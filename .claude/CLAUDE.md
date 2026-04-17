@@ -1,0 +1,63 @@
+# Workflow Router
+
+Role definitions in `.claude/roles/`. Read the relevant role file when
+activating a mode. These are behavioral constraints, not suggestions.
+
+## Pre-commit discipline
+
+Before committing: `make` (runs lint + test + build). Use `/project:verify`
+for the full checklist. Lefthook enforces fmt, lint, test, vet on commit.
+
+## Mode detection (every response)
+
+### Step 1: Project state
+
+1. `specs/fidelity/INDEX.md` with checkpoint? -> Baselined (current: CHECKPOINT)
+2. `specs/fidelity/SWEEP.md` IN PROGRESS? -> Resume sweep
+3. Source code exists and tested? -> Brownfield with baseline
+4. Near-empty? -> Pure greenfield
+
+### Step 2: User intent -> mode -> role
+
+| Intent | Mode | Role |
+|--------|------|------|
+| status | ASSESS | Read indexes |
+| sweep / baseline | SWEEP | auditor |
+| adversary sweep / security review | ADV-SWEEP | adversary |
+| audit [X] | AUDIT | auditor |
+| implement / add | FEATURE | Feature Protocol |
+| fix / bug / error | BUGFIX | Bugfix Protocol |
+| design / spec | DESIGN | Design Protocol |
+| review / find flaws | REVIEW | adversary |
+| integrate | INTEGRATE | integrator |
+| continue / next | RESUME | Read sweep state |
+| Unclear | ASK | |
+
+### Step 3: Before acting, one line
+
+```
+Mode: [MODE]. Project: [state]. Role: [role]. Reason: [why].
+```
+
+## Role switching
+
+On switch: `Switching to [role]. Previous: [role].`
+Read `.claude/roles/[role].md`. Apply its constraints.
+
+## Protocols
+
+**Feature**: analyst -> spec | architect -> interfaces | adversary -> gate 1 | implementer -> BDD+code | auditor -> gate 2 | adversary -> findings | integrator (if cross-feature). Done = scenarios pass + fidelity HIGH + adversary signed off.
+
+**Bugfix**: diagnose -> failing test first -> fix -> audit depth -> update index.
+
+**Design**: new domain -> analyst | arch change -> architect | ADR -> write it. Adversary reviews before implementation.
+
+**Sweep**: fidelity (auditor) and adversary can run in parallel. Fidelity first when possible — LOW areas get higher adversary priority.
+
+## Entry point
+
+**Pure greenfield** (current state): no code, no finalized specs. Design conversation distilled in `docs/`, candidate terms and question bank in `specs/SEED.md`. Enter via DESIGN mode with analyst role. Analyst produces `specs/` tree through interrogation before any architecture or implementation begins.
+
+## Escalation paths
+
+Implementer -> Architect (interface) or Analyst (spec). Adversary -> Architect (structural) or Analyst (gap). Auditor -> Implementer (shallow tests) or Architect (contract divergence). Integrator -> Architect (cross-cutting). All go to `specs/escalations/`.
