@@ -26,7 +26,7 @@ Read the workflow router before acting.
 6. `specs/architecture/enforcement-map.md` — invariant → code location
 7. `specs/architecture/build-phases.md` — implementation order
 8. `specs/architecture/error-taxonomy.md` — typed errors
-9. `specs/features/*.feature` — 132 Gherkin scenarios (the tests)
+9. `specs/features/*.feature` — 185 Gherkin scenarios (the tests)
 10. `specs/architecture/adr/*.md` — 19 architecture decision records
 
 ## Background documents (reference as needed)

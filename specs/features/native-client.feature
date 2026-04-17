@@ -157,6 +157,28 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And the client periodically attempts to reconnect via CXI
     And the failover is transparent to the workload
 
+  # --- Discovery protocol (ADR-008) ---
+
+  Scenario: All seed endpoints unreachable — discovery fails
+    Given the native client is configured with seed list [node1:9100, node2:9100]
+    And both seed endpoints are unreachable
+    When the native client attempts to initialize
+    Then discovery fails with retriable "no seeds reachable" error
+    And the client retries with exponential backoff
+    And the workload receives EIO until discovery succeeds
+
+  Scenario: Discovery returns shard and view topology
+    Given the native client connects to seed endpoint node1:9100
+    When it sends a discovery request
+    Then the response contains:
+      | field              | example                                    |
+      | shards             | [{shard_id, leader_node, key_range}, ...]   |
+      | views              | [{view_id, protocol, endpoint}, ...]        |
+      | gateways           | [{protocol, transport, endpoint}, ...]      |
+      | auth_requirements  | mTLS required, IdP optional                 |
+    And the client caches the discovery response with TTL
+    And no tenant-sensitive information is in the discovery response
+
   # --- Edge cases ---
 
   Scenario: Multiple clients writing to the same file concurrently

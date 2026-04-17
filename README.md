@@ -15,7 +15,7 @@ The design pipeline produced:
 
 | Phase | Output |
 |---|---|
-| Analyst | 8 bounded contexts, 56 invariants, 132 Gherkin scenarios, 20 failure modes, 50+ assumptions |
+| Analyst | 8 bounded contexts, 56 invariants, 185 Gherkin scenarios, 20 failure modes, 50+ assumptions |
 | Architect | 12 Rust crates + Go module, 19 ADRs, enforcement map, 13 build phases, error taxonomy, protobuf definitions |
 | Adversary | 8 architecture findings (2 blocking fixed, 6 accepted/deferred) |
 | Analyst backpass | 5 contention points resolved, 5 new invariants |
@@ -103,14 +103,16 @@ specs/
 ├── cross-context/
 │   └── interactions.md               # Data paths, contracts, cascades
 ├── features/
-│   ├── log.feature                   # 16 scenarios
+│   ├── log.feature                   # 18 scenarios
 │   ├── chunk-storage.feature         # 18 scenarios
-│   ├── key-management.feature        # 18 scenarios
-│   ├── composition.feature           # 17 scenarios
+│   ├── key-management.feature        # 17 scenarios
+│   ├── composition.feature           # 16 scenarios
 │   ├── view-materialization.feature  # 16 scenarios
-│   ├── protocol-gateway.feature      # 14 scenarios
-│   ├── native-client.feature         # 15 scenarios
-│   └── control-plane.feature         # 18 scenarios
+│   ├── protocol-gateway.feature      # 16 scenarios
+│   ├── native-client.feature         # 20 scenarios
+│   ├── control-plane.feature         # 23 scenarios
+│   ├── authentication.feature        # 13 scenarios (mTLS, IdP, SPIFFE)
+│   └── operational.feature           # 28 scenarios (integrity, versioning, compression)
 ├── findings/
 │   └── architecture-review.md        # 8 adversary architecture findings
 └── architecture/
