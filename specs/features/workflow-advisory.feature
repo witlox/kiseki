@@ -363,6 +363,80 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the rejection shape (code, payload size, latency distribution) is identical to a never-issued handle (I-WA6)
     And the workflow continues; other handles and subscriptions remain valid
 
+  # --- Gate-1 completeness back-fill (gaps found in post-architect audit) ---
+
+  Scenario: Own-hotspot telemetry on caller's contended composition
+    Given workflow "wf-abc" owns composition "shared-result.h5" that sees sustained concurrent reads from peer workloads in the same workload-id pool (fan-in)
+    And the workload is subscribed to the OWN_HOTSPOT telemetry channel
+    When contention crosses the soft threshold
+    Then an OwnHotspot telemetry event is emitted to "wf-abc" carrying { composition_id: shared-result.h5, contention: moderate|tight }
+    And no composition owned by a different workload is named in any own-hotspot event (I-WA5)
+    And the contention value is bucketed (no fine-grained counts)
+
+  Scenario: Deadline hint accepted and influences scheduling within policy
+    Given the workflow has an active phase with priority batch
+    When the client submits a DeadlineHint { composition: "checkpoint.pt", deadline: now + 90s }
+    Then the advisory subsystem accepts the hint and emits HintAck OUTCOME_ACCEPTED
+    And the write path MAY bias scheduling to meet the deadline (best-effort)
+    And failure to meet the deadline is NOT an error — the write succeeds whenever the data path completes it (I-WA1)
+    And a deadline in the past is rejected with "hint_too_large" treatment (schema validation) or ignored as advisory
+
+  Scenario: Phase summary audit event emitted on ring eviction (I-WA13, ADR-021 §9)
+    Given the workflow's phase ring has 64 entries (K = default)
+    When the client performs a 65th PhaseAdvance
+    Then phase entry 1 is evicted from the ring
+    And a PhaseSummaryEvent audit entry is emitted to the tenant audit shard with:
+      | field                                | shape                  |
+      | from_phase_id / to_phase_id         | raw integers           |
+      | total_hints_accepted_bucket          | log2 bucket (not exact) |
+      | total_hints_rejected_bucket          | log2 bucket            |
+      | duration_ms_bucket                   | log2 bucket            |
+    And the event is size-padded to a fixed bucket so its wire size does not leak workflow activity (ADR-021 §9)
+    And cluster-admin exports see workflow_id and phase_tag hashed (I-WA8, I-A3)
+
+  Scenario: Telemetry subscribe emits audit event
+    When the client subscribes to channels [BACKPRESSURE, LOCALITY, QOS_HEADROOM]
+    Then a TelemetrySubscribedEvent audit entry is emitted with the list of channel enum names
+    And unsubscribe via ACTION_REMOVE emits a corresponding TelemetrySubscribedEvent (ACTION_REMOVE variant)
+    And these events go to the tenant audit shard (I-WA8)
+
+  Scenario: Priority-class revoked mid-workflow produces priority_revoked on next PhaseAdvance (I-WA18)
+    Given the workflow's current phase uses priority batch
+    And the workload's allowed priorities were [batch, bulk] at DeclareWorkflow
+    When tenant admin narrows allowed priorities to [bulk] only
+    Then the current phase continues under the snapshotted priority batch (I-WA18)
+    And the next PhaseAdvance is rejected with "priority_revoked"
+    And the workflow remains on its current phase
+
+  Scenario: StreamWarning lifecycle — budget-exceeded, TTL-soon, cert-near-expiry
+    Given the workflow is active with a bidi advisory stream open
+    When the workload's hints/sec sustained rate exceeds its cap for >5 seconds
+    Then the server emits a StreamWarning { kind: BUDGET_EXCEEDED } on the stream (I-WA7, I-WA8)
+    When the workflow's TTL is within 60 seconds of expiry
+    Then the server emits StreamWarning { kind: WORKFLOW_TTL_SOON }
+    When the client's mTLS cert is within its notBefore/notAfter rollover window (about to expire)
+    Then the server emits StreamWarning { kind: CERT_NEAR_EXPIRY }
+    And each warning is additionally audited as an advisory-state-transition or informational event
+
+  Scenario: Server heartbeat keeps AdvisoryStream alive during idleness
+    Given the client has an open bidi advisory stream with no hints and no subscriptions
+    When 10 seconds of idleness elapse
+    Then the server emits StreamWarning { kind: HEARTBEAT } on the stream
+    And idle streams receive heartbeats every 10s ± jitter until closed
+    And a client missing three consecutive heartbeats treats the stream as dead and reconnects (client-side obligation)
+
+  Scenario: gRPC status code is NOT_FOUND for every scope violation (I-WA6, ADR-021 §8)
+    When any of the following happen:
+      | case                                          |
+      | Hint targets a composition owned by another workload |
+      | Hint targets a never-existed composition       |
+      | Advisory call presents a stolen workflow_ref from a neighbour |
+      | Advisory call presents a never-issued workflow_ref |
+    Then every response carries gRPC status code NOT_FOUND (5)
+    And no response uses PERMISSION_DENIED (7) or UNAUTHENTICATED (16)
+    And the application-level AdvisoryError.code is SCOPE_NOT_FOUND for all cases
+    And the response size, timing bucket, and message string are identical across all four cases
+
   # --- Covert-channel hardening (I-WA15) ---
 
   Scenario: Rejection latency does not leak neighbour state

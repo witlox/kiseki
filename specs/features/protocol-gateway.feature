@@ -196,6 +196,17 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     Then the advisory is submitted asynchronously (I-WA2) and the NFS read is served normally
     And the View Materialization subsystem MAY readahead for subsequent reads of the same caller
 
+  Scenario: NFS workflow_ref carriage model (v1)
+    Given NFSv4.1 is a POSIX-oriented protocol with no native header for workflow correlation
+    When a workload mounts an NFS export via "gw-nfs-pharma"
+    Then workflow correlation for NFS clients is attached per-mount by the gateway:
+      | option              | value                              |
+      | mount_option        | `workflow-ref=<16-byte-hex>`        |
+      | mount_option_source | workload's DeclareWorkflow response |
+    And all RPCs on that mount inherit that workflow_ref internally (translated to the gRPC binary header at the kiseki-server ingress)
+    And mounts without `workflow-ref` proceed with no advisory correlation — data-path behavior is identical to pre-advisory NFS (I-WA1, I-WA2)
+    And the gateway MAY refuse a mount whose workflow_ref is unknown or belongs to a different workload; that refusal is a mount-time error, not mid-session
+
   Scenario: Advisory disabled at workload — gateway ignores hints, serves protocol normally
     Given tenant admin transitions "training-run-42" advisory to disabled
     When NFS or S3 requests arrive with workflow_ref or priority hints
