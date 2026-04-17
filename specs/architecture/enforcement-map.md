@@ -127,3 +127,26 @@ architecture it gets enforced. Invariant without enforcement = violation.
 |---|---|---|
 | I-O5 (trust hash, explicit reconstruction) | `kiseki-log` + `kiseki-crypto` | Compaction: hashed_key ordering. Verify: tenant-key-decrypt + re-hash |
 | I-K11 (tenant KMS loss unrecoverable) | Documentation + audit trail | No code enforcement — by design |
+
+## Workflow advisory invariants (ADR-020 — architect will refine)
+
+| Invariant | Enforcement point | Mechanism |
+|---|---|---|
+| I-WA1 (hints advisory only) | `kiseki-advisory` hint handler + all data-path crates | Hint consumption is pure annotation; data-path code never reads hint outcome; property test: outcome equivalence with/without hints |
+| I-WA2 (advisory isolated from data path) | `kiseki-advisory` runtime | Separate tokio runtime / thread pool; fire-and-forget hint submission; bounded buffer with drop-and-audit on overflow; no awaits from data path on advisory futures |
+| I-WA3 (workflow scoped to workload) | `kiseki-advisory` session manager + mTLS validator | WorkflowSession binds to mTLS peer identity at DeclareWorkflow; every subsequent op checks identity match |
+| I-WA4 (client_id pinned per process) | `kiseki-client` startup + `kiseki-advisory` registrar | client_id = CSPRNG(≥128 bits) generated at process start; registrar binds `(client_id, mTLS identity)` at first use and rejects re-registration or identity-mismatch |
+| I-WA5 (telemetry scoped + k-anonymous) | `kiseki-advisory` telemetry emitter | Ownership check before any metric computation; aggregator applies k-anonymity ≥5 over neighbour workloads before exposure |
+| I-WA6 (telemetry not existence oracle) | `kiseki-advisory` telemetry emitter | Ownership check returns `not_found` with same shape/latency distribution as absent target; constant-time check where feasible |
+| I-WA7 (hint budgets hierarchical) | `control/pkg/policy` + `kiseki-advisory` budget enforcer | Policy pipeline computes effective budget = min across levels; budget-exceeded → throttle + audit, local to offending workload |
+| I-WA8 (advisory operations audited, batching allowed) | `kiseki-advisory` → `kiseki-audit` | Lifecycle + policy-violation events emitted per occurrence; `hint-accepted` and `hint-throttled` MAY be batched with per-second per-(workflow_id, reason) sampling guarantee and exact per-second counts preserved |
+| I-WA9 (placement server-authoritative) | `kiseki-chunk` placement engine | Hint read as preference only; engine decision ordered: policy > durability > retention > hint |
+| I-WA10 (opaque correlation IDs) | `kiseki-advisory` id generator | ≥128-bit CSPRNG; per-workload namespace; GC on End/TTL; handle treated as capability-reference validated by mTLS every call |
+| I-WA11 (restricted advisory target fields) | `kiseki-advisory` schema + serde | Protobuf schema admits only enums, numeric metrics, and caller-owned opaque references (composition_id, view_id, workflow_id); shard_id, log_position, chunk_id, dedup_hash, node_id, device_id, rack_label are rejected at schema-validation with `forbidden_target_field`; lint rule on proto enforces at compile time |
+| I-WA12 (opt-out with enabled/draining/disabled) | `control/pkg/policy` + `kiseki-advisory` gate | State machine per scope (org/project/workload, cluster-wide): enabled → draining (reject new Declare, continue existing) → disabled (audit-end active, reject all); all transitions audited; data path unaffected in every state |
+| I-WA13 (phase monotonic, bounded) | `kiseki-advisory` session manager | phase_id strict-increase check; ring buffer of last-K phases; older phases → aggregate audit summary |
+| I-WA14 (hints don't extend capability) | All data-path crates | Authorisation, quota, and retention checks run before hint consultation and ignore hints entirely |
+| I-WA15 (no covert channel via latency/size) | `kiseki-advisory` responder | Rejection path emits response after fixed delay bucket; telemetry messages padded to bucketed sizes; property test compares distributions |
+| I-WA16 (hint payload size bound) | `kiseki-advisory` ingress | Per-hint schema validator: prefetch-tuple cap from policy (default 4096, max 16384); 4 KiB hard cap for other hint types; oversize → `hint_too_large` + audit |
+| I-WA17 (declare-rate bound) | `kiseki-advisory` session manager + `control/pkg/policy` | Token-bucket rate limiter per `(workload_id)` at default 10/s; exceed → `declare_rate_exceeded` + audit |
+| I-WA18 (prospective policy application) | `kiseki-advisory` session manager | Snapshot effective policy at `DeclareWorkflow` into the workflow record; `PhaseAdvance` re-validates against current policy; revocation → `profile_revoked` / `priority_revoked` |

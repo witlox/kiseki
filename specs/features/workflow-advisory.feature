@@ -1,0 +1,351 @@
+Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC/AI workflows
+  Clients declare a workflow, advance through phases, and send advisory hints to
+  help storage steer placement, prefetch, caching, and QoS. Storage emits
+  caller-scoped telemetry feedback (backpressure, locality, materialization lag,
+  prefetch effectiveness, QoS headroom) on the same channel. Hints are advisory
+  only: correctness, ACL, and quota decisions never depend on them. Telemetry
+  never leaks cross-tenant information. The advisory subsystem is isolated from
+  the data path.
+
+  Background:
+    Given a Kiseki cluster with Workflow Advisory enabled cluster-wide
+    And organization "org-pharma" with project "clinical-trials" and workload "training-run-42"
+    And a native client process pinned as client_id "cli-7f3a" under "training-run-42"
+    And the workload's hint budget is:
+      | field                      | value |
+      | hints_per_sec              | 200   |
+      | concurrent_workflows       | 4     |
+      | phases_per_workflow        | 64    |
+      | telemetry_subscribers      | 4     |
+      | declared_prefetch_bytes    | 64GB  |
+    And the workload's allowed profiles are [ai-training, ai-inference, hpc-checkpoint]
+    And workflow_declares_per_sec is 10 and max_prefetch_tuples_per_hint is 4096
+
+  # --- Workflow lifecycle ---
+
+  Scenario: Client declares a workflow with an allowed profile
+    When the native client calls DeclareWorkflow with:
+      | field        | value             |
+      | profile      | ai-training       |
+      | initial_phase| stage-in          |
+      | ttl_seconds  | 3600              |
+    Then the call returns a workflow handle with opaque workflow_id of at least 128 bits entropy
+    And the workflow is scoped to workload "training-run-42" only
+    And an advisory-audit event "declare-workflow" is written to the tenant audit shard
+    And the current phase is "stage-in"
+
+  Scenario: Client attempts a profile not in its allow-list
+    When the native client calls DeclareWorkflow with profile "batch-etl"
+    Then the call is rejected with "profile_not_allowed"
+    And no workflow handle is issued
+    And an advisory-audit event "declare-workflow: rejected" is written with reason "profile_not_allowed"
+    And the workload's data-path operations remain unaffected
+
+  Scenario: Phase advance is monotonic and bounded
+    Given the workflow is in phase "stage-in" with phase_id 1
+    When the client calls PhaseAdvance to phase "compute" with phase_id 2 tagged "epoch-0"
+    Then the current phase becomes "compute"
+    When the client calls PhaseAdvance with phase_id 2
+    Then the call is rejected with "phase_not_monotonic"
+    When the client advances 64 times across the workflow's lifetime
+    Then older phases beyond the last 64 are compacted to aggregate audit summaries
+
+  Scenario: Workflow ends on explicit End
+    Given the workflow has been active for 120 seconds
+    When the client calls EndWorkflow
+    Then an advisory-audit event "end-workflow" is written
+    And the workflow_id is no longer accepted by the advisory channel
+    And all subscribed telemetry streams for the workflow are closed
+    And any cached per-workflow steering state is dropped within 1s
+
+  Scenario: Workflow ends on TTL expiry
+    Given the workflow was declared with ttl_seconds 60
+    When 61 seconds elapse without any advisory activity
+    Then the workflow is auto-ended with reason "ttl_expired"
+    And an advisory-audit event "end-workflow: ttl_expired" is written
+    And subsequent hint submissions with the workflow_id return "workflow_unknown"
+
+  # --- Hints are advisory only (I-WA1) ---
+
+  Scenario: Hint presence does not change data-path outcome
+    Given a composition "checkpoint.pt" under workload "training-run-42"
+    When the client writes 256MB to "checkpoint.pt" WITHOUT any hints
+    And separately writes 256MB to "checkpoint-b.pt" WITH a full hint bundle (access pattern, priority, affinity, retention)
+    Then both writes produce identical durability, encryption, dedup, and visibility outcomes
+    And the effective placement for both may differ (hint honoured for the second) but both are valid per placement policy
+
+  Scenario: Advisory channel outage does not affect data path
+    Given the advisory subsystem on the client's serving node becomes unresponsive
+    When the client issues reads and writes for "checkpoint.pt"
+    Then all operations complete with normal latency and durability
+    And no data-path operation is delayed, blocked, or reordered by the advisory outage
+    And the client observes that hint submissions time out or return "advisory_unavailable"
+
+  Scenario: Hint rejection returns the operation's own result unchanged
+    Given the workload's allowed priority classes are [batch, bulk] only
+    When the client submits a hint { priority: interactive } for an in-flight read
+    Then the hint is rejected with "priority_not_allowed"
+    And the underlying read completes with the same result, latency class, and error behavior it would have without the hint
+    And an advisory-audit event "hint-rejected" is written
+
+  # --- Tenant-hierarchy scoping (I-WA3, I-WA7) ---
+
+  Scenario: A workflow cannot cross workload boundaries
+    Given workload "training-run-42" and workload "inference-svc-9" both under "org-pharma"
+    When the client pinned under "training-run-42" calls DeclareWorkflow
+    And then submits a hint referencing composition_id owned by "inference-svc-9"
+    Then the hint is rejected with "scope_violation"
+    And the advisory-audit event includes only "training-run-42"'s identity, not "inference-svc-9"'s
+    And no information about "inference-svc-9"'s compositions is leaked in the error
+
+  Scenario: Org ceiling caps workload hint budget
+    Given "org-pharma" org-level ceiling is hints_per_sec 500
+    And "clinical-trials" project-level ceiling is hints_per_sec 300
+    And "training-run-42" workload-level budget is hints_per_sec 200
+    When the workload sustains 250 hints/sec
+    Then hint submissions beyond 200/sec are throttled with "budget_exceeded"
+    And only "training-run-42" is affected
+    And other workloads under "clinical-trials" continue at their own budgets
+    And an advisory-audit event "budget-exceeded" is written
+
+  Scenario: Child scope cannot broaden parent ceiling
+    Given "clinical-trials" project ceiling is hints_per_sec 300
+    When the tenant admin attempts to set "training-run-42" workload budget to hints_per_sec 500
+    Then the control-plane update is rejected with "child_exceeds_parent_ceiling"
+    And the workload's effective budget remains its last-valid value
+
+  # --- Telemetry scoping (I-WA5, I-WA6) ---
+
+  Scenario: Telemetry is computed over the caller's own resources only
+    Given the workload owns compositions [A, B] in pool "fast-nvme"
+    And a different workload "neighbour-42" owns compositions [C, D] in the same pool
+    When the client subscribes to pool-saturation telemetry for "fast-nvme"
+    Then the returned backpressure signal reflects the state of the pool as experienced by A and B
+    And cluster-wide utilisation exposed (if any) is bucketed with k-anonymity k>=5 over neighbour workloads
+    And no field in the telemetry response allows the caller to infer C or D's traffic
+
+  Scenario: Telemetry is not an existence oracle
+    Given composition "secret-study/results.h5" exists under "org-other" (a different org)
+    When the client queries locality telemetry with composition_id pointing at "secret-study/results.h5"
+    Then the call returns "not_found" with the same latency distribution and error shape as a genuinely non-existent composition owned by "org-pharma"
+    And no timing, size, or code difference distinguishes "forbidden" from "absent"
+
+  Scenario: Locality class is coarsely bucketed
+    Given the client reads a 1GB composition spanning chunks on local, same-rack, and remote nodes
+    When the client requests locality telemetry for that composition
+    Then the response uses enum values from {local-node, local-rack, same-pool, remote, degraded}
+    And does not reveal node IDs, rack labels, or device serials
+    And cannot be used to map neighbour workloads' placements
+
+  # --- Hints inform but never authorise (I-WA9, I-WA14) ---
+
+  Scenario: Affinity hint preference honoured within policy
+    Given the workload's allowed affinity is pool "fast-nvme"
+    When the client submits a hint { affinity: "fast-nvme", colocate_with: "rack-7" }
+    Then the placement engine MAY place new chunks in fast-nvme on rack-7
+    And MAY override the hint to satisfy EC durability (I-C4) or retention hold (I-C2b)
+    And never places chunks in a pool the workload is not authorised for
+
+  Scenario: Hint cannot bypass retention hold
+    Given composition "patient-scan.dcm" has a retention hold for 7 years
+    When the client sends hint { retention: temp } for "patient-scan.dcm"
+    Then the hint is rejected with "retention_policy_conflict"
+    And the retention hold remains in effect
+    And an advisory-audit event "hint-rejected" is written
+
+  Scenario: Hint cannot elevate priority beyond policy max
+    Given the workload's policy-allowed maximum priority is "batch"
+    When the client submits hint { priority: interactive } for a workflow phase
+    Then the hint is rejected with "priority_not_allowed"
+    And the phase's effective priority remains "batch"
+
+  # --- Prefetch hints (AI training epoch) ---
+
+  Scenario: Prefetch hints for shuffled epoch read order
+    Given the workflow is in phase "epoch-0" with profile ai-training
+    When the client submits a PrefetchHint with 4096 (composition_id, offset, length) tuples scoped to the workload's own compositions totaling 40GB
+    Then the advisory subsystem accepts the hint within the workload's declared_prefetch_bytes budget
+    And the view subsystem MAY warm the declared ranges opportunistically
+    And the client observes improved cache hit rate for the predicted read order
+    And prefetch-effectiveness telemetry for this phase reports hit rate in coarse buckets
+
+  Scenario: Prefetch hint beyond budget is capped
+    Given the workload's declared_prefetch_bytes budget is 64GB
+    When the client submits a PrefetchHint totaling 100GB in a single phase
+    Then the advisory subsystem accepts 64GB worth and drops the remainder with "prefetch_budget_exceeded"
+    And an advisory-audit event is written
+    And data-path reads for the unadopted ranges still succeed normally
+
+  Scenario: Collective checkpoint announcement
+    Given phase "checkpoint" is active with profile hpc-checkpoint
+    When the client submits a CollectiveAnnouncement { ranks: 1024, bytes_per_rank: 4GB, deadline: now+120s }
+    Then the advisory subsystem MAY pre-warm write-absorb capacity in the target pool
+    And the announcement is advisory — the checkpoint succeeds even if no warm-up occurs
+    And capacity is never reserved in a way that starves other tenants of their quota
+
+  # --- Backpressure feedback (I-WA5) ---
+
+  Scenario: Soft backpressure signals the caller to slow
+    Given the pool "fast-nvme" is at 80% of the caller's declared burst budget
+    When the client has a telemetry subscription for the current workflow
+    Then a backpressure telemetry event with severity "soft" and retry_after_ms hint is delivered
+    And the client MAY slow its submission rate
+    And data-path operations continue to be accepted
+
+  Scenario: Hard backpressure explicitly requests the caller to stop
+    Given the pool is at 100% of the caller's hard budget
+    When the client has a telemetry subscription
+    Then a backpressure telemetry event with severity "hard" is delivered
+    And subsequent submissions by this caller MAY be rejected with "quota_exceeded" on the data path (that is existing I-T2 behavior, not a new consequence of the hint system)
+
+  # --- Identity hygiene (I-WA10) ---
+
+  Scenario: Another workload cannot use a leaked workflow_id
+    Given "training-run-42" has an active workflow with workflow_id "wf-abc..."
+    And "training-run-42" inadvertently logs "wf-abc..." to a place visible to "inference-svc-9"
+    When a client authenticated as "inference-svc-9" submits a hint carrying workflow_id "wf-abc..."
+    Then the hint is rejected with "workflow_not_found_in_scope"
+    And no information about the workflow's existence or phase is revealed
+    And the rejection latency and error code are indistinguishable from a workflow_id that was never issued
+
+  Scenario: New process gets a new client_id
+    Given native client process with client_id "cli-7f3a" is running
+    When the process restarts
+    Then the new process obtains a new client_id "cli-bb01" from a fresh ≥128-bit CSPRNG draw
+    And the advisory registrar rejects any attempt to re-register "cli-7f3a"
+    And workflows held by "cli-7f3a" expire via TTL (no reattach protocol is defined in this ADR)
+    And the new process must call DeclareWorkflow afresh to obtain a new workflow handle
+
+  # --- Audit (I-WA8) ---
+
+  Scenario: All advisory decisions are audited on the tenant shard
+    When the client performs, within one workflow:
+      | step | action                                           |
+      | 1    | DeclareWorkflow(profile=ai-training)              |
+      | 2    | PhaseAdvance(epoch-0)                             |
+      | 3    | Hint(access_pattern=random) accepted              |
+      | 4    | Hint(priority=interactive) rejected               |
+      | 5    | PrefetchHint 200GB throttled to 64GB              |
+      | 6    | SubscribeTelemetry(backpressure)                  |
+      | 7    | EndWorkflow                                       |
+    Then seven advisory-audit events are written to the tenant audit shard
+    And each event carries the (org, project, workload, client_id, workflow_id, phase_id) correlation
+    And cluster-admin exports see workflow_id and phase_tag as opaque hashes only (per I-A3, ADR-015)
+    And tenant admin exports see the full correlation per I-A2
+
+  # --- Opt-out (I-WA12) ---
+
+  Scenario: Tenant admin disables advisory for a workload
+    Given "training-run-42" has Workflow Advisory enabled
+    When tenant admin disables advisory for "training-run-42"
+    Then new DeclareWorkflow calls from clients under "training-run-42" return "ADVISORY_DISABLED"
+    And in-flight workflows are gracefully ended with audit
+    And the workload's data-path operations proceed with full performance and correctness
+    And cluster admin can observe the opt-out in aggregate state but not the reason
+
+  Scenario: Cluster admin disables advisory cluster-wide (incident response)
+    Given a suspected advisory-subsystem bug
+    When cluster admin disables Workflow Advisory cluster-wide
+    Then all tenants see "ADVISORY_DISABLED" on DeclareWorkflow
+    And no data-path operation is affected
+    And the disable action is audited system-wide
+
+  # --- Adversary gate-0 hardening scenarios ---
+
+  Scenario: Hint rejection for unauthorized target is indistinguishable from absent target (I-WA6)
+    Given composition_id "comp-neighbour" exists under a different workload
+    And composition_id "comp-ghost" has never been allocated under any workload
+    When the client submits a hint referencing "comp-neighbour"
+    And separately submits a hint referencing "comp-ghost"
+    Then both calls return the same error code
+    And the response payload structures are byte-identical in size
+    And the latency distributions over many samples are statistically indistinguishable
+    And no timing, size, or code difference lets the caller tell "forbidden" from "absent"
+
+  Scenario: Low-k telemetry response has the same shape as populated-k (I-WA5)
+    Given pool "fast-nvme" has only the caller's workload and one neighbour workload active (k=2)
+    When the caller subscribes to pool-saturation telemetry
+    Then the response contains all fields it would in the k>=5 case
+    And neighbour-derived fields carry a fixed sentinel value defined by policy
+    And the response size, message timing, and field presence are indistinguishable from the populated case
+
+  Scenario: mTLS identity is re-validated per operation (I-WA3)
+    Given the client has an active bidi advisory stream under cert "tenant-cert-v1"
+    When "tenant-cert-v1" is revoked by the Cluster CA
+    Then within a bounded detection interval the advisory subsystem tears the stream down
+    And subsequent hints on any resumed stream require a currently-valid cert
+    And pre-revocation in-flight operations remain accepted up to the revocation point (per I-WA1)
+
+  Scenario: Cap on tuples per prefetch hint (I-WA16)
+    When the client submits a PrefetchHint with 20000 tuples
+    Then the hint is rejected with "hint_too_large"
+    And no tuples are adopted
+    And an advisory-audit event "hint-rejected: hint_too_large" is written
+    And subsequent prefetch hints within the cap continue to be accepted
+
+  Scenario: Cap on workflow declares per second (I-WA17)
+    When the client issues 30 DeclareWorkflow calls in a single second
+    Then the first 10 succeed
+    And the remaining 20 are rejected with "declare_rate_exceeded"
+    And an advisory-audit event is written for the rate exception
+    And the workload's concurrent_workflows cap is independent and still enforced
+
+  Scenario: Batched audit for high-rate hint throttling (I-WA8)
+    Given the workload sustains 200 hints/sec of which 150/sec are throttled
+    When measured over a 60-second window
+    Then at least one audit event per unique (workflow_id, rejection_reason) tuple is written per second
+    And exact accepted-count and throttled-count per workflow per second are preserved in audit
+    And the total audit event volume is bounded below the raw 150/sec figure
+    And declare/end/phase/policy-violation events are written per-occurrence without batching
+
+  Scenario: Concurrent PhaseAdvance is serialized (I-WA13)
+    Given two threads in one native-client process hold the same workflow handle at phase_id 5
+    When both call PhaseAdvance(6) concurrently
+    Then exactly one call returns success and the workflow advances to phase 6
+    And the other call returns "phase_not_monotonic"
+    And no intermediate state where two phases are active is ever observable
+
+  Scenario: Hints in-flight at EndWorkflow follow a clear boundary
+    Given the client has 30 hints buffered in the advisory channel toward its active workflow
+    When the client calls EndWorkflow
+    Then hints that crossed the server-side receive boundary before End are best-effort processed
+    And hints submitted after End return "workflow_unknown"
+    And EndWorkflow does not block on buffered hint processing
+    And an advisory-audit "end-workflow" event is written containing the count of pre-End hints dropped
+
+  Scenario: Draining state during opt-out (I-WA12)
+    Given "training-run-42" has two active workflows in phases "epoch-3" and "epoch-7"
+    When tenant admin transitions advisory for "training-run-42" from enabled to draining
+    Then new DeclareWorkflow calls return "ADVISORY_DISABLED"
+    And the two active workflows continue to accept hints within their current phases
+    And when a workflow advances phase or hits TTL, it is audit-ended
+    And when both active workflows have ended, the tenant admin may transition draining to disabled
+    And data-path operations for "training-run-42" are unaffected throughout
+
+  Scenario: Policy revocation applies prospectively (I-WA18)
+    Given the workflow is in phase "compute" with profile ai-training and priority batch
+    When tenant admin removes "ai-training" from the allow-list mid-workflow
+    Then the current phase continues normally to completion or TTL
+    And the next PhaseAdvance is rejected with "profile_revoked"
+    And the workflow remains on its current phase
+    And data-path operations for this workflow are unaffected
+
+  Scenario: Forbidden advisory target fields are rejected (I-WA11)
+    When the client submits a hint whose target field contains a shard_id, log_position, chunk_id, dedup_hash, node_id, or device_id
+    Then the hint is rejected with "forbidden_target_field" at the schema-validation layer
+    And no ownership check or side effect occurs
+    And an advisory-audit event is written
+
+  # --- Covert-channel hardening (I-WA15) ---
+
+  Scenario: Rejection latency does not leak neighbour state
+    Given workload A submits hints that would be rejected due to its own policy
+    And workload B submits hints that would be rejected due to pool-wide contention caused by neighbour traffic
+    When both rejections are measured over many samples
+    Then the latency distributions and error payloads are indistinguishable between A's and B's rejections
+    And neither A nor B can infer the other's activity from rejection timing
+
+  Scenario: Telemetry response size is bucketed
+    When a client subscribes to telemetry at different cluster load levels
+    Then the size of each telemetry message is one of a small fixed set of sizes (padded/bucketed)
+    And the client cannot infer neighbour load from message size variation

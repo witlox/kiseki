@@ -277,14 +277,40 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 
 ---
 
+## Workflow advisory failures (ADR-020)
+
+### F-ADV-1: Advisory subsystem outage
+
+| Field | Value |
+|---|---|
+| **Description** | The Workflow Advisory subsystem becomes unresponsive (crash, overload, network partition to the advisory runtime) on one or more serving nodes. |
+| **Blast radius** | Steering quality only. Clients observe `advisory_unavailable` on hint submission and lose telemetry feedback for affected workflows. No data-path operation is blocked, delayed, or reordered (I-WA2). |
+| **Detection** | Health probes on the advisory runtime; advisory-channel heartbeats from clients; declare/hint error rate. |
+| **Degradation** | In-flight data-path operations succeed with full correctness. New DeclareWorkflow calls return `advisory_unavailable`; native clients fall back to pattern-inference (pre-existing behavior) for prefetch and access-pattern heuristics. |
+| **Recovery** | Restart the advisory runtime. Clients redeclare. Prior workflow state is ephemeral and not recovered. |
+| **Severity** | **P2** (scoped to advisory steering quality; no correctness or durability impact) |
+
+### F-ADV-2: Advisory audit storm
+
+| Field | Value |
+|---|---|
+| **Description** | A misbehaving or malicious workload submits hints at or near its budget, with a high rejection rate, driving audit-event volume toward the tenant audit shard's capacity. |
+| **Blast radius** | Tenant audit shard throughput and the I-L4 / I-A4 GC-consumer relationship. Without mitigation, could block data-shard GC for the affected tenant (bounded by I-A5 safety valve). |
+| **Detection** | Audit write rate per tenant; advisory-audit backpressure counters. |
+| **Degradation** | I-WA8 batching/sampling for `hint-accepted` and `hint-throttled` reduces steady-state volume. I-A5 audit GC safety valve permits data GC to proceed past a documented gap when audit stalls >24 h. Budget reductions via control plane reduce the offending workload's hint rate. |
+| **Recovery** | Tenant admin or automated policy narrows the offending workload's `hints_per_sec`. Audit shard catches up. |
+| **Severity** | **P2** (tenant-scoped; safety valves exist) |
+
+---
+
 ## Failure severity summary
 
 | Severity | Count | Examples |
 |---|---|---|
 | P0 | 2 | System key manager loss, system KEK compromise |
 | P1 | 6 | Tenant KMS loss, log corruption, key compromise, algo deprecation, control plane down, network partition (wide) |
-| P2 | 7 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow) |
+| P2 | 9 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm |
 | P3 | 5 | Gateway crash, client crash, device failure, split latency, replay attack |
 
-Total: **20 failure modes** catalogued with blast radius, detection,
+Total: **22 failure modes** catalogued with blast radius, detection,
 degradation, and recovery.
