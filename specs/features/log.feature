@@ -172,3 +172,31 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     Then both operations proceed
     And compaction completes on the pre-split key range
     And the split creates a new shard with its own compaction state
+
+  # --- Workflow Advisory integration (ADR-020) ---
+  # The Log is largely passive to the advisory concern — phase markers
+  # are advisory hints routed upstream only as heuristics for compaction
+  # pacing and shard-side tuning. The Log emits caller-scoped shard
+  # saturation telemetry. Hints never change Raft ordering, durability,
+  # or compaction correctness (I-L1/L2/L3, I-WA1).
+
+  Scenario: Phase marker { checkpoint } may inform compaction pacing
+    Given workload "training-run-42" advances its workflow to phase "checkpoint"
+    And compositions on "shard-trials-1" are written heavily during this phase
+    When the compaction pacer observes the phase-marker heuristic
+    Then it MAY defer aggressive compaction on "shard-trials-1" during the checkpoint burst
+    And compaction MUST resume to honour its configured thresholds regardless of hints (I-L6)
+    And the hint never affects delta ordering, durability, or GC correctness (I-WA1)
+
+  Scenario: Shard saturation telemetry is caller-scoped
+    Given workload "training-run-42" has compositions on "shard-trials-1" (owned) and a neighbour workload has compositions on the same shard
+    When the caller subscribes to shard-saturation telemetry for "shard-trials-1"
+    Then the returned backpressure signal reflects only the caller's own append rate and commit latency for that shard
+    And neighbour workloads' contribution is not inferable (I-WA5)
+    And requesting telemetry for a shard with no caller-owned compositions returns the same shape as a nonexistent shard (I-WA6)
+
+  Scenario: Advisory disabled — log serves all tenants normally
+    Given advisory is disabled cluster-wide
+    When workloads append deltas, trigger shard splits, and run compaction
+    Then all Log operations succeed with full correctness and durability (I-WA2)
+    And no compaction pacing heuristic uses absent advisory signals (behaves as if no phase markers were present)

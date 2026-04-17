@@ -193,3 +193,53 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     When the native client mounts /mnt/kiseki/archive
     Then reads succeed normally
     And writes return EROFS (read-only filesystem)
+
+  # --- Workflow Advisory integration (ADR-020) ---
+  # The native client is the ORIGINATOR of advisory hints and the CONSUMER
+  # of telemetry feedback. Full lifecycle/invariant scenarios live in
+  # workflow-advisory.feature; scenarios here cover integration with the
+  # existing FUSE/native read/write/caching paths.
+
+  Scenario: Client declares a workflow and correlates subsequent operations
+    Given the native client is initialized under workload "training-run-42"
+    When the workload calls kiseki_declare_workflow(profile="ai-training", initial_phase="stage-in")
+    Then the client obtains an opaque WorkflowSession handle
+    And all subsequent read/write calls that take an optional session argument carry the workflow_ref annotation
+    And operations without a session argument continue to work unchanged (advisory annotation absent, I-WA1/I-WA2)
+
+  Scenario: Pattern-detector origin — access-pattern hint emitted on detected sequential read
+    Given the workflow is in phase "stage-in" with profile ai-training
+    And the native client's pattern detector observes three consecutive sequential reads on /mnt/kiseki/trials/dataset.h5
+    When the detector classifies the access as sequential
+    Then the client submits hint { access_pattern: sequential, target: composition_id of dataset.h5 } on the advisory channel
+    And continues to serve reads normally (hint emission is asynchronous and non-blocking, I-WA2)
+    And if the advisory channel is unavailable the read path is unaffected
+
+  Scenario: Client declares prefetch ranges for an AI shuffled epoch
+    Given the workflow advances to phase "epoch-0"
+    When the workload computes the shuffled read order and calls kiseki_declare_prefetch(tuples)
+    Then the client batches tuples into PrefetchHint messages each under max_prefetch_tuples_per_hint (I-WA16)
+    And submits them on the advisory channel
+    And subsequent FUSE reads in the predicted order benefit from warmed cache (measured via prefetch-effectiveness telemetry)
+
+  Scenario: Client throttles itself on hard backpressure telemetry
+    Given the workflow is subscribed to backpressure telemetry on pool "fast-nvme"
+    When the client receives a backpressure event with severity "hard" and retry_after_ms 250
+    Then the client MAY pause or rate-limit new submissions for ≈ retry_after_ms
+    And correctness of in-flight operations is unaffected (I-WA1)
+    And actual quota enforcement remains the data path's responsibility (I-T2)
+
+  Scenario: Advisory channel outage does not affect FUSE
+    Given a workflow is active with hints and telemetry in flight
+    When the advisory subsystem on the serving node becomes unresponsive
+    Then the client observes advisory_unavailable on future hint submissions
+    And FUSE reads and writes continue at normal latency and durability (I-WA2)
+    And the client falls back to pattern-inference for prefetch decisions (pre-existing behavior)
+    And when advisory recovers, new DeclareWorkflow calls resume
+
+  Scenario: Advisory disabled at workload level — client degrades gracefully
+    Given tenant admin disables Workflow Advisory for "training-run-42"
+    When the client calls kiseki_declare_workflow
+    Then the call returns ADVISORY_DISABLED
+    And the client falls back to pattern-inference for access-pattern heuristics
+    And FUSE reads and writes are fully correct and at normal performance (I-WA12)

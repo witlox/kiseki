@@ -173,3 +173,60 @@ Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
     Then the chunk is written to "fast-nvme" if capacity allows
     And the rebalance continues independently
     And the new chunk is not automatically included in the migration
+
+  # --- Workflow Advisory integration (ADR-020) ---
+  # Chunk Storage acts on affinity / prefetch / dedup-intent / retention-intent
+  # hints and emits locality-class and pool-backpressure telemetry to the
+  # caller. Hints are preferences; placement remains server-authoritative
+  # (I-WA9). Ownership is checked before any telemetry is computed (I-WA6).
+
+  Scenario: Affinity hint preference honoured within policy
+    Given workload "training-run-42" is authorised for pools [fast-nvme, bulk-nvme]
+    And a new chunk is being placed for composition "checkpoint.pt"
+    And the caller has attached hint { affinity_pool: "fast-nvme", colocate_rack: "rack-7" }
+    When the placement engine runs
+    Then the chunk MAY be placed in fast-nvme on rack-7 when durability and retention constraints allow
+    And the engine MAY override the hint to satisfy I-C3 (policy), I-C4 (durability), or I-C2b (retention hold)
+    And hints never cause placement in a pool the workload is not authorised for (I-WA14)
+
+  Scenario: Dedup-intent hint { per-rank } skips dedup path for scratch chunks
+    Given workload "training-run-42" writes per-rank scratch output
+    And the caller attaches hint { dedup_intent: per-rank }
+    When the chunk is presented for storage
+    Then the dedup refcount path is bypassed (no sha256 lookup; new chunk allocated)
+    And the chunk ID is still derived per I-K10 (tenant HMAC if opted out, sha256 otherwise)
+    And subsequent writes of identical plaintext by the same workload do NOT coalesce via dedup (hint honoured)
+    And tenant dedup policy (I-X2) is never violated regardless of hint
+
+  Scenario: Dedup-intent hint { shared-ensemble } uses normal dedup path
+    Given workload "training-run-42" writes ensemble-broadcast input data
+    And the caller attaches hint { dedup_intent: shared-ensemble }
+    When the chunk is presented for storage
+    Then the dedup refcount path is used normally, bounded by I-X2 tenant policy
+    And the hint never enables cross-tenant dedup when tenant policy opts out (I-K10)
+
+  Scenario: Locality-class telemetry for caller-owned chunks
+    Given workload "training-run-42" reads a 1GB composition spanning 64 chunks on mixed placement
+    When the caller requests LocalityTelemetry for the composition
+    Then the response classifies each chunk into one of {local-node, local-rack, same-pool, remote, degraded}
+    And no node ID, rack label, device serial, or pool utilisation metric is returned (I-WA11)
+    And only chunks owned by the caller's workload are included; unauthorised targets return the same shape as absent chunks (I-WA6)
+
+  Scenario: Pool backpressure telemetry uses k-anonymity bucketing under low-k
+    Given pool "fast-nvme" hosts chunks from workload "training-run-42" and three neighbour workloads (k=4 < 5)
+    When the caller subscribes to pool-backpressure telemetry for "fast-nvme"
+    Then the response shape is identical to the populated-k case
+    And neighbour-derived fields carry the fixed sentinel value defined by policy (I-WA5)
+    And no timing or size variation reveals the actual k
+
+  Scenario: Retention-intent hint { temp } informs but cannot shorten a retention hold
+    Given composition "patient-scan.dcm" has a 7-year retention hold
+    And the caller attaches hint { retention_intent: temp } to a new chunk for that composition
+    Then the chunk is placed with GC-urgency-preferred parameters when possible
+    And the retention hold (I-C2b) still blocks GC regardless of the hint (I-WA14)
+
+  Scenario: Repair-degraded read emits telemetry without leaking topology
+    Given a chunk in the caller's composition is being read while EC repair is in progress
+    When the read succeeds from the remaining shards
+    Then a repair-degraded warning telemetry event is emitted to the caller's workflow
+    And the event contains only { composition_id, degraded: true, severity: advisory } — no device, node, or parity-shard identifiers (I-WA11)
