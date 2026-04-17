@@ -56,7 +56,7 @@ Read `.claude/roles/[role].md`. Apply its constraints.
 
 ## Entry point
 
-**Analyst complete, entering architect** (current state): full spec tree produced through analyst interrogation (8 contexts, 51 invariants, 132 scenarios, 20 failure modes, 17 adversarial findings). No code yet. Enter via DESIGN mode with architect role. Architect produces `specs/architecture/` tree (module graph, data structures, API contracts, enforcement map, build phases, ADRs) before implementation begins.
+**Design complete, ready for implementation** (current state): full spec tree (analyst) + architecture (architect) + adversary review + analyst backpass all done. 56 invariants, 132 scenarios, 19 ADRs, 13 build phases. No code yet. Enter via FEATURE mode with implementer role. Start at Phase 0 (kiseki-common + kiseki-proto) per `specs/architecture/build-phases.md`.
 
 ## Escalation paths
 
