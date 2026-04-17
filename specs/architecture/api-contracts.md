@@ -71,7 +71,8 @@ is direct function calls via trait implementations.
 
 | Type | Operation | Caller | Spec reference |
 |---|---|---|---|
-| Command | `DeriveSystemDek(chunk_id, epoch) → dek` | Chunk, Crypto | key-management.feature#SystemDEK |
+| Command | `FetchMasterKey(epoch) → master_key` | Server (startup/rotation) | key-management.feature#SystemDEK |
+| Local | `DeriveSystemDek(chunk_id, epoch) → dek` | kiseki-server (local HKDF, no RPC) | ADR-003, ADV-ARCH-01 |
 | Command | `RotateSystemKey() → new_epoch` | Admin | key-management.feature#SystemKEKRotation |
 | Command | `RotateTenantKey(tenant) → new_epoch` | Tenant Admin | key-management.feature#EpochRotation |
 | Command | `CryptoShred(tenant) → result` | Tenant Admin | key-management.feature#CryptoShred |

@@ -146,7 +146,7 @@ versioning works, refcounts are correct, EXDEV on cross-shard rename.
 ## Phase 8: View Materialization
 
 **Crates**: `kiseki-view`
-**Depends on**: Phase 0, 1, 3, 6, 7
+**Depends on**: Phase 0, 1, 3, 6 (NOT Phase 7 — views read from Log and Chunk, not Composition)
 
 - Stream processor (delta consumption, payload decryption)
 - View lifecycle (create, discard, rebuild)

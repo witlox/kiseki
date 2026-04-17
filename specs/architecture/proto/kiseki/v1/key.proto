@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package kiseki.v1;
+
+import "kiseki/v1/common.proto";
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+// --- Key Manager Service (Rust keyserver, internal network) ---
+// The key manager stores master keys and serves them to authenticated
+// server processes. It NEVER sees individual chunk_ids (ADR-003/ADV-ARCH-01).
+
+service KeyManagerService {
+  // Fetch master key for an epoch. Called at server startup and on rotation.
+  rpc FetchMasterKey(FetchMasterKeyRequest) returns (FetchMasterKeyResponse);
+
+  // Get current epoch.
+  rpc CurrentEpoch(CurrentEpochRequest) returns (CurrentEpochResponse);
+
+  // Rotate system key — creates new epoch.
+  rpc RotateSystemKey(RotateSystemKeyRequest) returns (RotateSystemKeyResponse);
+
+  // Health check.
+  rpc Health(KeyManagerHealthRequest) returns (KeyManagerHealthResponse);
+}
+
+// --- Tenant KMS integration (called by server processes, not keyserver) ---
+
+service TenantKeyService {
+  // Rotate tenant key via tenant KMS.
+  rpc RotateTenantKey(RotateTenantKeyRequest) returns (RotateTenantKeyResponse);
+
+  // Execute crypto-shred — destroy tenant KEK.
+  rpc CryptoShred(CryptoShredRequest) returns (CryptoShredResponse);
+
+  // Trigger full re-encryption (key compromise).
+  rpc FullReEncrypt(FullReEncryptRequest) returns (FullReEncryptResponse);
+
+  // Check tenant KMS reachability.
+  rpc CheckKmsHealth(CheckKmsHealthRequest) returns (CheckKmsHealthResponse);
+}
+
+// --- Messages ---
+
+message FetchMasterKeyRequest {
+  KeyEpoch epoch = 1;
+  // Server authenticates via mTLS; key manager verifies it's a legitimate server.
+}
+
+message FetchMasterKeyResponse {
+  bytes key_material = 1; // 32 bytes, encrypted in transit (TLS)
+  KeyEpoch epoch = 2;
+  string algorithm = 3;
+  DeltaTimestamp created_at = 4;
+}
+
+message CurrentEpochRequest {}
+message CurrentEpochResponse {
+  KeyEpoch current = 1;
+  repeated KeyEpoch retained = 2; // old epochs still valid during rotation
+}
+
+message RotateSystemKeyRequest {
+  string triggered_by = 1;
+}
+
+message RotateSystemKeyResponse {
+  KeyEpoch new_epoch = 1;
+}
+
+message KeyManagerHealthRequest {}
+message KeyManagerHealthResponse {
+  KeyEpoch current_epoch = 1;
+  repeated uint64 raft_members = 2;
+  uint64 leader = 3;
+  bool healthy = 4;
+}
+
+message RotateTenantKeyRequest {
+  OrgId tenant_id = 1;
+  string triggered_by = 2;
+}
+
+message RotateTenantKeyResponse {
+  KeyEpoch new_epoch = 1;
+}
+
+message CryptoShredRequest {
+  OrgId tenant_id = 1;
+  bool force_without_hold_check = 2; // ADR-010
+}
+
+message CryptoShredResponse {
+  bool kek_destroyed = 1;
+  uint64 compositions_affected = 2;
+  uint64 chunks_refcount_decremented = 3;
+  uint64 chunks_gc_eligible = 4;
+  uint64 chunks_held_by_retention = 5;
+  DeltaTimestamp timestamp = 6;
+}
+
+message FullReEncryptRequest {
+  OrgId tenant_id = 1;
+  string reason = 2;
+}
+
+message FullReEncryptResponse {
+  string job_id = 1; // background job tracking
+}
+
+message CheckKmsHealthRequest {
+  OrgId tenant_id = 1;
+}
+
+message CheckKmsHealthResponse {
+  bool reachable = 1;
+  uint64 latency_ms = 2;
+}

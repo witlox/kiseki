@@ -1,0 +1,207 @@
+syntax = "proto3";
+
+package kiseki.v1;
+
+import "kiseki/v1/common.proto";
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+// --- Control Plane Service (Go, management network) ---
+
+service ControlService {
+  // Tenant lifecycle
+  rpc CreateOrganization(CreateOrganizationRequest) returns (CreateOrganizationResponse);
+  rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse);
+  rpc CreateWorkload(CreateWorkloadRequest) returns (CreateWorkloadResponse);
+  rpc GetOrganization(GetOrganizationRequest) returns (Organization);
+  rpc ListOrganizations(ListOrganizationsRequest) returns (ListOrganizationsResponse);
+
+  // Namespace
+  rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse);
+
+  // IAM / zero-trust boundary
+  rpc RequestAccess(AccessRequest) returns (AccessRequestResponse);
+  rpc ApproveAccess(ApproveAccessRequest) returns (ApproveAccessResponse);
+  rpc DenyAccess(DenyAccessRequest) returns (DenyAccessResponse);
+
+  // Policy
+  rpc SetQuota(SetQuotaRequest) returns (SetQuotaResponse);
+  rpc SetComplianceTags(SetComplianceTagsRequest) returns (SetComplianceTagsResponse);
+  rpc SetRetentionHold(SetRetentionHoldRequest) returns (SetRetentionHoldResponse);
+  rpc ReleaseRetentionHold(ReleaseRetentionHoldRequest) returns (ReleaseRetentionHoldResponse);
+
+  // Flavor
+  rpc ListFlavors(ListFlavorsRequest) returns (ListFlavorsResponse);
+  rpc MatchFlavor(MatchFlavorRequest) returns (MatchFlavorResponse);
+
+  // Federation
+  rpc RegisterPeer(RegisterPeerRequest) returns (RegisterPeerResponse);
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+
+  // Maintenance
+  rpc SetMaintenanceMode(SetMaintenanceModeRequest) returns (SetMaintenanceModeResponse);
+}
+
+// --- Messages ---
+
+message Organization {
+  OrgId org_id = 1;
+  string name = 2;
+  repeated ComplianceTag compliance_tags = 3;
+  Quota quota = 4;
+  QuotaUsage usage = 5;
+  DedupPolicy dedup_policy = 6;
+  WallTime created_at = 7;
+}
+
+message CreateOrganizationRequest {
+  string name = 1;
+  repeated ComplianceTag compliance_tags = 2;
+  Quota quota = 3;
+  DedupPolicy dedup_policy = 4;
+}
+
+message CreateOrganizationResponse {
+  OrgId org_id = 1;
+}
+
+message CreateProjectRequest {
+  OrgId org_id = 1;
+  string name = 2;
+  repeated ComplianceTag compliance_tags = 3;
+  Quota quota = 4;
+}
+
+message CreateProjectResponse {
+  ProjectId project_id = 1;
+}
+
+message CreateWorkloadRequest {
+  OrgId org_id = 1;
+  ProjectId project_id = 2; // optional
+  string name = 3;
+  Quota quota = 4;
+}
+
+message CreateWorkloadResponse {
+  WorkloadId workload_id = 1;
+}
+
+message GetOrganizationRequest { OrgId org_id = 1; }
+message ListOrganizationsRequest {}
+message ListOrganizationsResponse { repeated Organization organizations = 1; }
+
+message CreateNamespaceRequest {
+  OrgId org_id = 1;
+  string name = 2;
+  bool versioning_enabled = 3;
+}
+
+message CreateNamespaceResponse {
+  NamespaceId namespace_id = 1;
+  ShardId shard_id = 2;
+}
+
+message AccessRequest {
+  string requester = 1;
+  OrgId tenant_id = 2;
+  oneof scope {
+    NamespaceId namespace = 3;
+    OrgId org = 4;
+  }
+  uint32 duration_hours = 5;
+  AccessLevel access_level = 6;
+}
+
+enum AccessLevel {
+  ACCESS_LEVEL_UNSPECIFIED = 0;
+  ACCESS_LEVEL_READ_ONLY = 1;
+  ACCESS_LEVEL_READ_WRITE = 2;
+}
+
+message AccessRequestResponse { string request_id = 1; }
+message ApproveAccessRequest { string request_id = 1; string approved_by = 2; }
+message ApproveAccessResponse {}
+message DenyAccessRequest { string request_id = 1; string denied_by = 2; string reason = 3; }
+message DenyAccessResponse {}
+
+message SetQuotaRequest {
+  oneof scope {
+    OrgId org_id = 1;
+    WorkloadId workload_id = 2;
+  }
+  Quota quota = 3;
+}
+
+message SetQuotaResponse {}
+
+message SetComplianceTagsRequest {
+  oneof scope {
+    OrgId org_id = 1;
+    NamespaceId namespace_id = 2;
+  }
+  repeated ComplianceTag tags = 3;
+}
+
+message SetComplianceTagsResponse {}
+
+message SetRetentionHoldRequest {
+  string hold_id = 1;
+  oneof scope {
+    OrgId org_id = 2;
+    NamespaceId namespace_id = 3;
+  }
+  uint64 ttl_seconds = 4;
+  string reason = 5;
+}
+
+message SetRetentionHoldResponse {}
+message ReleaseRetentionHoldRequest { string hold_id = 1; }
+message ReleaseRetentionHoldResponse {}
+
+message ListFlavorsRequest {}
+message ListFlavorsResponse {
+  repeated Flavor flavors = 1;
+}
+
+message Flavor {
+  string flavor_id = 1;
+  string name = 2;
+  repeated string protocols = 3;
+  repeated string transports = 4;
+  string topology = 5;
+}
+
+message MatchFlavorRequest { Flavor requested = 1; }
+message MatchFlavorResponse {
+  Flavor provided = 1;
+  repeated string mismatches = 2;
+}
+
+message RegisterPeerRequest {
+  string site_name = 1;
+  string endpoint = 2;
+}
+
+message RegisterPeerResponse { string peer_id = 1; }
+message ListPeersRequest {}
+message ListPeersResponse {
+  repeated FederationPeer peers = 1;
+}
+
+message FederationPeer {
+  string peer_id = 1;
+  string site_name = 2;
+  string endpoint = 3;
+  string status = 4;
+}
+
+message SetMaintenanceModeRequest {
+  oneof scope {
+    ShardId shard_id = 1;
+    bool cluster_wide = 2;
+  }
+  bool enabled = 3;
+}
+
+message SetMaintenanceModeResponse {}

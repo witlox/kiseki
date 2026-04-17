@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package kiseki.v1;
+
+import "kiseki/v1/common.proto";
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+// --- Audit Export Service (Go control plane, tenant VLAN) ---
+
+service AuditExportService {
+  // Stream audit events for a tenant (filtered, coherent).
+  // Delivered on tenant VLAN per I-A2.
+  rpc StreamTenantAudit(StreamTenantAuditRequest) returns (stream AuditEvent);
+
+  // Get audit export configuration.
+  rpc GetAuditConfig(GetAuditConfigRequest) returns (AuditExportConfig);
+
+  // Update audit export configuration.
+  rpc SetAuditConfig(SetAuditConfigRequest) returns (SetAuditConfigResponse);
+}
+
+// --- Messages ---
+
+message AuditEvent {
+  string event_id = 1;
+  DeltaTimestamp timestamp = 2;
+  string event_type = 3;  // key_generation, key_rotation, data_access, etc.
+  string actor = 4;       // tenant admin, cluster admin, system
+  OrgId tenant_id = 5;    // if tenant-scoped
+  string description = 6; // human-readable, no plaintext content
+  map<string, string> metadata = 7; // structured fields
+}
+
+message StreamTenantAuditRequest {
+  OrgId tenant_id = 1;
+  // Start position (for resumption after disconnect)
+  uint64 from_sequence = 2;
+  // Optional: filter by event types
+  repeated string event_type_filter = 3;
+}
+
+message AuditExportConfig {
+  OrgId tenant_id = 1;
+  string export_endpoint = 2;
+  repeated SystemEventFilter system_event_filters = 3;
+}
+
+enum SystemEventFilter {
+  SYSTEM_EVENT_FILTER_UNSPECIFIED = 0;
+  SYSTEM_EVENT_FILTER_SHARD = 1;
+  SYSTEM_EVENT_FILTER_NODE = 2;
+  SYSTEM_EVENT_FILTER_MAINTENANCE = 3;
+  SYSTEM_EVENT_FILTER_SECURITY = 4;
+}
+
+message GetAuditConfigRequest { OrgId tenant_id = 1; }
+
+message SetAuditConfigRequest {
+  AuditExportConfig config = 1;
+}
+
+message SetAuditConfigResponse {}

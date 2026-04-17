@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package kiseki.v1;
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+// --- Identifiers ---
+
+message OrgId { string value = 1; }
+message ProjectId { string value = 1; }
+message WorkloadId { string value = 1; }
+message ShardId { string value = 1; }
+message ChunkId { bytes value = 1; } // 32 bytes (sha256 or HMAC)
+message NamespaceId { string value = 1; }
+message ViewId { string value = 1; }
+message NodeId { uint64 value = 1; }
+
+// --- Time (dual clock model, adapted from taba) ---
+
+message HybridLogicalClock {
+  uint64 physical_ms = 1;
+  uint32 logical = 2;
+  uint64 node_id = 3;
+}
+
+message WallTime {
+  uint64 millis_since_epoch = 1;
+  string timezone = 2;
+}
+
+enum ClockQuality {
+  CLOCK_QUALITY_UNSPECIFIED = 0;
+  CLOCK_QUALITY_NTP = 1;
+  CLOCK_QUALITY_PTP = 2;
+  CLOCK_QUALITY_GPS = 3;
+  CLOCK_QUALITY_UNSYNC = 4;
+}
+
+message DeltaTimestamp {
+  HybridLogicalClock hlc = 1;
+  WallTime wall = 2;
+  ClockQuality quality = 3;
+}
+
+// --- Tenant ---
+
+enum ComplianceTag {
+  COMPLIANCE_TAG_UNSPECIFIED = 0;
+  COMPLIANCE_TAG_HIPAA = 1;
+  COMPLIANCE_TAG_GDPR = 2;
+  COMPLIANCE_TAG_REVFADP = 3;
+  COMPLIANCE_TAG_SWISS_RESIDENCY = 4;
+}
+
+enum DedupPolicy {
+  DEDUP_POLICY_UNSPECIFIED = 0;
+  DEDUP_POLICY_CROSS_TENANT = 1;  // sha256, default
+  DEDUP_POLICY_TENANT_ISOLATED = 2; // HMAC
+}
+
+message Quota {
+  uint64 capacity_bytes = 1;
+  uint64 iops = 2;
+  uint64 metadata_ops_per_sec = 3;
+}
+
+message QuotaUsage {
+  uint64 capacity_bytes = 1;
+  uint64 iops_current = 2;
+  uint64 metadata_ops_current = 3;
+}
+
+// --- Key epoch ---
+
+message KeyEpoch { uint64 value = 1; }

@@ -120,14 +120,31 @@ pub enum KeyAuditEvent {
 
 // --- Trait stubs ---
 
-/// System key manager operations.
+/// System key manager operations (remote — kiseki-keyserver via gRPC).
+/// The key manager stores and serves master keys. It NEVER sees individual
+/// chunk_ids (ADR-003 revised per ADV-ARCH-01).
 pub trait KeyManagerOps {
-    /// Derive a system DEK for a given chunk (HKDF from master key).
-    /// ADR-003: derived, not stored individually.
-    fn derive_system_dek(&self, req: DeriveSystemDekRequest) -> Result<SystemDek, KisekiError>;
+    /// Fetch system master key for an epoch. Called at server startup
+    /// and on epoch rotation. NOT called per-chunk.
+    fn fetch_master_key(&self, epoch: KeyEpoch) -> Result<SystemMasterKey, KisekiError>;
+
+    /// Get current epoch number.
+    fn current_epoch(&self) -> Result<KeyEpoch, KisekiError>;
 
     fn rotate_system_key(&self, req: RotateSystemKeyRequest) -> Result<KeyEpoch, KisekiError>;
     fn key_manager_health(&self) -> Result<KeyManagerState, KisekiError>;
+}
+
+/// Local DEK derivation — runs on kiseki-server, NOT on keyserver.
+/// Master key cached locally (mlock'd). HKDF derives per-chunk DEK.
+/// ADR-003 revised per ADV-ARCH-01.
+pub trait LocalKeyDerivation {
+    /// Derive system DEK locally from cached master key + chunk_id.
+    /// No RPC to key manager. No chunk_id leakage.
+    fn derive_system_dek(&self, chunk_id: &ChunkId, epoch: KeyEpoch) -> Result<SystemDek, KisekiError>;
+
+    /// Refresh cached master key from key manager (on startup, rotation).
+    fn refresh_master_key(&self, epoch: KeyEpoch) -> Result<(), KisekiError>;
 }
 
 /// Tenant KMS integration operations.
