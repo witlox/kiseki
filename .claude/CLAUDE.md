@@ -9,12 +9,14 @@ Engineering guidelines in `.claude/guidelines/` (general, cross-project):
 - `engineering.md` — commits, errors, code org, testing philosophy
 - `rust.md` — Rust tooling, style, clippy, cargo-deny
 - `go.md` — Go tooling, style, golangci-lint
+- `python.md` — Python tooling, ruff, mypy, pytest
 - `ci.md` — CI/CD pipeline structure
 - `docs.md` — documentation requirements
 
 Project-specific coding standards in `.claude/coding/`:
 - `rust.md` — kiseki Rust: unsafe policy, FIPS crypto, traits, BDD
 - `go.md` — kiseki Go: control plane, gRPC boundary, godog
+- `python.md` — kiseki Python: PyO3 bindings, e2e test scripting
 
 ## Pre-commit discipline
 
