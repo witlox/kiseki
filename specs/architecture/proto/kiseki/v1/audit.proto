@@ -25,11 +25,132 @@ service AuditExportService {
 message AuditEvent {
   string event_id = 1;
   DeltaTimestamp timestamp = 2;
-  string event_type = 3;  // key_generation, key_rotation, data_access, etc.
+  string event_type = 3;  // key_generation, key_rotation, data_access, advisory_*, etc.
   string actor = 4;       // tenant admin, cluster admin, system
   OrgId tenant_id = 5;    // if tenant-scoped
   string description = 6; // human-readable, no plaintext content
   map<string, string> metadata = 7; // structured fields
+  // For advisory events, body is set to an AdvisoryAuditBody. Other
+  // event types may set other *_body oneof variants in future.
+  oneof body {
+    AdvisoryAuditBody advisory = 8;
+  }
+}
+
+// ============================================================================
+// Advisory audit events (ADR-020, ADR-021 §9, I-WA8)
+// Emitted by kiseki-advisory onto the tenant audit shard (ADR-009).
+// Cluster-admin exports hash workflow_id and phase_tag (I-A3, I-WA8).
+// Event body and numeric counters are padded/bucketed to a fixed wire
+// size to prevent the existence oracle described in gate-1 finding
+// "PhaseSummary emission size".
+// ============================================================================
+
+message AdvisoryAuditBody {
+  // Opaque correlation — tenant sees raw values, cluster-admin export
+  // replaces workflow_id and phase_tag_hash with hashes (applied at
+  // export time, not at emission).
+  bytes  workflow_id   = 1; // opaque handle
+  bytes  client_id     = 2;
+  uint64 phase_id      = 3;
+  string phase_tag     = 4; // tenant-scoped; hashed on cluster-admin export
+  WorkloadId workload  = 5;
+  ProjectId  project   = 6;
+  OrgId      org       = 7;
+
+  oneof event {
+    DeclareWorkflowEvent          declare_workflow          = 10;
+    EndWorkflowEvent              end_workflow              = 11;
+    PhaseAdvanceEvent             phase_advance             = 12;
+    HintAcceptedAggregateEvent    hint_accepted_aggregate   = 13;
+    HintThrottledAggregateEvent   hint_throttled_aggregate  = 14;
+    HintRejectedEvent             hint_rejected             = 15;
+    TelemetrySubscribedEvent      telemetry_subscribed      = 16;
+    BudgetExceededEvent           budget_exceeded           = 17;
+    AdvisoryStateTransitionEvent  advisory_state_transition = 18;
+    PhaseSummaryEvent             phase_summary             = 19;
+  }
+
+  // Padded to fixed-size bucket (128, 256, 512, 1024) to prevent
+  // emission-size side channels on tenant audit shards.
+  bytes padding = 127;
+}
+
+message DeclareWorkflowEvent {
+  string profile       = 1; // enum name as string, for human-readable audit
+  uint32 ttl_seconds   = 2;
+}
+
+message EndWorkflowEvent {
+  enum Reason {
+    REASON_UNSPECIFIED   = 0;
+    REASON_EXPLICIT_END  = 1;
+    REASON_TTL_EXPIRED   = 2;
+    REASON_ADVISORY_DISABLED = 3;
+    REASON_CERT_REVOKED  = 4;
+  }
+  Reason reason            = 1;
+  uint64 duration_ms       = 2;
+  // Bucketed counts (see ADR-021 §9 on size-padding).
+  uint32 hints_accepted_bucket  = 3;
+  uint32 hints_rejected_bucket  = 4;
+}
+
+message PhaseAdvanceEvent {
+  uint64 from_phase_id = 1;
+  uint64 to_phase_id   = 2;
+  string to_phase_tag  = 3;
+}
+
+message HintAcceptedAggregateEvent {
+  // One aggregate per (hint_kind) per second per workflow. I-WA8.
+  string hint_kind     = 1; // e.g., "access_pattern", "prefetch", "priority"
+  uint32 count         = 2;
+  uint64 window_start_ms = 3;
+  uint32 window_ms     = 4; // always 1000 for the per-second guarantee
+}
+
+message HintThrottledAggregateEvent {
+  string hint_kind           = 1;
+  string rejection_reason    = 2;
+  uint32 count               = 3;
+  uint64 window_start_ms     = 4;
+  uint32 window_ms           = 5;
+}
+
+message HintRejectedEvent {
+  string hint_kind        = 1;
+  string rejection_reason = 2; // matches AdvisoryErrorCode name
+}
+
+message TelemetrySubscribedEvent {
+  repeated string channels = 1; // TelemetryChannel enum names
+}
+
+message BudgetExceededEvent {
+  string budget_kind = 1; // "hints_per_sec", "declare_rate", "prefetch_bytes", ...
+}
+
+message AdvisoryStateTransitionEvent {
+  enum Scope {
+    SCOPE_UNSPECIFIED = 0;
+    SCOPE_CLUSTER     = 1;
+    SCOPE_ORG         = 2;
+    SCOPE_PROJECT     = 3;
+    SCOPE_WORKLOAD    = 4;
+  }
+  Scope  scope       = 1;
+  string from_state  = 2; // "enabled" | "draining" | "disabled"
+  string to_state    = 3;
+  string initiator   = 4; // "cluster_admin" | "tenant_admin"
+}
+
+message PhaseSummaryEvent {
+  uint64 from_phase_id         = 1;
+  uint64 to_phase_id           = 2;
+  uint32 total_hints_accepted_bucket  = 3; // log2 bucket, not exact
+  uint32 total_hints_rejected_bucket  = 4;
+  uint32 duration_ms_bucket    = 5;
 }
 
 message StreamTenantAuditRequest {

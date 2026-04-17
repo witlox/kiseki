@@ -161,3 +161,43 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     Then the operation returns EXDEV
     And the caller handles via copy + delete
     And no 2PC or cross-shard coordination occurs
+
+  # --- Workflow Advisory integration (ADR-020) ---
+  # Composition acts on collective-announcement and retention-intent hints,
+  # and emits caller-scoped refcount/version activity telemetry. Hints
+  # never relax namespace, tenant, or retention boundaries (I-WA14).
+
+  Scenario: Collective checkpoint announcement pre-allocates write-absorb
+    Given workload "training-run-42" is in phase "checkpoint" with profile hpc-checkpoint
+    And the caller submits hint { collective: { ranks: 1024, bytes_per_rank: 4GB, deadline: now+120s } }
+    When the Composition context forwards the hint to placement and the Log
+    Then write-absorb capacity MAY be pre-warmed in the target pool within tenant quota
+    And the announcement is advisory — checkpoint writes succeed even if no warm-up occurred (I-WA1)
+    And no capacity is reserved in a way that starves other tenants of their quota (I-T2)
+
+  Scenario: Retention-intent { final } informs refcount behavior during multipart finalize
+    Given a multipart upload for composition "checkpoint-final.pt" is in progress
+    And the caller attaches hint { retention_intent: final } at finalize
+    Then the finalize delta is processed normally (chunks confirmed durable before visibility, I-L5)
+    And the hint MAY bias background GC urgency for parts not included in the final composition
+    And it does NOT change refcount semantics (I-C2) or ordering guarantees (I-L5)
+
+  Scenario: Caller-scoped refcount activity telemetry
+    Given workload "training-run-42" performs rapid creates/updates on compositions in namespace "trials"
+    When the caller subscribes to refcount-activity telemetry
+    Then per-workflow rates are emitted in bucketed values (e.g., creates/sec, versions/sec)
+    And only activity attributable to the caller's workflow is included (I-WA5)
+    And no neighbour workload's activity in the same namespace is inferable
+
+  Scenario: Hint cannot enable cross-namespace composition creation
+    Given workload "training-run-42" is authorised for namespace "trials" only
+    When the caller submits a create-composition request for namespace "archive" (not authorised) carrying hint { priority: batch }
+    Then the request is rejected with the same error it would return without any hint
+    And the hint has no effect on authorisation (I-WA14)
+
+  Scenario: Advisory disabled — composition path unaffected
+    Given tenant admin transitions "training-run-42" advisory to disabled
+    When the workload creates, updates, and finalizes compositions
+    Then all create/update/multipart/finalize operations succeed with full correctness
+    And no advisory-dependent behavior (write-absorb preallocation, retention-intent biasing) is applied
+    And refcount, delta ordering, and chunk durability guarantees are unchanged (I-WA2)

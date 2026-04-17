@@ -105,3 +105,30 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     When the gateway "gw-s3-pharma" validates the signature
     Then the access key is resolved to a tenant + workload identity
     And the request is authorized against the tenant's policy
+
+  # --- Workflow Advisory authorization (ADR-020) ---
+  # The advisory channel uses the same mTLS tenant certificate as the
+  # data path, and re-validates identity per operation — not just at
+  # stream establishment (I-WA3).
+
+  Scenario: mTLS identity re-validated per advisory operation
+    Given a native client under workload "training-run-42" has an active bidi advisory stream
+    And the stream was established using certificate "tenant-cert-v1"
+    When the client submits a hint on the stream
+    Then the advisory subsystem re-validates "tenant-cert-v1" for the owning workload before acting (I-WA3)
+    And the hint is accepted if and only if the cert is currently valid for that workload
+
+  Scenario: Advisory stream torn down on certificate revocation
+    Given a workflow is active on a long-lived bidi advisory stream under cert "tenant-cert-v1"
+    When the Cluster CA revokes "tenant-cert-v1" (e.g., rotation, compromise)
+    Then within a bounded detection interval the advisory subsystem detects the revocation
+    And tears the stream down with a clear error ("cert_revoked")
+    And pre-revocation in-flight hints accepted before the detection point remain valid (they were advisory only, I-WA1)
+    And the next advisory operation requires a fresh, valid cert
+
+  Scenario: Workflow_id is a capability reference, mTLS is the authority
+    Given workload "inference-svc-9" has somehow obtained a workflow_id belonging to "training-run-42"
+    When "inference-svc-9" presents its own valid mTLS cert and the stolen workflow_id on the advisory channel
+    Then the advisory subsystem rejects the operation with "workflow_not_found_in_scope" (I-WA3, I-WA10)
+    And the error shape and latency distribution are identical to those for a never-issued workflow_id (I-WA6)
+    And no information about "training-run-42"'s workflow state is revealed

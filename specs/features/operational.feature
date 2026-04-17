@@ -239,3 +239,54 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     When both write latencies are measured
     Then the dedup hit is NOT observably faster (optional: random delay normalizes timing)
     And an external observer cannot distinguish new-write from dedup-hit by timing
+
+  # --- Workflow Advisory operational signals (ADR-020) ---
+  # Operational observability covers the ADVISORY SUBSYSTEM itself from
+  # the operator's perspective: its own health, its audit event flow,
+  # and its side-by-side isolation from the data path. Client-facing
+  # telemetry flows are spec'd in workflow-advisory.feature and the
+  # per-context files.
+
+  Scenario: Advisory subsystem health reported to cluster admin
+    Given the advisory subsystem is running on all storage nodes
+    When the cluster admin queries operational metrics (per ADR-015)
+    Then advisory-specific metrics are exposed, tenant-anonymized:
+      | metric                           | cardinality        |
+      | advisory_active_workflows_total  | cluster aggregate  |
+      | advisory_hints_accepted_total    | cluster aggregate  |
+      | advisory_hints_rejected_total    | by reason, aggregate |
+      | advisory_hints_throttled_total   | cluster aggregate  |
+      | advisory_channel_latency_p99_ms  | cluster aggregate  |
+      | advisory_audit_write_rate        | cluster aggregate  |
+      | advisory_state_by_scope          | enabled/draining/disabled counts |
+    And workflow_id, phase_tag, and workload_id appear only as opaque hashes (I-A3, I-WA8)
+    And no metric label has unbounded cardinality
+
+  Scenario: Advisory audit event volume and batching visible to operators
+    Given the cluster sustains high advisory-hint traffic
+    When the advisory audit emitter applies I-WA8 batching for hint-accepted and hint-throttled events
+    Then the operator metric `advisory_audit_batching_ratio` exposes the ratio of batched:emitted events cluster-wide
+    And per-tenant lifecycle events (declare, end, phase-advance, policy-violation) remain per-occurrence
+    And the per-second per-(workflow_id, reason) sampling guarantee is visible in the audit shard
+
+  Scenario: Advisory audit growth triggers I-A5 safety valve if stalled
+    Given advisory audit events on a tenant's audit shard have stalled (consumer behind by >24h)
+    When the audit safety valve (I-A5) engages
+    Then delta GC proceeds with a documented gap for that tenant
+    And an operational alert is raised to cluster admin and tenant admin
+    And the advisory subsystem continues to emit new events (rate-limited per I-WA8)
+
+  Scenario: Advisory subsystem isolation verified operationally
+    Given synthetic load drives the advisory subsystem to 100% of its runtime capacity
+    When data-path operations continue in parallel
+    Then data-path p50 / p99 / p999 latencies remain within their published SLOs (I-WA2)
+    And the operational metric `data_path_blocked_on_advisory_total` remains 0
+    And if the metric ever rises above 0, a P0 alert fires and the advisory subsystem is candidate for circuit-break
+
+  Scenario: Advisory subsystem outage F-ADV-1 — operator-visible state
+    Given the advisory subsystem on one node becomes unresponsive (F-ADV-1)
+    When operational health checks run
+    Then `advisory_health_status` for that node reports "unhealthy"
+    And `data_path_health_status` for that node remains "healthy"
+    And cluster admin is alerted to restart the advisory runtime
+    And no tenant data-path operation records any failure attributable to this outage

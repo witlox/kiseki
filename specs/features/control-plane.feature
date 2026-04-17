@@ -220,3 +220,86 @@ Feature: Control Plane — Tenancy, IAM, policy, placement, federation
     Then quotas are enforced using last-known cached values
     And actual usage may drift slightly from quota during outage
     And reconciliation occurs when Control Plane recovers
+
+  # --- Workflow Advisory policy (ADR-020) ---
+  # Control Plane owns profile allow-lists, hint budgets, and advisory
+  # opt-out state. Policy inherits org → project → workload with each
+  # level narrowing (never broadening) its parent. Data path is never
+  # affected by policy changes here (I-WA2, I-WA18).
+
+  Scenario: Cluster admin defines cluster-wide hint-budget ceilings
+    Given cluster admin "admin-ops" sets cluster-wide Workflow Advisory ceilings:
+      | field                   | value |
+      | hints_per_sec           | 1000  |
+      | concurrent_workflows    | 64    |
+      | telemetry_subscribers   | 16    |
+      | declared_prefetch_bytes | 256GB |
+      | workflow_declares_per_sec | 20  |
+    Then these values are enforced as upper bounds for all org-level settings
+    And any attempt by a tenant admin to exceed them is rejected with "exceeds_cluster_ceiling"
+    And the change is recorded in the cluster audit trail
+
+  Scenario: Org-level profile allow-list narrows per project and workload
+    Given tenant admin "pharma-admin" for "org-pharma" sets allowed profiles [ai-training, ai-inference, hpc-checkpoint, batch-etl]
+    And project "clinical-trials" admin narrows allowed profiles to [ai-training, hpc-checkpoint]
+    And workload "training-run-42" under "clinical-trials" declares allowed profiles [ai-training]
+    Then the effective allowed profiles for "training-run-42" are the intersection = [ai-training]
+    And a child scope cannot add a profile not present in its parent; such an attempt is rejected with "profile_not_in_parent"
+
+  Scenario: Workload budget cannot exceed project ceiling
+    Given project "clinical-trials" ceiling sets hints_per_sec 300
+    When tenant admin attempts to set workload "training-run-42" hints_per_sec 500
+    Then the update is rejected with "child_exceeds_parent_ceiling"
+    And the workload's effective budget remains its last-valid value
+    And the rejected change is audited
+
+  Scenario: Tenant admin disables Workflow Advisory for a workload — three-state transition
+    Given "training-run-42" has Workflow Advisory enabled with 2 active workflows
+    When tenant admin transitions advisory state to "draining"
+    Then new DeclareWorkflow calls from "training-run-42" clients return ADVISORY_DISABLED
+    And the 2 active workflows continue accepting hints within their current phases
+    And when each active workflow ends or TTLs, it is audit-ended
+    When the tenant admin subsequently transitions draining → disabled
+    Then all hint processing ends, active telemetry subscriptions close
+    And data-path operations remain fully correct throughout (I-WA12)
+
+  Scenario: Cluster admin disables Workflow Advisory cluster-wide during incident
+    Given a suspected advisory-subsystem issue
+    When cluster admin transitions cluster-wide state directly to "disabled"
+    Then all tenants observe ADVISORY_DISABLED on new DeclareWorkflow calls
+    And active workflows across tenants are audit-ended
+    And no data-path operation is blocked, slowed, or fails (I-WA2)
+    And the cluster-wide transition is recorded in the cluster audit trail
+
+  Scenario: Advisory policy changes apply prospectively to existing workflows
+    Given workflow "wf-abc" is active in phase "compute" under profile ai-training
+    When tenant admin removes "ai-training" from the workload's allow-list
+    Then "wf-abc" continues its current phase under the policy effective at DeclareWorkflow (I-WA18)
+    And the next PhaseAdvance is rejected with "profile_revoked" and the workflow remains on its current phase
+    And budget reductions take effect prospectively from the next second
+
+  Scenario: Tenant audit export includes advisory events
+    Given tenant admin "pharma-admin" retrieves the tenant audit export for the last 24h
+    When the export is generated
+    Then it includes advisory-audit events: declare-workflow, end-workflow, phase-advance, policy-violation rejections, budget-exceeded, and (batched per I-WA8) hint-accepted and hint-throttled aggregates
+    And each event carries the (org, project, workload, client_id, workflow_id, phase_id, reason) correlation
+    And cluster-admin exports over the same window see workflow_id and phase_tag as opaque hashes only (I-A3, I-WA8)
+
+  Scenario: Federation does NOT replicate advisory state
+    Given "org-pharma" is federated across two sites with async config replication
+    When a workflow is declared at site A
+    Then the workflow handle and in-memory state are local to site A
+    And no workflow_id is replicated to site B
+    And profile allow-lists, hint budgets, and opt-out state (which are config) ARE replicated async
+    And the advisory subsystem is independent per site
+
+  Scenario: Workload pool authorization produces tenant-chosen labels
+    Given tenant admin authorises workload "training-run-42" for pools with labels:
+      | opaque_label | cluster_internal_pool |
+      | fast-nvme    | pool-0af7             |
+      | bulk-nvme    | pool-921c             |
+    When the advisory subsystem mints pool handles at a DeclareWorkflow call
+    Then each call returns a fresh 128-bit handle per authorised pool
+    And the tenant-chosen `opaque_label` is returned alongside each handle
+    And the cluster-internal pool ID is never included in any response to the caller (I-WA11, I-WA19)
+    And two workflows under the same workload receive distinct handles mapping to the same internal pool

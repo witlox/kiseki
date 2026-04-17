@@ -115,3 +115,60 @@ No generic errors. No silent swallowing.
 | `AccessRequestPending` | Retriable | Waiting for tenant admin approval | I-T4 |
 | `FederationPeerUnreachable` | Retriable | Cross-site sync failure | F-O3 |
 | `FlavorUnavailable` | Permanent | No matching cluster capability | - |
+| `ChildExceedsParentCeiling` | Permanent | Workload/project budget > parent ceiling | I-WA7 |
+| `ProfileNotInParent` | Permanent | Child allow-list adds a profile absent from parent | I-WA7 |
+
+### kiseki-advisory
+
+Every advisory error is **scoped to the caller's own operation**. On
+scope-violation paths, the canonical `ScopeNotFound` is returned with
+identical response shape, payload size, and latency distribution as a
+genuinely absent target (I-WA6, ADR-021 §8). Internal audit records
+carry the true reason (I-WA8).
+
+| Error | Category | Trigger | Spec |
+|---|---|---|---|
+| `AdvisoryDisabled` | Retriable | Scope is in `disabled` or `draining` state | I-WA12 |
+| `AdvisoryUnavailable` | Retriable | Advisory runtime overloaded or restarting | I-WA2, F-ADV-1 |
+| `ProfileNotAllowed` | Permanent | Profile not in effective allow-list at DeclareWorkflow | I-WA7 |
+| `PriorityNotAllowed` | Permanent | Priority class exceeds policy-allowed maximum | I-WA14 |
+| `RetentionPolicyConflict` | Permanent | `retention: temp` against composition with active retention hold | I-WA14 |
+| `BudgetExceeded` | Retriable | Workload exceeded hints/sec, concurrent_workflows, telemetry_subscribers, or declared_prefetch_bytes | I-WA7 |
+| `DeclareRateExceeded` | Retriable | DeclareWorkflow rate exceeded `workflow_declares_per_sec` | I-WA17 |
+| `HintTooLarge` | Permanent | PrefetchHint tuple count > max_prefetch_tuples_per_hint, or other hint > 4 KiB | I-WA16 |
+| `PrefetchBudgetExceeded` | Retriable | Aggregate declared prefetch bytes > budget | I-WA16, I-WA7 |
+| `ForbiddenTargetField` | Permanent | Hint references a forbidden target field (shard, log position, chunk, dedup hash, node, device, rack) | I-WA11 |
+| `PhaseNotMonotonic` | Permanent | `next_phase_id` ≤ current; or concurrent CAS lost | I-WA13 |
+| `ProfileRevoked` | Permanent | Next PhaseAdvance after the profile was removed from allow-list | I-WA18 |
+| `PriorityRevoked` | Permanent | Next PhaseAdvance after the priority class was disallowed | I-WA18 |
+| `CertRevoked` | Security | mTLS cert revoked mid-stream | I-WA3, I-Auth1 |
+| `ScopeNotFound` | Security | Caller is not authorized for the target, OR target does not exist (unified) | I-WA3, I-WA6 |
+
+**Note on `AdvisoryUnavailable`**: this code is returned on the advisory
+control path only (DeclareWorkflow, hints, subscriptions). It NEVER
+propagates onto the data path — an `AdvisoryLookup::lookup()` timing
+out or seeing advisory unavailable returns `None`, not an error
+(ADR-021 §3, I-WA2).
+
+**Note on `ScopeNotFound` canonicalization**: cross-tenant, cross-
+workload, stolen-workflow_id, typo-in-composition_id, and
+never-existed-composition_id all return this code. The human-readable
+message is a constant (`"scope not found"`); any variation would be a
+covert-channel (I-WA15). Internal audit records distinguish the causes
+for forensic use.
+
+**gRPC status code binding**: `WorkflowAdvisoryService` MUST map every
+`AdvisoryErrorCode::SCOPE_NOT_FOUND` to gRPC status `NOT_FOUND`
+(code 5). Using `PERMISSION_DENIED` (7) or `UNAUTHENTICATED` (16) for
+authorization failures would leak the distinction through gRPC
+trailers. Enforced by a Phase 11.5 integration test that compares
+gRPC status code distributions across authorized-absent and
+unauthorized-existing cases (ADR-021 §8). Full status-code mapping:
+
+| Error | gRPC status |
+|---|---|
+| `AdvisoryDisabled`, `AdvisoryUnavailable` | `UNAVAILABLE` (14) |
+| `ProfileNotAllowed`, `PriorityNotAllowed`, `RetentionPolicyConflict`, `HintTooLarge`, `ForbiddenTargetField`, `PhaseNotMonotonic`, `ProfileRevoked`, `PriorityRevoked` | `FAILED_PRECONDITION` (9) |
+| `BudgetExceeded`, `DeclareRateExceeded`, `PrefetchBudgetExceeded` | `RESOURCE_EXHAUSTED` (8) |
+| `CertRevoked` | `UNAUTHENTICATED` (16) — but the stream is torn down first; no per-message mapping |
+| `ScopeNotFound` | `NOT_FOUND` (5) — ALWAYS, regardless of underlying cause |

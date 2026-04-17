@@ -297,6 +297,65 @@ continues (log, chunks, views keep working with last-known config).
 
 ---
 
+## Cross-cutting concerns
+
+### Workflow Advisory and Client Telemetry
+
+**Not a bounded context.** A cross-cutting concern threaded through Native
+Client, Protocol Gateway, Composition, Chunk Storage, View Materialization,
+Log, and Control Plane. Carries two distinct flows over a single advisory
+channel per declared workflow:
+
+- **Hints** (client → storage, inbound): advisory information about the
+  client's intended or current behavior. Never authoritative. May be
+  ignored, throttled, or rejected without affecting the correctness of
+  the operations they describe.
+- **Telemetry feedback** (storage → client, outbound): signals about the
+  state of resources the client is currently using (backpressure,
+  saturation, materialization lag, locality class, prefetch effectiveness,
+  QoS headroom). Scoped strictly to the caller's own authorization scope.
+
+**Correlation identity** (attached to every data-path operation when a
+workflow is active):
+
+```
+(org_id, project_id?, workload_id, client_id, workflow_id, phase_id)
+```
+
+`client_id` is pinned to a native-client process. `workflow_id` is opaque,
+tenant-scoped, and unique within its workload. `phase_id` is monotonic
+within a workflow.
+
+**Tenant-hierarchy scoping**: hint budgets, profile allow-lists, and
+telemetry-exposure policy inherit org → project → workload, with each
+level narrowing (never broadening) its parent. The workflow itself lives
+strictly within one workload; a workflow never crosses workloads.
+
+**Trust boundary**: the advisory channel runs on the data fabric under the
+same mTLS tenant certificate as the rest of the data path (I-Auth1).
+Hints are attributed to the authenticated workload; no impersonation,
+no cross-tenant hint targeting.
+
+**Touchpoints per context**:
+
+| Context | Inbound hint it acts on | Outbound telemetry it emits |
+|---|---|---|
+| Native Client | (originates hints) | (consumes telemetry for local steering) |
+| Protocol Gateway | priority class, access pattern, deadline | request-level backpressure, QoS headroom |
+| Composition | write-absorb preallocation (collective checkpoint), retention intent | caller-scoped refcount/version activity |
+| Chunk Storage | affinity preference, prefetch range, dedup intent, retention intent | placement locality class (caller-owned chunks only), pool backpressure, repair-degraded warning |
+| View Materialization | prefetch range, access pattern, phase marker | materialization lag (caller's views only), staleness against compliance floor, pin headroom |
+| Log | (none direct — phase marker informs shard-side heuristics only advisorily) | shard-level saturation (caller-scoped) |
+| Key Management | (none — advisory path never carries key material) | (none — key state never exposed via telemetry) |
+| Control Plane | profile allow-lists, budget definitions, compliance interactions | (none to clients; exposes admin-side aggregates per ADR-015) |
+
+**Key structural invariant** (enforced architecturally): the advisory path
+is **side-by-side, not in-band**, with the correctness-critical data path.
+A failure, outage, or overload of the advisory subsystem never blocks,
+delays, or corrupts a data-path operation. See I-WA1 / I-WA2 in invariants.
+
+---
+
 ## Cross-context relationships (summary)
 
 | Producer | Consumer | What flows |
@@ -308,6 +367,9 @@ continues (log, chunks, views keep working with last-known config).
 | Key Management | Protocol Gateway, Native Client | Tenant KEK (wrapping) |
 | View Materialization | Protocol Gateway, Native Client | Materialized view state |
 | Chunk Storage | View Materialization, Native Client | Chunk data (encrypted) |
+| Native Client | Advisory Channel → all contexts | Workflow advisory hints (advisory only) |
+| Chunk / View / Composition / Log / Gateway | Advisory Channel → Native Client | Caller-scoped telemetry feedback |
+| Control Plane | Advisory Channel (all contexts) | Profile allow-lists, hint budgets, compliance-gated advisory policy |
 
 ---
 
