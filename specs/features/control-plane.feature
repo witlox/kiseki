@@ -292,3 +292,14 @@ Feature: Control Plane — Tenancy, IAM, policy, placement, federation
     And no workflow_id is replicated to site B
     And profile allow-lists, hint budgets, and opt-out state (which are config) ARE replicated async
     And the advisory subsystem is independent per site
+
+  Scenario: Workload pool authorization produces tenant-chosen labels
+    Given tenant admin authorises workload "training-run-42" for pools with labels:
+      | opaque_label | cluster_internal_pool |
+      | fast-nvme    | pool-0af7             |
+      | bulk-nvme    | pool-921c             |
+    When the advisory subsystem mints pool handles at a DeclareWorkflow call
+    Then each call returns a fresh 128-bit handle per authorised pool
+    And the tenant-chosen `opaque_label` is returned alongside each handle
+    And the cluster-internal pool ID is never included in any response to the caller (I-WA11, I-WA19)
+    And two workflows under the same workload receive distinct handles mapping to the same internal pool

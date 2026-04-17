@@ -132,7 +132,7 @@ kiseki-gateway-nfs  kiseki-gateway-s3
 - `kiseki-gateway-s3` depends on `kiseki-common` + `kiseki-view` + `kiseki-composition` + `kiseki-crypto`
 - `kiseki-client` depends on `kiseki-common` + `kiseki-view` + `kiseki-composition` + `kiseki-chunk` + `kiseki-crypto` + `kiseki-transport`
 - `kiseki-proto` depends on nothing (generated code)
-- `kiseki-advisory` depends on `kiseki-common` + `kiseki-audit` + `kiseki-proto`. Notably: **no data-path crate depends on `kiseki-advisory`** (ADR-021 §1). Shared advisory domain types (`WorkflowRef`, `OperationAdvisory`, the hint enums) live in `kiseki-common` and are passed by value to data-path operations. The advisory runtime is wired at the `kiseki-server` binary level only.
+- `kiseki-advisory` depends on `kiseki-common` + `kiseki-audit` + `kiseki-proto`. Notably: **no data-path crate depends on `kiseki-advisory`** (ADR-021 §1). Shared advisory domain types (`WorkflowRef`, `OperationAdvisory`, the hint enums, **`PoolHandle` and `PoolDescriptor`**) live in `kiseki-common` and are passed by value to data-path operations. `PoolHandle` is an opaque 16-byte tenant-scoped token — the cluster-internal `AffinityPoolId` stays in `kiseki-chunk` and is translated by `kiseki-advisory` when a hint is consumed, preserving the no-cycle rule. The advisory runtime is wired at the `kiseki-server` binary level only.
 
 **Cross-language boundary**: `kiseki-proto` (Rust) ↔ `control/proto/` (Go) via gRPC. No direct Rust↔Go FFI for control plane.
 

@@ -56,12 +56,45 @@ runtime wiring happens only in the `kiseki-server` binary.
 
 When a data-path request arrives carrying a `workflow_ref` header:
 
-1. The data-path RPC handler extracts `workflow_ref` and passes it
-   to the data-path operation as part of `OperationAdvisory`.
-2. The data-path code may, synchronously and fallibly, call
-   `AdvisoryOps::lookup(workflow_ref) -> Option<OperationAdvisory>`
+### 3.a Header mechanism
+
+The `workflow_ref` is carried as a **gRPC metadata entry**, not as a
+protobuf field on any data-path message. Concrete binding:
+
+- Metadata key: `x-kiseki-workflow-ref-bin` (binary metadata, per
+  gRPC convention for raw-bytes values)
+- Metadata value: the raw 16-byte `WorkflowRef` handle
+- All data-path protos remain **unchanged** — this is the
+  structural payoff that makes I-WA2 tractable (data-path code
+  stays advisory-unaware).
+- A gRPC interceptor in `kiseki-server` lifts the header into a
+  request-scoped context at ingress. The context is accessed by
+  each data-path handler through a small `kiseki-common` helper
+  (`CurrentAdvisory::from_request_context()`), which returns an
+  `Option<OperationAdvisory>` by calling `AdvisoryLookup::lookup_fast`.
+- For intra-Rust calls (e.g., native client's native API path),
+  the same helper reads from a task-local set by the caller. The
+  native client's `WorkflowSession` handle scopes this automatically.
+- For external protocols (NFS, S3) the HTTP-level header is
+  `x-kiseki-workflow-ref` (plain, hex-encoded), translated by the
+  protocol gateway into the gRPC binary metadata entry
+  `x-kiseki-workflow-ref-bin` before forwarding to any internal
+  gRPC service. This keeps external clients unaware of gRPC
+  conventions.
+- No data-path proto file contains `workflow_ref`. Any future
+  attempt to add it is rejected at architecture review.
+
+1. The `kiseki-server` gRPC interceptor extracts `workflow_ref` and
+   stores it in the request context.
+2. The data-path operation (e.g., `WriteChunk`) optionally consults
+   `CurrentAdvisory::from_request_context()` to obtain an
+   `Option<OperationAdvisory>`.
+3. The data-path code may, synchronously and fallibly, call
+   `AdvisoryLookup::lookup_fast(workflow_ref) -> Option<OperationAdvisory>`
    with a strict bounded deadline (≤ 500 µs, configurable, default
-   200 µs).
+   200 µs). The method name carries the contract: implementations
+   MUST NOT block, allocate on the happy path, or call non-O(1)
+   functions.
 3. On timeout, unavailability, or cache miss the lookup returns
    `None`. The data-path code proceeds exactly as it would for an
    operation without any `workflow_ref`.
@@ -145,6 +178,15 @@ Bucket function: fixed set `{ok, soft, hard}` for severity,
   scope violation returns the `SCOPE_NOT_FOUND` code with the same
   message payload, regardless of whether the cause was "unauthorized"
   or "absent". Internal audit records carry the true reason.
+- **gRPC status code**: `WorkflowAdvisoryService` MUST return gRPC
+  status `NOT_FOUND` (code 5) for every `SCOPE_NOT_FOUND` case. Using
+  `PERMISSION_DENIED` (code 7) or `UNAUTHENTICATED` (code 16) on
+  authorization failures would leak the distinction via the gRPC
+  trailers, defeating the canonicalization above. All gRPC clients
+  and middleware expose the status code, so this is not a
+  "docs-only" rule — it is enforced by an integration test at
+  Phase 11.5 exit that compares status-code distributions across
+  authorized-absent and unauthorized-existing cases.
 
 ### 9. Phase-history compaction format
 
@@ -187,6 +229,41 @@ records in audit history.
    I-WA11 (target-field restriction) and I-WA16 (size cap)
    harder to enforce. Centralizing in `kiseki-advisory` and passing
    an already-validated bundle simplifies data-path code.
+
+### 10. Schema versioning
+
+`advisory.proto` ships as `kiseki.v1`. Forward-evolution rules:
+
+- **Additions** (new fields, new oneof variants, new enum values)
+  stay within `v1`. Unknown fields are preserved by gRPC clients.
+- **Deprecations** mark fields with `reserved` after one minor
+  release; old clients continue to work.
+- **Breaking changes** (semantic change of a field, required
+  removal) move to `v2` with a deprecation window ≥ 2 releases in
+  which both versions are served.
+- Advisory-policy changes in the control plane (profile allow-list
+  additions, budget changes) are config, not schema — no version
+  bump needed.
+
+### 11. Padding to bucket size
+
+`AdvisoryError.padding`, `AdvisoryServerMessage.padding`,
+`TelemetryEvent.padding`, `WorkflowStatus.padding`, and
+`AdvisoryAuditBody.padding` carry the variable bytes needed to hit
+one of the bucket sizes {128, 256, 512, 1024, 2048 for audit bodies}.
+Computation at emit time:
+
+```
+serialized_size = serialize(rest_of_message).len();
+target_bucket   = smallest bucket >= serialized_size + padding_overhead;
+padding_len     = target_bucket - serialized_size - varint_overhead(target_bucket);
+```
+
+`varint_overhead(N)` accounts for the two-byte (tag + length-varint)
+prefix of the padding field; standard protobuf wire format.
+Implementations MUST use the `kiseki-advisory::emit_bucketed_response`
+helper. Property test at Phase 11.5 exit: every response on
+`WorkflowAdvisoryService` is exactly one of the bucket sizes.
 
 ## Consequences
 

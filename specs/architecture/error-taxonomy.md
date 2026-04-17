@@ -156,3 +156,19 @@ never-existed-composition_id all return this code. The human-readable
 message is a constant (`"scope not found"`); any variation would be a
 covert-channel (I-WA15). Internal audit records distinguish the causes
 for forensic use.
+
+**gRPC status code binding**: `WorkflowAdvisoryService` MUST map every
+`AdvisoryErrorCode::SCOPE_NOT_FOUND` to gRPC status `NOT_FOUND`
+(code 5). Using `PERMISSION_DENIED` (7) or `UNAUTHENTICATED` (16) for
+authorization failures would leak the distinction through gRPC
+trailers. Enforced by a Phase 11.5 integration test that compares
+gRPC status code distributions across authorized-absent and
+unauthorized-existing cases (ADR-021 §8). Full status-code mapping:
+
+| Error | gRPC status |
+|---|---|
+| `AdvisoryDisabled`, `AdvisoryUnavailable` | `UNAVAILABLE` (14) |
+| `ProfileNotAllowed`, `PriorityNotAllowed`, `RetentionPolicyConflict`, `HintTooLarge`, `ForbiddenTargetField`, `PhaseNotMonotonic`, `ProfileRevoked`, `PriorityRevoked` | `FAILED_PRECONDITION` (9) |
+| `BudgetExceeded`, `DeclareRateExceeded`, `PrefetchBudgetExceeded` | `RESOURCE_EXHAUSTED` (8) |
+| `CertRevoked` | `UNAUTHENTICATED` (16) — but the stream is torn down first; no per-message mapping |
+| `ScopeNotFound` | `NOT_FOUND` (5) — ALWAYS, regardless of underlying cause |

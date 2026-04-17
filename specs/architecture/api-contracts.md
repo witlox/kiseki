@@ -183,3 +183,19 @@ Hints are consumed via read-only access through `AdvisoryLookup`
 (ADR-021 §3). A failed or timed-out lookup returns `None`, at which
 point the data path proceeds with its no-advisory code path, which is
 required to be byte-for-byte equivalent in outcome (I-WA1 property).
+
+### `workflow_ref` header binding on data-path RPCs
+
+The `workflow_ref` is carried as a **gRPC binary metadata entry**:
+
+| Metadata key | `x-kiseki-workflow-ref-bin` |
+|---|---|
+| Value | 16 raw bytes (the `WorkflowRef` handle) |
+| Scope | Every data-path RPC (chunk, composition, log, view, gateway) |
+| Parsing | `kiseki-server` ingress interceptor lifts into request context |
+| Proto impact | Zero — data-path protos are unchanged (ADR-021 §3.a) |
+| Intra-Rust path | Same value via `CurrentAdvisory` task-local set by caller |
+
+Any proposal to add a `workflow_ref` field to a data-path protobuf
+message is rejected at architecture review — the header is the only
+supported carrier, to preserve I-WA2 isolation.

@@ -336,6 +336,33 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And no ownership check or side effect occurs
     And an advisory-audit event is written
 
+  Scenario: DeclareWorkflow returns authorized pool handles (I-WA19)
+    Given workload "training-run-42" is authorised for pools with tenant-chosen labels ["fast-nvme", "bulk-nvme"]
+    When the client calls DeclareWorkflow with profile ai-training
+    Then the response carries an opaque 128-bit workflow handle
+    And an `available_pools` list containing one descriptor per authorized pool:
+      | field        | shape                                         |
+      | handle       | opaque 128-bit value, distinct per workflow   |
+      | opaque_label | "fast-nvme" / "bulk-nvme" (tenant-chosen)      |
+    And subsequent AffinityHint or PrefetchHint submissions MUST reference one of these handles
+    And a handle not in this set is rejected with "scope_not_found" (I-WA6)
+
+  Scenario: Policy narrowing revokes active telemetry subscriptions (I-WA18)
+    Given workflow "wf-abc" holds a telemetry subscription on pool handle "ph-fast"
+    When tenant admin narrows policy so the workload is no longer authorised for the pool underlying "ph-fast"
+    Then a terminal StreamWarning { kind: SUBSCRIPTION_REVOKED } is emitted to "wf-abc"
+    And the subscription is closed within a bounded interval
+    And an advisory-audit event "subscription-revoked" is written to the tenant audit shard
+    And data-path access to chunks in that pool is independently denied by data-path authorization
+    And the workflow's other subscriptions and hints are unaffected
+
+  Scenario: Decommissioned pool returns scope-not-found uniformly (I-WA19, I-WA6)
+    Given workflow "wf-abc" holds a valid pool handle "ph-fast"
+    When the pool underlying "ph-fast" is decommissioned by the cluster admin
+    Then subsequent hints referencing "ph-fast" are rejected with "scope_not_found"
+    And the rejection shape (code, payload size, latency distribution) is identical to a never-issued handle (I-WA6)
+    And the workflow continues; other handles and subscriptions remain valid
+
   # --- Covert-channel hardening (I-WA15) ---
 
   Scenario: Rejection latency does not leak neighbour state

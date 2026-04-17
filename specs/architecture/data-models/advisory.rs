@@ -18,7 +18,12 @@
 //!       specs/invariants.md I-WA1..I-WA18.
 
 use crate::common::*;
-use crate::chunk::AffinityPoolId;
+// Advisory domain types in `kiseki-common` deliberately do NOT import
+// `kiseki-chunk` or any other data-path crate. Pool identity on the
+// advisory path is represented by an opaque `PoolHandle` (defined in
+// `kiseki-common` alongside the advisory types) that the advisory
+// runtime translates to/from the cluster-internal `AffinityPoolId`.
+// This preserves the no-cycle constraint (ADR-021 §2).
 
 // =============================================================================
 // 1. Shared domain types (defined in `kiseki-common`)
@@ -78,11 +83,29 @@ pub enum DedupIntent {
     Default,
 }
 
+/// Opaque tenant-scoped reference to an affinity pool. Minted by
+/// `kiseki-advisory` at `DeclareWorkflow` time (based on the
+/// workload's authorized pools) and returned to the caller. Never
+/// reveals the cluster-internal `AffinityPoolId`. Caller-supplied
+/// value resolved to `AffinityPoolId` by the advisory runtime when a
+/// hint is consumed (I-WA11).
+pub struct PoolHandle(pub [u8; 16]);
+
+/// Descriptor returned with a workflow's authorized pools.
+pub struct PoolDescriptor {
+    pub handle: PoolHandle,
+    /// Opaque label ("fast-nvme", "bulk-nvme") chosen by tenant admin
+    /// at policy time; meaningful to the workload operator, not a
+    /// cluster-internal identifier.
+    pub opaque_label: String,
+}
+
 /// Tenant-scoped affinity preference. Data-path placement may ignore this
 /// to satisfy I-C3/I-C4/I-C2b (I-WA9).
 pub struct AffinityPreference {
-    pub preferred_pool: Option<AffinityPoolId>,
-    pub colocate_rack: Option<String>,
+    pub preferred_pool: Option<PoolHandle>,
+    // Rack-level colocation is deferred to a follow-up; not in v1 scope
+    // (gate-1 Finding: rack_hint side channel).
 }
 
 /// Bundle passed to each data-path operation. Every field is optional.
@@ -190,17 +213,28 @@ pub enum AdvisoryState {
 // =============================================================================
 
 /// Read-only lookup surface exposed by `kiseki-advisory` to the data path.
-/// Implementations must satisfy:
-///   - bounded deadline (≤500 µs; default 200 µs) before returning None.
-///   - no allocation in the happy path (snapshot read).
-///   - no shared mutex with the advisory runtime's writer path.
-/// Spec: ADR-021 §3, §4.
+/// The `_fast` suffix is part of the contract: implementations of
+/// `lookup_fast` MUST satisfy:
+///   - bounded wall-clock deadline (≤500 µs; default 200 µs) before
+///     returning None; no internal retry, no RPC, no I/O.
+///   - no allocation on the happy path (snapshot read via arc-swap).
+///   - no lock, channel, or future that can be held by the advisory
+///     runtime's writer path.
+/// A Phase 11.5 property test verifies these by running the lookup
+/// under synthetic advisory-runtime overload and measuring the
+/// return-None latency distribution.
+/// Spec: ADR-021 §3, §4; I-WA2.
 pub trait AdvisoryLookup: Send + Sync {
-    /// Resolve a caller-supplied `WorkflowRef` (typically lifted from a
-    /// data-path RPC header) into an `OperationAdvisory`. Returns `None`
-    /// on miss, timeout, or advisory-disabled — all indistinguishable
-    /// to the caller (I-WA2).
-    fn lookup(&self, workflow_ref: &WorkflowRef) -> Option<OperationAdvisory>;
+    /// Resolve a caller-supplied `WorkflowRef` (lifted from the
+    /// `x-kiseki-workflow-ref-bin` gRPC metadata header, or from a
+    /// task-local on the intra-Rust path) into an `OperationAdvisory`.
+    /// Returns `None` on miss, timeout, or advisory-disabled — all
+    /// indistinguishable to the caller (I-WA2).
+    fn lookup_fast(&self, workflow_ref: &WorkflowRef) -> Option<OperationAdvisory>;
+
+    /// Reports the cache's committed upper bound on `lookup_fast`
+    /// latency, in nanoseconds. Used by data-path health metrics.
+    fn lookup_budget_ns(&self) -> u64;
 }
 
 // =============================================================================
@@ -216,7 +250,7 @@ pub trait TelemetryEmitter: Send + Sync {
 /// Opaque telemetry event shape — domain representation, serialized to
 /// protobuf on the wire (advisory.proto). Caller-scoped (I-WA5).
 pub enum TelemetryEvent {
-    Backpressure { pool: AffinityPoolId, severity: BackpressureSeverity, retry_after: RetryAfterBucket },
+    Backpressure { pool: PoolHandle, severity: BackpressureSeverity, retry_after: RetryAfterBucket },
     MaterializationLag { view_id: ViewId, lag_bucket: LagBucket },
     Locality { composition_id: CompositionId, entries: Vec<(u64, u64, LocalityClass)> },
     PrefetchEffectiveness { hit_rate: HeadroomBucket },

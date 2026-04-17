@@ -96,11 +96,27 @@ message DeclareWorkflowRequest {
 }
 
 message DeclareWorkflowResponse {
-  // On success, the workflow handle.
+  oneof outcome {
+    DeclareWorkflowSuccess success = 1;
+    AdvisoryError           error  = 2;
+  }
+}
+
+message DeclareWorkflowSuccess {
   WorkflowRef workflow_ref = 1;
-  // On policy rejection (profile not allowed, declare rate exceeded, advisory
-  // disabled), see AdvisoryError. No handle is issued in that case.
-  AdvisoryError error = 2;
+  // Pools the workflow is authorized to reference in affinity hints.
+  // Opaque handles minted by kiseki-advisory at Declare time; caller
+  // uses them in PrefetchHint, AffinityHint, CollectiveAnnouncement.
+  // Handles are valid until EndWorkflow / TTL expiry (ADR-021 §3.a).
+  repeated PoolDescriptor available_pools = 2;
+}
+
+message PoolDescriptor {
+  PoolHandle handle       = 1;
+  // Tenant-chosen label; e.g., "fast-nvme", "bulk-nvme". Set via
+  // control-plane policy at workload-authorization time. Not a
+  // cluster-internal identifier (I-WA11).
+  string     opaque_label = 2;
 }
 
 message EndWorkflowRequest {
@@ -108,8 +124,13 @@ message EndWorkflowRequest {
 }
 
 message EndWorkflowResponse {
-  AdvisoryError error = 1; // empty on success
+  oneof outcome {
+    Empty         ok    = 1;
+    AdvisoryError error = 2;
+  }
 }
+
+message Empty {}
 
 message PhaseAdvanceRequest {
   WorkflowCorrelation correlation  = 1;
@@ -118,7 +139,10 @@ message PhaseAdvanceRequest {
 }
 
 message PhaseAdvanceResponse {
-  AdvisoryError error = 1; // empty on success
+  oneof outcome {
+    Empty         ok    = 1;
+    AdvisoryError error = 2;
+  }
 }
 
 message GetWorkflowStatusRequest {
@@ -126,14 +150,20 @@ message GetWorkflowStatusRequest {
 }
 
 message GetWorkflowStatusResponse {
+  oneof outcome {
+    WorkflowStatus status = 1;
+    AdvisoryError  error  = 2;
+  }
+}
+
+message WorkflowStatus {
   // Caller can only query its own workflows (I-WA3, I-WA6).
-  uint64          current_phase_id = 1;
-  string          current_phase_tag= 2;
-  uint32          hints_accepted_last_min = 3;
-  uint32          hints_rejected_last_min = 4;
+  uint64 current_phase_id         = 1;
+  string current_phase_tag        = 2;
+  uint32 hints_accepted_last_min  = 3;
+  uint32 hints_rejected_last_min  = 4;
   // Response is size-padded per ADR-021 §8.
-  bytes           padding = 15;
-  AdvisoryError   error   = 16;
+  bytes  padding = 15;
 }
 
 // ============================================================================
@@ -141,15 +171,18 @@ message GetWorkflowStatusResponse {
 // ============================================================================
 
 message AdvisoryClientMessage {
+  // Correlation is sent on every message for defense-in-depth: the server
+  // enforces exact match against the workflow the stream was established
+  // for. A mismatch produces SCOPE_NOT_FOUND (I-WA3 per-operation).
   WorkflowCorrelation correlation = 1;
   oneof payload {
     Hint                       hint                 = 2;
-    TelemetrySubscriptionOp    telemetry_subscription = 3;
     CollectiveAnnouncement     collective_announcement= 4;
     PrefetchHint               prefetch             = 5;
     // Heartbeat from client to keep stream alive (no action).
     Heartbeat                  heartbeat            = 6;
   }
+  reserved 3; // was telemetry_subscription; use SubscribeTelemetry RPC instead
 }
 
 message AdvisoryServerMessage {
@@ -211,16 +244,19 @@ message PriorityHint {
   Priority priority = 1;
 }
 
-// Affinity: opaque pool handle (not a pool ID visible in the cluster-wide
-// namespace) and an opaque rack hint the caller received earlier via its
-// discovery response. Server resolves to internal placement constraints.
+// Affinity preference at pool granularity. Rack-level colocation is
+// deferred to a follow-up feature and is NOT in v1 scope (gate-1
+// finding: rack hint values could be a cross-tenant side channel).
 message AffinityHint {
   PoolHandle preferred_pool = 1;
-  string     rack_hint      = 2; // opaque to caller, validated server-side
+  // reserved for future extension (rack, node, zone)
+  reserved 2 to 10;
 }
 
 // PoolHandle is the caller's tenant-scoped reference to an affinity pool,
-// NOT the cluster-internal pool ID (I-WA11).
+// NOT the cluster-internal pool ID (I-WA11). Minted by kiseki-advisory at
+// DeclareWorkflow time (returned in DeclareWorkflowSuccess.available_pools)
+// and valid until EndWorkflow / TTL expiry.
 message PoolHandle { bytes value = 1; }
 
 enum RetentionIntent {
@@ -275,6 +311,10 @@ message CollectiveAnnouncement {
   PoolHandle target_pool = 5;
 }
 
+// HintAck is emitted per hint, immediately. This is distinct from the
+// per-second audit-event batching for hint-accepted / hint-throttled
+// (I-WA8, ADR-021 §9). Client flow-control and hint correlation uses
+// HintAck; audit volume uses batching.
 message HintAck {
   bytes  hint_id = 1;
   enum   Outcome {
@@ -426,10 +466,18 @@ message RepairDegradedWarning {
 
 message StreamWarning {
   enum Kind {
-    KIND_UNSPECIFIED       = 0;
-    KIND_BUDGET_EXCEEDED   = 1;
-    KIND_CERT_NEAR_EXPIRY  = 2;
-    KIND_WORKFLOW_TTL_SOON = 3;
+    KIND_UNSPECIFIED         = 0;
+    KIND_BUDGET_EXCEEDED     = 1;
+    KIND_CERT_NEAR_EXPIRY    = 2;
+    KIND_WORKFLOW_TTL_SOON   = 3;
+    // Server-side liveness heartbeat (emitted every 10s of server-side
+    // idleness). Clients missing three consecutive heartbeats should
+    // reconnect.
+    KIND_HEARTBEAT           = 4;
+    // A subscription was revoked because policy narrowed (e.g., pool
+    // no longer authorized). Emitted once per affected subscription
+    // immediately before subscription termination.
+    KIND_SUBSCRIPTION_REVOKED = 5;
   }
   Kind kind = 1;
 }
