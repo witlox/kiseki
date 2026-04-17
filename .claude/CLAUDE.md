@@ -56,7 +56,7 @@ Read `.claude/roles/[role].md`. Apply its constraints.
 
 ## Entry point
 
-**Pure greenfield** (current state): no code, no finalized specs. Design conversation distilled in `docs/`, candidate terms and question bank in `specs/SEED.md`. Enter via DESIGN mode with analyst role. Analyst produces `specs/` tree through interrogation before any architecture or implementation begins.
+**Analyst complete, entering architect** (current state): full spec tree produced through analyst interrogation (8 contexts, 51 invariants, 132 scenarios, 20 failure modes, 17 adversarial findings). No code yet. Enter via DESIGN mode with architect role. Architect produces `specs/architecture/` tree (module graph, data structures, API contracts, enforcement map, build phases, ADRs) before implementation begins.
 
 ## Escalation paths
 

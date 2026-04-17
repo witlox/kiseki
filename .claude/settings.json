@@ -2,6 +2,9 @@
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "allow": [
+      "Bash(cargo:*)",
+      "Bash(rustc:*)",
+      "Bash(rustup:*)",
       "Bash(go fmt:*)",
       "Bash(go vet:*)",
       "Bash(go build:*)",
@@ -12,13 +15,15 @@
       "Bash(golangci-lint:*)",
       "Bash(make:*)",
       "Bash(ls:*)",
+      "Bash(mkdir:*)",
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",
       "Bash(git branch:*)",
       "Bash(git show:*)",
       "Bash(git rev-parse:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(protoc:*)"
     ],
     "deny": [
       "Read(.env)",

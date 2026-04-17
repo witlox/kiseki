@@ -5,7 +5,7 @@ constraints. Build against the architecture, not around it.
 
 ## Orient before coding (every session)
 
-Read: package graph, dependency graph, data structures for YOUR modules,
+Read: module graph, dependency graph, data structures for YOUR modules,
 Gherkin scenarios for YOUR feature, invariants, failure modes.
 If fidelity index exists, read your feature's confidence level.
 
@@ -35,41 +35,61 @@ One scenario at a time. No batching.
 
 ## Constraints
 
-- Go 1.25+, standard library preferred
-- `context.Context` threaded through all I/O operations
+### Rust (core: log, chunks, views, native client, hot paths)
+- Latest stable Rust
+- Async via tokio where appropriate; blocking threads for CPU-bound crypto
+- Error handling: thiserror for typed errors, anyhow avoided in library code
+- No unsafe unless justified and documented
+- FIPS crypto: aws-lc-rs (or ring with FIPS build)
+- Serialization: protobuf for cross-boundary, serde for internal persistence
+
+### Go (control plane: API, operators, CLI)
+- Go 1.23+, standard library preferred
+- context.Context threaded through all I/O operations
 - No globals, no init() functions with side effects
-- Error handling: wrap with `fmt.Errorf("operation: %w", err)`, no silent swallowing
-- No provider interfaces in dialect/ — concrete functions only
-- Tools in tool/ are direct OS calls — exec.Command, os.ReadFile, etc.
-- Tests: table-driven where appropriate, testify for assertions
+- Error handling: wrap with fmt.Errorf("operation: %w", err), no silent swallowing
 
-## Package-specific notes
+### gRPC boundary (Rust ↔ Go)
+- Protobuf definitions in specs/architecture/proto/
+- tonic (Rust) ↔ google.golang.org/grpc (Go)
+- All messages carry tenant_id, HLC timestamp, request tracing ID
 
-### dialect/
-- Each model file exports standalone functions: `BuildMessages()`, `ParseToolCalls()`, `SystemPrompt()`, `CompactionPrompt()`, `TokenCount()`
-- Router logic in router.go calls dialect functions directly based on config
-- Handoff via GLM5HandoffSummary/M25HandoffSummary creates checkpoint summary and reformats for target dialect
+## Module-specific notes
 
-### context/
-- Manager is the single owner of compaction + memory + drift decisions
-- Compactor calls dialect-specific compaction prompts
-- Drift detector uses memory/embedder for cosine similarity
+### Log (Rust)
+- Raft via openraft or equivalent mature library
+- Delta envelope: system-visible header + tenant-encrypted payload
+- Shard lifecycle: create, split, merge (automatic with configurable thresholds)
+- Compaction: merge SSTables by hashed_key + sequence_number, carry encrypted
+  payloads opaquely (never decrypt)
 
-### memory/
-- Store uses sqlite with append-only checkpoint table
-- Hash chain: each checkpoint's Hash = sha256(content), ParentHash = previous checkpoint
-- Signatures: ed25519 sign of Hash using developer's key from ~/.ghyll/keys/
-- Sync: git operations via tool/git.go, targeting orphan branch
-- Embedder: ONNX Runtime Go bindings, model lazy-downloaded to ~/.ghyll/models/
+### Chunk Storage (Rust)
+- Content-addressed chunks: sha256(plaintext) or HMAC(plaintext, tenant_key)
+- System DEK encryption via FIPS-validated AEAD (AES-256-GCM)
+- Idempotent writes (same chunk_id = increment refcount)
+- EC encoding per affinity pool policy
 
-### tool/
-- No abstraction. bash.go is exec.Command("bash", "-c", cmd) with timeout and output capture.
-- No permission checks — Tarn handles that.
+### Key Management (Rust + Go boundary)
+- System key manager: internal HA service (Rust)
+- Tenant KMS integration: pluggable (external KMS via gRPC/KMIP)
+- Two-layer model: system encrypts data, tenant KEK wraps system DEK
+- Key epoch tracking, rotation, crypto-shred orchestration
 
-### stream/
-- OpenAI-compatible /v1/chat/completions with streaming
-- SSE parsing, tool call detection, response assembly
-- Terminal rendering with markdown support
+### Native Client (Rust)
+- FUSE via fuser crate
+- Transport selection: libfabric/CXI → verbs → TCP (fallback chain)
+- Client-side encryption before any network I/O
+- Access pattern detection for prefetch decisions
+
+### Protocol Gateway (Rust)
+- NFS: nfs-server crate or custom NFSv4.1 implementation
+- S3: custom S3 API implementation (subset — scope from architect)
+- Gateway-side encryption for protocol-path clients
+
+### Control Plane (Go)
+- gRPC API for tenant management, IAM, policy, placement
+- Declarative configuration model
+- Federation: async config replication between sites
 
 ## When stuck
 
@@ -91,29 +111,22 @@ Impact: [can I continue with other scenarios?]
 - No cleverness. Boring readable code. Non-obvious paths get WHY comments
   referencing spec requirements.
 
-## Definition of Done (per package)
+## Definition of Done (per module)
 
-- [ ] All Gherkin scenarios from specs/features/ have corresponding Go tests
+- [ ] All Gherkin scenarios from specs/features/ have corresponding tests
 - [ ] All assigned invariants enforced
 - [ ] All assigned failure modes handled
 - [ ] No unresolved escalations (or explicitly non-blocking)
 - [ ] No undeclared dependencies
 - [ ] No architectural contract modifications
-- [ ] Domain language consistent
+- [ ] Domain language consistent with ubiquitous-language.md
 - [ ] Error handling complete with typed errors
-- [ ] `go vet` and `golangci-lint` pass with zero warnings
+- [ ] Rust: cargo clippy with zero warnings, cargo fmt
+- [ ] Go: go vet and golangci-lint pass with zero warnings
 - [ ] No TODO comments without linked issue
-- [ ] Public functions have godoc comments
 - [ ] Error paths tested (not just happy path)
+- [ ] Encryption invariants verified (no plaintext leak paths)
 - [ ] Fidelity confidence HIGH (if auditor has run — do not self-certify)
-
-## Anti-patterns
-
-- "I'll fix the interface later" -> escalate NOW
-- "Just one more dependency" -> pattern of 3+ means boundaries are wrong
-- "It works, ship it" -> run ALL tests, check ALL DoD items
-- Implementing beyond scope -> file observation, stay in lane
-- Premature completion -> evidence required, not feeling
 
 ## Session management
 

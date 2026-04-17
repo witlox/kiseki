@@ -47,39 +47,41 @@ Non-critical failure bringing down critical path?
 
 ### Security
 
-**Input validation**: every external input (network, file, config, env var)
-validated before use? Injection vectors (command, path traversal)?
-Deserialization of untrusted data?
+**Input validation**: every external input (network, protocol, config)
+validated before use? Injection vectors (path traversal, malformed protocol
+messages)?
 
-**Prompt injection**: tool output flowing back into LLM context? Memory
-backfill from other users injecting instructions? Checkpoint summaries
-carrying injection payloads?
+**Cryptographic correctness**: AEAD nonces unique and bound to log position?
+Key wrapping correct? Envelope structure authenticated? System DEK / tenant KEK
+boundary enforced? No plaintext leak on any code path?
 
-**Cryptography**: ed25519 key management? Hash chain integrity under partial
-sync? Proper randomness for signatures? Key rotation?
+**Tenant isolation**: cross-tenant data leakage paths? Refcount metadata
+exposing co-occurrence? Chunk ID namespace separation for opted-out tenants?
+Stream processor isolation (co-located tenants)?
 
-**Secrets & configuration**: secrets in logs/error messages? Config
-injection? TOML parsing edge cases? Default credentials?
+**Key management**: key rotation leaves dangling references? Crypto-shred
+propagation complete? Cache TTL bounds enforced? System key manager HA
+correct under partition?
 
-**Trust boundaries**: where does trusted meet untrusted? Every crossing validated?
-TOCTOU (time-of-check-to-time-of-use)? Memory from other developers trusted
-without verification?
+**Authentication**: mTLS certificate validation complete? Tenant certificate
+revocation path? Second-stage auth bypass? Cluster admin privilege escalation?
 
-**Supply chain**: dependency audit (known CVEs, abandoned, excessive permissions)?
-ONNX model download integrity?
+**Trust boundaries**: where does trusted meet untrusted? Every crossing
+validated? TOCTOU? Native client on untrusted compute? Gateway handling
+untrusted NFS/S3 requests?
 
 ### Robustness
 
 **Resource exhaustion**: unbounded allocations (memory, disk, connections)?
-Missing timeouts on LLM calls? Missing rate limits? Graceful degradation under load?
-Sqlite WAL growth? ONNX session lifecycle?
+Log growth without compaction? Shard count explosion? System DEK count at scale?
+Audit log growth blocking GC? MVCC pin preventing compaction?
 
 **Error handling quality**: errors that leak internal state? Panics on
-unexpected input? Recovery paths that leave corrupt state? Git operations
-failing mid-sync?
+unexpected input? Recovery paths that leave corrupt state? Partial writes
+leaving orphan chunks?
 
 **Observability gaps**: operations that can fail silently? Missing audit trail?
-Insufficient logging for debugging? Too much logging (sensitive data in context)?
+Insufficient metrics for debugging? Per-tenant metrics leaking access patterns?
 
 ## Finding format
 
@@ -94,16 +96,27 @@ Evidence: [concrete example, exploit scenario, or reproduction steps]
 Suggested resolution: [minimal, advisory]
 ```
 
-## Ghyll-specific attack surfaces
+## Kiseki-specific attack surfaces
 
-- **Dialect parsing**: malformed LLM responses, tool call extraction edge cases
-- **Checkpoint integrity**: Merkle DAG with ed25519 — can it be broken?
-- **Drift detection thresholds**: too sensitive = noise, too loose = missed drift
-- **Model switching**: context leakage between unrelated sessions during handoff
-- **Git sync**: partial push/pull, conflicting checkpoints, orphan branch corruption
-- **ONNX model download**: MITM, corrupted download, disk full mid-download
-- **Tool execution**: Tarn handles sandboxing, but what if Tarn isn't running?
-- **Vault client**: HTTP to vault server — auth, TLS, replay attacks
+- **Encryption boundary**: plaintext leaks in gateway memory, log payloads,
+  debug logs, error messages, core dumps
+- **Raft replication**: log entries replicated to peers — peers see delta
+  headers in clear; payloads encrypted. Header leakage sufficient?
+- **Cross-tenant dedup**: co-occurrence via chunk ID, refcount metadata,
+  timing side channels on dedup hit vs miss
+- **One-sided RDMA**: pre-encrypted chunks transferred without target CPU —
+  correct encryption unit alignment? Replay protection?
+- **Shard split**: write buffering during split — data loss if buffer
+  not durable? Split boundary correctness?
+- **Key hierarchy**: system KEK compromise → all system DEKs exposed →
+  combined with tenant KEK = full access. Is system KEK protection adequate?
+- **Federated KMS**: cross-site KMS traffic — MITM? Replay? Certificate pinning?
+- **Native client on untrusted compute**: tenant KEK in process memory —
+  ptrace/core dump exposure? Memory protection (mlock, guard pages)?
+- **Compaction**: operates on headers only — but what if a malicious header
+  is crafted to cause incorrect merge (hash collision, sequence manipulation)?
+- **Audit log**: append-only — but who audits the auditor? Integrity of the
+  audit log itself?
 
 ## Sweep Protocol (full codebase adversarial pass)
 
@@ -113,28 +126,13 @@ Trigger: "adversary sweep", "security review", "full review"
 
 1. Read fidelity index if exists (LOW confidence areas = higher priority)
 2. Inventory the attack surface:
-   - External interfaces (LLM API, CLI args, TOML config, git, ONNX)
-   - Trust boundaries (user input, LLM output, memory from other devs, network)
+   - External interfaces (NFS, S3, native API, gRPC, control plane API)
+   - Trust boundaries (tenant compute, storage nodes, gateways, control plane,
+     KMS connectivity, cross-site federation)
    - Data flows across boundaries
+   - Encryption boundaries (plaintext → ciphertext transition points)
    - Third-party dependencies
-3. Generate `specs/findings/ADVERSARY-SWEEP.md`:
-
-```markdown
-# Adversarial Sweep Plan
-Status: IN PROGRESS
-
-## Attack surface
-| Surface | Entry points | Trust level | Fidelity |
-|---------|-------------|-------------|----------|
-
-## Chunks (ordered by exposure)
-| # | Scope | Attack vectors | Status | Session |
-|---|-------|---------------|--------|---------|
-| 1 | [most exposed surface] | security, correctness | PENDING | — |
-| 2 | [next] | ... | PENDING | — |
-| N | cross-cutting | supply chain, resource exhaustion | PENDING | — |
-```
-
+3. Generate `specs/findings/ADVERSARY-SWEEP.md`
 4. Begin chunk 1 if context allows
 
 **Resuming (ADVERSARY-SWEEP.md exists):**
@@ -146,38 +144,6 @@ Status: IN PROGRESS
 6. Report: findings this session, total, remaining chunks
 
 **Completion:** all chunks DONE -> cross-cutting analysis -> COMPLETE
-
-**Output structure:**
-```
-specs/findings/
-├── INDEX.md
-├── ADVERSARY-SWEEP.md
-├── [chunk-name].md
-└── ...
-```
-
-**INDEX.md format:**
-```markdown
-# Adversarial Findings
-Last sweep: [date]
-Status: [IN PROGRESS | COMPLETE]
-
-## Summary
-| Severity | Count | Resolved | Open |
-|----------|-------|----------|------|
-| Critical | N | N | N |
-| High | N | N | N |
-| Medium | N | N | N |
-| Low | N | N | N |
-
-## Open findings (sorted by severity)
-| # | Title | Severity | Category | Location | Status |
-|---|-------|----------|----------|----------|--------|
-
-## Resolved findings
-| # | Title | Severity | Resolution | Resolved in |
-|---|-------|----------|------------|-------------|
-```
 
 ## Session management
 

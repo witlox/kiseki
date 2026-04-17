@@ -21,10 +21,10 @@ For each spec/feature file:
    - **SHALLOW**: asserts status/boolean/mock-invocation only
    - **MODERATE**: asserts real values through mocked dependencies
    - **THOROUGH**: asserts actual state through real or faithful code
-   - **INTEGRATION**: exercises real services (e.g., real sqlite, real git)
+   - **INTEGRATION**: exercises real services (e.g., real storage, real Raft)
 4. For each test setup: note if it bypasses real code paths
 
-### Phase 2: Interface fidelity (per package boundary)
+### Phase 2: Interface fidelity (per module boundary)
 
 For each exported function or type used as a testing seam:
 1. List functions, compare test doubles vs real implementation
@@ -32,13 +32,15 @@ For each exported function or type used as a testing seam:
    accepts any input
 3. Rate: **FAITHFUL** / **PARTIAL** / **DIVERGENT**
 
-Go-specific: check that test helpers using interfaces match the concrete
-functions they stand in for (ghyll uses concrete functions, not interfaces —
-so test doubles must match function signatures exactly).
+Language-specific:
+- Rust: check trait implementations match concrete types. Test mocks via
+  trait objects or generics must match real behavior.
+- Go: check interface implementations for control plane components.
+- gRPC boundary: protobuf message fidelity between Rust and Go.
 
 ### Phase 3: Decision record enforcement
 
-For each ADR/decision record in `docs/decisions/`:
+For each ADR in `specs/architecture/adr/`:
 1. State decision in one line
 2. Is there a test that fails if violated?
 3. Rate: **ENFORCED** / **DOCUMENTED** / **UNENFORCED**
@@ -46,8 +48,8 @@ For each ADR/decision record in `docs/decisions/`:
 ### Phase 4: Cross-cutting
 
 Dead specs (no tests), orphan tests (no spec), stale specs (language
-doesn't match code), coverage gaps (untested packages), feature flag gaps
-(build-tag-gated code without gated tests).
+doesn't match code), coverage gaps (untested modules), invariants
+claimed but unenforced.
 
 ## Output structure
 
@@ -68,7 +70,7 @@ specs/fidelity/
 3. Be specific with file paths and line numbers.
 4. Don't fix anything. Implementer fixes. You measure.
 5. Distinguish intentional simplification from accidental gaps.
-6. Rate impact. Shallow on logging = low. Shallow on hash chain = critical.
+6. Rate impact. Shallow on logging = low. Shallow on encryption = critical.
 
 ## Two operating modes
 
@@ -79,25 +81,8 @@ Trigger: "sweep", "baseline", "full audit"
 Runs across multiple sessions to reach a **checkpoint**.
 
 **First session (no SWEEP.md):**
-1. Inventory all spec files, test dirs, package boundaries, ADRs
-2. Generate `specs/fidelity/SWEEP.md`:
-
-```markdown
-# Sweep Plan
-Status: IN PROGRESS
-
-## Surface
-| Type | Count | Assessed | Remaining |
-|------|-------|----------|-----------|
-
-## Chunks (ordered by risk)
-| # | Scope | Specs | Interfaces | Status | Session |
-|---|-------|-------|------------|--------|---------|
-| 1 | [highest risk] | ... | ... | PENDING | — |
-| 2 | ... | ... | ... | PENDING | — |
-| N | cross-cutting | ADRs, gaps | — | PENDING | — |
-```
-
+1. Inventory all spec files, test dirs, module boundaries, ADRs
+2. Generate `specs/fidelity/SWEEP.md` with chunks ordered by risk
 3. Begin chunk 1 if context allows
 
 **Resuming (SWEEP.md exists):**
@@ -112,46 +97,6 @@ Status: IN PROGRESS
 ### Mode 2: Incremental (per feature or refresh)
 
 Trigger: "audit [feature]", "audit interfaces", "audit adrs", "refresh index"
-
-- **"audit [feature]"**: phases 1-2 for that feature + its package boundaries
-- **"audit interfaces"**: phase 2 only
-- **"audit adrs"**: phase 3 only
-- **"refresh"**: phases 1-4 for features modified since last scan (git diff)
-- **"checkpoint"**: verify INDEX.md complete, list gaps if any
-
-## INDEX.md format
-
-```markdown
-# Fidelity Index
-Last checkpoint: [date]
-Status: [IN PROGRESS | CHECKPOINT]
-
-## Summary
-| Package | Scenarios | THOROUGH+ | MODERATE | SHALLOW | NONE | Confidence |
-|---------|-----------|-----------|----------|---------|------|------------|
-
-## Interface Fidelity
-| Package Boundary | Functions | FAITHFUL | PARTIAL | DIVERGENT |
-|------------------|-----------|----------|---------|-----------|
-
-## Decision Enforcement
-| ADR | Decision | Status |
-|-----|----------|--------|
-
-## Priority Actions
-1. [highest impact gap]
-2. ...
-```
-
-## Checkpoint
-
-Complete fidelity snapshot: every spec has a row in INDEX.md, every package
-boundary rated, every decision record assessed, cross-cutting gaps identified,
-priority actions ranked.
-
-Checkpoint = everything measured. Not everything good.
-
-Re-sweep when: major refactoring, >50 commits, before release, trust lost.
 
 ## Session management
 
