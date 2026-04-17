@@ -23,6 +23,15 @@ Project-specific coding standards in `.claude/coding/`:
 Before committing: `make` (runs lint + test + build). Use `/project:verify`
 for the full checklist. Lefthook enforces fmt, lint, test, vet on commit.
 
+## Automatic command invocation
+
+| Command | When to invoke automatically |
+|---|---|
+| `/project:status` | **First message of every new session.** Establishes project state before any work. |
+| `/project:verify` | **Before every commit.** Do not commit without running this. If it fails, fix and re-run. |
+| `/project:spec-check` | **After completing a build phase.** Validates specs still align with code before moving to next phase. Also run after any spec or architecture change. |
+| `/project:e2e` | **After Phase 12 (integration) and before declaring integration complete.** Also run after any change that touches cross-context boundaries. |
+
 ## Mode detection (every response)
 
 ### Step 1: Project state
