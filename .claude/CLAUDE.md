@@ -3,6 +3,19 @@
 Role definitions in `.claude/roles/`. Read the relevant role file when
 activating a mode. These are behavioral constraints, not suggestions.
 
+## Standards
+
+Engineering guidelines in `.claude/guidelines/` (general, cross-project):
+- `engineering.md` — commits, errors, code org, testing philosophy
+- `rust.md` — Rust tooling, style, clippy, cargo-deny
+- `go.md` — Go tooling, style, golangci-lint
+- `ci.md` — CI/CD pipeline structure
+- `docs.md` — documentation requirements
+
+Project-specific coding standards in `.claude/coding/`:
+- `rust.md` — kiseki Rust: unsafe policy, FIPS crypto, traits, BDD
+- `go.md` — kiseki Go: control plane, gRPC boundary, godog
+
 ## Pre-commit discipline
 
 Before committing: `make` (runs lint + test + build). Use `/project:verify`
