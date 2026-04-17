@@ -157,11 +157,20 @@ domain expert unless marked otherwise.
 
 ---
 
+## Backpass invariants (analyst backpass, 2026-04-17)
+
+| ID | Invariant | Status |
+|---|---|---|
+| I-O7 | Runtime integrity monitor detects ptrace, /proc/pid/mem access, debugger attachment, core dump attempts on kiseki processes. Alerts cluster admin + tenant admin. Optional auto-rotate of keys on detection. | Confirmed |
+| I-A5 | Audit GC safety valve: if tenant audit export stalls > threshold (default 24h), data shard GC proceeds with documented gap. Per-tenant configurable: backpressure mode throttles writes instead. | Confirmed |
+| I-K15 | Crypto-shred cache TTL configurable per tenant within [5s, 300s], default 60s. Minimum 5s is hard engineering limit. | Confirmed |
+| I-O8 | Writable shared mmap returns ENOTSUP with clear error message. Read-only mmap supported. | Confirmed |
+| I-O9 | Client resilience via multi-endpoint resolution (DNS round-robin, seed list, multiple A records). Node failure → client reconnects to another node. | Confirmed |
+
+---
+
 ## Open / deferred
 
-- Shard split mechanism under sustained write load (I-O1) — architect
 - Maximum pin TTL defaults — needs operational experience
 - Audit event enumeration (what system events are "relevant" for
   tenant export) — behavioral spec
-- Chunk EC parameters (k, m) per pool — architect
-- FIPS module boundary (which Rust crate, which algorithms) — architect

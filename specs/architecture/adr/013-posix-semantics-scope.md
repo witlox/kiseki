@@ -40,7 +40,7 @@ POSIX support via FUSE with explicit compatibility matrix.
 
 | Operation | Reason |
 |---|---|
-| mmap (shared, writable) | Distributed shared writable mmap requires page-level coherence — not tractable for a distributed system at HPC scale. Read-only mmap is supported. |
+| mmap (shared, writable) | Distributed shared writable mmap requires page-level coherence — not tractable for a distributed system at HPC scale. Read-only mmap is supported. **The FUSE client returns ENOTSUP with a log message: "writable shared mmap not supported; use write() instead."** |
 | ACLs (POSIX.1e) | Unix permissions only (uid/gid/mode). POSIX ACLs add complexity without significant benefit for the target workload. Revisit if needed. |
 | chroot, pivot_root | Filesystem-level operations, not meaningful for FUSE mount |
 
