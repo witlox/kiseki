@@ -26,7 +26,8 @@ kiseki/
 │   ├── kiseki-keymanager/        ← Key Management: system key manager (HA)
 │   ├── kiseki-transport/         ← Transport abstraction: TCP, libfabric/CXI
 │   ├── kiseki-proto/             ← Generated protobuf/gRPC (Rust side)
-│   └── kiseki-audit/             ← Audit log: append-only, export
+│   ├── kiseki-audit/             ← Audit log: append-only, export
+│   └── kiseki-advisory/          ← Workflow Advisory: runtime, router, budgets (ADR-020, ADR-021)
 └── bin/
     ├── kiseki-server/            ← Storage node daemon (composes log+chunk+view+gateway)
     ├── kiseki-keyserver/         ← System key manager daemon
@@ -48,6 +49,7 @@ control/
 │   ├── flavor/                   ← Flavor management, best-fit matching
 │   ├── federation/               ← Cross-site: config sync, data replication
 │   ├── audit/                    ← Audit export: tenant-scoped filtering
+│   ├── advisory/                 ← Workflow Advisory policy: profile allow-lists, budgets, opt-out state (ADR-021 §6)
 │   └── discovery/                ← Fabric-level discovery service
 └── proto/                        ← Generated protobuf/gRPC (Go side)
 ```
@@ -64,7 +66,8 @@ proto/
 │   ├── composition.proto         ← CompositionMutation, NamespaceOps
 │   ├── view.proto                ← ViewDescriptor, ViewStatus
 │   ├── control.proto             ← TenantOps, PolicyOps, FederationOps
-│   └── audit.proto               ← AuditEvent, AuditExportStream
+│   ├── audit.proto               ← AuditEvent, AuditExportStream
+│   └── advisory.proto            ← WorkflowAdvisoryService (ADR-021)
 ```
 
 ---
@@ -84,6 +87,7 @@ proto/
 | Key Management (tenant KMS integration) | `kiseki-crypto` | Rust | (library) |
 | Control Plane | `control/` | Go | kiseki-control |
 | Audit | `kiseki-audit` + `control/pkg/audit` | Rust + Go | both |
+| Workflow Advisory (cross-cutting) | `kiseki-advisory` + `control/pkg/advisory` | Rust + Go | kiseki-server + kiseki-control |
 
 ---
 
@@ -128,6 +132,7 @@ kiseki-gateway-nfs  kiseki-gateway-s3
 - `kiseki-gateway-s3` depends on `kiseki-common` + `kiseki-view` + `kiseki-composition` + `kiseki-crypto`
 - `kiseki-client` depends on `kiseki-common` + `kiseki-view` + `kiseki-composition` + `kiseki-chunk` + `kiseki-crypto` + `kiseki-transport`
 - `kiseki-proto` depends on nothing (generated code)
+- `kiseki-advisory` depends on `kiseki-common` + `kiseki-audit` + `kiseki-proto`. Notably: **no data-path crate depends on `kiseki-advisory`** (ADR-021 §1). Shared advisory domain types (`WorkflowRef`, `OperationAdvisory`, the hint enums) live in `kiseki-common` and are passed by value to data-path operations. The advisory runtime is wired at the `kiseki-server` binary level only.
 
 **Cross-language boundary**: `kiseki-proto` (Rust) ↔ `control/proto/` (Go) via gRPC. No direct Rust↔Go FFI for control plane.
 
@@ -157,3 +162,27 @@ kiseki-gateway-nfs  kiseki-gateway-s3
 | `kiseki-chunk` | `compression` | Enable tenant opt-in compression |
 | `kiseki-gateway-nfs` | (always) | NFSv4.1 |
 | `kiseki-gateway-s3` | (always) | S3 API subset |
+| `kiseki-advisory` | (always) | Workflow Advisory & Client Telemetry |
+
+---
+
+## Advisory runtime isolation (ADR-021 §1)
+
+`kiseki-advisory` is compiled into `kiseki-server` but runs on a
+**dedicated tokio runtime** separate from the data-path runtime. The
+`kiseki-server` binary is responsible for:
+
+1. Instantiating the advisory runtime at process start.
+2. Binding a separate gRPC listener for `WorkflowAdvisoryService`.
+3. Passing the advisory router's `lookup_handle()` to each data-path
+   context so they can resolve `WorkflowRef` → `OperationAdvisory`
+   on the hot path (pull-based, non-blocking).
+4. Wiring `kiseki-advisory` to `kiseki-audit` for advisory-audit
+   event emission (bounded queue, drop-and-record on overflow).
+5. Refreshing effective policy from `control/pkg/advisory` via
+   `ControlService`.
+
+The `kiseki-client-fuse` binary does **not** host the advisory
+runtime — it only consumes the `WorkflowAdvisoryService` client
+surface (`DeclareWorkflow`, etc.) and attaches `workflow_ref`
+headers to data-path RPCs.

@@ -21,6 +21,7 @@ is direct function calls via trait implementations.
 | `AuditExportService` | Go control plane | Tenant SIEM | Tenant VLAN |
 | `KeyManagerService` | Rust keyserver | Rust server, Go control | Internal network |
 | `DiscoveryService` | Rust server | Rust client | Data fabric |
+| `WorkflowAdvisoryService` | Rust server (kiseki-advisory) | Rust client (and any tenant-authorized caller) | Data fabric (separate listener, ADR-021 §1) |
 
 ### Services that are intra-process (Rust trait calls)
 
@@ -33,6 +34,7 @@ is direct function calls via trait implementations.
 | `CryptoOps` | kiseki-crypto | all crates that encrypt/decrypt |
 | `KeyManagerOps` | kiseki-keymanager (remote) | kiseki-chunk, kiseki-crypto |
 | `TenantKmsOps` | kiseki-crypto | kiseki-gateway-*, kiseki-client, kiseki-view |
+| `AdvisoryLookup` | kiseki-advisory | kiseki-log, kiseki-chunk, kiseki-composition, kiseki-view, kiseki-gateway-* (wired by `kiseki-server`; bounded-deadline, non-blocking — ADR-021 §3) |
 
 ---
 
@@ -142,3 +144,42 @@ is direct function calls via trait implementations.
 | Command | `SetMaintenanceMode` | Cluster Admin | control-plane.feature#Maintenance |
 | Query | `ListFlavors / MatchFlavor` | Tenant Admin | control-plane.feature#FlavorMgmt |
 | Query | `GetAuditExport(tenant) → stream` | Tenant Admin | control-plane.feature |
+| Command | `SetAdvisoryPolicy(scope, profiles, budgets, state)` | Cluster/Tenant Admin | control-plane.feature#AdvisoryPolicy, ADR-021 §6 |
+| Command | `TransitionAdvisoryState(scope, state)` | Cluster/Tenant Admin | control-plane.feature#AdvisoryOptOut, I-WA12 |
+| Query | `GetEffectiveAdvisoryPolicy(workload) → policy` | kiseki-advisory | ADR-021 §6 (computed as min across cluster/org/project/workload) |
+
+### Workflow Advisory context (Rust server, gRPC)
+
+Service definition: `specs/architecture/proto/kiseki/v1/advisory.proto`.
+
+| Type | Operation | Caller | Spec reference |
+|---|---|---|---|
+| Command | `DeclareWorkflow(profile, initial_phase, ttl) → workflow_ref` | Native Client, any authorized caller | workflow-advisory.feature#DeclareWorkflow |
+| Command | `EndWorkflow(workflow_ref)` | Caller that owns the workflow | workflow-advisory.feature#EndWorkflow |
+| Command | `PhaseAdvance(workflow_ref, next_phase)` | Caller that owns the workflow | workflow-advisory.feature#PhaseAdvance, I-WA13 |
+| Query | `GetWorkflowStatus(workflow_ref) → status` | Caller that owns the workflow | workflow-advisory.feature |
+| Stream (bidi) | `AdvisoryStream` — hints in, telemetry out, multiplexed | Caller | workflow-advisory.feature, I-WA5..I-WA15 |
+| Stream (server) | `SubscribeTelemetry(channels)` | Caller | workflow-advisory.feature |
+| Event (internal) | `AdvisoryAuditEvent(declare/end/phase/hint/subscribe/budget/policy)` | → kiseki-audit (tenant shard) | I-WA8, ADR-021 §9 |
+
+### OperationAdvisory on data-path operations
+
+Every data-path `*Ops` trait method gains an optional advisory parameter
+(typed as `Option<&OperationAdvisory>`; crate-level shared type from
+`kiseki-common`). Methods treat the bundle as preferences only — any
+behaviour they tune on advisory must be cleanly skippable when the
+bundle is `None` or a given field is `None` (I-WA1, I-WA2).
+
+| Trait | Method | Advisory fields consumed |
+|---|---|---|
+| `LogOps` | `ReadDeltas` | phase_id (heuristic compaction pacing only) |
+| `ChunkOps` | `WriteChunk` | affinity, retention_intent, dedup_intent |
+| `ChunkOps` | `ReadChunk` | access_pattern, priority (for QoS scheduling within policy) |
+| `CompositionOps` | `FinalizeMultipart`, `Update` | retention_intent, collective_announcement side effect (via kiseki-advisory) |
+| `ViewOps` | `ReadView` | access_pattern, phase_id (cache retention bias) |
+| `ViewOps` | (internal prefetch path) | prefetch_tuples (pushed from kiseki-advisory) |
+
+Hints are consumed via read-only access through `AdvisoryLookup`
+(ADR-021 §3). A failed or timed-out lookup returns `None`, at which
+point the data path proceeds with its no-advisory code path, which is
+required to be byte-for-byte equivalent in outcome (I-WA1 property).

@@ -207,25 +207,62 @@ works, transport fallback works, discovery works without control plane.
 - Federation (async config replication)
 - Audit export (tenant-scoped filtering)
 - Discovery service support
+- **Advisory policy** (`control/pkg/advisory`): profile allow-list CRUD per scope, hint-budget CRUD with inheritance and validation (`ChildExceedsParentCeiling`, `ProfileNotInParent`), opt-out state machine (enabled/draining/disabled) with Raft-backed persistence, effective-policy computation endpoint. Federation replicates policy but NOT workflow state. (ADR-021 §6)
 
 **Exit criteria**: tenant CRUD works, quota enforcement works, compliance
-tags inherit correctly, federation peer registration works.
+tags inherit correctly, federation peer registration works, advisory
+policy inheritance computes correctly and rejects parent-exceeding
+updates.
+
+---
+
+## Phase 11.5: Workflow Advisory runtime (Rust)
+
+**Crates**: `kiseki-advisory`
+**Depends on**: Phase 0 (common + proto), Phase 5 (audit), Phase 11 (control plane for policy fetching)
+
+- `WorkflowAdvisoryService` gRPC server (separate listener, isolated tokio runtime per ADR-021 §1)
+- Workflow table / effective-hints table / prefetch ring (ADR-021 §4)
+- Budget enforcer (token buckets per workload for hints/sec and declare/sec)
+- Audit emitter → `kiseki-audit` (bounded queue, drop-and-audit on overflow, batched hint accept/throttle per I-WA8)
+- k-anonymity bucketing for aggregate telemetry (ADR-021 §7)
+- Covert-channel hardening helper: bucketed response timing + size padding (ADR-021 §8, I-WA15)
+- Phase-history ring + `PhaseSummary` rollup (ADR-021 §9)
+- `AdvisoryLookup` hot-path read surface (arc-swap snapshot, ≤500 µs deadline)
+- No data-path code in this crate; no `kiseki-advisory` dependency in data-path crates (I-WA2)
+
+**Exit criteria**:
+- Property test: data-path outcome equivalence with/without advisory
+  annotations (I-WA1, sampled across chunk/view/composition paths).
+- Property test: `AdvisoryLookup::lookup()` returns within deadline
+  under synthetic advisory-runtime overload, always safely returning
+  `None` past deadline (I-WA2).
+- Property test: `ScopeNotFound` response timing/size distributions
+  are statistically indistinguishable between unauthorized and absent
+  targets (I-WA6, I-WA15).
+- Unit tests: budget enforcement, hint payload size bounds, declare
+  rate, phase monotonicity, opt-out state transitions.
+- Integration test with `kiseki-audit`: event batching guarantees
+  (I-WA8).
 
 ---
 
 ## Phase 12: Integration (kiseki-server binary)
 
 **Binary**: `kiseki-server`
-**Depends on**: All Rust phases (3-10)
+**Depends on**: All Rust phases (3-10), Phase 11.5 (advisory)
 
 - Compose all Rust crates into single server binary
 - Process management for per-tenant stream processors (ADR-012)
 - Discovery responder
 - Node health reporting (clock quality, device health)
 - Maintenance mode
+- **Advisory runtime wiring**: instantiate second tokio runtime, bind separate gRPC listener for `WorkflowAdvisoryService`, pass `AdvisoryLookup` handle to each data-path context's constructor, fetch and refresh effective policy from `ControlService`, start advisory-audit emitter (ADR-021 §1)
 
 **Exit criteria**: end-to-end write→read through server binary,
-multi-tenant isolation verified, key rotation mid-traffic works.
+multi-tenant isolation verified, key rotation mid-traffic works,
+advisory runtime overload does not block data path (F-ADV-1 simulated
+and data-path SLOs maintained).
 
 ---
 
@@ -256,3 +293,4 @@ Phase 0 (common, proto)
 - Phase 11 (Go control plane) can be built in parallel with Phases 3-10
 - Phase 2 (transport) can be built in parallel with Phases 1, 3, 4
 - Phase 5 (audit) can start as soon as Phase 3 is done
+- Phase 11.5 (advisory) can start as soon as Phase 5 (audit) and the Phase 11 advisory-policy endpoint are done; it is independent of Phases 6-10 because it does not link against any data-path crate
