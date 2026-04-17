@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Go
+/control/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.*
+
+# Keys and secrets
+*.pem
+*.key
+*.p12
+*.jks
+credentials*
+secrets*
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Test artifacts
+*.prof
+*.test
+coverage.out
