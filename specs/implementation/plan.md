@@ -388,7 +388,7 @@ auditor fidelity HIGH across all contexts.
 | 9 | done | — | — | `phase9-gate2.md` | — | kiseki-gateway: 0 blocking |
 | 10 | done | — | — | `phase10-gate2.md` | — | kiseki-client: 0 blocking |
 | 10.5 | pending | — | — | — | — | bindings |
-| 11 | pending | — | — | — | — | Go control plane |
+| 11 | done | — | — | `phase11-gate2.md` | — | Go: tenant CRUD store, IAM, policy, advisory budget |
 | 11.5 | pending | — | — | — | — | advisory |
 | 12 | pending | — | — | — | — | integration |
 
