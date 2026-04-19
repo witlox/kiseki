@@ -1,0 +1,61 @@
+//! Gateway operations trait — protocol-agnostic read/write surface.
+
+use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
+
+use crate::error::GatewayError;
+
+/// A read request from a protocol client.
+#[derive(Clone, Debug)]
+pub struct ReadRequest {
+    /// Tenant making the request.
+    pub tenant_id: OrgId,
+    /// Target namespace.
+    pub namespace_id: NamespaceId,
+    /// Target composition (file or object).
+    pub composition_id: CompositionId,
+    /// Byte offset.
+    pub offset: u64,
+    /// Number of bytes to read.
+    pub length: u64,
+}
+
+/// A read response.
+#[derive(Clone, Debug)]
+pub struct ReadResponse {
+    /// Plaintext data (decrypted by the gateway for protocol clients).
+    pub data: Vec<u8>,
+    /// Whether end-of-file was reached.
+    pub eof: bool,
+}
+
+/// A write request from a protocol client.
+#[derive(Clone, Debug)]
+pub struct WriteRequest {
+    /// Tenant making the request.
+    pub tenant_id: OrgId,
+    /// Target namespace.
+    pub namespace_id: NamespaceId,
+    /// Plaintext data (will be encrypted by the gateway, I-K1).
+    pub data: Vec<u8>,
+}
+
+/// A write response.
+#[derive(Clone, Debug)]
+pub struct WriteResponse {
+    /// Composition ID of the written object.
+    pub composition_id: CompositionId,
+    /// Number of bytes written.
+    pub bytes_written: u64,
+}
+
+/// Protocol-agnostic gateway operations.
+///
+/// NFS and S3 gateways both implement this trait, translating their
+/// wire-protocol requests into these operations.
+pub trait GatewayOps {
+    /// Read data from a composition (decrypt + return plaintext to client).
+    fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError>;
+
+    /// Write data to a composition (encrypt plaintext from client → store).
+    fn write(&mut self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
+}

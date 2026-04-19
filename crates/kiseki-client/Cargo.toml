@@ -1,0 +1,22 @@
+[package]
+name = "kiseki-client"
+description = "Native client for Kiseki: FUSE mount, fabric discovery, client-side encryption."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+fuse = []
+
+[dependencies]
+kiseki-common = { path = "../kiseki-common" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

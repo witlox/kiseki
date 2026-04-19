@@ -385,8 +385,8 @@ auditor fidelity HIGH across all contexts.
 | 6 | done | — | — | `phase6-gate2.md` | — | kiseki-chunk: dedup, refcount, GC, holds, pools |
 | 7 | done | — | — | — | — | kiseki-composition: CRUD, namespace, multipart, EXDEV |
 | 8 | done | — | — | — | — | kiseki-view: descriptor, MVCC pins, staleness, lifecycle |
-| 9 | pending | — | — | — | — | |
-| 10 | pending | — | — | — | — | |
+| 9 | done | — | — | — | — | kiseki-gateway: GatewayOps trait, NFS/S3 stubs |
+| 10 | done | — | — | — | — | kiseki-client: discovery, cache, error types |
 | 10.5 | pending | — | — | — | — | bindings |
 | 11 | pending | — | — | — | — | Go control plane |
 | 11.5 | pending | — | — | — | — | advisory |

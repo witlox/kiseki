@@ -1045,6 +1045,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-client"
+version = "0.0.0"
+dependencies = [
+ "kiseki-common",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "kiseki-common"
 version = "0.0.0"
 dependencies = [
@@ -1077,6 +1086,15 @@ dependencies = [
  "tokio",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "kiseki-gateway"
+version = "0.0.0"
+dependencies = [
+ "kiseki-common",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]

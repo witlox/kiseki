@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "crates/kiseki-audit",
     "crates/kiseki-chunk",
+    "crates/kiseki-client",
     "crates/kiseki-common",
     "crates/kiseki-composition",
     "crates/kiseki-crypto",
+    "crates/kiseki-gateway",
     "crates/kiseki-keymanager",
     "crates/kiseki-log",
     "crates/kiseki-proto",

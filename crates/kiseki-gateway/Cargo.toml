@@ -1,0 +1,23 @@
+[package]
+name = "kiseki-gateway"
+description = "Protocol gateways for Kiseki: NFS and S3 protocol translation layers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["nfs", "s3"]
+nfs = []
+s3 = []
+
+[dependencies]
+kiseki-common = { path = "../kiseki-common" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
