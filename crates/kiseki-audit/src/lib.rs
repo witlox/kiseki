@@ -16,7 +16,9 @@
 #![deny(unsafe_code)]
 
 pub mod event;
+pub mod raft_store;
 pub mod store;
 
 pub use event::{AuditEvent, AuditEventType};
+pub use raft_store::RaftAuditStore;
 pub use store::{AuditLog, AuditOps, AuditQuery};
