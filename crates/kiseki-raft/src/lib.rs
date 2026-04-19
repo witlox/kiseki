@@ -10,7 +10,11 @@
 #![deny(unsafe_code)]
 
 pub mod config;
+pub mod log_store;
+pub mod network;
 pub mod node;
 
 pub use config::KisekiRaftConfig;
+pub use log_store::MemLogStore;
+pub use network::{StubNetwork, StubNetworkFactory};
 pub use node::KisekiNode;
