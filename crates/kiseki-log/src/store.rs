@@ -303,4 +303,49 @@ impl LogOps for MemShardStore {
 
         Ok(gc_boundary)
     }
+
+    fn compact_shard(&mut self, shard_id: ShardId) -> Result<u64, LogError> {
+        let shard = self
+            .shards
+            .get_mut(&shard_id)
+            .ok_or(LogError::ShardNotFound(shard_id))?;
+
+        let before_count = shard.deltas.len() as u64;
+
+        // Compaction: for each hashed_key, keep only the latest delta
+        // (highest sequence number). Tombstones are removed if all
+        // consumers have advanced past them.
+        let gc_boundary = shard.watermarks.gc_boundary().unwrap_or(SequenceNumber(0));
+
+        // Build a map of hashed_key → latest delta.
+        let mut latest: std::collections::HashMap<[u8; 32], &Delta> =
+            std::collections::HashMap::new();
+        for delta in &shard.deltas {
+            let entry = latest.entry(delta.header.hashed_key).or_insert(delta);
+            if delta.header.sequence > entry.header.sequence {
+                *entry = delta;
+            }
+        }
+
+        // Collect the surviving deltas.
+        let surviving: Vec<Delta> = latest
+            .into_values()
+            .filter(|d| {
+                // Remove tombstones that all consumers have passed.
+                if d.header.tombstone && d.header.sequence < gc_boundary {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        let after_count = surviving.len() as u64;
+        shard.deltas = surviving;
+        // Re-sort by sequence to maintain total order.
+        shard.deltas.sort_by_key(|d| d.header.sequence);
+        shard.info.delta_count = after_count;
+
+        Ok(before_count.saturating_sub(after_count))
+    }
 }

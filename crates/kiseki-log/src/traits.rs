@@ -64,4 +64,12 @@ pub trait LogOps {
     /// Run GC: truncate deltas below the minimum consumer watermark.
     /// Returns the new GC boundary.
     fn truncate_log(&mut self, shard_id: ShardId) -> Result<SequenceNumber, LogError>;
+
+    /// Run compaction on a shard: merge deltas by `(hashed_key, sequence)`.
+    ///
+    /// Newer deltas (higher sequence) supersede older ones for the same
+    /// `hashed_key`. Tombstones are removed if all consumers have
+    /// advanced past them. Payloads are carried opaquely — never
+    /// decrypted (I-L7). Returns the number of deltas removed.
+    fn compact_shard(&mut self, shard_id: ShardId) -> Result<u64, LogError>;
 }

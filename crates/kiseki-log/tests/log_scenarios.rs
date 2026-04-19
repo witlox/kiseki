@@ -314,3 +314,75 @@ fn key_out_of_range_rejected() {
     let result = store.append_delta(make_request(shard_id, 0xFF));
     assert!(result.is_err());
 }
+
+// --- Scenario: Automatic compaction merges SSTables ---
+#[test]
+fn compaction_keeps_latest_per_key() {
+    let mut store = setup_store();
+
+    // Append multiple deltas for the same hashed_key.
+    let key = 0x50u8;
+    for _ in 0..5 {
+        store
+            .append_delta(make_request(test_shard_id(), key))
+            .unwrap_or_else(|_| unreachable!());
+    }
+    // Append one delta for a different key.
+    store
+        .append_delta(make_request(test_shard_id(), 0x60))
+        .unwrap_or_else(|_| unreachable!());
+
+    assert_eq!(
+        store
+            .shard_health(test_shard_id())
+            .unwrap_or_else(|_| unreachable!())
+            .delta_count,
+        6
+    );
+
+    let removed = store
+        .compact_shard(test_shard_id())
+        .unwrap_or_else(|_| unreachable!());
+
+    // Should keep 1 for key 0x50 (latest) + 1 for key 0x60 = 2 total.
+    assert_eq!(removed, 4);
+    assert_eq!(
+        store
+            .shard_health(test_shard_id())
+            .unwrap_or_else(|_| unreachable!())
+            .delta_count,
+        2
+    );
+}
+
+// --- Scenario: Compaction removes tombstones past watermark ---
+#[test]
+fn compaction_removes_old_tombstones() {
+    let mut store = setup_store();
+
+    // Append a create, then a delete (tombstone) for the same key.
+    store
+        .append_delta(make_request(test_shard_id(), 0x50))
+        .unwrap_or_else(|_| unreachable!());
+    let mut delete_req = make_request(test_shard_id(), 0x50);
+    delete_req.operation = OperationType::Delete;
+    store
+        .append_delta(delete_req)
+        .unwrap_or_else(|_| unreachable!());
+
+    // Register a consumer that has consumed past both deltas.
+    store
+        .register_consumer(test_shard_id(), "sp-nfs", SequenceNumber(0))
+        .unwrap_or_else(|_| unreachable!());
+    store
+        .advance_watermark(test_shard_id(), "sp-nfs", SequenceNumber(3))
+        .unwrap_or_else(|_| unreachable!());
+
+    let removed = store
+        .compact_shard(test_shard_id())
+        .unwrap_or_else(|_| unreachable!());
+
+    // Tombstone for key 0x50 is the latest, but it's past watermark → removed.
+    // The create is superseded by the delete → removed.
+    assert_eq!(removed, 2);
+}
