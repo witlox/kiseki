@@ -1,36 +1,56 @@
 //! Kiseki storage server — composes all Rust crates into a single binary.
 //!
-//! Phase 12 integration binary. In production this will:
-//! - Compose all data-path contexts (Log, Chunk, Composition, View)
-//! - Start the Transport listener (TCP+TLS with mTLS)
-//! - Start Protocol Gateways (NFS, S3)
-//! - Start the Advisory runtime on an isolated tokio runtime
-//! - Run the discovery responder
-//! - Report node health (clock quality, device health)
-//!
-//! Currently a scaffold that validates all crate dependencies resolve
-//! and prints version info.
+//! Architecture:
+//! - **Main tokio runtime**: data-path contexts (Log, Chunk, Composition,
+//!   View, Gateways) + `KeyManagerService` gRPC
+//! - **Advisory tokio runtime**: isolated per ADR-021 §1, separate gRPC
+//!   listener for `WorkflowAdvisoryService`
+//! - **TCP+TLS listener**: mTLS with Cluster CA for all data-fabric
+//!   connections (I-Auth1)
 
 // Binary crate: allow expect/unwrap for startup and top-level error handling.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+mod config;
+mod runtime;
 
 fn main() {
-    // Validate all crate imports resolve (compile-time integration check).
-    let _ = kiseki_common::time::ClockQuality::Ntp;
-    let _ = kiseki_crypto::aead::Aead::new();
-    let _ = kiseki_log::shard::ShardState::Healthy;
-    let _ = kiseki_keymanager::health::KeyManagerStatus::Healthy;
-    let _ = kiseki_audit::event::AuditEventType::DataRead;
-    let _ = kiseki_chunk::pool::DurabilityStrategy::default();
-    let _ = kiseki_composition::multipart::MultipartState::InProgress;
-    let _ = kiseki_view::descriptor::ProtocolSemantics::Posix;
-    let _ = kiseki_gateway::error::GatewayError::OperationNotSupported(String::new());
-    let _ = kiseki_client::cache::ClientCache::new(5000, 100);
-    let _ = kiseki_advisory::workflow::WorkflowTable::new();
+    let cfg = config::ServerConfig::from_env();
+    eprintln!("kiseki-server starting on {}", cfg.data_addr);
+    eprintln!("  advisory addr: {}", cfg.advisory_addr);
 
-    eprintln!(
-        "kiseki-server: all {} crates linked successfully. \
-         Full server startup not yet implemented (Phase 12 scaffold).",
-        12
-    );
+    // Build the main tokio runtime.
+    let main_rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("kiseki-data")
+        .build()
+        .expect("failed to build main tokio runtime");
+
+    // Build the isolated advisory runtime (ADR-021 §1).
+    let advisory_rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("kiseki-advisory")
+        .worker_threads(2)
+        .build()
+        .expect("failed to build advisory tokio runtime");
+
+    // Start advisory gRPC on the isolated runtime.
+    let advisory_addr = cfg.advisory_addr;
+    let advisory_handle = advisory_rt.spawn(async move {
+        if let Err(e) = runtime::run_advisory(advisory_addr).await {
+            eprintln!("advisory runtime error: {e}");
+        }
+    });
+
+    // Run the main server on the main runtime.
+    main_rt.block_on(async move {
+        if let Err(e) = runtime::run_main(cfg).await {
+            eprintln!("server error: {e}");
+            std::process::exit(1);
+        }
+    });
+
+    // Clean shutdown.
+    advisory_rt.block_on(async { advisory_handle.await.ok() });
+    eprintln!("kiseki-server shut down.");
 }

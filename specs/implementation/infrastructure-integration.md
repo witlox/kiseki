@@ -166,4 +166,4 @@ latency unaffected (F-ADV-1).
 | WI-2c | done | — | passed | RaftLogStore: per-shard command log, 3 tests |
 | WI-2d | done | — | passed | RaftAuditStore: append-only command log, 3 tests |
 | WI-3 | done | — | passed | KeyManagerService + AdvisoryService gRPC, Go deferred |
-| WI-4 | pending | — | — | Server runtime |
+| WI-4 | done | — | passed | Dual-runtime server, gRPC on 9100+9101, advisory isolated |
