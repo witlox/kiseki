@@ -16,6 +16,7 @@
 
 pub mod delta;
 pub mod error;
+pub mod raft_store;
 pub mod shard;
 pub mod store;
 pub mod traits;
@@ -23,6 +24,7 @@ pub mod watermark;
 
 pub use delta::{Delta, DeltaHeader, DeltaPayload, OperationType};
 pub use error::LogError;
+pub use raft_store::RaftLogStore;
 pub use shard::{ShardConfig, ShardInfo, ShardState};
 pub use store::MemShardStore;
 pub use traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};

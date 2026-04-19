@@ -163,7 +163,7 @@ latency unaffected (F-ADV-1).
 | WI-1 | done | — | passed | Fidelity sweep: 1 HIGH, 4 MEDIUM, 8 LOW; 23% scenario coverage |
 | WI-2a | done | — | passed | LogOps &self, KeyManagerOps Arc, AuditOps trait extracted |
 | WI-2b | done | — | passed | RaftKeyStore: command log, state machine, replay, 6 tests |
-| WI-2c | pending | — | — | Log Raft |
+| WI-2c | done | — | passed | RaftLogStore: per-shard command log, 3 tests |
 | WI-2d | pending | — | — | Audit Raft |
 | WI-3 | pending | — | — | gRPC wiring |
 | WI-4 | pending | — | — | Server runtime |
