@@ -16,3 +16,6 @@ futures = "0.3"
 openraft = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
