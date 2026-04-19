@@ -17,6 +17,7 @@ pub mod epoch;
 pub mod error;
 pub mod grpc;
 pub mod health;
+pub mod raft;
 pub mod raft_store;
 pub mod store;
 

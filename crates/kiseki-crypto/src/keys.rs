@@ -42,7 +42,8 @@ impl SystemMasterKey {
 
     /// Access the raw key bytes. Caller must not log, persist, or
     /// transmit this value (I-K8).
-    pub(crate) fn material(&self) -> &[u8; 32] {
+    #[must_use]
+    pub fn material(&self) -> &[u8; 32] {
         &self.material
     }
 }
@@ -94,7 +95,8 @@ impl TenantKek {
 
     /// Access the raw key bytes. Caller must not log, persist, or
     /// transmit this value (I-K8).
-    pub(crate) fn material(&self) -> &[u8; 32] {
+    #[must_use]
+    pub fn material(&self) -> &[u8; 32] {
         &self.material
     }
 }

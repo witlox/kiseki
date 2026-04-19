@@ -44,6 +44,19 @@ pub enum KeyCommand {
     },
 }
 
+// I-K8: Display never prints key material.
+impl std::fmt::Display for KeyCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateEpoch { epoch, .. } => write!(f, "CreateEpoch(epoch={epoch})"),
+            Self::RotateToEpoch { epoch } => write!(f, "RotateToEpoch(epoch={epoch})"),
+            Self::MarkMigrationComplete { epoch } => {
+                write!(f, "MarkMigrationComplete(epoch={epoch})")
+            }
+        }
+    }
+}
+
 /// An epoch entry in the state machine.
 struct EpochEntry {
     key: Arc<SystemMasterKey>,

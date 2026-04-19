@@ -1389,11 +1389,15 @@ name = "kiseki-keymanager"
 version = "0.0.0"
 dependencies = [
  "aws-lc-rs",
+ "futures",
  "kiseki-common",
  "kiseki-crypto",
  "kiseki-proto",
+ "kiseki-raft",
+ "openraft",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tonic",
