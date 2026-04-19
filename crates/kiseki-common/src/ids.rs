@@ -7,16 +7,18 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Opaque node identifier within the cluster. Raw `u64` so HLC can use
 /// it as a final tiebreaker (see `time::HybridLogicalClock`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
 /// Tenant organization identifier — the isolation domain for keys,
 /// quotas, and data (I-T1, I-T3).
 ///
 /// Spec: `ubiquitous-language.md#Organization`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct OrgId(pub uuid::Uuid);
 
 /// Optional project within an organization.
@@ -91,7 +93,7 @@ pub struct ViewId(pub uuid::Uuid);
 
 /// Raft-assigned sequence number within a shard. Monotonic, gap-free,
 /// total order within the shard (I-L1).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct SequenceNumber(pub u64);
 
 impl SequenceNumber {

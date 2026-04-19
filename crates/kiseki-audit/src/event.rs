@@ -5,9 +5,10 @@
 
 use kiseki_common::ids::{OrgId, SequenceNumber};
 use kiseki_common::time::DeltaTimestamp;
+use serde::{Deserialize, Serialize};
 
 /// Audit event type categories.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum AuditEventType {
     // --- Key lifecycle ---
     /// System or tenant key generated.
@@ -55,7 +56,7 @@ pub enum AuditEventType {
 }
 
 /// A single audit event.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// Sequence number within the audit shard (monotonic).
     pub sequence: SequenceNumber,

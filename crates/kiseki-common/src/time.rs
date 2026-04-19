@@ -2,6 +2,8 @@
 //! wall time for duration-based policies, per-node `ClockQuality` for
 //! drift detection (I-T6).
 
+use serde::{Deserialize, Serialize};
+
 use crate::ids::NodeId;
 
 /// The HLC address space is exhausted: both the physical component
@@ -20,7 +22,7 @@ pub struct HlcExhausted;
 /// nodes via the Lamport merge rule implemented by [`HybridLogicalClock::merge`].
 ///
 /// Spec: I-T5, I-T7, `ubiquitous-language.md#Time`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct HybridLogicalClock {
     /// Physical time component, milliseconds since the Unix epoch.
     pub physical_ms: u64,
@@ -155,7 +157,7 @@ impl PartialOrd for HybridLogicalClock {
 /// used for correctness decisions.
 ///
 /// Spec: I-T5, `ubiquitous-language.md#WallClock`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WallTime {
     /// Milliseconds since the Unix epoch in UTC.
     pub millis_since_epoch: u64,
@@ -167,7 +169,7 @@ pub struct WallTime {
 /// staleness bounds involving their timestamps are unreliable.
 ///
 /// Spec: I-T6.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum ClockQuality {
     /// NTP-synchronized.
     Ntp,
@@ -186,7 +188,7 @@ pub enum ClockQuality {
 /// place in the `wall` component.
 ///
 /// Spec: `ubiquitous-language.md#DeltaTimestamp`, I-T5, I-T6, I-T7.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeltaTimestamp {
     /// Ordering clock (authoritative for causality).
     pub hlc: HybridLogicalClock,

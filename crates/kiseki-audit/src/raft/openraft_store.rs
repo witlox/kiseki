@@ -10,11 +10,15 @@ use std::sync::Arc;
 use kiseki_raft::{KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory};
 use openraft::Raft;
 
+use kiseki_common::ids::{OrgId, SequenceNumber};
+
 use super::state_machine::{AuditSmInner, AuditStateMachine};
 use super::types::AuditTypeConfig;
 use crate::error::AuditError;
+use crate::event::AuditEvent;
 use crate::health::{AuditHealth, AuditStatus};
 use crate::raft_store::AuditCommand;
+use crate::store::AuditQuery;
 
 type C = AuditTypeConfig;
 
@@ -87,5 +91,58 @@ impl OpenRaftAuditStore {
             status: AuditStatus::Healthy,
             event_count: inner.event_count,
         }
+    }
+
+    /// Append an `AuditEvent` through Raft consensus.
+    ///
+    /// This is the async equivalent of `AuditOps::append`. The event is
+    /// serialized into an `AuditCommand::AppendEvent` and written through
+    /// the Raft log for consensus-replicated, append-only storage.
+    pub async fn append(&self, event: AuditEvent) -> Result<(), AuditError> {
+        self.raft
+            .client_write(AuditCommand::AppendEvent {
+                tenant_id: event.tenant_id.map(|o| *o.0.as_bytes()),
+                event_type: crate::raft_store::RaftAuditStore::event_type_to_str_pub(
+                    &event.event_type,
+                )
+                .to_owned(),
+                actor: event.actor,
+                description: event.description,
+            })
+            .await
+            .map_err(|_| AuditError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Query audit events from the shared state machine.
+    ///
+    /// Async equivalent of `AuditOps::query`.
+    pub async fn query(&self, q: &AuditQuery) -> Vec<AuditEvent> {
+        let inner = self.state.lock().await;
+        inner.query(q)
+    }
+
+    /// Get the tip (latest sequence number) for a tenant or system shard.
+    ///
+    /// Async equivalent of `AuditOps::tip`.
+    pub async fn tip(&self, tenant_id: Option<OrgId>) -> SequenceNumber {
+        let inner = self.state.lock().await;
+        inner.tip(tenant_id)
+    }
+
+    /// Total event count across all shards.
+    ///
+    /// Async equivalent of `AuditOps::total_events`.
+    pub async fn total_events(&self) -> usize {
+        let inner = self.state.lock().await;
+        inner.total_events()
+    }
+
+    /// Export all events for a specific tenant.
+    ///
+    /// Async equivalent of `AuditOps::tenant_export`.
+    pub async fn tenant_export(&self, tenant_id: OrgId) -> Vec<AuditEvent> {
+        let inner = self.state.lock().await;
+        inner.tenant_export(tenant_id)
     }
 }

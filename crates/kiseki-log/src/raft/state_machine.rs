@@ -5,13 +5,16 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use futures::TryStreamExt;
+use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
 use openraft::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::{EntryResponder, RaftStateMachine, Snapshot};
 use openraft::{EntryPayload, OptionalSend, RaftSnapshotBuilder, StoredMembership};
 use serde::{Deserialize, Serialize};
 
 use super::types::{LogResponse, LogTypeConfig};
+use crate::delta::{Delta, DeltaHeader, DeltaPayload, OperationType};
 use crate::raft_store::LogCommand;
+use crate::watermark::ConsumerWatermarks;
 
 type C = LogTypeConfig;
 
@@ -24,6 +27,103 @@ struct ShardSnapshot {
     tip: u64,
     /// Whether in maintenance mode.
     maintenance: bool,
+    /// Serialized deltas.
+    deltas: Vec<SerializableDelta>,
+    /// Serialized consumer watermarks.
+    watermarks: Vec<(String, u64)>,
+    /// Shard ID bytes (if set).
+    shard_id: Option<[u8; 16]>,
+    /// Tenant ID bytes (if set).
+    tenant_id: Option<[u8; 16]>,
+}
+
+/// Serializable form of a Delta for snapshots.
+#[derive(Clone, Serialize, Deserialize)]
+struct SerializableDelta {
+    sequence: u64,
+    shard_id: [u8; 16],
+    tenant_id: [u8; 16],
+    operation: u8,
+    hashed_key: [u8; 32],
+    tombstone: bool,
+    chunk_refs: Vec<[u8; 32]>,
+    payload_size: u32,
+    has_inline_data: bool,
+    ciphertext: Vec<u8>,
+}
+
+impl SerializableDelta {
+    fn from_delta(d: &Delta) -> Self {
+        Self {
+            sequence: d.header.sequence.0,
+            shard_id: *d.header.shard_id.0.as_bytes(),
+            tenant_id: *d.header.tenant_id.0.as_bytes(),
+            operation: op_to_u8(d.header.operation),
+            hashed_key: d.header.hashed_key,
+            tombstone: d.header.tombstone,
+            chunk_refs: d.header.chunk_refs.iter().map(|c| c.0).collect(),
+            payload_size: d.header.payload_size,
+            has_inline_data: d.header.has_inline_data,
+            ciphertext: d.payload.ciphertext.clone(),
+        }
+    }
+
+    fn to_delta(&self) -> Delta {
+        Delta {
+            header: DeltaHeader {
+                sequence: SequenceNumber(self.sequence),
+                shard_id: ShardId(uuid::Uuid::from_bytes(self.shard_id)),
+                tenant_id: OrgId(uuid::Uuid::from_bytes(self.tenant_id)),
+                operation: u8_to_op(self.operation),
+                timestamp: kiseki_common::time::DeltaTimestamp {
+                    hlc: kiseki_common::time::HybridLogicalClock {
+                        physical_ms: 0,
+                        logical: 0,
+                        node_id: kiseki_common::ids::NodeId(0),
+                    },
+                    wall: kiseki_common::time::WallTime {
+                        millis_since_epoch: 0,
+                        timezone: "UTC".into(),
+                    },
+                    quality: kiseki_common::time::ClockQuality::Ntp,
+                },
+                hashed_key: self.hashed_key,
+                tombstone: self.tombstone,
+                chunk_refs: self
+                    .chunk_refs
+                    .iter()
+                    .map(|b| kiseki_common::ids::ChunkId(*b))
+                    .collect(),
+                payload_size: self.payload_size,
+                has_inline_data: self.has_inline_data,
+            },
+            payload: DeltaPayload {
+                ciphertext: self.ciphertext.clone(),
+            },
+        }
+    }
+}
+
+fn op_to_u8(op: OperationType) -> u8 {
+    match op {
+        OperationType::Create => 0,
+        OperationType::Update => 1,
+        OperationType::Delete => 2,
+        OperationType::Rename => 3,
+        OperationType::SetAttribute => 4,
+        OperationType::Finalize => 5,
+    }
+}
+
+fn u8_to_op(v: u8) -> OperationType {
+    match v {
+        0 => OperationType::Create,
+        1 => OperationType::Update,
+        2 => OperationType::Delete,
+        3 => OperationType::Rename,
+        4 => OperationType::SetAttribute,
+        _ => OperationType::Finalize,
+    }
 }
 
 /// Inner state for the shard state machine.
@@ -31,33 +131,93 @@ pub struct ShardSmInner {
     pub(crate) delta_count: u64,
     pub(crate) tip: u64,
     pub(crate) maintenance: bool,
+    pub(crate) deltas: Vec<Delta>,
+    pub(crate) watermarks: ConsumerWatermarks,
+    pub(crate) shard_id: ShardId,
+    pub(crate) tenant_id: OrgId,
     last_applied_log: Option<LogIdOf<C>>,
     last_membership: StoredMembershipOf<C>,
 }
 
 impl ShardSmInner {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(shard_id: ShardId, tenant_id: OrgId) -> Self {
         Self {
             delta_count: 0,
             tip: 0,
             maintenance: false,
+            deltas: Vec::new(),
+            watermarks: ConsumerWatermarks::new(),
+            shard_id,
+            tenant_id,
             last_applied_log: None,
             last_membership: StoredMembershipOf::<C>::default(),
         }
     }
 
-    fn apply_command(&mut self, cmd: &LogCommand) -> LogResponse {
+    fn apply_command(&mut self, cmd: &LogCommand, log_index: u64) -> LogResponse {
         match cmd {
-            LogCommand::AppendDelta { .. } => {
+            LogCommand::AppendDelta {
+                tenant_id_bytes,
+                operation,
+                hashed_key,
+                chunk_refs,
+                payload,
+                has_inline_data,
+            } => {
                 self.tip += 1;
                 self.delta_count += 1;
+                let next_seq = SequenceNumber(self.tip);
+
+                #[allow(clippy::cast_possible_truncation)]
+                let payload_size = payload.len() as u32;
+
+                let op = u8_to_op(*operation);
+
+                let timestamp = kiseki_common::time::DeltaTimestamp {
+                    hlc: kiseki_common::time::HybridLogicalClock {
+                        physical_ms: log_index,
+                        logical: 0,
+                        node_id: kiseki_common::ids::NodeId(0),
+                    },
+                    wall: kiseki_common::time::WallTime {
+                        millis_since_epoch: log_index,
+                        timezone: "UTC".into(),
+                    },
+                    quality: kiseki_common::time::ClockQuality::Ntp,
+                };
+
+                let delta = Delta {
+                    header: DeltaHeader {
+                        sequence: next_seq,
+                        shard_id: self.shard_id,
+                        tenant_id: OrgId(uuid::Uuid::from_bytes(*tenant_id_bytes)),
+                        operation: op,
+                        timestamp,
+                        hashed_key: *hashed_key,
+                        tombstone: *operation == 2,
+                        chunk_refs: chunk_refs
+                            .iter()
+                            .map(|b| kiseki_common::ids::ChunkId(*b))
+                            .collect(),
+                        payload_size,
+                        has_inline_data: *has_inline_data,
+                    },
+                    payload: DeltaPayload {
+                        ciphertext: payload.clone(),
+                    },
+                };
+
+                self.deltas.push(delta);
                 LogResponse::Appended(self.tip)
             }
             LogCommand::SetMaintenance { enabled } => {
                 self.maintenance = *enabled;
                 LogResponse::Ok
             }
-            LogCommand::AdvanceWatermark { .. } => LogResponse::Ok,
+            LogCommand::AdvanceWatermark { consumer, position } => {
+                self.watermarks.advance(consumer, SequenceNumber(*position));
+                LogResponse::Ok
+            }
         }
     }
 }
@@ -81,6 +241,14 @@ impl RaftSnapshotBuilder<C> for ShardStateMachine {
             delta_count: inner.delta_count,
             tip: inner.tip,
             maintenance: inner.maintenance,
+            deltas: inner
+                .deltas
+                .iter()
+                .map(SerializableDelta::from_delta)
+                .collect(),
+            watermarks: inner.watermarks.as_vec(),
+            shard_id: Some(*inner.shard_id.0.as_bytes()),
+            tenant_id: Some(*inner.tenant_id.0.as_bytes()),
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
         let snapshot_id = format!(
@@ -118,10 +286,11 @@ impl RaftStateMachine<C> for ShardStateMachine {
     {
         let mut inner = self.inner.lock().await;
         while let Some((entry, responder)) = entries.try_next().await? {
+            let log_index = entry.log_id.index();
             inner.last_applied_log = Some(entry.log_id);
             let response = match &entry.payload {
                 EntryPayload::Blank => LogResponse::Ok,
-                EntryPayload::Normal(cmd) => inner.apply_command(cmd),
+                EntryPayload::Normal(cmd) => inner.apply_command(cmd, log_index),
                 EntryPayload::Membership(mem) => {
                     inner.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
                     LogResponse::Ok
@@ -152,6 +321,22 @@ impl RaftStateMachine<C> for ShardStateMachine {
         inner.delta_count = snap.delta_count;
         inner.tip = snap.tip;
         inner.maintenance = snap.maintenance;
+        inner.deltas = snap
+            .deltas
+            .iter()
+            .map(SerializableDelta::to_delta)
+            .collect();
+        let mut wm = ConsumerWatermarks::new();
+        for (consumer, pos) in &snap.watermarks {
+            wm.advance(consumer, SequenceNumber(*pos));
+        }
+        inner.watermarks = wm;
+        if let Some(sid) = snap.shard_id {
+            inner.shard_id = ShardId(uuid::Uuid::from_bytes(sid));
+        }
+        if let Some(tid) = snap.tenant_id {
+            inner.tenant_id = OrgId(uuid::Uuid::from_bytes(tid));
+        }
         inner.last_applied_log = meta.last_log_id;
         inner.last_membership = meta.last_membership.clone();
         Ok(())
@@ -166,6 +351,14 @@ impl RaftStateMachine<C> for ShardStateMachine {
             delta_count: inner.delta_count,
             tip: inner.tip,
             maintenance: inner.maintenance,
+            deltas: inner
+                .deltas
+                .iter()
+                .map(SerializableDelta::from_delta)
+                .collect(),
+            watermarks: inner.watermarks.as_vec(),
+            shard_id: Some(*inner.shard_id.0.as_bytes()),
+            tenant_id: Some(*inner.tenant_id.0.as_bytes()),
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
         let meta = SnapshotMetaOf::<C> {

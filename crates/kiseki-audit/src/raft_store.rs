@@ -165,6 +165,12 @@ impl RaftAuditStore {
         }
     }
 
+    /// Convert an `AuditEventType` to its string representation.
+    #[must_use]
+    pub fn event_type_to_str_pub(t: &AuditEventType) -> &'static str {
+        Self::event_type_to_str(t)
+    }
+
     fn event_type_to_str(t: &AuditEventType) -> &'static str {
         match t {
             AuditEventType::KeyGeneration => "KeyGeneration",

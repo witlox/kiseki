@@ -70,6 +70,15 @@ impl ConsumerWatermarks {
     pub fn consumer_count(&self) -> usize {
         self.watermarks.len()
     }
+
+    /// Serialize watermarks as a vector of (consumer, position) pairs.
+    #[must_use]
+    pub fn as_vec(&self) -> Vec<(String, u64)> {
+        self.watermarks
+            .iter()
+            .map(|(k, v)| (k.clone(), v.0))
+            .collect()
+    }
 }
 
 #[cfg(test)]
