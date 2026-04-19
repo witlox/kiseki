@@ -165,5 +165,5 @@ latency unaffected (F-ADV-1).
 | WI-2b | done | — | passed | RaftKeyStore: command log, state machine, replay, 6 tests |
 | WI-2c | done | — | passed | RaftLogStore: per-shard command log, 3 tests |
 | WI-2d | done | — | passed | RaftAuditStore: append-only command log, 3 tests |
-| WI-3 | pending | — | — | gRPC wiring |
+| WI-3 | done | — | passed | KeyManagerService + AdvisoryService gRPC, Go deferred |
 | WI-4 | pending | — | — | Server runtime |

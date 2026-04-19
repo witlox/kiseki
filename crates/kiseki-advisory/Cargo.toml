@@ -13,7 +13,11 @@ workspace = true
 [dependencies]
 kiseki-common = { path = "../kiseki-common" }
 kiseki-audit = { path = "../kiseki-audit" }
+kiseki-proto = { path = "../kiseki-proto" }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tonic = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

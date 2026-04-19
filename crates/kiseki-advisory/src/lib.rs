@@ -17,6 +17,7 @@
 
 pub mod budget;
 pub mod error;
+pub mod grpc;
 pub mod lookup;
 pub mod workflow;
 
