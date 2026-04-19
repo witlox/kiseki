@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -19,17 +20,45 @@ use crate::config::TlsConfig;
 use crate::error::TransportError;
 use crate::traits::{Connection, PeerIdentity, Transport};
 
+/// Timeout configuration for transport connections.
+#[derive(Clone, Copy, Debug)]
+pub struct TimeoutConfig {
+    /// TCP connection timeout. Default: 5 seconds.
+    pub connect: Duration,
+    /// TLS handshake timeout. Default: 10 seconds.
+    pub handshake: Duration,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(5),
+            handshake: Duration::from_secs(10),
+        }
+    }
+}
+
 /// TCP+TLS transport with mutual TLS authentication.
 #[derive(Debug, Clone)]
 pub struct TcpTlsTransport {
     config: TlsConfig,
+    timeouts: TimeoutConfig,
 }
 
 impl TcpTlsTransport {
-    /// Create a new TCP+TLS transport from TLS configuration.
+    /// Create a new TCP+TLS transport with default timeouts.
     #[must_use]
     pub fn new(config: TlsConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            timeouts: TimeoutConfig::default(),
+        }
+    }
+
+    /// Create with explicit timeout configuration.
+    #[must_use]
+    pub fn with_timeouts(config: TlsConfig, timeouts: TimeoutConfig) -> Self {
+        Self { config, timeouts }
     }
 }
 
@@ -37,19 +66,32 @@ impl Transport for TcpTlsTransport {
     type Conn = TcpTlsConnection;
 
     async fn connect(&self, addr: SocketAddr) -> Result<TcpTlsConnection, TransportError> {
-        let tcp = TcpStream::connect(addr)
+        // TCP connection with timeout.
+        let tcp = tokio::time::timeout(self.timeouts.connect, TcpStream::connect(addr))
             .await
+            .map_err(|_| {
+                TransportError::Timeout(format!(
+                    "TCP connect to {addr} timed out after {:?}",
+                    self.timeouts.connect
+                ))
+            })?
             .map_err(|e| TransportError::ConnectionFailed(format!("{addr}: {e}")))?;
 
-        // Use IP address as SNI (storage fabric nodes don't use DNS names).
+        // TLS handshake with timeout.
         let server_name = ServerName::IpAddress(addr.ip().into());
 
-        let tls = self
-            .config
-            .connector()
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| TransportError::TlsHandshakeFailed(e.to_string()))?;
+        let tls = tokio::time::timeout(
+            self.timeouts.handshake,
+            self.config.connector().connect(server_name, tcp),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Timeout(format!(
+                "TLS handshake with {addr} timed out after {:?}",
+                self.timeouts.handshake
+            ))
+        })?
+        .map_err(|e| TransportError::TlsHandshakeFailed(e.to_string()))?;
 
         // Extract peer identity from the server's certificate.
         let identity = extract_peer_identity(&tls)?;

@@ -26,5 +26,5 @@ pub mod verbs;
 
 pub use config::TlsConfig;
 pub use error::TransportError;
-pub use tcp_tls::TcpTlsTransport;
+pub use tcp_tls::{TcpTlsTransport, TimeoutConfig};
 pub use traits::{Connection, PeerIdentity, Transport};

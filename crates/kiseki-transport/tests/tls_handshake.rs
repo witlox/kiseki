@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use kiseki_transport::config::TlsConfig;
+use kiseki_transport::tcp_tls::TimeoutConfig;
 use kiseki_transport::traits::{Connection, Transport};
 use kiseki_transport::TcpTlsTransport;
 use rcgen::{CertificateParams, KeyPair};
@@ -218,4 +219,49 @@ fn server_config_empty_ca_rejected() {
     ensure_crypto_provider();
     let result = TlsConfig::server_config(b"", b"cert", b"key");
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn connect_timeout_fires() {
+    ensure_crypto_provider();
+    let (ca_pem, _ca_key, ca) = generate_ca();
+    let (client_cert, client_key) = generate_node_cert(
+        &ca,
+        "client",
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    );
+
+    let config = TlsConfig::from_pem(
+        ca_pem.as_bytes(),
+        client_cert.as_bytes(),
+        client_key.as_bytes(),
+    )
+    .unwrap_or_else(|_| unreachable!());
+
+    // Use a very short timeout and connect to a non-routable address.
+    let timeouts = TimeoutConfig {
+        connect: std::time::Duration::from_millis(50),
+        handshake: std::time::Duration::from_secs(1),
+    };
+    let transport = TcpTlsTransport::with_timeouts(config, timeouts);
+
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737) — guaranteed non-routable.
+    let result = transport
+        .connect("192.0.2.1:9999".parse().unwrap_or_else(|_| unreachable!()))
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("timed out") || err_msg.contains("connect"),
+        "expected timeout or connection error, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn default_timeouts_used() {
+    let timeouts = TimeoutConfig::default();
+    assert_eq!(timeouts.connect, std::time::Duration::from_secs(5));
+    assert_eq!(timeouts.handshake, std::time::Duration::from_secs(10));
 }
