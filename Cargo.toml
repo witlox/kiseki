@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kiseki-common",
+    "crates/kiseki-crypto",
     "crates/kiseki-proto",
 ]
 
@@ -40,6 +41,8 @@ unimplemented = "deny"
 thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
+aws-lc-rs = { version = "1", features = ["alloc"] }
+flate2 = "1"
 
 # --- Async / time ---
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

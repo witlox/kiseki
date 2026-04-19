@@ -1,0 +1,31 @@
+[package]
+name = "kiseki-crypto"
+description = "FIPS-validated cryptography for Kiseki: AEAD, HKDF, envelope encryption, chunk ID derivation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["fips"]
+fips = ["aws-lc-rs/fips"]
+compression = ["flate2"]
+
+[dependencies]
+kiseki-common = { path = "../kiseki-common" }
+aws-lc-rs = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+# Optional: compress-then-encrypt (I-K14, tenant opt-in)
+flate2 = { version = "1", optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+cucumber = { workspace = true }
+tokio = { workspace = true }
