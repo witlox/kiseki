@@ -380,7 +380,7 @@ auditor fidelity HIGH across all contexts.
 | 1 | done | — | — | `phase1-gate2.md` | — | kiseki-crypto: 2 High resolved, 1 Medium resolved, 1 Low resolved |
 | 2 | done | — | — | `phase2-gate2.md` | — | kiseki-transport: 0 blocking, 3 Medium + 2 Low deferred |
 | 3 | done | — | — | `phase3-gate2.md` | — | kiseki-log: 1 blocking resolved (compaction), Raft deferred |
-| 4 | impl complete | — | — | — | — | kiseki-keymanager: epochs, rotation, health, MemKeyStore |
+| 4 | done | — | — | `phase4-gate2.md` | — | kiseki-keymanager: Raft deferred, 0 blocking |
 | 5 | pending | — | — | — | — | |
 | 6 | pending | — | — | — | — | |
 | 7 | pending | — | — | — | — | |
