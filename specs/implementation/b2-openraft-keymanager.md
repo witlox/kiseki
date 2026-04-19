@@ -1,6 +1,18 @@
 # B.2: openraft Integration for kiseki-keymanager
 
-**Status**: Planned. **Created**: 2026-04-19.
+**Status**: In progress. **Created**: 2026-04-19. **Updated**: 2026-04-19.
+
+**Phase 1 (async KeyManagerOps) complete at `68941d5`.**
+**Phases 2-5 stashed** — openraft 0.10.0-alpha.17 API has significant
+differences from documentation:
+- `Vote<LID>` takes `RaftLeaderId`, not `NodeId`
+- `LogId` uses `CommittedLeaderId`, not raw `NodeId`
+- `RaftNetwork` methods have different signatures than documented
+- Must use `openraft::type_config::alias::*` for all types
+- 34 compile errors remaining in WIP (stash: "WIP: B.2 openraft")
+
+**Next session**: unstash, study openraft 0.10 source for correct
+type aliases, fix all 34 errors, then test.
 
 ## Overview
 
