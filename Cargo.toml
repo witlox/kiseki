@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kiseki-audit",
+    "crates/kiseki-chunk",
     "crates/kiseki-common",
     "crates/kiseki-crypto",
     "crates/kiseki-keymanager",

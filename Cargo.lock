@@ -1033,6 +1033,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-chunk"
+version = "0.0.0"
+dependencies = [
+ "kiseki-common",
+ "kiseki-crypto",
+ "kiseki-keymanager",
+ "proptest",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "kiseki-common"
 version = "0.0.0"
 dependencies = [
