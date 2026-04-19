@@ -19,4 +19,4 @@ pub mod event;
 pub mod store;
 
 pub use event::{AuditEvent, AuditEventType};
-pub use store::{AuditLog, AuditQuery};
+pub use store::{AuditLog, AuditOps, AuditQuery};

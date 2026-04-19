@@ -1,6 +1,9 @@
 //! In-memory key store — reference implementation of [`KeyManagerOps`].
 //!
-//! Production use will replace with a Raft-backed store (ADR-007).
+//! Uses `Mutex` for interior mutability so that `KeyManagerOps` methods
+//! can take `&self` (required for Raft-backed implementations).
+
+use std::sync::{Arc, Mutex};
 
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::keys::SystemMasterKey;
@@ -11,43 +14,50 @@ use crate::health::{KeyManagerHealth, KeyManagerStatus};
 
 /// Entry for a single epoch in the key store.
 struct EpochEntry {
-    key: SystemMasterKey,
+    key: Arc<SystemMasterKey>,
     is_current: bool,
     migration_complete: bool,
 }
 
-/// In-memory key store for testing and development.
-pub struct MemKeyStore {
+/// Inner state behind the mutex.
+struct Inner {
     epochs: Vec<EpochEntry>,
     status: KeyManagerStatus,
+}
+
+/// In-memory key store for testing and development.
+pub struct MemKeyStore {
+    inner: Mutex<Inner>,
 }
 
 impl MemKeyStore {
     /// Create an empty key store and generate the initial epoch (epoch 1).
     pub fn new() -> Result<Self, KeyManagerError> {
-        let mut store = Self {
-            epochs: Vec::new(),
+        let key_material = generate_master_key()?;
+        let inner = Inner {
+            epochs: vec![EpochEntry {
+                key: Arc::new(SystemMasterKey::new(key_material, KeyEpoch(1))),
+                is_current: true,
+                migration_complete: true,
+            }],
             status: KeyManagerStatus::Healthy,
         };
-
-        // Generate the initial master key (epoch 1).
-        let key_material = generate_master_key()?;
-        store.epochs.push(EpochEntry {
-            key: SystemMasterKey::new(key_material, KeyEpoch(1)),
-            is_current: true,
-            migration_complete: true, // initial epoch has nothing to migrate
-        });
-
-        Ok(store)
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
     }
 
     /// Get the health status of this key store.
     #[must_use]
     pub fn health(&self) -> KeyManagerHealth {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         KeyManagerHealth {
-            status: self.status,
-            epoch_count: self.epochs.len(),
-            current_epoch: self
+            status: inner.status,
+            epoch_count: inner.epochs.len(),
+            current_epoch: inner
                 .epochs
                 .iter()
                 .find(|e| e.is_current)
@@ -56,65 +66,87 @@ impl MemKeyStore {
     }
 
     /// Set the status (for testing failure scenarios).
-    pub fn set_status(&mut self, status: KeyManagerStatus) {
-        self.status = status;
+    pub fn set_status(&self, status: KeyManagerStatus) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.status = status;
     }
 }
 
 impl Default for MemKeyStore {
     fn default() -> Self {
         Self::new().unwrap_or_else(|_| Self {
-            epochs: Vec::new(),
-            status: KeyManagerStatus::Unavailable,
+            inner: Mutex::new(Inner {
+                epochs: Vec::new(),
+                status: KeyManagerStatus::Unavailable,
+            }),
         })
     }
 }
 
 impl KeyManagerOps for MemKeyStore {
-    fn fetch_master_key(&self, epoch: KeyEpoch) -> Result<&SystemMasterKey, KeyManagerError> {
-        if self.status == KeyManagerStatus::Unavailable {
+    fn fetch_master_key(&self, epoch: KeyEpoch) -> Result<Arc<SystemMasterKey>, KeyManagerError> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
-        self.epochs
+        inner
+            .epochs
             .iter()
             .find(|e| e.key.epoch == epoch)
-            .map(|e| &e.key)
+            .map(|e| Arc::clone(&e.key))
             .ok_or(KeyManagerError::EpochNotFound(epoch))
     }
 
     fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError> {
-        if self.status == KeyManagerStatus::Unavailable {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
-        self.epochs
+        inner
+            .epochs
             .iter()
             .find(|e| e.is_current)
             .map(|e| e.key.epoch)
             .ok_or(KeyManagerError::Unavailable)
     }
 
-    fn rotate(&mut self) -> Result<KeyEpoch, KeyManagerError> {
-        if self.status == KeyManagerStatus::Unavailable {
+    fn rotate(&self) -> Result<KeyEpoch, KeyManagerError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
 
-        // Determine next epoch number.
-        let next_epoch = self.epochs.iter().map(|e| e.key.epoch.0).max().unwrap_or(0) + 1;
+        let next_epoch = inner
+            .epochs
+            .iter()
+            .map(|e| e.key.epoch.0)
+            .max()
+            .unwrap_or(0)
+            + 1;
 
-        // Generate new master key.
         let key_material = generate_master_key()?;
 
-        // Demote the current epoch.
-        for entry in &mut self.epochs {
+        for entry in &mut inner.epochs {
             if entry.is_current {
                 entry.is_current = false;
             }
         }
 
-        // Insert new epoch as current.
         let new_epoch = KeyEpoch(next_epoch);
-        self.epochs.push(EpochEntry {
-            key: SystemMasterKey::new(key_material, new_epoch),
+        inner.epochs.push(EpochEntry {
+            key: Arc::new(SystemMasterKey::new(key_material, new_epoch)),
             is_current: true,
             migration_complete: false,
         });
@@ -122,8 +154,12 @@ impl KeyManagerOps for MemKeyStore {
         Ok(new_epoch)
     }
 
-    fn mark_migration_complete(&mut self, epoch: KeyEpoch) -> Result<(), KeyManagerError> {
-        let entry = self
+    fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = inner
             .epochs
             .iter_mut()
             .find(|e| e.key.epoch == epoch)
@@ -133,7 +169,12 @@ impl KeyManagerOps for MemKeyStore {
     }
 
     fn list_epochs(&self) -> Vec<EpochInfo> {
-        self.epochs
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .epochs
             .iter()
             .map(|e| EpochInfo {
                 epoch: e.key.epoch,
@@ -146,10 +187,7 @@ impl KeyManagerOps for MemKeyStore {
 
 impl core::fmt::Debug for MemKeyStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MemKeyStore")
-            .field("epoch_count", &self.epochs.len())
-            .field("status", &self.status)
-            .finish_non_exhaustive()
+        f.debug_struct("MemKeyStore").finish_non_exhaustive()
     }
 }
 

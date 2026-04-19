@@ -4,6 +4,8 @@
 //! two epochs coexist (I-K6). Old epoch keys are retained until all
 //! chunks encrypted under that epoch have been re-wrapped.
 
+use std::sync::Arc;
+
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::keys::SystemMasterKey;
 
@@ -22,6 +24,14 @@ pub struct EpochInfo {
 
 /// Key manager operations trait.
 ///
+/// All mutation methods take `&self` (not `&mut self`) because the
+/// Raft-backed implementation uses interior mutability. In-memory
+/// implementations use `Mutex` internally.
+///
+/// `fetch_master_key` returns `Arc<SystemMasterKey>` (not a reference)
+/// because Raft-backed stores cannot return borrows into replicated
+/// state — the state may be updated between calls.
+///
 /// Implementations: `MemKeyStore` (in-memory, for testing),
 /// Raft-backed store (production, future).
 pub trait KeyManagerOps {
@@ -29,7 +39,7 @@ pub trait KeyManagerOps {
     ///
     /// Returns the key material. The caller (storage node) caches this
     /// locally for HKDF derivation (ADR-003).
-    fn fetch_master_key(&self, epoch: KeyEpoch) -> Result<&SystemMasterKey, KeyManagerError>;
+    fn fetch_master_key(&self, epoch: KeyEpoch) -> Result<Arc<SystemMasterKey>, KeyManagerError>;
 
     /// Get the current (latest) epoch.
     fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError>;
@@ -39,11 +49,11 @@ pub trait KeyManagerOps {
     ///
     /// The previous epoch's key is retained until migration is marked
     /// complete (I-K6). Returns the new epoch.
-    fn rotate(&mut self) -> Result<KeyEpoch, KeyManagerError>;
+    fn rotate(&self) -> Result<KeyEpoch, KeyManagerError>;
 
     /// Mark an old epoch's migration as complete. The key is retained
     /// for reads but no new operations use it.
-    fn mark_migration_complete(&mut self, epoch: KeyEpoch) -> Result<(), KeyManagerError>;
+    fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError>;
 
     /// List all epochs and their status.
     fn list_epochs(&self) -> Vec<EpochInfo>;

@@ -43,14 +43,19 @@ pub struct ReadDeltasRequest {
 
 /// The Log context API.
 ///
+/// All mutation methods take `&self` (not `&mut self`) because the
+/// Raft-backed implementation uses interior mutability — mutations go
+/// through the consensus layer, not direct field access. In-memory
+/// implementations use `Mutex` or `RefCell` internally.
+///
 /// Implementations: `MemShardStore` (in-memory, for testing),
-/// `RaftShardStore` (production, with openraft — future phase).
+/// `RaftShardStore` (production, with openraft — future).
 pub trait LogOps {
     /// Append a delta to a shard. Returns the assigned sequence number.
     ///
     /// Fails if the shard is in maintenance mode, splitting (for
     /// out-of-range keys), or has lost Raft quorum.
-    fn append_delta(&mut self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError>;
+    fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError>;
 
     /// Read deltas in `[from, to]` inclusive from a shard.
     fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError>;
@@ -59,11 +64,11 @@ pub trait LogOps {
     fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError>;
 
     /// Set or clear maintenance mode on a shard (I-O6).
-    fn set_maintenance(&mut self, shard_id: ShardId, enabled: bool) -> Result<(), LogError>;
+    fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError>;
 
     /// Run GC: truncate deltas below the minimum consumer watermark.
     /// Returns the new GC boundary.
-    fn truncate_log(&mut self, shard_id: ShardId) -> Result<SequenceNumber, LogError>;
+    fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError>;
 
     /// Run compaction on a shard: merge deltas by `(hashed_key, sequence)`.
     ///
@@ -71,5 +76,5 @@ pub trait LogOps {
     /// `hashed_key`. Tombstones are removed if all consumers have
     /// advanced past them. Payloads are carried opaquely — never
     /// decrypted (I-L7). Returns the number of deltas removed.
-    fn compact_shard(&mut self, shard_id: ShardId) -> Result<u64, LogError>;
+    fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError>;
 }

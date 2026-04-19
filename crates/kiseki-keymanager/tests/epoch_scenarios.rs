@@ -41,15 +41,15 @@ fn hkdf_derivation_with_fetched_key() {
         .unwrap_or_else(|_| unreachable!());
     let chunk_id = ChunkId([0xab; 32]);
 
-    let dek1 = derive_system_dek(master, &chunk_id).unwrap_or_else(|_| unreachable!());
-    let dek2 = derive_system_dek(master, &chunk_id).unwrap_or_else(|_| unreachable!());
+    let dek1 = derive_system_dek(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
+    let dek2 = derive_system_dek(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
     assert_eq!(*dek1, *dek2);
 }
 
 // --- Scenario: System KEK rotation ---
 #[test]
 fn key_rotation_creates_new_epoch() {
-    let mut store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
+    let store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
 
     let old_epoch = store.current_epoch().unwrap_or_else(|_| unreachable!());
     assert_eq!(old_epoch, KeyEpoch(1));
@@ -78,7 +78,7 @@ fn key_rotation_creates_new_epoch() {
 // --- Scenario: Different epochs yield different DEKs ---
 #[test]
 fn different_epochs_different_deks() {
-    let mut store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
+    let store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
     store.rotate().unwrap_or_else(|_| unreachable!());
 
     let chunk_id = ChunkId([0xcc; 32]);
@@ -89,8 +89,8 @@ fn different_epochs_different_deks() {
         .fetch_master_key(KeyEpoch(2))
         .unwrap_or_else(|_| unreachable!());
 
-    let dek1 = derive_system_dek(key1, &chunk_id).unwrap_or_else(|_| unreachable!());
-    let dek2 = derive_system_dek(key2, &chunk_id).unwrap_or_else(|_| unreachable!());
+    let dek1 = derive_system_dek(&key1, &chunk_id).unwrap_or_else(|_| unreachable!());
+    let dek2 = derive_system_dek(&key2, &chunk_id).unwrap_or_else(|_| unreachable!());
 
     // Different master keys → different DEKs.
     assert_ne!(*dek1, *dek2);
@@ -99,7 +99,7 @@ fn different_epochs_different_deks() {
 // --- Scenario: Mark migration complete ---
 #[test]
 fn mark_migration_complete() {
-    let mut store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
+    let store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
     store.rotate().unwrap_or_else(|_| unreachable!());
 
     store
@@ -117,7 +117,7 @@ fn mark_migration_complete() {
 // --- Scenario: Multiple rotations ---
 #[test]
 fn multiple_rotations() {
-    let mut store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
+    let store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
     store.rotate().unwrap_or_else(|_| unreachable!());
     store.rotate().unwrap_or_else(|_| unreachable!());
 
@@ -136,7 +136,7 @@ fn multiple_rotations() {
 // --- Scenario: System key manager failure ---
 #[test]
 fn unavailable_rejects_requests() {
-    let mut store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
+    let store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
     store.set_status(KeyManagerStatus::Unavailable);
 
     assert!(store.current_epoch().is_err());
@@ -147,7 +147,7 @@ fn unavailable_rejects_requests() {
 // --- Health reporting ---
 #[test]
 fn health_reports_correctly() {
-    let mut store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
+    let store = MemKeyStore::new().unwrap_or_else(|_| unreachable!());
     let health = store.health();
     assert_eq!(health.status, KeyManagerStatus::Healthy);
     assert_eq!(health.epoch_count, 1);

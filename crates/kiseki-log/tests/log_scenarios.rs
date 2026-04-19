@@ -50,7 +50,7 @@ fn make_request(shard_id: ShardId, key_byte: u8) -> AppendDeltaRequest {
 }
 
 fn setup_store() -> MemShardStore {
-    let mut store = MemShardStore::new();
+    let store = MemShardStore::new();
     store.create_shard(
         test_shard_id(),
         test_tenant(),
@@ -63,7 +63,7 @@ fn setup_store() -> MemShardStore {
 // --- Scenario: Successful delta append ---
 #[test]
 fn successful_delta_append() {
-    let mut store = setup_store();
+    let store = setup_store();
     let req = make_request(test_shard_id(), 0x50);
 
     let seq = store.append_delta(req);
@@ -74,7 +74,7 @@ fn successful_delta_append() {
 // --- Scenario: Delta with inline data below threshold ---
 #[test]
 fn inline_data_delta() {
-    let mut store = setup_store();
+    let store = setup_store();
     let mut req = make_request(test_shard_id(), 0x50);
     req.has_inline_data = true;
     req.payload = vec![0xcd; 1024]; // small inline data
@@ -97,7 +97,7 @@ fn inline_data_delta() {
 // --- Scenario: Deltas maintain total order within shard ---
 #[test]
 fn total_order_within_shard() {
-    let mut store = setup_store();
+    let store = setup_store();
 
     let seq1 = store
         .append_delta(make_request(test_shard_id(), 0x10))
@@ -131,7 +131,7 @@ fn total_order_within_shard() {
 // --- Scenario: Maintenance mode rejects writes ---
 #[test]
 fn maintenance_mode_rejects_writes() {
-    let mut store = setup_store();
+    let store = setup_store();
     store
         .set_maintenance(test_shard_id(), true)
         .unwrap_or_else(|_| unreachable!());
@@ -151,7 +151,7 @@ fn maintenance_mode_rejects_writes() {
 // --- Scenario: Exiting maintenance mode resumes writes ---
 #[test]
 fn exit_maintenance_resumes_writes() {
-    let mut store = setup_store();
+    let store = setup_store();
     store
         .set_maintenance(test_shard_id(), true)
         .unwrap_or_else(|_| unreachable!());
@@ -166,7 +166,7 @@ fn exit_maintenance_resumes_writes() {
 // --- Scenario: Delta GC respects all consumer watermarks ---
 #[test]
 fn gc_respects_consumer_watermarks() {
-    let mut store = setup_store();
+    let store = setup_store();
 
     // Append 10 deltas.
     for i in 0..10 {
@@ -211,7 +211,7 @@ fn gc_respects_consumer_watermarks() {
 // --- Scenario: Stream processor reads delta range ---
 #[test]
 fn read_delta_range() {
-    let mut store = setup_store();
+    let store = setup_store();
     for i in 0..20 {
         let key = (i * 10 + 10) as u8;
         store
@@ -236,7 +236,7 @@ fn read_delta_range() {
 // --- Scenario: Shard health reporting ---
 #[test]
 fn shard_health_reports_state() {
-    let mut store = setup_store();
+    let store = setup_store();
     store
         .append_delta(make_request(test_shard_id(), 0x50))
         .unwrap_or_else(|_| unreachable!());
@@ -260,7 +260,7 @@ fn shard_not_found() {
 // --- Scenario: Shard split ---
 #[test]
 fn shard_split_redistributes_deltas() {
-    let mut store = MemShardStore::new();
+    let store = MemShardStore::new();
     store.create_shard(
         test_shard_id(),
         test_tenant(),
@@ -299,7 +299,7 @@ fn shard_split_redistributes_deltas() {
 // --- Scenario: Key out of range rejected ---
 #[test]
 fn key_out_of_range_rejected() {
-    let mut store = MemShardStore::new();
+    let store = MemShardStore::new();
     let shard_id = test_shard_id();
     store.create_shard(shard_id, test_tenant(), test_node(), ShardConfig::default());
 
@@ -318,7 +318,7 @@ fn key_out_of_range_rejected() {
 // --- Scenario: Automatic compaction merges SSTables ---
 #[test]
 fn compaction_keeps_latest_per_key() {
-    let mut store = setup_store();
+    let store = setup_store();
 
     // Append multiple deltas for the same hashed_key.
     let key = 0x50u8;
@@ -358,7 +358,7 @@ fn compaction_keeps_latest_per_key() {
 // --- Scenario: Compaction removes tombstones past watermark ---
 #[test]
 fn compaction_removes_old_tombstones() {
-    let mut store = setup_store();
+    let store = setup_store();
 
     // Append a create, then a delete (tombstone) for the same key.
     store
