@@ -108,7 +108,7 @@ complexity.
 | A.3 | done | — | passed | CRL via server_config_with_crl, 0 blocking |
 | A.4 | done | — | passed | mTLS on both listeners, plaintext fallback for dev |
 | A.5 | done | — | passed | serve_with_shutdown + ctrl_c on both runtimes |
-| B.1 | pending | — | — | openraft scaffold |
+| B.1 | done | — | passed | kiseki-raft crate: KisekiNode, KisekiRaftConfig |
 | B.2 | pending | — | — | Keymanager Raft |
 | B.3 | pending | — | — | Log Raft (per-shard) |
 | B.4 | pending | — | — | Audit Raft |

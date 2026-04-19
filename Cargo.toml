@@ -12,6 +12,7 @@ members = [
     "crates/kiseki-keymanager",
     "crates/kiseki-log",
     "crates/kiseki-proto",
+    "crates/kiseki-raft",
     "crates/kiseki-server",
     "crates/kiseki-transport",
     "crates/kiseki-view",
@@ -56,6 +57,7 @@ aws-lc-rs = { version = "1", features = ["alloc"] }
 flate2 = "1"
 x509-parser = "0.16"
 libc = "0.2"
+openraft = { version = "0.10.0-alpha.17", features = ["serde"] }
 
 # --- Async / time ---
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
