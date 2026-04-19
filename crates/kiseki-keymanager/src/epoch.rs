@@ -24,37 +24,36 @@ pub struct EpochInfo {
 
 /// Key manager operations trait.
 ///
-/// All mutation methods take `&self` (not `&mut self`) because the
-/// Raft-backed implementation uses interior mutability. In-memory
-/// implementations use `Mutex` internally.
+/// All methods are async to support Raft-backed implementations where
+/// writes go through `raft.client_write().await`. In-memory
+/// implementations trivially wrap sync code.
+///
+/// All methods take `&self` — implementations use interior mutability.
 ///
 /// `fetch_master_key` returns `Arc<SystemMasterKey>` (not a reference)
 /// because Raft-backed stores cannot return borrows into replicated
-/// state — the state may be updated between calls.
+/// state.
 ///
 /// Implementations: `MemKeyStore` (in-memory, for testing),
-/// Raft-backed store (production, future).
-pub trait KeyManagerOps {
+/// `RaftKeyStore` (Raft-backed, production).
+#[tonic::async_trait]
+pub trait KeyManagerOps: Send + Sync {
     /// Fetch the master key for a given epoch.
-    ///
-    /// Returns the key material. The caller (storage node) caches this
-    /// locally for HKDF derivation (ADR-003).
-    fn fetch_master_key(&self, epoch: KeyEpoch) -> Result<Arc<SystemMasterKey>, KeyManagerError>;
+    async fn fetch_master_key(
+        &self,
+        epoch: KeyEpoch,
+    ) -> Result<Arc<SystemMasterKey>, KeyManagerError>;
 
     /// Get the current (latest) epoch.
-    fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError>;
+    async fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError>;
 
     /// Rotate the system master key — creates a new epoch with a fresh
     /// CSPRNG-generated master key.
-    ///
-    /// The previous epoch's key is retained until migration is marked
-    /// complete (I-K6). Returns the new epoch.
-    fn rotate(&self) -> Result<KeyEpoch, KeyManagerError>;
+    async fn rotate(&self) -> Result<KeyEpoch, KeyManagerError>;
 
-    /// Mark an old epoch's migration as complete. The key is retained
-    /// for reads but no new operations use it.
-    fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError>;
+    /// Mark an old epoch's migration as complete.
+    async fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError>;
 
     /// List all epochs and their status.
-    fn list_epochs(&self) -> Vec<EpochInfo>;
+    async fn list_epochs(&self) -> Vec<EpochInfo>;
 }

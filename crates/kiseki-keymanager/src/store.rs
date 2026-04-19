@@ -86,8 +86,12 @@ impl Default for MemKeyStore {
     }
 }
 
+#[tonic::async_trait]
 impl KeyManagerOps for MemKeyStore {
-    fn fetch_master_key(&self, epoch: KeyEpoch) -> Result<Arc<SystemMasterKey>, KeyManagerError> {
+    async fn fetch_master_key(
+        &self,
+        epoch: KeyEpoch,
+    ) -> Result<Arc<SystemMasterKey>, KeyManagerError> {
         let inner = self
             .inner
             .lock()
@@ -103,7 +107,7 @@ impl KeyManagerOps for MemKeyStore {
             .ok_or(KeyManagerError::EpochNotFound(epoch))
     }
 
-    fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError> {
+    async fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError> {
         let inner = self
             .inner
             .lock()
@@ -119,7 +123,7 @@ impl KeyManagerOps for MemKeyStore {
             .ok_or(KeyManagerError::Unavailable)
     }
 
-    fn rotate(&self) -> Result<KeyEpoch, KeyManagerError> {
+    async fn rotate(&self) -> Result<KeyEpoch, KeyManagerError> {
         let mut inner = self
             .inner
             .lock()
@@ -154,7 +158,7 @@ impl KeyManagerOps for MemKeyStore {
         Ok(new_epoch)
     }
 
-    fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError> {
+    async fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError> {
         let mut inner = self
             .inner
             .lock()
@@ -168,7 +172,7 @@ impl KeyManagerOps for MemKeyStore {
         Ok(())
     }
 
-    fn list_epochs(&self) -> Vec<EpochInfo> {
+    async fn list_epochs(&self) -> Vec<EpochInfo> {
         let inner = self
             .inner
             .lock()

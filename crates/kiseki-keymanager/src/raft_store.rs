@@ -217,8 +217,12 @@ impl RaftKeyStore {
     }
 }
 
+#[tonic::async_trait]
 impl KeyManagerOps for RaftKeyStore {
-    fn fetch_master_key(&self, epoch: KeyEpoch) -> Result<Arc<SystemMasterKey>, KeyManagerError> {
+    async fn fetch_master_key(
+        &self,
+        epoch: KeyEpoch,
+    ) -> Result<Arc<SystemMasterKey>, KeyManagerError> {
         let state = self
             .state
             .lock()
@@ -234,7 +238,7 @@ impl KeyManagerOps for RaftKeyStore {
             .ok_or(KeyManagerError::EpochNotFound(epoch))
     }
 
-    fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError> {
+    async fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError> {
         let state = self
             .state
             .lock()
@@ -250,7 +254,7 @@ impl KeyManagerOps for RaftKeyStore {
             .ok_or(KeyManagerError::Unavailable)
     }
 
-    fn rotate(&self) -> Result<KeyEpoch, KeyManagerError> {
+    async fn rotate(&self) -> Result<KeyEpoch, KeyManagerError> {
         // Generate new key material.
         let mut key_material = [0u8; 32];
         aws_lc_rs::rand::fill(&mut key_material)
@@ -281,7 +285,7 @@ impl KeyManagerOps for RaftKeyStore {
         Ok(KeyEpoch(next_epoch))
     }
 
-    fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError> {
+    async fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError> {
         {
             let state = self
                 .state
@@ -295,7 +299,7 @@ impl KeyManagerOps for RaftKeyStore {
         Ok(())
     }
 
-    fn list_epochs(&self) -> Vec<EpochInfo> {
+    async fn list_epochs(&self) -> Vec<EpochInfo> {
         let state = self
             .state
             .lock()
@@ -326,72 +330,79 @@ mod tests {
     use kiseki_common::ids::ChunkId;
     use kiseki_crypto::hkdf::derive_system_dek;
 
-    #[test]
-    fn bootstrap_creates_epoch_1() {
+    #[tokio::test]
+    async fn bootstrap_creates_epoch_1() {
         let store = RaftKeyStore::new().unwrap_or_else(|_| unreachable!());
         assert_eq!(
-            store.current_epoch().unwrap_or_else(|_| unreachable!()),
+            store
+                .current_epoch()
+                .await
+                .unwrap_or_else(|_| unreachable!()),
             KeyEpoch(1)
         );
-        assert!(store.fetch_master_key(KeyEpoch(1)).is_ok());
+        assert!(store.fetch_master_key(KeyEpoch(1)).await.is_ok());
     }
 
-    #[test]
-    fn rotate_via_command_log() {
+    #[tokio::test]
+    async fn rotate_via_command_log() {
         let store = RaftKeyStore::new().unwrap_or_else(|_| unreachable!());
-        let new_epoch = store.rotate().unwrap_or_else(|_| unreachable!());
+        let new_epoch = store.rotate().await.unwrap_or_else(|_| unreachable!());
         assert_eq!(new_epoch, KeyEpoch(2));
 
-        // Both epochs accessible.
-        assert!(store.fetch_master_key(KeyEpoch(1)).is_ok());
-        assert!(store.fetch_master_key(KeyEpoch(2)).is_ok());
+        assert!(store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+        assert!(store.fetch_master_key(KeyEpoch(2)).await.is_ok());
 
-        // Current is epoch 2.
         assert_eq!(
-            store.current_epoch().unwrap_or_else(|_| unreachable!()),
+            store
+                .current_epoch()
+                .await
+                .unwrap_or_else(|_| unreachable!()),
             KeyEpoch(2)
         );
 
-        // Log has 3 entries: create(1), migrate_complete(1), create(2).
         assert_eq!(store.log_length(), 3);
     }
 
-    #[test]
-    fn replay_rebuilds_state() {
+    #[tokio::test]
+    async fn replay_rebuilds_state() {
         let store = RaftKeyStore::new().unwrap_or_else(|_| unreachable!());
-        store.rotate().unwrap_or_else(|_| unreachable!());
+        store.rotate().await.unwrap_or_else(|_| unreachable!());
         store
             .mark_migration_complete(KeyEpoch(2))
+            .await
             .unwrap_or_else(|_| unreachable!());
 
-        // Get key before replay.
         let key_before = store
             .fetch_master_key(KeyEpoch(1))
+            .await
             .unwrap_or_else(|_| unreachable!());
 
-        // Replay from log.
         store.replay();
 
-        // State should be identical.
         let key_after = store
             .fetch_master_key(KeyEpoch(1))
+            .await
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(key_before.epoch, key_after.epoch);
         assert_eq!(
-            store.current_epoch().unwrap_or_else(|_| unreachable!()),
+            store
+                .current_epoch()
+                .await
+                .unwrap_or_else(|_| unreachable!()),
             KeyEpoch(2)
         );
 
-        let epochs = store.list_epochs();
+        let epochs = store.list_epochs().await;
         let e2 = epochs.iter().find(|e| e.epoch == KeyEpoch(2));
         assert!(e2.is_some_and(|e| e.migration_complete));
     }
 
-    #[test]
-    fn hkdf_works_with_raft_store() {
+    #[tokio::test]
+    async fn hkdf_works_with_raft_store() {
         let store = RaftKeyStore::new().unwrap_or_else(|_| unreachable!());
         let master = store
             .fetch_master_key(KeyEpoch(1))
+            .await
             .unwrap_or_else(|_| unreachable!());
         let chunk_id = ChunkId([0xab; 32]);
 
@@ -400,28 +411,27 @@ mod tests {
         assert_eq!(*dek1, *dek2);
     }
 
-    #[test]
-    fn idempotent_replay() {
+    #[tokio::test]
+    async fn idempotent_replay() {
         let store = RaftKeyStore::new().unwrap_or_else(|_| unreachable!());
-
-        // Apply same command twice via replay — should not duplicate epochs.
         store.replay();
         store.replay();
-
-        assert_eq!(store.list_epochs().len(), 1);
+        assert_eq!(store.list_epochs().await.len(), 1);
     }
 
-    #[test]
-    fn different_epochs_different_keys() {
+    #[tokio::test]
+    async fn different_epochs_different_keys() {
         let store = RaftKeyStore::new().unwrap_or_else(|_| unreachable!());
-        store.rotate().unwrap_or_else(|_| unreachable!());
+        store.rotate().await.unwrap_or_else(|_| unreachable!());
 
         let chunk_id = ChunkId([0xcc; 32]);
         let key1 = store
             .fetch_master_key(KeyEpoch(1))
+            .await
             .unwrap_or_else(|_| unreachable!());
         let key2 = store
             .fetch_master_key(KeyEpoch(2))
+            .await
             .unwrap_or_else(|_| unreachable!());
 
         let dek1 = derive_system_dek(&key1, &chunk_id).unwrap_or_else(|_| unreachable!());

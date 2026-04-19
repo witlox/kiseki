@@ -62,6 +62,7 @@ impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerG
         let _key = self
             .ops
             .fetch_master_key(epoch)
+            .await
             .map_err(|e| to_status(&e))?;
 
         Ok(Response::new(FetchMasterKeyResponse {
@@ -76,10 +77,11 @@ impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerG
         &self,
         _request: Request<CurrentEpochRequest>,
     ) -> Result<Response<CurrentEpochResponse>, Status> {
-        let epoch = self.ops.current_epoch().map_err(|e| to_status(&e))?;
+        let epoch = self.ops.current_epoch().await.map_err(|e| to_status(&e))?;
         let retained: Vec<kiseki_proto::v1::KeyEpoch> = self
             .ops
             .list_epochs()
+            .await
             .into_iter()
             .filter(|e| !e.is_current)
             .map(|e| to_proto_epoch(e.epoch))
@@ -95,7 +97,7 @@ impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerG
         &self,
         _request: Request<RotateSystemKeyRequest>,
     ) -> Result<Response<RotateSystemKeyResponse>, Status> {
-        let new_epoch = self.ops.rotate().map_err(|e| to_status(&e))?;
+        let new_epoch = self.ops.rotate().await.map_err(|e| to_status(&e))?;
         Ok(Response::new(RotateSystemKeyResponse {
             new_epoch: Some(to_proto_epoch(new_epoch)),
         }))
@@ -105,7 +107,7 @@ impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerG
         &self,
         _request: Request<KeyManagerHealthRequest>,
     ) -> Result<Response<KeyManagerHealthResponse>, Status> {
-        let epoch = self.ops.current_epoch().map_err(|e| to_status(&e))?;
+        let epoch = self.ops.current_epoch().await.map_err(|e| to_status(&e))?;
         Ok(Response::new(KeyManagerHealthResponse {
             current_epoch: Some(to_proto_epoch(epoch)),
             raft_members: Vec::new(), // filled by Raft layer
