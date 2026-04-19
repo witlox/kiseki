@@ -77,6 +77,86 @@ impl RaftAuditStore {
             .len()
     }
 
+    /// Replay the command log to rebuild state (e.g., after snapshot restore).
+    pub fn replay(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let log = inner.log.clone();
+        inner.shards.clear();
+        inner.last_applied = 0;
+
+        for (index, cmd) in &log {
+            if *index <= inner.last_applied {
+                continue;
+            }
+            inner.last_applied = *index;
+
+            let AuditCommand::AppendEvent {
+                tenant_id,
+                event_type,
+                actor,
+                description,
+            } = cmd;
+            {
+                let org_id = tenant_id.map(|b| OrgId(uuid::Uuid::from_bytes(b)));
+                let key = org_id.map_or(ShardKey::System, ShardKey::Tenant);
+                let shard = inner.shards.entry(key).or_insert_with(|| AuditShard {
+                    events: Vec::new(),
+                    tip: SequenceNumber(0),
+                });
+
+                let next_seq = SequenceNumber(shard.tip.0 + 1);
+                let timestamp = kiseki_common::time::DeltaTimestamp {
+                    hlc: kiseki_common::time::HybridLogicalClock {
+                        physical_ms: *index,
+                        logical: 0,
+                        node_id: kiseki_common::ids::NodeId(0),
+                    },
+                    wall: kiseki_common::time::WallTime {
+                        millis_since_epoch: *index,
+                        timezone: "UTC".into(),
+                    },
+                    quality: kiseki_common::time::ClockQuality::Ntp,
+                };
+
+                shard.events.push(AuditEvent {
+                    sequence: next_seq,
+                    timestamp,
+                    event_type: Self::event_type_from_str(event_type),
+                    tenant_id: org_id,
+                    actor: actor.clone(),
+                    description: description.clone(),
+                });
+                shard.tip = next_seq;
+            }
+        }
+    }
+
+    fn event_type_from_str(s: &str) -> AuditEventType {
+        match s {
+            "KeyGeneration" => AuditEventType::KeyGeneration,
+            "KeyRotation" => AuditEventType::KeyRotation,
+            "KeyDestruction" => AuditEventType::KeyDestruction,
+            "KeyAccess" => AuditEventType::KeyAccess,
+            "ReEncryption" => AuditEventType::ReEncryption,
+            "DataRead" => AuditEventType::DataRead,
+            "DataWrite" => AuditEventType::DataWrite,
+            "DataDelete" => AuditEventType::DataDelete,
+            "AuthSuccess" => AuditEventType::AuthSuccess,
+            "AuthFailure" => AuditEventType::AuthFailure,
+            "TenantLifecycle" => AuditEventType::TenantLifecycle,
+            "PolicyChange" => AuditEventType::PolicyChange,
+            "MaintenanceMode" => AuditEventType::MaintenanceMode,
+            "AdvisoryWorkflow" => AuditEventType::AdvisoryWorkflow,
+            "AdvisoryHint" => AuditEventType::AdvisoryHint,
+            "AdvisoryBudgetExceeded" => AuditEventType::AdvisoryBudgetExceeded,
+            _ => AuditEventType::AdminAction,
+        }
+    }
+
     fn event_type_to_str(t: &AuditEventType) -> &'static str {
         match t {
             AuditEventType::KeyGeneration => "KeyGeneration",
@@ -266,5 +346,29 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].sequence, SequenceNumber(1));
         assert_eq!(events[1].sequence, SequenceNumber(2));
+    }
+
+    #[test]
+    fn replay_rebuilds_state() {
+        let store = RaftAuditStore::new();
+        store.append(make_event(Some(test_tenant()), AuditEventType::DataWrite));
+        store.append(make_event(Some(test_tenant()), AuditEventType::KeyRotation));
+        store.append(make_event(None, AuditEventType::AdminAction));
+
+        // Replay from log.
+        store.replay();
+
+        // State should be identical after replay.
+        assert_eq!(store.tip(Some(test_tenant())), SequenceNumber(2));
+        assert_eq!(store.tip(None), SequenceNumber(1));
+        assert_eq!(store.total_events(), 3);
+
+        let events = store.query(&AuditQuery {
+            tenant_id: Some(test_tenant()),
+            from: SequenceNumber(1),
+            limit: 100,
+            event_type: None,
+        });
+        assert_eq!(events.len(), 2);
     }
 }
