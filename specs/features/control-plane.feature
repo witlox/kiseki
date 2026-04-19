@@ -102,7 +102,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And workload "training-run-42" has 50TB quota, 49TB used
     When a 2TB write is attempted by "training-run-42"
     Then the write is rejected (workload quota exceeded: 49 + 2 > 50)
-    Even though org-level quota has headroom
+    And org-level quota still has headroom
 
   Scenario: Quota adjustment by tenant admin
     Given tenant admin increases workload "training-run-42" quota to 100TB

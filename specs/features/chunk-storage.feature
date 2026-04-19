@@ -8,7 +8,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
       | pool       | device_class | durability | devices |
       | fast-nvme  | NVMe-U.2     | EC 4+2     | 24      |
       | bulk-nvme  | NVMe-QLC     | EC 8+3     | 48      |
-      | meta-nvme  | NVMe-U.2     | replicate-3| 12      |
+      | meta-nvme  | NVMe-U.2     | replicate-3 | 12      |
     And tenant "org-pharma" exists with cross-tenant dedup enabled (default)
     And tenant "org-defense" exists with cross-tenant dedup opted out (HMAC chunk IDs)
 
@@ -72,7 +72,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     Given pool "fast-nvme" is at 95% capacity
     When a new chunk targets "fast-nvme"
     Then the chunk is placed in "fast-nvme" if space exists after cleanup
-    Or the control plane is notified to trigger data migration to "bulk-nvme"
+    And the control plane is notified to trigger data migration to "bulk-nvme" if needed
     And the chunk write is not silently redirected without policy approval
 
   # --- GC and refcounting ---
