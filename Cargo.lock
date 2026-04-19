@@ -1294,6 +1294,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-acceptance"
+version = "0.0.0"
+dependencies = [
+ "cucumber",
+ "kiseki-advisory",
+ "kiseki-audit",
+ "kiseki-chunk",
+ "kiseki-common",
+ "kiseki-composition",
+ "kiseki-crypto",
+ "kiseki-keymanager",
+ "kiseki-log",
+ "kiseki-view",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "kiseki-advisory"
 version = "0.0.0"
 dependencies = [
@@ -1312,9 +1330,13 @@ dependencies = [
 name = "kiseki-audit"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "kiseki-common",
+ "kiseki-raft",
+ "openraft",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -1408,9 +1430,13 @@ dependencies = [
 name = "kiseki-log"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "kiseki-common",
+ "kiseki-raft",
+ "openraft",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -1429,6 +1455,7 @@ dependencies = [
 name = "kiseki-raft"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "kiseki-common",
  "openraft",
  "serde",
