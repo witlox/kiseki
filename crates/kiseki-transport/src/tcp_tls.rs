@@ -164,31 +164,47 @@ impl std::fmt::Debug for TcpTlsConnection {
 
 /// Extract tenant identity from the peer's TLS certificate.
 ///
-/// Parses the OU (Organizational Unit) field of the peer certificate's
-/// subject as the `OrgId`. Falls back to parsing SPIFFE URIs from SANs
-/// (I-Auth3).
+/// Parses the X.509 leaf certificate using `x509-parser`:
+/// 1. OU (Organizational Unit) from the subject → `OrgId`
+/// 2. Fallback: SPIFFE URI from SANs (`spiffe://cluster/org/<id>`) → `OrgId` (I-Auth3)
+/// 3. CN (Common Name) from the subject → `common_name`
+/// 4. SHA-256 fingerprint of the DER-encoded leaf cert
 fn extract_peer_identity(tls: &TlsStream<TcpStream>) -> Result<PeerIdentity, TransportError> {
     let (_, conn) = tls.get_ref();
     let certs = conn
         .peer_certificates()
         .ok_or(TransportError::ClientCertRequired)?;
 
-    let leaf = certs.first().ok_or(TransportError::ClientCertRequired)?;
+    let leaf_der = certs.first().ok_or(TransportError::ClientCertRequired)?;
 
-    // Compute SHA-256 fingerprint of the leaf cert.
-    let fingerprint = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, leaf.as_ref());
+    // SHA-256 fingerprint.
+    let fingerprint = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, leaf_der.as_ref());
     let mut cert_fingerprint = [0u8; 32];
     cert_fingerprint.copy_from_slice(fingerprint.as_ref());
 
-    // Parse the DER certificate to extract subject fields.
-    // Use a lightweight extraction: find the CN and OU from the subject.
-    // For now, derive org_id from the certificate fingerprint as a
-    // placeholder — full X.509 parsing will use x509-parser in Phase 10.
-    let cn = format!("node-{}", hex_prefix(&cert_fingerprint));
-    let org_id = OrgId(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_X500,
-        &cert_fingerprint,
-    ));
+    // Parse X.509.
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf_der.as_ref())
+        .map_err(|e| TransportError::CertNotTrusted(format!("X.509 parse failed: {e}")))?;
+
+    // Extract CN from subject.
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+        .unwrap_or("unknown")
+        .to_owned();
+
+    // Extract OrgId: try OU first, then SPIFFE SAN.
+    let org_id = extract_org_from_ou(&cert)
+        .or_else(|| extract_org_from_spiffe_san(&cert))
+        .unwrap_or_else(|| {
+            // Final fallback: derive from fingerprint (for certs without OU/SPIFFE).
+            OrgId(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_X500,
+                &cert_fingerprint,
+            ))
+        });
 
     Ok(PeerIdentity {
         org_id,
@@ -197,11 +213,53 @@ fn extract_peer_identity(tls: &TlsStream<TcpStream>) -> Result<PeerIdentity, Tra
     })
 }
 
-fn hex_prefix(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(8);
-    for b in bytes.iter().take(4) {
-        let _ = write!(s, "{b:02x}");
+/// Extract `OrgId` from the OU (Organizational Unit) field.
+fn extract_org_from_ou(cert: &x509_parser::certificate::X509Certificate<'_>) -> Option<OrgId> {
+    let ou_str = cert
+        .subject()
+        .iter_organizational_unit()
+        .next()?
+        .as_str()
+        .ok()?;
+
+    // Try parsing as UUID first; fall back to UUID v5 derivation.
+    if let Ok(uuid) = uuid::Uuid::parse_str(ou_str) {
+        Some(OrgId(uuid))
+    } else {
+        Some(OrgId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_X500,
+            ou_str.as_bytes(),
+        )))
     }
-    s
+}
+
+/// Extract `OrgId` from a SPIFFE SAN URI: `spiffe://cluster/org/<id>` (I-Auth3).
+fn extract_org_from_spiffe_san(
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+) -> Option<OrgId> {
+    use x509_parser::extensions::GeneralName;
+
+    let san_ext = cert
+        .extensions()
+        .iter()
+        .find(|ext| ext.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME)?;
+
+    let parsed = san_ext.parsed_extension();
+    if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) = parsed {
+        for name in &san.general_names {
+            if let GeneralName::URI(uri) = name {
+                if let Some(org_str) = uri.strip_prefix("spiffe://cluster/org/") {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(org_str) {
+                        return Some(OrgId(uuid));
+                    }
+                    return Some(OrgId(uuid::Uuid::new_v5(
+                        &uuid::Uuid::NAMESPACE_X500,
+                        org_str.as_bytes(),
+                    )));
+                }
+            }
+        }
+    }
+
+    None
 }

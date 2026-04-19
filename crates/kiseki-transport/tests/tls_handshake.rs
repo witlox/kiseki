@@ -260,6 +260,52 @@ async fn connect_timeout_fires() {
 }
 
 #[tokio::test]
+async fn ou_extracted_as_org_id() {
+    ensure_crypto_provider();
+    let (ca_pem, _ca_key, ca) = generate_ca();
+    let (server_cert, server_key) = generate_node_cert(
+        &ca,
+        "server",
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    );
+    let (client_cert, client_key) = generate_node_cert(
+        &ca,
+        "client",
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    );
+
+    let addr = start_echo_server(&ca_pem, &server_cert, &server_key).await;
+
+    let config = TlsConfig::from_pem(
+        ca_pem.as_bytes(),
+        client_cert.as_bytes(),
+        client_key.as_bytes(),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    let transport = TcpTlsTransport::new(config);
+
+    let conn = transport
+        .connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect: {e}"));
+
+    let identity = conn.peer_identity();
+
+    // Server cert has OU="test-tenant" → OrgId via UUID v5.
+    let expected_org = kiseki_common::ids::OrgId(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_X500,
+        b"test-tenant",
+    ));
+    assert_eq!(identity.org_id, expected_org);
+
+    // CN should be "server".
+    assert_eq!(identity.common_name, "server");
+
+    // Fingerprint non-zero.
+    assert_ne!(identity.cert_fingerprint, [0u8; 32]);
+}
+
+#[tokio::test]
 async fn default_timeouts_used() {
     let timeouts = TimeoutConfig::default();
     assert_eq!(timeouts.connect, std::time::Duration::from_secs(5));

@@ -104,7 +104,7 @@ complexity.
 | Step | Status | Commit | Adv gate | Notes |
 |------|--------|--------|----------|-------|
 | A.1 | done | — | passed | Connect 5s + handshake 10s, configurable, 2 tests |
-| A.2 | pending | — | — | X.509 parsing |
+| A.2 | done | — | passed | x509-parser OU/SAN extraction, SPIFFE fallback, 1 test |
 | A.3 | pending | — | — | CRL |
 | A.4 | pending | — | — | mTLS on gRPC |
 | A.5 | pending | — | — | Graceful shutdown |
