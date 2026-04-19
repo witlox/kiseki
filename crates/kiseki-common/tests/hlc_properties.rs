@@ -237,3 +237,20 @@ fn merge_at_zero() {
     let merged = merged.unwrap_or_else(|_| unreachable!());
     assert!(merged > a);
 }
+
+// ============================================================================
+// R1: Tests for "resolved" adversarial findings
+// ============================================================================
+
+/// ADV-PHASE0-007: `SequenceNumber::checked_next()` — overflow returns None.
+#[test]
+fn sequence_number_checked_next() {
+    use kiseki_common::ids::SequenceNumber;
+
+    let seq = SequenceNumber(1);
+    let next = seq.checked_next();
+    assert_eq!(next, Some(SequenceNumber(2)));
+
+    let max = SequenceNumber(u64::MAX);
+    assert_eq!(max.checked_next(), None);
+}

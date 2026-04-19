@@ -154,3 +154,73 @@ proptest! {
         prop_assert_ne!(id_a, id_b);
     }
 }
+
+// ============================================================================
+// R1: Tests for "resolved" adversarial findings
+// ============================================================================
+
+// ADV-PHASE1-003: Padding overflow returns error instead of silently skipping.
+#[cfg(feature = "compression")]
+proptest! {
+    #[test]
+    fn padding_overflow_returns_error(
+        key_bytes in master_key_strategy(),
+        chunk_id in chunk_id_strategy(),
+    ) {
+        // pad_alignment of 0 should return error
+        let aead = kiseki_crypto::aead::Aead::new();
+        let master = kiseki_crypto::keys::SystemMasterKey::new(key_bytes, kiseki_common::tenancy::KeyEpoch(1));
+        let result = kiseki_crypto::compress::compress_and_encrypt(
+            &aead, &master, &chunk_id, b"data", 0,
+        );
+        prop_assert!(result.is_err(), "pad_alignment=0 should fail");
+    }
+}
+
+/// ADV-PHASE1-005: Unwrapped `chunk_id` mismatch detected.
+#[test]
+fn chunk_id_mismatch_detected() {
+    use kiseki_common::ids::ChunkId;
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_crypto::aead::Aead;
+    use kiseki_crypto::envelope::{seal_envelope, unwrap_tenant, wrap_for_tenant};
+    use kiseki_crypto::keys::{MasterKeyCache, SystemMasterKey, TenantKek};
+
+    let aead = Aead::new();
+    let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+    let tenant_kek = TenantKek::new([0xaa; 32], KeyEpoch(1));
+
+    // Seal with chunk_id_a
+    let chunk_id_a = ChunkId([0x11; 32]);
+    let mut envelope = seal_envelope(&aead, &master, &chunk_id_a, b"secret").unwrap();
+    wrap_for_tenant(&aead, &mut envelope, &tenant_kek).unwrap();
+
+    // Tamper: change the envelope's chunk_id to a different one
+    envelope.chunk_id = ChunkId([0x22; 32]);
+
+    let mut cache = MasterKeyCache::new();
+    cache.insert(SystemMasterKey::new([0x42; 32], KeyEpoch(1)));
+
+    // Unwrap should fail — the wrapped material contains chunk_id_a
+    // but the envelope now claims chunk_id_b
+    let result = unwrap_tenant(&aead, &envelope, &tenant_kek, &cache);
+    assert!(result.is_err(), "chunk_id mismatch should be detected");
+}
+
+/// ADV-PHASE1-001: Key material `mlock` — verify construction and drop don't panic.
+/// (Actual `mlock` success depends on `RLIMIT_MEMLOCK` — we verify the code path runs.)
+#[test]
+fn key_material_mlock_construction() {
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_crypto::keys::{SystemMasterKey, TenantKek};
+
+    // Create and drop — mlock/munlock should not panic
+    let key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+    assert_eq!(key.epoch, KeyEpoch(1));
+    assert_eq!(key.material().len(), 32);
+    drop(key); // triggers munlock
+
+    let kek = TenantKek::new([0xaa; 32], KeyEpoch(2));
+    assert_eq!(kek.epoch, KeyEpoch(2));
+    drop(kek);
+}
