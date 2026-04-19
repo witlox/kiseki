@@ -1023,6 +1023,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-audit"
+version = "0.0.0"
+dependencies = [
+ "kiseki-common",
+ "proptest",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "kiseki-common"
 version = "0.0.0"
 dependencies = [
