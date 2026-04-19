@@ -159,6 +159,17 @@ pub fn unwrap_tenant(
         .map_err(|_| CryptoError::InvalidEnvelope("epoch parse failed".into()))?;
     let epoch = KeyEpoch(u64::from_le_bytes(epoch_bytes));
 
+    // Defense-in-depth: verify unwrapped chunk_id matches the envelope
+    // (ADV-PHASE1-005). The AEAD auth tag would catch a mismatch anyway,
+    // but an explicit check gives a clearer error.
+    let mut unwrapped_chunk_id = [0u8; 32];
+    unwrapped_chunk_id.copy_from_slice(&material[8..40]);
+    if unwrapped_chunk_id != envelope.chunk_id.0 {
+        return Err(CryptoError::InvalidEnvelope(
+            "unwrapped chunk_id does not match envelope".into(),
+        ));
+    }
+
     // Look up the master key for this epoch.
     let master = master_cache
         .get(epoch)

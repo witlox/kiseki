@@ -27,6 +27,7 @@ pub mod envelope;
 pub mod error;
 pub mod hkdf;
 pub mod keys;
+pub(crate) mod mem_protect;
 
 #[cfg(feature = "compression")]
 pub mod compress;

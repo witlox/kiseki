@@ -377,7 +377,7 @@ auditor fidelity HIGH across all contexts.
 | Phase | Status | Commit | Gate-1 | Gate-2 | Auditor | Notes |
 |---|---|---|---|---|---|---|
 | 0 | done | `726351c` | n/a | `phase0-gate2.md` | n/a | Foundation; adversarial pass resolved 4 findings |
-| 1 | impl complete | — | — | — | — | kiseki-crypto: AEAD, HKDF, envelope, chunk ID, tenant wrap, compress |
+| 1 | done | — | — | `phase1-gate2.md` | — | kiseki-crypto: 2 High resolved, 1 Medium resolved, 1 Low resolved |
 | 2 | pending | — | — | — | — | |
 | 3 | pending | — | — | — | — | |
 | 4 | pending | — | — | — | — | |

@@ -43,31 +43,51 @@ pub fn compress_and_encrypt(
         .finish()
         .map_err(|e| CryptoError::CompressionFailed(e.to_string()))?;
 
-    // Pad to alignment boundary.
+    // Pad to alignment boundary. Overflow means the compressed data is
+    // too large to pad — reject rather than silently skipping padding,
+    // which would defeat the side-channel protection (ADV-PHASE1-003).
     let padded_len = compressed
         .len()
         .checked_next_multiple_of(pad_alignment)
-        .unwrap_or(compressed.len());
+        .ok_or_else(|| {
+            CryptoError::CompressionFailed("compressed size too large for padding alignment".into())
+        })?;
     compressed.resize(padded_len, 0);
 
     // Encrypt the padded compressed data.
     seal_envelope(aead_ctx, master, chunk_id, &compressed)
 }
 
-/// Decrypt and decompress.
+/// Decrypt, decompress, and enforce a plaintext size bound.
+///
+/// `max_plaintext_size` prevents decompression bombs from causing OOM.
+/// Pass the expected maximum chunk size (e.g., the chunk size ceiling
+/// from the configuration).
 pub fn decrypt_and_decompress(
     aead_ctx: &Aead,
     master: &SystemMasterKey,
     envelope: &Envelope,
+    max_plaintext_size: usize,
 ) -> Result<Vec<u8>, CryptoError> {
     let compressed_padded = crate::envelope::open_envelope(aead_ctx, master, envelope)?;
 
-    // Decompress (deflate ignores trailing padding).
-    let mut decoder = DeflateDecoder::new(&compressed_padded[..]);
+    // Decompress with a size bound to prevent decompression bombs.
+    let limit = u64::try_from(max_plaintext_size)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut decoder = DeflateDecoder::new(&compressed_padded[..]).take(limit);
     let mut plaintext = Vec::new();
     decoder
         .read_to_end(&mut plaintext)
         .map_err(|e| CryptoError::CompressionFailed(e.to_string()))?;
+
+    if plaintext.len() > max_plaintext_size {
+        return Err(CryptoError::CompressionFailed(format!(
+            "decompressed size {} exceeds limit {}",
+            plaintext.len(),
+            max_plaintext_size
+        )));
+    }
 
     Ok(plaintext)
 }
@@ -88,11 +108,10 @@ mod tests {
         assert!(envelope.is_ok());
         let envelope = envelope.unwrap_or_else(|_| unreachable!());
 
-        // Ciphertext length should be a multiple of 256 (plus GCM tag overhead
-        // is in auth_tag, not ciphertext).
+        // Ciphertext length should be a multiple of 256.
         assert_eq!(envelope.ciphertext.len() % 256, 0);
 
-        let decrypted = decrypt_and_decompress(&aead, &master, &envelope);
+        let decrypted = decrypt_and_decompress(&aead, &master, &envelope, 1024 * 1024);
         assert!(decrypted.is_ok());
         assert_eq!(
             decrypted.unwrap_or_else(|_| unreachable!()).as_slice(),
@@ -106,6 +125,21 @@ mod tests {
         let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
         let chunk_id = ChunkId([0xcc; 32]);
         let result = compress_and_encrypt(&aead, &master, &chunk_id, b"data", 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decompress_size_limit_enforced() {
+        let aead = Aead::new();
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let chunk_id = ChunkId([0xcc; 32]);
+        // Create a large compressible payload.
+        let plaintext = vec![0u8; 10_000];
+        let envelope = compress_and_encrypt(&aead, &master, &chunk_id, &plaintext, 256)
+            .unwrap_or_else(|_| unreachable!());
+
+        // Decompress with a limit smaller than the plaintext.
+        let result = decrypt_and_decompress(&aead, &master, &envelope, 100);
         assert!(result.is_err());
     }
 }
