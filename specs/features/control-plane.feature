@@ -1,4 +1,4 @@
-Feature: Control Plane — Tenancy, IAM, policy, placement, federation
+Feature: Control Plane - Tenancy, IAM, policy, placement, federation
   The Control Plane provides the declarative API for tenancy, IAM, policy,
   placement, discovery, compliance tagging, and federation. Manages both
   cluster-level (cluster admin) and tenant-level (tenant admin) configuration
@@ -58,14 +58,14 @@ Feature: Control Plane — Tenancy, IAM, policy, placement, federation
 
   # --- IAM and zero-trust boundary ---
 
-  Scenario: Cluster admin requests access to tenant data — requires approval
+  Scenario: Cluster admin requests access to tenant data - requires approval
     Given cluster admin "admin-ops" needs to diagnose an issue with "org-pharma" data
     When "admin-ops" submits an access request for "org-pharma" config/logs
     Then the request is queued for tenant admin "pharma-admin" approval
     And "admin-ops" cannot access tenant data until approved
     And the request and its outcome are recorded in the audit log
 
-  Scenario: Cluster admin access request approved — scoped and time-limited
+  Scenario: Cluster admin access request approved - scoped and time-limited
     Given "pharma-admin" approves "admin-ops" access request
     When the approval is processed with:
       | field         | value              |
@@ -112,7 +112,7 @@ Feature: Control Plane — Tenancy, IAM, policy, placement, federation
 
   # --- Placement and flavor management ---
 
-  Scenario: Tenant selects a flavor — best-fit matching
+  Scenario: Tenant selects a flavor - best-fit matching
     Given the cluster offers flavors:
       | flavor         | protocol | transport | topology        |
       | hpc-slingshot  | NFS      | CXI       | hyperconverged  |
@@ -131,7 +131,7 @@ Feature: Control Plane — Tenancy, IAM, policy, placement, federation
 
   # --- Compliance tag management ---
 
-  Scenario: Compliance tag inheritance — union of constraints
+  Scenario: Compliance tag inheritance - union of constraints
     Given org "org-pharma" has tags [HIPAA, GDPR]
     And project "clinical-trials" has tag [revFADP]
     And namespace "swiss-patients" has tag [swiss-residency]
@@ -205,7 +205,7 @@ Feature: Control Plane — Tenancy, IAM, policy, placement, federation
 
   # --- Failure paths ---
 
-  Scenario: Control plane unavailable — data path continues
+  Scenario: Control plane unavailable - data path continues
     Given the Control Plane service is down
     Then existing data path continues (Log, Chunks, Views work with last-known config)
     And no new tenants can be created
@@ -223,7 +223,7 @@ Feature: Control Plane — Tenancy, IAM, policy, placement, federation
 
   # --- Workflow Advisory policy (ADR-020) ---
   # Control Plane owns profile allow-lists, hint budgets, and advisory
-  # opt-out state. Policy inherits org → project → workload with each
+  # opt-out state. Policy inherits org -> project -> workload with each
   # level narrowing (never broadening) its parent. Data path is never
   # affected by policy changes here (I-WA2, I-WA18).
 
@@ -253,13 +253,13 @@ Feature: Control Plane — Tenancy, IAM, policy, placement, federation
     And the workload's effective budget remains its last-valid value
     And the rejected change is audited
 
-  Scenario: Tenant admin disables Workflow Advisory for a workload — three-state transition
+  Scenario: Tenant admin disables Workflow Advisory for a workload - three-state transition
     Given "training-run-42" has Workflow Advisory enabled with 2 active workflows
     When tenant admin transitions advisory state to "draining"
     Then new DeclareWorkflow calls from "training-run-42" clients return ADVISORY_DISABLED
     And the 2 active workflows continue accepting hints within their current phases
     And when each active workflow ends or TTLs, it is audit-ended
-    When the tenant admin subsequently transitions draining → disabled
+    When the tenant admin subsequently transitions draining -> disabled
     Then all hint processing ends, active telemetry subscriptions close
     And data-path operations remain fully correct throughout (I-WA12)
 

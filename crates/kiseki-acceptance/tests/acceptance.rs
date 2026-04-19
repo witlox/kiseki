@@ -52,6 +52,7 @@ pub struct KisekiWorld {
 
     // === Test state (results from WHEN steps, checked in THEN) ===
     pub last_error: Option<String>,
+    pub last_epoch: Option<u64>,
     pub last_sequence: Option<SequenceNumber>,
     pub last_shard_id: Option<ShardId>,
     pub shard_names: HashMap<String, ShardId>,
@@ -84,6 +85,7 @@ impl KisekiWorld {
                 max_phases_per_workflow: 50,
             }),
             last_error: None,
+            last_epoch: None,
             last_sequence: None,
             last_shard_id: None,
             shard_names: HashMap::new(),

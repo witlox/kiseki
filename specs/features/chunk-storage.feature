@@ -1,4 +1,4 @@
-Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
+Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   The Chunk Storage context stores and retrieves opaque encrypted chunks,
   manages placement across affinity pools, handles replication/EC, runs
   GC based on refcounts, and enforces retention holds.
@@ -33,7 +33,7 @@ Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
     And the same plaintext from another tenant would produce a different chunk_id
     And cross-tenant dedup cannot match this chunk
 
-  Scenario: Dedup — existing chunk referenced by new composition
+  Scenario: Dedup - existing chunk referenced by new composition
     Given "org-pharma" has a chunk with chunk_id "abc123" and refcount 1
     When a new composition in "org-pharma" references the same plaintext
     And chunk_id = sha256(plaintext) = "abc123"
@@ -56,7 +56,7 @@ Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
     Given chunk "abc123" exists in pool "fast-nvme"
     When a stream processor requests ReadChunk for "abc123"
     Then the encrypted chunk envelope is returned
-    And the caller unwraps using: tenant KEK → system DEK → decrypt ciphertext
+    And the caller unwraps using: tenant KEK -> system DEK -> decrypt ciphertext
     And no plaintext is transmitted on the wire
 
   # --- Placement and affinity ---
@@ -102,7 +102,7 @@ Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
     And chunks with refcount 0 are NOT GC'd due to retention hold
     And chunks remain as system-encrypted ciphertext until hold expires
 
-  Scenario: Crypto-shred without retention hold — chunks GC'd
+  Scenario: Crypto-shred without retention hold - chunks GC'd
     Given tenant "org-temp" has compositions referencing chunks [c4, c5]
     And no retention hold is active
     When "org-temp" performs crypto-shred
@@ -122,7 +122,7 @@ Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
     And repaired fragments are placed on healthy devices in the pool
     And chunk availability is restored
 
-  Scenario: Chunk unrecoverable — insufficient EC parity
+  Scenario: Chunk unrecoverable - insufficient EC parity
     Given chunk "c99" has EC 4+2 encoding
     And 3 of 6 fragments are lost (exceeds parity tolerance of 2)
     When repair is attempted
@@ -144,7 +144,7 @@ Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
     Given a chunk write is in progress
     When the system DEK encryption step fails (e.g., HSM timeout)
     Then the chunk write is aborted
-    And no data — plaintext or partial ciphertext — is persisted
+    And no data - plaintext or partial ciphertext - is persisted
     And the Composition context receives a retriable error
 
   Scenario: Chunk envelope integrity verification on read
@@ -157,7 +157,7 @@ Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
 
   # --- Edge cases ---
 
-  Scenario: Concurrent dedup — two writers for same chunk_id simultaneously
+  Scenario: Concurrent dedup - two writers for same chunk_id simultaneously
     Given two compositions in "org-pharma" write the same plaintext concurrently
     And both compute chunk_id = "abc123"
     Then chunk writes are idempotent:
@@ -229,4 +229,4 @@ Feature: Chunk Storage — Encrypted chunk persistence, placement, and lifecycle
     Given a chunk in the caller's composition is being read while EC repair is in progress
     When the read succeeds from the remaining shards
     Then a repair-degraded warning telemetry event is emitted to the caller's workflow
-    And the event contains only { composition_id, degraded: true, severity: advisory } — no device, node, or parity-shard identifiers (I-WA11)
+    And the event contains only { composition_id, degraded: true, severity: advisory } - no device, node, or parity-shard identifiers (I-WA11)
