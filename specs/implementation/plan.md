@@ -383,10 +383,10 @@ auditor fidelity HIGH across all contexts.
 | 4 | done | — | — | `phase4-gate2.md` | — | kiseki-keymanager: Raft deferred, 0 blocking |
 | 5 | done | — | — | `phase5-gate2.md` | — | kiseki-audit: per-tenant shards, event types, 0 blocking |
 | 6 | done | — | — | `phase6-gate2.md` | — | kiseki-chunk: dedup, refcount, GC, holds, pools |
-| 7 | done | — | — | — | — | kiseki-composition: CRUD, namespace, multipart, EXDEV |
-| 8 | done | — | — | — | — | kiseki-view: descriptor, MVCC pins, staleness, lifecycle |
-| 9 | done | — | — | — | — | kiseki-gateway: GatewayOps trait, NFS/S3 stubs |
-| 10 | done | — | — | — | — | kiseki-client: discovery, cache, error types |
+| 7 | done | — | — | `phase7-gate2.md` | — | kiseki-composition: versioning added (blocking resolved) |
+| 8 | done | — | — | `phase8-gate2.md` | — | kiseki-view: staleness check added (blocking resolved) |
+| 9 | done | — | — | `phase9-gate2.md` | — | kiseki-gateway: 0 blocking |
+| 10 | done | — | — | `phase10-gate2.md` | — | kiseki-client: 0 blocking |
 | 10.5 | pending | — | — | — | — | bindings |
 | 11 | pending | — | — | — | — | Go control plane |
 | 11.5 | pending | — | — | — | — | advisory |

@@ -30,8 +30,27 @@ pub struct MaterializedView {
     pub watermark: SequenceNumber,
     /// Active read pins.
     pub pins: Vec<ReadPin>,
+    /// Wall-clock time (ms) when watermark was last advanced.
+    pub last_advanced_ms: u64,
     /// Next pin ID.
     next_pin_id: u64,
+}
+
+impl MaterializedView {
+    /// Check whether the view is within its staleness bound.
+    /// Returns `Ok(())` if healthy, or `Err(StalenessViolation)` if
+    /// the view has fallen behind (I-K9, I-V3).
+    pub fn check_staleness(&self, now_ms: u64) -> Result<(), ViewError> {
+        if let crate::descriptor::ConsistencyModel::BoundedStaleness { max_staleness_ms } =
+            self.descriptor.consistency
+        {
+            let lag = now_ms.saturating_sub(self.last_advanced_ms);
+            if lag > max_staleness_ms {
+                return Err(ViewError::StalenessViolation(self.descriptor.view_id, lag));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// View operations trait.
@@ -50,6 +69,7 @@ pub trait ViewOps {
         &mut self,
         view_id: ViewId,
         position: SequenceNumber,
+        now_ms: u64,
     ) -> Result<(), ViewError>;
 
     /// Acquire an MVCC read pin at the current watermark.
@@ -99,6 +119,7 @@ impl ViewOps for ViewStore {
                 state: ViewState::Building,
                 watermark: SequenceNumber(0),
                 pins: Vec::new(),
+                last_advanced_ms: 0,
                 next_pin_id: 1,
             },
         );
@@ -123,6 +144,7 @@ impl ViewOps for ViewStore {
         &mut self,
         view_id: ViewId,
         position: SequenceNumber,
+        now_ms: u64,
     ) -> Result<(), ViewError> {
         let view = self
             .views
@@ -135,6 +157,7 @@ impl ViewOps for ViewStore {
 
         if position > view.watermark {
             view.watermark = position;
+            view.last_advanced_ms = now_ms;
         }
 
         // Transition from Building → Active once we have a non-zero watermark.
@@ -223,7 +246,7 @@ mod tests {
         let view_id = store.create_view(desc).unwrap_or_else(|_| unreachable!());
 
         store
-            .advance_watermark(view_id, SequenceNumber(100))
+            .advance_watermark(view_id, SequenceNumber(100), 1000)
             .unwrap_or_else(|_| unreachable!());
 
         let view = store.get_view(view_id).unwrap_or_else(|_| unreachable!());
@@ -245,7 +268,7 @@ mod tests {
         assert_eq!(view.state, ViewState::Discarded);
 
         // Advance on discarded view fails.
-        let result = store.advance_watermark(view_id, SequenceNumber(50));
+        let result = store.advance_watermark(view_id, SequenceNumber(50), 1000);
         assert!(result.is_err());
     }
 
@@ -255,7 +278,7 @@ mod tests {
         let desc = test_descriptor();
         let view_id = store.create_view(desc).unwrap_or_else(|_| unreachable!());
         store
-            .advance_watermark(view_id, SequenceNumber(100))
+            .advance_watermark(view_id, SequenceNumber(100), 1000)
             .unwrap_or_else(|_| unreachable!());
 
         let pin_id = store
@@ -289,5 +312,33 @@ mod tests {
 
         let view = store.get_view(view_id).unwrap_or_else(|_| unreachable!());
         assert!(view.pins.is_empty());
+    }
+
+    #[test]
+    fn staleness_violation_detected() {
+        let mut store = ViewStore::new();
+        let desc = ViewDescriptor {
+            view_id: ViewId(uuid::Uuid::from_u128(2)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(100)),
+            source_shards: vec![ShardId(uuid::Uuid::from_u128(10))],
+            protocol: ProtocolSemantics::Posix,
+            consistency: ConsistencyModel::BoundedStaleness {
+                max_staleness_ms: 2000,
+            },
+            discardable: true,
+            version: 1,
+        };
+        let view_id = store.create_view(desc).unwrap_or_else(|_| unreachable!());
+        store
+            .advance_watermark(view_id, SequenceNumber(100), 1000)
+            .unwrap_or_else(|_| unreachable!());
+
+        let view = store.get_view(view_id).unwrap_or_else(|_| unreachable!());
+
+        // Within bound.
+        assert!(view.check_staleness(2500).is_ok());
+
+        // Exceeded bound (1000 + 2000 = 3000, now is 4000 → lag 3000 > 2000).
+        assert!(view.check_staleness(4000).is_err());
     }
 }

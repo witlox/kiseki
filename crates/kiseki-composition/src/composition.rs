@@ -52,6 +52,14 @@ pub trait CompositionOps {
         target_namespace: NamespaceId,
     ) -> Result<(), CompositionError>;
 
+    /// Update a composition — creates a new version with new chunk refs.
+    fn update(
+        &mut self,
+        id: CompositionId,
+        chunks: Vec<ChunkId>,
+        size: u64,
+    ) -> Result<u64, CompositionError>;
+
     /// Start a multipart upload.
     fn start_multipart(&mut self, namespace_id: NamespaceId) -> Result<String, CompositionError>;
 
@@ -135,6 +143,22 @@ impl CompositionOps for CompositionStore {
         self.compositions
             .get(&id)
             .ok_or(CompositionError::CompositionNotFound(id))
+    }
+
+    fn update(
+        &mut self,
+        id: CompositionId,
+        chunks: Vec<ChunkId>,
+        size: u64,
+    ) -> Result<u64, CompositionError> {
+        let comp = self
+            .compositions
+            .get_mut(&id)
+            .ok_or(CompositionError::CompositionNotFound(id))?;
+        comp.version += 1;
+        comp.chunks = chunks;
+        comp.size = size;
+        Ok(comp.version)
     }
 
     fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError> {
@@ -341,5 +365,25 @@ mod tests {
         let comp = store.get(comp_id).unwrap_or_else(|_| unreachable!());
         assert_eq!(comp.chunks.len(), 2);
         assert_eq!(comp.size, 1024);
+    }
+
+    #[test]
+    fn versioning() {
+        let mut store = setup();
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+            .unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(store.get(id).unwrap_or_else(|_| unreachable!()).version, 1);
+
+        let v2 = store
+            .update(id, vec![ChunkId([0x02; 32]), ChunkId([0x03; 32])], 200)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(v2, 2);
+
+        let comp = store.get(id).unwrap_or_else(|_| unreachable!());
+        assert_eq!(comp.version, 2);
+        assert_eq!(comp.chunks.len(), 2);
+        assert_eq!(comp.size, 200);
     }
 }
