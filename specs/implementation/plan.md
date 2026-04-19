@@ -378,7 +378,7 @@ auditor fidelity HIGH across all contexts.
 |---|---|---|---|---|---|---|
 | 0 | done | `726351c` | n/a | `phase0-gate2.md` | n/a | Foundation; adversarial pass resolved 4 findings |
 | 1 | done | — | — | `phase1-gate2.md` | — | kiseki-crypto: 2 High resolved, 1 Medium resolved, 1 Low resolved |
-| 2 | pending | — | — | — | — | |
+| 2 | impl complete | — | — | — | — | kiseki-transport: TCP+TLS, mTLS, Transport trait |
 | 3 | pending | — | — | — | — | |
 | 4 | pending | — | — | — | — | |
 | 5 | pending | — | — | — | — | |

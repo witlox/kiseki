@@ -1,0 +1,140 @@
+//! TLS configuration for mTLS with Cluster CA validation.
+//!
+//! Spec: I-Auth1, I-K13.
+
+use std::io::BufReader;
+use std::sync::Arc;
+
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::TlsConnector;
+
+use crate::error::TransportError;
+
+/// TLS configuration for a Kiseki node (client or server role).
+///
+/// Holds the Cluster CA trust root, the node's own certificate chain,
+/// and private key. Both client and server sides require mTLS — the
+/// server demands a client cert, and the client validates the server
+/// against the Cluster CA.
+#[derive(Clone)]
+pub struct TlsConfig {
+    /// TLS connector for outbound connections.
+    connector: TlsConnector,
+    /// Cluster CA root certificates (for verification).
+    ca_certs: Vec<CertificateDer<'static>>,
+}
+
+impl TlsConfig {
+    /// Build a TLS configuration from PEM-encoded materials.
+    ///
+    /// - `ca_pem`: Cluster CA certificate(s) in PEM format.
+    /// - `cert_pem`: This node's certificate chain in PEM format.
+    /// - `key_pem`: This node's private key in PEM format.
+    pub fn from_pem(
+        ca_pem: &[u8],
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<Self, TransportError> {
+        // Parse CA certs.
+        let ca_certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut BufReader::new(ca_pem))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| TransportError::ConfigError(format!("CA PEM parse: {e}")))?;
+
+        if ca_certs.is_empty() {
+            return Err(TransportError::ConfigError(
+                "no CA certificates found".into(),
+            ));
+        }
+
+        // Build root cert store from Cluster CA.
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in &ca_certs {
+            root_store
+                .add(cert.clone())
+                .map_err(|e| TransportError::ConfigError(format!("CA add: {e}")))?;
+        }
+
+        // Parse node cert chain.
+        let node_certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut BufReader::new(cert_pem))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| TransportError::ConfigError(format!("cert PEM parse: {e}")))?;
+
+        if node_certs.is_empty() {
+            return Err(TransportError::ConfigError(
+                "no node certificates found".into(),
+            ));
+        }
+
+        // Parse private key.
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem))
+            .map_err(|e| TransportError::ConfigError(format!("key PEM parse: {e}")))?
+            .ok_or_else(|| TransportError::ConfigError("no private key found".into()))?;
+
+        // Build client config with mTLS.
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(node_certs, key)
+            .map_err(|e| TransportError::ConfigError(format!("client config: {e}")))?;
+
+        Ok(Self {
+            connector: TlsConnector::from(Arc::new(client_config)),
+            ca_certs,
+        })
+    }
+
+    /// Build a server TLS configuration that requires client certificates.
+    ///
+    /// Returns a `rustls::ServerConfig` for use in listeners.
+    pub fn server_config(
+        ca_pem: &[u8],
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<rustls::ServerConfig, TransportError> {
+        // Parse CA for client cert verification.
+        let ca_certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut BufReader::new(ca_pem))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| TransportError::ConfigError(format!("CA PEM parse: {e}")))?;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in &ca_certs {
+            root_store
+                .add(cert.clone())
+                .map_err(|e| TransportError::ConfigError(format!("CA add: {e}")))?;
+        }
+
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| TransportError::ConfigError(format!("client verifier: {e}")))?;
+
+        // Parse server cert chain and key.
+        let server_certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut BufReader::new(cert_pem))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| TransportError::ConfigError(format!("cert PEM parse: {e}")))?;
+
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_pem))
+            .map_err(|e| TransportError::ConfigError(format!("key PEM parse: {e}")))?
+            .ok_or_else(|| TransportError::ConfigError("no private key found".into()))?;
+
+        rustls::ServerConfig::builder()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(server_certs, key)
+            .map_err(|e| TransportError::ConfigError(format!("server config: {e}")))
+    }
+
+    /// Get the TLS connector for outbound connections.
+    pub(crate) fn connector(&self) -> &TlsConnector {
+        &self.connector
+    }
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field("ca_count", &self.ca_certs.len())
+            .finish_non_exhaustive()
+    }
+}
