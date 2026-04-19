@@ -12,6 +12,7 @@ members = [
     "crates/kiseki-keymanager",
     "crates/kiseki-log",
     "crates/kiseki-proto",
+    "crates/kiseki-server",
     "crates/kiseki-transport",
     "crates/kiseki-view",
 ]

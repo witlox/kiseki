@@ -1,0 +1,29 @@
+[package]
+name = "kiseki-server"
+description = "Kiseki storage server binary — composes all Rust crates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kiseki-server"
+path = "src/main.rs"
+
+[dependencies]
+kiseki-common = { path = "../kiseki-common" }
+kiseki-crypto = { path = "../kiseki-crypto" }
+kiseki-transport = { path = "../kiseki-transport" }
+kiseki-log = { path = "../kiseki-log" }
+kiseki-keymanager = { path = "../kiseki-keymanager" }
+kiseki-audit = { path = "../kiseki-audit" }
+kiseki-chunk = { path = "../kiseki-chunk" }
+kiseki-composition = { path = "../kiseki-composition" }
+kiseki-view = { path = "../kiseki-view" }
+kiseki-gateway = { path = "../kiseki-gateway" }
+kiseki-client = { path = "../kiseki-client" }
+kiseki-advisory = { path = "../kiseki-advisory" }

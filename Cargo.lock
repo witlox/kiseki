@@ -1141,6 +1141,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-server"
+version = "0.0.0"
+dependencies = [
+ "kiseki-advisory",
+ "kiseki-audit",
+ "kiseki-chunk",
+ "kiseki-client",
+ "kiseki-common",
+ "kiseki-composition",
+ "kiseki-crypto",
+ "kiseki-gateway",
+ "kiseki-keymanager",
+ "kiseki-log",
+ "kiseki-transport",
+ "kiseki-view",
+]
+
+[[package]]
 name = "kiseki-transport"
 version = "0.0.0"
 dependencies = [
