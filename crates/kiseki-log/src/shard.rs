@@ -1,0 +1,73 @@
+//! Shard metadata and lifecycle types.
+//!
+//! A shard is the smallest unit of totally-ordered deltas, backed by
+//! one Raft group. Automatic lifecycle: created when a namespace is
+//! created, splits when thresholds are exceeded (I-L6).
+
+use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
+
+/// Shard lifecycle state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ShardState {
+    /// All replicas healthy, leader elected.
+    Healthy,
+    /// Leader election in progress — writes rejected with retriable error.
+    Election,
+    /// Quorum lost — writes rejected, reads may continue if stale-ok.
+    QuorumLost,
+    /// Split in progress — writes accepted to the original shard,
+    /// deltas for the new key range are buffered until the new shard
+    /// is ready.
+    Splitting,
+    /// Maintenance mode — writes rejected (retriable), reads and
+    /// health queries continue (I-O6).
+    Maintenance,
+}
+
+/// Multi-dimension split thresholds (I-L6).
+///
+/// Any single dimension exceeding its ceiling forces a mandatory split.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardConfig {
+    /// Maximum number of deltas before mandatory split.
+    pub max_delta_count: u64,
+    /// Maximum total byte size before mandatory split.
+    pub max_byte_size: u64,
+}
+
+impl Default for ShardConfig {
+    fn default() -> Self {
+        Self {
+            max_delta_count: 10_000_000,
+            max_byte_size: 10 * 1024 * 1024 * 1024, // 10 GB
+        }
+    }
+}
+
+/// Shard metadata — returned by `shard_health`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardInfo {
+    /// Shard identifier.
+    pub shard_id: ShardId,
+    /// Owning tenant.
+    pub tenant_id: OrgId,
+    /// Current Raft members.
+    pub raft_members: Vec<NodeId>,
+    /// Current leader (if elected).
+    pub leader: Option<NodeId>,
+    /// Highest committed sequence number.
+    pub tip: SequenceNumber,
+    /// Total number of committed deltas.
+    pub delta_count: u64,
+    /// Total byte size of committed deltas.
+    pub byte_size: u64,
+    /// Current lifecycle state.
+    pub state: ShardState,
+    /// Split thresholds.
+    pub config: ShardConfig,
+    /// Key range: `[range_start, range_end)`. Full range = `[0x00..00, 0xFF..FF]`.
+    /// Key range lower bound (inclusive).
+    pub range_start: [u8; 32],
+    /// Key range upper bound (exclusive).
+    pub range_end: [u8; 32],
+}

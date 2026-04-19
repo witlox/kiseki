@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kiseki-common",
     "crates/kiseki-crypto",
+    "crates/kiseki-log",
     "crates/kiseki-proto",
     "crates/kiseki-transport",
 ]

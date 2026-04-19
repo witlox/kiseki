@@ -379,7 +379,7 @@ auditor fidelity HIGH across all contexts.
 | 0 | done | `726351c` | n/a | `phase0-gate2.md` | n/a | Foundation; adversarial pass resolved 4 findings |
 | 1 | done | — | — | `phase1-gate2.md` | — | kiseki-crypto: 2 High resolved, 1 Medium resolved, 1 Low resolved |
 | 2 | done | — | — | `phase2-gate2.md` | — | kiseki-transport: 0 blocking, 3 Medium + 2 Low deferred |
-| 3 | pending | — | — | — | — | |
+| 3 | impl complete | — | — | — | — | kiseki-log: delta types, LogOps, MemShardStore, watermarks, GC, split |
 | 4 | pending | — | — | — | — | |
 | 5 | pending | — | — | — | — | |
 | 6 | pending | — | — | — | — | |

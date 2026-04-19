@@ -1,0 +1,19 @@
+[package]
+name = "kiseki-log"
+description = "Log context for Kiseki: delta ordering, Raft replication, shard lifecycle, compaction, GC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kiseki-common = { path = "../kiseki-common" }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
