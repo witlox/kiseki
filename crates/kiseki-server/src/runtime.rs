@@ -76,8 +76,17 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         );
     }
 
-    builder.add_service(key_svc).serve(cfg.data_addr).await?;
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("  data-path: shutdown signal received, draining...");
+    };
 
+    builder
+        .add_service(key_svc)
+        .serve_with_shutdown(cfg.data_addr, shutdown)
+        .await?;
+
+    eprintln!("  data-path: shut down.");
     Ok(())
 }
 
@@ -106,7 +115,16 @@ pub async fn run_advisory(
         eprintln!("  WARNING: advisory gRPC listening on {addr} (PLAINTEXT — development only)");
     }
 
-    builder.add_service(advisory_svc).serve(addr).await?;
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("  advisory: shutdown signal received, draining...");
+    };
 
+    builder
+        .add_service(advisory_svc)
+        .serve_with_shutdown(addr, shutdown)
+        .await?;
+
+    eprintln!("  advisory: shut down.");
     Ok(())
 }

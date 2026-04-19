@@ -58,7 +58,7 @@ x509-parser = "0.16"
 libc = "0.2"
 
 # --- Async / time ---
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 
 # --- TLS ---
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
