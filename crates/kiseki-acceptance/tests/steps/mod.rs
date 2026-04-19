@@ -7,8 +7,10 @@
 pub mod advisory;
 pub mod auth;
 pub mod chunk;
+pub mod client;
 pub mod composition;
 pub mod crypto;
 pub mod helpers;
 pub mod log;
+pub mod operational;
 pub mod view;

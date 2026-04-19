@@ -145,3 +145,9 @@ async fn when_update(w: &mut KisekiWorld) {
 async fn then_version(w: &mut KisekiWorld, expected: u64) {
     assert_eq!(w.last_epoch, Some(expected));
 }
+
+// Background steps shared with other features
+#[given(regex = r#"^a Kiseki cluster with tenant "(\S+)"$"#)]
+async fn given_cluster_tenant(w: &mut KisekiWorld, tenant: String) {
+    w.ensure_tenant(&tenant);
+}

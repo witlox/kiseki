@@ -85,3 +85,9 @@ async fn then_removed(w: &mut KisekiWorld) {
         assert!(w.advisory_table.get(&wf_ref).is_none());
     }
 }
+
+// Background
+#[given(regex = r#"^organization "(\S+)" with project "(\S+)" and workload "(\S+)"$"#)]
+async fn given_org_project_workload(w: &mut KisekiWorld, org: String, _proj: String, _wl: String) {
+    w.ensure_tenant(&org);
+}
