@@ -24,5 +24,6 @@ pub mod store;
 pub use epoch::{EpochInfo, KeyManagerOps};
 pub use error::KeyManagerError;
 pub use health::{KeyManagerHealth, KeyManagerStatus};
+pub use raft::OpenRaftKeyStore;
 pub use raft_store::RaftKeyStore;
 pub use store::MemKeyStore;

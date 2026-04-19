@@ -45,7 +45,7 @@ pub(crate) struct StateMachineInner {
 }
 
 impl StateMachineInner {
-    pub(crate) fn _new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             epochs: Vec::new(),
             last_applied_log: None,
@@ -101,7 +101,7 @@ pub struct KeyStateMachine {
 }
 
 impl KeyStateMachine {
-    pub(crate) fn _new(inner: Arc<futures::lock::Mutex<StateMachineInner>>) -> Self {
+    pub(crate) fn new(inner: Arc<futures::lock::Mutex<StateMachineInner>>) -> Self {
         Self { inner }
     }
 }

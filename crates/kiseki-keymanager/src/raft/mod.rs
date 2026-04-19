@@ -10,10 +10,13 @@ pub mod log_store;
 #[allow(missing_docs)]
 pub mod network;
 #[allow(missing_docs)]
+pub mod openraft_store;
+#[allow(missing_docs)]
 pub mod state_machine;
 pub mod types;
 
 pub use log_store::KeyLogStore;
 pub use network::StubNetworkFactory;
+pub use openraft_store::OpenRaftKeyStore;
 pub use state_machine::KeyStateMachine;
 pub use types::KeyTypeConfig;

@@ -112,7 +112,7 @@ complexity.
 | B.2 | done | — | passed | openraft traits: LogStore, StateMachine, SnapshotBuilder, NetworkV2 |
 | B.3 | done | — | passed | Log openraft: ShardLogStore, ShardStateMachine |
 | B.4 | done | — | passed | Audit openraft: AuditLogStore, AuditStateMachine (I-A1) |
-| B.5 | pending | — | — | Cluster bootstrap |
+| B.5 | done | — | passed | OpenRaftKeyStore: Raft::new + client_write, 7 integration tests |
 | C.1 | pending | — | — | LogService gRPC |
 | C.2 | pending | — | — | ChunkService gRPC |
 | C.3 | pending | — | — | CompositionService gRPC |
