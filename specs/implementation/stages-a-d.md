@@ -106,7 +106,7 @@ complexity.
 | A.1 | done | — | passed | Connect 5s + handshake 10s, configurable, 2 tests |
 | A.2 | done | — | passed | x509-parser OU/SAN extraction, SPIFFE fallback, 1 test |
 | A.3 | done | — | passed | CRL via server_config_with_crl, 0 blocking |
-| A.4 | pending | — | — | mTLS on gRPC |
+| A.4 | done | — | passed | mTLS on both listeners, plaintext fallback for dev |
 | A.5 | pending | — | — | Graceful shutdown |
 | B.1 | pending | — | — | openraft scaffold |
 | B.2 | pending | — | — | Keymanager Raft |

@@ -9,8 +9,25 @@ use kiseki_keymanager::grpc::KeyManagerGrpc;
 use kiseki_keymanager::raft_store::RaftKeyStore;
 use kiseki_proto::v1::key_manager_service_server::KeyManagerServiceServer;
 use kiseki_proto::v1::workflow_advisory_service_server::WorkflowAdvisoryServiceServer;
+use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, TlsFiles};
+
+/// Build a tonic `ServerTlsConfig` from PEM files.
+fn build_tls(files: &TlsFiles) -> Result<ServerTlsConfig, Box<dyn std::error::Error>> {
+    let ca_pem = std::fs::read(&files.ca_path)
+        .map_err(|e| format!("read CA {}: {e}", files.ca_path.display()))?;
+    let cert_pem = std::fs::read(&files.cert_path)
+        .map_err(|e| format!("read cert {}: {e}", files.cert_path.display()))?;
+    let key_pem = std::fs::read(&files.key_path)
+        .map_err(|e| format!("read key {}: {e}", files.key_path.display()))?;
+
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(&cert_pem, &key_pem))
+        .client_ca_root(Certificate::from_pem(&ca_pem));
+
+    Ok(tls)
+}
 
 /// Run the main data-path server.
 pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -43,18 +60,32 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
     let key_svc = KeyManagerServiceServer::new(KeyManagerGrpc::new(key_store));
 
-    eprintln!("  data-path gRPC listening on {}", cfg.data_addr);
+    let mut builder = tonic::transport::Server::builder();
 
-    tonic::transport::Server::builder()
-        .add_service(key_svc)
-        .serve(cfg.data_addr)
-        .await?;
+    // Wire mTLS if configured.
+    if let Some(ref tls_files) = cfg.tls {
+        let tls = build_tls(tls_files)?;
+        builder = builder
+            .tls_config(tls)
+            .map_err(|e| format!("data-path TLS config: {e}"))?;
+        eprintln!("  data-path gRPC listening on {} (mTLS)", cfg.data_addr);
+    } else {
+        eprintln!(
+            "  WARNING: data-path gRPC listening on {} (PLAINTEXT — development only)",
+            cfg.data_addr
+        );
+    }
+
+    builder.add_service(key_svc).serve(cfg.data_addr).await?;
 
     Ok(())
 }
 
 /// Run the advisory runtime on its isolated tokio runtime.
-pub async fn run_advisory(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_advisory(
+    addr: SocketAddr,
+    tls_files: Option<&TlsFiles>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let budget = BudgetConfig {
         hints_per_sec: 100,
         max_concurrent_workflows: 10,
@@ -63,12 +94,19 @@ pub async fn run_advisory(addr: SocketAddr) -> Result<(), Box<dyn std::error::Er
 
     let advisory_svc = WorkflowAdvisoryServiceServer::new(AdvisoryGrpc::new(budget));
 
-    eprintln!("  advisory gRPC listening on {addr}");
+    let mut builder = tonic::transport::Server::builder();
 
-    tonic::transport::Server::builder()
-        .add_service(advisory_svc)
-        .serve(addr)
-        .await?;
+    if let Some(files) = tls_files {
+        let tls = build_tls(files)?;
+        builder = builder
+            .tls_config(tls)
+            .map_err(|e| format!("advisory TLS config: {e}"))?;
+        eprintln!("  advisory gRPC listening on {addr} (mTLS)");
+    } else {
+        eprintln!("  WARNING: advisory gRPC listening on {addr} (PLAINTEXT — development only)");
+    }
+
+    builder.add_service(advisory_svc).serve(addr).await?;
 
     Ok(())
 }

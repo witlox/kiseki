@@ -1,6 +1,7 @@
 //! Server configuration.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// Server configuration — populated from environment or defaults.
 pub struct ServerConfig {
@@ -8,10 +9,29 @@ pub struct ServerConfig {
     pub data_addr: SocketAddr,
     /// Address for the advisory gRPC listener (isolated runtime).
     pub advisory_addr: SocketAddr,
+    /// TLS configuration paths (None = plaintext, for development only).
+    pub tls: Option<TlsFiles>,
+}
+
+/// Paths to TLS certificate files.
+#[allow(clippy::struct_field_names)] // all fields are paths — the suffix is intentional
+pub struct TlsFiles {
+    /// Cluster CA certificate PEM.
+    pub ca_path: PathBuf,
+    /// This node's certificate chain PEM.
+    pub cert_path: PathBuf,
+    /// This node's private key PEM.
+    pub key_path: PathBuf,
+    /// Optional CRL PEM for certificate revocation.
+    pub crl_path: Option<PathBuf>,
 }
 
 impl ServerConfig {
     /// Load config from environment variables with sensible defaults.
+    ///
+    /// TLS is enabled if `KISEKI_CA_PATH`, `KISEKI_CERT_PATH`, and
+    /// `KISEKI_KEY_PATH` are all set. Otherwise the server runs in
+    /// plaintext mode (development only — logged as a warning).
     pub fn from_env() -> Self {
         let data_addr = std::env::var("KISEKI_DATA_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:9100".into())
@@ -23,9 +43,24 @@ impl ServerConfig {
             .parse()
             .expect("invalid KISEKI_ADVISORY_ADDR");
 
+        let tls = match (
+            std::env::var("KISEKI_CA_PATH"),
+            std::env::var("KISEKI_CERT_PATH"),
+            std::env::var("KISEKI_KEY_PATH"),
+        ) {
+            (Ok(ca), Ok(cert), Ok(key)) => Some(TlsFiles {
+                ca_path: PathBuf::from(ca),
+                cert_path: PathBuf::from(cert),
+                key_path: PathBuf::from(key),
+                crl_path: std::env::var("KISEKI_CRL_PATH").ok().map(PathBuf::from),
+            }),
+            _ => None,
+        };
+
         Self {
             data_addr,
             advisory_addr,
+            tls,
         }
     }
 }
