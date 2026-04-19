@@ -15,11 +15,15 @@
 
 #![deny(unsafe_code)]
 
+pub mod error;
 pub mod event;
+pub mod health;
 pub mod raft;
 pub mod raft_store;
 pub mod store;
 
+pub use error::AuditError;
 pub use event::{AuditEvent, AuditEventType};
+pub use health::{AuditHealth, AuditStatus};
 pub use raft_store::RaftAuditStore;
 pub use store::{AuditLog, AuditOps, AuditQuery};

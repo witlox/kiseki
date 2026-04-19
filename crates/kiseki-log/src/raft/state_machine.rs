@@ -28,15 +28,15 @@ struct ShardSnapshot {
 
 /// Inner state for the shard state machine.
 pub struct ShardSmInner {
-    delta_count: u64,
-    tip: u64,
-    maintenance: bool,
+    pub(crate) delta_count: u64,
+    pub(crate) tip: u64,
+    pub(crate) maintenance: bool,
     last_applied_log: Option<LogIdOf<C>>,
     last_membership: StoredMembershipOf<C>,
 }
 
 impl ShardSmInner {
-    pub(crate) fn _new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             delta_count: 0,
             tip: 0,
@@ -69,7 +69,7 @@ pub struct ShardStateMachine {
 }
 
 impl ShardStateMachine {
-    pub(crate) fn _new(inner: Arc<futures::lock::Mutex<ShardSmInner>>) -> Self {
+    pub(crate) fn new(inner: Arc<futures::lock::Mutex<ShardSmInner>>) -> Self {
         Self { inner }
     }
 }

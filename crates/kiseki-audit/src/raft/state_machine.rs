@@ -20,13 +20,13 @@ struct AuditSnapshot {
 }
 
 pub struct AuditSmInner {
-    event_count: u64,
+    pub(crate) event_count: u64,
     last_applied_log: Option<LogIdOf<C>>,
     last_membership: StoredMembershipOf<C>,
 }
 
 impl AuditSmInner {
-    pub(crate) fn _new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             event_count: 0,
             last_applied_log: None,
@@ -41,7 +41,7 @@ pub struct AuditStateMachine {
 }
 
 impl AuditStateMachine {
-    pub(crate) fn _new(inner: Arc<futures::lock::Mutex<AuditSmInner>>) -> Self {
+    pub(crate) fn new(inner: Arc<futures::lock::Mutex<AuditSmInner>>) -> Self {
         Self { inner }
     }
 }

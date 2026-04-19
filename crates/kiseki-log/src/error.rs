@@ -33,6 +33,10 @@ pub enum LogError {
     /// Requested sequence range is invalid or beyond the shard tip.
     #[error("invalid sequence range for shard {0:?}")]
     InvalidRange(ShardId),
+
+    /// Raft unavailable (bootstrap, leader election, or consensus failure).
+    #[error("raft unavailable")]
+    Unavailable,
 }
 
 impl From<LogError> for KisekiError {
@@ -51,6 +55,9 @@ impl From<LogError> for KisekiError {
             LogError::KeyOutOfRange(id) | LogError::InvalidRange(id) => KisekiError::Permanent(
                 PermanentError::InvariantViolation(format!("log error on shard {id:?}")),
             ),
+            LogError::Unavailable => {
+                KisekiError::Retriable(RetriableError::ShardUnavailable(ShardId(uuid::Uuid::nil())))
+            }
         }
     }
 }
