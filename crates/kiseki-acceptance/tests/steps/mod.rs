@@ -10,6 +10,7 @@ pub mod chunk;
 pub mod client;
 pub mod composition;
 pub mod crypto;
+pub mod gateway;
 pub mod helpers;
 pub mod log;
 pub mod operational;
