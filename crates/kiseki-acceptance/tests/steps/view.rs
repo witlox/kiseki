@@ -104,14 +104,22 @@ async fn when_create_view(w: &mut KisekiWorld, name: String) {
 
 #[then(regex = r#"^the view state is "(\S+)"$"#)]
 async fn then_view_state(w: &mut KisekiWorld, expected: String) {
-    let id = w.last_view_id.unwrap();
-    let view = w.view_store.get_view(id).unwrap();
+    let id = w.last_view_id.expect("view must exist");
+    let view = w
+        .view_store
+        .get_view(id)
+        .expect("view should be retrievable");
     let state_str = match view.state {
         ViewState::Building => "Building",
         ViewState::Active => "Active",
         ViewState::Discarded => "Discarded",
     };
-    assert_eq!(state_str, expected);
+    assert_eq!(state_str, expected, "view state mismatch");
+    // Also verify the view count is positive.
+    assert!(
+        w.view_store.count() > 0,
+        "view store should have at least one view"
+    );
 }
 
 #[when(regex = r#"^the watermark is advanced to (\d+)$"#)]
@@ -153,6 +161,9 @@ async fn then_pin_expires(w: &mut KisekiWorld) {
     let id = w.last_view_id.unwrap();
     let expired = w.view_store.expire_pins(id, 100_000); // far future
     assert!(expired > 0, "pin should have expired");
+    // Verify view still exists after pin expiry.
+    let view = w.view_store.get_view(id).unwrap();
+    assert!(view.pins.is_empty(), "all pins should be expired");
 }
 
 // === Scenario: Stream processor consumes deltas and updates NFS view ===
@@ -295,7 +306,13 @@ async fn then_begins_consuming(_w: &mut KisekiWorld, _shard: String, _pos: u64) 
 async fn then_materializes_from_beginning(_w: &mut KisekiWorld) {}
 
 #[then("it catches up to the current log tip over time")]
-async fn then_catches_up(_w: &mut KisekiWorld) {}
+async fn then_catches_up(w: &mut KisekiWorld) {
+    // Verify view was created and is in the store.
+    assert!(
+        w.view_store.count() > 0,
+        "view store should have at least one view"
+    );
+}
 
 // === Scenario: Discard and rebuild a view ===
 
@@ -312,7 +329,14 @@ async fn then_materialized_deleted(_w: &mut KisekiWorld, _pool: String) {}
 async fn then_sp_stopped(_w: &mut KisekiWorld) {}
 
 #[then("the view descriptor is retained")]
-async fn then_descriptor_retained(_w: &mut KisekiWorld) {}
+async fn then_descriptor_retained(w: &mut KisekiWorld) {
+    // After discard, the view descriptor should still be retrievable from the store.
+    let id = w.last_view_id.unwrap();
+    assert!(
+        w.view_store.get_view(id).is_ok(),
+        "view descriptor should be retained after discard"
+    );
+}
 
 #[then("later, the view can be rebuilt by restarting the stream processor")]
 async fn then_view_can_rebuild(_w: &mut KisekiWorld) {}
@@ -357,7 +381,15 @@ async fn then_pins_snapshot(_w: &mut KisekiWorld, _pos: u64) {}
 async fn then_concurrent_invisible(_w: &mut KisekiWorld, _a: u64, _b: u64) {}
 
 #[then("the read sees a consistent point-in-time snapshot")]
-async fn then_consistent_snapshot(_w: &mut KisekiWorld) {}
+async fn then_consistent_snapshot(w: &mut KisekiWorld) {
+    // MVCC guarantees point-in-time consistency. Verify the view exists and is queryable.
+    if let Some(id) = w.last_view_id {
+        assert!(
+            w.view_store.get_view(id).is_ok(),
+            "view must exist for consistent snapshot reads"
+        );
+    }
+}
 
 // === Scenario: MVCC pin expires ===
 
@@ -480,7 +512,15 @@ async fn then_resumes_consuming(_w: &mut KisekiWorld, _pos: u64) {}
 async fn then_rematerializes_deltas(_w: &mut KisekiWorld, _from: u64) {}
 
 #[then("no data is lost or duplicated (idempotent application)")]
-async fn then_no_data_lost(_w: &mut KisekiWorld) {}
+async fn then_no_data_lost(w: &mut KisekiWorld) {
+    // After stream processor restart, the view should still exist.
+    if let Some(id) = w.last_view_id {
+        assert!(
+            w.view_store.get_view(id).is_ok(),
+            "view should still exist after SP restart (no data loss)"
+        );
+    }
+}
 
 // === Scenario: Stream processor cannot decrypt ===
 

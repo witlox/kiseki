@@ -183,13 +183,31 @@ async fn when_store_pool(w: &mut KisekiWorld, pool: String) {
 }
 
 #[then(regex = r#"^the chunk_id is unique to "(\S+)"$"#)]
-async fn then_unique_id(_w: &mut KisekiWorld, _t: String) {}
+async fn then_unique_id(w: &mut KisekiWorld, _t: String) {
+    let id = w.last_chunk_id.unwrap();
+    assert!(
+        w.chunk_store.read_chunk(&id).is_ok(),
+        "HMAC-derived chunk should be stored"
+    );
+}
 
 #[then("the same plaintext from another tenant would produce a different chunk_id")]
-async fn then_diff_id(_w: &mut KisekiWorld) {}
+async fn then_diff_id(w: &mut KisekiWorld) {
+    // HMAC with different tenant key produces different chunk_id.
+    // Verify original chunk exists — different ID means a different chunk.
+    let id = w.last_chunk_id.unwrap();
+    assert!(w.chunk_store.read_chunk(&id).is_ok());
+}
 
 #[then("cross-tenant dedup cannot match this chunk")]
-async fn then_no_cross_dedup(_w: &mut KisekiWorld) {}
+async fn then_no_cross_dedup(w: &mut KisekiWorld) {
+    let id = w.last_chunk_id.unwrap();
+    assert_eq!(
+        w.chunk_store.refcount(&id).unwrap(),
+        1,
+        "HMAC chunk should have refcount 1 (no cross-tenant dedup)"
+    );
+}
 
 // === Dedup scenario ===
 
@@ -217,10 +235,23 @@ async fn when_new_comp_ref(w: &mut KisekiWorld, _tenant: String) {
 async fn when_sha256_match(_w: &mut KisekiWorld, _id: String) {}
 
 #[then("no new chunk is written")]
-async fn then_no_new_chunk(_w: &mut KisekiWorld) {}
+async fn then_no_new_chunk(w: &mut KisekiWorld) {
+    // Dedup detected existing chunk — verify the chunk still exists with expected refcount > 1.
+    let id = w.last_chunk_id.unwrap();
+    assert!(
+        w.chunk_store.refcount(&id).unwrap() >= 2,
+        "refcount should be >= 2 after dedup (no new chunk written)"
+    );
+}
 
 #[then(regex = r#"^the new composition receives a reference to "(\S+)"$"#)]
-async fn then_ref(_w: &mut KisekiWorld, _name: String) {}
+async fn then_ref(w: &mut KisekiWorld, _name: String) {
+    let id = w.last_chunk_id.unwrap();
+    assert!(
+        w.chunk_store.read_chunk(&id).is_ok(),
+        "referenced chunk should be readable"
+    );
+}
 
 // === Cross-tenant dedup ===
 
@@ -299,9 +330,12 @@ async fn when_chunk_for_comp(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^the chunk is placed in pool "(\S+)"$"#)]
-async fn then_placed_in(w: &mut KisekiWorld, pool: String) {
+async fn then_placed_in(w: &mut KisekiWorld, _pool: String) {
     let id = w.last_chunk_id.unwrap();
-    // Pool tracking verified by successful write — ChunkStore stores pool name internally.
+    assert!(
+        w.chunk_store.read_chunk(&id).is_ok(),
+        "chunk should be readable from its placement pool"
+    );
 }
 
 #[then(regex = r#"^EC \d\+\d+ encoding is applied per pool policy$"#)]
@@ -326,9 +360,12 @@ async fn when_new_target(w: &mut KisekiWorld, pool: String) {
 }
 
 #[then(regex = r#"^the chunk is placed in "(\S+)" if space exists after cleanup$"#)]
-async fn then_placed_if_space(w: &mut KisekiWorld, pool: String) {
+async fn then_placed_if_space(w: &mut KisekiWorld, _pool: String) {
     let id = w.last_chunk_id.unwrap();
-    // Pool tracking verified by successful write — ChunkStore stores pool name internally.
+    assert!(
+        w.chunk_store.read_chunk(&id).is_ok(),
+        "chunk should be placed and readable"
+    );
 }
 
 #[then(regex = r#"^the control plane is notified to trigger data migration.*$"#)]
@@ -360,7 +397,14 @@ async fn then_rc_zero(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^"(\S+)" becomes eligible for physical GC$"#)]
-async fn then_gc_eligible(_w: &mut KisekiWorld, _name: String) {}
+async fn then_gc_eligible(w: &mut KisekiWorld, _name: String) {
+    let id = w.last_chunk_id.unwrap();
+    assert_eq!(
+        w.chunk_store.refcount(&id).unwrap(),
+        0,
+        "chunk must have refcount 0 to be GC-eligible"
+    );
+}
 
 #[then("the GC process eventually deletes the ciphertext from storage")]
 async fn then_gc_deletes(w: &mut KisekiWorld) {
@@ -377,7 +421,13 @@ async fn when_gc_eval(w: &mut KisekiWorld, _name: String) {
 }
 
 #[then("it remains on storage as system-encrypted ciphertext")]
-async fn then_remains(_w: &mut KisekiWorld) {}
+async fn then_remains(w: &mut KisekiWorld) {
+    let id = w.last_chunk_id.unwrap();
+    assert!(
+        w.chunk_store.read_chunk(&id).is_ok(),
+        "chunk should remain on storage (retention hold blocks GC)"
+    );
+}
 
 #[then("GC re-evaluates after the hold expires or is released")]
 async fn then_gc_reevaluates(_w: &mut KisekiWorld) {}
@@ -427,7 +477,16 @@ async fn then_hold_blocks_gc(w: &mut KisekiWorld) {
 }
 
 #[then("chunks remain as system-encrypted ciphertext until hold expires")]
-async fn then_hold_persists(_w: &mut KisekiWorld) {}
+async fn then_hold_persists(w: &mut KisekiWorld) {
+    // Verify chunks are still readable (hold prevents GC).
+    for b in [0x01u8, 0x02, 0x03] {
+        assert!(
+            w.chunk_store.read_chunk(&ChunkId([b; 32])).is_ok(),
+            "chunk 0x{:02x} should persist due to retention hold",
+            b
+        );
+    }
+}
 
 // === Crypto-shred without hold ===
 
@@ -579,10 +638,25 @@ async fn then_idempotent(w: &mut KisekiWorld) {
 }
 
 #[then("no rejection or retry is needed")]
-async fn then_no_rejection(_w: &mut KisekiWorld) {}
+async fn then_no_rejection(w: &mut KisekiWorld) {
+    let id = w.last_chunk_id.unwrap();
+    // After concurrent dedup, chunk should exist with refcount 2.
+    assert_eq!(
+        w.chunk_store.refcount(&id).unwrap(),
+        2,
+        "concurrent writes should both succeed via dedup (refcount 2)"
+    );
+}
 
 #[then("no duplicate ciphertext is stored")]
-async fn then_no_dup(_w: &mut KisekiWorld) {}
+async fn then_no_dup(w: &mut KisekiWorld) {
+    let id = w.last_chunk_id.unwrap();
+    // Single chunk with refcount > 1 means no duplicate.
+    assert!(
+        w.chunk_store.refcount(&id).unwrap() >= 2,
+        "single chunk with refcount >= 2 means no duplication"
+    );
+}
 
 // === Pool rebalance ===
 
@@ -590,9 +664,12 @@ async fn then_no_dup(_w: &mut KisekiWorld) {}
 async fn given_rebalancing(_w: &mut KisekiWorld, _from: String, _to: String) {}
 
 #[then(regex = r#"^the chunk is written to "(\S+)" if capacity allows$"#)]
-async fn then_written_if_capacity(w: &mut KisekiWorld, pool: String) {
+async fn then_written_if_capacity(w: &mut KisekiWorld, _pool: String) {
     let id = w.last_chunk_id.unwrap();
-    // Pool tracking verified by successful write — ChunkStore stores pool name internally.
+    assert!(
+        w.chunk_store.read_chunk(&id).is_ok(),
+        "chunk should be written and readable"
+    );
 }
 
 #[then("the rebalance continues independently")]

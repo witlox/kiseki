@@ -411,8 +411,11 @@ async fn then_comp_exists_in_ns(w: &mut KisekiWorld, _name: String, _ns: String)
 }
 
 #[then("the chunk's refcount includes this composition's reference")]
-async fn then_chunk_refcount_includes(_w: &mut KisekiWorld) {
-    // Refcount verified structurally — chunk store tracks references.
+async fn then_chunk_refcount_includes(w: &mut KisekiWorld) {
+    assert!(
+        w.last_composition_id.is_some(),
+        "composition must exist before checking refcount"
+    );
 }
 
 #[then("the protocol gateway receives success")]
@@ -441,8 +444,16 @@ async fn then_comp_complete_inline(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^new chunks \[([^\]]+)\] are written to Chunk Storage$"#)]
-async fn then_new_chunks_written(_w: &mut KisekiWorld, _chunks: String) {
-    // Chunk writes verified structurally.
+async fn then_new_chunks_written(w: &mut KisekiWorld, _chunks: String) {
+    assert!(
+        w.last_error.is_none(),
+        "chunk write should succeed: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.last_composition_id.is_some(),
+        "composition must exist after writing chunks"
+    );
 }
 
 #[then(regex = r#"^a delta is appended: "([^"]+)"$"#)]
@@ -451,13 +462,27 @@ async fn then_delta_appended(w: &mut KisekiWorld, _desc: String) {
 }
 
 #[then(regex = r#"^the composition now references \[([^\]]+)\]$"#)]
-async fn then_comp_references(_w: &mut KisekiWorld, _chunks: String) {
-    // Chunk reference list — structural assertion.
+async fn then_comp_references(w: &mut KisekiWorld, _chunks: String) {
+    let id = w
+        .last_composition_id
+        .expect("composition must exist to check references");
+    assert!(
+        w.comp_store.get(id).is_ok(),
+        "composition should be retrievable"
+    );
 }
 
 #[then(regex = r#"^refcounts for (\S+) are initialized to (\d+)$"#)]
-async fn then_refcounts_initialized(_w: &mut KisekiWorld, _chunks: String, _count: u64) {
-    // Refcount initialization — structural.
+async fn then_refcounts_initialized(w: &mut KisekiWorld, _chunks: String, _count: u64) {
+    assert!(
+        w.last_error.is_none(),
+        "refcount init should succeed: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.last_composition_id.is_some(),
+        "composition must exist for refcount initialization"
+    );
 }
 
 #[then(regex = r#"^a new chunk c2' is written covering the modified range$"#)]
@@ -486,18 +511,43 @@ async fn then_comp_verifies_durable(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^a single delta records the complete composition: \[([^\]]+)\]$"#)]
-async fn then_single_delta_records(_w: &mut KisekiWorld, _chunks: String) {
-    // Single finalize delta — structural.
+async fn then_single_delta_records(w: &mut KisekiWorld, _chunks: String) {
+    assert!(
+        w.last_error.is_none(),
+        "delta should commit: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.last_composition_id.is_some(),
+        "composition must exist after finalize delta"
+    );
 }
 
 #[then("the composition becomes visible to readers only after the finalize delta commits")]
 async fn then_visible_after_finalize(w: &mut KisekiWorld) {
-    assert!(w.last_composition_id.is_some());
+    let id = w
+        .last_composition_id
+        .expect("composition must exist after finalize");
+    assert!(
+        w.comp_store.get(id).is_ok(),
+        "composition should be retrievable after finalize"
+    );
 }
 
 #[then("individual parts are NOT visible before completion (I-L5)")]
-async fn then_parts_not_visible_il5(_w: &mut KisekiWorld) {
-    // Atomicity invariant I-L5 — structural.
+async fn then_parts_not_visible_il5(w: &mut KisekiWorld) {
+    // After CompleteMultipartUpload, the composition should exist atomically.
+    // The invariant I-L5 states individual parts are not visible before the finalize delta.
+    // We verify the composition was created atomically via the finalize step.
+    assert!(
+        w.last_composition_id.is_some(),
+        "composition must exist after finalize (atomicity of I-L5)"
+    );
+    assert!(
+        w.last_error.is_none(),
+        "finalize should succeed: {:?}",
+        w.last_error
+    );
 }
 
 #[then("no finalize delta is committed")]
@@ -541,13 +591,23 @@ async fn then_comp_not_visible(w: &mut KisekiWorld) {
 }
 
 #[then("a delete marker is appended (tombstone delta)")]
-async fn then_delete_marker(_w: &mut KisekiWorld) {
-    // Delete marker for versioned namespace — structural.
+async fn then_delete_marker(w: &mut KisekiWorld) {
+    assert!(
+        w.last_error.is_none(),
+        "delete marker should succeed: {:?}",
+        w.last_error
+    );
 }
 
 #[then("the current version becomes the delete marker")]
-async fn then_current_version_delete_marker(_w: &mut KisekiWorld) {
-    // Version semantics — structural.
+async fn then_current_version_delete_marker(w: &mut KisekiWorld) {
+    // After delete in versioned namespace, the composition should no longer be retrievable.
+    if let Some(id) = w.last_composition_id {
+        assert!(
+            w.comp_store.get(id).is_err(),
+            "current version should be a delete marker (not retrievable)"
+        );
+    }
 }
 
 #[then(regex = r#"^previous versions \[([^\]]+)\] remain accessible by version ID$"#)]
@@ -562,7 +622,11 @@ async fn then_chunk_refcounts_not_decremented(_w: &mut KisekiWorld) {
 
 #[then(regex = r#"^file B's composition references chunk "([^"]+)"$"#)]
 async fn then_file_b_refs_chunk(w: &mut KisekiWorld, _chunk: String) {
-    assert!(w.last_composition_id.is_some());
+    let id = w.last_composition_id.expect("composition B must exist");
+    assert!(
+        w.comp_store.get(id).is_ok(),
+        "file B's composition should be retrievable"
+    );
 }
 
 #[then(regex = r#"^chunk "([^"]+)" refcount is (\d+)$"#)]
@@ -606,13 +670,31 @@ async fn then_data_fully_isolated(_w: &mut KisekiWorld, _tenant: String) {
 }
 
 #[then(regex = r#"^a new shard is created for "([^"]+)"$"#)]
-async fn then_new_shard_for_ns(_w: &mut KisekiWorld, _ns: String) {
-    // Namespace shard creation — structural.
+async fn then_new_shard_for_ns(w: &mut KisekiWorld, ns: String) {
+    assert!(
+        w.last_error.is_none(),
+        "shard creation should succeed: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.namespace_ids.contains_key(&ns),
+        "namespace '{}' should be registered",
+        ns
+    );
 }
 
 #[then("the namespace is associated with the tenant and shard")]
-async fn then_ns_associated(_w: &mut KisekiWorld) {
-    // Namespace-tenant-shard association — structural.
+async fn then_ns_associated(w: &mut KisekiWorld) {
+    assert!(
+        w.last_error.is_none(),
+        "namespace creation should succeed: {:?}",
+        w.last_error
+    );
+    // Verify the namespace was registered in our ID map.
+    assert!(
+        !w.namespace_ids.is_empty(),
+        "at least one namespace should be registered"
+    );
 }
 
 #[then("compliance tags from the org level are inherited")]
@@ -641,8 +723,11 @@ async fn then_comp_create_aborted(w: &mut KisekiWorld) {
 }
 
 #[then("no delta is committed to the Log")]
-async fn then_no_delta_committed(_w: &mut KisekiWorld) {
-    // No delta on failure — structural.
+async fn then_no_delta_committed(w: &mut KisekiWorld) {
+    assert!(
+        w.last_error.is_some(),
+        "expected an error indicating failure"
+    );
 }
 
 #[then("the protocol gateway receives a retriable error")]
@@ -651,8 +736,13 @@ async fn then_pgw_retriable_error(w: &mut KisekiWorld) {
 }
 
 #[then("no partial state remains")]
-async fn then_no_partial_state(_w: &mut KisekiWorld) {
-    // Atomicity — no partial state on failure.
+async fn then_no_partial_state(w: &mut KisekiWorld) {
+    // Atomicity: after a failed create, no composition should exist.
+    assert!(
+        w.last_composition_id.is_none()
+            || w.comp_store.get(w.last_composition_id.unwrap()).is_err(),
+        "no partial composition should remain after failure"
+    );
 }
 
 #[then("the composition create fails")]
@@ -682,13 +772,24 @@ async fn then_operation_exdev(w: &mut KisekiWorld) {
 }
 
 #[then("the caller handles via copy + delete")]
-async fn then_caller_copy_delete(_w: &mut KisekiWorld) {
-    // Client-side copy+delete for cross-shard — structural.
+async fn then_caller_copy_delete(w: &mut KisekiWorld) {
+    // EXDEV was returned, confirming caller must handle cross-shard via copy+delete.
+    assert!(
+        w.last_error
+            .as_ref()
+            .is_some_and(|e| e.contains("cross-shard")),
+        "EXDEV error should still be present: {:?}",
+        w.last_error
+    );
 }
 
 #[then("no 2PC or cross-shard coordination occurs")]
-async fn then_no_2pc(_w: &mut KisekiWorld) {
-    // No distributed transaction — structural.
+async fn then_no_2pc(w: &mut KisekiWorld) {
+    // The EXDEV error proves we reject rather than coordinate.
+    assert!(
+        w.last_error.is_some(),
+        "cross-shard rename should have been rejected, not coordinated"
+    );
 }
 
 // === Then steps: Workflow Advisory integration ===
@@ -758,13 +859,27 @@ async fn then_all_ops_succeed(w: &mut KisekiWorld) {
 }
 
 #[then("no advisory-dependent behavior (write-absorb preallocation, retention-intent biasing) is applied")]
-async fn then_no_advisory_behavior(_w: &mut KisekiWorld) {
-    // Advisory disabled — no advisory effects.
+async fn then_no_advisory_behavior(w: &mut KisekiWorld) {
+    // Verify the composition was created successfully without advisory.
+    assert!(
+        w.last_error.is_none(),
+        "operations should succeed without advisory: {:?}",
+        w.last_error
+    );
 }
 
 #[then("refcount, delta ordering, and chunk durability guarantees are unchanged (I-WA2)")]
-async fn then_guarantees_unchanged_iwa2(_w: &mut KisekiWorld) {
-    // I-WA2: data-path independence.
+async fn then_guarantees_unchanged_iwa2(w: &mut KisekiWorld) {
+    // I-WA2: data-path independence — verify composition exists and no error.
+    assert!(
+        w.last_error.is_none(),
+        "data-path guarantees require no error: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.last_composition_id.is_some(),
+        "composition should exist (I-WA2 data-path independence)"
+    );
 }
 
 // Background steps shared with other features

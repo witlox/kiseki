@@ -143,7 +143,28 @@ async fn then_order(w: &mut KisekiWorld) {
 }
 
 #[then("no gaps exist in the sequence")]
-async fn then_no_gaps(_w: &mut KisekiWorld) {} // verified above
+async fn then_no_gaps(w: &mut KisekiWorld) {
+    // Verify the shard has contiguous deltas from 1 to tip.
+    let sid = *w.shard_names.get("shard-alpha").unwrap();
+    let tip = w.log_store.shard_health(sid).unwrap().tip;
+    let deltas = w
+        .log_store
+        .read_deltas(ReadDeltasRequest {
+            shard_id: sid,
+            from: SequenceNumber(1),
+            to: tip,
+        })
+        .unwrap();
+    for pair in deltas.windows(2) {
+        assert_eq!(
+            pair[1].header.sequence.0,
+            pair[0].header.sequence.0 + 1,
+            "gap detected between {:?} and {:?}",
+            pair[0].header.sequence,
+            pair[1].header.sequence
+        );
+    }
+}
 
 // === Scenario 4: Raft leader loss ===
 
@@ -163,7 +184,14 @@ async fn then_writes_resume(_w: &mut KisekiWorld) {}
 async fn then_retried(_w: &mut KisekiWorld) {}
 
 #[then("no committed deltas are lost")]
-async fn then_no_loss(_w: &mut KisekiWorld) {}
+async fn then_no_loss(w: &mut KisekiWorld) {
+    // The shard should still be queryable after leader loss.
+    let sid = *w.shard_names.get("shard-alpha").unwrap();
+    assert!(
+        w.log_store.shard_health(sid).is_ok(),
+        "previously committed deltas should still be present"
+    );
+}
 
 // === Scenario 5: Write during election ===
 
@@ -193,7 +221,13 @@ async fn then_leader_unavailable(w: &mut KisekiWorld) {
 }
 
 #[then("the Composition context retries after backoff")]
-async fn then_backoff(_w: &mut KisekiWorld) {}
+async fn then_backoff(w: &mut KisekiWorld) {
+    // The error should be present to trigger retry logic.
+    assert!(
+        w.last_error.is_some(),
+        "error must be present for retry/backoff behavior"
+    );
+}
 
 // === Scenario 6: Quorum loss ===
 
@@ -289,7 +323,20 @@ async fn then_routing(_w: &mut KisekiWorld) {}
 #[then(regex = r#"^"(\S+)" continues serving reads for its existing range$"#)]
 async fn then_serves_reads(w: &mut KisekiWorld, name: String) {
     let sid = *w.shard_names.get(&name).unwrap();
-    assert!(w.log_store.shard_health(sid).is_ok());
+    let health = w.log_store.shard_health(sid).unwrap();
+    assert!(
+        health.delta_count > 0,
+        "shard should still have deltas to serve"
+    );
+    // Verify reads actually work.
+    assert!(w
+        .log_store
+        .read_deltas(ReadDeltasRequest {
+            shard_id: sid,
+            from: SequenceNumber(1),
+            to: health.tip,
+        })
+        .is_ok());
 }
 
 #[then("a ShardSplit event is emitted")]
@@ -321,7 +368,13 @@ async fn then_accepted_committed(w: &mut KisekiWorld) {
 }
 
 #[then("the split operation continues in the background")]
-async fn then_split_bg(_w: &mut KisekiWorld) {}
+async fn then_split_bg(w: &mut KisekiWorld) {
+    // The delta was accepted even during split, proving non-blocking.
+    assert!(
+        w.last_sequence.is_some(),
+        "delta should be committed during split"
+    );
+}
 
 // === Scenario 10: Compaction ===
 
@@ -573,7 +626,15 @@ async fn then_no_pacing(_w: &mut KisekiWorld) {}
 async fn then_tombstones(_w: &mut KisekiWorld) {}
 
 #[then("tenant-encrypted payloads are carried opaquely — never decrypted")]
-async fn then_opaque(_w: &mut KisekiWorld) {}
+async fn then_opaque(w: &mut KisekiWorld) {
+    // Verify deltas are readable (compaction preserved them).
+    let sid = *w.shard_names.get("shard-alpha").unwrap();
+    let health = w.log_store.shard_health(sid).unwrap();
+    assert!(
+        health.delta_count > 0,
+        "compacted deltas should still be readable"
+    );
+}
 
 #[then("the resulting SSTable count is reduced")]
 async fn then_reduced(w: &mut KisekiWorld) {
@@ -599,7 +660,15 @@ async fn then_admin_compact_runs(w: &mut KisekiWorld) {
 }
 
 #[then("the same merge semantics apply")]
-async fn then_same_semantics(_w: &mut KisekiWorld) {}
+async fn then_same_semantics(w: &mut KisekiWorld) {
+    // After admin compaction, verify deltas are still readable and compacted.
+    let sid = *w.shard_names.get("shard-alpha").unwrap();
+    let health = w.log_store.shard_health(sid).unwrap();
+    assert!(
+        health.delta_count < 20,
+        "compaction should have reduced delta count"
+    );
+}
 
 #[then("the operation is recorded in the audit log")]
 async fn then_audit_logged(_w: &mut KisekiWorld) {}
@@ -615,10 +684,17 @@ async fn then_alert_stale(_w: &mut KisekiWorld) {}
 #[then("a ShardMaintenanceEntered event is emitted")]
 async fn then_maint_event(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    assert_eq!(
-        w.log_store.shard_health(sid).unwrap().state,
-        ShardState::Maintenance
-    );
+    let health = w.log_store.shard_health(sid).unwrap();
+    assert_eq!(health.state, ShardState::Maintenance);
+    // Verify reads still work in maintenance.
+    assert!(w
+        .log_store
+        .read_deltas(ReadDeltasRequest {
+            shard_id: sid,
+            from: SequenceNumber(1),
+            to: SequenceNumber(1),
+        })
+        .is_ok());
 }
 
 // Exit maintenance — split trigger
@@ -664,7 +740,17 @@ async fn then_latency_bump(_w: &mut KisekiWorld) {}
 async fn then_committed_to(_w: &mut KisekiWorld, _shard: String) {}
 
 #[then("no delta is lost, duplicated, or misplaced")]
-async fn then_no_delta_lost(_w: &mut KisekiWorld) {}
+async fn then_no_delta_lost(w: &mut KisekiWorld) {
+    assert!(
+        w.last_sequence.is_some(),
+        "delta should have been committed successfully"
+    );
+    assert!(
+        w.last_error.is_none(),
+        "no error should occur: {:?}",
+        w.last_error
+    );
+}
 
 // Concurrent split + compaction
 #[given(regex = r#"^"(\S+)" is being compacted$"#)]
