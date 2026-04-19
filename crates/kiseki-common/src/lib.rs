@@ -35,7 +35,7 @@ pub use ids::{
     WorkloadId,
 };
 pub use tenancy::{ComplianceTag, DedupPolicy, KeyEpoch, Quota, TenantScope};
-pub use time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+pub use time::{ClockQuality, DeltaTimestamp, HlcExhausted, HybridLogicalClock, WallTime};
 
 pub use advisory::{
     AccessPattern, AffinityPreference, ClientId, DedupIntent, OperationAdvisory, PhaseId,

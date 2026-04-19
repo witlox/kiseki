@@ -4,6 +4,15 @@
 
 use crate::ids::NodeId;
 
+/// The HLC address space is exhausted: both the physical component
+/// (`u64::MAX`) and the logical counter (`u32::MAX`) are saturated.
+/// No strictly-greater timestamp can be produced. This condition is
+/// unreachable in practice (`physical_ms` = `u64::MAX` corresponds to
+/// year ~584,942,417 CE) but must be handled to preserve the
+/// monotonicity contract (I-T5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HlcExhausted;
+
 /// Hybrid Logical Clock — authoritative for ordering and causality.
 ///
 /// Combines a physical-time component (ms since Unix epoch) with a
@@ -40,24 +49,31 @@ impl HybridLogicalClock {
     ///
     /// If the wall-clock reading is strictly greater than `self.physical_ms`,
     /// the physical component advances and the logical counter resets to
-    /// zero. Otherwise the logical counter is incremented, which is the
-    /// only branch that can overflow. On overflow the physical component
-    /// is pushed forward by 1 ms and the logical counter resets —
-    /// preserving strict monotonicity without panicking.
+    /// zero. Otherwise the logical counter is incremented. If the logical
+    /// counter overflows, the physical component is pushed forward by 1 ms
+    /// and the logical counter resets — preserving strict monotonicity.
+    ///
+    /// Returns [`HlcExhausted`] if both components are at their maximum
+    /// values and no strictly-greater timestamp can be produced.
     ///
     /// Spec: I-T5, §HLC.
-    #[must_use]
-    pub fn tick(mut self, now_physical_ms: u64) -> Self {
+    pub fn tick(mut self, now_physical_ms: u64) -> Result<Self, HlcExhausted> {
         if now_physical_ms > self.physical_ms {
             self.physical_ms = now_physical_ms;
             self.logical = 0;
         } else if let Some(next) = self.logical.checked_add(1) {
             self.logical = next;
         } else {
-            self.physical_ms = self.physical_ms.saturating_add(1);
-            self.logical = 0;
+            // Logical counter saturated — try to advance physical.
+            match self.physical_ms.checked_add(1) {
+                Some(next_phys) => {
+                    self.physical_ms = next_phys;
+                    self.logical = 0;
+                }
+                None => return Err(HlcExhausted),
+            }
         }
-        self
+        Ok(self)
     }
 
     /// Merge a received remote HLC into the local clock, given the
@@ -71,15 +87,11 @@ impl HybridLogicalClock {
     ///          otherwise (phys' == now > both):        0
     /// ```
     ///
-    /// Logical-counter overflow (fully saturated `u32`) is resolved by
-    /// advancing the physical component by 1 ms and resetting logical to
-    /// zero. Under all inputs the returned clock is strictly greater
-    /// than both `self` and `remote` in the induced total order, so
-    /// monotonicity holds.
+    /// Returns [`HlcExhausted`] if both components are at their maximum
+    /// values and no strictly-greater timestamp can be produced.
     ///
     /// Spec: `ubiquitous-language.md#HLC`, I-T5.
-    #[must_use]
-    pub fn merge(self, remote: Self, now_physical_ms: u64) -> Self {
+    pub fn merge(self, remote: Self, now_physical_ms: u64) -> Result<Self, HlcExhausted> {
         let local_phys = self.physical_ms;
         let remote_phys = remote.physical_ms;
         let phys_prime = local_phys.max(remote_phys).max(now_physical_ms);
@@ -92,24 +104,30 @@ impl HybridLogicalClock {
             remote.logical
         } else {
             // now strictly dominates both inputs — reset logical.
-            return Self {
+            return Ok(Self {
                 physical_ms: phys_prime,
                 logical: 0,
                 node_id: self.node_id,
-            };
+            });
         };
 
         match base_logical.checked_add(1) {
-            Some(logical) => Self {
+            Some(logical) => Ok(Self {
                 physical_ms: phys_prime,
                 logical,
                 node_id: self.node_id,
-            },
-            None => Self {
-                physical_ms: phys_prime.saturating_add(1),
-                logical: 0,
-                node_id: self.node_id,
-            },
+            }),
+            None => {
+                // Logical counter saturated — try to advance physical.
+                match phys_prime.checked_add(1) {
+                    Some(next_phys) => Ok(Self {
+                        physical_ms: next_phys,
+                        logical: 0,
+                        node_id: self.node_id,
+                    }),
+                    None => Err(HlcExhausted),
+                }
+            }
         }
     }
 }

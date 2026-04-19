@@ -93,3 +93,14 @@ pub struct ViewId(pub uuid::Uuid);
 /// total order within the shard (I-L1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SequenceNumber(pub u64);
+
+impl SequenceNumber {
+    /// Return the next sequence number, or `None` if `u64::MAX` is reached.
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(n) => Some(Self(n)),
+            None => None,
+        }
+    }
+}
