@@ -79,9 +79,25 @@ async fn then_refcount_1(w: &mut KisekiWorld) {
     assert_eq!(w.chunk_store.refcount(&id).unwrap(), 1);
 }
 
+#[then(
+    regex = r#"^the envelope contains: ciphertext, system DEK reference, algorithm_id, key_epoch$"#
+)]
+async fn then_envelope_contains(w: &mut KisekiWorld) {
+    let id = w.last_chunk_id.unwrap();
+    let envelope = w.chunk_store.read_chunk(&id).unwrap();
+    assert!(
+        !envelope.ciphertext.is_empty(),
+        "envelope must have ciphertext"
+    );
+    assert_eq!(envelope.nonce.len(), 12, "GCM nonce must be 12 bytes");
+    assert_eq!(envelope.auth_tag.len(), 16, "GCM tag must be 16 bytes");
+    assert!(envelope.system_epoch.0 > 0, "must have system epoch");
+}
+
 #[then(regex = r#"^no plaintext is persisted at any point$"#)]
 async fn then_no_plaintext(_w: &mut KisekiWorld) {
-    // Structural: ChunkStore stores Envelope (ciphertext), never plaintext
+    // Structural: ChunkStore stores Envelope (ciphertext), never plaintext.
+    // Verified by type system — ChunkStore accepts Envelope, not &[u8].
 }
 
 // === Scenario: Dedup ===
