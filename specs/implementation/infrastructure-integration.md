@@ -160,7 +160,7 @@ latency unaffected (F-ADV-1).
 
 | Step | Status | Commit | Adv gate | Notes |
 |------|--------|--------|----------|-------|
-| WI-1 | pending | — | — | Fidelity sweep |
+| WI-1 | done | — | passed | Fidelity sweep: 1 HIGH, 4 MEDIUM, 8 LOW; 23% scenario coverage |
 | WI-2a | pending | — | — | Trait prep (breaking) |
 | WI-2b | pending | — | — | Keymanager Raft |
 | WI-2c | pending | — | — | Log Raft |
