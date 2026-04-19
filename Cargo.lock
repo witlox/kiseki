@@ -1054,6 +1054,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-composition"
+version = "0.0.0"
+dependencies = [
+ "kiseki-common",
+ "proptest",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "kiseki-crypto"
 version = "0.0.0"
 dependencies = [

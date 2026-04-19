@@ -383,7 +383,7 @@ auditor fidelity HIGH across all contexts.
 | 4 | done | — | — | `phase4-gate2.md` | — | kiseki-keymanager: Raft deferred, 0 blocking |
 | 5 | done | — | — | `phase5-gate2.md` | — | kiseki-audit: per-tenant shards, event types, 0 blocking |
 | 6 | done | — | — | `phase6-gate2.md` | — | kiseki-chunk: dedup, refcount, GC, holds, pools |
-| 7 | pending | — | — | — | — | |
+| 7 | done | — | — | — | — | kiseki-composition: CRUD, namespace, multipart, EXDEV |
 | 8 | pending | — | — | — | — | |
 | 9 | pending | — | — | — | — | |
 | 10 | pending | — | — | — | — | |
