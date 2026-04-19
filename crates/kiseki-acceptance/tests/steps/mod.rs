@@ -1,13 +1,12 @@
 //! Step definitions for Kiseki acceptance tests.
 //!
-//! Each module registers steps for a specific feature file.
-//! cucumber-rs macros register globally via the World type.
-//!
-//! Modules without real crate code behind them are stubs —
-//! unmatched scenarios show as "skipped" until implementations exist.
+//! Only steps with REAL behavioral assertions are defined here.
+//! Undefined steps show as "skipped" in cucumber output — that's
+//! our honest backlog of unimplemented behavior.
 
 pub mod advisory;
 pub mod auth;
+pub mod chunk;
 pub mod composition;
 pub mod crypto;
 pub mod helpers;

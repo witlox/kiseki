@@ -11,24 +11,27 @@
     dead_code,
     unused_mut,
     clippy::needless_pass_by_value,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::uninlined_format_args
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cucumber::World;
 use kiseki_advisory::budget::{BudgetConfig, BudgetEnforcer};
 use kiseki_advisory::workflow::WorkflowTable;
 use kiseki_audit::store::AuditLog;
 use kiseki_chunk::store::ChunkStore;
+use kiseki_common::advisory::*;
 use kiseki_common::ids::*;
 use kiseki_common::tenancy::*;
 use kiseki_common::time::*;
 use kiseki_composition::composition::CompositionStore;
+use kiseki_composition::namespace::Namespace;
 use kiseki_keymanager::store::MemKeyStore;
 use kiseki_log::shard::{ShardConfig, ShardState};
 use kiseki_log::store::MemShardStore;
-use kiseki_log::traits::{AppendDeltaRequest, LogOps};
+use kiseki_log::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 use kiseki_view::view::ViewStore;
 
 mod steps;
@@ -50,13 +53,26 @@ pub struct KisekiWorld {
     pub advisory_table: WorkflowTable,
     pub budget_enforcer: BudgetEnforcer,
 
-    // === Test state (results from WHEN steps, checked in THEN) ===
+    // === Test state ===
     pub last_error: Option<String>,
     pub last_epoch: Option<u64>,
     pub last_sequence: Option<SequenceNumber>,
     pub last_shard_id: Option<ShardId>,
+    pub last_chunk_id: Option<ChunkId>,
+    pub last_composition_id: Option<CompositionId>,
+    pub last_view_id: Option<ViewId>,
+    pub last_workflow_ref: Option<WorkflowRef>,
+
+    // === Name → ID mappings ===
     pub shard_names: HashMap<String, ShardId>,
     pub tenant_ids: HashMap<String, OrgId>,
+    pub namespace_ids: HashMap<String, NamespaceId>,
+    pub view_ids: HashMap<String, ViewId>,
+    pub workflow_names: HashMap<String, WorkflowRef>,
+
+    // === Flags for behavioral assertions ===
+    pub writes_rejected: bool,
+    pub reads_working: bool,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -88,8 +104,17 @@ impl KisekiWorld {
             last_epoch: None,
             last_sequence: None,
             last_shard_id: None,
+            last_chunk_id: None,
+            last_composition_id: None,
+            last_view_id: None,
+            last_workflow_ref: None,
             shard_names: HashMap::new(),
             tenant_ids: HashMap::new(),
+            namespace_ids: HashMap::new(),
+            view_ids: HashMap::new(),
+            workflow_names: HashMap::new(),
+            writes_rejected: false,
+            reads_working: false,
         }
     }
 
@@ -119,6 +144,27 @@ impl KisekiWorld {
         id
     }
 
+    /// Get or create a namespace by name.
+    pub fn ensure_namespace(&mut self, name: &str, shard_name: &str) -> NamespaceId {
+        if let Some(&id) = self.namespace_ids.get(name) {
+            return id;
+        }
+        let ns_id = NamespaceId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            name.as_bytes(),
+        ));
+        let shard_id = self.ensure_shard(shard_name);
+        let tenant_id = self.ensure_tenant("org-pharma");
+        self.comp_store.add_namespace(Namespace {
+            id: ns_id,
+            tenant_id,
+            shard_id,
+            read_only: false,
+        });
+        self.namespace_ids.insert(name.to_owned(), ns_id);
+        ns_id
+    }
+
     /// Make a test timestamp.
     pub fn timestamp(&self) -> DeltaTimestamp {
         DeltaTimestamp {
@@ -132,6 +178,24 @@ impl KisekiWorld {
                 timezone: "UTC".into(),
             },
             quality: ClockQuality::Ntp,
+        }
+    }
+
+    /// Make a standard append request.
+    pub fn make_append_request(&self, shard_id: ShardId, key_byte: u8) -> AppendDeltaRequest {
+        let tenant_id = *self
+            .tenant_ids
+            .get("org-pharma")
+            .unwrap_or(&OrgId(uuid::Uuid::from_u128(100)));
+        AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation: kiseki_log::delta::OperationType::Create,
+            timestamp: self.timestamp(),
+            hashed_key: [key_byte; 32],
+            chunk_refs: vec![],
+            payload: vec![0xab; 64],
+            has_inline_data: false,
         }
     }
 }
