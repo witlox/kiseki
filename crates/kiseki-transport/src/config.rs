@@ -86,12 +86,28 @@ impl TlsConfig {
 
     /// Build a server TLS configuration that requires client certificates.
     ///
+    /// Optionally accepts CRL PEM data for certificate revocation checking.
+    /// If `crl_pem` is `Some`, revoked client certificates will be rejected
+    /// at TLS handshake time.
+    ///
     /// Returns a `rustls::ServerConfig` for use in listeners.
     pub fn server_config(
         ca_pem: &[u8],
         cert_pem: &[u8],
         key_pem: &[u8],
     ) -> Result<rustls::ServerConfig, TransportError> {
+        Self::server_config_with_crl(ca_pem, cert_pem, key_pem, None)
+    }
+
+    /// Build a server TLS configuration with optional CRL checking.
+    pub fn server_config_with_crl(
+        ca_pem: &[u8],
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        crl_pem: Option<&[u8]>,
+    ) -> Result<rustls::ServerConfig, TransportError> {
+        use rustls::pki_types::CertificateRevocationListDer;
+
         // Parse CA for client cert verification.
         let ca_certs: Vec<CertificateDer<'static>> =
             rustls_pemfile::certs(&mut BufReader::new(ca_pem))
@@ -105,7 +121,21 @@ impl TlsConfig {
                 .map_err(|e| TransportError::ConfigError(format!("CA add: {e}")))?;
         }
 
-        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        let mut verifier_builder =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+
+        // Add CRLs if provided.
+        if let Some(crl_data) = crl_pem {
+            let crls: Vec<CertificateRevocationListDer<'static>> =
+                rustls_pemfile::crls(&mut BufReader::new(crl_data))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| TransportError::ConfigError(format!("CRL PEM parse: {e}")))?;
+            if !crls.is_empty() {
+                verifier_builder = verifier_builder.with_crls(crls);
+            }
+        }
+
+        let client_verifier = verifier_builder
             .build()
             .map_err(|e| TransportError::ConfigError(format!("client verifier: {e}")))?;
 
