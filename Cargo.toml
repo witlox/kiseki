@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/kiseki-advisory",
     "crates/kiseki-audit",
     "crates/kiseki-chunk",
     "crates/kiseki-client",
