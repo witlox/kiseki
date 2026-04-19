@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kiseki-common",
+    "crates/kiseki-proto",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+version = "0.0.0"
+license = "Apache-2.0"
+repository = "https://github.com/witlox/kiseki"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints we disable with justification:
+# - `module_name_repetitions`: domain naming (KisekiError, ChunkId) is intentional.
+# - `missing_errors_doc`/`missing_panics_doc`: redundant with thiserror + error-taxonomy.md.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Domain-correctness lints elevated to deny:
+float_cmp = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.dependencies]
+# --- Core ---
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = { version = "1", features = ["derive"] }
+
+# --- Async / time ---
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# --- Serialization / protobuf ---
+prost = "0.13"
+prost-types = "0.13"
+tonic = { version = "0.12", features = ["tls"] }
+tonic-build = "0.12"
+
+# --- Testing ---
+proptest = "1"
+cucumber = "0.21"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+overflow-checks = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = 2
+overflow-checks = true
+
+# Tests always run with overflow checks on.
+[profile.test]
+opt-level = 0
+overflow-checks = true

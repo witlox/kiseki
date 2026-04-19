@@ -7,7 +7,7 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed — workspace contains binaries (kiseki-server, kiseki-keyserver, kiseki-client-fuse).
 
 # Go
 /control/vendor/
@@ -41,3 +41,15 @@ secrets*
 *.prof
 *.test
 coverage.out
+coverage.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Protobuf / generated code is produced by build.rs into OUT_DIR; nothing to ignore.

@@ -9,18 +9,31 @@ commodity fabrics. Production-grade, multi-tenant, encryption-native.
 
 ## Status
 
-**Phase**: Ready for implementation (analyst + architect + adversary + backpass complete)
+**Phase**: **Phase 0 in progress** — workspace scaffold, shared types,
+protobuf. See `specs/architecture/build-phases.md` for the full 13-phase
+plan.
 
-The design pipeline produced:
-
-| Phase | Output |
+| Stage | State |
 |---|---|
-| Analyst | 8 bounded contexts, 56 invariants, 185 Gherkin scenarios, 20 failure modes, 50+ assumptions |
-| Architect | 12 Rust crates + Go module, 19 ADRs, enforcement map, 13 build phases, error taxonomy, protobuf definitions |
-| Adversary | 8 architecture findings (2 blocking fixed, 6 accepted/deferred) |
-| Analyst backpass | 5 contention points resolved, 5 new invariants |
+| Design (analyst + architect + adversary + backpass) | Complete |
+| Phase 0 — `kiseki-common`, `kiseki-proto`, CI scaffold | In progress |
+| Phases 1 – 12 | Pending |
 
-Next: implementation starting from Phase 0 (common types + protobuf).
+### Workspace
+
+```
+crates/
+├── kiseki-common/      # shared types: HLC, identifiers, advisory surface, errors
+└── kiseki-proto/       # generated prost/tonic from specs/architecture/proto/
+control/                # Go control plane scaffold (Phase 11)
+```
+
+### Pre-commit
+
+```
+make           # fmt + clippy + test + go vet + go test (local)
+make verify    # strict CI-equivalent (adds cargo-deny + golangci-lint)
+```
 
 ---
 

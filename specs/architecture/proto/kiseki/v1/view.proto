@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+// View Materialization context — descriptors, stream processor state, MVCC.
+// Spec: specs/architecture/data-models/view.rs,
+//       specs/architecture/api-contracts.md#View-Materialization-context,
+//       specs/features/view-materialization.feature,
+//       invariants.md I-V1..I-V4, I-K9, I-O3.
+
+package kiseki.v1;
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+import "kiseki/v1/common.proto";
+import "kiseki/v1/chunk.proto";
+
+// ============================================================================
+// Descriptor (declarative specification of a view's shape)
+// ============================================================================
+
+enum ProtocolSemantics {
+  PROTOCOL_SEMANTICS_UNSPECIFIED = 0;
+  PROTOCOL_SEMANTICS_POSIX       = 1;
+  PROTOCOL_SEMANTICS_S3          = 2;
+}
+
+message ConsistencyModel {
+  oneof model {
+    // Read-your-writes; stream processor tracks log tip (I-V3).
+    ReadYourWrites   read_your_writes   = 1;
+    // Bounded staleness; effective = max(this, compliance floor) (I-K9).
+    BoundedStaleness bounded_staleness  = 2;
+    // No bound; used for analytics views.
+    Eventual         eventual           = 3;
+  }
+}
+
+message ReadYourWrites   {}
+message BoundedStaleness { uint64 max_staleness_ms = 1; }
+message Eventual         {}
+
+message ViewDescriptor {
+  ViewId view_id   = 1;
+  OrgId  tenant_id = 2;
+  repeated ShardId source_shards = 3;
+  ProtocolSemantics protocol     = 4;
+  ConsistencyModel  consistency  = 5;
+  AffinityPoolId    affinity_pool = 6;
+  // Discardable views can be dropped and rebuilt from log (I-V1).
+  bool   discardable = 7;
+  uint64 version     = 8; // incremented on update
+  DeltaTimestamp created_at = 9;
+}
+
+// ============================================================================
+// Stream processor state
+// ============================================================================
+
+message ShardWatermark {
+  ShardId shard_id = 1;
+  uint64  position = 2; // sequence number
+}
+
+message StreamProcessorState {
+  ViewId view_id = 1;
+  OrgId  tenant_id = 2;
+  repeated ShardWatermark watermarks = 3;
+  uint64 descriptor_version = 4;
+  StreamProcessorStatus status = 5;
+  // Whether this processor has the tenant KEK cached (I-O3).
+  bool has_cached_tenant_key = 6;
+}
+
+message StreamProcessorStatus {
+  oneof status {
+    Running                running                 = 1;
+    StalenessViolation     staleness_violation     = 2;
+    KeyUnavailable         key_unavailable         = 3;
+    SourceUnavailable      source_unavailable      = 4;
+    Stopped                stopped                 = 5;
+    Rebuilding             rebuilding              = 6;
+  }
+}
+
+message Running            {}
+message StalenessViolation { uint64 behind_ms = 1; }
+message KeyUnavailable     {}
+message SourceUnavailable  { ShardId shard = 1; }
+message Stopped            {}
+message Rebuilding         { float progress_pct = 1; }
+
+// ============================================================================
+// MVCC read pin (bounded TTL — I-V4)
+// ============================================================================
+
+message MvccReadPin {
+  bytes  pin_id      = 1; // 16-byte UUID
+  ViewId view_id     = 2;
+  uint64 position    = 3; // sequence number
+  WallTime created_at = 4;
+  uint32 ttl_seconds = 5;
+}
+
+// ============================================================================
+// Commands (value shapes for the intra-Rust `ViewOps` trait)
+// ============================================================================
+
+message CreateViewRequest {
+  ViewDescriptor descriptor = 1;
+}
+
+message DiscardViewRequest {
+  ViewId view_id = 1;
+  // The org that approved the discard (required if caller is not
+  // the tenant admin of the owning org).
+  OrgId  approved_by = 2;
+}
+
+message UpdateDescriptorRequest {
+  ViewId view_id = 1;
+  ViewDescriptor new_descriptor = 2;
+}
+
+message AcquirePinRequest {
+  ViewId view_id = 1;
+  uint32 ttl_seconds = 2;
+}
+
+message AcquirePinResponse {
+  MvccReadPin pin = 1;
+}

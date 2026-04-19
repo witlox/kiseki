@@ -1,0 +1,229 @@
+syntax = "proto3";
+
+// Chunk Storage context — encrypted chunks, placement, EC, GC, retention.
+// Spec: specs/architecture/data-models/chunk.rs,
+//       specs/architecture/api-contracts.md#Chunk-Storage-context,
+//       specs/features/chunk-storage.feature,
+//       invariants.md I-C1..I-C4, I-K1, I-K7, I-K10.
+//
+// Intra-process in Rust. This proto defines the on-disk envelope metadata
+// and the internal request/response shapes used by `ChunkOps` callers.
+
+package kiseki.v1;
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+import "kiseki/v1/common.proto";
+
+// ============================================================================
+// Crypto-agility identifiers (ADR-021 §note on algorithm identifiers)
+// ============================================================================
+
+enum EncryptionAlgorithm {
+  ENCRYPTION_ALGORITHM_UNSPECIFIED = 0;
+  ENCRYPTION_ALGORITHM_AES_256_GCM = 1;
+  // Post-quantum candidates reserved for future phases.
+}
+
+enum ChunkIdAlgorithm {
+  CHUNK_ID_ALGORITHM_UNSPECIFIED = 0;
+  CHUNK_ID_ALGORITHM_SHA256      = 1; // cross-tenant dedup default
+  CHUNK_ID_ALGORITHM_HMAC_SHA256 = 2; // tenant-isolated (I-K10, I-X2)
+}
+
+// ============================================================================
+// Envelope (chunks and delta payloads share this shape — I-K1, I-K7)
+// ============================================================================
+
+message Envelope {
+  // Ciphertext bytes. Never decrypted except inside `kiseki-crypto` with
+  // valid system and tenant key material.
+  bytes ciphertext = 1;
+  // AEAD auth tag, 16 bytes.
+  bytes auth_tag   = 2;
+  // Nonce / IV, 12 bytes.
+  bytes nonce      = 3;
+  EncryptionAlgorithm algorithm = 4;
+  KeyEpoch system_epoch = 5;
+  // Optional for non-tenant-scoped envelopes (should be present for all
+  // tenant data).
+  KeyEpoch tenant_epoch = 6;
+  // Tenant KEK-wrapped system DEK derivation material (ADR-003).
+  bytes    tenant_wrapped_material = 7;
+  // Plaintext-derived (for default dedup) or tenant-HMAC-derived (for
+  // tenant-isolated dedup). Always in clear so the system can address
+  // without tenant keys (I-K4).
+  ChunkId  chunk_id = 8;
+}
+
+// Minimal envelope metadata — stored alongside chunk rows in the index.
+// The ciphertext itself lives on disk.
+message EnvelopeMeta {
+  EncryptionAlgorithm algorithm = 1;
+  KeyEpoch system_epoch = 2;
+  bytes    nonce    = 3;
+  bytes    auth_tag = 4;
+}
+
+// ============================================================================
+// Affinity pools & placement
+// ============================================================================
+
+enum DeviceClass {
+  DEVICE_CLASS_UNSPECIFIED            = 0;
+  DEVICE_CLASS_NVME_U2                = 1;
+  DEVICE_CLASS_NVME_QLC               = 2;
+  DEVICE_CLASS_NVME_PERSISTENT_MEMORY = 3;
+  // Tenant/admin-provided classes use DEVICE_CLASS_CUSTOM + `custom_label`.
+  DEVICE_CLASS_CUSTOM                 = 4;
+}
+
+message AffinityPoolId { bytes value = 1; } // 16-byte UUID
+message DeviceId       { bytes value = 1; } // 16-byte UUID
+
+message DurabilityStrategy {
+  oneof strategy {
+    ErasureCoding erasure_coding = 1;
+    Replication   replication    = 2;
+  }
+}
+
+message ErasureCoding {
+  uint32 data_chunks   = 1;
+  uint32 parity_chunks = 2;
+}
+
+message Replication {
+  uint32 copies = 1;
+}
+
+message AffinityPool {
+  AffinityPoolId pool_id      = 1;
+  DeviceClass    device_class = 2;
+  // Populated only when device_class == DEVICE_CLASS_CUSTOM.
+  string         custom_label = 3;
+  DurabilityStrategy durability = 4;
+  repeated DeviceId devices    = 5;
+  uint64 capacity_bytes = 6;
+  uint64 used_bytes     = 7;
+}
+
+message ChunkPlacement {
+  // For EC: which devices hold which fragments.
+  repeated DeviceFragment fragments = 1;
+  // For replication: which devices hold copies.
+  repeated DeviceId       replicas  = 2;
+}
+
+message DeviceFragment {
+  DeviceId device = 1;
+  uint32   fragment_index = 2;
+}
+
+// ============================================================================
+// Retention holds (I-C2b — ordering: set hold → crypto-shred → expire → GC)
+// ============================================================================
+
+message RetentionHoldId { bytes value = 1; } // 16-byte UUID
+
+message RetentionScope {
+  oneof scope {
+    OrgId          tenant      = 1;
+    NamespaceId    namespace   = 2;
+    CompositionId  composition = 3;
+  }
+}
+
+message RetentionHold {
+  RetentionHoldId hold_id   = 1;
+  RetentionScope  scope     = 2;
+  WallTime created_at = 3;
+  // Unset = explicit release required.
+  WallTime expires_at = 4;
+  string reason = 5;
+}
+
+// ============================================================================
+// Chunk metadata
+// ============================================================================
+
+message ChunkMeta {
+  ChunkId        chunk_id       = 1;
+  EnvelopeMeta   envelope_meta  = 2;
+  AffinityPoolId pool_id        = 3;
+  ChunkPlacement placement      = 4;
+  uint64         refcount       = 5;
+  repeated RetentionHoldId retention_holds = 6;
+  DeltaTimestamp created_at     = 7;
+  uint64 ciphertext_size        = 8;
+  bool   compressed             = 9;
+}
+
+// ============================================================================
+// Requests / responses (intra-Rust via `ChunkOps`; ABI-stable to prevent
+// silent behaviour changes when types are refactored).
+// ============================================================================
+
+message WriteChunkRequest {
+  ChunkId   chunk_id     = 1;
+  Envelope  envelope     = 2;
+  AffinityPoolId target_pool = 3;
+  OrgId     tenant_id    = 4;
+}
+
+// Idempotent: if chunk exists, increments refcount (I-C2).
+message WriteChunkResponse {
+  ChunkId chunk_id      = 1;
+  bool    was_dedup     = 2;
+  uint64  new_refcount  = 3;
+}
+
+message ReadChunkRequest {
+  ChunkId chunk_id = 1;
+}
+
+message ReadChunkResponse {
+  Envelope     envelope = 1;
+  EnvelopeMeta meta     = 2;
+}
+
+message IncrementRefcountRequest {
+  ChunkId chunk_id  = 1;
+  OrgId   tenant_id = 2;
+}
+
+message DecrementRefcountRequest {
+  ChunkId chunk_id  = 1;
+  OrgId   tenant_id = 2;
+}
+
+enum RepairTrigger {
+  REPAIR_TRIGGER_UNSPECIFIED     = 0;
+  REPAIR_TRIGGER_DEVICE_FAILURE  = 1;
+  REPAIR_TRIGGER_INTEGRITY_CHECK = 2;
+  REPAIR_TRIGGER_ADMIN_TRIGGERED = 3;
+}
+
+message RepairChunkRequest {
+  ChunkId chunk_id = 1;
+  RepairTrigger trigger = 2;
+  // Set only when trigger == DEVICE_FAILURE.
+  DeviceId failed_device = 3;
+}
+
+// ============================================================================
+// Events (cross-context subscribers consume these)
+// ============================================================================
+
+message ChunkStoredEvent {
+  ChunkId chunk_id = 1;
+  bool    was_dedup = 2;
+}
+
+message ChunkLostEvent {
+  ChunkId chunk_id = 1;
+}
+
+message DeviceFailureEvent {
+  DeviceId device_id = 1;
+}
