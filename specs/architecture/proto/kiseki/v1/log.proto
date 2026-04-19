@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+// Log context — deltas, shards, Raft lifecycle.
+// Spec: specs/architecture/data-models/log.rs,
+//       specs/architecture/api-contracts.md#Log-context,
+//       specs/features/log.feature,
+//       invariants.md I-L1..I-L8, I-O1, I-O2, I-O6.
+//
+// All Log operations are intra-process Rust trait calls (see
+// `LogOps` in api-contracts.md). This proto is used only for the on-disk
+// delta envelope, events emitted onto the audit shard, and cross-node
+// Raft replication carriers. It is NOT exposed as a gRPC service.
+
+package kiseki.v1;
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+import "kiseki/v1/common.proto";
+
+// ============================================================================
+// Delta envelope (I-L7: structural separation of header and payload)
+// ============================================================================
+
+enum OperationType {
+  OPERATION_TYPE_UNSPECIFIED = 0;
+  OPERATION_TYPE_CREATE      = 1;
+  OPERATION_TYPE_UPDATE      = 2;
+  OPERATION_TYPE_DELETE      = 3;
+  OPERATION_TYPE_RENAME      = 4;
+  OPERATION_TYPE_SET_ATTRIBUTE = 5;
+  // Multipart finalize — composition becomes visible to readers (I-L5).
+  OPERATION_TYPE_FINALIZE    = 6;
+}
+
+// System-visible delta header. Cleartext or system-encrypted; compaction
+// operates on headers only (I-L7, I-O2). Carries enough to sort and merge
+// without ever decrypting the tenant-encrypted payload.
+message DeltaHeader {
+  uint64        sequence       = 1; // Raft-assigned within shard (I-L1)
+  ShardId       shard_id       = 2;
+  OrgId         tenant_id      = 3;
+  OperationType operation      = 4;
+  DeltaTimestamp timestamp     = 5;
+  // hash(parent_dir_id, name) — used for compaction merge ordering (I-O5).
+  bytes         hashed_key     = 6; // 32 bytes
+  bool          tombstone      = 7;
+  // ChunkIds referenced by this delta (already content hashes).
+  repeated ChunkId chunk_refs  = 8;
+  uint32        payload_size   = 9;
+  bool          has_inline_data = 10; // true if payload contains inline data below threshold
+}
+
+// Tenant-encrypted delta payload — contains filenames, attributes,
+// inline data. Encrypted with system DEK, wrapped with tenant KEK (I-K3).
+message DeltaPayload {
+  bytes ciphertext = 1;
+  bytes auth_tag   = 2; // 16 bytes, AEAD
+  bytes nonce      = 3; // 12 bytes, AEAD
+  KeyEpoch system_epoch = 4;
+  KeyEpoch tenant_epoch = 5;
+  // Wrapped system DEK derivation material; the tenant KEK unwraps this
+  // to yield the HKDF input on read paths.
+  bytes    tenant_wrapped_material = 6;
+}
+
+// Complete delta. Immutable once committed (I-L3).
+message Delta {
+  DeltaHeader  header  = 1;
+  DeltaPayload payload = 2;
+}
+
+// ============================================================================
+// Shard lifecycle
+// ============================================================================
+
+enum ShardState {
+  SHARD_STATE_UNSPECIFIED = 0;
+  SHARD_STATE_HEALTHY     = 1;
+  // Leader election in progress.
+  SHARD_STATE_ELECTION    = 2;
+  // Quorum lost — writes unavailable (F-C1).
+  SHARD_STATE_QUORUM_LOST = 3;
+  // Split in progress (I-L6, I-O1). Writes buffered for new key range.
+  SHARD_STATE_SPLITTING   = 4;
+  // Read-only maintenance mode (I-O6).
+  SHARD_STATE_MAINTENANCE = 5;
+}
+
+// Configurable split thresholds (I-L6). Any dimension exceeding its
+// ceiling forces a split.
+message ShardSplitConfig {
+  uint64 max_delta_count                  = 1;
+  uint64 max_byte_size                    = 2;
+  uint64 max_write_throughput_bytes_per_sec = 3;
+}
+
+message ShardInfo {
+  ShardId      shard_id      = 1;
+  OrgId        tenant_id     = 2;
+  NamespaceId  namespace_id  = 3;
+  repeated NodeId raft_members = 4;
+  NodeId       leader        = 5;
+  uint64       tip           = 6; // current sequence number
+  ShardState   state         = 7;
+  ShardSplitConfig split_config = 8;
+  // Populated only when state == SPLITTING.
+  bytes        split_boundary    = 9;  // 32-byte hashed-key boundary
+  ShardId      split_new_shard   = 10;
+}
+
+// ============================================================================
+// Consumer watermarks (GC driver — I-L4)
+// ============================================================================
+
+message ViewWatermark {
+  ViewId view_id = 1;
+  uint64 position = 2; // sequence number
+}
+
+message ReadPin {
+  // UUID bytes of the pin.
+  bytes  pin_id      = 1;
+  uint64 position    = 2; // sequence number
+  WallTime created_at = 3;
+  uint32 ttl_seconds = 4; // bounded by view descriptor (I-V4)
+}
+
+message ConsumerWatermarks {
+  ShardId shard_id = 1;
+  repeated ViewWatermark view_watermarks = 2;
+  // Audit log watermark — participates in GC check (I-L4, I-A4).
+  uint64 audit_watermark = 3;
+  // Active MVCC read pins. GC considers pin positions.
+  repeated ReadPin active_pins = 4;
+}
+
+// ============================================================================
+// Events (emitted onto audit shard and cross-context subscribers)
+// ============================================================================
+
+message DeltaCommittedEvent {
+  ShardId shard_id = 1;
+  uint64 sequence  = 2;
+}
+
+message ShardSplitEvent {
+  ShardId old_shard = 1;
+  ShardId new_shard = 2;
+  bytes   boundary  = 3; // 32 bytes
+}
+
+message MaintenanceEnteredEvent {
+  ShardId shard_id = 1;
+  // If true, all new writes are rejected until maintenance ends.
+  bool read_only   = 2;
+}

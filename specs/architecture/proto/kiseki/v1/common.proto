@@ -11,6 +11,7 @@ message ProjectId { string value = 1; }
 message WorkloadId { string value = 1; }
 message ShardId { string value = 1; }
 message ChunkId { bytes value = 1; } // 32 bytes (sha256 or HMAC)
+message CompositionId { string value = 1; }
 message NamespaceId { string value = 1; }
 message ViewId { string value = 1; }
 message NodeId { uint64 value = 1; }

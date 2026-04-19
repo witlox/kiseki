@@ -1,0 +1,33 @@
+[package]
+name = "kiseki-proto"
+description = "Protobuf definitions for Kiseki (tonic/prost codegen)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The generated code is prost/tonic output; the hand-written surface of
+# this crate is intentionally minimal. Pedantic lints are relaxed here
+# because they fire constantly on generated code.
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+# Generated prost code triggers these; keep them out of the generated path.
+pedantic = "allow"
+nursery  = "allow"
+restriction = "allow"
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+prost = { workspace = true }

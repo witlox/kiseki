@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+// Composition context — namespaces, chunk assembly, refcounting, multipart.
+// Spec: specs/architecture/data-models/composition.rs,
+//       specs/architecture/api-contracts.md#Composition-context,
+//       specs/features/composition.feature,
+//       invariants.md I-X1..I-X3, I-L5, I-L8.
+//
+// Intra-process in Rust. This proto defines value types only — no gRPC
+// service. Cross-boundary mutations always go through the log (I-X3).
+
+package kiseki.v1;
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+import "kiseki/v1/common.proto";
+
+// ============================================================================
+// Core types
+// ============================================================================
+
+// One chunk reference within a composition. Ordered list in `chunks`
+// gives the logical layout.
+message ChunkRef {
+  ChunkId chunk_id = 1;
+  uint64  offset   = 2; // logical offset in the assembled composition
+  uint64  length   = 3; // length contributed by this chunk
+}
+
+message CompositionVersion {
+  // UUID bytes of this version.
+  bytes version_id = 1;
+  uint64 sequence  = 2; // log position at which this version was committed
+  repeated ChunkRef chunks = 3;
+  uint64 logical_size = 4;
+  DeltaTimestamp created_at = 5;
+}
+
+message Composition {
+  CompositionId composition_id = 1;
+  NamespaceId   namespace_id   = 2;
+  OrgId         tenant_id      = 3;
+  repeated ChunkRef chunks     = 4;
+  uint64 logical_size          = 5;
+  uint64 version               = 6; // sequence number of last mutation
+  DeltaTimestamp created_at    = 7;
+  DeltaTimestamp modified_at   = 8;
+  // Populated only when the namespace has versioning enabled.
+  repeated CompositionVersion version_history = 9;
+}
+
+// Tenant-scoped collection of compositions within a shard.
+message Namespace {
+  NamespaceId namespace_id = 1;
+  OrgId       tenant_id    = 2;
+  ShardId     shard_id     = 3;
+  string      name         = 4;
+  // Union of own + inherited compliance tags (constraints never loosen).
+  repeated ComplianceTag compliance_tags = 5;
+  bool versioning_enabled = 6;
+  bool read_only          = 7;
+  DeltaTimestamp created_at = 8;
+}
+
+// ============================================================================
+// Multipart upload (I-L5: not visible to readers until Finalize)
+// ============================================================================
+
+message MultipartPart {
+  uint32 part_number = 1;
+  repeated ChunkId chunk_ids = 2;
+  uint64 size    = 3;
+  bool   stored  = 4;
+}
+
+message MultipartUpload {
+  bytes upload_id = 1; // 16-byte UUID
+  CompositionId composition_id = 2;
+  NamespaceId   namespace_id   = 3;
+  OrgId         tenant_id      = 4;
+  repeated MultipartPart parts = 5;
+  DeltaTimestamp started_at    = 6;
+}
+
+// ============================================================================
+// Commands (value shapes used by `CompositionOps` traits)
+// ============================================================================
+
+message CreateCompositionRequest {
+  NamespaceId namespace_id = 1;
+  OrgId       tenant_id    = 2;
+  // Encrypted composition name (lives in delta payload; I-K3).
+  bytes       name_encrypted = 3;
+  repeated ChunkRef chunks = 4;
+  // If present and below `INLINE_DATA_THRESHOLD` (ADR-006), no chunks are
+  // required — the bytes ride inline in the delta payload.
+  bytes       inline_data  = 5;
+}
+
+message ChunkMutation {
+  oneof op {
+    ChunkRef append  = 1;
+    Replace  replace = 2;
+    Truncate truncate = 3;
+  }
+}
+
+message Replace {
+  ChunkId old_chunk = 1;
+  ChunkRef new_chunk = 2;
+}
+
+message Truncate {
+  uint64 new_size = 1;
+}
+
+message UpdateCompositionRequest {
+  CompositionId composition_id = 1;
+  repeated ChunkMutation chunk_mutations = 2;
+}
+
+message DeleteCompositionRequest {
+  CompositionId composition_id = 1;
+  // If versioning is enabled: creates delete marker. If not: tombstone.
+  bool version_aware = 2;
+}
+
+message FinalizeMultipartRequest {
+  bytes upload_id = 1;
+  repeated uint32 parts = 2; // part numbers, ascending
+}
+
+message AbortMultipartRequest {
+  bytes upload_id = 1;
+}
