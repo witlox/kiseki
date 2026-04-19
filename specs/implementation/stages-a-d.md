@@ -109,7 +109,7 @@ complexity.
 | A.4 | done | — | passed | mTLS on both listeners, plaintext fallback for dev |
 | A.5 | done | — | passed | serve_with_shutdown + ctrl_c on both runtimes |
 | B.1 | done | — | passed | kiseki-raft crate: KisekiNode, KisekiRaftConfig |
-| B.2 | pending | — | — | Keymanager Raft |
+| B.2 | done | — | passed | openraft traits: LogStore, StateMachine, SnapshotBuilder, NetworkV2 |
 | B.3 | pending | — | — | Log Raft (per-shard) |
 | B.4 | pending | — | — | Audit Raft |
 | B.5 | pending | — | — | Cluster bootstrap |
