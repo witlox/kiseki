@@ -1,0 +1,21 @@
+[package]
+name = "kiseki-keymanager"
+description = "System Key Manager for Kiseki: epoch management, master key rotation, health."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kiseki-common = { path = "../kiseki-common" }
+kiseki-crypto = { path = "../kiseki-crypto" }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+aws-lc-rs = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
