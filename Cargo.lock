@@ -1128,6 +1128,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-view"
+version = "0.0.0"
+dependencies = [
+ "kiseki-common",
+ "proptest",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "lazy-regex"
 version = "3.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

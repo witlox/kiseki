@@ -384,7 +384,7 @@ auditor fidelity HIGH across all contexts.
 | 5 | done | — | — | `phase5-gate2.md` | — | kiseki-audit: per-tenant shards, event types, 0 blocking |
 | 6 | done | — | — | `phase6-gate2.md` | — | kiseki-chunk: dedup, refcount, GC, holds, pools |
 | 7 | done | — | — | — | — | kiseki-composition: CRUD, namespace, multipart, EXDEV |
-| 8 | pending | — | — | — | — | |
+| 8 | done | — | — | — | — | kiseki-view: descriptor, MVCC pins, staleness, lifecycle |
 | 9 | pending | — | — | — | — | |
 | 10 | pending | — | — | — | — | |
 | 10.5 | pending | — | — | — | — | bindings |
