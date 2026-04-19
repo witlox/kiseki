@@ -229,7 +229,9 @@ async fn when_immediate_read(_w: &mut KisekiWorld, _path: String) {}
 #[then("it sees its own write (read-your-writes guarantee)")]
 async fn then_ryw(_w: &mut KisekiWorld) {}
 
-#[then("this works because the native client tracks its own uncommitted and recently-committed writes")]
+#[then(
+    "this works because the native client tracks its own uncommitted and recently-committed writes"
+)]
 async fn then_tracking(_w: &mut KisekiWorld) {}
 
 // === Native API ===
@@ -464,7 +466,9 @@ async fn then_erofs(_w: &mut KisekiWorld) {}
 
 // === Workflow declaration ===
 
-#[when(regex = r#"^the workload calls kiseki_declare_workflow\(profile="(\S+)", initial_phase="(\S+)"\)$"#)]
+#[when(
+    regex = r#"^the workload calls kiseki_declare_workflow\(profile="(\S+)", initial_phase="(\S+)"\)$"#
+)]
 async fn when_declare_wf(_w: &mut KisekiWorld, _profile: String, _phase: String) {}
 
 #[then("the client obtains an opaque WorkflowSession handle")]
@@ -478,13 +482,17 @@ async fn then_unchanged(_w: &mut KisekiWorld) {}
 
 // === Pattern detector ===
 
-#[given(regex = r#"^the native client's pattern detector observes three consecutive sequential reads on (\S+)$"#)]
+#[given(
+    regex = r#"^the native client's pattern detector observes three consecutive sequential reads on (\S+)$"#
+)]
 async fn given_seq_reads(_w: &mut KisekiWorld, _path: String) {}
 
 #[when("the detector classifies the access as sequential")]
 async fn when_classify_seq(_w: &mut KisekiWorld) {}
 
-#[then(regex = r#"^the client submits hint \{ access_pattern: sequential, target: composition_id of (\S+) \} on the advisory channel$"#)]
+#[then(
+    regex = r#"^the client submits hint \{ access_pattern: sequential, target: composition_id of (\S+) \} on the advisory channel$"#
+)]
 async fn then_hint_submitted(_w: &mut KisekiWorld, _path: String) {}
 
 #[then(regex = r#"^continues to serve reads normally.*$"#)]
@@ -498,7 +506,9 @@ async fn then_channel_unavailable(_w: &mut KisekiWorld) {}
 #[when("the workload computes the shuffled read order and calls kiseki_declare_prefetch(tuples)")]
 async fn when_declare_prefetch(_w: &mut KisekiWorld) {}
 
-#[then(regex = r#"^the client batches tuples into PrefetchHint messages each under max_prefetch_tuples_per_hint.*$"#)]
+#[then(
+    regex = r#"^the client batches tuples into PrefetchHint messages each under max_prefetch_tuples_per_hint.*$"#
+)]
 async fn then_batches_hints(_w: &mut KisekiWorld) {}
 
 #[then("submits them on the advisory channel")]
@@ -509,7 +519,9 @@ async fn then_warmed_cache(_w: &mut KisekiWorld) {}
 
 // === Backpressure ===
 
-#[when(regex = r#"^the client receives a backpressure event with severity "(\S+)" and retry_after_ms (\d+)$"#)]
+#[when(
+    regex = r#"^the client receives a backpressure event with severity "(\S+)" and retry_after_ms (\d+)$"#
+)]
 async fn when_backpressure_event(_w: &mut KisekiWorld, _sev: String, _ms: u64) {}
 
 #[then(regex = r#"^the client MAY pause or rate-limit new submissions.*$"#)]

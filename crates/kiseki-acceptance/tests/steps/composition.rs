@@ -379,7 +379,9 @@ async fn when_subscribe_refcount_telemetry(_w: &mut KisekiWorld) {
     // Telemetry subscription — advisory operation.
 }
 
-#[when(regex = r#"^the caller submits a create-composition request for namespace "([^"]+)" \(not authorised\) carrying hint \{ priority: batch \}$"#)]
+#[when(
+    regex = r#"^the caller submits a create-composition request for namespace "([^"]+)" \(not authorised\) carrying hint \{ priority: batch \}$"#
+)]
 async fn when_create_unauthorized_ns(w: &mut KisekiWorld, ns: String) {
     // Attempt to create in unauthorized namespace — rejected.
     w.last_error = Some("namespace not authorised".to_string());
@@ -500,7 +502,10 @@ async fn then_parts_not_visible_il5(_w: &mut KisekiWorld) {
 
 #[then("no finalize delta is committed")]
 async fn then_no_finalize_delta(w: &mut KisekiWorld) {
-    assert!(w.last_composition_id.is_none(), "no composition should exist after abort");
+    assert!(
+        w.last_composition_id.is_none(),
+        "no composition should exist after abort"
+    );
 }
 
 #[then(regex = r#"^chunks c10, c11 have refcount 0 \(no composition references them\)$"#)]
@@ -693,7 +698,9 @@ async fn then_write_absorb_may_prewarm(_w: &mut KisekiWorld) {
     // Advisory — MAY behavior, structural.
 }
 
-#[then("the announcement is advisory — checkpoint writes succeed even if no warm-up occurred (I-WA1)")]
+#[then(
+    "the announcement is advisory — checkpoint writes succeed even if no warm-up occurred (I-WA1)"
+)]
 async fn then_advisory_iwa1(_w: &mut KisekiWorld) {
     // I-WA1: advisory never blocks data path.
 }
@@ -703,7 +710,9 @@ async fn then_no_starvation_it2(_w: &mut KisekiWorld) {
     // I-T2: tenant quota fairness.
 }
 
-#[then("the finalize delta is processed normally (chunks confirmed durable before visibility, I-L5)")]
+#[then(
+    "the finalize delta is processed normally (chunks confirmed durable before visibility, I-L5)"
+)]
 async fn then_finalize_normal_il5(_w: &mut KisekiWorld) {
     // I-L5: finalize semantics unchanged by hint.
 }
