@@ -480,8 +480,8 @@ mod tests {
             ShardConfig::default(),
         );
 
-        for i in 0..5 {
-            let key = (i * 20 + 10) as u8;
+        for i in 0u8..5 {
+            let key = (i * 20 + 10) % 255;
             store
                 .append_delta(make_req(test_shard(), key))
                 .unwrap_or_else(|_| unreachable!());

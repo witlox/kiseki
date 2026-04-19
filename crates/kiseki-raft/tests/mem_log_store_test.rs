@@ -1,4 +1,4 @@
-//! Tests for the generic MemLogStore.
+//! Tests for the generic `MemLogStore`.
 
 use std::io::Cursor;
 

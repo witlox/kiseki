@@ -1,6 +1,6 @@
 //! Tests for log.feature scenarios against the in-memory shard store.
 //!
-//! Maps Gherkin scenarios to unit tests covering the LogOps semantics.
+//! Maps Gherkin scenarios to unit tests covering the `LogOps` semantics.
 
 use kiseki_common::ids::*;
 use kiseki_common::time::*;
@@ -169,8 +169,8 @@ fn gc_respects_consumer_watermarks() {
     let store = setup_store();
 
     // Append 10 deltas.
-    for i in 0..10 {
-        let key = (i * 10 + 10) as u8;
+    for i in 0u8..10 {
+        let key = i * 10 + 10;
         store
             .append_delta(make_request(test_shard_id(), key))
             .unwrap_or_else(|_| unreachable!());
@@ -212,8 +212,8 @@ fn gc_respects_consumer_watermarks() {
 #[test]
 fn read_delta_range() {
     let store = setup_store();
-    for i in 0..20 {
-        let key = (i * 10 + 10) as u8;
+    for i in 0u8..20 {
+        let key = i * 10 + 10;
         store
             .append_delta(make_request(test_shard_id(), key))
             .unwrap_or_else(|_| unreachable!());

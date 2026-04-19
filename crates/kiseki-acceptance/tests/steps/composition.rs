@@ -87,7 +87,7 @@ async fn then_exdev(w: &mut KisekiWorld) {
     assert!(
         w.last_error
             .as_ref()
-            .map_or(false, |e| e.contains("cross-shard")),
+            .is_some_and(|e| e.contains("cross-shard")),
         "expected EXDEV, got: {:?}",
         w.last_error
     );
@@ -117,7 +117,7 @@ async fn then_readonly(w: &mut KisekiWorld) {
     assert!(
         w.last_error
             .as_ref()
-            .map_or(false, |e| e.contains("read-only")),
+            .is_some_and(|e| e.contains("read-only")),
         "expected read-only error, got: {:?}",
         w.last_error
     );

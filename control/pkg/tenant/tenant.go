@@ -35,8 +35,8 @@ const (
 
 // Quota defines resource limits at a tenant hierarchy level.
 type Quota struct {
-	CapacityBytes    uint64
-	IOPS             uint64
+	CapacityBytes     uint64
+	IOPS              uint64
 	MetadataOpsPerSec uint64
 }
 
@@ -60,11 +60,11 @@ type Project struct {
 
 // Workload is the runtime isolation unit within a tenant.
 type Workload struct {
-	ID      string
-	OrgID   string
-	ProjID  string // empty if no project
-	Name    string
-	Quota   Quota
+	ID     string
+	OrgID  string
+	ProjID string // empty if no project
+	Name   string
+	Quota  Quota
 }
 
 // EffectiveComplianceTags returns the union of compliance tags from

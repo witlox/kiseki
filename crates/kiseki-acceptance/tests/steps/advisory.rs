@@ -52,7 +52,7 @@ async fn then_non_monotonic(w: &mut KisekiWorld) {
     assert!(w
         .last_error
         .as_ref()
-        .map_or(false, |e| e.contains("monotonic")));
+        .is_some_and(|e| e.contains("monotonic")));
 }
 
 #[when("the budget limit is exceeded")]
@@ -69,10 +69,7 @@ async fn when_budget_exceeded(w: &mut KisekiWorld) {
 
 #[then("the hint is rejected with budget exceeded")]
 async fn then_budget(w: &mut KisekiWorld) {
-    assert!(w
-        .last_error
-        .as_ref()
-        .map_or(false, |e| e.contains("budget")));
+    assert!(w.last_error.as_ref().is_some_and(|e| e.contains("budget")));
 }
 
 #[when(regex = r#"^the workflow "(\S+)" is ended$"#)]

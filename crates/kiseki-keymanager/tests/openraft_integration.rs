@@ -1,6 +1,6 @@
 //! Integration test: single-node Raft key manager.
 //!
-//! Exercises the full path: Raft::new → initialize → client_write →
+//! Exercises the full path: `Raft::new` → initialize → `client_write` →
 //! state machine apply → read from shared state.
 
 use kiseki_common::ids::ChunkId;

@@ -90,21 +90,17 @@ async fn start_echo_server(ca_pem: &str, cert_pem: &str, key_pem: &str) -> Socke
 
     tokio::spawn(async move {
         loop {
-            let (tcp, _) = match listener.accept().await {
-                Ok(v) => v,
-                Err(_) => break,
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
             };
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                match acceptor.accept(tcp).await {
-                    Ok(mut tls) => {
-                        let mut buf = vec![0u8; 1024];
-                        if let Ok(n) = tls.read(&mut buf).await {
-                            let _ = tls.write_all(&buf[..n]).await;
-                            let _ = tls.shutdown().await;
-                        }
+                if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    let mut buf = vec![0u8; 1024];
+                    if let Ok(n) = tls.read(&mut buf).await {
+                        let _ = tls.write_all(&buf[..n]).await;
+                        let _ = tls.shutdown().await;
                     }
-                    Err(_) => {} // reject
                 }
             });
         }

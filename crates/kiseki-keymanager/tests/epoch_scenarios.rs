@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)]
 //! Tests for key-management.feature scenarios (manager surface).
 
 use kiseki_common::ids::ChunkId;

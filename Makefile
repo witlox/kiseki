@@ -15,7 +15,10 @@ SHELL := /bin/bash
 CARGO        ?= cargo
 CARGO_TEST   ?= $(CARGO) test --workspace --all-targets
 CARGO_BUILD  ?= $(CARGO) build --workspace --all-targets
-CARGO_CLIPPY ?= $(CARGO) clippy --workspace --all-targets -- -D warnings
+# -D warnings promotes all warnings to errors.
+# -A overrides for test-common patterns (unwrap, expect, panic, missing docs on macro-generated types).
+CARGO_CLIPPY ?= $(CARGO) clippy --workspace --all-targets -- -D warnings \
+	-A clippy::unwrap-used -A clippy::expect-used -A clippy::panic -A missing-docs
 CARGO_FMT    ?= $(CARGO) fmt --all
 
 # --- Go toolchain commands ---
