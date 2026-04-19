@@ -29,6 +29,14 @@ pub enum AuditCommand {
     },
 }
 
+impl std::fmt::Display for AuditCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AppendEvent { event_type, .. } => write!(f, "AppendEvent({event_type})"),
+        }
+    }
+}
+
 /// Shard key.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 enum ShardKey {

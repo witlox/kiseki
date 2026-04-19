@@ -1,0 +1,17 @@
+//! openraft integration for the Log context.
+//!
+//! Per-shard Raft groups. Each shard gets its own log store and
+//! state machine. Pattern follows `kiseki-keymanager/src/raft/`.
+
+#[allow(missing_docs)]
+pub mod log_store;
+#[allow(missing_docs)]
+pub mod network;
+#[allow(missing_docs)]
+pub mod state_machine;
+pub mod types;
+
+pub use log_store::ShardLogStore;
+pub use network::StubNetworkFactory;
+pub use state_machine::ShardStateMachine;
+pub use types::LogTypeConfig;

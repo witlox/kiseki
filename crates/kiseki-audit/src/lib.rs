@@ -16,6 +16,7 @@
 #![deny(unsafe_code)]
 
 pub mod event;
+pub mod raft;
 pub mod raft_store;
 pub mod store;
 

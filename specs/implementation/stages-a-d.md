@@ -110,8 +110,8 @@ complexity.
 | A.5 | done | — | passed | serve_with_shutdown + ctrl_c on both runtimes |
 | B.1 | done | — | passed | kiseki-raft crate: KisekiNode, KisekiRaftConfig |
 | B.2 | done | — | passed | openraft traits: LogStore, StateMachine, SnapshotBuilder, NetworkV2 |
-| B.3 | pending | — | — | Log Raft (per-shard) |
-| B.4 | pending | — | — | Audit Raft |
+| B.3 | done | — | passed | Log openraft: ShardLogStore, ShardStateMachine |
+| B.4 | done | — | passed | Audit openraft: AuditLogStore, AuditStateMachine (I-A1) |
 | B.5 | pending | — | — | Cluster bootstrap |
 | C.1 | pending | — | — | LogService gRPC |
 | C.2 | pending | — | — | ChunkService gRPC |

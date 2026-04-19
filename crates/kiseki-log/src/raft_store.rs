@@ -49,6 +49,18 @@ pub enum LogCommand {
     },
 }
 
+impl std::fmt::Display for LogCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AppendDelta { operation, .. } => write!(f, "AppendDelta(op={operation})"),
+            Self::SetMaintenance { enabled } => write!(f, "SetMaintenance({enabled})"),
+            Self::AdvanceWatermark { consumer, position } => {
+                write!(f, "AdvanceWatermark({consumer}={position})")
+            }
+        }
+    }
+}
+
 /// Per-shard state machine.
 struct ShardStateMachine {
     info: ShardInfo,
