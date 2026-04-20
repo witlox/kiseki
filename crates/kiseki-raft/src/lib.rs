@@ -13,8 +13,22 @@ pub mod config;
 pub mod log_store;
 pub mod network;
 pub mod node;
+#[allow(
+    missing_docs,
+    clippy::len_without_is_empty,
+    clippy::must_use_candidate,
+    clippy::cast_possible_truncation,
+    clippy::unwrap_used,
+    clippy::manual_map,
+    clippy::io_other_error,
+    clippy::map_err_ignore,
+    mismatched_lifetime_syntaxes,
+    deprecated
+)]
+pub mod redb_log_store;
 
 pub use config::KisekiRaftConfig;
 pub use log_store::MemLogStore;
 pub use network::{StubNetwork, StubNetworkFactory};
 pub use node::KisekiNode;
+pub use redb_log_store::RedbLogStore;
