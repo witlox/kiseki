@@ -116,3 +116,60 @@ Feature: NFSv4.2 wire protocol compliance (RFC 7862)
     When the client sends COMPOUND with 100 operations
     Then only the first 32 are processed
     And the response contains at most 32 op results
+
+  # §18.16 — OPEN
+  Scenario: RFC7862 §18.16 OPEN — open file for read
+    Given a file was created via COMPOUND WRITE
+    When the client sends COMPOUND with SEQUENCE + OPEN for reading
+    Then the response status is NFS4_OK
+    And a stateid is returned
+    And the stateid is usable for subsequent READ
+
+  Scenario: RFC7862 §18.16 OPEN — open for create
+    When the client sends COMPOUND with SEQUENCE + OPEN with CREATE flag
+    Then the response status is NFS4_OK
+    And a new file is created
+    And a stateid is returned for writing
+
+  Scenario: RFC7862 §18.16 OPEN — open nonexistent without CREATE returns NFS4ERR_NOENT
+    When the client sends OPEN for "nosuchfile" without CREATE
+    Then the response status is NFS4ERR_NOENT
+
+  # §18.2 — CLOSE
+  Scenario: RFC7862 §18.2 CLOSE — release stateid
+    Given a file is opened with a valid stateid
+    When the client sends CLOSE with that stateid
+    Then the response status is NFS4_OK
+    And subsequent READ with the old stateid returns NFS4ERR_BAD_STATEID
+
+  # §18.10 — LOCK
+  Scenario: RFC7862 §18.10 LOCK — advisory byte-range lock
+    Given a file is opened with a valid stateid
+    When the client sends LOCK for bytes 0-1024 (READ_LT)
+    Then the response status is NFS4_OK
+    And a lock_stateid is returned
+
+  Scenario: RFC7862 §18.10 LOCK — conflicting lock returns NFS4ERR_DENIED
+    Given a file has a WRITE lock on bytes 0-1024
+    When another client sends LOCK for bytes 0-512 (WRITE_LT)
+    Then the response status is NFS4ERR_DENIED
+
+  # §18.15 — LOOKUP
+  Scenario: RFC7862 §18.15 LOOKUP — resolve name in COMPOUND
+    Given a file "test.dat" exists
+    When the client sends COMPOUND with PUTROOTFH + LOOKUP "test.dat" + GETFH
+    Then LOOKUP status is NFS4_OK
+    And GETFH returns the file handle for "test.dat"
+
+  # §18.25 — REMOVE
+  Scenario: RFC7862 §18.25 REMOVE — delete file via COMPOUND
+    Given a file "removeme.dat" exists
+    When the client sends COMPOUND with PUTROOTFH + REMOVE "removeme.dat"
+    Then REMOVE status is NFS4_OK
+    And subsequent LOOKUP for "removeme.dat" returns NFS4ERR_NOENT
+
+  # §18.26 — READDIR
+  Scenario: RFC7862 §18.26 READDIR — list directory entries
+    Given files "x.bin" and "y.bin" exist
+    When the client sends COMPOUND with PUTROOTFH + READDIR
+    Then READDIR returns entries including "x.bin" and "y.bin"

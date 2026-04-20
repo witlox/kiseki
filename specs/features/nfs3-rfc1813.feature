@@ -88,3 +88,36 @@ Feature: NFSv3 wire protocol compliance (RFC 1813)
     And the entries include "." and ".."
     And the entries include "a.txt" and "b.txt"
     And eof is true
+
+  # §3.3.12 — REMOVE
+  Scenario: RFC1813 §3.3.12 REMOVE — delete existing file
+    Given a file "deleteme.txt" was created via NFS CREATE
+    When the client sends REMOVE for "deleteme.txt" in the root directory
+    Then the response status is NFS3_OK
+    And LOOKUP for "deleteme.txt" returns NFS3ERR_NOENT
+
+  Scenario: RFC1813 §3.3.12 REMOVE — nonexistent file returns NFS3ERR_NOENT
+    When the client sends REMOVE for "nosuchfile.txt"
+    Then the response status is NFS3ERR_NOENT
+
+  # §3.3.14 — RENAME
+  Scenario: RFC1813 §3.3.14 RENAME — rename within same directory
+    Given a file "old.txt" was created via NFS CREATE
+    When the client sends RENAME from "old.txt" to "new.txt"
+    Then the response status is NFS3_OK
+    And LOOKUP for "new.txt" succeeds
+    And LOOKUP for "old.txt" returns NFS3ERR_NOENT
+
+  # §3.3.20 — FSINFO
+  Scenario: RFC1813 §3.3.20 FSINFO — filesystem capabilities
+    When the client sends FSINFO on the root handle
+    Then the response status is NFS3_OK
+    And maxfilesize is reported
+    And rtmax and wtmax are reported (read/write transfer sizes)
+
+  # §3.3.21 — FSSTAT
+  Scenario: RFC1813 §3.3.21 FSSTAT — filesystem statistics
+    When the client sends FSSTAT on the root handle
+    Then the response status is NFS3_OK
+    And total bytes and free bytes are reported
+    And total files and free files are reported

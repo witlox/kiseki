@@ -64,3 +64,29 @@ Feature: S3 API wire protocol compliance
     When the client sends GET /nonexistent-bucket/key
     Then the response status is 404 or 200
     # Note: bucket auto-creates on first write (namespace created on demand)
+
+  # ListObjectsV2
+  Scenario: S3 ListObjectsV2 — list all objects in bucket
+    Given objects "file1", "file2", "file3" were uploaded to bucket "default"
+    When the client sends GET /default (list objects)
+    Then the response status is 200
+    And the response contains all three object keys
+    And each object has a key, size, and last modified timestamp
+
+  Scenario: S3 ListObjectsV2 — prefix filtering
+    Given objects "data/a.csv", "data/b.csv", "logs/c.txt" exist
+    When the client sends GET /default?prefix=data/
+    Then only "data/a.csv" and "data/b.csv" are returned
+
+  Scenario: S3 ListObjectsV2 — empty bucket returns empty list
+    Given bucket "empty-bucket" has no objects
+    When the client sends GET /empty-bucket
+    Then the response status is 200
+    And the object list is empty
+
+  Scenario: S3 ListObjectsV2 — pagination with max-keys
+    Given 100 objects exist in bucket "default"
+    When the client sends GET /default?max-keys=10
+    Then 10 objects are returned
+    And IsTruncated is true
+    And a NextContinuationToken is provided
