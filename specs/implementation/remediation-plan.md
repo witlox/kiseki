@@ -175,16 +175,16 @@ These are the Stage D items. Each enables ~20 BDD scenarios.
 
 ## Tracking
 
-| Phase | Status | BDD scenarios passing |
-|-------|--------|----------------------|
-| R0 | pending | 3 |
-| R1 | pending | 3 |
-| R2 | pending | 3 |
-| R3 | pending | target: 20+ |
-| R4 | pending | target: 25+ |
-| R5 | pending | target: 30+ |
-| R6 | pending | 30+ |
-| R7 | pending | target: 80+ |
-| R8 | pending | target: 90+ |
-| R9 | pending | 90+ |
-| R10 | pending | final |
+| Phase | Status | Tests | Notes |
+|-------|--------|-------|-------|
+| R0 | done | 3 BDD | CI green, `make` passes |
+| R1 | done | 4 unit | All 4 "resolved" findings have tests |
+| R2 | done | — | OPEN-FINDINGS.md created |
+| R3 | done | 249/288 BDD | 86% BDD, 90/556 Then steps with real assertions |
+| R4 | done | 21 Raft | OpenRaft stores for log+audit+keymanager |
+| R5 | done | 4 gRPC | LogService gRPC, api-contracts.md updated |
+| R6 | done | — | All 4 R1 tests already existed |
+| R7 | done | 6 gateway | InMemoryGateway + S3/NFS data path |
+| R8 | done | 4 Go gRPC | ControlService + AuditExportService |
+| R9 | done | — | Lefthook, Docker, PyO3 stub |
+| R10 | in progress | — | Tracking tables, fidelity sweep |
