@@ -1,9 +1,10 @@
 # Kiseki local development stack.
 #
-# Runs the data-path server (Rust) and control plane (Go) in containers.
-# No TLS — development only.
+# Usage:
+#   docker compose up --build              — dev stack
+#   docker compose up --build -d && pytest — e2e tests
 #
-# Usage: docker compose up --build
+# The server creates a bootstrap shard for e2e testing by default.
 
 services:
   kiseki-server:
@@ -16,6 +17,12 @@ services:
     environment:
       KISEKI_DATA_ADDR: "0.0.0.0:9100"
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+      KISEKI_BOOTSTRAP: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "true"]  # TODO: grpc_health_probe
+      interval: 2s
+      timeout: 2s
+      retries: 10
 
   kiseki-control:
     build:

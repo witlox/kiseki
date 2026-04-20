@@ -11,6 +11,8 @@ pub struct ServerConfig {
     pub advisory_addr: SocketAddr,
     /// TLS configuration paths (None = plaintext, for development only).
     pub tls: Option<TlsFiles>,
+    /// Create a well-known bootstrap shard on startup (for e2e tests).
+    pub bootstrap: bool,
 }
 
 /// Paths to TLS certificate files.
@@ -57,10 +59,15 @@ impl ServerConfig {
             _ => None,
         };
 
+        let bootstrap = std::env::var("KISEKI_BOOTSTRAP")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         Self {
             data_addr,
             advisory_addr,
             tls,
+            bootstrap,
         }
     }
 }

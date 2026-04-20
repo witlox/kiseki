@@ -30,3 +30,4 @@ kiseki-advisory = { path = "../kiseki-advisory" }
 kiseki-proto = { path = "../kiseki-proto" }
 tokio = { workspace = true }
 tonic = { workspace = true }
+uuid = { workspace = true }

@@ -125,6 +125,11 @@ build: rust-build go-build ## Build all artefacts
 
 verify: rust-fmt-check rust-clippy rust-deny rust-test go-fmt-check go-vet go-lint go-test ## CI-equivalent strict verification
 
+e2e: ## Run Python e2e tests (requires docker compose)
+	/usr/local/bin/docker compose up --build -d
+	.venv/bin/pytest tests/e2e/ -m e2e -v || { /usr/local/bin/docker compose down; exit 1; }
+	/usr/local/bin/docker compose down
+
 clean: ## Remove build artefacts
 	$(CARGO) clean
 	rm -rf $(GO_DIR)/bin

@@ -46,6 +46,22 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // Log: in-memory store, shared across composition and view.
     let log_store = Arc::new(kiseki_log::MemShardStore::new());
 
+    // Bootstrap: create a well-known shard for e2e testing.
+    if cfg.bootstrap {
+        let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+        let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+        log_store.create_shard(
+            bootstrap_shard,
+            bootstrap_tenant,
+            kiseki_common::ids::NodeId(1),
+            kiseki_log::ShardConfig::default(),
+        );
+        eprintln!(
+            "  bootstrap: shard {} for tenant {}",
+            bootstrap_shard.0, bootstrap_tenant.0
+        );
+    }
+
     // Audit: in-memory store.
     let _audit_store = kiseki_audit::AuditLog::new();
 
