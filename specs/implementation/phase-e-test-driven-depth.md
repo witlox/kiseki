@@ -276,3 +276,46 @@ After all 5 items:
 3. `make e2e` — Docker e2e pass (including NFS, mTLS, persistence)
 4. Adversarial review — CRITICALs from D/C/BA reviews resolved
 5. Fidelity index updated — no LOW confidence crates remaining
+
+---
+
+## Addendum: Design Decisions (2026-04-20)
+
+### Storage backend: redb (pure Rust)
+
+**Decision**: Use `redb` v2 for all persistent storage:
+- Raft WAL + log entries
+- State machine snapshots
+- Chunk metadata index (chunk_id → placement, refcount)
+- View watermark checkpoints
+
+**Rationale**: Pure Rust, zero build deps, ACID with copy-on-write B-tree,
+crash-safe via atomic commit. ~50KB binary overhead. No compaction needed.
+Matches our needs (Raft log append, snapshot read/write, metadata lookup).
+
+**Not used for**: Chunk ciphertext data — stored as files in pool directories
+(one file per chunk, 4KB-aligned). redb handles the index, not the blobs.
+
+### Protocol compliance: RFC-driven BDD
+
+**Decision**: Create dedicated feature files mapping to RFC sections:
+- `specs/features/nfs3-rfc1813.feature` — 7 procedures × 2 scenarios = 14
+- `specs/features/nfs4-rfc7862.feature` — 10 operations × 2 scenarios = 20
+- `specs/features/s3-api.feature` — 5 operations × 2 scenarios = 10
+
+Each scenario tests wire format compliance, not just domain semantics.
+Python e2e tests validate actual wire encoding via raw TCP (NFS) and
+HTTP (S3).
+
+### Updated E.4 scope
+
+E.4 now uses redb instead of custom files:
+- `crates/kiseki-raft/src/redb_log_store.rs` — redb-backed Raft log
+- `crates/kiseki-raft/Cargo.toml` — add `redb = "2"`
+- State machine snapshots via redb transactions
+- Chunk metadata index: `redb::TableDefinition<&[u8; 32], &[u8]>`
+
+### New item: E.0 (inserted before E.3)
+
+**E.0: RFC-driven BDD scenarios** — create the 44 feature file scenarios
+before implementing protocol fixes. Red first, then green.
