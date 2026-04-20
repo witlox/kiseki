@@ -20,6 +20,13 @@ pub enum GatewayError {
     /// Upstream error from the view or composition layer.
     #[error("upstream error: {0}")]
     Upstream(String),
+
+    /// View is stale — watermark too far behind (I-K9).
+    #[error("view stale: lag {lag_ms}ms exceeds bound")]
+    StaleView {
+        /// How far behind the view is (milliseconds).
+        lag_ms: u64,
+    },
 }
 
 impl From<GatewayError> for KisekiError {

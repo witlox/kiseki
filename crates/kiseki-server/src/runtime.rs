@@ -79,8 +79,8 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let mut comp_store = kiseki_composition::composition::CompositionStore::new()
         .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
 
-    // View: in-memory store with stream processor.
-    let mut view_store = kiseki_view::view::ViewStore::new();
+    // View: shared between gateway (staleness check) and stream processor.
+    let view_store = Arc::new(std::sync::Mutex::new(kiseki_view::view::ViewStore::new()));
 
     // Bootstrap namespace for protocol gateways (maps "default" bucket/export).
     let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
@@ -97,15 +97,18 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
         // Create a bootstrap view for the default namespace.
         let bootstrap_view = kiseki_common::ids::ViewId(uuid::Uuid::from_u128(1));
-        let _ = view_store.create_view(kiseki_view::ViewDescriptor {
-            view_id: bootstrap_view,
-            tenant_id: bootstrap_tenant,
-            source_shards: vec![bootstrap_shard],
-            protocol: kiseki_view::ProtocolSemantics::Posix,
-            consistency: kiseki_view::ConsistencyModel::ReadYourWrites,
-            discardable: true,
-            version: 1,
-        });
+        let _ = view_store
+            .lock()
+            .unwrap()
+            .create_view(kiseki_view::ViewDescriptor {
+                view_id: bootstrap_view,
+                tenant_id: bootstrap_tenant,
+                source_shards: vec![bootstrap_shard],
+                protocol: kiseki_view::ProtocolSemantics::Posix,
+                consistency: kiseki_view::ConsistencyModel::ReadYourWrites,
+                discardable: true,
+                version: 1,
+            });
         eprintln!("  bootstrap: namespace 'default' + view for gateways");
     } else {
         eprintln!("  WARNING: KISEKI_BOOTSTRAP not set — S3/NFS gateways have no namespaces");
@@ -115,11 +118,10 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // Shared gateway: wires composition + chunk + crypto. Used by S3 and NFS.
     let master_key =
         kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
-    let gw = Arc::new(kiseki_gateway::InMemoryGateway::new(
-        comp_store,
-        chunk_store,
-        master_key,
-    ));
+    let gw = Arc::new(
+        kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
+            .with_view_store(Arc::clone(&view_store)),
+    );
 
     // S3 gateway.
     let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&gw));
@@ -151,13 +153,17 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
     // Stream processor: polls deltas from log → advances view watermarks.
     let sp_log = Arc::clone(&log_store);
+    let sp_views = Arc::clone(&view_store);
     let sp_view_id = kiseki_common::ids::ViewId(uuid::Uuid::from_u128(1));
     tokio::spawn(async move {
         loop {
             {
+                let mut vs = sp_views
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut sp = kiseki_view::stream_processor::TrackedStreamProcessor::new(
                     sp_log.as_ref(),
-                    &mut view_store,
+                    &mut *vs,
                 );
                 sp.track(sp_view_id);
                 sp.poll(

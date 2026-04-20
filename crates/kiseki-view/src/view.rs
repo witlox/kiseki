@@ -101,6 +101,12 @@ impl ViewStore {
     pub fn count(&self) -> usize {
         self.views.len()
     }
+
+    /// List all view IDs.
+    #[must_use]
+    pub fn view_ids(&self) -> Vec<ViewId> {
+        self.views.keys().copied().collect()
+    }
 }
 
 impl Default for ViewStore {

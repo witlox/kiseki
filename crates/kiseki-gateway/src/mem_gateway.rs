@@ -5,6 +5,8 @@
 
 use std::sync::Mutex;
 
+use std::sync::Arc;
+
 use kiseki_chunk::store::{ChunkOps, ChunkStore};
 use kiseki_common::tenancy::DedupPolicy;
 use kiseki_composition::composition::{CompositionOps, CompositionStore};
@@ -12,6 +14,7 @@ use kiseki_crypto::aead::Aead;
 use kiseki_crypto::chunk_id::derive_chunk_id;
 use kiseki_crypto::envelope;
 use kiseki_crypto::keys::SystemMasterKey;
+use kiseki_view::view::{ViewOps, ViewStore};
 
 use crate::error::GatewayError;
 use crate::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
@@ -27,6 +30,7 @@ pub struct InMemoryGateway {
     master_key: SystemMasterKey,
     dedup_policy: DedupPolicy,
     tenant_hmac_key: Option<Vec<u8>>,
+    view_store: Option<Arc<Mutex<ViewStore>>>,
 }
 
 impl InMemoryGateway {
@@ -47,7 +51,15 @@ impl InMemoryGateway {
             master_key,
             dedup_policy: DedupPolicy::CrossTenant,
             tenant_hmac_key: None,
+            view_store: None,
         }
+    }
+
+    /// Attach a shared view store for staleness enforcement (I-K9).
+    #[must_use]
+    pub fn with_view_store(mut self, vs: Arc<Mutex<ViewStore>>) -> Self {
+        self.view_store = Some(vs);
+        self
     }
 
     /// Configure the dedup policy (I-X2).
@@ -80,6 +92,27 @@ impl GatewayOps for InMemoryGateway {
         // Verify tenant ownership (I-T1).
         if comp.tenant_id != req.tenant_id {
             return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
+        }
+
+        // Check view staleness (I-K9) if view store is attached.
+        if let Some(ref vs) = self.view_store {
+            let view_store = vs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Find a view covering this composition's shard.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            // Check all views for staleness — any stale view blocks the read.
+            // In production, only the view serving this shard matters.
+            for view_id in view_store.view_ids() {
+                if let Ok(view) = view_store.get_view(view_id) {
+                    if view.check_staleness(now_ms).is_err() {
+                        return Err(GatewayError::StaleView {
+                            lag_ms: now_ms.saturating_sub(view.last_advanced_ms),
+                        });
+                    }
+                }
+            }
         }
 
         // Read and decrypt all chunks, concatenate.

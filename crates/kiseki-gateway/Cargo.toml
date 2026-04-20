@@ -24,6 +24,7 @@ axum = "0.7"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto", "service"] }
 kiseki-transport = { path = "../kiseki-transport" }
+kiseki-view = { path = "../kiseki-view" }
 rustls = { version = "0.23", default-features = false }
 thiserror = { workspace = true }
 tokio = { workspace = true }

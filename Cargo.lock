@@ -1445,6 +1445,7 @@ dependencies = [
  "kiseki-composition",
  "kiseki-crypto",
  "kiseki-transport",
+ "kiseki-view",
  "proptest",
  "rustls",
  "thiserror 1.0.69",
