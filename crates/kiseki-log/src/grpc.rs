@@ -262,7 +262,13 @@ impl<T: LogOps + Send + Sync + 'static> LogService for LogGrpc<T> {
             .ops
             .read_deltas(domain_req)
             .map_err(|e| to_status(&e))?;
-        let proto_deltas: Vec<_> = deltas.iter().map(domain_delta_to_proto).collect();
+        // Server-side cap: max 1000 deltas per response to prevent OOM.
+        let capped = if deltas.len() > 1000 {
+            &deltas[..1000]
+        } else {
+            &deltas
+        };
+        let proto_deltas: Vec<_> = capped.iter().map(domain_delta_to_proto).collect();
 
         Ok(Response::new(ReadDeltasResponse {
             deltas: proto_deltas,

@@ -24,8 +24,11 @@ const NFS3_VERSION: u32 = 3;
 mod proc {
     pub const NULL: u32 = 0;
     pub const GETATTR: u32 = 1;
+    pub const LOOKUP: u32 = 3;
     pub const READ: u32 = 6;
     pub const WRITE: u32 = 7;
+    pub const CREATE: u32 = 8;
+    pub const READDIR: u32 = 16;
 }
 
 /// NFS3 status codes.
@@ -86,8 +89,11 @@ fn dispatch_nfs3<G: GatewayOps>(
     match header.procedure {
         proc::NULL => reply_null(header.xid),
         proc::GETATTR => reply_getattr(header.xid, reader, ctx),
+        proc::LOOKUP => reply_lookup(header.xid, reader, ctx),
         proc::READ => reply_read(header.xid, reader, ctx),
         proc::WRITE => reply_write(header.xid, reader, ctx),
+        proc::CREATE => reply_create(header.xid, reader, ctx),
+        proc::READDIR => reply_readdir(header.xid, reader, ctx),
         _ => {
             // Unsupported procedure — reply PROC_UNAVAIL.
             let mut w = XdrWriter::new();
@@ -219,6 +225,90 @@ fn reply_write<G: GatewayOps>(
             w.write_u32(status::NFS3ERR_IO);
         }
     }
+
+    w.into_bytes()
+}
+
+fn reply_lookup<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+    let name = reader.read_string().unwrap_or_default();
+
+    match ctx.lookup_by_name(&name) {
+        Some((fh, _attrs)) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_opaque(&fh);
+            w.write_bool(false); // post-op attrs omitted
+            w.write_bool(false); // dir attrs omitted
+        }
+        None => {
+            w.write_u32(status::NFS3ERR_NOENT);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_create<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+    let _name = reader.read_string().unwrap_or_default();
+
+    match ctx.write(Vec::new()) {
+        Ok((new_fh, _resp)) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(true);
+            w.write_opaque(&new_fh);
+            w.write_bool(false); // post-op
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_IO);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_readdir<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+
+    w.write_u32(status::NFS3_OK);
+    w.write_bool(false); // dir attrs omitted
+    w.write_opaque_fixed(&[0u8; 8]); // cookieverf
+
+    let entries = ctx.readdir();
+    for (i, entry) in entries.iter().enumerate() {
+        w.write_bool(true);
+        w.write_u64(entry.fileid);
+        w.write_string(&entry.name);
+        w.write_u64((i + 1) as u64);
+    }
+    w.write_bool(false); // no more
+    w.write_bool(true); // eof
 
     w.into_bytes()
 }

@@ -223,4 +223,42 @@ impl<G: GatewayOps> NfsContext<G> {
 
         Ok((fh, resp))
     }
+
+    /// Look up a file by name in the namespace. Returns handle + attrs.
+    pub fn lookup_by_name(&self, _name: &str) -> Option<(FileHandle, NfsAttrs)> {
+        // TODO: directory index mapping names → composition IDs.
+        None
+    }
+
+    /// List directory entries for READDIR.
+    pub fn readdir(&self) -> Vec<ReadDirEntry> {
+        let mut entries = vec![
+            ReadDirEntry {
+                fileid: 1,
+                name: ".".into(),
+            },
+            ReadDirEntry {
+                fileid: 1,
+                name: "..".into(),
+            },
+        ];
+
+        let handles = self.handles.handles.lock().unwrap();
+        for (&fh, entry) in handles.iter() {
+            if let HandleEntry::File { composition_id, .. } = entry {
+                entries.push(ReadDirEntry {
+                    fileid: u64::from_le_bytes(fh[..8].try_into().unwrap_or([0; 8])),
+                    name: composition_id.0.to_string(),
+                });
+            }
+        }
+
+        entries
+    }
+}
+
+/// Directory entry for READDIR response.
+pub struct ReadDirEntry {
+    pub fileid: u64,
+    pub name: String,
 }

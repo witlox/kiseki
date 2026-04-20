@@ -38,6 +38,7 @@ pub mod nfs;
     clippy::cast_sign_loss,
     clippy::cast_lossless,
     clippy::doc_markdown,
+    clippy::single_match_else,
     clippy::unreadable_literal,
     clippy::needless_pass_by_value,
     clippy::unwrap_used
