@@ -58,8 +58,10 @@ pub mod nfs3_server;
     clippy::unreadable_literal,
     clippy::needless_pass_by_value,
     clippy::unwrap_used,
+    clippy::items_after_statements,
     clippy::manual_let_else,
     clippy::struct_field_names,
+    clippy::unused_self,
     dead_code
 )]
 pub mod nfs4_server;

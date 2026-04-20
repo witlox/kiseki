@@ -1,4 +1,4 @@
-FROM rust:latest AS builder
+FROM rust:1.88 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake clang pkg-config golang-go protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*

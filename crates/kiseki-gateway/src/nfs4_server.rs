@@ -76,16 +76,13 @@ impl SessionManager {
     }
 
     fn exchange_id(&self) -> u64 {
-        let mut id = self.next_client_id.lock().unwrap();
-        let client_id = *id;
-        *id += 1;
-        client_id
+        // Random client IDs prevent prediction (C-ADV-7).
+        uuid::Uuid::new_v4().as_u128() as u64
     }
 
     fn create_session(&self, client_id: u64, slots: u32) -> [u8; 16] {
-        let mut session_id = [0u8; 16];
-        session_id[..8].copy_from_slice(&client_id.to_be_bytes());
-        session_id[8..16].copy_from_slice(&1u64.to_be_bytes());
+        // Random session IDs prevent hijacking (C-ADV-2).
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
 
         let session = Session {
             session_id,
@@ -166,7 +163,7 @@ fn dispatch_compound<G: GatewayOps>(
 ) -> Vec<u8> {
     let _tag = reader.read_opaque().unwrap_or_default();
     let _minor_version = reader.read_u32().unwrap_or(2);
-    let num_ops = reader.read_u32().unwrap_or(0);
+    let num_ops = reader.read_u32().unwrap_or(0).min(32); // Cap at 32 ops (C-ADV-3).
 
     let mut op_results: Vec<Vec<u8>> = Vec::new();
     let mut compound_status = nfs4_status::NFS4_OK;

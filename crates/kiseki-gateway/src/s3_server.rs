@@ -147,18 +147,17 @@ pub async fn run_s3_server(addr: SocketAddr, router: Router, use_tls: bool) {
         .expect("S3 bind failed");
 
     if use_tls {
+        // D-ADV-2: Do NOT silently fall back to plaintext.
         // TODO: Accept rustls::ServerConfig, wrap listener with TlsAcceptor.
-        // For now, log a warning and fall back to plaintext.
-        eprintln!("  WARNING: S3 TLS requested but not yet implemented — using plaintext");
+        eprintln!(
+            "  ERROR: S3 TLS requested but not yet implemented — refusing to start in plaintext"
+        );
+        eprintln!(
+            "  Set KISEKI_CA_PATH/CERT_PATH/KEY_PATH to empty or remove to use plaintext mode"
+        );
+        return;
     }
 
-    eprintln!(
-        "  S3 HTTP gateway listening on {addr} ({})",
-        if use_tls {
-            "plaintext — TLS pending"
-        } else {
-            "plaintext"
-        }
-    );
+    eprintln!("  WARNING: S3 HTTP gateway listening on {addr} (PLAINTEXT — development only)");
     axum::serve(listener, router).await.ok();
 }

@@ -8,6 +8,9 @@
 
 use std::io::{self, Read, Write};
 
+/// Maximum NFS frame size (16 MB) to prevent OOM from malicious headers.
+const MAX_NFS_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 /// XDR encoder — writes big-endian, 4-byte-aligned data.
 pub struct XdrWriter {
     buf: Vec<u8>,
@@ -216,6 +219,14 @@ pub fn read_rm_message<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
         let fragment_header = u32::from_be_bytes(hdr);
         let last = (fragment_header & 0x8000_0000) != 0;
         let len = (fragment_header & 0x7FFF_FFFF) as usize;
+
+        // Cap frame size to prevent OOM from malicious headers (C-ADV-1).
+        if buf.len() + len > MAX_NFS_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NFS frame exceeds 16MB limit",
+            ));
+        }
 
         let start = buf.len();
         buf.resize(start + len, 0);

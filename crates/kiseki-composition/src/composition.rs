@@ -153,10 +153,10 @@ impl CompositionOps for CompositionStore {
         };
         self.compositions.insert(id, comp.clone());
 
-        // Emit delta to log if attached.
+        // Emit delta to log if attached. Roll back on failure (PIPE-ADV-1).
         if let Some(ref log) = self.log {
             let hashed_key = composition_hash_key(namespace_id, id);
-            log_bridge::emit_delta(
+            if !log_bridge::emit_delta(
                 log.as_ref(),
                 comp.shard_id,
                 comp.tenant_id,
@@ -164,7 +164,10 @@ impl CompositionOps for CompositionStore {
                 hashed_key,
                 comp.chunks.clone(),
                 id.0.as_bytes().to_vec(),
-            );
+            ) {
+                self.compositions.remove(&id);
+                return Err(CompositionError::NamespaceNotFound(namespace_id));
+            }
         }
 
         Ok(id)
@@ -294,18 +297,16 @@ impl CompositionOps for CompositionStore {
     }
 }
 
-/// Compute the hashed key for a composition (deterministic routing key
-/// for the shard's key range). Uses `sha256(namespace_id || composition_id)`.
+/// Compute the hashed key for a composition — deterministic routing key.
+///
+/// Uses UUID v5 (SHA-1 based, deterministic) of `namespace_id` || `composition_id`.
+/// Stable across restarts (PIPE-ADV-3).
 fn composition_hash_key(ns: NamespaceId, comp: CompositionId) -> [u8; 32] {
-    use std::hash::{Hash, Hasher};
-    // Simple hash — production would use sha256, but we avoid adding
-    // a crypto dep here. The log layer only needs a 32-byte routing key.
+    let combined = uuid::Uuid::new_v5(&ns.0, comp.0.as_bytes());
     let mut buf = [0u8; 32];
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    ns.0.hash(&mut hasher);
-    comp.0.hash(&mut hasher);
-    let h = hasher.finish().to_le_bytes();
-    buf[..8].copy_from_slice(&h);
+    buf[..16].copy_from_slice(combined.as_bytes());
+    // Mirror to fill 32 bytes deterministically.
+    buf[16..32].copy_from_slice(combined.as_bytes());
     buf
 }
 

@@ -22,7 +22,7 @@ pub(crate) fn emit_delta<L: LogOps + ?Sized>(
     hashed_key: [u8; 32],
     chunk_refs: Vec<ChunkId>,
     payload: Vec<u8>,
-) {
+) -> bool {
     let timestamp = now_timestamp();
     let req = AppendDeltaRequest {
         shard_id,
@@ -34,11 +34,15 @@ pub(crate) fn emit_delta<L: LogOps + ?Sized>(
         payload,
         has_inline_data: false,
     };
-    // Best-effort: log errors are not propagated to the composition
-    // caller because the composition mutation already succeeded in
-    // the local store. The delta will be retried or detected as
-    // missing by the stream processor.
-    let _ = log.append_delta(req);
+    match log.append_delta(req) {
+        Ok(_seq) => true,
+        Err(e) => {
+            // Log the error — callers check the return value to decide
+            // whether to roll back the local mutation (PIPE-ADV-1).
+            eprintln!("WARNING: delta emission failed: {e}");
+            false
+        }
+    }
 }
 
 fn now_timestamp() -> DeltaTimestamp {
