@@ -113,3 +113,14 @@ func (s *Store) OrgCount() int {
 	defer s.mu.RUnlock()
 	return len(s.orgs)
 }
+
+// ListOrgs returns all organizations.
+func (s *Store) ListOrgs() []*Organization {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*Organization, 0, len(s.orgs))
+	for _, org := range s.orgs {
+		result = append(result, org)
+	}
+	return result
+}

@@ -23,6 +23,7 @@ Grouped by what blocks resolution.
 
 - wi3-gate: No mTLS interceptor on gRPC services (Medium)
 - R5-review: LogService has no tenant authorization check (High) — TODO in grpc.rs, needs interceptor
+- R8-review: Control plane server has no TLS (High) — TODO in main.go, needs mTLS
 - a4-mtls-grpc-gate: No integration test with mTLS client (Medium)
 
 ## Blocked by: gRPC wiring (remaining)
