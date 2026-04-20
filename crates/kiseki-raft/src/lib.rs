@@ -29,6 +29,20 @@ pub mod redb_log_store;
 
 pub use config::KisekiRaftConfig;
 pub use log_store::MemLogStore;
+#[allow(
+    missing_docs,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
+    clippy::cast_possible_truncation,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::io_other_error,
+    clippy::needless_pass_by_value,
+    dead_code
+)]
+pub mod tcp_transport;
+
 pub use network::{StubNetwork, StubNetworkFactory};
 pub use node::KisekiNode;
 pub use redb_log_store::RedbLogStore;
+pub use tcp_transport::{TcpNetwork, TcpNetworkFactory};
