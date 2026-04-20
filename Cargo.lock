@@ -1403,9 +1403,13 @@ dependencies = [
 name = "kiseki-gateway"
 version = "0.0.0"
 dependencies = [
+ "kiseki-chunk",
  "kiseki-common",
+ "kiseki-composition",
+ "kiseki-crypto",
  "proptest",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]
@@ -1434,6 +1438,7 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "kiseki-common",
+ "kiseki-proto",
  "kiseki-raft",
  "openraft",
  "proptest",
@@ -1441,6 +1446,8 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "uuid",
 ]
 

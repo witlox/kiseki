@@ -16,6 +16,7 @@
 
 pub mod delta;
 pub mod error;
+pub mod grpc;
 pub mod raft;
 pub mod raft_store;
 pub mod shard;

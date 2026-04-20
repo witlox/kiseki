@@ -7,7 +7,9 @@ use kiseki_advisory::budget::BudgetConfig;
 use kiseki_advisory::grpc::AdvisoryGrpc;
 use kiseki_keymanager::grpc::KeyManagerGrpc;
 use kiseki_keymanager::raft_store::RaftKeyStore;
+use kiseki_log::grpc::LogGrpc;
 use kiseki_proto::v1::key_manager_service_server::KeyManagerServiceServer;
+use kiseki_proto::v1::log_service_server::LogServiceServer;
 use kiseki_proto::v1::workflow_advisory_service_server::WorkflowAdvisoryServiceServer;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
@@ -42,7 +44,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     );
 
     // Log: in-memory store (Raft integration will replace).
-    let _log_store = kiseki_log::MemShardStore::new();
+    let log_store = Arc::new(kiseki_log::MemShardStore::new());
 
     // Audit: in-memory store.
     let _audit_store = kiseki_audit::AuditLog::new();
@@ -59,6 +61,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // --- gRPC services ---
 
     let key_svc = KeyManagerServiceServer::new(KeyManagerGrpc::new(key_store));
+    let log_svc = LogServiceServer::new(LogGrpc::new(log_store));
 
     let mut builder = tonic::transport::Server::builder();
 
@@ -83,6 +86,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
     builder
         .add_service(key_svc)
+        .add_service(log_svc)
         .serve_with_shutdown(cfg.data_addr, shutdown)
         .await?;
 

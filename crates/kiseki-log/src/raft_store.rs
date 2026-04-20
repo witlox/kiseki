@@ -245,6 +245,11 @@ impl RaftLogStore {
                     },
                     payload: DeltaPayload {
                         ciphertext: payload.clone(),
+                        auth_tag: Vec::new(),
+                        nonce: Vec::new(),
+                        system_epoch: None,
+                        tenant_epoch: None,
+                        tenant_wrapped_material: Vec::new(),
                     },
                 };
 

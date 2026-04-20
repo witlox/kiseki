@@ -99,6 +99,11 @@ impl SerializableDelta {
             },
             payload: DeltaPayload {
                 ciphertext: self.ciphertext.clone(),
+                auth_tag: Vec::new(),
+                nonce: Vec::new(),
+                system_epoch: None,
+                tenant_epoch: None,
+                tenant_wrapped_material: Vec::new(),
             },
         }
     }
@@ -204,6 +209,11 @@ impl ShardSmInner {
                     },
                     payload: DeltaPayload {
                         ciphertext: payload.clone(),
+                        auth_tag: Vec::new(),
+                        nonce: Vec::new(),
+                        system_epoch: None,
+                        tenant_epoch: None,
+                        tenant_wrapped_material: Vec::new(),
                     },
                 };
 

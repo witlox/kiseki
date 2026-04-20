@@ -1,0 +1,152 @@
+//! In-memory gateway — wires Composition + Chunk + Crypto for protocol gateways.
+//!
+//! Handles the full data path: plaintext from protocol client → encrypt →
+//! chunk store → composition metadata, and reverse for reads.
+
+use std::sync::Mutex;
+
+use kiseki_chunk::store::{ChunkOps, ChunkStore};
+use kiseki_common::tenancy::DedupPolicy;
+use kiseki_composition::composition::{CompositionOps, CompositionStore};
+use kiseki_crypto::aead::Aead;
+use kiseki_crypto::chunk_id::derive_chunk_id;
+use kiseki_crypto::envelope;
+use kiseki_crypto::keys::SystemMasterKey;
+
+use crate::error::GatewayError;
+use crate::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
+
+/// In-memory gateway backed by composition store, chunk store, and crypto.
+///
+/// Uses `Mutex` for interior mutability so `GatewayOps` methods can
+/// take `&self`, enabling concurrent access.
+pub struct InMemoryGateway {
+    compositions: Mutex<CompositionStore>,
+    chunks: Mutex<ChunkStore>,
+    aead: Aead,
+    master_key: SystemMasterKey,
+    dedup_policy: DedupPolicy,
+    tenant_hmac_key: Option<Vec<u8>>,
+}
+
+impl InMemoryGateway {
+    /// Create a new in-memory gateway with the given crypto material.
+    ///
+    /// Uses `CrossTenant` dedup policy by default. Call
+    /// `with_dedup_policy` to configure per-tenant isolation (I-X2).
+    #[must_use]
+    pub fn new(
+        compositions: CompositionStore,
+        chunks: ChunkStore,
+        master_key: SystemMasterKey,
+    ) -> Self {
+        Self {
+            compositions: Mutex::new(compositions),
+            chunks: Mutex::new(chunks),
+            aead: Aead::new(),
+            master_key,
+            dedup_policy: DedupPolicy::CrossTenant,
+            tenant_hmac_key: None,
+        }
+    }
+
+    /// Configure the dedup policy (I-X2).
+    ///
+    /// `TenantIsolated` requires a tenant HMAC key for chunk ID derivation.
+    #[must_use]
+    pub fn with_dedup_policy(mut self, policy: DedupPolicy, hmac_key: Option<Vec<u8>>) -> Self {
+        self.dedup_policy = policy;
+        self.tenant_hmac_key = hmac_key;
+        self
+    }
+}
+
+impl GatewayOps for InMemoryGateway {
+    fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
+        let compositions = self
+            .compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let chunks = self
+            .chunks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Look up the composition.
+        let comp = compositions
+            .get(req.composition_id)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        // Verify tenant ownership (I-T1).
+        if comp.tenant_id != req.tenant_id {
+            return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
+        }
+
+        // Read and decrypt all chunks, concatenate.
+        let mut plaintext = Vec::new();
+        for chunk_id in &comp.chunks {
+            let env = chunks
+                .read_chunk(chunk_id)
+                .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            let decrypted = envelope::open_envelope(&self.aead, &self.master_key, env)
+                .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            plaintext.extend_from_slice(&decrypted);
+        }
+
+        // Apply offset/length.
+        let start = usize::try_from(req.offset).unwrap_or(usize::MAX);
+        if start >= plaintext.len() {
+            return Ok(ReadResponse {
+                data: Vec::new(),
+                eof: true,
+            });
+        }
+        let length = usize::try_from(req.length).unwrap_or(usize::MAX);
+        let end = std::cmp::min(start.saturating_add(length), plaintext.len());
+        let eof = end >= plaintext.len();
+
+        Ok(ReadResponse {
+            data: plaintext[start..end].to_vec(),
+            eof,
+        })
+    }
+
+    fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
+        // Compute content-addressed chunk ID.
+        // TODO(I-X2): Production must look up the tenant's DedupPolicy.
+        // TenantIsolated tenants need HMAC-SHA256 with their tenant HMAC
+        // key to prevent cross-tenant co-occurrence analysis.
+        let chunk_id = derive_chunk_id(
+            &req.data,
+            self.dedup_policy,
+            self.tenant_hmac_key.as_deref(),
+        )
+        .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        // Encrypt the data (I-K1: no plaintext past the gateway boundary).
+        let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, &req.data)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        let bytes_written = req.data.len() as u64;
+
+        // Store the encrypted chunk.
+        self.chunks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_chunk(env, "default")
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        // Create a composition referencing this chunk.
+        let comp_id = self
+            .compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .create(req.namespace_id, vec![chunk_id], bytes_written)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        Ok(WriteResponse {
+            composition_id: comp_id,
+            bytes_written,
+        })
+    }
+}

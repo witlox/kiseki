@@ -19,13 +19,25 @@ Grouped by what blocks resolution.
 - phase7-gate2: No refcount integration with chunk store (High)
 - phase7-gate2: Multipart abort doesn't clean up chunks (Medium)
 
-## Blocked by: gRPC wiring (R5)
+## Blocked by: gRPC auth interceptor
 
 - wi3-gate: No mTLS interceptor on gRPC services (Medium)
+- R5-review: LogService has no tenant authorization check (High) — TODO in grpc.rs, needs interceptor
+- a4-mtls-grpc-gate: No integration test with mTLS client (Medium)
+
+## Blocked by: gRPC wiring (remaining)
+
 - wi3-gate: Go ControlService not wired (Medium)
 - wi3-gate: Advisory streaming RPCs unimplemented (Low)
-- a4-mtls-grpc-gate: No integration test with mTLS client (Medium)
 - phase12-gate2: Server is scaffold, no e2e test (High)
+
+## Blocked by: gRPC pagination (R9 debt)
+
+- R5-review: ReadDeltas response unbounded — needs max_count or server-side cap (Medium)
+
+## Blocked by: Tenant dedup policy wiring
+
+- R7-review: Gateway must look up tenant DedupPolicy for I-X2 (High) — currently configurable per-gateway, production needs per-tenant lookup from control plane
 
 ## Blocked by: Protocol implementations (R7)
 

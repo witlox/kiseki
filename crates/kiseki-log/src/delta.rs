@@ -61,11 +61,22 @@ pub struct DeltaHeader {
 ///
 /// The Log stores, replicates, and carries this blob without ever
 /// decrypting it. Only the Composition context (with tenant KEK)
-/// can interpret the contents.
+/// can interpret the contents. Carries full AEAD metadata so the
+/// payload is self-describing for decryption.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeltaPayload {
     /// Encrypted payload bytes.
     pub ciphertext: Vec<u8>,
+    /// AEAD authentication tag (16 bytes).
+    pub auth_tag: Vec<u8>,
+    /// AEAD nonce (12 bytes).
+    pub nonce: Vec<u8>,
+    /// System key epoch used for encryption.
+    pub system_epoch: Option<u64>,
+    /// Tenant key epoch used for wrapping.
+    pub tenant_epoch: Option<u64>,
+    /// Tenant KEK-wrapped derivation material.
+    pub tenant_wrapped_material: Vec<u8>,
 }
 
 /// Complete delta = header + payload (I-L3: immutable once committed).

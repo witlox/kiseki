@@ -20,6 +20,7 @@
 #![deny(unsafe_code)]
 
 pub mod error;
+pub mod mem_gateway;
 pub mod ops;
 
 #[cfg(feature = "nfs")]
@@ -29,4 +30,5 @@ pub mod nfs;
 pub mod s3;
 
 pub use error::GatewayError;
+pub use mem_gateway::InMemoryGateway;
 pub use ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};

@@ -50,12 +50,13 @@ pub struct WriteResponse {
 
 /// Protocol-agnostic gateway operations.
 ///
-/// NFS and S3 gateways both implement this trait, translating their
-/// wire-protocol requests into these operations.
+/// All methods take `&self` (not `&mut self`) because implementations
+/// use interior mutability — matching the `LogOps` pattern. This allows
+/// concurrent readers and writers on a shared gateway instance.
 pub trait GatewayOps {
     /// Read data from a composition (decrypt + return plaintext to client).
     fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError>;
 
     /// Write data to a composition (encrypt plaintext from client → store).
-    fn write(&mut self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
+    fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
 }

@@ -22,12 +22,16 @@ is direct function calls via trait implementations.
 | `KeyManagerService` | Rust keyserver | Rust server, Go control | Internal network |
 | `DiscoveryService` | Rust server | Rust client | Data fabric |
 | `WorkflowAdvisoryService` | Rust server (kiseki-advisory) | Rust client (and any tenant-authorized caller) | Data fabric (separate listener, ADR-021 §1) |
+| `LogService` | Rust server (kiseki-log) | Rust client, gateways | Data fabric |
 
 ### Services that are intra-process (Rust trait calls)
 
+Co-located callers use the trait directly; remote callers use the gRPC
+service backed by the same trait implementation.
+
 | Interface | Provider | Consumer |
 |---|---|---|
-| `LogOps` | kiseki-log | kiseki-composition |
+| `LogOps` | kiseki-log | kiseki-composition (co-located) |
 | `ChunkOps` | kiseki-chunk | kiseki-composition, kiseki-view |
 | `CompositionOps` | kiseki-composition | kiseki-gateway-*, kiseki-client |
 | `ViewOps` | kiseki-view | kiseki-gateway-*, kiseki-client |

@@ -17,7 +17,11 @@ s3 = []
 
 [dependencies]
 kiseki-common = { path = "../kiseki-common" }
+kiseki-chunk = { path = "../kiseki-chunk" }
+kiseki-composition = { path = "../kiseki-composition" }
+kiseki-crypto = { path = "../kiseki-crypto" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+uuid = { workspace = true }

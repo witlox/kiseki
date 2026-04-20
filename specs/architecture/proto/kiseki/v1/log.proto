@@ -6,16 +6,74 @@ syntax = "proto3";
 //       specs/features/log.feature,
 //       invariants.md I-L1..I-L8, I-O1, I-O2, I-O6.
 //
-// All Log operations are intra-process Rust trait calls (see
-// `LogOps` in api-contracts.md). This proto is used only for the on-disk
-// delta envelope, events emitted onto the audit shard, and cross-node
-// Raft replication carriers. It is NOT exposed as a gRPC service.
+// Core Log operations are available via `LogOps` trait (intra-process)
+// and via `LogService` gRPC (network data path). The proto also
+// defines the on-disk delta envelope, events emitted onto the audit
+// shard, and cross-node Raft replication carriers.
 
 package kiseki.v1;
 
 option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
 
 import "kiseki/v1/common.proto";
+
+// ============================================================================
+// LogService — data-path gRPC for delta read/write
+// ============================================================================
+
+service LogService {
+  // Append a delta to a shard. Returns the assigned sequence number.
+  rpc AppendDelta(AppendDeltaRequest) returns (AppendDeltaResponse);
+
+  // Read deltas in [from, to] inclusive from a shard.
+  rpc ReadDeltas(ReadDeltasRequest) returns (ReadDeltasResponse);
+
+  // Get shard health and metadata.
+  rpc ShardHealth(ShardHealthRequest) returns (ShardHealthResponse);
+
+  // Set or clear maintenance mode on a shard (I-O6).
+  rpc SetMaintenance(SetMaintenanceRequest) returns (SetMaintenanceResponse);
+}
+
+message AppendDeltaRequest {
+  ShardId   shard_id       = 1;
+  OrgId     tenant_id      = 2;
+  OperationType operation  = 3;
+  DeltaTimestamp timestamp = 4;
+  bytes     hashed_key     = 5; // 32 bytes
+  repeated ChunkId chunk_refs = 6;
+  bytes     payload        = 7; // encrypted payload
+  bool      has_inline_data = 8;
+}
+
+message AppendDeltaResponse {
+  uint64 sequence = 1; // assigned sequence number
+}
+
+message ReadDeltasRequest {
+  ShardId shard_id = 1;
+  uint64  from     = 2; // inclusive
+  uint64  to       = 3; // inclusive
+}
+
+message ReadDeltasResponse {
+  repeated Delta deltas = 1;
+}
+
+message ShardHealthRequest {
+  ShardId shard_id = 1;
+}
+
+message ShardHealthResponse {
+  ShardInfo info = 1;
+}
+
+message SetMaintenanceRequest {
+  ShardId shard_id = 1;
+  bool    enabled  = 2;
+}
+
+message SetMaintenanceResponse {}
 
 // ============================================================================
 // Delta envelope (I-L7: structural separation of header and payload)

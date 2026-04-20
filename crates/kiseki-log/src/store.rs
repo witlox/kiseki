@@ -250,6 +250,11 @@ impl LogOps for MemShardStore {
             },
             payload: DeltaPayload {
                 ciphertext: req.payload,
+                auth_tag: Vec::new(),
+                nonce: Vec::new(),
+                system_epoch: None,
+                tenant_epoch: None,
+                tenant_wrapped_material: Vec::new(),
             },
         };
 
