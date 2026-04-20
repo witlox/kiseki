@@ -60,3 +60,13 @@ pub trait GatewayOps {
     /// Write data to a composition (encrypt plaintext from client → store).
     fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
 }
+
+/// Blanket impl: `Arc<G>` delegates to `G` via deref.
+impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
+    fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
+        (**self).read(req)
+    }
+    fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
+        (**self).write(req)
+    }
+}

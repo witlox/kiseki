@@ -8,6 +8,8 @@ use kiseki_advisory::grpc::AdvisoryGrpc;
 use kiseki_keymanager::grpc::KeyManagerGrpc;
 use kiseki_keymanager::raft_store::RaftKeyStore;
 use kiseki_log::grpc::LogGrpc;
+use kiseki_audit::AuditOps;
+use kiseki_view::ViewOps;
 use kiseki_proto::v1::key_manager_service_server::KeyManagerServiceServer;
 use kiseki_proto::v1::log_service_server::LogServiceServer;
 use kiseki_proto::v1::workflow_advisory_service_server::WorkflowAdvisoryServiceServer;
@@ -32,6 +34,7 @@ fn build_tls(files: &TlsFiles) -> Result<ServerTlsConfig, Box<dyn std::error::Er
 }
 
 /// Run the main data-path server.
+#[allow(clippy::too_many_lines)]
 pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- Context construction ---
 
@@ -63,7 +66,11 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     }
 
     // Audit: in-memory store.
-    let _audit_store = kiseki_audit::AuditLog::new();
+    let audit_store = kiseki_audit::AuditLog::new();
+    eprintln!(
+        "  audit log: in-memory (events: {})",
+        audit_store.total_events()
+    );
 
     // Chunk: in-memory store.
     let chunk_store = kiseki_chunk::ChunkStore::new();
@@ -72,16 +79,14 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let mut comp_store = kiseki_composition::composition::CompositionStore::new()
         .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
 
-    // View: in-memory store (stream processor polls from log_store).
-    let _view_store = kiseki_view::view::ViewStore::new();
+    // View: in-memory store with stream processor.
+    let mut view_store = kiseki_view::view::ViewStore::new();
 
-    // Bootstrap namespace for S3 gateway (maps "default" bucket).
+    // Bootstrap namespace for protocol gateways (maps "default" bucket/export).
     let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+    let bootstrap_ns =
+        kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
     if cfg.bootstrap {
-        let bootstrap_ns = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_DNS,
-            b"default",
-        ));
         let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
         comp_store.add_namespace(kiseki_composition::namespace::Namespace {
             id: bootstrap_ns,
@@ -89,17 +94,33 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             shard_id: bootstrap_shard,
             read_only: false,
         });
-        eprintln!("  bootstrap: namespace 'default' for S3 gateway");
+
+        // Create a bootstrap view for the default namespace.
+        let bootstrap_view = kiseki_common::ids::ViewId(uuid::Uuid::from_u128(1));
+        let _ = view_store.create_view(kiseki_view::ViewDescriptor {
+            view_id: bootstrap_view,
+            tenant_id: bootstrap_tenant,
+            source_shards: vec![bootstrap_shard],
+            protocol: kiseki_view::ProtocolSemantics::Posix,
+            consistency: kiseki_view::ConsistencyModel::ReadYourWrites,
+            discardable: true,
+            version: 1,
+        });
+        eprintln!("  bootstrap: namespace 'default' + view for gateways");
     }
 
-    // S3 gateway: wires composition + chunk + crypto.
+    // Shared gateway: wires composition + chunk + crypto. Used by S3 and NFS.
     let master_key =
         kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
-    let gw = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key);
-    let s3_gw = kiseki_gateway::s3::S3Gateway::new(gw);
-    let s3_router = kiseki_gateway::s3_server::s3_router(s3_gw, bootstrap_tenant);
+    let gw = Arc::new(kiseki_gateway::InMemoryGateway::new(
+        comp_store,
+        chunk_store,
+        master_key,
+    ));
 
-    // Spawn S3 HTTP server.
+    // S3 gateway.
+    let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&gw));
+    let s3_router = kiseki_gateway::s3_server::s3_router(s3_gw, bootstrap_tenant);
     let s3_addr = cfg.s3_addr;
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(s3_addr)
@@ -107,6 +128,40 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             .expect("S3 bind failed");
         eprintln!("  S3 HTTP gateway listening on {s3_addr}");
         axum::serve(listener, s3_router).await.ok();
+    });
+
+    // NFS gateway (NFSv3 + NFSv4.2 on port 2049).
+    let nfs_gw = kiseki_gateway::nfs::NfsGateway::new(Arc::clone(&gw));
+    let nfs_addr = cfg.nfs_addr;
+    std::thread::spawn(move || {
+        kiseki_gateway::nfs_server::run_nfs_server(
+            nfs_addr,
+            nfs_gw,
+            bootstrap_tenant,
+            bootstrap_ns,
+        );
+    });
+
+    // Stream processor: polls deltas from log → advances view watermarks.
+    let sp_log = Arc::clone(&log_store);
+    let sp_view_id = kiseki_common::ids::ViewId(uuid::Uuid::from_u128(1));
+    tokio::spawn(async move {
+        loop {
+            {
+                let mut sp = kiseki_view::stream_processor::TrackedStreamProcessor::new(
+                    sp_log.as_ref(),
+                    &mut view_store,
+                );
+                sp.track(sp_view_id);
+                sp.poll(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                        .unwrap_or(0),
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     });
 
     // --- gRPC services ---
