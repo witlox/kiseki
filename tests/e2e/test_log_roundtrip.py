@@ -64,36 +64,37 @@ def test_maintenance_mode_rejects_writes(grpc_channel: grpc.Channel) -> None:
     """SetMaintenance blocks writes, clearing it allows writes again."""
     stub = log_pb2_grpc.LogServiceStub(grpc_channel)
 
-    # Enable maintenance.
-    stub.SetMaintenance(
-        log_pb2.SetMaintenanceRequest(
-            shard_id=common_pb2.ShardId(value=BOOTSTRAP_SHARD_UUID),
-            enabled=True,
-        )
-    )
-
-    # Write should fail with FAILED_PRECONDITION.
-    with pytest.raises(grpc.RpcError) as exc_info:
-        stub.AppendDelta(
-            log_pb2.AppendDeltaRequest(
+    try:
+        # Enable maintenance.
+        stub.SetMaintenance(
+            log_pb2.SetMaintenanceRequest(
                 shard_id=common_pb2.ShardId(value=BOOTSTRAP_SHARD_UUID),
-                tenant_id=common_pb2.OrgId(value=BOOTSTRAP_TENANT_UUID),
-                operation=1,
-                timestamp=_make_timestamp(),
-                hashed_key=bytes(32),
-                payload=b"should-fail",
-                has_inline_data=False,
+                enabled=True,
             )
         )
-    assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
 
-    # Clear maintenance.
-    stub.SetMaintenance(
-        log_pb2.SetMaintenanceRequest(
-            shard_id=common_pb2.ShardId(value=BOOTSTRAP_SHARD_UUID),
-            enabled=False,
+        # Write should fail with FAILED_PRECONDITION.
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.AppendDelta(
+                log_pb2.AppendDeltaRequest(
+                    shard_id=common_pb2.ShardId(value=BOOTSTRAP_SHARD_UUID),
+                    tenant_id=common_pb2.OrgId(value=BOOTSTRAP_TENANT_UUID),
+                    operation=1,
+                    timestamp=_make_timestamp(),
+                    hashed_key=bytes(32),
+                    payload=b"should-fail",
+                    has_inline_data=False,
+                )
+            )
+        assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    finally:
+        # Always clear maintenance to avoid cross-test contamination (BA-ADV-2).
+        stub.SetMaintenance(
+            log_pb2.SetMaintenanceRequest(
+                shard_id=common_pb2.ShardId(value=BOOTSTRAP_SHARD_UUID),
+                enabled=False,
+            )
         )
-    )
 
     # Write should succeed now.
     resp = stub.AppendDelta(

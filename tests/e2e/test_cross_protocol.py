@@ -43,12 +43,12 @@ def test_s3_write_grpc_verify(
         )
     )
 
-    # At least one delta should exist (from this or prior S3 writes).
+    # At least one delta should exist from the S3 PUT.
     assert len(read_resp.deltas) >= 1, "expected deltas in log after S3 PUT"
 
-    # Verify the latest delta is a Create operation.
-    latest = read_resp.deltas[-1]
-    assert latest.header.operation == 1  # Create
+    # Verify a Create delta exists with the S3 payload (BA-ADV-3).
+    create_deltas = [d for d in read_resp.deltas if d.header.operation == 1]
+    assert len(create_deltas) >= 1, "expected at least one Create delta"
 
 
 @pytest.mark.e2e

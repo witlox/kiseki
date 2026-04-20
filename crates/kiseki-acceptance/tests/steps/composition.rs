@@ -43,11 +43,14 @@ async fn then_created(w: &mut KisekiWorld) {
             to: SequenceNumber(u64::MAX),
         })
         .unwrap();
+    // Verify delta matches THIS composition (BA-ADV-8).
+    let comp_id_bytes = w.last_composition_id.unwrap().0.as_bytes().to_vec();
     assert!(
-        deltas
-            .iter()
-            .any(|d| d.header.operation == kiseki_log::delta::OperationType::Create),
-        "composition create should emit a Create delta to the log"
+        deltas.iter().any(
+            |d| d.header.operation == kiseki_log::delta::OperationType::Create
+                && d.payload.ciphertext == comp_id_bytes
+        ),
+        "composition create should emit a Create delta with matching composition ID"
     );
 }
 

@@ -107,6 +107,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             version: 1,
         });
         eprintln!("  bootstrap: namespace 'default' + view for gateways");
+    } else {
+        eprintln!("  WARNING: KISEKI_BOOTSTRAP not set — S3/NFS gateways have no namespaces");
+        eprintln!("  Set KISEKI_BOOTSTRAP=true for development/testing");
     }
 
     // Shared gateway: wires composition + chunk + crypto. Used by S3 and NFS.

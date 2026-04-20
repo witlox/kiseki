@@ -23,7 +23,7 @@ services:
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
       KISEKI_BOOTSTRAP: "true"
     healthcheck:
-      test: ["CMD-SHELL", "true"]  # TODO: grpc_health_probe
+      test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null"]
       interval: 2s
       timeout: 2s
       retries: 10

@@ -45,15 +45,19 @@ pub(crate) fn emit_delta<L: LogOps + ?Sized>(
     }
 }
 
+/// Monotonic logical counter for HLC tie-breaking (PIPE-ADV-2).
+static HLC_LOGICAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn now_timestamp() -> DeltaTimestamp {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0);
+    let logical = HLC_LOGICAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     DeltaTimestamp {
         hlc: HybridLogicalClock {
             physical_ms: now_ms,
-            logical: 0,
+            logical,
             node_id: NodeId(0),
         },
         wall: WallTime {
