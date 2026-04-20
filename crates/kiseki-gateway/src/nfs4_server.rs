@@ -23,11 +23,16 @@ const NFS4_VERSION: u32 = 4;
 
 /// NFSv4 operation codes (subset for MVP).
 mod op {
+    pub const CLOSE: u32 = 4;
     pub const GETATTR: u32 = 9;
     pub const GETFH: u32 = 10;
+    pub const LOCK: u32 = 12;
     pub const LOOKUP: u32 = 15;
+    pub const OPEN: u32 = 18;
     pub const PUTROOTFH: u32 = 24;
     pub const READ: u32 = 25;
+    pub const READDIR: u32 = 26;
+    pub const REMOVE: u32 = 28;
     pub const WRITE: u32 = 38;
     pub const EXCHANGE_ID: u32 = 42;
     pub const CREATE_SESSION: u32 = 43;
@@ -45,6 +50,8 @@ mod nfs4_status {
     pub const NFS4ERR_BADHANDLE: u32 = 10001;
     pub const NFS4ERR_STALE_CLIENTID: u32 = 10012;
     pub const NFS4ERR_BADSESSION: u32 = 10052;
+    pub const NFS4ERR_BAD_STATEID: u32 = 10025;
+    pub const NFS4ERR_DENIED: u32 = 10010;
 }
 
 /// NFSv4 session state.
@@ -56,15 +63,36 @@ struct Session {
     sequence_ids: Vec<u32>,
 }
 
+/// Stateid — identifies an open file or lock state.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct StateId([u8; 16]);
+
+/// Open file state.
+struct OpenState {
+    stateid: StateId,
+    file_handle: FileHandle,
+}
+
+/// Lock state.
+struct LockState {
+    lock_stateid: StateId,
+    offset: u64,
+    length: u64,
+    write: bool,
+}
+
 /// Per-connection NFSv4 COMPOUND state.
 struct CompoundState {
     current_fh: Option<FileHandle>,
+    current_stateid: Option<StateId>,
 }
 
-/// NFSv4 session manager — tracks active sessions and client IDs.
+/// NFSv4 session manager — tracks active sessions, stateids, and locks.
 pub struct SessionManager {
     next_client_id: Mutex<u64>,
     sessions: Mutex<HashMap<[u8; 16], Session>>,
+    open_files: Mutex<HashMap<StateId, OpenState>>,
+    locks: Mutex<Vec<LockState>>,
 }
 
 impl SessionManager {
@@ -72,7 +100,48 @@ impl SessionManager {
         Self {
             next_client_id: Mutex::new(1),
             sessions: Mutex::new(HashMap::new()),
+            open_files: Mutex::new(HashMap::new()),
+            locks: Mutex::new(Vec::new()),
         }
+    }
+
+    fn open_file(&self, fh: FileHandle) -> StateId {
+        let sid = StateId(*uuid::Uuid::new_v4().as_bytes());
+        self.open_files.lock().unwrap().insert(
+            sid,
+            OpenState {
+                stateid: sid,
+                file_handle: fh,
+            },
+        );
+        sid
+    }
+
+    fn close_file(&self, sid: &StateId) -> bool {
+        self.open_files.lock().unwrap().remove(sid).is_some()
+    }
+
+    fn is_open(&self, sid: &StateId) -> bool {
+        self.open_files.lock().unwrap().contains_key(sid)
+    }
+
+    fn add_lock(&self, sid: StateId, offset: u64, length: u64, write: bool) -> Result<StateId, ()> {
+        let mut locks = self.locks.lock().unwrap();
+        // Check for conflicting locks.
+        for lock in locks.iter() {
+            let overlaps = lock.offset < offset + length && offset < lock.offset + lock.length;
+            if overlaps && (write || lock.write) {
+                return Err(()); // Conflict
+            }
+        }
+        let lock_sid = StateId(*uuid::Uuid::new_v4().as_bytes());
+        locks.push(LockState {
+            lock_stateid: lock_sid,
+            offset,
+            length,
+            write,
+        });
+        Ok(lock_sid)
     }
 
     fn exchange_id(&self) -> u64 {
@@ -167,7 +236,10 @@ fn dispatch_compound<G: GatewayOps>(
 
     let mut op_results: Vec<Vec<u8>> = Vec::new();
     let mut compound_status = nfs4_status::NFS4_OK;
-    let mut state = CompoundState { current_fh: None };
+    let mut state = CompoundState {
+        current_fh: None,
+        current_stateid: None,
+    };
 
     for _ in 0..num_ops {
         let op_code = match reader.read_u32() {
@@ -214,8 +286,14 @@ fn process_op<G: GatewayOps>(
         op::PUTROOTFH => op_putrootfh(ctx, state),
         op::GETFH => op_getfh(state),
         op::GETATTR => op_getattr(reader, ctx, state),
+        op::LOOKUP => op_lookup(reader, ctx, state),
+        op::OPEN => op_open(reader, ctx, sessions, state),
+        op::CLOSE => op_close(reader, sessions, state),
+        op::LOCK => op_lock(reader, sessions, state),
         op::READ => op_read(reader, ctx, state),
         op::WRITE => op_write(reader, ctx, state),
+        op::REMOVE => op_remove(reader, ctx),
+        op::READDIR => op_readdir(ctx),
         op::IO_ADVISE => op_io_advise(reader),
         _ => {
             let mut w = XdrWriter::new();
@@ -482,6 +560,182 @@ fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_u32(1); // hints bitmap count
     w.write_u32(0); // no hints applied
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_open<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    sessions: &SessionManager,
+    state: &mut CompoundState,
+) -> (u32, Vec<u8>) {
+    // Simplified OPEN: seqid + share_access + share_deny + owner + openhow
+    let _seqid = reader.read_u32().unwrap_or(0);
+    let _share_access = reader.read_u32().unwrap_or(1); // READ
+    let _share_deny = reader.read_u32().unwrap_or(0); // NONE
+                                                      // Skip owner (clientid + opaque)
+    let _clientid = reader.read_u64().unwrap_or(0);
+    let _owner = reader.read_opaque().unwrap_or_default();
+    // openhow: opentype
+    let open_type = reader.read_u32().unwrap_or(0); // OPEN4_NOCREATE=0, OPEN4_CREATE=1
+    let name = reader.read_string().unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::OPEN);
+
+    if open_type == 1 {
+        // CREATE: write a new file.
+        match ctx.write_named(&name, Vec::new()) {
+            Ok((fh, _resp)) => {
+                let sid = sessions.open_file(fh);
+                state.current_fh = Some(fh);
+                state.current_stateid = Some(sid);
+                w.write_u32(nfs4_status::NFS4_OK);
+                w.write_opaque_fixed(&sid.0); // stateid
+                w.write_bool(false); // cinfo (not implemented)
+                w.write_u32(1); // rflags: OPEN4_RESULT_CONFIRM
+            }
+            Err(_) => {
+                w.write_u32(nfs4_status::NFS4ERR_IO);
+            }
+        }
+    } else {
+        // NOCREATE: open existing file by name.
+        match ctx.lookup_by_name(&name) {
+            Some((fh, _attrs)) => {
+                let sid = sessions.open_file(fh);
+                state.current_fh = Some(fh);
+                state.current_stateid = Some(sid);
+                w.write_u32(nfs4_status::NFS4_OK);
+                w.write_opaque_fixed(&sid.0);
+                w.write_bool(false);
+                w.write_u32(0);
+            }
+            None => {
+                w.write_u32(nfs4_status::NFS4ERR_NOENT);
+            }
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_close(
+    reader: &mut XdrReader<'_>,
+    sessions: &SessionManager,
+    state: &mut CompoundState,
+) -> (u32, Vec<u8>) {
+    let _seqid = reader.read_u32().unwrap_or(0);
+    let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::CLOSE);
+
+    if sid_bytes.len() == 16 {
+        let mut sid = [0u8; 16];
+        sid.copy_from_slice(&sid_bytes);
+        if sessions.close_file(&StateId(sid)) {
+            state.current_stateid = None;
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_opaque_fixed(&[0u8; 16]); // zeroed stateid (closed)
+        } else {
+            w.write_u32(nfs4_status::NFS4ERR_BAD_STATEID);
+        }
+    } else {
+        w.write_u32(nfs4_status::NFS4ERR_BAD_STATEID);
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_lock(
+    reader: &mut XdrReader<'_>,
+    sessions: &SessionManager,
+    state: &mut CompoundState,
+) -> (u32, Vec<u8>) {
+    let lock_type = reader.read_u32().unwrap_or(1); // READ_LT=1, WRITE_LT=2
+    let _reclaim = reader.read_bool().unwrap_or(false);
+    let offset = reader.read_u64().unwrap_or(0);
+    let length = reader.read_u64().unwrap_or(u64::MAX);
+    // Skip locker union (simplified).
+
+    let write = lock_type == 2 || lock_type == 4; // WRITE_LT or WRITEW_LT
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::LOCK);
+
+    let sid = state.current_stateid.unwrap_or(StateId([0; 16]));
+    match sessions.add_lock(sid, offset, length, write) {
+        Ok(lock_sid) => {
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_opaque_fixed(&lock_sid.0); // lock_stateid
+        }
+        Err(()) => {
+            w.write_u32(nfs4_status::NFS4ERR_DENIED);
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_lookup<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    state: &mut CompoundState,
+) -> (u32, Vec<u8>) {
+    let name = reader.read_string().unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::LOOKUP);
+
+    match ctx.lookup_by_name(&name) {
+        Some((fh, _attrs)) => {
+            state.current_fh = Some(fh);
+            w.write_u32(nfs4_status::NFS4_OK);
+        }
+        None => {
+            w.write_u32(nfs4_status::NFS4ERR_NOENT);
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_remove<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+    let name = reader.read_string().unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::REMOVE);
+
+    match ctx.remove_file(&name) {
+        Ok(()) => {
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_bool(false); // cinfo
+        }
+        Err(_) => {
+            w.write_u32(nfs4_status::NFS4ERR_NOENT);
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_readdir<G: GatewayOps>(ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+    let mut w = XdrWriter::new();
+    w.write_u32(op::READDIR);
+    w.write_u32(nfs4_status::NFS4_OK);
+    w.write_opaque_fixed(&[0u8; 8]); // cookieverf
+
+    let entries = ctx.readdir();
+    for (i, entry) in entries.iter().enumerate() {
+        w.write_bool(true); // entry follows
+        w.write_u64((i + 1) as u64); // cookie
+        w.write_string(&entry.name);
+        w.write_u32(0); // attrs bitmap count (empty)
+    }
+    w.write_bool(false); // no more
+    w.write_bool(true); // eof
 
     (nfs4_status::NFS4_OK, w.into_bytes())
 }

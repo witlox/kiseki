@@ -73,6 +73,7 @@ pub mod nfs3_server;
     clippy::manual_let_else,
     clippy::struct_field_names,
     clippy::unused_self,
+    unused_variables,
     dead_code
 )]
 pub mod nfs4_server;
