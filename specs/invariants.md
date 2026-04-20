@@ -32,6 +32,18 @@ domain expert unless marked otherwise.
 | I-C2b | A chunk is not GC'd while a retention hold is active, regardless of refcount. Retention hold must be set before crypto-shred to prevent GC race. Ordering: set hold → crypto-shred → hold expires → GC eligible. | Confirmed |
 | I-C3 | Chunks are placed according to affinity policy derived from the referencing composition's view descriptor. | Confirmed |
 | I-C4 | Chunk durability strategy is per affinity pool. EC is the default. Replication (N-copy) available for pools where EC overhead is unacceptable. Pool-level policy set by cluster admin. | Confirmed |
+| I-C5 | Pool writes are rejected when pool reaches Critical threshold (per-device-class: SSD 85%, HDD 92%). Pool redirection stays within same device class only. ENOSPC returned when pool is Full. | Confirmed |
+
+---
+
+## Device invariants
+
+| ID | Invariant | Status |
+|---|---|---|
+| I-D1 | Chunks on a failed device are automatically repaired from EC parity or replicas. Repair is triggered immediately on device failure detection. | Confirmed |
+| I-D2 | Device state transitions (Healthy → Degraded → Evacuating → Failed → Removed) are recorded in the audit log with timestamp, reason, and admin identity (if manual). | Confirmed |
+| I-D3 | Automatic evacuation is triggered when a device reports SMART wear >90% (SSD) or >100 bad sectors (HDD). Evacuation is background, cancellable by admin. | Confirmed |
+| I-D4 | EC fragments are placed across distinct physical devices within a pool via deterministic hashing (CRUSH-like). No two fragments of the same chunk on the same device. | Confirmed |
 
 ---
 

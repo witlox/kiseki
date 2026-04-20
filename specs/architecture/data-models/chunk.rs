@@ -46,11 +46,24 @@ pub struct AffinityPool {
 
 pub struct DeviceId(pub uuid::Uuid);
 
+/// Spec: ADR-024
 pub enum DeviceClass {
     NvmeU2,
     NvmeQlc,
     NvmePersistentMemory,
+    SsdSata,
+    HddEnterprise,
+    HddBulk,
     Custom(String),
+}
+
+/// Spec: ADR-024
+pub enum DeviceState {
+    Healthy,
+    Degraded { reason: String },
+    Evacuating { progress_percent: u8 },
+    Failed { since_epoch_ms: u64 },
+    Removed,
 }
 
 /// Spec: I-C4, ADR-005

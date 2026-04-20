@@ -141,9 +141,29 @@ impl AffinityPool {
 **Placement engine behavior**:
 - **Healthy**: Place chunks according to affinity policy
 - **Warning**: Continue placing but emit telemetry; cluster admin should add capacity
-- **Critical**: Reject new placements; redirect to sibling pools if available
+- **Critical**: Reject new placements; redirect to **same device-class sibling** only
 - **ReadOnly**: In-flight writes complete; new writes fail with retriable error
 - **Full**: ENOSPC — client gets permanent error
+
+**Pool redirection policy**: When a pool is Critical, the placement
+engine redirects to another pool of the **same device class** only.
+Never cross device-class boundaries (e.g., never NVMe → HDD).
+If no same-class sibling has capacity, return ENOSPC to client.
+This preserves performance SLAs and compliance tag enforcement.
+
+### System partition
+
+**OS-managed RAID-1** on 2× SSD. Kiseki does not manage the RAID.
+
+Kiseki monitors system partition health:
+1. On startup: check `/proc/mdstat` for RAID health
+2. If degraded → log WARNING, continue operating
+3. If both drives failed → log CRITICAL, refuse to start
+4. Periodic check every 60 seconds
+
+Admin is responsible for replacing failed system drives and
+rebuilding the RAID. Kiseki trusts the OS for system partition
+durability.
 
 ### Device health monitoring
 

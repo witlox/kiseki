@@ -32,22 +32,51 @@ Use **redb** v2 for all structured persistent storage.
 
 ### What redb does NOT handle
 
-**Chunk ciphertext data** is stored as files in pool directories:
+**Chunk ciphertext data** is stored in pool files (one large sparse file
+per device, not one file per chunk — avoids inode exhaustion at scale):
 ```
 $KISEKI_DATA_DIR/
   pools/
-    fast-nvme/
-      <chunk_id_hex>.enc    # 4KB-aligned encrypted blob
-    bulk-nvme/
-      <chunk_id_hex>.enc
+    fast-nvme-dev0.pool   # sparse file, grows to device capacity
+    fast-nvme-dev1.pool   # chunks stored at offsets within file
+    bulk-hdd-dev0.pool
   raft/
-    db.redb                 # redb database file
+    db.redb               # redb database file
 ```
 
-This separation is intentional:
-- redb is optimized for small key-value pairs (metadata)
-- Chunk blobs are large (64KB-64MB), benefit from direct file I/O
-- Future RDMA one-sided reads need file-level access (not DB pages)
+redb tracks chunk placement: `chunk_meta` table maps
+`chunk_id → (device_id, offset, size, fragment_index)`.
+
+**Why pool files, not per-chunk files**:
+- At 100TB / 64KB avg = 1.6B chunks → filesystem inode exhaustion
+- Pool files support O_DIRECT and RDMA pre-registration (single mmap region)
+- Chunks are 4KB-aligned within the pool file for NVMe block alignment
+- Pool file is sparse: only allocated regions consume disk space
+
+### EC fragment placement (CRUSH-like)
+
+Fragments placed across devices via deterministic hashing:
+```
+fn place_fragment(chunk_id, frag_idx, pool_devices) -> DeviceId {
+    // Ensure no two fragments on same device
+    let mut candidates = pool_devices.clone();
+    for prior in 0..frag_idx {
+        candidates.remove(placed[prior]);
+    }
+    candidates[hash(chunk_id, frag_idx) % candidates.len()]
+}
+```
+Deterministic — can recalculate placement without storing it.
+Reverse index `(device_id, chunk_id) → fragment_index` in redb
+enables efficient repair on device failure.
+
+### Raft snapshots
+
+- **Trigger**: Every 10,000 log entries
+- **Format**: `bincode::serialize(&state_machine_inner)`
+- **Storage**: redb `sm_snapshot` table, key = `"latest"`
+- **Restore**: Deserialize snapshot → replay log entries after snapshot index
+- **Log cleanup**: Truncate entries before snapshot index after snapshot
 
 ## Rationale
 
