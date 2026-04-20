@@ -1388,6 +1388,8 @@ name = "kiseki-composition"
 version = "0.0.0"
 dependencies = [
  "kiseki-common",
+ "kiseki-log",
+ "kiseki-view",
  "proptest",
  "thiserror 1.0.69",
  "uuid",
@@ -1525,6 +1527,7 @@ name = "kiseki-view"
 version = "0.0.0"
 dependencies = [
  "kiseki-common",
+ "kiseki-log",
  "proptest",
  "thiserror 1.0.69",
  "uuid",

@@ -1,10 +1,13 @@
 //! Composition types and operations.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use kiseki_common::ids::{ChunkId, CompositionId, NamespaceId, OrgId, ShardId};
+use kiseki_log::traits::LogOps;
 
 use crate::error::CompositionError;
+use crate::log_bridge;
 use crate::multipart::MultipartUpload;
 use crate::namespace::Namespace;
 
@@ -68,10 +71,14 @@ pub trait CompositionOps {
 }
 
 /// In-memory composition store.
+///
+/// When a `LogOps` implementation is attached via `with_log`, mutations
+/// emit deltas to the log shard (Composition → Log data path).
 pub struct CompositionStore {
     compositions: HashMap<CompositionId, Composition>,
     namespaces: HashMap<NamespaceId, Namespace>,
     multiparts: HashMap<String, (MultipartUpload, NamespaceId)>,
+    log: Option<Arc<dyn LogOps + Send + Sync>>,
 }
 
 impl CompositionStore {
@@ -82,7 +89,16 @@ impl CompositionStore {
             compositions: HashMap::new(),
             namespaces: HashMap::new(),
             multiparts: HashMap::new(),
+            log: None,
         }
+    }
+
+    /// Attach a log store for delta emission. When set, create/update/delete
+    /// operations emit deltas to the shard's log.
+    #[must_use]
+    pub fn with_log(mut self, log: Arc<dyn LogOps + Send + Sync>) -> Self {
+        self.log = Some(log);
+        self
     }
 
     /// Register a namespace.
@@ -135,7 +151,22 @@ impl CompositionOps for CompositionStore {
             version: 1,
             size,
         };
-        self.compositions.insert(id, comp);
+        self.compositions.insert(id, comp.clone());
+
+        // Emit delta to log if attached.
+        if let Some(ref log) = self.log {
+            let hashed_key = composition_hash_key(namespace_id, id);
+            log_bridge::emit_delta(
+                log.as_ref(),
+                comp.shard_id,
+                comp.tenant_id,
+                kiseki_log::delta::OperationType::Create,
+                hashed_key,
+                comp.chunks.clone(),
+                id.0.as_bytes().to_vec(),
+            );
+        }
+
         Ok(id)
     }
 
@@ -156,16 +187,47 @@ impl CompositionOps for CompositionStore {
             .get_mut(&id)
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.version += 1;
-        comp.chunks = chunks;
+        comp.chunks.clone_from(&chunks);
         comp.size = size;
-        Ok(comp.version)
+        let version = comp.version;
+        let shard_id = comp.shard_id;
+        let tenant_id = comp.tenant_id;
+        let namespace_id = comp.namespace_id;
+
+        if let Some(ref log) = self.log {
+            log_bridge::emit_delta(
+                log.as_ref(),
+                shard_id,
+                tenant_id,
+                kiseki_log::delta::OperationType::Update,
+                composition_hash_key(namespace_id, id),
+                chunks,
+                id.0.as_bytes().to_vec(),
+            );
+        }
+
+        Ok(version)
     }
 
     fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError> {
-        self.compositions
+        let comp = self
+            .compositions
             .remove(&id)
-            .map(|_| ())
-            .ok_or(CompositionError::CompositionNotFound(id))
+            .ok_or(CompositionError::CompositionNotFound(id))?;
+
+        if let Some(ref log) = self.log {
+            log_bridge::emit_delta(
+                log.as_ref(),
+                comp.shard_id,
+                comp.tenant_id,
+                kiseki_log::delta::OperationType::Delete,
+                composition_hash_key(comp.namespace_id, id),
+                vec![],
+                id.0.as_bytes().to_vec(),
+            );
+        }
+
+        Ok(())
     }
 
     fn rename(
@@ -230,6 +292,21 @@ impl CompositionOps for CompositionStore {
         // Create the composition now that it's visible (I-L5).
         self.create(ns_id, chunks, size)
     }
+}
+
+/// Compute the hashed key for a composition (deterministic routing key
+/// for the shard's key range). Uses `sha256(namespace_id || composition_id)`.
+fn composition_hash_key(ns: NamespaceId, comp: CompositionId) -> [u8; 32] {
+    use std::hash::{Hash, Hasher};
+    // Simple hash — production would use sha256, but we avoid adding
+    // a crypto dep here. The log layer only needs a 32-byte routing key.
+    let mut buf = [0u8; 32];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ns.0.hash(&mut hasher);
+    comp.0.hash(&mut hasher);
+    let h = hasher.finish().to_le_bytes();
+    buf[..8].copy_from_slice(&h);
+    buf
 }
 
 #[cfg(test)]

@@ -12,8 +12,11 @@ workspace = true
 
 [dependencies]
 kiseki-common = { path = "../kiseki-common" }
+kiseki-log = { path = "../kiseki-log" }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+kiseki-view = { path = "../kiseki-view" }
 proptest = { workspace = true }
+uuid = { workspace = true }

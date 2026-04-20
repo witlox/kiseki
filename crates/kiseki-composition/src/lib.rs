@@ -15,6 +15,7 @@
 
 pub mod composition;
 pub mod error;
+pub(crate) mod log_bridge;
 pub mod multipart;
 pub mod namespace;
 
