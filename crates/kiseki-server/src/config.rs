@@ -9,6 +9,8 @@ pub struct ServerConfig {
     pub data_addr: SocketAddr,
     /// Address for the advisory gRPC listener (isolated runtime).
     pub advisory_addr: SocketAddr,
+    /// S3 HTTP gateway address.
+    pub s3_addr: SocketAddr,
     /// TLS configuration paths (None = plaintext, for development only).
     pub tls: Option<TlsFiles>,
     /// Create a well-known bootstrap shard on startup (for e2e tests).
@@ -59,6 +61,11 @@ impl ServerConfig {
             _ => None,
         };
 
+        let s3_addr = std::env::var("KISEKI_S3_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:9000".into())
+            .parse()
+            .expect("invalid KISEKI_S3_ADDR");
+
         let bootstrap = std::env::var("KISEKI_BOOTSTRAP")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -66,6 +73,7 @@ impl ServerConfig {
         Self {
             data_addr,
             advisory_addr,
+            s3_addr,
             tls,
             bootstrap,
         }

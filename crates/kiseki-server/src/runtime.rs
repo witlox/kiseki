@@ -66,14 +66,48 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let _audit_store = kiseki_audit::AuditLog::new();
 
     // Chunk: in-memory store.
-    let _chunk_store = kiseki_chunk::ChunkStore::new();
+    let chunk_store = kiseki_chunk::ChunkStore::new();
 
     // Composition: wired to log for delta emission.
-    let _comp_store = kiseki_composition::composition::CompositionStore::new()
+    let mut comp_store = kiseki_composition::composition::CompositionStore::new()
         .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
 
     // View: in-memory store (stream processor polls from log_store).
     let _view_store = kiseki_view::view::ViewStore::new();
+
+    // Bootstrap namespace for S3 gateway (maps "default" bucket).
+    let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+    if cfg.bootstrap {
+        let bootstrap_ns = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            b"default",
+        ));
+        let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+        comp_store.add_namespace(kiseki_composition::namespace::Namespace {
+            id: bootstrap_ns,
+            tenant_id: bootstrap_tenant,
+            shard_id: bootstrap_shard,
+            read_only: false,
+        });
+        eprintln!("  bootstrap: namespace 'default' for S3 gateway");
+    }
+
+    // S3 gateway: wires composition + chunk + crypto.
+    let master_key =
+        kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
+    let gw = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key);
+    let s3_gw = kiseki_gateway::s3::S3Gateway::new(gw);
+    let s3_router = kiseki_gateway::s3_server::s3_router(s3_gw, bootstrap_tenant);
+
+    // Spawn S3 HTTP server.
+    let s3_addr = cfg.s3_addr;
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(s3_addr)
+            .await
+            .expect("S3 bind failed");
+        eprintln!("  S3 HTTP gateway listening on {s3_addr}");
+        axum::serve(listener, s3_router).await.ok();
+    });
 
     // --- gRPC services ---
 

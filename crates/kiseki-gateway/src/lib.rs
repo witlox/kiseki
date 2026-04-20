@@ -29,6 +29,9 @@ pub mod nfs;
 #[cfg(feature = "s3")]
 pub mod s3;
 
+#[cfg(feature = "s3")]
+pub mod s3_server;
+
 pub use error::GatewayError;
 pub use mem_gateway::InMemoryGateway;
 pub use ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};

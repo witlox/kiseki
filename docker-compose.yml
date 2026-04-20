@@ -12,11 +12,13 @@ services:
       context: .
       dockerfile: Dockerfile.server
     ports:
+      - "9000:9000"  # S3 HTTP gateway
       - "9100:9100"  # data-path gRPC
       - "9101:9101"  # advisory gRPC
     environment:
       KISEKI_DATA_ADDR: "0.0.0.0:9100"
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+      KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_BOOTSTRAP: "true"
     healthcheck:
       test: ["CMD-SHELL", "true"]  # TODO: grpc_health_probe

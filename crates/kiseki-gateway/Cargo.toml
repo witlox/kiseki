@@ -20,7 +20,10 @@ kiseki-common = { path = "../kiseki-common" }
 kiseki-chunk = { path = "../kiseki-chunk" }
 kiseki-composition = { path = "../kiseki-composition" }
 kiseki-crypto = { path = "../kiseki-crypto" }
+axum = "0.7"
 thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
