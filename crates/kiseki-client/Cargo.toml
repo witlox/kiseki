@@ -17,8 +17,13 @@ python = ["pyo3"]
 
 [dependencies]
 kiseki-common = { path = "../kiseki-common" }
+kiseki-gateway = { path = "../kiseki-gateway" }
 pyo3 = { version = "0.23", optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+kiseki-chunk = { path = "../kiseki-chunk" }
+kiseki-composition = { path = "../kiseki-composition" }
+kiseki-crypto = { path = "../kiseki-crypto" }
 proptest = { workspace = true }
+uuid = { workspace = true }

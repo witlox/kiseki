@@ -1384,10 +1384,15 @@ dependencies = [
 name = "kiseki-client"
 version = "0.0.0"
 dependencies = [
+ "kiseki-chunk",
  "kiseki-common",
+ "kiseki-composition",
+ "kiseki-crypto",
+ "kiseki-gateway",
  "proptest",
  "pyo3",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

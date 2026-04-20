@@ -14,6 +14,8 @@
 pub mod cache;
 pub mod discovery;
 pub mod error;
+#[allow(missing_docs)]
+pub mod fuse_fs;
 
 #[cfg(feature = "python")]
 pub mod python;
