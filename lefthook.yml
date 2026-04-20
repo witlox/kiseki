@@ -1,0 +1,24 @@
+# Lefthook pre-commit hooks for Kiseki.
+# Install: lefthook install
+
+pre-commit:
+  parallel: true
+  commands:
+    rust-fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+    rust-clippy:
+      glob: "*.rs"
+      run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::unwrap-used -A clippy::expect-used -A clippy::panic -A missing-docs
+    rust-test:
+      glob: "*.rs"
+      run: cargo test --workspace --all-targets
+    go-fmt:
+      glob: "*.go"
+      run: cd control && test -z "$(gofmt -s -d .)" || { gofmt -s -d .; exit 1; }
+    go-vet:
+      glob: "*.go"
+      run: cd control && go vet ./...
+    go-test:
+      glob: "*.go"
+      run: cd control && go test ./...

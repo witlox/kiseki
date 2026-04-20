@@ -1,0 +1,27 @@
+# Kiseki local development stack.
+#
+# Runs the data-path server (Rust) and control plane (Go) in containers.
+# No TLS — development only.
+#
+# Usage: docker compose up --build
+
+services:
+  kiseki-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "9100:9100"  # data-path gRPC
+      - "9101:9101"  # advisory gRPC
+    environment:
+      KISEKI_DATA_ADDR: "0.0.0.0:9100"
+      KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+
+  kiseki-control:
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    ports:
+      - "9200:9200"  # control-plane gRPC
+    environment:
+      KISEKI_CONTROL_ADDR: "0.0.0.0:9200"

@@ -1,0 +1,11 @@
+FROM rust:1.80 AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY specs/architecture/proto/ specs/architecture/proto/
+RUN cargo build --release --bin kiseki-server
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/kiseki-server /usr/local/bin/
+ENTRYPOINT ["kiseki-server"]

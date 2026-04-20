@@ -15,6 +15,9 @@ pub mod cache;
 pub mod discovery;
 pub mod error;
 
+#[cfg(feature = "python")]
+pub mod python;
+
 pub use cache::ClientCache;
 pub use discovery::{DiscoveryResponse, SeedEndpoint};
 pub use error::ClientError;

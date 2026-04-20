@@ -13,9 +13,11 @@ workspace = true
 [features]
 default = []
 fuse = []
+python = ["pyo3"]
 
 [dependencies]
 kiseki-common = { path = "../kiseki-common" }
+pyo3 = { version = "0.23", optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

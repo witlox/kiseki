@@ -1,0 +1,11 @@
+FROM golang:1.24 AS builder
+WORKDIR /src
+COPY control/ control/
+COPY specs/architecture/proto/ specs/architecture/proto/
+WORKDIR /src/control
+RUN go build -o /kiseki-control ./cmd/kiseki-control
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /kiseki-control /usr/local/bin/
+ENTRYPOINT ["kiseki-control"]

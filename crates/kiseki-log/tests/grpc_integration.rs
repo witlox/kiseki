@@ -1,4 +1,4 @@
-//! gRPC integration test: write a delta via LogService, read it back.
+//! gRPC integration test: write a delta via `LogService`, read it back.
 
 use std::sync::Arc;
 
