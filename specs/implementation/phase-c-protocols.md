@@ -61,54 +61,80 @@ Tenant derived from well-known bootstrap tenant (e2e) or future mTLS cert.
 
 ---
 
-## C.2: NFS Gateway (Medium risk)
+## C.2: NFS Gateway — NFSv3 + NFSv4.2 (Medium risk)
 
-No Rust NFSv4 server crate found in the ecosystem. Two options:
+Both NFSv3 (stateless, HPC ubiquity) and NFSv4.2 (sessions, IO_ADVISE,
+server-side copy). Core ops shared, wire format differs.
 
-**Option A**: Minimal NFSv3 over TCP using the `nfs3` wire format.
-NFSv3 is simpler than v4 (stateless, no COMPOUND), and Rust has
-basic XDR/RPC encoding via `onc-rpc` or hand-rolled.
+### Architecture
 
-**Option B**: Implement a minimal custom NFSv4.1 TCP handler with
-just READ/WRITE/LOOKUP/GETATTR/READDIR operations.
+```
+NFSv3 ONC RPC (:2049)  ──┐
+                          ├──→ nfs_ops.rs (shared) ──→ NfsGateway<GatewayOps>
+NFSv4.2 COMPOUND (:2049) ──┘
+         ↕
+    nfs_xdr.rs (XDR codec, shared)
+```
 
-**Recommended**: Option A — NFSv3 over TCP. Simpler protocol, maps
-cleanly to `NfsGateway::read`/`write`, clients can mount via
-`mount -t nfs -o nfsvers=3,tcp host:/export /mnt`.
+Version negotiated at mount time. Single port 2049, TCP only.
 
 ### Files
 
-| File | Action |
-|------|--------|
-| `crates/kiseki-gateway/Cargo.toml` | Add NFS wire format deps (or hand-roll XDR) |
-| `crates/kiseki-gateway/src/nfs_server.rs` | New: TCP listener + NFS RPC dispatcher |
-| `crates/kiseki-gateway/src/nfs_xdr.rs` | New: XDR encode/decode for NFS3 ops |
+| File | Purpose |
+|------|---------|
+| `crates/kiseki-gateway/src/nfs_xdr.rs` | XDR encode/decode (shared by v3+v4) |
+| `crates/kiseki-gateway/src/nfs_ops.rs` | Shared ops: lookup, read, write, getattr, readdir, create |
+| `crates/kiseki-gateway/src/nfs3_server.rs` | NFSv3 ONC RPC dispatcher (program 100003, version 3) |
+| `crates/kiseki-gateway/src/nfs4_server.rs` | NFSv4.2 COMPOUND dispatcher + session/lease state |
+| `crates/kiseki-gateway/src/nfs_server.rs` | TCP listener, version routing |
 | `crates/kiseki-server/src/config.rs` | Add `nfs_addr: SocketAddr` (default `:2049`) |
 | `crates/kiseki-server/src/runtime.rs` | Spawn NFS TCP server |
 | `docker-compose.yml` | Map port 2049 |
 
-### NFS ops (MVP)
+### Shared ops (both versions)
 
-| NFS3 Procedure | Maps to |
-|----------------|---------|
-| NULL | ping (no-op) |
-| GETATTR | composition metadata |
-| LOOKUP | namespace + path → filehandle |
-| READ | `NfsGateway::read` |
-| WRITE | `NfsGateway::write` |
-| READDIR | list compositions in namespace |
-| CREATE | `GatewayOps::write` (new file) |
+| Operation | NFSv3 proc | NFSv4.2 op | Maps to |
+|-----------|-----------|------------|---------|
+| Ping | NULL | — | no-op |
+| Read | READ | READ | `NfsGateway::read` |
+| Write | WRITE | WRITE | `NfsGateway::write` |
+| Lookup | LOOKUP | LOOKUP | namespace + path → filehandle |
+| Getattr | GETATTR | GETATTR | composition metadata |
+| Readdir | READDIR | READDIR | list compositions |
+| Create | CREATE | OPEN(create) | `GatewayOps::write` |
+| Remove | REMOVE | REMOVE | `CompositionOps::delete` |
+
+### NFSv4.2-specific ops (after NFSv3 works)
+
+| Op | Purpose | Kiseki mapping |
+|----|---------|----------------|
+| EXCHANGE_ID | Session setup | Tenant auth (mTLS cert) |
+| CREATE_SESSION | Session state | Per-client lease |
+| SEQUENCE | Request ordering | Slot/sequence validation |
+| IO_ADVISE | I/O hints | → Advisory subsystem (ADR-020) |
+| COPY | Server-side copy | Composition clone (no data movement) |
+| SEEK | Sparse file holes | Beyond MVP |
+
+### Implementation order
+
+1. **XDR codec** — shared encoder/decoder for basic XDR types
+2. **Shared ops** — file handle management, path resolution, stat
+3. **NFSv3 dispatcher** — ONC RPC framing + procedure dispatch
+4. **E2E test** — mount via NFSv3, write, read, ls
+5. **NFSv4.2 COMPOUND** — op-by-op dispatch, session management
+6. **NFSv4.2 extras** — IO_ADVISE → advisory, COPY → clone
 
 ### E2E tests
 
 | File | Tests |
 |------|-------|
-| `tests/e2e/test_nfs_gateway.py` | Mount + write + read + ls (via subprocess `mount` or NFS client lib) |
+| `tests/e2e/test_nfs_gateway.py` | NFSv3: mount + write + read + ls |
+| `tests/e2e/test_nfs4_gateway.py` | NFSv4.2: mount + write + read (after sessions) |
 
-**Risk mitigation**: If NFS wire format proves too complex, fall back
-to a gRPC-based "NFS-like" service with the same semantics, and
-add real NFS wire format later. The domain logic (NfsGateway) is
-already tested.
+### Risk mitigation
+
+NFSv3 ships first (simpler, covers HPC). NFSv4.2 COMPOUND follows.
+Domain logic (NfsGateway) is already tested independently.
 
 ---
 

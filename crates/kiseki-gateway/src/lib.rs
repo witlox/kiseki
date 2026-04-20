@@ -26,6 +26,51 @@ pub mod ops;
 #[cfg(feature = "nfs")]
 pub mod nfs;
 
+// NFS protocol implementation — internal wire format code.
+// Allows for protocol-specific patterns (casts, missing docs on XDR fields).
+#[cfg(feature = "nfs")]
+#[allow(
+    missing_docs,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::doc_markdown,
+    clippy::unreadable_literal,
+    clippy::needless_pass_by_value,
+    clippy::unwrap_used
+)]
+pub mod nfs3_server;
+
+#[cfg(feature = "nfs")]
+#[allow(
+    missing_docs,
+    clippy::doc_markdown,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
+    clippy::needless_pass_by_value,
+    clippy::unwrap_used
+)]
+pub mod nfs_ops;
+
+#[cfg(feature = "nfs")]
+#[allow(missing_docs, clippy::doc_markdown, clippy::unwrap_used)]
+pub mod nfs_server;
+
+#[cfg(feature = "nfs")]
+#[allow(
+    missing_docs,
+    clippy::doc_markdown,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap
+)]
+pub mod nfs_xdr;
+
 #[cfg(feature = "s3")]
 pub mod s3;
 
