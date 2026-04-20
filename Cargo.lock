@@ -1438,15 +1438,19 @@ name = "kiseki-gateway"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "hyper",
+ "hyper-util",
  "kiseki-chunk",
  "kiseki-common",
  "kiseki-composition",
  "kiseki-crypto",
  "kiseki-transport",
  "proptest",
+ "rustls",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
+ "tower 0.5.3",
  "uuid",
 ]
 

@@ -135,29 +135,57 @@ fn namespace_from_bucket(bucket: &str) -> NamespaceId {
     ))
 }
 
-/// Start the S3 HTTP server.
+/// Start the S3 HTTP server with optional mTLS.
 ///
-/// Currently plaintext only. When mTLS is needed, wrap the listener
-/// with `tokio_rustls::TlsAcceptor` built from
-/// `kiseki_transport::TlsConfig::server_config()`.
+/// When `tls_config` is `Some`, requires mTLS client certs. When
+/// `None`, serves plaintext (development only).
 #[allow(clippy::expect_used)]
-pub async fn run_s3_server(addr: SocketAddr, router: Router, use_tls: bool) {
+pub async fn run_s3_server(
+    addr: SocketAddr,
+    router: Router,
+    tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
+) {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("S3 bind failed");
 
-    if use_tls {
-        // D-ADV-2: Do NOT silently fall back to plaintext.
-        // TODO: Accept rustls::ServerConfig, wrap listener with TlsAcceptor.
-        eprintln!(
-            "  ERROR: S3 TLS requested but not yet implemented — refusing to start in plaintext"
-        );
-        eprintln!(
-            "  Set KISEKI_CA_PATH/CERT_PATH/KEY_PATH to empty or remove to use plaintext mode"
-        );
-        return;
-    }
+    if let Some(tls) = tls_config {
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+        eprintln!("  S3 HTTP gateway listening on {addr} (mTLS)");
 
-    eprintln!("  WARNING: S3 HTTP gateway listening on {addr} (PLAINTEXT — development only)");
-    axum::serve(listener, router).await.ok();
+        loop {
+            let (tcp_stream, _peer) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  S3 accept error: {e}");
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            let router = router.clone();
+            tokio::spawn(async move {
+                match acceptor.accept(tcp_stream).await {
+                    Ok(tls_stream) => {
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        let svc =
+                            hyper_util::service::TowerToHyperService::new(router.into_service());
+                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(io, svc)
+                        .await
+                        {
+                            eprintln!("  S3 connection error: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  S3 TLS handshake failed: {e}");
+                    }
+                }
+            });
+        }
+    } else {
+        eprintln!("  WARNING: S3 HTTP gateway listening on {addr} (PLAINTEXT — development only)");
+        axum::serve(listener, router).await.ok();
+    }
 }

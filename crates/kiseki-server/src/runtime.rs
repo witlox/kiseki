@@ -125,9 +125,16 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&gw));
     let s3_router = kiseki_gateway::s3_server::s3_router(s3_gw, bootstrap_tenant);
     let s3_addr = cfg.s3_addr;
-    let s3_use_tls = cfg.tls.is_some();
+    let s3_tls = cfg.tls.as_ref().and_then(|files| {
+        let ca = std::fs::read(&files.ca_path).ok()?;
+        let cert = std::fs::read(&files.cert_path).ok()?;
+        let key = std::fs::read(&files.key_path).ok()?;
+        kiseki_transport::TlsConfig::server_config(&ca, &cert, &key)
+            .map(Arc::new)
+            .ok()
+    });
     tokio::spawn(async move {
-        kiseki_gateway::s3_server::run_s3_server(s3_addr, s3_router, s3_use_tls).await;
+        kiseki_gateway::s3_server::run_s3_server(s3_addr, s3_router, s3_tls).await;
     });
 
     // NFS gateway (NFSv3 + NFSv4.2 on port 2049).
