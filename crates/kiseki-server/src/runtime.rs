@@ -46,19 +46,41 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         key_store.health().current_epoch.unwrap_or(0)
     );
 
-    // Log: in-memory store, shared across composition and view.
-    let log_store = Arc::new(kiseki_log::MemShardStore::new());
+    // Log store: persistent (redb) if KISEKI_DATA_DIR set, otherwise in-memory.
+    let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+    let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
 
-    // Bootstrap: create a well-known shard for e2e testing.
+    let log_store: Arc<dyn kiseki_log::LogOps + Send + Sync> = if let Some(ref dir) = cfg.data_dir {
+        std::fs::create_dir_all(dir.join("raft")).ok();
+        let store = kiseki_log::persistent_store::PersistentShardStore::open(
+            &dir.join("raft").join("log.redb"),
+        )
+        .map_err(|e| format!("persistent store: {e}"))?;
+        if cfg.bootstrap {
+            store.create_shard(
+                bootstrap_shard,
+                bootstrap_tenant,
+                kiseki_common::ids::NodeId(1),
+                kiseki_log::ShardConfig::default(),
+            );
+        }
+        eprintln!("  log store: persistent (redb at {})", dir.display());
+        Arc::new(store)
+    } else {
+        let store = kiseki_log::MemShardStore::new();
+        if cfg.bootstrap {
+            store.create_shard(
+                bootstrap_shard,
+                bootstrap_tenant,
+                kiseki_common::ids::NodeId(1),
+                kiseki_log::ShardConfig::default(),
+            );
+        }
+        eprintln!("  log store: in-memory (no persistence)");
+        Arc::new(store)
+    };
+
     if cfg.bootstrap {
-        let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
-        let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
-        log_store.create_shard(
-            bootstrap_shard,
-            bootstrap_tenant,
-            kiseki_common::ids::NodeId(1),
-            kiseki_log::ShardConfig::default(),
-        );
         eprintln!(
             "  bootstrap: shard {} for tenant {}",
             bootstrap_shard.0, bootstrap_tenant.0

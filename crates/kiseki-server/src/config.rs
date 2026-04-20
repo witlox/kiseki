@@ -15,6 +15,8 @@ pub struct ServerConfig {
     pub nfs_addr: SocketAddr,
     /// TLS configuration paths (None = plaintext, for development only).
     pub tls: Option<TlsFiles>,
+    /// Data directory for persistent storage (redb). None = in-memory only.
+    pub data_dir: Option<std::path::PathBuf>,
     /// Create a well-known bootstrap shard on startup (for e2e tests).
     pub bootstrap: bool,
 }
@@ -73,6 +75,10 @@ impl ServerConfig {
             .parse()
             .expect("invalid KISEKI_NFS_ADDR");
 
+        let data_dir = std::env::var("KISEKI_DATA_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
+
         let bootstrap = std::env::var("KISEKI_BOOTSTRAP")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -83,6 +89,7 @@ impl ServerConfig {
             s3_addr,
             nfs_addr,
             tls,
+            data_dir,
             bootstrap,
         }
     }

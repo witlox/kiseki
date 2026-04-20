@@ -21,7 +21,10 @@ services:
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
       KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
+      KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "true"
+    volumes:
+      - kiseki-data:/data
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null"]
       interval: 2s
@@ -36,3 +39,6 @@ services:
       - "9200:9200"  # control-plane gRPC
     environment:
       KISEKI_CONTROL_ADDR: "0.0.0.0:9200"
+
+volumes:
+  kiseki-data:

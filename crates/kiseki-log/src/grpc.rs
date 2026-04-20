@@ -16,14 +16,14 @@ use crate::error::LogError;
 use crate::traits::LogOps;
 
 /// gRPC handler wrapping a `LogOps` implementation.
-pub struct LogGrpc<T: LogOps> {
-    ops: std::sync::Arc<T>,
+pub struct LogGrpc {
+    ops: std::sync::Arc<dyn LogOps + Send + Sync>,
 }
 
-impl<T: LogOps> LogGrpc<T> {
+impl LogGrpc {
     /// Create a new gRPC handler.
     #[must_use]
-    pub fn new(ops: std::sync::Arc<T>) -> Self {
+    pub fn new(ops: std::sync::Arc<dyn LogOps + Send + Sync>) -> Self {
         Self { ops }
     }
 }
@@ -194,7 +194,7 @@ pub fn auth_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
     Ok(req)
 }
 #[tonic::async_trait]
-impl<T: LogOps + Send + Sync + 'static> LogService for LogGrpc<T> {
+impl LogService for LogGrpc {
     async fn append_delta(
         &self,
         request: Request<ProtoAppendReq>,

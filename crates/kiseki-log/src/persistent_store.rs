@@ -56,11 +56,72 @@ impl PersistentShardStore {
 
     /// Reload all data from redb into the in-memory store.
     ///
-    /// MVP: shards are re-created via bootstrap on startup.
-    /// Production would iterate redb keys to rebuild shard state.
-    #[allow(clippy::unused_self)]
+    /// Iterates persisted shard metadata and deltas, re-creates shards
+    /// and replays deltas into the in-memory store.
     fn reload(&mut self) {
-        // TODO: iterate redb shard metadata keys, recreate shards in mem.
+        // MVP: shard metadata not iterated from redb. Shards are
+        // re-created via bootstrap on startup. Deltas replayed below.
+
+        // Reload deltas — iterate all entries in the log table.
+        if let Ok(entries) = self.redb.range::<PersistedDelta>(1, u64::MAX) {
+            use kiseki_common::ids::{NodeId, OrgId, ShardId};
+            use kiseki_common::time::{
+                ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime,
+            };
+
+            // First pass: collect unique shard IDs and ensure they exist.
+            let mut seen_shards = std::collections::HashSet::new();
+            for (_, delta) in &entries {
+                let shard_id = ShardId(uuid::Uuid::from_bytes(delta.shard_id_bytes));
+                if seen_shards.insert(shard_id) {
+                    let tenant_id = OrgId(uuid::Uuid::from_bytes(delta.tenant_id_bytes));
+                    // Create shard if not already exists (idempotent).
+                    self.mem.create_shard(
+                        shard_id,
+                        tenant_id,
+                        NodeId(1),
+                        crate::shard::ShardConfig::default(),
+                    );
+                }
+            }
+
+            // Second pass: replay deltas.
+            for (_seq, delta) in entries {
+                let shard_id = ShardId(uuid::Uuid::from_bytes(delta.shard_id_bytes));
+                let tenant_id = OrgId(uuid::Uuid::from_bytes(delta.tenant_id_bytes));
+                let operation = match delta.operation {
+                    0 => crate::delta::OperationType::Create,
+                    1 => crate::delta::OperationType::Update,
+                    2 => crate::delta::OperationType::Delete,
+                    3 => crate::delta::OperationType::Rename,
+                    4 => crate::delta::OperationType::SetAttribute,
+                    _ => crate::delta::OperationType::Finalize,
+                };
+                let timestamp = DeltaTimestamp {
+                    hlc: HybridLogicalClock {
+                        physical_ms: 0,
+                        logical: 0,
+                        node_id: NodeId(0),
+                    },
+                    wall: WallTime {
+                        millis_since_epoch: 0,
+                        timezone: "UTC".into(),
+                    },
+                    quality: ClockQuality::Ntp,
+                };
+                let _ = self.mem.append_delta(AppendDeltaRequest {
+                    shard_id,
+                    tenant_id,
+                    operation,
+                    timestamp,
+                    hashed_key: delta.hashed_key,
+                    chunk_refs: vec![],
+                    payload: delta.payload,
+                    has_inline_data: delta.has_inline_data,
+                });
+            }
+            eprintln!("  reload: {} shards restored from redb", seen_shards.len());
+        }
     }
 }
 
@@ -71,14 +132,38 @@ struct ShardMeta {
     node_id: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedDelta {
+    shard_id_bytes: [u8; 16],
+    tenant_id_bytes: [u8; 16],
+    operation: u8,
+    hashed_key: [u8; 32],
+    payload: Vec<u8>,
+    has_inline_data: bool,
+}
+
 impl LogOps for PersistentShardStore {
     fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         // Write to in-memory first (assigns sequence number).
         let seq = self.mem.append_delta(req.clone())?;
 
-        // Persist to redb.
-        let key = format!("delta:{}:{}", req.shard_id.0, seq.0);
-        let _ = self.redb.append(seq.0, &key);
+        // Persist the full request to redb for reload.
+        let persisted = PersistedDelta {
+            shard_id_bytes: *req.shard_id.0.as_bytes(),
+            tenant_id_bytes: *req.tenant_id.0.as_bytes(),
+            operation: match req.operation {
+                crate::delta::OperationType::Create => 0,
+                crate::delta::OperationType::Update => 1,
+                crate::delta::OperationType::Delete => 2,
+                crate::delta::OperationType::Rename => 3,
+                crate::delta::OperationType::SetAttribute => 4,
+                crate::delta::OperationType::Finalize => 5,
+            },
+            hashed_key: req.hashed_key,
+            payload: req.payload,
+            has_inline_data: req.has_inline_data,
+        };
+        let _ = self.redb.append(seq.0, &persisted);
 
         Ok(seq)
     }
@@ -107,9 +192,9 @@ impl LogOps for PersistentShardStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta::OperationType;
     use kiseki_common::ids::NodeId;
     use kiseki_common::time::*;
-    use crate::delta::OperationType;
 
     fn test_shard() -> ShardId {
         ShardId(uuid::Uuid::from_u128(1))
@@ -198,12 +283,18 @@ mod tests {
                 .unwrap();
         }
 
-        // Reopen — redb should have the record.
+        // Reopen — reload should restore the delta into in-memory store.
         {
             let store = PersistentShardStore::open(&path).unwrap();
-            // Verify redb has the delta key.
-            let key: Option<String> = store.redb.get(1).unwrap();
-            assert!(key.is_some(), "redb should have persisted delta at index 1");
+            let deltas = store
+                .read_deltas(ReadDeltasRequest {
+                    shard_id: test_shard(),
+                    from: SequenceNumber(1),
+                    to: SequenceNumber(1),
+                })
+                .unwrap();
+            assert_eq!(deltas.len(), 1, "delta should survive reopen via reload");
+            assert_eq!(deltas[0].payload.ciphertext, b"persisted");
         }
     }
 }

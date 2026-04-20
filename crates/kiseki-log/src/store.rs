@@ -69,15 +69,13 @@ impl MemShardStore {
             .shards
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        shards.insert(
-            shard_id,
-            MemShard {
-                info,
-                deltas: Vec::new(),
-                watermarks: ConsumerWatermarks::new(),
-                gc_floor: SequenceNumber(0),
-            },
-        );
+        // Idempotent: don't overwrite if shard already exists (e.g., restored from redb).
+        shards.entry(shard_id).or_insert(MemShard {
+            info,
+            deltas: Vec::new(),
+            watermarks: ConsumerWatermarks::new(),
+            gc_floor: SequenceNumber(0),
+        });
     }
 
     /// Register a consumer on a shard's watermark tracker.
