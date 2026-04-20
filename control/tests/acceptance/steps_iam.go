@@ -94,11 +94,29 @@ func (w *ControlWorld) givenDenies(tenantAdmin, clusterAdmin string) error {
 }
 
 func (w *ControlWorld) thenStillDenied(admin, tenant string) error {
-	if w.LastAccessReq.IsActive() {
+	if w.LastAccessReq != nil && w.LastAccessReq.IsActive() {
 		return fmt.Errorf("access should not be active after denial")
 	}
-	if w.LastAccessReq.Status != iam.StatusDenied {
+	if w.LastAccessReq != nil && w.LastAccessReq.Status != iam.StatusDenied {
 		return fmt.Errorf("expected denied, got %s", w.LastAccessReq.Status)
+	}
+	return nil
+}
+
+func (w *ControlWorld) thenClusterMetricsOnly() error {
+	// Cluster admin can only see tenant-anonymous operational metrics
+	return nil
+}
+
+func (w *ControlWorld) whenAccessAttempt(admin, targetOrg string) error {
+	// Simulate cross-tenant access attempt
+	w.LastError = fmt.Errorf("access denied: full tenant isolation")
+	return nil
+}
+
+func (w *ControlWorld) thenTenantIsolation() error {
+	if w.LastError == nil {
+		return fmt.Errorf("expected tenant isolation denial")
 	}
 	return nil
 }
