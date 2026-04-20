@@ -16,6 +16,7 @@
 )]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use cucumber::World;
 use kiseki_advisory::budget::{BudgetConfig, BudgetEnforcer};
@@ -44,7 +45,7 @@ mod steps;
 #[world(init = Self::new)]
 pub struct KisekiWorld {
     // === Real implementations (in-memory stores) ===
-    pub log_store: MemShardStore,
+    pub log_store: Arc<MemShardStore>,
     pub key_store: MemKeyStore,
     pub audit_log: AuditLog,
     pub chunk_store: ChunkStore,
@@ -87,12 +88,15 @@ impl std::fmt::Debug for KisekiWorld {
 impl KisekiWorld {
     fn new() -> Self {
         let key_store = MemKeyStore::new().unwrap_or_else(|_| MemKeyStore::default());
+        let log_store = Arc::new(MemShardStore::new());
+        let comp_store = CompositionStore::new()
+            .with_log(Arc::clone(&log_store) as Arc<dyn LogOps + Send + Sync>);
         Self {
-            log_store: MemShardStore::new(),
+            log_store,
             key_store,
             audit_log: AuditLog::new(),
             chunk_store: ChunkStore::new(),
-            comp_store: CompositionStore::new(),
+            comp_store,
             view_store: ViewStore::new(),
             advisory_table: WorkflowTable::new(),
             budget_enforcer: BudgetEnforcer::new(BudgetConfig {
@@ -179,6 +183,16 @@ impl KisekiWorld {
             },
             quality: ClockQuality::Ntp,
         }
+    }
+
+    /// Run the stream processor to advance all tracked views from the log.
+    pub fn poll_views(&mut self) {
+        use kiseki_view::stream_processor::TrackedStreamProcessor;
+        let mut proc = TrackedStreamProcessor::new(self.log_store.as_ref(), &mut self.view_store);
+        for &view_id in self.view_ids.values() {
+            proc.track(view_id);
+        }
+        proc.poll(1000);
     }
 
     /// Make a standard append request.

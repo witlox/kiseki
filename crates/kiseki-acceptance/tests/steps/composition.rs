@@ -6,6 +6,7 @@ use kiseki_common::ids::*;
 use kiseki_composition::composition::{CompositionOps, CompositionStore};
 use kiseki_composition::error::CompositionError;
 use kiseki_composition::namespace::Namespace;
+use kiseki_log::traits::{LogOps, ReadDeltasRequest};
 
 // === Scenario: Create composition ===
 
@@ -31,6 +32,23 @@ async fn when_create(w: &mut KisekiWorld, ns: String) {
 #[then("the composition is created successfully")]
 async fn then_created(w: &mut KisekiWorld) {
     assert!(w.last_composition_id.is_some(), "error: {:?}", w.last_error);
+
+    // Cross-context: verify a Create delta was emitted to the log.
+    let comp = w.comp_store.get(w.last_composition_id.unwrap()).unwrap();
+    let deltas = w
+        .log_store
+        .read_deltas(ReadDeltasRequest {
+            shard_id: comp.shard_id,
+            from: SequenceNumber(1),
+            to: SequenceNumber(u64::MAX),
+        })
+        .unwrap();
+    assert!(
+        deltas
+            .iter()
+            .any(|d| d.header.operation == kiseki_log::delta::OperationType::Create),
+        "composition create should emit a Create delta to the log"
+    );
 }
 
 // === Scenario: Delete ===
@@ -49,6 +67,26 @@ async fn when_delete(w: &mut KisekiWorld) {
 async fn then_gone(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         assert!(w.comp_store.get(id).is_err());
+
+        // Cross-context: verify a Delete delta was emitted to the log.
+        // We check all shards since the composition is already gone.
+        for &shard_id in w.shard_names.values() {
+            let deltas = w
+                .log_store
+                .read_deltas(ReadDeltasRequest {
+                    shard_id,
+                    from: SequenceNumber(1),
+                    to: SequenceNumber(u64::MAX),
+                })
+                .unwrap_or_default();
+            if deltas
+                .iter()
+                .any(|d| d.header.operation == kiseki_log::delta::OperationType::Delete)
+            {
+                return; // found it
+            }
+        }
+        panic!("composition delete should emit a Delete delta to the log");
     }
 }
 
@@ -144,6 +182,26 @@ async fn when_update(w: &mut KisekiWorld) {
 #[then(regex = r#"^the version is incremented to (\d+)$"#)]
 async fn then_version(w: &mut KisekiWorld, expected: u64) {
     assert_eq!(w.last_epoch, Some(expected));
+
+    // Cross-context: verify an Update delta was emitted.
+    if let Some(comp_id) = w.last_composition_id {
+        if let Ok(comp) = w.comp_store.get(comp_id) {
+            let deltas = w
+                .log_store
+                .read_deltas(ReadDeltasRequest {
+                    shard_id: comp.shard_id,
+                    from: SequenceNumber(1),
+                    to: SequenceNumber(u64::MAX),
+                })
+                .unwrap_or_default();
+            assert!(
+                deltas
+                    .iter()
+                    .any(|d| d.header.operation == kiseki_log::delta::OperationType::Update),
+                "composition version update should emit an Update delta"
+            );
+        }
+    }
 }
 
 // === When: Composition context processes the create (DataTable) ===
