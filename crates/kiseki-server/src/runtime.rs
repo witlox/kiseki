@@ -43,7 +43,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         key_store.health().current_epoch.unwrap_or(0)
     );
 
-    // Log: in-memory store (Raft integration will replace).
+    // Log: in-memory store, shared across composition and view.
     let log_store = Arc::new(kiseki_log::MemShardStore::new());
 
     // Audit: in-memory store.
@@ -52,10 +52,11 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // Chunk: in-memory store.
     let _chunk_store = kiseki_chunk::ChunkStore::new();
 
-    // Composition: in-memory store.
-    let _comp_store = kiseki_composition::composition::CompositionStore::new();
+    // Composition: wired to log for delta emission.
+    let _comp_store = kiseki_composition::composition::CompositionStore::new()
+        .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
 
-    // View: in-memory store.
+    // View: in-memory store (stream processor polls from log_store).
     let _view_store = kiseki_view::view::ViewStore::new();
 
     // --- gRPC services ---
