@@ -117,6 +117,15 @@ impl CompositionStore {
     pub fn count(&self) -> usize {
         self.compositions.len()
     }
+
+    /// List all compositions in a namespace.
+    #[must_use]
+    pub fn list_by_namespace(&self, ns_id: NamespaceId) -> Vec<&Composition> {
+        self.compositions
+            .values()
+            .filter(|c| c.namespace_id == ns_id)
+            .collect()
+    }
 }
 
 impl Default for CompositionStore {

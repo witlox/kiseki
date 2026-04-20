@@ -35,6 +35,7 @@ pub fn s3_router<G: GatewayOps + Send + Sync + 'static>(
     let state = Arc::new(S3State { gateway, tenant_id });
 
     Router::new()
+        .route("/:bucket", get(list_objects::<G>))
         .route("/:bucket/:key", put(put_object::<G>))
         .route("/:bucket/:key", get(get_object::<G>))
         .route("/:bucket/:key", head(head_object::<G>))
@@ -125,6 +126,34 @@ async fn delete_object<G: GatewayOps + Send + Sync + 'static>(
 ) -> impl IntoResponse {
     // TODO: wire to CompositionOps::delete
     StatusCode::NO_CONTENT
+}
+
+async fn list_objects<G: GatewayOps + Send + Sync + 'static>(
+    State(state): State<Arc<S3State<G>>>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    let ns_id = namespace_from_bucket(&bucket);
+    match state.gateway.list_objects(state.tenant_id, ns_id) {
+        Ok(objects) => {
+            // Simple JSON response (not XML like real S3, but functional).
+            let items: Vec<serde_json::Value> = objects
+                .iter()
+                .map(|(id, size)| {
+                    serde_json::json!({
+                        "key": id.0.to_string(),
+                        "size": size,
+                    })
+                })
+                .collect();
+            let body = serde_json::json!({
+                "contents": items,
+                "key_count": items.len(),
+                "is_truncated": false,
+            });
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Map S3 bucket name to a deterministic `NamespaceId`.

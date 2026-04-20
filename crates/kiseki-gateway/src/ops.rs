@@ -59,6 +59,17 @@ pub trait GatewayOps {
 
     /// Write data to a composition (encrypt plaintext from client → store).
     fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
+
+    /// List compositions in a namespace. Returns `(composition_id, size)` pairs.
+    fn list(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<(CompositionId, u64)>, GatewayError> {
+        // Default: empty list (override in implementations that support it).
+        let _ = (tenant_id, namespace_id);
+        Ok(Vec::new())
+    }
 }
 
 /// Blanket impl: `Arc<G>` delegates to `G` via deref.
@@ -68,5 +79,12 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
     }
     fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         (**self).write(req)
+    }
+    fn list(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<(CompositionId, u64)>, GatewayError> {
+        (**self).list(tenant_id, namespace_id)
     }
 }

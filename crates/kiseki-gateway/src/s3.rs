@@ -87,4 +87,13 @@ impl<G: GatewayOps> S3Gateway<G> {
             etag: write_resp.composition_id.0.to_string(),
         })
     }
+
+    /// S3 `ListObjectsV2` — lists objects in a bucket.
+    pub fn list_objects(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<(CompositionId, u64)>, GatewayError> {
+        self.inner.list(tenant_id, namespace_id)
+    }
 }

@@ -1448,6 +1448,7 @@ dependencies = [
  "kiseki-view",
  "proptest",
  "rustls",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",

@@ -55,6 +55,22 @@ impl InMemoryGateway {
         }
     }
 
+    /// List compositions in a namespace (for S3 `ListObjectsV2`).
+    pub fn list_compositions(
+        &self,
+        ns_id: kiseki_common::ids::NamespaceId,
+    ) -> Vec<(kiseki_common::ids::CompositionId, u64)> {
+        let compositions = self
+            .compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        compositions
+            .list_by_namespace(ns_id)
+            .into_iter()
+            .map(|c| (c.id, c.size))
+            .collect()
+    }
+
     /// Attach a shared view store for staleness enforcement (I-K9).
     #[must_use]
     pub fn with_view_store(mut self, vs: Arc<Mutex<ViewStore>>) -> Self {
@@ -181,5 +197,13 @@ impl GatewayOps for InMemoryGateway {
             composition_id: comp_id,
             bytes_written,
         })
+    }
+
+    fn list(
+        &self,
+        _tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+    ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
+        Ok(self.list_compositions(namespace_id))
     }
 }
