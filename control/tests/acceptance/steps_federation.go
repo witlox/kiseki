@@ -47,7 +47,16 @@ func (w *ControlWorld) thenDataCiphertextOnly() error {
 }
 
 func (w *ControlWorld) thenSameKMS() error {
-	// KMS configuration is implicit
+	// Both sites connect to the same tenant KMS — verify peers are connected
+	peers := w.FederationReg.ListPeers()
+	if len(peers) == 0 {
+		return fmt.Errorf("expected federation peers for KMS sharing")
+	}
+	for _, p := range peers {
+		if !p.Connected {
+			return fmt.Errorf("peer %s not connected — cannot share KMS", p.SiteID)
+		}
+	}
 	return nil
 }
 
@@ -87,6 +96,17 @@ func (w *ControlWorld) thenReplicationBlocked() error {
 
 func (w *ControlWorld) thenOnlyUnconstrainedReplicates() error {
 	// Data without residency constraints replicates normally
+	// Verify the constrained replication was blocked (LastError set)
+	if w.LastError == nil {
+		return fmt.Errorf("expected constrained replication to be blocked")
+	}
+	// Verify peers are still connected (unconstrained data can flow)
+	peers := w.FederationReg.ListPeers()
+	for _, p := range peers {
+		if !p.Connected {
+			return fmt.Errorf("peer %s disconnected — unconstrained replication would fail", p.SiteID)
+		}
+	}
 	return nil
 }
 
@@ -122,7 +142,10 @@ func (w *ControlWorld) thenConfigReplicatesToSite(siteB string) error {
 }
 
 func (w *ControlWorld) thenSiteEnforcesNewQuota(site string) error {
-	// After async sync, the new quota is enforced
+	// After async sync, the new quota is enforced at the remote site
+	if !w.FederationReg.IsConnected(site) {
+		return fmt.Errorf("site %s not connected — cannot enforce replicated quota", site)
+	}
 	return nil
 }
 

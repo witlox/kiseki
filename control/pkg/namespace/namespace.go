@@ -29,6 +29,7 @@ type Store struct {
 	mu         sync.RWMutex
 	namespaces map[string]*Namespace
 	shardSeq   int
+	readOnly   bool
 }
 
 // NewStore creates an empty namespace store.
@@ -39,9 +40,13 @@ func NewStore() *Store {
 }
 
 // Create creates a new namespace, assigning a shard automatically.
+// Returns an error if the store is in read-only mode (maintenance).
 func (s *Store) Create(ns *Namespace) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.readOnly {
+		return fmt.Errorf("store is read-only: writes rejected (retriable)")
+	}
 	if _, exists := s.namespaces[ns.ID]; exists {
 		return fmt.Errorf("namespace %s already exists", ns.ID)
 	}
@@ -64,10 +69,11 @@ func (s *Store) Get(id string) (*Namespace, error) {
 	return ns, nil
 }
 
-// SetReadOnly sets the read-only flag on all namespaces.
+// SetReadOnly sets the read-only flag on the store and all namespaces.
 func (s *Store) SetReadOnly(readOnly bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.readOnly = readOnly
 	for _, ns := range s.namespaces {
 		ns.ReadOnly = readOnly
 	}

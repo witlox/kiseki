@@ -14,7 +14,7 @@ func TestFeatures(t *testing.T) {
 			Format:   "pretty",
 			Paths:    []string{"../../../specs/features/control-plane.feature"},
 			Output:   os.Stdout,
-			Strict:   false, // Allow undefined steps (shows as pending)
+			Strict:   true, // Pending/undefined steps fail the test
 			TestingT: t,
 		},
 	}
