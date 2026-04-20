@@ -38,6 +38,16 @@ fn build_tls(files: &TlsFiles) -> Result<ServerTlsConfig, Box<dyn std::error::Er
 pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- Context construction ---
 
+    // Node identity for multi-node Raft.
+    if cfg.node_id > 0 {
+        eprintln!(
+            "  node: id={}, peers={}, raft_addr={:?}",
+            cfg.node_id,
+            cfg.raft_peers.len(),
+            cfg.raft_addr
+        );
+    }
+
     // Key Manager: Raft-ready store with initial epoch.
     let key_store = RaftKeyStore::new().map_err(|e| format!("key store init: {e}"))?;
     let key_store = Arc::new(key_store);

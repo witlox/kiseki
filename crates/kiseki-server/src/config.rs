@@ -17,6 +17,12 @@ pub struct ServerConfig {
     pub tls: Option<TlsFiles>,
     /// Data directory for persistent storage (redb). None = in-memory only.
     pub data_dir: Option<std::path::PathBuf>,
+    /// This node's Raft ID (0 = single-node mode).
+    pub node_id: u64,
+    /// Raft peer addresses (comma-separated "id=addr" pairs).
+    pub raft_peers: Vec<(u64, String)>,
+    /// Raft RPC listen address.
+    pub raft_addr: Option<SocketAddr>,
     /// Create a well-known bootstrap shard on startup (for e2e tests).
     pub bootstrap: bool,
 }
@@ -79,6 +85,26 @@ impl ServerConfig {
             .ok()
             .map(std::path::PathBuf::from);
 
+        let node_id = std::env::var("KISEKI_NODE_ID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let raft_peers = std::env::var("KISEKI_RAFT_PEERS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|entry| {
+                let (id_str, addr) = entry.split_once('=')?;
+                let id: u64 = id_str.parse().ok()?;
+                Some((id, addr.to_owned()))
+            })
+            .collect();
+
+        let raft_addr = std::env::var("KISEKI_RAFT_ADDR")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
         let bootstrap = std::env::var("KISEKI_BOOTSTRAP")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -90,6 +116,9 @@ impl ServerConfig {
             nfs_addr,
             tls,
             data_dir,
+            node_id,
+            raft_peers,
+            raft_addr,
             bootstrap,
         }
     }
