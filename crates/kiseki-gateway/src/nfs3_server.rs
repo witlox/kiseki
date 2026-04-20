@@ -24,12 +24,8 @@ const NFS3_VERSION: u32 = 3;
 mod proc {
     pub const NULL: u32 = 0;
     pub const GETATTR: u32 = 1;
-    pub const _LOOKUP: u32 = 3;
     pub const READ: u32 = 6;
     pub const WRITE: u32 = 7;
-    pub const _CREATE: u32 = 8;
-    pub const _REMOVE: u32 = 12;
-    pub const _READDIR: u32 = 16;
 }
 
 /// NFS3 status codes.
@@ -40,7 +36,19 @@ mod status {
     pub const NFS3ERR_BADHANDLE: u32 = 10001;
 }
 
-/// Handle one NFS3 TCP connection.
+/// Process a single already-decoded NFS3 message and return the reply bytes.
+pub fn handle_nfs3_first_message<G: GatewayOps>(
+    header: &RpcCallHeader,
+    raw_msg: &[u8],
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut reader = XdrReader::new(raw_msg);
+    // Skip past the RPC header (already decoded by caller).
+    let _ = RpcCallHeader::decode(&mut reader);
+    dispatch_nfs3(header, &mut reader, ctx)
+}
+
+/// Handle one NFS3 TCP connection (after the first message).
 pub fn handle_nfs3_connection<G: GatewayOps>(
     mut stream: TcpStream,
     ctx: Arc<NfsContext<G>>,

@@ -1,10 +1,11 @@
 //! NFS TCP server — listens on port 2049, routes to NFSv3 or NFSv4.2.
 //!
-//! Version is determined by the ONC RPC program version in the first
-//! call. Currently only NFSv3 is implemented; NFSv4.2 COMPOUND will
-//! be added in a follow-up.
+//! Both versions share the same port. The ONC RPC version field in
+//! the first call determines which dispatcher handles the connection.
+//! NFSv3 = version 3, NFSv4.x = version 4.
 
-use std::net::{SocketAddr, TcpListener};
+use std::io;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
@@ -12,13 +13,15 @@ use kiseki_common::ids::{NamespaceId, OrgId};
 
 use crate::nfs::NfsGateway;
 use crate::nfs3_server::handle_nfs3_connection;
+use crate::nfs4_server::{handle_nfs4_connection, SessionManager};
 use crate::nfs_ops::NfsContext;
+use crate::nfs_xdr::{read_rm_message, write_rm_message, RpcCallHeader, XdrReader};
 use crate::ops::GatewayOps;
 
-/// Start the NFS TCP server on the given address.
+/// Start the NFS TCP server supporting both NFSv3 and NFSv4.2.
 ///
-/// Spawns a thread per connection (NFS is stateful per-connection).
-/// Production would use async I/O; this is MVP.
+/// Spawns a thread per connection. The first RPC call determines the
+/// version for that connection.
 pub fn run_nfs_server<G: GatewayOps + Send + Sync + 'static>(
     addr: SocketAddr,
     gateway: NfsGateway<G>,
@@ -26,13 +29,14 @@ pub fn run_nfs_server<G: GatewayOps + Send + Sync + 'static>(
     namespace_id: NamespaceId,
 ) {
     let ctx = Arc::new(NfsContext::new(gateway, tenant_id, namespace_id));
+    let sessions = Arc::new(SessionManager::new());
 
     let listener = TcpListener::bind(addr).unwrap_or_else(|e| {
         eprintln!("NFS bind {addr}: {e}");
         std::process::exit(1);
     });
 
-    eprintln!("  NFS server listening on {addr} (NFSv3)");
+    eprintln!("  NFS server listening on {addr} (NFSv3 + NFSv4.2)");
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -44,10 +48,37 @@ pub fn run_nfs_server<G: GatewayOps + Send + Sync + 'static>(
         };
 
         let ctx = Arc::clone(&ctx);
+        let sessions = Arc::clone(&sessions);
         thread::spawn(move || {
-            if let Err(e) = handle_nfs3_connection(stream, ctx) {
+            if let Err(e) = handle_connection(stream, ctx, sessions) {
                 eprintln!("NFS connection error: {e}");
             }
         });
+    }
+}
+
+/// Handle a connection — peek at the first RPC to determine version,
+/// then delegate to v3 or v4 handler for the rest.
+fn handle_connection<G: GatewayOps>(
+    mut stream: TcpStream,
+    ctx: Arc<NfsContext<G>>,
+    sessions: Arc<SessionManager>,
+) -> io::Result<()> {
+    // Read first message to determine version.
+    let first_msg = read_rm_message(&mut stream)?;
+    let mut reader = XdrReader::new(&first_msg);
+    let header = RpcCallHeader::decode(&mut reader)?;
+
+    if header.version == 4 {
+        // NFSv4 — process first COMPOUND, then continue with v4 handler.
+        let reply =
+            crate::nfs4_server::handle_nfs4_first_compound(&header, &first_msg, &ctx, &sessions);
+        write_rm_message(&mut stream, &reply)?;
+        handle_nfs4_connection(stream, ctx, sessions)
+    } else {
+        // NFSv3 (or unknown — v3 handler returns PROG_MISMATCH for wrong versions).
+        let reply = crate::nfs3_server::handle_nfs3_first_message(&header, &first_msg, &ctx);
+        write_rm_message(&mut stream, &reply)?;
+        handle_nfs3_connection(stream, ctx)
     }
 }

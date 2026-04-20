@@ -50,6 +50,25 @@ pub mod nfs3_server;
     clippy::doc_markdown,
     clippy::must_use_candidate,
     clippy::new_without_default,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::unreadable_literal,
+    clippy::needless_pass_by_value,
+    clippy::unwrap_used,
+    clippy::manual_let_else,
+    clippy::struct_field_names,
+    dead_code
+)]
+pub mod nfs4_server;
+
+#[cfg(feature = "nfs")]
+#[allow(
+    missing_docs,
+    clippy::doc_markdown,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
     clippy::needless_pass_by_value,
     clippy::unwrap_used
 )]
