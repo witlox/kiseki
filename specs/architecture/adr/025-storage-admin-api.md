@@ -233,3 +233,106 @@ This preserves the zero-trust boundary (I-T4).
 - Ceph: `ceph osd pool set` command reference
 - Lustre: `lctl set_param` tunables
 - I-T4: Zero-trust infra/tenant boundary
+
+---
+
+## Addendum: Adversarial Review Resolutions (2026-04-20)
+
+### C1: Per-tenant resource usage → ControlService, not StorageAdminService
+
+Per-tenant resource usage (capacity, IOPS attribution) is exposed via
+**ControlService** with tenant-admin authorization, NOT via StorageAdminService.
+Cluster admin sees pool-level aggregates only. Tenant admin sees their
+own usage. This preserves I-T4.
+
+```protobuf
+// In ControlService (not StorageAdminService):
+rpc GetTenantUsage(GetTenantUsageRequest) returns (TenantUsage);
+// Requires tenant admin cert (mTLS OU = tenant ID)
+```
+
+### C2: Per-device I/O stats added
+
+```protobuf
+rpc DeviceIOStats(DeviceIOStatsRequest) returns (stream DeviceIOStatsEvent);
+
+message DeviceIOStatsEvent {
+  string device_id = 1;
+  double read_iops = 2;
+  double write_iops = 3;
+  double read_latency_p50_ms = 4;
+  double read_latency_p99_ms = 5;
+  double errors_per_sec = 6;
+  uint64 timestamp_ms = 7;
+}
+```
+
+### C3: Shard health observability added
+
+```protobuf
+rpc GetShardHealth(GetShardHealthRequest) returns (ShardHealthInfo);
+
+message ShardHealthInfo {
+  string shard_id = 1;
+  uint64 leader_node_id = 2;
+  uint32 replica_count = 3;
+  uint32 reachable_count = 4;
+  uint32 recent_elections = 5;
+  uint64 commit_lag_entries = 6;
+}
+```
+
+### C4: EC parameters immutable per pool
+
+**New invariant I-C6**: EC parameters (data_chunks, parity_chunks) are
+immutable per pool. `SetPoolDurability` applies only to NEW chunks.
+Existing chunks retain their original EC configuration. Explicit
+re-encoding via `ReencodePool` RPC (long-running, cancellable).
+
+### C5: Compaction rate validation
+
+Protobuf-level validation: `compaction_rate_mb_s ∈ [10, 1000]`.
+API rejects values outside range. Audit event on every change.
+
+### C6: Inline threshold is prospective
+
+**New invariant I-L9**: A delta's inlined payload is immutable after
+write. `inline_threshold_bytes` changes do NOT retroactively affect
+existing deltas. Old and new thresholds coexist in the log.
+
+### C7: RemoveDevice requires evacuated state
+
+**New invariant I-D5**: `RemoveDevice` rejects if device state is not
+`Removed` (post-evacuation). Precondition: `EvacuateDevice` must
+complete first. Error code: `DEVICE_NOT_EVACUATED`.
+
+### C8: Pool modifications audited to affected tenants
+
+**New invariant I-T4c**: Cluster admin modifications to pools containing
+tenant data (SetPoolDurability, EvacuateDevice) are audit-logged to
+the affected tenant's audit shard. Tenant admin can review.
+
+### C9: Tuning change audit trail
+
+**New invariant I-A6**: All tuning parameter changes via SetTuningParams
+are recorded in the cluster audit shard with parameter name, old value,
+new value, timestamp, and admin identity.
+
+### H5: SRE roles defined
+
+| Role | Access |
+|------|--------|
+| `cluster-admin` | Full StorageAdminService (read + write) |
+| `sre-on-call` | Read-only: List*, Get*, Status, Health streams |
+| `sre-incident-response` | SRE + TriggerScrub, RepairChunk |
+
+Enforced via mTLS certificate OU field.
+
+### M4: DrainNode added
+
+```protobuf
+rpc DrainNode(DrainNodeRequest) returns (stream DrainNodeProgress);
+```
+
+Internally evacuates all devices on the node, then removes them.
+Idempotent, safe to retry.

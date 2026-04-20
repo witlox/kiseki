@@ -20,6 +20,7 @@ domain expert unless marked otherwise.
 | I-L6 | Shards have a hard ceiling triggering mandatory split. Ceiling configurable across dimensions: delta count, byte size, write throughput. Any dimension exceeding its ceiling forces split. Thresholds set by cluster admin or control plane defaults. | Confirmed |
 | I-L7 | Delta envelope has structurally separated system-visible header (cleartext/system-encrypted) and tenant-encrypted payload. Compaction operates on headers only; payloads are carried opaquely. | Confirmed |
 | I-L8 | Cross-shard rename returns EXDEV. Shards are independent consensus domains; no 2PC. Applications handle via copy + delete. | Confirmed |
+| I-L9 | A delta's inlined payload is immutable after write. `inline_threshold_bytes` changes apply prospectively only — existing deltas not re-evaluated. | Confirmed |
 
 ---
 
@@ -33,6 +34,7 @@ domain expert unless marked otherwise.
 | I-C3 | Chunks are placed according to affinity policy derived from the referencing composition's view descriptor. | Confirmed |
 | I-C4 | Chunk durability strategy is per affinity pool. EC is the default. Replication (N-copy) available for pools where EC overhead is unacceptable. Pool-level policy set by cluster admin. | Confirmed |
 | I-C5 | Pool writes are rejected when pool reaches Critical threshold (per-device-class: SSD 85%, HDD 92%). Pool redirection stays within same device class only. ENOSPC returned when pool is Full. | Confirmed |
+| I-C6 | EC parameters (data_chunks, parity_chunks) are immutable per pool. `SetPoolDurability` applies only to new chunks. Existing chunks retain original EC config. Re-encoding requires explicit `ReencodePool` RPC. | Confirmed |
 
 ---
 
@@ -44,6 +46,7 @@ domain expert unless marked otherwise.
 | I-D2 | Device state transitions (Healthy → Degraded → Evacuating → Failed → Removed) are recorded in the audit log with timestamp, reason, and admin identity (if manual). | Confirmed |
 | I-D3 | Automatic evacuation is triggered when a device reports SMART wear >90% (SSD) or >100 bad sectors (HDD). Evacuation is background, cancellable by admin. | Confirmed |
 | I-D4 | EC fragments are placed across distinct physical devices within a pool via deterministic hashing (CRUSH-like). No two fragments of the same chunk on the same device. | Confirmed |
+| I-D5 | `RemoveDevice` rejects if device state is not `Removed` (post-evacuation). Evacuation must complete before physical removal. | Confirmed |
 
 ---
 
@@ -76,6 +79,7 @@ domain expert unless marked otherwise.
 | I-T2 | A tenant's resource consumption (capacity, IOPS, metadata ops) is bounded by quotas at org and workload levels. Project-level quotas optional. Org sets ceiling; workload gets allocation within it. | Confirmed |
 | I-T3 | A tenant's keys are not accessible to other tenants or to shared system processes. | Confirmed |
 | I-T4 | Cluster admin cannot access tenant config, logs, or data without explicit tenant admin approval. Zero-trust infra/tenant boundary. | Confirmed |
+| I-T4c | Cluster admin modifications to pools containing tenant data are audit-logged to the affected tenant's audit shard. Tenant admin can review. | Confirmed |
 
 ---
 
@@ -104,6 +108,7 @@ domain expert unless marked otherwise.
 | I-A2 | Tenant audit export: filtered to tenant's events + relevant system events. Delivered on tenant VLAN. Coherent enough for independent compliance demonstration. | Confirmed |
 | I-A3 | Cluster admin audit view: system-level events only. Tenant-anonymous or aggregated per zero-trust boundary. | Confirmed |
 | I-A4 | Audit log is a GC consumer: delta GC blocked until audit log has captured the relevant event. | Confirmed (subset of I-L4) |
+| I-A6 | All tuning parameter changes via `SetTuningParams` are recorded in the cluster audit shard with parameter name, old value, new value, timestamp, and admin identity. | Confirmed |
 
 ---
 
