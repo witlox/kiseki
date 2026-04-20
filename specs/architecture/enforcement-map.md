@@ -20,6 +20,7 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | I-L6 (hard shard ceiling) | `kiseki-log` shard monitor | Background task checks dimensions; triggers SplitShard |
 | I-L7 (header/payload structural separation) | `kiseki-log` + `kiseki-crypto` | DeltaHeader + DeltaPayload structs; compaction reads headers only |
 | I-L8 (cross-shard rename = EXDEV) | `kiseki-composition` rename handler | Check source/target shard; return EXDEV if different |
+| I-L9 (inline payload immutable after write) | `kiseki-log` delta storage | inline_threshold_bytes changes apply prospectively only; existing deltas untouched |
 
 ## Chunk invariants
 
@@ -30,6 +31,18 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | I-C2b (no GC while retention hold) | `kiseki-chunk` GC process | Check retention_holds list before delete |
 | I-C3 (placement per affinity policy) | `kiseki-chunk` placement engine | Pool selection from view descriptor's affinity_pool |
 | I-C4 (EC per pool) | `kiseki-chunk` pool config | DurabilityStrategy on AffinityPool; applied at write time |
+| I-C5 (pool capacity thresholds) | `kiseki-chunk` placement engine | PoolHealth state machine; per-device-class thresholds; redirect within same class; ENOSPC at Full |
+| I-C6 (EC params immutable per pool) | `kiseki-chunk` pool config | SetPoolDurability applies to new chunks only; existing chunks retain original EC |
+
+## Device invariants (ADR-024)
+
+| Invariant | Enforcement point | Mechanism |
+|---|---|---|
+| I-D1 (auto-repair on device failure) | `kiseki-chunk` repair subsystem | Device failure event → identify affected chunks → EC reconstruct → re-place |
+| I-D2 (device state transitions audited) | `kiseki-server` device monitor | State change → audit event to cluster audit shard with timestamp, reason, admin |
+| I-D3 (auto-evacuation on SMART/sectors) | `kiseki-server` device monitor | SMART wear >90% (SSD) or >100 bad sectors (HDD) → background evacuation |
+| I-D4 (EC fragments on distinct devices) | `kiseki-chunk` CRUSH placement | hash(chunk_id, frag_idx) → device; distinct-device constraint enforced |
+| I-D5 (RemoveDevice requires evacuated) | `StorageAdminService` RPC handler | Precondition check: reject if device state ≠ Removed |
 
 ## Composition invariants
 
@@ -56,6 +69,7 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | I-T2 (quota enforcement) | `control/pkg/policy` + gateway/client | Quota check before write; reject with QuotaExceeded |
 | I-T3 (tenant keys not accessible to others) | `kiseki-crypto` + process isolation | Separate processes per tenant (ADR-012); mlock on key material |
 | I-T4 (cluster admin needs approval) | `control/pkg/iam` | AccessRequest workflow; deny by default |
+| I-T4c (pool mods audited to tenant) | `StorageAdminService` + `kiseki-audit` | Pool modifications logged to affected tenant's audit shard |
 
 ## Encryption invariants
 
@@ -101,6 +115,7 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | I-A2 (tenant export coherent) | `control/pkg/audit` | Filter pipeline: tenant events + system event filter |
 | I-A3 (cluster admin: tenant-anonymous) | `control/pkg/audit` | Anonymization layer on system metrics export |
 | I-A4 (audit log is GC consumer) | `kiseki-log` + `kiseki-audit` | Audit watermark tracked per tenant audit shard (ADR-009) |
+| I-A6 (tuning changes audited) | `StorageAdminService` | SetTuningParams → TuningParameterChanged event to cluster audit shard |
 
 ## Operational invariants
 

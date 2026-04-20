@@ -1,7 +1,7 @@
-# Fidelity Index — Kiseki (Post Phase D)
+# Fidelity Index — Kiseki (Post Phase F)
 
-**Checkpoint**: 2026-04-20 (post Phase D — Go BDD + security + protocols)
-**Previous**: 2026-04-20 (post-R9 remediation)
+**Checkpoint**: 2026-04-20 (post Phase F — persistence + protocol completeness)
+**Previous**: 2026-04-20 (post Phase D)
 
 ## Per-Crate Status
 
@@ -72,10 +72,18 @@ All deferred to specific future work (mTLS impl, NFS directory index).
 
 ## Remaining Gaps
 
-1. **Persistence** — all in-memory, server restart = data loss
-2. **Multi-node Raft** — single-node only, no failover
-3. **EC erasure coding** — chunks stored whole, no striping
-4. **mTLS on S3/NFS** — plumbing defined, TLS acceptor not wired
-5. **NFS directory index** — LOOKUP/CREATE need name→composition mapping
-6. **ViewStore in read path** — views exist but disconnected from gateways
-7. **Go BDD assertion depth** — structural, not behavioral
+### Resolved by Phase E/F
+
+- ~~Persistence~~ — redb + PersistentShardStore, data survives Docker restart (e2e proven)
+- ~~NFS directory index~~ — DirectoryIndex with LOOKUP/CREATE/READDIR/REMOVE/RENAME
+- ~~ViewStore in read path~~ — Arc<Mutex<ViewStore>> shared with gateway, staleness enforced
+- ~~Go BDD assertion depth~~ — Strict:true, 27 steps strengthened
+- ~~mTLS on S3~~ — TLS acceptor wired (tokio-rustls), test certs generated
+
+### Remaining gaps (Phase G)
+
+1. **Multi-node Raft** — single-node only, no failover (ADR-026 ready)
+2. **EC erasure coding** — chunks stored whole, no striping
+3. **Device/pool management** — ADR-024/025 designed, no code
+4. **Storage admin API** — ADR-025 designed, proto not defined
+5. **Protocol RFC completion** — ~60 remaining red scenarios

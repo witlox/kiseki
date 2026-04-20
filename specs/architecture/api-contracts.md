@@ -23,6 +23,7 @@ is direct function calls via trait implementations.
 | `DiscoveryService` | Rust server | Rust client | Data fabric |
 | `WorkflowAdvisoryService` | Rust server (kiseki-advisory) | Rust client (and any tenant-authorized caller) | Data fabric (separate listener, ADR-021 §1) |
 | `LogService` | Rust server (kiseki-log) | Rust client, gateways | Data fabric |
+| `StorageAdminService` | Rust server (kiseki-server) | Cluster admin, SRE | Management network (ADR-025) |
 
 ### Services that are intra-process (Rust trait calls)
 
@@ -151,6 +152,29 @@ service backed by the same trait implementation.
 | Command | `SetAdvisoryPolicy(scope, profiles, budgets, state)` | Cluster/Tenant Admin | control-plane.feature#AdvisoryPolicy, ADR-021 §6 |
 | Command | `TransitionAdvisoryState(scope, state)` | Cluster/Tenant Admin | control-plane.feature#AdvisoryOptOut, I-WA12 |
 | Query | `GetEffectiveAdvisoryPolicy(workload) → policy` | kiseki-advisory | ADR-021 §6 (computed as min across cluster/org/project/workload) |
+
+### Storage Admin context (Rust server, gRPC — ADR-025)
+
+Service definition: `specs/architecture/proto/kiseki/v1/admin.proto` (planned).
+Authorization: cluster admin only (mTLS cert with admin OU). SRE read-only role.
+
+| Type | Operation | Caller | Spec reference |
+|---|---|---|---|
+| Query | `ListDevices / GetDevice` | Cluster admin, SRE | storage-admin.feature |
+| Command | `AddDevice / RemoveDevice` | Cluster admin | storage-admin.feature, device-management.feature |
+| Command | `EvacuateDevice / CancelEvacuation` | Cluster admin | device-management.feature |
+| Query | `ListPools / GetPool / PoolStatus` | Cluster admin, SRE | storage-admin.feature |
+| Command | `CreatePool / SetPoolDurability / SetPoolThresholds` | Cluster admin | storage-admin.feature |
+| Command | `RebalancePool / CancelRebalance` | Cluster admin | storage-admin.feature |
+| Command | `SetTuningParams / GetTuningParams` | Cluster admin | storage-admin.feature |
+| Query | `ClusterStatus` | Cluster admin, SRE | storage-admin.feature |
+| Stream | `DeviceHealth → stream DeviceHealthEvent` | Cluster admin, SRE | storage-admin.feature |
+| Stream | `IOStats → stream IOStatsEvent` | Cluster admin, SRE | storage-admin.feature |
+| Stream | `DeviceIOStats → stream DeviceIOStatsEvent` | Cluster admin, SRE | storage-admin.feature |
+| Query | `ListShards / GetShard / GetShardHealth` | Cluster admin, SRE | storage-admin.feature |
+| Command | `SplitShard / SetShardMaintenance` | Cluster admin | storage-admin.feature |
+| Command | `TriggerScrub / RepairChunk / ListRepairs` | Cluster admin, SRE-IR | storage-admin.feature |
+| Command | `DrainNode` | Cluster admin | storage-admin.feature |
 
 ### Workflow Advisory context (Rust server, gRPC)
 
