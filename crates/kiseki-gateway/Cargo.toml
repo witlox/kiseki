@@ -21,8 +21,10 @@ kiseki-chunk = { path = "../kiseki-chunk" }
 kiseki-composition = { path = "../kiseki-composition" }
 kiseki-crypto = { path = "../kiseki-crypto" }
 axum = "0.7"
+kiseki-transport = { path = "../kiseki-transport" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = "0.26"
 uuid = { workspace = true }
 
 [dev-dependencies]

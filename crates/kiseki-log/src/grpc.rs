@@ -179,10 +179,20 @@ fn domain_delta_to_proto(d: &crate::delta::Delta) -> kiseki_proto::v1::Delta {
     }
 }
 
-// TODO(auth): Wire tonic interceptor to validate caller identity against
-// tenant_id before processing writes. Currently relies on mTLS for
-// cluster-internal access control. Must be enforced before multi-tenant
-// deployment. See: I-Auth1, I-T1.
+/// Tonic interceptor for tenant identity validation (I-Auth1, I-T1).
+///
+/// When mTLS is configured, extracts the tenant `OrgId` from the client
+/// certificate's OU or SPIFFE SAN and attaches it to the request
+/// extensions. RPCs then verify the request's `tenant_id` matches.
+///
+/// Currently a no-op pass-through — returns `Ok(req)` unconditionally.
+/// Wire via `tonic::service::interceptor(LogServiceServer::new(...), auth_interceptor)`.
+#[allow(clippy::result_large_err)]
+pub fn auth_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
+    // TODO: Extract OrgId from tonic::Request::peer_certs() when mTLS active.
+    // For now, pass through all requests (development mode).
+    Ok(req)
+}
 #[tonic::async_trait]
 impl<T: LogOps + Send + Sync + 'static> LogService for LogGrpc<T> {
     async fn append_delta(

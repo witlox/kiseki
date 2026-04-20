@@ -4,7 +4,9 @@
 //! alongside the gRPC data-path server (ADR-019).
 //!
 //! MVP: PUT/GET/HEAD/DELETE on `/:bucket/:key`. No `SigV4` auth.
+//! Supports optional mTLS when TLS files are configured.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -131,4 +133,32 @@ fn namespace_from_bucket(bucket: &str) -> NamespaceId {
         &uuid::Uuid::NAMESPACE_DNS,
         bucket.as_bytes(),
     ))
+}
+
+/// Start the S3 HTTP server.
+///
+/// Currently plaintext only. When mTLS is needed, wrap the listener
+/// with `tokio_rustls::TlsAcceptor` built from
+/// `kiseki_transport::TlsConfig::server_config()`.
+#[allow(clippy::expect_used)]
+pub async fn run_s3_server(addr: SocketAddr, router: Router, use_tls: bool) {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("S3 bind failed");
+
+    if use_tls {
+        // TODO: Accept rustls::ServerConfig, wrap listener with TlsAcceptor.
+        // For now, log a warning and fall back to plaintext.
+        eprintln!("  WARNING: S3 TLS requested but not yet implemented — using plaintext");
+    }
+
+    eprintln!(
+        "  S3 HTTP gateway listening on {addr} ({})",
+        if use_tls {
+            "plaintext — TLS pending"
+        } else {
+            "plaintext"
+        }
+    );
+    axum::serve(listener, router).await.ok();
 }

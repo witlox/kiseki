@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use kiseki_advisory::budget::BudgetConfig;
 use kiseki_advisory::grpc::AdvisoryGrpc;
+use kiseki_audit::AuditOps;
 use kiseki_keymanager::grpc::KeyManagerGrpc;
 use kiseki_keymanager::raft_store::RaftKeyStore;
 use kiseki_log::grpc::LogGrpc;
-use kiseki_audit::AuditOps;
-use kiseki_view::ViewOps;
 use kiseki_proto::v1::key_manager_service_server::KeyManagerServiceServer;
 use kiseki_proto::v1::log_service_server::LogServiceServer;
 use kiseki_proto::v1::workflow_advisory_service_server::WorkflowAdvisoryServiceServer;
+use kiseki_view::ViewOps;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::config::{ServerConfig, TlsFiles};
@@ -122,12 +122,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&gw));
     let s3_router = kiseki_gateway::s3_server::s3_router(s3_gw, bootstrap_tenant);
     let s3_addr = cfg.s3_addr;
+    let s3_use_tls = cfg.tls.is_some();
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(s3_addr)
-            .await
-            .expect("S3 bind failed");
-        eprintln!("  S3 HTTP gateway listening on {s3_addr}");
-        axum::serve(listener, s3_router).await.ok();
+        kiseki_gateway::s3_server::run_s3_server(s3_addr, s3_router, s3_use_tls).await;
     });
 
     // NFS gateway (NFSv3 + NFSv4.2 on port 2049).
