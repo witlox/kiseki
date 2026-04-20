@@ -28,7 +28,11 @@ mod proc {
     pub const READ: u32 = 6;
     pub const WRITE: u32 = 7;
     pub const CREATE: u32 = 8;
+    pub const REMOVE: u32 = 12;
+    pub const RENAME: u32 = 14;
     pub const READDIR: u32 = 16;
+    pub const FSSTAT: u32 = 21;
+    pub const FSINFO: u32 = 20;
 }
 
 /// NFS3 status codes.
@@ -93,7 +97,11 @@ fn dispatch_nfs3<G: GatewayOps>(
         proc::READ => reply_read(header.xid, reader, ctx),
         proc::WRITE => reply_write(header.xid, reader, ctx),
         proc::CREATE => reply_create(header.xid, reader, ctx),
+        proc::REMOVE => reply_remove(header.xid, reader, ctx),
+        proc::RENAME => reply_rename(header.xid, reader, ctx),
         proc::READDIR => reply_readdir(header.xid, reader, ctx),
+        proc::FSSTAT => reply_fsstat(header.xid, ctx),
+        proc::FSINFO => reply_fsinfo(header.xid, ctx),
         _ => {
             // Unsupported procedure — reply PROC_UNAVAIL.
             let mut w = XdrWriter::new();
@@ -309,6 +317,114 @@ fn reply_readdir<G: GatewayOps>(
     }
     w.write_bool(false); // no more
     w.write_bool(true); // eof
+
+    w.into_bytes()
+}
+
+fn reply_remove<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+    let name = reader.read_string().unwrap_or_default();
+
+    match ctx.remove_file(&name) {
+        Ok(()) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_NOENT);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_rename<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _from_dir = reader.read_opaque().unwrap_or_default();
+    let from_name = reader.read_string().unwrap_or_default();
+    let _to_dir = reader.read_opaque().unwrap_or_default();
+    let to_name = reader.read_string().unwrap_or_default();
+
+    match ctx.rename_file(&from_name, &to_name) {
+        Ok(()) => {
+            w.write_u32(status::NFS3_OK);
+            // from dir wcc + to dir wcc (both absent)
+            w.write_bool(false);
+            w.write_bool(false);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_NOENT);
+            w.write_bool(false);
+            w.write_bool(false);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_fsstat<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    w.write_u32(status::NFS3_OK);
+    w.write_bool(false); // post-op attrs
+                         // tbytes, fbytes, abytes (total, free, available)
+    w.write_u64(1_000_000_000_000); // 1TB total
+    w.write_u64(500_000_000_000); // 500GB free
+    w.write_u64(500_000_000_000); // 500GB available
+                                  // tfiles, ffiles, afiles
+    w.write_u64(1_000_000);
+    w.write_u64(500_000);
+    w.write_u64(500_000);
+    // invarsec
+    w.write_u32(0);
+
+    w.into_bytes()
+}
+
+fn reply_fsinfo<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    w.write_u32(status::NFS3_OK);
+    w.write_bool(false); // post-op attrs
+                         // rtmax, rtpref, rtmult (read transfer)
+    w.write_u32(1_048_576); // 1MB max read
+    w.write_u32(65536); // 64KB preferred
+    w.write_u32(4096); // 4KB multiple
+                       // wtmax, wtpref, wtmult (write transfer)
+    w.write_u32(1_048_576);
+    w.write_u32(65536);
+    w.write_u32(4096);
+    // dtpref (readdir)
+    w.write_u32(65536);
+    // maxfilesize
+    w.write_u64(u64::MAX);
+    // time_delta (seconds, nseconds)
+    w.write_u32(0);
+    w.write_u32(1);
+    // properties
+    w.write_u32(0x001b); // FSF_LINK | FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME
 
     w.into_bytes()
 }

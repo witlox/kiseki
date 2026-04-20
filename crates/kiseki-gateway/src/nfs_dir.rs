@@ -85,6 +85,20 @@ impl DirectoryIndex {
             .unwrap_or(false)
     }
 
+    /// Rename a file within a namespace.
+    pub fn rename(&self, ns: NamespaceId, old_name: &str, new_name: &str) -> bool {
+        let mut entries = self.entries.lock().unwrap();
+        let Some(dir) = entries.get_mut(&ns) else {
+            return false;
+        };
+        let Some(mut entry) = dir.remove(old_name) else {
+            return false;
+        };
+        entry.name = new_name.to_owned();
+        dir.insert(new_name.to_owned(), entry);
+        true
+    }
+
     /// Number of files in a namespace.
     pub fn count(&self, ns: NamespaceId) -> usize {
         let entries = self.entries.lock().unwrap();
@@ -159,6 +173,24 @@ mod tests {
     fn remove_nonexistent() {
         let idx = DirectoryIndex::new();
         assert!(!idx.remove(ns1(), "nope"));
+    }
+
+    #[test]
+    fn rename_entry() {
+        let idx = DirectoryIndex::new();
+        idx.insert(ns1(), "old.txt".into(), [1; 32], comp(1), 10);
+
+        assert!(idx.rename(ns1(), "old.txt", "new.txt"));
+        assert!(idx.lookup(ns1(), "old.txt").is_none());
+        let entry = idx.lookup(ns1(), "new.txt").unwrap();
+        assert_eq!(entry.composition_id, comp(1));
+        assert_eq!(entry.name, "new.txt");
+    }
+
+    #[test]
+    fn rename_nonexistent() {
+        let idx = DirectoryIndex::new();
+        assert!(!idx.rename(ns1(), "nope", "also_nope"));
     }
 
     #[test]

@@ -32,7 +32,8 @@ pub mod nfs;
     clippy::must_use_candidate,
     clippy::new_without_default,
     clippy::unwrap_used,
-    clippy::map_unwrap_or
+    clippy::map_unwrap_or,
+    clippy::assigning_clones
 )]
 pub mod nfs_dir;
 

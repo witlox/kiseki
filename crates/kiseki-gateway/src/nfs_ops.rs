@@ -281,6 +281,24 @@ impl<G: GatewayOps> NfsContext<G> {
 
         entries
     }
+
+    /// Remove a file by name.
+    pub fn remove_file(&self, name: &str) -> Result<(), GatewayError> {
+        if self.dir_index.remove(self.namespace_id, name) {
+            Ok(())
+        } else {
+            Err(GatewayError::ProtocolError("file not found".into()))
+        }
+    }
+
+    /// Rename a file within the namespace.
+    pub fn rename_file(&self, old_name: &str, new_name: &str) -> Result<(), GatewayError> {
+        if self.dir_index.rename(self.namespace_id, old_name, new_name) {
+            Ok(())
+        } else {
+            Err(GatewayError::ProtocolError("source file not found".into()))
+        }
+    }
 }
 
 /// Directory entry for READDIR response.
