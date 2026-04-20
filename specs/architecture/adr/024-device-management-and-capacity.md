@@ -62,15 +62,26 @@ failure without Kiseki's own repair mechanism.
 
 ### Pool capacity management
 
-Each pool tracks capacity with threshold-based behavior:
+### Per-device-class capacity thresholds
 
-| Pool usage | State | Behavior |
-|-----------|-------|----------|
-| 0-80% | **Healthy** | Normal writes, background rebalance |
-| 80-90% | **Warning** | Log warning, emit telemetry, reduce rebalance target |
-| 90-95% | **Critical** | Reject new chunk placements to this pool, advisory backpressure |
-| 95-99% | **ReadOnly** | Existing writes drain, no new writes, alert cluster admin |
-| 99-100% | **Full** | Return ENOSPC to clients, all writes rejected |
+Thresholds vary by device type because NVMe/SSD suffer GC-induced write
+amplification at high fill levels, while HDD does not. Enterprise
+arrays (VAST, Pure) can operate at 95%+ because they have global wear
+leveling — JBOD does not have that luxury.
+
+| State | NVMe/SSD | HDD | Behavior |
+|-------|----------|-----|----------|
+| **Healthy** | 0-75% | 0-85% | Normal writes, background rebalance |
+| **Warning** | 75-85% | 85-92% | Log warning, emit telemetry |
+| **Critical** | 85-92% | 92-97% | Reject new placements, advisory backpressure |
+| **ReadOnly** | 92-97% | 97-99% | In-flight writes drain, no new writes |
+| **Full** | 97-100% | 99-100% | ENOSPC to clients |
+
+**Rationale**: NVMe/SSD GC pressure increases sharply above ~80% fill.
+QLC is worse than TLC. The SSD Warning threshold (75%) gives the
+placement engine time to redirect before the GC cliff. HDD has no
+such cliff — outer-track vs inner-track difference is ~20%, not
+a performance wall.
 
 **Implementation**:
 ```rust
@@ -82,11 +93,42 @@ pub enum PoolHealth {
     Full,
 }
 
+pub struct CapacityThresholds {
+    pub warning_pct: u8,
+    pub critical_pct: u8,
+    pub readonly_pct: u8,
+    pub full_pct: u8,
+}
+
+impl CapacityThresholds {
+    pub fn for_device_class(class: &DeviceClass) -> Self {
+        match class {
+            DeviceClass::NvmeU2 | DeviceClass::NvmeQlc
+            | DeviceClass::NvmePersistentMemory | DeviceClass::SsdSata => Self {
+                warning_pct: 75,
+                critical_pct: 85,
+                readonly_pct: 92,
+                full_pct: 97,
+            },
+            DeviceClass::HddEnterprise | DeviceClass::HddBulk => Self {
+                warning_pct: 85,
+                critical_pct: 92,
+                readonly_pct: 97,
+                full_pct: 99,
+            },
+            DeviceClass::Custom(_) => Self {
+                warning_pct: 80,
+                critical_pct: 90,
+                readonly_pct: 95,
+                full_pct: 99,
+            },
+        }
+    }
+}
+
 impl AffinityPool {
     pub fn health(&self) -> PoolHealth {
         let pct = (self.used_bytes * 100) / self.capacity_bytes;
-        match pct {
-            0..=80 => PoolHealth::Healthy,
             81..=90 => PoolHealth::Warning { used_percent: pct as u8 },
             91..=95 => PoolHealth::Critical { used_percent: pct as u8 },
             96..=99 => PoolHealth::ReadOnly { used_percent: pct as u8 },
@@ -118,8 +160,64 @@ Each device reports SMART/health metrics:
 **Device states**:
 ```
 Healthy → Degraded → Failed → Removed
-                ↗ Evacuating → Removed
+     ↘       ↗
+   Evacuating → Removed
 ```
+
+### Eviction and evacuation policy
+
+**Key principle**: Unhealthy devices are evacuated proactively, not
+waited on until failure. Full devices are write-blocked, not evicted
+(data is still readable).
+
+| Trigger | Action | Automatic? | Priority |
+|---------|--------|-----------|----------|
+| SMART wear >90% (SSD) | **Evacuate** — migrate chunks to other pool members | Yes (background) | Normal |
+| Bad sectors >100 (HDD) | **Evacuate** — migrate before cascading failure | Yes (background) | High |
+| Uncorrectable read error | **Evacuate + EC repair** for affected chunks | Yes (immediate) | Critical |
+| Temperature >80°C | **Throttle** I/O, alert admin | Yes | High |
+| Device unresponsive | **Mark Failed** — trigger EC repair from survivors | Yes (immediate) | Critical |
+| Pool at Critical threshold | **Block writes** — redirect to sibling pools | Yes | Normal |
+| Pool at ReadOnly threshold | **Drain writes** — no new data, existing completes | Yes | Normal |
+| Admin-initiated | **Evacuate** — controlled migration before physical removal | Manual | Normal |
+
+**Evacuation process**:
+1. Mark device `Evacuating`
+2. For each chunk on device: read fragment, write to another healthy device in pool
+3. Update chunk metadata (redb) with new placement
+4. When all chunks migrated: mark device `Removed`
+5. Admin can physically pull the device
+
+**Evacuation speed**: Bounded by network and destination device throughput.
+At 1 GB/s NVMe write speed, a 4TB device evacuates in ~67 minutes.
+EC repair (from parity) is faster since only the missing fragments
+need reconstruction.
+
+**Invariant**: A device in `Evacuating` state accepts no new writes
+but serves reads for chunks not yet migrated.
+
+### Filesystem per JBOD device
+
+| Approach | Pros | Cons | Recommendation |
+|----------|------|------|----------------|
+| **xfs** | Scales to 100M+ files, good NVMe support | Extra FS overhead | Default for HDD + SSD |
+| **ext4** | Well-tested, fast for small files | Inode limits at scale | Acceptable for small deployments |
+| **Raw block** | Zero FS overhead, direct I/O | Complex, custom allocator needed | Future optimization |
+
+**Default**: xfs on each JBOD device, mounted at `/data/<device-id>/`.
+Kiseki manages files within the mount point. Operator provisions the
+filesystem as part of node setup.
+
+### Device discovery
+
+**Manual configuration** (MVP):
+- Admin provides device list in node config (`kiseki-server.toml`)
+- Each device: path, class, pool assignment
+
+**Future: Auto-discovery**:
+- Scan `/sys/block/` for NVMe/SSD/HDD devices
+- Classify by transport (NVMe, SATA, SAS) and media (rotational flag)
+- Present to admin for pool assignment confirmation
 
 - **Healthy**: Normal I/O
 - **Degraded**: Elevated errors or latency; reduce write priority
