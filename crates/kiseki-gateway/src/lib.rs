@@ -26,6 +26,16 @@ pub mod ops;
 #[cfg(feature = "nfs")]
 pub mod nfs;
 
+#[cfg(feature = "nfs")]
+#[allow(
+    missing_docs,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
+    clippy::unwrap_used,
+    clippy::map_unwrap_or
+)]
+pub mod nfs_dir;
+
 // NFS protocol implementation — internal wire format code.
 // Allows for protocol-specific patterns (casts, missing docs on XDR fields).
 #[cfg(feature = "nfs")]

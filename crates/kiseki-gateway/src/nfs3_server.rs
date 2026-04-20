@@ -265,9 +265,9 @@ fn reply_create<G: GatewayOps>(
     encode_reply_accepted(&mut w, xid, 0);
 
     let _dir_fh = reader.read_opaque().unwrap_or_default();
-    let _name = reader.read_string().unwrap_or_default();
+    let name = reader.read_string().unwrap_or_default();
 
-    match ctx.write(Vec::new()) {
+    match ctx.write_named(&name, Vec::new()) {
         Ok((new_fh, _resp)) => {
             w.write_u32(status::NFS3_OK);
             w.write_bool(true);

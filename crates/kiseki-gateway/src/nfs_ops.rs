@@ -10,6 +10,7 @@ use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 
 use crate::error::GatewayError;
 use crate::nfs::{NfsGateway, NfsReadRequest, NfsReadResponse, NfsWriteRequest, NfsWriteResponse};
+use crate::nfs_dir::DirectoryIndex;
 use crate::ops::GatewayOps;
 
 /// NFS file handle — 32-byte opaque identifier.
@@ -129,6 +130,7 @@ impl HandleRegistry {
 pub struct NfsContext<G: GatewayOps> {
     pub gateway: NfsGateway<G>,
     pub handles: HandleRegistry,
+    pub dir_index: DirectoryIndex,
     pub tenant_id: OrgId,
     pub namespace_id: NamespaceId,
 }
@@ -143,6 +145,7 @@ impl<G: GatewayOps> NfsContext<G> {
         Self {
             gateway,
             handles,
+            dir_index: DirectoryIndex::new(),
             tenant_id,
             namespace_id,
         }
@@ -209,6 +212,23 @@ impl<G: GatewayOps> NfsContext<G> {
         })
     }
 
+    /// Write to create a new named file (NFS CREATE).
+    pub fn write_named(
+        &self,
+        name: &str,
+        data: Vec<u8>,
+    ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
+        let (fh, resp) = self.write(data)?;
+        self.dir_index.insert(
+            self.namespace_id,
+            name.to_owned(),
+            fh,
+            resp.composition_id,
+            u64::from(resp.count),
+        );
+        Ok((fh, resp))
+    }
+
     /// Write to create a new file (NFS CREATE + WRITE).
     pub fn write(&self, data: Vec<u8>) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
         let resp = self.gateway.write(NfsWriteRequest {
@@ -225,9 +245,18 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Look up a file by name in the namespace. Returns handle + attrs.
-    pub fn lookup_by_name(&self, _name: &str) -> Option<(FileHandle, NfsAttrs)> {
-        // TODO: directory index mapping names → composition IDs.
-        None
+    pub fn lookup_by_name(&self, name: &str) -> Option<(FileHandle, NfsAttrs)> {
+        let entry = self.dir_index.lookup(self.namespace_id, name)?;
+        let attrs = NfsAttrs {
+            file_type: FileType::Regular,
+            size: entry.size,
+            mode: 0o644,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            fileid: u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+        };
+        Some((entry.file_handle, attrs))
     }
 
     /// List directory entries for READDIR.
@@ -243,14 +272,11 @@ impl<G: GatewayOps> NfsContext<G> {
             },
         ];
 
-        let handles = self.handles.handles.lock().unwrap();
-        for (&fh, entry) in handles.iter() {
-            if let HandleEntry::File { composition_id, .. } = entry {
-                entries.push(ReadDirEntry {
-                    fileid: u64::from_le_bytes(fh[..8].try_into().unwrap_or([0; 8])),
-                    name: composition_id.0.to_string(),
-                });
-            }
+        for dir_entry in self.dir_index.list(self.namespace_id) {
+            entries.push(ReadDirEntry {
+                fileid: u64::from_le_bytes(dir_entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+                name: dir_entry.name,
+            });
         }
 
         entries
