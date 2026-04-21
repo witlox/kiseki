@@ -4,6 +4,7 @@
 //! Undefined steps show as "skipped" in cucumber output — that's
 //! our honest backlog of unimplemented behavior.
 
+pub mod admin;
 pub mod advisory;
 pub mod auth;
 pub mod chunk;
