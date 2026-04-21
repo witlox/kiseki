@@ -13,6 +13,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod cache;
 pub mod epoch;
 pub mod error;
 pub mod grpc;

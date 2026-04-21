@@ -27,4 +27,5 @@ tonic = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

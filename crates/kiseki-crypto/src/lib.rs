@@ -28,6 +28,7 @@ pub mod error;
 pub mod hkdf;
 pub mod keys;
 pub(crate) mod mem_protect;
+pub mod shred;
 
 #[cfg(feature = "compression")]
 pub mod compress;
