@@ -325,6 +325,20 @@ impl KisekiWorld {
             .tenant_ids
             .get("org-pharma")
             .unwrap_or(&OrgId(uuid::Uuid::from_u128(1)));
+
+        // Ensure namespace exists in the gateway's composition store.
+        let shard_id = *self
+            .shard_names
+            .values()
+            .next()
+            .unwrap_or(&ShardId(uuid::Uuid::from_u128(1)));
+        self.gateway.add_namespace(Namespace {
+            id: ns_id,
+            tenant_id,
+            shard_id,
+            read_only: false,
+        });
+
         self.gateway
             .write(WriteRequest {
                 namespace_id: ns_id,

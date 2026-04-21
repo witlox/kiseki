@@ -55,6 +55,17 @@ impl InMemoryGateway {
         }
     }
 
+    /// Register a namespace in the gateway's composition store.
+    ///
+    /// Namespaces are created by the Control Plane and must be registered
+    /// with the gateway before any write/read operations can target them.
+    pub fn add_namespace(&self, ns: kiseki_composition::namespace::Namespace) {
+        self.compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add_namespace(ns);
+    }
+
     /// List compositions in a namespace (for S3 `ListObjectsV2`).
     pub fn list_compositions(
         &self,
