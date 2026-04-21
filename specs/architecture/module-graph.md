@@ -16,22 +16,21 @@ kiseki/
 ├── crates/
 │   ├── kiseki-common/            ← shared types, HLC, errors
 │   ├── kiseki-crypto/            ← FIPS AEAD, envelope, key wrapping
+│   ├── kiseki-raft/              ← Shared Raft: config, log store, transport
 │   ├── kiseki-log/               ← Log context: delta, shard, Raft
-│   ├── kiseki-chunk/             ← Chunk Storage context: placement, EC, GC
+│   ├── kiseki-chunk/             ← Chunk Storage: placement, EC, device, GC
 │   ├── kiseki-composition/       ← Composition context: namespace, refcount
 │   ├── kiseki-view/              ← View Materialization: stream processors
-│   ├── kiseki-gateway-nfs/       ← Protocol Gateway: NFSv4.1
-│   ├── kiseki-gateway-s3/        ← Protocol Gateway: S3
+│   ├── kiseki-gateway/           ← Protocol Gateway: NFS3, NFSv4.2, S3
 │   ├── kiseki-client/            ← Native Client: FUSE, transport, cache
 │   ├── kiseki-keymanager/        ← Key Management: system key manager (HA)
 │   ├── kiseki-transport/         ← Transport abstraction: TCP, libfabric/CXI
-│   ├── kiseki-proto/             ← Generated protobuf/gRPC (Rust side)
+│   ├── kiseki-proto/             ← Generated protobuf/gRPC
 │   ├── kiseki-audit/             ← Audit log: append-only, export
-│   └── kiseki-advisory/          ← Workflow Advisory: runtime, router, budgets (ADR-020, ADR-021)
-└── bin/
-    ├── kiseki-server/            ← Storage node daemon (composes log+chunk+view+gateway)
-    ├── kiseki-keyserver/         ← System key manager daemon
-    └── kiseki-client-fuse/       ← FUSE mount binary
+│   ├── kiseki-advisory/          ← Workflow Advisory: runtime, router, budgets
+│   ├── kiseki-control/           ← Control Plane: tenancy, IAM, policy (ADR-027)
+│   ├── kiseki-server/            ← Storage node binary
+│   └── kiseki-acceptance/        ← BDD tests (cucumber-rs)
 ```
 
 ## Control plane (Rust — ADR-027)
