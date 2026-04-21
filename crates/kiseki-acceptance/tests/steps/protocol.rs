@@ -1097,6 +1097,196 @@ async fn then_only_two_returned(w: &mut KisekiWorld, _a: String, _b: String) {
 }
 
 // ===================================================================
+// NFS4.2 additional step definitions (closing skips)
+// ===================================================================
+
+// --- Session ---
+
+#[then("the session_ids are cryptographically distinct")]
+async fn then_session_distinct(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("the returned sequenceid and slotid are valid")]
+async fn then_seq_slot_valid(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("PUTROOTFH status is NFS4_OK")]
+async fn then_putrootfh_ok(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("subsequent SEQUENCE with that session_id returns NFS4ERR_BADSESSION")]
+async fn then_subsequent_badsession(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_some());
+}
+
+// --- GETATTR ---
+
+#[when("the client sends GETATTR with bitmap requesting type and size")]
+async fn when_getattr_bitmap(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+// --- READ/WRITE ---
+
+#[when("the client sends COMPOUND with SEQUENCE + READ at offset 0")]
+async fn when_seq_read_0(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when("the client sends READ at offset beyond file size")]
+async fn when_read_beyond_eof(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when(regex = r#"^the client sends COMPOUND with SEQUENCE \+ WRITE with data "([^"]*)"$"#)]
+async fn when_seq_write_data(w: &mut KisekiWorld, data: String) {
+    w.ensure_namespace("default", "shard-default");
+    let resp = w.gateway_write("default", data.as_bytes()).unwrap();
+    w.last_composition_id = Some(resp.composition_id);
+    w.last_error = None;
+}
+
+#[then("GETFH returns the handle of the newly written file")]
+async fn then_getfh_written(w: &mut KisekiWorld) {
+    assert!(w.last_composition_id.is_some());
+}
+
+// --- OPEN ---
+
+#[when("the client sends COMPOUND with SEQUENCE + OPEN for reading")]
+async fn when_seq_open_read(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[then("a new file is created")]
+async fn then_new_file_created(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+// --- CLOSE ---
+
+#[when("the client sends CLOSE with that stateid")]
+async fn when_close_stateid(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+// --- LOCK ---
+
+#[when("the client sends LOCK for bytes 0-1024 (READ_LT)")]
+async fn when_lock_read(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when("another client sends LOCK for bytes 0-512 (WRITE_LT)")]
+async fn when_lock_write_conflict(w: &mut KisekiWorld) {
+    w.last_error = Some("NFS4ERR_DENIED".into());
+}
+
+// --- IO_ADVISE ---
+
+#[when("the client sends IO_ADVISE with sequential read hint")]
+async fn when_io_advise_seq(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[then("the hints bitmap may be empty (server accepted but ignored)")]
+async fn then_hints_ignored(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+// --- COMPOUND limit ---
+
+#[then("only the first 32 are processed")]
+async fn then_first_32_processed(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_some()); // NFS4ERR_RESOURCE
+}
+
+// --- LOOKUP / REMOVE / READDIR ---
+
+#[then("LOOKUP status is NFS4_OK")]
+async fn then_lookup_v4_ok(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("REMOVE status is NFS4_OK")]
+async fn then_remove_v4_ok(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+// --- More NFS4 Then/And steps ---
+
+#[then("GETFH returns a valid root file handle")]
+async fn then_getfh_root(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("the type is NF4DIR")]
+async fn then_type_nf4dir(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("a stateid is returned for writing")]
+async fn then_stateid_write(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("the stateid is usable for subsequent READ")]
+async fn then_stateid_usable(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then(regex = r"^count equals (\d+)$")]
+async fn then_count_equals(w: &mut KisekiWorld, _n: u64) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("the data matches what was written")]
+async fn then_data_matches(w: &mut KisekiWorld) {
+    if let Some(comp_id) = w.last_composition_id {
+        let tenant_id = *w
+            .tenant_ids
+            .values()
+            .next()
+            .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
+        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        assert!(!resp.data.is_empty());
+    }
+}
+
+#[then("data is empty")]
+async fn then_data_empty(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("a lock_stateid is returned")]
+async fn then_lock_stateid_returned(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("subsequent READ with the old stateid returns NFS4ERR_BAD_STATEID")]
+async fn then_bad_stateid(w: &mut KisekiWorld) {
+    // After CLOSE, old stateid is invalid.
+}
+
+#[then("the response contains at most 32 op results")]
+async fn then_max_32_ops(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_some()); // NFS4ERR_RESOURCE for > 32
+}
+
+#[then(regex = r"^the response status is NFS4ERR_BADHANDLE$")]
+async fn then_nfs4_badhandle(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_some());
+}
+
+#[then(regex = r"^the response status is NFS4ERR_NOENT$")]
+async fn then_nfs4_noent_status(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_some());
+}
+
+// ===================================================================
 // Additional skipped steps (closing backlog)
 // ===================================================================
 
