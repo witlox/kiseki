@@ -123,6 +123,8 @@ async fn then_badhandle(w: &mut KisekiWorld) {
 #[given(regex = r#"^a file "([^"]*)" was created via NFS CREATE$"#)]
 async fn given_file_created(w: &mut KisekiWorld, name: String) {
     w.ensure_namespace("default", "shard-bootstrap");
+    let resp = w.gateway_write("default", name.as_bytes()).unwrap();
+    w.last_composition_id = Some(resp.composition_id);
 }
 
 #[when(regex = r#"^the client sends LOOKUP for "([^"]*)" in the root directory$"#)]
@@ -150,8 +152,10 @@ async fn then_noent(w: &mut KisekiWorld) {
 // --- READ ---
 
 #[given(regex = r#"^a file "([^"]*)" was created with content "([^"]*)"$"#)]
-async fn given_file_with_content(w: &mut KisekiWorld, _name: String, _content: String) {
+async fn given_file_with_content(w: &mut KisekiWorld, _name: String, content: String) {
     w.ensure_namespace("default", "shard-bootstrap");
+    let resp = w.gateway_write("default", content.as_bytes()).unwrap();
+    w.last_composition_id = Some(resp.composition_id);
 }
 
 #[when(regex = r#"^the client sends READ on "([^"]*)" at offset (\d+) count (\d+)$"#)]
@@ -165,8 +169,8 @@ async fn then_data_equals(w: &mut KisekiWorld, expected: String) {
     if let Some(comp_id) = w.last_composition_id {
         let tenant_id = *w
             .tenant_ids
-            .get("org-test")
-            .or(w.tenant_ids.get("org-pharma"))
+            .values()
+            .next()
             .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
         let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
         assert_eq!(String::from_utf8_lossy(&resp.data), expected);
@@ -181,7 +185,11 @@ async fn then_eof(w: &mut KisekiWorld, _eof: String) {
 // --- WRITE ---
 
 #[given("a file handle from a prior CREATE")]
-async fn given_file_handle(w: &mut KisekiWorld) {}
+async fn given_file_handle(w: &mut KisekiWorld) {
+    w.ensure_namespace("default", "shard-bootstrap");
+    let resp = w.gateway_write("default", b"file-handle-test").unwrap();
+    w.last_composition_id = Some(resp.composition_id);
+}
 
 #[when(regex = r#"^the client sends WRITE with data "([^"]*)" stable FILE_SYNC$"#)]
 async fn when_write_sync(w: &mut KisekiWorld, data: String) {
@@ -223,8 +231,10 @@ async fn then_handle_follows(w: &mut KisekiWorld) {
 // --- READDIR ---
 
 #[given(regex = r#"^files "([^"]*)" and "([^"]*)" were created via NFS CREATE$"#)]
-async fn given_two_files(w: &mut KisekiWorld, _a: String, _b: String) {
+async fn given_two_files(w: &mut KisekiWorld, a: String, b: String) {
     w.ensure_namespace("default", "shard-bootstrap");
+    let _ = w.gateway_write("default", a.as_bytes());
+    let _ = w.gateway_write("default", b.as_bytes());
 }
 
 #[when("the client sends READDIR on the root directory")]
@@ -412,8 +422,10 @@ async fn then_stateid_invalid(w: &mut KisekiWorld) {
 // --- LOOKUP (NFSv4) ---
 
 #[given(regex = r#"^a file "([^"]*)" exists in the namespace$"#)]
-async fn given_file_exists(w: &mut KisekiWorld, _name: String) {
-    // File exists — precondition.
+async fn given_file_exists(w: &mut KisekiWorld, name: String) {
+    w.ensure_namespace("default", "shard-default");
+    let resp = w.gateway_write("default", name.as_bytes()).unwrap();
+    w.last_composition_id = Some(resp.composition_id);
 }
 
 #[when(regex = r#"^the client sends COMPOUND with PUTROOTFH \+ LOOKUP "([^"]*)" \+ GETFH$"#)]
@@ -680,8 +692,8 @@ async fn then_body_equals(w: &mut KisekiWorld, expected: String) {
     if let Some(comp_id) = w.last_composition_id {
         let tenant_id = *w
             .tenant_ids
-            .get("org-test")
-            .or(w.tenant_ids.get("org-pharma"))
+            .values()
+            .next()
             .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
         let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
         assert_eq!(String::from_utf8_lossy(&resp.data), expected);
@@ -693,8 +705,8 @@ async fn then_content_length(w: &mut KisekiWorld, len: u64) {
     if let Some(comp_id) = w.last_composition_id {
         let tenant_id = *w
             .tenant_ids
-            .get("org-test")
-            .or(w.tenant_ids.get("org-pharma"))
+            .values()
+            .next()
             .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
         let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
         assert_eq!(resp.data.len() as u64, len);
@@ -760,8 +772,8 @@ async fn then_contents(w: &mut KisekiWorld, _a: String, _b: String) {
         .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1)));
     let tenant_id = *w
         .tenant_ids
-        .get("org-test")
-        .or(w.tenant_ids.get("org-pharma"))
+        .values()
+        .next()
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
     let listing = w.gateway.list(tenant_id, ns_id).unwrap();
     assert!(
@@ -785,8 +797,8 @@ async fn given_empty_bucket(w: &mut KisekiWorld, bucket: String) {
                 .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1))),
             tenant_id: *w
                 .tenant_ids
-                .get("org-test")
-                .or(w.tenant_ids.get("org-pharma"))
+                .values()
+                .next()
                 .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1))),
             shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
             read_only: false,
@@ -802,8 +814,8 @@ async fn then_empty_contents(w: &mut KisekiWorld) {
         .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(99)));
     let tenant_id = *w
         .tenant_ids
-        .get("org-test")
-        .or(w.tenant_ids.get("org-pharma"))
+        .values()
+        .next()
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
     let listing = w.gateway.list(tenant_id, ns_id).unwrap();
     assert!(
@@ -822,8 +834,8 @@ async fn then_key_count_0(w: &mut KisekiWorld) {
         .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(99)));
     let tenant_id = *w
         .tenant_ids
-        .get("org-test")
-        .or(w.tenant_ids.get("org-pharma"))
+        .values()
+        .next()
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
     let listing = w.gateway.list(tenant_id, ns_id).unwrap();
     assert_eq!(listing.len(), 0, "KeyCount should be 0");
@@ -914,11 +926,17 @@ async fn given_redb(w: &mut KisekiWorld) {}
 async fn given_file_compound(w: &mut KisekiWorld) {}
 
 #[given("a small file exists")]
-async fn given_small_file(w: &mut KisekiWorld) {}
+async fn given_small_file(w: &mut KisekiWorld) {
+    w.ensure_namespace("default", "shard-default");
+    let resp = w.gateway_write("default", b"small-file-data").unwrap();
+    w.last_composition_id = Some(resp.composition_id);
+}
 
 #[given(regex = r#"^a file "([^"]*)" exists$"#)]
-async fn given_file_exists_short(w: &mut KisekiWorld, _name: String) {
-    panic!("not yet implemented");
+async fn given_file_exists_short(w: &mut KisekiWorld, name: String) {
+    w.ensure_namespace("default", "shard-default");
+    let resp = w.gateway_write("default", name.as_bytes()).unwrap();
+    w.last_composition_id = Some(resp.composition_id);
 }
 
 #[given("a file has a WRITE lock on bytes 0-1024")]
@@ -940,8 +958,10 @@ async fn given_root_fh_nfs4(w: &mut KisekiWorld) {}
 async fn given_two_sessions(w: &mut KisekiWorld) {}
 
 #[given(regex = r#"^files "([^"]*)" and "([^"]*)" exist$"#)]
-async fn given_files_exist(w: &mut KisekiWorld, _a: String, _b: String) {
-    panic!("not yet implemented");
+async fn given_files_exist(w: &mut KisekiWorld, a: String, b: String) {
+    w.ensure_namespace("default", "shard-default");
+    let _ = w.gateway_write("default", a.as_bytes());
+    let _ = w.gateway_write("default", b.as_bytes());
 }
 
 #[when(regex = r"^the client sends COMPOUND with (\d+) operations$")]

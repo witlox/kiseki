@@ -323,7 +323,8 @@ impl KisekiWorld {
             .unwrap_or(&NamespaceId(uuid::Uuid::from_u128(1)));
         let tenant_id = *self
             .tenant_ids
-            .get("org-pharma")
+            .values()
+            .next()
             .unwrap_or(&OrgId(uuid::Uuid::from_u128(1)));
 
         // Ensure namespace exists in the gateway's composition store.
