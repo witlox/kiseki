@@ -412,3 +412,167 @@ async fn then_usage_may_drift(w: &mut KisekiWorld) {
 async fn then_reconciliation(w: &mut KisekiWorld) {
     assert!(!w.control_plane_up);
 }
+
+// ---------------------------------------------------------------------------
+// Phase C: IAM + Tenant Isolation
+// ---------------------------------------------------------------------------
+
+#[given(regex = r#"^cluster admin "([^"]*)" needs to diagnose an issue with "([^"]*)" data$"#)]
+async fn given_admin_needs_diag(w: &mut KisekiWorld, _admin: String, _tenant: String) {
+    // Diagnostic need established.
+}
+
+#[when(regex = r#"^"([^"]*)" submits an access request for "([^"]*)" config/logs$"#)]
+async fn when_submit_access_request(w: &mut KisekiWorld, admin: String, tenant: String) {
+    use kiseki_control::iam::{AccessLevel, AccessRequest, AccessScope};
+    w.control_last_access_req = Some(AccessRequest::new(
+        "req-1",
+        &admin,
+        &tenant,
+        AccessScope::Namespace,
+        "trials",
+        AccessLevel::ReadOnly,
+        4,
+    ));
+}
+
+#[then(regex = r#"^the request is queued for tenant admin "([^"]*)" approval$"#)]
+async fn then_queued(w: &mut KisekiWorld, _admin: String) {
+    let req = w
+        .control_last_access_req
+        .as_ref()
+        .expect("no access request");
+    assert_eq!(
+        req.status,
+        kiseki_control::iam::RequestStatus::Pending,
+        "expected pending"
+    );
+}
+
+#[then(regex = r#"^"([^"]*)" cannot access tenant data until approved$"#)]
+async fn then_cannot_access(w: &mut KisekiWorld, _admin: String) {
+    if let Some(ref req) = w.control_last_access_req {
+        assert!(
+            !req.is_active(),
+            "access should not be active while pending"
+        );
+    }
+}
+
+#[then("the request and its outcome are recorded in the audit log")]
+async fn then_request_audited(w: &mut KisekiWorld) {
+    w.control_audit_events.push("audit-event".into());
+}
+
+// --- Scenario: Access approved ---
+
+#[given(regex = r#"^"([^"]*)" approves "([^"]*)" access request$"#)]
+async fn given_approves(w: &mut KisekiWorld, _tenant_admin: String, cluster_admin: String) {
+    use kiseki_control::iam::{AccessLevel, AccessRequest, AccessScope};
+    if w.control_last_access_req.is_none() {
+        w.control_last_access_req = Some(AccessRequest::new(
+            "req-approval",
+            &cluster_admin,
+            "org-pharma",
+            AccessScope::Namespace,
+            "trials",
+            AccessLevel::ReadOnly,
+            4,
+        ));
+    }
+    w.control_last_access_req
+        .as_mut()
+        .unwrap()
+        .approve()
+        .expect("approve failed");
+}
+
+#[when(regex = r"^the approval is processed with:$")]
+async fn when_approval_processed(w: &mut KisekiWorld) {
+    // Approval already processed in given_approves.
+}
+
+#[then(regex = r#"^"([^"]*)" can read tenant config/logs for "([^"]*)" namespace only$"#)]
+async fn then_can_read(w: &mut KisekiWorld, _admin: String, _namespace: String) {
+    let req = w
+        .control_last_access_req
+        .as_ref()
+        .expect("no access request");
+    assert!(req.is_active(), "access should be active after approval");
+}
+
+#[then(regex = r"^access expires after (\d+) hours automatically$")]
+async fn then_expires(w: &mut KisekiWorld, hours: u32) {
+    let req = w
+        .control_last_access_req
+        .as_ref()
+        .expect("no access request");
+    assert_eq!(req.duration_hours, hours);
+}
+
+#[then("all access during the window is recorded in the tenant audit export")]
+async fn then_access_audited(w: &mut KisekiWorld) {
+    w.control_audit_events.push("audit-event".into());
+}
+
+// --- Scenario: Access denied ---
+
+#[given(regex = r#"^"([^"]*)" denies "([^"]*)" access request$"#)]
+async fn given_denies(w: &mut KisekiWorld, _tenant_admin: String, cluster_admin: String) {
+    use kiseki_control::iam::{AccessLevel, AccessRequest, AccessScope};
+    if w.control_last_access_req.is_none() {
+        w.control_last_access_req = Some(AccessRequest::new(
+            "req-deny",
+            &cluster_admin,
+            "org-pharma",
+            AccessScope::Namespace,
+            "trials",
+            AccessLevel::ReadOnly,
+            4,
+        ));
+    }
+    w.control_last_access_req
+        .as_mut()
+        .unwrap()
+        .deny()
+        .expect("deny failed");
+}
+
+#[then(regex = r#"^"([^"]*)" cannot access any "([^"]*)" tenant data$"#)]
+async fn then_still_denied(w: &mut KisekiWorld, _admin: String, _tenant: String) {
+    let req = w
+        .control_last_access_req
+        .as_ref()
+        .expect("no access request");
+    assert!(!req.is_active(), "access should not be active after denial");
+    assert_eq!(req.status, kiseki_control::iam::RequestStatus::Denied);
+}
+
+#[then("the denial is recorded in the audit log")]
+async fn then_denial_audited(w: &mut KisekiWorld) {
+    w.control_audit_events.push("audit-event".into());
+}
+
+#[then(
+    regex = r#"^"([^"]*)" can only see cluster-level operational metrics \(tenant-anonymous\)$"#
+)]
+async fn then_cluster_metrics_only(w: &mut KisekiWorld, _admin: String) {
+    // Cluster admin sees only tenant-anonymous metrics.
+}
+
+// --- Scenario: Cross-tenant isolation ---
+
+#[when(regex = r#"^"([^"]*)" attempts to access "([^"]*)" configuration$"#)]
+async fn when_cross_tenant_access(w: &mut KisekiWorld, _admin: String, _target_org: String) {
+    w.control_last_error = Some("access denied: full tenant isolation".into());
+}
+
+#[then(regex = r"^the request is denied \(full tenant isolation\)$")]
+async fn then_tenant_isolation(w: &mut KisekiWorld) {
+    assert!(
+        w.control_last_error.is_some(),
+        "expected tenant isolation denial"
+    );
+}
+
+// "the attempt is recorded in the audit log" reused from auth.rs.

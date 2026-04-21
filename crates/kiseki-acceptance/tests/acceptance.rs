@@ -29,6 +29,7 @@ use kiseki_common::tenancy::*;
 use kiseki_common::time::*;
 use kiseki_composition::composition::CompositionStore;
 use kiseki_composition::namespace::Namespace;
+use kiseki_control::iam::AccessRequest;
 use kiseki_control::maintenance::MaintenanceState;
 use kiseki_control::namespace::NamespaceStore;
 use kiseki_control::tenant::TenantStore;
@@ -86,6 +87,7 @@ pub struct KisekiWorld {
     pub control_last_project_id: Option<String>,
     pub control_last_workload_id: Option<String>,
     pub control_last_error: Option<String>,
+    pub control_last_access_req: Option<AccessRequest>,
     pub control_audit_events: Vec<String>,
     pub control_plane_up: bool,
 }
@@ -140,6 +142,7 @@ impl KisekiWorld {
             control_last_project_id: None,
             control_last_workload_id: None,
             control_last_error: None,
+            control_last_access_req: None,
             control_audit_events: Vec::new(),
             control_plane_up: true,
         }

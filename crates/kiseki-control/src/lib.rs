@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 pub mod error;
+pub mod iam;
 pub mod maintenance;
 pub mod namespace;
 pub mod tenant;
