@@ -7,9 +7,41 @@
 //! protocol operations via the in-memory gateway stores.
 
 use cucumber::{given, then, when};
+use kiseki_gateway::nfs3_server::handle_nfs3_first_message;
+use kiseki_gateway::nfs_xdr::{RpcCallHeader, XdrWriter};
 use kiseki_gateway::ops::GatewayOps;
 
 use crate::KisekiWorld;
+
+/// Build an NFS3 RPC CALL message for a given procedure with body bytes.
+fn build_nfs3_rpc(xid: u32, procedure: u32, body: &[u8]) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    w.write_u32(xid);
+    w.write_u32(0); // CALL
+    w.write_u32(2); // rpc version
+    w.write_u32(100003); // NFS3 program
+    w.write_u32(3); // NFS3 version
+    w.write_u32(procedure);
+    w.write_u32(0);
+    w.write_u32(0); // AUTH_NONE cred
+    w.write_u32(0);
+    w.write_u32(0); // AUTH_NONE verf
+    let mut msg = w.into_bytes();
+    msg.extend_from_slice(body);
+    msg
+}
+
+/// Send an NFS3 RPC through the real server and return the reply bytes.
+fn nfs3_call(w: &KisekiWorld, procedure: u32, body: &[u8]) -> Vec<u8> {
+    let msg = build_nfs3_rpc(1, procedure, body);
+    let header = RpcCallHeader {
+        xid: 1,
+        program: 100003,
+        version: 3,
+        procedure,
+    };
+    handle_nfs3_first_message(&header, &msg, &w.nfs_ctx)
+}
 
 // ===================================================================
 // Shared background steps
@@ -152,21 +184,54 @@ async fn then_noent(w: &mut KisekiWorld) {
 // --- READ ---
 
 #[given(regex = r#"^a file "([^"]*)" was created with content "([^"]*)"$"#)]
-async fn given_file_with_content(w: &mut KisekiWorld, _name: String, content: String) {
+async fn given_file_with_content(w: &mut KisekiWorld, name: String, content: String) {
+    // Write through gateway_write (which handles namespace registration).
     w.ensure_namespace("default", "shard-bootstrap");
     let resp = w.gateway_write("default", content.as_bytes()).unwrap();
     w.last_composition_id = Some(resp.composition_id);
+    // Also register in NFS directory index so lookup_by_name works.
+    let fh = w.nfs_ctx.handles.file_handle(
+        w.nfs_ctx.namespace_id,
+        w.nfs_ctx.tenant_id,
+        resp.composition_id,
+    );
+    w.nfs_ctx.dir_index.insert(
+        w.nfs_ctx.namespace_id,
+        name,
+        fh,
+        resp.composition_id,
+        content.len() as u64,
+    );
+    w.last_read_data = None; // Clear for When step to fill.
 }
 
 #[when(regex = r#"^the client sends READ on "([^"]*)" at offset (\d+) count (\d+)$"#)]
-async fn when_read(w: &mut KisekiWorld, _name: String, _offset: u64, _count: u64) {
-    w.last_error = None;
+async fn when_read(w: &mut KisekiWorld, name: String, offset: u64, count: u64) {
+    // Read through real NFS context (handles offset/count correctly).
+    if let Some((fh, _)) = w.nfs_ctx.lookup_by_name(&name) {
+        match w.nfs_ctx.read(&fh, offset, count as u32) {
+            Ok(resp) => {
+                w.last_read_data = Some(resp.data);
+                w.last_error = None;
+            }
+            Err(e) => w.last_error = Some(e.to_string()),
+        }
+    } else {
+        w.last_error = Some("file not found".into());
+    }
 }
 
 #[then(regex = r#"^the data equals "([^"]*)"$"#)]
 async fn then_data_equals(w: &mut KisekiWorld, expected: String) {
-    // Read through gateway pipeline — data should match.
-    if let Some(comp_id) = w.last_composition_id {
+    // Use data from last NFS read (When step stores it in last_read_data).
+    if let Some(ref data) = w.last_read_data {
+        assert_eq!(
+            String::from_utf8_lossy(data),
+            expected,
+            "read data mismatch"
+        );
+    } else if let Some(comp_id) = w.last_composition_id {
+        // Fallback: read through gateway for non-NFS scenarios.
         let tenant_id = *w
             .tenant_ids
             .values()

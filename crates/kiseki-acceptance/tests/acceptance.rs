@@ -37,6 +37,8 @@ use kiseki_control::namespace::NamespaceStore;
 use kiseki_control::retention::RetentionStore;
 use kiseki_control::tenant::TenantStore;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
+use kiseki_gateway::nfs::NfsGateway;
+use kiseki_gateway::nfs_ops::NfsContext;
 use kiseki_gateway::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 use kiseki_keymanager::store::MemKeyStore;
 use kiseki_log::shard::{ShardConfig, ShardState};
@@ -65,9 +67,11 @@ pub struct KisekiWorld {
 
     // === Integrated pipeline (R1) ===
     pub gateway: Arc<InMemoryGateway>,
+    pub nfs_ctx: Arc<NfsContext<Arc<InMemoryGateway>>>,
 
     // === Test state ===
     pub last_error: Option<String>,
+    pub last_read_data: Option<Vec<u8>>,
     pub last_epoch: Option<u64>,
     pub last_sequence: Option<SequenceNumber>,
     pub last_shard_id: Option<ShardId>,
@@ -142,6 +146,19 @@ impl KisekiWorld {
         let gw_master = kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], KeyEpoch(1));
         let gateway = Arc::new(InMemoryGateway::new(gw_comps, gw_chunks, gw_master));
 
+        // NFS context wrapping the gateway — for real NFS3/4 wire-format testing.
+        let default_ns = NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
+        let default_tenant = OrgId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"org-test"));
+        // Register the NFS namespace in the gateway's composition store.
+        gateway.add_namespace(Namespace {
+            id: default_ns,
+            tenant_id: default_tenant,
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+        });
+        let nfs_gw = NfsGateway::new(Arc::clone(&gateway));
+        let nfs_ctx = Arc::new(NfsContext::new(nfs_gw, default_tenant, default_ns));
+
         Self {
             log_store,
             key_store,
@@ -156,7 +173,9 @@ impl KisekiWorld {
                 max_phases_per_workflow: 50,
             }),
             gateway,
+            nfs_ctx,
             last_error: None,
+            last_read_data: None,
             last_epoch: None,
             last_sequence: None,
             last_shard_id: None,
