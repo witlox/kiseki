@@ -35,6 +35,7 @@ use kiseki_control::iam::AccessRequest;
 use kiseki_control::maintenance::MaintenanceState;
 use kiseki_control::namespace::NamespaceStore;
 use kiseki_control::retention::RetentionStore;
+use kiseki_control::storage_admin::StorageAdminService;
 use kiseki_control::tenant::TenantStore;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
 use kiseki_gateway::nfs::NfsGateway;
@@ -121,6 +122,9 @@ pub struct KisekiWorld {
     pub control_workload_policy: Option<kiseki_control::advisory_policy::ScopePolicy>,
     pub control_last_policy_error: Option<String>,
     pub control_pool_authorized: std::collections::HashMap<String, String>,
+
+    // === Storage admin (ADR-025) ===
+    pub control_admin: StorageAdminService,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -149,11 +153,21 @@ impl KisekiWorld {
         // NFS context wrapping the gateway — for real NFS3/4 wire-format testing.
         let default_ns = NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
         let default_tenant = OrgId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"org-test"));
+        let default_shard = ShardId(uuid::Uuid::from_u128(1));
+        // Ensure the shard exists in the log store — the composition store's log
+        // bridge emits deltas on write (PIPE-ADV-1 rollback) which requires the
+        // shard to exist.
+        log_store.create_shard(
+            default_shard,
+            default_tenant,
+            kiseki_common::ids::NodeId(1),
+            ShardConfig::default(),
+        );
         // Register the NFS namespace in the gateway's composition store.
         gateway.add_namespace(Namespace {
             id: default_ns,
             tenant_id: default_tenant,
-            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            shard_id: default_shard,
             read_only: false,
         });
         let nfs_gw = NfsGateway::new(Arc::clone(&gateway));
@@ -219,6 +233,7 @@ impl KisekiWorld {
             control_workload_policy: None,
             control_last_policy_error: None,
             control_pool_authorized: HashMap::new(),
+            control_admin: StorageAdminService::new(),
         }
     }
 
@@ -290,6 +305,28 @@ impl KisekiWorld {
         ns_id
     }
 
+    /// Ensure the default gateway namespace is registered with the NFS
+    /// context's tenant, so `gateway.write(...)` succeeds without callers
+    /// needing to set up namespaces individually.
+    pub fn ensure_gateway_ns(&self) {
+        let tenant_id = self.nfs_ctx.tenant_id;
+        let ns_id = self.nfs_ctx.namespace_id;
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        // Ensure the log store has the shard (composition store log bridge needs it).
+        self.log_store.create_shard(
+            shard_id,
+            tenant_id,
+            kiseki_common::ids::NodeId(1),
+            ShardConfig::default(),
+        );
+        self.gateway.add_namespace(Namespace {
+            id: ns_id,
+            tenant_id,
+            shard_id,
+            read_only: false,
+        });
+    }
+
     /// Make a test timestamp.
     pub fn timestamp(&self) -> DeltaTimestamp {
         DeltaTimestamp {
@@ -334,24 +371,43 @@ impl KisekiWorld {
         }
     }
 
+    /// Resolve the tenant to use for gateway operations.
+    ///
+    /// Prefers "org-pharma" when registered (most scenarios), then falls back
+    /// to any registered tenant, and finally to the NFS context's default.
+    pub fn gateway_tenant(&self) -> OrgId {
+        self.tenant_ids
+            .get("org-pharma")
+            .or_else(|| self.tenant_ids.values().next())
+            .copied()
+            .unwrap_or(self.nfs_ctx.tenant_id)
+    }
+
     /// Write data through the integrated pipeline (gateway → encrypt → store).
     pub fn gateway_write(&self, ns_name: &str, data: &[u8]) -> Result<WriteResponse, String> {
+        self.gateway_write_as(ns_name, data, self.gateway_tenant())
+    }
+
+    /// Write data through the pipeline with an explicit tenant.
+    pub fn gateway_write_as(
+        &self,
+        ns_name: &str,
+        data: &[u8],
+        tenant_id: OrgId,
+    ) -> Result<WriteResponse, String> {
         let ns_id = *self
             .namespace_ids
             .get(ns_name)
             .unwrap_or(&NamespaceId(uuid::Uuid::from_u128(1)));
-        let tenant_id = *self
-            .tenant_ids
-            .values()
-            .next()
-            .unwrap_or(&OrgId(uuid::Uuid::from_u128(1)));
 
-        // Ensure namespace exists in the gateway's composition store.
-        let shard_id = *self
-            .shard_names
-            .values()
-            .next()
-            .unwrap_or(&ShardId(uuid::Uuid::from_u128(1)));
+        // Ensure namespace and its shard exist in the gateway's stores.
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        self.log_store.create_shard(
+            shard_id,
+            tenant_id,
+            kiseki_common::ids::NodeId(1),
+            ShardConfig::default(),
+        );
         self.gateway.add_namespace(Namespace {
             id: ns_id,
             tenant_id,

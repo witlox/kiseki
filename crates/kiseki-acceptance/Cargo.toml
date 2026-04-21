@@ -30,6 +30,8 @@ kiseki-view = { path = "../kiseki-view" }
 kiseki-advisory = { path = "../kiseki-advisory" }
 kiseki-control = { path = "../kiseki-control" }
 kiseki-gateway = { path = "../kiseki-gateway" }
+kiseki-transport = { path = "../kiseki-transport" }
+kiseki-client = { path = "../kiseki-client" }
 
 # BDD framework
 cucumber = { workspace = true }
