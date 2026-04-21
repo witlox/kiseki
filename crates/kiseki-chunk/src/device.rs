@@ -152,9 +152,9 @@ impl ManagedDevice {
     /// Check if device should auto-evacuate based on health indicators.
     #[must_use]
     pub fn should_auto_evacuate(&self) -> bool {
-        // SSD: SMART wear > 90%.
+        // SSD: SMART wear >= 90% (ADR-024).
         if let Some(wear) = self.smart_wear_pct {
-            if wear > 90 {
+            if wear >= 90 {
                 return true;
             }
         }

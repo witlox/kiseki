@@ -27,6 +27,10 @@ pub fn place_fragments(
     n_fragments: usize,
     devices: &[DeviceInfo],
 ) -> Option<Vec<usize>> {
+    if n_fragments == 0 {
+        return None;
+    }
+
     let online: Vec<usize> = devices
         .iter()
         .enumerate()

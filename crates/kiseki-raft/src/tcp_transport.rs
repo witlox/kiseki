@@ -1,10 +1,11 @@
 //! TCP transport for multi-node Raft.
 //!
 //! Implements openraft's `RaftNetworkFactory` and `RaftNetworkV2` traits
-//! over TCP with bincode serialization. Per ADR-026 (Strategy A).
+//! over TCP with JSON serialization. Per ADR-026 (Strategy A).
 //!
-//! Each Raft RPC (AppendEntries, Vote, Snapshot) is serialized with
-//! bincode, length-prefixed (u32 big-endian), and sent over TCP.
+//! Each Raft RPC (`AppendEntries`, `Vote`, Snapshot) is serialized with
+//! `serde_json`, length-prefixed (u32 big-endian), and sent over TCP.
+//! MVP: plaintext TCP. Production requires mTLS (G-ADV-11).
 
 use std::io;
 use std::sync::Arc;

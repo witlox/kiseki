@@ -156,14 +156,17 @@ impl TenantStore {
     }
 
     /// Create a project within an organization.
+    ///
+    /// Holds org read lock during quota validation and project insert
+    /// to prevent TOCTOU (G-ADV-4).
     pub fn create_project(&self, proj: Project) -> Result<(), ControlError> {
         let orgs = self.orgs.read().unwrap();
         let org = orgs
             .get(&proj.org_id)
             .ok_or_else(|| ControlError::NotFound(format!("organization {}", proj.org_id)))?;
         validate_quota(&org.quota, &proj.quota)?;
-        drop(orgs);
 
+        // Hold org lock while inserting project — prevents TOCTOU.
         let mut projects = self.projects.write().unwrap();
         projects.insert(proj.id.clone(), proj);
         Ok(())
@@ -185,7 +188,6 @@ impl TenantStore {
             .get(&wl.org_id)
             .ok_or_else(|| ControlError::NotFound(format!("organization {}", wl.org_id)))?;
         validate_quota(&org.quota, &wl.quota)?;
-        drop(orgs);
 
         let mut workloads = self.workloads.write().unwrap();
         workloads.insert(wl.id.clone(), wl);

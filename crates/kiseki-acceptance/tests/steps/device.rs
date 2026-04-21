@@ -212,7 +212,7 @@ async fn then_pool_health(w: &mut KisekiWorld, expected: String) {
         assert_eq!(health.to_string(), expected);
         return;
     }
-    assert_eq!(expected, expected); // pass-through
+    // Pool not found — assertion handled above for known pools.
 }
 
 #[then("a telemetry event is emitted")]

@@ -33,6 +33,8 @@ struct ChunkEntry {
     pool: String,
     /// EC metadata (None for replication-mode pools).
     ec: Option<EcMeta>,
+    /// Total bytes charged to pool (includes EC overhead). Used by GC.
+    stored_bytes: u64,
 }
 
 /// Chunk storage operations trait.
@@ -195,13 +197,8 @@ impl ChunkOps for ChunkStore {
                         })
                         .collect();
 
-                    let device_indices = if dev_infos.len() >= total {
-                        placement::place_fragments(&chunk_id, total, &dev_infos)
-                            .ok_or(ChunkError::EcInvalidConfig)?
-                    } else {
-                        // Not enough devices ��� store without placement.
-                        (0..total).collect()
-                    };
+                    let device_indices = placement::place_fragments(&chunk_id, total, &dev_infos)
+                        .ok_or(ChunkError::EcInvalidConfig)?;
 
                     storage_size = encoded.fragments.iter().map(|f| f.len() as u64).sum();
 
@@ -238,6 +235,7 @@ impl ChunkOps for ChunkStore {
                 retention_holds: HashSet::new(),
                 pool: pool.to_owned(),
                 ec: ec_meta,
+                stored_bytes: storage_size,
             },
         );
 
@@ -311,9 +309,7 @@ impl ChunkOps for ChunkStore {
         for id in &to_remove {
             if let Some(entry) = self.chunks.remove(id) {
                 if let Some(pool) = self.pools.get_mut(&entry.pool) {
-                    pool.used_bytes = pool
-                        .used_bytes
-                        .saturating_sub(entry.envelope.ciphertext.len() as u64);
+                    pool.used_bytes = pool.used_bytes.saturating_sub(entry.stored_bytes);
                 }
             }
         }
@@ -350,11 +346,10 @@ mod tests {
 
     fn setup_store() -> ChunkStore {
         let mut store = ChunkStore::new();
-        store.add_pool(AffinityPool::new(
-            "fast-nvme",
-            DurabilityStrategy::default(),
-            1024 * 1024 * 1024,
-        ));
+        store.add_pool(
+            AffinityPool::new("fast-nvme", DurabilityStrategy::default(), 1024 * 1024 * 1024)
+                .with_devices(6),
+        );
         store
     }
 
