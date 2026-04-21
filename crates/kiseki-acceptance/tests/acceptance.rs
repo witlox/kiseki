@@ -29,6 +29,7 @@ use kiseki_common::tenancy::*;
 use kiseki_common::time::*;
 use kiseki_composition::composition::CompositionStore;
 use kiseki_composition::namespace::Namespace;
+use kiseki_control::tenant::TenantStore;
 use kiseki_keymanager::store::MemKeyStore;
 use kiseki_log::shard::{ShardConfig, ShardState};
 use kiseki_log::store::MemShardStore;
@@ -74,6 +75,15 @@ pub struct KisekiWorld {
     // === Flags for behavioral assertions ===
     pub writes_rejected: bool,
     pub reads_working: bool,
+
+    // === Control plane (ADR-027 migration) ===
+    pub control_tenant_store: TenantStore,
+    pub control_last_org_id: Option<String>,
+    pub control_last_project_id: Option<String>,
+    pub control_last_workload_id: Option<String>,
+    pub control_last_error: Option<String>,
+    pub control_audit_events: Vec<String>,
+    pub control_plane_up: bool,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -119,6 +129,13 @@ impl KisekiWorld {
             workflow_names: HashMap::new(),
             writes_rejected: false,
             reads_working: false,
+            control_tenant_store: TenantStore::new(),
+            control_last_org_id: None,
+            control_last_project_id: None,
+            control_last_workload_id: None,
+            control_last_error: None,
+            control_audit_events: Vec::new(),
+            control_plane_up: true,
         }
     }
 
@@ -145,7 +162,28 @@ impl KisekiWorld {
             name.as_bytes(),
         ));
         self.tenant_ids.insert(name.to_owned(), id);
+
+        // Also populate control-plane tenant store (ADR-027 migration).
+        self.ensure_control_tenant(name);
+
         id
+    }
+
+    /// Ensure a tenant exists in the control-plane store.
+    pub fn ensure_control_tenant(&mut self, name: &str) {
+        use kiseki_control::tenant::Organization;
+        let org = Organization {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            compliance_tags: vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr],
+            dedup_policy: DedupPolicy::CrossTenant,
+            quota: Quota {
+                capacity_bytes: 500_000_000_000_000,
+                iops: 100_000,
+                metadata_ops_per_sec: 10_000,
+            },
+        };
+        let _ = self.control_tenant_store.create_org(org);
     }
 
     /// Get or create a namespace by name.

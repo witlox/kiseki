@@ -8,6 +8,7 @@ members = [
     "crates/kiseki-client",
     "crates/kiseki-common",
     "crates/kiseki-composition",
+    "crates/kiseki-control",
     "crates/kiseki-crypto",
     "crates/kiseki-gateway",
     "crates/kiseki-keymanager",

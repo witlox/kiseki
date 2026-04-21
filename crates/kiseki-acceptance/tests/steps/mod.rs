@@ -9,6 +9,7 @@ pub mod auth;
 pub mod chunk;
 pub mod client;
 pub mod composition;
+pub mod control;
 pub mod crypto;
 pub mod gateway;
 pub mod helpers;

@@ -1,0 +1,24 @@
+[package]
+name = "kiseki-control"
+description = "Control plane for Kiseki: tenancy, IAM, policy, flavor, federation, compliance."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# ADV-3: Dependency firewall — control plane depends ONLY on kiseki-common
+# and kiseki-proto. No data-path crates (log, chunk, composition, view,
+# gateway, client, keymanager, crypto, raft, transport, audit, advisory).
+[dependencies]
+kiseki-common = { path = "../kiseki-common" }
+kiseki-proto = { path = "../kiseki-proto" }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
