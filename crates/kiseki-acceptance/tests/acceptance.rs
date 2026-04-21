@@ -36,6 +36,8 @@ use kiseki_control::maintenance::MaintenanceState;
 use kiseki_control::namespace::NamespaceStore;
 use kiseki_control::retention::RetentionStore;
 use kiseki_control::tenant::TenantStore;
+use kiseki_gateway::mem_gateway::InMemoryGateway;
+use kiseki_gateway::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 use kiseki_keymanager::store::MemKeyStore;
 use kiseki_log::shard::{ShardConfig, ShardState};
 use kiseki_log::store::MemShardStore;
@@ -60,6 +62,9 @@ pub struct KisekiWorld {
     pub view_store: ViewStore,
     pub advisory_table: WorkflowTable,
     pub budget_enforcer: BudgetEnforcer,
+
+    // === Integrated pipeline (R1) ===
+    pub gateway: Arc<InMemoryGateway>,
 
     // === Test state ===
     pub last_error: Option<String>,
@@ -129,6 +134,14 @@ impl KisekiWorld {
         let log_store = Arc::new(MemShardStore::new());
         let comp_store = CompositionStore::new()
             .with_log(Arc::clone(&log_store) as Arc<dyn LogOps + Send + Sync>);
+
+        // Integrated pipeline: InMemoryGateway chains encrypt → store → composition.
+        let gw_chunks = kiseki_chunk::ChunkStore::new();
+        let gw_comps = CompositionStore::new()
+            .with_log(Arc::clone(&log_store) as Arc<dyn LogOps + Send + Sync>);
+        let gw_master = kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let gateway = Arc::new(InMemoryGateway::new(gw_comps, gw_chunks, gw_master));
+
         Self {
             log_store,
             key_store,
@@ -142,6 +155,7 @@ impl KisekiWorld {
                 max_concurrent_workflows: 10,
                 max_phases_per_workflow: 50,
             }),
+            gateway,
             last_error: None,
             last_epoch: None,
             last_sequence: None,
@@ -299,6 +313,47 @@ impl KisekiWorld {
             payload: vec![0xab; 64],
             has_inline_data: false,
         }
+    }
+
+    /// Write data through the integrated pipeline (gateway → encrypt → store).
+    pub fn gateway_write(&self, ns_name: &str, data: &[u8]) -> Result<WriteResponse, String> {
+        let ns_id = *self
+            .namespace_ids
+            .get(ns_name)
+            .unwrap_or(&NamespaceId(uuid::Uuid::from_u128(1)));
+        let tenant_id = *self
+            .tenant_ids
+            .get("org-pharma")
+            .unwrap_or(&OrgId(uuid::Uuid::from_u128(1)));
+        self.gateway
+            .write(WriteRequest {
+                namespace_id: ns_id,
+                tenant_id,
+                data: data.to_vec(),
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Read data through the integrated pipeline (store → decrypt → gateway).
+    pub fn gateway_read(
+        &self,
+        composition_id: CompositionId,
+        tenant_id: OrgId,
+        ns_name: &str,
+    ) -> Result<ReadResponse, String> {
+        let ns_id = *self
+            .namespace_ids
+            .get(ns_name)
+            .unwrap_or(&NamespaceId(uuid::Uuid::from_u128(1)));
+        self.gateway
+            .read(ReadRequest {
+                tenant_id,
+                namespace_id: ns_id,
+                composition_id,
+                offset: 0,
+                length: u64::MAX,
+            })
+            .map_err(|e| e.to_string())
     }
 }
 
