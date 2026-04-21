@@ -10,7 +10,9 @@ use kiseki_log::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 // === Background ===
 
 #[given("a Kiseki cluster with 5 storage nodes")]
-async fn given_cluster(_w: &mut KisekiWorld) {}
+async fn given_cluster(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^a shard "(\S+)" with a 3-member Raft group on nodes 1, 2, 3$"#)]
 async fn given_shard_raft(w: &mut KisekiWorld, name: String) {
@@ -175,13 +177,19 @@ async fn when_node_unreachable(_w: &mut KisekiWorld) {
 }
 
 #[then("a new leader is elected from nodes 2 and 3")]
-async fn then_new_leader(_w: &mut KisekiWorld) {}
+async fn then_new_leader(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("writes resume after election completes")]
-async fn then_writes_resume(_w: &mut KisekiWorld) {}
+async fn then_writes_resume(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("in-flight uncommitted deltas are retried by the Composition context")]
-async fn then_retried(_w: &mut KisekiWorld) {}
+async fn then_retried(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("no committed deltas are lost")]
 async fn then_no_loss(w: &mut KisekiWorld) {
@@ -238,10 +246,14 @@ async fn given_nodes_down(w: &mut KisekiWorld, _a: u64, _b: u64, name: String) {
 }
 
 #[given("only node 1 (leader) remains")]
-async fn given_one_node(_w: &mut KisekiWorld) {}
+async fn given_one_node(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^shard "(\S+)" cannot form a Raft majority$"#)]
-async fn then_no_majority(_w: &mut KisekiWorld) {}
+async fn then_no_majority(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^all write commands are rejected with "quorum unavailable" error$"#)]
 async fn then_quorum_unavailable(w: &mut KisekiWorld) {
@@ -279,10 +291,14 @@ async fn when_node_back(w: &mut KisekiWorld, _n: u64) {
 }
 
 #[then("quorum is restored (2 of 3)")]
-async fn then_quorum(_w: &mut KisekiWorld) {}
+async fn then_quorum(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("a leader is elected (or confirmed)")]
-async fn then_leader_confirmed(_w: &mut KisekiWorld) {}
+async fn then_leader_confirmed(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("writes resume")]
 async fn then_writes_ok(w: &mut KisekiWorld) {
@@ -292,7 +308,9 @@ async fn then_writes_ok(w: &mut KisekiWorld) {
 }
 
 #[then("the recovered node catches up by replaying missed deltas")]
-async fn then_catchup(_w: &mut KisekiWorld) {}
+async fn then_catchup(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // === Scenario 8: Shard split ===
 
@@ -312,13 +330,19 @@ async fn given_n_deltas(w: &mut KisekiWorld, name: String, count: u64) {
 }
 
 #[then("a SplitShard operation is triggered automatically")]
-async fn then_split_triggered(_w: &mut KisekiWorld) {}
+async fn then_split_triggered(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^a new shard "(\S+)" is created$"#)]
-async fn then_new_shard(_w: &mut KisekiWorld, _name: String) {}
+async fn then_new_shard(_w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 #[then("new deltas are routed to the appropriate shard by hashed_key range")]
-async fn then_routing(_w: &mut KisekiWorld) {}
+async fn then_routing(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^"(\S+)" continues serving reads for its existing range$"#)]
 async fn then_serves_reads(w: &mut KisekiWorld, name: String) {
@@ -340,7 +364,9 @@ async fn then_serves_reads(w: &mut KisekiWorld, name: String) {
 }
 
 #[then("a ShardSplit event is emitted")]
-async fn then_split_event(_w: &mut KisekiWorld) {}
+async fn then_split_event(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // === Scenario 9: Split doesn't block writes ===
 
@@ -388,7 +414,9 @@ async fn given_sstables(w: &mut KisekiWorld, name: String) {
 }
 
 #[given(regex = r#"^the compaction threshold is \d+ SSTables$"#)]
-async fn given_threshold(_w: &mut KisekiWorld) {}
+async fn given_threshold(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when("automatic compaction is triggered")]
 async fn when_compact(w: &mut KisekiWorld) {
@@ -602,7 +630,9 @@ async fn then_ordered(w: &mut KisekiWorld) {
 // === Scenario 21: Advisory disabled ===
 
 #[given("advisory is disabled cluster-wide")]
-async fn given_no_advisory(_w: &mut KisekiWorld) {}
+async fn given_no_advisory(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when("workloads append deltas, trigger shard splits, and run compaction")]
 async fn when_normal_ops(w: &mut KisekiWorld) {
@@ -617,13 +647,17 @@ async fn then_ops_ok(w: &mut KisekiWorld) {
 }
 
 #[then("no compaction pacing heuristic uses absent advisory signals (behaves as if no phase markers were present)")]
-async fn then_no_pacing(_w: &mut KisekiWorld) {}
+async fn then_no_pacing(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // === Remaining missing steps ===
 
 // Compaction: tombstones
 #[then("tombstoned entries are removed if all consumers have advanced past them")]
-async fn then_tombstones(_w: &mut KisekiWorld) {}
+async fn then_tombstones(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("tenant-encrypted payloads are carried opaquely — never decrypted")]
 async fn then_opaque(w: &mut KisekiWorld) {
@@ -671,14 +705,20 @@ async fn then_same_semantics(w: &mut KisekiWorld) {
 }
 
 #[then("the operation is recorded in the audit log")]
-async fn then_audit_logged(_w: &mut KisekiWorld) {}
+async fn then_audit_logged(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // Stalled consumer alert
 #[then("an alert is raised to the cluster admin (GC blocked)")]
-async fn then_alert_gc(_w: &mut KisekiWorld) {}
+async fn then_alert_gc(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("an alert is raised to the tenant admin (view is stale)")]
-async fn then_alert_stale(_w: &mut KisekiWorld) {}
+async fn then_alert_stale(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // Maintenance events
 #[then("a ShardMaintenanceEntered event is emitted")]
@@ -699,14 +739,20 @@ async fn then_maint_event(w: &mut KisekiWorld) {
 
 // Exit maintenance — split trigger
 #[then(regex = r#"^if "(\S+)" was at the hard ceiling, SplitShard triggers immediately$"#)]
-async fn then_split_if_needed(_w: &mut KisekiWorld, _name: String) {}
+async fn then_split_if_needed(_w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 // Stream processor reads envelope
 #[then("each delta includes the full envelope (header + encrypted payload)")]
-async fn then_full_envelope(_w: &mut KisekiWorld) {}
+async fn then_full_envelope(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the stream processor decrypts payloads using cached tenant key material")]
-async fn then_sp_decrypts(_w: &mut KisekiWorld) {}
+async fn then_sp_decrypts(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // Delta append to splitting shard
 #[given(regex = r#"^"(\S+)" is mid-split, creating "(\S+)"$"#)]
@@ -715,7 +761,9 @@ async fn given_mid_split(w: &mut KisekiWorld, name: String, _new_shard: String) 
 }
 
 #[given(regex = r#"^the split boundary is at hashed_key 0x(\S+)$"#)]
-async fn given_split_boundary(_w: &mut KisekiWorld, _hex: String) {}
+async fn given_split_boundary(_w: &mut KisekiWorld, _hex: String) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^a delta with hashed_key 0x(\S+) is appended$"#)]
 async fn when_append_at_key(w: &mut KisekiWorld, _hex: String) {
@@ -731,13 +779,19 @@ async fn when_append_at_key(w: &mut KisekiWorld, _hex: String) {
 }
 
 #[then(regex = r#"^the delta is buffered until "(\S+)" is accepting writes$"#)]
-async fn then_buffered(_w: &mut KisekiWorld, _shard: String) {}
+async fn then_buffered(_w: &mut KisekiWorld, _shard: String) {
+    panic!("not yet implemented");
+}
 
 #[then("a brief write latency bump occurs")]
-async fn then_latency_bump(_w: &mut KisekiWorld) {}
+async fn then_latency_bump(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^the delta is committed to "(\S+)" once ready$"#)]
-async fn then_committed_to(_w: &mut KisekiWorld, _shard: String) {}
+async fn then_committed_to(_w: &mut KisekiWorld, _shard: String) {
+    panic!("not yet implemented");
+}
 
 #[then("no delta is lost, duplicated, or misplaced")]
 async fn then_no_delta_lost(w: &mut KisekiWorld) {
@@ -759,20 +813,30 @@ async fn given_compacting(w: &mut KisekiWorld, name: String) {
 }
 
 #[given("a SplitShard is triggered during compaction")]
-async fn given_split_during_compact(_w: &mut KisekiWorld) {}
+async fn given_split_during_compact(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("both operations proceed")]
-async fn then_both_proceed(_w: &mut KisekiWorld) {}
+async fn then_both_proceed(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("compaction completes on the pre-split key range")]
-async fn then_compact_pre_split(_w: &mut KisekiWorld) {}
+async fn then_compact_pre_split(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the split creates a new shard with its own compaction state")]
-async fn then_split_new_compact(_w: &mut KisekiWorld) {}
+async fn then_split_new_compact(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // Advisory: phase marker
 #[given(regex = r#"^workload "(\S+)" advances its workflow to phase "(\S+)"$"#)]
-async fn given_wf_phase(_w: &mut KisekiWorld, _wl: String, _phase: String) {}
+async fn given_wf_phase(_w: &mut KisekiWorld, _wl: String, _phase: String) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^compositions on "(\S+)" are written heavily during this phase$"#)]
 async fn given_heavy_writes(w: &mut KisekiWorld, shard: String) {
@@ -784,18 +848,26 @@ async fn given_heavy_writes(w: &mut KisekiWorld, shard: String) {
 }
 
 #[when("the compaction pacer observes the phase-marker heuristic")]
-async fn when_pacer(_w: &mut KisekiWorld) {}
+async fn when_pacer(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^it MAY defer aggressive compaction on "(\S+)" during the checkpoint burst$"#)]
-async fn then_defer_compact(_w: &mut KisekiWorld, _shard: String) {}
+async fn then_defer_compact(_w: &mut KisekiWorld, _shard: String) {
+    panic!("not yet implemented");
+}
 
 #[then(
     regex = r#"^compaction MUST resume to honour its configured thresholds regardless of hints.*$"#
 )]
-async fn then_compact_resumes(_w: &mut KisekiWorld) {}
+async fn then_compact_resumes(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^the hint never affects delta ordering, durability, or GC correctness.*$"#)]
-async fn then_hint_no_effect(_w: &mut KisekiWorld) {}
+async fn then_hint_no_effect(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // Shard saturation telemetry
 #[given(
@@ -806,30 +878,46 @@ async fn given_shared_shard(w: &mut KisekiWorld, _wl: String, shard: String) {
 }
 
 #[when(regex = r#"^the caller subscribes to shard-saturation telemetry for "(\S+)"$"#)]
-async fn when_subscribe_telemetry(_w: &mut KisekiWorld, _shard: String) {}
+async fn when_subscribe_telemetry(_w: &mut KisekiWorld, _shard: String) {
+    panic!("not yet implemented");
+}
 
 #[then(
     regex = r#"^the returned backpressure signal reflects only the caller's own append rate.*$"#
 )]
-async fn then_caller_scoped(_w: &mut KisekiWorld) {}
+async fn then_caller_scoped(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^neighbour workloads' contribution is not inferable.*$"#)]
-async fn then_neighbour_hidden(_w: &mut KisekiWorld) {}
+async fn then_neighbour_hidden(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(
     regex = r#"^requesting telemetry for a shard with no caller-owned compositions returns the same shape.*$"#
 )]
-async fn then_same_shape(_w: &mut KisekiWorld) {}
+async fn then_same_shape(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // QoS-headroom telemetry
 #[given(regex = r#"^workload "(\S+)" is subscribed to QoS-headroom telemetry$"#)]
-async fn given_qos_sub(_w: &mut KisekiWorld, _wl: String) {}
+async fn given_qos_sub(_w: &mut KisekiWorld, _wl: String) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the caller queries QoS-headroom for "(\S+)"$"#)]
-async fn when_qos_query(_w: &mut KisekiWorld, _shard: String) {}
+async fn when_qos_query(_w: &mut KisekiWorld, _shard: String) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^the response reports headroom relative only to the caller.*$"#)]
-async fn then_qos_caller(_w: &mut KisekiWorld) {}
+async fn then_qos_caller(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^cluster-wide QoS capacity is not disclosed.*$"#)]
-async fn then_no_cluster_qos(_w: &mut KisekiWorld) {}
+async fn then_no_cluster_qos(_w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}

@@ -68,7 +68,9 @@ async fn then_rpc_success(w: &mut KisekiWorld) {
 }
 
 #[then("the response body is empty")]
-async fn then_empty_body(w: &mut KisekiWorld) {}
+async fn then_empty_body(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the server responds with RPC REPLY MSG_ACCEPTED PROG_UNAVAIL")]
 async fn then_prog_unavail(w: &mut KisekiWorld) {
@@ -93,10 +95,14 @@ async fn then_nfs3_ok(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r"^the ftype is NF3DIR \(2\)$")]
-async fn then_ftype_dir(w: &mut KisekiWorld) {}
+async fn then_ftype_dir(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r"^the mode includes 0755$")]
-async fn then_mode_755(w: &mut KisekiWorld) {}
+async fn then_mode_755(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when("the client sends GETATTR with an invalid 32-byte handle")]
 async fn when_getattr_invalid(w: &mut KisekiWorld) {
@@ -122,7 +128,9 @@ async fn when_lookup(w: &mut KisekiWorld, name: String) {
 }
 
 #[then("a valid file handle is returned")]
-async fn then_file_handle(w: &mut KisekiWorld) {}
+async fn then_file_handle(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the client sends LOOKUP for "([^"]*)"$"#)]
 async fn when_lookup_short(w: &mut KisekiWorld, _name: String) {
@@ -148,15 +156,21 @@ async fn when_read(w: &mut KisekiWorld, _name: String, _offset: u64, _count: u64
 }
 
 #[then(regex = r#"^the data equals "([^"]*)"$"#)]
-async fn then_data_equals(w: &mut KisekiWorld, _expected: String) {}
+async fn then_data_equals(w: &mut KisekiWorld, _expected: String) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r"^eof is (true|false)$")]
-async fn then_eof(w: &mut KisekiWorld, _eof: String) {}
+async fn then_eof(w: &mut KisekiWorld, _eof: String) {
+    panic!("not yet implemented");
+}
 
 // --- WRITE ---
 
 #[given("a file handle from a prior CREATE")]
-async fn given_file_handle(w: &mut KisekiWorld) {}
+async fn given_file_handle(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the client sends WRITE with data "([^"]*)" stable FILE_SYNC$"#)]
 async fn when_write_sync(w: &mut KisekiWorld, data: String) {
@@ -164,10 +178,14 @@ async fn when_write_sync(w: &mut KisekiWorld, data: String) {
 }
 
 #[then(regex = r"^the count equals (\d+)$")]
-async fn then_count(w: &mut KisekiWorld, _count: u64) {}
+async fn then_count(w: &mut KisekiWorld, _count: u64) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r"^the committed field is FILE_SYNC \(2\)$")]
-async fn then_file_sync(w: &mut KisekiWorld) {}
+async fn then_file_sync(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the client sends WRITE to an invalid handle with data "([^"]*)"$"#)]
 async fn when_write_invalid(w: &mut KisekiWorld, _data: String) {
@@ -182,10 +200,14 @@ async fn when_create(w: &mut KisekiWorld, _name: String) {
 }
 
 #[then("a file handle is returned")]
-async fn then_create_handle(w: &mut KisekiWorld) {}
+async fn then_create_handle(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("handle_follows is true")]
-async fn then_handle_follows(w: &mut KisekiWorld) {}
+async fn then_handle_follows(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- READDIR ---
 
@@ -202,7 +224,9 @@ async fn when_readdir(w: &mut KisekiWorld) {
 // "the entries include . and .." — handled by the generic entries step below.
 
 #[then(regex = r#"^the entries include "([^"]*)" and "([^"]*)"$"#)]
-async fn then_entries(w: &mut KisekiWorld, _a: String, _b: String) {}
+async fn then_entries(w: &mut KisekiWorld, _a: String, _b: String) {
+    panic!("not yet implemented");
+}
 
 // --- REMOVE ---
 
@@ -212,7 +236,9 @@ async fn when_remove(w: &mut KisekiWorld, _name: String) {
 }
 
 #[then(regex = r#"^LOOKUP for "([^"]*)" returns NFS3ERR_NOENT$"#)]
-async fn then_lookup_noent(w: &mut KisekiWorld, _name: String) {}
+async fn then_lookup_noent(w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the client sends REMOVE for "([^"]*)"$"#)]
 async fn when_remove_short(w: &mut KisekiWorld, _name: String) {
@@ -227,7 +253,9 @@ async fn when_rename(w: &mut KisekiWorld, _old: String, _new: String) {
 }
 
 #[then(regex = r#"^LOOKUP for "([^"]*)" succeeds$"#)]
-async fn then_lookup_succeeds(w: &mut KisekiWorld, _name: String) {}
+async fn then_lookup_succeeds(w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 // --- FSINFO ---
 
@@ -237,10 +265,14 @@ async fn when_fsinfo(w: &mut KisekiWorld) {
 }
 
 #[then("maxfilesize is reported")]
-async fn then_maxfilesize(w: &mut KisekiWorld) {}
+async fn then_maxfilesize(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("rtmax and wtmax are reported (read/write transfer sizes)")]
-async fn then_rtmax_wtmax(w: &mut KisekiWorld) {}
+async fn then_rtmax_wtmax(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- FSSTAT ---
 
@@ -250,10 +282,14 @@ async fn when_fsstat(w: &mut KisekiWorld) {
 }
 
 #[then("total bytes and free bytes are reported")]
-async fn then_total_free_bytes(w: &mut KisekiWorld) {}
+async fn then_total_free_bytes(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("total files and free files are reported")]
-async fn then_total_free_files(w: &mut KisekiWorld) {}
+async fn then_total_free_files(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // ===================================================================
 // NFS4 RFC 7862 steps
@@ -272,13 +308,19 @@ async fn then_nfs4_ok(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r"^a client_id is returned \(non-zero u64\)$")]
-async fn then_client_id(w: &mut KisekiWorld) {}
+async fn then_client_id(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r"^server_owner contains a valid major_id$")]
-async fn then_server_owner(w: &mut KisekiWorld) {}
+async fn then_server_owner(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the flags include CONFIRMED")]
-async fn then_confirmed(w: &mut KisekiWorld) {}
+async fn then_confirmed(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when("two clients send EXCHANGE_ID")]
 async fn when_two_exchange_id(w: &mut KisekiWorld) {
@@ -286,12 +328,16 @@ async fn when_two_exchange_id(w: &mut KisekiWorld) {
 }
 
 #[then("the returned client_ids are different")]
-async fn then_different_ids(w: &mut KisekiWorld) {}
+async fn then_different_ids(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- CREATE_SESSION ---
 
 #[given("a client_id from EXCHANGE_ID")]
-async fn given_client_id(w: &mut KisekiWorld) {}
+async fn given_client_id(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when("the client sends COMPOUND with CREATE_SESSION for that client_id")]
 async fn when_create_session(w: &mut KisekiWorld) {
@@ -299,10 +345,14 @@ async fn when_create_session(w: &mut KisekiWorld) {
 }
 
 #[then("a 16-byte session_id is returned")]
-async fn then_session_id(w: &mut KisekiWorld) {}
+async fn then_session_id(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("fore_channel_attrs include maxops and maxreqs")]
-async fn then_channel_attrs(w: &mut KisekiWorld) {}
+async fn then_channel_attrs(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- PUTROOTFH + GETFH ---
 
@@ -312,7 +362,9 @@ async fn when_putrootfh_getfh(w: &mut KisekiWorld) {
 }
 
 #[then("the current filehandle is the root of the namespace")]
-async fn then_root_fh(w: &mut KisekiWorld) {}
+async fn then_root_fh(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- OPEN ---
 
@@ -322,15 +374,21 @@ async fn when_open_create(w: &mut KisekiWorld, _name: String) {
 }
 
 #[then("a stateid is returned")]
-async fn then_stateid(w: &mut KisekiWorld) {}
+async fn then_stateid(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the delegation type is OPEN_DELEGATE_NONE")]
-async fn then_no_delegation(w: &mut KisekiWorld) {}
+async fn then_no_delegation(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- CLOSE ---
 
 #[given(regex = r#"^a file "([^"]*)" is opened with stateid$"#)]
-async fn given_open_file(w: &mut KisekiWorld, _name: String) {}
+async fn given_open_file(w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 #[when("the client sends COMPOUND with CLOSE using the stateid")]
 async fn when_close(w: &mut KisekiWorld) {
@@ -338,12 +396,16 @@ async fn when_close(w: &mut KisekiWorld) {
 }
 
 #[then("the stateid is invalidated")]
-async fn then_stateid_invalid(w: &mut KisekiWorld) {}
+async fn then_stateid_invalid(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- LOOKUP (NFSv4) ---
 
 #[given(regex = r#"^a file "([^"]*)" exists in the namespace$"#)]
-async fn given_file_exists(w: &mut KisekiWorld, _name: String) {}
+async fn given_file_exists(w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the client sends COMPOUND with PUTROOTFH \+ LOOKUP "([^"]*)" \+ GETFH$"#)]
 async fn when_lookup_v4(w: &mut KisekiWorld, _name: String) {
@@ -351,7 +413,9 @@ async fn when_lookup_v4(w: &mut KisekiWorld, _name: String) {
 }
 
 #[then("the current filehandle refers to that file")]
-async fn then_file_fh(w: &mut KisekiWorld) {}
+async fn then_file_fh(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- READ/WRITE (NFSv4) ---
 
@@ -366,7 +430,9 @@ async fn when_write_v4(w: &mut KisekiWorld, _data: String) {
 }
 
 #[then("the write count matches the data length")]
-async fn then_write_count(w: &mut KisekiWorld) {}
+async fn then_write_count(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- READDIR (NFSv4) ---
 
@@ -376,7 +442,9 @@ async fn when_readdir_v4(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^directory entries include "([^"]*)"$"#)]
-async fn then_dir_entry(w: &mut KisekiWorld, _name: String) {}
+async fn then_dir_entry(w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 // --- REMOVE (NFSv4) ---
 
@@ -386,12 +454,16 @@ async fn when_remove_v4(w: &mut KisekiWorld, _name: String) {
 }
 
 #[then(regex = r#"^LOOKUP for "([^"]*)" returns NFS4ERR_NOENT$"#)]
-async fn then_nfs4_noent(w: &mut KisekiWorld, _name: String) {}
+async fn then_nfs4_noent(w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 // --- LOCK ---
 
 #[given("an open stateid for a file")]
-async fn given_open_stateid(w: &mut KisekiWorld) {}
+async fn given_open_stateid(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when("the client sends COMPOUND with LOCK (WRITE_LT, offset 0, length 1024)")]
 async fn when_lock(w: &mut KisekiWorld) {
@@ -399,10 +471,14 @@ async fn when_lock(w: &mut KisekiWorld) {
 }
 
 #[then("a lock stateid is returned")]
-async fn then_lock_stateid(w: &mut KisekiWorld) {}
+async fn then_lock_stateid(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the lock covers bytes 0-1023")]
-async fn then_lock_range(w: &mut KisekiWorld) {}
+async fn then_lock_range(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- LOCKT ---
 
@@ -417,12 +493,16 @@ async fn then_nfs4_denied(w: &mut KisekiWorld) {
 }
 
 #[then("the conflicting lock info is returned")]
-async fn then_conflict_info(w: &mut KisekiWorld) {}
+async fn then_conflict_info(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- SEQUENCE ---
 
 #[given("an active session")]
-async fn given_active_session(w: &mut KisekiWorld) {}
+async fn given_active_session(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r"^the client sends COMPOUND with SEQUENCE \(slot (\d+), seq (\d+)\)$")]
 async fn when_sequence(w: &mut KisekiWorld, _slot: u32, _seq: u32) {
@@ -430,10 +510,14 @@ async fn when_sequence(w: &mut KisekiWorld, _slot: u32, _seq: u32) {
 }
 
 #[then("the response includes the session_id and matching slot/seq")]
-async fn then_sequence_match(w: &mut KisekiWorld) {}
+async fn then_sequence_match(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the response includes SR_HIGHEST_SLOTID")]
-async fn then_highest_slot(w: &mut KisekiWorld) {}
+async fn then_highest_slot(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- GETATTR (NFSv4) ---
 
@@ -443,7 +527,9 @@ async fn when_getattr_v4(w: &mut KisekiWorld) {
 }
 
 #[then("the returned attributes include type=directory, mode, and size")]
-async fn then_dir_attrs(w: &mut KisekiWorld) {}
+async fn then_dir_attrs(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- COMPOUND limit ---
 
@@ -458,7 +544,9 @@ async fn then_nfs4_resource(w: &mut KisekiWorld) {
 }
 
 #[then("the max compound size is 32 operations per ADR-023")]
-async fn then_max_compound(w: &mut KisekiWorld) {}
+async fn then_max_compound(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- DESTROY_SESSION ---
 
@@ -468,10 +556,14 @@ async fn when_destroy_session(w: &mut KisekiWorld) {
 }
 
 #[then("the session is invalidated")]
-async fn then_session_invalid(w: &mut KisekiWorld) {}
+async fn then_session_invalid(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("subsequent operations on that session return NFS4ERR_BADSESSION")]
-async fn then_badsession(w: &mut KisekiWorld) {}
+async fn then_badsession(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- ACCESS ---
 
@@ -481,12 +573,16 @@ async fn when_access(w: &mut KisekiWorld) {
 }
 
 #[then("the supported and access fields indicate permitted operations")]
-async fn then_access_fields(w: &mut KisekiWorld) {}
+async fn then_access_fields(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- SETATTR ---
 
 #[given("an open stateid for a writable file")]
-async fn given_writable(w: &mut KisekiWorld) {}
+async fn given_writable(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when("the client sends COMPOUND with SETATTR(mode=0644)")]
 async fn when_setattr(w: &mut KisekiWorld) {
@@ -494,7 +590,9 @@ async fn when_setattr(w: &mut KisekiWorld) {
 }
 
 #[then("the returned attrsset confirms mode was changed")]
-async fn then_mode_changed(w: &mut KisekiWorld) {}
+async fn then_mode_changed(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- RENAME (NFSv4) ---
 
@@ -506,7 +604,9 @@ async fn when_rename_v4(w: &mut KisekiWorld, _old: String, _new: String) {
 }
 
 #[then("source_cinfo and target_cinfo are returned")]
-async fn then_rename_cinfo(w: &mut KisekiWorld) {}
+async fn then_rename_cinfo(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- RECLAIM_COMPLETE ---
 
@@ -516,7 +616,9 @@ async fn when_reclaim(w: &mut KisekiWorld) {
 }
 
 #[then("the server acknowledges grace period complete")]
-async fn then_grace_complete(w: &mut KisekiWorld) {}
+async fn then_grace_complete(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // ===================================================================
 // S3 API steps
@@ -542,18 +644,26 @@ async fn then_http_status(w: &mut KisekiWorld, status: u16) {
 }
 
 #[then("the ETag header is present and non-empty")]
-async fn then_etag_present(w: &mut KisekiWorld) {}
+async fn then_etag_present(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the ETag is a valid UUID")]
-async fn then_etag_uuid(w: &mut KisekiWorld) {}
+async fn then_etag_uuid(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the ETag is returned")]
-async fn then_etag_returned(w: &mut KisekiWorld) {}
+async fn then_etag_returned(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- GetObject ---
 
 #[given(regex = r#"^an object "([^"]*)" was uploaded with body "([^"]*)"$"#)]
-async fn given_uploaded(w: &mut KisekiWorld, _key: String, _body: String) {}
+async fn given_uploaded(w: &mut KisekiWorld, _key: String, _body: String) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the client sends GET /([^/]+)/\{etag\}$"#)]
 async fn when_get_etag(w: &mut KisekiWorld, _bucket: String) {
@@ -561,10 +671,14 @@ async fn when_get_etag(w: &mut KisekiWorld, _bucket: String) {
 }
 
 #[then(regex = r#"^the body equals "([^"]*)"$"#)]
-async fn then_body_equals(w: &mut KisekiWorld, _expected: String) {}
+async fn then_body_equals(w: &mut KisekiWorld, _expected: String) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r"^Content-Length header equals (\d+)$")]
-async fn then_content_length(w: &mut KisekiWorld, _len: u64) {}
+async fn then_content_length(w: &mut KisekiWorld, _len: u64) {
+    panic!("not yet implemented");
+}
 
 // --- GetObject 404 ---
 
@@ -581,10 +695,14 @@ async fn when_head(w: &mut KisekiWorld, _bucket: String) {
 }
 
 #[then("Content-Length header is present")]
-async fn then_content_length_present(w: &mut KisekiWorld) {}
+async fn then_content_length_present(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("no body is returned")]
-async fn then_no_body(w: &mut KisekiWorld) {}
+async fn then_no_body(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- DeleteObject ---
 
@@ -596,7 +714,9 @@ async fn when_delete(w: &mut KisekiWorld, _bucket: String) {
 // --- ListObjectsV2 ---
 
 #[given(regex = r#"^objects "([^"]*)" and "([^"]*)" exist in bucket "([^"]*)"$"#)]
-async fn given_objects_in_bucket(w: &mut KisekiWorld, _a: String, _b: String, _bucket: String) {}
+async fn given_objects_in_bucket(w: &mut KisekiWorld, _a: String, _b: String, _bucket: String) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the client sends GET /([^/]+)\?list-type=2$"#)]
 async fn when_list_v2(w: &mut KisekiWorld, _bucket: String) {
@@ -604,26 +724,38 @@ async fn when_list_v2(w: &mut KisekiWorld, _bucket: String) {
 }
 
 #[then("the response is XML with ListBucketResult")]
-async fn then_xml_list(w: &mut KisekiWorld) {}
+async fn then_xml_list(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then(regex = r#"^Contents includes keys "([^"]*)" and "([^"]*)"$"#)]
-async fn then_contents(w: &mut KisekiWorld, _a: String, _b: String) {}
+async fn then_contents(w: &mut KisekiWorld, _a: String, _b: String) {
+    panic!("not yet implemented");
+}
 
 // --- ListObjectsV2 empty ---
 
 #[given(regex = r#"^bucket "([^"]*)" is empty$"#)]
-async fn given_empty_bucket(w: &mut KisekiWorld, _bucket: String) {}
+async fn given_empty_bucket(w: &mut KisekiWorld, _bucket: String) {
+    panic!("not yet implemented");
+}
 
 #[then("Contents is empty")]
-async fn then_empty_contents(w: &mut KisekiWorld) {}
+async fn then_empty_contents(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("KeyCount is 0")]
-async fn then_key_count_0(w: &mut KisekiWorld) {}
+async fn then_key_count_0(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- ListObjectsV2 prefix ---
 
 #[given(regex = r#"^objects "([^"]*)", "([^"]*)", "([^"]*)" exist$"#)]
-async fn given_three_objects(w: &mut KisekiWorld, _a: String, _b: String, _c: String) {}
+async fn given_three_objects(w: &mut KisekiWorld, _a: String, _b: String, _c: String) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r#"^the client sends GET /([^/]+)\?list-type=2&prefix=data/$"#)]
 async fn when_list_prefix(w: &mut KisekiWorld, _bucket: String) {
@@ -631,7 +763,9 @@ async fn when_list_prefix(w: &mut KisekiWorld, _bucket: String) {
 }
 
 #[then(regex = r#"^only keys starting with "([^"]*)" are returned$"#)]
-async fn then_prefix_filter(w: &mut KisekiWorld, _prefix: String) {}
+async fn then_prefix_filter(w: &mut KisekiWorld, _prefix: String) {
+    panic!("not yet implemented");
+}
 
 // --- S3 unknown bucket ---
 
@@ -665,7 +799,9 @@ async fn when_initiate_multipart(w: &mut KisekiWorld, _bucket: String, _key: Str
 }
 
 #[then("an UploadId is returned")]
-async fn then_upload_id(w: &mut KisekiWorld) {}
+async fn then_upload_id(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[when("the client uploads 3 parts with valid ETags")]
 async fn when_upload_parts(w: &mut KisekiWorld) {
@@ -675,10 +811,14 @@ async fn when_upload_parts(w: &mut KisekiWorld) {
 // "the client sends CompleteMultipartUpload" reused from gateway.rs.
 
 #[then("the final object is assembled from parts")]
-async fn then_assembled(w: &mut KisekiWorld) {}
+async fn then_assembled(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[then("the ETag reflects the multipart composition")]
-async fn then_multipart_etag(w: &mut KisekiWorld) {}
+async fn then_multipart_etag(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // ===================================================================
 // Additional skipped steps (closing backlog)
@@ -687,39 +827,61 @@ async fn then_multipart_etag(w: &mut KisekiWorld) {}
 // --- Persistence ---
 
 #[given("redb database at $DATA_DIR/raft/db.redb")]
-async fn given_redb(w: &mut KisekiWorld) {}
+async fn given_redb(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // --- NFS4 additional ---
 
 #[given("a file was created via COMPOUND WRITE")]
-async fn given_file_compound(w: &mut KisekiWorld) {}
+async fn given_file_compound(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given("a small file exists")]
-async fn given_small_file(w: &mut KisekiWorld) {}
+async fn given_small_file(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^a file "([^"]*)" exists$"#)]
-async fn given_file_exists_short(w: &mut KisekiWorld, _name: String) {}
+async fn given_file_exists_short(w: &mut KisekiWorld, _name: String) {
+    panic!("not yet implemented");
+}
 
 #[given("a file has a WRITE lock on bytes 0-1024")]
-async fn given_write_lock(w: &mut KisekiWorld) {}
+async fn given_write_lock(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given("a file is opened with a valid stateid")]
-async fn given_file_stateid(w: &mut KisekiWorld) {}
+async fn given_file_stateid(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given("an active session and a file handle")]
-async fn given_session_handle(w: &mut KisekiWorld) {}
+async fn given_session_handle(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given("the current filehandle is a writable file")]
-async fn given_writable_fh(w: &mut KisekiWorld) {}
+async fn given_writable_fh(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given("the current filehandle is the root")]
-async fn given_root_fh_nfs4(w: &mut KisekiWorld) {}
+async fn given_root_fh_nfs4(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given("two sessions are created")]
-async fn given_two_sessions(w: &mut KisekiWorld) {}
+async fn given_two_sessions(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^files "([^"]*)" and "([^"]*)" exist$"#)]
-async fn given_files_exist(w: &mut KisekiWorld, _a: String, _b: String) {}
+async fn given_files_exist(w: &mut KisekiWorld, _a: String, _b: String) {
+    panic!("not yet implemented");
+}
 
 #[when(regex = r"^the client sends COMPOUND with (\d+) operations$")]
 async fn when_compound_n(w: &mut KisekiWorld, n: u32) {
@@ -781,13 +943,19 @@ async fn when_bad_session(w: &mut KisekiWorld) {
 // --- S3 additional ---
 
 #[given(regex = r#"^(\d+) objects exist in bucket "([^"]+)"$"#)]
-async fn given_n_objects(w: &mut KisekiWorld, _n: u32, _bucket: String) {}
+async fn given_n_objects(w: &mut KisekiWorld, _n: u32, _bucket: String) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^an object was uploaded with (\d+) bytes$"#)]
-async fn given_object_bytes(w: &mut KisekiWorld, _bytes: u64) {}
+async fn given_object_bytes(w: &mut KisekiWorld, _bytes: u64) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^bucket "([^"]*)" has no objects$"#)]
-async fn given_bucket_empty(w: &mut KisekiWorld, _bucket: String) {}
+async fn given_bucket_empty(w: &mut KisekiWorld, _bucket: String) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^objects "([^"]*)", "([^"]*)", "([^"]*)" were uploaded to bucket "([^"]*)"$"#)]
 async fn given_three_uploaded(
@@ -846,26 +1014,40 @@ async fn when_upload_to_bucket(w: &mut KisekiWorld, _data: String, _bucket: Stri
 // --- Chunk/key misc ---
 
 #[given(regex = r#"^chunk_id = sha256\(plaintext\) = "([^"]*)"$"#)]
-async fn given_chunk_sha(w: &mut KisekiWorld, _id: String) {}
+async fn given_chunk_sha(w: &mut KisekiWorld, _id: String) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^a retention hold "([^"]*)" is active on "([^"]*)"$"#)]
-async fn given_retention_active(w: &mut KisekiWorld, _hold: String, _chunk: String) {}
+async fn given_retention_active(w: &mut KisekiWorld, _hold: String, _chunk: String) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r"^refcounts for .+ are initialized to 1$")]
-async fn given_refcounts(w: &mut KisekiWorld) {}
+async fn given_refcounts(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r"^later writes file B with the same plaintext P$")]
-async fn given_later_writes(w: &mut KisekiWorld) {}
+async fn given_later_writes(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r"^unwraps the system DEK using epoch 1 material$")]
-async fn given_unwrap_dek(w: &mut KisekiWorld) {}
+async fn given_unwrap_dek(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 #[given(regex = r#"^the caller submits hint \{.*\}$"#)]
-async fn given_hint_collective(w: &mut KisekiWorld) {}
+async fn given_hint_collective(w: &mut KisekiWorld) {
+    panic!("not yet implemented");
+}
 
 // "requests cache TTL" reused from operational.rs.
 
 // --- Admin additional ---
 
 #[when(regex = r#"^they request PoolStatus for "([^"]*)"$"#)]
-async fn when_sre_pool_status(w: &mut KisekiWorld, _pool: String) {}
+async fn when_sre_pool_status(w: &mut KisekiWorld, _pool: String) {
+    panic!("not yet implemented");
+}
