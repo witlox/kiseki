@@ -21,7 +21,7 @@ Project-specific coding standards in `.claude/coding/`:
 ## Pre-commit discipline
 
 Before committing: `make` (runs lint + test + build). Use `/project:verify`
-for the full checklist. Lefthook enforces fmt, lint, test, vet on commit.
+for the full checklist.
 
 ## Automatic command invocation
 
