@@ -996,8 +996,7 @@ async fn given_retention_active(w: &mut KisekiWorld, _hold: String, _chunk: Stri
 #[given(regex = r"^refcounts for .+ are initialized to 1$")]
 async fn given_refcounts(w: &mut KisekiWorld) {}
 
-#[given(regex = r"^later writes file B with the same plaintext P$")]
-async fn given_later_writes(w: &mut KisekiWorld) {}
+// "later writes file B" handled by composition.rs When step.
 
 #[given(regex = r"^unwraps the system DEK using epoch 1 material$")]
 async fn given_unwrap_dek(w: &mut KisekiWorld) {}

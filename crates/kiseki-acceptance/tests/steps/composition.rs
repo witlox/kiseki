@@ -340,6 +340,18 @@ async fn when_delete_issued(w: &mut KisekiWorld, _name: String) {
     }
 }
 
+#[given("later writes file B with the same plaintext P")]
+async fn given_later_writes_same_plaintext(w: &mut KisekiWorld) {
+    let ns_id = w.ensure_namespace("trials", "shard-trials-1");
+    match w.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+        Ok(id) => {
+            w.last_composition_id = Some(id);
+            w.last_error = None;
+        }
+        Err(e) => w.last_error = Some(e.to_string()),
+    }
+}
+
 #[when("later writes file B with the same plaintext P")]
 async fn when_later_writes_same_plaintext(w: &mut KisekiWorld) {
     // Dedup: second file referencing same chunk_id.
