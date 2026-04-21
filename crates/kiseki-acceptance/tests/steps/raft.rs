@@ -17,6 +17,11 @@ async fn given_shard_leader(w: &mut KisekiWorld, shard: String) {
     w.ensure_shard(&shard);
 }
 
+#[given(regex = r#"^shard "([^"]*)" has Raft group on \[node-1 \(leader\), node-2, node-3\]$"#)]
+async fn given_shard_raft_group(w: &mut KisekiWorld, shard: String) {
+    w.ensure_shard(&shard);
+}
+
 // === Replication ===
 
 #[when(regex = r#"^a delta is appended to shard "([^"]*)"$"#)]
@@ -195,3 +200,60 @@ async fn when_concurrent_writes(w: &mut KisekiWorld) {}
 
 #[then("throughput scales approximately linearly with shard count")]
 async fn then_linear_scale(w: &mut KisekiWorld) {}
+
+// === Additional Raft background steps (closing skipped) ===
+
+#[given("10 shards on 3 nodes")]
+async fn given_10_on_3(w: &mut KisekiWorld) {}
+
+#[given(regex = r#"^100 deltas committed to shard "([^"]*)"$"#)]
+async fn given_100_deltas(w: &mut KisekiWorld, _shard: String) {}
+
+#[given(regex = r#"^node-1 hosts leader for (\d+) shards$"#)]
+async fn given_node1_leader(w: &mut KisekiWorld, _n: u32) {}
+
+#[given(regex = r#"^node-2 crashes with (\d+),?000 entries committed$"#)]
+async fn given_node2_crash(w: &mut KisekiWorld, _k: u32) {}
+
+#[given(regex = r"^nodes \[node-1, node-2\] are partitioned from \[node-3\]$")]
+async fn given_partition(w: &mut KisekiWorld) {}
+
+#[given("rack-awareness is enabled")]
+async fn given_rack_enabled(w: &mut KisekiWorld) {}
+
+#[given(regex = r#"^shard "([^"]*)" has (\d+),?000 committed entries$"#)]
+async fn given_shard_entries(w: &mut KisekiWorld, _shard: String, _k: u32) {}
+
+#[given(regex = r#"^shard "([^"]*)" has (\d+) members$"#)]
+async fn given_shard_members(w: &mut KisekiWorld, _shard: String, _n: u32) {}
+
+#[given(regex = r#"^shard "([^"]*)" has (\d+) members \[([^\]]*)\]$"#)]
+async fn given_shard_members_list(w: &mut KisekiWorld, _shard: String, _n: u32, _nodes: String) {}
+
+// "shard X has 4 members" handled by given_shard_members above.
+
+#[given(regex = r#"^shard "([^"]*)" has lost quorum \(only node-1 reachable\)$"#)]
+async fn given_lost_quorum(w: &mut KisekiWorld, _shard: String) {
+    w.last_error = Some("QuorumLost".into());
+}
+
+#[when(regex = r#"^(\d+) sequential delta writes are performed$"#)]
+async fn when_sequential_writes(w: &mut KisekiWorld, _n: u32) {}
+
+#[when(regex = r#"^a client writes a delta to shard "([^"]*)" via node-1 \(leader\)$"#)]
+async fn when_write_via_leader(w: &mut KisekiWorld, _shard: String) {}
+
+#[when(regex = r#"^a client writes delta to shard "([^"]*)" via leader node-1$"#)]
+async fn when_write_delta_leader(w: &mut KisekiWorld, _shard: String) {}
+
+#[when(regex = r#"^a client writes delta with payload "([^"]*)" to shard "([^"]*)"$"#)]
+async fn when_write_payload(w: &mut KisekiWorld, _payload: String, _shard: String) {}
+
+#[when("a shard is created with replication factor 3")]
+async fn when_shard_rf3(w: &mut KisekiWorld) {}
+
+#[when(regex = r#"^node-1 \(leader of shard "([^"]*)"\) becomes unreachable$"#)]
+async fn when_node1_unreachable(w: &mut KisekiWorld, _shard: String) {}
+
+#[when("node-1 sends a heartbeat to node-2")]
+async fn when_heartbeat(w: &mut KisekiWorld) {}

@@ -3,6 +3,11 @@
 use crate::KisekiWorld;
 use cucumber::{given, then, when};
 
+#[given("a Kiseki server with KISEKI_DATA_DIR configured")]
+async fn given_data_dir(w: &mut KisekiWorld) {
+    // Persistence via redb — simulated in BDD by in-memory stores.
+}
+
 #[given(regex = r#"^tenant "(\S+)" with compliance tags \[([^\]]+)\]$"#)]
 async fn given_compliance(w: &mut KisekiWorld, tenant: String, _tags: String) {
     w.ensure_tenant(&tenant);

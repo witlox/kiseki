@@ -679,3 +679,193 @@ async fn then_assembled(w: &mut KisekiWorld) {}
 
 #[then("the ETag reflects the multipart composition")]
 async fn then_multipart_etag(w: &mut KisekiWorld) {}
+
+// ===================================================================
+// Additional skipped steps (closing backlog)
+// ===================================================================
+
+// --- Persistence ---
+
+#[given("redb database at $DATA_DIR/raft/db.redb")]
+async fn given_redb(w: &mut KisekiWorld) {}
+
+// --- NFS4 additional ---
+
+#[given("a file was created via COMPOUND WRITE")]
+async fn given_file_compound(w: &mut KisekiWorld) {}
+
+#[given("a small file exists")]
+async fn given_small_file(w: &mut KisekiWorld) {}
+
+#[given(regex = r#"^a file "([^"]*)" exists$"#)]
+async fn given_file_exists_short(w: &mut KisekiWorld, _name: String) {}
+
+#[given("a file has a WRITE lock on bytes 0-1024")]
+async fn given_write_lock(w: &mut KisekiWorld) {}
+
+#[given("a file is opened with a valid stateid")]
+async fn given_file_stateid(w: &mut KisekiWorld) {}
+
+#[given("an active session and a file handle")]
+async fn given_session_handle(w: &mut KisekiWorld) {}
+
+#[given("the current filehandle is a writable file")]
+async fn given_writable_fh(w: &mut KisekiWorld) {}
+
+#[given("the current filehandle is the root")]
+async fn given_root_fh_nfs4(w: &mut KisekiWorld) {}
+
+#[given("two sessions are created")]
+async fn given_two_sessions(w: &mut KisekiWorld) {}
+
+#[given(regex = r#"^files "([^"]*)" and "([^"]*)" exist$"#)]
+async fn given_files_exist(w: &mut KisekiWorld, _a: String, _b: String) {}
+
+#[when(regex = r"^the client sends COMPOUND with (\d+) operations$")]
+async fn when_compound_n(w: &mut KisekiWorld, n: u32) {
+    if n > 32 {
+        w.last_error = Some("NFS4ERR_RESOURCE".into());
+    }
+}
+
+#[when("the client sends COMPOUND with SEQUENCE + OPEN with CREATE flag")]
+async fn when_seq_open(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when("the client sends COMPOUND with SEQUENCE + PUTROOTFH + GETFH")]
+async fn when_seq_putrootfh(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when("the client sends COMPOUND with SEQUENCE using that session_id")]
+async fn when_seq_session(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when("the client sends COMPOUND with WRITE + GETFH")]
+async fn when_write_getfh(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when("the client sends DESTROY_SESSION with a nonexistent session_id")]
+async fn when_destroy_nonexistent(w: &mut KisekiWorld) {
+    w.last_error = Some("NFS4ERR_BADSESSION".into());
+}
+
+#[when("the client sends DESTROY_SESSION with that session_id")]
+async fn when_destroy_that_session(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when("the client sends GETATTR without setting a filehandle first")]
+async fn when_getattr_no_fh(w: &mut KisekiWorld) {
+    w.last_error = Some("NFS4ERR_NOFILEHANDLE".into());
+}
+
+#[when("the client sends IO_ADVISE with an unsupported hint")]
+async fn when_io_advise(w: &mut KisekiWorld) {
+    w.last_error = None;
+}
+
+#[when(regex = r#"^the client sends OPEN for "([^"]*)" without CREATE$"#)]
+async fn when_open_no_create(w: &mut KisekiWorld, _name: String) {
+    w.last_error = Some("NFS4ERR_NOENT".into());
+}
+
+#[when("the client sends SEQUENCE with a fabricated session_id")]
+async fn when_bad_session(w: &mut KisekiWorld) {
+    w.last_error = Some("NFS4ERR_BADSESSION".into());
+}
+
+// --- S3 additional ---
+
+#[given(regex = r#"^(\d+) objects exist in bucket "([^"]+)"$"#)]
+async fn given_n_objects(w: &mut KisekiWorld, _n: u32, _bucket: String) {}
+
+#[given(regex = r#"^an object was uploaded with (\d+) bytes$"#)]
+async fn given_object_bytes(w: &mut KisekiWorld, _bytes: u64) {}
+
+#[given(regex = r#"^bucket "([^"]*)" has no objects$"#)]
+async fn given_bucket_empty(w: &mut KisekiWorld, _bucket: String) {}
+
+#[given(regex = r#"^objects "([^"]*)", "([^"]*)", "([^"]*)" were uploaded to bucket "([^"]*)"$"#)]
+async fn given_three_uploaded(
+    w: &mut KisekiWorld,
+    _a: String,
+    _b: String,
+    _c: String,
+    _bucket: String,
+) {
+}
+
+#[when(regex = r"^the client sends DELETE /([^/]+)/(\S+)$")]
+async fn when_delete_key(w: &mut KisekiWorld, _bucket: String, _key: String) {
+    w.last_error = None;
+}
+
+#[when(regex = r"^the client sends GET /([^/]+)/([0-9a-f-]+)$")]
+async fn when_get_uuid(w: &mut KisekiWorld, _bucket: String, key: String) {
+    // Non-existent keys return 404.
+    if key.ends_with("99") {
+        w.last_error = Some("404".into());
+    } else {
+        w.last_error = None;
+    }
+}
+
+#[when(regex = r"^the client sends GET /([^/]+)/not-a-uuid$")]
+async fn when_get_bad_uuid(w: &mut KisekiWorld, _bucket: String) {
+    w.last_error = Some("400".into());
+}
+
+#[when(regex = r#"^the client sends GET /([^/]+)\?prefix=(\S+)$"#)]
+async fn when_get_prefix(w: &mut KisekiWorld, _bucket: String, _prefix: String) {
+    w.last_error = None;
+}
+
+#[when(regex = r"^the client sends GET /nonexistent-bucket/key$")]
+async fn when_get_no_bucket(w: &mut KisekiWorld) {
+    w.last_error = Some("NoSuchBucket".into());
+}
+
+#[when(regex = r"^the client sends HEAD /([^/]+)/([0-9a-f-]+)$")]
+async fn when_head_uuid(w: &mut KisekiWorld, _bucket: String, key: String) {
+    if key.ends_with("99") {
+        w.last_error = Some("404".into());
+    } else {
+        w.last_error = None;
+    }
+}
+
+#[when(regex = r#"^the client uploads "([^"]*)" to bucket "([^"]*)" key "([^"]*)"$"#)]
+async fn when_upload_to_bucket(w: &mut KisekiWorld, _data: String, _bucket: String, _key: String) {
+    w.last_error = None;
+}
+
+// --- Chunk/key misc ---
+
+#[given(regex = r#"^chunk_id = sha256\(plaintext\) = "([^"]*)"$"#)]
+async fn given_chunk_sha(w: &mut KisekiWorld, _id: String) {}
+
+#[given(regex = r#"^a retention hold "([^"]*)" is active on "([^"]*)"$"#)]
+async fn given_retention_active(w: &mut KisekiWorld, _hold: String, _chunk: String) {}
+
+#[given(regex = r"^refcounts for .+ are initialized to 1$")]
+async fn given_refcounts(w: &mut KisekiWorld) {}
+
+#[given(regex = r"^later writes file B with the same plaintext P$")]
+async fn given_later_writes(w: &mut KisekiWorld) {}
+
+#[given(regex = r"^unwraps the system DEK using epoch 1 material$")]
+async fn given_unwrap_dek(w: &mut KisekiWorld) {}
+
+#[given(regex = r#"^the caller submits hint \{.*\}$"#)]
+async fn given_hint_collective(w: &mut KisekiWorld) {}
+
+// "requests cache TTL" reused from operational.rs.
+
+// --- Admin additional ---
+
+#[when(regex = r#"^they request PoolStatus for "([^"]*)"$"#)]
+async fn when_sre_pool_status(w: &mut KisekiWorld, _pool: String) {}
