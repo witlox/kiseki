@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
-use kiseki_raft::{KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory};
+use kiseki_raft::{
+    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory, TcpNetworkFactory,
+};
 use openraft::Raft;
 
 use super::state_machine::{ShardSmInner, ShardStateMachine};
@@ -53,23 +55,49 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
 }
 
 impl OpenRaftLogStore {
-    /// Create and bootstrap a single-node Raft log store for a shard.
-    pub async fn new(node_id: u64, shard_id: ShardId, tenant_id: OrgId) -> Result<Self, LogError> {
+    /// Create and bootstrap a Raft log store for a shard.
+    ///
+    /// When `peers` is empty, runs in single-node mode with a stub network.
+    /// When `peers` contains entries, uses TCP transport for multi-node Raft.
+    /// The `peers` map should include this node's own `(node_id, addr)` entry.
+    pub async fn new(
+        node_id: u64,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        peers: &BTreeMap<u64, String>,
+    ) -> Result<Self, LogError> {
         let config = KisekiRaftConfig::default_config();
         let log_store = MemLogStore::<C>::new();
         let state_inner = Arc::new(futures::lock::Mutex::new(ShardSmInner::new(
             shard_id, tenant_id,
         )));
         let state_machine = ShardStateMachine::new(Arc::clone(&state_inner));
-        let network = StubNetworkFactory::<C>::new();
 
-        let raft = Raft::new(node_id, config, network, log_store, state_machine)
-            .await
-            .map_err(|_e| LogError::Unavailable)?;
+        let members: BTreeMap<u64, KisekiNode> = if peers.len() > 1 {
+            peers
+                .iter()
+                .map(|(id, addr)| (*id, KisekiNode::new(addr)))
+                .collect()
+        } else {
+            let mut m = BTreeMap::new();
+            let addr = peers.get(&node_id).map_or("localhost:9201", String::as_str);
+            m.insert(node_id, KisekiNode::new(addr));
+            m
+        };
 
-        // Initialize as single-node cluster.
-        let mut members = BTreeMap::new();
-        members.insert(node_id, KisekiNode::new("localhost:9201"));
+        // Use TCP transport for multi-node, stub for single-node.
+        let raft = if peers.len() > 1 {
+            let network = TcpNetworkFactory::<C>::new();
+            Raft::new(node_id, config, network, log_store, state_machine)
+                .await
+                .map_err(|_e| LogError::Unavailable)?
+        } else {
+            let network = StubNetworkFactory::<C>::new();
+            Raft::new(node_id, config, network, log_store, state_machine)
+                .await
+                .map_err(|_e| LogError::Unavailable)?
+        };
+
         raft.initialize(members)
             .await
             .map_err(|_| LogError::Unavailable)?;
@@ -80,6 +108,20 @@ impl OpenRaftLogStore {
             shard_id,
             tenant_id,
         })
+    }
+
+    /// Spawn the Raft RPC server for this shard's Raft group.
+    ///
+    /// Listens on `addr` for incoming Raft RPCs (`AppendEntries`, `Vote`)
+    /// from peer nodes. Only needed in multi-node mode.
+    /// Returns a `JoinHandle` for the server task.
+    #[must_use]
+    pub fn spawn_rpc_server(
+        &self,
+        addr: String,
+    ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
+        let raft = Arc::new(self.raft.clone());
+        tokio::spawn(async move { tcp_transport::run_raft_rpc_server::<C>(&addr, raft).await })
     }
 
     /// Append a delta through Raft consensus.

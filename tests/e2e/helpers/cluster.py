@@ -31,6 +31,15 @@ class ServerInfo:
     _process: subprocess.Popen[bytes] | None = None
 
 
+@dataclass
+class ClusterInfo:
+    """Running multi-node cluster connection info."""
+
+    nodes: list[ServerInfo]
+    compose_file: str
+    mode: str  # "docker"
+
+
 def _workspace_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -137,3 +146,73 @@ def stop_server(info: ServerInfo) -> None:
         except subprocess.TimeoutExpired:
             info._process.kill()
             info._process.wait()
+
+
+def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo:
+    """Start a multi-node cluster via docker compose."""
+    root = _workspace_root()
+    subprocess.run(
+        ["/usr/local/bin/docker", "compose", "-f", compose_file, "up", "--build", "-d"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Node port mappings: node1=9100, node2=9110, node3=9120.
+    nodes = [
+        ServerInfo(
+            data_addr="127.0.0.1:9100",
+            advisory_addr="127.0.0.1:9101",
+            control_addr="",
+            mode="docker",
+        ),
+        ServerInfo(
+            data_addr="127.0.0.1:9110",
+            advisory_addr="127.0.0.1:9111",
+            control_addr="",
+            mode="docker",
+        ),
+        ServerInfo(
+            data_addr="127.0.0.1:9120",
+            advisory_addr="127.0.0.1:9121",
+            control_addr="",
+            mode="docker",
+        ),
+    ]
+
+    for node in nodes:
+        _wait_for_ready(node.data_addr)
+
+    return ClusterInfo(nodes=nodes, compose_file=compose_file, mode="docker")
+
+
+def stop_cluster(info: ClusterInfo) -> None:
+    """Stop a multi-node cluster."""
+    root = _workspace_root()
+    subprocess.run(
+        ["/usr/local/bin/docker", "compose", "-f", info.compose_file, "down", "-v"],
+        cwd=root,
+        capture_output=True,
+    )
+
+
+def stop_node(compose_file: str, service_name: str) -> None:
+    """Stop a single node in the cluster."""
+    root = _workspace_root()
+    subprocess.run(
+        ["/usr/local/bin/docker", "compose", "-f", compose_file, "stop", service_name],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def start_node(compose_file: str, service_name: str) -> None:
+    """Start a previously stopped node."""
+    root = _workspace_root()
+    subprocess.run(
+        ["/usr/local/bin/docker", "compose", "-f", compose_file, "start", service_name],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )

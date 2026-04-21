@@ -65,9 +65,7 @@ impl PersistentShardStore {
         // Reload deltas — iterate all entries in the log table.
         if let Ok(entries) = self.redb.range::<PersistedDelta>(1, u64::MAX) {
             use kiseki_common::ids::{NodeId, OrgId, ShardId};
-            use kiseki_common::time::{
-                ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime,
-            };
+            use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
 
             // First pass: collect unique shard IDs and ensure they exist.
             let mut seen_shards = std::collections::HashSet::new();

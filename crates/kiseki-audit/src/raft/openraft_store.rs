@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use kiseki_raft::{KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory};
+use kiseki_raft::{
+    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory, TcpNetworkFactory,
+};
 use openraft::Raft;
 
 use kiseki_common::ids::{OrgId, SequenceNumber};
@@ -32,21 +34,40 @@ pub struct OpenRaftAuditStore {
 }
 
 impl OpenRaftAuditStore {
-    /// Create and bootstrap a single-node Raft audit store.
-    pub async fn new(node_id: u64) -> Result<Self, AuditError> {
+    /// Create and bootstrap a Raft audit store.
+    ///
+    /// When `peers` is empty, runs single-node with stub network.
+    /// When `peers` has entries, uses TCP transport for multi-node Raft.
+    pub async fn new(node_id: u64, peers: &BTreeMap<u64, String>) -> Result<Self, AuditError> {
         let config = KisekiRaftConfig::default_config();
         let log_store = MemLogStore::<C>::new();
         let state_inner = Arc::new(futures::lock::Mutex::new(AuditSmInner::new()));
         let state_machine = AuditStateMachine::new(Arc::clone(&state_inner));
-        let network = StubNetworkFactory::<C>::new();
 
-        let raft = Raft::new(node_id, config, network, log_store, state_machine)
-            .await
-            .map_err(|_e| AuditError::Unavailable)?;
+        let members: BTreeMap<u64, KisekiNode> = if peers.len() > 1 {
+            peers
+                .iter()
+                .map(|(id, addr)| (*id, KisekiNode::new(addr)))
+                .collect()
+        } else {
+            let mut m = BTreeMap::new();
+            let addr = peers.get(&node_id).map_or("localhost:9103", String::as_str);
+            m.insert(node_id, KisekiNode::new(addr));
+            m
+        };
 
-        // Initialize as single-node cluster.
-        let mut members = BTreeMap::new();
-        members.insert(node_id, KisekiNode::new("localhost:9103"));
+        let raft = if peers.len() > 1 {
+            let network = TcpNetworkFactory::<C>::new();
+            Raft::new(node_id, config, network, log_store, state_machine)
+                .await
+                .map_err(|_e| AuditError::Unavailable)?
+        } else {
+            let network = StubNetworkFactory::<C>::new();
+            Raft::new(node_id, config, network, log_store, state_machine)
+                .await
+                .map_err(|_e| AuditError::Unavailable)?
+        };
+
         raft.initialize(members)
             .await
             .map_err(|_| AuditError::Unavailable)?;
@@ -55,6 +76,16 @@ impl OpenRaftAuditStore {
             raft,
             state: state_inner,
         })
+    }
+
+    /// Spawn the Raft RPC server for the audit Raft group.
+    #[must_use]
+    pub fn spawn_rpc_server(
+        &self,
+        addr: String,
+    ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
+        let raft = Arc::new(self.raft.clone());
+        tokio::spawn(async move { tcp_transport::run_raft_rpc_server::<C>(&addr, raft).await })
     }
 
     /// Append an audit event through Raft consensus.

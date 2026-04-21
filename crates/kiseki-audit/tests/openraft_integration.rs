@@ -51,7 +51,9 @@ fn test_tenant_2() -> OrgId {
 
 #[tokio::test]
 async fn bootstrap_and_verify() {
-    let store = OpenRaftAuditStore::new(1).await.unwrap();
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+        .await
+        .unwrap();
 
     // Initial event count should be 0.
     assert_eq!(store.event_count().await, 0);
@@ -64,7 +66,9 @@ async fn bootstrap_and_verify() {
 
 #[tokio::test]
 async fn append_through_raft() {
-    let store = OpenRaftAuditStore::new(1).await.unwrap();
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+        .await
+        .unwrap();
 
     store
         .append_event("DataWrite", "user-1", None, "wrote a chunk")
@@ -79,7 +83,9 @@ async fn append_through_raft() {
 
 #[tokio::test]
 async fn multiple_appends() {
-    let store = OpenRaftAuditStore::new(1).await.unwrap();
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+        .await
+        .unwrap();
 
     store
         .append_event("DataWrite", "user-1", None, "wrote chunk 1")
@@ -103,7 +109,9 @@ async fn multiple_appends() {
 
 #[tokio::test]
 async fn event_round_trip() {
-    let store = OpenRaftAuditStore::new(1).await.unwrap();
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+        .await
+        .unwrap();
 
     // Append via the AuditEvent-based method.
     let event = make_event(
@@ -134,7 +142,9 @@ async fn event_round_trip() {
 
 #[tokio::test]
 async fn per_tenant_isolation() {
-    let store = OpenRaftAuditStore::new(1).await.unwrap();
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+        .await
+        .unwrap();
     let t1 = test_tenant();
     let t2 = test_tenant_2();
 
@@ -199,7 +209,9 @@ async fn per_tenant_isolation() {
 
 #[tokio::test]
 async fn tenant_export_returns_only_tenant_events() {
-    let store = OpenRaftAuditStore::new(1).await.unwrap();
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+        .await
+        .unwrap();
     let t1 = test_tenant();
     let t2 = test_tenant_2();
 
@@ -244,7 +256,9 @@ async fn tenant_export_returns_only_tenant_events() {
 
 #[tokio::test]
 async fn event_metadata_preserved() {
-    let store = OpenRaftAuditStore::new(1).await.unwrap();
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+        .await
+        .unwrap();
 
     store
         .append(make_event(

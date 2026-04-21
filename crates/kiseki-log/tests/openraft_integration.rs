@@ -42,9 +42,14 @@ fn make_append_req(key_byte: u8) -> AppendDeltaRequest {
 
 #[tokio::test]
 async fn bootstrap_and_verify() {
-    let store = OpenRaftLogStore::new(1, test_shard(), test_tenant())
-        .await
-        .unwrap();
+    let store = OpenRaftLogStore::new(
+        1,
+        test_shard(),
+        test_tenant(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Initial tip should be 0 (no deltas appended).
     let tip = store.current_tip().await;
@@ -64,9 +69,14 @@ async fn bootstrap_and_verify() {
 
 #[tokio::test]
 async fn append_through_raft() {
-    let store = OpenRaftLogStore::new(1, test_shard(), test_tenant())
-        .await
-        .unwrap();
+    let store = OpenRaftLogStore::new(
+        1,
+        test_shard(),
+        test_tenant(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
 
     let seq = store.append_delta(make_append_req(0x50)).await.unwrap();
     assert_eq!(seq, SequenceNumber(1));
@@ -83,9 +93,14 @@ async fn append_through_raft() {
 
 #[tokio::test]
 async fn append_and_read_deltas_round_trip() {
-    let store = OpenRaftLogStore::new(1, test_shard(), test_tenant())
-        .await
-        .unwrap();
+    let store = OpenRaftLogStore::new(
+        1,
+        test_shard(),
+        test_tenant(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Append 3 deltas with different keys.
     for i in 0u8..3 {
@@ -128,9 +143,14 @@ async fn append_and_read_deltas_round_trip() {
 
 #[tokio::test]
 async fn maintenance_through_raft() {
-    let store = OpenRaftLogStore::new(1, test_shard(), test_tenant())
-        .await
-        .unwrap();
+    let store = OpenRaftLogStore::new(
+        1,
+        test_shard(),
+        test_tenant(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Enable maintenance.
     store.set_maintenance(true).await.unwrap();
@@ -153,9 +173,14 @@ async fn maintenance_through_raft() {
 
 #[tokio::test]
 async fn multiple_appends() {
-    let store = OpenRaftLogStore::new(1, test_shard(), test_tenant())
-        .await
-        .unwrap();
+    let store = OpenRaftLogStore::new(
+        1,
+        test_shard(),
+        test_tenant(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
 
     for i in 0u8..5 {
         let seq = store
@@ -176,9 +201,14 @@ async fn multiple_appends() {
 
 #[tokio::test]
 async fn watermark_advancement() {
-    let store = OpenRaftLogStore::new(1, test_shard(), test_tenant())
-        .await
-        .unwrap();
+    let store = OpenRaftLogStore::new(
+        1,
+        test_shard(),
+        test_tenant(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Append some deltas.
     for i in 0u8..5 {
@@ -218,9 +248,14 @@ async fn watermark_advancement() {
 
 #[tokio::test]
 async fn compact_shard_deduplicates() {
-    let store = OpenRaftLogStore::new(1, test_shard(), test_tenant())
-        .await
-        .unwrap();
+    let store = OpenRaftLogStore::new(
+        1,
+        test_shard(),
+        test_tenant(),
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Append two deltas with the same key — second supersedes first.
     store.append_delta(make_append_req(0x42)).await.unwrap();

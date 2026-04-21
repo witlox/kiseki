@@ -1,0 +1,93 @@
+# Kiseki 3-node Raft cluster for multi-node testing.
+#
+# Usage:
+#   docker compose -f docker-compose.3node.yml up --build -d
+#   KISEKI_E2E_COMPOSE=docker-compose.3node.yml pytest tests/e2e/test_multi_node.py
+#
+# Each node has unique node_id, shared raft_peers, and its own data volume.
+# Node 1 is the bootstrap node (creates initial shard).
+
+services:
+  kiseki-node1:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "9100:9100"  # data-path gRPC
+      - "9101:9101"  # advisory gRPC
+      - "9000:9000"  # S3
+      - "2049:2049"  # NFS
+    environment:
+      KISEKI_DATA_ADDR: "0.0.0.0:9100"
+      KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+      KISEKI_S3_ADDR: "0.0.0.0:9000"
+      KISEKI_NFS_ADDR: "0.0.0.0:2049"
+      KISEKI_DATA_DIR: "/data"
+      KISEKI_BOOTSTRAP: "true"
+      KISEKI_NODE_ID: "1"
+      KISEKI_RAFT_PEERS: "1=kiseki-node1:9300,2=kiseki-node2:9300,3=kiseki-node3:9300"
+      KISEKI_RAFT_ADDR: "0.0.0.0:9300"
+    volumes:
+      - node1-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  kiseki-node2:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "9110:9100"  # data-path gRPC
+      - "9111:9101"  # advisory gRPC
+      - "9010:9000"  # S3
+    environment:
+      KISEKI_DATA_ADDR: "0.0.0.0:9100"
+      KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+      KISEKI_S3_ADDR: "0.0.0.0:9000"
+      KISEKI_NFS_ADDR: "0.0.0.0:2049"
+      KISEKI_DATA_DIR: "/data"
+      KISEKI_BOOTSTRAP: "true"
+      KISEKI_NODE_ID: "2"
+      KISEKI_RAFT_PEERS: "1=kiseki-node1:9300,2=kiseki-node2:9300,3=kiseki-node3:9300"
+      KISEKI_RAFT_ADDR: "0.0.0.0:9300"
+    volumes:
+      - node2-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  kiseki-node3:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "9120:9100"  # data-path gRPC
+      - "9121:9101"  # advisory gRPC
+      - "9020:9000"  # S3
+    environment:
+      KISEKI_DATA_ADDR: "0.0.0.0:9100"
+      KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+      KISEKI_S3_ADDR: "0.0.0.0:9000"
+      KISEKI_NFS_ADDR: "0.0.0.0:2049"
+      KISEKI_DATA_DIR: "/data"
+      KISEKI_BOOTSTRAP: "true"
+      KISEKI_NODE_ID: "3"
+      KISEKI_RAFT_PEERS: "1=kiseki-node1:9300,2=kiseki-node2:9300,3=kiseki-node3:9300"
+      KISEKI_RAFT_ADDR: "0.0.0.0:9300"
+    volumes:
+      - node3-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
