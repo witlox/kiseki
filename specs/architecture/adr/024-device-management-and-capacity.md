@@ -1,6 +1,6 @@
 # ADR-024: Device Management, Storage Tiers, and Capacity Thresholds
 
-**Status**: Proposed.
+**Status**: Accepted (19/19 device-management BDD scenarios pass).
 **Date**: 2026-04-20.
 **Deciders**: Architect + domain expert.
 

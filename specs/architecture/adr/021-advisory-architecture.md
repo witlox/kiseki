@@ -1,6 +1,6 @@
 # ADR-021: Workflow Advisory Architecture
 
-**Status**: Proposed (architect phase — awaits adversary gate-1 review before implementation)
+**Status**: Accepted (implemented, 51/51 BDD scenarios pass)
 **Date**: 2026-04-17
 **Context**: ADR-020 analyst-level decision; this ADR commits the architecture (crate shape, runtime isolation, advisory-to-data-path coupling, protobuf + intra-Rust boundaries).
 

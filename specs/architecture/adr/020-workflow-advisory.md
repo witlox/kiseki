@@ -1,6 +1,6 @@
 # ADR-020: Workflow Advisory & Client Telemetry
 
-**Status**: Proposed (analyst phase — awaits architect interface design and adversary gate review)
+**Status**: Accepted (implemented, 51/51 BDD scenarios pass)
 **Date**: 2026-04-17
 **Context**: new capability — HPC/AI workloads need to steer storage (prefetch, affinity, priority, phase-adaptive tuning) and consume caller-scoped feedback (backpressure, locality, materialization lag, QoS headroom). ADR-015 covers operator-facing observability; this ADR covers the orthogonal client-facing advisory/telemetry surface.
 

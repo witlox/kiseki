@@ -140,7 +140,8 @@ former language wall. Enforced by `make arch-check`.
 | `kiseki-keyserver` | keymanager | Dedicated HA cluster (3-5 nodes) |
 | `kiseki-client-fuse` | client + transport | Compute nodes (workload-side) |
 | `kiseki-control` | control plane (Rust, ADR-027) | Management network (3+ instances) |
-| `kiseki-cli` | admin CLI (Rust) | Admin workstations |
+| `kiseki-cli` | admin CLI (Rust) | Admin workstations (future) |
+| `kiseki-keyserver` | system key manager (HA) | Dedicated cluster (future) |
 
 ---
 
