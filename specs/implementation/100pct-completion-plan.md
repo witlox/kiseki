@@ -157,3 +157,117 @@ After each phase:
 2. `cargo test --workspace` — 0 unit test regressions
 3. No empty bodies, no panic→comment conversions
 4. Every Then-step calls real domain code
+
+---
+
+## Addendum: Duplication Analysis + Revised Execution Order
+
+**Date**: 2026-04-21 (added after partial H1/H7/H11 execution)
+
+### Problem identified
+
+The original H1-H12 phases have significant overlap:
+- H1 (crypto) and H11 (chunk pipeline) both touch encryption
+- H4 (NFS handlers), H5 (S3 handlers), and H6 (gateway integration)
+  are really one phase — wire protocols through the pipeline
+- H7 (admin) overlaps with existing device/pool code from Phase G
+- BDD steps written so far create inline crypto roundtrips instead of
+  exercising the actual system pipeline end-to-end
+
+### Root cause
+
+The pieces exist individually (crypto, EC, placement, stores, gateway)
+but there's no single integrated write/read path:
+```
+write: client → gateway → composition → encrypt → EC encode → place → store
+read:  store → gather fragments → EC decode → decrypt → gateway → client
+```
+
+### Revised execution order (merging overlapping phases)
+
+**R1: Integrated Write/Read Pipeline** (merges H11 + H6 + H1 partial)
+- Build `kiseki-gateway/src/pipeline.rs` — single function that chains:
+  write: plaintext → seal_envelope → EC encode → place fragments → store
+  read: gather fragments → EC decode → open_envelope → plaintext
+- Wire InMemoryGateway.write() and .read() through this pipeline
+- All crypto, EC, placement happens inside the pipeline
+- BDD steps call gateway.write/read and assert plaintext roundtrip
+- **Unlocks**: chunk-storage, key-management, gateway, composition scenarios
+- **Est. scenarios**: ~60
+
+**R2: NFS + S3 Protocol Handlers** (merges H4 + H5)
+- NFS3 procedure handlers call pipeline via NfsGateway
+- NFS4 COMPOUND ops call pipeline via NfsGateway
+- S3 HEAD/DELETE/LIST handlers call pipeline via S3Gateway
+- BDD steps assert protocol-specific response fields
+- **Depends on**: R1 (pipeline must exist)
+- **Est. scenarios**: ~40
+
+**R3: View + Stream Processor** (H3 unchanged)
+- Object versioning
+- Staleness enforcement
+- Stream processor crash recovery
+- **Depends on**: R1 (deltas must flow through pipeline)
+- **Est. scenarios**: ~15
+
+**R4: Log + Raft** (merges H2 + H12)
+- Auto-split at hard ceiling
+- Multi-node Raft test harness
+- Persistence BDD steps (redb round-trip)
+- **Depends on**: R1 (deltas come from pipeline writes)
+- **Est. scenarios**: ~25
+
+**R5: Admin API** (H7 reduced — remove overlap with Phase G)
+- Pool/shard/device admin gRPC service
+- Per-tenant billing
+- Observability streaming
+- **Independent of R1-R4**
+- **Est. scenarios**: ~30
+
+**R6: Auth + Identity** (H8 unchanged)
+- SPIFFE SVID, IdP, gateway auth
+- **Independent**
+- **Est. scenarios**: ~10
+
+**R7: Native Client** (H9 unchanged)
+- Discovery, transport selection, FUSE pipeline, batching, prefetch
+- **Depends on**: R1 (client calls pipeline)
+- **Est. scenarios**: ~26
+
+**R8: Operational** (H10 unchanged)
+- Integrity monitoring, format versioning, compression
+- **Mostly independent**
+- **Est. scenarios**: ~33
+
+### Revised execution diagram
+
+```
+R1 (pipeline) ──→ R2 (NFS+S3) ──→ done
+      │
+      ├──→ R3 (view)
+      ├──→ R4 (log+raft)
+      └──→ R7 (client)
+
+R5 (admin) ──→ done (independent)
+R6 (auth) ──→ done (independent)
+R8 (operational) ──→ done (independent)
+```
+
+R1 is THE critical path. Everything else follows.
+
+### Original H1-H12 tracking (for completion audit)
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| H1 Crypto | PARTIAL | shred.rs + cache.rs created, 6 BDD scenarios fixed. Remaining: inline assertions need pipeline. |
+| H2 Log | NOT STARTED | |
+| H3 View | PARTIAL | 9 scenarios fixed with real ViewStore assertions |
+| H4 NFS | NOT STARTED | |
+| H5 S3 | NOT STARTED | |
+| H6 Gateway | NOT STARTED | Merged into R1 |
+| H7 Admin | PARTIAL | 9 more scenarios with pool/state assertions |
+| H8 Auth | PARTIAL | 7 scenarios with cert/identity assertions |
+| H9 Client | NOT STARTED | |
+| H10 Operational | NOT STARTED | |
+| H11 Chunk | PARTIAL | 5 scenarios with crypto+EC assertions. Needs pipeline. |
+| H12 Raft | NOT STARTED | |
