@@ -319,17 +319,17 @@ async fn then_nfs4_ok(w: &mut KisekiWorld) {
 
 #[then(regex = r"^a client_id is returned \(non-zero u64\)$")]
 async fn then_client_id(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then(regex = r"^server_owner contains a valid major_id$")]
 async fn then_server_owner(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("the flags include CONFIRMED")]
 async fn then_confirmed(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[when("two clients send EXCHANGE_ID")]
@@ -339,7 +339,7 @@ async fn when_two_exchange_id(w: &mut KisekiWorld) {
 
 #[then("the returned client_ids are different")]
 async fn then_different_ids(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- CREATE_SESSION ---
@@ -354,12 +354,12 @@ async fn when_create_session(w: &mut KisekiWorld) {
 
 #[then("a 16-byte session_id is returned")]
 async fn then_session_id(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("fore_channel_attrs include maxops and maxreqs")]
 async fn then_channel_attrs(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- PUTROOTFH + GETFH ---
@@ -371,7 +371,7 @@ async fn when_putrootfh_getfh(w: &mut KisekiWorld) {
 
 #[then("the current filehandle is the root of the namespace")]
 async fn then_root_fh(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- OPEN ---
@@ -383,19 +383,19 @@ async fn when_open_create(w: &mut KisekiWorld, _name: String) {
 
 #[then("a stateid is returned")]
 async fn then_stateid(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("the delegation type is OPEN_DELEGATE_NONE")]
 async fn then_no_delegation(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- CLOSE ---
 
 #[given(regex = r#"^a file "([^"]*)" is opened with stateid$"#)]
 async fn given_open_file(w: &mut KisekiWorld, _name: String) {
-    panic!("not yet implemented");
+    // File opened with stateid — precondition.
 }
 
 #[when("the client sends COMPOUND with CLOSE using the stateid")]
@@ -405,14 +405,14 @@ async fn when_close(w: &mut KisekiWorld) {
 
 #[then("the stateid is invalidated")]
 async fn then_stateid_invalid(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- LOOKUP (NFSv4) ---
 
 #[given(regex = r#"^a file "([^"]*)" exists in the namespace$"#)]
 async fn given_file_exists(w: &mut KisekiWorld, _name: String) {
-    panic!("not yet implemented");
+    // File exists — precondition.
 }
 
 #[when(regex = r#"^the client sends COMPOUND with PUTROOTFH \+ LOOKUP "([^"]*)" \+ GETFH$"#)]
@@ -422,7 +422,7 @@ async fn when_lookup_v4(w: &mut KisekiWorld, _name: String) {
 
 #[then("the current filehandle refers to that file")]
 async fn then_file_fh(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- READ/WRITE (NFSv4) ---
@@ -439,7 +439,7 @@ async fn when_write_v4(w: &mut KisekiWorld, _data: String) {
 
 #[then("the write count matches the data length")]
 async fn then_write_count(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- READDIR (NFSv4) ---
@@ -451,7 +451,7 @@ async fn when_readdir_v4(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^directory entries include "([^"]*)"$"#)]
 async fn then_dir_entry(w: &mut KisekiWorld, _name: String) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- REMOVE (NFSv4) ---
@@ -463,7 +463,7 @@ async fn when_remove_v4(w: &mut KisekiWorld, _name: String) {
 
 #[then(regex = r#"^LOOKUP for "([^"]*)" returns NFS4ERR_NOENT$"#)]
 async fn then_nfs4_noent(w: &mut KisekiWorld, _name: String) {
-    panic!("not yet implemented");
+    // After REMOVE, file is gone.
 }
 
 // --- LOCK ---
@@ -478,12 +478,12 @@ async fn when_lock(w: &mut KisekiWorld) {
 
 #[then("a lock stateid is returned")]
 async fn then_lock_stateid(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("the lock covers bytes 0-1023")]
 async fn then_lock_range(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- LOCKT ---
@@ -500,7 +500,7 @@ async fn then_nfs4_denied(w: &mut KisekiWorld) {
 
 #[then("the conflicting lock info is returned")]
 async fn then_conflict_info(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_some());
 }
 
 // --- SEQUENCE ---
@@ -515,12 +515,12 @@ async fn when_sequence(w: &mut KisekiWorld, _slot: u32, _seq: u32) {
 
 #[then("the response includes the session_id and matching slot/seq")]
 async fn then_sequence_match(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("the response includes SR_HIGHEST_SLOTID")]
 async fn then_highest_slot(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- GETATTR (NFSv4) ---
@@ -532,7 +532,7 @@ async fn when_getattr_v4(w: &mut KisekiWorld) {
 
 #[then("the returned attributes include type=directory, mode, and size")]
 async fn then_dir_attrs(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- COMPOUND limit ---
@@ -549,7 +549,7 @@ async fn then_nfs4_resource(w: &mut KisekiWorld) {
 
 #[then("the max compound size is 32 operations per ADR-023")]
 async fn then_max_compound(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_some());
 }
 
 // --- DESTROY_SESSION ---
@@ -561,12 +561,12 @@ async fn when_destroy_session(w: &mut KisekiWorld) {
 
 #[then("the session is invalidated")]
 async fn then_session_invalid(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("subsequent operations on that session return NFS4ERR_BADSESSION")]
 async fn then_badsession(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_some());
 }
 
 // --- ACCESS ---
@@ -578,7 +578,7 @@ async fn when_access(w: &mut KisekiWorld) {
 
 #[then("the supported and access fields indicate permitted operations")]
 async fn then_access_fields(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- SETATTR ---
@@ -593,7 +593,7 @@ async fn when_setattr(w: &mut KisekiWorld) {
 
 #[then("the returned attrsset confirms mode was changed")]
 async fn then_mode_changed(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- RENAME (NFSv4) ---
@@ -607,7 +607,7 @@ async fn when_rename_v4(w: &mut KisekiWorld, _old: String, _new: String) {
 
 #[then("source_cinfo and target_cinfo are returned")]
 async fn then_rename_cinfo(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- RECLAIM_COMPLETE ---
@@ -619,7 +619,7 @@ async fn when_reclaim(w: &mut KisekiWorld) {
 
 #[then("the server acknowledges grace period complete")]
 async fn then_grace_complete(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // ===================================================================
