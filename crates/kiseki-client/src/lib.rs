@@ -11,11 +11,14 @@
 
 #![deny(unsafe_code)]
 
+pub mod batching;
 pub mod cache;
 pub mod discovery;
 pub mod error;
 #[allow(missing_docs)]
 pub mod fuse_fs;
+pub mod prefetch;
+pub mod transport_select;
 
 #[cfg(feature = "python")]
 pub mod python;

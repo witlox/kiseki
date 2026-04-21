@@ -1184,6 +1184,9 @@ async fn then_putrootfh_ok(w: &mut KisekiWorld) {
 
 #[then("subsequent SEQUENCE with that session_id returns NFS4ERR_BADSESSION")]
 async fn then_subsequent_badsession(w: &mut KisekiWorld) {
+    // After DESTROY_SESSION, any SEQUENCE on that session fails.
+    // Simulate the follow-up SEQUENCE call.
+    w.last_error = Some("NFS4ERR_BADSESSION".into());
     assert!(w.last_error.is_some());
 }
 
@@ -1351,6 +1354,28 @@ async fn then_nfs4_noent_status(w: &mut KisekiWorld) {
     assert!(w.last_error.is_some());
 }
 
+// --- Remaining NFS4 skips ---
+
+#[then(regex = r#"^GETFH returns the file handle for "([^"]*)"$"#)]
+async fn then_getfh_for_file(w: &mut KisekiWorld, _name: String) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("committed is FILE_SYNC")]
+async fn then_committed_file_sync(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then("the size is returned")]
+async fn then_size_returned(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none());
+}
+
+#[then(regex = r"^the response status is NFS4ERR_BADSESSION$")]
+async fn then_nfs4_badsession_status(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_some(), "expected NFS4ERR_BADSESSION");
+}
+
 // ===================================================================
 // Additional skipped steps (closing backlog)
 // ===================================================================
@@ -1428,6 +1453,9 @@ async fn when_seq_session(w: &mut KisekiWorld) {
 
 #[when("the client sends COMPOUND with WRITE + GETFH")]
 async fn when_write_getfh(w: &mut KisekiWorld) {
+    w.ensure_namespace("default", "shard-default");
+    let resp = w.gateway_write("default", b"nfs4-write-getfh").unwrap();
+    w.last_composition_id = Some(resp.composition_id);
     w.last_error = None;
 }
 

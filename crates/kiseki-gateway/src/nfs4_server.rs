@@ -21,22 +21,34 @@ use crate::ops::GatewayOps;
 const NFS4_PROGRAM: u32 = 100003;
 const NFS4_VERSION: u32 = 4;
 
-/// NFSv4 operation codes (subset for MVP).
+/// NFSv4 operation codes (RFC 7530 + RFC 7862).
+#[allow(dead_code)]
 mod op {
+    pub const ACCESS: u32 = 3;
     pub const CLOSE: u32 = 4;
+    pub const COMMIT: u32 = 5;
+    pub const CREATE: u32 = 6;
     pub const GETATTR: u32 = 9;
     pub const GETFH: u32 = 10;
+    pub const LINK: u32 = 11;
     pub const LOCK: u32 = 12;
     pub const LOOKUP: u32 = 15;
     pub const OPEN: u32 = 18;
+    pub const PUTFH: u32 = 22;
     pub const PUTROOTFH: u32 = 24;
     pub const READ: u32 = 25;
     pub const READDIR: u32 = 26;
+    pub const READLINK: u32 = 27;
     pub const REMOVE: u32 = 28;
+    pub const RENAME: u32 = 29;
+    pub const RESTOREFH: u32 = 31;
+    pub const SAVEFH: u32 = 32;
+    pub const SETATTR: u32 = 34;
     pub const WRITE: u32 = 38;
     pub const EXCHANGE_ID: u32 = 42;
     pub const CREATE_SESSION: u32 = 43;
     pub const DESTROY_SESSION: u32 = 44;
+    pub const RECLAIM_COMPLETE: u32 = 58;
     pub const SEQUENCE: u32 = 53;
     pub const IO_ADVISE: u32 = 63;
 }
@@ -84,6 +96,7 @@ struct LockState {
 /// Per-connection NFSv4 COMPOUND state.
 struct CompoundState {
     current_fh: Option<FileHandle>,
+    saved_fh: Option<FileHandle>,
     current_stateid: Option<StateId>,
 }
 
@@ -238,6 +251,7 @@ fn dispatch_compound<G: GatewayOps>(
     let mut compound_status = nfs4_status::NFS4_OK;
     let mut state = CompoundState {
         current_fh: None,
+        saved_fh: None,
         current_stateid: None,
     };
 
@@ -279,13 +293,16 @@ fn process_op<G: GatewayOps>(
     state: &mut CompoundState,
 ) -> (u32, Vec<u8>) {
     match op_code {
+        op::ACCESS => op_access(reader, ctx, state),
         op::EXCHANGE_ID => op_exchange_id(reader, sessions),
         op::CREATE_SESSION => op_create_session(reader, sessions),
         op::DESTROY_SESSION => op_destroy_session(reader, sessions),
         op::SEQUENCE => op_sequence(reader, sessions),
         op::PUTROOTFH => op_putrootfh(ctx, state),
+        op::PUTFH => op_putfh(reader, state),
         op::GETFH => op_getfh(state),
         op::GETATTR => op_getattr(reader, ctx, state),
+        op::SETATTR => op_setattr(reader, ctx, state),
         op::LOOKUP => op_lookup(reader, ctx, state),
         op::OPEN => op_open(reader, ctx, sessions, state),
         op::CLOSE => op_close(reader, sessions, state),
@@ -293,7 +310,15 @@ fn process_op<G: GatewayOps>(
         op::READ => op_read(reader, ctx, state),
         op::WRITE => op_write(reader, ctx, state),
         op::REMOVE => op_remove(reader, ctx),
+        op::RENAME => op_rename(reader, ctx),
+        op::LINK => op_link(reader, ctx, state),
         op::READDIR => op_readdir(ctx),
+        op::READLINK => op_readlink(ctx, state),
+        op::CREATE => op_create(reader, ctx, state),
+        op::COMMIT => op_commit(),
+        op::SAVEFH => op_savefh(state),
+        op::RESTOREFH => op_restorefh(state),
+        op::RECLAIM_COMPLETE => op_reclaim_complete(reader),
         op::IO_ADVISE => op_io_advise(reader),
         _ => {
             let mut w = XdrWriter::new();
@@ -737,5 +762,275 @@ fn op_readdir<G: GatewayOps>(ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
     w.write_bool(false); // no more
     w.write_bool(true); // eof
 
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+// --- F2: New NFSv4 operation handlers ---
+
+fn op_access<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    state: &CompoundState,
+) -> (u32, Vec<u8>) {
+    let requested = reader.read_u32().unwrap_or(0x3F);
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::ACCESS);
+
+    let Some(fh) = &state.current_fh else {
+        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+        return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
+    };
+
+    match ctx.access(fh) {
+        Ok(granted) => {
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_u32(requested & granted); // supported
+            w.write_u32(requested & granted); // access
+        }
+        Err(_) => {
+            w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_setattr<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    state: &CompoundState,
+) -> (u32, Vec<u8>) {
+    // stateid + attrmask + attr_vals
+    let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
+    let bitmap_count = reader.read_u32().unwrap_or(0);
+    for _ in 0..bitmap_count {
+        let _ = reader.read_u32();
+    }
+    let _attr_vals = reader.read_opaque().unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::SETATTR);
+
+    let Some(fh) = &state.current_fh else {
+        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+        w.write_u32(0); // attrsset bitmap count
+        return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
+    };
+
+    if ctx.setattr(fh, None).is_ok() {
+        w.write_u32(nfs4_status::NFS4_OK);
+        w.write_u32(0); // attrsset bitmap count (none actually set)
+    } else {
+        w.write_u32(nfs4_status::NFS4ERR_IO);
+        w.write_u32(0);
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_rename<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+    let old_name = reader.read_string().unwrap_or_default();
+    let new_name = reader.read_string().unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::RENAME);
+
+    match ctx.rename_file(&old_name, &new_name) {
+        Ok(()) => {
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_bool(false); // source cinfo
+            w.write_bool(false); // target cinfo
+        }
+        Err(_) => {
+            w.write_u32(nfs4_status::NFS4ERR_NOENT);
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_link<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    state: &CompoundState,
+) -> (u32, Vec<u8>) {
+    let new_name = reader.read_string().unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::LINK);
+
+    // LINK uses saved_fh as the target and current_fh's dir for the new name.
+    let Some(target_fh) = &state.saved_fh else {
+        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+        return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
+    };
+
+    match ctx.link(target_fh, &new_name) {
+        Ok(()) => {
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_bool(false); // cinfo
+        }
+        Err(_) => {
+            w.write_u32(nfs4_status::NFS4ERR_IO);
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_readlink<G: GatewayOps>(ctx: &NfsContext<G>, state: &CompoundState) -> (u32, Vec<u8>) {
+    let mut w = XdrWriter::new();
+    w.write_u32(op::READLINK);
+
+    let Some(fh) = &state.current_fh else {
+        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+        return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
+    };
+
+    match ctx.readlink(fh) {
+        Ok(target) => {
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_string(&target);
+        }
+        Err(_) => {
+            w.write_u32(nfs4_status::NFS4ERR_IO);
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_create<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    state: &mut CompoundState,
+) -> (u32, Vec<u8>) {
+    let obj_type = reader.read_u32().unwrap_or(1); // NF4REG=1, NF4DIR=2, NF4LNK=5
+                                                   // For symlinks, read the linkdata.
+    let linkdata = if obj_type == 5 {
+        reader.read_string().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let name = reader.read_string().unwrap_or_default();
+    // Skip createattrs (bitmap + values).
+    let bitmap_count = reader.read_u32().unwrap_or(0);
+    for _ in 0..bitmap_count {
+        let _ = reader.read_u32();
+    }
+    let _attr_vals = reader.read_opaque().unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::CREATE);
+
+    match obj_type {
+        2 => {
+            // Directory
+            match ctx.mkdir(&name) {
+                Ok((fh, _)) => {
+                    state.current_fh = Some(fh);
+                    w.write_u32(nfs4_status::NFS4_OK);
+                    w.write_bool(false); // cinfo
+                    w.write_u32(0); // attrsset bitmap count
+                }
+                Err(_) => {
+                    w.write_u32(nfs4_status::NFS4ERR_IO);
+                }
+            }
+        }
+        5 => {
+            // Symlink
+            match ctx.symlink(&name, &linkdata) {
+                Ok((fh, _)) => {
+                    state.current_fh = Some(fh);
+                    w.write_u32(nfs4_status::NFS4_OK);
+                    w.write_bool(false);
+                    w.write_u32(0);
+                }
+                Err(_) => {
+                    w.write_u32(nfs4_status::NFS4ERR_IO);
+                }
+            }
+        }
+        _ => {
+            // Regular file or unsupported — create empty file.
+            match ctx.write_named(&name, Vec::new()) {
+                Ok((fh, _)) => {
+                    state.current_fh = Some(fh);
+                    w.write_u32(nfs4_status::NFS4_OK);
+                    w.write_bool(false);
+                    w.write_u32(0);
+                }
+                Err(_) => {
+                    w.write_u32(nfs4_status::NFS4ERR_IO);
+                }
+            }
+        }
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_commit() -> (u32, Vec<u8>) {
+    let mut w = XdrWriter::new();
+    w.write_u32(op::COMMIT);
+    w.write_u32(nfs4_status::NFS4_OK);
+    w.write_opaque_fixed(&[0u8; 8]); // write verifier
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_putfh(reader: &mut XdrReader<'_>, state: &mut CompoundState) -> (u32, Vec<u8>) {
+    let fh_bytes = reader.read_opaque().unwrap_or_default();
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::PUTFH);
+
+    if fh_bytes.len() == 32 {
+        let mut fh = [0u8; 32];
+        fh.copy_from_slice(&fh_bytes);
+        state.current_fh = Some(fh);
+        w.write_u32(nfs4_status::NFS4_OK);
+    } else {
+        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_savefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
+    let mut w = XdrWriter::new();
+    w.write_u32(op::SAVEFH);
+
+    if let Some(fh) = state.current_fh {
+        state.saved_fh = Some(fh);
+        w.write_u32(nfs4_status::NFS4_OK);
+    } else {
+        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_restorefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
+    let mut w = XdrWriter::new();
+    w.write_u32(op::RESTOREFH);
+
+    if let Some(fh) = state.saved_fh {
+        state.current_fh = Some(fh);
+        w.write_u32(nfs4_status::NFS4_OK);
+    } else {
+        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn op_reclaim_complete(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+    let _one_fs = reader.read_bool().unwrap_or(false);
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::RECLAIM_COMPLETE);
+    w.write_u32(nfs4_status::NFS4_OK);
     (nfs4_status::NFS4_OK, w.into_bytes())
 }

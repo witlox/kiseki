@@ -20,26 +20,42 @@ const NFS3_PROGRAM: u32 = 100003;
 /// NFS3 version.
 const NFS3_VERSION: u32 = 3;
 
-/// NFS3 procedure numbers.
+/// NFS3 procedure numbers (RFC 1813 section 3.3).
 mod proc {
     pub const NULL: u32 = 0;
     pub const GETATTR: u32 = 1;
+    pub const SETATTR: u32 = 2;
     pub const LOOKUP: u32 = 3;
+    pub const ACCESS: u32 = 4;
+    pub const READLINK: u32 = 5;
     pub const READ: u32 = 6;
     pub const WRITE: u32 = 7;
     pub const CREATE: u32 = 8;
+    pub const MKDIR: u32 = 9;
+    pub const SYMLINK: u32 = 10;
+    pub const MKNOD: u32 = 11;
     pub const REMOVE: u32 = 12;
+    pub const RMDIR: u32 = 13;
     pub const RENAME: u32 = 14;
+    pub const LINK: u32 = 15;
     pub const READDIR: u32 = 16;
-    pub const FSSTAT: u32 = 21;
+    pub const READDIRPLUS: u32 = 17;
+    pub const PATHCONF: u32 = 19;
     pub const FSINFO: u32 = 20;
+    pub const FSSTAT: u32 = 21;
+    pub const COMMIT: u32 = 22;
 }
 
 /// NFS3 status codes.
+#[allow(dead_code)]
 mod status {
     pub const NFS3_OK: u32 = 0;
     pub const NFS3ERR_NOENT: u32 = 2;
     pub const NFS3ERR_IO: u32 = 5;
+    pub const NFS3ERR_EXIST: u32 = 17;
+    pub const NFS3ERR_NOTDIR: u32 = 20;
+    pub const NFS3ERR_NOTEMPTY: u32 = 66;
+    pub const NFS3ERR_NOTSUPP: u32 = 10004;
     pub const NFS3ERR_BADHANDLE: u32 = 10001;
 }
 
@@ -93,15 +109,26 @@ fn dispatch_nfs3<G: GatewayOps>(
     match header.procedure {
         proc::NULL => reply_null(header.xid),
         proc::GETATTR => reply_getattr(header.xid, reader, ctx),
+        proc::SETATTR => reply_setattr(header.xid, reader, ctx),
         proc::LOOKUP => reply_lookup(header.xid, reader, ctx),
+        proc::ACCESS => reply_access(header.xid, reader, ctx),
+        proc::READLINK => reply_readlink(header.xid, reader, ctx),
         proc::READ => reply_read(header.xid, reader, ctx),
         proc::WRITE => reply_write(header.xid, reader, ctx),
         proc::CREATE => reply_create(header.xid, reader, ctx),
+        proc::MKDIR => reply_mkdir(header.xid, reader, ctx),
+        proc::SYMLINK => reply_symlink(header.xid, reader, ctx),
+        proc::MKNOD => reply_mknod(header.xid),
         proc::REMOVE => reply_remove(header.xid, reader, ctx),
+        proc::RMDIR => reply_rmdir(header.xid, reader, ctx),
         proc::RENAME => reply_rename(header.xid, reader, ctx),
+        proc::LINK => reply_link(header.xid, reader, ctx),
         proc::READDIR => reply_readdir(header.xid, reader, ctx),
+        proc::READDIRPLUS => reply_readdirplus(header.xid, reader, ctx),
+        proc::PATHCONF => reply_pathconf(header.xid),
         proc::FSSTAT => reply_fsstat(header.xid, ctx),
         proc::FSINFO => reply_fsinfo(header.xid, ctx),
+        proc::COMMIT => reply_commit(header.xid),
         _ => {
             // Unsupported procedure — reply PROC_UNAVAIL.
             let mut w = XdrWriter::new();
@@ -425,6 +452,359 @@ fn reply_fsinfo<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
     w.write_u32(1);
     // properties
     w.write_u32(0x001b); // FSF_LINK | FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME
+
+    w.into_bytes()
+}
+
+// --- F1: New NFS3 handlers below ---
+
+fn reply_setattr<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let fh = match reader.read_opaque() {
+        Ok(fh) if fh.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&fh);
+            arr
+        }
+        _ => {
+            w.write_u32(status::NFS3ERR_BADHANDLE);
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+            return w.into_bytes();
+        }
+    };
+
+    // sattr3: each field is optional (bool + value).
+    // Read mode if present.
+    let set_mode = reader.read_bool().unwrap_or(false);
+    let mode = if set_mode {
+        Some(reader.read_u32().unwrap_or(0o644))
+    } else {
+        None
+    };
+    // Skip uid, gid, size, atime, mtime (all optional).
+    for _ in 0..5 {
+        if reader.read_bool().unwrap_or(false) {
+            let _ = reader.read_u32(); // consume value (or time)
+        }
+    }
+    // guard check (sattrguard3): bool + optional pre-op ctime
+    if reader.read_bool().unwrap_or(false) {
+        let _ = reader.read_u32(); // seconds
+        let _ = reader.read_u32(); // nseconds
+    }
+
+    match ctx.setattr(&fh, mode) {
+        Ok(_attrs) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_IO);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_access<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let fh = match reader.read_opaque() {
+        Ok(fh) if fh.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&fh);
+            arr
+        }
+        _ => {
+            w.write_u32(status::NFS3ERR_BADHANDLE);
+            w.write_bool(false); // post-op attrs
+            return w.into_bytes();
+        }
+    };
+
+    let requested = reader.read_u32().unwrap_or(0x3F);
+
+    match ctx.access(&fh) {
+        Ok(granted) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(false); // post-op attrs
+            w.write_u32(granted & requested); // only grant what was requested
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_BADHANDLE);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_readlink<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let fh = match reader.read_opaque() {
+        Ok(fh) if fh.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&fh);
+            arr
+        }
+        _ => {
+            w.write_u32(status::NFS3ERR_BADHANDLE);
+            w.write_bool(false); // post-op attrs
+            return w.into_bytes();
+        }
+    };
+
+    match ctx.readlink(&fh) {
+        Ok(target) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(false); // post-op attrs
+            w.write_string(&target); // nfspath3
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_IO);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_mkdir<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+    let name = reader.read_string().unwrap_or_default();
+    // Skip sattr3 (mode, uid, gid, size, atime, mtime — all optional).
+    for _ in 0..6 {
+        if reader.read_bool().unwrap_or(false) {
+            let _ = reader.read_u32();
+        }
+    }
+
+    match ctx.mkdir(&name) {
+        Ok((new_fh, _attrs)) => {
+            w.write_u32(status::NFS3_OK);
+            // post_op_fh3: handle follows = true + handle
+            w.write_bool(true);
+            w.write_opaque(&new_fh);
+            // post-op attrs
+            w.write_bool(false);
+            // dir wcc
+            w.write_bool(false); // pre
+            w.write_bool(false); // post
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_IO);
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_symlink<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+    let name = reader.read_string().unwrap_or_default();
+    // Skip sattr3 (6 optional fields).
+    for _ in 0..6 {
+        if reader.read_bool().unwrap_or(false) {
+            let _ = reader.read_u32();
+        }
+    }
+    let target = reader.read_string().unwrap_or_default();
+
+    match ctx.symlink(&name, &target) {
+        Ok((new_fh, _attrs)) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(true);
+            w.write_opaque(&new_fh);
+            w.write_bool(false); // post-op attrs
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_IO);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+/// MKNOD creates special device files. Kiseki does not support device files,
+/// so we always return `NFS3ERR_NOTSUPP`.
+fn reply_mknod(xid: u32) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+    w.write_u32(status::NFS3ERR_NOTSUPP);
+    w.write_bool(false); // pre wcc
+    w.write_bool(false); // post wcc
+    w.into_bytes()
+}
+
+fn reply_rmdir<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+    let name = reader.read_string().unwrap_or_default();
+
+    match ctx.rmdir(&name) {
+        Ok(()) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_NOENT);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_link<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let target_fh = match reader.read_opaque() {
+        Ok(fh) if fh.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&fh);
+            arr
+        }
+        _ => {
+            w.write_u32(status::NFS3ERR_BADHANDLE);
+            w.write_bool(false); // post-op attrs
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+            return w.into_bytes();
+        }
+    };
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+    let name = reader.read_string().unwrap_or_default();
+
+    match ctx.link(&target_fh, &name) {
+        Ok(()) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(false); // post-op file attrs
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_IO);
+            w.write_bool(false);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+    }
+
+    w.into_bytes()
+}
+
+fn reply_readdirplus<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    let _dir_fh = reader.read_opaque().unwrap_or_default();
+    let _cookie = reader.read_u64().unwrap_or(0);
+    let _cookieverf = reader.read_opaque_fixed(8).unwrap_or_default();
+    let _dircount = reader.read_u32().unwrap_or(0);
+    let _maxcount = reader.read_u32().unwrap_or(0);
+
+    w.write_u32(status::NFS3_OK);
+    w.write_bool(false); // dir attrs omitted
+    w.write_opaque_fixed(&[0u8; 8]); // cookieverf
+
+    let entries = ctx.readdir();
+    for (i, entry) in entries.iter().enumerate() {
+        w.write_bool(true); // entry follows
+        w.write_u64(entry.fileid);
+        w.write_string(&entry.name);
+        w.write_u64((i + 1) as u64); // cookie
+                                     // name_attributes (post_op_attr): false = not present
+        w.write_bool(false);
+        // name_handle (post_op_fh3): false = not present
+        w.write_bool(false);
+    }
+    w.write_bool(false); // no more entries
+    w.write_bool(true); // eof
+
+    w.into_bytes()
+}
+
+/// PATHCONF returns static filesystem configuration.
+fn reply_pathconf(xid: u32) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    w.write_u32(status::NFS3_OK);
+    w.write_bool(false); // post-op attrs
+    w.write_u32(1024); // linkmax
+    w.write_u32(255); // name_max
+    w.write_bool(true); // no_trunc
+    w.write_bool(false); // chown_restricted
+    w.write_bool(true); // case_insensitive = false (we say true = case preserving)
+    w.write_bool(true); // case_preserving
+
+    w.into_bytes()
+}
+
+/// COMMIT flushes pending writes to stable storage.
+fn reply_commit(xid: u32) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    encode_reply_accepted(&mut w, xid, 0);
+
+    w.write_u32(status::NFS3_OK);
+    w.write_bool(false); // pre wcc
+    w.write_bool(false); // post wcc
+    w.write_opaque_fixed(&[0u8; 8]); // write verifier
 
     w.into_bytes()
 }

@@ -74,7 +74,7 @@ pub struct CapacityThresholds {
 }
 
 impl CapacityThresholds {
-    /// NVMe thresholds per ADR-024.
+    /// `NVMe` thresholds per ADR-024.
     #[must_use]
     pub fn nvme() -> Self {
         Self {

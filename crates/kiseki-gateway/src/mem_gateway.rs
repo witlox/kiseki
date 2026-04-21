@@ -82,6 +82,73 @@ impl InMemoryGateway {
             .collect()
     }
 
+    /// Start a multipart upload. Returns the upload ID.
+    pub fn start_multipart(
+        &self,
+        namespace_id: kiseki_common::ids::NamespaceId,
+    ) -> Result<String, GatewayError> {
+        self.compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .start_multipart(namespace_id)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))
+    }
+
+    /// Upload a part: encrypt + store chunk, then register it with the upload.
+    pub fn upload_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<kiseki_common::ids::ChunkId, GatewayError> {
+        let chunk_id = kiseki_crypto::chunk_id::derive_chunk_id(
+            data,
+            self.dedup_policy,
+            self.tenant_hmac_key.as_deref(),
+        )
+        .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, data)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        let size = data.len() as u64;
+
+        self.chunks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_chunk(env, "default")
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        self.compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upload_part(upload_id, part_number, chunk_id, size)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        Ok(chunk_id)
+    }
+
+    /// Complete a multipart upload.
+    pub fn complete_multipart(
+        &self,
+        upload_id: &str,
+    ) -> Result<kiseki_common::ids::CompositionId, GatewayError> {
+        self.compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finalize_multipart(upload_id)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))
+    }
+
+    /// Abort a multipart upload.
+    pub fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        self.compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .abort_multipart(upload_id)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))
+    }
+
     /// Attach a shared view store for staleness enforcement (I-K9).
     #[must_use]
     pub fn with_view_store(mut self, vs: Arc<Mutex<ViewStore>>) -> Self {
@@ -216,5 +283,31 @@ impl GatewayOps for InMemoryGateway {
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
         Ok(self.list_compositions(namespace_id))
+    }
+
+    fn delete(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        _namespace_id: kiseki_common::ids::NamespaceId,
+        composition_id: kiseki_common::ids::CompositionId,
+    ) -> Result<(), GatewayError> {
+        // Verify tenant ownership before deleting.
+        {
+            let compositions = self
+                .compositions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let comp = compositions
+                .get(composition_id)
+                .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            if comp.tenant_id != tenant_id {
+                return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
+            }
+        }
+        self.compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .delete(composition_id)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
 }

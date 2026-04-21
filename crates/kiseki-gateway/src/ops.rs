@@ -70,6 +70,17 @@ pub trait GatewayOps {
         let _ = (tenant_id, namespace_id);
         Ok(Vec::new())
     }
+
+    /// Delete a composition by ID.
+    fn delete(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        composition_id: CompositionId,
+    ) -> Result<(), GatewayError> {
+        let _ = (tenant_id, namespace_id, composition_id);
+        Err(GatewayError::ProtocolError("delete not supported".into()))
+    }
 }
 
 /// Blanket impl: `Arc<G>` delegates to `G` via deref.
@@ -86,5 +97,13 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
         namespace_id: NamespaceId,
     ) -> Result<Vec<(CompositionId, u64)>, GatewayError> {
         (**self).list(tenant_id, namespace_id)
+    }
+    fn delete(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        composition_id: CompositionId,
+    ) -> Result<(), GatewayError> {
+        (**self).delete(tenant_id, namespace_id, composition_id)
     }
 }

@@ -96,4 +96,99 @@ impl<G: GatewayOps> S3Gateway<G> {
     ) -> Result<Vec<(CompositionId, u64)>, GatewayError> {
         self.inner.list(tenant_id, namespace_id)
     }
+
+    /// S3 `DeleteObject` — deletes an object by composition ID.
+    pub fn delete_object(&self, req: DeleteObjectRequest) -> Result<(), GatewayError> {
+        self.inner
+            .delete(req.tenant_id, req.namespace_id, req.composition_id)
+    }
+
+    /// S3 `HeadObject` — gets object metadata without the body.
+    pub fn head_object(&self, req: GetObjectRequest) -> Result<HeadObjectResponse, GatewayError> {
+        // Full read to get size (in production, metadata-only path).
+        let resp = self.inner.read(ReadRequest {
+            tenant_id: req.tenant_id,
+            namespace_id: req.namespace_id,
+            composition_id: req.composition_id,
+            offset: 0,
+            length: u64::MAX,
+        })?;
+        Ok(HeadObjectResponse {
+            content_length: resp.data.len() as u64,
+            etag: req.composition_id.0.to_string(),
+        })
+    }
+}
+
+/// S3 `DeleteObject` request.
+#[derive(Clone, Copy, Debug)]
+#[allow(missing_docs)]
+pub struct DeleteObjectRequest {
+    pub tenant_id: OrgId,
+    pub namespace_id: NamespaceId,
+    pub composition_id: CompositionId,
+}
+
+/// S3 `HeadObject` response.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct HeadObjectResponse {
+    pub content_length: u64,
+    pub etag: String,
+}
+
+/// S3 `CreateMultipartUpload` request.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct CreateMultipartUploadRequest {
+    pub tenant_id: OrgId,
+    pub namespace_id: NamespaceId,
+}
+
+/// S3 `CreateMultipartUpload` response.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct CreateMultipartUploadResponse {
+    pub upload_id: String,
+}
+
+/// S3 `UploadPart` request.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct UploadPartRequest {
+    pub tenant_id: OrgId,
+    pub namespace_id: NamespaceId,
+    pub upload_id: String,
+    pub part_number: u32,
+    pub body: Vec<u8>,
+}
+
+/// S3 `UploadPart` response.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct UploadPartResponse {
+    pub etag: String,
+}
+
+/// S3 `CompleteMultipartUpload` request.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct CompleteMultipartUploadRequest {
+    pub tenant_id: OrgId,
+    pub namespace_id: NamespaceId,
+    pub upload_id: String,
+}
+
+/// S3 `CompleteMultipartUpload` response.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct CompleteMultipartUploadResponse {
+    pub etag: String,
+}
+
+/// S3 `AbortMultipartUpload` request.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct AbortMultipartUploadRequest {
+    pub upload_id: String,
 }

@@ -124,9 +124,8 @@ impl ChunkStore {
             .chunks
             .get(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
-        let ec = match &entry.ec {
-            Some(ec) => ec,
-            None => return Ok(entry.envelope.ciphertext.clone()),
+        let Some(ec) = &entry.ec else {
+            return Ok(entry.envelope.ciphertext.clone());
         };
 
         let pool = self

@@ -59,8 +59,10 @@ pub fn place_fragments(
 
     for frag_idx in 0..n_fragments {
         // Mix seed with fragment index for per-fragment variation.
-        let hash = seed.wrapping_mul(2654435761).wrapping_add(frag_idx as u64);
-        let idx = (hash as usize) % available.len();
+        let hash = seed
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(frag_idx as u64);
+        let idx = usize::try_from(hash).unwrap_or(usize::MAX) % available.len();
         selected.push(available.remove(idx));
     }
 

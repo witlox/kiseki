@@ -14,6 +14,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod auto_split;
+pub mod compaction_worker;
 pub mod delta;
 pub mod error;
 pub mod grpc;

@@ -15,6 +15,8 @@
 
 pub mod config;
 pub mod error;
+pub mod revocation;
+pub mod spiffe;
 pub mod tcp_tls;
 pub mod traits;
 

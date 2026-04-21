@@ -66,6 +66,18 @@ pub trait CompositionOps {
     /// Start a multipart upload.
     fn start_multipart(&mut self, namespace_id: NamespaceId) -> Result<String, CompositionError>;
 
+    /// Upload a single part of a multipart upload.
+    fn upload_part(
+        &mut self,
+        upload_id: &str,
+        part_number: u32,
+        chunk_id: ChunkId,
+        size: u64,
+    ) -> Result<(), CompositionError>;
+
+    /// Abort a multipart upload — marks parts for GC.
+    fn abort_multipart(&mut self, upload_id: &str) -> Result<(), CompositionError>;
+
     /// Finalize a multipart upload — makes the composition visible (I-L5).
     fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError>;
 }
@@ -283,6 +295,44 @@ impl CompositionOps for CompositionStore {
             (MultipartUpload::new(upload_id.clone()), namespace_id),
         );
         Ok(upload_id)
+    }
+
+    fn upload_part(
+        &mut self,
+        upload_id: &str,
+        part_number: u32,
+        chunk_id: ChunkId,
+        size: u64,
+    ) -> Result<(), CompositionError> {
+        let (upload, _ns_id) = self
+            .multiparts
+            .get_mut(upload_id)
+            .ok_or_else(|| CompositionError::MultipartNotFound(upload_id.to_owned()))?;
+
+        if !upload.add_part(crate::multipart::MultipartPart {
+            part_number,
+            chunk_id,
+            size,
+        }) {
+            return Err(CompositionError::MultipartNotFinalized(
+                upload_id.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn abort_multipart(&mut self, upload_id: &str) -> Result<(), CompositionError> {
+        let (upload, _ns_id) = self
+            .multiparts
+            .get_mut(upload_id)
+            .ok_or_else(|| CompositionError::MultipartNotFound(upload_id.to_owned()))?;
+
+        if !upload.abort() {
+            return Err(CompositionError::MultipartNotFinalized(
+                upload_id.to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError> {

@@ -20,6 +20,7 @@ pub mod grpc;
 pub mod health;
 pub mod raft;
 pub mod raft_store;
+pub mod rewrap_worker;
 pub mod store;
 
 pub use epoch::{EpochInfo, KeyManagerOps};

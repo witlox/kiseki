@@ -10,15 +10,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, head, put};
 use axum::Router;
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 
 use crate::ops::GatewayOps;
-use crate::s3::{GetObjectRequest, PutObjectRequest, S3Gateway};
+use crate::s3::{DeleteObjectRequest, GetObjectRequest, PutObjectRequest, S3Gateway};
 
 /// Shared state for S3 HTTP handlers.
 struct S3State<G: GatewayOps> {
@@ -67,12 +67,29 @@ async fn put_object<G: GatewayOps + Send + Sync + 'static>(
 async fn get_object<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
     Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
     let comp_id = match uuid::Uuid::parse_str(&key) {
         Ok(u) => CompositionId(u),
         Err(_) => return (StatusCode::NOT_FOUND, "invalid key (must be UUID)").into_response(),
     };
+
+    let etag = format!("\"{}\"", comp_id.0);
+
+    // Conditional: If-None-Match → 304 Not Modified.
+    if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+        if inm == etag || inm == "*" {
+            return StatusCode::NOT_MODIFIED.into_response();
+        }
+    }
+
+    // Conditional: If-Match → 412 Precondition Failed.
+    if let Some(im) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
+        if im != etag && im != "*" {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+    }
 
     match state.gateway.get_object(GetObjectRequest {
         tenant_id: state.tenant_id,
@@ -81,7 +98,10 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
     }) {
         Ok(resp) => (
             StatusCode::OK,
-            [("content-length", resp.content_length.to_string())],
+            [
+                ("content-length", resp.content_length.to_string()),
+                ("etag", etag),
+            ],
             resp.body,
         )
             .into_response(),
@@ -121,22 +141,68 @@ async fn head_object<G: GatewayOps + Send + Sync + 'static>(
 }
 
 async fn delete_object<G: GatewayOps + Send + Sync + 'static>(
-    State(_state): State<Arc<S3State<G>>>,
-    Path((_bucket, _key)): Path<(String, String)>,
+    State(state): State<Arc<S3State<G>>>,
+    Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    // TODO: wire to CompositionOps::delete
-    StatusCode::NO_CONTENT
+    let ns_id = namespace_from_bucket(&bucket);
+    let comp_id = match uuid::Uuid::parse_str(&key) {
+        Ok(u) => CompositionId(u),
+        Err(_) => return (StatusCode::NOT_FOUND, "invalid key (must be UUID)").into_response(),
+    };
+
+    match state.gateway.delete_object(DeleteObjectRequest {
+        tenant_id: state.tenant_id,
+        namespace_id: ns_id,
+        composition_id: comp_id,
+    }) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            let code = if e.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, e.to_string()).into_response()
+        }
+    }
+}
+
+/// Query parameters for `ListObjectsV2`.
+#[derive(serde::Deserialize, Default)]
+struct ListParams {
+    prefix: Option<String>,
+    #[serde(rename = "max-keys")]
+    max_keys: Option<usize>,
+    #[serde(rename = "continuation-token")]
+    continuation_token: Option<String>,
 }
 
 async fn list_objects<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
     Path(bucket): Path<String>,
+    Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
     match state.gateway.list_objects(state.tenant_id, ns_id) {
         Ok(objects) => {
-            // Simple JSON response (not XML like real S3, but functional).
-            let items: Vec<serde_json::Value> = objects
+            let max_keys = params.max_keys.unwrap_or(1000);
+            let prefix = params.prefix.unwrap_or_default();
+
+            // Filter by prefix.
+            let filtered: Vec<_> = objects
+                .into_iter()
+                .filter(|(id, _)| id.0.to_string().starts_with(&prefix))
+                .collect();
+
+            // Pagination: continuation token is the index to start from.
+            let start = params
+                .continuation_token
+                .and_then(|t| t.parse::<usize>().ok())
+                .unwrap_or(0);
+            let page: Vec<_> = filtered.iter().skip(start).take(max_keys).collect();
+            let is_truncated = start + page.len() < filtered.len();
+
+            let items: Vec<serde_json::Value> = page
                 .iter()
                 .map(|(id, size)| {
                     serde_json::json!({
@@ -145,11 +211,17 @@ async fn list_objects<G: GatewayOps + Send + Sync + 'static>(
                     })
                 })
                 .collect();
-            let body = serde_json::json!({
+
+            let mut body = serde_json::json!({
                 "contents": items,
                 "key_count": items.len(),
-                "is_truncated": false,
+                "is_truncated": is_truncated,
             });
+
+            if is_truncated {
+                body["next_continuation_token"] = serde_json::json!((start + max_keys).to_string());
+            }
+
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

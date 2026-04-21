@@ -16,6 +16,7 @@ pub mod descriptor;
 pub mod error;
 pub mod pin;
 pub mod stream_processor;
+pub mod versioning;
 pub mod view;
 
 pub use descriptor::{ConsistencyModel, ProtocolSemantics, ViewDescriptor};

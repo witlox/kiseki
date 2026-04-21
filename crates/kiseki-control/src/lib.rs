@@ -26,4 +26,5 @@ pub mod maintenance;
 pub mod namespace;
 pub mod policy;
 pub mod retention;
+pub mod storage_admin;
 pub mod tenant;

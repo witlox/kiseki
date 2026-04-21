@@ -299,6 +299,124 @@ impl<G: GatewayOps> NfsContext<G> {
             Err(GatewayError::ProtocolError("source file not found".into()))
         }
     }
+
+    /// Set file attributes (mode, size). Returns updated attrs.
+    pub fn setattr(&self, fh: &FileHandle, _mode: Option<u32>) -> Result<NfsAttrs, GatewayError> {
+        // In-memory store: attrs are computed, not stored.
+        // Return current attrs (mode update is advisory for now).
+        self.getattr(fh)
+    }
+
+    /// Create a directory. Returns handle + attrs.
+    pub fn mkdir(&self, name: &str) -> Result<(FileHandle, NfsAttrs), GatewayError> {
+        // Directories are namespace-level in Kiseki. Create a dir entry.
+        let mut fh = [0u8; 32];
+        fh[..8].copy_from_slice(&(name.len() as u64).to_le_bytes());
+        fh[8..16].copy_from_slice(&self.namespace_id.0.as_bytes()[..8]);
+        fh[16] = 0xFE; // marker for subdirectory
+
+        self.dir_index.insert(
+            self.namespace_id,
+            name.to_owned(),
+            fh,
+            CompositionId(uuid::Uuid::nil()), // dirs have no composition
+            0,
+        );
+
+        Ok((
+            fh,
+            NfsAttrs {
+                file_type: FileType::Directory,
+                size: 4096,
+                mode: 0o755,
+                nlink: 2,
+                uid: 0,
+                gid: 0,
+                fileid: u64::from_le_bytes(fh[..8].try_into().unwrap_or([0; 8])),
+            },
+        ))
+    }
+
+    /// Remove a directory by name.
+    pub fn rmdir(&self, name: &str) -> Result<(), GatewayError> {
+        if self.dir_index.remove(self.namespace_id, name) {
+            Ok(())
+        } else {
+            Err(GatewayError::ProtocolError("directory not found".into()))
+        }
+    }
+
+    /// Check access permissions. Returns allowed access bits.
+    /// Single-tenant in-memory: all access granted.
+    pub fn access(&self, fh: &FileHandle) -> Result<u32, GatewayError> {
+        let _ = self
+            .handles
+            .lookup(fh)
+            .ok_or_else(|| GatewayError::ProtocolError("stale handle".into()))?;
+        // ACCESS4_READ | ACCESS4_LOOKUP | ACCESS4_MODIFY | ACCESS4_EXTEND | ACCESS4_DELETE | ACCESS4_EXECUTE
+        Ok(0x3F)
+    }
+
+    /// Create a symbolic link. Stores target as inline data.
+    pub fn symlink(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> Result<(FileHandle, NfsAttrs), GatewayError> {
+        let (fh, resp) = self.write(target.as_bytes().to_vec())?;
+        self.dir_index.insert(
+            self.namespace_id,
+            name.to_owned(),
+            fh,
+            resp.composition_id,
+            target.len() as u64,
+        );
+        Ok((
+            fh,
+            NfsAttrs {
+                file_type: FileType::Regular, // symlinks stored as regular files with link content
+                size: target.len() as u64,
+                mode: 0o777,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                fileid: u64::from_le_bytes(fh[..8].try_into().unwrap_or([0; 8])),
+            },
+        ))
+    }
+
+    /// Read a symbolic link target.
+    pub fn readlink(&self, fh: &FileHandle) -> Result<String, GatewayError> {
+        let resp = self.read(fh, 0, u32::MAX)?;
+        String::from_utf8(resp.data)
+            .map_err(|_| GatewayError::ProtocolError("invalid symlink target".into()))
+    }
+
+    /// Create a hard link (within same namespace).
+    pub fn link(&self, target_fh: &FileHandle, new_name: &str) -> Result<(), GatewayError> {
+        let (ns, _tenant, comp_id) = self
+            .handles
+            .lookup(target_fh)
+            .ok_or_else(|| GatewayError::ProtocolError("stale handle".into()))?;
+        if ns != self.namespace_id {
+            return Err(GatewayError::ProtocolError(
+                "cross-namespace link (EXDEV)".into(),
+            ));
+        }
+        self.dir_index.insert(
+            self.namespace_id,
+            new_name.to_owned(),
+            *target_fh,
+            comp_id.unwrap_or(CompositionId(uuid::Uuid::nil())),
+            0,
+        );
+        Ok(())
+    }
+
+    /// Commit (fsync). No-op for in-memory; would flush redb for persistent.
+    pub fn commit(&self) -> Result<(), GatewayError> {
+        Ok(())
+    }
 }
 
 /// Directory entry for READDIR response.

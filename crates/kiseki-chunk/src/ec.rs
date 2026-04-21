@@ -113,7 +113,10 @@ pub fn decode(
 /// Compute storage overhead ratio for an EC scheme.
 #[must_use]
 pub fn overhead_ratio(data_shards: usize, parity_shards: usize) -> f64 {
-    (data_shards + parity_shards) as f64 / data_shards as f64
+    #[allow(clippy::cast_precision_loss)]
+    {
+        (data_shards + parity_shards) as f64 / data_shards as f64
+    }
 }
 
 #[cfg(test)]

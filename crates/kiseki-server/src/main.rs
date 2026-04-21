@@ -12,6 +12,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod config;
+mod integrity;
 mod runtime;
 
 fn main() {

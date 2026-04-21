@@ -23,6 +23,7 @@ pub mod error;
 pub mod ids;
 pub mod tenancy;
 pub mod time;
+pub mod versioning;
 
 // Advisory surface lives here per ADR-021 §2 to preserve the no-cycle rule.
 pub mod advisory;
