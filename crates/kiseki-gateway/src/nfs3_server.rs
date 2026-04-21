@@ -239,12 +239,18 @@ fn reply_write<G: GatewayOps>(
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
-    // Skip file handle (we create a new composition for each write).
     let _fh = reader.read_opaque().unwrap_or_default();
-    let _offset = reader.read_u64().unwrap_or(0);
+    let offset = reader.read_u64().unwrap_or(0);
     let _count = reader.read_u32().unwrap_or(0);
     let _stable = reader.read_u32().unwrap_or(0); // FILE_SYNC=2
     let data = reader.read_opaque().unwrap_or_default();
+
+    // Kiseki compositions are immutable — writes at nonzero offsets are not
+    // supported. Return NFS3ERR_IO for append/modify; offset 0 creates new.
+    if offset != 0 {
+        w.write_u32(status::NFS3ERR_IO);
+        return w.into_bytes();
+    }
 
     match ctx.write(data) {
         Ok((_new_fh, resp)) => {
@@ -488,11 +494,31 @@ fn reply_setattr<G: GatewayOps>(
     } else {
         None
     };
-    // Skip uid, gid, size, atime, mtime (all optional).
-    for _ in 0..5 {
-        if reader.read_bool().unwrap_or(false) {
-            let _ = reader.read_u32(); // consume value (or time)
-        }
+    // sattr3 fields per RFC 1813: uid (u32), gid (u32), size (u64),
+    // atime (set_it + nfstime3), mtime (set_it + nfstime3).
+    // uid
+    if reader.read_bool().unwrap_or(false) {
+        let _ = reader.read_u32();
+    }
+    // gid
+    if reader.read_bool().unwrap_or(false) {
+        let _ = reader.read_u32();
+    }
+    // size (uint64 per RFC 1813)
+    if reader.read_bool().unwrap_or(false) {
+        let _ = reader.read_u64();
+    }
+    // atime: set_it enum (0=DONT, 1=SET_TO_SERVER_TIME, 2=SET_TO_CLIENT_TIME)
+    let atime_set = reader.read_u32().unwrap_or(0);
+    if atime_set == 2 {
+        let _ = reader.read_u32(); // seconds
+        let _ = reader.read_u32(); // nseconds
+    }
+    // mtime: same as atime
+    let mtime_set = reader.read_u32().unwrap_or(0);
+    if mtime_set == 2 {
+        let _ = reader.read_u32(); // seconds
+        let _ = reader.read_u32(); // nseconds
     }
     // guard check (sattrguard3): bool + optional pre-op ctime
     if reader.read_bool().unwrap_or(false) {

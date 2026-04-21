@@ -154,6 +154,10 @@ pub fn execute_split(log: &MemShardStore, plan: &SplitPlan) -> Result<(), crate:
         }
     }
 
+    // Update key ranges: original keeps [start, midpoint), new gets [midpoint, end).
+    log.update_shard_range(plan.original_shard, plan.range_start, plan.midpoint);
+    log.update_shard_range(plan.new_shard, plan.midpoint, plan.range_end);
+
     Ok(())
 }
 

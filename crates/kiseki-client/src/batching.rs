@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 pub struct BatchConfig {
     /// Target batch size in bytes.
     pub target_size: usize,
+    /// Maximum buffer size before forced flush (OOM protection).
+    pub max_buffer_size: usize,
     /// Maximum time to hold a partial batch before flushing.
     pub max_delay: Duration,
 }
@@ -18,7 +20,8 @@ pub struct BatchConfig {
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
-            target_size: 64 * 1024, // 64 KB
+            target_size: 64 * 1024,            // 64 KB
+            max_buffer_size: 16 * 1024 * 1024, // 16 MB hard cap
             max_delay: Duration::from_millis(10),
         }
     }
@@ -42,14 +45,17 @@ impl WriteBatcher {
         }
     }
 
-    /// Add data to the batch. Returns `Some(batch)` if the batch is full.
+    /// Add data to the batch. Returns `Some(batch)` if the batch is full
+    /// or the buffer has reached the hard cap.
     pub fn add(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         if self.first_write.is_none() {
             self.first_write = Some(Instant::now());
         }
         self.buffer.extend_from_slice(data);
 
-        if self.buffer.len() >= self.config.target_size {
+        if self.buffer.len() >= self.config.target_size
+            || self.buffer.len() >= self.config.max_buffer_size
+        {
             Some(self.flush())
         } else {
             None
@@ -90,6 +96,7 @@ mod tests {
     fn batch_accumulates() {
         let mut batcher = WriteBatcher::new(BatchConfig {
             target_size: 100,
+            max_buffer_size: 1024,
             max_delay: Duration::from_secs(1),
         });
 
@@ -101,6 +108,7 @@ mod tests {
     fn batch_flushes_at_target() {
         let mut batcher = WriteBatcher::new(BatchConfig {
             target_size: 10,
+            max_buffer_size: 1024,
             max_delay: Duration::from_secs(1),
         });
 

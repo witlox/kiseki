@@ -19,6 +19,9 @@ pub struct CompactionConfig {
     pub tombstone_ratio_threshold: f64,
     /// Maximum bytes per second to read during compaction (rate limit).
     pub max_bytes_per_sec: u64,
+    /// Minimum number of versions to retain per key (for version history).
+    /// Superseded versions older than this count are eligible for removal.
+    pub min_versions_retained: u64,
 }
 
 impl Default for CompactionConfig {
@@ -27,6 +30,7 @@ impl Default for CompactionConfig {
             batch_size: 10_000,
             tombstone_ratio_threshold: 0.3,
             max_bytes_per_sec: 50 * 1024 * 1024, // 50 MB/s
+            min_versions_retained: 1,
         }
     }
 }
@@ -78,44 +82,53 @@ impl Default for CompactionProgress {
 ///
 /// Returns the list of deltas to keep. Removed deltas are:
 /// - Delete tombstones (the key is gone)
-/// - Superseded Creates/Updates (a newer version of the same key exists)
+/// - Superseded Creates/Updates beyond the version retention window
+///
+/// `min_versions` controls how many versions per key are retained
+/// for the versioning layer's historical reads.
 #[must_use]
-pub fn compact_deltas(deltas: &[Delta], progress: &CompactionProgress) -> Vec<Delta> {
+pub fn compact_deltas(
+    deltas: &[Delta],
+    progress: &CompactionProgress,
+    min_versions: u64,
+) -> Vec<Delta> {
     use std::collections::HashMap;
 
-    // Group by hashed_key — keep only the latest version per key.
-    let mut latest_by_key: HashMap<[u8; 32], &Delta> = HashMap::new();
+    if progress.is_cancelled() {
+        return deltas.to_vec();
+    }
 
+    // Group all deltas by key, sorted by sequence (newest first).
+    let mut by_key: HashMap<[u8; 32], Vec<&Delta>> = HashMap::new();
     for delta in deltas {
-        if progress.is_cancelled() {
-            return deltas.to_vec();
-        }
         progress.examined.fetch_add(1, Ordering::Relaxed);
-
-        let entry = latest_by_key
+        by_key
             .entry(delta.header.hashed_key)
-            .or_insert(delta);
-        if delta.header.sequence > entry.header.sequence {
-            *entry = delta;
-        }
+            .or_default()
+            .push(delta);
     }
 
     let mut retained = Vec::new();
-    let total_examined = deltas.len() as u64;
+    let min_keep = usize::try_from(min_versions.max(1)).unwrap_or(usize::MAX);
 
-    for latest in latest_by_key.values() {
-        if latest.header.operation == OperationType::Delete {
-            progress.removed.fetch_add(1, Ordering::Relaxed);
-        } else {
-            retained.push((*latest).clone());
-            progress.retained.fetch_add(1, Ordering::Relaxed);
+    for (_key, mut versions) in by_key {
+        if progress.is_cancelled() {
+            return deltas.to_vec();
+        }
+        // Sort newest first.
+        versions.sort_by(|a, b| b.header.sequence.cmp(&a.header.sequence));
+
+        for (i, delta) in versions.iter().enumerate() {
+            let is_tombstone = delta.header.operation == OperationType::Delete;
+            // Keep the newest `min_keep` versions. Remove older superseded + tombstones.
+            if i < min_keep && !is_tombstone {
+                retained.push((*delta).clone());
+                progress.retained.fetch_add(1, Ordering::Relaxed);
+            } else {
+                progress.removed.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
-
-    // Count superseded entries as removed.
-    let unique_keys = latest_by_key.len() as u64;
-    let superseded = total_examined.saturating_sub(unique_keys);
-    progress.removed.fetch_add(superseded, Ordering::Relaxed);
 
     retained.sort_by_key(|d| d.header.sequence);
     retained
@@ -188,7 +201,7 @@ mod tests {
         ];
 
         let progress = CompactionProgress::new();
-        let retained = compact_deltas(&deltas, &progress);
+        let retained = compact_deltas(&deltas, &progress, 1);
 
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].header.hashed_key, [0xBB; 32]);
@@ -204,7 +217,7 @@ mod tests {
         ];
 
         let progress = CompactionProgress::new();
-        let retained = compact_deltas(&deltas, &progress);
+        let retained = compact_deltas(&deltas, &progress, 1);
 
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].header.sequence, SequenceNumber(3));
@@ -219,14 +232,14 @@ mod tests {
         ];
 
         let progress = CompactionProgress::new();
-        let retained = compact_deltas(&deltas, &progress);
+        let retained = compact_deltas(&deltas, &progress, 1);
         assert_eq!(retained.len(), 3);
     }
 
     #[test]
     fn compact_empty_is_noop() {
         let progress = CompactionProgress::new();
-        let retained = compact_deltas(&[], &progress);
+        let retained = compact_deltas(&[], &progress, 1);
         assert!(retained.is_empty());
     }
 
@@ -239,7 +252,7 @@ mod tests {
 
         let progress = CompactionProgress::new();
         progress.cancel();
-        let retained = compact_deltas(&deltas, &progress);
+        let retained = compact_deltas(&deltas, &progress, 1);
         assert_eq!(retained.len(), 2);
     }
 

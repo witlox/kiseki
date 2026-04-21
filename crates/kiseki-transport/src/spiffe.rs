@@ -29,6 +29,11 @@ impl SpiffeId {
             .map(String::from)
             .collect();
 
+        // SPIFFE spec requires at least one non-empty path segment.
+        if path.is_empty() {
+            return None;
+        }
+
         Some(Self {
             trust_domain: domain.to_owned(),
             path,
@@ -76,6 +81,12 @@ mod tests {
     #[test]
     fn invalid_no_scheme() {
         assert!(SpiffeId::parse("https://example.com/path").is_none());
+    }
+
+    #[test]
+    fn invalid_empty_path() {
+        // SPIFFE spec requires at least one path segment.
+        assert!(SpiffeId::parse("spiffe://domain.com/").is_none());
     }
 
     #[test]

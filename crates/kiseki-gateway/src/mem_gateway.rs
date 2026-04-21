@@ -279,10 +279,20 @@ impl GatewayOps for InMemoryGateway {
 
     fn list(
         &self,
-        _tenant_id: kiseki_common::ids::OrgId,
+        tenant_id: kiseki_common::ids::OrgId,
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
-        Ok(self.list_compositions(namespace_id))
+        // Filter by tenant_id to prevent cross-tenant composition ID leak.
+        let compositions = self
+            .compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(compositions
+            .list_by_namespace(namespace_id)
+            .into_iter()
+            .filter(|c| c.tenant_id == tenant_id)
+            .map(|c| (c.id, c.size))
+            .collect())
     }
 
     fn delete(

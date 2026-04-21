@@ -1,7 +1,7 @@
 //! Protocol and format versioning.
 //!
 //! Tracks wire format versions for backward/forward compatibility.
-//! Each serialized structure includes a format_version field so
+//! Each serialized structure includes a `format_version` field so
 //! readers can negotiate or reject incompatible formats.
 
 /// Current format version for delta headers.
@@ -40,18 +40,16 @@ pub enum VersionCheck {
 /// Readers cannot handle newer writers (incompatible).
 #[must_use]
 pub fn check_version(reader_version: u32, writer_version: u32) -> VersionCheck {
-    if reader_version == writer_version {
-        VersionCheck::Compatible
-    } else if reader_version > writer_version {
-        VersionCheck::ForwardCompatible {
+    match reader_version.cmp(&writer_version) {
+        std::cmp::Ordering::Equal => VersionCheck::Compatible,
+        std::cmp::Ordering::Greater => VersionCheck::ForwardCompatible {
             reader: reader_version,
             writer: writer_version,
-        }
-    } else {
-        VersionCheck::Incompatible {
+        },
+        std::cmp::Ordering::Less => VersionCheck::Incompatible {
             reader: reader_version,
             writer: writer_version,
-        }
+        },
     }
 }
 

@@ -6,6 +6,9 @@
 //!
 //! Program: 100003, Version: 4 (minor version 2).
 
+// NFSv4 ops use match on Result for status tracking — clearer than if-let chains.
+#![allow(clippy::single_match_else)]
+
 use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
@@ -140,9 +143,11 @@ impl SessionManager {
 
     fn add_lock(&self, sid: StateId, offset: u64, length: u64, write: bool) -> Result<StateId, ()> {
         let mut locks = self.locks.lock().unwrap();
-        // Check for conflicting locks.
+        // Check for conflicting locks (saturating to prevent overflow).
+        let req_end = offset.saturating_add(length);
         for lock in locks.iter() {
-            let overlaps = lock.offset < offset + length && offset < lock.offset + lock.length;
+            let lock_end = lock.offset.saturating_add(lock.length);
+            let overlaps = lock.offset < req_end && offset < lock_end;
             if overlaps && (write || lock.write) {
                 return Err(()); // Conflict
             }
@@ -308,11 +313,11 @@ fn process_op<G: GatewayOps>(
         op::CLOSE => op_close(reader, sessions, state),
         op::LOCK => op_lock(reader, sessions, state),
         op::READ => op_read(reader, ctx, state),
-        op::WRITE => op_write(reader, ctx, state),
+        op::WRITE => op_write(reader, ctx, sessions, state),
         op::REMOVE => op_remove(reader, ctx),
         op::RENAME => op_rename(reader, ctx),
         op::LINK => op_link(reader, ctx, state),
-        op::READDIR => op_readdir(ctx),
+        op::READDIR => op_readdir(reader, ctx),
         op::READLINK => op_readlink(ctx, state),
         op::CREATE => op_create(reader, ctx, state),
         op::COMMIT => op_commit(),
@@ -404,10 +409,11 @@ fn op_destroy_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> 
     w.write_u32(op::DESTROY_SESSION);
     if sessions.destroy_session(&session_id) {
         w.write_u32(nfs4_status::NFS4_OK);
+        (nfs4_status::NFS4_OK, w.into_bytes())
     } else {
         w.write_u32(nfs4_status::NFS4ERR_BADSESSION);
+        (nfs4_status::NFS4ERR_BADSESSION, w.into_bytes())
     }
-    (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
 fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
@@ -457,12 +463,13 @@ fn op_getfh(state: &CompoundState) -> (u32, Vec<u8>) {
         Some(fh) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_opaque(fh);
+            (nfs4_status::NFS4_OK, w.into_bytes())
         }
         None => {
             w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+            (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes())
         }
     }
-    (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
 fn op_getattr<G: GatewayOps>(
@@ -484,7 +491,7 @@ fn op_getattr<G: GatewayOps>(
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    match ctx.getattr(fh) {
+    let status = match ctx.getattr(fh) {
         Ok(attrs) => {
             w.write_u32(nfs4_status::NFS4_OK);
             // Simplified attribute response: bitmap + attr values.
@@ -500,13 +507,15 @@ fn op_getattr<G: GatewayOps>(
             attr_w.write_u32(ftype);
             attr_w.write_u64(attrs.size);
             w.write_opaque(&attr_w.into_bytes());
+            nfs4_status::NFS4_OK
         }
         Err(_) => {
             w.write_u32(nfs4_status::NFS4ERR_NOENT);
+            nfs4_status::NFS4ERR_NOENT
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_read<G: GatewayOps>(
@@ -527,48 +536,69 @@ fn op_read<G: GatewayOps>(
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    match ctx.read(fh, offset, count) {
+    let status = match ctx.read(fh, offset, count) {
         Ok(resp) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_bool(resp.eof);
             w.write_opaque(&resp.data);
+            nfs4_status::NFS4_OK
         }
         Err(_) => {
             w.write_u32(nfs4_status::NFS4ERR_IO);
+            nfs4_status::NFS4ERR_IO
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_write<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
+    sessions: &SessionManager,
     state: &mut CompoundState,
 ) -> (u32, Vec<u8>) {
     // stateid + offset + stable + data
-    let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
-    let _offset = reader.read_u64().unwrap_or(0);
+    let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
+    let offset = reader.read_u64().unwrap_or(0);
     let _stable = reader.read_u32().unwrap_or(2); // FILE_SYNC
     let data = reader.read_opaque().unwrap_or_default();
 
     let mut w = XdrWriter::new();
     w.write_u32(op::WRITE);
 
-    match ctx.write(data) {
+    // Validate stateid is an open file (skip for special stateids).
+    if sid_bytes.len() == 16 && sid_bytes != [0u8; 16] {
+        let mut sid = [0u8; 16];
+        sid.copy_from_slice(&sid_bytes);
+        if !sessions.is_open(&StateId(sid)) {
+            w.write_u32(nfs4_status::NFS4ERR_BAD_STATEID);
+            return (nfs4_status::NFS4ERR_BAD_STATEID, w.into_bytes());
+        }
+    }
+
+    // Kiseki compositions are immutable — reject nonzero offsets.
+    if offset != 0 {
+        w.write_u32(nfs4_status::NFS4ERR_IO);
+        return (nfs4_status::NFS4ERR_IO, w.into_bytes());
+    }
+
+    let status = match ctx.write(data) {
         Ok((new_fh, resp)) => {
             state.current_fh = Some(new_fh);
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_u32(resp.count); // count
             w.write_u32(2); // committed = FILE_SYNC
             w.write_opaque_fixed(&[0u8; 8]); // write verifier
+            nfs4_status::NFS4_OK
         }
         Err(_) => {
             w.write_u32(nfs4_status::NFS4ERR_IO);
+            nfs4_status::NFS4ERR_IO
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
@@ -576,7 +606,11 @@ fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
     let _offset = reader.read_u64().unwrap_or(0);
     let _count = reader.read_u64().unwrap_or(0);
-    let _hints_count = reader.read_u32().unwrap_or(0);
+    let hints_count = reader.read_u32().unwrap_or(0);
+    // Consume all bitmap words to keep the reader aligned.
+    for _ in 0..hints_count {
+        let _ = reader.read_u32();
+    }
 
     // TODO: forward hints to Advisory subsystem (ADR-020).
     // For now, accept and acknowledge.
@@ -609,7 +643,7 @@ fn op_open<G: GatewayOps>(
     let mut w = XdrWriter::new();
     w.write_u32(op::OPEN);
 
-    if open_type == 1 {
+    let status = if open_type == 1 {
         // CREATE: write a new file.
         match ctx.write_named(&name, Vec::new()) {
             Ok((fh, _resp)) => {
@@ -620,9 +654,11 @@ fn op_open<G: GatewayOps>(
                 w.write_opaque_fixed(&sid.0); // stateid
                 w.write_bool(false); // cinfo (not implemented)
                 w.write_u32(1); // rflags: OPEN4_RESULT_CONFIRM
+                nfs4_status::NFS4_OK
             }
             Err(_) => {
                 w.write_u32(nfs4_status::NFS4ERR_IO);
+                nfs4_status::NFS4ERR_IO
             }
         }
     } else {
@@ -636,14 +672,16 @@ fn op_open<G: GatewayOps>(
                 w.write_opaque_fixed(&sid.0);
                 w.write_bool(false);
                 w.write_u32(0);
+                nfs4_status::NFS4_OK
             }
             None => {
                 w.write_u32(nfs4_status::NFS4ERR_NOENT);
+                nfs4_status::NFS4ERR_NOENT
             }
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_close(
@@ -657,21 +695,24 @@ fn op_close(
     let mut w = XdrWriter::new();
     w.write_u32(op::CLOSE);
 
-    if sid_bytes.len() == 16 {
+    let status = if sid_bytes.len() == 16 {
         let mut sid = [0u8; 16];
         sid.copy_from_slice(&sid_bytes);
         if sessions.close_file(&StateId(sid)) {
             state.current_stateid = None;
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_opaque_fixed(&[0u8; 16]); // zeroed stateid (closed)
+            nfs4_status::NFS4_OK
         } else {
             w.write_u32(nfs4_status::NFS4ERR_BAD_STATEID);
+            nfs4_status::NFS4ERR_BAD_STATEID
         }
     } else {
         w.write_u32(nfs4_status::NFS4ERR_BAD_STATEID);
-    }
+        nfs4_status::NFS4ERR_BAD_STATEID
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_lock(
@@ -691,17 +732,19 @@ fn op_lock(
     w.write_u32(op::LOCK);
 
     let sid = state.current_stateid.unwrap_or(StateId([0; 16]));
-    match sessions.add_lock(sid, offset, length, write) {
+    let status = match sessions.add_lock(sid, offset, length, write) {
         Ok(lock_sid) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_opaque_fixed(&lock_sid.0); // lock_stateid
+            nfs4_status::NFS4_OK
         }
         Err(()) => {
             w.write_u32(nfs4_status::NFS4ERR_DENIED);
+            nfs4_status::NFS4ERR_DENIED
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_lookup<G: GatewayOps>(
@@ -714,17 +757,19 @@ fn op_lookup<G: GatewayOps>(
     let mut w = XdrWriter::new();
     w.write_u32(op::LOOKUP);
 
-    match ctx.lookup_by_name(&name) {
+    let status = match ctx.lookup_by_name(&name) {
         Some((fh, _attrs)) => {
             state.current_fh = Some(fh);
             w.write_u32(nfs4_status::NFS4_OK);
+            nfs4_status::NFS4_OK
         }
         None => {
             w.write_u32(nfs4_status::NFS4ERR_NOENT);
+            nfs4_status::NFS4ERR_NOENT
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_remove<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
@@ -733,20 +778,32 @@ fn op_remove<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> 
     let mut w = XdrWriter::new();
     w.write_u32(op::REMOVE);
 
-    match ctx.remove_file(&name) {
+    let status = match ctx.remove_file(&name) {
         Ok(()) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_bool(false); // cinfo
+            nfs4_status::NFS4_OK
         }
         Err(_) => {
             w.write_u32(nfs4_status::NFS4ERR_NOENT);
+            nfs4_status::NFS4ERR_NOENT
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
-fn op_readdir<G: GatewayOps>(ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+fn op_readdir<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+    // Consume READDIR4args: cookie(u64) + cookieverf(8 bytes) + dircount(u32) + maxcount(u32) + attr_request(bitmap).
+    let _cookie = reader.read_u64().unwrap_or(0);
+    let _cookieverf = reader.read_opaque_fixed(8).unwrap_or_default();
+    let _dircount = reader.read_u32().unwrap_or(0);
+    let _maxcount = reader.read_u32().unwrap_or(0);
+    let bitmap_count = reader.read_u32().unwrap_or(0);
+    for _ in 0..bitmap_count {
+        let _ = reader.read_u32();
+    }
+
     let mut w = XdrWriter::new();
     w.write_u32(op::READDIR);
     w.write_u32(nfs4_status::NFS4_OK);
@@ -782,18 +839,20 @@ fn op_access<G: GatewayOps>(
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    match ctx.access(fh) {
+    let status = match ctx.access(fh) {
         Ok(granted) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_u32(requested & granted); // supported
             w.write_u32(requested & granted); // access
+            nfs4_status::NFS4_OK
         }
         Err(_) => {
             w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+            nfs4_status::NFS4ERR_BADHANDLE
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_setattr<G: GatewayOps>(
@@ -818,15 +877,17 @@ fn op_setattr<G: GatewayOps>(
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    if ctx.setattr(fh, None).is_ok() {
+    let status = if ctx.setattr(fh, None).is_ok() {
         w.write_u32(nfs4_status::NFS4_OK);
         w.write_u32(0); // attrsset bitmap count (none actually set)
+        nfs4_status::NFS4_OK
     } else {
         w.write_u32(nfs4_status::NFS4ERR_IO);
         w.write_u32(0);
-    }
+        nfs4_status::NFS4ERR_IO
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_rename<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
@@ -836,18 +897,20 @@ fn op_rename<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> 
     let mut w = XdrWriter::new();
     w.write_u32(op::RENAME);
 
-    match ctx.rename_file(&old_name, &new_name) {
+    let status = match ctx.rename_file(&old_name, &new_name) {
         Ok(()) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_bool(false); // source cinfo
             w.write_bool(false); // target cinfo
+            nfs4_status::NFS4_OK
         }
         Err(_) => {
             w.write_u32(nfs4_status::NFS4ERR_NOENT);
+            nfs4_status::NFS4ERR_NOENT
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_link<G: GatewayOps>(
@@ -866,17 +929,19 @@ fn op_link<G: GatewayOps>(
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    match ctx.link(target_fh, &new_name) {
+    let status = match ctx.link(target_fh, &new_name) {
         Ok(()) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_bool(false); // cinfo
+            nfs4_status::NFS4_OK
         }
         Err(_) => {
             w.write_u32(nfs4_status::NFS4ERR_IO);
+            nfs4_status::NFS4ERR_IO
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_readlink<G: GatewayOps>(ctx: &NfsContext<G>, state: &CompoundState) -> (u32, Vec<u8>) {
@@ -888,17 +953,19 @@ fn op_readlink<G: GatewayOps>(ctx: &NfsContext<G>, state: &CompoundState) -> (u3
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    match ctx.readlink(fh) {
+    let status = match ctx.readlink(fh) {
         Ok(target) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_string(&target);
+            nfs4_status::NFS4_OK
         }
         Err(_) => {
             w.write_u32(nfs4_status::NFS4ERR_IO);
+            nfs4_status::NFS4ERR_IO
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_create<G: GatewayOps>(
@@ -924,7 +991,7 @@ fn op_create<G: GatewayOps>(
     let mut w = XdrWriter::new();
     w.write_u32(op::CREATE);
 
-    match obj_type {
+    let status = match obj_type {
         2 => {
             // Directory
             match ctx.mkdir(&name) {
@@ -933,9 +1000,11 @@ fn op_create<G: GatewayOps>(
                     w.write_u32(nfs4_status::NFS4_OK);
                     w.write_bool(false); // cinfo
                     w.write_u32(0); // attrsset bitmap count
+                    nfs4_status::NFS4_OK
                 }
                 Err(_) => {
                     w.write_u32(nfs4_status::NFS4ERR_IO);
+                    nfs4_status::NFS4ERR_IO
                 }
             }
         }
@@ -947,9 +1016,11 @@ fn op_create<G: GatewayOps>(
                     w.write_u32(nfs4_status::NFS4_OK);
                     w.write_bool(false);
                     w.write_u32(0);
+                    nfs4_status::NFS4_OK
                 }
                 Err(_) => {
                     w.write_u32(nfs4_status::NFS4ERR_IO);
+                    nfs4_status::NFS4ERR_IO
                 }
             }
         }
@@ -961,15 +1032,17 @@ fn op_create<G: GatewayOps>(
                     w.write_u32(nfs4_status::NFS4_OK);
                     w.write_bool(false);
                     w.write_u32(0);
+                    nfs4_status::NFS4_OK
                 }
                 Err(_) => {
                     w.write_u32(nfs4_status::NFS4ERR_IO);
+                    nfs4_status::NFS4ERR_IO
                 }
             }
         }
-    }
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_commit() -> (u32, Vec<u8>) {
@@ -986,44 +1059,50 @@ fn op_putfh(reader: &mut XdrReader<'_>, state: &mut CompoundState) -> (u32, Vec<
     let mut w = XdrWriter::new();
     w.write_u32(op::PUTFH);
 
-    if fh_bytes.len() == 32 {
+    let status = if fh_bytes.len() == 32 {
         let mut fh = [0u8; 32];
         fh.copy_from_slice(&fh_bytes);
         state.current_fh = Some(fh);
         w.write_u32(nfs4_status::NFS4_OK);
+        nfs4_status::NFS4_OK
     } else {
         w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
-    }
+        nfs4_status::NFS4ERR_BADHANDLE
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_savefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
     let mut w = XdrWriter::new();
     w.write_u32(op::SAVEFH);
 
-    if let Some(fh) = state.current_fh {
+    let status = if let Some(fh) = state.current_fh {
         state.saved_fh = Some(fh);
         w.write_u32(nfs4_status::NFS4_OK);
+        nfs4_status::NFS4_OK
     } else {
         w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
-    }
+        nfs4_status::NFS4ERR_BADHANDLE
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_restorefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
     let mut w = XdrWriter::new();
     w.write_u32(op::RESTOREFH);
 
-    if let Some(fh) = state.saved_fh {
+    let status = if let Some(fh) = state.saved_fh {
         state.current_fh = Some(fh);
         w.write_u32(nfs4_status::NFS4_OK);
+        nfs4_status::NFS4_OK
     } else {
         w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
-    }
+        nfs4_status::NFS4ERR_BADHANDLE
+    };
 
-    (nfs4_status::NFS4_OK, w.into_bytes())
+    (status, w.into_bytes())
 }
 
 fn op_reclaim_complete(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {

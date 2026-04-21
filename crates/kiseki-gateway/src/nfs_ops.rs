@@ -309,10 +309,10 @@ impl<G: GatewayOps> NfsContext<G> {
 
     /// Create a directory. Returns handle + attrs.
     pub fn mkdir(&self, name: &str) -> Result<(FileHandle, NfsAttrs), GatewayError> {
-        // Directories are namespace-level in Kiseki. Create a dir entry.
+        // Use UUID v5 (deterministic hash of namespace + name) to avoid collisions.
+        let dir_uuid = uuid::Uuid::new_v5(&self.namespace_id.0, name.as_bytes());
         let mut fh = [0u8; 32];
-        fh[..8].copy_from_slice(&(name.len() as u64).to_le_bytes());
-        fh[8..16].copy_from_slice(&self.namespace_id.0.as_bytes()[..8]);
+        fh[..16].copy_from_slice(dir_uuid.as_bytes());
         fh[16] = 0xFE; // marker for subdirectory
 
         self.dir_index.insert(
@@ -385,9 +385,9 @@ impl<G: GatewayOps> NfsContext<G> {
         ))
     }
 
-    /// Read a symbolic link target.
+    /// Read a symbolic link target. Capped at 4096 bytes (NFS3 MAXPATHLEN).
     pub fn readlink(&self, fh: &FileHandle) -> Result<String, GatewayError> {
-        let resp = self.read(fh, 0, u32::MAX)?;
+        let resp = self.read(fh, 0, 4096)?;
         String::from_utf8(resp.data)
             .map_err(|_| GatewayError::ProtocolError("invalid symlink target".into()))
     }

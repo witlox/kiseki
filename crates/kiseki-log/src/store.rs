@@ -78,6 +78,23 @@ impl MemShardStore {
         });
     }
 
+    /// Update a shard's key range (used during split).
+    pub fn update_shard_range(
+        &self,
+        shard_id: ShardId,
+        range_start: [u8; 32],
+        range_end: [u8; 32],
+    ) {
+        let mut shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(shard) = shards.get_mut(&shard_id) {
+            shard.info.range_start = range_start;
+            shard.info.range_end = range_end;
+        }
+    }
+
     /// Register a consumer on a shard's watermark tracker.
     pub fn register_consumer(
         &self,

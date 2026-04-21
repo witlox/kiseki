@@ -62,11 +62,17 @@ fn is_debugger_attached() -> bool {
 fn are_core_dumps_enabled() -> bool {
     #[cfg(target_os = "linux")]
     {
-        // Check /proc/self/limits for core dump size.
+        // Parse /proc/self/limits for the soft core dump limit.
+        // Format: "Max core file size     <soft>     <hard>     <units>"
         if let Ok(limits) = std::fs::read_to_string("/proc/self/limits") {
             for line in limits.lines() {
                 if line.starts_with("Max core file size") {
-                    return !line.contains("0");
+                    // Extract the soft limit (first number after the label).
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    // "Max core file size" is 4 words; soft limit is field[4].
+                    if let Some(&soft) = fields.get(4) {
+                        return soft != "0";
+                    }
                 }
             }
         }

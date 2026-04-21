@@ -123,17 +123,25 @@ impl VersionStore {
     }
 
     /// Point-in-time read: get the version that was current at a given timestamp.
+    /// Returns `None` if the object was deleted at that point in time.
     #[must_use]
     pub fn version_at_time(
         &self,
         hashed_key: &[u8; 32],
         timestamp_ms: u64,
     ) -> Option<&ObjectVersion> {
-        self.versions
+        let v = self
+            .versions
             .get(hashed_key)?
             .iter()
             .rev()
-            .find(|v| v.timestamp_ms <= timestamp_ms)
+            .find(|v| v.timestamp_ms <= timestamp_ms)?;
+        // If the version at this time was a delete tombstone, return None.
+        if v.is_deleted {
+            None
+        } else {
+            Some(v)
+        }
     }
 
     /// Total tracked objects.

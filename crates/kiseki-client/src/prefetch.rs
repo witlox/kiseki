@@ -72,7 +72,9 @@ impl PrefetchAdvisor {
 
         // Suggest prefetch if we've seen enough sequential reads.
         if history.sequential_count >= self.config.sequential_threshold {
-            let prefetch_offset = offset + length;
+            let Some(prefetch_offset) = offset.checked_add(length) else {
+                return None; // overflow near u64::MAX — skip prefetch
+            };
             Some((prefetch_offset, self.config.window_bytes))
         } else {
             None

@@ -11,6 +11,7 @@ use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::aead::Aead;
 use kiseki_crypto::envelope::{self, Envelope};
 use kiseki_crypto::keys::SystemMasterKey;
+use zeroize::Zeroizing;
 
 /// Progress state for a re-wrap operation.
 #[derive(Debug)]
@@ -85,9 +86,10 @@ pub fn rewrap_envelope(
         });
     }
 
-    // Decrypt with old key.
-    let plaintext =
-        envelope::open_envelope(aead, old_master, env).map_err(|_| RewrapError::DecryptFailed)?;
+    // Decrypt with old key. Wrap in Zeroizing to clear plaintext from heap.
+    let plaintext = Zeroizing::new(
+        envelope::open_envelope(aead, old_master, env).map_err(|_| RewrapError::DecryptFailed)?,
+    );
 
     // Re-encrypt with new key.
     let new_env = envelope::seal_envelope(aead, new_master, &env.chunk_id, &plaintext)
