@@ -18,4 +18,6 @@ pub mod gateway;
 pub mod helpers;
 pub mod log;
 pub mod operational;
+pub mod protocol;
+pub mod raft;
 pub mod view;

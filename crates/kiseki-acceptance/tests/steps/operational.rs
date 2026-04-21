@@ -346,8 +346,7 @@ async fn then_tenant_notified_hold(_w: &mut KisekiWorld) {}
 
 // === Scenario: Crypto-shred blocked when compliance implies retention ===
 
-#[given(regex = r#"^namespace "(\S+)" has tag \[HIPAA\]$"#)]
-async fn given_ns_hipaa_tag(_w: &mut KisekiWorld, _ns: String) {}
+// "namespace X has tag [HIPAA]" reused from control.rs.
 
 #[given(
     regex = r#"^no explicit retention hold exists \(auto-hold was not created .+ edge case\)$"#
