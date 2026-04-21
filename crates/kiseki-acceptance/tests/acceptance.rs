@@ -29,9 +29,11 @@ use kiseki_common::tenancy::*;
 use kiseki_common::time::*;
 use kiseki_composition::composition::CompositionStore;
 use kiseki_composition::namespace::Namespace;
+use kiseki_control::flavor::Flavor;
 use kiseki_control::iam::AccessRequest;
 use kiseki_control::maintenance::MaintenanceState;
 use kiseki_control::namespace::NamespaceStore;
+use kiseki_control::retention::RetentionStore;
 use kiseki_control::tenant::TenantStore;
 use kiseki_keymanager::store::MemKeyStore;
 use kiseki_log::shard::{ShardConfig, ShardState};
@@ -96,6 +98,10 @@ pub struct KisekiWorld {
     pub control_workload_cap_total: u64,
     pub control_last_write_error: Option<String>,
     pub control_last_quota_adjustment: bool,
+    pub control_flavor_list: Vec<Flavor>,
+    pub control_last_flavor_match: Option<Flavor>,
+    pub control_last_flavor_error: Option<String>,
+    pub control_retention_store: RetentionStore,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -157,6 +163,10 @@ impl KisekiWorld {
             control_workload_cap_total: 0,
             control_last_write_error: None,
             control_last_quota_adjustment: false,
+            control_flavor_list: Vec::new(),
+            control_last_flavor_match: None,
+            control_last_flavor_error: None,
+            control_retention_store: RetentionStore::new(),
         }
     }
 
