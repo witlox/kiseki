@@ -1443,6 +1443,7 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "tokio",
+ "tonic",
  "uuid",
 ]
 
@@ -1560,6 +1561,7 @@ dependencies = [
  "kiseki-client",
  "kiseki-common",
  "kiseki-composition",
+ "kiseki-control",
  "kiseki-crypto",
  "kiseki-gateway",
  "kiseki-keymanager",

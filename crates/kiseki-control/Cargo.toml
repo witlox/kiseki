@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 kiseki-common = { path = "../kiseki-common" }
 kiseki-proto = { path = "../kiseki-proto" }
+tonic = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 serde = { version = "1", features = ["derive"] }

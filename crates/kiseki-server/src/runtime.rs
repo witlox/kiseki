@@ -6,9 +6,12 @@ use std::sync::Arc;
 use kiseki_advisory::budget::BudgetConfig;
 use kiseki_advisory::grpc::AdvisoryGrpc;
 use kiseki_audit::AuditOps;
+use kiseki_control::grpc::ControlGrpc;
+use kiseki_control::tenant::TenantStore;
 use kiseki_keymanager::grpc::KeyManagerGrpc;
 use kiseki_keymanager::raft_store::RaftKeyStore;
 use kiseki_log::grpc::LogGrpc;
+use kiseki_proto::v1::control_service_server::ControlServiceServer;
 use kiseki_proto::v1::key_manager_service_server::KeyManagerServiceServer;
 use kiseki_proto::v1::log_service_server::LogServiceServer;
 use kiseki_proto::v1::workflow_advisory_service_server::WorkflowAdvisoryServiceServer;
@@ -211,6 +214,11 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
     // --- gRPC services ---
 
+    // Control plane (ADR-027: Rust-only).
+    let control_tenants = Arc::new(TenantStore::new());
+    let control_svc = ControlServiceServer::new(ControlGrpc::new(control_tenants));
+    eprintln!("  control plane: in-process (ControlService on data-path gRPC)");
+
     let key_svc = KeyManagerServiceServer::new(KeyManagerGrpc::new(key_store));
     let log_svc = LogServiceServer::new(LogGrpc::new(log_store));
 
@@ -236,6 +244,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     };
 
     builder
+        .add_service(control_svc)
         .add_service(key_svc)
         .add_service(log_svc)
         .serve_with_shutdown(cfg.data_addr, shutdown)

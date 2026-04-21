@@ -14,6 +14,13 @@ pub mod advisory_policy;
 pub mod error;
 pub mod federation;
 pub mod flavor;
+#[allow(
+    clippy::result_large_err,
+    clippy::needless_pass_by_value,
+    clippy::unused_async,
+    clippy::doc_markdown
+)]
+pub mod grpc;
 pub mod iam;
 pub mod maintenance;
 pub mod namespace;

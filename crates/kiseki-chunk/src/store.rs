@@ -347,8 +347,12 @@ mod tests {
     fn setup_store() -> ChunkStore {
         let mut store = ChunkStore::new();
         store.add_pool(
-            AffinityPool::new("fast-nvme", DurabilityStrategy::default(), 1024 * 1024 * 1024)
-                .with_devices(6),
+            AffinityPool::new(
+                "fast-nvme",
+                DurabilityStrategy::default(),
+                1024 * 1024 * 1024,
+            )
+            .with_devices(6),
         );
         store
     }

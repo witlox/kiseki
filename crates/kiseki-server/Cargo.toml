@@ -27,6 +27,7 @@ kiseki-view = { path = "../kiseki-view" }
 kiseki-gateway = { path = "../kiseki-gateway" }
 kiseki-client = { path = "../kiseki-client" }
 kiseki-advisory = { path = "../kiseki-advisory" }
+kiseki-control = { path = "../kiseki-control" }
 kiseki-proto = { path = "../kiseki-proto" }
 axum = "0.7"
 tokio = { workspace = true }
