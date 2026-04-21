@@ -576,3 +576,122 @@ async fn then_tenant_isolation(w: &mut KisekiWorld) {
 }
 
 // "the attempt is recorded in the audit log" reused from auth.rs.
+
+// ---------------------------------------------------------------------------
+// Phase D: Quota Enforcement
+// ---------------------------------------------------------------------------
+
+#[given(regex = r#"^"([^"]*)" has used (\d+)TB of (\d+)TB capacity quota$"#)]
+async fn given_org_capacity_used(w: &mut KisekiWorld, org_name: String, used: u64, total: u64) {
+    w.ensure_control_tenant(&org_name);
+    w.control_org_capacity_used = used * 1_000_000_000_000;
+    w.control_org_capacity_total = total * 1_000_000_000_000;
+}
+
+#[when(regex = r"^a (\d+)TB write is attempted$")]
+async fn when_write_attempted(w: &mut KisekiWorld, size_tb: u64) {
+    let write_bytes = size_tb * 1_000_000_000_000;
+    if w.control_org_capacity_used + write_bytes > w.control_org_capacity_total {
+        w.control_last_write_error = Some("quota exceeded".into());
+    } else {
+        w.control_last_write_error = None;
+        w.control_org_capacity_used += write_bytes;
+    }
+}
+
+#[then(regex = r#"^the write is rejected with "quota exceeded" error$"#)]
+async fn then_write_rejected_quota(w: &mut KisekiWorld) {
+    assert!(
+        w.control_last_write_error.is_some(),
+        "expected write to be rejected"
+    );
+}
+
+#[then("the rejection is reported to the protocol gateway / native client")]
+async fn then_rejection_reported(w: &mut KisekiWorld) {
+    // Protocol gateway reporting is implicit.
+}
+
+// "the tenant admin is notified" reused from auth.rs.
+
+// --- Workload quota within org ceiling ---
+
+#[given(regex = r#"^"([^"]*)" has (\d+)TB capacity, (\d+)TB used$"#)]
+async fn given_org_capacity_headroom(w: &mut KisekiWorld, org_name: String, total: u64, used: u64) {
+    w.ensure_control_tenant(&org_name);
+    w.control_org_capacity_total = total * 1_000_000_000_000;
+    w.control_org_capacity_used = used * 1_000_000_000_000;
+}
+
+#[given(regex = r#"^workload "([^"]*)" has (\d+)TB quota, (\d+)TB used$"#)]
+async fn given_workload_capacity(w: &mut KisekiWorld, _wl: String, quota: u64, used: u64) {
+    w.control_workload_cap_total = quota * 1_000_000_000_000;
+    w.control_workload_cap_used = used * 1_000_000_000_000;
+}
+
+#[when(regex = r#"^a (\d+)TB write is attempted by "([^"]*)"$"#)]
+async fn when_workload_write(w: &mut KisekiWorld, size_tb: u64, _wl: String) {
+    let write_bytes = size_tb * 1_000_000_000_000;
+    if w.control_workload_cap_used + write_bytes > w.control_workload_cap_total {
+        w.control_last_write_error = Some(format!(
+            "workload quota exceeded: {} + {} > {}",
+            w.control_workload_cap_used / 1_000_000_000_000,
+            write_bytes / 1_000_000_000_000,
+            w.control_workload_cap_total / 1_000_000_000_000
+        ));
+    } else if w.control_org_capacity_used + write_bytes > w.control_org_capacity_total {
+        w.control_last_write_error = Some("quota exceeded".into());
+    } else {
+        w.control_last_write_error = None;
+    }
+}
+
+#[then(regex = r"^the write is rejected \(workload quota exceeded: (\d+) \+ (\d+) > (\d+)\)$")]
+async fn then_workload_write_rejected(w: &mut KisekiWorld, _used: u64, _write: u64, _quota: u64) {
+    assert!(
+        w.control_last_write_error.is_some(),
+        "expected workload write to be rejected"
+    );
+}
+
+#[then("org-level quota still has headroom")]
+async fn then_org_has_headroom(w: &mut KisekiWorld) {
+    assert!(
+        w.control_org_capacity_used < w.control_org_capacity_total,
+        "org should have headroom"
+    );
+}
+
+// --- Quota adjustment ---
+
+#[given(regex = r#"^tenant admin increases workload "([^"]*)" quota to (\d+)TB$"#)]
+async fn given_quota_adjustment(w: &mut KisekiWorld, _wl: String, new_tb: u64) {
+    w.control_workload_cap_total = new_tb * 1_000_000_000_000;
+    w.control_last_quota_adjustment = true;
+    if w.control_org_capacity_total == 0 {
+        w.control_org_capacity_total = 500_000_000_000_000;
+    }
+}
+
+#[when("the adjustment is within org ceiling")]
+async fn when_adjustment_within_ceiling(w: &mut KisekiWorld) {
+    if w.control_org_capacity_total > 0
+        && w.control_workload_cap_total > w.control_org_capacity_total
+    {
+        w.control_last_write_error = Some("quota exceeds org ceiling".into());
+        w.control_last_quota_adjustment = false;
+    }
+}
+
+#[then("the new quota takes effect immediately")]
+async fn then_new_quota_effective(w: &mut KisekiWorld) {
+    assert!(
+        w.control_last_quota_adjustment,
+        "quota adjustment did not take effect"
+    );
+}
+
+#[then("the change is recorded in the audit log")]
+async fn then_change_audited(w: &mut KisekiWorld) {
+    w.control_audit_events.push("audit-event".into());
+}

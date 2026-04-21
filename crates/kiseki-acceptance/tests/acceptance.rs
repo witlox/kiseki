@@ -90,6 +90,12 @@ pub struct KisekiWorld {
     pub control_last_access_req: Option<AccessRequest>,
     pub control_audit_events: Vec<String>,
     pub control_plane_up: bool,
+    pub control_org_capacity_used: u64,
+    pub control_org_capacity_total: u64,
+    pub control_workload_cap_used: u64,
+    pub control_workload_cap_total: u64,
+    pub control_last_write_error: Option<String>,
+    pub control_last_quota_adjustment: bool,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -145,6 +151,12 @@ impl KisekiWorld {
             control_last_access_req: None,
             control_audit_events: Vec::new(),
             control_plane_up: true,
+            control_org_capacity_used: 0,
+            control_org_capacity_total: 0,
+            control_workload_cap_used: 0,
+            control_workload_cap_total: 0,
+            control_last_write_error: None,
+            control_last_quota_adjustment: false,
         }
     }
 
