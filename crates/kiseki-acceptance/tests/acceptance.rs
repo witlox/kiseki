@@ -29,6 +29,8 @@ use kiseki_common::tenancy::*;
 use kiseki_common::time::*;
 use kiseki_composition::composition::CompositionStore;
 use kiseki_composition::namespace::Namespace;
+use kiseki_control::maintenance::MaintenanceState;
+use kiseki_control::namespace::NamespaceStore;
 use kiseki_control::tenant::TenantStore;
 use kiseki_keymanager::store::MemKeyStore;
 use kiseki_log::shard::{ShardConfig, ShardState};
@@ -78,6 +80,8 @@ pub struct KisekiWorld {
 
     // === Control plane (ADR-027 migration) ===
     pub control_tenant_store: TenantStore,
+    pub control_namespace_store: NamespaceStore,
+    pub control_maintenance: MaintenanceState,
     pub control_last_org_id: Option<String>,
     pub control_last_project_id: Option<String>,
     pub control_last_workload_id: Option<String>,
@@ -130,6 +134,8 @@ impl KisekiWorld {
             writes_rejected: false,
             reads_working: false,
             control_tenant_store: TenantStore::new(),
+            control_namespace_store: NamespaceStore::new(),
+            control_maintenance: MaintenanceState::new(),
             control_last_org_id: None,
             control_last_project_id: None,
             control_last_workload_id: None,
