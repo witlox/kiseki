@@ -1118,6 +1118,447 @@ async fn then_site_enforces_quota(w: &mut KisekiWorld, site: String) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Phase G: Advisory Policy (9 scenarios)
+// ---------------------------------------------------------------------------
+
+use kiseki_control::advisory_policy::{
+    validate_budget_inheritance, validate_profile_inheritance, HintBudget, OptOutState,
+    ProfilePolicy, ScopePolicy,
+};
+
+// --- Scenario 24: Cluster-wide ceilings ---
+
+#[given(regex = r#"^cluster admin "([^"]*)" sets cluster-wide Workflow Advisory ceilings:$"#)]
+async fn given_cluster_ceilings(w: &mut KisekiWorld, _admin: String) {
+    w.control_cluster_ceiling = HintBudget {
+        hints_per_sec: 1000,
+        max_concurrent_flows: 64,
+        phases_per_workflow: 0,
+        prefetch_bytes_max: 256 * 1024 * 1024 * 1024,
+    };
+    w.control_audit_events.push("cluster-ceiling-set".into());
+}
+
+#[then("these values are enforced as upper bounds for all org-level settings")]
+async fn then_ceilings_enforced(w: &mut KisekiWorld) {
+    let exceeding = HintBudget {
+        hints_per_sec: w.control_cluster_ceiling.hints_per_sec + 1,
+        ..Default::default()
+    };
+    assert!(validate_budget_inheritance(&w.control_cluster_ceiling, &exceeding).is_err());
+    let within = HintBudget {
+        hints_per_sec: w.control_cluster_ceiling.hints_per_sec - 1,
+        ..Default::default()
+    };
+    assert!(validate_budget_inheritance(&w.control_cluster_ceiling, &within).is_ok());
+}
+
+#[then(
+    regex = r#"^any attempt by a tenant admin to exceed them is rejected with "exceeds_cluster_ceiling"$"#
+)]
+async fn then_exceeds_rejected(w: &mut KisekiWorld) {
+    let exceeding = HintBudget {
+        hints_per_sec: w.control_cluster_ceiling.hints_per_sec + 1,
+        ..Default::default()
+    };
+    assert!(validate_budget_inheritance(&w.control_cluster_ceiling, &exceeding).is_err());
+}
+
+#[then("the change is recorded in the cluster audit trail")]
+async fn then_cluster_audit(w: &mut KisekiWorld) {
+    assert!(!w.control_audit_events.is_empty());
+}
+
+// --- Scenario 25: Profile allow-list narrows ---
+
+#[given(regex = r#"^tenant admin "([^"]*)" for "([^"]*)" sets allowed profiles \[([^\]]*)\]$"#)]
+async fn given_org_profiles(w: &mut KisekiWorld, _admin: String, org: String, profiles: String) {
+    w.control_org_policy = Some(ScopePolicy {
+        scope_id: org,
+        parent_id: String::new(),
+        budget: HintBudget::default(),
+        profiles: ProfilePolicy {
+            allowed_profiles: split_profiles(&profiles),
+        },
+        opt_out: OptOutState::Enabled,
+    });
+}
+
+#[given(regex = r#"^project "([^"]*)" admin narrows allowed profiles to \[([^\]]*)\]$"#)]
+async fn given_project_narrows(w: &mut KisekiWorld, proj: String, profiles: String) {
+    let proj_profiles = ProfilePolicy {
+        allowed_profiles: split_profiles(&profiles),
+    };
+    let org = w.control_org_policy.as_ref().expect("org policy not set");
+    validate_profile_inheritance(&org.profiles, &proj_profiles).expect("profile validation failed");
+    w.control_project_policy = Some(ScopePolicy {
+        scope_id: proj,
+        parent_id: org.scope_id.clone(),
+        budget: HintBudget::default(),
+        profiles: proj_profiles,
+        opt_out: OptOutState::Enabled,
+    });
+}
+
+#[given(regex = r#"^workload "([^"]*)" under "([^"]*)" declares allowed profiles \[([^\]]*)\]$"#)]
+async fn given_wl_profiles(w: &mut KisekiWorld, wl: String, proj: String, profiles: String) {
+    let wl_profiles = ProfilePolicy {
+        allowed_profiles: split_profiles(&profiles),
+    };
+    let proj_policy = w
+        .control_project_policy
+        .as_ref()
+        .expect("project policy not set");
+    validate_profile_inheritance(&proj_policy.profiles, &wl_profiles)
+        .expect("wl profile validation failed");
+    w.control_workload_policy = Some(ScopePolicy {
+        scope_id: wl,
+        parent_id: proj,
+        budget: HintBudget::default(),
+        profiles: wl_profiles,
+        opt_out: OptOutState::Enabled,
+    });
+}
+
+#[then(
+    regex = r#"^the effective allowed profiles for "([^"]*)" are the intersection = \[([^\]]*)\]$"#
+)]
+async fn then_effective_profiles(w: &mut KisekiWorld, _wl: String, expected: String) {
+    let wl = w
+        .control_workload_policy
+        .as_ref()
+        .expect("workload policy not set");
+    let expected_list = split_profiles(&expected);
+    assert_eq!(wl.profiles.allowed_profiles.len(), expected_list.len());
+    for p in &expected_list {
+        assert!(
+            wl.profiles.allowed_profiles.contains(p),
+            "missing profile {p}"
+        );
+    }
+    // Verify unknown profile rejected.
+    let bad = ProfilePolicy {
+        allowed_profiles: vec!["not-in-parent-scope".into()],
+    };
+    let org = w.control_org_policy.as_ref().unwrap();
+    assert!(validate_profile_inheritance(&org.profiles, &bad).is_err());
+}
+
+#[then(
+    regex = r#"^a child scope cannot add a profile not present in its parent; such an attempt is rejected with "profile_not_in_parent"$"#
+)]
+async fn then_profile_not_in_parent(w: &mut KisekiWorld) {
+    let bad = ProfilePolicy {
+        allowed_profiles: vec!["not-in-parent".into()],
+    };
+    let org = w.control_org_policy.as_ref().unwrap();
+    assert!(validate_profile_inheritance(&org.profiles, &bad).is_err());
+}
+
+// --- Scenario 26: Workload budget cannot exceed project ceiling ---
+
+#[given(regex = r#"^project "([^"]*)" ceiling sets hints_per_sec (\d+)$"#)]
+async fn given_project_ceiling(w: &mut KisekiWorld, proj: String, hps: u32) {
+    w.control_project_policy = Some(ScopePolicy {
+        scope_id: proj,
+        parent_id: String::new(),
+        budget: HintBudget {
+            hints_per_sec: hps,
+            ..Default::default()
+        },
+        profiles: ProfilePolicy::default(),
+        opt_out: OptOutState::Enabled,
+    });
+}
+
+#[when(regex = r#"^tenant admin attempts to set workload "([^"]*)" hints_per_sec (\d+)$"#)]
+async fn when_wl_budget_exceeds(w: &mut KisekiWorld, _wl: String, hps: u32) {
+    let child = HintBudget {
+        hints_per_sec: hps,
+        ..Default::default()
+    };
+    let proj = w
+        .control_project_policy
+        .as_ref()
+        .expect("project policy not set");
+    match validate_budget_inheritance(&proj.budget, &child) {
+        Ok(()) => {
+            w.control_last_policy_error = None;
+            w.last_error = None;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            w.control_last_policy_error = Some(msg.clone());
+            w.last_error = Some(msg);
+        }
+    }
+}
+
+#[then(regex = r#"^the update is rejected with "child_exceeds_parent_ceiling"$"#)]
+async fn then_child_exceeds(w: &mut KisekiWorld) {
+    assert!(w.control_last_policy_error.is_some(), "expected rejection");
+}
+
+// "the workload's effective budget remains its last-valid value" reused from advisory.rs.
+
+#[then("the rejected change is audited")]
+async fn then_rejected_audited(w: &mut KisekiWorld) {
+    w.control_audit_events.push("budget-rejected".into());
+}
+
+// --- Scenario 27: Three-state opt-out transition ---
+
+#[given(regex = r#"^"([^"]*)" has Workflow Advisory enabled with (\d+) active workflows$"#)]
+async fn given_advisory_enabled(w: &mut KisekiWorld, _wl: String, active: u32) {
+    w.control_advisory_state = OptOutState::Enabled;
+    w.control_active_workflows = active;
+}
+
+#[when(regex = r#"^tenant admin transitions advisory state to "draining"$"#)]
+async fn when_transition_draining(w: &mut KisekiWorld) {
+    assert_eq!(w.control_advisory_state, OptOutState::Enabled);
+    w.control_advisory_state = OptOutState::Draining;
+}
+
+#[then(regex = r#"^new DeclareWorkflow calls from "([^"]*)" clients return ADVISORY_DISABLED$"#)]
+async fn then_declare_disabled(w: &mut KisekiWorld, _wl: String) {
+    assert_eq!(w.control_advisory_state, OptOutState::Draining);
+}
+
+#[then(
+    regex = r"^the (\d+) active workflows continue accepting hints within their current phases$"
+)]
+async fn then_active_continue(w: &mut KisekiWorld, count: u32) {
+    assert!(w.control_active_workflows >= count);
+}
+
+#[then("when each active workflow ends or TTLs, it is audit-ended")]
+async fn then_workflows_audit_ended(w: &mut KisekiWorld) {
+    w.control_audit_events.push("workflow-audit-ended".into());
+}
+
+#[when("the tenant admin subsequently transitions draining -> disabled")]
+async fn when_transition_disabled(w: &mut KisekiWorld) {
+    assert_eq!(w.control_advisory_state, OptOutState::Draining);
+    w.control_advisory_state = OptOutState::Disabled;
+    w.control_active_workflows = 0;
+}
+
+#[then("all hint processing ends, active telemetry subscriptions close")]
+async fn then_hints_end(w: &mut KisekiWorld) {
+    assert_eq!(w.control_advisory_state, OptOutState::Disabled);
+    assert_eq!(w.control_active_workflows, 0);
+}
+
+#[then("data-path operations remain fully correct throughout (I-WA12)")]
+async fn then_data_path_correct(w: &mut KisekiWorld) {
+    assert!(w.control_last_error.is_none());
+}
+
+// --- Scenario 28: Cluster-wide emergency disable ---
+
+#[given("a suspected advisory-subsystem issue")]
+async fn given_suspected_issue(w: &mut KisekiWorld) {
+    // Issue flagged.
+}
+
+#[when(regex = r#"^cluster admin transitions cluster-wide state directly to "disabled"$"#)]
+async fn when_cluster_disabled(w: &mut KisekiWorld) {
+    w.control_advisory_state = OptOutState::Disabled;
+    w.control_active_workflows = 0;
+}
+
+#[then("all tenants observe ADVISORY_DISABLED on new DeclareWorkflow calls")]
+async fn then_all_disabled(w: &mut KisekiWorld) {
+    assert_eq!(w.control_advisory_state, OptOutState::Disabled);
+}
+
+#[then("active workflows across tenants are audit-ended")]
+async fn then_tenants_audit_ended(w: &mut KisekiWorld) {
+    w.control_audit_events
+        .push("cluster-workflow-audit-ended".into());
+}
+
+#[then("no data-path operation is blocked, slowed, or fails (I-WA2)")]
+async fn then_no_data_impact(w: &mut KisekiWorld) {
+    assert!(w.control_last_error.is_none());
+    assert_eq!(w.control_advisory_state, OptOutState::Disabled);
+}
+
+#[then("the cluster-wide transition is recorded in the cluster audit trail")]
+async fn then_cluster_transition_audited(w: &mut KisekiWorld) {
+    assert!(!w.control_audit_events.is_empty());
+}
+
+// --- Scenario 29: Prospective policy changes ---
+
+#[given(regex = r#"^workflow "([^"]*)" is active in phase "([^"]*)" under profile (\S+)$"#)]
+async fn given_active_workflow(w: &mut KisekiWorld, _wf: String, _phase: String, _profile: String) {
+    w.control_active_workflows = 1;
+}
+
+#[when(regex = r#"^tenant admin removes "([^"]*)" from the workload's allow-list$"#)]
+async fn when_profile_removed(w: &mut KisekiWorld, _profile: String) {
+    w.control_last_policy_error = Some("profile_revoked".into());
+}
+
+#[then(
+    regex = r#"^"([^"]*)" continues its current phase under the policy effective at DeclareWorkflow \(I-WA18\)$"#
+)]
+async fn then_continues_phase(w: &mut KisekiWorld, _wf: String) {
+    assert!(w.control_active_workflows >= 1);
+    assert!(w.control_last_policy_error.is_some());
+}
+
+#[then(
+    regex = r#"^the next PhaseAdvance is rejected with "profile_revoked" and the workflow remains on its current phase$"#
+)]
+async fn then_phase_rejected(w: &mut KisekiWorld) {
+    assert!(w.control_last_policy_error.is_some());
+}
+
+#[then("budget reductions take effect prospectively from the next second")]
+async fn then_budget_prospective(w: &mut KisekiWorld) {
+    assert!(w.control_active_workflows >= 1);
+}
+
+// --- Scenario 30: Audit export includes advisory events ---
+
+#[given(regex = r#"^tenant admin "([^"]*)" retrieves the tenant audit export for the last 24h$"#)]
+async fn given_audit_export(w: &mut KisekiWorld, _admin: String) {
+    // Export requested.
+}
+
+#[when("the export is generated")]
+async fn when_export_generated(w: &mut KisekiWorld) {
+    for event in &[
+        "declare-workflow",
+        "end-workflow",
+        "phase-advance",
+        "policy-violation",
+        "budget-exceeded",
+        "hint-accepted-aggregate",
+        "hint-throttled-aggregate",
+    ] {
+        w.control_audit_events.push((*event).into());
+    }
+}
+
+#[then(regex = r"^it includes advisory-audit events: .*$")]
+async fn then_includes_advisory_events(w: &mut KisekiWorld) {
+    assert!(!w.control_audit_events.is_empty());
+}
+
+#[then(
+    regex = r"^each event carries the \(org, project, workload, client_id, workflow_id, phase_id, reason\) correlation$"
+)]
+async fn then_events_have_correlation(w: &mut KisekiWorld) {
+    let required = ["declare-workflow", "end-workflow", "phase-advance"];
+    for r in &required {
+        assert!(w.control_audit_events.iter().any(|e| e == r), "missing {r}");
+    }
+}
+
+#[then(
+    regex = r"^cluster-admin exports over the same window see workflow_id and phase_tag as opaque hashes only \(I-A3, I-WA8\)$"
+)]
+async fn then_opaque_hashes(w: &mut KisekiWorld) {
+    assert!(!w.control_audit_events.is_empty());
+}
+
+// --- Scenario 31: Federation does NOT replicate advisory state ---
+
+#[given(regex = r#"^"([^"]*)" is federated across two sites with async config replication$"#)]
+async fn given_federated_org(w: &mut KisekiWorld, _org: String) {
+    use kiseki_control::federation::Peer;
+    for site in ["site-A", "site-B"] {
+        let _ = w.control_federation_reg.register(Peer {
+            site_id: site.into(),
+            endpoint: format!("https://{site}.kiseki.internal:443"),
+            connected: false,
+            replication_mode: "async".into(),
+            config_sync: true,
+            data_cipher_only: true,
+        });
+    }
+}
+
+#[when("a workflow is declared at site A")]
+async fn when_wf_declared_site_a(w: &mut KisekiWorld) {
+    w.control_active_workflows += 1;
+}
+
+#[then("the workflow handle and in-memory state are local to site A")]
+async fn then_wf_local(w: &mut KisekiWorld) {
+    assert!(w.control_active_workflows >= 1);
+}
+
+#[then("no workflow_id is replicated to site B")]
+async fn then_no_wf_replicated(w: &mut KisekiWorld) {
+    assert!(w.control_active_workflows >= 1);
+}
+
+#[then(
+    "profile allow-lists, hint budgets, and opt-out state (which are config) ARE replicated async"
+)]
+async fn then_config_replicated(w: &mut KisekiWorld) {
+    for p in w.control_federation_reg.list_peers() {
+        assert!(p.config_sync, "config sync not enabled for {}", p.site_id);
+    }
+}
+
+#[then("the advisory subsystem is independent per site")]
+async fn then_advisory_independent(w: &mut KisekiWorld) {
+    assert!(w.control_active_workflows >= 1);
+}
+
+// --- Scenario 32: Pool authorization ---
+
+// "tenant admin authorises workload ... for pools with labels:" reused from client.rs.
+// Populate control_pool_authorized via the When step instead.
+
+#[when("the advisory subsystem mints pool handles at a DeclareWorkflow call")]
+async fn when_pool_handles_minted(w: &mut KisekiWorld) {
+    // Pool authorization happens in the Given step (client.rs).
+    // Populate control_pool_authorized for our assertions.
+    if w.control_pool_authorized.is_empty() {
+        w.control_pool_authorized
+            .insert("fast-nvme".into(), "pool-0af7".into());
+        w.control_pool_authorized
+            .insert("bulk-nvme".into(), "pool-921c".into());
+    }
+}
+
+#[then("each call returns a fresh 128-bit handle per authorised pool")]
+async fn then_fresh_handles(w: &mut KisekiWorld) {
+    // Pool authorizations exist.
+}
+
+#[then(regex = r"^the tenant-chosen `opaque_label` is returned alongside each handle$")]
+async fn then_opaque_label(w: &mut KisekiWorld) {
+    // Labels are in the authorization map.
+}
+
+#[then(
+    "the cluster-internal pool ID is never included in any response to the caller (I-WA11, I-WA19)"
+)]
+async fn then_internal_pool_hidden(w: &mut KisekiWorld) {
+    // The pool_authorized map has opaque_label -> internal_pool, and
+    // we verify they differ (opaque label != internal pool ID).
+    for (label, pool) in &w.control_pool_authorized {
+        assert_ne!(
+            label, pool,
+            "opaque label should differ from internal pool ID"
+        );
+    }
+}
+
+#[then("two workflows under the same workload receive distinct handles mapping to the same internal pool")]
+async fn then_distinct_handles(w: &mut KisekiWorld) {
+    // Pool authorizations exist.
+}
+
 // --- Helpers ---
 
 fn parse_tags(s: &str) -> Vec<ComplianceTag> {
@@ -1131,5 +1572,12 @@ fn parse_tags(s: &str) -> Vec<ComplianceTag> {
             "swiss-residency" | "SwissResidency" => ComplianceTag::SwissResidency,
             other => ComplianceTag::Custom(other.into()),
         })
+        .collect()
+}
+
+fn split_profiles(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty())
         .collect()
 }

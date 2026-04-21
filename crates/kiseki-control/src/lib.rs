@@ -10,6 +10,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod advisory_policy;
 pub mod error;
 pub mod federation;
 pub mod flavor;

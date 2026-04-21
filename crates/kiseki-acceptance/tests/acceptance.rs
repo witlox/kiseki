@@ -104,6 +104,14 @@ pub struct KisekiWorld {
     pub control_last_flavor_error: Option<String>,
     pub control_retention_store: RetentionStore,
     pub control_federation_reg: FederationRegistry,
+    pub control_advisory_state: kiseki_control::advisory_policy::OptOutState,
+    pub control_active_workflows: u32,
+    pub control_cluster_ceiling: kiseki_control::advisory_policy::HintBudget,
+    pub control_org_policy: Option<kiseki_control::advisory_policy::ScopePolicy>,
+    pub control_project_policy: Option<kiseki_control::advisory_policy::ScopePolicy>,
+    pub control_workload_policy: Option<kiseki_control::advisory_policy::ScopePolicy>,
+    pub control_last_policy_error: Option<String>,
+    pub control_pool_authorized: std::collections::HashMap<String, String>,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -170,6 +178,14 @@ impl KisekiWorld {
             control_last_flavor_error: None,
             control_retention_store: RetentionStore::new(),
             control_federation_reg: FederationRegistry::new(),
+            control_advisory_state: kiseki_control::advisory_policy::OptOutState::Enabled,
+            control_active_workflows: 0,
+            control_cluster_ceiling: kiseki_control::advisory_policy::HintBudget::default(),
+            control_org_policy: None,
+            control_project_policy: None,
+            control_workload_policy: None,
+            control_last_policy_error: None,
+            control_pool_authorized: HashMap::new(),
         }
     }
 
