@@ -37,17 +37,49 @@ pub struct AffinityPool {
     pub capacity_bytes: u64,
     /// Current used bytes.
     pub used_bytes: u64,
+    /// Devices in this pool.
+    pub devices: Vec<PoolDevice>,
+}
+
+/// A device within a pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolDevice {
+    /// Device identifier (e.g., `"d1"`).
+    pub id: String,
+    /// Whether the device is online.
+    pub online: bool,
 }
 
 impl AffinityPool {
     /// Create a new pool.
     #[must_use]
+    /// Create a new pool with no devices.
     pub fn new(name: &str, durability: DurabilityStrategy, capacity_bytes: u64) -> Self {
         Self {
             name: name.to_owned(),
             durability,
             capacity_bytes,
             used_bytes: 0,
+            devices: Vec::new(),
+        }
+    }
+
+    /// Create a pool with `n` auto-named online devices.
+    #[must_use]
+    pub fn with_devices(mut self, n: usize) -> Self {
+        self.devices = (1..=n)
+            .map(|i| PoolDevice {
+                id: format!("d{i}"),
+                online: true,
+            })
+            .collect();
+        self
+    }
+
+    /// Set a device online/offline by ID.
+    pub fn set_device_online(&mut self, device_id: &str, online: bool) {
+        if let Some(d) = self.devices.iter_mut().find(|d| d.id == device_id) {
+            d.online = online;
         }
     }
 

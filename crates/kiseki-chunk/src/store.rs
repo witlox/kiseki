@@ -5,8 +5,25 @@ use std::collections::{HashMap, HashSet};
 use kiseki_common::ids::ChunkId;
 use kiseki_crypto::envelope::Envelope;
 
+use crate::ec;
 use crate::error::ChunkError;
-use crate::pool::AffinityPool;
+use crate::placement::{self, DeviceInfo};
+use crate::pool::{AffinityPool, DurabilityStrategy};
+
+/// EC metadata for a stored chunk.
+#[derive(Clone, Debug)]
+pub struct EcMeta {
+    /// Number of data shards.
+    pub data_shards: usize,
+    /// Number of parity shards.
+    pub parity_shards: usize,
+    /// Fragment data indexed by shard index.
+    pub fragments: Vec<Vec<u8>>,
+    /// Device index per fragment (into the pool's device list).
+    pub device_indices: Vec<usize>,
+    /// Original ciphertext length.
+    pub original_len: usize,
+}
 
 /// Stored chunk entry.
 struct ChunkEntry {
@@ -14,6 +31,8 @@ struct ChunkEntry {
     refcount: u64,
     retention_holds: HashSet<String>,
     pool: String,
+    /// EC metadata (None for replication-mode pools).
+    ec: Option<EcMeta>,
 }
 
 /// Chunk storage operations trait.
@@ -76,6 +95,63 @@ impl ChunkStore {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// Get EC metadata for a chunk (for BDD assertions).
+    #[must_use]
+    pub fn ec_meta(&self, chunk_id: &ChunkId) -> Option<&EcMeta> {
+        self.chunks.get(chunk_id).and_then(|e| e.ec.as_ref())
+    }
+
+    /// Get a mutable pool reference.
+    pub fn pool_mut(&mut self, name: &str) -> Option<&mut AffinityPool> {
+        self.pools.get_mut(name)
+    }
+
+    /// Get a pool reference.
+    #[must_use]
+    pub fn pool(&self, name: &str) -> Option<&AffinityPool> {
+        self.pools.get(name)
+    }
+
+    /// Read a chunk with EC-aware degraded read.
+    ///
+    /// Checks which devices are online in the pool, gathers available
+    /// fragments, and reconstructs via EC if needed.
+    pub fn read_chunk_ec(&self, chunk_id: &ChunkId) -> Result<Vec<u8>, ChunkError> {
+        let entry = self
+            .chunks
+            .get(chunk_id)
+            .ok_or(ChunkError::NotFound(*chunk_id))?;
+        let ec = match &entry.ec {
+            Some(ec) => ec,
+            None => return Ok(entry.envelope.ciphertext.clone()),
+        };
+
+        let pool = self
+            .pools
+            .get(&entry.pool)
+            .ok_or(ChunkError::NotFound(*chunk_id))?;
+        let total = ec.data_shards + ec.parity_shards;
+
+        // Build fragment array with None for offline devices.
+        let mut frags: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
+        for i in 0..total {
+            let dev_idx = ec.device_indices[i];
+            let online = pool.devices.get(dev_idx).is_some_and(|d| d.online);
+            if online {
+                frags.push(Some(ec.fragments[i].clone()));
+            } else {
+                frags.push(None);
+            }
+        }
+
+        ec::decode(
+            &mut frags,
+            ec.data_shards,
+            ec.parity_shards,
+            ec.original_len,
+        )
+    }
 }
 
 impl Default for ChunkStore {
@@ -95,12 +171,63 @@ impl ChunkOps for ChunkStore {
         }
 
         // Check pool capacity.
+        let storage_size;
+        let ec_meta = if let Some(p) = self.pools.get(pool) {
+            match p.durability {
+                DurabilityStrategy::ErasureCoding {
+                    data_shards,
+                    parity_shards,
+                } => {
+                    let encoded = ec::encode(
+                        &envelope.ciphertext,
+                        usize::from(data_shards),
+                        usize::from(parity_shards),
+                    )?;
+
+                    // Place fragments on devices.
+                    let total = encoded.fragments.len();
+                    let dev_infos: Vec<DeviceInfo> = p
+                        .devices
+                        .iter()
+                        .map(|d| DeviceInfo {
+                            id: d.id.clone(),
+                            online: d.online,
+                        })
+                        .collect();
+
+                    let device_indices = if dev_infos.len() >= total {
+                        placement::place_fragments(&chunk_id, total, &dev_infos)
+                            .ok_or(ChunkError::EcInvalidConfig)?
+                    } else {
+                        // Not enough devices ��� store without placement.
+                        (0..total).collect()
+                    };
+
+                    storage_size = encoded.fragments.iter().map(|f| f.len() as u64).sum();
+
+                    Some(EcMeta {
+                        data_shards: encoded.data_shards,
+                        parity_shards: encoded.parity_shards,
+                        fragments: encoded.fragments,
+                        device_indices,
+                        original_len: encoded.original_len,
+                    })
+                }
+                DurabilityStrategy::Replication { copies } => {
+                    storage_size = envelope.ciphertext.len() as u64 * u64::from(copies);
+                    None
+                }
+            }
+        } else {
+            storage_size = envelope.ciphertext.len() as u64;
+            None
+        };
+
         if let Some(p) = self.pools.get_mut(pool) {
-            let size = envelope.ciphertext.len() as u64;
-            if !p.has_capacity(size) {
+            if !p.has_capacity(storage_size) {
                 return Err(ChunkError::PoolFull(pool.to_owned()));
             }
-            p.used_bytes += size;
+            p.used_bytes += storage_size;
         }
 
         self.chunks.insert(
@@ -110,6 +237,7 @@ impl ChunkOps for ChunkStore {
                 refcount: 1,
                 retention_holds: HashSet::new(),
                 pool: pool.to_owned(),
+                ec: ec_meta,
             },
         );
 
