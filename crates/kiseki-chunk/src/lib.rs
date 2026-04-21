@@ -13,6 +13,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod device;
 pub mod ec;
 pub mod error;
 pub mod placement;

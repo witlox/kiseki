@@ -25,16 +25,33 @@ fn test_envelope(id_byte: u8) -> Envelope {
 
 #[given(regex = r#"^a Kiseki cluster with \d+ affinity pools:$"#)]
 async fn given_pools(w: &mut KisekiWorld) {
-    w.chunk_store.add_pool(AffinityPool::new(
-        "fast-nvme",
-        DurabilityStrategy::default(),
-        1024 * 1024 * 1024,
-    ));
-    w.chunk_store.add_pool(AffinityPool::new(
-        "bulk-nvme",
-        DurabilityStrategy::default(),
-        10 * 1024 * 1024 * 1024,
-    ));
+    w.chunk_store.add_pool(
+        AffinityPool::new(
+            "fast-nvme",
+            DurabilityStrategy::default(),
+            100 * 1024 * 1024 * 1024,
+        )
+        .with_devices(6),
+    );
+    w.chunk_store.add_pool(
+        AffinityPool::new(
+            "bulk-nvme",
+            DurabilityStrategy::default(),
+            1000 * 1024 * 1024 * 1024,
+        )
+        .with_devices(12),
+    );
+    w.chunk_store.add_pool(
+        AffinityPool::new(
+            "bulk-hdd",
+            DurabilityStrategy::ErasureCoding {
+                data_shards: 8,
+                parity_shards: 3,
+            },
+            1000 * 1024 * 1024 * 1024,
+        )
+        .with_devices(12),
+    );
 }
 
 #[given(regex = r#"^tenant "(\S+)" exists with cross-tenant dedup enabled.*$"#)]

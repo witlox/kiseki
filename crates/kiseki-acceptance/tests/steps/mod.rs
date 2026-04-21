@@ -11,6 +11,7 @@ pub mod client;
 pub mod composition;
 pub mod control;
 pub mod crypto;
+pub mod device;
 pub mod ec;
 pub mod gateway;
 pub mod helpers;
