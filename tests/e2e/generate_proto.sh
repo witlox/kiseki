@@ -18,7 +18,8 @@ PYTHON="${WORKSPACE_ROOT}/.venv/bin/python"
     --grpc_python_out="$OUT_DIR" \
     "kiseki/v1/common.proto" \
     "kiseki/v1/log.proto" \
-    "kiseki/v1/key.proto"
+    "kiseki/v1/key.proto" \
+    "kiseki/v1/control.proto"
 
 # Create __init__.py for the generated package
 mkdir -p "$OUT_DIR/kiseki/v1"
