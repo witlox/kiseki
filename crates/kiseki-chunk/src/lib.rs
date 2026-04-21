@@ -13,7 +13,9 @@
 
 #![deny(unsafe_code)]
 
+pub mod ec;
 pub mod error;
+pub mod placement;
 pub mod pool;
 pub mod store;
 

@@ -77,6 +77,9 @@ prost-types = "0.13"
 tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
 
+# --- Erasure coding ---
+reed-solomon-erasure = "6"
+
 # --- Testing ---
 proptest = "1"
 cucumber = "0.21"

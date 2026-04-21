@@ -14,6 +14,7 @@ workspace = true
 kiseki-common = { path = "../kiseki-common" }
 kiseki-crypto = { path = "../kiseki-crypto" }
 kiseki-keymanager = { path = "../kiseki-keymanager" }
+reed-solomon-erasure = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 

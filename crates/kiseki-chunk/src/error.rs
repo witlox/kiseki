@@ -25,6 +25,18 @@ pub enum ChunkError {
     /// Pool is full.
     #[error("affinity pool full: {0}")]
     PoolFull(String),
+
+    /// EC configuration invalid (zero shards, too few devices).
+    #[error("EC configuration invalid")]
+    EcInvalidConfig,
+
+    /// EC encode failed.
+    #[error("EC encode failed")]
+    EcEncodeFailed,
+
+    /// Chunk lost — too many fragments missing to reconstruct.
+    #[error("chunk lost: insufficient fragments for reconstruction")]
+    ChunkLost,
 }
 
 impl From<ChunkError> for KisekiError {
@@ -42,6 +54,12 @@ impl From<ChunkError> for KisekiError {
             ChunkError::PoolFull(pool) => KisekiError::Permanent(
                 PermanentError::InvariantViolation(format!("pool full: {pool}")),
             ),
+            ChunkError::EcInvalidConfig | ChunkError::EcEncodeFailed => {
+                KisekiError::Permanent(PermanentError::InvariantViolation("EC error".into()))
+            }
+            ChunkError::ChunkLost => {
+                KisekiError::Permanent(PermanentError::ChunkLost(ChunkId([0; 32])))
+            }
         }
     }
 }
