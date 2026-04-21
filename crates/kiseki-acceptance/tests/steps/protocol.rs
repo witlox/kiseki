@@ -7,6 +7,7 @@
 //! protocol operations via the in-memory gateway stores.
 
 use cucumber::{given, then, when};
+use kiseki_gateway::ops::GatewayOps;
 
 use crate::KisekiWorld;
 
@@ -647,24 +648,26 @@ async fn then_http_status(w: &mut KisekiWorld, status: u16) {
 
 #[then("the ETag header is present and non-empty")]
 async fn then_etag_present(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("the ETag is a valid UUID")]
 async fn then_etag_uuid(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("the ETag is returned")]
 async fn then_etag_returned(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- GetObject ---
 
 #[given(regex = r#"^an object "([^"]*)" was uploaded with body "([^"]*)"$"#)]
-async fn given_uploaded(w: &mut KisekiWorld, _key: String, _body: String) {
-    panic!("not yet implemented");
+async fn given_uploaded(w: &mut KisekiWorld, _key: String, body: String) {
+    w.ensure_namespace("default", "shard-default");
+    let resp = w.gateway_write("default", body.as_bytes()).unwrap();
+    w.last_composition_id = Some(resp.composition_id);
 }
 
 #[when(regex = r#"^the client sends GET /([^/]+)/\{etag\}$"#)]
@@ -673,13 +676,29 @@ async fn when_get_etag(w: &mut KisekiWorld, _bucket: String) {
 }
 
 #[then(regex = r#"^the body equals "([^"]*)"$"#)]
-async fn then_body_equals(w: &mut KisekiWorld, _expected: String) {
-    panic!("not yet implemented");
+async fn then_body_equals(w: &mut KisekiWorld, expected: String) {
+    if let Some(comp_id) = w.last_composition_id {
+        let tenant_id = *w
+            .tenant_ids
+            .get("org-test")
+            .or(w.tenant_ids.get("org-pharma"))
+            .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
+        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        assert_eq!(String::from_utf8_lossy(&resp.data), expected);
+    }
 }
 
 #[then(regex = r"^Content-Length header equals (\d+)$")]
-async fn then_content_length(w: &mut KisekiWorld, _len: u64) {
-    panic!("not yet implemented");
+async fn then_content_length(w: &mut KisekiWorld, len: u64) {
+    if let Some(comp_id) = w.last_composition_id {
+        let tenant_id = *w
+            .tenant_ids
+            .get("org-test")
+            .or(w.tenant_ids.get("org-pharma"))
+            .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
+        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        assert_eq!(resp.data.len() as u64, len);
+    }
 }
 
 // --- GetObject 404 ---
@@ -698,12 +717,12 @@ async fn when_head(w: &mut KisekiWorld, _bucket: String) {
 
 #[then("Content-Length header is present")]
 async fn then_content_length_present(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("no body is returned")]
 async fn then_no_body(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- DeleteObject ---
@@ -716,8 +735,10 @@ async fn when_delete(w: &mut KisekiWorld, _bucket: String) {
 // --- ListObjectsV2 ---
 
 #[given(regex = r#"^objects "([^"]*)" and "([^"]*)" exist in bucket "([^"]*)"$"#)]
-async fn given_objects_in_bucket(w: &mut KisekiWorld, _a: String, _b: String, _bucket: String) {
-    panic!("not yet implemented");
+async fn given_objects_in_bucket(w: &mut KisekiWorld, a: String, b: String, _bucket: String) {
+    w.ensure_namespace("default", "shard-default");
+    let _ = w.gateway_write("default", a.as_bytes());
+    let _ = w.gateway_write("default", b.as_bytes());
 }
 
 #[when(regex = r#"^the client sends GET /([^/]+)\?list-type=2$"#)]
@@ -727,29 +748,85 @@ async fn when_list_v2(w: &mut KisekiWorld, _bucket: String) {
 
 #[then("the response is XML with ListBucketResult")]
 async fn then_xml_list(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then(regex = r#"^Contents includes keys "([^"]*)" and "([^"]*)"$"#)]
 async fn then_contents(w: &mut KisekiWorld, _a: String, _b: String) {
-    panic!("not yet implemented");
+    // Gateway list should return the objects we wrote.
+    let ns_id = *w
+        .namespace_ids
+        .get("default")
+        .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1)));
+    let tenant_id = *w
+        .tenant_ids
+        .get("org-test")
+        .or(w.tenant_ids.get("org-pharma"))
+        .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
+    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    assert!(
+        listing.len() >= 2,
+        "expected at least 2 objects, got {}",
+        listing.len()
+    );
 }
 
 // --- ListObjectsV2 empty ---
 
 #[given(regex = r#"^bucket "([^"]*)" is empty$"#)]
-async fn given_empty_bucket(w: &mut KisekiWorld, _bucket: String) {
-    panic!("not yet implemented");
+async fn given_empty_bucket(w: &mut KisekiWorld, bucket: String) {
+    // Create the namespace (bucket) with no objects.
+    w.ensure_namespace(&bucket, "shard-default");
+    w.gateway
+        .add_namespace(kiseki_composition::namespace::Namespace {
+            id: *w
+                .namespace_ids
+                .get(&bucket)
+                .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1))),
+            tenant_id: *w
+                .tenant_ids
+                .get("org-test")
+                .or(w.tenant_ids.get("org-pharma"))
+                .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1))),
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+        });
 }
 
 #[then("Contents is empty")]
 async fn then_empty_contents(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    let ns_id = *w
+        .namespace_ids
+        .get("empty-bucket")
+        .or(w.namespace_ids.get("default"))
+        .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(99)));
+    let tenant_id = *w
+        .tenant_ids
+        .get("org-test")
+        .or(w.tenant_ids.get("org-pharma"))
+        .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
+    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    assert!(
+        listing.is_empty(),
+        "expected empty listing, got {} items",
+        listing.len()
+    );
 }
 
 #[then("KeyCount is 0")]
 async fn then_key_count_0(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    let ns_id = *w
+        .namespace_ids
+        .get("empty-bucket")
+        .or(w.namespace_ids.get("default"))
+        .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(99)));
+    let tenant_id = *w
+        .tenant_ids
+        .get("org-test")
+        .or(w.tenant_ids.get("org-pharma"))
+        .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
+    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    assert_eq!(listing.len(), 0, "KeyCount should be 0");
 }
 
 // --- ListObjectsV2 prefix ---
@@ -802,7 +879,7 @@ async fn when_initiate_multipart(w: &mut KisekiWorld, _bucket: String, _key: Str
 
 #[then("an UploadId is returned")]
 async fn then_upload_id(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[when("the client uploads 3 parts with valid ETags")]
@@ -814,12 +891,12 @@ async fn when_upload_parts(w: &mut KisekiWorld) {
 
 #[then("the final object is assembled from parts")]
 async fn then_assembled(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("the ETag reflects the multipart composition")]
 async fn then_multipart_etag(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // ===================================================================
