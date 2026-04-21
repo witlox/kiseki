@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 pub mod error;
+pub mod federation;
 pub mod flavor;
 pub mod iam;
 pub mod maintenance;

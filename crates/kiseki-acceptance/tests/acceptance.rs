@@ -29,6 +29,7 @@ use kiseki_common::tenancy::*;
 use kiseki_common::time::*;
 use kiseki_composition::composition::CompositionStore;
 use kiseki_composition::namespace::Namespace;
+use kiseki_control::federation::FederationRegistry;
 use kiseki_control::flavor::Flavor;
 use kiseki_control::iam::AccessRequest;
 use kiseki_control::maintenance::MaintenanceState;
@@ -102,6 +103,7 @@ pub struct KisekiWorld {
     pub control_last_flavor_match: Option<Flavor>,
     pub control_last_flavor_error: Option<String>,
     pub control_retention_store: RetentionStore,
+    pub control_federation_reg: FederationRegistry,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -167,6 +169,7 @@ impl KisekiWorld {
             control_last_flavor_match: None,
             control_last_flavor_error: None,
             control_retention_store: RetentionStore::new(),
+            control_federation_reg: FederationRegistry::new(),
         }
     }
 
