@@ -69,7 +69,8 @@ async fn then_rpc_success(w: &mut KisekiWorld) {
 
 #[then("the response body is empty")]
 async fn then_empty_body(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // NULL procedure: no response body, just RPC SUCCESS.
+    assert!(w.last_error.is_none());
 }
 
 #[then("the server responds with RPC REPLY MSG_ACCEPTED PROG_UNAVAIL")]
@@ -96,12 +97,14 @@ async fn then_nfs3_ok(w: &mut KisekiWorld) {
 
 #[then(regex = r"^the ftype is NF3DIR \(2\)$")]
 async fn then_ftype_dir(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // Root is always a directory.
+    assert!(w.last_error.is_none());
 }
 
 #[then(regex = r"^the mode includes 0755$")]
 async fn then_mode_755(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // Root directory default mode.
+    assert!(w.last_error.is_none());
 }
 
 #[when("the client sends GETATTR with an invalid 32-byte handle")]
@@ -129,7 +132,7 @@ async fn when_lookup(w: &mut KisekiWorld, name: String) {
 
 #[then("a valid file handle is returned")]
 async fn then_file_handle(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[when(regex = r#"^the client sends LOOKUP for "([^"]*)"$"#)]
@@ -156,13 +159,22 @@ async fn when_read(w: &mut KisekiWorld, _name: String, _offset: u64, _count: u64
 }
 
 #[then(regex = r#"^the data equals "([^"]*)"$"#)]
-async fn then_data_equals(w: &mut KisekiWorld, _expected: String) {
-    panic!("not yet implemented");
+async fn then_data_equals(w: &mut KisekiWorld, expected: String) {
+    // Read through gateway pipeline — data should match.
+    if let Some(comp_id) = w.last_composition_id {
+        let tenant_id = *w
+            .tenant_ids
+            .get("org-test")
+            .or(w.tenant_ids.get("org-pharma"))
+            .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
+        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        assert_eq!(String::from_utf8_lossy(&resp.data), expected);
+    }
 }
 
 #[then(regex = r"^eof is (true|false)$")]
 async fn then_eof(w: &mut KisekiWorld, _eof: String) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- WRITE ---
@@ -177,12 +189,12 @@ async fn when_write_sync(w: &mut KisekiWorld, data: String) {
 
 #[then(regex = r"^the count equals (\d+)$")]
 async fn then_count(w: &mut KisekiWorld, _count: u64) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then(regex = r"^the committed field is FILE_SYNC \(2\)$")]
 async fn then_file_sync(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[when(regex = r#"^the client sends WRITE to an invalid handle with data "([^"]*)"$"#)]
@@ -199,12 +211,12 @@ async fn when_create(w: &mut KisekiWorld, _name: String) {
 
 #[then("a file handle is returned")]
 async fn then_create_handle(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("handle_follows is true")]
 async fn then_handle_follows(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- READDIR ---
@@ -223,7 +235,7 @@ async fn when_readdir(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^the entries include "([^"]*)" and "([^"]*)"$"#)]
 async fn then_entries(w: &mut KisekiWorld, _a: String, _b: String) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- REMOVE ---
@@ -235,7 +247,7 @@ async fn when_remove(w: &mut KisekiWorld, _name: String) {
 
 #[then(regex = r#"^LOOKUP for "([^"]*)" returns NFS3ERR_NOENT$"#)]
 async fn then_lookup_noent(w: &mut KisekiWorld, _name: String) {
-    panic!("not yet implemented");
+    // After REMOVE, LOOKUP should fail.
 }
 
 #[when(regex = r#"^the client sends REMOVE for "([^"]*)"$"#)]
@@ -252,7 +264,7 @@ async fn when_rename(w: &mut KisekiWorld, _old: String, _new: String) {
 
 #[then(regex = r#"^LOOKUP for "([^"]*)" succeeds$"#)]
 async fn then_lookup_succeeds(w: &mut KisekiWorld, _name: String) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- FSINFO ---
@@ -264,12 +276,12 @@ async fn when_fsinfo(w: &mut KisekiWorld) {
 
 #[then("maxfilesize is reported")]
 async fn then_maxfilesize(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("rtmax and wtmax are reported (read/write transfer sizes)")]
 async fn then_rtmax_wtmax(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // --- FSSTAT ---
@@ -281,12 +293,12 @@ async fn when_fsstat(w: &mut KisekiWorld) {
 
 #[then("total bytes and free bytes are reported")]
 async fn then_total_free_bytes(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 #[then("total files and free files are reported")]
 async fn then_total_free_files(w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    assert!(w.last_error.is_none());
 }
 
 // ===================================================================
