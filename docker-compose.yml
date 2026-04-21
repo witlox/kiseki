@@ -31,14 +31,8 @@ services:
       timeout: 2s
       retries: 10
 
-  kiseki-control:
-    build:
-      context: .
-      dockerfile: Dockerfile.control
-    ports:
-      - "9200:9200"  # control-plane gRPC
-    environment:
-      KISEKI_CONTROL_ADDR: "0.0.0.0:9200"
+  # Control plane (ADR-027): now a Rust crate (kiseki-control), will be
+  # wired into kiseki-server or run as a separate binary in a future phase.
 
 volumes:
   kiseki-data:

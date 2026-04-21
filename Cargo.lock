@@ -1329,6 +1329,7 @@ dependencies = [
  "kiseki-chunk",
  "kiseki-common",
  "kiseki-composition",
+ "kiseki-control",
  "kiseki-crypto",
  "kiseki-keymanager",
  "kiseki-log",
@@ -1414,6 +1415,18 @@ dependencies = [
  "kiseki-view",
  "proptest",
  "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "kiseki-control"
+version = "0.0.0"
+dependencies = [
+ "kiseki-common",
+ "kiseki-proto",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
  "uuid",
 ]
 

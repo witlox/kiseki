@@ -63,38 +63,8 @@ jobs:
           command: check
           arguments: --all-features
 
-  # -------------------------------------------------------------------
-  # Go: fmt, vet, test, lint
-  # -------------------------------------------------------------------
-  go:
-    name: Go
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: control
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: control/go.mod
-          cache-dependency-path: control/go.sum
-
-      - name: gofmt -d (fails if any diff)
-        run: test -z "$(gofmt -s -d .)" || { gofmt -s -d .; exit 1; }
-
-      - name: go vet
-        run: go vet ./...
-
-      - name: go test -race
-        run: go test -race ./...
-
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          working-directory: control
-          args: --timeout 5m
+  # Go control plane removed per ADR-027 (single-language Rust).
+  # Control plane is now crates/kiseki-control/.
 
   # -------------------------------------------------------------------
   # Docs / specs sanity: fail if any .proto file is not referenced from

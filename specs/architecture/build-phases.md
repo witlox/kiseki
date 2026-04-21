@@ -194,20 +194,24 @@ works, transport fallback works, discovery works without control plane.
 
 ---
 
-## Phase 11: Control Plane (Go)
+## Phase 11: Control Plane (Rust — ADR-027)
 
-**Module**: `control/`
-**Binary**: `kiseki-control`, `kiseki-cli`
-**Depends on**: Phase 0 (protobuf definitions)
+**Crate**: `kiseki-control`
+**Binary**: `kiseki-control` (standalone or wired into `kiseki-server`)
+**Depends on**: Phase 0 (common + proto only; crate-graph firewall)
 
 - Tenant management (org, project, workload CRUD)
-- IAM (Cluster CA, cert issuance, access requests)
+- IAM (access requests, zero-trust boundary)
 - Policy (quotas, compliance tags, placement)
 - Flavor management (best-fit matching)
-- Federation (async config replication)
-- Audit export (tenant-scoped filtering)
-- Discovery service support
-- **Advisory policy** (`control/pkg/advisory`): profile allow-list CRUD per scope, hint-budget CRUD with inheritance and validation (`ChildExceedsParentCeiling`, `ProfileNotInParent`), opt-out state machine (enabled/draining/disabled) with Raft-backed persistence, effective-policy computation endpoint. Federation replicates policy but NOT workflow state. (ADR-021 §6)
+- Federation (async config replication, peer registry)
+- Namespace management (shard assignment, maintenance mode)
+- Retention holds (GC blocking)
+- **Advisory policy**: profile allow-list CRUD per scope, hint-budget
+  inheritance with validation, opt-out state machine (enabled/draining/
+  disabled). Federation replicates policy but NOT workflow state (ADR-021 §6).
+
+**Status**: 32/32 BDD scenarios GREEN (cucumber-rs). Go code removed.
 
 **Exit criteria**: tenant CRUD works, quota enforcement works, compliance
 tags inherit correctly, federation peer registration works, advisory
@@ -284,13 +288,13 @@ Phase 0 (common, proto)
   ├── Phase 2 (transport)
   │     └── Phase 10 (client)
   │
-  ├── Phase 11 (control plane, Go — can build in parallel with Rust phases)
+  ├── Phase 11 (control plane, Rust — ADR-027)
   │
   └── Phase 12 (integration — final)
 ```
 
 **Parallelism opportunities**:
-- Phase 11 (Go control plane) can be built in parallel with Phases 3-10
+- Phase 11 (control plane) can be built in parallel with Phases 3-10
 - Phase 2 (transport) can be built in parallel with Phases 1, 3, 4
 - Phase 5 (audit) can start as soon as Phase 3 is done
 - Phase 11.5 (advisory) can start as soon as Phase 5 (audit) and the Phase 11 advisory-policy endpoint are done; it is independent of Phases 6-10 because it does not link against any data-path crate

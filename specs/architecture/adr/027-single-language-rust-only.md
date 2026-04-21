@@ -1,7 +1,7 @@
 # ADR-027: Single-Language Implementation — Rust Only
 
-**Status**: Proposed (architect phase — awaits adversary gate-1 review before spec/module-graph rewrites)
-**Date**: 2026-04-20
+**Status**: Accepted (implemented 2026-04-21, Go code removed)
+**Date**: 2026-04-20 (proposed), 2026-04-21 (accepted + migrated)
 **Context**: Supersedes the implicit language split in `docs/analysis/design-conversation.md` §2.13. No prior ADR recorded the Rust/Go decision.
 
 ## Context
@@ -14,7 +14,12 @@ Kiseki's original design split the implementation across two languages:
 
 The split was recorded in `docs/analysis/design-conversation.md` §2.13 but never promoted to an ADR. It surfaces in `specs/architecture/module-graph.md` (Go modules section), `.claude/coding/go.md`, and in two contexts that are currently split across both languages. The split pre-dates ADR-001 (pure-Rust, no Mochi/FFI), which already identified "FIPS compliance surface across two languages" as a cost.
 
-Because no code has been written yet (Phase 0 entry per `build-phases.md`), revisiting the decision now is cheap. Revisiting after Phase 3+ would not be.
+At proposal time, 1,490 lines of Go business logic existed with 32/32 BDD
+scenarios passing (godog, Strict:true). The migration ported all 32 scenarios
+to cucumber-rs backed by a new `kiseki-control` Rust crate (~650 lines,
+10 modules) before deleting the Go code. See
+`specs/implementation/adr027-go-to-rust-migration.md` for the migration plan
+and `specs/findings/adr027-adversarial.md` for the gate-1 review.
 
 ## Decision
 

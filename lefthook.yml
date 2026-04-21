@@ -13,12 +13,3 @@ pre-commit:
     rust-test:
       glob: "*.rs"
       run: cargo test --workspace --all-targets
-    go-fmt:
-      glob: "*.go"
-      run: cd control && test -z "$(gofmt -s -d .)" || { gofmt -s -d .; exit 1; }
-    go-vet:
-      glob: "*.go"
-      run: cd control && go vet ./...
-    go-test:
-      glob: "*.go"
-      run: cd control && go test ./...

@@ -34,25 +34,16 @@ kiseki/
     └── kiseki-client-fuse/       ← FUSE mount binary
 ```
 
-## Go modules (control plane)
+## Control plane (Rust — ADR-027)
 
 ```
-control/
-├── go.mod
-├── cmd/
-│   ├── kiseki-control/           ← Control plane API server
-│   └── kiseki-cli/               ← Admin CLI
-├── pkg/
-│   ├── tenant/                   ← Tenancy: org, project, workload
-│   ├── iam/                      ← IAM: mTLS CA, access requests
-│   ├── policy/                   ← Placement, quota, compliance tags
-│   ├── flavor/                   ← Flavor management, best-fit matching
-│   ├── federation/               ← Cross-site: config sync, data replication
-│   ├── audit/                    ← Audit export: tenant-scoped filtering
-│   ├── advisory/                 ← Workflow Advisory policy: profile allow-lists, budgets, opt-out state (ADR-021 §6)
-│   └── discovery/                ← Fabric-level discovery service
-└── proto/                        ← Generated protobuf/gRPC (Go side)
+crates/
+  └── kiseki-control/             ← Control plane: tenancy, IAM, policy,
+                                    flavor, federation, namespace, retention,
+                                    maintenance, advisory policy
 ```
+
+Depends only on `kiseki-common` + `kiseki-proto` (crate-graph firewall).
 
 ## Shared
 
@@ -85,9 +76,9 @@ proto/
 | Native Client | `kiseki-client` | Rust | kiseki-client-fuse |
 | Key Management (system) | `kiseki-keymanager` | Rust | kiseki-keyserver |
 | Key Management (tenant KMS integration) | `kiseki-crypto` | Rust | (library) |
-| Control Plane | `control/` | Go | kiseki-control |
-| Audit | `kiseki-audit` + `control/pkg/audit` | Rust + Go | both |
-| Workflow Advisory (cross-cutting) | `kiseki-advisory` + `control/pkg/advisory` | Rust + Go | kiseki-server + kiseki-control |
+| Control Plane | `kiseki-control` | Rust | kiseki-server (or standalone) |
+| Audit | `kiseki-audit` | Rust | kiseki-server |
+| Workflow Advisory (cross-cutting) | `kiseki-advisory` | Rust | kiseki-server |
 
 ---
 
@@ -134,7 +125,9 @@ kiseki-gateway-nfs  kiseki-gateway-s3
 - `kiseki-proto` depends on nothing (generated code)
 - `kiseki-advisory` depends on `kiseki-common` + `kiseki-audit` + `kiseki-proto`. Notably: **no data-path crate depends on `kiseki-advisory`** (ADR-021 §1). Shared advisory domain types (`WorkflowRef`, `OperationAdvisory`, the hint enums, **`PoolHandle` and `PoolDescriptor`**) live in `kiseki-common` and are passed by value to data-path operations. `PoolHandle` is an opaque 16-byte tenant-scoped token — the cluster-internal `AffinityPoolId` stays in `kiseki-chunk` and is translated by `kiseki-advisory` when a hint is consumed, preserving the no-cycle rule. The advisory runtime is wired at the `kiseki-server` binary level only.
 
-**Cross-language boundary**: `kiseki-proto` (Rust) ↔ `control/proto/` (Go) via gRPC. No direct Rust↔Go FFI for control plane.
+**Control-plane boundary** (ADR-027): `kiseki-control` depends only on
+`kiseki-common` + `kiseki-proto`. The crate-graph firewall replaces the
+former language wall. Enforced by `make arch-check`.
 
 **No cycles.** Every dependency is downward in the graph.
 
@@ -147,8 +140,8 @@ kiseki-gateway-nfs  kiseki-gateway-s3
 | `kiseki-server` | log + chunk + composition + view + gateway-nfs + gateway-s3 + audit | Every storage node |
 | `kiseki-keyserver` | keymanager | Dedicated HA cluster (3-5 nodes) |
 | `kiseki-client-fuse` | client + transport | Compute nodes (workload-side) |
-| `kiseki-control` | control plane (Go) | Management network (3+ instances) |
-| `kiseki-cli` | admin CLI (Go) | Admin workstations |
+| `kiseki-control` | control plane (Rust, ADR-027) | Management network (3+ instances) |
+| `kiseki-cli` | admin CLI (Rust) | Admin workstations |
 
 ---
 
