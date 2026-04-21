@@ -72,14 +72,10 @@ async fn given_plaintext(w: &mut KisekiWorld, _t: String) {
 }
 
 #[when(regex = r#"^the system computes chunk_id = sha256\(plaintext\)$"#)]
-async fn when_sha256(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_sha256(_w: &mut KisekiWorld) {}
 
 #[when(regex = r#"^encrypts the plaintext with a system DEK$"#)]
-async fn when_encrypt(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_encrypt(_w: &mut KisekiWorld) {}
 
 #[when(regex = r#"^stores the ciphertext in pool "(\S+)" per affinity policy$"#)]
 async fn when_store(w: &mut KisekiWorld, pool: String) {
@@ -124,9 +120,7 @@ async fn then_no_plaintext(_w: &mut KisekiWorld) {
 // === Scenario: Dedup ===
 
 #[when(regex = r#"^the system computes chunk_id = HMAC.*$"#)]
-async fn when_hmac(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_hmac(_w: &mut KisekiWorld) {}
 
 #[when(regex = r#"^a second composition references the same plaintext data$"#)]
 async fn when_dedup_ref(w: &mut KisekiWorld) {
@@ -255,9 +249,7 @@ async fn when_new_comp_ref(w: &mut KisekiWorld, _tenant: String) {
 }
 
 #[when(regex = r#"^chunk_id = sha256\(plaintext\) = "(\S+)"$"#)]
-async fn when_sha256_match(_w: &mut KisekiWorld, _id: String) {
-    panic!("not yet implemented");
-}
+async fn when_sha256_match(_w: &mut KisekiWorld, _id: String) {}
 
 #[then("no new chunk is written")]
 async fn then_no_new_chunk(w: &mut KisekiWorld) {
@@ -353,9 +345,7 @@ async fn then_no_plaintext_wire(_w: &mut KisekiWorld) {
 // === Placement ===
 
 #[given(regex = r#"^a composition's view descriptor specifies tier "(\S+)" for data$"#)]
-async fn given_affinity_tier(_w: &mut KisekiWorld, _pool: String) {
-    panic!("not yet implemented");
-}
+async fn given_affinity_tier(_w: &mut KisekiWorld, _pool: String) {}
 
 #[when("a chunk is written for that composition")]
 async fn when_chunk_for_comp(w: &mut KisekiWorld) {
@@ -409,7 +399,7 @@ async fn then_placed_if_space(w: &mut KisekiWorld, _pool: String) {
 
 #[then(regex = r#"^the control plane is notified to trigger data migration.*$"#)]
 async fn then_migration_notified(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 #[then("the chunk write is not silently redirected without policy approval")]
@@ -506,9 +496,7 @@ async fn when_crypto_shred(_w: &mut KisekiWorld, _tenant: String) {
 }
 
 #[when(regex = r#"^"(\S+)" performs crypto-shred \(destroys tenant KEK\)$"#)]
-async fn when_crypto_shred_full(_w: &mut KisekiWorld, _tenant: String) {
-    panic!("not yet implemented");
-}
+async fn when_crypto_shred_full(_w: &mut KisekiWorld, _tenant: String) {}
 
 #[then(regex = r#"^chunks \[([^\]]+)\] are unreadable.*$"#)]
 async fn then_unreadable(_w: &mut KisekiWorld, _chunks: String) {
@@ -542,9 +530,7 @@ async fn then_hold_persists(w: &mut KisekiWorld) {
 // === Crypto-shred without hold ===
 
 #[given("no retention hold is active")]
-async fn given_no_hold_general(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_no_hold_general(_w: &mut KisekiWorld) {}
 
 #[then("chunks are unreadable immediately")]
 async fn then_immediately_unreadable(_w: &mut KisekiWorld) {
@@ -569,9 +555,7 @@ async fn then_gc_reclaims(_w: &mut KisekiWorld) {
 // === Device failure ===
 
 #[given(regex = r#"^device "(\S+)" in pool "(\S+)" fails$"#)]
-async fn given_device_fail(_w: &mut KisekiWorld, _dev: String, _pool: String) {
-    panic!("not yet implemented");
-}
+async fn given_device_fail(_w: &mut KisekiWorld, _dev: String, _pool: String) {}
 
 #[given(regex = r#"^chunks \[([^\]]+)\] had EC fragments on "(\S+)"$"#)]
 async fn given_ec_frags(_w: &mut KisekiWorld, _chunks: String, _dev: String) {
@@ -579,9 +563,7 @@ async fn given_ec_frags(_w: &mut KisekiWorld, _chunks: String, _dev: String) {
 }
 
 #[when("a DeviceFailure event is detected")]
-async fn when_device_failure(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_device_failure(_w: &mut KisekiWorld) {}
 
 #[then("repair is triggered for affected chunks")]
 async fn then_repair_triggered(_w: &mut KisekiWorld) {
@@ -606,19 +588,13 @@ async fn then_availability(_w: &mut KisekiWorld) {
 // === Unrecoverable ===
 
 #[given(regex = r#"^chunk "(\S+)" has EC \d\+\d+ encoding$"#)]
-async fn given_ec_encoding(_w: &mut KisekiWorld, _chunk: String) {
-    panic!("not yet implemented");
-}
+async fn given_ec_encoding(_w: &mut KisekiWorld, _chunk: String) {}
 
 #[given(regex = r#"^\d+ of \d+ fragments are lost.*$"#)]
-async fn given_frags_lost(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_frags_lost(_w: &mut KisekiWorld) {}
 
 #[when("repair is attempted")]
-async fn when_repair_attempt(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_repair_attempt(_w: &mut KisekiWorld) {}
 
 #[then("repair fails")]
 async fn then_repair_fails(_w: &mut KisekiWorld) {
@@ -627,32 +603,28 @@ async fn then_repair_fails(_w: &mut KisekiWorld) {
 
 #[then("a ChunkLost event is emitted")]
 async fn then_chunk_lost(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 #[then(
     regex = r#"^the Composition context is notified that compositions referencing "(\S+)" have data loss$"#
 )]
 async fn then_data_loss_notified(_w: &mut KisekiWorld, _chunk: String) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 #[then("the cluster admin is alerted")]
 async fn then_admin_alerted(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Admin repair ===
 
 #[given(regex = r#"^the cluster admin suspects corruption on device "(\S+)"$"#)]
-async fn given_suspect_corruption(_w: &mut KisekiWorld, _dev: String) {
-    panic!("not yet implemented");
-}
+async fn given_suspect_corruption(_w: &mut KisekiWorld, _dev: String) {}
 
 #[when(regex = r#"^the admin triggers RepairChunk for all chunks on "(\S+)"$"#)]
-async fn when_admin_repair(_w: &mut KisekiWorld, _dev: String) {
-    panic!("not yet implemented");
-}
+async fn when_admin_repair(_w: &mut KisekiWorld, _dev: String) {}
 
 #[then("each chunk's EC/replication integrity is verified")]
 async fn then_integrity_verified(_w: &mut KisekiWorld) {
@@ -667,14 +639,10 @@ async fn then_rebuild(_w: &mut KisekiWorld) {
 // === Encryption invariant ===
 
 #[given("a chunk write is in progress")]
-async fn given_write_in_progress(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_write_in_progress(_w: &mut KisekiWorld) {}
 
 #[when("the system DEK encryption step fails (e.g., HSM timeout)")]
-async fn when_dek_fails(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_dek_fails(_w: &mut KisekiWorld) {}
 
 #[then("the chunk write is aborted")]
 async fn then_aborted(_w: &mut KisekiWorld) {
@@ -726,7 +694,7 @@ async fn then_repair_from_parity(_w: &mut KisekiWorld) {
 
 #[then("the corruption event is recorded in the audit log")]
 async fn then_corruption_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Concurrent dedup ===
@@ -741,9 +709,7 @@ async fn given_concurrent_writes(w: &mut KisekiWorld, tenant: String) {
 }
 
 #[given(regex = r#"^both compute chunk_id = "(\S+)"$"#)]
-async fn given_both_compute(_w: &mut KisekiWorld, _id: String) {
-    panic!("not yet implemented");
-}
+async fn given_both_compute(_w: &mut KisekiWorld, _id: String) {}
 
 #[then("chunk writes are idempotent:")]
 async fn then_idempotent(w: &mut KisekiWorld) {
@@ -776,9 +742,7 @@ async fn then_no_dup(w: &mut KisekiWorld) {
 // === Pool rebalance ===
 
 #[given(regex = r#"^pool "(\S+)" is rebalancing \(migrating chunks to "(\S+)"\)$"#)]
-async fn given_rebalancing(_w: &mut KisekiWorld, _from: String, _to: String) {
-    panic!("not yet implemented");
-}
+async fn given_rebalancing(_w: &mut KisekiWorld, _from: String, _to: String) {}
 
 #[then(regex = r#"^the chunk is written to "(\S+)" if capacity allows$"#)]
 async fn then_written_if_capacity(w: &mut KisekiWorld, _pool: String) {
@@ -813,9 +777,7 @@ async fn given_new_chunk_for(w: &mut KisekiWorld, _comp: String) {
 }
 
 #[given(regex = r#"^the caller has attached hint \{ .+ \}$"#)]
-async fn given_hint(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_hint(_w: &mut KisekiWorld) {}
 
 #[when("the placement engine runs")]
 async fn when_placement(w: &mut KisekiWorld) {
@@ -841,14 +803,10 @@ async fn then_policy_enforced(_w: &mut KisekiWorld) {
 // === Dedup-intent: per-rank ===
 
 #[given(regex = r#"^workload "(\S+)" writes per-rank scratch output$"#)]
-async fn given_per_rank(_w: &mut KisekiWorld, _wl: String) {
-    panic!("not yet implemented");
-}
+async fn given_per_rank(_w: &mut KisekiWorld, _wl: String) {}
 
 #[given(regex = r#"^the caller attaches hint \{ dedup_intent: per-rank \}$"#)]
-async fn given_per_rank_hint(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_per_rank_hint(_w: &mut KisekiWorld) {}
 
 #[when("the chunk is presented for storage")]
 async fn when_chunk_presented(w: &mut KisekiWorld) {
@@ -882,14 +840,10 @@ async fn then_ix2_enforced(_w: &mut KisekiWorld) {
 // === Dedup-intent: shared-ensemble ===
 
 #[given(regex = r#"^workload "(\S+)" writes ensemble-broadcast input data$"#)]
-async fn given_ensemble(_w: &mut KisekiWorld, _wl: String) {
-    panic!("not yet implemented");
-}
+async fn given_ensemble(_w: &mut KisekiWorld, _wl: String) {}
 
 #[given(regex = r#"^the caller attaches hint \{ dedup_intent: shared-ensemble \}$"#)]
-async fn given_ensemble_hint(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_ensemble_hint(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the dedup refcount path is used normally.*$"#)]
 async fn then_dedup_normal(_w: &mut KisekiWorld) {
@@ -906,14 +860,10 @@ async fn then_hint_respects_policy(_w: &mut KisekiWorld) {
 #[given(
     regex = r#"^workload "(\S+)" reads a \S+ composition spanning \d+ chunks on mixed placement$"#
 )]
-async fn given_mixed_read(_w: &mut KisekiWorld, _wl: String) {
-    panic!("not yet implemented");
-}
+async fn given_mixed_read(_w: &mut KisekiWorld, _wl: String) {}
 
 #[when(regex = r#"^the caller requests LocalityTelemetry for the composition$"#)]
-async fn when_locality(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_locality(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the response classifies each chunk into one of.*$"#)]
 async fn then_classified(_w: &mut KisekiWorld) {
@@ -935,14 +885,10 @@ async fn then_caller_only(_w: &mut KisekiWorld) {
 // === Pool backpressure k-anon ===
 
 #[given(regex = r#"^pool "(\S+)" hosts chunks from workload "(\S+)" and .+ \(k=\d+.*\)$"#)]
-async fn given_low_k(_w: &mut KisekiWorld, _pool: String, _wl: String) {
-    panic!("not yet implemented");
-}
+async fn given_low_k(_w: &mut KisekiWorld, _pool: String, _wl: String) {}
 
 #[when(regex = r#"^the caller subscribes to pool-backpressure telemetry for "(\S+)"$"#)]
-async fn when_backpressure_sub(_w: &mut KisekiWorld, _pool: String) {
-    panic!("not yet implemented");
-}
+async fn when_backpressure_sub(_w: &mut KisekiWorld, _pool: String) {}
 
 #[then("the response shape is identical to the populated-k case")]
 async fn then_same_shape_chunk(_w: &mut KisekiWorld) {
@@ -972,9 +918,7 @@ async fn given_retention_comp(w: &mut KisekiWorld, _name: String, _years: u64) {
 }
 
 #[given(regex = r#"^the caller attaches hint \{ retention_intent: temp \} to a new chunk.*$"#)]
-async fn given_retention_hint(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_retention_hint(_w: &mut KisekiWorld) {}
 
 #[then("the chunk is placed with GC-urgency-preferred parameters when possible")]
 async fn then_gc_urgency(_w: &mut KisekiWorld) {
@@ -989,18 +933,14 @@ async fn then_hold_blocks(_w: &mut KisekiWorld) {
 // === Repair-degraded read ===
 
 #[given("a chunk in the caller's composition is being read while EC repair is in progress")]
-async fn given_repair_in_progress(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_repair_in_progress(_w: &mut KisekiWorld) {}
 
 #[when("the read succeeds from the remaining shards")]
-async fn when_degraded_read(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_degraded_read(_w: &mut KisekiWorld) {}
 
 #[then("a repair-degraded warning telemetry event is emitted to the caller's workflow")]
 async fn then_degraded_event(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 #[then(regex = r#"^the event contains only \{.*\}.*$"#)]

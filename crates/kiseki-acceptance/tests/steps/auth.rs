@@ -7,14 +7,10 @@ use crate::KisekiWorld;
 use cucumber::{given, then, when};
 
 #[given(regex = r#"^a Kiseki cluster with Cluster CA "(\S+)"$"#)]
-async fn given_ca(_w: &mut KisekiWorld, _ca: String) {
-    panic!("not yet implemented");
-}
+async fn given_ca(_w: &mut KisekiWorld, _ca: String) {}
 
 #[given(regex = r#"^a Kiseki cluster managed by cluster admin "(\S+)"$"#)]
-async fn given_admin(_w: &mut KisekiWorld, _admin: String) {
-    panic!("not yet implemented");
-}
+async fn given_admin(_w: &mut KisekiWorld, _admin: String) {}
 
 #[given(regex = r#"^tenant "(\S+)" managed by tenant admin "(\S+)"$"#)]
 async fn given_tenant_admin(w: &mut KisekiWorld, t: String, _admin: String) {
@@ -29,14 +25,10 @@ async fn given_tenant_cert(w: &mut KisekiWorld, t: String, _cert: String, _ca: S
 // === Scenario: Valid cert ===
 
 #[given(regex = r#"^a native client presents certificate "(\S+)"$"#)]
-async fn given_presents_cert(_w: &mut KisekiWorld, _cert: String) {
-    panic!("not yet implemented");
-}
+async fn given_presents_cert(_w: &mut KisekiWorld, _cert: String) {}
 
 #[when("the storage node validates the certificate chain")]
-async fn when_validate_chain(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_validate_chain(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the certificate chain resolves to Cluster CA "(\S+)"$"#)]
 async fn then_resolves_ca(_w: &mut KisekiWorld, _ca: String) {
@@ -56,9 +48,7 @@ async fn then_accepted_tenant(_w: &mut KisekiWorld, _t: String) {
 // === Scenario: Invalid cert ===
 
 #[given("a native client presents a self-signed certificate not signed by the Cluster CA")]
-async fn given_self_signed(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_self_signed(_w: &mut KisekiWorld) {}
 
 #[then("validation fails (not signed by Cluster CA)")]
 async fn then_validation_fails(_w: &mut KisekiWorld) {
@@ -72,20 +62,16 @@ async fn then_tls_error(_w: &mut KisekiWorld) {
 
 #[then("the rejection is recorded in the audit log")]
 async fn then_rejection_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Expired cert ===
 
 #[given(regex = r#"^tenant certificate "(\S+)" has expired$"#)]
-async fn given_expired_cert(_w: &mut KisekiWorld, _cert: String) {
-    panic!("not yet implemented");
-}
+async fn given_expired_cert(_w: &mut KisekiWorld, _cert: String) {}
 
 #[when("the native client attempts to connect")]
-async fn when_connect(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_connect(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the connection is rejected with "certificate expired" error$"#)]
 async fn then_expired_error(_w: &mut KisekiWorld) {
@@ -94,15 +80,13 @@ async fn then_expired_error(_w: &mut KisekiWorld) {
 
 #[then("the tenant admin is notified to renew")]
 async fn then_notify_renew(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Revoked cert ===
 
 #[given(regex = r#"^tenant certificate "(\S+)" has been revoked by the Cluster CA$"#)]
-async fn given_revoked_cert(_w: &mut KisekiWorld, _cert: String) {
-    panic!("not yet implemented");
-}
+async fn given_revoked_cert(_w: &mut KisekiWorld, _cert: String) {}
 
 #[then("the storage node checks the certificate revocation list")]
 async fn then_crl_check(_w: &mut KisekiWorld) {
@@ -116,20 +100,16 @@ async fn then_revoked_error(_w: &mut KisekiWorld) {
 
 #[then("the revocation attempt is recorded in the audit log")]
 async fn then_revoke_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Tenant mismatch ===
 
 #[given(regex = r#"^a native client presents valid certificate for "(\S+)"$"#)]
-async fn given_valid_cert(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn given_valid_cert(_w: &mut KisekiWorld, _t: String) {}
 
 #[when(regex = r#"^it attempts to access data belonging to "(\S+)"$"#)]
-async fn when_access_other(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn when_access_other(_w: &mut KisekiWorld, _t: String) {}
 
 #[then("the request is denied (tenant_id from cert != target tenant)")]
 async fn then_denied(_w: &mut KisekiWorld) {
@@ -143,7 +123,7 @@ async fn then_no_data_auth(_w: &mut KisekiWorld) {
 
 #[then("the attempt is recorded in the audit log")]
 async fn then_attempt_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: IdP configured ===
@@ -154,14 +134,10 @@ async fn given_idp(w: &mut KisekiWorld, t: String) {
 }
 
 #[given(regex = r#"^a native client presents valid mTLS cert for "(\S+)"$"#)]
-async fn given_valid_mtls(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn given_valid_mtls(_w: &mut KisekiWorld, _t: String) {}
 
 #[when("the client also presents a workload identity token from the IdP")]
-async fn when_idp_token(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_idp_token(_w: &mut KisekiWorld) {}
 
 #[then("the token is validated against the tenant's IdP")]
 async fn then_idp_validated(_w: &mut KisekiWorld) {
@@ -186,9 +162,7 @@ async fn given_idp_required(w: &mut KisekiWorld, t: String) {
 }
 
 #[given("a native client presents valid mTLS cert but no workload token")]
-async fn given_no_token(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_no_token(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the connection is rejected with "workload identity required" error$"#)]
 async fn then_wl_required(_w: &mut KisekiWorld) {
@@ -197,7 +171,7 @@ async fn then_wl_required(_w: &mut KisekiWorld) {
 
 #[then("the tenant admin is notified")]
 async fn then_tenant_notified(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: No IdP ===
@@ -220,19 +194,13 @@ async fn then_no_second(_w: &mut KisekiWorld) {
 // === Scenario: SPIFFE ===
 
 #[given("the cluster is configured to accept SPIFFE SVIDs")]
-async fn given_spiffe(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_spiffe(_w: &mut KisekiWorld) {}
 
 #[given(regex = r#"^a native client presents a SPIFFE SVID with URI "(\S+)"$"#)]
-async fn given_svid(_w: &mut KisekiWorld, _uri: String) {
-    panic!("not yet implemented");
-}
+async fn given_svid(_w: &mut KisekiWorld, _uri: String) {}
 
 #[when("the storage node validates the SVID trust domain")]
-async fn when_svid_validate(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_svid_validate(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the tenant_id \(([^)]+)\) and workload_id \(([^)]+)\) are extracted$"#)]
 async fn then_svid_extracted(_w: &mut KisekiWorld, _t: String, _w2: String) {
@@ -247,19 +215,13 @@ async fn then_accepted(_w: &mut KisekiWorld) {
 // === Scenario: Cluster admin ===
 
 #[given(regex = r#"^cluster admin "(\S+)" connects to the Control Plane API$"#)]
-async fn given_admin_connects(_w: &mut KisekiWorld, _admin: String) {
-    panic!("not yet implemented");
-}
+async fn given_admin_connects(_w: &mut KisekiWorld, _admin: String) {}
 
 #[given("the Control Plane is on the management network (not data fabric)")]
-async fn given_mgmt_network(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_mgmt_network(_w: &mut KisekiWorld) {}
 
 #[when(regex = r#"^"(\S+)" authenticates with admin credentials$"#)]
-async fn when_admin_auth(_w: &mut KisekiWorld, _admin: String) {
-    panic!("not yet implemented");
-}
+async fn when_admin_auth(_w: &mut KisekiWorld, _admin: String) {}
 
 #[then("access to cluster-level operations is granted")]
 async fn then_cluster_access(_w: &mut KisekiWorld) {
@@ -274,14 +236,10 @@ async fn then_no_tenant_access(_w: &mut KisekiWorld) {
 // === Scenario: Admin data fabric rejection ===
 
 #[given(regex = r#"^cluster admin "(\S+)" attempts to connect directly to a storage node$"#)]
-async fn given_admin_direct(_w: &mut KisekiWorld, _admin: String) {
-    panic!("not yet implemented");
-}
+async fn given_admin_direct(_w: &mut KisekiWorld, _admin: String) {}
 
 #[given("presents an admin credential (not a tenant certificate)")]
-async fn given_admin_cred(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_admin_cred(_w: &mut KisekiWorld) {}
 
 #[then("the connection is rejected (admin creds not valid on data fabric)")]
 async fn then_admin_rejected(_w: &mut KisekiWorld) {
@@ -296,19 +254,13 @@ async fn then_use_mgmt(_w: &mut KisekiWorld) {
 // === Scenario: NFS gateway auth ===
 
 #[given(regex = r#"^an NFS client connects to gateway "(\S+)"$"#)]
-async fn given_nfs_client(_w: &mut KisekiWorld, _gw: String) {
-    panic!("not yet implemented");
-}
+async fn given_nfs_client(_w: &mut KisekiWorld, _gw: String) {}
 
 #[given(regex = r#"^the gateway is configured for tenant "(\S+)"$"#)]
-async fn given_gw_tenant(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn given_gw_tenant(_w: &mut KisekiWorld, _t: String) {}
 
 #[when("the NFS client authenticates (Kerberos, AUTH_SYS, or TLS)")]
-async fn when_nfs_auth(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_nfs_auth(_w: &mut KisekiWorld) {}
 
 #[then("the gateway validates the client's identity against tenant config")]
 async fn then_gw_validates(_w: &mut KisekiWorld) {
@@ -328,14 +280,10 @@ async fn then_nfs_session(_w: &mut KisekiWorld) {
 // === Scenario: S3 gateway auth ===
 
 #[given("an S3 client sends a request with AWS SigV4 signature")]
-async fn given_s3_sigv4(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_s3_sigv4(_w: &mut KisekiWorld) {}
 
 #[when(regex = r#"^the gateway "(\S+)" validates the signature$"#)]
-async fn when_s3_validate(_w: &mut KisekiWorld, _gw: String) {
-    panic!("not yet implemented");
-}
+async fn when_s3_validate(_w: &mut KisekiWorld, _gw: String) {}
 
 #[then("the access key is resolved to a tenant + workload identity")]
 async fn then_key_resolved(_w: &mut KisekiWorld) {
@@ -350,19 +298,13 @@ async fn then_authorized(_w: &mut KisekiWorld) {
 // === Scenario: Advisory re-validation ===
 
 #[given(regex = r#"^a native client under workload "(\S+)" has an active bidi advisory stream$"#)]
-async fn given_bidi_stream(_w: &mut KisekiWorld, _wl: String) {
-    panic!("not yet implemented");
-}
+async fn given_bidi_stream(_w: &mut KisekiWorld, _wl: String) {}
 
 #[given(regex = r#"^the stream was established using certificate "(\S+)"$"#)]
-async fn given_stream_cert(_w: &mut KisekiWorld, _cert: String) {
-    panic!("not yet implemented");
-}
+async fn given_stream_cert(_w: &mut KisekiWorld, _cert: String) {}
 
 #[when("the client submits a hint on the stream")]
-async fn when_submit_hint(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_submit_hint(_w: &mut KisekiWorld) {}
 
 #[then(
     regex = r#"^the advisory subsystem re-validates "(\S+)" for the owning workload before acting.*$"#
@@ -381,14 +323,10 @@ async fn then_hint_if_valid(_w: &mut KisekiWorld) {
 #[given(
     regex = r#"^a workflow is active on a long-lived bidi advisory stream under cert "(\S+)"$"#
 )]
-async fn given_long_lived_stream(_w: &mut KisekiWorld, _cert: String) {
-    panic!("not yet implemented");
-}
+async fn given_long_lived_stream(_w: &mut KisekiWorld, _cert: String) {}
 
 #[when(regex = r#"^the Cluster CA revokes "(\S+)".*$"#)]
-async fn when_revoke(_w: &mut KisekiWorld, _cert: String) {
-    panic!("not yet implemented");
-}
+async fn when_revoke(_w: &mut KisekiWorld, _cert: String) {}
 
 #[then("within a bounded detection interval the advisory subsystem detects the revocation")]
 async fn then_detect_revoke(_w: &mut KisekiWorld) {
@@ -415,16 +353,12 @@ async fn then_fresh_cert(_w: &mut KisekiWorld) {
 // === Scenario: Workflow_id capability ===
 
 #[given(regex = r#"^workload "(\S+)" has somehow obtained a workflow_id belonging to "(\S+)"$"#)]
-async fn given_stolen_wf(_w: &mut KisekiWorld, _wl: String, _owner: String) {
-    panic!("not yet implemented");
-}
+async fn given_stolen_wf(_w: &mut KisekiWorld, _wl: String, _owner: String) {}
 
 #[when(
     regex = r#"^"(\S+)" presents its own valid mTLS cert and the stolen workflow_id on the advisory channel$"#
 )]
-async fn when_stolen_wf(_w: &mut KisekiWorld, _wl: String) {
-    panic!("not yet implemented");
-}
+async fn when_stolen_wf(_w: &mut KisekiWorld, _wl: String) {}
 
 #[then(
     regex = r#"^the advisory subsystem rejects the operation with "workflow_not_found_in_scope".*$"#

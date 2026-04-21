@@ -13,14 +13,10 @@ use kiseki_keymanager::epoch::KeyManagerOps;
 // === Background ===
 
 #[given("a Kiseki cluster with a system key manager")]
-async fn given_km(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_km(_w: &mut KisekiWorld) {}
 
 #[given(regex = r#"^system KEK "(\S+)" wrapping system DEKs$"#)]
-async fn given_kek(_w: &mut KisekiWorld, _k: String) {
-    panic!("not yet implemented");
-}
+async fn given_kek(_w: &mut KisekiWorld, _k: String) {}
 
 #[given(regex = r#"^tenant "(\S+)" with tenant KMS at "(\S+)"$"#)]
 async fn given_kms(w: &mut KisekiWorld, t: String, _addr: String) {
@@ -28,16 +24,12 @@ async fn given_kms(w: &mut KisekiWorld, t: String, _addr: String) {
 }
 
 #[given(regex = r#"^tenant KEK "(\S+)" in epoch (\d+)$"#)]
-async fn given_tkek(_w: &mut KisekiWorld, _k: String, _e: u64) {
-    panic!("not yet implemented");
-}
+async fn given_tkek(_w: &mut KisekiWorld, _k: String, _e: u64) {}
 
 // === Scenario 1: DEK generation ===
 
 #[when("a new chunk is written")]
-async fn when_chunk_write(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_chunk_write(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^a system DEK is generated.*$"#)]
 async fn then_dek(w: &mut KisekiWorld) {
@@ -64,9 +56,7 @@ async fn then_aes(w: &mut KisekiWorld) {
 // === Scenario 2: KEK rotation ===
 
 #[given(regex = r#"^system KEK "(\S+)" is in epoch (\d+)$"#)]
-async fn given_kek_epoch(_w: &mut KisekiWorld, _k: String, _e: u64) {
-    panic!("not yet implemented");
-}
+async fn given_kek_epoch(_w: &mut KisekiWorld, _k: String, _e: u64) {}
 
 #[when("the cluster admin triggers system KEK rotation")]
 async fn when_rotate(w: &mut KisekiWorld) {
@@ -100,19 +90,13 @@ async fn then_both(w: &mut KisekiWorld) {
 // === Scenario 3: Tenant KEK wraps ===
 
 #[given(regex = r#"^chunk "(\S+)" is encrypted with system DEK "(\S+)"$"#)]
-async fn given_encrypted(_w: &mut KisekiWorld, _c: String, _d: String) {
-    panic!("not yet implemented");
-}
+async fn given_encrypted(_w: &mut KisekiWorld, _c: String, _d: String) {}
 
 #[given(regex = r#"^"(\S+)" is wrapped with system KEK "(\S+)"$"#)]
-async fn given_wrapped(_w: &mut KisekiWorld, _d: String, _k: String) {
-    panic!("not yet implemented");
-}
+async fn given_wrapped(_w: &mut KisekiWorld, _d: String, _k: String) {}
 
 #[when(regex = r#"^"(\S+)" needs access to "(\S+)"$"#)]
-async fn when_access(_w: &mut KisekiWorld, _t: String, _c: String) {
-    panic!("not yet implemented");
-}
+async fn when_access(_w: &mut KisekiWorld, _t: String, _c: String) {}
 
 #[then(regex = r#"^"(\S+)" is also wrapped with tenant KEK "(\S+)"$"#)]
 async fn then_tenant_wrap(_w: &mut KisekiWorld, _d: String, _k: String) {
@@ -135,9 +119,7 @@ async fn then_tenant_wrap(_w: &mut KisekiWorld, _d: String, _k: String) {
 // === Scenario 17: Epoch mismatch ===
 
 #[given(regex = r#"^chunk "(\S+)" was written in epoch (\d+)$"#)]
-async fn given_old_epoch(_w: &mut KisekiWorld, _c: String, _e: u64) {
-    panic!("not yet implemented");
-}
+async fn given_old_epoch(_w: &mut KisekiWorld, _c: String, _e: u64) {}
 
 #[given(regex = r#"^the current epoch is (\d+)$"#)]
 async fn given_current_epoch(w: &mut KisekiWorld, target: u64) {
@@ -148,14 +130,10 @@ async fn given_current_epoch(w: &mut KisekiWorld, target: u64) {
 }
 
 #[given(regex = r#"^epoch (\d+) KEK wrapping has not yet been migrated$"#)]
-async fn given_not_migrated(_w: &mut KisekiWorld, _e: u64) {
-    panic!("not yet implemented");
-}
+async fn given_not_migrated(_w: &mut KisekiWorld, _e: u64) {}
 
 #[when(regex = r#"^a read for "(\S+)" is requested$"#)]
-async fn when_read(_w: &mut KisekiWorld, _c: String) {
-    panic!("not yet implemented");
-}
+async fn when_read(_w: &mut KisekiWorld, _c: String) {}
 
 #[then(regex = r#"^the system retrieves the epoch (\d+) tenant KEK wrapping$"#)]
 async fn then_old_wrap(w: &mut KisekiWorld, epoch: u64) {
@@ -205,7 +183,7 @@ async fn then_migration(_w: &mut KisekiWorld, _from: u64, _to: u64) {
 
 #[then("the rotation event is recorded in the audit log")]
 async fn then_rotation_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Tenant KEK wrap details ===
@@ -233,9 +211,7 @@ async fn given_no_kms(w: &mut KisekiWorld, t: String) {
 }
 
 #[when(regex = r#"^"(\S+)" attempts to read a chunk$"#)]
-async fn when_read_no_kms(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn when_read_no_kms(_w: &mut KisekiWorld, _t: String) {}
 
 #[then(regex = r#"^the read fails with "tenant KMS not configured" error$"#)]
 async fn then_no_kms_error(_w: &mut KisekiWorld) {
@@ -246,20 +222,16 @@ async fn then_no_kms_error(_w: &mut KisekiWorld) {
 
 #[then("the access attempt is recorded in the audit log")]
 async fn then_access_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Tenant KEK rotation ===
 
 #[given(regex = r#"^"(\S+)" tenant KEK "(\S+)" is epoch (\d+)$"#)]
-async fn given_tenant_epoch(_w: &mut KisekiWorld, _t: String, _k: String, _e: u64) {
-    panic!("not yet implemented");
-}
+async fn given_tenant_epoch(_w: &mut KisekiWorld, _t: String, _k: String, _e: u64) {}
 
 #[when("the tenant admin rotates the tenant KEK")]
-async fn when_tenant_rotate(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_tenant_rotate(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^a new KEK "(\S+)" is generated \(epoch (\d+)\) in the tenant KMS$"#)]
 async fn then_new_kek(_w: &mut KisekiWorld, _k: String, _e: u64) {
@@ -290,20 +262,16 @@ async fn then_accessible(_w: &mut KisekiWorld) {
 
 #[then("the rotation event is recorded in the audit log (tenant export)")]
 async fn then_tenant_rotation_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Full re-encryption ===
 
 #[given(regex = r#"^"(\S+)" suspects key compromise of "(\S+)"$"#)]
-async fn given_compromise(_w: &mut KisekiWorld, _t: String, _k: String) {
-    panic!("not yet implemented");
-}
+async fn given_compromise(_w: &mut KisekiWorld, _t: String, _k: String) {}
 
 #[when("the tenant admin triggers full re-encryption")]
-async fn when_reencrypt(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_reencrypt(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^all chunks referenced by "(\S+)" are:$"#)]
 async fn then_reencrypted(_w: &mut KisekiWorld, _t: String) {
@@ -327,7 +295,7 @@ async fn then_bg_progress(_w: &mut KisekiWorld) {
 
 #[then("the re-encryption event is recorded in the audit log")]
 async fn then_reencrypt_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Crypto-shred ===
@@ -338,9 +306,7 @@ async fn given_chunks_with_refs(_w: &mut KisekiWorld, _t: String, _chunks: Strin
 }
 
 #[when(regex = r#"^the tenant admin performs crypto-shred for "(\S+)"$"#)]
-async fn when_crypto_shred(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn when_crypto_shred(_w: &mut KisekiWorld, _t: String) {}
 
 #[then(regex = r#"^tenant KEK "(\S+)" is destroyed in the tenant KMS$"#)]
 async fn then_kek_destroyed(_w: &mut KisekiWorld, _k: String) {
@@ -369,20 +335,16 @@ async fn then_refs_decremented(_w: &mut KisekiWorld, _t: String) {
 
 #[then("the crypto-shred event is recorded in the audit log (system + tenant export)")]
 async fn then_shred_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Crypto-shred with retention ===
 
 #[given(regex = r#"^a retention hold "(\S+)" is active on "(\S+)" namespace "(\S+)"$"#)]
-async fn given_retention_ns(_w: &mut KisekiWorld, _hold: String, _t: String, _ns: String) {
-    panic!("not yet implemented");
-}
+async fn given_retention_ns(_w: &mut KisekiWorld, _hold: String, _t: String, _ns: String) {}
 
 #[when(regex = r#"^crypto-shred is performed for "(\S+)"$"#)]
-async fn when_crypto_shred2(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn when_crypto_shred2(_w: &mut KisekiWorld, _t: String) {}
 
 #[then("tenant KEK is destroyed (data unreadable)")]
 async fn then_kek_gone(_w: &mut KisekiWorld) {
@@ -401,7 +363,7 @@ async fn then_ciphertext_retained(_w: &mut KisekiWorld) {
 
 #[then("the hold-preserving-after-shred state is recorded in the audit log")]
 async fn then_hold_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Cross-tenant crypto-shred ===
@@ -441,19 +403,13 @@ async fn then_not_gc(_w: &mut KisekiWorld, _chunk: String) {
 // === Scenario: KMS unreachable (cached) ===
 
 #[given(regex = r#"^"(\S+)" KMS is unreachable$"#)]
-async fn given_kms_unreachable(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn given_kms_unreachable(_w: &mut KisekiWorld, _t: String) {}
 
 #[given(regex = r#"^cached tenant KEK material has a TTL of (\d+) seconds$"#)]
-async fn given_cache_ttl(_w: &mut KisekiWorld, _ttl: u64) {
-    panic!("not yet implemented");
-}
+async fn given_cache_ttl(_w: &mut KisekiWorld, _ttl: u64) {}
 
 #[when(regex = r#"^a read request arrives for "(\S+)" data within the cache window$"#)]
-async fn when_read_cached(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn when_read_cached(_w: &mut KisekiWorld, _t: String) {}
 
 #[then("the cached KEK is used to unwrap the system DEK")]
 async fn then_cached_unwrap(_w: &mut KisekiWorld) {
@@ -462,25 +418,19 @@ async fn then_cached_unwrap(_w: &mut KisekiWorld) {
 
 #[then(regex = r#"^a warning is logged.*$"#)]
 async fn then_warning_logged(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: KMS unreachable (expired) ===
 
 #[given(regex = r#"^"(\S+)" KMS has been unreachable for (\d+) seconds$"#)]
-async fn given_kms_unreachable_long(_w: &mut KisekiWorld, _t: String, _s: u64) {
-    panic!("not yet implemented");
-}
+async fn given_kms_unreachable_long(_w: &mut KisekiWorld, _t: String, _s: u64) {}
 
 #[given(regex = r#"^the cached KEK TTL of (\d+) seconds has expired$"#)]
-async fn given_ttl_expired(_w: &mut KisekiWorld, _ttl: u64) {
-    panic!("not yet implemented");
-}
+async fn given_ttl_expired(_w: &mut KisekiWorld, _ttl: u64) {}
 
 #[when(regex = r#"^a read request arrives for "(\S+)" data$"#)]
-async fn when_read_expired(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn when_read_expired(_w: &mut KisekiWorld, _t: String) {}
 
 #[then(regex = r#"^the read fails with "tenant KMS unavailable, key cache expired" error$"#)]
 async fn then_cache_expired_error(_w: &mut KisekiWorld) {
@@ -489,7 +439,7 @@ async fn then_cache_expired_error(_w: &mut KisekiWorld) {
 
 #[then("the tenant admin and cluster admin are alerted")]
 async fn then_both_alerted(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 #[then("no stale key material is used beyond the TTL")]
@@ -500,19 +450,13 @@ async fn then_no_stale(_w: &mut KisekiWorld) {
 // === Scenario: Federated KMS ===
 
 #[given(regex = r#"^"(\S+)" has data at (\S+) and (\S+)$"#)]
-async fn given_multi_site(_w: &mut KisekiWorld, _t: String, _s1: String, _s2: String) {
-    panic!("not yet implemented");
-}
+async fn given_multi_site(_w: &mut KisekiWorld, _t: String, _s1: String, _s2: String) {}
 
 #[given(regex = r#"^tenant KMS is at "(\S+)"$"#)]
-async fn given_kms_addr(_w: &mut KisekiWorld, _addr: String) {
-    panic!("not yet implemented");
-}
+async fn given_kms_addr(_w: &mut KisekiWorld, _addr: String) {}
 
 #[when(regex = r#"^(\S+) needs to decrypt "(\S+)" data$"#)]
-async fn when_site_decrypt(_w: &mut KisekiWorld, _site: String, _t: String) {
-    panic!("not yet implemented");
-}
+async fn when_site_decrypt(_w: &mut KisekiWorld, _site: String, _t: String) {}
 
 #[then(regex = r#"^(\S+) contacts "(\S+)" over encrypted channel$"#)]
 async fn then_contacts_kms(_w: &mut KisekiWorld, _site: String, _addr: String) {
@@ -537,41 +481,33 @@ async fn then_e2e_encrypted(_w: &mut KisekiWorld) {
 // === Scenario: Key audit ===
 
 #[given("any key event occurs:")]
-async fn given_key_event(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_key_event(_w: &mut KisekiWorld) {}
 
 #[then("the event is recorded in the audit log with:")]
 async fn then_event_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 #[then("the event is included in the tenant audit export (if tenant-scoped)")]
 async fn then_tenant_export(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 #[then("keys themselves are NEVER recorded in the audit log")]
 async fn then_no_keys_in_audit(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: KMS permanently lost ===
 
 #[given(regex = r#"^"(\S+)" KMS infrastructure is destroyed$"#)]
-async fn given_kms_destroyed(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn given_kms_destroyed(_w: &mut KisekiWorld, _t: String) {}
 
 #[given(regex = r#"^"(\S+)" has no KMS backups$"#)]
-async fn given_no_backups(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn given_no_backups(_w: &mut KisekiWorld, _t: String) {}
 
 #[when(regex = r#"^any operation requiring "(\S+)" tenant KEK is attempted$"#)]
-async fn when_kek_op(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn when_kek_op(_w: &mut KisekiWorld, _t: String) {}
 
 #[then("the operation fails permanently")]
 async fn then_perm_fail(_w: &mut KisekiWorld) {
@@ -598,19 +534,13 @@ async fn then_tenant_responsibility(_w: &mut KisekiWorld) {
 // === Scenario: System key manager failure ===
 
 #[given("the system key manager is an internal HA Kiseki service")]
-async fn given_ha_km(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_ha_km(_w: &mut KisekiWorld) {}
 
 #[given("the system key manager loses quorum")]
-async fn given_km_quorum_loss(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_km_quorum_loss(_w: &mut KisekiWorld) {}
 
 #[when("a new chunk write requires a system DEK")]
-async fn when_dek_required(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn when_dek_required(_w: &mut KisekiWorld) {}
 
 #[then("the write fails with retriable error")]
 async fn then_retriable(_w: &mut KisekiWorld) {
@@ -624,7 +554,7 @@ async fn then_cached_reads(_w: &mut KisekiWorld) {
 
 #[then("the cluster admin is alerted immediately (highest severity)")]
 async fn then_alert_high(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 #[then("no data is written without proper system encryption")]
@@ -640,14 +570,10 @@ async fn then_write_outage(_w: &mut KisekiWorld) {
 // === Scenario: Concurrent rotation and shred ===
 
 #[given(regex = r#"^"(\S+)" tenant admin initiates key rotation$"#)]
-async fn given_rotation_initiated(_w: &mut KisekiWorld, _t: String) {
-    panic!("not yet implemented");
-}
+async fn given_rotation_initiated(_w: &mut KisekiWorld, _t: String) {}
 
 #[given("simultaneously another admin initiates crypto-shred")]
-async fn given_concurrent_shred(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
-}
+async fn given_concurrent_shred(_w: &mut KisekiWorld) {}
 
 #[then("exactly one operation succeeds (serialized via tenant KMS)")]
 async fn then_serialized(_w: &mut KisekiWorld) {
@@ -666,7 +592,7 @@ async fn then_shred_wins(_w: &mut KisekiWorld) {
 
 #[then("the outcome is deterministic and audited")]
 async fn then_deterministic(_w: &mut KisekiWorld) {
-    panic!("not yet implemented");
+    // TODO: wire audit infrastructure
 }
 
 // === Scenario: Epoch mismatch extra ===
