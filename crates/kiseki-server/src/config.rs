@@ -105,9 +105,7 @@ impl ServerConfig {
             .ok()
             .and_then(|v| v.parse().ok());
 
-        let bootstrap = std::env::var("KISEKI_BOOTSTRAP")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        let bootstrap = std::env::var("KISEKI_BOOTSTRAP").is_ok_and(|v| v == "true" || v == "1");
 
         Self {
             data_addr,

@@ -9,7 +9,6 @@ use kiseki_audit::AuditOps;
 use kiseki_control::grpc::ControlGrpc;
 use kiseki_control::tenant::TenantStore;
 use kiseki_keymanager::grpc::KeyManagerGrpc;
-use kiseki_keymanager::raft_store::RaftKeyStore;
 use kiseki_log::grpc::LogGrpc;
 use kiseki_proto::v1::control_service_server::ControlServiceServer;
 use kiseki_proto::v1::key_manager_service_server::KeyManagerServiceServer;
@@ -225,8 +224,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                 sp.poll(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                        .unwrap_or(0),
+                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                 );
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

@@ -176,9 +176,10 @@ impl StorageAdminService {
         // Enforce state machine: Online→Draining→Decommissioned, Online↔Offline.
         let valid = matches!(
             (dev.status, status),
-            (DeviceStatus::Online, DeviceStatus::Draining)
-                | (DeviceStatus::Online, DeviceStatus::Offline)
-                | (DeviceStatus::Offline, DeviceStatus::Online)
+            (
+                DeviceStatus::Online,
+                DeviceStatus::Draining | DeviceStatus::Offline
+            ) | (DeviceStatus::Offline, DeviceStatus::Online)
                 | (DeviceStatus::Draining, DeviceStatus::Decommissioned)
         );
         if !valid {

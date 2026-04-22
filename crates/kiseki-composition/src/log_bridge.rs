@@ -51,8 +51,7 @@ static HLC_LOGICAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 fn now_timestamp() -> DeltaTimestamp {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let logical = HLC_LOGICAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     DeltaTimestamp {
         hlc: HybridLogicalClock {

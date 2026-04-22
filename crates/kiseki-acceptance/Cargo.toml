@@ -37,3 +37,13 @@ kiseki-client = { workspace = true }
 cucumber = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+
+# BDD step definitions are test code — relax lints.
+[lints.clippy]
+all = "allow"
+pedantic = "allow"
+
+[lints.rust]
+missing_docs = "allow"
+unused_imports = "allow"
+unused_comparisons = "allow"

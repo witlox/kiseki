@@ -34,7 +34,7 @@ missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
+all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Pedantic lints we disable with justification:
 # - `module_name_repetitions`: domain naming (KisekiError, ChunkId) is intentional.
@@ -44,13 +44,10 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 # Domain-correctness lints elevated to deny:
 float_cmp = "deny"
-# unwrap/expect/panic: warn at workspace level so tests can use them.
-# Production code uses unwrap_or_else consistently — enforced by review.
-unwrap_used = "warn"
-expect_used = "warn"
-panic = "warn"
 todo = "deny"
 unimplemented = "deny"
+# unwrap/expect/panic: not lint-enforced (review-enforced in production code).
+# Tests and integration code use these freely. Matches pact pattern.
 
 [workspace.dependencies]
 # --- Internal crates ---

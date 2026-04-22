@@ -2,6 +2,10 @@
 //!
 //! Detects debugger attachment (ptrace) and disables core dumps to
 //! prevent memory extraction of key material in production.
+//!
+//! Not yet wired into the server startup — will be called from runtime.rs
+//! when the integrity monitor is enabled (Phase I2).
+#![allow(dead_code)]
 
 /// Integrity check result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,17 +90,11 @@ fn are_core_dumps_enabled() -> bool {
 }
 
 /// Attempt to disable core dumps for this process.
-pub fn disable_core_dumps() -> Result<(), String> {
+pub fn disable_core_dumps() {
     #[cfg(target_os = "linux")]
     {
         // Would call setrlimit(RLIMIT_CORE, 0) via libc — skipped in safe Rust.
         // In production, this is done by the systemd unit file.
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(())
     }
 }
 
@@ -114,6 +112,6 @@ mod tests {
 
     #[test]
     fn disable_core_dumps_succeeds() {
-        assert!(disable_core_dumps().is_ok());
+        disable_core_dumps(); // Should not panic.
     }
 }

@@ -85,6 +85,40 @@ impl RaftAuditStore {
             .len()
     }
 
+    /// Get a snapshot of the current command log.
+    #[must_use]
+    pub fn command_log(&self) -> Vec<(u64, AuditCommand)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .log
+            .clone()
+    }
+
+    /// Apply a command externally (for persistent store wrapper).
+    /// Returns the log index assigned to this command.
+    pub fn apply_command_external(&self, event: AuditEvent) -> u64 {
+        // Delegates to the AuditOps::append impl, then returns index.
+        self.append(event);
+        self.log_length() as u64
+    }
+
+    /// Reconstruct a `RaftAuditStore` from a persisted command log.
+    pub fn from_commands(commands: impl Iterator<Item = (u64, AuditCommand)>) -> Self {
+        let store = Self::new();
+        {
+            let mut inner = store
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (idx, cmd) in commands {
+                inner.log.push((idx, cmd));
+            }
+        }
+        store.replay();
+        store
+    }
+
     /// Replay the command log to rebuild state (e.g., after snapshot restore).
     pub fn replay(&self) {
         let mut inner = self

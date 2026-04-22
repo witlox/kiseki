@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)]
 //! Integration test: single-node Raft key manager.
 //!
 //! Exercises the full path: `Raft::new` → initialize → `client_write` →

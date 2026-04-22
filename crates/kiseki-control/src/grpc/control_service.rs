@@ -29,8 +29,9 @@ fn to_status(e: &ControlError) -> Status {
     match e {
         ControlError::AlreadyExists(msg) => Status::already_exists(msg.clone()),
         ControlError::NotFound(msg) => Status::not_found(msg.clone()),
-        ControlError::QuotaExceeded(msg) => Status::failed_precondition(msg.clone()),
-        ControlError::Rejected(msg) => Status::failed_precondition(msg.clone()),
+        ControlError::QuotaExceeded(msg) | ControlError::Rejected(msg) => {
+            Status::failed_precondition(msg.clone())
+        }
     }
 }
 
@@ -47,16 +48,18 @@ fn proto_tags(tags: &[i32]) -> Vec<ComplianceTag> {
 }
 
 fn proto_quota(q: Option<&pb::Quota>) -> Quota {
-    q.map(|q| Quota {
-        capacity_bytes: q.capacity_bytes,
-        iops: q.iops,
-        metadata_ops_per_sec: q.metadata_ops_per_sec,
-    })
-    .unwrap_or(Quota {
-        capacity_bytes: 0,
-        iops: 0,
-        metadata_ops_per_sec: 0,
-    })
+    q.map_or(
+        Quota {
+            capacity_bytes: 0,
+            iops: 0,
+            metadata_ops_per_sec: 0,
+        },
+        |q| Quota {
+            capacity_bytes: q.capacity_bytes,
+            iops: q.iops,
+            metadata_ops_per_sec: q.metadata_ops_per_sec,
+        },
+    )
 }
 
 #[tonic::async_trait]
@@ -142,7 +145,7 @@ impl ControlService for ControlGrpc {
         request: Request<pb::GetOrganizationRequest>,
     ) -> Result<Response<pb::Organization>, Status> {
         let req = request.into_inner();
-        let org_id = req.org_id.as_ref().map(|o| o.value.as_str()).unwrap_or("");
+        let org_id = req.org_id.as_ref().map_or("", |o| o.value.as_str());
         let org = self.tenants.get_org(org_id).map_err(|e| to_status(&e))?;
         Ok(Response::new(pb::Organization {
             org_id: Some(pb::OrgId { value: org.id }),

@@ -326,12 +326,12 @@ mod tests {
 
         let ts = DeltaTimestamp {
             hlc: HybridLogicalClock {
-                physical_ms: 1718000000000,
+                physical_ms: 1_718_000_000_000,
                 logical: 42,
                 node_id: NodeId(7),
             },
             wall: WallTime {
-                millis_since_epoch: 1718000000000,
+                millis_since_epoch: 1_718_000_000_000,
                 timezone: "Europe/Zurich".into(),
             },
             quality: ClockQuality::Ptp,
@@ -373,10 +373,13 @@ mod tests {
 
             assert_eq!(deltas.len(), 1);
             let d = &deltas[0];
-            assert_eq!(d.header.timestamp.hlc.physical_ms, 1718000000000);
+            assert_eq!(d.header.timestamp.hlc.physical_ms, 1_718_000_000_000);
             assert_eq!(d.header.timestamp.hlc.logical, 42);
             assert_eq!(d.header.timestamp.hlc.node_id, NodeId(7));
-            assert_eq!(d.header.timestamp.wall.millis_since_epoch, 1718000000000);
+            assert_eq!(
+                d.header.timestamp.wall.millis_since_epoch,
+                1_718_000_000_000
+            );
             assert_eq!(d.header.timestamp.wall.timezone, "Europe/Zurich");
             assert_eq!(d.header.timestamp.quality, ClockQuality::Ptp);
         }

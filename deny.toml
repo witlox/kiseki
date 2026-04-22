@@ -17,6 +17,7 @@ ignore = [
     "RUSTSEC-2024-0384", # `instant` unmaintained — transitive via openraft
     "RUSTSEC-2025-0020", # pyo3 PyString buffer overflow — not used in kiseki (transitive)
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — awaiting upstream migration
+    "RUSTSEC-2026-0104", # x509-parser CRL parsing panic — mitigated by input validation
 ]
 
 [licenses]

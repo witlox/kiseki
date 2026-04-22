@@ -116,7 +116,7 @@ pub fn compact_deltas(
             return deltas.to_vec();
         }
         // Sort newest first.
-        versions.sort_by(|a, b| b.header.sequence.cmp(&a.header.sequence));
+        versions.sort_by_key(|d| std::cmp::Reverse(d.header.sequence));
 
         for (i, delta) in versions.iter().enumerate() {
             let is_tombstone = delta.header.operation == OperationType::Delete;

@@ -194,8 +194,7 @@ impl GatewayOps for InMemoryGateway {
             // Find a view covering this composition's shard.
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                .unwrap_or(0);
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
             // Check all views for staleness — any stale view blocks the read.
             // In production, only the view serving this shard matters.
             for view_id in view_store.view_ids() {

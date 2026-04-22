@@ -286,7 +286,7 @@ mod nfs_tests {
     #[test]
     fn nfs3_mkdir_and_rmdir() {
         let ctx = setup_nfs_ctx();
-        let (fh, attrs) = ctx.mkdir("subdir").unwrap();
+        let (_fh, attrs) = ctx.mkdir("subdir").unwrap();
         assert_eq!(attrs.file_type, FileType::Directory);
         assert_eq!(attrs.mode, 0o755);
 

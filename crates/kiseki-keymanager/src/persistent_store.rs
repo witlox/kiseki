@@ -13,7 +13,7 @@ use kiseki_raft::redb_log_store::RedbLogStore;
 
 use crate::epoch::{EpochInfo, KeyManagerOps};
 use crate::error::KeyManagerError;
-use crate::health::{KeyManagerHealth, KeyManagerStatus};
+use crate::health::KeyManagerHealth;
 use crate::raft_store::{KeyCommand, RaftKeyStore};
 
 /// Persistent key store — in-memory state machine + redb for durability.
@@ -54,6 +54,7 @@ impl PersistentKeyStore {
     }
 
     /// Persist a command to redb and apply it to the state machine.
+    #[allow(clippy::needless_pass_by_value)]
     fn persist_and_apply(&self, cmd: KeyCommand) {
         let idx = self.inner.apply_command(cmd.clone());
         let _ = self.redb.append(idx, &cmd);
@@ -115,6 +116,7 @@ impl core::fmt::Debug for PersistentKeyStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PersistentKeyStore")
             .field("inner", &self.inner)
+            .field("redb", &"RedbLogStore")
             .finish()
     }
 }

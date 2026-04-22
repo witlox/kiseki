@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic, missing_docs)]
 //! Tests for the generic `MemLogStore`.
 
 use std::io::Cursor;
