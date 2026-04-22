@@ -96,6 +96,23 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     };
     let key_store = Arc::new(key_store);
 
+    // Small object store for inline files (ADR-030).
+    // Created before the log store so Raft state machines can use it.
+    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> =
+        if let Some(ref dir) = cfg.data_dir {
+            std::fs::create_dir_all(dir.join("small")).ok();
+            let store =
+                kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects.redb"))
+                    .map_err(|e| format!("small object store: {e}"))?;
+            eprintln!(
+                "  small object store: persistent (redb at {})",
+                dir.display()
+            );
+            Some(std::sync::Arc::new(store))
+        } else {
+            None
+        };
+
     // Log store: Raft (multi-node), persistent (redb), or in-memory.
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
     let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
@@ -108,12 +125,16 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             let raft_addr_str = cfg
                 .raft_addr
                 .map_or_else(|| "0.0.0.0:9300".to_owned(), |a| a.to_string());
-            let store = kiseki_log::RaftShardStore::new(
+            let mut store = kiseki_log::RaftShardStore::new(
                 cfg.node_id,
                 peers,
                 tokio::runtime::Handle::current(),
                 cfg.data_dir.clone(),
             );
+            if let Some(ref ss) = small_store {
+                store = store.with_inline_store(std::sync::Arc::clone(ss)
+                    as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>);
+            }
             if cfg.bootstrap {
                 store.create_shard(
                     bootstrap_shard,
@@ -236,10 +257,16 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // Shared gateway: wires composition + chunk + crypto. Used by S3 and NFS.
     let master_key =
         kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
-    let gw = Arc::new(
-        kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
-            .with_view_store(Arc::clone(&view_store)),
-    );
+    let mut gw_builder = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
+        .with_view_store(Arc::clone(&view_store));
+    if let Some(ref ss) = small_store {
+        gw_builder = gw_builder.with_inline_threshold(
+            kiseki_log::ShardConfig::default().inline_threshold_bytes,
+            std::sync::Arc::clone(ss)
+                as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>,
+        );
+    }
+    let gw = Arc::new(gw_builder);
 
     // S3 gateway.
     let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&gw));

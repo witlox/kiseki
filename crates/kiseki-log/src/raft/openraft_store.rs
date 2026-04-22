@@ -72,11 +72,14 @@ impl OpenRaftLogStore {
         tenant_id: OrgId,
         peers: &BTreeMap<u64, String>,
         data_dir: Option<&std::path::Path>,
+        inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
     ) -> Result<Self, LogError> {
         let config = KisekiRaftConfig::default_config();
-        let state_inner = Arc::new(futures::lock::Mutex::new(ShardSmInner::new(
-            shard_id, tenant_id,
-        )));
+        let mut sm_inner = ShardSmInner::new(shard_id, tenant_id);
+        if let Some(store) = inline_store {
+            sm_inner = sm_inner.with_inline_store(store);
+        }
+        let state_inner = Arc::new(futures::lock::Mutex::new(sm_inner));
         let state_machine = ShardStateMachine::new(Arc::clone(&state_inner));
 
         let members: BTreeMap<u64, KisekiNode> = if peers.len() > 1 {

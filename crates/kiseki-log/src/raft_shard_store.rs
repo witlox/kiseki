@@ -34,6 +34,7 @@ pub struct RaftShardStore {
     peers: BTreeMap<u64, String>,
     rt: tokio::runtime::Handle,
     data_dir: Option<PathBuf>,
+    inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
 }
 
 impl RaftShardStore {
@@ -54,7 +55,18 @@ impl RaftShardStore {
             peers,
             rt,
             data_dir,
+            inline_store: None,
         }
+    }
+
+    /// Set the inline store for small-file content (ADR-030).
+    #[must_use]
+    pub fn with_inline_store(
+        mut self,
+        store: Arc<dyn kiseki_common::inline_store::InlineStore>,
+    ) -> Self {
+        self.inline_store = Some(store);
+        self
     }
 
     /// Create a shard with its own Raft group.
@@ -79,6 +91,7 @@ impl RaftShardStore {
         let node_id = self.node_id;
         let rt = self.rt.clone();
         let data_dir = self.data_dir.clone();
+        let inline_store = self.inline_store.clone();
 
         let store = tokio::task::block_in_place(|| {
             rt.block_on(async {
@@ -88,6 +101,7 @@ impl RaftShardStore {
                     tenant_id,
                     &peers,
                     data_dir.as_deref(),
+                    inline_store,
                 )
                 .await
                 .expect("failed to create Raft log store");
