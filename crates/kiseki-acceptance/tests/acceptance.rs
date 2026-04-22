@@ -163,7 +163,11 @@ impl KisekiWorld {
         let gw_comps = CompositionStore::new()
             .with_log(Arc::clone(&log_store) as Arc<dyn LogOps + Send + Sync>);
         let gw_master = kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-        let gateway = Arc::new(InMemoryGateway::new(gw_comps, gw_chunks, gw_master));
+        let gateway = Arc::new(InMemoryGateway::new(
+            gw_comps,
+            Box::new(gw_chunks),
+            gw_master,
+        ));
 
         // NFS context wrapping the gateway — for real NFS3/4 wire-format testing.
         let default_ns = NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));

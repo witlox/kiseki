@@ -127,8 +127,25 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         audit_store.total_events()
     );
 
-    // Chunk: in-memory store.
-    let chunk_store = kiseki_chunk::ChunkStore::new();
+    // Chunk store: persistent (raw block device) if KISEKI_DATA_DIR set,
+    // otherwise in-memory. The gateway accepts any ChunkOps implementation.
+    let chunk_store: Box<dyn kiseki_chunk::ChunkOps + Send> = if let Some(ref dir) = cfg.data_dir {
+        std::fs::create_dir_all(dir.join("chunks")).ok();
+        let dev_path = dir.join("chunks").join("data.dev");
+        let meta_path = dir.join("chunks").join("meta.json");
+        let store = if dev_path.exists() {
+            kiseki_chunk::PersistentChunkStore::open(&dev_path, &meta_path)
+                .map_err(|e| format!("persistent chunk store open: {e}"))?
+        } else {
+            kiseki_chunk::PersistentChunkStore::init(&dev_path, &meta_path, 4 * 1024 * 1024 * 1024)
+                .map_err(|e| format!("persistent chunk store init: {e}"))?
+        };
+        eprintln!("  chunk store: persistent (raw block at {})", dir.display());
+        Box::new(store)
+    } else {
+        eprintln!("  chunk store: in-memory (no persistence)");
+        Box::new(kiseki_chunk::ChunkStore::new())
+    };
 
     // Composition: wired to log for delta emission.
     let mut comp_store = kiseki_composition::composition::CompositionStore::new()

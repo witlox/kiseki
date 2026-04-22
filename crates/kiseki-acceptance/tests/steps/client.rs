@@ -1981,5 +1981,5 @@ fn make_test_gateway() -> InMemoryGateway {
     let chunk_store = kiseki_chunk::store::ChunkStore::new();
     let master_key =
         kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
-    InMemoryGateway::new(comp_store, chunk_store, master_key)
+    InMemoryGateway::new(comp_store, Box::new(chunk_store), master_key)
 }

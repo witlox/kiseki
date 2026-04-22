@@ -418,7 +418,7 @@ async fn then_lock_local(w: &mut KisekiWorld) {
                 .with_log(
                     Arc::clone(&w.log_store) as Arc<dyn kiseki_log::traits::LogOps + Send + Sync>
                 ),
-            kiseki_chunk::ChunkStore::new(),
+            Box::new(kiseki_chunk::ChunkStore::new()),
             kiseki_crypto::keys::SystemMasterKey::new(
                 [0x42; 32],
                 kiseki_common::tenancy::KeyEpoch(1),
@@ -526,7 +526,7 @@ async fn then_nfs_detect_loss(_w: &mut KisekiWorld) {
         kiseki_gateway::nfs::NfsGateway::new(Arc::new(
             kiseki_gateway::mem_gateway::InMemoryGateway::new(
                 kiseki_composition::composition::CompositionStore::new(),
-                kiseki_chunk::ChunkStore::new(),
+                Box::new(kiseki_chunk::ChunkStore::new()),
                 kiseki_crypto::keys::SystemMasterKey::new(
                     [0x42; 32],
                     kiseki_common::tenancy::KeyEpoch(1),

@@ -25,7 +25,7 @@ use crate::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteRespo
 /// take `&self`, enabling concurrent access.
 pub struct InMemoryGateway {
     compositions: Mutex<CompositionStore>,
-    chunks: Mutex<ChunkStore>,
+    chunks: Mutex<Box<dyn ChunkOps + Send>>,
     aead: Aead,
     master_key: SystemMasterKey,
     dedup_policy: DedupPolicy,
@@ -41,7 +41,7 @@ impl InMemoryGateway {
     #[must_use]
     pub fn new(
         compositions: CompositionStore,
-        chunks: ChunkStore,
+        chunks: Box<dyn ChunkOps + Send>,
         master_key: SystemMasterKey,
     ) -> Self {
         Self {
