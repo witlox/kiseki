@@ -50,7 +50,7 @@ def test_delta_survives_restart(kiseki_server: ServerInfo) -> None:
 
     # Restart the server container.
     subprocess.run(
-        ["/usr/local/bin/docker", "compose", "restart", "kiseki-server"],
+        ["docker", "compose", "restart", "kiseki-server"],
         cwd=WORKSPACE,
         check=True,
         capture_output=True,

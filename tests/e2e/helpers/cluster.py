@@ -62,7 +62,7 @@ def _start_docker(
     """Start via docker compose."""
     root = _workspace_root()
     subprocess.run(
-        ["/usr/local/bin/docker", "compose", "up", "--build", "-d"],
+        ["docker", "compose", "up", "--build", "-d"],
         cwd=root,
         check=True,
         capture_output=True,
@@ -135,7 +135,7 @@ def stop_server(info: ServerInfo) -> None:
     if info.mode == "docker":
         root = _workspace_root()
         subprocess.run(
-            ["/usr/local/bin/docker", "compose", "down"],
+            ["docker", "compose", "down"],
             cwd=root,
             capture_output=True,
         )
@@ -152,7 +152,7 @@ def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo
     """Start a multi-node cluster via docker compose."""
     root = _workspace_root()
     subprocess.run(
-        ["/usr/local/bin/docker", "compose", "-f", compose_file, "up", "--build", "-d"],
+        ["docker", "compose", "-f", compose_file, "up", "--build", "-d"],
         cwd=root,
         check=True,
         capture_output=True,
@@ -190,7 +190,7 @@ def stop_cluster(info: ClusterInfo) -> None:
     """Stop a multi-node cluster."""
     root = _workspace_root()
     subprocess.run(
-        ["/usr/local/bin/docker", "compose", "-f", info.compose_file, "down", "-v"],
+        ["docker", "compose", "-f", info.compose_file, "down", "-v"],
         cwd=root,
         capture_output=True,
     )
@@ -200,7 +200,7 @@ def stop_node(compose_file: str, service_name: str) -> None:
     """Stop a single node in the cluster."""
     root = _workspace_root()
     subprocess.run(
-        ["/usr/local/bin/docker", "compose", "-f", compose_file, "stop", service_name],
+        ["docker", "compose", "-f", compose_file, "stop", service_name],
         cwd=root,
         check=True,
         capture_output=True,
@@ -211,7 +211,7 @@ def start_node(compose_file: str, service_name: str) -> None:
     """Start a previously stopped node."""
     root = _workspace_root()
     subprocess.run(
-        ["/usr/local/bin/docker", "compose", "-f", compose_file, "start", service_name],
+        ["docker", "compose", "-f", compose_file, "start", service_name],
         cwd=root,
         check=True,
         capture_output=True,
