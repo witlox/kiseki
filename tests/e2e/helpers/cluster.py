@@ -151,6 +151,12 @@ def stop_server(info: ServerInfo) -> None:
 def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo:
     """Start a multi-node cluster via docker compose."""
     root = _workspace_root()
+    # Stop any single-node compose that may be running (port conflicts).
+    subprocess.run(
+        ["docker", "compose", "down", "-v"],
+        cwd=root,
+        capture_output=True,
+    )
     result = subprocess.run(
         ["docker", "compose", "-f", compose_file, "up", "--build", "-d"],
         cwd=root,
