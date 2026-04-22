@@ -1897,8 +1897,7 @@ async fn then_plaintext_matches(w: &mut KisekiWorld) {
     let tenant_id = w.gateway_tenant();
     let resp = w.gateway_read(comp_id, tenant_id, "persist-ns").unwrap();
     assert_eq!(
-        resp.data,
-        b"persistent-chunk-data",
+        resp.data, b"persistent-chunk-data",
         "plaintext should match"
     );
 }
@@ -2047,8 +2046,5 @@ async fn then_previous_snapshot(w: &mut KisekiWorld) {
 async fn then_no_corrupt_snapshot(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("crash-snapshot");
     let health = w.log_store.shard_health(sid).unwrap();
-    assert!(
-        health.delta_count > 0,
-        "no corrupted data should be loaded"
-    );
+    assert!(health.delta_count > 0, "no corrupted data should be loaded");
 }

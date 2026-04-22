@@ -310,9 +310,7 @@ impl KisekiWorld {
         if let Some(&id) = self.view_ids.get(name) {
             return id;
         }
-        use kiseki_view::descriptor::{
-            ConsistencyModel, ProtocolSemantics, ViewDescriptor,
-        };
+        use kiseki_view::descriptor::{ConsistencyModel, ProtocolSemantics, ViewDescriptor};
         use kiseki_view::view::ViewOps;
         let desc = ViewDescriptor {
             view_id: ViewId(uuid::Uuid::new_v5(

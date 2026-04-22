@@ -762,8 +762,14 @@ async fn then_no_overlap(w: &mut KisekiWorld) {
     // Verify we can write to two different shards independently.
     let sid0 = *w.shard_names.get("shard-election-0").unwrap();
     let sid1 = *w.shard_names.get("shard-election-1").unwrap();
-    assert!(w.log_store.append_delta(w.make_append_request(sid0, 0xa0)).is_ok());
-    assert!(w.log_store.append_delta(w.make_append_request(sid1, 0xa1)).is_ok());
+    assert!(w
+        .log_store
+        .append_delta(w.make_append_request(sid0, 0xa0))
+        .is_ok());
+    assert!(w
+        .log_store
+        .append_delta(w.make_append_request(sid1, 0xa1))
+        .is_ok());
 }
 
 // --- Scenario: Quorum loss blocks writes ---
@@ -791,7 +797,7 @@ async fn then_stale_reads_ok(w: &mut KisekiWorld) {
 #[when("node-2 comes back online")]
 async fn when_node2_comes_back(w: &mut KisekiWorld) {
     w.last_error = None; // Quorum restored.
-    // Ensure shard-alpha exists and is healthy for the shared `then_quorum` step.
+                         // Ensure shard-alpha exists and is healthy for the shared `then_quorum` step.
     let sid = w.ensure_shard("shard-alpha");
     let _ = w.log_store.set_maintenance(sid, false);
 }
@@ -872,7 +878,10 @@ async fn then_shard_returns_members(w: &mut KisekiWorld, shard: String, _n: u32)
 async fn then_quorum_adjusts_accordingly(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     let req = w.make_append_request(sid, 0x84);
-    assert!(w.log_store.append_delta(req).is_ok(), "quorum should adjust");
+    assert!(
+        w.log_store.append_delta(req).is_ok(),
+        "quorum should adjust"
+    );
 }
 
 // --- Scenario: Raft messages travel over TLS ---
