@@ -1,0 +1,137 @@
+//! Raft-backed shard store for multi-node clusters.
+//!
+//! Wraps per-shard `OpenRaftLogStore` instances behind the sync
+//! `LogOps` trait. Each shard gets its own Raft group for independent
+//! consensus. The sync↔async bridge uses `block_in_place` (safe on
+//! tokio's multi-thread runtime).
+//!
+//! Phase I2: multi-node Raft consensus with in-memory Raft log
+//! (`MemLogStore`). Durability via Raft replication to majority.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+
+use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
+
+use crate::delta::Delta;
+use crate::error::LogError;
+use crate::raft::OpenRaftLogStore;
+use crate::shard::{ShardConfig, ShardInfo};
+use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
+
+/// Raft-backed shard store for multi-node clusters.
+///
+/// Holds a map of `ShardId → OpenRaftLogStore`. Each shard has its
+/// own Raft group with independent leader election. The `LogOps`
+/// trait methods bridge sync→async via `tokio::task::block_in_place`.
+pub struct RaftShardStore {
+    shards: Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>,
+    node_id: u64,
+    peers: BTreeMap<u64, String>,
+    rt: tokio::runtime::Handle,
+}
+
+impl RaftShardStore {
+    /// Create a new (empty) Raft shard store.
+    ///
+    /// Call `create_shard` to add Raft groups for each shard.
+    #[must_use]
+    pub fn new(node_id: u64, peers: BTreeMap<u64, String>, rt: tokio::runtime::Handle) -> Self {
+        Self {
+            shards: Mutex::new(HashMap::new()),
+            node_id,
+            peers,
+            rt,
+        }
+    }
+
+    /// Create a shard with its own Raft group.
+    ///
+    /// Initializes a new `OpenRaftLogStore`, calls `raft.initialize()`
+    /// with the configured peers, and optionally spawns the Raft RPC
+    /// server on `raft_addr`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Raft instance fails to initialize (fatal for
+    /// server startup).
+    pub fn create_shard(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        _node_id: NodeId,
+        _config: ShardConfig,
+        raft_addr: Option<&str>,
+    ) {
+        let peers = self.peers.clone();
+        let node_id = self.node_id;
+        let rt = self.rt.clone();
+
+        let store = tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let store = OpenRaftLogStore::new(node_id, shard_id, tenant_id, &peers)
+                    .await
+                    .expect("failed to create Raft log store");
+
+                // Spawn RPC server for this shard's Raft group.
+                if let Some(addr) = raft_addr {
+                    std::mem::drop(store.spawn_rpc_server(addr.to_owned()));
+                    eprintln!("  raft: RPC server for shard {} on {addr}", shard_id.0);
+                }
+
+                Arc::new(store)
+            })
+        });
+
+        let mut shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shards.insert(shard_id, store);
+    }
+
+    /// Look up a shard's Raft store.
+    fn get_shard(&self, shard_id: ShardId) -> Result<Arc<OpenRaftLogStore>, LogError> {
+        let shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shards
+            .get(&shard_id)
+            .cloned()
+            .ok_or(LogError::ShardNotFound(shard_id))
+    }
+}
+
+impl LogOps for RaftShardStore {
+    fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
+        let store = self.get_shard(req.shard_id)?;
+        tokio::task::block_in_place(|| self.rt.block_on(store.append_delta(req)))
+    }
+
+    fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
+        let store = self.get_shard(req.shard_id)?;
+        tokio::task::block_in_place(|| self.rt.block_on(store.read_deltas(req)))
+    }
+
+    fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
+        let store = self.get_shard(shard_id)?;
+        let info = tokio::task::block_in_place(|| self.rt.block_on(store.shard_health()));
+        Ok(info)
+    }
+
+    fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
+        let store = self.get_shard(shard_id)?;
+        tokio::task::block_in_place(|| self.rt.block_on(store.set_maintenance(enabled)))
+    }
+
+    fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        let store = self.get_shard(shard_id)?;
+        tokio::task::block_in_place(|| self.rt.block_on(store.truncate_log()))
+    }
+
+    fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
+        let store = self.get_shard(shard_id)?;
+        tokio::task::block_in_place(|| self.rt.block_on(store.compact_shard()))
+    }
+}

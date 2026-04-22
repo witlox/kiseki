@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use std::sync::Arc;
 
-use kiseki_chunk::store::{ChunkOps, ChunkStore};
+use kiseki_chunk::store::ChunkOps;
 use kiseki_common::tenancy::DedupPolicy;
 use kiseki_composition::composition::{CompositionOps, CompositionStore};
 use kiseki_crypto::aead::Aead;

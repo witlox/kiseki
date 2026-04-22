@@ -16,6 +16,7 @@ use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
 use kiseki_raft::{
     tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory, TcpNetworkFactory,
 };
+use openraft::type_config::async_runtime::WatchReceiver;
 use openraft::Raft;
 
 use super::state_machine::{ShardSmInner, ShardStateMachine};
@@ -147,11 +148,18 @@ impl OpenRaftLogStore {
             has_inline_data: req.has_inline_data,
         };
 
-        let resp = self
-            .raft
-            .client_write(cmd)
-            .await
-            .map_err(|_| LogError::Unavailable)?;
+        let resp = self.raft.client_write(cmd).await.map_err(|e| {
+            if matches!(
+                e,
+                openraft::errors::RaftError::APIError(
+                    openraft::error::ClientWriteError::ForwardToLeader(_)
+                )
+            ) {
+                LogError::LeaderUnavailable(self.shard_id)
+            } else {
+                LogError::Unavailable
+            }
+        })?;
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
@@ -189,11 +197,18 @@ impl OpenRaftLogStore {
             has_inline_data,
         };
 
-        let resp = self
-            .raft
-            .client_write(cmd)
-            .await
-            .map_err(|_| LogError::Unavailable)?;
+        let resp = self.raft.client_write(cmd).await.map_err(|e| {
+            if matches!(
+                e,
+                openraft::errors::RaftError::APIError(
+                    openraft::error::ClientWriteError::ForwardToLeader(_)
+                )
+            ) {
+                LogError::LeaderUnavailable(self.shard_id)
+            } else {
+                LogError::Unavailable
+            }
+        })?;
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
@@ -221,7 +236,18 @@ impl OpenRaftLogStore {
         self.raft
             .client_write(LogCommand::SetMaintenance { enabled })
             .await
-            .map_err(|_| LogError::Unavailable)?;
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    openraft::errors::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_)
+                    )
+                ) {
+                    LogError::LeaderUnavailable(self.shard_id)
+                } else {
+                    LogError::Unavailable
+                }
+            })?;
 
         Ok(())
     }
@@ -239,13 +265,32 @@ impl OpenRaftLogStore {
     }
 
     /// Get shard health metadata from the state machine.
+    ///
+    /// Includes Raft leader and membership info from metrics.
     pub async fn shard_health(&self) -> ShardInfo {
         let inner = self.state.lock().await;
+
+        // Read leader from Raft metrics.
+        let leader = self
+            .raft
+            .current_leader()
+            .await
+            .map(kiseki_common::ids::NodeId);
+
+        // Read membership from Raft metrics.
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let raft_members: Vec<kiseki_common::ids::NodeId> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| kiseki_common::ids::NodeId(*id))
+            .collect();
+
         ShardInfo {
             shard_id: self.shard_id,
             tenant_id: self.tenant_id,
-            raft_members: vec![],
-            leader: None,
+            raft_members,
+            leader,
             tip: SequenceNumber(inner.tip),
             delta_count: inner.delta_count,
             byte_size: inner
@@ -276,7 +321,18 @@ impl OpenRaftLogStore {
                 position: position.0,
             })
             .await
-            .map_err(|_| LogError::Unavailable)?;
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    openraft::errors::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_)
+                    )
+                ) {
+                    LogError::LeaderUnavailable(self.shard_id)
+                } else {
+                    LogError::Unavailable
+                }
+            })?;
 
         Ok(())
     }
