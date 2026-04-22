@@ -47,7 +47,7 @@ pub struct ShardId(pub uuid::Uuid);
 /// form. Never embed a `ChunkId` in an error message together with its
 /// plaintext — the plaintext would leak the dedup-resistant property of
 /// the HMAC variant (I-K8).
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ChunkId(pub [u8; 32]);
 
 impl fmt::Debug for ChunkId {

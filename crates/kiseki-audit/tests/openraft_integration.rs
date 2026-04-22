@@ -52,7 +52,7 @@ fn test_tenant_2() -> OrgId {
 
 #[tokio::test]
 async fn bootstrap_and_verify() {
-    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
 
@@ -67,7 +67,7 @@ async fn bootstrap_and_verify() {
 
 #[tokio::test]
 async fn append_through_raft() {
-    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
 
@@ -84,7 +84,7 @@ async fn append_through_raft() {
 
 #[tokio::test]
 async fn multiple_appends() {
-    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
 
@@ -110,7 +110,7 @@ async fn multiple_appends() {
 
 #[tokio::test]
 async fn event_round_trip() {
-    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
 
@@ -143,7 +143,7 @@ async fn event_round_trip() {
 
 #[tokio::test]
 async fn per_tenant_isolation() {
-    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
     let t1 = test_tenant();
@@ -210,7 +210,7 @@ async fn per_tenant_isolation() {
 
 #[tokio::test]
 async fn tenant_export_returns_only_tenant_events() {
-    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
     let t1 = test_tenant();
@@ -257,7 +257,7 @@ async fn tenant_export_returns_only_tenant_events() {
 
 #[tokio::test]
 async fn event_metadata_preserved() {
-    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftAuditStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
 

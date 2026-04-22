@@ -98,20 +98,20 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
     // Small object store for inline files (ADR-030).
     // Created before the log store so Raft state machines can use it.
-    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> =
-        if let Some(ref dir) = cfg.data_dir {
-            std::fs::create_dir_all(dir.join("small")).ok();
-            let store =
-                kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects.redb"))
-                    .map_err(|e| format!("small object store: {e}"))?;
-            eprintln!(
-                "  small object store: persistent (redb at {})",
-                dir.display()
-            );
-            Some(std::sync::Arc::new(store))
-        } else {
-            None
-        };
+    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> = if let Some(ref dir) =
+        cfg.data_dir
+    {
+        std::fs::create_dir_all(dir.join("small")).ok();
+        let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects.redb"))
+            .map_err(|e| format!("small object store: {e}"))?;
+        eprintln!(
+            "  small object store: persistent (redb at {})",
+            dir.display()
+        );
+        Some(std::sync::Arc::new(store))
+    } else {
+        None
+    };
 
     // Log store: Raft (multi-node), persistent (redb), or in-memory.
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));

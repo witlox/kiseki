@@ -12,7 +12,7 @@ use kiseki_keymanager::raft::OpenRaftKeyStore;
 
 #[tokio::test]
 async fn bootstrap_and_read_epoch() {
-    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
 
@@ -31,7 +31,7 @@ async fn bootstrap_and_read_epoch() {
 
 #[tokio::test]
 async fn rotate_through_raft() {
-    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
 
@@ -52,7 +52,7 @@ async fn rotate_through_raft() {
 
 #[tokio::test]
 async fn hkdf_works_through_raft() {
-    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
     let master = store.fetch_master_key(KeyEpoch(1)).await.unwrap();
@@ -65,7 +65,7 @@ async fn hkdf_works_through_raft() {
 
 #[tokio::test]
 async fn different_epochs_different_keys() {
-    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
     store.rotate().await.unwrap();
@@ -81,7 +81,7 @@ async fn different_epochs_different_keys() {
 
 #[tokio::test]
 async fn mark_migration_complete_through_raft() {
-    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
     store.rotate().await.unwrap();
@@ -95,7 +95,7 @@ async fn mark_migration_complete_through_raft() {
 
 #[tokio::test]
 async fn multiple_rotations_through_raft() {
-    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
     store.rotate().await.unwrap();
@@ -111,7 +111,7 @@ async fn multiple_rotations_through_raft() {
 
 #[tokio::test]
 async fn health_reports_correctly() {
-    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new())
+    let store = OpenRaftKeyStore::new(1, &std::collections::BTreeMap::new(), None)
         .await
         .unwrap();
     let health = store.health().await;

@@ -19,6 +19,7 @@ compression = ["flate2"]
 kiseki-common = { workspace = true }
 aws-lc-rs = { workspace = true }
 libc = { workspace = true }
+serde = { version = "1", features = ["derive"] }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

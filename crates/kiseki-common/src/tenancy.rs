@@ -80,5 +80,7 @@ pub struct Quota {
 /// Key epoch version marker for rotation.
 ///
 /// Spec: `ubiquitous-language.md#KeyEpoch`, I-K6.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub struct KeyEpoch(pub u64);

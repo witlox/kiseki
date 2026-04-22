@@ -18,7 +18,7 @@ use crate::hkdf::derive_system_dek;
 use crate::keys::{SystemMasterKey, TenantKek};
 
 /// Complete envelope for an encrypted chunk or delta payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Envelope {
     /// Encrypted data (without tag — tag is separate for clarity).
     pub ciphertext: Vec<u8>,

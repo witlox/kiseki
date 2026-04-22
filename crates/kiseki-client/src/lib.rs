@@ -15,6 +15,9 @@ pub mod batching;
 pub mod cache;
 pub mod discovery;
 pub mod error;
+#[cfg(feature = "fuse")]
+#[allow(missing_docs, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub mod fuse_daemon;
 #[allow(missing_docs)]
 pub mod fuse_fs;
 pub mod prefetch;

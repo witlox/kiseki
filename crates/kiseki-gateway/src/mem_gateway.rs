@@ -259,11 +259,29 @@ impl GatewayOps for InMemoryGateway {
         }
 
         // Read and decrypt all chunks, concatenate.
+        // Checks inline store first (ADR-030), then block device.
         let mut plaintext = Vec::new();
         for chunk_id in &comp.chunks {
-            let env = chunks
-                .read_chunk(chunk_id)
-                .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            // Try inline store first (small files).
+            let inline_hit = if let Some(ref store) = self.small_store {
+                store
+                    .get(&chunk_id.0)
+                    .ok()
+                    .flatten()
+                    .and_then(|data| serde_json::from_slice::<envelope::Envelope>(&data).ok())
+            } else {
+                None
+            };
+
+            let env = if let Some(env) = inline_hit {
+                env
+            } else {
+                // Fall back to chunk store (block device).
+                chunks
+                    .read_chunk(chunk_id)
+                    .map_err(|e| GatewayError::Upstream(e.to_string()))?
+            };
+
             let decrypted = envelope::open_envelope(&self.aead, &self.master_key, &env)
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
             plaintext.extend_from_slice(&decrypted);
@@ -305,8 +323,20 @@ impl GatewayOps for InMemoryGateway {
 
         let bytes_written = req.data.len() as u64;
 
-        // Store the encrypted chunk (I-C2: refcount managed by write_chunk).
-        {
+        // Route: inline (ADR-030) or chunk store.
+        if bytes_written <= self.inline_threshold && self.small_store.is_some() {
+            // Inline path: serialize envelope and store in small/objects.redb.
+            // The delta payload will carry this data through Raft, and the
+            // state machine offloads it to the inline store on apply (I-SF5).
+            let env_bytes =
+                serde_json::to_vec(&env).map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            if let Some(ref store) = self.small_store {
+                store
+                    .put(&chunk_id.0, &env_bytes)
+                    .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            }
+        } else {
+            // Chunk path: store encrypted envelope on block device.
             let mut chunks = self
                 .chunks
                 .lock()
@@ -314,7 +344,6 @@ impl GatewayOps for InMemoryGateway {
             let is_new = chunks
                 .write_chunk(env, "default")
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
-            // If dedup hit (chunk existed), explicitly increment refcount.
             if !is_new {
                 let _ = chunks.increment_refcount(&chunk_id);
             }

@@ -12,12 +12,13 @@ workspace = true
 
 [features]
 default = []
-fuse = []
+fuse = ["fuser"]
 python = ["pyo3"]
 
 [dependencies]
 kiseki-common = { workspace = true }
 kiseki-gateway = { workspace = true }
+fuser = { version = "0.15", optional = true }
 pyo3 = { version = "0.23", optional = true }
 thiserror = { workspace = true }
 

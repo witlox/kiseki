@@ -10,7 +10,8 @@ use std::sync::Arc;
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_raft::{
-    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory, TcpNetworkFactory,
+    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, RedbRaftLogStore, StubNetworkFactory,
+    TcpNetworkFactory,
 };
 use openraft::Raft;
 
@@ -37,9 +38,12 @@ impl OpenRaftKeyStore {
     ///
     /// When `peers` is empty, runs single-node with stub network.
     /// When `peers` has entries, uses TCP transport for multi-node Raft.
-    pub async fn new(node_id: u64, peers: &BTreeMap<u64, String>) -> Result<Self, KeyManagerError> {
+    pub async fn new(
+        node_id: u64,
+        peers: &BTreeMap<u64, String>,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<Self, KeyManagerError> {
         let config = KisekiRaftConfig::default_config();
-        let log_store = MemLogStore::<C>::new();
         let state_inner = Arc::new(futures::lock::Mutex::new(StateMachineInner::new()));
         let state_machine = KeyStateMachine::new(Arc::clone(&state_inner));
 
@@ -55,21 +59,47 @@ impl OpenRaftKeyStore {
             m
         };
 
-        let raft = if peers.len() > 1 {
-            let network = TcpNetworkFactory::<C>::new();
-            Raft::new(node_id, config, network, log_store, state_machine)
-                .await
-                .map_err(|_e| KeyManagerError::Unavailable)?
+        // Select log store backend: persistent (redb) or in-memory.
+        let (raft, already_initialized) = if let Some(dir) = data_dir {
+            let raft_dir = dir.join("raft");
+            std::fs::create_dir_all(&raft_dir).ok();
+            let redb_path = raft_dir.join("keymanager.redb");
+            let log_store = RedbRaftLogStore::<C>::open(&redb_path)
+                .map_err(|_| KeyManagerError::Unavailable)?;
+            let has_state = log_store.has_state();
+            let raft = if peers.len() > 1 {
+                let network = TcpNetworkFactory::<C>::new();
+                Raft::new(node_id, config, network, log_store, state_machine)
+                    .await
+                    .map_err(|_e| KeyManagerError::Unavailable)?
+            } else {
+                let network = StubNetworkFactory::<C>::new();
+                Raft::new(node_id, config, network, log_store, state_machine)
+                    .await
+                    .map_err(|_e| KeyManagerError::Unavailable)?
+            };
+            (raft, has_state)
         } else {
-            let network = StubNetworkFactory::<C>::new();
-            Raft::new(node_id, config, network, log_store, state_machine)
-                .await
-                .map_err(|_e| KeyManagerError::Unavailable)?
+            let log_store = MemLogStore::<C>::new();
+            let raft = if peers.len() > 1 {
+                let network = TcpNetworkFactory::<C>::new();
+                Raft::new(node_id, config, network, log_store, state_machine)
+                    .await
+                    .map_err(|_e| KeyManagerError::Unavailable)?
+            } else {
+                let network = StubNetworkFactory::<C>::new();
+                Raft::new(node_id, config, network, log_store, state_machine)
+                    .await
+                    .map_err(|_e| KeyManagerError::Unavailable)?
+            };
+            (raft, false)
         };
 
-        raft.initialize(members)
-            .await
-            .map_err(|_| KeyManagerError::Unavailable)?;
+        if !already_initialized {
+            raft.initialize(members)
+                .await
+                .map_err(|_| KeyManagerError::Unavailable)?;
+        }
 
         // Bootstrap: create initial epoch via Raft consensus.
         let mut key_material = [0u8; 32];
