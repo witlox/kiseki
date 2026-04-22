@@ -11,6 +11,7 @@ use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 use crate::error::GatewayError;
 use crate::nfs::{NfsGateway, NfsReadRequest, NfsReadResponse, NfsWriteRequest, NfsWriteResponse};
 use crate::nfs_dir::DirectoryIndex;
+use crate::nfs_lock::LockManager;
 use crate::ops::GatewayOps;
 
 /// NFS file handle — 32-byte opaque identifier.
@@ -126,11 +127,12 @@ impl HandleRegistry {
     }
 }
 
-/// NFS operations context — wraps gateway + handle registry.
+/// NFS operations context — wraps gateway + handle registry + lock manager.
 pub struct NfsContext<G: GatewayOps> {
     pub gateway: NfsGateway<G>,
     pub handles: HandleRegistry,
     pub dir_index: DirectoryIndex,
+    pub locks: LockManager,
     pub tenant_id: OrgId,
     pub namespace_id: NamespaceId,
 }
@@ -146,6 +148,7 @@ impl<G: GatewayOps> NfsContext<G> {
             gateway,
             handles,
             dir_index: DirectoryIndex::new(),
+            locks: LockManager::default(),
             tenant_id,
             namespace_id,
         }

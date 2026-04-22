@@ -324,6 +324,39 @@ impl GatewayOps for InMemoryGateway {
             .collect())
     }
 
+    fn start_multipart(
+        &self,
+        namespace_id: kiseki_common::ids::NamespaceId,
+    ) -> Result<String, GatewayError> {
+        self.start_multipart(namespace_id)
+    }
+
+    fn upload_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<String, GatewayError> {
+        let chunk_id = self.upload_part(upload_id, part_number, data)?;
+        let mut hex = String::with_capacity(64);
+        for b in &chunk_id.0 {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+        Ok(hex)
+    }
+
+    fn complete_multipart(
+        &self,
+        upload_id: &str,
+    ) -> Result<kiseki_common::ids::CompositionId, GatewayError> {
+        self.complete_multipart(upload_id)
+    }
+
+    fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        self.abort_multipart(upload_id)
+    }
+
     fn delete(
         &self,
         tenant_id: kiseki_common::ids::OrgId,

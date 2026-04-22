@@ -13,12 +13,15 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, head, put};
+use axum::routing::{get, put};
 use axum::Router;
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 
 use crate::ops::GatewayOps;
-use crate::s3::{DeleteObjectRequest, GetObjectRequest, PutObjectRequest, S3Gateway};
+use crate::s3::{
+    AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CreateMultipartUploadRequest,
+    DeleteObjectRequest, GetObjectRequest, PutObjectRequest, UploadPartRequest, S3Gateway,
+};
 
 /// Shared state for S3 HTTP handlers.
 struct S3State<G: GatewayOps> {
@@ -36,19 +39,55 @@ pub fn s3_router<G: GatewayOps + Send + Sync + 'static>(
 
     Router::new()
         .route("/:bucket", get(list_objects::<G>))
-        .route("/:bucket/:key", put(put_object::<G>))
-        .route("/:bucket/:key", get(get_object::<G>))
-        .route("/:bucket/:key", head(head_object::<G>))
-        .route("/:bucket/:key", delete(delete_object::<G>))
+        .route(
+            "/:bucket/:key",
+            put(put_or_upload_part::<G>)
+                .get(get_object::<G>)
+                .head(head_object::<G>)
+                .delete(delete_or_abort::<G>)
+                .post(post_multipart::<G>),
+        )
         .with_state(state)
 }
 
-async fn put_object<G: GatewayOps + Send + Sync + 'static>(
+/// Query params for PUT — distinguishes `PutObject` from `UploadPart`.
+#[derive(serde::Deserialize, Default)]
+struct PutParams {
+    #[serde(rename = "uploadId")]
+    upload_id: Option<String>,
+    #[serde(rename = "partNumber")]
+    part_number: Option<u32>,
+}
+
+async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
     Path((bucket, _key)): Path<(String, String)>,
+    Query(params): Query<PutParams>,
     body: Bytes,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
+
+    // If uploadId + partNumber present, this is UploadPart.
+    if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
+        let req = UploadPartRequest {
+            tenant_id: state.tenant_id,
+            namespace_id: ns_id,
+            upload_id,
+            part_number,
+            body: body.to_vec(),
+        };
+        return match state.gateway.upload_part(&req) {
+            Ok(resp) => (
+                StatusCode::OK,
+                [("etag", format!("\"{}\"", resp.etag))],
+                String::new(),
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
+    // Regular PutObject.
     match state.gateway.put_object(PutObjectRequest {
         tenant_id: state.tenant_id,
         namespace_id: ns_id,
@@ -140,13 +179,81 @@ async fn head_object<G: GatewayOps + Send + Sync + 'static>(
     }
 }
 
-async fn delete_object<G: GatewayOps + Send + Sync + 'static>(
+/// Query params for POST — distinguishes `CreateMultipartUpload` from `CompleteMultipartUpload`.
+#[derive(serde::Deserialize, Default)]
+struct PostParams {
+    uploads: Option<String>,
+    #[serde(rename = "uploadId")]
+    upload_id: Option<String>,
+}
+
+async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((bucket, _key)): Path<(String, String)>,
+    Query(params): Query<PostParams>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
-    // S3 spec: DELETE is idempotent — always returns 204 even if object
-    // doesn't exist or key is invalid.
+
+    // POST ?uploads → CreateMultipartUpload
+    if params.uploads.is_some() {
+        let req = CreateMultipartUploadRequest {
+            tenant_id: state.tenant_id,
+            namespace_id: ns_id,
+        };
+        return match state.gateway.create_multipart_upload(&req) {
+            Ok(resp) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "uploadId": resp.upload_id })),
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
+    // POST ?uploadId=X → CompleteMultipartUpload
+    if let Some(upload_id) = params.upload_id {
+        let req = CompleteMultipartUploadRequest {
+            tenant_id: state.tenant_id,
+            namespace_id: ns_id,
+            upload_id,
+        };
+        return match state.gateway.complete_multipart_upload(&req) {
+            Ok(resp) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "etag": resp.etag })),
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
+    (StatusCode::BAD_REQUEST, "missing ?uploads or ?uploadId").into_response()
+}
+
+/// Query params for DELETE — distinguishes `DeleteObject` from `AbortMultipartUpload`.
+#[derive(serde::Deserialize, Default)]
+struct DeleteParams {
+    #[serde(rename = "uploadId")]
+    upload_id: Option<String>,
+}
+
+async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
+    State(state): State<Arc<S3State<G>>>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<DeleteParams>,
+) -> impl IntoResponse {
+    let ns_id = namespace_from_bucket(&bucket);
+
+    // DELETE ?uploadId=X → AbortMultipartUpload
+    if let Some(upload_id) = params.upload_id {
+        let req = AbortMultipartUploadRequest { upload_id };
+        return match state.gateway.abort_multipart_upload(&req) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
+    // Regular DeleteObject.
     let comp_id = match uuid::Uuid::parse_str(&key) {
         Ok(u) => CompositionId(u),
         Err(_) => return StatusCode::NO_CONTENT.into_response(),
@@ -160,7 +267,7 @@ async fn delete_object<G: GatewayOps + Send + Sync + 'static>(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             let code = if e.to_string().contains("not found") {
-                StatusCode::NO_CONTENT // S3: delete of non-existent is idempotent
+                StatusCode::NO_CONTENT
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };

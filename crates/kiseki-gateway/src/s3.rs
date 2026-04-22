@@ -192,3 +192,44 @@ pub struct CompleteMultipartUploadResponse {
 pub struct AbortMultipartUploadRequest {
     pub upload_id: String,
 }
+
+impl<G: GatewayOps> S3Gateway<G> {
+    /// S3 `CreateMultipartUpload`.
+    pub fn create_multipart_upload(
+        &self,
+        req: &CreateMultipartUploadRequest,
+    ) -> Result<CreateMultipartUploadResponse, GatewayError> {
+        let upload_id = self.inner.start_multipart(req.namespace_id)?;
+        Ok(CreateMultipartUploadResponse { upload_id })
+    }
+
+    /// S3 `UploadPart`.
+    pub fn upload_part(
+        &self,
+        req: &UploadPartRequest,
+    ) -> Result<UploadPartResponse, GatewayError> {
+        let etag = self
+            .inner
+            .upload_part(&req.upload_id, req.part_number, &req.body)?;
+        Ok(UploadPartResponse { etag })
+    }
+
+    /// S3 `CompleteMultipartUpload`.
+    pub fn complete_multipart_upload(
+        &self,
+        req: &CompleteMultipartUploadRequest,
+    ) -> Result<CompleteMultipartUploadResponse, GatewayError> {
+        let comp_id = self.inner.complete_multipart(&req.upload_id)?;
+        Ok(CompleteMultipartUploadResponse {
+            etag: comp_id.0.to_string(),
+        })
+    }
+
+    /// S3 `AbortMultipartUpload`.
+    pub fn abort_multipart_upload(
+        &self,
+        req: &AbortMultipartUploadRequest,
+    ) -> Result<(), GatewayError> {
+        self.inner.abort_multipart(&req.upload_id)
+    }
+}

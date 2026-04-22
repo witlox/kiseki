@@ -81,6 +81,43 @@ pub trait GatewayOps {
         let _ = (tenant_id, namespace_id, composition_id);
         Err(GatewayError::ProtocolError("delete not supported".into()))
     }
+
+    /// Start a multipart upload. Returns upload ID.
+    fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, GatewayError> {
+        let _ = namespace_id;
+        Err(GatewayError::OperationNotSupported(
+            "multipart not supported".into(),
+        ))
+    }
+
+    /// Upload a part of a multipart upload. Returns part `ETag`.
+    fn upload_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<String, GatewayError> {
+        let _ = (upload_id, part_number, data);
+        Err(GatewayError::OperationNotSupported(
+            "multipart not supported".into(),
+        ))
+    }
+
+    /// Complete a multipart upload. Returns composition ID.
+    fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+        let _ = upload_id;
+        Err(GatewayError::OperationNotSupported(
+            "multipart not supported".into(),
+        ))
+    }
+
+    /// Abort a multipart upload.
+    fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        let _ = upload_id;
+        Err(GatewayError::OperationNotSupported(
+            "multipart not supported".into(),
+        ))
+    }
 }
 
 /// Blanket impl: `Arc<G>` delegates to `G` via deref.
@@ -105,5 +142,22 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
         composition_id: CompositionId,
     ) -> Result<(), GatewayError> {
         (**self).delete(tenant_id, namespace_id, composition_id)
+    }
+    fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, GatewayError> {
+        (**self).start_multipart(namespace_id)
+    }
+    fn upload_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<String, GatewayError> {
+        (**self).upload_part(upload_id, part_number, data)
+    }
+    fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+        (**self).complete_multipart(upload_id)
+    }
+    fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        (**self).abort_multipart(upload_id)
     }
 }
