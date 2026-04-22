@@ -25,6 +25,9 @@ pub mod tenancy;
 pub mod time;
 pub mod versioning;
 
+// Inline store trait (ADR-030) — shared between kiseki-log and kiseki-chunk.
+pub mod inline_store;
+
 // Advisory surface lives here per ADR-021 §2 to preserve the no-cycle rule.
 pub mod advisory;
 

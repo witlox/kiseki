@@ -142,6 +142,10 @@ pub struct ShardSmInner {
     pub(crate) tenant_id: OrgId,
     last_applied_log: Option<LogIdOf<C>>,
     last_membership: StoredMembershipOf<C>,
+    /// Inline content store for small files (ADR-030, I-SF5).
+    /// When set, inline payloads are offloaded to this store on apply
+    /// and cleared from in-memory deltas.
+    pub(crate) inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
 }
 
 impl ShardSmInner {
@@ -156,7 +160,18 @@ impl ShardSmInner {
             tenant_id,
             last_applied_log: None,
             last_membership: StoredMembershipOf::<C>::default(),
+            inline_store: None,
         }
+    }
+
+    /// Set the inline store for small-file content offload.
+    #[allow(dead_code)]
+    pub(crate) fn with_inline_store(
+        mut self,
+        store: Arc<dyn kiseki_common::inline_store::InlineStore>,
+    ) -> Self {
+        self.inline_store = Some(store);
+        self
     }
 
     fn apply_command(&mut self, cmd: &LogCommand, log_index: u64) -> LogResponse {
@@ -191,6 +206,20 @@ impl ShardSmInner {
                     quality: kiseki_common::time::ClockQuality::Ntp,
                 };
 
+                // Offload inline content to the store if available (I-SF5).
+                let ciphertext = if *has_inline_data {
+                    if let Some(ref store) = self.inline_store {
+                        // Use hashed_key as the chunk ID for inline content.
+                        let _ = store.put(hashed_key, payload);
+                        // Clear payload from in-memory delta.
+                        Vec::new()
+                    } else {
+                        payload.clone()
+                    }
+                } else {
+                    payload.clone()
+                };
+
                 let delta = Delta {
                     header: DeltaHeader {
                         sequence: next_seq,
@@ -208,7 +237,7 @@ impl ShardSmInner {
                         has_inline_data: *has_inline_data,
                     },
                     payload: DeltaPayload {
-                        ciphertext: payload.clone(),
+                        ciphertext,
                         auth_tag: Vec::new(),
                         nonce: Vec::new(),
                         system_epoch: None,
@@ -247,15 +276,28 @@ impl ShardStateMachine {
 impl RaftSnapshotBuilder<C> for ShardStateMachine {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<C>, io::Error> {
         let inner = self.inner.lock().await;
+        // Build serializable deltas, reading inline content from store
+        // for deltas whose ciphertext was offloaded (I-SF5).
+        let deltas: Vec<SerializableDelta> = inner
+            .deltas
+            .iter()
+            .map(|d| {
+                let mut sd = SerializableDelta::from_delta(d);
+                if d.header.has_inline_data && sd.ciphertext.is_empty() {
+                    if let Some(ref store) = inner.inline_store {
+                        if let Ok(Some(data)) = store.get(&d.header.hashed_key) {
+                            sd.ciphertext = data;
+                        }
+                    }
+                }
+                sd
+            })
+            .collect();
         let snap = ShardSnapshot {
             delta_count: inner.delta_count,
             tip: inner.tip,
             maintenance: inner.maintenance,
-            deltas: inner
-                .deltas
-                .iter()
-                .map(SerializableDelta::from_delta)
-                .collect(),
+            deltas,
             watermarks: inner.watermarks.as_vec(),
             shard_id: Some(*inner.shard_id.0.as_bytes()),
             tenant_id: Some(*inner.tenant_id.0.as_bytes()),
@@ -331,10 +373,26 @@ impl RaftStateMachine<C> for ShardStateMachine {
         inner.delta_count = snap.delta_count;
         inner.tip = snap.tip;
         inner.maintenance = snap.maintenance;
+        // Restore deltas, offloading inline content to the store if available.
         inner.deltas = snap
             .deltas
             .iter()
-            .map(SerializableDelta::to_delta)
+            .map(|sd| {
+                let delta = sd.to_delta();
+                if delta.header.has_inline_data && !sd.ciphertext.is_empty() {
+                    if let Some(ref store) = inner.inline_store {
+                        let _ = store.put(&delta.header.hashed_key, &sd.ciphertext);
+                    }
+                }
+                // Clear ciphertext from in-memory delta if store is available.
+                if delta.header.has_inline_data && inner.inline_store.is_some() {
+                    let mut d = delta;
+                    d.payload.ciphertext = Vec::new();
+                    d
+                } else {
+                    delta
+                }
+            })
             .collect();
         let mut wm = ConsumerWatermarks::new();
         for (consumer, pos) in &snap.watermarks {

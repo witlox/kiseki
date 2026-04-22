@@ -141,6 +141,20 @@ impl SmallObjectStore {
     }
 }
 
+impl kiseki_common::inline_store::InlineStore for SmallObjectStore {
+    fn put(&self, key: &[u8; 32], data: &[u8]) -> io::Result<bool> {
+        self.put(&ChunkId(*key), data)
+    }
+
+    fn get(&self, key: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
+        self.get(&ChunkId(*key))
+    }
+
+    fn delete(&self, key: &[u8; 32]) -> io::Result<bool> {
+        self.delete(&ChunkId(*key))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

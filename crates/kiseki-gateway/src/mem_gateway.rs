@@ -39,6 +39,12 @@ pub struct InMemoryGateway {
             kiseki_common::ids::SequenceNumber,
         >,
     >,
+    /// Inline data threshold (ADR-030). Files with encrypted payload
+    /// at or below this size are stored inline in the delta payload
+    /// instead of as chunk extents. 0 = disable inline.
+    inline_threshold: u64,
+    /// Inline content store for small-file reads (ADR-030).
+    small_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
 }
 
 impl InMemoryGateway {
@@ -61,7 +67,24 @@ impl InMemoryGateway {
             tenant_hmac_key: None,
             view_store: None,
             last_written_seq: Mutex::new(std::collections::HashMap::new()),
+            inline_threshold: 0, // disabled by default; set via with_inline_threshold
+            small_store: None,
         }
+    }
+
+    /// Set the inline data threshold (ADR-030).
+    ///
+    /// Files with encrypted payload at or below this size are stored
+    /// inline in the delta payload. Set to 0 to disable.
+    #[must_use]
+    pub fn with_inline_threshold(
+        mut self,
+        threshold: u64,
+        store: Arc<dyn kiseki_common::inline_store::InlineStore>,
+    ) -> Self {
+        self.inline_threshold = threshold;
+        self.small_store = Some(store);
+        self
     }
 
     /// Register a namespace in the gateway's composition store.

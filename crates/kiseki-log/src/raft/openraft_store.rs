@@ -388,6 +388,14 @@ impl OpenRaftLogStore {
     pub async fn truncate_log(&self) -> Result<SequenceNumber, LogError> {
         let mut inner = self.state.lock().await;
         let gc_boundary = inner.watermarks.gc_boundary().unwrap_or(SequenceNumber(0));
+        // Delete inline store entries for GC'd inline deltas (I-SF6).
+        if let Some(ref store) = inner.inline_store {
+            for d in &inner.deltas {
+                if d.header.sequence < gc_boundary && d.header.has_inline_data {
+                    let _ = store.delete(&d.header.hashed_key);
+                }
+            }
+        }
         inner.deltas.retain(|d| d.header.sequence >= gc_boundary);
         Ok(gc_boundary)
     }
@@ -416,6 +424,17 @@ impl OpenRaftLogStore {
             .filter(|d| !(d.header.tombstone && d.header.sequence < gc_boundary))
             .cloned()
             .collect();
+
+        // Delete inline store entries for compacted inline deltas (I-SF6).
+        if let Some(ref store) = inner.inline_store {
+            let surviving_keys: std::collections::HashSet<[u8; 32]> =
+                surviving.iter().map(|d| d.header.hashed_key).collect();
+            for d in &inner.deltas {
+                if d.header.has_inline_data && !surviving_keys.contains(&d.header.hashed_key) {
+                    let _ = store.delete(&d.header.hashed_key);
+                }
+            }
+        }
 
         let after = surviving.len() as u64;
         inner.deltas = surviving;
