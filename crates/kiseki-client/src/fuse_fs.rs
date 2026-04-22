@@ -51,6 +51,13 @@ enum InodeEntry {
         composition_id: CompositionId,
         size: u64,
     },
+    Dir {
+        name: String,
+    },
+    Symlink {
+        name: String,
+        target: String,
+    },
 }
 
 /// FUSE filesystem backed by `GatewayOps`.
@@ -86,8 +93,8 @@ impl<G: GatewayOps> KisekiFuse<G> {
     pub fn getattr(&self, ino: Ino) -> Result<FileAttr, i32> {
         let entry = self.inodes.get(&ino).ok_or(libc_enoent())?;
         Ok(match entry {
-            InodeEntry::Root => FileAttr {
-                ino: 1,
+            InodeEntry::Root | InodeEntry::Dir { .. } => FileAttr {
+                ino,
                 size: 0,
                 kind: FileKind::Directory,
                 mode: 0o755,
@@ -98,6 +105,13 @@ impl<G: GatewayOps> KisekiFuse<G> {
                 size: *size,
                 kind: FileKind::Regular,
                 mode: 0o644,
+                nlink: 1,
+            },
+            InodeEntry::Symlink { target, .. } => FileAttr {
+                ino,
+                size: target.len() as u64,
+                kind: FileKind::Regular,
+                mode: 0o777,
                 nlink: 1,
             },
         })
@@ -177,16 +191,105 @@ impl<G: GatewayOps> KisekiFuse<G> {
         ];
 
         for (&ino, entry) in &self.inodes {
-            if let InodeEntry::File { name, .. } = entry {
-                entries.push(DirEntry {
-                    ino,
-                    name: name.clone(),
-                    kind: FileKind::Regular,
-                });
+            match entry {
+                InodeEntry::File { name, .. } | InodeEntry::Symlink { name, .. } => {
+                    entries.push(DirEntry {
+                        ino,
+                        name: name.clone(),
+                        kind: FileKind::Regular,
+                    });
+                }
+                InodeEntry::Dir { name } => {
+                    entries.push(DirEntry {
+                        ino,
+                        name: name.clone(),
+                        kind: FileKind::Directory,
+                    });
+                }
+                InodeEntry::Root => {}
             }
         }
 
         entries
+    }
+
+    /// Create a directory.
+    pub fn mkdir(&mut self, name: &str) -> Result<Ino, i32> {
+        if self.name_to_ino.contains_key(name) {
+            return Err(17); // EEXIST
+        }
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        self.inodes.insert(ino, InodeEntry::Dir { name: name.to_owned() });
+        self.name_to_ino.insert(name.to_owned(), ino);
+        Ok(ino)
+    }
+
+    /// Remove a directory.
+    pub fn rmdir(&mut self, name: &str) -> Result<(), i32> {
+        let ino = self.name_to_ino.get(name).ok_or(libc_enoent())?;
+        if !matches!(self.inodes.get(ino), Some(InodeEntry::Dir { .. })) {
+            return Err(20); // ENOTDIR
+        }
+        let ino = self.name_to_ino.remove(name).unwrap();
+        self.inodes.remove(&ino);
+        Ok(())
+    }
+
+    /// Rename a file or directory.
+    pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), i32> {
+        let ino = self.name_to_ino.remove(old_name).ok_or(libc_enoent())?;
+        // Update the name in the inode entry.
+        if let Some(entry) = self.inodes.get_mut(&ino) {
+            match entry {
+                InodeEntry::File { name, .. }
+                | InodeEntry::Dir { name }
+                | InodeEntry::Symlink { name, .. } => {
+                    new_name.clone_into(name);
+                }
+                InodeEntry::Root => return Err(libc_eio()),
+            }
+        }
+        // Remove any existing entry at new_name (overwrite semantics).
+        if let Some(old_ino) = self.name_to_ino.remove(new_name) {
+            self.inodes.remove(&old_ino);
+        }
+        self.name_to_ino.insert(new_name.to_owned(), ino);
+        Ok(())
+    }
+
+    /// Set file attributes (mode only for now).
+    pub fn setattr(&mut self, ino: Ino, _mode: Option<u32>) -> Result<FileAttr, i32> {
+        // Attributes are computed, not stored (in-memory FS).
+        // Return current attributes unchanged.
+        self.getattr(ino)
+    }
+
+    /// Create a symbolic link.
+    pub fn symlink(&mut self, name: &str, target: &str) -> Result<Ino, i32> {
+        if self.name_to_ino.contains_key(name) {
+            return Err(17); // EEXIST
+        }
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        self.inodes.insert(
+            ino,
+            InodeEntry::Symlink {
+                name: name.to_owned(),
+                target: target.to_owned(),
+            },
+        );
+        self.name_to_ino.insert(name.to_owned(), ino);
+        Ok(ino)
+    }
+
+    /// Read a symbolic link target.
+    pub fn readlink(&self, ino: Ino) -> Result<String, i32> {
+        let entry = self.inodes.get(&ino).ok_or(libc_enoent())?;
+        match entry {
+            InodeEntry::Symlink { target, .. } => Ok(target.clone()),
+            _ => Err(22), // EINVAL
+        }
     }
 }
 

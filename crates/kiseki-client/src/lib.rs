@@ -24,5 +24,5 @@ pub mod transport_select;
 pub mod python;
 
 pub use cache::ClientCache;
-pub use discovery::{DiscoveryResponse, SeedEndpoint};
+pub use discovery::{DiscoveryClient, DiscoveryResponse, SeedEndpoint};
 pub use error::ClientError;
