@@ -151,12 +151,15 @@ def stop_server(info: ServerInfo) -> None:
 def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo:
     """Start a multi-node cluster via docker compose."""
     root = _workspace_root()
-    subprocess.run(
+    result = subprocess.run(
         ["docker", "compose", "-f", compose_file, "up", "--build", "-d"],
         cwd=root,
-        check=True,
         capture_output=True,
+        text=True,
     )
+    if result.returncode != 0:
+        print(f"docker compose build failed:\nstdout: {result.stdout[-2000:]}\nstderr: {result.stderr[-2000:]}")
+        result.check_returncode()
 
     # Node port mappings: node1=9100, node2=9110, node3=9120.
     nodes = [
