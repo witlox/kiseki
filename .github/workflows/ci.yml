@@ -127,13 +127,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
       - uses: Swatinem/rust-cache@v2
-      - name: Run BDD acceptance tests (456+ scenarios, 0 failures required)
+      - name: Run BDD acceptance tests (554+ scenarios, 0 failures required)
         run: |
           output=$(cargo test -p kiseki-acceptance --locked 2>&1)
           echo "$output" | tail -10
-          if echo "$output" | grep -qE "[0-9]+ failed"; then
+          if echo "$output" | grep -qE "[1-9][0-9]* failed"; then
             echo "::error::BDD scenarios failed"
-            echo "$output" | grep -E "failed"
+            echo "$output" | grep -E "[1-9][0-9]* failed"
             exit 1
           fi
 
