@@ -207,10 +207,19 @@ impl ShardSmInner {
                 };
 
                 // Offload inline content to the store if available (I-SF5).
+                // Key = sha256(hashed_key || sequence) to ensure uniqueness
+                // per delta (multiple deltas can share the same hashed_key).
+                let inline_key = {
+                    let mut k = *hashed_key;
+                    let seq_bytes = self.tip.to_le_bytes();
+                    for (i, &b) in seq_bytes.iter().enumerate() {
+                        k[24 + i] ^= b; // mix sequence into last 8 bytes
+                    }
+                    k
+                };
                 let ciphertext = if *has_inline_data {
                     if let Some(ref store) = self.inline_store {
-                        // Use hashed_key as the chunk ID for inline content.
-                        let _ = store.put(hashed_key, payload);
+                        let _ = store.put(&inline_key, payload);
                         // Clear payload from in-memory delta.
                         Vec::new()
                     } else {
@@ -285,7 +294,12 @@ impl RaftSnapshotBuilder<C> for ShardStateMachine {
                 let mut sd = SerializableDelta::from_delta(d);
                 if d.header.has_inline_data && sd.ciphertext.is_empty() {
                     if let Some(ref store) = inner.inline_store {
-                        if let Ok(Some(data)) = store.get(&d.header.hashed_key) {
+                        let mut inline_key = d.header.hashed_key;
+                        let seq_bytes = d.header.sequence.0.to_le_bytes();
+                        for (i, &b) in seq_bytes.iter().enumerate() {
+                            inline_key[24 + i] ^= b;
+                        }
+                        if let Ok(Some(data)) = store.get(&inline_key) {
                             sd.ciphertext = data;
                         }
                     }

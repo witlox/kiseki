@@ -360,9 +360,16 @@ impl OpenRaftLogStore {
             .filter(|d| d.header.sequence >= req.from && d.header.sequence <= req.to)
             .map(|d| {
                 // Reconstruct inline payload from store if needed.
+                // Key = hashed_key with sequence mixed into last 8 bytes
+                // (must match the key used in apply_command).
                 if d.header.has_inline_data && d.payload.ciphertext.is_empty() {
                     if let Some(ref store) = inner.inline_store {
-                        if let Ok(Some(data)) = store.get(&d.header.hashed_key) {
+                        let mut inline_key = d.header.hashed_key;
+                        let seq_bytes = d.header.sequence.0.to_le_bytes();
+                        for (i, &b) in seq_bytes.iter().enumerate() {
+                            inline_key[24 + i] ^= b;
+                        }
+                        if let Ok(Some(data)) = store.get(&inline_key) {
                             let mut reconstructed = d.clone();
                             reconstructed.payload.ciphertext = data;
                             return reconstructed;
@@ -503,7 +510,12 @@ impl OpenRaftLogStore {
         if let Some(ref store) = inner.inline_store {
             for d in &inner.deltas {
                 if d.header.sequence < gc_boundary && d.header.has_inline_data {
-                    let _ = store.delete(&d.header.hashed_key);
+                    let mut inline_key = d.header.hashed_key;
+                    let seq_bytes = d.header.sequence.0.to_le_bytes();
+                    for (i, &b) in seq_bytes.iter().enumerate() {
+                        inline_key[24 + i] ^= b;
+                    }
+                    let _ = store.delete(&inline_key);
                 }
             }
         }
@@ -538,11 +550,16 @@ impl OpenRaftLogStore {
 
         // Delete inline store entries for compacted inline deltas (I-SF6).
         if let Some(ref store) = inner.inline_store {
-            let surviving_keys: std::collections::HashSet<[u8; 32]> =
-                surviving.iter().map(|d| d.header.hashed_key).collect();
+            let surviving_seqs: std::collections::HashSet<u64> =
+                surviving.iter().map(|d| d.header.sequence.0).collect();
             for d in &inner.deltas {
-                if d.header.has_inline_data && !surviving_keys.contains(&d.header.hashed_key) {
-                    let _ = store.delete(&d.header.hashed_key);
+                if d.header.has_inline_data && !surviving_seqs.contains(&d.header.sequence.0) {
+                    let mut inline_key = d.header.hashed_key;
+                    let seq_bytes = d.header.sequence.0.to_le_bytes();
+                    for (i, &b) in seq_bytes.iter().enumerate() {
+                        inline_key[24 + i] ^= b;
+                    }
+                    let _ = store.delete(&inline_key);
                 }
             }
         }
