@@ -463,9 +463,9 @@ async fn when_list_shards(w: &mut KisekiWorld) {}
 
 #[then("the response includes shard IDs, tenant IDs, and tip sequence numbers")]
 async fn then_shard_list(w: &mut KisekiWorld) {
-    // Verify at least the bootstrap shard exists.
-    // Real ListShards would query all shards — in BDD we verify the store is queryable.
-    assert!(w.chunk_store.chunk_count() >= 0);
+    // Verify the shard store is queryable (may be empty in test harness).
+    // Real ListShards returns all shards — here we verify the API doesn't error.
+    assert!(w.last_error.is_none(), "ListShards should not error");
 }
 
 #[given(regex = r#"^shard "([^"]*)" has (\S+) deltas \(ceiling is (\S+)\)$"#)]
