@@ -48,6 +48,12 @@ highlight = "all"
 # Never pull in `ring` in production — FIPS crypto must come from aws-lc-rs.
 # (Allowed transitively in tests/dev for now; promoted to deny when kiseki-crypto lands.)
 deny = []
+# Allow thiserror v1/v2 duplicate — redb 2.x uses thiserror v1, we use v2.
+# Will resolve when redb upgrades to thiserror v2.
+skip = [
+    { crate = "thiserror@1", reason = "redb transitive dependency" },
+    { crate = "thiserror-impl@1", reason = "redb transitive dependency" },
+]
 
 [sources]
 unknown-registry = "deny"
