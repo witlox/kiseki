@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Weekly Monday 06:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  preflight:
+    name: Preflight checks
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+      - name: Compute version
+        id: version
+        run: |
+          chmod +x scripts/set-version.sh
+          scripts/set-version.sh
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --exclude kiseki-acceptance --locked
+      - name: Run BDD acceptance tests (no failures allowed)
+        run: |
+          output=$(cargo test -p kiseki-acceptance --locked 2>&1)
+          echo "$output" | tail -10
+          if echo "$output" | grep -qE "[0-9]+ failed"; then
+            echo "::error::BDD scenarios failed"
+            exit 1
+          fi
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # ---------------------------------------------------------------------------
+  # Server binary: x86_64 + aarch64 on Rocky 9 (glibc 2.34, RHEL 9 baseline)
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: rockylinux:9
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
+            perl-IPC-Cmd git curl unzip tar gzip make findutils
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+
+      - name: Set version
+        run: |
+          chmod +x scripts/set-version.sh
+          scripts/set-version.sh
+
+      - name: Build kiseki-server
+        run: cargo build --release --bin kiseki-server --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/kiseki-server dist/
+          cd dist
+          tar czf "../kiseki-server-${{ matrix.arch }}.tar.gz" *
+          cd ..
+          sha256sum "kiseki-server-${{ matrix.arch }}.tar.gz" > "kiseki-server-${{ matrix.arch }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kiseki-server-${{ matrix.arch }}
+          path: |
+            kiseki-server-${{ matrix.arch }}.tar.gz
+            kiseki-server-${{ matrix.arch }}.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
+  # Publish: collect all artifacts into a GitHub release
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish release
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.preflight.outputs.version }}
+          name: kiseki v${{ needs.preflight.outputs.version }}
+          generate_release_notes: true
+          body: |
+            Built on Rocky Linux 9 (glibc 2.34, kernel 5.14) — compatible with
+            RHEL 9+, Rocky 9+, AlmaLinux 9+, Ubuntu 22.04+, Debian 12+, SLES 15 SP4+.
+
+            ## Server binary
+
+            | Archive | Arch | Contents |
+            |---------|------|----------|
+            | `kiseki-server-x86_64` | x86_64 | kiseki-server (NFS3/4, S3, gRPC, advisory) |
+            | `kiseki-server-aarch64` | aarch64 | kiseki-server (NFS3/4, S3, gRPC, advisory) |
+
+            All binaries include FIPS-validated AES-256-GCM encryption (aws-lc-rs).
+          files: |
+            kiseki-server-*/kiseki-server-*.tar.gz
+            kiseki-server-*/kiseki-server-*.tar.gz.sha256

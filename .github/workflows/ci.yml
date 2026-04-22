@@ -3,79 +3,187 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "specs/**"
+      - "*.md"
+      - "infra/**"
   pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "specs/**"
+      - "*.md"
+      - "infra/**"
 
-# Cancel in-progress runs on the same ref when a new push arrives.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
-  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-Dwarnings"
+
+# Stage 1: fast gates (fmt, clippy, deny) — parallel
+# Stage 2: feature flag compilation matrix — after stage 1
+# Stage 3: test suites (unit, BDD, e2e, proto, arch) — parallel, after stage 2
+# Stage 4: coverage — after stage 3
 
 jobs:
-  # -------------------------------------------------------------------
-  # Rust: fmt, clippy, test, cargo-deny
-  # -------------------------------------------------------------------
-  rust:
-    name: Rust (${{ matrix.toolchain }})
-    runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        toolchain: [stable]
-      fail-fast: false
+  # ---------------------------------------------------------------------------
+  # Stage 1 — fast checks, gate everything
+  # ---------------------------------------------------------------------------
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.toolchain }}
-          components: rustfmt, clippy
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: rustfmt
-        run: cargo fmt --all -- --check
-
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: test
-        run: cargo test --workspace --all-targets
-
-  rust-deny:
-    name: Rust cargo-deny
-    runs-on: ubuntu-24.04
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: --all-features
 
-  # Go control plane removed per ADR-027 (single-language Rust).
-  # Control plane is now crates/kiseki-control/.
+  # ---------------------------------------------------------------------------
+  # Stage 2 — feature flag compilation (needs stage 1)
+  # ---------------------------------------------------------------------------
 
-  # -------------------------------------------------------------------
-  # Docs / specs sanity: fail if any .proto file is not referenced from
-  # the kiseki-proto build script (prevents silent drift between the
-  # canonical proto tree and what Rust compiles).
-  # -------------------------------------------------------------------
-  spec-proto-coverage:
-    name: Proto coverage (specs ↔ build.rs)
-    runs-on: ubuntu-24.04
+  feature-check:
+    name: Feature Check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, deny]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: crypto-fips
+            cmd: cargo check -p kiseki-crypto --features fips --locked
+          - name: crypto-compression
+            cmd: cargo check -p kiseki-crypto --features compression --locked
+          - name: gateway-nfs-only
+            cmd: cargo check -p kiseki-gateway --no-default-features --features nfs --locked
+          - name: gateway-s3-only
+            cmd: cargo check -p kiseki-gateway --no-default-features --features s3 --locked
+          - name: gateway-all
+            cmd: cargo check -p kiseki-gateway --all-features --locked
+          - name: client-fuse
+            cmd: cargo check -p kiseki-client --features fuse --locked
+          - name: server-default
+            cmd: cargo check -p kiseki-server --locked
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.name }}
+      - run: ${{ matrix.cmd }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 3 — test suites (needs stage 2, all parallel)
+  # ---------------------------------------------------------------------------
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: [feature-check]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --exclude kiseki-acceptance --locked
+
+  acceptance:
+    name: BDD Acceptance
+    runs-on: ubuntu-latest
+    needs: [feature-check]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+      - name: Run BDD acceptance tests (456+ scenarios, 0 failures required)
+        run: |
+          output=$(cargo test -p kiseki-acceptance --locked 2>&1)
+          echo "$output" | tail -10
+          if echo "$output" | grep -qE "[0-9]+ failed"; then
+            echo "::error::BDD scenarios failed"
+            echo "$output" | grep -E "failed"
+            exit 1
+          fi
+
+  e2e:
+    name: E2E Integration
+    runs-on: ubuntu-latest
+    needs: [feature-check]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build kiseki-server
+        run: cargo build --bin kiseki-server --locked
+
+      - name: Build Docker image
+        run: docker compose build
+
+      - name: Start server
+        run: docker compose up -d
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose exec -T kiseki-server timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null; then
+              echo "Server healthy after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install Python deps
+        run: pip install --quiet -r tests/e2e/pyproject.toml 2>/dev/null || pip install grpcio grpcio-tools protobuf pytest tenacity pydantic structlog
+
+      - name: Run e2e tests
+        working-directory: tests/e2e
+        run: pytest -ra --tb=short
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
+
+  proto-coverage:
+    name: Proto Coverage
+    runs-on: ubuntu-latest
+    needs: [feature-check]
+    steps:
+      - uses: actions/checkout@v6
       - name: Check every .proto is in build.rs
         run: |
           set -euo pipefail
@@ -88,3 +196,42 @@ jobs:
             fi
           done
           exit $miss
+
+  arch-check:
+    name: Architecture Check
+    runs-on: ubuntu-latest
+    needs: [feature-check]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify kiseki-control dependency boundary (ADR-027)
+        run: |
+          set -euo pipefail
+          deps=$(grep '^kiseki-' crates/kiseki-control/Cargo.toml | grep -v 'kiseki-common\|kiseki-proto' | grep -v '^#' || true)
+          if [ -n "$deps" ]; then
+            echo "::error::kiseki-control has forbidden dependencies: $deps"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage 4 — coverage (needs stage 3)
+  # ---------------------------------------------------------------------------
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: [test, acceptance]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: >
+          cargo llvm-cov --workspace
+          --exclude kiseki-acceptance
+          --locked
+          --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
