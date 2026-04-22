@@ -4,6 +4,7 @@ members = [
     "crates/kiseki-acceptance",
     "crates/kiseki-advisory",
     "crates/kiseki-audit",
+    "crates/kiseki-block",
     "crates/kiseki-chunk",
     "crates/kiseki-client",
     "crates/kiseki-common",
@@ -51,6 +52,7 @@ unimplemented = "deny"
 
 [workspace.dependencies]
 # --- Internal crates ---
+kiseki-block = { path = "crates/kiseki-block", version = "2026.1.0" }
 kiseki-common = { path = "crates/kiseki-common", version = "2026.1.0" }
 kiseki-crypto = { path = "crates/kiseki-crypto", version = "2026.1.0" }
 kiseki-proto = { path = "crates/kiseki-proto", version = "2026.1.0" }

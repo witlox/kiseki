@@ -1,0 +1,21 @@
+[package]
+name = "kiseki-block"
+description = "Raw block device I/O for Kiseki: DeviceBackend trait, bitmap allocator, extent management (ADR-029)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kiseki-common = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1388,6 +1388,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-block"
+version = "2026.1.0"
+dependencies = [
+ "kiseki-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "kiseki-chunk"
 version = "2026.1.0"
 dependencies = [
