@@ -80,7 +80,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
   Scenario: Allocation is block-aligned
     Given a device with physical_block_size 4096
     When 513 bytes is allocated
-    Then the extent length is 4096 (rounded up to one block)
+    Then the extent length is one physical block (4096 bytes)
 
   Scenario: Allocation fails when device is full
     Given a device with 99% of blocks allocated
@@ -215,6 +215,33 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
   Scenario: Device reports accurate capacity
     Given an initialized 1TB device with 100GB allocated
     When capacity is queried
-    Then used_bytes is approximately 100GB
-    And total_bytes is approximately 1TB
+    Then used_bytes is 100GB minus superblock and bitmap overhead
+    And total_bytes is 1TB
     And the values account for superblock and bitmap overhead
+
+  # === Additional crash recovery and validation scenarios ===
+
+  Scenario: WAL intent entry detected on restart — extent freed if no chunk_meta
+    Given an extent was allocated with a WAL intent entry
+    But no chunk_meta was committed for that extent
+    When the device is reopened
+    Then the WAL intent entry is detected during startup scrub
+    And the extent is freed (bitmap cleared)
+    And the WAL intent entry is removed
+
+  Scenario: Superblock checksum verified on every open
+    Given an initialized device
+    When the device is opened
+    Then the superblock checksum is verified against its contents
+    And any mismatch prevents the device from being used
+
+  Scenario: Free-list rebuilt from bitmap on restart
+    Given a device with 50 extents allocated
+    When the device is reopened
+    Then the free-list is rebuilt from the bitmap
+    And allocations work correctly after rebuild
+
+  Scenario: Unknown superblock version rejected
+    Given a device with superblock version 99
+    When the device is opened
+    Then the open fails with "unsupported version" error

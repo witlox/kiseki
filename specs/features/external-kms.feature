@@ -61,7 +61,7 @@ Feature: External Tenant KMS Providers (ADR-028)
       | slot_id      | 0                               |
       | key_name     | kiseki-bank-kek                 |
     Then the PKCS#11 library is loaded via FFI
-    And the HSM key is located with CKA_LABEL "kiseki-bank-kek"
+    And the HSM key handle is resolved via C_FindObjects with label "kiseki-bank-kek"
     And a test wrap/unwrap round-trip succeeds via C_WrapKey/C_UnwrapKey
     And key material never leaves the HSM
 
@@ -356,3 +356,23 @@ Feature: External Tenant KMS Providers (ADR-028)
       | reason  | Operator with access to both Raft groups has full access |
       | recommendation | Compliance-sensitive tenants should use external provider |
     And this trade-off is recorded in the tenant's configuration metadata
+
+  # === Additional security and operational edge cases ===
+
+  Scenario: Cloud KMS never caches KEK material
+    Given tenant "org-cloud" with AWS KMS provider
+    Then no KEK material exists in process memory
+    And only unwrapped derivation parameters are cached
+    And cached parameters are Zeroizing (cleared on eviction)
+
+  Scenario: KMS credential rotation does not leak old secrets
+    Given tenant "org-pharma" with Vault AppRole auth
+    When the secret_id is rotated to a new value
+    Then the old secret_id is zeroized from memory
+    And the old secret_id does not appear in logs
+
+  Scenario: Provider migration can be cancelled mid-operation
+    Given migration from Internal to Vault at 50%
+    When the operator cancels the migration
+    Then re-wrapped envelopes revert to Internal provider
+    And no data is lost

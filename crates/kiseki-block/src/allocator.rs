@@ -34,6 +34,7 @@ impl BitmapAllocator {
     /// The bitmap is initialized to all-free (zeros).
     #[must_use]
     pub fn new(total_blocks: u64, block_size: u32) -> Self {
+        assert!(block_size > 0, "block_size must be positive");
         #[allow(clippy::cast_possible_truncation)]
         // bitmap index always fits in usize for practical device sizes
         let bitmap_bytes = total_blocks.div_ceil(8) as usize;
@@ -54,6 +55,7 @@ impl BitmapAllocator {
     /// Create an allocator from an existing bitmap (loaded from device).
     #[must_use]
     pub fn from_bitmap(bitmap: Vec<u8>, total_blocks: u64, block_size: u32) -> Self {
+        assert!(block_size > 0, "block_size must be positive");
         let max_extent_blocks = MAX_EXTENT_BYTES / u64::from(block_size);
         let mut alloc = Self {
             total_blocks,
@@ -166,6 +168,11 @@ impl BitmapAllocator {
     // --- Internal ---
 
     fn set_bit(&mut self, block: u64, allocated: bool) {
+        debug_assert!(
+            block < self.total_blocks,
+            "bitmap OOB: block={block}, total={}",
+            self.total_blocks
+        );
         let byte_idx = (block / 8) as usize;
         let bit_idx = (block % 8) as u8;
         if byte_idx < self.bitmap.len() {
@@ -178,6 +185,11 @@ impl BitmapAllocator {
     }
 
     fn get_bit(&self, block: u64) -> bool {
+        debug_assert!(
+            block < self.total_blocks,
+            "bitmap OOB: block={block}, total={}",
+            self.total_blocks
+        );
         let byte_idx = (block / 8) as usize;
         let bit_idx = (block % 8) as u8;
         if byte_idx < self.bitmap.len() {

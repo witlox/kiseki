@@ -95,6 +95,9 @@ impl FileBackedDevice {
 
     /// Open an existing file-backed device.
     pub fn open(path: &Path) -> Result<Self, BlockError> {
+        if !path.exists() {
+            return Err(BlockError::NotInitialized);
+        }
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
         // Read superblock.
@@ -104,12 +107,25 @@ impl FileBackedDevice {
         let sb = Superblock::from_bytes(&sb_buf)?;
 
         // Read primary bitmap.
+        let bitmap_size_u64 = sb.total_blocks.div_ceil(8);
+        assert!(
+            usize::try_from(bitmap_size_u64).is_ok(),
+            "bitmap too large for this platform"
+        );
         #[allow(clippy::cast_possible_truncation)]
-        // bitmap index fits in usize for practical device sizes
-        let bitmap_size = sb.total_blocks.div_ceil(8) as usize;
+        // guarded by assert above
+        let bitmap_size = bitmap_size_u64 as usize;
         let mut bitmap = vec![0u8; bitmap_size];
         file.seek(SeekFrom::Start(sb.bitmap_offset))?;
         file.read_exact(&mut bitmap)?;
+
+        // Read mirror bitmap and compare with primary.
+        let mut mirror = vec![0u8; bitmap_size];
+        file.seek(SeekFrom::Start(sb.bitmap_mirror_offset))?;
+        file.read_exact(&mut mirror)?;
+        if bitmap != mirror {
+            eprintln!("warning: bitmap primary/mirror mismatch detected, using primary");
+        }
 
         let allocator = BitmapAllocator::from_bitmap(bitmap, sb.total_blocks, sb.block_size);
         let chars = DeviceCharacteristics::file_backed_defaults();
@@ -159,9 +175,15 @@ impl DeviceBackend for FileBackedDevice {
     }
 
     fn write(&self, extent: &Extent, data: &[u8]) -> Result<(), BlockError> {
+        if data.len() > u32::MAX as usize {
+            return Err(BlockError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "data exceeds 4GB",
+            )));
+        }
         let crc = crc32c(data);
         let abs_offset = self.superblock.data_offset + extent.offset;
-        #[allow(clippy::cast_possible_truncation)] // extent data always < 16MB (max extent size)
+        #[allow(clippy::cast_possible_truncation)] // guarded by check above
         let data_len = data.len() as u32;
 
         let mut file = self
@@ -172,6 +194,9 @@ impl DeviceBackend for FileBackedDevice {
         file.seek(SeekFrom::Start(abs_offset))?;
         file.write_all(&data_len.to_le_bytes())?; // 4-byte length header
         file.write_all(data)?; // payload
+                               // Note: partial CRC32 on crash is handled by WAL intent journal
+                               // (ADR-029 F-I6). If chunk_meta is not committed, the orphan extent
+                               // is freed by scrub.
         file.write_all(&crc.to_le_bytes())?; // 4-byte CRC32 trailer
 
         Ok(())

@@ -19,6 +19,9 @@ use crate::error::ChunkError;
 use crate::pool::AffinityPool;
 use crate::store::ChunkOps;
 
+/// Compile-time assertion: `ChunkId` must be exactly 32 bytes.
+const _: () = assert!(std::mem::size_of::<ChunkId>() == 32);
+
 /// Metadata for a persisted chunk.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct PersistedChunkMeta {
@@ -27,6 +30,10 @@ struct PersistedChunkMeta {
     retention_holds: Vec<String>,
     pool_name: String,
     stored_bytes: u64,
+    /// Actual data length in bytes (distinct from extent-aligned `stored_bytes`).
+    /// Used for accurate capacity accounting in pool usage.
+    #[serde(default)]
+    data_bytes: u64,
     /// Device extent where ciphertext + envelope is stored.
     extent_offset: u64,
     extent_length: u64,
@@ -89,7 +96,8 @@ impl PersistentChunkStore {
         let chunks = if meta_path.exists() {
             let data =
                 std::fs::read_to_string(meta_path).map_err(|e| ChunkError::Io(e.to_string()))?;
-            let metas: Vec<PersistedChunkMeta> = serde_json::from_str(&data).unwrap_or_default();
+            let metas: Vec<PersistedChunkMeta> = serde_json::from_str(&data)
+                .map_err(|e| ChunkError::Io(format!("metadata parse error: {e}")))?;
             let mut map = HashMap::new();
             for meta in metas {
                 let chunk_id = ChunkId(meta.chunk_id);
@@ -123,15 +131,17 @@ impl PersistentChunkStore {
             .insert(pool.name.clone(), pool);
     }
 
-    /// Save metadata to JSON file.
+    /// Save metadata to JSON file (atomic: write tmp then rename).
     fn save_meta(&self) -> Result<(), ChunkError> {
-        let chunks = self
-            .chunks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let chunks = self.chunks.lock().unwrap_or_else(|e| {
+            eprintln!("warning: mutex poisoned, recovering");
+            e.into_inner()
+        });
         let metas: Vec<&PersistedChunkMeta> = chunks.values().map(|e| &e.envelope_meta).collect();
         let json = serde_json::to_string(&metas).map_err(|e| ChunkError::Io(e.to_string()))?;
-        std::fs::write(&self.meta_path, json).map_err(|e| ChunkError::Io(e.to_string()))?;
+        let tmp_path = self.meta_path.with_extension("tmp");
+        std::fs::write(&tmp_path, json).map_err(|e| ChunkError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, &self.meta_path).map_err(|e| ChunkError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -162,28 +172,37 @@ impl ChunkOps for PersistentChunkStore {
     fn write_chunk(&mut self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
         let chunk_id = envelope.chunk_id;
 
+        // Hold the chunks lock for the entire operation to prevent a race
+        // where two concurrent writes for the same chunk_id both pass the
+        // dedup check. The I/O is the bottleneck, not the lock.
+        let mut chunks = self
+            .chunks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         // Dedup: if chunk already exists, just bump refcount.
-        {
-            let mut chunks = self
-                .chunks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(entry) = chunks.get_mut(&chunk_id) {
-                entry.envelope_meta.refcount += 1;
-                drop(chunks);
-                self.save_meta()?;
-                return Ok(false);
-            }
+        if let Some(entry) = chunks.get_mut(&chunk_id) {
+            entry.envelope_meta.refcount = entry
+                .envelope_meta
+                .refcount
+                .checked_add(1)
+                .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
+            drop(chunks);
+            self.save_meta()?;
+            return Ok(false);
         }
 
         // Allocate extent on device.
         let data = &envelope.ciphertext;
+        let data_bytes = data.len() as u64;
         let extent = self
             .device
             .alloc(data.len() as u64)
             .map_err(|e| ChunkError::Io(e.to_string()))?;
 
         // Write ciphertext to device (includes CRC32).
+        // If crash occurs between device write and metadata persist, the orphan
+        // extent is detected and freed by periodic scrub (ADR-029 F-I6).
         self.device
             .write(&extent, data)
             .map_err(|e| ChunkError::Io(e.to_string()))?;
@@ -195,6 +214,7 @@ impl ChunkOps for PersistentChunkStore {
             retention_holds: Vec::new(),
             pool_name: pool.to_owned(),
             stored_bytes: extent.length,
+            data_bytes,
             extent_offset: extent.offset,
             extent_length: extent.length,
             nonce: envelope.nonce,
@@ -204,31 +224,27 @@ impl ChunkOps for PersistentChunkStore {
             tenant_wrapped_material: envelope.tenant_wrapped_material.clone(),
         };
 
-        // Update pool usage.
+        // Update pool usage (use data_bytes for accurate capacity accounting).
         {
             let mut pools = self
                 .pools
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(p) = pools.get_mut(pool) {
-                p.used_bytes += extent.length;
+                p.used_bytes += data_bytes;
             }
         }
 
         // Insert into in-memory index.
-        {
-            let mut chunks = self
-                .chunks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            chunks.insert(
-                chunk_id,
-                ChunkEntry {
-                    envelope_meta: meta,
-                    extent,
-                },
-            );
-        }
+        chunks.insert(
+            chunk_id,
+            ChunkEntry {
+                envelope_meta: meta,
+                extent,
+            },
+        );
+
+        drop(chunks);
 
         // Persist metadata + sync device.
         self.save_meta()?;
@@ -258,7 +274,11 @@ impl ChunkOps for PersistentChunkStore {
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
-        entry.envelope_meta.refcount += 1;
+        entry.envelope_meta.refcount = entry
+            .envelope_meta
+            .refcount
+            .checked_add(1)
+            .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
         let rc = entry.envelope_meta.refcount;
         drop(chunks);
         self.save_meta()?;
@@ -332,32 +352,47 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn gc(&mut self) -> u64 {
-        let mut chunks = self
-            .chunks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut chunks = self.chunks.lock().unwrap_or_else(|e| {
+            eprintln!("warning: mutex poisoned, recovering");
+            e.into_inner()
+        });
 
-        let to_remove: Vec<(ChunkId, Extent, String)> = chunks
+        let to_remove: Vec<(ChunkId, Extent, String, u64)> = chunks
             .iter()
             .filter(|(_, e)| {
                 e.envelope_meta.refcount == 0 && e.envelope_meta.retention_holds.is_empty()
             })
-            .map(|(id, e)| (*id, e.extent, e.envelope_meta.pool_name.clone()))
+            .map(|(id, e)| {
+                (
+                    *id,
+                    e.extent,
+                    e.envelope_meta.pool_name.clone(),
+                    e.envelope_meta.data_bytes,
+                )
+            })
             .collect();
 
-        let count = to_remove.len() as u64;
+        let mut freed_count: u64 = 0;
 
-        for (id, extent, pool_name) in &to_remove {
-            chunks.remove(id);
-            // Free extent on device.
-            let _ = self.device.free(extent);
-            // Update pool usage.
-            let mut pools = self
-                .pools
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(p) = pools.get_mut(pool_name.as_str()) {
-                p.used_bytes = p.used_bytes.saturating_sub(extent.length);
+        for (id, extent, pool_name, data_bytes) in &to_remove {
+            // Only remove chunk from metadata if device.free() succeeds.
+            // If free fails, skip this chunk (leave it for next GC cycle).
+            match self.device.free(extent) {
+                Ok(()) => {
+                    chunks.remove(id);
+                    freed_count += 1;
+                    // Update pool usage.
+                    let mut pools = self.pools.lock().unwrap_or_else(|e| {
+                        eprintln!("warning: mutex poisoned, recovering");
+                        e.into_inner()
+                    });
+                    if let Some(p) = pools.get_mut(pool_name.as_str()) {
+                        p.used_bytes = p.used_bytes.saturating_sub(*data_bytes);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: gc free failed for chunk {id}: {e}, skipping");
+                }
             }
         }
 
@@ -365,7 +400,7 @@ impl ChunkOps for PersistentChunkStore {
         let _ = self.save_meta();
         let _ = self.device.sync();
 
-        count
+        freed_count
     }
 
     fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {

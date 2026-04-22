@@ -113,17 +113,52 @@ impl Superblock {
         let mut device_id = [0u8; 16];
         device_id.copy_from_slice(&buf[12..28]);
 
+        let block_size = u32::from_le_bytes(buf[28..32].try_into().unwrap());
+        let total_blocks = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+        let bitmap_offset = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        let bitmap_mirror_offset = u64::from_le_bytes(buf[48..56].try_into().unwrap());
+        let bitmap_blocks = u64::from_le_bytes(buf[56..64].try_into().unwrap());
+        let data_offset = u64::from_le_bytes(buf[64..72].try_into().unwrap());
+        let generation = u64::from_le_bytes(buf[72..80].try_into().unwrap());
+
+        // Validate parsed fields.
+        if block_size == 0 || !block_size.is_power_of_two() {
+            return Err(BlockError::InvalidSuperblock(format!(
+                "block_size must be a positive power of two, got {block_size}"
+            )));
+        }
+        if bitmap_offset < SUPERBLOCK_SIZE {
+            return Err(BlockError::InvalidSuperblock(format!(
+                "bitmap_offset ({bitmap_offset}) must be >= SUPERBLOCK_SIZE ({SUPERBLOCK_SIZE})"
+            )));
+        }
+        if bitmap_mirror_offset <= bitmap_offset {
+            return Err(BlockError::InvalidSuperblock(format!(
+                "bitmap_mirror_offset ({bitmap_mirror_offset}) must be > bitmap_offset ({bitmap_offset})"
+            )));
+        }
+        if data_offset <= bitmap_mirror_offset {
+            return Err(BlockError::InvalidSuperblock(format!(
+                "data_offset ({data_offset}) must be > bitmap_mirror_offset ({bitmap_mirror_offset})"
+            )));
+        }
+        if total_blocks == 0 {
+            return Err(BlockError::InvalidSuperblock(
+                "total_blocks must be > 0".into(),
+            ));
+        }
+
         Ok(Self {
             magic,
             version,
             device_id,
-            block_size: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
-            total_blocks: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
-            bitmap_offset: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
-            bitmap_mirror_offset: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
-            bitmap_blocks: u64::from_le_bytes(buf[56..64].try_into().unwrap()),
-            data_offset: u64::from_le_bytes(buf[64..72].try_into().unwrap()),
-            generation: u64::from_le_bytes(buf[72..80].try_into().unwrap()),
+            block_size,
+            total_blocks,
+            bitmap_offset,
+            bitmap_mirror_offset,
+            bitmap_blocks,
+            data_offset,
+            generation,
         })
     }
 

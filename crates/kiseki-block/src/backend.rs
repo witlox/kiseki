@@ -77,4 +77,10 @@ mod tests {
     fn crc32c_empty() {
         let _ = crc32c(b""); // Should not panic.
     }
+
+    #[test]
+    fn crc32c_test_vector() {
+        // Known CRC32C test vector: CRC32C("123456789") = 0xE3069283
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+    }
 }
