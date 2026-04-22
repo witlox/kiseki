@@ -8,6 +8,7 @@
 //! MVP: plaintext TCP. Production requires mTLS (G-ADV-11).
 
 use std::io;
+use std::io::Cursor;
 use std::sync::Arc;
 
 use openraft::error::{RPCError, Unreachable};
@@ -38,7 +39,9 @@ pub struct TcpNetwork {
     addr: String,
 }
 
-impl<C: RaftTypeConfig<Node = KisekiNode>> RaftNetworkFactory<C> for TcpNetworkFactory<C> {
+impl<C: RaftTypeConfig<Node = KisekiNode, SnapshotData = Cursor<Vec<u8>>>> RaftNetworkFactory<C>
+    for TcpNetworkFactory<C>
+{
     type Network = TcpNetwork;
 
     async fn new_client(&mut self, _target: C::NodeId, node: &KisekiNode) -> TcpNetwork {
@@ -95,7 +98,20 @@ fn to_rpc_error<C: RaftTypeConfig>(e: io::Error) -> RPCError<C> {
     RPCError::Unreachable(Unreachable::new(&e))
 }
 
-impl<C: RaftTypeConfig> RaftNetworkV2<C> for TcpNetwork
+/// Serializable snapshot envelope for the wire protocol.
+///
+/// Wraps snapshot metadata + data bytes so they can be sent as a
+/// single length-prefixed JSON message over TCP.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+struct SnapshotEnvelope<C: RaftTypeConfig> {
+    vote: openraft::alias::VoteOf<C>,
+    meta: openraft::alias::SnapshotMetaOf<C>,
+    /// Snapshot data as raw bytes (the state machine's JSON blob).
+    data: Vec<u8>,
+}
+
+impl<C: RaftTypeConfig<SnapshotData = Cursor<Vec<u8>>>> RaftNetworkV2<C> for TcpNetwork
 where
     C::D: Serialize + DeserializeOwned + Send,
     C::R: Serialize + DeserializeOwned + Send,
@@ -112,21 +128,29 @@ where
 
     async fn full_snapshot(
         &mut self,
-        _vote: openraft::alias::VoteOf<C>,
-        _snapshot: openraft::alias::SnapshotOf<C>,
+        vote: openraft::alias::VoteOf<C>,
+        snapshot: openraft::alias::SnapshotOf<C>,
         _cancel: impl futures::Future<Output = openraft::error::ReplicationClosed>
             + openraft::OptionalSend
             + 'static,
         _option: openraft::network::RPCOption,
     ) -> Result<openraft::raft::SnapshotResponse<C>, openraft::error::StreamingError<C>> {
-        // TODO: Implement snapshot streaming over TCP.
-        // For now, return Unreachable (snapshot transfer deferred).
-        Err(openraft::error::StreamingError::Unreachable(
-            Unreachable::new(&io::Error::new(
-                io::ErrorKind::NotConnected,
-                "snapshot transfer not yet implemented",
-            )),
-        ))
+        // Read snapshot data from the Cursor<Vec<u8>>.
+        let data = snapshot.snapshot.into_inner();
+        let envelope = SnapshotEnvelope::<C> {
+            vote,
+            meta: snapshot.meta,
+            data,
+        };
+
+        let resp: openraft::raft::SnapshotResponse<C> =
+            rpc_call(&self.addr, &("full_snapshot", &envelope))
+                .await
+                .map_err(|e| {
+                    openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
+                })?;
+
+        Ok(resp)
     }
 
     async fn vote(
@@ -152,7 +176,7 @@ where
 /// TCP RPC server — listens for incoming Raft RPCs and dispatches them.
 ///
 /// Call this on each node to accept Raft messages from peers.
-pub async fn run_raft_rpc_server<C: RaftTypeConfig>(
+pub async fn run_raft_rpc_server<C: RaftTypeConfig<SnapshotData = Cursor<Vec<u8>>>>(
     addr: &str,
     raft: Arc<openraft::Raft<C, impl openraft::storage::RaftStateMachine<C>>>,
 ) -> io::Result<()>
@@ -180,7 +204,8 @@ where
             }
 
             // Dispatch based on RPC type tag.
-            // Client sends ("append_entries", payload) or ("vote", payload).
+            // Client sends ("append_entries", payload), ("vote", payload),
+            // or ("full_snapshot", envelope).
             let tag_result: Result<(String, serde_json::Value), _> =
                 serde_json::from_slice(&req_buf);
 
@@ -204,6 +229,21 @@ where
                             Ok(resp) => serde_json::to_vec(&resp).unwrap_or_default(),
                             Err(_) => Vec::new(),
                         },
+                        Err(_) => Vec::new(),
+                    }
+                }
+                Ok((ref tag, _)) if tag == "full_snapshot" => {
+                    match serde_json::from_slice::<(String, SnapshotEnvelope<C>)>(&req_buf) {
+                        Ok((_, env)) => {
+                            let snapshot = openraft::storage::Snapshot {
+                                meta: env.meta,
+                                snapshot: Cursor::new(env.data),
+                            };
+                            match raft.install_full_snapshot(env.vote, snapshot).await {
+                                Ok(resp) => serde_json::to_vec(&resp).unwrap_or_default(),
+                                Err(_) => Vec::new(),
+                            }
+                        }
                         Err(_) => Vec::new(),
                     }
                 }

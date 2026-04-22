@@ -29,7 +29,7 @@ fn setup_gateway() -> InMemoryGateway {
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
 
-    InMemoryGateway::new(compositions, chunks, master_key)
+    InMemoryGateway::new(compositions, Box::new(chunks), master_key)
 }
 
 #[test]

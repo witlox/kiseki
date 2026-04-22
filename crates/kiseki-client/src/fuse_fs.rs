@@ -229,7 +229,7 @@ mod tests {
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-        let gateway = InMemoryGateway::new(compositions, chunks, master_key);
+        let gateway = InMemoryGateway::new(compositions, Box::new(chunks), master_key);
 
         KisekiFuse::new(gateway, test_tenant(), test_namespace())
     }
