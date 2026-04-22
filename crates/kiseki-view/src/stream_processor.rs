@@ -38,6 +38,41 @@ impl DeltaHandler for NoopHandler {
     fn handle_deltas(&mut self, _deltas: &[Delta]) {}
 }
 
+/// Decrypting handler — decrypts delta payloads via a caller-provided
+/// function. The decrypt function receives ciphertext and returns
+/// plaintext (or the original bytes on failure).
+///
+/// Used by the server runtime to materialize decrypted view content
+/// without pulling `kiseki-crypto` into the view crate.
+pub struct DecryptingHandler<F: FnMut(&[u8]) -> Vec<u8>> {
+    decrypt: F,
+    /// Accumulated decrypted payloads from the last `handle_deltas` call.
+    pub decrypted: Vec<Vec<u8>>,
+}
+
+impl<F: FnMut(&[u8]) -> Vec<u8>> DecryptingHandler<F> {
+    /// Create a decrypting handler with the given decrypt function.
+    pub fn new(decrypt: F) -> Self {
+        Self {
+            decrypt,
+            decrypted: Vec::new(),
+        }
+    }
+}
+
+impl<F: FnMut(&[u8]) -> Vec<u8>> DeltaHandler for DecryptingHandler<F> {
+    fn handle_deltas(&mut self, deltas: &[Delta]) {
+        self.decrypted.clear();
+        for delta in deltas {
+            if delta.payload.ciphertext.is_empty() {
+                continue;
+            }
+            let plaintext = (self.decrypt)(&delta.payload.ciphertext);
+            self.decrypted.push(plaintext);
+        }
+    }
+}
+
 /// Stream processor with explicit view ID tracking.
 ///
 /// Bridges Log → View by polling deltas from source shards

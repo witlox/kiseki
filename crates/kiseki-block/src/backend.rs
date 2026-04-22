@@ -36,6 +36,13 @@ pub trait DeviceBackend: Send + Sync {
 
     /// Get a copy of the allocation bitmap (for persistence/scrub).
     fn bitmap_bytes(&self) -> Vec<u8>;
+
+    /// Run a consistency scrub: verify bitmap integrity, detect orphan
+    /// extents, check CRC32 on sampled blocks. Returns a human-readable
+    /// report or empty string if clean. Default: no-op.
+    fn scrub(&self) -> String {
+        String::new()
+    }
 }
 
 /// Compute CRC32 of data using the Castagnoli polynomial (CRC32C).

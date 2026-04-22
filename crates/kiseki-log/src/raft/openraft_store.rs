@@ -43,6 +43,74 @@ pub struct OpenRaftLogStore {
     state: Arc<futures::lock::Mutex<ShardSmInner>>,
     shard_id: ShardId,
     tenant_id: OrgId,
+    /// Inline write rate meter (I-SF7): tracks bytes written in the
+    /// current sliding window. When rate exceeds budget, the effective
+    /// inline threshold drops to floor.
+    inline_rate: std::sync::Mutex<InlineRateMeter>,
+}
+
+/// Sliding-window rate meter for inline write throughput (I-SF7).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    dead_code
+)]
+struct InlineRateMeter {
+    /// Bytes written in the current window.
+    window_bytes: u64,
+    /// Window start time (epoch ms).
+    window_start_ms: u64,
+    /// Window duration (ms).
+    window_ms: u64,
+    /// Budget in bytes per second.
+    budget_bytes_per_sec: u64,
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+impl InlineRateMeter {
+    fn new(budget_mbps: u64) -> Self {
+        Self {
+            window_bytes: 0,
+            window_start_ms: 0,
+            window_ms: 10_000, // 10-second sliding window
+            budget_bytes_per_sec: budget_mbps * 1024 * 1024,
+        }
+    }
+
+    /// Record an inline write and return whether the rate is exceeded.
+    fn record(&mut self, bytes: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+
+        // Reset window if expired.
+        if now.saturating_sub(self.window_start_ms) > self.window_ms {
+            self.window_bytes = 0;
+            self.window_start_ms = now;
+        }
+
+        self.window_bytes += bytes;
+
+        // Check if rate exceeds budget.
+        let elapsed_secs = (now.saturating_sub(self.window_start_ms)).max(1) as f64 / 1000.0;
+        let rate = self.window_bytes as f64 / elapsed_secs;
+        rate > self.budget_bytes_per_sec as f64
+    }
+
+    /// Check if the current rate exceeds the budget (without recording).
+    fn is_exceeded(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+
+        if now.saturating_sub(self.window_start_ms) > self.window_ms {
+            return false; // Window expired, rate is zero.
+        }
+
+        let elapsed_secs = (now.saturating_sub(self.window_start_ms)).max(1) as f64 / 1000.0;
+        let rate = self.window_bytes as f64 / elapsed_secs;
+        rate > self.budget_bytes_per_sec as f64
+    }
 }
 
 fn op_to_u8(op: crate::delta::OperationType) -> u8 {
@@ -144,7 +212,28 @@ impl OpenRaftLogStore {
             state: state_inner,
             shard_id,
             tenant_id,
+            inline_rate: std::sync::Mutex::new(InlineRateMeter::new(10)), // 10 MB/s default
         })
+    }
+
+    /// Check if the inline write rate is currently exceeded (I-SF7).
+    ///
+    /// Returns `true` if the effective inline threshold should drop
+    /// to floor to prevent inline writes from starving Raft.
+    #[must_use]
+    pub fn inline_rate_exceeded(&self) -> bool {
+        self.inline_rate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_exceeded()
+    }
+
+    /// Record an inline write for rate tracking (I-SF7).
+    pub fn record_inline_write(&self, bytes: u64) -> bool {
+        self.inline_rate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(bytes)
     }
 
     /// Spawn the Raft RPC server for this shard's Raft group.

@@ -23,6 +23,10 @@ pub mod fuse_fs;
 pub mod prefetch;
 pub mod transport_select;
 
+#[cfg(feature = "ffi")]
+#[allow(missing_docs, clippy::missing_safety_doc)]
+pub mod ffi;
+
 #[cfg(feature = "python")]
 pub mod python;
 

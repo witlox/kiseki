@@ -328,6 +328,12 @@ impl GatewayOps for InMemoryGateway {
             // Inline path: serialize envelope and store in small/objects.redb.
             // The delta payload will carry this data through Raft, and the
             // state machine offloads it to the inline store on apply (I-SF5).
+            //
+            // Refcount note: inline content does NOT use chunk refcounts.
+            // Dedup is handled by SmallObjectStore.put() (returns is_new=false
+            // on duplicate). GC is handled by I-SF6 (truncate/compact deletes
+            // inline entries). This is intentional — inline files live in the
+            // metadata tier, not the chunk tier.
             let env_bytes =
                 serde_json::to_vec(&env).map_err(|e| GatewayError::Upstream(e.to_string()))?;
             if let Some(ref store) = self.small_store {
