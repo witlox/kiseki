@@ -11,9 +11,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-kiseki-common = { path = "../kiseki-common" }
-kiseki-crypto = { path = "../kiseki-crypto" }
-kiseki-keymanager = { path = "../kiseki-keymanager" }
+kiseki-common = { workspace = true }
+kiseki-crypto = { workspace = true }
+kiseki-keymanager = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

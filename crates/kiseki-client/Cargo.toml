@@ -16,14 +16,14 @@ fuse = []
 python = ["pyo3"]
 
 [dependencies]
-kiseki-common = { path = "../kiseki-common" }
-kiseki-gateway = { path = "../kiseki-gateway" }
+kiseki-common = { workspace = true }
+kiseki-gateway = { workspace = true }
 pyo3 = { version = "0.23", optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-kiseki-chunk = { path = "../kiseki-chunk" }
-kiseki-composition = { path = "../kiseki-composition" }
-kiseki-crypto = { path = "../kiseki-crypto" }
+kiseki-chunk = { workspace = true }
+kiseki-composition = { workspace = true }
+kiseki-crypto = { workspace = true }
 proptest = { workspace = true }
 uuid = { workspace = true }

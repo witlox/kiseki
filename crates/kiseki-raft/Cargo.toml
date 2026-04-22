@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-kiseki-common = { path = "../kiseki-common" }
+kiseki-common = { workspace = true }
 futures = "0.3"
 openraft = { workspace = true }
 redb = "2"

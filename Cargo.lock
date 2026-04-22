@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-acceptance"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "cucumber",
  "kiseki-advisory",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-advisory"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "kiseki-audit",
  "kiseki-common",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-audit"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "futures",
  "kiseki-common",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-chunk"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "kiseki-common",
  "kiseki-crypto",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-client"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "kiseki-chunk",
  "kiseki-common",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-common"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-composition"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "kiseki-common",
  "kiseki-log",
@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-control"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "kiseki-common",
  "kiseki-proto",
@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-crypto"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "aws-lc-rs",
  "cucumber",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-gateway"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "axum",
  "hyper",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-keymanager"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "aws-lc-rs",
  "futures",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-log"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "futures",
  "kiseki-common",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-proto"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-raft"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "futures",
  "kiseki-common",
@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-server"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "axum",
  "kiseki-advisory",
@@ -1581,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-transport"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "aws-lc-rs",
  "kiseki-common",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-view"
-version = "0.0.0"
+version = "2026.1.0"
 dependencies = [
  "kiseki-common",
  "kiseki-log",

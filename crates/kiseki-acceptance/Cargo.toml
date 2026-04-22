@@ -19,19 +19,19 @@ path = "tests/acceptance.rs"
 
 [dependencies]
 # Domain crates under test
-kiseki-common = { path = "../kiseki-common" }
-kiseki-crypto = { path = "../kiseki-crypto" }
-kiseki-log = { path = "../kiseki-log" }
-kiseki-keymanager = { path = "../kiseki-keymanager" }
-kiseki-audit = { path = "../kiseki-audit" }
-kiseki-chunk = { path = "../kiseki-chunk" }
-kiseki-composition = { path = "../kiseki-composition" }
-kiseki-view = { path = "../kiseki-view" }
-kiseki-advisory = { path = "../kiseki-advisory" }
-kiseki-control = { path = "../kiseki-control" }
-kiseki-gateway = { path = "../kiseki-gateway" }
-kiseki-transport = { path = "../kiseki-transport" }
-kiseki-client = { path = "../kiseki-client" }
+kiseki-common = { workspace = true }
+kiseki-crypto = { workspace = true }
+kiseki-log = { workspace = true }
+kiseki-keymanager = { workspace = true }
+kiseki-audit = { workspace = true }
+kiseki-chunk = { workspace = true }
+kiseki-composition = { workspace = true }
+kiseki-view = { workspace = true }
+kiseki-advisory = { workspace = true }
+kiseki-control = { workspace = true }
+kiseki-gateway = { workspace = true }
+kiseki-transport = { workspace = true }
+kiseki-client = { workspace = true }
 
 # BDD framework
 cucumber = { workspace = true }

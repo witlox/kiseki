@@ -569,26 +569,40 @@ async fn then_refcounts_initialized(w: &mut KisekiWorld, _chunks: String, _count
 #[then(regex = r#"^a new chunk c2' is written covering the modified range$"#)]
 async fn then_new_chunk_c2_prime(w: &mut KisekiWorld) {
     // Byte-range overwrite produces a new chunk — verify composition still readable.
-    assert!(w.last_error.is_none(), "overwrite should succeed: {:?}", w.last_error);
+    assert!(
+        w.last_error.is_none(),
+        "overwrite should succeed: {:?}",
+        w.last_error
+    );
 }
 
 #[then(regex = r#"^a delta records: "([^"]+)"$"#)]
 async fn then_delta_records(w: &mut KisekiWorld, _desc: String) {
     // Delta appended — verify no error on the write path.
-    assert!(w.last_error.is_none(), "delta record should succeed: {:?}", w.last_error);
+    assert!(
+        w.last_error.is_none(),
+        "delta record should succeed: {:?}",
+        w.last_error
+    );
 }
 
 #[then("c2 refcount is decremented (if no other composition references it)")]
 async fn then_c2_refcount_decremented(w: &mut KisekiWorld) {
     // Refcount decrement verified via chunk store — chunk should still exist
     // (refcount may be >0 if other compositions reference it).
-    assert!(w.last_error.is_none(), "refcount decrement path should not error");
+    assert!(
+        w.last_error.is_none(),
+        "refcount decrement path should not error"
+    );
 }
 
 #[then("c2' refcount is initialized to 1")]
 async fn then_c2_prime_refcount_1(w: &mut KisekiWorld) {
     // New chunk created with refcount 1.
-    assert!(w.last_error.is_none(), "new chunk refcount init should not error");
+    assert!(
+        w.last_error.is_none(),
+        "new chunk refcount init should not error"
+    );
 }
 
 #[then("the Composition context verifies all chunks are durable")]
@@ -670,13 +684,21 @@ async fn then_tombstone_appended(w: &mut KisekiWorld) {
 #[then("c5 refcount is decremented to 1 (still referenced elsewhere)")]
 async fn then_c5_refcount_1(w: &mut KisekiWorld) {
     // Shared chunk: still has references from other compositions.
-    assert!(w.last_error.is_none(), "delete should succeed: {:?}", w.last_error);
+    assert!(
+        w.last_error.is_none(),
+        "delete should succeed: {:?}",
+        w.last_error
+    );
 }
 
 #[then("c6 refcount is decremented to 0 (eligible for GC if no hold)")]
 async fn then_c6_refcount_0(w: &mut KisekiWorld) {
     // Sole-reference chunk: refcount 0 after delete, eligible for GC.
-    assert!(w.last_error.is_none(), "delete should succeed: {:?}", w.last_error);
+    assert!(
+        w.last_error.is_none(),
+        "delete should succeed: {:?}",
+        w.last_error
+    );
 }
 
 #[then("the composition is no longer visible in the namespace")]
@@ -715,7 +737,10 @@ async fn then_previous_versions_accessible(w: &mut KisekiWorld, _versions: Strin
 #[then("chunk refcounts are NOT decremented (versions still reference them)")]
 async fn then_chunk_refcounts_not_decremented(w: &mut KisekiWorld) {
     // Versioned delete preserves chunk references from old versions.
-    assert!(w.last_error.is_none(), "versioned delete should preserve refcounts");
+    assert!(
+        w.last_error.is_none(),
+        "versioned delete should preserve refcounts"
+    );
 }
 
 #[then(regex = r#"^file B's composition references chunk "([^"]+)"$"#)]
@@ -774,7 +799,10 @@ async fn then_no_dedup_match(w: &mut KisekiWorld, _id1: String, _id2: String) {
 #[then(regex = r#"^a new chunk "([^"]+)" is stored for "([^"]+)"$"#)]
 async fn then_new_chunk_stored_for(w: &mut KisekiWorld, _chunk: String, _tenant: String) {
     // Isolated chunk storage: opted-out tenant gets its own chunk.
-    assert!(w.last_error.is_none(), "isolated chunk write should succeed");
+    assert!(
+        w.last_error.is_none(),
+        "isolated chunk write should succeed"
+    );
 }
 
 #[then(regex = r#"^"([^"]+)" data is fully isolated$"#)]

@@ -23,7 +23,7 @@ members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.80"
-version = "0.0.0"
+version = "2026.1.0"
 license = "Apache-2.0"
 repository = "https://github.com/witlox/kiseki"
 
@@ -53,6 +53,24 @@ todo = "deny"
 unimplemented = "deny"
 
 [workspace.dependencies]
+# --- Internal crates ---
+kiseki-common = { path = "crates/kiseki-common", version = "2026.1.0" }
+kiseki-crypto = { path = "crates/kiseki-crypto", version = "2026.1.0" }
+kiseki-proto = { path = "crates/kiseki-proto", version = "2026.1.0" }
+kiseki-raft = { path = "crates/kiseki-raft", version = "2026.1.0" }
+kiseki-transport = { path = "crates/kiseki-transport", version = "2026.1.0" }
+kiseki-log = { path = "crates/kiseki-log", version = "2026.1.0" }
+kiseki-keymanager = { path = "crates/kiseki-keymanager", version = "2026.1.0" }
+kiseki-audit = { path = "crates/kiseki-audit", version = "2026.1.0" }
+kiseki-chunk = { path = "crates/kiseki-chunk", version = "2026.1.0" }
+kiseki-composition = { path = "crates/kiseki-composition", version = "2026.1.0" }
+kiseki-view = { path = "crates/kiseki-view", version = "2026.1.0" }
+kiseki-advisory = { path = "crates/kiseki-advisory", version = "2026.1.0" }
+kiseki-gateway = { path = "crates/kiseki-gateway", version = "2026.1.0" }
+kiseki-client = { path = "crates/kiseki-client", version = "2026.1.0" }
+kiseki-control = { path = "crates/kiseki-control", version = "2026.1.0" }
+kiseki-server = { path = "crates/kiseki-server", version = "2026.1.0" }
+
 # --- Core ---
 thiserror = "1"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }

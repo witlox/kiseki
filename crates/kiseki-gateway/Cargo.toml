@@ -16,15 +16,15 @@ nfs = []
 s3 = []
 
 [dependencies]
-kiseki-common = { path = "../kiseki-common" }
-kiseki-chunk = { path = "../kiseki-chunk" }
-kiseki-composition = { path = "../kiseki-composition" }
-kiseki-crypto = { path = "../kiseki-crypto" }
+kiseki-common = { workspace = true }
+kiseki-chunk = { workspace = true }
+kiseki-composition = { workspace = true }
+kiseki-crypto = { workspace = true }
 axum = "0.7"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto", "service"] }
-kiseki-transport = { path = "../kiseki-transport" }
-kiseki-view = { path = "../kiseki-view" }
+kiseki-transport = { workspace = true }
+kiseki-view = { workspace = true }
 rustls = { version = "0.23", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

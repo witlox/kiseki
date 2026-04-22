@@ -14,8 +14,8 @@ workspace = true
 # and kiseki-proto. No data-path crates (log, chunk, composition, view,
 # gateway, client, keymanager, crypto, raft, transport, audit, advisory).
 [dependencies]
-kiseki-common = { path = "../kiseki-common" }
-kiseki-proto = { path = "../kiseki-proto" }
+kiseki-common = { workspace = true }
+kiseki-proto = { workspace = true }
 tonic = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

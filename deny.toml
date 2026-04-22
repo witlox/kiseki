@@ -13,7 +13,11 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    "RUSTSEC-2024-0384", # `instant` unmaintained — transitive via openraft
+    "RUSTSEC-2025-0020", # pyo3 PyString buffer overflow — not used in kiseki (transitive)
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — awaiting upstream migration
+]
 
 [licenses]
 version = 2
@@ -21,6 +25,7 @@ version = 2
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "BlueOak-1.0.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
@@ -28,6 +33,7 @@ allow = [
     "ISC",
     "MIT",
     "MPL-2.0",
+    "OpenSSL",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",

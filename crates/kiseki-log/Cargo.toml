@@ -11,9 +11,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-kiseki-common = { path = "../kiseki-common" }
-kiseki-proto = { path = "../kiseki-proto" }
-kiseki-raft = { path = "../kiseki-raft" }
+kiseki-common = { workspace = true }
+kiseki-proto = { workspace = true }
+kiseki-raft = { workspace = true }
 futures = "0.3"
 openraft = { workspace = true }
 serde = { version = "1", features = ["derive"] }
