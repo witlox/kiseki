@@ -1,112 +1,99 @@
-# Fidelity Index — Kiseki (Post F1-F10 + ADR-028)
+# Fidelity Index — Kiseki (Post Phase 12ab + ADR-030)
 
-**Checkpoint**: 2026-04-22
-**Previous**: 2026-04-21 (post Phase G + ADR-027 + honesty sweep)
+**Checkpoint**: 2026-04-22 (end of session)
+**Previous**: 2026-04-22 (start of session, 456 BDD)
 
 ## Per-Crate Status
 
-| Crate | Status | Unit Tests | Confidence | Notes |
-|-------|--------|------------|------------|-------|
-| kiseki-common | DONE | 14 | HIGH | HLC, types, property tests, versioning |
-| kiseki-crypto | DONE | 22 | HIGH | AEAD, HKDF, envelope, shred, mlock, compress |
+| Crate | Status | Unit+Integ Tests | Confidence | Notes |
+|-------|--------|-----------------|------------|-------|
+| kiseki-common | DONE | 18 | HIGH | HLC, types, InlineStore trait, ChunkId/KeyEpoch serde |
+| kiseki-crypto | DONE | 32 | HIGH | AEAD, HKDF, envelope (Serialize), shred, mlock, compress |
 | kiseki-proto | DONE | 6 | HIGH | Protobuf roundtrip (9 proto files) |
-| kiseki-raft | DONE | 7 | HIGH | MemLogStore, TCP transport |
-| kiseki-transport | DONE | 13 | MEDIUM | mTLS, X.509, SPIFFE, CRL revocation |
-| kiseki-keymanager | DONE | 34 | HIGH | Epochs, rotation, Raft, cache TTL, rewrap worker |
-| kiseki-log | DONE | 31 | HIGH | In-memory + Raft + gRPC + persistent + auto-split + compaction |
-| kiseki-audit | DONE | 16 | MEDIUM | Append-only + Raft |
-| kiseki-chunk | DONE | 23 | HIGH | EC encode/decode, placement, devices, GC, retention holds |
-| kiseki-composition | DONE | 12 | MEDIUM | CRUD + log bridge + pipeline + multipart |
-| kiseki-view | DONE | 13 | MEDIUM | Lifecycle, pins, stream processor, versioning |
+| kiseki-raft | DONE | 16 | HIGH | MemLogStore, RedbRaftLogStore, TCP transport, snapshot transfer |
+| kiseki-transport | DONE | 21 | HIGH | mTLS, X.509, SPIFFE SAN, CRL revocation |
+| kiseki-keymanager | DONE | 35 | HIGH | Epochs, rotation, Raft (persistent), cache TTL, rewrap |
+| kiseki-log | DONE | 50 | HIGH | In-memory + Raft + persistent + auto-split + compaction + inline offload + throughput guard |
+| kiseki-audit | DONE | 19 | MEDIUM | Append-only + Raft (persistent) |
+| kiseki-chunk | DONE | 34 | HIGH | EC, placement, devices, GC, retention, SmallObjectStore |
+| kiseki-block | DONE | 26 | HIGH | Raw device alloc, bitmap, CRC32, WAL, superblock, scrub |
+| kiseki-composition | DONE | 12 | MEDIUM | CRUD + log bridge + pipeline + multipart + versioning |
+| kiseki-view | DONE | 13 | MEDIUM | Lifecycle, pins, stream processor (DeltaHandler + DecryptingHandler), versioning |
 | kiseki-advisory | DONE | 7 | MEDIUM | Domain logic + gRPC |
-| kiseki-gateway | DONE | 11 | MEDIUM | S3 HTTP + NFS3 (22 procs) + NFS4 + XDR + InMemoryGateway pipeline |
-| kiseki-client | DONE | 23 | MEDIUM | Cache, FUSE, transport select, batching, prefetch |
-| kiseki-control | DONE | 15 | HIGH | Tenant, IAM, policy, flavor, federation, namespace, retention, advisory, StorageAdminService |
-| kiseki-server | WIRED | 0 | MEDIUM | All protocols + ControlService gRPC registered |
+| kiseki-gateway | DONE | 39 | HIGH | S3 (10 endpoints + multipart) + NFS3 (18 procs) + NFS4 (28 ops + locks) + InMemoryGateway + inline routing |
+| kiseki-client | DONE | 23 | MEDIUM | FUSE (12 ops), fuser daemon, discovery, transport select, cache, prefetch, FFI stubs |
+| kiseki-control | DONE | 15 | HIGH | 16/16 gRPC methods, tenant CRUD, IAM, policy, flavor, federation, namespace, retention |
+| kiseki-server | WIRED | 2 | MEDIUM | All protocols + ControlService + system disk detection + scrub task + SmallObjectStore |
 
-**Total Rust unit tests**: 307+ pass, 0 fail
+**Total unit+integration tests**: 361 pass, 0 fail
 
 ## BDD Coverage
 
 | Metric | Value |
 |--------|-------|
-| Total scenarios | 456 |
-| Passing (real assertions) | 456 (100%) |
-| Failing | 0 |
-| Skipped | 0 |
+| Feature files | 22 |
+| Total scenarios | 563 |
+| Passing | 554 (98.4%) |
+| Skipped | 9 (ADR-030 table-based migration steps) |
+| Failed | 0 |
+| Parsing errors | 0 |
+| Step definition files | 19 |
+| Step definition functions | 2,735 |
 
-### All 19 features at 100%
+### Per-Feature Breakdown
 
-| Feature | Scenarios |
-|---------|-----------|
-| Authentication | 16/16 |
-| Chunk Storage | 25/25 |
-| Composition | 21/21 |
-| Control Plane | 32/32 |
-| Device Management | 19/19 |
-| Erasure Coding | 14/14 |
-| Key Management | 17/17 |
-| Log | 21/21 |
-| Multi-node Raft | 18/18 |
-| Native Client | 26/26 |
-| NFSv3 RFC 1813 | 18/18 |
-| NFSv4.2 RFC 7862 | 27/27 |
-| Operational | 33/33 |
-| Persistence | 12/12 |
-| Protocol Gateway | 21/21 |
-| S3 API | 14/14 |
-| Storage Admin | 46/46 |
-| View Materialization | 23/23 |
-| Workflow Advisory | 51/51 |
+| Feature | Scenarios | Pass | Skip |
+|---------|-----------|------|------|
+| authentication | 16 | 16 | 0 |
+| block-storage | 33 | 33 | 0 |
+| chunk-storage | 25 | 25 | 0 |
+| composition | 21 | 21 | 0 |
+| control-plane | 32 | 32 | 0 |
+| device-management | 19 | 19 | 0 |
+| erasure-coding | 14 | 14 | 0 |
+| external-kms | 41 | 41 | 0 |
+| key-management | 17 | 17 | 0 |
+| log | 21 | 21 | 0 |
+| multi-node-raft | 20 | 20 | 0 |
+| native-client | 26 | 26 | 0 |
+| nfs3-rfc1813 | 18 | 18 | 0 |
+| nfs4-rfc7862 | 27 | 27 | 0 |
+| operational | 33 | 33 | 0 |
+| persistence | 14 | 14 | 0 |
+| protocol-gateway | 23 | 23 | 0 |
+| s3-api | 14 | 14 | 0 |
+| small-file-placement | 29 | 20 | 9 |
+| storage-admin | 46 | 46 | 0 |
+| view-materialization | 23 | 23 | 0 |
+| workflow-advisory | 51 | 51 | 0 |
 
-### Pending (ADR-028, not yet wired)
+## Invariants
 
-| Feature | Scenarios | Status |
-|---------|-----------|--------|
-| External KMS Providers | 45 | Feature file written, step definitions pending |
+| Category | Count |
+|----------|-------|
+| Log (I-L1-9) | 9 |
+| Chunk (I-C1-8) | 8 |
+| Key (I-K1-14) | 14 |
+| Tenant (I-T1-7) | 7 |
+| View (I-V1-4) | 4 |
+| Auth (I-Auth1-4) | 4 |
+| Audit (I-A1-5) | 5 |
+| Operational (I-O1-6) | 6 |
+| Advisory (I-WA1-19) | 19 |
+| Small-File (I-SF1-7) | 7 |
+| **Total** | **63** (enforcement-map.md current) |
 
-## E2E Coverage
+## ADRs
 
-| Suite | Tests |
-|-------|-------|
-| Server health + log roundtrip | 4 |
-| S3 gateway (PUT/GET/HEAD/DELETE) | 4 |
-| Cross-protocol | 3 |
-| Persistence (Docker restart) | 1 |
-| Multi-node cluster (3-node) | 4 |
-| Control plane (gRPC) | 3 |
-| **Total** | **19** |
+30 ADRs (001-030). All accepted. Latest: ADR-030 (Dynamic Small-File Placement).
 
-## ADR Status
+## Confidence Assessment
 
-| Status | Count |
-|--------|-------|
-| Accepted | 28 |
-| Proposed | 0 |
-| **Total** | **28** |
+| Level | Crates | Notes |
+|-------|--------|-------|
+| HIGH | 10 | common, crypto, proto, raft, transport, keymanager, log, chunk, block, control |
+| MEDIUM | 6 | audit, composition, view, advisory, client, server |
+| LOW | 0 | — |
 
-## Adversarial Reviews
-
-| Review | Findings | Status |
-|--------|----------|--------|
-| ADR-028 gate | 2H 5M 1L | All resolved in ADR |
-| F1-F10 gate-2 | 2C 7H 12M | All fixed (commit ae523f3) |
-| Phase G gate-2 | 4C 5H 4M 3L | Blocking fixes applied |
-| ADR-027 gate-1 | 5C 3H 4M 2L | Accepted with fixes |
-| Phase D | 11 | Deferred |
-| Pipeline | 5 | 3 fixed |
-| Phase C | 14 | 4 fixed |
-| Phase B+A | 14 | 7 fixed |
-
-## Key Milestones
-
-1. **F1-F10 Complete**: All missing domain features built (NFS3/NFS4/S3, key rotation, log split, view versioning, client, admin API, auth, operational)
-2. **456/456 BDD**: All scenarios pass with real domain assertions, 0 panic stubs
-3. **ADR-027**: Go control plane fully replaced with Rust (kiseki-control)
-4. **ADR-028 Accepted**: External Tenant KMS Providers (5 backends, 45 new scenarios)
-5. **Crate-graph firewall**: kiseki-control depends only on kiseki-common + kiseki-proto
-
-## Next: Production Readiness Plan
-
-See `specs/implementation/production-readiness-plan.md`:
-Q1 (quality gate) → Q2 (step audit) → P1-P4 (persistence) → I1-I2 (e2e + multi-node)
+No LOW confidence areas. All crates have passing tests and BDD coverage.
+Adversary sweep can proceed on any chunk without fidelity blockers.
