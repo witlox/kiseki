@@ -298,6 +298,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::SetQuotaRequest>,
     ) -> Result<Response<pb::SetQuotaResponse>, Status> {
+        super::authz::require_admin(&request)?;
         let req = request.into_inner();
         // Verify the target scope exists.
         match req.scope {
@@ -321,6 +322,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::SetComplianceTagsRequest>,
     ) -> Result<Response<pb::SetComplianceTagsResponse>, Status> {
+        super::authz::require_admin(&request)?;
         let req = request.into_inner();
         // Verify scope exists.
         match req.scope {
@@ -341,6 +343,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::SetRetentionHoldRequest>,
     ) -> Result<Response<pb::SetRetentionHoldResponse>, Status> {
+        super::authz::require_admin(&request)?;
         let req = request.into_inner();
         let ns_id = match req.scope {
             Some(pb::set_retention_hold_request::Scope::NamespaceId(ref ns)) => ns.value.clone(),
@@ -357,6 +360,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::ReleaseRetentionHoldRequest>,
     ) -> Result<Response<pb::ReleaseRetentionHoldResponse>, Status> {
+        super::authz::require_admin(&request)?;
         let req = request.into_inner();
         self.retention
             .release_hold(&req.hold_id)
@@ -368,6 +372,7 @@ impl ControlService for ControlGrpc {
         &self,
         _request: Request<pb::ListFlavorsRequest>,
     ) -> Result<Response<pb::ListFlavorsResponse>, Status> {
+        super::authz::require_admin(&_request)?;
         let flavors = flavor::default_flavors();
         let proto_flavors: Vec<pb::Flavor> = flavors
             .iter()
@@ -388,6 +393,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::MatchFlavorRequest>,
     ) -> Result<Response<pb::MatchFlavorResponse>, Status> {
+        super::authz::require_admin(&request)?;
         let req = request.into_inner();
         let available = flavor::default_flavors();
         let requested_proto = req.requested.unwrap_or_default();
@@ -423,6 +429,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::RegisterPeerRequest>,
     ) -> Result<Response<pb::RegisterPeerResponse>, Status> {
+        super::authz::require_admin(&request)?;
         let req = request.into_inner();
         let peer_id = uuid::Uuid::new_v4().to_string();
         let peer = Peer {
@@ -441,6 +448,7 @@ impl ControlService for ControlGrpc {
         &self,
         _request: Request<pb::ListPeersRequest>,
     ) -> Result<Response<pb::ListPeersResponse>, Status> {
+        super::authz::require_admin(&_request)?;
         let peers = self.federation.list_peers();
         let proto_peers = peers
             .into_iter()
@@ -462,6 +470,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::SetMaintenanceModeRequest>,
     ) -> Result<Response<pb::SetMaintenanceModeResponse>, Status> {
+        super::authz::require_admin(&request)?;
         let req = request.into_inner();
         if req.enabled {
             self.maintenance.enable();

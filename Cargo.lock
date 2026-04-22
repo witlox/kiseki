@@ -1647,10 +1647,13 @@ dependencies = [
  "kiseki-common",
  "openraft",
  "redb",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

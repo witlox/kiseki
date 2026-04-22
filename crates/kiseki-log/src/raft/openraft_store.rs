@@ -247,7 +247,9 @@ impl OpenRaftLogStore {
         addr: String,
     ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
         let raft = Arc::new(self.raft.clone());
-        tokio::spawn(async move { tcp_transport::run_raft_rpc_server::<C>(&addr, raft).await })
+        tokio::spawn(
+            async move { tcp_transport::run_raft_rpc_server::<C>(&addr, raft, None).await },
+        )
     }
 
     /// Append a delta through Raft consensus.
