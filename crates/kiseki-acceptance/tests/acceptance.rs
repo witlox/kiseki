@@ -305,6 +305,33 @@ impl KisekiWorld {
         ns_id
     }
 
+    /// Get or create a view by name.
+    pub fn ensure_view(&mut self, name: &str) -> ViewId {
+        if let Some(&id) = self.view_ids.get(name) {
+            return id;
+        }
+        use kiseki_view::descriptor::{
+            ConsistencyModel, ProtocolSemantics, ViewDescriptor,
+        };
+        use kiseki_view::view::ViewOps;
+        let desc = ViewDescriptor {
+            view_id: ViewId(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_DNS,
+                name.as_bytes(),
+            )),
+            tenant_id: OrgId(uuid::Uuid::from_u128(100)),
+            source_shards: vec![ShardId(uuid::Uuid::from_u128(1))],
+            protocol: ProtocolSemantics::Posix,
+            consistency: ConsistencyModel::ReadYourWrites,
+            discardable: false,
+            version: 1,
+        };
+        let id = self.view_store.create_view(desc).unwrap();
+        self.view_ids.insert(name.to_owned(), id);
+        self.last_view_id = Some(id);
+        id
+    }
+
     /// Ensure the default gateway namespace is registered with the NFS
     /// context's tenant, so `gateway.write(...)` succeeds without callers
     /// needing to set up namespaces individually.

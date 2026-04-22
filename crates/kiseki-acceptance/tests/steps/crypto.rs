@@ -987,7 +987,7 @@ async fn then_deterministic(_w: &mut KisekiWorld) {
 
 // === Scenario: Epoch mismatch extra ===
 
-#[then(regex = r#"^and unwraps the system DEK using epoch (\d+) material$"#)]
+#[then(regex = r#"^unwraps the system DEK using epoch (\d+) material$"#)]
 async fn then_unwrap_epoch(w: &mut KisekiWorld, epoch: u64) {
     assert!(w.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
 }

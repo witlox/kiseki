@@ -142,10 +142,17 @@ async fn given_chunk_refcount(w: &mut KisekiWorld, _name: String, count: u64) {
     let env = test_envelope(0x42);
     w.last_chunk_id = Some(env.chunk_id);
     w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    for _ in 1..count {
+    // write_chunk starts with refcount 1; adjust to the requested count.
+    if count == 0 {
         w.chunk_store
-            .increment_refcount(&ChunkId([0x42; 32]))
+            .decrement_refcount(&ChunkId([0x42; 32]))
             .unwrap();
+    } else {
+        for _ in 1..count {
+            w.chunk_store
+                .increment_refcount(&ChunkId([0x42; 32]))
+                .unwrap();
+        }
     }
 }
 
@@ -187,6 +194,15 @@ async fn then_not_deleted(w: &mut KisekiWorld, _name: String) {
     assert!(
         w.chunk_store.read_chunk(&id).is_ok(),
         "retention hold should prevent GC"
+    );
+}
+
+#[then(regex = r#"^"(\S+)" is NOT deleted$"#)]
+async fn then_not_deleted_short(w: &mut KisekiWorld, _name: String) {
+    let id = w.last_chunk_id.unwrap();
+    assert!(
+        w.chunk_store.read_chunk(&id).is_ok(),
+        "retention hold should prevent GC (chunk still readable)"
     );
 }
 
@@ -530,11 +546,12 @@ async fn then_remains(w: &mut KisekiWorld) {
 #[then("GC re-evaluates after the hold expires or is released")]
 async fn then_gc_reevaluates(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    // Release the hold, then GC should delete the chunk.
+    // Release all known hold names, then GC should delete the chunk.
     let holds: Vec<String> = vec![
         "legal-hold".into(),
         "hipaa-7yr".into(),
         "retention-hold".into(),
+        "hipaa-litigation-2026".into(),
     ];
     for hold in &holds {
         let _ = w.chunk_store.release_retention_hold(&id, hold);

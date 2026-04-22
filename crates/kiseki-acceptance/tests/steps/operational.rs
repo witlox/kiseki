@@ -1248,7 +1248,7 @@ async fn then_key_unavailable(_w: &mut KisekiWorld, _client: String) {
 
 // === Scenario: Tenant configures shorter crypto-shred TTL ===
 
-#[given(regex = r#"^"(\S+)" requests cache TTL of (\d+) seconds \(within \[(\S+)\] bounds\)$"#)]
+#[given(regex = r#"^"(\S+)" requests cache TTL of (\d+) seconds \(within \[([^\]]+)\] bounds\)$"#)]
 async fn given_ttl_request(w: &mut KisekiWorld, tenant: String, _ttl: u64, _bounds: String) {
     w.ensure_tenant(&tenant);
 }

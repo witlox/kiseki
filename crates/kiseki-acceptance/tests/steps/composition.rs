@@ -545,7 +545,7 @@ async fn then_comp_references(w: &mut KisekiWorld, _chunks: String) {
     );
 }
 
-#[then(regex = r#"^refcounts for (\S+) are initialized to (\d+)$"#)]
+#[then(regex = r#"^refcounts for (.+) are initialized to (\d+)$"#)]
 async fn then_refcounts_initialized(w: &mut KisekiWorld, _chunks: String, _count: u64) {
     assert!(
         w.last_error.is_none(),

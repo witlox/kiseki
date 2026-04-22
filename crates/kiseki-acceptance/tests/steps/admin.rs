@@ -390,6 +390,9 @@ async fn when_subscribe_device_health(w: &mut KisekiWorld) {}
 #[given(regex = r"^a device transitions from Healthy to Degraded$")]
 async fn given_device_transition(w: &mut KisekiWorld) {}
 
+#[when(regex = r"^a device transitions from Healthy to Degraded$")]
+async fn when_device_transition(w: &mut KisekiWorld) {}
+
 #[then(regex = r"^the admin receives a DeviceHealthEvent with old_state and new_state$")]
 async fn then_health_event(w: &mut KisekiWorld) {
     // Simulate device state transition using StorageAdminService and verify
@@ -1218,6 +1221,9 @@ async fn then_cluster_audit_contains(w: &mut KisekiWorld) {
 
 #[given(regex = r"^(\d+),?000 events are generated before the client reads$")]
 async fn given_many_events(w: &mut KisekiWorld, _k: u64) {}
+
+#[when(regex = r"^(\d+),?000 events are generated before the client reads$")]
+async fn when_many_events(w: &mut KisekiWorld, _k: u64) {}
 
 #[then(regex = r"^the oldest events are dropped \(buffer capped at (\d+),?000\)$")]
 async fn then_events_dropped(w: &mut KisekiWorld, cap_k: u64) {
