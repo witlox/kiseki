@@ -393,8 +393,16 @@ impl ControlService for ControlGrpc {
         let requested_proto = req.requested.unwrap_or_default();
         let requested = flavor::Flavor {
             name: requested_proto.name,
-            protocol: requested_proto.protocols.first().cloned().unwrap_or_default(),
-            transport: requested_proto.transports.first().cloned().unwrap_or_default(),
+            protocol: requested_proto
+                .protocols
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            transport: requested_proto
+                .transports
+                .first()
+                .cloned()
+                .unwrap_or_default(),
             topology: requested_proto.topology,
         };
         let matched = flavor::match_best_fit(&available, &requested);
@@ -447,9 +455,7 @@ impl ControlService for ControlGrpc {
                 },
             })
             .collect();
-        Ok(Response::new(pb::ListPeersResponse {
-            peers: proto_peers,
-        }))
+        Ok(Response::new(pb::ListPeersResponse { peers: proto_peers }))
     }
 
     async fn set_maintenance_mode(

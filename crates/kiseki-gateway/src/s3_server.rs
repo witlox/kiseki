@@ -20,7 +20,7 @@ use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 use crate::ops::GatewayOps;
 use crate::s3::{
     AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CreateMultipartUploadRequest,
-    DeleteObjectRequest, GetObjectRequest, PutObjectRequest, UploadPartRequest, S3Gateway,
+    DeleteObjectRequest, GetObjectRequest, PutObjectRequest, S3Gateway, UploadPartRequest,
 };
 
 /// Shared state for S3 HTTP handlers.

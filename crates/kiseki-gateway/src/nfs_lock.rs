@@ -206,10 +206,7 @@ impl LockManager {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .entry(file_handle)
-            .or_default()
-            .try_lock(lock, now_ms)
+        state.entry(file_handle).or_default().try_lock(lock, now_ms)
     }
 
     /// Release a byte-range lock.
@@ -245,9 +242,10 @@ impl LockManager {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .get(&file_handle)
-            .and_then(|fs| fs.test_lock(lock_type, offset, length, owner, now_ms).cloned())
+        state.get(&file_handle).and_then(|fs| {
+            fs.test_lock(lock_type, offset, length, owner, now_ms)
+                .cloned()
+        })
     }
 
     /// Expire all stale locks across all files. Returns total expired.

@@ -33,7 +33,12 @@ pub struct InMemoryGateway {
     view_store: Option<Arc<Mutex<ViewStore>>>,
     /// Last-written sequence per session for `ReadYourWrites` enforcement.
     /// Maps (tenant, namespace) → highest committed sequence number.
-    last_written_seq: Mutex<std::collections::HashMap<(kiseki_common::ids::OrgId, kiseki_common::ids::NamespaceId), kiseki_common::ids::SequenceNumber>>,
+    last_written_seq: Mutex<
+        std::collections::HashMap<
+            (kiseki_common::ids::OrgId, kiseki_common::ids::NamespaceId),
+            kiseki_common::ids::SequenceNumber,
+        >,
+    >,
 }
 
 impl InMemoryGateway {

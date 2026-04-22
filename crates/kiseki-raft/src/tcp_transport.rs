@@ -146,9 +146,7 @@ where
         let resp: openraft::raft::SnapshotResponse<C> =
             rpc_call(&self.addr, &("full_snapshot", &envelope))
                 .await
-                .map_err(|e| {
-                    openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
-                })?;
+                .map_err(|e| openraft::error::StreamingError::Unreachable(Unreachable::new(&e)))?;
 
         Ok(resp)
     }

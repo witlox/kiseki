@@ -204,10 +204,7 @@ impl<G: GatewayOps> S3Gateway<G> {
     }
 
     /// S3 `UploadPart`.
-    pub fn upload_part(
-        &self,
-        req: &UploadPartRequest,
-    ) -> Result<UploadPartResponse, GatewayError> {
+    pub fn upload_part(&self, req: &UploadPartRequest) -> Result<UploadPartResponse, GatewayError> {
         let etag = self
             .inner
             .upload_part(&req.upload_id, req.part_number, &req.body)?;

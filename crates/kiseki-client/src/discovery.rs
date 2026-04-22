@@ -86,7 +86,11 @@ impl DiscoveryClient {
             .split(',')
             .filter(|s| !s.is_empty())
             .filter_map(|addr_str| {
-                addr_str.trim().parse().ok().map(|addr| SeedEndpoint { addr })
+                addr_str
+                    .trim()
+                    .parse()
+                    .ok()
+                    .map(|addr| SeedEndpoint { addr })
             })
             .collect();
         Self::new(seeds)
@@ -98,12 +102,9 @@ impl DiscoveryClient {
     /// Returns `None` if all seeds are unreachable.
     pub fn discover(&mut self) -> Option<&DiscoveryResponse> {
         // Check if cache is still valid.
-        let cache_valid = self
-            .cached
-            .as_ref()
-            .is_some_and(|(resp, fetched_at)| {
-                fetched_at.elapsed().as_millis() < u128::from(resp.ttl_ms)
-            });
+        let cache_valid = self.cached.as_ref().is_some_and(|(resp, fetched_at)| {
+            fetched_at.elapsed().as_millis() < u128::from(resp.ttl_ms)
+        });
 
         if cache_valid {
             return self.cached.as_ref().map(|(r, _)| r);

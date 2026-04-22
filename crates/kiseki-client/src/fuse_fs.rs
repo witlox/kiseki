@@ -220,7 +220,12 @@ impl<G: GatewayOps> KisekiFuse<G> {
         }
         let ino = self.next_ino;
         self.next_ino += 1;
-        self.inodes.insert(ino, InodeEntry::Dir { name: name.to_owned() });
+        self.inodes.insert(
+            ino,
+            InodeEntry::Dir {
+                name: name.to_owned(),
+            },
+        );
         self.name_to_ino.insert(name.to_owned(), ino);
         Ok(ino)
     }
