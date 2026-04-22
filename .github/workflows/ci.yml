@@ -97,6 +97,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: features-${{ matrix.name }}
+      - name: Install libfuse3-dev (for client-fuse feature)
+        if: matrix.name == 'client-fuse'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - run: ${{ matrix.cmd }}
 
   # ---------------------------------------------------------------------------

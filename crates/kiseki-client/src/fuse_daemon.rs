@@ -17,7 +17,7 @@ use std::path::Path;
 #[cfg(feature = "fuse")]
 use fuser::{
     FileAttr as FuserAttr, FileType as FuserFileType, Filesystem, MountOption, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request, TimeOrNow,
+    ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
 
 #[cfg(feature = "fuse")]
@@ -75,7 +75,7 @@ impl<G: GatewayOps> FuseDaemon<G> {
 
 #[cfg(feature = "fuse")]
 impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let fs = self.inner.lock().unwrap();
         match fs.getattr(ino) {
             Ok(attr) => reply.attr(&TTL, &to_fuser_attr(ino, &attr)),
