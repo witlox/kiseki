@@ -16,10 +16,12 @@
 pub mod device;
 pub mod ec;
 pub mod error;
+pub mod persistent_store;
 pub mod placement;
 pub mod pool;
 pub mod store;
 
 pub use error::ChunkError;
+pub use persistent_store::PersistentChunkStore;
 pub use pool::{AffinityPool, DurabilityStrategy};
 pub use store::{ChunkOps, ChunkStore};

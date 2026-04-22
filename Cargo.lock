@@ -1403,11 +1403,15 @@ dependencies = [
 name = "kiseki-chunk"
 version = "2026.1.0"
 dependencies = [
+ "kiseki-block",
  "kiseki-common",
  "kiseki-crypto",
  "kiseki-keymanager",
  "proptest",
  "reed-solomon-erasure",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "uuid",
 ]

@@ -125,20 +125,18 @@ impl DeviceCharacteristics {
     fn probe_fallback(path: &Path) -> Self {
         // Non-block-device path (regular file, or non-Linux).
         // Use file-backed defaults with 4K simulated alignment.
-        let is_block_device = path
-            .metadata()
-            .is_ok_and(|m| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::FileTypeExt;
-                    m.file_type().is_block_device()
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = m;
-                    false
-                }
-            });
+        let is_block_device = path.metadata().is_ok_and(|m| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                m.file_type().is_block_device()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = m;
+                false
+            }
+        });
 
         if is_block_device {
             // Block device but no sysfs — assume SSD with conservative defaults.

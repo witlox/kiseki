@@ -37,6 +37,10 @@ pub enum ChunkError {
     /// Chunk lost — too many fragments missing to reconstruct.
     #[error("chunk lost: insufficient fragments for reconstruction")]
     ChunkLost,
+
+    /// I/O error from persistent storage backend.
+    #[error("chunk I/O error: {0}")]
+    Io(String),
 }
 
 impl From<ChunkError> for KisekiError {
@@ -60,6 +64,7 @@ impl From<ChunkError> for KisekiError {
             ChunkError::ChunkLost => {
                 KisekiError::Permanent(PermanentError::ChunkLost(ChunkId([0; 32])))
             }
+            ChunkError::Io(msg) => KisekiError::Permanent(PermanentError::InvariantViolation(msg)),
         }
     }
 }

@@ -43,8 +43,9 @@ pub trait ChunkOps {
     /// increments the refcount instead of writing new data (I-C1, I-C2).
     fn write_chunk(&mut self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError>;
 
-    /// Read a chunk by ID.
-    fn read_chunk(&self, chunk_id: &ChunkId) -> Result<&Envelope, ChunkError>;
+    /// Read a chunk by ID. Returns an owned Envelope (supports both
+    /// in-memory and persistent backends).
+    fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError>;
 
     /// Increment refcount for an existing chunk (dedup).
     fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
@@ -241,10 +242,10 @@ impl ChunkOps for ChunkStore {
         Ok(true) // new write
     }
 
-    fn read_chunk(&self, chunk_id: &ChunkId) -> Result<&Envelope, ChunkError> {
+    fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
         self.chunks
             .get(chunk_id)
-            .map(|e| &e.envelope)
+            .map(|e| e.envelope.clone())
             .ok_or(ChunkError::NotFound(*chunk_id))
     }
 

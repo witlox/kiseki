@@ -34,7 +34,8 @@ impl BitmapAllocator {
     /// The bitmap is initialized to all-free (zeros).
     #[must_use]
     pub fn new(total_blocks: u64, block_size: u32) -> Self {
-        #[allow(clippy::cast_possible_truncation)] // bitmap index always fits in usize for practical device sizes
+        #[allow(clippy::cast_possible_truncation)]
+        // bitmap index always fits in usize for practical device sizes
         let bitmap_bytes = total_blocks.div_ceil(8) as usize;
         let bitmap = vec![0u8; bitmap_bytes];
         let max_extent_blocks = MAX_EXTENT_BYTES / u64::from(block_size);
@@ -70,8 +71,7 @@ impl BitmapAllocator {
     /// Returns a single extent up to `max_extent_blocks`. For larger
     /// requests, the caller must call `alloc` multiple times.
     pub fn alloc(&mut self, size_bytes: u64) -> Result<Extent, AllocError> {
-        let blocks_needed =
-            size_bytes.div_ceil(u64::from(self.block_size));
+        let blocks_needed = size_bytes.div_ceil(u64::from(self.block_size));
         let blocks_needed = blocks_needed.min(self.max_extent_blocks);
 
         if blocks_needed == 0 {

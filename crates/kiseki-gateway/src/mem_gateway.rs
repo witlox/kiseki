@@ -214,7 +214,7 @@ impl GatewayOps for InMemoryGateway {
             let env = chunks
                 .read_chunk(chunk_id)
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
-            let decrypted = envelope::open_envelope(&self.aead, &self.master_key, env)
+            let decrypted = envelope::open_envelope(&self.aead, &self.master_key, &env)
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
             plaintext.extend_from_slice(&decrypted);
         }

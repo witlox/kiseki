@@ -69,7 +69,8 @@ impl FileBackedDevice {
         }
 
         // Write empty bitmaps (all zeros = all free).
-        #[allow(clippy::cast_possible_truncation)] // bitmap index fits in usize for practical device sizes
+        #[allow(clippy::cast_possible_truncation)]
+        // bitmap index fits in usize for practical device sizes
         let bitmap_size = sb.total_blocks.div_ceil(8) as usize;
         let empty_bitmap = vec![0u8; bitmap_size];
         {
@@ -103,7 +104,8 @@ impl FileBackedDevice {
         let sb = Superblock::from_bytes(&sb_buf)?;
 
         // Read primary bitmap.
-        #[allow(clippy::cast_possible_truncation)] // bitmap index fits in usize for practical device sizes
+        #[allow(clippy::cast_possible_truncation)]
+        // bitmap index fits in usize for practical device sizes
         let bitmap_size = sb.total_blocks.div_ceil(8) as usize;
         let mut bitmap = vec![0u8; bitmap_size];
         file.seek(SeekFrom::Start(sb.bitmap_offset))?;
