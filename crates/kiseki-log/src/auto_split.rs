@@ -179,6 +179,7 @@ mod tests {
             config: ShardConfig {
                 max_delta_count: 100,
                 max_byte_size: 1024,
+                ..ShardConfig::default()
             },
             range_start: [0u8; 32],
             range_end: [0xFFu8; 32],

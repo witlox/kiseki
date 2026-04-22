@@ -79,6 +79,9 @@ pub mod nfs3_server;
 pub mod nfs4_server;
 
 #[cfg(feature = "nfs")]
+pub mod nfs_lock;
+
+#[cfg(feature = "nfs")]
 #[allow(
     missing_docs,
     clippy::doc_markdown,

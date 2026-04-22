@@ -24,15 +24,30 @@ pub enum ShardState {
     Maintenance,
 }
 
-/// Multi-dimension split thresholds (I-L6).
+/// Multi-dimension split thresholds (I-L6) and inline data config (ADR-030).
 ///
 /// Any single dimension exceeding its ceiling forces a mandatory split.
+/// The inline threshold determines whether small-file content is stored
+/// in `small/objects.redb` (metadata tier) or as a chunk extent on a
+/// raw block device (data tier). See I-SF1, I-L9.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardConfig {
     /// Maximum number of deltas before mandatory split.
     pub max_delta_count: u64,
     /// Maximum total byte size before mandatory split.
     pub max_byte_size: u64,
+    /// Inline data threshold in bytes (ADR-030, I-SF1).
+    ///
+    /// Files with encrypted payload <= this size are stored inline
+    /// in `small/objects.redb`. Files above go to chunk block devices.
+    /// Dynamic: computed from cluster topology, clamped to
+    /// `[inline_floor, inline_ceiling]`. Changes are prospective only (I-L9).
+    pub inline_threshold_bytes: u64,
+    /// Hard lower bound for inline threshold (ADR-030).
+    /// Metadata-like payloads (empty files, symlinks) always inline.
+    pub inline_floor_bytes: u64,
+    /// Hard upper bound for inline threshold (ADR-030).
+    pub inline_ceiling_bytes: u64,
 }
 
 impl Default for ShardConfig {
@@ -40,6 +55,9 @@ impl Default for ShardConfig {
         Self {
             max_delta_count: 10_000_000,
             max_byte_size: 10 * 1024 * 1024 * 1024, // 10 GB
+            inline_threshold_bytes: 4096,
+            inline_floor_bytes: 128,
+            inline_ceiling_bytes: 65536,
         }
     }
 }

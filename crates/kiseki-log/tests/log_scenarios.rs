@@ -268,6 +268,7 @@ fn shard_split_redistributes_deltas() {
         ShardConfig {
             max_delta_count: 5,
             max_byte_size: u64::MAX,
+            ..ShardConfig::default()
         },
     );
 

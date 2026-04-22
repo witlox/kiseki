@@ -31,6 +31,9 @@ pub struct InMemoryGateway {
     dedup_policy: DedupPolicy,
     tenant_hmac_key: Option<Vec<u8>>,
     view_store: Option<Arc<Mutex<ViewStore>>>,
+    /// Last-written sequence per session for `ReadYourWrites` enforcement.
+    /// Maps (tenant, namespace) → highest committed sequence number.
+    last_written_seq: Mutex<std::collections::HashMap<(kiseki_common::ids::OrgId, kiseki_common::ids::NamespaceId), kiseki_common::ids::SequenceNumber>>,
 }
 
 impl InMemoryGateway {
@@ -52,6 +55,7 @@ impl InMemoryGateway {
             dedup_policy: DedupPolicy::CrossTenant,
             tenant_hmac_key: None,
             view_store: None,
+            last_written_seq: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -188,21 +192,39 @@ impl GatewayOps for InMemoryGateway {
             return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
         }
 
-        // Check view staleness (I-K9) if view store is attached.
+        // Check view staleness and ReadYourWrites consistency (I-K9, I-V3).
         if let Some(ref vs) = self.view_store {
             let view_store = vs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Find a view covering this composition's shard.
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-            // Check all views for staleness — any stale view blocks the read.
-            // In production, only the view serving this shard matters.
+
             for view_id in view_store.view_ids() {
                 if let Ok(view) = view_store.get_view(view_id) {
+                    // BoundedStaleness: check lag.
                     if view.check_staleness(now_ms).is_err() {
                         return Err(GatewayError::StaleView {
                             lag_ms: now_ms.saturating_sub(view.last_advanced_ms),
                         });
+                    }
+                    // ReadYourWrites: ensure view has caught up to our last write.
+                    if matches!(
+                        view.descriptor.consistency,
+                        kiseki_view::ConsistencyModel::ReadYourWrites
+                    ) {
+                        let last_seq = self
+                            .last_written_seq
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(&(req.tenant_id, req.namespace_id))
+                            .copied();
+                        if let Some(seq) = last_seq {
+                            if view.watermark < seq {
+                                return Err(GatewayError::StaleView {
+                                    lag_ms: 0, // not time-based, sequence-based
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -255,12 +277,20 @@ impl GatewayOps for InMemoryGateway {
 
         let bytes_written = req.data.len() as u64;
 
-        // Store the encrypted chunk.
-        self.chunks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_chunk(env, "default")
-            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+        // Store the encrypted chunk (I-C2: refcount managed by write_chunk).
+        {
+            let mut chunks = self
+                .chunks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let is_new = chunks
+                .write_chunk(env, "default")
+                .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            // If dedup hit (chunk existed), explicitly increment refcount.
+            if !is_new {
+                let _ = chunks.increment_refcount(&chunk_id);
+            }
+        }
 
         // Create a composition referencing this chunk.
         let comp_id = self
@@ -300,7 +330,8 @@ impl GatewayOps for InMemoryGateway {
         _namespace_id: kiseki_common::ids::NamespaceId,
         composition_id: kiseki_common::ids::CompositionId,
     ) -> Result<(), GatewayError> {
-        // Verify tenant ownership before deleting.
+        // Verify tenant ownership and collect chunk refs before deleting.
+        let chunk_ids: Vec<kiseki_common::ids::ChunkId>;
         {
             let compositions = self
                 .compositions
@@ -312,11 +343,27 @@ impl GatewayOps for InMemoryGateway {
             if comp.tenant_id != tenant_id {
                 return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
             }
+            chunk_ids = comp.chunks.clone();
         }
+
+        // Delete the composition.
         self.compositions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .delete(composition_id)
-            .map_err(|e| GatewayError::Upstream(e.to_string()))
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+
+        // Decrement chunk refcounts (I-C2: GC when refcount reaches 0).
+        {
+            let mut chunks = self
+                .chunks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for chunk_id in &chunk_ids {
+                let _ = chunks.decrement_refcount(chunk_id);
+            }
+        }
+
+        Ok(())
     }
 }

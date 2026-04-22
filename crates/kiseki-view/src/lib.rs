@@ -22,4 +22,5 @@ pub mod view;
 pub use descriptor::{ConsistencyModel, ProtocolSemantics, ViewDescriptor};
 pub use error::ViewError;
 pub use pin::ReadPin;
+pub use stream_processor::{DeltaHandler, NoopHandler, TrackedStreamProcessor};
 pub use view::{ViewOps, ViewState, ViewStore};
