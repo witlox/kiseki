@@ -29,3 +29,4 @@ tonic = { workspace = true }
 proptest = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

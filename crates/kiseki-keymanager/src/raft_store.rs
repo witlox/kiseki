@@ -169,8 +169,9 @@ impl RaftKeyStore {
     }
 
     /// Apply a command: append to log and apply to state machine.
+    /// Returns the log index assigned to this command.
     #[allow(clippy::needless_pass_by_value)] // cmd is logged + applied; taking by value is clearer
-    fn apply_command(&self, cmd: KeyCommand) {
+    pub fn apply_command(&self, cmd: KeyCommand) -> u64 {
         let mut log = self
             .log
             .lock()
@@ -184,6 +185,42 @@ impl RaftKeyStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.apply(index, &cmd);
+        index
+    }
+
+    /// Get a snapshot of the current command log.
+    #[must_use]
+    pub fn command_log(&self) -> Vec<(u64, KeyCommand)> {
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Reconstruct a `RaftKeyStore` from a persisted command log.
+    /// Does NOT bootstrap — assumes the commands contain the initial epoch.
+    pub fn from_commands(
+        commands: impl Iterator<Item = (u64, KeyCommand)>,
+    ) -> Result<Self, KeyManagerError> {
+        let store = Self {
+            state: Mutex::new(StateMachine::new()),
+            log: Mutex::new(Vec::new()),
+        };
+        for (idx, cmd) in commands {
+            let mut log = store
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            log.push((idx, cmd.clone()));
+            drop(log);
+
+            let mut state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.apply(idx, &cmd);
+        }
+        Ok(store)
     }
 
     /// Get the command log length.

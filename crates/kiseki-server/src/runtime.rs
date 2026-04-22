@@ -51,13 +51,34 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         );
     }
 
-    // Key Manager: Raft-ready store with initial epoch.
-    let key_store = RaftKeyStore::new().map_err(|e| format!("key store init: {e}"))?;
+    // Key Manager: persistent (redb) if KISEKI_DATA_DIR set, otherwise in-memory.
+    // Uses PersistentKeyStore for dual-write (memory + redb) in persistent mode.
+    // Falls back to plain RaftKeyStore (memory-only) otherwise.
+    // Both implement KeyManagerOps; gRPC uses PersistentKeyStore when available.
+    let key_store = if let Some(ref dir) = cfg.data_dir {
+        std::fs::create_dir_all(dir.join("keys")).ok();
+        let store =
+            kiseki_keymanager::PersistentKeyStore::open(&dir.join("keys").join("epochs.redb"))
+                .map_err(|e| format!("persistent key store: {e}"))?;
+        eprintln!(
+            "  key manager: persistent (redb), epoch {} ready",
+            store.health().current_epoch.unwrap_or(0)
+        );
+        store
+    } else {
+        // In-memory: use PersistentKeyStore with a temp path that won't be reused.
+        // This keeps the runtime code uniform (single type for key_store).
+        let tmp = std::env::temp_dir().join(format!("kiseki-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let store = kiseki_keymanager::PersistentKeyStore::open(&tmp.join("epochs.redb"))
+            .map_err(|e| format!("key store init: {e}"))?;
+        eprintln!(
+            "  key manager: in-memory (ephemeral), epoch {} ready",
+            store.health().current_epoch.unwrap_or(0)
+        );
+        store
+    };
     let key_store = Arc::new(key_store);
-    eprintln!(
-        "  key manager: epoch {} ready",
-        key_store.health().current_epoch.unwrap_or(0)
-    );
 
     // Log store: persistent (redb) if KISEKI_DATA_DIR set, otherwise in-memory.
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
