@@ -95,20 +95,51 @@ test passes against Docker.
 
 ---
 
-## Phase P4: Persistence — Chunk (pool files)
+## Phase P4: Persistence — Chunk (raw block devices, ADR-029)
 
-**Goal**: Chunk data persisted to pool files on disk.
+**Goal**: Chunk ciphertext persisted to raw block devices via the
+new `kiseki-block` crate. Metadata in redb on system partition.
 
-This is the largest persistence task — chunks are currently
-HashMap<ChunkId, ChunkEntry>. Need a file-backed store with
-offset tracking per pool device.
+### P4a: `kiseki-block` crate — DeviceBackend + allocator
 
-**Key files**:
-- `crates/kiseki-chunk/src/store.rs` (add file-backed impl)
-- `crates/kiseki-chunk/src/pool.rs` (device → file mapping)
+**New crate**: `crates/kiseki-block/`
+
+- `DeviceBackend` trait (alloc, write, read, free, sync, capacity)
+- `FileBackedDevice` — sparse file implementation (VMs/CI/tests)
+- `RawBlockDevice` — O_DIRECT implementation (real hardware)
+- `DeviceProbe` — sysfs auto-detection of device characteristics
+- `Superblock` — on-disk format (magic, UUID, bitmap offsets)
+- `BitmapAllocator` — extent allocation with free-list cache,
+  mirrored bitmap, redb journal for crash safety
+- Per-extent CRC32 for corruption detection
+- WAL intent journal for crash-safe writes
+
+**Exit**: `FileBackedDevice` passes full test suite: alloc/free
+round-trip, CRC32 verification, crash recovery (simulated),
+bitmap mirror consistency, extent coalescing, scrub.
+
+### P4b: `PersistentChunkStore` — wire into `kiseki-chunk`
+
+- Implements `ChunkOps` using `DeviceBackend` + redb `chunk_meta`
+- Write path: EC encode → alloc extents → write with CRC32 →
+  commit chunk_meta → clear intent journal
+- Read path: lookup chunk_meta → read extents → verify CRC32 →
+  EC decode → return Envelope
+- GC: free extents → batch TRIM → remove chunk_meta
 
 **Exit**: Chunk write→restart→read returns correct data. GC
-reclaims disk space.
+reclaims space. EC repair works after simulated device failure.
+
+### P4c: Server wiring + device manager
+
+- `DeviceManager` opens devices at startup, probes characteristics
+- Server runtime: conditional `PersistentChunkStore` when
+  `KISEKI_DATA_DIR` is set
+- Device init safety checks (existing superblock, FS signatures)
+- Periodic scrub (bitmap vs redb consistency)
+
+**Exit**: `kiseki-server` boots with file-backed devices, writes
+and reads chunks through the full pipeline.
 
 ---
 
@@ -116,7 +147,7 @@ reclaims disk space.
 
 **Goal**: Run the 19 existing e2e tests against Docker deployment.
 
-1. `docker compose up` with single node
+1. `docker compose up` with single node (file-backed devices)
 2. Run `tests/e2e/` suite
 3. Fix any failures (likely: auth, timing, port conflicts)
 4. Run 3-node cluster e2e tests
@@ -141,14 +172,17 @@ reclaims disk space.
 ## Execution order
 
 ```
-Q1 (quality gate) ──→ Q2 (step audit) ──→ P1 (log persistence)
-                                           ├── P2 (key persistence)
-                                           ├── P3 (audit persistence)
-                                           └── P4 (chunk persistence)
-                                                    ↓
-                                              I1 (e2e validation)
-                                                    ↓
-                                              I2 (multi-node raft)
+Q1 ──→ Q2 ──→ P1 (log) ──→ P2 (keys) ──→ P3 (audit)
+                                              ↓
+                              P4a (kiseki-block crate)
+                                              ↓
+                              P4b (PersistentChunkStore)
+                                              ↓
+                              P4c (server wiring)
+                                              ↓
+                                        I1 (e2e)
+                                              ↓
+                                        I2 (multi-node)
 ```
 
 ## Verification
@@ -160,14 +194,16 @@ After each phase:
 
 ## Estimated effort
 
-| Phase | Sessions |
-|-------|----------|
-| Q1 Quality gate | 1 |
-| Q2 Step audit | 1-2 |
-| P1 Log persistence | 2 |
-| P2 Key persistence | 1 |
-| P3 Audit persistence | 1 |
-| P4 Chunk persistence | 2-3 |
-| I1 E2E validation | 1-2 |
-| I2 Multi-node Raft | 2-3 |
-| **Total** | **~12-15** |
+| Phase | Sessions | Status |
+|-------|----------|--------|
+| Q1 Quality gate | 1 | **Done** |
+| Q2 Step audit | 1 | **Done** |
+| P1 Log persistence | 1 | **Done** |
+| P2 Key persistence | 1 | **Done** |
+| P3 Audit persistence | 1 | **Done** |
+| P4a kiseki-block crate | 3-4 | Pending |
+| P4b PersistentChunkStore | 2 | Pending |
+| P4c Server wiring | 1 | Pending |
+| I1 E2E validation | 1-2 | Pending |
+| I2 Multi-node Raft | 2-3 | Pending |
+| **Total** | **~15-18** | **5 done, 5 pending** |

@@ -216,17 +216,18 @@ need reconstruction.
 **Invariant**: A device in `Evacuating` state accepts no new writes
 but serves reads for chunks not yet migrated.
 
-### Filesystem per JBOD device
+### Storage backend per JBOD device
 
 | Approach | Pros | Cons | Recommendation |
 |----------|------|------|----------------|
-| **xfs** | Scales to 100M+ files, good NVMe support | Extra FS overhead | Default for HDD + SSD |
-| **ext4** | Well-tested, fast for small files | Inode limits at scale | Acceptable for small deployments |
-| **Raw block** | Zero FS overhead, direct I/O | Complex, custom allocator needed | Future optimization |
+| **Raw block** (ADR-029) | Zero FS overhead, direct I/O, aligned writes, bitmap allocator with redb journal | Custom allocator in `kiseki-block` | **Default** — recommended for production |
+| **File-backed** (ADR-029) | Same `DeviceBackend` trait, works in VMs/CI without raw devices | Slight overhead from host FS | VMs and CI environments |
+| **xfs** | Scales to 100M+ files, good NVMe support | Extra FS overhead, inode pressure at scale | Legacy / deprecated |
 
-**Default**: xfs on each JBOD device, mounted at `/data/<device-id>/`.
-Kiseki manages files within the mount point. Operator provisions the
-filesystem as part of node setup.
+**Default**: Raw block device I/O via `kiseki-block` (`DeviceBackend`
+trait with auto-detection of device characteristics). File-backed
+fallback for VMs and CI. XFS is deprecated as a chunk storage backend;
+existing XFS deployments can migrate via background evacuation.
 
 ### Device discovery
 

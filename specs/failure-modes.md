@@ -1,7 +1,7 @@
 # Failure Modes — Kiseki
 
 **Status**: Layer 5 — derived from Layers 1-4 interrogation.
-**Last updated**: 2026-04-22. Added ADR-028 per-provider failure modes.
+**Last updated**: 2026-04-22. Added ADR-028 per-provider failure modes and ADR-029 block I/O failure modes.
 
 Each failure mode has: description, blast radius, detection mechanism,
 desired degradation, and severity.
@@ -55,6 +55,28 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 | **Detection** | Device health monitoring, I/O errors |
 | **Degradation** | EC repair for affected chunks using surviving fragments/replicas. Pool operates at reduced redundancy until repair completes. |
 | **Recovery** | Replace device. Rebalance and re-protect affected chunks. |
+| **Severity** | **P3** |
+
+### F-I5: Bitmap corruption on data device (ADR-029)
+
+| Field | Value |
+|---|---|
+| **Description** | Allocation bitmap on a raw block device is corrupted (bit flip, partial write) |
+| **Blast radius** | One device's chunks — space accounting incorrect for that device |
+| **Detection** | Checksum mismatch on bitmap read (superblock carries bitmap checksum) |
+| **Degradation** | Device marked degraded. Reads for existing chunks unaffected (chunk_meta in redb is intact). New allocations on this device suspended. |
+| **Recovery** | Rebuild bitmap from redb `chunk_meta` reverse scan (`device_alloc` table). All extents recorded in redb are marked allocated; all others freed. Automatic on detection. |
+| **Severity** | **P3** |
+
+### F-I6: Extent leak — blocks allocated but chunk_meta not written (ADR-029)
+
+| Field | Value |
+|---|---|
+| **Description** | Blocks allocated in bitmap and journaled in redb, but chunk_meta entry never written (crash between allocation and chunk write completion) |
+| **Blast radius** | Wasted space on one device — orphan extents consume capacity but hold no valid data |
+| **Detection** | Periodic scrub comparing bitmap allocations vs redb `chunk_meta` entries. Orphan extents have bitmap bits set but no corresponding `chunk_meta` record. |
+| **Degradation** | Space waste only. No data loss. No read impact. |
+| **Recovery** | Scrub frees orphan extents (clear bitmap bits, remove `device_alloc` journal entry). Scrub runs periodically (default: every 6 hours) and on device startup. |
 | **Severity** | **P3** |
 
 ---
@@ -354,7 +376,7 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 | P0 | 2 | System key manager loss, system KEK compromise |
 | P1 | 6 | Tenant KMS loss, log corruption, key compromise, algo deprecation, control plane down, network partition (wide) |
 | P2 | 9 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm |
-| P3 | 5 | Gateway crash, client crash, device failure, split latency, replay attack |
+| P3 | 7 | Gateway crash, client crash, device failure, split latency, replay attack, bitmap corruption, extent leak |
 
-Total: **22 failure modes** catalogued with blast radius, detection,
+Total: **24 failure modes** catalogued with blast radius, detection,
 degradation, and recovery.

@@ -125,6 +125,26 @@ EC rebuild works, GC respects holds, retention holds block deletion.
 
 ---
 
+## Phase 6.5: Block I/O (ADR-029)
+
+**Crates**: `kiseki-block`
+**Depends on**: Phase 0
+
+- `DeviceBackend` trait with two implementations: `RawDevice`, `FileBacked`
+- Auto-detection of device characteristics (physical block size, optimal I/O size)
+- Bitmap allocator with redb journal (allocation bitmap updates journaled before application)
+- Superblock per device (magic, version, device UUID, bitmap offset, capacity)
+- Block-aligned I/O (all writes aligned to physical block size)
+- File-backed fallback for VMs and CI (same trait, backed by a regular file)
+- Periodic scrub: bitmap vs redb `device_alloc` consistency check
+
+**Exit criteria**: raw device write→read round-trip with alignment, bitmap
+allocate→free cycle, journal crash recovery (simulate crash between journal
+write and bitmap apply), file-backed fallback passes same test suite,
+auto-detection returns correct block size for NVMe and file backends.
+
+---
+
 ## Phase 7: Composition
 
 **Crates**: `kiseki-composition`
@@ -283,8 +303,9 @@ Phase 0 (common, proto)
   │     │     │     │     └── Phase 10 (client) ←── Phase 2
   │     │     │     │
   │     ├── Phase 4 (key manager)
-  │     │     └── Phase 6 (chunk)
+  │     │     └── Phase 6 (chunk) ←── Phase 6.5 (block I/O)
   │     │
+  ├── Phase 6.5 (block I/O — ADR-029, depends on Phase 0 only)
   ├── Phase 2 (transport)
   │     └── Phase 10 (client)
   │
@@ -297,4 +318,5 @@ Phase 0 (common, proto)
 - Phase 11 (control plane) can be built in parallel with Phases 3-10
 - Phase 2 (transport) can be built in parallel with Phases 1, 3, 4
 - Phase 5 (audit) can start as soon as Phase 3 is done
+- Phase 6.5 (block I/O) depends only on Phase 0 and can be built in parallel with Phases 1-5
 - Phase 11.5 (advisory) can start as soon as Phase 5 (audit) and the Phase 11 advisory-policy endpoint are done; it is independent of Phases 6-10 because it does not link against any data-path crate

@@ -39,6 +39,7 @@ service backed by the same trait implementation.
 | `CryptoOps` | kiseki-crypto | all crates that encrypt/decrypt |
 | `KeyManagerOps` | kiseki-keymanager (remote) | kiseki-chunk, kiseki-crypto |
 | `TenantKmsProvider` | kiseki-crypto (5 impls: Internal, Vault, KMIP, AWS KMS, PKCS#11 — ADR-028) | kiseki-gateway, kiseki-client, kiseki-view (via CryptoOps) |
+| `DeviceBackend` | kiseki-block (2 impls: RawDevice, FileBacked — ADR-029) | kiseki-chunk (block-aligned I/O, bitmap allocation) |
 | `AdvisoryLookup` | kiseki-advisory | kiseki-log, kiseki-chunk, kiseki-composition, kiseki-view, kiseki-gateway-* (wired by `kiseki-server`; bounded-deadline, non-blocking — ADR-021 §3) |
 
 ---

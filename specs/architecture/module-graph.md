@@ -18,6 +18,7 @@ kiseki/
 │   ├── kiseki-crypto/            ← FIPS AEAD, envelope, TenantKmsProvider (ADR-028)
 │   ├── kiseki-raft/              ← Shared Raft: config, log store, transport
 │   ├── kiseki-log/               ← Log context: delta, shard, Raft
+│   ├── kiseki-block/             ← Raw block device I/O: DeviceBackend, bitmap allocator (ADR-029)
 │   ├── kiseki-chunk/             ← Chunk Storage: placement, EC, device, GC
 │   ├── kiseki-composition/       ← Composition context: namespace, refcount
 │   ├── kiseki-view/              ← View Materialization: stream processors
@@ -67,6 +68,7 @@ proto/
 | Bounded context | Primary module | Language | Binary |
 |---|---|---|---|
 | Log | `kiseki-log` | Rust | kiseki-server |
+| Block I/O | `kiseki-block` | Rust | kiseki-server |
 | Chunk Storage | `kiseki-chunk` | Rust | kiseki-server |
 | Composition | `kiseki-composition` | Rust | kiseki-server |
 | View Materialization | `kiseki-view` | Rust | kiseki-server |
@@ -115,7 +117,8 @@ kiseki-gateway-nfs  kiseki-gateway-s3
 - `kiseki-log` depends on `kiseki-common` + `kiseki-crypto` + openraft
 - `kiseki-audit` depends on `kiseki-common` + `kiseki-crypto`
 - `kiseki-keymanager` depends on `kiseki-common` + `kiseki-crypto` + openraft
-- `kiseki-chunk` depends on `kiseki-common` + `kiseki-crypto`
+- `kiseki-block` depends on `kiseki-common` (raw device I/O, bitmap allocator, redb journal)
+- `kiseki-chunk` depends on `kiseki-common` + `kiseki-crypto` + `kiseki-block`
 - `kiseki-composition` depends on `kiseki-common` + `kiseki-log` + `kiseki-chunk`
 - `kiseki-view` depends on `kiseki-common` + `kiseki-log` + `kiseki-chunk` + `kiseki-crypto`
 - `kiseki-gateway-nfs` depends on `kiseki-common` + `kiseki-view` + `kiseki-composition` + `kiseki-crypto`

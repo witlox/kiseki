@@ -1,6 +1,6 @@
 # Ubiquitous Language — Kiseki
 
-**Status**: Layer 1 complete. Updated for ADR-027 (Rust-only) and ADR-028 (External KMS).
+**Status**: Layer 1 complete. Updated for ADR-027 (Rust-only), ADR-028 (External KMS), and ADR-029 (Raw Block Device Allocator).
 **Last updated**: 2026-04-22.
 
 One term per concept. No synonyms. If a term is not in this file, it is
@@ -88,6 +88,16 @@ not part of the domain language.
 | Term | Definition | Context | Notes |
 |---|---|---|---|
 | **Chunk compression** | Optional compress-then-encrypt with fixed-size padding at the chunk level. Default off (safest). Tenant opt-in. Compliance tags may prohibit enabling. | Chunk Storage | CRIME/BREACH side-channel risk mitigated by padding. Residual risk accepted by tenant on opt-in. |
+
+## Block I/O (ADR-029)
+
+| Term | Definition | Context | Notes |
+|---|---|---|---|
+| **Extent** | A contiguous range on a data device, identified by (offset, length). The unit of space allocation for chunk data. Extents are block-aligned. | Chunk Storage / Block I/O | An extent maps 1:1 to a chunk fragment on a device. |
+| **DeviceBackend** | Trait abstracting raw block device I/O. Two implementations: `RawDevice` (direct block device access via O_DIRECT) and `FileBacked` (regular file fallback for VMs/CI). Auto-detected at device open. | Block I/O | ADR-029. All chunk data I/O goes through this trait. |
+| **Superblock** | Per-device metadata block written at offset 0. Contains: magic number, format version, device UUID, bitmap offset, bitmap size, capacity, physical block size. Written once at device initialization; updated on format changes. | Block I/O | ADR-029. Read at device open to validate and configure the allocator. |
+| **Allocation bitmap** | Per-device bit vector tracking free vs allocated blocks. Ground truth for space management on a device. Updates are journaled in redb before application. Free-list is a derived in-memory cache rebuilt from the bitmap on startup. | Block I/O | ADR-029. One bit per allocatable block. |
+| **DeviceCharacteristics** | Auto-probed properties of a data device: physical block size, logical block size, optimal I/O size, rotational flag, capacity. Probed via `ioctl` on raw devices or `statfs` on file-backed devices. Used to align all I/O. | Block I/O | ADR-029. Cached at device open. |
 
 ## Workflow advisory and telemetry
 

@@ -28,24 +28,31 @@ Use **redb** v2 for all structured persistent storage.
 | Raft vote/term | `raft_meta` | `&str` ("vote", "term") | `u64` |
 | State machine snapshot | `sm_snapshot` | `"latest"` | bincode-serialized state |
 | Chunk metadata | `chunk_meta` | `[u8; 32]` (chunk_id) | bincode ChunkMeta |
+| Device allocation | `device_alloc` | `(DeviceId, u64)` (device + offset) | `[u8; 32]` (chunk_id) — reverse index |
 | View watermarks | `view_wm` | `[u8; 16]` (view_id) | `u64` (sequence) |
 
 ### What redb does NOT handle
 
-**Chunk ciphertext data** is stored in pool files (one large sparse file
-per device, not one file per chunk — avoids inode exhaustion at scale):
+**Chunk ciphertext data** is written directly to raw block devices
+(or file-backed fallback for VMs/CI) via the `DeviceBackend` trait
+in `kiseki-block` (ADR-029). redb stores metadata only; chunk
+ciphertext never passes through redb.
 ```
 $KISEKI_DATA_DIR/
-  pools/
-    fast-nvme-dev0.pool   # sparse file, grows to device capacity
-    fast-nvme-dev1.pool   # chunks stored at offsets within file
-    bulk-hdd-dev0.pool
+  devices/
+    /dev/nvme0n1          # raw block device (default, ADR-029)
+    /dev/nvme1n1          # raw block device
+    /tmp/kiseki-dev0.img  # file-backed fallback (VMs/CI)
   raft/
-    db.redb               # redb database file
+    db.redb               # redb database file (metadata only)
 ```
 
 redb tracks chunk placement: `chunk_meta` table maps
 `chunk_id → (device_id, offset, size, fragment_index)`.
+The `device_alloc` table provides a reverse index
+`(device_id, offset) → chunk_id` for bitmap rebuild and scrub.
+Bitmap allocation updates are journaled in redb before application
+to the on-device bitmap (ADR-029).
 
 **Why pool files, not per-chunk files**:
 - At 100TB / 64KB avg = 1.6B chunks → filesystem inode exhaustion
@@ -109,3 +116,4 @@ Raft log append + metadata lookup.
 - redb: https://github.com/cberner/redb
 - RFC 1813 §3: NFS3 procedure semantics
 - build-phases.md Phase 3: "SSTable" storage (now redb B-tree)
+- ADR-029: Raw Block Device Allocator (chunk data I/O)

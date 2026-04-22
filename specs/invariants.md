@@ -1,6 +1,6 @@
 # Invariants — Kiseki
 
-**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers).
+**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers) and ADR-029 (Raw Block Device Allocator).
 **Last updated**: 2026-04-22.
 
 All invariants below have been confirmed through interrogation with the
@@ -35,6 +35,8 @@ domain expert unless marked otherwise.
 | I-C4 | Chunk durability strategy is per affinity pool. EC is the default. Replication (N-copy) available for pools where EC overhead is unacceptable. Pool-level policy set by cluster admin. | Confirmed |
 | I-C5 | Pool writes are rejected when pool reaches Critical threshold (per-device-class: SSD 85%, HDD 92%). Pool redirection stays within same device class only. ENOSPC returned when pool is Full. | Confirmed |
 | I-C6 | EC parameters (data_chunks, parity_chunks) are immutable per pool. `SetPoolDurability` applies only to new chunks. Existing chunks retain original EC config. Re-encoding requires explicit `ReencodePool` RPC. | Confirmed |
+| I-C7 | All chunk data writes are aligned to the device's physical block size (auto-detected via `DeviceCharacteristics`). No unaligned I/O. Alignment enforced by `kiseki-block` `DeviceBackend` trait (ADR-029). | Confirmed |
+| I-C8 | Allocation bitmap on each data device is the ground truth for space management. Free-list is a derived cache rebuilt on startup. Bitmap updates are journaled in redb (`device_alloc` table) before application to the on-device bitmap. Crash between journal and bitmap apply is recovered by replaying the redb journal (ADR-029). | Confirmed |
 
 ---
 
