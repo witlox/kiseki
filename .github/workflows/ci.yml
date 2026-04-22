@@ -169,17 +169,24 @@ jobs:
       - name: Install Python deps
         run: pip install --quiet -r tests/e2e/pyproject.toml 2>/dev/null || pip install grpcio grpcio-tools protobuf pytest tenacity pydantic structlog
 
-      - name: Run e2e tests
+      - name: Run single-node e2e tests
         working-directory: tests/e2e
-        run: pytest -ra --tb=short
+        run: pytest -ra --tb=short --ignore=test_multi_node.py
+
+      - name: Teardown single-node
+        run: docker compose down -v
+
+      - name: Run multi-node e2e tests
+        working-directory: tests/e2e
+        run: pytest -ra --tb=short test_multi_node.py
 
       - name: Collect logs on failure
         if: failure()
-        run: docker compose logs
+        run: docker compose -f docker-compose.3node.yml logs 2>/dev/null; docker compose logs 2>/dev/null; true
 
       - name: Teardown
         if: always()
-        run: docker compose down -v
+        run: docker compose -f docker-compose.3node.yml down -v 2>/dev/null; docker compose down -v 2>/dev/null; true
 
   proto-coverage:
     name: Proto Coverage
