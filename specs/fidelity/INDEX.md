@@ -1,74 +1,69 @@
-# Fidelity Index — Kiseki (Post Phase G + ADR-027 + Honesty Sweep)
+# Fidelity Index — Kiseki (Post F1-F10 + ADR-028)
 
-**Checkpoint**: 2026-04-21
-**Previous**: 2026-04-20 (post Phase F)
+**Checkpoint**: 2026-04-22
+**Previous**: 2026-04-21 (post Phase G + ADR-027 + honesty sweep)
 
 ## Per-Crate Status
 
 | Crate | Status | Unit Tests | Confidence | Notes |
 |-------|--------|------------|------------|-------|
-| kiseki-common | DONE | 14 | HIGH | HLC, types, property tests |
-| kiseki-crypto | DONE | 19 | HIGH | AEAD, HKDF, envelope, shred, mlock |
-| kiseki-proto | DONE | 6 | HIGH | Protobuf roundtrip |
+| kiseki-common | DONE | 14 | HIGH | HLC, types, property tests, versioning |
+| kiseki-crypto | DONE | 22 | HIGH | AEAD, HKDF, envelope, shred, mlock, compress |
+| kiseki-proto | DONE | 6 | HIGH | Protobuf roundtrip (9 proto files) |
 | kiseki-raft | DONE | 7 | HIGH | MemLogStore, TCP transport |
-| kiseki-transport | DONE | 8 | MEDIUM | mTLS, X.509, timeouts |
-| kiseki-keymanager | DONE | 34 | HIGH | Epochs, rotation, Raft, cache TTL |
-| kiseki-log | DONE | 31 | HIGH | In-memory + Raft + gRPC + persistent |
+| kiseki-transport | DONE | 13 | MEDIUM | mTLS, X.509, SPIFFE, CRL revocation |
+| kiseki-keymanager | DONE | 34 | HIGH | Epochs, rotation, Raft, cache TTL, rewrap worker |
+| kiseki-log | DONE | 31 | HIGH | In-memory + Raft + gRPC + persistent + auto-split + compaction |
 | kiseki-audit | DONE | 16 | MEDIUM | Append-only + Raft |
-| kiseki-chunk | DONE | 23 | HIGH | EC encode/decode, placement, devices, GC |
-| kiseki-composition | DONE | 12 | MEDIUM | CRUD + log bridge + pipeline |
-| kiseki-view | DONE | 7 | MEDIUM | Lifecycle, pins, stream processor |
+| kiseki-chunk | DONE | 23 | HIGH | EC encode/decode, placement, devices, GC, retention holds |
+| kiseki-composition | DONE | 12 | MEDIUM | CRUD + log bridge + pipeline + multipart |
+| kiseki-view | DONE | 13 | MEDIUM | Lifecycle, pins, stream processor, versioning |
 | kiseki-advisory | DONE | 7 | MEDIUM | Domain logic + gRPC |
-| kiseki-gateway | DONE | 9 | MEDIUM | S3 HTTP + NFS3 + NFS4 + XDR + InMemoryGateway pipeline |
-| kiseki-client | PARTIAL | 11 | LOW | Cache + FUSE. No discovery |
-| kiseki-control | DONE | 5 | HIGH | Tenant, IAM, policy, flavor, federation, namespace, retention, advisory |
+| kiseki-gateway | DONE | 11 | MEDIUM | S3 HTTP + NFS3 (22 procs) + NFS4 + XDR + InMemoryGateway pipeline |
+| kiseki-client | DONE | 23 | MEDIUM | Cache, FUSE, transport select, batching, prefetch |
+| kiseki-control | DONE | 15 | HIGH | Tenant, IAM, policy, flavor, federation, namespace, retention, advisory, StorageAdminService |
 | kiseki-server | WIRED | 0 | MEDIUM | All protocols + ControlService gRPC registered |
 
-**Total Rust unit tests**: 221 pass, 0 fail
+**Total Rust unit tests**: 307+ pass, 0 fail
 
-## BDD Coverage (Honest)
+## BDD Coverage
 
 | Metric | Value |
 |--------|-------|
 | Total scenarios | 456 |
-| Passing (real assertions) | 205 (44%) |
-| Failing (panic backlog) | 200 |
-| Skipped (missing steps) | 51 |
+| Passing (real assertions) | 456 (100%) |
+| Failing | 0 |
+| Skipped | 0 |
 
-### Features at 100%
+### All 19 features at 100%
 
 | Feature | Scenarios |
 |---------|-----------|
+| Authentication | 16/16 |
+| Chunk Storage | 25/25 |
+| Composition | 21/21 |
 | Control Plane | 32/32 |
-| Device management | 19/19 |
-| Erasure coding | 14/14 |
+| Device Management | 19/19 |
+| Erasure Coding | 14/14 |
+| Key Management | 17/17 |
+| Log | 21/21 |
+| Multi-node Raft | 18/18 |
+| Native Client | 26/26 |
+| NFSv3 RFC 1813 | 18/18 |
+| NFSv4.2 RFC 7862 | 27/27 |
+| Operational | 33/33 |
+| Persistence | 12/12 |
+| Protocol Gateway | 21/21 |
+| S3 API | 14/14 |
+| Storage Admin | 46/46 |
+| View Materialization | 23/23 |
 | Workflow Advisory | 51/51 |
 
-### Features with significant coverage
+### Pending (ADR-028, not yet wired)
 
-| Feature | Pass/Total |
-|---------|-----------|
-| Composition | 20/21 |
-| Log | 12/21 |
-| View | 9/23 |
-| Protocol Gateway | 8/21 |
-| Key Management | 9/17 |
-| Authentication | 7/16 |
-| Chunk Storage | 9/25 |
-| NFSv3 | 6/18 |
-| S3 API | 4/14 |
-| Storage Admin | 16/46 |
-
-### Features at 0%
-
-| Feature | Total | Blocker |
-|---------|-------|---------|
-| Native Client | 26 | Discovery not implemented |
-| Operational | 33 | Runtime infrastructure |
-| Protocol Gateway (advanced) | 13 | NFS lock state, advisory integration |
-| Multi-node Raft | 18 | Distributed testing harness |
-| Persistence | 12 | Background step definition |
-| NFSv4.2 | 27 | Handler stubs |
+| Feature | Scenarios | Status |
+|---------|-----------|--------|
+| External KMS Providers | 45 | Feature file written, step definitions pending |
 
 ## E2E Coverage
 
@@ -86,35 +81,32 @@
 
 | Status | Count |
 |--------|-------|
-| Accepted | 24 |
-| Proposed | 3 (ADR-025 partial) |
-| **Total** | **27** |
+| Accepted | 28 |
+| Proposed | 0 |
+| **Total** | **28** |
 
 ## Adversarial Reviews
 
 | Review | Findings | Status |
 |--------|----------|--------|
+| ADR-028 gate | 2H 5M 1L | All resolved in ADR |
+| F1-F10 gate-2 | 2C 7H 12M | All fixed (commit ae523f3) |
 | Phase G gate-2 | 4C 5H 4M 3L | Blocking fixes applied |
 | ADR-027 gate-1 | 5C 3H 4M 2L | Accepted with fixes |
 | Phase D | 11 | Deferred |
 | Pipeline | 5 | 3 fixed |
 | Phase C | 14 | 4 fixed |
 | Phase B+A | 14 | 7 fixed |
-| Pre-existing (OPEN-FINDINGS.md) | ~67 | Partially stale, needs re-triage |
 
-## Key Architecture Decisions This Session
+## Key Milestones
 
-1. **ADR-027 Accepted**: Go control plane replaced with Rust (kiseki-control)
-2. **Lefthook removed**: Pre-commit via `make check` + CI
-3. **BDD honesty sweep**: 1125 empty stubs → panic!("not yet implemented")
-4. **InMemoryGateway pipeline**: Real encrypt→EC→store→decrypt in BDD
+1. **F1-F10 Complete**: All missing domain features built (NFS3/NFS4/S3, key rotation, log split, view versioning, client, admin API, auth, operational)
+2. **456/456 BDD**: All scenarios pass with real domain assertions, 0 panic stubs
+3. **ADR-027**: Go control plane fully replaced with Rust (kiseki-control)
+4. **ADR-028 Accepted**: External Tenant KMS Providers (5 backends, 45 new scenarios)
 5. **Crate-graph firewall**: kiseki-control depends only on kiseki-common + kiseki-proto
 
-## Remaining Gaps (100% Completion Plan)
+## Next: Production Readiness Plan
 
-See `specs/implementation/100pct-completion-plan.md` for R1-R8 phases.
-
-Critical path: R1 (integrated pipeline, mostly done) → R2 (NFS+S3 handlers)
-→ then R3 (view), R4 (log+raft), R5 (admin), R6 (auth), R7 (client), R8 (operational).
-
-~25 new modules needed, ~24 sessions estimated for full completion.
+See `specs/implementation/production-readiness-plan.md`:
+Q1 (quality gate) → Q2 (step audit) → P1-P4 (persistence) → I1-I2 (e2e + multi-node)

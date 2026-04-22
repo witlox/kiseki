@@ -3,8 +3,8 @@
 **Status**: Architect phase.
 **Last updated**: 2026-04-17.
 
-Maps bounded contexts to Rust crates and Go packages. Every module
-traces to a spec artifact.
+Maps bounded contexts to Rust crates. Every module traces to a spec
+artifact. Go removed per ADR-027 — single-language Rust.
 
 ---
 
@@ -15,7 +15,7 @@ kiseki/
 ├── Cargo.toml                    (workspace root)
 ├── crates/
 │   ├── kiseki-common/            ← shared types, HLC, errors
-│   ├── kiseki-crypto/            ← FIPS AEAD, envelope, key wrapping
+│   ├── kiseki-crypto/            ← FIPS AEAD, envelope, TenantKmsProvider (ADR-028)
 │   ├── kiseki-raft/              ← Shared Raft: config, log store, transport
 │   ├── kiseki-log/               ← Log context: delta, shard, Raft
 │   ├── kiseki-chunk/             ← Chunk Storage: placement, EC, device, GC

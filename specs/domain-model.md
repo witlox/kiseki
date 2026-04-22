@@ -1,7 +1,7 @@
 # Domain Model — Kiseki
 
-**Status**: First cut — Layer 1 interrogation in progress.
-**Last updated**: 2026-04-17, Session 2.
+**Status**: Layer 1 complete. Updated for ADR-027 (Rust-only) and ADR-028 (External KMS).
+**Last updated**: 2026-04-22.
 
 ---
 
@@ -22,7 +22,7 @@ distinct responsibility, failure domain, and scaling concern.
 ┌────────────────────┐              ┌────────────────────┐
 │        Log         │              │  Key Management    │
 │  Delta ordering    │              │  System key mgr    │
-│  Raft per shard    │              │  Tenant KMS integ  │
+│  Raft per shard    │              │  Tenant KMS (5 providers, ADR-028)  │
 │  Replication       │              │  Rotation/escrow   │
 │  Durability        │              │  Crypto-shred      │
 └────────┬───────────┘              └────────┬───────────┘

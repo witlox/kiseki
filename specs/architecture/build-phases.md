@@ -14,7 +14,7 @@ releases — all phases must complete before production deployment.
 **Crates**: `kiseki-common`, `kiseki-proto`
 
 - Shared types: HLC, identifiers, error types, DeltaTimestamp
-- Protobuf definitions: compile and generate Rust + Go code
+- Protobuf definitions: compile and generate Rust code (Go removed per ADR-027)
 - Unit tests: type serialization, HLC ordering, clock sync
 
 **Exit criteria**: all common types compile, protobuf generates cleanly,

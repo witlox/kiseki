@@ -1,7 +1,7 @@
 # Assumptions Log — Kiseki
 
-**Status**: Active — updated through Session 2.
-**Last updated**: 2026-04-17.
+**Status**: Active — updated for ADR-028 (External KMS Providers).
+**Last updated**: 2026-04-22.
 
 Statuses: **Validated** (confirmed true), **Rejected** (confirmed false),
 **Accepted** (acknowledged risk, proceeding), **Unknown** (needs investigation).
@@ -49,7 +49,9 @@ Statuses: **Validated** (confirmed true), **Rejected** (confirmed false),
 | A-K4 | Content-address hash (chunk ID) computed on plaintext before encryption | **Validated** | Co-occurrence leak (existence confirmation with candidate plaintext) accepted as bounded risk. Mitigated by: tenant-scoped chunk ID namespace for opted-out tenants, chunk IDs stored within system-encrypted layer, dedup ratios subject to tenant access controls. |
 | A-K5 | Crypto-shred destroys tenant KEK only; system encryption remains | **Validated** | Physical GC runs separately on refcount=0 + no retention hold. Retention holds must be set before crypto-shred. |
 | A-K6 | NIC-offloaded wire encryption on Slingshot Cassini is not production-ready | **Unknown** | If false, one-sided RDMA with encryption becomes more viable. If true, CPU-encrypt or design around it. |
-| A-K7 | Tenants operate their own external KMS (or are willing to) | **Unknown** | Kiseki-hosted KMS with tenant-admin-only access is an alternative. Exact KMS boundary deferred to architect. |
+| A-K7 | Tenants choose external KMS provider at onboarding. Five options: Kiseki-Internal (default), Vault, KMIP 2.1, AWS KMS, PKCS#11. Provider cannot be changed without full re-wrapping (ADR-028). | **Validated** | ADR-028 accepted 2026-04-22. Internal provider is zero-config default. |
+| A-K7b | Each external KMS provider's availability is the tenant's responsibility. Kiseki provides cached-key window (5s-300s TTL, I-K15) but no SLA harmonization across providers. | **Accepted (risk)** | Provider connectivity varies; tenant designs for multi-region failover if required. |
+| A-K7c | Tenant manages KMS provider credentials (Vault AppRole rotation, AWS IAM role rotation, KMIP cert renewal, PKCS#11 PIN). Kiseki does not automate credential lifecycle. Credential expiry = key access loss (same as F-K1). | **Accepted** | Documented in ADR-028 security considerations. |
 
 ## Tenancy
 
@@ -76,8 +78,7 @@ Statuses: **Validated** (confirmed true), **Rejected** (confirmed false),
 These emerged during interrogation and are explicitly NOT the analyst's
 decisions:
 
-1. KMS deployment topology: dedicated per-tenant VLAN instance vs.
-   shared with tenant-scoped policies vs. tenant-brings-own
+1. ~~KMS deployment topology~~ — **RESOLVED** by ADR-028: pluggable TenantKmsProvider trait with 5 backends
 2. Shard split/merge threshold tuning: who configures (cluster admin,
    tenant admin, both)?
 3. System DEK granularity: per-chunk vs. per-group

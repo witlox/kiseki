@@ -1,7 +1,7 @@
 # Cross-Context Interactions — Kiseki
 
-**Status**: Layer 4 — interrogation in progress.
-**Last updated**: 2026-04-17, Session 2.
+**Status**: Layer 4 complete. Updated for ADR-028 (External KMS Providers).
+**Last updated**: 2026-04-22.
 
 ---
 
@@ -25,7 +25,7 @@ Chunk Storage        Composition
   │                View Materialization (stream processor consumes)
   │
   └─── Key Management (system DEK for chunk encryption,
-                        tenant KEK wrapping for access)
+                        tenant KEK wrapping via TenantKmsProvider — ADR-028)
 ```
 
 **Contract**: The Protocol Gateway is the coordinator. It:
@@ -44,10 +44,12 @@ Chunk Storage        Composition
 - Step 7 fails (delta commit): abort, orphan chunks GC'd (refcount 0)
 - Step 8 timeout: client retries; idempotent chunk writes safe to repeat
 
-**Key material flow**:
-- Gateway holds cached tenant KEK (from tenant KMS)
-- Gateway requests system DEK from system key manager
-- System DEK encrypts chunk; system DEK wrapped with tenant KEK in envelope
+**Key material flow** (ADR-028):
+- Gateway calls `TenantKmsProvider::wrap()` with AAD=chunk_id
+- Provider handles wrap locally (Internal, Vault, KMIP) or remotely (AWS KMS, PKCS#11)
+- System DEK derived locally via HKDF (ADR-003); never sent over network
+- Wrapped derivation parameters stored in envelope
+- On read: `TenantKmsProvider::unwrap()` → HKDF → decrypt
 
 ---
 

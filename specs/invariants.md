@@ -1,7 +1,7 @@
 # Invariants — Kiseki
 
-**Status**: Layer 2 — interrogation substantially complete.
-**Last updated**: 2026-04-17, Session 2.
+**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers).
+**Last updated**: 2026-04-22.
 
 All invariants below have been confirmed through interrogation with the
 domain expert unless marked otherwise.
@@ -142,6 +142,18 @@ domain expert unless marked otherwise.
 | I-K12 | System key manager is an internal Kiseki service with its own HA/consensus. Unavailability blocks all chunk writes cluster-wide. Must be at least as available as the Log. | Confirmed |
 | I-K13 | Data-fabric authentication is mTLS with per-tenant certificates signed by the Cluster CA. Optional second-stage auth via tenant IdP. No real-time auth server required on the data path. | Confirmed |
 | I-K14 | Compression is off by default. Tenant opt-in for compress-then-encrypt with padding. Compliance tags may prohibit compression (e.g., HIPAA namespaces). | Confirmed |
+
+---
+
+## External KMS invariants (ADR-028)
+
+| ID | Invariant | Status |
+|---|---|---|
+| I-K16 | Provider abstraction is opaque to callers. No access-control, correctness, or crypto decision depends on which TenantKmsProvider backend is selected. Provider failures are handled identically regardless of backend. | Confirmed |
+| I-K17 | Wrap/unwrap operations include AAD (chunk_id) binding. A wrapped blob cannot be spliced from one envelope to another without authentication failure. Each provider maps AAD to its native mechanism (Vault context, KMS EncryptionContext, KMIP Correlation Value, PKCS#11 pParameter). | Confirmed |
+| I-K18 | Tenant KMS provider is validated on configuration: connectivity test, wrap/unwrap round-trip, certificate chain (if mTLS). Validation failure prevents tenant activation. Invalid configurations are rejected atomically — no partial state. | Confirmed |
+| I-K19 | Internal provider stores tenant KEKs in a separate Raft group from system master keys. Compromise of one group does not expose the other. Internal mode does not provide the full two-layer security guarantee of ADR-002 — operators with access to both groups have full access. | Confirmed |
+| I-K20 | Provider migration (e.g., Internal → Vault) requires re-wrapping all existing envelopes. Migration is operator-initiated, background, audited, and preserves data availability throughout. Provider switch is atomic after 100% re-wrap. | Confirmed |
 
 ---
 

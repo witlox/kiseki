@@ -1,6 +1,7 @@
 # Open Adversarial Findings Index
 
-Generated: 2026-04-19. Total: 67 open findings across 21 documents.
+Generated: 2026-04-19. Updated: 2026-04-22 (ADR-027/028, F1-F10 complete).
+Total: ~50 open findings (17 resolved since last triage).
 
 Grouped by what blocks resolution.
 
@@ -23,12 +24,12 @@ Grouped by what blocks resolution.
 
 - wi3-gate: No mTLS interceptor on gRPC services (Medium)
 - R5-review: LogService has no tenant authorization check (High) — TODO in grpc.rs, needs interceptor
-- R8-review: Control plane server has no TLS (High) — TODO in main.go, needs mTLS
+- R8-review: Control plane server has no TLS (High) — RESOLVED: Rust control plane via ADR-027, gRPC + mTLS wired in kiseki-server
 - a4-mtls-grpc-gate: No integration test with mTLS client (Medium)
 
 ## Blocked by: gRPC wiring (remaining)
 
-- wi3-gate: Go ControlService not wired (Medium)
+- wi3-gate: ~~Go ControlService not wired~~ RESOLVED: Rust ControlService wired (ADR-027)
 - wi3-gate: Advisory streaming RPCs unimplemented (Low)
 - phase12-gate2: Server is scaffold, no e2e test (High)
 
@@ -42,22 +43,22 @@ Grouped by what blocks resolution.
 
 ## Blocked by: Protocol implementations (R7)
 
-- phase9-gate2: No implementation behind GatewayOps (Medium)
-- phase10-gate2: No FUSE implementation (Medium)
+- ~~phase9-gate2: No implementation behind GatewayOps~~ RESOLVED: F1-F3 (NFS3/NFS4/S3 handlers)
+- ~~phase10-gate2: No FUSE implementation~~ RESOLVED: F7 (client FUSE + transport)
 - phase10-gate2: Discovery response not authenticated (Medium)
 
 ## Blocked by: Missing features
 
-- phase2-gate2: OrgId extraction placeholder (Medium) — RESOLVED in A.2
-- phase2-gate2: No connection timeout (Medium) — RESOLVED in A.1
-- phase2-gate2: No CRL checking (Medium) — RESOLVED in A.3 (untested)
+- ~~phase2-gate2: OrgId extraction placeholder (Medium) — RESOLVED in A.2~~
+- ~~phase2-gate2: No connection timeout (Medium) — RESOLVED in A.1~~
+- ~~phase2-gate2: No CRL checking (Medium) — RESOLVED in A.3~~
 - phase2-gate2: No connection pool (Low)
-- phase2-gate2: No SPIFFE SAN parsing (Low) — RESOLVED in A.2
+- ~~phase2-gate2: No SPIFFE SAN parsing (Low) — RESOLVED in A.2~~
 - phase3-gate2: Naive split midpoint (Medium)
 - phase3-gate2: Rough byte_size estimate (Low)
 - phase3-gate2: gc_floor not exposed (Low)
-- phase6-gate2: No EC encoding (Medium)
-- phase6-gate2: No placement engine (Medium)
+- ~~phase6-gate2: No EC encoding~~ RESOLVED: kiseki-chunk EC encode/decode (23 unit tests)
+- ~~phase6-gate2: No placement engine~~ RESOLVED: kiseki-chunk placement module
 - phase11-gate2: No persistence or gRPC server for control plane (High)
 - phase11-gate2: AccessRequest uses time.Now() (Medium)
 - phase11_5-gate2: No gRPC server or isolated runtime (High)

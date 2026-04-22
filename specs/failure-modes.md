@@ -1,7 +1,7 @@
 # Failure Modes — Kiseki
 
 **Status**: Layer 5 — derived from Layers 1-4 interrogation.
-**Last updated**: 2026-04-17, Session 2.
+**Last updated**: 2026-04-22. Added ADR-028 per-provider failure modes.
 
 Each failure mode has: description, blast radius, detection mechanism,
 desired degradation, and severity.
@@ -141,6 +141,50 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 | **Degradation** | System KEK rotation. Full re-encryption of all system DEK wrappings. |
 | **Recovery** | Rotate system KEK. Re-wrap all system DEKs with new system KEK. If attacker also has tenant KEK: full re-encryption of affected data. |
 | **Severity** | **P0** (security incident) |
+
+### F-K1a: Vault provider — sealed or token expired (ADR-028)
+
+| Field | Value |
+|---|---|
+| **Description** | Vault is sealed, storage backend offline, or auth token expired |
+| **Blast radius** | One tenant using Vault provider |
+| **Detection** | Wrap/unwrap returns 503 (sealed) or 403 (token expired) |
+| **Degradation** | Cached KEK sustains reads within TTL. Circuit breaker opens after 5 failures. |
+| **Recovery** | Unseal Vault or refresh auth token. Circuit breaker half-open probe resumes. |
+| **Severity** | **P1** (tenant-scoped) |
+
+### F-K1b: KMIP provider — protocol or certificate failure (ADR-028)
+
+| Field | Value |
+|---|---|
+| **Description** | KMIP server offline, protocol version incompatible, or client cert revoked |
+| **Blast radius** | One tenant using KMIP provider |
+| **Detection** | TTLV decode failure, connection refused, or TLS handshake error |
+| **Degradation** | Cached KEK sustains reads within TTL. |
+| **Recovery** | Restore KMIP server or renew client certificate. |
+| **Severity** | **P1** (tenant-scoped) |
+
+### F-K1c: AWS KMS — rate limit or region outage (ADR-028)
+
+| Field | Value |
+|---|---|
+| **Description** | AWS KMS ThrottlingException, region unavailable, or IAM role expired |
+| **Blast radius** | One tenant using AWS KMS provider |
+| **Detection** | HTTP 429 (throttle) or 503 (region). IAM: 403. |
+| **Degradation** | Cached derivation params sustain reads within TTL. Rate limiting triggers backoff. |
+| **Recovery** | Wait for rate limit reset, region recovery, or IAM role refresh. |
+| **Severity** | **P1** (tenant-scoped) |
+
+### F-K1d: PKCS#11 — HSM disconnect or PIN lockout (ADR-028)
+
+| Field | Value |
+|---|---|
+| **Description** | HSM device disconnected, session expired, or PIN lockout after failed attempts |
+| **Blast radius** | One tenant using PKCS#11 provider |
+| **Detection** | C_WrapKey/C_UnwrapKey returns CKR_TOKEN_NOT_PRESENT or CKR_PIN_LOCKED |
+| **Degradation** | Cached derivation params sustain reads within TTL. No fallback for PIN lockout. |
+| **Recovery** | Reconnect HSM or reset PIN via HSM admin console (out-of-band). |
+| **Severity** | **P1** (tenant-scoped) |
 
 ---
 

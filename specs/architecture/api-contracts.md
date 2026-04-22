@@ -10,16 +10,16 @@ scenarios in specs/features/.
 
 ## Cross-language boundary (gRPC)
 
-The Rust↔Go boundary uses gRPC/protobuf. All other intra-Rust communication
-is direct function calls via trait implementations.
+All communication is intra-Rust via trait implementations (Go removed per
+ADR-027). gRPC is used for inter-process and network boundaries.
 
 ### Services exposed via gRPC
 
 | Service | Provider | Consumer | Transport |
 |---|---|---|---|
-| `ControlService` | Go control plane | Rust server, CLI | Management network |
-| `AuditExportService` | Go control plane | Tenant SIEM | Tenant VLAN |
-| `KeyManagerService` | Rust keyserver | Rust server, Go control | Internal network |
+| `ControlService` | Rust control plane (kiseki-control) | Rust server, CLI | Management network |
+| `AuditExportService` | Rust control plane | Tenant SIEM | Tenant VLAN |
+| `KeyManagerService` | Rust keyserver (kiseki-keymanager) | Rust server | Internal network |
 | `DiscoveryService` | Rust server | Rust client | Data fabric |
 | `WorkflowAdvisoryService` | Rust server (kiseki-advisory) | Rust client (and any tenant-authorized caller) | Data fabric (separate listener, ADR-021 §1) |
 | `LogService` | Rust server (kiseki-log) | Rust client, gateways | Data fabric |
@@ -38,7 +38,7 @@ service backed by the same trait implementation.
 | `ViewOps` | kiseki-view | kiseki-gateway-*, kiseki-client |
 | `CryptoOps` | kiseki-crypto | all crates that encrypt/decrypt |
 | `KeyManagerOps` | kiseki-keymanager (remote) | kiseki-chunk, kiseki-crypto |
-| `TenantKmsOps` | kiseki-crypto | kiseki-gateway-*, kiseki-client, kiseki-view |
+| `TenantKmsProvider` | kiseki-crypto (5 impls: Internal, Vault, KMIP, AWS KMS, PKCS#11 — ADR-028) | kiseki-gateway, kiseki-client, kiseki-view (via CryptoOps) |
 | `AdvisoryLookup` | kiseki-advisory | kiseki-log, kiseki-chunk, kiseki-composition, kiseki-view, kiseki-gateway-* (wired by `kiseki-server`; bounded-deadline, non-blocking — ADR-021 §3) |
 
 ---

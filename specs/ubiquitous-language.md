@@ -1,7 +1,7 @@
 # Ubiquitous Language — Kiseki
 
-**Status**: Draft — Layer 1 interrogation in progress.
-**Last updated**: 2026-04-17, Session 2.
+**Status**: Layer 1 complete. Updated for ADR-027 (Rust-only) and ADR-028 (External KMS).
+**Last updated**: 2026-04-22.
 
 One term per concept. No synonyms. If a term is not in this file, it is
 not part of the domain language.
@@ -44,7 +44,9 @@ not part of the domain language.
 | **Envelope** | Complete wrapped structure for a chunk: ciphertext + system-layer wrapping metadata + tenant-layer wrapping metadata + authenticated metadata (chunk ID, algorithm identifiers, key epoch). | Key Management / Chunk Storage | Must carry algorithm identifiers for crypto-agility. |
 | **Key epoch** | Version marker for key rotation. New data uses current epoch's keys. Old data retains its epoch until background re-encryption migrates it (epoch-based rotation). Full re-encryption available as explicit admin action. | Key Management | Two epochs may coexist during rotation window. |
 | **System key manager** | Cluster-level component managing system keys (system DEKs and system KEKs). Onboard or external. Operated by cluster admin. | Key Management | |
-| **Tenant KMS** | Tenant-controlled key management system. External (tenant brings own: AWS KMS, HashiCorp Vault, HSM) or Kiseki-hosted with tenant-admin-only access. Must be reachable on tenant's VLAN. | Key Management | Exact deployment topology deferred to architect. |
+| **Tenant KMS** | Tenant-controlled key management system, accessed via the `TenantKmsProvider` trait (ADR-028). Five backends: Kiseki-Internal (default), HashiCorp Vault, KMIP 2.1, AWS KMS, PKCS#11. Selection is per-tenant at onboarding. Must be reachable from storage nodes. | Key Management | Provider abstraction encapsulates local-vs-remote material models. |
+| **Tenant KMS provider** | One of five pluggable backends implementing the `TenantKmsProvider` trait. Handles wrap/unwrap of DEK derivation parameters with AAD binding, key rotation, crypto-shred, and health checks. Callers never branch on provider type — the trait fully encapsulates protocol differences. | Key Management | ADR-028. Phases K1-K5. |
+| **KMS epoch ID** | Provider-specific key version identifier returned by `rotate()`. Maps to: Vault key version, KMIP key state transitions, AWS KMS key ID, PKCS#11 key handle, or Kiseki-internal `KeyEpoch`. Opaque to callers. | Key Management | ADR-028. |
 | **Crypto-shred** | Deletion by destroying the tenant KEK. Renders all tenant data unreadable. Does NOT immediately reclaim storage — physical GC runs separately when chunk refcount drops to 0 and no retention hold is active. | Key Management | Semantically authoritative deletion. Chunk ciphertext remains system-encrypted on disk until GC. |
 
 ## Infrastructure
