@@ -22,4 +22,5 @@ pub mod log;
 pub mod operational;
 pub mod protocol;
 pub mod raft;
+pub mod small_file;
 pub mod view;

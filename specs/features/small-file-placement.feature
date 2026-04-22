@@ -66,8 +66,8 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And node-1 has small_file_budget = 50 GB
     And node-2 has small_file_budget = 40 GB
     And shard "shard-1" has an estimated 10,000,000 files
-    Then the raw threshold = 40 GB / 10,000,000 = 4096 bytes
-    And the shard inline threshold is clamped to 4096 bytes
+    Then the raw threshold = 40 GB / 10,000,000 = 4294 bytes
+    And the shard inline threshold is clamped to 4294 bytes
 
   Scenario: Threshold clamped to floor when budget is tiny
     Given shard "shard-2" has voters on node-1 and node-2
