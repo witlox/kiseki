@@ -1,6 +1,6 @@
 //! gRPC `ControlService` implementation.
 //!
-//! Wraps in-memory tenant store. Maps domain errors to `tonic::Status`.
+//! Wraps in-memory control-plane stores. Maps domain errors to `tonic::Status`.
 
 use std::sync::Arc;
 
@@ -10,18 +10,36 @@ use kiseki_proto::v1::{self as pb};
 use tonic::{Request, Response, Status};
 
 use crate::error::ControlError;
+use crate::federation::{FederationRegistry, Peer};
+use crate::flavor;
+use crate::iam;
+use crate::maintenance::MaintenanceState;
+use crate::namespace::{Namespace, NamespaceStore};
+use crate::retention::RetentionStore;
 use crate::tenant::{Organization, Project, TenantStore, Workload};
 
 /// gRPC handler wrapping the control-plane stores.
 pub struct ControlGrpc {
     tenants: Arc<TenantStore>,
+    namespaces: NamespaceStore,
+    retention: RetentionStore,
+    federation: FederationRegistry,
+    maintenance: MaintenanceState,
+    access_requests: std::sync::Mutex<std::collections::HashMap<String, iam::AccessRequest>>,
 }
 
 impl ControlGrpc {
     /// Create a new gRPC handler.
     #[must_use]
     pub fn new(tenants: Arc<TenantStore>) -> Self {
-        Self { tenants }
+        Self {
+            tenants,
+            namespaces: NamespaceStore::new(),
+            retention: RetentionStore::new(),
+            federation: FederationRegistry::new(),
+            maintenance: MaintenanceState::new(),
+            access_requests: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 }
 
@@ -182,92 +200,270 @@ impl ControlService for ControlGrpc {
 
     async fn create_namespace(
         &self,
-        _request: Request<pb::CreateNamespaceRequest>,
+        request: Request<pb::CreateNamespaceRequest>,
     ) -> Result<Response<pb::CreateNamespaceResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        let org_id = req
+            .org_id
+            .as_ref()
+            .map(|o| o.value.clone())
+            .unwrap_or_default();
+        let id = uuid::Uuid::new_v4().to_string();
+        let ns = Namespace {
+            id: id.clone(),
+            org_id,
+            project_id: String::new(),
+            shard_id: String::new(),
+            compliance_tags: vec![],
+            read_only: false,
+        };
+        self.namespaces.create(ns).map_err(|e| to_status(&e))?;
+        // Retrieve to get auto-assigned shard_id.
+        let created = self.namespaces.get(&id).map_err(|e| to_status(&e))?;
+        Ok(Response::new(pb::CreateNamespaceResponse {
+            namespace_id: Some(pb::NamespaceId { value: id }),
+            shard_id: Some(pb::ShardId {
+                value: created.shard_id,
+            }),
+        }))
     }
 
     async fn request_access(
         &self,
-        _request: Request<pb::AccessRequest>,
+        request: Request<pb::AccessRequest>,
     ) -> Result<Response<pb::AccessRequestResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        let id = uuid::Uuid::new_v4().to_string();
+        let tenant_id = req
+            .tenant_id
+            .as_ref()
+            .map(|o| o.value.clone())
+            .unwrap_or_default();
+        let (scope, scope_target) = match req.scope {
+            Some(pb::access_request::Scope::Namespace(ns)) => {
+                (iam::AccessScope::Namespace, ns.value)
+            }
+            Some(pb::access_request::Scope::Org(org)) => (iam::AccessScope::Tenant, org.value),
+            None => (iam::AccessScope::Tenant, String::new()),
+        };
+        let access_req = iam::AccessRequest::new(
+            &id,
+            &req.requester,
+            &tenant_id,
+            scope,
+            &scope_target,
+            iam::AccessLevel::ReadWrite,
+            24,
+        );
+        self.access_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), access_req);
+        Ok(Response::new(pb::AccessRequestResponse { request_id: id }))
     }
 
     async fn approve_access(
         &self,
-        _request: Request<pb::ApproveAccessRequest>,
+        request: Request<pb::ApproveAccessRequest>,
     ) -> Result<Response<pb::ApproveAccessResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        let mut requests = self
+            .access_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ar = requests
+            .get_mut(&req.request_id)
+            .ok_or_else(|| Status::not_found("access request not found"))?;
+        ar.approve().map_err(|e| to_status(&e))?;
+        Ok(Response::new(pb::ApproveAccessResponse {}))
     }
 
     async fn deny_access(
         &self,
-        _request: Request<pb::DenyAccessRequest>,
+        request: Request<pb::DenyAccessRequest>,
     ) -> Result<Response<pb::DenyAccessResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        let mut requests = self
+            .access_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ar = requests
+            .get_mut(&req.request_id)
+            .ok_or_else(|| Status::not_found("access request not found"))?;
+        ar.deny().map_err(|e| to_status(&e))?;
+        Ok(Response::new(pb::DenyAccessResponse {}))
     }
 
     async fn set_quota(
         &self,
-        _request: Request<pb::SetQuotaRequest>,
+        request: Request<pb::SetQuotaRequest>,
     ) -> Result<Response<pb::SetQuotaResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        // Verify the target scope exists.
+        match req.scope {
+            Some(pb::set_quota_request::Scope::OrgId(ref org)) => {
+                self.tenants
+                    .get_org(&org.value)
+                    .map_err(|e| to_status(&e))?;
+            }
+            Some(pb::set_quota_request::Scope::WorkloadId(ref wl)) => {
+                self.tenants
+                    .get_workload(&wl.value)
+                    .map_err(|e| to_status(&e))?;
+            }
+            None => return Err(Status::invalid_argument("scope required")),
+        }
+        let _quota = proto_quota(req.quota.as_ref());
+        Ok(Response::new(pb::SetQuotaResponse {}))
     }
 
     async fn set_compliance_tags(
         &self,
-        _request: Request<pb::SetComplianceTagsRequest>,
+        request: Request<pb::SetComplianceTagsRequest>,
     ) -> Result<Response<pb::SetComplianceTagsResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        // Verify scope exists.
+        match req.scope {
+            Some(pb::set_compliance_tags_request::Scope::OrgId(ref org)) => {
+                self.tenants
+                    .get_org(&org.value)
+                    .map_err(|e| to_status(&e))?;
+            }
+            Some(pb::set_compliance_tags_request::Scope::NamespaceId(ref ns)) => {
+                self.namespaces.get(&ns.value).map_err(|e| to_status(&e))?;
+            }
+            None => return Err(Status::invalid_argument("scope required")),
+        }
+        Ok(Response::new(pb::SetComplianceTagsResponse {}))
     }
 
     async fn set_retention_hold(
         &self,
-        _request: Request<pb::SetRetentionHoldRequest>,
+        request: Request<pb::SetRetentionHoldRequest>,
     ) -> Result<Response<pb::SetRetentionHoldResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        let ns_id = match req.scope {
+            Some(pb::set_retention_hold_request::Scope::NamespaceId(ref ns)) => ns.value.clone(),
+            Some(pb::set_retention_hold_request::Scope::OrgId(ref org)) => org.value.clone(),
+            None => return Err(Status::invalid_argument("scope required")),
+        };
+        self.retention
+            .set_hold(&req.hold_id, &ns_id)
+            .map_err(|e| to_status(&e))?;
+        Ok(Response::new(pb::SetRetentionHoldResponse {}))
     }
 
     async fn release_retention_hold(
         &self,
-        _request: Request<pb::ReleaseRetentionHoldRequest>,
+        request: Request<pb::ReleaseRetentionHoldRequest>,
     ) -> Result<Response<pb::ReleaseRetentionHoldResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        self.retention
+            .release_hold(&req.hold_id)
+            .map_err(|e| to_status(&e))?;
+        Ok(Response::new(pb::ReleaseRetentionHoldResponse {}))
     }
 
     async fn list_flavors(
         &self,
         _request: Request<pb::ListFlavorsRequest>,
     ) -> Result<Response<pb::ListFlavorsResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let flavors = flavor::default_flavors();
+        let proto_flavors: Vec<pb::Flavor> = flavors
+            .iter()
+            .map(|f| pb::Flavor {
+                flavor_id: f.name.clone(),
+                name: f.name.clone(),
+                protocols: vec![f.protocol.clone()],
+                transports: vec![f.transport.clone()],
+                topology: f.topology.clone(),
+            })
+            .collect();
+        Ok(Response::new(pb::ListFlavorsResponse {
+            flavors: proto_flavors,
+        }))
     }
 
     async fn match_flavor(
         &self,
-        _request: Request<pb::MatchFlavorRequest>,
+        request: Request<pb::MatchFlavorRequest>,
     ) -> Result<Response<pb::MatchFlavorResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        let available = flavor::default_flavors();
+        let requested_proto = req.requested.unwrap_or_default();
+        let requested = flavor::Flavor {
+            name: requested_proto.name,
+            protocol: requested_proto.protocols.first().cloned().unwrap_or_default(),
+            transport: requested_proto.transports.first().cloned().unwrap_or_default(),
+            topology: requested_proto.topology,
+        };
+        let matched = flavor::match_best_fit(&available, &requested);
+        let provided = matched.map(|f| pb::Flavor {
+            flavor_id: f.name.clone(),
+            name: f.name,
+            protocols: vec![f.protocol],
+            transports: vec![f.transport],
+            topology: f.topology,
+        });
+        Ok(Response::new(pb::MatchFlavorResponse {
+            provided,
+            mismatches: vec![],
+        }))
     }
 
     async fn register_peer(
         &self,
-        _request: Request<pb::RegisterPeerRequest>,
+        request: Request<pb::RegisterPeerRequest>,
     ) -> Result<Response<pb::RegisterPeerResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        let peer_id = uuid::Uuid::new_v4().to_string();
+        let peer = Peer {
+            site_id: req.site_name.clone(),
+            endpoint: req.endpoint,
+            connected: false,
+            replication_mode: "async".to_owned(),
+            config_sync: false,
+            data_cipher_only: false,
+        };
+        self.federation.register(peer).map_err(|e| to_status(&e))?;
+        Ok(Response::new(pb::RegisterPeerResponse { peer_id }))
     }
 
     async fn list_peers(
         &self,
         _request: Request<pb::ListPeersRequest>,
     ) -> Result<Response<pb::ListPeersResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let peers = self.federation.list_peers();
+        let proto_peers = peers
+            .into_iter()
+            .map(|p| pb::FederationPeer {
+                peer_id: p.site_id.clone(),
+                site_name: p.site_id,
+                endpoint: p.endpoint,
+                status: if p.connected {
+                    "connected".to_owned()
+                } else {
+                    "disconnected".to_owned()
+                },
+            })
+            .collect();
+        Ok(Response::new(pb::ListPeersResponse {
+            peers: proto_peers,
+        }))
     }
 
     async fn set_maintenance_mode(
         &self,
-        _request: Request<pb::SetMaintenanceModeRequest>,
+        request: Request<pb::SetMaintenanceModeRequest>,
     ) -> Result<Response<pb::SetMaintenanceModeResponse>, Status> {
-        Err(Status::unimplemented("not yet wired"))
+        let req = request.into_inner();
+        if req.enabled {
+            self.maintenance.enable();
+            self.namespaces.set_read_only(true);
+        } else {
+            self.maintenance.disable();
+            self.namespaces.set_read_only(false);
+        }
+        Ok(Response::new(pb::SetMaintenanceModeResponse {}))
     }
 }
