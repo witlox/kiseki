@@ -1,12 +1,20 @@
 # MVP → Production Plan
 
-**Date**: 2026-04-22
+**Date**: 2026-04-22 (updated: integrated all remaining gaps)
 **Baseline**: MVP feature complete. 554/563 BDD, 368 tests, 30 ADRs,
 63 invariants, both sweeps passed, all adversary findings fixed.
 
-This plan covers the gap from "architecture proven" to "production HPC
-storage system." Organized into 6 workstreams that can be parallelized
-across teams. Each workstream has phases ordered by dependency.
+This plan covers every gap from "architecture proven" to "production
+HPC storage system ready for deployment." Organized into 9 workstreams
+that can be parallelized across teams.
+
+Sources integrated:
+- Original 6-workstream plan (crypto, storage, raft, transport, gateway, ops)
+- `specs/failure-modes.md` (20 failure modes, P0-P3)
+- `specs/assumptions.md` (50+ assumptions needing validation)
+- `specs/features/*.feature` (unimplemented BDD scenarios)
+- Hardware-specific items (CXL, GPU-direct, NUMA)
+- Operational tooling (CLI, docs, upgrade, backup)
 
 ---
 
@@ -30,8 +38,8 @@ across teams. Each workstream has phases ordered by dependency.
 ### 1.3 Crypto-shred propagation
 - Delete tenant KEK → all tenant data unreadable
 - Propagate to all nodes holding tenant chunks
-- Verify: read after shred returns crypto error, not stale data
 - Cache TTL enforcement (I-K9) — invalidate cached DEKs
+- **Failure mode F-S1**: graceful drain of active reads during shred
 - E2e test: write → shred → read fails
 - **Depends on**: 1.1
 - **Effort**: 1-2 sessions
@@ -41,6 +49,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Circuit breaker for KMS latency (already typed)
 - Tenant-brings-own-KMS flow: tenant registers provider,
   kiseki wraps/unwraps via external API
+- Wire the 41 `external-kms.feature` scenarios
 - **Depends on**: 1.1
 - **Effort**: 3-5 sessions (per provider)
 
@@ -61,6 +70,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Bypass OS page cache (kiseki manages its own cache)
 - Superblock detection on real /dev/sdX, /dev/nvmeXn1
 - Safety checks: refuse init if filesystem signatures detected
+- **Assumption validation**: verify O_DIRECT alignment on target hardware
 - **Depends on**: nothing
 - **Effort**: 2-3 sessions
 
@@ -77,6 +87,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Move chunks from hot pool to sibling pool (same device class)
 - Respect I-C5 thresholds during rebalance
 - Rate-limited to avoid saturating I/O
+- **Failure mode F-D2**: rebalance during device evacuation
 - **Depends on**: 2.1
 - **Effort**: 2 sessions
 
@@ -86,6 +97,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Create new shard, redistribute deltas
 - Atomic cutover: old shard narrows range, new shard takes upper half
 - Raft membership for new shard (new Raft group)
+- **Failure mode F-L2**: write buffering during split must be durable
 - **Depends on**: nothing (auto_split.rs has detection, needs execution)
 - **Effort**: 3-4 sessions
 
@@ -99,6 +111,22 @@ across teams. Each workstream has phases ordered by dependency.
 - **Depends on**: 2.2
 - **Effort**: 1-2 sessions
 
+### 2.7 CXL / Persistent memory tier
+- `NvmePersistentMemory` device class (ADR-024 defined, not implemented)
+- DAX (Direct Access) mmap for ultra-low-latency metadata
+- Use as write-ahead buffer before NVMe commit
+- **Assumption**: CXL.mem Type 3 devices available on target platform
+- **Depends on**: 2.2
+- **Effort**: 3-5 sessions
+
+### 2.8 GPU-direct storage
+- Bypass CPU for AI training data loading (GPUDirect Storage / cuFile)
+- Pre-registered GPU memory regions for DMA from NVMe
+- Integration with chunk read path: decrypt → DMA to GPU buffer
+- **Assumption**: NVIDIA GPUDirect Storage driver available
+- **Depends on**: 2.2, 4.2 (for fabric-direct GPU path)
+- **Effort**: 5-8 sessions
+
 ---
 
 ## Workstream 3: Raft & Consensus Hardening
@@ -107,7 +135,6 @@ across teams. Each workstream has phases ordered by dependency.
 - TLS infrastructure already wired (ADV-S2)
 - Generate cluster CA + per-node certs in Docker compose
 - `TcpNetworkFactory::with_tls(config)` activated in runtime
-- `run_raft_rpc_server(addr, raft, Some(server_config))`
 - Cert OU validation: only cluster members accepted
 - **Depends on**: nothing (infrastructure done)
 - **Effort**: 1-2 sessions
@@ -115,12 +142,13 @@ across teams. Each workstream has phases ordered by dependency.
 ### 3.2 Dynamic membership changes
 - `raft.add_learner()` → `raft.change_membership()`
 - Control plane API: `AddShardMember`, `RemoveShardMember`
-- Graceful decommission: add new member → catch up → promote → demote old
+- Graceful decommission: add new → catch up → promote → demote old
 - Needed for ADR-030 shard placement migration
+- **Failure mode F-C1**: leader loss during membership change
 - **Depends on**: 3.1
 - **Effort**: 2-3 sessions
 
-### 3.3 Persistent Raft log for production
+### 3.3 Persistent Raft log hardening
 - Current: RedbRaftLogStore works but not battle-tested
 - Production: test under concurrent load, verify crash recovery
 - Benchmark: Raft commit latency with redb fsync
@@ -136,15 +164,25 @@ across teams. Each workstream has phases ordered by dependency.
 - **Depends on**: nothing
 - **Effort**: 1-2 sessions
 
+### 3.5 Clock skew and split-brain detection
+- **Failure mode F-C3**: HLC clock skew exceeds tolerance
+- Detect: compare HLC physical_ms drift across Raft peers
+- Alert if skew > configurable threshold (default 500ms)
+- Refuse writes if skew > hard limit (prevent causal violations)
+- NTP/PTP quality monitoring per node (ClockQuality already modeled)
+- **Depends on**: nothing
+- **Effort**: 1-2 sessions
+
 ---
 
 ## Workstream 4: Network Transports
 
 ### 4.1 Transport abstraction refinement
 - Current `Transport` trait: `connect() → Connection`
-- Add: connection pooling, health tracking, reconnect
-- Add: per-connection timeout, backoff on failure
+- Add: connection pooling, health tracking, reconnect with backoff
+- Add: per-connection timeout, circuit breaker
 - Add: transport metrics (latency histogram, error rate)
+- NUMA-aware: pin transport threads to NUMA node of the NIC
 - **Depends on**: nothing
 - **Effort**: 2 sessions
 
@@ -157,6 +195,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Message framing: same length-prefixed protocol over fabric
 - VNI (Virtual Network Interface) for tenant isolation
 - Service ID based addressing (no IP, no TCP)
+- Slingshot adaptive routing configuration hints
 - Build: feature-gated `transport-cxi`, requires libfabric-dev + CXI headers
 - Testing: requires Slingshot hardware or CXI simulator
 - **Depends on**: 4.1
@@ -181,7 +220,7 @@ across teams. Each workstream has phases ordered by dependency.
 - ECN/PFC congestion control configuration
 - DSCP marking for QoS priority
 - MTU negotiation (usually 4096 for RoCE)
-- Can share implementation with 4.3 — difference is at NIC/switch config level
+- Shares implementation with 4.3 — difference is at NIC/switch config
 - Build: same `transport-ib` feature as 4.3
 - Testing: requires RoCEv2 NIC (Mellanox/NVIDIA ConnectX) or SoftROCE
 - **Depends on**: 4.3 (shared verbs layer)
@@ -198,6 +237,15 @@ across teams. Each workstream has phases ordered by dependency.
 - Raft transport: use same selection (prefer fabric for low-latency consensus)
 - **Depends on**: 4.2, 4.3, 4.4
 - **Effort**: 2-3 sessions
+
+### 4.6 NUMA-aware thread pinning
+- Detect NUMA topology at boot (`/sys/devices/system/node/`)
+- Pin I/O threads to NUMA node of associated NIC
+- Pin Raft threads to same NUMA node as Raft NIC
+- Pin chunk I/O threads to NUMA node of associated NVMe controller
+- Avoid cross-NUMA memory access for hot data paths
+- **Depends on**: 4.1
+- **Effort**: 1-2 sessions
 
 ---
 
@@ -240,7 +288,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Write-at-offset (currently only offset=0)
 - File locking (POSIX fcntl)
 - Connection pooling to gateway
-- Reconnect on gateway failure
+- Reconnect on gateway failure with exponential backoff
 - **Depends on**: nothing
 - **Effort**: 2-3 sessions
 
@@ -256,9 +304,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Control plane aggregates `NodeMetadataCapacity` from all nodes
 - Computes per-shard threshold from min voter budget
 - Commits threshold updates via Raft `ShardConfig` change
-- Threshold decrease: automatic on soft-limit breach
-- Threshold increase: admin approval via maintenance mode
-- Emergency: hard-limit breach → threshold floor via gRPC (not Raft)
+- Emergency: hard-limit breach → threshold floor via gRPC
 - **Depends on**: nothing (infrastructure done, needs control plane loop)
 - **Effort**: 2-3 sessions
 
@@ -299,6 +345,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Async delta replication for multi-site (no cross-site Raft)
 - Conflict resolution: last-writer-wins with HLC timestamps
 - Data-cipher-only mode: replicate encrypted chunks without key access
+- **Failure mode F-N1**: federation link failure → queue-and-retry
 - **Depends on**: 3.2
 - **Effort**: 5-8 sessions
 
@@ -308,6 +355,7 @@ across teams. Each workstream has phases ordered by dependency.
 - Shard split under load
 - Node failure during rebalance
 - Multi-tenant contention
+- Clock skew beyond HLC tolerance (F-C3)
 - **Depends on**: all workstreams
 - **Effort**: 5-8 sessions
 
@@ -323,32 +371,154 @@ across teams. Each workstream has phases ordered by dependency.
 
 ---
 
+## Workstream 7: Failure Mode Handling
+
+Covers all 20 failure modes from `specs/failure-modes.md` not already
+addressed in other workstreams.
+
+### 7.1 Consensus failures (P0)
+- **F-C1**: Leader loss → election timeout → new leader (already works)
+- **F-C2**: Quorum loss → shard unavailable → writes rejected (already works)
+- **F-C3**: Clock skew → handled in 3.5
+- **Validation**: automated test for each, verify recovery time < SLO
+- **Effort**: 1-2 sessions
+
+### 7.2 Storage failures (P0-P1)
+- **F-D1**: Device failure → EC repair from parity (needs 2.1)
+- **F-D2**: Multiple device failure → partial data loss if > EC parity
+- **F-D3**: Corrupted extent → CRC32 detection → read from replica
+- **F-D4**: Full device → pool capacity threshold → redirect (needs 2.4)
+- **Validation**: inject device failures, verify repair completes
+- **Effort**: 2-3 sessions
+
+### 7.3 Network failures (P1)
+- **F-N1**: Federation link failure → queued replication (needs 6.4)
+- **F-N2**: Client disconnect during write → partial write cleanup
+- **F-N3**: Fabric transport failure → fallback to TCP (needs 4.5)
+- **Validation**: inject network partitions, verify graceful degradation
+- **Effort**: 1-2 sessions
+
+### 7.4 Security failures (P1)
+- **F-S1**: Crypto-shred during active reads → drain then shred (needs 1.3)
+- **F-S2**: Certificate expiry → alert + auto-renewal integration
+- **F-S3**: KMS unavailable → circuit breaker + cached keys (needs 1.4)
+- **Validation**: inject cert expiry, KMS timeout, verify behavior
+- **Effort**: 1-2 sessions
+
+### 7.5 Operational failures (P2-P3)
+- **F-O1**: Metadata disk full → emergency threshold floor (ADR-030, done)
+- **F-O2**: Audit log backpressure → I-A5 safety valve (spec exists)
+- **F-O3**: Stalled consumer blocks GC → alert + admin intervention
+- **F-O4**: Schema version mismatch on upgrade → reject incompatible
+- **Validation**: inject resource exhaustion, verify alerts fire
+- **Effort**: 1-2 sessions
+
+---
+
+## Workstream 8: Tooling & Documentation
+
+### 8.1 Admin CLI
+- `kiseki-admin` binary for cluster management
+- Subcommands: `status`, `pool`, `device`, `shard`, `tenant`, `maintenance`
+- Connects via gRPC to ControlService
+- Tabular output (human) + JSON output (scripting)
+- **Depends on**: nothing
+- **Effort**: 3-5 sessions
+
+### 8.2 Upgrade / schema migration
+- redb schema versioning (version table in each database)
+- Proto backward compatibility (new fields are always optional)
+- Rolling upgrade: mixed-version clusters during transition
+- Rollback: downgrade path for one version back
+- **Assumption validation**: verify redb handles schema evolution
+- **Depends on**: nothing
+- **Effort**: 2-3 sessions
+
+### 8.3 Backup & disaster recovery
+- Full cluster snapshot: pause writes → snapshot all shards → resume
+- Point-in-time restore: replay from snapshot + Raft log
+- Cross-site backup: async replication to cold-standby site
+- Recovery time objective (RTO) / recovery point objective (RPO) SLOs
+- **Depends on**: 6.4 (federation for cross-site)
+- **Effort**: 5-8 sessions
+
+### 8.4 Capacity planning tooling
+- Predict when to add nodes based on growth rate
+- Model: (current_usage, growth_rate, threshold) → days_until_full
+- Alert: "pool X will reach Warning in N days at current rate"
+- Recommendation engine: suggest node count / device class for workload
+- **Depends on**: 6.2 (metrics)
+- **Effort**: 2-3 sessions
+
+### 8.5 Documentation
+- Operator guide: deployment, configuration, monitoring, troubleshooting
+- API reference: gRPC service definitions with examples
+- Architecture overview: for new engineers joining the project
+- Deployment runbook: Docker compose → Kubernetes → bare metal
+- Performance tuning guide: transport selection, EC params, pool sizing
+- **Depends on**: all workstreams (documents what's built)
+- **Effort**: 5-8 sessions
+
+---
+
+## Workstream 9: Assumption Validation
+
+Items from `specs/assumptions.md` that need hardware validation.
+
+### 9.1 Hardware performance assumptions
+- CXI fabric latency: assumed < 2µs for small messages
+- NVMe write latency: assumed < 20µs for 4KB aligned writes
+- HDD sequential throughput: assumed > 200 MB/s per drive
+- EC encode overhead: assumed < 5% CPU for 4+2 RS coding
+- **Method**: benchmark on target hardware, update SLOs
+- **Effort**: 2-3 sessions
+
+### 9.2 Scale assumptions
+- 10B files / 100PB: metadata tier sizing validated (ADR-030 math done)
+- Raft group count: assumed < 10K shards per cluster
+- Concurrent clients: assumed < 100K FUSE mounts cluster-wide
+- **Method**: load test with synthetic workload generators
+- **Effort**: 2-3 sessions
+
+### 9.3 Operational assumptions
+- NTP/PTP clock quality: assumed < 1ms skew in HPC environments
+- Network partition duration: assumed < 30s for fabric recovery
+- Device replacement time: assumed < 1 hour for hot-swap
+- **Method**: validate with site operations team
+- **Effort**: 1-2 sessions
+
+---
+
 ## Dependency Graph
 
 ```
-Workstream 1 (Crypto)     ─── independent ───────────────────────┐
-Workstream 2 (Storage)    ─── independent ───────────────────────┤
-Workstream 3 (Raft)       ─── 3.1 before 3.2 ───────────────────┤
-Workstream 4 (Transport)  ─── 4.1 → 4.2/4.3 → 4.4 → 4.5 ──────┤
-Workstream 5 (Gateway)    ─── 5.1 → 5.2/5.4; 5.3 → 5.4 ────────┤
-Workstream 6 (Operations) ─── 6.1 → 6.2/6.3; all → 6.5/6.6 ────┘
+WS1 (Crypto)     ─── independent ────────────────────────────────┐
+WS2 (Storage)    ─── independent (2.7→2.2, 2.8→2.2+4.2) ────────┤
+WS3 (Raft)       ─── 3.1 → 3.2 ─────────────────────────────────┤
+WS4 (Transport)  ─── 4.1 → 4.2/4.3 → 4.4 → 4.5 ────────────────┤
+WS5 (Gateway)    ─── 5.1 → 5.2/5.4; 5.3 → 5.4 ──────────────────┤
+WS6 (Operations) ─── 6.1 → 6.2/6.3; 3.2 → 6.4; all → 6.5/6.6 ──┤
+WS7 (Failures)   ─── depends on respective WS items ──────────────┤
+WS8 (Tooling)    ─── 8.3 → 6.4; 8.4 → 6.2; 8.5 → all ───────────┤
+WS9 (Validation) ─── requires hardware access ─────────────────────┘
 ```
 
-Workstreams 1-5 are parallelizable across teams. Workstream 6 is
-cross-cutting and should start early (6.1 structured logging first).
+WS1-5 parallelizable across teams. WS6-9 cross-cutting.
 
 ## Estimated Total Effort
 
 | Workstream | Sessions | Critical Path |
 |------------|----------|---------------|
 | 1. Crypto / KMS | 8-12 | No |
-| 2. Storage engine | 10-15 | Shard split (2.5) |
-| 3. Raft consensus | 5-9 | mTLS (3.1) → membership (3.2) |
-| 4. Network transports | 15-23 | CXI (4.2) + IB (4.3) are big |
+| 2. Storage engine | 17-26 | Shard split (2.5), GPU-direct (2.8) |
+| 3. Raft consensus | 7-11 | mTLS (3.1) → membership (3.2) |
+| 4. Network transports | 16-25 | CXI (4.2) + IB (4.3) are big |
 | 5. Gateway / client | 12-19 | SigV4 (5.1) + Kerberos (5.3) |
 | 6. Operations | 20-30 | Federation (6.4) + chaos (6.5) |
-| **Total** | **70-108** | |
+| 7. Failure modes | 6-11 | Depends on WS1-6 items |
+| 8. Tooling / docs | 17-27 | Backup (8.3) + docs (8.5) |
+| 9. Assumption validation | 5-8 | Requires hardware |
+| **Total** | **108-169** | |
 
-Critical path to HPC production: **3.1 → 4.2 → 4.5 → 6.6** (Raft mTLS
-→ Slingshot transport → transport selection → benchmarking). This is the
-path that unlocks real hardware deployment.
+Critical path to HPC production: **3.1 → 4.1 → 4.2 → 4.5 → 6.6 → 9.1**
+(Raft mTLS → transport refine → Slingshot → selection → benchmark → validate).
