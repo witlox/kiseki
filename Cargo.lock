@@ -1410,6 +1410,7 @@ dependencies = [
  "kiseki-crypto",
  "kiseki-keymanager",
  "proptest",
+ "redb",
  "reed-solomon-erasure",
  "serde",
  "serde_json",

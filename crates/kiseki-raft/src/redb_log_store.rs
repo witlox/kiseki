@@ -183,6 +183,61 @@ impl RedbLogStore {
         }
     }
 
+    /// Truncate log entries after the given index (exclusive).
+    ///
+    /// Removes all entries with index > `after`. Used by openraft's
+    /// `truncate` operation when a leader overwrites a follower's
+    /// conflicting log suffix.
+    pub fn truncate_after(&self, after: u64) -> io::Result<u64> {
+        let db = self.db.lock().unwrap();
+        let txn = db
+            .begin_write()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let mut count = 0u64;
+        {
+            let mut table = txn
+                .open_table(LOG_TABLE)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let keys: Vec<u64> = {
+                let range = table
+                    .range((after + 1)..=u64::MAX)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                range
+                    .filter_map(|e| e.ok().map(|(k, _)| k.value()))
+                    .collect()
+            };
+            for key in keys {
+                table
+                    .remove(key)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                count += 1;
+            }
+        }
+        txn.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(count)
+    }
+
+    /// Get the last (highest index) log entry key, or None if empty.
+    pub fn last_index(&self) -> io::Result<Option<u64>> {
+        let db = self.db.lock().unwrap();
+        let txn = db
+            .begin_read()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let table = txn
+            .open_table(LOG_TABLE)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let last = table
+            .range(0..=u64::MAX)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            .last();
+        match last {
+            Some(Ok((k, _))) => Ok(Some(k.value())),
+            Some(Err(e)) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+            None => Ok(None),
+        }
+    }
+
     /// Count of log entries.
     pub fn len(&self) -> io::Result<u64> {
         let db = self.db.lock().unwrap();

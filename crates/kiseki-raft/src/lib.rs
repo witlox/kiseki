@@ -33,6 +33,18 @@ pub use log_store::MemLogStore;
     missing_docs,
     clippy::must_use_candidate,
     clippy::new_without_default,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::io_other_error,
+    clippy::needless_pass_by_value,
+    dead_code
+)]
+pub mod redb_raft_log_store;
+pub use redb_raft_log_store::RedbRaftLogStore;
+#[allow(
+    missing_docs,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
     clippy::cast_possible_truncation,
     clippy::unused_self,
     clippy::doc_markdown,
