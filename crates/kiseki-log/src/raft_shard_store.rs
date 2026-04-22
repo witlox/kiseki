@@ -9,6 +9,7 @@
 //! (`MemLogStore`). Durability via Raft replication to majority.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
@@ -24,24 +25,35 @@ use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 /// Holds a map of `ShardId → OpenRaftLogStore`. Each shard has its
 /// own Raft group with independent leader election. The `LogOps`
 /// trait methods bridge sync→async via `tokio::task::block_in_place`.
+///
+/// When `data_dir` is set, uses `RedbRaftLogStore` for persistent
+/// Raft state (Phase 12b). When `None`, uses in-memory `MemLogStore`.
 pub struct RaftShardStore {
     shards: Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>,
     node_id: u64,
     peers: BTreeMap<u64, String>,
     rt: tokio::runtime::Handle,
+    data_dir: Option<PathBuf>,
 }
 
 impl RaftShardStore {
     /// Create a new (empty) Raft shard store.
     ///
-    /// Call `create_shard` to add Raft groups for each shard.
+    /// When `data_dir` is `Some`, Raft log state is persisted to redb
+    /// and survives restart. When `None`, uses in-memory log (volatile).
     #[must_use]
-    pub fn new(node_id: u64, peers: BTreeMap<u64, String>, rt: tokio::runtime::Handle) -> Self {
+    pub fn new(
+        node_id: u64,
+        peers: BTreeMap<u64, String>,
+        rt: tokio::runtime::Handle,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             shards: Mutex::new(HashMap::new()),
             node_id,
             peers,
             rt,
+            data_dir,
         }
     }
 
@@ -66,12 +78,19 @@ impl RaftShardStore {
         let peers = self.peers.clone();
         let node_id = self.node_id;
         let rt = self.rt.clone();
+        let data_dir = self.data_dir.clone();
 
         let store = tokio::task::block_in_place(|| {
             rt.block_on(async {
-                let store = OpenRaftLogStore::new(node_id, shard_id, tenant_id, &peers)
-                    .await
-                    .expect("failed to create Raft log store");
+                let store = OpenRaftLogStore::new(
+                    node_id,
+                    shard_id,
+                    tenant_id,
+                    &peers,
+                    data_dir.as_deref(),
+                )
+                .await
+                .expect("failed to create Raft log store");
 
                 // Spawn RPC server for this shard's Raft group.
                 if let Some(addr) = raft_addr {

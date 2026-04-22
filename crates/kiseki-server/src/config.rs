@@ -25,6 +25,10 @@ pub struct ServerConfig {
     pub raft_addr: Option<SocketAddr>,
     /// Create a well-known bootstrap shard on startup (for e2e tests).
     pub bootstrap: bool,
+    /// Metadata soft limit percentage (ADR-030, default 50).
+    pub meta_soft_limit_pct: u8,
+    /// Metadata hard limit percentage (ADR-030, default 75).
+    pub meta_hard_limit_pct: u8,
 }
 
 /// Paths to TLS certificate files.
@@ -107,6 +111,16 @@ impl ServerConfig {
 
         let bootstrap = std::env::var("KISEKI_BOOTSTRAP").is_ok_and(|v| v == "true" || v == "1");
 
+        let meta_soft_limit_pct = std::env::var("KISEKI_META_SOFT_LIMIT_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+
+        let meta_hard_limit_pct = std::env::var("KISEKI_META_HARD_LIMIT_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(75);
+
         Self {
             data_addr,
             advisory_addr,
@@ -118,6 +132,8 @@ impl ServerConfig {
             raft_peers,
             raft_addr,
             bootstrap,
+            meta_soft_limit_pct,
+            meta_hard_limit_pct,
         }
     }
 }

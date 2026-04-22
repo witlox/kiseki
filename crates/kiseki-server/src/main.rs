@@ -14,6 +14,7 @@
 mod config;
 mod integrity;
 mod runtime;
+mod system_disk;
 
 fn main() {
     let cfg = config::ServerConfig::from_env();

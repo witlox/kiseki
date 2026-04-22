@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
 use kiseki_raft::{
-    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory, TcpNetworkFactory,
+    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, RedbRaftLogStore, StubNetworkFactory,
+    TcpNetworkFactory,
 };
 use openraft::type_config::async_runtime::WatchReceiver;
 use openraft::Raft;
@@ -61,14 +62,18 @@ impl OpenRaftLogStore {
     /// When `peers` is empty, runs in single-node mode with a stub network.
     /// When `peers` contains entries, uses TCP transport for multi-node Raft.
     /// The `peers` map should include this node's own `(node_id, addr)` entry.
+    ///
+    /// When `data_dir` is `Some`, uses `RedbRaftLogStore` for persistent
+    /// Raft state (Phase 12b). On restart, skips `initialize()` if the
+    /// store already has state. When `None`, uses in-memory `MemLogStore`.
     pub async fn new(
         node_id: u64,
         shard_id: ShardId,
         tenant_id: OrgId,
         peers: &BTreeMap<u64, String>,
+        data_dir: Option<&std::path::Path>,
     ) -> Result<Self, LogError> {
         let config = KisekiRaftConfig::default_config();
-        let log_store = MemLogStore::<C>::new();
         let state_inner = Arc::new(futures::lock::Mutex::new(ShardSmInner::new(
             shard_id, tenant_id,
         )));
@@ -86,22 +91,50 @@ impl OpenRaftLogStore {
             m
         };
 
-        // Use TCP transport for multi-node, stub for single-node.
-        let raft = if peers.len() > 1 {
-            let network = TcpNetworkFactory::<C>::new();
-            Raft::new(node_id, config, network, log_store, state_machine)
-                .await
-                .map_err(|_e| LogError::Unavailable)?
+        // Select log store backend: persistent (redb) or in-memory.
+        let (raft, already_initialized) = if let Some(dir) = data_dir {
+            let raft_dir = dir.join("raft");
+            std::fs::create_dir_all(&raft_dir).ok();
+            let redb_path = raft_dir.join(format!("shard-{}.redb", shard_id.0));
+            let log_store =
+                RedbRaftLogStore::<C>::open(&redb_path).map_err(|_| LogError::Unavailable)?;
+            let has_state = log_store.has_state();
+
+            let raft = if peers.len() > 1 {
+                let network = TcpNetworkFactory::<C>::new();
+                Raft::new(node_id, config, network, log_store, state_machine)
+                    .await
+                    .map_err(|_e| LogError::Unavailable)?
+            } else {
+                let network = StubNetworkFactory::<C>::new();
+                Raft::new(node_id, config, network, log_store, state_machine)
+                    .await
+                    .map_err(|_e| LogError::Unavailable)?
+            };
+            (raft, has_state)
         } else {
-            let network = StubNetworkFactory::<C>::new();
-            Raft::new(node_id, config, network, log_store, state_machine)
-                .await
-                .map_err(|_e| LogError::Unavailable)?
+            let log_store = MemLogStore::<C>::new();
+            let raft = if peers.len() > 1 {
+                let network = TcpNetworkFactory::<C>::new();
+                Raft::new(node_id, config, network, log_store, state_machine)
+                    .await
+                    .map_err(|_e| LogError::Unavailable)?
+            } else {
+                let network = StubNetworkFactory::<C>::new();
+                Raft::new(node_id, config, network, log_store, state_machine)
+                    .await
+                    .map_err(|_e| LogError::Unavailable)?
+            };
+            (raft, false)
         };
 
-        raft.initialize(members)
-            .await
-            .map_err(|_| LogError::Unavailable)?;
+        // Only initialize on first boot — skip if redb already has state
+        // (the node already has membership from a previous run).
+        if !already_initialized {
+            raft.initialize(members)
+                .await
+                .map_err(|_| LogError::Unavailable)?;
+        }
 
         Ok(Self {
             raft,

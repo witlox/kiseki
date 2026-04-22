@@ -40,6 +40,23 @@ fn build_tls(files: &TlsFiles) -> Result<ServerTlsConfig, Box<dyn std::error::Er
 pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- Context construction ---
 
+    // System disk detection (ADR-030).
+    if let Some(ref dir) = cfg.data_dir {
+        let capacity = crate::system_disk::compute_capacity(
+            dir,
+            cfg.meta_soft_limit_pct,
+            cfg.meta_hard_limit_pct,
+        );
+        crate::system_disk::warn_if_rotational(capacity.media_type);
+        eprintln!(
+            "  system disk: {:?}, total {} GB, soft limit {} GB, budget {} GB",
+            capacity.media_type,
+            capacity.total_bytes / (1024 * 1024 * 1024),
+            capacity.soft_limit_bytes / (1024 * 1024 * 1024),
+            capacity.small_file_budget_bytes / (1024 * 1024 * 1024),
+        );
+    }
+
     // Node identity for multi-node Raft.
     if cfg.node_id > 0 {
         eprintln!(
@@ -83,61 +100,64 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
     let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
 
-    let log_store: Arc<dyn kiseki_log::LogOps + Send + Sync> = if cfg.node_id > 0
-        && cfg.raft_peers.len() > 1
-    {
-        // Multi-node Raft: consensus-replicated log store.
-        let peers: std::collections::BTreeMap<u64, String> =
-            cfg.raft_peers.iter().cloned().collect();
-        let raft_addr_str = cfg
-            .raft_addr
-            .map_or_else(|| "0.0.0.0:9300".to_owned(), |a| a.to_string());
-        let store =
-            kiseki_log::RaftShardStore::new(cfg.node_id, peers, tokio::runtime::Handle::current());
-        if cfg.bootstrap {
-            store.create_shard(
-                bootstrap_shard,
-                bootstrap_tenant,
-                kiseki_common::ids::NodeId(cfg.node_id),
-                kiseki_log::ShardConfig::default(),
-                Some(&raft_addr_str),
+    let log_store: Arc<dyn kiseki_log::LogOps + Send + Sync> =
+        if cfg.node_id > 0 && cfg.raft_peers.len() > 1 {
+            // Multi-node Raft: consensus-replicated log store.
+            let peers: std::collections::BTreeMap<u64, String> =
+                cfg.raft_peers.iter().cloned().collect();
+            let raft_addr_str = cfg
+                .raft_addr
+                .map_or_else(|| "0.0.0.0:9300".to_owned(), |a| a.to_string());
+            let store = kiseki_log::RaftShardStore::new(
+                cfg.node_id,
+                peers,
+                tokio::runtime::Handle::current(),
+                cfg.data_dir.clone(),
             );
-        }
-        eprintln!(
-            "  log store: Raft (node {}, {} peers)",
-            cfg.node_id,
-            cfg.raft_peers.len()
-        );
-        Arc::new(store)
-    } else if let Some(ref dir) = cfg.data_dir {
-        std::fs::create_dir_all(dir.join("raft")).ok();
-        let store = kiseki_log::persistent_store::PersistentShardStore::open(
-            &dir.join("raft").join("log.redb"),
-        )
-        .map_err(|e| format!("persistent store: {e}"))?;
-        if cfg.bootstrap {
-            store.create_shard(
-                bootstrap_shard,
-                bootstrap_tenant,
-                kiseki_common::ids::NodeId(1),
-                kiseki_log::ShardConfig::default(),
+            if cfg.bootstrap {
+                store.create_shard(
+                    bootstrap_shard,
+                    bootstrap_tenant,
+                    kiseki_common::ids::NodeId(cfg.node_id),
+                    kiseki_log::ShardConfig::default(),
+                    Some(&raft_addr_str),
+                );
+            }
+            eprintln!(
+                "  log store: Raft (node {}, {} peers)",
+                cfg.node_id,
+                cfg.raft_peers.len()
             );
-        }
-        eprintln!("  log store: persistent (redb at {})", dir.display());
-        Arc::new(store)
-    } else {
-        let store = kiseki_log::MemShardStore::new();
-        if cfg.bootstrap {
-            store.create_shard(
-                bootstrap_shard,
-                bootstrap_tenant,
-                kiseki_common::ids::NodeId(1),
-                kiseki_log::ShardConfig::default(),
-            );
-        }
-        eprintln!("  log store: in-memory (no persistence)");
-        Arc::new(store)
-    };
+            Arc::new(store)
+        } else if let Some(ref dir) = cfg.data_dir {
+            std::fs::create_dir_all(dir.join("raft")).ok();
+            let store = kiseki_log::persistent_store::PersistentShardStore::open(
+                &dir.join("raft").join("log.redb"),
+            )
+            .map_err(|e| format!("persistent store: {e}"))?;
+            if cfg.bootstrap {
+                store.create_shard(
+                    bootstrap_shard,
+                    bootstrap_tenant,
+                    kiseki_common::ids::NodeId(1),
+                    kiseki_log::ShardConfig::default(),
+                );
+            }
+            eprintln!("  log store: persistent (redb at {})", dir.display());
+            Arc::new(store)
+        } else {
+            let store = kiseki_log::MemShardStore::new();
+            if cfg.bootstrap {
+                store.create_shard(
+                    bootstrap_shard,
+                    bootstrap_tenant,
+                    kiseki_common::ids::NodeId(1),
+                    kiseki_log::ShardConfig::default(),
+                );
+            }
+            eprintln!("  log store: in-memory (no persistence)");
+            Arc::new(store)
+        };
 
     if cfg.bootstrap {
         eprintln!(

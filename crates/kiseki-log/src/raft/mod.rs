@@ -13,7 +13,7 @@ pub mod openraft_store;
 pub mod state_machine;
 pub mod types;
 
-pub use log_store::ShardLogStore;
+pub use log_store::{ShardMemLogStore, ShardRedbLogStore};
 pub use network::StubNetworkFactory;
 pub use openraft_store::OpenRaftLogStore;
 pub use state_machine::ShardStateMachine;
