@@ -344,18 +344,35 @@ impl OpenRaftLogStore {
     }
 
     /// Read deltas in `[from, to]` inclusive from the shard.
+    ///
+    /// For inline deltas (`has_inline_data=true`), reconstructs the
+    /// payload from the inline store if the in-memory ciphertext was
+    /// cleared by the state machine offload (I-SF5).
     pub async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
         if req.from > req.to {
             return Err(LogError::InvalidRange(self.shard_id));
         }
 
         let inner = self.state.lock().await;
-        Ok(inner
+        let deltas: Vec<Delta> = inner
             .deltas
             .iter()
             .filter(|d| d.header.sequence >= req.from && d.header.sequence <= req.to)
-            .cloned()
-            .collect())
+            .map(|d| {
+                // Reconstruct inline payload from store if needed.
+                if d.header.has_inline_data && d.payload.ciphertext.is_empty() {
+                    if let Some(ref store) = inner.inline_store {
+                        if let Ok(Some(data)) = store.get(&d.header.hashed_key) {
+                            let mut reconstructed = d.clone();
+                            reconstructed.payload.ciphertext = data;
+                            return reconstructed;
+                        }
+                    }
+                }
+                d.clone()
+            })
+            .collect();
+        Ok(deltas)
     }
 
     /// Set or clear maintenance mode through Raft consensus.
