@@ -47,6 +47,8 @@ async fn bootstrap_and_verify() {
         test_shard(),
         test_tenant(),
         &std::collections::BTreeMap::new(),
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -74,6 +76,8 @@ async fn append_through_raft() {
         test_shard(),
         test_tenant(),
         &std::collections::BTreeMap::new(),
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -98,6 +102,8 @@ async fn append_and_read_deltas_round_trip() {
         test_shard(),
         test_tenant(),
         &std::collections::BTreeMap::new(),
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -148,6 +154,8 @@ async fn maintenance_through_raft() {
         test_shard(),
         test_tenant(),
         &std::collections::BTreeMap::new(),
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -178,6 +186,8 @@ async fn multiple_appends() {
         test_shard(),
         test_tenant(),
         &std::collections::BTreeMap::new(),
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -206,6 +216,8 @@ async fn watermark_advancement() {
         test_shard(),
         test_tenant(),
         &std::collections::BTreeMap::new(),
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -253,6 +265,8 @@ async fn compact_shard_deduplicates() {
         test_shard(),
         test_tenant(),
         &std::collections::BTreeMap::new(),
+        None,
+        None,
     )
     .await
     .unwrap();

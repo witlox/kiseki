@@ -158,8 +158,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_store::MemLogStore;
-    use openraft::storage::RaftLogStorage;
 
     // Use a concrete type config for testing — borrow from kiseki-log's LogTypeConfig.
     // Since we can't depend on kiseki-log from kiseki-raft, define a minimal test config.
