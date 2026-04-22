@@ -119,6 +119,25 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     When a shard is created with replication factor 3
     Then the 3 members are placed in at least 2 different racks
 
+  # === Shard migration via membership change (ADR-030) ===
+
+  Scenario: Shard migrated to SSD node via learner promotion
+    Given shard "s1" has voters on [node-1, node-2, node-3] (all HDD)
+    And node-4 is an SSD node with available capacity
+    When the control plane initiates migration of "s1" to node-4
+    Then node-4 is added as a learner
+    And node-4 receives a snapshot and catches up
+    And node-4 is promoted to voter
+    And one HDD node is removed from the voter set
+    And writes continue throughout without interruption
+
+  Scenario: Learner added as read accelerator (ADR-030 §7)
+    Given shard "s1" has voters on [node-1, node-2, node-3]
+    When an SSD learner is added on node-4
+    Then node-4 receives the Raft log but does not vote
+    And node-4 can serve read requests
+    And removing node-4 does not affect write quorum
+
   # === Performance ===
 
   Scenario: Write latency within SLO

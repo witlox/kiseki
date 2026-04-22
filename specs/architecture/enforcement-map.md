@@ -1,7 +1,7 @@
 # Enforcement Map — Invariant → Enforcement Point
 
 **Status**: Architect phase.
-**Last updated**: 2026-04-17.
+**Last updated**: 2026-04-22.
 
 Every invariant from specs/invariants.md mapped to WHERE in the
 architecture it gets enforced. Invariant without enforcement = violation.
@@ -166,3 +166,15 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | I-WA17 (declare-rate bound) | `kiseki-advisory` session manager + `control/pkg/policy` | Token-bucket rate limiter per `(workload_id)` at default 10/s; exceed → `declare_rate_exceeded` + audit |
 | I-WA18 (prospective policy application) | `kiseki-advisory` session manager | Snapshot effective policy at `DeclareWorkflow` into the workflow record; `PhaseAdvance` re-validates against current policy; revocation → `profile_revoked` / `priority_revoked`; active telemetry subscriptions re-evaluated on policy narrowing, terminated with `SUBSCRIPTION_REVOKED` StreamWarning |
 | workflow_ref header carriage | `kiseki-server` gRPC interceptor | Binary metadata key `x-kiseki-workflow-ref-bin` (16 bytes); lifted into request-scoped context; data-path protos unchanged (ADR-021 §3.a) |
+
+## Small-file placement invariants (ADR-030)
+
+| Invariant | Enforcement point | Mechanism |
+|---|---|---|
+| I-SF1 (per-shard inline threshold) | `kiseki-log` shard leader + `kiseki-server` control plane | Leader computes threshold = clamp(min(voter_budgets) / file_count, FLOOR, CEILING); stored in ShardConfig; replicated via Raft |
+| I-SF2 (system disk capacity limits) | `kiseki-server` boot + periodic monitor | Boot: detect disk type/capacity via sysfs, compute budget. Periodic: report `NodeMetadataCapacity` via gRPC health. Hard-limit breach → out-of-band gRPC alert to leader (not Raft). Leader commits threshold=FLOOR with 2/3 majority. |
+| I-SF3 (migration catch-up before promote) | `kiseki-log` Raft membership change | `add_learner` → wait until learner's last_applied matches leader's committed index → `change_membership`. Leader checks learner metrics before initiating promotion. |
+| I-SF4 (placement rate limiting) | `kiseki-server` control plane / placement policy | Per-shard exponential backoff timer (2h floor, 24h cap). Cluster-wide semaphore: `max(1, num_nodes/10)` concurrent migrations. Timer persisted in control plane state. |
+| I-SF5 (inline content in Raft, offloaded on apply) | `kiseki-log` state machine `apply()` + `build_snapshot()` | `apply()`: writes payload to `small/objects.redb`, keeps only header in memory. `build_snapshot()`: reads from redb, includes in snapshot. `install_snapshot()`: writes to redb on target. |
+| I-SF6 (GC covers small/objects.redb) | `kiseki-log` `truncate_log` + `compact_shard` | When removing a delta referencing inline content, delete corresponding `small/objects.redb` entry by chunk_id. Periodic scrub detects orphans. |
+| I-SF7 (Raft inline throughput guard) | `kiseki-log` shard leader write path | Sliding-window rate meter (10s). If inline_write_rate > `RAFT_INLINE_MBPS`, effective threshold drops to FLOOR. Rate check is pre-routing: before deciding inline vs chunk for each write. |

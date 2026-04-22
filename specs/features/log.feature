@@ -24,13 +24,14 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a DeltaCommitted event is emitted with sequence_number 1001
     And the commit_ack is returned to the Composition context
 
-  Scenario: Delta with inline data below threshold
-    Given the inline data threshold is 4096 bytes
+  Scenario: Delta with inline data below threshold (I-L9, ADR-030)
+    Given the shard inline threshold is 4096 bytes (per-shard, dynamic — ADR-030)
     When the Composition context appends a delta with:
       | field             | value                        |
       | operation_type    | create                       |
       | encrypted_payload | <1024 bytes, includes inline data> |
     Then the delta is committed with inline data in the payload
+    And the payload is offloaded to small/objects.redb on apply (I-SF5)
     And no separate chunk write is required
 
   Scenario: Deltas maintain total order within shard

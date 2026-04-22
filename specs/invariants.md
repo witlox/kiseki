@@ -1,6 +1,6 @@
 # Invariants — Kiseki
 
-**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers) and ADR-029 (Raw Block Device Allocator).
+**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers), ADR-029 (Raw Block Device Allocator), and ADR-030 (Dynamic Small-File Placement).
 **Last updated**: 2026-04-22.
 
 All invariants below have been confirmed through interrogation with the
@@ -223,6 +223,20 @@ domain expert unless marked otherwise.
 | I-WA17 | Workflow declaration rate is bounded per workload. `workflow_declares_per_sec` (default 10, policy-configurable) caps the rate of new `DeclareWorkflow` calls. Exceeding the rate returns `declare_rate_exceeded`; the calling workload's concurrent workflow cap remains enforced independently. | Confirmed |
 | I-WA18 | Runtime policy changes apply prospectively, not retroactively. An active workflow runs to completion (or TTL) under the profile, allow-lists, and budgets effective at its `DeclareWorkflow` moment. A policy change takes effect for the next `DeclareWorkflow` and for the next `PhaseAdvance` within existing workflows; if the new policy forbids the current phase's priority class or profile, that `PhaseAdvance` is rejected with `profile_revoked` or `priority_revoked` and the workflow continues on its current phase. Budget reductions apply prospectively from the next second. Active telemetry subscriptions are re-evaluated on policy narrowing (e.g., pool handle no longer authorized); revoked subscriptions receive a terminal `subscription-revoked` notification and are closed, with an audit event; the data path access to the revoked resource is governed independently by the data-path authorization stack. | Confirmed |
 | I-WA19 | Pool handles are the sole advisory-layer reference to affinity pools. At `DeclareWorkflow`, the advisory subsystem returns the set of pool handles (with tenant-chosen opaque labels) the workload is authorized to target in hints. Handles are valid for the workflow's lifetime only, are never reused across workflows, and never equal or leak the cluster-internal pool identity. A handle for a pool decommissioned or de-authorized during the workflow's life returns `scope-not-found` on use (uniform with the general oracle invariant I-WA6). | Confirmed |
+
+---
+
+## Small-file placement invariants (ADR-030)
+
+| ID | Invariant | Status |
+|---|---|---|
+| I-SF1 | The inline threshold for a shard is the minimum affordable threshold across all nodes hosting that shard's voter set. Threshold stored in ShardConfig, replicated via Raft. Computation: `clamp(min(voter_budgets) / file_count_estimate, INLINE_FLOOR, INLINE_CEILING)`. | Confirmed |
+| I-SF2 | System disk metadata usage must not exceed `hard_limit_pct` (default 75%) of system partition capacity. Exceeding `soft_limit_pct` (default 50%) triggers threshold reduction. Exceeding hard limit forces threshold to `INLINE_FLOOR` and emits alert. Capacity alerts use out-of-band gRPC health reports, not Raft, so full-disk nodes can signal without writing Raft entries. | Confirmed |
+| I-SF3 | Shard migration via Raft membership change must not proceed until the target node has fully caught up (learner state matches leader's committed index). Old voter remains in membership until new voter is promoted. | Confirmed |
+| I-SF4 | Placement change rate per shard follows exponential backoff (2h floor, 24h cap). Backoff resets never go below 2h floor, even on workload profile changes. Cluster-wide concurrent migrations bounded by `max(1, num_nodes / 10)`. | Confirmed |
+| I-SF5 | Inline content is carried in Raft log entries and offloaded to `small/objects.redb` on state machine apply. Snapshots include inline content read from redb. No inline content is held in the in-memory state machine after apply. This ensures snapshot transfer to learners/restarted nodes includes all inline data. | Confirmed |
+| I-SF6 | GC (`truncate_log`, `compact_shard`) must delete corresponding entries from `small/objects.redb` when removing deltas that reference inline objects. Orphan redb entries are a capacity leak. Periodic scrub detects orphans. | Confirmed |
+| I-SF7 | Per-shard Raft inline throughput must not exceed `KISEKI_RAFT_INLINE_MBPS` (default 10 MB/s). When exceeded, effective inline threshold drops to `INLINE_FLOOR` until rate subsides. Prevents inline data from starving metadata-only Raft operations during write storms. | Confirmed |
 
 ---
 
