@@ -145,9 +145,11 @@ async fn delete_object<G: GatewayOps + Send + Sync + 'static>(
     Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
+    // S3 spec: DELETE is idempotent — always returns 204 even if object
+    // doesn't exist or key is invalid.
     let comp_id = match uuid::Uuid::parse_str(&key) {
         Ok(u) => CompositionId(u),
-        Err(_) => return (StatusCode::NOT_FOUND, "invalid key (must be UUID)").into_response(),
+        Err(_) => return StatusCode::NO_CONTENT.into_response(),
     };
 
     match state.gateway.delete_object(DeleteObjectRequest {
@@ -158,7 +160,7 @@ async fn delete_object<G: GatewayOps + Send + Sync + 'static>(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             let code = if e.to_string().contains("not found") {
-                StatusCode::NOT_FOUND
+                StatusCode::NO_CONTENT // S3: delete of non-existent is idempotent
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
