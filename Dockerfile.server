@@ -7,7 +7,10 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY specs/architecture/proto/ specs/architecture/proto/
-RUN cargo build --release --bin kiseki-server --locked
+# Build without FIPS feature — FIPS module requires certified toolchain.
+# CI/dev Docker uses standard aws-lc-rs (non-FIPS). Production FIPS
+# builds use a dedicated certified build environment.
+RUN cargo build --release --bin kiseki-server --locked --no-default-features
 
 FROM rust:slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
