@@ -7,6 +7,7 @@
 pub mod admin;
 pub mod advisory;
 pub mod auth;
+pub mod block;
 pub mod chunk;
 pub mod client;
 pub mod composition;
@@ -16,6 +17,7 @@ pub mod device;
 pub mod ec;
 pub mod gateway;
 pub mod helpers;
+pub mod kms;
 pub mod log;
 pub mod operational;
 pub mod protocol;

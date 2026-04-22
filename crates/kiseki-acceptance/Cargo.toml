@@ -32,6 +32,8 @@ kiseki-control = { workspace = true }
 kiseki-gateway = { workspace = true }
 kiseki-transport = { workspace = true }
 kiseki-client = { workspace = true }
+kiseki-block = { workspace = true }
+tempfile = "3"
 
 # BDD framework
 cucumber = { workspace = true }

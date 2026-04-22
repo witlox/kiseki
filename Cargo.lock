@@ -1341,6 +1341,7 @@ dependencies = [
  "cucumber",
  "kiseki-advisory",
  "kiseki-audit",
+ "kiseki-block",
  "kiseki-chunk",
  "kiseki-client",
  "kiseki-common",
@@ -1352,6 +1353,7 @@ dependencies = [
  "kiseki-log",
  "kiseki-transport",
  "kiseki-view",
+ "tempfile",
  "tokio",
  "uuid",
 ]

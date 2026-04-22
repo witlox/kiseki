@@ -22,6 +22,8 @@ use cucumber::World;
 use kiseki_advisory::budget::{BudgetConfig, BudgetEnforcer};
 use kiseki_advisory::workflow::WorkflowTable;
 use kiseki_audit::store::AuditLog;
+use kiseki_block::file::FileBackedDevice;
+use kiseki_block::{DeviceBackend, Extent};
 use kiseki_chunk::store::ChunkStore;
 use kiseki_common::advisory::*;
 use kiseki_common::ids::*;
@@ -123,8 +125,21 @@ pub struct KisekiWorld {
     pub control_last_policy_error: Option<String>,
     pub control_pool_authorized: std::collections::HashMap<String, String>,
 
+    // === External KMS (ADR-028) ===
+    pub kms_provider_type: Option<String>,
+    pub kms_circuit_open: bool,
+    pub kms_concurrent_count: u32,
+
     // === Storage admin (ADR-025) ===
     pub control_admin: StorageAdminService,
+
+    // === Block storage (ADR-029) ===
+    pub block_device: Option<Box<dyn DeviceBackend>>,
+    pub last_extent: Option<Extent>,
+    pub block_device_path: Option<std::path::PathBuf>,
+    pub block_extents: Vec<Extent>,
+    pub block_temp_dir: Option<tempfile::TempDir>,
+    pub block_scrub_report: Option<String>,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -233,7 +248,16 @@ impl KisekiWorld {
             control_workload_policy: None,
             control_last_policy_error: None,
             control_pool_authorized: HashMap::new(),
+            kms_provider_type: None,
+            kms_circuit_open: false,
+            kms_concurrent_count: 0,
             control_admin: StorageAdminService::new(),
+            block_device: None,
+            last_extent: None,
+            block_device_path: None,
+            block_extents: Vec::new(),
+            block_temp_dir: None,
+            block_scrub_report: None,
         }
     }
 
