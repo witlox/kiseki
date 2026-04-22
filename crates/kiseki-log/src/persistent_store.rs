@@ -97,15 +97,20 @@ impl PersistentShardStore {
                 };
                 let timestamp = DeltaTimestamp {
                     hlc: HybridLogicalClock {
-                        physical_ms: 0,
-                        logical: 0,
-                        node_id: NodeId(0),
+                        physical_ms: delta.hlc_physical_ms,
+                        logical: delta.hlc_logical,
+                        node_id: NodeId(delta.hlc_node_id),
                     },
                     wall: WallTime {
-                        millis_since_epoch: 0,
-                        timezone: "UTC".into(),
+                        millis_since_epoch: delta.wall_millis,
+                        timezone: delta.wall_timezone.clone(),
                     },
-                    quality: ClockQuality::Ntp,
+                    quality: match delta.clock_quality {
+                        1 => ClockQuality::Ptp,
+                        2 => ClockQuality::Gps,
+                        3 => ClockQuality::Unsync,
+                        _ => ClockQuality::Ntp,
+                    },
                 };
                 let _ = self.mem.append_delta(AppendDeltaRequest {
                     shard_id,
@@ -138,6 +143,13 @@ struct PersistedDelta {
     hashed_key: [u8; 32],
     payload: Vec<u8>,
     has_inline_data: bool,
+    // Timestamp fields (added for timestamp fidelity across restart).
+    hlc_physical_ms: u64,
+    hlc_logical: u32,
+    hlc_node_id: u64,
+    wall_millis: u64,
+    wall_timezone: String,
+    clock_quality: u8,
 }
 
 impl LogOps for PersistentShardStore {
@@ -160,6 +172,17 @@ impl LogOps for PersistentShardStore {
             hashed_key: req.hashed_key,
             payload: req.payload,
             has_inline_data: req.has_inline_data,
+            hlc_physical_ms: req.timestamp.hlc.physical_ms,
+            hlc_logical: req.timestamp.hlc.logical,
+            hlc_node_id: req.timestamp.hlc.node_id.0,
+            wall_millis: req.timestamp.wall.millis_since_epoch,
+            wall_timezone: req.timestamp.wall.timezone.clone(),
+            clock_quality: match req.timestamp.quality {
+                kiseki_common::time::ClockQuality::Ntp => 0,
+                kiseki_common::time::ClockQuality::Ptp => 1,
+                kiseki_common::time::ClockQuality::Gps => 2,
+                kiseki_common::time::ClockQuality::Unsync => 3,
+            },
         };
         let _ = self.redb.append(seq.0, &persisted);
 
@@ -293,6 +316,69 @@ mod tests {
                 .unwrap();
             assert_eq!(deltas.len(), 1, "delta should survive reopen via reload");
             assert_eq!(deltas[0].payload.ciphertext, b"persisted");
+        }
+    }
+
+    #[test]
+    fn timestamps_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ts.redb");
+
+        let ts = DeltaTimestamp {
+            hlc: HybridLogicalClock {
+                physical_ms: 1718000000000,
+                logical: 42,
+                node_id: NodeId(7),
+            },
+            wall: WallTime {
+                millis_since_epoch: 1718000000000,
+                timezone: "Europe/Zurich".into(),
+            },
+            quality: ClockQuality::Ptp,
+        };
+
+        // Write delta with specific timestamp.
+        {
+            let store = PersistentShardStore::open(&path).unwrap();
+            store.create_shard(
+                test_shard(),
+                test_tenant(),
+                NodeId(7),
+                ShardConfig::default(),
+            );
+            store
+                .append_delta(AppendDeltaRequest {
+                    shard_id: test_shard(),
+                    tenant_id: test_tenant(),
+                    operation: OperationType::Create,
+                    timestamp: ts.clone(),
+                    hashed_key: [0xAA; 32],
+                    chunk_refs: vec![],
+                    payload: b"timestamped".to_vec(),
+                    has_inline_data: false,
+                })
+                .unwrap();
+        }
+
+        // Reopen and verify timestamp fidelity.
+        {
+            let store = PersistentShardStore::open(&path).unwrap();
+            let deltas = store
+                .read_deltas(ReadDeltasRequest {
+                    shard_id: test_shard(),
+                    from: SequenceNumber(1),
+                    to: SequenceNumber(1),
+                })
+                .unwrap();
+
+            assert_eq!(deltas.len(), 1);
+            let d = &deltas[0];
+            assert_eq!(d.header.timestamp.hlc.physical_ms, 1718000000000);
+            assert_eq!(d.header.timestamp.hlc.logical, 42);
+            assert_eq!(d.header.timestamp.hlc.node_id, NodeId(7));
+            assert_eq!(d.header.timestamp.wall.millis_since_epoch, 1718000000000);
+            assert_eq!(d.header.timestamp.wall.timezone, "Europe/Zurich");
+            assert_eq!(d.header.timestamp.quality, ClockQuality::Ptp);
         }
     }
 }
