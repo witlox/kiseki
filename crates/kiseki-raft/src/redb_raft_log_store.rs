@@ -215,7 +215,6 @@ mod tests {
 
     #[tokio::test]
     async fn entries_survive_reopen() {
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("persist.redb");
 
