@@ -22,6 +22,7 @@ pub mod persistent_store;
 pub mod raft;
 pub mod raft_store;
 pub mod rewrap_worker;
+pub mod rotation_monitor;
 pub mod store;
 
 pub use epoch::{EpochInfo, KeyManagerOps};
