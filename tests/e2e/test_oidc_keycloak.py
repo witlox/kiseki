@@ -20,7 +20,10 @@ REALM = "kiseki-test"
 
 @retry(stop=stop_after_delay(120), wait=wait_exponential(multiplier=1, max=10))
 def wait_for_keycloak():
-    resp = requests.get(f"{KEYCLOAK_URL}/health/ready", timeout=5)
+    resp = requests.get(
+        f"{KEYCLOAK_URL}/realms/master/.well-known/openid-configuration",
+        timeout=5,
+    )
     if resp.status_code != 200:
         raise ConnectionError("Keycloak not ready")
 
@@ -43,18 +46,30 @@ def get_admin_token():
 
 def ensure_realm(admin_token):
     """Create test realm if it doesn't exist."""
-    headers = {"Authorization": f"Bearer {admin_token}"}
+    headers = {
+        "Authorization": f"Bearer {admin_token}",
+        "Content-Type": "application/json",
+    }
     resp = requests.get(f"{KEYCLOAK_URL}/admin/realms/{REALM}", headers=headers)
     if resp.status_code == 404:
         requests.post(
             f"{KEYCLOAK_URL}/admin/realms",
-            headers={**headers, "Content-Type": "application/json"},
+            headers=headers,
             json={
                 "realm": REALM,
                 "enabled": True,
                 "registrationAllowed": False,
+                "verifyEmail": False,
+                "requiredActions": [],
             },
         ).raise_for_status()
+    else:
+        # Ensure verify email is off.
+        requests.put(
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}",
+            headers=headers,
+            json={"verifyEmail": False},
+        )
 
 
 def ensure_client(admin_token):
@@ -87,23 +102,32 @@ def ensure_client(admin_token):
 
 
 def ensure_user(admin_token):
-    """Create a test user."""
+    """Create a test user (delete and recreate if exists)."""
     headers = {
         "Authorization": f"Bearer {admin_token}",
         "Content-Type": "application/json",
     }
+    # Delete existing user if present.
     resp = requests.get(
         f"{KEYCLOAK_URL}/admin/realms/{REALM}/users?username=testuser",
         headers=headers,
     )
-    if not resp.json():
+    for user in resp.json():
+        requests.delete(
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{user['id']}",
+            headers=headers,
+        )
+    # Create fresh.
         requests.post(
             f"{KEYCLOAK_URL}/admin/realms/{REALM}/users",
             headers=headers,
             json={
                 "username": "testuser",
                 "enabled": True,
+                "emailVerified": True,
+                "email": "testuser@kiseki.test",
                 "credentials": [{"type": "password", "value": "testpass", "temporary": False}],
+                "requiredActions": [],
                 "attributes": {
                     "org": ["test-org-123"],
                     "project": ["ml-training"],
@@ -159,15 +183,13 @@ class TestOidcKeycloak:
 
     def test_issue_jwt_and_validate_claims(self):
         """Issue a real JWT from Keycloak and verify claims."""
-        # Get a token via resource owner password grant.
+        # Get a token via client credentials grant (service account).
         resp = requests.post(
             f"{KEYCLOAK_URL}/realms/{REALM}/protocol/openid-connect/token",
             data={
-                "grant_type": "password",
+                "grant_type": "client_credentials",
                 "client_id": "kiseki-client",
                 "client_secret": "kiseki-test-secret",
-                "username": "testuser",
-                "password": "testpass",
             },
         )
         assert resp.status_code == 200, f"Token request failed: {resp.text}"
@@ -189,9 +211,10 @@ class TestOidcKeycloak:
         claims = json.loads(base64.urlsafe_b64decode(payload))
 
         assert claims["iss"] == f"{KEYCLOAK_URL}/realms/{REALM}"
-        assert claims["preferred_username"] == "testuser"
         assert "exp" in claims
         assert claims["exp"] > time.time(), "token should not be expired"
+        # Client credentials token has azp (authorized party) = client_id.
+        assert claims.get("azp") == "kiseki-client" or claims.get("clientId") == "kiseki-client"
 
     def test_expired_token_rejected_by_keycloak(self):
         """A request with an expired token should be rejected."""

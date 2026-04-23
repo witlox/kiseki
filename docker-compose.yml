@@ -26,9 +26,10 @@ services:
       KISEKI_METRICS_ADDR: "0.0.0.0:9090"
       KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "true"
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
-      OTEL_SERVICE_NAME: "kiseki-server"
-      OTEL_TRACES_SAMPLER_ARG: "1.0"
+      # OTEL disabled until init_tracing runs inside tokio runtime
+      # OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+      # OTEL_SERVICE_NAME: "kiseki-server"
+      # OTEL_TRACES_SAMPLER_ARG: "1.0"
     volumes:
       - kiseki-data:/data
     depends_on:
@@ -43,7 +44,7 @@ services:
       retries: 10
 
   jaeger:
-    image: jaegertracing/jaeger:2
+    image: jaegertracing/all-in-one:latest
     ports:
       - "4317:4317"   # OTLP gRPC receiver
       - "16686:16686" # Jaeger UI
@@ -60,7 +61,7 @@ services:
     cap_add:
       - IPC_LOCK
     healthcheck:
-      test: ["CMD", "vault", "status"]
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8200/v1/sys/health || exit 1"]
       interval: 2s
       timeout: 2s
       retries: 10
