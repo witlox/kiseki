@@ -258,6 +258,25 @@ mod tests {
     }
 
     #[test]
+    fn slow_io_latency_returned_correctly() {
+        let fi = FaultInjector::new();
+        let latency = Duration::from_millis(123);
+        fi.slow_io_on(latency);
+
+        assert!(fi.is_slow_io());
+        assert_eq!(
+            fi.slow_io_latency(),
+            latency,
+            "slow_io_latency should return the exact configured latency"
+        );
+
+        // Verify update works.
+        let new_latency = Duration::from_millis(456);
+        fi.slow_io_on(new_latency);
+        assert_eq!(fi.slow_io_latency(), new_latency);
+    }
+
+    #[test]
     fn fault_counter_increments() {
         let fi = FaultInjector::new();
         fi.partition_on();

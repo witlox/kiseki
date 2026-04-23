@@ -147,6 +147,59 @@ fn tenant_mismatch_rejected() {
     );
 }
 
+#[test]
+fn bucket_isolation_list_returns_only_own_objects() {
+    // Create two namespaces (buckets), write to each, verify list
+    // returns only the objects belonging to each namespace.
+    let ns1 = NamespaceId(uuid::Uuid::from_u128(201));
+    let ns2 = NamespaceId(uuid::Uuid::from_u128(202));
+    let tenant = test_tenant();
+
+    let mut compositions = CompositionStore::new();
+    compositions.add_namespace(Namespace {
+        id: ns1,
+        tenant_id: tenant,
+        shard_id: ShardId(uuid::Uuid::from_u128(1)),
+        read_only: false,
+    });
+    compositions.add_namespace(Namespace {
+        id: ns2,
+        tenant_id: tenant,
+        shard_id: ShardId(uuid::Uuid::from_u128(1)),
+        read_only: false,
+    });
+    let chunks = ChunkStore::new();
+    let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+    let gw = InMemoryGateway::new(compositions, Box::new(chunks), master_key);
+
+    // Write to ns1.
+    gw.write(kiseki_gateway::WriteRequest {
+        tenant_id: tenant,
+        namespace_id: ns1,
+        data: b"object-in-bucket1".to_vec(),
+    })
+    .unwrap();
+
+    // Write to ns2.
+    gw.write(kiseki_gateway::WriteRequest {
+        tenant_id: tenant,
+        namespace_id: ns2,
+        data: b"object-in-bucket2".to_vec(),
+    })
+    .unwrap();
+
+    // List ns1 — should see only its object.
+    let list1 = gw.list(tenant, ns1).unwrap();
+    assert_eq!(list1.len(), 1, "ns1 should have exactly 1 object");
+
+    // List ns2 — should see only its object.
+    let list2 = gw.list(tenant, ns2).unwrap();
+    assert_eq!(list2.len(), 1, "ns2 should have exactly 1 object");
+
+    // The composition IDs should be different.
+    assert_ne!(list1[0].0, list2[0].0);
+}
+
 #[cfg(feature = "s3")]
 mod s3_tests {
     use super::*;

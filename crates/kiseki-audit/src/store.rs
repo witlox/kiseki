@@ -257,4 +257,83 @@ mod tests {
         });
         assert!(events.is_empty());
     }
+
+    #[test]
+    fn append_only_order_preserved_ia1() {
+        let log = AuditLog::new();
+
+        // Append 5 events and verify they come back in order with
+        // monotonically increasing sequence numbers.
+        for _ in 0..5 {
+            log.append(make_event(Some(test_tenant()), AuditEventType::DataWrite));
+        }
+
+        let events = log.query(&AuditQuery {
+            tenant_id: Some(test_tenant()),
+            from: SequenceNumber(1),
+            limit: 100,
+            event_type: None,
+        });
+        assert_eq!(events.len(), 5);
+
+        // Verify monotonic ordering.
+        for i in 0..events.len() - 1 {
+            assert!(
+                events[i].sequence < events[i + 1].sequence,
+                "sequence numbers must be strictly increasing"
+            );
+        }
+
+        // I-A1: no mutation API — AuditOps has append/query/tip/export but
+        // no update or delete methods. The trait itself enforces append-only.
+    }
+
+    #[test]
+    fn event_count_matches_after_multiple_appends() {
+        let log = AuditLog::new();
+        assert_eq!(log.total_events(), 0);
+
+        log.append(make_event(Some(test_tenant()), AuditEventType::DataWrite));
+        log.append(make_event(Some(test_tenant()), AuditEventType::DataRead));
+        log.append(make_event(None, AuditEventType::AdminAction));
+
+        assert_eq!(log.total_events(), 3);
+    }
+
+    #[test]
+    fn empty_store_returns_empty_results() {
+        let log = AuditLog::new();
+
+        // Query returns empty.
+        let events = log.query(&AuditQuery {
+            tenant_id: Some(test_tenant()),
+            from: SequenceNumber(1),
+            limit: 100,
+            event_type: None,
+        });
+        assert!(events.is_empty());
+
+        // Tip is zero.
+        assert_eq!(log.tip(Some(test_tenant())), SequenceNumber(0));
+        assert_eq!(log.tip(None), SequenceNumber(0));
+
+        // Total is zero.
+        assert_eq!(log.total_events(), 0);
+
+        // Export returns empty.
+        let export = log.tenant_export(test_tenant());
+        assert!(export.is_empty());
+    }
+
+    #[test]
+    fn tip_advances_with_appends() {
+        let log = AuditLog::new();
+        assert_eq!(log.tip(Some(test_tenant())), SequenceNumber(0));
+
+        log.append(make_event(Some(test_tenant()), AuditEventType::DataWrite));
+        assert_eq!(log.tip(Some(test_tenant())), SequenceNumber(1));
+
+        log.append(make_event(Some(test_tenant()), AuditEventType::DataWrite));
+        assert_eq!(log.tip(Some(test_tenant())), SequenceNumber(2));
+    }
 }

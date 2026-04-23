@@ -453,4 +453,36 @@ mod tests {
         let list = mgr.list();
         assert_eq!(list.len(), 2);
     }
+
+    #[test]
+    fn corrupt_manifest_skipped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool_dir = dir.path().to_path_buf();
+
+        // Create a valid staging directory with a corrupt manifest.
+        let staging_dir = pool_dir.join("staging");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        std::fs::write(
+            staging_dir.join("_corrupt.manifest"),
+            "this is not valid json{{{",
+        )
+        .unwrap();
+
+        // Also create a valid manifest alongside the corrupt one.
+        let valid_manifest = StagingManifest {
+            namespace_path: "/good/data".into(),
+            chunk_ids: vec![hex_encode_chunk(&test_chunk_id(0xAA))],
+            bytes: 512,
+        };
+        std::fs::write(
+            staging_dir.join("_good_data.manifest"),
+            serde_json::to_string_pretty(&valid_manifest).unwrap(),
+        )
+        .unwrap();
+
+        // Loading should skip the corrupt manifest and load the valid one.
+        let mgr = StagingManager::new(Some(pool_dir), StagingConfig::default());
+        assert_eq!(mgr.count(), 1, "should load only the valid manifest");
+        assert!(mgr.is_staged("/good/data"));
+    }
 }

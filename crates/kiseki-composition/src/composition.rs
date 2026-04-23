@@ -523,4 +523,70 @@ mod tests {
         assert_eq!(comp.chunks.len(), 2);
         assert_eq!(comp.size, 200);
     }
+
+    #[test]
+    fn composition_belongs_to_one_tenant_ix1() {
+        let mut store = setup();
+        let id = store
+            .create(test_ns(), vec![ChunkId([0xaa; 32])], 512)
+            .unwrap_or_else(|_| unreachable!());
+
+        let comp = store.get(id).unwrap_or_else(|_| unreachable!());
+        // I-X1: composition is owned by the namespace's tenant.
+        assert_eq!(comp.tenant_id, test_tenant());
+        assert_eq!(comp.namespace_id, test_ns());
+    }
+
+    #[test]
+    fn namespace_not_found_returns_error() {
+        let mut store = CompositionStore::new();
+        let bogus_ns = NamespaceId(uuid::Uuid::from_u128(999));
+        let result = store.create(bogus_ns, vec![], 0);
+        assert!(matches!(
+            result,
+            Err(CompositionError::NamespaceNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn list_compositions_in_namespace() {
+        let mut store = setup();
+
+        let id1 = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+            .unwrap_or_else(|_| unreachable!());
+        let id2 = store
+            .create(test_ns(), vec![ChunkId([0x02; 32])], 200)
+            .unwrap_or_else(|_| unreachable!());
+        let id3 = store
+            .create(test_ns(), vec![ChunkId([0x03; 32])], 300)
+            .unwrap_or_else(|_| unreachable!());
+
+        let listed = store.list_by_namespace(test_ns());
+        assert_eq!(listed.len(), 3);
+
+        let listed_ids: Vec<CompositionId> = listed.iter().map(|c| c.id).collect();
+        assert!(listed_ids.contains(&id1));
+        assert!(listed_ids.contains(&id2));
+        assert!(listed_ids.contains(&id3));
+    }
+
+    #[test]
+    fn count_tracks_compositions() {
+        let mut store = setup();
+        assert_eq!(store.count(), 0);
+
+        store
+            .create(test_ns(), vec![], 0)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(store.count(), 1);
+
+        let id2 = store
+            .create(test_ns(), vec![], 0)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(store.count(), 2);
+
+        store.delete(id2).unwrap_or_else(|_| unreachable!());
+        assert_eq!(store.count(), 1);
+    }
 }

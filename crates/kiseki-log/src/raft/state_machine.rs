@@ -458,3 +458,50 @@ impl RaftStateMachine<C> for ShardStateMachine {
         self.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Inline store key derivation: XOR sequence into last 8 bytes of `hashed_key`.
+    /// Two deltas with the same `hashed_key` but different sequences must produce
+    /// different inline keys (I-SF5 uniqueness invariant).
+    fn compute_inline_key(hashed_key: &[u8; 32], sequence: u64) -> [u8; 32] {
+        let mut k = *hashed_key;
+        let seq_bytes = sequence.to_le_bytes();
+        for (i, &b) in seq_bytes.iter().enumerate() {
+            k[24 + i] ^= b;
+        }
+        k
+    }
+
+    #[test]
+    fn inline_key_differs_for_different_sequences() {
+        let hashed_key = [0xAB_u8; 32];
+        let key_seq1 = compute_inline_key(&hashed_key, 1);
+        let key_seq2 = compute_inline_key(&hashed_key, 2);
+        assert_ne!(
+            key_seq1, key_seq2,
+            "inline keys for same hashed_key with different sequences must differ"
+        );
+    }
+
+    #[test]
+    fn inline_key_same_for_same_sequence() {
+        let hashed_key = [0xCD_u8; 32];
+        let key_a = compute_inline_key(&hashed_key, 42);
+        let key_b = compute_inline_key(&hashed_key, 42);
+        assert_eq!(
+            key_a, key_b,
+            "inline keys for same hashed_key and same sequence must be identical"
+        );
+    }
+
+    #[test]
+    fn inline_key_xor_only_affects_last_8_bytes() {
+        let hashed_key = [0xFF_u8; 32];
+        let key = compute_inline_key(&hashed_key, 1);
+        // First 24 bytes should be unchanged.
+        assert_eq!(&key[..24], &[0xFF_u8; 24]);
+        // Last 8 bytes should differ from original (XOR with non-zero sequence).
+        assert_ne!(&key[24..], &[0xFF_u8; 8]);
+    }
+}

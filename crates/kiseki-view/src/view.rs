@@ -321,6 +321,69 @@ mod tests {
     }
 
     #[test]
+    fn create_view_id_matches_descriptor() {
+        let mut store = ViewStore::new();
+        let desc = test_descriptor();
+        let expected_id = desc.view_id;
+        let view_id = store.create_view(desc).unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(view_id, expected_id);
+        assert_eq!(store.count(), 1);
+        assert!(store.view_ids().contains(&expected_id));
+    }
+
+    #[test]
+    fn duplicate_view_creation_succeeds_idempotently() {
+        let mut store = ViewStore::new();
+        let desc = test_descriptor();
+        let id1 = store
+            .create_view(desc.clone())
+            .unwrap_or_else(|_| unreachable!());
+        let id2 = store
+            .create_view(desc.clone())
+            .unwrap_or_else(|_| unreachable!());
+
+        // Same ID returned, store still has one entry for that key.
+        assert_eq!(id1, id2);
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn view_descriptor_fields_preserved() {
+        let mut store = ViewStore::new();
+        let desc = ViewDescriptor {
+            view_id: ViewId(uuid::Uuid::from_u128(42)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(7)),
+            source_shards: vec![
+                ShardId(uuid::Uuid::from_u128(10)),
+                ShardId(uuid::Uuid::from_u128(20)),
+            ],
+            protocol: ProtocolSemantics::S3,
+            consistency: ConsistencyModel::Eventual,
+            discardable: false,
+            version: 5,
+        };
+        let view_id = store
+            .create_view(desc.clone())
+            .unwrap_or_else(|_| unreachable!());
+
+        let view = store.get_view(view_id).unwrap_or_else(|_| unreachable!());
+        assert_eq!(view.descriptor.tenant_id, desc.tenant_id);
+        assert_eq!(view.descriptor.source_shards, desc.source_shards);
+        assert_eq!(view.descriptor.protocol, ProtocolSemantics::S3);
+        assert_eq!(view.descriptor.consistency, ConsistencyModel::Eventual);
+        assert!(!view.descriptor.discardable);
+        assert_eq!(view.descriptor.version, 5);
+    }
+
+    #[test]
+    fn get_nonexistent_view_returns_error() {
+        let store = ViewStore::new();
+        let bogus_id = ViewId(uuid::Uuid::from_u128(999));
+        assert!(store.get_view(bogus_id).is_err());
+    }
+
+    #[test]
     fn staleness_violation_detected() {
         let mut store = ViewStore::new();
         let desc = ViewDescriptor {

@@ -466,4 +466,74 @@ mod tests {
         let result = store.read_chunk(&ChunkId([0xff; 32]));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn write_chunk_returns_false_for_duplicate() {
+        // I-C1: dedup — write_chunk returns is_new=false on duplicate.
+        let mut store = setup_store();
+        let env1 = test_envelope(0x42);
+        let env2 = test_envelope(0x42); // same chunk ID
+
+        let is_new1 = store.write_chunk(env1, "fast-nvme").unwrap();
+        assert!(is_new1, "first write should be new");
+
+        let is_new2 = store.write_chunk(env2, "fast-nvme").unwrap();
+        assert!(!is_new2, "duplicate write should return is_new=false");
+
+        // Refcount should be 2 after two writes of the same chunk.
+        assert_eq!(store.refcount(&ChunkId([0x42; 32])).unwrap(), 2);
+    }
+
+    #[test]
+    fn retention_hold_survives_gc_then_release_allows_gc() {
+        // I-C2b: chunk with retention hold is not GC'd.
+        let mut store = setup_store();
+        let env = test_envelope(0x50);
+        let chunk_id = env.chunk_id;
+
+        store.write_chunk(env, "fast-nvme").unwrap();
+        store.decrement_refcount(&chunk_id).unwrap(); // refcount = 0
+
+        // Set hold.
+        store
+            .set_retention_hold(&chunk_id, "legal-hold-2025")
+            .unwrap();
+
+        // GC should NOT delete it.
+        assert_eq!(store.gc(), 0);
+        assert_eq!(store.chunk_count(), 1);
+
+        // Add a second hold, release the first.
+        store.set_retention_hold(&chunk_id, "audit-hold").unwrap();
+        store
+            .release_retention_hold(&chunk_id, "legal-hold-2025")
+            .unwrap();
+
+        // Still one hold left — should survive GC.
+        assert_eq!(store.gc(), 0);
+
+        // Release the last hold — now GC should remove it.
+        store
+            .release_retention_hold(&chunk_id, "audit-hold")
+            .unwrap();
+        assert_eq!(store.gc(), 1);
+        assert_eq!(store.chunk_count(), 0);
+    }
+
+    #[test]
+    fn refcount_increment_twice_decrement_once() {
+        let mut store = setup_store();
+        let env = test_envelope(0x60);
+        let chunk_id = env.chunk_id;
+
+        store.write_chunk(env, "fast-nvme").unwrap(); // refcount = 1
+        store.increment_refcount(&chunk_id).unwrap(); // refcount = 2
+        store.increment_refcount(&chunk_id).unwrap(); // refcount = 3
+        store.decrement_refcount(&chunk_id).unwrap(); // refcount = 2
+
+        assert_eq!(store.refcount(&chunk_id).unwrap(), 2);
+
+        // Should NOT be GC'd since refcount > 0.
+        assert_eq!(store.gc(), 0);
+    }
 }

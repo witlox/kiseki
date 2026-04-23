@@ -310,6 +310,56 @@ mod tests {
     }
 
     #[test]
+    fn tampered_auth_tag_rejected_ik7() {
+        let aead = Aead::new();
+        let master = test_master();
+        let chunk_id = test_chunk_id();
+
+        let mut envelope = seal_envelope(&aead, &master, &chunk_id, b"secret data")
+            .unwrap_or_else(|_| unreachable!());
+        // Flip a byte in the auth tag.
+        envelope.auth_tag[0] ^= 0xff;
+        let result = open_envelope(&aead, &master, &envelope);
+        assert!(result.is_err(), "tampered auth tag must be rejected (I-K7)");
+    }
+
+    #[test]
+    fn nonce_uniqueness() {
+        let aead = Aead::new();
+        let master = test_master();
+        let chunk_id = test_chunk_id();
+        let plaintext = b"same plaintext";
+
+        let env1 =
+            seal_envelope(&aead, &master, &chunk_id, plaintext).unwrap_or_else(|_| unreachable!());
+        let env2 =
+            seal_envelope(&aead, &master, &chunk_id, plaintext).unwrap_or_else(|_| unreachable!());
+
+        // Two seals of the same plaintext must produce different nonces.
+        assert_ne!(env1.nonce, env2.nonce, "nonces must differ between seals");
+    }
+
+    #[test]
+    fn wrong_chunk_id_context_fails() {
+        let aead = Aead::new();
+        let master = test_master();
+        let chunk_id = test_chunk_id();
+        let other_chunk = ChunkId([0xcc; 32]);
+
+        let envelope = seal_envelope(&aead, &master, &chunk_id, b"bound to chunk")
+            .unwrap_or_else(|_| unreachable!());
+
+        // Reconstruct with wrong chunk_id — AAD mismatch should fail AEAD.
+        let mut tampered_env = envelope.clone();
+        tampered_env.chunk_id = other_chunk;
+        let result = open_envelope(&aead, &master, &tampered_env);
+        assert!(
+            result.is_err(),
+            "wrong chunk_id AAD must cause decryption failure"
+        );
+    }
+
+    #[test]
     fn large_plaintext_roundtrip() {
         let aead = Aead::new();
         let master = test_master();

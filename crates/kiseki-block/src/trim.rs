@@ -249,4 +249,51 @@ mod tests {
         assert_eq!(flushed[0].offset, 0);
         assert_eq!(flushed[0].length, 12288);
     }
+
+    #[test]
+    fn overlapping_extents_stay_separate() {
+        // Currently the TrimQueue only merges *adjacent* extents
+        // (last.end == next.offset). Overlapping extents like
+        // [0,8192) and [4096,8192) are NOT merged because 8192 != 4096.
+        // This test documents that behavior.
+        let mut q = TrimQueue::new(TrimConfig::default());
+        q.enqueue(Extent {
+            offset: 0,
+            length: 8192,
+        });
+        q.enqueue(Extent {
+            offset: 4096,
+            length: 4096,
+        });
+
+        let flushed = q.flush();
+        // After sorting: [0,8192), [4096,8192).
+        // 0 + 8192 = 8192 != 4096, so they are not adjacent => stay separate.
+        assert_eq!(
+            flushed.len(),
+            2,
+            "overlapping extents should NOT be merged (only adjacent are)"
+        );
+    }
+
+    #[test]
+    fn non_adjacent_extents_stay_separate() {
+        let mut q = TrimQueue::new(TrimConfig::default());
+        // Two extents with a gap between them.
+        q.enqueue(Extent {
+            offset: 0,
+            length: 4096,
+        });
+        q.enqueue(Extent {
+            offset: 16384,
+            length: 4096,
+        });
+
+        let flushed = q.flush();
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(flushed[0].offset, 0);
+        assert_eq!(flushed[0].length, 4096);
+        assert_eq!(flushed[1].offset, 16384);
+        assert_eq!(flushed[1].length, 4096);
+    }
 }

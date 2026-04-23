@@ -117,4 +117,52 @@ mod tests {
         enforcer.release_workflow();
         assert!(enforcer.try_declare().is_ok());
     }
+
+    #[test]
+    fn budget_exceeded_returns_error_message() {
+        let config = BudgetConfig {
+            hints_per_sec: 1,
+            max_concurrent_workflows: 1,
+            max_phases_per_workflow: 10,
+        };
+        let mut enforcer = BudgetEnforcer::new(config);
+
+        // First hint succeeds.
+        assert!(enforcer.try_hint().is_ok());
+        assert_eq!(enforcer.hints_used(), 1);
+
+        // Second hint exceeds the budget of 1 hint/sec.
+        let err = enforcer.try_hint().unwrap_err();
+        assert!(
+            matches!(err, AdvisoryError::BudgetExceeded(ref msg) if msg.contains("hints/sec")),
+            "expected BudgetExceeded with hints/sec, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reset_window_clears_hint_counter() {
+        let mut enforcer = BudgetEnforcer::new(test_config());
+
+        // Fill the window.
+        for _ in 0..3 {
+            enforcer.try_hint().unwrap_or_else(|_| unreachable!());
+        }
+        assert_eq!(enforcer.hints_used(), 3);
+        assert!(enforcer.try_hint().is_err());
+
+        // Reset simulates a new 1-second window.
+        enforcer.reset_window();
+        assert_eq!(enforcer.hints_used(), 0);
+        assert!(enforcer.try_hint().is_ok());
+    }
+
+    #[test]
+    fn release_workflow_saturates_at_zero() {
+        let mut enforcer = BudgetEnforcer::new(test_config());
+        assert_eq!(enforcer.active_workflows(), 0);
+
+        // Releasing with no active workflows should not underflow.
+        enforcer.release_workflow();
+        assert_eq!(enforcer.active_workflows(), 0);
+    }
 }

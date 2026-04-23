@@ -412,6 +412,46 @@ mod tests {
     }
 
     #[test]
+    fn restore_from_snapshot_reads_manifest_and_shard_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = temp_config(tmp.path());
+        cfg.include_data = true;
+        let mgr = BackupManager::new(cfg);
+
+        let shards = vec![
+            ShardSnapshot {
+                shard_id: "shard-a".into(),
+                metadata: b"{\"version\": 1}".to_vec(),
+                data: Some(b"payload-bytes".to_vec()),
+            },
+            ShardSnapshot {
+                shard_id: "shard-b".into(),
+                metadata: b"{\"version\": 2}".to_vec(),
+                data: Some(b"more-data".to_vec()),
+            },
+        ];
+
+        let snap = mgr.create_snapshot(&shards).unwrap();
+
+        // Read manifest back and verify fields.
+        let manifest_raw = std::fs::read_to_string(snap.path.join("manifest.json")).unwrap();
+        let parsed = parse_manifest(&manifest_raw, &snap.path).unwrap();
+        assert_eq!(parsed.shard_count, 2);
+        assert_eq!(parsed.snapshot_id, snap.snapshot_id);
+        assert!(parsed.metadata_bytes > 0);
+
+        // Verify shard data files were written with correct content.
+        let data_a = std::fs::read(snap.path.join("shard-a.data")).unwrap();
+        assert_eq!(data_a, b"payload-bytes");
+        let data_b = std::fs::read(snap.path.join("shard-b.data")).unwrap();
+        assert_eq!(data_b, b"more-data");
+
+        // Verify shard metadata files.
+        let meta_a = std::fs::read(snap.path.join("shard-a.meta.json")).unwrap();
+        assert_eq!(meta_a, b"{\"version\": 1}");
+    }
+
+    #[test]
     fn concurrent_backup_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = BackupManager::new(temp_config(tmp.path()));

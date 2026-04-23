@@ -413,4 +413,21 @@ mod tests {
         sel.register(FabricTransport::TcpTls);
         assert_eq!(sel.status().len(), 1);
     }
+
+    #[test]
+    fn needs_reprobe_empty_when_all_healthy() {
+        let mut sel = FabricSelector::new(HealthConfig::default());
+        sel.register(FabricTransport::VerbsIb);
+        sel.register(FabricTransport::TcpTls);
+
+        // Record some successes — everything is healthy.
+        sel.record_success(FabricTransport::VerbsIb, Duration::from_micros(10));
+        sel.record_success(FabricTransport::TcpTls, Duration::from_micros(50));
+
+        let reprobe = sel.needs_reprobe();
+        assert!(
+            reprobe.is_empty(),
+            "no transports need reprobe when all are healthy"
+        );
+    }
 }

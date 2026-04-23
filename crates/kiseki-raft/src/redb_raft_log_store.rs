@@ -214,6 +214,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entries_survive_reopen() {
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persist.redb");
+
+        // Write entries, then drop the store.
+        {
+            let mut store = RedbRaftLogStore::<TestConfig>::open(&path).unwrap();
+            let vote = openraft::Vote::new(1, 10);
+            store.save_vote(&vote).await.unwrap();
+
+            // Append entries via the underlying RedbLogStore directly,
+            // since creating proper Entry types requires internal openraft
+            // constructors. We verify persistence at the redb layer.
+            store.redb.append(1, &"entry-1").unwrap();
+            store.redb.append(2, &"entry-2").unwrap();
+            store.redb.append(3, &"entry-3").unwrap();
+        }
+
+        // Reopen and verify entries survived.
+        {
+            let mut store = RedbRaftLogStore::<TestConfig>::open(&path).unwrap();
+            assert!(store.has_state(), "store should have state after reopen");
+
+            // Verify entries at the redb layer.
+            let v1: Option<String> = store.redb.get(1).unwrap();
+            assert_eq!(v1, Some("entry-1".to_string()));
+            let v2: Option<String> = store.redb.get(2).unwrap();
+            assert_eq!(v2, Some("entry-2".to_string()));
+            let v3: Option<String> = store.redb.get(3).unwrap();
+            assert_eq!(v3, Some("entry-3".to_string()));
+
+            // Vote should also survive.
+            let vote = store.read_vote().await.unwrap();
+            assert!(vote.is_some(), "vote should survive reopen");
+        }
+    }
+
+    #[tokio::test]
     async fn has_state_after_vote() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voted.redb");

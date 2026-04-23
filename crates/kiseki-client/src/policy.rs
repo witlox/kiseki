@@ -331,4 +331,22 @@ mod tests {
         detector.record_success();
         assert!(!detector.is_disconnected());
     }
+
+    #[test]
+    fn disconnect_detector_with_1s_threshold() {
+        // I-CC6: create detector with 1s threshold, simulate time passing,
+        // verify is_disconnected becomes true.
+        let detector = DisconnectDetector::new(1);
+        assert!(
+            !detector.is_disconnected(),
+            "should not be disconnected immediately"
+        );
+
+        // Sleep just over 1 second.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            detector.is_disconnected(),
+            "should be disconnected after threshold exceeded"
+        );
+    }
 }

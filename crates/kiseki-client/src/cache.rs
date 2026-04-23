@@ -998,4 +998,45 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(mgr.stats().meta_hits, 1);
     }
+
+    // --- L2 capacity edge case ---
+
+    #[test]
+    fn l2_write_at_exact_capacity_succeeds_one_over_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool_dir = dir.path().join("pool");
+        // Max 14 bytes: 10 data + 4 CRC trailer = exactly one chunk.
+        let mut l2 = CacheL2::open(pool_dir, 14).unwrap();
+
+        let id1 = test_chunk_id(0xA1);
+        l2.put(&id1, &[0; 10]).unwrap(); // 10 + 4 = 14 bytes = exactly at capacity
+
+        // One byte more should fail.
+        let id2 = test_chunk_id(0xA2);
+        let result = l2.put(&id2, &[0; 1]); // 1 + 4 = 5 bytes, but 14 + 5 > 14
+        assert!(result.is_err(), "write over capacity should fail");
+    }
+
+    // --- Bypass mode: put is no-op, get returns None ---
+
+    #[test]
+    fn bypass_mode_put_is_noop_get_returns_none() {
+        let config = CacheConfig {
+            mode: CacheMode::Bypass,
+            ..CacheConfig::default()
+        };
+        let mut mgr = CacheManager::new(&config).unwrap();
+
+        let chunk_id = test_chunk_id(0xBB);
+        mgr.put_chunk(chunk_id, vec![1, 2, 3]);
+
+        // get_chunk should return None in bypass mode.
+        assert!(mgr.get_chunk(&chunk_id).is_none());
+
+        // Stats should show bypasses, not misses.
+        let stats = mgr.stats();
+        assert_eq!(stats.bypasses, 1);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.l1_hits, 0);
+    }
 }

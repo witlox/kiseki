@@ -313,4 +313,42 @@ mod tests {
         };
         store.create_workload(wl).unwrap();
     }
+
+    #[test]
+    fn child_quota_exceeding_parent_rejected() {
+        // Quota narrowing: child quota > parent on any dimension should fail.
+        let parent = Quota {
+            capacity_bytes: 1_000_000,
+            iops: 10_000,
+            metadata_ops_per_sec: 1_000,
+        };
+
+        // Exceeds capacity.
+        let child_cap = Quota {
+            capacity_bytes: 2_000_000,
+            iops: 100,
+            metadata_ops_per_sec: 100,
+        };
+        assert!(validate_quota(&parent, &child_cap).is_err());
+
+        // Exceeds IOPS.
+        let child_iops = Quota {
+            capacity_bytes: 500_000,
+            iops: 20_000,
+            metadata_ops_per_sec: 100,
+        };
+        assert!(validate_quota(&parent, &child_iops).is_err());
+
+        // Exceeds metadata ops/sec.
+        let child_meta = Quota {
+            capacity_bytes: 500_000,
+            iops: 100,
+            metadata_ops_per_sec: 5_000,
+        };
+        assert!(validate_quota(&parent, &child_meta).is_err());
+
+        // Equal to parent — should succeed.
+        let child_equal = parent;
+        assert!(validate_quota(&parent, &child_equal).is_ok());
+    }
 }

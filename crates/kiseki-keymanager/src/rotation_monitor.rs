@@ -212,4 +212,36 @@ mod tests {
         let progress = new_rewrap_progress();
         assert_eq!(progress.total.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
+
+    #[tokio::test]
+    async fn multiple_rotations_over_time() {
+        // Verify that the monitor can trigger multiple rotations when
+        // the TTL is very short.
+        let km = Arc::new(MockKeyManager::new());
+        let rotated = Arc::new(AtomicU64::new(0));
+        let rotated_clone = Arc::clone(&rotated);
+
+        let config = RotationConfig {
+            epoch_ttl: Duration::from_millis(30),
+            check_interval: Duration::from_millis(10),
+        };
+
+        let handle = tokio::spawn(run_rotation_monitor(
+            Arc::clone(&km),
+            config,
+            move |_old, _new| {
+                rotated_clone.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+
+        // Wait long enough for at least 2 rotations.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.abort();
+
+        let count = rotated.load(Ordering::Relaxed);
+        assert!(
+            count >= 2,
+            "should have rotated at least twice, got {count}"
+        );
+    }
 }

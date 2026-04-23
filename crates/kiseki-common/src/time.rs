@@ -181,6 +181,37 @@ pub enum ClockQuality {
     Unsync,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hlc_ordering_after_tick() {
+        let node = NodeId(1);
+        let hlc1 = HybridLogicalClock::zero(node);
+        let hlc2 = hlc1.tick(1000).unwrap();
+
+        assert!(hlc2 > hlc1, "ticked HLC must be greater than the original");
+        assert_eq!(hlc2.physical_ms, 1000);
+        assert_eq!(hlc2.logical, 0);
+    }
+
+    #[test]
+    fn hlc_ordering_same_physical_increments_logical() {
+        let node = NodeId(1);
+        let hlc1 = HybridLogicalClock {
+            physical_ms: 1000,
+            logical: 0,
+            node_id: node,
+        };
+        // Tick with the same physical time.
+        let hlc2 = hlc1.tick(1000).unwrap();
+        assert!(hlc2 > hlc1);
+        assert_eq!(hlc2.physical_ms, 1000);
+        assert_eq!(hlc2.logical, 1);
+    }
+}
+
 /// The triple attached to every delta and every event.
 ///
 /// `hlc` provides ordering and causality, `wall` provides duration-based

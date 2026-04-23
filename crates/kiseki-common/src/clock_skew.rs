@@ -214,6 +214,28 @@ mod tests {
     }
 
     #[test]
+    fn skew_at_exact_soft_limit_is_normal() {
+        // Severity uses `>` not `>=` for the soft limit check,
+        // so exactly at the soft limit is Normal, not Warning.
+        let mut detector = ClockSkewDetector::with_defaults(); // soft_limit=500ms
+                                                               // Exactly 500 ms skew — at the boundary, not above.
+        detector.record_observation(2, 1000, 1500);
+        assert_eq!(
+            detector.severity(),
+            SkewSeverity::Normal,
+            "exactly at soft_limit should be Normal (not Warning)"
+        );
+    }
+
+    #[test]
+    fn skew_one_ms_above_soft_limit_is_warning() {
+        let mut detector = ClockSkewDetector::with_defaults(); // soft_limit=500ms
+                                                               // 501 ms skew — just above soft limit.
+        detector.record_observation(2, 1000, 1501);
+        assert_eq!(detector.severity(), SkewSeverity::Warning);
+    }
+
+    #[test]
     fn sliding_window_evicts_oldest() {
         let mut detector =
             ClockSkewDetector::new(Duration::from_millis(500), Duration::from_secs(5));

@@ -334,6 +334,49 @@ mod tests {
     }
 
     #[test]
+    fn check_and_plan_returns_none_for_small_shard() {
+        let cfg = test_config(); // min_split_size=10, max_delta_count=100
+        let shard = ShardId(uuid::Uuid::from_u128(20));
+
+        // 50 deltas and 500 bytes — both below thresholds.
+        assert!(check_and_plan(shard, 50, 500, &cfg).is_none());
+    }
+
+    #[test]
+    fn check_and_plan_returns_some_for_large_shard() {
+        let cfg = test_config();
+        let shard = ShardId(uuid::Uuid::from_u128(21));
+
+        // 300 deltas > 100 max_delta_count, and 300 >= 2*10 min_split_size
+        let plan = check_and_plan(shard, 300, 0, &cfg);
+        assert!(plan.is_some());
+    }
+
+    #[test]
+    fn split_plan_midpoint_even_count() {
+        let cfg = test_config();
+        let shard = ShardId(uuid::Uuid::from_u128(22));
+
+        let plan = compute_split_plan(shard, 200, 0, &cfg).unwrap();
+        assert_eq!(plan.split_point, SequenceNumber(100));
+        assert_eq!(plan.deltas_remaining, 100);
+        assert_eq!(plan.deltas_to_new, 100);
+    }
+
+    #[test]
+    fn split_plan_midpoint_odd_count() {
+        let cfg = test_config();
+        let shard = ShardId(uuid::Uuid::from_u128(23));
+
+        let plan = compute_split_plan(shard, 301, 0, &cfg).unwrap();
+        // 301 / 2 = 150 (integer division)
+        assert_eq!(plan.split_point, SequenceNumber(150));
+        assert_eq!(plan.deltas_remaining, 150);
+        assert_eq!(plan.deltas_to_new, 151);
+        assert_eq!(plan.deltas_remaining + plan.deltas_to_new, 301);
+    }
+
+    #[test]
     fn check_and_plan_returns_none_when_below_threshold() {
         let cfg = test_config();
         let shard = ShardId(uuid::Uuid::from_u128(11));

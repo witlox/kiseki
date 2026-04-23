@@ -557,4 +557,19 @@ mod tests {
         assert_eq!(auth.tenant_id, tenant);
         assert_eq!(auth.access_key, access_key);
     }
+
+    #[test]
+    fn missing_authorization_returns_missing_auth() {
+        // Verify that a request with no Authorization header yields MissingAuth.
+        let store = AccessKeyStore::new();
+        let headers = HeaderMap::new(); // no authorization header
+        let result = validate_request(
+            &Method::PUT,
+            &"/bucket/object".parse().unwrap(),
+            &headers,
+            &sha256_hex(b"data"),
+            &store,
+        );
+        assert_eq!(result.unwrap_err(), AuthError::MissingAuth);
+    }
 }

@@ -231,4 +231,24 @@ mod tests {
         let device_ids: HashSet<[u8; 16]> = map.fragments.iter().map(|f| f.device_id).collect();
         assert_eq!(device_ids.len(), 6);
     }
+
+    #[test]
+    fn exact_device_count_equals_fragment_count_all_assigned() {
+        // When device count == fragment count, every device must get
+        // exactly one fragment (no device left unused).
+        let chunk_id = ChunkId([0xff; 32]);
+        let total_data = 3u32;
+        let total_parity = 2u32;
+        let total = (total_data + total_parity) as usize;
+        let devices = make_devices(total);
+
+        let map = assign_fragments(&chunk_id, total_data, total_parity, &devices).unwrap();
+        assert_eq!(map.fragments.len(), total);
+
+        // Every device must appear exactly once.
+        let used_device_ids: HashSet<[u8; 16]> =
+            map.fragments.iter().map(|f| f.device_id).collect();
+        let all_device_ids: HashSet<[u8; 16]> = devices.iter().copied().collect();
+        assert_eq!(used_device_ids, all_device_ids);
+    }
 }

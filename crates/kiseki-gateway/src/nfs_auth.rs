@@ -288,4 +288,28 @@ mod tests {
         assert!(export.allows_method(NfsAuthMethod::Kerberos));
         assert!(!export.allows_method(NfsAuthMethod::None));
     }
+
+    #[test]
+    fn auth_none_rejected() {
+        // NFS AUTH_NONE must be rejected when not in allowed methods.
+        let tenant = test_org_id();
+        let export = NfsExportAuth {
+            path: "/data/secure".into(),
+            allowed_methods: vec![NfsAuthMethod::AuthSys],
+            tenant_id: tenant,
+            uid_mapping: UidMapping::AllToTenant,
+        };
+        let creds = NfsCredentials {
+            method: NfsAuthMethod::None,
+            uid: 0,
+            gid: 0,
+            hostname: "anon-client".into(),
+            principal: None,
+        };
+        let result = validate_credentials(&creds, &export);
+        assert!(matches!(
+            result,
+            Err(NfsAuthError::MethodNotAllowed(NfsAuthMethod::None))
+        ));
+    }
 }

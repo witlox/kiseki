@@ -333,4 +333,29 @@ mod tests {
         let e = alloc.alloc(4096 * 4).unwrap();
         assert_eq!(e.offset, a.offset); // Reuses the smaller 5-block gap.
     }
+
+    #[test]
+    fn alloc_at_capacity_then_error() {
+        // Allocate every block one by one, then verify next alloc fails.
+        let total = 8;
+        let mut alloc = BitmapAllocator::new(total, 4096);
+        let mut extents = Vec::new();
+        for _ in 0..total {
+            extents.push(alloc.alloc(4096).unwrap());
+        }
+        assert_eq!(alloc.free_blocks(), 0);
+
+        // Next allocation must fail with DeviceFull.
+        let err = alloc.alloc(4096).unwrap_err();
+        assert!(
+            matches!(err, AllocError::DeviceFull { .. }),
+            "expected DeviceFull, got: {err:?}"
+        );
+
+        // Free one block and re-allocate succeeds.
+        alloc.free(&extents[0]).unwrap();
+        assert_eq!(alloc.free_blocks(), 1);
+        alloc.alloc(4096).unwrap();
+        assert_eq!(alloc.free_blocks(), 0);
+    }
 }

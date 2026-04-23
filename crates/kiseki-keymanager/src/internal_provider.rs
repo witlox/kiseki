@@ -220,4 +220,41 @@ mod tests {
         let unwrapped = provider.unwrap(&wrapped, b"aad").unwrap();
         assert!(unwrapped.is_empty());
     }
+
+    #[test]
+    fn double_rotation_produces_distinct_epochs() {
+        let provider = InternalProvider::new(test_key());
+        let epoch1 = provider.rotate().unwrap();
+        let epoch2 = provider.rotate().unwrap();
+        assert_ne!(
+            epoch1, epoch2,
+            "each rotation must produce a distinct epoch"
+        );
+        // Epoch numbers should be sequential.
+        assert!(
+            epoch1.ends_with("-2"),
+            "first rotation should be epoch 2, got {epoch1}"
+        );
+        assert!(
+            epoch2.ends_with("-3"),
+            "second rotation should be epoch 3, got {epoch2}"
+        );
+    }
+
+    #[test]
+    fn wrap_with_aad_unwrap_with_different_aad_fails() {
+        // Wrap with AAD "chunk-1", unwrap with AAD "chunk-2" should fail
+        // with AadMismatch.
+        let provider = InternalProvider::new(test_key());
+        let plaintext = b"some DEK material";
+
+        let wrapped = provider.wrap(plaintext, b"chunk-1").unwrap();
+        let result = provider.unwrap(&wrapped, b"chunk-2");
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), KmsError::AadMismatch),
+            "mismatched AAD should yield AadMismatch"
+        );
+    }
 }

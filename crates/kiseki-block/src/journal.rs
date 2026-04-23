@@ -208,4 +208,35 @@ mod tests {
         let j = Journal::open(&path).unwrap();
         assert!(j.is_empty());
     }
+
+    #[test]
+    fn journal_replay_unapplied_after_simulated_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+
+        // Write an entry but do NOT mark it applied (simulating a crash
+        // between journal write and bitmap update).
+        {
+            let mut j = Journal::open(&path).unwrap();
+            let ext = Extent {
+                offset: 0,
+                length: 4096,
+            };
+            j.record_alloc(&ext).unwrap();
+            // Intentionally skip mark_applied — simulates crash.
+            assert_eq!(j.unapplied().len(), 1);
+        }
+
+        // "Reopen" after crash — the unapplied entry must survive.
+        {
+            let j = Journal::open(&path).unwrap();
+            assert_eq!(j.len(), 1);
+            let unapplied = j.unapplied();
+            assert_eq!(unapplied.len(), 1);
+            assert_eq!(unapplied[0].offset, 0);
+            assert_eq!(unapplied[0].length, 4096);
+            assert_eq!(unapplied[0].op, JournalOp::Alloc);
+            assert!(!unapplied[0].applied);
+        }
+    }
 }

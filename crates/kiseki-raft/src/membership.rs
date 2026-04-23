@@ -297,6 +297,31 @@ mod tests {
     }
 
     #[test]
+    fn quorum_size_for_various_counts() {
+        // 1→1, 2→2, 3→2, 5→3, 7→4
+        assert_eq!(quorum_size(1), 1);
+        assert_eq!(quorum_size(2), 2);
+        assert_eq!(quorum_size(3), 2);
+        assert_eq!(quorum_size(5), 3);
+        assert_eq!(quorum_size(7), 4);
+    }
+
+    #[test]
+    fn add_learner_with_empty_voters_succeeds() {
+        let voters: &[u64] = &[];
+        let learners: &[u64] = &[];
+        let change = MembershipChange {
+            node_id: 1,
+            addr: "10.0.0.1:9102".to_owned(),
+            action: MembershipAction::AddLearner,
+        };
+        assert!(
+            validate_membership_change(voters, learners, &change).is_ok(),
+            "adding a learner to an empty cluster should succeed"
+        );
+    }
+
+    #[test]
     fn can_remove_safely_cases() {
         assert!(!can_remove_safely(0));
         assert!(!can_remove_safely(1));

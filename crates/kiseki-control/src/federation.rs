@@ -350,4 +350,24 @@ mod tests {
         registry.register(peer).unwrap();
         assert!(registry.is_connected("site-ch"));
     }
+
+    #[test]
+    fn deregister_nonexistent_returns_peer_not_found() {
+        // Explicit test: deregistering a peer that was never registered
+        // returns PeerNotFound.
+        let registry = FederationRegistry::new();
+        let err = registry.deregister_peer("totally-fake-peer").unwrap_err();
+        match err {
+            FederationError::PeerNotFound(id) => {
+                assert_eq!(id, "totally-fake-peer");
+            }
+            other => panic!("expected PeerNotFound, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn get_nonexistent_peer_returns_none() {
+        let registry = FederationRegistry::new();
+        assert!(registry.get_peer("ghost-peer").is_none());
+    }
 }

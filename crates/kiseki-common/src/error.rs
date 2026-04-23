@@ -140,3 +140,56 @@ pub enum SecurityError {
     #[error("crypto-shred complete for scope {0:?}")]
     CryptoShredComplete(TenantScope),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::ShardId;
+
+    #[test]
+    fn kiseki_error_display_does_not_leak_internal_details() {
+        let shard_id = ShardId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        let err = KisekiError::Retriable(RetriableError::ShardUnavailable(shard_id));
+        let msg = err.to_string();
+        // Display should be user-safe: no stack traces, no file paths, no memory addresses.
+        assert!(
+            !msg.contains("src/"),
+            "Display should not contain source file paths"
+        );
+        assert!(
+            !msg.contains("0x"),
+            "Display should not contain memory addresses"
+        );
+        assert!(
+            msg.contains("shard unavailable"),
+            "Display should contain the error category, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn security_error_display_is_opaque() {
+        let err = KisekiError::Security(SecurityError::AuthenticationFailed);
+        let msg = err.to_string();
+        assert_eq!(msg, "authentication failed");
+        // Should NOT leak any internal state or stack info.
+        assert!(
+            !msg.contains("stack"),
+            "security errors must not leak stack info"
+        );
+    }
+
+    #[test]
+    fn error_category_discriminant() {
+        let retriable = KisekiError::Retriable(RetriableError::KeyManagerUnavailable);
+        assert_eq!(retriable.category(), ErrorCategory::Retriable);
+        assert!(retriable.is_retriable());
+
+        let permanent = KisekiError::Permanent(PermanentError::InvariantViolation("test".into()));
+        assert_eq!(permanent.category(), ErrorCategory::Permanent);
+        assert!(!permanent.is_retriable());
+
+        let security = KisekiError::Security(SecurityError::ClusterAdminAccessDenied);
+        assert_eq!(security.category(), ErrorCategory::Security);
+        assert!(!security.is_retriable());
+    }
+}

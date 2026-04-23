@@ -165,4 +165,31 @@ mod tests {
         assert_eq!(result.threshold_bytes, INLINE_CEILING);
         assert_eq!(result.reason, ThresholdReason::Normal);
     }
+
+    #[test]
+    fn emergency_triggered_when_any_voter_at_hard_limit() {
+        // Even if only one voter out of many breaches the hard limit,
+        // emergency floor must be triggered.
+        let mut reports = vec![healthy_report(1), healthy_report(2), healthy_report(3)];
+        // Only node 3 breaches hard limit.
+        reports[2].used_bytes = reports[2].hard_limit_bytes + 1;
+
+        let result = compute_shard_threshold(shard(), &reports, 100);
+        assert_eq!(result.threshold_bytes, INLINE_FLOOR);
+        assert_eq!(result.reason, ThresholdReason::EmergencyFloor);
+    }
+
+    #[test]
+    fn soft_limit_approaching_reason() {
+        let mut reports = vec![healthy_report(1), healthy_report(2)];
+        // Push node 1 to soft limit (but not past hard limit).
+        reports[0].used_bytes = reports[0].soft_limit_bytes;
+        // used < hard_limit, so not emergency.
+        let result = compute_shard_threshold(shard(), &reports, 100);
+        assert_eq!(
+            result.reason,
+            ThresholdReason::SoftLimitApproaching,
+            "should report SoftLimitApproaching when a voter hits soft limit"
+        );
+    }
 }

@@ -258,4 +258,30 @@ mod tests {
             "should reprobe after interval"
         );
     }
+
+    #[test]
+    fn current_latency_none_for_unknown_transport() {
+        let tracker = TransportHealthTracker::default();
+        assert!(
+            tracker.current_latency("nonexistent-transport").is_none(),
+            "unknown transport should have no latency"
+        );
+    }
+
+    #[test]
+    fn current_latency_tracked_per_transport() {
+        let mut tracker = TransportHealthTracker::default();
+        tracker.record_success("tcp-tls", Duration::from_micros(100));
+        tracker.record_success("verbs-ib", Duration::from_micros(5));
+
+        assert!(tracker.current_latency("tcp-tls").is_some());
+        assert!(tracker.current_latency("verbs-ib").is_some());
+        assert!(tracker.current_latency("cxi").is_none());
+
+        // Latencies should differ since they track per-transport.
+        assert_ne!(
+            tracker.current_latency("tcp-tls"),
+            tracker.current_latency("verbs-ib")
+        );
+    }
 }

@@ -218,6 +218,59 @@ mod tests {
     }
 
     #[test]
+    fn older_version_triggers_migration_and_updates_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Write a version file with version 0 (older than CURRENT_SCHEMA_VERSION).
+        // Since CURRENT_SCHEMA_VERSION is 1 and run_migration is a no-op,
+        // the migration should succeed and update the file to version 1.
+        let json = "{\"version\":0,\"migrated_at\":\"0\"}";
+        std::fs::write(dir.path().join(VERSION_FILE), json).expect("write");
+
+        let sv = check_and_migrate(dir.path()).expect("migration should succeed");
+        assert_eq!(sv.version, CURRENT_SCHEMA_VERSION);
+
+        // Verify the version file was actually updated on disk.
+        let contents = std::fs::read_to_string(dir.path().join(VERSION_FILE)).expect("read");
+        assert!(contents.contains(&format!("\"version\":{CURRENT_SCHEMA_VERSION}")));
+    }
+
+    #[test]
+    fn corrupt_version_file_missing_field_is_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Write a valid JSON object but with a missing required field.
+        std::fs::write(
+            dir.path().join(VERSION_FILE),
+            "{\"migrated_at\":\"2026-01-01\"}",
+        )
+        .expect("write");
+
+        let err = check_and_migrate(dir.path()).expect_err("should fail");
+        match err {
+            MigrationError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("version"),
+                    "error message should mention the missing field, got: {msg}"
+                );
+            }
+            other => panic!("expected Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_version_file_garbage_json_is_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(VERSION_FILE), "{{{{garbage}}}}").expect("write");
+
+        let err = check_and_migrate(dir.path()).expect_err("should fail");
+        assert!(
+            matches!(err, MigrationError::Corrupt(_)),
+            "garbage JSON should produce Corrupt error"
+        );
+    }
+
+    #[test]
     fn parse_version_file_roundtrip() {
         let json = "{\"version\":42,\"migrated_at\":\"2026-01-01T00:00:00Z\"}";
         let sv = parse_version_file(json).expect("parse");

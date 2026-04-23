@@ -162,4 +162,42 @@ mod tests {
         assert_eq!(table.active_count(), 0);
         assert!(table.get(&test_ref()).is_none());
     }
+
+    #[test]
+    fn phase_monotonicity_forward_then_backward_rejected() {
+        let mut entry = WorkflowEntry::new(test_ref(), WorkloadProfile::AiTraining, PhaseId(1), 10);
+
+        // Advance 1 → 2 → 3 succeeds.
+        assert!(entry.advance_phase(PhaseId(2)).is_ok());
+        assert!(entry.advance_phase(PhaseId(3)).is_ok());
+        assert_eq!(entry.current_phase, PhaseId(3));
+
+        // Going backward to phase 1 is rejected (I-WA13).
+        let err = entry.advance_phase(PhaseId(1));
+        assert!(err.is_err());
+        assert!(matches!(
+            err.unwrap_err(),
+            AdvisoryError::PhaseNotMonotonic {
+                current: 3,
+                requested: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn phase_history_tracks_advances() {
+        let mut entry = WorkflowEntry::new(test_ref(), WorkloadProfile::AiTraining, PhaseId(1), 10);
+
+        entry
+            .advance_phase(PhaseId(2))
+            .unwrap_or_else(|_| unreachable!());
+        entry
+            .advance_phase(PhaseId(3))
+            .unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(
+            entry.phase_history,
+            vec![PhaseId(1), PhaseId(2), PhaseId(3)]
+        );
+    }
 }
