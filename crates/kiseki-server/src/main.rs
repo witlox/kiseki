@@ -13,6 +13,7 @@
 
 mod config;
 mod integrity;
+pub(crate) mod metrics;
 mod runtime;
 mod system_disk;
 

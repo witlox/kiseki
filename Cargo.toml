@@ -86,6 +86,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 # --- Observability ---
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+prometheus = "0.13"
 
 # --- TLS ---
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }

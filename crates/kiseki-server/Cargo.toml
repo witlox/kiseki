@@ -30,6 +30,8 @@ kiseki-advisory = { workspace = true }
 kiseki-control = { workspace = true }
 kiseki-proto = { workspace = true }
 axum = "0.7"
+hyper = { version = "1", features = ["server", "http1"] }
+prometheus = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }

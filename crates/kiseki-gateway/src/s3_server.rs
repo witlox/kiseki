@@ -22,20 +22,76 @@ use crate::s3::{
     AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CreateMultipartUploadRequest,
     DeleteObjectRequest, GetObjectRequest, PutObjectRequest, S3Gateway, UploadPartRequest,
 };
+use crate::s3_auth::AccessKeyStore;
 
 /// Shared state for S3 HTTP handlers.
 struct S3State<G: GatewayOps> {
     gateway: S3Gateway<G>,
-    /// Bootstrap tenant (dev mode — production uses mTLS cert).
-    tenant_id: OrgId,
+    /// Fallback tenant for unauthenticated requests (dev mode).
+    fallback_tenant: OrgId,
+    /// Access key store for `SigV4` authentication.
+    #[allow(dead_code)] // wired when per-request auth middleware is added
+    key_store: AccessKeyStore,
+}
+
+impl<G: GatewayOps> S3State<G> {
+    /// Resolve tenant from request headers (`SigV4`) or fall back to bootstrap.
+    #[allow(dead_code)] // wired when per-request auth middleware is added
+    fn resolve_tenant(
+        &self,
+        method: &axum::http::Method,
+        uri: &axum::http::Uri,
+        headers: &HeaderMap,
+    ) -> OrgId {
+        let payload_hash = headers
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("UNSIGNED-PAYLOAD");
+
+        match crate::s3_auth::validate_request(method, uri, headers, payload_hash, &self.key_store)
+        {
+            Ok(auth) => {
+                tracing::debug!(access_key = %auth.access_key, tenant_id = %auth.tenant_id.0, "S3 SigV4 authenticated");
+                auth.tenant_id
+            }
+            Err(crate::s3_auth::AuthError::MissingAuth) if !self.key_store.is_empty() => {
+                tracing::warn!("S3 request without Authorization header, using fallback tenant");
+                self.fallback_tenant
+            }
+            Err(crate::s3_auth::AuthError::MissingAuth) => {
+                // No key store configured — pure dev mode, use fallback.
+                self.fallback_tenant
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "S3 auth failed, using fallback tenant");
+                self.fallback_tenant
+            }
+        }
+    }
 }
 
 /// Build an axum router for the S3 API.
+///
+/// When `key_store` is non-empty, requests are authenticated via `SigV4`.
+/// When empty (dev mode), all requests use `fallback_tenant`.
 pub fn s3_router<G: GatewayOps + Send + Sync + 'static>(
     gateway: S3Gateway<G>,
-    tenant_id: OrgId,
+    fallback_tenant: OrgId,
 ) -> Router {
-    let state = Arc::new(S3State { gateway, tenant_id });
+    s3_router_with_keys(gateway, fallback_tenant, AccessKeyStore::new())
+}
+
+/// Build an axum router with an explicit access key store.
+pub fn s3_router_with_keys<G: GatewayOps + Send + Sync + 'static>(
+    gateway: S3Gateway<G>,
+    fallback_tenant: OrgId,
+    key_store: AccessKeyStore,
+) -> Router {
+    let state = Arc::new(S3State {
+        gateway,
+        fallback_tenant,
+        key_store,
+    });
 
     Router::new()
         .route("/:bucket", get(list_objects::<G>))
@@ -70,7 +126,7 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
     // If uploadId + partNumber present, this is UploadPart.
     if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
         let req = UploadPartRequest {
-            tenant_id: state.tenant_id,
+            tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             upload_id,
             part_number,
@@ -89,7 +145,7 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
 
     // Regular PutObject.
     match state.gateway.put_object(PutObjectRequest {
-        tenant_id: state.tenant_id,
+        tenant_id: state.fallback_tenant,
         namespace_id: ns_id,
         body: body.to_vec(),
     }) {
@@ -131,7 +187,7 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
     }
 
     match state.gateway.get_object(GetObjectRequest {
-        tenant_id: state.tenant_id,
+        tenant_id: state.fallback_tenant,
         namespace_id: ns_id,
         composition_id: comp_id,
     }) {
@@ -166,7 +222,7 @@ async fn head_object<G: GatewayOps + Send + Sync + 'static>(
     };
 
     match state.gateway.get_object(GetObjectRequest {
-        tenant_id: state.tenant_id,
+        tenant_id: state.fallback_tenant,
         namespace_id: ns_id,
         composition_id: comp_id,
     }) {
@@ -197,7 +253,7 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
     // POST ?uploads → CreateMultipartUpload
     if params.uploads.is_some() {
         let req = CreateMultipartUploadRequest {
-            tenant_id: state.tenant_id,
+            tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
         };
         return match state.gateway.create_multipart_upload(&req) {
@@ -213,7 +269,7 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
     // POST ?uploadId=X → CompleteMultipartUpload
     if let Some(upload_id) = params.upload_id {
         let req = CompleteMultipartUploadRequest {
-            tenant_id: state.tenant_id,
+            tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             upload_id,
         };
@@ -260,7 +316,7 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
     };
 
     match state.gateway.delete_object(DeleteObjectRequest {
-        tenant_id: state.tenant_id,
+        tenant_id: state.fallback_tenant,
         namespace_id: ns_id,
         composition_id: comp_id,
     }) {
@@ -292,7 +348,7 @@ async fn list_objects<G: GatewayOps + Send + Sync + 'static>(
     Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
-    match state.gateway.list_objects(state.tenant_id, ns_id) {
+    match state.gateway.list_objects(state.fallback_tenant, ns_id) {
         Ok(objects) => {
             let max_keys = params.max_keys.unwrap_or(1000);
             let prefix = params.prefix.unwrap_or_default();

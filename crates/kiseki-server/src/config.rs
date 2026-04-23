@@ -13,6 +13,8 @@ pub struct ServerConfig {
     pub s3_addr: SocketAddr,
     /// NFS server address.
     pub nfs_addr: SocketAddr,
+    /// Prometheus metrics HTTP address.
+    pub metrics_addr: SocketAddr,
     /// TLS configuration paths (None = plaintext, for development only).
     pub tls: Option<TlsFiles>,
     /// Data directory for persistent storage (redb). None = in-memory only.
@@ -85,6 +87,11 @@ impl ServerConfig {
             .parse()
             .expect("invalid KISEKI_NFS_ADDR");
 
+        let metrics_addr = std::env::var("KISEKI_METRICS_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:9090".into())
+            .parse()
+            .expect("invalid KISEKI_METRICS_ADDR");
+
         let data_dir = std::env::var("KISEKI_DATA_DIR")
             .ok()
             .map(std::path::PathBuf::from);
@@ -126,6 +133,7 @@ impl ServerConfig {
             advisory_addr,
             s3_addr,
             nfs_addr,
+            metrics_addr,
             tls,
             data_dir,
             node_id,

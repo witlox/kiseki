@@ -282,6 +282,15 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         kiseki_gateway::s3_server::run_s3_server(s3_addr, s3_router, s3_tls).await;
     });
 
+    // Prometheus metrics server.
+    let metrics = crate::metrics::KisekiMetrics::new();
+    let metrics_addr = cfg.metrics_addr;
+    tokio::spawn(async move {
+        if let Err(e) = crate::metrics::run_metrics_server(metrics_addr, metrics).await {
+            tracing::error!(error = %e, "metrics server error");
+        }
+    });
+
     // NFS gateway (NFSv3 + NFSv4.2 on port 2049).
     let nfs_gw = kiseki_gateway::nfs::NfsGateway::new(Arc::clone(&gw));
     let nfs_addr = cfg.nfs_addr;
