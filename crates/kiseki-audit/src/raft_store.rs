@@ -280,7 +280,7 @@ impl AuditOps for RaftAuditStore {
             .events
             .iter()
             .filter(|e| e.sequence >= q.from)
-            .filter(|e| q.event_type.as_ref().map_or(true, |t| &e.event_type == t))
+            .filter(|e| q.event_type.as_ref().is_none_or(|t| &e.event_type == t))
             .take(q.limit)
             .cloned()
             .collect()

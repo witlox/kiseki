@@ -209,7 +209,7 @@ fn pin_linux(cpus: &[u32]) -> io::Result<()> {
         let ret = libc::sched_setaffinity(
             0, // current thread
             std::mem::size_of::<libc::cpu_set_t>(),
-            &set as *const libc::cpu_set_t,
+            &raw const set,
         );
         if ret != 0 {
             return Err(io::Error::last_os_error());

@@ -2,8 +2,8 @@
 //!
 //! These tests spin up real Raft instances with TCP transport to verify
 //! correct cluster formation, leader election, and replication.
-//! Follows the lattice pattern: seed node calls initialize(), followers
-//! join by receiving membership via AppendEntries RPCs.
+//! Follows the lattice pattern: seed node calls `initialize()`, followers
+//! join by receiving membership via `AppendEntries` RPCs.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -55,7 +55,7 @@ fn find_ports(n: usize) -> Vec<u16> {
     ports
 }
 
-/// Build peers map: node_id (1-based) → "127.0.0.1:{port}".
+/// Build peers map: `node_id` (1-based) to `"127.0.0.1:{port}"`.
 fn peers_map(ports: &[u16]) -> BTreeMap<u64, String> {
     ports
         .iter()

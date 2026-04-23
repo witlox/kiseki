@@ -73,7 +73,7 @@ impl KeyCache {
     /// Check if a tenant's cached key is expired.
     #[must_use]
     pub fn is_expired(&self, tenant: &OrgId) -> bool {
-        self.entries.get(tenant).map_or(true, CachedKey::is_expired)
+        self.entries.get(tenant).is_none_or(CachedKey::is_expired)
     }
 
     /// Remove a tenant's cached key (e.g., on crypto-shred).
