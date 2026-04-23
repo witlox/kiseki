@@ -212,6 +212,24 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         Box::new(kiseki_chunk::ChunkStore::new())
     };
 
+    // Raw device discovery (KISEKI_RAW_DEVICES).
+    // This is the discovery phase — actual device opening via DeviceBackend
+    // is deferred until the RawBlockDevice implementation is wired.
+    if !cfg.raw_devices.is_empty() {
+        tracing::info!(
+            devices = cfg.raw_devices.len(),
+            "raw block devices configured"
+        );
+        for dev_path in &cfg.raw_devices {
+            let path = std::path::Path::new(dev_path);
+            if path.exists() {
+                tracing::info!(device = dev_path, "raw device detected");
+            } else {
+                tracing::warn!(device = dev_path, "raw device not found — skipping");
+            }
+        }
+    }
+
     // Composition: wired to log for delta emission.
     let mut comp_store = kiseki_composition::composition::CompositionStore::new()
         .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);

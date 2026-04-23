@@ -18,6 +18,9 @@ python = ["pyo3"]
 
 [dependencies]
 kiseki-common = { workspace = true }
+kiseki-chunk = { workspace = true }
+kiseki-composition = { workspace = true }
+kiseki-crypto = { workspace = true }
 kiseki-gateway = { workspace = true }
 fuser = { version = "0.16", optional = true }
 libc = { workspace = true }
@@ -35,8 +38,5 @@ name = "kiseki-client"
 path = "src/bin/kiseki_client.rs"
 
 [dev-dependencies]
-kiseki-chunk = { workspace = true }
-kiseki-composition = { workspace = true }
-kiseki-crypto = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3"

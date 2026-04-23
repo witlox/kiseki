@@ -31,15 +31,9 @@ variable "zone" {
 }
 
 variable "ssh_user" {
-  description = "SSH username"
+  description = "SSH username (used with OS Login)"
   type        = string
   default     = "kiseki"
-}
-
-variable "ssh_pub_key_file" {
-  description = "Path to SSH public key"
-  type        = string
-  default     = "~/.ssh/id_ed25519.pub"
 }
 
 # ---------------------------------------------------------------------------
@@ -136,7 +130,7 @@ resource "google_compute_instance" "storage_1" {
   }
 
   metadata = {
-    ssh-keys = "${var.ssh_user}:${file(var.ssh_pub_key_file)}"
+    enable-oslogin = "TRUE"
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-storage.sh", {
@@ -176,7 +170,7 @@ resource "google_compute_instance" "storage_2" {
   }
 
   metadata = {
-    ssh-keys = "${var.ssh_user}:${file(var.ssh_pub_key_file)}"
+    enable-oslogin = "TRUE"
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-storage.sh", {
@@ -223,7 +217,7 @@ resource "google_compute_instance" "storage_3" {
   }
 
   metadata = {
-    ssh-keys = "${var.ssh_user}:${file(var.ssh_pub_key_file)}"
+    enable-oslogin = "TRUE"
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-storage.sh", {
@@ -273,7 +267,7 @@ resource "google_compute_instance" "client_1" {
   }
 
   metadata = {
-    ssh-keys = "${var.ssh_user}:${file(var.ssh_pub_key_file)}"
+    enable-oslogin = "TRUE"
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-client.sh", {
@@ -304,14 +298,8 @@ resource "google_compute_instance" "client_2" {
     }
   }
 
-  guest_accelerator {
-    type  = "nvidia-tesla-t4"
-    count = 1
-  }
-
-  scheduling {
-    on_host_maintenance = "TERMINATE"
-  }
+  # GPU accelerator removed — T4 not available in europe-west6-a.
+  # For GPU-direct testing, use a zone with GPU availability.
 
   network_interface {
     subnetwork = google_compute_subnetwork.kiseki.id
@@ -320,7 +308,7 @@ resource "google_compute_instance" "client_2" {
   }
 
   metadata = {
-    ssh-keys = "${var.ssh_user}:${file(var.ssh_pub_key_file)}"
+    enable-oslogin = "TRUE"
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-client.sh", {
@@ -351,7 +339,7 @@ resource "google_compute_instance" "client_3" {
   }
 
   metadata = {
-    ssh-keys = "${var.ssh_user}:${file(var.ssh_pub_key_file)}"
+    enable-oslogin = "TRUE"
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-client.sh", {
@@ -385,7 +373,7 @@ resource "google_compute_instance" "bench_ctrl" {
   }
 
   metadata = {
-    ssh-keys = "${var.ssh_user}:${file(var.ssh_pub_key_file)}"
+    enable-oslogin = "TRUE"
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-bench-ctrl.sh", {

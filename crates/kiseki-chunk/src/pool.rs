@@ -26,6 +26,19 @@ impl Default for DurabilityStrategy {
     }
 }
 
+/// Device class for pool-level placement decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeviceClass {
+    /// `NVMe` SSD — lowest latency.
+    NvmeSsd,
+    /// SATA/SAS SSD.
+    Ssd,
+    /// Rotational hard drive — bulk capacity.
+    Hdd,
+    /// Mixed or unspecified device types.
+    Mixed,
+}
+
 /// An affinity pool — group of storage devices sharing a device class.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AffinityPool {
@@ -37,6 +50,8 @@ pub struct AffinityPool {
     pub capacity_bytes: u64,
     /// Current used bytes.
     pub used_bytes: u64,
+    /// Device class for this pool.
+    pub device_class: DeviceClass,
     /// Devices in this pool.
     pub devices: Vec<PoolDevice>,
 }
@@ -60,6 +75,7 @@ impl AffinityPool {
             durability,
             capacity_bytes,
             used_bytes: 0,
+            device_class: DeviceClass::Mixed,
             devices: Vec::new(),
         }
     }
@@ -93,5 +109,86 @@ impl AffinityPool {
     #[must_use]
     pub fn has_capacity(&self, size: u64) -> bool {
         self.available_bytes() >= size
+    }
+
+    /// Set the device class for this pool (builder pattern).
+    #[must_use]
+    pub fn with_device_class(mut self, class: DeviceClass) -> Self {
+        self.device_class = class;
+        self
+    }
+}
+
+/// Select the appropriate pool for a write based on data characteristics.
+///
+/// Small files (< 64 KiB) prefer NVMe/SSD pools for fast metadata access;
+/// large files prefer HDD/Mixed pools for bulk capacity. A `preferred_class`
+/// override is tried first.
+#[must_use]
+pub fn select_pool_for_write(
+    pools: &[AffinityPool],
+    data_size: u64,
+    preferred_class: Option<DeviceClass>,
+) -> Option<&AffinityPool> {
+    // Try preferred class first.
+    if let Some(class) = preferred_class {
+        if let Some(pool) = pools.iter().find(|p| p.device_class == class) {
+            return Some(pool);
+        }
+    }
+
+    // Auto-select: small data → fastest pool, large data → bulk pool.
+    if data_size < 64 * 1024 {
+        pools
+            .iter()
+            .find(|p| p.device_class == DeviceClass::NvmeSsd || p.device_class == DeviceClass::Ssd)
+            .or(pools.first())
+    } else {
+        pools
+            .iter()
+            .find(|p| p.device_class == DeviceClass::Hdd || p.device_class == DeviceClass::Mixed)
+            .or(pools.first())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_pools() -> Vec<AffinityPool> {
+        vec![
+            AffinityPool::new("nvme-fast", DurabilityStrategy::default(), 1_000_000)
+                .with_device_class(DeviceClass::NvmeSsd),
+            AffinityPool::new("ssd-tier", DurabilityStrategy::default(), 10_000_000)
+                .with_device_class(DeviceClass::Ssd),
+            AffinityPool::new("hdd-bulk", DurabilityStrategy::default(), 100_000_000)
+                .with_device_class(DeviceClass::Hdd),
+        ]
+    }
+
+    #[test]
+    fn small_write_prefers_nvme() {
+        let pools = make_pools();
+        let selected = select_pool_for_write(&pools, 4096, None).unwrap();
+        assert_eq!(selected.device_class, DeviceClass::NvmeSsd);
+    }
+
+    #[test]
+    fn large_write_prefers_hdd() {
+        let pools = make_pools();
+        let selected = select_pool_for_write(&pools, 10 * 1024 * 1024, None).unwrap();
+        assert_eq!(selected.device_class, DeviceClass::Hdd);
+    }
+
+    #[test]
+    fn fallback_to_first_when_no_match() {
+        let pools = vec![AffinityPool::new(
+            "only-mixed",
+            DurabilityStrategy::default(),
+            1_000_000,
+        )];
+        // Small write with no NVMe/SSD pool — should fall back to first.
+        let selected = select_pool_for_write(&pools, 1024, None).unwrap();
+        assert_eq!(selected.name, "only-mixed");
     }
 }

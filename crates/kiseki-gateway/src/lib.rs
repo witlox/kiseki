@@ -109,6 +109,9 @@ pub mod nfs_server;
 )]
 pub mod nfs_xdr;
 
+#[cfg(feature = "nfs")]
+pub mod pnfs;
+
 #[cfg(feature = "s3")]
 pub mod s3;
 

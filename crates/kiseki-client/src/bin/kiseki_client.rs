@@ -1,7 +1,8 @@
 #![allow(clippy::cast_precision_loss)] // format_bytes: display-only f64 cast is fine
-//! Kiseki client CLI -- staging, cache management, diagnostics.
+//! Kiseki client CLI -- staging, cache management, FUSE mount, diagnostics.
 //!
 //! Usage:
+//!   kiseki-client mount --endpoint <host:port> --mountpoint /mnt/kiseki [--cache-mode organic] [--cache-dir /cache]
 //!   kiseki-client stage --dataset /training/imagenet [--timeout 300]
 //!   kiseki-client stage --status
 //!   kiseki-client stage --release /training/imagenet
@@ -25,6 +26,7 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "mount" => handle_mount(&args[2..]),
         "stage" => handle_stage(&args[2..]),
         "cache" => handle_cache(&args[2..]),
         "version" => println!("kiseki-client {}", env!("CARGO_PKG_VERSION")),
@@ -46,10 +48,17 @@ USAGE:
     kiseki-client <COMMAND> [OPTIONS]
 
 COMMANDS:
+    mount       Mount a Kiseki filesystem via FUSE
     stage       Dataset staging (pre-fetch, status, release)
     cache       Cache management (stats, wipe)
     version     Print version
     help        Print this help
+
+MOUNT OPTIONS:
+    --endpoint <host:port>   Gateway endpoint (required)
+    --mountpoint <path>      Local mount path (required)
+    --cache-mode <mode>      Cache mode: pinned, organic, bypass (default: organic)
+    --cache-dir <path>       Cache directory (default: /tmp/kiseki-cache)
 
 STAGE OPTIONS:
     --dataset <path>     Stage a dataset (pre-fetch chunks into L2 cache)
@@ -79,6 +88,101 @@ fn cache_dir() -> PathBuf {
 /// Resolve the pool directory (`cache_dir` / `default-tenant` / pool).
 fn pool_dir() -> PathBuf {
     cache_dir().join("default-tenant").join("pool")
+}
+
+fn handle_mount(args: &[String]) {
+    let mut endpoint: Option<String> = None;
+    let mut mountpoint: Option<String> = None;
+    let mut cache_mode = String::from("organic");
+    let mut _cache_dir: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--endpoint" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --endpoint requires a value");
+                    std::process::exit(2);
+                }
+                endpoint = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--mountpoint" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --mountpoint requires a value");
+                    std::process::exit(2);
+                }
+                mountpoint = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--cache-mode" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --cache-mode requires a value");
+                    std::process::exit(2);
+                }
+                cache_mode.clone_from(&args[i + 1]);
+                i += 2;
+            }
+            "--cache-dir" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --cache-dir requires a value");
+                    std::process::exit(2);
+                }
+                _cache_dir = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown mount option: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let _endpoint = endpoint.unwrap_or_else(|| {
+        eprintln!("Error: --endpoint is required");
+        std::process::exit(2);
+    });
+    let mountpoint = mountpoint.unwrap_or_else(|| {
+        eprintln!("Error: --mountpoint is required");
+        std::process::exit(2);
+    });
+
+    // Create gateway (local in-memory for now — real gRPC gateway connection deferred).
+    let tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+    let namespace =
+        kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
+    let shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+
+    let mut compositions = kiseki_composition::composition::CompositionStore::new();
+    compositions.add_namespace(kiseki_composition::namespace::Namespace {
+        id: namespace,
+        tenant_id: tenant,
+        shard_id: shard,
+        read_only: false,
+    });
+
+    let master_key =
+        kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
+    let gw = kiseki_gateway::InMemoryGateway::new(
+        compositions,
+        Box::new(kiseki_chunk::store::ChunkStore::new()),
+        master_key,
+    );
+    let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
+
+    println!("Mounting at {mountpoint} (cache_mode: {cache_mode})");
+
+    #[cfg(feature = "fuse")]
+    {
+        use std::path::Path;
+        kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint)).expect("FUSE mount failed");
+    }
+    #[cfg(not(feature = "fuse"))]
+    {
+        let _ = fuse; // suppress unused warning
+        eprintln!("FUSE support not compiled — rebuild with --features fuse");
+        std::process::exit(1);
+    }
 }
 
 fn handle_stage(args: &[String]) {

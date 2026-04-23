@@ -33,6 +33,10 @@ pub struct ServerConfig {
     pub meta_soft_limit_pct: u8,
     /// Metadata hard limit percentage (ADR-030, default 75).
     pub meta_hard_limit_pct: u8,
+    /// Raw block device paths for `DeviceBackend` (comma-separated).
+    /// When set, kiseki manages these devices directly instead of using
+    /// the `data_dir` filesystem.
+    pub raw_devices: Vec<String>,
 }
 
 /// Paths to TLS certificate files.
@@ -135,6 +139,13 @@ impl ServerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(75);
 
+        let raw_devices = std::env::var("KISEKI_RAW_DEVICES")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+
         Self {
             data_addr,
             advisory_addr,
@@ -150,6 +161,7 @@ impl ServerConfig {
             bootstrap,
             meta_soft_limit_pct,
             meta_hard_limit_pct,
+            raw_devices,
         }
     }
 }
