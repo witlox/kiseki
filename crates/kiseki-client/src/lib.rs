@@ -30,6 +30,6 @@ pub mod ffi;
 #[cfg(feature = "python")]
 pub mod python;
 
-pub use cache::ClientCache;
+pub use cache::{CacheConfig, CacheManager, CacheMode, CacheStats, ClientCache};
 pub use discovery::{DiscoveryClient, DiscoveryResponse, SeedEndpoint};
 pub use error::ClientError;
