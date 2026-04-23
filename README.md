@@ -1,212 +1,171 @@
-# Kiseki — Distributed Storage for HPC/AI
+<p align="center">
+  <img src="logo-only.png" alt="kiseki" width="200">
+</p>
 
-Distributed storage system for HPC / AI workloads on Slingshot and
-commodity fabrics. Production-grade, multi-tenant, encryption-native.
-
-**Project name**: Kiseki (軌跡 — Japanese: locus, trajectory, trace)
-
----
-
-## Status
-
-**Phase**: **Phase 0 in progress** — workspace scaffold, shared types,
-protobuf. See `specs/architecture/build-phases.md` for the full 13-phase
-plan.
-
-| Stage | State |
-|---|---|
-| Design (analyst + architect + adversary + backpass) | Complete |
-| Phase 0 — `kiseki-common`, `kiseki-proto`, CI scaffold | In progress |
-| Phases 1 – 12 | Pending |
-
-### Workspace
-
-```
-crates/
-├── kiseki-common/      # shared types: HLC, identifiers, advisory surface, errors
-└── kiseki-proto/       # generated prost/tonic from specs/architecture/proto/
-control/                # Go control plane scaffold (Phase 11)
-```
-
-### Pre-commit
-
-```
-make           # fmt + clippy + test + go vet + go test (local)
-make verify    # strict CI-equivalent (adds cargo-deny + golangci-lint)
-```
+<p align="center">
+  <a href="https://github.com/witlox/kiseki/actions/workflows/ci.yml"><img src="https://github.com/witlox/kiseki/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/witlox/kiseki"><img src="https://codecov.io/gh/witlox/kiseki/branch/main/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://github.com/witlox/kiseki/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+  <a href="https://github.com/witlox/kiseki"><img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust"></a>
+  <a href="https://witlox.github.io/kiseki/"><img src="https://img.shields.io/badge/docs-mdbook-blue.svg" alt="Docs"></a>
+</p>
 
 ---
 
-## Architecture overview
+Distributed storage system for HPC/AI workloads. Kiseki (軌跡 — *trajectory*) manages encrypted, content-addressed data across Slingshot, InfiniBand, RoCEv2, and TCP fabrics with S3 and NFS gateways, per-shard Raft consensus, and client-side caching on compute-node NVMe.
+
+## Design Principles
+
+- **Encryption-native** — all data encrypted at rest and in transit (AES-256-GCM, FIPS 140-2/3 via aws-lc-rs). No plaintext past the gateway boundary.
+- **Multi-tenant isolation** — per-tenant encryption keys, zero-trust admin boundary, HMAC-keyed chunk IDs, scoped audit trail
+- **HPC fabric-first** — Slingshot CXI, InfiniBand, RoCEv2 with automatic failover to TCP+TLS. GPU-direct for NVIDIA and AMD.
+- **Client-side caching** — two-tier (L1 memory + L2 NVMe) cache with staging API for training datasets. Slurm and Lattice integration.
+- **Raft per shard** — independent consensus groups, dynamic membership, persistent log, automatic split at threshold
+
+## Architecture
 
 ```
-Compute nodes                    Storage nodes                     Management
-┌─────────────────┐   ┌──────────────────────────────────┐   ┌──────────────┐
-│ kiseki-client   │   │ kiseki-server                    │   │kiseki-control│
-│  FUSE + native  │   │  Log (Raft per shard)            │   │  Tenancy     │
-│  Client encrypt │   │  Chunk Storage (EC, placement)   │   │  IAM         │
-│  Transport sel. │──▶│  Composition (namespace, refcount)│   │  Policy      │
-│  Pattern detect │   │  View Materialization (streams)  │   │  Federation  │
-│  Cache          │   │  Gateway NFS + S3                │   │  Audit export│
-└─────────────────┘   │  Audit                           │   └──────────────┘
-                      └──────────┬───────────────────────┘
-                                 │
-                      ┌──────────▼───────────────────────┐
-                      │ kiseki-keyserver (HA, Raft)      │
-                      │  System master keys              │
-                      │  Epoch management                │
-                      └──────────────────────────────────┘
+Clients          FUSE mount / Python SDK / C FFI / S3 / NFS
+                          │
+Gateways         S3 (SigV4) ─── NFS (Kerberos/AUTH_SYS)
+                          │
+Data Plane       Composition → Log (Raft per shard) → Chunk (EC on devices)
+                          │
+Control Plane    Tenancy · IAM · Quota · Federation · Compliance · Advisory
+                          │
+Key Management   Internal · Vault · AWS KMS · Azure Key Vault · GCP Cloud KMS
+                          │
+Transports       CXI / InfiniBand / RoCEv2 / TCP+TLS
 ```
 
-### Languages and boundaries
+18 Rust crates, 74K+ lines, 721 tests, 26 e2e tests, 31 ADRs, 76 invariants.
 
-- **Rust** (core): log, chunks, views, gateways, native client, key manager, crypto
-- **Go** (control plane): tenancy, IAM, policy, federation, audit export, CLI
-- **gRPC/protobuf**: Rust ↔ Go boundary
-- **FIPS 140-2/3**: aws-lc-rs (AES-256-GCM, HKDF-SHA256)
+Integrates with [Lattice](https://github.com/witlox/lattice) (workload scheduling),
+[Pact](https://github.com/witlox/pact) (node configuration), and
+[OpenCHAMI](https://openchami.org) (boot infrastructure).
 
-### Key architectural decisions
+## Installation
 
-- **Log-as-truth**: ordered, replicated log of deltas per shard (Raft)
-- **Two-layer encryption (model C)**: system DEK encrypts data (HKDF-derived,
-  never stored individually); tenant KEK wraps access. No plaintext at rest
-  or in flight.
-- **Multi-tenancy**: org → [project] → workload hierarchy. Zero-trust
-  boundary: cluster admin cannot access tenant data without approval.
-- **Multi-protocol**: NFS (ADR-013: POSIX subset) + S3 (ADR-014: HPC/AI
-  subset) via gateways, native Rust client + FUSE
-- **Content-addressed chunks**: cross-tenant dedup by default (sha256);
-  tenant opt-out via HMAC for full isolation
-- **Federated multi-site**: async replication, per-site consistency, shared
-  tenant KMS across sites
-- **Dual clock model**: HLC for ordering/causality, wall clock for
-  retention/staleness/audit (adapted from taba)
-- **Client-side resilience**: multi-endpoint resolution (DNS, seed list),
-  automatic failover on node failure. No master node.
+Download pre-built binaries from the [latest release](https://github.com/witlox/kiseki/releases/latest):
 
-### Target hardware
+```bash
+# Server (storage nodes) — pick your arch
+curl -LO https://github.com/witlox/kiseki/releases/latest/download/kiseki-server-x86_64.tar.gz
+tar xzf kiseki-server-x86_64.tar.gz -C /usr/local/bin/
 
-HPE Cray ClusterStor E1000/E1000F — all-NVMe, Slingshot-attached.
-Architecture is hardware-neutral; ClusterStor is the initial substrate.
+# Client (compute nodes) — pick your arch
+curl -LO https://github.com/witlox/kiseki/releases/latest/download/kiseki-client-x86_64.tar.gz
+tar xzf kiseki-client-x86_64.tar.gz -C /usr/local/bin/
 
-### Regulatory compliance
-
-HIPAA, GDPR, revFADP (Swiss Federal Act on Data Protection). Shapes
-encryption, audit, retention, and data residency decisions throughout.
-
----
-
-## Repository structure
-
-```
-docs/
-├── analysis/
-│   └── design-conversation.md        # Distilled 16-turn design conversation
-└── prior-art/
-    └── deltafs-mochi-evaluation.md   # DeltaFS + Mochi comparison
-
-specs/
-├── SEED.md                           # Original analyst seed
-├── ubiquitous-language.md            # 45+ confirmed domain terms
-├── domain-model.md                   # 8 bounded contexts
-├── invariants.md                     # 56 invariants
-├── assumptions.md                    # 50+ tracked assumptions
-├── failure-modes.md                  # 20 failure modes (P0-P3)
-├── adversarial-findings.md           # 17 analyst adversarial findings
-├── cross-context/
-│   └── interactions.md               # Data paths, contracts, cascades
-├── features/
-│   ├── log.feature                   # 18 scenarios
-│   ├── chunk-storage.feature         # 18 scenarios
-│   ├── key-management.feature        # 17 scenarios
-│   ├── composition.feature           # 16 scenarios
-│   ├── view-materialization.feature  # 16 scenarios
-│   ├── protocol-gateway.feature      # 16 scenarios
-│   ├── native-client.feature         # 20 scenarios
-│   ├── control-plane.feature         # 23 scenarios
-│   ├── authentication.feature        # 13 scenarios (mTLS, IdP, SPIFFE)
-│   └── operational.feature           # 28 scenarios (integrity, versioning, compression)
-├── findings/
-│   └── architecture-review.md        # 8 adversary architecture findings
-└── architecture/
-    ├── module-graph.md               # 12 Rust crates + Go module
-    ├── api-contracts.md              # Per-context commands/events/queries
-    ├── enforcement-map.md            # 56 invariants → enforcement points
-    ├── build-phases.md               # 13 dependency-ordered phases
-    ├── error-taxonomy.md             # Typed errors per context
-    ├── data-models/
-    │   ├── common.rs                 # HLC, identifiers, base errors
-    │   ├── crypto.rs                 # AEAD, envelope, CryptoOps trait
-    │   ├── log.rs                    # Delta, Shard, LogOps trait
-    │   ├── chunk.rs                  # Chunk, AffinityPool, ChunkOps trait
-    │   ├── composition.rs            # Composition, Namespace
-    │   ├── view.rs                   # ViewDescriptor, StreamProcessor
-    │   ├── key.rs                    # KeyManager, TenantKMS
-    │   └── tenant.rs                 # Organization, Flavor, Federation
-    ├── proto/kiseki/v1/
-    │   ├── common.proto              # Shared types
-    │   ├── control.proto             # ControlService (Go)
-    │   ├── key.proto                 # KeyManagerService (Rust)
-    │   └── audit.proto               # AuditExportService (Go)
-    └── adr/
-        ├── 001-pure-rust-no-mochi.md
-        ├── 002-two-layer-encryption-model-c.md
-        ├── 003-system-dek-derivation.md
-        ├── 004-schema-versioning-and-upgrade.md
-        ├── 005-ec-and-chunk-durability.md
-        ├── 006-inline-data-threshold.md
-        ├── 007-system-key-manager-ha.md
-        ├── 008-native-client-discovery.md
-        ├── 009-audit-log-sharding.md
-        ├── 010-retention-hold-enforcement.md
-        ├── 011-crypto-shred-cache-ttl.md
-        ├── 012-stream-processor-isolation.md
-        ├── 013-posix-semantics-scope.md
-        ├── 014-s3-api-scope.md
-        ├── 015-observability.md
-        ├── 016-backup-and-dr.md
-        ├── 017-dedup-refcount-access-control.md
-        ├── 018-runtime-integrity-monitor.md
-        └── 019-gateway-deployment-model.md
+# Admin CLI (workstation)
+curl -LO https://github.com/witlox/kiseki/releases/latest/download/kiseki-server-x86_64.tar.gz
+tar xzf kiseki-server-x86_64.tar.gz kiseki-admin -C /usr/local/bin/
 ```
 
----
+| Server binaries | Client binaries |
+|----------------|----------------|
+| `kiseki-server-x86_64` (server + admin CLI) | `kiseki-client-x86_64` (CLI + libkiseki_client + header) |
+| `kiseki-server-aarch64` | `kiseki-client-aarch64` |
 
-## Build phases (summary)
+Or use Docker:
 
-| Phase | Module | Depends on | Parallelizable with |
-|---|---|---|---|
-| 0 | Common types + protobuf | — | — |
-| 1 | Crypto (FIPS AEAD) | 0 | 2 |
-| 2 | Transport (TCP/TLS, CXI) | 0 | 1 |
-| 3 | Log (Raft, delta, shard) | 0, 1 | — |
-| 4 | System key manager | 0, 1 | 3, 5 |
-| 5 | Audit | 0, 1, 3 | 4 |
-| 6 | Chunk storage | 0, 1, 4 | 5, 7 |
-| 7 | Composition | 0, 1, 3, 6 | 8 |
-| 8 | View materialization | 0, 1, 3, 6 | 7, 9 |
-| 9 | Protocol gateways (NFS, S3) | 0, 1, 7, 8 | 10 |
-| 10 | Native client (FUSE) | 0, 1, 2, 6, 7, 8 | 9 |
-| 11 | Control plane (Go) | 0 | 1-10 (fully parallel) |
-| 12 | Integration | All | — |
+```bash
+docker pull ghcr.io/witlox/kiseki:latest
+```
 
-See `specs/architecture/build-phases.md` for full details.
+## Quick Start
 
----
+```bash
+# Start the full stack (server + Jaeger + Vault + Keycloak)
+docker compose up -d
 
-## Prior art
+# Admin dashboard
+open http://localhost:9090/ui
 
-- **DeltaFS** (CMU PDL / LANL): log-structured metadata, serverless,
-  per-job. Kiseki differs in: persistence, multi-tenancy, standard
-  protocols, first-class encryption.
-- **Mochi** (Argonne / LANL / CMU): composable HPC data services.
-  Kiseki borrows patterns but builds in pure Rust (ADR-001).
-- **DAOS, Ceph, Lustre, VAST**: evaluated as comparison points.
+# Create a bucket and write an object
+curl -X PUT http://localhost:9000/my-bucket
+curl -X PUT http://localhost:9000/my-bucket/hello.txt -d "hello kiseki"
 
-See `docs/prior-art/deltafs-mochi-evaluation.md` for detailed analysis.
+# Check cluster status
+kiseki-admin --endpoint http://localhost:9090 status
+```
 
----
+## CLI Overview
+
+```bash
+# Server admin (embedded in kiseki-server binary)
+kiseki-server status                    # Cluster health summary
+kiseki-server maintenance on            # Enable read-only mode
+kiseki-server shard list                # List all shards
+
+# Remote admin (from workstation)
+kiseki-admin --endpoint http://node:9090 status
+kiseki-admin --endpoint http://node:9090 nodes
+kiseki-admin --endpoint http://node:9090 events --severity error --hours 1
+
+# Client (compute nodes)
+kiseki-client stage --dataset /training/imagenet
+kiseki-client stage --status
+kiseki-client cache --stats
+```
+
+## Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **S3 Gateway** | PUT/GET/HEAD/DELETE, bucket CRUD, multipart, SigV4 auth |
+| **NFS Gateway** | NFSv3 + NFSv4.2, AUTH_SYS/Kerberos, per-export config |
+| **FUSE Mount** | POSIX read/write/mkdir/symlink, nested directories |
+| **Client Cache** | L1 (memory) + L2 (NVMe), pinned/organic/bypass modes |
+| **Staging API** | Pre-fetch datasets, Slurm prolog/epilog, Lattice integration |
+| **Erasure Coding** | 4+2, 8+3, degraded reads, automatic repair |
+| **Raft Consensus** | Per-shard groups, mTLS, persistent log (redb), dynamic membership |
+| **Transports** | CXI, InfiniBand, RoCEv2, TCP+TLS with automatic failover |
+| **GPU-Direct** | NVIDIA cuFile + AMD ROCm for zero-copy training data loading |
+| **Encryption** | AES-256-GCM, HKDF-SHA256, FIPS via aws-lc-rs, crypto-shred |
+| **KMS Providers** | Internal, HashiCorp Vault, AWS KMS, Azure Key Vault, GCP Cloud KMS |
+| **Authentication** | mTLS, SPIFFE, S3 SigV4, NFS Kerberos, OIDC/JWT (RS256/ES256) |
+| **Observability** | Prometheus metrics, structured tracing, OpenTelemetry/Jaeger |
+| **Admin UI** | Web dashboard (HTMX + Chart.js), 3-hour metric history, alerts |
+| **Federation** | Async cross-site replication, data residency enforcement |
+
+## Documentation
+
+Full documentation at **[witlox.github.io/kiseki](https://witlox.github.io/kiseki/)** — or build locally:
+
+```bash
+mdbook serve  # http://localhost:3000
+```
+
+| Section | Contents |
+|---------|----------|
+| [User Guide](https://witlox.github.io/kiseki/guide/getting-started.html) | Getting started, S3, NFS, FUSE, Python SDK, client cache |
+| [Administration](https://witlox.github.io/kiseki/admin/deployment.html) | Deployment, configuration, monitoring, backup, key management |
+| [Architecture](https://witlox.github.io/kiseki/architecture/overview.html) | System design, bounded contexts, data flow, encryption, Raft |
+| [Security](https://witlox.github.io/kiseki/security/model.html) | Security model, STRIDE analysis, authentication, tenant isolation |
+| [API Reference](https://witlox.github.io/kiseki/api/grpc.html) | gRPC, REST, CLI, environment variables |
+| [Decisions](https://witlox.github.io/kiseki/decisions/index.html) | 31 Architecture Decision Records |
+
+## Development
+
+```bash
+# Build
+cargo build --workspace
+
+# Test (721 unit + integration tests)
+cargo test --workspace --exclude kiseki-acceptance
+
+# BDD acceptance tests
+cargo test -p kiseki-acceptance
+
+# E2e tests (requires Docker)
+docker compose up -d
+cd tests/e2e && pytest -ra
+
+# Lint
+cargo fmt --check && cargo clippy -- -D warnings
+```
 
 ## License
 
-TBD
+Apache-2.0. See [LICENSE](LICENSE).
