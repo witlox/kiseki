@@ -81,16 +81,17 @@ jobs:
         with:
           key: server-${{ matrix.arch }}
 
-      - name: Build kiseki-server (all features, non-FIPS)
+      - name: Build kiseki-server and kiseki-admin (all features, non-FIPS)
         run: |
           sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml
-          cargo build --release --bin kiseki-server \
+          cargo build --release --bin kiseki-server --bin kiseki-admin \
             --features kiseki-keymanager/kms-vault,kiseki-keymanager/kms-aws,kiseki-keymanager/kms-azure,kiseki-keymanager/kms-gcp
 
       - name: Package
         run: |
           mkdir -p dist
           cp target/release/kiseki-server dist/
+          cp target/release/kiseki-admin dist/
           cd dist
           tar czf "../kiseki-server-${{ matrix.arch }}.tar.gz" *
           cd ..
@@ -221,8 +222,12 @@ jobs:
 
             | Archive | Arch | Contents |
             |---------|------|----------|
-            | `kiseki-server-x86_64` | x86_64 | kiseki-server |
-            | `kiseki-server-aarch64` | aarch64 | kiseki-server |
+            | `kiseki-server-x86_64` | x86_64 | kiseki-server, kiseki-admin |
+            | `kiseki-server-aarch64` | aarch64 | kiseki-server, kiseki-admin |
+
+            `kiseki-admin` is a standalone remote administration CLI that
+            connects to any node via the REST API (:9090). Run from your
+            workstation — no server dependencies required.
 
             ## Client library and CLI
 

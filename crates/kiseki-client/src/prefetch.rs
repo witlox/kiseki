@@ -93,6 +93,47 @@ impl PrefetchAdvisor {
     }
 }
 
+/// A structured prefetch suggestion.
+#[derive(Clone, Debug)]
+pub struct PrefetchSuggestion {
+    /// The file this suggestion applies to.
+    pub file_id: u64,
+    /// Offset to begin prefetching from.
+    pub next_offset: u64,
+    /// Number of bytes to prefetch.
+    pub window_bytes: u64,
+}
+
+impl PrefetchSuggestion {
+    /// Convert to an advisory hint for the advisory channel.
+    #[must_use]
+    pub fn to_hint(&self) -> crate::advisory::AdvisoryHint {
+        crate::advisory::AdvisoryHint::Prefetch {
+            file_id: self.file_id,
+            offset: self.next_offset,
+            length: self.window_bytes,
+        }
+    }
+}
+
+impl PrefetchAdvisor {
+    /// Like [`record_read`](Self::record_read) but returns a structured
+    /// [`PrefetchSuggestion`] that can be converted to an advisory hint.
+    pub fn record_read_suggestion(
+        &mut self,
+        file_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Option<PrefetchSuggestion> {
+        self.record_read(file_id, offset, length)
+            .map(|(next_offset, window_bytes)| PrefetchSuggestion {
+                file_id,
+                next_offset,
+                window_bytes,
+            })
+    }
+}
+
 impl Default for PrefetchAdvisor {
     fn default() -> Self {
         Self::new(PrefetchConfig::default())
@@ -133,6 +174,42 @@ mod tests {
         advisor.record_read(1, 4096, 4096);
         advisor.reset(1);
         assert_eq!(advisor.tracked_files(), 0);
+    }
+
+    #[test]
+    fn prefetch_suggestion_to_hint_conversion() {
+        let suggestion = PrefetchSuggestion {
+            file_id: 42,
+            next_offset: 8192,
+            window_bytes: 65536,
+        };
+        let hint = suggestion.to_hint();
+        match hint {
+            crate::advisory::AdvisoryHint::Prefetch {
+                file_id,
+                offset,
+                length,
+            } => {
+                assert_eq!(file_id, 42);
+                assert_eq!(offset, 8192);
+                assert_eq!(length, 65536);
+            }
+            _ => panic!("expected Prefetch hint"),
+        }
+    }
+
+    #[test]
+    fn record_read_suggestion_returns_structured() {
+        let mut advisor = PrefetchAdvisor::new(PrefetchConfig {
+            sequential_threshold: 2,
+            window_bytes: 1024,
+        });
+        advisor.record_read(1, 0, 100);
+        advisor.record_read(1, 100, 100);
+        let suggestion = advisor.record_read_suggestion(1, 200, 100).unwrap();
+        assert_eq!(suggestion.file_id, 1);
+        assert_eq!(suggestion.next_offset, 300);
+        assert_eq!(suggestion.window_bytes, 1024);
     }
 
     #[test]

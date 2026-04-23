@@ -5,7 +5,7 @@
 //! single client process. Workflow and client identifiers are 128-bit
 //! values drawn from a CSPRNG (uuid v4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +23,146 @@ pub enum AdvisoryError {
     /// The advisory channel is not connected.
     #[error("advisory channel unavailable")]
     ChannelUnavailable,
+}
+
+/// A hint to send on the advisory channel.
+#[derive(Clone, Debug)]
+pub enum AdvisoryHint {
+    /// Access pattern detected (sequential, random, strided).
+    AccessPattern {
+        /// The detected pattern name.
+        pattern: String,
+        /// File identifier.
+        file_id: u64,
+    },
+    /// Prefetch suggestion from `PrefetchAdvisor`.
+    Prefetch {
+        /// File identifier.
+        file_id: u64,
+        /// Offset to prefetch from.
+        offset: u64,
+        /// Number of bytes to prefetch.
+        length: u64,
+    },
+    /// Phase advance notification.
+    PhaseAdvance {
+        /// Workflow identifier.
+        workflow_id: u128,
+        /// Phase name.
+        phase: String,
+    },
+    /// Workload profile declaration.
+    Profile {
+        /// Profile name.
+        profile: String,
+    },
+}
+
+/// Telemetry signal received from the server.
+#[derive(Clone, Debug)]
+pub enum TelemetryFeedback {
+    /// Backpressure signal (ok, soft, hard).
+    Backpressure {
+        /// Severity level.
+        severity: String,
+        /// Milliseconds before retry.
+        retry_after_ms: u64,
+    },
+    /// Locality class for recent operations.
+    Locality {
+        /// Locality class name.
+        class: String,
+    },
+    /// Prefetch hit rate feedback.
+    PrefetchEffectiveness {
+        /// Hit rate as a fraction in [0.0, 1.0].
+        hit_rate: f64,
+    },
+}
+
+/// Advisory channel state -- wraps the connection to the advisory gRPC service.
+///
+/// Non-blocking: if the channel is unavailable or drops, the client
+/// continues without advisory (I-WA2). All methods are best-effort.
+pub struct AdvisoryChannel {
+    /// Advisory endpoint address.
+    endpoint: String,
+    /// Whether the channel is connected.
+    connected: AtomicBool,
+    /// Hint send queue (bounded, drops oldest on overflow).
+    hint_queue: Mutex<VecDeque<AdvisoryHint>>,
+    /// Max hint queue depth before dropping.
+    max_queue_depth: usize,
+}
+
+/// Default maximum queue depth for the advisory hint queue.
+const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
+
+impl AdvisoryChannel {
+    /// Create a new advisory channel targeting `endpoint`.
+    #[must_use]
+    pub fn new(endpoint: String) -> Self {
+        Self {
+            endpoint,
+            connected: AtomicBool::new(false),
+            hint_queue: Mutex::new(VecDeque::new()),
+            max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+        }
+    }
+
+    /// Try to connect. Non-blocking: returns immediately if unreachable.
+    ///
+    /// For now this only validates the endpoint is non-empty. Real gRPC
+    /// bidi stream connection is deferred to when the tonic client is wired.
+    pub fn try_connect(&self) -> bool {
+        if self.endpoint.is_empty() {
+            return false;
+        }
+        self.connected.store(true, Ordering::Release);
+        true
+    }
+
+    /// Send a hint (fire-and-forget, I-WA1). Never blocks.
+    ///
+    /// Returns `false` if the hint was dropped (queue full or disconnected).
+    pub fn send_hint(&self, hint: AdvisoryHint) -> bool {
+        if !self.connected.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(mut queue) = self.hint_queue.lock() else {
+            return false; // poisoned -- non-blocking
+        };
+        if queue.len() >= self.max_queue_depth {
+            queue.pop_front(); // drop oldest
+        }
+        queue.push_back(hint);
+        true
+    }
+
+    /// Drain pending hints (for the background sender task).
+    pub fn drain_hints(&self) -> Vec<AdvisoryHint> {
+        match self.hint_queue.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Check if connected.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Mark as disconnected (on stream drop or error).
+    pub fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::Release);
+        tracing::debug!("advisory channel disconnected (data path unaffected, I-WA2)");
+    }
+
+    /// The endpoint address.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
 }
 
 /// A single workflow session tracked by the advisory subsystem.
@@ -109,6 +249,7 @@ impl WorkflowSession {
 pub struct ClientAdvisory {
     client_id: u128,
     active_workflows: HashMap<u128, Arc<WorkflowSession>>,
+    channel: Option<AdvisoryChannel>,
 }
 
 impl ClientAdvisory {
@@ -118,15 +259,45 @@ impl ClientAdvisory {
         Self {
             client_id: uuid::Uuid::new_v4().as_u128(),
             active_workflows: HashMap::new(),
+            channel: None,
+        }
+    }
+
+    /// Create a `ClientAdvisory` connected to an advisory endpoint.
+    ///
+    /// The connection attempt is best-effort and non-blocking (I-WA2).
+    #[must_use]
+    pub fn with_advisory_endpoint(endpoint: String) -> Self {
+        let channel = AdvisoryChannel::new(endpoint);
+        channel.try_connect(); // best-effort, non-blocking
+        Self {
+            client_id: uuid::Uuid::new_v4().as_u128(),
+            active_workflows: HashMap::new(),
+            channel: Some(channel),
         }
     }
 
     /// Declare a new workflow, returning a shared handle to the session.
+    ///
+    /// If an advisory channel is connected, a [`AdvisoryHint::Profile`] hint
+    /// is emitted on a best-effort basis (I-WA2).
     pub fn declare_workflow(&mut self) -> Arc<WorkflowSession> {
         let session = Arc::new(WorkflowSession::new(self.client_id));
         self.active_workflows
             .insert(session.workflow_id, Arc::clone(&session));
+        // Best-effort: notify advisory if connected.
+        if let Some(ref ch) = self.channel {
+            ch.send_hint(AdvisoryHint::Profile {
+                profile: "default".into(),
+            });
+        }
         session
+    }
+
+    /// Return a reference to the advisory channel, if configured.
+    #[must_use]
+    pub fn channel(&self) -> Option<&AdvisoryChannel> {
+        self.channel.as_ref()
     }
 
     /// End the workflow identified by `workflow_id` and remove it from the
@@ -218,5 +389,121 @@ mod tests {
         let s1 = advisory.declare_workflow();
         let s2 = advisory.declare_workflow();
         assert_ne!(s1.workflow_id, s2.workflow_id);
+    }
+
+    // --- Advisory channel tests ---
+
+    #[test]
+    fn advisory_channel_send_hint_when_connected() {
+        let ch = AdvisoryChannel::new("localhost:9090".into());
+        ch.try_connect();
+        assert!(ch.is_connected());
+        let ok = ch.send_hint(AdvisoryHint::Profile {
+            profile: "checkpoint".into(),
+        });
+        assert!(ok);
+        let hints = ch.drain_hints();
+        assert_eq!(hints.len(), 1);
+        assert!(matches!(&hints[0], AdvisoryHint::Profile { profile } if profile == "checkpoint"));
+    }
+
+    #[test]
+    fn advisory_channel_send_hint_when_disconnected_returns_false() {
+        let ch = AdvisoryChannel::new("localhost:9090".into());
+        // Do not connect.
+        assert!(!ch.is_connected());
+        let ok = ch.send_hint(AdvisoryHint::Profile {
+            profile: "x".into(),
+        });
+        assert!(!ok);
+        assert!(ch.drain_hints().is_empty());
+    }
+
+    #[test]
+    fn advisory_channel_drops_oldest_on_overflow() {
+        let ch = AdvisoryChannel {
+            endpoint: "localhost:9090".into(),
+            connected: AtomicBool::new(true),
+            hint_queue: Mutex::new(VecDeque::new()),
+            max_queue_depth: 2,
+        };
+        ch.send_hint(AdvisoryHint::Prefetch {
+            file_id: 1,
+            offset: 0,
+            length: 100,
+        });
+        ch.send_hint(AdvisoryHint::Prefetch {
+            file_id: 2,
+            offset: 0,
+            length: 200,
+        });
+        // Queue is full (2). Next send drops oldest (file_id=1).
+        ch.send_hint(AdvisoryHint::Prefetch {
+            file_id: 3,
+            offset: 0,
+            length: 300,
+        });
+        let hints = ch.drain_hints();
+        assert_eq!(hints.len(), 2);
+        // Oldest was dropped; remaining are file_id 2 and 3.
+        assert!(matches!(
+            &hints[0],
+            AdvisoryHint::Prefetch { file_id: 2, .. }
+        ));
+        assert!(matches!(
+            &hints[1],
+            AdvisoryHint::Prefetch { file_id: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn advisory_channel_drain_empties_queue() {
+        let ch = AdvisoryChannel::new("localhost:9090".into());
+        ch.try_connect();
+        ch.send_hint(AdvisoryHint::Profile {
+            profile: "a".into(),
+        });
+        ch.send_hint(AdvisoryHint::Profile {
+            profile: "b".into(),
+        });
+        assert_eq!(ch.drain_hints().len(), 2);
+        // Second drain should be empty.
+        assert!(ch.drain_hints().is_empty());
+    }
+
+    #[test]
+    fn advisory_channel_mark_disconnected() {
+        let ch = AdvisoryChannel::new("localhost:9090".into());
+        ch.try_connect();
+        assert!(ch.is_connected());
+        ch.mark_disconnected();
+        assert!(!ch.is_connected());
+        // Sending after disconnect should fail gracefully.
+        assert!(!ch.send_hint(AdvisoryHint::Profile {
+            profile: "x".into(),
+        }));
+    }
+
+    #[test]
+    fn client_advisory_with_endpoint_connects() {
+        let advisory = ClientAdvisory::with_advisory_endpoint("localhost:9090".into());
+        assert!(advisory.channel().is_some());
+        assert!(advisory.channel().unwrap().is_connected());
+    }
+
+    #[test]
+    fn client_advisory_with_empty_endpoint_does_not_connect() {
+        let advisory = ClientAdvisory::with_advisory_endpoint(String::new());
+        assert!(advisory.channel().is_some());
+        assert!(!advisory.channel().unwrap().is_connected());
+    }
+
+    #[test]
+    fn declare_workflow_emits_hint_when_channel_connected() {
+        let mut advisory = ClientAdvisory::with_advisory_endpoint("localhost:9090".into());
+        let _session = advisory.declare_workflow();
+        let hints = advisory.channel().unwrap().drain_hints();
+        assert_eq!(hints.len(), 1);
+        assert!(matches!(&hints[0], AdvisoryHint::Profile { profile } if profile == "default"));
     }
 }

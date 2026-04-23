@@ -232,6 +232,106 @@ Print the client version.
 
 ---
 
+## kiseki-admin
+
+Standalone remote administration CLI. Runs from an admin workstation
+and connects to any Kiseki node via the REST API (port 9090). No server
+dependencies are needed on the workstation.
+
+Default endpoint: `KISEKI_ENDPOINT` env var, or `http://localhost:9090`.
+
+### status
+
+```
+kiseki-admin --endpoint http://storage-node:9090 status
+```
+
+Cluster status summary: node count, Raft entries, gateway requests,
+data written/read, and active connections.
+
+Example output:
+
+```
+Cluster Status
+══════════════
+Nodes:       3/3 healthy
+Raft:        42,567 entries
+Requests:    1,234 served
+Written:     12.5 GB
+Read:        8.2 GB
+Connections: 15 active
+```
+
+### nodes
+
+```
+kiseki-admin nodes
+```
+
+Node list with health badges and per-node metrics.
+
+Example output:
+
+```
+NODE              STATUS    RAFT     REQUESTS  WRITTEN   READ      CONNS
+10.0.0.1:9090     healthy   14,189   411       4.2 GB    2.7 GB    5
+10.0.0.2:9090     healthy   14,189   412       4.2 GB    2.8 GB    5
+10.0.0.3:9090     healthy   14,189   411       4.1 GB    2.7 GB    5
+```
+
+### events
+
+```
+kiseki-admin events [--severity error] [--hours 1]
+```
+
+Filtered event log. Optional `--severity` (info, warning, error,
+critical) and `--hours` (default: 3).
+
+Example output:
+
+```
+TIME      SEVERITY  CATEGORY  SOURCE    MESSAGE
+12:34:56  ERROR     node      node-3    unreachable
+12:35:12  ERROR     device    nvme0n1   CRC mismatch detected
+```
+
+### history
+
+```
+kiseki-admin history [--hours 3]
+```
+
+Metric history time series for the specified number of hours (default: 3).
+
+### maintenance
+
+```
+kiseki-admin maintenance on
+kiseki-admin maintenance off
+```
+
+Toggle cluster-wide maintenance mode. Enables read-only on all shards.
+Write commands return a retriable error (I-O6).
+
+### backup
+
+```
+kiseki-admin backup
+```
+
+Trigger a background backup operation (ADR-016).
+
+### scrub
+
+```
+kiseki-admin scrub
+```
+
+Trigger a background data integrity scrub.
+
+---
+
 ## Exit codes
 
 | Code | Meaning |

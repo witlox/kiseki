@@ -9,37 +9,37 @@ All architectural decisions are recorded as ADRs in
 
 | ADR | Title | Status |
 |---|---|---|
-| [ADR-001](../../specs/architecture/adr/001-pure-rust-no-mochi.md) | Pure Rust, No Mochi Dependency | Accepted |
-| [ADR-002](../../specs/architecture/adr/002-two-layer-encryption-model-c.md) | Two-Layer Encryption Model (C) | Accepted |
-| [ADR-003](../../specs/architecture/adr/003-system-dek-derivation.md) | System DEK Derivation (Not Storage) | Accepted |
-| [ADR-004](../../specs/architecture/adr/004-schema-versioning-and-upgrade.md) | Schema Versioning and Rolling Upgrades | Accepted |
-| [ADR-005](../../specs/architecture/adr/005-ec-and-chunk-durability.md) | Erasure Coding and Chunk Durability | Accepted |
-| [ADR-006](../../specs/architecture/adr/006-inline-data-threshold.md) | Inline Data Threshold | Accepted |
-| [ADR-007](../../specs/architecture/adr/007-system-key-manager-ha.md) | System Key Manager HA via Raft | Accepted |
-| [ADR-008](../../specs/architecture/adr/008-native-client-discovery.md) | Native Client Fabric Discovery | Accepted |
-| [ADR-009](../../specs/architecture/adr/009-audit-log-sharding.md) | Audit Log Sharding and GC | Accepted |
-| [ADR-010](../../specs/architecture/adr/010-retention-hold-enforcement.md) | Retention Hold Enforcement Before Crypto-Shred | Accepted |
-| [ADR-011](../../specs/architecture/adr/011-crypto-shred-cache-ttl.md) | Crypto-Shred Cache Invalidation and TTL | Accepted |
-| [ADR-012](../../specs/architecture/adr/012-stream-processor-isolation.md) | Stream Processor Tenant Isolation | Accepted |
-| [ADR-013](../../specs/architecture/adr/013-posix-semantics-scope.md) | POSIX Semantics Scope | Accepted |
-| [ADR-014](../../specs/architecture/adr/014-s3-api-scope.md) | S3 API Compatibility Scope | Accepted |
-| [ADR-015](../../specs/architecture/adr/015-observability.md) | Observability Contract | Accepted |
-| [ADR-016](../../specs/architecture/adr/016-backup-and-dr.md) | Backup and Disaster Recovery | Accepted |
-| [ADR-017](../../specs/architecture/adr/017-dedup-refcount-access-control.md) | Dedup Refcount Metadata Access Control | Accepted |
-| [ADR-018](../../specs/architecture/adr/018-runtime-integrity-monitor.md) | Runtime Integrity Monitor | Accepted |
-| [ADR-019](../../specs/architecture/adr/019-gateway-deployment-model.md) | Gateway Deployment Model | Accepted |
-| [ADR-020](../../specs/architecture/adr/020-workflow-advisory.md) | Workflow Advisory & Client Telemetry | Accepted |
-| [ADR-021](../../specs/architecture/adr/021-advisory-architecture.md) | Workflow Advisory Architecture | Accepted |
-| [ADR-022](../../specs/architecture/adr/022-storage-backend-redb.md) | Storage Backend -- redb (Pure Rust) | Accepted |
-| [ADR-023](../../specs/architecture/adr/023-protocol-rfc-compliance.md) | Protocol RFC Compliance Scope | Accepted |
-| [ADR-024](../../specs/architecture/adr/024-device-management-and-capacity.md) | Device Management, Storage Tiers, and Capacity Thresholds | Accepted |
-| [ADR-025](../../specs/architecture/adr/025-storage-admin-api.md) | Storage Administration API | Accepted |
-| [ADR-026](../../specs/architecture/adr/026-raft-topology.md) | Raft Topology -- Per-Shard on Fabric (Strategy A) | Accepted |
-| [ADR-027](../../specs/architecture/adr/027-single-language-rust-only.md) | Single-Language Implementation -- Rust Only | Accepted |
-| [ADR-028](../../specs/architecture/adr/028-external-tenant-kms-providers.md) | External Tenant KMS Providers | Accepted |
-| [ADR-029](../../specs/architecture/adr/029-raw-block-device-allocator.md) | Raw Block Device Allocator | Accepted |
-| [ADR-030](../../specs/architecture/adr/030-dynamic-small-file-placement.md) | Dynamic Small-File Placement and Metadata Capacity Management | Accepted |
-| [ADR-031](../../specs/architecture/adr/031-client-side-cache.md) | Client-Side Cache | Accepted |
+| [ADR-001](adr/001-pure-rust-no-mochi.md) | Pure Rust, No Mochi Dependency | Accepted |
+| [ADR-002](adr/002-two-layer-encryption-model-c.md) | Two-Layer Encryption Model (C) | Accepted |
+| [ADR-003](adr/003-system-dek-derivation.md) | System DEK Derivation (Not Storage) | Accepted |
+| [ADR-004](adr/004-schema-versioning-and-upgrade.md) | Schema Versioning and Rolling Upgrades | Accepted |
+| [ADR-005](adr/005-ec-and-chunk-durability.md) | Erasure Coding and Chunk Durability | Accepted |
+| [ADR-006](adr/006-inline-data-threshold.md) | Inline Data Threshold | Accepted |
+| [ADR-007](adr/007-system-key-manager-ha.md) | System Key Manager HA via Raft | Accepted |
+| [ADR-008](adr/008-native-client-discovery.md) | Native Client Fabric Discovery | Accepted |
+| [ADR-009](adr/009-audit-log-sharding.md) | Audit Log Sharding and GC | Accepted |
+| [ADR-010](adr/010-retention-hold-enforcement.md) | Retention Hold Enforcement Before Crypto-Shred | Accepted |
+| [ADR-011](adr/011-crypto-shred-cache-ttl.md) | Crypto-Shred Cache Invalidation and TTL | Accepted |
+| [ADR-012](adr/012-stream-processor-isolation.md) | Stream Processor Tenant Isolation | Accepted |
+| [ADR-013](adr/013-posix-semantics-scope.md) | POSIX Semantics Scope | Accepted |
+| [ADR-014](adr/014-s3-api-scope.md) | S3 API Compatibility Scope | Accepted |
+| [ADR-015](adr/015-observability.md) | Observability Contract | Accepted |
+| [ADR-016](adr/016-backup-and-dr.md) | Backup and Disaster Recovery | Accepted |
+| [ADR-017](adr/017-dedup-refcount-access-control.md) | Dedup Refcount Metadata Access Control | Accepted |
+| [ADR-018](adr/018-runtime-integrity-monitor.md) | Runtime Integrity Monitor | Accepted |
+| [ADR-019](adr/019-gateway-deployment-model.md) | Gateway Deployment Model | Accepted |
+| [ADR-020](adr/020-workflow-advisory.md) | Workflow Advisory & Client Telemetry | Accepted |
+| [ADR-021](adr/021-advisory-architecture.md) | Workflow Advisory Architecture | Accepted |
+| [ADR-022](adr/022-storage-backend-redb.md) | Storage Backend -- redb (Pure Rust) | Accepted |
+| [ADR-023](adr/023-protocol-rfc-compliance.md) | Protocol RFC Compliance Scope | Accepted |
+| [ADR-024](adr/024-device-management-and-capacity.md) | Device Management, Storage Tiers, and Capacity Thresholds | Accepted |
+| [ADR-025](adr/025-storage-admin-api.md) | Storage Administration API | Accepted |
+| [ADR-026](adr/026-raft-topology.md) | Raft Topology -- Per-Shard on Fabric (Strategy A) | Accepted |
+| [ADR-027](adr/027-single-language-rust-only.md) | Single-Language Implementation -- Rust Only | Accepted |
+| [ADR-028](adr/028-external-tenant-kms-providers.md) | External Tenant KMS Providers | Accepted |
+| [ADR-029](adr/029-raw-block-device-allocator.md) | Raw Block Device Allocator | Accepted |
+| [ADR-030](adr/030-dynamic-small-file-placement.md) | Dynamic Small-File Placement and Metadata Capacity Management | Accepted |
+| [ADR-031](adr/031-client-side-cache.md) | Client-Side Cache | Accepted |
 
 ---
 
