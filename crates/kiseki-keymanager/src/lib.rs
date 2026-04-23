@@ -27,6 +27,11 @@ pub mod rewrap_worker;
 pub mod rotation_monitor;
 pub mod store;
 
+#[cfg(feature = "kms-aws")]
+pub mod aws_provider;
+#[cfg(feature = "kms-vault")]
+pub mod vault_provider;
+
 pub use epoch::{EpochInfo, KeyManagerOps};
 pub use error::KeyManagerError;
 pub use health::{KeyManagerHealth, KeyManagerStatus};

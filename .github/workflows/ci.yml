@@ -98,6 +98,10 @@ jobs:
             cmd: cargo check -p kiseki-chunk --features gpu-cuda --locked
           - name: chunk-gpu-rocm
             cmd: cargo check -p kiseki-chunk --features gpu-rocm --locked
+          - name: kms-vault
+            cmd: cargo check -p kiseki-keymanager --features kms-vault --locked
+          - name: kms-aws
+            cmd: cargo check -p kiseki-keymanager --features kms-aws --locked
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

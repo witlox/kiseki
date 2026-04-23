@@ -26,6 +26,8 @@ pub mod idp;
 pub mod maintenance;
 pub mod namespace;
 pub mod policy;
+pub mod replication;
 pub mod retention;
 pub mod storage_admin;
 pub mod tenant;
+pub mod threshold;

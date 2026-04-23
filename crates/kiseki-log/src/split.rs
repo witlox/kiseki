@@ -162,6 +162,29 @@ pub fn compute_split_plan(
 }
 
 // ---------------------------------------------------------------------------
+// Detection-to-execution bridge
+// ---------------------------------------------------------------------------
+
+/// Check if a shard needs splitting and compute the plan if so.
+///
+/// Returns `Some(plan)` when either the delta count or byte size threshold
+/// is breached and the shard is large enough to split. Returns `None`
+/// when no split is needed or the shard is too small.
+#[must_use]
+pub fn check_and_plan(
+    shard_id: ShardId,
+    delta_count: u64,
+    byte_size: u64,
+    config: &SplitConfig,
+) -> Option<SplitPlan> {
+    if config.should_split(delta_count, byte_size) {
+        compute_split_plan(shard_id, delta_count, byte_size, config).ok()
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -293,5 +316,30 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains('5'));
         assert!(msg.contains("20"));
+    }
+
+    // -- check_and_plan -------------------------------------------------------
+
+    #[test]
+    fn check_and_plan_returns_some_when_threshold_exceeded() {
+        let cfg = test_config(); // max_delta_count=100, max_byte_size=1024, min_split_size=10
+        let shard = ShardId(uuid::Uuid::from_u128(10));
+
+        // 200 deltas > 100 threshold, and 200 >= 2*min_split_size(10)
+        let plan = check_and_plan(shard, 200, 0, &cfg);
+        assert!(plan.is_some());
+        let plan = plan.unwrap();
+        assert_eq!(plan.source_shard, shard);
+        assert_eq!(plan.split_point, SequenceNumber(100));
+    }
+
+    #[test]
+    fn check_and_plan_returns_none_when_below_threshold() {
+        let cfg = test_config();
+        let shard = ShardId(uuid::Uuid::from_u128(11));
+
+        // 50 deltas < 100 threshold, 500 bytes < 1024 threshold
+        let plan = check_and_plan(shard, 50, 500, &cfg);
+        assert!(plan.is_none());
     }
 }
