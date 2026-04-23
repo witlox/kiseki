@@ -30,6 +30,7 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/ui/fragment/cluster-cards", get(fragment_cluster_cards))
         .route("/ui/fragment/node-table", get(fragment_node_table))
         .route("/ui/fragment/chart-data", get(fragment_chart_data))
+        .route("/ui/fragment/alerts", get(fragment_alerts))
         .with_state(state)
 }
 
@@ -123,6 +124,69 @@ async fn fragment_chart_data(State(state): State<UiState>) -> impl IntoResponse 
         "reads": reads,
         "requests": requests,
     }))
+}
+
+#[allow(clippy::items_after_statements)]
+async fn fragment_alerts(State(state): State<UiState>) -> Html<String> {
+    use std::fmt::Write;
+    let metrics_text = (state.metrics_encode)();
+    state.aggregator.update_local(metrics_text).await;
+    let nodes = state.aggregator.all_snapshots().await;
+    let now = chrono_lite();
+
+    let mut html = String::new();
+
+    // Check for unhealthy nodes.
+    let unhealthy: Vec<_> = nodes.iter().filter(|n| !n.healthy).collect();
+    if unhealthy.is_empty() {
+        let _ = write!(
+            html,
+            r#"<div class="alert-row"><span class="dot green"></span><span class="msg">All {} nodes healthy</span><span class="time">{now}</span></div>"#,
+            nodes.len()
+        );
+    } else {
+        for n in &unhealthy {
+            let _ = write!(
+                html,
+                r#"<div class="alert-row"><span class="dot red"></span><span class="msg">Node <b>{}</b> unreachable</span><span class="time">{now}</span></div>"#,
+                n.address
+            );
+        }
+    }
+
+    let _ = write!(
+        html,
+        r#"<div class="alert-row"><span class="dot blue"></span><span class="msg">Capacity monitoring active ({} nodes reporting)</span><span class="time">{now}</span></div>"#,
+        nodes.len()
+    );
+
+    for n in &nodes {
+        if n.summary.gateway_requests > 0 {
+            let _ = write!(
+                html,
+                r#"<div class="alert-row"><span class="dot green"></span><span class="msg">{}: {} gateway requests served</span><span class="time">{now}</span></div>"#,
+                n.address,
+                format_number(n.summary.gateway_requests)
+            );
+        }
+    }
+
+    if html.is_empty() {
+        html.push_str(r#"<div class="alert-row"><span class="dot green"></span><span class="msg">No alerts</span></div>"#);
+    }
+
+    Html(html)
+}
+
+fn chrono_lite() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 async fn dashboard_page() -> Html<&'static str> {

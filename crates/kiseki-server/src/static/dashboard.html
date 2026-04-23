@@ -7,332 +7,284 @@
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <style>
-        :root {
-            --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
-            --text: #e1e4ed; --text-dim: #8b8fa3;
-            --accent: #6366f1; --green: #22c55e; --yellow: #eab308; --red: #ef4444;
-            --blue: #3b82f6;
-        }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: var(--bg); color: var(--text); min-height: 100vh; }
-        a { color: var(--accent); text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        header { display: flex; align-items: center; gap: 16px; padding: 16px 32px; background: var(--surface); border-bottom: 1px solid var(--border); }
-        header img { height: 36px; filter: brightness(0) invert(1); }
-        header h1 { font-size: 20px; font-weight: 600; }
-        header nav { display: flex; gap: 16px; margin-left: 32px; }
-        header nav a { color: var(--text-dim); font-size: 13px; padding: 4px 12px; border-radius: 6px; transition: all 0.2s; }
-        header nav a:hover, header nav a.active { color: var(--text); background: var(--bg); text-decoration: none; }
-        header .clock { color: var(--text-dim); font-size: 13px; margin-left: auto; font-family: monospace; }
-        main { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
-        .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 32px; }
-        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; cursor: pointer; transition: all 0.2s; }
-        .card:hover { border-color: var(--accent); transform: translateY(-1px); }
-        .card h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 8px; }
-        .card .big-number { font-size: 28px; font-weight: 700; font-family: monospace; }
-        .card .label { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
-        .card.healthy { border-left: 3px solid var(--green); }
-        .card.degraded { border-left: 3px solid var(--yellow); }
-        .card.down { border-left: 3px solid var(--red); }
-        .section { margin-bottom: 32px; }
-        .section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; color: var(--text-dim); }
-        table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: 8px; overflow: hidden; }
-        th, td { padding: 10px 16px; text-align: left; border-bottom: 1px solid var(--border); }
-        th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); background: var(--bg); }
-        td { font-size: 13px; font-family: monospace; }
-        tr:hover td { background: rgba(99,102,241,0.05); }
-        .badge { padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-        .badge.healthy { background: rgba(34,197,94,0.15); color: var(--green); }
-        .badge.down { background: rgba(239,68,68,0.15); color: var(--red); }
-        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-        .chart-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
-        .chart-box h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 12px; }
-        canvas { max-height: 220px; }
-        /* Detail panel */
-        .detail-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 24px; display: none; }
-        .detail-panel.visible { display: block; }
-        .detail-panel h2 { font-size: 16px; margin-bottom: 16px; display: flex; align-items: center; gap: 12px; }
-        .detail-panel .close { cursor: pointer; color: var(--text-dim); font-size: 18px; margin-left: auto; }
-        .detail-panel .close:hover { color: var(--text); }
-        .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
-        .detail-stat { padding: 12px; background: var(--bg); border-radius: 6px; }
-        .detail-stat .value { font-size: 20px; font-weight: 700; font-family: monospace; }
-        .detail-stat .key { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
-        /* Operations */
-        .ops-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-        .ops-btn { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; cursor: pointer; transition: all 0.2s; color: var(--text); font-size: 13px; text-align: left; }
-        .ops-btn:hover { border-color: var(--accent); }
-        .ops-btn h4 { font-size: 12px; color: var(--accent); margin-bottom: 4px; }
-        .ops-btn p { font-size: 11px; color: var(--text-dim); }
-        footer { text-align: center; padding: 24px; color: var(--text-dim); font-size: 11px; }
-        @media (max-width: 768px) { .charts { grid-template-columns: 1fr; } main { padding: 16px; } }
+        :root { --bg:#0f1117;--surface:#1a1d27;--border:#2a2d3a;--text:#e1e4ed;--dim:#8b8fa3;--accent:#6366f1;--green:#22c55e;--yellow:#eab308;--red:#ef4444;--blue:#3b82f6; }
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,monospace;background:var(--bg);color:var(--text);min-height:100vh}
+        a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+        header{display:flex;align-items:center;gap:16px;padding:12px 32px;background:var(--surface);border-bottom:1px solid var(--border)}
+        header img{height:32px;filter:brightness(0) invert(1)}
+        header h1{font-size:18px;font-weight:600}
+        header nav{display:flex;gap:4px;margin-left:32px}
+        header nav a{color:var(--dim);font-size:12px;padding:6px 14px;border-radius:6px;transition:all .2s;cursor:pointer}
+        header nav a:hover,header nav a.active{color:var(--text);background:var(--bg);text-decoration:none}
+        header .clock{color:var(--dim);font-size:12px;margin-left:auto;font-family:monospace}
+        main{padding:20px 32px;max-width:1440px;margin:0 auto}
+        .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
+        .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;transition:border-color .2s}
+        .card:hover{border-color:var(--accent)}
+        .card h3{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);margin-bottom:6px}
+        .card .num{font-size:24px;font-weight:700;font-family:monospace}
+        .card .sub{font-size:10px;color:var(--dim);margin-top:2px}
+        .card.healthy{border-left:3px solid var(--green)}.card.degraded{border-left:3px solid var(--yellow)}.card.down{border-left:3px solid var(--red)}
+        .section{margin-bottom:24px}
+        .section-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+        .section-head h2{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim)}
+        .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+        .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+        .chart-box{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px}
+        .chart-box h3{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);margin-bottom:8px}
+        canvas{max-height:180px}
+        table{width:100%;border-collapse:collapse;background:var(--surface);border-radius:8px;overflow:hidden}
+        th,td{padding:8px 14px;text-align:left;border-bottom:1px solid var(--border)}
+        th{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);background:var(--bg)}
+        td{font-size:12px;font-family:monospace}
+        tr[data-addr]{cursor:pointer}tr[data-addr]:hover td{background:rgba(99,102,241,.05)}
+        .badge{padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600}
+        .badge.healthy{background:rgba(34,197,94,.15);color:var(--green)}
+        .badge.down{background:rgba(239,68,68,.15);color:var(--red)}
+        .alerts{background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+        .alert-row{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--border);font-size:12px}
+        .alert-row:last-child{border-bottom:none}
+        .alert-row .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+        .dot.green{background:var(--green)}.dot.yellow{background:var(--yellow)}.dot.red{background:var(--red)}.dot.blue{background:var(--blue)}
+        .alert-row .msg{flex:1;color:var(--text)}.alert-row .time{color:var(--dim);font-size:11px;font-family:monospace}
+        .ops-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+        .ops-btn{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;cursor:pointer;transition:all .2s;color:var(--text);font-size:12px;text-align:left}
+        .ops-btn:hover{border-color:var(--accent)}.ops-btn h4{font-size:11px;color:var(--accent);margin-bottom:3px}.ops-btn p{font-size:10px;color:var(--dim)}
+        footer{text-align:center;padding:16px;color:var(--dim);font-size:10px}
+        @media(max-width:900px){.grid-2,.grid-3{grid-template-columns:1fr}main{padding:12px}}
     </style>
 </head>
 <body>
-    <header>
-        <img src="/ui/logo" alt="K" onerror="this.textContent='K';this.style.cssText='font-size:28px;font-weight:800;color:#6366f1;';">
-        <h1>Kiseki</h1>
-        <nav>
-            <a href="#" class="active" onclick="showTab('overview')">Overview</a>
-            <a href="#" onclick="showTab('nodes')">Nodes</a>
-            <a href="#" onclick="showTab('performance')">Performance</a>
-            <a href="#" onclick="showTab('operations')">Operations</a>
-        </nav>
-        <span class="clock" id="clock"></span>
-    </header>
-    <main>
-        <!-- Node detail panel (hidden by default) -->
-        <div class="detail-panel" id="nodeDetail">
-            <h2><span id="detailNodeName"></span> <span class="close" onclick="closeDetail()">&times;</span></h2>
-            <div class="detail-grid" id="detailStats"></div>
-            <div class="chart-box"><h3>Node Metrics (5 min)</h3><canvas id="detailChart"></canvas></div>
+<header>
+    <img src="/ui/logo" alt="K" onerror="this.textContent='K';this.style.cssText='font-size:24px;font-weight:800;color:#6366f1;';">
+    <h1>Kiseki</h1>
+    <nav id="nav">
+        <a class="active" onclick="showTab('overview',this)">Overview</a>
+        <a onclick="showTab('performance',this)">Performance</a>
+        <a onclick="showTab('alerts',this)">Alerts</a>
+        <a onclick="showTab('operations',this)">Operations</a>
+    </nav>
+    <span class="clock" id="clock"></span>
+</header>
+<main>
+<!-- =============== OVERVIEW =============== -->
+<div id="tab-overview">
+    <div class="cards" hx-get="/ui/fragment/cluster-cards" hx-trigger="load,every 5s" hx-swap="innerHTML">
+        <div class="card"><div class="num" style="color:var(--dim)">...</div></div>
+    </div>
+    <div class="section">
+        <div class="section-head"><h2>Cluster Throughput (5 min)</h2></div>
+        <div class="grid-2">
+            <div class="chart-box"><h3>Data I/O Rate</h3><canvas id="ioChart"></canvas></div>
+            <div class="chart-box"><h3>Request Rate</h3><canvas id="rqChart"></canvas></div>
         </div>
+    </div>
+    <div class="section">
+        <div class="section-head"><h2>Nodes</h2></div>
+        <div hx-get="/ui/fragment/node-table" hx-trigger="load,every 5s" hx-swap="innerHTML" id="nodeTable"></div>
+    </div>
+</div>
 
-        <!-- Overview tab -->
-        <div id="tab-overview">
-            <div class="cards"
-                 hx-get="/ui/fragment/cluster-cards"
-                 hx-trigger="load, every 5s"
-                 hx-swap="innerHTML">
-                <div class="card"><div class="big-number" style="color:var(--text-dim)">Loading...</div></div>
-            </div>
-            <div class="section">
-                <h2>Nodes</h2>
-                <div hx-get="/ui/fragment/node-table"
-                     hx-trigger="load, every 5s"
-                     hx-swap="innerHTML"
-                     id="nodeTableContainer">
-                    <p style="color:var(--text-dim);padding:16px;">Loading nodes...</p>
-                </div>
-            </div>
+<!-- =============== PERFORMANCE =============== -->
+<div id="tab-performance" style="display:none">
+    <div class="section">
+        <div class="section-head"><h2>Per-Node Comparison</h2></div>
+        <div class="grid-2">
+            <div class="chart-box"><h3>Data Written per Node</h3><canvas id="pnWrite"></canvas></div>
+            <div class="chart-box"><h3>Data Read per Node</h3><canvas id="pnRead"></canvas></div>
         </div>
-
-        <!-- Nodes tab -->
-        <div id="tab-nodes" style="display:none">
-            <div class="section">
-                <h2>All Nodes</h2>
-                <div hx-get="/ui/fragment/node-table"
-                     hx-trigger="load, every 5s"
-                     hx-swap="innerHTML">
-                </div>
-            </div>
+    </div>
+    <div class="section">
+        <div class="section-head"><h2>Raft &amp; Connections</h2></div>
+        <div class="grid-2">
+            <div class="chart-box"><h3>Raft Entries per Node</h3><canvas id="pnRaft"></canvas></div>
+            <div class="chart-box"><h3>Gateway Requests per Node</h3><canvas id="pnReq"></canvas></div>
         </div>
+    </div>
+</div>
 
-        <!-- Performance tab -->
-        <div id="tab-performance" style="display:none">
-            <div class="section">
-                <h2>Cluster Throughput (5 min rolling)</h2>
-                <div class="charts">
-                    <div class="chart-box"><h3>Data Volume (bytes/5s)</h3><canvas id="throughputChart"></canvas></div>
-                    <div class="chart-box"><h3>Gateway Requests (/5s)</h3><canvas id="requestChart"></canvas></div>
-                </div>
-            </div>
-            <div class="section" style="margin-top:24px">
-                <h2>Per-Node Snapshot</h2>
-                <div class="charts">
-                    <div class="chart-box"><h3>Data Written per Node</h3><canvas id="nodeWriteChart"></canvas></div>
-                    <div class="chart-box"><h3>Raft Entries per Node</h3><canvas id="nodeRaftChart"></canvas></div>
-                </div>
-            </div>
+<!-- =============== ALERTS =============== -->
+<div id="tab-alerts" style="display:none">
+    <div class="section">
+        <div class="section-head"><h2>System Alerts</h2></div>
+        <div class="alerts" id="alertsList" hx-get="/ui/fragment/alerts" hx-trigger="load,every 5s" hx-swap="innerHTML">
+            <div class="alert-row"><span class="dot green"></span><span class="msg" style="color:var(--dim)">Loading...</span></div>
         </div>
+    </div>
+</div>
 
-        <!-- Operations tab -->
-        <div id="tab-operations" style="display:none">
-            <div class="section">
-                <h2>Cluster Operations</h2>
-                <div class="ops-grid">
-                    <button class="ops-btn" onclick="alert('Maintenance mode toggle — wire to gRPC SetMaintenanceMode')">
-                        <h4>Maintenance Mode</h4>
-                        <p>Enable/disable cluster-wide read-only mode</p>
-                    </button>
-                    <button class="ops-btn" onclick="alert('Backup — wire to BackupManager.create_snapshot()')">
-                        <h4>Create Backup</h4>
-                        <p>Snapshot cluster state for disaster recovery</p>
-                    </button>
-                    <button class="ops-btn" onclick="alert('Key rotation — wire to rotation_monitor.rotate()')">
-                        <h4>Rotate Keys</h4>
-                        <p>Trigger system key epoch rotation</p>
-                    </button>
-                    <button class="ops-btn" onclick="alert('Scrub — wire to scrub_engine.run_scrub()')">
-                        <h4>Run Scrub</h4>
-                        <p>Verify bitmap consistency and CRC integrity</p>
-                    </button>
-                    <button class="ops-btn" onclick="alert('Rebalance — wire to rebalance.compute_plan()')">
-                        <h4>Rebalance Pools</h4>
-                        <p>Redistribute chunks across pool devices</p>
-                    </button>
-                    <button class="ops-btn" onclick="window.open('/metrics','_blank')">
-                        <h4>Prometheus Metrics</h4>
-                        <p>View raw /metrics endpoint</p>
-                    </button>
-                </div>
-            </div>
+<!-- =============== OPERATIONS =============== -->
+<div id="tab-operations" style="display:none">
+    <div class="section">
+        <div class="section-head"><h2>Cluster Operations</h2></div>
+        <div class="ops-grid">
+            <button class="ops-btn" onclick="alert('Wire to gRPC SetMaintenanceMode')"><h4>Maintenance Mode</h4><p>Toggle cluster-wide read-only</p></button>
+            <button class="ops-btn" onclick="alert('Wire to BackupManager')"><h4>Create Backup</h4><p>Snapshot cluster state</p></button>
+            <button class="ops-btn" onclick="alert('Wire to rotation_monitor')"><h4>Rotate Keys</h4><p>Trigger key epoch rotation</p></button>
+            <button class="ops-btn" onclick="alert('Wire to scrub_engine')"><h4>Run Scrub</h4><p>Verify data integrity</p></button>
+            <button class="ops-btn" onclick="alert('Wire to rebalance')"><h4>Rebalance Pools</h4><p>Redistribute chunks</p></button>
+            <button class="ops-btn" onclick="window.open('/metrics','_blank')"><h4>Raw Metrics</h4><p>Prometheus /metrics</p></button>
         </div>
-    </main>
-    <footer>Kiseki Distributed Storage System</footer>
+    </div>
+</div>
 
-    <script>
-    // --- Tab navigation ---
-    function showTab(name) {
-        document.querySelectorAll('[id^="tab-"]').forEach(t => t.style.display = 'none');
-        document.getElementById('tab-' + name).style.display = 'block';
-        document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
-        event.target.classList.add('active');
-    }
+<!-- =============== NODE DETAIL (opens as tab) =============== -->
+<div id="tab-node-detail" style="display:none">
+    <div class="section">
+        <div class="section-head"><h2 id="ndTitle">Node Detail</h2></div>
+        <div class="cards" id="ndCards"></div>
+    </div>
+    <div class="section">
+        <div class="section-head"><h2>Node Metrics (5 min)</h2></div>
+        <div class="grid-2">
+            <div class="chart-box"><h3>Data I/O</h3><canvas id="ndIO"></canvas></div>
+            <div class="chart-box"><h3>Requests</h3><canvas id="ndReq"></canvas></div>
+        </div>
+    </div>
+</div>
+</main>
+<footer>Kiseki Distributed Storage</footer>
 
-    // --- Clock ---
-    function updateClock() { document.getElementById('clock').textContent = new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC'; }
-    updateClock(); setInterval(updateClock, 1000);
+<script>
+// --- Tabs ---
+function showTab(id, el) {
+    document.querySelectorAll('[id^="tab-"]').forEach(t => t.style.display = 'none');
+    document.getElementById('tab-' + id).style.display = 'block';
+    document.querySelectorAll('#nav a').forEach(a => a.classList.remove('active'));
+    if (el) el.classList.add('active');
+}
 
-    // --- Time-series history (rolling 60 samples = 5 min at 5s intervals) ---
-    const MAX_HISTORY = 60;
-    const history = { labels: [], writes: [], reads: [], requests: [], raft: [] };
-    let prevData = { writes: 0, reads: 0, requests: 0, raft: 0 };
+// --- Clock ---
+setInterval(() => { document.getElementById('clock').textContent = new Date().toISOString().replace('T',' ').slice(0,19)+' UTC'; }, 1000);
 
-    // --- Charts ---
-    Chart.defaults.color = '#8b8fa3';
-    const gridColor = '#2a2d3a';
-    const commonOpts = {
-        responsive: true,
-        animation: { duration: 300 },
-        plugins: { legend: { labels: { color: '#8b8fa3', font: { size: 10 } } } },
-        scales: {
-            x: { ticks: { color: '#8b8fa3', font: { size: 9 }, maxTicksLimit: 10 }, grid: { color: gridColor } },
-            y: { beginAtZero: true, ticks: { color: '#8b8fa3', font: { size: 10 } }, grid: { color: gridColor } },
-        },
-    };
+// --- History ---
+const H = 60;
+const ts = { l:[], w:[], r:[], q:[], rf:[] };
+let prev = { w:0, r:0, q:0, rf:0 };
+// Per-node history for detail
+const ndH = {};
 
-    const throughputChart = new Chart(document.getElementById('throughputChart'), {
-        type: 'line',
-        data: { labels: [], datasets: [
-            { label: 'Written', data: [], borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
-            { label: 'Read', data: [], borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
-        ]},
-        options: { ...commonOpts, scales: { ...commonOpts.scales, y: { ...commonOpts.scales.y, ticks: { ...commonOpts.scales.y.ticks, callback: formatBytes } } } },
+// --- Chart defaults ---
+Chart.defaults.color = '#8b8fa3';
+const g = '#2a2d3a';
+function lineOpts(yFmt) {
+    return { responsive:true, animation:{duration:200}, plugins:{legend:{labels:{font:{size:10}}}},
+        scales:{ x:{ticks:{font:{size:9},maxTicksLimit:10},grid:{color:g}},
+                 y:{beginAtZero:true,ticks:{font:{size:9},callback:yFmt||undefined},grid:{color:g}} } };
+}
+function barOpts() {
+    return { responsive:true, animation:{duration:200}, plugins:{legend:{labels:{font:{size:10}}}},
+        scales:{ x:{ticks:{font:{size:9}},grid:{color:g}}, y:{beginAtZero:true,ticks:{font:{size:9}},grid:{color:g}} } };
+}
+function fmtB(b){if(!b||b===0)return'0 B';const k=1024,s=['B','KB','MB','GB','TB'];const i=Math.floor(Math.log(b)/Math.log(k));return(b/Math.pow(k,i)).toFixed(1)+' '+s[i]}
+function fmtN(n){if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return n.toString()}
+
+// Overview charts
+const ioC = new Chart(document.getElementById('ioChart'), {
+    type:'line', data:{labels:[],datasets:[
+        {label:'Written/5s',data:[],borderColor:'#6366f1',backgroundColor:'rgba(99,102,241,.08)',fill:true,tension:.3,pointRadius:0,borderWidth:1.5},
+        {label:'Read/5s',data:[],borderColor:'#22c55e',backgroundColor:'rgba(34,197,94,.08)',fill:true,tension:.3,pointRadius:0,borderWidth:1.5},
+    ]}, options:lineOpts(fmtB)
+});
+const rqC = new Chart(document.getElementById('rqChart'), {
+    type:'line', data:{labels:[],datasets:[
+        {label:'Requests/5s',data:[],borderColor:'#eab308',backgroundColor:'rgba(234,179,8,.08)',fill:true,tension:.3,pointRadius:0,borderWidth:1.5},
+    ]}, options:lineOpts()
+});
+
+// Performance charts
+const pnW = new Chart(document.getElementById('pnWrite'),{type:'bar',data:{labels:[],datasets:[{label:'Written',data:[],backgroundColor:'rgba(99,102,241,.6)',borderRadius:3}]},options:barOpts()});
+const pnR = new Chart(document.getElementById('pnRead'),{type:'bar',data:{labels:[],datasets:[{label:'Read',data:[],backgroundColor:'rgba(34,197,94,.6)',borderRadius:3}]},options:barOpts()});
+const pnRf = new Chart(document.getElementById('pnRaft'),{type:'bar',data:{labels:[],datasets:[{label:'Raft',data:[],backgroundColor:'rgba(59,130,246,.6)',borderRadius:3}]},options:barOpts()});
+const pnRq = new Chart(document.getElementById('pnReq'),{type:'bar',data:{labels:[],datasets:[{label:'Requests',data:[],backgroundColor:'rgba(234,179,8,.6)',borderRadius:3}]},options:barOpts()});
+
+// Node detail charts
+let ndIOC = new Chart(document.getElementById('ndIO'),{type:'line',data:{labels:[],datasets:[
+    {label:'Written/5s',data:[],borderColor:'#6366f1',fill:false,tension:.3,pointRadius:0,borderWidth:1.5},
+    {label:'Read/5s',data:[],borderColor:'#22c55e',fill:false,tension:.3,pointRadius:0,borderWidth:1.5},
+]},options:lineOpts(fmtB)});
+let ndReqC = new Chart(document.getElementById('ndReq'),{type:'line',data:{labels:[],datasets:[
+    {label:'Requests/5s',data:[],borderColor:'#eab308',fill:false,tension:.3,pointRadius:0,borderWidth:1.5},
+]},options:lineOpts()});
+
+// --- Data fetch ---
+let _nodes = [];
+async function poll() {
+    try {
+        const [cr, nr] = await Promise.all([fetch('/ui/api/cluster').then(r=>r.json()), fetch('/ui/api/nodes').then(r=>r.json())]);
+        _nodes = nr;
+        const now = new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+        const dw=Math.max(0,cr.aggregate.chunk_write_bytes-prev.w);
+        const dr=Math.max(0,cr.aggregate.chunk_read_bytes-prev.r);
+        const dq=Math.max(0,cr.aggregate.gateway_requests-prev.q);
+        prev={w:cr.aggregate.chunk_write_bytes,r:cr.aggregate.chunk_read_bytes,q:cr.aggregate.gateway_requests};
+
+        ts.l.push(now);ts.w.push(dw);ts.r.push(dr);ts.q.push(dq);
+        if(ts.l.length>H){ts.l.shift();ts.w.shift();ts.r.shift();ts.q.shift();}
+
+        ioC.data.labels=[...ts.l];ioC.data.datasets[0].data=[...ts.w];ioC.data.datasets[1].data=[...ts.r];ioC.update();
+        rqC.data.labels=[...ts.l];rqC.data.datasets[0].data=[...ts.q];rqC.update();
+
+        const lbl=nr.map(n=>n.address.split(':')[0]);
+        pnW.data.labels=lbl;pnW.data.datasets[0].data=nr.map(n=>n.summary.chunk_write_bytes);pnW.update();
+        pnR.data.labels=lbl;pnR.data.datasets[0].data=nr.map(n=>n.summary.chunk_read_bytes);pnR.update();
+        pnRf.data.labels=lbl;pnRf.data.datasets[0].data=nr.map(n=>n.summary.raft_entries);pnRf.update();
+        pnRq.data.labels=lbl;pnRq.data.datasets[0].data=nr.map(n=>n.summary.gateway_requests);pnRq.update();
+
+        // Per-node history for detail view
+        for (const n of nr) {
+            if (!ndH[n.address]) ndH[n.address] = {l:[],w:[],r:[],q:[],pw:0,pr:0,pq:0};
+            const h = ndH[n.address];
+            const nw=Math.max(0,n.summary.chunk_write_bytes-h.pw);
+            const nrr=Math.max(0,n.summary.chunk_read_bytes-h.pr);
+            const nq=Math.max(0,n.summary.gateway_requests-h.pq);
+            h.pw=n.summary.chunk_write_bytes;h.pr=n.summary.chunk_read_bytes;h.pq=n.summary.gateway_requests;
+            h.l.push(now);h.w.push(nw);h.r.push(nrr);h.q.push(nq);
+            if(h.l.length>H){h.l.shift();h.w.shift();h.r.shift();h.q.shift();}
+        }
+        // Update detail if open
+        if(document.getElementById('tab-node-detail').style.display!=='none' && window._detailAddr) updateDetail(window._detailAddr);
+    } catch(e){}
+}
+poll(); setInterval(poll, 5000);
+
+// --- Node click → detail tab ---
+document.addEventListener('htmx:afterSettle', () => {
+    document.querySelectorAll('tr[data-addr]').forEach(r => {
+        r.onclick = () => openNodeDetail(r.dataset.addr);
     });
+});
 
-    const requestChart = new Chart(document.getElementById('requestChart'), {
-        type: 'line',
-        data: { labels: [], datasets: [
-            { label: 'Requests', data: [], borderColor: '#eab308', backgroundColor: 'rgba(234,179,8,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
-        ]},
-        options: commonOpts,
-    });
+function openNodeDetail(addr) {
+    window._detailAddr = addr;
+    const n = _nodes.find(x=>x.address===addr);
+    if(!n) return;
+    document.getElementById('ndTitle').textContent = 'Node: ' + addr;
+    document.getElementById('ndCards').innerHTML = `
+        <div class="card ${n.healthy?'healthy':'down'}"><h3>Status</h3><div class="num">${n.healthy?'Healthy':'Down'}</div></div>
+        <div class="card"><h3>Raft Entries</h3><div class="num">${fmtN(n.summary.raft_entries)}</div></div>
+        <div class="card"><h3>Requests</h3><div class="num">${fmtN(n.summary.gateway_requests)}</div></div>
+        <div class="card"><h3>Written</h3><div class="num">${fmtB(n.summary.chunk_write_bytes)}</div></div>
+        <div class="card"><h3>Read</h3><div class="num">${fmtB(n.summary.chunk_read_bytes)}</div></div>
+        <div class="card"><h3>Connections</h3><div class="num">${n.summary.transport_connections}</div></div>
+    `;
+    // Add a dynamic "Node: x" tab
+    let tab = document.getElementById('nav-node');
+    if (!tab) { tab = document.createElement('a'); tab.id='nav-node'; document.getElementById('nav').appendChild(tab); }
+    tab.textContent = 'Node: ' + addr.split(':')[0];
+    tab.className = 'active';
+    tab.onclick = () => showTab('node-detail', tab);
+    showTab('node-detail', tab);
+    updateDetail(addr);
+}
 
-    const nodeWriteChart = new Chart(document.getElementById('nodeWriteChart'), {
-        type: 'bar',
-        data: { labels: [], datasets: [
-            { label: 'Written', data: [], backgroundColor: 'rgba(99,102,241,0.7)', borderRadius: 4 },
-            { label: 'Read', data: [], backgroundColor: 'rgba(34,197,94,0.7)', borderRadius: 4 },
-        ]},
-        options: commonOpts,
-    });
-
-    const nodeRaftChart = new Chart(document.getElementById('nodeRaftChart'), {
-        type: 'bar',
-        data: { labels: [], datasets: [
-            { label: 'Raft Entries', data: [], backgroundColor: 'rgba(59,130,246,0.7)', borderRadius: 4 },
-        ]},
-        options: commonOpts,
-    });
-
-    // Detail chart (per-node)
-    let detailChart = null;
-    const detailHistory = { labels: [], writes: [], reads: [] };
-
-    async function updateCharts() {
-        try {
-            const r = await fetch('/ui/api/cluster');
-            const cluster = await r.json();
-
-            // Time label
-            const now = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-
-            // Compute deltas for time series
-            const dw = Math.max(0, cluster.aggregate.chunk_write_bytes - prevData.writes);
-            const dr = Math.max(0, cluster.aggregate.chunk_read_bytes - prevData.reads);
-            const dq = Math.max(0, cluster.aggregate.gateway_requests - prevData.requests);
-            prevData = { writes: cluster.aggregate.chunk_write_bytes, reads: cluster.aggregate.chunk_read_bytes, requests: cluster.aggregate.gateway_requests };
-
-            // Push to history
-            history.labels.push(now);
-            history.writes.push(dw);
-            history.reads.push(dr);
-            history.requests.push(dq);
-            if (history.labels.length > MAX_HISTORY) {
-                history.labels.shift(); history.writes.shift(); history.reads.shift(); history.requests.shift();
-            }
-
-            // Update time-series charts
-            throughputChart.data.labels = [...history.labels];
-            throughputChart.data.datasets[0].data = [...history.writes];
-            throughputChart.data.datasets[1].data = [...history.reads];
-            throughputChart.update();
-
-            requestChart.data.labels = [...history.labels];
-            requestChart.data.datasets[0].data = [...history.requests];
-            requestChart.update();
-
-            // Per-node bar charts
-            const nr = await fetch('/ui/api/nodes');
-            const nodes = await nr.json();
-            const labels = nodes.map(n => n.address.split(':')[0]);
-            nodeWriteChart.data.labels = labels;
-            nodeWriteChart.data.datasets[0].data = nodes.map(n => n.summary.chunk_write_bytes);
-            nodeWriteChart.data.datasets[1].data = nodes.map(n => n.summary.chunk_read_bytes);
-            nodeWriteChart.update();
-            nodeRaftChart.data.labels = labels;
-            nodeRaftChart.data.datasets[0].data = nodes.map(n => n.summary.raft_entries);
-            nodeRaftChart.update();
-
-            // Store nodes globally for detail view
-            window._nodes = nodes;
-        } catch(e) {}
-    }
-    updateCharts(); setInterval(updateCharts, 5000);
-
-    // --- Node detail drill-down ---
-    function showNodeDetail(addr) {
-        const node = (window._nodes || []).find(n => n.address === addr);
-        if (!node) return;
-        document.getElementById('detailNodeName').textContent = addr;
-        document.getElementById('detailStats').innerHTML = `
-            <div class="detail-stat"><div class="value">${node.healthy ? '&#10003; Healthy' : '&#10007; Down'}</div><div class="key">Status</div></div>
-            <div class="detail-stat"><div class="value">${fmtNum(node.summary.raft_entries)}</div><div class="key">Raft Entries</div></div>
-            <div class="detail-stat"><div class="value">${fmtNum(node.summary.gateway_requests)}</div><div class="key">Gateway Requests</div></div>
-            <div class="detail-stat"><div class="value">${formatBytes(node.summary.chunk_write_bytes)}</div><div class="key">Written</div></div>
-            <div class="detail-stat"><div class="value">${formatBytes(node.summary.chunk_read_bytes)}</div><div class="key">Read</div></div>
-            <div class="detail-stat"><div class="value">${node.summary.transport_connections}</div><div class="key">Connections</div></div>
-        `;
-        document.getElementById('nodeDetail').classList.add('visible');
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-
-    function closeDetail() {
-        document.getElementById('nodeDetail').classList.remove('visible');
-    }
-
-    // Make node table rows clickable (delegate via htmx:afterSettle)
-    document.addEventListener('htmx:afterSettle', function() {
-        document.querySelectorAll('#nodeTableContainer tr[data-addr], #tab-nodes tr[data-addr]').forEach(row => {
-            row.style.cursor = 'pointer';
-            row.onclick = () => showNodeDetail(row.dataset.addr);
-        });
-    });
-
-    // --- Helpers ---
-    function formatBytes(b) {
-        if (!b || b === 0) return '0 B';
-        const k = 1024, s = ['B','KB','MB','GB','TB'];
-        const i = Math.floor(Math.log(b) / Math.log(k));
-        return parseFloat((b / Math.pow(k, i)).toFixed(1)) + ' ' + s[i];
-    }
-    function fmtNum(n) {
-        if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
-        if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
-        if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
-        return n.toString();
-    }
-    </script>
+function updateDetail(addr) {
+    const h = ndH[addr];
+    if(!h) return;
+    ndIOC.data.labels=[...h.l];ndIOC.data.datasets[0].data=[...h.w];ndIOC.data.datasets[1].data=[...h.r];ndIOC.update();
+    ndReqC.data.labels=[...h.l];ndReqC.data.datasets[0].data=[...h.q];ndReqC.update();
+}
+</script>
 </body>
 </html>
