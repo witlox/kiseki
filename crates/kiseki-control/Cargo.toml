@@ -23,6 +23,7 @@ base64 = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+aws-lc-rs = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

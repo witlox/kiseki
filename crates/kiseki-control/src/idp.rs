@@ -23,12 +23,18 @@ pub struct TenantIdpConfig {
     ///
     /// # Warning
     ///
-    /// JWKS signature verification is **not yet implemented**. Setting this to
-    /// `false` (the default) causes `validate_jwt` to reject all tokens until
-    /// signature verification is available. Callers must explicitly set this to
-    /// `true` to opt in to insecure, structure-only validation.
+    /// JWKS signature verification is **not yet implemented** for RS256/ES256.
+    /// Setting this to `false` (the default) causes `validate_jwt` to reject
+    /// RS256/ES256 tokens until JWKS verification is available. HS256 tokens
+    /// are verified via `shared_secret` regardless of this flag.
     #[serde(default)]
     pub unsafe_no_signature_verify: bool,
+    /// Shared secret for HS256 signature verification.
+    ///
+    /// When set, tokens with `alg: HS256` are verified using HMAC-SHA256
+    /// with this secret. Required for HS256 tokens.
+    #[serde(default)]
+    pub shared_secret: Option<String>,
 }
 
 /// Configurable mapping from JWT claim names to Kiseki identity fields.
@@ -116,17 +122,52 @@ pub fn validate_jwt(token: &str, config: &TenantIdpConfig) -> Result<ValidatedCl
         ));
     }
 
-    // Reject tokens unless the caller explicitly opted in to insecure mode.
-    if !config.unsafe_no_signature_verify {
-        return Err(IdpError::InvalidToken(
-            "signature verification required but not implemented".into(),
-        ));
+    // Parse header to extract algorithm.
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|e| IdpError::InvalidToken(format!("header base64 decode failed: {e}")))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| IdpError::InvalidToken(format!("header JSON parse failed: {e}")))?;
+    let alg = header
+        .get("alg")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+
+    // Reject alg=none — unsigned tokens are never acceptable.
+    if alg.eq_ignore_ascii_case("none") {
+        return Err(IdpError::InvalidToken("alg=none not allowed".into()));
     }
 
-    tracing::warn!(
-        "JWT signature verification not implemented \
-         — accepting token without cryptographic proof"
-    );
+    // Only allow known algorithms.
+    if !matches!(alg, "HS256" | "RS256" | "ES256") {
+        return Err(IdpError::InvalidToken(format!(
+            "unsupported algorithm: {alg}"
+        )));
+    }
+
+    // Verify signature based on algorithm.
+    match alg {
+        "HS256" => {
+            let secret = config.shared_secret.as_deref().ok_or_else(|| {
+                IdpError::InvalidToken("HS256 token but no shared_secret configured".into())
+            })?;
+            verify_hs256(parts[0], parts[1], parts[2], secret)?;
+        }
+        "RS256" | "ES256" => {
+            // JWKS verification not yet implemented for RS256/ES256.
+            if !config.unsafe_no_signature_verify {
+                return Err(IdpError::InvalidToken(
+                    "signature verification required but JWKS not yet implemented".into(),
+                ));
+            }
+            tracing::warn!(
+                alg = alg,
+                "JWT signature verification not implemented for {alg} \
+                 — accepting token without cryptographic proof"
+            );
+        }
+        _ => unreachable!(), // Covered by the allowlist check above.
+    }
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -194,6 +235,26 @@ pub fn validate_jwt(token: &str, config: &TenantIdpConfig) -> Result<ValidatedCl
     })
 }
 
+/// Verify an HS256 (HMAC-SHA256) JWT signature.
+fn verify_hs256(
+    header_b64: &str,
+    payload_b64: &str,
+    signature_b64: &str,
+    secret: &str,
+) -> Result<(), IdpError> {
+    use aws_lc_rs::hmac;
+
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|e| IdpError::InvalidToken(format!("signature base64 decode failed: {e}")))?;
+
+    hmac::verify(&key, signing_input.as_bytes(), &sig_bytes)
+        .map_err(|_| IdpError::InvalidToken("HS256 signature verification failed".into()))
+}
+
 /// Extract a required string claim from the JWT payload.
 fn extract_string_claim(claims: &serde_json::Value, claim_name: &str) -> Result<String, IdpError> {
     claims
@@ -203,15 +264,35 @@ fn extract_string_claim(claims: &serde_json::Value, claim_name: &str) -> Result<
         .ok_or_else(|| IdpError::MissingClaim(claim_name.into()))
 }
 
-/// Build a minimal unsigned JWT for testing purposes.
+/// Build an HS256-signed JWT for testing purposes.
 ///
-/// Creates a token with the given claims JSON as the payload.
-/// Header and signature are minimal stubs.
+/// Creates a token with the given claims JSON as the payload,
+/// signed with the provided secret using HMAC-SHA256.
 #[cfg(test)]
-fn build_test_jwt(claims: &serde_json::Value) -> String {
-    let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\",\"typ\":\"JWT\"}");
+fn build_test_jwt_hs256(claims: &serde_json::Value, secret: &str) -> String {
+    use aws_lc_rs::hmac;
+
+    let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
     let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
-    format!("{header}.{payload}.test-signature")
+    let signing_input = format!("{header}.{payload}");
+
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let tag = hmac::sign(&key, signing_input.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(tag.as_ref());
+
+    format!("{signing_input}.{signature}")
+}
+
+/// Build a JWT with a custom header for testing (e.g., alg=none).
+#[cfg(test)]
+fn build_test_jwt_with_header(
+    header_json: &str,
+    claims: &serde_json::Value,
+    signature: &str,
+) -> String {
+    let header = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+    let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+    format!("{header}.{payload}.{signature}")
 }
 
 #[cfg(test)]
@@ -234,12 +315,15 @@ mod tests {
             - 60
     }
 
+    const TEST_SECRET: &str = "test-shared-secret-for-hs256";
+
     fn test_config() -> TenantIdpConfig {
         TenantIdpConfig {
             issuer_url: "https://idp.example.com".into(),
             audience: Some("kiseki-api".into()),
             claim_mapping: ClaimMapping::default(),
-            unsafe_no_signature_verify: true,
+            unsafe_no_signature_verify: false,
+            shared_secret: Some(TEST_SECRET.into()),
         }
     }
 
@@ -256,7 +340,7 @@ mod tests {
 
     #[test]
     fn valid_claims_extracted() {
-        let token = build_test_jwt(&valid_claims());
+        let token = build_test_jwt_hs256(&valid_claims(), TEST_SECRET);
         let config = test_config();
 
         let result = validate_jwt(&token, &config).unwrap();
@@ -271,7 +355,7 @@ mod tests {
     fn expired_token_rejected() {
         let mut claims = valid_claims();
         claims["exp"] = serde_json::json!(past_exp());
-        let token = build_test_jwt(&claims);
+        let token = build_test_jwt_hs256(&claims, TEST_SECRET);
 
         let result = validate_jwt(&token, &test_config());
 
@@ -282,7 +366,7 @@ mod tests {
     fn wrong_issuer_rejected() {
         let mut claims = valid_claims();
         claims["iss"] = serde_json::json!("https://evil.example.com");
-        let token = build_test_jwt(&claims);
+        let token = build_test_jwt_hs256(&claims, TEST_SECRET);
 
         let result = validate_jwt(&token, &test_config());
 
@@ -300,7 +384,7 @@ mod tests {
         let mut claims = valid_claims();
         // Remove the org claim.
         claims.as_object_mut().unwrap().remove("org");
-        let token = build_test_jwt(&claims);
+        let token = build_test_jwt_hs256(&claims, TEST_SECRET);
 
         let result = validate_jwt(&token, &test_config());
 
@@ -319,7 +403,7 @@ mod tests {
     fn invalid_audience_rejected() {
         let mut claims = valid_claims();
         claims["aud"] = serde_json::json!("wrong-audience");
-        let token = build_test_jwt(&claims);
+        let token = build_test_jwt_hs256(&claims, TEST_SECRET);
 
         let result = validate_jwt(&token, &test_config());
 
@@ -336,22 +420,27 @@ mod tests {
     fn optional_project_claim() {
         let mut claims = valid_claims();
         claims.as_object_mut().unwrap().remove("project");
-        let token = build_test_jwt(&claims);
+        let token = build_test_jwt_hs256(&claims, TEST_SECRET);
 
         let result = validate_jwt(&token, &test_config()).unwrap();
         assert!(result.project_id.is_none());
     }
 
     #[test]
-    fn secure_mode_rejects_without_signature_verify() {
-        let token = build_test_jwt(&valid_claims());
+    fn rs256_rejected_without_unsafe_flag() {
+        // RS256 tokens require unsafe_no_signature_verify since JWKS is not implemented.
+        let token = build_test_jwt_with_header(
+            r#"{"alg":"RS256","typ":"JWT"}"#,
+            &valid_claims(),
+            "fake-sig",
+        );
         let config = TenantIdpConfig {
             unsafe_no_signature_verify: false,
             ..test_config()
         };
         let result = validate_jwt(&token, &config);
         assert!(
-            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("signature verification required"))
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("JWKS not yet implemented"))
         );
     }
 
@@ -359,9 +448,59 @@ mod tests {
     fn audience_as_array() {
         let mut claims = valid_claims();
         claims["aud"] = serde_json::json!(["other-api", "kiseki-api"]);
-        let token = build_test_jwt(&claims);
+        let token = build_test_jwt_hs256(&claims, TEST_SECRET);
 
         let result = validate_jwt(&token, &test_config());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn alg_none_rejected() {
+        let token =
+            build_test_jwt_with_header(r#"{"alg":"none","typ":"JWT"}"#, &valid_claims(), "");
+        let result = validate_jwt(&token, &test_config());
+        assert!(matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("alg=none")));
+    }
+
+    #[test]
+    fn hs256_correct_secret_passes() {
+        let token = build_test_jwt_hs256(&valid_claims(), TEST_SECRET);
+        let result = validate_jwt(&token, &test_config());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hs256_wrong_secret_fails() {
+        let token = build_test_jwt_hs256(&valid_claims(), "wrong-secret");
+        let result = validate_jwt(&token, &test_config());
+        assert!(
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("HS256 signature verification failed"))
+        );
+    }
+
+    #[test]
+    fn unsupported_algorithm_rejected() {
+        let token = build_test_jwt_with_header(
+            r#"{"alg":"PS256","typ":"JWT"}"#,
+            &valid_claims(),
+            "fake-sig",
+        );
+        let result = validate_jwt(&token, &test_config());
+        assert!(
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("unsupported algorithm"))
+        );
+    }
+
+    #[test]
+    fn hs256_no_shared_secret_configured() {
+        let token = build_test_jwt_hs256(&valid_claims(), TEST_SECRET);
+        let config = TenantIdpConfig {
+            shared_secret: None,
+            ..test_config()
+        };
+        let result = validate_jwt(&token, &config);
+        assert!(
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("no shared_secret configured"))
+        );
     }
 }

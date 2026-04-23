@@ -23,21 +23,26 @@ mod system_disk;
 mod telemetry;
 
 fn main() {
-    let otel_provider = telemetry::init_tracing();
-
+    // Load config before the runtime — it's pure env parsing, no async needed.
     let cfg = config::ServerConfig::from_env();
-    tracing::info!(
-        data_addr = %cfg.data_addr,
-        advisory_addr = %cfg.advisory_addr,
-        "kiseki-server starting"
-    );
 
-    // Build the main tokio runtime.
+    // Build the main tokio runtime BEFORE tracing init.
+    // The OTLP exporter (tonic gRPC) requires a tokio runtime context.
     let main_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kiseki-data")
         .build()
         .expect("failed to build main tokio runtime");
+
+    // Initialize tracing inside the runtime so the OTLP tonic channel
+    // has a tokio context for lazy connection.
+    let otel_provider = main_rt.block_on(async { telemetry::init_tracing() });
+
+    tracing::info!(
+        data_addr = %cfg.data_addr,
+        advisory_addr = %cfg.advisory_addr,
+        "kiseki-server starting"
+    );
 
     // Build the isolated advisory runtime (ADR-021 §1).
     let advisory_rt = tokio::runtime::Builder::new_multi_thread()

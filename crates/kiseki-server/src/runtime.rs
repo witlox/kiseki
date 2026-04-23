@@ -328,6 +328,12 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         }
     });
 
+    // TODO: Wire rotation_monitor::run_rotation_monitor() here.
+    // The components exist (kiseki_keymanager::rotation_monitor + rewrap_worker)
+    // but need a real KeyManagerOps reference from the Raft key store.
+    // Current key manager is bootstrapped with a fixed key; production
+    // requires the Raft-backed OpenRaftKeyStore for distributed rotation.
+
     // Periodic device scrub (P4c): bitmap vs redb consistency check.
     // Runs every 60 seconds when persistent chunk store is active.
     if cfg.data_dir.is_some() {
