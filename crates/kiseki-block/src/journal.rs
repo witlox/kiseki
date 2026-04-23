@@ -118,8 +118,7 @@ impl Journal {
     }
 
     fn persist(&self) -> std::io::Result<()> {
-        let json = serde_json::to_string(&self.entries)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string(&self.entries).map_err(std::io::Error::other)?;
         std::fs::write(&self.path, json)
     }
 }

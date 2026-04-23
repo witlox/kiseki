@@ -16,14 +16,19 @@
 pub mod device;
 pub mod ec;
 pub mod error;
+pub mod evacuation;
+
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm", test))]
 #[allow(unsafe_code)]
 pub mod gpu_direct;
 pub mod persistent_store;
 pub mod placement;
 pub mod pool;
+pub mod rebalance;
+pub mod scrub_engine;
 pub mod small_object_store;
 pub mod store;
+pub mod striping;
 
 pub use error::ChunkError;
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm", test))]
