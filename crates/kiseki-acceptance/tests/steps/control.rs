@@ -995,7 +995,7 @@ async fn then_config_replicates(w: &mut KisekiWorld) {
     let peers = w.control_federation_reg.list_peers();
     assert!(!peers.is_empty(), "expected at least one peer");
     for p in &peers {
-        assert!(p.config_sync, "config sync not enabled for {}", p.site_id);
+        assert!(p.config_sync, "config sync not enabled for {}", p.peer_id);
     }
 }
 
@@ -1006,7 +1006,7 @@ async fn then_data_cipher_only(w: &mut KisekiWorld) {
         assert!(
             p.data_cipher_only,
             "data should be ciphertext only for {}",
-            p.site_id
+            p.peer_id
         );
     }
 }
@@ -1016,7 +1016,7 @@ async fn then_same_kms(w: &mut KisekiWorld) {
     let peers = w.control_federation_reg.list_peers();
     assert!(!peers.is_empty());
     for p in &peers {
-        assert!(p.connected, "peer {} not connected", p.site_id);
+        assert!(p.connected(), "peer {} not connected", p.peer_id);
     }
 }
 
@@ -1504,7 +1504,7 @@ async fn then_no_wf_replicated(w: &mut KisekiWorld) {
 )]
 async fn then_config_replicated(w: &mut KisekiWorld) {
     for p in w.control_federation_reg.list_peers() {
-        assert!(p.config_sync, "config sync not enabled for {}", p.site_id);
+        assert!(p.config_sync, "config sync not enabled for {}", p.peer_id);
     }
 }
 

@@ -1674,9 +1674,11 @@ dependencies = [
 name = "kiseki-control"
 version = "2026.1.0"
 dependencies = [
+ "base64",
  "kiseki-common",
  "kiseki-proto",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tonic 0.12.3",
@@ -1706,6 +1708,7 @@ version = "2026.1.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "kiseki-chunk",
@@ -1823,6 +1826,8 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus",
+ "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tonic 0.12.3",
  "tracing",

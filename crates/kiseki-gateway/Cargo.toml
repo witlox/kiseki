@@ -37,5 +37,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+axum = { version = "0.7", features = ["tokio"] }
+http-body-util = "0.1"
 proptest = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 uuid = { workspace = true }

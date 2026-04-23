@@ -21,6 +21,7 @@
 
 pub mod error;
 pub mod mem_gateway;
+pub mod nfs_auth;
 pub mod ops;
 
 #[cfg(feature = "nfs")]

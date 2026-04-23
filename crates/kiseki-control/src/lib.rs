@@ -22,6 +22,7 @@ pub mod flavor;
 )]
 pub mod grpc;
 pub mod iam;
+pub mod idp;
 pub mod maintenance;
 pub mod namespace;
 pub mod policy;

@@ -6,8 +6,9 @@
 //! MVP: PUT/GET/HEAD/DELETE on `/:bucket/:key`. No `SigV4` auth.
 //! Supports optional mTLS when TLS files are configured.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -32,6 +33,8 @@ struct S3State<G: GatewayOps> {
     /// Access key store for `SigV4` authentication.
     #[allow(dead_code)] // wired when per-request auth middleware is added
     key_store: AccessKeyStore,
+    /// In-memory bucket registry (namespace mapping).
+    buckets: Mutex<HashSet<String>>,
 }
 
 impl<G: GatewayOps> S3State<G> {
@@ -91,10 +94,18 @@ pub fn s3_router_with_keys<G: GatewayOps + Send + Sync + 'static>(
         gateway,
         fallback_tenant,
         key_store,
+        buckets: Mutex::new(HashSet::new()),
     });
 
     Router::new()
-        .route("/:bucket", get(list_objects::<G>))
+        .route("/", get(list_buckets::<G>))
+        .route(
+            "/:bucket",
+            get(list_objects::<G>)
+                .put(create_bucket::<G>)
+                .delete(delete_bucket::<G>)
+                .head(head_bucket::<G>),
+        )
         .route(
             "/:bucket/:key",
             put(put_or_upload_part::<G>)
@@ -332,6 +343,82 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
     }
 }
 
+// ── Bucket-level handlers (S3 5.2) ──────────────────────────────────
+
+/// `PUT /<bucket>` — create a bucket. Returns 200 or 409.
+async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
+    State(state): State<Arc<S3State<G>>>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    let mut buckets = state
+        .buckets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if buckets.contains(&bucket) {
+        return (StatusCode::CONFLICT, "BucketAlreadyExists").into_response();
+    }
+    buckets.insert(bucket);
+    StatusCode::OK.into_response()
+}
+
+/// `DELETE /<bucket>` — delete a bucket. Returns 204 or 404.
+async fn delete_bucket<G: GatewayOps + Send + Sync + 'static>(
+    State(state): State<Arc<S3State<G>>>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    let mut buckets = state
+        .buckets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if buckets.remove(&bucket) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// `HEAD /<bucket>` — check bucket existence. Returns 200 or 404.
+async fn head_bucket<G: GatewayOps + Send + Sync + 'static>(
+    State(state): State<Arc<S3State<G>>>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    let buckets = state
+        .buckets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if buckets.contains(&bucket) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// `GET /` — list all buckets. Returns XML `<ListAllMyBucketsResult>`.
+async fn list_buckets<G: GatewayOps + Send + Sync + 'static>(
+    State(state): State<Arc<S3State<G>>>,
+) -> impl IntoResponse {
+    let buckets = state
+        .buckets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListAllMyBucketsResult>\
+         <Buckets>",
+    );
+    let mut sorted: Vec<&String> = buckets.iter().collect();
+    sorted.sort();
+    for name in sorted {
+        xml.push_str("<Bucket><Name>");
+        xml.push_str(name);
+        xml.push_str("</Name></Bucket>");
+    }
+    xml.push_str("</Buckets></ListAllMyBucketsResult>");
+
+    (StatusCode::OK, [("content-type", "application/xml")], xml)
+}
+
 /// Query parameters for `ListObjectsV2`.
 #[derive(serde::Deserialize, Default)]
 struct ListParams {
@@ -405,7 +492,7 @@ fn namespace_from_bucket(bucket: &str) -> NamespaceId {
 ///
 /// When `tls_config` is `Some`, requires mTLS client certs. When
 /// `None`, serves plaintext (development only).
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::missing_panics_doc)]
 pub async fn run_s3_server(
     addr: SocketAddr,
     router: Router,
@@ -453,5 +540,171 @@ pub async fn run_s3_server(
     } else {
         tracing::warn!(addr = %addr, "S3 HTTP gateway listening (PLAINTEXT — development only)");
         axum::serve(listener, router).await.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use crate::mem_gateway::InMemoryGateway;
+    use crate::s3::S3Gateway;
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_crypto::keys::SystemMasterKey;
+
+    fn test_router() -> Router {
+        let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            Box::new(ChunkStore::new()),
+            master_key,
+        );
+        let s3gw = S3Gateway::new(gw);
+        let tenant = OrgId(uuid::Uuid::nil());
+        s3_router(s3gw, tenant)
+    }
+
+    #[tokio::test]
+    async fn create_bucket_returns_200() {
+        let app = test_router();
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn duplicate_bucket_returns_409() {
+        let app = test_router();
+
+        // First create.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/dup-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second create — should conflict.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/dup-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn head_nonexistent_bucket_returns_404() {
+        let app = test_router();
+        let req = Request::builder()
+            .method("HEAD")
+            .uri("/no-such-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn head_existing_bucket_returns_200() {
+        let app = test_router();
+
+        // Create bucket first.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/my-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // HEAD should find it.
+        let req = Request::builder()
+            .method("HEAD")
+            .uri("/my-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_returns_204() {
+        let app = test_router();
+
+        // Create, then delete.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/del-bucket")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/del-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_bucket_returns_404() {
+        let app = test_router();
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/ghost-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_buckets_returns_xml() {
+        let app = test_router();
+
+        // Create two buckets.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/alpha")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/beta")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // List.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("<Name>alpha</Name>"), "xml: {xml}");
+        assert!(xml.contains("<Name>beta</Name>"), "xml: {xml}");
+        assert!(xml.contains("ListAllMyBucketsResult"), "xml: {xml}");
     }
 }

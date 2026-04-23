@@ -453,13 +453,13 @@ impl ControlService for ControlGrpc {
         let proto_peers = peers
             .into_iter()
             .map(|p| pb::FederationPeer {
-                peer_id: p.site_id.clone(),
-                site_name: p.site_id,
+                peer_id: p.peer_id.clone(),
+                site_name: p.peer_id,
                 endpoint: p.endpoint,
-                status: if p.connected {
-                    "connected".to_owned()
-                } else {
-                    "disconnected".to_owned()
+                status: match p.status {
+                    crate::federation::PeerStatus::Active
+                    | crate::federation::PeerStatus::Syncing => "connected".to_owned(),
+                    _ => "disconnected".to_owned(),
                 },
             })
             .collect();

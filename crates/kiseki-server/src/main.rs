@@ -11,9 +11,13 @@
 // Binary crate: allow expect/unwrap for startup and top-level error handling.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[allow(dead_code)] // Wired when admin CLI binary is added.
+pub(crate) mod admin;
 mod config;
 mod integrity;
 pub(crate) mod metrics;
+#[allow(dead_code)] // Wired at startup when data-dir migration is integrated.
+pub(crate) mod migration;
 mod runtime;
 mod system_disk;
 mod telemetry;
