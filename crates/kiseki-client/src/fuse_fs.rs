@@ -47,17 +47,31 @@ pub struct DirEntry {
 enum InodeEntry {
     Root,
     File {
+        parent: Ino,
         name: String,
         composition_id: CompositionId,
         size: u64,
     },
     Dir {
+        parent: Ino,
         name: String,
     },
     Symlink {
+        parent: Ino,
         name: String,
         target: String,
     },
+}
+
+impl InodeEntry {
+    fn parent(&self) -> Option<Ino> {
+        match self {
+            InodeEntry::Root => None,
+            InodeEntry::File { parent, .. }
+            | InodeEntry::Dir { parent, .. }
+            | InodeEntry::Symlink { parent, .. } => Some(*parent),
+        }
+    }
 }
 
 /// FUSE filesystem backed by `GatewayOps`.
@@ -69,7 +83,8 @@ pub struct KisekiFuse<G: GatewayOps> {
     tenant_id: OrgId,
     namespace_id: NamespaceId,
     inodes: HashMap<Ino, InodeEntry>,
-    name_to_ino: HashMap<String, Ino>,
+    /// Maps `(parent_ino, child_name)` to child inode.
+    children: HashMap<(Ino, String), Ino>,
     next_ino: Ino,
 }
 
@@ -84,8 +99,17 @@ impl<G: GatewayOps> KisekiFuse<G> {
             tenant_id,
             namespace_id,
             inodes,
-            name_to_ino: HashMap::new(),
+            children: HashMap::new(),
             next_ino: 2,
+        }
+    }
+
+    /// Validate that `ino` is a directory (Root or Dir). Returns error if not.
+    fn require_dir(&self, ino: Ino) -> Result<(), i32> {
+        match self.inodes.get(&ino) {
+            Some(InodeEntry::Root | InodeEntry::Dir { .. }) => Ok(()),
+            Some(_) => Err(20), // ENOTDIR
+            None => Err(libc_enoent()),
         }
     }
 
@@ -117,9 +141,22 @@ impl<G: GatewayOps> KisekiFuse<G> {
         })
     }
 
-    /// Look up a name in the root directory.
+    /// Look up a name in the given parent directory.
+    ///
+    /// For backwards compatibility, the single-argument form searches
+    /// all entries by name (flat namespace). Use `lookup_in` for proper
+    /// nested directory support.
     pub fn lookup(&self, name: &str) -> Result<FileAttr, i32> {
-        let ino = self.name_to_ino.get(name).ok_or(libc_enoent())?;
+        self.lookup_in(1, name)
+    }
+
+    /// Look up a child by name within a specific parent directory.
+    pub fn lookup_in(&self, parent: Ino, name: &str) -> Result<FileAttr, i32> {
+        self.require_dir(parent)?;
+        let ino = self
+            .children
+            .get(&(parent, name.to_owned()))
+            .ok_or(libc_enoent())?;
         self.getattr(*ino)
     }
 
@@ -142,8 +179,94 @@ impl<G: GatewayOps> KisekiFuse<G> {
             .map_err(|_| libc_eio())
     }
 
-    /// Write a new file (create + write).
+    /// Write data to an existing file at a given offset.
+    ///
+    /// Performs a read-modify-write: reads the full file, splices the
+    /// new data at `offset`, then writes the result as a new composition,
+    /// updating the inode to point at the new composition.
+    pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32, i32> {
+        let entry = self.inodes.get(&ino).ok_or(libc_enoent())?;
+        let (old_size, old_composition_id) = match entry {
+            InodeEntry::File {
+                size,
+                composition_id,
+                ..
+            } => (*size, *composition_id),
+            _ => return Err(libc_eisdir()),
+        };
+
+        // Read existing data.
+        let mut buf = if old_size > 0 {
+            self.gateway
+                .read(ReadRequest {
+                    tenant_id: self.tenant_id,
+                    namespace_id: self.namespace_id,
+                    composition_id: old_composition_id,
+                    offset: 0,
+                    length: old_size,
+                })
+                .map(|r| r.data)
+                .map_err(|_| libc_eio())?
+        } else {
+            Vec::new()
+        };
+
+        // Extend buffer if offset + data goes beyond current size.
+        #[allow(clippy::cast_possible_truncation)]
+        let end = offset as usize + data.len();
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+
+        // Splice new data in.
+        #[allow(clippy::cast_possible_truncation)]
+        let start = offset as usize;
+        buf[start..end].copy_from_slice(data);
+
+        let new_size = buf.len() as u64;
+
+        // Write the full buffer as a new composition.
+        let resp = self
+            .gateway
+            .write(WriteRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                data: buf,
+            })
+            .map_err(|_| libc_eio())?;
+
+        // Update inode.
+        if let Some(InodeEntry::File {
+            composition_id,
+            size,
+            ..
+        }) = self.inodes.get_mut(&ino)
+        {
+            *composition_id = resp.composition_id;
+            *size = new_size;
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let written = data.len() as u32;
+        Ok(written)
+    }
+
+    /// Write a new file (create + write) under the given parent directory.
+    ///
+    /// The single-argument `create(name, data)` form creates under root (inode 1).
+    /// Use `create_in` for nested directory support.
     pub fn create(&mut self, name: &str, data: Vec<u8>) -> Result<Ino, i32> {
+        self.create_in(1, name, data)
+    }
+
+    /// Create a file under a specific parent directory.
+    pub fn create_in(&mut self, parent: Ino, name: &str, data: Vec<u8>) -> Result<Ino, i32> {
+        self.require_dir(parent)?;
+
+        if self.children.contains_key(&(parent, name.to_owned())) {
+            return Err(17); // EEXIST
+        }
+
         let size = data.len() as u64;
         let resp = self
             .gateway
@@ -159,38 +282,65 @@ impl<G: GatewayOps> KisekiFuse<G> {
         self.inodes.insert(
             ino,
             InodeEntry::File {
+                parent,
                 name: name.to_owned(),
                 composition_id: resp.composition_id,
                 size,
             },
         );
-        self.name_to_ino.insert(name.to_owned(), ino);
+        self.children.insert((parent, name.to_owned()), ino);
         Ok(ino)
     }
 
-    /// Remove a file.
+    /// Remove a file from the root directory.
     pub fn unlink(&mut self, name: &str) -> Result<(), i32> {
-        let ino = self.name_to_ino.remove(name).ok_or(libc_enoent())?;
+        self.unlink_in(1, name)
+    }
+
+    /// Remove a file from a specific parent directory.
+    pub fn unlink_in(&mut self, parent: Ino, name: &str) -> Result<(), i32> {
+        self.require_dir(parent)?;
+        let ino = self
+            .children
+            .remove(&(parent, name.to_owned()))
+            .ok_or(libc_enoent())?;
         self.inodes.remove(&ino);
         Ok(())
     }
 
-    /// List directory entries.
+    /// List directory entries for the given directory inode.
+    ///
+    /// The no-argument form lists the root directory (inode 1).
     pub fn readdir(&self) -> Vec<DirEntry> {
+        self.readdir_in(1)
+    }
+
+    /// List directory entries for a specific directory.
+    pub fn readdir_in(&self, dir_ino: Ino) -> Vec<DirEntry> {
+        let parent_ino = match self.inodes.get(&dir_ino) {
+            Some(InodeEntry::Root) => dir_ino, // root's parent is itself
+            Some(InodeEntry::Dir { parent, .. }) => *parent,
+            _ => return Vec::new(),
+        };
+
         let mut entries = vec![
             DirEntry {
-                ino: 1,
+                ino: dir_ino,
                 name: ".".into(),
                 kind: FileKind::Directory,
             },
             DirEntry {
-                ino: 1,
+                ino: parent_ino,
                 name: "..".into(),
                 kind: FileKind::Directory,
             },
         ];
 
+        // Iterate children of this directory.
         for (&ino, entry) in &self.inodes {
+            if entry.parent() != Some(dir_ino) {
+                continue;
+            }
             match entry {
                 InodeEntry::File { name, .. } | InodeEntry::Symlink { name, .. } => {
                     entries.push(DirEntry {
@@ -199,7 +349,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
                         kind: FileKind::Regular,
                     });
                 }
-                InodeEntry::Dir { name } => {
+                InodeEntry::Dir { name, .. } => {
                     entries.push(DirEntry {
                         ino,
                         name: name.clone(),
@@ -213,53 +363,95 @@ impl<G: GatewayOps> KisekiFuse<G> {
         entries
     }
 
-    /// Create a directory.
+    /// Create a directory under root.
     pub fn mkdir(&mut self, name: &str) -> Result<Ino, i32> {
-        if self.name_to_ino.contains_key(name) {
+        self.mkdir_in(1, name)
+    }
+
+    /// Create a directory under a specific parent.
+    pub fn mkdir_in(&mut self, parent: Ino, name: &str) -> Result<Ino, i32> {
+        self.require_dir(parent)?;
+
+        if self.children.contains_key(&(parent, name.to_owned())) {
             return Err(17); // EEXIST
         }
+
         let ino = self.next_ino;
         self.next_ino += 1;
         self.inodes.insert(
             ino,
             InodeEntry::Dir {
+                parent,
                 name: name.to_owned(),
             },
         );
-        self.name_to_ino.insert(name.to_owned(), ino);
+        self.children.insert((parent, name.to_owned()), ino);
         Ok(ino)
     }
 
-    /// Remove a directory.
+    /// Remove a directory from root.
     pub fn rmdir(&mut self, name: &str) -> Result<(), i32> {
-        let ino = self.name_to_ino.get(name).ok_or(libc_enoent())?;
-        if !matches!(self.inodes.get(ino), Some(InodeEntry::Dir { .. })) {
+        self.rmdir_in(1, name)
+    }
+
+    /// Remove a directory from a specific parent.
+    pub fn rmdir_in(&mut self, parent: Ino, name: &str) -> Result<(), i32> {
+        self.require_dir(parent)?;
+        let ino = *self
+            .children
+            .get(&(parent, name.to_owned()))
+            .ok_or(libc_enoent())?;
+        if !matches!(self.inodes.get(&ino), Some(InodeEntry::Dir { .. })) {
             return Err(20); // ENOTDIR
         }
-        let ino = self.name_to_ino.remove(name).unwrap();
+        // Check directory is empty.
+        let has_children = self.children.keys().any(|(p, _)| *p == ino);
+        if has_children {
+            return Err(39); // ENOTEMPTY (macOS) / 66 on some systems
+        }
+        self.children.remove(&(parent, name.to_owned()));
         self.inodes.remove(&ino);
         Ok(())
     }
 
-    /// Rename a file or directory.
+    /// Rename a file or directory within the root directory.
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), i32> {
-        let ino = self.name_to_ino.remove(old_name).ok_or(libc_enoent())?;
-        // Update the name in the inode entry.
+        self.rename_in(1, old_name, 1, new_name)
+    }
+
+    /// Rename a file or directory, possibly moving between parents.
+    pub fn rename_in(
+        &mut self,
+        old_parent: Ino,
+        old_name: &str,
+        new_parent: Ino,
+        new_name: &str,
+    ) -> Result<(), i32> {
+        self.require_dir(old_parent)?;
+        self.require_dir(new_parent)?;
+
+        let ino = self
+            .children
+            .remove(&(old_parent, old_name.to_owned()))
+            .ok_or(libc_enoent())?;
+
+        // Update the name (and parent) in the inode entry.
         if let Some(entry) = self.inodes.get_mut(&ino) {
             match entry {
-                InodeEntry::File { name, .. }
-                | InodeEntry::Dir { name }
-                | InodeEntry::Symlink { name, .. } => {
+                InodeEntry::File { name, parent, .. }
+                | InodeEntry::Dir { name, parent }
+                | InodeEntry::Symlink { name, parent, .. } => {
                     new_name.clone_into(name);
+                    *parent = new_parent;
                 }
                 InodeEntry::Root => return Err(libc_eio()),
             }
         }
         // Remove any existing entry at new_name (overwrite semantics).
-        if let Some(old_ino) = self.name_to_ino.remove(new_name) {
+        if let Some(old_ino) = self.children.remove(&(new_parent, new_name.to_owned())) {
             self.inodes.remove(&old_ino);
         }
-        self.name_to_ino.insert(new_name.to_owned(), ino);
+        self.children.insert((new_parent, new_name.to_owned()), ino);
         Ok(())
     }
 
@@ -270,9 +462,15 @@ impl<G: GatewayOps> KisekiFuse<G> {
         self.getattr(ino)
     }
 
-    /// Create a symbolic link.
+    /// Create a symbolic link under root.
     pub fn symlink(&mut self, name: &str, target: &str) -> Result<Ino, i32> {
-        if self.name_to_ino.contains_key(name) {
+        self.symlink_in(1, name, target)
+    }
+
+    /// Create a symbolic link under a specific parent.
+    pub fn symlink_in(&mut self, parent: Ino, name: &str, target: &str) -> Result<Ino, i32> {
+        self.require_dir(parent)?;
+        if self.children.contains_key(&(parent, name.to_owned())) {
             return Err(17); // EEXIST
         }
         let ino = self.next_ino;
@@ -280,11 +478,12 @@ impl<G: GatewayOps> KisekiFuse<G> {
         self.inodes.insert(
             ino,
             InodeEntry::Symlink {
+                parent,
                 name: name.to_owned(),
                 target: target.to_owned(),
             },
         );
-        self.name_to_ino.insert(name.to_owned(), ino);
+        self.children.insert((parent, name.to_owned()), ino);
         Ok(ino)
     }
 
@@ -409,5 +608,81 @@ mod tests {
 
         let chunk = fs.read(ino, 4, 4).unwrap();
         assert_eq!(chunk, b"efgh");
+    }
+
+    #[test]
+    fn nested_directory_create_and_lookup() {
+        let mut fs = setup_fuse();
+
+        // Create a subdirectory under root.
+        let subdir_ino = fs.mkdir("subdir").unwrap();
+        assert!(subdir_ino >= 2);
+
+        // Verify subdirectory appears in root listing.
+        let root_entries = fs.readdir();
+        assert!(root_entries
+            .iter()
+            .any(|e| e.name == "subdir" && e.kind == FileKind::Directory));
+
+        // Create a file inside the subdirectory.
+        let file_ino = fs
+            .create_in(subdir_ino, "nested.txt", b"nested data".to_vec())
+            .unwrap();
+        assert!(file_ino > subdir_ino);
+
+        // Look up the file by name within the subdirectory.
+        let attr = fs.lookup_in(subdir_ino, "nested.txt").unwrap();
+        assert_eq!(attr.kind, FileKind::Regular);
+        assert_eq!(attr.size, 11);
+        assert_eq!(attr.ino, file_ino);
+
+        // The file must NOT appear in the root directory listing.
+        let root_entries = fs.readdir();
+        assert!(!root_entries.iter().any(|e| e.name == "nested.txt"));
+
+        // The file MUST appear in the subdirectory listing.
+        let sub_entries = fs.readdir_in(subdir_ino);
+        assert!(sub_entries.iter().any(|e| e.name == "nested.txt"));
+        // Subdirectory listing includes . and ..
+        assert!(sub_entries.iter().any(|e| e.name == "."));
+        assert!(sub_entries.iter().any(|e| e.name == ".."));
+
+        // Look up in root must fail for the nested file.
+        assert!(fs.lookup_in(1, "nested.txt").is_err());
+
+        // Read the file data to confirm it works.
+        let data = fs.read(file_ino, 0, 1024).unwrap();
+        assert_eq!(data, b"nested data");
+    }
+
+    #[test]
+    fn write_at_offset() {
+        let mut fs = setup_fuse();
+
+        // Create a file with initial content.
+        let ino = fs.create("wfile.txt", b"Hello, World!".to_vec()).unwrap();
+
+        // Verify initial content.
+        let data = fs.read(ino, 0, 1024).unwrap();
+        assert_eq!(data, b"Hello, World!");
+
+        // Write at offset 5 — replace ", World!" with " Rust!"
+        let written = fs.write(ino, 5, b" Rust!").unwrap();
+        assert_eq!(written, 6);
+
+        // Read back the full file. Length should be max(old_len, offset+new_len).
+        // "Hello, World!" is 13 bytes, offset 5 + 6 = 11, so file is still 13.
+        let data = fs.read(ino, 0, 1024).unwrap();
+        assert_eq!(data, b"Hello Rust!d!");
+
+        // Write beyond end of file — extends the file.
+        let written = fs.write(ino, 15, b"XY").unwrap();
+        assert_eq!(written, 2);
+
+        let data = fs.read(ino, 0, 1024).unwrap();
+        // Bytes 13..15 should be zero-filled.
+        assert_eq!(data.len(), 17);
+        assert_eq!(&data[13..15], &[0, 0]);
+        assert_eq!(&data[15..17], b"XY");
     }
 }

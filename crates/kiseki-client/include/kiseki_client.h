@@ -24,7 +24,22 @@ typedef enum {
     KISEKI_IO_ERROR        = 3,
     KISEKI_INVALID_ARG     = 4,
     KISEKI_NOT_CONNECTED   = 5,
+    KISEKI_TIMED_OUT       = 6,
 } KisekiStatus;
+
+/* Cache statistics. */
+typedef struct {
+    uint64_t l1_hits;
+    uint64_t l2_hits;
+    uint64_t misses;
+    uint64_t bypasses;
+    uint64_t errors;
+    uint64_t l1_bytes;
+    uint64_t l2_bytes;
+    uint64_t meta_hits;
+    uint64_t meta_misses;
+    uint64_t wipes;
+} KisekiCacheStats;
 
 /* Open a connection to a Kiseki cluster.
  * seed_addr: "host:port" of a seed node (null-terminated).
@@ -56,6 +71,21 @@ KisekiStatus kiseki_write(KisekiHandle *handle, const char *path,
  * size_out: object size in bytes (output). */
 KisekiStatus kiseki_stat(KisekiHandle *handle, const char *path,
                          uint64_t *size_out);
+
+/* Stage a dataset into the local cache.
+ * path: namespace path (null-terminated).
+ * timeout_secs: maximum seconds to wait for staging to complete. */
+KisekiStatus kiseki_stage(KisekiHandle *handle, const char *path,
+                          uint32_t timeout_secs);
+
+/* Release a previously staged dataset.
+ * path: namespace path (null-terminated). */
+KisekiStatus kiseki_release(KisekiHandle *handle, const char *path);
+
+/* Get current cache statistics.
+ * stats_out: pointer to a KisekiCacheStats struct (output). */
+KisekiStatus kiseki_cache_stats(KisekiHandle *handle,
+                                KisekiCacheStats *stats_out);
 
 #ifdef __cplusplus
 } /* extern "C" */
@@ -116,6 +146,23 @@ public:
         KisekiStatus s = kiseki_stat(handle_, path.c_str(), &size);
         if (s != KISEKI_OK) throw ClientError(s, "kiseki_stat failed");
         return size;
+    }
+
+    void stage(const std::string &path, uint32_t timeout_secs = 300) {
+        KisekiStatus s = kiseki_stage(handle_, path.c_str(), timeout_secs);
+        if (s != KISEKI_OK) throw ClientError(s, "kiseki_stage failed");
+    }
+
+    void release(const std::string &path) {
+        KisekiStatus s = kiseki_release(handle_, path.c_str());
+        if (s != KISEKI_OK) throw ClientError(s, "kiseki_release failed");
+    }
+
+    KisekiCacheStats cache_stats() {
+        KisekiCacheStats stats = {};
+        KisekiStatus s = kiseki_cache_stats(handle_, &stats);
+        if (s != KISEKI_OK) throw ClientError(s, "kiseki_cache_stats failed");
+        return stats;
     }
 };
 

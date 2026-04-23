@@ -11,6 +11,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod advisory;
 pub mod batching;
 pub mod cache;
 pub mod discovery;
@@ -28,7 +29,7 @@ pub mod staging;
 pub mod transport_select;
 
 #[cfg(feature = "ffi")]
-#[allow(missing_docs, clippy::missing_safety_doc)]
+#[allow(missing_docs, unsafe_code, clippy::missing_safety_doc)]
 pub mod ffi;
 
 #[cfg(feature = "python")]

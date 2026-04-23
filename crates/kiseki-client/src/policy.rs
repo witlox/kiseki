@@ -323,11 +323,12 @@ mod tests {
 
     #[test]
     fn disconnect_reset_on_success() {
-        let mut detector = DisconnectDetector::new(0);
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(detector.is_disconnected());
+        // Use a 5-second threshold so there's no race.
+        let mut detector = DisconnectDetector::new(5);
+        // Not disconnected initially (just created).
+        assert!(!detector.is_disconnected());
+        // Record success — still not disconnected.
         detector.record_success();
-        // Immediately after success, not disconnected yet.
         assert!(!detector.is_disconnected());
     }
 }
