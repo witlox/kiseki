@@ -94,7 +94,7 @@ async fn fragment_node_table(State(state): State<UiState>) -> Html<String> {
         };
         let _ = write!(
             html,
-            "<tr><td>{}</td><td>{badge}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr data-addr=\"{0}\"><td>{0}</td><td>{badge}</td><td>{1}</td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td></tr>",
             node.address,
             format_number(node.summary.raft_entries),
             format_number(node.summary.gateway_requests),

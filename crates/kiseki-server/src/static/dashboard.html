@@ -11,17 +11,23 @@
             --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
             --text: #e1e4ed; --text-dim: #8b8fa3;
             --accent: #6366f1; --green: #22c55e; --yellow: #eab308; --red: #ef4444;
+            --blue: #3b82f6;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: var(--bg); color: var(--text); min-height: 100vh; }
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
         header { display: flex; align-items: center; gap: 16px; padding: 16px 32px; background: var(--surface); border-bottom: 1px solid var(--border); }
         header img { height: 36px; filter: brightness(0) invert(1); }
         header h1 { font-size: 20px; font-weight: 600; }
-        header .subtitle { color: var(--text-dim); font-size: 13px; margin-left: auto; font-family: monospace; }
+        header nav { display: flex; gap: 16px; margin-left: 32px; }
+        header nav a { color: var(--text-dim); font-size: 13px; padding: 4px 12px; border-radius: 6px; transition: all 0.2s; }
+        header nav a:hover, header nav a.active { color: var(--text); background: var(--bg); text-decoration: none; }
+        header .clock { color: var(--text-dim); font-size: 13px; margin-left: auto; font-family: monospace; }
         main { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
         .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 32px; }
-        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; transition: border-color 0.3s; }
-        .card:hover { border-color: var(--accent); }
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; cursor: pointer; transition: all 0.2s; }
+        .card:hover { border-color: var(--accent); transform: translateY(-1px); }
         .card h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 8px; }
         .card .big-number { font-size: 28px; font-weight: 700; font-family: monospace; }
         .card .label { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
@@ -34,50 +40,131 @@
         th, td { padding: 10px 16px; text-align: left; border-bottom: 1px solid var(--border); }
         th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); background: var(--bg); }
         td { font-size: 13px; font-family: monospace; }
+        tr:hover td { background: rgba(99,102,241,0.05); }
         .badge { padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
         .badge.healthy { background: rgba(34,197,94,0.15); color: var(--green); }
         .badge.down { background: rgba(239,68,68,0.15); color: var(--red); }
         .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
         .chart-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
         .chart-box h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 12px; }
-        canvas { max-height: 250px; }
+        canvas { max-height: 220px; }
+        /* Detail panel */
+        .detail-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 24px; display: none; }
+        .detail-panel.visible { display: block; }
+        .detail-panel h2 { font-size: 16px; margin-bottom: 16px; display: flex; align-items: center; gap: 12px; }
+        .detail-panel .close { cursor: pointer; color: var(--text-dim); font-size: 18px; margin-left: auto; }
+        .detail-panel .close:hover { color: var(--text); }
+        .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+        .detail-stat { padding: 12px; background: var(--bg); border-radius: 6px; }
+        .detail-stat .value { font-size: 20px; font-weight: 700; font-family: monospace; }
+        .detail-stat .key { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+        /* Operations */
+        .ops-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+        .ops-btn { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; cursor: pointer; transition: all 0.2s; color: var(--text); font-size: 13px; text-align: left; }
+        .ops-btn:hover { border-color: var(--accent); }
+        .ops-btn h4 { font-size: 12px; color: var(--accent); margin-bottom: 4px; }
+        .ops-btn p { font-size: 11px; color: var(--text-dim); }
         footer { text-align: center; padding: 24px; color: var(--text-dim); font-size: 11px; }
         @media (max-width: 768px) { .charts { grid-template-columns: 1fr; } main { padding: 16px; } }
     </style>
 </head>
 <body>
     <header>
-        <img src="/ui/logo" alt="K" onerror="this.textContent='K'; this.style.fontSize='28px'; this.style.fontWeight='800'; this.style.color='#6366f1';">
+        <img src="/ui/logo" alt="K" onerror="this.textContent='K';this.style.cssText='font-size:28px;font-weight:800;color:#6366f1;';">
         <h1>Kiseki</h1>
-        <span class="subtitle" id="clock"></span>
+        <nav>
+            <a href="#" class="active" onclick="showTab('overview')">Overview</a>
+            <a href="#" onclick="showTab('nodes')">Nodes</a>
+            <a href="#" onclick="showTab('performance')">Performance</a>
+            <a href="#" onclick="showTab('operations')">Operations</a>
+        </nav>
+        <span class="clock" id="clock"></span>
     </header>
     <main>
-        <div class="cards"
-             hx-get="/ui/fragment/cluster-cards"
-             hx-trigger="load, every 5s"
-             hx-swap="innerHTML">
-            <div class="card"><div class="big-number" style="color:var(--text-dim)">Loading...</div></div>
+        <!-- Node detail panel (hidden by default) -->
+        <div class="detail-panel" id="nodeDetail">
+            <h2><span id="detailNodeName"></span> <span class="close" onclick="closeDetail()">&times;</span></h2>
+            <div class="detail-grid" id="detailStats"></div>
+            <div class="chart-box"><h3>Node Metrics (5 min)</h3><canvas id="detailChart"></canvas></div>
         </div>
 
-        <div class="section">
-            <h2>Nodes</h2>
-            <div hx-get="/ui/fragment/node-table"
+        <!-- Overview tab -->
+        <div id="tab-overview">
+            <div class="cards"
+                 hx-get="/ui/fragment/cluster-cards"
                  hx-trigger="load, every 5s"
                  hx-swap="innerHTML">
-                <p style="color:var(--text-dim);padding:16px;">Loading nodes...</p>
+                <div class="card"><div class="big-number" style="color:var(--text-dim)">Loading...</div></div>
+            </div>
+            <div class="section">
+                <h2>Nodes</h2>
+                <div hx-get="/ui/fragment/node-table"
+                     hx-trigger="load, every 5s"
+                     hx-swap="innerHTML"
+                     id="nodeTableContainer">
+                    <p style="color:var(--text-dim);padding:16px;">Loading nodes...</p>
+                </div>
             </div>
         </div>
 
-        <div class="section">
-            <h2>Performance</h2>
-            <div class="charts">
-                <div class="chart-box">
-                    <h3>Data Volume per Node</h3>
-                    <canvas id="dataChart"></canvas>
+        <!-- Nodes tab -->
+        <div id="tab-nodes" style="display:none">
+            <div class="section">
+                <h2>All Nodes</h2>
+                <div hx-get="/ui/fragment/node-table"
+                     hx-trigger="load, every 5s"
+                     hx-swap="innerHTML">
                 </div>
-                <div class="chart-box">
-                    <h3>Gateway Requests per Node</h3>
-                    <canvas id="requestChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Performance tab -->
+        <div id="tab-performance" style="display:none">
+            <div class="section">
+                <h2>Cluster Throughput (5 min rolling)</h2>
+                <div class="charts">
+                    <div class="chart-box"><h3>Data Volume (bytes/5s)</h3><canvas id="throughputChart"></canvas></div>
+                    <div class="chart-box"><h3>Gateway Requests (/5s)</h3><canvas id="requestChart"></canvas></div>
+                </div>
+            </div>
+            <div class="section" style="margin-top:24px">
+                <h2>Per-Node Snapshot</h2>
+                <div class="charts">
+                    <div class="chart-box"><h3>Data Written per Node</h3><canvas id="nodeWriteChart"></canvas></div>
+                    <div class="chart-box"><h3>Raft Entries per Node</h3><canvas id="nodeRaftChart"></canvas></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Operations tab -->
+        <div id="tab-operations" style="display:none">
+            <div class="section">
+                <h2>Cluster Operations</h2>
+                <div class="ops-grid">
+                    <button class="ops-btn" onclick="alert('Maintenance mode toggle — wire to gRPC SetMaintenanceMode')">
+                        <h4>Maintenance Mode</h4>
+                        <p>Enable/disable cluster-wide read-only mode</p>
+                    </button>
+                    <button class="ops-btn" onclick="alert('Backup — wire to BackupManager.create_snapshot()')">
+                        <h4>Create Backup</h4>
+                        <p>Snapshot cluster state for disaster recovery</p>
+                    </button>
+                    <button class="ops-btn" onclick="alert('Key rotation — wire to rotation_monitor.rotate()')">
+                        <h4>Rotate Keys</h4>
+                        <p>Trigger system key epoch rotation</p>
+                    </button>
+                    <button class="ops-btn" onclick="alert('Scrub — wire to scrub_engine.run_scrub()')">
+                        <h4>Run Scrub</h4>
+                        <p>Verify bitmap consistency and CRC integrity</p>
+                    </button>
+                    <button class="ops-btn" onclick="alert('Rebalance — wire to rebalance.compute_plan()')">
+                        <h4>Rebalance Pools</h4>
+                        <p>Redistribute chunks across pool devices</p>
+                    </button>
+                    <button class="ops-btn" onclick="window.open('/metrics','_blank')">
+                        <h4>Prometheus Metrics</h4>
+                        <p>View raw /metrics endpoint</p>
+                    </button>
                 </div>
             </div>
         </div>
@@ -85,54 +172,167 @@
     <footer>Kiseki Distributed Storage System</footer>
 
     <script>
-        // Clock
-        function updateClock() {
-            document.getElementById('clock').textContent = new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
-        }
-        updateClock(); setInterval(updateClock, 1000);
+    // --- Tab navigation ---
+    function showTab(name) {
+        document.querySelectorAll('[id^="tab-"]').forEach(t => t.style.display = 'none');
+        document.getElementById('tab-' + name).style.display = 'block';
+        document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
+        event.target.classList.add('active');
+    }
 
-        // Chart config
-        Chart.defaults.color = '#8b8fa3';
-        const chartOpts = {
-            responsive: true,
-            plugins: { legend: { labels: { color: '#8b8fa3', font: { size: 11 } } } },
-            scales: {
-                x: { ticks: { color: '#8b8fa3', font: { size: 10 } }, grid: { color: '#2a2d3a' } },
-                y: { ticks: { color: '#8b8fa3', font: { size: 10 } }, grid: { color: '#2a2d3a' } },
-            },
-        };
+    // --- Clock ---
+    function updateClock() { document.getElementById('clock').textContent = new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC'; }
+    updateClock(); setInterval(updateClock, 1000);
 
-        let dataChart = new Chart(document.getElementById('dataChart'), {
-            type: 'bar',
-            data: { labels: [], datasets: [
-                { label: 'Written', data: [], backgroundColor: 'rgba(99,102,241,0.7)', borderRadius: 4 },
-                { label: 'Read', data: [], backgroundColor: 'rgba(34,197,94,0.7)', borderRadius: 4 },
-            ]},
-            options: chartOpts,
+    // --- Time-series history (rolling 60 samples = 5 min at 5s intervals) ---
+    const MAX_HISTORY = 60;
+    const history = { labels: [], writes: [], reads: [], requests: [], raft: [] };
+    let prevData = { writes: 0, reads: 0, requests: 0, raft: 0 };
+
+    // --- Charts ---
+    Chart.defaults.color = '#8b8fa3';
+    const gridColor = '#2a2d3a';
+    const commonOpts = {
+        responsive: true,
+        animation: { duration: 300 },
+        plugins: { legend: { labels: { color: '#8b8fa3', font: { size: 10 } } } },
+        scales: {
+            x: { ticks: { color: '#8b8fa3', font: { size: 9 }, maxTicksLimit: 10 }, grid: { color: gridColor } },
+            y: { beginAtZero: true, ticks: { color: '#8b8fa3', font: { size: 10 } }, grid: { color: gridColor } },
+        },
+    };
+
+    const throughputChart = new Chart(document.getElementById('throughputChart'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: 'Written', data: [], borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+            { label: 'Read', data: [], borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+        ]},
+        options: { ...commonOpts, scales: { ...commonOpts.scales, y: { ...commonOpts.scales.y, ticks: { ...commonOpts.scales.y.ticks, callback: formatBytes } } } },
+    });
+
+    const requestChart = new Chart(document.getElementById('requestChart'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: 'Requests', data: [], borderColor: '#eab308', backgroundColor: 'rgba(234,179,8,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+        ]},
+        options: commonOpts,
+    });
+
+    const nodeWriteChart = new Chart(document.getElementById('nodeWriteChart'), {
+        type: 'bar',
+        data: { labels: [], datasets: [
+            { label: 'Written', data: [], backgroundColor: 'rgba(99,102,241,0.7)', borderRadius: 4 },
+            { label: 'Read', data: [], backgroundColor: 'rgba(34,197,94,0.7)', borderRadius: 4 },
+        ]},
+        options: commonOpts,
+    });
+
+    const nodeRaftChart = new Chart(document.getElementById('nodeRaftChart'), {
+        type: 'bar',
+        data: { labels: [], datasets: [
+            { label: 'Raft Entries', data: [], backgroundColor: 'rgba(59,130,246,0.7)', borderRadius: 4 },
+        ]},
+        options: commonOpts,
+    });
+
+    // Detail chart (per-node)
+    let detailChart = null;
+    const detailHistory = { labels: [], writes: [], reads: [] };
+
+    async function updateCharts() {
+        try {
+            const r = await fetch('/ui/api/cluster');
+            const cluster = await r.json();
+
+            // Time label
+            const now = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+            // Compute deltas for time series
+            const dw = Math.max(0, cluster.aggregate.chunk_write_bytes - prevData.writes);
+            const dr = Math.max(0, cluster.aggregate.chunk_read_bytes - prevData.reads);
+            const dq = Math.max(0, cluster.aggregate.gateway_requests - prevData.requests);
+            prevData = { writes: cluster.aggregate.chunk_write_bytes, reads: cluster.aggregate.chunk_read_bytes, requests: cluster.aggregate.gateway_requests };
+
+            // Push to history
+            history.labels.push(now);
+            history.writes.push(dw);
+            history.reads.push(dr);
+            history.requests.push(dq);
+            if (history.labels.length > MAX_HISTORY) {
+                history.labels.shift(); history.writes.shift(); history.reads.shift(); history.requests.shift();
+            }
+
+            // Update time-series charts
+            throughputChart.data.labels = [...history.labels];
+            throughputChart.data.datasets[0].data = [...history.writes];
+            throughputChart.data.datasets[1].data = [...history.reads];
+            throughputChart.update();
+
+            requestChart.data.labels = [...history.labels];
+            requestChart.data.datasets[0].data = [...history.requests];
+            requestChart.update();
+
+            // Per-node bar charts
+            const nr = await fetch('/ui/api/nodes');
+            const nodes = await nr.json();
+            const labels = nodes.map(n => n.address.split(':')[0]);
+            nodeWriteChart.data.labels = labels;
+            nodeWriteChart.data.datasets[0].data = nodes.map(n => n.summary.chunk_write_bytes);
+            nodeWriteChart.data.datasets[1].data = nodes.map(n => n.summary.chunk_read_bytes);
+            nodeWriteChart.update();
+            nodeRaftChart.data.labels = labels;
+            nodeRaftChart.data.datasets[0].data = nodes.map(n => n.summary.raft_entries);
+            nodeRaftChart.update();
+
+            // Store nodes globally for detail view
+            window._nodes = nodes;
+        } catch(e) {}
+    }
+    updateCharts(); setInterval(updateCharts, 5000);
+
+    // --- Node detail drill-down ---
+    function showNodeDetail(addr) {
+        const node = (window._nodes || []).find(n => n.address === addr);
+        if (!node) return;
+        document.getElementById('detailNodeName').textContent = addr;
+        document.getElementById('detailStats').innerHTML = `
+            <div class="detail-stat"><div class="value">${node.healthy ? '&#10003; Healthy' : '&#10007; Down'}</div><div class="key">Status</div></div>
+            <div class="detail-stat"><div class="value">${fmtNum(node.summary.raft_entries)}</div><div class="key">Raft Entries</div></div>
+            <div class="detail-stat"><div class="value">${fmtNum(node.summary.gateway_requests)}</div><div class="key">Gateway Requests</div></div>
+            <div class="detail-stat"><div class="value">${formatBytes(node.summary.chunk_write_bytes)}</div><div class="key">Written</div></div>
+            <div class="detail-stat"><div class="value">${formatBytes(node.summary.chunk_read_bytes)}</div><div class="key">Read</div></div>
+            <div class="detail-stat"><div class="value">${node.summary.transport_connections}</div><div class="key">Connections</div></div>
+        `;
+        document.getElementById('nodeDetail').classList.add('visible');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function closeDetail() {
+        document.getElementById('nodeDetail').classList.remove('visible');
+    }
+
+    // Make node table rows clickable (delegate via htmx:afterSettle)
+    document.addEventListener('htmx:afterSettle', function() {
+        document.querySelectorAll('#nodeTableContainer tr[data-addr], #tab-nodes tr[data-addr]').forEach(row => {
+            row.style.cursor = 'pointer';
+            row.onclick = () => showNodeDetail(row.dataset.addr);
         });
+    });
 
-        let requestChart = new Chart(document.getElementById('requestChart'), {
-            type: 'bar',
-            data: { labels: [], datasets: [
-                { label: 'Requests', data: [], backgroundColor: 'rgba(234,179,8,0.7)', borderRadius: 4 },
-            ]},
-            options: chartOpts,
-        });
-
-        async function updateCharts() {
-            try {
-                const r = await fetch('/ui/fragment/chart-data');
-                const d = await r.json();
-                dataChart.data.labels = d.labels;
-                dataChart.data.datasets[0].data = d.writes;
-                dataChart.data.datasets[1].data = d.reads;
-                dataChart.update();
-                requestChart.data.labels = d.labels;
-                requestChart.data.datasets[0].data = d.requests;
-                requestChart.update();
-            } catch(e) {}
-        }
-        updateCharts(); setInterval(updateCharts, 5000);
+    // --- Helpers ---
+    function formatBytes(b) {
+        if (!b || b === 0) return '0 B';
+        const k = 1024, s = ['B','KB','MB','GB','TB'];
+        const i = Math.floor(Math.log(b) / Math.log(k));
+        return parseFloat((b / Math.pow(k, i)).toFixed(1)) + ' ' + s[i];
+    }
+    function fmtNum(n) {
+        if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
+        if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+        if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+        return n.toString();
+    }
     </script>
 </body>
 </html>
