@@ -1,7 +1,7 @@
 # Invariants — Kiseki
 
-**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers), ADR-029 (Raw Block Device Allocator), and ADR-030 (Dynamic Small-File Placement).
-**Last updated**: 2026-04-22.
+**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers), ADR-029 (Raw Block Device Allocator), ADR-030 (Dynamic Small-File Placement), and ADR-031 (Client-Side Cache).
+**Last updated**: 2026-04-23.
 
 All invariants below have been confirmed through interrogation with the
 domain expert unless marked otherwise.
@@ -237,6 +237,25 @@ domain expert unless marked otherwise.
 | I-SF5 | Inline content is carried in Raft log entries and offloaded to `small/objects.redb` on state machine apply. Snapshots include inline content read from redb. No inline content is held in the in-memory state machine after apply. This ensures snapshot transfer to learners/restarted nodes includes all inline data. | Confirmed |
 | I-SF6 | GC (`truncate_log`, `compact_shard`) must delete corresponding entries from `small/objects.redb` when removing deltas that reference inline objects. Orphan redb entries are a capacity leak. Periodic scrub detects orphans. | Confirmed |
 | I-SF7 | Per-shard Raft inline throughput must not exceed `KISEKI_RAFT_INLINE_MBPS` (default 10 MB/s). When exceeded, effective inline threshold drops to `INLINE_FLOOR` until rate subsides. Prevents inline data from starving metadata-only Raft operations during write storms. | Confirmed |
+
+---
+
+## Client-side cache invariants (ADR-031)
+
+| ID | Invariant | Status |
+|---|---|---|
+| I-CC1 | A chunk in pinned or organic mode is served from cache if and only if (a) the chunk was fetched from canonical and verified by chunk_id content-address match (SHA-256) at fetch time, and (b) no crypto-shred event has been detected for that tenant since fetch. Chunks are immutable in canonical (I-C1); therefore a verified chunk remains correct indefinitely absent crypto-shred. | Confirmed |
+| I-CC2 | Cached plaintext is overwritten with zeros (zeroize) before deallocation, eviction, or cache wipe. File-level: overwrite contents before unlink. Memory-level: `Zeroizing<Vec<u8>>` for L1 entries. This provides logical-level erasure; physical-level erasure on flash storage requires hardware encryption (OPAL/SED). | Confirmed |
+| I-CC3 | File→chunk_list metadata mappings are served from cache only within the configured TTL (default 5s). After TTL expiry, the mapping must be re-fetched from canonical. Within the TTL window, the cached mapping is authoritative: it may serve data for files that have since been modified or deleted in canonical. This is the sole freshness window in the cache design — chunk data itself has no TTL. | Confirmed |
+| I-CC5 | Metadata TTL is the upper bound on read staleness. A file modified or deleted in canonical is visible to a caching client within at most one metadata TTL period (default 5s). | Confirmed |
+| I-CC6 | Cached entries remain authoritative across fabric disconnects shorter than `max_disconnect_seconds` (default 300s). Beyond this threshold, the entire cache (L1 + L2) is wiped. Disconnect defined as: no successful RPC to any canonical endpoint for the threshold duration. Background heartbeat RPCs (every 60s) maintain the `last_successful_rpc` timestamp. | Confirmed |
+| I-CC7 | Any local cache error (L2 I/O failure, CRC32 mismatch, metadata lookup failure) bypasses to canonical unconditionally. The cache never serves data it cannot verify. | Confirmed |
+| I-CC8 | The cache is ephemeral. On process start, the client either creates a new L2 pool (wiping orphaned pools detected via flock) or adopts an existing pool via `KISEKI_CACHE_POOL_ID`. A `kiseki-cache-scrub` service runs on node boot and periodically to clean orphaned pools from crashed processes. | Confirmed |
+| I-CC9 | When effective cache policy is unreachable at session start, the client operates with conservative defaults (cache enabled, organic mode, 10 GB ceiling, 5s metadata TTL). Policy is fetched via data-path gRPC (primary), gateway (secondary), persisted last-known (tertiary), or conservative defaults (fallback). | Confirmed |
+| I-CC10 | Cache policy changes apply to new sessions only. Active sessions continue under session-start policy (consistent with I-WA18). | Confirmed |
+| I-CC11 | Staged chunks are fetched from canonical, verified by content-address, and stored with pinned retention as a point-in-time snapshot. The staged version is immutable in the cache regardless of canonical updates. To pick up updates, the user must explicitly release and re-stage. Staging enumerates directory trees recursively up to `max_staging_depth` (10) and `max_staging_files` (100,000). | Confirmed |
+| I-CC12 | On crypto-shred event, all cached plaintext for the affected tenant is wiped from L1 and L2 with zeroize. Detection via periodic key health check (default 30s), advisory channel notification, or KMS error on next operation. Maximum detection latency bounded by `min(key_health_interval, max_disconnect_seconds)`. | Confirmed |
+| I-CC13 | L2 cache entries are protected by a CRC32 checksum computed at insert time and stored as a 4-byte trailer. On L2 read, the CRC32 is verified before serving. Mismatch triggers bypass to canonical and L2 entry deletion. | Confirmed |
 
 ---
 

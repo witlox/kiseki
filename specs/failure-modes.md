@@ -369,14 +369,62 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 
 ---
 
+## Client-side cache failures (ADR-031)
+
+### F-CC1: Client crash leaves plaintext on NVMe
+
+| Field | Value |
+|---|---|
+| **Description** | Client process crash (SIGKILL, OOM kill, kernel panic) skips the clean exit wipe path. Decrypted plaintext chunk files remain on local NVMe in the L2 cache pool directory. |
+| **Blast radius** | Single compute node, single tenant's cached data. Plaintext is file-permission protected (0600) but not zeroized. |
+| **Detection** | Next kiseki process start: orphan scavenger detects pool with no live flock holder. `kiseki-cache-scrub` service detects orphaned pools on node boot and every 60s. |
+| **Degradation** | Plaintext persists until scavenger or scrub service runs. No data-path impact — canonical data unaffected. |
+| **Recovery** | Scavenger or scrub service wipes orphaned pool (zeroize + delete). For stronger guarantees, use OPAL/SED NVMe with per-boot key rotation. |
+| **Severity** | **P3** |
+
+### F-CC2: L2 NVMe corruption serves bad data
+
+| Field | Value |
+|---|---|
+| **Description** | Bit-flip or filesystem error corrupts an L2 chunk file. Client serves corrupted plaintext. |
+| **Blast radius** | Single client process, single chunk read. |
+| **Detection** | CRC32 trailer verification on every L2 read (I-CC13). |
+| **Degradation** | CRC mismatch → bypass to canonical, delete corrupt L2 entry (I-CC7). Transparent to caller. |
+| **Recovery** | Automatic: chunk re-fetched from canonical on next access. |
+| **Severity** | **P3** |
+
+### F-CC3: Crypto-shred with cached plaintext
+
+| Field | Value |
+|---|---|
+| **Description** | Tenant admin destroys KEK (crypto-shred) while clients have decrypted plaintext in cache. Cached data must be wiped but detection is not instantaneous. |
+| **Blast radius** | All client processes for the shredded tenant on all compute nodes. |
+| **Detection** | Periodic key health check (default 30s), advisory channel notification, or KMS error on next operation. Unreachability falls through to disconnect timer wipe (I-CC6). |
+| **Degradation** | Cached plaintext may be served for up to `min(key_health_interval, max_disconnect_seconds)` after the shred event (default 30s). After detection: immediate wipe with zeroize. |
+| **Recovery** | Automatic: cache wiped on detection. No recovery action needed — data is intentionally destroyed. |
+| **Severity** | **P1** (tenant-wide, time-bounded: max 30s default exposure window) |
+
+### F-CC4: Staging exhausts compute-node NVMe
+
+| Field | Value |
+|---|---|
+| **Description** | Multiple concurrent staging requests from Slurm prolog fill the compute-node NVMe hosting `$KISEKI_CACHE_DIR`, impacting other applications using local scratch. |
+| **Blast radius** | Single compute node, all processes using local NVMe (not just Kiseki). |
+| **Detection** | Per-node capacity check (`max_node_cache_bytes`, default 80% of filesystem). Disk-pressure backstop at 90% utilization. |
+| **Degradation** | Staging rejected with `CacheCapacityExceeded` when node limit reached. Existing cached data remains servable. Other applications' NVMe use is protected by the 80%/90% limits. |
+| **Recovery** | Release staged datasets (`kiseki-client stage --release`). Reduce `max_cache_bytes` per process or `max_node_cache_bytes` per node via policy. |
+| **Severity** | **P3** |
+
+---
+
 ## Failure severity summary
 
 | Severity | Count | Examples |
 |---|---|---|
 | P0 | 2 | System key manager loss, system KEK compromise |
-| P1 | 6 | Tenant KMS loss, log corruption, key compromise, algo deprecation, control plane down, network partition (wide) |
+| P1 | 7 | Tenant KMS loss, log corruption, key compromise, algo deprecation, control plane down, network partition (wide), crypto-shred with cached plaintext (F-CC3) |
 | P2 | 9 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm |
-| P3 | 7 | Gateway crash, client crash, device failure, split latency, replay attack, bitmap corruption, extent leak |
+| P3 | 10 | Gateway crash, client crash, device failure, split latency, replay attack, bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4) |
 
-Total: **24 failure modes** catalogued with blast radius, detection,
+Total: **28 failure modes** catalogued with blast radius, detection,
 degradation, and recovery.

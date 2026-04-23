@@ -243,3 +243,135 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     Then the call returns ADVISORY_DISABLED
     And the client falls back to pattern-inference for access-pattern heuristics
     And FUSE reads and writes are fully correct and at normal performance (I-WA12)
+
+  # =====================================================================
+  # Client-side cache (ADR-031)
+  # =====================================================================
+
+  Scenario: L1 cache hit avoids fabric round-trip
+    Given a client with cache_mode "organic" and a warm cache
+    And chunk "abc123" is in the L1 cache
+    When the client reads chunk "abc123"
+    Then the chunk is served from L1 without a fabric RPC
+    And cache_l1_hits counter increments
+
+  Scenario: L2 cache hit avoids fabric round-trip and decryption
+    Given a client with cache_mode "organic" and chunk "abc123" in L2
+    When the client reads chunk "abc123"
+    Then the chunk is read from local NVMe
+    And the CRC32 trailer is verified before serving (I-CC13)
+    And cache_l2_hits counter increments
+
+  Scenario: Cache miss fetches from canonical and populates L1+L2
+    Given a client with cache_mode "organic" and an empty cache
+    When the client reads chunk "abc123" from canonical
+    Then the chunk is decrypted and verified by content-address (SHA-256)
+    And the plaintext is stored in L1 and L2 with CRC32 trailer
+    And cache_misses counter increments
+
+  Scenario: L2 CRC32 mismatch bypasses to canonical
+    Given a client with cache_mode "organic" and a corrupted L2 entry for chunk "abc123"
+    When the client reads chunk "abc123"
+    Then the CRC32 check fails
+    And the read bypasses to canonical (I-CC7)
+    And the corrupt L2 entry is deleted
+    And cache_errors counter increments
+
+  Scenario: Metadata TTL expiry triggers re-fetch
+    Given a client with cache_mode "organic" and metadata_ttl_ms 5000
+    And file "/data/file.txt" metadata was cached 6 seconds ago
+    When the client reads "/data/file.txt"
+    Then the metadata mapping is re-fetched from canonical before serving chunks
+    And cache_meta_misses counter increments
+
+  Scenario: Metadata cache serves deleted file within TTL window
+    Given a client with cache_mode "organic" and metadata_ttl_ms 5000
+    And file "/data/file.txt" metadata was cached 2 seconds ago
+    And file "/data/file.txt" was deleted in canonical 1 second ago
+    When the client reads "/data/file.txt"
+    Then the file's data is served from cache (I-CC3 — within TTL, accepted staleness)
+    And cache_meta_hits counter increments
+
+  Scenario: Write-through updates local metadata cache
+    Given a client with cache_mode "organic"
+    When the client writes "/data/new_file.txt"
+    Then the metadata cache is updated immediately with the new chunk list
+    And a subsequent read of "/data/new_file.txt" serves the written data (read-your-writes)
+
+  Scenario: Bypass mode reads directly from canonical
+    Given a client with cache_mode "bypass"
+    When the client reads any file
+    Then the read goes directly to canonical
+    And no L1 or L2 entries are created
+    And cache_bypasses counter increments
+
+  Scenario: Pinned mode stages a dataset
+    Given a client with cache_mode "pinned" and staging_enabled true
+    When the client runs "kiseki-client stage --dataset /training/imagenet"
+    Then all compositions under "/training/imagenet" are enumerated recursively
+    And each chunk is fetched from canonical, verified (SHA-256), and stored in L2
+    And a staging manifest is written listing all compositions and chunk_ids
+    And staged chunks are retained against LRU eviction
+
+  Scenario: Staging handoff from prolog to workload
+    Given a staging daemon has populated an L2 pool with pool_id "abc"
+    And the staging daemon holds the pool.lock flock
+    When a workload process starts with KISEKI_CACHE_POOL_ID="abc"
+    Then the workload adopts the existing pool instead of creating a new one
+    And the workload takes over the flock
+    And the staging daemon exits cleanly
+
+  Scenario: Staging beyond capacity returns error
+    Given a client with cache_mode "pinned" and max_cache_bytes 10GB
+    And 9GB is already staged
+    When the client stages a 5GB dataset
+    Then the staging returns CacheCapacityExceeded
+    And no existing pinned data is evicted
+
+  Scenario: Process crash leaves orphaned L2 pool
+    Given a client process has cached plaintext in L2
+    When the process is killed (SIGKILL)
+    Then L2 chunk files remain on NVMe (no zeroize opportunity)
+    And the pool.lock flock is released by the kernel
+    And the next kiseki process on that node detects the orphaned pool via flock
+    And the orphaned pool is wiped (zeroize + delete)
+
+  Scenario: kiseki-cache-scrub cleans orphaned pools on boot
+    Given a compute node reboots after a client crash
+    And orphaned L2 pool directories exist from the crashed process
+    When kiseki-cache-scrub runs on boot
+    Then all orphaned pools (no live flock holder) are wiped with zeroize
+
+  Scenario: Disconnect threshold triggers cache wipe
+    Given a client with max_disconnect_seconds 300 and a warm cache
+    When the fabric is unreachable for 301 seconds (no successful RPC)
+    Then the entire cache (L1 + L2) is wiped (I-CC6)
+    And cache_wipes counter increments
+    And on reconnect, the cache starts cold
+
+  Scenario: Crypto-shred triggers immediate cache wipe
+    Given a client with cached plaintext for tenant "org-A"
+    When the tenant admin destroys the KEK (crypto-shred)
+    And the periodic key health check detects KEK_DESTROYED
+    Then all cached plaintext for "org-A" is wiped from L1 and L2 with zeroize (I-CC12)
+    And cache_wipes counter increments
+
+  Scenario: Cache policy resolved via data-path gRPC
+    Given a compute node with no gateway or control plane access
+    And the client connects to a storage node via data-path gRPC
+    When the client establishes a session
+    Then cache policy is fetched via GetCachePolicy RPC on the data-path channel (I-CC9)
+    And the client operates within the policy ceilings
+
+  Scenario: Cache policy unreachable — conservative defaults
+    Given a compute node with no reachable storage nodes at session start
+    When the client establishes a session
+    Then cache operates with conservative defaults (organic, 10GB, 5s TTL) (I-CC9)
+    And data-path reads and writes proceed normally
+
+  Scenario: Per-node cache capacity enforcement
+    Given 5 concurrent client processes for the same tenant on one node
+    And max_node_cache_bytes is set to 200GB
+    When the 5th process attempts to insert into L2 and total usage exceeds 200GB
+    Then the insert is rejected
+    And organic mode triggers additional eviction before retrying

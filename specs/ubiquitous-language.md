@@ -118,6 +118,18 @@ not part of the domain language.
 | **Pool handle** | Opaque tenant-scoped reference to an affinity pool the workload is authorized to target via advisory hints. Minted by the advisory subsystem at `DeclareWorkflow` and returned to the caller as part of the workflow's `authorized pools` set. Never reveals the cluster-internal pool identity. Lifetime = the workflow's lifetime. | Workflow Advisory | Replaces any cluster-internal pool ID on the advisory path (I-WA11). A pool decommissioned during the workflow's life turns the handle into a `scope-not-found` on use. |
 | **Pool descriptor** | The record returned alongside a pool handle: `{handle, opaque_label}`. The label is a tenant-chosen string (e.g., "fast-nvme", "bulk-nvme") set at workload-authorization time. It is meaningful to the workload operator; it is not a cluster-internal identifier. | Workflow Advisory | Multiple tenants can see the same opaque label attached to different internal pools; correlation across tenants is impossible because handles differ. |
 
+## Client-side cache (ADR-031)
+
+| Term | Definition | Context | Notes |
+|---|---|---|---|
+| **Client cache** | Two-tier (L1 in-memory, L2 local NVMe) read-only cache of decrypted plaintext chunks in `kiseki-client`. Content-addressed by `ChunkId`. Ephemeral — wiped on process restart and long disconnect. | Native Client | Performance feature, not correctness mechanism. Three modes: pinned, organic, bypass. |
+| **Cache pool** | Per-process L2 directory on local NVMe, identified by a 128-bit CSPRNG `pool_id`. Isolated per process and per tenant. Ownership proven by `flock` on `pool.lock`. Orphaned pools (no live flock holder) are scavenged on startup or by `kiseki-cache-scrub`. | Native Client | No cross-process sharing. Concurrent same-tenant processes have independent pools. |
+| **Cache mode** | One of three operational modes per client instance: **pinned** (staging-driven, eviction-resistant, for declared datasets), **organic** (LRU with usage-weighted retention, default for mixed workloads), **bypass** (no caching, for streaming/checkpoint workloads). Selected at session establishment within admin-allowed set. | Native Client | Mode is per session, not per file. |
+| **Staging** | Client-local pull-based operation that pre-fetches a dataset's chunks from canonical into the L2 cache with pinned retention. Takes a namespace path, recursively enumerates compositions, fetches and verifies all chunks. Idempotent and resumable. | Native Client | Used by Slurm prolog, Lattice pre-dispatch, or manual invocation. Produces a manifest file listing staged compositions and chunk_ids. |
+| **Staging handoff** | Mechanism for transferring an L2 cache pool from a staging daemon process to a workload process. The staging daemon holds the `pool.lock` flock; the workload adopts the pool via `KISEKI_CACHE_POOL_ID` environment variable and takes over the flock. | Native Client | Enables staging in Slurm prolog (separate process) to survive into the workload process. |
+| **Metadata TTL** | Time-to-live for cached file→chunk_list mappings. The sole freshness window in the cache design. Within TTL, cached metadata is authoritative (may serve stale data for modified or deleted files). Default 5 seconds. | Native Client | Chunk data has no TTL — chunks are immutable (I-C1). |
+| **Key health check** | Periodic client-side probe of the tenant KMS (default every 30s) to detect crypto-shred events. Returns `KEK_DESTROYED` if the tenant KEK has been deleted, triggering immediate cache wipe. | Native Client / Key Management | Primary detection mechanism for crypto-shred. Bounded detection latency: `min(key_health_interval, max_disconnect_seconds)`. |
+
 ## Retired / rejected terms
 
 | Term | Replaced by | Reason |

@@ -303,3 +303,57 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And the tenant-chosen `opaque_label` is returned alongside each handle
     And the cluster-internal pool ID is never included in any response to the caller (I-WA11, I-WA19)
     And two workflows under the same workload receive distinct handles mapping to the same internal pool
+
+  # =====================================================================
+  # Client-side cache policy (ADR-031)
+  # =====================================================================
+
+  Scenario: Cluster admin sets default cache policy
+    Given a cluster admin
+    When they set cluster-wide cache policy:
+      | attribute          | value                        |
+      | cache_enabled      | true                         |
+      | allowed_modes      | pinned, organic, bypass      |
+      | max_cache_bytes     | 100GB                        |
+      | max_node_cache_bytes| 500GB                        |
+      | metadata_ttl_ms    | 5000                         |
+      | staging_enabled    | true                         |
+    Then all tenants inherit the cluster default cache policy
+    And native clients resolve this policy via data-path gRPC or gateway
+
+  Scenario: Org-level cache policy narrows cluster default
+    Given cluster allows cache modes {pinned, organic, bypass}
+    And org "research-lab" sets allowed_modes to {organic, bypass}
+    Then workloads under "research-lab" cannot use pinned mode
+    And a client requesting cache_mode "pinned" is clamped to "organic"
+
+  Scenario: Org cannot broaden cluster-level cache restrictions
+    Given cluster sets max_cache_bytes to 100GB
+    When org "research-lab" attempts to set max_cache_bytes to 200GB
+    Then the request is rejected with "exceeds_parent_ceiling"
+
+  Scenario: Tenant admin disables cache for a workload
+    Given org "pharma-co" has cache_enabled = true
+    When tenant admin sets cache_enabled = false for workload "compliance-job"
+    Then clients running as "compliance-job" operate with cache disabled (bypass)
+    And no plaintext is written to local NVMe for that workload
+
+  Scenario: Cache policy changes apply prospectively
+    Given a client session established with cache_mode "organic" and max_cache_bytes 50GB
+    And cluster admin changes max_cache_bytes to 20GB during the session
+    Then the active session continues with 50GB ceiling (I-CC10)
+    And new sessions start with 20GB ceiling
+
+  Scenario: Cache policy resolved during control plane outage
+    Given the Control Plane is unavailable
+    And a client connects to a storage node via data-path gRPC
+    When the client requests cache policy
+    Then the storage node returns last-known cached TenantConfig (stale tolerance)
+    And the client operates within the last-known policy
+
+  Scenario: First-ever session with no policy available
+    Given no TenantConfig has ever been fetched
+    And the Control Plane and all storage nodes are unreachable
+    When a client starts a session
+    Then the client uses conservative defaults: organic, 10GB, 5s TTL (I-CC9)
+    And data-path operations proceed normally
