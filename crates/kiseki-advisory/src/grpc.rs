@@ -5,7 +5,7 @@
 //! domain errors are returned inside the oneof, not as `tonic::Status`.
 
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use kiseki_common::advisory::{PhaseId, WorkflowRef, WorkloadProfile};
 use kiseki_proto::v1::{
@@ -84,7 +84,7 @@ fn proto_profile_to_domain(val: i32) -> Result<WorkloadProfile, Status> {
 /// gRPC handler for the Workflow Advisory service.
 pub struct AdvisoryGrpc {
     table: Mutex<WorkflowTable>,
-    budget: Mutex<BudgetEnforcer>,
+    budget: Arc<Mutex<BudgetEnforcer>>,
 }
 
 impl AdvisoryGrpc {
@@ -93,8 +93,62 @@ impl AdvisoryGrpc {
     pub fn new(budget_config: BudgetConfig) -> Self {
         Self {
             table: Mutex::new(WorkflowTable::new()),
-            budget: Mutex::new(BudgetEnforcer::new(budget_config)),
+            budget: Arc::new(Mutex::new(BudgetEnforcer::new(budget_config))),
         }
+    }
+}
+
+impl AdvisoryGrpc {
+    /// Process a single client message: check budget, extract `hint_id`, send ack.
+    async fn process_client_message(
+        msg: &AdvisoryClientMessage,
+        budget: &Arc<Mutex<BudgetEnforcer>>,
+        tx: &tokio::sync::mpsc::Sender<Result<AdvisoryServerMessage, Status>>,
+    ) {
+        use kiseki_proto::v1::advisory_client_message::Payload;
+        use kiseki_proto::v1::advisory_server_message::Payload as ServerPayload;
+        use kiseki_proto::v1::hint_ack;
+
+        // Extract hint_id for the ack (from Hint or PrefetchHint payloads).
+        let hint_id = match msg.payload {
+            Some(Payload::Hint(ref h)) => h.hint_id.clone(),
+            Some(Payload::Prefetch(ref p)) => p.hint_id.clone(),
+            Some(Payload::Heartbeat(_)) => {
+                // Heartbeat: no ack needed, just keep-alive.
+                tracing::trace!("advisory stream: heartbeat received");
+                return;
+            }
+            Some(Payload::CollectiveAnnouncement(ref c)) => c.hint_id.clone(),
+            None => Vec::new(),
+        };
+
+        // Budget check.
+        let outcome = {
+            let mut b = budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match b.try_hint() {
+                Ok(()) => {
+                    tracing::debug!("advisory hint accepted");
+                    hint_ack::Outcome::Accepted
+                }
+                Err(ref e) => {
+                    tracing::debug!(error = %e, "advisory hint throttled");
+                    hint_ack::Outcome::Throttled
+                }
+            }
+        };
+
+        // Send HintAck back (best-effort).
+        let ack = AdvisoryServerMessage {
+            payload: Some(ServerPayload::HintAck(kiseki_proto::v1::HintAck {
+                hint_id,
+                outcome: outcome.into(),
+                error: None,
+            })),
+            padding: Vec::new(),
+        };
+        let _ = tx.send(Ok(ack)).await;
     }
 }
 
@@ -232,9 +286,71 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
 
     async fn advisory_stream(
         &self,
-        _request: Request<tonic::Streaming<AdvisoryClientMessage>>,
+        request: Request<tonic::Streaming<AdvisoryClientMessage>>,
     ) -> Result<Response<Self::AdvisoryStreamStream>, Status> {
-        Err(Status::unimplemented("advisory stream not yet implemented"))
+        let mut in_stream = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AdvisoryServerMessage, Status>>(64);
+
+        // Validate first message to bind the stream to a workflow.
+        // Subsequent messages must carry the same workflow_ref.
+        let first_msg = in_stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("stream read error: {e}")))?
+            .ok_or_else(|| Status::invalid_argument("empty stream — expected initial message"))?;
+
+        let bound_wf_ref = extract_wf_ref(
+            first_msg
+                .correlation
+                .as_ref()
+                .map(|c| c as &WorkflowCorrelation),
+        )?;
+
+        // Verify the workflow exists.
+        {
+            let tbl = self
+                .table
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if tbl.get(&bound_wf_ref).is_none() {
+                return Err(Status::not_found("workflow not found"));
+            }
+        }
+
+        // Process the first message's hint.
+        let budget = Arc::clone(&self.budget);
+        Self::process_client_message(&first_msg, &budget, &tx).await;
+
+        // Spawn a task to process subsequent incoming hints.
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = in_stream.message().await {
+                // Verify correlation matches the bound workflow (defense-in-depth, I-WA3).
+                if let Ok(msg_ref) =
+                    extract_wf_ref(msg.correlation.as_ref().map(|c| c as &WorkflowCorrelation))
+                {
+                    if msg_ref.0 != bound_wf_ref.0 {
+                        tracing::debug!("advisory stream: correlation mismatch, ignoring message");
+                        let _ = tx
+                            .send(Ok(AdvisoryServerMessage {
+                                payload: Some(
+                                    kiseki_proto::v1::advisory_server_message::Payload::Warning(
+                                        kiseki_proto::v1::StreamWarning { kind: 0 },
+                                    ),
+                                ),
+                                padding: Vec::new(),
+                            }))
+                            .await;
+                        continue;
+                    }
+                }
+
+                Self::process_client_message(&msg, &budget, &tx).await;
+            }
+            tracing::debug!("advisory stream closed by client");
+        });
+
+        let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(out_stream)))
     }
 
     type SubscribeTelemetryStream =

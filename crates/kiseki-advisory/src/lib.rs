@@ -19,6 +19,7 @@ pub mod budget;
 pub mod error;
 pub mod grpc;
 pub mod lookup;
+pub mod stream;
 pub mod workflow;
 
 pub use budget::BudgetEnforcer;

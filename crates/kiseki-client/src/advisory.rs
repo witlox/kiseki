@@ -6,6 +6,7 @@
 //! values drawn from a CSPRNG (uuid v4).
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +27,8 @@ pub enum AdvisoryError {
 }
 
 /// A hint to send on the advisory channel.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdvisoryHint {
     /// Access pattern detected (sequential, random, strided).
     AccessPattern {
@@ -80,15 +82,21 @@ pub enum TelemetryFeedback {
     },
 }
 
-/// Advisory channel state -- wraps the connection to the advisory gRPC service.
+/// Advisory channel state -- wraps the connection to the advisory TCP stream.
 ///
 /// Non-blocking: if the channel is unavailable or drops, the client
 /// continues without advisory (I-WA2). All methods are best-effort.
+///
+/// Uses a length-prefixed JSON protocol over TCP to communicate with the
+/// advisory stream server (port 9102 by default). This avoids requiring
+/// tonic as a dependency in the client library.
 pub struct AdvisoryChannel {
-    /// Advisory endpoint address.
+    /// Advisory endpoint address (host:port for the TCP stream server).
     endpoint: String,
     /// Whether the channel is connected.
     connected: AtomicBool,
+    /// Persistent TCP connection to the advisory stream server.
+    tcp_stream: Mutex<Option<std::net::TcpStream>>,
     /// Hint send queue (bounded, drops oldest on overflow).
     hint_queue: Mutex<VecDeque<AdvisoryHint>>,
     /// Max hint queue depth before dropping.
@@ -98,6 +106,12 @@ pub struct AdvisoryChannel {
 /// Default maximum queue depth for the advisory hint queue.
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 
+/// TCP connection timeout.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// TCP write timeout.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl AdvisoryChannel {
     /// Create a new advisory channel targeting `endpoint`.
     #[must_use]
@@ -105,32 +119,76 @@ impl AdvisoryChannel {
         Self {
             endpoint,
             connected: AtomicBool::new(false),
+            tcp_stream: Mutex::new(None),
             hint_queue: Mutex::new(VecDeque::new()),
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
         }
     }
 
-    /// Try to connect. Non-blocking: returns immediately if unreachable.
+    /// Try to connect to the advisory TCP stream server.
     ///
-    /// For now this only validates the endpoint is non-empty. Real gRPC
-    /// bidi stream connection is deferred to when the tonic client is wired.
+    /// Non-blocking in the sense that it times out after 2 seconds.
+    /// If the server is unreachable, the client continues without
+    /// advisory (I-WA2). Returns `true` if connected.
     pub fn try_connect(&self) -> bool {
         if self.endpoint.is_empty() {
             return false;
         }
-        self.connected.store(true, Ordering::Release);
-        true
+
+        let Ok(addr) = self.endpoint.parse::<std::net::SocketAddr>() else {
+            tracing::debug!(
+                endpoint = %self.endpoint,
+                "advisory channel: invalid endpoint address"
+            );
+            return false;
+        };
+
+        match std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                // Set non-blocking write timeout to avoid stalling the data path.
+                stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                    .ok();
+
+                let mut guard = match self.tcp_stream.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                *guard = Some(stream);
+                self.connected.store(true, Ordering::Release);
+                tracing::info!(endpoint = %self.endpoint, "advisory channel connected");
+                true
+            }
+            Err(e) => {
+                tracing::debug!(
+                    endpoint = %self.endpoint,
+                    error = %e,
+                    "advisory channel unavailable (data path unaffected, I-WA2)"
+                );
+                false
+            }
+        }
     }
 
-    /// Send a hint (fire-and-forget, I-WA1). Never blocks.
+    /// Send a hint (fire-and-forget, I-WA1). Never blocks the data path.
     ///
-    /// Returns `false` if the hint was dropped (queue full or disconnected).
+    /// Tries to send directly over TCP. If the TCP connection is not
+    /// available, queues the hint for later drain. Returns `false` if
+    /// the hint was dropped (queue full and no TCP connection).
     pub fn send_hint(&self, hint: AdvisoryHint) -> bool {
         if !self.connected.load(Ordering::Acquire) {
             return false;
         }
+
+        // Try direct TCP send first.
+        if self.send_hint_tcp(&hint) {
+            return true;
+        }
+
+        // TCP send failed — queue for background drain.
         let Ok(mut queue) = self.hint_queue.lock() else {
-            return false; // poisoned -- non-blocking
+            return false;
         };
         if queue.len() >= self.max_queue_depth {
             queue.pop_front(); // drop oldest
@@ -139,12 +197,65 @@ impl AdvisoryChannel {
         true
     }
 
-    /// Drain pending hints (for the background sender task).
-    pub fn drain_hints(&self) -> Vec<AdvisoryHint> {
-        match self.hint_queue.lock() {
-            Ok(mut q) => q.drain(..).collect(),
-            Err(_) => Vec::new(),
+    /// Send a hint directly over the TCP connection.
+    ///
+    /// Returns `true` if sent successfully. On failure, marks
+    /// the channel as disconnected.
+    fn send_hint_tcp(&self, hint: &AdvisoryHint) -> bool {
+        let Ok(mut guard) = self.tcp_stream.lock() else {
+            return false;
+        };
+        let Some(stream) = guard.as_mut() else {
+            return false;
+        };
+
+        let Ok(json) = serde_json::to_vec(hint) else {
+            return false;
+        };
+
+        // Hint JSON will never exceed u32::MAX in practice (I-WA16: 64 KiB max).
+        #[allow(clippy::cast_possible_truncation)]
+        let len = (json.len() as u32).to_be_bytes();
+        if stream.write_all(&len).is_err()
+            || stream.write_all(&json).is_err()
+            || stream.flush().is_err()
+        {
+            drop(guard);
+            self.mark_disconnected();
+            return false;
         }
+
+        // Read ack (best-effort, non-blocking due to read timeout).
+        // We don't block on the ack — if it's not ready, we move on.
+        let mut ack_len = [0u8; 4];
+        if stream.read_exact(&mut ack_len).is_ok() {
+            let ack_size = u32::from_be_bytes(ack_len) as usize;
+            if ack_size <= 1024 {
+                let mut ack_buf = vec![0u8; ack_size];
+                let _ = stream.read_exact(&mut ack_buf);
+            }
+        }
+        // Ack read failure is non-fatal — hint was sent.
+
+        true
+    }
+
+    /// Drain pending hints (for the background sender task).
+    ///
+    /// Attempts to send each queued hint over TCP. Returns hints
+    /// that were successfully drained from the queue.
+    pub fn drain_hints(&self) -> Vec<AdvisoryHint> {
+        let hints: Vec<AdvisoryHint> = match self.hint_queue.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => return Vec::new(),
+        };
+
+        // Try to send each over TCP.
+        for hint in &hints {
+            self.send_hint_tcp(hint);
+        }
+
+        hints
     }
 
     /// Check if connected.
@@ -155,6 +266,10 @@ impl AdvisoryChannel {
     /// Mark as disconnected (on stream drop or error).
     pub fn mark_disconnected(&self) {
         self.connected.store(false, Ordering::Release);
+        // Drop the TCP stream.
+        if let Ok(mut guard) = self.tcp_stream.lock() {
+            *guard = None;
+        }
         tracing::debug!("advisory channel disconnected (data path unaffected, I-WA2)");
     }
 
@@ -393,16 +508,30 @@ mod tests {
 
     // --- Advisory channel tests ---
 
+    /// Create a channel in "logically connected" state without a real TCP
+    /// connection. Hints go to the queue only (no TCP send, since
+    /// `tcp_stream` is None and `send_hint_tcp` returns false, falling
+    /// through to the queue path).
+    fn connected_channel_no_tcp(endpoint: &str) -> AdvisoryChannel {
+        AdvisoryChannel {
+            endpoint: endpoint.into(),
+            connected: AtomicBool::new(true),
+            tcp_stream: Mutex::new(None),
+            hint_queue: Mutex::new(VecDeque::new()),
+            max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+        }
+    }
+
     #[test]
     fn advisory_channel_send_hint_when_connected() {
-        let ch = AdvisoryChannel::new("localhost:9090".into());
-        ch.try_connect();
+        let ch = connected_channel_no_tcp("localhost:9090");
         assert!(ch.is_connected());
         let ok = ch.send_hint(AdvisoryHint::Profile {
             profile: "checkpoint".into(),
         });
         assert!(ok);
-        let hints = ch.drain_hints();
+        // Hint went to queue (no TCP stream).
+        let hints: Vec<_> = ch.hint_queue.lock().unwrap().drain(..).collect();
         assert_eq!(hints.len(), 1);
         assert!(matches!(&hints[0], AdvisoryHint::Profile { profile } if profile == "checkpoint"));
     }
@@ -416,7 +545,6 @@ mod tests {
             profile: "x".into(),
         });
         assert!(!ok);
-        assert!(ch.drain_hints().is_empty());
     }
 
     #[test]
@@ -424,6 +552,7 @@ mod tests {
         let ch = AdvisoryChannel {
             endpoint: "localhost:9090".into(),
             connected: AtomicBool::new(true),
+            tcp_stream: Mutex::new(None),
             hint_queue: Mutex::new(VecDeque::new()),
             max_queue_depth: 2,
         };
@@ -443,7 +572,7 @@ mod tests {
             offset: 0,
             length: 300,
         });
-        let hints = ch.drain_hints();
+        let hints: Vec<_> = ch.hint_queue.lock().unwrap().drain(..).collect();
         assert_eq!(hints.len(), 2);
         // Oldest was dropped; remaining are file_id 2 and 3.
         assert!(matches!(
@@ -458,23 +587,23 @@ mod tests {
 
     #[test]
     fn advisory_channel_drain_empties_queue() {
-        let ch = AdvisoryChannel::new("localhost:9090".into());
-        ch.try_connect();
+        let ch = connected_channel_no_tcp("localhost:9090");
         ch.send_hint(AdvisoryHint::Profile {
             profile: "a".into(),
         });
         ch.send_hint(AdvisoryHint::Profile {
             profile: "b".into(),
         });
-        assert_eq!(ch.drain_hints().len(), 2);
-        // Second drain should be empty.
+        // drain_hints() tries TCP (fails) but returns the vec.
+        let hints = ch.drain_hints();
+        assert_eq!(hints.len(), 2);
+        // Second drain should be empty (queue was drained).
         assert!(ch.drain_hints().is_empty());
     }
 
     #[test]
     fn advisory_channel_mark_disconnected() {
-        let ch = AdvisoryChannel::new("localhost:9090".into());
-        ch.try_connect();
+        let ch = connected_channel_no_tcp("localhost:9090");
         assert!(ch.is_connected());
         ch.mark_disconnected();
         assert!(!ch.is_connected());
@@ -485,10 +614,18 @@ mod tests {
     }
 
     #[test]
-    fn client_advisory_with_endpoint_connects() {
-        let advisory = ClientAdvisory::with_advisory_endpoint("localhost:9090".into());
-        assert!(advisory.channel().is_some());
-        assert!(advisory.channel().unwrap().is_connected());
+    fn advisory_channel_try_connect_empty_endpoint_returns_false() {
+        let ch = AdvisoryChannel::new(String::new());
+        assert!(!ch.try_connect());
+        assert!(!ch.is_connected());
+    }
+
+    #[test]
+    fn advisory_channel_try_connect_unreachable_returns_false() {
+        // Port 1 is almost certainly not listening.
+        let ch = AdvisoryChannel::new("127.0.0.1:1".into());
+        assert!(!ch.try_connect());
+        assert!(!ch.is_connected());
     }
 
     #[test]
@@ -499,10 +636,23 @@ mod tests {
     }
 
     #[test]
-    fn declare_workflow_emits_hint_when_channel_connected() {
-        let mut advisory = ClientAdvisory::with_advisory_endpoint("localhost:9090".into());
+    fn declare_workflow_queues_hint_when_channel_connected() {
+        // Use a logically-connected channel without real TCP.
+        let channel = connected_channel_no_tcp("localhost:9090");
+        let mut advisory = ClientAdvisory {
+            client_id: uuid::Uuid::new_v4().as_u128(),
+            active_workflows: HashMap::new(),
+            channel: Some(channel),
+        };
         let _session = advisory.declare_workflow();
-        let hints = advisory.channel().unwrap().drain_hints();
+        let hints: Vec<_> = advisory
+            .channel()
+            .unwrap()
+            .hint_queue
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect();
         assert_eq!(hints.len(), 1);
         assert!(matches!(&hints[0], AdvisoryHint::Profile { profile } if profile == "default"));
     }

@@ -404,8 +404,14 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Run the advisory runtime on its isolated tokio runtime.
+///
+/// Starts both the gRPC service (on `addr`) and a TCP stream server
+/// (on `stream_addr`) for non-gRPC clients. The TCP stream uses
+/// length-prefixed JSON for lightweight hint submission from
+/// `kiseki-client` without requiring a tonic dependency.
 pub async fn run_advisory(
     addr: SocketAddr,
+    stream_addr: SocketAddr,
     tls_files: Option<&TlsFiles>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let budget = BudgetConfig {
@@ -414,7 +420,21 @@ pub async fn run_advisory(
         max_phases_per_workflow: 50,
     };
 
-    let advisory_svc = WorkflowAdvisoryServiceServer::new(AdvisoryGrpc::new(budget));
+    let advisory_svc = WorkflowAdvisoryServiceServer::new(AdvisoryGrpc::new(budget.clone()));
+
+    // Shared budget enforcer for the TCP stream server.
+    let stream_budget = Arc::new(std::sync::Mutex::new(kiseki_advisory::BudgetEnforcer::new(
+        budget,
+    )));
+
+    // Start TCP advisory stream server alongside gRPC.
+    tokio::spawn(async move {
+        if let Err(e) =
+            kiseki_advisory::stream::run_advisory_stream_server(stream_addr, stream_budget).await
+        {
+            tracing::error!(error = %e, "advisory TCP stream server error");
+        }
+    });
 
     let mut builder = tonic::transport::Server::builder();
 

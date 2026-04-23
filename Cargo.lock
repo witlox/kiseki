@@ -1566,10 +1566,12 @@ dependencies = [
  "kiseki-common",
  "kiseki-proto",
  "proptest",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
+ "tracing",
  "uuid",
 ]
 

@@ -567,8 +567,7 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
                 match args[i].as_str() {
                     "--severity" => {
                         i += 1;
-                        severity =
-                            Some(args.get(i).ok_or("--severity requires a value")?.clone());
+                        severity = Some(args.get(i).ok_or("--severity requires a value")?.clone());
                     }
                     "--hours" => {
                         i += 1;
@@ -657,48 +656,49 @@ fn main() {
         }
     };
 
-    let result = match args.command {
-        Command::Status => {
-            http_get(&args.endpoint, "/ui/api/cluster").map(|b| format_cluster_status(&b))
-        }
-        Command::Nodes => http_get(&args.endpoint, "/ui/api/nodes").map(|b| format_nodes(&b)),
-        Command::Events { severity, hours } => {
-            let mut params = Vec::new();
-            if let Some(s) = &severity {
-                params.push(format!("severity={s}"));
+    let result =
+        match args.command {
+            Command::Status => {
+                http_get(&args.endpoint, "/ui/api/cluster").map(|b| format_cluster_status(&b))
             }
-            if let Some(h) = hours {
-                params.push(format!("hours={h}"));
+            Command::Nodes => http_get(&args.endpoint, "/ui/api/nodes").map(|b| format_nodes(&b)),
+            Command::Events { severity, hours } => {
+                let mut params = Vec::new();
+                if let Some(s) = &severity {
+                    params.push(format!("severity={s}"));
+                }
+                if let Some(h) = hours {
+                    params.push(format!("hours={h}"));
+                }
+                let path = if params.is_empty() {
+                    "/ui/api/events".to_string()
+                } else {
+                    format!("/ui/api/events?{}", params.join("&"))
+                };
+                http_get(&args.endpoint, &path).map(|b| format_events(&b))
             }
-            let path = if params.is_empty() {
-                "/ui/api/events".to_string()
-            } else {
-                format!("/ui/api/events?{}", params.join("&"))
-            };
-            http_get(&args.endpoint, &path).map(|b| format_events(&b))
-        }
-        Command::History { hours } => {
-            let path = if let Some(h) = hours {
-                format!("/ui/api/history?hours={h}")
-            } else {
-                "/ui/api/history".to_string()
-            };
-            http_get(&args.endpoint, &path).map(|b| format_history(&b))
-        }
-        Command::Maintenance { enabled } => {
-            let body = format!(r#"{{"enabled":{enabled}}}"#);
-            http_post(&args.endpoint, "/ui/api/ops/maintenance", &body)
-                .map(|b| format_ops_response(&b))
-        }
-        Command::Backup => http_post(&args.endpoint, "/ui/api/ops/backup", "{}")
-            .map(|b| format_ops_response(&b)),
-        Command::Scrub => http_post(&args.endpoint, "/ui/api/ops/scrub", "{}")
-            .map(|b| format_ops_response(&b)),
-        Command::Help => {
-            print_usage();
-            std::process::exit(0);
-        }
-    };
+            Command::History { hours } => {
+                let path = if let Some(h) = hours {
+                    format!("/ui/api/history?hours={h}")
+                } else {
+                    "/ui/api/history".to_string()
+                };
+                http_get(&args.endpoint, &path).map(|b| format_history(&b))
+            }
+            Command::Maintenance { enabled } => {
+                let body = format!(r#"{{"enabled":{enabled}}}"#);
+                http_post(&args.endpoint, "/ui/api/ops/maintenance", &body)
+                    .map(|b| format_ops_response(&b))
+            }
+            Command::Backup => http_post(&args.endpoint, "/ui/api/ops/backup", "{}")
+                .map(|b| format_ops_response(&b)),
+            Command::Scrub => http_post(&args.endpoint, "/ui/api/ops/scrub", "{}")
+                .map(|b| format_ops_response(&b)),
+            Command::Help => {
+                print_usage();
+                std::process::exit(0);
+            }
+        };
 
     match result {
         Ok(output) => {

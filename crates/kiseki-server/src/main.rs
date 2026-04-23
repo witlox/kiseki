@@ -68,6 +68,7 @@ fn main() {
     // Clone TLS files ref for the advisory thread (both runtimes use
     // the same cert — they're the same node).
     let advisory_addr = cfg.advisory_addr;
+    let advisory_stream_addr = cfg.advisory_stream_addr;
     let advisory_tls = cfg.tls.as_ref().map(|t| config::TlsFiles {
         ca_path: t.ca_path.clone(),
         cert_path: t.cert_path.clone(),
@@ -75,7 +76,9 @@ fn main() {
         crl_path: t.crl_path.clone(),
     });
     let advisory_handle = advisory_rt.spawn(async move {
-        if let Err(e) = runtime::run_advisory(advisory_addr, advisory_tls.as_ref()).await {
+        if let Err(e) =
+            runtime::run_advisory(advisory_addr, advisory_stream_addr, advisory_tls.as_ref()).await
+        {
             tracing::error!(error = %e, "advisory runtime error");
         }
     });

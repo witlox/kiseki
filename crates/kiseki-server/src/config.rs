@@ -9,6 +9,8 @@ pub struct ServerConfig {
     pub data_addr: SocketAddr,
     /// Address for the advisory gRPC listener (isolated runtime).
     pub advisory_addr: SocketAddr,
+    /// Address for the advisory TCP stream listener (non-gRPC clients).
+    pub advisory_stream_addr: SocketAddr,
     /// S3 HTTP gateway address.
     pub s3_addr: SocketAddr,
     /// NFS server address.
@@ -62,6 +64,11 @@ impl ServerConfig {
             .unwrap_or_else(|_| "0.0.0.0:9101".into())
             .parse()
             .expect("invalid KISEKI_ADVISORY_ADDR");
+
+        let advisory_stream_addr = std::env::var("KISEKI_ADVISORY_STREAM_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:9102".into())
+            .parse()
+            .expect("invalid KISEKI_ADVISORY_STREAM_ADDR");
 
         let tls = match (
             std::env::var("KISEKI_CA_PATH"),
@@ -131,6 +138,7 @@ impl ServerConfig {
         Self {
             data_addr,
             advisory_addr,
+            advisory_stream_addr,
             s3_addr,
             nfs_addr,
             metrics_addr,
