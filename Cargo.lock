@@ -1573,6 +1573,7 @@ dependencies = [
 name = "kiseki-gateway"
 version = "2026.1.0"
 dependencies = [
+ "aws-lc-rs",
  "axum",
  "hyper",
  "hyper-util",

@@ -112,6 +112,9 @@ pub mod nfs_xdr;
 pub mod s3;
 
 #[cfg(feature = "s3")]
+pub mod s3_auth;
+
+#[cfg(feature = "s3")]
 pub mod s3_server;
 
 pub use error::GatewayError;
