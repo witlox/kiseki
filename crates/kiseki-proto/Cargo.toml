@@ -25,9 +25,11 @@ restriction = "allow"
 prost = { workspace = true }
 prost-types = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = "0.14"
 
 [build-dependencies]
 tonic-build = { workspace = true }
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 prost = { workspace = true }

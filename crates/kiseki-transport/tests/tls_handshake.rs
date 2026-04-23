@@ -15,7 +15,7 @@ use kiseki_transport::config::TlsConfig;
 use kiseki_transport::tcp_tls::TimeoutConfig;
 use kiseki_transport::traits::{Connection, Transport};
 use kiseki_transport::TcpTlsTransport;
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{CertificateParams, Issuer, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -26,8 +26,15 @@ fn ensure_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+/// A CA bundle: the PEM-encoded cert, key, and the issuer needed to sign child certs.
+struct CaBundle {
+    ca_pem: String,
+    _key_pem: String,
+    issuer: Issuer<'static, KeyPair>,
+}
+
 /// Generate a self-signed CA certificate and key pair.
-fn generate_ca() -> (String, String, rcgen::CertifiedKey) {
+fn generate_ca() -> CaBundle {
     let mut params =
         CertificateParams::new(Vec::<String>::new()).unwrap_or_else(|_| unreachable!());
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -45,13 +52,18 @@ fn generate_ca() -> (String, String, rcgen::CertifiedKey) {
 
     let ca_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
-    let certified = rcgen::CertifiedKey { cert, key_pair };
-    (ca_pem, key_pem, certified)
+    let issuer = Issuer::new(params, key_pair);
+
+    CaBundle {
+        ca_pem,
+        _key_pem: key_pem,
+        issuer,
+    }
 }
 
 /// Generate a node certificate signed by the given CA.
 fn generate_node_cert(
-    ca: &rcgen::CertifiedKey,
+    ca: &Issuer<'_, KeyPair>,
     cn: &str,
     ip: std::net::IpAddr,
 ) -> (String, String) {
@@ -68,7 +80,7 @@ fn generate_node_cert(
 
     let key_pair = KeyPair::generate().unwrap_or_else(|_| unreachable!());
     let cert = params
-        .signed_by(&key_pair, &ca.cert, &ca.key_pair)
+        .signed_by(&key_pair, ca)
         .unwrap_or_else(|_| unreachable!());
 
     (cert.pem(), key_pair.serialize_pem())
@@ -112,22 +124,22 @@ async fn start_echo_server(ca_pem: &str, cert_pem: &str, key_pem: &str) -> Socke
 #[tokio::test]
 async fn mtls_handshake_and_echo() {
     ensure_crypto_provider();
-    let (ca_pem, _ca_key, ca) = generate_ca();
+    let ca = generate_ca();
     let (server_cert, server_key) = generate_node_cert(
-        &ca,
+        &ca.issuer,
         "server",
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     );
     let (client_cert, client_key) = generate_node_cert(
-        &ca,
+        &ca.issuer,
         "client",
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     );
 
-    let addr = start_echo_server(&ca_pem, &server_cert, &server_key).await;
+    let addr = start_echo_server(&ca.ca_pem, &server_cert, &server_key).await;
 
     let config = TlsConfig::from_pem(
-        ca_pem.as_bytes(),
+        ca.ca_pem.as_bytes(),
         client_cert.as_bytes(),
         client_key.as_bytes(),
     );
@@ -165,26 +177,26 @@ async fn mtls_handshake_and_echo() {
 #[tokio::test]
 async fn wrong_ca_rejected() {
     ensure_crypto_provider();
-    let (ca_pem, _ca_key, ca) = generate_ca();
-    let (other_ca_pem, _other_key, other_ca) = generate_ca();
+    let ca = generate_ca();
+    let other_ca = generate_ca();
 
     let (server_cert, server_key) = generate_node_cert(
-        &ca,
+        &ca.issuer,
         "server",
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     );
     // Client cert signed by OTHER CA.
     let (client_cert, client_key) = generate_node_cert(
-        &other_ca,
+        &other_ca.issuer,
         "rogue",
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     );
 
-    let addr = start_echo_server(&ca_pem, &server_cert, &server_key).await;
+    let addr = start_echo_server(&ca.ca_pem, &server_cert, &server_key).await;
 
     // Client trusts the other CA, not the server's CA — handshake should fail.
     let config = TlsConfig::from_pem(
-        other_ca_pem.as_bytes(),
+        other_ca.ca_pem.as_bytes(),
         client_cert.as_bytes(),
         client_key.as_bytes(),
     );
@@ -205,8 +217,8 @@ fn empty_ca_pem_rejected() {
 #[test]
 fn empty_cert_pem_rejected() {
     ensure_crypto_provider();
-    let (ca_pem, _, _) = generate_ca();
-    let result = TlsConfig::from_pem(ca_pem.as_bytes(), b"", b"not-a-key");
+    let ca = generate_ca();
+    let result = TlsConfig::from_pem(ca.ca_pem.as_bytes(), b"", b"not-a-key");
     assert!(result.is_err());
 }
 
@@ -220,15 +232,15 @@ fn server_config_empty_ca_rejected() {
 #[tokio::test]
 async fn connect_timeout_fires() {
     ensure_crypto_provider();
-    let (ca_pem, _ca_key, ca) = generate_ca();
+    let ca = generate_ca();
     let (client_cert, client_key) = generate_node_cert(
-        &ca,
+        &ca.issuer,
         "client",
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     );
 
     let config = TlsConfig::from_pem(
-        ca_pem.as_bytes(),
+        ca.ca_pem.as_bytes(),
         client_cert.as_bytes(),
         client_key.as_bytes(),
     )
@@ -258,22 +270,22 @@ async fn connect_timeout_fires() {
 #[tokio::test]
 async fn ou_extracted_as_org_id() {
     ensure_crypto_provider();
-    let (ca_pem, _ca_key, ca) = generate_ca();
+    let ca = generate_ca();
     let (server_cert, server_key) = generate_node_cert(
-        &ca,
+        &ca.issuer,
         "server",
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     );
     let (client_cert, client_key) = generate_node_cert(
-        &ca,
+        &ca.issuer,
         "client",
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     );
 
-    let addr = start_echo_server(&ca_pem, &server_cert, &server_key).await;
+    let addr = start_echo_server(&ca.ca_pem, &server_cert, &server_key).await;
 
     let config = TlsConfig::from_pem(
-        ca_pem.as_bytes(),
+        ca.ca_pem.as_bytes(),
         client_cert.as_bytes(),
         client_key.as_bytes(),
     )
