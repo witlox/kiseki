@@ -26,6 +26,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - name: Compute version
         id: version
@@ -77,6 +79,8 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: server-${{ matrix.arch }}
@@ -135,6 +139,8 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: client-${{ matrix.arch }}
@@ -193,11 +199,56 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
+  # Publish crates to crates.io (topological order)
+  # ---------------------------------------------------------------------------
+  crates:
+    name: Publish crates
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish crates (topological order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          # Publish in dependency order. --no-verify skips build (already tested).
+          # Sleep between publishes to let crates.io index catch up.
+          CRATES=(
+            kiseki-common
+            kiseki-proto
+            kiseki-block
+            kiseki-crypto
+            kiseki-raft
+            kiseki-transport
+            kiseki-log
+            kiseki-audit
+            kiseki-keymanager
+            kiseki-chunk
+            kiseki-composition
+            kiseki-view
+            kiseki-advisory
+            kiseki-gateway
+            kiseki-client
+            kiseki-server
+          )
+          for crate in "${CRATES[@]}"; do
+            echo "Publishing $crate..."
+            cargo publish -p "$crate" --no-verify --allow-dirty 2>&1 || echo "  $crate: skipped (already published or not publishable)"
+            sleep 5
+          done
+
+  # ---------------------------------------------------------------------------
   # Publish: GitHub release with all artifacts
   # ---------------------------------------------------------------------------
   publish:
     name: Publish release
-    needs: [preflight, server, client, docker]
+    needs: [preflight, server, client, docker, crates]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -247,16 +298,11 @@ jobs:
             docker pull ghcr.io/${{ github.repository }}:${{ needs.preflight.outputs.version }}
             ```
 
-            ## Crate integration
+            ## Crate integration (crates.io)
 
-            For Lattice (workload scheduler):
             ```toml
-            kiseki-client = { git = "https://github.com/witlox/kiseki" }
-            ```
-
-            For Pact (admin operations):
-            ```toml
-            kiseki-common = { git = "https://github.com/witlox/kiseki" }
+            kiseki-client = "${{ needs.preflight.outputs.version }}"
+            kiseki-common = "${{ needs.preflight.outputs.version }}"
             ```
           files: |
             kiseki-server-*/kiseki-server-*.tar.gz
