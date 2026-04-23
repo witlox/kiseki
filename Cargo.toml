@@ -23,7 +23,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.82"
 version = "2026.1.0"
 license = "Apache-2.0"
 repository = "https://github.com/witlox/kiseki"
@@ -100,10 +100,12 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 
 # --- Serialization / protobuf ---
-prost = "0.13"
-prost-types = "0.13"
-tonic = { version = "0.12", features = ["tls"] }
-tonic-build = "0.12"
+prost = "0.14"
+prost-types = "0.14"
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
+tonic-build = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 
 # --- Erasure coding ---
 reed-solomon-erasure = "6"
