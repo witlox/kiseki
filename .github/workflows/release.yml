@@ -215,7 +215,7 @@ jobs:
 
       - name: Publish crates (topological order)
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
         run: |
           # Publish in dependency order. --no-verify skips build (already tested).
           # Sleep between publishes to let crates.io index catch up.
