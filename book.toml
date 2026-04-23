@@ -1,0 +1,12 @@
+[book]
+title = "Kiseki Documentation"
+description = "Distributed storage system for HPC/AI workloads"
+authors = ["witlox"]
+language = "en"
+src = "docs"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/witlox/kiseki"
+edit-url-template = "https://github.com/witlox/kiseki/edit/main/{path}"

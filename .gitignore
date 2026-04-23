@@ -53,3 +53,4 @@ __pycache__/
 .ruff_cache/
 
 # Protobuf / generated code is produced by build.rs into OUT_DIR; nothing to ignore.
+book/
