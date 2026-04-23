@@ -150,7 +150,7 @@ impl Client {
 }
 
 /// Python-visible cache statistics.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct CacheStatsView {
     #[pyo3(get)]
