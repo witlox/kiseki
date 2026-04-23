@@ -1,15 +1,10 @@
-//! kiseki-admin — remote cluster administration CLI.
+//! kiseki-admin -- remote cluster administration CLI.
 //!
 //! Connects to any Kiseki node via the REST API at `:9090`.
 //!
 //! Default endpoint: `localhost:9090` (or `KISEKI_ENDPOINT` env var).
-#![allow(
-    clippy::doc_markdown,
-    clippy::manual_strip,
-    clippy::missing_docs_in_private_items,
-    clippy::format_push_string
-)]
 
+use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -34,6 +29,30 @@ fn extract_host_port(url: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Read an HTTP response from a connected stream and return the body.
+fn read_http_body(stream: &mut TcpStream) -> Result<String, String> {
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+
+    let text = String::from_utf8_lossy(&buf);
+    let body_start = text
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .ok_or("malformed HTTP response")?;
+
+    let body = &text[body_start..];
+    if text[..body_start]
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        Ok(decode_chunked(body))
+    } else {
+        Ok(body.to_string())
+    }
+}
+
 /// Perform a blocking HTTP GET, return the response body.
 fn http_get(endpoint: &str, path: &str) -> Result<String, String> {
     let url = format!("{endpoint}{path}");
@@ -50,27 +69,7 @@ fn http_get(endpoint: &str, path: &str) -> Result<String, String> {
         .map_err(|e| format!("write failed: {e}"))?;
     stream.flush().map_err(|e| format!("flush failed: {e}"))?;
 
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read failed: {e}"))?;
-
-    let text = String::from_utf8_lossy(&buf);
-    let body_start = text
-        .find("\r\n\r\n")
-        .map(|i| i + 4)
-        .ok_or("malformed HTTP response")?;
-
-    // Check for chunked transfer-encoding and decode if needed.
-    let body = &text[body_start..];
-    if text[..body_start]
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
-        Ok(decode_chunked(body))
-    } else {
-        Ok(body.to_string())
-    }
+    read_http_body(&mut stream)
 }
 
 /// Perform a blocking HTTP POST with a JSON body, return the response body.
@@ -97,26 +96,7 @@ fn http_post(endpoint: &str, path: &str, body: &str) -> Result<String, String> {
         .map_err(|e| format!("write failed: {e}"))?;
     stream.flush().map_err(|e| format!("flush failed: {e}"))?;
 
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read failed: {e}"))?;
-
-    let text = String::from_utf8_lossy(&buf);
-    let body_start = text
-        .find("\r\n\r\n")
-        .map(|i| i + 4)
-        .ok_or("malformed HTTP response")?;
-
-    let resp_body = &text[body_start..];
-    if text[..body_start]
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
-        Ok(decode_chunked(resp_body))
-    } else {
-        Ok(resp_body.to_string())
-    }
+    read_http_body(&mut stream)
 }
 
 /// Decode a chunked transfer-encoding body.
@@ -140,12 +120,10 @@ fn decode_chunked(input: &str) -> String {
         if data_start + size <= remaining_trimmed.len() {
             result.push_str(&remaining_trimmed[data_start..data_start + size]);
             remaining = &remaining_trimmed[data_start + size..];
-            // skip trailing \r\n after chunk data
             if remaining.starts_with("\r\n") {
                 remaining = &remaining[2..];
             }
         } else {
-            // Incomplete chunk — take what we have.
             result.push_str(&remaining_trimmed[data_start..]);
             break;
         }
@@ -154,39 +132,32 @@ fn decode_chunked(input: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal JSON helpers (no serde — this binary has no deps beyond std)
+// Minimal JSON helpers (no serde -- this binary uses only std)
 // ---------------------------------------------------------------------------
 
-/// Extract a string value for a given key from a flat JSON object.
+/// Extract a string value for a given key from a JSON object.
 fn json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let pattern = format!("\"{key}\"");
     let idx = json.find(&pattern)?;
     let after_key = &json[idx + pattern.len()..];
-    // skip `:` and whitespace
     let after_colon = after_key.trim_start().strip_prefix(':')?;
     let after_ws = after_colon.trim_start();
-    if after_ws.starts_with('"') {
-        let start = 1;
-        let end = after_ws[1..].find('"')? + 1;
-        Some(&after_ws[start..end])
-    } else {
-        None
-    }
+    let stripped = after_ws.strip_prefix('"')?;
+    let end = stripped.find('"')?;
+    Some(&stripped[..end])
 }
 
-/// Extract a numeric value (u64) for a given key from a flat JSON object.
+/// Extract a numeric value (u64) for a given key.
 fn json_u64(json: &str, key: &str) -> Option<u64> {
     let pattern = format!("\"{key}\"");
     let idx = json.find(&pattern)?;
     let after_key = &json[idx + pattern.len()..];
     let after_colon = after_key.trim_start().strip_prefix(':')?;
     let after_ws = after_colon.trim_start();
-    // Read digits (and dots, for floats we'll truncate).
     let end = after_ws
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(after_ws.len());
     let num_str = &after_ws[..end];
-    // Handle float by truncating.
     if let Some(dot) = num_str.find('.') {
         num_str[..dot].parse().ok()
     } else {
@@ -228,7 +199,7 @@ fn json_bool(json: &str, key: &str) -> Option<bool> {
     }
 }
 
-/// Split a JSON array (top-level `[...]`) into individual object strings.
+/// Split a JSON array (`[...]`) into individual object strings.
 fn json_array_elements(json: &str) -> Vec<&str> {
     let trimmed = json.trim();
     let inner = if trimmed.starts_with('[') && trimmed.ends_with(']') {
@@ -274,7 +245,6 @@ fn json_array_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     if !after_ws.starts_with('[') {
         return None;
     }
-    // Find matching bracket.
     let mut depth = 0i32;
     for (i, c) in after_ws.char_indices() {
         match c {
@@ -295,8 +265,8 @@ fn json_array_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 // Formatters
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::cast_precision_loss)]
 fn format_bytes(bytes: u64) -> String {
-    #[allow(clippy::cast_precision_loss)]
     if bytes >= 1_099_511_627_776 {
         format!("{:.1} TB", bytes as f64 / 1_099_511_627_776.0)
     } else if bytes >= 1_073_741_824 {
@@ -311,7 +281,6 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn format_number(n: u64) -> String {
-    // Format with thousands separators.
     let s = n.to_string();
     let mut result = String::new();
     for (i, c) in s.chars().rev().enumerate() {
@@ -323,11 +292,22 @@ fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
+/// Extract `HH:MM:SS` from an ISO timestamp, or return the input as-is.
+fn shorten_timestamp(time: &str) -> &str {
+    if let Some(t_pos) = time.find('T') {
+        let after_t = &time[t_pos + 1..];
+        &after_t[..after_t.len().min(8)]
+    } else if time.len() > 8 {
+        &time[..8]
+    } else {
+        time
+    }
+}
+
 fn format_cluster_status(body: &str) -> String {
     let total = json_u64(body, "total_nodes").unwrap_or(0);
     let healthy = json_u64(body, "healthy_nodes").unwrap_or(0);
 
-    // The aggregate object is nested — find it.
     let agg_start = body.find("\"aggregate\"").unwrap_or(0);
     let agg = &body[agg_start..];
 
@@ -373,7 +353,6 @@ fn format_nodes(body: &str) -> String {
         let addr = json_str(node, "address").unwrap_or("?");
         let healthy = json_bool(node, "healthy").unwrap_or(false);
 
-        // Summary is nested.
         let sum_start = node.find("\"summary\"").unwrap_or(0);
         let sum = &node[sum_start..];
 
@@ -389,8 +368,9 @@ fn format_nodes(body: &str) -> String {
             ("down", RED)
         };
 
-        out.push_str(&format!(
-            "{:<18}{color}{:<10}{RESET}{:<10}{:<10}{:<10}{:<10}{:<6}\n",
+        let _ = writeln!(
+            out,
+            "{:<18}{color}{:<10}{RESET}{:<10}{:<10}{:<10}{:<10}{:<6}",
             addr,
             status,
             format_number(raft),
@@ -398,7 +378,7 @@ fn format_nodes(body: &str) -> String {
             format_bytes(written),
             format_bytes(read),
             conns,
-        ));
+        );
     }
     out
 }
@@ -432,25 +412,17 @@ fn format_events(body: &str) -> String {
             _ => GREEN,
         };
 
-        // Show just HH:MM:SS from the timestamp if it contains 'T'.
-        let time_short = if let Some(t_pos) = time.find('T') {
-            let after_t = &time[t_pos + 1..];
-            // Take up to 8 chars (HH:MM:SS).
-            &after_t[..after_t.len().min(8)]
-        } else if time.len() > 8 {
-            &time[..8]
-        } else {
-            time
-        };
+        let time_short = shorten_timestamp(time);
 
-        out.push_str(&format!(
-            "{:<10}{color}{:<10}{RESET}{:<12}{:<12}{}\n",
+        let _ = writeln!(
+            out,
+            "{:<10}{color}{:<10}{RESET}{:<12}{:<12}{}",
             time_short,
             severity.to_ascii_uppercase(),
             category,
             source,
             message,
-        ));
+        );
     }
     out
 }
@@ -479,15 +451,11 @@ fn format_history(body: &str) -> String {
         let conns = json_i64(pt, "transport_connections").unwrap_or(0);
         let deltas = json_u64(pt, "shard_deltas").unwrap_or(0);
 
-        let time_short = if let Some(t_pos) = time.find('T') {
-            let after_t = &time[t_pos + 1..];
-            &after_t[..after_t.len().min(8)]
-        } else {
-            time
-        };
+        let time_short = shorten_timestamp(time);
 
-        out.push_str(&format!(
-            "{:<12}{:<10}{:<10}{:<10}{:<10}{:<10}{:<6}\n",
+        let _ = writeln!(
+            out,
+            "{:<12}{:<10}{:<10}{:<10}{:<10}{:<10}{:<6}",
             time_short,
             format_number(raft),
             format_number(requests),
@@ -495,7 +463,7 @@ fn format_history(body: &str) -> String {
             format_bytes(read),
             conns,
             format_number(deltas),
-        ));
+        );
     }
     out
 }
@@ -540,7 +508,7 @@ enum Command {
 
 fn print_usage() {
     eprintln!(
-        "kiseki-admin — remote cluster administration CLI\n\
+        "kiseki-admin -- remote cluster administration CLI\n\
          \n\
          Usage:\n\
          \x20 kiseki-admin [--endpoint URL] <command> [options]\n\
@@ -559,48 +527,39 @@ fn print_usage() {
     );
 }
 
-fn parse_args() -> Result<Args, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    if args.is_empty() {
-        return Ok(Args {
-            endpoint: default_endpoint(),
-            command: Command::Help,
-        });
-    }
-
+/// Parse the global `--endpoint` flag and return (endpoint, remaining index).
+fn parse_endpoint(args: &[String]) -> (String, usize) {
     let mut endpoint: Option<String> = None;
     let mut i = 0;
 
-    // Parse --endpoint before subcommand.
     while i < args.len() {
         if args[i] == "--endpoint" {
             i += 1;
-            endpoint = Some(args.get(i).ok_or("--endpoint requires a value")?.clone());
+            endpoint = args.get(i).cloned();
             i += 1;
-        } else if args[i].starts_with("--endpoint=") {
-            endpoint = Some(args[i]["--endpoint=".len()..].to_string());
+        } else if let Some(val) = args[i].strip_prefix("--endpoint=") {
+            endpoint = Some(val.to_string());
             i += 1;
         } else {
             break;
         }
     }
 
-    let endpoint = endpoint.unwrap_or_else(default_endpoint);
+    (endpoint.unwrap_or_else(default_endpoint), i)
+}
 
-    if i >= args.len() {
-        return Ok(Args {
-            endpoint,
-            command: Command::Help,
-        });
+/// Parse the subcommand and its options from remaining args.
+fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
+    if start >= args.len() {
+        return Ok(Command::Help);
     }
 
-    let cmd = args[i].as_str();
-    i += 1;
+    let cmd = args[start].as_str();
+    let mut i = start + 1;
 
-    let command = match cmd {
-        "status" => Command::Status,
-        "nodes" => Command::Nodes,
+    match cmd {
+        "status" => Ok(Command::Status),
+        "nodes" => Ok(Command::Nodes),
         "events" => {
             let mut severity = None;
             let mut hours = None;
@@ -608,7 +567,8 @@ fn parse_args() -> Result<Args, String> {
                 match args[i].as_str() {
                     "--severity" => {
                         i += 1;
-                        severity = Some(args.get(i).ok_or("--severity requires a value")?.clone());
+                        severity =
+                            Some(args.get(i).ok_or("--severity requires a value")?.clone());
                     }
                     "--hours" => {
                         i += 1;
@@ -623,7 +583,7 @@ fn parse_args() -> Result<Args, String> {
                 }
                 i += 1;
             }
-            Command::Events { severity, hours }
+            Ok(Command::Events { severity, hours })
         }
         "history" => {
             let mut hours = None;
@@ -642,7 +602,7 @@ fn parse_args() -> Result<Args, String> {
                 }
                 i += 1;
             }
-            Command::History { hours }
+            Ok(Command::History { hours })
         }
         "maintenance" => {
             let toggle = args
@@ -654,13 +614,27 @@ fn parse_args() -> Result<Args, String> {
                 "off" => false,
                 other => return Err(format!("maintenance expects 'on' or 'off', got '{other}'")),
             };
-            Command::Maintenance { enabled }
+            Ok(Command::Maintenance { enabled })
         }
-        "backup" => Command::Backup,
-        "scrub" => Command::Scrub,
-        "help" | "--help" | "-h" => Command::Help,
-        other => return Err(format!("unknown command: {other}")),
-    };
+        "backup" => Ok(Command::Backup),
+        "scrub" => Ok(Command::Scrub),
+        "help" | "--help" | "-h" => Ok(Command::Help),
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+fn parse_args() -> Result<Args, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.is_empty() {
+        return Ok(Args {
+            endpoint: default_endpoint(),
+            command: Command::Help,
+        });
+    }
+
+    let (endpoint, sub_start) = parse_endpoint(&args);
+    let command = parse_subcommand(&args, sub_start)?;
 
     Ok(Args { endpoint, command })
 }
@@ -683,49 +657,48 @@ fn main() {
         }
     };
 
-    let result =
-        match args.command {
-            Command::Status => {
-                http_get(&args.endpoint, "/ui/api/cluster").map(|b| format_cluster_status(&b))
+    let result = match args.command {
+        Command::Status => {
+            http_get(&args.endpoint, "/ui/api/cluster").map(|b| format_cluster_status(&b))
+        }
+        Command::Nodes => http_get(&args.endpoint, "/ui/api/nodes").map(|b| format_nodes(&b)),
+        Command::Events { severity, hours } => {
+            let mut params = Vec::new();
+            if let Some(s) = &severity {
+                params.push(format!("severity={s}"));
             }
-            Command::Nodes => http_get(&args.endpoint, "/ui/api/nodes").map(|b| format_nodes(&b)),
-            Command::Events { severity, hours } => {
-                let mut params = Vec::new();
-                if let Some(s) = &severity {
-                    params.push(format!("severity={s}"));
-                }
-                if let Some(h) = hours {
-                    params.push(format!("hours={h}"));
-                }
-                let path = if params.is_empty() {
-                    "/ui/api/events".to_string()
-                } else {
-                    format!("/ui/api/events?{}", params.join("&"))
-                };
-                http_get(&args.endpoint, &path).map(|b| format_events(&b))
+            if let Some(h) = hours {
+                params.push(format!("hours={h}"));
             }
-            Command::History { hours } => {
-                let path = if let Some(h) = hours {
-                    format!("/ui/api/history?hours={h}")
-                } else {
-                    "/ui/api/history".to_string()
-                };
-                http_get(&args.endpoint, &path).map(|b| format_history(&b))
-            }
-            Command::Maintenance { enabled } => {
-                let body = format!(r#"{{"enabled":{enabled}}}"#);
-                http_post(&args.endpoint, "/ui/api/ops/maintenance", &body)
-                    .map(|b| format_ops_response(&b))
-            }
-            Command::Backup => http_post(&args.endpoint, "/ui/api/ops/backup", "{}")
-                .map(|b| format_ops_response(&b)),
-            Command::Scrub => http_post(&args.endpoint, "/ui/api/ops/scrub", "{}")
-                .map(|b| format_ops_response(&b)),
-            Command::Help => {
-                print_usage();
-                std::process::exit(0);
-            }
-        };
+            let path = if params.is_empty() {
+                "/ui/api/events".to_string()
+            } else {
+                format!("/ui/api/events?{}", params.join("&"))
+            };
+            http_get(&args.endpoint, &path).map(|b| format_events(&b))
+        }
+        Command::History { hours } => {
+            let path = if let Some(h) = hours {
+                format!("/ui/api/history?hours={h}")
+            } else {
+                "/ui/api/history".to_string()
+            };
+            http_get(&args.endpoint, &path).map(|b| format_history(&b))
+        }
+        Command::Maintenance { enabled } => {
+            let body = format!(r#"{{"enabled":{enabled}}}"#);
+            http_post(&args.endpoint, "/ui/api/ops/maintenance", &body)
+                .map(|b| format_ops_response(&b))
+        }
+        Command::Backup => http_post(&args.endpoint, "/ui/api/ops/backup", "{}")
+            .map(|b| format_ops_response(&b)),
+        Command::Scrub => http_post(&args.endpoint, "/ui/api/ops/scrub", "{}")
+            .map(|b| format_ops_response(&b)),
+        Command::Help => {
+            print_usage();
+            std::process::exit(0);
+        }
+    };
 
     match result {
         Ok(output) => {
