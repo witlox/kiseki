@@ -232,23 +232,70 @@ impl Default for KisekiMetrics {
     }
 }
 
-/// Start the metrics HTTP server on the given address.
+/// Start the metrics + admin UI HTTP server on the given address.
 ///
 /// Serves:
 /// - `GET /metrics` — Prometheus text exposition format
 /// - `GET /health` — `200 OK` (load balancer probe)
-pub async fn run_metrics_server(addr: SocketAddr, metrics: KisekiMetrics) -> std::io::Result<()> {
+/// - `GET /ui` — Admin dashboard (HTMX + Chart.js)
+/// - `GET /ui/api/*` — JSON API endpoints
+/// - `GET /ui/fragment/*` — HTMX HTML partial endpoints
+/// - `GET /ui/logo` — Logo image
+pub async fn run_metrics_server(
+    addr: SocketAddr,
+    metrics: KisekiMetrics,
+    peer_addrs: Vec<String>,
+) -> std::io::Result<()> {
+    use crate::web;
+
+    // Set up the metrics aggregator for cluster-wide view.
+    let metrics_addr = addr.to_string();
+    let aggregator = std::sync::Arc::new(web::aggregator::MetricsAggregator::new(metrics_addr, 10));
+
+    // Clone metrics for the encode closure.
+    let metrics_for_ui = metrics.clone();
+    let ui_state = web::api::UiState {
+        aggregator: std::sync::Arc::clone(&aggregator),
+        metrics_encode: std::sync::Arc::new(move || metrics_for_ui.encode()),
+    };
+
+    // Build combined router: metrics + health + admin UI.
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
-        .with_state(metrics);
+        .route("/ui/logo", get(logo_handler))
+        .with_state(metrics)
+        .merge(web::api::ui_router(ui_state));
 
-    tracing::info!(addr = %addr, "metrics server listening");
+    tracing::info!(addr = %addr, "metrics + admin UI server listening");
+
+    // Spawn background peer scraper.
+    let scrape_agg = std::sync::Arc::clone(&aggregator);
+    let scrape_peers = peer_addrs;
+    tokio::spawn(async move {
+        let interval = scrape_agg.interval();
+        loop {
+            for peer in &scrape_peers {
+                scrape_agg.scrape_peer(peer).await;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .await
         .map_err(std::io::Error::other)
+}
+
+async fn logo_handler() -> impl axum::response::IntoResponse {
+    // Serve the embedded logo image.
+    let logo_bytes: &[u8] = include_bytes!("../../../logo-only.png");
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "image/png")],
+        logo_bytes,
+    )
 }
 
 async fn metrics_handler(

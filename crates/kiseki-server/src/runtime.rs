@@ -282,11 +282,24 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         kiseki_gateway::s3_server::run_s3_server(s3_addr, s3_router, s3_tls).await;
     });
 
-    // Prometheus metrics server.
+    // Prometheus metrics + admin UI server.
     let metrics = crate::metrics::KisekiMetrics::new();
     let metrics_addr = cfg.metrics_addr;
+    // Collect peer metrics addresses for the admin UI aggregator.
+    let peer_metrics_addrs: Vec<String> = cfg
+        .raft_peers
+        .iter()
+        .map(|(_, addr)| {
+            // Raft peer addr is host:raft_port. Metrics is on the metrics port.
+            // For now, assume peers use the same metrics port as this node.
+            let host = addr.split(':').next().unwrap_or("127.0.0.1");
+            format!("{host}:{}", metrics_addr.port())
+        })
+        .collect();
     tokio::spawn(async move {
-        if let Err(e) = crate::metrics::run_metrics_server(metrics_addr, metrics).await {
+        if let Err(e) =
+            crate::metrics::run_metrics_server(metrics_addr, metrics, peer_metrics_addrs).await
+        {
             tracing::error!(error = %e, "metrics server error");
         }
     });
