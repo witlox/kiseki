@@ -290,7 +290,7 @@ pub async fn run_metrics_server(
 
 async fn logo_handler() -> impl axum::response::IntoResponse {
     // Serve the embedded logo image.
-    let logo_bytes: &[u8] = include_bytes!("../../../logo-only.png");
+    let logo_bytes: &[u8] = include_bytes!("static/logo.png");
     (
         axum::http::StatusCode::OK,
         [("content-type", "image/png")],
