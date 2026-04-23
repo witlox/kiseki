@@ -25,6 +25,9 @@ pub mod tenancy;
 pub mod time;
 pub mod versioning;
 
+// Clock skew detection for cluster health monitoring (I-T6).
+pub mod clock_skew;
+
 // Inline store trait (ADR-030) — shared between kiseki-log and kiseki-chunk.
 pub mod inline_store;
 
@@ -40,6 +43,8 @@ pub use ids::{
 };
 pub use tenancy::{ComplianceTag, DedupPolicy, KeyEpoch, Quota, TenantScope};
 pub use time::{ClockQuality, DeltaTimestamp, HlcExhausted, HybridLogicalClock, WallTime};
+
+pub use clock_skew::{ClockSkewDetector, SkewObservation, SkewSeverity};
 
 pub use advisory::{
     AccessPattern, AffinityPreference, ClientId, DedupIntent, OperationAdvisory, PhaseId,

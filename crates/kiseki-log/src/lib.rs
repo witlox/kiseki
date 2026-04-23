@@ -24,6 +24,7 @@ pub mod raft;
 pub mod raft_shard_store;
 pub mod raft_store;
 pub mod shard;
+pub mod split;
 pub mod store;
 pub mod traits;
 pub mod watermark;

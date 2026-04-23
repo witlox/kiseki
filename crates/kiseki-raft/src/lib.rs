@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod log_store;
+pub mod membership;
 pub mod network;
 pub mod node;
 #[allow(
@@ -29,6 +30,10 @@ pub mod redb_log_store;
 
 pub use config::KisekiRaftConfig;
 pub use log_store::MemLogStore;
+pub use membership::{
+    can_remove_safely, quorum_size, validate_membership_change, MembershipAction, MembershipChange,
+    MembershipError, MembershipResult,
+};
 #[allow(
     missing_docs,
     clippy::must_use_candidate,
