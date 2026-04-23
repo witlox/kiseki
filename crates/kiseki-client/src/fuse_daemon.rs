@@ -37,7 +37,7 @@ const TTL: Duration = Duration::from_secs(1);
 #[cfg(feature = "fuse")]
 fn to_fuser_attr(ino: u64, attr: &crate::fuse_fs::FileAttr) -> FuserAttr {
     FuserAttr {
-        ino: INodeNo::from(ino),
+        ino: INodeNo(ino),
         size: attr.size,
         blocks: (attr.size + 511) / 512,
         atime: SystemTime::UNIX_EPOCH,
