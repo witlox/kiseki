@@ -20,7 +20,9 @@ pub mod error;
 pub mod fuse_daemon;
 #[allow(missing_docs)]
 pub mod fuse_fs;
+pub mod policy;
 pub mod prefetch;
+pub mod scrub;
 #[allow(unsafe_code)] // flock on Unix for pool handoff
 pub mod staging;
 pub mod transport_select;
