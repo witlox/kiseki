@@ -15,6 +15,7 @@ use openraft::error::{RPCError, Unreachable};
 use openraft::network::v2::RaftNetworkV2;
 use openraft::network::RaftNetworkFactory;
 use openraft::RaftTypeConfig;
+use rustls::pki_types::ServerName;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -57,9 +58,8 @@ impl<C: RaftTypeConfig> TcpNetworkFactory<C> {
 /// A TCP connection to a single Raft peer.
 pub struct TcpNetwork {
     addr: String,
-    // TLS config for this connection (if mTLS is enabled).
-    // Not used yet in rpc_call — will wrap TcpStream when activated.
-    _tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// TLS client config for mTLS-secured connections (ADV-S2).
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl<C: RaftTypeConfig<Node = KisekiNode, SnapshotData = Cursor<Vec<u8>>>> RaftNetworkFactory<C>
@@ -70,7 +70,7 @@ impl<C: RaftTypeConfig<Node = KisekiNode, SnapshotData = Cursor<Vec<u8>>>> RaftN
     async fn new_client(&mut self, _target: C::NodeId, node: &KisekiNode) -> TcpNetwork {
         TcpNetwork {
             addr: node.addr.clone(),
-            _tls_config: self.tls_config.clone(),
+            tls_config: self.tls_config.clone(),
         }
     }
 }
@@ -90,13 +90,47 @@ enum RaftRpcResponse<C: RaftTypeConfig> {
     Ok,
 }
 
-/// Send a request and receive a response over TCP.
-async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
+/// Send a request and receive a response over TCP (plaintext).
+async fn rpc_call_plain<Req: Serialize, Resp: DeserializeOwned>(
     addr: &str,
     req: &Req,
 ) -> io::Result<Resp> {
     let mut stream = TcpStream::connect(addr).await?;
+    rpc_exchange(&mut stream, req).await
+}
 
+/// Send a request and receive a response over TCP+TLS (mTLS).
+async fn rpc_call_tls<Req: Serialize, Resp: DeserializeOwned>(
+    addr: &str,
+    tls_config: &Arc<rustls::ClientConfig>,
+    req: &Req,
+) -> io::Result<Resp> {
+    let tcp = TcpStream::connect(addr).await?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::clone(tls_config));
+
+    // Parse the address to extract the IP for SNI.
+    let ip: std::net::IpAddr = addr
+        .split(':')
+        .next()
+        .and_then(|h| h.parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Raft peer address"))?;
+    let server_name = ServerName::IpAddress(ip.into());
+
+    let mut tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+
+    rpc_exchange(&mut tls_stream, req).await
+}
+
+/// Length-prefixed request/response exchange over any `AsyncRead + AsyncWrite`.
+async fn rpc_exchange<S, Req, Resp>(stream: &mut S, req: &Req) -> io::Result<Resp>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+    Req: Serialize,
+    Resp: DeserializeOwned,
+{
     // Serialize request.
     let data =
         serde_json::to_vec(req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -122,6 +156,18 @@ async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
     stream.read_exact(&mut resp_buf).await?;
 
     serde_json::from_slice(&resp_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Send a request and receive a response, using TLS if configured.
+async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
+    addr: &str,
+    tls_config: Option<&Arc<rustls::ClientConfig>>,
+    req: &Req,
+) -> io::Result<Resp> {
+    match tls_config {
+        Some(tls) => rpc_call_tls(addr, tls, req).await,
+        None => rpc_call_plain(addr, req).await,
+    }
 }
 
 fn to_rpc_error<C: RaftTypeConfig>(e: io::Error) -> RPCError<C> {
@@ -151,9 +197,13 @@ where
         rpc: openraft::raft::AppendEntriesRequest<C>,
         _option: openraft::network::RPCOption,
     ) -> Result<openraft::raft::AppendEntriesResponse<C>, RPCError<C>> {
-        rpc_call(&self.addr, &("append_entries", &rpc))
-            .await
-            .map_err(to_rpc_error::<C>)
+        rpc_call(
+            &self.addr,
+            self.tls_config.as_ref(),
+            &("append_entries", &rpc),
+        )
+        .await
+        .map_err(to_rpc_error::<C>)
     }
 
     async fn full_snapshot(
@@ -173,10 +223,13 @@ where
             data,
         };
 
-        let resp: openraft::raft::SnapshotResponse<C> =
-            rpc_call(&self.addr, &("full_snapshot", &envelope))
-                .await
-                .map_err(|e| openraft::error::StreamingError::Unreachable(Unreachable::new(&e)))?;
+        let resp: openraft::raft::SnapshotResponse<C> = rpc_call(
+            &self.addr,
+            self.tls_config.as_ref(),
+            &("full_snapshot", &envelope),
+        )
+        .await
+        .map_err(|e| openraft::error::StreamingError::Unreachable(Unreachable::new(&e)))?;
 
         Ok(resp)
     }
@@ -186,7 +239,7 @@ where
         rpc: openraft::raft::VoteRequest<C>,
         _option: openraft::network::RPCOption,
     ) -> Result<openraft::raft::VoteResponse<C>, RPCError<C>> {
-        rpc_call(&self.addr, &("vote", &rpc))
+        rpc_call(&self.addr, self.tls_config.as_ref(), &("vote", &rpc))
             .await
             .map_err(to_rpc_error::<C>)
     }
@@ -209,92 +262,125 @@ where
 pub async fn run_raft_rpc_server<C: RaftTypeConfig<SnapshotData = Cursor<Vec<u8>>>>(
     addr: &str,
     raft: Arc<openraft::Raft<C, impl openraft::storage::RaftStateMachine<C>>>,
-    _tls_config: Option<Arc<rustls::ServerConfig>>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> io::Result<()>
 where
     C::D: Serialize + DeserializeOwned + Send + Sync,
     C::R: Serialize + DeserializeOwned + Send + Sync,
 {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    eprintln!("  Raft RPC server listening on {addr}");
+    let tls_acceptor = tls_config.map(tokio_rustls::TlsAcceptor::from);
+
+    if tls_acceptor.is_some() {
+        eprintln!("  Raft RPC server listening on {addr} (mTLS)");
+    } else {
+        eprintln!("  Raft RPC server listening on {addr} (plaintext — dev mode)");
+    }
 
     loop {
-        let (mut stream, _peer) = listener.accept().await?;
+        let (tcp_stream, _peer) = listener.accept().await?;
         let raft = Arc::clone(&raft);
+        let acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            // Read length-prefixed request.
-            let mut len_buf = [0u8; 4];
-            if stream.read_exact(&mut len_buf).await.is_err() {
-                return;
-            }
-            let req_len = u32::from_be_bytes(len_buf) as usize;
-            // ADV-S1/S6: reject oversized messages to prevent OOM.
-            if req_len > MAX_RAFT_RPC_SIZE {
-                eprintln!(
-                    "  Raft RPC: rejecting oversized request ({req_len} bytes, max {MAX_RAFT_RPC_SIZE})"
-                );
-                return;
-            }
-            let mut req_buf = vec![0u8; req_len];
-            if stream.read_exact(&mut req_buf).await.is_err() {
-                return;
-            }
-
-            // Dispatch based on RPC type tag.
-            // Client sends ("append_entries", payload), ("vote", payload),
-            // or ("full_snapshot", envelope).
-            let tag_result: Result<(String, serde_json::Value), _> =
-                serde_json::from_slice(&req_buf);
-
-            let resp_data = match tag_result {
-                Ok((ref tag, _)) if tag == "append_entries" => {
-                    match serde_json::from_slice::<(String, openraft::raft::AppendEntriesRequest<C>)>(
-                        &req_buf,
-                    ) {
-                        Ok((_, ae_req)) => match raft.append_entries(ae_req).await {
-                            Ok(resp) => serde_json::to_vec(&resp).unwrap_or_default(),
-                            Err(_) => Vec::new(),
-                        },
-                        Err(_) => Vec::new(),
+            if let Some(acceptor) = acceptor {
+                // mTLS path: handshake first, then dispatch.
+                match acceptor.accept(tcp_stream).await {
+                    Ok(tls_stream) => {
+                        let mut stream = tls_stream;
+                        dispatch_raft_rpc(&mut stream, &raft).await;
+                    }
+                    Err(e) => {
+                        eprintln!("  Raft RPC: TLS handshake failed: {e}");
                     }
                 }
-                Ok((ref tag, _)) if tag == "vote" => {
-                    match serde_json::from_slice::<(String, openraft::raft::VoteRequest<C>)>(
-                        &req_buf,
-                    ) {
-                        Ok((_, vote_req)) => match raft.vote(vote_req).await {
-                            Ok(resp) => serde_json::to_vec(&resp).unwrap_or_default(),
-                            Err(_) => Vec::new(),
-                        },
-                        Err(_) => Vec::new(),
-                    }
-                }
-                Ok((ref tag, _)) if tag == "full_snapshot" => {
-                    match serde_json::from_slice::<(String, SnapshotEnvelope<C>)>(&req_buf) {
-                        Ok((_, env)) => {
-                            let snapshot = openraft::storage::Snapshot {
-                                meta: env.meta,
-                                snapshot: Cursor::new(env.data),
-                            };
-                            match raft.install_full_snapshot(env.vote, snapshot).await {
-                                Ok(resp) => serde_json::to_vec(&resp).unwrap_or_default(),
-                                Err(_) => Vec::new(),
-                            }
-                        }
-                        Err(_) => Vec::new(),
-                    }
-                }
-                _ => Vec::new(),
-            };
-
-            // Send response.
-            let len = resp_data.len() as u32;
-            let _ = stream.write_all(&len.to_be_bytes()).await;
-            let _ = stream.write_all(&resp_data).await;
-            let _ = stream.flush().await;
+            } else {
+                // Plaintext path.
+                let mut stream = tcp_stream;
+                dispatch_raft_rpc(&mut stream, &raft).await;
+            }
         });
     }
+}
+
+/// Read a length-prefixed Raft RPC, dispatch to the Raft instance,
+/// and send the response back.
+async fn dispatch_raft_rpc<C, S>(
+    stream: &mut S,
+    raft: &openraft::Raft<C, impl openraft::storage::RaftStateMachine<C>>,
+) where
+    C: RaftTypeConfig<SnapshotData = Cursor<Vec<u8>>>,
+    C::D: Serialize + DeserializeOwned + Send + Sync,
+    C::R: Serialize + DeserializeOwned + Send + Sync,
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    // Read length-prefixed request.
+    let mut len_buf = [0u8; 4];
+    if stream.read_exact(&mut len_buf).await.is_err() {
+        return;
+    }
+    let req_len = u32::from_be_bytes(len_buf) as usize;
+    // ADV-S1/S6: reject oversized messages to prevent OOM.
+    if req_len > MAX_RAFT_RPC_SIZE {
+        eprintln!(
+            "  Raft RPC: rejecting oversized request ({req_len} bytes, max {MAX_RAFT_RPC_SIZE})"
+        );
+        return;
+    }
+    let mut req_buf = vec![0u8; req_len];
+    if stream.read_exact(&mut req_buf).await.is_err() {
+        return;
+    }
+
+    // Dispatch based on RPC type tag.
+    // Client sends ("append_entries", payload), ("vote", payload),
+    // or ("full_snapshot", envelope).
+    let tag_result: Result<(String, serde_json::Value), _> = serde_json::from_slice(&req_buf);
+
+    let resp_data = match tag_result {
+        Ok((ref tag, _)) if tag == "append_entries" => {
+            match serde_json::from_slice::<(String, openraft::raft::AppendEntriesRequest<C>)>(
+                &req_buf,
+            ) {
+                Ok((_, ae_req)) => match raft.append_entries(ae_req).await {
+                    Ok(resp) => serde_json::to_vec(&resp).unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            }
+        }
+        Ok((ref tag, _)) if tag == "vote" => {
+            match serde_json::from_slice::<(String, openraft::raft::VoteRequest<C>)>(&req_buf) {
+                Ok((_, vote_req)) => match raft.vote(vote_req).await {
+                    Ok(resp) => serde_json::to_vec(&resp).unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            }
+        }
+        Ok((ref tag, _)) if tag == "full_snapshot" => {
+            match serde_json::from_slice::<(String, SnapshotEnvelope<C>)>(&req_buf) {
+                Ok((_, env)) => {
+                    let snapshot = openraft::storage::Snapshot {
+                        meta: env.meta,
+                        snapshot: Cursor::new(env.data),
+                    };
+                    match raft.install_full_snapshot(env.vote, snapshot).await {
+                        Ok(resp) => serde_json::to_vec(&resp).unwrap_or_default(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    // Send response.
+    let len = resp_data.len() as u32;
+    let _ = stream.write_all(&len.to_be_bytes()).await;
+    let _ = stream.write_all(&resp_data).await;
+    let _ = stream.flush().await;
 }
 
 #[cfg(test)]
@@ -359,8 +445,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         });
 
-        // Client calls rpc_call — should get an error, not OOM.
-        let result: io::Result<String> = rpc_call(&addr.to_string(), &"test-request").await;
+        // Client calls rpc_call (plaintext) — should get an error, not OOM.
+        let no_tls: Option<&Arc<rustls::ClientConfig>> = None;
+        let result: io::Result<String> = rpc_call(&addr.to_string(), no_tls, &"test-request").await;
 
         assert!(
             result.is_err(),

@@ -46,7 +46,7 @@ impl CrlCache {
     /// Whether the cache needs a refresh.
     #[must_use]
     pub fn is_stale(&self) -> bool {
-        self.last_fetched.elapsed() > self.ttl
+        self.last_fetched.elapsed() >= self.ttl
     }
 
     /// Number of revoked entries.

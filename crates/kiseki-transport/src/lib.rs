@@ -15,6 +15,9 @@
 
 pub mod config;
 pub mod error;
+pub mod health;
+pub mod metrics;
+pub mod pool;
 pub mod revocation;
 pub mod spiffe;
 pub mod tcp_tls;
@@ -28,5 +31,8 @@ pub mod verbs;
 
 pub use config::TlsConfig;
 pub use error::TransportError;
+pub use health::{HealthConfig, TransportHealthTracker};
+pub use metrics::TransportMetrics;
+pub use pool::{ConnectionPool, PoolConfig};
 pub use tcp_tls::{TcpTlsTransport, TimeoutConfig};
 pub use traits::{Connection, PeerIdentity, Transport};
