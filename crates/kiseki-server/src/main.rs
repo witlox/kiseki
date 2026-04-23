@@ -16,10 +16,35 @@ mod integrity;
 mod runtime;
 mod system_disk;
 
+fn init_tracing() {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let log_format = std::env::var("KISEKI_LOG_FORMAT").unwrap_or_default();
+    if log_format == "json" {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().json())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer())
+            .init();
+    }
+}
+
 fn main() {
+    init_tracing();
+
     let cfg = config::ServerConfig::from_env();
-    eprintln!("kiseki-server starting on {}", cfg.data_addr);
-    eprintln!("  advisory addr: {}", cfg.advisory_addr);
+    tracing::info!(
+        data_addr = %cfg.data_addr,
+        advisory_addr = %cfg.advisory_addr,
+        "kiseki-server starting"
+    );
 
     // Build the main tokio runtime.
     let main_rt = tokio::runtime::Builder::new_multi_thread()
@@ -48,19 +73,19 @@ fn main() {
     });
     let advisory_handle = advisory_rt.spawn(async move {
         if let Err(e) = runtime::run_advisory(advisory_addr, advisory_tls.as_ref()).await {
-            eprintln!("advisory runtime error: {e}");
+            tracing::error!(error = %e, "advisory runtime error");
         }
     });
 
     // Run the main server on the main runtime.
     main_rt.block_on(async move {
         if let Err(e) = runtime::run_main(cfg).await {
-            eprintln!("server error: {e}");
+            tracing::error!(error = %e, "server error");
             std::process::exit(1);
         }
     });
 
     // Clean shutdown.
     advisory_rt.block_on(async { advisory_handle.await.ok() });
-    eprintln!("kiseki-server shut down.");
+    tracing::info!("kiseki-server shut down");
 }

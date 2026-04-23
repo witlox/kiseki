@@ -39,7 +39,7 @@ pub(crate) fn emit_delta<L: LogOps + ?Sized>(
         Err(e) => {
             // Log the error — callers check the return value to decide
             // whether to roll back the local mutation (PIPE-ADV-1).
-            eprintln!("WARNING: delta emission failed: {e}");
+            tracing::warn!(error = %e, "delta emission failed");
             false
         }
     }

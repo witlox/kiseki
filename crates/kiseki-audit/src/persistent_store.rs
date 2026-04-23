@@ -36,9 +36,7 @@ impl PersistentAuditStore {
             let inner = RaftAuditStore::from_commands(entries.into_iter());
             let log_len = inner.log_length();
             if log_len != redb_count {
-                eprintln!(
-                    "warning: audit store log length ({log_len}) differs from redb entry count ({redb_count})"
-                );
+                tracing::error!(log_len, redb_count, "audit store log length differs from redb entry count");
             }
             Ok(Self { inner, redb })
         }

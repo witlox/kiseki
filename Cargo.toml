@@ -83,6 +83,10 @@ openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
 # --- Async / time ---
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 
+# --- Observability ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
 # --- TLS ---
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
 tokio-rustls = "0.26"

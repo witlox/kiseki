@@ -32,17 +32,17 @@ pub fn run_nfs_server<G: GatewayOps + Send + Sync + 'static>(
     let sessions = Arc::new(SessionManager::new());
 
     let listener = TcpListener::bind(addr).unwrap_or_else(|e| {
-        eprintln!("NFS bind {addr}: {e}");
+        tracing::error!(addr = %addr, error = %e, "NFS bind failed");
         std::process::exit(1);
     });
 
-    eprintln!("  NFS server listening on {addr} (NFSv3 + NFSv4.2)");
+    tracing::info!(addr = %addr, "NFS server listening (NFSv3 + NFSv4.2)");
 
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("NFS accept: {e}");
+                tracing::error!(error = %e, "NFS accept error");
                 continue;
             }
         };
@@ -51,7 +51,7 @@ pub fn run_nfs_server<G: GatewayOps + Send + Sync + 'static>(
         let sessions = Arc::clone(&sessions);
         thread::spawn(move || {
             if let Err(e) = handle_connection(stream, ctx, sessions) {
-                eprintln!("NFS connection error: {e}");
+                tracing::error!(error = %e, "NFS connection error");
             }
         });
     }

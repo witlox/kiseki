@@ -190,7 +190,7 @@ pub fn pin_current_thread(cpus: &[u32]) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = cpus;
-        eprintln!("  NUMA: thread pinning not supported on this platform");
+        tracing::warn!("NUMA thread pinning not supported on this platform");
         Ok(())
     }
 }

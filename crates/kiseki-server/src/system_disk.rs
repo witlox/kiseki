@@ -151,8 +151,9 @@ fn fs_stats(path: &Path) -> (u64, u64) {
 /// Emit a warning if the system disk is rotational (HDD).
 pub fn warn_if_rotational(media_type: MediaType) {
     if media_type == MediaType::Hdd {
-        eprintln!("  WARNING: system disk is rotational (HDD). Raft fsync latency will");
-        eprintln!("  be 5-10ms per commit. Production deployments require NVMe or SSD");
-        eprintln!("  for the metadata partition. See ADR-030.");
+        tracing::warn!(
+            "system disk is rotational (HDD). Raft fsync latency will be 5-10ms per commit. \
+             Production deployments require NVMe or SSD for the metadata partition. See ADR-030."
+        );
     }
 }

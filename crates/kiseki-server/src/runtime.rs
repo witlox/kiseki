@@ -48,22 +48,22 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             cfg.meta_hard_limit_pct,
         );
         crate::system_disk::warn_if_rotational(capacity.media_type);
-        eprintln!(
-            "  system disk: {:?}, total {} GB, soft limit {} GB, budget {} GB",
-            capacity.media_type,
-            capacity.total_bytes / (1024 * 1024 * 1024),
-            capacity.soft_limit_bytes / (1024 * 1024 * 1024),
-            capacity.small_file_budget_bytes / (1024 * 1024 * 1024),
+        tracing::info!(
+            media_type = ?capacity.media_type,
+            total_gb = capacity.total_bytes / (1024 * 1024 * 1024),
+            soft_limit_gb = capacity.soft_limit_bytes / (1024 * 1024 * 1024),
+            budget_gb = capacity.small_file_budget_bytes / (1024 * 1024 * 1024),
+            "system disk detected",
         );
     }
 
     // Node identity for multi-node Raft.
     if cfg.node_id > 0 {
-        eprintln!(
-            "  node: id={}, peers={}, raft_addr={:?}",
-            cfg.node_id,
-            cfg.raft_peers.len(),
-            cfg.raft_addr
+        tracing::info!(
+            node_id = cfg.node_id,
+            peers = cfg.raft_peers.len(),
+            raft_addr = ?cfg.raft_addr,
+            "node identity configured",
         );
     }
 
@@ -76,9 +76,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         let store =
             kiseki_keymanager::PersistentKeyStore::open(&dir.join("keys").join("epochs.redb"))
                 .map_err(|e| format!("persistent key store: {e}"))?;
-        eprintln!(
-            "  key manager: persistent (redb), epoch {} ready",
-            store.health().current_epoch.unwrap_or(0)
+        tracing::info!(
+            epoch = store.health().current_epoch.unwrap_or(0),
+            "key manager: persistent (redb) ready",
         );
         store
     } else {
@@ -88,9 +88,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         std::fs::create_dir_all(&tmp).ok();
         let store = kiseki_keymanager::PersistentKeyStore::open(&tmp.join("epochs.redb"))
             .map_err(|e| format!("key store init: {e}"))?;
-        eprintln!(
-            "  key manager: in-memory (ephemeral), epoch {} ready",
-            store.health().current_epoch.unwrap_or(0)
+        tracing::info!(
+            epoch = store.health().current_epoch.unwrap_or(0),
+            "key manager: in-memory (ephemeral) ready",
         );
         store
     };
@@ -104,9 +104,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         std::fs::create_dir_all(dir.join("small")).ok();
         let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects.redb"))
             .map_err(|e| format!("small object store: {e}"))?;
-        eprintln!(
-            "  small object store: persistent (redb at {})",
-            dir.display()
+        tracing::info!(
+            path = %dir.display(),
+            "small object store: persistent (redb)",
         );
         Some(std::sync::Arc::new(store))
     } else {
@@ -144,10 +144,10 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                     Some(&raft_addr_str),
                 );
             }
-            eprintln!(
-                "  log store: Raft (node {}, {} peers)",
-                cfg.node_id,
-                cfg.raft_peers.len()
+            tracing::info!(
+                node_id = cfg.node_id,
+                peers = cfg.raft_peers.len(),
+                "log store: Raft",
             );
             Arc::new(store)
         } else if let Some(ref dir) = cfg.data_dir {
@@ -164,7 +164,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                     kiseki_log::ShardConfig::default(),
                 );
             }
-            eprintln!("  log store: persistent (redb at {})", dir.display());
+            tracing::info!(path = %dir.display(), "log store: persistent (redb)");
             Arc::new(store)
         } else {
             let store = kiseki_log::MemShardStore::new();
@@ -176,23 +176,21 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                     kiseki_log::ShardConfig::default(),
                 );
             }
-            eprintln!("  log store: in-memory (no persistence)");
+            tracing::info!("log store: in-memory (no persistence)");
             Arc::new(store)
         };
 
     if cfg.bootstrap {
-        eprintln!(
-            "  bootstrap: shard {} for tenant {}",
-            bootstrap_shard.0, bootstrap_tenant.0
+        tracing::info!(
+            shard = %bootstrap_shard.0,
+            tenant = %bootstrap_tenant.0,
+            "bootstrap: shard created for tenant",
         );
     }
 
     // Audit: in-memory store.
     let audit_store = kiseki_audit::AuditLog::new();
-    eprintln!(
-        "  audit log: in-memory (events: {})",
-        audit_store.total_events()
-    );
+    tracing::info!(events = audit_store.total_events(), "audit log: in-memory",);
 
     // Chunk store: persistent (raw block device) if KISEKI_DATA_DIR set,
     // otherwise in-memory. The gateway accepts any ChunkOps implementation.
@@ -207,10 +205,10 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             kiseki_chunk::PersistentChunkStore::init(&dev_path, &meta_path, 4 * 1024 * 1024 * 1024)
                 .map_err(|e| format!("persistent chunk store init: {e}"))?
         };
-        eprintln!("  chunk store: persistent (raw block at {})", dir.display());
+        tracing::info!(path = %dir.display(), "chunk store: persistent (raw block)");
         Box::new(store)
     } else {
-        eprintln!("  chunk store: in-memory (no persistence)");
+        tracing::info!("chunk store: in-memory (no persistence)");
         Box::new(kiseki_chunk::ChunkStore::new())
     };
 
@@ -248,10 +246,10 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                 discardable: true,
                 version: 1,
             });
-        eprintln!("  bootstrap: namespace 'default' + view for gateways");
+        tracing::info!("bootstrap: namespace 'default' + view for gateways");
     } else {
-        eprintln!("  WARNING: KISEKI_BOOTSTRAP not set — S3/NFS gateways have no namespaces");
-        eprintln!("  Set KISEKI_BOOTSTRAP=true for development/testing");
+        tracing::warn!("KISEKI_BOOTSTRAP not set — S3/NFS gateways have no namespaces");
+        tracing::warn!("set KISEKI_BOOTSTRAP=true for development/testing");
     }
 
     // Shared gateway: wires composition + chunk + crypto. Used by S3 and NFS.
@@ -330,7 +328,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                 // Scrub runs on the block device layer; report logged if issues found.
                 // The actual scrub is performed by DeviceBackend::scrub() which
                 // checks bitmap integrity and detects orphan extents.
-                eprintln!("  scrub: periodic check completed");
+                tracing::info!("scrub: periodic check completed");
             }
         });
     }
@@ -340,7 +338,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // Control plane (ADR-027: Rust-only).
     let control_tenants = Arc::new(TenantStore::new());
     let control_svc = ControlServiceServer::new(ControlGrpc::new(control_tenants));
-    eprintln!("  control plane: in-process (ControlService on data-path gRPC)");
+    tracing::info!("control plane: in-process (ControlService on data-path gRPC)");
 
     let key_svc = KeyManagerServiceServer::new(KeyManagerGrpc::new(key_store));
     let log_svc = LogServiceServer::new(LogGrpc::new(log_store));
@@ -353,17 +351,17 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         builder = builder
             .tls_config(tls)
             .map_err(|e| format!("data-path TLS config: {e}"))?;
-        eprintln!("  data-path gRPC listening on {} (mTLS)", cfg.data_addr);
+        tracing::info!(addr = %cfg.data_addr, "data-path gRPC listening (mTLS)");
     } else {
-        eprintln!(
-            "  WARNING: data-path gRPC listening on {} (PLAINTEXT — development only)",
-            cfg.data_addr
+        tracing::warn!(
+            addr = %cfg.data_addr,
+            "data-path gRPC listening (PLAINTEXT — development only)",
         );
     }
 
     let shutdown = async {
         tokio::signal::ctrl_c().await.ok();
-        eprintln!("  data-path: shutdown signal received, draining...");
+        tracing::info!("data-path: shutdown signal received, draining...");
     };
 
     builder
@@ -373,7 +371,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         .serve_with_shutdown(cfg.data_addr, shutdown)
         .await?;
 
-    eprintln!("  data-path: shut down.");
+    tracing::info!("data-path: shut down");
     Ok(())
 }
 
@@ -397,14 +395,14 @@ pub async fn run_advisory(
         builder = builder
             .tls_config(tls)
             .map_err(|e| format!("advisory TLS config: {e}"))?;
-        eprintln!("  advisory gRPC listening on {addr} (mTLS)");
+        tracing::info!(%addr, "advisory gRPC listening (mTLS)");
     } else {
-        eprintln!("  WARNING: advisory gRPC listening on {addr} (PLAINTEXT — development only)");
+        tracing::warn!(%addr, "advisory gRPC listening (PLAINTEXT — development only)");
     }
 
     let shutdown = async {
         tokio::signal::ctrl_c().await.ok();
-        eprintln!("  advisory: shutdown signal received, draining...");
+        tracing::info!("advisory: shutdown signal received, draining...");
     };
 
     builder
@@ -412,6 +410,6 @@ pub async fn run_advisory(
         .serve_with_shutdown(addr, shutdown)
         .await?;
 
-    eprintln!("  advisory: shut down.");
+    tracing::info!("advisory: shut down");
     Ok(())
 }

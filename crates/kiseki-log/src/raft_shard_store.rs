@@ -109,7 +109,7 @@ impl RaftShardStore {
                 // Spawn RPC server for this shard's Raft group.
                 if let Some(addr) = raft_addr {
                     std::mem::drop(store.spawn_rpc_server(addr.to_owned()));
-                    eprintln!("  raft: RPC server for shard {} on {addr}", shard_id.0);
+                    tracing::info!(shard_id = %shard_id.0, addr, "Raft RPC server started for shard");
                 }
 
                 Arc::new(store)

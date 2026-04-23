@@ -26,7 +26,7 @@ impl KisekiRaftConfig {
         Arc::new(config.validate().unwrap_or_else(|e| {
             // Config validation should never fail with these values.
             // If it does, the defaults in openraft changed — use them.
-            eprintln!("WARNING: raft config validation failed: {e}, using defaults");
+            tracing::warn!(error = %e, "raft config validation failed, using defaults");
             openraft::Config::default()
         }))
     }

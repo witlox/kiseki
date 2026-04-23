@@ -124,7 +124,7 @@ impl FileBackedDevice {
         file.seek(SeekFrom::Start(sb.bitmap_mirror_offset))?;
         file.read_exact(&mut mirror)?;
         if bitmap != mirror {
-            eprintln!("warning: bitmap primary/mirror mismatch detected, using primary");
+            tracing::warn!("bitmap primary/mirror mismatch detected, using primary");
         }
 
         let allocator = BitmapAllocator::from_bitmap(bitmap, sb.total_blocks, sb.block_size);

@@ -272,9 +272,9 @@ where
     let tls_acceptor = tls_config.map(tokio_rustls::TlsAcceptor::from);
 
     if tls_acceptor.is_some() {
-        eprintln!("  Raft RPC server listening on {addr} (mTLS)");
+        tracing::info!(addr, "Raft RPC server listening (mTLS)");
     } else {
-        eprintln!("  Raft RPC server listening on {addr} (plaintext — dev mode)");
+        tracing::warn!(addr, "Raft RPC server listening (plaintext — dev mode)");
     }
 
     loop {
@@ -291,7 +291,7 @@ where
                         dispatch_raft_rpc(&mut stream, &raft).await;
                     }
                     Err(e) => {
-                        eprintln!("  Raft RPC: TLS handshake failed: {e}");
+                        tracing::error!(error = %e, "Raft RPC TLS handshake failed");
                     }
                 }
             } else {
@@ -322,8 +322,10 @@ async fn dispatch_raft_rpc<C, S>(
     let req_len = u32::from_be_bytes(len_buf) as usize;
     // ADV-S1/S6: reject oversized messages to prevent OOM.
     if req_len > MAX_RAFT_RPC_SIZE {
-        eprintln!(
-            "  Raft RPC: rejecting oversized request ({req_len} bytes, max {MAX_RAFT_RPC_SIZE})"
+        tracing::warn!(
+            req_len,
+            max = MAX_RAFT_RPC_SIZE,
+            "Raft RPC rejecting oversized request"
         );
         return;
     }

@@ -361,13 +361,13 @@ pub async fn run_s3_server(
 
     if let Some(tls) = tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-        eprintln!("  S3 HTTP gateway listening on {addr} (mTLS)");
+        tracing::info!(addr = %addr, "S3 HTTP gateway listening (mTLS)");
 
         loop {
             let (tcp_stream, _peer) = match listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("  S3 accept error: {e}");
+                    tracing::error!(error = %e, "S3 accept error");
                     continue;
                 }
             };
@@ -385,17 +385,17 @@ pub async fn run_s3_server(
                         .serve_connection(io, svc)
                         .await
                         {
-                            eprintln!("  S3 connection error: {e}");
+                            tracing::error!(error = %e, "S3 connection error");
                         }
                     }
                     Err(e) => {
-                        eprintln!("  S3 TLS handshake failed: {e}");
+                        tracing::error!(error = %e, "S3 TLS handshake failed");
                     }
                 }
             });
         }
     } else {
-        eprintln!("  WARNING: S3 HTTP gateway listening on {addr} (PLAINTEXT — development only)");
+        tracing::warn!(addr = %addr, "S3 HTTP gateway listening (PLAINTEXT — development only)");
         axum::serve(listener, router).await.ok();
     }
 }

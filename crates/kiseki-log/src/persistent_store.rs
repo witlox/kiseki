@@ -123,7 +123,7 @@ impl PersistentShardStore {
                     has_inline_data: delta.has_inline_data,
                 });
             }
-            eprintln!("  reload: {} shards restored from redb", seen_shards.len());
+            tracing::info!(shard_count = seen_shards.len(), "shards restored from redb");
         }
     }
 }

@@ -32,4 +32,6 @@ kiseki-proto = { workspace = true }
 axum = "0.7"
 tokio = { workspace = true }
 tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

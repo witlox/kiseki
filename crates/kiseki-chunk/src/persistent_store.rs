@@ -134,7 +134,7 @@ impl PersistentChunkStore {
     /// Save metadata to JSON file (atomic: write tmp then rename).
     fn save_meta(&self) -> Result<(), ChunkError> {
         let chunks = self.chunks.lock().unwrap_or_else(|e| {
-            eprintln!("warning: mutex poisoned, recovering");
+            tracing::warn!("mutex poisoned in save_meta, recovering");
             e.into_inner()
         });
         let metas: Vec<&PersistedChunkMeta> = chunks.values().map(|e| &e.envelope_meta).collect();
@@ -353,7 +353,7 @@ impl ChunkOps for PersistentChunkStore {
 
     fn gc(&mut self) -> u64 {
         let mut chunks = self.chunks.lock().unwrap_or_else(|e| {
-            eprintln!("warning: mutex poisoned, recovering");
+            tracing::warn!("mutex poisoned in gc, recovering");
             e.into_inner()
         });
 
@@ -383,7 +383,7 @@ impl ChunkOps for PersistentChunkStore {
                     freed_count += 1;
                     // Update pool usage.
                     let mut pools = self.pools.lock().unwrap_or_else(|e| {
-                        eprintln!("warning: mutex poisoned, recovering");
+                        tracing::warn!("mutex poisoned in gc pool update, recovering");
                         e.into_inner()
                     });
                     if let Some(p) = pools.get_mut(pool_name.as_str()) {
@@ -391,7 +391,7 @@ impl ChunkOps for PersistentChunkStore {
                     }
                 }
                 Err(e) => {
-                    eprintln!("warning: gc free failed for chunk {id}: {e}, skipping");
+                    tracing::warn!(chunk_id = %id, error = %e, "gc free failed, skipping");
                 }
             }
         }
