@@ -22,7 +22,7 @@ kiseki-chunk = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-crypto = { workspace = true }
 kiseki-gateway = { workspace = true }
-fuser = { version = "0.16", optional = true }
+fuser = { version = "0.17", optional = true }
 libc = { workspace = true }
 pyo3 = { version = "0.23", optional = true }
 serde = { version = "1", features = ["derive"] }
