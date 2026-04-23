@@ -81,10 +81,11 @@ jobs:
         with:
           key: server-${{ matrix.arch }}
 
-      - name: Build kiseki-server (non-FIPS for release)
+      - name: Build kiseki-server (all features, non-FIPS)
         run: |
           sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml
-          cargo build --release --bin kiseki-server
+          cargo build --release --bin kiseki-server \
+            --features kiseki-keymanager/kms-vault,kiseki-keymanager/kms-aws,kiseki-keymanager/kms-azure,kiseki-keymanager/kms-gcp
 
       - name: Package
         run: |
