@@ -90,6 +90,10 @@ jobs:
             cmd: cargo check -p kiseki-client --features fuse --locked
           - name: server-default
             cmd: cargo check -p kiseki-server --locked
+          - name: transport-verbs
+            cmd: cargo check -p kiseki-transport --features verbs --locked
+          - name: transport-cxi
+            cmd: cargo check -p kiseki-transport --features cxi --locked
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
