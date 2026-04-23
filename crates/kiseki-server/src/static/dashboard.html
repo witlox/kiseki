@@ -119,10 +119,10 @@
     <div class="section">
         <div class="section-head"><h2>Cluster Operations</h2></div>
         <div class="ops-grid">
-            <button class="ops-btn" onclick="alert('Wire to gRPC SetMaintenanceMode')"><h4>Maintenance Mode</h4><p>Toggle cluster-wide read-only</p></button>
-            <button class="ops-btn" onclick="alert('Wire to BackupManager')"><h4>Create Backup</h4><p>Snapshot cluster state</p></button>
+            <button class="ops-btn" onclick="doOp('/ui/api/ops/maintenance',{enabled:true},this)"><h4>Maintenance Mode</h4><p>Toggle cluster-wide read-only</p></button>
+            <button class="ops-btn" onclick="doOp('/ui/api/ops/backup',{},this)"><h4>Create Backup</h4><p>Snapshot cluster state</p></button>
             <button class="ops-btn" onclick="alert('Wire to rotation_monitor')"><h4>Rotate Keys</h4><p>Trigger key epoch rotation</p></button>
-            <button class="ops-btn" onclick="alert('Wire to scrub_engine')"><h4>Run Scrub</h4><p>Verify data integrity</p></button>
+            <button class="ops-btn" onclick="doOp('/ui/api/ops/scrub',{},this)"><h4>Run Scrub</h4><p>Verify data integrity</p></button>
             <button class="ops-btn" onclick="alert('Wire to rebalance')"><h4>Rebalance Pools</h4><p>Redistribute chunks</p></button>
             <button class="ops-btn" onclick="window.open('/metrics','_blank')"><h4>Raw Metrics</h4><p>Prometheus /metrics</p></button>
         </div>
@@ -147,6 +147,20 @@
 <footer>Kiseki Distributed Storage</footer>
 
 <script>
+// --- Operations ---
+async function doOp(url, body, btn) {
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    try {
+        const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
+        const d = await r.json();
+        btn.querySelector('p').textContent = d.message || 'Done';
+    } catch(e) {
+        btn.querySelector('p').textContent = 'Failed: ' + e.message;
+    }
+    setTimeout(() => { btn.disabled = false; btn.style.opacity = '1'; }, 2000);
+}
+
 // --- Tabs ---
 function showTab(id, el) {
     document.querySelectorAll('[id^="tab-"]').forEach(t => t.style.display = 'none');

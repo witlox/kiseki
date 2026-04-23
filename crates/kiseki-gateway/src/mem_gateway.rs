@@ -3,6 +3,7 @@
 //! Handles the full data path: plaintext from protocol client → encrypt →
 //! chunk store → composition metadata, and reverse for reads.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use std::sync::Arc;
@@ -31,6 +32,12 @@ pub struct InMemoryGateway {
     dedup_policy: DedupPolicy,
     tenant_hmac_key: Option<Vec<u8>>,
     view_store: Option<Arc<Mutex<ViewStore>>>,
+    /// Total gateway requests (reads + writes).
+    pub requests_total: AtomicU64,
+    /// Cumulative bytes written through the gateway.
+    pub bytes_written: AtomicU64,
+    /// Cumulative bytes read through the gateway.
+    pub bytes_read: AtomicU64,
     /// Last-written sequence per session for `ReadYourWrites` enforcement.
     /// Maps (tenant, namespace) → highest committed sequence number.
     last_written_seq: Mutex<
@@ -66,6 +73,9 @@ impl InMemoryGateway {
             dedup_policy: DedupPolicy::CrossTenant,
             tenant_hmac_key: None,
             view_store: None,
+            requests_total: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
             last_written_seq: Mutex::new(std::collections::HashMap::new()),
             inline_threshold: 0, // disabled by default; set via with_inline_threshold
             small_store: None,
@@ -325,6 +335,10 @@ impl GatewayOps for InMemoryGateway {
         let end = std::cmp::min(start.saturating_add(length), plaintext.len());
         let eof = end >= plaintext.len();
 
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read
+            .fetch_add((end - start) as u64, Ordering::Relaxed);
+
         Ok(ReadResponse {
             data: plaintext[start..end].to_vec(),
             eof,
@@ -348,6 +362,10 @@ impl GatewayOps for InMemoryGateway {
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
         let bytes_written = req.data.len() as u64;
+
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(bytes_written, Ordering::Relaxed);
 
         // Route: inline (ADR-030) or chunk store.
         if bytes_written <= self.inline_threshold && self.small_store.is_some() {

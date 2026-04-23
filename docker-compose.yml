@@ -26,10 +26,9 @@ services:
       KISEKI_METRICS_ADDR: "0.0.0.0:9090"
       KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "true"
-      # OTEL disabled until init_tracing runs inside tokio runtime
-      # OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
-      # OTEL_SERVICE_NAME: "kiseki-server"
-      # OTEL_TRACES_SAMPLER_ARG: "1.0"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+      OTEL_SERVICE_NAME: "kiseki-server"
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
     volumes:
       - kiseki-data:/data
     depends_on:

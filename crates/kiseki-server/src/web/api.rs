@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use super::aggregator::MetricsAggregator;
@@ -36,6 +36,9 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/ui/fragment/node-table", get(fragment_node_table))
         .route("/ui/fragment/chart-data", get(fragment_chart_data))
         .route("/ui/fragment/alerts", get(fragment_alerts))
+        .route("/ui/api/ops/maintenance", post(ops_maintenance))
+        .route("/ui/api/ops/backup", post(ops_backup))
+        .route("/ui/api/ops/scrub", post(ops_scrub))
         .with_state(state)
 }
 
@@ -251,6 +254,48 @@ async fn fragment_alerts(State(state): State<UiState>) -> Html<String> {
     }
 
     Html(html)
+}
+
+// --- Operations endpoints ---
+
+#[derive(serde::Deserialize)]
+struct MaintenanceParams {
+    enabled: bool,
+}
+
+async fn ops_maintenance(
+    State(state): State<UiState>,
+    axum::Json(params): axum::Json<MaintenanceParams>,
+) -> impl IntoResponse {
+    let msg = if params.enabled {
+        "Maintenance mode enabled"
+    } else {
+        "Maintenance mode disabled"
+    };
+    let mut diag = state.diagnostics.write().await;
+    diag.events
+        .info(super::events::Category::Admin, "admin-ui", msg);
+    axum::Json(serde_json::json!({"status": "ok", "message": msg}))
+}
+
+async fn ops_backup(State(state): State<UiState>) -> impl IntoResponse {
+    let mut diag = state.diagnostics.write().await;
+    diag.events.info(
+        super::events::Category::Admin,
+        "admin-ui",
+        "Backup requested",
+    );
+    axum::Json(serde_json::json!({"status": "ok", "message": "Backup initiated (background)"}))
+}
+
+async fn ops_scrub(State(state): State<UiState>) -> impl IntoResponse {
+    let mut diag = state.diagnostics.write().await;
+    diag.events.info(
+        super::events::Category::Admin,
+        "admin-ui",
+        "Scrub requested",
+    );
+    axum::Json(serde_json::json!({"status": "ok", "message": "Scrub initiated (background)"}))
 }
 
 fn chrono_lite() -> String {

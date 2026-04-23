@@ -11,10 +11,8 @@
 // Binary crate: allow expect/unwrap for startup and top-level error handling.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-#[allow(dead_code)] // Wired when admin CLI binary is added.
 pub(crate) mod admin;
 pub(crate) mod backup;
-#[allow(dead_code)] // Wired when admin subcommand is integrated into main.
 pub(crate) mod cli;
 mod config;
 mod integrity;
@@ -28,6 +26,15 @@ mod telemetry;
 pub(crate) mod web;
 
 fn main() {
+    // Check for admin subcommand before starting the server runtime.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] != "--help" {
+        if let Some(cmd) = cli::parse_admin_args(&args) {
+            run_admin_command(&cmd);
+            return;
+        }
+    }
+
     // Load config before the runtime — it's pure env parsing, no async needed.
     let cfg = config::ServerConfig::from_env();
 
@@ -85,4 +92,17 @@ fn main() {
     advisory_rt.block_on(async { advisory_handle.await.ok() });
     tracing::info!("kiseki-server shut down");
     telemetry::shutdown_tracing(otel_provider);
+}
+
+/// Run an admin CLI command and exit.
+fn run_admin_command(cmd: &cli::AdminCommand) {
+    match cmd {
+        cli::AdminCommand::Status => {
+            let status = admin::cluster_status();
+            println!("{}", status.to_table());
+        }
+        cli::AdminCommand::MaintenanceOn => println!("Maintenance mode: ON (wire to gRPC)"),
+        cli::AdminCommand::MaintenanceOff => println!("Maintenance mode: OFF (wire to gRPC)"),
+        _ => println!("Command recognized but not yet wired to gRPC"),
+    }
 }

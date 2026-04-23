@@ -4,6 +4,7 @@
 //! is separate; this module provides the domain types and formatting.
 
 /// Admin operation result.
+#[allow(dead_code)] // Used when admin gRPC wiring lands.
 pub struct AdminResponse {
     /// Whether the operation succeeded.
     pub success: bool,
@@ -63,6 +64,7 @@ impl ClusterStatus {
     /// Uses manual formatting to avoid a `serde_json` dependency in
     /// the server binary for this single use case.
     #[must_use]
+    #[allow(dead_code)] // Used when admin gRPC wiring lands.
     pub fn to_json(&self) -> String {
         format!(
             "{{\
