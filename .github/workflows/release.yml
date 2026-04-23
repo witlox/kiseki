@@ -255,7 +255,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
-
+        with:
+          pattern: kiseki-*
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
