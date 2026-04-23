@@ -252,11 +252,15 @@ pub async fn run_metrics_server(
     let metrics_addr = addr.to_string();
     let aggregator = std::sync::Arc::new(web::aggregator::MetricsAggregator::new(metrics_addr, 10));
 
+    // Diagnostic store: metric history (3h) + event log (10K events).
+    let diagnostics = web::events::new_shared();
+
     // Clone metrics for the encode closure.
     let metrics_for_ui = metrics.clone();
     let ui_state = web::api::UiState {
         aggregator: std::sync::Arc::clone(&aggregator),
         metrics_encode: std::sync::Arc::new(move || metrics_for_ui.encode()),
+        diagnostics: std::sync::Arc::clone(&diagnostics),
     };
 
     // Build combined router: metrics + health + admin UI.
@@ -269,14 +273,25 @@ pub async fn run_metrics_server(
 
     tracing::info!(addr = %addr, "metrics + admin UI server listening");
 
-    // Spawn background peer scraper.
+    // Spawn background peer scraper + diagnostic recorder.
     let scrape_agg = std::sync::Arc::clone(&aggregator);
+    let scrape_diag = std::sync::Arc::clone(&diagnostics);
     let scrape_peers = peer_addrs;
     tokio::spawn(async move {
         let interval = scrape_agg.interval();
         loop {
             for peer in &scrape_peers {
                 scrape_agg.scrape_peer(peer).await;
+            }
+            // Record cluster snapshot into diagnostic history.
+            let summary = scrape_agg.cluster_summary().await;
+            {
+                let mut diag = scrape_diag.write().await;
+                diag.record_snapshot(
+                    summary.aggregate,
+                    summary.healthy_nodes,
+                    summary.total_nodes,
+                );
             }
             tokio::time::sleep(interval).await;
         }

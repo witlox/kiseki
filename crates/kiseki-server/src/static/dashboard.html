@@ -159,11 +159,43 @@ function showTab(id, el) {
 setInterval(() => { document.getElementById('clock').textContent = new Date().toISOString().replace('T',' ').slice(0,19)+' UTC'; }, 1000);
 
 // --- History ---
-const H = 60;
+const H = 1080; // 3 hours at 10s intervals
 const ts = { l:[], w:[], r:[], q:[], rf:[] };
 let prev = { w:0, r:0, q:0, rf:0 };
+let historyLoaded = false;
 // Per-node history for detail
 const ndH = {};
+
+// Load server-side metric history on page open
+async function loadHistory() {
+    try {
+        const r = await fetch('/ui/api/history?hours=3');
+        const data = await r.json();
+        if (data.points && data.points.length > 1) {
+            let lastW=0, lastR=0, lastQ=0;
+            for (const p of data.points) {
+                const d = new Date(p.timestamp_ms);
+                const label = d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+                const dw = Math.max(0, p.summary.chunk_write_bytes - lastW);
+                const dr = Math.max(0, p.summary.chunk_read_bytes - lastR);
+                const dq = Math.max(0, p.summary.gateway_requests - lastQ);
+                lastW = p.summary.chunk_write_bytes;
+                lastR = p.summary.chunk_read_bytes;
+                lastQ = p.summary.gateway_requests;
+                // Skip first point (delta would be the cumulative total)
+                if (ts.l.length > 0 || lastW === 0) {
+                    ts.l.push(label); ts.w.push(dw); ts.r.push(dr); ts.q.push(dq);
+                }
+            }
+            // Set prev to last known values for live continuation
+            prev.w = lastW; prev.r = lastR; prev.q = lastQ;
+            // Update charts with history
+            ioC.data.labels=[...ts.l];ioC.data.datasets[0].data=[...ts.w];ioC.data.datasets[1].data=[...ts.r];ioC.update();
+            rqC.data.labels=[...ts.l];rqC.data.datasets[0].data=[...ts.q];rqC.update();
+        }
+        historyLoaded = true;
+    } catch(e) { historyLoaded = true; }
+}
 
 // --- Chart defaults ---
 Chart.defaults.color = '#8b8fa3';
@@ -247,7 +279,8 @@ async function poll() {
         if(document.getElementById('tab-node-detail').style.display!=='none' && window._detailAddr) updateDetail(window._detailAddr);
     } catch(e){}
 }
-poll(); setInterval(poll, 5000);
+// Load server-side history first, then start live polling.
+loadHistory().then(() => { poll(); setInterval(poll, 5000); });
 
 // --- Node click → detail tab ---
 document.addEventListener('htmx:afterSettle', () => {

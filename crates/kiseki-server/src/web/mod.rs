@@ -6,3 +6,4 @@
 
 pub mod aggregator;
 pub mod api;
+pub mod events;

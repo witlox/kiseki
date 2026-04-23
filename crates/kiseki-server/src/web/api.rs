@@ -10,6 +10,7 @@ use axum::routing::get;
 use axum::Router;
 
 use super::aggregator::MetricsAggregator;
+use super::events::SharedDiagnostics;
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -18,6 +19,8 @@ pub struct UiState {
     pub aggregator: Arc<MetricsAggregator>,
     /// Function to encode local Prometheus metrics.
     pub metrics_encode: Arc<dyn Fn() -> String + Send + Sync>,
+    /// Diagnostic store for metric history + events.
+    pub diagnostics: SharedDiagnostics,
 }
 
 /// Build the web UI router.
@@ -27,6 +30,8 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/ui/", get(dashboard_page))
         .route("/ui/api/cluster", get(api_cluster_summary))
         .route("/ui/api/nodes", get(api_nodes))
+        .route("/ui/api/history", get(api_history))
+        .route("/ui/api/events", get(api_events))
         .route("/ui/fragment/cluster-cards", get(fragment_cluster_cards))
         .route("/ui/fragment/node-table", get(fragment_node_table))
         .route("/ui/fragment/chart-data", get(fragment_chart_data))
@@ -39,6 +44,76 @@ async fn api_cluster_summary(State(state): State<UiState>) -> impl IntoResponse 
     state.aggregator.update_local(metrics_text).await;
     let summary = state.aggregator.cluster_summary().await;
     axum::Json(summary)
+}
+
+/// Query params for history endpoint.
+#[derive(serde::Deserialize)]
+struct HistoryParams {
+    /// Number of hours to retrieve. Default: 3.
+    hours: Option<f64>,
+}
+
+async fn api_history(
+    State(state): State<UiState>,
+    axum::extract::Query(params): axum::extract::Query<HistoryParams>,
+) -> impl IntoResponse {
+    let hours = params.hours.unwrap_or(3.0);
+    let diag = state.diagnostics.read().await;
+    let points = diag.metrics.since_hours(hours);
+    axum::Json(serde_json::json!({
+        "hours": hours,
+        "points": points,
+    }))
+}
+
+/// Query params for events endpoint.
+#[derive(serde::Deserialize)]
+struct EventParams {
+    /// Filter by severity: info, warning, error, critical.
+    severity: Option<String>,
+    /// Filter by category: node, shard, device, tenant, security, admin.
+    category: Option<String>,
+    /// Hours to look back. Default: 3.
+    hours: Option<f64>,
+    /// Maximum events to return. Default: 100.
+    limit: Option<usize>,
+}
+
+async fn api_events(
+    State(state): State<UiState>,
+    axum::extract::Query(params): axum::extract::Query<EventParams>,
+) -> impl IntoResponse {
+    use super::events::{Category, Severity};
+
+    let hours = params.hours.unwrap_or(3.0);
+    let severity = params.severity.as_deref().and_then(|s| match s {
+        "info" => Some(Severity::Info),
+        "warning" => Some(Severity::Warning),
+        "error" => Some(Severity::Error),
+        "critical" => Some(Severity::Critical),
+        _ => None,
+    });
+    let category = params.category.as_deref().and_then(|c| match c {
+        "node" => Some(Category::Node),
+        "shard" => Some(Category::Shard),
+        "device" => Some(Category::Device),
+        "tenant" => Some(Category::Tenant),
+        "security" => Some(Category::Security),
+        "admin" => Some(Category::Admin),
+        "gateway" => Some(Category::Gateway),
+        "raft" => Some(Category::Raft),
+        _ => None,
+    });
+
+    let diag = state.diagnostics.read().await;
+    let events = diag.events.query(severity, category, hours);
+    let limit = params.limit.unwrap_or(100);
+    let events: Vec<_> = events.into_iter().rev().take(limit).collect();
+
+    axum::Json(serde_json::json!({
+        "count": events.len(),
+        "events": events,
+    }))
 }
 
 async fn api_nodes(State(state): State<UiState>) -> impl IntoResponse {
