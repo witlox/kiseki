@@ -13,6 +13,7 @@
 
 #[allow(dead_code)] // Wired when admin CLI binary is added.
 pub(crate) mod admin;
+pub(crate) mod backup;
 #[allow(dead_code)] // Wired when admin subcommand is integrated into main.
 pub(crate) mod cli;
 mod config;

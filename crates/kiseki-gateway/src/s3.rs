@@ -97,6 +97,15 @@ impl<G: GatewayOps> S3Gateway<G> {
         self.inner.list(tenant_id, namespace_id)
     }
 
+    /// Ensure a namespace exists for a bucket.
+    pub fn ensure_namespace(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<(), GatewayError> {
+        self.inner.ensure_namespace(tenant_id, namespace_id)
+    }
+
     /// S3 `DeleteObject` — deletes an object by composition ID.
     pub fn delete_object(&self, req: DeleteObjectRequest) -> Result<(), GatewayError> {
         self.inner

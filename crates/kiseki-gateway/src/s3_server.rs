@@ -357,7 +357,18 @@ async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
     if buckets.contains(&bucket) {
         return (StatusCode::CONFLICT, "BucketAlreadyExists").into_response();
     }
-    buckets.insert(bucket);
+    buckets.insert(bucket.clone());
+    // Drop the lock before calling ensure_namespace to avoid holding it
+    // across a potentially expensive operation.
+    drop(buckets);
+
+    // Register the namespace in the composition store so that subsequent
+    // PUT object requests can find it (fixes "namespace not found" 500).
+    let ns_id = namespace_from_bucket(&bucket);
+    if let Err(e) = state.gateway.ensure_namespace(state.fallback_tenant, ns_id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
     StatusCode::OK.into_response()
 }
 
@@ -706,5 +717,50 @@ mod tests {
         assert!(xml.contains("<Name>alpha</Name>"), "xml: {xml}");
         assert!(xml.contains("<Name>beta</Name>"), "xml: {xml}");
         assert!(xml.contains("ListAllMyBucketsResult"), "xml: {xml}");
+    }
+
+    #[tokio::test]
+    async fn put_get_object_roundtrip() {
+        let app = test_router();
+
+        // Create bucket first (registers namespace).
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/roundtrip-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // PUT object.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/roundtrip-bucket/any-key")
+            .body(Body::from("hello world"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Extract etag (composition UUID) for GET.
+        let etag = resp
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_owned();
+
+        // GET object by composition UUID.
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/roundtrip-bucket/{etag}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"hello world");
     }
 }

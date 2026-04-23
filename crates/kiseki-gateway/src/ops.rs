@@ -118,6 +118,19 @@ pub trait GatewayOps {
             "multipart not supported".into(),
         ))
     }
+
+    /// Ensure a namespace exists in the composition store.
+    ///
+    /// Called by `create_bucket` to register the namespace before any
+    /// object writes target it. Default is a no-op (namespace already exists).
+    fn ensure_namespace(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<(), GatewayError> {
+        let _ = (tenant_id, namespace_id);
+        Ok(())
+    }
 }
 
 /// Blanket impl: `Arc<G>` delegates to `G` via deref.
@@ -159,5 +172,12 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
     }
     fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
         (**self).abort_multipart(upload_id)
+    }
+    fn ensure_namespace(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<(), GatewayError> {
+        (**self).ensure_namespace(tenant_id, namespace_id)
     }
 }

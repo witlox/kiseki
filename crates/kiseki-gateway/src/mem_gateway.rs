@@ -199,6 +199,32 @@ impl InMemoryGateway {
     }
 }
 
+impl InMemoryGateway {
+    /// Ensure a namespace exists — creates it if missing.
+    ///
+    /// Used by `create_bucket` so the composition store has a registered
+    /// namespace before any object write targets it.
+    pub fn ensure_namespace_exists(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+    ) -> Result<(), GatewayError> {
+        let mut comps = self
+            .compositions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if comps.namespace(namespace_id).is_none() {
+            comps.add_namespace(kiseki_composition::namespace::Namespace {
+                id: namespace_id,
+                tenant_id,
+                shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+                read_only: false,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl GatewayOps for InMemoryGateway {
     fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
         let compositions = self
@@ -418,6 +444,14 @@ impl GatewayOps for InMemoryGateway {
 
     fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
         self.abort_multipart(upload_id)
+    }
+
+    fn ensure_namespace(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+    ) -> Result<(), GatewayError> {
+        self.ensure_namespace_exists(tenant_id, namespace_id)
     }
 
     fn delete(

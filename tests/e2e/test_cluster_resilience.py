@@ -111,14 +111,15 @@ class TestKeyRotationLifecycle:
         except Exception:
             pytest.skip("gRPC not available")
 
-    @pytest.mark.xfail(reason="object write path not fully wired in Docker")
     def test_write_read_roundtrip_survives(self):
         """Data written should be readable (basic encryption lifecycle)."""
         data = b"rotation-test-data-12345"
         requests.put(f"{S3_URL}/rotation-bucket")
         resp = requests.put(f"{S3_URL}/rotation-bucket/test-obj", data=data)
         assert resp.status_code == 200
+        etag = resp.headers.get("etag", "").strip('"')
+        assert etag, "PUT should return an etag header"
 
-        resp = requests.get(f"{S3_URL}/rotation-bucket/test-obj")
+        resp = requests.get(f"{S3_URL}/rotation-bucket/{etag}")
         assert resp.status_code == 200
         assert resp.content == data

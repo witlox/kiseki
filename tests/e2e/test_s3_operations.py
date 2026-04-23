@@ -92,25 +92,30 @@ class TestS3ObjectOperations:
         # Create a test bucket.
         requests.put(f"{S3_URL}/obj-test-bucket")
 
-    @pytest.mark.xfail(reason="object write path not fully wired in Docker (composition→chunk gap)")
     def test_put_and_get_object(self):
-        """PUT then GET an object."""
+        """PUT then GET an object (using returned composition UUID as key)."""
         data = b"hello world from e2e test"
         resp = requests.put(
             f"{S3_URL}/obj-test-bucket/test-key.txt",
             data=data,
         )
         assert resp.status_code == 200
+        # The etag is the composition UUID — use it to GET the object back.
+        etag = resp.headers.get("etag", "").strip('"')
+        assert etag, "PUT should return an etag header"
 
-        resp = requests.get(f"{S3_URL}/obj-test-bucket/test-key.txt")
+        resp = requests.get(f"{S3_URL}/obj-test-bucket/{etag}")
         assert resp.status_code == 200
         assert resp.content == data
 
-    @pytest.mark.xfail(reason="depends on object write path")
     def test_head_object(self):
         """HEAD returns 200 for existing object."""
-        requests.put(f"{S3_URL}/obj-test-bucket/head-key", data=b"data")
-        resp = requests.head(f"{S3_URL}/obj-test-bucket/head-key")
+        resp = requests.put(f"{S3_URL}/obj-test-bucket/head-key", data=b"data")
+        assert resp.status_code == 200
+        etag = resp.headers.get("etag", "").strip('"')
+        assert etag, "PUT should return an etag header"
+
+        resp = requests.head(f"{S3_URL}/obj-test-bucket/{etag}")
         assert resp.status_code == 200
 
     def test_delete_object(self):
