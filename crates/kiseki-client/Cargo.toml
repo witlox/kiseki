@@ -30,6 +30,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
 
+[[bin]]
+name = "kiseki-client"
+path = "src/bin/kiseki_client.rs"
+
 [dev-dependencies]
 kiseki-chunk = { workspace = true }
 kiseki-composition = { workspace = true }

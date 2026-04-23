@@ -46,8 +46,8 @@ object store). Backup data is encrypted with the system key at rest.
 # Via the admin dashboard
 curl -X POST http://node1:9090/ui/api/ops/backup
 
-# Via the StorageAdminService gRPC API
-grpcurl node1:9100 kiseki.v1.StorageAdminService/CreateBackup
+# Via the kiseki-server CLI
+kiseki-server backup create
 ```
 
 ### Backup contents
@@ -75,14 +75,13 @@ reading and re-encrypting terabytes of data).
 ### Listing backups
 
 ```bash
-grpcurl node1:9100 kiseki.v1.StorageAdminService/ListBackups
+kiseki-server backup list
 ```
 
 ### Deleting a backup
 
 ```bash
-grpcurl -d '{"backup_id": "backup-20260423-001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/DeleteBackup
+kiseki-server backup delete --backup-id backup-20260423-001
 ```
 
 ---
@@ -118,7 +117,7 @@ Deletion of expired backups is recorded in the cluster audit log.
 No manual intervention required. Monitor the repair progress via:
 
 ```bash
-grpcurl node1:9100 kiseki.v1.StorageAdminService/ListRepairs
+kiseki-server repair list
 ```
 
 ### Multiple node failure (quorum maintained)

@@ -2,7 +2,11 @@
 
 Kiseki provides two binaries with CLI interfaces: `kiseki-server` (which
 doubles as the admin CLI) and `kiseki-client` (native client with staging
-commands).
+and cache commands).
+
+All admin operations use these CLIs. The underlying gRPC API is also
+available for programmatic access (see [gRPC](grpc.md)), but the CLI is
+the primary admin interface.
 
 ---
 
@@ -30,71 +34,127 @@ kiseki-server status
 Display cluster status summary: node count, shard count, device health,
 Raft leadership, and pool utilization.
 
-### pool list
+### Node management
 
 ```
-kiseki-server pool list
+kiseki-server node add --node-id <id>
+kiseki-server node drain --node-id <id>
+kiseki-server node remove --node-id <id>
 ```
 
-List all affinity pools with their device class, capacity, utilization,
-EC parameters, and health thresholds.
+Add, drain, or remove a node from the cluster. Drain migrates shard
+assignments before removal. See
+[Cluster Management](../admin/cluster-management.md).
 
-### device list
-
-```
-kiseki-server device list
-```
-
-List all storage devices with their state (Healthy, Degraded, Evacuating,
-Failed, Removed), device class, capacity, and pool membership.
-
-### shard list
+### Shard management
 
 ```
 kiseki-server shard list
+kiseki-server shard info --shard-id <id>
+kiseki-server shard health --shard-id <id>
+kiseki-server shard split --shard-id <id> [--boundary <key>]
+kiseki-server shard maintenance --shard-id <id> --enabled
+kiseki-server shard maintenance --shard-id <id> --disabled
 ```
 
-List all shards with their Raft state (leader node, voter set), delta
-count, and maintenance status.
+List shards, inspect details, check health, trigger manual splits, and
+toggle per-shard maintenance mode (I-O6).
 
-### maintenance on
+### Pool management
+
+```
+kiseki-server pool list
+kiseki-server pool status --pool-id <id>
+kiseki-server pool create --pool-id <id> --device-class <class> --ec-data <n> --ec-parity <n>
+kiseki-server pool set-durability --pool-id <id> --ec-data <n> --ec-parity <n>
+kiseki-server pool rebalance --pool-id <id>
+kiseki-server pool cancel-rebalance --pool-id <id>
+kiseki-server pool set-thresholds --pool-id <id> --warning-pct <n> --critical-pct <n>
+```
+
+Manage affinity pools: create, inspect capacity, set EC parameters,
+rebalance data, and adjust capacity thresholds (I-C5, I-C6).
+
+### Device management
+
+```
+kiseki-server device list
+kiseki-server device info --device-id <id>
+kiseki-server device evacuate --device-id <id>
+kiseki-server device cancel-evacuation --device-id <id>
+kiseki-server device scrub --device-id <id>
+```
+
+List devices, check health and SMART status, trigger evacuation or
+integrity scrub, and cancel in-progress evacuations (I-D2, I-D3, I-D5).
+
+### Maintenance mode
 
 ```
 kiseki-server maintenance on
-```
-
-Enable maintenance mode. Sets all shards to read-only. Write commands are
-rejected with a retriable error. Shard splits, compaction, and GC for
-in-progress operations continue but no new triggers fire from write
-pressure (I-O6).
-
-### maintenance off
-
-```
 kiseki-server maintenance off
 ```
 
-Disable maintenance mode. Shards resume accepting writes.
+Enable or disable cluster-wide maintenance mode. Sets all shards to
+read-only. Write commands are rejected with a retriable error. Shard
+splits, compaction, and GC for in-progress operations continue but no
+new triggers fire from write pressure (I-O6).
+
+### Backup and recovery
+
+```
+kiseki-server backup create
+kiseki-server backup list
+kiseki-server backup delete --backup-id <id>
+kiseki-server repair list
+kiseki-server compact
+```
+
+Create, list, and delete backup snapshots. List active repairs and
+evacuations. Trigger Raft log compaction.
+
+### Key management
+
+```
+kiseki-server keymanager health
+kiseki-server keymanager check-kms
+kiseki-server keymanager check-kms --tenant-id <id>
+```
+
+Check system key manager health and tenant KMS connectivity.
+
+### S3 credentials
+
+```
+kiseki-server s3-credentials create --tenant-id <id> --workload-id <id>
+```
+
+Provision S3-compatible access keys for a tenant workload via the
+control plane.
+
+### Tuning parameters
+
+```
+kiseki-server tuning set --inline-threshold-bytes <n>
+kiseki-server tuning set --raft-snapshot-interval <n>
+kiseki-server tuning set --compaction-rate-mb-s <n>
+kiseki-server tuning set --stream-proc-poll-ms <n>
+```
+
+Adjust cluster-wide tuning parameters. See
+[Performance Tuning](../operations/performance.md) for guidance.
 
 ---
 
 ## kiseki-client
 
-The native client binary provides FUSE mount and staging commands.
-
-### FUSE mount
-
-```
-kiseki-client mount --mountpoint /mnt/kiseki --endpoint host:9100
-```
-
-Mount Kiseki as a FUSE filesystem at the specified mountpoint. The client
-discovers shards and views via the data fabric (ADR-008).
+The native client binary provides dataset staging and cache management
+commands for compute nodes.
 
 ### stage --dataset
 
 ```
-kiseki-client stage --dataset /path/to/data
+kiseki-client stage --dataset <path> [--timeout <seconds>]
 ```
 
 Pre-fetch a dataset's chunks into the L2 cache with pinned retention.
@@ -119,11 +179,56 @@ chunks fetched, total size, and any errors.
 ### stage --release
 
 ```
-kiseki-client stage --release
+kiseki-client stage --release <path>
 ```
 
 Release a staged dataset. Unpins cached chunks, making them eligible for
 LRU eviction. To pick up updates from canonical, release and re-stage.
+
+### stage --release-all
+
+```
+kiseki-client stage --release-all
+```
+
+Release all staged datasets.
+
+### cache --stats
+
+```
+kiseki-client cache --stats
+```
+
+Print cache statistics: mode, L1/L2 bytes used, hit/miss counts, errors,
+metadata cache stats, and wipe count.
+
+### cache --wipe
+
+```
+kiseki-client cache --wipe
+```
+
+Wipe all cached data (L1 + L2 + metadata). Zeroizes data before deletion
+(I-CC2).
+
+### version
+
+```
+kiseki-client version
+```
+
+Print the client version.
+
+---
+
+## Environment variables (kiseki-client)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KISEKI_CACHE_DIR` | `/tmp/kiseki-cache` | Cache directory |
+| `KISEKI_CACHE_MODE` | `organic` | Cache mode: `pinned`, `organic`, `bypass` |
+| `KISEKI_CACHE_L1_MAX` | `268435456` (256 MB) | L1 max bytes |
+| `KISEKI_CACHE_L2_MAX` | `53687091200` (50 GB) | L2 max bytes |
 
 ---
 

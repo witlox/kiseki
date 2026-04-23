@@ -145,8 +145,7 @@ df -h /var/lib/kiseki
 1. **Add devices** to the pool to increase capacity.
 2. **Rebalance** to distribute data more evenly:
    ```bash
-   grpcurl -d '{"pool_id": "fast-nvme"}' \
-     node1:9100 kiseki.v1.StorageAdminService/RebalancePool
+   kiseki-server pool rebalance --pool-id fast-nvme
    ```
 3. **Evacuate** devices from an over-full pool to a different pool
    (within the same device class).
@@ -155,11 +154,8 @@ df -h /var/lib/kiseki
 5. **Adjust thresholds** if the defaults are too conservative for your
    deployment:
    ```bash
-   grpcurl -d '{
-     "pool_id": "fast-nvme",
-     "warning_threshold_pct": 80,
-     "critical_threshold_pct": 90
-   }' node1:9100 kiseki.v1.StorageAdminService/SetPoolThresholds
+   kiseki-server pool set-thresholds --pool-id fast-nvme \
+     --warning-pct 80 --critical-pct 90
    ```
 
 ### Metadata disk full (system partition)
@@ -186,7 +182,7 @@ du -sh /var/lib/kiseki/small/objects.redb
    (128 bytes) when the hard limit is exceeded (I-SF2).
 2. Trigger Raft log compaction to reduce `raft/log.redb` size:
    ```bash
-   grpcurl node1:9100 kiseki.v1.StorageAdminService/TriggerCompaction
+   kiseki-server compact
    ```
 3. Run GC to clean up orphaned entries in `small/objects.redb`
    (I-SF6).
@@ -206,8 +202,7 @@ du -sh /var/lib/kiseki/small/objects.redb
 
 ```bash
 # Check shard health
-grpcurl -d '{"shard_id": "shard-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/GetShardHealth
+kiseki-server shard health --shard-id shard-0001
 
 # Check Raft events
 curl 'http://node1:9090/ui/api/events?category=raft'
@@ -257,8 +252,7 @@ does not complete.
 **Diagnosis**:
 
 ```bash
-grpcurl -d '{"shard_id": "shard-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/GetShard
+kiseki-server shard info --shard-id shard-0001
 ```
 
 **Resolution**:
@@ -270,8 +264,7 @@ grpcurl -d '{"shard_id": "shard-0001"}' \
   placement changes per shard.
 - Manually trigger a split if auto-split is not firing:
   ```bash
-  grpcurl -d '{"shard_id": "shard-0001"}' \
-    node1:9100 kiseki.v1.StorageAdminService/SplitShard
+  kiseki-server shard split --shard-id shard-0001
   ```
 
 ---
@@ -286,9 +279,8 @@ Trigger a manual integrity scrub to verify chunk data against EC parity:
 # Scrub all devices
 curl -X POST http://node1:9090/ui/api/ops/scrub
 
-# Scrub via gRPC (more options)
-grpcurl -d '{"device_id": "nvme-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/TriggerScrub
+# Scrub a specific device
+kiseki-server device scrub --device-id nvme-0001
 ```
 
 The periodic scrub runs every 7 days by default (`scrub_interval_h`).
@@ -303,8 +295,7 @@ Automatic evacuation triggers when a device reports:
 Check device health:
 
 ```bash
-grpcurl -d '{"device_id": "nvme-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/GetDevice
+kiseki-server device info --device-id nvme-0001
 ```
 
 ### Device evacuation
@@ -313,11 +304,10 @@ Monitor evacuation progress:
 
 ```bash
 # List active repairs/evacuations
-grpcurl node1:9100 kiseki.v1.StorageAdminService/ListRepairs
+kiseki-server repair list
 
 # Check device state
-grpcurl -d '{"device_id": "nvme-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/GetDevice
+kiseki-server device info --device-id nvme-0001
 ```
 
 Device state transitions: `Healthy -> Degraded -> Evacuating -> Failed -> Removed` (I-D2).
@@ -325,8 +315,7 @@ Device state transitions: `Healthy -> Degraded -> Evacuating -> Failed -> Remove
 A device in `Evacuating` state can be cancelled:
 
 ```bash
-grpcurl -d '{"device_id": "nvme-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/CancelEvacuation
+kiseki-server device cancel-evacuation --device-id nvme-0001
 ```
 
 `RemoveDevice` is rejected unless the device state is `Removed`
@@ -345,7 +334,7 @@ cluster-wide (I-K12).
 
 ```bash
 # Check key manager health
-grpcurl keyserver1:9400 kiseki.v1.KeyManagerService/KeyManagerHealth
+kiseki-server keymanager health
 
 # Check connectivity from storage node
 curl -s http://node1:9090/metrics | grep kms_reachability
@@ -368,8 +357,7 @@ the affected tenant. Other tenants are unaffected.
 **Diagnosis**:
 
 ```bash
-grpcurl -d '{"tenant_id": "acme-corp"}' \
-  node1:9100 kiseki.v1.KeyManagerService/CheckKmsHealth
+kiseki-server keymanager check-kms --tenant-id acme-corp
 ```
 
 **Resolution**:

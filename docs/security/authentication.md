@@ -141,8 +141,7 @@ API clients.
 Access keys are provisioned via the control plane:
 
 ```bash
-grpcurl -d '{"tenant_id": "acme-corp", "workload_id": "training-job-1"}' \
-  control:9200 kiseki.v1.ControlService/CreateS3Credentials
+kiseki-server s3-credentials create --tenant-id acme-corp --workload-id training-job-1
 ```
 
 ### Compatibility

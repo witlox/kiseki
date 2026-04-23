@@ -138,16 +138,18 @@ jobs:
         with:
           key: client-${{ matrix.arch }}
 
-      - name: Build client library (FFI + FUSE)
+      - name: Build client library and CLI (FFI + FUSE)
         run: |
           sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml
           cargo build --release -p kiseki-client --features ffi,fuse
+          cargo build --release --bin kiseki-client --features ffi,fuse
 
       - name: Package
         run: |
           mkdir -p dist
           cp target/release/libkiseki_client.so dist/ 2>/dev/null || \
           cp target/release/libkiseki_client.a dist/ 2>/dev/null || true
+          cp target/release/kiseki-client dist/ 2>/dev/null || true
           cp crates/kiseki-client/include/kiseki_client.h dist/ 2>/dev/null || true
           cd dist
           tar czf "../kiseki-client-${{ matrix.arch }}.tar.gz" *
@@ -222,16 +224,17 @@ jobs:
             | `kiseki-server-x86_64` | x86_64 | kiseki-server |
             | `kiseki-server-aarch64` | aarch64 | kiseki-server |
 
-            ## Client library
+            ## Client library and CLI
 
             Deploy on compute nodes. FUSE mount, C FFI, client-side cache
             with staging, C/C++ header for native integration.
+            Includes `kiseki-client` CLI for staging and cache management.
             Python SDK via `maturin develop --features python`.
 
             | Archive | Arch | Contents |
             |---------|------|----------|
-            | `kiseki-client-x86_64` | x86_64 | libkiseki_client.so + kiseki_client.h |
-            | `kiseki-client-aarch64` | aarch64 | libkiseki_client.so + kiseki_client.h |
+            | `kiseki-client-x86_64` | x86_64 | kiseki-client + libkiseki_client.so + kiseki_client.h |
+            | `kiseki-client-aarch64` | aarch64 | kiseki-client + libkiseki_client.so + kiseki_client.h |
 
             ## Docker image
 

@@ -277,10 +277,10 @@ testing.
 
 ```bash
 # Check key manager health
-grpcurl keyserver1:9400 kiseki.v1.KeyManagerService/KeyManagerHealth
+kiseki-server keymanager health
 
 # Check tenant KMS connectivity
-grpcurl node1:9100 kiseki.v1.KeyManagerService/CheckKmsHealth
+kiseki-server keymanager check-kms
 
 # Monitor key rotation metrics
 curl -s http://node1:9090/metrics | grep kiseki_key_rotation_total

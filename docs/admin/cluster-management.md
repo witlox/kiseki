@@ -23,8 +23,7 @@ are zero-downtime and zero-data-loss operations.
 3. Promote the node to a voter once it has caught up:
 
    ```bash
-   # Via the StorageAdminService gRPC API
-   grpcurl -d '{"node_id": 4}' node1:9100 kiseki.v1.StorageAdminService/AddNode
+   kiseki-server node add --node-id 4
    ```
 
 4. The node receives shard assignments and begins participating in Raft
@@ -39,7 +38,7 @@ remains in membership until the new voter is promoted.
 1. Drain the node to migrate its shard assignments to other nodes:
 
    ```bash
-   grpcurl -d '{"node_id": 4}' node1:9100 kiseki.v1.StorageAdminService/DrainNode
+   kiseki-server node drain --node-id 4
    ```
 
 2. Wait for all shards to be migrated. The drain operation uses Raft
@@ -49,7 +48,7 @@ remains in membership until the new voter is promoted.
 3. Once drained, remove the node from the cluster:
 
    ```bash
-   grpcurl -d '{"node_id": 4}' node1:9100 kiseki.v1.StorageAdminService/RemoveNode
+   kiseki-server node remove --node-id 4
    ```
 
 4. Stop the `kiseki-server` process and decommission the hardware.
@@ -80,15 +79,13 @@ are exceeded (I-L6).
 
 ```bash
 # List all shards
-grpcurl node1:9100 kiseki.v1.StorageAdminService/ListShards
+kiseki-server shard list
 
 # Get details for a specific shard
-grpcurl -d '{"shard_id": "shard-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/GetShard
+kiseki-server shard info --shard-id shard-0001
 
 # Check shard health
-grpcurl -d '{"shard_id": "shard-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/GetShardHealth
+kiseki-server shard health --shard-id shard-0001
 ```
 
 ### Automatic shard split
@@ -111,8 +108,7 @@ Any dimension exceeding its ceiling forces a split. The split operation:
 ### Manual shard split
 
 ```bash
-grpcurl -d '{"shard_id": "shard-0001", "boundary": "..."}' \
-  node1:9100 kiseki.v1.StorageAdminService/SplitShard
+kiseki-server shard split --shard-id shard-0001 --boundary "..."
 ```
 
 ### Shard maintenance mode
@@ -121,8 +117,7 @@ Set a shard to read-only for maintenance operations:
 
 ```bash
 # Enable maintenance mode (writes rejected with retriable error)
-grpcurl -d '{"shard_id": "shard-0001", "enabled": true}' \
-  node1:9100 kiseki.v1.StorageAdminService/SetShardMaintenance
+kiseki-server shard maintenance --shard-id shard-0001 --enabled
 ```
 
 During maintenance mode (I-O6):
@@ -150,22 +145,17 @@ Pools are the unit of capacity management and durability policy.
 
 ```bash
 # List all pools
-grpcurl node1:9100 kiseki.v1.StorageAdminService/ListPools
+kiseki-server pool list
 
 # Get pool details including capacity and health
-grpcurl -d '{"pool_id": "fast-nvme"}' \
-  node1:9100 kiseki.v1.StorageAdminService/PoolStatus
+kiseki-server pool status --pool-id fast-nvme
 ```
 
 ### Creating a pool
 
 ```bash
-grpcurl -d '{
-  "pool_id": "fast-nvme",
-  "device_class": "NvmeU2",
-  "ec_data_chunks": 4,
-  "ec_parity_chunks": 2
-}' node1:9100 kiseki.v1.StorageAdminService/CreatePool
+kiseki-server pool create --pool-id fast-nvme --device-class NvmeU2 \
+  --ec-data 4 --ec-parity 2
 ```
 
 **Important**: EC parameters (`ec_data_chunks`, `ec_parity_chunks`) are
@@ -176,11 +166,8 @@ creating a new pool and migrating data via `ReencodePool`.
 
 ```bash
 # Switch pool durability strategy (applies to new chunks only)
-grpcurl -d '{
-  "pool_id": "fast-nvme",
-  "ec_data_chunks": 4,
-  "ec_parity_chunks": 2
-}' node1:9100 kiseki.v1.StorageAdminService/SetPoolDurability
+kiseki-server pool set-durability --pool-id fast-nvme \
+  --ec-data 4 --ec-parity 2
 ```
 
 Existing chunks retain their original EC config. Re-encoding requires
@@ -192,12 +179,10 @@ Rebalance distributes data evenly across devices in a pool:
 
 ```bash
 # Start rebalance
-grpcurl -d '{"pool_id": "fast-nvme"}' \
-  node1:9100 kiseki.v1.StorageAdminService/RebalancePool
+kiseki-server pool rebalance --pool-id fast-nvme
 
 # Cancel a running rebalance
-grpcurl -d '{"pool_id": "fast-nvme"}' \
-  node1:9100 kiseki.v1.StorageAdminService/CancelRebalance
+kiseki-server pool cancel-rebalance --pool-id fast-nvme
 ```
 
 Rebalance runs at the configured `rebalance_rate_mb_s` (default
@@ -211,12 +196,10 @@ Evacuation can also be initiated manually:
 
 ```bash
 # Start evacuation
-grpcurl -d '{"device_id": "nvme-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/EvacuateDevice
+kiseki-server device evacuate --device-id nvme-0001
 
 # Cancel evacuation
-grpcurl -d '{"device_id": "nvme-0001"}' \
-  node1:9100 kiseki.v1.StorageAdminService/CancelEvacuation
+kiseki-server device cancel-evacuation --device-id nvme-0001
 ```
 
 Evacuation migrates all chunks from the device to other devices in the
@@ -258,9 +241,8 @@ curl -X POST http://node1:9090/ui/api/ops/maintenance \
   -H 'Content-Type: application/json' \
   -d '{"enabled": true}'
 
-# Via the control plane
-grpcurl -d '{"enabled": true}' \
-  node1:9100 kiseki.v1.ControlService/SetMaintenanceMode
+# Via the kiseki-server CLI
+kiseki-server maintenance on
 ```
 
 ### Maintenance mode behavior

@@ -133,8 +133,7 @@ system disk capacity (I-SF1, I-SF2). Manual adjustment:
 
 ```bash
 # Set cluster-wide default for new shards
-grpcurl -d '{"params": {"inline_threshold_bytes": 8192}}' \
-  node1:9100 kiseki.v1.StorageAdminService/SetTuningParams
+kiseki-server tuning set --inline-threshold-bytes 8192
 ```
 
 ### Trade-offs
@@ -218,8 +217,7 @@ srun --export=ALL python train.py
 ### Snapshot interval
 
 ```bash
-grpcurl -d '{"params": {"raft_snapshot_interval": 10000}}' \
-  node1:9100 kiseki.v1.StorageAdminService/SetTuningParams
+kiseki-server tuning set --raft-snapshot-interval 10000
 ```
 
 - **Lower values** (1000-5000): More frequent snapshots. Faster
@@ -230,8 +228,7 @@ grpcurl -d '{"params": {"raft_snapshot_interval": 10000}}' \
 ### Compaction rate
 
 ```bash
-grpcurl -d '{"params": {"compaction_rate_mb_s": 200}}' \
-  node1:9100 kiseki.v1.StorageAdminService/SetTuningParams
+kiseki-server tuning set --compaction-rate-mb-s 200
 ```
 
 Higher compaction rate reduces Raft log size faster but consumes more
@@ -240,8 +237,7 @@ I/O bandwidth.
 ### View materialization poll interval
 
 ```bash
-grpcurl -d '{"params": {"stream_proc_poll_ms": 50}}' \
-  node1:9100 kiseki.v1.StorageAdminService/SetTuningParams
+kiseki-server tuning set --stream-proc-poll-ms 50
 ```
 
 Lower poll interval reduces view staleness but increases CPU usage.
