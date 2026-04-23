@@ -28,6 +28,9 @@ pub mod versioning;
 // Clock skew detection for cluster health monitoring (I-T6).
 pub mod clock_skew;
 
+// Chaos testing framework — fault injection primitives.
+pub mod chaos;
+
 // Inline store trait (ADR-030) — shared between kiseki-log and kiseki-chunk.
 pub mod inline_store;
 
