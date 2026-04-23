@@ -38,3 +38,4 @@ rustls = { workspace = true }
 rcgen = "0.13"
 proptest = { workspace = true }
 serde_json = "1"
+tempfile = "3"
