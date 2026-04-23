@@ -178,7 +178,52 @@ pub trait TenantKmsProvider: Send + Sync {
 
 - Connectivity test, wrap/unwrap round-trip, cert chain validation
 
-**Effort**: 8-12 sessions (3-4 per provider)
+### 3.6 OIDC/JWT tenant IdP validation (I-Auth2)
+
+File: `kiseki-control/src/idp.rs`
+
+Per-tenant OIDC configuration in `TenantConfig`:
+```rust
+pub struct TenantIdpConfig {
+    pub issuer_url: String,          // e.g. https://keycloak.site/realms/hpc
+    pub client_id: String,           // Kiseki's client_id at the IdP
+    pub jwks_uri: Option<String>,    // override; default: {issuer}/.well-known/jwks.json
+    pub audience: Option<String>,    // expected JWT "aud" claim
+    pub claim_mapping: ClaimMapping, // which JWT claims → OrgId, project, workload
+}
+
+pub struct ClaimMapping {
+    pub org_claim: String,       // default: "org" or "tenant_id"
+    pub project_claim: String,   // default: "project"
+    pub workload_claim: String,  // default: "workload" or "sub"
+}
+```
+
+Implementation:
+- **JWT validation**: verify signature against JWKS (RS256/ES256),
+  check `exp`, `iss`, `aud` claims. Use `jsonwebtoken` crate.
+- **JWKS cache**: fetch JWKS from IdP, cache with TTL (default 1h),
+  refresh on unknown `kid`.
+- **Claim extraction**: map JWT claims to `(OrgId, ProjectId, WorkloadId)`
+  via `ClaimMapping`.
+- **Integration point**: second-stage auth after mTLS (I-Auth2).
+  mTLS establishes "belongs to this cluster", JWT establishes
+  "authorized by this tenant's admin for this workload."
+- **Fallback**: if tenant has no IdP configured, mTLS alone is
+  sufficient (existing behavior, I-Auth2 is optional).
+- **LDAP/AD note**: not consumed directly. Sites using LDAP/AD
+  federate through their OIDC provider (Keycloak LDAP federation,
+  Azure AD, etc.). Kiseki speaks OIDC only. Document in deployment
+  guide.
+
+Tests:
+- Valid JWT accepted, claims extracted correctly
+- Expired JWT rejected
+- Wrong issuer rejected
+- Unknown kid triggers JWKS refresh
+- No IdP config → mTLS-only (pass-through)
+
+**Effort**: 10-14 sessions (3-4 per provider + 2-3 for OIDC)
 
 ---
 
@@ -280,11 +325,11 @@ Phase 6 is the capstone — tests everything.
 |-------|----------|-------|
 | 1: Consensus hardening | 8-12 | Membership, clock skew, shard split |
 | 2: Admin + gateway | 10-15 | CLI, S3 CRUD, threshold, migration |
-| 3: External KMS | 8-12 | Vault + AWS + validation |
+| 3: External KMS + OIDC | 10-14 | Vault + AWS + OIDC/JWT + validation |
 | 4: NFS Kerberos | 3-5 | RPCSEC_GSS + ACLs |
 | 5: Federation | 5-8 | Async replication + residency |
 | 6: Chaos testing | 5-8 | Fault injection + Jepsen-style |
-| **Total** | **39-60** | |
+| **Total** | **41-62** | |
 
 ## Post-implementation
 
