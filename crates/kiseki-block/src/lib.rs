@@ -18,13 +18,17 @@ pub mod backend;
 pub mod error;
 pub mod extent;
 pub mod file;
+pub mod journal;
 pub mod probe;
 pub mod superblock;
+pub mod trim;
 
 pub use allocator::BitmapAllocator;
 pub use backend::DeviceBackend;
 pub use error::{AllocError, BlockError};
 pub use extent::Extent;
 pub use file::FileBackedDevice;
+pub use journal::Journal;
 pub use probe::{DetectedMedium, DeviceCharacteristics, IoStrategy};
 pub use superblock::Superblock;
+pub use trim::{TrimConfig, TrimQueue};
