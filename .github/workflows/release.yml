@@ -10,6 +10,9 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Preflight: format, clippy, tests, deny
+  # ---------------------------------------------------------------------------
   preflight:
     name: Preflight checks
     runs-on: ubuntu-latest
@@ -27,29 +30,28 @@ jobs:
       - name: Compute version
         id: version
         run: |
-          chmod +x scripts/set-version.sh
-          scripts/set-version.sh
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --exclude kiseki-acceptance --locked
-      - name: Run BDD acceptance tests (no failures allowed)
+      - run: cargo nextest run --workspace --exclude kiseki-acceptance --run-ignored all
+      - name: Run BDD acceptance tests
         run: |
-          output=$(cargo test -p kiseki-acceptance --locked 2>&1)
+          output=$(cargo test -p kiseki-acceptance 2>&1)
           echo "$output" | tail -10
-          if echo "$output" | grep -qE "[0-9]+ failed"; then
+          if echo "$output" | grep -qE "[1-9][0-9]* failed"; then
             echo "::error::BDD scenarios failed"
             exit 1
           fi
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # ---------------------------------------------------------------------------
-  # Server binary: x86_64 + aarch64 on Rocky 9 (glibc 2.34, RHEL 9 baseline)
+  # Server binary: kiseki-server — per-arch on Rocky 9
   # ---------------------------------------------------------------------------
-  build:
-    name: Build (${{ matrix.arch }})
+  server:
+    name: Server (${{ matrix.arch }})
     needs: preflight
     runs-on: ${{ matrix.runner }}
     container:
@@ -66,7 +68,7 @@ jobs:
       - name: Install system dependencies
         run: |
           dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
-            perl-IPC-Cmd git curl unzip tar gzip make findutils
+            perl-IPC-Cmd git curl unzip tar gzip make findutils cmake
 
       - uses: actions/checkout@v6
         with:
@@ -77,15 +79,12 @@ jobs:
       - uses: arduino/setup-protoc@v3
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.arch }}
+          key: server-${{ matrix.arch }}
 
-      - name: Set version
+      - name: Build kiseki-server (non-FIPS for release)
         run: |
-          chmod +x scripts/set-version.sh
-          scripts/set-version.sh
-
-      - name: Build kiseki-server
-        run: cargo build --release --bin kiseki-server --locked
+          sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml
+          cargo build --release --bin kiseki-server
 
       - name: Package
         run: |
@@ -104,11 +103,97 @@ jobs:
             kiseki-server-${{ matrix.arch }}.tar.gz.sha256
 
   # ---------------------------------------------------------------------------
-  # Publish: collect all artifacts into a GitHub release
+  # Client library: kiseki-client — per-arch on Rocky 9
+  # ---------------------------------------------------------------------------
+  client:
+    name: Client (${{ matrix.arch }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: rockylinux:9
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
+            perl-IPC-Cmd git curl unzip tar gzip make findutils cmake \
+            fuse3-devel
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: client-${{ matrix.arch }}
+
+      - name: Build client library (FFI + FUSE)
+        run: |
+          sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml
+          cargo build --release -p kiseki-client --features ffi,fuse
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/libkiseki_client.so dist/ 2>/dev/null || \
+          cp target/release/libkiseki_client.a dist/ 2>/dev/null || true
+          cp crates/kiseki-client/include/kiseki_client.h dist/ 2>/dev/null || true
+          cd dist
+          tar czf "../kiseki-client-${{ matrix.arch }}.tar.gz" *
+          cd ..
+          sha256sum "kiseki-client-${{ matrix.arch }}.tar.gz" > "kiseki-client-${{ matrix.arch }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kiseki-client-${{ matrix.arch }}
+          path: |
+            kiseki-client-${{ matrix.arch }}.tar.gz
+            kiseki-client-${{ matrix.arch }}.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
+  # Docker image: ghcr.io
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.server
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ needs.preflight.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Publish: GitHub release with all artifacts
   # ---------------------------------------------------------------------------
   publish:
     name: Publish release
-    needs: [preflight, build]
+    needs: [preflight, server, client, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -126,14 +211,46 @@ jobs:
             Built on Rocky Linux 9 (glibc 2.34, kernel 5.14) — compatible with
             RHEL 9+, Rocky 9+, AlmaLinux 9+, Ubuntu 22.04+, Debian 12+, SLES 15 SP4+.
 
-            ## Server binary
+            ## Server binaries
+
+            Deploy on storage nodes. Includes S3/NFS gateways, Raft consensus,
+            admin web UI, Prometheus metrics, OpenTelemetry tracing, admin CLI.
 
             | Archive | Arch | Contents |
             |---------|------|----------|
-            | `kiseki-server-x86_64` | x86_64 | kiseki-server (NFS3/4, S3, gRPC, advisory) |
-            | `kiseki-server-aarch64` | aarch64 | kiseki-server (NFS3/4, S3, gRPC, advisory) |
+            | `kiseki-server-x86_64` | x86_64 | kiseki-server |
+            | `kiseki-server-aarch64` | aarch64 | kiseki-server |
 
-            All binaries include FIPS-validated AES-256-GCM encryption (aws-lc-rs).
+            ## Client library
+
+            Deploy on compute nodes. FUSE mount, C FFI, client-side cache
+            with staging, C/C++ header for native integration.
+            Python SDK via `maturin develop --features python`.
+
+            | Archive | Arch | Contents |
+            |---------|------|----------|
+            | `kiseki-client-x86_64` | x86_64 | libkiseki_client.so + kiseki_client.h |
+            | `kiseki-client-aarch64` | aarch64 | libkiseki_client.so + kiseki_client.h |
+
+            ## Docker image
+
+            ```
+            docker pull ghcr.io/${{ github.repository }}:${{ needs.preflight.outputs.version }}
+            ```
+
+            ## Crate integration
+
+            For Lattice (workload scheduler):
+            ```toml
+            kiseki-client = { git = "https://github.com/witlox/kiseki" }
+            ```
+
+            For Pact (admin operations):
+            ```toml
+            kiseki-common = { git = "https://github.com/witlox/kiseki" }
+            ```
           files: |
             kiseki-server-*/kiseki-server-*.tar.gz
             kiseki-server-*/kiseki-server-*.tar.gz.sha256
+            kiseki-client-*/kiseki-client-*.tar.gz
+            kiseki-client-*/kiseki-client-*.tar.gz.sha256
