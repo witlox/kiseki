@@ -71,7 +71,7 @@ kiseki-control = { path = "crates/kiseki-control", version = "2026.1.0" }
 kiseki-server = { path = "crates/kiseki-server", version = "2026.1.0" }
 
 # --- Core ---
-thiserror = "1"
+thiserror = "2"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
 aws-lc-rs = { version = "1", features = ["alloc"] }
@@ -110,7 +110,7 @@ reed-solomon-erasure = "6"
 
 # --- Testing ---
 proptest = "1"
-cucumber = "0.21"
+cucumber = "0.22"
 tokio-test = "0.4"
 
 [profile.release]
