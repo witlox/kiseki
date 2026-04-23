@@ -5,6 +5,7 @@
 #   docker compose up --build -d && pytest — e2e tests
 #
 # The server creates a bootstrap shard for e2e testing by default.
+# Includes: Jaeger (tracing), Vault (KMS), Keycloak (OIDC).
 
 services:
   kiseki-server:
@@ -14,6 +15,7 @@ services:
     ports:
       - "2049:2049"  # NFS (v3 + v4.2)
       - "9000:9000"  # S3 HTTP gateway
+      - "9090:9090"  # Prometheus metrics
       - "9100:9100"  # data-path gRPC
       - "9101:9101"  # advisory gRPC
     environment:
@@ -21,9 +23,9 @@ services:
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
       KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
+      KISEKI_METRICS_ADDR: "0.0.0.0:9090"
       KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "true"
-      KISEKI_METRICS_ADDR: "0.0.0.0:9090"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
       OTEL_SERVICE_NAME: "kiseki-server"
       OTEL_TRACES_SAMPLER_ARG: "1.0"
@@ -32,6 +34,8 @@ services:
     depends_on:
       jaeger:
         condition: service_started
+      vault:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null"]
       interval: 2s
@@ -45,6 +49,37 @@ services:
       - "16686:16686" # Jaeger UI
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+
+  vault:
+    image: hashicorp/vault:1.19
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "kiseki-e2e-token"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    ports:
+      - "8080:8080"
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+    command: ["start-dev"]
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && cat <&3 | grep -q UP"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
 volumes:
   kiseki-data:
