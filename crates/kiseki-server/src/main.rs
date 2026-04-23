@@ -24,6 +24,8 @@ pub(crate) mod migration;
 mod runtime;
 mod system_disk;
 mod telemetry;
+#[allow(dead_code)] // Wired when metrics server integrates UI router.
+pub(crate) mod web;
 
 fn main() {
     // Load config before the runtime — it's pure env parsing, no async needed.
