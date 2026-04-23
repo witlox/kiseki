@@ -86,6 +86,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 # --- Observability ---
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 prometheus = "0.13"
 
 # --- TLS ---

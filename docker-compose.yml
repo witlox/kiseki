@@ -23,16 +23,28 @@ services:
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
       KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "true"
+      KISEKI_METRICS_ADDR: "0.0.0.0:9090"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+      OTEL_SERVICE_NAME: "kiseki-server"
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
     volumes:
       - kiseki-data:/data
+    depends_on:
+      jaeger:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null"]
       interval: 2s
       timeout: 2s
       retries: 10
 
-  # Control plane (ADR-027): now a Rust crate (kiseki-control), will be
-  # wired into kiseki-server or run as a separate binary in a future phase.
+  jaeger:
+    image: jaegertracing/jaeger:2
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "16686:16686" # Jaeger UI
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
 
 volumes:
   kiseki-data:

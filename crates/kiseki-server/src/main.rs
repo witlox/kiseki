@@ -16,29 +16,10 @@ mod integrity;
 pub(crate) mod metrics;
 mod runtime;
 mod system_disk;
-
-fn init_tracing() {
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    let log_format = std::env::var("KISEKI_LOG_FORMAT").unwrap_or_default();
-    if log_format == "json" {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer().json())
-            .init();
-    } else {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer())
-            .init();
-    }
-}
+mod telemetry;
 
 fn main() {
-    init_tracing();
+    let otel_provider = telemetry::init_tracing();
 
     let cfg = config::ServerConfig::from_env();
     tracing::info!(
@@ -89,4 +70,5 @@ fn main() {
     // Clean shutdown.
     advisory_rt.block_on(async { advisory_handle.await.ok() });
     tracing::info!("kiseki-server shut down");
+    telemetry::shutdown_tracing(otel_provider);
 }
