@@ -37,7 +37,7 @@ const TTL: Duration = Duration::from_secs(1);
 #[cfg(feature = "fuse")]
 fn to_fuser_attr(ino: u64, attr: &crate::fuse_fs::FileAttr) -> FuserAttr {
     FuserAttr {
-        ino,
+        ino: INodeNo::from(ino),
         size: attr.size,
         blocks: (attr.size + 511) / 512,
         atime: SystemTime::UNIX_EPOCH,
@@ -233,14 +233,12 @@ pub fn mount<G: GatewayOps + Send + Sync + 'static>(
     mountpoint: &Path,
 ) -> Result<(), std::io::Error> {
     let daemon = FuseDaemon::new(fs);
-    let options = Config {
-        mount_options: vec![
-            MountOption::RO,
-            MountOption::FSName("kiseki".to_owned()),
-            MountOption::AutoUnmount,
-        ],
-        ..Config::default()
-    };
+    let mut options = Config::default();
+    options.mount_options = vec![
+        MountOption::RO,
+        MountOption::FSName("kiseki".to_owned()),
+        MountOption::AutoUnmount,
+    ];
     fuser::mount2(daemon, mountpoint, &options)
         .map_err(|e| std::io::Error::other(format!("FUSE mount failed: {e}")))
 }
