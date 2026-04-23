@@ -24,10 +24,13 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
 
+# PRs:   Stage 1 only (fast gates)
+# Push:  All stages
+#
 # Stage 1: fast gates (fmt, clippy, deny) — parallel
-# Stage 2: feature flag compilation matrix — after stage 1
-# Stage 3: test suites (unit, BDD, e2e, proto, arch) — parallel, after stage 2
-# Stage 4: coverage — after stage 3
+# Stage 2: feature flag compilation matrix — after stage 1 (push only)
+# Stage 3: test suites (unit, BDD, e2e, proto, arch) — parallel, after stage 2 (push only)
+# Stage 4: coverage — after stage 3 (push only)
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -70,6 +73,7 @@ jobs:
 
   feature-check:
     name: Feature Check (${{ matrix.name }})
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [fmt, clippy, deny]
     strategy:
@@ -124,6 +128,7 @@ jobs:
 
   test:
     name: Unit Tests
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [feature-check]
     steps:
@@ -136,6 +141,7 @@ jobs:
 
   acceptance:
     name: BDD Acceptance
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [feature-check]
     steps:
@@ -155,6 +161,7 @@ jobs:
 
   e2e:
     name: E2E Integration
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [feature-check]
     continue-on-error: true  # Phase 12c: e2e integration hardening in progress
@@ -207,6 +214,7 @@ jobs:
 
   proto-coverage:
     name: Proto Coverage
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [feature-check]
     steps:
@@ -226,6 +234,7 @@ jobs:
 
   arch-check:
     name: Architecture Check
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [feature-check]
     steps:
@@ -245,6 +254,7 @@ jobs:
 
   coverage:
     name: Coverage
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [test, acceptance]
     steps:
