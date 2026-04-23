@@ -47,7 +47,17 @@ impl Journal {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let entries = if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            serde_json::from_str::<Vec<JournalEntry>>(&content).unwrap_or_default()
+            match serde_json::from_str::<Vec<JournalEntry>>(&content) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "journal file corrupt, entries may be lost"
+                    );
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -119,7 +129,10 @@ impl Journal {
 
     fn persist(&self) -> std::io::Result<()> {
         let json = serde_json::to_string(&self.entries).map_err(std::io::Error::other)?;
-        std::fs::write(&self.path, json)
+        // Atomic write: write to temp file, then rename (atomic on POSIX).
+        let tmp_path = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, json)?;
+        std::fs::rename(&tmp_path, &self.path)
     }
 }
 

@@ -7,6 +7,7 @@
 use std::sync::Mutex;
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
+use zeroize::Zeroizing;
 
 use crate::provider::{KmsEpochId, KmsError, KmsHealth, TenantKmsProvider};
 
@@ -22,7 +23,7 @@ pub struct InternalProvider {
 }
 
 struct InternalState {
-    key: Vec<u8>,
+    key: Zeroizing<Vec<u8>>,
     epoch: u64,
 }
 
@@ -36,7 +37,10 @@ impl InternalProvider {
     pub fn new(key: Vec<u8>) -> Self {
         assert!(key.len() == 32, "key must be exactly 32 bytes");
         Self {
-            inner: Mutex::new(InternalState { key, epoch: 1 }),
+            inner: Mutex::new(InternalState {
+                key: Zeroizing::new(key),
+                epoch: 1,
+            }),
         }
     }
 
@@ -119,7 +123,7 @@ impl TenantKmsProvider for InternalProvider {
 
         state.epoch += 1;
         let epoch_id = format!("internal-epoch-{}", state.epoch);
-        state.key = new_key;
+        state.key = Zeroizing::new(new_key);
 
         Ok(epoch_id)
     }

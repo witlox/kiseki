@@ -88,12 +88,13 @@ impl<T: Transport> ConnectionPool<T> {
         }
 
         // Check active count before creating new.
+        // Lock ordering: idle THEN active (same order as the idle-check block
+        // above) to prevent deadlocks.
         {
-            let active = self.active.lock().await;
-            let count = active.get(&addr).copied().unwrap_or(0);
-            // Also count idle connections toward the cap.
             let idle = self.idle.lock().await;
             let idle_count = idle.get(&addr).map_or(0, VecDeque::len);
+            let active = self.active.lock().await;
+            let count = active.get(&addr).copied().unwrap_or(0);
             if count + idle_count >= self.config.max_per_endpoint {
                 return Err(TransportError::PoolExhausted(addr.to_string()));
             }

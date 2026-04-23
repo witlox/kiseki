@@ -19,6 +19,16 @@ pub struct TenantIdpConfig {
     pub audience: Option<String>,
     /// Mapping from JWT claims to Kiseki identity fields.
     pub claim_mapping: ClaimMapping,
+    /// When `true`, accept tokens without cryptographic signature verification.
+    ///
+    /// # Warning
+    ///
+    /// JWKS signature verification is **not yet implemented**. Setting this to
+    /// `false` (the default) causes `validate_jwt` to reject all tokens until
+    /// signature verification is available. Callers must explicitly set this to
+    /// `true` to opt in to insecure, structure-only validation.
+    #[serde(default)]
+    pub unsafe_no_signature_verify: bool,
 }
 
 /// Configurable mapping from JWT claim names to Kiseki identity fields.
@@ -91,9 +101,12 @@ pub enum IdpError {
 /// This performs structural validation (base64 decode, JSON parse),
 /// issuer verification, expiry check, and claim extraction.
 ///
-/// **Note:** JWKS signature verification is not yet implemented.
-/// This function trusts the token structure after decode. Full
-/// signature validation will be added behind a feature gate.
+/// # Warning — signature verification not implemented
+///
+/// JWKS signature verification is **not yet implemented**. Unless
+/// `config.unsafe_no_signature_verify` is `true`, this function will
+/// return an error. Callers must explicitly opt in to insecure mode.
+#[must_use = "this result must be checked — signature verification is not implemented"]
 pub fn validate_jwt(token: &str, config: &TenantIdpConfig) -> Result<ValidatedClaims, IdpError> {
     // JWT is header.payload.signature — we need the payload.
     let parts: Vec<&str> = token.split('.').collect();
@@ -102,6 +115,18 @@ pub fn validate_jwt(token: &str, config: &TenantIdpConfig) -> Result<ValidatedCl
             "expected 3 dot-separated parts".into(),
         ));
     }
+
+    // Reject tokens unless the caller explicitly opted in to insecure mode.
+    if !config.unsafe_no_signature_verify {
+        return Err(IdpError::InvalidToken(
+            "signature verification required but not implemented".into(),
+        ));
+    }
+
+    tracing::warn!(
+        "JWT signature verification not implemented \
+         — accepting token without cryptographic proof"
+    );
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -214,6 +239,7 @@ mod tests {
             issuer_url: "https://idp.example.com".into(),
             audience: Some("kiseki-api".into()),
             claim_mapping: ClaimMapping::default(),
+            unsafe_no_signature_verify: true,
         }
     }
 
@@ -314,6 +340,19 @@ mod tests {
 
         let result = validate_jwt(&token, &test_config()).unwrap();
         assert!(result.project_id.is_none());
+    }
+
+    #[test]
+    fn secure_mode_rejects_without_signature_verify() {
+        let token = build_test_jwt(&valid_claims());
+        let config = TenantIdpConfig {
+            unsafe_no_signature_verify: false,
+            ..test_config()
+        };
+        let result = validate_jwt(&token, &config);
+        assert!(
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("signature verification required"))
+        );
     }
 
     #[test]

@@ -179,12 +179,28 @@ pub fn compute_plan(pool_devices: &[DeviceUsage], capacity_threshold: f64) -> Ve
 
         #[allow(clippy::cast_possible_truncation)]
         let chunks_needed = excess.div_ceil(avg_chunk_size) as usize;
-        let chunks_to_move: Vec<ChunkId> = src.chunks.iter().take(chunks_needed).copied().collect();
+        // Cap by target device free space so we don't over-fill the target.
+        let target = under[under_idx];
+        let target_free = target.capacity_bytes.saturating_sub(target.used_bytes);
+        #[allow(clippy::cast_possible_truncation)]
+        let max_by_target = target_free.checked_div(avg_chunk_size).unwrap_or(0) as usize;
+        let chunks_to_move: Vec<ChunkId> = src
+            .chunks
+            .iter()
+            .take(chunks_needed.min(max_by_target))
+            .copied()
+            .collect();
+
+        if chunks_to_move.is_empty() {
+            under_idx += 1;
+            continue;
+        }
+
         let estimated_bytes = chunks_to_move.len() as u64 * avg_chunk_size;
 
         plans.push(RebalancePlan {
             source_device: src.device_id,
-            target_device: under[under_idx].device_id,
+            target_device: target.device_id,
             chunks_to_move,
             estimated_bytes,
         });

@@ -77,9 +77,10 @@ impl FaultInjector {
 
     /// Enable slow I/O with the given latency.
     pub fn slow_io_on(&self, latency: Duration) {
-        self.inner
-            .slow_io_us
-            .store(u64::try_from(latency.as_micros()).unwrap_or(u64::MAX), Ordering::Release);
+        self.inner.slow_io_us.store(
+            u64::try_from(latency.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
         self.inner.slow_io_enabled.store(true, Ordering::Release);
         self.inner.faults_injected.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(latency_us = latency.as_micros(), "chaos: slow I/O ENABLED");
@@ -111,9 +112,10 @@ impl FaultInjector {
 
     /// Enable clock skew with the given offset.
     pub fn clock_skew_on(&self, offset: Duration) {
-        self.inner
-            .clock_skew_ms
-            .store(u64::try_from(offset.as_millis()).unwrap_or(u64::MAX), Ordering::Release);
+        self.inner.clock_skew_ms.store(
+            u64::try_from(offset.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
         self.inner.clock_skew_enabled.store(true, Ordering::Release);
         self.inner.faults_injected.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(offset_ms = offset.as_millis(), "chaos: clock skew ENABLED");

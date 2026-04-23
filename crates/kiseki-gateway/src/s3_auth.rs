@@ -277,11 +277,26 @@ pub fn validate_request(
         .lookup(&parsed.access_key)
         .ok_or_else(|| AuthError::UnknownAccessKey(parsed.access_key.clone()))?;
 
+    // Validate that signed_headers includes "host" (AWS SigV4 requirement).
+    if !parsed.signed_headers.iter().any(|h| h == "host") {
+        return Err(AuthError::MalformedAuth(
+            "host must be a signed header".into(),
+        ));
+    }
+
     // Get timestamp from x-amz-date header.
     let timestamp = headers
         .get("x-amz-date")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+
+    if timestamp.is_empty() {
+        return Err(AuthError::MalformedAuth(
+            "missing or empty x-amz-date header".into(),
+        ));
+    }
+
+    // TODO: Validate timestamp window (+-15min) when wall clock is available.
 
     // Build scope.
     let scope = format!(
@@ -300,8 +315,8 @@ pub fn validate_request(
     let expected_sig = hmac_sha256(signing_key.as_ref(), sts.as_bytes());
     let expected_hex = hex_encode(expected_sig.as_ref());
 
-    // Constant-time comparison.
-    if expected_hex != parsed.signature {
+    // Constant-time comparison to prevent timing side-channels.
+    if !constant_time_eq(expected_hex.as_bytes(), parsed.signature.as_bytes()) {
         return Err(AuthError::SignatureDoesNotMatch);
     }
 
@@ -323,6 +338,21 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
 fn sha256_hex(data: &[u8]) -> String {
     let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
     hex_encode(digest.as_ref())
+}
+
+/// Constant-time byte comparison to prevent timing side-channels.
+///
+/// Returns `true` if both slices are equal. Always examines all bytes
+/// regardless of where (or whether) they differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
