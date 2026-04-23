@@ -10,7 +10,15 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# NVIDIA GPUDirect Storage via cuFile (requires CUDA toolkit + nvidia-gds).
+gpu-cuda = ["libc"]
+# AMD ROCm GPU-direct via HIP (requires ROCm toolkit).
+gpu-rocm = ["libc"]
+
 [dependencies]
+libc = { workspace = true, optional = true }
 kiseki-block = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }

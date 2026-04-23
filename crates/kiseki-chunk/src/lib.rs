@@ -16,6 +16,9 @@
 pub mod device;
 pub mod ec;
 pub mod error;
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm", test))]
+#[allow(unsafe_code)]
+pub mod gpu_direct;
 pub mod persistent_store;
 pub mod placement;
 pub mod pool;
@@ -23,6 +26,8 @@ pub mod small_object_store;
 pub mod store;
 
 pub use error::ChunkError;
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm", test))]
+pub use gpu_direct::{GpuBackend, GpuDmaAllocator, GpuDmaBuffer, MockDmaAllocator};
 pub use persistent_store::PersistentChunkStore;
 pub use pool::{AffinityPool, DurabilityStrategy};
 pub use small_object_store::SmallObjectStore;

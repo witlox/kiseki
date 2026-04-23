@@ -98,7 +98,7 @@ fn tcp_is_ultimate_fallback() {
     );
 }
 
-/// Even with no registered transports, select() returns TcpTls.
+/// Even with no registered transports, `select()` returns `TcpTls`.
 #[test]
 fn empty_selector_returns_tcp() {
     let sel = FabricSelector::new(HealthConfig::default());
@@ -109,7 +109,7 @@ fn empty_selector_returns_tcp() {
 // F-N3: Failover ordering respects priority
 // ---------------------------------------------------------------------------
 
-/// When CXI fails, should fall to VerbsIb, not straight to TCP.
+/// When CXI fails, should fall to `VerbsIb`, not straight to TCP.
 #[test]
 fn failover_respects_priority_chain() {
     let config = HealthConfig {
@@ -141,7 +141,7 @@ fn failover_respects_priority_chain() {
 // Hardware removal simulation
 // ---------------------------------------------------------------------------
 
-/// When hardware is physically removed (mark_unavailable), the
+/// When hardware is physically removed (`mark_unavailable`), the
 /// transport should be skipped even if the circuit breaker is healthy.
 #[test]
 fn hardware_removal_skips_transport() {
@@ -165,7 +165,7 @@ fn hardware_removal_skips_transport() {
 
 /// Validates that the transport layer properly handles connection drops
 /// during in-flight operations. This is a structural test — the actual
-/// orphan prevention happens in the state machine layer (AppendDelta
+/// orphan prevention happens in the state machine layer (`AppendDelta`
 /// is atomic via Raft consensus, so a dropped client connection results
 /// in either a fully committed or fully absent delta).
 #[tokio::test]
@@ -181,12 +181,9 @@ async fn connection_drop_during_write_is_safe() {
         // Read whatever arrives before client drops.
         let mut buf = vec![0u8; 1024];
         let result = stream.read(&mut buf).await;
-        // Connection was dropped — should get Ok(0) or an error, not panic.
-        match result {
-            Ok(0) => true,  // clean close
-            Ok(_n) => true, // got partial data
-            Err(_) => true, // connection reset — also fine
-        }
+        // Connection was dropped — should get Ok(0), partial data,
+        // or a connection reset. All are acceptable — no panic.
+        result.is_ok() || result.is_err()
     });
 
     // Client: connect, send partial data, then drop.

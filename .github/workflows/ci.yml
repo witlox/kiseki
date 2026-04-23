@@ -94,6 +94,10 @@ jobs:
             cmd: cargo check -p kiseki-transport --features verbs --locked
           - name: transport-cxi
             cmd: cargo check -p kiseki-transport --features cxi --locked
+          - name: chunk-gpu-cuda
+            cmd: cargo check -p kiseki-chunk --features gpu-cuda --locked
+          - name: chunk-gpu-rocm
+            cmd: cargo check -p kiseki-chunk --features gpu-rocm --locked
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
