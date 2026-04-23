@@ -3,13 +3,17 @@
 # Disks are NOT mounted — Kiseki DeviceBackend manages them directly.
 #
 # Variables: node_id, node_ip, all_peers, raft_port, raw_devices, device_class, meta_dir
-set -euo pipefail
+set -eo pipefail
+
+# GCE metadata runner doesn't set HOME or full PATH — fix it
+export HOME="$${HOME:-/root}"
+export PATH="$$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$${PATH:-}"
 
 echo "=== Kiseki storage node ${node_id} (${device_class}) ==="
 
 # Install build dependencies
 dnf install -y --allowerasing gcc gcc-c++ openssl-devel cmake make git \
-  unzip iperf3 fio curl 2>&1 | tail -3
+  unzip iperf3 fio curl bc 2>&1 | tail -3
 
 # Install Rust
 if ! command -v rustc &>/dev/null; then
@@ -91,7 +95,13 @@ Environment=KISEKI_METRICS_ADDR=0.0.0.0:9090
 
 # Metadata on boot disk (fast SSD), data on raw devices
 Environment=KISEKI_DATA_DIR=${meta_dir}
+# Only node 1 bootstraps (seeds the Raft cluster).
+# Other nodes join as followers via Raft RPCs from the leader.
+%{ if node_id == 1 ~}
 Environment=KISEKI_BOOTSTRAP=true
+%{ else ~}
+Environment=KISEKI_BOOTSTRAP=false
+%{ endif ~}
 
 # Cluster identity
 Environment=KISEKI_NODE_ID=${node_id}
@@ -109,7 +119,29 @@ EOF
 
 systemctl daemon-reload
 systemctl enable kiseki-server
-systemctl start kiseki-server
+
+# Stagger startup: node 1 starts first, others wait for node 1's
+# Raft RPC port to be reachable before starting. This gives node 1
+# time to initialize the Raft group and begin leader election before
+# followers join.
+if [ "${node_id}" -eq 1 ]; then
+  echo "Node 1: starting first (cluster seed)"
+  systemctl start kiseki-server
+else
+  SEED_IP=$(echo "${all_peers}" | tr ',' '\n' | grep '^1=' | cut -d= -f2 | cut -d: -f1)
+  SEED_PORT=$(echo "${all_peers}" | tr ',' '\n' | grep '^1=' | cut -d= -f2 | cut -d: -f2)
+  echo "Waiting for seed node ($SEED_IP:$SEED_PORT) ..."
+  for i in $(seq 1 120); do
+    if curl -sf --connect-timeout 2 "http://$SEED_IP:9090/health" >/dev/null 2>&1; then
+      echo "  Seed node ready after $${i}s"
+      break
+    fi
+    sleep 1
+  done
+  # Brief delay to let Raft initialize on seed before followers join
+  sleep 3
+  systemctl start kiseki-server
+fi
 
 echo "=== Node ${node_id} (${device_class}) started ==="
 echo "  Metadata:    ${meta_dir}"
@@ -118,3 +150,4 @@ echo "  Raft:        ${node_ip}:${raft_port}"
 echo "  S3:          ${node_ip}:9000"
 echo "  NFS:         ${node_ip}:2049"
 echo "  Dashboard:   http://${node_ip}:9090/ui"
+echo "  Cluster:     http://${node_ip}:9090/cluster/info"

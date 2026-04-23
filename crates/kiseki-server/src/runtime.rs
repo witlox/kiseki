@@ -135,15 +135,17 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                 store = store.with_inline_store(std::sync::Arc::clone(ss)
                     as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>);
             }
-            if cfg.bootstrap {
-                store.create_shard(
-                    bootstrap_shard,
-                    bootstrap_tenant,
-                    kiseki_common::ids::NodeId(cfg.node_id),
-                    kiseki_log::ShardConfig::default(),
-                    Some(&raft_addr_str),
-                );
-            }
+            // All nodes in the cluster create the shard. The bootstrap flag
+            // controls whether this node seeds the Raft group (calls initialize)
+            // or joins as a follower (receives membership from the leader).
+            store.create_shard(
+                bootstrap_shard,
+                bootstrap_tenant,
+                kiseki_common::ids::NodeId(cfg.node_id),
+                kiseki_log::ShardConfig::default(),
+                Some(&raft_addr_str),
+                cfg.bootstrap,
+            );
             tracing::info!(
                 node_id = cfg.node_id,
                 peers = cfg.raft_peers.len(),
@@ -314,9 +316,23 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             format!("{host}:{}", metrics_addr.port())
         })
         .collect();
+    let node_info = crate::web::api::NodeInfo {
+        node_id: cfg.node_id,
+        s3_addr: cfg.s3_addr.to_string(),
+        nfs_addr: cfg.nfs_addr.to_string(),
+        metrics_addr: cfg.metrics_addr.to_string(),
+        raft_peers: cfg.raft_peers.clone(),
+    };
+    let metrics_log_store = Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>;
     tokio::spawn(async move {
-        if let Err(e) =
-            crate::metrics::run_metrics_server(metrics_addr, metrics, peer_metrics_addrs).await
+        if let Err(e) = crate::metrics::run_metrics_server(
+            metrics_addr,
+            metrics,
+            peer_metrics_addrs,
+            Some(metrics_log_store),
+            node_info,
+        )
+        .await
         {
             tracing::error!(error = %e, "metrics server error");
         }

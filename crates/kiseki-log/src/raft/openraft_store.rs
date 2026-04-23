@@ -125,15 +125,23 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
 }
 
 impl OpenRaftLogStore {
-    /// Create and bootstrap a Raft log store for a shard.
+    /// Create a Raft log store for a shard.
     ///
     /// When `peers` is empty, runs in single-node mode with a stub network.
     /// When `peers` contains entries, uses TCP transport for multi-node Raft.
     /// The `peers` map should include this node's own `(node_id, addr)` entry.
     ///
-    /// When `data_dir` is `Some`, uses `RedbRaftLogStore` for persistent
-    /// Raft state (Phase 12b). On restart, skips `initialize()` if the
-    /// store already has state. When `None`, uses in-memory `MemLogStore`.
+    /// `bootstrap` controls whether `raft.initialize()` is called:
+    /// - `true`: this is the seed node — calls `initialize(members)` to
+    ///   create the initial cluster membership. Only one node should
+    ///   bootstrap per cluster.
+    /// - `false`: this is a follower — does NOT call `initialize()`.
+    ///   The node will receive membership from the leader via
+    ///   `AppendEntries` RPCs.
+    ///
+    /// On persistent restarts (`data_dir` is `Some` and the redb store
+    /// already has state), `initialize()` is skipped regardless of
+    /// the `bootstrap` flag.
     pub async fn new(
         node_id: u64,
         shard_id: ShardId,
@@ -141,6 +149,52 @@ impl OpenRaftLogStore {
         peers: &BTreeMap<u64, String>,
         data_dir: Option<&std::path::Path>,
         inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
+    ) -> Result<Self, LogError> {
+        Self::create(
+            node_id,
+            shard_id,
+            tenant_id,
+            peers,
+            data_dir,
+            inline_store,
+            true,
+        )
+        .await
+    }
+
+    /// Create a follower Raft log store — does NOT call `initialize()`.
+    ///
+    /// Use this for non-seed nodes joining an existing cluster. The node
+    /// receives its membership configuration from the leader via Raft RPCs.
+    pub async fn new_follower(
+        node_id: u64,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        peers: &BTreeMap<u64, String>,
+        data_dir: Option<&std::path::Path>,
+        inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
+    ) -> Result<Self, LogError> {
+        Self::create(
+            node_id,
+            shard_id,
+            tenant_id,
+            peers,
+            data_dir,
+            inline_store,
+            false,
+        )
+        .await
+    }
+
+    /// Internal constructor shared by `new` (seed) and `new_follower`.
+    async fn create(
+        node_id: u64,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        peers: &BTreeMap<u64, String>,
+        data_dir: Option<&std::path::Path>,
+        inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
+        bootstrap: bool,
     ) -> Result<Self, LogError> {
         let config = KisekiRaftConfig::default_config();
         let mut sm_inner = ShardSmInner::new(shard_id, tenant_id);
@@ -199,9 +253,15 @@ impl OpenRaftLogStore {
             (raft, false)
         };
 
-        // Only initialize on first boot — skip if redb already has state
-        // (the node already has membership from a previous run).
-        if !already_initialized {
+        // Initialize the Raft cluster membership.
+        //
+        // Only the seed node (bootstrap=true) calls initialize() on first boot.
+        // Follower nodes (bootstrap=false) receive membership from the leader
+        // via AppendEntries RPCs — they must NOT call initialize().
+        //
+        // On persistent restarts, already_initialized=true (redb has state),
+        // so initialize() is skipped regardless.
+        if bootstrap && !already_initialized {
             raft.initialize(members)
                 .await
                 .map_err(|_| LogError::Unavailable)?;

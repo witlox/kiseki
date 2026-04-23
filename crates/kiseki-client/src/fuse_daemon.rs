@@ -17,8 +17,8 @@ use std::path::Path;
 #[cfg(feature = "fuse")]
 use fuser::{
     Config, Errno, FileAttr as FuserAttr, FileHandle, FileType as FuserFileType, Filesystem,
-    FopenFlags, Generation, INodeNo, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEntry, RenameFlags, Request,
+    FopenFlags, Generation, INodeNo, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyData,
+    ReplyDirectory, ReplyEntry, Request,
 };
 
 #[cfg(feature = "fuse")]

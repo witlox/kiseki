@@ -3,13 +3,17 @@
 # Runs FUSE mount, NFS mount, and benchmark tools.
 #
 # Variables: storage_ips, cache_dev, client_id
-set -euo pipefail
+set -eo pipefail
+
+# GCE metadata runner doesn't set HOME or full PATH — fix it
+export HOME="$${HOME:-/root}"
+export PATH="$$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$${PATH:-}"
 
 echo "=== Kiseki client ${client_id} setup ==="
 
 # Install dependencies
 dnf install -y --allowerasing nfs-utils fuse3 fuse3-devel fio iperf3 \
-  python3 python3-pip curl wget git gcc gcc-c++ openssl-devel cmake make unzip 2>&1 | tail -3
+  python3 python3-pip curl wget git gcc gcc-c++ openssl-devel cmake make unzip bc 2>&1 | tail -3
 pip3 install --break-system-packages boto3 awscli 2>/dev/null || true
 
 # Install Rust (for building kiseki-client)

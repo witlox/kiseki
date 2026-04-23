@@ -21,6 +21,20 @@ pub struct UiState {
     pub metrics_encode: Arc<dyn Fn() -> String + Send + Sync>,
     /// Diagnostic store for metric history + events.
     pub diagnostics: SharedDiagnostics,
+    /// Log store for shard health / leader queries.
+    pub log_store: Option<Arc<dyn kiseki_log::LogOps + Send + Sync>>,
+    /// This node's identity.
+    pub node_info: NodeInfo,
+}
+
+/// Static node identity exposed via `/cluster/info`.
+#[derive(Clone, serde::Serialize)]
+pub struct NodeInfo {
+    pub node_id: u64,
+    pub s3_addr: String,
+    pub nfs_addr: String,
+    pub metrics_addr: String,
+    pub raft_peers: Vec<(u64, String)>,
 }
 
 /// Build the web UI router.
@@ -39,6 +53,7 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/ui/api/ops/maintenance", post(ops_maintenance))
         .route("/ui/api/ops/backup", post(ops_backup))
         .route("/ui/api/ops/scrub", post(ops_scrub))
+        .route("/cluster/info", get(cluster_info))
         .with_state(state)
 }
 
@@ -296,6 +311,58 @@ async fn ops_scrub(State(state): State<UiState>) -> impl IntoResponse {
         "Scrub requested",
     );
     axum::Json(serde_json::json!({"status": "ok", "message": "Scrub initiated (background)"}))
+}
+
+/// Cluster info: this node's identity, leader, and peer map.
+///
+/// Benchmark scripts and clients use this to discover the Raft leader
+/// and route writes to the correct node's S3/NFS endpoint.
+async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
+    let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+
+    let (leader_id, leader_s3) = if let Some(ref log) = state.log_store {
+        match log.shard_health(bootstrap_shard) {
+            Ok(info) => {
+                let lid = info.leader.map(|n| n.0);
+                // Resolve leader's S3 address from the peer list.
+                let leader_s3 = lid.and_then(|id| {
+                    state
+                        .node_info
+                        .raft_peers
+                        .iter()
+                        .find(|(pid, _)| *pid == id)
+                        .map(|(_, addr)| {
+                            // Raft addr is host:raft_port → S3 is host:9000
+                            let host = addr.split(':').next().unwrap_or("127.0.0.1");
+                            format!("{host}:9000")
+                        })
+                });
+                (lid, leader_s3)
+            }
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    axum::Json(serde_json::json!({
+        "node_id": state.node_info.node_id,
+        "s3_addr": state.node_info.s3_addr,
+        "nfs_addr": state.node_info.nfs_addr,
+        "metrics_addr": state.node_info.metrics_addr,
+        "leader_id": leader_id,
+        "leader_s3": leader_s3,
+        "peers": state.node_info.raft_peers.iter().map(|(id, addr)| {
+            let host = addr.split(':').next().unwrap_or("127.0.0.1");
+            serde_json::json!({
+                "id": id,
+                "raft_addr": addr,
+                "s3_addr": format!("{host}:9000"),
+                "nfs_addr": format!("{host}:2049"),
+                "metrics_addr": format!("{host}:{}", state.node_info.metrics_addr.split(':').next_back().unwrap_or("9090")),
+            })
+        }).collect::<Vec<_>>(),
+    }))
 }
 
 fn chrono_lite() -> String {

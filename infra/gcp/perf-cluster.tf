@@ -47,23 +47,37 @@ resource "google_compute_subnetwork" "sub" {
 resource "google_compute_firewall" "internal" {
   name    = "kiseki-perf-internal"
   network = google_compute_network.net.name
-  allow { protocol = "tcp"; ports = ["0-65535"] }
-  allow { protocol = "udp"; ports = ["0-65535"] }
-  allow { protocol = "icmp" }
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+  allow {
+    protocol = "udp"
+    ports    = ["0-65535"]
+  }
+  allow {
+    protocol = "icmp"
+  }
   source_ranges = ["10.0.0.0/24"]
 }
 
 resource "google_compute_firewall" "ssh" {
   name    = "kiseki-perf-ssh"
   network = google_compute_network.net.name
-  allow { protocol = "tcp"; ports = ["22"] }
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
   source_ranges = ["0.0.0.0/0"]
 }
 
 resource "google_compute_firewall" "services" {
   name    = "kiseki-perf-svc"
   network = google_compute_network.net.name
-  allow { protocol = "tcp"; ports = ["2049", "9000", "9090", "9100", "9101", "9102"] }
+  allow {
+    protocol = "tcp"
+    ports    = ["2049", "9000", "9090", "9100", "9101", "9102"]
+  }
   source_ranges = ["0.0.0.0/0"]
   target_tags   = ["kiseki-storage"]
 }
@@ -123,7 +137,7 @@ resource "google_compute_instance" "hdd" {
 # 9 PD-Standard disks (3 per HDD node)
 resource "google_compute_disk" "hdd" {
   count = 9
-  name  = "kiseki-hdd-${count.index}"
+  name  = "kiseki-data-hdd-${count.index}"
   type  = "pd-standard"
   size  = 200 # 200GB each, 600GB per node
   zone  = var.zone
@@ -149,7 +163,10 @@ resource "google_compute_instance" "fast" {
     }
   }
 
-  # 1 × local NVMe SSD (metadata tier — fastest)
+  # 2 × local NVMe SSD (GCP requires multiples of 2)
+  scratch_disk {
+    interface = "NVME"
+  }
   scratch_disk {
     interface = "NVME"
   }

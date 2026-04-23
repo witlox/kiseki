@@ -71,9 +71,11 @@ impl RaftShardStore {
 
     /// Create a shard with its own Raft group.
     ///
-    /// Initializes a new `OpenRaftLogStore`, calls `raft.initialize()`
-    /// with the configured peers, and optionally spawns the Raft RPC
-    /// server on `raft_addr`.
+    /// When `bootstrap` is true, calls `raft.initialize()` with the
+    /// configured peers (seed node). When false, the node joins the
+    /// existing cluster by receiving membership from the leader.
+    ///
+    /// Optionally spawns the Raft RPC server on `raft_addr`.
     ///
     /// # Panics
     ///
@@ -86,6 +88,7 @@ impl RaftShardStore {
         _node_id: NodeId,
         _config: ShardConfig,
         raft_addr: Option<&str>,
+        bootstrap: bool,
     ) {
         let peers = self.peers.clone();
         let node_id = self.node_id;
@@ -95,16 +98,29 @@ impl RaftShardStore {
 
         let store = tokio::task::block_in_place(|| {
             rt.block_on(async {
-                let store = OpenRaftLogStore::new(
-                    node_id,
-                    shard_id,
-                    tenant_id,
-                    &peers,
-                    data_dir.as_deref(),
-                    inline_store,
-                )
-                .await
-                .expect("failed to create Raft log store");
+                let store = if bootstrap {
+                    OpenRaftLogStore::new(
+                        node_id,
+                        shard_id,
+                        tenant_id,
+                        &peers,
+                        data_dir.as_deref(),
+                        inline_store,
+                    )
+                    .await
+                    .expect("failed to create Raft log store (seed)")
+                } else {
+                    OpenRaftLogStore::new_follower(
+                        node_id,
+                        shard_id,
+                        tenant_id,
+                        &peers,
+                        data_dir.as_deref(),
+                        inline_store,
+                    )
+                    .await
+                    .expect("failed to create Raft log store (follower)")
+                };
 
                 // Spawn RPC server for this shard's Raft group.
                 if let Some(addr) = raft_addr {

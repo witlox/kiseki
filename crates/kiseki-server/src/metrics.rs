@@ -237,6 +237,7 @@ impl Default for KisekiMetrics {
 /// Serves:
 /// - `GET /metrics` — Prometheus text exposition format
 /// - `GET /health` — `200 OK` (load balancer probe)
+/// - `GET /cluster/info` — JSON cluster info with leader discovery
 /// - `GET /ui` — Admin dashboard (HTMX + Chart.js)
 /// - `GET /ui/api/*` — JSON API endpoints
 /// - `GET /ui/fragment/*` — HTMX HTML partial endpoints
@@ -245,6 +246,8 @@ pub async fn run_metrics_server(
     addr: SocketAddr,
     metrics: KisekiMetrics,
     peer_addrs: Vec<String>,
+    log_store: Option<std::sync::Arc<dyn kiseki_log::LogOps + Send + Sync>>,
+    node_info: crate::web::api::NodeInfo,
 ) -> std::io::Result<()> {
     use crate::web;
 
@@ -261,6 +264,8 @@ pub async fn run_metrics_server(
         aggregator: std::sync::Arc::clone(&aggregator),
         metrics_encode: std::sync::Arc::new(move || metrics_for_ui.encode()),
         diagnostics: std::sync::Arc::clone(&diagnostics),
+        log_store,
+        node_info,
     };
 
     // Build combined router: metrics + health + admin UI.
