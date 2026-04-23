@@ -29,6 +29,10 @@ pub mod store;
 
 #[cfg(feature = "kms-aws")]
 pub mod aws_provider;
+#[cfg(feature = "kms-azure")]
+pub mod azure_provider;
+#[cfg(feature = "kms-gcp")]
+pub mod gcp_provider;
 #[cfg(feature = "kms-vault")]
 pub mod vault_provider;
 

@@ -102,6 +102,10 @@ jobs:
             cmd: cargo check -p kiseki-keymanager --features kms-vault --locked
           - name: kms-aws
             cmd: cargo check -p kiseki-keymanager --features kms-aws --locked
+          - name: kms-azure
+            cmd: cargo check -p kiseki-keymanager --features kms-azure --locked
+          - name: kms-gcp
+            cmd: cargo check -p kiseki-keymanager --features kms-gcp --locked
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

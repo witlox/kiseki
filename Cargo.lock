@@ -1736,6 +1736,7 @@ name = "kiseki-keymanager"
 version = "2026.1.0"
 dependencies = [
  "aws-lc-rs",
+ "base64",
  "futures",
  "kiseki-common",
  "kiseki-crypto",

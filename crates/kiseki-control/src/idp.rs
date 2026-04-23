@@ -1,14 +1,50 @@
 //! OIDC/JWT validation for tenant identity (I-Auth2).
 //!
 //! Decodes and validates JWT tokens against per-tenant OIDC configuration.
-//! Full JWKS signature verification is deferred (requires `jsonwebtoken`
-//! crate, feature-gated). Currently validates structure, issuer, expiry,
-//! and extracts claims via configurable mapping.
+//! Validates structure, issuer, expiry, and extracts claims via configurable
+//! mapping. Supports HS256 (shared secret), RS256 (JWKS RSA), and ES256
+//! (JWKS EC P-256) signature verification using `aws-lc-rs`.
 
+use aws_lc_rs::signature;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// JSON Web Key Set — cached from the identity provider's JWKS endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Jwks {
+    /// The set of JSON Web Keys.
+    pub keys: Vec<Jwk>,
+}
+
+/// A single JSON Web Key (RFC 7517).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Jwk {
+    /// Key type: `"RSA"` or `"EC"`.
+    pub kty: String,
+    /// Key ID (used to match the JWT header `kid`).
+    #[serde(default)]
+    pub kid: Option<String>,
+    /// Algorithm: `"RS256"` or `"ES256"`.
+    #[serde(default)]
+    pub alg: Option<String>,
+    /// RSA modulus (base64url-encoded, big-endian unsigned integer).
+    #[serde(default)]
+    pub n: Option<String>,
+    /// RSA public exponent (base64url-encoded).
+    #[serde(default)]
+    pub e: Option<String>,
+    /// EC x coordinate (base64url-encoded).
+    #[serde(default)]
+    pub x: Option<String>,
+    /// EC y coordinate (base64url-encoded).
+    #[serde(default)]
+    pub y: Option<String>,
+    /// EC curve name (e.g. `"P-256"`).
+    #[serde(default)]
+    pub crv: Option<String>,
+}
 
 /// Per-tenant OIDC configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -21,12 +57,9 @@ pub struct TenantIdpConfig {
     pub claim_mapping: ClaimMapping,
     /// When `true`, accept tokens without cryptographic signature verification.
     ///
-    /// # Warning
-    ///
-    /// JWKS signature verification is **not yet implemented** for RS256/ES256.
-    /// Setting this to `false` (the default) causes `validate_jwt` to reject
-    /// RS256/ES256 tokens until JWKS verification is available. HS256 tokens
-    /// are verified via `shared_secret` regardless of this flag.
+    /// For RS256/ES256 tokens without `jwks_keys`, this flag must be set to
+    /// `true` to bypass verification. When `jwks_keys` is provided, signatures
+    /// are verified cryptographically regardless of this flag.
     #[serde(default)]
     pub unsafe_no_signature_verify: bool,
     /// Shared secret for HS256 signature verification.
@@ -35,6 +68,13 @@ pub struct TenantIdpConfig {
     /// with this secret. Required for HS256 tokens.
     #[serde(default)]
     pub shared_secret: Option<String>,
+    /// Pre-fetched JWKS keys for RS256/ES256 verification.
+    ///
+    /// When set, RS256 and ES256 tokens are verified against matching keys
+    /// from this key set. Fetching keys from the identity provider's JWKS URL is deferred
+    /// to a higher layer.
+    #[serde(default)]
+    pub jwks_keys: Option<Jwks>,
 }
 
 /// Configurable mapping from JWT claim names to Kiseki identity fields.
@@ -105,14 +145,16 @@ pub enum IdpError {
 /// Validate a JWT token against the given tenant IDP configuration.
 ///
 /// This performs structural validation (base64 decode, JSON parse),
-/// issuer verification, expiry check, and claim extraction.
+/// signature verification, issuer verification, expiry check, and
+/// claim extraction.
 ///
-/// # Warning — signature verification not implemented
+/// Supported algorithms:
+/// - **HS256**: verified via `shared_secret` (HMAC-SHA256).
+/// - **RS256**: verified via JWKS keys (RSASSA-PKCS1-v1_5 with SHA-256).
+/// - **ES256**: verified via JWKS keys (ECDSA P-256 with SHA-256).
 ///
-/// JWKS signature verification is **not yet implemented**. Unless
-/// `config.unsafe_no_signature_verify` is `true`, this function will
-/// return an error. Callers must explicitly opt in to insecure mode.
-#[must_use = "this result must be checked — signature verification is not implemented"]
+/// For RS256/ES256, if `jwks_keys` is not configured, the token is rejected
+/// unless `unsafe_no_signature_verify` is set.
 pub fn validate_jwt(token: &str, config: &TenantIdpConfig) -> Result<ValidatedClaims, IdpError> {
     // JWT is header.payload.signature — we need the payload.
     let parts: Vec<&str> = token.split('.').collect();
@@ -146,28 +188,7 @@ pub fn validate_jwt(token: &str, config: &TenantIdpConfig) -> Result<ValidatedCl
     }
 
     // Verify signature based on algorithm.
-    match alg {
-        "HS256" => {
-            let secret = config.shared_secret.as_deref().ok_or_else(|| {
-                IdpError::InvalidToken("HS256 token but no shared_secret configured".into())
-            })?;
-            verify_hs256(parts[0], parts[1], parts[2], secret)?;
-        }
-        "RS256" | "ES256" => {
-            // JWKS verification not yet implemented for RS256/ES256.
-            if !config.unsafe_no_signature_verify {
-                return Err(IdpError::InvalidToken(
-                    "signature verification required but JWKS not yet implemented".into(),
-                ));
-            }
-            tracing::warn!(
-                alg = alg,
-                "JWT signature verification not implemented for {alg} \
-                 — accepting token without cryptographic proof"
-            );
-        }
-        _ => unreachable!(), // Covered by the allowlist check above.
-    }
+    verify_jwt_signature(alg, &header, &parts, config)?;
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -235,6 +256,60 @@ pub fn validate_jwt(token: &str, config: &TenantIdpConfig) -> Result<ValidatedCl
     })
 }
 
+/// Dispatch JWT signature verification by algorithm.
+fn verify_jwt_signature(
+    alg: &str,
+    header: &serde_json::Value,
+    parts: &[&str],
+    config: &TenantIdpConfig,
+) -> Result<(), IdpError> {
+    match alg {
+        "HS256" => {
+            let secret = config.shared_secret.as_deref().ok_or_else(|| {
+                IdpError::InvalidToken("HS256 token but no shared_secret configured".into())
+            })?;
+            verify_hs256(parts[0], parts[1], parts[2], secret)
+        }
+        "RS256" => verify_jwks_signature(header, parts, config, "RSA", "RS256"),
+        "ES256" => verify_jwks_signature(header, parts, config, "EC", "ES256"),
+        _ => unreachable!(), // Covered by the allowlist check in validate_jwt.
+    }
+}
+
+/// Verify a JWKS-based (RS256/ES256) JWT signature.
+fn verify_jwks_signature(
+    header: &serde_json::Value,
+    parts: &[&str],
+    config: &TenantIdpConfig,
+    kty: &str,
+    alg: &str,
+) -> Result<(), IdpError> {
+    if let Some(ref jwks) = config.jwks_keys {
+        let kid = header.get("kid").and_then(|v| v.as_str());
+        let jwk = find_jwk(&jwks.keys, kid, kty)
+            .ok_or_else(|| IdpError::InvalidToken(format!("no matching {kty} JWK for kid")))?;
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .map_err(|e| IdpError::InvalidToken(format!("signature base64 decode failed: {e}")))?;
+        match alg {
+            "RS256" => verify_rs256(signing_input.as_bytes(), &sig_bytes, jwk),
+            "ES256" => verify_es256(signing_input.as_bytes(), &sig_bytes, jwk),
+            _ => unreachable!(),
+        }
+    } else if config.unsafe_no_signature_verify {
+        tracing::warn!(
+            "JWT {alg} signature verification skipped — \
+             unsafe_no_signature_verify is set"
+        );
+        Ok(())
+    } else {
+        Err(IdpError::InvalidToken(format!(
+            "{alg} requires jwks_keys or unsafe_no_signature_verify"
+        )))
+    }
+}
+
 /// Verify an HS256 (HMAC-SHA256) JWT signature.
 fn verify_hs256(
     header_b64: &str,
@@ -253,6 +328,71 @@ fn verify_hs256(
 
     hmac::verify(&key, signing_input.as_bytes(), &sig_bytes)
         .map_err(|_| IdpError::InvalidToken("HS256 signature verification failed".into()))
+}
+
+/// Decode a base64url-encoded string (no padding).
+fn base64url_decode(input: &str) -> Result<Vec<u8>, IdpError> {
+    URL_SAFE_NO_PAD
+        .decode(input)
+        .map_err(|e| IdpError::InvalidToken(format!("base64url decode failed: {e}")))
+}
+
+/// Find a matching JWK by key ID and key type.
+///
+/// If `kid` is `None`, returns the first key matching `kty`.
+/// If `kid` is `Some`, returns the key matching both `kid` and `kty`.
+fn find_jwk<'a>(keys: &'a [Jwk], kid: Option<&str>, kty: &str) -> Option<&'a Jwk> {
+    keys.iter().find(|k| {
+        k.kty == kty
+            && match (kid, k.kid.as_deref()) {
+                (Some(want), Some(have)) => want == have,
+                (Some(_), None) => false,
+                (None, _) => true,
+            }
+    })
+}
+
+/// Verify an RS256 (RSASSA-PKCS1-v1_5 SHA-256) signature using a JWK.
+fn verify_rs256(signing_input: &[u8], sig_bytes: &[u8], jwk: &Jwk) -> Result<(), IdpError> {
+    let n = base64url_decode(jwk.n.as_deref().unwrap_or(""))?;
+    let e = base64url_decode(jwk.e.as_deref().unwrap_or(""))?;
+
+    if n.is_empty() || e.is_empty() {
+        return Err(IdpError::InvalidToken(
+            "RSA JWK missing n or e component".into(),
+        ));
+    }
+
+    let components = signature::RsaPublicKeyComponents { n: &n, e: &e };
+    components
+        .verify(
+            &signature::RSA_PKCS1_2048_8192_SHA256,
+            signing_input,
+            sig_bytes,
+        )
+        .map_err(|_| IdpError::InvalidToken("RS256 signature verification failed".into()))
+}
+
+/// Verify an ES256 (ECDSA P-256 SHA-256) signature using a JWK.
+fn verify_es256(signing_input: &[u8], sig_bytes: &[u8], jwk: &Jwk) -> Result<(), IdpError> {
+    let x = base64url_decode(jwk.x.as_deref().unwrap_or(""))?;
+    let y = base64url_decode(jwk.y.as_deref().unwrap_or(""))?;
+
+    if x.is_empty() || y.is_empty() {
+        return Err(IdpError::InvalidToken(
+            "EC JWK missing x or y coordinate".into(),
+        ));
+    }
+
+    // Uncompressed EC point: 0x04 || x || y
+    let mut point = Vec::with_capacity(1 + x.len() + y.len());
+    point.push(0x04);
+    point.extend_from_slice(&x);
+    point.extend_from_slice(&y);
+
+    let key = signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, &point);
+    key.verify(signing_input, sig_bytes)
+        .map_err(|_| IdpError::InvalidToken("ES256 signature verification failed".into()))
 }
 
 /// Extract a required string claim from the JWT payload.
@@ -324,6 +464,7 @@ mod tests {
             claim_mapping: ClaimMapping::default(),
             unsafe_no_signature_verify: false,
             shared_secret: Some(TEST_SECRET.into()),
+            jwks_keys: None,
         }
     }
 
@@ -427,8 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn rs256_rejected_without_unsafe_flag() {
-        // RS256 tokens require unsafe_no_signature_verify since JWKS is not implemented.
+    fn rs256_without_jwks_requires_unsafe() {
         let token = build_test_jwt_with_header(
             r#"{"alg":"RS256","typ":"JWT"}"#,
             &valid_claims(),
@@ -436,12 +576,346 @@ mod tests {
         );
         let config = TenantIdpConfig {
             unsafe_no_signature_verify: false,
+            jwks_keys: None,
             ..test_config()
         };
         let result = validate_jwt(&token, &config);
         assert!(
-            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("JWKS not yet implemented"))
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("RS256 requires jwks_keys"))
         );
+    }
+
+    #[test]
+    fn es256_without_jwks_requires_unsafe() {
+        let token = build_test_jwt_with_header(
+            r#"{"alg":"ES256","typ":"JWT"}"#,
+            &valid_claims(),
+            "fake-sig",
+        );
+        let config = TenantIdpConfig {
+            unsafe_no_signature_verify: false,
+            jwks_keys: None,
+            ..test_config()
+        };
+        let result = validate_jwt(&token, &config);
+        assert!(
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("ES256 requires jwks_keys"))
+        );
+    }
+
+    #[test]
+    fn rs256_jwks_wrong_kid_rejected() {
+        let jwks = Jwks {
+            keys: vec![Jwk {
+                kty: "RSA".into(),
+                kid: Some("key-1".into()),
+                alg: Some("RS256".into()),
+                n: Some("dGVzdA".into()),
+                e: Some("AQAB".into()),
+                x: None,
+                y: None,
+                crv: None,
+            }],
+        };
+        // Token header has kid=key-999 which doesn't match key-1.
+        let token = build_test_jwt_with_header(
+            r#"{"alg":"RS256","typ":"JWT","kid":"key-999"}"#,
+            &valid_claims(),
+            "fake-sig",
+        );
+        let config = TenantIdpConfig {
+            jwks_keys: Some(jwks),
+            ..test_config()
+        };
+        let result = validate_jwt(&token, &config);
+        assert!(
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("no matching RSA JWK"))
+        );
+    }
+
+    #[test]
+    fn es256_jwks_wrong_kid_rejected() {
+        let jwks = Jwks {
+            keys: vec![Jwk {
+                kty: "EC".into(),
+                kid: Some("ec-key-1".into()),
+                alg: Some("ES256".into()),
+                n: None,
+                e: None,
+                x: Some("dGVzdA".into()),
+                y: Some("dGVzdA".into()),
+                crv: Some("P-256".into()),
+            }],
+        };
+        let token = build_test_jwt_with_header(
+            r#"{"alg":"ES256","typ":"JWT","kid":"ec-key-999"}"#,
+            &valid_claims(),
+            "fake-sig",
+        );
+        let config = TenantIdpConfig {
+            jwks_keys: Some(jwks),
+            ..test_config()
+        };
+        let result = validate_jwt(&token, &config);
+        assert!(
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("no matching EC JWK"))
+        );
+    }
+
+    #[test]
+    fn jwks_deserialize() {
+        let json = r#"{
+            "keys": [
+                {
+                    "kty": "RSA",
+                    "kid": "rsa-key-1",
+                    "alg": "RS256",
+                    "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+                    "e": "AQAB"
+                },
+                {
+                    "kty": "EC",
+                    "kid": "ec-key-1",
+                    "alg": "ES256",
+                    "crv": "P-256",
+                    "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+                    "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+                }
+            ]
+        }"#;
+        let jwks: Jwks = serde_json::from_str(json).unwrap();
+        assert_eq!(jwks.keys.len(), 2);
+        assert_eq!(jwks.keys[0].kty, "RSA");
+        assert_eq!(jwks.keys[0].kid.as_deref(), Some("rsa-key-1"));
+        assert!(jwks.keys[0].n.is_some());
+        assert_eq!(jwks.keys[1].kty, "EC");
+        assert_eq!(jwks.keys[1].crv.as_deref(), Some("P-256"));
+    }
+
+    #[test]
+    fn base64url_decode_works() {
+        // "AQAB" is base64url for [1, 0, 1] (RSA exponent 65537)
+        let decoded = base64url_decode("AQAB").unwrap();
+        assert_eq!(decoded, vec![1, 0, 1]);
+
+        // Empty input decodes to empty vec.
+        let empty = base64url_decode("").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn es256_verify_with_generated_key() {
+        use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+
+        // Generate an EC P-256 key pair.
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
+
+        // Extract the public key (uncompressed point: 0x04 || x || y).
+        let pub_key_bytes = key_pair.public_key().as_ref();
+        assert_eq!(pub_key_bytes.len(), 65); // 1 + 32 + 32
+        assert_eq!(pub_key_bytes[0], 0x04);
+        let x_bytes = &pub_key_bytes[1..33];
+        let y_bytes = &pub_key_bytes[33..65];
+
+        let x_b64 = URL_SAFE_NO_PAD.encode(x_bytes);
+        let y_b64 = URL_SAFE_NO_PAD.encode(y_bytes);
+
+        // Build the JWKS.
+        let jwks = Jwks {
+            keys: vec![Jwk {
+                kty: "EC".into(),
+                kid: Some("test-ec".into()),
+                alg: Some("ES256".into()),
+                n: None,
+                e: None,
+                x: Some(x_b64),
+                y: Some(y_b64),
+                crv: Some("P-256".into()),
+            }],
+        };
+
+        // Build the JWT.
+        let header_json = r#"{"alg":"ES256","typ":"JWT","kid":"test-ec"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(valid_claims().to_string().as_bytes());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+
+        // Sign the token.
+        let sig = key_pair.sign(&rng, signing_input.as_bytes()).unwrap();
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
+        let token = format!("{signing_input}.{sig_b64}");
+
+        let config = TenantIdpConfig {
+            jwks_keys: Some(jwks),
+            ..test_config()
+        };
+        let result = validate_jwt(&token, &config);
+        assert!(result.is_ok(), "ES256 verification failed: {result:?}");
+    }
+
+    #[test]
+    fn es256_wrong_signature_rejected() {
+        use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+
+        // Generate two different key pairs.
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8_sign =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let sign_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8_sign.as_ref())
+                .unwrap();
+
+        let pkcs8_verify =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let verify_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8_verify.as_ref())
+                .unwrap();
+
+        // Use the verification pair's public key in JWKS but sign with the other key.
+        let pub_key_bytes = verify_pair.public_key().as_ref();
+        let x_b64 = URL_SAFE_NO_PAD.encode(&pub_key_bytes[1..33]);
+        let y_b64 = URL_SAFE_NO_PAD.encode(&pub_key_bytes[33..65]);
+
+        let jwks = Jwks {
+            keys: vec![Jwk {
+                kty: "EC".into(),
+                kid: None,
+                alg: Some("ES256".into()),
+                n: None,
+                e: None,
+                x: Some(x_b64),
+                y: Some(y_b64),
+                crv: Some("P-256".into()),
+            }],
+        };
+
+        let header_json = r#"{"alg":"ES256","typ":"JWT"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(valid_claims().to_string().as_bytes());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+
+        // Sign with the WRONG key.
+        let sig = sign_pair.sign(&rng, signing_input.as_bytes()).unwrap();
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
+        let token = format!("{signing_input}.{sig_b64}");
+
+        let config = TenantIdpConfig {
+            jwks_keys: Some(jwks),
+            ..test_config()
+        };
+        let result = validate_jwt(&token, &config);
+        assert!(
+            matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("ES256 signature verification failed"))
+        );
+    }
+
+    /// Parse an RFC 8017 `RSAPublicKey` DER: `SEQUENCE { INTEGER n, INTEGER e }`.
+    /// Returns (n, e) as big-endian unsigned byte slices (leading zeros stripped).
+    fn parse_rsa_public_key_der(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        // Minimal DER parser: we just need two INTEGERs from a SEQUENCE.
+        let mut pos = 0;
+
+        // Outer SEQUENCE tag (0x30).
+        assert_eq!(der[pos], 0x30, "expected SEQUENCE");
+        pos += 1;
+        let (_seq_len, consumed) = parse_der_length(&der[pos..]);
+        pos += consumed;
+
+        // First INTEGER (n).
+        assert_eq!(der[pos], 0x02, "expected INTEGER for n");
+        pos += 1;
+        let (n_len, consumed) = parse_der_length(&der[pos..]);
+        pos += consumed;
+        let mut n = der[pos..pos + n_len].to_vec();
+        pos += n_len;
+        // Strip leading zero (DER sign byte).
+        if n.first() == Some(&0) && n.len() > 1 {
+            n.remove(0);
+        }
+
+        // Second INTEGER (e).
+        assert_eq!(der[pos], 0x02, "expected INTEGER for e");
+        pos += 1;
+        let (e_len, consumed) = parse_der_length(&der[pos..]);
+        pos += consumed;
+        let mut e = der[pos..pos + e_len].to_vec();
+        if e.first() == Some(&0) && e.len() > 1 {
+            e.remove(0);
+        }
+
+        (n, e)
+    }
+
+    /// Parse a DER length field, returning (length, bytes consumed).
+    fn parse_der_length(data: &[u8]) -> (usize, usize) {
+        if data[0] < 0x80 {
+            (data[0] as usize, 1)
+        } else {
+            let num_bytes = (data[0] & 0x7F) as usize;
+            let mut len = 0usize;
+            for byte in &data[1..=num_bytes] {
+                len = (len << 8) | (*byte as usize);
+            }
+            (len, 1 + num_bytes)
+        }
+    }
+
+    #[test]
+    fn rs256_verify_with_generated_key() {
+        use aws_lc_rs::rsa;
+        use aws_lc_rs::signature::KeyPair;
+
+        // Generate an RSA 2048-bit key pair.
+        let key_pair = rsa::KeyPair::generate(rsa::KeySize::Rsa2048).unwrap();
+
+        // Extract n and e from the DER-encoded public key (RFC 8017 format).
+        let pub_key_der = key_pair.public_key().as_ref();
+        let (n_bytes, e_bytes) = parse_rsa_public_key_der(pub_key_der);
+
+        let n_b64 = URL_SAFE_NO_PAD.encode(&n_bytes);
+        let e_b64 = URL_SAFE_NO_PAD.encode(&e_bytes);
+
+        let jwks = Jwks {
+            keys: vec![Jwk {
+                kty: "RSA".into(),
+                kid: Some("test-rsa".into()),
+                alg: Some("RS256".into()),
+                n: Some(n_b64),
+                e: Some(e_b64),
+                x: None,
+                y: None,
+                crv: None,
+            }],
+        };
+
+        let header_json = r#"{"alg":"RS256","typ":"JWT","kid":"test-rsa"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(valid_claims().to_string().as_bytes());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+
+        // Sign the token with PKCS1 SHA-256.
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let mut sig_buf = vec![0u8; key_pair.public_modulus_len()];
+        key_pair
+            .sign(
+                &signature::RSA_PKCS1_SHA256,
+                &rng,
+                signing_input.as_bytes(),
+                &mut sig_buf,
+            )
+            .unwrap();
+        let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_buf);
+        let token = format!("{signing_input}.{sig_b64}");
+
+        let config = TenantIdpConfig {
+            jwks_keys: Some(jwks),
+            ..test_config()
+        };
+        let result = validate_jwt(&token, &config);
+        assert!(result.is_ok(), "RS256 verification failed: {result:?}");
     }
 
     #[test]

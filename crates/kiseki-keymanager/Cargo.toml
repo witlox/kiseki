@@ -10,11 +10,14 @@ repository.workspace = true
 [features]
 kms-vault = []
 kms-aws = []
+kms-azure = []
+kms-gcp = []
 
 [lints]
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }
 thiserror = { workspace = true }

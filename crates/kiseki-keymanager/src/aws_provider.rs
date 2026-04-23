@@ -1,10 +1,12 @@
-//! AWS KMS provider (feature: kms-aws).
+//! AWS KMS provider (feature: `kms-aws`).
 //!
-//! Compile-time stub that defines the types and API surface without
-//! depending on `aws-sdk-kms`. All operations return
-//! [`KmsError::Unavailable`] until the SDK dependency is wired in.
+//! Request construction is real (correct JSON bodies, base64 encoding).
+//! The actual HTTP call returns [`KmsError::Unavailable`] — full `SigV4`
+//! signing requires the AWS SDK or a substantial signing implementation.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use base64::prelude::*;
 
 use crate::provider::{KmsEpochId, KmsError, KmsHealth, TenantKmsProvider};
 
@@ -25,8 +27,8 @@ pub struct AwsKmsConfig {
 
 /// AWS KMS provider.
 ///
-/// Current build is a compile-time stub; all operations return
-/// [`KmsError::Unavailable`] until `aws-sdk-kms` is added.
+/// Request construction is functional; HTTP transport returns
+/// `Unavailable` until aws-sdk-kms or `SigV4` signing is linked.
 #[derive(Debug)]
 pub struct AwsKmsProvider {
     config: AwsKmsConfig,
@@ -48,30 +50,62 @@ impl AwsKmsProvider {
     pub fn config(&self) -> &AwsKmsConfig {
         &self.config
     }
+
+    /// Build the JSON body for an AWS KMS Encrypt request.
+    #[must_use]
+    pub fn build_encrypt_body(key_id: &str, plaintext: &[u8], aad: &[u8]) -> String {
+        let pt_b64 = BASE64_STANDARD.encode(plaintext);
+        let aad_b64 = BASE64_STANDARD.encode(aad);
+        format!(
+            r#"{{"KeyId":"{key_id}","Plaintext":"{pt_b64}","EncryptionContext":{{"aad":"{aad_b64}"}}}}"#
+        )
+    }
+
+    /// Build the JSON body for an AWS KMS Decrypt request.
+    #[must_use]
+    pub fn build_decrypt_body(key_id: &str, ciphertext_blob: &[u8], aad: &[u8]) -> String {
+        let ct_b64 = BASE64_STANDARD.encode(ciphertext_blob);
+        let aad_b64 = BASE64_STANDARD.encode(aad);
+        format!(
+            r#"{{"KeyId":"{key_id}","CiphertextBlob":"{ct_b64}","EncryptionContext":{{"aad":"{aad_b64}"}}}}"#
+        )
+    }
+
+    /// The KMS endpoint for the configured region.
+    #[must_use]
+    pub fn endpoint(&self) -> String {
+        format!("https://kms.{}.amazonaws.com", self.config.region)
+    }
 }
 
 impl TenantKmsProvider for AwsKmsProvider {
-    fn wrap(&self, _plaintext: &[u8], _aad: &[u8]) -> Result<Vec<u8>, KmsError> {
+    fn wrap(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, KmsError> {
+        // Request construction is real — body is valid AWS KMS JSON.
+        let _body = Self::build_encrypt_body(&self.config.key_id, plaintext, aad);
+        let _endpoint = self.endpoint();
         Err(KmsError::Unavailable(
-            "aws-sdk-kms not compiled — enable kms-aws feature".into(),
+            "aws-sdk-kms not linked — SigV4 signing required".into(),
         ))
     }
 
-    fn unwrap(&self, _ciphertext: &[u8], _aad: &[u8]) -> Result<Vec<u8>, KmsError> {
+    fn unwrap(&self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, KmsError> {
+        let _body = Self::build_decrypt_body(&self.config.key_id, ciphertext, aad);
+        let _endpoint = self.endpoint();
         Err(KmsError::Unavailable(
-            "aws-sdk-kms not compiled — enable kms-aws feature".into(),
+            "aws-sdk-kms not linked — SigV4 signing required".into(),
         ))
     }
 
     fn rotate(&self) -> Result<KmsEpochId, KmsError> {
+        let _ = self.epoch.load(Ordering::Relaxed);
         Err(KmsError::Unavailable(
-            "aws-sdk-kms not compiled — enable kms-aws feature".into(),
+            "aws-sdk-kms not linked — SigV4 signing required".into(),
         ))
     }
 
     fn health_check(&self) -> KmsHealth {
         let _ = self.epoch.load(Ordering::Relaxed);
-        KmsHealth::Unavailable("aws-sdk-kms not compiled — enable kms-aws feature".into())
+        KmsHealth::Unavailable("aws-sdk-kms not linked — SigV4 signing required".into())
     }
 
     fn name(&self) -> &'static str {
@@ -99,7 +133,28 @@ mod tests {
         let provider = AwsKmsProvider::new(cfg);
         assert_eq!(provider.config().region, "eu-central-1");
         assert!(provider.config().key_id.contains("test-key-id"));
+        assert_eq!(
+            provider.endpoint(),
+            "https://kms.eu-central-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn name_is_aws_kms() {
+        let provider = AwsKmsProvider::new(test_config());
         assert_eq!(provider.name(), "aws-kms");
+    }
+
+    #[test]
+    fn encrypt_body_format() {
+        let body = AwsKmsProvider::build_encrypt_body("key-1", b"secret", b"aad-data");
+        assert!(body.contains("\"KeyId\":\"key-1\""));
+        assert!(body.contains("\"Plaintext\":\""));
+        assert!(body.contains("\"EncryptionContext\""));
+
+        // Verify base64 is decodable.
+        // The plaintext field value is base64("secret") = "c2VjcmV0"
+        assert!(body.contains("c2VjcmV0"));
     }
 
     #[test]
