@@ -1,0 +1,32 @@
+# Systemd service for kiseki-server.
+#
+# Install:
+#   cp examples/kiseki-server.service /etc/systemd/system/
+#   cp examples/single-node.env /etc/kiseki/server.env  (edit as needed)
+#   systemctl daemon-reload
+#   systemctl enable --now kiseki-server
+
+[Unit]
+Description=Kiseki Storage Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kiseki-server
+EnvironmentFile=/etc/kiseki/server.env
+Restart=always
+RestartSec=5
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Security hardening
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kiseki
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
