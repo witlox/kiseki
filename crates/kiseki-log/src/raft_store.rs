@@ -289,8 +289,9 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
     }
 }
 
+#[async_trait::async_trait]
 impl LogOps for RaftLogStore {
-    fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
+    async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         // Pre-check state and key range.
         {
             let inner = self
@@ -332,7 +333,7 @@ impl LogOps for RaftLogStore {
         Ok(inner.shards[&req.shard_id].info.tip)
     }
 
-    fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
+    async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
         let inner = self
             .inner
             .lock()
@@ -354,7 +355,7 @@ impl LogOps for RaftLogStore {
             .collect())
     }
 
-    fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
+    async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
         let inner = self
             .inner
             .lock()
@@ -366,11 +367,11 @@ impl LogOps for RaftLogStore {
             .ok_or(LogError::ShardNotFound(shard_id))
     }
 
-    fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
+    async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
         self.apply_command(shard_id, LogCommand::SetMaintenance { enabled })
     }
 
-    fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+    async fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
         let mut inner = self
             .inner
             .lock()
@@ -386,7 +387,7 @@ impl LogOps for RaftLogStore {
         Ok(gc_boundary)
     }
 
-    fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
+    async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         let mut inner = self
             .inner
             .lock()
@@ -459,8 +460,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn append_via_command_log() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn append_via_command_log() {
         let store = RaftLogStore::new();
         store.create_shard(
             test_shard(),
@@ -469,14 +470,14 @@ mod tests {
             ShardConfig::default(),
         );
 
-        let seq = store.append_delta(make_req(test_shard(), 0x50));
+        let seq = store.append_delta(make_req(test_shard(), 0x50)).await;
         assert!(seq.is_ok());
         assert_eq!(seq.unwrap_or_else(|_| unreachable!()), SequenceNumber(1));
         assert_eq!(store.log_length(test_shard()), 1);
     }
 
-    #[test]
-    fn total_order_via_command_log() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn total_order_via_command_log() {
         let store = RaftLogStore::new();
         store.create_shard(
             test_shard(),
@@ -489,6 +490,7 @@ mod tests {
             let key = (i * 20 + 10) % 255;
             store
                 .append_delta(make_req(test_shard(), key))
+                .await
                 .unwrap_or_else(|_| unreachable!());
         }
 
@@ -498,6 +500,7 @@ mod tests {
                 from: SequenceNumber(1),
                 to: SequenceNumber(5),
             })
+            .await
             .unwrap_or_else(|_| unreachable!());
 
         assert_eq!(deltas.len(), 5);
@@ -506,8 +509,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn maintenance_via_command_log() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn maintenance_via_command_log() {
         let store = RaftLogStore::new();
         store.create_shard(
             test_shard(),
@@ -518,13 +521,15 @@ mod tests {
 
         store
             .set_maintenance(test_shard(), true)
+            .await
             .unwrap_or_else(|_| unreachable!());
 
-        let result = store.append_delta(make_req(test_shard(), 0x50));
+        let result = store.append_delta(make_req(test_shard(), 0x50)).await;
         assert!(result.is_err());
 
         let health = store
             .shard_health(test_shard())
+            .await
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(health.state, ShardState::Maintenance);
     }

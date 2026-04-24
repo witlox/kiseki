@@ -32,9 +32,10 @@ pub struct Composition {
 }
 
 /// Composition operations trait.
-pub trait CompositionOps {
+#[async_trait::async_trait]
+pub trait CompositionOps: Send + Sync {
     /// Create a new composition in a namespace.
-    fn create(
+    async fn create(
         &mut self,
         namespace_id: NamespaceId,
         chunks: Vec<ChunkId>,
@@ -45,7 +46,7 @@ pub trait CompositionOps {
     fn get(&self, id: CompositionId) -> Result<&Composition, CompositionError>;
 
     /// Delete a composition (creates a tombstone delta).
-    fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError>;
+    async fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError>;
 
     /// Rename a composition. Returns `CrossShardRename` if source and
     /// target are on different shards (I-L8).
@@ -56,7 +57,7 @@ pub trait CompositionOps {
     ) -> Result<(), CompositionError>;
 
     /// Update a composition — creates a new version with new chunk refs.
-    fn update(
+    async fn update(
         &mut self,
         id: CompositionId,
         chunks: Vec<ChunkId>,
@@ -79,7 +80,10 @@ pub trait CompositionOps {
     fn abort_multipart(&mut self, upload_id: &str) -> Result<(), CompositionError>;
 
     /// Finalize a multipart upload — makes the composition visible (I-L5).
-    fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError>;
+    async fn finalize_multipart(
+        &mut self,
+        upload_id: &str,
+    ) -> Result<CompositionId, CompositionError>;
 }
 
 /// In-memory composition store.
@@ -146,8 +150,9 @@ impl Default for CompositionStore {
     }
 }
 
+#[async_trait::async_trait]
 impl CompositionOps for CompositionStore {
-    fn create(
+    async fn create(
         &mut self,
         namespace_id: NamespaceId,
         chunks: Vec<ChunkId>,
@@ -185,7 +190,9 @@ impl CompositionOps for CompositionStore {
                 hashed_key,
                 comp.chunks.clone(),
                 id.0.as_bytes().to_vec(),
-            ) {
+            )
+            .await
+            {
                 self.compositions.remove(&id);
                 return Err(CompositionError::NamespaceNotFound(namespace_id));
             }
@@ -200,7 +207,7 @@ impl CompositionOps for CompositionStore {
             .ok_or(CompositionError::CompositionNotFound(id))
     }
 
-    fn update(
+    async fn update(
         &mut self,
         id: CompositionId,
         chunks: Vec<ChunkId>,
@@ -227,13 +234,14 @@ impl CompositionOps for CompositionStore {
                 composition_hash_key(namespace_id, id),
                 chunks,
                 id.0.as_bytes().to_vec(),
-            );
+            )
+            .await;
         }
 
         Ok(version)
     }
 
-    fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError> {
+    async fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError> {
         let comp = self
             .compositions
             .remove(&id)
@@ -248,7 +256,8 @@ impl CompositionOps for CompositionStore {
                 composition_hash_key(comp.namespace_id, id),
                 vec![],
                 id.0.as_bytes().to_vec(),
-            );
+            )
+            .await;
         }
 
         Ok(())
@@ -335,7 +344,10 @@ impl CompositionOps for CompositionStore {
         Ok(())
     }
 
-    fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError> {
+    async fn finalize_multipart(
+        &mut self,
+        upload_id: &str,
+    ) -> Result<CompositionId, CompositionError> {
         let (upload, ns_id) = self
             .multiparts
             .get_mut(upload_id)
@@ -352,7 +364,7 @@ impl CompositionOps for CompositionStore {
         let ns_id = *ns_id;
 
         // Create the composition now that it's visible (I-L5).
-        self.create(ns_id, chunks, size)
+        self.create(ns_id, chunks, size).await
     }
 }
 
@@ -399,8 +411,9 @@ mod tests {
     #[test]
     fn create_and_get() {
         let mut store = setup();
-        let id = store
-            .create(test_ns(), vec![ChunkId([0x01; 32])], 1024)
+        let id = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(store.create(test_ns(), vec![ChunkId([0x01; 32])], 1024))
             .unwrap_or_else(|_| unreachable!());
 
         let comp = store.get(id).unwrap_or_else(|_| unreachable!());
@@ -411,16 +424,19 @@ mod tests {
 
     #[test]
     fn delete_removes_composition() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
-        let id = store
-            .create(test_ns(), vec![], 0)
+        let id = rt
+            .block_on(store.create(test_ns(), vec![], 0))
             .unwrap_or_else(|_| unreachable!());
-        store.delete(id).unwrap_or_else(|_| unreachable!());
+        rt.block_on(store.delete(id))
+            .unwrap_or_else(|_| unreachable!());
         assert!(store.get(id).is_err());
     }
 
     #[test]
     fn cross_shard_rename_returns_exdev() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
         // Add a namespace on a different shard.
         store.add_namespace(Namespace {
@@ -430,8 +446,8 @@ mod tests {
             read_only: false,
         });
 
-        let id = store
-            .create(test_ns(), vec![], 0)
+        let id = rt
+            .block_on(store.create(test_ns(), vec![], 0))
             .unwrap_or_else(|_| unreachable!());
         let result = store.rename(id, NamespaceId(uuid::Uuid::from_u128(20)));
         assert!(matches!(
@@ -442,6 +458,7 @@ mod tests {
 
     #[test]
     fn same_shard_rename_succeeds() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
         store.add_namespace(Namespace {
             id: NamespaceId(uuid::Uuid::from_u128(11)),
@@ -450,8 +467,8 @@ mod tests {
             read_only: false,
         });
 
-        let id = store
-            .create(test_ns(), vec![], 0)
+        let id = rt
+            .block_on(store.create(test_ns(), vec![], 0))
             .unwrap_or_else(|_| unreachable!());
         let result = store.rename(id, NamespaceId(uuid::Uuid::from_u128(11)));
         assert!(result.is_ok());
@@ -459,6 +476,7 @@ mod tests {
 
     #[test]
     fn read_only_namespace_rejects_create() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = CompositionStore::new();
         store.add_namespace(Namespace {
             id: test_ns(),
@@ -467,7 +485,7 @@ mod tests {
             read_only: true,
         });
 
-        let result = store.create(test_ns(), vec![], 0);
+        let result = rt.block_on(store.create(test_ns(), vec![], 0));
         assert!(matches!(
             result,
             Err(CompositionError::ReadOnlyNamespace(_))
@@ -476,6 +494,7 @@ mod tests {
 
     #[test]
     fn multipart_lifecycle() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
         let upload_id = store
             .start_multipart(test_ns())
@@ -495,8 +514,8 @@ mod tests {
             });
         }
 
-        let comp_id = store
-            .finalize_multipart(&upload_id)
+        let comp_id = rt
+            .block_on(store.finalize_multipart(&upload_id))
             .unwrap_or_else(|_| unreachable!());
 
         let comp = store.get(comp_id).unwrap_or_else(|_| unreachable!());
@@ -506,15 +525,16 @@ mod tests {
 
     #[test]
     fn versioning() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
-        let id = store
-            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+        let id = rt
+            .block_on(store.create(test_ns(), vec![ChunkId([0x01; 32])], 100))
             .unwrap_or_else(|_| unreachable!());
 
         assert_eq!(store.get(id).unwrap_or_else(|_| unreachable!()).version, 1);
 
-        let v2 = store
-            .update(id, vec![ChunkId([0x02; 32]), ChunkId([0x03; 32])], 200)
+        let v2 = rt
+            .block_on(store.update(id, vec![ChunkId([0x02; 32]), ChunkId([0x03; 32])], 200))
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(v2, 2);
 
@@ -526,9 +546,10 @@ mod tests {
 
     #[test]
     fn composition_belongs_to_one_tenant_ix1() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
-        let id = store
-            .create(test_ns(), vec![ChunkId([0xaa; 32])], 512)
+        let id = rt
+            .block_on(store.create(test_ns(), vec![ChunkId([0xaa; 32])], 512))
             .unwrap_or_else(|_| unreachable!());
 
         let comp = store.get(id).unwrap_or_else(|_| unreachable!());
@@ -539,9 +560,10 @@ mod tests {
 
     #[test]
     fn namespace_not_found_returns_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = CompositionStore::new();
         let bogus_ns = NamespaceId(uuid::Uuid::from_u128(999));
-        let result = store.create(bogus_ns, vec![], 0);
+        let result = rt.block_on(store.create(bogus_ns, vec![], 0));
         assert!(matches!(
             result,
             Err(CompositionError::NamespaceNotFound(_))
@@ -550,16 +572,17 @@ mod tests {
 
     #[test]
     fn list_compositions_in_namespace() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
 
-        let id1 = store
-            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+        let id1 = rt
+            .block_on(store.create(test_ns(), vec![ChunkId([0x01; 32])], 100))
             .unwrap_or_else(|_| unreachable!());
-        let id2 = store
-            .create(test_ns(), vec![ChunkId([0x02; 32])], 200)
+        let id2 = rt
+            .block_on(store.create(test_ns(), vec![ChunkId([0x02; 32])], 200))
             .unwrap_or_else(|_| unreachable!());
-        let id3 = store
-            .create(test_ns(), vec![ChunkId([0x03; 32])], 300)
+        let id3 = rt
+            .block_on(store.create(test_ns(), vec![ChunkId([0x03; 32])], 300))
             .unwrap_or_else(|_| unreachable!());
 
         let listed = store.list_by_namespace(test_ns());
@@ -573,20 +596,21 @@ mod tests {
 
     #[test]
     fn count_tracks_compositions() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
         assert_eq!(store.count(), 0);
 
-        store
-            .create(test_ns(), vec![], 0)
+        rt.block_on(store.create(test_ns(), vec![], 0))
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(store.count(), 1);
 
-        let id2 = store
-            .create(test_ns(), vec![], 0)
+        let id2 = rt
+            .block_on(store.create(test_ns(), vec![], 0))
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(store.count(), 2);
 
-        store.delete(id2).unwrap_or_else(|_| unreachable!());
+        rt.block_on(store.delete(id2))
+            .unwrap_or_else(|_| unreachable!());
         assert_eq!(store.count(), 1);
     }
 }

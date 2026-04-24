@@ -321,7 +321,7 @@ async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
 
     let (leader_id, leader_s3) = if let Some(ref log) = state.log_store {
-        match log.shard_health(bootstrap_shard) {
+        match log.shard_health(bootstrap_shard).await {
             Ok(info) => {
                 let lid = info.leader.map(|n| n.0);
                 // Resolve leader's S3 address from the peer list.

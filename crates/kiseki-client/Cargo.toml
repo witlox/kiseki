@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-ffi = ["tokio"]
+ffi = []
 fuse = ["fuser"]
 python = ["pyo3"]
 
@@ -26,7 +26,7 @@ fuser = { version = "0.17", optional = true }
 libc = { workspace = true }
 pyo3 = { version = "0.28", optional = true }
 serde = { version = "1", features = ["derive"] }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true }
 serde_json = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }

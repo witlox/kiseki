@@ -1,9 +1,9 @@
 //! Raft-backed shard store for multi-node clusters.
 //!
-//! Wraps per-shard `OpenRaftLogStore` instances behind the sync
-//! `LogOps` trait. Each shard gets its own Raft group for independent
-//! consensus. The sync↔async bridge uses `block_in_place` (safe on
-//! tokio's multi-thread runtime).
+//! Wraps per-shard `OpenRaftLogStore` instances behind the async
+//! `LogOps` trait (ADR-032). Each shard gets its own Raft group for
+//! independent consensus. Methods are called directly from async
+//! context — no sync↔async bridge needed.
 //!
 //! Phase I2: multi-node Raft consensus with in-memory Raft log
 //! (`MemLogStore`). Durability via Raft replication to majority.
@@ -24,12 +24,8 @@ use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 ///
 /// Holds a map of `ShardId → OpenRaftLogStore`. Each shard has its
 /// own Raft group with independent leader election. The `LogOps`
-/// trait methods bridge sync→async via `block_on` on a **dedicated**
-/// tokio runtime, separate from the server's main runtime.
-///
-/// This avoids deadlocks when the S3/NFS gateway calls `append_delta`
-/// from async context: `block_in_place` + `block_on` on the *same*
-/// runtime would starve worker threads under concurrent load.
+/// trait methods are async (ADR-032), so callers await directly
+/// without sync↔async bridging.
 ///
 /// When `data_dir` is set, uses `RedbRaftLogStore` for persistent
 /// Raft state (Phase 12b). When `None`, uses in-memory `MemLogStore`.
@@ -182,62 +178,36 @@ impl RaftShardStore {
     }
 }
 
-/// Run a future on the dedicated Raft runtime from any context.
-///
-/// Spawns the work on the Raft runtime via `spawn` and blocks the
-/// current thread waiting for the result via a oneshot channel.
-/// This avoids both:
-/// - "cannot start a runtime from within a runtime" (`block_on`)
-/// - Worker thread starvation (`block_in_place` with 32+ concurrent requests)
-fn run_on_raft<F, T>(rt: &tokio::runtime::Runtime, f: F) -> T
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    rt.spawn(async move {
-        tracing::trace!("run_on_raft: future starting");
-        let result = f.await;
-        tracing::trace!("run_on_raft: future completed, sending result");
-        let _ = tx.send(result);
-    });
-    tracing::trace!("run_on_raft: waiting for result on mpsc channel");
-    rx.recv()
-        .expect("Raft runtime task dropped without completing")
-}
-
+#[async_trait::async_trait]
 impl LogOps for RaftShardStore {
-    fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
+    async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(req.shard_id)?;
-        run_on_raft(&self.rt, async move { store.append_delta(req).await })
+        store.append_delta(req).await
     }
 
-    fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
+    async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
         let store = self.get_shard(req.shard_id)?;
-        run_on_raft(&self.rt, async move { store.read_deltas(req).await })
+        store.read_deltas(req).await
     }
 
-    fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
+    async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
         let store = self.get_shard(shard_id)?;
-        let info = run_on_raft(&self.rt, async move { store.shard_health().await });
+        let info = store.shard_health().await;
         Ok(info)
     }
 
-    fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
+    async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
         let store = self.get_shard(shard_id)?;
-        run_on_raft(
-            &self.rt,
-            async move { store.set_maintenance(enabled).await },
-        )
+        store.set_maintenance(enabled).await
     }
 
-    fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+    async fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(shard_id)?;
-        run_on_raft(&self.rt, async move { store.truncate_log().await })
+        store.truncate_log().await
     }
 
-    fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
+    async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         let store = self.get_shard(shard_id)?;
-        run_on_raft(&self.rt, async move { store.compact_shard().await })
+        store.compact_shard().await
     }
 }

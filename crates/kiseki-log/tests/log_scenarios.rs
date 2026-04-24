@@ -61,25 +61,25 @@ fn setup_store() -> MemShardStore {
 }
 
 // --- Scenario: Successful delta append ---
-#[test]
-fn successful_delta_append() {
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_delta_append() {
     let store = setup_store();
     let req = make_request(test_shard_id(), 0x50);
 
-    let seq = store.append_delta(req);
+    let seq = store.append_delta(req).await;
     assert!(seq.is_ok());
     assert_eq!(seq.unwrap_or_else(|_| unreachable!()), SequenceNumber(1));
 }
 
 // --- Scenario: Delta with inline data below threshold ---
-#[test]
-fn inline_data_delta() {
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_data_delta() {
     let store = setup_store();
     let mut req = make_request(test_shard_id(), 0x50);
     req.has_inline_data = true;
     req.payload = vec![0xcd; 1024]; // small inline data
 
-    let seq = store.append_delta(req);
+    let seq = store.append_delta(req).await;
     assert!(seq.is_ok());
 
     let deltas = store
@@ -88,6 +88,7 @@ fn inline_data_delta() {
             from: SequenceNumber(1),
             to: SequenceNumber(1),
         })
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     assert_eq!(deltas.len(), 1);
@@ -95,18 +96,21 @@ fn inline_data_delta() {
 }
 
 // --- Scenario: Deltas maintain total order within shard ---
-#[test]
-fn total_order_within_shard() {
+#[tokio::test(flavor = "multi_thread")]
+async fn total_order_within_shard() {
     let store = setup_store();
 
     let seq1 = store
         .append_delta(make_request(test_shard_id(), 0x10))
+        .await
         .unwrap_or_else(|_| unreachable!());
     let seq2 = store
         .append_delta(make_request(test_shard_id(), 0x20))
+        .await
         .unwrap_or_else(|_| unreachable!());
     let seq3 = store
         .append_delta(make_request(test_shard_id(), 0x30))
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     // Monotonic, gap-free (I-L1).
@@ -121,6 +125,7 @@ fn total_order_within_shard() {
             from: SequenceNumber(1),
             to: SequenceNumber(3),
         })
+        .await
         .unwrap_or_else(|_| unreachable!());
     assert_eq!(deltas.len(), 3);
     assert_eq!(deltas[0].header.sequence, SequenceNumber(1));
@@ -129,18 +134,21 @@ fn total_order_within_shard() {
 }
 
 // --- Scenario: Maintenance mode rejects writes ---
-#[test]
-fn maintenance_mode_rejects_writes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn maintenance_mode_rejects_writes() {
     let store = setup_store();
     store
         .set_maintenance(test_shard_id(), true)
+        .await
         .unwrap_or_else(|_| unreachable!());
 
-    let result = store.append_delta(make_request(test_shard_id(), 0x50));
+    let result = store
+        .append_delta(make_request(test_shard_id(), 0x50))
+        .await;
     assert!(result.is_err());
 
     // Reads still work.
-    let health = store.shard_health(test_shard_id());
+    let health = store.shard_health(test_shard_id()).await;
     assert!(health.is_ok());
     assert_eq!(
         health.unwrap_or_else(|_| unreachable!()).state,
@@ -149,23 +157,27 @@ fn maintenance_mode_rejects_writes() {
 }
 
 // --- Scenario: Exiting maintenance mode resumes writes ---
-#[test]
-fn exit_maintenance_resumes_writes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_maintenance_resumes_writes() {
     let store = setup_store();
     store
         .set_maintenance(test_shard_id(), true)
+        .await
         .unwrap_or_else(|_| unreachable!());
     store
         .set_maintenance(test_shard_id(), false)
+        .await
         .unwrap_or_else(|_| unreachable!());
 
-    let result = store.append_delta(make_request(test_shard_id(), 0x50));
+    let result = store
+        .append_delta(make_request(test_shard_id(), 0x50))
+        .await;
     assert!(result.is_ok());
 }
 
 // --- Scenario: Delta GC respects all consumer watermarks ---
-#[test]
-fn gc_respects_consumer_watermarks() {
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_respects_consumer_watermarks() {
     let store = setup_store();
 
     // Append 10 deltas.
@@ -173,6 +185,7 @@ fn gc_respects_consumer_watermarks() {
         let key = i * 10 + 10;
         store
             .append_delta(make_request(test_shard_id(), key))
+            .await
             .unwrap_or_else(|_| unreachable!());
     }
 
@@ -193,6 +206,7 @@ fn gc_respects_consumer_watermarks() {
     // GC boundary should be min(8, 5) = 5.
     let boundary = store
         .truncate_log(test_shard_id())
+        .await
         .unwrap_or_else(|_| unreachable!());
     assert_eq!(boundary, SequenceNumber(5));
 
@@ -203,19 +217,21 @@ fn gc_respects_consumer_watermarks() {
             from: SequenceNumber(1),
             to: SequenceNumber(10),
         })
+        .await
         .unwrap_or_else(|_| unreachable!());
     assert_eq!(remaining.len(), 6); // sequences 5,6,7,8,9,10
     assert_eq!(remaining[0].header.sequence, SequenceNumber(5));
 }
 
 // --- Scenario: Stream processor reads delta range ---
-#[test]
-fn read_delta_range() {
+#[tokio::test(flavor = "multi_thread")]
+async fn read_delta_range() {
     let store = setup_store();
     for i in 0u8..20 {
         let key = i * 10 + 10;
         store
             .append_delta(make_request(test_shard_id(), key))
+            .await
             .unwrap_or_else(|_| unreachable!());
     }
 
@@ -225,6 +241,7 @@ fn read_delta_range() {
             from: SequenceNumber(10),
             to: SequenceNumber(15),
         })
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     assert_eq!(deltas.len(), 6);
@@ -234,15 +251,17 @@ fn read_delta_range() {
 }
 
 // --- Scenario: Shard health reporting ---
-#[test]
-fn shard_health_reports_state() {
+#[tokio::test(flavor = "multi_thread")]
+async fn shard_health_reports_state() {
     let store = setup_store();
     store
         .append_delta(make_request(test_shard_id(), 0x50))
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     let info = store
         .shard_health(test_shard_id())
+        .await
         .unwrap_or_else(|_| unreachable!());
     assert_eq!(info.state, ShardState::Healthy);
     assert_eq!(info.tip, SequenceNumber(1));
@@ -250,16 +269,18 @@ fn shard_health_reports_state() {
 }
 
 // --- Scenario: Shard not found ---
-#[test]
-fn shard_not_found() {
+#[tokio::test(flavor = "multi_thread")]
+async fn shard_not_found() {
     let store = MemShardStore::new();
-    let result = store.shard_health(ShardId(uuid::Uuid::from_u128(999)));
+    let result = store
+        .shard_health(ShardId(uuid::Uuid::from_u128(999)))
+        .await;
     assert!(result.is_err());
 }
 
 // --- Scenario: Shard split ---
-#[test]
-fn shard_split_redistributes_deltas() {
+#[tokio::test(flavor = "multi_thread")]
+async fn shard_split_redistributes_deltas() {
     let store = MemShardStore::new();
     store.create_shard(
         test_shard_id(),
@@ -276,6 +297,7 @@ fn shard_split_redistributes_deltas() {
     for i in 0u8..6 {
         store
             .append_delta(make_request(test_shard_id(), i * 40 + 10))
+            .await
             .unwrap_or_else(|_| unreachable!());
     }
 
@@ -288,9 +310,11 @@ fn shard_split_redistributes_deltas() {
     // Both shards should exist and have deltas partitioned by key range.
     let old_info = store
         .shard_health(test_shard_id())
+        .await
         .unwrap_or_else(|_| unreachable!());
     let new_info = store
         .shard_health(new_id)
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     // Total deltas should equal original count.
@@ -298,8 +322,8 @@ fn shard_split_redistributes_deltas() {
 }
 
 // --- Scenario: Key out of range rejected ---
-#[test]
-fn key_out_of_range_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn key_out_of_range_rejected() {
     let store = MemShardStore::new();
     let shard_id = test_shard_id();
     store.create_shard(shard_id, test_tenant(), test_node(), ShardConfig::default());
@@ -312,13 +336,13 @@ fn key_out_of_range_rejected() {
 
     // The original shard now covers [0x00, midpoint).
     // A key at 0xFF should be out of range.
-    let result = store.append_delta(make_request(shard_id, 0xFF));
+    let result = store.append_delta(make_request(shard_id, 0xFF)).await;
     assert!(result.is_err());
 }
 
 // --- Scenario: Automatic compaction merges SSTables ---
-#[test]
-fn compaction_keeps_latest_per_key() {
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_keeps_latest_per_key() {
     let store = setup_store();
 
     // Append multiple deltas for the same hashed_key.
@@ -326,16 +350,19 @@ fn compaction_keeps_latest_per_key() {
     for _ in 0..5 {
         store
             .append_delta(make_request(test_shard_id(), key))
+            .await
             .unwrap_or_else(|_| unreachable!());
     }
     // Append one delta for a different key.
     store
         .append_delta(make_request(test_shard_id(), 0x60))
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     assert_eq!(
         store
             .shard_health(test_shard_id())
+            .await
             .unwrap_or_else(|_| unreachable!())
             .delta_count,
         6
@@ -343,6 +370,7 @@ fn compaction_keeps_latest_per_key() {
 
     let removed = store
         .compact_shard(test_shard_id())
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     // Should keep 1 for key 0x50 (latest) + 1 for key 0x60 = 2 total.
@@ -350,6 +378,7 @@ fn compaction_keeps_latest_per_key() {
     assert_eq!(
         store
             .shard_health(test_shard_id())
+            .await
             .unwrap_or_else(|_| unreachable!())
             .delta_count,
         2
@@ -357,18 +386,20 @@ fn compaction_keeps_latest_per_key() {
 }
 
 // --- Scenario: Compaction removes tombstones past watermark ---
-#[test]
-fn compaction_removes_old_tombstones() {
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_removes_old_tombstones() {
     let store = setup_store();
 
     // Append a create, then a delete (tombstone) for the same key.
     store
         .append_delta(make_request(test_shard_id(), 0x50))
+        .await
         .unwrap_or_else(|_| unreachable!());
     let mut delete_req = make_request(test_shard_id(), 0x50);
     delete_req.operation = OperationType::Delete;
     store
         .append_delta(delete_req)
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     // Register a consumer that has consumed past both deltas.
@@ -381,6 +412,7 @@ fn compaction_removes_old_tombstones() {
 
     let removed = store
         .compact_shard(test_shard_id())
+        .await
         .unwrap_or_else(|_| unreachable!());
 
     // Tombstone for key 0x50 is the latest, but it's past watermark → removed.

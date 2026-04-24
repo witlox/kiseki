@@ -67,13 +67,14 @@ fn setup() -> (Arc<MemShardStore>, CompositionStore, ViewStore) {
     (log, comp_store, views)
 }
 
-#[test]
-fn create_composition_emits_delta_to_log() {
+#[tokio::test(flavor = "multi_thread")]
+async fn create_composition_emits_delta_to_log() {
     let (log, mut comp, _views) = setup();
 
     // Create a composition.
     let _comp_id = comp
         .create(test_namespace(), vec![ChunkId([0x01; 32])], 1024)
+        .await
         .unwrap();
 
     // The log should have one delta.
@@ -83,6 +84,7 @@ fn create_composition_emits_delta_to_log() {
             from: SequenceNumber(1),
             to: SequenceNumber(100),
         })
+        .await
         .unwrap();
 
     assert_eq!(deltas.len(), 1);
@@ -94,18 +96,20 @@ fn create_composition_emits_delta_to_log() {
     assert_eq!(deltas[0].header.tenant_id, test_tenant());
 }
 
-#[test]
-fn update_and_delete_emit_deltas() {
+#[tokio::test(flavor = "multi_thread")]
+async fn update_and_delete_emit_deltas() {
     let (log, mut comp, _views) = setup();
 
     let comp_id = comp
         .create(test_namespace(), vec![ChunkId([0x01; 32])], 100)
+        .await
         .unwrap();
 
     comp.update(comp_id, vec![ChunkId([0x02; 32])], 200)
+        .await
         .unwrap();
 
-    comp.delete(comp_id).unwrap();
+    comp.delete(comp_id).await.unwrap();
 
     let deltas = log
         .read_deltas(ReadDeltasRequest {
@@ -113,6 +117,7 @@ fn update_and_delete_emit_deltas() {
             from: SequenceNumber(1),
             to: SequenceNumber(100),
         })
+        .await
         .unwrap();
 
     assert_eq!(deltas.len(), 3);
@@ -130,13 +135,14 @@ fn update_and_delete_emit_deltas() {
     );
 }
 
-#[test]
-fn stream_processor_advances_view_watermark() {
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_processor_advances_view_watermark() {
     let (log, mut comp, mut views) = setup();
 
     // Write 3 compositions → 3 deltas in the log.
     for i in 0u8..3 {
         comp.create(test_namespace(), vec![ChunkId([i; 32])], u64::from(i) * 100)
+            .await
             .unwrap();
     }
 
@@ -148,7 +154,7 @@ fn stream_processor_advances_view_watermark() {
     // Stream processor polls and consumes deltas.
     let mut sp = TrackedStreamProcessor::new(log.as_ref(), &mut views);
     sp.track(test_view());
-    let consumed = sp.poll(1000);
+    let consumed = sp.poll(1000).await;
 
     assert_eq!(consumed, 3);
 
@@ -158,26 +164,27 @@ fn stream_processor_advances_view_watermark() {
     assert_eq!(view.state, ViewState::Active);
 }
 
-#[test]
-fn stream_processor_is_idempotent() {
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_processor_is_idempotent() {
     let (log, mut comp, mut views) = setup();
 
     comp.create(test_namespace(), vec![ChunkId([0x01; 32])], 100)
+        .await
         .unwrap();
 
     // First poll: consumes 1 delta.
     let mut sp = TrackedStreamProcessor::new(log.as_ref(), &mut views);
     sp.track(test_view());
-    assert_eq!(sp.poll(1000), 1);
+    assert_eq!(sp.poll(1000).await, 1);
 
     // Second poll: no new deltas.
     let mut sp2 = TrackedStreamProcessor::new(log.as_ref(), &mut views);
     sp2.track(test_view());
-    assert_eq!(sp2.poll(2000), 0);
+    assert_eq!(sp2.poll(2000).await, 0);
 }
 
-#[test]
-fn full_pipeline_write_through_to_view() {
+#[tokio::test(flavor = "multi_thread")]
+async fn full_pipeline_write_through_to_view() {
     let (log, mut comp, mut views) = setup();
 
     // Write data through composition.
@@ -187,6 +194,7 @@ fn full_pipeline_write_through_to_view() {
             vec![ChunkId([0xAA; 32]), ChunkId([0xBB; 32])],
             2048,
         )
+        .await
         .unwrap();
 
     // Verify delta in log.
@@ -196,6 +204,7 @@ fn full_pipeline_write_through_to_view() {
             from: SequenceNumber(1),
             to: SequenceNumber(1),
         })
+        .await
         .unwrap();
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0].header.chunk_refs.len(), 2);
@@ -203,7 +212,7 @@ fn full_pipeline_write_through_to_view() {
     // Stream processor advances view.
     let mut sp = TrackedStreamProcessor::new(log.as_ref(), &mut views);
     sp.track(test_view());
-    sp.poll(1000);
+    sp.poll(1000).await;
 
     // View is now Active at watermark 1.
     let view = views.get_view(test_view()).unwrap();

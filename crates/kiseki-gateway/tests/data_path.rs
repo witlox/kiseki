@@ -32,8 +32,8 @@ fn setup_gateway() -> InMemoryGateway {
     InMemoryGateway::new(compositions, Box::new(chunks), master_key)
 }
 
-#[test]
-fn write_then_read_roundtrip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn write_then_read_roundtrip() {
     let gw = setup_gateway();
     let plaintext = b"hello kiseki world";
 
@@ -44,6 +44,7 @@ fn write_then_read_roundtrip() {
             namespace_id: test_namespace(),
             data: plaintext.to_vec(),
         })
+        .await
         .unwrap();
 
     assert_eq!(write_resp.bytes_written, plaintext.len() as u64);
@@ -57,14 +58,15 @@ fn write_then_read_roundtrip() {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
 
     assert_eq!(read_resp.data, plaintext);
     assert!(read_resp.eof);
 }
 
-#[test]
-fn read_with_offset_and_length() {
+#[tokio::test(flavor = "multi_thread")]
+async fn read_with_offset_and_length() {
     let gw = setup_gateway();
     let plaintext = b"abcdefghijklmnop";
 
@@ -74,6 +76,7 @@ fn read_with_offset_and_length() {
             namespace_id: test_namespace(),
             data: plaintext.to_vec(),
         })
+        .await
         .unwrap();
 
     // Read middle portion.
@@ -85,14 +88,15 @@ fn read_with_offset_and_length() {
             offset: 4,
             length: 4,
         })
+        .await
         .unwrap();
 
     assert_eq!(read_resp.data, b"efgh");
     assert!(!read_resp.eof);
 }
 
-#[test]
-fn read_past_eof_returns_empty() {
+#[tokio::test(flavor = "multi_thread")]
+async fn read_past_eof_returns_empty() {
     let gw = setup_gateway();
 
     let write_resp = gw
@@ -101,6 +105,7 @@ fn read_past_eof_returns_empty() {
             namespace_id: test_namespace(),
             data: b"short".to_vec(),
         })
+        .await
         .unwrap();
 
     let read_resp = gw
@@ -111,14 +116,15 @@ fn read_past_eof_returns_empty() {
             offset: 100,
             length: 10,
         })
+        .await
         .unwrap();
 
     assert!(read_resp.data.is_empty());
     assert!(read_resp.eof);
 }
 
-#[test]
-fn tenant_mismatch_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_mismatch_rejected() {
     let gw = setup_gateway();
 
     let write_resp = gw
@@ -127,6 +133,7 @@ fn tenant_mismatch_rejected() {
             namespace_id: test_namespace(),
             data: b"secret".to_vec(),
         })
+        .await
         .unwrap();
 
     // Try to read with a different tenant.
@@ -139,6 +146,7 @@ fn tenant_mismatch_rejected() {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap_err();
 
     assert!(
@@ -147,8 +155,8 @@ fn tenant_mismatch_rejected() {
     );
 }
 
-#[test]
-fn bucket_isolation_list_returns_only_own_objects() {
+#[tokio::test(flavor = "multi_thread")]
+async fn bucket_isolation_list_returns_only_own_objects() {
     // Create two namespaces (buckets), write to each, verify list
     // returns only the objects belonging to each namespace.
     let ns1 = NamespaceId(uuid::Uuid::from_u128(201));
@@ -178,6 +186,7 @@ fn bucket_isolation_list_returns_only_own_objects() {
         namespace_id: ns1,
         data: b"object-in-bucket1".to_vec(),
     })
+    .await
     .unwrap();
 
     // Write to ns2.
@@ -186,14 +195,15 @@ fn bucket_isolation_list_returns_only_own_objects() {
         namespace_id: ns2,
         data: b"object-in-bucket2".to_vec(),
     })
+    .await
     .unwrap();
 
     // List ns1 — should see only its object.
-    let list1 = gw.list(tenant, ns1).unwrap();
+    let list1 = gw.list(tenant, ns1).await.unwrap();
     assert_eq!(list1.len(), 1, "ns1 should have exactly 1 object");
 
     // List ns2 — should see only its object.
-    let list2 = gw.list(tenant, ns2).unwrap();
+    let list2 = gw.list(tenant, ns2).await.unwrap();
     assert_eq!(list2.len(), 1, "ns2 should have exactly 1 object");
 
     // The composition IDs should be different.
@@ -205,8 +215,8 @@ mod s3_tests {
     use super::*;
     use kiseki_gateway::s3::{GetObjectRequest, PutObjectRequest, S3Gateway};
 
-    #[test]
-    fn s3_put_then_get() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s3_put_then_get() {
         let gw = setup_gateway();
         let s3 = S3Gateway::new(gw);
 
@@ -216,6 +226,7 @@ mod s3_tests {
                 namespace_id: test_namespace(),
                 body: b"s3 object data".to_vec(),
             })
+            .await
             .unwrap();
 
         assert!(!put_resp.etag.is_empty());
@@ -230,6 +241,7 @@ mod s3_tests {
                 namespace_id: test_namespace(),
                 composition_id: comp_id,
             })
+            .await
             .unwrap();
 
         assert_eq!(get_resp.body, b"s3 object data");
@@ -244,8 +256,8 @@ mod nfs_tests {
     use kiseki_gateway::nfs_ops::{FileType, NfsContext};
     use std::sync::Arc;
 
-    #[test]
-    fn nfs_write_then_read() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs_write_then_read() {
         let gw = setup_gateway();
         let nfs = NfsGateway::new(gw);
 
@@ -255,6 +267,7 @@ mod nfs_tests {
                 namespace_id: test_namespace(),
                 data: b"nfs file content".to_vec(),
             })
+            .await
             .unwrap();
 
         assert_eq!(write_resp.count, 16);
@@ -267,6 +280,7 @@ mod nfs_tests {
                 offset: 0,
                 count: 1024,
             })
+            .await
             .unwrap();
 
         assert_eq!(read_resp.data, b"nfs file content");

@@ -71,6 +71,7 @@ kiseki-control = { path = "crates/kiseki-control", version = "2026.1.0" }
 kiseki-server = { path = "crates/kiseki-server", version = "2026.1.0" }
 
 # --- Core ---
+async-trait = "0.1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 zeroize = { version = "1", features = ["derive"] }

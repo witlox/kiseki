@@ -4,9 +4,9 @@
 //! chunk store → composition metadata, and reverse for reads.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use kiseki_chunk::store::ChunkOps;
 use kiseki_common::tenancy::DedupPolicy;
@@ -22,7 +22,7 @@ use crate::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteRespo
 
 /// In-memory gateway backed by composition store, chunk store, and crypto.
 ///
-/// Uses `Mutex` for interior mutability so `GatewayOps` methods can
+/// Uses `tokio::sync::Mutex` for interior mutability so `GatewayOps` methods can
 /// take `&self`, enabling concurrent access.
 pub struct InMemoryGateway {
     compositions: Mutex<CompositionStore>,
@@ -31,7 +31,7 @@ pub struct InMemoryGateway {
     master_key: SystemMasterKey,
     dedup_policy: DedupPolicy,
     tenant_hmac_key: Option<Vec<u8>>,
-    view_store: Option<Arc<Mutex<ViewStore>>>,
+    view_store: Option<Arc<std::sync::Mutex<ViewStore>>>,
     /// Total gateway requests (reads + writes).
     pub requests_total: AtomicU64,
     /// Cumulative bytes written through the gateway.
@@ -40,7 +40,7 @@ pub struct InMemoryGateway {
     pub bytes_read: AtomicU64,
     /// Last-written sequence per session for `ReadYourWrites` enforcement.
     /// Maps (tenant, namespace) → highest committed sequence number.
-    last_written_seq: Mutex<
+    last_written_seq: std::sync::Mutex<
         std::collections::HashMap<
             (kiseki_common::ids::OrgId, kiseki_common::ids::NamespaceId),
             kiseki_common::ids::SequenceNumber,
@@ -76,7 +76,7 @@ impl InMemoryGateway {
             requests_total: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
-            last_written_seq: Mutex::new(std::collections::HashMap::new()),
+            last_written_seq: std::sync::Mutex::new(std::collections::HashMap::new()),
             inline_threshold: 0, // disabled by default; set via with_inline_threshold
             small_store: None,
         }
@@ -101,22 +101,16 @@ impl InMemoryGateway {
     ///
     /// Namespaces are created by the Control Plane and must be registered
     /// with the gateway before any write/read operations can target them.
-    pub fn add_namespace(&self, ns: kiseki_composition::namespace::Namespace) {
-        self.compositions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .add_namespace(ns);
+    pub async fn add_namespace(&self, ns: kiseki_composition::namespace::Namespace) {
+        self.compositions.lock().await.add_namespace(ns);
     }
 
     /// List compositions in a namespace (for S3 `ListObjectsV2`).
-    pub fn list_compositions(
+    pub async fn list_compositions(
         &self,
         ns_id: kiseki_common::ids::NamespaceId,
     ) -> Vec<(kiseki_common::ids::CompositionId, u64)> {
-        let compositions = self
-            .compositions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let compositions = self.compositions.lock().await;
         compositions
             .list_by_namespace(ns_id)
             .into_iter()
@@ -125,19 +119,19 @@ impl InMemoryGateway {
     }
 
     /// Start a multipart upload. Returns the upload ID.
-    pub fn start_multipart(
+    pub async fn start_multipart_internal(
         &self,
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<String, GatewayError> {
         self.compositions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .await
             .start_multipart(namespace_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
 
     /// Upload a part: encrypt + store chunk, then register it with the upload.
-    pub fn upload_part(
+    pub async fn upload_part_internal(
         &self,
         upload_id: &str,
         part_number: u32,
@@ -157,13 +151,13 @@ impl InMemoryGateway {
 
         self.chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .await
             .write_chunk(env, "default")
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
         self.compositions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .await
             .upload_part(upload_id, part_number, chunk_id, size)
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
@@ -171,29 +165,30 @@ impl InMemoryGateway {
     }
 
     /// Complete a multipart upload.
-    pub fn complete_multipart(
+    pub async fn complete_multipart_internal(
         &self,
         upload_id: &str,
     ) -> Result<kiseki_common::ids::CompositionId, GatewayError> {
         self.compositions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .await
             .finalize_multipart(upload_id)
+            .await
             .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
 
     /// Abort a multipart upload.
-    pub fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+    pub async fn abort_multipart_internal(&self, upload_id: &str) -> Result<(), GatewayError> {
         self.compositions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .await
             .abort_multipart(upload_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
 
     /// Attach a shared view store for staleness enforcement (I-K9).
     #[must_use]
-    pub fn with_view_store(mut self, vs: Arc<Mutex<ViewStore>>) -> Self {
+    pub fn with_view_store(mut self, vs: Arc<std::sync::Mutex<ViewStore>>) -> Self {
         self.view_store = Some(vs);
         self
     }
@@ -214,15 +209,12 @@ impl InMemoryGateway {
     ///
     /// Used by `create_bucket` so the composition store has a registered
     /// namespace before any object write targets it.
-    pub fn ensure_namespace_exists(
+    pub async fn ensure_namespace_exists(
         &self,
         tenant_id: kiseki_common::ids::OrgId,
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<(), GatewayError> {
-        let mut comps = self
-            .compositions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut comps = self.compositions.lock().await;
         if comps.namespace(namespace_id).is_none() {
             comps.add_namespace(kiseki_composition::namespace::Namespace {
                 id: namespace_id,
@@ -235,16 +227,11 @@ impl InMemoryGateway {
     }
 }
 
+#[async_trait::async_trait]
 impl GatewayOps for InMemoryGateway {
-    fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        let compositions = self
-            .compositions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let chunks = self
-            .chunks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
+        let compositions = self.compositions.lock().await;
+        let chunks = self.chunks.lock().await;
 
         // Look up the composition.
         let comp = compositions
@@ -345,11 +332,8 @@ impl GatewayOps for InMemoryGateway {
         })
     }
 
-    fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
+    async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         // Compute content-addressed chunk ID.
-        // TODO(I-X2): Production must look up the tenant's DedupPolicy.
-        // TenantIsolated tenants need HMAC-SHA256 with their tenant HMAC
-        // key to prevent cross-tenant co-occurrence analysis.
         let chunk_id = derive_chunk_id(
             &req.data,
             self.dedup_policy,
@@ -369,15 +353,6 @@ impl GatewayOps for InMemoryGateway {
 
         // Route: inline (ADR-030) or chunk store.
         if bytes_written <= self.inline_threshold && self.small_store.is_some() {
-            // Inline path: serialize envelope and store in small/objects.redb.
-            // The delta payload will carry this data through Raft, and the
-            // state machine offloads it to the inline store on apply (I-SF5).
-            //
-            // Refcount note: inline content does NOT use chunk refcounts.
-            // Dedup is handled by SmallObjectStore.put() (returns is_new=false
-            // on duplicate). GC is handled by I-SF6 (truncate/compact deletes
-            // inline entries). This is intentional — inline files live in the
-            // metadata tier, not the chunk tier.
             let env_bytes =
                 serde_json::to_vec(&env).map_err(|e| GatewayError::Upstream(e.to_string()))?;
             if let Some(ref store) = self.small_store {
@@ -387,10 +362,7 @@ impl GatewayOps for InMemoryGateway {
             }
         } else {
             // Chunk path: store encrypted envelope on block device.
-            let mut chunks = self
-                .chunks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut chunks = self.chunks.lock().await;
             let is_new = chunks
                 .write_chunk(env, "default")
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
@@ -403,8 +375,9 @@ impl GatewayOps for InMemoryGateway {
         let comp_id = self
             .compositions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .await
             .create(req.namespace_id, vec![chunk_id], bytes_written)
+            .await
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
         Ok(WriteResponse {
@@ -413,16 +386,13 @@ impl GatewayOps for InMemoryGateway {
         })
     }
 
-    fn list(
+    async fn list(
         &self,
         tenant_id: kiseki_common::ids::OrgId,
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
         // Filter by tenant_id to prevent cross-tenant composition ID leak.
-        let compositions = self
-            .compositions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let compositions = self.compositions.lock().await;
         Ok(compositions
             .list_by_namespace(namespace_id)
             .into_iter()
@@ -431,20 +401,22 @@ impl GatewayOps for InMemoryGateway {
             .collect())
     }
 
-    fn start_multipart(
+    async fn start_multipart(
         &self,
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<String, GatewayError> {
-        self.start_multipart(namespace_id)
+        self.start_multipart_internal(namespace_id).await
     }
 
-    fn upload_part(
+    async fn upload_part(
         &self,
         upload_id: &str,
         part_number: u32,
         data: &[u8],
     ) -> Result<String, GatewayError> {
-        let chunk_id = self.upload_part(upload_id, part_number, data)?;
+        let chunk_id = self
+            .upload_part_internal(upload_id, part_number, data)
+            .await?;
         let mut hex = String::with_capacity(64);
         for b in &chunk_id.0 {
             use std::fmt::Write;
@@ -453,26 +425,26 @@ impl GatewayOps for InMemoryGateway {
         Ok(hex)
     }
 
-    fn complete_multipart(
+    async fn complete_multipart(
         &self,
         upload_id: &str,
     ) -> Result<kiseki_common::ids::CompositionId, GatewayError> {
-        self.complete_multipart(upload_id)
+        self.complete_multipart_internal(upload_id).await
     }
 
-    fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
-        self.abort_multipart(upload_id)
+    async fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        self.abort_multipart_internal(upload_id).await
     }
 
-    fn ensure_namespace(
+    async fn ensure_namespace(
         &self,
         tenant_id: kiseki_common::ids::OrgId,
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<(), GatewayError> {
-        self.ensure_namespace_exists(tenant_id, namespace_id)
+        self.ensure_namespace_exists(tenant_id, namespace_id).await
     }
 
-    fn delete(
+    async fn delete(
         &self,
         tenant_id: kiseki_common::ids::OrgId,
         _namespace_id: kiseki_common::ids::NamespaceId,
@@ -481,10 +453,7 @@ impl GatewayOps for InMemoryGateway {
         // Verify tenant ownership and collect chunk refs before deleting.
         let chunk_ids: Vec<kiseki_common::ids::ChunkId>;
         {
-            let compositions = self
-                .compositions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let compositions = self.compositions.lock().await;
             let comp = compositions
                 .get(composition_id)
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
@@ -497,16 +466,14 @@ impl GatewayOps for InMemoryGateway {
         // Delete the composition.
         self.compositions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .await
             .delete(composition_id)
+            .await
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
         // Decrement chunk refcounts (I-C2: GC when refcount reaches 0).
         {
-            let mut chunks = self
-                .chunks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut chunks = self.chunks.lock().await;
             for chunk_id in &chunk_ids {
                 let _ = chunks.decrement_refcount(chunk_id);
             }

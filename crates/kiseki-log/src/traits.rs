@@ -49,26 +49,30 @@ pub struct ReadDeltasRequest {
 /// implementations use `Mutex` or `RefCell` internally.
 ///
 /// Implementations: `MemShardStore` (in-memory, for testing),
-/// `RaftShardStore` (production, with openraft — future).
-pub trait LogOps {
+/// `RaftShardStore` (production, with openraft).
+///
+/// All methods are async (ADR-032) to avoid thread starvation when
+/// bridging to the Raft consensus layer under concurrent load.
+#[async_trait::async_trait]
+pub trait LogOps: Send + Sync {
     /// Append a delta to a shard. Returns the assigned sequence number.
     ///
     /// Fails if the shard is in maintenance mode, splitting (for
     /// out-of-range keys), or has lost Raft quorum.
-    fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError>;
+    async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError>;
 
     /// Read deltas in `[from, to]` inclusive from a shard.
-    fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError>;
+    async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError>;
 
     /// Get shard health and metadata.
-    fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError>;
+    async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError>;
 
     /// Set or clear maintenance mode on a shard (I-O6).
-    fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError>;
+    async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError>;
 
     /// Run GC: truncate deltas below the minimum consumer watermark.
     /// Returns the new GC boundary.
-    fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError>;
+    async fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError>;
 
     /// Run compaction on a shard: merge deltas by `(hashed_key, sequence)`.
     ///
@@ -76,5 +80,5 @@ pub trait LogOps {
     /// `hashed_key`. Tombstones are removed if all consumers have
     /// advanced past them. Payloads are carried opaquely — never
     /// decrypted (I-L7). Returns the number of deltas removed.
-    fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError>;
+    async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError>;
 }

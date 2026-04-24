@@ -66,14 +66,17 @@ impl<G: GatewayOps> NfsGateway<G> {
     }
 
     /// NFS READ — reads from a file handle at a given offset.
-    pub fn read(&self, req: NfsReadRequest) -> Result<NfsReadResponse, GatewayError> {
-        let read_resp = self.inner.read(ReadRequest {
-            tenant_id: req.tenant_id,
-            namespace_id: req.namespace_id,
-            composition_id: req.composition_id,
-            offset: req.offset,
-            length: u64::from(req.count),
-        })?;
+    pub async fn read(&self, req: NfsReadRequest) -> Result<NfsReadResponse, GatewayError> {
+        let read_resp = self
+            .inner
+            .read(ReadRequest {
+                tenant_id: req.tenant_id,
+                namespace_id: req.namespace_id,
+                composition_id: req.composition_id,
+                offset: req.offset,
+                length: u64::from(req.count),
+            })
+            .await?;
 
         Ok(NfsReadResponse {
             data: read_resp.data,
@@ -83,12 +86,15 @@ impl<G: GatewayOps> NfsGateway<G> {
 
     /// NFS WRITE — writes data to a new file.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn write(&self, req: NfsWriteRequest) -> Result<NfsWriteResponse, GatewayError> {
-        let write_resp = self.inner.write(WriteRequest {
-            tenant_id: req.tenant_id,
-            namespace_id: req.namespace_id,
-            data: req.data,
-        })?;
+    pub async fn write(&self, req: NfsWriteRequest) -> Result<NfsWriteResponse, GatewayError> {
+        let write_resp = self
+            .inner
+            .write(WriteRequest {
+                tenant_id: req.tenant_id,
+                namespace_id: req.namespace_id,
+                data: req.data,
+            })
+            .await?;
 
         Ok(NfsWriteResponse {
             count: write_resp.bytes_written as u32,

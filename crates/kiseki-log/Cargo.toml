@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-proto = { workspace = true }
 kiseki-raft = { workspace = true }

@@ -128,6 +128,9 @@ impl HandleRegistry {
 }
 
 /// NFS operations context — wraps gateway + handle registry + lock manager.
+///
+/// Holds a `tokio::runtime::Handle` to bridge sync NFS protocol callbacks
+/// to async `GatewayOps` methods via `block_on`.
 pub struct NfsContext<G: GatewayOps> {
     pub gateway: NfsGateway<G>,
     pub handles: HandleRegistry,
@@ -136,6 +139,8 @@ pub struct NfsContext<G: GatewayOps> {
     pub layouts: Mutex<crate::pnfs::LayoutManager>,
     pub tenant_id: OrgId,
     pub namespace_id: NamespaceId,
+    /// Tokio runtime handle for bridging sync NFS → async gateway ops.
+    pub rt: tokio::runtime::Handle,
 }
 
 impl<G: GatewayOps> NfsContext<G> {
@@ -156,6 +161,23 @@ impl<G: GatewayOps> NfsContext<G> {
         // Register root handle.
         handles.root_handle(namespace_id, tenant_id);
 
+        // Try to get the current tokio handle; if not in a tokio context,
+        // create a dedicated runtime for NFS.
+        let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            // Create a dedicated multi-thread runtime for NFS gateway ops.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("nfs-rt")
+                .build()
+                .expect("failed to create NFS tokio runtime");
+            // Leak the runtime so the handle remains valid for the process lifetime.
+            // NFS server runs for the entire process anyway.
+            let handle = runtime.handle().clone();
+            std::mem::forget(runtime);
+            handle
+        });
+
         Self {
             gateway,
             handles,
@@ -164,6 +186,7 @@ impl<G: GatewayOps> NfsContext<G> {
             layouts: Mutex::new(crate::pnfs::LayoutManager::new(storage_nodes)),
             tenant_id,
             namespace_id,
+            rt,
         }
     }
 
@@ -219,13 +242,13 @@ impl<G: GatewayOps> NfsContext<G> {
             ));
         };
 
-        self.gateway.read(NfsReadRequest {
+        self.rt.block_on(self.gateway.read(NfsReadRequest {
             tenant_id,
             namespace_id: ns_id,
             composition_id: comp_id,
             offset,
             count,
-        })
+        }))
     }
 
     /// Write to create a new named file (NFS CREATE).
@@ -247,11 +270,11 @@ impl<G: GatewayOps> NfsContext<G> {
 
     /// Write to create a new file (NFS CREATE + WRITE).
     pub fn write(&self, data: Vec<u8>) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
-        let resp = self.gateway.write(NfsWriteRequest {
+        let resp = self.rt.block_on(self.gateway.write(NfsWriteRequest {
             tenant_id: self.tenant_id,
             namespace_id: self.namespace_id,
             data,
-        })?;
+        }))?;
 
         let fh = self
             .handles

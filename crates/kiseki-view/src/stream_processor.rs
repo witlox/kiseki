@@ -125,7 +125,7 @@ impl<'a, L: LogOps + ?Sized, V: ViewOps, H: DeltaHandler> TrackedStreamProcessor
     /// across all shards (consistent prefix, I-V2).
     ///
     /// Returns the total number of deltas consumed across all views.
-    pub fn poll(&mut self, now_ms: u64) -> u64 {
+    pub async fn poll(&mut self, now_ms: u64) -> u64 {
         let mut total = 0;
 
         for i in 0..self.tracked_views.len() {
@@ -151,6 +151,7 @@ impl<'a, L: LogOps + ?Sized, V: ViewOps, H: DeltaHandler> TrackedStreamProcessor
                 let Ok(deltas) = self
                     .log
                     .read_deltas(ReadDeltasRequest { shard_id, from, to })
+                    .await
                 else {
                     continue;
                 };

@@ -40,8 +40,8 @@ fn setup_nfs_gateway() -> Arc<NfsGateway<InMemoryGateway>> {
 }
 
 /// NFS write/read roundtrip on a single thread.
-#[test]
-fn nfs_write_read_roundtrip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn nfs_write_read_roundtrip() {
     let nfs = setup_nfs_gateway();
     let data = vec![0xAB; 4096];
 
@@ -51,6 +51,7 @@ fn nfs_write_read_roundtrip() {
             namespace_id: test_namespace(),
             data: data.clone(),
         })
+        .await
         .unwrap();
 
     assert_eq!(write_resp.count, 4096);
@@ -63,6 +64,7 @@ fn nfs_write_read_roundtrip() {
             offset: 0,
             count: 4096,
         })
+        .await
         .unwrap();
 
     assert_eq!(read_resp.data, data);
@@ -81,14 +83,15 @@ fn concurrent_nfs_writes_no_deadlock() {
     for i in 0u8..16 {
         let nfs = Arc::clone(&nfs);
         handles.push(thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
             for j in 0..10 {
                 let data = vec![i.wrapping_add(j); 1024];
-                let resp = nfs
-                    .write(NfsWriteRequest {
+                let resp = rt
+                    .block_on(nfs.write(NfsWriteRequest {
                         tenant_id: test_tenant(),
                         namespace_id: test_namespace(),
                         data,
-                    })
+                    }))
                     .unwrap();
                 assert!(resp.count > 0, "write returned 0 bytes");
             }
@@ -108,17 +111,19 @@ fn concurrent_nfs_mixed_read_write() {
     let nfs = setup_nfs_gateway();
 
     // Pre-write objects for readers.
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut comp_ids = Vec::new();
     for i in 0u8..10 {
-        let resp = nfs
-            .write(NfsWriteRequest {
+        let resp = rt
+            .block_on(nfs.write(NfsWriteRequest {
                 tenant_id: test_tenant(),
                 namespace_id: test_namespace(),
                 data: vec![i; 2048],
-            })
+            }))
             .unwrap();
         comp_ids.push(resp.composition_id);
     }
+    drop(rt);
 
     let comp_ids = Arc::new(comp_ids);
     let mut handles = Vec::new();
@@ -127,13 +132,14 @@ fn concurrent_nfs_mixed_read_write() {
     for i in 0u8..8 {
         let nfs = Arc::clone(&nfs);
         handles.push(thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
             for j in 0..5 {
                 let data = vec![i.wrapping_add(j); 4096];
-                nfs.write(NfsWriteRequest {
+                rt.block_on(nfs.write(NfsWriteRequest {
                     tenant_id: test_tenant(),
                     namespace_id: test_namespace(),
                     data,
-                })
+                }))
                 .unwrap();
             }
         }));
@@ -144,16 +150,17 @@ fn concurrent_nfs_mixed_read_write() {
         let nfs = Arc::clone(&nfs);
         let comp_ids = Arc::clone(&comp_ids);
         handles.push(thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
             let comp_id = comp_ids[i % comp_ids.len()];
             for _ in 0..5 {
-                let resp = nfs
-                    .read(NfsReadRequest {
+                let resp = rt
+                    .block_on(nfs.read(NfsReadRequest {
                         tenant_id: test_tenant(),
                         namespace_id: test_namespace(),
                         composition_id: comp_id,
                         offset: 0,
                         count: 2048,
-                    })
+                    }))
                     .unwrap();
                 assert_eq!(resp.data.len(), 2048);
             }

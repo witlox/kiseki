@@ -122,7 +122,10 @@ pub fn plan_split(info: &ShardInfo) -> Option<SplitPlan> {
 /// 1. Create the new shard with the upper key range.
 /// 2. Redistribute deltas from the original shard to the new one.
 /// 3. Update key ranges on both shards.
-pub fn execute_split(log: &MemShardStore, plan: &SplitPlan) -> Result<(), crate::error::LogError> {
+pub async fn execute_split(
+    log: &MemShardStore,
+    plan: &SplitPlan,
+) -> Result<(), crate::error::LogError> {
     // Create new shard for the upper range.
     log.create_shard(
         plan.new_shard,
@@ -132,11 +135,13 @@ pub fn execute_split(log: &MemShardStore, plan: &SplitPlan) -> Result<(), crate:
     );
 
     // Read all deltas from original shard.
-    let deltas = log.read_deltas(crate::traits::ReadDeltasRequest {
-        shard_id: plan.original_shard,
-        from: kiseki_common::ids::SequenceNumber(0),
-        to: kiseki_common::ids::SequenceNumber(u64::MAX),
-    })?;
+    let deltas = log
+        .read_deltas(crate::traits::ReadDeltasRequest {
+            shard_id: plan.original_shard,
+            from: kiseki_common::ids::SequenceNumber(0),
+            to: kiseki_common::ids::SequenceNumber(u64::MAX),
+        })
+        .await?;
 
     // Redistribute: deltas with hashed_key >= midpoint go to new shard.
     for delta in &deltas {
@@ -150,7 +155,8 @@ pub fn execute_split(log: &MemShardStore, plan: &SplitPlan) -> Result<(), crate:
                 chunk_refs: delta.header.chunk_refs.clone(),
                 payload: delta.payload.ciphertext.clone(),
                 has_inline_data: delta.header.has_inline_data,
-            })?;
+            })
+            .await?;
         }
     }
 
@@ -248,8 +254,8 @@ mod tests {
         assert!(plan.midpoint[0] >= 0x7F);
     }
 
-    #[test]
-    fn execute_split_creates_new_shard() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_split_creates_new_shard() {
         use crate::store::MemShardStore;
 
         let store = MemShardStore::new();
@@ -264,10 +270,10 @@ mod tests {
         );
 
         let plan = plan_split(&info).unwrap();
-        execute_split(&store, &plan).unwrap();
+        execute_split(&store, &plan).await.unwrap();
 
         // New shard should exist.
-        let health = store.shard_health(plan.new_shard);
+        let health = store.shard_health(plan.new_shard).await;
         assert!(health.is_ok());
     }
 }

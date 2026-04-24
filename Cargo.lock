@@ -1644,11 +1644,13 @@ dependencies = [
 name = "kiseki-composition"
 version = "2026.1.0"
 dependencies = [
+ "async-trait",
  "kiseki-common",
  "kiseki-log",
  "kiseki-view",
  "proptest",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -1691,6 +1693,7 @@ dependencies = [
 name = "kiseki-gateway"
 version = "2026.1.0"
 dependencies = [
+ "async-trait",
  "aws-lc-rs",
  "axum 0.7.9",
  "http-body-util",
@@ -1742,6 +1745,7 @@ dependencies = [
 name = "kiseki-log"
 version = "2026.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "kiseki-common",
  "kiseki-proto",

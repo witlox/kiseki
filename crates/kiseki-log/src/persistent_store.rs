@@ -26,12 +26,12 @@ impl PersistentShardStore {
     ///
     /// If the redb database contains existing data, it is loaded
     /// into the in-memory store on startup.
-    pub fn open(path: &Path) -> Result<Self, LogError> {
+    pub async fn open(path: &Path) -> Result<Self, LogError> {
         let redb = RedbLogStore::open(path).map_err(|_| LogError::Unavailable)?;
         let mem = MemShardStore::new();
 
         let mut store = Self { mem, redb };
-        store.reload();
+        store.reload().await;
         Ok(store)
     }
 
@@ -58,7 +58,7 @@ impl PersistentShardStore {
     ///
     /// Iterates persisted shard metadata and deltas, re-creates shards
     /// and replays deltas into the in-memory store.
-    fn reload(&mut self) {
+    async fn reload(&mut self) {
         // MVP: shard metadata not iterated from redb. Shards are
         // re-created via bootstrap on startup. Deltas replayed below.
 
@@ -112,16 +112,19 @@ impl PersistentShardStore {
                         _ => ClockQuality::Ntp,
                     },
                 };
-                let _ = self.mem.append_delta(AppendDeltaRequest {
-                    shard_id,
-                    tenant_id,
-                    operation,
-                    timestamp,
-                    hashed_key: delta.hashed_key,
-                    chunk_refs: vec![],
-                    payload: delta.payload,
-                    has_inline_data: delta.has_inline_data,
-                });
+                let _ = self
+                    .mem
+                    .append_delta(AppendDeltaRequest {
+                        shard_id,
+                        tenant_id,
+                        operation,
+                        timestamp,
+                        hashed_key: delta.hashed_key,
+                        chunk_refs: vec![],
+                        payload: delta.payload,
+                        has_inline_data: delta.has_inline_data,
+                    })
+                    .await;
             }
             tracing::info!(shard_count = seen_shards.len(), "shards restored from redb");
         }
@@ -152,10 +155,11 @@ struct PersistedDelta {
     clock_quality: u8,
 }
 
+#[async_trait::async_trait]
 impl LogOps for PersistentShardStore {
-    fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
+    async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         // Write to in-memory first (assigns sequence number).
-        let seq = self.mem.append_delta(req.clone())?;
+        let seq = self.mem.append_delta(req.clone()).await?;
 
         // Persist the full request to redb for reload.
         let persisted = PersistedDelta {
@@ -189,24 +193,24 @@ impl LogOps for PersistentShardStore {
         Ok(seq)
     }
 
-    fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
-        self.mem.read_deltas(req)
+    async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
+        self.mem.read_deltas(req).await
     }
 
-    fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
-        self.mem.shard_health(shard_id)
+    async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
+        self.mem.shard_health(shard_id).await
     }
 
-    fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
-        self.mem.set_maintenance(shard_id, enabled)
+    async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
+        self.mem.set_maintenance(shard_id, enabled).await
     }
 
-    fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
-        self.mem.truncate_log(shard_id)
+    async fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        self.mem.truncate_log(shard_id).await
     }
 
-    fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
-        self.mem.compact_shard(shard_id)
+    async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
+        self.mem.compact_shard(shard_id).await
     }
 }
 
@@ -238,10 +242,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn append_and_read() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn append_and_read() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PersistentShardStore::open(&dir.path().join("test.redb")).unwrap();
+        let store = PersistentShardStore::open(&dir.path().join("test.redb"))
+            .await
+            .unwrap();
         store.create_shard(
             test_shard(),
             test_tenant(),
@@ -260,6 +266,7 @@ mod tests {
                 payload: b"test payload".to_vec(),
                 has_inline_data: true,
             })
+            .await
             .unwrap();
 
         assert_eq!(seq, SequenceNumber(1));
@@ -270,20 +277,21 @@ mod tests {
                 from: SequenceNumber(1),
                 to: SequenceNumber(1),
             })
+            .await
             .unwrap();
 
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].header.sequence, SequenceNumber(1));
     }
 
-    #[test]
-    fn redb_records_persist() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redb_records_persist() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("persist.redb");
 
         // Write data.
         {
-            let store = PersistentShardStore::open(&path).unwrap();
+            let store = PersistentShardStore::open(&path).await.unwrap();
             store.create_shard(
                 test_shard(),
                 test_tenant(),
@@ -301,26 +309,28 @@ mod tests {
                     payload: b"persisted".to_vec(),
                     has_inline_data: false,
                 })
+                .await
                 .unwrap();
         }
 
         // Reopen — reload should restore the delta into in-memory store.
         {
-            let store = PersistentShardStore::open(&path).unwrap();
+            let store = PersistentShardStore::open(&path).await.unwrap();
             let deltas = store
                 .read_deltas(ReadDeltasRequest {
                     shard_id: test_shard(),
                     from: SequenceNumber(1),
                     to: SequenceNumber(1),
                 })
+                .await
                 .unwrap();
             assert_eq!(deltas.len(), 1, "delta should survive reopen via reload");
             assert_eq!(deltas[0].payload.ciphertext, b"persisted");
         }
     }
 
-    #[test]
-    fn timestamps_survive_restart() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timestamps_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ts.redb");
 
@@ -339,7 +349,7 @@ mod tests {
 
         // Write delta with specific timestamp.
         {
-            let store = PersistentShardStore::open(&path).unwrap();
+            let store = PersistentShardStore::open(&path).await.unwrap();
             store.create_shard(
                 test_shard(),
                 test_tenant(),
@@ -357,18 +367,20 @@ mod tests {
                     payload: b"timestamped".to_vec(),
                     has_inline_data: false,
                 })
+                .await
                 .unwrap();
         }
 
         // Reopen and verify timestamp fidelity.
         {
-            let store = PersistentShardStore::open(&path).unwrap();
+            let store = PersistentShardStore::open(&path).await.unwrap();
             let deltas = store
                 .read_deltas(ReadDeltasRequest {
                     shard_id: test_shard(),
                     from: SequenceNumber(1),
                     to: SequenceNumber(1),
                 })
+                .await
                 .unwrap();
 
             assert_eq!(deltas.len(), 1);

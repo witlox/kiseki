@@ -143,7 +143,7 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
             part_number,
             body: body.to_vec(),
         };
-        return match tokio::task::block_in_place(|| state.gateway.upload_part(&req)) {
+        return match state.gateway.upload_part(&req).await {
             Ok(resp) => (
                 StatusCode::OK,
                 [("etag", format!("\"{}\"", resp.etag))],
@@ -154,15 +154,16 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
         };
     }
 
-    // Regular PutObject. block_in_place prevents std::sync::Mutex
-    // contention from blocking tokio worker threads under concurrent load.
-    match tokio::task::block_in_place(|| {
-        state.gateway.put_object(PutObjectRequest {
+    // Regular PutObject.
+    match state
+        .gateway
+        .put_object(PutObjectRequest {
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             body: body.to_vec(),
         })
-    }) {
+        .await
+    {
         Ok(resp) => (
             StatusCode::OK,
             [("etag", format!("\"{}\"", resp.etag))],
@@ -200,13 +201,15 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
         }
     }
 
-    match tokio::task::block_in_place(|| {
-        state.gateway.get_object(GetObjectRequest {
+    match state
+        .gateway
+        .get_object(GetObjectRequest {
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             composition_id: comp_id,
         })
-    }) {
+        .await
+    {
         Ok(resp) => (
             StatusCode::OK,
             [
@@ -237,13 +240,15 @@ async fn head_object<G: GatewayOps + Send + Sync + 'static>(
         Err(_) => return (StatusCode::NOT_FOUND).into_response(),
     };
 
-    match tokio::task::block_in_place(|| {
-        state.gateway.get_object(GetObjectRequest {
+    match state
+        .gateway
+        .get_object(GetObjectRequest {
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             composition_id: comp_id,
         })
-    }) {
+        .await
+    {
         Ok(resp) => (
             StatusCode::OK,
             [("content-length", resp.content_length.to_string())],
@@ -274,7 +279,7 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
         };
-        return match tokio::task::block_in_place(|| state.gateway.create_multipart_upload(&req)) {
+        return match state.gateway.create_multipart_upload(&req).await {
             Ok(resp) => (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({ "uploadId": resp.upload_id })),
@@ -291,7 +296,7 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
             namespace_id: ns_id,
             upload_id,
         };
-        return match tokio::task::block_in_place(|| state.gateway.complete_multipart_upload(&req)) {
+        return match state.gateway.complete_multipart_upload(&req).await {
             Ok(resp) => (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({ "etag": resp.etag })),
@@ -321,7 +326,7 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
     // DELETE ?uploadId=X → AbortMultipartUpload
     if let Some(upload_id) = params.upload_id {
         let req = AbortMultipartUploadRequest { upload_id };
-        return match tokio::task::block_in_place(|| state.gateway.abort_multipart_upload(&req)) {
+        return match state.gateway.abort_multipart_upload(&req).await {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
@@ -333,13 +338,15 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
         Err(_) => return StatusCode::NO_CONTENT.into_response(),
     };
 
-    match tokio::task::block_in_place(|| {
-        state.gateway.delete_object(DeleteObjectRequest {
+    match state
+        .gateway
+        .delete_object(DeleteObjectRequest {
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             composition_id: comp_id,
         })
-    }) {
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             let code = if e.to_string().contains("not found") {
@@ -358,24 +365,33 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
 async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
     Path(bucket): Path<String>,
-) -> impl IntoResponse {
-    let mut buckets = state
-        .buckets
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if buckets.contains(&bucket) {
+) -> axum::response::Response {
+    // Check and insert bucket — scope the MutexGuard so it is dropped
+    // before any `.await` point, keeping the future `Send`.
+    let already_exists = {
+        let mut buckets = state
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buckets.contains(&bucket) {
+            true
+        } else {
+            buckets.insert(bucket.clone());
+            false
+        }
+    };
+
+    if already_exists {
         return (StatusCode::CONFLICT, "BucketAlreadyExists").into_response();
     }
-    buckets.insert(bucket.clone());
-    // Drop the lock before calling ensure_namespace to avoid holding it
-    // across a potentially expensive operation.
-    drop(buckets);
 
     // Register the namespace in the composition store so that subsequent
     // PUT object requests can find it (fixes "namespace not found" 500).
     let ns_id = namespace_from_bucket(&bucket);
-    if let Err(e) =
-        tokio::task::block_in_place(|| state.gateway.ensure_namespace(state.fallback_tenant, ns_id))
+    if let Err(e) = state
+        .gateway
+        .ensure_namespace(state.fallback_tenant, ns_id)
+        .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
@@ -457,7 +473,11 @@ async fn list_objects<G: GatewayOps + Send + Sync + 'static>(
     Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
-    match tokio::task::block_in_place(|| state.gateway.list_objects(state.fallback_tenant, ns_id)) {
+    match state
+        .gateway
+        .list_objects(state.fallback_tenant, ns_id)
+        .await
+    {
         Ok(objects) => {
             let max_keys = params.max_keys.unwrap_or(1000);
             let prefix = params.prefix.unwrap_or_default();

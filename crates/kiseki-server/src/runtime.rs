@@ -153,6 +153,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         let store = kiseki_log::persistent_store::PersistentShardStore::open(
             &dir.join("raft").join("log.redb"),
         )
+        .await
         .map_err(|e| format!("persistent store: {e}"))?;
         if cfg.bootstrap {
             store.create_shard(
@@ -358,12 +359,16 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     });
 
     // Stream processor: polls deltas from log → advances view watermarks.
+    // Uses block_in_place to hold the std::sync::MutexGuard (not Send)
+    // while awaiting the async poll(). This is safe because the spawned
+    // task runs on a multi-thread runtime with block_in_place support.
     let sp_log = Arc::clone(&log_store);
     let sp_views = Arc::clone(&view_store);
     let sp_view_id = kiseki_common::ids::ViewId(uuid::Uuid::from_u128(1));
+    let sp_rt = tokio::runtime::Handle::current();
     tokio::spawn(async move {
         loop {
-            {
+            tokio::task::block_in_place(|| {
                 let mut vs = sp_views
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -372,12 +377,14 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                     &mut *vs,
                 );
                 sp.track(sp_view_id);
-                sp.poll(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                sp_rt.block_on(
+                    sp.poll(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                    ),
                 );
-            }
+            });
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });

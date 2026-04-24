@@ -53,15 +53,16 @@ pub struct WriteResponse {
 /// All methods take `&self` (not `&mut self`) because implementations
 /// use interior mutability — matching the `LogOps` pattern. This allows
 /// concurrent readers and writers on a shared gateway instance.
-pub trait GatewayOps {
+#[async_trait::async_trait]
+pub trait GatewayOps: Send + Sync {
     /// Read data from a composition (decrypt + return plaintext to client).
-    fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError>;
+    async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError>;
 
     /// Write data to a composition (encrypt plaintext from client → store).
-    fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
+    async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
 
     /// List compositions in a namespace. Returns `(composition_id, size)` pairs.
-    fn list(
+    async fn list(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
@@ -72,7 +73,7 @@ pub trait GatewayOps {
     }
 
     /// Delete a composition by ID.
-    fn delete(
+    async fn delete(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
@@ -83,7 +84,7 @@ pub trait GatewayOps {
     }
 
     /// Start a multipart upload. Returns upload ID.
-    fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, GatewayError> {
+    async fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, GatewayError> {
         let _ = namespace_id;
         Err(GatewayError::OperationNotSupported(
             "multipart not supported".into(),
@@ -91,7 +92,7 @@ pub trait GatewayOps {
     }
 
     /// Upload a part of a multipart upload. Returns part `ETag`.
-    fn upload_part(
+    async fn upload_part(
         &self,
         upload_id: &str,
         part_number: u32,
@@ -104,7 +105,7 @@ pub trait GatewayOps {
     }
 
     /// Complete a multipart upload. Returns composition ID.
-    fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+    async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
         let _ = upload_id;
         Err(GatewayError::OperationNotSupported(
             "multipart not supported".into(),
@@ -112,7 +113,7 @@ pub trait GatewayOps {
     }
 
     /// Abort a multipart upload.
-    fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+    async fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
         let _ = upload_id;
         Err(GatewayError::OperationNotSupported(
             "multipart not supported".into(),
@@ -123,7 +124,7 @@ pub trait GatewayOps {
     ///
     /// Called by `create_bucket` to register the namespace before any
     /// object writes target it. Default is a no-op (namespace already exists).
-    fn ensure_namespace(
+    async fn ensure_namespace(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
@@ -134,50 +135,53 @@ pub trait GatewayOps {
 }
 
 /// Blanket impl: `Arc<G>` delegates to `G` via deref.
+#[async_trait::async_trait]
 impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
-    fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        (**self).read(req)
+    async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
+        (**self).read(req).await
     }
-    fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
-        (**self).write(req)
+    async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
+        (**self).write(req).await
     }
-    fn list(
+    async fn list(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
     ) -> Result<Vec<(CompositionId, u64)>, GatewayError> {
-        (**self).list(tenant_id, namespace_id)
+        (**self).list(tenant_id, namespace_id).await
     }
-    fn delete(
+    async fn delete(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
         composition_id: CompositionId,
     ) -> Result<(), GatewayError> {
-        (**self).delete(tenant_id, namespace_id, composition_id)
+        (**self)
+            .delete(tenant_id, namespace_id, composition_id)
+            .await
     }
-    fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, GatewayError> {
-        (**self).start_multipart(namespace_id)
+    async fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, GatewayError> {
+        (**self).start_multipart(namespace_id).await
     }
-    fn upload_part(
+    async fn upload_part(
         &self,
         upload_id: &str,
         part_number: u32,
         data: &[u8],
     ) -> Result<String, GatewayError> {
-        (**self).upload_part(upload_id, part_number, data)
+        (**self).upload_part(upload_id, part_number, data).await
     }
-    fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
-        (**self).complete_multipart(upload_id)
+    async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+        (**self).complete_multipart(upload_id).await
     }
-    fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
-        (**self).abort_multipart(upload_id)
+    async fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        (**self).abort_multipart(upload_id).await
     }
-    fn ensure_namespace(
+    async fn ensure_namespace(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
     ) -> Result<(), GatewayError> {
-        (**self).ensure_namespace(tenant_id, namespace_id)
+        (**self).ensure_namespace(tenant_id, namespace_id).await
     }
 }

@@ -60,14 +60,20 @@ impl<G: GatewayOps> S3Gateway<G> {
     }
 
     /// S3 `GetObject` — reads an object and returns the plaintext body.
-    pub fn get_object(&self, req: GetObjectRequest) -> Result<GetObjectResponse, GatewayError> {
-        let read_resp = self.inner.read(ReadRequest {
-            tenant_id: req.tenant_id,
-            namespace_id: req.namespace_id,
-            composition_id: req.composition_id,
-            offset: 0,
-            length: u64::MAX,
-        })?;
+    pub async fn get_object(
+        &self,
+        req: GetObjectRequest,
+    ) -> Result<GetObjectResponse, GatewayError> {
+        let read_resp = self
+            .inner
+            .read(ReadRequest {
+                tenant_id: req.tenant_id,
+                namespace_id: req.namespace_id,
+                composition_id: req.composition_id,
+                offset: 0,
+                length: u64::MAX,
+            })
+            .await?;
 
         Ok(GetObjectResponse {
             content_length: read_resp.data.len() as u64,
@@ -76,12 +82,18 @@ impl<G: GatewayOps> S3Gateway<G> {
     }
 
     /// S3 `PutObject` — writes an object, returns the `ETag`.
-    pub fn put_object(&self, req: PutObjectRequest) -> Result<PutObjectResponse, GatewayError> {
-        let write_resp = self.inner.write(WriteRequest {
-            tenant_id: req.tenant_id,
-            namespace_id: req.namespace_id,
-            data: req.body,
-        })?;
+    pub async fn put_object(
+        &self,
+        req: PutObjectRequest,
+    ) -> Result<PutObjectResponse, GatewayError> {
+        let write_resp = self
+            .inner
+            .write(WriteRequest {
+                tenant_id: req.tenant_id,
+                namespace_id: req.namespace_id,
+                data: req.body,
+            })
+            .await?;
 
         Ok(PutObjectResponse {
             etag: write_resp.composition_id.0.to_string(),
@@ -89,39 +101,46 @@ impl<G: GatewayOps> S3Gateway<G> {
     }
 
     /// S3 `ListObjectsV2` — lists objects in a bucket.
-    pub fn list_objects(
+    pub async fn list_objects(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
     ) -> Result<Vec<(CompositionId, u64)>, GatewayError> {
-        self.inner.list(tenant_id, namespace_id)
+        self.inner.list(tenant_id, namespace_id).await
     }
 
     /// Ensure a namespace exists for a bucket.
-    pub fn ensure_namespace(
+    pub async fn ensure_namespace(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
     ) -> Result<(), GatewayError> {
-        self.inner.ensure_namespace(tenant_id, namespace_id)
+        self.inner.ensure_namespace(tenant_id, namespace_id).await
     }
 
     /// S3 `DeleteObject` — deletes an object by composition ID.
-    pub fn delete_object(&self, req: DeleteObjectRequest) -> Result<(), GatewayError> {
+    pub async fn delete_object(&self, req: DeleteObjectRequest) -> Result<(), GatewayError> {
         self.inner
             .delete(req.tenant_id, req.namespace_id, req.composition_id)
+            .await
     }
 
     /// S3 `HeadObject` — gets object metadata without the body.
-    pub fn head_object(&self, req: GetObjectRequest) -> Result<HeadObjectResponse, GatewayError> {
+    pub async fn head_object(
+        &self,
+        req: GetObjectRequest,
+    ) -> Result<HeadObjectResponse, GatewayError> {
         // Full read to get size (in production, metadata-only path).
-        let resp = self.inner.read(ReadRequest {
-            tenant_id: req.tenant_id,
-            namespace_id: req.namespace_id,
-            composition_id: req.composition_id,
-            offset: 0,
-            length: u64::MAX,
-        })?;
+        let resp = self
+            .inner
+            .read(ReadRequest {
+                tenant_id: req.tenant_id,
+                namespace_id: req.namespace_id,
+                composition_id: req.composition_id,
+                offset: 0,
+                length: u64::MAX,
+            })
+            .await?;
         Ok(HeadObjectResponse {
             content_length: resp.data.len() as u64,
             etag: req.composition_id.0.to_string(),
@@ -204,38 +223,42 @@ pub struct AbortMultipartUploadRequest {
 
 impl<G: GatewayOps> S3Gateway<G> {
     /// S3 `CreateMultipartUpload`.
-    pub fn create_multipart_upload(
+    pub async fn create_multipart_upload(
         &self,
         req: &CreateMultipartUploadRequest,
     ) -> Result<CreateMultipartUploadResponse, GatewayError> {
-        let upload_id = self.inner.start_multipart(req.namespace_id)?;
+        let upload_id = self.inner.start_multipart(req.namespace_id).await?;
         Ok(CreateMultipartUploadResponse { upload_id })
     }
 
     /// S3 `UploadPart`.
-    pub fn upload_part(&self, req: &UploadPartRequest) -> Result<UploadPartResponse, GatewayError> {
+    pub async fn upload_part(
+        &self,
+        req: &UploadPartRequest,
+    ) -> Result<UploadPartResponse, GatewayError> {
         let etag = self
             .inner
-            .upload_part(&req.upload_id, req.part_number, &req.body)?;
+            .upload_part(&req.upload_id, req.part_number, &req.body)
+            .await?;
         Ok(UploadPartResponse { etag })
     }
 
     /// S3 `CompleteMultipartUpload`.
-    pub fn complete_multipart_upload(
+    pub async fn complete_multipart_upload(
         &self,
         req: &CompleteMultipartUploadRequest,
     ) -> Result<CompleteMultipartUploadResponse, GatewayError> {
-        let comp_id = self.inner.complete_multipart(&req.upload_id)?;
+        let comp_id = self.inner.complete_multipart(&req.upload_id).await?;
         Ok(CompleteMultipartUploadResponse {
             etag: comp_id.0.to_string(),
         })
     }
 
     /// S3 `AbortMultipartUpload`.
-    pub fn abort_multipart_upload(
+    pub async fn abort_multipart_upload(
         &self,
         req: &AbortMultipartUploadRequest,
     ) -> Result<(), GatewayError> {
-        self.inner.abort_multipart(&req.upload_id)
+        self.inner.abort_multipart(&req.upload_id).await
     }
 }

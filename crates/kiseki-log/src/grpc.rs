@@ -241,6 +241,7 @@ impl LogService for LogGrpc {
         let seq = self
             .ops
             .append_delta(domain_req)
+            .await
             .map_err(|e| to_status(&e))?;
         Ok(Response::new(AppendDeltaResponse { sequence: seq.0 }))
     }
@@ -261,6 +262,7 @@ impl LogService for LogGrpc {
         let deltas = self
             .ops
             .read_deltas(domain_req)
+            .await
             .map_err(|e| to_status(&e))?;
         // Server-side cap: max 1000 deltas per response to prevent OOM.
         let capped = if deltas.len() > 1000 {
@@ -282,7 +284,11 @@ impl LogService for LogGrpc {
         let req = request.into_inner();
         let shard_id = extract_shard_id(req.shard_id)?;
 
-        let info = self.ops.shard_health(shard_id).map_err(|e| to_status(&e))?;
+        let info = self
+            .ops
+            .shard_health(shard_id)
+            .await
+            .map_err(|e| to_status(&e))?;
 
         let proto_info = kiseki_proto::v1::ShardInfo {
             shard_id: Some(kiseki_proto::v1::ShardId {
@@ -319,6 +325,7 @@ impl LogService for LogGrpc {
 
         self.ops
             .set_maintenance(shard_id, req.enabled)
+            .await
             .map_err(|e| to_status(&e))?;
 
         Ok(Response::new(SetMaintenanceResponse {}))

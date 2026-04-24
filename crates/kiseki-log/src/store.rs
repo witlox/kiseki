@@ -225,8 +225,9 @@ impl Default for MemShardStore {
     }
 }
 
+#[async_trait::async_trait]
 impl LogOps for MemShardStore {
-    fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
+    async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         let mut shards = self
             .shards
             .lock()
@@ -281,7 +282,7 @@ impl LogOps for MemShardStore {
         Ok(next_seq)
     }
 
-    fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
+    async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
         let shards = self
             .shards
             .lock()
@@ -302,7 +303,7 @@ impl LogOps for MemShardStore {
             .collect())
     }
 
-    fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
+    async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
         let shards = self
             .shards
             .lock()
@@ -313,7 +314,7 @@ impl LogOps for MemShardStore {
             .ok_or(LogError::ShardNotFound(shard_id))
     }
 
-    fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
+    async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
         let mut shards = self
             .shards
             .lock()
@@ -329,7 +330,7 @@ impl LogOps for MemShardStore {
         Ok(())
     }
 
-    fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+    async fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
         let mut shards = self
             .shards
             .lock()
@@ -345,7 +346,7 @@ impl LogOps for MemShardStore {
         Ok(gc_boundary)
     }
 
-    fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
+    async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         let mut shards = self
             .shards
             .lock()
