@@ -60,7 +60,9 @@ fn fuse_mkdir_create_readdir() {
     let mut fs = setup_fuse();
 
     let dir_ino = fs.mkdir("subdir").unwrap();
-    let _file_ino = fs.create_in(dir_ino, "file.txt", b"content".to_vec()).unwrap();
+    let _file_ino = fs
+        .create_in(dir_ino, "file.txt", b"content".to_vec())
+        .unwrap();
 
     let entries = fs.readdir();
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -90,13 +92,18 @@ fn concurrent_fuse_creates() {
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
-        handle.join().unwrap_or_else(|_| panic!("FUSE create thread {i} panicked"));
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("FUSE create thread {i} panicked"));
     }
 
     // Verify total file count.
     let entries = fs.lock().unwrap().readdir();
     // 80 files + . + ..
-    let file_count = entries.iter().filter(|e| e.name != "." && e.name != "..").count();
+    let file_count = entries
+        .iter()
+        .filter(|e| e.name != "." && e.name != "..")
+        .count();
     assert_eq!(file_count, 80, "expected 80 files, got {file_count}");
 }
 
@@ -147,7 +154,9 @@ fn concurrent_fuse_mixed_read_write() {
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
-        handle.join().unwrap_or_else(|_| panic!("FUSE mixed thread {i} panicked"));
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("FUSE mixed thread {i} panicked"));
     }
 }
 
@@ -167,17 +176,16 @@ fn concurrent_fuse_metadata_ops() {
                 let renamed = format!("renamed-{t}-{i}.dat");
 
                 fs.lock().unwrap().mkdir(&dir_name).unwrap();
-                fs.lock()
-                    .unwrap()
-                    .create(&file_name, vec![t; 256])
-                    .unwrap();
+                fs.lock().unwrap().create(&file_name, vec![t; 256]).unwrap();
                 fs.lock().unwrap().rename(&file_name, &renamed).unwrap();
             }
         }));
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
-        handle.join().unwrap_or_else(|_| panic!("FUSE metadata thread {i} panicked"));
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("FUSE metadata thread {i} panicked"));
     }
 
     // Verify: 20 dirs + 20 renamed files + . + ..
@@ -187,7 +195,12 @@ fn concurrent_fuse_metadata_ops() {
         .filter(|e| e.name != "." && e.name != "..")
         .map(|e| e.name.as_str())
         .collect();
-    assert_eq!(non_dot.len(), 40, "expected 40 entries, got {}", non_dot.len());
+    assert_eq!(
+        non_dot.len(),
+        40,
+        "expected 40 entries, got {}",
+        non_dot.len()
+    );
 
     // All renamed files should exist, original names should not.
     for t in 0u8..4 {

@@ -52,11 +52,7 @@ impl RaftShardStore {
     /// When `data_dir` is `Some`, Raft log state is persisted to redb
     /// and survives restart. When `None`, uses in-memory log (volatile).
     #[must_use]
-    pub fn new(
-        node_id: u64,
-        peers: BTreeMap<u64, String>,
-        data_dir: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(node_id: u64, peers: BTreeMap<u64, String>, data_dir: Option<PathBuf>) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .thread_name("kiseki-raft")

@@ -96,7 +96,9 @@ fn concurrent_nfs_writes_no_deadlock() {
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
-        handle.join().unwrap_or_else(|_| panic!("NFS writer thread {i} panicked"));
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("NFS writer thread {i} panicked"));
     }
 }
 
@@ -159,7 +161,9 @@ fn concurrent_nfs_mixed_read_write() {
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
-        handle.join().unwrap_or_else(|_| panic!("NFS mixed thread {i} panicked"));
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("NFS mixed thread {i} panicked"));
     }
 }
 
@@ -181,7 +185,11 @@ fn pnfs_layout_delegation() {
     assert_eq!(layout.file_id, 42);
 
     // Verify round-robin striping across nodes.
-    let addrs: Vec<&str> = layout.segments.iter().map(|s| s.device_addr.as_str()).collect();
+    let addrs: Vec<&str> = layout
+        .segments
+        .iter()
+        .map(|s| s.device_addr.as_str())
+        .collect();
     // With 3 nodes and 4MB, we should see striping.
     assert!(
         addrs.len() >= 2,
@@ -212,9 +220,9 @@ fn pnfs_concurrent_layout_requests() {
         "10.0.0.20:9100".to_owned(),
         "10.0.0.21:9100".to_owned(),
     ];
-    let mgr = Arc::new(Mutex::new(
-        kiseki_gateway::pnfs::LayoutManager::new(storage_nodes),
-    ));
+    let mgr = Arc::new(Mutex::new(kiseki_gateway::pnfs::LayoutManager::new(
+        storage_nodes,
+    )));
 
     let mut handles = Vec::new();
 
@@ -223,12 +231,10 @@ fn pnfs_concurrent_layout_requests() {
         handles.push(thread::spawn(move || {
             for i in 0u64..10 {
                 let file_id = t * 100 + i;
-                let layout = mgr.lock().unwrap().layout_get(
-                    file_id,
-                    0,
-                    1024 * 1024,
-                    IoMode::Read,
-                );
+                let layout = mgr
+                    .lock()
+                    .unwrap()
+                    .layout_get(file_id, 0, 1024 * 1024, IoMode::Read);
                 assert!(!layout.segments.is_empty());
                 assert_eq!(layout.file_id, file_id);
 
