@@ -298,6 +298,18 @@ resource "google_service_account" "ctrl" {
   display_name = "Kiseki benchmark controller"
 }
 
+resource "google_project_iam_member" "ctrl_os_login" {
+  project = var.project_id
+  role    = "roles/compute.osAdminLogin"
+  member  = "serviceAccount:${google_service_account.ctrl.email}"
+}
+
+resource "google_project_iam_member" "ctrl_sa_user" {
+  project = var.project_id
+  role    = "roles/iam.serviceAccountUser"
+  member  = "serviceAccount:${google_service_account.ctrl.email}"
+}
+
 resource "google_storage_bucket_iam_member" "ctrl_write" {
   bucket = google_storage_bucket.perf_results.name
   role   = "roles/storage.objectCreator"
