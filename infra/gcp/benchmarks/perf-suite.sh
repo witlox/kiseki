@@ -5,6 +5,8 @@
 # Uses /cluster/info to discover the Raft leader for write routing.
 # Scrapes Prometheus metrics continuously during the test.
 #
+# Test order: lightweight first, S3 concurrent writes last.
+#
 # Run from the benchmark controller node.
 set -eo pipefail
 
@@ -16,6 +18,9 @@ RESULTS="/tmp/kiseki-perf-$(date +%Y%m%d-%H%M%S)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$RESULTS"
 
+# Concurrency level — tune down for small ctrl nodes (e.g., 4 vCPU).
+PAR=${KISEKI_BENCH_PAR:-8}
+
 # GCS bucket for result upload (set by Terraform)
 GCS_BUCKET="${KISEKI_PERF_BUCKET:-gs://kiseki-perf-results}"
 
@@ -25,9 +30,8 @@ echo "╔═══════════════════════�
 echo "║       Kiseki Cluster Performance Benchmark                   ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║ Cluster: 5 nodes (3 HDD + 2 Fast), single Raft group        ║"
-echo "║ HDD:     3 × n2-standard-16, 3 × PD-Standard 200GB each     ║"
-echo "║ Fast:    2 × n2-standard-16, local NVMe + 2 × PD-SSD 375GB  ║"
 echo "║ Clients: 3 × n2-standard-8 with 100GB SSD cache             ║"
+echo "║ Parallelism: $PAR (set KISEKI_BENCH_PAR to override)"
 echo "║ Results: $RESULTS"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
@@ -41,7 +45,6 @@ COLLECTOR_PID=$!
 cleanup() {
   log "Stopping metrics collector (pid=$COLLECTOR_PID)"
   kill "$COLLECTOR_PID" 2>/dev/null; wait "$COLLECTOR_PID" 2>/dev/null || true
-  # Generate metrics summary
   bash "$SCRIPT_DIR/metrics-collector.sh" --summarize "$RESULTS" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -79,7 +82,6 @@ if [ -z "$LEADER_S3" ]; then
 fi
 LEADER_HOST=$(echo "$LEADER_S3" | sed 's|http://||; s|:.*||')
 [ -z "$LEADER_NFS" ] && LEADER_NFS="$LEADER_HOST"
-# Strip port from NFS address if present
 LEADER_NFS_HOST=$(echo "$LEADER_NFS" | sed 's|:.*||')
 
 log ""
@@ -93,124 +95,59 @@ log "  All writes routed to leader; reads distributed"
   echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$RESULTS/cluster-info.txt"
 
+EP="$LEADER_S3"
 CLIENT_ARRAY=($CLIENTS)
 
 # ---------------------------------------------------------------------------
-# 1. S3 sequential write throughput (single-client baseline)
+# 1. Cluster state snapshot
 # ---------------------------------------------------------------------------
 log ""
-log "=== 1. S3 Sequential Write (single client → leader) ==="
-
-EP="$LEADER_S3"
-curl -sf -X PUT "$EP/perf-seq" >/dev/null 2>&1 || true
-
-for SIZE in 1 4 16; do
-  TOTAL=$((200 / SIZE > 0 ? 200 / SIZE : 50))
-  [ "$SIZE" -ge 16 ] && TOTAL=25
-  PAR=32
-  [ "$SIZE" -ge 16 ] && PAR=8
-
-  START=$(date +%s%N)
-  for i in $(seq 1 $TOTAL); do
-    dd if=/dev/urandom bs=${SIZE}M count=1 2>/dev/null | \
-      curl -sf -X PUT "$EP/perf-seq/w${SIZE}m-$i" --data-binary @- >/dev/null &
-    [ $((i % PAR)) -eq 0 ] && wait
-  done
-  wait
-  END=$(date +%s%N)
-  MS=$(( (END - START) / 1000000 ))
-  TOTAL_MB=$((TOTAL * SIZE))
-  MBPS=$(python3 -c "print(f'{$TOTAL_MB * 1000 / $MS:.1f}')" 2>/dev/null || echo "N/A")
-  log "  ${SIZE}MB × ${TOTAL} (${PAR}∥): ${MS}ms — ${MBPS} MB/s — total ${TOTAL_MB} MB" | tee -a "$RESULTS/s3-write.txt"
+log "=== 1. Cluster State ==="
+for ip in $ALL_STORAGE; do
+  INFO=$(curl -sf "http://$ip:9090/cluster/info" 2>/dev/null || echo "{}")
+  log "  $ip: $INFO" | tee -a "$RESULTS/cluster-state.txt"
 done
 
 # ---------------------------------------------------------------------------
-# 2. S3 parallel write throughput (multi-client → leader)
+# 2. Transport detection
 # ---------------------------------------------------------------------------
 log ""
-log "=== 2. S3 Parallel Write (3 clients → leader, aggregate throughput) ==="
-
-log "  3 clients × 100 objects × 1MB = 300 MB total, 32 concurrent per client"
-AGG_START=$(date +%s%N)
-for idx in 0 1 2; do
-  CIP="${CLIENT_ARRAY[$idx]}"
-  ssh -o StrictHostKeyChecking=no "$CIP" "
-    EP='$LEADER_S3'
-    for i in \$(seq 1 100); do
-      dd if=/dev/urandom bs=1M count=1 2>/dev/null | \
-        curl -sf -X PUT \"\$EP/perf-agg/c${idx}-\$i\" --data-binary @- >/dev/null &
-      [ \$((i % 32)) -eq 0 ] && wait
-    done
-    wait
-  " 2>/dev/null &
+log "=== 2. Transport Selection ==="
+log "  GCP: no RDMA/RoCEv2 → TCP+TLS fallback" | tee -a "$RESULTS/transport.txt"
+for ip in $ALL_STORAGE; do
+  RDMA=$(ssh -o StrictHostKeyChecking=no "$ip" "ls /sys/class/infiniband/ 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+  log "  $ip: IB=$RDMA → TCP" | tee -a "$RESULTS/transport.txt"
 done
-wait
-AGG_END=$(date +%s%N)
-AGG_MS=$(( (AGG_END - AGG_START) / 1000000 ))
-AGG_MBPS=$(python3 -c "print(f'{300 * 1000 / $AGG_MS:.1f}')" 2>/dev/null || echo "N/A")
-log "  Aggregate: 300 MB in ${AGG_MS}ms — ${AGG_MBPS} MB/s" | tee -a "$RESULTS/s3-parallel-write.txt"
-
-log "  3 clients × 50 objects × 4MB = 600 MB total, 16 concurrent per client"
-AGG_START=$(date +%s%N)
-for idx in 0 1 2; do
-  CIP="${CLIENT_ARRAY[$idx]}"
-  ssh -o StrictHostKeyChecking=no "$CIP" "
-    EP='$LEADER_S3'
-    for i in \$(seq 1 50); do
-      dd if=/dev/urandom bs=4M count=1 2>/dev/null | \
-        curl -sf -X PUT \"\$EP/perf-agg4/c${idx}-\$i\" --data-binary @- >/dev/null &
-      [ \$((i % 16)) -eq 0 ] && wait
-    done
-    wait
-  " 2>/dev/null &
-done
-wait
-AGG_END=$(date +%s%N)
-AGG_MS=$(( (AGG_END - AGG_START) / 1000000 ))
-AGG_MBPS=$(python3 -c "print(f'{600 * 1000 / $AGG_MS:.1f}')" 2>/dev/null || echo "N/A")
-log "  Aggregate: 600 MB in ${AGG_MS}ms — ${AGG_MBPS} MB/s" | tee -a "$RESULTS/s3-parallel-write.txt"
 
 # ---------------------------------------------------------------------------
-# 3. S3 PUT latency
+# 3. TCP bandwidth between nodes
 # ---------------------------------------------------------------------------
 log ""
-log "=== 3. S3 PUT Latency (1KB × 100 → leader) ==="
+log "=== 3. Inter-Node TCP Bandwidth ==="
 
-LATS=""
-for i in $(seq 1 100); do
-  S=$(date +%s%N)
-  echo "x" | curl -sf -X PUT "$EP/perf-seq/lat-$i" --data-binary @- >/dev/null
-  E=$(date +%s%N)
-  LATS="$LATS $(( (E - S) / 1000 ))"
+ssh -o StrictHostKeyChecking=no "$LEADER_HOST" "pkill iperf3 2>/dev/null; iperf3 -s -D 2>/dev/null" 2>/dev/null
+sleep 1
+
+for ip in $CLIENTS; do
+  BW=$(ssh -o StrictHostKeyChecking=no "$ip" "iperf3 -c $LEADER_HOST -t 5 -J 2>/dev/null" 2>/dev/null | \
+    python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"end\"][\"sum_received\"][\"bits_per_second\"]/1e9:.1f}')" 2>/dev/null || echo "N/A")
+  log "  $ip (client) → $LEADER_HOST (leader): ${BW} Gbps" | tee -a "$RESULTS/bandwidth.txt"
 done
 
-echo "$LATS" | tr ' ' '\n' | sort -n | awk '
-  { a[NR]=$1; sum+=$1 }
-  END { n=NR; printf "  p50: %d µs, p99: %d µs, avg: %d µs, min: %d µs, max: %d µs\n", a[int(n*.5)], a[int(n*.99)], sum/n, a[1], a[n] }
-' | tee -a "$RESULTS/s3-latency.txt"
-
-# ---------------------------------------------------------------------------
-# 4. S3 read throughput
-# ---------------------------------------------------------------------------
-log ""
-log "=== 4. S3 Read Throughput (objects written in test 1) ==="
-
-START=$(date +%s%N)
-for i in $(seq 1 200); do
-  curl -sf "$EP/perf-seq/w1m-$i" -o /dev/null &
-  [ $((i % 32)) -eq 0 ] && wait
+FAST1="10.0.0.20"
+ssh -o StrictHostKeyChecking=no "$FAST1" "pkill iperf3 2>/dev/null; iperf3 -s -D 2>/dev/null" 2>/dev/null
+sleep 1
+for ip in $STORAGE_HDD; do
+  BW=$(ssh -o StrictHostKeyChecking=no "$ip" "iperf3 -c $FAST1 -t 5 -J 2>/dev/null" 2>/dev/null | \
+    python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"end\"][\"sum_received\"][\"bits_per_second\"]/1e9:.1f}')" 2>/dev/null || echo "N/A")
+  log "  $ip (HDD) → $FAST1 (Fast): ${BW} Gbps" | tee -a "$RESULTS/bandwidth.txt"
 done
-wait
-END=$(date +%s%N)
-MS=$(( (END - START) / 1000000 ))
-MBPS=$(python3 -c "print(f'{200 * 1000 / $MS:.1f}')" 2>/dev/null || echo "N/A")
-log "  Read 200 × 1MB (32∥): ${MS}ms — ${MBPS} MB/s" | tee -a "$RESULTS/s3-read.txt"
 
 # ---------------------------------------------------------------------------
-# 5. NFS single-server write (from clients)
+# 4. NFS single-server write (from clients)
 # ---------------------------------------------------------------------------
 log ""
-log "=== 5. NFS Write (3 clients → leader, NFSv4) ==="
+log "=== 4. NFS Write (3 clients → leader, NFSv4) ==="
 
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
@@ -232,36 +169,27 @@ done
 wait
 
 # ---------------------------------------------------------------------------
-# 5b. pNFS parallel write (layout delegation)
+# 4b. pNFS parallel write (layout delegation)
 # ---------------------------------------------------------------------------
 log ""
-log "=== 5b. pNFS Write (3 clients → cluster, layout delegation) ==="
+log "=== 4b. pNFS Write (3 clients → cluster, layout delegation) ==="
 log "  Note: pNFS layout wire-up pending — expects NFSv4.2 fallback"
 
-PNFS_OK=0
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
   ssh -o StrictHostKeyChecking=no "$CIP" "
     mkdir -p /mnt/kiseki-pnfs
     umount /mnt/kiseki-pnfs 2>/dev/null || true
-
-    # Mount with pNFS enabled — falls back to regular NFS if server doesn't support layouts
     mount -t nfs4 -o vers=4.2,pnfs,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/ /mnt/kiseki-pnfs 2>/dev/null
     if mountpoint -q /mnt/kiseki-pnfs 2>/dev/null; then
-      # Write test
       fio --name=pnfs-write --directory=/mnt/kiseki-pnfs --rw=write --bs=1m \
         --size=128m --numjobs=4 --group_reporting --output-format=json 2>/dev/null | \
         python3 -c 'import sys,json; d=json.load(sys.stdin); bw=d[\"jobs\"][0][\"write\"][\"bw\"]/1024; print(f\"  client-$((idx+1)) write: {bw:.1f} MB/s\")' 2>/dev/null || echo '  client-$((idx+1)) write: fio parse error'
-
-      # Read test
       fio --name=pnfs-read --directory=/mnt/kiseki-pnfs --rw=read --bs=1m \
         --size=128m --numjobs=4 --group_reporting --output-format=json 2>/dev/null | \
         python3 -c 'import sys,json; d=json.load(sys.stdin); bw=d[\"jobs\"][0][\"read\"][\"bw\"]/1024; print(f\"  client-$((idx+1)) read:  {bw:.1f} MB/s\")' 2>/dev/null || echo '  client-$((idx+1)) read: fio parse error'
-
-      # Check for pNFS layout activity
       echo '--- mountstats ---'
       cat /proc/self/mountstats 2>/dev/null | grep -A5 'kiseki-pnfs' | grep -i layout || echo '  No LAYOUTGET observed (fallback to regular NFS)'
-
       rm -f /mnt/kiseki-pnfs/pnfs-* 2>/dev/null
       umount /mnt/kiseki-pnfs 2>/dev/null || true
     else
@@ -271,7 +199,6 @@ for idx in 0 1 2; do
 done
 wait
 
-# Report pNFS status
 if grep -q "LAYOUTGET" "$RESULTS/pnfs.txt" 2>/dev/null; then
   log "  pNFS: layout delegation ACTIVE" | tee -a "$RESULTS/pnfs.txt"
 else
@@ -279,10 +206,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. FUSE native client benchmark
+# 5. FUSE native client benchmark
 # ---------------------------------------------------------------------------
 log ""
-log "=== 6. FUSE Native Client (client-1 → leader) ==="
+log "=== 5. FUSE Native Client (client-1 → leader) ==="
 
 FIRST_CLIENT="${CLIENT_ARRAY[0]}"
 ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
@@ -333,48 +260,111 @@ ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
 " 2>/dev/null | tee -a "$RESULTS/fuse.txt"
 
 # ---------------------------------------------------------------------------
-# 7. TCP bandwidth between nodes
+# 6. S3 PUT latency (from client-1, single-threaded)
 # ---------------------------------------------------------------------------
 log ""
-log "=== 7. Inter-Node TCP Bandwidth ==="
+log "=== 6. S3 PUT Latency (1KB × 100 → leader, from client-1) ==="
 
-ssh -o StrictHostKeyChecking=no "$LEADER_HOST" "pkill iperf3 2>/dev/null; iperf3 -s -D 2>/dev/null" 2>/dev/null
-sleep 1
-
-for ip in $CLIENTS; do
-  BW=$(ssh -o StrictHostKeyChecking=no "$ip" "iperf3 -c $LEADER_HOST -t 5 -J 2>/dev/null" 2>/dev/null | \
-    python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"end\"][\"sum_received\"][\"bits_per_second\"]/1e9:.1f}')" 2>/dev/null || echo "N/A")
-  log "  $ip (client) → $LEADER_HOST (leader): ${BW} Gbps" | tee -a "$RESULTS/bandwidth.txt"
-done
-
-FAST1="10.0.0.20"
-ssh -o StrictHostKeyChecking=no "$FAST1" "pkill iperf3 2>/dev/null; iperf3 -s -D 2>/dev/null" 2>/dev/null
-sleep 1
-for ip in $STORAGE_HDD; do
-  BW=$(ssh -o StrictHostKeyChecking=no "$ip" "iperf3 -c $FAST1 -t 5 -J 2>/dev/null" 2>/dev/null | \
-    python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"end\"][\"sum_received\"][\"bits_per_second\"]/1e9:.1f}')" 2>/dev/null || echo "N/A")
-  log "  $ip (HDD) → $FAST1 (Fast): ${BW} Gbps" | tee -a "$RESULTS/bandwidth.txt"
-done
+FIRST_CLIENT="${CLIENT_ARRAY[0]}"
+ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
+  EP='$LEADER_S3'
+  curl -sf -X PUT \"\$EP/perf-seq\" >/dev/null 2>&1 || true
+  LATS=''
+  for i in \$(seq 1 100); do
+    S=\$(date +%s%N)
+    echo 'x' | curl -sf -X PUT \"\$EP/perf-seq/lat-\$i\" --data-binary @- >/dev/null
+    E=\$(date +%s%N)
+    LATS=\"\$LATS \$(( (E - S) / 1000 ))\"
+  done
+  echo \"\$LATS\" | tr ' ' '\n' | sort -n | awk '
+    { a[NR]=\$1; sum+=\$1 }
+    END { n=NR; printf \"  p50: %d µs, p99: %d µs, avg: %d µs, min: %d µs, max: %d µs\n\", a[int(n*.5)], a[int(n*.99)], sum/n, a[1], a[n] }
+  '
+" 2>/dev/null | tee -a "$RESULTS/s3-latency.txt"
 
 # ---------------------------------------------------------------------------
-# 8. Transport detection
+# 7. S3 sequential write throughput (from client-1)
 # ---------------------------------------------------------------------------
 log ""
-log "=== 8. Transport Selection ==="
-log "  GCP: no RDMA/RoCEv2 → TCP+TLS fallback" | tee -a "$RESULTS/transport.txt"
+log "=== 7. S3 Sequential Write (client-1 → leader, ${PAR}∥) ==="
+
+ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
+  EP='$LEADER_S3'
+  PAR=$PAR
+  for SIZE in 1 4 16; do
+    TOTAL=\$((200 / SIZE > 0 ? 200 / SIZE : 50))
+    [ \"\$SIZE\" -ge 16 ] && TOTAL=25
+    START=\$(date +%s%N)
+    for i in \$(seq 1 \$TOTAL); do
+      dd if=/dev/urandom bs=\${SIZE}M count=1 2>/dev/null | \
+        curl -sf -X PUT \"\$EP/perf-seq/w\${SIZE}m-\$i\" --data-binary @- >/dev/null &
+      [ \$((i % PAR)) -eq 0 ] && wait
+    done
+    wait
+    END=\$(date +%s%N)
+    MS=\$(( (END - START) / 1000000 ))
+    TOTAL_MB=\$((TOTAL * SIZE))
+    MBPS=\$(python3 -c \"print(f'{\$TOTAL_MB * 1000 / \$MS:.1f}')\" 2>/dev/null || echo 'N/A')
+    echo \"  \${SIZE}MB × \${TOTAL} (\${PAR}∥): \${MS}ms — \${MBPS} MB/s — total \${TOTAL_MB} MB\"
+  done
+" 2>/dev/null | tee -a "$RESULTS/s3-write.txt"
+
+# ---------------------------------------------------------------------------
+# 8. S3 read throughput (from client-1)
+# ---------------------------------------------------------------------------
+log ""
+log "=== 8. S3 Read Throughput (from client-1, objects from test 7) ==="
+
+ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
+  EP='$LEADER_S3'
+  PAR=$PAR
+  START=\$(date +%s%N)
+  for i in \$(seq 1 200); do
+    curl -sf \"\$EP/perf-seq/w1m-\$i\" -o /dev/null &
+    [ \$((i % PAR)) -eq 0 ] && wait
+  done
+  wait
+  END=\$(date +%s%N)
+  MS=\$(( (END - START) / 1000000 ))
+  MBPS=\$(python3 -c \"print(f'{200 * 1000 / \$MS:.1f}')\" 2>/dev/null || echo 'N/A')
+  echo \"  Read 200 × 1MB (\${PAR}∥): \${MS}ms — \${MBPS} MB/s\"
+" 2>/dev/null | tee -a "$RESULTS/s3-read.txt"
+
+# ---------------------------------------------------------------------------
+# 9. S3 parallel write throughput (3 clients → leader)
+# ---------------------------------------------------------------------------
+log ""
+log "=== 9. S3 Parallel Write (3 clients → leader, aggregate throughput) ==="
+
+log "  3 clients × 100 objects × 1MB = 300 MB total, ${PAR} concurrent per client"
+AGG_START=$(date +%s%N)
+for idx in 0 1 2; do
+  CIP="${CLIENT_ARRAY[$idx]}"
+  ssh -o StrictHostKeyChecking=no "$CIP" "
+    EP='$LEADER_S3'
+    curl -sf -X PUT \"\$EP/perf-agg\" >/dev/null 2>&1 || true
+    for i in \$(seq 1 100); do
+      dd if=/dev/urandom bs=1M count=1 2>/dev/null | \
+        curl -sf -X PUT \"\$EP/perf-agg/c${idx}-\$i\" --data-binary @- >/dev/null &
+      [ \$((i % $PAR)) -eq 0 ] && wait
+    done
+    wait
+  " 2>/dev/null &
+done
+wait
+AGG_END=$(date +%s%N)
+AGG_MS=$(( (AGG_END - AGG_START) / 1000000 ))
+AGG_MBPS=$(python3 -c "print(f'{300 * 1000 / $AGG_MS:.1f}')" 2>/dev/null || echo "N/A")
+log "  Aggregate: 300 MB in ${AGG_MS}ms — ${AGG_MBPS} MB/s" | tee -a "$RESULTS/s3-parallel-write.txt"
+
+# ---------------------------------------------------------------------------
+# 10. Prometheus metrics snapshot
+# ---------------------------------------------------------------------------
+log ""
+log "=== 10. Prometheus Metrics ==="
 for ip in $ALL_STORAGE; do
-  RDMA=$(ssh -o StrictHostKeyChecking=no "$ip" "ls /sys/class/infiniband/ 2>/dev/null | wc -l" 2>/dev/null || echo "0")
-  log "  $ip: IB=$RDMA → TCP" | tee -a "$RESULTS/transport.txt"
-done
-
-# ---------------------------------------------------------------------------
-# 9. Cluster metrics snapshot (final state)
-# ---------------------------------------------------------------------------
-log ""
-log "=== 9. Cluster State ==="
-for ip in $ALL_STORAGE; do
-  INFO=$(curl -sf "http://$ip:9090/cluster/info" 2>/dev/null || echo "{}")
-  log "  $ip: $INFO" | tee -a "$RESULTS/cluster-state.txt"
+  REQS=$(curl -sf "http://$ip:9090/metrics" 2>/dev/null | grep "kiseki_gateway_requests_total" | awk '{sum+=$2} END{print sum+0}')
+  log "  $ip: gateway_requests=$REQS" | tee -a "$RESULTS/metrics-snapshot.txt"
 done
 
 # ---------------------------------------------------------------------------
@@ -387,21 +377,17 @@ log "╠════════════════════════
 log "║ Results: $RESULTS"
 log "╠═══════════════════════════════════════════════════════════════╣"
 log "║ Tests run:                                                    ║"
-log "║  1. S3 sequential write (1/4/16 MB, single client)            ║"
-log "║  2. S3 parallel write (3 clients, aggregate throughput)       ║"
-log "║  3. S3 PUT latency (1KB, p50/p99)                             ║"
-log "║  4. S3 read throughput (32∥)                                  ║"
-log "║  5. NFS write (3 clients, NFSv4.2)                            ║"
-log "║  5b. pNFS write+read (3 clients, layout delegation)           ║"
-log "║  6. FUSE native client (write/read/rand/metadata)             ║"
-log "║  7. TCP bandwidth (client→leader, HDD→fast)                   ║"
-log "║  8. Transport detection                                       ║"
-log "║  9. Cluster state                                             ║"
-log "╠═══════════════════════════════════════════════════════════════╣"
-log "║ Comparison Context (vs Ceph/Lustre):                          ║"
-log "║  Single Raft group → single leader for all writes.            ║"
-log "║  Multi-shard: linear write scaling with shard count.          ║"
-log "║  pNFS: parallel data path when layout delegation is wired.    ║"
+log "║  1. Cluster state                                             ║"
+log "║  2. Transport detection                                       ║"
+log "║  3. TCP bandwidth (client→leader, HDD→fast)                   ║"
+log "║  4. NFS write (3 clients, NFSv4.2)                            ║"
+log "║  4b. pNFS write+read (3 clients, layout delegation)           ║"
+log "║  5. FUSE native client (write/read/rand/metadata)             ║"
+log "║  6. S3 PUT latency (1KB, p50/p99)                             ║"
+log "║  7. S3 sequential write (1/4/16 MB, single client)            ║"
+log "║  8. S3 read throughput                                        ║"
+log "║  9. S3 parallel write (3 clients, aggregate throughput)       ║"
+log "║  10. Prometheus metrics                                       ║"
 log "╚═══════════════════════════════════════════════════════════════╝"
 
 # Concatenate all result files into SUMMARY.txt
@@ -409,8 +395,9 @@ log "╚════════════════════════
   echo "=== KISEKI PERFORMANCE RESULTS ==="
   echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "Results dir: $RESULTS"
+  echo "Parallelism: $PAR"
   echo ""
-  for f in cluster-info s3-write s3-parallel-write s3-latency s3-read nfs-write pnfs fuse bandwidth transport cluster-state; do
+  for f in cluster-info cluster-state transport bandwidth nfs-write pnfs fuse s3-latency s3-write s3-read s3-parallel-write metrics-snapshot; do
     if [ -f "$RESULTS/$f.txt" ]; then
       echo "--- $f ---"
       cat "$RESULTS/$f.txt"
@@ -438,5 +425,4 @@ else
   log "gsutil not found — results only at $RESULTS"
 fi
 
-# Write results dir path for wrapper script
 echo "$RESULTS" > /tmp/kiseki-perf-latest
