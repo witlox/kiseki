@@ -161,22 +161,23 @@ impl<G: GatewayOps> NfsContext<G> {
         // Register root handle.
         handles.root_handle(namespace_id, tenant_id);
 
-        // Try to get the current tokio handle; if not in a tokio context,
-        // create a dedicated runtime for NFS.
-        let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            // Create a dedicated multi-thread runtime for NFS gateway ops.
+        // Always create a dedicated runtime for NFS — never reuse the
+        // caller's runtime. NFS methods use block_on() which panics if
+        // called from within the same runtime (e.g., in tests running
+        // under cucumber's async runtime).
+        let rt = std::thread::spawn(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
                 .thread_name("nfs-rt")
                 .build()
                 .expect("failed to create NFS tokio runtime");
-            // Leak the runtime so the handle remains valid for the process lifetime.
-            // NFS server runs for the entire process anyway.
             let handle = runtime.handle().clone();
             std::mem::forget(runtime);
             handle
-        });
+        })
+        .join()
+        .expect("NFS runtime thread panicked");
 
         Self {
             gateway,
@@ -187,6 +188,19 @@ impl<G: GatewayOps> NfsContext<G> {
             tenant_id,
             namespace_id,
             rt,
+        }
+    }
+
+    /// Block on an async gateway call. Uses `block_in_place` when on a
+    /// tokio worker thread (tests), or direct `block_on` on OS threads.
+    fn block_gateway<F, T>(&self, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.rt.block_on(f))
+        } else {
+            self.rt.block_on(f)
         }
     }
 
@@ -242,7 +256,7 @@ impl<G: GatewayOps> NfsContext<G> {
             ));
         };
 
-        self.rt.block_on(self.gateway.read(NfsReadRequest {
+        self.block_gateway(self.gateway.read(NfsReadRequest {
             tenant_id,
             namespace_id: ns_id,
             composition_id: comp_id,
@@ -270,7 +284,7 @@ impl<G: GatewayOps> NfsContext<G> {
 
     /// Write to create a new file (NFS CREATE + WRITE).
     pub fn write(&self, data: Vec<u8>) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
-        let resp = self.rt.block_on(self.gateway.write(NfsWriteRequest {
+        let resp = self.block_gateway(self.gateway.write(NfsWriteRequest {
             tenant_id: self.tenant_id,
             namespace_id: self.namespace_id,
             data,

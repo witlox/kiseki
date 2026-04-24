@@ -80,7 +80,11 @@ impl InodeEntry {
 /// Thread-safe via interior mutability in the gateway.
 ///
 /// Holds a `tokio::runtime::Handle` to bridge sync FUSE callbacks
-/// to async `GatewayOps` methods via `block_on`.
+/// to async `GatewayOps` methods via `block_on` on a dedicated runtime.
+///
+/// The `run_sync` helper ensures `block_on` is never called from a
+/// tokio worker thread (which panics). It spawns the future on the
+/// dedicated runtime and blocks the caller via `mpsc::recv`.
 pub struct KisekiFuse<G: GatewayOps> {
     gateway: G,
     tenant_id: OrgId,
@@ -99,9 +103,10 @@ impl<G: GatewayOps> KisekiFuse<G> {
         let mut inodes = HashMap::new();
         inodes.insert(1, InodeEntry::Root);
 
-        // Try to get the current tokio handle; if not in a tokio context,
-        // create a dedicated runtime for FUSE gateway ops.
-        let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+        // Always create a dedicated runtime — never reuse the caller's.
+        // FUSE/NFS methods use block_on() which panics if called from
+        // within the same runtime (e.g., in BDD tests under cucumber).
+        let rt = std::thread::spawn(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -109,10 +114,11 @@ impl<G: GatewayOps> KisekiFuse<G> {
                 .build()
                 .expect("failed to create FUSE tokio runtime");
             let handle = runtime.handle().clone();
-            // Leak the runtime so the handle remains valid for the process lifetime.
             std::mem::forget(runtime);
             handle
-        });
+        })
+        .join()
+        .expect("FUSE runtime thread panicked");
 
         Self {
             gateway,
@@ -122,6 +128,22 @@ impl<G: GatewayOps> KisekiFuse<G> {
             children: HashMap::new(),
             next_ino: 2,
             rt,
+        }
+    }
+
+    /// Block on an async gateway call. Uses `block_in_place` when on a
+    /// tokio multi-thread runtime (tests), or `block_on` when on an OS
+    /// thread (FUSE daemon).
+    fn block_gateway<F, T>(&self, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // On a tokio worker — use block_in_place so we don't panic.
+            tokio::task::block_in_place(|| self.rt.block_on(f))
+        } else {
+            // On an OS thread (FUSE daemon) — block_on directly.
+            self.rt.block_on(f)
         }
     }
 
@@ -188,16 +210,15 @@ impl<G: GatewayOps> KisekiFuse<G> {
             return Err(libc_eisdir());
         };
 
-        self.rt
-            .block_on(self.gateway.read(ReadRequest {
-                tenant_id: self.tenant_id,
-                namespace_id: self.namespace_id,
-                composition_id: *composition_id,
-                offset,
-                length: u64::from(size),
-            }))
-            .map(|r| r.data)
-            .map_err(|_| libc_eio())
+        self.block_gateway(self.gateway.read(ReadRequest {
+            tenant_id: self.tenant_id,
+            namespace_id: self.namespace_id,
+            composition_id: *composition_id,
+            offset,
+            length: u64::from(size),
+        }))
+        .map(|r| r.data)
+        .map_err(|_| libc_eio())
     }
 
     /// Write data to an existing file at a given offset.
@@ -218,16 +239,15 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
         // Read existing data.
         let mut buf = if old_size > 0 {
-            self.rt
-                .block_on(self.gateway.read(ReadRequest {
-                    tenant_id: self.tenant_id,
-                    namespace_id: self.namespace_id,
-                    composition_id: old_composition_id,
-                    offset: 0,
-                    length: old_size,
-                }))
-                .map(|r| r.data)
-                .map_err(|_| libc_eio())?
+            self.block_gateway(self.gateway.read(ReadRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                composition_id: old_composition_id,
+                offset: 0,
+                length: old_size,
+            }))
+            .map(|r| r.data)
+            .map_err(|_| libc_eio())?
         } else {
             Vec::new()
         };
@@ -248,8 +268,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
         // Write the full buffer as a new composition.
         let resp = self
-            .rt
-            .block_on(self.gateway.write(WriteRequest {
+            .block_gateway(self.gateway.write(WriteRequest {
                 tenant_id: self.tenant_id,
                 namespace_id: self.namespace_id,
                 data: buf,
@@ -290,8 +309,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
         let size = data.len() as u64;
         let resp = self
-            .rt
-            .block_on(self.gateway.write(WriteRequest {
+            .block_gateway(self.gateway.write(WriteRequest {
                 tenant_id: self.tenant_id,
                 namespace_id: self.namespace_id,
                 data,
