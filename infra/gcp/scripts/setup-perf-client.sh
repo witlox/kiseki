@@ -20,7 +20,7 @@ pip3 install --break-system-packages boto3 awscli 2>/dev/null || true
 if [ ! -f /usr/local/bin/kiseki-client ]; then
   ARCH=$(uname -m)
   echo "Downloading kiseki-client ($${ARCH}) from ${release_tag}..."
-  curl -sfL "https://github.com/witlox/kiseki/releases/${release_tag}/download/kiseki-client-$${ARCH}.tar.gz" \
+  curl -sfL "https://github.com/witlox/kiseki/releases/download/${release_tag}/kiseki-client-$${ARCH}.tar.gz" \
     -o /tmp/kiseki-client.tar.gz || {
     echo "ERROR: Failed to download client release"
     exit 1
@@ -29,7 +29,7 @@ if [ ! -f /usr/local/bin/kiseki-client ]; then
   chmod +x /usr/local/bin/kiseki-client 2>/dev/null || true
 
   # Also grab kiseki-admin for diagnostics
-  curl -sfL "https://github.com/witlox/kiseki/releases/${release_tag}/download/kiseki-server-$${ARCH}.tar.gz" \
+  curl -sfL "https://github.com/witlox/kiseki/releases/download/${release_tag}/kiseki-server-$${ARCH}.tar.gz" \
     -o /tmp/kiseki-server.tar.gz || true
   if [ -f /tmp/kiseki-server.tar.gz ]; then
     tar xzf /tmp/kiseki-server.tar.gz -C /usr/local/bin/ kiseki-admin 2>/dev/null || true

@@ -17,7 +17,7 @@ dnf install -y --allowerasing openssl-libs unzip iperf3 fio curl bc tar gzip 2>&
 # Download pre-built release binaries
 if [ ! -f /usr/local/bin/kiseki-server ]; then
   ARCH=$(uname -m)
-  RELEASE_URL="https://github.com/witlox/kiseki/releases/${release_tag}/download/kiseki-server-$${ARCH}.tar.gz"
+  RELEASE_URL="https://github.com/witlox/kiseki/releases/download/${release_tag}/kiseki-server-$${ARCH}.tar.gz"
   echo "Downloading kiseki-server ($${ARCH}) from ${release_tag}..."
   curl -sfL "$RELEASE_URL" -o /tmp/kiseki-server.tar.gz || {
     echo "ERROR: Failed to download release from $RELEASE_URL"

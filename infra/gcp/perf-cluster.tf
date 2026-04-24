@@ -29,7 +29,7 @@ variable "zone" {
 }
 
 variable "release_tag" {
-  description = "GitHub release tag to download binaries from (e.g. 'latest' or 'tags/v2026.1.42')"
+  description = "GitHub release tag to download binaries from (e.g. 'v2026.1.326')"
   type        = string
   default     = "latest"
 }
