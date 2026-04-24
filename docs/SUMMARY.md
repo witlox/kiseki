@@ -43,6 +43,7 @@
 
 - [Troubleshooting](operations/troubleshooting.md)
 - [Performance Tuning](operations/performance.md)
+- [Performance Benchmarks](performance/README.md)
 - [Capacity Planning](operations/capacity.md)
 
 # API Reference
@@ -86,3 +87,4 @@
   - [ADR-029: Raw Block Allocator](decisions/adr/029-raw-block-device-allocator.md)
   - [ADR-030: Small-File Placement](decisions/adr/030-dynamic-small-file-placement.md)
   - [ADR-031: Client-Side Cache](decisions/adr/031-client-side-cache.md)
+  - [ADR-032: Async GatewayOps](decisions/adr/032-async-gateway-ops.md)
