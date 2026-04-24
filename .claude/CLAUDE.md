@@ -80,7 +80,11 @@ Read `.claude/roles/[role].md`. Apply its constraints.
 
 ## Entry point
 
-**Design complete, ready for implementation** (current state): full spec tree (analyst) + architecture (architect) + adversary review + analyst backpass all done. 56 invariants, 132 scenarios, 19 ADRs, 13 build phases. No code yet. Enter via FEATURE mode with implementer role. Start at Phase 0 (kiseki-common + kiseki-proto) per `specs/architecture/build-phases.md`.
+**Phase 12 complete** (current state): 12 crates implemented, 32 ADRs
+(001-032), 599/599 BDD scenarios passing, 753 unit/integration tests.
+Async GatewayOps (ADR-032) deployed. Performance benchmarked on GCP
+(1.1 GB/s S3 write, 1.1 GB/s read). NFS/pNFS/FUSE functional locally.
+Enter via FEATURE or BUGFIX mode for new work.
 
 ## Escalation paths
 

@@ -1,7 +1,7 @@
 # Kiseki
 
-Distributed storage system for HPC/AI workloads. Design complete,
-ready for implementation.
+Distributed storage system for HPC/AI workloads. Phase 12 integration
+complete. 32 ADRs, 599 BDD scenarios, 753 tests.
 
 ## Language
 
