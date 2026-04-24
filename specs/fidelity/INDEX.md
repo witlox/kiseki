@@ -1,7 +1,7 @@
-# Fidelity Index — Kiseki (Post Phase 12ab + ADR-030)
+# Fidelity Index — Kiseki (Post ADR-032 Async GatewayOps)
 
-**Checkpoint**: 2026-04-22 (end of session)
-**Previous**: 2026-04-22 (start of session, 456 BDD)
+**Checkpoint**: 2026-04-24 (end of session)
+**Previous**: 2026-04-22 (456 BDD → 599 BDD)
 
 ## Per-Crate Status
 
@@ -32,9 +32,9 @@
 | Metric | Value |
 |--------|-------|
 | Feature files | 22 |
-| Total scenarios | 563 |
-| Passing | 554 (98.4%) |
-| Skipped | 9 (ADR-030 table-based migration steps) |
+| Total scenarios | 599 |
+| Passing | 599 (100%) |
+| Skipped | 0 |
 | Failed | 0 |
 | Parsing errors | 0 |
 | Step definition files | 19 |
@@ -85,7 +85,8 @@
 
 ## ADRs
 
-30 ADRs (001-030). All accepted. Latest: ADR-030 (Dynamic Small-File Placement).
+32 ADRs (001-032). All accepted. Latest: ADR-032 (Async GatewayOps).
+ADR-031: Client-Side Cache. ADR-032: Async GatewayOps (lock-free composition writes).
 
 ## Confidence Assessment
 

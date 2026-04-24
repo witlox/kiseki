@@ -30,11 +30,11 @@ ADR-027). gRPC is used for inter-process and network boundaries.
 Co-located callers use the trait directly; remote callers use the gRPC
 service backed by the same trait implementation.
 
-| Interface | Provider | Consumer |
-|---|---|---|
-| `LogOps` | kiseki-log | kiseki-composition (co-located) |
-| `ChunkOps` | kiseki-chunk | kiseki-composition, kiseki-view |
-| `CompositionOps` | kiseki-composition | kiseki-gateway-*, kiseki-client |
+| Interface | Provider | Consumer | Sync/Async |
+|---|---|---|---|
+| `LogOps` | kiseki-log | kiseki-composition, kiseki-gateway (co-located) | **async** (ADR-032) |
+| `ChunkOps` | kiseki-chunk | kiseki-composition, kiseki-view | sync |
+| `CompositionOps` | kiseki-composition | kiseki-gateway-*, kiseki-client | **sync** (in-memory only; log emission handled by gateway — ADR-032) |
 | `ViewOps` | kiseki-view | kiseki-gateway-*, kiseki-client |
 | `CryptoOps` | kiseki-crypto | all crates that encrypt/decrypt |
 | `KeyManagerOps` | kiseki-keymanager (remote) | kiseki-chunk, kiseki-crypto |

@@ -1,6 +1,6 @@
 # ADR-032: Async GatewayOps
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-04-24  
 **Traces**: I-L2, I-L5, I-V3, I-WA2, I-C2, I-C5, I-L8
 
@@ -133,3 +133,27 @@ Big-bang conversion. All callers updated in one pass:
 - NFS/FUSE `block_on` on a non-tokio thread: works correctly but
   must not be called from within a tokio context (same issue we
   already solved with `std::thread::spawn` for runtime creation).
+
+## Implementation Notes (2026-04-24)
+
+**CompositionOps reverted to sync.** The initial implementation made
+`CompositionOps` async, but holding `tokio::sync::Mutex<CompositionStore>`
+across `emit_delta().await` serialized all writes behind a single Raft
+round-trip — the same bottleneck as before, just without thread starvation.
+
+**Final architecture:**
+- `GatewayOps`: async (S3 handlers await directly)
+- `LogOps`: async (Raft consensus)
+- `CompositionOps`: **sync** (in-memory HashMap operations only)
+
+**Gateway write pattern (lock-free):**
+1. Lock compositions → `create()` (sync, microseconds) → drop lock
+2. Emit delta to log (async, Raft consensus, ~8ms) — no lock held
+3. If emission fails, re-acquire lock and rollback (PIPE-ADV-1)
+
+**NFS/FUSE bridge:** `block_gateway()` helper uses `block_in_place`
+when on a tokio worker thread (tests), or direct `block_on` on OS
+threads (production NFS/FUSE daemon).
+
+**Result:** 1MB write throughput: 39.5 → 380.2 MB/s (9.6x improvement).
+32 concurrent S3 PUTs complete in 50ms with no deadlock.
