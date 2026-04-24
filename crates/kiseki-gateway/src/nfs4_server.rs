@@ -52,6 +52,8 @@ mod op {
     pub const CREATE_SESSION: u32 = 43;
     pub const DESTROY_SESSION: u32 = 44;
     pub const RECLAIM_COMPLETE: u32 = 58;
+    pub const LAYOUTGET: u32 = 50;
+    pub const LAYOUTRETURN: u32 = 51;
     pub const SEQUENCE: u32 = 53;
     pub const IO_ADVISE: u32 = 63;
 }
@@ -67,6 +69,8 @@ mod nfs4_status {
     pub const NFS4ERR_BADSESSION: u32 = 10052;
     pub const NFS4ERR_BAD_STATEID: u32 = 10025;
     pub const NFS4ERR_DENIED: u32 = 10010;
+    pub const NFS4ERR_NOFILEHANDLE: u32 = 10020;
+    pub const NFS4ERR_LAYOUTUNAVAILABLE: u32 = 10059;
 }
 
 /// NFSv4 session state.
@@ -325,6 +329,8 @@ fn process_op<G: GatewayOps>(
         op::RESTOREFH => op_restorefh(state),
         op::RECLAIM_COMPLETE => op_reclaim_complete(reader),
         op::IO_ADVISE => op_io_advise(reader),
+        op::LAYOUTGET => op_layoutget(reader, ctx, state),
+        op::LAYOUTRETURN => op_layoutreturn(reader, ctx),
         _ => {
             let mut w = XdrWriter::new();
             w.write_u32(op_code);
@@ -619,6 +625,111 @@ fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_u32(1); // hints bitmap count
     w.write_u32(0); // no hints applied
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+/// LAYOUTGET (RFC 5661 §18.43) — return pNFS layout for direct I/O.
+fn op_layoutget<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    state: &CompoundState,
+) -> (u32, Vec<u8>) {
+    // Parse LAYOUTGET4args.
+    let _signal_layout_avail = reader.read_bool().unwrap_or(false);
+    let _layout_type = reader.read_u32().unwrap_or(1); // LAYOUT4_NFSV4_1_FILES = 1
+    let iomode = reader.read_u32().unwrap_or(1); // LAYOUTIOMODE4_READ = 1
+    let offset = reader.read_u64().unwrap_or(0);
+    let length = reader.read_u64().unwrap_or(0);
+    let _minlength = reader.read_u64().unwrap_or(0);
+    let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
+    let _maxcount = reader.read_u32().unwrap_or(0);
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::LAYOUTGET);
+
+    // Require current file handle.
+    let fh = match state.current_fh {
+        Some(fh) => fh,
+        None => {
+            w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
+            return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
+        }
+    };
+
+    // Map file handle to a file_id for the layout manager.
+    let file_id = u64::from_le_bytes(fh[..8].try_into().unwrap_or([0; 8]));
+
+    // Map NFS iomode to pNFS IoMode.
+    let pnfs_iomode = if iomode >= 2 {
+        crate::pnfs::IoMode::ReadWrite
+    } else {
+        crate::pnfs::IoMode::Read
+    };
+
+    // Get or create layout.
+    let layout = ctx
+        .layouts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .layout_get(file_id, offset, length, pnfs_iomode);
+
+    w.write_u32(nfs4_status::NFS4_OK);
+    w.write_bool(true); // return_on_close
+    w.write_opaque_fixed(&layout.stateid); // lo_stateid
+                                           // Layout array (count + segments).
+    w.write_u32(layout.segments.len() as u32);
+    for seg in &layout.segments {
+        w.write_u64(seg.offset);
+        w.write_u64(seg.length);
+        w.write_u32(if matches!(seg.iomode, crate::pnfs::IoMode::ReadWrite) {
+            2
+        } else {
+            1
+        });
+        w.write_u32(1); // layout_type = LAYOUT4_NFSV4_1_FILES
+                        // Layout body: device address as opaque.
+        w.write_opaque(seg.device_addr.as_bytes());
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+/// LAYOUTRETURN (RFC 5661 §18.44) — return pNFS layout.
+fn op_layoutreturn<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> (u32, Vec<u8>) {
+    // Parse LAYOUTRETURN4args.
+    let _reclaim = reader.read_bool().unwrap_or(false);
+    let _layout_type = reader.read_u32().unwrap_or(1);
+    let _iomode = reader.read_u32().unwrap_or(1);
+    let return_type = reader.read_u32().unwrap_or(4); // LAYOUTRETURN4_ALL = 4
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::LAYOUTRETURN);
+
+    if return_type == 1 {
+        // LAYOUTRETURN4_FILE: return layout for a specific file.
+        let offset = reader.read_u64().unwrap_or(0);
+        let _length = reader.read_u64().unwrap_or(0);
+        let stateid = reader.read_opaque_fixed(16).unwrap_or_default();
+        let _lrf_body = reader.read_opaque().unwrap_or_default();
+
+        // Derive file_id from stateid (first 8 bytes, matching layout_get).
+        let file_id = u64::from_le_bytes(stateid[..8].try_into().unwrap_or([0; 8]));
+        let _ = offset; // used for partial returns (not implemented)
+
+        ctx.layouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .layout_return(file_id);
+    }
+    // LAYOUTRETURN4_ALL: no file-specific data to parse.
+
+    w.write_u32(nfs4_status::NFS4_OK);
+    w.write_bool(true); // lrs_present (stateid present)
+    w.write_opaque_fixed(&[0u8; 16]); // empty stateid (no new state)
 
     (nfs4_status::NFS4_OK, w.into_bytes())
 }

@@ -133,13 +133,25 @@ pub struct NfsContext<G: GatewayOps> {
     pub handles: HandleRegistry,
     pub dir_index: DirectoryIndex,
     pub locks: LockManager,
+    pub layouts: Mutex<crate::pnfs::LayoutManager>,
     pub tenant_id: OrgId,
     pub namespace_id: NamespaceId,
 }
 
 impl<G: GatewayOps> NfsContext<G> {
     /// Create a new NFS context.
+    /// Create a new NFS context with default (empty) pNFS layout manager.
     pub fn new(gateway: NfsGateway<G>, tenant_id: OrgId, namespace_id: NamespaceId) -> Self {
+        Self::with_storage_nodes(gateway, tenant_id, namespace_id, Vec::new())
+    }
+
+    /// Create a new NFS context with pNFS storage node addresses.
+    pub fn with_storage_nodes(
+        gateway: NfsGateway<G>,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        storage_nodes: Vec<String>,
+    ) -> Self {
         let handles = HandleRegistry::new();
         // Register root handle.
         handles.root_handle(namespace_id, tenant_id);
@@ -149,6 +161,7 @@ impl<G: GatewayOps> NfsContext<G> {
             handles,
             dir_index: DirectoryIndex::new(),
             locks: LockManager::default(),
+            layouts: Mutex::new(crate::pnfs::LayoutManager::new(storage_nodes)),
             tenant_id,
             namespace_id,
         }

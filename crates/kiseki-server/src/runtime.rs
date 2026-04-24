@@ -334,15 +334,26 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         }
     });
 
-    // NFS gateway (NFSv3 + NFSv4.2 on port 2049).
+    // NFS gateway (NFSv3 + NFSv4.2 + pNFS on port 2049).
     let nfs_gw = kiseki_gateway::nfs::NfsGateway::new(Arc::clone(&gw));
     let nfs_addr = cfg.nfs_addr;
+    // Pass peer addresses for pNFS layout delegation (LAYOUTGET).
+    let nfs_storage_nodes: Vec<String> = cfg
+        .raft_peers
+        .iter()
+        .map(|(_, addr)| {
+            // Raft peer addr is "host:9300" — replace port with NFS port.
+            let host = addr.split(':').next().unwrap_or(addr);
+            format!("{host}:9100")
+        })
+        .collect();
     std::thread::spawn(move || {
-        kiseki_gateway::nfs_server::run_nfs_server(
+        kiseki_gateway::nfs_server::run_nfs_server_with_peers(
             nfs_addr,
             nfs_gw,
             bootstrap_tenant,
             bootstrap_ns,
+            nfs_storage_nodes,
         );
     });
 

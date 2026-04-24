@@ -28,7 +28,23 @@ pub fn run_nfs_server<G: GatewayOps + Send + Sync + 'static>(
     tenant_id: OrgId,
     namespace_id: NamespaceId,
 ) {
-    let ctx = Arc::new(NfsContext::new(gateway, tenant_id, namespace_id));
+    run_nfs_server_with_peers(addr, gateway, tenant_id, namespace_id, Vec::new());
+}
+
+/// Start the NFS server with pNFS storage node addresses for layout delegation.
+pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
+    addr: SocketAddr,
+    gateway: NfsGateway<G>,
+    tenant_id: OrgId,
+    namespace_id: NamespaceId,
+    storage_nodes: Vec<String>,
+) {
+    let ctx = Arc::new(NfsContext::with_storage_nodes(
+        gateway,
+        tenant_id,
+        namespace_id,
+        storage_nodes,
+    ));
     let sessions = Arc::new(SessionManager::new());
 
     let listener = TcpListener::bind(addr).unwrap_or_else(|e| {
