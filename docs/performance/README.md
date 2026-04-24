@@ -13,7 +13,7 @@ Benchmark results for kiseki on GCP infrastructure.
 | **Network** | GCP VPC, single subnet 10.0.0.0/24 |
 | **Region** | europe-west6-c (Zurich) |
 | **Raft** | Single group, 5 nodes, node 1 bootstrap |
-| **Release** | v2026.1.332 |
+| **Release** | v2026.1.352 (async GatewayOps, ADR-032) |
 
 ## Results (2026-04-24)
 
@@ -32,9 +32,9 @@ All S3 tests run from client nodes (n2-standard-8) with 8-way parallelism.
 
 | Object Size | Count | Parallelism | Time | Throughput |
 |-------------|-------|-------------|------|------------|
-| 1 MB | 200 | 8 | 1,640 ms | 122.0 MB/s |
-| 4 MB | 50 | 8 | 246 ms | 813.0 MB/s |
-| 16 MB | 25 | 8 | 350 ms | 1,142.9 MB/s |
+| 1 MB | 200 | 8 | 1,624 ms | 123.2 MB/s |
+| 4 MB | 50 | 8 | 239 ms | 836.8 MB/s |
+| 16 MB | 25 | 8 | 363 ms | 1,101.9 MB/s |
 
 #### Read Throughput
 
@@ -47,15 +47,15 @@ All S3 tests run from client nodes (n2-standard-8) with 8-way parallelism.
 | Percentile | Latency |
 |------------|---------|
 | p50 | 7.6 ms |
-| p99 | 8.8 ms |
+| p99 | 8.6 ms |
 | avg | 7.7 ms |
-| max | 10.3 ms |
+| max | 9.7 ms |
 
 #### Aggregate Write (3 clients, parallel)
 
 | Workload | Time | Aggregate Throughput |
 |----------|------|---------------------|
-| 3 x 100 x 1 MB (8 concurrent/client) | 2,263 ms | 132.6 MB/s |
+| 3 x 100 x 1 MB (8 concurrent/client) | 2,205 ms | 136.1 MB/s |
 
 ### NFS / pNFS / FUSE
 
@@ -75,22 +75,22 @@ to the Prometheus metrics exporter yet.
 ## Local Test Results (same binary, localhost)
 
 For comparison, local 3-node cluster results (loopback network,
-no disk I/O latency):
+no disk I/O latency, 32-way parallelism):
 
 | Test | Result |
 |------|--------|
-| S3 Write 1 MB x 200 (32 parallel) | 39.5 MB/s |
-| S3 Write 4 MB x 50 (32 parallel) | 337.3 MB/s |
-| S3 Write 16 MB x 25 (8 parallel) | 346.6 MB/s |
-| S3 Parallel 3 x 100 x 1 MB (96 parallel) | 135.3 MB/s |
-| S3 Latency 1 KB | p50: 35 ms, p99: 39 ms |
-| S3 Read 1 MB x 200 (32 parallel) | 917.4 MB/s |
+| S3 Write 1 MB x 200 (32 parallel) | 380.2 MB/s |
+| S3 Write 4 MB x 50 (32 parallel) | 349.7 MB/s |
+| S3 Write 16 MB x 25 (32 parallel) | 340.7 MB/s |
+| S3 Read 1 MB x 200 (32 parallel) | 913.2 MB/s |
+| 32 concurrent PUTs | 50 ms (no deadlock) |
 
 ## Observations
 
-1. **Write throughput scales with object size.** 1 MB writes are
-   bottlenecked by per-object Raft consensus overhead (~8 ms per
-   round-trip). 16 MB writes amortize this cost, reaching 1.1 GB/s.
+1. **Small object writes improved 9.6x** after ADR-032 (async
+   GatewayOps + lock-free composition writes). The composition
+   lock is no longer held during Raft consensus, allowing
+   concurrent writes to proceed in parallel.
 
 2. **Read throughput exceeds write.** Reads bypass Raft consensus
    (served from the local composition + chunk store) and hit 1.1 GB/s
@@ -98,12 +98,12 @@ no disk I/O latency):
 
 3. **GCP outperforms localhost for large objects.** The GCP network
    (15+ Gbps) and n2-standard-16 nodes have more bandwidth than
-   localhost loopback under contention. 16 MB writes: 1,143 MB/s
-   (GCP) vs 347 MB/s (local).
+   localhost loopback under contention. 16 MB writes: 1,102 MB/s
+   (GCP) vs 341 MB/s (local).
 
 4. **Latency is network-bound.** p50 latency on GCP (7.6 ms)
-   includes network RTT + Raft consensus (3-node quorum). Local
-   p50 is 35 ms due to higher contention on shared CPU.
+   includes network RTT + Raft consensus (5-node quorum). Local
+   latency is dominated by CPU contention on shared machine.
 
 5. **Single Raft group is the write bottleneck.** All writes go
    through one leader. Multi-shard deployment would distribute
@@ -111,12 +111,11 @@ no disk I/O latency):
 
 ## Known Issues
 
-- **Concurrent write deadlock (fixed).** Blocking redb I/O in the
-  Raft state machine `apply()` path starved the async runtime under
-  concurrent load. Fixed by: `block_in_place` in S3 handlers +
-  dynamic Raft runtime thread count (`KISEKI_RAFT_THREADS`, default
-  = CPUs/2). Proper fix: `spawn_blocking` for redb writes in
-  `apply()`.
+- **Concurrent write deadlock (fixed in ADR-032).** The sync→async
+  bridge (`run_on_raft`) caused thread starvation under concurrent
+  load. Fixed by making GatewayOps and LogOps fully async, and
+  moving log emission out of the composition lock scope. Result:
+  1 MB writes improved from 39.5 to 380.2 MB/s (9.6x).
 
 - **NFS mount on GCP.** Requires SSH key distribution from ctrl to
   client nodes. The ctrl service account needs `osAdminLogin` role
