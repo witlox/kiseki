@@ -123,14 +123,14 @@ resource "google_compute_instance" "hdd" {
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-raw-storage.sh", {
-    node_id    = count.index + 1
-    node_ip    = "10.0.0.${10 + count.index}"
-    all_peers  = "1=10.0.0.10:9300,2=10.0.0.11:9300,3=10.0.0.12:9300,4=10.0.0.20:9300,5=10.0.0.21:9300"
-    raft_port  = 9300
+    node_id   = count.index + 1
+    node_ip   = "10.0.0.${10 + count.index}"
+    all_peers = "1=10.0.0.10:9300,2=10.0.0.11:9300,3=10.0.0.12:9300,4=10.0.0.20:9300,5=10.0.0.21:9300"
+    raft_port = 9300
     # Raw device paths — Kiseki manages these directly
-    raw_devices = "/dev/disk/by-id/google-kiseki-hdd-0,/dev/disk/by-id/google-kiseki-hdd-1,/dev/disk/by-id/google-kiseki-hdd-2"
+    raw_devices  = "/dev/disk/by-id/google-kiseki-hdd-0,/dev/disk/by-id/google-kiseki-hdd-1,/dev/disk/by-id/google-kiseki-hdd-2"
     device_class = "hdd"
-    meta_dir   = "/var/lib/kiseki"
+    meta_dir     = "/var/lib/kiseki"
   })
 }
 
@@ -192,14 +192,14 @@ resource "google_compute_instance" "fast" {
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-raw-storage.sh", {
-    node_id    = count.index + 4
-    node_ip    = "10.0.0.${20 + count.index}"
-    all_peers  = "1=10.0.0.10:9300,2=10.0.0.11:9300,3=10.0.0.12:9300,4=10.0.0.20:9300,5=10.0.0.21:9300"
-    raft_port  = 9300
+    node_id   = count.index + 4
+    node_ip   = "10.0.0.${20 + count.index}"
+    all_peers = "1=10.0.0.10:9300,2=10.0.0.11:9300,3=10.0.0.12:9300,4=10.0.0.20:9300,5=10.0.0.21:9300"
+    raft_port = 9300
     # NVMe for metadata, PD-SSD for data — all raw
-    raw_devices = "/dev/nvme0n1,/dev/disk/by-id/google-kiseki-ssd-0,/dev/disk/by-id/google-kiseki-ssd-1"
+    raw_devices  = "/dev/nvme0n1,/dev/disk/by-id/google-kiseki-ssd-0,/dev/disk/by-id/google-kiseki-ssd-1"
     device_class = "nvme+ssd"
-    meta_dir   = "/var/lib/kiseki"
+    meta_dir     = "/var/lib/kiseki"
   })
 }
 
@@ -263,6 +263,45 @@ resource "google_compute_disk" "cache" {
 }
 
 # ---------------------------------------------------------------------------
+# GCS bucket for performance results
+# ---------------------------------------------------------------------------
+
+resource "google_storage_bucket" "perf_results" {
+  name          = "${var.project_id}-kiseki-perf-results"
+  location      = var.region
+  force_destroy = true
+
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  uniform_bucket_level_access = true
+}
+
+# Service account for ctrl node (GCS write access)
+resource "google_service_account" "ctrl" {
+  account_id   = "kiseki-bench-ctrl"
+  display_name = "Kiseki benchmark controller"
+}
+
+resource "google_storage_bucket_iam_member" "ctrl_write" {
+  bucket = google_storage_bucket.perf_results.name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.ctrl.email}"
+}
+
+resource "google_storage_bucket_iam_member" "ctrl_read" {
+  bucket = google_storage_bucket.perf_results.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.ctrl.email}"
+}
+
+# ---------------------------------------------------------------------------
 # Benchmark controller
 # ---------------------------------------------------------------------------
 
@@ -288,6 +327,17 @@ resource "google_compute_instance" "ctrl" {
   metadata = {
     enable-oslogin = "TRUE"
   }
+
+  service_account {
+    email  = google_service_account.ctrl.email
+    scopes = ["cloud-platform"]
+  }
+
+  metadata_startup_script = templatefile("${path.module}/scripts/setup-bench-ctrl.sh", {
+    storage_ips = "10.0.0.10,10.0.0.11,10.0.0.12,10.0.0.20,10.0.0.21"
+    client_ips  = "10.0.0.30,10.0.0.31,10.0.0.32"
+    perf_bucket = "gs://${google_storage_bucket.perf_results.name}"
+  })
 }
 
 # ---------------------------------------------------------------------------
@@ -320,6 +370,10 @@ output "clients" {
 
 output "ctrl_ip" {
   value = google_compute_instance.ctrl.network_interface[0].access_config[0].nat_ip
+}
+
+output "perf_bucket" {
+  value = "gs://${google_storage_bucket.perf_results.name}"
 }
 
 output "dashboard" {
