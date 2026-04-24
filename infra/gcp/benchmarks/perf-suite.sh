@@ -26,6 +26,12 @@ GCS_BUCKET="${KISEKI_PERF_BUCKET:-gs://kiseki-perf-results}"
 
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$RESULTS/perf.log"; }
 
+# SSH wrapper: uses OS Login user + key if available, falls back to root.
+SSH_USER=$(gcloud compute os-login describe-profile --format='value(posixAccounts[0].username)' 2>/dev/null || echo root)
+SSH_KEY=""
+[ -f /root/.ssh/id_ed25519 ] && SSH_KEY="-i /root/.ssh/id_ed25519"
+node_ssh() { local H=$1; shift; ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $SSH_KEY "$SSH_USER@$H" "$@"; }
+
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║       Kiseki Cluster Performance Benchmark                   ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
@@ -56,7 +62,6 @@ log "=== 0. Cluster Health & Leader Discovery ==="
 
 LEADER_S3=""
 LEADER_ID=""
-LEADER_NFS=""
 for ip in $ALL_STORAGE; do
   STATUS=$(curl -sf "http://$ip:9090/health" 2>/dev/null || echo "DOWN")
   log "  $ip: $STATUS"
@@ -65,11 +70,9 @@ for ip in $ALL_STORAGE; do
     INFO=$(curl -sf "http://$ip:9090/cluster/info" 2>/dev/null || echo "{}")
     CANDIDATE=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('leader_s3',''))" 2>/dev/null || echo "")
     CANDIDATE_ID=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); l=d.get('leader_id'); print(l if l else '')" 2>/dev/null || echo "")
-    CANDIDATE_NFS=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('leader_nfs', d.get('nfs_addr','')))" 2>/dev/null || echo "")
     if [ -n "$CANDIDATE" ]; then
       LEADER_S3="http://$CANDIDATE"
       LEADER_ID="$CANDIDATE_ID"
-      LEADER_NFS="$CANDIDATE_NFS"
     fi
   fi
 done
@@ -78,19 +81,18 @@ if [ -z "$LEADER_S3" ]; then
   log "  WARNING: No Raft leader found — falling back to first HDD node"
   LEADER_S3="http://10.0.0.10:9000"
   LEADER_ID="unknown"
-  LEADER_NFS="10.0.0.10"
 fi
 LEADER_HOST=$(echo "$LEADER_S3" | sed 's|http://||; s|:.*||')
-[ -z "$LEADER_NFS" ] && LEADER_NFS="$LEADER_HOST"
-LEADER_NFS_HOST=$(echo "$LEADER_NFS" | sed 's|:.*||')
+# NFS runs on the same host as S3 — use the leader's reachable IP,
+# not the bind address (0.0.0.0) from cluster/info.
+LEADER_NFS_HOST="$LEADER_HOST"
 
 log ""
-log "  Raft leader: node $LEADER_ID → S3=$LEADER_S3 NFS=$LEADER_NFS_HOST:2049"
+log "  Raft leader: node $LEADER_ID → S3=$LEADER_S3 NFS=$LEADER_HOST:2049"
 log "  All writes routed to leader; reads distributed"
 {
   echo "leader_id=$LEADER_ID"
   echo "leader_s3=$LEADER_S3"
-  echo "leader_nfs=$LEADER_NFS_HOST"
   echo "leader_host=$LEADER_HOST"
   echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$RESULTS/cluster-info.txt"
@@ -115,7 +117,7 @@ log ""
 log "=== 2. Transport Selection ==="
 log "  GCP: no RDMA/RoCEv2 → TCP+TLS fallback" | tee -a "$RESULTS/transport.txt"
 for ip in $ALL_STORAGE; do
-  RDMA=$(ssh -o StrictHostKeyChecking=no "$ip" "ls /sys/class/infiniband/ 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+  RDMA=$(node_ssh "$ip" "ls /sys/class/infiniband/ 2>/dev/null | wc -l" 2>/dev/null || echo "0")
   log "  $ip: IB=$RDMA → TCP" | tee -a "$RESULTS/transport.txt"
 done
 
@@ -125,20 +127,20 @@ done
 log ""
 log "=== 3. Inter-Node TCP Bandwidth ==="
 
-ssh -o StrictHostKeyChecking=no "$LEADER_HOST" "pkill iperf3 2>/dev/null; iperf3 -s -D 2>/dev/null" 2>/dev/null
+node_ssh "$LEADER_HOST" "pkill iperf3 2>/dev/null; iperf3 -s -D 2>/dev/null" 2>/dev/null
 sleep 1
 
 for ip in $CLIENTS; do
-  BW=$(ssh -o StrictHostKeyChecking=no "$ip" "iperf3 -c $LEADER_HOST -t 5 -J 2>/dev/null" 2>/dev/null | \
+  BW=$(node_ssh "$ip" "iperf3 -c $LEADER_HOST -t 5 -J 2>/dev/null" 2>/dev/null | \
     python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"end\"][\"sum_received\"][\"bits_per_second\"]/1e9:.1f}')" 2>/dev/null || echo "N/A")
   log "  $ip (client) → $LEADER_HOST (leader): ${BW} Gbps" | tee -a "$RESULTS/bandwidth.txt"
 done
 
 FAST1="10.0.0.20"
-ssh -o StrictHostKeyChecking=no "$FAST1" "pkill iperf3 2>/dev/null; iperf3 -s -D 2>/dev/null" 2>/dev/null
+node_ssh "$FAST1" "pkill iperf3 2>/dev/null; iperf3 -s -D 2>/dev/null" 2>/dev/null
 sleep 1
 for ip in $STORAGE_HDD; do
-  BW=$(ssh -o StrictHostKeyChecking=no "$ip" "iperf3 -c $FAST1 -t 5 -J 2>/dev/null" 2>/dev/null | \
+  BW=$(node_ssh "$ip" "iperf3 -c $FAST1 -t 5 -J 2>/dev/null" 2>/dev/null | \
     python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"end\"][\"sum_received\"][\"bits_per_second\"]/1e9:.1f}')" 2>/dev/null || echo "N/A")
   log "  $ip (HDD) → $FAST1 (Fast): ${BW} Gbps" | tee -a "$RESULTS/bandwidth.txt"
 done
@@ -151,7 +153,7 @@ log "=== 4. NFS Write (3 clients → leader, NFSv4) ==="
 
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
-  ssh -o StrictHostKeyChecking=no "$CIP" "
+  node_ssh "$CIP" "
     mkdir -p /mnt/kiseki-nfs-leader
     umount /mnt/kiseki-nfs-leader 2>/dev/null || true
     mount -t nfs4 -o vers=4.2,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/ /mnt/kiseki-nfs-leader 2>/dev/null
@@ -177,7 +179,7 @@ log "  Note: pNFS layout wire-up pending — expects NFSv4.2 fallback"
 
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
-  ssh -o StrictHostKeyChecking=no "$CIP" "
+  node_ssh "$CIP" "
     mkdir -p /mnt/kiseki-pnfs
     umount /mnt/kiseki-pnfs 2>/dev/null || true
     mount -t nfs4 -o vers=4.2,pnfs,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/ /mnt/kiseki-pnfs 2>/dev/null
@@ -212,7 +214,7 @@ log ""
 log "=== 5. FUSE Native Client (client-1 → leader) ==="
 
 FIRST_CLIENT="${CLIENT_ARRAY[0]}"
-ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
+node_ssh "$FIRST_CLIENT" "
   source /etc/kiseki-client.env 2>/dev/null || true
 
   kiseki-client mount --endpoint $LEADER_HOST:9100 --mountpoint /mnt/kiseki-fuse \
@@ -266,7 +268,7 @@ log ""
 log "=== 6. S3 PUT Latency (1KB × 100 → leader, from client-1) ==="
 
 FIRST_CLIENT="${CLIENT_ARRAY[0]}"
-ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
+node_ssh "$FIRST_CLIENT" "
   EP='$LEADER_S3'
   curl -sf -X PUT \"\$EP/perf-seq\" >/dev/null 2>&1 || true
   LATS=''
@@ -288,7 +290,7 @@ ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
 log ""
 log "=== 7. S3 Sequential Write (client-1 → leader, ${PAR}∥) ==="
 
-ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
+node_ssh "$FIRST_CLIENT" "
   EP='$LEADER_S3'
   PAR=$PAR
   for SIZE in 1 4 16; do
@@ -315,7 +317,7 @@ ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
 log ""
 log "=== 8. S3 Read Throughput (from client-1, objects from test 7) ==="
 
-ssh -o StrictHostKeyChecking=no "$FIRST_CLIENT" "
+node_ssh "$FIRST_CLIENT" "
   EP='$LEADER_S3'
   PAR=$PAR
   START=\$(date +%s%N)
@@ -340,7 +342,7 @@ log "  3 clients × 100 objects × 1MB = 300 MB total, ${PAR} concurrent per cli
 AGG_START=$(date +%s%N)
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
-  ssh -o StrictHostKeyChecking=no "$CIP" "
+  node_ssh "$CIP" "
     EP='$LEADER_S3'
     curl -sf -X PUT \"\$EP/perf-agg\" >/dev/null 2>&1 || true
     for i in \$(seq 1 100); do
