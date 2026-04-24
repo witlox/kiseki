@@ -56,9 +56,19 @@ impl RaftShardStore {
         // Build the Raft runtime on a background thread to avoid
         // "cannot start a runtime from within a runtime" when called
         // from an async context (e.g., run_main on the server's tokio runtime).
-        let rt = std::thread::spawn(|| {
+        // Default to half of available CPUs (min 4). Leaves the other
+        // half for the S3/NFS gateway runtime, OS, and other processes.
+        // Override with KISEKI_RAFT_THREADS for tuning.
+        let raft_threads = std::env::var("KISEKI_RAFT_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(8, |n| (n.get() / 2).max(4))
+            });
+        tracing::info!(threads = raft_threads, "Raft runtime");
+        let rt = std::thread::spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
+                .worker_threads(raft_threads)
                 .thread_name("kiseki-raft")
                 .enable_all()
                 .build()
@@ -112,7 +122,7 @@ impl RaftShardStore {
         let data_dir = self.data_dir.clone();
         let inline_store = self.inline_store.clone();
 
-        let raft_addr_owned = raft_addr.map(|a| a.to_owned());
+        let raft_addr_owned = raft_addr.map(str::to_owned);
         let handle = self.rt.handle().clone();
         let store = std::thread::spawn(move || {
             handle.block_on(async {
@@ -177,8 +187,8 @@ impl RaftShardStore {
 /// Spawns the work on the Raft runtime via `spawn` and blocks the
 /// current thread waiting for the result via a oneshot channel.
 /// This avoids both:
-/// - "cannot start a runtime from within a runtime" (block_on)
-/// - Worker thread starvation (block_in_place with 32+ concurrent requests)
+/// - "cannot start a runtime from within a runtime" (`block_on`)
+/// - Worker thread starvation (`block_in_place` with 32+ concurrent requests)
 fn run_on_raft<F, T>(rt: &tokio::runtime::Runtime, f: F) -> T
 where
     F: std::future::Future<Output = T> + Send + 'static,
@@ -186,9 +196,12 @@ where
 {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     rt.spawn(async move {
+        tracing::trace!("run_on_raft: future starting");
         let result = f.await;
+        tracing::trace!("run_on_raft: future completed, sending result");
         let _ = tx.send(result);
     });
+    tracing::trace!("run_on_raft: waiting for result on mpsc channel");
     rx.recv()
         .expect("Raft runtime task dropped without completing")
 }

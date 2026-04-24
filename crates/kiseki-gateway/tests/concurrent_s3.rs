@@ -50,7 +50,7 @@ fn setup_router() -> axum::Router {
 }
 
 /// Test that a single PUT/GET roundtrip works through the HTTP layer.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn single_put_get_roundtrip() {
     let app = setup_router();
 
@@ -100,7 +100,7 @@ async fn single_put_get_roundtrip() {
 /// complete within a reasonable timeout. Before the fix (dedicated
 /// Raft runtime), this would deadlock when `block_in_place` +
 /// `block_on` starved the shared tokio worker threads.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_puts_no_deadlock() {
     let app = setup_router();
 
@@ -151,7 +151,7 @@ async fn concurrent_puts_no_deadlock() {
 }
 
 /// Test concurrent PUT + GET (mixed read/write) under load.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_mixed_read_write() {
     let app = setup_router();
 

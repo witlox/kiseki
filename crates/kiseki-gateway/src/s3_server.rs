@@ -143,7 +143,7 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
             part_number,
             body: body.to_vec(),
         };
-        return match state.gateway.upload_part(&req) {
+        return match tokio::task::block_in_place(|| state.gateway.upload_part(&req)) {
             Ok(resp) => (
                 StatusCode::OK,
                 [("etag", format!("\"{}\"", resp.etag))],
@@ -154,11 +154,14 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
         };
     }
 
-    // Regular PutObject.
-    match state.gateway.put_object(PutObjectRequest {
-        tenant_id: state.fallback_tenant,
-        namespace_id: ns_id,
-        body: body.to_vec(),
+    // Regular PutObject. block_in_place prevents std::sync::Mutex
+    // contention from blocking tokio worker threads under concurrent load.
+    match tokio::task::block_in_place(|| {
+        state.gateway.put_object(PutObjectRequest {
+            tenant_id: state.fallback_tenant,
+            namespace_id: ns_id,
+            body: body.to_vec(),
+        })
     }) {
         Ok(resp) => (
             StatusCode::OK,
@@ -197,10 +200,12 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
         }
     }
 
-    match state.gateway.get_object(GetObjectRequest {
-        tenant_id: state.fallback_tenant,
-        namespace_id: ns_id,
-        composition_id: comp_id,
+    match tokio::task::block_in_place(|| {
+        state.gateway.get_object(GetObjectRequest {
+            tenant_id: state.fallback_tenant,
+            namespace_id: ns_id,
+            composition_id: comp_id,
+        })
     }) {
         Ok(resp) => (
             StatusCode::OK,
@@ -232,10 +237,12 @@ async fn head_object<G: GatewayOps + Send + Sync + 'static>(
         Err(_) => return (StatusCode::NOT_FOUND).into_response(),
     };
 
-    match state.gateway.get_object(GetObjectRequest {
-        tenant_id: state.fallback_tenant,
-        namespace_id: ns_id,
-        composition_id: comp_id,
+    match tokio::task::block_in_place(|| {
+        state.gateway.get_object(GetObjectRequest {
+            tenant_id: state.fallback_tenant,
+            namespace_id: ns_id,
+            composition_id: comp_id,
+        })
     }) {
         Ok(resp) => (
             StatusCode::OK,
@@ -267,7 +274,7 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
         };
-        return match state.gateway.create_multipart_upload(&req) {
+        return match tokio::task::block_in_place(|| state.gateway.create_multipart_upload(&req)) {
             Ok(resp) => (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({ "uploadId": resp.upload_id })),
@@ -284,7 +291,7 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
             namespace_id: ns_id,
             upload_id,
         };
-        return match state.gateway.complete_multipart_upload(&req) {
+        return match tokio::task::block_in_place(|| state.gateway.complete_multipart_upload(&req)) {
             Ok(resp) => (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({ "etag": resp.etag })),
@@ -314,7 +321,7 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
     // DELETE ?uploadId=X → AbortMultipartUpload
     if let Some(upload_id) = params.upload_id {
         let req = AbortMultipartUploadRequest { upload_id };
-        return match state.gateway.abort_multipart_upload(&req) {
+        return match tokio::task::block_in_place(|| state.gateway.abort_multipart_upload(&req)) {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
@@ -326,10 +333,12 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
         Err(_) => return StatusCode::NO_CONTENT.into_response(),
     };
 
-    match state.gateway.delete_object(DeleteObjectRequest {
-        tenant_id: state.fallback_tenant,
-        namespace_id: ns_id,
-        composition_id: comp_id,
+    match tokio::task::block_in_place(|| {
+        state.gateway.delete_object(DeleteObjectRequest {
+            tenant_id: state.fallback_tenant,
+            namespace_id: ns_id,
+            composition_id: comp_id,
+        })
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -365,7 +374,9 @@ async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
     // Register the namespace in the composition store so that subsequent
     // PUT object requests can find it (fixes "namespace not found" 500).
     let ns_id = namespace_from_bucket(&bucket);
-    if let Err(e) = state.gateway.ensure_namespace(state.fallback_tenant, ns_id) {
+    if let Err(e) =
+        tokio::task::block_in_place(|| state.gateway.ensure_namespace(state.fallback_tenant, ns_id))
+    {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -446,7 +457,7 @@ async fn list_objects<G: GatewayOps + Send + Sync + 'static>(
     Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
-    match state.gateway.list_objects(state.fallback_tenant, ns_id) {
+    match tokio::task::block_in_place(|| state.gateway.list_objects(state.fallback_tenant, ns_id)) {
         Ok(objects) => {
             let max_keys = params.max_keys.unwrap_or(1000);
             let prefix = params.prefix.unwrap_or_default();
@@ -581,7 +592,7 @@ mod tests {
         s3_router(s3gw, tenant)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn create_bucket_returns_200() {
         let app = test_router();
         let req = Request::builder()
@@ -593,7 +604,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn duplicate_bucket_returns_409() {
         let app = test_router();
 
@@ -616,7 +627,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn head_nonexistent_bucket_returns_404() {
         let app = test_router();
         let req = Request::builder()
@@ -628,7 +639,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn head_existing_bucket_returns_200() {
         let app = test_router();
 
@@ -651,7 +662,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn delete_bucket_returns_204() {
         let app = test_router();
 
@@ -672,7 +683,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn delete_nonexistent_bucket_returns_404() {
         let app = test_router();
         let req = Request::builder()
@@ -684,7 +695,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn list_buckets_returns_xml() {
         let app = test_router();
 
@@ -719,7 +730,7 @@ mod tests {
         assert!(xml.contains("ListAllMyBucketsResult"), "xml: {xml}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn put_get_object_roundtrip() {
         let app = test_router();
 
