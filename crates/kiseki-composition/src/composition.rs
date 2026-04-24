@@ -320,6 +320,7 @@ impl CompositionOps for CompositionStore {
 ///
 /// Uses UUID v5 (SHA-1 based, deterministic) of `namespace_id` || `composition_id`.
 /// Stable across restarts (PIPE-ADV-3).
+#[must_use]
 pub fn composition_hash_key(ns: NamespaceId, comp: CompositionId) -> [u8; 32] {
     let combined = uuid::Uuid::new_v5(&ns.0, comp.0.as_bytes());
     let mut buf = [0u8; 32];
