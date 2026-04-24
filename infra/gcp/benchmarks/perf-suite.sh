@@ -151,6 +151,7 @@ done
 log ""
 log "=== 4. NFS Write (3 clients → leader, NFSv4) ==="
 
+PIDS=""
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
   node_ssh "$CIP" "
@@ -167,8 +168,9 @@ for idx in 0 1 2; do
       echo '  client-$((idx+1)): NFS mount failed'
     fi
   " 2>/dev/null | tee -a "$RESULTS/nfs-write.txt" &
+  PIDS="$PIDS $!"
 done
-wait
+for pid in $PIDS; do wait $pid 2>/dev/null || true; done
 
 # ---------------------------------------------------------------------------
 # 4b. pNFS parallel write (layout delegation)
@@ -177,6 +179,7 @@ log ""
 log "=== 4b. pNFS Write (3 clients → cluster, layout delegation) ==="
 log "  Note: pNFS layout wire-up pending — expects NFSv4.2 fallback"
 
+PIDS=""
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
   node_ssh "$CIP" "
@@ -198,8 +201,9 @@ for idx in 0 1 2; do
       echo '  client-$((idx+1)): pNFS mount failed (expected if server lacks pNFS support)'
     fi
   " 2>/dev/null | tee -a "$RESULTS/pnfs.txt" &
+  PIDS="$PIDS $!"
 done
-wait
+for pid in $PIDS; do wait $pid 2>/dev/null || true; done
 
 if grep -q "LAYOUTGET" "$RESULTS/pnfs.txt" 2>/dev/null; then
   log "  pNFS: layout delegation ACTIVE" | tee -a "$RESULTS/pnfs.txt"
@@ -340,6 +344,7 @@ log "=== 9. S3 Parallel Write (3 clients → leader, aggregate throughput) ==="
 
 log "  3 clients × 100 objects × 1MB = 300 MB total, ${PAR} concurrent per client"
 AGG_START=$(date +%s%N)
+PIDS=""
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
   node_ssh "$CIP" "
@@ -352,8 +357,9 @@ for idx in 0 1 2; do
     done
     wait
   " 2>/dev/null &
+  PIDS="$PIDS $!"
 done
-wait
+for pid in $PIDS; do wait $pid 2>/dev/null || true; done
 AGG_END=$(date +%s%N)
 AGG_MS=$(( (AGG_END - AGG_START) / 1000000 ))
 AGG_MBPS=$(python3 -c "print(f'{300 * 1000 / $AGG_MS:.1f}')" 2>/dev/null || echo "N/A")
