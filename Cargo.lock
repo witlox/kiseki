@@ -1703,6 +1703,7 @@ dependencies = [
  "kiseki-common",
  "kiseki-composition",
  "kiseki-crypto",
+ "kiseki-log",
  "kiseki-transport",
  "kiseki-view",
  "proptest",

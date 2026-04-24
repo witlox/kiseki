@@ -173,7 +173,6 @@ impl InMemoryGateway {
             .lock()
             .await
             .finalize_multipart(upload_id)
-            .await
             .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
 
@@ -371,14 +370,44 @@ impl GatewayOps for InMemoryGateway {
             }
         }
 
-        // Create a composition referencing this chunk.
-        let comp_id = self
-            .compositions
-            .lock()
+        // Create composition (sync, fast) — lock released before Raft.
+        // Log emission happens after lock release to avoid holding the
+        // Mutex across Raft consensus (ADR-032).
+        let (comp_id, log, emit_params) = {
+            let mut comps = self.compositions.lock().await;
+            let comp_id = comps
+                .create(req.namespace_id, vec![chunk_id], bytes_written)
+                .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            let comp = comps.get(comp_id).unwrap();
+            let params = (
+                comp.shard_id,
+                comp.tenant_id,
+                comp.namespace_id,
+                comp.chunks.clone(),
+            );
+            let log = comps.log().cloned();
+            (comp_id, log, params)
+        }; // Lock dropped here — before Raft consensus.
+
+        // Emit delta to log (async, slow — Raft consensus).
+        if let Some(ref log) = log {
+            let hashed_key = kiseki_composition::composition_hash_key(emit_params.2, comp_id);
+            if !kiseki_composition::log_bridge::emit_delta(
+                log.as_ref(),
+                emit_params.0,
+                emit_params.1,
+                kiseki_log::delta::OperationType::Create,
+                hashed_key,
+                emit_params.3,
+                comp_id.0.as_bytes().to_vec(),
+            )
             .await
-            .create(req.namespace_id, vec![chunk_id], bytes_written)
-            .await
-            .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+            {
+                // Rollback: re-acquire lock and remove (PIPE-ADV-1).
+                self.compositions.lock().await.delete(comp_id).ok();
+                return Err(GatewayError::Upstream("delta emission failed".to_string()));
+            }
+        }
 
         Ok(WriteResponse {
             composition_id: comp_id,
@@ -463,12 +492,12 @@ impl GatewayOps for InMemoryGateway {
             chunk_ids = comp.chunks.clone();
         }
 
-        // Delete the composition.
+        // Delete the composition (sync — no lock held during Raft).
+        // Log emission for delete tombstone would go here if needed.
         self.compositions
             .lock()
             .await
             .delete(composition_id)
-            .await
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
         // Decrement chunk refcounts (I-C2: GC when refcount reaches 0).

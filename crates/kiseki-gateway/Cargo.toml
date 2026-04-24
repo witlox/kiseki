@@ -18,6 +18,7 @@ s3 = []
 [dependencies]
 async-trait = { workspace = true }
 kiseki-common = { workspace = true }
+kiseki-log = { workspace = true }
 kiseki-chunk = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-crypto = { workspace = true }

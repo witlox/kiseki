@@ -7,7 +7,6 @@ use kiseki_common::ids::{ChunkId, CompositionId, NamespaceId, OrgId, ShardId};
 use kiseki_log::traits::LogOps;
 
 use crate::error::CompositionError;
-use crate::log_bridge;
 use crate::multipart::MultipartUpload;
 use crate::namespace::Namespace;
 
@@ -32,10 +31,14 @@ pub struct Composition {
 }
 
 /// Composition operations trait.
-#[async_trait::async_trait]
-pub trait CompositionOps: Send + Sync {
+///
+/// All methods are sync — they operate on in-memory state only.
+/// Log emission (Raft consensus) is handled by the gateway after
+/// releasing the composition lock, avoiding lock-across-await
+/// serialization (ADR-032).
+pub trait CompositionOps {
     /// Create a new composition in a namespace.
-    async fn create(
+    fn create(
         &mut self,
         namespace_id: NamespaceId,
         chunks: Vec<ChunkId>,
@@ -45,8 +48,8 @@ pub trait CompositionOps: Send + Sync {
     /// Read a composition by ID.
     fn get(&self, id: CompositionId) -> Result<&Composition, CompositionError>;
 
-    /// Delete a composition (creates a tombstone delta).
-    async fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError>;
+    /// Delete a composition.
+    fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError>;
 
     /// Rename a composition. Returns `CrossShardRename` if source and
     /// target are on different shards (I-L8).
@@ -57,7 +60,7 @@ pub trait CompositionOps: Send + Sync {
     ) -> Result<(), CompositionError>;
 
     /// Update a composition — creates a new version with new chunk refs.
-    async fn update(
+    fn update(
         &mut self,
         id: CompositionId,
         chunks: Vec<ChunkId>,
@@ -80,10 +83,7 @@ pub trait CompositionOps: Send + Sync {
     fn abort_multipart(&mut self, upload_id: &str) -> Result<(), CompositionError>;
 
     /// Finalize a multipart upload — makes the composition visible (I-L5).
-    async fn finalize_multipart(
-        &mut self,
-        upload_id: &str,
-    ) -> Result<CompositionId, CompositionError>;
+    fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError>;
 }
 
 /// In-memory composition store.
@@ -109,12 +109,17 @@ impl CompositionStore {
         }
     }
 
-    /// Attach a log store for delta emission. When set, create/update/delete
-    /// operations emit deltas to the shard's log.
+    /// Attach a log store for delta emission.
     #[must_use]
     pub fn with_log(mut self, log: Arc<dyn LogOps + Send + Sync>) -> Self {
         self.log = Some(log);
         self
+    }
+
+    /// Get the attached log store (if any).
+    #[must_use]
+    pub fn log(&self) -> Option<&Arc<dyn LogOps + Send + Sync>> {
+        self.log.as_ref()
     }
 
     /// Register a namespace.
@@ -150,9 +155,8 @@ impl Default for CompositionStore {
     }
 }
 
-#[async_trait::async_trait]
 impl CompositionOps for CompositionStore {
-    async fn create(
+    fn create(
         &mut self,
         namespace_id: NamespaceId,
         chunks: Vec<ChunkId>,
@@ -177,27 +181,7 @@ impl CompositionOps for CompositionStore {
             version: 1,
             size,
         };
-        self.compositions.insert(id, comp.clone());
-
-        // Emit delta to log if attached. Roll back on failure (PIPE-ADV-1).
-        if let Some(ref log) = self.log {
-            let hashed_key = composition_hash_key(namespace_id, id);
-            if !log_bridge::emit_delta(
-                log.as_ref(),
-                comp.shard_id,
-                comp.tenant_id,
-                kiseki_log::delta::OperationType::Create,
-                hashed_key,
-                comp.chunks.clone(),
-                id.0.as_bytes().to_vec(),
-            )
-            .await
-            {
-                self.compositions.remove(&id);
-                return Err(CompositionError::NamespaceNotFound(namespace_id));
-            }
-        }
-
+        self.compositions.insert(id, comp);
         Ok(id)
     }
 
@@ -207,7 +191,7 @@ impl CompositionOps for CompositionStore {
             .ok_or(CompositionError::CompositionNotFound(id))
     }
 
-    async fn update(
+    fn update(
         &mut self,
         id: CompositionId,
         chunks: Vec<ChunkId>,
@@ -220,46 +204,13 @@ impl CompositionOps for CompositionStore {
         comp.version += 1;
         comp.chunks.clone_from(&chunks);
         comp.size = size;
-        let version = comp.version;
-        let shard_id = comp.shard_id;
-        let tenant_id = comp.tenant_id;
-        let namespace_id = comp.namespace_id;
-
-        if let Some(ref log) = self.log {
-            log_bridge::emit_delta(
-                log.as_ref(),
-                shard_id,
-                tenant_id,
-                kiseki_log::delta::OperationType::Update,
-                composition_hash_key(namespace_id, id),
-                chunks,
-                id.0.as_bytes().to_vec(),
-            )
-            .await;
-        }
-
-        Ok(version)
+        Ok(comp.version)
     }
 
-    async fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError> {
-        let comp = self
-            .compositions
+    fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError> {
+        self.compositions
             .remove(&id)
             .ok_or(CompositionError::CompositionNotFound(id))?;
-
-        if let Some(ref log) = self.log {
-            log_bridge::emit_delta(
-                log.as_ref(),
-                comp.shard_id,
-                comp.tenant_id,
-                kiseki_log::delta::OperationType::Delete,
-                composition_hash_key(comp.namespace_id, id),
-                vec![],
-                id.0.as_bytes().to_vec(),
-            )
-            .await;
-        }
-
         Ok(())
     }
 
@@ -344,10 +295,7 @@ impl CompositionOps for CompositionStore {
         Ok(())
     }
 
-    async fn finalize_multipart(
-        &mut self,
-        upload_id: &str,
-    ) -> Result<CompositionId, CompositionError> {
+    fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError> {
         let (upload, ns_id) = self
             .multiparts
             .get_mut(upload_id)
@@ -364,7 +312,7 @@ impl CompositionOps for CompositionStore {
         let ns_id = *ns_id;
 
         // Create the composition now that it's visible (I-L5).
-        self.create(ns_id, chunks, size).await
+        self.create(ns_id, chunks, size)
     }
 }
 
@@ -372,7 +320,7 @@ impl CompositionOps for CompositionStore {
 ///
 /// Uses UUID v5 (SHA-1 based, deterministic) of `namespace_id` || `composition_id`.
 /// Stable across restarts (PIPE-ADV-3).
-fn composition_hash_key(ns: NamespaceId, comp: CompositionId) -> [u8; 32] {
+pub fn composition_hash_key(ns: NamespaceId, comp: CompositionId) -> [u8; 32] {
     let combined = uuid::Uuid::new_v5(&ns.0, comp.0.as_bytes());
     let mut buf = [0u8; 32];
     buf[..16].copy_from_slice(combined.as_bytes());
@@ -411,12 +359,11 @@ mod tests {
     #[test]
     fn create_and_get() {
         let mut store = setup();
-        let id = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(store.create(test_ns(), vec![ChunkId([0x01; 32])], 1024))
-            .unwrap_or_else(|_| unreachable!());
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 1024)
+            .unwrap();
 
-        let comp = store.get(id).unwrap_or_else(|_| unreachable!());
+        let comp = store.get(id).unwrap();
         assert_eq!(comp.tenant_id, test_tenant());
         assert_eq!(comp.chunks.len(), 1);
         assert_eq!(comp.size, 1024);
@@ -424,31 +371,23 @@ mod tests {
 
     #[test]
     fn delete_removes_composition() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
-        let id = rt
-            .block_on(store.create(test_ns(), vec![], 0))
-            .unwrap_or_else(|_| unreachable!());
-        rt.block_on(store.delete(id))
-            .unwrap_or_else(|_| unreachable!());
+        let id = store.create(test_ns(), vec![], 0).unwrap();
+        store.delete(id).unwrap();
         assert!(store.get(id).is_err());
     }
 
     #[test]
     fn cross_shard_rename_returns_exdev() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
-        // Add a namespace on a different shard.
         store.add_namespace(Namespace {
             id: NamespaceId(uuid::Uuid::from_u128(20)),
             tenant_id: test_tenant(),
-            shard_id: ShardId(uuid::Uuid::from_u128(2)), // different shard
+            shard_id: ShardId(uuid::Uuid::from_u128(2)),
             read_only: false,
         });
 
-        let id = rt
-            .block_on(store.create(test_ns(), vec![], 0))
-            .unwrap_or_else(|_| unreachable!());
+        let id = store.create(test_ns(), vec![], 0).unwrap();
         let result = store.rename(id, NamespaceId(uuid::Uuid::from_u128(20)));
         assert!(matches!(
             result,
@@ -458,25 +397,21 @@ mod tests {
 
     #[test]
     fn same_shard_rename_succeeds() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
         store.add_namespace(Namespace {
             id: NamespaceId(uuid::Uuid::from_u128(11)),
             tenant_id: test_tenant(),
-            shard_id: test_shard(), // same shard
+            shard_id: test_shard(),
             read_only: false,
         });
 
-        let id = rt
-            .block_on(store.create(test_ns(), vec![], 0))
-            .unwrap_or_else(|_| unreachable!());
+        let id = store.create(test_ns(), vec![], 0).unwrap();
         let result = store.rename(id, NamespaceId(uuid::Uuid::from_u128(11)));
         assert!(result.is_ok());
     }
 
     #[test]
     fn read_only_namespace_rejects_create() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = CompositionStore::new();
         store.add_namespace(Namespace {
             id: test_ns(),
@@ -485,7 +420,7 @@ mod tests {
             read_only: true,
         });
 
-        let result = rt.block_on(store.create(test_ns(), vec![], 0));
+        let result = store.create(test_ns(), vec![], 0);
         assert!(matches!(
             result,
             Err(CompositionError::ReadOnlyNamespace(_))
@@ -494,7 +429,6 @@ mod tests {
 
     #[test]
     fn multipart_lifecycle() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
         let upload_id = store
             .start_multipart(test_ns())
@@ -514,8 +448,8 @@ mod tests {
             });
         }
 
-        let comp_id = rt
-            .block_on(store.finalize_multipart(&upload_id))
+        let comp_id = store
+            .finalize_multipart(&upload_id)
             .unwrap_or_else(|_| unreachable!());
 
         let comp = store.get(comp_id).unwrap_or_else(|_| unreachable!());
@@ -525,16 +459,15 @@ mod tests {
 
     #[test]
     fn versioning() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
-        let id = rt
-            .block_on(store.create(test_ns(), vec![ChunkId([0x01; 32])], 100))
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
             .unwrap_or_else(|_| unreachable!());
 
         assert_eq!(store.get(id).unwrap_or_else(|_| unreachable!()).version, 1);
 
-        let v2 = rt
-            .block_on(store.update(id, vec![ChunkId([0x02; 32]), ChunkId([0x03; 32])], 200))
+        let v2 = store
+            .update(id, vec![ChunkId([0x02; 32]), ChunkId([0x03; 32])], 200)
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(v2, 2);
 
@@ -546,10 +479,9 @@ mod tests {
 
     #[test]
     fn composition_belongs_to_one_tenant_ix1() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
-        let id = rt
-            .block_on(store.create(test_ns(), vec![ChunkId([0xaa; 32])], 512))
+        let id = store
+            .create(test_ns(), vec![ChunkId([0xaa; 32])], 512)
             .unwrap_or_else(|_| unreachable!());
 
         let comp = store.get(id).unwrap_or_else(|_| unreachable!());
@@ -560,10 +492,9 @@ mod tests {
 
     #[test]
     fn namespace_not_found_returns_error() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = CompositionStore::new();
         let bogus_ns = NamespaceId(uuid::Uuid::from_u128(999));
-        let result = rt.block_on(store.create(bogus_ns, vec![], 0));
+        let result = store.create(bogus_ns, vec![], 0);
         assert!(matches!(
             result,
             Err(CompositionError::NamespaceNotFound(_))
@@ -572,17 +503,16 @@ mod tests {
 
     #[test]
     fn list_compositions_in_namespace() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
 
-        let id1 = rt
-            .block_on(store.create(test_ns(), vec![ChunkId([0x01; 32])], 100))
+        let id1 = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
             .unwrap_or_else(|_| unreachable!());
-        let id2 = rt
-            .block_on(store.create(test_ns(), vec![ChunkId([0x02; 32])], 200))
+        let id2 = store
+            .create(test_ns(), vec![ChunkId([0x02; 32])], 200)
             .unwrap_or_else(|_| unreachable!());
-        let id3 = rt
-            .block_on(store.create(test_ns(), vec![ChunkId([0x03; 32])], 300))
+        let id3 = store
+            .create(test_ns(), vec![ChunkId([0x03; 32])], 300)
             .unwrap_or_else(|_| unreachable!());
 
         let listed = store.list_by_namespace(test_ns());
@@ -596,21 +526,20 @@ mod tests {
 
     #[test]
     fn count_tracks_compositions() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let mut store = setup();
         assert_eq!(store.count(), 0);
 
-        rt.block_on(store.create(test_ns(), vec![], 0))
+        store
+            .create(test_ns(), vec![], 0)
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(store.count(), 1);
 
-        let id2 = rt
-            .block_on(store.create(test_ns(), vec![], 0))
+        let id2 = store
+            .create(test_ns(), vec![], 0)
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(store.count(), 2);
 
-        rt.block_on(store.delete(id2))
-            .unwrap_or_else(|_| unreachable!());
+        store.delete(id2).unwrap_or_else(|_| unreachable!());
         assert_eq!(store.count(), 1);
     }
 }

@@ -15,11 +15,11 @@
 
 pub mod composition;
 pub mod error;
-pub(crate) mod log_bridge;
+pub mod log_bridge;
 pub mod multipart;
 pub mod namespace;
 
-pub use composition::{Composition, CompositionOps};
+pub use composition::{composition_hash_key, Composition, CompositionOps};
 pub use error::CompositionError;
 pub use multipart::{MultipartState, MultipartUpload};
 pub use namespace::Namespace;

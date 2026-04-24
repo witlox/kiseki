@@ -1,7 +1,8 @@
-//! End-to-end pipeline test: Composition → Log → View.
+//! End-to-end pipeline test: Composition store operations + log/view plumbing.
 //!
-//! Verifies that composition mutations emit deltas to the log,
-//! and the stream processor advances view watermarks accordingly.
+//! Composition mutations are now sync (in-memory only). Log emission is the
+//! gateway's responsibility. These tests verify the composition store CRUD
+//! works correctly and that the log/view infrastructure functions independently.
 
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ fn test_view() -> ViewId {
     ViewId(uuid::Uuid::from_u128(300))
 }
 
-/// Set up the full pipeline: log store + composition store (with log bridge) + view store.
+/// Set up the full pipeline: log store + composition store + view store.
 fn setup() -> (Arc<MemShardStore>, CompositionStore, ViewStore) {
     let log = Arc::new(MemShardStore::new());
     log.create_shard(
@@ -67,17 +68,32 @@ fn setup() -> (Arc<MemShardStore>, CompositionStore, ViewStore) {
     (log, comp_store, views)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn create_composition_emits_delta_to_log() {
-    let (log, mut comp, _views) = setup();
+#[test]
+fn create_composition_stores_in_memory() {
+    let (_log, mut comp, _views) = setup();
 
-    // Create a composition.
-    let _comp_id = comp
+    // Create a composition — sync, no log emission.
+    let comp_id = comp
         .create(test_namespace(), vec![ChunkId([0x01; 32])], 1024)
-        .await
         .unwrap();
 
-    // The log should have one delta.
+    // Composition is immediately readable.
+    let c = comp.get(comp_id).unwrap();
+    assert_eq!(c.tenant_id, test_tenant());
+    assert_eq!(c.size, 1024);
+    assert_eq!(c.chunks.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn composition_does_not_emit_deltas_to_log() {
+    // Composition is now sync — it does NOT write to the log.
+    // Log emission is the gateway's responsibility.
+    let (log, mut comp, _views) = setup();
+
+    let _comp_id = comp
+        .create(test_namespace(), vec![ChunkId([0x01; 32])], 1024)
+        .unwrap();
+
     let deltas = log
         .read_deltas(ReadDeltasRequest {
             shard_id: test_shard(),
@@ -87,62 +103,35 @@ async fn create_composition_emits_delta_to_log() {
         .await
         .unwrap();
 
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].header.sequence, SequenceNumber(1));
-    assert_eq!(
-        deltas[0].header.operation,
-        kiseki_log::delta::OperationType::Create
-    );
-    assert_eq!(deltas[0].header.tenant_id, test_tenant());
+    // Gateway hasn't emitted anything — log is empty.
+    assert_eq!(deltas.len(), 0);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn update_and_delete_emit_deltas() {
-    let (log, mut comp, _views) = setup();
+#[test]
+fn update_and_delete_operate_on_in_memory_store() {
+    let (_log, mut comp, _views) = setup();
 
     let comp_id = comp
         .create(test_namespace(), vec![ChunkId([0x01; 32])], 100)
-        .await
         .unwrap();
 
-    comp.update(comp_id, vec![ChunkId([0x02; 32])], 200)
-        .await
+    let v2 = comp
+        .update(comp_id, vec![ChunkId([0x02; 32])], 200)
         .unwrap();
+    assert_eq!(v2, 2);
 
-    comp.delete(comp_id).await.unwrap();
-
-    let deltas = log
-        .read_deltas(ReadDeltasRequest {
-            shard_id: test_shard(),
-            from: SequenceNumber(1),
-            to: SequenceNumber(100),
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(deltas.len(), 3);
-    assert_eq!(
-        deltas[0].header.operation,
-        kiseki_log::delta::OperationType::Create
-    );
-    assert_eq!(
-        deltas[1].header.operation,
-        kiseki_log::delta::OperationType::Update
-    );
-    assert_eq!(
-        deltas[2].header.operation,
-        kiseki_log::delta::OperationType::Delete
-    );
+    comp.delete(comp_id).unwrap();
+    assert!(comp.get(comp_id).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stream_processor_advances_view_watermark() {
+async fn stream_processor_does_not_advance_without_gateway_deltas() {
+    // Without the gateway emitting deltas, the log stays empty and the
+    // stream processor has nothing to consume.
     let (log, mut comp, mut views) = setup();
 
-    // Write 3 compositions → 3 deltas in the log.
     for i in 0u8..3 {
         comp.create(test_namespace(), vec![ChunkId([i; 32])], u64::from(i) * 100)
-            .await
             .unwrap();
     }
 
@@ -151,53 +140,50 @@ async fn stream_processor_advances_view_watermark() {
     assert_eq!(view.watermark, SequenceNumber(0));
     assert_eq!(view.state, ViewState::Building);
 
-    // Stream processor polls and consumes deltas.
+    // Stream processor polls — log is empty (composition didn't emit).
     let mut sp = TrackedStreamProcessor::new(log.as_ref(), &mut views);
     sp.track(test_view());
     let consumed = sp.poll(1000).await;
 
-    assert_eq!(consumed, 3);
+    assert_eq!(consumed, 0);
 
-    // View watermark should be at 3, state Active.
+    // Watermark stays at 0, view stays Building.
     let view = views.get_view(test_view()).unwrap();
-    assert_eq!(view.watermark, SequenceNumber(3));
-    assert_eq!(view.state, ViewState::Active);
+    assert_eq!(view.watermark, SequenceNumber(0));
+    assert_eq!(view.state, ViewState::Building);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stream_processor_is_idempotent() {
+async fn stream_processor_is_idempotent_on_empty_log() {
     let (log, mut comp, mut views) = setup();
 
     comp.create(test_namespace(), vec![ChunkId([0x01; 32])], 100)
-        .await
         .unwrap();
 
-    // First poll: consumes 1 delta.
+    // Both polls return 0 — composition didn't write to the log.
     let mut sp = TrackedStreamProcessor::new(log.as_ref(), &mut views);
     sp.track(test_view());
-    assert_eq!(sp.poll(1000).await, 1);
+    assert_eq!(sp.poll(1000).await, 0);
 
-    // Second poll: no new deltas.
     let mut sp2 = TrackedStreamProcessor::new(log.as_ref(), &mut views);
     sp2.track(test_view());
     assert_eq!(sp2.poll(2000).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_pipeline_write_through_to_view() {
-    let (log, mut comp, mut views) = setup();
+async fn composition_store_crud_independent_of_log() {
+    let (log, mut comp, _views) = setup();
 
-    // Write data through composition.
+    // Write through composition store.
     let comp_id = comp
         .create(
             test_namespace(),
             vec![ChunkId([0xAA; 32]), ChunkId([0xBB; 32])],
             2048,
         )
-        .await
         .unwrap();
 
-    // Verify delta in log.
+    // Log has no deltas — gateway hasn't emitted anything.
     let deltas = log
         .read_deltas(ReadDeltasRequest {
             shard_id: test_shard(),
@@ -206,19 +192,10 @@ async fn full_pipeline_write_through_to_view() {
         })
         .await
         .unwrap();
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].header.chunk_refs.len(), 2);
+    assert_eq!(deltas.len(), 0);
 
-    // Stream processor advances view.
-    let mut sp = TrackedStreamProcessor::new(log.as_ref(), &mut views);
-    sp.track(test_view());
-    sp.poll(1000).await;
-
-    // View is now Active at watermark 1.
-    let view = views.get_view(test_view()).unwrap();
-    assert_eq!(view.state, ViewState::Active);
-    assert_eq!(view.watermark, SequenceNumber(1));
-
-    // Composition is still readable.
-    let _ = comp.get(comp_id).unwrap();
+    // Composition is still readable from the in-memory store.
+    let c = comp.get(comp_id).unwrap();
+    assert_eq!(c.chunks.len(), 2);
+    assert_eq!(c.size, 2048);
 }

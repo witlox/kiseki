@@ -14,7 +14,7 @@ use kiseki_log::traits::{AppendDeltaRequest, LogOps};
 /// Called by `CompositionStore` after a successful create/update/delete.
 /// The payload is the composition ID serialized as bytes (opaque to
 /// the log per I-L7).
-pub(crate) async fn emit_delta<L: LogOps + ?Sized>(
+pub async fn emit_delta<L: LogOps + ?Sized>(
     log: &L,
     shard_id: ShardId,
     tenant_id: OrgId,
