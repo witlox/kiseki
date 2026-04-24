@@ -33,9 +33,9 @@ pub struct RaftShardStore {
     shards: Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>,
     node_id: u64,
     peers: BTreeMap<u64, String>,
-    /// Dedicated runtime for Raft async operations. Separate from the
-    /// server's main runtime to prevent deadlocks when sync gateway
-    /// code calls into async Raft consensus.
+    /// Dedicated runtime for Raft async operations. Kept separate from
+    /// the server's main runtime so NFS/FUSE threads can call `block_on`
+    /// without nesting, and for Raft RPC server + bootstrap.
     rt: tokio::runtime::Runtime,
     data_dir: Option<PathBuf>,
     inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
