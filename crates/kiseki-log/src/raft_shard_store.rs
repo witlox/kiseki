@@ -112,39 +112,45 @@ impl RaftShardStore {
         let data_dir = self.data_dir.clone();
         let inline_store = self.inline_store.clone();
 
-        let store = self.rt.block_on(async {
-            let store = if bootstrap {
-                OpenRaftLogStore::new(
-                    node_id,
-                    shard_id,
-                    tenant_id,
-                    &peers,
-                    data_dir.as_deref(),
-                    inline_store,
-                )
-                .await
-                .expect("failed to create Raft log store (seed)")
-            } else {
-                OpenRaftLogStore::new_follower(
-                    node_id,
-                    shard_id,
-                    tenant_id,
-                    &peers,
-                    data_dir.as_deref(),
-                    inline_store,
-                )
-                .await
-                .expect("failed to create Raft log store (follower)")
-            };
+        let raft_addr_owned = raft_addr.map(|a| a.to_owned());
+        let handle = self.rt.handle().clone();
+        let store = std::thread::spawn(move || {
+            handle.block_on(async {
+                let store = if bootstrap {
+                    OpenRaftLogStore::new(
+                        node_id,
+                        shard_id,
+                        tenant_id,
+                        &peers,
+                        data_dir.as_deref(),
+                        inline_store,
+                    )
+                    .await
+                    .expect("failed to create Raft log store (seed)")
+                } else {
+                    OpenRaftLogStore::new_follower(
+                        node_id,
+                        shard_id,
+                        tenant_id,
+                        &peers,
+                        data_dir.as_deref(),
+                        inline_store,
+                    )
+                    .await
+                    .expect("failed to create Raft log store (follower)")
+                };
 
-            // Spawn RPC server for this shard's Raft group.
-            if let Some(addr) = raft_addr {
-                std::mem::drop(store.spawn_rpc_server(addr.to_owned()));
-                tracing::info!(shard_id = %shard_id.0, addr, "Raft RPC server started for shard");
-            }
+                // Spawn RPC server for this shard's Raft group.
+                if let Some(addr) = raft_addr_owned {
+                    tracing::info!(shard_id = %shard_id.0, %addr, "Raft RPC server started for shard");
+                    std::mem::drop(store.spawn_rpc_server(addr));
+                }
 
-            Arc::new(store)
-        });
+                Arc::new(store)
+            })
+        })
+        .join()
+        .expect("Raft shard creation thread panicked");
 
         let mut shards = self
             .shards
@@ -166,35 +172,59 @@ impl RaftShardStore {
     }
 }
 
+/// Run a future on the dedicated Raft runtime from any context.
+///
+/// Spawns the work on the Raft runtime via `spawn` and blocks the
+/// current thread waiting for the result via a oneshot channel.
+/// This avoids both:
+/// - "cannot start a runtime from within a runtime" (block_on)
+/// - Worker thread starvation (block_in_place with 32+ concurrent requests)
+fn run_on_raft<F, T>(rt: &tokio::runtime::Runtime, f: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    rt.spawn(async move {
+        let result = f.await;
+        let _ = tx.send(result);
+    });
+    rx.recv()
+        .expect("Raft runtime task dropped without completing")
+}
+
 impl LogOps for RaftShardStore {
     fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(req.shard_id)?;
-        self.rt.block_on(store.append_delta(req))
+        run_on_raft(&self.rt, async move { store.append_delta(req).await })
     }
 
     fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
         let store = self.get_shard(req.shard_id)?;
-        self.rt.block_on(store.read_deltas(req))
+        run_on_raft(&self.rt, async move { store.read_deltas(req).await })
     }
 
     fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
         let store = self.get_shard(shard_id)?;
-        let info = self.rt.block_on(store.shard_health());
+        let info = run_on_raft(&self.rt, async move { store.shard_health().await });
         Ok(info)
     }
 
     fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
         let store = self.get_shard(shard_id)?;
-        self.rt.block_on(store.set_maintenance(enabled))
+        run_on_raft(
+            &self.rt,
+            async move { store.set_maintenance(enabled).await },
+        )
     }
 
     fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(shard_id)?;
-        self.rt.block_on(store.truncate_log())
+        run_on_raft(&self.rt, async move { store.truncate_log().await })
     }
 
     fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         let store = self.get_shard(shard_id)?;
-        self.rt.block_on(store.compact_shard())
+        run_on_raft(&self.rt, async move { store.compact_shard().await })
     }
 }
