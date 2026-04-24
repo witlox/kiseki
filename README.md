@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo-only.png" alt="kiseki" width="200">
+  <img src="logo.png" alt="kiseki" width="200">
 </p>
 
 <p align="center">
