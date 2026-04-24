@@ -26,11 +26,15 @@ GCS_BUCKET="${KISEKI_PERF_BUCKET:-gs://kiseki-perf-results}"
 
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$RESULTS/perf.log"; }
 
-# SSH wrapper: uses OS Login user + key if available, falls back to root.
-SSH_USER=$(gcloud compute os-login describe-profile --format='value(posixAccounts[0].username)' 2>/dev/null || echo root)
+# SSH wrapper: uses OS Login user + key from bench env, falls back to root.
+# The ctrl startup script registers a key via OS Login and stores the
+# username in /etc/kiseki-bench.env as SSH_USER.
+source /etc/kiseki-bench.env 2>/dev/null || true
+SSH_USER="${SSH_USER:-$(gcloud compute os-login describe-profile --format='value(posixAccounts[0].username)' 2>/dev/null || echo root)}"
 SSH_KEY=""
 [ -f /root/.ssh/id_ed25519 ] && SSH_KEY="-i /root/.ssh/id_ed25519"
 node_ssh() { local H=$1; shift; ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $SSH_KEY "$SSH_USER@$H" "$@"; }
+log "SSH: user=$SSH_USER key=${SSH_KEY:-(default)}"
 
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║       Kiseki Cluster Performance Benchmark                   ║"

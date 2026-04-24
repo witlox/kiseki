@@ -49,19 +49,18 @@ FIRST_STORAGE=$(echo "${storage_ips}" | cut -d',' -f1)
 KISEKI_PERF_BUCKET="${perf_bucket}"
 EOF
 
-# Generate SSH key and push to all cluster nodes via instance metadata.
-# Disables OS Login on target instances so raw root SSH works from the
-# perf-suite script without needing gcloud compute ssh wrappers.
+# Register SSH key with OS Login for ctrl→node access.
+# The ctrl service account has roles/compute.osAdminLogin,
+# so this key grants SSH to all project instances.
 if [ ! -f /root/.ssh/id_ed25519 ]; then
   ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 2>/dev/null
 fi
-PUBKEY=$(cat /root/.ssh/id_ed25519.pub)
-ZONE=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone | rev | cut -d/ -f1 | rev)
-for INST in kiseki-hdd-1 kiseki-hdd-2 kiseki-hdd-3 kiseki-fast-1 kiseki-fast-2 kiseki-client-1 kiseki-client-2 kiseki-client-3; do
-  gcloud compute instances add-metadata "$INST" --zone="$ZONE" \
-    --metadata="ssh-keys=root:$PUBKEY,enable-oslogin=FALSE" 2>/dev/null || true
-done
-echo "SSH keys distributed to cluster nodes"
+gcloud compute os-login ssh-keys add --key-file=/root/.ssh/id_ed25519.pub --ttl=30d 2>/dev/null || true
+
+# Store the OS Login username for the perf-suite's node_ssh wrapper.
+OS_USER=$(gcloud compute os-login describe-profile --format='value(posixAccounts[0].username)' 2>/dev/null || echo root)
+echo "SSH_USER=$OS_USER" >> /etc/kiseki-bench.env
+echo "SSH key registered (OS Login user: $OS_USER)"
 
 echo "=== Benchmark controller ready ==="
 echo "Storage nodes: ${storage_ips}"
