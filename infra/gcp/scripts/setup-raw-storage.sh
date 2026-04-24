@@ -101,6 +101,10 @@ Environment=KISEKI_RAFT_ADDR=${node_ip}:${raft_port}
 # Raw device paths for DeviceBackend (comma-separated)
 Environment=KISEKI_RAW_DEVICES=${raw_devices}
 
+# Raft runtime threads — needs to exceed max concurrent writes to avoid
+# blocking on redb I/O in the state machine apply path.
+Environment=KISEKI_RAFT_THREADS=64
+
 Environment=RUST_LOG=info
 
 [Install]
