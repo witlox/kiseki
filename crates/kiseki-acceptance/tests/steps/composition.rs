@@ -42,6 +42,7 @@ async fn then_created(w: &mut KisekiWorld) {
             from: SequenceNumber(1),
             to: SequenceNumber(u64::MAX),
         })
+        .await
         .unwrap();
     // Verify delta matches THIS composition (BA-ADV-8).
     let comp_id_bytes = w.last_composition_id.unwrap().0.as_bytes().to_vec();
@@ -81,6 +82,7 @@ async fn then_gone(w: &mut KisekiWorld) {
                     from: SequenceNumber(1),
                     to: SequenceNumber(u64::MAX),
                 })
+                .await
                 .unwrap_or_default();
             if deltas
                 .iter()
@@ -196,6 +198,7 @@ async fn then_version(w: &mut KisekiWorld, expected: u64) {
                     from: SequenceNumber(1),
                     to: SequenceNumber(u64::MAX),
                 })
+                .await
                 .unwrap_or_default();
             assert!(
                 deltas

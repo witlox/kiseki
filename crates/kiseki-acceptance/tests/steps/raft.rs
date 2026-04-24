@@ -29,7 +29,7 @@ async fn given_shard_raft_group(w: &mut KisekiWorld, shard: String) {
 async fn when_delta_appended(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
     let req = w.make_append_request(shard_id, 0x10);
-    w.log_store.append_delta(req).unwrap();
+    w.log_store.append_delta(req).await.unwrap();
     w.last_error = None;
 }
 
@@ -38,7 +38,7 @@ async fn then_majority_replicated(w: &mut KisekiWorld) {
     // In the MemShardStore, append_delta commits immediately (single-node quorum).
     // Verify the delta was committed by checking the shard health.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "delta should be committed (replicated)"
@@ -64,7 +64,7 @@ async fn when_read_leader(w: &mut KisekiWorld) {
 async fn then_read_after_write(w: &mut KisekiWorld) {
     // Read-after-write consistency on the leader.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     let deltas = w
         .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
@@ -72,6 +72,7 @@ async fn then_read_after_write(w: &mut KisekiWorld) {
             from: kiseki_common::ids::SequenceNumber(1),
             to: health.tip,
         })
+        .await
         .unwrap();
     assert!(
         !deltas.is_empty(),
@@ -88,7 +89,7 @@ async fn then_eventual(w: &mut KisekiWorld) {
     // In the in-memory store, reads always return committed data.
     let sid = w.ensure_shard("shard-alpha");
     // Read succeeds (may or may not include latest delta on follower).
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 // === Leader election ===
@@ -102,7 +103,7 @@ async fn then_new_leader(w: &mut KisekiWorld) {
     // In the in-memory store, the shard remains healthy (simulates election success).
     let sid = w.ensure_shard("shard-alpha");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "shard should survive leader election"
     );
 }
@@ -118,7 +119,7 @@ async fn then_election_time(_w: &mut KisekiWorld) {
 async fn then_deltas_survive(w: &mut KisekiWorld) {
     // I-L1: committed deltas survive leader election.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "committed deltas should survive election"
@@ -142,7 +143,7 @@ async fn then_30_elections(w: &mut KisekiWorld) {
         let name = format!("shard-election-{i}");
         let sid = *w.shard_names.get(&name).unwrap();
         assert!(
-            w.log_store.shard_health(sid).is_ok(),
+            w.log_store.shard_health(sid).await.is_ok(),
             "shard {name} should survive election"
         );
     }
@@ -156,8 +157,8 @@ async fn then_no_interference(w: &mut KisekiWorld) {
     let sid1 = *w.shard_names.get("shard-election-1").unwrap();
     let req0 = w.make_append_request(sid0, 0x10);
     let req1 = w.make_append_request(sid1, 0x20);
-    assert!(w.log_store.append_delta(req0).is_ok());
-    assert!(w.log_store.append_delta(req1).is_ok());
+    assert!(w.log_store.append_delta(req0).await.is_ok());
+    assert!(w.log_store.append_delta(req1).await.is_ok());
 }
 
 // === Quorum ===
@@ -183,7 +184,7 @@ async fn then_writes_resume(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x30);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "writes should resume after recovery"
     );
 }
@@ -192,7 +193,7 @@ async fn then_writes_resume(w: &mut KisekiWorld) {
 async fn then_catches_up(w: &mut KisekiWorld) {
     // Recovery: node-2 replays missed deltas.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     let deltas = w
         .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
@@ -200,6 +201,7 @@ async fn then_catches_up(w: &mut KisekiWorld) {
             from: kiseki_common::ids::SequenceNumber(1),
             to: health.tip,
         })
+        .await
         .unwrap();
     assert!(
         !deltas.is_empty(),
@@ -216,7 +218,7 @@ async fn when_add_member(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     let req = w.make_append_request(sid, 0x40);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "shard should accept writes during membership change"
     );
 }
@@ -225,7 +227,7 @@ async fn when_add_member(w: &mut KisekiWorld, shard: String) {
 async fn then_snapshot(w: &mut KisekiWorld) {
     // New node receives a snapshot. Verify the shard has state to snapshot.
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "shard should have state for snapshot"
@@ -238,7 +240,7 @@ async fn then_new_entries(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x41);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "new entries should be accepted"
     );
 }
@@ -247,7 +249,7 @@ async fn then_new_entries(w: &mut KisekiWorld) {
 async fn when_remove_member(w: &mut KisekiWorld, shard: String) {
     // Membership change: remove node-3.
     let sid = w.ensure_shard(&shard);
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[then("node-3 stops receiving log entries")]
@@ -255,7 +257,7 @@ async fn then_stops(w: &mut KisekiWorld) {
     // After removal, node-3 is no longer a member.
     // The remaining members continue operating.
     let sid = w.ensure_shard("shard-alpha");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[then("the quorum requirement adjusts to 2/3")]
@@ -264,7 +266,7 @@ async fn then_quorum_adjusts(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x42);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "quorum should adjust"
     );
 }
@@ -312,7 +314,7 @@ async fn then_majority_continues(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x50);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "majority should continue operating"
     );
 }
@@ -325,7 +327,7 @@ async fn given_large_shard(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     for i in 0..50u8 {
         let req = w.make_append_request(sid, i + 1);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -337,7 +339,7 @@ async fn then_snapshot_not_replay(w: &mut KisekiWorld) {
     // Snapshot transfer is more efficient than replaying all entries.
     // Verify the shard has entries that would be included in a snapshot.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "shard should have entries for snapshot"
@@ -348,7 +350,7 @@ async fn then_snapshot_not_replay(w: &mut KisekiWorld) {
 async fn then_caught_up(w: &mut KisekiWorld) {
     // After snapshot, the new node is caught up.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert_eq!(health.state, ShardState::Healthy);
 }
 
@@ -362,7 +364,7 @@ async fn when_read_local(_w: &mut KisekiWorld) {}
 async fn then_local_replay(w: &mut KisekiWorld) {
     // After restart, committed entries are replayed from the local store.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     let deltas = w
         .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
@@ -370,6 +372,7 @@ async fn then_local_replay(w: &mut KisekiWorld) {
             from: kiseki_common::ids::SequenceNumber(1),
             to: health.tip,
         })
+        .await
         .unwrap();
     assert!(!deltas.is_empty(), "committed entries should be replayable");
 }
@@ -378,7 +381,10 @@ async fn then_local_replay(w: &mut KisekiWorld) {
 async fn then_fetch_from_leader(w: &mut KisekiWorld) {
     // After local replay, any remaining entries are fetched from the leader.
     let sid = w.ensure_shard("shard-alpha");
-    assert!(w.log_store.shard_health(sid).is_ok(), "should be caught up");
+    assert!(
+        w.log_store.shard_health(sid).await.is_ok(),
+        "should be caught up"
+    );
 }
 
 // === Placement ===
@@ -387,7 +393,7 @@ async fn then_fetch_from_leader(w: &mut KisekiWorld) {
 async fn then_distinct_nodes(w: &mut KisekiWorld, shard: String) {
     // Raft group members are placed on distinct nodes (no co-location).
     let sid = *w.shard_names.get(&shard).unwrap();
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     // In the in-memory store, raft_members has one node.
     // The placement constraint is verified at the cluster scheduler level.
     assert_eq!(health.state, ShardState::Healthy);
@@ -408,7 +414,7 @@ async fn then_rack_spread(w: &mut KisekiWorld) {
     // Verify the shard is healthy (placement was successful).
     let sid = w.ensure_shard("shard-alpha");
     assert_eq!(
-        w.log_store.shard_health(sid).unwrap().state,
+        w.log_store.shard_health(sid).await.unwrap().state,
         ShardState::Healthy
     );
 }
@@ -419,14 +425,14 @@ async fn then_rack_spread(w: &mut KisekiWorld) {
 async fn when_raft_write(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x60);
-    w.log_store.append_delta(req).unwrap();
+    w.log_store.append_delta(req).await.unwrap();
 }
 
 #[then(regex = r"^the write latency is under 500.s \(TCP\) or 100.s \(RDMA\)$")]
 async fn then_latency(w: &mut KisekiWorld) {
     // Latency is a performance metric — verify the write completed successfully.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "write should complete with low latency"
@@ -446,7 +452,7 @@ async fn when_concurrent_writes(w: &mut KisekiWorld) {
         let name = format!("shard-perf-{i}");
         let sid = *w.shard_names.get(&name).unwrap();
         let req = w.make_append_request(sid, (i + 1) as u8);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -456,7 +462,7 @@ async fn then_linear_scale(w: &mut KisekiWorld) {
     for i in 0..10 {
         let name = format!("shard-perf-{i}");
         let sid = *w.shard_names.get(&name).unwrap();
-        let health = w.log_store.shard_health(sid).unwrap();
+        let health = w.log_store.shard_health(sid).await.unwrap();
         assert!(health.delta_count > 0, "shard {name} should have writes");
     }
 }
@@ -476,7 +482,7 @@ async fn given_100_deltas(w: &mut KisekiWorld, shard: String) {
     // Cap at 50 for test speed.
     for i in 0..50u8 {
         let req = w.make_append_request(sid, i + 1);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -506,7 +512,7 @@ async fn given_shard_entries(w: &mut KisekiWorld, shard: String, _k: u32) {
     // Cap at 50 for test speed.
     for i in 0..50u8 {
         let req = w.make_append_request(sid, i + 1);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -530,7 +536,7 @@ async fn when_sequential_writes(w: &mut KisekiWorld, n: u32) {
     let sid = w.ensure_shard("shard-alpha");
     for i in 0..std::cmp::min(n, 50) {
         let req = w.make_append_request(sid, ((i % 254) + 1) as u8);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -538,7 +544,7 @@ async fn when_sequential_writes(w: &mut KisekiWorld, n: u32) {
 async fn when_write_via_leader(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     let req = w.make_append_request(sid, 0x70);
-    match w.log_store.append_delta(req) {
+    match w.log_store.append_delta(req).await {
         Ok(seq) => {
             w.last_sequence = Some(seq);
             w.last_error = None;
@@ -551,7 +557,7 @@ async fn when_write_via_leader(w: &mut KisekiWorld, shard: String) {
 async fn when_write_delta_leader(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     let req = w.make_append_request(sid, 0x71);
-    match w.log_store.append_delta(req) {
+    match w.log_store.append_delta(req).await {
         Ok(seq) => {
             w.last_sequence = Some(seq);
             w.last_error = None;
@@ -564,7 +570,7 @@ async fn when_write_delta_leader(w: &mut KisekiWorld, shard: String) {
 async fn when_write_payload(w: &mut KisekiWorld, _payload: String, shard: String) {
     let sid = w.ensure_shard(&shard);
     let req = w.make_append_request(sid, 0x72);
-    match w.log_store.append_delta(req) {
+    match w.log_store.append_delta(req).await {
         Ok(seq) => {
             w.last_sequence = Some(seq);
             w.last_error = None;
@@ -583,7 +589,7 @@ async fn when_node1_unreachable(w: &mut KisekiWorld, shard: String) {
     // Simulate leader becoming unreachable — new leader elected.
     let sid = w.ensure_shard(&shard);
     // Shard remains in the store — simulates election completing.
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[when("node-1 sends a heartbeat to node-2")]
@@ -596,7 +602,7 @@ async fn when_heartbeat(_w: &mut KisekiWorld) {}
 #[then("the delta is written to node-1's local log")]
 async fn then_delta_local_log(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "delta should be written to node-1's local log"
@@ -607,7 +613,7 @@ async fn then_delta_local_log(w: &mut KisekiWorld) {
 async fn then_replicated_one_follower(w: &mut KisekiWorld) {
     // In-memory store: append is synchronous (replicated on commit).
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(health.delta_count > 0, "delta should be replicated");
 }
 
@@ -625,7 +631,7 @@ async fn then_ack_after_majority(w: &mut KisekiWorld) {
 #[when(regex = r#"^immediately reads from shard "([^"]*)" on node-1 \(leader\)$"#)]
 async fn when_immediate_read_leader(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     let deltas = w
         .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
@@ -633,6 +639,7 @@ async fn when_immediate_read_leader(w: &mut KisekiWorld, shard: String) {
             from: kiseki_common::ids::SequenceNumber(1),
             to: health.tip,
         })
+        .await
         .unwrap();
     w.last_read_data = if deltas.is_empty() {
         None
@@ -655,14 +662,14 @@ async fn then_delta_payload_returned(w: &mut KisekiWorld, _payload: String) {
 async fn when_read_follower_before_repl(w: &mut KisekiWorld) {
     // Follower reads may be stale — in-memory store returns committed data.
     let sid = w.ensure_shard("s1");
-    let _ = w.log_store.shard_health(sid);
+    let _ = w.log_store.shard_health(sid).await;
 }
 
 #[then("the read may not include the latest delta")]
 async fn then_may_not_include(w: &mut KisekiWorld) {
     // Eventual consistency on followers: delta may or may not be present.
     let sid = w.ensure_shard("s1");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 // --- Scenario: Leader failure triggers election ---
@@ -672,7 +679,7 @@ async fn then_election_begins(w: &mut KisekiWorld) {
     // After leader failure, an election starts. Shard remains healthy.
     let sid = w.ensure_shard("s1");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "shard should survive election"
     );
 }
@@ -682,7 +689,7 @@ async fn then_elected_within(w: &mut KisekiWorld) {
     // F-C1: election timeout 300-600ms. In BDD, election completes.
     let sid = w.ensure_shard("s1");
     assert_eq!(
-        w.log_store.shard_health(sid).unwrap().state,
+        w.log_store.shard_health(sid).await.unwrap().state,
         ShardState::Healthy
     );
 }
@@ -692,7 +699,7 @@ async fn then_writes_resume_new_leader(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     let req = w.make_append_request(sid, 0x80);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "writes should resume on the new leader"
     );
 }
@@ -703,13 +710,13 @@ async fn then_writes_resume_new_leader(w: &mut KisekiWorld, shard: String) {
 async fn when_leader_fails_new_elected(w: &mut KisekiWorld) {
     // Simulate leader failure + election. Shard remains healthy.
     let sid = w.ensure_shard("s1");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[then("all 100 committed deltas are present on the new leader")]
 async fn then_100_deltas_present(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "committed deltas should survive election"
@@ -720,7 +727,7 @@ async fn then_100_deltas_present(w: &mut KisekiWorld) {
 async fn then_seq_continuous(w: &mut KisekiWorld) {
     // I-L1: committed deltas survive with continuous sequence numbers.
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     let deltas = w
         .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
@@ -728,6 +735,7 @@ async fn then_seq_continuous(w: &mut KisekiWorld) {
             from: kiseki_common::ids::SequenceNumber(1),
             to: health.tip,
         })
+        .await
         .unwrap();
     // Verify sequence numbers are monotonically increasing.
     for pair in deltas.windows(2) {
@@ -751,7 +759,7 @@ async fn then_30_elections_start(w: &mut KisekiWorld) {
     for i in 0..30 {
         let name = format!("shard-election-{i}");
         if let Some(&sid) = w.shard_names.get(&name) {
-            assert!(w.log_store.shard_health(sid).is_ok());
+            assert!(w.log_store.shard_health(sid).await.is_ok());
         }
     }
 }
@@ -765,10 +773,12 @@ async fn then_no_overlap(w: &mut KisekiWorld) {
     assert!(w
         .log_store
         .append_delta(w.make_append_request(sid0, 0xa0))
+        .await
         .is_ok());
     assert!(w
         .log_store
         .append_delta(w.make_append_request(sid1, 0xa1))
+        .await
         .is_ok());
 }
 
@@ -789,7 +799,7 @@ async fn then_quorum_lost_error(w: &mut KisekiWorld, _shard: String) {
 async fn then_stale_reads_ok(w: &mut KisekiWorld) {
     // Stale reads from old leader may succeed.
     let sid = w.ensure_shard("s1");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 // --- Scenario: Quorum restored ---
@@ -799,7 +809,7 @@ async fn when_node2_comes_back(w: &mut KisekiWorld) {
     w.last_error = None; // Quorum restored.
                          // Ensure shard-alpha exists and is healthy for the shared `then_quorum` step.
     let sid = w.ensure_shard("shard-alpha");
-    let _ = w.log_store.set_maintenance(sid, false);
+    let _ = w.log_store.set_maintenance(sid, false).await;
 }
 
 // "quorum is restored (2 of 3)" step defined in log.rs
@@ -809,7 +819,7 @@ async fn then_writes_to_shard_resume(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     let req = w.make_append_request(sid, 0x81);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "writes should resume after quorum restored"
     );
 }
@@ -817,7 +827,7 @@ async fn then_writes_to_shard_resume(w: &mut KisekiWorld, shard: String) {
 #[then("node-2 catches up via log replay")]
 async fn then_catches_up_replay(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "node-2 should catch up via log replay"
@@ -834,7 +844,7 @@ async fn when_node4_added(w: &mut KisekiWorld) {
     // Write some deltas so snapshot transfer has state.
     for i in 0..3u8 {
         let req = w.make_append_request(sid, 0x82 + i);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -843,7 +853,7 @@ async fn then_begins_new_entries(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     let req = w.make_append_request(sid, 0x83);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "new entries should be accepted"
     );
 }
@@ -851,7 +861,7 @@ async fn then_begins_new_entries(w: &mut KisekiWorld) {
 #[then(regex = r#"^shard "([^"]*)" now has (\d+) members$"#)]
 async fn then_shard_member_count(w: &mut KisekiWorld, shard: String, _n: u32) {
     let sid = *w.shard_names.get(&shard).unwrap();
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 // --- Scenario: Remove replica from shard ---
@@ -859,19 +869,19 @@ async fn then_shard_member_count(w: &mut KisekiWorld, shard: String, _n: u32) {
 #[when("node-4 is removed from the group")]
 async fn when_node4_removed(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[then("node-4 stops receiving log entries")]
 async fn then_node4_stops(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[then(regex = r#"^shard "([^"]*)" returns to (\d+) members$"#)]
 async fn then_shard_returns_members(w: &mut KisekiWorld, shard: String, _n: u32) {
     let sid = *w.shard_names.get(&shard).unwrap();
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[then("quorum requirement adjusts accordingly")]
@@ -879,7 +889,7 @@ async fn then_quorum_adjusts_accordingly(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     let req = w.make_append_request(sid, 0x84);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "quorum should adjust"
     );
 }
@@ -904,7 +914,7 @@ async fn then_tls_encrypted(_w: &mut KisekiWorld) {
 async fn then_majority_elect(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "majority partition should elect a leader"
     );
 }
@@ -925,13 +935,13 @@ async fn then_node3_no_writes(_w: &mut KisekiWorld) {
 async fn when_node4_joins(w: &mut KisekiWorld) {
     // New member joins — receives snapshot.
     let sid = w.ensure_shard("s1");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[then("node-4 receives a snapshot (not 100k individual entries)")]
 async fn then_snapshot_not_100k(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "shard should have entries for snapshot"
@@ -942,7 +952,7 @@ async fn then_snapshot_not_100k(w: &mut KisekiWorld) {
 async fn then_full_state(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     assert_eq!(
-        w.log_store.shard_health(sid).unwrap().state,
+        w.log_store.shard_health(sid).await.unwrap().state,
         ShardState::Healthy
     );
 }
@@ -951,7 +961,7 @@ async fn then_full_state(w: &mut KisekiWorld) {
 async fn then_new_entries_from_snapshot(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     let req = w.make_append_request(sid, 0x85);
-    assert!(w.log_store.append_delta(req).is_ok());
+    assert!(w.log_store.append_delta(req).await.is_ok());
 }
 
 // --- Scenario: Crashed node recovers ---
@@ -964,28 +974,28 @@ async fn when_node2_restarts(w: &mut KisekiWorld) {
     // Write some entries to simulate committed entries the node had.
     for i in 0..5u8 {
         let req = w.make_append_request(sid, 0x90 + i);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
 #[then("it loads its local redb log (entries it already had)")]
 async fn then_loads_local_log(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(health.delta_count > 0, "local log should have entries");
 }
 
 #[then("receives missing entries from the leader")]
 async fn then_receives_missing(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 #[then("catches up without needing a full snapshot")]
 async fn then_catches_up_no_snapshot(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     assert_eq!(
-        w.log_store.shard_health(sid).unwrap().state,
+        w.log_store.shard_health(sid).await.unwrap().state,
         ShardState::Healthy,
         "node should catch up without full snapshot"
     );
@@ -997,7 +1007,7 @@ async fn then_catches_up_no_snapshot(w: &mut KisekiWorld) {
 async fn then_3_on_3_nodes(w: &mut KisekiWorld) {
     // Placement constraint: RF=3 members on distinct nodes.
     let sid = w.ensure_shard("shard-rf3");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     // In-memory store has one raft member; the constraint is verified
     // at the cluster scheduler level.
     assert_eq!(health.state, ShardState::Healthy);
@@ -1007,7 +1017,7 @@ async fn then_3_on_3_nodes(w: &mut KisekiWorld) {
 async fn then_no_colocation(w: &mut KisekiWorld) {
     // Verified by placement scheduler — structural guarantee.
     let sid = w.ensure_shard("shard-rf3");
-    assert!(w.log_store.shard_health(sid).is_ok());
+    assert!(w.log_store.shard_health(sid).await.is_ok());
 }
 
 // --- Scenario: Rack-aware placement ---
@@ -1017,7 +1027,7 @@ async fn then_rack_spread_2(w: &mut KisekiWorld) {
     // Rack-aware placement: at least 2 racks for RF=3.
     let sid = w.ensure_shard("shard-rf3");
     assert_eq!(
-        w.log_store.shard_health(sid).unwrap().state,
+        w.log_store.shard_health(sid).await.unwrap().state,
         ShardState::Healthy,
         "rack-aware placement should produce healthy shard"
     );
@@ -1029,7 +1039,7 @@ async fn then_rack_spread_2(w: &mut KisekiWorld) {
 async fn then_p99_latency(w: &mut KisekiWorld) {
     // Performance: verify writes completed successfully (latency is a perf metric).
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "writes should complete with low latency"
@@ -1044,7 +1054,7 @@ async fn when_10_concurrent(w: &mut KisekiWorld) {
         let name = format!("shard-multi-{i}");
         let sid = *w.shard_names.get(&name).unwrap();
         let req = w.make_append_request(sid, (i + 1) as u8);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -1053,7 +1063,7 @@ async fn then_10x_throughput(w: &mut KisekiWorld) {
     for i in 0..10 {
         let name = format!("shard-multi-{i}");
         let sid = *w.shard_names.get(&name).unwrap();
-        let health = w.log_store.shard_health(sid).unwrap();
+        let health = w.log_store.shard_health(sid).await.unwrap();
         assert!(health.delta_count > 0, "shard {name} should have writes");
     }
 }
@@ -1065,7 +1075,7 @@ async fn then_no_degradation(w: &mut KisekiWorld) {
         let name = format!("shard-multi-{i}");
         let sid = *w.shard_names.get(&name).unwrap();
         assert_eq!(
-            w.log_store.shard_health(sid).unwrap().state,
+            w.log_store.shard_health(sid).await.unwrap().state,
             ShardState::Healthy,
             "shard {name} should not be degraded"
         );

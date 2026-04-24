@@ -176,36 +176,36 @@ async fn given_sp_at_watermark(_w: &mut KisekiWorld, _sp: String, _wm: u64) {
 #[when(regex = r#"^new deltas \[(\d+)\.\.(\d+)\] are available in "(\S+)"$"#)]
 async fn when_new_deltas(w: &mut KisekiWorld, _from: u64, to: u64, shard: String) {
     let sid = w.ensure_shard(&shard);
-    let current = w.log_store.shard_health(sid).unwrap().tip.0;
+    let current = w.log_store.shard_health(sid).await.unwrap().tip.0;
     for i in current..to {
         let req = w.make_append_request(sid, ((i % 254) + 1) as u8);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
 #[then(regex = r#"^"(\S+)" reads deltas (\d+) to (\d+)$"#)]
 async fn then_sp_reads_deltas(w: &mut KisekiWorld, _sp: String, _from: u64, _to: u64) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then("decrypts each delta payload using cached tenant KEK")]
 async fn then_decrypts_delta(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then("applies the mutations to the materialized POSIX directory tree")]
 async fn then_applies_mutations(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then(regex = r#"^advances its watermark to (\d+)$"#)]
 async fn then_advances_watermark(w: &mut KisekiWorld, _wm: u64) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then(regex = r#"^the NFS view reflects state as of sequence (\d+)$"#)]
 async fn then_nfs_view_reflects(w: &mut KisekiWorld, _seq: u64) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 // === Scenario: Stream processor respects staleness bound ===
@@ -218,17 +218,17 @@ async fn when_seconds_elapsed(_w: &mut KisekiWorld, _secs: u64, _wm: u64) {}
 
 #[then(regex = r#"^"(\S+)" MUST consume available deltas to stay within bound$"#)]
 async fn then_must_consume(w: &mut KisekiWorld, _sp: String) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then(regex = r#"^if deltas are available, it advances to at least the delta within (\S+)$"#)]
 async fn then_advances_within(w: &mut KisekiWorld, _bound: String) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then("if no deltas exist in that window, the view is current")]
 async fn then_view_current(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 // === Scenario: POSIX view provides read-your-writes ===
@@ -244,12 +244,12 @@ async fn when_read_through_nfs(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the stream processor applies delta (\d+) before serving the read$"#)]
 async fn then_sp_applies_delta(w: &mut KisekiWorld, _seq: u64) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then("the reader sees the write that was just committed")]
 async fn then_reader_sees_write(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
     for &vid in w.view_ids.values() {
         assert!(
             w.view_store.get_view(vid).is_ok(),
@@ -260,7 +260,7 @@ async fn then_reader_sees_write(w: &mut KisekiWorld) {
 
 #[then("this guarantee holds for reads through the same protocol")]
 async fn then_guarantee_holds(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 // === Scenario: Create a new view ===
@@ -339,12 +339,12 @@ async fn then_sp_spawned(w: &mut KisekiWorld, _sp: String) {
 
 #[then(regex = r#"^it begins consuming from (\S+) at position (\d+)$"#)]
 async fn then_begins_consuming(w: &mut KisekiWorld, _shard: String, _pos: u64) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then("it materializes the view from the beginning of the log")]
 async fn then_materializes_from_beginning(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then("it catches up to the current log tip over time")]
@@ -397,7 +397,7 @@ async fn then_view_can_rebuild(w: &mut KisekiWorld) {
 
 #[then("it re-materializes from the log (position 0)")]
 async fn then_rematerializes(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 // === Scenario: View descriptor version change ===
@@ -417,17 +417,17 @@ async fn then_new_descriptor_version(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^on the next materialization cycle, "(\S+)" detects the new version$"#)]
 async fn then_detects_version(w: &mut KisekiWorld, _sp: String) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then(regex = r#"^it begins materializing new state in "(\S+)"$"#)]
 async fn then_begins_materializing(w: &mut KisekiWorld, _pool: String) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then("it migrates existing materialized data in background")]
 async fn then_migrates_data(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 #[then("reads continue from old materialization until migration completes")]
@@ -734,7 +734,7 @@ async fn when_read_nfs_same(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the NFS view reflects (\d+) \(read-your-writes guarantee\)$"#)]
 async fn then_nfs_reflects_ryw(w: &mut KisekiWorld, _seq: u64) {
-    w.poll_views();
+    w.poll_views().await;
     for &vid in w.view_ids.values() {
         if let Ok(view) = w.view_store.get_view(vid) {
             if view.descriptor.consistency == ConsistencyModel::ReadYourWrites {
@@ -749,7 +749,7 @@ async fn then_nfs_reflects_ryw(w: &mut KisekiWorld, _seq: u64) {
 
 #[then("the reader sees their own write")]
 async fn then_reader_sees_own(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
     for &vid in w.view_ids.values() {
         let view = w.view_store.get_view(vid).expect("view must exist");
         if view.descriptor.consistency == ConsistencyModel::ReadYourWrites {
@@ -782,7 +782,7 @@ async fn then_reads_last_watermark(w: &mut KisekiWorld, _wm: u64) {
 
 #[then(regex = r#"^resumes consuming from position (\d+)$"#)]
 async fn then_resumes_consuming(w: &mut KisekiWorld, _pos: u64) {
-    w.poll_views();
+    w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         assert!(
             w.view_store.get_view(vid).is_ok(),
@@ -793,7 +793,7 @@ async fn then_resumes_consuming(w: &mut KisekiWorld, _pos: u64) {
 
 #[then(regex = r#"^re-materializes deltas \[(\d+)\.\.current\] into the view$"#)]
 async fn then_rematerializes_deltas(w: &mut KisekiWorld, _from: u64) {
-    w.poll_views();
+    w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         let view = w.view_store.get_view(vid).expect("view must exist");
         assert!(
@@ -827,7 +827,7 @@ async fn when_new_deltas_arrive(_w: &mut KisekiWorld) {}
 #[then("the stream processor stalls at its current watermark")]
 async fn then_sp_stalls(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        w.poll_views();
+        w.poll_views().await;
         assert!(
             w.view_store.get_view(vid).is_ok(),
             "view must still exist when SP stalls"
@@ -889,7 +889,7 @@ async fn then_alerts_raised_view_stalled(_w: &mut KisekiWorld) {
 
 #[then("when KMS becomes reachable, the processor resumes and catches up")]
 async fn then_kms_resumes(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         assert!(
             w.view_store.get_view(vid).is_ok(),
@@ -990,7 +990,7 @@ async fn then_stale_warning_header(_w: &mut KisekiWorld) {
 
 #[then("the stream processor continues catching up as fast as possible")]
 async fn then_sp_catching_up(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         assert!(
             w.view_store.get_view(vid).is_ok(),
@@ -1052,7 +1052,7 @@ async fn then_no_new_writes(w: &mut KisekiWorld) {
             .get_view(vid)
             .map(|v| v.watermark)
             .unwrap_or(SequenceNumber(0));
-        w.poll_views();
+        w.poll_views().await;
         let wm_after = w
             .view_store
             .get_view(vid)
@@ -1081,7 +1081,7 @@ async fn when_sp_idle(_w: &mut KisekiWorld) {}
 #[then("it MAY decrypt + cache chunk data for the declared ranges in advance of read requests")]
 async fn then_may_prefetch(w: &mut KisekiWorld) {
     // Prefetch is advisory (MAY). Verify view store is operational.
-    w.poll_views();
+    w.poll_views().await;
     let _ = w.view_store.count();
 }
 
@@ -1090,7 +1090,7 @@ async fn then_must_not_advance_watermark(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
         let view = w.view_store.get_view(vid).expect("view must exist");
         let wm = view.watermark;
-        w.poll_views();
+        w.poll_views().await;
         let view_after = w.view_store.get_view(vid).expect("view must exist");
         assert!(
             view_after.watermark >= wm,
@@ -1405,7 +1405,7 @@ async fn when_sp_no_hints(_w: &mut KisekiWorld) {}
 
 #[then("existing materialization and read paths continue unchanged (I-WA2)")]
 async fn then_materialization_continues(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
     for &vid in w.view_ids.values() {
         assert!(
             w.view_store.get_view(vid).is_ok(),
@@ -1416,7 +1416,7 @@ async fn then_materialization_continues(w: &mut KisekiWorld) {
 
 #[then("any pre-declared prefetch ranges for this workload are abandoned (not retained across disable)")]
 async fn then_prefetch_abandoned(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         assert!(
             w.view_store.get_view(vid).is_ok(),
@@ -1427,7 +1427,7 @@ async fn then_prefetch_abandoned(w: &mut KisekiWorld) {
 
 #[then("correctness of views served to the workload is unaffected")]
 async fn then_correctness_unaffected(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
     for &vid in w.view_ids.values() {
         let view = w.view_store.get_view(vid).expect("view must exist");
         assert!(

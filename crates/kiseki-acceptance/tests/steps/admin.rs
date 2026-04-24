@@ -287,7 +287,7 @@ async fn then_inline_new(w: &mut KisekiWorld, kb: u64) {
     let mut req = w.make_append_request(shard_id, 0x50);
     req.has_inline_data = true;
     req.payload = vec![0xab; (kb * 1024 - 1) as usize]; // just under threshold
-    let result = w.log_store.append_delta(req);
+    let result = w.log_store.append_delta(req).await;
     assert!(result.is_ok(), "inline delta write should succeed");
 }
 
@@ -296,7 +296,7 @@ async fn then_inline_prospective(w: &mut KisekiWorld) {
     // Verify we can still read existing deltas — the threshold change
     // is prospective and doesn't modify already-stored data.
     let shard_id = w.ensure_shard("inline-test-shard");
-    let info = w.log_store.shard_health(shard_id).unwrap();
+    let info = w.log_store.shard_health(shard_id).await.unwrap();
     assert!(
         info.delta_count >= 1,
         "existing deltas should still be present"
@@ -486,7 +486,7 @@ async fn given_shard_near_ceiling(
     for i in 0..std::cmp::min(count_val, 20) {
         let mut req = w.make_append_request(shard_id, (i & 0xFF) as u8);
         req.payload = vec![0xab; 64];
-        let _ = w.log_store.append_delta(req);
+        let _ = w.log_store.append_delta(req).await;
     }
 }
 
@@ -517,7 +517,7 @@ async fn then_split_midpoint(w: &mut KisekiWorld) {
     assert!(w.last_error.is_none(), "split should succeed");
     // Verify the new shard is queryable.
     let new_id = w.last_shard_id.unwrap();
-    let health = w.log_store.shard_health(new_id);
+    let health = w.log_store.shard_health(new_id).await;
     assert!(health.is_ok(), "new shard should be queryable after split");
 }
 
@@ -527,7 +527,7 @@ async fn then_two_shards(w: &mut KisekiWorld) {
     let new_id = w
         .last_shard_id
         .expect("split should have produced a new shard");
-    let new_info = w.log_store.shard_health(new_id).unwrap();
+    let new_info = w.log_store.shard_health(new_id).await.unwrap();
     assert_eq!(new_info.state, ShardState::Healthy);
 }
 
@@ -537,7 +537,7 @@ async fn then_latency_bump(w: &mut KisekiWorld) {
     let new_id = w
         .last_shard_id
         .expect("split should have produced a new shard");
-    let new_info = w.log_store.shard_health(new_id).unwrap();
+    let new_info = w.log_store.shard_health(new_id).await.unwrap();
     // The shard should be in Healthy state (not Splitting), accepting writes.
     assert_eq!(new_info.state, ShardState::Healthy);
 }
@@ -874,7 +874,7 @@ async fn then_skew_visible(w: &mut KisekiWorld) {
 #[when(regex = r#"^the admin requests GetShardHealth for (?:shard )?"([^"]*)"$"#)]
 async fn when_shard_health(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
-    let info = w.log_store.shard_health(shard_id);
+    let info = w.log_store.shard_health(shard_id).await;
     assert!(info.is_ok(), "shard health query should succeed");
 }
 
@@ -883,7 +883,7 @@ async fn then_shard_health_fields(w: &mut KisekiWorld) {
     // Verify ShardInfo has leader, raft_members (replica_count), and all are queryable.
     // Use the most recently created shard.
     for &shard_id in w.shard_names.values() {
-        let info = w.log_store.shard_health(shard_id).unwrap();
+        let info = w.log_store.shard_health(shard_id).await.unwrap();
         assert!(info.leader.is_some(), "leader_node_id must be present");
         assert!(!info.raft_members.is_empty(), "replica_count must be > 0");
         // reachable_count = raft_members.len() in healthy state.
@@ -895,7 +895,7 @@ async fn then_shard_health_fields(w: &mut KisekiWorld) {
 async fn then_commit_lag(w: &mut KisekiWorld) {
     // Commit lag = tip sequence - consumer watermark. Verify tip is queryable.
     for &shard_id in w.shard_names.values() {
-        let info = w.log_store.shard_health(shard_id).unwrap();
+        let info = w.log_store.shard_health(shard_id).await.unwrap();
         // tip.0 represents committed entries; lag is derived from this.
         let _ = info.tip;
         break;
@@ -924,7 +924,7 @@ async fn then_reachable_count(w: &mut KisekiWorld, reachable: u8, total: u8) {
     );
     // Verify shard health is still queryable even in degraded state.
     for &shard_id in w.shard_names.values() {
-        let info = w.log_store.shard_health(shard_id);
+        let info = w.log_store.shard_health(shard_id).await;
         assert!(info.is_ok(), "shard must be queryable even when degraded");
         break;
     }
@@ -1057,7 +1057,7 @@ async fn then_existing_inline(w: &mut KisekiWorld) {
     let mut req = w.make_append_request(shard_id, 0x60);
     req.payload = vec![0xab; 4096]; // 4KB inline
     req.has_inline_data = true;
-    let _ = w.log_store.append_delta(req);
+    let _ = w.log_store.append_delta(req).await;
 
     // Read it back and verify size is unchanged.
     let deltas = w
@@ -1067,6 +1067,7 @@ async fn then_existing_inline(w: &mut KisekiWorld) {
             from: SequenceNumber(0),
             to: SequenceNumber(u64::MAX),
         })
+        .await
         .unwrap();
     assert!(
         deltas.iter().any(|d| d.payload.ciphertext.len() == 4096),
@@ -1081,7 +1082,7 @@ async fn then_new_inline(w: &mut KisekiWorld) {
     let mut req = w.make_append_request(shard_id, 0x61);
     req.payload = vec![0xab; 65536]; // 64KB
     req.has_inline_data = true;
-    let result = w.log_store.append_delta(req);
+    let result = w.log_store.append_delta(req).await;
     assert!(result.is_ok(), "64KB inline delta should be accepted");
 }
 

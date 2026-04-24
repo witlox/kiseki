@@ -95,7 +95,7 @@ async fn then_kek(_w: &mut KisekiWorld) {
 #[then("it is ready to serve reads and writes")]
 async fn then_ready(_w: &mut KisekiWorld) {
     // Verify end-to-end readiness: write through the NFS context path.
-    _w.ensure_gateway_ns();
+    _w.ensure_gateway_ns().await;
     let result = _w.nfs_ctx.write(b"readiness-probe".to_vec());
     assert!(
         result.is_ok(),
@@ -174,7 +174,8 @@ async fn then_resolve(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     fuse.create("data.bin", b"content".to_vec()).unwrap();
     let attr = fuse.lookup("data.bin").unwrap();
@@ -196,7 +197,8 @@ async fn then_fetch(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     let ino = fuse.create("fetch.bin", b"fetched-data".to_vec()).unwrap();
     let data = fuse.read(ino, 0, 1024).unwrap();
@@ -222,7 +224,8 @@ async fn then_no_plaintext(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let plaintext = b"secret-data-must-not-leak";
     let resp = gw
         .write(WriteRequest {
@@ -230,6 +233,7 @@ async fn then_no_plaintext(_w: &mut KisekiWorld) {
             namespace_id: ns,
             data: plaintext.to_vec(),
         })
+        .await
         .unwrap();
     // Read back — the gateway decrypts in-process.
     let read = gw
@@ -240,6 +244,7 @@ async fn then_no_plaintext(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(
         read.data, plaintext,
@@ -418,7 +423,8 @@ async fn then_resolve_cache(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     fuse.create("cached.txt", b"data".to_vec()).unwrap();
     let attr = fuse.lookup("cached.txt").unwrap();
@@ -438,7 +444,8 @@ async fn then_chunk_refs(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     let ino = fuse.create("range.bin", b"abcdefghij".to_vec()).unwrap();
     let data = fuse.read(ino, 2, 4).unwrap();
@@ -456,13 +463,15 @@ async fn then_fetch_encrypted(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let resp = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"encrypted-on-wire".to_vec(),
         })
+        .await
         .unwrap();
     let read = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -472,6 +481,7 @@ async fn then_fetch_encrypted(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(read.data, b"encrypted-on-wire");
 }
@@ -498,7 +508,8 @@ async fn then_decrypt_inprocess(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let plain = b"plaintext-roundtrip-check";
     let wr = gw
         .write(WriteRequest {
@@ -506,6 +517,7 @@ async fn then_decrypt_inprocess(_w: &mut KisekiWorld) {
             namespace_id: ns,
             data: plain.to_vec(),
         })
+        .await
         .unwrap();
     let rd = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -515,6 +527,7 @@ async fn then_decrypt_inprocess(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(rd.data, plain, "decryption must recover original plaintext");
 }
@@ -530,7 +543,8 @@ async fn then_returns_fuse(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     let data = b"returned-via-fuse";
     let ino = fuse.create("fuse_ret.txt", data.to_vec()).unwrap();
@@ -550,13 +564,15 @@ async fn then_no_plaintext_leak(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let resp = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"no-leak-test".to_vec(),
         })
+        .await
         .unwrap();
     let read = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -566,6 +582,7 @@ async fn then_no_plaintext_leak(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(read.data, b"no-leak-test");
 }
@@ -589,7 +606,8 @@ async fn then_ryw(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let data = b"read-your-writes-data";
     let wr = gw
         .write(WriteRequest {
@@ -597,6 +615,7 @@ async fn then_ryw(_w: &mut KisekiWorld) {
             namespace_id: ns,
             data: data.to_vec(),
         })
+        .await
         .unwrap();
     let rd = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -606,6 +625,7 @@ async fn then_ryw(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(rd.data, data, "must see own write immediately after commit");
 }
@@ -624,7 +644,8 @@ async fn then_tracking(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     fuse.create("tracked.txt", b"tracked".to_vec()).unwrap();
     // Immediately visible in local view (no poll/sync needed).
@@ -648,13 +669,15 @@ async fn then_no_fuse_overhead(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let wr = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"native-api".to_vec(),
         })
+        .await
         .unwrap();
     let rd = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -664,6 +687,7 @@ async fn then_no_fuse_overhead(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(rd.data, b"native-api");
 }
@@ -680,13 +704,15 @@ async fn then_lower_latency(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let wr = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"sm".to_vec(),
         })
+        .await
         .unwrap();
     let rd = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -696,6 +722,7 @@ async fn then_lower_latency(_w: &mut KisekiWorld) {
             offset: 0,
             length: 2,
         })
+        .await
         .unwrap();
     assert_eq!(rd.data, b"sm", "small read via native API must succeed");
 }
@@ -711,13 +738,15 @@ async fn then_buffer(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let wr = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"buffer-contents".to_vec(),
         })
+        .await
         .unwrap();
     let rd = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -727,6 +756,7 @@ async fn then_buffer(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert!(!rd.data.is_empty(), "API must return non-empty buffer");
     assert_eq!(rd.data, b"buffer-contents");
@@ -748,7 +778,8 @@ async fn then_write_ack(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     let ino = fuse.create("ack.txt", b"acked".to_vec()).unwrap();
     assert!(ino >= 2, "write must return valid inode (ack)");
@@ -766,7 +797,8 @@ async fn then_plaintext_only_mem(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let secret = b"in-memory-only";
     let wr = gw
         .write(WriteRequest {
@@ -774,6 +806,7 @@ async fn then_plaintext_only_mem(_w: &mut KisekiWorld) {
             namespace_id: ns,
             data: secret.to_vec(),
         })
+        .await
         .unwrap();
     let rd = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -783,6 +816,7 @@ async fn then_plaintext_only_mem(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(rd.data, secret, "only in-process plaintext roundtrip");
 }
@@ -799,13 +833,15 @@ async fn then_encrypted_wire(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let wr = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"wire-encrypted".to_vec(),
         })
+        .await
         .unwrap();
     assert!(
         wr.bytes_written > 0,
@@ -1056,13 +1092,15 @@ async fn then_decrypt_inprocess2(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let wr = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"rdma-decrypt".to_vec(),
         })
+        .await
         .unwrap();
     let rd = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -1072,6 +1110,7 @@ async fn then_decrypt_inprocess2(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(rd.data, b"rdma-decrypt", "in-process decryption must work");
 }
@@ -1100,13 +1139,15 @@ async fn then_pre_encrypted(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let wr = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"pre-encrypted-wire".to_vec(),
         })
+        .await
         .unwrap();
     assert!(wr.bytes_written > 0, "encrypted chunk must be stored");
 }
@@ -1140,13 +1181,15 @@ async fn then_committed_durable(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let wr = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"committed-durable".to_vec(),
         })
+        .await
         .unwrap();
     // Read back — committed write is durable.
     let rd = gw
@@ -1157,6 +1200,7 @@ async fn then_committed_durable(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(rd.data, b"committed-durable");
 }
@@ -1173,7 +1217,8 @@ async fn then_others_unaffected(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let gw = Arc::new(gw);
     {
         // Client 1 writes and is dropped.
@@ -1190,6 +1235,7 @@ async fn then_others_unaffected(_w: &mut KisekiWorld) {
             namespace_id: ns,
             data: b"from-client2".to_vec(),
         })
+        .await
         .unwrap();
     assert!(wr.bytes_written > 0, "other clients must be unaffected");
 }
@@ -1197,7 +1243,7 @@ async fn then_others_unaffected(_w: &mut KisekiWorld) {
 #[then("no cluster-wide impact")]
 async fn then_no_cluster_impact(_w: &mut KisekiWorld) {
     // Gateway remains operational after client crash.
-    _w.ensure_gateway_ns();
+    _w.ensure_gateway_ns().await;
     let result = _w.nfs_ctx.write(b"cluster-ok".to_vec());
     assert!(
         result.is_ok(),
@@ -1237,7 +1283,8 @@ async fn then_eio(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let fuse = KisekiFuse::new(gw, tenant, ns);
     let err = fuse.read(999, 0, 1024).unwrap_err();
     assert!(err > 0, "FUSE must return a POSIX error code");
@@ -1246,7 +1293,7 @@ async fn then_eio(_w: &mut KisekiWorld) {
 #[then("when KMS is reachable again, operations resume")]
 async fn then_ops_resume(_w: &mut KisekiWorld) {
     // After KMS recovery, the gateway can serve reads/writes again.
-    _w.ensure_gateway_ns();
+    _w.ensure_gateway_ns().await;
     let result = _w.nfs_ctx.write(b"resumed".to_vec());
     assert!(
         result.is_ok(),
@@ -1468,13 +1515,15 @@ async fn then_serialized(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let w1 = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"client-a".to_vec(),
         })
+        .await
         .unwrap();
     let w2 = gw
         .write(WriteRequest {
@@ -1482,6 +1531,7 @@ async fn then_serialized(_w: &mut KisekiWorld) {
             namespace_id: ns,
             data: b"client-b".to_vec(),
         })
+        .await
         .unwrap();
     assert_ne!(
         w1.composition_id, w2.composition_id,
@@ -1500,13 +1550,15 @@ async fn then_total_order(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let w1 = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"first".to_vec(),
         })
+        .await
         .unwrap();
     let w2 = gw
         .write(WriteRequest {
@@ -1514,6 +1566,7 @@ async fn then_total_order(_w: &mut KisekiWorld) {
             namespace_id: ns,
             data: b"second".to_vec(),
         })
+        .await
         .unwrap();
     let r1 = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -1523,6 +1576,7 @@ async fn then_total_order(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     let r2 = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -1532,6 +1586,7 @@ async fn then_total_order(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(r1.data, b"first");
     assert_eq!(r2.data, b"second");
@@ -1548,13 +1603,15 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let w1 = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"write-a".to_vec(),
         })
+        .await
         .unwrap();
     let w2 = gw
         .write(WriteRequest {
@@ -1562,6 +1619,7 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
             namespace_id: ns,
             data: b"write-b".to_vec(),
         })
+        .await
         .unwrap();
     // Both must be readable.
     assert!(gw
@@ -1572,6 +1630,7 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .is_ok());
     assert!(gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -1581,6 +1640,7 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .is_ok());
 }
 
@@ -1600,13 +1660,15 @@ async fn then_reads_ok(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let wr = gw
         .write(WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"readable".to_vec(),
         })
+        .await
         .unwrap();
     let rd = gw
         .read(kiseki_gateway::ops::ReadRequest {
@@ -1616,6 +1678,7 @@ async fn then_reads_ok(_w: &mut KisekiWorld) {
             offset: 0,
             length: u64::MAX,
         })
+        .await
         .unwrap();
     assert_eq!(rd.data, b"readable");
 }
@@ -1631,12 +1694,15 @@ async fn then_erofs(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: true,
-    });
-    let result = gw.write(WriteRequest {
-        tenant_id: tenant,
-        namespace_id: ns,
-        data: b"should-fail".to_vec(),
-    });
+    })
+    .await;
+    let result = gw
+        .write(WriteRequest {
+            tenant_id: tenant,
+            namespace_id: ns,
+            data: b"should-fail".to_vec(),
+        })
+        .await;
     assert!(result.is_err(), "write to read-only namespace must fail");
 }
 
@@ -1666,7 +1732,7 @@ async fn then_annotated(_w: &mut KisekiWorld) {
 #[then(regex = r#"^operations without a session argument continue to work unchanged.*$"#)]
 async fn then_unchanged(_w: &mut KisekiWorld) {
     // Operations work without a workflow session — verify gateway write with no session.
-    _w.ensure_gateway_ns();
+    _w.ensure_gateway_ns().await;
     let result = _w.nfs_ctx.write(b"no-session".to_vec());
     assert!(
         result.is_ok(),
@@ -1715,7 +1781,8 @@ async fn then_continues_reads(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     let ino = fuse.create("normal.txt", b"normal-read".to_vec()).unwrap();
     let data = fuse.read(ino, 0, 1024).unwrap();
@@ -1733,7 +1800,8 @@ async fn then_channel_unavailable(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     let ino = fuse
         .create("no-advisory.txt", b"still-works".to_vec())
@@ -1849,12 +1917,15 @@ async fn then_quota_enforcement(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: true,
-    });
-    let result = gw.write(WriteRequest {
-        tenant_id: tenant,
-        namespace_id: ns,
-        data: b"over-quota".to_vec(),
-    });
+    })
+    .await;
+    let result = gw
+        .write(WriteRequest {
+            tenant_id: tenant,
+            namespace_id: ns,
+            data: b"over-quota".to_vec(),
+        })
+        .await;
     assert!(result.is_err(), "data path must enforce restrictions");
 }
 
@@ -1884,7 +1955,8 @@ async fn then_fuse_continues(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     let ino = fuse
         .create("advisory-down.txt", b"still-works".to_vec())
@@ -1958,7 +2030,8 @@ async fn then_fuse_correct(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
-    });
+    })
+    .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
     let data = b"correct-and-performant";
     let ino = fuse.create("correct.txt", data.to_vec()).unwrap();

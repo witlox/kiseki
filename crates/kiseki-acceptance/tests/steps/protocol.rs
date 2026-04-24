@@ -159,7 +159,7 @@ async fn then_badhandle(w: &mut KisekiWorld) {
 #[given(regex = r#"^a file "([^"]*)" was created via NFS CREATE$"#)]
 async fn given_file_created(w: &mut KisekiWorld, name: String) {
     w.ensure_namespace("default", "shard-bootstrap");
-    let resp = w.gateway_write("default", name.as_bytes()).unwrap();
+    let resp = w.gateway_write("default", name.as_bytes()).await.unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
@@ -195,6 +195,7 @@ async fn given_file_with_content(w: &mut KisekiWorld, name: String, content: Str
     let nfs_tenant = w.nfs_ctx.tenant_id;
     let resp = w
         .gateway_write_as("default", content.as_bytes(), nfs_tenant)
+        .await
         .unwrap();
     w.last_composition_id = Some(resp.composition_id);
     // Also register in NFS directory index so lookup_by_name works.
@@ -245,7 +246,7 @@ async fn then_data_equals(w: &mut KisekiWorld, expected: String) {
             .values()
             .next()
             .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        let resp = w.gateway_read(comp_id, tenant_id, "default").await.unwrap();
         assert_eq!(String::from_utf8_lossy(&resp.data), expected);
     }
 }
@@ -260,7 +261,10 @@ async fn then_eof(w: &mut KisekiWorld, _eof: String) {
 #[given("a file handle from a prior CREATE")]
 async fn given_file_handle(w: &mut KisekiWorld) {
     w.ensure_namespace("default", "shard-bootstrap");
-    let resp = w.gateway_write("default", b"file-handle-test").unwrap();
+    let resp = w
+        .gateway_write("default", b"file-handle-test")
+        .await
+        .unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
@@ -306,8 +310,8 @@ async fn then_handle_follows(w: &mut KisekiWorld) {
 #[given(regex = r#"^files "([^"]*)" and "([^"]*)" were created via NFS CREATE$"#)]
 async fn given_two_files(w: &mut KisekiWorld, a: String, b: String) {
     w.ensure_namespace("default", "shard-bootstrap");
-    let _ = w.gateway_write("default", a.as_bytes());
-    let _ = w.gateway_write("default", b.as_bytes());
+    let _ = w.gateway_write("default", a.as_bytes()).await;
+    let _ = w.gateway_write("default", b.as_bytes()).await;
 }
 
 #[when("the client sends READDIR on the root directory")]
@@ -497,7 +501,7 @@ async fn then_stateid_invalid(w: &mut KisekiWorld) {
 #[given(regex = r#"^a file "([^"]*)" exists in the namespace$"#)]
 async fn given_file_exists(w: &mut KisekiWorld, name: String) {
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", name.as_bytes()).unwrap();
+    let resp = w.gateway_write("default", name.as_bytes()).await.unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
@@ -781,7 +785,7 @@ async fn then_etag_returned(w: &mut KisekiWorld) {
 #[given(regex = r#"^an object "([^"]*)" was uploaded with body "([^"]*)"$"#)]
 async fn given_uploaded(w: &mut KisekiWorld, _key: String, body: String) {
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", body.as_bytes()).unwrap();
+    let resp = w.gateway_write("default", body.as_bytes()).await.unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
@@ -794,7 +798,7 @@ async fn when_get_etag(w: &mut KisekiWorld, _bucket: String) {
 async fn then_body_equals(w: &mut KisekiWorld, expected: String) {
     if let Some(comp_id) = w.last_composition_id {
         let tenant_id = w.gateway_tenant();
-        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        let resp = w.gateway_read(comp_id, tenant_id, "default").await.unwrap();
         assert_eq!(String::from_utf8_lossy(&resp.data), expected);
     }
 }
@@ -803,7 +807,7 @@ async fn then_body_equals(w: &mut KisekiWorld, expected: String) {
 async fn then_content_length(w: &mut KisekiWorld, len: u64) {
     if let Some(comp_id) = w.last_composition_id {
         let tenant_id = w.gateway_tenant();
-        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        let resp = w.gateway_read(comp_id, tenant_id, "default").await.unwrap();
         assert_eq!(resp.data.len() as u64, len);
     }
 }
@@ -844,8 +848,8 @@ async fn when_delete(w: &mut KisekiWorld, _bucket: String) {
 #[given(regex = r#"^objects "([^"]*)" and "([^"]*)" exist in bucket "([^"]*)"$"#)]
 async fn given_objects_in_bucket(w: &mut KisekiWorld, a: String, b: String, _bucket: String) {
     w.ensure_namespace("default", "shard-default");
-    let _ = w.gateway_write("default", a.as_bytes());
-    let _ = w.gateway_write("default", b.as_bytes());
+    let _ = w.gateway_write("default", a.as_bytes()).await;
+    let _ = w.gateway_write("default", b.as_bytes()).await;
 }
 
 #[when(regex = r#"^the client sends GET /([^/]+)\?list-type=2$"#)]
@@ -870,7 +874,7 @@ async fn then_contents(w: &mut KisekiWorld, _a: String, _b: String) {
         .values()
         .next()
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         listing.len() >= 2,
         "expected at least 2 objects, got {}",
@@ -897,7 +901,8 @@ async fn given_empty_bucket(w: &mut KisekiWorld, bucket: String) {
                 .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1))),
             shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
             read_only: false,
-        });
+        })
+        .await;
 }
 
 #[then("Contents is empty")]
@@ -912,7 +917,7 @@ async fn then_empty_contents(w: &mut KisekiWorld) {
         .values()
         .next()
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         listing.is_empty(),
         "expected empty listing, got {} items",
@@ -932,7 +937,7 @@ async fn then_key_count_0(w: &mut KisekiWorld) {
         .values()
         .next()
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert_eq!(listing.len(), 0, "KeyCount should be 0");
 }
 
@@ -941,8 +946,8 @@ async fn then_key_count_0(w: &mut KisekiWorld) {
 #[given(regex = r#"^objects "([^"]*)", "([^"]*)", "([^"]*)" exist$"#)]
 async fn given_three_objects(w: &mut KisekiWorld, a: String, b: String, c: String) {
     w.ensure_namespace("default", "shard-default");
-    let _ = w.gateway_write("default", a.as_bytes());
-    let _ = w.gateway_write("default", b.as_bytes());
+    let _ = w.gateway_write("default", a.as_bytes()).await;
+    let _ = w.gateway_write("default", b.as_bytes()).await;
     let _ = w.gateway_write("default", c.as_bytes());
 }
 
@@ -964,7 +969,7 @@ async fn then_prefix_filter(w: &mut KisekiWorld, _prefix: String) {
         .values()
         .next()
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         !listing.is_empty(),
         "should have objects for prefix filtering"
@@ -1040,7 +1045,7 @@ async fn when_head_for_object(w: &mut KisekiWorld) {
 async fn then_content_length_equals(w: &mut KisekiWorld, len: u64) {
     if let Some(comp_id) = w.last_composition_id {
         let tenant_id = w.gateway_tenant();
-        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        let resp = w.gateway_read(comp_id, tenant_id, "default").await.unwrap();
         assert_eq!(resp.data.len() as u64, len);
     }
 }
@@ -1089,7 +1094,7 @@ async fn then_three_keys(w: &mut KisekiWorld) {
         .get("default")
         .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1)));
     let tenant_id = w.gateway_tenant();
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         listing.len() >= 3,
         "expected 3 objects, got {}",
@@ -1120,7 +1125,8 @@ async fn when_get_bucket(w: &mut KisekiWorld, bucket: String) {
                 .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1))),
             shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
             read_only: false,
-        });
+        })
+        .await;
     w.last_error = None;
 }
 
@@ -1136,7 +1142,7 @@ async fn then_object_list_empty(w: &mut KisekiWorld) {
         .values()
         .next()
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         listing.is_empty(),
         "expected empty, got {} items",
@@ -1166,7 +1172,7 @@ async fn then_is_truncated(w: &mut KisekiWorld) {
         .get("default")
         .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1)));
     let tenant_id = w.gateway_tenant();
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         listing.len() > 1,
         "listing should have more objects than max-keys"
@@ -1182,7 +1188,7 @@ async fn then_continuation_token(w: &mut KisekiWorld) {
         .get("default")
         .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1)));
     let tenant_id = w.gateway_tenant();
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         !listing.is_empty(),
         "listing should have items for continuation"
@@ -1199,7 +1205,7 @@ async fn then_only_two_returned(w: &mut KisekiWorld, _a: String, _b: String) {
         .get("default")
         .unwrap_or(&kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1)));
     let tenant_id = w.gateway_tenant();
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     // At least 3 objects exist (data/a, data/b, logs/c). Prefix filter at HTTP layer
     // would return 2. Here we verify the data is stored correctly.
     assert!(
@@ -1259,7 +1265,7 @@ async fn when_read_beyond_eof(w: &mut KisekiWorld) {
 #[when(regex = r#"^the client sends COMPOUND with SEQUENCE \+ WRITE with data "([^"]*)"$"#)]
 async fn when_seq_write_data(w: &mut KisekiWorld, data: String) {
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", data.as_bytes()).unwrap();
+    let resp = w.gateway_write("default", data.as_bytes()).await.unwrap();
     w.last_composition_id = Some(resp.composition_id);
     w.last_error = None;
 }
@@ -1366,7 +1372,7 @@ async fn then_data_matches(w: &mut KisekiWorld) {
             .values()
             .next()
             .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        let resp = w.gateway_read(comp_id, tenant_id, "default").await.unwrap();
         assert!(!resp.data.is_empty());
     }
 }
@@ -1445,14 +1451,17 @@ async fn given_file_compound(w: &mut KisekiWorld) {}
 #[given("a small file exists")]
 async fn given_small_file(w: &mut KisekiWorld) {
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"small-file-data").unwrap();
+    let resp = w
+        .gateway_write("default", b"small-file-data")
+        .await
+        .unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
 #[given(regex = r#"^a file "([^"]*)" exists$"#)]
 async fn given_file_exists_short(w: &mut KisekiWorld, name: String) {
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", name.as_bytes()).unwrap();
+    let resp = w.gateway_write("default", name.as_bytes()).await.unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
@@ -1482,6 +1491,7 @@ async fn given_files_exist(w: &mut KisekiWorld, a: String, b: String) {
         let nfs_tenant = w.nfs_ctx.tenant_id;
         let resp = w
             .gateway_write_as("default", name.as_bytes(), nfs_tenant)
+            .await
             .unwrap();
         let fh = w.nfs_ctx.handles.file_handle(
             w.nfs_ctx.namespace_id,
@@ -1523,7 +1533,10 @@ async fn when_seq_session(w: &mut KisekiWorld) {
 #[when("the client sends COMPOUND with WRITE + GETFH")]
 async fn when_write_getfh(w: &mut KisekiWorld) {
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"nfs4-write-getfh").unwrap();
+    let resp = w
+        .gateway_write("default", b"nfs4-write-getfh")
+        .await
+        .unwrap();
     w.last_composition_id = Some(resp.composition_id);
     w.last_error = None;
 }
@@ -1573,7 +1586,7 @@ async fn given_n_objects(w: &mut KisekiWorld, n: u32, bucket: String) {
 async fn given_object_bytes(w: &mut KisekiWorld, bytes: u64) {
     w.ensure_namespace("default", "shard-default");
     let data = vec![0xab; bytes as usize];
-    let resp = w.gateway_write("default", &data).unwrap();
+    let resp = w.gateway_write("default", &data).await.unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
@@ -1593,7 +1606,8 @@ async fn given_bucket_no_objects(w: &mut KisekiWorld, bucket: String) {
                 .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1))),
             shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
             read_only: false,
-        });
+        })
+        .await;
 }
 
 // "objects uploaded to bucket" step defined above (line ~975).
@@ -1693,7 +1707,7 @@ async fn when_sre_pool_status(w: &mut KisekiWorld, _pool: String) {
 async fn given_delta_written(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("persist-test");
     let req = w.make_append_request(sid, 0xAA);
-    w.log_store.append_delta(req).unwrap();
+    w.log_store.append_delta(req).await.unwrap();
 }
 
 #[when("the server is restarted")]
@@ -1705,14 +1719,14 @@ async fn when_server_restart(_w: &mut KisekiWorld) {
 #[then("the delta is readable via ReadDeltas")]
 async fn then_delta_readable(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("persist-test");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(health.delta_count > 0, "delta should survive restart");
 }
 
 #[then("the sequence number is preserved")]
 async fn then_seq_preserved(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("persist-test");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "sequence numbers should be preserved"
@@ -1724,21 +1738,21 @@ async fn given_n_deltas(w: &mut KisekiWorld, n: u32, shard: String) {
     let sid = w.ensure_shard(&shard);
     for i in 0..n {
         let req = w.make_append_request(sid, (i & 0xFF) as u8);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
 #[then(regex = r"^all (\d+) deltas are readable$")]
 async fn then_all_readable(w: &mut KisekiWorld, n: u64) {
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert_eq!(health.delta_count, n);
 }
 
 #[then(regex = r"^their order is preserved \(I-L1\)$")]
 async fn then_order_preserved(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(health.delta_count > 0, "deltas should be in order");
 }
 
@@ -1747,13 +1761,13 @@ async fn given_raft_term(w: &mut KisekiWorld, _term: u64) {
     // Ensure a shard exists to hold Raft state.
     let sid = w.ensure_shard("raft-term-test");
     let req = w.make_append_request(sid, 0xBB);
-    w.log_store.append_delta(req).unwrap();
+    w.log_store.append_delta(req).await.unwrap();
 }
 
 #[then(regex = r"^the persisted term is (\d+)$")]
 async fn then_term_persisted(w: &mut KisekiWorld, _term: u64) {
     let sid = w.ensure_shard("raft-term-test");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(health.delta_count > 0, "raft state should be persisted");
 }
 
@@ -1761,7 +1775,7 @@ async fn then_term_persisted(w: &mut KisekiWorld, _term: u64) {
 async fn then_vote_preserved(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("raft-term-test");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "vote state should be preserved"
     );
 }
@@ -1775,14 +1789,14 @@ async fn given_deltas_since_snapshot(w: &mut KisekiWorld) {
     let count = 100u32;
     for i in 0..count {
         let req = w.make_append_request(sid, (i & 0xFF) as u8);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
 #[then("a snapshot is automatically created")]
 async fn then_snapshot_created(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("snapshot-test");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 0,
         "snapshot should capture state machine state"
@@ -1802,7 +1816,7 @@ async fn given_snapshot_at_index(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("snapshot-restore");
     for i in 0..50u8 {
         let req = w.make_append_request(sid, i);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -1812,7 +1826,7 @@ async fn given_additional_entries(w: &mut KisekiWorld, n: u32) {
     let count = std::cmp::min(n, 50);
     for i in 0..count {
         let req = w.make_append_request(sid, (0x50 + (i & 0xFF)) as u8);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -1820,7 +1834,7 @@ async fn given_additional_entries(w: &mut KisekiWorld, n: u32) {
 async fn then_restored_from_snapshot(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("snapshot-restore");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "state machine should be restored"
     );
 }
@@ -1828,7 +1842,7 @@ async fn then_restored_from_snapshot(w: &mut KisekiWorld) {
 #[then(regex = r"^entries [\d,]+-[\d,]+ are replayed$")]
 async fn then_entries_replayed(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("snapshot-restore");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 50,
         "replayed entries should be present"
@@ -1839,7 +1853,7 @@ async fn then_entries_replayed(w: &mut KisekiWorld) {
 async fn then_final_state_matches(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("snapshot-restore");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "final state should match"
     );
 }
@@ -1849,7 +1863,7 @@ async fn given_snapshot_taken(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("snapshot-survive");
     for i in 0..10u8 {
         let req = w.make_append_request(sid, i);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -1857,7 +1871,7 @@ async fn given_snapshot_taken(w: &mut KisekiWorld) {
 async fn then_snapshot_in_redb(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("snapshot-survive");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "snapshot should be available after restart"
     );
 }
@@ -1867,7 +1881,7 @@ async fn then_append_after_snapshot(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("snapshot-survive");
     let req = w.make_append_request(sid, 0xCC);
     assert!(
-        w.log_store.append_delta(req).is_ok(),
+        w.log_store.append_delta(req).await.is_ok(),
         "should append after snapshot"
     );
 }
@@ -1879,6 +1893,7 @@ async fn given_chunk_via_gateway(w: &mut KisekiWorld) {
     w.ensure_namespace("persist-ns", "persist-shard");
     let resp = w
         .gateway_write("persist-ns", b"persistent-chunk-data")
+        .await
         .unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
@@ -1887,7 +1902,10 @@ async fn given_chunk_via_gateway(w: &mut KisekiWorld) {
 async fn then_chunk_readable_gateway(w: &mut KisekiWorld) {
     let comp_id = w.last_composition_id.unwrap();
     let tenant_id = w.gateway_tenant();
-    let resp = w.gateway_read(comp_id, tenant_id, "persist-ns").unwrap();
+    let resp = w
+        .gateway_read(comp_id, tenant_id, "persist-ns")
+        .await
+        .unwrap();
     assert!(!resp.data.is_empty(), "chunk should be readable");
 }
 
@@ -1901,7 +1919,10 @@ async fn then_plaintext_matches(w: &mut KisekiWorld) {
         assert!(!data.is_empty(), "plaintext should not be empty");
     } else if let Some(comp_id) = w.last_composition_id {
         let tenant_id = w.gateway_tenant();
-        let resp = w.gateway_read(comp_id, tenant_id, "persist-ns").unwrap();
+        let resp = w
+            .gateway_read(comp_id, tenant_id, "persist-ns")
+            .await
+            .unwrap();
         assert_eq!(
             resp.data, b"persistent-chunk-data",
             "plaintext should match"
@@ -1928,7 +1949,7 @@ async fn given_n_chunks_in_pool(w: &mut KisekiWorld, n: u32, _pool: String) {
     let count = std::cmp::min(n, 50); // Scale down for test speed.
     for i in 0..count {
         let data = format!("chunk-{i}");
-        let resp = w.gateway_write("pool-test", data.as_bytes()).unwrap();
+        let resp = w.gateway_write("pool-test", data.as_bytes()).await.unwrap();
         w.last_composition_id = Some(resp.composition_id);
     }
 }
@@ -1939,7 +1960,9 @@ async fn then_all_chunks_accessible(w: &mut KisekiWorld, _n: u32) {
     if let Some(comp_id) = w.last_composition_id {
         let tenant_id = w.gateway_tenant();
         assert!(
-            w.gateway_read(comp_id, tenant_id, "pool-test").is_ok(),
+            w.gateway_read(comp_id, tenant_id, "pool-test")
+                .await
+                .is_ok(),
             "chunks should be accessible after restart"
         );
     }
@@ -2023,7 +2046,7 @@ async fn when_server_crashes(_w: &mut KisekiWorld) {
 #[then("the uncommitted delta is not visible")]
 async fn then_uncommitted_not_visible(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("crash-test");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert_eq!(
         health.delta_count, 0,
         "uncommitted delta should not be visible after crash"
@@ -2034,7 +2057,7 @@ async fn then_uncommitted_not_visible(w: &mut KisekiWorld) {
 async fn then_log_consistent(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("crash-test");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "log should be consistent"
     );
 }
@@ -2044,7 +2067,7 @@ async fn given_snapshot_in_progress(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("crash-snapshot");
     for i in 0..5u8 {
         let req = w.make_append_request(sid, i);
-        w.log_store.append_delta(req).unwrap();
+        w.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -2057,7 +2080,7 @@ async fn when_crash_mid_snapshot(_w: &mut KisekiWorld) {
 async fn then_previous_snapshot(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("crash-snapshot");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "previous snapshot should be usable"
     );
 }
@@ -2065,6 +2088,6 @@ async fn then_previous_snapshot(w: &mut KisekiWorld) {
 #[then("no corrupted snapshot data is loaded")]
 async fn then_no_corrupt_snapshot(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("crash-snapshot");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     assert!(health.delta_count > 0, "no corrupted data should be loaded");
 }

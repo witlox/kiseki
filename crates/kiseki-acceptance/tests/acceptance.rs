@@ -217,12 +217,16 @@ impl KisekiWorld {
             ShardConfig::default(),
         );
         // Register the NFS namespace in the gateway's composition store.
-        gateway.add_namespace(Namespace {
-            id: default_ns,
-            tenant_id: default_tenant,
-            shard_id: default_shard,
-            read_only: false,
-        });
+        // Use block_on since World::new() is sync but add_namespace is async.
+        {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime for init");
+            rt.block_on(gateway.add_namespace(Namespace {
+                id: default_ns,
+                tenant_id: default_tenant,
+                shard_id: default_shard,
+                read_only: false,
+            }));
+        }
         let nfs_gw = NfsGateway::new(Arc::clone(&gateway));
         let nfs_ctx = Arc::new(NfsContext::new(nfs_gw, default_tenant, default_ns));
 
@@ -427,7 +431,7 @@ impl KisekiWorld {
     /// Ensure the default gateway namespace is registered with the NFS
     /// context's tenant, so `gateway.write(...)` succeeds without callers
     /// needing to set up namespaces individually.
-    pub fn ensure_gateway_ns(&self) {
+    pub async fn ensure_gateway_ns(&self) {
         let tenant_id = self.nfs_ctx.tenant_id;
         let ns_id = self.nfs_ctx.namespace_id;
         let shard_id = ShardId(uuid::Uuid::from_u128(1));
@@ -438,12 +442,14 @@ impl KisekiWorld {
             kiseki_common::ids::NodeId(1),
             ShardConfig::default(),
         );
-        self.gateway.add_namespace(Namespace {
-            id: ns_id,
-            tenant_id,
-            shard_id,
-            read_only: false,
-        });
+        self.gateway
+            .add_namespace(Namespace {
+                id: ns_id,
+                tenant_id,
+                shard_id,
+                read_only: false,
+            })
+            .await;
     }
 
     /// Make a test timestamp.
@@ -463,13 +469,13 @@ impl KisekiWorld {
     }
 
     /// Run the stream processor to advance all tracked views from the log.
-    pub fn poll_views(&mut self) {
+    pub async fn poll_views(&mut self) {
         use kiseki_view::stream_processor::TrackedStreamProcessor;
         let mut proc = TrackedStreamProcessor::new(self.log_store.as_ref(), &mut self.view_store);
         for &view_id in self.view_ids.values() {
             proc.track(view_id);
         }
-        proc.poll(1000);
+        proc.poll(1000).await;
     }
 
     /// Make a standard append request.
@@ -503,12 +509,13 @@ impl KisekiWorld {
     }
 
     /// Write data through the integrated pipeline (gateway → encrypt → store).
-    pub fn gateway_write(&self, ns_name: &str, data: &[u8]) -> Result<WriteResponse, String> {
+    pub async fn gateway_write(&self, ns_name: &str, data: &[u8]) -> Result<WriteResponse, String> {
         self.gateway_write_as(ns_name, data, self.gateway_tenant())
+            .await
     }
 
     /// Write data through the pipeline with an explicit tenant.
-    pub fn gateway_write_as(
+    pub async fn gateway_write_as(
         &self,
         ns_name: &str,
         data: &[u8],
@@ -527,12 +534,14 @@ impl KisekiWorld {
             kiseki_common::ids::NodeId(1),
             ShardConfig::default(),
         );
-        self.gateway.add_namespace(Namespace {
-            id: ns_id,
-            tenant_id,
-            shard_id,
-            read_only: false,
-        });
+        self.gateway
+            .add_namespace(Namespace {
+                id: ns_id,
+                tenant_id,
+                shard_id,
+                read_only: false,
+            })
+            .await;
 
         self.gateway
             .write(WriteRequest {
@@ -540,11 +549,12 @@ impl KisekiWorld {
                 tenant_id,
                 data: data.to_vec(),
             })
+            .await
             .map_err(|e| e.to_string())
     }
 
     /// Read data through the integrated pipeline (store → decrypt → gateway).
-    pub fn gateway_read(
+    pub async fn gateway_read(
         &self,
         composition_id: CompositionId,
         tenant_id: OrgId,
@@ -562,6 +572,7 @@ impl KisekiWorld {
                 offset: 0,
                 length: u64::MAX,
             })
+            .await
             .map_err(|e| e.to_string())
     }
 }

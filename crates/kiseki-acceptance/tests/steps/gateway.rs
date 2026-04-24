@@ -71,7 +71,10 @@ async fn given_s3_view(w: &mut KisekiWorld, name: String, _wm: u64) {
 async fn given_nfs_read(w: &mut KisekiWorld, _path: String, _offset: u64, _len: String) {
     // Write data through pipeline so there's something to read.
     let ns = w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"nfs-read-test-data").unwrap();
+    let resp = w
+        .gateway_write("default", b"nfs-read-test-data")
+        .await
+        .unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
@@ -83,7 +86,7 @@ async fn when_gw_receives(w: &mut KisekiWorld, _gw: String) {
             .tenant_ids
             .get("org-pharma")
             .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-        match w.gateway_read(comp_id, tenant_id, "default") {
+        match w.gateway_read(comp_id, tenant_id, "default").await {
             Ok(resp) => {
                 w.reads_working = true;
                 w.last_error = None;
@@ -127,7 +130,7 @@ async fn then_returns_plaintext_tls(w: &mut KisekiWorld) {
             .tenant_ids
             .get("org-pharma")
             .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        let resp = w.gateway_read(comp_id, tenant_id, "default").await.unwrap();
         assert_eq!(resp.data, b"nfs-read-test-data", "plaintext roundtrip");
     }
 }
@@ -154,7 +157,7 @@ async fn then_reads_dir_listing(w: &mut KisekiWorld) {
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id);
+    let listing = w.gateway.list(tenant_id, ns_id).await;
     assert!(listing.is_ok());
 }
 
@@ -181,7 +184,7 @@ async fn when_gw_receives_plaintext(_w: &mut KisekiWorld, _gw: String) {}
 async fn then_gateway_steps(w: &mut KisekiWorld) {
     // Full write pipeline: plaintext → encrypt → store → composition.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"nfs-write-data");
+    let resp = w.gateway_write("default", b"nfs-write-data").await;
     assert!(
         resp.is_ok(),
         "gateway write should succeed: {:?}",
@@ -217,7 +220,7 @@ async fn when_gw_receives_data(_w: &mut KisekiWorld, _gw: String) {}
 async fn then_encrypts_for_delta(w: &mut KisekiWorld) {
     // Small file: write through pipeline.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", &[0xab; 256]);
+    let resp = w.gateway_write("default", &[0xab; 256]).await;
     assert!(resp.is_ok());
     w.last_composition_id = Some(resp.unwrap().composition_id);
 }
@@ -246,7 +249,7 @@ async fn then_delta_inline(w: &mut KisekiWorld) {
 async fn given_s3_getobject(w: &mut KisekiWorld, _key: String) {
     // Write data through pipeline first so there's something to GET.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"s3-object-data").unwrap();
+    let resp = w.gateway_write("default", b"s3-object-data").await.unwrap();
     w.last_composition_id = Some(resp.composition_id);
 }
 
@@ -263,7 +266,7 @@ async fn then_decrypts_tenant_system(w: &mut KisekiWorld) {
             .tenant_ids
             .get("org-pharma")
             .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-        let resp = w.gateway_read(comp_id, tenant_id, "default").unwrap();
+        let resp = w.gateway_read(comp_id, tenant_id, "default").await.unwrap();
         assert_eq!(resp.data, b"s3-object-data", "decrypt roundtrip");
     }
 }
@@ -279,7 +282,7 @@ async fn then_returns_s3_tls(w: &mut KisekiWorld) {
 async fn given_s3_list(w: &mut KisekiWorld, _bucket: String, _prefix: String) {
     w.ensure_namespace("default", "shard-default");
     // Write some data so the listing is non-empty.
-    let _ = w.gateway_write("default", b"list-object");
+    let _ = w.gateway_write("default", b"list-object").await;
 }
 
 #[then("it reads the object listing from the S3 view")]
@@ -292,7 +295,7 @@ async fn then_reads_s3_listing(w: &mut KisekiWorld) {
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).unwrap();
+    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         !listing.is_empty(),
         "listing should have at least one object"
@@ -306,7 +309,7 @@ async fn then_returns_matching_keys(w: &mut KisekiWorld) {
 
 #[then("the listing reflects the S3 view's current watermark (bounded-staleness)")]
 async fn then_listing_at_watermark(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
 }
 
 // === Scenario: S3 PutObject ===
@@ -319,7 +322,10 @@ async fn given_s3_putobject(w: &mut KisekiWorld, _key: String, _size: String) {
 #[then("the gateway chunks, computes chunk_ids, writes chunks, commits delta")]
 async fn then_gw_write_pipeline(w: &mut KisekiWorld) {
     // Full write pipeline through gateway.
-    let resp = w.gateway_write("default", b"s3-put-object-body").unwrap();
+    let resp = w
+        .gateway_write("default", b"s3-put-object-body")
+        .await
+        .unwrap();
     w.last_composition_id = Some(resp.composition_id);
     assert!(resp.bytes_written > 0);
 }
@@ -331,7 +337,7 @@ async fn then_s3_200(w: &mut KisekiWorld) {
 
 #[then("the object is visible in the S3 view after the stream processor consumes the delta")]
 async fn then_visible_after_consume(w: &mut KisekiWorld) {
-    w.poll_views();
+    w.poll_views().await;
     assert!(w.last_composition_id.is_some());
 }
 
@@ -352,7 +358,7 @@ async fn then_verifies_durable(w: &mut KisekiWorld) {
     w.ensure_namespace("default", "shard-default");
     for i in 0..3 {
         let data = format!("part-{i}");
-        let resp = w.gateway_write("default", data.as_bytes()).unwrap();
+        let resp = w.gateway_write("default", data.as_bytes()).await.unwrap();
         if i == 2 {
             w.last_composition_id = Some(resp.composition_id);
         }
@@ -449,7 +455,7 @@ async fn when_put_if_none_match(_w: &mut KisekiWorld) {}
 #[then("the write succeeds")]
 async fn then_write_succeeds_gw(w: &mut KisekiWorld) {
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"conditional-write");
+    let resp = w.gateway_write("default", b"conditional-write").await;
     assert!(resp.is_ok(), "conditional write should succeed");
 }
 
@@ -466,7 +472,7 @@ async fn then_412_precondition(w: &mut KisekiWorld) {
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id);
+    let listing = w.gateway.list(tenant_id, ns_id).await;
     assert!(listing.is_ok(), "gateway should be able to check existence");
 }
 
@@ -505,7 +511,7 @@ async fn then_s3_https(_w: &mut KisekiWorld) {
 async fn then_s3_rest_semantics(w: &mut KisekiWorld) {
     // Verify the gateway supports standard S3 operations: write + list + read.
     w.ensure_namespace("s3-test", "shard-default");
-    let resp = w.gateway_write("s3-test", b"s3-semantics-test");
+    let resp = w.gateway_write("s3-test", b"s3-semantics-test").await;
     assert!(resp.is_ok(), "S3 gateway should support standard write");
 }
 
@@ -553,7 +559,7 @@ async fn then_clients_reconnect(w: &mut KisekiWorld) {
     // The log store (durability layer) survives gateway crashes.
     let sid = w.ensure_shard("shard-default");
     assert!(
-        w.log_store.shard_health(sid).is_ok(),
+        w.log_store.shard_health(sid).await.is_ok(),
         "log store survives gateway crash"
     );
 }
@@ -571,7 +577,7 @@ async fn then_no_committed_data_lost(w: &mut KisekiWorld) {
     // Committed data lives in the log store, not the gateway.
     // Verify previously written data is still accessible through the log.
     let sid = w.ensure_shard("shard-default");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     // Log store retains all committed deltas independent of gateway state.
     assert!(health.state == kiseki_log::shard::ShardState::Healthy);
 }
@@ -581,7 +587,7 @@ async fn then_uncommitted_lost(w: &mut KisekiWorld) {
     // Uncommitted writes are in gateway memory only.
     // After crash, only committed deltas survive.
     let sid = w.ensure_shard("shard-default");
-    let health = w.log_store.shard_health(sid).unwrap();
+    let health = w.log_store.shard_health(sid).await.unwrap();
     // Tip reflects only committed deltas.
     assert!(health.tip.0 >= 0);
 }
@@ -632,12 +638,17 @@ async fn then_write_rejected_retriable(_w: &mut KisekiWorld) {
 async fn then_cached_reads_work(w: &mut KisekiWorld) {
     // If data was previously written, reads still work through the pipeline.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"cached-read-data").unwrap();
+    let resp = w
+        .gateway_write("default", b"cached-read-data")
+        .await
+        .unwrap();
     let tenant_id = *w
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let read = w.gateway_read(resp.composition_id, tenant_id, "default");
+    let read = w
+        .gateway_read(resp.composition_id, tenant_id, "default")
+        .await;
     assert!(read.is_ok(), "cached data should be readable");
 }
 
@@ -669,12 +680,14 @@ async fn then_repair_completes(w: &mut KisekiWorld) {
     // Successful repair means the gateway returns data to the client.
     // Verify the pipeline can complete a read.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"repair-data").unwrap();
+    let resp = w.gateway_write("default", b"repair-data").await.unwrap();
     let tenant_id = *w
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let read = w.gateway_read(resp.composition_id, tenant_id, "default");
+    let read = w
+        .gateway_read(resp.composition_id, tenant_id, "default")
+        .await;
     assert!(read.is_ok(), "read should complete after repair");
 }
 
@@ -704,7 +717,7 @@ async fn then_auth_rejected(w: &mut KisekiWorld) {
     // Verify the gateway's tenant isolation via the composition store.
     let wrong_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(999));
     let ns_id = kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(999));
-    let listing = w.gateway.list(wrong_tenant, ns_id);
+    let listing = w.gateway.list(wrong_tenant, ns_id).await;
     // Listing with a wrong tenant/namespace returns empty or error — no data exposed.
     match listing {
         Ok(items) => assert!(items.is_empty(), "wrong tenant should get no data"),
@@ -719,7 +732,7 @@ async fn then_no_data_exposed(w: &mut KisekiWorld, tenant: String) {
     // Verify the gateway doesn't expose data for a different tenant.
     let wrong_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(888));
     let ns_id = kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(888));
-    let listing = w.gateway.list(wrong_tenant, ns_id);
+    let listing = w.gateway.list(wrong_tenant, ns_id).await;
     match listing {
         Ok(items) => assert!(
             items.is_empty(),
@@ -752,7 +765,7 @@ async fn then_annotates_write(w: &mut KisekiWorld) {
     // The write path is annotated with workflow_ref metadata.
     // Verify the gateway can complete a write (annotation is internal).
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"annotated-write");
+    let resp = w.gateway_write("default", b"annotated-write").await;
     assert!(resp.is_ok(), "write should succeed with annotation");
 }
 
@@ -760,7 +773,7 @@ async fn then_annotates_write(w: &mut KisekiWorld) {
 async fn then_ignores_mismatch(w: &mut KisekiWorld) {
     // I-WA1: unknown workflow_ref is silently ignored — data-path unaffected.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"no-advisory-write");
+    let resp = w.gateway_write("default", b"no-advisory-write").await;
     assert!(resp.is_ok(), "write should succeed even with unknown ref");
 }
 
@@ -798,7 +811,7 @@ async fn then_priority_rejected(w: &mut KisekiWorld) {
     // I-WA14: rejected hints don't affect the data path.
     // Verify the gateway still processes writes even after hint rejection.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"after-rejected-hint");
+    let resp = w.gateway_write("default", b"after-rejected-hint").await;
     assert!(resp.is_ok(), "request should proceed despite rejected hint");
 }
 
@@ -840,7 +853,7 @@ async fn then_caller_queue_only(w: &mut KisekiWorld) {
 async fn then_data_path_accepts(w: &mut KisekiWorld) {
     // Backpressure telemetry does not block the data path.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"data-path-continues");
+    let resp = w.gateway_write("default", b"data-path-continues").await;
     assert!(
         resp.is_ok(),
         "data path should accept requests during backpressure"
@@ -905,7 +918,7 @@ async fn then_mounts_without_ref(w: &mut KisekiWorld) {
     // I-WA1, I-WA2: no advisory = normal data path.
     // Verify a gateway without advisory still works.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"no-advisory-mount");
+    let resp = w.gateway_write("default", b"no-advisory-mount").await;
     assert!(
         resp.is_ok(),
         "mounts without workflow_ref should work normally"
@@ -931,7 +944,7 @@ async fn then_ignores_advisory(w: &mut KisekiWorld) {
     // When advisory is disabled, all annotations are ignored.
     // Verify the gateway still processes requests normally.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"advisory-disabled");
+    let resp = w.gateway_write("default", b"advisory-disabled").await;
     assert!(resp.is_ok(), "gateway should work with advisory disabled");
 }
 
@@ -940,12 +953,17 @@ async fn then_default_scheduling(w: &mut KisekiWorld) {
     // Default scheduling = no QoS differentiation.
     // Verify a read-write roundtrip works at baseline.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"default-scheduling").unwrap();
+    let resp = w
+        .gateway_write("default", b"default-scheduling")
+        .await
+        .unwrap();
     let tenant_id = *w
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let read = w.gateway_read(resp.composition_id, tenant_id, "default");
+    let read = w
+        .gateway_read(resp.composition_id, tenant_id, "default")
+        .await;
     assert!(
         read.is_ok(),
         "default scheduling should serve requests correctly"
@@ -957,13 +975,17 @@ async fn then_no_regression(w: &mut KisekiWorld) {
     // I-WA12: disabling advisory causes zero correctness regression.
     // Verify the full write-read pipeline still works.
     w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"no-regression-test").unwrap();
+    let resp = w
+        .gateway_write("default", b"no-regression-test")
+        .await
+        .unwrap();
     let tenant_id = *w
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
     let read = w
         .gateway_read(resp.composition_id, tenant_id, "default")
+        .await
         .unwrap();
     assert_eq!(read.data, b"no-regression-test", "data integrity preserved");
 }
