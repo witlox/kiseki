@@ -11,31 +11,21 @@ export PATH="$$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
 echo "=== Kiseki storage node ${node_id} (${device_class}) ==="
 
-# Install build dependencies
-dnf install -y --allowerasing gcc gcc-c++ openssl-devel cmake make git \
-  unzip iperf3 fio curl bc 2>&1 | tail -3
+# Install runtime dependencies
+dnf install -y --allowerasing openssl-libs unzip iperf3 fio curl bc tar gzip 2>&1 | tail -3
 
-# Install Rust
-if ! command -v rustc &>/dev/null; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable 2>&1 | tail -3
-fi
-source "$HOME/.cargo/env" 2>/dev/null || true
-
-# Install protoc
-if ! command -v protoc &>/dev/null; then
-  curl -sLO https://github.com/protocolbuffers/protobuf/releases/download/v29.5/protoc-29.5-linux-x86_64.zip
-  unzip -o protoc-29.5-linux-x86_64.zip -d /usr/local 2>&1 | tail -1
-fi
-
-# Clone and build kiseki-server (if not already built)
+# Download pre-built release binaries
 if [ ! -f /usr/local/bin/kiseki-server ]; then
-  echo "Building kiseki-server from source..."
-  git clone --depth=1 https://github.com/witlox/kiseki.git /tmp/kiseki 2>&1 | tail -1
-  cd /tmp/kiseki
-  sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml
-  cargo build --release --bin kiseki-server --bin kiseki-admin 2>&1 | tail -3
-  cp target/release/kiseki-server target/release/kiseki-admin /usr/local/bin/
-  echo "Build complete"
+  ARCH=$(uname -m)
+  RELEASE_URL="https://github.com/witlox/kiseki/releases/${release_tag}/download/kiseki-server-$${ARCH}.tar.gz"
+  echo "Downloading kiseki-server ($${ARCH}) from ${release_tag}..."
+  curl -sfL "$RELEASE_URL" -o /tmp/kiseki-server.tar.gz || {
+    echo "ERROR: Failed to download release from $RELEASE_URL"
+    exit 1
+  }
+  tar xzf /tmp/kiseki-server.tar.gz -C /usr/local/bin/
+  chmod +x /usr/local/bin/kiseki-server /usr/local/bin/kiseki-admin
+  echo "Installed kiseki-server and kiseki-admin from release"
 fi
 
 # Create metadata directory (on boot disk — NOT on raw devices)

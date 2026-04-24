@@ -33,7 +33,7 @@ fi
 
 # Download kiseki-admin
 ARCH=$(uname -m)
-wget -q "https://github.com/witlox/kiseki/releases/latest/download/kiseki-server-$${ARCH}.tar.gz" -O /tmp/kiseki-server.tar.gz 2>/dev/null || true
+wget -q "https://github.com/witlox/kiseki/releases/${release_tag}/download/kiseki-server-$${ARCH}.tar.gz" -O /tmp/kiseki-server.tar.gz 2>/dev/null || true
 if [ -f /tmp/kiseki-server.tar.gz ]; then
   tar xzf /tmp/kiseki-server.tar.gz -C /usr/local/bin/ kiseki-admin 2>/dev/null || true
 fi

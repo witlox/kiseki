@@ -2,7 +2,7 @@
 # Setup script for Kiseki performance test client nodes.
 # Runs FUSE mount, NFS mount, and benchmark tools.
 #
-# Variables: storage_ips, cache_dev, client_id
+# Variables: storage_ips, cache_dev, client_id, release_tag
 set -eo pipefail
 
 # GCE metadata runner doesn't set HOME or full PATH — fix it
@@ -11,34 +11,30 @@ export PATH="$$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
 echo "=== Kiseki client ${client_id} setup ==="
 
-# Install dependencies
-dnf install -y --allowerasing nfs-utils fuse3 fuse3-devel fio iperf3 \
-  python3 python3-pip curl wget git gcc gcc-c++ openssl-devel cmake make unzip bc 2>&1 | tail -3
+# Install runtime dependencies
+dnf install -y --allowerasing nfs-utils fuse3 fio iperf3 \
+  python3 python3-pip curl wget unzip bc tar gzip 2>&1 | tail -3
 pip3 install --break-system-packages boto3 awscli 2>/dev/null || true
 
-# Install Rust (for building kiseki-client)
-if ! command -v rustc &>/dev/null; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable 2>&1 | tail -3
-fi
-source "$HOME/.cargo/env" 2>/dev/null || true
-
-# Install protoc
-if ! command -v protoc &>/dev/null; then
-  curl -sLO https://github.com/protocolbuffers/protobuf/releases/download/v29.5/protoc-29.5-linux-x86_64.zip
-  unzip -o protoc-29.5-linux-x86_64.zip -d /usr/local 2>&1 | tail -1
-fi
-
-# Build kiseki-client with FUSE support
+# Download pre-built release binaries
 if [ ! -f /usr/local/bin/kiseki-client ]; then
-  echo "Building kiseki-client..."
-  git clone --depth=1 https://github.com/witlox/kiseki.git /tmp/kiseki 2>&1 | tail -1
-  cd /tmp/kiseki
-  sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml
-  cargo build --release --bin kiseki-client --features fuse -p kiseki-client 2>&1 | tail -3
-  cp target/release/kiseki-client /usr/local/bin/ 2>/dev/null || true
-  # Also build kiseki-admin for diagnostics
-  cargo build --release --bin kiseki-admin 2>&1 | tail -3
-  cp target/release/kiseki-admin /usr/local/bin/ 2>/dev/null || true
+  ARCH=$(uname -m)
+  echo "Downloading kiseki-client ($${ARCH}) from ${release_tag}..."
+  curl -sfL "https://github.com/witlox/kiseki/releases/${release_tag}/download/kiseki-client-$${ARCH}.tar.gz" \
+    -o /tmp/kiseki-client.tar.gz || {
+    echo "ERROR: Failed to download client release"
+    exit 1
+  }
+  tar xzf /tmp/kiseki-client.tar.gz -C /usr/local/bin/
+  chmod +x /usr/local/bin/kiseki-client 2>/dev/null || true
+
+  # Also grab kiseki-admin for diagnostics
+  curl -sfL "https://github.com/witlox/kiseki/releases/${release_tag}/download/kiseki-server-$${ARCH}.tar.gz" \
+    -o /tmp/kiseki-server.tar.gz || true
+  if [ -f /tmp/kiseki-server.tar.gz ]; then
+    tar xzf /tmp/kiseki-server.tar.gz -C /usr/local/bin/ kiseki-admin 2>/dev/null || true
+  fi
+  echo "Installed kiseki-client and kiseki-admin from release"
 fi
 
 # Format cache disk (this one IS a filesystem — for L2 cache)

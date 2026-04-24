@@ -28,6 +28,12 @@ variable "zone" {
   default = "europe-west6-a"
 }
 
+variable "release_tag" {
+  description = "GitHub release tag to download binaries from (e.g. 'latest' or 'tags/v2026.1.42')"
+  type        = string
+  default     = "latest"
+}
+
 # ---------------------------------------------------------------------------
 # Network
 # ---------------------------------------------------------------------------
@@ -131,6 +137,7 @@ resource "google_compute_instance" "hdd" {
     raw_devices  = "/dev/disk/by-id/google-kiseki-hdd-0,/dev/disk/by-id/google-kiseki-hdd-1,/dev/disk/by-id/google-kiseki-hdd-2"
     device_class = "hdd"
     meta_dir     = "/var/lib/kiseki"
+    release_tag  = var.release_tag
   })
 }
 
@@ -200,6 +207,7 @@ resource "google_compute_instance" "fast" {
     raw_devices  = "/dev/nvme0n1,/dev/disk/by-id/google-kiseki-ssd-0,/dev/disk/by-id/google-kiseki-ssd-1"
     device_class = "nvme+ssd"
     meta_dir     = "/var/lib/kiseki"
+    release_tag  = var.release_tag
   })
 }
 
@@ -251,6 +259,7 @@ resource "google_compute_instance" "client" {
     storage_ips = "10.0.0.10,10.0.0.11,10.0.0.12,10.0.0.20,10.0.0.21"
     cache_dev   = "/dev/disk/by-id/google-kiseki-cache"
     client_id   = count.index + 1
+    release_tag = var.release_tag
   })
 }
 
@@ -337,6 +346,7 @@ resource "google_compute_instance" "ctrl" {
     storage_ips = "10.0.0.10,10.0.0.11,10.0.0.12,10.0.0.20,10.0.0.21"
     client_ips  = "10.0.0.30,10.0.0.31,10.0.0.32"
     perf_bucket = "gs://${google_storage_bucket.perf_results.name}"
+    release_tag = var.release_tag
   })
 }
 
