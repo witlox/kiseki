@@ -35,7 +35,7 @@ echo "╚═══════════════════════�
 # Start background metrics collector
 # ---------------------------------------------------------------------------
 log "Starting metrics collector (10s interval)"
-bash "$SCRIPT_DIR/metrics-collector.sh" "$RESULTS" &
+bash "$SCRIPT_DIR/metrics-collector.sh" "$RESULTS" </dev/null >"$RESULTS/collector.log" 2>&1 &
 COLLECTOR_PID=$!
 
 cleanup() {
