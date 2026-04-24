@@ -128,7 +128,6 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             let mut store = kiseki_log::RaftShardStore::new(
                 cfg.node_id,
                 peers,
-                tokio::runtime::Handle::current(),
                 cfg.data_dir.clone(),
             );
             if let Some(ref ss) = small_store {

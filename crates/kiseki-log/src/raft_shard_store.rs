@@ -24,7 +24,12 @@ use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 ///
 /// Holds a map of `ShardId → OpenRaftLogStore`. Each shard has its
 /// own Raft group with independent leader election. The `LogOps`
-/// trait methods bridge sync→async via `tokio::task::block_in_place`.
+/// trait methods bridge sync→async via `block_on` on a **dedicated**
+/// tokio runtime, separate from the server's main runtime.
+///
+/// This avoids deadlocks when the S3/NFS gateway calls `append_delta`
+/// from async context: `block_in_place` + `block_on` on the *same*
+/// runtime would starve worker threads under concurrent load.
 ///
 /// When `data_dir` is set, uses `RedbRaftLogStore` for persistent
 /// Raft state (Phase 12b). When `None`, uses in-memory `MemLogStore`.
@@ -32,7 +37,10 @@ pub struct RaftShardStore {
     shards: Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>,
     node_id: u64,
     peers: BTreeMap<u64, String>,
-    rt: tokio::runtime::Handle,
+    /// Dedicated runtime for Raft async operations. Separate from the
+    /// server's main runtime to prevent deadlocks when sync gateway
+    /// code calls into async Raft consensus.
+    rt: tokio::runtime::Runtime,
     data_dir: Option<PathBuf>,
     inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
 }
@@ -40,15 +48,21 @@ pub struct RaftShardStore {
 impl RaftShardStore {
     /// Create a new (empty) Raft shard store.
     ///
+    /// Spawns a dedicated tokio runtime for Raft async operations.
     /// When `data_dir` is `Some`, Raft log state is persisted to redb
     /// and survives restart. When `None`, uses in-memory log (volatile).
     #[must_use]
     pub fn new(
         node_id: u64,
         peers: BTreeMap<u64, String>,
-        rt: tokio::runtime::Handle,
         data_dir: Option<PathBuf>,
     ) -> Self {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("kiseki-raft")
+            .enable_all()
+            .build()
+            .expect("failed to create Raft runtime");
         Self {
             shards: Mutex::new(HashMap::new()),
             node_id,
@@ -92,44 +106,41 @@ impl RaftShardStore {
     ) {
         let peers = self.peers.clone();
         let node_id = self.node_id;
-        let rt = self.rt.clone();
         let data_dir = self.data_dir.clone();
         let inline_store = self.inline_store.clone();
 
-        let store = tokio::task::block_in_place(|| {
-            rt.block_on(async {
-                let store = if bootstrap {
-                    OpenRaftLogStore::new(
-                        node_id,
-                        shard_id,
-                        tenant_id,
-                        &peers,
-                        data_dir.as_deref(),
-                        inline_store,
-                    )
-                    .await
-                    .expect("failed to create Raft log store (seed)")
-                } else {
-                    OpenRaftLogStore::new_follower(
-                        node_id,
-                        shard_id,
-                        tenant_id,
-                        &peers,
-                        data_dir.as_deref(),
-                        inline_store,
-                    )
-                    .await
-                    .expect("failed to create Raft log store (follower)")
-                };
+        let store = self.rt.block_on(async {
+            let store = if bootstrap {
+                OpenRaftLogStore::new(
+                    node_id,
+                    shard_id,
+                    tenant_id,
+                    &peers,
+                    data_dir.as_deref(),
+                    inline_store,
+                )
+                .await
+                .expect("failed to create Raft log store (seed)")
+            } else {
+                OpenRaftLogStore::new_follower(
+                    node_id,
+                    shard_id,
+                    tenant_id,
+                    &peers,
+                    data_dir.as_deref(),
+                    inline_store,
+                )
+                .await
+                .expect("failed to create Raft log store (follower)")
+            };
 
-                // Spawn RPC server for this shard's Raft group.
-                if let Some(addr) = raft_addr {
-                    std::mem::drop(store.spawn_rpc_server(addr.to_owned()));
-                    tracing::info!(shard_id = %shard_id.0, addr, "Raft RPC server started for shard");
-                }
+            // Spawn RPC server for this shard's Raft group.
+            if let Some(addr) = raft_addr {
+                std::mem::drop(store.spawn_rpc_server(addr.to_owned()));
+                tracing::info!(shard_id = %shard_id.0, addr, "Raft RPC server started for shard");
+            }
 
-                Arc::new(store)
-            })
+            Arc::new(store)
         });
 
         let mut shards = self
@@ -155,32 +166,32 @@ impl RaftShardStore {
 impl LogOps for RaftShardStore {
     fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(req.shard_id)?;
-        tokio::task::block_in_place(|| self.rt.block_on(store.append_delta(req)))
+        self.rt.block_on(store.append_delta(req))
     }
 
     fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
         let store = self.get_shard(req.shard_id)?;
-        tokio::task::block_in_place(|| self.rt.block_on(store.read_deltas(req)))
+        self.rt.block_on(store.read_deltas(req))
     }
 
     fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
         let store = self.get_shard(shard_id)?;
-        let info = tokio::task::block_in_place(|| self.rt.block_on(store.shard_health()));
+        let info = self.rt.block_on(store.shard_health());
         Ok(info)
     }
 
     fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
         let store = self.get_shard(shard_id)?;
-        tokio::task::block_in_place(|| self.rt.block_on(store.set_maintenance(enabled)))
+        self.rt.block_on(store.set_maintenance(enabled))
     }
 
     fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(shard_id)?;
-        tokio::task::block_in_place(|| self.rt.block_on(store.truncate_log()))
+        self.rt.block_on(store.truncate_log())
     }
 
     fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         let store = self.get_shard(shard_id)?;
-        tokio::task::block_in_place(|| self.rt.block_on(store.compact_shard()))
+        self.rt.block_on(store.compact_shard())
     }
 }
