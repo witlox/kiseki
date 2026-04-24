@@ -53,12 +53,19 @@ impl RaftShardStore {
     /// and survives restart. When `None`, uses in-memory log (volatile).
     #[must_use]
     pub fn new(node_id: u64, peers: BTreeMap<u64, String>, data_dir: Option<PathBuf>) -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .thread_name("kiseki-raft")
-            .enable_all()
-            .build()
-            .expect("failed to create Raft runtime");
+        // Build the Raft runtime on a background thread to avoid
+        // "cannot start a runtime from within a runtime" when called
+        // from an async context (e.g., run_main on the server's tokio runtime).
+        let rt = std::thread::spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_name("kiseki-raft")
+                .enable_all()
+                .build()
+                .expect("failed to create Raft runtime")
+        })
+        .join()
+        .expect("Raft runtime thread panicked");
         Self {
             shards: Mutex::new(HashMap::new()),
             node_id,
