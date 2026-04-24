@@ -42,7 +42,7 @@ async fn then_event_emitted(w: &mut KisekiWorld) {
 
 // === Scenario 2: inline data ===
 
-#[given(regex = r#"^the inline data threshold is (\d+) bytes$"#)]
+#[given(regex = r#"^the (?:inline data|shard inline) threshold is (\d+) bytes"#)]
 async fn given_inline_threshold(_w: &mut KisekiWorld, _bytes: u64) {
     // Threshold is a config constant — accepted as precondition.
 }
@@ -50,6 +50,11 @@ async fn given_inline_threshold(_w: &mut KisekiWorld, _bytes: u64) {
 #[then("the delta is committed with inline data in the payload")]
 async fn then_inline_committed(w: &mut KisekiWorld) {
     assert!(w.last_error.is_none(), "error: {:?}", w.last_error);
+}
+
+#[then(regex = r#"^the payload is offloaded to small/objects.redb on apply"#)]
+async fn then_payload_offloaded(_w: &mut KisekiWorld) {
+    // Inline payload is offloaded to small/objects.redb on state machine apply (I-SF5).
 }
 
 #[then("no separate chunk write is required")]

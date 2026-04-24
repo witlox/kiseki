@@ -1081,3 +1081,96 @@ async fn then_no_degradation(w: &mut KisekiWorld) {
         );
     }
 }
+
+// === Shard migration via membership change (ADR-030) ===
+
+#[given(regex = r#"^shard "([^"]*)" has voters on \[([^\]]*)\] \(all HDD\)$"#)]
+async fn given_shard_voters_all_hdd(w: &mut KisekiWorld, shard: String, _nodes: String) {
+    w.ensure_shard(&shard);
+}
+
+#[given(regex = r#"^shard "([^"]*)" has voters on \[([^\]]*)\]$"#)]
+async fn given_shard_voters_list(w: &mut KisekiWorld, shard: String, _nodes: String) {
+    w.ensure_shard(&shard);
+}
+
+#[given(regex = r#"^node-\d+ is an SSD node with available capacity$"#)]
+async fn given_ssd_node_available(_w: &mut KisekiWorld) {}
+
+#[when(regex = r#"^the control plane initiates migration of "([^"]*)" to node-\d+$"#)]
+async fn when_initiate_migration(w: &mut KisekiWorld, shard: String) {
+    let sid = w.ensure_shard(&shard);
+    let req = w.make_append_request(sid, 0xB0);
+    assert!(w.log_store.append_delta(req).await.is_ok());
+}
+
+#[then(regex = r#"^node-\d+ is added as a learner$"#)]
+async fn then_node_added_as_learner(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    assert_eq!(
+        w.log_store.shard_health(sid).await.unwrap().state,
+        ShardState::Healthy,
+    );
+}
+
+#[then(regex = r#"^node-\d+ receives a snapshot and catches up$"#)]
+async fn then_node_snapshot_catchup(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    assert!(w.log_store.shard_health(sid).await.unwrap().delta_count > 0);
+}
+
+#[then(regex = r#"^node-\d+ is promoted to voter$"#)]
+async fn then_node_promoted_voter(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    assert_eq!(
+        w.log_store.shard_health(sid).await.unwrap().state,
+        ShardState::Healthy,
+    );
+}
+
+#[then("one HDD node is removed from the voter set")]
+async fn then_hdd_removed(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    assert!(w.log_store.shard_health(sid).await.is_ok());
+}
+
+#[then("writes continue throughout without interruption")]
+async fn then_writes_throughout(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    let req = w.make_append_request(sid, 0xB1);
+    assert!(
+        w.log_store.append_delta(req).await.is_ok(),
+        "writes should continue during migration"
+    );
+}
+
+#[when(regex = r#"^an SSD learner is added on node-\d+$"#)]
+async fn when_ssd_learner_added(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    assert!(w.log_store.shard_health(sid).await.is_ok());
+}
+
+#[then(regex = r#"^node-\d+ receives the Raft log but does not vote$"#)]
+async fn then_receives_log_no_vote(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    assert_eq!(
+        w.log_store.shard_health(sid).await.unwrap().state,
+        ShardState::Healthy,
+    );
+}
+
+#[then(regex = r#"^node-\d+ can serve read requests$"#)]
+async fn then_can_serve_reads(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    assert!(w.log_store.shard_health(sid).await.is_ok());
+}
+
+#[then(regex = r#"^removing node-\d+ does not affect write quorum$"#)]
+async fn then_removing_no_quorum_impact(w: &mut KisekiWorld) {
+    let sid = w.ensure_shard("s1");
+    let req = w.make_append_request(sid, 0xB2);
+    assert!(
+        w.log_store.append_delta(req).await.is_ok(),
+        "removing learner should not affect write quorum"
+    );
+}

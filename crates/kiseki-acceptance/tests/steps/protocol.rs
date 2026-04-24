@@ -948,7 +948,7 @@ async fn given_three_objects(w: &mut KisekiWorld, a: String, b: String, c: Strin
     w.ensure_namespace("default", "shard-default");
     let _ = w.gateway_write("default", a.as_bytes()).await;
     let _ = w.gateway_write("default", b.as_bytes()).await;
-    let _ = w.gateway_write("default", c.as_bytes());
+    let _ = w.gateway_write("default", c.as_bytes()).await;
 }
 
 #[when(regex = r#"^the client sends GET /([^/]+)\?list-type=2&prefix=data/$"#)]
@@ -1077,9 +1077,9 @@ async fn given_three_uploaded_to_bucket(
     bucket: String,
 ) {
     w.ensure_namespace(&bucket, "shard-default");
-    let _ = w.gateway_write(&bucket, a.as_bytes());
-    let _ = w.gateway_write(&bucket, b.as_bytes());
-    let _ = w.gateway_write(&bucket, c.as_bytes());
+    let _ = w.gateway_write(&bucket, a.as_bytes()).await;
+    let _ = w.gateway_write(&bucket, b.as_bytes()).await;
+    let _ = w.gateway_write(&bucket, c.as_bytes()).await;
 }
 
 #[when(regex = r"^the client sends GET /([^ ]+) \(list objects\)$")]
@@ -1578,7 +1578,7 @@ async fn given_n_objects(w: &mut KisekiWorld, n: u32, bucket: String) {
     w.ensure_namespace(&bucket, "shard-default");
     for i in 0..n {
         let data = format!("object-{i}");
-        let _ = w.gateway_write(&bucket, data.as_bytes());
+        let _ = w.gateway_write(&bucket, data.as_bytes()).await;
     }
 }
 

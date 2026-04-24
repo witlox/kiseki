@@ -130,10 +130,15 @@ async fn given_shard_files(w: &mut KisekiWorld, _shard: String, count: String) {
     w.sf_estimated_files = count.replace(',', "").parse().unwrap_or(0);
 }
 
-#[then(regex = r#"^the raw threshold = .+ = (\d+) bytes$"#)]
-async fn then_raw_threshold(w: &mut KisekiWorld, expected: u64) {
+#[then(regex = r#"^the raw threshold = .+ = (\d+) (bytes|GB)$"#)]
+async fn then_raw_threshold(w: &mut KisekiWorld, expected: u64, unit: String) {
     let raw = (w.sf_min_budget_gb * 1024 * 1024 * 1024) / w.sf_estimated_files.max(1);
-    assert_eq!(raw, expected);
+    let expected_bytes = if unit == "GB" {
+        expected * 1024 * 1024 * 1024
+    } else {
+        expected
+    };
+    assert_eq!(raw, expected_bytes);
 }
 
 #[then(regex = r#"^the shard inline threshold is clamped to (\d+) bytes"#)]
@@ -162,7 +167,14 @@ async fn given_files_written_inline(w: &mut KisekiWorld, count: u64) {
     w.sf_inline_file_count = count;
 }
 
-#[when(regex = r#"^node-\d+'s metadata usage (?:approaches|crosses) (?:soft|hard) limit"#)]
+#[given(regex = r#"^KISEKI_RAFT_INLINE_MBPS = (\d+)$"#)]
+async fn given_raft_inline_mbps(w: &mut KisekiWorld, mbps: u64) {
+    w.sf_raft_inline_mbps = mbps as u32;
+}
+
+#[when(
+    regex = r#"^(?:node-\d+'s )?metadata usage (?:approaches|crosses) (?:\d+% \()?(?:soft|hard) limit"#
+)]
 async fn when_metadata_pressure(w: &mut KisekiWorld) {
     w.sf_capacity_pressure = true;
 }
@@ -620,7 +632,7 @@ async fn then_may_migrate(w: &mut KisekiWorld) {
     assert_eq!(w.sf_backoff_hours, 2);
 }
 
-#[given(regex = r#"^a (\d+)-node cluster"#)]
+#[given(regex = r#"^a (\d+)-node cluster \("#)]
 async fn given_n_node_cluster(w: &mut KisekiWorld, n: u64) {
     w.sf_node_count = n;
 }

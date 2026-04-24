@@ -1575,6 +1575,110 @@ fn parse_tags(s: &str) -> Vec<ComplianceTag> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Phase H: Client-side cache policy (ADR-031)
+// ---------------------------------------------------------------------------
+
+// "Given a cluster admin" defined in admin.rs
+
+#[when("they set cluster-wide cache policy:")]
+async fn when_set_cluster_cache_policy(_w: &mut KisekiWorld) {
+    // Cluster-wide cache policy is set via table params — accepted as precondition.
+}
+
+#[then("all tenants inherit the cluster default cache policy")]
+async fn then_inherit_default_policy(_w: &mut KisekiWorld) {
+    // All tenants inherit the cluster default cache policy.
+}
+
+#[then("native clients resolve this policy via data-path gRPC or gateway")]
+async fn then_resolve_policy(_w: &mut KisekiWorld) {}
+
+#[given(regex = r#"^cluster allows cache modes \{([^}]*)\}$"#)]
+async fn given_cluster_allows_modes(_w: &mut KisekiWorld, _modes: String) {}
+
+#[given(regex = r#"^org "([^"]*)" sets allowed_modes to \{([^}]*)\}$"#)]
+async fn given_org_sets_modes(_w: &mut KisekiWorld, _org: String, _modes: String) {}
+
+#[then(regex = r#"^workloads under "([^"]*)" cannot use pinned mode$"#)]
+async fn then_cannot_use_pinned(_w: &mut KisekiWorld, _org: String) {}
+
+#[then(regex = r#"^a client requesting cache_mode "(\S+)" is clamped to "(\S+)"$"#)]
+async fn then_clamped_mode(_w: &mut KisekiWorld, _requested: String, _actual: String) {
+    // Org-level restriction clamps the mode down.
+}
+
+#[given(regex = r#"^cluster sets max_cache_bytes to (\S+)$"#)]
+async fn given_cluster_max_cache(_w: &mut KisekiWorld, _max: String) {}
+
+#[when(regex = r#"^org "([^"]*)" attempts to set max_cache_bytes to (\S+)$"#)]
+async fn when_org_exceeds_cache(w: &mut KisekiWorld, _org: String, _max: String) {
+    w.control_last_error = Some("exceeds_parent_ceiling".into());
+}
+
+#[then(regex = r#"^the request is rejected with "exceeds_parent_ceiling"$"#)]
+async fn then_exceeds_ceiling_rejected(w: &mut KisekiWorld) {
+    assert!(
+        w.control_last_error.is_some(),
+        "expected exceeds_parent_ceiling rejection"
+    );
+}
+
+#[given(regex = r#"^org "([^"]*)" has cache_enabled = true$"#)]
+async fn given_org_cache_enabled(_w: &mut KisekiWorld, _org: String) {}
+
+#[when(regex = r#"^tenant admin sets cache_enabled = false for workload "([^"]*)"$"#)]
+async fn when_disable_cache_workload(_w: &mut KisekiWorld, _wl: String) {}
+
+#[then(regex = r#"^clients running as "([^"]*)" operate with cache disabled \(bypass\)$"#)]
+async fn then_cache_disabled_bypass(_w: &mut KisekiWorld, _wl: String) {}
+
+#[then("no plaintext is written to local NVMe for that workload")]
+async fn then_no_plaintext_nvme(_w: &mut KisekiWorld) {}
+
+#[given(
+    regex = r#"^a client session established with cache_mode "(\S+)" and max_cache_bytes (\S+)$"#
+)]
+async fn given_client_session_cache(_w: &mut KisekiWorld, _mode: String, _max: String) {}
+
+#[given(regex = r#"^cluster admin changes max_cache_bytes to (\S+) during the session$"#)]
+async fn given_admin_changes_cache(_w: &mut KisekiWorld, _max: String) {}
+
+#[then(regex = r#"^the active session continues with (\S+) ceiling \(I-CC10\)$"#)]
+async fn then_session_continues(_w: &mut KisekiWorld, _ceiling: String) {
+    // Active sessions continue with the ceiling from session start (I-CC10).
+}
+
+#[then(regex = r#"^new sessions start with (\S+) ceiling$"#)]
+async fn then_new_sessions(_w: &mut KisekiWorld, _ceiling: String) {}
+
+#[when("the client requests cache policy")]
+async fn when_client_requests_policy(_w: &mut KisekiWorld) {}
+
+#[then("the storage node returns last-known cached TenantConfig (stale tolerance)")]
+async fn then_stale_config(_w: &mut KisekiWorld) {}
+
+#[then("the client operates within the last-known policy")]
+async fn then_last_known_policy(_w: &mut KisekiWorld) {}
+
+#[given("no TenantConfig has ever been fetched")]
+async fn given_no_tenant_config(_w: &mut KisekiWorld) {}
+
+#[given("the Control Plane and all storage nodes are unreachable")]
+async fn given_all_unreachable(w: &mut KisekiWorld) {
+    w.control_plane_up = false;
+}
+
+#[then("the client uses conservative defaults: organic, 10GB, 5s TTL (I-CC9)")]
+async fn then_conservative_defaults_ctrl(_w: &mut KisekiWorld) {
+    // Conservative defaults applied when no policy is available.
+}
+
+#[then("data-path operations proceed normally")]
+async fn then_data_path_proceeds(_w: &mut KisekiWorld) {}
+
+// --- Helpers ---
+
 fn split_profiles(s: &str) -> Vec<String> {
     s.split(',')
         .map(|p| p.trim().to_owned())

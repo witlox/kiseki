@@ -10,6 +10,7 @@ pub mod auth;
 pub mod block;
 pub mod chunk;
 pub mod client;
+pub mod cluster;
 pub mod composition;
 pub mod control;
 pub mod crypto;
