@@ -8,7 +8,7 @@
 # Test order: lightweight first, S3 concurrent writes last.
 #
 # Run from the benchmark controller node.
-set -eo pipefail
+set -o pipefail
 
 STORAGE_HDD="10.0.0.10 10.0.0.11 10.0.0.12"
 STORAGE_FAST="10.0.0.20 10.0.0.21"
