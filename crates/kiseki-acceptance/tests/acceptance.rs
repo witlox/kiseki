@@ -215,6 +215,8 @@ impl KisekiWorld {
             tenant_id: default_tenant,
             shard_id: default_shard,
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         });
 
         let gateway = Arc::new(InMemoryGateway::new(
@@ -394,6 +396,8 @@ impl KisekiWorld {
             tenant_id,
             shard_id,
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         });
         self.namespace_ids.insert(name.to_owned(), ns_id);
         ns_id
@@ -444,6 +448,8 @@ impl KisekiWorld {
                 tenant_id,
                 shard_id,
                 read_only: false,
+                versioning_enabled: false,
+                compliance_tags: Vec::new(),
             })
             .await;
     }
@@ -536,6 +542,8 @@ impl KisekiWorld {
                 tenant_id,
                 shard_id,
                 read_only: false,
+                versioning_enabled: false,
+                compliance_tags: Vec::new(),
             })
             .await;
 

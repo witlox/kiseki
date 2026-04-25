@@ -404,6 +404,309 @@ mod tests {
         }
     }
 
+    // --- log.feature @unit: "Maintenance mode rejects writes" ---
+
+    #[tokio::test]
+    async fn maintenance_mode_rejects_writes() {
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(100));
+        let node_id = NodeId(1);
+
+        store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
+
+        // Enter maintenance mode.
+        store.set_maintenance(shard_id, true).await.unwrap();
+
+        // Verify shard is in maintenance state.
+        let info = store.shard_health(shard_id).await.unwrap();
+        assert_eq!(info.state, ShardState::Maintenance);
+
+        // AppendDelta should be rejected with MaintenanceMode error.
+        let req = AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation: OperationType::Create,
+            timestamp: test_timestamp(),
+            hashed_key: [0x10u8; 32],
+            chunk_refs: vec![],
+            payload: vec![0xAA; 100],
+            has_inline_data: false,
+        };
+        let result = store.append_delta(req).await;
+        assert!(
+            matches!(result, Err(crate::error::LogError::MaintenanceMode(_))),
+            "writes must be rejected in maintenance mode"
+        );
+
+        // ReadDeltas should continue to work.
+        let read_result = store
+            .read_deltas(crate::traits::ReadDeltasRequest {
+                shard_id,
+                from: SequenceNumber(0),
+                to: SequenceNumber(100),
+            })
+            .await;
+        assert!(
+            read_result.is_ok(),
+            "reads must continue in maintenance mode"
+        );
+
+        // ShardHealth should continue to work.
+        let health_result = store.shard_health(shard_id).await;
+        assert!(
+            health_result.is_ok(),
+            "health queries must continue in maintenance mode"
+        );
+    }
+
+    // --- log.feature @unit: "Exiting maintenance mode resumes writes" ---
+
+    #[tokio::test]
+    async fn exiting_maintenance_resumes_writes() {
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(100));
+        let node_id = NodeId(1);
+
+        store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
+
+        // Enter then exit maintenance mode.
+        store.set_maintenance(shard_id, true).await.unwrap();
+        store.set_maintenance(shard_id, false).await.unwrap();
+
+        // Verify shard is healthy again.
+        let info = store.shard_health(shard_id).await.unwrap();
+        assert_eq!(info.state, ShardState::Healthy);
+
+        // AppendDelta should be accepted again.
+        let req = AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation: OperationType::Create,
+            timestamp: test_timestamp(),
+            hashed_key: [0x10u8; 32],
+            chunk_refs: vec![],
+            payload: vec![0xAA; 100],
+            has_inline_data: false,
+        };
+        let result = store.append_delta(req).await;
+        assert!(
+            result.is_ok(),
+            "writes must resume after maintenance clears"
+        );
+    }
+
+    // --- log.feature @unit: "Stream processor reads delta range" ---
+
+    #[tokio::test]
+    async fn stream_processor_reads_delta_range() {
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(100));
+        let node_id = NodeId(1);
+
+        store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
+
+        // Append 50 deltas (seq 1..=50).
+        for i in 0..50 {
+            let req = AppendDeltaRequest {
+                shard_id,
+                tenant_id,
+                operation: OperationType::Create,
+                timestamp: test_timestamp(),
+                hashed_key: [i as u8; 32],
+                chunk_refs: vec![],
+                payload: vec![0xAA; 64],
+                has_inline_data: false,
+            };
+            store.append_delta(req).await.unwrap();
+        }
+
+        // Read range [40, 50] — simulating a stream processor reading
+        // from position 40 to 50.
+        let deltas = store
+            .read_deltas(crate::traits::ReadDeltasRequest {
+                shard_id,
+                from: SequenceNumber(40),
+                to: SequenceNumber(50),
+            })
+            .await
+            .unwrap();
+
+        // Should receive 11 deltas [40..=50] in order.
+        assert_eq!(deltas.len(), 11);
+        for (i, delta) in deltas.iter().enumerate() {
+            assert_eq!(
+                delta.header.sequence,
+                SequenceNumber(40 + i as u64),
+                "deltas must be in order"
+            );
+            // Each delta includes the full envelope (header + encrypted payload).
+            assert!(
+                !delta.payload.ciphertext.is_empty(),
+                "payload must be present"
+            );
+        }
+    }
+
+    // --- log.feature @unit: "Phase marker { checkpoint } may inform compaction pacing" ---
+    // The log works correctly regardless of advisory state. Phase markers
+    // are MAY heuristics — they never affect delta ordering, durability,
+    // or GC correctness (I-WA1). This test proves compaction works
+    // without any advisory signal.
+
+    #[tokio::test]
+    async fn compaction_works_without_advisory_phase_markers() {
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(100));
+        let node_id = NodeId(1);
+
+        store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
+
+        // Append multiple versions of the same key (simulating checkpoint burst).
+        for i in 0..5 {
+            let req = AppendDeltaRequest {
+                shard_id,
+                tenant_id,
+                operation: if i == 0 {
+                    OperationType::Create
+                } else {
+                    OperationType::Update
+                },
+                timestamp: test_timestamp(),
+                hashed_key: [0xAA; 32], // same key
+                chunk_refs: vec![],
+                payload: vec![0xBB; 100],
+                has_inline_data: false,
+            };
+            store.append_delta(req).await.unwrap();
+        }
+
+        // Compact without any advisory/phase-marker signal.
+        // Compaction MUST honour its configured thresholds regardless of hints (I-L6).
+        let removed = store.compact_shard(shard_id).await.unwrap();
+        assert!(
+            removed > 0,
+            "compaction must remove superseded deltas without advisory"
+        );
+
+        // Delta ordering is preserved after compaction.
+        let remaining = store
+            .read_deltas(crate::traits::ReadDeltasRequest {
+                shard_id,
+                from: SequenceNumber(0),
+                to: SequenceNumber(u64::MAX),
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1, "only latest version should survive");
+    }
+
+    // --- log.feature @unit: "Shard saturation telemetry is caller-scoped" ---
+    // The log produces per-shard metrics. This test verifies that shard
+    // health (the basis for backpressure signals) is available per-shard
+    // and reports the shard's own metrics independently.
+
+    #[tokio::test]
+    async fn shard_health_reports_independent_metrics() {
+        let store = MemShardStore::new();
+        let tenant_a = OrgId(uuid::Uuid::from_u128(100));
+        let _tenant_b = OrgId(uuid::Uuid::from_u128(200));
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        let node_id = NodeId(1);
+
+        store.create_shard(shard_id, tenant_a, node_id, ShardConfig::default());
+
+        // Append deltas from tenant_a.
+        for _ in 0..5 {
+            let req = AppendDeltaRequest {
+                shard_id,
+                tenant_id: tenant_a,
+                operation: OperationType::Create,
+                timestamp: test_timestamp(),
+                hashed_key: [0x10; 32],
+                chunk_refs: vec![],
+                payload: vec![0xAA; 100],
+                has_inline_data: false,
+            };
+            store.append_delta(req).await.unwrap();
+        }
+
+        // Shard health reports metrics for the shard (basis for
+        // caller-scoped telemetry at the gateway level).
+        let info = store.shard_health(shard_id).await.unwrap();
+        assert_eq!(info.delta_count, 5);
+        assert!(info.byte_size > 0);
+
+        // Requesting health for a nonexistent shard returns an error
+        // (same shape — I-WA6).
+        let nonexistent = ShardId(uuid::Uuid::from_u128(999));
+        let result = store.shard_health(nonexistent).await;
+        assert!(
+            result.is_err(),
+            "nonexistent shard must return the same error shape"
+        );
+    }
+
+    // --- log.feature @unit: "Advisory disabled — log serves all tenants normally" ---
+    // When advisory is disabled cluster-wide, all Log operations succeed
+    // with full correctness and durability (I-WA2). No compaction pacing
+    // heuristic uses absent advisory signals.
+
+    #[tokio::test]
+    async fn advisory_disabled_log_operates_normally() {
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(100));
+        let node_id = NodeId(1);
+
+        store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
+
+        // Append deltas — no advisory signals present.
+        for i in 0..10 {
+            let req = AppendDeltaRequest {
+                shard_id,
+                tenant_id,
+                operation: OperationType::Create,
+                timestamp: test_timestamp(),
+                hashed_key: [i as u8; 32],
+                chunk_refs: vec![],
+                payload: vec![0xCC; 50],
+                has_inline_data: false,
+            };
+            store.append_delta(req).await.unwrap();
+        }
+
+        // Read deltas — all 10 present.
+        let deltas = store
+            .read_deltas(crate::traits::ReadDeltasRequest {
+                shard_id,
+                from: SequenceNumber(0),
+                to: SequenceNumber(u64::MAX),
+            })
+            .await
+            .unwrap();
+        assert_eq!(deltas.len(), 10);
+
+        // Compact — works without advisory.
+        let removed = store.compact_shard(shard_id).await.unwrap();
+        // All keys are unique, so nothing is removed.
+        assert_eq!(removed, 0);
+
+        // Truncation works without advisory.
+        store
+            .register_consumer(shard_id, "sp-nfs", SequenceNumber(5))
+            .unwrap();
+        let boundary = store.truncate_log(shard_id).await.unwrap();
+        assert_eq!(boundary, SequenceNumber(5));
+
+        // Shard health is available.
+        let info = store.shard_health(shard_id).await.unwrap();
+        assert_eq!(info.state, ShardState::Healthy);
+    }
+
     /// Inline threshold changes are prospective only (I-L9): the Log layer
     /// (`append_delta`) accepts payloads of any size. Threshold enforcement
     /// happens at the Gateway, not the Log. This test proves that both a
@@ -432,7 +735,10 @@ mod tests {
             payload: payload_4k,
             has_inline_data: true,
         };
-        let seq1 = store.append_delta(req_4k).await.expect("4KB delta should succeed");
+        let seq1 = store
+            .append_delta(req_4k)
+            .await
+            .expect("4KB delta should succeed");
         assert_eq!(seq1, SequenceNumber(1));
 
         // 8 KB payload — above default inline threshold (4096).
@@ -447,7 +753,10 @@ mod tests {
             payload: payload_8k,
             has_inline_data: false,
         };
-        let seq2 = store.append_delta(req_8k).await.expect("8KB delta should succeed");
+        let seq2 = store
+            .append_delta(req_8k)
+            .await
+            .expect("8KB delta should succeed");
         assert_eq!(seq2, SequenceNumber(2));
     }
 }

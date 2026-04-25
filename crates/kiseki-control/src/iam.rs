@@ -127,4 +127,133 @@ impl AccessRequest {
             false
         }
     }
+
+    /// Check whether the requester can access the specified tenant data
+    /// given the current request state.
+    #[must_use]
+    pub fn can_access(&self, tenant_id: &str) -> bool {
+        self.tenant_id == tenant_id && self.is_active()
+    }
+
+    /// Build an audit event descriptor for this request.
+    #[must_use]
+    pub fn audit_event(&self) -> AuditEventDesc {
+        AuditEventDesc {
+            event_type: match self.status {
+                RequestStatus::Pending => "access_request_created",
+                RequestStatus::Approved => "access_request_approved",
+                RequestStatus::Denied => "access_request_denied",
+                RequestStatus::Expired => "access_request_expired",
+            },
+            requester_id: self.requester_id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            scope_target: self.scope_target.clone(),
+        }
+    }
+}
+
+/// Audit event descriptor produced by IAM operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditEventDesc {
+    /// Event type string.
+    pub event_type: &'static str,
+    /// Who requested access.
+    pub requester_id: String,
+    /// Target tenant.
+    pub tenant_id: String,
+    /// Scope target (namespace name, etc.).
+    pub scope_target: String,
+}
+
+/// Check whether `acting_tenant_admin` can access `target_tenant_id`.
+/// Returns `Ok(())` if they match, `Err` otherwise (full tenant isolation).
+pub fn check_tenant_isolation(
+    acting_tenant_id: &str,
+    target_tenant_id: &str,
+) -> Result<(), ControlError> {
+    if acting_tenant_id == target_tenant_id {
+        Ok(())
+    } else {
+        Err(ControlError::Rejected(format!(
+            "tenant {acting_tenant_id} cannot access tenant {target_tenant_id}: full tenant isolation"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_request() -> AccessRequest {
+        AccessRequest::new(
+            "req-1",
+            "admin-ops",
+            "org-pharma",
+            AccessScope::Namespace,
+            "trials",
+            AccessLevel::ReadOnly,
+            4,
+        )
+    }
+
+    #[test]
+    fn cluster_admin_access_requires_approval() {
+        // Scenario: Cluster admin requests access to tenant data - requires approval
+        let req = pending_request();
+        assert_eq!(req.status, RequestStatus::Pending);
+        assert!(
+            !req.can_access("org-pharma"),
+            "pending request must not grant access"
+        );
+        let audit = req.audit_event();
+        assert_eq!(audit.event_type, "access_request_created");
+        assert_eq!(audit.requester_id, "admin-ops");
+        assert_eq!(audit.tenant_id, "org-pharma");
+    }
+
+    #[test]
+    fn approved_access_is_scoped_and_time_limited() {
+        // Scenario: Cluster admin access request approved - scoped and time-limited
+        let mut req = pending_request();
+        req.approve().unwrap();
+        assert_eq!(req.status, RequestStatus::Approved);
+        assert!(req.is_active(), "just-approved request should be active");
+        assert_eq!(req.scope, AccessScope::Namespace);
+        assert_eq!(req.scope_target, "trials");
+        assert_eq!(req.access_level, AccessLevel::ReadOnly);
+        assert_eq!(req.duration_hours, 4);
+        // Can access the right tenant
+        assert!(req.can_access("org-pharma"));
+        // Cannot access a different tenant
+        assert!(!req.can_access("org-biotech"));
+        let audit = req.audit_event();
+        assert_eq!(audit.event_type, "access_request_approved");
+    }
+
+    #[test]
+    fn denied_access_blocks_all_tenant_data() {
+        // Scenario: Cluster admin access request denied
+        let mut req = pending_request();
+        req.deny().unwrap();
+        assert_eq!(req.status, RequestStatus::Denied);
+        assert!(
+            !req.can_access("org-pharma"),
+            "denied request must not grant access"
+        );
+        let audit = req.audit_event();
+        assert_eq!(audit.event_type, "access_request_denied");
+    }
+
+    #[test]
+    fn tenant_admin_cannot_access_other_tenant() {
+        // Scenario: Tenant admin cannot access other tenant's data
+        assert!(check_tenant_isolation("org-pharma", "org-pharma").is_ok());
+        let err = check_tenant_isolation("org-pharma", "org-biotech");
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("tenant isolation"),
+            "error should mention isolation: {msg}"
+        );
+    }
 }

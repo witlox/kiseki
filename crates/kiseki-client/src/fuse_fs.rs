@@ -572,6 +572,8 @@ mod tests {
             tenant_id: test_tenant(),
             shard_id: ShardId(uuid::Uuid::from_u128(1)),
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -728,10 +730,10 @@ mod tests {
     /// at rest (ciphertext != plaintext) and decrypted on read (I-K1, I-K2).
     #[test]
     fn write_encryption_chain_ciphertext_differs_from_plaintext() {
+        use kiseki_common::tenancy::DedupPolicy;
         use kiseki_crypto::aead::Aead;
         use kiseki_crypto::chunk_id::derive_chunk_id;
         use kiseki_crypto::envelope;
-        use kiseki_common::tenancy::DedupPolicy;
 
         let plaintext = b"sensitive HPC payload that must be encrypted at rest";
 
@@ -748,10 +750,8 @@ mod tests {
         // The gateway uses seal_envelope — ciphertext is NOT equal to plaintext.
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
         let aead = Aead::new();
-        let chunk_id =
-            derive_chunk_id(plaintext, DedupPolicy::CrossTenant, None).unwrap();
-        let envelope =
-            envelope::seal_envelope(&aead, &master_key, &chunk_id, plaintext).unwrap();
+        let chunk_id = derive_chunk_id(plaintext, DedupPolicy::CrossTenant, None).unwrap();
+        let envelope = envelope::seal_envelope(&aead, &master_key, &chunk_id, plaintext).unwrap();
 
         assert_ne!(
             envelope.ciphertext, plaintext,

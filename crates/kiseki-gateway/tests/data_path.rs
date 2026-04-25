@@ -24,6 +24,8 @@ fn setup_gateway() -> InMemoryGateway {
         tenant_id: test_tenant(),
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
 
     let chunks = ChunkStore::new();
@@ -169,12 +171,16 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
     compositions.add_namespace(Namespace {
         id: ns2,
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));

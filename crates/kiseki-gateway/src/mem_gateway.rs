@@ -220,6 +220,8 @@ impl InMemoryGateway {
                 tenant_id,
                 shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
                 read_only: false,
+                versioning_enabled: false,
+                compliance_tags: Vec::new(),
             });
         }
         Ok(())
@@ -404,7 +406,7 @@ impl GatewayOps for InMemoryGateway {
             .await
             {
                 // Rollback: re-acquire lock and remove (PIPE-ADV-1).
-                self.compositions.lock().await.delete(comp_id).ok();
+                let _ = self.compositions.lock().await.delete(comp_id).ok();
                 return Err(GatewayError::Upstream("delta emission failed".to_string()));
             }
         }
@@ -479,8 +481,7 @@ impl GatewayOps for InMemoryGateway {
         _namespace_id: kiseki_common::ids::NamespaceId,
         composition_id: kiseki_common::ids::CompositionId,
     ) -> Result<(), GatewayError> {
-        // Verify tenant ownership and collect chunk refs before deleting.
-        let chunk_ids: Vec<kiseki_common::ids::ChunkId>;
+        // Verify tenant ownership before deleting.
         {
             let compositions = self.compositions.lock().await;
             let comp = compositions
@@ -489,21 +490,22 @@ impl GatewayOps for InMemoryGateway {
             if comp.tenant_id != tenant_id {
                 return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
             }
-            chunk_ids = comp.chunks.clone();
         }
 
         // Delete the composition (sync — no lock held during Raft).
         // Log emission for delete tombstone would go here if needed.
-        self.compositions
+        let delete_result = self
+            .compositions
             .lock()
             .await
             .delete(composition_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
-        // Decrement chunk refcounts (I-C2: GC when refcount reaches 0).
-        {
+        // Decrement chunk refcounts only when actually removed (not
+        // a versioned delete marker). I-C2: GC when refcount reaches 0.
+        if let kiseki_composition::DeleteResult::Removed(ref released) = delete_result {
             let mut chunks = self.chunks.lock().await;
-            for chunk_id in &chunk_ids {
+            for chunk_id in released {
                 let _ = chunks.decrement_refcount(chunk_id);
             }
         }

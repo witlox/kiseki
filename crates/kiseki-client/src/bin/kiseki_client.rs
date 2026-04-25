@@ -159,6 +159,8 @@ fn handle_mount(args: &[String]) {
         tenant_id: tenant,
         shard_id: shard,
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
 
     let master_key =

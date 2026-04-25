@@ -50,6 +50,8 @@ fn setup() -> (Arc<MemShardStore>, CompositionStore, ViewStore) {
         tenant_id: test_tenant(),
         shard_id: test_shard(),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
 
     let mut views = ViewStore::new();
@@ -120,7 +122,8 @@ fn update_and_delete_operate_on_in_memory_store() {
         .unwrap();
     assert_eq!(v2, 2);
 
-    comp.delete(comp_id).unwrap();
+    let del = comp.delete(comp_id).unwrap();
+    assert!(matches!(del, kiseki_composition::DeleteResult::Removed(_)));
     assert!(comp.get(comp_id).is_err());
 }
 

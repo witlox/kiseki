@@ -61,7 +61,7 @@ async fn then_created(w: &mut KisekiWorld) {
 async fn when_delete(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         match w.comp_store.delete(id) {
-            Ok(()) => w.last_error = None,
+            Ok(_) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
     }
@@ -110,6 +110,8 @@ async fn given_other_ns(w: &mut KisekiWorld, ns: String) {
         tenant_id,
         shard_id: other_shard,
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
     w.namespace_ids.insert(ns, ns_id);
 }
@@ -151,6 +153,8 @@ async fn given_readonly(w: &mut KisekiWorld, ns: String) {
         tenant_id,
         shard_id,
         read_only: true,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
     w.namespace_ids.insert(ns, ns_id);
 }
@@ -316,7 +320,7 @@ async fn given_c6_refcount_1(_w: &mut KisekiWorld) {
 async fn when_comp_ctx_delete(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         match w.comp_store.delete(id) {
-            Ok(()) => w.last_error = None,
+            Ok(_) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
     }
@@ -337,7 +341,7 @@ async fn given_comp_versions(w: &mut KisekiWorld, _name: String, _versions: Stri
 async fn when_delete_issued(w: &mut KisekiWorld, _name: String) {
     if let Some(id) = w.last_composition_id {
         match w.comp_store.delete(id) {
-            Ok(()) => w.last_error = None,
+            Ok(_) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
     }
@@ -420,6 +424,8 @@ async fn when_posix_rename_targets(w: &mut KisekiWorld, ns: String, shard: Strin
         tenant_id,
         shard_id: other_shard,
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
     w.namespace_ids.insert(ns.clone(), ns_id);
 

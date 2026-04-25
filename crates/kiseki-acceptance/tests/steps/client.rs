@@ -174,6 +174,8 @@ async fn then_resolve(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -197,6 +199,8 @@ async fn then_fetch(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -224,6 +228,8 @@ async fn then_no_plaintext(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let plaintext = b"secret-data-must-not-leak";
@@ -423,6 +429,8 @@ async fn then_resolve_cache(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -444,6 +452,8 @@ async fn then_chunk_refs(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -463,6 +473,8 @@ async fn then_fetch_encrypted(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let resp = gw
@@ -508,6 +520,8 @@ async fn then_decrypt_inprocess(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let plain = b"plaintext-roundtrip-check";
@@ -543,6 +557,8 @@ async fn then_returns_fuse(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -564,6 +580,8 @@ async fn then_no_plaintext_leak(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let resp = gw
@@ -606,6 +624,8 @@ async fn then_ryw(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let data = b"read-your-writes-data";
@@ -644,6 +664,8 @@ async fn then_tracking(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -669,6 +691,8 @@ async fn then_no_fuse_overhead(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let wr = gw
@@ -704,6 +728,8 @@ async fn then_lower_latency(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let wr = gw
@@ -738,6 +764,8 @@ async fn then_buffer(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let wr = gw
@@ -778,6 +806,8 @@ async fn then_write_ack(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -797,6 +827,8 @@ async fn then_plaintext_only_mem(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let secret = b"in-memory-only";
@@ -833,6 +865,8 @@ async fn then_encrypted_wire(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let wr = gw
@@ -1092,6 +1126,8 @@ async fn then_decrypt_inprocess2(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let wr = gw
@@ -1139,6 +1175,8 @@ async fn then_pre_encrypted(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let wr = gw
@@ -1181,6 +1219,8 @@ async fn then_committed_durable(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let wr = gw
@@ -1217,6 +1257,8 @@ async fn then_others_unaffected(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let gw = Arc::new(gw);
@@ -1283,6 +1325,8 @@ async fn then_eio(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let fuse = KisekiFuse::new(gw, tenant, ns);
@@ -1515,6 +1559,8 @@ async fn then_serialized(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let w1 = gw
@@ -1550,6 +1596,8 @@ async fn then_total_order(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let w1 = gw
@@ -1603,6 +1651,8 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let w1 = gw
@@ -1660,6 +1710,8 @@ async fn then_reads_ok(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let wr = gw
@@ -1694,6 +1746,8 @@ async fn then_erofs(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: true,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let result = gw
@@ -1781,6 +1835,8 @@ async fn then_continues_reads(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -1800,6 +1856,8 @@ async fn then_channel_unavailable(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -1917,6 +1975,8 @@ async fn then_quota_enforcement(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: true,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let result = gw
@@ -1955,6 +2015,8 @@ async fn then_fuse_continues(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);
@@ -2030,6 +2092,8 @@ async fn then_fuse_correct(_w: &mut KisekiWorld) {
         tenant_id: tenant,
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     })
     .await;
     let mut fuse = KisekiFuse::new(gw, tenant, ns);

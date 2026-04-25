@@ -220,9 +220,19 @@ mod tests {
         assert_eq!(failures, 1, "exactly one thread must fail");
 
         // The failing result must be PhaseNotMonotonic.
-        let err = results.into_iter().find(|r| r.is_err()).unwrap().unwrap_err();
+        let err = results
+            .into_iter()
+            .find(|r| r.is_err())
+            .unwrap()
+            .unwrap_err();
         assert!(
-            matches!(err, AdvisoryError::PhaseNotMonotonic { current: 6, requested: 6 }),
+            matches!(
+                err,
+                AdvisoryError::PhaseNotMonotonic {
+                    current: 6,
+                    requested: 6
+                }
+            ),
             "expected PhaseNotMonotonic(6, 6), got {err:?}"
         );
 

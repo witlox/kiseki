@@ -45,14 +45,14 @@ pub fn enable_compression(tags: &[ComplianceTag]) -> Result<(), crate::error::Co
 /// Acceptable range is [5, 300] seconds. Values outside this range are rejected.
 pub fn validate_cache_ttl(secs: u64) -> Result<u64, crate::error::ControlError> {
     if secs < 5 {
-        return Err(crate::error::ControlError::Rejected(
-            format!("cache TTL {secs}s below minimum of 5s"),
-        ));
+        return Err(crate::error::ControlError::Rejected(format!(
+            "cache TTL {secs}s below minimum of 5s"
+        )));
     }
     if secs > 300 {
-        return Err(crate::error::ControlError::Rejected(
-            format!("cache TTL {secs}s exceeds maximum of 300s"),
-        ));
+        return Err(crate::error::ControlError::Rejected(format!(
+            "cache TTL {secs}s exceeds maximum of 300s"
+        )));
     }
     Ok(secs)
 }
@@ -100,7 +100,10 @@ mod tests {
         let result = validate_cache_ttl(2);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("minimum"), "error should mention minimum: {err}");
+        assert!(
+            err.contains("minimum"),
+            "error should mention minimum: {err}"
+        );
     }
 
     #[test]
@@ -108,6 +111,9 @@ mod tests {
         let result = validate_cache_ttl(500);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("maximum"), "error should mention maximum: {err}");
+        assert!(
+            err.contains("maximum"),
+            "error should mention maximum: {err}"
+        );
     }
 }

@@ -901,6 +901,8 @@ async fn given_empty_bucket(w: &mut KisekiWorld, bucket: String) {
                 .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1))),
             shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         })
         .await;
 }
@@ -1125,6 +1127,8 @@ async fn when_get_bucket(w: &mut KisekiWorld, bucket: String) {
                 .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1))),
             shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         })
         .await;
     w.last_error = None;
@@ -1606,6 +1610,8 @@ async fn given_bucket_no_objects(w: &mut KisekiWorld, bucket: String) {
                 .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1))),
             shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         })
         .await;
 }

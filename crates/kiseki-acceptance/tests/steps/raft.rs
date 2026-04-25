@@ -807,7 +807,9 @@ async fn then_full_state(_w: &mut KisekiWorld) {
 
 #[then("node-4 begins receiving new entries from the snapshot point")]
 async fn then_new_entries_from_snapshot(_w: &mut KisekiWorld) {
-    todo!("verify node-4 receives new log entries starting from the snapshot index, not from index 0")
+    todo!(
+        "verify node-4 receives new log entries starting from the snapshot index, not from index 0"
+    )
 }
 
 // --- Scenario: Crashed node recovers ---
@@ -884,7 +886,9 @@ async fn then_10x_throughput(_w: &mut KisekiWorld) {
 
 #[then("per-shard throughput is not degraded by other shards")]
 async fn then_no_degradation(_w: &mut KisekiWorld) {
-    todo!("measure per-shard throughput under concurrent load and verify no degradation vs isolated")
+    todo!(
+        "measure per-shard throughput under concurrent load and verify no degradation vs isolated"
+    )
 }
 
 // === Shard migration via membership change (ADR-030) ===
@@ -948,7 +952,9 @@ async fn when_ssd_learner_added(_w: &mut KisekiWorld) {
 
 #[then(regex = r#"^node-\d+ receives the Raft log but does not vote$"#)]
 async fn then_receives_log_no_vote(_w: &mut KisekiWorld) {
-    todo!("verify the learner receives AppendEntries but is not included in vote quorum calculations")
+    todo!(
+        "verify the learner receives AppendEntries but is not included in vote quorum calculations"
+    )
 }
 
 #[then(regex = r#"^node-\d+ can serve read requests$"#)]

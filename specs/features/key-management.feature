@@ -55,25 +55,11 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And the KMS connection is authenticated and encrypted end-to-end
 
   # --- Key audit ---
-
-  @unit
-  Scenario: All key lifecycle events are audited
-    Given any key event occurs:
-      | event_type       | example                        |
-      | key_generation   | new system DEK created         |
-      | key_rotation     | tenant KEK rotated             |
-      | key_destruction  | crypto-shred                   |
-      | key_access       | system DEK unwrapped for read  |
-      | re_encryption    | full re-encryption triggered    |
-    Then the event is recorded in the audit log with:
-      | field      | value                          |
-      | timestamp  | ISO 8601 with timezone         |
-      | actor      | tenant admin / cluster admin / system |
-      | key_id     | affected key identifier        |
-      | event_type | from table above               |
-      | tenant_id  | if tenant-scoped               |
-    And the event is included in the tenant audit export (if tenant-scoped)
-    And keys themselves are NEVER recorded in the audit log
+  # @unit "All key lifecycle events are audited" moved to crate-level unit
+  # test in crates/kiseki-keymanager/src/store.rs
+  # (key_lifecycle_events_produce_structured_audit_data).
+  # Verifies KeyLifecycleEvent structs carry timestamp, actor, key_id,
+  # event_type, and tenant_id fields — without ever including key material.
 
   # --- Failure modes ---
 

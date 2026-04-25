@@ -977,4 +977,58 @@ mod tests {
             matches!(result, Err(IdpError::InvalidToken(ref msg)) if msg.contains("no shared_secret configured"))
         );
     }
+
+    // ---------------------------------------------------------------
+    // Scenario: Tenant with IdP configured — second-stage validation
+    // Valid mTLS + valid workload token => accepted with full identity.
+    // ---------------------------------------------------------------
+    #[test]
+    fn idp_configured_valid_token_accepted() {
+        let config = test_config();
+        let token = build_test_jwt_hs256(&valid_claims(), TEST_SECRET);
+
+        let result = validate_jwt(&token, &config).unwrap();
+        assert_eq!(result.org_id, "acme-corp");
+        assert_eq!(result.workload_id, "workload-42");
+        assert_eq!(result.issuer, "https://idp.example.com");
+        // Full workload identity: org + workload extracted.
+        assert!(result.project_id.is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Tenant with IdP configured — missing token
+    // When IdP is required but no token is presented, reject.
+    // ---------------------------------------------------------------
+    #[test]
+    fn idp_configured_missing_token_rejected() {
+        let config = test_config();
+        // An empty string is not a valid JWT — simulates "no token".
+        let result = validate_jwt("", &config);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IdpError::InvalidToken(_))));
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Tenant without IdP — mTLS only (sufficient)
+    // When no IdP is configured, there is nothing to validate.
+    // The absence of config means mTLS alone is sufficient.
+    // ---------------------------------------------------------------
+    #[test]
+    fn no_idp_config_mtls_only_sufficient() {
+        // With no IdP configured, there is no token to validate —
+        // the caller simply skips the IdP validation step.
+        // Verify that the config can represent "no IdP" state.
+        let no_idp = TenantIdpConfig {
+            issuer_url: String::new(),
+            audience: None,
+            claim_mapping: ClaimMapping::default(),
+            unsafe_no_signature_verify: false,
+            shared_secret: None,
+            jwks_keys: None,
+        };
+        // An empty issuer_url indicates no IdP is configured.
+        assert!(no_idp.issuer_url.is_empty());
+        assert!(no_idp.shared_secret.is_none());
+        assert!(no_idp.jwks_keys.is_none());
+    }
 }

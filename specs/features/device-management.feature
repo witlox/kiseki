@@ -76,19 +76,9 @@ Feature: Device management and pool capacity (ADR-024)
     When a client attempts to write a chunk
     Then the write is rejected with ENOSPC
 
-  @unit
-  Scenario: Pool redirection stays within same device class
-    Given pool "fast-nvme-a" is Critical
-    And pool "fast-nvme-b" is Healthy
-    When a chunk targets "fast-nvme-a"
-    Then the placement engine redirects to "fast-nvme-b"
-    And the chunk is never placed on a HDD pool
-
-  @unit
-  Scenario: No sibling pool available — ENOSPC
-    Given pool "fast-nvme" is the only NVMe pool and is Critical
-    When a chunk targets "fast-nvme"
-    Then the write returns ENOSPC (no same-class sibling)
+  # @unit scenarios moved to crate-level unit tests:
+  #   - pool.rs: pool_redirection_stays_within_device_class, no_sibling_pool_returns_enospc
+  #   - device.rs: device_state_transition_audit_event
 
   # === Automatic evacuation on health warnings ===
 
@@ -106,17 +96,6 @@ Feature: Device management and pool capacity (ADR-024)
     And an alert is emitted
 
   # === Device state audit trail (I-D2) ===
-
-  @unit
-  Scenario: All device state transitions are audited
-    When device "dev-1" transitions from "Healthy" to "Degraded"
-    Then the audit log contains an entry with:
-      | field       | value        |
-      | device_id   | dev-1        |
-      | old_state   | Healthy      |
-      | new_state   | Degraded     |
-      | reason      | SMART wear   |
-      | admin_id    | (system)     |
 
   # === EC fragment placement (I-D4) ===
 

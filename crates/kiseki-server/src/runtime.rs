@@ -247,6 +247,8 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             tenant_id: bootstrap_tenant,
             shard_id: bootstrap_shard,
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         });
 
         // Create a bootstrap view for the default namespace.
@@ -476,10 +478,8 @@ mod tests {
 
     #[test]
     fn redb_layout_paths_are_distinct_and_under_data_dir() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "kiseki-redb-layout-test-{}",
-            std::process::id()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("kiseki-redb-layout-test-{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let paths = canonical_store_paths(&data_dir);

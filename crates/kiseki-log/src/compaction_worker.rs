@@ -280,4 +280,96 @@ mod tests {
     fn needs_compaction_empty() {
         assert!(!needs_compaction(&[], &CompactionConfig::default()));
     }
+
+    // --- log.feature @unit: "Automatic compaction merges SSTables" ---
+    // Proves: SSTables are merged by hashed_key and sequence_number,
+    // newer deltas supersede older ones, tombstoned entries are removed,
+    // tenant-encrypted payloads are carried opaquely (never decrypted),
+    // and the resulting count is reduced.
+
+    #[test]
+    fn automatic_compaction_merges_by_key_and_sequence() {
+        // Simulate 20 deltas across several keys with superseded versions.
+        let mut deltas = Vec::new();
+        // Key 0xAA: 5 versions (Create + 4 Updates) — only latest survives.
+        deltas.push(make_delta(1, 0xAA, OperationType::Create));
+        deltas.push(make_delta(5, 0xAA, OperationType::Update));
+        deltas.push(make_delta(10, 0xAA, OperationType::Update));
+        deltas.push(make_delta(15, 0xAA, OperationType::Update));
+        deltas.push(make_delta(20, 0xAA, OperationType::Update));
+
+        // Key 0xBB: created then deleted (tombstone) — both removed.
+        deltas.push(make_delta(2, 0xBB, OperationType::Create));
+        deltas.push(make_delta(12, 0xBB, OperationType::Delete));
+
+        // Key 0xCC: single create — survives.
+        deltas.push(make_delta(3, 0xCC, OperationType::Create));
+
+        // Key 0xDD: 3 versions — only latest survives.
+        deltas.push(make_delta(4, 0xDD, OperationType::Create));
+        deltas.push(make_delta(8, 0xDD, OperationType::Update));
+        deltas.push(make_delta(16, 0xDD, OperationType::Update));
+
+        let progress = CompactionProgress::new();
+        let retained = compact_deltas(&deltas, &progress, 1);
+
+        // Key 0xAA: 1 (seq 20), Key 0xBB: 0 (tombstoned), Key 0xCC: 1, Key 0xDD: 1 (seq 16).
+        assert_eq!(
+            retained.len(),
+            3,
+            "should retain only latest per key, removing tombstones"
+        );
+
+        // Newer deltas (higher sequence_number) supersede older ones.
+        let aa = retained.iter().find(|d| d.header.hashed_key == [0xAA; 32]);
+        assert_eq!(aa.unwrap().header.sequence, SequenceNumber(20));
+
+        let dd = retained.iter().find(|d| d.header.hashed_key == [0xDD; 32]);
+        assert_eq!(dd.unwrap().header.sequence, SequenceNumber(16));
+
+        // Tombstoned entry is removed.
+        let bb = retained.iter().find(|d| d.header.hashed_key == [0xBB; 32]);
+        assert!(bb.is_none(), "tombstoned key should be removed");
+
+        // Payloads are carried opaquely — the compaction never decrypts.
+        // (Structural proof: compact_deltas clones Delta which includes
+        // DeltaPayload.ciphertext unchanged.)
+        for delta in &retained {
+            // Payload is the same empty vec from make_delta — never modified.
+            assert_eq!(delta.payload.ciphertext, Vec::<u8>::new());
+        }
+
+        // Count is reduced.
+        assert!(
+            retained.len() < deltas.len(),
+            "compaction must reduce delta count"
+        );
+    }
+
+    // --- log.feature @unit: "Admin-triggered compaction" ---
+    // Proves: compaction runs regardless of the automatic threshold,
+    // same merge semantics apply.
+
+    #[test]
+    fn admin_triggered_compaction_runs_regardless_of_threshold() {
+        // Two versions of the same key — below any automatic threshold.
+        let deltas = vec![
+            make_delta(1, 0xAA, OperationType::Create),
+            make_delta(2, 0xAA, OperationType::Update),
+        ];
+
+        // Verify this would NOT trigger automatic compaction (no tombstones).
+        assert!(
+            !needs_compaction(&deltas, &CompactionConfig::default()),
+            "should not auto-trigger"
+        );
+
+        // But admin-triggered compaction runs regardless.
+        let progress = CompactionProgress::new();
+        let retained = compact_deltas(&deltas, &progress, 1);
+
+        // Same merge semantics: only latest version survives.
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].header.sequence, SequenceNumber(2));
+    }
 }

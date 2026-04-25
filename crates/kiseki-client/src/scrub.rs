@@ -145,28 +145,16 @@ mod tests {
         std::fs::write(&file2, b"NESTED SECRET").unwrap();
 
         // Verify files exist with non-zero content.
-        assert_eq!(
-            std::fs::read(&file1).unwrap(),
-            b"TOP SECRET DATA"
-        );
-        assert_eq!(
-            std::fs::read(&file2).unwrap(),
-            b"NESTED SECRET"
-        );
+        assert_eq!(std::fs::read(&file1).unwrap(), b"TOP SECRET DATA");
+        assert_eq!(std::fs::read(&file2).unwrap(), b"NESTED SECRET");
 
         // Wipe the directory. This calls the same wipe_directory_recursive
         // that scrub uses, which overwrites with zeros before unlinking.
         wipe_directory_recursive(&target);
 
         // All files must be deleted.
-        assert!(
-            !file1.exists(),
-            "file1 should be deleted after wipe"
-        );
-        assert!(
-            !file2.exists(),
-            "file2 should be deleted after wipe"
-        );
+        assert!(!file1.exists(), "file1 should be deleted after wipe");
+        assert!(!file2.exists(), "file2 should be deleted after wipe");
 
         // NOTE: The zeroize-before-delete guarantee (I-CC2) is implemented
         // in wipe_directory_recursive at lines 79-83: it writes a zero

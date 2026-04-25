@@ -19,6 +19,7 @@ pub mod compaction_worker;
 pub mod delta;
 pub mod error;
 pub mod grpc;
+pub mod merge;
 pub mod persistent_store;
 pub mod raft;
 pub mod raft_shard_store;

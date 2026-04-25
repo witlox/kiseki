@@ -116,7 +116,10 @@ mod tests {
         use kiseki_common::tenancy::ComplianceTag;
         let tags = vec![ComplianceTag::Hipaa];
         let result = check_shred_allowed(&tags, false);
-        assert!(result.is_err(), "shred should be blocked for HIPAA without hold release");
+        assert!(
+            result.is_err(),
+            "shred should be blocked for HIPAA without hold release"
+        );
     }
 
     #[test]

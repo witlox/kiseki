@@ -572,4 +572,60 @@ mod tests {
         );
         assert_eq!(result.unwrap_err(), AuthError::MissingAuth);
     }
+
+    // ---------------------------------------------------------------
+    // Scenario: S3 gateway authenticates incoming request
+    // Access key resolved to tenant + workload identity, request
+    // authorized against tenant policy.
+    // ---------------------------------------------------------------
+    #[test]
+    fn s3_gateway_resolves_access_key_to_tenant() {
+        let mut store = AccessKeyStore::new();
+        let tenant = OrgId(uuid::Uuid::new_v4());
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let access_key = "AKIAEXAMPLE";
+        store.insert(access_key.into(), secret.into(), tenant);
+
+        // Verify the access key resolves to the correct tenant.
+        let (resolved_secret, resolved_tenant) = store.lookup(access_key).unwrap();
+        assert_eq!(resolved_secret, secret);
+        assert_eq!(resolved_tenant, tenant);
+
+        // Unknown key is rejected.
+        assert!(store.lookup("UNKNOWN_KEY").is_none());
+
+        // Verify full SigV4 flow resolves tenant identity.
+        let date = "20260425";
+        let timestamp = "20260425T120000Z";
+        let region = "us-east-1";
+        let payload_hash = sha256_hex(b"");
+        let uri: Uri = "/mybucket/myobject".parse().unwrap();
+        let method = Method::GET;
+        let signed_header_names = vec![
+            "host".to_string(),
+            "x-amz-content-sha256".to_string(),
+            "x-amz-date".to_string(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "s3.example.com:9000".parse().unwrap());
+        headers.insert("x-amz-content-sha256", payload_hash.parse().unwrap());
+        headers.insert("x-amz-date", timestamp.parse().unwrap());
+
+        let canon = canonical_request(&method, &uri, &headers, &signed_header_names, &payload_hash);
+        let scope = format!("{date}/{region}/s3/aws4_request");
+        let sts = string_to_sign(timestamp, &scope, &canon);
+        let signing_key = derive_signing_key(secret, date, region, "s3");
+        let sig = hmac_sha256(signing_key.as_ref(), sts.as_bytes());
+        let sig_hex = hex_encode(sig.as_ref());
+
+        let auth_value = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{date}/{region}/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={sig_hex}"
+        );
+        headers.insert("authorization", auth_value.parse().unwrap());
+
+        let result = validate_request(&method, &uri, &headers, &payload_hash, &store);
+        let auth = result.expect("valid S3 request should authenticate");
+        assert_eq!(auth.tenant_id, tenant);
+        assert_eq!(auth.access_key, access_key);
+    }
 }
