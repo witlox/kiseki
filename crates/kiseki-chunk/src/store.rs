@@ -76,6 +76,8 @@ pub trait ChunkOps {
 pub struct ChunkStore {
     chunks: HashMap<ChunkId, ChunkEntry>,
     pools: HashMap<String, AffinityPool>,
+    /// Simulated unavailable chunks for fault injection (ADR-037).
+    unavailable: HashSet<ChunkId>,
 }
 
 impl ChunkStore {
@@ -85,7 +87,23 @@ impl ChunkStore {
         Self {
             chunks: HashMap::new(),
             pools: HashMap::new(),
+            unavailable: HashSet::new(),
         }
+    }
+
+    /// Mark chunks as unavailable (fault injection for testing).
+    pub fn inject_unavailable(&mut self, chunk_id: ChunkId) {
+        self.unavailable.insert(chunk_id);
+    }
+
+    /// Clear all fault injections.
+    pub fn clear_faults(&mut self) {
+        self.unavailable.clear();
+    }
+
+    /// Check if a chunk has an injected fault.
+    pub fn is_unavailable(&self, chunk_id: &ChunkId) -> bool {
+        self.unavailable.contains(chunk_id)
     }
 
     /// Add an affinity pool.
@@ -243,6 +261,10 @@ impl ChunkOps for ChunkStore {
     }
 
     fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
+        // Fault injection: simulated unavailability (ADR-037).
+        if self.unavailable.contains(chunk_id) {
+            return Err(ChunkError::DeviceUnavailable(*chunk_id));
+        }
         self.chunks
             .get(chunk_id)
             .map(|e| e.envelope.clone())
@@ -720,5 +742,33 @@ mod tests {
 
         // Both responses have identical shape (same struct fields).
         assert_eq!(low_k.pool_name, high_k.pool_name);
+    }
+
+    #[test]
+    fn fault_injection_makes_chunk_unavailable() {
+        let mut store = ChunkStore::new();
+        store.add_pool(
+            AffinityPool::new(
+                "default",
+                DurabilityStrategy::Replication { copies: 1 },
+                1_000_000,
+            )
+            .with_devices(1),
+        );
+        let env = test_envelope(0x42);
+        let chunk_id = env.chunk_id;
+        store.write_chunk(env, "default").unwrap();
+
+        // Before fault: read succeeds.
+        assert!(store.read_chunk(&chunk_id).is_ok());
+
+        // Inject fault: read fails with DeviceUnavailable.
+        store.inject_unavailable(chunk_id);
+        let err = store.read_chunk(&chunk_id).unwrap_err();
+        assert!(matches!(err, ChunkError::DeviceUnavailable(_)));
+
+        // Clear fault: read succeeds again.
+        store.clear_faults();
+        assert!(store.read_chunk(&chunk_id).is_ok());
     }
 }

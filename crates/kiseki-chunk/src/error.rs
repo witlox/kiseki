@@ -38,6 +38,10 @@ pub enum ChunkError {
     #[error("chunk lost: insufficient fragments for reconstruction")]
     ChunkLost,
 
+    /// Device unavailable — chunk fragment not accessible (fault injection or real failure).
+    #[error("device unavailable for chunk {0}")]
+    DeviceUnavailable(ChunkId),
+
     /// I/O error from persistent storage backend.
     #[error("chunk I/O error: {0}")]
     Io(String),
@@ -60,6 +64,9 @@ impl From<ChunkError> for KisekiError {
             ),
             ChunkError::EcInvalidConfig | ChunkError::EcEncodeFailed => {
                 KisekiError::Permanent(PermanentError::InvariantViolation("EC error".into()))
+            }
+            ChunkError::DeviceUnavailable(id) => {
+                KisekiError::Permanent(PermanentError::ChunkLost(id))
             }
             ChunkError::ChunkLost => {
                 KisekiError::Permanent(PermanentError::ChunkLost(ChunkId([0; 32])))
