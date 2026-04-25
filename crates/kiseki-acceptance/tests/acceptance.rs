@@ -138,8 +138,6 @@ pub struct KisekiWorld {
     pub topology_config: ShardTopologyConfig,
     pub shard_map_store: NamespaceShardMapStore,
     pub topology_active_nodes: Vec<NodeId>,
-    pub topology_last_map: Option<kiseki_control::shard_topology::NamespaceShardMap>,
-    pub topology_last_error: Option<String>,
 
     // === Small-file placement (ADR-030) ===
     pub sf_node_count: u64,
@@ -302,8 +300,6 @@ impl KisekiWorld {
             topology_config: ShardTopologyConfig::default(),
             shard_map_store: NamespaceShardMapStore::new(),
             topology_active_nodes: Vec::new(),
-            topology_last_map: None,
-            topology_last_error: None,
             sf_node_count: 3,
             sf_soft_limit_pct: 50,
             sf_hard_limit_pct: 75,
@@ -414,6 +410,68 @@ impl KisekiWorld {
         });
         self.namespace_ids.insert(name.to_owned(), ns_id);
         ns_id
+    }
+
+    /// Create a multi-shard namespace via the real shard topology store,
+    /// then register each shard in the log store with its key range and
+    /// register the namespace in the gateway's composition store.
+    ///
+    /// This is the integrated path: topology → log store → composition → gateway.
+    pub async fn ensure_topology_namespace(
+        &mut self,
+        name: &str,
+        tenant_name: &str,
+        requested_shards: Option<u32>,
+    ) {
+        use kiseki_control::shard_topology;
+
+        let tenant_id = self.ensure_tenant(tenant_name);
+        let ns_id = NamespaceId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            name.as_bytes(),
+        ));
+
+        // Create namespace in the shard map store (topology computation).
+        let map = self
+            .shard_map_store
+            .create_namespace(
+                name,
+                tenant_id,
+                &self.topology_config,
+                &self.topology_active_nodes,
+                requested_shards,
+            )
+            .expect("topology namespace creation should succeed");
+
+        // Register each shard in the log store with its specific key range.
+        for shard_range in &map.shards {
+            self.log_store.create_shard(
+                shard_range.shard_id,
+                tenant_id,
+                shard_range.leader_node,
+                ShardConfig::default(),
+            );
+            self.log_store.update_shard_range(
+                shard_range.shard_id,
+                shard_range.range_start,
+                shard_range.range_end,
+            );
+        }
+
+        // Register namespace in the gateway's composition store,
+        // pointing to the first shard as default.
+        let default_shard = map.shards[0].shard_id;
+        let ns = Namespace {
+            id: ns_id,
+            tenant_id,
+            shard_id: default_shard,
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        };
+        self.gateway.add_namespace(ns.clone()).await;
+
+        self.namespace_ids.insert(name.to_owned(), ns_id);
     }
 
     /// Get or create a view by name.

@@ -394,9 +394,11 @@ impl GatewayOps for InMemoryGateway {
         // Emit delta to log (async, slow — Raft consensus).
         if let Some(ref log) = log {
             let hashed_key = kiseki_composition::composition_hash_key(emit_params.2, comp_id);
-            if !kiseki_composition::log_bridge::emit_delta(
+            let shard_id = emit_params.0;
+
+            match kiseki_composition::log_bridge::emit_delta(
                 log.as_ref(),
-                emit_params.0,
+                shard_id,
                 emit_params.1,
                 kiseki_log::delta::OperationType::Create,
                 hashed_key,
@@ -405,9 +407,16 @@ impl GatewayOps for InMemoryGateway {
             )
             .await
             {
-                // Rollback: re-acquire lock and remove (PIPE-ADV-1).
-                let _ = self.compositions.lock().await.delete(comp_id).ok();
-                return Err(GatewayError::Upstream("delta emission failed".to_string()));
+                Ok(_seq) => {}
+                Err(kiseki_log::error::LogError::KeyOutOfRange(sid)) => {
+                    let _ = self.compositions.lock().await.delete(comp_id).ok();
+                    return Err(GatewayError::KeyOutOfRange { shard_id: sid });
+                }
+                Err(e) => {
+                    // Rollback: re-acquire lock and remove (PIPE-ADV-1).
+                    let _ = self.compositions.lock().await.delete(comp_id).ok();
+                    return Err(GatewayError::Upstream(format!("delta emission failed: {e}")));
+                }
             }
         }
 

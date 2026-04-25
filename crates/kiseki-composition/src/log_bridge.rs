@@ -4,9 +4,10 @@
 //! (create, update, delete) emit deltas to the log shard. This
 //! wires the Composition → Log data path per api-contracts.md.
 
-use kiseki_common::ids::{ChunkId, NodeId, OrgId, ShardId};
+use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
 use kiseki_log::delta::OperationType;
+use kiseki_log::error::LogError;
 use kiseki_log::traits::{AppendDeltaRequest, LogOps};
 
 /// Emit a delta to the log for a composition mutation.
@@ -14,6 +15,9 @@ use kiseki_log::traits::{AppendDeltaRequest, LogOps};
 /// Called by `CompositionStore` after a successful create/update/delete.
 /// The payload is the composition ID serialized as bytes (opaque to
 /// the log per I-L7).
+///
+/// Returns the assigned `SequenceNumber` on success, or the `LogError`
+/// on failure (e.g., `KeyOutOfRange` for stale shard map routing).
 pub async fn emit_delta<L: LogOps + ?Sized>(
     log: &L,
     shard_id: ShardId,
@@ -22,7 +26,7 @@ pub async fn emit_delta<L: LogOps + ?Sized>(
     hashed_key: [u8; 32],
     chunk_refs: Vec<ChunkId>,
     payload: Vec<u8>,
-) -> bool {
+) -> Result<SequenceNumber, LogError> {
     let timestamp = now_timestamp();
     let req = AppendDeltaRequest {
         shard_id,
@@ -34,15 +38,7 @@ pub async fn emit_delta<L: LogOps + ?Sized>(
         payload,
         has_inline_data: false,
     };
-    match log.append_delta(req).await {
-        Ok(_seq) => true,
-        Err(e) => {
-            // Log the error — callers check the return value to decide
-            // whether to roll back the local mutation (PIPE-ADV-1).
-            tracing::warn!(error = %e, "delta emission failed");
-            false
-        }
-    }
+    log.append_delta(req).await
 }
 
 /// Monotonic logical counter for HLC tie-breaking (PIPE-ADV-2).
