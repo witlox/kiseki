@@ -87,6 +87,29 @@ impl NamespaceStore {
         namespaces.values().cloned().collect()
     }
 
+    /// Check whether a compliance tag can be removed from a namespace.
+    ///
+    /// A tag cannot be removed if the namespace contains compositions
+    /// (i.e. has data). The caller must provide the composition count.
+    pub fn can_remove_compliance_tag(
+        &self,
+        namespace_id: &str,
+        _tag: &kiseki_common::tenancy::ComplianceTag,
+        composition_count: u64,
+    ) -> Result<(), ControlError> {
+        // Verify namespace exists.
+        let namespaces = self.namespaces.read().unwrap();
+        if !namespaces.contains_key(namespace_id) {
+            return Err(ControlError::NotFound(format!("namespace {namespace_id}")));
+        }
+        if composition_count > 0 {
+            return Err(ControlError::Rejected(
+                "cannot remove compliance tag with existing data; migrate or delete first".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Set read-only mode on the store and all existing namespaces.
     pub fn set_read_only(&self, read_only: bool) {
         *self.read_only.write().unwrap() = read_only;
@@ -100,5 +123,41 @@ impl NamespaceStore {
 impl Default for NamespaceStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kiseki_common::tenancy::ComplianceTag;
+
+    #[test]
+    fn compliance_tag_removal_blocked_with_existing_data() {
+        // Scenario: Compliance tag cannot be removed if data exists under it
+        let store = NamespaceStore::new();
+        let ns = Namespace {
+            id: "trials".into(),
+            org_id: "org-pharma".into(),
+            project_id: String::new(),
+            shard_id: String::new(),
+            compliance_tags: vec![ComplianceTag::Hipaa],
+            read_only: false,
+        };
+        store.create(ns).unwrap();
+
+        // Namespace has compositions (data exists) -> removal rejected
+        let result = store.can_remove_compliance_tag("trials", &ComplianceTag::Hipaa, 5);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("cannot remove compliance tag"), "error: {msg}");
+        assert!(
+            msg.contains("migrate or delete"),
+            "error should suggest migration: {msg}"
+        );
+
+        // No compositions -> removal allowed
+        assert!(store
+            .can_remove_compliance_tag("trials", &ComplianceTag::Hipaa, 0)
+            .is_ok());
     }
 }

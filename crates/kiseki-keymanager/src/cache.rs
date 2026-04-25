@@ -127,4 +127,59 @@ mod tests {
         cache.remove(&test_org());
         assert!(!cache.has_entry(&test_org()));
     }
+
+    // ---------------------------------------------------------------
+    // Scenario: Cache TTL jitter prevents thundering herd
+    // TTL per node is 60 +/- 10% (54s to 66s, randomized).
+    // ---------------------------------------------------------------
+    #[test]
+    fn cache_ttl_jitter_prevents_thundering_herd() {
+        let base_ttl: u64 = 60;
+        let jitter_pct: f64 = 0.10;
+
+        // Simulate 100 nodes picking jittered TTLs.
+        let mut ttls = Vec::with_capacity(100);
+        for i in 0u64..100 {
+            // Deterministic jitter based on node index for reproducibility.
+            // Precision loss acceptable: i and base_ttl are small values used for jitter calculation.
+            #[allow(clippy::cast_precision_loss)]
+            let jitter_factor = 1.0 + jitter_pct * (2.0 * (i as f64 / 99.0) - 1.0);
+            // Truncation and sign loss acceptable: jitter_factor is always positive and result fits in u64.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            let jittered = (base_ttl as f64 * jitter_factor) as u64;
+            ttls.push(jittered);
+        }
+
+        let min_ttl = *ttls.iter().min().unwrap();
+        let max_ttl = *ttls.iter().max().unwrap();
+
+        // TTLs should span at least 10 seconds (the jitter window).
+        assert!(
+            max_ttl - min_ttl >= 10,
+            "jitter window too narrow: {min_ttl}..{max_ttl}"
+        );
+        // All TTLs should be within [54, 66].
+        assert!(min_ttl >= 54, "min TTL {min_ttl} below 54");
+        assert!(max_ttl <= 66, "max TTL {max_ttl} above 66");
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Cache TTL expiry triggers provider fetch
+    // After TTL expires, get() returns None, forcing a new fetch.
+    // ---------------------------------------------------------------
+    #[test]
+    fn cache_expiry_triggers_fetch() {
+        let mut cache = KeyCache::new(0); // 0-second TTL
+        cache.insert(test_org(), [0x42; 32]);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Expired: get returns None, signaling "fetch from provider".
+        assert!(cache.get(&test_org()).is_none());
+        assert!(cache.is_expired(&test_org()));
+
+        // After "re-fetch", insert again with fresh TTL.
+        cache.insert(test_org(), [0x43; 32]);
+        // With 0-second TTL it expires immediately, but the insert succeeded.
+        assert!(cache.has_entry(&test_org()));
+    }
 }

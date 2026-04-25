@@ -11,6 +11,7 @@ pub mod network;
 pub mod openraft_store;
 #[allow(missing_docs)]
 pub mod state_machine;
+pub mod test_cluster;
 pub mod types;
 
 pub use log_store::{ShardMemLogStore, ShardRedbLogStore};

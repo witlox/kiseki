@@ -247,6 +247,8 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             tenant_id: bootstrap_tenant,
             shard_id: bootstrap_shard,
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         });
 
         // Create a bootstrap view for the default namespace.
@@ -508,4 +510,82 @@ pub async fn run_advisory(
 
     tracing::info!("advisory: shut down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// The 4 canonical persistent store paths that the runtime constructs
+    /// under `data_dir`. Three are redb databases, one is a chunk device +
+    /// metadata pair. All must be in distinct subdirectories under `data_dir`.
+    ///
+    /// Layout (from `runtime::run_main`):
+    ///   raft/log.redb       — Raft log (persistent shard store)
+    ///   keys/epochs.redb    — Key manager epochs
+    ///   small/objects.redb  — Small object inline store
+    ///   chunks/data.dev     — Raw block device for chunks
+    fn canonical_store_paths(data_dir: &std::path::Path) -> [PathBuf; 4] {
+        [
+            data_dir.join("raft").join("log.redb"),
+            data_dir.join("keys").join("epochs.redb"),
+            data_dir.join("small").join("objects.redb"),
+            data_dir.join("chunks").join("data.dev"),
+        ]
+    }
+
+    #[test]
+    fn redb_layout_paths_are_distinct_and_under_data_dir() {
+        let data_dir =
+            std::env::temp_dir().join(format!("kiseki-redb-layout-test-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let paths = canonical_store_paths(&data_dir);
+
+        // All 4 paths must be distinct.
+        let unique: HashSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            4,
+            "all 4 store paths must be distinct: {paths:?}"
+        );
+
+        // Each path must be under data_dir.
+        for path in &paths {
+            assert!(
+                path.starts_with(&data_dir),
+                "store path {path:?} must be under data_dir {data_dir:?}"
+            );
+        }
+
+        // The 3 redb stores must have .redb extension.
+        let redb_paths = &paths[..3];
+        for path in redb_paths {
+            assert_eq!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("redb"),
+                "redb store path must have .redb extension: {path:?}"
+            );
+        }
+
+        // Subdirectories must be distinct (raft, keys, small, chunks).
+        let subdirs: HashSet<_> = paths
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(&data_dir)
+                    .ok()
+                    .and_then(|rel| rel.components().next())
+                    .map(|c| c.as_os_str().to_owned())
+            })
+            .collect();
+        assert_eq!(
+            subdirs.len(),
+            4,
+            "each store must reside in a distinct subdirectory: {subdirs:?}"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
 }

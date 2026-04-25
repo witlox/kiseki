@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod log_store;
+pub mod mem_transport;
 pub mod membership;
 pub mod network;
 pub mod node;

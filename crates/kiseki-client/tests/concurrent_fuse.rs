@@ -32,6 +32,8 @@ fn setup_fuse() -> KisekiFuse<InMemoryGateway> {
         tenant_id: test_tenant(),
         shard_id: ShardId(uuid::Uuid::from_u128(1)),
         read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
     });
 
     let chunks = ChunkStore::new();

@@ -13,12 +13,12 @@ Every project follows: **Build → Validate → Test**
 
 ### Validate Stage
 
-- Formatting check (gofmt/rustfmt)
-- Static analysis (go vet/clippy)
-- Module hygiene (go mod tidy / Cargo.lock consistency)
-- Linting (golangci-lint / clippy with deny warnings)
-- Security scanning (gosec / govulncheck / cargo-deny advisories)
-- Vulnerability checking (govulncheck / cargo-deny / CodeQL)
+- Formatting check (rustfmt)
+- Static analysis (clippy)
+- Module hygiene (Cargo.lock consistency)
+- Linting (clippy with deny warnings)
+- Security scanning (cargo-deny advisories)
+- Vulnerability checking (cargo-deny / CodeQL)
 
 ### Test Stage
 
@@ -39,7 +39,6 @@ Every project follows: **Build → Validate → Test**
 ## Caching
 
 - Rust: `Swatinem/rust-cache@v2`
-- Go: built-in module cache
 
 ## Additional Workflows
 
@@ -52,7 +51,7 @@ Every project follows: **Build → Validate → Test**
 
 - Multi-stage: builder (full SDK) → runtime (minimal Alpine)
 - Non-root user in runtime image
-- Strip debug symbols (`-s -w` for Go, release profile for Rust)
+- Strip debug symbols (release profile for Rust)
 - Version injection at build time
 - No privileged mode in CI
 

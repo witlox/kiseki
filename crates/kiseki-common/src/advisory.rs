@@ -228,3 +228,72 @@ impl OperationAdvisory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // Scenario: workflow_id is a capability reference
+    // WorkflowRef is opaque 128-bit (16 bytes), not reused (I-WA10).
+    // ---------------------------------------------------------------
+    #[test]
+    fn workflow_ref_is_opaque_128_bit() {
+        let wf = WorkflowRef([0x42; 16]);
+        // WorkflowRef is exactly 16 bytes (128 bits).
+        assert_eq!(core::mem::size_of::<WorkflowRef>(), 16);
+        assert_eq!(wf.0.len(), 16);
+    }
+
+    #[test]
+    fn workflow_ref_distinct_values_not_equal() {
+        let wf_a = WorkflowRef([0x01; 16]);
+        let wf_b = WorkflowRef([0x02; 16]);
+        assert_ne!(wf_a, wf_b);
+    }
+
+    #[test]
+    fn workflow_ref_same_values_equal() {
+        let wf_a = WorkflowRef([0xAB; 16]);
+        let wf_b = WorkflowRef([0xAB; 16]);
+        assert_eq!(wf_a, wf_b);
+    }
+
+    #[test]
+    fn workflow_ref_debug_truncates() {
+        // Debug output must not reveal full handle (I-K8).
+        let mut bytes = [0x00u8; 16];
+        bytes[0] = 0xDE;
+        bytes[1] = 0xAD;
+        bytes[2] = 0xBE;
+        bytes[3] = 0xEF;
+        let wf = WorkflowRef(bytes);
+        let dbg = format!("{wf:?}");
+        assert!(dbg.starts_with("WorkflowRef("));
+        assert!(dbg.contains('\u{2026}')); // ellipsis character
+    }
+
+    #[test]
+    fn workflow_ref_hashable_for_table_lookup() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        let wf1 = WorkflowRef([0x01; 16]);
+        let wf2 = WorkflowRef([0x02; 16]);
+        set.insert(wf1);
+        set.insert(wf2);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&wf1));
+    }
+
+    #[test]
+    fn operation_advisory_empty_is_none_everywhere() {
+        let adv = OperationAdvisory::empty();
+        assert!(adv.workflow_ref.is_none());
+        assert!(adv.phase_id.is_none());
+        assert!(adv.access_pattern.is_none());
+        assert!(adv.priority.is_none());
+        assert!(adv.affinity.is_none());
+        assert!(adv.retention_intent.is_none());
+        assert!(adv.dedup_intent.is_none());
+    }
+}

@@ -312,4 +312,38 @@ mod tests {
             Err(NfsAuthError::MethodNotAllowed(NfsAuthMethod::None))
         ));
     }
+
+    // ---------------------------------------------------------------
+    // Scenario: NFS gateway authenticates incoming client
+    // Gateway configured for a tenant; client validates against
+    // tenant config and maps identity to the authorization model.
+    // ---------------------------------------------------------------
+    #[test]
+    fn nfs_gateway_authenticates_client_to_tenant() {
+        let tenant = test_org_id();
+        let export = NfsExportAuth {
+            path: "/data/pharma".into(),
+            allowed_methods: vec![NfsAuthMethod::AuthSys, NfsAuthMethod::Kerberos],
+            tenant_id: tenant,
+            uid_mapping: UidMapping::AllToTenant,
+        };
+
+        // AUTH_SYS client authenticates and is mapped to tenant.
+        let creds = NfsCredentials::from_auth_sys(1000, 1000, "nfs-client-1.local".into());
+        let result = validate_credentials(&creds, &export);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), tenant);
+
+        // Kerberos client also maps to same tenant.
+        let krb_creds = NfsCredentials {
+            method: NfsAuthMethod::Kerberos,
+            uid: 1000,
+            gid: 1000,
+            hostname: "nfs-client-2.local".into(),
+            principal: Some("user@PHARMA.COM".into()),
+        };
+        let result2 = validate_credentials(&krb_creds, &export);
+        assert!(result2.is_ok());
+        assert_eq!(result2.unwrap(), tenant);
+    }
 }

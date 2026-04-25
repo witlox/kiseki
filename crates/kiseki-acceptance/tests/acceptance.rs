@@ -37,6 +37,7 @@ use kiseki_control::iam::AccessRequest;
 use kiseki_control::maintenance::MaintenanceState;
 use kiseki_control::namespace::NamespaceStore;
 use kiseki_control::retention::RetentionStore;
+use kiseki_control::shard_topology::{NamespaceShardMapStore, ShardTopologyConfig};
 use kiseki_control::storage_admin::StorageAdminService;
 use kiseki_control::tenant::TenantStore;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
@@ -59,7 +60,7 @@ mod steps;
 #[world(init = Self::new)]
 pub struct KisekiWorld {
     // === Real implementations (in-memory stores) ===
-    pub log_store: Arc<MemShardStore>,
+    pub log_store: Arc<dyn LogOps + Send + Sync>,
     pub key_store: MemKeyStore,
     pub audit_log: AuditLog,
     pub chunk_store: ChunkStore,
@@ -133,6 +134,11 @@ pub struct KisekiWorld {
     // === Storage admin (ADR-025) ===
     pub control_admin: StorageAdminService,
 
+    // === Shard topology (ADR-033) ===
+    pub topology_config: ShardTopologyConfig,
+    pub shard_map_store: Arc<NamespaceShardMapStore>,
+    pub topology_active_nodes: Vec<NodeId>,
+
     // === Small-file placement (ADR-030) ===
     pub sf_node_count: u64,
     pub sf_soft_limit_pct: u8,
@@ -174,6 +180,9 @@ pub struct KisekiWorld {
     pub block_extents: Vec<Extent>,
     pub block_temp_dir: Option<tempfile::TempDir>,
     pub block_scrub_report: Option<String>,
+
+    // === Raft test cluster (ADR-037) ===
+    pub raft_cluster: Option<kiseki_log::raft::test_cluster::RaftTestCluster>,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -215,13 +224,15 @@ impl KisekiWorld {
             tenant_id: default_tenant,
             shard_id: default_shard,
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         });
 
-        let gateway = Arc::new(InMemoryGateway::new(
-            gw_comps,
-            Box::new(gw_chunks),
-            gw_master,
-        ));
+        let shard_map_store = Arc::new(NamespaceShardMapStore::new());
+        let gateway = Arc::new(
+            InMemoryGateway::new(gw_comps, Box::new(gw_chunks), gw_master)
+                .with_shard_map(Arc::clone(&shard_map_store)),
+        );
         let nfs_gw = NfsGateway::new(Arc::clone(&gateway));
         let nfs_ctx = Arc::new(NfsContext::new(nfs_gw, default_tenant, default_ns));
 
@@ -289,6 +300,9 @@ impl KisekiWorld {
             kms_circuit_open: false,
             kms_concurrent_count: 0,
             control_admin: StorageAdminService::new(),
+            topology_config: ShardTopologyConfig::default(),
+            shard_map_store,
+            topology_active_nodes: Vec::new(),
             sf_node_count: 3,
             sf_soft_limit_pct: 50,
             sf_hard_limit_pct: 75,
@@ -327,6 +341,7 @@ impl KisekiWorld {
             block_extents: Vec::new(),
             block_temp_dir: None,
             block_scrub_report: None,
+            raft_cluster: None,
         }
     }
 
@@ -373,6 +388,7 @@ impl KisekiWorld {
                 iops: 100_000,
                 metadata_ops_per_sec: 10_000,
             },
+            compression_enabled: false,
         };
         let _ = self.control_tenant_store.create_org(org);
     }
@@ -393,9 +409,86 @@ impl KisekiWorld {
             tenant_id,
             shard_id,
             read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
         });
         self.namespace_ids.insert(name.to_owned(), ns_id);
         ns_id
+    }
+
+    /// Create a multi-shard namespace via the real shard topology store,
+    /// then register each shard in the log store with its key range and
+    /// register the namespace in the gateway's composition store.
+    ///
+    /// This is the integrated path: topology → log store → composition → gateway.
+    pub async fn ensure_topology_namespace(
+        &mut self,
+        name: &str,
+        tenant_name: &str,
+        requested_shards: Option<u32>,
+    ) {
+        use kiseki_control::shard_topology;
+
+        let tenant_id = self.ensure_tenant(tenant_name);
+        let ns_id = NamespaceId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            name.as_bytes(),
+        ));
+
+        // Create namespace in the shard map store under the UUID string
+        // (matches gateway routing: NamespaceId.0.to_string()) and also
+        // store an alias under the human name for step definition lookups.
+        let ns_key = ns_id.0.to_string();
+        let map = self
+            .shard_map_store
+            .create_namespace(
+                &ns_key,
+                tenant_id,
+                &self.topology_config,
+                &self.topology_active_nodes,
+                requested_shards,
+            )
+            .expect("topology namespace creation should succeed");
+        // Alias: store under human name too for step definition lookups.
+        self.shard_map_store.alias(name, &ns_key);
+
+        // Register each shard in the log store with its specific key range.
+        for shard_range in &map.shards {
+            self.log_store.create_shard(
+                shard_range.shard_id,
+                tenant_id,
+                shard_range.leader_node,
+                ShardConfig::default(),
+            );
+            self.log_store.update_shard_range(
+                shard_range.shard_id,
+                shard_range.range_start,
+                shard_range.range_end,
+            );
+        }
+
+        // Register namespace in the gateway's composition store,
+        // pointing to the first shard as default.
+        let default_shard = map.shards[0].shard_id;
+        let ns = Namespace {
+            id: ns_id,
+            tenant_id,
+            shard_id: default_shard,
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        };
+        self.gateway.add_namespace(ns.clone()).await;
+
+        self.namespace_ids.insert(name.to_owned(), ns_id);
+    }
+
+    /// Advance the key manager to the specified epoch by rotating.
+    pub async fn advance_to_epoch(&self, target: u64) {
+        use kiseki_keymanager::epoch::KeyManagerOps;
+        while self.key_store.current_epoch().await.unwrap().0 < target {
+            self.key_store.rotate().await.unwrap();
+        }
     }
 
     /// Get or create a view by name.
@@ -443,6 +536,8 @@ impl KisekiWorld {
                 tenant_id,
                 shard_id,
                 read_only: false,
+                versioning_enabled: false,
+                compliance_tags: Vec::new(),
             })
             .await;
     }
@@ -521,22 +616,27 @@ impl KisekiWorld {
             .get(ns_name)
             .unwrap_or(&NamespaceId(uuid::Uuid::from_u128(1)));
 
-        // Ensure namespace and its shard exist in the gateway's stores.
-        let shard_id = ShardId(uuid::Uuid::from_u128(1));
-        self.log_store.create_shard(
-            shard_id,
-            tenant_id,
-            kiseki_common::ids::NodeId(1),
-            ShardConfig::default(),
-        );
-        self.gateway
-            .add_namespace(Namespace {
-                id: ns_id,
-                tenant_id,
+        // If the namespace was already registered (e.g., via ensure_topology_namespace),
+        // use its existing shards. Otherwise create a default full-range shard.
+        if !self.namespace_ids.contains_key(ns_name) {
+            let shard_id = ShardId(uuid::Uuid::from_u128(1));
+            self.log_store.create_shard(
                 shard_id,
-                read_only: false,
-            })
-            .await;
+                tenant_id,
+                kiseki_common::ids::NodeId(1),
+                ShardConfig::default(),
+            );
+            self.gateway
+                .add_namespace(Namespace {
+                    id: ns_id,
+                    tenant_id,
+                    shard_id,
+                    read_only: false,
+                    versioning_enabled: false,
+                    compliance_tags: Vec::new(),
+                })
+                .await;
+        }
 
         self.gateway
             .write(WriteRequest {
@@ -578,5 +678,18 @@ impl KisekiWorld {
 
 fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(KisekiWorld::cucumber().run("features/"));
+
+    // By default, skip @slow scenarios (Raft clusters take ~1s each).
+    // Include them with: cargo test -p kiseki-acceptance --features slow-tests
+    #[cfg(feature = "slow-tests")]
+    let runner = KisekiWorld::cucumber();
+    #[cfg(not(feature = "slow-tests"))]
+    let runner = KisekiWorld::cucumber().filter_run("features/", |_, _, sc| {
+        !sc.tags.iter().any(|t| t == "slow")
+    });
+
+    #[cfg(feature = "slow-tests")]
+    rt.block_on(runner.run("features/"));
+    #[cfg(not(feature = "slow-tests"))]
+    rt.block_on(runner);
 }

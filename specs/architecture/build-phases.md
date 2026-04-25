@@ -1,7 +1,7 @@
 # Build Phases — Dependency-Ordered Build Sequence
 
 **Status**: Architect phase.
-**Last updated**: 2026-04-17.
+**Last updated**: 2026-04-25. Added Phase 13 (cluster topology — ADR-033/034/035).
 
 Build order follows the dependency graph. Each phase can be built and
 tested independently before the next phase starts. No incremental
@@ -287,6 +287,56 @@ updates.
 multi-tenant isolation verified, key rotation mid-traffic works,
 advisory runtime overload does not block data path (F-ADV-1 simulated
 and data-path SLOs maintained).
+
+---
+
+## Phase 13: Cluster Topology (ADR-033, ADR-034, ADR-035)
+
+**Crates**: `kiseki-control`, `kiseki-log`, `kiseki-gateway`, `kiseki-client`
+**Depends on**: Phase 3 (log), Phase 11 (control plane), Phase 12 (integration)
+
+Three sub-phases, in dependency order:
+
+### Phase 13a: Persistent namespace shard map + initial topology (ADR-033)
+
+- Replace `NamespaceStore` in-memory HashMap with Raft-backed `NamespaceShardMapStore`
+- `CreateNamespace` computes `initial_shards`, creates N Raft groups with uniform key ranges
+- I-L12 placement: fewest-leaders-for-namespace with NodeId tie-break
+- `GetNamespaceShardMap` RPC for gateway/client routing cache
+- Gateway routing: replace hardcoded `ShardId::from_u128(1)` with `route_to_shard()`
+- Wire `ShardEndpoint` in discovery response
+- I-L11 ratio-floor evaluator (background, topology-change triggered)
+
+**Exit criteria**: namespace creation produces N shards distributed across
+nodes; writes route to correct shard by hashed_key; shard map survives
+process restart; ratio-floor auto-split fires when nodes are added.
+
+### Phase 13b: Shard merge (ADR-034)
+
+- Merge candidate scanner (periodic, 5-min interval)
+- Copy-then-cutover merge protocol
+- `ShardMerged` event handling in gateway, view stream processor
+- `Merging`/`Retiring` shard states
+- F-O6 merge/split race exclusion
+
+**Exit criteria**: adjacent under-utilized shards merge after 24h;
+merge does not block writes (< 50ms cutover pause); merged shard
+serves reads correctly; split during merge is rejected.
+
+### Phase 13c: Node lifecycle + drain (ADR-035)
+
+- `NodeRecord` with state machine in control plane Raft
+- `DrainNode` / `CancelDrain` RPCs
+- Drain orchestrator: leadership transfer → voter replacement → eviction
+- Pre-check: refuse drain if RF would be violated
+- `DrainProgress` persistence for crash recovery
+- Drain audit events
+- CLI: `kiseki-admin node drain|drain-cancel|list|status`
+
+**Exit criteria**: drain moves all leaders and voters off a node without
+dropping below RF=3 at any step; drain refused on 3-node cluster without
+replacement; cancelled drain returns node to Active with no rollback of
+completed replacements; drain survives orchestrator restart.
 
 ---
 

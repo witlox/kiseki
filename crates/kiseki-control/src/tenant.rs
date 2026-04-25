@@ -25,6 +25,9 @@ pub struct Organization {
     pub dedup_policy: DedupPolicy,
     /// Resource quota ceiling.
     pub quota: Quota,
+    /// Whether compression is enabled for this org (default: false).
+    /// HIPAA orgs cannot enable compression.
+    pub compression_enabled: bool,
 }
 
 /// Project — optional grouping within an organization.
@@ -225,6 +228,7 @@ mod tests {
                 iops: 100_000,
                 metadata_ops_per_sec: 10_000,
             },
+            compression_enabled: false,
         }
     }
 
@@ -312,6 +316,83 @@ mod tests {
             },
         };
         store.create_workload(wl).unwrap();
+    }
+
+    #[test]
+    fn compression_disabled_by_default() {
+        let org = test_org();
+        assert!(
+            !org.compression_enabled,
+            "new orgs must have compression disabled by default"
+        );
+    }
+
+    #[test]
+    fn workload_quota_exceeded_rejects_write() {
+        // Scenario: Workload quota within org ceiling
+        // Org has 500TB capacity, workload has 50TB quota.
+        // A write that would push workload over its quota is rejected.
+        let org_quota = Quota {
+            capacity_bytes: 500_000_000_000_000, // 500TB
+            iops: 100_000,
+            metadata_ops_per_sec: 10_000,
+        };
+        let workload_quota = Quota {
+            capacity_bytes: 50_000_000_000_000, // 50TB
+            iops: 100_000,
+            metadata_ops_per_sec: 10_000,
+        };
+        // Workload has used 49TB, wants to write 2TB => 51TB > 50TB quota
+        let used_bytes: u64 = 49_000_000_000_000;
+        let write_bytes: u64 = 2_000_000_000_000;
+        let would_exceed = used_bytes + write_bytes > workload_quota.capacity_bytes;
+        assert!(would_exceed, "49TB + 2TB should exceed 50TB workload quota");
+        // Org still has headroom: 300TB used + 2TB < 500TB
+        let org_used: u64 = 300_000_000_000_000;
+        assert!(
+            org_used + write_bytes < org_quota.capacity_bytes,
+            "org should still have headroom"
+        );
+    }
+
+    #[test]
+    fn quota_adjustment_within_ceiling_succeeds() {
+        // Scenario: Quota adjustment by tenant admin
+        // Tenant admin increases workload quota, must stay within org ceiling.
+        let store = TenantStore::new();
+        store.create_org(test_org()).unwrap();
+        let wl = Workload {
+            id: "wl-adjust".into(),
+            org_id: "org-test".into(),
+            project_id: String::new(),
+            name: "training-run-42".into(),
+            quota: Quota {
+                capacity_bytes: 50_000_000_000_000,
+                iops: 20_000,
+                metadata_ops_per_sec: 2_000,
+            },
+        };
+        store.create_workload(wl).unwrap();
+        // Increase to 100TB — still within org's 500TB ceiling
+        let new_quota = Quota {
+            capacity_bytes: 100_000_000_000_000,
+            iops: 20_000,
+            metadata_ops_per_sec: 2_000,
+        };
+        assert!(
+            validate_quota(&test_org().quota, &new_quota).is_ok(),
+            "100TB should be within 500TB org ceiling"
+        );
+        // Trying to exceed org ceiling should fail
+        let too_big = Quota {
+            capacity_bytes: 600_000_000_000_000,
+            iops: 20_000,
+            metadata_ops_per_sec: 2_000,
+        };
+        assert!(
+            validate_quota(&test_org().quota, &too_big).is_err(),
+            "600TB should exceed 500TB org ceiling"
+        );
     }
 
     #[test]

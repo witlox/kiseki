@@ -27,8 +27,8 @@
 ## Inline Documentation
 
 - Doc comments explain WHY, not WHAT
-- All public items documented (rustdoc `///`, godoc comments)
-- Module-level docs (`//!` in Rust, package doc in Go)
+- All public items documented (rustdoc `///`)
+- Module-level docs (`//!` in Rust)
 - Code comments only where logic isn't self-evident
 
 ## Keeping Docs Current

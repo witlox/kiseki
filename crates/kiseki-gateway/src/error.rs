@@ -1,6 +1,7 @@
 //! Gateway errors.
 
 use kiseki_common::error::{KisekiError, PermanentError, SecurityError};
+use kiseki_common::ids::ShardId;
 
 /// Errors from gateway operations.
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +27,14 @@ pub enum GatewayError {
     StaleView {
         /// How far behind the view is (milliseconds).
         lag_ms: u64,
+    },
+
+    /// Delta's `hashed_key` is outside the target shard's key range (ADR-033).
+    /// Gateway should refresh shard map and retry with the correct shard.
+    #[error("key out of range for shard {shard_id:?}")]
+    KeyOutOfRange {
+        /// The shard that rejected the key.
+        shard_id: ShardId,
     },
 }
 

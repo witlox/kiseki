@@ -1,57 +1,54 @@
 # Workflow Router
 
 Role definitions in `.claude/roles/`. Read the relevant role file when
-activating a mode. These are behavioral constraints, not suggestions.
+activating a mode. These are behavioral constraints.
 
-## Standards
+## Role → files to load
 
-Engineering guidelines in `.claude/guidelines/` (general, cross-project):
-- `engineering.md` — commits, errors, code org, testing philosophy
-- `rust.md` — Rust tooling, style, clippy, cargo-deny
-- `go.md` — Go tooling, style, golangci-lint
-- `python.md` — Python tooling, ruff, mypy, pytest
-- `ci.md` — CI/CD pipeline structure
-- `docs.md` — documentation requirements
+| Role | Load these files |
+|------|-----------------|
+| analyst | `roles/analyst.md` |
+| architect | `roles/architect.md`, `coding/rust.md` |
+| adversary | `roles/adversary.md`, `coding/rust.md` (impl review) |
+| implementer | `roles/implementer.md`, `coding/rust.md`, `coding/python.md`, `guidelines/engineering.md` |
+| auditor | `roles/auditor.md` |
+| integrator | `roles/integrator.md`, `guidelines/ci.md` |
 
-Project-specific coding standards in `.claude/coding/`:
-- `rust.md` — kiseki Rust: unsafe policy, FIPS crypto, traits, BDD
-- `go.md` — kiseki Go: control plane, gRPC boundary, godog
-- `python.md` — kiseki Python: PyO3 bindings, e2e test scripting
+Standards: `.claude/guidelines/`. Coding: `.claude/coding/`.
 
-## Pre-commit discipline
+## Pre-commit
 
-Before committing: `make` (runs lint + test + build). Use `/project:verify`
-for the full checklist.
+`make` (lint + test + build). Use `/project:verify` for full checklist.
 
-## Automatic command invocation
+## Automatic commands
 
-| Command | When to invoke automatically |
+| Command | When |
 |---|---|
-| `/project:status` | **First message of every new session.** Establishes project state before any work. |
-| `/project:verify` | **Before every commit.** Do not commit without running this. If it fails, fix and re-run. |
-| `/project:spec-check` | **After completing a build phase.** Validates specs still align with code before moving to next phase. Also run after any spec or architecture change. |
-| `/project:e2e` | **After Phase 12 (integration) and before declaring integration complete.** Also run after any change that touches cross-context boundaries. |
+| `/project:status` | First message of every new session |
+| `/project:verify` | Before every commit |
+| `/project:spec-check` | After completing a build phase or spec change |
+| `/project:e2e` | After cross-context boundary changes |
 
-## Mode detection (every response)
+## Mode detection
 
 ### Step 1: Project state
 
-1. `specs/fidelity/INDEX.md` with checkpoint? -> Baselined (current: CHECKPOINT)
-2. `specs/fidelity/SWEEP.md` IN PROGRESS? -> Resume sweep
-3. Source code exists and tested? -> Brownfield with baseline
-4. Near-empty? -> Pure greenfield
+1. `specs/fidelity/INDEX.md` with checkpoint? → Baselined
+2. `specs/fidelity/SWEEP.md` IN PROGRESS? → Resume sweep
+3. Source code exists and tested? → Brownfield with baseline
+4. Near-empty? → Pure greenfield
 
-### Step 2: User intent -> mode -> role
+### Step 2: User intent → role
 
 | Intent | Mode | Role |
 |--------|------|------|
 | status | ASSESS | Read indexes |
 | sweep / baseline | SWEEP | auditor |
-| adversary sweep / security review | ADV-SWEEP | adversary |
+| adversary sweep | ADV-SWEEP | adversary |
 | audit [X] | AUDIT | auditor |
-| implement / add | FEATURE | Feature Protocol |
-| fix / bug / error | BUGFIX | Bugfix Protocol |
-| design / spec | DESIGN | Design Protocol |
+| implement / add | FEATURE | implementer |
+| fix / bug / error | BUGFIX | implementer |
+| design / spec | DESIGN | analyst or architect |
 | review / find flaws | REVIEW | adversary |
 | integrate | INTEGRATE | integrator |
 | continue / next | RESUME | Read sweep state |
@@ -63,29 +60,27 @@ for the full checklist.
 Mode: [MODE]. Project: [state]. Role: [role]. Reason: [why].
 ```
 
-## Role switching
-
-On switch: `Switching to [role]. Previous: [role].`
-Read `.claude/roles/[role].md`. Apply its constraints.
-
 ## Protocols
 
-**Feature**: analyst -> spec | architect -> interfaces | adversary -> gate 1 | implementer -> BDD+code | auditor -> gate 2 | adversary -> findings | integrator (if cross-feature). Done = scenarios pass + fidelity HIGH + adversary signed off.
+**Feature**: analyst → spec | architect → interfaces | adversary → gate 1 | implementer → BDD+code | auditor → gate 2 | adversary → findings | integrator (if cross-feature).
 
-**Bugfix**: diagnose -> failing test first -> fix -> audit depth -> update index.
+Gate 2: auditor verifies step depth. See `roles/auditor.md`.
 
-**Design**: new domain -> analyst | arch change -> architect | ADR -> write it. Adversary reviews before implementation.
+**Bugfix**: diagnose → failing test first → fix → audit depth → update index.
 
-**Sweep**: fidelity (auditor) and adversary can run in parallel. Fidelity first when possible — LOW areas get higher adversary priority.
+**Design**: new domain → analyst | arch change → architect | ADR → write it. Adversary reviews before implementation.
+
+**Sweep**: fidelity (auditor) and adversary in parallel. LOW areas get higher adversary priority.
 
 ## Entry point
 
-**Phase 12 complete** (current state): 12 crates implemented, 32 ADRs
-(001-032), 599/599 BDD scenarios passing, 753 unit/integration tests.
-Async GatewayOps (ADR-032) deployed. Performance benchmarked on GCP
-(1.1 GB/s S3 write, 1.1 GB/s read). NFS/pNFS/FUSE functional locally.
-Enter via FEATURE or BUGFIX mode for new work.
+Phase 13 (cluster topology) in progress. 12 crates, 35 ADRs,
+241 @integration BDD scenarios as implementer targets.
 
 ## Escalation paths
 
-Implementer -> Architect (interface) or Analyst (spec). Adversary -> Architect (structural) or Analyst (gap). Auditor -> Implementer (shallow tests) or Architect (contract divergence). Integrator -> Architect (cross-cutting). All go to `specs/escalations/`.
+Implementer → Architect (interface) or Analyst (spec).
+Adversary → Architect (structural) or Analyst (gap).
+Auditor → Implementer (shallow tests) or Architect (contract divergence).
+Integrator → Architect (cross-cutting).
+All go to `specs/escalations/`.

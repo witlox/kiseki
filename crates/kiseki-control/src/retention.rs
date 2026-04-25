@@ -77,3 +77,56 @@ impl Default for RetentionStore {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_retention_hold_blocks_gc() {
+        // Scenario: Set retention hold before crypto-shred
+        let store = RetentionStore::new();
+        store.set_hold("hipaa-litigation-2026", "trials").unwrap();
+
+        // Hold is active — physical GC must be blocked
+        assert!(
+            store.is_held("trials"),
+            "namespace under hold must report held"
+        );
+
+        // Verify the hold exists with correct metadata
+        let holds = store.holds.read().unwrap();
+        let hold = holds.get("hipaa-litigation-2026").unwrap();
+        assert!(hold.active);
+        assert_eq!(hold.namespace_id, "trials");
+        assert_eq!(hold.name, "hipaa-litigation-2026");
+    }
+
+    #[test]
+    fn release_retention_hold_enables_gc() {
+        // Scenario: Release retention hold
+        let store = RetentionStore::new();
+        store.set_hold("hipaa-litigation-2026", "trials").unwrap();
+        assert!(store.is_held("trials"));
+
+        // Release the hold
+        store.release_hold("hipaa-litigation-2026").unwrap();
+
+        // After release, chunks with refcount 0 become eligible for GC
+        assert!(
+            !store.is_held("trials"),
+            "released hold should not block GC"
+        );
+
+        // Verify hold is inactive
+        let holds = store.holds.read().unwrap();
+        let hold = holds.get("hipaa-litigation-2026").unwrap();
+        assert!(!hold.active);
+    }
+
+    #[test]
+    fn release_nonexistent_hold_fails() {
+        let store = RetentionStore::new();
+        assert!(store.release_hold("nonexistent").is_err());
+    }
+}

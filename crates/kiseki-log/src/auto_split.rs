@@ -10,7 +10,6 @@
 use kiseki_common::ids::{NodeId, OrgId, ShardId};
 
 use crate::shard::{ShardConfig, ShardInfo};
-use crate::store::MemShardStore;
 use crate::traits::LogOps;
 
 /// Result of checking whether a shard should split.
@@ -117,13 +116,13 @@ pub fn plan_split(info: &ShardInfo) -> Option<SplitPlan> {
     })
 }
 
-/// Execute a split plan on an in-memory log store.
+/// Execute a split plan on any LogOps backend.
 ///
 /// 1. Create the new shard with the upper key range.
 /// 2. Redistribute deltas from the original shard to the new one.
 /// 3. Update key ranges on both shards.
-pub async fn execute_split(
-    log: &MemShardStore,
+pub async fn execute_split<L: LogOps + ?Sized>(
+    log: &L,
     plan: &SplitPlan,
 ) -> Result<(), crate::error::LogError> {
     // Create new shard for the upper range.

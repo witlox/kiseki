@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use kiseki_common::advisory::{PhaseId, WorkflowRef, WorkloadProfile};
+use kiseki_common::advisory::{PhaseId, Priority, WorkflowRef, WorkloadProfile};
 
 use crate::error::AdvisoryError;
 
@@ -19,6 +19,16 @@ pub struct WorkflowEntry {
     pub phase_history: Vec<PhaseId>,
     /// Max phases to retain in history.
     max_history: usize,
+    /// TTL in seconds (0 = no TTL).
+    pub ttl_seconds: u64,
+    /// Whether this workflow has been ended.
+    pub ended: bool,
+    /// End reason (if ended).
+    pub end_reason: Option<String>,
+    /// Count of evicted phases (for ring eviction tracking).
+    pub evicted_phase_count: u64,
+    /// Snapshotted priority at declare time.
+    pub snapshotted_priority: Option<Priority>,
 }
 
 impl WorkflowEntry {
@@ -36,7 +46,38 @@ impl WorkflowEntry {
             current_phase: initial_phase,
             phase_history: vec![initial_phase],
             max_history,
+            ttl_seconds: 0,
+            ended: false,
+            end_reason: None,
+            evicted_phase_count: 0,
+            snapshotted_priority: None,
         }
+    }
+
+    /// Create with TTL.
+    #[must_use]
+    pub fn with_ttl(mut self, ttl_seconds: u64) -> Self {
+        self.ttl_seconds = ttl_seconds;
+        self
+    }
+
+    /// Create with snapshotted priority.
+    #[must_use]
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.snapshotted_priority = Some(priority);
+        self
+    }
+
+    /// End this workflow with a reason.
+    pub fn end(&mut self, reason: &str) {
+        self.ended = true;
+        self.end_reason = Some(reason.to_owned());
+    }
+
+    /// Check TTL expiry. Returns true if expired.
+    #[must_use]
+    pub fn is_ttl_expired(&self, elapsed_seconds: u64) -> bool {
+        self.ttl_seconds > 0 && elapsed_seconds > self.ttl_seconds
     }
 
     /// Advance to a new phase. Must be strictly greater than current (I-WA13).
@@ -51,6 +92,7 @@ impl WorkflowEntry {
         self.phase_history.push(new_phase);
         if self.phase_history.len() > self.max_history {
             self.phase_history.remove(0);
+            self.evicted_phase_count += 1;
         }
         Ok(())
     }
@@ -182,6 +224,63 @@ mod tests {
                 requested: 1
             }
         ));
+    }
+
+    #[test]
+    fn concurrent_phase_advance_serialized() {
+        // Spawn 2 threads that both call advance_phase(6) on the same
+        // WorkflowEntry (protected by Mutex). Exactly one must succeed
+        // and the other must get PhaseNotMonotonic (since 6 == 6 after
+        // the first advance, violating monotonicity).
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let entry = Arc::new(Mutex::new(WorkflowEntry::new(
+            test_ref(),
+            WorkloadProfile::AiTraining,
+            PhaseId(1),
+            10,
+        )));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+
+        for _ in 0..2 {
+            let entry = Arc::clone(&entry);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut e = entry.lock().unwrap();
+                e.advance_phase(PhaseId(6))
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(successes, 1, "exactly one thread must succeed");
+        assert_eq!(failures, 1, "exactly one thread must fail");
+
+        // The failing result must be PhaseNotMonotonic.
+        let err = results
+            .into_iter()
+            .find(std::result::Result::is_err)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AdvisoryError::PhaseNotMonotonic {
+                    current: 6,
+                    requested: 6
+                }
+            ),
+            "expected PhaseNotMonotonic(6, 6), got {err:?}"
+        );
+
+        // Final phase must be 6.
+        let e = entry.lock().unwrap();
+        assert_eq!(e.current_phase, PhaseId(6));
     }
 
     #[test]

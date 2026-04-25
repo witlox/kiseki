@@ -11,7 +11,7 @@ use kiseki_raft::redb_log_store::RedbLogStore;
 
 use crate::delta::Delta;
 use crate::error::LogError;
-use crate::shard::{ShardConfig, ShardInfo};
+use crate::shard::{ShardConfig, ShardInfo, ShardState};
 use crate::store::MemShardStore;
 use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 
@@ -211,6 +211,37 @@ impl LogOps for PersistentShardStore {
 
     async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         self.mem.compact_shard(shard_id).await
+    }
+
+    fn create_shard(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        node_id: NodeId,
+        config: ShardConfig,
+    ) {
+        // Delegate to inherent method (persists metadata to redb).
+        Self::create_shard(self, shard_id, tenant_id, node_id, config);
+    }
+
+    fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]) {
+        self.mem.update_shard_range(shard_id, range_start, range_end);
+    }
+
+    fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
+        self.mem.set_shard_state(shard_id, state);
+    }
+
+    fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
+        self.mem.set_shard_config(shard_id, config);
+    }
+
+    async fn register_consumer(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+        self.mem.register_consumer(shard_id, consumer, position)
+    }
+
+    async fn advance_watermark(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+        self.mem.advance_watermark(shard_id, consumer, position)
     }
 }
 

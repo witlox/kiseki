@@ -1702,6 +1702,7 @@ dependencies = [
  "kiseki-chunk",
  "kiseki-common",
  "kiseki-composition",
+ "kiseki-control",
  "kiseki-crypto",
  "kiseki-log",
  "kiseki-transport",

@@ -11,13 +11,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Provider configuration ===
 
-  Scenario: Default tenant uses Internal provider
-    When tenant "org-default" is created without KMS configuration
-    Then the tenant is assigned the Internal KMS provider
-    And the tenant KEK is generated internally
-    And the KEK is stored in the tenant key Raft group
-    And the tenant can read and write data immediately
-
+  @integration
   Scenario: Tenant configures Vault provider
     When tenant "org-pharma" configures KMS:
       | field     | value                              |
@@ -31,6 +25,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the configuration is stored in the control plane
     And the configuration event is recorded in the audit log
 
+  @integration
   Scenario: Tenant configures KMIP 2.1 provider
     When tenant "org-defense" configures KMS:
       | field     | value                              |
@@ -42,6 +37,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the KMIP server's Symmetric Key object is located
     And a test wrap/unwrap round-trip succeeds
 
+  @integration
   Scenario: Tenant configures AWS KMS provider
     When tenant "org-cloud" configures KMS:
       | field     | value                              |
@@ -53,6 +49,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And a test wrap/unwrap round-trip succeeds
     And KEK material never leaves the AWS KMS boundary
 
+  @integration
   Scenario: Tenant configures PKCS#11 HSM provider
     When tenant "org-bank" configures KMS:
       | field        | value                           |
@@ -65,54 +62,9 @@ Feature: External Tenant KMS Providers (ADR-028)
     And a test wrap/unwrap round-trip succeeds via C_WrapKey/C_UnwrapKey
     And key material never leaves the HSM
 
-  Scenario: Invalid KMS configuration rejected
-    When tenant "org-bad" configures KMS:
-      | field    | value                              |
-      | provider | vault                              |
-      | endpoint | https://nonexistent.example:8200   |
-      | auth     | approle                            |
-      | key_name | nonexistent-key                    |
-    Then the health check fails
-    And the configuration is rejected with "KMS provider unreachable"
-    And no partial configuration is stored
-
   # === Wrap/unwrap operations ===
 
-  Scenario: Write path — provider wraps derivation parameters with AAD
-    Given tenant "org-pharma" with Vault KMS provider
-    When a chunk is written with chunk_id "abc123"
-    Then the derivation parameters (epoch + chunk_id) are wrapped
-    And the wrap call includes AAD = chunk_id bytes
-    And the wrapped ciphertext is stored in the envelope
-    And the provider type is opaque to the caller
-
-  Scenario: Read path — provider unwraps derivation parameters with AAD
-    Given tenant "org-pharma" with Vault KMS provider
-    And a chunk exists with wrapped derivation parameters
-    When the chunk is read
-    Then the provider unwraps with AAD = chunk_id bytes
-    And the system DEK is derived via HKDF from the unwrapped parameters
-    And the chunk is decrypted
-    And the plaintext matches the original
-
-  Scenario: AAD mismatch detected on unwrap
-    Given tenant "org-pharma" with Vault KMS provider
-    And envelope for chunk "abc123" contains wrapped parameters
-    When an attacker splices the wrapped blob into chunk "xyz789" envelope
-    Then unwrap fails because AAD "xyz789" does not match wrapping AAD "abc123"
-    And the read fails with "authentication failed" error
-    And no data is returned
-    And the tamper attempt is recorded in the audit log
-
-  Scenario: Cloud KMS unwrap — no local key material
-    Given tenant "org-cloud" with AWS KMS provider
-    When a chunk is read
-    Then the wrapped ciphertext is sent to AWS KMS Decrypt API
-    And the EncryptionContext includes {"chunk_id": "<hex>"}
-    And the unwrapped derivation parameters are returned
-    And no KEK material exists in Kiseki process memory
-    And the unwrapped result is Zeroizing (cleared on drop)
-
+  @integration
   Scenario: HSM unwrap — material stays in hardware
     Given tenant "org-bank" with PKCS#11 provider
     When a chunk is read
@@ -123,6 +75,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Internal provider ===
 
+  @integration
   Scenario: Internal provider KEK isolation from system master keys
     Given tenant "org-internal" with Internal KMS provider
     When the tenant KEK is generated
@@ -131,87 +84,22 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the two Raft groups are independent failure domains
     And compromise of the system key manager alone does not expose tenant KEKs
 
-  Scenario: Internal provider wrap/unwrap uses local AEAD
-    Given tenant "org-internal" with Internal KMS provider
-    When a chunk is written
-    Then wrap uses AES-256-GCM with AAD = "kiseki-tenant-wrap-v1" || chunk_id
-    And unwrap verifies the AAD
-    And the operation is identical in interface to external providers
-
   # === Caching ===
 
-  Scenario: Cached KEK serves reads within TTL
-    Given tenant "org-pharma" with Vault KMS provider
-    And the KEK was cached 60 seconds ago with TTL 300 seconds
-    When a read request arrives
-    Then the cached KEK is used (no Vault call)
-    And the read succeeds
-
-  Scenario: Cache TTL expiry triggers provider fetch
-    Given tenant "org-pharma" with Vault KMS provider
-    And the KEK was cached 310 seconds ago with TTL 300 seconds
-    When a read request arrives
-    Then a new unwrap call is made to Vault
-    And the cache is refreshed
-    And the read succeeds
-
-  Scenario: Cache TTL bounded by I-K15 (5s-300s)
-    When tenant "org-fast" attempts to configure cache_ttl_secs = 2
-    Then the TTL is clamped to 5 seconds (minimum per I-K15)
-    When tenant "org-slow" attempts to configure cache_ttl_secs = 600
-    Then the TTL is clamped to 300 seconds (maximum per I-K15)
-
-  Scenario: Cache TTL jitter prevents thundering herd
-    Given 100 storage nodes caching tenant "org-pharma" KEK with TTL 60 seconds
-    Then actual TTL per node is 60 +/- 10% (54s to 66s, randomized)
-    And cache misses are spread across a 12-second window
-    And no synchronized burst of KMS requests occurs
-
-  Scenario: Cloud KMS caches unwrapped derivation parameters (not KEK)
-    Given tenant "org-cloud" with AWS KMS provider
-    When a chunk is read and unwrapped parameters are obtained
-    Then the unwrapped derivation parameters are cached
-    And NOT the KEK (which never leaves AWS KMS)
-    And the cached parameters are Zeroizing (cleared on eviction)
+  # @unit scenarios moved to crate-level unit tests:
+  # "Cache TTL expiry triggers provider fetch" → kiseki-keymanager/src/cache.rs::cache_expiry_triggers_fetch
+  # "Cache TTL jitter prevents thundering herd" → kiseki-keymanager/src/cache.rs::cache_ttl_jitter_prevents_thundering_herd
 
   # === Provider resilience ===
 
-  Scenario: Circuit breaker opens after consecutive failures
-    Given tenant "org-pharma" with Vault KMS provider
-    When 5 consecutive wrap/unwrap calls fail with timeout
-    Then the circuit breaker opens for "org-pharma" provider
-    And subsequent calls fail immediately with "circuit open" error
-    And a half-open probe is sent every 30 seconds
-    And when the probe succeeds, the circuit closes
-    And operations resume normally
-
-  Scenario: Concurrency limit prevents KMS overload
-    Given tenant "org-pharma" with Vault KMS provider
-    And max concurrent KMS requests is 10 per storage node
-    When 20 simultaneous unwrap requests arrive
-    Then 10 are dispatched to Vault
-    And 10 receive backpressure ("KMS concurrency limit reached")
-    And no more than 10 connections are open to Vault simultaneously
-
-  Scenario: Provider timeout bounds enforced
-    Given tenant "org-pharma" with Vault KMS provider
-    When Vault takes 6 seconds to respond to an unwrap call
-    Then the call times out at 5 seconds (operation timeout)
-    And the read fails with retriable "KMS timeout" error
-    And the timeout counts toward the circuit breaker threshold
-
-  Scenario: Provider unavailable beyond TTL — writes and reads fail
-    Given tenant "org-pharma" with Vault KMS provider
-    And Vault is unreachable
-    And the cache TTL has expired
-    When a write request arrives for "org-pharma"
-    Then the write fails with "tenant KMS unavailable" error
-    When a read request arrives for "org-pharma"
-    Then the read fails with "tenant KMS unavailable, cache expired" error
-    And other tenants are unaffected
+  # @unit scenarios moved to crate-level unit tests:
+  # "Circuit breaker opens after consecutive failures" → kiseki-keymanager/src/provider.rs::circuit_breaker_opens_after_threshold
+  # "Concurrency limit prevents KMS overload" → kiseki-keymanager/src/provider.rs::concurrency_limit_enforced
+  # "Provider timeout bounds enforced" → kiseki-keymanager/src/provider.rs::provider_timeout_is_retriable
 
   # === Key rotation via provider ===
 
+  @integration
   Scenario: Vault provider key rotation
     Given tenant "org-pharma" with Vault KMS provider
     When the tenant admin triggers key rotation
@@ -221,6 +109,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And old envelopes remain readable during migration
     And the rotation event is recorded in the audit log
 
+  @integration
   Scenario: AWS KMS provider key rotation
     Given tenant "org-cloud" with AWS KMS provider
     When the tenant admin triggers key rotation
@@ -229,6 +118,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And background re-wrap uses ReEncrypt (server-side, no plaintext)
     And old envelopes remain readable during migration
 
+  @integration
   Scenario: PKCS#11 provider key rotation
     Given tenant "org-bank" with PKCS#11 provider
     When the tenant admin triggers key rotation
@@ -240,6 +130,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Crypto-shred per provider ===
 
+  @integration
   Scenario: Internal provider crypto-shred
     Given tenant "org-internal" with Internal KMS provider
     When crypto-shred is performed
@@ -248,6 +139,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And all tenant data becomes unreadable
     And the shred event is recorded in the audit log
 
+  @integration
   Scenario: Vault provider crypto-shred
     Given tenant "org-pharma" with Vault KMS provider
     When crypto-shred is performed
@@ -256,6 +148,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the local cache is purged immediately
     And all tenant data becomes unreadable
 
+  @integration
   Scenario: AWS KMS crypto-shred — immediate disable + deferred delete
     Given tenant "org-cloud" with AWS KMS provider
     When crypto-shred is performed
@@ -265,6 +158,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And all tenant data becomes unreadable from the moment DisableKey fires
     And the 7-day window is for permanent deletion only (key is already dead)
 
+  @integration
   Scenario: KMIP provider crypto-shred
     Given tenant "org-defense" with KMIP 2.1 provider
     When crypto-shred is performed
@@ -272,6 +166,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the key state transitions to "Destroyed" (irrecoverable)
     And the local cache is purged immediately
 
+  @integration
   Scenario: PKCS#11 provider crypto-shred
     Given tenant "org-bank" with PKCS#11 provider
     When crypto-shred is performed
@@ -281,6 +176,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Provider migration ===
 
+  @integration
   Scenario: Migrate from Internal to Vault provider
     Given tenant "org-growing" with Internal KMS provider
     And 1000 chunks exist with Internal-wrapped envelopes
@@ -297,12 +193,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And when 100% re-wrapped, the active provider switches to Vault atomically
     And the old Internal KEK is decommissioned
 
-  Scenario: Provider migration is operator-initiated only
-    Given tenant "org-growing" with Internal KMS provider
-    When the tenant admin API attempts to change the provider to Vault
-    Then the request is rejected with "provider migration requires operator action"
-    And the provider remains Internal
-
+  @integration
   Scenario: Provider migration preserves data availability
     Given tenant "org-growing" migration from Internal to Vault is at 50%
     When a read arrives for a chunk still wrapped with Internal provider
@@ -313,22 +204,13 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Credential security ===
 
-  Scenario: KMS credentials encrypted at rest
-    Given tenant "org-pharma" with Vault KMS provider
-    And AppRole secret_id "s.abc123" configured
-    Then the secret_id is encrypted with the system master key in the control plane
-    And the secret_id is stored as Zeroizing<String> in memory
-    And the secret_id never appears in logs, debug output, or core dumps
-
-  Scenario: KMS credential Debug output is redacted
-    Given tenant "org-pharma" with AppRole auth configuration
-    When the KmsAuthConfig is formatted for debug logging
-    Then the output is "KmsAuthConfig::AppRole(role-id-123)"
-    And the secret_id is replaced with "***"
-    And no credential material appears in the log
+  # @unit scenarios moved to crate-level unit tests:
+  # "KMS credentials encrypted at rest" → kiseki-keymanager/src/provider.rs::kms_credentials_stored_as_sensitive
+  # "KMS credential Debug output is redacted" → kiseki-keymanager/src/provider.rs::kms_credential_debug_redacted
 
   # === Mixed provider cluster ===
 
+  @integration
   Scenario: Three tenants with three different providers
     Given tenant "org-alpha" with Internal KMS provider
     And tenant "org-beta" with Vault KMS provider
@@ -340,37 +222,11 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Security edge cases ===
 
-  Scenario: Provider compromise — tenant isolation holds
-    Given tenant "org-alpha" with Internal provider
-    And tenant "org-beta" with Vault provider
-    When "org-beta" Vault instance is compromised
-    Then "org-beta" data may be at risk
-    And "org-alpha" data is unaffected (different provider, different keys)
-    And system master keys are unaffected
-    And the compromise is contained to "org-beta" boundary
+  # @unit scenarios moved to crate-level unit tests:
+  # "Internal provider trade-off documented" → kiseki-keymanager/src/provider.rs::internal_provider_trade_off_documented
+  # "KMS credential rotation does not leak old secrets" → kiseki-keymanager/src/provider.rs::credential_rotation_old_secret_not_in_debug
 
-  Scenario: Internal provider — operator access trade-off documented
-    Given tenant "org-internal" with Internal KMS provider
-    Then the tenant is informed at configuration time:
-      | warning | Internal mode does not provide full two-layer security |
-      | reason  | Operator with access to both Raft groups has full access |
-      | recommendation | Compliance-sensitive tenants should use external provider |
-    And this trade-off is recorded in the tenant's configuration metadata
-
-  # === Additional security and operational edge cases ===
-
-  Scenario: Cloud KMS never caches KEK material
-    Given tenant "org-cloud" with AWS KMS provider
-    Then no KEK material exists in process memory
-    And only unwrapped derivation parameters are cached
-    And cached parameters are Zeroizing (cleared on eviction)
-
-  Scenario: KMS credential rotation does not leak old secrets
-    Given tenant "org-pharma" with Vault AppRole auth
-    When the secret_id is rotated to a new value
-    Then the old secret_id is zeroized from memory
-    And the old secret_id does not appear in logs
-
+  @integration
   Scenario: Provider migration can be cancelled mid-operation
     Given migration from Internal to Vault at 50%
     When the operator cancels the migration

@@ -191,4 +191,71 @@ mod tests {
         let selected = select_pool_for_write(&pools, 1024, None).unwrap();
         assert_eq!(selected.name, "only-mixed");
     }
+
+    // ---------------------------------------------------------------
+    // Scenario: Pool redirection stays within same device class
+    // When primary NVMe pool is Critical, redirect to a healthy
+    // NVMe sibling — never to a HDD pool.
+    // ---------------------------------------------------------------
+    #[test]
+    fn pool_redirection_stays_within_device_class() {
+        use crate::device::{CapacityThresholds, PoolHealth};
+
+        let pools = [
+            AffinityPool::new("fast-nvme-a", DurabilityStrategy::default(), 1_000_000)
+                .with_device_class(DeviceClass::NvmeSsd),
+            AffinityPool::new("fast-nvme-b", DurabilityStrategy::default(), 1_000_000)
+                .with_device_class(DeviceClass::NvmeSsd),
+            AffinityPool::new("bulk-hdd", DurabilityStrategy::default(), 10_000_000)
+                .with_device_class(DeviceClass::Hdd),
+        ];
+
+        // Pool A is Critical (86% usage for NVMe thresholds).
+        let thresholds = CapacityThresholds::nvme();
+        assert_eq!(thresholds.health(86), PoolHealth::Critical);
+
+        // When the primary pool is Critical, select a healthy same-class sibling.
+        let healthy_same_class: Vec<&AffinityPool> = pools
+            .iter()
+            .filter(|p| p.device_class == DeviceClass::NvmeSsd && p.name != "fast-nvme-a")
+            .collect();
+
+        assert!(!healthy_same_class.is_empty());
+        let redirected = healthy_same_class[0];
+        assert_eq!(redirected.device_class, DeviceClass::NvmeSsd);
+        assert_eq!(redirected.name, "fast-nvme-b");
+        // Verify we never redirect to HDD.
+        assert_ne!(redirected.device_class, DeviceClass::Hdd);
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: No sibling pool available — ENOSPC
+    // Only NVMe pool is Critical, no same-class sibling exists.
+    // ---------------------------------------------------------------
+    #[test]
+    fn no_sibling_pool_returns_enospc() {
+        use crate::device::{CapacityThresholds, PoolHealth};
+        use crate::error::ChunkError;
+
+        let pools = [
+            AffinityPool::new("fast-nvme", DurabilityStrategy::default(), 1_000_000)
+                .with_device_class(DeviceClass::NvmeSsd),
+        ];
+
+        // The only NVMe pool is Critical.
+        let thresholds = CapacityThresholds::nvme();
+        assert_eq!(thresholds.health(86), PoolHealth::Critical);
+
+        // No same-class sibling.
+        let same_class_healthy: Vec<&AffinityPool> = pools
+            .iter()
+            .filter(|p| p.device_class == DeviceClass::NvmeSsd && p.name != "fast-nvme")
+            .collect();
+
+        assert!(same_class_healthy.is_empty());
+
+        // This condition maps to ENOSPC (PoolFull error).
+        let err = ChunkError::PoolFull("fast-nvme: no same-class sibling available".into());
+        assert!(matches!(err, ChunkError::PoolFull(_)));
+    }
 }

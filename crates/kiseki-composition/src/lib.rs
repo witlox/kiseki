@@ -19,7 +19,9 @@ pub mod log_bridge;
 pub mod multipart;
 pub mod namespace;
 
-pub use composition::{composition_hash_key, Composition, CompositionOps};
+pub use composition::{
+    composition_hash_key, Composition, CompositionOps, DeleteResult, INLINE_DATA_THRESHOLD,
+};
 pub use error::CompositionError;
 pub use multipart::{MultipartState, MultipartUpload};
-pub use namespace::Namespace;
+pub use namespace::{ComplianceTag, Namespace};

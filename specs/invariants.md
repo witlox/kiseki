@@ -1,7 +1,14 @@
 # Invariants — Kiseki
 
-**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers), ADR-029 (Raw Block Device Allocator), ADR-030 (Dynamic Small-File Placement), and ADR-031 (Client-Side Cache).
-**Last updated**: 2026-04-23.
+**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers), ADR-029 (Raw Block Device Allocator), ADR-030 (Dynamic Small-File Placement), ADR-031 (Client-Side Cache), and ADR-033/034/035 (cluster topology, shard merge, node lifecycle — *architect designed, enforcement code pending*).
+**Last updated**: 2026-04-25.
+
+> **Spec-only marker**: Invariants tagged **`Spec-only`** below describe required system
+> behavior whose enforcement code is incomplete or absent today. The audit performed
+> 2026-04-25 found `auto_split::execute_split` is dead code, `NamespaceStore` is
+> in-process memory only, and shard merge / node drain have no implementation.
+> ADR-033/034/035 accepted with enforcement designs; implementer to wire.
+> Do not remove the marker until enforcement is wired and tested.
 
 All invariants below have been confirmed through interrogation with the
 domain expert unless marked otherwise.
@@ -21,6 +28,12 @@ domain expert unless marked otherwise.
 | I-L7 | Delta envelope has structurally separated system-visible header (cleartext/system-encrypted) and tenant-encrypted payload. Compaction operates on headers only; payloads are carried opaquely. | Confirmed |
 | I-L8 | Cross-shard rename returns EXDEV. Shards are independent consensus domains; no 2PC. Applications handle via copy + delete. | Confirmed |
 | I-L9 | A delta's inlined payload is immutable after write. `inline_threshold_bytes` changes apply prospectively only — existing deltas not re-evaluated. | Confirmed |
+| I-L10 | A namespace is created with an *initial shard topology*: `initial_shards = max(min(3 × node_count_at_creation, 64), 3)` by default. Cluster admin sets cluster-wide defaults; tenant admin may override per namespace within admin-defined min/max. The initial Raft groups are placed by *best-effort round-robin* (I-L12) so leaders distribute across nodes from creation. | Spec-only (ADR-033) |
+| I-L11 | The shards-per-node ratio for any namespace MUST NOT drop below the cluster *ratio floor* (default 1.5). Whenever a node-add event or namespace-creation event would leave the ratio below the floor, an auto-split is triggered for the affected namespace until the floor is restored. This trigger is in addition to the per-shard ceilings of I-L6; either trigger alone suffices to fire a split. | Spec-only (ADR-033) |
+| I-L12 | Leader placement at shard creation, split, and merge is *best-effort round-robin*: the new shard's initial leader is chosen as the node currently hosting the fewest leaders for the namespace, with deterministic tie-break on node ID. No invariant constrains post-hoc balance — drift between rebalancing events is permitted. Operators may trigger explicit rebalance (out of scope for ADR-033). | Spec-only (ADR-033) |
+| I-L13 | Two adjacent shards (by `hashed_key` range) are merged when (a) their combined utilization on every dimension (delta count, byte size, write throughput) is below the *merge threshold* (default 25% of split ceiling per dimension) for the *merge interval* (default 24 h), AND (b) the merge would not violate the I-L11 ratio floor. If either condition fails, no merge fires. Merge thresholds are configurable cluster-wide; tenant admin may override per namespace within the admin envelope. | Spec-only (ADR-034) |
+| I-L14 | Shard merge preserves total order across the merged `hashed_key` range. A reader of the resulting shard sees a sequence of deltas that is consistent with the per-shard total orders of both inputs at the time of merge. Merge does not block writes (consistent with A-O1 / I-O1). The merge protocol records a `ShardMerged` event identifying the input shard IDs, the resulting shard ID, the merged range, and the merge HLC timestamp. | Spec-only (ADR-034) |
+| I-L15 | The namespace-shard map (which shards constitute a namespace and which `hashed_key` range each owns) MUST be persisted in a Raft-replicated control-plane store. In-process memory ONLY is forbidden. Updates on namespace creation, shard split, and shard merge are applied atomically through the control plane's Raft group; the gateway and native client refresh their routing caches from this store. | Spec-only (ADR-033) |
 
 ---
 
@@ -185,6 +198,20 @@ domain expert unless marked otherwise.
 | ID | Invariant | Status |
 |---|---|---|
 | I-O6 | Maintenance mode sets cluster or specific shards to read-only. Write commands rejected with retriable error. Shard splits, compaction, and GC continue for in-progress operations but no new triggers fire from write pressure. | Confirmed |
+
+---
+
+## Node lifecycle invariants (ADR-035)
+
+| ID | Invariant | Status |
+|---|---|---|
+| I-N1 | Every cluster node has a *node state* in `{Active, Degraded, Failed, Draining, Evicted}`. `Active`: healthy. `Degraded`: partial device failures or SMART warnings — still reachable, no new shard assignments. `Failed`: unreachable (heartbeat timeout). `Draining`: operator-initiated graceful removal. `Evicted`: terminal. Automatic transitions: Active↔Degraded (condition-based), Active/Degraded→Failed (heartbeat timeout), Failed→Active (recovery). Operator transitions: Active/Degraded/Failed→Draining (`DrainNode`), Draining→Active (`CancelDrain`, I-N7). Draining→Evicted is automatic when all voter replacements complete. No transition out of `Evicted` — re-adding requires a fresh node identity. | Spec-only (ADR-035) |
+| I-N2 | A node in `Draining` state accepts no new leader assignments and MUST have leadership transferred off for every shard it currently leads before it can transition to `Evicted`. Leadership transfer uses the openraft membership primitive (no re-election). The new leader is selected per the I-L12 placement policy. | Spec-only (ADR-035) |
+| I-N3 | For every shard the draining node holds a voter slot in, a replacement voter is added on a surviving node, caught up to the leader's committed index, and promoted to voter before the old voter is removed. The cluster MUST NOT operate below RF=3 for any shard at any intermediate state during a drain (consistent with I-CS1, ADR-026). | Spec-only (ADR-035) |
+| I-N4 | A drain request is REFUSED at submission if completing it would leave any shard unable to satisfy I-N3 (e.g., a 3-node cluster cannot drain a node without first adding a replacement). The control plane returns `DrainRefused: insufficient capacity to maintain RF=N`. The operator must add a replacement node first, then re-issue the drain. | Spec-only (ADR-035) |
+| I-N5 | Re-replication completes — replacement voters caught up and promoted for every affected shard — before the node is allowed to enter `Evicted`. The drain may proceed concurrently across shards, bounded by the I-SF4 cluster-wide migration concurrency cap (`max(1, num_nodes / 10)` simultaneous migrations) to avoid Raft instability. | Spec-only (ADR-035) |
+| I-N6 | Node state transitions are recorded in the cluster audit shard with timestamp, reason, and admin identity. `Active → Draining`, `Draining → Evicted`, and any `DrainRefused` outcome are auditable events. Independent of device state transitions (I-D2). | Spec-only (ADR-035) |
+| I-N7 | A drain MAY be cancelled by the operator while the node is in `Draining` and has not yet entered `Evicted`. Cancellation transitions the node back to `Active` (the only permitted reverse transition). Voter replacements that completed before cancellation are NOT rolled back — they remain in their new placements; pending replacements are aborted; leader assignments may be rebalanced later by explicit operator action. | Spec-only (ADR-035) |
 
 ---
 

@@ -1,7 +1,7 @@
 # Assumptions Log — Kiseki
 
-**Status**: Active — updated for ADR-028 (External KMS Providers).
-**Last updated**: 2026-04-22.
+**Status**: Active — updated for ADR-028 (External KMS Providers) and ADR-033/034/035 (cluster topology, shard merge, node lifecycle — *spec-only, enforcement deferred*).
+**Last updated**: 2026-04-25.
 
 Statuses: **Validated** (confirmed true), **Rejected** (confirmed false),
 **Accepted** (acknowledged risk, proceeding), **Unknown** (needs investigation).
@@ -79,8 +79,7 @@ These emerged during interrogation and are explicitly NOT the analyst's
 decisions:
 
 1. ~~KMS deployment topology~~ — **RESOLVED** by ADR-028: pluggable TenantKmsProvider trait with 5 backends
-2. Shard split/merge threshold tuning: who configures (cluster admin,
-   tenant admin, both)?
+2. ~~Shard split/merge threshold tuning: who configures (cluster admin, tenant admin, both)?~~ — **RESOLVED** by analyst layer 2 update 2026-04-25: cluster admin sets cluster-wide defaults and per-tenant min/max envelope; tenant admin may override per namespace within that envelope. See A-N5.
 3. System DEK granularity: per-chunk vs. per-group
 4. FIPS module boundary: aws-lc-rs vs. ring vs. other
 5. Flavor best-fit matching algorithm
@@ -126,3 +125,15 @@ decisions:
 | A-CC2 | Software zeroize on NVMe/SSD provides adequate erasure for the threat model. Physical block remapping by the FTL may leave residual data on flash. | **Accepted (risk)** | Consistent with I-K8 (zeroize for heap memory). For environments requiring physical erasure, OPAL/SED NVMe with per-boot key rotation is recommended as operational hardening. |
 | A-CC3 | 5-second metadata TTL default is acceptable staleness for the target workload mix. Training runs (epoch reuse) and inference (static model) tolerate minutes of staleness. Climate simulations with hard deadlines use pinned mode (no TTL dependency). | **Accepted (risk)** | If workloads require sub-second freshness, they should use bypass mode or set `metadata_ttl_ms` lower. |
 | A-CC4 | `kiseki-cache-scrub` service will be deployed on compute nodes. If not deployed, crashed-process plaintext cleanup depends on the next kiseki process starting on the same node for the same tenant. | **Accepted (risk)** | Scrub service is a one-shot systemd unit or cron entry. Straightforward to deploy. If omitted, the security posture degrades to "plaintext persists until next same-tenant process or node reboot." |
+
+## Cluster topology and node-lifecycle assumptions (ADR-033, ADR-034, ADR-035)
+
+| # | Assumption | Status | Evidence / risk if false |
+|---|---|---|---|
+| A-N1 | Default initial shard count of `max(min(3 × node_count_at_creation, 64), 3)` gives day-one multi-leader distribution while bounding Raft-group overhead. | **Accepted (risk)** | The 3× multiplier is a starting point picked to give every node ~3 shards on average. The 64 cap is a soft limit chosen because each shard = 1 Raft group; 64 groups per cluster is well-tested in similar systems (Ceph PGs scale higher, but with batched heartbeats kiseki-raft does not yet support). If kiseki-raft adds Multi-Raft-style heartbeat batching, the cap can be raised. If the 3× starting ratio proves too sparse for typical workloads, the cluster admin may raise the multiplier without spec change. |
+| A-N2 | Ratio floor of 1.5× is sufficient to avoid stranding nodes idle when one shard is hot. | **Accepted (risk)** | At ratio 1.5, every node hosts on average 1.5 shards; even if one shard is hot enough to dominate a single node's resources, every other node has at least one alternative leader. Below 1.5 (e.g., 1.0), a single hot shard can monopolize a node. The floor is cluster-admin configurable; if observed workloads need higher headroom, raise it. |
+| A-N3 | Best-effort round-robin leader placement at creation/split/merge is sufficient for steady-state balance; explicit periodic rebalance is not required for correctness. | **Accepted (risk)** | No invariant enforces post-hoc balance. Drift between events is permitted. If observed drift consistently strands nodes, an explicit rebalance ADR may follow. Operators have a manual rebalance lever (out of scope for ADR-033). |
+| A-N4 | The drain-refusal-at-RF-floor policy (I-N4) is the correct safety stance — refusing the drain is preferable to allowing temporary RF<3 with alarms. | **Validated** | Confirmed by domain expert 2026-04-25 (Q1=a). Trades operator inconvenience for durability invariant preservation; aligned with I-CS1 (CP for writes) and the regulatory threat model A-E4. |
+| A-N5 | Threshold ownership: cluster admin sets cluster-wide split/merge defaults and per-tenant min/max envelopes; tenant admin may override per namespace within the envelope. | **Validated** | Confirmed by analyst inference 2026-04-25 (resolves prior open escalation #2). Prevents one tenant from saturating Raft-group budget; tenant admin retains tuning control for their workloads' characteristics. |
+| A-N6 | The merge interval default of 24 hours is long enough to avoid thrash from transient utilization dips but short enough to reclaim Raft-group overhead within an operationally acceptable window. | **Accepted (risk)** | Tunable per cluster admin. If observed workloads have day-cycle utilization patterns (e.g., quiet overnight, busy during day), the interval may need raising to a multiple of 24 h to avoid daily merge/split oscillation. |
+| A-N7 | Drain cancellation (I-N7) is operationally desirable and does not compromise correctness — completed voter replacements are not rolled back, which is the simplest safe behavior. | **Validated** | Architect confirmed 2026-04-25 in ADR-035 §4. Rollback would require removing the new voter and re-adding the old one, risking a window where RF < 3. The completed replacements are valid placements; the cluster operates correctly. Operator can use explicit voter management to rebalance later. |

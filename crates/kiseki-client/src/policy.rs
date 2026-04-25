@@ -239,6 +239,40 @@ impl DisconnectDetector {
 }
 
 // ---------------------------------------------------------------------------
+// Trigger chains (I-CC6, I-CC12)
+// ---------------------------------------------------------------------------
+
+/// Check key health and wipe cache if KEK is destroyed (I-CC12).
+///
+/// Returns `true` if a wipe was triggered.
+pub fn check_key_health_and_wipe(
+    checker: &KeyHealthChecker,
+    cache: &mut crate::cache::CacheManager,
+) -> bool {
+    if checker.status() == KeyHealth::Destroyed {
+        cache.wipe();
+        true
+    } else {
+        false
+    }
+}
+
+/// Check disconnect status and wipe cache if threshold exceeded (I-CC6).
+///
+/// Returns `true` if a wipe was triggered.
+pub fn check_disconnect_and_wipe(
+    detector: &DisconnectDetector,
+    cache: &mut crate::cache::CacheManager,
+) -> bool {
+    if detector.is_disconnected() {
+        cache.wipe();
+        true
+    } else {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -348,5 +382,97 @@ mod tests {
             detector.is_disconnected(),
             "should be disconnected after threshold exceeded"
         );
+    }
+
+    /// I-CC12: KEK destroyed triggers cache wipe via `check_key_health_and_wipe`.
+    #[test]
+    fn kek_destroyed_triggers_cache_wipe() {
+        use crate::cache::{CacheConfig, CacheManager, CacheMode};
+        use kiseki_common::ids::ChunkId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = CacheConfig {
+            mode: CacheMode::Organic,
+            cache_dir: dir.path().to_path_buf(),
+            ..CacheConfig::default()
+        };
+        let mut cache = CacheManager::new(&config).unwrap();
+
+        // Insert a chunk into the cache.
+        let chunk_id = ChunkId([0xAA; 32]);
+        cache.put_chunk(chunk_id, vec![1, 2, 3, 4, 5]);
+        assert!(
+            cache.get_chunk(&chunk_id).is_some(),
+            "chunk should be present before wipe"
+        );
+
+        // Healthy status should NOT trigger wipe.
+        let mut checker = KeyHealthChecker::new(Duration::from_secs(30));
+        assert!(!check_key_health_and_wipe(&checker, &mut cache));
+        assert!(
+            cache.get_chunk(&chunk_id).is_some(),
+            "chunk should survive healthy check"
+        );
+
+        // Record KEK destroyed.
+        checker.record_check(KeyHealth::Destroyed);
+        assert_eq!(checker.status(), KeyHealth::Destroyed);
+
+        // Destroyed status MUST trigger wipe.
+        assert!(check_key_health_and_wipe(&checker, &mut cache));
+        assert!(
+            cache.get_chunk(&chunk_id).is_none(),
+            "cache must be empty after KEK destroyed (I-CC12)"
+        );
+        assert_eq!(cache.stats().wipes, 1, "wipe counter should be 1");
+    }
+
+    /// I-CC6: Disconnect threshold exceeded triggers cache wipe via
+    /// `check_disconnect_and_wipe`.
+    #[test]
+    fn disconnect_triggers_cache_wipe() {
+        use crate::cache::{CacheConfig, CacheManager, CacheMode};
+        use kiseki_common::ids::ChunkId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = CacheConfig {
+            mode: CacheMode::Organic,
+            cache_dir: dir.path().to_path_buf(),
+            ..CacheConfig::default()
+        };
+        let mut cache = CacheManager::new(&config).unwrap();
+
+        // Insert data into the cache.
+        let chunk_id = ChunkId([0xBB; 32]);
+        cache.put_chunk(chunk_id, vec![10, 20, 30]);
+        assert!(
+            cache.get_chunk(&chunk_id).is_some(),
+            "chunk should be present before disconnect"
+        );
+
+        // Create detector with 1-second threshold.
+        let detector = DisconnectDetector::new(1);
+
+        // Not yet disconnected — no wipe.
+        assert!(!check_disconnect_and_wipe(&detector, &mut cache));
+        assert!(
+            cache.get_chunk(&chunk_id).is_some(),
+            "chunk should survive when still connected"
+        );
+
+        // Wait for disconnect threshold to expire.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            detector.is_disconnected(),
+            "detector should report disconnected"
+        );
+
+        // Disconnected — must trigger wipe.
+        assert!(check_disconnect_and_wipe(&detector, &mut cache));
+        assert!(
+            cache.get_chunk(&chunk_id).is_none(),
+            "cache must be empty after disconnect wipe (I-CC6)"
+        );
+        assert_eq!(cache.stats().wipes, 1, "wipe counter should be 1");
     }
 }

@@ -118,7 +118,7 @@ repos:
 
 ## CI Pipeline
 
-Same three-stage pattern as Go/Rust:
+Same three-stage pattern as Rust:
 1. Build — `python -m build`, upload dist/ artifacts
 2. Validate — ruff, black --check, mypy, bandit, vulture
 3. Test — pytest with coverage → Codecov, threshold enforcement

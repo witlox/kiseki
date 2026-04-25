@@ -52,6 +52,10 @@ pub struct InMemoryGateway {
     inline_threshold: u64,
     /// Inline content store for small-file reads (ADR-030).
     small_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
+    /// Shard map store for multi-shard routing (ADR-033).
+    /// When present, the gateway routes writes to the correct shard
+    /// based on `hashed_key`. When absent, uses the namespace's single `shard_id`.
+    shard_map: std::sync::RwLock<Option<Arc<kiseki_control::shard_topology::NamespaceShardMapStore>>>,
 }
 
 impl InMemoryGateway {
@@ -79,7 +83,44 @@ impl InMemoryGateway {
             last_written_seq: std::sync::Mutex::new(std::collections::HashMap::new()),
             inline_threshold: 0, // disabled by default; set via with_inline_threshold
             small_store: None,
+            shard_map: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Attach a shard map store for multi-shard routing (ADR-033).
+    #[must_use]
+    pub fn with_shard_map(
+        self,
+        store: Arc<kiseki_control::shard_topology::NamespaceShardMapStore>,
+    ) -> Self {
+        *self.shard_map.write().unwrap() = Some(store);
+        self
+    }
+
+    /// Clear the shard map (simulates stale cache — falls back to namespace `shard_id`).
+    pub fn clear_shard_map(&self) {
+        *self.shard_map.write().unwrap() = None;
+    }
+
+    /// Re-attach a shard map store after clearing (simulates cache refresh).
+    pub fn set_shard_map(&self, store: Arc<kiseki_control::shard_topology::NamespaceShardMapStore>) {
+        *self.shard_map.write().unwrap() = Some(store);
+    }
+
+    /// Simulate a gateway crash: drop all ephemeral state.
+    ///
+    /// Clears namespace cache, session tracking, and counters.
+    /// Durable state (log store, chunk store) is unaffected.
+    /// NFS opens/locks and in-flight multipart uploads are lost.
+    pub async fn crash(&self) {
+        // Clear composition namespace cache (ephemeral).
+        self.compositions.lock().await.clear_namespaces();
+        // Clear session tracking.
+        self.last_written_seq.lock().unwrap().clear();
+        // Reset counters.
+        self.requests_total.store(0, Ordering::Relaxed);
+        self.bytes_written.store(0, Ordering::Relaxed);
+        self.bytes_read.store(0, Ordering::Relaxed);
     }
 
     /// Set the inline data threshold (ADR-030).
@@ -220,6 +261,8 @@ impl InMemoryGateway {
                 tenant_id,
                 shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
                 read_only: false,
+                versioning_enabled: false,
+                compliance_tags: Vec::new(),
             });
         }
         Ok(())
@@ -392,9 +435,24 @@ impl GatewayOps for InMemoryGateway {
         // Emit delta to log (async, slow — Raft consensus).
         if let Some(ref log) = log {
             let hashed_key = kiseki_composition::composition_hash_key(emit_params.2, comp_id);
-            if !kiseki_composition::log_bridge::emit_delta(
+
+            // ADR-033: route to correct shard via shard map if available.
+            let shard_id = if let Some(ref shard_map) = *self.shard_map.read().unwrap() {
+                // Convert NamespaceId to string for shard map lookup.
+                let ns_str = emit_params.2.0.to_string();
+                if let Ok(map) = shard_map.get(&ns_str, emit_params.1) {
+                    kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)
+                        .unwrap_or(emit_params.0)
+                } else {
+                    emit_params.0
+                }
+            } else {
+                emit_params.0
+            };
+
+            match kiseki_composition::log_bridge::emit_delta(
                 log.as_ref(),
-                emit_params.0,
+                shard_id,
                 emit_params.1,
                 kiseki_log::delta::OperationType::Create,
                 hashed_key,
@@ -403,9 +461,16 @@ impl GatewayOps for InMemoryGateway {
             )
             .await
             {
-                // Rollback: re-acquire lock and remove (PIPE-ADV-1).
-                self.compositions.lock().await.delete(comp_id).ok();
-                return Err(GatewayError::Upstream("delta emission failed".to_string()));
+                Ok(_seq) => {}
+                Err(kiseki_log::error::LogError::KeyOutOfRange(sid)) => {
+                    let _ = self.compositions.lock().await.delete(comp_id).ok();
+                    return Err(GatewayError::KeyOutOfRange { shard_id: sid });
+                }
+                Err(e) => {
+                    // Rollback: re-acquire lock and remove (PIPE-ADV-1).
+                    let _ = self.compositions.lock().await.delete(comp_id).ok();
+                    return Err(GatewayError::Upstream(format!("delta emission failed: {e}")));
+                }
             }
         }
 
@@ -479,8 +544,7 @@ impl GatewayOps for InMemoryGateway {
         _namespace_id: kiseki_common::ids::NamespaceId,
         composition_id: kiseki_common::ids::CompositionId,
     ) -> Result<(), GatewayError> {
-        // Verify tenant ownership and collect chunk refs before deleting.
-        let chunk_ids: Vec<kiseki_common::ids::ChunkId>;
+        // Verify tenant ownership before deleting.
         {
             let compositions = self.compositions.lock().await;
             let comp = compositions
@@ -489,21 +553,22 @@ impl GatewayOps for InMemoryGateway {
             if comp.tenant_id != tenant_id {
                 return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
             }
-            chunk_ids = comp.chunks.clone();
         }
 
         // Delete the composition (sync — no lock held during Raft).
         // Log emission for delete tombstone would go here if needed.
-        self.compositions
+        let delete_result = self
+            .compositions
             .lock()
             .await
             .delete(composition_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
-        // Decrement chunk refcounts (I-C2: GC when refcount reaches 0).
-        {
+        // Decrement chunk refcounts only when actually removed (not
+        // a versioned delete marker). I-C2: GC when refcount reaches 0.
+        if let kiseki_composition::DeleteResult::Removed(ref released) = delete_result {
             let mut chunks = self.chunks.lock().await;
-            for chunk_id in &chunk_ids {
+            for chunk_id in released {
                 let _ = chunks.decrement_refcount(chunk_id);
             }
         }

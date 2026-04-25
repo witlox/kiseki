@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 pub mod advisory_policy;
+pub mod cache_policy;
 pub mod error;
 pub mod federation;
 pub mod flavor;
@@ -28,6 +29,7 @@ pub mod namespace;
 pub mod policy;
 pub mod replication;
 pub mod retention;
+pub mod shard_topology;
 pub mod storage_admin;
 pub mod tenant;
 pub mod threshold;

@@ -1,7 +1,7 @@
 # API Contracts — Per-Context Interfaces
 
 **Status**: Architect phase.
-**Last updated**: 2026-04-17.
+**Last updated**: 2026-04-25. Added ADR-033 (shard map, initial topology), ADR-034 (merge), ADR-035 (drain) operations.
 
 Commands, events, and queries per bounded context. Traces to Gherkin
 scenarios in specs/features/.
@@ -55,10 +55,18 @@ service backed by the same trait implementation.
 | Command | `CompactShard(shard, trigger)` | System/Admin | log.feature#AutomaticCompaction |
 | Command | `TruncateLog(shard) → gc_boundary` | System/Admin | log.feature#DeltaGC |
 | Command | `SetMaintenance(shard, enabled)` | Admin | log.feature#MaintenanceMode |
+| Command | `CreateShard(shard_id, tenant, node, config)` | Control | ADR-033, ADR-036 |
+| Command | `UpdateShardRange(shard_id, start, end)` | Control | ADR-033, ADR-036 |
+| Command | `SetShardState(shard_id, state)` | Control | ADR-034, ADR-036 |
+| Command | `RegisterConsumer(shard_id, consumer, position)` | View stream proc | I-L4, ADR-036 |
+| Command | `AdvanceWatermark(shard_id, consumer, position)` | View stream proc | I-L4, ADR-036 |
 | Query | `ReadDeltas(shard, from, to) → [delta]` | View stream proc | log.feature#StreamProcessorReads |
 | Query | `ShardHealth(shard) → ShardInfo` | Admin, Control | log.feature |
 | Event | `DeltaCommitted(shard, seq)` | → View, Audit | log.feature#SuccessfulDeltaAppend |
+| Command | `MergeShard(shard_a, shard_b) → merged_shard` | System/Admin | log.feature#ShardMerge, ADR-034 |
 | Event | `ShardSplit(old, new, boundary)` | → Control, View, Client | log.feature#ShardSplitTriggered |
+| Event | `ShardMerged(input_ids, merged_id, range, hlc)` | → Control, View, Client, Gateway | log.feature#ShardMerge, ADR-034 |
+| Event | `MergeAborted(input_ids, reason)` | → Control | ADR-034 (ADV-034-2) |
 | Event | `MaintenanceEntered(shard)` | → Gateway, Client | log.feature#MaintenanceMode |
 
 ### Chunk Storage context
@@ -145,7 +153,12 @@ service backed by the same trait implementation.
 | Command | `CreateOrg / CreateProject / CreateWorkload` | Admin | control-plane.feature#TenantLifecycle |
 | Command | `SetComplianceTags / SetQuota` | Admin | control-plane.feature#ComplianceTags |
 | Command | `RequestAccess / ApproveAccess / DenyAccess` | Admin | control-plane.feature#IAM |
-| Command | `CreateNamespace` | Tenant Admin | control-plane.feature#NamespaceMgmt |
+| Command | `CreateNamespace(ns, initial_shards?)` | Tenant Admin | control-plane.feature#NamespaceMgmt, ADR-033 |
+| Query | `GetNamespaceShardMap(ns) → NamespaceShardMap` | Gateway, Client (tenant-authorized — ADV-033-9) | ADR-033 (I-L15) |
+| Command | `DrainNode(node_id)` | Cluster Admin | multi-node-raft.feature#DrainNode, ADR-035 |
+| Command | `CancelDrain(node_id)` | Cluster Admin | multi-node-raft.feature#DrainCancel, ADR-035 |
+| Query | `ListNodes → [NodeRecord]` | Cluster Admin, SRE | ADR-035 |
+| Query | `GetNodeStatus(node_id) → NodeRecord` | Cluster Admin, SRE | ADR-035 |
 | Command | `RegisterFederationPeer` | Cluster Admin | control-plane.feature#Federation |
 | Command | `SetMaintenanceMode` | Cluster Admin | control-plane.feature#Maintenance |
 | Query | `ListFlavors / MatchFlavor` | Tenant Admin | control-plane.feature#FlavorMgmt |
@@ -175,7 +188,9 @@ Authorization: cluster admin only (mTLS cert with admin OU). SRE read-only role.
 | Query | `ListShards / GetShard / GetShardHealth` | Cluster admin, SRE | storage-admin.feature |
 | Command | `SplitShard / SetShardMaintenance` | Cluster admin | storage-admin.feature |
 | Command | `TriggerScrub / RepairChunk / ListRepairs` | Cluster admin, SRE-IR | storage-admin.feature |
-| Command | `DrainNode` | Cluster admin | storage-admin.feature |
+| Command | `DrainNode` | Cluster admin | storage-admin.feature, ADR-035 |
+| Command | `CancelDrain` | Cluster admin | storage-admin.feature, ADR-035 |
+| Query | `ListNodes / GetNodeStatus` | Cluster admin, SRE | ADR-035 |
 
 ### Workflow Advisory context (Rust server, gRPC)
 

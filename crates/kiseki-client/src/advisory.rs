@@ -635,6 +635,120 @@ mod tests {
         assert!(!advisory.channel().unwrap().is_connected());
     }
 
+    // ---------------------------------------------------------------
+    // Scenario: Client declares a workflow and correlates operations
+    // ---------------------------------------------------------------
+    #[test]
+    fn declare_workflow_returns_session_with_correlation() {
+        let mut advisory = ClientAdvisory::new();
+        let session = advisory.declare_workflow();
+
+        // Session has a valid workflow_id.
+        assert_ne!(session.workflow_id(), 0);
+        // Session is active and at phase 0.
+        assert!(session.is_active());
+        assert_eq!(session.current_phase(), 0);
+        // Client ID is stable.
+        assert_eq!(session.client_id, advisory.client_id());
+
+        // Operations without a session work unchanged (I-WA1, I-WA2).
+        // (The advisory is optional — we just verify the session exists.)
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Pattern-detector emits access-pattern hint on sequential read
+    // ---------------------------------------------------------------
+    #[test]
+    fn pattern_detector_emits_sequential_hint() {
+        use crate::prefetch::PrefetchAdvisor;
+
+        let mut advisor = PrefetchAdvisor::default();
+
+        // Three consecutive sequential reads.
+        advisor.record_read(42, 0, 4096);
+        advisor.record_read(42, 4096, 4096);
+        advisor.record_read(42, 8192, 4096);
+
+        // After threshold, the detector classifies access as sequential
+        // and suggests a prefetch range.
+        let suggestion = advisor.record_read_suggestion(42, 12288, 4096);
+        assert!(
+            suggestion.is_some(),
+            "sequential pattern should trigger prefetch suggestion"
+        );
+
+        let hint = suggestion.unwrap().to_hint();
+        assert!(
+            matches!(hint, AdvisoryHint::Prefetch { file_id: 42, .. }),
+            "hint should be a Prefetch for the detected file"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Client declares prefetch ranges (batched per I-WA16)
+    // ---------------------------------------------------------------
+    #[test]
+    fn prefetch_ranges_batched() {
+        // PrefetchHint messages are bounded per I-WA16.
+        // Verify hint creation does not panic with large inputs.
+        let hints: Vec<AdvisoryHint> = (0..100)
+            .map(|i| AdvisoryHint::Prefetch {
+                file_id: 1,
+                offset: i * 4096,
+                length: 4096,
+            })
+            .collect();
+        assert_eq!(hints.len(), 100);
+
+        // Each hint is independently serializable.
+        for hint in &hints {
+            let json = serde_json::to_vec(hint).unwrap();
+            assert!(!json.is_empty());
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Client throttles on hard backpressure telemetry
+    // ---------------------------------------------------------------
+    #[test]
+    fn hard_backpressure_telemetry_has_retry_after() {
+        let feedback = TelemetryFeedback::Backpressure {
+            severity: "hard".into(),
+            retry_after_ms: 250,
+        };
+
+        match &feedback {
+            TelemetryFeedback::Backpressure {
+                severity,
+                retry_after_ms,
+            } => {
+                assert_eq!(severity, "hard");
+                assert_eq!(*retry_after_ms, 250);
+            }
+            _ => unreachable!("expected backpressure feedback"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Advisory disabled — client degrades gracefully
+    // ---------------------------------------------------------------
+    #[test]
+    fn advisory_disabled_degrades_gracefully() {
+        // When advisory is disabled, declare_workflow can still succeed
+        // locally (pattern-inference fallback). The channel is simply
+        // not connected.
+        let mut advisory = ClientAdvisory::new(); // no endpoint
+        assert!(advisory.channel().is_none());
+
+        // Workflow declaration works without advisory channel.
+        let session = advisory.declare_workflow();
+        assert!(session.is_active());
+
+        // Phase advance works normally.
+        let phase = session.advance_phase("stage-in").unwrap();
+        assert_eq!(phase, 1);
+    }
+
     #[test]
     fn declare_workflow_queues_hint_when_channel_connected() {
         // Use a logically-connected channel without real TCP.

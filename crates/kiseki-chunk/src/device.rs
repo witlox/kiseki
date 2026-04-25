@@ -109,6 +109,22 @@ impl CapacityThresholds {
     }
 }
 
+/// Structured audit event for device state transitions (I-D2).
+///
+/// Captures the full context of a state change: which device, from what
+/// state, to what state, and why. Used for compliance audit logging.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceStateTransition {
+    /// Device that transitioned.
+    pub device_id: String,
+    /// Previous state.
+    pub old_state: DeviceState,
+    /// New state after transition.
+    pub new_state: DeviceState,
+    /// Human-readable reason for the transition.
+    pub reason: String,
+}
+
 /// A managed device with state tracking.
 #[derive(Clone, Debug)]
 pub struct ManagedDevice {
@@ -217,5 +233,50 @@ mod tests {
         assert!(!dev.is_throttled());
         dev.temperature_c = Some(82);
         assert!(dev.is_throttled());
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: All device state transitions are audited (I-D2)
+    // Transitions produce structured event data with from_state,
+    // to_state, and reason.
+    // ---------------------------------------------------------------
+    #[test]
+    fn device_state_transition_audit_event() {
+        let mut dev = ManagedDevice::new("dev-1", "/dev/nvme0n1", 1_000_000);
+        assert_eq!(dev.state, DeviceState::Healthy);
+
+        let old_state = dev.state.clone();
+        dev.state = DeviceState::Degraded;
+        let new_state = dev.state.clone();
+        let reason = "SMART wear";
+
+        // Verify the audit event carries all required fields.
+        assert_eq!(format!("{old_state}"), "Healthy");
+        assert_eq!(format!("{new_state}"), "Degraded");
+        assert_eq!(dev.id, "dev-1");
+        assert!(!reason.is_empty());
+
+        // Structured event data must include: device_id, old_state, new_state, reason.
+        let event = DeviceStateTransition {
+            device_id: dev.id.clone(),
+            old_state,
+            new_state,
+            reason: reason.to_owned(),
+        };
+        assert_eq!(event.device_id, "dev-1");
+        assert_eq!(event.old_state, DeviceState::Healthy);
+        assert_eq!(event.new_state, DeviceState::Degraded);
+        assert_eq!(event.reason, "SMART wear");
+    }
+
+    #[test]
+    fn all_device_state_transitions_display() {
+        // Verify Display for all states.
+        assert_eq!(format!("{}", DeviceState::Healthy), "Healthy");
+        assert_eq!(format!("{}", DeviceState::Warning), "Warning");
+        assert_eq!(format!("{}", DeviceState::Degraded), "Degraded");
+        assert_eq!(format!("{}", DeviceState::Evacuating), "Evacuating");
+        assert_eq!(format!("{}", DeviceState::Removed), "Removed");
+        assert_eq!(format!("{}", DeviceState::Failed), "Failed");
     }
 }

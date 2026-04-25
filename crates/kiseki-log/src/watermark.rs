@@ -118,4 +118,79 @@ mod tests {
         assert!(wm.is_stalled("sp-slow", 10000));
         assert!(!wm.is_stalled("sp-fast", 10000));
     }
+
+    // --- log.feature @unit: "Delta GC respects all consumer watermarks" ---
+
+    #[test]
+    fn gc_boundary_is_minimum_of_all_consumers() {
+        let mut wm = ConsumerWatermarks::new();
+        // Three consumers at different positions.
+        wm.advance("sp-nfs", SequenceNumber(9500));
+        wm.advance("sp-s3", SequenceNumber(8000));
+        wm.advance("audit", SequenceNumber(9000));
+
+        // GC boundary = min(9500, 8000, 9000) = 8000.
+        // Deltas with sequence < 8000 are eligible for GC.
+        let boundary = wm.gc_boundary().unwrap();
+        assert_eq!(boundary, SequenceNumber(8000));
+
+        // Verify: deltas from 8000 onward must be retained.
+        for seq in 8000..=10000 {
+            assert!(
+                SequenceNumber(seq) >= boundary,
+                "seq {seq} should be retained"
+            );
+        }
+        // Verify: deltas below 8000 are eligible for GC.
+        for seq in 0..8000 {
+            assert!(
+                SequenceNumber(seq) < boundary,
+                "seq {seq} should be GC-eligible"
+            );
+        }
+    }
+
+    // --- log.feature @unit: "Stalled consumer blocks GC" ---
+
+    #[test]
+    fn stalled_consumer_blocks_gc() {
+        let mut wm = ConsumerWatermarks::new();
+        // sp-analytics stalled at 1000, all others far ahead.
+        wm.advance("sp-analytics", SequenceNumber(1000));
+        wm.advance("sp-nfs", SequenceNumber(50000));
+        wm.advance("sp-s3", SequenceNumber(55000));
+        wm.advance("audit", SequenceNumber(52000));
+
+        // GC boundary is blocked at 1000 by the stalled consumer.
+        let boundary = wm.gc_boundary().unwrap();
+        assert_eq!(boundary, SequenceNumber(1000));
+
+        // No deltas after 999 should be GC'd.
+        assert!(SequenceNumber(1000) >= boundary);
+
+        // Verify sp-analytics is identifiable as stalled.
+        assert!(wm.is_stalled("sp-analytics", 10000));
+        // The stalled consumer's identity is known.
+        assert!(!wm.is_stalled("sp-nfs", 10000));
+        assert!(!wm.is_stalled("sp-s3", 10000));
+        assert!(!wm.is_stalled("audit", 10000));
+    }
+
+    #[test]
+    fn stalled_consumer_id_is_identifiable() {
+        let mut wm = ConsumerWatermarks::new();
+        wm.advance("sp-analytics", SequenceNumber(1000));
+        wm.advance("sp-nfs", SequenceNumber(50000));
+
+        // We can identify which consumer is stalled by checking each.
+        let stalled: Vec<String> = wm
+            .as_vec()
+            .iter()
+            .filter(|(name, _)| wm.is_stalled(name, 10000))
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        assert_eq!(stalled.len(), 1);
+        assert_eq!(stalled[0], "sp-analytics");
+    }
 }

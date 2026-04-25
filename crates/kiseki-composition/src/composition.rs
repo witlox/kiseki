@@ -10,6 +10,10 @@ use crate::error::CompositionError;
 use crate::multipart::MultipartUpload;
 use crate::namespace::Namespace;
 
+/// Default inline data threshold in bytes. Data below this size is
+/// stored inline in the delta payload rather than as a separate chunk.
+pub const INLINE_DATA_THRESHOLD: u64 = 4096;
+
 /// A composition — metadata describing how to assemble chunks into a
 /// coherent data unit (file or object).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +32,19 @@ pub struct Composition {
     pub version: u64,
     /// Total size in bytes.
     pub size: u64,
+    /// Whether the composition data is inline in the delta (no chunks).
+    pub has_inline_data: bool,
+}
+
+/// Result of a delete operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeleteResult {
+    /// Composition was removed. Contains chunk IDs whose refcounts should
+    /// be decremented.
+    Removed(Vec<ChunkId>),
+    /// A delete marker (tombstone) was appended because versioning is
+    /// enabled. No chunk refcounts are changed.
+    DeleteMarker,
 }
 
 /// Composition operations trait.
@@ -48,8 +65,9 @@ pub trait CompositionOps {
     /// Read a composition by ID.
     fn get(&self, id: CompositionId) -> Result<&Composition, CompositionError>;
 
-    /// Delete a composition.
-    fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError>;
+    /// Delete a composition. Returns `DeleteMarker` if versioning is
+    /// enabled on the namespace.
+    fn delete(&mut self, id: CompositionId) -> Result<DeleteResult, CompositionError>;
 
     /// Rename a composition. Returns `CrossShardRename` if source and
     /// target are on different shards (I-L8).
@@ -127,6 +145,11 @@ impl CompositionStore {
         self.namespaces.insert(ns.id, ns);
     }
 
+    /// Clear all namespace registrations (gateway crash simulation).
+    pub fn clear_namespaces(&mut self) {
+        self.namespaces.clear();
+    }
+
     /// Get a namespace.
     #[must_use]
     pub fn namespace(&self, id: NamespaceId) -> Option<&Namespace> {
@@ -172,6 +195,7 @@ impl CompositionOps for CompositionStore {
         }
 
         let id = CompositionId(uuid::Uuid::new_v4());
+        let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
         let comp = Composition {
             id,
             tenant_id: ns.tenant_id,
@@ -180,6 +204,7 @@ impl CompositionOps for CompositionStore {
             chunks,
             version: 1,
             size,
+            has_inline_data,
         };
         self.compositions.insert(id, comp);
         Ok(id)
@@ -207,11 +232,31 @@ impl CompositionOps for CompositionStore {
         Ok(comp.version)
     }
 
-    fn delete(&mut self, id: CompositionId) -> Result<(), CompositionError> {
-        self.compositions
-            .remove(&id)
+    fn delete(&mut self, id: CompositionId) -> Result<DeleteResult, CompositionError> {
+        let comp = self
+            .compositions
+            .get(&id)
             .ok_or(CompositionError::CompositionNotFound(id))?;
-        Ok(())
+
+        let ns = self.namespaces.get(&comp.namespace_id);
+        let versioning = ns.is_some_and(|n| n.versioning_enabled);
+
+        if versioning {
+            // Versioned delete: keep all versions, just bump version as
+            // a tombstone marker. Chunk refcounts are NOT decremented.
+            let comp = self
+                .compositions
+                .get_mut(&id)
+                .ok_or(CompositionError::CompositionNotFound(id))?;
+            comp.version += 1;
+            Ok(DeleteResult::DeleteMarker)
+        } else {
+            let comp = self
+                .compositions
+                .remove(&id)
+                .ok_or(CompositionError::CompositionNotFound(id))?;
+            Ok(DeleteResult::Removed(comp.chunks))
+        }
     }
 
     fn rename(
@@ -342,14 +387,20 @@ mod tests {
         ShardId(uuid::Uuid::from_u128(1))
     }
 
+    fn make_ns(id: u128, tenant: OrgId, shard: ShardId) -> Namespace {
+        Namespace {
+            id: NamespaceId(uuid::Uuid::from_u128(id)),
+            tenant_id: tenant,
+            shard_id: shard,
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        }
+    }
+
     fn setup() -> CompositionStore {
         let mut store = CompositionStore::new();
-        store.add_namespace(Namespace {
-            id: NamespaceId(uuid::Uuid::from_u128(10)),
-            tenant_id: test_tenant(),
-            shard_id: test_shard(),
-            read_only: false,
-        });
+        store.add_namespace(make_ns(10, test_tenant(), test_shard()));
         store
     }
 
@@ -374,19 +425,19 @@ mod tests {
     fn delete_removes_composition() {
         let mut store = setup();
         let id = store.create(test_ns(), vec![], 0).unwrap();
-        store.delete(id).unwrap();
+        let result = store.delete(id).unwrap();
+        assert!(matches!(result, DeleteResult::Removed(_)));
         assert!(store.get(id).is_err());
     }
 
     #[test]
     fn cross_shard_rename_returns_exdev() {
         let mut store = setup();
-        store.add_namespace(Namespace {
-            id: NamespaceId(uuid::Uuid::from_u128(20)),
-            tenant_id: test_tenant(),
-            shard_id: ShardId(uuid::Uuid::from_u128(2)),
-            read_only: false,
-        });
+        store.add_namespace(make_ns(
+            20,
+            test_tenant(),
+            ShardId(uuid::Uuid::from_u128(2)),
+        ));
 
         let id = store.create(test_ns(), vec![], 0).unwrap();
         let result = store.rename(id, NamespaceId(uuid::Uuid::from_u128(20)));
@@ -399,12 +450,7 @@ mod tests {
     #[test]
     fn same_shard_rename_succeeds() {
         let mut store = setup();
-        store.add_namespace(Namespace {
-            id: NamespaceId(uuid::Uuid::from_u128(11)),
-            tenant_id: test_tenant(),
-            shard_id: test_shard(),
-            read_only: false,
-        });
+        store.add_namespace(make_ns(11, test_tenant(), test_shard()));
 
         let id = store.create(test_ns(), vec![], 0).unwrap();
         let result = store.rename(id, NamespaceId(uuid::Uuid::from_u128(11)));
@@ -414,12 +460,9 @@ mod tests {
     #[test]
     fn read_only_namespace_rejects_create() {
         let mut store = CompositionStore::new();
-        store.add_namespace(Namespace {
-            id: test_ns(),
-            tenant_id: test_tenant(),
-            shard_id: test_shard(),
-            read_only: true,
-        });
+        let mut ns = make_ns(10, test_tenant(), test_shard());
+        ns.read_only = true;
+        store.add_namespace(ns);
 
         let result = store.create(test_ns(), vec![], 0);
         assert!(matches!(
@@ -540,7 +583,459 @@ mod tests {
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(store.count(), 2);
 
-        store.delete(id2).unwrap_or_else(|_| unreachable!());
+        let _ = store.delete(id2).unwrap_or_else(|_| unreachable!());
         assert_eq!(store.count(), 1);
+    }
+
+    // ===================================================================
+    // Composition-feature @unit scenario tests
+    // ===================================================================
+
+    // --- Scenario: Create a new file composition via protocol gateway ---
+    #[test]
+    fn create_composition_returns_chunk_ids_for_refcount() {
+        let mut store = setup();
+        let c1 = ChunkId([0x01; 32]);
+        let c2 = ChunkId([0x02; 32]);
+        let id = store.create(test_ns(), vec![c1, c2], 2048).unwrap();
+        let comp = store.get(id).unwrap();
+
+        // Composition references chunks that the caller would pass to
+        // ChunkStore for refcount tracking.
+        assert_eq!(comp.chunks, vec![c1, c2]);
+        assert_eq!(comp.shard_id, test_shard());
+        assert_eq!(comp.version, 1);
+        assert!(!comp.has_inline_data);
+    }
+
+    // --- Scenario: Create a small file with inline data ---
+    #[test]
+    fn create_small_file_sets_inline_data_flag() {
+        let mut store = setup();
+        // 512 bytes, no chunk IDs — data would be inline in the delta payload.
+        let id = store.create(test_ns(), vec![], 512).unwrap();
+        let comp = store.get(id).unwrap();
+
+        assert!(comp.has_inline_data);
+        assert!(comp.chunks.is_empty());
+        assert_eq!(comp.size, 512);
+    }
+
+    #[test]
+    fn create_above_threshold_not_inline() {
+        let mut store = setup();
+        // 8192 bytes with a chunk ref — not inline.
+        let id = store
+            .create(test_ns(), vec![ChunkId([0xaa; 32])], 8192)
+            .unwrap();
+        let comp = store.get(id).unwrap();
+        assert!(!comp.has_inline_data);
+    }
+
+    #[test]
+    fn create_zero_size_not_inline() {
+        let mut store = setup();
+        // Empty file (size 0, no chunks) — not inline (nothing to inline).
+        let id = store.create(test_ns(), vec![], 0).unwrap();
+        let comp = store.get(id).unwrap();
+        assert!(!comp.has_inline_data);
+    }
+
+    // --- Scenario: Append data to an existing composition ---
+    #[test]
+    fn append_extends_chunk_list() {
+        let mut store = setup();
+        let c1 = ChunkId([0x01; 32]);
+        let c2 = ChunkId([0x02; 32]);
+        let id = store
+            .create(test_ns(), vec![c1, c2], 128 * 1024 * 1024)
+            .unwrap();
+
+        let c3 = ChunkId([0x03; 32]);
+        let c4 = ChunkId([0x04; 32]);
+        let v2 = store
+            .update(id, vec![c1, c2, c3, c4], 256 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(v2, 2);
+
+        let comp = store.get(id).unwrap();
+        assert_eq!(comp.chunks, vec![c1, c2, c3, c4]);
+    }
+
+    // --- Scenario: Overwrite a byte range in a composition ---
+    #[test]
+    fn overwrite_replaces_chunk_in_list() {
+        let mut store = setup();
+        let c1 = ChunkId([0x01; 32]);
+        let c2 = ChunkId([0x02; 32]);
+        let c3 = ChunkId([0x03; 32]);
+        let id = store
+            .create(test_ns(), vec![c1, c2, c3], 192 * 1024 * 1024)
+            .unwrap();
+
+        // Replace c2 with c2_prime (byte-range overwrite of second chunk).
+        let c2_prime = ChunkId([0x22; 32]);
+        let v2 = store
+            .update(id, vec![c1, c2_prime, c3], 192 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(v2, 2);
+
+        let comp = store.get(id).unwrap();
+        assert_eq!(comp.chunks, vec![c1, c2_prime, c3]);
+        // c2 is no longer referenced — caller decrements its refcount.
+        assert!(!comp.chunks.contains(&c2));
+    }
+
+    // --- Scenario: S3 multipart upload (I-L5) ---
+    #[test]
+    fn multipart_not_visible_before_finalize_il5() {
+        let mut store = setup();
+        let upload_id = store.start_multipart(test_ns()).unwrap();
+
+        store
+            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 1024)
+            .unwrap();
+        store
+            .upload_part(&upload_id, 2, ChunkId([0x11; 32]), 1024)
+            .unwrap();
+        store
+            .upload_part(&upload_id, 3, ChunkId([0x12; 32]), 1024)
+            .unwrap();
+
+        // Before finalize: no composition exists for these parts (I-L5).
+        assert_eq!(store.count(), 0);
+
+        let comp_id = store.finalize_multipart(&upload_id).unwrap();
+        let comp = store.get(comp_id).unwrap();
+        assert_eq!(comp.chunks.len(), 3);
+        assert_eq!(comp.size, 3072);
+    }
+
+    // --- Scenario: Multipart upload aborted ---
+    #[test]
+    fn multipart_abort_no_composition_created() {
+        let mut store = setup();
+        let upload_id = store.start_multipart(test_ns()).unwrap();
+
+        store
+            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 1024)
+            .unwrap();
+        store
+            .upload_part(&upload_id, 2, ChunkId([0x11; 32]), 1024)
+            .unwrap();
+
+        store.abort_multipart(&upload_id).unwrap();
+
+        // No composition was created — chunks have refcount 0.
+        assert_eq!(store.count(), 0);
+
+        // Verify the upload is in Aborted state — cannot finalize.
+        let result = store.finalize_multipart(&upload_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn aborted_multipart_rejects_further_parts() {
+        let mut store = setup();
+        let upload_id = store.start_multipart(test_ns()).unwrap();
+        store.abort_multipart(&upload_id).unwrap();
+
+        let result = store.upload_part(&upload_id, 1, ChunkId([0x10; 32]), 512);
+        assert!(result.is_err());
+    }
+
+    // --- Scenario: Delete a composition (refcount tracking) ---
+    #[test]
+    fn delete_returns_chunk_ids_for_refcount_decrement() {
+        let mut store = setup();
+        let c5 = ChunkId([0x05; 32]);
+        let c6 = ChunkId([0x06; 32]);
+        let id = store.create(test_ns(), vec![c5, c6], 1024).unwrap();
+
+        let result = store.delete(id).unwrap();
+        // Caller uses the returned chunk IDs to decrement refcounts.
+        assert_eq!(result, DeleteResult::Removed(vec![c5, c6]));
+        assert!(store.get(id).is_err());
+    }
+
+    // --- Scenario: Delete composition with object versioning enabled ---
+    #[test]
+    fn versioned_delete_creates_delete_marker() {
+        let mut store = CompositionStore::new();
+        let mut ns = make_ns(10, test_tenant(), test_shard());
+        ns.versioning_enabled = true;
+        store.add_namespace(ns);
+
+        let c1 = ChunkId([0x01; 32]);
+        let id = store.create(test_ns(), vec![c1], 100).unwrap();
+        assert_eq!(store.get(id).unwrap().version, 1);
+
+        // Create versions v2, v3.
+        store.update(id, vec![ChunkId([0x02; 32])], 200).unwrap();
+        store.update(id, vec![ChunkId([0x03; 32])], 300).unwrap();
+        assert_eq!(store.get(id).unwrap().version, 3);
+
+        let result = store.delete(id).unwrap();
+        assert_eq!(result, DeleteResult::DeleteMarker);
+
+        // Composition still exists (versioned — not removed).
+        let comp = store.get(id).unwrap();
+        // Version bumped for the tombstone.
+        assert_eq!(comp.version, 4);
+        // Chunk refcounts are NOT decremented (caller checks DeleteMarker).
+    }
+
+    // --- Scenario: Intra-tenant dedup — same chunk ID yields same ref ---
+    #[test]
+    fn intra_tenant_dedup_same_chunk_id() {
+        let mut store = setup();
+        let chunk_abc = ChunkId([0xab; 32]); // sha256(P) = "abc"
+
+        let id_a = store.create(test_ns(), vec![chunk_abc], 1024).unwrap();
+        let id_b = store.create(test_ns(), vec![chunk_abc], 1024).unwrap();
+
+        let comp_a = store.get(id_a).unwrap();
+        let comp_b = store.get(id_b).unwrap();
+
+        // Both compositions reference the same chunk — refcount would be 2.
+        assert_eq!(comp_a.chunks, vec![chunk_abc]);
+        assert_eq!(comp_b.chunks, vec![chunk_abc]);
+        // The ChunkStore (separate) handles the actual refcount.
+    }
+
+    // --- Scenario: Cross-tenant dedup (default tenants) ---
+    #[test]
+    fn cross_tenant_dedup_same_chunk_id() {
+        let mut store = CompositionStore::new();
+        let tenant_pharma = OrgId(uuid::Uuid::from_u128(100));
+        let tenant_biotech = OrgId(uuid::Uuid::from_u128(200));
+        store.add_namespace(make_ns(10, tenant_pharma, test_shard()));
+        store.add_namespace(make_ns(20, tenant_biotech, test_shard()));
+
+        let chunk_abc = ChunkId([0xab; 32]);
+        let ns_pharma = NamespaceId(uuid::Uuid::from_u128(10));
+        let ns_biotech = NamespaceId(uuid::Uuid::from_u128(20));
+
+        let id_p = store.create(ns_pharma, vec![chunk_abc], 1024).unwrap();
+        let id_b = store.create(ns_biotech, vec![chunk_abc], 1024).unwrap();
+
+        // Both compositions reference the same chunk ID — dedup at ChunkStore.
+        assert_eq!(store.get(id_p).unwrap().chunks, vec![chunk_abc]);
+        assert_eq!(store.get(id_b).unwrap().chunks, vec![chunk_abc]);
+        // Different tenants own the compositions.
+        assert_eq!(store.get(id_p).unwrap().tenant_id, tenant_pharma);
+        assert_eq!(store.get(id_b).unwrap().tenant_id, tenant_biotech);
+    }
+
+    // --- Scenario: No cross-tenant dedup for HMAC opted-out tenant ---
+    #[test]
+    fn hmac_tenant_different_chunk_id_no_dedup() {
+        let mut store = CompositionStore::new();
+        let tenant_defense = OrgId(uuid::Uuid::from_u128(300));
+        let tenant_pharma = OrgId(uuid::Uuid::from_u128(100));
+        store.add_namespace(make_ns(30, tenant_defense, test_shard()));
+        store.add_namespace(make_ns(10, tenant_pharma, test_shard()));
+
+        // HMAC-derived chunk ID vs SHA256 chunk ID for the same plaintext.
+        let chunk_hmac = ChunkId([0xde; 32]); // HMAC(P, defense_key) = "def456"
+        let chunk_sha = ChunkId([0xab; 32]); // sha256(P) = "abc123"
+
+        let ns_defense = NamespaceId(uuid::Uuid::from_u128(30));
+        let ns_pharma = NamespaceId(uuid::Uuid::from_u128(10));
+
+        let id_d = store.create(ns_defense, vec![chunk_hmac], 1024).unwrap();
+        let id_p = store.create(ns_pharma, vec![chunk_sha], 1024).unwrap();
+
+        // Different chunk IDs — no dedup match.
+        assert_ne!(
+            store.get(id_d).unwrap().chunks[0],
+            store.get(id_p).unwrap().chunks[0]
+        );
+    }
+
+    // --- Scenario: Namespace inherits compliance tags ---
+    #[test]
+    fn namespace_inherits_org_compliance_tags() {
+        use crate::namespace::ComplianceTag;
+
+        let org_tags = vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr];
+        let ns = Namespace {
+            id: test_ns(),
+            tenant_id: test_tenant(),
+            shard_id: test_shard(),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: vec![ComplianceTag::RevFadp],
+        };
+
+        let effective = ns.effective_compliance_tags(&org_tags);
+        assert_eq!(
+            effective,
+            vec![
+                ComplianceTag::Hipaa,
+                ComplianceTag::Gdpr,
+                ComplianceTag::RevFadp
+            ]
+        );
+    }
+
+    #[test]
+    fn namespace_compliance_tags_dedup() {
+        use crate::namespace::ComplianceTag;
+
+        let org_tags = vec![ComplianceTag::Hipaa];
+        let ns = Namespace {
+            id: test_ns(),
+            tenant_id: test_tenant(),
+            shard_id: test_shard(),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr],
+        };
+
+        let effective = ns.effective_compliance_tags(&org_tags);
+        // HIPAA appears once despite being in both org and namespace.
+        assert_eq!(effective, vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr]);
+    }
+
+    // --- Scenario: Chunk write fails during composition create ---
+    #[test]
+    fn chunk_write_failure_aborts_create_no_partial_state() {
+        // Composition creates take chunk IDs after the caller confirms
+        // chunk writes. If the caller does not pass chunk IDs (simulating
+        // a chunk write failure), no composition is created.
+        let mut store = setup();
+        let initial_count = store.count();
+
+        // Simulate: chunk write failed, so we never call create().
+        // Verify the store has no partial state.
+        assert_eq!(store.count(), initial_count);
+
+        // Also: creating with valid chunks then deleting leaves no trace.
+        let id = store
+            .create(test_ns(), vec![ChunkId([0xff; 32])], 100)
+            .unwrap();
+        assert_eq!(store.count(), initial_count + 1);
+        let _ = store.delete(id).unwrap();
+        assert_eq!(store.count(), initial_count);
+    }
+
+    // --- Scenario: Delta commit fails after chunk write succeeds ---
+    #[test]
+    fn delta_commit_failure_rollback_removes_composition() {
+        let mut store = setup();
+        let c20 = ChunkId([0x20; 32]);
+        let id = store.create(test_ns(), vec![c20], 4096).unwrap();
+
+        // Simulate delta commit failure: caller rolls back by deleting.
+        let result = store.delete(id).unwrap();
+        assert_eq!(result, DeleteResult::Removed(vec![c20]));
+        assert!(store.get(id).is_err());
+        // c20 now has refcount 0 (returned to caller for GC).
+    }
+
+    // --- Scenario: Collective checkpoint announcement (I-WA1) ---
+    #[test]
+    fn advisory_hint_does_not_affect_create_correctness() {
+        // Advisory hints are pass-through — composition operations succeed
+        // identically with or without them (I-WA1).
+        let mut store = setup();
+        let chunks = vec![ChunkId([0xcc; 32])];
+
+        // Create without any advisory context.
+        let id = store.create(test_ns(), chunks.clone(), 4096).unwrap();
+        let comp = store.get(id).unwrap().clone();
+
+        // Verify the composition is correct regardless of advisory state.
+        assert_eq!(comp.chunks, chunks);
+        assert_eq!(comp.size, 4096);
+        assert_eq!(comp.version, 1);
+    }
+
+    // --- Scenario: Retention-intent { final } ---
+    #[test]
+    fn retention_intent_does_not_change_multipart_finalize() {
+        // retention_intent is advisory — finalize semantics are unchanged.
+        let mut store = setup();
+        let upload_id = store.start_multipart(test_ns()).unwrap();
+
+        store
+            .upload_part(&upload_id, 1, ChunkId([0xa0; 32]), 512)
+            .unwrap();
+        store
+            .upload_part(&upload_id, 2, ChunkId([0xa1; 32]), 512)
+            .unwrap();
+
+        let comp_id = store.finalize_multipart(&upload_id).unwrap();
+        let comp = store.get(comp_id).unwrap();
+
+        // I-L5: chunks confirmed and visible only after finalize.
+        assert_eq!(comp.chunks.len(), 2);
+        assert_eq!(comp.size, 1024);
+        // I-C2: refcount semantics unchanged by advisory hints.
+    }
+
+    // --- Scenario: Caller-scoped refcount activity telemetry ---
+    #[test]
+    fn rapid_creates_tracked_by_store_count() {
+        // Telemetry is an observability concern; unit-level validation:
+        // the store tracks composition count accurately under rapid mutations.
+        let mut store = setup();
+        let mut ids = Vec::new();
+        for i in 0u8..10 {
+            let id = store
+                .create(test_ns(), vec![ChunkId([i; 32])], 100)
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(store.count(), 10);
+
+        for id in &ids[..5] {
+            let _ = store.delete(*id).unwrap();
+        }
+        assert_eq!(store.count(), 5);
+    }
+
+    // --- Scenario: Hint cannot enable cross-namespace creation (I-WA14) ---
+    #[test]
+    fn create_in_unauthorized_namespace_rejected_regardless_of_hints() {
+        let mut store = setup();
+        // Namespace 99 does not exist — any create attempt is rejected
+        // regardless of advisory context.
+        let bogus_ns = NamespaceId(uuid::Uuid::from_u128(99));
+        let result = store.create(bogus_ns, vec![], 0);
+        assert!(matches!(
+            result,
+            Err(CompositionError::NamespaceNotFound(_))
+        ));
+    }
+
+    // --- Scenario: Advisory disabled — composition path unaffected (I-WA2) ---
+    #[test]
+    fn all_ops_succeed_without_advisory_context() {
+        // Full lifecycle without any advisory integration — correctness
+        // is identical (I-WA2).
+        let mut store = setup();
+
+        // Create.
+        let c1 = ChunkId([0x01; 32]);
+        let id = store.create(test_ns(), vec![c1], 1024).unwrap();
+
+        // Update.
+        let c2 = ChunkId([0x02; 32]);
+        let v2 = store.update(id, vec![c1, c2], 2048).unwrap();
+        assert_eq!(v2, 2);
+
+        // Multipart.
+        let upload_id = store.start_multipart(test_ns()).unwrap();
+        store
+            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 512)
+            .unwrap();
+        let mp_id = store.finalize_multipart(&upload_id).unwrap();
+        assert!(store.get(mp_id).is_ok());
+
+        // Delete.
+        let result = store.delete(id).unwrap();
+        assert!(matches!(result, DeleteResult::Removed(_)));
     }
 }

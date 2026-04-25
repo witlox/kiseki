@@ -43,6 +43,7 @@ async fn when_request_processed(w: &mut KisekiWorld) {
             iops: 100_000,
             metadata_ops_per_sec: 10_000,
         },
+        compression_enabled: false,
     };
 
     match w.control_tenant_store.create_org(org) {
@@ -120,6 +121,7 @@ async fn given_tenant_admin_for(w: &mut KisekiWorld, _admin: String, org_name: S
             iops: 100_000,
             metadata_ops_per_sec: 10_000,
         },
+        compression_enabled: false,
     };
     let _ = w.control_tenant_store.create_org(org); // Ignore if exists
 }
@@ -805,6 +807,7 @@ async fn given_org_has_tags(w: &mut KisekiWorld, org_name: String, tags: String)
             iops: 100_000,
             metadata_ops_per_sec: 10_000,
         },
+        compression_enabled: false,
     };
     let _ = w.control_tenant_store.create_org(org);
 }
