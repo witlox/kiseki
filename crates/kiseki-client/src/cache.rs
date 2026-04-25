@@ -1039,4 +1039,73 @@ mod tests {
         assert_eq!(stats.misses, 0);
         assert_eq!(stats.l1_hits, 0);
     }
+
+    /// I-CC8/I-CC12: Crypto-shred wipe clears both L1 and L2, and
+    /// increments the wipe counter exactly once.
+    #[test]
+    fn crypto_shred_wipes_l1_and_l2() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CacheConfig {
+            mode: CacheMode::Organic,
+            cache_dir: dir.path().to_path_buf(),
+            ..CacheConfig::default()
+        };
+        let mut mgr = CacheManager::new(&config).unwrap();
+
+        // Insert multiple chunks — they go into both L1 and L2.
+        let id1 = test_chunk_id(0xC1);
+        let id2 = test_chunk_id(0xC2);
+        let id3 = test_chunk_id(0xC3);
+        mgr.put_chunk(id1, vec![1; 100]);
+        mgr.put_chunk(id2, vec![2; 200]);
+        mgr.put_chunk(id3, vec![3; 300]);
+
+        // Verify all chunks are readable from L1.
+        assert!(mgr.get_chunk(&id1).is_some(), "id1 should be in cache");
+        assert!(mgr.get_chunk(&id2).is_some(), "id2 should be in cache");
+        assert!(mgr.get_chunk(&id3).is_some(), "id3 should be in cache");
+
+        // Also insert metadata to verify metadata cache is wiped.
+        mgr.put_metadata("/crypto-shred-test.dat".into(), vec![id1, id2]);
+        assert!(mgr.get_metadata("/crypto-shred-test.dat").is_some());
+
+        // Verify L1 and L2 have data before wipe.
+        let pre_stats = mgr.stats();
+        assert!(pre_stats.l1_bytes > 0, "L1 should have data before wipe");
+        assert!(pre_stats.l2_bytes > 0, "L2 should have data before wipe");
+        assert_eq!(pre_stats.wipes, 0, "no wipes yet");
+
+        // Simulate crypto-shred: trigger a full wipe.
+        mgr.wipe();
+
+        // L1 must be empty.
+        assert!(
+            mgr.get_chunk(&id1).is_none(),
+            "id1 must be gone after crypto-shred"
+        );
+        assert!(
+            mgr.get_chunk(&id2).is_none(),
+            "id2 must be gone after crypto-shred"
+        );
+        assert!(
+            mgr.get_chunk(&id3).is_none(),
+            "id3 must be gone after crypto-shred"
+        );
+
+        // Metadata must be wiped.
+        // Note: get_metadata increments meta_misses, so check is_none.
+        assert!(
+            mgr.get_metadata("/crypto-shred-test.dat").is_none(),
+            "metadata must be wiped after crypto-shred"
+        );
+
+        // Stats: L1 and L2 bytes should be 0, wipe counter should be 1.
+        let post_stats = mgr.stats();
+        assert_eq!(post_stats.l1_bytes, 0, "L1 bytes must be 0 after wipe");
+        assert_eq!(post_stats.l2_bytes, 0, "L2 bytes must be 0 after wipe");
+        assert_eq!(
+            post_stats.wipes, 1,
+            "wipe counter must be exactly 1 (I-CC8)"
+        );
+    }
 }

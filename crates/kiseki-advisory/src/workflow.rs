@@ -185,6 +185,53 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_phase_advance_serialized() {
+        // Spawn 2 threads that both call advance_phase(6) on the same
+        // WorkflowEntry (protected by Mutex). Exactly one must succeed
+        // and the other must get PhaseNotMonotonic (since 6 == 6 after
+        // the first advance, violating monotonicity).
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let entry = Arc::new(Mutex::new(WorkflowEntry::new(
+            test_ref(),
+            WorkloadProfile::AiTraining,
+            PhaseId(1),
+            10,
+        )));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+
+        for _ in 0..2 {
+            let entry = Arc::clone(&entry);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut e = entry.lock().unwrap();
+                e.advance_phase(PhaseId(6))
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(successes, 1, "exactly one thread must succeed");
+        assert_eq!(failures, 1, "exactly one thread must fail");
+
+        // The failing result must be PhaseNotMonotonic.
+        let err = results.into_iter().find(|r| r.is_err()).unwrap().unwrap_err();
+        assert!(
+            matches!(err, AdvisoryError::PhaseNotMonotonic { current: 6, requested: 6 }),
+            "expected PhaseNotMonotonic(6, 6), got {err:?}"
+        );
+
+        // Final phase must be 6.
+        let e = entry.lock().unwrap();
+        assert_eq!(e.current_phase, PhaseId(6));
+    }
+
+    #[test]
     fn phase_history_tracks_advances() {
         let mut entry = WorkflowEntry::new(test_ref(), WorkloadProfile::AiTraining, PhaseId(1), 10);
 

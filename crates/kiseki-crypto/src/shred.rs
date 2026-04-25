@@ -49,6 +49,27 @@ pub fn system_path_intact(envelope: &Envelope) -> bool {
     envelope.system_epoch.0 > 0
 }
 
+/// Check whether crypto-shred is allowed given compliance tags and hold state.
+///
+/// HIPAA-tagged namespaces require an explicit retention hold release before
+/// crypto-shred is permitted.
+pub fn check_shred_allowed(
+    compliance_tags: &[kiseki_common::tenancy::ComplianceTag],
+    has_hold_released: bool,
+) -> Result<(), crate::error::CryptoError> {
+    use kiseki_common::tenancy::ComplianceTag;
+    for tag in compliance_tags {
+        if let ComplianceTag::Hipaa = tag {
+            if !has_hold_released {
+                return Err(crate::error::CryptoError::InvalidEnvelope(
+                    "crypto-shred blocked: HIPAA namespace requires explicit retention hold release".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +109,28 @@ mod tests {
         let result = shred_tenant(shred_kek, &mut [env], false);
         assert_eq!(result.invalidated_count, 1);
         assert!(!result.retention_held);
+    }
+
+    #[test]
+    fn hipaa_blocks_shred_without_hold_release() {
+        use kiseki_common::tenancy::ComplianceTag;
+        let tags = vec![ComplianceTag::Hipaa];
+        let result = check_shred_allowed(&tags, false);
+        assert!(result.is_err(), "shred should be blocked for HIPAA without hold release");
+    }
+
+    #[test]
+    fn hipaa_allows_shred_with_hold_release() {
+        use kiseki_common::tenancy::ComplianceTag;
+        let tags = vec![ComplianceTag::Hipaa];
+        assert!(check_shred_allowed(&tags, true).is_ok());
+    }
+
+    #[test]
+    fn non_hipaa_allows_shred_without_hold() {
+        use kiseki_common::tenancy::ComplianceTag;
+        let tags = vec![ComplianceTag::Gdpr];
+        assert!(check_shred_allowed(&tags, false).is_ok());
     }
 
     #[test]

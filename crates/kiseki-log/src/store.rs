@@ -381,3 +381,73 @@ impl LogOps for MemShardStore {
         Ok(before_count.saturating_sub(after_count))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delta::OperationType;
+    use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+
+    fn test_timestamp() -> DeltaTimestamp {
+        DeltaTimestamp {
+            hlc: HybridLogicalClock {
+                physical_ms: 1000,
+                logical: 0,
+                node_id: NodeId(1),
+            },
+            wall: WallTime {
+                millis_since_epoch: 1000,
+                timezone: "UTC".into(),
+            },
+            quality: ClockQuality::Ntp,
+        }
+    }
+
+    /// Inline threshold changes are prospective only (I-L9): the Log layer
+    /// (`append_delta`) accepts payloads of any size. Threshold enforcement
+    /// happens at the Gateway, not the Log. This test proves that both a
+    /// 4 KB and an 8 KB delta succeed regardless of the shard's configured
+    /// inline threshold (default 4096 bytes).
+    #[tokio::test]
+    async fn append_delta_accepts_any_payload_size() {
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(1));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(100));
+        let node_id = NodeId(1);
+
+        store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
+
+        let hashed_key = [0x10u8; 32]; // within default range [0x00, 0xff]
+
+        // 4 KB payload — below default inline threshold (4096).
+        let payload_4k = vec![0xAA; 4096];
+        let req_4k = AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation: OperationType::Create,
+            timestamp: test_timestamp(),
+            hashed_key,
+            chunk_refs: vec![],
+            payload: payload_4k,
+            has_inline_data: true,
+        };
+        let seq1 = store.append_delta(req_4k).await.expect("4KB delta should succeed");
+        assert_eq!(seq1, SequenceNumber(1));
+
+        // 8 KB payload — above default inline threshold (4096).
+        let payload_8k = vec![0xBB; 8192];
+        let req_8k = AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation: OperationType::Update,
+            timestamp: test_timestamp(),
+            hashed_key,
+            chunk_refs: vec![],
+            payload: payload_8k,
+            has_inline_data: false,
+        };
+        let seq2 = store.append_delta(req_8k).await.expect("8KB delta should succeed");
+        assert_eq!(seq2, SequenceNumber(2));
+    }
+}

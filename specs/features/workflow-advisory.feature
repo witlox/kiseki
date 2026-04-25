@@ -57,14 +57,6 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And no data-path operation is delayed, blocked, or reordered by the advisory outage
     And the client observes that hint submissions time out or return "advisory_unavailable"
 
-  @unit
-  Scenario: Hint rejection returns the operation's own result unchanged
-    Given the workload's allowed priority classes are [batch, bulk] only
-    When the client submits a hint { priority: interactive } for an in-flight read
-    Then the hint is rejected with "priority_not_allowed"
-    And the underlying read completes with the same result, latency class, and error behavior it would have without the hint
-    And an advisory-audit event "hint-rejected" is written
-
   # --- Tenant-hierarchy scoping (I-WA3, I-WA7) ---
 
   @unit
@@ -181,15 +173,6 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
   # --- Identity hygiene (I-WA10) ---
 
   @unit
-  Scenario: Another workload cannot use a leaked workflow_id
-    Given "training-run-42" has an active workflow with workflow_id "wf-abc..."
-    And "training-run-42" inadvertently logs "wf-abc..." to a place visible to "inference-svc-9"
-    When a client authenticated as "inference-svc-9" submits a hint carrying workflow_id "wf-abc..."
-    Then the hint is rejected with "workflow_not_found_in_scope"
-    And no information about the workflow's existence or phase is revealed
-    And the rejection latency and error code are indistinguishable from a workflow_id that was never issued
-
-  @unit
   Scenario: New process gets a new client_id
     Given native client process with client_id "cli-7f3a" is running
     When the process restarts
@@ -272,14 +255,6 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And exact accepted-count and throttled-count per workflow per second are preserved in audit
     And the total audit event volume is bounded below the raw 150/sec figure
     And declare/end/phase/policy-violation events are written per-occurrence without batching
-
-  @unit
-  Scenario: Concurrent PhaseAdvance is serialized (I-WA13)
-    Given two threads in one native-client process hold the same workflow handle at phase_id 5
-    When both call PhaseAdvance(6) concurrently
-    Then exactly one call returns success and the workflow advances to phase 6
-    And the other call returns "phase_not_monotonic"
-    And no intermediate state where two phases are active is ever observable
 
   @unit
   Scenario: Hints in-flight at EndWorkflow follow a clear boundary

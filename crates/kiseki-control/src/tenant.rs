@@ -25,6 +25,9 @@ pub struct Organization {
     pub dedup_policy: DedupPolicy,
     /// Resource quota ceiling.
     pub quota: Quota,
+    /// Whether compression is enabled for this org (default: false).
+    /// HIPAA orgs cannot enable compression.
+    pub compression_enabled: bool,
 }
 
 /// Project — optional grouping within an organization.
@@ -225,6 +228,7 @@ mod tests {
                 iops: 100_000,
                 metadata_ops_per_sec: 10_000,
             },
+            compression_enabled: false,
         }
     }
 
@@ -312,6 +316,12 @@ mod tests {
             },
         };
         store.create_workload(wl).unwrap();
+    }
+
+    #[test]
+    fn compression_disabled_by_default() {
+        let org = test_org();
+        assert!(!org.compression_enabled, "new orgs must have compression disabled by default");
     }
 
     #[test]

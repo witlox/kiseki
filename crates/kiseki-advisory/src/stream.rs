@@ -226,6 +226,57 @@ mod tests {
         assert!(reason.unwrap().contains("budget_exceeded"));
     }
 
+    #[test]
+    fn hint_rejection_returns_unchanged_result() {
+        // Verify that a rejected hint (budget exceeded) does not alter any
+        // data-path state. Advisory is isolated from the data path by design
+        // (I-WA2), so the only observable side-effect is the budget counter
+        // itself — no external state should change.
+        let budget = Arc::new(Mutex::new(BudgetEnforcer::new(BudgetConfig {
+            hints_per_sec: 1,
+            max_concurrent_workflows: 2,
+            max_phases_per_workflow: 10,
+        })));
+
+        // Consume the single allowed hint.
+        {
+            let mut b = budget.lock().unwrap();
+            b.try_hint().unwrap();
+        }
+
+        // Snapshot budget state before rejection.
+        let (hints_before, workflows_before) = {
+            let b = budget.lock().unwrap();
+            (b.hints_used(), b.active_workflows())
+        };
+
+        // Submit a hint that will be rejected.
+        let (accepted, reason) = process_hint_json(
+            r#"{"type":"access_pattern","pattern":"random","file_id":99}"#,
+            &budget,
+        );
+        assert!(!accepted, "hint should be rejected when budget exhausted");
+        assert!(
+            reason.as_ref().unwrap().contains("budget_exceeded"),
+            "rejection reason should indicate budget_exceeded"
+        );
+
+        // Verify budget state is unchanged after rejection — the rejected
+        // hint must not consume a token or alter workflow count.
+        let (hints_after, workflows_after) = {
+            let b = budget.lock().unwrap();
+            (b.hints_used(), b.active_workflows())
+        };
+        assert_eq!(
+            hints_before, hints_after,
+            "hint counter must not change on rejection"
+        );
+        assert_eq!(
+            workflows_before, workflows_after,
+            "workflow count must not change on rejection"
+        );
+    }
+
     #[tokio::test]
     async fn server_accepts_connection_and_processes_hint() {
         let budget = test_budget();

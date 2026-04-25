@@ -94,6 +94,7 @@ impl ControlService for ControlGrpc {
             compliance_tags: proto_tags(&req.compliance_tags),
             dedup_policy: DedupPolicy::CrossTenant,
             quota: proto_quota(req.quota.as_ref()),
+            compression_enabled: false,
         };
         self.tenants.create_org(org).map_err(|e| to_status(&e))?;
         Ok(Response::new(pb::CreateOrganizationResponse {

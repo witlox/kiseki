@@ -72,6 +72,9 @@ pub struct StorageAdminService {
     pools: RwLock<HashMap<String, StoragePool>>,
     devices: RwLock<HashMap<String, DeviceInfo>>,
     shard_assignments: RwLock<HashMap<ShardId, String>>, // shard → pool
+    /// Inline data threshold in bytes (ADR-030, I-SF1).
+    /// Changes are prospective only — existing deltas are not affected.
+    inline_threshold_bytes: RwLock<u64>,
 }
 
 /// Check that the caller has admin privileges.
@@ -101,7 +104,33 @@ impl StorageAdminService {
             pools: RwLock::new(HashMap::new()),
             devices: RwLock::new(HashMap::new()),
             shard_assignments: RwLock::new(HashMap::new()),
+            inline_threshold_bytes: RwLock::new(4096),
         }
+    }
+
+    /// Set the inline data threshold in bytes (ADR-030).
+    /// Changes are prospective only — existing deltas are not affected (I-L9).
+    pub fn set_inline_threshold(&self, bytes: u64) {
+        *self.inline_threshold_bytes.write().unwrap() = bytes;
+    }
+
+    /// Get the current inline data threshold in bytes.
+    #[must_use]
+    pub fn inline_threshold(&self) -> u64 {
+        *self.inline_threshold_bytes.read().unwrap()
+    }
+
+    /// Attempt to change a tenant quota via `StorageAdminService`.
+    /// Always fails — tenant quotas must be changed via `ControlService` (I-Auth3).
+    pub fn change_tenant_quota(
+        &self,
+        _role: AdminRole,
+        _tenant_id: &str,
+        _new_quota_bytes: u64,
+    ) -> Result<(), AdminError> {
+        Err(AdminError::NotPermitted(
+            "use ControlService for quota changes".into(),
+        ))
     }
 
     /// Create a storage pool. Requires admin role.
@@ -264,6 +293,9 @@ pub enum AdminError {
         /// Requested status.
         to: DeviceStatus,
     },
+    /// Operation not permitted on this service.
+    #[error("not permitted: {0}")]
+    NotPermitted(String),
 }
 
 #[cfg(test)]
@@ -379,5 +411,55 @@ mod tests {
         let svc = StorageAdminService::new();
         let shard = ShardId(uuid::Uuid::from_u128(1));
         assert!(svc.assign_shard(shard, "missing", ADMIN).is_err());
+    }
+
+    #[test]
+    fn inline_threshold_store_and_retrieve() {
+        let svc = StorageAdminService::new();
+        // Default is 4096.
+        assert_eq!(svc.inline_threshold(), 4096);
+        // Set to 8192 and verify.
+        svc.set_inline_threshold(8192);
+        assert_eq!(svc.inline_threshold(), 8192);
+    }
+
+    #[test]
+    fn cluster_admin_cannot_modify_tenant_quota() {
+        let svc = StorageAdminService::new();
+        let result = svc.change_tenant_quota(AdminRole::Admin, "tenant-1", 1_000_000);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, AdminError::NotPermitted(ref msg) if msg.contains("ControlService")),
+            "expected NotPermitted error directing to ControlService, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pool_status_has_only_aggregate_fields() {
+        // Structural assertion: StoragePool exposes only aggregate capacity
+        // fields (total_capacity_bytes, used_bytes, device_count) with no
+        // per-tenant breakdown.
+        let svc = StorageAdminService::new();
+        svc.create_pool(test_pool(), ADMIN).unwrap();
+
+        let pool = svc.get_pool("nvme-fast").unwrap();
+        // Access aggregate fields — these must exist.
+        let _total = pool.total_capacity_bytes;
+        let _used = pool.used_bytes;
+        let _devices = pool.device_count;
+        // If StoragePool ever gains per-tenant fields this test's compile
+        // ensures we consciously update it. The struct has exactly these
+        // public data fields (plus name, media_type, ec_*).
+        let StoragePool {
+            name: _,
+            media_type: _,
+            device_count: _,
+            total_capacity_bytes: _,
+            used_bytes: _,
+            ec_data_shards: _,
+            ec_parity_shards: _,
+        } = pool;
+        // Destructure succeeds — no per-tenant attribution fields exist.
     }
 }

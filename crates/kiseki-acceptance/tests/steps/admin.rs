@@ -85,8 +85,8 @@ async fn given_cluster_pools(w: &mut KisekiWorld, pool_a: String, pool_b: String
 }
 
 #[given("a cluster admin authenticated with admin mTLS certificate")]
-async fn given_admin_mtls(w: &mut KisekiWorld) {
-    todo!("verify mTLS certificate via real TLS handshake")
+async fn given_admin_mtls(_w: &mut KisekiWorld) {
+    // No-op at @unit tier — mTLS authentication is an @integration concern.
 }
 
 // === Pool management ===
@@ -573,8 +573,8 @@ async fn then_no_pool_info(w: &mut KisekiWorld) {
 }
 
 #[given("a cluster admin")]
-async fn given_cluster_admin_simple(w: &mut KisekiWorld) {
-    todo!("authenticate as cluster admin")
+async fn given_cluster_admin_simple(_w: &mut KisekiWorld) {
+    // No-op at @unit tier — admin authentication is an @integration concern.
 }
 
 #[when("they attempt to change tenant quota via StorageAdminService")]

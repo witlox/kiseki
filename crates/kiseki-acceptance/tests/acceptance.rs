@@ -373,6 +373,7 @@ impl KisekiWorld {
                 iops: 100_000,
                 metadata_ops_per_sec: 10_000,
             },
+            compression_enabled: false,
         };
         let _ = self.control_tenant_store.create_org(org);
     }

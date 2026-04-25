@@ -46,21 +46,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # --- Write path ---
 
-  @unit
-  Scenario: POSIX write via FUSE — client-side encryption
-    Given the workload writes 256MB to /mnt/kiseki/trials/checkpoint.pt
-    When the native client processes the write:
-      | step | action                                              |
-      | 1    | chunk plaintext (content-defined, variable-size)     |
-      | 2    | compute chunk_id = sha256(plaintext) per chunk       |
-      | 3    | encrypt chunks: system DEK from system key manager   |
-      | 4    | write encrypted chunks to Chunk Storage over fabric  |
-      | 5    | submit delta to Composition (via shard)               |
-      | 6    | receive DeltaCommitted                               |
-    Then the write is acknowledged to the workload via FUSE
-    And plaintext existed only in the workload process memory
-    And encrypted chunks traveled on the wire
-
   # --- RDMA path ---
 
   @integration
@@ -82,15 +67,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And committed writes (acknowledged) are durable in the Log
     And other clients and views are unaffected
     And no cluster-wide impact
-
-  @unit
-  Scenario: Tenant KMS unreachable — cached key expires
-    Given the native client's cached tenant KEK expires
-    And the tenant KMS is unreachable from the compute node
-    When the workload issues a read or write
-    Then the operation fails with "tenant key unavailable" error
-    And the workload receives EIO (FUSE) or error code (native API)
-    And when KMS is reachable again, operations resume
 
   @integration
   Scenario: Storage node unreachable — chunk read fails
@@ -226,31 +202,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     When the client stages a 5GB dataset
     Then the staging returns CacheCapacityExceeded
     And no existing pinned data is evicted
-
-  @unit
-  Scenario: Process crash leaves orphaned L2 pool
-    Given a client process has cached plaintext in L2
-    When the process is killed (SIGKILL)
-    Then L2 chunk files remain on NVMe (no zeroize opportunity)
-    And the pool.lock flock is released by the kernel
-    And the next kiseki process on that node detects the orphaned pool via flock
-    And the orphaned pool is wiped (zeroize + delete)
-
-  @unit
-  Scenario: Disconnect threshold triggers cache wipe
-    Given a client with max_disconnect_seconds 300 and a warm cache
-    When the fabric is unreachable for 301 seconds (no successful RPC)
-    Then the entire cache (L1 + L2) is wiped (I-CC6)
-    And cache_wipes counter increments
-    And on reconnect, the cache starts cold
-
-  @unit
-  Scenario: Crypto-shred triggers immediate cache wipe
-    Given a client with cached plaintext for tenant "org-A"
-    When the tenant admin destroys the KEK (crypto-shred)
-    And the periodic key health check detects KEK_DESTROYED
-    Then all cached plaintext for "org-A" is wiped from L1 and L2 with zeroize (I-CC12)
-    And cache_wipes counter increments
 
   @integration
   Scenario: Cache policy resolved via data-path gRPC

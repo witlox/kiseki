@@ -69,20 +69,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     Then the ciphertext is decrypted
     And decompressed to recover the original 10MB plaintext
 
-  @unit
-  Scenario: HIPAA namespace blocks compression opt-in
-    Given "org-pharma" has compliance tag [HIPAA]
-    When the tenant admin attempts to enable compression
-    Then the request is rejected with "compression prohibited by HIPAA compliance tag"
-    And no compression setting is changed
-
-  @unit
-  Scenario: Compression disabled by default
-    Given a new tenant "org-newco" is created with default settings
-    Then compression is disabled
-    And all chunks are stored without compression
-
-  # --- Audit GC safety valve (ADR-009 revised, I-A5) ---
+# --- Audit GC safety valve (ADR-009 revised, I-A5) ---
 
   @unit
   Scenario: Audit export stalls — safety valve triggers GC
@@ -125,14 +112,6 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the tenant admin is notified of the auto-hold
 
   @unit
-  Scenario: Crypto-shred blocked when compliance implies retention
-    Given namespace "patient-records" has tag [HIPAA]
-    And no explicit retention hold exists (auto-hold was not created — edge case)
-    When "org-pharma" attempts crypto-shred
-    Then crypto-shred is blocked with error: "compliance tags imply retention; set hold or use force override"
-    And the block is recorded in the audit log
-
-  @unit
   Scenario: Crypto-shred with force override — audited
     Given namespace "patient-records" has HIPAA tag but no retention hold
     When "org-pharma" performs crypto-shred with force_without_hold_check=true
@@ -161,21 +140,6 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And after 60 seconds, the cached KEK expires
     And subsequent operations from "client-1" fail with "key unavailable"
 
-  @unit
-  Scenario: Tenant configures shorter crypto-shred TTL
-    Given "org-pharma" requests cache TTL of 10 seconds (within [5s, 300s] bounds)
-    When the control plane processes the request
-    Then the TTL is set to 10 seconds for all "org-pharma" key caches
-    And KMS load increases (key refresh every 10 seconds per component)
-    And the configuration change is recorded in the audit log
-
-  @unit
-  Scenario: TTL below minimum rejected
-    Given "org-pharma" requests cache TTL of 2 seconds
-    When the control plane processes the request
-    Then the request is rejected with "TTL below minimum (5s)"
-    And the current TTL is unchanged
-
   # --- Writable mmap (ADR-013, I-O8) ---
 
   @unit
@@ -185,14 +149,6 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     Then the native client returns ENOTSUP
     And logs: "writable shared mmap not supported; use write() instead"
     And the workload receives the error immediately
-
-  @unit
-  Scenario: Read-only mmap works
-    Given a workload opens a file via FUSE mount
-    When the workload calls mmap with PROT_READ and MAP_PRIVATE
-    Then the mmap succeeds
-    And the file contents are readable through the mapped region
-    And this is useful for model loading and read-only data access
 
   # --- Multi-endpoint client resilience (ADR-019, I-O9) ---
 

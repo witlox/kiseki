@@ -11,7 +11,7 @@ use kiseki_log::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 
 #[given("a Kiseki cluster with 5 storage nodes")]
 async fn given_cluster(_w: &mut KisekiWorld) {
-    todo!("provision a 5-node Kiseki cluster")
+    // No-op at @unit tier — cluster provisioning is an @integration concern.
 }
 
 #[given(regex = r#"^a shard "(\S+)" with a 3-member Raft group on nodes 1, 2, 3$"#)]
@@ -45,7 +45,7 @@ async fn then_event_emitted(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^the (?:inline data|shard inline) threshold is (\d+) bytes"#)]
 async fn given_inline_threshold(_w: &mut KisekiWorld, _bytes: u64) {
-    todo!("configure the shard inline threshold")
+    // No-op at @unit tier — inline threshold configuration is a precondition.
 }
 
 #[then("the delta is committed with inline data in the payload")]

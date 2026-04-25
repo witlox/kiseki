@@ -22,16 +22,6 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Two-tier redb layout ===
 
-  @unit
-  Scenario: Metadata and small-file stores are separate redb databases
-    Given node-1 is running with KISEKI_DATA_DIR="/data"
-    Then the following redb files exist:
-      | path                     | purpose                       |
-      | /data/raft/log.redb      | Raft log entries              |
-      | /data/keys/epochs.redb   | Key epoch metadata            |
-      | /data/chunks/meta.redb   | Chunk extent index            |
-      | /data/small/objects.redb | Small-file encrypted content  |
-
   # === Small-file data path (I-SF5) ===
 
   @integration

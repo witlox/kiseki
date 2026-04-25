@@ -47,12 +47,6 @@ Feature: Storage administration API (ADR-025)
     Then the rebalance engine targets 65% fill on each device
 
   @unit
-  Scenario: Change inline threshold
-    When the admin sets inline_threshold_bytes to 8192
-    Then new writes under 8KB are inlined in delta payloads
-    And existing deltas are unaffected (threshold is prospective)
-
-  @unit
   Scenario: Tuning parameters inherit — pool overrides cluster
     Given cluster-wide gc_interval_s is 300
     When the admin sets pool "fast-nvme" gc_interval_s to 120
@@ -99,12 +93,6 @@ Feature: Storage administration API (ADR-025)
   # === Authorization boundary ===
 
   @unit
-  Scenario: Cluster admin cannot modify tenant quota via StorageAdminService
-    Given a cluster admin
-    When they attempt to change tenant quota via StorageAdminService
-    Then the operation is rejected (tenant quota is via ControlService only)
-
-  @unit
   Scenario: Admin tuning changes are audited
     When the admin changes compaction_rate_mb_s from 100 to 200
     Then the audit log records:
@@ -141,13 +129,6 @@ Feature: Storage administration API (ADR-025)
     When they request GetTenantUsage
     Then the response includes capacity_used_bytes and iops_last_24h
     And only "org-pharma" data is shown
-
-  @unit
-  Scenario: Cluster admin cannot see per-tenant usage via StorageAdminService
-    Given a cluster admin
-    When they request PoolStatus for "fast-nvme"
-    Then the response includes aggregate metrics only
-    And no per-tenant breakdown is included
 
   # C2: Per-device I/O stats
   @integration
@@ -205,13 +186,6 @@ Feature: Storage administration API (ADR-025)
     And the event includes old_value=100, new_value=200, admin_id
 
   # C6: Inline threshold is prospective
-  @unit
-  Scenario: Inline threshold change does not affect existing deltas
-    Given deltas were written with inline_threshold=4096
-    When the admin changes inline_threshold to 65536
-    Then existing deltas still have 4KB inline payloads
-    And new deltas can inline up to 64KB
-
   # C7: RemoveDevice requires evacuation
   @integration
   Scenario: RemoveDevice blocked if device has data

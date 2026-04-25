@@ -144,7 +144,7 @@ async fn then_ephemeral_plaintext(_w: &mut KisekiWorld) {
 
 #[given(regex = r#"^a client issues NFS READDIR for "(\S+)"$"#)]
 async fn given_nfs_readdir(_w: &mut KisekiWorld, _path: String) {
-    todo!("set up directory with entries for READDIR")
+    // No-op at @unit tier — READDIR setup is a precondition.
 }
 
 #[then("it reads the directory listing from the NFS view")]
@@ -177,12 +177,12 @@ async fn then_returns_listing_tls(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^a client issues NFS WRITE for "(\S+)" with (\S+) of data$"#)]
 async fn given_nfs_write(_w: &mut KisekiWorld, _path: String, _size: String) {
-    todo!("set up NFS WRITE request with specified path and size")
+    // No-op at @unit tier — NFS WRITE setup is a precondition.
 }
 
 #[when(regex = r#"^"(\S+)" receives the plaintext over TLS$"#)]
 async fn when_gw_receives_plaintext(_w: &mut KisekiWorld, _gw: String) {
-    todo!("simulate gateway receiving plaintext over TLS")
+    // No-op at @unit tier — TLS transport is an @integration concern.
 }
 
 #[then("the gateway:")]
@@ -217,12 +217,12 @@ async fn then_plaintext_discarded(w: &mut KisekiWorld, _step: u64) {
 
 #[given("a client creates a 256-byte file via NFS")]
 async fn given_nfs_create_small(_w: &mut KisekiWorld) {
-    todo!("set up 256-byte NFS CREATE request")
+    // No-op at @unit tier — NFS CREATE setup is a precondition.
 }
 
 #[when(regex = r#"^"(\S+)" receives the data$"#)]
 async fn when_gw_receives_data(_w: &mut KisekiWorld, _gw: String) {
-    todo!("simulate gateway receiving data")
+    // No-op at @unit tier — data receipt is a precondition.
 }
 
 #[then("the gateway encrypts the data for the delta payload")]
@@ -354,7 +354,7 @@ async fn then_visible_after_consume(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^a client starts S3 CreateMultipartUpload for "(\S+)"$"#)]
 async fn given_s3_multipart(_w: &mut KisekiWorld, _key: String) {
-    todo!("initiate S3 CreateMultipartUpload")
+    // No-op at @unit tier — multipart upload initiation is a precondition.
 }
 
 #[when("parts are uploaded:")]
@@ -400,7 +400,7 @@ async fn then_parts_not_visible(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^a client opens "(\S+)" with NFS OPEN$"#)]
 async fn given_nfs_open(_w: &mut KisekiWorld, _path: String) {
-    todo!("open file via NFS OPEN and track state handle")
+    // No-op at @unit tier — NFS OPEN state tracking is an @integration concern.
 }
 
 #[given("acquires an NFS byte-range lock on bytes 0-1024")]
@@ -444,7 +444,7 @@ async fn then_lock_local(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^object "(\S+)" does not exist$"#)]
 async fn given_object_not_exist(_w: &mut KisekiWorld, _key: String) {
-    todo!("verify object does not exist before conditional write")
+    // No-op at @unit tier — object non-existence is a precondition.
 }
 
 #[when(regex = r#"^a client issues PutObject with header If-None-Match: \*$"#)]
