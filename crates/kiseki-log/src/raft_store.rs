@@ -447,6 +447,20 @@ impl LogOps for RaftLogStore {
             sm.info.state = state;
         }
     }
+
+    async fn register_consumer(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sm = inner.shards.get_mut(&shard_id).ok_or(LogError::ShardNotFound(shard_id))?;
+        sm.watermarks.register(consumer, position);
+        Ok(())
+    }
+
+    async fn advance_watermark(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sm = inner.shards.get_mut(&shard_id).ok_or(LogError::ShardNotFound(shard_id))?;
+        sm.watermarks.advance(consumer, position);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -234,4 +234,14 @@ impl LogOps for RaftShardStore {
         // Shard state transitions are coordinated by the control plane.
         let _ = shard_id;
     }
+
+    async fn register_consumer(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+        let store = self.get_shard(shard_id)?;
+        store.register_consumer(consumer, position).await
+    }
+
+    async fn advance_watermark(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+        let store = self.get_shard(shard_id)?;
+        store.advance_watermark(consumer, position).await
+    }
 }

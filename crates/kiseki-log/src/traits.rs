@@ -107,4 +107,28 @@ pub trait LogOps: Send + Sync {
 
     /// Transition a shard's lifecycle state (ADR-034 merge protocol).
     fn set_shard_state(&self, shard_id: ShardId, state: ShardState);
+
+    // --- Consumer watermarks (ADR-036, I-L4) ---
+
+    /// Register a consumer at a starting position.
+    ///
+    /// Async because on Raft-backed stores, consumer state is part of
+    /// the replicated state machine.
+    async fn register_consumer(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) -> Result<(), LogError>;
+
+    /// Advance a consumer's watermark. Only moves forward.
+    ///
+    /// Callers advance watermarks BEFORE calling `truncate_log` — GC
+    /// uses `min(all watermarks)` as the boundary (I-L4).
+    async fn advance_watermark(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) -> Result<(), LogError>;
 }

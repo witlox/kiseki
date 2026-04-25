@@ -334,7 +334,7 @@ async fn then_new_shard(w: &mut KisekiWorld, name: String) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let info = w.log_store.shard_health(sid).await.unwrap();
     if let Some(plan) = plan_split(&info) {
-        execute_split(&w.log_store, &plan).await.unwrap();
+        execute_split(w.log_store.as_ref(), &plan).await.unwrap();
         w.shard_names.insert(name, plan.new_shard);
         assert!(
             w.log_store.shard_health(plan.new_shard).await.is_ok(),
@@ -907,7 +907,7 @@ async fn then_split_new_compact(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let info = w.log_store.shard_health(sid).await.unwrap();
     if let Some(plan) = plan_split(&info) {
-        execute_split(&w.log_store, &plan).await.unwrap();
+        execute_split(w.log_store.as_ref(), &plan).await.unwrap();
         let new_health = w.log_store.shard_health(plan.new_shard).await.unwrap();
         // New shard exists with its own state.
         assert_eq!(new_health.state, ShardState::Healthy);
@@ -1458,7 +1458,7 @@ async fn when_auto_split_fires(w: &mut KisekiWorld) {
 
     // Plan and execute split through real LogOps.
     let plan = auto_split::plan_split(&health).expect("split plan should be produced");
-    auto_split::execute_split(&w.log_store, &plan).await
+    auto_split::execute_split(w.log_store.as_ref(), &plan).await
         .expect("split execution should succeed");
 
     // Register the new shard name.

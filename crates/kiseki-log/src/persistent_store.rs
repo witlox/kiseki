@@ -231,6 +231,14 @@ impl LogOps for PersistentShardStore {
     fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
         self.mem.set_shard_state(shard_id, state);
     }
+
+    async fn register_consumer(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+        self.mem.register_consumer(shard_id, consumer, position)
+    }
+
+    async fn advance_watermark(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+        self.mem.advance_watermark(shard_id, consumer, position)
+    }
 }
 
 #[cfg(test)]

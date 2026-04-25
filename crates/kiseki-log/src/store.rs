@@ -427,6 +427,24 @@ impl LogOps for MemShardStore {
     fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
         Self::set_shard_state(self, shard_id, state);
     }
+
+    async fn register_consumer(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) -> Result<(), LogError> {
+        Self::register_consumer(self, shard_id, consumer, position)
+    }
+
+    async fn advance_watermark(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) -> Result<(), LogError> {
+        Self::advance_watermark(self, shard_id, consumer, position)
+    }
 }
 
 #[cfg(test)]
