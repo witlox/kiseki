@@ -50,6 +50,7 @@ fn to_status(e: &ControlError) -> Status {
         ControlError::QuotaExceeded(msg) | ControlError::Rejected(msg) => {
             Status::failed_precondition(msg.clone())
         }
+        ControlError::NotPermitted(msg) => Status::permission_denied(msg.clone()),
     }
 }
 

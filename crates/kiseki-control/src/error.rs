@@ -18,4 +18,8 @@ pub enum ControlError {
     /// Operation rejected (e.g., maintenance mode, policy violation).
     #[error("{0}")]
     Rejected(String),
+
+    /// Permission denied (e.g., cross-tenant access).
+    #[error("permission denied: {0}")]
+    NotPermitted(String),
 }

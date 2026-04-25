@@ -37,6 +37,7 @@ use kiseki_control::iam::AccessRequest;
 use kiseki_control::maintenance::MaintenanceState;
 use kiseki_control::namespace::NamespaceStore;
 use kiseki_control::retention::RetentionStore;
+use kiseki_control::shard_topology::{NamespaceShardMapStore, ShardTopologyConfig};
 use kiseki_control::storage_admin::StorageAdminService;
 use kiseki_control::tenant::TenantStore;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
@@ -132,6 +133,13 @@ pub struct KisekiWorld {
 
     // === Storage admin (ADR-025) ===
     pub control_admin: StorageAdminService,
+
+    // === Shard topology (ADR-033) ===
+    pub topology_config: ShardTopologyConfig,
+    pub shard_map_store: NamespaceShardMapStore,
+    pub topology_active_nodes: Vec<NodeId>,
+    pub topology_last_map: Option<kiseki_control::shard_topology::NamespaceShardMap>,
+    pub topology_last_error: Option<String>,
 
     // === Small-file placement (ADR-030) ===
     pub sf_node_count: u64,
@@ -291,6 +299,11 @@ impl KisekiWorld {
             kms_circuit_open: false,
             kms_concurrent_count: 0,
             control_admin: StorageAdminService::new(),
+            topology_config: ShardTopologyConfig::default(),
+            shard_map_store: NamespaceShardMapStore::new(),
+            topology_active_nodes: Vec::new(),
+            topology_last_map: None,
+            topology_last_error: None,
             sf_node_count: 3,
             sf_soft_limit_pct: 50,
             sf_hard_limit_pct: 75,
