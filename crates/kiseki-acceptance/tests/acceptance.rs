@@ -479,6 +479,14 @@ impl KisekiWorld {
         self.namespace_ids.insert(name.to_owned(), ns_id);
     }
 
+    /// Advance the key manager to the specified epoch by rotating.
+    pub async fn advance_to_epoch(&self, target: u64) {
+        use kiseki_keymanager::epoch::KeyManagerOps;
+        while self.key_store.current_epoch().await.unwrap().0 < target {
+            self.key_store.rotate().await.unwrap();
+        }
+    }
+
     /// Get or create a view by name.
     pub fn ensure_view(&mut self, name: &str) -> ViewId {
         if let Some(&id) = self.view_ids.get(name) {

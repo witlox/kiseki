@@ -35,6 +35,7 @@ pub use error::LogError;
 pub use raft_shard_store::RaftShardStore;
 pub use raft_store::RaftLogStore;
 pub use shard::{ShardConfig, ShardInfo, ShardState};
+pub use persistent_store::PersistentShardStore;
 pub use store::MemShardStore;
 pub use traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 pub use watermark::ConsumerWatermarks;
