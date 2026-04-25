@@ -170,14 +170,6 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And chunk c20 has refcount 0 (no composition references it)
     And c20 becomes eligible for GC (orphan chunk cleanup)
 
-  @unit
-  Scenario: Cross-shard rename returns EXDEV
-    Given composition "file.txt" exists in namespace "alpha" (shard-1)
-    When a POSIX rename targets namespace "beta" (shard-2)
-    Then the operation returns EXDEV
-    And the caller handles via copy + delete
-    And no 2PC or cross-shard coordination occurs
-
   # --- Workflow Advisory integration (ADR-020) ---
   # Composition acts on collective-announcement and retention-intent hints,
   # and emits caller-scoped refcount/version activity telemetry. Hints

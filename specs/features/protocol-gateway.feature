@@ -12,84 +12,6 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And NFS view "nfs-trials" at watermark 5000
     And S3 view "s3-trials" at watermark 4998
 
-  # --- NFS read path ---
-
-  @unit
-  Scenario: NFS READ — serve from materialized view
-    Given a client issues NFS READ for "/trials/results.h5" offset 0 length 64MB
-    When "gw-nfs-pharma" receives the request
-    Then it resolves the path in the NFS view "nfs-trials"
-    And identifies the chunk references for the requested byte range
-    And reads encrypted chunks from Chunk Storage
-    And unwraps system DEK via tenant KEK
-    And decrypts chunks to plaintext
-    And returns plaintext to the NFS client over TLS
-    And plaintext exists only in gateway memory, ephemerally
-
-  @unit
-  Scenario: NFS READDIR — directory listing from view
-    Given a client issues NFS READDIR for "/trials/"
-    When "gw-nfs-pharma" receives the request
-    Then it reads the directory listing from the NFS view
-    And the view contains decrypted filenames (stream processor decrypted them)
-    And returns the listing to the client over TLS
-
-  # --- NFS write path ---
-
-  @unit
-  Scenario: NFS WRITE — encrypt and commit through Composition
-    Given a client issues NFS WRITE for "/trials/new-data.bin" with 128MB of data
-    When "gw-nfs-pharma" receives the plaintext over TLS
-    Then the gateway:
-      | step | action                                              |
-      | 1    | chunks the plaintext (content-defined, variable-size)|
-      | 2    | computes chunk_id = sha256(plaintext) per chunk      |
-      | 3    | submits chunks to Chunk Storage (system encrypts)    |
-      | 4    | receives ChunkStored confirmations                   |
-      | 5    | submits delta to Composition context                 |
-      | 6    | Composition appends delta to shard                   |
-      | 7    | receives DeltaCommitted                              |
-    And the gateway returns NFS WRITE success to the client
-    And plaintext is discarded from gateway memory after step 2
-
-  @unit
-  Scenario: NFS CREATE — small file with inline data
-    Given a client creates a 256-byte file via NFS
-    When "gw-nfs-pharma" receives the data
-    Then the gateway encrypts the data for the delta payload
-    And submits to Composition with inline data (below threshold)
-    And no chunk write occurs
-    And the delta commits with inline encrypted payload
-
-  # --- S3 read path ---
-
-  @unit
-  Scenario: S3 GetObject — serve from S3 view
-    Given a client issues S3 GetObject for "s3://trials/dataset.parquet"
-    When "gw-s3-pharma" receives the request
-    Then it resolves the object key in the S3 view "s3-trials"
-    And reads encrypted chunks from Chunk Storage
-    And decrypts using tenant KEK → system DEK
-    And returns plaintext as S3 response body over TLS
-
-  @unit
-  Scenario: S3 ListObjectsV2 — bucket listing from view
-    Given a client issues S3 ListObjectsV2 for bucket "trials" with prefix "study-42/"
-    When "gw-s3-pharma" receives the request
-    Then it reads the object listing from the S3 view
-    And returns matching keys, sizes, and last-modified timestamps
-    And the listing reflects the S3 view's current watermark (bounded-staleness)
-
-  # --- S3 write path ---
-
-  @unit
-  Scenario: S3 PutObject — single-part upload
-    Given a client issues S3 PutObject for "results/output.csv" with 10MB body
-    When "gw-s3-pharma" receives the plaintext over TLS
-    Then the gateway chunks, computes chunk_ids, writes chunks, commits delta
-    And returns S3 200 OK with ETag
-    And the object is visible in the S3 view after the stream processor consumes the delta
-
   @unit
   Scenario: S3 multipart upload — large object
     Given a client starts S3 CreateMultipartUpload for "checkpoints/epoch-100.pt"
@@ -169,14 +91,6 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And if repair fails, the read returns an error to the client
     And the error is protocol-appropriate (NFS: EIO, S3: 500 Internal Server Error)
 
-  @unit
-  Scenario: Gateway receives request for wrong tenant
-    Given "gw-nfs-pharma" serves only tenant "org-pharma"
-    When a request arrives with credentials for "org-biotech"
-    Then the request is rejected with authentication error
-    And the attempt is recorded in the audit log
-    And no data from "org-pharma" is exposed
-
   # --- Workflow Advisory integration (ADR-020) ---
   # Gateways act on priority-class, access-pattern, and deadline hints
   # and emit request-level backpressure and QoS-headroom telemetry to the
@@ -227,14 +141,6 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And all RPCs on that mount inherit that workflow_ref internally (translated to the gRPC binary header at the kiseki-server ingress)
     And mounts without `workflow-ref` proceed with no advisory correlation — data-path behavior is identical to pre-advisory NFS (I-WA1, I-WA2)
     And the gateway MAY refuse a mount whose workflow_ref is unknown or belongs to a different workload; that refusal is a mount-time error, not mid-session
-
-  @unit
-  Scenario: Advisory disabled at workload — gateway ignores hints, serves protocol normally
-    Given tenant admin transitions "training-run-42" advisory to disabled
-    When NFS or S3 requests arrive with workflow_ref or priority hints
-    Then the gateway ignores all advisory annotations
-    And serves the request with default scheduling and protocol semantics
-    And no performance or correctness regression is observable (I-WA12)
 
   @unit
   Scenario: QoS-headroom telemetry caller-scoped

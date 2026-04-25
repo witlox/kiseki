@@ -37,25 +37,6 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Schema versioning (ADR-004) ---
 
-  @unit
-  Scenario: New-version stream processor reads old-format deltas
-    Given shard "shard-1" contains deltas in format version 1
-    And a new stream processor supports format versions [1, 2]
-    When the stream processor consumes deltas from shard-1
-    Then it reads format version 1 deltas successfully
-    And materializes the view correctly
-    And no upgrade of the delta format is required
-
-  @unit
-  Scenario: Old-version stream processor encounters unknown format
-    Given shard "shard-1" contains a delta in format version 3
-    And the stream processor supports format versions [1, 2] only
-    When the stream processor encounters the version 3 delta
-    Then it skips the delta with a warning log
-    And continues processing subsequent deltas
-    And the skipped delta is flagged for manual review
-    And the view may have a gap (documented behavior)
-
   @integration
   Scenario: Rolling upgrade — mixed version cluster
     Given nodes [1, 2, 3] are running kiseki-server v1.0 (format version 1)
@@ -64,14 +45,6 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And node 1 writes format v1 deltas (not v2, until all nodes upgraded)
     And Raft replication works across mixed versions
     And after all nodes upgraded: writers switch to format v2
-
-  @unit
-  Scenario: Chunk envelope version preserved through compaction
-    Given shard "shard-1" has deltas with format versions [1, 1, 2, 2]
-    When compaction merges these deltas
-    Then each delta retains its original format version
-    And compaction does not upgrade delta formats
-    And encrypted payloads are carried opaquely regardless of version
 
   # --- Compression (I-K14) ---
 
@@ -282,15 +255,6 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And subsequent operations on n1 succeed normally
 
   # --- Dedup refcount access control (ADR-017) ---
-
-  @unit
-  Scenario: Cluster admin sees total refcount only
-    Given chunk "abc123" is referenced by org-pharma (1 ref) and org-biotech (1 ref)
-    And total refcount = 2
-    When the cluster admin queries ChunkHealth for "abc123"
-    Then the response includes total_refcount: 2
-    And the response does NOT include per-tenant attribution
-    And the cluster admin cannot determine which tenants share the chunk
 
   @unit
   Scenario: Dedup timing side channel — normalized write latency

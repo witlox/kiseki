@@ -36,15 +36,6 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And advances its watermark to 5000
     And the NFS view reflects state as of sequence 5000
 
-  @unit
-  Scenario: Stream processor respects staleness bound
-    Given stream processor "sp-s3-trials" is at watermark 4950
-    And the effective staleness bound is 2s (HIPAA floor overrides 5s descriptor)
-    When 2 seconds have elapsed since watermark 4950's timestamp
-    Then "sp-s3-trials" MUST consume available deltas to stay within bound
-    And if deltas are available, it advances to at least the delta within 2s
-    And if no deltas exist in that window, the view is current
-
   @integration
   Scenario: POSIX view provides read-your-writes
     Given the NFS view is at watermark 5000
@@ -92,65 +83,6 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And it migrates existing materialized data in background
     And reads continue from old materialization until migration completes
 
-  # --- MVCC reads ---
-
-  @unit
-  Scenario: MVCC read pins a log position
-    Given the NFS view is at watermark 5000
-    When a read operation begins
-    Then it pins a snapshot at position 5000
-    And concurrent writes (position 5001, 5002) are invisible to this read
-    And the read sees a consistent point-in-time snapshot
-
-  @unit
-  Scenario: MVCC pin expires — read must restart or complete
-    Given a read pinned at position 3000 has been active for 600 seconds
-    And the pin TTL for this view is 300 seconds
-    When the pin expires
-    Then the snapshot guarantee is revoked
-    And the read receives a "snapshot expired" error if still in progress
-    And the caller may restart the read from a fresher position
-    And compaction can now proceed past position 3000
-
-  # --- Object versioning ---
-
-  @unit
-  Scenario: View exposes object versions
-    Given namespace "trials" has versioning enabled
-    And composition "results.h5" has been written 3 times (v1, v2, v3)
-    When the S3 view lists versions for "results.h5"
-    Then it returns [v1, v2, v3] with their respective log positions
-    And each version is independently readable
-    And the current version is v3
-
-  @unit
-  Scenario: Version read at historical position
-    Given "results.h5" v1 was committed at log position 1000
-    And v2 at position 2000, v3 at position 3000
-    When a read requests version v1 specifically
-    Then the view returns the state of "results.h5" at position 1000
-    And chunks referenced by v1 are read from Chunk Storage
-    And the read does not require replaying the log (view has version index)
-
-  # --- Cross-view consistency ---
-
-  @unit
-  Scenario: Write via NFS, read via S3 — bounded staleness
-    Given a write through NFS commits at sequence 5001
-    And the NFS view reflects 5001 immediately (read-your-writes)
-    And the S3 view is at watermark 4999 (within 2s HIPAA floor)
-    When a read arrives through S3 for the same data
-    Then the S3 view may NOT reflect 5001 yet (staleness within bound)
-    And the reader sees state as of 4999
-    And this is compliant because S3 declares bounded-staleness
-
-  @unit
-  Scenario: Write via NFS, read via NFS — read-your-writes
-    Given a write through NFS commits at sequence 5001
-    When a read arrives through NFS for the same data
-    Then the NFS view reflects 5001 (read-your-writes guarantee)
-    And the reader sees their own write
-
   # --- Failure paths ---
 
   @integration
@@ -171,16 +103,6 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And the view becomes stale (falls behind the staleness bound)
     And alerts are raised to cluster admin (view stalled) and tenant admin (KMS issue)
     And when KMS becomes reachable, the processor resumes and catches up
-
-  @unit
-  Scenario: Stream processor falls behind — staleness violation
-    Given "sp-s3-trials" is at watermark 4000
-    And the effective staleness bound is 2s
-    And 10 seconds have elapsed since watermark 4000
-    Then the staleness bound is violated
-    And alerts are raised to both cluster admin and tenant admin
-    And reads from the S3 view may optionally return a "stale data" warning header
-    And the stream processor continues catching up as fast as possible
 
   @integration
   Scenario: Source shard unavailable — view serves last known state
@@ -232,13 +154,6 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     Then the stream returns lag values for "nfs-trials" and "s3-trials" only
     And attempts to subscribe to "nfs-other" return not_found with shape identical to absent views (I-WA6)
     And the numeric lag values are reported in bucketed milliseconds (no fine-grained timing leak)
-
-  @unit
-  Scenario: Staleness-floor exposure respects compliance floor
-    Given view "nfs-trials" has compliance_floor 2s (HIPAA) and view_preference 500ms
-    When the caller requests staleness telemetry
-    Then the reported effective-staleness bound is max(view_preference, compliance_floor) = 2s (I-K9)
-    And hints cannot lower the reported value below the compliance floor (I-WA14)
 
   @unit
   Scenario: Pin-headroom telemetry

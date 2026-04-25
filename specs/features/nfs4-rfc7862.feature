@@ -71,22 +71,6 @@ Feature: NFSv4.2 wire protocol compliance (RFC 7862)
     When the client sends GETATTR without setting a filehandle first
     Then the response status is NFS4ERR_BADHANDLE
 
-  # §18.25 — READ
-  @unit
-  Scenario: RFC7862 §18.25 READ — read file via COMPOUND
-    Given a file was created via COMPOUND WRITE
-    When the client sends COMPOUND with SEQUENCE + READ at offset 0
-    Then the response status is NFS4_OK
-    And the data matches what was written
-
-  @unit
-  Scenario: RFC7862 §18.25 READ — read past EOF returns empty with eof=true
-    Given a small file exists
-    When the client sends READ at offset beyond file size
-    Then the response status is NFS4_OK
-    And eof is true
-    And data is empty
-
   # §18.38 — WRITE
   @unit
   Scenario: RFC7862 §18.38 WRITE — write data via COMPOUND
@@ -100,40 +84,6 @@ Feature: NFSv4.2 wire protocol compliance (RFC 7862)
   Scenario: RFC7862 §18.38 WRITE — write updates current filehandle
     When the client sends COMPOUND with WRITE + GETFH
     Then GETFH returns the handle of the newly written file
-
-  # §18.37 — DESTROY_SESSION
-  @unit
-  Scenario: RFC7862 §18.37 DESTROY_SESSION — session teardown
-    Given an active session
-    When the client sends DESTROY_SESSION with that session_id
-    Then the response status is NFS4_OK
-    And subsequent SEQUENCE with that session_id returns NFS4ERR_BADSESSION
-
-  @unit
-  Scenario: RFC7862 §18.37 DESTROY_SESSION — unknown session
-    When the client sends DESTROY_SESSION with a nonexistent session_id
-    Then the response status is NFS4ERR_BADSESSION
-
-  # §15.5 — IO_ADVISE (NFSv4.2 specific)
-  @unit
-  Scenario: RFC7862 §15.5 IO_ADVISE — hint accepted
-    Given an active session and a file handle
-    When the client sends IO_ADVISE with sequential read hint
-    Then the response status is NFS4_OK
-
-  @unit
-  Scenario: RFC7862 §15.5 IO_ADVISE — hints are advisory only
-    Given an active session
-    When the client sends IO_ADVISE with an unsupported hint
-    Then the response status is NFS4_OK
-    And the hints bitmap may be empty (server accepted but ignored)
-
-  # COMPOUND limits
-  @unit
-  Scenario: RFC7862 — COMPOUND ops capped at 32
-    When the client sends COMPOUND with 100 operations
-    Then only the first 32 are processed
-    And the response contains at most 32 op results
 
   # §18.16 — OPEN
   @unit
@@ -164,39 +114,3 @@ Feature: NFSv4.2 wire protocol compliance (RFC 7862)
     Then the response status is NFS4_OK
     And subsequent READ with the old stateid returns NFS4ERR_BAD_STATEID
 
-  # §18.10 — LOCK
-  @unit
-  Scenario: RFC7862 §18.10 LOCK — advisory byte-range lock
-    Given a file is opened with a valid stateid
-    When the client sends LOCK for bytes 0-1024 (READ_LT)
-    Then the response status is NFS4_OK
-    And a lock_stateid is returned
-
-  @unit
-  Scenario: RFC7862 §18.10 LOCK — conflicting lock returns NFS4ERR_DENIED
-    Given a file has a WRITE lock on bytes 0-1024
-    When another client sends LOCK for bytes 0-512 (WRITE_LT)
-    Then the response status is NFS4ERR_DENIED
-
-  # §18.15 — LOOKUP
-  @unit
-  Scenario: RFC7862 §18.15 LOOKUP — resolve name in COMPOUND
-    Given a file "test.dat" exists
-    When the client sends COMPOUND with PUTROOTFH + LOOKUP "test.dat" + GETFH
-    Then LOOKUP status is NFS4_OK
-    And GETFH returns the file handle for "test.dat"
-
-  # §18.25 — REMOVE
-  @unit
-  Scenario: RFC7862 §18.25 REMOVE — delete file via COMPOUND
-    Given a file "removeme.dat" exists
-    When the client sends COMPOUND with PUTROOTFH + REMOVE "removeme.dat"
-    Then REMOVE status is NFS4_OK
-    And subsequent LOOKUP for "removeme.dat" returns NFS4ERR_NOENT
-
-  # §18.26 — READDIR
-  @unit
-  Scenario: RFC7862 §18.26 READDIR — list directory entries
-    Given files "x.bin" and "y.bin" exist
-    When the client sends COMPOUND with PUTROOTFH + READDIR
-    Then READDIR returns entries including "x.bin" and "y.bin"

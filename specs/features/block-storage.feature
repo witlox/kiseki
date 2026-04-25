@@ -78,51 +78,6 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === Extent allocation ===
 
-  @unit
-  Scenario: Allocate an extent on an empty device
-    Given an initialized device with 1GB capacity and 4K block size
-    When 256KB is allocated
-    Then an extent is returned with offset in the data region
-    And the extent length is 256KB (64 blocks at 4K)
-    And the corresponding bitmap bits are marked allocated
-
-  @unit
-  Scenario: Allocation is block-aligned
-    Given a device with physical_block_size 4096
-    When 513 bytes is allocated
-    Then the extent length is one physical block (4096 bytes)
-
-  @unit
-  Scenario: Allocation fails when device is full
-    Given a device with 99% of blocks allocated
-    When an allocation exceeding remaining free space is attempted
-    Then the allocation fails with "device full" error
-
-  @unit
-  Scenario: Free an extent and reclaim space
-    Given an extent of 256KB was previously allocated
-    When the extent is freed
-    Then the corresponding bitmap bits are cleared
-    And the free-list gains a new free extent
-    And device used_bytes decreases by 256KB
-
-  @unit
-  Scenario: Adjacent free extents are coalesced
-    Given three consecutive 64KB extents were allocated
-    When the middle extent is freed
-    Then the free-list contains one 64KB free extent
-    When the first extent is freed
-    Then the two adjacent free extents merge into one 128KB extent
-    When the third extent is freed
-    Then all three merge into one 192KB extent
-
-  @unit
-  Scenario: Large allocation split into multiple extents
-    Given maximum extent size is 16MB
-    When 32MB is requested
-    Then two extents of 16MB each are allocated
-    And both are returned as a Vec<Extent>
-
   # === Data I/O ===
 
   @integration

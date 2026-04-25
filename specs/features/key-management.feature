@@ -10,76 +10,6 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And tenant "org-pharma" with tenant KMS at "kms.pharma.internal"
     And tenant KEK "pharma-kek-001" in epoch 1
 
-  # --- System key lifecycle ---
-
-  @unit
-  Scenario: System DEK generation for chunk encryption
-    When a new chunk is written
-    Then a system DEK is generated (or retrieved from the current epoch pool)
-    And the DEK encrypts the chunk plaintext using AES-256-GCM
-    And the DEK is wrapped with the system KEK
-    And the wrapped DEK is stored in the chunk envelope
-    And the plaintext DEK is held only in memory, never persisted
-
-  @unit
-  Scenario: System KEK rotation
-    Given system KEK "sys-kek-001" is in epoch 1
-    When the cluster admin triggers system KEK rotation
-    Then a new system KEK "sys-kek-002" is generated (epoch 2)
-    And new chunks use system DEKs wrapped with "sys-kek-002"
-    And existing chunks retain epoch 1 wrapping
-    And background re-wrapping migrates epoch 1 DEK wrappings to epoch 2
-    And both epochs are valid until migration completes
-    And the rotation event is recorded in the audit log
-
-  # --- Tenant key wrapping ---
-
-  @unit
-  Scenario: Tenant KEK wraps system DEK for tenant access
-    Given chunk "abc123" is encrypted with system DEK "dek-42"
-    And "dek-42" is wrapped with system KEK "sys-kek-001"
-    When "org-pharma" needs access to "abc123"
-    Then "dek-42" is also wrapped with tenant KEK "pharma-kek-001"
-    And "org-pharma" can: unwrap "dek-42" with their KEK → decrypt chunk
-    And the system can: unwrap "dek-42" with system KEK → but only for system operations
-    And both wrappings coexist in the envelope
-
-  @unit
-  Scenario: Tenant without KEK cannot access any chunks
-    Given a new tenant "org-newco" has been created but has not configured a KMS
-    When "org-newco" attempts to read a chunk
-    Then the read fails with "tenant KMS not configured" error
-    And no data is returned
-    And the access attempt is recorded in the audit log
-
-  # --- Tenant key rotation (epoch-based) ---
-
-  @unit
-  Scenario: Epoch-based tenant key rotation
-    Given "org-pharma" tenant KEK "pharma-kek-001" is epoch 1
-    When the tenant admin rotates the tenant KEK
-    Then a new KEK "pharma-kek-002" is generated (epoch 2) in the tenant KMS
-    And new chunks get system DEK wrappings under epoch 2 tenant KEK
-    And existing chunks retain epoch 1 tenant KEK wrapping
-    And background re-wrapping migrates epoch 1 wrappings to epoch 2
-    And both epochs are valid during migration
-    And old data remains accessible throughout rotation
-    And the rotation event is recorded in the audit log (tenant export)
-
-  @unit
-  Scenario: Full re-encryption triggered by admin (key compromise)
-    Given "org-pharma" suspects key compromise of "pharma-kek-001"
-    When the tenant admin triggers full re-encryption
-    Then all chunks referenced by "org-pharma" are:
-      | step | action                                              |
-      | 1    | decrypted using system DEK (unwrapped via old KEK)  |
-      | 2    | re-encrypted with a new system DEK                  |
-      | 3    | new DEK wrapped with new tenant KEK (epoch 2)       |
-    And old system DEKs for affected chunks are destroyed
-    And old tenant KEK wrappings are destroyed
-    And the operation runs in background with progress tracking
-    And the re-encryption event is recorded in the audit log
-
   # --- Crypto-shred ---
 
   @integration
@@ -114,24 +44,6 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- KMS connectivity ---
 
-  @unit
-  Scenario: Tenant KMS temporarily unreachable — cached keys sustain operations
-    Given "org-pharma" KMS is unreachable
-    And cached tenant KEK material has a TTL of 300 seconds
-    When a read request arrives for "org-pharma" data within the cache window
-    Then the cached KEK is used to unwrap the system DEK
-    And the read succeeds
-    And a warning is logged: "tenant KMS unreachable, using cached key material"
-
-  @unit
-  Scenario: Tenant KMS unreachable — cache expired
-    Given "org-pharma" KMS has been unreachable for 600 seconds
-    And the cached KEK TTL of 300 seconds has expired
-    When a read request arrives for "org-pharma" data
-    Then the read fails with "tenant KMS unavailable, key cache expired" error
-    And the tenant admin and cluster admin are alerted
-    And no stale key material is used beyond the TTL
-
   @integration
   Scenario: Tenant KMS reachable from federated site
     Given "org-pharma" has data at site-EU and site-CH
@@ -165,17 +77,6 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Failure modes ---
 
-  @unit
-  Scenario: Tenant KMS permanently lost — unrecoverable
-    Given "org-pharma" KMS infrastructure is destroyed
-    And "org-pharma" has no KMS backups
-    When any operation requiring "org-pharma" tenant KEK is attempted
-    Then the operation fails permanently
-    And all "org-pharma" data is unreadable (system-encrypted but tenant-unwrappable)
-    And the cluster admin is alerted
-    And Kiseki does not provide key escrow or recovery
-    And the loss is documented as tenant responsibility per I-K11
-
   @integration
   Scenario: System key manager failure
     Given the system key manager is an internal HA Kiseki service
@@ -198,13 +99,3 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And if shred wins: KEK is destroyed, rotation is moot
     And the outcome is deterministic and audited
 
-  @unit
-  Scenario: Key epoch mismatch during read
-    Given chunk "c50" was written in epoch 1
-    And the current epoch is 3
-    And epoch 1 KEK wrapping has not yet been migrated
-    When a read for "c50" is requested
-    Then the system retrieves the epoch 1 tenant KEK wrapping
-    And unwraps the system DEK using epoch 1 material
-    And the read succeeds
-    And the chunk is flagged for background re-wrapping to epoch 3

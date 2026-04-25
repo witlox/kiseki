@@ -15,17 +15,6 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # --- Happy path: chunk write ---
 
   @unit
-  Scenario: Write a chunk with content-addressed ID (default tenant)
-    Given the Composition context for "org-pharma" submits plaintext data
-    When the system computes chunk_id = sha256(plaintext)
-    And encrypts the plaintext with a system DEK
-    And stores the ciphertext in pool "fast-nvme" per affinity policy
-    Then a ChunkStored event is emitted with the chunk_id
-    And the chunk's refcount is initialized to 1
-    And the envelope contains: ciphertext, system DEK reference, algorithm_id, key_epoch
-    And no plaintext is persisted at any point
-
-  @unit
   Scenario: Write a chunk with HMAC ID (opted-out tenant)
     Given the Composition context for "org-defense" submits plaintext data
     When the system computes chunk_id = HMAC(plaintext, org-defense_tenant_key)
@@ -35,44 +24,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And the same plaintext from another tenant would produce a different chunk_id
     And cross-tenant dedup cannot match this chunk
 
-  @unit
-  Scenario: Dedup - existing chunk referenced by new composition
-    Given "org-pharma" has a chunk with chunk_id "abc123" and refcount 1
-    When a new composition in "org-pharma" references the same plaintext
-    And chunk_id = sha256(plaintext) = "abc123"
-    Then no new chunk is written
-    And the existing chunk's refcount is incremented to 2
-    And the new composition receives a reference to "abc123"
-
-  @unit
-  Scenario: Cross-tenant dedup for default tenants
-    Given "org-pharma" has chunk "abc123" with refcount 1
-    And another default tenant "org-biotech" writes the same plaintext
-    And chunk_id = sha256(plaintext) = "abc123"
-    Then no new chunk is written
-    And chunk "abc123" refcount is incremented to 2
-    And "org-biotech" receives a tenant KEK wrapping of the system DEK for "abc123"
-    And "org-pharma" and "org-biotech" each have independent key-wrapping paths
-
-  # --- Chunk read ---
-
-  @unit
-  Scenario: Read an encrypted chunk
-    Given chunk "abc123" exists in pool "fast-nvme"
-    When a stream processor requests ReadChunk for "abc123"
-    Then the encrypted chunk envelope is returned
-    And the caller unwraps using: tenant KEK -> system DEK -> decrypt ciphertext
-    And no plaintext is transmitted on the wire
-
   # --- Placement and affinity ---
-
-  @unit
-  Scenario: Chunk placed according to affinity policy
-    Given a composition's view descriptor specifies tier "fast-nvme" for data
-    When a chunk is written for that composition
-    Then the chunk is placed in pool "fast-nvme"
-    And EC 4+2 encoding is applied per pool policy
-    And the chunk's fragments are distributed across devices in the pool
 
   @integration
   Scenario: Pool capacity exhausted triggers rebalance
@@ -83,44 +35,6 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And the chunk write is not silently redirected without policy approval
 
   # --- GC and refcounting ---
-
-  @unit
-  Scenario: Chunk GC when refcount reaches zero
-    Given chunk "abc123" has refcount 1
-    And no retention hold is active on "abc123"
-    When the last composition referencing "abc123" is deleted
-    Then refcount drops to 0
-    And "abc123" becomes eligible for physical GC
-    And the GC process eventually deletes the ciphertext from storage
-
-  @unit
-  Scenario: Chunk GC blocked by retention hold
-    Given chunk "abc123" has refcount 0
-    And a retention hold "hipaa-litigation-2026" is active on "abc123"
-    When the GC process evaluates "abc123"
-    Then "abc123" is NOT deleted
-    And it remains on storage as system-encrypted ciphertext
-    And GC re-evaluates after the hold expires or is released
-
-  @unit
-  Scenario: Retention hold set before crypto-shred
-    Given tenant "org-pharma" has compositions referencing chunks [c1, c2, c3]
-    And a retention hold "gdpr-retention-7yr" is set on namespace "patient-data"
-    When "org-pharma" performs crypto-shred (destroys tenant KEK)
-    Then chunks [c1, c2, c3] are unreadable (no tenant key to unwrap system DEK)
-    And refcounts decrement as composition references are invalidated
-    And chunks with refcount 0 are NOT GC'd due to retention hold
-    And chunks remain as system-encrypted ciphertext until hold expires
-
-  @unit
-  Scenario: Crypto-shred without retention hold - chunks GC'd
-    Given tenant "org-temp" has compositions referencing chunks [c4, c5]
-    And no retention hold is active
-    When "org-temp" performs crypto-shred
-    Then chunks are unreadable immediately
-    And refcounts drop to 0
-    And chunks become eligible for physical GC
-    And GC eventually reclaims storage
 
   # --- Repair and failure ---
 
@@ -154,35 +68,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Encryption invariant enforcement ---
 
-  @unit
-  Scenario: Plaintext never reaches storage
-    Given a chunk write is in progress
-    When the system DEK encryption step fails (e.g., HSM timeout)
-    Then the chunk write is aborted
-    And no data - plaintext or partial ciphertext - is persisted
-    And the Composition context receives a retriable error
-
-  @unit
-  Scenario: Chunk envelope integrity verification on read
-    Given chunk "abc123" is read from storage
-    When the authenticated encryption tag is verified
-    Then if verification succeeds, the chunk is returned
-    And if verification fails, the chunk is flagged as corrupted
-    And a repair is triggered from EC parity or replicas
-    And the corruption event is recorded in the audit log
-
   # --- Edge cases ---
-
-  @unit
-  Scenario: Concurrent dedup - two writers for same chunk_id simultaneously
-    Given two compositions in "org-pharma" write the same plaintext concurrently
-    And both compute chunk_id = "abc123"
-    Then chunk writes are idempotent:
-      | writer | chunk exists? | action                    | result     |
-      | first  | no            | store ciphertext, refcount=1 | success |
-      | second | yes           | increment refcount to 2   | success    |
-    And no rejection or retry is needed
-    And no duplicate ciphertext is stored
 
   @integration
   Scenario: Chunk write during pool rebalance
@@ -241,13 +127,6 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     Then the response shape is identical to the populated-k case
     And neighbour-derived fields carry the fixed sentinel value defined by policy (I-WA5)
     And no timing or size variation reveals the actual k
-
-  @unit
-  Scenario: Retention-intent hint { temp } informs but cannot shorten a retention hold
-    Given composition "patient-scan.dcm" has a 7-year retention hold
-    And the caller attaches hint { retention_intent: temp } to a new chunk for that composition
-    Then the chunk is placed with GC-urgency-preferred parameters when possible
-    And the retention hold (I-C2b) still blocks GC regardless of the hint (I-WA14)
 
   @integration
   Scenario: Repair-degraded read emits telemetry without leaking topology

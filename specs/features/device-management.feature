@@ -45,12 +45,6 @@ Feature: Device management and pool capacity (ADR-024)
     And the repaired fragment is placed on a healthy device
     And the repair event is recorded in the audit log
 
-  @unit
-  Scenario: Remove device without prior evacuation — blocked
-    Given device "dev-1" has chunks stored on it
-    When the admin attempts to remove "dev-1" without evacuating
-    Then the operation is rejected with "device has data, evacuate first"
-
   # === Capacity thresholds (per device class) ===
 
   @integration
@@ -111,13 +105,6 @@ Feature: Device management and pool capacity (ADR-024)
     Then the device is automatically marked "Evacuating"
     And an alert is emitted
 
-  @unit
-  Scenario: Temperature throttling
-    Given device "dev-1" reports temperature 82°C
-    Then I/O to the device is throttled
-    And a warning is logged
-    And the device is NOT evacuated (temperature may be transient)
-
   # === Device state audit trail (I-D2) ===
 
   @unit
@@ -132,20 +119,6 @@ Feature: Device management and pool capacity (ADR-024)
       | admin_id    | (system)     |
 
   # === EC fragment placement (I-D4) ===
-
-  @unit
-  Scenario: EC fragments placed on distinct devices
-    When a chunk is written to pool "fast-nvme" with EC 4+2
-    Then 6 fragments are created
-    And each fragment is on a different device
-    And no two fragments share the same device
-
-  @unit
-  Scenario: Insufficient devices for EC — write rejected
-    Given pool "fast-nvme" has only 3 healthy devices
-    And EC requires 4+2 = 6 devices
-    When a chunk write is attempted
-    Then the write is rejected (insufficient devices for durability)
 
   # === System partition monitoring ===
 

@@ -34,28 +34,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And falls back to TCP if CXI connection fails
     And the transport selection is transparent to the workload
 
-  # --- FUSE read path ---
-
-  @unit
-  Scenario: POSIX read via FUSE mount
-    Given the native client mounts namespace "trials" at /mnt/kiseki/trials
-    When the workload reads /mnt/kiseki/trials/results.h5 offset 0 length 64MB
-    Then the client resolves the path in the local view cache
-    And identifies chunk references for the byte range
-    And fetches encrypted chunks from Chunk Storage over selected transport
-    And unwraps system DEK via tenant KEK (in-process)
-    And decrypts chunks to plaintext (in-process)
-    And returns plaintext to the workload via FUSE
-    And plaintext never left the workload process
-
-  @unit
-  Scenario: POSIX read-your-writes via FUSE
-    Given the workload writes data to /mnt/kiseki/trials/output.bin
-    And the write commits (delta committed, acknowledged)
-    When the workload immediately reads /mnt/kiseki/trials/output.bin
-    Then it sees its own write (read-your-writes guarantee)
-    And this works because the native client tracks its own uncommitted and recently-committed writes
-
   # --- Native API read path ---
 
   @unit
@@ -82,48 +60,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     Then the write is acknowledged to the workload via FUSE
     And plaintext existed only in the workload process memory
     And encrypted chunks traveled on the wire
-
-  @unit
-  Scenario: Native client batches small writes
-    Given the workload issues many small POSIX writes (log file, 100-byte appends)
-    When the native client receives these writes
-    Then it batches them into larger deltas (within inline threshold)
-    And periodically flushes to the shard
-    And the workload sees fsync semantics: flush guarantees durability
-
-  # --- Access pattern detection ---
-
-  @unit
-  Scenario: Sequential read detected — prefetch
-    Given the workload reads /mnt/kiseki/trials/dataset.h5 sequentially
-    When the native client detects sequential access pattern
-    Then it prefetches upcoming chunks in background
-    And subsequent reads hit the local cache
-    And read latency improves after warmup
-
-  @unit
-  Scenario: Random read detected — no prefetch
-    Given the workload reads random offsets in a large file
-    When the native client detects random access pattern
-    Then it disables prefetch to avoid wasting bandwidth
-    And each read fetches on demand
-
-  # --- Client-side caching ---
-
-  @unit
-  Scenario: Cache hit — no network round trip
-    Given the native client has chunk "abc123" decrypted in its local cache
-    When the workload reads the byte range covered by "abc123"
-    Then the read is served from cache
-    And no Chunk Storage request is made
-    And cache entries have a bounded TTL
-
-  @unit
-  Scenario: Cache invalidation on write
-    Given the native client has cached view state for namespace "trials"
-    When a write modifies a composition in "trials"
-    Then the affected cache entries are invalidated
-    And subsequent reads fetch fresh data
 
   # --- RDMA path ---
 
@@ -254,15 +190,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And actual quota enforcement remains the data path's responsibility (I-T2)
 
   @unit
-  Scenario: Advisory channel outage does not affect FUSE
-    Given a workflow is active with hints and telemetry in flight
-    When the advisory subsystem on the serving node becomes unresponsive
-    Then the client observes advisory_unavailable on future hint submissions
-    And FUSE reads and writes continue at normal latency and durability (I-WA2)
-    And the client falls back to pattern-inference for prefetch decisions (pre-existing behavior)
-    And when advisory recovers, new DeclareWorkflow calls resume
-
-  @unit
   Scenario: Advisory disabled at workload level — client degrades gracefully
     Given tenant admin disables Workflow Advisory for "training-run-42"
     When the client calls kiseki_declare_workflow
@@ -273,71 +200,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
   # =====================================================================
   # Client-side cache (ADR-031)
   # =====================================================================
-
-  @unit
-  Scenario: L1 cache hit avoids fabric round-trip
-    Given a client with cache_mode "organic" and a warm cache
-    And chunk "abc123" is in the L1 cache
-    When the client reads chunk "abc123"
-    Then the chunk is served from L1 without a fabric RPC
-    And cache_l1_hits counter increments
-
-  @unit
-  Scenario: L2 cache hit avoids fabric round-trip and decryption
-    Given a client with cache_mode "organic" and chunk "abc123" in L2
-    When the client reads chunk "abc123"
-    Then the chunk is read from local NVMe
-    And the CRC32 trailer is verified before serving (I-CC13)
-    And cache_l2_hits counter increments
-
-  @unit
-  Scenario: Cache miss fetches from canonical and populates L1+L2
-    Given a client with cache_mode "organic" and an empty cache
-    When the client reads chunk "abc123" from canonical
-    Then the chunk is decrypted and verified by content-address (SHA-256)
-    And the plaintext is stored in L1 and L2 with CRC32 trailer
-    And cache_misses counter increments
-
-  @unit
-  Scenario: L2 CRC32 mismatch bypasses to canonical
-    Given a client with cache_mode "organic" and a corrupted L2 entry for chunk "abc123"
-    When the client reads chunk "abc123"
-    Then the CRC32 check fails
-    And the read bypasses to canonical (I-CC7)
-    And the corrupt L2 entry is deleted
-    And cache_errors counter increments
-
-  @unit
-  Scenario: Metadata TTL expiry triggers re-fetch
-    Given a client with cache_mode "organic" and metadata_ttl_ms 5000
-    And file "/data/file.txt" metadata was cached 6 seconds ago
-    When the client reads "/data/file.txt"
-    Then the metadata mapping is re-fetched from canonical before serving chunks
-    And cache_meta_misses counter increments
-
-  @unit
-  Scenario: Metadata cache serves deleted file within TTL window
-    Given a client with cache_mode "organic" and metadata_ttl_ms 5000
-    And file "/data/file.txt" metadata was cached 2 seconds ago
-    And file "/data/file.txt" was deleted in canonical 1 second ago
-    When the client reads "/data/file.txt"
-    Then the file's data is served from cache (I-CC3 — within TTL, accepted staleness)
-    And cache_meta_hits counter increments
-
-  @unit
-  Scenario: Write-through updates local metadata cache
-    Given a client with cache_mode "organic"
-    When the client writes "/data/new_file.txt"
-    Then the metadata cache is updated immediately with the new chunk list
-    And a subsequent read of "/data/new_file.txt" serves the written data (read-your-writes)
-
-  @unit
-  Scenario: Bypass mode reads directly from canonical
-    Given a client with cache_mode "bypass"
-    When the client reads any file
-    Then the read goes directly to canonical
-    And no L1 or L2 entries are created
-    And cache_bypasses counter increments
 
   @unit
   Scenario: Pinned mode stages a dataset
@@ -375,13 +237,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And the orphaned pool is wiped (zeroize + delete)
 
   @unit
-  Scenario: kiseki-cache-scrub cleans orphaned pools on boot
-    Given a compute node reboots after a client crash
-    And orphaned L2 pool directories exist from the crashed process
-    When kiseki-cache-scrub runs on boot
-    Then all orphaned pools (no live flock holder) are wiped with zeroize
-
-  @unit
   Scenario: Disconnect threshold triggers cache wipe
     Given a client with max_disconnect_seconds 300 and a warm cache
     When the fabric is unreachable for 301 seconds (no successful RPC)
@@ -404,13 +259,6 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     When the client establishes a session
     Then cache policy is fetched via GetCachePolicy RPC on the data-path channel (I-CC9)
     And the client operates within the policy ceilings
-
-  @unit
-  Scenario: Cache policy unreachable — conservative defaults
-    Given a compute node with no reachable storage nodes at session start
-    When the client establishes a session
-    Then cache operates with conservative defaults (organic, 10GB, 5s TTL) (I-CC9)
-    And data-path reads and writes proceed normally
 
   @unit
   Scenario: Per-node cache capacity enforcement

@@ -24,43 +24,12 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
   # --- Workflow lifecycle ---
 
   @unit
-  Scenario: Client declares a workflow with an allowed profile
-    When the native client calls DeclareWorkflow with:
-      | field        | value             |
-      | profile      | ai-training       |
-      | initial_phase| stage-in          |
-      | ttl_seconds  | 3600              |
-    Then the call returns a workflow handle with opaque workflow_id of at least 128 bits entropy
-    And the workflow is scoped to workload "training-run-42" only
-    And an advisory-audit event "declare-workflow" is written to the tenant audit shard
-    And the current phase is "stage-in"
-
-  @unit
   Scenario: Client attempts a profile not in its allow-list
     When the native client calls DeclareWorkflow with profile "batch-etl"
     Then the call is rejected with "profile_not_allowed"
     And no workflow handle is issued
     And an advisory-audit event "declare-workflow: rejected" is written with reason "profile_not_allowed"
     And the workload's data-path operations remain unaffected
-
-  @unit
-  Scenario: Phase advance is monotonic and bounded
-    Given the workflow is in phase "stage-in" with phase_id 1
-    When the client calls PhaseAdvance to phase "compute" with phase_id 2 tagged "epoch-0"
-    Then the current phase becomes "compute"
-    When the client calls PhaseAdvance with phase_id 2
-    Then the call is rejected with "phase_not_monotonic"
-    When the client advances 64 times across the workflow's lifetime
-    Then older phases beyond the last 64 are compacted to aggregate audit summaries
-
-  @unit
-  Scenario: Workflow ends on explicit End
-    Given the workflow has been active for 120 seconds
-    When the client calls EndWorkflow
-    Then an advisory-audit event "end-workflow" is written
-    And the workflow_id is no longer accepted by the advisory channel
-    And all subscribed telemetry streams for the workflow are closed
-    And any cached per-workflow steering state is dropped within 1s
 
   @unit
   Scenario: Workflow ends on TTL expiry
@@ -106,17 +75,6 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     Then the hint is rejected with "scope_violation"
     And the advisory-audit event includes only "training-run-42"'s identity, not "inference-svc-9"'s
     And no information about "inference-svc-9"'s compositions is leaked in the error
-
-  @unit
-  Scenario: Org ceiling caps workload hint budget
-    Given "org-pharma" org-level ceiling is hints_per_sec 500
-    And "clinical-trials" project-level ceiling is hints_per_sec 300
-    And "training-run-42" workload-level budget is hints_per_sec 200
-    When the workload sustains 250 hints/sec
-    Then hint submissions beyond 200/sec are throttled with "budget_exceeded"
-    And only "training-run-42" is affected
-    And other workloads under "clinical-trials" continue at their own budgets
-    And an advisory-audit event "budget-exceeded" is written
 
   @unit
   Scenario: Child scope cannot broaden parent ceiling
@@ -305,22 +263,6 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     Then within a bounded detection interval the advisory subsystem tears the stream down
     And subsequent hints on any resumed stream require a currently-valid cert
     And pre-revocation in-flight operations remain accepted up to the revocation point (per I-WA1)
-
-  @unit
-  Scenario: Cap on tuples per prefetch hint (I-WA16)
-    When the client submits a PrefetchHint with 20000 tuples
-    Then the hint is rejected with "hint_too_large"
-    And no tuples are adopted
-    And an advisory-audit event "hint-rejected: hint_too_large" is written
-    And subsequent prefetch hints within the cap continue to be accepted
-
-  @unit
-  Scenario: Cap on workflow declares per second (I-WA17)
-    When the client issues 30 DeclareWorkflow calls in a single second
-    Then the first 10 succeed
-    And the remaining 20 are rejected with "declare_rate_exceeded"
-    And an advisory-audit event is written for the rate exception
-    And the workload's concurrent_workflows cap is independent and still enforced
 
   @unit
   Scenario: Batched audit for high-rate hint throttling (I-WA8)

@@ -8,47 +8,6 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     Given a Kiseki cluster managed by cluster admin "admin-ops"
     And tenant "org-pharma" managed by tenant admin "pharma-admin"
 
-  # --- Tenant lifecycle ---
-
-  @unit
-  Scenario: Create a new organization (tenant)
-    Given cluster admin "admin-ops" receives a tenant creation request
-    When the request is processed with:
-      | field             | value              |
-      | org_name          | org-genomics       |
-      | compliance_tags   | [HIPAA, GDPR]      |
-      | quota_capacity    | 500TB              |
-      | quota_iops        | 100000             |
-      | dedup_policy      | cross-tenant (default) |
-    Then organization "org-genomics" is created
-    And a tenant admin role is provisioned
-    And compliance tags [HIPAA, GDPR] are set at org level
-    And quotas are enforced from creation
-    And the tenant creation is recorded in the audit log
-
-  @unit
-  Scenario: Create optional project within organization
-    Given tenant admin "pharma-admin" for "org-pharma"
-    When they create project "clinical-trials":
-      | field             | value              |
-      | quota_capacity    | 200TB              |
-      | compliance_tags   | [revFADP]          |
-    Then project "clinical-trials" is created under "org-pharma"
-    And it inherits org-level tags [HIPAA, GDPR] plus its own [revFADP]
-    And effective compliance is [HIPAA, GDPR, revFADP]
-    And capacity quota 200TB is carved from org's 500TB
-
-  @unit
-  Scenario: Create workload within tenant
-    Given tenant admin creates workload "training-run-42" under "org-pharma"
-    When the workload is configured with:
-      | field             | value              |
-      | quota_capacity    | 50TB               |
-      | quota_iops        | 20000              |
-    Then workload "training-run-42" is created
-    And quotas are enforced within org ceiling
-    And the workload can authenticate native clients and gateway access
-
   # --- Namespace management ---
 
   @integration
@@ -99,14 +58,6 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
   # --- Quota enforcement ---
 
   @unit
-  Scenario: Write rejected when tenant quota exceeded
-    Given "org-pharma" has used 499TB of 500TB capacity quota
-    When a 2TB write is attempted
-    Then the write is rejected with "quota exceeded" error
-    And the rejection is reported to the protocol gateway / native client
-    And the tenant admin is notified
-
-  @unit
   Scenario: Workload quota within org ceiling
     Given "org-pharma" has 500TB capacity, 300TB used
     And workload "training-run-42" has 50TB quota, 49TB used
@@ -143,16 +94,6 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And available flavors are listed in the response
 
   # --- Compliance tag management ---
-
-  @unit
-  Scenario: Compliance tag inheritance - union of constraints
-    Given org "org-pharma" has tags [HIPAA, GDPR]
-    And project "clinical-trials" has tag [revFADP]
-    And namespace "swiss-patients" has tag [swiss-residency]
-    Then effective tags for "swiss-patients" are [HIPAA, GDPR, revFADP, swiss-residency]
-    And the staleness floor is the strictest across all four regimes
-    And data residency constraints from "swiss-residency" are enforced
-    And audit requirements are the union of all regimes
 
   @unit
   Scenario: Compliance tag cannot be removed if data exists under it

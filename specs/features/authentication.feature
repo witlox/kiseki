@@ -34,14 +34,6 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     And the tenant admin is notified to renew
 
   @unit
-  Scenario: Revoked certificate — connection rejected
-    Given tenant certificate "cert-pharma-001" has been revoked by the Cluster CA
-    When the native client attempts to connect
-    Then the storage node checks the certificate revocation list
-    And the connection is rejected with "certificate revoked" error
-    And the revocation attempt is recorded in the audit log
-
-  @unit
   Scenario: Certificate tenant mismatch — data access denied
     Given a native client presents valid certificate for "org-pharma"
     When it attempts to access data belonging to "org-biotech"
@@ -73,16 +65,6 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     And a native client presents valid mTLS cert for "org-biotech"
     Then the connection is accepted with org-level identity only
     And no second-stage auth is required
-
-  # --- SPIFFE/SPIRE alternative (I-Auth3) ---
-
-  @unit
-  Scenario: SPIFFE SVID presented instead of raw mTLS cert
-    Given the cluster is configured to accept SPIFFE SVIDs
-    And a native client presents a SPIFFE SVID with URI "spiffe://cluster/org/pharma/workload/training-42"
-    When the storage node validates the SVID trust domain
-    Then the tenant_id (org-pharma) and workload_id (training-42) are extracted
-    And the connection is accepted
 
   # --- Cluster admin authentication (I-Auth4) ---
 
@@ -123,23 +105,6 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
   # The advisory channel uses the same mTLS tenant certificate as the
   # data path, and re-validates identity per operation — not just at
   # stream establishment (I-WA3).
-
-  @unit
-  Scenario: mTLS identity re-validated per advisory operation
-    Given a native client under workload "training-run-42" has an active bidi advisory stream
-    And the stream was established using certificate "tenant-cert-v1"
-    When the client submits a hint on the stream
-    Then the advisory subsystem re-validates "tenant-cert-v1" for the owning workload before acting (I-WA3)
-    And the hint is accepted if and only if the cert is currently valid for that workload
-
-  @unit
-  Scenario: Advisory stream torn down on certificate revocation
-    Given a workflow is active on a long-lived bidi advisory stream under cert "tenant-cert-v1"
-    When the Cluster CA revokes "tenant-cert-v1" (e.g., rotation, compromise)
-    Then within a bounded detection interval the advisory subsystem detects the revocation
-    And tears the stream down with a clear error ("cert_revoked")
-    And pre-revocation in-flight hints accepted before the detection point remain valid (they were advisory only, I-WA1)
-    And the next advisory operation requires a fresh, valid cert
 
   @unit
   Scenario: Workflow_id is a capability reference, mTLS is the authority

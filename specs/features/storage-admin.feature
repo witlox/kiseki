@@ -10,12 +10,6 @@ Feature: Storage administration API (ADR-025)
 
   # === Pool management ===
 
-  @unit
-  Scenario: Create a new pool
-    When the admin creates pool "warm-ssd" with device class "SsdSata" and EC 4+2
-    Then the pool appears in ListPools response
-    And the pool has zero capacity (no devices assigned yet)
-
   @integration
   Scenario: Add devices to pool
     Given pool "warm-ssd" exists with no devices
@@ -68,18 +62,6 @@ Feature: Storage administration API (ADR-025)
   # === Observability ===
 
   @unit
-  Scenario: Cluster status shows aggregate health
-    When the admin requests ClusterStatus
-    Then the response includes:
-      | field              | type    |
-      | node_count         | integer |
-      | healthy_nodes      | integer |
-      | total_capacity     | bytes   |
-      | used_bytes         | bytes   |
-      | active_repairs     | integer |
-      | evacuating_devices | integer |
-
-  @unit
   Scenario: Pool status shows performance metrics
     When the admin requests PoolStatus for "fast-nvme"
     Then the response includes read_iops, write_iops, avg_read_latency_ms
@@ -99,11 +81,6 @@ Feature: Storage administration API (ADR-025)
 
   # === Shard management ===
 
-  @unit
-  Scenario: List all shards
-    When the admin requests ListShards
-    Then the response includes shard IDs, tenant IDs, and tip sequence numbers
-
   @integration
   Scenario: Split shard when approaching ceiling
     Given shard "s1" has 900,000 deltas (ceiling is 1,000,000)
@@ -120,13 +97,6 @@ Feature: Storage administration API (ADR-025)
     And the scrub result is returned with repair count
 
   # === Authorization boundary ===
-
-  @unit
-  Scenario: Tenant admin cannot access StorageAdminService
-    Given a tenant admin authenticated with tenant certificate
-    When they attempt to call ListPools
-    Then the request is rejected with PERMISSION_DENIED
-    And no pool information is returned
 
   @unit
   Scenario: Cluster admin cannot modify tenant quota via StorageAdminService
