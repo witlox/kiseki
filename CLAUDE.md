@@ -1,14 +1,11 @@
 # Kiseki
 
-Distributed storage system for HPC/AI workloads. Phase 12 complete,
-Phase 13 (cluster topology) in progress. 35 ADRs, 633 BDD scenarios
-(599 `@unit` passing, 34 `@integration` pending implementation).
-Depth audit: 97% of existing BDD steps test in-memory mocks only.
+Distributed storage system for HPC/AI workloads. 12 Rust crates,
+35 ADRs, 241 @integration BDD scenarios (implementer targets).
 
 ## Language
 
 - Core: Rust (12 crates in workspace)
-- Control plane: Go
 - Boundary: gRPC / protobuf (4 service definitions)
 - Client bindings: Rust native + C FFI, Python (PyO3), C++ wrapper
 - Crypto: FIPS 140-2/3 validated (aws-lc-rs, AES-256-GCM, HKDF-SHA256)
@@ -16,7 +13,6 @@ Depth audit: 97% of existing BDD steps test in-memory mocks only.
 ## Workflow
 
 Diamond workflow via `.claude/CLAUDE.md`. Role definitions in `.claude/roles/`.
-Read the workflow router before acting.
 
 ## Spec documents (read order for new sessions)
 
@@ -28,8 +24,8 @@ Read the workflow router before acting.
 6. `specs/architecture/enforcement-map.md` — invariant → code location
 7. `specs/architecture/build-phases.md` — implementation order
 8. `specs/architecture/error-taxonomy.md` — typed errors
-9. `specs/features/*.feature` — 185 Gherkin scenarios (the tests)
-10. `specs/architecture/adr/*.md` — 19 architecture decision records
+9. `specs/features/*.feature` — Gherkin scenarios (the tests)
+10. `specs/architecture/adr/*.md` — architecture decision records
 
 ## Background documents (reference as needed)
 
@@ -37,7 +33,7 @@ Read the workflow router before acting.
 - `docs/prior-art/deltafs-mochi-evaluation.md` — DeltaFS + Mochi comparison
 - `specs/SEED.md` — original analyst seed
 - `specs/assumptions.md` — 50+ tracked assumptions
-- `specs/failure-modes.md` — 20 failure modes (P0-P3)
+- `specs/failure-modes.md` — failure modes (P0-P3)
 - `specs/adversarial-findings.md` — analyst adversarial findings
 - `specs/findings/architecture-review.md` — architect adversarial findings
 - `specs/cross-context/interactions.md` — data paths and failure cascades
@@ -45,5 +41,4 @@ Read the workflow router before acting.
 ## Pre-commit
 
 Run `make` before committing (once a Makefile exists).
-Rust: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
-Go: `go fmt ./... && go vet ./... && go test ./...`
+`cargo fmt --check && cargo clippy -- -D warnings && cargo test`

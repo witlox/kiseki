@@ -45,7 +45,7 @@
 
 ### Test Organization
 
-- Unit tests: co-located with source (in-module for Rust, `_test.go` for Go)
+- Unit tests: co-located with source (in-module for Rust)
 - Integration tests: `tests/integration/` — require external services (Docker, DB)
 - Acceptance tests: `tests/acceptance/` or `tests/e2e/` — BDD/Gherkin scenarios
 - Test helpers and fixtures: `tests/testutil/` — shared mocks, in-memory implementations
