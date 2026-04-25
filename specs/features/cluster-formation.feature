@@ -9,14 +9,14 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Seed bootstrap ===
 
-  @integration
+  @integration @slow
   Scenario: Seed node initializes and becomes leader
     When node-1 creates a shard as seed with 3 members [1, 2, 3]
     Then node-1 calls raft.initialize() with all 3 members
     And node-1 becomes leader (single-node quorum until peers join)
     And node-1 accepts writes immediately
 
-  @integration
+  @integration @slow
   Scenario: Seed node starts RPC server before other nodes join
     When node-1 creates a shard as seed
     Then node-1's Raft RPC server is listening
@@ -24,7 +24,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Follower join ===
 
-  @integration
+  @integration @slow
   Scenario: Follower joins existing cluster without calling initialize
     Given node-1 has seeded the cluster and is leader
     When node-2 creates its Raft instance for the same shard
@@ -33,14 +33,14 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And node-2 receives membership from node-1 via AppendEntries
     And node-2 becomes a follower
 
-  @integration
+  @integration @slow
   Scenario: Follower joins even if seed started minutes earlier
     Given node-1 has been running as leader for 60 seconds
     When node-2 starts and joins the cluster
     Then node-2 successfully becomes a follower
     And node-2 receives any committed log entries from the leader
 
-  @integration
+  @integration @slow
   Scenario: All 3 nodes form a healthy cluster
     Given node-1 has seeded the cluster
     When node-2 and node-3 join the cluster
@@ -51,7 +51,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Staggered startup ===
 
-  @integration
+  @integration @slow
   Scenario: Nodes can join in any order after seed
     Given node-1 has seeded the cluster
     When node-3 joins before node-2
@@ -59,7 +59,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And when node-2 joins later, it also becomes a follower
     And the cluster has 3 healthy members
 
-  @integration
+  @integration @slow
   Scenario: Cluster reaches quorum when majority joins
     Given node-1 has seeded the cluster (1 of 3 — no quorum)
     When node-2 joins (2 of 3 — quorum reached)
@@ -68,7 +68,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Leader election after formation ===
 
-  @integration
+  @integration @slow
   Scenario: Leader election works after cluster formation
     Given a 3-node cluster is fully formed
     When the leader's Raft RPC server stops
@@ -77,7 +77,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Configuration ===
 
-  @integration
+  @integration @slow
   Scenario: Seed vs follower determined by bootstrap flag
     Given KISEKI_BOOTSTRAP=true on node-1
     And KISEKI_BOOTSTRAP=false on node-2 and node-3
@@ -87,14 +87,14 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Error handling ===
 
-  @integration
+  @integration @slow
   Scenario: Follower retries if seed is not yet available
     When node-2 starts before node-1 (seed)
     Then node-2's RPC server starts and listens
     And node-2 retries connecting to the seed
     And once node-1 starts, node-2 receives membership and joins
 
-  @integration
+  @integration @slow
   Scenario: Double initialize is harmless on the same node
     When node-1 calls initialize() twice with the same membership
     Then the second call is a no-op (idempotent)

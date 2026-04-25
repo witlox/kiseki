@@ -678,5 +678,18 @@ impl KisekiWorld {
 
 fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(KisekiWorld::cucumber().run("features/"));
+
+    // By default, skip @slow scenarios (Raft clusters take ~1s each).
+    // Include them with: cargo test -p kiseki-acceptance --features slow-tests
+    #[cfg(feature = "slow-tests")]
+    let runner = KisekiWorld::cucumber();
+    #[cfg(not(feature = "slow-tests"))]
+    let runner = KisekiWorld::cucumber().filter_run("features/", |_, _, sc| {
+        !sc.tags.iter().any(|t| t == "slow")
+    });
+
+    #[cfg(feature = "slow-tests")]
+    rt.block_on(runner.run("features/"));
+    #[cfg(not(feature = "slow-tests"))]
+    rt.block_on(runner);
 }

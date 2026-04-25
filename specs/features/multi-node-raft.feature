@@ -9,20 +9,20 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Replication ===
 
-  @integration
+  @integration @slow
   Scenario: Delta replicated to majority before ack (I-L2)
     When a client writes a delta to shard "s1" via node-1 (leader)
     Then the delta is written to node-1's local log
     And replicated to at least one follower (node-2 or node-3)
     And the client receives ack only after majority commit
 
-  @integration
+  @integration @slow
   Scenario: Read after write — consistent on leader
     When a client writes delta with payload "test" to shard "s1"
     And immediately reads from shard "s1" on node-1 (leader)
     Then the delta with payload "test" is returned
 
-  @integration
+  @integration @slow
   Scenario: Follower read may be stale (eventual)
     When a client writes delta to shard "s1" via leader node-1
     And reads from follower node-2 before replication completes
@@ -31,21 +31,21 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Leader election ===
 
-  @integration
+  @integration @slow
   Scenario: Leader failure triggers election (F-C1)
     When node-1 (leader of shard "s1") becomes unreachable
     Then an election begins among node-2 and node-3
     And a new leader is elected within 300-600ms
     And writes to shard "s1" resume on the new leader
 
-  @integration
+  @integration @slow
   Scenario: Election does not lose committed deltas
     Given 100 deltas committed to shard "s1"
     When the leader fails and a new leader is elected
     Then all 100 committed deltas are present on the new leader
     And the sequence numbers are continuous (I-L1)
 
-  @integration
+  @integration @slow
   Scenario: Concurrent elections across shards — bounded storm
     Given node-1 hosts leader for 30 shards
     When node-1 fails
@@ -55,14 +55,14 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Quorum ===
 
-  @integration
+  @integration @slow
   Scenario: Quorum loss blocks writes (F-C2)
     Given shard "s1" has 3 members [node-1, node-2, node-3]
     When node-2 and node-3 both become unreachable
     Then writes to shard "s1" fail with QuorumLost error
     And reads from node-1 (old leader) may still succeed (stale)
 
-  @integration
+  @integration @slow
   Scenario: Quorum restored — writes resume
     Given shard "s1" has lost quorum (only node-1 reachable)
     When node-2 comes back online
@@ -72,7 +72,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Member management ===
 
-  @integration
+  @integration @slow
   Scenario: Add replica to shard
     Given shard "s1" has 3 members
     When a new node-4 is added as a member
@@ -80,7 +80,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And begins receiving new log entries
     And shard "s1" now has 4 members
 
-  @integration
+  @integration @slow
   Scenario: Remove replica from shard
     Given shard "s1" has 4 members
     When node-4 is removed from the group
@@ -90,13 +90,13 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Network transport ===
 
-  @integration
+  @integration @slow
   Scenario: Raft messages travel over TLS
     When node-1 sends a heartbeat to node-2
     Then the message is TLS-encrypted
     And the receiver validates the sender's certificate
 
-  @integration
+  @integration @slow
   Scenario: Network partition — minority side cannot elect
     Given nodes [node-1, node-2] are partitioned from [node-3]
     Then [node-1, node-2] form majority and elect a leader
@@ -105,7 +105,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Snapshot and recovery ===
 
-  @integration
+  @integration @slow
   Scenario: New member catches up via snapshot
     Given shard "s1" has 100,000 committed entries
     When a new node-4 joins the group
@@ -113,7 +113,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And the snapshot contains the full state machine state
     And node-4 begins receiving new entries from the snapshot point
 
-  @integration
+  @integration @slow
   Scenario: Crashed node recovers from local log + network
     Given node-2 crashes with 50,000 entries committed
     When node-2 restarts
@@ -123,13 +123,13 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Placement ===
 
-  @integration
+  @integration @slow
   Scenario: Shard members placed on distinct nodes
     When a shard is created with replication factor 3
     Then the 3 Raft members are placed on 3 different nodes
     And no two members share the same physical node
 
-  @integration
+  @integration @slow
   Scenario: Rack-aware placement (if configured)
     Given rack-awareness is enabled
     When a shard is created with replication factor 3
@@ -137,7 +137,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Shard migration via membership change (ADR-030) ===
 
-  @integration
+  @integration @slow
   Scenario: Shard migrated to SSD node via learner promotion
     Given shard "s1" has voters on [node-1, node-2, node-3] (all HDD)
     And node-4 is an SSD node with available capacity
@@ -148,7 +148,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And one HDD node is removed from the voter set
     And writes continue throughout without interruption
 
-  @integration
+  @integration @slow
   Scenario: Learner added as read accelerator (ADR-030 §7)
     Given shard "s1" has voters on [node-1, node-2, node-3]
     When an SSD learner is added on node-4
@@ -158,7 +158,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Node lifecycle / drain (I-N1..I-N7 — ADR-035, spec-only) ===
 
-  @integration
+  @integration @slow
   Scenario: Operator drains a node — leadership transfers off
     Given the cluster has 4 Active nodes [node-1, node-2, node-3, node-4]
     And node-1 leads shards "s1" and "s2"
@@ -169,7 +169,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And leadership for "s2" is similarly transferred
     And node-1 holds zero leader assignments
 
-  @integration
+  @integration @slow
   Scenario: Drain completes with full re-replication (I-N3, I-N5)
     Given node-1 is Draining and has been stripped of leadership
     And node-1 still holds voter slots in shards "s1", "s2", "s3"
@@ -180,7 +180,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And RF=3 is preserved at every intermediate state — no shard observes RF<3 during the drain
     And once all three shards have completed voter replacement, node-1 transitions Draining → Evicted
 
-  @integration
+  @integration @slow
   Scenario: Drain refused at RF floor (I-N4)
     Given the cluster has exactly 3 Active nodes [node-1, node-2, node-3]
     And every shard has voters on all 3 nodes (RF=3)
@@ -190,7 +190,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And no leadership transfer or voter replacement is attempted
     And the refusal is recorded in the cluster audit shard (I-N6)
 
-  @integration
+  @integration @slow
   Scenario: Drain proceeds after replacement node is added (I-N4 mitigation)
     Given the cluster has 3 Active nodes and a previous DrainRefused for node-1
     When the cluster admin adds node-4 (now 4 Active nodes)
@@ -199,7 +199,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And voter replacements target node-4 first by best-effort placement
     And the drain completes per the standard protocol
 
-  @integration
+  @integration @slow
   Scenario: Drain cancellation returns node to Active (I-N7)
     Given node-1 is in state Draining
     And voter replacement has completed for "s1" but not yet for "s2" or "s3"
@@ -210,7 +210,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And the cluster operates correctly with the resulting placement
     And the cancellation is recorded in the cluster audit shard
 
-  @integration
+  @integration @slow
   Scenario: Drain concurrency bounded by I-SF4 cap
     Given node-1 is Draining with voter slots in 100 shards
     When the drain orchestrator schedules voter replacements
@@ -218,14 +218,14 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And remaining replacements are queued
     And the drain completes in bounded time without Raft instability
 
-  @integration
+  @integration @slow
   Scenario: Evicted state is terminal (I-N1)
     Given node-1 is in state Evicted
     When the cluster admin attempts to re-activate node-1
     Then the request is rejected with "node identity is Evicted; re-add requires fresh node identity"
     And node-1 remains in state Evicted
 
-  @integration
+  @integration @slow
   Scenario: Split fires during active drain — leader not placed on draining node (ADV-033-8)
     Given node-1 is in state Draining
     And shard "s5" exceeds its hard ceiling (I-L6)
@@ -234,7 +234,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And "s5-b"'s leader is placed on a node in {Active, Degraded} state — NOT on node-1
     And the I-L12 placement engine excludes Failed, Draining, and Evicted nodes
 
-  @integration
+  @integration @slow
   Scenario: Degraded node is eligible as drain replacement target (ADV-035-10)
     Given the cluster has 4 nodes: node-1 (Active), node-2 (Active), node-3 (Degraded), node-4 (Active)
     And node-4 holds voter slots in shards "s1", "s2", "s3"
@@ -243,7 +243,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And voter replacements may be placed on node-3
     And the drain completes successfully
 
-  @integration
+  @integration @slow
   Scenario: Failed node recovers after eviction — stale membership harmless (ADV-035-5)
     Given node-1 was Failed and then drained to Evicted
     When node-1 physically recovers and its Raft instances restart
@@ -253,12 +253,12 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # === Performance ===
 
-  @integration
+  @integration @slow
   Scenario: Write latency within SLO
     When 1000 sequential delta writes are performed
     Then the p99 write latency is under 500µs (TCP) or 100µs (RDMA)
 
-  @integration
+  @integration @slow
   Scenario: Throughput scales with shard count
     Given 10 shards on 3 nodes
     When all 10 shards receive concurrent writes

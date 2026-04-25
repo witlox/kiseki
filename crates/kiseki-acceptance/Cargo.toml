@@ -17,6 +17,12 @@ name = "acceptance"
 harness = false
 path = "tests/acceptance.rs"
 
+[features]
+default = []
+## Include slow @integration scenarios (Raft clusters, ~1s each).
+## Run with: cargo test -p kiseki-acceptance --features slow-tests
+slow-tests = []
+
 [dependencies]
 # Domain crates under test
 kiseki-common = { workspace = true }

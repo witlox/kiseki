@@ -11,7 +11,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Happy path: delta append ---
 
-  @integration
+  @integration @slow @slow
   Scenario: Successful delta append
     Given shard "shard-alpha" is healthy with all 3 replicas online
     When the Composition context appends a delta with:
@@ -46,7 +46,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Failure: Raft leader loss ---
 
-  @integration
+  @integration @slow @slow
   Scenario: Raft leader loss triggers election
     Given node 1 is the Raft leader for "shard-alpha"
     When node 1 becomes unreachable
@@ -55,7 +55,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And in-flight uncommitted deltas are retried by the Composition context
     And no committed deltas are lost
 
-  @integration
+  @integration @slow @slow
   Scenario: Write during leader election is rejected with retriable error
     Given a leader election is in progress for "shard-alpha"
     When the Composition context appends a delta
@@ -64,7 +64,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Failure: Raft quorum loss ---
 
-  @integration
+  @integration @slow @slow
   Scenario: Quorum loss makes shard unavailable for writes
     Given nodes 2 and 3 become unreachable for "shard-alpha"
     And only node 1 (leader) remains
@@ -72,7 +72,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And all write commands are rejected with "quorum unavailable" error
     And read commands from existing replicas may continue if stale reads are permitted by the view descriptor
 
-  @integration
+  @integration @slow @slow
   Scenario: Quorum recovery resumes normal operation
     Given shard "shard-alpha" lost quorum with only node 1 available
     When node 2 comes back online
