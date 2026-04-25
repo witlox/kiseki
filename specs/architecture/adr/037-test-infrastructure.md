@@ -34,7 +34,8 @@ RaftTestCluster
 **Key methods:**
 - `RaftTestCluster::new(node_count, shard_id, tenant_id)` — bootstrap
 - `write_delta(key_byte)` — write through leader
-- `isolate_node(id)` / `restore_node(id)` — partition simulation
+- `isolate_node(id)` / `restore_node(id)` — symmetric partition (blocks both directions, ADV-037-1)
+- `block_link(from, to)` / `unblock_link(from, to)` — asymmetric partition
 - `wait_for_leader(timeout)` — election verification
 - `add_node(id)` / `change_membership(voters)` — membership changes
 - `trigger_election(id)` / `trigger_snapshot(id)` — explicit triggers
@@ -60,6 +61,7 @@ Five new trait definitions for remaining scenarios:
 - `subscribe_backpressure(workflow_ref)` → `Receiver<BackpressureEvent>`
 - `query_qos_headroom(workflow_ref)` → `QosHeadroom`
 - `is_healthy()` → `bool`
+- `set_healthy(bool)` — failure injection (ADV-037-4: F-ADV-1 outage scenario)
 
 **GatewayLifecycleOps** (3 scenarios) — `kiseki-gateway/src/lifecycle.rs`
 - `crash()` — drop ephemeral state (locks, sessions, cached KEK)
