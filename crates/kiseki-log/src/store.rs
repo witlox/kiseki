@@ -403,6 +403,30 @@ impl LogOps for MemShardStore {
 
         Ok(before_count.saturating_sub(after_count))
     }
+
+    fn create_shard(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        node_id: NodeId,
+        config: ShardConfig,
+    ) {
+        // Delegate to inherent method.
+        Self::create_shard(self, shard_id, tenant_id, node_id, config);
+    }
+
+    fn update_shard_range(
+        &self,
+        shard_id: ShardId,
+        range_start: [u8; 32],
+        range_end: [u8; 32],
+    ) {
+        Self::update_shard_range(self, shard_id, range_start, range_end);
+    }
+
+    fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
+        Self::set_shard_state(self, shard_id, state);
+    }
 }
 
 #[cfg(test)]

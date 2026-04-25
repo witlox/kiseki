@@ -422,6 +422,31 @@ impl LogOps for RaftLogStore {
 
         Ok(before.saturating_sub(after))
     }
+
+    fn create_shard(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        node_id: NodeId,
+        config: ShardConfig,
+    ) {
+        Self::create_shard(self, shard_id, tenant_id, node_id, config);
+    }
+
+    fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]) {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sm) = inner.shards.get_mut(&shard_id) {
+            sm.info.range_start = range_start;
+            sm.info.range_end = range_end;
+        }
+    }
+
+    fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sm) = inner.shards.get_mut(&shard_id) {
+            sm.info.state = state;
+        }
+    }
 }
 
 #[cfg(test)]

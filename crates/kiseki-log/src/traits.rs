@@ -2,12 +2,12 @@
 //!
 //! Spec: `api-contracts.md` §Log, `data-models/log.rs`.
 
-use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
+use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
 use kiseki_common::time::DeltaTimestamp;
 
 use crate::delta::{Delta, OperationType};
 use crate::error::LogError;
-use crate::shard::ShardInfo;
+use crate::shard::{ShardConfig, ShardInfo, ShardState};
 
 /// Request to append a delta to a shard.
 #[derive(Clone, Debug)]
@@ -81,4 +81,30 @@ pub trait LogOps: Send + Sync {
     /// advanced past them. Payloads are carried opaquely — never
     /// decrypted (I-L7). Returns the number of deltas removed.
     async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError>;
+
+    // --- Shard management (ADR-036) ---
+
+    /// Create a new shard with the given parameters.
+    ///
+    /// Idempotent: if the shard already exists, this is a no-op.
+    /// Sync because shard metadata is local state (control plane Raft
+    /// handles distributed coordination separately).
+    fn create_shard(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        node_id: NodeId,
+        config: ShardConfig,
+    );
+
+    /// Update a shard's key range (used during split/merge, ADR-033/034).
+    fn update_shard_range(
+        &self,
+        shard_id: ShardId,
+        range_start: [u8; 32],
+        range_end: [u8; 32],
+    );
+
+    /// Transition a shard's lifecycle state (ADR-034 merge protocol).
+    fn set_shard_state(&self, shard_id: ShardId, state: ShardState);
 }

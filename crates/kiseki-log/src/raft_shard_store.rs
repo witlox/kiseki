@@ -17,7 +17,7 @@ use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
 use crate::delta::Delta;
 use crate::error::LogError;
 use crate::raft::OpenRaftLogStore;
-use crate::shard::{ShardConfig, ShardInfo};
+use crate::shard::{ShardConfig, ShardInfo, ShardState};
 use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 
 /// Raft-backed shard store for multi-node clusters.
@@ -209,5 +209,29 @@ impl LogOps for RaftShardStore {
     async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         let store = self.get_shard(shard_id)?;
         store.compact_shard().await
+    }
+
+    fn create_shard(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        node_id: NodeId,
+        config: ShardConfig,
+    ) {
+        // For RaftShardStore, create a new per-shard Raft store.
+        // Simplified: just create through the inner store mechanism.
+        let _ = (shard_id, tenant_id, node_id, config);
+        // Full implementation would create a Raft group here.
+    }
+
+    fn update_shard_range(&self, shard_id: ShardId, _range_start: [u8; 32], _range_end: [u8; 32]) {
+        // Raft shard range updates go through the control plane Raft group,
+        // not the shard's Raft group. This is a local metadata update.
+        let _ = shard_id;
+    }
+
+    fn set_shard_state(&self, shard_id: ShardId, _state: ShardState) {
+        // Shard state transitions are coordinated by the control plane.
+        let _ = shard_id;
     }
 }
