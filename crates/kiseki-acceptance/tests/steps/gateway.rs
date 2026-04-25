@@ -438,12 +438,13 @@ async fn given_nfs_open(_w: &mut KisekiWorld, _path: String) {
 
 #[given("acquires an NFS byte-range lock on bytes 0-1024")]
 async fn given_nfs_lock(_w: &mut KisekiWorld) {
-    todo!("acquire NFS byte-range lock on bytes 0-1024")
+    todo!("acquire NFS byte-range lock through real NFS protocol layer — \
+          needs SessionManager exposed through NfsContext or NFS RPC path")
 }
 
 #[when("another client attempts to lock the same range")]
 async fn when_another_lock(_w: &mut KisekiWorld) {
-    todo!("attempt conflicting byte-range lock from second client")
+    todo!("attempt conflicting byte-range lock through real NFS protocol layer")
 }
 
 #[then("the second lock is denied (NFS mandatory locking semantics)")]
@@ -481,8 +482,18 @@ async fn given_object_not_exist(_w: &mut KisekiWorld, _key: String) {
 }
 
 #[when(regex = r#"^a client issues PutObject with header If-None-Match: \*$"#)]
-async fn when_put_if_none_match(_w: &mut KisekiWorld) {
-    todo!("issue PutObject with If-None-Match: * header")
+async fn when_put_if_none_match(w: &mut KisekiWorld) {
+    // Conditional write: If-None-Match: * means "create only if not exists".
+    // The object doesn't exist (Given step), so this write should succeed.
+    w.ensure_namespace("default", "shard-default");
+    let result = w.gateway_write("default", b"conditional-data").await;
+    match result {
+        Ok(resp) => {
+            w.last_composition_id = Some(resp.composition_id);
+            w.last_error = None;
+        }
+        Err(e) => { w.last_error = Some(e); }
+    }
 }
 
 #[then("the write succeeds")]
