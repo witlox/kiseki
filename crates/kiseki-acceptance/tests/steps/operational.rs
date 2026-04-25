@@ -9,10 +9,22 @@ use kiseki_log::compaction_worker::{compact_deltas, CompactionProgress};
 
 #[given("a Kiseki server with KISEKI_DATA_DIR configured")]
 async fn given_data_dir(w: &mut KisekiWorld) {
-    todo!("configure KISEKI_DATA_DIR and verify persistence via redb — \
-          requires changing World.log_store from Arc<MemShardStore> to \
-          Arc<dyn LogOps + Send + Sync> and adding create_shard/update_shard_range \
-          to LogOps trait or keeping a separate shard management handle")
+    // Create a tempdir and open a PersistentShardStore for real persistence.
+    let dir = tempfile::tempdir().expect("tempdir for persistence");
+    let db_path = dir.path().join("test.redb");
+    let store = kiseki_log::PersistentShardStore::open(&db_path)
+        .await
+        .expect("PersistentShardStore should open");
+    // Create the default shard.
+    let tenant = w.ensure_tenant("org-pharma");
+    let default_shard = w.ensure_shard("shard-alpha");
+    store.create_shard(default_shard, tenant, kiseki_common::ids::NodeId(1),
+        kiseki_log::ShardConfig::default());
+    // Swap the World's log store to the persistent one.
+    w.log_store = std::sync::Arc::new(store);
+    // Keep tempdir alive and store path for restart simulation.
+    w.block_temp_dir = Some(dir);
+    w.block_device_path = Some(db_path);
 }
 
 #[given(regex = r#"^tenant "(\S+)" with compliance tags \[([^\]]+)\]$"#)]
