@@ -253,7 +253,7 @@ async fn when_append_64mb(w: &mut KisekiWorld) {
 
 #[given("chunk c2 covers byte range 64MB-128MB")]
 async fn given_chunk_c2_byte_range(_w: &mut KisekiWorld) {
-    // Byte range metadata — structural precondition accepted.
+    todo!("set up chunk c2 with byte range 64MB-128MB in chunk store")
 }
 
 #[when("a write modifies bytes 80MB-90MB")]
@@ -304,12 +304,12 @@ async fn when_abort_multipart(w: &mut KisekiWorld) {
 
 #[given("c5 has refcount 2 (shared with another composition)")]
 async fn given_c5_refcount_2(_w: &mut KisekiWorld) {
-    // Refcount setup — structural precondition for delete scenario.
+    todo!("set c5 refcount to 2 in chunk store")
 }
 
 #[given("c6 has refcount 1")]
 async fn given_c6_refcount_1(_w: &mut KisekiWorld) {
-    // Refcount setup — structural precondition for delete scenario.
+    todo!("set c6 refcount to 1 in chunk store")
 }
 
 #[when("the Composition context processes a DELETE")]
@@ -376,12 +376,12 @@ async fn given_default_dedup_writes(w: &mut KisekiWorld, tenant: String) {
 
 #[given(regex = r#"^chunk_id = HMAC\(P, (\S+)\) = "([^"]+)"$"#)]
 async fn given_hmac_chunk_id(_w: &mut KisekiWorld, _key: String, _id: String) {
-    // HMAC chunk ID — structural precondition for isolation scenario.
+    todo!("compute HMAC chunk ID and store in chunk store")
 }
 
 #[given(regex = r#"^"([^"]+)" has chunk sha256\(P\) = "([^"]+)"$"#)]
 async fn given_sha256_chunk(_w: &mut KisekiWorld, _tenant: String, _id: String) {
-    // SHA256 chunk in other tenant — structural precondition.
+    todo!("store SHA256-addressed chunk for tenant in chunk store")
 }
 
 #[when("the Control Plane approves (quota, policy check)")]
@@ -398,14 +398,12 @@ async fn given_ns_additional_tag(_w: &mut KisekiWorld, _ns: String, _tag: String
 
 #[given("chunk write to Chunk Storage fails (pool full, system key manager down)")]
 async fn given_chunk_write_fails(w: &mut KisekiWorld) {
-    // Simulate chunk write failure by setting error state.
-    w.last_error = Some("chunk write failed: pool full".to_string());
+    todo!("trigger real chunk write failure via fault injection in chunk store")
 }
 
 #[given("the subsequent delta commit to the Log fails (shard unavailable)")]
 async fn given_delta_commit_fails(w: &mut KisekiWorld) {
-    // Simulate delta commit failure.
-    w.last_error = Some("delta commit failed: shard unavailable".to_string());
+    todo!("trigger real delta commit failure via fault injection in log store")
 }
 
 #[when(regex = r#"^a POSIX rename targets namespace "(\S+)" \((\S+)\)$"#)]
@@ -437,30 +435,29 @@ async fn when_posix_rename_targets(w: &mut KisekiWorld, ns: String, shard: Strin
 
 #[given(regex = r#"^the caller submits hint \{[^}]+\}$"#)]
 async fn given_caller_submits_hint(_w: &mut KisekiWorld) {
-    // Advisory hint — structural precondition.
+    todo!("attach advisory hint to workflow context")
 }
 
 #[when("the Composition context forwards the hint to placement and the Log")]
 async fn when_comp_forwards_hint(_w: &mut KisekiWorld) {
-    // Hint forwarding — advisory, no-op in in-memory harness.
+    todo!("forward advisory hint to placement and log subsystems")
 }
 
 #[given(regex = r#"^the caller attaches hint \{ retention_intent: final \} at finalize$"#)]
 async fn given_retention_intent_final(_w: &mut KisekiWorld) {
-    // Retention-intent hint — advisory precondition.
+    todo!("attach retention_intent:final hint to finalize context")
 }
 
 #[when("the caller subscribes to refcount-activity telemetry")]
 async fn when_subscribe_refcount_telemetry(_w: &mut KisekiWorld) {
-    // Telemetry subscription — advisory operation.
+    todo!("subscribe to refcount-activity telemetry stream")
 }
 
 #[when(
     regex = r#"^the caller submits a create-composition request for namespace "([^"]+)" \(not authorised\) carrying hint \{ priority: batch \}$"#
 )]
 async fn when_create_unauthorized_ns(w: &mut KisekiWorld, ns: String) {
-    // Attempt to create in unauthorized namespace — rejected.
-    w.last_error = Some("namespace not authorised".to_string());
+    todo!("attempt real create in unauthorized namespace and capture auth error")
 }
 
 #[when("the workload creates, updates, and finalizes compositions")]
@@ -479,19 +476,12 @@ async fn when_workload_creates_updates_finalizes(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^the composition "([^"]+)" exists in namespace "(\S+)"$"#)]
 async fn then_comp_exists_in_ns(w: &mut KisekiWorld, _name: String, _ns: String) {
-    assert!(
-        w.last_composition_id.is_some(),
-        "composition should exist, error: {:?}",
-        w.last_error
-    );
+    todo!("verify composition exists in the specified namespace via comp_store")
 }
 
 #[then("the chunk's refcount includes this composition's reference")]
 async fn then_chunk_refcount_includes(w: &mut KisekiWorld) {
-    assert!(
-        w.last_composition_id.is_some(),
-        "composition must exist before checking refcount"
-    );
+    todo!("verify actual chunk refcount incremented for this composition's chunks")
 }
 
 #[then("the protocol gateway receives success")]
@@ -501,48 +491,32 @@ async fn then_pgw_success(w: &mut KisekiWorld) {
 
 #[then("no chunk is written to Chunk Storage")]
 async fn then_no_chunk_written(w: &mut KisekiWorld) {
-    // Inline data below threshold — verify composition exists but no chunk was stored.
-    assert!(
-        w.last_composition_id.is_some(),
-        "composition should exist for inline data"
-    );
+    todo!("verify actual chunk store has no new chunks written")
 }
 
 #[then("the file data is included inline in the delta's encrypted payload")]
 async fn then_inline_data(w: &mut KisekiWorld) {
-    // Verify the composition was created (inline data is part of the delta payload).
-    assert!(
-        w.last_composition_id.is_some(),
-        "inline data should produce a composition"
-    );
+    todo!("verify actual delta payload contains inline file data")
 }
 
 #[then("the delta is committed to the shard")]
 async fn then_delta_committed(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none(), "error: {:?}", w.last_error);
+    todo!("verify actual delta committed to shard in log store")
 }
 
 #[then("the composition is complete with inline data only")]
 async fn then_comp_complete_inline(w: &mut KisekiWorld) {
-    assert!(w.last_composition_id.is_some());
+    todo!("verify composition has zero chunk references and inline payload")
 }
 
 #[then(regex = r#"^new chunks \[([^\]]+)\] are written to Chunk Storage$"#)]
 async fn then_new_chunks_written(w: &mut KisekiWorld, _chunks: String) {
-    assert!(
-        w.last_error.is_none(),
-        "chunk write should succeed: {:?}",
-        w.last_error
-    );
-    assert!(
-        w.last_composition_id.is_some(),
-        "composition must exist after writing chunks"
-    );
+    todo!("verify actual chunks exist in chunk store")
 }
 
 #[then(regex = r#"^a delta is appended: "([^"]+)"$"#)]
 async fn then_delta_appended(w: &mut KisekiWorld, _desc: String) {
-    assert!(w.last_error.is_none(), "error: {:?}", w.last_error);
+    todo!("verify actual delta appended to log store with matching description")
 }
 
 #[then(regex = r#"^the composition now references \[([^\]]+)\]$"#)]
@@ -558,72 +532,37 @@ async fn then_comp_references(w: &mut KisekiWorld, _chunks: String) {
 
 #[then(regex = r#"^refcounts for (.+) are initialized to (\d+)$"#)]
 async fn then_refcounts_initialized(w: &mut KisekiWorld, _chunks: String, _count: u64) {
-    assert!(
-        w.last_error.is_none(),
-        "refcount init should succeed: {:?}",
-        w.last_error
-    );
-    assert!(
-        w.last_composition_id.is_some(),
-        "composition must exist for refcount initialization"
-    );
+    todo!("verify actual chunk refcounts in chunk store match expected count")
 }
 
 #[then(regex = r#"^a new chunk c2' is written covering the modified range$"#)]
 async fn then_new_chunk_c2_prime(w: &mut KisekiWorld) {
-    // Byte-range overwrite produces a new chunk — verify composition still readable.
-    assert!(
-        w.last_error.is_none(),
-        "overwrite should succeed: {:?}",
-        w.last_error
-    );
+    todo!("verify new chunk c2' exists in chunk store covering modified byte range")
 }
 
 #[then(regex = r#"^a delta records: "([^"]+)"$"#)]
 async fn then_delta_records(w: &mut KisekiWorld, _desc: String) {
-    // Delta appended — verify no error on the write path.
-    assert!(
-        w.last_error.is_none(),
-        "delta record should succeed: {:?}",
-        w.last_error
-    );
+    todo!("verify actual delta recorded in log store with matching content")
 }
 
 #[then("c2 refcount is decremented (if no other composition references it)")]
 async fn then_c2_refcount_decremented(w: &mut KisekiWorld) {
-    // Refcount decrement verified via chunk store — chunk should still exist
-    // (refcount may be >0 if other compositions reference it).
-    assert!(
-        w.last_error.is_none(),
-        "refcount decrement path should not error"
-    );
+    todo!("verify actual c2 refcount decremented in chunk store")
 }
 
 #[then("c2' refcount is initialized to 1")]
 async fn then_c2_prime_refcount_1(w: &mut KisekiWorld) {
-    // New chunk created with refcount 1.
-    assert!(
-        w.last_error.is_none(),
-        "new chunk refcount init should not error"
-    );
+    todo!("verify actual c2' refcount is 1 in chunk store")
 }
 
 #[then("the Composition context verifies all chunks are durable")]
 async fn then_comp_verifies_durable(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none(), "error: {:?}", w.last_error);
+    todo!("verify chunk durability check was performed for all composition chunks")
 }
 
 #[then(regex = r#"^a single delta records the complete composition: \[([^\]]+)\]$"#)]
 async fn then_single_delta_records(w: &mut KisekiWorld, _chunks: String) {
-    assert!(
-        w.last_error.is_none(),
-        "delta should commit: {:?}",
-        w.last_error
-    );
-    assert!(
-        w.last_composition_id.is_some(),
-        "composition must exist after finalize delta"
-    );
+    todo!("verify single delta in log store contains all listed chunks")
 }
 
 #[then("the composition becomes visible to readers only after the finalize delta commits")]
@@ -639,18 +578,7 @@ async fn then_visible_after_finalize(w: &mut KisekiWorld) {
 
 #[then("individual parts are NOT visible before completion (I-L5)")]
 async fn then_parts_not_visible_il5(w: &mut KisekiWorld) {
-    // After CompleteMultipartUpload, the composition should exist atomically.
-    // The invariant I-L5 states individual parts are not visible before the finalize delta.
-    // We verify the composition was created atomically via the finalize step.
-    assert!(
-        w.last_composition_id.is_some(),
-        "composition must exist after finalize (atomicity of I-L5)"
-    );
-    assert!(
-        w.last_error.is_none(),
-        "finalize should succeed: {:?}",
-        w.last_error
-    );
+    todo!("verify parts are not independently visible before finalize delta commits (I-L5)")
 }
 
 #[then("no finalize delta is committed")]
@@ -663,45 +591,27 @@ async fn then_no_finalize_delta(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^chunks c10, c11 have refcount 0 \(no composition references them\)$"#)]
 async fn then_abort_chunks_refcount_0(w: &mut KisekiWorld) {
-    // After abort, no composition references these chunks.
-    assert!(
-        w.last_composition_id.is_none(),
-        "no composition should exist after abort — chunks have refcount 0"
-    );
+    todo!("verify actual refcount of c10, c11 is 0 in chunk store after abort")
 }
 
 #[then("chunks become eligible for GC")]
 async fn then_chunks_eligible_gc(w: &mut KisekiWorld) {
-    // Chunks with refcount 0 and no retention hold are GC-eligible.
-    assert!(
-        w.last_composition_id.is_none(),
-        "aborted composition means orphan chunks are GC-eligible"
-    );
+    todo!("verify chunks with refcount 0 are marked GC-eligible")
 }
 
 #[then("a tombstone delta is appended to the shard")]
 async fn then_tombstone_appended(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none(), "error: {:?}", w.last_error);
+    todo!("verify actual tombstone delta appended to log store")
 }
 
 #[then("c5 refcount is decremented to 1 (still referenced elsewhere)")]
 async fn then_c5_refcount_1(w: &mut KisekiWorld) {
-    // Shared chunk: still has references from other compositions.
-    assert!(
-        w.last_error.is_none(),
-        "delete should succeed: {:?}",
-        w.last_error
-    );
+    todo!("verify actual c5 refcount is 1 in chunk store")
 }
 
 #[then("c6 refcount is decremented to 0 (eligible for GC if no hold)")]
 async fn then_c6_refcount_0(w: &mut KisekiWorld) {
-    // Sole-reference chunk: refcount 0 after delete, eligible for GC.
-    assert!(
-        w.last_error.is_none(),
-        "delete should succeed: {:?}",
-        w.last_error
-    );
+    todo!("verify actual c6 refcount is 0 in chunk store")
 }
 
 #[then("the composition is no longer visible in the namespace")]
@@ -713,11 +623,7 @@ async fn then_comp_not_visible(w: &mut KisekiWorld) {
 
 #[then("a delete marker is appended (tombstone delta)")]
 async fn then_delete_marker(w: &mut KisekiWorld) {
-    assert!(
-        w.last_error.is_none(),
-        "delete marker should succeed: {:?}",
-        w.last_error
-    );
+    todo!("verify actual delete marker delta appended to log store")
 }
 
 #[then("the current version becomes the delete marker")]
@@ -733,17 +639,12 @@ async fn then_current_version_delete_marker(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^previous versions \[([^\]]+)\] remain accessible by version ID$"#)]
 async fn then_previous_versions_accessible(w: &mut KisekiWorld, _versions: String) {
-    // Versioned namespace: previous versions are accessible.
-    assert!(w.last_error.is_none(), "version access should not error");
+    todo!("verify previous versions are retrievable by version ID from comp_store")
 }
 
 #[then("chunk refcounts are NOT decremented (versions still reference them)")]
 async fn then_chunk_refcounts_not_decremented(w: &mut KisekiWorld) {
-    // Versioned delete preserves chunk references from old versions.
-    assert!(
-        w.last_error.is_none(),
-        "versioned delete should preserve refcounts"
-    );
+    todo!("verify actual chunk refcounts unchanged after versioned delete")
 }
 
 #[then(regex = r#"^file B's composition references chunk "([^"]+)"$"#)]
@@ -777,40 +678,32 @@ async fn then_chunk_refcount_increments_to(w: &mut KisekiWorld, _chunk: String, 
 
 #[then("no new chunk is stored")]
 async fn then_no_new_chunk_stored(w: &mut KisekiWorld) {
-    // Dedup: same plaintext → same chunk_id → refcount increment, no new chunk.
-    assert!(w.last_error.is_none(), "dedup write should succeed");
+    todo!("verify chunk store count unchanged (dedup reused existing chunk)")
 }
 
 #[then(regex = r#"^"([^"]+)" receives a tenant KEK wrapping for the system DEK$"#)]
 async fn then_receives_kek_wrapping(w: &mut KisekiWorld, _tenant: String) {
-    // Cross-tenant key wrapping: the write path wraps for the tenant.
-    assert!(w.last_error.is_none(), "KEK wrapping should succeed");
+    todo!("verify tenant KEK wrapping created for system DEK")
 }
 
 #[then("one copy of ciphertext serves both tenants")]
 async fn then_one_copy_serves_both(w: &mut KisekiWorld) {
-    // Cross-tenant dedup: single ciphertext, multiple KEK wrappings.
-    assert!(w.last_error.is_none(), "dedup should serve both tenants");
+    todo!("verify single ciphertext chunk shared across both tenants")
 }
 
 #[then(regex = r#"^"([^"]+)" != "([^"]+)" — no dedup match$"#)]
 async fn then_no_dedup_match(w: &mut KisekiWorld, _id1: String, _id2: String) {
-    // HMAC isolation: opted-out tenants get different chunk_ids for same plaintext.
-    assert!(w.last_error.is_none(), "HMAC isolation should succeed");
+    todo!("verify HMAC chunk IDs differ for isolated tenants")
 }
 
 #[then(regex = r#"^a new chunk "([^"]+)" is stored for "([^"]+)"$"#)]
 async fn then_new_chunk_stored_for(w: &mut KisekiWorld, _chunk: String, _tenant: String) {
-    // Isolated chunk storage: opted-out tenant gets its own chunk.
-    assert!(
-        w.last_error.is_none(),
-        "isolated chunk write should succeed"
-    );
+    todo!("verify isolated chunk stored for tenant in chunk store")
 }
 
 #[then(regex = r#"^"([^"]+)" data is fully isolated$"#)]
 async fn then_data_fully_isolated(_w: &mut KisekiWorld, _tenant: String) {
-    // Tenant data isolation — structural.
+    todo!("verify tenant data isolation: no shared chunks between tenants")
 }
 
 #[then(regex = r#"^a new shard is created for "([^"]+)"$"#)]
@@ -843,22 +736,22 @@ async fn then_ns_associated(w: &mut KisekiWorld) {
 
 #[then("compliance tags from the org level are inherited")]
 async fn then_compliance_tags_inherited(_w: &mut KisekiWorld) {
-    // Compliance tag inheritance — structural.
+    todo!("verify namespace inherited compliance tags from org level")
 }
 
 #[then(regex = r#"^the effective compliance regime for "(\S+)" is \[([^\]]+)\]$"#)]
 async fn then_effective_compliance(_w: &mut KisekiWorld, _ns: String, _tags: String) {
-    // Effective compliance tags — structural.
+    todo!("verify effective compliance tags match expected merged set")
 }
 
 #[then("the staleness floor is the strictest of the three regimes")]
 async fn then_staleness_floor(_w: &mut KisekiWorld) {
-    // Staleness floor — structural.
+    todo!("verify staleness floor reflects strictest compliance regime")
 }
 
 #[then("audit requirements are the union of all three")]
 async fn then_audit_union(_w: &mut KisekiWorld) {
-    // Audit requirements union — structural.
+    todo!("verify audit requirements are union of all compliance regimes")
 }
 
 #[then("the composition create is aborted")]
@@ -896,12 +789,12 @@ async fn then_comp_create_fails(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^chunk c20 has refcount 0 \(no composition references it\)$"#)]
 async fn then_c20_refcount_0(_w: &mut KisekiWorld) {
-    // Orphan chunk — refcount 0 after failed delta commit.
+    todo!("verify actual c20 refcount is 0 in chunk store")
 }
 
 #[then("c20 becomes eligible for GC (orphan chunk cleanup)")]
 async fn then_c20_gc_eligible(_w: &mut KisekiWorld) {
-    // Orphan chunk GC eligibility — structural.
+    todo!("verify c20 is marked GC-eligible as orphan chunk")
 }
 
 #[then("the operation returns EXDEV")]
@@ -940,51 +833,51 @@ async fn then_no_2pc(w: &mut KisekiWorld) {
 
 #[then("write-absorb capacity MAY be pre-warmed in the target pool within tenant quota")]
 async fn then_write_absorb_may_prewarm(_w: &mut KisekiWorld) {
-    // Advisory — MAY behavior, structural.
+    todo!("verify write-absorb pre-warm was attempted within tenant quota")
 }
 
 #[then(
     "the announcement is advisory — checkpoint writes succeed even if no warm-up occurred (I-WA1)"
 )]
 async fn then_advisory_iwa1(_w: &mut KisekiWorld) {
-    // I-WA1: advisory never blocks data path.
+    todo!("verify checkpoint writes succeed without warm-up (I-WA1)")
 }
 
 #[then("no capacity is reserved in a way that starves other tenants of their quota (I-T2)")]
 async fn then_no_starvation_it2(_w: &mut KisekiWorld) {
-    // I-T2: tenant quota fairness.
+    todo!("verify pre-warm does not exceed tenant quota (I-T2)")
 }
 
 #[then(
     "the finalize delta is processed normally (chunks confirmed durable before visibility, I-L5)"
 )]
 async fn then_finalize_normal_il5(_w: &mut KisekiWorld) {
-    // I-L5: finalize semantics unchanged by hint.
+    todo!("verify finalize delta processed with chunk durability check (I-L5)")
 }
 
 #[then("the hint MAY bias background GC urgency for parts not included in the final composition")]
 async fn then_hint_may_bias_gc(_w: &mut KisekiWorld) {
-    // Retention-intent MAY behavior — structural.
+    todo!("verify GC urgency bias applied for non-final parts")
 }
 
 #[then("it does NOT change refcount semantics (I-C2) or ordering guarantees (I-L5)")]
 async fn then_no_change_ic2_il5(_w: &mut KisekiWorld) {
-    // Invariant preservation — structural.
+    todo!("verify refcount semantics (I-C2) and ordering (I-L5) unchanged by hint")
 }
 
 #[then("per-workflow rates are emitted in bucketed values (e.g., creates/sec, versions/sec)")]
 async fn then_bucketed_rates(_w: &mut KisekiWorld) {
-    // Telemetry emission — structural.
+    todo!("verify bucketed telemetry rates emitted for workflow")
 }
 
 #[then("only activity attributable to the caller's workflow is included (I-WA5)")]
 async fn then_caller_scoped_iwa5(_w: &mut KisekiWorld) {
-    // I-WA5: caller-scoped telemetry.
+    todo!("verify telemetry scoped to caller's workflow only (I-WA5)")
 }
 
 #[then("no neighbour workload's activity in the same namespace is inferable")]
 async fn then_no_neighbour_inferable(_w: &mut KisekiWorld) {
-    // Privacy — no information leakage.
+    todo!("verify telemetry does not leak neighbour workload activity")
 }
 
 #[then("the request is rejected with the same error it would return without any hint")]
@@ -994,7 +887,7 @@ async fn then_rejected_same_error(w: &mut KisekiWorld) {
 
 #[then("the hint has no effect on authorisation (I-WA14)")]
 async fn then_hint_no_effect_iwa14(_w: &mut KisekiWorld) {
-    // I-WA14: hints cannot override authorization.
+    todo!("verify hint did not bypass authorization check (I-WA14)")
 }
 
 #[then("all create/update/multipart/finalize operations succeed with full correctness")]
@@ -1014,16 +907,7 @@ async fn then_no_advisory_behavior(w: &mut KisekiWorld) {
 
 #[then("refcount, delta ordering, and chunk durability guarantees are unchanged (I-WA2)")]
 async fn then_guarantees_unchanged_iwa2(w: &mut KisekiWorld) {
-    // I-WA2: data-path independence — verify composition exists and no error.
-    assert!(
-        w.last_error.is_none(),
-        "data-path guarantees require no error: {:?}",
-        w.last_error
-    );
-    assert!(
-        w.last_composition_id.is_some(),
-        "composition should exist (I-WA2 data-path independence)"
-    );
+    todo!("verify refcount, delta ordering, and chunk durability unchanged (I-WA2)")
 }
 
 // Background steps shared with other features

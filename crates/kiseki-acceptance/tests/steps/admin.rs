@@ -85,7 +85,9 @@ async fn given_cluster_pools(w: &mut KisekiWorld, pool_a: String, pool_b: String
 }
 
 #[given("a cluster admin authenticated with admin mTLS certificate")]
-async fn given_admin_mtls(w: &mut KisekiWorld) {}
+async fn given_admin_mtls(w: &mut KisekiWorld) {
+    todo!("verify mTLS certificate via real TLS handshake")
+}
 
 // === Pool management ===
 
@@ -148,7 +150,7 @@ async fn then_capacity_sum(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^the pool health is "([^"]*)"$"#)]
 async fn then_pool_health_is(w: &mut KisekiWorld, expected: String) {
-    assert_eq!(expected, "Healthy");
+    todo!("query actual pool health from ChunkStore and compare to {expected}")
 }
 
 #[given(regex = r#"^pool "([^"]*)" has stored chunks$"#)]
@@ -161,31 +163,22 @@ async fn given_pool_has_chunks(w: &mut KisekiWorld, pool: String) {
     regex = r#"^the admin attempts to change durability from EC (\d+)\+(\d+) to EC (\d+)\+(\d+)$"#
 )]
 async fn when_change_durability(w: &mut KisekiWorld, _d1: u8, _p1: u8, _d2: u8, _p2: u8) {
-    w.last_error = Some("pool has existing data".into());
+    todo!("attempt real durability change via StorageAdminService and capture rejection")
 }
 
 #[then(regex = r#"^the operation is rejected with "pool has existing data"$"#)]
 async fn then_rejected_existing_data(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some());
+    todo!("verify rejection error contains 'pool has existing data'")
 }
 
 #[then("a note suggests creating a new pool and migrating")]
 async fn then_migration_note(w: &mut KisekiWorld) {
-    // Rejection message includes migration suggestion.
-    assert!(w.last_error.is_some());
+    todo!("verify rejection message includes migration suggestion")
 }
 
 #[when(regex = r#"^the admin sets pool "([^"]*)" warning threshold to (\d+)%$"#)]
 async fn when_set_threshold(w: &mut KisekiWorld, pool: String, pct: u8) {
-    // Use ChunkStore pool_mut to set the warning threshold via CapacityThresholds.
-    // We store the custom threshold on the world for later verification.
-    if let Some(p) = w.chunk_store.pool_mut(&pool) {
-        // Simulate setting a custom warning threshold by adjusting used_bytes
-        // to test threshold behavior. Store the custom pct for then-step.
-        // The real mechanism: CapacityThresholds with custom warning_pct.
-        let _ = pct; // threshold stored implicitly via CapacityThresholds
-    }
-    w.last_error = None;
+    todo!("set custom CapacityThresholds on pool via StorageAdminService")
 }
 
 #[then(regex = r"^subsequent writes trigger Warning at (\d+)% instead of default (\d+)%$")]
@@ -261,23 +254,18 @@ async fn then_compaction_rejected(w: &mut KisekiWorld) {
 
 #[when(regex = r#"^the admin sets pool "([^"]*)" target_fill_pct to (\d+)$"#)]
 async fn when_set_fill_target(w: &mut KisekiWorld, pool: String, pct: u64) {
-    // Verify the pool exists, then record the target fill percentage.
-    assert!(
-        w.chunk_store.pool(&pool).is_some(),
-        "pool {pool} must exist to set target fill"
-    );
-    w.last_error = None;
+    todo!("set target_fill_pct on pool via StorageAdminService")
 }
 
 #[then(regex = r"^the rebalance engine targets (\d+)% fill on each device$")]
 async fn then_fill_target(w: &mut KisekiWorld, pct: u64) {
-    // Verify that the target is within valid range (1-100) and was accepted.
-    assert!(pct > 0 && pct <= 100, "target fill must be 1-100%");
-    assert!(w.last_error.is_none());
+    todo!("verify rebalance engine picked up the target_fill_pct setting")
 }
 
 #[when(regex = r"^the admin sets inline_threshold_bytes to (\d+)$")]
-async fn when_set_inline(w: &mut KisekiWorld, _bytes: u64) {}
+async fn when_set_inline(w: &mut KisekiWorld, _bytes: u64) {
+    todo!("set inline_threshold_bytes via StorageAdminService")
+}
 
 #[then(regex = r"^new writes under (\d+)KB are inlined in delta payloads$")]
 async fn then_inline_new(w: &mut KisekiWorld, kb: u64) {
@@ -304,7 +292,9 @@ async fn then_inline_prospective(w: &mut KisekiWorld) {
 }
 
 #[given(regex = r"^cluster-wide gc_interval_s is (\d+)$")]
-async fn given_gc_interval(w: &mut KisekiWorld, _sec: u64) {}
+async fn given_gc_interval(w: &mut KisekiWorld, _sec: u64) {
+    todo!("configure cluster-wide gc_interval_s")
+}
 
 #[when(regex = r#"^the admin sets pool "([^"]*)" gc_interval_s to (\d+)$"#)]
 async fn when_set_gc_interval(w: &mut KisekiWorld, pool: String, sec: u64) {
@@ -338,25 +328,13 @@ async fn then_gc_default(w: &mut KisekiWorld, pool: String, sec: u64) {
 // === Observability ===
 
 #[when("the admin requests ClusterStatus")]
-async fn when_cluster_status(w: &mut KisekiWorld) {}
+async fn when_cluster_status(w: &mut KisekiWorld) {
+    todo!("call ClusterStatus RPC via StorageAdminService")
+}
 
 #[then("the response includes:")]
 async fn then_response_includes_table(w: &mut KisekiWorld) {
-    // ClusterStatus should include pools and device information.
-    // Verify pools exist and are queryable via StorageAdminService.
-    let pools = w.control_admin.list_pools();
-    assert!(
-        !pools.is_empty(),
-        "ClusterStatus must include at least one pool"
-    );
-    // Verify each pool has the required fields.
-    for pool in &pools {
-        assert!(!pool.name.is_empty(), "pool must have a name");
-        assert!(
-            pool.total_capacity_bytes > 0 || pool.device_count >= 0,
-            "pool must have capacity info"
-        );
-    }
+    todo!("verify ClusterStatus response includes the expected table fields")
 }
 
 #[when(regex = r#"^the admin requests PoolStatus for "([^"]*)"$"#)]
@@ -368,30 +346,28 @@ async fn when_pool_status(w: &mut KisekiWorld, pool: String) {
 
 #[then(regex = r"^the response includes read_iops, write_iops, avg_read_latency_ms$")]
 async fn then_pool_metrics(w: &mut KisekiWorld) {
-    // Verify pool status fields exist. StoragePool has capacity fields;
-    // metrics are derived from device activity. Verify pool is queryable.
-    let pools = w.control_admin.list_pools();
-    assert!(!pools.is_empty(), "must have pools to report metrics");
-    let pool = &pools[0];
-    // Verify structural fields that would carry metrics.
-    assert!(pool.device_count > 0 || pool.total_capacity_bytes >= 0);
+    todo!("verify PoolStatus response includes read_iops, write_iops, avg_read_latency_ms fields")
 }
 
 #[then("the metrics reflect the last 60-second window")]
 async fn then_60s_window(w: &mut KisekiWorld) {
-    // Metrics windowing is a runtime concern. Verify pools are live and queryable.
-    let pools = w.control_admin.list_pools();
-    assert!(!pools.is_empty());
+    todo!("verify metrics window is 60 seconds via PoolStatus response metadata")
 }
 
 #[when("the admin subscribes to DeviceHealth events")]
-async fn when_subscribe_device_health(w: &mut KisekiWorld) {}
+async fn when_subscribe_device_health(w: &mut KisekiWorld) {
+    todo!("subscribe to DeviceHealth event stream via StorageAdminService")
+}
 
 #[given(regex = r"^a device transitions from Healthy to Degraded$")]
-async fn given_device_transition(w: &mut KisekiWorld) {}
+async fn given_device_transition(w: &mut KisekiWorld) {
+    todo!("trigger real device Healthy->Degraded transition")
+}
 
 #[when(regex = r"^a device transitions from Healthy to Degraded$")]
-async fn when_device_transition(w: &mut KisekiWorld) {}
+async fn when_device_transition(w: &mut KisekiWorld) {
+    todo!("trigger real device Healthy->Degraded transition")
+}
 
 #[then(regex = r"^the admin receives a DeviceHealthEvent with old_state and new_state$")]
 async fn then_health_event(w: &mut KisekiWorld) {
@@ -441,31 +417,24 @@ async fn when_subscribe_io_stats(w: &mut KisekiWorld, pool: String) {
 
 #[then("the admin receives periodic IOStatsEvent messages")]
 async fn then_io_events(w: &mut KisekiWorld) {
-    // Verify that pool status data is available to generate events from.
-    let pools = w.control_admin.list_pools();
-    assert!(!pools.is_empty(), "pools must exist to generate IO events");
+    todo!("verify periodic IOStatsEvent messages arrive on subscription stream")
 }
 
 #[then("each event contains read/write IOPS and throughput")]
 async fn then_iops_throughput(w: &mut KisekiWorld) {
-    // Verify StoragePool has the fields needed for IOPS reporting.
-    let pools = w.control_admin.list_pools();
-    for pool in &pools {
-        // StoragePool carries used_bytes and total_capacity_bytes for throughput.
-        assert!(pool.total_capacity_bytes >= pool.used_bytes);
-    }
+    todo!("verify IOStatsEvent contains read_iops, write_iops, and throughput fields")
 }
 
 // === Shard management ===
 
 #[when("the admin requests ListShards")]
-async fn when_list_shards(w: &mut KisekiWorld) {}
+async fn when_list_shards(w: &mut KisekiWorld) {
+    todo!("call ListShards RPC via StorageAdminService")
+}
 
 #[then("the response includes shard IDs, tenant IDs, and tip sequence numbers")]
 async fn then_shard_list(w: &mut KisekiWorld) {
-    // Verify the shard store is queryable (may be empty in test harness).
-    // Real ListShards returns all shards — here we verify the API doesn't error.
-    assert!(w.last_error.is_none(), "ListShards should not error");
+    todo!("verify ListShards response includes shard IDs, tenant IDs, and tip sequence numbers")
 }
 
 #[given(regex = r#"^shard "([^"]*)" has (\S+) deltas \(ceiling is (\S+)\)$"#)]
@@ -584,42 +553,48 @@ async fn then_scrub_result(w: &mut KisekiWorld) {
 // === Authorization boundary ===
 
 #[given("a tenant admin authenticated with tenant certificate")]
-async fn given_tenant_auth(w: &mut KisekiWorld) {}
+async fn given_tenant_auth(w: &mut KisekiWorld) {
+    todo!("authenticate as tenant admin with tenant certificate")
+}
 
 #[when("they attempt to call ListPools")]
 async fn when_tenant_list_pools(w: &mut KisekiWorld) {
-    w.last_error = Some("PERMISSION_DENIED".into());
+    todo!("trigger real auth rejection via StorageAdminService")
 }
 
 #[then("the request is rejected with PERMISSION_DENIED")]
 async fn then_permission_denied(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some());
+    todo!("verify PERMISSION_DENIED error from StorageAdminService")
 }
 
 #[then("no pool information is returned")]
 async fn then_no_pool_info(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some(), "should be denied — no pool info");
+    todo!("verify response body contains no pool data")
 }
 
 #[given("a cluster admin")]
-async fn given_cluster_admin_simple(w: &mut KisekiWorld) {}
+async fn given_cluster_admin_simple(w: &mut KisekiWorld) {
+    todo!("authenticate as cluster admin")
+}
 
 #[when("they attempt to change tenant quota via StorageAdminService")]
 async fn when_change_quota_via_admin(w: &mut KisekiWorld) {
-    w.last_error = Some("tenant quota is via ControlService only".into());
+    todo!("trigger real auth rejection via StorageAdminService")
 }
 
 #[then("the operation is rejected (tenant quota is via ControlService only)")]
 async fn then_control_service_only(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some());
+    todo!("verify rejection with 'tenant quota is via ControlService only' error")
 }
 
 #[when(regex = r"^the admin changes compaction_rate_mb_s from (\d+) to (\d+)$")]
-async fn when_change_compaction(w: &mut KisekiWorld, _old: u64, _new: u64) {}
+async fn when_change_compaction(w: &mut KisekiWorld, _old: u64, _new: u64) {
+    todo!("change compaction_rate_mb_s via StorageAdminService and capture audit event")
+}
 
 #[then("the audit log records:")]
 async fn then_audit_records(w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+    todo!("wire audit event and verify")
 }
 
 // === Operational safety ===
@@ -643,44 +618,38 @@ async fn given_rebalance(w: &mut KisekiWorld, pool: String) {
 }
 
 #[when("the admin cancels the rebalance")]
-async fn when_cancel_rebalance(w: &mut KisekiWorld) {}
+async fn when_cancel_rebalance(w: &mut KisekiWorld) {
+    todo!("call CancelRebalance via StorageAdminService")
+}
 
 #[then("the rebalance stops gracefully")]
 async fn then_rebalance_stops(w: &mut KisekiWorld) {
-    // Rebalance cancellation — pool should still be queryable.
-    assert!(w.chunk_store.pool("fast-nvme").is_some());
+    todo!("verify rebalance operation stopped gracefully")
 }
 
 #[then("partially moved chunks remain consistent")]
 async fn then_consistent_chunks(w: &mut KisekiWorld) {
-    // No data corruption after cancellation.
-    assert!(w.chunk_store.pool("fast-nvme").is_some());
+    todo!("verify chunk integrity after partial rebalance cancellation")
 }
 
 #[then("the pool is left in a valid state")]
 async fn then_valid_state(w: &mut KisekiWorld) {
-    let pool = w.chunk_store.pool("fast-nvme").unwrap();
-    assert!(pool.capacity_bytes > 0);
+    todo!("verify pool consistency invariants after rebalance cancellation")
 }
 
 #[when("the admin requests per-tenant usage summary")]
-async fn when_usage_summary(w: &mut KisekiWorld) {}
+async fn when_usage_summary(w: &mut KisekiWorld) {
+    todo!("call GetPerTenantUsageSummary via StorageAdminService")
+}
 
 #[then("the response shows capacity used per tenant")]
 async fn then_capacity_per_tenant(w: &mut KisekiWorld) {
-    // Verify pools carry usage data (used_bytes) via StorageAdminService.
-    let pools = w.control_admin.list_pools();
-    for pool in &pools {
-        // Each pool has used_bytes — per-tenant attribution is the sum across pools.
-        assert!(pool.total_capacity_bytes >= pool.used_bytes);
-    }
+    todo!("verify per-tenant usage summary response contains per-tenant capacity_used_bytes")
 }
 
 #[then("IOPS attribution per tenant (last 24h)")]
 async fn then_iops_per_tenant(w: &mut KisekiWorld) {
-    // IOPS attribution requires runtime metrics. Verify pool structure exists.
-    let pools = w.control_admin.list_pools();
-    assert!(!pools.is_empty(), "pools must exist for IOPS attribution");
+    todo!("verify per-tenant IOPS attribution in usage summary response")
 }
 
 #[then("no tenant can see other tenants' usage")]
@@ -710,18 +679,13 @@ async fn given_tenant_admin_for(w: &mut KisekiWorld, org: String) {
 }
 
 #[when("they request GetTenantUsage")]
-async fn when_tenant_usage(w: &mut KisekiWorld) {}
+async fn when_tenant_usage(w: &mut KisekiWorld) {
+    todo!("call GetTenantUsage RPC via StorageAdminService")
+}
 
 #[then("the response includes capacity_used_bytes and iops_last_24h")]
 async fn then_tenant_usage_fields(w: &mut KisekiWorld) {
-    // Verify StoragePool has the fields needed: used_bytes (capacity_used_bytes)
-    // and device_count (for IOPS derivation).
-    let pools = w.control_admin.list_pools();
-    for pool in &pools {
-        // used_bytes maps to capacity_used_bytes in the response.
-        let _ = pool.used_bytes;
-        let _ = pool.device_count;
-    }
+    todo!("verify GetTenantUsage response includes capacity_used_bytes and iops_last_24h")
 }
 
 #[then(regex = r#"^only "([^"]*)" data is shown$"#)]
@@ -749,22 +713,12 @@ async fn then_only_org_data(w: &mut KisekiWorld, org: String) {
 
 #[then("the response includes aggregate metrics only")]
 async fn then_aggregate_only(w: &mut KisekiWorld) {
-    // Cluster admin sees aggregate — verify pools list returns combined data.
-    let pools = w.control_admin.list_pools();
-    assert!(!pools.is_empty(), "aggregate metrics require pools");
-    // Aggregate = sum of all pools, not per-tenant breakdown.
-    let total_capacity: u64 = pools.iter().map(|p| p.total_capacity_bytes).sum();
-    assert!(total_capacity >= 0);
+    todo!("verify cluster admin response contains only aggregate metrics, no per-tenant breakdown")
 }
 
 #[then("no per-tenant breakdown is included")]
 async fn then_no_breakdown(w: &mut KisekiWorld) {
-    // StoragePool does not have a tenant field — it's aggregate by design.
-    let pools = w.control_admin.list_pools();
-    for pool in &pools {
-        // Pool is identified by name, not by tenant — confirming no breakdown.
-        assert!(!pool.name.is_empty());
-    }
+    todo!("verify response schema has no per-tenant breakdown fields")
 }
 
 #[when(regex = r#"^the admin subscribes to DeviceIOStats for device "([^"]*)"$"#)]
@@ -855,7 +809,9 @@ async fn given_skew(w: &mut KisekiWorld, d1: String, iops1: u64, d2: String, iop
 }
 
 #[when("the admin views DeviceIOStats for both")]
-async fn when_view_both_stats(w: &mut KisekiWorld) {}
+async fn when_view_both_stats(w: &mut KisekiWorld) {
+    todo!("query DeviceIOStats for both devices and store responses")
+}
 
 #[then("the 10x skew is visible in the metrics")]
 async fn then_skew_visible(w: &mut KisekiWorld) {
@@ -893,13 +849,7 @@ async fn then_shard_health_fields(w: &mut KisekiWorld) {
 
 #[then("commit_lag_entries is reported")]
 async fn then_commit_lag(w: &mut KisekiWorld) {
-    // Commit lag = tip sequence - consumer watermark. Verify tip is queryable.
-    for &shard_id in w.shard_names.values() {
-        let info = w.log_store.shard_health(shard_id).await.unwrap();
-        // tip.0 represents committed entries; lag is derived from this.
-        let _ = info.tip;
-        break;
-    }
+    todo!("verify GetShardHealth response includes commit_lag_entries field")
 }
 
 #[given(regex = r#"^shard "([^"]*)" has (\d+) replicas but only (\d+) are reachable$"#)]
@@ -932,7 +882,7 @@ async fn then_reachable_count(w: &mut KisekiWorld, reachable: u8, total: u8) {
 
 #[then("the admin is alerted to investigate")]
 async fn then_alert_investigate(w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+    todo!("wire audit event and verify")
 }
 
 #[given(regex = r#"^pool "([^"]*)" has existing chunks with EC (\d+)\+(\d+)$"#)]
@@ -942,7 +892,9 @@ async fn given_existing_ec(w: &mut KisekiWorld, pool: String, _d: u8, _p: u8) {
 }
 
 #[when(regex = r#"^the admin attempts SetPoolDurability to EC (\d+)\+(\d+)$"#)]
-async fn when_set_durability(w: &mut KisekiWorld, _d: u8, _p: u8) {}
+async fn when_set_durability(w: &mut KisekiWorld, _d: u8, _p: u8) {
+    todo!("call SetPoolDurability RPC via StorageAdminService")
+}
 
 #[then("the operation applies to new chunks only")]
 async fn then_new_chunks_only(w: &mut KisekiWorld) {
@@ -975,7 +927,9 @@ async fn given_pool_ec_chunks(w: &mut KisekiWorld, pool: String, _d: u8, _p: u8)
 }
 
 #[when(regex = r#"^the admin triggers ReencodePool to EC (\d+)\+(\d+)$"#)]
-async fn when_reencode(w: &mut KisekiWorld, _d: u8, _p: u8) {}
+async fn when_reencode(w: &mut KisekiWorld, _d: u8, _p: u8) {
+    todo!("call ReencodePool RPC via StorageAdminService")
+}
 
 #[then("a long-running operation begins")]
 async fn then_long_running(w: &mut KisekiWorld) {
@@ -1018,11 +972,13 @@ async fn then_min_rejected(w: &mut KisekiWorld) {
 }
 
 #[when(regex = r"^the admin sets compaction_rate_mb_s from (\d+) to (\d+)$")]
-async fn when_set_compaction_audited(w: &mut KisekiWorld, _old: u64, _new: u64) {}
+async fn when_set_compaction_audited(w: &mut KisekiWorld, _old: u64, _new: u64) {
+    todo!("change compaction_rate_mb_s via StorageAdminService with audit trail")
+}
 
 #[then("the cluster audit shard contains a TuningParameterChanged event")]
 async fn then_tuning_event(w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+    todo!("wire audit event and verify")
 }
 
 #[then("the event includes old_value=100, new_value=200, admin_id")]
@@ -1043,10 +999,14 @@ async fn then_tuning_values(w: &mut KisekiWorld) {
 }
 
 #[given("deltas were written with inline_threshold=4096")]
-async fn given_inline_4096(w: &mut KisekiWorld) {}
+async fn given_inline_4096(w: &mut KisekiWorld) {
+    todo!("write deltas with inline_threshold=4096 and verify they are stored")
+}
 
 #[when("the admin changes inline_threshold to 65536")]
-async fn when_change_inline(w: &mut KisekiWorld) {}
+async fn when_change_inline(w: &mut KisekiWorld) {
+    todo!("change inline_threshold to 65536 via StorageAdminService")
+}
 
 #[then("existing deltas still have 4KB inline payloads")]
 async fn then_existing_inline(w: &mut KisekiWorld) {
@@ -1115,13 +1075,12 @@ async fn given_dev_has_chunks(w: &mut KisekiWorld, dev: String) {
 
 #[when(regex = r#"^the admin calls RemoveDevice for "([^"]*)"$"#)]
 async fn when_remove_device(w: &mut KisekiWorld, dev: String) {
-    // Check if device was evacuated.
-    w.last_error = Some("DEVICE_NOT_EVACUATED".into());
+    todo!("trigger real auth rejection via StorageAdminService")
 }
 
 #[then("the operation fails with DEVICE_NOT_EVACUATED")]
 async fn then_not_evacuated(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some());
+    todo!("verify DEVICE_NOT_EVACUATED error from RemoveDevice RPC")
 }
 
 #[given(regex = r#"^device "([^"]*)" was evacuated \(state = Removed\)$"#)]
@@ -1190,56 +1149,48 @@ async fn given_pool_tenant_data(w: &mut KisekiWorld, pool: String, tenant: Strin
 }
 
 #[when("the cluster admin changes pool durability")]
-async fn when_cluster_changes_durability(w: &mut KisekiWorld) {}
+async fn when_cluster_changes_durability(w: &mut KisekiWorld) {
+    todo!("change pool durability via StorageAdminService as cluster admin")
+}
 
 #[then(regex = r#"^"([^"]*)" tenant audit shard contains a PoolModified event$"#)]
 async fn then_pool_modified_event(w: &mut KisekiWorld, tenant: String) {
-    // Verify tenant exists — audit event would be written to their shard.
-    assert!(
-        w.tenant_ids.contains_key(&tenant),
-        "tenant {tenant} must exist for audit"
-    );
+    todo!("verify PoolModified audit event in tenant audit shard")
 }
 
 #[then("the event includes pool_id, change_type, admin_id")]
 async fn then_event_fields(w: &mut KisekiWorld) {
-    // Verify the pool is queryable (pool_id exists), which is the structural
-    // prerequisite for audit events.
-    let pools = w.control_admin.list_pools();
-    assert!(
-        !pools.is_empty(),
-        "pool_id must be available for audit event"
-    );
+    todo!("verify audit event includes pool_id, change_type, admin_id fields")
 }
 
 #[when(regex = r"^the admin changes gc_interval_s from (\d+) to (\d+)$")]
-async fn when_change_gc(w: &mut KisekiWorld, _old: u64, _new: u64) {}
+async fn when_change_gc(w: &mut KisekiWorld, _old: u64, _new: u64) {
+    todo!("change gc_interval_s via StorageAdminService with audit trail")
+}
 
 #[then("the cluster audit shard contains:")]
 async fn then_cluster_audit_contains(w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+    todo!("wire audit event and verify")
 }
 
 #[given(regex = r"^(\d+),?000 events are generated before the client reads$")]
-async fn given_many_events(w: &mut KisekiWorld, _k: u64) {}
+async fn given_many_events(w: &mut KisekiWorld, _k: u64) {
+    todo!("generate N thousand events into event buffer")
+}
 
 #[when(regex = r"^(\d+),?000 events are generated before the client reads$")]
-async fn when_many_events(w: &mut KisekiWorld, _k: u64) {}
+async fn when_many_events(w: &mut KisekiWorld, _k: u64) {
+    todo!("generate N thousand events into event buffer before client reads")
+}
 
 #[then(regex = r"^the oldest events are dropped \(buffer capped at (\d+),?000\)$")]
 async fn then_events_dropped(w: &mut KisekiWorld, cap_k: u64) {
-    // Buffer cap is a configuration concern. Verify the cap value is reasonable.
-    let cap = cap_k * 1000;
-    assert!(cap > 0, "event buffer cap must be positive");
-    assert!(cap <= 100_000, "event buffer cap should be bounded");
+    todo!("verify oldest events were dropped and buffer is capped at {cap_k}k")
 }
 
 #[then("a StreamOverflowWarning is sent to the client")]
 async fn then_overflow_warning(w: &mut KisekiWorld) {
-    // Verify that overflow detection is structurally possible:
-    // when events > cap, the oldest are dropped and a warning is generated.
-    // This is a protocol concern; verify no error state.
-    assert!(w.last_error.is_none() || w.last_error.is_some());
+    todo!("verify StreamOverflowWarning is sent to the client on buffer overflow")
 }
 
 #[given(regex = r#"^a rebalance is in progress on pool "([^"]*)" at (\d+)%$"#)]
@@ -1261,7 +1212,9 @@ async fn given_rebalance_progress(w: &mut KisekiWorld, pool: String, pct: u8) {
 }
 
 #[when("the admin calls CancelRebalance")]
-async fn when_cancel_rebalance_call(w: &mut KisekiWorld) {}
+async fn when_cancel_rebalance_call(w: &mut KisekiWorld) {
+    todo!("call CancelRebalance RPC via StorageAdminService")
+}
 
 #[then("the rebalance stops")]
 async fn then_rebalance_stopped(w: &mut KisekiWorld) {
@@ -1301,10 +1254,14 @@ async fn then_pool_consistent(w: &mut KisekiWorld) {
 }
 
 #[given("a rebalance is in progress")]
-async fn given_rebalance_active(w: &mut KisekiWorld) {}
+async fn given_rebalance_active(w: &mut KisekiWorld) {
+    todo!("start a real rebalance operation on a pool")
+}
 
 #[when("the admin calls GetRebalanceProgress")]
-async fn when_get_progress(w: &mut KisekiWorld) {}
+async fn when_get_progress(w: &mut KisekiWorld) {
+    todo!("call GetRebalanceProgress RPC via StorageAdminService")
+}
 
 #[then("the response includes progress_percent, chunks_moved, estimated_time")]
 async fn then_progress_fields(w: &mut KisekiWorld) {
@@ -1335,39 +1292,40 @@ async fn given_shard_splitting(w: &mut KisekiWorld, shard: String) {
 
 #[when(regex = r#"^the admin calls SplitShard for "([^"]*)"$"#)]
 async fn when_split_shard_again(w: &mut KisekiWorld, _shard: String) {
-    w.last_error = Some("SPLIT_IN_PROGRESS".into());
+    todo!("trigger real auth rejection via StorageAdminService")
 }
 
 #[then("the operation fails with SPLIT_IN_PROGRESS")]
 async fn then_split_in_progress(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some());
+    todo!("verify SPLIT_IN_PROGRESS error from SplitShard RPC")
 }
 
 // === SRE roles ===
 
 #[given("an SRE authenticated with sre-on-call certificate")]
-async fn given_sre_oncall(w: &mut KisekiWorld) {}
+async fn given_sre_oncall(w: &mut KisekiWorld) {
+    todo!("authenticate as SRE with sre-on-call certificate")
+}
 
 #[when("they request ClusterStatus")]
-async fn when_sre_cluster_status(w: &mut KisekiWorld) {}
+async fn when_sre_cluster_status(w: &mut KisekiWorld) {
+    todo!("call ClusterStatus RPC as SRE role")
+}
 
 #[then("the response is returned successfully")]
 async fn then_sre_response_ok(w: &mut KisekiWorld) {
-    // SRE with on-call role can view cluster status (read-only).
-    // Verify list_pools works (read operation, no role restriction on reads).
-    let pools = w.control_admin.list_pools();
-    // Cluster should have pools from background setup.
-    // SRE can read — verify no error.
-    assert!(pools.len() >= 0);
+    todo!("verify SRE on-call role receives successful ClusterStatus response")
 }
 
 #[when("they attempt SetPoolThresholds")]
 async fn when_sre_set_thresholds(w: &mut KisekiWorld) {
-    w.last_error = Some("PERMISSION_DENIED".into());
+    todo!("trigger real auth rejection via StorageAdminService")
 }
 
 #[given("an SRE authenticated with sre-incident-response certificate")]
-async fn given_sre_incident(w: &mut KisekiWorld) {}
+async fn given_sre_incident(w: &mut KisekiWorld) {
+    todo!("authenticate as SRE with sre-incident-response certificate")
+}
 
 #[when(regex = r#"^they call TriggerScrub on pool "([^"]*)"$"#)]
 async fn when_sre_scrub(w: &mut KisekiWorld, pool: String) {
@@ -1432,27 +1390,18 @@ async fn given_multi_tenant_pool(w: &mut KisekiWorld, pool: String) {
 }
 
 #[when("the cluster admin views PoolStatus")]
-async fn when_admin_pool_status(w: &mut KisekiWorld) {}
+async fn when_admin_pool_status(w: &mut KisekiWorld) {
+    todo!("call PoolStatus RPC as cluster admin")
+}
 
 #[then("read_iops is a combined aggregate")]
 async fn then_combined_iops(w: &mut KisekiWorld) {
-    // Pool metrics are aggregate — no per-tenant IOPS breakdown at pool level.
-    let pools = w.control_admin.list_pools();
-    assert!(!pools.is_empty(), "pools must exist for aggregate IOPS");
-    // StoragePool.used_bytes is aggregate across all tenants.
-    for pool in &pools {
-        assert!(pool.total_capacity_bytes >= pool.used_bytes);
-    }
+    todo!("verify read_iops in PoolStatus is a combined aggregate across tenants")
 }
 
 #[then("there is no way to attribute IOPS to tenant A vs B")]
 async fn then_no_attribution(w: &mut KisekiWorld) {
-    // StoragePool has no tenant_id field — confirming pool-level stats are aggregate.
-    let pools = w.control_admin.list_pools();
-    for pool in &pools {
-        // Pool identified by name only, no tenant field.
-        assert!(!pool.name.is_empty());
-    }
+    todo!("verify PoolStatus response has no per-tenant IOPS attribution")
 }
 
 // === DrainNode ===
@@ -1525,16 +1474,7 @@ async fn then_parallel_evac(w: &mut KisekiWorld, count: u64) {
 
 #[then("progress is reported per device")]
 async fn then_per_device_progress(w: &mut KisekiWorld) {
-    // Each device can be independently queried for status.
-    // Verify devices are individually queryable.
-    for pool_name in ["fast-nvme", "bulk-nvme", "drain-pool"] {
-        let devices = w.control_admin.list_devices(pool_name);
-        for dev in &devices {
-            // Each device has its own status — progress is per-device.
-            let _ = dev.status;
-            let _ = dev.used_bytes;
-        }
-    }
+    todo!("verify DrainNode progress is reported per device with bytes_remaining")
 }
 
 #[then(regex = r#"^when complete, all devices are in state "Removed"$"#)]

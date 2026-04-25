@@ -10,7 +10,9 @@ use kiseki_log::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 // === Background ===
 
 #[given("a Kiseki cluster with 5 storage nodes")]
-async fn given_cluster(_w: &mut KisekiWorld) {}
+async fn given_cluster(_w: &mut KisekiWorld) {
+    todo!("provision a 5-node Kiseki cluster")
+}
 
 #[given(regex = r#"^a shard "(\S+)" with a 3-member Raft group on nodes 1, 2, 3$"#)]
 async fn given_shard_raft(w: &mut KisekiWorld, name: String) {
@@ -31,8 +33,7 @@ async fn given_tenant(w: &mut KisekiWorld, t: String) {
 
 #[then(regex = r#"^the delta is replicated to at least \d+ of \d+ Raft members$"#)]
 async fn then_replicated(_w: &mut KisekiWorld) {
-    // In-memory single-node store always "replicates" — Raft integration tested in
-    // kiseki-keymanager openraft_integration.rs. Accept as no-op.
+    todo!("verify delta is replicated to Raft majority")
 }
 
 #[then(regex = r#"^a DeltaCommitted event is emitted with sequence_number \d+$"#)]
@@ -44,7 +45,7 @@ async fn then_event_emitted(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^the (?:inline data|shard inline) threshold is (\d+) bytes"#)]
 async fn given_inline_threshold(_w: &mut KisekiWorld, _bytes: u64) {
-    // Threshold is a config constant — accepted as precondition.
+    todo!("configure the shard inline threshold")
 }
 
 #[then("the delta is committed with inline data in the payload")]
@@ -54,12 +55,12 @@ async fn then_inline_committed(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^the payload is offloaded to small/objects.redb on apply"#)]
 async fn then_payload_offloaded(_w: &mut KisekiWorld) {
-    // Inline payload is offloaded to small/objects.redb on state machine apply (I-SF5).
+    todo!("verify payload is offloaded to small/objects.redb on apply")
 }
 
 #[then("no separate chunk write is required")]
 async fn then_no_chunk_write(_w: &mut KisekiWorld) {
-    // Inline data skips chunk storage — verified by architecture.
+    todo!("verify no separate chunk write occurred for inline data")
 }
 
 // === Scenario 1: Successful delta append ===
@@ -120,8 +121,8 @@ async fn when_two(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^they are assigned sequence_numbers \d+ and \d+$"#)]
-async fn then_two_seq(w: &mut KisekiWorld) {
-    assert!(w.last_sequence.is_some());
+async fn then_two_seq(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 #[then(regex = r#"^the total order is \[[\d, ]+\]$"#)]
@@ -177,61 +178,34 @@ async fn then_no_gaps(w: &mut KisekiWorld) {
 
 #[when("node 1 becomes unreachable")]
 async fn when_node_unreachable(_w: &mut KisekiWorld) {
-    // Raft leader loss is modelled at the cluster level, not in-memory store.
-    // Accept as precondition — the Then steps verify recovery behavior.
+    todo!("trigger real Raft election")
 }
 
 #[then("a new leader is elected from nodes 2 and 3")]
-async fn then_new_leader(w: &mut KisekiWorld) {
-    // In the in-memory store, the shard remains healthy after simulated leader loss.
-    // The MemShardStore doesn't model multi-node election, but the shard should
-    // still be accessible (verifies data survives leader transitions).
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    assert!(
-        w.log_store.shard_health(sid).await.is_ok(),
-        "shard should survive leader loss"
-    );
+async fn then_new_leader(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft election")
 }
 
 #[then("writes resume after election completes")]
-async fn then_writes_resume(w: &mut KisekiWorld) {
-    // After election, writes should succeed. Verify via append.
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let req = w.make_append_request(sid, 0xAA);
-    assert!(
-        w.log_store.append_delta(req).await.is_ok(),
-        "writes should resume after election"
-    );
+async fn then_writes_resume(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft election")
 }
 
 #[then("in-flight uncommitted deltas are retried by the Composition context")]
-async fn then_retried(w: &mut KisekiWorld) {
-    // Retry logic: verify the shard accepts a delta after transient failure.
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let req = w.make_append_request(sid, 0xBB);
-    assert!(
-        w.log_store.append_delta(req).await.is_ok(),
-        "retried delta should succeed"
-    );
+async fn then_retried(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft election")
 }
 
 #[then("no committed deltas are lost")]
-async fn then_no_loss(w: &mut KisekiWorld) {
-    // The shard should still be queryable after leader loss.
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    assert!(
-        w.log_store.shard_health(sid).await.is_ok(),
-        "previously committed deltas should still be present"
-    );
+async fn then_no_loss(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft election")
 }
 
 // === Scenario 5: Write during election ===
 
 #[given(regex = r#"^a leader election is in progress for "(\S+)"$"#)]
-async fn given_election(w: &mut KisekiWorld, name: String) {
-    // Model election as maintenance mode (rejects writes) for in-memory test.
-    let sid = w.ensure_shard(&name);
-    w.log_store.set_maintenance(sid, true).await.unwrap();
+async fn given_election(_w: &mut KisekiWorld, _name: String) {
+    todo!("trigger real Raft election")
 }
 
 #[when("the Composition context appends a delta")]
@@ -248,87 +222,62 @@ async fn when_append_single(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^the append is rejected with a retriable "leader unavailable" error$"#)]
-async fn then_leader_unavailable(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some(), "expected rejection");
+async fn then_leader_unavailable(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft election")
 }
 
 #[then("the Composition context retries after backoff")]
-async fn then_backoff(w: &mut KisekiWorld) {
-    // The error should be present to trigger retry logic.
-    assert!(
-        w.last_error.is_some(),
-        "error must be present for retry/backoff behavior"
-    );
+async fn then_backoff(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft election")
 }
 
 // === Scenario 6: Quorum loss ===
 
 #[given(regex = r#"^nodes (\d+) and (\d+) become unreachable for "(\S+)"$"#)]
-async fn given_nodes_down(w: &mut KisekiWorld, _a: u64, _b: u64, name: String) {
-    let sid = w.ensure_shard(&name);
-    w.log_store.set_maintenance(sid, true).await.unwrap();
+async fn given_nodes_down(_w: &mut KisekiWorld, _a: u64, _b: u64, _name: String) {
+    todo!("trigger real Raft quorum loss")
 }
 
 #[given("only node 1 (leader) remains")]
-async fn given_one_node(_w: &mut KisekiWorld) {}
+async fn given_one_node(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft quorum loss")
+}
 
 #[then(regex = r#"^shard "(\S+)" cannot form a Raft majority$"#)]
-async fn then_no_majority(w: &mut KisekiWorld) {
-    // Simulated via maintenance mode — shard rejects writes.
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let info = w.log_store.shard_health(sid).await.unwrap();
-    assert_eq!(info.state, kiseki_log::shard::ShardState::Maintenance);
+async fn then_no_majority(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft quorum loss")
 }
 
 #[then(regex = r#"^all write commands are rejected with "quorum unavailable" error$"#)]
-async fn then_quorum_unavailable(w: &mut KisekiWorld) {
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let req = w.make_append_request(sid, 0x70);
-    assert!(w.log_store.append_delta(req).await.is_err());
+async fn then_quorum_unavailable(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft quorum loss")
 }
 
 #[then("read commands from existing replicas may continue if stale reads are permitted by the view descriptor")]
-async fn then_stale_reads(w: &mut KisekiWorld) {
-    // Reads still work even in maintenance mode
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    assert!(w
-        .log_store
-        .read_deltas(ReadDeltasRequest {
-            shard_id: sid,
-            from: SequenceNumber(1),
-            to: SequenceNumber(1),
-        })
-        .await
-        .is_ok());
+async fn then_stale_reads(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft quorum loss")
 }
 
 // === Scenario 7: Quorum recovery ===
 
 #[given(regex = r#"^shard "(\S+)" lost quorum with only node (\d+) available$"#)]
-async fn given_lost_quorum(w: &mut KisekiWorld, name: String, _node: u64) {
-    let sid = w.ensure_shard(&name);
-    w.log_store.set_maintenance(sid, true).await.unwrap();
+async fn given_lost_quorum(_w: &mut KisekiWorld, _name: String, _node: u64) {
+    todo!("trigger real Raft quorum loss")
 }
 
 #[when(regex = r#"^node (\d+) comes back online$"#)]
-async fn when_node_back(w: &mut KisekiWorld, _n: u64) {
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    w.log_store.set_maintenance(sid, false).await.unwrap();
+async fn when_node_back(_w: &mut KisekiWorld, _n: u64) {
+    todo!("trigger real Raft quorum loss")
 }
 
 #[then("quorum is restored (2 of 3)")]
-async fn then_quorum(w: &mut KisekiWorld) {
-    // Maintenance mode cleared means shard is writable again.
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let info = w.log_store.shard_health(sid).await.unwrap();
-    assert_eq!(info.state, kiseki_log::shard::ShardState::Healthy);
+async fn then_quorum(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft quorum loss")
 }
 
 #[then("a leader is elected (or confirmed)")]
-async fn then_leader_confirmed(w: &mut KisekiWorld) {
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let info = w.log_store.shard_health(sid).await.unwrap();
-    assert_eq!(info.state, kiseki_log::shard::ShardState::Healthy);
+async fn then_leader_confirmed(_w: &mut KisekiWorld) {
+    todo!("trigger real Raft election")
 }
 
 #[then("writes resume")]
@@ -374,11 +323,8 @@ async fn given_n_deltas(w: &mut KisekiWorld, name: String, count: u64) {
 }
 
 #[then("a SplitShard operation is triggered automatically")]
-async fn then_split_triggered(w: &mut KisekiWorld) {
-    // The shard has deltas → it should be splittable.
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let info = w.log_store.shard_health(sid).await.unwrap();
-    assert!(info.delta_count > 0, "shard should have deltas for split");
+async fn then_split_triggered(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 #[then(regex = r#"^a new shard "(\S+)" is created$"#)]
@@ -434,7 +380,7 @@ async fn then_serves_reads(w: &mut KisekiWorld, name: String) {
 
 #[then("a ShardSplit event is emitted")]
 async fn then_split_event(_w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+    todo!("wire audit event emission and verify event in audit log")
 }
 
 // === Scenario 9: Split doesn't block writes ===
@@ -483,7 +429,9 @@ async fn given_sstables(w: &mut KisekiWorld, name: String) {
 }
 
 #[given(regex = r#"^the compaction threshold is \d+ SSTables$"#)]
-async fn given_threshold(_w: &mut KisekiWorld) {}
+async fn given_threshold(_w: &mut KisekiWorld) {
+    todo!("configure the compaction threshold")
+}
 
 #[when("automatic compaction is triggered")]
 async fn when_compact(w: &mut KisekiWorld) {
@@ -699,14 +647,16 @@ async fn when_read_range(w: &mut KisekiWorld, from: u64, to: u64) {
 }
 
 #[then(regex = r#"^it receives deltas \[\d+, \d+, \.\.\., \d+\] in order$"#)]
-async fn then_ordered(w: &mut KisekiWorld) {
-    assert!(w.last_sequence.unwrap().0 > 0);
+async fn then_ordered(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 // === Scenario 21: Advisory disabled ===
 
 #[given("advisory is disabled cluster-wide")]
-async fn given_no_advisory(_w: &mut KisekiWorld) {}
+async fn given_no_advisory(_w: &mut KisekiWorld) {
+    todo!("disable advisory signals cluster-wide")
+}
 
 #[when("workloads append deltas, trigger shard splits, and run compaction")]
 async fn when_normal_ops(w: &mut KisekiWorld) {
@@ -751,14 +701,8 @@ async fn then_tombstones(w: &mut KisekiWorld) {
 }
 
 #[then("tenant-encrypted payloads are carried opaquely — never decrypted")]
-async fn then_opaque(w: &mut KisekiWorld) {
-    // Verify deltas are readable (compaction preserved them).
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    assert!(
-        health.delta_count > 0,
-        "compacted deltas should still be readable"
-    );
+async fn then_opaque(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 #[then("the resulting SSTable count is reduced")]
@@ -797,30 +741,18 @@ async fn then_same_semantics(w: &mut KisekiWorld) {
 
 #[then("the operation is recorded in the audit log")]
 async fn then_audit_logged(_w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+    todo!("wire audit event emission and verify event in audit log")
 }
 
 // Stalled consumer alert
 #[then("an alert is raised to the cluster admin (GC blocked)")]
-async fn then_alert_gc(w: &mut KisekiWorld) {
-    // GC boundary should equal the stalled consumer's watermark.
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    // Shard still has deltas (GC was blocked).
-    assert!(
-        health.delta_count > 0,
-        "GC should be blocked by stalled consumer"
-    );
+async fn then_alert_gc(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 #[then("an alert is raised to the tenant admin (view is stale)")]
-async fn then_alert_stale(w: &mut KisekiWorld) {
-    // Stale view alert: the stalled consumer's watermark blocks GC.
-    // Verify the consumer watermark is behind the shard tip.
-    let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    // Tip is ahead of GC boundary — view is stale.
-    assert!(health.delta_count > 0, "stalled consumer makes view stale");
+async fn then_alert_stale(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 // Maintenance events
@@ -898,7 +830,9 @@ async fn given_mid_split(w: &mut KisekiWorld, name: String, _new_shard: String) 
 }
 
 #[given(regex = r#"^the split boundary is at hashed_key 0x(\S+)$"#)]
-async fn given_split_boundary(_w: &mut KisekiWorld, _hex: String) {}
+async fn given_split_boundary(_w: &mut KisekiWorld, _hex: String) {
+    todo!("configure split boundary at the given hashed_key")
+}
 
 #[when(regex = r#"^a delta with hashed_key 0x(\S+) is appended$"#)]
 async fn when_append_at_key(w: &mut KisekiWorld, _hex: String) {
@@ -914,43 +848,23 @@ async fn when_append_at_key(w: &mut KisekiWorld, _hex: String) {
 }
 
 #[then(regex = r#"^the delta is buffered until "(\S+)" is accepting writes$"#)]
-async fn then_buffered(w: &mut KisekiWorld, _shard: String) {
-    // During split, deltas may be briefly buffered.
-    // In the in-memory store, the delta was accepted (no split blocking).
-    assert!(
-        w.last_sequence.is_some() || w.last_error.is_some(),
-        "delta should be buffered or committed"
-    );
+async fn then_buffered(_w: &mut KisekiWorld, _shard: String) {
+    todo!()
 }
 
 #[then("a brief write latency bump occurs")]
-async fn then_latency_bump(w: &mut KisekiWorld) {
-    // Latency bump during split: the delta was accepted.
-    // In BDD, we verify the delta eventually committed.
-    assert!(
-        w.last_sequence.is_some(),
-        "delta should commit despite latency bump"
-    );
+async fn then_latency_bump(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 #[then(regex = r#"^the delta is committed to "(\S+)" once ready$"#)]
-async fn then_committed_to(w: &mut KisekiWorld, _shard: String) {
-    // The delta was committed to the target shard.
-    assert!(w.last_sequence.is_some(), "delta should be committed");
-    assert!(w.last_error.is_none(), "no error during commit");
+async fn then_committed_to(_w: &mut KisekiWorld, _shard: String) {
+    todo!()
 }
 
 #[then("no delta is lost, duplicated, or misplaced")]
-async fn then_no_delta_lost(w: &mut KisekiWorld) {
-    assert!(
-        w.last_sequence.is_some(),
-        "delta should have been committed successfully"
-    );
-    assert!(
-        w.last_error.is_none(),
-        "no error should occur: {:?}",
-        w.last_error
-    );
+async fn then_no_delta_lost(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 // Concurrent split + compaction
@@ -960,7 +874,9 @@ async fn given_compacting(w: &mut KisekiWorld, name: String) {
 }
 
 #[given("a SplitShard is triggered during compaction")]
-async fn given_split_during_compact(_w: &mut KisekiWorld) {}
+async fn given_split_during_compact(_w: &mut KisekiWorld) {
+    todo!("trigger SplitShard during active compaction")
+}
 
 #[then("both operations proceed")]
 async fn then_both_proceed(w: &mut KisekiWorld) {
@@ -1000,7 +916,9 @@ async fn then_split_new_compact(w: &mut KisekiWorld) {
 
 // Advisory: phase marker
 #[given(regex = r#"^workload "(\S+)" advances its workflow to phase "(\S+)"$"#)]
-async fn given_wf_phase(_w: &mut KisekiWorld, _wl: String, _phase: String) {}
+async fn given_wf_phase(_w: &mut KisekiWorld, _wl: String, _phase: String) {
+    todo!("advance workload to the given workflow phase")
+}
 
 #[given(regex = r#"^compositions on "(\S+)" are written heavily during this phase$"#)]
 async fn given_heavy_writes(w: &mut KisekiWorld, shard: String) {
@@ -1012,7 +930,9 @@ async fn given_heavy_writes(w: &mut KisekiWorld, shard: String) {
 }
 
 #[when("the compaction pacer observes the phase-marker heuristic")]
-async fn when_pacer(_w: &mut KisekiWorld) {}
+async fn when_pacer(_w: &mut KisekiWorld) {
+    todo!("observe the compaction pacer phase-marker heuristic")
+}
 
 #[then(regex = r#"^it MAY defer aggressive compaction on "(\S+)" during the checkpoint burst$"#)]
 async fn then_defer_compact(w: &mut KisekiWorld, shard: String) {
@@ -1073,68 +993,46 @@ async fn given_shared_shard(w: &mut KisekiWorld, _wl: String, shard: String) {
 }
 
 #[when(regex = r#"^the caller subscribes to shard-saturation telemetry for "(\S+)"$"#)]
-async fn when_subscribe_telemetry(_w: &mut KisekiWorld, _shard: String) {}
+async fn when_subscribe_telemetry(_w: &mut KisekiWorld, _shard: String) {
+    todo!("subscribe to shard-saturation telemetry")
+}
 
 #[then(
     regex = r#"^the returned backpressure signal reflects only the caller's own append rate.*$"#
 )]
-async fn then_caller_scoped(w: &mut KisekiWorld) {
-    // Backpressure signal is caller-scoped (I-WA5).
-    // Verify the shard reports its own health independently.
-    let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    // Health info is per-shard, not cross-workload.
-    assert_eq!(health.state, ShardState::Healthy);
+async fn then_caller_scoped(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 #[then(regex = r#"^neighbour workloads' contribution is not inferable.*$"#)]
-async fn then_neighbour_hidden(w: &mut KisekiWorld) {
-    // Neighbour workloads' state is not visible through shard telemetry.
-    // The shard health only reports aggregate metrics, not per-workload breakdown.
-    let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    // Only aggregate delta_count is visible — no per-workload attribution.
-    assert_eq!(health.state, ShardState::Healthy);
+async fn then_neighbour_hidden(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 #[then(
     regex = r#"^requesting telemetry for a shard with no caller-owned compositions returns the same shape.*$"#
 )]
-async fn then_same_shape(w: &mut KisekiWorld) {
-    // Telemetry for a shard with no owned compositions returns the same shape.
-    // Create a new shard with no compositions and verify health shape is identical.
-    let empty_sid = w.ensure_shard("shard-empty-telemetry");
-    let health = w.log_store.shard_health(empty_sid).await.unwrap();
-    assert_eq!(health.state, ShardState::Healthy);
-    assert_eq!(health.delta_count, 0, "empty shard has same health shape");
+async fn then_same_shape(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 // QoS-headroom telemetry
 #[given(regex = r#"^workload "(\S+)" is subscribed to QoS-headroom telemetry$"#)]
-async fn given_qos_sub(_w: &mut KisekiWorld, _wl: String) {}
+async fn given_qos_sub(_w: &mut KisekiWorld, _wl: String) {
+    todo!("subscribe workload to QoS-headroom telemetry")
+}
 
 #[when(regex = r#"^the caller queries QoS-headroom for "(\S+)"$"#)]
-async fn when_qos_query(_w: &mut KisekiWorld, _shard: String) {}
+async fn when_qos_query(_w: &mut KisekiWorld, _shard: String) {
+    todo!("query QoS-headroom for the shard")
+}
 
 #[then(regex = r#"^the response reports headroom relative only to the caller.*$"#)]
-async fn then_qos_caller(w: &mut KisekiWorld) {
-    // QoS headroom is relative to the caller's own quota.
-    // Verify the shard health is accessible for headroom computation.
-    let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    assert!(
-        health.config.max_delta_count > 0,
-        "quota config should be accessible"
-    );
+async fn then_qos_caller(_w: &mut KisekiWorld) {
+    todo!()
 }
 
 #[then(regex = r#"^cluster-wide QoS capacity is not disclosed.*$"#)]
-async fn then_no_cluster_qos(w: &mut KisekiWorld) {
-    // Cluster-wide capacity is not disclosed to individual callers.
-    // Each shard reports its own config, not cluster aggregates.
-    let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    // Only per-shard config is visible, not cluster totals.
-    assert!(health.config.max_delta_count > 0);
-    assert!(health.config.max_byte_size > 0);
+async fn then_no_cluster_qos(_w: &mut KisekiWorld) {
+    todo!()
 }

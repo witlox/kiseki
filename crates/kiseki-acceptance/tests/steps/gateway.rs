@@ -137,14 +137,15 @@ async fn then_returns_plaintext_tls(w: &mut KisekiWorld) {
 
 #[then("plaintext exists only in gateway memory, ephemerally")]
 async fn then_ephemeral_plaintext(_w: &mut KisekiWorld) {
-    // Verified by the fact that ChunkStore holds only ciphertext.
-    // The gateway decrypts into a local Vec that's dropped after response.
+    todo!("verify ChunkStore holds only ciphertext, not plaintext")
 }
 
 // === Scenario: NFS READDIR ===
 
 #[given(regex = r#"^a client issues NFS READDIR for "(\S+)"$"#)]
-async fn given_nfs_readdir(_w: &mut KisekiWorld, _path: String) {}
+async fn given_nfs_readdir(_w: &mut KisekiWorld, _path: String) {
+    todo!("set up directory with entries for READDIR")
+}
 
 #[then("it reads the directory listing from the NFS view")]
 async fn then_reads_dir_listing(w: &mut KisekiWorld) {
@@ -175,10 +176,14 @@ async fn then_returns_listing_tls(w: &mut KisekiWorld) {
 // === Scenario: NFS WRITE ===
 
 #[given(regex = r#"^a client issues NFS WRITE for "(\S+)" with (\S+) of data$"#)]
-async fn given_nfs_write(_w: &mut KisekiWorld, _path: String, _size: String) {}
+async fn given_nfs_write(_w: &mut KisekiWorld, _path: String, _size: String) {
+    todo!("set up NFS WRITE request with specified path and size")
+}
 
 #[when(regex = r#"^"(\S+)" receives the plaintext over TLS$"#)]
-async fn when_gw_receives_plaintext(_w: &mut KisekiWorld, _gw: String) {}
+async fn when_gw_receives_plaintext(_w: &mut KisekiWorld, _gw: String) {
+    todo!("simulate gateway receiving plaintext over TLS")
+}
 
 #[then("the gateway:")]
 async fn then_gateway_steps(w: &mut KisekiWorld) {
@@ -211,10 +216,14 @@ async fn then_plaintext_discarded(w: &mut KisekiWorld, _step: u64) {
 // === Scenario: NFS CREATE — small file ===
 
 #[given("a client creates a 256-byte file via NFS")]
-async fn given_nfs_create_small(_w: &mut KisekiWorld) {}
+async fn given_nfs_create_small(_w: &mut KisekiWorld) {
+    todo!("set up 256-byte NFS CREATE request")
+}
 
 #[when(regex = r#"^"(\S+)" receives the data$"#)]
-async fn when_gw_receives_data(_w: &mut KisekiWorld, _gw: String) {}
+async fn when_gw_receives_data(_w: &mut KisekiWorld, _gw: String) {
+    todo!("simulate gateway receiving data")
+}
 
 #[then("the gateway encrypts the data for the delta payload")]
 async fn then_encrypts_for_delta(w: &mut KisekiWorld) {
@@ -344,13 +353,19 @@ async fn then_visible_after_consume(w: &mut KisekiWorld) {
 // === Scenario: S3 multipart upload ===
 
 #[given(regex = r#"^a client starts S3 CreateMultipartUpload for "(\S+)"$"#)]
-async fn given_s3_multipart(_w: &mut KisekiWorld, _key: String) {}
+async fn given_s3_multipart(_w: &mut KisekiWorld, _key: String) {
+    todo!("initiate S3 CreateMultipartUpload")
+}
 
 #[when("parts are uploaded:")]
-async fn when_parts_uploaded(_w: &mut KisekiWorld) {}
+async fn when_parts_uploaded(_w: &mut KisekiWorld) {
+    todo!("upload multipart parts")
+}
 
 #[when("the client sends CompleteMultipartUpload")]
-async fn when_complete_multipart(_w: &mut KisekiWorld) {}
+async fn when_complete_multipart(_w: &mut KisekiWorld) {
+    todo!("send CompleteMultipartUpload")
+}
 
 #[then("the gateway verifies all chunks are durable")]
 async fn then_verifies_durable(w: &mut KisekiWorld) {
@@ -384,13 +399,19 @@ async fn then_parts_not_visible(w: &mut KisekiWorld) {
 // === Scenario: NFSv4.1 state management ===
 
 #[given(regex = r#"^a client opens "(\S+)" with NFS OPEN$"#)]
-async fn given_nfs_open(_w: &mut KisekiWorld, _path: String) {}
+async fn given_nfs_open(_w: &mut KisekiWorld, _path: String) {
+    todo!("open file via NFS OPEN and track state handle")
+}
 
 #[given("acquires an NFS byte-range lock on bytes 0-1024")]
-async fn given_nfs_lock(_w: &mut KisekiWorld) {}
+async fn given_nfs_lock(_w: &mut KisekiWorld) {
+    todo!("acquire NFS byte-range lock on bytes 0-1024")
+}
 
 #[when("another client attempts to lock the same range")]
-async fn when_another_lock(_w: &mut KisekiWorld) {}
+async fn when_another_lock(_w: &mut KisekiWorld) {
+    todo!("attempt conflicting byte-range lock from second client")
+}
 
 #[then("the second lock is denied (NFS mandatory locking semantics)")]
 async fn then_lock_denied(w: &mut KisekiWorld) {
@@ -416,41 +437,20 @@ async fn then_lock_state_maintained(w: &mut KisekiWorld) {
 
 #[then("lock state is gateway-local (not replicated to other gateways)")]
 async fn then_lock_local(w: &mut KisekiWorld) {
-    // Verify lock state is local by creating a second NfsContext (simulating
-    // a second gateway). The second gateway has no knowledge of the first's locks.
-    let gw2 =
-        Arc::new(kiseki_gateway::mem_gateway::InMemoryGateway::new(
-            kiseki_composition::composition::CompositionStore::new()
-                .with_log(
-                    Arc::clone(&w.log_store) as Arc<dyn kiseki_log::traits::LogOps + Send + Sync>
-                ),
-            Box::new(kiseki_chunk::ChunkStore::new()),
-            kiseki_crypto::keys::SystemMasterKey::new(
-                [0x42; 32],
-                kiseki_common::tenancy::KeyEpoch(1),
-            ),
-        ));
-    let nfs_gw2 = kiseki_gateway::nfs::NfsGateway::new(gw2);
-    let ctx2 = kiseki_gateway::nfs_ops::NfsContext::new(
-        nfs_gw2,
-        kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)),
-        kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1)),
-    );
-    // ctx2 has empty lock state — independent of w.nfs_ctx.
-    let entries = ctx2.readdir();
-    assert!(
-        entries.is_empty() || true,
-        "second gateway has independent state"
-    );
+    todo!("verify lock state is gateway-local by checking second gateway has no locks from first")
 }
 
 // === Scenario: S3 conditional write ===
 
 #[given(regex = r#"^object "(\S+)" does not exist$"#)]
-async fn given_object_not_exist(_w: &mut KisekiWorld, _key: String) {}
+async fn given_object_not_exist(_w: &mut KisekiWorld, _key: String) {
+    todo!("verify object does not exist before conditional write")
+}
 
 #[when(regex = r#"^a client issues PutObject with header If-None-Match: \*$"#)]
-async fn when_put_if_none_match(_w: &mut KisekiWorld) {}
+async fn when_put_if_none_match(_w: &mut KisekiWorld) {
+    todo!("issue PutObject with If-None-Match: * header")
+}
 
 #[then("the write succeeds")]
 async fn then_write_succeeds_gw(w: &mut KisekiWorld) {
@@ -479,32 +479,30 @@ async fn then_412_precondition(w: &mut KisekiWorld) {
 // === Scenario: NFS gateway over TCP ===
 
 #[given(regex = r#"^"(\S+)" is configured with transport TCP$"#)]
-async fn given_transport_tcp(_w: &mut KisekiWorld, _gw: String) {}
+async fn given_transport_tcp(_w: &mut KisekiWorld, _gw: String) {
+    todo!("configure gateway with TCP transport")
+}
 
 #[when("a client connects")]
-async fn when_client_connects(_w: &mut KisekiWorld) {}
+async fn when_client_connects(_w: &mut KisekiWorld) {
+    todo!("simulate client TCP connection to gateway")
+}
 
 #[then("NFS traffic flows over TCP with TLS encryption")]
 async fn then_nfs_tcp_tls(_w: &mut KisekiWorld) {
-    // TLS is the only supported transport — plaintext is not an option.
-    // The transport layer (kiseki-transport) enforces TLS on all connections.
-    // In BDD, the transport layer is tested in kiseki-transport unit tests.
+    todo!("verify NFS traffic flows over TCP with TLS encryption")
 }
 
 #[then("the gateway handles NFS RPC framing over TCP")]
 async fn then_nfs_rpc_framing(w: &mut KisekiWorld) {
-    // NFS RPC framing: verify the gateway's NFS context can handle requests.
-    // The NFS context wraps the gateway and handles RPC framing internally.
-    let entries = w.nfs_ctx.readdir();
-    // If readdir succeeds, the NFS layer is processing RPC framing correctly.
+    todo!("verify gateway handles NFS RPC framing over TCP")
 }
 
 // === Scenario: S3 gateway over TCP (HTTPS) ===
 
 #[then("S3 traffic flows over HTTPS (TLS)")]
 async fn then_s3_https(_w: &mut KisekiWorld) {
-    // S3 traffic is always over HTTPS — TLS is the only transport option.
-    // The transport layer enforces TLS; plaintext is not supported.
+    todo!("verify S3 traffic flows over HTTPS with TLS")
 }
 
 #[then("standard S3 REST API semantics apply")]
@@ -518,10 +516,14 @@ async fn then_s3_rest_semantics(w: &mut KisekiWorld) {
 // === Scenario: Gateway crash ===
 
 #[given(regex = r#"^"(\S+)" crashes$"#)]
-async fn given_gw_crashes(_w: &mut KisekiWorld, _gw: String) {}
+async fn given_gw_crashes(_w: &mut KisekiWorld, _gw: String) {
+    todo!("simulate gateway crash by dropping gateway state")
+}
 
 #[when("the gateway is restarted (or a new instance spun up)")]
-async fn when_gw_restarts(_w: &mut KisekiWorld) {}
+async fn when_gw_restarts(_w: &mut KisekiWorld) {
+    todo!("restart gateway with fresh state")
+}
 
 #[then("NFS clients detect connection loss")]
 async fn then_nfs_detect_loss(_w: &mut KisekiWorld) {
@@ -566,10 +568,7 @@ async fn then_clients_reconnect(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^NFS state \(opens, locks\) is lost .+ clients re-establish$"#)]
 async fn then_nfs_state_lost(w: &mut KisekiWorld) {
-    // NFS state (opens, locks) is gateway-local — lost on crash.
-    // Verify the NFS context holds state that would be lost.
-    let entries = w.nfs_ctx.readdir();
-    // The current context's state is ephemeral; a new instance has none.
+    todo!("verify NFS state (opens, locks) is lost after crash and clients must re-establish")
 }
 
 #[then(regex = r#"^no committed data is lost \(durability is in the Log \+ Chunk Storage\)$"#)]
@@ -584,24 +583,25 @@ async fn then_no_committed_data_lost(w: &mut KisekiWorld) {
 
 #[then("in-flight uncommitted writes are lost")]
 async fn then_uncommitted_lost(w: &mut KisekiWorld) {
-    // Uncommitted writes are in gateway memory only.
-    // After crash, only committed deltas survive.
-    let sid = w.ensure_shard("shard-default");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    // Tip reflects only committed deltas.
-    assert!(health.tip.0 >= 0);
+    todo!("verify in-flight uncommitted writes are lost after gateway crash")
 }
 
 // === Scenario: Gateway cannot reach tenant KMS ===
 
 #[given(regex = r#"^tenant KMS for "(\S+)" is unreachable$"#)]
-async fn given_tenant_kms_unreachable_gw(_w: &mut KisekiWorld, _tenant: String) {}
+async fn given_tenant_kms_unreachable_gw(_w: &mut KisekiWorld, _tenant: String) {
+    todo!("configure tenant KMS as unreachable")
+}
 
 #[given("cached KEK has expired")]
-async fn given_cached_kek_expired(_w: &mut KisekiWorld) {}
+async fn given_cached_kek_expired(_w: &mut KisekiWorld) {
+    todo!("expire cached KEK to simulate KMS unreachability")
+}
 
 #[when(regex = r#"^a write arrives at "(\S+)"$"#)]
-async fn when_write_arrives(_w: &mut KisekiWorld, _gw: String) {}
+async fn when_write_arrives(_w: &mut KisekiWorld, _gw: String) {
+    todo!("send write request to gateway with expired KEK")
+}
 
 #[then("the gateway cannot encrypt for the tenant")]
 async fn then_cannot_encrypt(_w: &mut KisekiWorld) {
@@ -654,25 +654,24 @@ async fn then_cached_reads_work(w: &mut KisekiWorld) {
 
 #[then("the tenant admin is alerted")]
 async fn then_tenant_admin_alerted(_w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+    todo!("wire audit event and verify")
 }
 
 // === Scenario: Gateway cannot reach Chunk Storage ===
 
 #[given("Chunk Storage is partially unavailable")]
-async fn given_chunk_storage_partial(_w: &mut KisekiWorld) {}
+async fn given_chunk_storage_partial(_w: &mut KisekiWorld) {
+    todo!("configure chunk storage as partially unavailable")
+}
 
 #[when("a read requests a chunk on an unavailable device")]
-async fn when_read_unavailable_device(_w: &mut KisekiWorld) {}
+async fn when_read_unavailable_device(_w: &mut KisekiWorld) {
+    todo!("issue read for chunk on unavailable device")
+}
 
 #[then("EC repair is attempted if parity is available")]
 async fn then_ec_repair_attempted(w: &mut KisekiWorld) {
-    // EC repair is a chunk-store operation. Verify the chunk store is accessible.
-    // In the in-memory harness, all chunks are available (no device failures).
-    assert!(
-        w.last_error.is_none() || w.last_error.is_some(),
-        "EC repair outcome depends on parity availability"
-    );
+    todo!("simulate partial chunk unavailability and verify EC repair is attempted")
 }
 
 #[then("if repair succeeds, the read completes")]
@@ -693,23 +692,25 @@ async fn then_repair_completes(w: &mut KisekiWorld) {
 
 #[then("if repair fails, the read returns an error to the client")]
 async fn then_repair_fails_error(_w: &mut KisekiWorld) {
-    // Failed repair: gateway returns an error to the client.
-    // The gateway propagates typed errors through the read pipeline.
+    todo!("verify read returns error when EC repair fails")
 }
 
 #[then("the error is protocol-appropriate (NFS: EIO, S3: 500 Internal Server Error)")]
 async fn then_protocol_error(_w: &mut KisekiWorld) {
-    // Protocol-appropriate errors are handled by the NFS/S3 layers.
-    // NFS maps errors to NFS3ERR_IO; S3 maps to HTTP 500.
+    todo!("verify error is protocol-appropriate: NFS EIO or S3 500")
 }
 
 // === Scenario: Gateway receives request for wrong tenant ===
 
 #[given(regex = r#"^"(\S+)" serves only tenant "(\S+)"$"#)]
-async fn given_gw_serves_tenant(_w: &mut KisekiWorld, _gw: String, _tenant: String) {}
+async fn given_gw_serves_tenant(_w: &mut KisekiWorld, _gw: String, _tenant: String) {
+    todo!("configure gateway to serve only the specified tenant")
+}
 
 #[when(regex = r#"^a request arrives with credentials for "(\S+)"$"#)]
-async fn when_wrong_tenant_request(_w: &mut KisekiWorld, _tenant: String) {}
+async fn when_wrong_tenant_request(_w: &mut KisekiWorld, _tenant: String) {
+    todo!("send request with wrong tenant credentials")
+}
 
 #[then("the request is rejected with authentication error")]
 async fn then_auth_rejected(w: &mut KisekiWorld) {
@@ -745,19 +746,18 @@ async fn then_no_data_exposed(w: &mut KisekiWorld, tenant: String) {
 // === Scenario: S3 request carries workflow_ref header ===
 
 #[given(regex = r#"^S3 client under workload "(\S+)" has an active workflow$"#)]
-async fn given_s3_client_workflow(_w: &mut KisekiWorld, _wl: String) {}
+async fn given_s3_client_workflow(_w: &mut KisekiWorld, _wl: String) {
+    todo!("set up S3 client with active workflow")
+}
 
 #[when(regex = r#"^a PutObject arrives with header `x-kiseki-workflow-ref: <opaque>`$"#)]
-async fn when_putobject_workflow_ref(_w: &mut KisekiWorld) {}
+async fn when_putobject_workflow_ref(_w: &mut KisekiWorld) {
+    todo!("issue PutObject with x-kiseki-workflow-ref header")
+}
 
 #[then("the gateway validates the ref against the authenticated tenant identity (I-WA3)")]
 async fn then_validates_ref(w: &mut KisekiWorld) {
-    // Workflow ref validation: the advisory table validates workflow ownership.
-    // A valid workflow must belong to the authenticated tenant.
-    assert!(
-        w.advisory_table.active_count() == 0 || true,
-        "workflow table should be queryable for ref validation"
-    );
+    todo!("validate workflow_ref against authenticated tenant identity (I-WA3)")
 }
 
 #[then("on success, annotates the write path for advisory correlation")]
@@ -791,10 +791,14 @@ async fn given_priority_classes(w: &mut KisekiWorld, _wl: String, _classes: Stri
 }
 
 #[given(regex = r#"^the client's hint carries \{ priority: (\S+) \}$"#)]
-async fn given_priority_hint(_w: &mut KisekiWorld, _priority: String) {}
+async fn given_priority_hint(_w: &mut KisekiWorld, _priority: String) {
+    todo!("attach priority hint to request")
+}
 
 #[when("the gateway schedules the request against concurrent workload traffic")]
-async fn when_gw_schedules(_w: &mut KisekiWorld) {}
+async fn when_gw_schedules(_w: &mut KisekiWorld) {
+    todo!("schedule request against concurrent workload traffic")
+}
 
 #[then(regex = r#"^the request is placed in the (\S+) QoS class$"#)]
 async fn then_qos_class(w: &mut KisekiWorld, _class: String) {
@@ -818,19 +822,25 @@ async fn then_priority_rejected(w: &mut KisekiWorld) {
 // === Scenario: Request-level backpressure telemetry ===
 
 #[given(regex = r#"^the gateway serves "(\S+)" with (\d+) concurrent in-flight requests$"#)]
-async fn given_gw_concurrent(_w: &mut KisekiWorld, _wl: String, _count: u64) {}
+async fn given_gw_concurrent(_w: &mut KisekiWorld, _wl: String, _count: u64) {
+    todo!("set up gateway with concurrent in-flight requests")
+}
 
 #[given("the workload has subscribed to backpressure telemetry")]
-async fn given_backpressure_sub(_w: &mut KisekiWorld) {}
+async fn given_backpressure_sub(_w: &mut KisekiWorld) {
+    todo!("subscribe workload to backpressure telemetry")
+}
 
 #[when("the gateway's per-caller queue depth crosses the soft threshold")]
-async fn when_queue_crosses_threshold(_w: &mut KisekiWorld) {}
+async fn when_queue_crosses_threshold(_w: &mut KisekiWorld) {
+    todo!("push per-caller queue depth past soft threshold")
+}
 
 #[then(
     regex = r#"^a backpressure event \{ severity: soft, retry_after_ms: <bucketed> \} is emitted to the workflow \(I-WA5\)$"#
 )]
 async fn then_backpressure_event(_w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+    todo!("wire audit event and verify")
 }
 
 #[then("only the caller's own queue state contributes to the signal; neighbour callers do not leak through this channel (I-WA5)")]
@@ -865,35 +875,38 @@ async fn then_data_path_accepts(w: &mut KisekiWorld) {
 #[given(
     regex = r#"^an NFSv4\.1 client submits read with `io_advise` hints indicating sequential access$"#
 )]
-async fn given_nfs_io_advise(_w: &mut KisekiWorld) {}
+async fn given_nfs_io_advise(_w: &mut KisekiWorld) {
+    todo!("submit NFSv4.1 read with io_advise sequential hint")
+}
 
 #[when(
     regex = r#"^the gateway maps the advisory to a Workflow Advisory hint \{ access_pattern: sequential \}$"#
 )]
-async fn when_gw_maps_advisory(_w: &mut KisekiWorld) {}
+async fn when_gw_maps_advisory(_w: &mut KisekiWorld) {
+    todo!("map NFS io_advise to Workflow Advisory hint")
+}
 
 #[then("the advisory is submitted asynchronously (I-WA2) and the NFS read is served normally")]
 async fn then_advisory_async(w: &mut KisekiWorld) {
-    // I-WA2: advisory is async — the NFS read completes regardless.
-    // Verify a read through the NFS context works.
-    let entries = w.nfs_ctx.readdir();
-    // Readdir succeeds — advisory submission doesn't block reads.
+    todo!("verify advisory is submitted asynchronously and NFS read completes normally")
 }
 
 #[then("the View Materialization subsystem MAY readahead for subsequent reads of the same caller")]
 async fn then_may_readahead(w: &mut KisekiWorld) {
-    // Readahead is advisory — MAY means optional.
-    // Verify the view store is accessible for materialization.
-    assert!(w.view_store.count() >= 0, "view store should be accessible");
+    todo!("verify readahead is triggered for sequential access pattern")
 }
 
 // === Scenario: NFS workflow_ref carriage model (v1) ===
 
 #[given("NFSv4.1 is a POSIX-oriented protocol with no native header for workflow correlation")]
-async fn given_nfs_no_native_header(_w: &mut KisekiWorld) {}
+async fn given_nfs_no_native_header(_w: &mut KisekiWorld) {
+    todo!("establish NFSv4.1 has no native workflow correlation header")
+}
 
 #[when(regex = r#"^a workload mounts an NFS export via "(\S+)"$"#)]
-async fn when_nfs_mount(_w: &mut KisekiWorld, _gw: String) {}
+async fn when_nfs_mount(_w: &mut KisekiWorld, _gw: String) {
+    todo!("mount NFS export via gateway")
+}
 
 #[then("workflow correlation for NFS clients is attached per-mount by the gateway:")]
 async fn then_workflow_per_mount(w: &mut KisekiWorld) {
@@ -907,10 +920,7 @@ async fn then_workflow_per_mount(w: &mut KisekiWorld) {
 
 #[then("all RPCs on that mount inherit that workflow_ref internally (translated to the gRPC binary header at the kiseki-server ingress)")]
 async fn then_rpcs_inherit_ref(w: &mut KisekiWorld) {
-    // RPCs on the mount inherit the workflow_ref — the NFS context propagates it.
-    // Verify the context's namespace_id is consistent across operations.
-    let entries = w.nfs_ctx.readdir();
-    // All operations go through the same NfsContext instance (same mount).
+    todo!("verify all RPCs on mount inherit workflow_ref via gRPC binary header")
 }
 
 #[then("mounts without `workflow-ref` proceed with no advisory correlation — data-path behavior is identical to pre-advisory NFS (I-WA1, I-WA2)")]
@@ -937,7 +947,9 @@ async fn then_may_refuse_mount(w: &mut KisekiWorld) {
 // "tenant admin transitions ... advisory to disabled" step is in advisory.rs
 
 #[when("NFS or S3 requests arrive with workflow_ref or priority hints")]
-async fn when_requests_with_hints(_w: &mut KisekiWorld) {}
+async fn when_requests_with_hints(_w: &mut KisekiWorld) {
+    todo!("send NFS/S3 requests with workflow_ref and priority hints")
+}
 
 #[then("the gateway ignores all advisory annotations")]
 async fn then_ignores_advisory(w: &mut KisekiWorld) {
@@ -994,7 +1006,9 @@ async fn then_no_regression(w: &mut KisekiWorld) {
 // "workload ... is subscribed to QoS-headroom telemetry" step is in log.rs
 
 #[when(regex = r#"^the gateway computes headroom within the workload's I-T2 quota$"#)]
-async fn when_gw_computes_headroom(_w: &mut KisekiWorld) {}
+async fn when_gw_computes_headroom(_w: &mut KisekiWorld) {
+    todo!("compute QoS headroom within workload I-T2 quota")
+}
 
 #[then(regex = r#"^the value is a bucketed fraction .+ \{ample, moderate, tight, exhausted\}$"#)]
 async fn then_bucketed_fraction(w: &mut KisekiWorld) {
