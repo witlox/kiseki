@@ -448,6 +448,13 @@ impl LogOps for RaftLogStore {
         }
     }
 
+    fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sm) = inner.shards.get_mut(&shard_id) {
+            sm.info.config = config;
+        }
+    }
+
     async fn register_consumer(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let sm = inner.shards.get_mut(&shard_id).ok_or(LogError::ShardNotFound(shard_id))?;

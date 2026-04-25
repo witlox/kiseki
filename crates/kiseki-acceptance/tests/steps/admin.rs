@@ -462,17 +462,31 @@ async fn given_shard_near_ceiling(
 #[when(regex = r#"^the admin triggers SplitShard for "([^"]*)"$"#)]
 async fn when_split_shard(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
-    // Use MemShardStore::split_shard to perform the split.
-    let new_shard_id = ShardId(uuid::Uuid::new_v4());
-    let result = w.log_store.split_shard(shard_id, new_shard_id, NodeId(1));
-    match result {
-        Ok(new_id) => {
-            w.last_shard_id = Some(new_id);
-            w.last_error = None;
+    // Admin-initiated split: force split regardless of thresholds.
+    let health = w.log_store.shard_health(shard_id).await.unwrap();
+    let midpoint = kiseki_log::auto_split::compute_midpoint(
+        &health.range_start, &health.range_end,
+    );
+    match midpoint {
+        Some(mid) => {
+            let plan = kiseki_log::auto_split::SplitPlan {
+                original_shard: shard_id,
+                new_shard: ShardId(uuid::Uuid::new_v4()),
+                tenant_id: health.tenant_id,
+                midpoint: mid,
+                range_start: health.range_start,
+                range_end: health.range_end,
+                initial_node: health.leader.unwrap_or(NodeId(1)),
+            };
+            match kiseki_log::auto_split::execute_split(w.log_store.as_ref(), &plan).await {
+                Ok(()) => {
+                    w.last_shard_id = Some(plan.new_shard);
+                    w.last_error = None;
+                }
+                Err(e) => { w.last_error = Some(e.to_string()); }
+            }
         }
-        Err(e) => {
-            w.last_error = Some(e.to_string());
-        }
+        None => { w.last_error = Some("range too narrow to split".into()); }
     }
 }
 

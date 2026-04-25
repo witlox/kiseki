@@ -108,6 +108,9 @@ pub trait LogOps: Send + Sync {
     /// Transition a shard's lifecycle state (ADR-034 merge protocol).
     fn set_shard_state(&self, shard_id: ShardId, state: ShardState);
 
+    /// Update a shard's split thresholds.
+    fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig);
+
     // --- Consumer watermarks (ADR-036, I-L4) ---
 
     /// Register a consumer at a starting position.

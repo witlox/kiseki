@@ -232,6 +232,10 @@ impl LogOps for PersistentShardStore {
         self.mem.set_shard_state(shard_id, state);
     }
 
+    fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
+        self.mem.set_shard_config(shard_id, config);
+    }
+
     async fn register_consumer(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
         self.mem.register_consumer(shard_id, consumer, position)
     }

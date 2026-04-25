@@ -231,7 +231,10 @@ impl LogOps for RaftShardStore {
     }
 
     fn set_shard_state(&self, shard_id: ShardId, _state: ShardState) {
-        // Shard state transitions are coordinated by the control plane.
+        let _ = shard_id;
+    }
+
+    fn set_shard_config(&self, shard_id: ShardId, _config: ShardConfig) {
         let _ = shard_id;
     }
 

@@ -481,10 +481,10 @@ async fn given_range(w: &mut KisekiWorld, name: String, _from: u64, to: u64) {
 async fn given_watermark(w: &mut KisekiWorld, consumer: String, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     w.log_store
-        .register_consumer(sid, &consumer, SequenceNumber(0))
+        .register_consumer(sid, &consumer, SequenceNumber(0)).await
         .unwrap();
     w.log_store
-        .advance_watermark(sid, &consumer, SequenceNumber(seq))
+        .advance_watermark(sid, &consumer, SequenceNumber(seq)).await
         .unwrap();
 }
 
@@ -492,10 +492,10 @@ async fn given_watermark(w: &mut KisekiWorld, consumer: String, seq: u64) {
 async fn given_audit_wm(w: &mut KisekiWorld, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     w.log_store
-        .register_consumer(sid, "audit", SequenceNumber(0))
+        .register_consumer(sid, "audit", SequenceNumber(0)).await
         .unwrap();
     w.log_store
-        .advance_watermark(sid, "audit", SequenceNumber(seq))
+        .advance_watermark(sid, "audit", SequenceNumber(seq)).await
         .unwrap();
 }
 
@@ -545,10 +545,10 @@ async fn given_stalled(w: &mut KisekiWorld, consumer: String, seq: u64) {
         w.log_store.append_delta(req).await.unwrap();
     }
     w.log_store
-        .register_consumer(sid, &consumer, SequenceNumber(0))
+        .register_consumer(sid, &consumer, SequenceNumber(0)).await
         .unwrap();
     w.log_store
-        .advance_watermark(sid, &consumer, SequenceNumber(seq))
+        .advance_watermark(sid, &consumer, SequenceNumber(seq)).await
         .unwrap();
 }
 
@@ -556,10 +556,10 @@ async fn given_stalled(w: &mut KisekiWorld, consumer: String, seq: u64) {
 async fn given_others(w: &mut KisekiWorld, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     w.log_store
-        .register_consumer(sid, "sp-fast", SequenceNumber(0))
+        .register_consumer(sid, "sp-fast", SequenceNumber(0)).await
         .unwrap();
     w.log_store
-        .advance_watermark(sid, "sp-fast", SequenceNumber(seq))
+        .advance_watermark(sid, "sp-fast", SequenceNumber(seq)).await
         .unwrap();
 }
 

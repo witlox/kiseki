@@ -60,7 +60,7 @@ mod steps;
 #[world(init = Self::new)]
 pub struct KisekiWorld {
     // === Real implementations (in-memory stores) ===
-    pub log_store: Arc<MemShardStore>,
+    pub log_store: Arc<dyn LogOps + Send + Sync>,
     pub key_store: MemKeyStore,
     pub audit_log: AuditLog,
     pub chunk_store: ChunkStore,

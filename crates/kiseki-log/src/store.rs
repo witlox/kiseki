@@ -428,6 +428,10 @@ impl LogOps for MemShardStore {
         Self::set_shard_state(self, shard_id, state);
     }
 
+    fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
+        Self::set_shard_config(self, shard_id, config);
+    }
+
     async fn register_consumer(
         &self,
         shard_id: ShardId,
