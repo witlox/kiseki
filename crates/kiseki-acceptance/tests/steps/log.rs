@@ -848,8 +848,21 @@ async fn given_mid_split(w: &mut KisekiWorld, name: String, _new_shard: String) 
 }
 
 #[given(regex = r#"^the split boundary is at hashed_key 0x(\S+)$"#)]
-async fn given_split_boundary(_w: &mut KisekiWorld, _hex: String) {
-    todo!("configure split boundary at the given hashed_key")
+async fn given_split_boundary(w: &mut KisekiWorld, hex: String) {
+    // Set the shard's range to end at the split boundary.
+    let sid = w.ensure_shard("shard-alpha");
+    let mut boundary = [0u8; 32];
+    // Parse hex string byte by byte.
+    let hex_bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&hex[i..i.min(hex.len()).max(i+2)], 16).ok())
+        .collect();
+    for (i, b) in hex_bytes.iter().enumerate().take(32) {
+        boundary[i] = *b;
+    }
+    // The shard covers [0x00, boundary) — writes at or above boundary are out of range.
+    w.log_store.update_shard_range(sid, [0x00; 32], boundary);
+    w.log_store.set_shard_state(sid, ShardState::Splitting);
 }
 
 #[when(regex = r#"^a delta with hashed_key 0x(\S+) is appended$"#)]
