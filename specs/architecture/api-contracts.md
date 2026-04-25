@@ -55,6 +55,9 @@ service backed by the same trait implementation.
 | Command | `CompactShard(shard, trigger)` | System/Admin | log.feature#AutomaticCompaction |
 | Command | `TruncateLog(shard) → gc_boundary` | System/Admin | log.feature#DeltaGC |
 | Command | `SetMaintenance(shard, enabled)` | Admin | log.feature#MaintenanceMode |
+| Command | `CreateShard(shard_id, tenant, node, config)` | Control | ADR-033, ADR-036 |
+| Command | `UpdateShardRange(shard_id, start, end)` | Control | ADR-033, ADR-036 |
+| Command | `SetShardState(shard_id, state)` | Control | ADR-034, ADR-036 |
 | Query | `ReadDeltas(shard, from, to) → [delta]` | View stream proc | log.feature#StreamProcessorReads |
 | Query | `ShardHealth(shard) → ShardInfo` | Admin, Control | log.feature |
 | Event | `DeltaCommitted(shard, seq)` | → View, Audit | log.feature#SuccessfulDeltaAppend |
