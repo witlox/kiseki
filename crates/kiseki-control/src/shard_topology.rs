@@ -430,6 +430,16 @@ impl NamespaceShardMapStore {
         self.maps.read().unwrap().contains_key(namespace_id)
     }
 
+    /// Create an alias: lookups for `alias` resolve to `target`.
+    pub fn alias(&self, alias: &str, target: &str) {
+        let maps = self.maps.read().unwrap();
+        if let Some(map) = maps.get(target) {
+            let aliased = map.clone();
+            drop(maps);
+            self.maps.write().unwrap().insert(alias.to_owned(), aliased);
+        }
+    }
+
     /// Insert a namespace in Creating state (for testing ADV-033-1).
     pub fn insert_creating(&self, namespace_id: &str, tenant_id: OrgId) {
         let map = NamespaceShardMap {

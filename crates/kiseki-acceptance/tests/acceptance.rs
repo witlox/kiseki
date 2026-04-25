@@ -136,7 +136,7 @@ pub struct KisekiWorld {
 
     // === Shard topology (ADR-033) ===
     pub topology_config: ShardTopologyConfig,
-    pub shard_map_store: NamespaceShardMapStore,
+    pub shard_map_store: Arc<NamespaceShardMapStore>,
     pub topology_active_nodes: Vec<NodeId>,
 
     // === Small-file placement (ADR-030) ===
@@ -225,11 +225,11 @@ impl KisekiWorld {
             compliance_tags: Vec::new(),
         });
 
-        let gateway = Arc::new(InMemoryGateway::new(
-            gw_comps,
-            Box::new(gw_chunks),
-            gw_master,
-        ));
+        let shard_map_store = Arc::new(NamespaceShardMapStore::new());
+        let gateway = Arc::new(
+            InMemoryGateway::new(gw_comps, Box::new(gw_chunks), gw_master)
+                .with_shard_map(Arc::clone(&shard_map_store)),
+        );
         let nfs_gw = NfsGateway::new(Arc::clone(&gateway));
         let nfs_ctx = Arc::new(NfsContext::new(nfs_gw, default_tenant, default_ns));
 
@@ -298,7 +298,7 @@ impl KisekiWorld {
             kms_concurrent_count: 0,
             control_admin: StorageAdminService::new(),
             topology_config: ShardTopologyConfig::default(),
-            shard_map_store: NamespaceShardMapStore::new(),
+            shard_map_store,
             topology_active_nodes: Vec::new(),
             sf_node_count: 3,
             sf_soft_limit_pct: 50,
@@ -431,17 +431,22 @@ impl KisekiWorld {
             name.as_bytes(),
         ));
 
-        // Create namespace in the shard map store (topology computation).
+        // Create namespace in the shard map store under the UUID string
+        // (matches gateway routing: NamespaceId.0.to_string()) and also
+        // store an alias under the human name for step definition lookups.
+        let ns_key = ns_id.0.to_string();
         let map = self
             .shard_map_store
             .create_namespace(
-                name,
+                &ns_key,
                 tenant_id,
                 &self.topology_config,
                 &self.topology_active_nodes,
                 requested_shards,
             )
             .expect("topology namespace creation should succeed");
+        // Alias: store under human name too for step definition lookups.
+        self.shard_map_store.alias(name, &ns_key);
 
         // Register each shard in the log store with its specific key range.
         for shard_range in &map.shards {
@@ -599,24 +604,27 @@ impl KisekiWorld {
             .get(ns_name)
             .unwrap_or(&NamespaceId(uuid::Uuid::from_u128(1)));
 
-        // Ensure namespace and its shard exist in the gateway's stores.
-        let shard_id = ShardId(uuid::Uuid::from_u128(1));
-        self.log_store.create_shard(
-            shard_id,
-            tenant_id,
-            kiseki_common::ids::NodeId(1),
-            ShardConfig::default(),
-        );
-        self.gateway
-            .add_namespace(Namespace {
-                id: ns_id,
-                tenant_id,
+        // If the namespace was already registered (e.g., via ensure_topology_namespace),
+        // use its existing shards. Otherwise create a default full-range shard.
+        if !self.namespace_ids.contains_key(ns_name) {
+            let shard_id = ShardId(uuid::Uuid::from_u128(1));
+            self.log_store.create_shard(
                 shard_id,
-                read_only: false,
-                versioning_enabled: false,
-                compliance_tags: Vec::new(),
-            })
-            .await;
+                tenant_id,
+                kiseki_common::ids::NodeId(1),
+                ShardConfig::default(),
+            );
+            self.gateway
+                .add_namespace(Namespace {
+                    id: ns_id,
+                    tenant_id,
+                    shard_id,
+                    read_only: false,
+                    versioning_enabled: false,
+                    compliance_tags: Vec::new(),
+                })
+                .await;
+        }
 
         self.gateway
             .write(WriteRequest {

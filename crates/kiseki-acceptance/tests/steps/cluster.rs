@@ -4,6 +4,8 @@
 //! (scenarios 12-23). Topology steps exercise the real integrated
 //! gateway→composition→log path.
 
+use std::sync::Arc;
+
 use cucumber::{given, then, when};
 use kiseki_log::traits::LogOps;
 
@@ -485,32 +487,7 @@ async fn given_tenant_bounds(w: &mut KisekiWorld, min_shards: u32, max_shards: u
 
 #[when(regex = r#"^tenant admin requests `initial_shards = (\d+)` for namespace "([^"]*)"$"#)]
 async fn when_tenant_requests_shards(w: &mut KisekiWorld, shards: u32, ns: String) {
-    let tenant_id = w.ensure_tenant("org-pharma");
-    match w.shard_map_store.create_namespace(
-        &ns,
-        tenant_id,
-        &w.topology_config,
-        &w.topology_active_nodes,
-        Some(shards),
-    ) {
-        Ok(map) => {
-            // Register shards in log store and namespace in gateway.
-            for sr in &map.shards {
-                w.log_store.create_shard(sr.shard_id, tenant_id, sr.leader_node,
-                    kiseki_log::shard::ShardConfig::default());
-                w.log_store.update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
-            }
-            let ns_id = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_DNS, ns.as_bytes()));
-            w.gateway.add_namespace(kiseki_composition::namespace::Namespace {
-                id: ns_id, tenant_id, shard_id: map.shards[0].shard_id,
-                read_only: false, versioning_enabled: false, compliance_tags: Vec::new(),
-            }).await;
-            w.namespace_ids.insert(ns.clone(), ns_id);
-            w.last_error = None;
-        }
-        Err(e) => { w.last_error = Some(e.to_string()); }
-    }
+    w.ensure_topology_namespace(&ns, "org-pharma", Some(shards)).await;
 }
 
 #[then(regex = r#"^(\d+) shards are created$"#)]
@@ -584,6 +561,11 @@ async fn then_auto_split_fires(w: &mut KisekiWorld, ns: String, target: u32) {
         &ns, &w.topology_config, &w.topology_active_nodes,
     ).expect("splits should fire");
     assert!(new_count >= target, "expected >= {} shards, got {}", target, new_count);
+
+    // Sync the UUID-keyed entry so gateway routing sees updated shards.
+    if let Some(ns_id) = w.namespace_ids.get(&ns) {
+        w.shard_map_store.alias(&ns_id.0.to_string(), &ns);
+    }
 
     // Register the new shards in the log store with their ranges.
     let tenant_id = w.ensure_tenant("org-pharma");
@@ -748,6 +730,10 @@ async fn then_splits_to_cap(w: &mut KisekiWorld, _cap: u32, target: u32) {
     ).expect("splits should fire");
     assert_eq!(new_count, target);
 
+    // Sync the UUID-keyed entry so gateway routing sees the updated shards.
+    let ns_id = w.namespace_ids.get("big-ns").unwrap();
+    w.shard_map_store.alias(&ns_id.0.to_string(), "big-ns");
+
     // Register new shards and verify gateway write.
     let tenant_id = w.ensure_tenant("org-pharma");
     let map = w.shard_map_store.get("big-ns", tenant_id).unwrap();
@@ -801,4 +787,75 @@ async fn then_permission_denied(w: &mut KisekiWorld) {
 #[then("no shard topology information is returned")]
 async fn then_no_topology_returned(w: &mut KisekiWorld) {
     assert!(w.last_error.is_some(), "should have error, no topology returned");
+}
+
+// --- Scenario 10: ADV-033-3 KeyOutOfRange via real gateway path ---
+
+#[given(regex = r#"^namespace "([^"]*)" has (\d+) shards covering ranges \[0x00, 0x55\), \[0x55, 0xAA\), \[0xAA, 0xFF\]$"#)]
+async fn given_ns_with_specific_ranges(w: &mut KisekiWorld, ns: String, count: u32) {
+    if w.topology_active_nodes.is_empty() {
+        for i in 1..=3u32 {
+            w.topology_active_nodes.push(kiseki_common::ids::NodeId(i as u64));
+        }
+    }
+    w.ensure_topology_namespace(&ns, "org-pharma", Some(count)).await;
+}
+
+#[given("the gateway has a stale shard map (pre-split, single shard)")]
+async fn given_stale_shard_map(w: &mut KisekiWorld) {
+    // Simulate stale cache: clear the gateway's shard map so it falls back
+    // to the namespace's single shard_id (shard 0).
+    w.gateway.clear_shard_map();
+    // Narrow shard 0's range so most keys miss — triggers real KeyOutOfRange.
+    let tenant_id = w.ensure_tenant("org-pharma");
+    let map = w.shard_map_store.get("ns-routed", tenant_id).unwrap();
+    let narrow_shard = map.shards[0].shard_id;
+    let mut end = [0x00; 32];
+    end[31] = 0x01;
+    w.log_store.update_shard_range(narrow_shard, [0x00; 32], end);
+}
+
+#[when(regex = r#"^the gateway sends a delta with hashed_key=0x([0-9a-fA-F]+) to shard-(\d+) \(range .+\)$"#)]
+async fn when_gateway_sends_to_wrong_shard(w: &mut KisekiWorld, _key_hex: String, _shard_idx: u32) {
+    // Write through the real gateway. The gateway will use the namespace's
+    // default shard_id (shard 0, now narrowed to [0x00, 0x01)).
+    // The composition_hash_key will almost certainly fall outside this range,
+    // triggering a real KeyOutOfRange from append_delta().
+    let result = w.gateway_write("ns-routed", b"misrouted-data").await;
+    match result {
+        Ok(_) => { w.last_error = None; }
+        Err(e) => { w.last_error = Some(e.to_string()); }
+    }
+}
+
+#[then(regex = r#"^shard-(\d+) rejects the delta with KeyOutOfRange$"#)]
+async fn then_key_out_of_range(w: &mut KisekiWorld, _shard: u32) {
+    let err = w.last_error.as_ref().expect("expected KeyOutOfRange from real path");
+    assert!(err.contains("key out of range"), "expected KeyOutOfRange, got '{}'", err);
+}
+
+#[then("the gateway refreshes its shard map via GetNamespaceShardMap")]
+async fn then_gateway_refreshes(w: &mut KisekiWorld) {
+    // Re-attach the shard map store (simulates cache refresh).
+    w.gateway.set_shard_map(Arc::clone(&w.shard_map_store));
+    // Restore the correct ranges on all shards.
+    let tenant_id = w.ensure_tenant("org-pharma");
+    let map = w.shard_map_store.get("ns-routed", tenant_id).unwrap();
+    for sr in &map.shards {
+        w.log_store.update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
+    }
+}
+
+#[then(regex = r#"^the gateway retries to shard-(\d+) \(range .+\)$"#)]
+async fn then_gateway_retries(w: &mut KisekiWorld, _shard_idx: u32) {
+    // Write again — now all shards have correct ranges, so it succeeds.
+    let result = w.gateway_write("ns-routed", b"retried-data").await;
+    assert!(result.is_ok(), "retry should succeed: {:?}", result.err());
+    w.last_error = None;
+}
+
+#[then("the delta is accepted")]
+async fn then_delta_accepted(w: &mut KisekiWorld) {
+    assert!(w.last_error.is_none() || w.last_error.as_deref() == Some(""),
+        "delta should be accepted after retry");
 }

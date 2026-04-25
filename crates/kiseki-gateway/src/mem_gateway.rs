@@ -52,6 +52,10 @@ pub struct InMemoryGateway {
     inline_threshold: u64,
     /// Inline content store for small-file reads (ADR-030).
     small_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
+    /// Shard map store for multi-shard routing (ADR-033).
+    /// When present, the gateway routes writes to the correct shard
+    /// based on hashed_key. When absent, uses the namespace's single shard_id.
+    shard_map: std::sync::RwLock<Option<Arc<kiseki_control::shard_topology::NamespaceShardMapStore>>>,
 }
 
 impl InMemoryGateway {
@@ -79,7 +83,28 @@ impl InMemoryGateway {
             last_written_seq: std::sync::Mutex::new(std::collections::HashMap::new()),
             inline_threshold: 0, // disabled by default; set via with_inline_threshold
             small_store: None,
+            shard_map: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Attach a shard map store for multi-shard routing (ADR-033).
+    #[must_use]
+    pub fn with_shard_map(
+        self,
+        store: Arc<kiseki_control::shard_topology::NamespaceShardMapStore>,
+    ) -> Self {
+        *self.shard_map.write().unwrap() = Some(store);
+        self
+    }
+
+    /// Clear the shard map (simulates stale cache — falls back to namespace shard_id).
+    pub fn clear_shard_map(&self) {
+        *self.shard_map.write().unwrap() = None;
+    }
+
+    /// Re-attach a shard map store after clearing (simulates cache refresh).
+    pub fn set_shard_map(&self, store: Arc<kiseki_control::shard_topology::NamespaceShardMapStore>) {
+        *self.shard_map.write().unwrap() = Some(store);
     }
 
     /// Set the inline data threshold (ADR-030).
@@ -394,7 +419,20 @@ impl GatewayOps for InMemoryGateway {
         // Emit delta to log (async, slow — Raft consensus).
         if let Some(ref log) = log {
             let hashed_key = kiseki_composition::composition_hash_key(emit_params.2, comp_id);
-            let shard_id = emit_params.0;
+
+            // ADR-033: route to correct shard via shard map if available.
+            let shard_id = if let Some(ref shard_map) = *self.shard_map.read().unwrap() {
+                // Convert NamespaceId to string for shard map lookup.
+                let ns_str = emit_params.2.0.to_string();
+                if let Ok(map) = shard_map.get(&ns_str, emit_params.1) {
+                    kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)
+                        .unwrap_or(emit_params.0)
+                } else {
+                    emit_params.0
+                }
+            } else {
+                emit_params.0
+            };
 
             match kiseki_composition::log_bridge::emit_delta(
                 log.as_ref(),
