@@ -18,8 +18,14 @@ async fn given_compliance(w: &mut KisekiWorld, tenant: String, _tags: String) {
 }
 
 #[given(regex = r#"^system key manager healthy at epoch (\d+)$"#)]
-async fn given_key_manager_epoch(_w: &mut KisekiWorld, _epoch: u64) {
-    todo!("set key manager to specified epoch")
+async fn given_key_manager_epoch(w: &mut KisekiWorld, epoch: u64) {
+    use kiseki_keymanager::epoch::KeyManagerOps;
+    use kiseki_keymanager::health::KeyManagerStatus;
+    w.key_store.set_status(KeyManagerStatus::Healthy);
+    let current = w.key_store.current_epoch().await.unwrap();
+    for _ in current.0..epoch {
+        w.key_store.rotate().await.unwrap();
+    }
 }
 
 // === Scenario: ptrace attachment detected ===

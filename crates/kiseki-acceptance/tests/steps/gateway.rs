@@ -353,18 +353,51 @@ async fn then_visible_after_consume(w: &mut KisekiWorld) {
 // === Scenario: S3 multipart upload ===
 
 #[given(regex = r#"^a client starts S3 CreateMultipartUpload for "(\S+)"$"#)]
-async fn given_s3_multipart(_w: &mut KisekiWorld, _key: String) {
-    // No-op at @unit tier — multipart upload initiation is a precondition.
+async fn given_s3_multipart(w: &mut KisekiWorld, _key: String) {
+    w.ensure_namespace("default", "shard-default");
+    let ns_id = *w.namespace_ids.get("default").unwrap();
+    let upload_id = w.gateway.start_multipart(ns_id).await.unwrap();
+    // Store upload_id in workflow_names map for subsequent steps.
+    w.workflow_names.insert(
+        "multipart-upload".to_owned(),
+        kiseki_common::advisory::WorkflowRef(
+            uuid::Uuid::parse_str(&upload_id)
+                .unwrap_or_else(|_| uuid::Uuid::new_v4())
+                .into_bytes(),
+        ),
+    );
+    // Also store the raw string for API calls.
+    w.shard_names.entry("_multipart_upload_id".to_owned()).or_insert_with(|| {
+        kiseki_common::ids::ShardId(uuid::Uuid::parse_str(&upload_id).unwrap_or_else(|_| uuid::Uuid::new_v4()))
+    });
 }
 
 #[when("parts are uploaded:")]
-async fn when_parts_uploaded(_w: &mut KisekiWorld) {
-    todo!("upload multipart parts")
+async fn when_parts_uploaded(w: &mut KisekiWorld) {
+    let upload_sid = w.shard_names.get("_multipart_upload_id").unwrap();
+    let upload_id = upload_sid.0.to_string();
+    for (i, data) in [b"part-1-data".as_slice(), b"part-2-data", b"part-3-data"]
+        .iter()
+        .enumerate()
+    {
+        w.gateway
+            .upload_part(&upload_id, (i + 1) as u32, data)
+            .await
+            .unwrap();
+    }
 }
 
 #[when("the client sends CompleteMultipartUpload")]
-async fn when_complete_multipart(_w: &mut KisekiWorld) {
-    todo!("send CompleteMultipartUpload")
+async fn when_complete_multipart(w: &mut KisekiWorld) {
+    let upload_sid = w.shard_names.get("_multipart_upload_id").unwrap();
+    let upload_id = upload_sid.0.to_string();
+    match w.gateway.complete_multipart(&upload_id).await {
+        Ok(comp_id) => {
+            w.last_composition_id = Some(comp_id);
+            w.last_error = None;
+        }
+        Err(e) => w.last_error = Some(e.to_string()),
+    }
 }
 
 #[then("the gateway verifies all chunks are durable")]
