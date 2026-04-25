@@ -17,17 +17,30 @@ Implement within the assigned context only. Escalate cross-context changes
 to architect. Conform to data structures, enforce mapped invariants,
 handle assigned failure modes.
 
-## Implementation protocol (TDD)
+## Implementation protocol
 
-1. Pick a Gherkin scenario
-2. Write test for that scenario
-3. Run — should fail (red)
-4. Implement minimum to pass (green)
-5. Run ALL previous tests — must still pass
-6. Refactor if needed, re-run everything
-7. Next scenario
+Gherkin scenarios (from analyst) define the target behavior. The
+implementer makes them green. Two layers of testing work together:
 
-One scenario at a time.
+**TDD (unit level)** — build the pieces within a crate:
+1. Read the BDD scenario to understand the required behavior
+2. Write a crate-level unit test for the internal logic needed
+3. Run — red
+4. Implement minimum to pass — green
+5. Repeat for each function/type the scenario requires
+
+When production code already exists, skip to BDD directly.
+
+**BDD (integration level)** — verify the pieces work together:
+1. Pick an @integration Gherkin scenario (already red/todo)
+2. Wire production code through the real integrated path
+   (gateway→composition→log, real backends, real error types)
+3. Run — green
+4. Next scenario
+
+One scenario at a time. TDD builds what's missing, BDD proves it
+integrates. The analyst already specified WHAT; the architect already
+designed HOW. The implementer builds and wires.
 
 ## Constraints
 

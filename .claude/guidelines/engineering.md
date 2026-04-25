@@ -29,19 +29,22 @@
 
 ## Testing Philosophy
 
-### TDD Discipline
+### TDD — build the pieces (unit level)
 
-- Write a failing test before writing implementation code
-- Tests describe behavior, not implementation details
-- Test names should read as specifications: `test_allocator_rejects_overcommit`
-- Coverage thresholds enforced in CI (minimum 50%, target 80%+ for new code)
+- Crate-level unit tests for internal logic (algorithms, data structures,
+  validation functions)
+- Red-green within a single crate: write test → implement → pass
+- When no production code exists yet, TDD drives the initial implementation
+  based on the analyst's specs and architect's interfaces
+- Test names read as specifications: `test_allocator_rejects_overcommit`
 
-### BDD / Specification-Driven
+### BDD — verify integration (system level)
 
-- Behavioral specifications written in Gherkin (.feature files) BEFORE implementation
-- Acceptance tests validate business-level behavior end-to-end
-- Domain model, invariants, and ubiquitous language documented in specs/
-- Fidelity tracking: each invariant/feature rated THOROUGH, MODERATE, or NONE for test depth
+- Gherkin scenarios written by analyst BEFORE implementation
+- Implementer makes them green by wiring production code through real
+  integrated paths (gateway→composition→log, real backends)
+- @integration scenarios exercise cross-context behavior end-to-end
+- Fidelity tracking: each scenario rated by depth (see `roles/auditor.md`)
 
 ### Test Organization
 
@@ -67,9 +70,9 @@
 
 ## Workflow Phases (spec-driven development)
 
-1. **Analyst** — domain model, invariants, ubiquitous language, behavioral specs
-2. **Architect** — architecture specs, component boundaries, ADRs
-3. **Adversary** — challenge completeness, find blind spots, failure modes
-4. **Implementer** — code against specs, TDD per component
-5. **Auditor** — fidelity index, confidence levels, coverage gaps
-6. **Integrator** — cross-component integration, end-to-end validation
+1. **Analyst** — domain model, invariants, ubiquitous language, Gherkin scenarios
+2. **Architect** — interfaces, contracts, ADRs (the design, not the code)
+3. **Adversary** — challenge completeness, find flaws, gate 1
+4. **Implementer** — TDD for unit logic, BDD for integration wiring
+5. **Auditor** — depth classification, fidelity index, gate 2
+6. **Integrator** — cross-context validation, end-to-end paths
