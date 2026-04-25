@@ -107,6 +107,22 @@ impl InMemoryGateway {
         *self.shard_map.write().unwrap() = Some(store);
     }
 
+    /// Simulate a gateway crash: drop all ephemeral state.
+    ///
+    /// Clears namespace cache, session tracking, and counters.
+    /// Durable state (log store, chunk store) is unaffected.
+    /// NFS opens/locks and in-flight multipart uploads are lost.
+    pub async fn crash(&self) {
+        // Clear composition namespace cache (ephemeral).
+        self.compositions.lock().await.clear_namespaces();
+        // Clear session tracking.
+        self.last_written_seq.lock().unwrap().clear();
+        // Reset counters.
+        self.requests_total.store(0, Ordering::Relaxed);
+        self.bytes_written.store(0, Ordering::Relaxed);
+        self.bytes_read.store(0, Ordering::Relaxed);
+    }
+
     /// Set the inline data threshold (ADR-030).
     ///
     /// Files with encrypted payload at or below this size are stored

@@ -145,6 +145,11 @@ impl CompositionStore {
         self.namespaces.insert(ns.id, ns);
     }
 
+    /// Clear all namespace registrations (gateway crash simulation).
+    pub fn clear_namespaces(&mut self) {
+        self.namespaces.clear();
+    }
+
     /// Get a namespace.
     #[must_use]
     pub fn namespace(&self, id: NamespaceId) -> Option<&Namespace> {
