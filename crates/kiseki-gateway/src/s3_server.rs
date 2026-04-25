@@ -750,6 +750,247 @@ mod tests {
         assert!(xml.contains("ListAllMyBucketsResult"), "xml: {xml}");
     }
 
+    // ---------- S3 PutObject — empty body creates zero-byte object ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_empty_body_returns_200_with_etag() {
+        let app = test_router();
+
+        // Create bucket first.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/empty-bucket")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // PUT with empty body.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/empty-bucket/empty-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("etag").is_some(),
+            "ETag should be returned for empty body PUT"
+        );
+    }
+
+    // ---------- S3 GetObject — nonexistent returns 404 ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_nonexistent_object_returns_404() {
+        let app = test_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/default/00000000-0000-0000-0000-000000000099")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---------- S3 GetObject — invalid UUID key returns 404 ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_invalid_uuid_returns_404() {
+        let app = test_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/default/not-a-uuid")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---------- S3 HeadObject — metadata without body ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn head_object_returns_content_length_and_empty_body() {
+        let app = test_router();
+
+        // Create bucket.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/head-bucket")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // PUT 100-byte object.
+        let data = vec![0x42u8; 100];
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/head-bucket/some-key")
+            .body(Body::from(data))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_owned();
+
+        // HEAD by composition UUID.
+        let req = Request::builder()
+            .method("HEAD")
+            .uri(format!("/head-bucket/{etag}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cl = resp
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cl, "100", "Content-Length should equal 100");
+
+        // HEAD should have empty body.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty(), "HEAD response body should be empty");
+    }
+
+    // ---------- S3 HeadObject — nonexistent returns 404 ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn head_nonexistent_object_returns_404() {
+        let app = test_router();
+        let req = Request::builder()
+            .method("HEAD")
+            .uri("/default/00000000-0000-0000-0000-000000000099")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---------- S3 DeleteObject — returns 204 ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_object_returns_204() {
+        let app = test_router();
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/default/anything")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    // ---------- S3 ListObjectsV2 — prefix filtering ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_objects_prefix_filtering() {
+        let app = test_router();
+
+        // Create bucket + register namespace.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/prefix-bucket")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // PUT several objects — keys are ignored, composition UUIDs are the real keys.
+        // For prefix filtering to work, we need UUIDs that share a prefix.
+        // Since UUIDs are random, we'll just verify the mechanism works
+        // by creating objects and checking we can list them.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/prefix-bucket/obj1")
+            .body(Body::from("data1"))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/prefix-bucket/obj2")
+            .body(Body::from("data2"))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // List all objects (no prefix filter).
+        let req = Request::builder()
+            .method("GET")
+            .uri("/prefix-bucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let count = json["key_count"].as_u64().unwrap();
+        assert_eq!(count, 2, "should have 2 objects");
+
+        // List with a prefix that matches nothing.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/prefix-bucket?prefix=zzz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let count = json["key_count"].as_u64().unwrap();
+        assert_eq!(count, 0, "prefix=zzz should match nothing");
+    }
+
+    // ---------- S3 ListObjectsV2 — pagination with max-keys ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_objects_pagination() {
+        let app = test_router();
+
+        // Create bucket.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/page-bucket")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // PUT several objects.
+        for i in 0..5 {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!("/page-bucket/obj-{i}"))
+                .body(Body::from(format!("data-{i}")))
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+        }
+
+        // List with max-keys=2.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/page-bucket?max-keys=2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let count = json["key_count"].as_u64().unwrap();
+        assert_eq!(count, 2, "should return max-keys=2 objects");
+        assert_eq!(json["is_truncated"].as_bool().unwrap(), true, "should be truncated");
+        assert!(
+            json["next_continuation_token"].is_string(),
+            "should provide NextContinuationToken"
+        );
+    }
+
+    // ---------- Original roundtrip test ----------
+
     #[tokio::test(flavor = "multi_thread")]
     async fn put_get_object_roundtrip() {
         let app = test_router();

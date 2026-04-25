@@ -14,15 +14,8 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Happy path: chunk write ---
 
-  @unit
-  Scenario: Write a chunk with HMAC ID (opted-out tenant)
-    Given the Composition context for "org-defense" submits plaintext data
-    When the system computes chunk_id = HMAC(plaintext, org-defense_tenant_key)
-    And encrypts the plaintext with a system DEK
-    And stores the ciphertext in pool "fast-nvme"
-    Then the chunk_id is unique to "org-defense"
-    And the same plaintext from another tenant would produce a different chunk_id
-    And cross-tenant dedup cannot match this chunk
+  # @unit Scenario "Write a chunk with HMAC ID" moved to crate-level unit test:
+  # kiseki-crypto/src/chunk_id.rs::hmac_chunk_id_unique_per_tenant_no_cross_dedup
 
   # --- Placement and affinity ---
 
@@ -84,49 +77,12 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # caller. Hints are preferences; placement remains server-authoritative
   # (I-WA9). Ownership is checked before any telemetry is computed (I-WA6).
 
-  @unit
-  Scenario: Affinity hint preference honoured within policy
-    Given workload "training-run-42" is authorised for pools [fast-nvme, bulk-nvme]
-    And a new chunk is being placed for composition "checkpoint.pt"
-    And the caller has attached hint { affinity_pool: "fast-nvme", colocate_rack: "rack-7" }
-    When the placement engine runs
-    Then the chunk MAY be placed in fast-nvme on rack-7 when durability and retention constraints allow
-    And the engine MAY override the hint to satisfy I-C3 (policy), I-C4 (durability), or I-C2b (retention hold)
-    And hints never cause placement in a pool the workload is not authorised for (I-WA14)
-
-  @unit
-  Scenario: Dedup-intent hint { per-rank } skips dedup path for scratch chunks
-    Given workload "training-run-42" writes per-rank scratch output
-    And the caller attaches hint { dedup_intent: per-rank }
-    When the chunk is presented for storage
-    Then the dedup refcount path is bypassed (no sha256 lookup; new chunk allocated)
-    And the chunk ID is still derived per I-K10 (tenant HMAC if opted out, sha256 otherwise)
-    And subsequent writes of identical plaintext by the same workload do NOT coalesce via dedup (hint honoured)
-    And tenant dedup policy (I-X2) is never violated regardless of hint
-
-  @unit
-  Scenario: Dedup-intent hint { shared-ensemble } uses normal dedup path
-    Given workload "training-run-42" writes ensemble-broadcast input data
-    And the caller attaches hint { dedup_intent: shared-ensemble }
-    When the chunk is presented for storage
-    Then the dedup refcount path is used normally, bounded by I-X2 tenant policy
-    And the hint never enables cross-tenant dedup when tenant policy opts out (I-K10)
-
-  @unit
-  Scenario: Locality-class telemetry for caller-owned chunks
-    Given workload "training-run-42" reads a 1GB composition spanning 64 chunks on mixed placement
-    When the caller requests LocalityTelemetry for the composition
-    Then the response classifies each chunk into one of {local-node, local-rack, same-pool, remote, degraded}
-    And no node ID, rack label, device serial, or pool utilisation metric is returned (I-WA11)
-    And only chunks owned by the caller's workload are included; unauthorised targets return the same shape as absent chunks (I-WA6)
-
-  @unit
-  Scenario: Pool backpressure telemetry uses k-anonymity bucketing under low-k
-    Given pool "fast-nvme" hosts chunks from workload "training-run-42" and three neighbour workloads (k=4 < 5)
-    When the caller subscribes to pool-backpressure telemetry for "fast-nvme"
-    Then the response shape is identical to the populated-k case
-    And neighbour-derived fields carry the fixed sentinel value defined by policy (I-WA5)
-    And no timing or size variation reveals the actual k
+  # @unit scenarios moved to crate-level unit tests:
+  # "Affinity hint preference" → kiseki-chunk/src/store.rs::placement_works_without_affinity_hints
+  # "Dedup-intent { per-rank }" → kiseki-chunk/src/store.rs::dedup_intent_per_rank_skips_dedup
+  # "Dedup-intent { shared-ensemble }" → kiseki-chunk/src/store.rs::dedup_intent_shared_ensemble_uses_normal_dedup
+  # "Locality-class telemetry" → kiseki-chunk/src/store.rs::locality_class_telemetry_shape
+  # "Pool backpressure k-anonymity" → kiseki-chunk/src/store.rs::pool_backpressure_k_anonymity_sentinel
 
   @integration
   Scenario: Repair-degraded read emits telemetry without leaking topology

@@ -101,4 +101,41 @@ mod tests {
             id2.unwrap_or_else(|_| unreachable!())
         );
     }
+
+    // ---------------------------------------------------------------
+    // Scenario: Write a chunk with HMAC ID (opted-out tenant)
+    // HMAC chunk ID is unique per tenant: same plaintext from two
+    // tenants with different keys produces different IDs (I-K10).
+    // Cross-tenant dedup cannot match.
+    // ---------------------------------------------------------------
+    #[test]
+    fn hmac_chunk_id_unique_per_tenant_no_cross_dedup() {
+        let plaintext = b"identical payload";
+        let key_defense = b"org-defense-tenant-key-material!";
+        let key_pharma = b"org-pharma-tenant-key-material!!";
+
+        // Both tenants produce chunk IDs from the same plaintext.
+        let id_defense =
+            derive_chunk_id(plaintext, DedupPolicy::TenantIsolated, Some(key_defense)).unwrap();
+        let id_pharma =
+            derive_chunk_id(plaintext, DedupPolicy::TenantIsolated, Some(key_pharma)).unwrap();
+
+        // Same plaintext, different tenant keys → different chunk IDs.
+        assert_ne!(
+            id_defense, id_pharma,
+            "HMAC IDs must differ across tenants (cross-tenant dedup blocked)"
+        );
+
+        // Same tenant, same plaintext → deterministic.
+        let id_defense_2 =
+            derive_chunk_id(plaintext, DedupPolicy::TenantIsolated, Some(key_defense)).unwrap();
+        assert_eq!(
+            id_defense, id_defense_2,
+            "HMAC ID must be deterministic within a tenant"
+        );
+
+        // Cross-tenant dedup (SHA-256) would match — HMAC does not.
+        let id_cross = derive_chunk_id(plaintext, DedupPolicy::CrossTenant, None).unwrap();
+        assert_ne!(id_cross, id_defense, "HMAC ID must differ from SHA-256 ID");
+    }
 }

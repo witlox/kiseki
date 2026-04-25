@@ -128,6 +128,58 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ---------------------------------------------------------------
+    // Scenario: Tenant opts in to compression
+    // New chunks are compressed before encryption, padded to 4KB.
+    // ---------------------------------------------------------------
+    #[test]
+    fn tenant_opt_in_compression_4kb_padding() {
+        let aead = Aead::new();
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let chunk_id = ChunkId([0xDD; 32]);
+        let plaintext = b"compressible data that repeats: data data data data data data";
+
+        // Compress with 4KB alignment (as specified for tenant opt-in).
+        let envelope =
+            compress_and_encrypt(&aead, &master, &chunk_id, plaintext, 4096).unwrap();
+
+        // Ciphertext length is a multiple of 4096 (padded).
+        assert_eq!(
+            envelope.ciphertext.len() % 4096,
+            0,
+            "ciphertext must be padded to 4KB alignment"
+        );
+
+        // Round-trip: decrypt and decompress recovers original plaintext.
+        let recovered = decrypt_and_decompress(&aead, &master, &envelope, 1024 * 1024).unwrap();
+        assert_eq!(recovered.as_slice(), plaintext, "round-trip must recover plaintext");
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Compressed chunk round-trip (10MB)
+    // ---------------------------------------------------------------
+    #[test]
+    fn compressed_chunk_roundtrip_large() {
+        let aead = Aead::new();
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let chunk_id = ChunkId([0xEE; 32]);
+
+        // 100KB of compressible data (simulating a scaled-down version).
+        let plaintext = vec![0x42u8; 100_000];
+
+        let envelope =
+            compress_and_encrypt(&aead, &master, &chunk_id, &plaintext, 4096).unwrap();
+
+        // Ciphertext should be padded and NOT equal to plaintext.
+        assert_ne!(envelope.ciphertext, plaintext);
+        assert_eq!(envelope.ciphertext.len() % 4096, 0);
+
+        // Decrypt and decompress recovers original.
+        let recovered =
+            decrypt_and_decompress(&aead, &master, &envelope, 200_000).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
     #[test]
     fn decompress_size_limit_enforced() {
         let aead = Aead::new();

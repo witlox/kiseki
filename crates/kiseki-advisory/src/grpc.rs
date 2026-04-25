@@ -52,11 +52,22 @@ fn to_proto_ref(wf: &WorkflowRef) -> kiseki_proto::v1::WorkflowRef {
 
 fn domain_error_to_proto(e: &AdvisoryError) -> kiseki_proto::v1::AdvisoryError {
     let code = match e {
-        AdvisoryError::WorkflowNotFound => 14,        // ScopeNotFound
+        AdvisoryError::WorkflowNotFound
+        | AdvisoryError::ScopeViolation
+        | AdvisoryError::ScopeNotFound
+        | AdvisoryError::WorkflowUnknown => 14,       // ScopeNotFound / NOT_FOUND
         AdvisoryError::BudgetExceeded(_) => 5,        // BudgetExceeded
         AdvisoryError::ProfileNotAllowed(_) => 3,     // ProfileNotAllowed
         AdvisoryError::PhaseNotMonotonic { .. } => 9, // PhaseNotMonotonic
         AdvisoryError::AdvisoryDisabled => 2,         // AdvisoryDisabled
+        AdvisoryError::ChildExceedsParentCeiling(_) => 6,
+        AdvisoryError::RetentionPolicyConflict => 10,
+        AdvisoryError::PriorityNotAllowed => 11,
+        AdvisoryError::PrefetchBudgetExceeded => 12,
+        AdvisoryError::ForbiddenTargetField(_) => 13,
+        AdvisoryError::ProfileRevoked => 15,
+        AdvisoryError::PriorityRevoked => 16,
+        AdvisoryError::TtlExpired => 17,
     };
     kiseki_proto::v1::AdvisoryError {
         code,

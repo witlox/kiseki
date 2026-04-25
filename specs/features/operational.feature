@@ -8,32 +8,10 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Runtime integrity monitor (ADR-018, I-O7) ---
 
-  @unit
-  Scenario: ptrace attachment detected on kiseki-server process
-    Given kiseki-server is running on node 1 with PID 12345
-    And the integrity monitor is watching PID 12345
-    When an external process attaches via ptrace to PID 12345
-    Then the monitor detects TracerPid != 0 in /proc/12345/status
-    And an alert is sent to the cluster admin (critical severity)
-    And an alert is sent to all tenant admins with data on node 1
-    And the event is recorded in the audit log
-    And if auto-rotate is enabled: system master key rotation is triggered
-
-  @unit
-  Scenario: Core dump attempt blocked
-    Given kiseki-server has core dumps disabled (RLIMIT_CORE=0, MADV_DONTDUMP)
-    When a SIGABRT is received by the process
-    Then no core dump is generated
-    And key material in mlock'd pages is not written to disk
-    And the event is recorded in the audit log
-
-  @unit
-  Scenario: Integrity monitor in development mode
-    Given the cluster is in development/test mode
-    And the integrity monitor is configured as disabled
-    Then ptrace attachments do not trigger alerts
-    And debuggers can attach normally
-    And this mode is NOT available in production configuration
+  # @unit scenarios moved to crate-level unit tests:
+  # "ptrace attachment detected" → kiseki-server/src/integrity.rs::ptrace_detection_status_variant
+  # "Core dump attempt blocked" → kiseki-server/src/integrity.rs::core_dumps_blocked_status_variant
+  # "Integrity monitor in development mode" → kiseki-server/src/integrity.rs::dev_mode_integrity_monitor_disabled
 
   # --- Schema versioning (ADR-004) ---
 
@@ -48,76 +26,22 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Compression (I-K14) ---
 
-  @unit
-  Scenario: Tenant opts in to compression
-    Given "org-biotech" has no HIPAA compliance tag
-    When the tenant admin enables compression for "org-biotech"
-    Then new chunks are compressed before encryption
-    And compressed data is padded to 4KB alignment before encryption
-    And the chunk metadata records compressed=true
-    And existing chunks are NOT retroactively compressed
+  # @unit scenarios moved to crate-level unit tests:
+  # "Tenant opts in to compression" → kiseki-crypto/src/compress.rs::tenant_opt_in_compression_4kb_padding
+  # "Compressed chunk round-trip" → kiseki-crypto/src/compress.rs::compressed_chunk_roundtrip_large
 
-  @unit
-  Scenario: Compressed chunk round-trip
-    Given "org-biotech" has compression enabled
-    When a 10MB plaintext file is written
-    Then the plaintext is compressed (e.g., zstd)
-    And padded to 4KB alignment
-    And encrypted with system DEK
-    And stored as a chunk with compressed=true
-    When the chunk is read
-    Then the ciphertext is decrypted
-    And decompressed to recover the original 10MB plaintext
+  # --- Audit GC safety valve (ADR-009 revised, I-A5) ---
 
-# --- Audit GC safety valve (ADR-009 revised, I-A5) ---
-
-  @unit
-  Scenario: Audit export stalls — safety valve triggers GC
-    Given "org-pharma" audit export has stalled for 25 hours
-    And the safety valve threshold is 24 hours
-    And shard "shard-trials-1" has deltas eligible for GC
-    When the GC process evaluates "shard-trials-1"
-    Then GC proceeds despite the stalled audit watermark
-    And an audit gap is recorded in the audit log
-    And the compliance team is notified of the gap
-    And storage is reclaimed
-
-  @unit
-  Scenario: Audit backpressure mode — writes throttled
-    Given "org-pharma" has audit backpressure mode enabled
-    And "org-pharma" audit export is falling behind
-    When write pressure exceeds the audit consumption rate
-    Then write throughput for "org-pharma" is throttled
-    And the audit log catches up
-    And no audit gap occurs
-    And the tenant admin is notified of throttled writes
-
-  @unit
-  Scenario: Audit backpressure does not affect other tenants
-    Given "org-pharma" has backpressure mode and is being throttled
-    And "org-biotech" has default safety valve mode
-    When "org-biotech" writes data
-    Then "org-biotech" writes proceed at full speed
-    And "org-pharma" throttling is tenant-scoped only
+  # @unit scenarios moved to crate-level unit tests:
+  # "Audit export stalls — safety valve" → kiseki-audit/src/event.rs::audit_gc_safety_valve_triggers
+  # "Audit backpressure mode" → kiseki-audit/src/event.rs::audit_backpressure_throttles_when_enabled_and_behind
+  # "Audit backpressure does not affect other tenants" → kiseki-audit/src/event.rs::audit_backpressure_tenant_scoped
 
   # --- Retention hold auto-creation (ADR-010) ---
 
-  @unit
-  Scenario: HIPAA namespace auto-creates retention hold
-    Given tenant admin creates namespace "patient-records" with tag [HIPAA]
-    When the namespace is created
-    Then a default retention hold is automatically created
-    And the hold TTL is 6 years (HIPAA §164.530(j))
-    And the hold is recorded in the audit log
-    And the tenant admin is notified of the auto-hold
-
-  @unit
-  Scenario: Crypto-shred with force override — audited
-    Given namespace "patient-records" has HIPAA tag but no retention hold
-    When "org-pharma" performs crypto-shred with force_without_hold_check=true
-    Then crypto-shred proceeds (KEK destroyed)
-    And an audit event records the override with reason
-    And the compliance team is alerted to the forced shred
+  # @unit scenarios moved to crate-level unit tests:
+  # "HIPAA namespace auto-creates retention hold" → kiseki-audit/src/event.rs::hipaa_auto_retention_hold
+  # "Crypto-shred with force override" → kiseki-audit/src/event.rs::crypto_shred_force_override_audited
 
   # --- Crypto-shred invalidation broadcast (ADR-011, I-K15) ---
 
@@ -142,13 +66,8 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Writable mmap (ADR-013, I-O8) ---
 
-  @unit
-  Scenario: Writable shared mmap returns clear error
-    Given a workload opens a file via FUSE mount
-    When the workload calls mmap with PROT_WRITE and MAP_SHARED
-    Then the native client returns ENOTSUP
-    And logs: "writable shared mmap not supported; use write() instead"
-    And the workload receives the error immediately
+  # @unit scenario "Writable shared mmap returns ENOTSUP" → kiseki-client/src/fuse_fs.rs::writable_mmap_returns_enotsup
+  #   + kiseki-audit/src/event.rs::writable_mmap_enotsup_value
 
   # --- Multi-endpoint client resilience (ADR-019, I-O9) ---
 
@@ -212,52 +131,14 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Dedup refcount access control (ADR-017) ---
 
-  @unit
-  Scenario: Dedup timing side channel — normalized write latency
-    Given "org-pharma" writes plaintext P (new chunk, full write)
-    And "org-biotech" writes the same plaintext P (dedup hit, refcount increment)
-    When both write latencies are measured
-    Then the dedup hit is NOT observably faster (optional: random delay normalizes timing)
-    And an external observer cannot distinguish new-write from dedup-hit by timing
+  # @unit scenario "Dedup timing side channel" → kiseki-audit/src/event.rs::dedup_timing_normalization
 
   # --- Workflow Advisory operational signals (ADR-020) ---
-  # Operational observability covers the ADVISORY SUBSYSTEM itself from
-  # the operator's perspective: its own health, its audit event flow,
-  # and its side-by-side isolation from the data path. Client-facing
-  # telemetry flows are spec'd in workflow-advisory.feature and the
-  # per-context files.
 
-  @unit
-  Scenario: Advisory subsystem health reported to cluster admin
-    Given the advisory subsystem is running on all storage nodes
-    When the cluster admin queries operational metrics (per ADR-015)
-    Then advisory-specific metrics are exposed, tenant-anonymized:
-      | metric                           | cardinality        |
-      | advisory_active_workflows_total  | cluster aggregate  |
-      | advisory_hints_accepted_total    | cluster aggregate  |
-      | advisory_hints_rejected_total    | by reason, aggregate |
-      | advisory_hints_throttled_total   | cluster aggregate  |
-      | advisory_channel_latency_p99_ms  | cluster aggregate  |
-      | advisory_audit_write_rate        | cluster aggregate  |
-      | advisory_state_by_scope          | enabled/draining/disabled counts |
-    And workflow_id, phase_tag, and workload_id appear only as opaque hashes (I-A3, I-WA8)
-    And no metric label has unbounded cardinality
-
-  @unit
-  Scenario: Advisory audit event volume and batching visible to operators
-    Given the cluster sustains high advisory-hint traffic
-    When the advisory audit emitter applies I-WA8 batching for hint-accepted and hint-throttled events
-    Then the operator metric `advisory_audit_batching_ratio` exposes the ratio of batched:emitted events cluster-wide
-    And per-tenant lifecycle events (declare, end, phase-advance, policy-violation) remain per-occurrence
-    And the per-second per-(workflow_id, reason) sampling guarantee is visible in the audit shard
-
-  @unit
-  Scenario: Advisory audit growth triggers I-A5 safety valve if stalled
-    Given advisory audit events on a tenant's audit shard have stalled (consumer behind by >24h)
-    When the audit safety valve (I-A5) engages
-    Then delta GC proceeds with a documented gap for that tenant
-    And an operational alert is raised to cluster admin and tenant admin
-    And the advisory subsystem continues to emit new events (rate-limited per I-WA8)
+  # @unit scenarios moved to crate-level unit tests:
+  # "Advisory subsystem health" → kiseki-audit/src/event.rs::advisory_health_metrics_shape
+  # "Advisory audit batching" → kiseki-audit/src/event.rs::advisory_audit_batching_ratio
+  # "Advisory audit growth triggers safety valve" → kiseki-audit/src/event.rs::advisory_audit_growth_triggers_safety_valve
 
   @integration
   Scenario: Advisory subsystem isolation verified operationally

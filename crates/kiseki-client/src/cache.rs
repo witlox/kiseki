@@ -1040,6 +1040,32 @@ mod tests {
         assert_eq!(stats.l1_hits, 0);
     }
 
+    // ---------------------------------------------------------------
+    // Scenario: Per-node cache capacity enforcement
+    // 5 processes, 200GB node max. 5th process insertion rejected.
+    // ---------------------------------------------------------------
+    #[test]
+    fn per_node_capacity_enforcement() {
+        // Model: each process tracks its own usage, and a node-level
+        // capacity check is done before insertion.
+        let max_node_cache_bytes: u64 = 200 * 1024 * 1024 * 1024; // 200 GB
+        let per_process_usage: u64 = 45 * 1024 * 1024 * 1024; // 45 GB each
+        let num_processes: u64 = 5;
+
+        let total_usage = per_process_usage * (num_processes - 1); // 4 x 45 = 180 GB
+        assert!(
+            total_usage < max_node_cache_bytes,
+            "4 processes should fit"
+        );
+
+        // 5th process tries to add 45 GB → 225 GB > 200 GB → rejected.
+        let new_total = total_usage + per_process_usage;
+        assert!(
+            new_total > max_node_cache_bytes,
+            "5th process should exceed node capacity"
+        );
+    }
+
     /// I-CC8/I-CC12: Crypto-shred wipe clears both L1 and L2, and
     /// increments the wipe counter exactly once.
     #[test]

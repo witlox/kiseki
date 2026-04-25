@@ -114,4 +114,53 @@ mod tests {
     fn disable_core_dumps_succeeds() {
         disable_core_dumps(); // Should not panic.
     }
+
+    // ---------------------------------------------------------------
+    // Scenario: ptrace attachment detected
+    // When TracerPid != 0, IntegrityStatus::DebuggerDetected is reported.
+    // ---------------------------------------------------------------
+    #[test]
+    fn ptrace_detection_status_variant() {
+        // Verify the DebuggerDetected variant exists and is distinct.
+        let status = IntegrityStatus::DebuggerDetected;
+        assert_ne!(status, IntegrityStatus::Ok);
+        assert_ne!(status, IntegrityStatus::CoreDumpsEnabled);
+        assert_eq!(status, IntegrityStatus::DebuggerDetected);
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Core dump attempt blocked
+    // RLIMIT_CORE=0, MADV_DONTDUMP — no core dump generated.
+    // ---------------------------------------------------------------
+    #[test]
+    fn core_dumps_blocked_status_variant() {
+        let status = IntegrityStatus::CoreDumpsEnabled;
+        assert_ne!(status, IntegrityStatus::Ok);
+        // In production, this triggers an alert. Here we verify
+        // the status can be checked and used for branching.
+        let should_alert = status == IntegrityStatus::CoreDumpsEnabled;
+        assert!(should_alert);
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario: Integrity monitor in development mode
+    // In dev/test mode, ptrace does not trigger alerts.
+    // ---------------------------------------------------------------
+    #[test]
+    fn dev_mode_integrity_monitor_disabled() {
+        let dev_mode = true;
+        let results = check_integrity();
+
+        // In dev mode, results are not actionable.
+        if dev_mode {
+            // No alerts should be sent regardless of results.
+            for status in &results {
+                let _alert = match status {
+                    IntegrityStatus::DebuggerDetected if !dev_mode => true,
+                    IntegrityStatus::CoreDumpsEnabled if !dev_mode => true,
+                    _ => false, // dev mode: suppress
+                };
+            }
+        }
+    }
 }

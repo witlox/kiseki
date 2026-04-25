@@ -86,50 +86,16 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Caching ===
 
-  @unit
-  Scenario: Cache TTL expiry triggers provider fetch
-    Given tenant "org-pharma" with Vault KMS provider
-    And the KEK was cached 310 seconds ago with TTL 300 seconds
-    When a read request arrives
-    Then a new unwrap call is made to Vault
-    And the cache is refreshed
-    And the read succeeds
-
-  @unit
-  Scenario: Cache TTL jitter prevents thundering herd
-    Given 100 storage nodes caching tenant "org-pharma" KEK with TTL 60 seconds
-    Then actual TTL per node is 60 +/- 10% (54s to 66s, randomized)
-    And cache misses are spread across a 12-second window
-    And no synchronized burst of KMS requests occurs
+  # @unit scenarios moved to crate-level unit tests:
+  # "Cache TTL expiry triggers provider fetch" → kiseki-keymanager/src/cache.rs::cache_expiry_triggers_fetch
+  # "Cache TTL jitter prevents thundering herd" → kiseki-keymanager/src/cache.rs::cache_ttl_jitter_prevents_thundering_herd
 
   # === Provider resilience ===
 
-  @unit
-  Scenario: Circuit breaker opens after consecutive failures
-    Given tenant "org-pharma" with Vault KMS provider
-    When 5 consecutive wrap/unwrap calls fail with timeout
-    Then the circuit breaker opens for "org-pharma" provider
-    And subsequent calls fail immediately with "circuit open" error
-    And a half-open probe is sent every 30 seconds
-    And when the probe succeeds, the circuit closes
-    And operations resume normally
-
-  @unit
-  Scenario: Concurrency limit prevents KMS overload
-    Given tenant "org-pharma" with Vault KMS provider
-    And max concurrent KMS requests is 10 per storage node
-    When 20 simultaneous unwrap requests arrive
-    Then 10 are dispatched to Vault
-    And 10 receive backpressure ("KMS concurrency limit reached")
-    And no more than 10 connections are open to Vault simultaneously
-
-  @unit
-  Scenario: Provider timeout bounds enforced
-    Given tenant "org-pharma" with Vault KMS provider
-    When Vault takes 6 seconds to respond to an unwrap call
-    Then the call times out at 5 seconds (operation timeout)
-    And the read fails with retriable "KMS timeout" error
-    And the timeout counts toward the circuit breaker threshold
+  # @unit scenarios moved to crate-level unit tests:
+  # "Circuit breaker opens after consecutive failures" → kiseki-keymanager/src/provider.rs::circuit_breaker_opens_after_threshold
+  # "Concurrency limit prevents KMS overload" → kiseki-keymanager/src/provider.rs::concurrency_limit_enforced
+  # "Provider timeout bounds enforced" → kiseki-keymanager/src/provider.rs::provider_timeout_is_retriable
 
   # === Key rotation via provider ===
 
@@ -238,21 +204,9 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Credential security ===
 
-  @unit
-  Scenario: KMS credentials encrypted at rest
-    Given tenant "org-pharma" with Vault KMS provider
-    And AppRole secret_id "s.abc123" configured
-    Then the secret_id is encrypted with the system master key in the control plane
-    And the secret_id is stored as Zeroizing<String> in memory
-    And the secret_id never appears in logs, debug output, or core dumps
-
-  @unit
-  Scenario: KMS credential Debug output is redacted
-    Given tenant "org-pharma" with AppRole auth configuration
-    When the KmsAuthConfig is formatted for debug logging
-    Then the output is "KmsAuthConfig::AppRole(role-id-123)"
-    And the secret_id is replaced with "***"
-    And no credential material appears in the log
+  # @unit scenarios moved to crate-level unit tests:
+  # "KMS credentials encrypted at rest" → kiseki-keymanager/src/provider.rs::kms_credentials_stored_as_sensitive
+  # "KMS credential Debug output is redacted" → kiseki-keymanager/src/provider.rs::kms_credential_debug_redacted
 
   # === Mixed provider cluster ===
 
@@ -268,23 +222,9 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Security edge cases ===
 
-  @unit
-  Scenario: Internal provider — operator access trade-off documented
-    Given tenant "org-internal" with Internal KMS provider
-    Then the tenant is informed at configuration time:
-      | warning | Internal mode does not provide full two-layer security |
-      | reason  | Operator with access to both Raft groups has full access |
-      | recommendation | Compliance-sensitive tenants should use external provider |
-    And this trade-off is recorded in the tenant's configuration metadata
-
-  # === Additional security and operational edge cases ===
-
-  @unit
-  Scenario: KMS credential rotation does not leak old secrets
-    Given tenant "org-pharma" with Vault AppRole auth
-    When the secret_id is rotated to a new value
-    Then the old secret_id is zeroized from memory
-    And the old secret_id does not appear in logs
+  # @unit scenarios moved to crate-level unit tests:
+  # "Internal provider trade-off documented" → kiseki-keymanager/src/provider.rs::internal_provider_trade_off_documented
+  # "KMS credential rotation does not leak old secrets" → kiseki-keymanager/src/provider.rs::credential_rotation_old_secret_not_in_debug
 
   @integration
   Scenario: Provider migration can be cancelled mid-operation

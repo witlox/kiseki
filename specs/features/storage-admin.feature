@@ -17,49 +17,21 @@ Feature: Storage administration API (ADR-025)
     Then the pool capacity equals the sum of device sizes
     And the pool health is "Healthy"
 
-  @unit
-  Scenario: Change pool durability — rejects if data exists
-    Given pool "fast-nvme" has stored chunks
-    When the admin attempts to change durability from EC 4+2 to EC 8+3
-    Then the operation is rejected with "pool has existing data"
-    And a note suggests creating a new pool and migrating
-
-  @unit
-  Scenario: Set pool thresholds
-    When the admin sets pool "fast-nvme" warning threshold to 70%
-    Then subsequent writes trigger Warning at 70% instead of default 75%
+  # @unit scenarios moved to crate-level unit tests:
+  # "Change pool durability" → kiseki-control/src/storage_admin.rs::change_pool_durability_rejects_with_data
+  # "Set pool thresholds" → kiseki-control/src/storage_admin.rs::set_pool_warning_threshold
 
   # === Performance tuning ===
 
-  @unit
-  Scenario: Set cluster-wide compaction rate
-    When the admin sets compaction_rate_mb_s to 200
-    Then background compaction runs at up to 200 MB/s
-
-  @unit
-  Scenario: Guard rail — compaction rate cannot be zero
-    When the admin attempts to set compaction_rate_mb_s to 0
-    Then the operation is rejected with "compaction rate must be >= 10"
-
-  @unit
-  Scenario: Set per-pool rebalance target
-    When the admin sets pool "fast-nvme" target_fill_pct to 65
-    Then the rebalance engine targets 65% fill on each device
-
-  @unit
-  Scenario: Tuning parameters inherit — pool overrides cluster
-    Given cluster-wide gc_interval_s is 300
-    When the admin sets pool "fast-nvme" gc_interval_s to 120
-    Then "fast-nvme" runs GC every 120s
-    And "bulk-hdd" still runs GC every 300s (cluster default)
+  # @unit scenarios moved to crate-level unit tests:
+  # "Set cluster-wide compaction rate" → kiseki-control/src/storage_admin.rs::set_compaction_rate
+  # "Guard rail — compaction rate cannot be zero" → kiseki-control/src/storage_admin.rs::compaction_rate_minimum_guard
+  # "Set per-pool rebalance target" → kiseki-control/src/storage_admin.rs::rebalance_target_per_pool
+  # "Tuning parameters inherit" → kiseki-control/src/storage_admin.rs::tuning_params_pool_overrides_cluster
 
   # === Observability ===
 
-  @unit
-  Scenario: Pool status shows performance metrics
-    When the admin requests PoolStatus for "fast-nvme"
-    Then the response includes read_iops, write_iops, avg_read_latency_ms
-    And the metrics reflect the last 60-second window
+  # @unit scenario "Pool status shows performance metrics" → kiseki-control/src/storage_admin.rs::pool_status_includes_metrics
 
   @integration
   Scenario: Device health streaming
@@ -92,16 +64,7 @@ Feature: Storage administration API (ADR-025)
 
   # === Authorization boundary ===
 
-  @unit
-  Scenario: Admin tuning changes are audited
-    When the admin changes compaction_rate_mb_s from 100 to 200
-    Then the audit log records:
-      | field      | value               |
-      | action     | SetTuningParams     |
-      | param      | compaction_rate_mb_s |
-      | old_value  | 100                 |
-      | new_value  | 200                 |
-      | admin_id   | cluster-admin-1     |
+  # @unit scenario "Admin tuning changes are audited" → kiseki-control/src/storage_admin.rs::tuning_changes_audited
 
   # === Operational safety ===
 
@@ -113,22 +76,12 @@ Feature: Storage administration API (ADR-025)
     And partially moved chunks remain consistent
     And the pool is left in a valid state
 
-  @unit
-  Scenario: Per-tenant resource usage for chargeback
-    When the admin requests per-tenant usage summary
-    Then the response shows capacity used per tenant
-    And IOPS attribution per tenant (last 24h)
-    And no tenant can see other tenants' usage
+  # @unit scenario "Per-tenant resource usage" → kiseki-control/src/storage_admin.rs::per_tenant_usage_isolation
 
   # === ADR025 adversarial findings — additional scenarios ===
 
   # C1: Per-tenant usage (via ControlService, not StorageAdmin)
-  @unit
-  Scenario: Tenant admin can view their own resource usage
-    Given a tenant admin authenticated for "org-pharma"
-    When they request GetTenantUsage
-    Then the response includes capacity_used_bytes and iops_last_24h
-    And only "org-pharma" data is shown
+  # @unit scenario "Tenant admin views own usage" → kiseki-control/src/storage_admin.rs::tenant_admin_own_usage
 
   # C2: Per-device I/O stats
   @integration
@@ -158,12 +111,7 @@ Feature: Storage administration API (ADR-025)
     And the admin is alerted to investigate
 
   # C4: EC parameter immutability
-  @unit
-  Scenario: EC parameters cannot be changed on pool with data
-    Given pool "fast-nvme" has existing chunks with EC 4+2
-    When the admin attempts SetPoolDurability to EC 8+3
-    Then the operation applies to new chunks only
-    And existing chunks retain EC 4+2
+  # @unit scenario "EC parameters cannot be changed" → kiseki-control/src/storage_admin.rs::ec_immutability_existing_chunks
 
   @integration
   Scenario: ReencodePool explicitly migrates EC parameters
@@ -174,18 +122,13 @@ Feature: Storage administration API (ADR-025)
     And the operation is cancellable
 
   # C5: Compaction rate guard rails
-  @unit
-  Scenario: Compaction rate cannot be set below minimum
-    When the admin attempts to set compaction_rate_mb_s to 5
-    Then the operation is rejected with "minimum is 10 MB/s"
-
-  @unit
-  Scenario: Compaction rate change is audited
-    When the admin sets compaction_rate_mb_s from 100 to 200
-    Then the cluster audit shard contains a TuningParameterChanged event
-    And the event includes old_value=100, new_value=200, admin_id
+  # @unit scenarios moved to crate-level unit tests:
+  # "Compaction rate below minimum" → kiseki-control/src/storage_admin.rs::compaction_rate_minimum_guard
+  # "Compaction rate change is audited" → kiseki-control/src/storage_admin.rs::compaction_rate_change_audited
 
   # C6: Inline threshold is prospective
+  # @unit scenario → kiseki-control/src/storage_admin.rs::inline_threshold_prospective
+
   # C7: RemoveDevice requires evacuation
   @integration
   Scenario: RemoveDevice blocked if device has data
@@ -200,20 +143,10 @@ Feature: Storage administration API (ADR-025)
     Then the device is removed from the pool
 
   # C8: Pool modifications audited to affected tenants
-  @unit
-  Scenario: Pool durability change audited to tenant shard
-    Given pool "fast-nvme" contains data for tenant "org-pharma"
-    When the cluster admin changes pool durability
-    Then "org-pharma" tenant audit shard contains a PoolModified event
-    And the event includes pool_id, change_type, admin_id
+  # @unit scenario "Pool durability change audited" → kiseki-control/src/storage_admin.rs::pool_durability_change_audited_to_tenant
 
   # C9: Tuning changes audited
-  @unit
-  Scenario: All tuning parameter changes are audited
-    When the admin changes gc_interval_s from 300 to 120
-    Then the cluster audit shard contains:
-      | param         | old | new | admin           |
-      | gc_interval_s | 300 | 120 | cluster-admin-1 |
+  # @unit scenario "All tuning parameter changes" → kiseki-control/src/storage_admin.rs::all_tuning_params_audited
 
   # H1: Streaming buffer semantics
   @integration
@@ -246,17 +179,9 @@ Feature: Storage administration API (ADR-025)
     Then the operation fails with SPLIT_IN_PROGRESS
 
   # H5: SRE read-only access
-  @unit
-  Scenario: SRE on-call can view cluster status
-    Given an SRE authenticated with sre-on-call certificate
-    When they request ClusterStatus
-    Then the response is returned successfully
-
-  @unit
-  Scenario: SRE on-call cannot modify pool settings
-    Given an SRE authenticated with sre-on-call certificate
-    When they attempt SetPoolThresholds
-    Then the request is rejected with PERMISSION_DENIED
+  # @unit scenarios moved to crate-level unit tests:
+  # "SRE on-call can view cluster status" → kiseki-control/src/storage_admin.rs::sre_can_view_cluster_status
+  # "SRE on-call cannot modify pool settings" → kiseki-control/src/storage_admin.rs::sre_cannot_create_pool
 
   @integration
   Scenario: SRE incident-response can trigger scrub
@@ -265,12 +190,7 @@ Feature: Storage administration API (ADR-025)
     Then the scrub begins successfully
 
   # H6/H7/H8: Multi-tenancy stats leakage documented
-  @unit
-  Scenario: Pool stats are aggregate — no tenant breakdown visible
-    Given pool "fast-nvme" serves tenants A and B
-    When the cluster admin views PoolStatus
-    Then read_iops is a combined aggregate
-    And there is no way to attribute IOPS to tenant A vs B
+  # @unit scenario "Pool stats are aggregate" → kiseki-control/src/storage_admin.rs::pool_status_has_only_aggregate_fields
 
   # M4: DrainNode
   @integration

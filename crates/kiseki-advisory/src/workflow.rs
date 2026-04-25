@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use kiseki_common::advisory::{PhaseId, WorkflowRef, WorkloadProfile};
+use kiseki_common::advisory::{PhaseId, Priority, WorkflowRef, WorkloadProfile};
 
 use crate::error::AdvisoryError;
 
@@ -19,6 +19,16 @@ pub struct WorkflowEntry {
     pub phase_history: Vec<PhaseId>,
     /// Max phases to retain in history.
     max_history: usize,
+    /// TTL in seconds (0 = no TTL).
+    pub ttl_seconds: u64,
+    /// Whether this workflow has been ended.
+    pub ended: bool,
+    /// End reason (if ended).
+    pub end_reason: Option<String>,
+    /// Count of evicted phases (for ring eviction tracking).
+    pub evicted_phase_count: u64,
+    /// Snapshotted priority at declare time.
+    pub snapshotted_priority: Option<Priority>,
 }
 
 impl WorkflowEntry {
@@ -36,7 +46,38 @@ impl WorkflowEntry {
             current_phase: initial_phase,
             phase_history: vec![initial_phase],
             max_history,
+            ttl_seconds: 0,
+            ended: false,
+            end_reason: None,
+            evicted_phase_count: 0,
+            snapshotted_priority: None,
         }
+    }
+
+    /// Create with TTL.
+    #[must_use]
+    pub fn with_ttl(mut self, ttl_seconds: u64) -> Self {
+        self.ttl_seconds = ttl_seconds;
+        self
+    }
+
+    /// Create with snapshotted priority.
+    #[must_use]
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.snapshotted_priority = Some(priority);
+        self
+    }
+
+    /// End this workflow with a reason.
+    pub fn end(&mut self, reason: &str) {
+        self.ended = true;
+        self.end_reason = Some(reason.to_owned());
+    }
+
+    /// Check TTL expiry. Returns true if expired.
+    #[must_use]
+    pub fn is_ttl_expired(&self, elapsed_seconds: u64) -> bool {
+        self.ttl_seconds > 0 && elapsed_seconds > self.ttl_seconds
     }
 
     /// Advance to a new phase. Must be strictly greater than current (I-WA13).
@@ -51,6 +92,7 @@ impl WorkflowEntry {
         self.phase_history.push(new_phase);
         if self.phase_history.len() > self.max_history {
             self.phase_history.remove(0);
+            self.evicted_phase_count += 1;
         }
         Ok(())
     }

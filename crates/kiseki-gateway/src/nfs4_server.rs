@@ -1224,3 +1224,481 @@ fn op_reclaim_complete(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     w.write_u32(nfs4_status::NFS4_OK);
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem_gateway::InMemoryGateway;
+    use crate::nfs::NfsGateway;
+    use crate::nfs_ops::NfsContext;
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::ids::{NamespaceId, OrgId};
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_crypto::keys::SystemMasterKey;
+
+    fn test_ctx() -> NfsContext<InMemoryGateway> {
+        let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
+        let tenant = OrgId(uuid::Uuid::nil());
+        let ns = NamespaceId(uuid::Uuid::from_u128(1));
+        let mut store = CompositionStore::new();
+        store.add_namespace(kiseki_composition::namespace::Namespace {
+            id: ns,
+            tenant_id: tenant,
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        });
+        let gw = InMemoryGateway::new(store, Box::new(ChunkStore::new()), master_key);
+        let nfs_gw = NfsGateway::new(gw);
+        NfsContext::new(nfs_gw, tenant, ns)
+    }
+
+    fn test_sessions() -> SessionManager {
+        SessionManager::new()
+    }
+
+    // ---------- EXCHANGE_ID (§18.35) ----------
+
+    #[test]
+    fn exchange_id_returns_ok_with_client_id() {
+        let sessions = test_sessions();
+        let mut body = XdrWriter::new();
+        body.write_opaque_fixed(&[0u8; 8]); // verifier
+        body.write_opaque(b"test-client"); // owner_id
+        body.write_u32(0); // flags
+        body.write_u32(0); // state_protect (SP4_NONE)
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, result) = op_exchange_id(&mut reader, &sessions);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        let op_code = r.read_u32().unwrap();
+        assert_eq!(op_code, op::EXCHANGE_ID);
+        let st = r.read_u32().unwrap();
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        let client_id = r.read_u64().unwrap();
+        assert_ne!(client_id, 0, "client_id should be non-zero");
+        let _seqid = r.read_u32().unwrap();
+        let flags = r.read_u32().unwrap();
+        assert_eq!(flags & 0x01, 0x01, "CONFIRMED flag should be set");
+        let _state_protect = r.read_u32().unwrap();
+        let _minor_id = r.read_u64().unwrap();
+        let major_id = r.read_opaque().unwrap();
+        assert!(!major_id.is_empty(), "server major_id should be present");
+    }
+
+    #[test]
+    fn exchange_id_returns_unique_client_ids() {
+        let sessions = test_sessions();
+
+        let make_exchange = || {
+            let mut body = XdrWriter::new();
+            body.write_opaque_fixed(&[0u8; 8]);
+            body.write_opaque(b"client");
+            body.write_u32(0);
+            body.write_u32(0);
+            let bytes = body.into_bytes();
+            let mut reader = XdrReader::new(&bytes);
+            let (_, result) = op_exchange_id(&mut reader, &sessions);
+            let mut r = XdrReader::new(&result);
+            r.read_u32().unwrap(); // op
+            r.read_u32().unwrap(); // status
+            r.read_u64().unwrap() // client_id
+        };
+
+        let id1 = make_exchange();
+        let id2 = make_exchange();
+        assert_ne!(id1, id2, "client_ids should be unique");
+    }
+
+    // ---------- CREATE_SESSION (§18.36) ----------
+
+    #[test]
+    fn create_session_returns_ok_with_session_id() {
+        let sessions = test_sessions();
+        let client_id = sessions.exchange_id();
+
+        let mut body = XdrWriter::new();
+        body.write_u64(client_id);
+        body.write_u32(1); // sequence
+        body.write_u32(0); // flags
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, result) = op_create_session(&mut reader, &sessions);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        let op_code = r.read_u32().unwrap();
+        assert_eq!(op_code, op::CREATE_SESSION);
+        let st = r.read_u32().unwrap();
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        let session_id = r.read_opaque_fixed(16).unwrap();
+        assert_eq!(session_id.len(), 16, "session_id should be 16 bytes");
+        let _seqid = r.read_u32().unwrap();
+        let _flags = r.read_u32().unwrap();
+        // fore channel attrs
+        let _headerpad = r.read_u32().unwrap();
+        let _maxreq = r.read_u32().unwrap();
+        let _maxresp = r.read_u32().unwrap();
+        let _maxresp_cached = r.read_u32().unwrap();
+        let maxops = r.read_u32().unwrap();
+        assert!(maxops > 0, "maxops should be positive");
+        let maxreqs = r.read_u32().unwrap();
+        assert!(maxreqs > 0, "maxreqs should be positive");
+    }
+
+    #[test]
+    fn create_session_produces_distinct_ids() {
+        let sessions = test_sessions();
+        let cid = sessions.exchange_id();
+
+        let create = |s: &SessionManager| {
+            let mut body = XdrWriter::new();
+            body.write_u64(cid);
+            body.write_u32(1);
+            body.write_u32(0);
+            let bytes = body.into_bytes();
+            let mut reader = XdrReader::new(&bytes);
+            let (_, result) = op_create_session(&mut reader, s);
+            let mut r = XdrReader::new(&result);
+            r.read_u32().unwrap(); // op
+            r.read_u32().unwrap(); // status
+            r.read_opaque_fixed(16).unwrap()
+        };
+
+        let sid1 = create(&sessions);
+        let sid2 = create(&sessions);
+        assert_ne!(sid1, sid2, "session_ids should be cryptographically distinct");
+    }
+
+    // ---------- SEQUENCE (§18.46) ----------
+
+    #[test]
+    fn sequence_valid_session_returns_ok() {
+        let sessions = test_sessions();
+        let cid = sessions.exchange_id();
+        let session_id = sessions.create_session(cid, 8);
+
+        let mut body = XdrWriter::new();
+        body.write_opaque_fixed(&session_id);
+        body.write_u32(1); // sequenceid
+        body.write_u32(0); // slotid
+        body.write_u32(7); // highest_slotid
+        body.write_bool(false); // cachethis
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, result) = op_sequence(&mut reader, &sessions);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        let _op = r.read_u32().unwrap();
+        let st = r.read_u32().unwrap();
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        let ret_sid = r.read_opaque_fixed(16).unwrap();
+        assert_eq!(ret_sid, session_id);
+        let seqid = r.read_u32().unwrap();
+        assert_eq!(seqid, 1);
+        let slotid = r.read_u32().unwrap();
+        assert_eq!(slotid, 0);
+    }
+
+    #[test]
+    fn sequence_invalid_session_returns_badsession() {
+        let sessions = test_sessions();
+        let fake_sid = [0xABu8; 16];
+
+        let mut body = XdrWriter::new();
+        body.write_opaque_fixed(&fake_sid);
+        body.write_u32(1);
+        body.write_u32(0);
+        body.write_u32(0);
+        body.write_bool(false);
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, _) = op_sequence(&mut reader, &sessions);
+        assert_eq!(status, nfs4_status::NFS4ERR_BADSESSION);
+    }
+
+    // ---------- PUTROOTFH (§18.24) ----------
+
+    #[test]
+    fn putrootfh_sets_current_filehandle() {
+        let ctx = test_ctx();
+        let mut state = CompoundState {
+            current_fh: None,
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        let (status, _) = op_putrootfh(&ctx, &mut state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+        assert!(state.current_fh.is_some(), "current_fh should be set after PUTROOTFH");
+
+        let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
+        assert_eq!(state.current_fh.unwrap(), root_fh);
+    }
+
+    // ---------- GETATTR (§18.9) ----------
+
+    #[test]
+    fn getattr_root_returns_dir_type() {
+        let ctx = test_ctx();
+        let state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        // Encode bitmap request.
+        let mut body = XdrWriter::new();
+        body.write_u32(2); // bitmap count
+        body.write_u32(0x0000_0018); // type + size
+        body.write_u32(0);
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, result) = op_getattr(&mut reader, &ctx, &state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        let _op = r.read_u32().unwrap();
+        let st = r.read_u32().unwrap();
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        // bitmap
+        let bm_count = r.read_u32().unwrap();
+        assert_eq!(bm_count, 2);
+        let _bm0 = r.read_u32().unwrap();
+        let _bm1 = r.read_u32().unwrap();
+        // attr values (opaque)
+        let attr_bytes = r.read_opaque().unwrap();
+        let mut ar = XdrReader::new(&attr_bytes);
+        let ftype = ar.read_u32().unwrap();
+        assert_eq!(ftype, 2, "root type should be NF4DIR (2)");
+        let size = ar.read_u64().unwrap();
+        assert!(size > 0, "root size should be reported");
+    }
+
+    #[test]
+    fn getattr_no_filehandle_returns_badhandle() {
+        let ctx = test_ctx();
+        let state = CompoundState {
+            current_fh: None,
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        let mut body = XdrWriter::new();
+        body.write_u32(0); // no bitmap
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, _) = op_getattr(&mut reader, &ctx, &state);
+        assert_eq!(status, nfs4_status::NFS4ERR_BADHANDLE);
+    }
+
+    // ---------- WRITE (§18.38) ----------
+
+    #[test]
+    fn write_returns_ok_with_count_and_file_sync() {
+        let ctx = test_ctx();
+        let sessions = test_sessions();
+        let mut state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        let data = b"nfs4 write";
+        let mut body = XdrWriter::new();
+        body.write_opaque_fixed(&[0u8; 16]); // special stateid (anonymous)
+        body.write_u64(0); // offset
+        body.write_u32(2); // FILE_SYNC
+        body.write_opaque(data);
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, result) = op_write(&mut reader, &ctx, &sessions, &mut state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        let _op = r.read_u32().unwrap();
+        let st = r.read_u32().unwrap();
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        let count = r.read_u32().unwrap();
+        assert_eq!(count, 10);
+        let committed = r.read_u32().unwrap();
+        assert_eq!(committed, 2, "committed should be FILE_SYNC");
+    }
+
+    #[test]
+    fn write_updates_current_filehandle() {
+        let ctx = test_ctx();
+        let sessions = test_sessions();
+        let mut state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        let original_fh = state.current_fh;
+
+        let mut body = XdrWriter::new();
+        body.write_opaque_fixed(&[0u8; 16]);
+        body.write_u64(0);
+        body.write_u32(2);
+        body.write_opaque(b"test data");
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, _) = op_write(&mut reader, &ctx, &sessions, &mut state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+        assert_ne!(state.current_fh, original_fh, "WRITE should update current_fh");
+    }
+
+    // ---------- OPEN (§18.16) ----------
+
+    #[test]
+    fn open_create_returns_ok_with_stateid() {
+        let ctx = test_ctx();
+        let sessions = test_sessions();
+        let mut state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        let mut body = XdrWriter::new();
+        body.write_u32(0); // seqid
+        body.write_u32(2); // share_access (WRITE)
+        body.write_u32(0); // share_deny
+        body.write_u64(1); // clientid
+        body.write_opaque(b"owner"); // owner
+        body.write_u32(1); // OPEN4_CREATE
+        body.write_string("created-file.txt");
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, result) = op_open(&mut reader, &ctx, &sessions, &mut state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        let _op = r.read_u32().unwrap();
+        let st = r.read_u32().unwrap();
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        let stateid = r.read_opaque_fixed(16).unwrap();
+        assert_ne!(stateid, [0u8; 16], "stateid should be non-zero");
+    }
+
+    #[test]
+    fn open_read_existing_returns_ok_with_stateid() {
+        let ctx = test_ctx();
+        let sessions = test_sessions();
+
+        // First create a file.
+        ctx.write_named("readable.txt", b"content".to_vec()).unwrap();
+
+        let mut state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        let mut body = XdrWriter::new();
+        body.write_u32(0); // seqid
+        body.write_u32(1); // share_access (READ)
+        body.write_u32(0); // share_deny
+        body.write_u64(1); // clientid
+        body.write_opaque(b"owner");
+        body.write_u32(0); // OPEN4_NOCREATE
+        body.write_string("readable.txt");
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, result) = op_open(&mut reader, &ctx, &sessions, &mut state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        r.read_u32().unwrap(); // op
+        r.read_u32().unwrap(); // status
+        let stateid = r.read_opaque_fixed(16).unwrap();
+        assert_ne!(stateid, [0u8; 16]);
+    }
+
+    #[test]
+    fn open_nonexistent_nocreate_returns_noent() {
+        let ctx = test_ctx();
+        let sessions = test_sessions();
+        let mut state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        let mut body = XdrWriter::new();
+        body.write_u32(0);
+        body.write_u32(1);
+        body.write_u32(0);
+        body.write_u64(1);
+        body.write_opaque(b"owner");
+        body.write_u32(0); // NOCREATE
+        body.write_string("nosuchfile");
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, _) = op_open(&mut reader, &ctx, &sessions, &mut state);
+        assert_eq!(status, nfs4_status::NFS4ERR_NOENT);
+    }
+
+    // ---------- CLOSE (§18.2) ----------
+
+    #[test]
+    fn close_valid_stateid_returns_ok() {
+        let ctx = test_ctx();
+        let sessions = test_sessions();
+
+        // Create and open a file to get a stateid.
+        ctx.write_named("closeable.txt", b"data".to_vec()).unwrap();
+        let (fh, _) = ctx.lookup_by_name("closeable.txt").unwrap();
+        let sid = sessions.open_file(fh);
+
+        let mut state = CompoundState {
+            current_fh: Some(fh),
+            saved_fh: None,
+            current_stateid: Some(sid),
+        };
+
+        let mut body = XdrWriter::new();
+        body.write_u32(0); // seqid
+        body.write_opaque_fixed(&sid.0); // stateid
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, _) = op_close(&mut reader, &sessions, &mut state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        // The stateid should no longer be valid.
+        assert!(!sessions.is_open(&sid), "stateid should be invalidated after CLOSE");
+    }
+
+    #[test]
+    fn close_then_read_returns_bad_stateid() {
+        let sessions = test_sessions();
+
+        // Open a file.
+        let fh = [0x11u8; 32];
+        let sid = sessions.open_file(fh);
+
+        // Close it.
+        sessions.close_file(&sid);
+
+        // Verify the stateid is invalid.
+        assert!(!sessions.is_open(&sid));
+    }
+}

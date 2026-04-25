@@ -19,10 +19,19 @@ pub mod budget;
 pub mod error;
 pub mod grpc;
 pub mod lookup;
+pub mod policy;
 pub mod stream;
+pub mod telemetry;
 pub mod workflow;
 
 pub use budget::BudgetEnforcer;
 pub use error::AdvisoryError;
 pub use lookup::AdvisoryLookup;
+pub use policy::{
+    AdvisoryState, ProfileAllowList, WorkloadPolicy,
+};
+pub use telemetry::{
+    AuditCorrelation, BackpressureSeverity, ContentionLevel, LocalityClass, OwnHotspotEvent,
+    PhaseSummaryEvent, StreamWarningKind, TelemetryChannel, TelemetryResponse,
+};
 pub use workflow::{WorkflowEntry, WorkflowTable};

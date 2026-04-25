@@ -12,7 +12,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And NFS view "nfs-trials" at watermark 5000
     And S3 view "s3-trials" at watermark 4998
 
-  @unit
+  @integration
   Scenario: S3 multipart upload — large object
     Given a client starts S3 CreateMultipartUpload for "checkpoints/epoch-100.pt"
     When parts are uploaded:
@@ -28,7 +28,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
 
   # --- Protocol semantics enforcement ---
 
-  @unit
+  @integration
   Scenario: NFSv4.1 state management — open/lock
     Given a client opens "/trials/shared.log" with NFS OPEN
     And acquires an NFS byte-range lock on bytes 0-1024
@@ -37,7 +37,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And the gateway maintains lock state per client session
     And lock state is gateway-local (not replicated to other gateways)
 
-  @unit
+  @integration
   Scenario: S3 conditional write — If-None-Match
     Given object "results/v2.json" does not exist
     When a client issues PutObject with header If-None-Match: *
@@ -72,7 +72,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And no committed data is lost (durability is in the Log + Chunk Storage)
     And in-flight uncommitted writes are lost
 
-  @unit
+  @integration
   Scenario: Gateway cannot reach tenant KMS — writes fail
     Given tenant KMS for "org-pharma" is unreachable
     And cached KEK has expired
@@ -98,7 +98,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
   # via a lightweight header; correlation to a workflow is optional and
   # never a precondition for the request (I-WA1, I-WA2).
 
-  @unit
+  @integration
   Scenario: S3 request carries workflow_ref header to advisory
     Given S3 client under workload "training-run-42" has an active workflow
     When a PutObject arrives with header `x-kiseki-workflow-ref: <opaque>`
@@ -106,7 +106,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And on success, annotates the write path for advisory correlation
     And on mismatch or unknown ref, ignores the header silently and processes the request unchanged (I-WA1)
 
-  @unit
+  @integration
   Scenario: Priority-class hint applied to request scheduling within policy
     Given workload "training-run-42"'s allowed priority classes are [batch, bulk]
     And the client's hint carries { priority: batch }
@@ -114,7 +114,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     Then the request is placed in the batch QoS class
     And a hint requesting { priority: interactive } is rejected with hint-rejected reason "priority_not_allowed" without affecting the underlying request (I-WA14)
 
-  @unit
+  @integration
   Scenario: Request-level backpressure telemetry emitted on sustained saturation
     Given the gateway serves "training-run-42" with 200 concurrent in-flight requests
     And the workload has subscribed to backpressure telemetry
@@ -123,14 +123,14 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And only the caller's own queue state contributes to the signal; neighbour callers do not leak through this channel (I-WA5)
     And data-path requests continue to be accepted
 
-  @unit
+  @integration
   Scenario: Access-pattern hint routed from protocol metadata
     Given an NFSv4.1 client submits read with `io_advise` hints indicating sequential access
     When the gateway maps the advisory to a Workflow Advisory hint { access_pattern: sequential }
     Then the advisory is submitted asynchronously (I-WA2) and the NFS read is served normally
     And the View Materialization subsystem MAY readahead for subsequent reads of the same caller
 
-  @unit
+  @integration
   Scenario: NFS workflow_ref carriage model (v1)
     Given NFSv4.1 is a POSIX-oriented protocol with no native header for workflow correlation
     When a workload mounts an NFS export via "gw-nfs-pharma"
@@ -142,7 +142,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And mounts without `workflow-ref` proceed with no advisory correlation — data-path behavior is identical to pre-advisory NFS (I-WA1, I-WA2)
     And the gateway MAY refuse a mount whose workflow_ref is unknown or belongs to a different workload; that refusal is a mount-time error, not mid-session
 
-  @unit
+  @integration
   Scenario: QoS-headroom telemetry caller-scoped
     Given workload "training-run-42" is subscribed to QoS-headroom telemetry
     When the gateway computes headroom within the workload's I-T2 quota

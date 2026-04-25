@@ -36,13 +36,8 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # --- Native API read path ---
 
-  @unit
-  Scenario: Native API direct read — bypass FUSE overhead
-    Given the workload uses the native Rust API directly
-    When it calls kiseki_read(namespace, path, offset, length)
-    Then the read path is the same as FUSE but without FUSE kernel overhead
-    And latency is lower for small reads
-    And the API returns a buffer with plaintext data
+  # @unit scenarios moved to crate-level unit tests:
+  # "Native API direct read" → kiseki-client/src/fuse_fs.rs::native_api_direct_read_same_path_as_fuse
 
   # --- Write path ---
 
@@ -60,13 +55,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # --- Failure paths ---
 
-  @unit
-  Scenario: Native client process crashes — uncommitted writes lost
-    Given the workload process crashes
-    Then all in-flight uncommitted writes are lost
-    And committed writes (acknowledged) are durable in the Log
-    And other clients and views are unaffected
-    And no cluster-wide impact
+  # @unit scenario "Native client process crashes" → kiseki-client/src/fuse_fs.rs::crash_semantics_committed_survives
 
   @integration
   Scenario: Storage node unreachable — chunk read fails
@@ -119,89 +108,24 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And the final state reflects a total order of all writes
     And neither client's writes are lost (though interleaving is possible)
 
-  @unit
-  Scenario: FUSE mount with read-only namespace
-    Given namespace "archive" is marked read-only in the control plane
-    When the native client mounts /mnt/kiseki/archive
-    Then reads succeed normally
-    And writes return EROFS (read-only filesystem)
+  # @unit scenario "FUSE mount with read-only namespace" → kiseki-client/src/fuse_fs.rs::read_only_namespace_rejects_writes
 
   # --- Workflow Advisory integration (ADR-020) ---
-  # The native client is the ORIGINATOR of advisory hints and the CONSUMER
-  # of telemetry feedback. Full lifecycle/invariant scenarios live in
-  # workflow-advisory.feature; scenarios here cover integration with the
-  # existing FUSE/native read/write/caching paths.
-
-  @unit
-  Scenario: Client declares a workflow and correlates subsequent operations
-    Given the native client is initialized under workload "training-run-42"
-    When the workload calls kiseki_declare_workflow(profile="ai-training", initial_phase="stage-in")
-    Then the client obtains an opaque WorkflowSession handle
-    And all subsequent read/write calls that take an optional session argument carry the workflow_ref annotation
-    And operations without a session argument continue to work unchanged (advisory annotation absent, I-WA1/I-WA2)
-
-  @unit
-  Scenario: Pattern-detector origin — access-pattern hint emitted on detected sequential read
-    Given the workflow is in phase "stage-in" with profile ai-training
-    And the native client's pattern detector observes three consecutive sequential reads on /mnt/kiseki/trials/dataset.h5
-    When the detector classifies the access as sequential
-    Then the client submits hint { access_pattern: sequential, target: composition_id of dataset.h5 } on the advisory channel
-    And continues to serve reads normally (hint emission is asynchronous and non-blocking, I-WA2)
-    And if the advisory channel is unavailable the read path is unaffected
-
-  @unit
-  Scenario: Client declares prefetch ranges for an AI shuffled epoch
-    Given the workflow advances to phase "epoch-0"
-    When the workload computes the shuffled read order and calls kiseki_declare_prefetch(tuples)
-    Then the client batches tuples into PrefetchHint messages each under max_prefetch_tuples_per_hint (I-WA16)
-    And submits them on the advisory channel
-    And subsequent FUSE reads in the predicted order benefit from warmed cache (measured via prefetch-effectiveness telemetry)
-
-  @unit
-  Scenario: Client throttles itself on hard backpressure telemetry
-    Given the workflow is subscribed to backpressure telemetry on pool "fast-nvme"
-    When the client receives a backpressure event with severity "hard" and retry_after_ms 250
-    Then the client MAY pause or rate-limit new submissions for ≈ retry_after_ms
-    And correctness of in-flight operations is unaffected (I-WA1)
-    And actual quota enforcement remains the data path's responsibility (I-T2)
-
-  @unit
-  Scenario: Advisory disabled at workload level — client degrades gracefully
-    Given tenant admin disables Workflow Advisory for "training-run-42"
-    When the client calls kiseki_declare_workflow
-    Then the call returns ADVISORY_DISABLED
-    And the client falls back to pattern-inference for access-pattern heuristics
-    And FUSE reads and writes are fully correct and at normal performance (I-WA12)
+  # @unit scenarios moved to crate-level unit tests:
+  # "Client declares a workflow" → kiseki-client/src/advisory.rs::declare_workflow_returns_session_with_correlation
+  # "Pattern-detector origin" → kiseki-client/src/advisory.rs::pattern_detector_emits_sequential_hint
+  # "Client declares prefetch ranges" → kiseki-client/src/advisory.rs::prefetch_ranges_batched
+  # "Client throttles on backpressure" → kiseki-client/src/advisory.rs::hard_backpressure_telemetry_has_retry_after
+  # "Advisory disabled" → kiseki-client/src/advisory.rs::advisory_disabled_degrades_gracefully
 
   # =====================================================================
   # Client-side cache (ADR-031)
   # =====================================================================
 
-  @unit
-  Scenario: Pinned mode stages a dataset
-    Given a client with cache_mode "pinned" and staging_enabled true
-    When the client runs "kiseki-client stage --dataset /training/imagenet"
-    Then all compositions under "/training/imagenet" are enumerated recursively
-    And each chunk is fetched from canonical, verified (SHA-256), and stored in L2
-    And a staging manifest is written listing all compositions and chunk_ids
-    And staged chunks are retained against LRU eviction
-
-  @unit
-  Scenario: Staging handoff from prolog to workload
-    Given a staging daemon has populated an L2 pool with pool_id "abc"
-    And the staging daemon holds the pool.lock flock
-    When a workload process starts with KISEKI_CACHE_POOL_ID="abc"
-    Then the workload adopts the existing pool instead of creating a new one
-    And the workload takes over the flock
-    And the staging daemon exits cleanly
-
-  @unit
-  Scenario: Staging beyond capacity returns error
-    Given a client with cache_mode "pinned" and max_cache_bytes 10GB
-    And 9GB is already staged
-    When the client stages a 5GB dataset
-    Then the staging returns CacheCapacityExceeded
-    And no existing pinned data is evicted
+  # @unit scenarios moved to crate-level unit tests:
+  # "Pinned mode stages a dataset" → kiseki-client/src/staging.rs::pinned_mode_stages_dataset_with_manifest
+  # "Staging handoff" → kiseki-client/src/staging.rs::staging_handoff_pool_adoption
+  # "Staging beyond capacity" → kiseki-client/src/staging.rs::staging_beyond_capacity_no_eviction
 
   @integration
   Scenario: Cache policy resolved via data-path gRPC
@@ -211,10 +135,4 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     Then cache policy is fetched via GetCachePolicy RPC on the data-path channel (I-CC9)
     And the client operates within the policy ceilings
 
-  @unit
-  Scenario: Per-node cache capacity enforcement
-    Given 5 concurrent client processes for the same tenant on one node
-    And max_node_cache_bytes is set to 200GB
-    When the 5th process attempts to insert into L2 and total usage exceeds 200GB
-    Then the insert is rejected
-    And organic mode triggers additional eviction before retrying
+  # @unit scenario "Per-node cache capacity enforcement" → kiseki-client/src/cache.rs::per_node_capacity_enforcement

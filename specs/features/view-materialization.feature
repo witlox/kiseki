@@ -113,59 +113,10 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And no new writes can be reflected until the shard recovers
 
   # --- Workflow Advisory integration (ADR-020) ---
-  # View Materialization acts on prefetch-range, access-pattern, and phase
-  # hints from callers and emits materialization-lag and pin-headroom
-  # telemetry scoped strictly to the caller's own views (I-WA5, I-WA6).
-  # Hints never change consistency-model or compliance-floor enforcement
-  # (I-WA14, I-K9).
-
-  @unit
-  Scenario: Prefetch-range hint warms caller's view opportunistically
-    Given workload "training-run-42" has an active workflow in phase "epoch-0"
-    And the workflow has submitted a PrefetchHint of 4096 (composition_id, offset, length) tuples into view "nfs-trials"
-    When the stream processor has idle materialization capacity
-    Then it MAY decrypt + cache chunk data for the declared ranges in advance of read requests
-    And MUST NOT advance its public watermark past its normal rules (I-V2)
-    And MUST NOT decrypt payloads outside the caller's tenant scope (I-T1)
-    And prefetch work is preempted by genuine read requests or compaction pressure
-
-  @unit
-  Scenario: Access-pattern hint { random } suppresses readahead
-    Given the stream processor normally performs sequential readahead for POSIX views
-    And the caller submits hint { access_pattern: random } for view "nfs-trials"
-    When subsequent reads arrive
-    Then the readahead heuristic is disabled for this caller's reads
-    And cache residency policy shifts toward per-chunk LRU rather than sequential warm-forward
-    And other callers' reads on the same view are unaffected (steering is caller-scoped)
-
-  @unit
-  Scenario: Phase marker { checkpoint } biases cache retention
-    Given the workflow advances to phase "checkpoint" with profile hpc-checkpoint
-    When the stream processor observes the phase marker on subsequent reads/writes
-    Then cache retention for checkpoint-target compositions is extended within policy bounds
-    And cache eviction preferentially targets non-checkpoint compositions of the same caller
-    And cross-tenant cache state is not affected (I-T1)
-
-  @unit
-  Scenario: Materialization-lag telemetry scoped to caller's views
-    Given workload "training-run-42" owns views "nfs-trials" and "s3-trials"
-    And a neighbour workload owns view "nfs-other"
-    When the caller subscribes to materialization-lag telemetry
-    Then the stream returns lag values for "nfs-trials" and "s3-trials" only
-    And attempts to subscribe to "nfs-other" return not_found with shape identical to absent views (I-WA6)
-    And the numeric lag values are reported in bucketed milliseconds (no fine-grained timing leak)
-
-  @unit
-  Scenario: Pin-headroom telemetry
-    Given workload "training-run-42" holds 80% of its allowed MVCC pins (I-V4)
-    When the caller subscribes to pin-headroom telemetry
-    Then a bucketed value ("ample" | "approaching-limit" | "near-exhaustion") is returned
-    And no absolute pin counts or neighbour-workload pin state is exposed (I-WA5)
-
-  @unit
-  Scenario: Advisory opt-out on workload — view stops accepting hints, continues serving reads
-    Given tenant admin transitions "training-run-42" advisory to disabled
-    When the stream processor receives no new hints for this workload
-    Then existing materialization and read paths continue unchanged (I-WA2)
-    And any pre-declared prefetch ranges for this workload are abandoned (not retained across disable)
-    And correctness of views served to the workload is unaffected
+  # @unit scenarios moved to crate-level unit tests:
+  # "Prefetch-range hint warms view" → kiseki-view/src/view.rs::prefetch_warm_up_does_not_advance_watermark
+  # "Access-pattern { random } suppresses readahead" → kiseki-view/src/view.rs::readahead_suppression_per_caller
+  # "Phase marker { checkpoint } biases retention" → kiseki-view/src/view.rs::phase_marker_checkpoint_retention
+  # "Materialization-lag telemetry scoped" → kiseki-view/src/view.rs::materialization_lag_telemetry_scoped
+  # "Pin-headroom telemetry" → kiseki-view/src/view.rs::pin_headroom_telemetry_bucketed
+  # "Advisory opt-out" → kiseki-view/src/view.rs::advisory_opt_out_view_continues_serving
