@@ -10,18 +10,21 @@ Feature: Persistence and crash recovery (ADR-022)
 
   # === Raft log persistence ===
 
+  @integration
   Scenario: Delta survives server restart
     Given a delta was written via LogService AppendDelta
     When the server is restarted
     Then the delta is readable via ReadDeltas
     And the sequence number is preserved
 
+  @integration
   Scenario: Multiple deltas survive restart
     Given 100 deltas were written to shard "s1"
     When the server is restarted
     Then all 100 deltas are readable
     And their order is preserved (I-L1)
 
+  @integration
   Scenario: Raft vote and term survive restart
     Given the Raft group elected leader at term 5
     When the server is restarted
@@ -30,12 +33,14 @@ Feature: Persistence and crash recovery (ADR-022)
 
   # === Raft snapshots ===
 
+  @integration
   Scenario: Snapshot taken after 10,000 entries
     Given 10,000 deltas have been written since last snapshot
     Then a snapshot is automatically created
     And the snapshot contains the full state machine state
     And log entries before the snapshot can be truncated
 
+  @integration
   Scenario: Restore from snapshot + replay
     Given a snapshot exists at log index 10,000
     And 500 additional log entries exist (10,001 to 10,500)
@@ -44,6 +49,7 @@ Feature: Persistence and crash recovery (ADR-022)
     And entries 10,001-10,500 are replayed
     And the final state matches pre-restart state
 
+  @integration
   Scenario: Snapshot survives restart
     Given a snapshot was taken
     When the server is restarted
@@ -52,12 +58,14 @@ Feature: Persistence and crash recovery (ADR-022)
 
   # === Chunk data persistence ===
 
+  @integration
   Scenario: Chunk data survives restart
     Given a chunk was written via the gateway (encrypt + store)
     When the server is restarted
     Then the chunk is readable via the gateway (decrypt + return)
     And the plaintext matches the original
 
+  @integration
   Scenario: Pool file integrity
     Given 1000 chunks stored in pool file "fast-nvme-dev0.pool"
     When the server is restarted
@@ -66,6 +74,7 @@ Feature: Persistence and crash recovery (ADR-022)
 
   # === View watermarks ===
 
+  @integration
   Scenario: View watermark survives restart
     Given the stream processor advanced view "v1" to watermark 500
     When the server is restarted
@@ -74,6 +83,7 @@ Feature: Persistence and crash recovery (ADR-022)
 
   # === Key manager persistence ===
 
+  @integration
   Scenario: Key epochs survive restart
     Given the key manager has epochs [1, 2, 3] with epoch 3 current
     When the server is restarted
@@ -82,6 +92,7 @@ Feature: Persistence and crash recovery (ADR-022)
 
   # === Small-file inline content persistence (ADR-030) ===
 
+  @integration
   Scenario: Inline small files survive restart
     Given 100 files below the inline threshold were written
     And their content is in small/objects.redb
@@ -89,6 +100,7 @@ Feature: Persistence and crash recovery (ADR-022)
     Then all 100 files are readable from small/objects.redb
     And their encrypted content matches the original writes
 
+  @integration
   Scenario: Inline files included in Raft snapshot
     Given shard "s1" has 500 inline files in small/objects.redb
     When a Raft snapshot is built for shard "s1"
@@ -98,6 +110,7 @@ Feature: Persistence and crash recovery (ADR-022)
 
   # === Crash recovery edge cases ===
 
+  @integration
   Scenario: Crash during write — partial data not visible
     Given a delta write is in progress (Raft not yet committed)
     When the server crashes
@@ -105,6 +118,7 @@ Feature: Persistence and crash recovery (ADR-022)
     Then the uncommitted delta is not visible
     And the log is consistent (no partial entries)
 
+  @integration
   Scenario: Crash during snapshot — old snapshot preserved
     Given a snapshot is being written
     When the server crashes mid-snapshot

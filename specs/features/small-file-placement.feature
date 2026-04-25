@@ -22,6 +22,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === System disk auto-detection (I-SF2) ===
 
+  @unit
   Scenario: NVMe root disk detected — no warning
     Given node-1 boots with KISEKI_DATA_DIR="/data"
     When the server detects /sys/block/nvme0/queue/rotational = 0
@@ -30,6 +31,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And hard_limit_bytes = 192 GB (75% of 256 GB)
     And no rotational warning is emitted
 
+  @unit
   Scenario: HDD root disk detected — warning emitted
     Given a node boots with root disk on /dev/sdb (rotational = 1)
     When the server detects /sys/block/sdb/queue/rotational = 1
@@ -42,6 +44,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
       """
     And the warning appears in health reports
 
+  @unit
   Scenario: Custom soft/hard limits via environment
     Given KISEKI_META_SOFT_LIMIT_PCT=60 and KISEKI_META_HARD_LIMIT_PCT=80
     When node-1 boots with a 256 GB root disk
@@ -50,6 +53,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Two-tier redb layout ===
 
+  @unit
   Scenario: Metadata and small-file stores are separate redb databases
     Given node-1 is running with KISEKI_DATA_DIR="/data"
     Then the following redb files exist:
@@ -61,6 +65,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Per-shard dynamic inline threshold (I-SF1) ===
 
+  @unit
   Scenario: Threshold computed from minimum voter budget
     Given shard "shard-1" has voters on node-1 and node-2
     And node-1 has small_file_budget = 50 GB
@@ -69,6 +74,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     Then the raw threshold = 40 GB / 10,000,000 = 4294 bytes
     And the shard inline threshold is clamped to 4294 bytes
 
+  @unit
   Scenario: Threshold clamped to floor when budget is tiny
     Given shard "shard-2" has voters on node-1 and node-2
     And node-1 has small_file_budget = 1 GB
@@ -76,6 +82,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     Then the raw threshold = 1 GB / 100,000,000 = 10 bytes
     And the shard inline threshold is clamped to 128 bytes (floor)
 
+  @unit
   Scenario: Threshold clamped to ceiling
     Given shard "shard-3" has voters on node-1 and node-2
     And both nodes have small_file_budget = 100 GB
@@ -83,6 +90,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     Then the raw threshold = 100 GB / 100 = 1 GB
     And the shard inline threshold is clamped to 65536 bytes (ceiling)
 
+  @unit
   Scenario: Threshold decrease is automatic and prospective (I-L9)
     Given shard "shard-1" has inline threshold = 4096 bytes
     And 500 files were written with inline data (each < 4096 bytes)
@@ -93,6 +101,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And the 500 existing inline files remain in small/objects.redb
     And no retroactive migration occurs
 
+  @unit
   Scenario: Threshold increase requires admin action
     Given shard "shard-1" has inline threshold = 128 bytes (floor)
     When the control plane attempts to increase threshold to 4096
@@ -103,6 +112,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Small-file data path (I-SF5) ===
 
+  @integration
   Scenario: File below threshold stored inline via Raft
     Given shard "shard-1" has inline threshold = 4096 bytes
     When a client writes a 512-byte file
@@ -112,6 +122,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And on apply the state machine offloads the payload to small/objects.redb
     And the in-memory state machine retains only the delta header
 
+  @integration
   Scenario: File above threshold stored as chunk extent
     Given shard "shard-1" has inline threshold = 4096 bytes
     When a client writes a 100 KB file
@@ -121,6 +132,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And the delta contains only the chunk_ref (no payload)
     And the Raft log entry carries metadata only
 
+  @integration
   Scenario: Read path is transparent — checks redb first, then block
     Given shard "shard-1" has both inline and chunked files
     When a client reads an inline file (chunk_id = "abc123")
@@ -131,6 +143,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And reads from the block device extent
     And returns the encrypted content
 
+  @integration
   Scenario: Snapshot includes inline content (I-SF5)
     Given shard "shard-1" has 1000 inline files in small/objects.redb
     When the state machine builds a snapshot
@@ -142,6 +155,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Raft throughput guard (I-SF7) ===
 
+  @unit
   Scenario: Inline write rate exceeds budget — threshold drops to floor
     Given shard "shard-1" has inline threshold = 4096 bytes
     And KISEKI_RAFT_INLINE_MBPS = 10
@@ -154,6 +168,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Metadata capacity management (I-SF2) ===
 
+  @unit
   Scenario: Soft limit triggers threshold reduction
     Given node-1's metadata usage is at 49% of root disk
     And shard "shard-1" is hosted on node-1 with threshold = 4096
@@ -162,6 +177,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And the shard leader recomputes threshold
     And threshold decreases (e.g., to 2048 bytes)
 
+  @unit
   Scenario: Hard limit forces threshold to floor and emits alert
     Given node-2's metadata usage is at 74%
     When metadata usage crosses 75% (hard limit)
@@ -170,6 +186,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And an alert is emitted to cluster admin
     And the leader commits the threshold change via Raft with 2/3 majority
 
+  @integration
   Scenario: Emergency signal uses gRPC, not Raft
     Given node-2's disk is at 76% (above hard limit)
     And node-2 cannot write new Raft log entries (disk full for journal)
@@ -180,6 +197,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === GC for small/objects.redb (I-SF6) ===
 
+  @integration
   Scenario: Inline file deletion cleans small/objects.redb
     Given an inline file with chunk_id "abc123" exists in small/objects.redb
     When the file is deleted (tombstone delta committed via Raft)
@@ -188,6 +206,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     Then the entry for "abc123" is removed from small/objects.redb
     And no orphan entry remains
 
+  @integration
   Scenario: Orphan detection in small/objects.redb
     Given small/objects.redb has 10,000 entries
     And the delta log references only 9,990 of them
@@ -197,6 +216,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Workload-driven shard placement ===
 
+  @integration
   Scenario: Control plane migrates shard to SSD node (decision tree)
     Given shard "shard-hot" is on node-1 and node-2 (HDD data devices)
     And shard "shard-hot" has small_file_ratio = 0.85
@@ -213,6 +233,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
       | 3    | raft.change_membership (add node-3) |
       | 4    | raft.change_membership (remove node-1 or node-2) |
 
+  @integration
   Scenario: Homogeneous cluster — only threshold and split available
     Given all 3 nodes have identical hardware (NVMe root + HDD data)
     When shard "shard-1" metadata pressure exceeds soft limit
@@ -223,6 +244,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     When the shard does not exceed split ceiling
     Then an alert is emitted: "metadata tier at capacity, no placement options"
 
+  @integration
   Scenario: Migration has zero downtime
     Given shard "shard-1" is receiving writes at 1000 ops/sec
     When a migration from node-1 to node-3 is in progress
@@ -230,6 +252,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And reads continue from existing voters
     And the new voter (node-3) becomes available after catch-up
 
+  @integration
   Scenario: Failed migration is rolled back
     Given a migration of shard "shard-1" to node-3 is initiated
     And node-3 crashes during learner catch-up
@@ -239,6 +262,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Placement rate limiting (I-SF4) ===
 
+  @unit
   Scenario: Exponential backoff prevents excessive migrations
     Given shard "shard-1" was migrated at T=0
     Then the next migration for shard "shard-1" is blocked until T+2h
@@ -248,12 +272,14 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     Then the next migration is blocked until T+6h+8h = T+14h
     And the backoff continues doubling up to 24h cap
 
+  @unit
   Scenario: Backoff reset never goes below 2-hour floor
     Given shard "shard-1" has a backoff of 8 hours
     When the workload profile changes significantly (small_file_ratio crosses 0.3 to 0.8)
     Then the backoff resets to 2 hours (floor), not 30 minutes
     And the shard may be migrated after the 2-hour window
 
+  @unit
   Scenario: Cluster-wide migration rate limit
     Given a 30-node cluster (max concurrent = max(1, 30/10) = 3)
     When 5 shards are candidates for migration simultaneously
@@ -262,6 +288,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === SSD learners as read accelerators ===
 
+  @integration
   Scenario: Add SSD learner for read-heavy shard
     Given shard "shard-1" has RF=3 voters on HDD nodes
     And shard "shard-1" has high read IOPS for small files
@@ -272,6 +299,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And the learner does NOT participate in elections
     And the learner does NOT count toward commit quorum
 
+  @integration
   Scenario: Learner promoted to voter when workload persists
     Given shard "shard-1" has an SSD learner serving reads for 24 hours
     And the small-file workload persists
@@ -282,6 +310,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
 
   # === Bimodal read latency (documented behavior) ===
 
+  @unit
   Scenario: Same-sized files have different latency after threshold drop
     Given shard "shard-1" had threshold = 4096 and stored 1000 files of 2KB inline
     When threshold drops to 128 bytes

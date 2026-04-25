@@ -10,6 +10,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
 
   # --- mTLS on data fabric (I-Auth1) ---
 
+  @unit
   Scenario: Valid tenant certificate — connection accepted
     Given a native client presents certificate "cert-pharma-001"
     When the storage node validates the certificate chain
@@ -17,6 +18,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     And the tenant_id is extracted from the certificate subject
     And the connection is accepted for tenant "org-pharma"
 
+  @unit
   Scenario: Invalid certificate — connection rejected
     Given a native client presents a self-signed certificate not signed by the Cluster CA
     When the storage node validates the certificate chain
@@ -24,12 +26,14 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     And the connection is rejected with TLS handshake error
     And the rejection is recorded in the audit log
 
+  @unit
   Scenario: Expired certificate — connection rejected
     Given tenant certificate "cert-pharma-001" has expired
     When the native client attempts to connect
     Then the connection is rejected with "certificate expired" error
     And the tenant admin is notified to renew
 
+  @unit
   Scenario: Revoked certificate — connection rejected
     Given tenant certificate "cert-pharma-001" has been revoked by the Cluster CA
     When the native client attempts to connect
@@ -37,6 +41,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     And the connection is rejected with "certificate revoked" error
     And the revocation attempt is recorded in the audit log
 
+  @unit
   Scenario: Certificate tenant mismatch — data access denied
     Given a native client presents valid certificate for "org-pharma"
     When it attempts to access data belonging to "org-biotech"
@@ -46,6 +51,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
 
   # --- Optional second-stage auth (I-Auth2) ---
 
+  @unit
   Scenario: Tenant with IdP configured — second-stage validation
     Given "org-pharma" has configured an external IdP for workload identity
     And a native client presents valid mTLS cert for "org-pharma"
@@ -54,12 +60,14 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     And the workload_id is extracted from the token
     And the connection is accepted with full workload identity (org + workload)
 
+  @unit
   Scenario: Tenant with IdP configured — missing token
     Given "org-pharma" has configured an external IdP (second stage required)
     And a native client presents valid mTLS cert but no workload token
     Then the connection is rejected with "workload identity required" error
     And the tenant admin is notified
 
+  @unit
   Scenario: Tenant without IdP — mTLS only (sufficient)
     Given "org-biotech" has NOT configured an external IdP
     And a native client presents valid mTLS cert for "org-biotech"
@@ -68,6 +76,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
 
   # --- SPIFFE/SPIRE alternative (I-Auth3) ---
 
+  @unit
   Scenario: SPIFFE SVID presented instead of raw mTLS cert
     Given the cluster is configured to accept SPIFFE SVIDs
     And a native client presents a SPIFFE SVID with URI "spiffe://cluster/org/pharma/workload/training-42"
@@ -77,6 +86,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
 
   # --- Cluster admin authentication (I-Auth4) ---
 
+  @unit
   Scenario: Cluster admin authenticates via control plane
     Given cluster admin "admin-ops" connects to the Control Plane API
     And the Control Plane is on the management network (not data fabric)
@@ -84,6 +94,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     Then access to cluster-level operations is granted
     And no access to tenant-scoped data is granted without approval (I-T4)
 
+  @unit
   Scenario: Cluster admin attempts data fabric access — rejected
     Given cluster admin "admin-ops" attempts to connect directly to a storage node
     And presents an admin credential (not a tenant certificate)
@@ -92,6 +103,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
 
   # --- Gateway authentication ---
 
+  @unit
   Scenario: NFS gateway authenticates incoming client
     Given an NFS client connects to gateway "gw-nfs-pharma"
     And the gateway is configured for tenant "org-pharma"
@@ -100,6 +112,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     And maps the client identity to the tenant's authorization model
     And the NFS session is established
 
+  @unit
   Scenario: S3 gateway authenticates incoming request
     Given an S3 client sends a request with AWS SigV4 signature
     When the gateway "gw-s3-pharma" validates the signature
@@ -111,6 +124,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
   # data path, and re-validates identity per operation — not just at
   # stream establishment (I-WA3).
 
+  @unit
   Scenario: mTLS identity re-validated per advisory operation
     Given a native client under workload "training-run-42" has an active bidi advisory stream
     And the stream was established using certificate "tenant-cert-v1"
@@ -118,6 +132,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     Then the advisory subsystem re-validates "tenant-cert-v1" for the owning workload before acting (I-WA3)
     And the hint is accepted if and only if the cert is currently valid for that workload
 
+  @unit
   Scenario: Advisory stream torn down on certificate revocation
     Given a workflow is active on a long-lived bidi advisory stream under cert "tenant-cert-v1"
     When the Cluster CA revokes "tenant-cert-v1" (e.g., rotation, compromise)
@@ -126,6 +141,7 @@ Feature: Authentication — mTLS, tenant identity, cluster admin IAM
     And pre-revocation in-flight hints accepted before the detection point remain valid (they were advisory only, I-WA1)
     And the next advisory operation requires a fresh, valid cert
 
+  @unit
   Scenario: Workflow_id is a capability reference, mTLS is the authority
     Given workload "inference-svc-9" has somehow obtained a workflow_id belonging to "training-run-42"
     When "inference-svc-9" presents its own valid mTLS cert and the stolen workflow_id on the advisory channel

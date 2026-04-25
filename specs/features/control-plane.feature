@@ -10,6 +10,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Tenant lifecycle ---
 
+  @unit
   Scenario: Create a new organization (tenant)
     Given cluster admin "admin-ops" receives a tenant creation request
     When the request is processed with:
@@ -25,6 +26,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And quotas are enforced from creation
     And the tenant creation is recorded in the audit log
 
+  @unit
   Scenario: Create optional project within organization
     Given tenant admin "pharma-admin" for "org-pharma"
     When they create project "clinical-trials":
@@ -36,6 +38,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And effective compliance is [HIPAA, GDPR, revFADP]
     And capacity quota 200TB is carved from org's 500TB
 
+  @unit
   Scenario: Create workload within tenant
     Given tenant admin creates workload "training-run-42" under "org-pharma"
     When the workload is configured with:
@@ -48,6 +51,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Namespace management ---
 
+  @integration
   Scenario: Create namespace triggers shard creation
     Given tenant admin creates namespace "patient-data" under "org-pharma"
     When the Control Plane processes the request
@@ -58,6 +62,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- IAM and zero-trust boundary ---
 
+  @unit
   Scenario: Cluster admin requests access to tenant data - requires approval
     Given cluster admin "admin-ops" needs to diagnose an issue with "org-pharma" data
     When "admin-ops" submits an access request for "org-pharma" config/logs
@@ -65,6 +70,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And "admin-ops" cannot access tenant data until approved
     And the request and its outcome are recorded in the audit log
 
+  @unit
   Scenario: Cluster admin access request approved - scoped and time-limited
     Given "pharma-admin" approves "admin-ops" access request
     When the approval is processed with:
@@ -76,12 +82,14 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And access expires after 4 hours automatically
     And all access during the window is recorded in the tenant audit export
 
+  @unit
   Scenario: Cluster admin access request denied
     Given "pharma-admin" denies "admin-ops" access request
     Then "admin-ops" cannot access any "org-pharma" tenant data
     And the denial is recorded in the audit log
     And "admin-ops" can only see cluster-level operational metrics (tenant-anonymous)
 
+  @unit
   Scenario: Tenant admin cannot access other tenant's data
     Given tenant admin "pharma-admin" for "org-pharma"
     When "pharma-admin" attempts to access "org-biotech" configuration
@@ -90,6 +98,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Quota enforcement ---
 
+  @unit
   Scenario: Write rejected when tenant quota exceeded
     Given "org-pharma" has used 499TB of 500TB capacity quota
     When a 2TB write is attempted
@@ -97,6 +106,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And the rejection is reported to the protocol gateway / native client
     And the tenant admin is notified
 
+  @unit
   Scenario: Workload quota within org ceiling
     Given "org-pharma" has 500TB capacity, 300TB used
     And workload "training-run-42" has 50TB quota, 49TB used
@@ -104,6 +114,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     Then the write is rejected (workload quota exceeded: 49 + 2 > 50)
     And org-level quota still has headroom
 
+  @unit
   Scenario: Quota adjustment by tenant admin
     Given tenant admin increases workload "training-run-42" quota to 100TB
     When the adjustment is within org ceiling
@@ -112,6 +123,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Placement and flavor management ---
 
+  @unit
   Scenario: Tenant selects a flavor - best-fit matching
     Given the cluster offers flavors:
       | flavor         | protocol | transport | topology        |
@@ -124,6 +136,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And reports the actual configuration to the tenant admin
     And the mismatch is logged (requested vs. provided)
 
+  @unit
   Scenario: Flavor unavailable
     Given tenant requests flavor "quantum-rdma" which doesn't match any cluster capability
     Then the request is rejected with "no matching flavor available"
@@ -131,6 +144,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Compliance tag management ---
 
+  @unit
   Scenario: Compliance tag inheritance - union of constraints
     Given org "org-pharma" has tags [HIPAA, GDPR]
     And project "clinical-trials" has tag [revFADP]
@@ -140,6 +154,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And data residency constraints from "swiss-residency" are enforced
     And audit requirements are the union of all regimes
 
+  @unit
   Scenario: Compliance tag cannot be removed if data exists under it
     Given namespace "trials" has tag [HIPAA] and contains compositions
     When tenant admin attempts to remove the HIPAA tag
@@ -149,6 +164,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Retention hold management ---
 
+  @unit
   Scenario: Set retention hold before crypto-shred
     Given tenant admin sets retention hold on namespace "trials":
       | field    | value                  |
@@ -159,6 +175,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And physical GC is blocked for held chunks even if refcount drops to 0
     And the hold is recorded in the audit log
 
+  @unit
   Scenario: Release retention hold
     Given retention hold "hipaa-litigation-2026" has expired (or is released by tenant admin)
     When the hold is released
@@ -167,6 +184,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Federation ---
 
+  @integration
   Scenario: Register federation peer
     Given cluster admin registers site-CH as a federation peer to site-EU
     When the peering is established:
@@ -179,6 +197,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And data replication carries ciphertext (no key material)
     And both sites connect to the same tenant KMS per tenant
 
+  @integration
   Scenario: Data residency enforcement in federation
     Given org "org-pharma" has namespace "swiss-patients" tagged [swiss-residency]
     And the residency policy requires data to stay in Switzerland
@@ -187,6 +206,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And only data without residency constraints replicates
     And the blocked replication attempt is recorded in the audit log
 
+  @integration
   Scenario: Tenant config sync across federated sites
     Given org "org-pharma" exists at both site-EU and site-CH
     When tenant admin updates a quota at site-EU
@@ -195,6 +215,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Maintenance mode ---
 
+  @unit
   Scenario: Cluster-wide maintenance mode
     Given cluster admin sets the cluster to maintenance mode
     Then all shards enter read-only mode
@@ -205,6 +226,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Failure paths ---
 
+  @integration
   Scenario: Control plane unavailable - data path continues
     Given the Control Plane service is down
     Then existing data path continues (Log, Chunks, Views work with last-known config)
@@ -213,6 +235,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And no placement decisions can be made for new shards
     And the cluster admin is alerted
 
+  @integration
   Scenario: Quota enforcement during control plane outage
     Given the Control Plane is unavailable
     And quotas are cached locally by gateways and native clients
@@ -227,6 +250,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
   # level narrowing (never broadening) its parent. Data path is never
   # affected by policy changes here (I-WA2, I-WA18).
 
+  @unit
   Scenario: Cluster admin defines cluster-wide hint-budget ceilings
     Given cluster admin "admin-ops" sets cluster-wide Workflow Advisory ceilings:
       | field                   | value |
@@ -239,6 +263,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And any attempt by a tenant admin to exceed them is rejected with "exceeds_cluster_ceiling"
     And the change is recorded in the cluster audit trail
 
+  @unit
   Scenario: Org-level profile allow-list narrows per project and workload
     Given tenant admin "pharma-admin" for "org-pharma" sets allowed profiles [ai-training, ai-inference, hpc-checkpoint, batch-etl]
     And project "clinical-trials" admin narrows allowed profiles to [ai-training, hpc-checkpoint]
@@ -246,6 +271,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     Then the effective allowed profiles for "training-run-42" are the intersection = [ai-training]
     And a child scope cannot add a profile not present in its parent; such an attempt is rejected with "profile_not_in_parent"
 
+  @unit
   Scenario: Workload budget cannot exceed project ceiling
     Given project "clinical-trials" ceiling sets hints_per_sec 300
     When tenant admin attempts to set workload "training-run-42" hints_per_sec 500
@@ -253,6 +279,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And the workload's effective budget remains its last-valid value
     And the rejected change is audited
 
+  @unit
   Scenario: Tenant admin disables Workflow Advisory for a workload - three-state transition
     Given "training-run-42" has Workflow Advisory enabled with 2 active workflows
     When tenant admin transitions advisory state to "draining"
@@ -263,6 +290,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     Then all hint processing ends, active telemetry subscriptions close
     And data-path operations remain fully correct throughout (I-WA12)
 
+  @unit
   Scenario: Cluster admin disables Workflow Advisory cluster-wide during incident
     Given a suspected advisory-subsystem issue
     When cluster admin transitions cluster-wide state directly to "disabled"
@@ -271,6 +299,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And no data-path operation is blocked, slowed, or fails (I-WA2)
     And the cluster-wide transition is recorded in the cluster audit trail
 
+  @unit
   Scenario: Advisory policy changes apply prospectively to existing workflows
     Given workflow "wf-abc" is active in phase "compute" under profile ai-training
     When tenant admin removes "ai-training" from the workload's allow-list
@@ -278,6 +307,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And the next PhaseAdvance is rejected with "profile_revoked" and the workflow remains on its current phase
     And budget reductions take effect prospectively from the next second
 
+  @unit
   Scenario: Tenant audit export includes advisory events
     Given tenant admin "pharma-admin" retrieves the tenant audit export for the last 24h
     When the export is generated
@@ -285,6 +315,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And each event carries the (org, project, workload, client_id, workflow_id, phase_id, reason) correlation
     And cluster-admin exports over the same window see workflow_id and phase_tag as opaque hashes only (I-A3, I-WA8)
 
+  @integration
   Scenario: Federation does NOT replicate advisory state
     Given "org-pharma" is federated across two sites with async config replication
     When a workflow is declared at site A
@@ -293,6 +324,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And profile allow-lists, hint budgets, and opt-out state (which are config) ARE replicated async
     And the advisory subsystem is independent per site
 
+  @unit
   Scenario: Workload pool authorization produces tenant-chosen labels
     Given tenant admin authorises workload "training-run-42" for pools with labels:
       | opaque_label | cluster_internal_pool |
@@ -308,6 +340,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
   # Client-side cache policy (ADR-031)
   # =====================================================================
 
+  @unit
   Scenario: Cluster admin sets default cache policy
     Given a cluster admin
     When they set cluster-wide cache policy:
@@ -321,29 +354,34 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     Then all tenants inherit the cluster default cache policy
     And native clients resolve this policy via data-path gRPC or gateway
 
+  @unit
   Scenario: Org-level cache policy narrows cluster default
     Given cluster allows cache modes {pinned, organic, bypass}
     And org "research-lab" sets allowed_modes to {organic, bypass}
     Then workloads under "research-lab" cannot use pinned mode
     And a client requesting cache_mode "pinned" is clamped to "organic"
 
+  @unit
   Scenario: Org cannot broaden cluster-level cache restrictions
     Given cluster sets max_cache_bytes to 100GB
     When org "research-lab" attempts to set max_cache_bytes to 200GB
     Then the request is rejected with "exceeds_parent_ceiling"
 
+  @unit
   Scenario: Tenant admin disables cache for a workload
     Given org "pharma-co" has cache_enabled = true
     When tenant admin sets cache_enabled = false for workload "compliance-job"
     Then clients running as "compliance-job" operate with cache disabled (bypass)
     And no plaintext is written to local NVMe for that workload
 
+  @unit
   Scenario: Cache policy changes apply prospectively
     Given a client session established with cache_mode "organic" and max_cache_bytes 50GB
     And cluster admin changes max_cache_bytes to 20GB during the session
     Then the active session continues with 50GB ceiling (I-CC10)
     And new sessions start with 20GB ceiling
 
+  @integration
   Scenario: Cache policy resolved during control plane outage
     Given the Control Plane is unavailable
     And a client connects to a storage node via data-path gRPC
@@ -351,6 +389,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     Then the storage node returns last-known cached TenantConfig (stale tolerance)
     And the client operates within the last-known policy
 
+  @unit
   Scenario: First-ever session with no policy available
     Given no TenantConfig has ever been fetched
     And the Control Plane and all storage nodes are unreachable

@@ -23,6 +23,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Workflow lifecycle ---
 
+  @unit
   Scenario: Client declares a workflow with an allowed profile
     When the native client calls DeclareWorkflow with:
       | field        | value             |
@@ -34,6 +35,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And an advisory-audit event "declare-workflow" is written to the tenant audit shard
     And the current phase is "stage-in"
 
+  @unit
   Scenario: Client attempts a profile not in its allow-list
     When the native client calls DeclareWorkflow with profile "batch-etl"
     Then the call is rejected with "profile_not_allowed"
@@ -41,6 +43,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And an advisory-audit event "declare-workflow: rejected" is written with reason "profile_not_allowed"
     And the workload's data-path operations remain unaffected
 
+  @unit
   Scenario: Phase advance is monotonic and bounded
     Given the workflow is in phase "stage-in" with phase_id 1
     When the client calls PhaseAdvance to phase "compute" with phase_id 2 tagged "epoch-0"
@@ -50,6 +53,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     When the client advances 64 times across the workflow's lifetime
     Then older phases beyond the last 64 are compacted to aggregate audit summaries
 
+  @unit
   Scenario: Workflow ends on explicit End
     Given the workflow has been active for 120 seconds
     When the client calls EndWorkflow
@@ -58,6 +62,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And all subscribed telemetry streams for the workflow are closed
     And any cached per-workflow steering state is dropped within 1s
 
+  @unit
   Scenario: Workflow ends on TTL expiry
     Given the workflow was declared with ttl_seconds 60
     When 61 seconds elapse without any advisory activity
@@ -67,6 +72,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Hints are advisory only (I-WA1) ---
 
+  @unit
   Scenario: Hint presence does not change data-path outcome
     Given a composition "checkpoint.pt" under workload "training-run-42"
     When the client writes 256MB to "checkpoint.pt" WITHOUT any hints
@@ -74,6 +80,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     Then both writes produce identical durability, encryption, dedup, and visibility outcomes
     And the effective placement for both may differ (hint honoured for the second) but both are valid per placement policy
 
+  @integration
   Scenario: Advisory channel outage does not affect data path
     Given the advisory subsystem on the client's serving node becomes unresponsive
     When the client issues reads and writes for "checkpoint.pt"
@@ -81,6 +88,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And no data-path operation is delayed, blocked, or reordered by the advisory outage
     And the client observes that hint submissions time out or return "advisory_unavailable"
 
+  @unit
   Scenario: Hint rejection returns the operation's own result unchanged
     Given the workload's allowed priority classes are [batch, bulk] only
     When the client submits a hint { priority: interactive } for an in-flight read
@@ -90,6 +98,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Tenant-hierarchy scoping (I-WA3, I-WA7) ---
 
+  @unit
   Scenario: A workflow cannot cross workload boundaries
     Given workload "training-run-42" and workload "inference-svc-9" both under "org-pharma"
     When the client pinned under "training-run-42" calls DeclareWorkflow
@@ -98,6 +107,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the advisory-audit event includes only "training-run-42"'s identity, not "inference-svc-9"'s
     And no information about "inference-svc-9"'s compositions is leaked in the error
 
+  @unit
   Scenario: Org ceiling caps workload hint budget
     Given "org-pharma" org-level ceiling is hints_per_sec 500
     And "clinical-trials" project-level ceiling is hints_per_sec 300
@@ -108,6 +118,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And other workloads under "clinical-trials" continue at their own budgets
     And an advisory-audit event "budget-exceeded" is written
 
+  @unit
   Scenario: Child scope cannot broaden parent ceiling
     Given "clinical-trials" project ceiling is hints_per_sec 300
     When the tenant admin attempts to set "training-run-42" workload budget to hints_per_sec 500
@@ -116,6 +127,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Telemetry scoping (I-WA5, I-WA6) ---
 
+  @unit
   Scenario: Telemetry is computed over the caller's own resources only
     Given the workload owns compositions [A, B] in pool "fast-nvme"
     And a different workload "neighbour-42" owns compositions [C, D] in the same pool
@@ -124,12 +136,14 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And cluster-wide utilisation exposed (if any) is bucketed with k-anonymity k>=5 over neighbour workloads
     And no field in the telemetry response allows the caller to infer C or D's traffic
 
+  @unit
   Scenario: Telemetry is not an existence oracle
     Given composition "secret-study/results.h5" exists under "org-other" (a different org)
     When the client queries locality telemetry with composition_id pointing at "secret-study/results.h5"
     Then the call returns "not_found" with the same latency distribution and error shape as a genuinely non-existent composition owned by "org-pharma"
     And no timing, size, or code difference distinguishes "forbidden" from "absent"
 
+  @unit
   Scenario: Locality class is coarsely bucketed
     Given the client reads a 1GB composition spanning chunks on local, same-rack, and remote nodes
     When the client requests locality telemetry for that composition
@@ -139,6 +153,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Hints inform but never authorise (I-WA9, I-WA14) ---
 
+  @unit
   Scenario: Affinity hint preference honoured within policy
     Given the workload's allowed affinity is pool "fast-nvme"
     When the client submits a hint { affinity: "fast-nvme", colocate_with: "rack-7" }
@@ -146,6 +161,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And MAY override the hint to satisfy EC durability (I-C4) or retention hold (I-C2b)
     And never places chunks in a pool the workload is not authorised for
 
+  @unit
   Scenario: Hint cannot bypass retention hold
     Given composition "patient-scan.dcm" has a retention hold for 7 years
     When the client sends hint { retention: temp } for "patient-scan.dcm"
@@ -153,6 +169,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the retention hold remains in effect
     And an advisory-audit event "hint-rejected" is written
 
+  @unit
   Scenario: Hint cannot elevate priority beyond policy max
     Given the workload's policy-allowed maximum priority is "batch"
     When the client submits hint { priority: interactive } for a workflow phase
@@ -161,6 +178,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Prefetch hints (AI training epoch) ---
 
+  @unit
   Scenario: Prefetch hints for shuffled epoch read order
     Given the workflow is in phase "epoch-0" with profile ai-training
     When the client submits a PrefetchHint with 4096 (composition_id, offset, length) tuples scoped to the workload's own compositions totaling 40GB
@@ -169,6 +187,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the client observes improved cache hit rate for the predicted read order
     And prefetch-effectiveness telemetry for this phase reports hit rate in coarse buckets
 
+  @unit
   Scenario: Prefetch hint beyond budget is capped
     Given the workload's declared_prefetch_bytes budget is 64GB
     When the client submits a PrefetchHint totaling 100GB in a single phase
@@ -176,6 +195,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And an advisory-audit event is written
     And data-path reads for the unadopted ranges still succeed normally
 
+  @unit
   Scenario: Collective checkpoint announcement
     Given phase "checkpoint" is active with profile hpc-checkpoint
     When the client submits a CollectiveAnnouncement { ranks: 1024, bytes_per_rank: 4GB, deadline: now+120s }
@@ -185,6 +205,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Backpressure feedback (I-WA5) ---
 
+  @unit
   Scenario: Soft backpressure signals the caller to slow
     Given the pool "fast-nvme" is at 80% of the caller's declared burst budget
     When the client has a telemetry subscription for the current workflow
@@ -192,6 +213,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the client MAY slow its submission rate
     And data-path operations continue to be accepted
 
+  @unit
   Scenario: Hard backpressure explicitly requests the caller to stop
     Given the pool is at 100% of the caller's hard budget
     When the client has a telemetry subscription
@@ -200,6 +222,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Identity hygiene (I-WA10) ---
 
+  @unit
   Scenario: Another workload cannot use a leaked workflow_id
     Given "training-run-42" has an active workflow with workflow_id "wf-abc..."
     And "training-run-42" inadvertently logs "wf-abc..." to a place visible to "inference-svc-9"
@@ -208,6 +231,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And no information about the workflow's existence or phase is revealed
     And the rejection latency and error code are indistinguishable from a workflow_id that was never issued
 
+  @unit
   Scenario: New process gets a new client_id
     Given native client process with client_id "cli-7f3a" is running
     When the process restarts
@@ -218,6 +242,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Audit (I-WA8) ---
 
+  @unit
   Scenario: All advisory decisions are audited on the tenant shard
     When the client performs, within one workflow:
       | step | action                                           |
@@ -235,6 +260,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Opt-out (I-WA12) ---
 
+  @unit
   Scenario: Tenant admin disables advisory for a workload
     Given "training-run-42" has Workflow Advisory enabled
     When tenant admin disables advisory for "training-run-42"
@@ -243,6 +269,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the workload's data-path operations proceed with full performance and correctness
     And cluster admin can observe the opt-out in aggregate state but not the reason
 
+  @unit
   Scenario: Cluster admin disables advisory cluster-wide (incident response)
     Given a suspected advisory-subsystem bug
     When cluster admin disables Workflow Advisory cluster-wide
@@ -252,6 +279,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Adversary gate-0 hardening scenarios ---
 
+  @unit
   Scenario: Hint rejection for unauthorized target is indistinguishable from absent target (I-WA6)
     Given composition_id "comp-neighbour" exists under a different workload
     And composition_id "comp-ghost" has never been allocated under any workload
@@ -262,6 +290,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the latency distributions over many samples are statistically indistinguishable
     And no timing, size, or code difference lets the caller tell "forbidden" from "absent"
 
+  @unit
   Scenario: Low-k telemetry response has the same shape as populated-k (I-WA5)
     Given pool "fast-nvme" has only the caller's workload and one neighbour workload active (k=2)
     When the caller subscribes to pool-saturation telemetry
@@ -269,6 +298,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And neighbour-derived fields carry a fixed sentinel value defined by policy
     And the response size, message timing, and field presence are indistinguishable from the populated case
 
+  @unit
   Scenario: mTLS identity is re-validated per operation (I-WA3)
     Given the client has an active bidi advisory stream under cert "tenant-cert-v1"
     When "tenant-cert-v1" is revoked by the Cluster CA
@@ -276,6 +306,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And subsequent hints on any resumed stream require a currently-valid cert
     And pre-revocation in-flight operations remain accepted up to the revocation point (per I-WA1)
 
+  @unit
   Scenario: Cap on tuples per prefetch hint (I-WA16)
     When the client submits a PrefetchHint with 20000 tuples
     Then the hint is rejected with "hint_too_large"
@@ -283,6 +314,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And an advisory-audit event "hint-rejected: hint_too_large" is written
     And subsequent prefetch hints within the cap continue to be accepted
 
+  @unit
   Scenario: Cap on workflow declares per second (I-WA17)
     When the client issues 30 DeclareWorkflow calls in a single second
     Then the first 10 succeed
@@ -290,6 +322,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And an advisory-audit event is written for the rate exception
     And the workload's concurrent_workflows cap is independent and still enforced
 
+  @unit
   Scenario: Batched audit for high-rate hint throttling (I-WA8)
     Given the workload sustains 200 hints/sec of which 150/sec are throttled
     When measured over a 60-second window
@@ -298,6 +331,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the total audit event volume is bounded below the raw 150/sec figure
     And declare/end/phase/policy-violation events are written per-occurrence without batching
 
+  @unit
   Scenario: Concurrent PhaseAdvance is serialized (I-WA13)
     Given two threads in one native-client process hold the same workflow handle at phase_id 5
     When both call PhaseAdvance(6) concurrently
@@ -305,6 +339,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the other call returns "phase_not_monotonic"
     And no intermediate state where two phases are active is ever observable
 
+  @unit
   Scenario: Hints in-flight at EndWorkflow follow a clear boundary
     Given the client has 30 hints buffered in the advisory channel toward its active workflow
     When the client calls EndWorkflow
@@ -313,6 +348,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And EndWorkflow does not block on buffered hint processing
     And an advisory-audit "end-workflow" event is written containing the count of pre-End hints dropped
 
+  @unit
   Scenario: Draining state during opt-out (I-WA12)
     Given "training-run-42" has two active workflows in phases "epoch-3" and "epoch-7"
     When tenant admin transitions advisory for "training-run-42" from enabled to draining
@@ -322,6 +358,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And when both active workflows have ended, the tenant admin may transition draining to disabled
     And data-path operations for "training-run-42" are unaffected throughout
 
+  @unit
   Scenario: Policy revocation applies prospectively (I-WA18)
     Given the workflow is in phase "compute" with profile ai-training and priority batch
     When tenant admin removes "ai-training" from the allow-list mid-workflow
@@ -330,12 +367,14 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the workflow remains on its current phase
     And data-path operations for this workflow are unaffected
 
+  @unit
   Scenario: Forbidden advisory target fields are rejected (I-WA11)
     When the client submits a hint whose target field contains a shard_id, log_position, chunk_id, dedup_hash, node_id, or device_id
     Then the hint is rejected with "forbidden_target_field" at the schema-validation layer
     And no ownership check or side effect occurs
     And an advisory-audit event is written
 
+  @unit
   Scenario: DeclareWorkflow returns authorized pool handles (I-WA19)
     Given workload "training-run-42" is authorised for pools with tenant-chosen labels ["fast-nvme", "bulk-nvme"]
     When the client calls DeclareWorkflow with profile ai-training
@@ -347,6 +386,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And subsequent AffinityHint or PrefetchHint submissions MUST reference one of these handles
     And a handle not in this set is rejected with "scope_not_found" (I-WA6)
 
+  @unit
   Scenario: Policy narrowing revokes active telemetry subscriptions (I-WA18)
     Given workflow "wf-abc" holds a telemetry subscription on pool handle "ph-fast"
     When tenant admin narrows policy so the workload is no longer authorised for the pool underlying "ph-fast"
@@ -356,6 +396,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And data-path access to chunks in that pool is independently denied by data-path authorization
     And the workflow's other subscriptions and hints are unaffected
 
+  @unit
   Scenario: Decommissioned pool returns scope-not-found uniformly (I-WA19, I-WA6)
     Given workflow "wf-abc" holds a valid pool handle "ph-fast"
     When the pool underlying "ph-fast" is decommissioned by the cluster admin
@@ -365,6 +406,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Gate-1 completeness back-fill (gaps found in post-architect audit) ---
 
+  @unit
   Scenario: Own-hotspot telemetry on caller's contended composition
     Given workflow "wf-abc" owns composition "shared-result.h5" that sees sustained concurrent reads from peer workloads in the same workload-id pool (fan-in)
     And the workload is subscribed to the OWN_HOTSPOT telemetry channel
@@ -373,6 +415,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And no composition owned by a different workload is named in any own-hotspot event (I-WA5)
     And the contention value is bucketed (no fine-grained counts)
 
+  @unit
   Scenario: Deadline hint accepted and influences scheduling within policy
     Given the workflow has an active phase with priority batch
     When the client submits a DeadlineHint { composition: "checkpoint.pt", deadline: now + 90s }
@@ -381,6 +424,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And failure to meet the deadline is NOT an error — the write succeeds whenever the data path completes it (I-WA1)
     And a deadline in the past is rejected with "hint_too_large" treatment (schema validation) or ignored as advisory
 
+  @unit
   Scenario: Phase summary audit event emitted on ring eviction (I-WA13, ADR-021 §9)
     Given the workflow's phase ring has 64 entries (K = default)
     When the client performs a 65th PhaseAdvance
@@ -394,12 +438,14 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the event is size-padded to a fixed bucket so its wire size does not leak workflow activity (ADR-021 §9)
     And cluster-admin exports see workflow_id and phase_tag hashed (I-WA8, I-A3)
 
+  @unit
   Scenario: Telemetry subscribe emits audit event
     When the client subscribes to channels [BACKPRESSURE, LOCALITY, QOS_HEADROOM]
     Then a TelemetrySubscribedEvent audit entry is emitted with the list of channel enum names
     And unsubscribe via ACTION_REMOVE emits a corresponding TelemetrySubscribedEvent (ACTION_REMOVE variant)
     And these events go to the tenant audit shard (I-WA8)
 
+  @unit
   Scenario: Priority-class revoked mid-workflow produces priority_revoked on next PhaseAdvance (I-WA18)
     Given the workflow's current phase uses priority batch
     And the workload's allowed priorities were [batch, bulk] at DeclareWorkflow
@@ -408,6 +454,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the next PhaseAdvance is rejected with "priority_revoked"
     And the workflow remains on its current phase
 
+  @unit
   Scenario: StreamWarning lifecycle — budget-exceeded, TTL-soon, cert-near-expiry
     Given the workflow is active with a bidi advisory stream open
     When the workload's hints/sec sustained rate exceeds its cap for >5 seconds
@@ -418,6 +465,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     Then the server emits StreamWarning { kind: CERT_NEAR_EXPIRY }
     And each warning is additionally audited as an advisory-state-transition or informational event
 
+  @unit
   Scenario: Server heartbeat keeps AdvisoryStream alive during idleness
     Given the client has an open bidi advisory stream with no hints and no subscriptions
     When 10 seconds of idleness elapse
@@ -425,6 +473,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And idle streams receive heartbeats every 10s ± jitter until closed
     And a client missing three consecutive heartbeats treats the stream as dead and reconnects (client-side obligation)
 
+  @unit
   Scenario: gRPC status code is NOT_FOUND for every scope violation (I-WA6, ADR-021 §8)
     When any of the following happen:
       | case                                          |
@@ -439,6 +488,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
 
   # --- Covert-channel hardening (I-WA15) ---
 
+  @unit
   Scenario: Rejection latency does not leak neighbour state
     Given workload A submits hints that would be rejected due to its own policy
     And workload B submits hints that would be rejected due to pool-wide contention caused by neighbour traffic
@@ -446,6 +496,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     Then the latency distributions and error payloads are indistinguishable between A's and B's rejections
     And neither A nor B can infer the other's activity from rejection timing
 
+  @unit
   Scenario: Telemetry response size is bucketed
     When a client subscribes to telemetry at different cluster load levels
     Then the size of each telemetry message is one of a small fixed set of sizes (padded/bucketed)

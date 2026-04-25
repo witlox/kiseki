@@ -12,6 +12,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- System key lifecycle ---
 
+  @unit
   Scenario: System DEK generation for chunk encryption
     When a new chunk is written
     Then a system DEK is generated (or retrieved from the current epoch pool)
@@ -20,6 +21,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And the wrapped DEK is stored in the chunk envelope
     And the plaintext DEK is held only in memory, never persisted
 
+  @unit
   Scenario: System KEK rotation
     Given system KEK "sys-kek-001" is in epoch 1
     When the cluster admin triggers system KEK rotation
@@ -32,6 +34,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Tenant key wrapping ---
 
+  @unit
   Scenario: Tenant KEK wraps system DEK for tenant access
     Given chunk "abc123" is encrypted with system DEK "dek-42"
     And "dek-42" is wrapped with system KEK "sys-kek-001"
@@ -41,6 +44,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And the system can: unwrap "dek-42" with system KEK → but only for system operations
     And both wrappings coexist in the envelope
 
+  @unit
   Scenario: Tenant without KEK cannot access any chunks
     Given a new tenant "org-newco" has been created but has not configured a KMS
     When "org-newco" attempts to read a chunk
@@ -50,6 +54,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Tenant key rotation (epoch-based) ---
 
+  @unit
   Scenario: Epoch-based tenant key rotation
     Given "org-pharma" tenant KEK "pharma-kek-001" is epoch 1
     When the tenant admin rotates the tenant KEK
@@ -61,6 +66,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And old data remains accessible throughout rotation
     And the rotation event is recorded in the audit log (tenant export)
 
+  @unit
   Scenario: Full re-encryption triggered by admin (key compromise)
     Given "org-pharma" suspects key compromise of "pharma-kek-001"
     When the tenant admin triggers full re-encryption
@@ -76,6 +82,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Crypto-shred ---
 
+  @integration
   Scenario: Crypto-shred destroys tenant KEK
     Given "org-pharma" has chunks [c1, c2, c3] with refcounts [2, 1, 1]
     When the tenant admin performs crypto-shred for "org-pharma"
@@ -86,6 +93,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And refcounts for "org-pharma"'s references are decremented
     And the crypto-shred event is recorded in the audit log (system + tenant export)
 
+  @integration
   Scenario: Crypto-shred with retention hold preserves ciphertext
     Given a retention hold "hipaa-7yr" is active on "org-pharma" namespace "trials"
     When crypto-shred is performed for "org-pharma"
@@ -94,6 +102,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And system-encrypted ciphertext is retained until hold expires
     And the hold-preserving-after-shred state is recorded in the audit log
 
+  @integration
   Scenario: Crypto-shred does not affect other tenants' access
     Given chunk "shared-99" has refcount 2 (org-pharma and org-biotech, cross-tenant dedup)
     When "org-pharma" performs crypto-shred
@@ -105,6 +114,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- KMS connectivity ---
 
+  @unit
   Scenario: Tenant KMS temporarily unreachable — cached keys sustain operations
     Given "org-pharma" KMS is unreachable
     And cached tenant KEK material has a TTL of 300 seconds
@@ -113,6 +123,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And the read succeeds
     And a warning is logged: "tenant KMS unreachable, using cached key material"
 
+  @unit
   Scenario: Tenant KMS unreachable — cache expired
     Given "org-pharma" KMS has been unreachable for 600 seconds
     And the cached KEK TTL of 300 seconds has expired
@@ -121,6 +132,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And the tenant admin and cluster admin are alerted
     And no stale key material is used beyond the TTL
 
+  @integration
   Scenario: Tenant KMS reachable from federated site
     Given "org-pharma" has data at site-EU and site-CH
     And tenant KMS is at "kms.pharma.internal"
@@ -132,6 +144,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Key audit ---
 
+  @unit
   Scenario: All key lifecycle events are audited
     Given any key event occurs:
       | event_type       | example                        |
@@ -152,6 +165,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Failure modes ---
 
+  @unit
   Scenario: Tenant KMS permanently lost — unrecoverable
     Given "org-pharma" KMS infrastructure is destroyed
     And "org-pharma" has no KMS backups
@@ -162,6 +176,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And Kiseki does not provide key escrow or recovery
     And the loss is documented as tenant responsibility per I-K11
 
+  @integration
   Scenario: System key manager failure
     Given the system key manager is an internal HA Kiseki service
     And the system key manager loses quorum
@@ -174,6 +189,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Edge cases ---
 
+  @integration
   Scenario: Concurrent key rotation and crypto-shred
     Given "org-pharma" tenant admin initiates key rotation
     And simultaneously another admin initiates crypto-shred
@@ -182,6 +198,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And if shred wins: KEK is destroyed, rotation is moot
     And the outcome is deterministic and audited
 
+  @unit
   Scenario: Key epoch mismatch during read
     Given chunk "c50" was written in epoch 1
     And the current epoch is 3

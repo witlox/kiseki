@@ -9,17 +9,20 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
 
   # === Write path ===
 
+  @unit
   Scenario: Chunk written with EC 4+2
     When a 1MB chunk is written to pool "fast-nvme"
     Then the chunk is split into 4 data fragments (256KB each)
     And 2 parity fragments are computed
     And all 6 fragments are written to distinct devices (I-D4)
 
+  @unit
   Scenario: Chunk written with EC 8+3
     When a 4MB chunk is written to pool "bulk-hdd"
     Then 8 data fragments + 3 parity fragments are created
     And all 11 fragments are on distinct devices
 
+  @unit
   Scenario: Small chunk below EC minimum
     When a 4KB chunk is written to pool "fast-nvme"
     Then EC is still applied (4 × 1KB data + 2 × 1KB parity)
@@ -27,6 +30,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
 
   # === Read path ===
 
+  @unit
   Scenario: Normal read — all fragments available
     Given a chunk with EC 4+2 on devices [d1..d6]
     When the chunk is read
@@ -34,6 +38,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
     And parity fragments are not read (fast path)
     And the chunk is reassembled from data fragments
 
+  @unit
   Scenario: Degraded read — one device unavailable
     Given a chunk with EC 4+2 and device d3 is offline
     When the chunk is read
@@ -41,6 +46,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
     And the missing fragment is reconstructed via EC math
     And the chunk is returned successfully
 
+  @unit
   Scenario: Degraded read — two devices unavailable (max for 4+2)
     Given devices d3 and d5 are offline
     When the chunk is read
@@ -48,6 +54,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
     And 2 missing fragments reconstructed from parity
     And the chunk is returned
 
+  @unit
   Scenario: Read fails — too many devices offline
     Given devices d3, d5, and d6 are offline (3 > parity count 2)
     When the chunk is read
@@ -56,6 +63,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
 
   # === Repair ===
 
+  @integration
   Scenario: Device failure triggers automatic repair (I-D1)
     Given device d3 fails
     When repair is triggered
@@ -64,6 +72,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
     And write reconstructed fragment to a healthy device
     And update chunk metadata with new placement
 
+  @integration
   Scenario: Repair during normal I/O
     Given a repair is in progress for device d3
     When new writes target pool "fast-nvme"
@@ -72,11 +81,13 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
 
   # === Placement (CRUSH-like, I-D4) ===
 
+  @unit
   Scenario: Fragments deterministically placed
     Given the same chunk_id and pool device list
     When placement is computed twice
     Then the same devices are selected both times (deterministic)
 
+  @integration
   Scenario: Device addition triggers rebalance
     Given pool "fast-nvme" has 6 devices
     When device d7 is added
@@ -85,11 +96,13 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
 
   # === Storage efficiency ===
 
+  @unit
   Scenario: EC 4+2 storage overhead is 1.5x
     When 100GB of data is written to pool "fast-nvme" (EC 4+2)
     Then 150GB of storage is used (100GB data + 50GB parity)
     And storage efficiency is 67%
 
+  @unit
   Scenario: EC 8+3 storage overhead is 1.375x
     When 100GB of data is written to pool "bulk-hdd" (EC 8+3)
     Then 137.5GB of storage is used
@@ -97,6 +110,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
 
   # === Replication mode (meta pool) ===
 
+  @unit
   Scenario: Meta pool uses replication-3 (not EC)
     Given pool "meta-nvme" with replication-3
     When a chunk is written

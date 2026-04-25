@@ -9,12 +9,14 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Seed bootstrap ===
 
+  @integration
   Scenario: Seed node initializes and becomes leader
     When node-1 creates a shard as seed with 3 members [1, 2, 3]
     Then node-1 calls raft.initialize() with all 3 members
     And node-1 becomes leader (single-node quorum until peers join)
     And node-1 accepts writes immediately
 
+  @integration
   Scenario: Seed node starts RPC server before other nodes join
     When node-1 creates a shard as seed
     Then node-1's Raft RPC server is listening
@@ -22,6 +24,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Follower join ===
 
+  @integration
   Scenario: Follower joins existing cluster without calling initialize
     Given node-1 has seeded the cluster and is leader
     When node-2 creates its Raft instance for the same shard
@@ -30,12 +33,14 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And node-2 receives membership from node-1 via AppendEntries
     And node-2 becomes a follower
 
+  @integration
   Scenario: Follower joins even if seed started minutes earlier
     Given node-1 has been running as leader for 60 seconds
     When node-2 starts and joins the cluster
     Then node-2 successfully becomes a follower
     And node-2 receives any committed log entries from the leader
 
+  @integration
   Scenario: All 3 nodes form a healthy cluster
     Given node-1 has seeded the cluster
     When node-2 and node-3 join the cluster
@@ -46,6 +51,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Staggered startup ===
 
+  @integration
   Scenario: Nodes can join in any order after seed
     Given node-1 has seeded the cluster
     When node-3 joins before node-2
@@ -53,6 +59,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And when node-2 joins later, it also becomes a follower
     And the cluster has 3 healthy members
 
+  @integration
   Scenario: Cluster reaches quorum when majority joins
     Given node-1 has seeded the cluster (1 of 3 — no quorum)
     When node-2 joins (2 of 3 — quorum reached)
@@ -61,6 +68,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Leader election after formation ===
 
+  @integration
   Scenario: Leader election works after cluster formation
     Given a 3-node cluster is fully formed
     When the leader's Raft RPC server stops
@@ -69,6 +77,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Configuration ===
 
+  @integration
   Scenario: Seed vs follower determined by bootstrap flag
     Given KISEKI_BOOTSTRAP=true on node-1
     And KISEKI_BOOTSTRAP=false on node-2 and node-3
@@ -78,12 +87,14 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Error handling ===
 
+  @integration
   Scenario: Follower retries if seed is not yet available
     When node-2 starts before node-1 (seed)
     Then node-2's RPC server starts and listens
     And node-2 retries connecting to the seed
     And once node-1 starts, node-2 receives membership and joins
 
+  @integration
   Scenario: Double initialize is harmless on the same node
     When node-1 calls initialize() twice with the same membership
     Then the second call is a no-op (idempotent)
@@ -91,6 +102,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Initial shard topology (I-L10, I-L12, I-L15 — ADR-033, spec-only) ===
 
+  @integration
   Scenario: Namespace creation produces 3x node_count shards by default
     Given the cluster has 3 Active nodes
     And no cluster-admin override of `initial_shard_multiplier` is in effect
@@ -102,6 +114,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And the namespace shard map records all 9 shards with disjoint hashed_key ranges covering the full key space
     And the namespace shard map is persisted in the control plane Raft group (I-L15)
 
+  @integration
   Scenario: Initial topology floor — small cluster
     Given the cluster has 1 Active node
     When tenant admin creates namespace "small-ns"
@@ -109,6 +122,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And all 3 leaders are on the single node (best-effort honors what is available)
     And the namespace shard map is persisted
 
+  @integration
   Scenario: Initial topology cap — large cluster
     Given the cluster has 100 Active nodes
     When tenant admin creates namespace "big-ns"
@@ -116,12 +130,14 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And the 64 leaders are placed best-effort round-robin across the 100 nodes
     And approximately 64/100 nodes host one leader; remaining nodes host none for this namespace
 
+  @integration
   Scenario: Cluster admin overrides initial multiplier
     Given the cluster admin sets `initial_shard_multiplier = 2` cluster-wide
     And the cluster has 5 Active nodes
     When tenant admin creates namespace "ns-x"
     Then 10 shards are created (max(min(2 * 5, 64), 3))
 
+  @integration
   Scenario: Tenant admin overrides within admin envelope
     Given the cluster admin defines per-tenant initial-shard bounds: min=4, max=32
     And the cluster has 10 Active nodes
@@ -132,6 +148,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Ratio floor trigger (I-L11 — ADR-033, spec-only) ===
 
+  @integration
   Scenario: Adding a node below the ratio floor triggers auto-split
     Given the cluster has 3 Active nodes
     And namespace "ns-a" has 9 shards (ratio = 3.0)
@@ -141,6 +158,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And the new shards are placed best-effort round-robin so leaders distribute across the 7 nodes
     And the namespace shard map is updated atomically through the control plane Raft group
 
+  @integration
   Scenario: Adding a node within the ratio floor does not trigger split
     Given the cluster has 3 Active nodes
     And namespace "ns-b" has 9 shards (ratio = 3.0)
@@ -150,6 +168,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
 
   # === Adversary findings (ADV-033) ===
 
+  @integration
   Scenario: Namespace creation is atomic — partial Raft group failure rolls back (ADV-033-1)
     Given the cluster has 3 Active nodes
     And node-3 is temporarily unreachable
@@ -160,12 +179,14 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And the CreateNamespace call returns error "namespace creation failed: shard 7 did not reach quorum"
     And a subsequent CreateNamespace for "partial-ns" succeeds once node-3 recovers
 
+  @integration
   Scenario: Concurrent CreateNamespace for same ID is rejected during creation (ADV-033-1)
     Given namespace "dup-ns" is in state Creating (Raft groups being formed)
     When a second CreateNamespace("dup-ns") arrives
     Then the second call is rejected with "namespace creation in progress"
     And the first creation continues
 
+  @integration
   Scenario: Write to wrong shard is rejected with KeyOutOfRange (ADV-033-3)
     Given namespace "ns-routed" has 3 shards covering ranges [0x00, 0x55), [0x55, 0xAA), [0xAA, 0xFF]
     And the gateway has a stale shard map (pre-split, single shard)
@@ -175,6 +196,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And the gateway retries to shard-2 (range [0x55, 0xAA))
     And the delta is accepted
 
+  @integration
   Scenario: Ratio-floor splits respect shard cap (ADV-033-7)
     Given the cluster scales from 3 to 50 Active nodes
     And namespace "big-ns" has 9 shards (ratio = 9/50 = 0.18, far below floor)
@@ -183,6 +205,7 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     And not 75 (the shard_cap takes precedence)
     And at most max(1, 50/5) = 10 splits are in flight concurrently
 
+  @integration
   Scenario: GetNamespaceShardMap requires tenant authorization (ADV-033-9)
     Given tenant "org-alpha" owns namespace "alpha-data"
     And a gateway authenticated as tenant "org-beta"

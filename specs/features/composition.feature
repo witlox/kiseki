@@ -11,6 +11,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
 
   # --- Happy path: create composition ---
 
+  @unit
   Scenario: Create a new file composition via protocol gateway
     Given the protocol gateway receives an NFS CREATE for "/trials/study-42/results.h5"
     When the Composition context processes the create:
@@ -26,6 +27,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And the chunk's refcount includes this composition's reference
     And the protocol gateway receives success
 
+  @unit
   Scenario: Create a small file with inline data
     Given the protocol gateway receives a CREATE for a 512-byte file
     And the inline data threshold is 4096 bytes
@@ -37,6 +39,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
 
   # --- Write path: update composition ---
 
+  @unit
   Scenario: Append data to an existing composition
     Given composition "results.h5" exists with chunks [c1, c2]
     When a 64MB append is written
@@ -45,6 +48,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And the composition now references [c1, c2, c3, c4]
     And refcounts for c3, c4 are initialized to 1
 
+  @unit
   Scenario: Overwrite a byte range in a composition
     Given composition "model.bin" exists with chunks [c1, c2, c3]
     And chunk c2 covers byte range 64MB-128MB
@@ -56,6 +60,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
 
   # --- Multipart / bulk write ---
 
+  @unit
   Scenario: S3 multipart upload
     Given the protocol gateway receives an S3 CreateMultipartUpload
     When parts are uploaded in parallel:
@@ -69,6 +74,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And the composition becomes visible to readers only after the finalize delta commits
     And individual parts are NOT visible before completion (I-L5)
 
+  @unit
   Scenario: Multipart upload aborted
     Given a multipart upload is in progress with chunks [c10, c11] stored
     When the protocol gateway sends AbortMultipartUpload
@@ -78,6 +84,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
 
   # --- Delete ---
 
+  @unit
   Scenario: Delete a composition
     Given composition "old-results.csv" references chunks [c5, c6]
     And c5 has refcount 2 (shared with another composition)
@@ -88,6 +95,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And c6 refcount is decremented to 0 (eligible for GC if no hold)
     And the composition is no longer visible in the namespace
 
+  @unit
   Scenario: Delete composition with object versioning enabled
     Given namespace "trials" has object versioning enabled
     And composition "results.h5" has versions [v1, v2, v3]
@@ -99,6 +107,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
 
   # --- Dedup ---
 
+  @unit
   Scenario: Intra-tenant dedup — same data written twice
     Given "org-pharma" writes file A with plaintext P (chunk_id = sha256(P) = "abc")
     And later writes file B with the same plaintext P
@@ -106,6 +115,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And chunk "abc" refcount is 2
     And no new chunk is stored
 
+  @unit
   Scenario: Cross-tenant dedup (default tenants)
     Given "org-pharma" has chunk "abc" (refcount 1)
     And "org-biotech" (default dedup) writes the same plaintext
@@ -113,6 +123,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And "org-biotech" receives a tenant KEK wrapping for the system DEK
     And one copy of ciphertext serves both tenants
 
+  @unit
   Scenario: No cross-tenant dedup for opted-out tenant
     Given "org-defense" (HMAC chunk IDs) writes plaintext P
     And chunk_id = HMAC(P, org-defense_key) = "def456"
@@ -123,6 +134,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
 
   # --- Namespace management ---
 
+  @integration
   Scenario: Create namespace
     Given tenant admin for "org-pharma" requests new namespace "genomics"
     When the Control Plane approves (quota, policy check)
@@ -130,6 +142,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And the namespace is associated with the tenant and shard
     And compliance tags from the org level are inherited
 
+  @unit
   Scenario: Namespace inherits compliance tags
     Given org "org-pharma" has compliance tags [HIPAA, GDPR]
     And namespace "trials" has additional tag [revFADP]
@@ -139,6 +152,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
 
   # --- Failure paths ---
 
+  @unit
   Scenario: Chunk write fails during composition create
     Given the Composition context is creating a new composition
     And chunk write to Chunk Storage fails (pool full, system key manager down)
@@ -147,6 +161,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And the protocol gateway receives a retriable error
     And no partial state remains
 
+  @unit
   Scenario: Delta commit fails after chunk write succeeds
     Given chunk c20 was successfully written (refcount 1)
     And the subsequent delta commit to the Log fails (shard unavailable)
@@ -155,6 +170,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And chunk c20 has refcount 0 (no composition references it)
     And c20 becomes eligible for GC (orphan chunk cleanup)
 
+  @unit
   Scenario: Cross-shard rename returns EXDEV
     Given composition "file.txt" exists in namespace "alpha" (shard-1)
     When a POSIX rename targets namespace "beta" (shard-2)
@@ -167,6 +183,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
   # and emits caller-scoped refcount/version activity telemetry. Hints
   # never relax namespace, tenant, or retention boundaries (I-WA14).
 
+  @unit
   Scenario: Collective checkpoint announcement pre-allocates write-absorb
     Given workload "training-run-42" is in phase "checkpoint" with profile hpc-checkpoint
     And the caller submits hint { collective: { ranks: 1024, bytes_per_rank: 4GB, deadline: now+120s } }
@@ -175,6 +192,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And the announcement is advisory — checkpoint writes succeed even if no warm-up occurred (I-WA1)
     And no capacity is reserved in a way that starves other tenants of their quota (I-T2)
 
+  @unit
   Scenario: Retention-intent { final } informs refcount behavior during multipart finalize
     Given a multipart upload for composition "checkpoint-final.pt" is in progress
     And the caller attaches hint { retention_intent: final } at finalize
@@ -182,6 +200,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And the hint MAY bias background GC urgency for parts not included in the final composition
     And it does NOT change refcount semantics (I-C2) or ordering guarantees (I-L5)
 
+  @unit
   Scenario: Caller-scoped refcount activity telemetry
     Given workload "training-run-42" performs rapid creates/updates on compositions in namespace "trials"
     When the caller subscribes to refcount-activity telemetry
@@ -189,12 +208,14 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
     And only activity attributable to the caller's workflow is included (I-WA5)
     And no neighbour workload's activity in the same namespace is inferable
 
+  @unit
   Scenario: Hint cannot enable cross-namespace composition creation
     Given workload "training-run-42" is authorised for namespace "trials" only
     When the caller submits a create-composition request for namespace "archive" (not authorised) carrying hint { priority: batch }
     Then the request is rejected with the same error it would return without any hint
     And the hint has no effect on authorisation (I-WA14)
 
+  @unit
   Scenario: Advisory disabled — composition path unaffected
     Given tenant admin transitions "training-run-42" advisory to disabled
     When the workload creates, updates, and finalizes compositions

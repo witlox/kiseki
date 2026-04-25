@@ -8,6 +8,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Runtime integrity monitor (ADR-018, I-O7) ---
 
+  @unit
   Scenario: ptrace attachment detected on kiseki-server process
     Given kiseki-server is running on node 1 with PID 12345
     And the integrity monitor is watching PID 12345
@@ -18,6 +19,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the event is recorded in the audit log
     And if auto-rotate is enabled: system master key rotation is triggered
 
+  @unit
   Scenario: Core dump attempt blocked
     Given kiseki-server has core dumps disabled (RLIMIT_CORE=0, MADV_DONTDUMP)
     When a SIGABRT is received by the process
@@ -25,6 +27,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And key material in mlock'd pages is not written to disk
     And the event is recorded in the audit log
 
+  @unit
   Scenario: Integrity monitor in development mode
     Given the cluster is in development/test mode
     And the integrity monitor is configured as disabled
@@ -34,6 +37,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Schema versioning (ADR-004) ---
 
+  @unit
   Scenario: New-version stream processor reads old-format deltas
     Given shard "shard-1" contains deltas in format version 1
     And a new stream processor supports format versions [1, 2]
@@ -42,6 +46,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And materializes the view correctly
     And no upgrade of the delta format is required
 
+  @unit
   Scenario: Old-version stream processor encounters unknown format
     Given shard "shard-1" contains a delta in format version 3
     And the stream processor supports format versions [1, 2] only
@@ -51,6 +56,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the skipped delta is flagged for manual review
     And the view may have a gap (documented behavior)
 
+  @integration
   Scenario: Rolling upgrade — mixed version cluster
     Given nodes [1, 2, 3] are running kiseki-server v1.0 (format version 1)
     When node 1 is upgraded to v1.1 (supports format versions [1, 2])
@@ -59,6 +65,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And Raft replication works across mixed versions
     And after all nodes upgraded: writers switch to format v2
 
+  @unit
   Scenario: Chunk envelope version preserved through compaction
     Given shard "shard-1" has deltas with format versions [1, 1, 2, 2]
     When compaction merges these deltas
@@ -68,6 +75,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Compression (I-K14) ---
 
+  @unit
   Scenario: Tenant opts in to compression
     Given "org-biotech" has no HIPAA compliance tag
     When the tenant admin enables compression for "org-biotech"
@@ -76,6 +84,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the chunk metadata records compressed=true
     And existing chunks are NOT retroactively compressed
 
+  @unit
   Scenario: Compressed chunk round-trip
     Given "org-biotech" has compression enabled
     When a 10MB plaintext file is written
@@ -87,12 +96,14 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     Then the ciphertext is decrypted
     And decompressed to recover the original 10MB plaintext
 
+  @unit
   Scenario: HIPAA namespace blocks compression opt-in
     Given "org-pharma" has compliance tag [HIPAA]
     When the tenant admin attempts to enable compression
     Then the request is rejected with "compression prohibited by HIPAA compliance tag"
     And no compression setting is changed
 
+  @unit
   Scenario: Compression disabled by default
     Given a new tenant "org-newco" is created with default settings
     Then compression is disabled
@@ -100,6 +111,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Audit GC safety valve (ADR-009 revised, I-A5) ---
 
+  @unit
   Scenario: Audit export stalls — safety valve triggers GC
     Given "org-pharma" audit export has stalled for 25 hours
     And the safety valve threshold is 24 hours
@@ -110,6 +122,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the compliance team is notified of the gap
     And storage is reclaimed
 
+  @unit
   Scenario: Audit backpressure mode — writes throttled
     Given "org-pharma" has audit backpressure mode enabled
     And "org-pharma" audit export is falling behind
@@ -119,6 +132,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And no audit gap occurs
     And the tenant admin is notified of throttled writes
 
+  @unit
   Scenario: Audit backpressure does not affect other tenants
     Given "org-pharma" has backpressure mode and is being throttled
     And "org-biotech" has default safety valve mode
@@ -128,6 +142,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Retention hold auto-creation (ADR-010) ---
 
+  @unit
   Scenario: HIPAA namespace auto-creates retention hold
     Given tenant admin creates namespace "patient-records" with tag [HIPAA]
     When the namespace is created
@@ -136,6 +151,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the hold is recorded in the audit log
     And the tenant admin is notified of the auto-hold
 
+  @unit
   Scenario: Crypto-shred blocked when compliance implies retention
     Given namespace "patient-records" has tag [HIPAA]
     And no explicit retention hold exists (auto-hold was not created — edge case)
@@ -143,6 +159,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     Then crypto-shred is blocked with error: "compliance tags imply retention; set hold or use force override"
     And the block is recorded in the audit log
 
+  @unit
   Scenario: Crypto-shred with force override — audited
     Given namespace "patient-records" has HIPAA tag but no retention hold
     When "org-pharma" performs crypto-shred with force_without_hold_check=true
@@ -152,6 +169,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Crypto-shred invalidation broadcast (ADR-011, I-K15) ---
 
+  @integration
   Scenario: Crypto-shred triggers invalidation broadcast
     Given gateways [gw-1, gw-2] and stream processors [sp-1, sp-2] cache "org-pharma" KEK
     When crypto-shred is executed for "org-pharma"
@@ -160,6 +178,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And crypto-shred returns success after KEK destruction + broadcast
     And it does NOT wait for all acknowledgments
 
+  @integration
   Scenario: Unreachable component — TTL expires naturally
     Given native client "client-1" on an unreachable compute node caches "org-pharma" KEK
     And the cache TTL is 60 seconds
@@ -169,6 +188,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And after 60 seconds, the cached KEK expires
     And subsequent operations from "client-1" fail with "key unavailable"
 
+  @unit
   Scenario: Tenant configures shorter crypto-shred TTL
     Given "org-pharma" requests cache TTL of 10 seconds (within [5s, 300s] bounds)
     When the control plane processes the request
@@ -176,6 +196,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And KMS load increases (key refresh every 10 seconds per component)
     And the configuration change is recorded in the audit log
 
+  @unit
   Scenario: TTL below minimum rejected
     Given "org-pharma" requests cache TTL of 2 seconds
     When the control plane processes the request
@@ -184,6 +205,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Writable mmap (ADR-013, I-O8) ---
 
+  @unit
   Scenario: Writable shared mmap returns clear error
     Given a workload opens a file via FUSE mount
     When the workload calls mmap with PROT_WRITE and MAP_SHARED
@@ -191,6 +213,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And logs: "writable shared mmap not supported; use write() instead"
     And the workload receives the error immediately
 
+  @unit
   Scenario: Read-only mmap works
     Given a workload opens a file via FUSE mount
     When the workload calls mmap with PROT_READ and MAP_PRIVATE
@@ -200,6 +223,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Multi-endpoint client resilience (ADR-019, I-O9) ---
 
+  @integration
   Scenario: NFS client reconnects after node failure
     Given an NFS client is connected to gateway on node 1
     And the NFS mount is configured with multiple server addresses [node1, node2, node3]
@@ -208,6 +232,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And reconnects to node 2 or node 3 automatically
     And NFS operations resume (session state re-established)
 
+  @integration
   Scenario: S3 client retries to different endpoint on error
     Given an S3 client sends PutObject to node 1
     And node 1 returns 503 Service Unavailable
@@ -215,6 +240,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     Then DNS resolves to [node2, node3] (round-robin)
     And the retry succeeds on a healthy node
 
+  @integration
   Scenario: Native client discovery updates after shard split
     Given the native client has cached discovery results
     And shard "shard-1" splits into "shard-1" and "shard-1b"
@@ -225,6 +251,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Node lifecycle / operator drain workflow (ADR-035, spec-only) ---
 
+  @integration
   Scenario: Operator workflow — graceful node retirement
     Given the cluster admin needs to retire node "n7" for hardware refresh
     And the cluster has 5 Active nodes [n1..n5] including n7
@@ -236,6 +263,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the operator is signalled completion with a per-shard summary
     And every state transition is recorded in the cluster audit shard (I-N6)
 
+  @integration
   Scenario: Operator workflow — drain refused, replacement added, drain re-issued
     Given the cluster has exactly 3 Active nodes [n1, n2, n3]
     When the operator runs `kiseki-admin node drain n1`
@@ -245,6 +273,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     Then the drain is accepted and proceeds per the standard protocol
     And the audit log records both the refusal and the successful drain
 
+  @integration
   Scenario: Operator workflow — drain cancellation
     Given node n1 is Draining with voter replacement in progress
     When the operator runs `kiseki-admin node drain-cancel n1`
@@ -254,6 +283,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Dedup refcount access control (ADR-017) ---
 
+  @unit
   Scenario: Cluster admin sees total refcount only
     Given chunk "abc123" is referenced by org-pharma (1 ref) and org-biotech (1 ref)
     And total refcount = 2
@@ -262,6 +292,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the response does NOT include per-tenant attribution
     And the cluster admin cannot determine which tenants share the chunk
 
+  @unit
   Scenario: Dedup timing side channel — normalized write latency
     Given "org-pharma" writes plaintext P (new chunk, full write)
     And "org-biotech" writes the same plaintext P (dedup hit, refcount increment)
@@ -276,6 +307,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
   # telemetry flows are spec'd in workflow-advisory.feature and the
   # per-context files.
 
+  @unit
   Scenario: Advisory subsystem health reported to cluster admin
     Given the advisory subsystem is running on all storage nodes
     When the cluster admin queries operational metrics (per ADR-015)
@@ -291,6 +323,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And workflow_id, phase_tag, and workload_id appear only as opaque hashes (I-A3, I-WA8)
     And no metric label has unbounded cardinality
 
+  @unit
   Scenario: Advisory audit event volume and batching visible to operators
     Given the cluster sustains high advisory-hint traffic
     When the advisory audit emitter applies I-WA8 batching for hint-accepted and hint-throttled events
@@ -298,6 +331,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And per-tenant lifecycle events (declare, end, phase-advance, policy-violation) remain per-occurrence
     And the per-second per-(workflow_id, reason) sampling guarantee is visible in the audit shard
 
+  @unit
   Scenario: Advisory audit growth triggers I-A5 safety valve if stalled
     Given advisory audit events on a tenant's audit shard have stalled (consumer behind by >24h)
     When the audit safety valve (I-A5) engages
@@ -305,6 +339,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And an operational alert is raised to cluster admin and tenant admin
     And the advisory subsystem continues to emit new events (rate-limited per I-WA8)
 
+  @integration
   Scenario: Advisory subsystem isolation verified operationally
     Given synthetic load drives the advisory subsystem to 100% of its runtime capacity
     When data-path operations continue in parallel
@@ -312,6 +347,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the operational metric `data_path_blocked_on_advisory_total` remains 0
     And if the metric ever rises above 0, a P0 alert fires and the advisory subsystem is candidate for circuit-break
 
+  @integration
   Scenario: Advisory subsystem outage F-ADV-1 — operator-visible state
     Given the advisory subsystem on one node becomes unresponsive (F-ADV-1)
     When operational health checks run

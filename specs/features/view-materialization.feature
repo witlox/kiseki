@@ -26,6 +26,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- Happy path: incremental materialization ---
 
+  @integration
   Scenario: Stream processor consumes deltas and updates NFS view
     Given stream processor "sp-nfs-trials" is at watermark 4990
     When new deltas [4991..5000] are available in "shard-trials-1"
@@ -35,6 +36,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And advances its watermark to 5000
     And the NFS view reflects state as of sequence 5000
 
+  @unit
   Scenario: Stream processor respects staleness bound
     Given stream processor "sp-s3-trials" is at watermark 4950
     And the effective staleness bound is 2s (HIPAA floor overrides 5s descriptor)
@@ -43,6 +45,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And if deltas are available, it advances to at least the delta within 2s
     And if no deltas exist in that window, the view is current
 
+  @integration
   Scenario: POSIX view provides read-your-writes
     Given the NFS view is at watermark 5000
     And a new delta (sequence 5001) is committed by a write through NFS
@@ -53,6 +56,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- View lifecycle ---
 
+  @integration
   Scenario: Create a new view
     Given tenant admin creates view descriptor "analytics-trials":
       | field             | value              |
@@ -68,6 +72,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And it materializes the view from the beginning of the log
     And it catches up to the current log tip over time
 
+  @integration
   Scenario: Discard and rebuild a view
     Given view "s3-trials" is discardable and occupies 500GB on bulk-nvme
     When the cluster admin (with tenant admin approval) discards the view
@@ -77,6 +82,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And later, the view can be rebuilt by restarting the stream processor
     And it re-materializes from the log (position 0)
 
+  @integration
   Scenario: View descriptor version change — pull-based propagation
     Given stream processor "sp-nfs-trials" is running
     When the tenant admin updates descriptor "nfs-trials" to change affinity_pool to "bulk-nvme"
@@ -88,6 +94,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- MVCC reads ---
 
+  @unit
   Scenario: MVCC read pins a log position
     Given the NFS view is at watermark 5000
     When a read operation begins
@@ -95,6 +102,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And concurrent writes (position 5001, 5002) are invisible to this read
     And the read sees a consistent point-in-time snapshot
 
+  @unit
   Scenario: MVCC pin expires — read must restart or complete
     Given a read pinned at position 3000 has been active for 600 seconds
     And the pin TTL for this view is 300 seconds
@@ -106,6 +114,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- Object versioning ---
 
+  @unit
   Scenario: View exposes object versions
     Given namespace "trials" has versioning enabled
     And composition "results.h5" has been written 3 times (v1, v2, v3)
@@ -114,6 +123,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And each version is independently readable
     And the current version is v3
 
+  @unit
   Scenario: Version read at historical position
     Given "results.h5" v1 was committed at log position 1000
     And v2 at position 2000, v3 at position 3000
@@ -124,6 +134,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- Cross-view consistency ---
 
+  @unit
   Scenario: Write via NFS, read via S3 — bounded staleness
     Given a write through NFS commits at sequence 5001
     And the NFS view reflects 5001 immediately (read-your-writes)
@@ -133,6 +144,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And the reader sees state as of 4999
     And this is compliant because S3 declares bounded-staleness
 
+  @unit
   Scenario: Write via NFS, read via NFS — read-your-writes
     Given a write through NFS commits at sequence 5001
     When a read arrives through NFS for the same data
@@ -141,6 +153,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- Failure paths ---
 
+  @integration
   Scenario: Stream processor crashes — recovery from last watermark
     Given stream processor "sp-nfs-trials" crashes at watermark 4500
     When it restarts
@@ -149,6 +162,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And re-materializes deltas [4501..current] into the view
     And no data is lost or duplicated (idempotent application)
 
+  @integration
   Scenario: Stream processor cannot decrypt — tenant key unavailable
     Given "sp-nfs-trials" cached tenant KEK expires
     And tenant KMS is unreachable
@@ -158,6 +172,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And alerts are raised to cluster admin (view stalled) and tenant admin (KMS issue)
     And when KMS becomes reachable, the processor resumes and catches up
 
+  @unit
   Scenario: Stream processor falls behind — staleness violation
     Given "sp-s3-trials" is at watermark 4000
     And the effective staleness bound is 2s
@@ -167,6 +182,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And reads from the S3 view may optionally return a "stale data" warning header
     And the stream processor continues catching up as fast as possible
 
+  @integration
   Scenario: Source shard unavailable — view serves last known state
     Given shard "shard-trials-1" loses Raft quorum
     When the stream processor cannot read new deltas
@@ -181,6 +197,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
   # Hints never change consistency-model or compliance-floor enforcement
   # (I-WA14, I-K9).
 
+  @unit
   Scenario: Prefetch-range hint warms caller's view opportunistically
     Given workload "training-run-42" has an active workflow in phase "epoch-0"
     And the workflow has submitted a PrefetchHint of 4096 (composition_id, offset, length) tuples into view "nfs-trials"
@@ -190,6 +207,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And MUST NOT decrypt payloads outside the caller's tenant scope (I-T1)
     And prefetch work is preempted by genuine read requests or compaction pressure
 
+  @unit
   Scenario: Access-pattern hint { random } suppresses readahead
     Given the stream processor normally performs sequential readahead for POSIX views
     And the caller submits hint { access_pattern: random } for view "nfs-trials"
@@ -198,6 +216,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And cache residency policy shifts toward per-chunk LRU rather than sequential warm-forward
     And other callers' reads on the same view are unaffected (steering is caller-scoped)
 
+  @unit
   Scenario: Phase marker { checkpoint } biases cache retention
     Given the workflow advances to phase "checkpoint" with profile hpc-checkpoint
     When the stream processor observes the phase marker on subsequent reads/writes
@@ -205,6 +224,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And cache eviction preferentially targets non-checkpoint compositions of the same caller
     And cross-tenant cache state is not affected (I-T1)
 
+  @unit
   Scenario: Materialization-lag telemetry scoped to caller's views
     Given workload "training-run-42" owns views "nfs-trials" and "s3-trials"
     And a neighbour workload owns view "nfs-other"
@@ -213,18 +233,21 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And attempts to subscribe to "nfs-other" return not_found with shape identical to absent views (I-WA6)
     And the numeric lag values are reported in bucketed milliseconds (no fine-grained timing leak)
 
+  @unit
   Scenario: Staleness-floor exposure respects compliance floor
     Given view "nfs-trials" has compliance_floor 2s (HIPAA) and view_preference 500ms
     When the caller requests staleness telemetry
     Then the reported effective-staleness bound is max(view_preference, compliance_floor) = 2s (I-K9)
     And hints cannot lower the reported value below the compliance floor (I-WA14)
 
+  @unit
   Scenario: Pin-headroom telemetry
     Given workload "training-run-42" holds 80% of its allowed MVCC pins (I-V4)
     When the caller subscribes to pin-headroom telemetry
     Then a bucketed value ("ample" | "approaching-limit" | "near-exhaustion") is returned
     And no absolute pin counts or neighbour-workload pin state is exposed (I-WA5)
 
+  @unit
   Scenario: Advisory opt-out on workload — view stops accepting hints, continues serving reads
     Given tenant admin transitions "training-run-42" advisory to disabled
     When the stream processor receives no new hints for this workload

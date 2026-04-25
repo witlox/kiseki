@@ -11,6 +11,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Happy path: delta append ---
 
+  @integration
   Scenario: Successful delta append
     Given shard "shard-alpha" is healthy with all 3 replicas online
     When the Composition context appends a delta with:
@@ -24,6 +25,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a DeltaCommitted event is emitted with sequence_number 1001
     And the commit_ack is returned to the Composition context
 
+  @integration
   Scenario: Delta with inline data below threshold (I-L9, ADR-030)
     Given the shard inline threshold is 4096 bytes (per-shard, dynamic — ADR-030)
     When the Composition context appends a delta with:
@@ -34,6 +36,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the payload is offloaded to small/objects.redb on apply (I-SF5)
     And no separate chunk write is required
 
+  @integration
   Scenario: Deltas maintain total order within shard
     Given shard "shard-alpha" has committed deltas with sequence_numbers [1000, 1001, 1002]
     When two deltas are appended concurrently
@@ -43,6 +46,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Failure: Raft leader loss ---
 
+  @integration
   Scenario: Raft leader loss triggers election
     Given node 1 is the Raft leader for "shard-alpha"
     When node 1 becomes unreachable
@@ -51,6 +55,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And in-flight uncommitted deltas are retried by the Composition context
     And no committed deltas are lost
 
+  @integration
   Scenario: Write during leader election is rejected with retriable error
     Given a leader election is in progress for "shard-alpha"
     When the Composition context appends a delta
@@ -59,6 +64,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Failure: Raft quorum loss ---
 
+  @integration
   Scenario: Quorum loss makes shard unavailable for writes
     Given nodes 2 and 3 become unreachable for "shard-alpha"
     And only node 1 (leader) remains
@@ -66,6 +72,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And all write commands are rejected with "quorum unavailable" error
     And read commands from existing replicas may continue if stale reads are permitted by the view descriptor
 
+  @integration
   Scenario: Quorum recovery resumes normal operation
     Given shard "shard-alpha" lost quorum with only node 1 available
     When node 2 comes back online
@@ -76,6 +83,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Shard split ---
 
+  @integration
   Scenario: Shard split triggered by hard ceiling (I-L6)
     Given the hard ceiling for "shard-alpha" is:
       | dimension    | threshold  |
@@ -88,6 +96,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And "shard-alpha" continues serving reads for its existing range
     And a ShardSplit event is emitted
 
+  @integration
   Scenario: Split fully wires the new shard end-to-end (I-L6, I-L12, I-L15 — ADR-033)
     Given "shard-alpha" exceeds its hard ceiling
     When the auto-split trigger fires
@@ -98,6 +107,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a write whose hashed_key falls in the new range is committed on "shard-alpha-2" (not on "shard-alpha")
     And no write returns KeyOutOfRange after the split completes
 
+  @integration
   Scenario: Shard split does not block writes
     Given a SplitShard operation is in progress for "shard-alpha"
     When the Composition context appends a delta to "shard-alpha"
@@ -106,6 +116,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Shard merge (I-L13, I-L14 — ADR-034, spec-only) ---
 
+  @integration
   Scenario: Adjacent shards merge when sustained underutilization is observed
     Given namespace "ns-c" has shards "shard-c1" (range [0x0000, 0x4000)) and "shard-c2" (range [0x4000, 0x8000))
     And both shards have been below 25% of every split-ceiling dimension for the past 24 hours
@@ -117,6 +128,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a ShardMerged event is emitted recording the input IDs, output ID, range, and merge HLC
     And the namespace shard map is updated atomically (I-L15)
 
+  @unit
   Scenario: Merge refused when ratio floor would be violated
     Given namespace "ns-d" has 5 shards on a 3-node cluster (ratio = 1.67)
     And shards "shard-d1" and "shard-d2" are merge-eligible by utilization
@@ -124,6 +136,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     Then the merge is NOT triggered, because merging would yield ratio = 4/3 ≈ 1.33 < 1.5
     And a MergeRefused event is recorded with reason "ratio_floor_would_be_violated"
 
+  @integration
   Scenario: Merge does not block writes (consistent with A-O1, I-O1)
     Given a MergeShard operation is in progress for "shard-c1" and "shard-c2"
     When the Composition context appends a delta whose hashed_key falls in either input range
@@ -131,6 +144,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the merge operation continues in the background
     And after merge completes, the delta is readable from the merged shard "shard-c12"
 
+  @integration
   Scenario: Concurrent merge and split on the same range is rejected
     Given a MergeShard for "shard-c1" + "shard-c2" has started but not completed
     When a SplitShard is triggered for "shard-c1"
@@ -138,6 +152,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the merge proceeds to completion
     And the split may be re-evaluated against "shard-c12" after merge completes
 
+  @integration
   Scenario: Merge aborted when tail-chase does not converge (ADV-034-2)
     Given a MergeShard is in progress for "shard-e1" and "shard-e2"
     And both input shards are receiving sustained high write traffic
@@ -148,6 +163,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a MergeAborted event is emitted with reason "convergence_timeout"
     And no writes were lost
 
+  @integration
   Scenario: Merge cutover aborted when tail exceeds budget (ADV-034-2)
     Given a MergeShard has entered cutover (input shards set to read-only)
     And the remaining tail has more than 200 deltas
@@ -157,6 +173,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the merged shard is torn down
     And a MergeAborted event is emitted with reason "cutover_budget_exceeded"
 
+  @unit
   Scenario: Merge HLC tie-break produces deterministic order (ADV-034-6)
     Given shard "shard-f1" (ShardId lower) and "shard-f2" (ShardId higher) are being merged
     And both have a delta with hashed_key=0xABCD and identical HLC values
@@ -166,6 +183,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Compaction ---
 
+  @unit
   Scenario: Automatic compaction merges SSTables
     Given shard "shard-alpha" has 20 unmerged SSTables
     And the compaction threshold is 10 SSTables
@@ -176,6 +194,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And tenant-encrypted payloads are carried opaquely — never decrypted
     And the resulting SSTable count is reduced
 
+  @unit
   Scenario: Admin-triggered compaction
     Given the cluster admin triggers compaction on "shard-alpha"
     Then compaction runs regardless of the automatic threshold
@@ -184,6 +203,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Truncation / GC ---
 
+  @unit
   Scenario: Delta GC respects all consumer watermarks
     Given shard "shard-alpha" has deltas from sequence 1 to 10000
     And stream processor "sp-nfs" has consumed up to sequence 9500
@@ -194,6 +214,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And deltas from 8000 onward are retained
     And the minimum consumer watermark (8000) determines the GC boundary
 
+  @unit
   Scenario: Stalled consumer blocks GC
     Given stream processor "sp-analytics" has stalled at sequence 1000
     And all other consumers have advanced past sequence 50000
@@ -204,6 +225,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Maintenance mode ---
 
+  @unit
   Scenario: Maintenance mode rejects writes
     Given the cluster admin sets "shard-alpha" to maintenance mode
     Then a ShardMaintenanceEntered event is emitted
@@ -211,6 +233,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And ReadDeltas queries continue to work
     And ShardHealth queries continue to work
 
+  @unit
   Scenario: Exiting maintenance mode resumes writes
     Given "shard-alpha" is in maintenance mode
     When the cluster admin clears maintenance mode
@@ -219,6 +242,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Range read for view materialization ---
 
+  @unit
   Scenario: Stream processor reads delta range
     Given shard "shard-alpha" has deltas from sequence 1 to 5000
     When a stream processor reads deltas from position 4000 to 5000
@@ -228,6 +252,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Edge cases ---
 
+  @integration
   Scenario: Delta append to a shard that is splitting
     Given "shard-alpha" is mid-split, creating "shard-alpha-2"
     And the split boundary is at hashed_key 0x8000
@@ -237,6 +262,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the delta is committed to "shard-alpha-2" once ready
     And no delta is lost, duplicated, or misplaced
 
+  @integration
   Scenario: Concurrent split and compaction
     Given "shard-alpha" is being compacted
     And a SplitShard is triggered during compaction
@@ -251,6 +277,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
   # saturation telemetry. Hints never change Raft ordering, durability,
   # or compaction correctness (I-L1/L2/L3, I-WA1).
 
+  @unit
   Scenario: Phase marker { checkpoint } may inform compaction pacing
     Given workload "training-run-42" advances its workflow to phase "checkpoint"
     And compositions on "shard-trials-1" are written heavily during this phase
@@ -259,6 +286,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And compaction MUST resume to honour its configured thresholds regardless of hints (I-L6)
     And the hint never affects delta ordering, durability, or GC correctness (I-WA1)
 
+  @unit
   Scenario: Shard saturation telemetry is caller-scoped
     Given workload "training-run-42" has compositions on "shard-trials-1" (owned) and a neighbour workload has compositions on the same shard
     When the caller subscribes to shard-saturation telemetry for "shard-trials-1"
@@ -266,6 +294,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And neighbour workloads' contribution is not inferable (I-WA5)
     And requesting telemetry for a shard with no caller-owned compositions returns the same shape as a nonexistent shard (I-WA6)
 
+  @unit
   Scenario: Advisory disabled — log serves all tenants normally
     Given advisory is disabled cluster-wide
     When workloads append deltas, trigger shard splits, and run compaction

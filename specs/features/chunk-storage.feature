@@ -14,6 +14,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Happy path: chunk write ---
 
+  @unit
   Scenario: Write a chunk with content-addressed ID (default tenant)
     Given the Composition context for "org-pharma" submits plaintext data
     When the system computes chunk_id = sha256(plaintext)
@@ -24,6 +25,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And the envelope contains: ciphertext, system DEK reference, algorithm_id, key_epoch
     And no plaintext is persisted at any point
 
+  @unit
   Scenario: Write a chunk with HMAC ID (opted-out tenant)
     Given the Composition context for "org-defense" submits plaintext data
     When the system computes chunk_id = HMAC(plaintext, org-defense_tenant_key)
@@ -33,6 +35,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And the same plaintext from another tenant would produce a different chunk_id
     And cross-tenant dedup cannot match this chunk
 
+  @unit
   Scenario: Dedup - existing chunk referenced by new composition
     Given "org-pharma" has a chunk with chunk_id "abc123" and refcount 1
     When a new composition in "org-pharma" references the same plaintext
@@ -41,6 +44,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And the existing chunk's refcount is incremented to 2
     And the new composition receives a reference to "abc123"
 
+  @unit
   Scenario: Cross-tenant dedup for default tenants
     Given "org-pharma" has chunk "abc123" with refcount 1
     And another default tenant "org-biotech" writes the same plaintext
@@ -52,6 +56,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Chunk read ---
 
+  @unit
   Scenario: Read an encrypted chunk
     Given chunk "abc123" exists in pool "fast-nvme"
     When a stream processor requests ReadChunk for "abc123"
@@ -61,6 +66,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Placement and affinity ---
 
+  @unit
   Scenario: Chunk placed according to affinity policy
     Given a composition's view descriptor specifies tier "fast-nvme" for data
     When a chunk is written for that composition
@@ -68,6 +74,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And EC 4+2 encoding is applied per pool policy
     And the chunk's fragments are distributed across devices in the pool
 
+  @integration
   Scenario: Pool capacity exhausted triggers rebalance
     Given pool "fast-nvme" is at 95% capacity
     When a new chunk targets "fast-nvme"
@@ -77,6 +84,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- GC and refcounting ---
 
+  @unit
   Scenario: Chunk GC when refcount reaches zero
     Given chunk "abc123" has refcount 1
     And no retention hold is active on "abc123"
@@ -85,6 +93,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And "abc123" becomes eligible for physical GC
     And the GC process eventually deletes the ciphertext from storage
 
+  @unit
   Scenario: Chunk GC blocked by retention hold
     Given chunk "abc123" has refcount 0
     And a retention hold "hipaa-litigation-2026" is active on "abc123"
@@ -93,6 +102,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And it remains on storage as system-encrypted ciphertext
     And GC re-evaluates after the hold expires or is released
 
+  @unit
   Scenario: Retention hold set before crypto-shred
     Given tenant "org-pharma" has compositions referencing chunks [c1, c2, c3]
     And a retention hold "gdpr-retention-7yr" is set on namespace "patient-data"
@@ -102,6 +112,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And chunks with refcount 0 are NOT GC'd due to retention hold
     And chunks remain as system-encrypted ciphertext until hold expires
 
+  @unit
   Scenario: Crypto-shred without retention hold - chunks GC'd
     Given tenant "org-temp" has compositions referencing chunks [c4, c5]
     And no retention hold is active
@@ -113,6 +124,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Repair and failure ---
 
+  @integration
   Scenario: Device failure triggers chunk repair
     Given device "nvme-17" in pool "fast-nvme" fails
     And chunks [c10, c11, c12] had EC fragments on "nvme-17"
@@ -122,6 +134,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And repaired fragments are placed on healthy devices in the pool
     And chunk availability is restored
 
+  @integration
   Scenario: Chunk unrecoverable - insufficient EC parity
     Given chunk "c99" has EC 4+2 encoding
     And 3 of 6 fragments are lost (exceeds parity tolerance of 2)
@@ -131,6 +144,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And the Composition context is notified that compositions referencing "c99" have data loss
     And the cluster admin is alerted
 
+  @integration
   Scenario: Admin-triggered chunk repair
     Given the cluster admin suspects corruption on device "nvme-22"
     When the admin triggers RepairChunk for all chunks on "nvme-22"
@@ -140,6 +154,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Encryption invariant enforcement ---
 
+  @unit
   Scenario: Plaintext never reaches storage
     Given a chunk write is in progress
     When the system DEK encryption step fails (e.g., HSM timeout)
@@ -147,6 +162,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And no data - plaintext or partial ciphertext - is persisted
     And the Composition context receives a retriable error
 
+  @unit
   Scenario: Chunk envelope integrity verification on read
     Given chunk "abc123" is read from storage
     When the authenticated encryption tag is verified
@@ -157,6 +173,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Edge cases ---
 
+  @unit
   Scenario: Concurrent dedup - two writers for same chunk_id simultaneously
     Given two compositions in "org-pharma" write the same plaintext concurrently
     And both compute chunk_id = "abc123"
@@ -167,6 +184,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And no rejection or retry is needed
     And no duplicate ciphertext is stored
 
+  @integration
   Scenario: Chunk write during pool rebalance
     Given pool "fast-nvme" is rebalancing (migrating chunks to "bulk-nvme")
     When a new chunk targets "fast-nvme"
@@ -180,6 +198,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # caller. Hints are preferences; placement remains server-authoritative
   # (I-WA9). Ownership is checked before any telemetry is computed (I-WA6).
 
+  @unit
   Scenario: Affinity hint preference honoured within policy
     Given workload "training-run-42" is authorised for pools [fast-nvme, bulk-nvme]
     And a new chunk is being placed for composition "checkpoint.pt"
@@ -189,6 +208,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And the engine MAY override the hint to satisfy I-C3 (policy), I-C4 (durability), or I-C2b (retention hold)
     And hints never cause placement in a pool the workload is not authorised for (I-WA14)
 
+  @unit
   Scenario: Dedup-intent hint { per-rank } skips dedup path for scratch chunks
     Given workload "training-run-42" writes per-rank scratch output
     And the caller attaches hint { dedup_intent: per-rank }
@@ -198,6 +218,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And subsequent writes of identical plaintext by the same workload do NOT coalesce via dedup (hint honoured)
     And tenant dedup policy (I-X2) is never violated regardless of hint
 
+  @unit
   Scenario: Dedup-intent hint { shared-ensemble } uses normal dedup path
     Given workload "training-run-42" writes ensemble-broadcast input data
     And the caller attaches hint { dedup_intent: shared-ensemble }
@@ -205,6 +226,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     Then the dedup refcount path is used normally, bounded by I-X2 tenant policy
     And the hint never enables cross-tenant dedup when tenant policy opts out (I-K10)
 
+  @unit
   Scenario: Locality-class telemetry for caller-owned chunks
     Given workload "training-run-42" reads a 1GB composition spanning 64 chunks on mixed placement
     When the caller requests LocalityTelemetry for the composition
@@ -212,6 +234,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And no node ID, rack label, device serial, or pool utilisation metric is returned (I-WA11)
     And only chunks owned by the caller's workload are included; unauthorised targets return the same shape as absent chunks (I-WA6)
 
+  @unit
   Scenario: Pool backpressure telemetry uses k-anonymity bucketing under low-k
     Given pool "fast-nvme" hosts chunks from workload "training-run-42" and three neighbour workloads (k=4 < 5)
     When the caller subscribes to pool-backpressure telemetry for "fast-nvme"
@@ -219,12 +242,14 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And neighbour-derived fields carry the fixed sentinel value defined by policy (I-WA5)
     And no timing or size variation reveals the actual k
 
+  @unit
   Scenario: Retention-intent hint { temp } informs but cannot shorten a retention hold
     Given composition "patient-scan.dcm" has a 7-year retention hold
     And the caller attaches hint { retention_intent: temp } to a new chunk for that composition
     Then the chunk is placed with GC-urgency-preferred parameters when possible
     And the retention hold (I-C2b) still blocks GC regardless of the hint (I-WA14)
 
+  @integration
   Scenario: Repair-degraded read emits telemetry without leaking topology
     Given a chunk in the caller's composition is being read while EC repair is in progress
     When the read succeeds from the remaining shards
