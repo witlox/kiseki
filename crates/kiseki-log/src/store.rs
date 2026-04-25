@@ -78,6 +78,17 @@ impl MemShardStore {
         });
     }
 
+    /// Update a shard's split thresholds (for testing auto-split).
+    pub fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
+        let mut shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(shard) = shards.get_mut(&shard_id) {
+            shard.info.config = config;
+        }
+    }
+
     /// Set a shard's lifecycle state (ADR-034: merge state transitions).
     pub fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
         let mut shards = self
