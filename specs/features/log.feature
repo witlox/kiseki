@@ -76,7 +76,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Shard split ---
 
-  Scenario: Shard split triggered by hard ceiling
+  Scenario: Shard split triggered by hard ceiling (I-L6)
     Given the hard ceiling for "shard-alpha" is:
       | dimension    | threshold  |
       | delta_count  | 10000000   |
@@ -88,11 +88,55 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And "shard-alpha" continues serving reads for its existing range
     And a ShardSplit event is emitted
 
+  Scenario: Split fully wires the new shard end-to-end (I-L6, I-L12, I-L15 — ADR-033)
+    Given "shard-alpha" exceeds its hard ceiling
+    When the auto-split trigger fires
+    Then a new Raft group is formed for "shard-alpha-2" with full RF=3 voter set on three distinct surviving nodes
+    And "shard-alpha-2"'s leader is placed per the best-effort round-robin policy (I-L12)
+    And the namespace shard map for the affected namespace is atomically updated through the control plane Raft group to record the new range partition (I-L15)
+    And the gateway routing cache is invalidated so subsequent writes resolve to the correct shard
+    And a write whose hashed_key falls in the new range is committed on "shard-alpha-2" (not on "shard-alpha")
+    And no write returns KeyOutOfRange after the split completes
+
   Scenario: Shard split does not block writes
     Given a SplitShard operation is in progress for "shard-alpha"
     When the Composition context appends a delta to "shard-alpha"
     Then the delta is accepted and committed
     And the split operation continues in the background
+
+  # --- Shard merge (I-L13, I-L14 — ADR-034, spec-only) ---
+
+  Scenario: Adjacent shards merge when sustained underutilization is observed
+    Given namespace "ns-c" has shards "shard-c1" (range [0x0000, 0x4000)) and "shard-c2" (range [0x4000, 0x8000))
+    And both shards have been below 25% of every split-ceiling dimension for the past 24 hours
+    And merging them would not violate the ratio floor (I-L11)
+    Then a MergeShard operation is triggered automatically
+    And a new shard "shard-c12" with range [0x0000, 0x8000) is created
+    And total order is preserved across the merged range (I-L14)
+    And "shard-c1" and "shard-c2" are retired after the merge HLC timestamp
+    And a ShardMerged event is emitted recording the input IDs, output ID, range, and merge HLC
+    And the namespace shard map is updated atomically (I-L15)
+
+  Scenario: Merge refused when ratio floor would be violated
+    Given namespace "ns-d" has 5 shards on a 3-node cluster (ratio = 1.67)
+    And shards "shard-d1" and "shard-d2" are merge-eligible by utilization
+    When the merge candidate evaluator runs
+    Then the merge is NOT triggered, because merging would yield ratio = 4/3 ≈ 1.33 < 1.5
+    And a MergeRefused event is recorded with reason "ratio_floor_would_be_violated"
+
+  Scenario: Merge does not block writes (consistent with A-O1, I-O1)
+    Given a MergeShard operation is in progress for "shard-c1" and "shard-c2"
+    When the Composition context appends a delta whose hashed_key falls in either input range
+    Then the delta is accepted and committed
+    And the merge operation continues in the background
+    And after merge completes, the delta is readable from the merged shard "shard-c12"
+
+  Scenario: Concurrent merge and split on the same range is rejected
+    Given a MergeShard for "shard-c1" + "shard-c2" has started but not completed
+    When a SplitShard is triggered for "shard-c1"
+    Then the split is rejected with "shard busy: merge in progress"
+    And the merge proceeds to completion
+    And the split may be re-evaluated against "shard-c12" after merge completes
 
   # --- Compaction ---
 

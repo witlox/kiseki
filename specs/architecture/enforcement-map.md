@@ -1,7 +1,7 @@
 # Enforcement Map — Invariant → Enforcement Point
 
-**Status**: Architect phase.
-**Last updated**: 2026-04-22.
+**Status**: Architect phase. Updated 2026-04-25 with cluster topology / shard merge / node lifecycle invariants (ADR-033/034/035) — entries marked **Spec-only** indicate enforcement code is absent or stubbed; architect to design, implementer to wire.
+**Last updated**: 2026-04-25.
 
 Every invariant from specs/invariants.md mapped to WHERE in the
 architecture it gets enforced. Invariant without enforcement = violation.
@@ -21,6 +21,12 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | I-L7 (header/payload structural separation) | `kiseki-log` + `kiseki-crypto` | DeltaHeader + DeltaPayload structs; compaction reads headers only |
 | I-L8 (cross-shard rename = EXDEV) | `kiseki-composition` rename handler | Check source/target shard; return EXDEV if different |
 | I-L9 (inline payload immutable after write) | `kiseki-log` delta storage | inline_threshold_bytes changes apply prospectively only; existing deltas untouched |
+| I-L10 (initial shard topology) | `kiseki-control` namespace creation | **Spec-only (ADR-033).** Today: `crates/kiseki-control/src/namespace.rs:64-67` creates one shard per namespace. Required: compute `initial_shards` per A-N1, place leaders best-effort round-robin (I-L12), create N Raft groups, persist mapping (I-L15). |
+| I-L11 (cluster ratio floor split trigger) | `kiseki-control` topology monitor + `kiseki-log` shard creation | **Spec-only (ADR-033).** No ratio-floor evaluator exists today. Required: on every node-add and namespace-creation event, compute live ratio; if < floor, schedule splits until restored. Reuse the I-L6 split mechanism (which is itself dead code per code audit — see I-L6 row). |
+| I-L12 (best-effort round-robin leader placement) | `kiseki-control` placement engine | **Spec-only (ADR-033).** Today: `crates/kiseki-log/src/auto_split.rs:107` makes the new leader equal to the old leader. Required: query namespace's per-node leader counts, pick the minimum, deterministic tie-break on node ID. |
+| I-L13 (shard merge trigger) | `kiseki-log` merge orchestrator | **Spec-only (ADR-034).** No merge code exists in kiseki-log. Required: per-shard utilization tracker over the merge interval; candidate scanner for adjacent merge-eligible pairs; ratio-floor guard before commit. |
+| I-L14 (merge preserves total order) | `kiseki-log` merge protocol | **Spec-only (ADR-034).** Total order across the merged range must be a consistent extension of both inputs. Implementation requires a leader-coordinated cutover or a copy-then-cutover. Architect to choose mechanism. |
+| I-L15 (persistent namespace shard map) | `kiseki-control` namespace store | **Spec-only (ADR-033).** Today: `crates/kiseki-control/src/namespace.rs:34` is an in-process `RwLock<HashMap>`. Required: persistent store backed by the control plane's Raft group; atomic update on namespace create / split / merge; refresh path for gateway and client routing caches. Touches `crates/kiseki-gateway/src/mem_gateway.rs:221` (currently hardcoded `ShardId::from_u128(1)`) and `crates/kiseki-client/src/discovery.rs:18-35` (defines `ShardEndpoint` but never uses it for routing). |
 
 ## Chunk invariants
 
@@ -127,6 +133,18 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | I-O4 (client discovery without control plane) | `kiseki-client` + `kiseki-server` discovery responder | Seed-based discovery on data fabric (ADR-008) |
 | I-O5 (compaction trusts hash, explicit reconstruction) | `kiseki-log` compaction + verify command | Normal: merge by hashed_key. Verify: decrypt + re-hash with tenant key |
 | I-O6 (maintenance mode = read-only) | `kiseki-log` shard state machine | ShardState::Maintenance rejects AppendDelta |
+
+## Node lifecycle invariants (ADR-035)
+
+| Invariant | Enforcement point | Mechanism |
+|---|---|---|
+| I-N1 (node state machine) | `kiseki-control` node registry | **Spec-only.** Today: no node state exists; cluster has implicit "joined or not" only. Required: persistent node-state field per node, audited transitions, control-plane RPCs `DrainNode` / `CancelDrain`. |
+| I-N2 (leadership transfer before evict) | `kiseki-control` drain orchestrator + `kiseki-raft` membership | **Spec-only.** Primitives exist: `crates/kiseki-raft/src/membership.rs:11-18` defines `AddLearner` / `PromoteVoter` / `RemoveVoter`. Required: per-shard leadership-transfer call (openraft has the API), orchestrator that loops over every shard the draining node leads and transfers off per I-L12 placement. |
+| I-N3 (voter replacement preserves RF) | `kiseki-control` drain orchestrator + `kiseki-raft` membership | **Spec-only.** Same primitives as I-N2 + I-SF3 (already proved for shard migration). Reuse the learner-promote-then-remove sequence. |
+| I-N4 (drain refused at RF floor) | `kiseki-control` drain validator | **Spec-only.** Up-front validation: for every shard, simulate post-drain voter set; reject if any drops below RF. Returns `DrainRefused` before any state change. |
+| I-N5 (re-replication completes before evict) | `kiseki-control` drain orchestrator | **Spec-only.** Orchestrator tracks completion status per shard; node enters `Evicted` only when all shards report success. |
+| I-N6 (audit transitions) | `kiseki-control` + `kiseki-audit` | **Spec-only.** Each `Active → Draining`, `Draining → Evicted`, `DrainRefused`, `Draining → Active` (cancel) emits an event to the cluster audit shard. |
+| I-N7 (drain cancellation) | `kiseki-control` drain orchestrator | **Spec-only.** `CancelDrain` RPC — aborts pending replacements, transitions node to Active, does not roll back completed replacements. Architect to confirm rollback policy (A-N7). |
 
 ## Consistency invariants
 

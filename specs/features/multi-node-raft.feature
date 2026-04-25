@@ -138,6 +138,68 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And node-4 can serve read requests
     And removing node-4 does not affect write quorum
 
+  # === Node lifecycle / drain (I-N1..I-N7 — ADR-035, spec-only) ===
+
+  Scenario: Operator drains a node — leadership transfers off
+    Given the cluster has 4 Active nodes [node-1, node-2, node-3, node-4]
+    And node-1 leads shards "s1" and "s2"
+    And node-1 holds voter slots in shards "s1", "s2", "s3"
+    When the cluster admin issues `DrainNode(node-1)`
+    Then node-1's state transitions Active → Draining
+    And leadership for "s1" is transferred to a voter on another node (node-2 or node-3 per I-L12)
+    And leadership for "s2" is similarly transferred
+    And node-1 holds zero leader assignments
+
+  Scenario: Drain completes with full re-replication (I-N3, I-N5)
+    Given node-1 is Draining and has been stripped of leadership
+    And node-1 still holds voter slots in shards "s1", "s2", "s3"
+    When the drain orchestrator runs voter replacement for each affected shard
+    Then for each shard, a learner is added on a surviving node and caught up to the leader's committed index
+    And the learner is promoted to voter
+    And node-1 is removed from the voter set
+    And RF=3 is preserved at every intermediate state — no shard observes RF<3 during the drain
+    And once all three shards have completed voter replacement, node-1 transitions Draining → Evicted
+
+  Scenario: Drain refused at RF floor (I-N4)
+    Given the cluster has exactly 3 Active nodes [node-1, node-2, node-3]
+    And every shard has voters on all 3 nodes (RF=3)
+    When the cluster admin issues `DrainNode(node-1)` without first adding a replacement
+    Then the request is rejected with "DrainRefused: insufficient capacity to maintain RF=3"
+    And node-1 remains in state Active
+    And no leadership transfer or voter replacement is attempted
+    And the refusal is recorded in the cluster audit shard (I-N6)
+
+  Scenario: Drain proceeds after replacement node is added (I-N4 mitigation)
+    Given the cluster has 3 Active nodes and a previous DrainRefused for node-1
+    When the cluster admin adds node-4 (now 4 Active nodes)
+    And the cluster admin re-issues `DrainNode(node-1)`
+    Then the drain is accepted
+    And voter replacements target node-4 first by best-effort placement
+    And the drain completes per the standard protocol
+
+  Scenario: Drain cancellation returns node to Active (I-N7)
+    Given node-1 is in state Draining
+    And voter replacement has completed for "s1" but not yet for "s2" or "s3"
+    When the cluster admin issues `CancelDrain(node-1)`
+    Then node-1 transitions Draining → Active (the only permitted reverse transition)
+    And pending voter replacements for "s2" and "s3" are aborted
+    And the completed voter replacement for "s1" is NOT rolled back — node-1 is no longer in "s1"'s voter set
+    And the cluster operates correctly with the resulting placement
+    And the cancellation is recorded in the cluster audit shard
+
+  Scenario: Drain concurrency bounded by I-SF4 cap
+    Given node-1 is Draining with voter slots in 100 shards
+    When the drain orchestrator schedules voter replacements
+    Then no more than `max(1, num_nodes / 10)` replacements are in flight simultaneously
+    And remaining replacements are queued
+    And the drain completes in bounded time without Raft instability
+
+  Scenario: Evicted state is terminal (I-N1)
+    Given node-1 is in state Evicted
+    When the cluster admin attempts to re-activate node-1
+    Then the request is rejected with "node identity is Evicted; re-add requires fresh node identity"
+    And node-1 remains in state Evicted
+
   # === Performance ===
 
   Scenario: Write latency within SLO

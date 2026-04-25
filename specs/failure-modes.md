@@ -304,6 +304,50 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 | **Recovery** | Restore connectivity. Replication resumes and catches up. |
 | **Severity** | **P2** |
 
+### F-O4: Drain interrupted mid-flight (ADR-035, spec-only)
+
+| Field | Value |
+|---|---|
+| **Description** | Drain orchestrator crashes, network partitions, or operator cancels partway through a node drain. Some shards have completed voter replacement; others are in mid-promotion or have not started. |
+| **Blast radius** | One node — leader/voter placements may be partially shifted. RF=3 is preserved at every observable state because voter replacement is "add new + catch up + promote + remove old" sequenced (I-N3). |
+| **Detection** | Drain orchestrator heartbeat absence; cluster admin observes `Draining` state with stalled progress; audit log shows incomplete transition. |
+| **Degradation** | The node remains in `Draining` state. Cluster operates correctly under the partial placement. Reads and writes proceed. New leader assignments avoid the draining node (I-N2). |
+| **Recovery** | Restart drain orchestrator: it resumes per-shard from the persisted state (which voters are pending promotion, which have not started). Or: operator cancels drain (I-N7) and the node returns to Active; completed voter replacements are not rolled back. |
+| **Severity** | **P3** (transient; correctness preserved) |
+
+### F-O5: Drain refused — RF cannot be maintained (ADR-035, spec-only)
+
+| Field | Value |
+|---|---|
+| **Description** | Operator requests `DrainNode(X)` on a cluster where completing the drain would leave at least one shard with insufficient surviving voters to satisfy RF=3 (I-N3, I-N4). |
+| **Blast radius** | None — the request is refused before any state change. |
+| **Detection** | Up-front validation in the control plane checks every shard's voter set against the post-drain node count. |
+| **Degradation** | The drain is rejected with `DrainRefused: insufficient capacity to maintain RF=N`. Node X stays in `Active`. |
+| **Recovery** | Operator adds a replacement node first, then re-issues the drain. The audit log records both the refusal and the eventual successful drain (I-N6). |
+| **Severity** | **P3** (operator workflow — no data path impact) |
+
+### F-O6: Merge / split race on the same shard (ADR-033, ADR-034, spec-only)
+
+| Field | Value |
+|---|---|
+| **Description** | A shard becomes simultaneously eligible for both merge (utilization low for merge interval) and split (one of the I-L6 ceilings exceeds threshold), or two competing operations arrive at the orchestrator near the same time (e.g., split fires from a write spike while a merge is mid-execution). |
+| **Blast radius** | One shard — risk of inconsistent shard state if both proceed. Mitigated by ordering rule below. |
+| **Detection** | Orchestrator pre-check: any in-flight membership operation on the candidate shard. |
+| **Degradation** | Ordering rule: an in-flight merge wins — concurrent split is rejected with `shard busy: merge in progress`. An in-flight split wins — concurrent merge is rejected with `shard busy: split in progress`. The losing operation may be re-evaluated against the resulting shard topology after the in-flight operation completes. |
+| **Recovery** | Automatic — orchestrator re-evaluates after the winning operation completes. Periodic scan re-checks merge eligibility on stable shards. |
+| **Severity** | **P3** (transient; correctness preserved by ordering rule) |
+
+### F-O7: Node added during in-flight namespace operations (ADR-033, spec-only)
+
+| Field | Value |
+|---|---|
+| **Description** | Cluster admin adds a new node while a namespace has an in-flight split (from a ceiling trigger) or while a ratio-floor split is pending evaluation. The freshly added node could have been used as a placement target for the in-flight split's voter set. |
+| **Blast radius** | Placement quality of in-flight operations — newly added node is initially under-utilized. No correctness impact. |
+| **Detection** | Control plane observes node-add event during ongoing membership changes. |
+| **Degradation** | In-flight operations complete with their pre-add placement (best-effort round-robin used the node count at the time of decision). The ratio floor evaluator (I-L11) re-runs after the node-add and may trigger additional splits to redistribute load onto the new node. |
+| **Recovery** | Automatic via I-L11 re-evaluation. Operator may also trigger explicit rebalance (out of scope for ADR-033). |
+| **Severity** | **P3** (placement quality only) |
+
 ---
 
 ## Crypto-specific failures
@@ -424,7 +468,7 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 | P0 | 2 | System key manager loss, system KEK compromise |
 | P1 | 7 | Tenant KMS loss, log corruption, key compromise, algo deprecation, control plane down, network partition (wide), crypto-shred with cached plaintext (F-CC3) |
 | P2 | 9 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm |
-| P3 | 10 | Gateway crash, client crash, device failure, split latency, replay attack, bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4) |
+| P3 | 14 | Gateway crash, client crash, device failure, split latency, replay attack, bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4), drain interrupted (F-O4), drain refused (F-O5), merge/split race (F-O6), node-add mid-operation (F-O7) |
 
-Total: **28 failure modes** catalogued with blast radius, detection,
+Total: **32 failure modes** catalogued with blast radius, detection,
 degradation, and recovery.

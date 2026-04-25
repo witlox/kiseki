@@ -223,6 +223,35 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And receives the updated shard list including "shard-1b"
     And routes subsequent operations to the correct shard
 
+  # --- Node lifecycle / operator drain workflow (ADR-035, spec-only) ---
+
+  Scenario: Operator workflow — graceful node retirement
+    Given the cluster admin needs to retire node "n7" for hardware refresh
+    And the cluster has 5 Active nodes [n1..n5] including n7
+    When the operator runs `kiseki-admin node drain n7`
+    Then the control plane validates that draining n7 leaves every shard with sufficient capacity for RF=3 (I-N4)
+    And n7 transitions to Draining
+    And progress is reported per shard (leadership transfers, learner adds, voter promotions)
+    And on completion n7 transitions to Evicted
+    And the operator is signalled completion with a per-shard summary
+    And every state transition is recorded in the cluster audit shard (I-N6)
+
+  Scenario: Operator workflow — drain refused, replacement added, drain re-issued
+    Given the cluster has exactly 3 Active nodes [n1, n2, n3]
+    When the operator runs `kiseki-admin node drain n1`
+    Then the request is refused with "insufficient capacity to maintain RF=3" (I-N4)
+    And the operator adds a replacement node n4
+    And the operator re-runs `kiseki-admin node drain n1`
+    Then the drain is accepted and proceeds per the standard protocol
+    And the audit log records both the refusal and the successful drain
+
+  Scenario: Operator workflow — drain cancellation
+    Given node n1 is Draining with voter replacement in progress
+    When the operator runs `kiseki-admin node drain-cancel n1`
+    Then n1 transitions Draining → Active (I-N7)
+    And the cancellation reason is recorded in the audit log
+    And subsequent operations on n1 succeed normally
+
   # --- Dedup refcount access control (ADR-017) ---
 
   Scenario: Cluster admin sees total refcount only
