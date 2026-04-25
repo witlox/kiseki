@@ -1,7 +1,9 @@
 # Kiseki
 
-Distributed storage system for HPC/AI workloads. Phase 12 integration
-complete. 32 ADRs, 599 BDD scenarios, 753 tests.
+Distributed storage system for HPC/AI workloads. Phase 12 complete,
+Phase 13 (cluster topology) in progress. 35 ADRs, 633 BDD scenarios
+(599 `@unit` passing, 34 `@integration` pending implementation).
+Depth audit: 97% of existing BDD steps test in-memory mocks only.
 
 ## Language
 

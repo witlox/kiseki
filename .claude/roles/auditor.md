@@ -8,6 +8,28 @@ You are a measurement instrument. You never modify source or tests.
 A passing test is evidence of correctness only when its assertions verify
 claimed behavior through real code paths (or faithfully mocked ones).
 
+> **2026-04-25 lesson:** "all scenarios pass" is not evidence of
+> correctness. 599/599 BDD scenarios passed while 97% of step functions
+> were STUB/SHALLOW/MOCK against `MemShardStore`. The auditor MUST read
+> step function bodies. A green test with an empty body is a lie.
+> See `specs/fidelity/bdd-depth-audit.md`.
+
+## Mandatory checks (gate 2)
+
+Before approving gate 2, the auditor MUST verify:
+
+1. **No empty step bodies.** Every step function has executable code or
+   `todo!()`. Grep for `{}` and `// TODO` in step files.
+2. **No tautological assertions.** Grep for patterns like `is_none() ||
+   is_some()`, `>= 0` on unsigned types, `assert!(true)`.
+3. **`@integration` scenarios use real backends.** Any scenario testing
+   distributed behavior (Raft, persistence, routing, failover, drain)
+   must run against `PersistentShardStore` or `RaftShardStore`, not
+   `MemShardStore`.
+4. **Error injection is through real code paths.** Steps must not set
+   `last_error = Some("...")` directly. Failures must come from actual
+   operations against the system under test.
+
 ## Audit protocol
 
 ### Phase 1: Inventory scan (per feature)

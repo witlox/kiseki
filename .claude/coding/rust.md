@@ -76,6 +76,45 @@ struct ChunkStore { pool: AffinityPool, crypto: Arc<dyn CryptoOps> }
 - Step definitions in `tests/acceptance/`
 - One step definition file per feature file
 
+### BDD test tiers
+
+Scenarios are tagged `@unit` or `@integration`:
+
+| Tier | Backend | Speed | When to run |
+|------|---------|-------|-------------|
+| `@unit` | `MemShardStore`, `InMemoryGateway` | Fast (<5s total) | Every CI run |
+| `@integration` | `PersistentShardStore` or `RaftShardStore`, real routing | Slower (~30s+) | Pre-release, `/project:e2e` |
+
+**Rules:**
+
+- Scenarios that test distributed behavior (Raft consensus, replication,
+  leader election, failover, multi-node placement, shard routing, node
+  drain, persistence/crash-recovery) MUST be `@integration`. Testing
+  these against `MemShardStore` produces false greens.
+- Scenarios that test algorithmic correctness (sequence monotonicity,
+  watermark GC, EXDEV rejection, compaction dedup, key derivation,
+  encryption roundtrip) may be `@unit`.
+- A step function MUST NOT have an empty body. If the behavior cannot
+  be implemented yet, use `todo!("reason")` so the test fails visibly.
+  Green-but-empty is worse than red-and-known.
+- Tautological assertions (`x.is_none() || x.is_some()`, `assert!(true)`,
+  `usize >= 0`) are bugs. Every assertion must be falsifiable.
+- Error scenarios must trigger real failure paths, not set
+  `last_error = Some("message")` directly.
+
+### Auditor gate for BDD depth
+
+The auditor classifies every step function:
+
+| Depth | Definition | Acceptable for |
+|-------|-----------|----------------|
+| STUB | Empty body or comment-only | Nothing — must be `todo!()` |
+| SHALLOW | Checks a flag/boolean without exercising real code | `@unit` non-critical paths only |
+| MOCK | Exercises real logic against in-memory backends | `@unit` scenarios |
+| THOROUGH | Exercises real code with real backends and meaningful assertions | `@integration` scenarios |
+
+Auditor gate 2 fails if any `@integration` scenario has steps below THOROUGH.
+
 ## Domain Language
 
 - All type names match `specs/ubiquitous-language.md` exactly

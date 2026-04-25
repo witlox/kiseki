@@ -72,6 +72,17 @@ Read `.claude/roles/[role].md`. Apply its constraints.
 
 **Feature**: analyst -> spec | architect -> interfaces | adversary -> gate 1 | implementer -> BDD+code | auditor -> gate 2 | adversary -> findings | integrator (if cross-feature). Done = scenarios pass + fidelity HIGH + adversary signed off.
 
+> **Gate 2 lesson (2026-04-25 audit):** "scenarios pass" is necessary
+> but not sufficient. The auditor MUST read step bodies and classify
+> depth (STUB/SHALLOW/MOCK/THOROUGH). 599 scenarios passed against
+> `MemShardStore` while exercising zero Raft consensus, zero persistence,
+> and zero multi-node behavior. See `specs/fidelity/bdd-depth-audit.md`.
+>
+> **Implementer rule:** distributed behavior scenarios (`@integration`)
+> must run against real backends (`PersistentShardStore` or
+> `RaftShardStore`). Empty step bodies are forbidden — use `todo!()`
+> to fail visibly. See `.claude/coding/rust.md#bdd-test-tiers`.
+
 **Bugfix**: diagnose -> failing test first -> fix -> audit depth -> update index.
 
 **Design**: new domain -> analyst | arch change -> architect | ADR -> write it. Adversary reviews before implementation.
@@ -80,11 +91,16 @@ Read `.claude/roles/[role].md`. Apply its constraints.
 
 ## Entry point
 
-**Phase 12 complete** (current state): 12 crates implemented, 32 ADRs
-(001-032), 599/599 BDD scenarios passing, 753 unit/integration tests.
-Async GatewayOps (ADR-032) deployed. Performance benchmarked on GCP
-(1.1 GB/s S3 write, 1.1 GB/s read). NFS/pNFS/FUSE functional locally.
-Enter via FEATURE or BUGFIX mode for new work.
+**Phase 12 complete, Phase 13 in progress** (current state): 12 crates,
+35 ADRs (001-035), 633 BDD scenarios (599 passing `@unit` against
+MemShardStore; 34 new `@integration` scenarios for ADR-033/034/035 —
+not yet implemented). Depth audit found 97% of existing steps are
+STUB/SHALLOW/MOCK. See `specs/fidelity/bdd-depth-audit.md`.
+
+Phase 13 (cluster topology) work:
+- ADR-033/034/035 accepted with adversary review (10 findings resolved)
+- Implementer phase next: wire real backends, red-green cycle
+- Entry via FEATURE mode (Phase 13a/b/c in build-phases.md)
 
 ## Escalation paths
 
