@@ -6,7 +6,20 @@
 
 use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
 
-/// Shard lifecycle state.
+/// Shard lifecycle state (ADR-033/034).
+///
+/// State machine transitions (F-O6):
+/// ```text
+/// Healthy → Splitting (split trigger)
+/// Healthy → Merging   (merge trigger)
+/// Splitting → Healthy (split complete)
+/// Merging → Healthy   (merge complete, for merged output shard)
+/// Merging → Retiring  (merge complete, for input shards)
+/// Retiring → removed  (after grace period)
+/// ```
+///
+/// A shard in `Splitting` or `Merging` rejects the other operation
+/// with `ShardBusy`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ShardState {
     /// All replicas healthy, leader elected.
@@ -19,9 +32,31 @@ pub enum ShardState {
     /// deltas for the new key range are buffered until the new shard
     /// is ready.
     Splitting,
+    /// Merge in progress (ADR-034) — writes accepted during copy phase,
+    /// rejected during cutover (< 50ms). Input shards transition to
+    /// `Retiring` after cutover; output shard transitions to `Healthy`.
+    Merging,
+    /// Input shard after merge cutover (ADR-034) — reads continue for
+    /// grace period (default 5 minutes), then Raft group is torn down.
+    Retiring,
     /// Maintenance mode — writes rejected (retriable), reads and
     /// health queries continue (I-O6).
     Maintenance,
+}
+
+impl ShardState {
+    /// Whether this shard accepts writes.
+    #[must_use]
+    pub fn accepts_writes(self) -> bool {
+        matches!(self, Self::Healthy | Self::Splitting | Self::Merging)
+    }
+
+    /// Whether this shard is busy with a lifecycle operation (split or merge)
+    /// and rejects the other operation (F-O6).
+    #[must_use]
+    pub fn is_busy(self) -> bool {
+        matches!(self, Self::Splitting | Self::Merging)
+    }
 }
 
 /// Multi-dimension split thresholds (I-L6) and inline data config (ADR-030).

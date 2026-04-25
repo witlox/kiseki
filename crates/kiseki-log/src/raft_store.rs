@@ -307,7 +307,8 @@ impl LogOps for RaftLogStore {
                 ShardState::Maintenance => return Err(LogError::MaintenanceMode(req.shard_id)),
                 ShardState::Election => return Err(LogError::LeaderUnavailable(req.shard_id)),
                 ShardState::QuorumLost => return Err(LogError::QuorumLost(req.shard_id)),
-                ShardState::Healthy | ShardState::Splitting => {}
+                ShardState::Retiring => return Err(LogError::MaintenanceMode(req.shard_id)),
+                ShardState::Healthy | ShardState::Splitting | ShardState::Merging => {}
             }
 
             if req.hashed_key < sm.info.range_start || req.hashed_key >= sm.info.range_end {

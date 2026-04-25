@@ -35,6 +35,7 @@ fn to_status(e: &LogError) -> Status {
         LogError::ShardSplitting(_)
         | LogError::LeaderUnavailable(_)
         | LogError::QuorumLost(_)
+        | LogError::ShardBusy { .. }
         | LogError::Unavailable => Status::unavailable(e.to_string()),
         LogError::KeyOutOfRange(_) => Status::out_of_range(e.to_string()),
         LogError::InvalidRange(_) => Status::invalid_argument(e.to_string()),
@@ -74,6 +75,8 @@ fn proto_shard_state(state: crate::shard::ShardState) -> i32 {
         crate::shard::ShardState::QuorumLost => 3,
         crate::shard::ShardState::Splitting => 4,
         crate::shard::ShardState::Maintenance => 5,
+        crate::shard::ShardState::Merging => 6,
+        crate::shard::ShardState::Retiring => 7,
     }
 }
 

@@ -30,6 +30,15 @@ pub enum LogError {
     #[error("key out of range for shard {0:?}")]
     KeyOutOfRange(ShardId),
 
+    /// Shard is busy with a lifecycle operation — split or merge in progress (F-O6).
+    #[error("shard busy: {reason}")]
+    ShardBusy {
+        /// The busy shard.
+        shard_id: ShardId,
+        /// Reason: "merge in progress" or "split in progress".
+        reason: &'static str,
+    },
+
     /// Requested sequence range is invalid or beyond the shard tip.
     #[error("invalid sequence range for shard {0:?}")]
     InvalidRange(ShardId),
@@ -50,6 +59,9 @@ impl From<LogError> for KisekiError {
             }
             LogError::LeaderUnavailable(id) | LogError::ShardSplitting(id) => {
                 KisekiError::Retriable(RetriableError::ShardUnavailable(id))
+            }
+            LogError::ShardBusy { shard_id, .. } => {
+                KisekiError::Retriable(RetriableError::ShardUnavailable(shard_id))
             }
             LogError::QuorumLost(id) => KisekiError::Retriable(RetriableError::QuorumLost(id)),
             LogError::KeyOutOfRange(id) | LogError::InvalidRange(id) => KisekiError::Permanent(

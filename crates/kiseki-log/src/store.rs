@@ -78,6 +78,17 @@ impl MemShardStore {
         });
     }
 
+    /// Set a shard's lifecycle state (ADR-034: merge state transitions).
+    pub fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
+        let mut shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(shard) = shards.get_mut(&shard_id) {
+            shard.info.state = state;
+        }
+    }
+
     /// Update a shard's key range (used during split).
     pub fn update_shard_range(
         &self,
@@ -240,7 +251,8 @@ impl LogOps for MemShardStore {
             ShardState::Maintenance => return Err(LogError::MaintenanceMode(req.shard_id)),
             ShardState::Election => return Err(LogError::LeaderUnavailable(req.shard_id)),
             ShardState::QuorumLost => return Err(LogError::QuorumLost(req.shard_id)),
-            ShardState::Healthy | ShardState::Splitting => {}
+            ShardState::Retiring => return Err(LogError::MaintenanceMode(req.shard_id)),
+            ShardState::Healthy | ShardState::Splitting | ShardState::Merging => {}
         }
 
         if req.hashed_key < shard.info.range_start || req.hashed_key >= shard.info.range_end {
