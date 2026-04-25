@@ -68,13 +68,40 @@ pub enum AdminRole {
 }
 
 /// Storage admin service — manages pools and devices.
+/// Device health transition event.
+#[derive(Clone, Debug)]
+pub struct DeviceHealthEvent {
+    /// Device that transitioned.
+    pub device_id: String,
+    /// Previous status.
+    pub old_status: DeviceStatus,
+    /// New status.
+    pub new_status: DeviceStatus,
+}
+
+/// IO statistics snapshot for a pool.
+#[derive(Clone, Debug)]
+pub struct IOStatsEvent {
+    /// Pool name.
+    pub pool: String,
+    /// Read IOPS.
+    pub read_iops: u64,
+    /// Write IOPS.
+    pub write_iops: u64,
+    /// Read throughput bytes/sec.
+    pub read_throughput: u64,
+    /// Write throughput bytes/sec.
+    pub write_throughput: u64,
+}
+
 pub struct StorageAdminService {
     pools: RwLock<HashMap<String, StoragePool>>,
     devices: RwLock<HashMap<String, DeviceInfo>>,
     shard_assignments: RwLock<HashMap<ShardId, String>>, // shard → pool
     /// Inline data threshold in bytes (ADR-030, I-SF1).
-    /// Changes are prospective only — existing deltas are not affected.
     inline_threshold_bytes: RwLock<u64>,
+    /// Recorded device health events (ADR-037).
+    health_events: RwLock<Vec<DeviceHealthEvent>>,
 }
 
 /// Check that the caller has admin privileges.
@@ -105,7 +132,25 @@ impl StorageAdminService {
             devices: RwLock::new(HashMap::new()),
             shard_assignments: RwLock::new(HashMap::new()),
             inline_threshold_bytes: RwLock::new(4096),
+            health_events: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Get recorded device health events.
+    pub fn health_events(&self) -> Vec<DeviceHealthEvent> {
+        self.health_events.read().unwrap().clone()
+    }
+
+    /// Generate a synthetic IO stats event for a pool.
+    pub fn io_stats(&self, pool: &str) -> Option<IOStatsEvent> {
+        let pools = self.pools.read().unwrap();
+        pools.get(pool).map(|p| IOStatsEvent {
+            pool: p.name.clone(),
+            read_iops: 1000,
+            write_iops: 500,
+            read_throughput: 100_000_000,
+            write_throughput: 50_000_000,
+        })
     }
 
     /// Set the inline data threshold in bytes (ADR-030).
@@ -217,7 +262,14 @@ impl StorageAdminService {
                 to: status,
             });
         }
+        let old_status = dev.status;
         dev.status = status;
+        // Record health event.
+        self.health_events.write().unwrap().push(DeviceHealthEvent {
+            device_id: device_id.to_owned(),
+            old_status,
+            new_status: status,
+        });
         Ok(())
     }
 
