@@ -9,7 +9,10 @@ use kiseki_log::compaction_worker::{compact_deltas, CompactionProgress};
 
 #[given("a Kiseki server with KISEKI_DATA_DIR configured")]
 async fn given_data_dir(w: &mut KisekiWorld) {
-    todo!("configure KISEKI_DATA_DIR and verify persistence via redb")
+    todo!("configure KISEKI_DATA_DIR and verify persistence via redb — \
+          requires changing World.log_store from Arc<MemShardStore> to \
+          Arc<dyn LogOps + Send + Sync> and adding create_shard/update_shard_range \
+          to LogOps trait or keeping a separate shard management handle")
 }
 
 #[given(regex = r#"^tenant "(\S+)" with compliance tags \[([^\]]+)\]$"#)]
