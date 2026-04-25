@@ -180,6 +180,9 @@ pub struct KisekiWorld {
     pub block_extents: Vec<Extent>,
     pub block_temp_dir: Option<tempfile::TempDir>,
     pub block_scrub_report: Option<String>,
+
+    // === Raft test cluster (ADR-037) ===
+    pub raft_cluster: Option<kiseki_log::raft::test_cluster::RaftTestCluster>,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -338,6 +341,7 @@ impl KisekiWorld {
             block_extents: Vec::new(),
             block_temp_dir: None,
             block_scrub_report: None,
+            raft_cluster: None,
         }
     }
 
