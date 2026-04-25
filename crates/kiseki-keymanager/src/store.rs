@@ -223,7 +223,7 @@ pub enum KeyEventType {
 /// Structured audit event for a key lifecycle operation.
 ///
 /// Contains all fields required by the audit log (timestamp, actor,
-/// key_id, event_type, tenant_id) without ever including the key
+/// `key_id`, `event_type`, `tenant_id`) without ever including the key
 /// material itself.
 #[derive(Clone, Debug)]
 pub struct KeyLifecycleEvent {

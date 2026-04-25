@@ -54,7 +54,7 @@ pub struct InMemoryGateway {
     small_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
     /// Shard map store for multi-shard routing (ADR-033).
     /// When present, the gateway routes writes to the correct shard
-    /// based on hashed_key. When absent, uses the namespace's single shard_id.
+    /// based on `hashed_key`. When absent, uses the namespace's single `shard_id`.
     shard_map: std::sync::RwLock<Option<Arc<kiseki_control::shard_topology::NamespaceShardMapStore>>>,
 }
 
@@ -97,7 +97,7 @@ impl InMemoryGateway {
         self
     }
 
-    /// Clear the shard map (simulates stale cache — falls back to namespace shard_id).
+    /// Clear the shard map (simulates stale cache — falls back to namespace `shard_id`).
     pub fn clear_shard_map(&self) {
         *self.shard_map.write().unwrap() = None;
     }

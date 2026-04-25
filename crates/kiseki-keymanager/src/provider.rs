@@ -225,7 +225,7 @@ impl Drop for ConcurrencyPermit<'_> {
 
 /// KMS authentication configuration. `Debug` is redacted (I-K8).
 pub enum KmsAuthConfig {
-    /// Vault AppRole authentication.
+    /// Vault `AppRole` authentication.
     AppRole {
         /// Role ID (non-secret).
         role_id: String,

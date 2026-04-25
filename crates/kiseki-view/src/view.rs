@@ -470,16 +470,16 @@ mod tests {
     fn phase_marker_checkpoint_retention() {
         // Model: checkpoint-target compositions get extended retention.
         struct CacheRetentionPolicy {
-            is_checkpoint: bool,
+            _is_checkpoint: bool,
             retention_weight: u32,
         }
 
         let checkpoint = CacheRetentionPolicy {
-            is_checkpoint: true,
+            _is_checkpoint: true,
             retention_weight: 10, // extended
         };
         let non_checkpoint = CacheRetentionPolicy {
-            is_checkpoint: false,
+            _is_checkpoint: false,
             retention_weight: 1, // normal
         };
 

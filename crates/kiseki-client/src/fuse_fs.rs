@@ -696,11 +696,11 @@ mod tests {
         assert_eq!(data, b"nested data");
     }
 
-    /// Read-only mmap (PROT_READ + MAP_PRIVATE) is functionally equivalent
-    /// to the read() path in this FUSE implementation. The kernel FUSE
-    /// layer does not expose mmap() directly to our filesystem; instead,
+    /// Read-only mmap (`PROT_READ` + `MAP_PRIVATE`) is functionally equivalent
+    /// to the `read()` path in this FUSE implementation. The kernel FUSE
+    /// layer does not expose `mmap()` directly to our filesystem; instead,
     /// mmap reads are transparently serviced by the kernel calling our
-    /// read() handler. This test asserts that the read() path (which
+    /// `read()` handler. This test asserts that the `read()` path (which
     /// already covers mmap semantics) returns correct data at arbitrary
     /// offsets, confirming mmap-style random access works.
     #[test]
@@ -722,7 +722,7 @@ mod tests {
         assert_eq!(chunk3, b"abcdef");
 
         // Full-file read (equivalent to mmap of entire file).
-        let full = fs.read(ino, 0, data.len() as u32).unwrap();
+        let full = fs.read(ino, 0, u32::try_from(data.len()).unwrap_or(u32::MAX)).unwrap();
         assert_eq!(full, data);
     }
 
@@ -782,7 +782,7 @@ mod tests {
         let ino = fs.create("native.bin", data.to_vec()).unwrap();
 
         // Direct read via the FUSE fs (same path as native API).
-        let result = fs.read(ino, 0, data.len() as u32).unwrap();
+        let result = fs.read(ino, 0, u32::try_from(data.len()).unwrap_or(u32::MAX)).unwrap();
         assert_eq!(result, data, "native API read must return same data");
 
         // Partial read: "native api test data" offset 7 = "pi test"
@@ -848,7 +848,7 @@ mod tests {
 
         // The FUSE layer does not support writable shared mmap.
         // We verify the constant is defined and usable.
-        assert!(ENOTSUP > 0, "ENOTSUP must be a valid errno");
+        const { assert!(ENOTSUP > 0, "ENOTSUP must be a valid errno") };
     }
 
     #[test]

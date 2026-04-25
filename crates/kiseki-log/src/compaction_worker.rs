@@ -290,25 +290,23 @@ mod tests {
     #[test]
     fn automatic_compaction_merges_by_key_and_sequence() {
         // Simulate 20 deltas across several keys with superseded versions.
-        let mut deltas = Vec::new();
-        // Key 0xAA: 5 versions (Create + 4 Updates) — only latest survives.
-        deltas.push(make_delta(1, 0xAA, OperationType::Create));
-        deltas.push(make_delta(5, 0xAA, OperationType::Update));
-        deltas.push(make_delta(10, 0xAA, OperationType::Update));
-        deltas.push(make_delta(15, 0xAA, OperationType::Update));
-        deltas.push(make_delta(20, 0xAA, OperationType::Update));
-
-        // Key 0xBB: created then deleted (tombstone) — both removed.
-        deltas.push(make_delta(2, 0xBB, OperationType::Create));
-        deltas.push(make_delta(12, 0xBB, OperationType::Delete));
-
-        // Key 0xCC: single create — survives.
-        deltas.push(make_delta(3, 0xCC, OperationType::Create));
-
-        // Key 0xDD: 3 versions — only latest survives.
-        deltas.push(make_delta(4, 0xDD, OperationType::Create));
-        deltas.push(make_delta(8, 0xDD, OperationType::Update));
-        deltas.push(make_delta(16, 0xDD, OperationType::Update));
+        let deltas = vec![
+            // Key 0xAA: 5 versions (Create + 4 Updates) — only latest survives.
+            make_delta(1, 0xAA, OperationType::Create),
+            make_delta(5, 0xAA, OperationType::Update),
+            make_delta(10, 0xAA, OperationType::Update),
+            make_delta(15, 0xAA, OperationType::Update),
+            make_delta(20, 0xAA, OperationType::Update),
+            // Key 0xBB: created then deleted (tombstone) — both removed.
+            make_delta(2, 0xBB, OperationType::Create),
+            make_delta(12, 0xBB, OperationType::Delete),
+            // Key 0xCC: single create — survives.
+            make_delta(3, 0xCC, OperationType::Create),
+            // Key 0xDD: 3 versions — only latest survives.
+            make_delta(4, 0xDD, OperationType::Create),
+            make_delta(8, 0xDD, OperationType::Update),
+            make_delta(16, 0xDD, OperationType::Update),
+        ];
 
         let progress = CompactionProgress::new();
         let retained = compact_deltas(&deltas, &progress, 1);

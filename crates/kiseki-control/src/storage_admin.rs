@@ -483,14 +483,13 @@ mod tests {
     #[test]
     fn tuning_params_pool_overrides_cluster() {
         let cluster_gc_interval_s: u64 = 300;
-        let pool_gc_interval_s: Option<u64> = Some(120);
+        let pool_gc_interval_s: u64 = 120;
 
-        let effective_gc = pool_gc_interval_s.unwrap_or(cluster_gc_interval_s);
+        let effective_gc = pool_gc_interval_s;
         assert_eq!(effective_gc, 120, "pool override should take precedence");
 
         // Another pool without override uses cluster default.
-        let pool2_gc_interval_s: Option<u64> = None;
-        let effective_gc2 = pool2_gc_interval_s.unwrap_or(cluster_gc_interval_s);
+        let effective_gc2 = cluster_gc_interval_s;
         assert_eq!(effective_gc2, 300, "no override → cluster default");
     }
 
@@ -583,18 +582,18 @@ mod tests {
         struct TenantUsage {
             tenant_id: String,
             capacity_used_bytes: u64,
-            iops_last_24h: u64,
+            _iops_last_24h: u64,
         }
 
         let usage_a = TenantUsage {
             tenant_id: "org-pharma".into(),
             capacity_used_bytes: 1_000_000_000,
-            iops_last_24h: 500_000,
+            _iops_last_24h: 500_000,
         };
         let usage_b = TenantUsage {
             tenant_id: "org-biotech".into(),
             capacity_used_bytes: 2_000_000_000,
-            iops_last_24h: 300_000,
+            _iops_last_24h: 300_000,
         };
 
         // Each tenant sees only their own usage.
@@ -630,7 +629,7 @@ mod tests {
             param: String,
             old_value: u64,
             new_value: u64,
-            admin_id: String,
+            _admin_id: String,
         }
 
         let event = TuningAuditEvent {
@@ -638,7 +637,7 @@ mod tests {
             param: "compaction_rate_mb_s".into(),
             old_value: 100,
             new_value: 200,
-            admin_id: "cluster-admin-1".into(),
+            _admin_id: "cluster-admin-1".into(),
         };
 
         assert_eq!(event.action, "SetTuningParams");
@@ -656,14 +655,14 @@ mod tests {
             param: String,
             old: u64,
             new: u64,
-            admin: String,
+            _admin: String,
         }
 
         let event = TuningChangedEvent {
             param: "gc_interval_s".into(),
             old: 300,
             new: 120,
-            admin: "cluster-admin-1".into(),
+            _admin: "cluster-admin-1".into(),
         };
 
         assert_eq!(event.param, "gc_interval_s");
@@ -706,17 +705,17 @@ mod tests {
     fn compaction_rate_change_audited() {
         // Verify the audit event structure.
         struct TuningParameterChanged {
-            param: String,
+            _param: String,
             old_value: u64,
             new_value: u64,
-            admin_id: String,
+            _admin_id: String,
         }
 
         let event = TuningParameterChanged {
-            param: "compaction_rate_mb_s".into(),
+            _param: "compaction_rate_mb_s".into(),
             old_value: 100,
             new_value: 200,
-            admin_id: "cluster-admin-1".into(),
+            _admin_id: "cluster-admin-1".into(),
         };
 
         assert_eq!(event.old_value, 100);
@@ -731,13 +730,13 @@ mod tests {
         struct PoolModifiedEvent {
             pool_id: String,
             change_type: String,
-            admin_id: String,
+            _admin_id: String,
         }
 
         let event = PoolModifiedEvent {
             pool_id: "fast-nvme".into(),
             change_type: "durability_change".into(),
-            admin_id: "cluster-admin-1".into(),
+            _admin_id: "cluster-admin-1".into(),
         };
 
         assert_eq!(event.pool_id, "fast-nvme");
@@ -769,9 +768,12 @@ mod tests {
 
         let pool = svc.get_pool("nvme-fast").unwrap();
         // Access aggregate fields — these must exist.
-        let _total = pool.total_capacity_bytes;
-        let _used = pool.used_bytes;
-        let _devices = pool.device_count;
+        let total = pool.total_capacity_bytes;
+        let used = pool.used_bytes;
+        let devices = pool.device_count;
+        // Ensure aggregate fields are accessible (suppress unused warnings).
+        assert!(total >= used);
+        let _ = devices;
         // If StoragePool ever gains per-tenant fields this test's compile
         // ensures we consciously update it. The struct has exactly these
         // public data fields (plus name, media_type, ec_*).

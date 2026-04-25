@@ -201,7 +201,7 @@ mod tests {
     fn pool_redirection_stays_within_device_class() {
         use crate::device::{CapacityThresholds, PoolHealth};
 
-        let pools = vec![
+        let pools = [
             AffinityPool::new("fast-nvme-a", DurabilityStrategy::default(), 1_000_000)
                 .with_device_class(DeviceClass::NvmeSsd),
             AffinityPool::new("fast-nvme-b", DurabilityStrategy::default(), 1_000_000)
@@ -237,7 +237,7 @@ mod tests {
         use crate::device::{CapacityThresholds, PoolHealth};
         use crate::error::ChunkError;
 
-        let pools = vec![
+        let pools = [
             AffinityPool::new("fast-nvme", DurabilityStrategy::default(), 1_000_000)
                 .with_device_class(DeviceClass::NvmeSsd),
         ];

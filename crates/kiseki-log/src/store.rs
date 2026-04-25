@@ -509,13 +509,13 @@ mod tests {
         store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
 
         // Append 50 deltas (seq 1..=50).
-        for i in 0..50 {
+        for i in 0u8..50 {
             let req = AppendDeltaRequest {
                 shard_id,
                 tenant_id,
                 operation: OperationType::Create,
                 timestamp: test_timestamp(),
-                hashed_key: [i as u8; 32],
+                hashed_key: [i; 32],
                 chunk_refs: vec![],
                 payload: vec![0xAA; 64],
                 has_inline_data: false,
@@ -665,13 +665,13 @@ mod tests {
         store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
 
         // Append deltas — no advisory signals present.
-        for i in 0..10 {
+        for i in 0u8..10 {
             let req = AppendDeltaRequest {
                 shard_id,
                 tenant_id,
                 operation: OperationType::Create,
                 timestamp: test_timestamp(),
-                hashed_key: [i as u8; 32],
+                hashed_key: [i; 32],
                 chunk_refs: vec![],
                 payload: vec![0xCC; 50],
                 has_inline_data: false,

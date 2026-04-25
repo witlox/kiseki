@@ -982,7 +982,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let count = json["key_count"].as_u64().unwrap();
         assert_eq!(count, 2, "should return max-keys=2 objects");
-        assert_eq!(json["is_truncated"].as_bool().unwrap(), true, "should be truncated");
+        assert!(json["is_truncated"].as_bool().unwrap(), "should be truncated");
         assert!(
             json["next_continuation_token"].is_string(),
             "should provide NextContinuationToken"

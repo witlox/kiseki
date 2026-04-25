@@ -257,19 +257,19 @@ mod tests {
         struct AdvisoryMetrics {
             active_workflows_total: u64,
             hints_accepted_total: u64,
-            hints_rejected_total: u64,
-            hints_throttled_total: u64,
-            channel_latency_p99_ms: f64,
-            audit_write_rate: f64,
+            _hints_rejected_total: u64,
+            _hints_throttled_total: u64,
+            _channel_latency_p99_ms: f64,
+            _audit_write_rate: f64,
         }
 
         let metrics = AdvisoryMetrics {
             active_workflows_total: 42,
             hints_accepted_total: 1000,
-            hints_rejected_total: 50,
-            hints_throttled_total: 10,
-            channel_latency_p99_ms: 2.5,
-            audit_write_rate: 100.0,
+            _hints_rejected_total: 50,
+            _hints_throttled_total: 10,
+            _channel_latency_p99_ms: 2.5,
+            _audit_write_rate: 100.0,
         };
 
         // Cluster-aggregate metrics — no per-tenant breakdown.
@@ -285,6 +285,8 @@ mod tests {
     fn advisory_audit_batching_ratio() {
         let total_events: u64 = 10_000;
         let emitted_events: u64 = 1_000; // after batching
+        // Precision loss is acceptable: these are event counts used for a ratio metric.
+        #[allow(clippy::cast_precision_loss)]
         let batching_ratio = total_events as f64 / emitted_events as f64;
 
         assert!(

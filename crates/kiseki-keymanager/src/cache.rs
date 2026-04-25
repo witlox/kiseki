@@ -141,7 +141,11 @@ mod tests {
         let mut ttls = Vec::with_capacity(100);
         for i in 0u64..100 {
             // Deterministic jitter based on node index for reproducibility.
+            // Precision loss acceptable: i and base_ttl are small values used for jitter calculation.
+            #[allow(clippy::cast_precision_loss)]
             let jitter_factor = 1.0 + jitter_pct * (2.0 * (i as f64 / 99.0) - 1.0);
+            // Truncation and sign loss acceptable: jitter_factor is always positive and result fits in u64.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
             let jittered = (base_ttl as f64 * jitter_factor) as u64;
             ttls.push(jittered);
         }

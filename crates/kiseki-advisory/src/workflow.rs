@@ -264,7 +264,7 @@ mod tests {
         // The failing result must be PhaseNotMonotonic.
         let err = results
             .into_iter()
-            .find(|r| r.is_err())
+            .find(std::result::Result::is_err)
             .unwrap()
             .unwrap_err();
         assert!(

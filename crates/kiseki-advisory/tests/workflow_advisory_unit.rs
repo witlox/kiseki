@@ -537,8 +537,8 @@ fn low_k_telemetry_same_shape() {
     // Low-k uses sentinel value.
     assert!(low_k.is_low_k());
     assert!(!high_k.is_low_k());
-    assert_eq!(low_k.aggregate_saturation, LOW_K_SENTINEL);
-    assert_eq!(high_k.aggregate_saturation, 0.8);
+    assert!((low_k.aggregate_saturation - LOW_K_SENTINEL).abs() < f64::EPSILON);
+    assert!((high_k.aggregate_saturation - 0.8).abs() < f64::EPSILON);
 
     // Both have bucketed sizes from the same fixed set.
     assert!(low_k.size_is_bucketed());
@@ -1099,13 +1099,13 @@ fn k_anonymity_threshold_enforced() {
 
     // Below threshold: sentinel.
     let low = TelemetryResponse::new(None, None, vec![], 0.5, 4);
-    assert_eq!(low.aggregate_saturation, LOW_K_SENTINEL);
+    assert!((low.aggregate_saturation - LOW_K_SENTINEL).abs() < f64::EPSILON);
 
     // At threshold: real value.
     let at = TelemetryResponse::new(None, None, vec![], 0.5, 5);
-    assert_eq!(at.aggregate_saturation, 0.5);
+    assert!((at.aggregate_saturation - 0.5).abs() < f64::EPSILON);
 
     // Above threshold: real value.
     let above = TelemetryResponse::new(None, None, vec![], 0.7, 10);
-    assert_eq!(above.aggregate_saturation, 0.7);
+    assert!((above.aggregate_saturation - 0.7).abs() < f64::EPSILON);
 }

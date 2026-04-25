@@ -164,7 +164,7 @@ pub fn transition_opt_out(
 }
 
 /// Check whether a profile is still allowed for an active workflow.
-/// Returns Ok if the profile is in the allow-list, Err("profile_revoked")
+/// Returns `Ok` if the profile is in the allow-list, `Err("profile_revoked")`
 /// if it has been removed (I-WA18: prospective application).
 pub fn check_profile_for_phase_advance(
     current_profile: &str,
@@ -207,7 +207,7 @@ pub enum AdvisoryAuditEvent {
 }
 
 impl AdvisoryAuditEvent {
-    /// For cluster-admin exports, workflow_id and phase_tag are opaque hashes (I-A3, I-WA8).
+    /// For cluster-admin exports, `workflow_id` and `phase_tag` are opaque hashes (I-A3, I-WA8).
     #[must_use]
     pub fn as_cluster_admin_view(&self) -> (&'static str, String) {
         match self {
@@ -254,14 +254,14 @@ pub struct PoolAuthorization {
     pub cluster_internal_pool: String,
 }
 
-/// Mint a pool handle — returns (handle, opaque_label). The cluster-internal
+/// Mint a pool handle — returns (handle, `opaque_label`). The cluster-internal
 /// pool ID is never included in the response (I-WA11, I-WA19).
 #[must_use]
 pub fn mint_pool_handle(auth: &PoolAuthorization) -> (u128, String) {
     // Fresh 128-bit handle. In production this would use a CSPRNG;
     // for the guard we just derive from the label + a counter proxy.
-    let handle = hash_opaque(&auth.opaque_label) as u128
-        | ((hash_opaque(&auth.cluster_internal_pool) as u128) << 64);
+    let handle = u128::from(hash_opaque(&auth.opaque_label))
+        | (u128::from(hash_opaque(&auth.cluster_internal_pool)) << 64);
     (handle, auth.opaque_label.clone())
     // Note: cluster_internal_pool is intentionally NOT returned.
 }
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn workload_pool_authorization_produces_handles() {
         // Scenario: Workload pool authorization produces tenant-chosen labels
-        let pools = vec![
+        let pools = [
             PoolAuthorization {
                 opaque_label: "fast-nvme".into(),
                 cluster_internal_pool: "pool-0af7".into(),

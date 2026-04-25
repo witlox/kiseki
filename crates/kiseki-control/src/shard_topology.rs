@@ -43,7 +43,9 @@ impl Default for ShardTopologyConfig {
 /// Per-tenant shard bounds set by cluster admin (ADR-033 §1).
 #[derive(Clone, Debug)]
 pub struct TenantShardBounds {
+    /// Minimum shards for this tenant.
     pub min_shards: u32,
+    /// Maximum shards for this tenant.
     pub max_shards: u32,
 }
 
@@ -63,6 +65,7 @@ pub enum NamespaceCreationState {
 /// A single shard's key range within a namespace (ADR-033 §4).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardRange {
+    /// Unique shard identifier.
     pub shard_id: ShardId,
     /// Inclusive lower bound of the 256-bit key range.
     pub range_start: [u8; 32],
@@ -75,7 +78,9 @@ pub struct ShardRange {
 /// Persistent namespace-to-shard mapping (ADR-033 §4).
 #[derive(Clone, Debug)]
 pub struct NamespaceShardMap {
+    /// Namespace identifier.
     pub namespace_id: String,
+    /// Owning tenant identifier.
     pub tenant_id: OrgId,
     /// Monotonically increasing version on every mutation.
     pub version: u64,
@@ -156,12 +161,16 @@ fn range_point(i: u32, shard_count: u32) -> [u8; 32] {
     // Start with numerator = i, shift left 256 bits, divide by shard_count.
     // This is equivalent to long division of (i << 256) / shard_count.
     let mut result = [0u8; 32];
-    let mut remainder: u64 = i as u64;
+    let mut remainder: u64 = u64::from(i);
+    let divisor = u64::from(shard_count);
 
     for byte in &mut result {
         remainder <<= 8;
-        *byte = (remainder / shard_count as u64) as u8;
-        remainder %= shard_count as u64;
+        // Safe: quotient is always <= 255 because remainder < divisor * 256.
+        #[allow(clippy::cast_possible_truncation)]
+        let q = (remainder / divisor) as u8;
+        *byte = q;
+        remainder %= divisor;
     }
 
     result
@@ -170,6 +179,7 @@ fn range_point(i: u32, shard_count: u32) -> [u8; 32] {
 /// Route a hashed key to the correct shard (ADR-033 §5).
 ///
 /// Binary search over sorted `ShardRange` list. O(log N) where N ≤ 64.
+#[must_use]
 pub fn route_to_shard(map: &NamespaceShardMap, hashed_key: &[u8; 32]) -> Option<ShardId> {
     // Shards are sorted by range_start. Find the last shard whose
     // range_start <= hashed_key.
@@ -206,12 +216,14 @@ pub fn check_ratio_floor(
         return None;
     }
 
-    let ratio = current_shard_count as f64 / active_node_count as f64;
+    let ratio = f64::from(current_shard_count) / f64::from(active_node_count);
     if ratio >= config.ratio_floor {
         return None;
     }
 
-    let target = (config.ratio_floor * active_node_count as f64).ceil() as u32;
+    // Safe: ratio_floor and node count are both small positive values.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let target = (config.ratio_floor * f64::from(active_node_count)).ceil() as u32;
     let capped = target.min(config.shard_cap);
 
     if capped > current_shard_count {
@@ -245,6 +257,7 @@ pub struct NamespaceShardMapStore {
 }
 
 impl NamespaceShardMapStore {
+    /// Create an empty namespace shard map store.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -307,7 +320,7 @@ impl NamespaceShardMapStore {
                 requested
             }
         } else {
-            compute_initial_shards(config, active_nodes.len() as u32)
+            compute_initial_shards(config, u32::try_from(active_nodes.len()).unwrap_or(u32::MAX))
         };
 
         // ADV-033-1: failure injection — simulate partial Raft group failure.
@@ -315,8 +328,7 @@ impl NamespaceShardMapStore {
         if let Some(fail_shard) = fail_at {
             if fail_shard <= shard_count {
                 return Err(ControlError::Rejected(format!(
-                    "namespace creation failed: shard {} did not reach quorum",
-                    fail_shard
+                    "namespace creation failed: shard {fail_shard} did not reach quorum"
                 )));
             }
         }
@@ -377,12 +389,12 @@ impl NamespaceShardMapStore {
         let mut maps = self.maps.write().unwrap();
         let map = maps.get_mut(namespace_id)?;
 
-        let current = map.shards.len() as u32;
-        let target = check_ratio_floor(config, current, active_nodes.len() as u32)?;
+        let current = u32::try_from(map.shards.len()).unwrap_or(u32::MAX);
+        let target = check_ratio_floor(config, current, u32::try_from(active_nodes.len()).unwrap_or(u32::MAX))?;
 
         // Split shards until we reach the target.
         // Each split divides the largest shard's key range at its midpoint.
-        while (map.shards.len() as u32) < target {
+        while u32::try_from(map.shards.len()).unwrap_or(u32::MAX) < target {
             // Find the shard with the widest range (simplification: pick the first
             // shard that hasn't been split yet in this cycle, or the one with the
             // widest range).
@@ -412,17 +424,17 @@ impl NamespaceShardMapStore {
             map.shards.push(right);
 
             // Keep sorted by range_start.
-            map.shards.sort_by(|a, b| a.range_start.cmp(&b.range_start));
+            map.shards.sort_by_key(|s| s.range_start);
         }
 
         map.version += 1;
-        Some(map.shards.len() as u32)
+        Some(u32::try_from(map.shards.len()).unwrap_or(u32::MAX))
     }
 
     /// Get the current shard count for a namespace (unauthenticated, internal use).
     pub fn shard_count(&self, namespace_id: &str) -> Option<u32> {
         let maps = self.maps.read().unwrap();
-        maps.get(namespace_id).map(|m| m.shards.len() as u32)
+        maps.get(namespace_id).and_then(|m| u32::try_from(m.shards.len()).ok())
     }
 
     /// Check whether a namespace exists in the store (any state).
@@ -461,12 +473,8 @@ fn find_widest_shard(shards: &[ShardRange]) -> usize {
     shards
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            range_width(&a.range_start, &a.range_end)
-                .cmp(&range_width(&b.range_start, &b.range_end))
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+        .max_by_key(|(_, s)| range_width(&s.range_start, &s.range_end))
+        .map_or(0, |(i, _)| i)
 }
 
 /// Approximate range width for comparison (first 8 bytes as u64).
@@ -484,7 +492,7 @@ fn midpoint_256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     // Add a + b byte-by-byte from LSB to MSB.
     let mut sum = [0u16; 32];
     for i in (0..32).rev() {
-        let s = a[i] as u16 + b[i] as u16 + carry;
+        let s = u16::from(a[i]) + u16::from(b[i]) + carry;
         sum[i] = s & 0xFF;
         carry = s >> 8;
     }
@@ -493,7 +501,10 @@ fn midpoint_256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let mut borrow: u16 = carry; // carry from addition becomes MSB
     for i in 0..32 {
         let val = (borrow << 8) | sum[i];
-        result[i] = (val >> 1) as u8;
+        // Safe: val >> 1 is at most 255 when inputs are bytes.
+        #[allow(clippy::cast_possible_truncation)]
+        let byte = (val >> 1) as u8;
+        result[i] = byte;
         borrow = val & 1;
     }
 

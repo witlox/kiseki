@@ -1036,3 +1036,42 @@ async fn then_qos_caller(_w: &mut KisekiWorld) {
 async fn then_no_cluster_qos(_w: &mut KisekiWorld) {
     todo!()
 }
+
+// --- ADR-033/034: Split and merge scenarios (skipped → now red with todo) ---
+
+#[given(regex = r#"^"([^"]*)" exceeds its hard ceiling$"#)]
+async fn given_shard_exceeds_ceiling(w: &mut KisekiWorld, shard_name: String) {
+    todo!("set shard delta_count/byte_size above ShardConfig ceiling to trigger auto-split")
+}
+
+#[given(regex = r#"^namespace "([^"]*)" has shards "([^"]*)" \(range \[([^)]+)\)\) and "([^"]*)" \(range \[([^)]+)\)\)$"#)]
+async fn given_ns_with_two_shards(
+    w: &mut KisekiWorld,
+    _ns: String,
+    _shard1: String,
+    _range1: String,
+    _shard2: String,
+    _range2: String,
+) {
+    todo!("create namespace with two adjacent shards with specific key ranges for merge testing")
+}
+
+#[given(regex = r#"^a MergeShard operation is in progress for "([^"]*)" and "([^"]*)"$"#)]
+async fn given_merge_in_progress(w: &mut KisekiWorld, _shard1: String, _shard2: String) {
+    todo!("initiate a real MergeShard operation and hold it in the copy phase")
+}
+
+#[given(regex = r#"^a MergeShard for "([^"]*)" \+ "([^"]*)" has started but not completed$"#)]
+async fn given_merge_started(w: &mut KisekiWorld, _shard1: String, _shard2: String) {
+    todo!("initiate a real MergeShard and pause before cutover for concurrent split test")
+}
+
+#[given(regex = r#"^a MergeShard is in progress for "([^"]*)" and "([^"]*)"$"#)]
+async fn given_merge_in_progress_alt(w: &mut KisekiWorld, _shard1: String, _shard2: String) {
+    todo!("initiate a real MergeShard with sustained write traffic for convergence timeout test")
+}
+
+#[given(regex = r#"^a MergeShard has entered cutover \(input shards set to read-only\)$"#)]
+async fn given_merge_cutover(w: &mut KisekiWorld) {
+    todo!("advance a real MergeShard to cutover phase with input shards in read-only mode")
+}

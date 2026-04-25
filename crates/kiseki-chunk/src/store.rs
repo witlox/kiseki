@@ -637,6 +637,7 @@ mod tests {
     fn locality_class_telemetry_shape() {
         // Locality classes defined by the spec.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[allow(dead_code)]
         enum LocalityClass {
             LocalNode,
             LocalRack,
@@ -680,6 +681,7 @@ mod tests {
         const K_THRESHOLD: usize = 5;
         const SENTINEL: &str = "<redacted>";
 
+        #[allow(dead_code)]
         struct BackpressureTelemetry {
             pool_name: String,
             caller_usage_pct: u8,

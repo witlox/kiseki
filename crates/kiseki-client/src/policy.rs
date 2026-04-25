@@ -384,7 +384,7 @@ mod tests {
         );
     }
 
-    /// I-CC12: KEK destroyed triggers cache wipe via check_key_health_and_wipe.
+    /// I-CC12: KEK destroyed triggers cache wipe via `check_key_health_and_wipe`.
     #[test]
     fn kek_destroyed_triggers_cache_wipe() {
         use crate::cache::{CacheConfig, CacheManager, CacheMode};
@@ -428,7 +428,7 @@ mod tests {
     }
 
     /// I-CC6: Disconnect threshold exceeded triggers cache wipe via
-    /// check_disconnect_and_wipe.
+    /// `check_disconnect_and_wipe`.
     #[test]
     fn disconnect_triggers_cache_wipe() {
         use crate::cache::{CacheConfig, CacheManager, CacheMode};

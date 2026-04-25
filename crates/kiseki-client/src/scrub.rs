@@ -119,15 +119,15 @@ mod tests {
         assert!(!pool_dir.exists(), "orphaned pool should be deleted");
     }
 
-    /// I-CC2: wipe_directory_recursive overwrites files with zeros before
+    /// I-CC2: `wipe_directory_recursive` overwrites files with zeros before
     /// deleting them. We verify by intercepting the file content between
     /// the zeroize write and the unlink.
     ///
     /// Since the zeroize+unlink sequence is not externally observable
     /// (the file is gone after the function returns), we test the
-    /// constituent behavior: write a file, call wipe_directory_recursive,
+    /// constituent behavior: write a file, call `wipe_directory_recursive`,
     /// and verify the file no longer exists. The zero-before-delete
-    /// guarantee is enforced by code inspection of wipe_directory_recursive
+    /// guarantee is enforced by code inspection of `wipe_directory_recursive`
     /// (lines 79-83 of scrub.rs: writes zeros then removes).
     ///
     /// Additionally, we create a directory structure and verify ALL files

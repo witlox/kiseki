@@ -453,16 +453,75 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Run the advisory runtime on its isolated tokio runtime.
+///
+/// Starts both the gRPC service (on `addr`) and a TCP stream server
+/// (on `stream_addr`) for non-gRPC clients. The TCP stream uses
+/// length-prefixed JSON for lightweight hint submission from
+/// `kiseki-client` without requiring a tonic dependency.
+pub async fn run_advisory(
+    addr: SocketAddr,
+    stream_addr: SocketAddr,
+    tls_files: Option<&TlsFiles>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let budget = BudgetConfig {
+        hints_per_sec: 100,
+        max_concurrent_workflows: 10,
+        max_phases_per_workflow: 50,
+    };
+
+    let advisory_svc = WorkflowAdvisoryServiceServer::new(AdvisoryGrpc::new(budget.clone()));
+
+    // Shared budget enforcer for the TCP stream server.
+    let stream_budget = Arc::new(std::sync::Mutex::new(kiseki_advisory::BudgetEnforcer::new(
+        budget,
+    )));
+
+    // Start TCP advisory stream server alongside gRPC.
+    tokio::spawn(async move {
+        if let Err(e) =
+            kiseki_advisory::stream::run_advisory_stream_server(stream_addr, stream_budget).await
+        {
+            tracing::error!(error = %e, "advisory TCP stream server error");
+        }
+    });
+
+    let mut builder = tonic::transport::Server::builder();
+
+    if let Some(files) = tls_files {
+        let tls = build_tls(files)?;
+        builder = builder
+            .tls_config(tls)
+            .map_err(|e| format!("advisory TLS config: {e}"))?;
+        tracing::info!(%addr, "advisory gRPC listening (mTLS)");
+    } else {
+        tracing::warn!(%addr, "advisory gRPC listening (PLAINTEXT — development only)");
+    }
+
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("advisory: shutdown signal received, draining...");
+    };
+
+    builder
+        .add_service(advisory_svc)
+        .serve_with_shutdown(addr, shutdown)
+        .await?;
+
+    tracing::info!("advisory: shut down");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
     /// The 4 canonical persistent store paths that the runtime constructs
-    /// under data_dir. Three are redb databases, one is a chunk device +
-    /// metadata pair. All must be in distinct subdirectories under data_dir.
+    /// under `data_dir`. Three are redb databases, one is a chunk device +
+    /// metadata pair. All must be in distinct subdirectories under `data_dir`.
     ///
-    /// Layout (from runtime::run_main):
+    /// Layout (from `runtime::run_main`):
     ///   raft/log.redb       — Raft log (persistent shard store)
     ///   keys/epochs.redb    — Key manager epochs
     ///   small/objects.redb  — Small object inline store
@@ -529,63 +588,4 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_dir_all(&data_dir);
     }
-}
-
-/// Run the advisory runtime on its isolated tokio runtime.
-///
-/// Starts both the gRPC service (on `addr`) and a TCP stream server
-/// (on `stream_addr`) for non-gRPC clients. The TCP stream uses
-/// length-prefixed JSON for lightweight hint submission from
-/// `kiseki-client` without requiring a tonic dependency.
-pub async fn run_advisory(
-    addr: SocketAddr,
-    stream_addr: SocketAddr,
-    tls_files: Option<&TlsFiles>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let budget = BudgetConfig {
-        hints_per_sec: 100,
-        max_concurrent_workflows: 10,
-        max_phases_per_workflow: 50,
-    };
-
-    let advisory_svc = WorkflowAdvisoryServiceServer::new(AdvisoryGrpc::new(budget.clone()));
-
-    // Shared budget enforcer for the TCP stream server.
-    let stream_budget = Arc::new(std::sync::Mutex::new(kiseki_advisory::BudgetEnforcer::new(
-        budget,
-    )));
-
-    // Start TCP advisory stream server alongside gRPC.
-    tokio::spawn(async move {
-        if let Err(e) =
-            kiseki_advisory::stream::run_advisory_stream_server(stream_addr, stream_budget).await
-        {
-            tracing::error!(error = %e, "advisory TCP stream server error");
-        }
-    });
-
-    let mut builder = tonic::transport::Server::builder();
-
-    if let Some(files) = tls_files {
-        let tls = build_tls(files)?;
-        builder = builder
-            .tls_config(tls)
-            .map_err(|e| format!("advisory TLS config: {e}"))?;
-        tracing::info!(%addr, "advisory gRPC listening (mTLS)");
-    } else {
-        tracing::warn!(%addr, "advisory gRPC listening (PLAINTEXT — development only)");
-    }
-
-    let shutdown = async {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("advisory: shutdown signal received, draining...");
-    };
-
-    builder
-        .add_service(advisory_svc)
-        .serve_with_shutdown(addr, shutdown)
-        .await?;
-
-    tracing::info!("advisory: shut down");
-    Ok(())
 }
