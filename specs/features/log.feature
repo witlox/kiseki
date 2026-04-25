@@ -138,6 +138,32 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the merge proceeds to completion
     And the split may be re-evaluated against "shard-c12" after merge completes
 
+  Scenario: Merge aborted when tail-chase does not converge (ADV-034-2)
+    Given a MergeShard is in progress for "shard-e1" and "shard-e2"
+    And both input shards are receiving sustained high write traffic
+    When the tail-chase exceeds the convergence timeout (60 seconds)
+    Then the merge is aborted
+    And the in-progress merged shard is torn down
+    And input shards "shard-e1" and "shard-e2" return to state Healthy
+    And a MergeAborted event is emitted with reason "convergence_timeout"
+    And no writes were lost
+
+  Scenario: Merge cutover aborted when tail exceeds budget (ADV-034-2)
+    Given a MergeShard has entered cutover (input shards set to read-only)
+    And the remaining tail has more than 200 deltas
+    When the cutover budget (50ms) would be exceeded
+    Then the cutover is aborted
+    And input shards are restored to read-write
+    And the merged shard is torn down
+    And a MergeAborted event is emitted with reason "cutover_budget_exceeded"
+
+  Scenario: Merge HLC tie-break produces deterministic order (ADV-034-6)
+    Given shard "shard-f1" (ShardId lower) and "shard-f2" (ShardId higher) are being merged
+    And both have a delta with hashed_key=0xABCD and identical HLC values
+    When the merge interleave runs
+    Then the delta from "shard-f1" (lower ShardId) is ordered before the delta from "shard-f2"
+    And the resulting total order is deterministic and reproducible
+
   # --- Compaction ---
 
   Scenario: Automatic compaction merges SSTables

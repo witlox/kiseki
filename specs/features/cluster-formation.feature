@@ -147,3 +147,45 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     When 1 more node is added (now 4 Active nodes; ratio = 9/4 = 2.25)
     Then the ratio floor is satisfied (2.25 >= 1.5)
     And no auto-split is triggered for "ns-b"
+
+  # === Adversary findings (ADV-033) ===
+
+  Scenario: Namespace creation is atomic — partial Raft group failure rolls back (ADV-033-1)
+    Given the cluster has 3 Active nodes
+    And node-3 is temporarily unreachable
+    When tenant admin creates namespace "partial-ns" (requires 9 shards)
+    And shard 7 fails to reach quorum within 30 seconds (node-3 down)
+    Then all 6 successfully created Raft groups are torn down
+    And no namespace shard map entry is committed
+    And the CreateNamespace call returns error "namespace creation failed: shard 7 did not reach quorum"
+    And a subsequent CreateNamespace for "partial-ns" succeeds once node-3 recovers
+
+  Scenario: Concurrent CreateNamespace for same ID is rejected during creation (ADV-033-1)
+    Given namespace "dup-ns" is in state Creating (Raft groups being formed)
+    When a second CreateNamespace("dup-ns") arrives
+    Then the second call is rejected with "namespace creation in progress"
+    And the first creation continues
+
+  Scenario: Write to wrong shard is rejected with KeyOutOfRange (ADV-033-3)
+    Given namespace "ns-routed" has 3 shards covering ranges [0x00, 0x55), [0x55, 0xAA), [0xAA, 0xFF]
+    And the gateway has a stale shard map (pre-split, single shard)
+    When the gateway sends a delta with hashed_key=0x80 to shard-1 (range [0x00, 0x55))
+    Then shard-1 rejects the delta with KeyOutOfRange
+    And the gateway refreshes its shard map via GetNamespaceShardMap
+    And the gateway retries to shard-2 (range [0x55, 0xAA))
+    And the delta is accepted
+
+  Scenario: Ratio-floor splits respect shard cap (ADV-033-7)
+    Given the cluster scales from 3 to 50 Active nodes
+    And namespace "big-ns" has 9 shards (ratio = 9/50 = 0.18, far below floor)
+    When the ratio-floor evaluator fires
+    Then splits fire until shard count reaches min(ceil(1.5 * 50), 64) = 64
+    And not 75 (the shard_cap takes precedence)
+    And at most max(1, 50/5) = 10 splits are in flight concurrently
+
+  Scenario: GetNamespaceShardMap requires tenant authorization (ADV-033-9)
+    Given tenant "org-alpha" owns namespace "alpha-data"
+    And a gateway authenticated as tenant "org-beta"
+    When the gateway calls GetNamespaceShardMap("alpha-data")
+    Then the call is rejected with PermissionDenied
+    And no shard topology information is returned

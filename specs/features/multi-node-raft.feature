@@ -200,6 +200,29 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     Then the request is rejected with "node identity is Evicted; re-add requires fresh node identity"
     And node-1 remains in state Evicted
 
+  Scenario: Split fires during active drain — leader not placed on draining node (ADV-033-8)
+    Given node-1 is in state Draining
+    And shard "s5" exceeds its hard ceiling (I-L6)
+    When the auto-split trigger fires for "s5"
+    Then a new shard "s5-b" is created
+    And "s5-b"'s leader is placed on a node in {Active, Degraded} state — NOT on node-1
+    And the I-L12 placement engine excludes Failed, Draining, and Evicted nodes
+
+  Scenario: Degraded node is eligible as drain replacement target (ADV-035-10)
+    Given the cluster has 4 nodes: node-1 (Active), node-2 (Active), node-3 (Degraded), node-4 (Active)
+    And node-4 holds voter slots in shards "s1", "s2", "s3"
+    When the cluster admin issues `DrainNode(node-4)`
+    Then node-3 (Degraded) is eligible as a replacement voter target
+    And voter replacements may be placed on node-3
+    And the drain completes successfully
+
+  Scenario: Failed node recovers after eviction — stale membership harmless (ADV-035-5)
+    Given node-1 was Failed and then drained to Evicted
+    When node-1 physically recovers and its Raft instances restart
+    Then node-1 receives AppendEntries with a higher term showing its removal
+    And node-1 steps down and does not rejoin any voter set
+    And the control plane NodeRecord for node-1 remains Evicted
+
   # === Performance ===
 
   Scenario: Write latency within SLO

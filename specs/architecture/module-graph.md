@@ -1,7 +1,7 @@
 # Module Graph — Kiseki
 
 **Status**: Architect phase.
-**Last updated**: 2026-04-17.
+**Last updated**: 2026-04-25. Updated for ADR-033/034/035 (cluster topology, shard merge, node lifecycle).
 
 Maps bounded contexts to Rust crates. Every module traces to a spec
 artifact. Go removed per ADR-027 — single-language Rust.
@@ -40,7 +40,10 @@ kiseki/
 crates/
   └── kiseki-control/             ← Control plane: tenancy, IAM, policy,
                                     flavor, federation, namespace, retention,
-                                    maintenance, advisory policy
+                                    maintenance, advisory policy,
+                                    cluster topology (ADR-033: NamespaceShardMapStore,
+                                    ADR-034: merge candidate scanner,
+                                    ADR-035: NodeRecord, DrainOrchestrator)
 ```
 
 Depends only on `kiseki-common` + `kiseki-proto` (crate-graph firewall).

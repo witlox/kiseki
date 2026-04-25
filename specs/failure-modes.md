@@ -348,6 +348,28 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 | **Recovery** | Automatic via I-L11 re-evaluation. Operator may also trigger explicit rebalance (out of scope for ADR-033). |
 | **Severity** | **P3** (placement quality only) |
 
+### F-O8: Control plane Raft quorum loss (ADV-033-4)
+
+| Field | Value |
+|---|---|
+| **Description** | The control plane's Raft group (which stores namespace shard maps, node records, and drain progress) loses quorum. All topology mutations are blocked: no namespace creation, no shard split/merge map updates, no drain initiation/completion, no `GetNamespaceShardMap` responses. |
+| **Blast radius** | Topology management only. Data-path reads and writes continue unaffected — data shards have their own Raft groups. Gateways and clients serve traffic using cached shard maps. |
+| **Detection** | Control plane health check. `GetNamespaceShardMap` RPCs time out; drain progress stalls; `CreateNamespace` returns error. |
+| **Degradation** | Data path unaffected. Topology mutations queued until quorum restored. Splits that fire during the outage cannot update the shard map — new Raft groups are not committed. In-progress drains stall (no voter replacements committed). Namespace creations fail. |
+| **Recovery** | Restore control plane Raft quorum. Queued mutations resume. No data loss. Production clusters should size the control plane Raft group at 5 voters (not 3) to survive 2 simultaneous failures. |
+| **Severity** | **P2** (topology management blocked; data path unaffected) |
+
+### F-O9: Merge convergence timeout (ADV-034-2)
+
+| Field | Value |
+|---|---|
+| **Description** | During shard merge, the tail-chase (Phase 2 step 7) cannot converge because write rate to input shards exceeds the copy rate to the merged shard. Or the cutover pause exceeds the 50ms budget (> 200 remaining deltas). |
+| **Blast radius** | One namespace — the merge is aborted. No data loss. Input shards continue serving normally. |
+| **Detection** | Merge orchestrator tracks tail-chase progress; timeout (60s) or cutover budget (50ms / 200 deltas) exceeded. |
+| **Degradation** | Merge aborted. Input shards restored to state=Healthy. `MergeAborted` event emitted. The merge candidate scanner re-evaluates on its next scan (5 minutes). If write rate has subsided, merge may be re-attempted. |
+| **Recovery** | Automatic re-evaluation. If workload remains too hot for merge, the shards stay split (correct behavior — they're not actually under-utilized). |
+| **Severity** | **P3** (operational; no data impact) |
+
 ---
 
 ## Crypto-specific failures
@@ -467,8 +489,8 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 |---|---|---|
 | P0 | 2 | System key manager loss, system KEK compromise |
 | P1 | 7 | Tenant KMS loss, log corruption, key compromise, algo deprecation, control plane down, network partition (wide), crypto-shred with cached plaintext (F-CC3) |
-| P2 | 9 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm |
-| P3 | 14 | Gateway crash, client crash, device failure, split latency, replay attack, bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4), drain interrupted (F-O4), drain refused (F-O5), merge/split race (F-O6), node-add mid-operation (F-O7) |
+| P2 | 10 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm, control plane quorum loss (F-O8) |
+| P3 | 15 | Gateway crash, client crash, device failure, split latency, replay attack, bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4), drain interrupted (F-O4), drain refused (F-O5), merge/split race (F-O6), node-add mid-operation (F-O7), merge convergence timeout (F-O9) |
 
-Total: **32 failure modes** catalogued with blast radius, detection,
+Total: **34 failure modes** catalogued with blast radius, detection,
 degradation, and recovery.

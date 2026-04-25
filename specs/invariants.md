@@ -1,14 +1,14 @@
 # Invariants — Kiseki
 
-**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers), ADR-029 (Raw Block Device Allocator), ADR-030 (Dynamic Small-File Placement), ADR-031 (Client-Side Cache), and ADR-033/034/035 (cluster topology, shard merge, node lifecycle — *spec-only, enforcement deferred*).
+**Status**: Layer 2 complete. Updated for ADR-028 (External KMS Providers), ADR-029 (Raw Block Device Allocator), ADR-030 (Dynamic Small-File Placement), ADR-031 (Client-Side Cache), and ADR-033/034/035 (cluster topology, shard merge, node lifecycle — *architect designed, enforcement code pending*).
 **Last updated**: 2026-04-25.
 
 > **Spec-only marker**: Invariants tagged **`Spec-only`** below describe required system
 > behavior whose enforcement code is incomplete or absent today. The audit performed
 > 2026-04-25 found `auto_split::execute_split` is dead code, `NamespaceStore` is
 > in-process memory only, and shard merge / node drain have no implementation.
-> Architect work (ADR-033/034/035) and implementer work follow this spec; do not
-> remove the marker until enforcement is wired and tested.
+> ADR-033/034/035 accepted with enforcement designs; implementer to wire.
+> Do not remove the marker until enforcement is wired and tested.
 
 All invariants below have been confirmed through interrogation with the
 domain expert unless marked otherwise.
@@ -205,7 +205,7 @@ domain expert unless marked otherwise.
 
 | ID | Invariant | Status |
 |---|---|---|
-| I-N1 | Every cluster node has a *node state* in `{Active, Draining, Evicted}`. The forward path is `Active → Draining → Evicted`; the only reverse transition is operator-initiated drain cancellation (I-N7), which returns a `Draining` node to `Active`. There is no transition out of `Evicted` — re-adding a node requires a fresh node identity. The `Active → Draining` transition is operator-initiated; `Draining → Evicted` is automatic when drain conditions are satisfied (I-N2, I-N3, I-N5). | Spec-only (ADR-035) |
+| I-N1 | Every cluster node has a *node state* in `{Active, Degraded, Failed, Draining, Evicted}`. `Active`: healthy. `Degraded`: partial device failures or SMART warnings — still reachable, no new shard assignments. `Failed`: unreachable (heartbeat timeout). `Draining`: operator-initiated graceful removal. `Evicted`: terminal. Automatic transitions: Active↔Degraded (condition-based), Active/Degraded→Failed (heartbeat timeout), Failed→Active (recovery). Operator transitions: Active/Degraded/Failed→Draining (`DrainNode`), Draining→Active (`CancelDrain`, I-N7). Draining→Evicted is automatic when all voter replacements complete. No transition out of `Evicted` — re-adding requires a fresh node identity. | Spec-only (ADR-035) |
 | I-N2 | A node in `Draining` state accepts no new leader assignments and MUST have leadership transferred off for every shard it currently leads before it can transition to `Evicted`. Leadership transfer uses the openraft membership primitive (no re-election). The new leader is selected per the I-L12 placement policy. | Spec-only (ADR-035) |
 | I-N3 | For every shard the draining node holds a voter slot in, a replacement voter is added on a surviving node, caught up to the leader's committed index, and promoted to voter before the old voter is removed. The cluster MUST NOT operate below RF=3 for any shard at any intermediate state during a drain (consistent with I-CS1, ADR-026). | Spec-only (ADR-035) |
 | I-N4 | A drain request is REFUSED at submission if completing it would leave any shard unable to satisfy I-N3 (e.g., a 3-node cluster cannot drain a node without first adding a replacement). The control plane returns `DrainRefused: insufficient capacity to maintain RF=N`. The operator must add a replacement node first, then re-issue the drain. | Spec-only (ADR-035) |
