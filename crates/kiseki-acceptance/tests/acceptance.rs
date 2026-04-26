@@ -866,16 +866,57 @@ impl KisekiWorld {
 fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
+    // Optional env-var filter for ad-hoc per-subset timing measurements.
+    // KISEKI_SCENARIO_FILTER=substring restricts to scenarios whose name
+    // contains the substring. KISEKI_FEATURE_FILTER=substring restricts
+    // to feature files whose path contains the substring. Both default
+    // to "no extra restriction".
+    let scenario_filter = std::env::var("KISEKI_SCENARIO_FILTER").ok();
+    let feature_filter = std::env::var("KISEKI_FEATURE_FILTER").ok();
+    let scenario_filter_for_closure = scenario_filter.clone();
+    let feature_filter_for_closure = feature_filter.clone();
+
     // By default, skip @slow scenarios (Raft clusters take ~1s each).
     // Include them with: cargo test -p kiseki-acceptance --features slow-tests
     #[cfg(feature = "slow-tests")]
-    let runner = KisekiWorld::cucumber();
+    let runner = KisekiWorld::cucumber().filter_run("features/", move |feat, _, sc| {
+        if let Some(ref fname) = feature_filter_for_closure {
+            if !feat
+                .path
+                .as_deref()
+                .is_some_and(|p| p.to_string_lossy().contains(fname))
+            {
+                return false;
+            }
+        }
+        if let Some(ref name) = scenario_filter_for_closure {
+            if !sc.name.contains(name) {
+                return false;
+            }
+        }
+        true
+    });
     #[cfg(not(feature = "slow-tests"))]
-    let runner = KisekiWorld::cucumber()
-        .filter_run("features/", |_, _, sc| !sc.tags.iter().any(|t| t == "slow"));
+    let runner = KisekiWorld::cucumber().filter_run("features/", move |feat, _, sc| {
+        if sc.tags.iter().any(|t| t == "slow") {
+            return false;
+        }
+        if let Some(ref fname) = feature_filter_for_closure {
+            if !feat
+                .path
+                .as_deref()
+                .is_some_and(|p| p.to_string_lossy().contains(fname))
+            {
+                return false;
+            }
+        }
+        if let Some(ref name) = scenario_filter_for_closure {
+            if !sc.name.contains(name) {
+                return false;
+            }
+        }
+        true
+    });
 
-    #[cfg(feature = "slow-tests")]
-    rt.block_on(runner.run("features/"));
-    #[cfg(not(feature = "slow-tests"))]
     rt.block_on(runner);
 }

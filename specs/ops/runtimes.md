@@ -8,7 +8,35 @@ right verification step before committing.
 | Suite | Cmd | Scenarios | Wall time | Notes |
 |---|---|---:|---:|---|
 | Fast | `cargo test -p kiseki-acceptance --test acceptance` | 181 | **~1m 45s** (measured 2026-04-26) | Default; runs on every CI push. |
-| Slow | `cargo test -p kiseki-acceptance --test acceptance --features slow-tests` | 241 | **~1m 02s** (measured 2026-04-26) | Faster than the fast suite because (a) ~23 scenarios short-circuit on `todo!()` panics (Phase 14f scope) and (b) the `@slow` tag is **pre-Phase-13f legacy** — before ADR-037 introduced the in-process `RaftTestCluster` (mpsc transport + `MemLogStore`), Raft scenarios needed real networking + persistent storage and were genuinely 1-2 s each. Now they're tens of ms. Going forward the tag should mean "exercises real disk fsync or real TCP/TLS" — the persistence subsections wired in Phase 14b are the natural new owners. macOS used to be ×10-100 slower than Linux for this suite because of osxfs/virtiofs fsync cost + macOS timer-coalescing stretching `tokio::time::sleep` past the 150-300 ms election window; on Linux with `epoll` and native fs, both costs collapse. **First attempt hung at "Quorum loss blocks writes"** because `RaftTestCluster::write_delta` had no timeout; openraft's `client_write` blocks indefinitely without quorum. Killed at ~90 min wall. Fix landed (5 s `tokio::time::timeout` around `client_write` in `crates/kiseki-log/src/raft/test_cluster.rs`). |
+| Slow | `cargo test -p kiseki-acceptance --test acceptance --features slow-tests` | 241 | **~1m 02s** (measured 2026-04-26) | Faster than the fast suite because (a) ~23 scenarios short-circuit on `todo!()` panics (Phase 14f scope) and (b) the `@slow` tag is **pre-Phase-13f legacy**. See "Per-feature measurements" below. **First attempt hung at "Quorum loss blocks writes"** because `RaftTestCluster::write_delta` had no timeout; openraft's `client_write` blocks indefinitely without quorum. Killed at ~90 min wall. Fix landed (5 s `tokio::time::timeout` around `client_write` in `crates/kiseki-log/src/raft/test_cluster.rs`). |
+
+### Per-feature measurements (2026-04-26, Linux, slow-tests on)
+
+Drive a subset by passing `KISEKI_FEATURE_FILTER=<substring>` to the
+test binary directly (the runner picks it up via env var, see
+`tests/acceptance.rs::main`). Equivalent for scenario-name filtering:
+`KISEKI_SCENARIO_FILTER=<substring>`.
+
+| Feature | Real backend | Scenarios | Wall | Per scenario |
+|---|---|---:|---:|---:|
+| `persistence` | redb on tmpfs | 14 | 3.9 s | ~280 ms |
+| `protocol-gateway` | loopback TCP via NFS/S3 listeners | 14 | 2.9 s | ~205 ms |
+| `multi-node-raft` | in-process openraft + mpsc transport | 30 | 9.7 s | ~323 ms |
+| `log` | MemShardStore + redb (mixed) | 17 | 3.3 s | ~197 ms |
+| `block-storage` | FileBackedDevice on tmpfs | 27 | 4.7 s | ~176 ms |
+
+**Conclusion**: nothing here is meaningfully "slow" on Linux. The
+`@slow` tag is therefore semantic noise on this OS. It should be
+either retired entirely, or repurposed to mean "scenarios that need
+an external service (real KMS, real S3, real cloud)" — which is what
+Phase 14a's stubbed cloud-KMS backends and Phase 14d's S3 backup
+backend would tag.
+
+Historical context: macOS suffered ×10-100 here because of (i)
+osxfs/virtiofs fsync overhead amplifying every redb commit, and
+(ii) macOS timer coalescing stretching tokio's `time::sleep` past
+the 150-300 ms election window so Raft scenarios constantly retried.
+On Linux with `epoll` and native filesystems both costs collapse.
 
 The slow suite spins up real `RaftTestCluster` instances (multi-node
 openraft, channel-based transport), fault-injection scenarios with
