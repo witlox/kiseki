@@ -293,14 +293,19 @@ jobs:
 
       - name: Run single-node e2e tests
         working-directory: tests/e2e
-        run: pytest -ra --tb=short --ignore=test_multi_node.py
+        # Ignore *both* multi-node test files. test_multi_node_resilience.py
+        # uses the `cluster` fixture, which calls `docker compose down -v`
+        # to clear any single-node stack before bringing up the 3-node
+        # one — that wipes the kiseki-server container + volume mid-run,
+        # and every subsequent single-node test fails connection-refused.
+        run: pytest -ra --tb=short --ignore=test_multi_node.py --ignore=test_multi_node_resilience.py
 
       - name: Teardown single-node
         run: docker compose down -v
 
       - name: Run multi-node e2e tests
         working-directory: tests/e2e
-        run: pytest -ra --tb=short test_multi_node.py
+        run: pytest -ra --tb=short test_multi_node.py test_multi_node_resilience.py
 
       - name: Collect logs on failure
         if: failure()
