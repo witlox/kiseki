@@ -19,6 +19,7 @@ pub mod error;
 pub mod grpc;
 pub mod health;
 pub mod internal_provider;
+pub mod node_identity;
 pub mod persistent_store;
 pub mod provider;
 pub mod raft;
