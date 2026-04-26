@@ -14,10 +14,11 @@ SHELL := /bin/bash
 CARGO        ?= cargo
 CARGO_TEST   ?= $(CARGO) test --workspace --all-targets
 CARGO_BUILD  ?= $(CARGO) build --workspace --all-targets
-# -D warnings promotes all warnings to errors.
-# -A overrides for test-common patterns (unwrap, expect, panic, missing docs on macro-generated types).
-CARGO_CLIPPY ?= $(CARGO) clippy --workspace --all-targets -- -D warnings \
-	-A clippy::unwrap-used -A clippy::expect-used -A clippy::panic -A missing-docs
+# Mirrors the CI Clippy invocation (`.github/workflows/ci.yml`) — keep
+# them in sync so `make` catches everything CI does. -D warnings promotes
+# all warnings to errors. RUSTFLAGS=-Dwarnings is also set in CI; --locked
+# matches the exact lockfile resolution CI uses.
+CARGO_CLIPPY ?= $(CARGO) clippy --workspace --all-targets --locked -- -D warnings
 CARGO_FMT    ?= $(CARGO) fmt --all
 
 all: check ## Default: fmt + lint + test

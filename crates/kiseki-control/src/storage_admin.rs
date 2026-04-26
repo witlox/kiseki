@@ -94,6 +94,9 @@ pub struct IOStatsEvent {
     pub write_throughput: u64,
 }
 
+/// Storage admin façade — pools, devices, shard assignments, and the
+/// inline-data threshold (ADR-025/030/037). Operations are guarded by
+/// the role-based checks in [`Self::require_admin`] and `require_sre`.
 pub struct StorageAdminService {
     pools: RwLock<HashMap<String, StoragePool>>,
     devices: RwLock<HashMap<String, DeviceInfo>>,

@@ -64,21 +64,42 @@ pub struct NodeRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NodeAuditEvent {
     /// `DrainNode(target)` accepted; node moved Active → Draining.
-    DrainRequested { node_id: NodeId, admin: String },
+    DrainRequested {
+        /// Node the drain was requested against.
+        node_id: NodeId,
+        /// Admin identity that issued the request.
+        admin: String,
+    },
     /// `DrainNode(target)` rejected; reason recorded.
     DrainRefused {
+        /// Node the drain was attempted against.
         node_id: NodeId,
+        /// Admin identity that issued the request.
         admin: String,
+        /// Human-readable refusal reason (typically the I-N4 message).
         reason: String,
     },
     /// `CancelDrain(target)` accepted; node moved Draining → Active.
-    DrainCancelled { node_id: NodeId, admin: String },
+    DrainCancelled {
+        /// Node whose drain was cancelled.
+        node_id: NodeId,
+        /// Admin identity that issued the cancellation.
+        admin: String,
+    },
     /// All voter replacements complete; node moved Draining → Evicted.
-    Evicted { node_id: NodeId, admin: String },
+    Evicted {
+        /// Node that completed eviction.
+        node_id: NodeId,
+        /// Admin identity associated with the closing transition.
+        admin: String,
+    },
     /// Per-shard voter replacement completed during a drain.
     VoterReplaced {
+        /// Node being drained.
         node_id: NodeId,
+        /// Index of the affected shard within the node's voter list.
         shard_idx: u32,
+        /// Node that received the replacement voter slot.
         replacement: NodeId,
     },
 }
@@ -96,7 +117,12 @@ pub enum DrainError {
     /// Operation forbidden in the node's current state (e.g.,
     /// `CancelDrain` on an Active or Evicted node).
     #[error("invalid state transition: {from:?} → {to:?}")]
-    InvalidTransition { from: NodeState, to: NodeState },
+    InvalidTransition {
+        /// State the node was in when the transition was attempted.
+        from: NodeState,
+        /// State the operator tried to move it to.
+        to: NodeState,
+    },
 }
 
 /// Replication factor enforced by the orchestrator (I-N4).
