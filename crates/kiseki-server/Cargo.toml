@@ -48,6 +48,11 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+# Phase 14d: tar archives for backup snapshots (ADR-016).
+# `tar` is a small (~3 kLOC) zero-dep wrapper around the POSIX ustar
+# format. We use it to build one tarball per snapshot — much simpler
+# to ship to / restore from S3 than per-shard files.
+tar = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
