@@ -281,7 +281,15 @@ jobs:
           done
 
       - name: Install Python deps
-        run: pip install --quiet -r tests/e2e/pyproject.toml 2>/dev/null || pip install grpcio grpcio-tools protobuf pytest tenacity pydantic structlog
+        # Install from the e2e crate's pyproject.toml so dep updates
+        # (e.g. the `requests` add for S3 / Vault / Keycloak / tracing
+        # tests) land here automatically. Fallback list mirrors current
+        # pyproject.toml so a transient project-install failure still
+        # gives a working test environment.
+        run: |
+          pip install --quiet ./tests/e2e \
+            || pip install --quiet grpcio grpcio-tools protobuf pytest \
+                                   tenacity pydantic structlog requests
 
       - name: Run single-node e2e tests
         working-directory: tests/e2e
@@ -296,7 +304,17 @@ jobs:
 
       - name: Collect logs on failure
         if: failure()
-        run: docker compose -f docker-compose.3node.yml logs 2>/dev/null; docker compose logs 2>/dev/null; true
+        # Print logs to stdout so they show up in the workflow output
+        # (the previous version piped both compose calls to /dev/null
+        # for stderr suppression and the result was an empty step).
+        run: |
+          set +e
+          echo "=== docker ps -a ==="
+          docker ps -a
+          echo "=== single-node compose logs ==="
+          docker compose logs --no-color || true
+          echo "=== 3-node compose logs ==="
+          docker compose -f docker-compose.3node.yml logs --no-color || true
 
       - name: Teardown
         if: always()

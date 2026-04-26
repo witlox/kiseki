@@ -122,9 +122,15 @@ def _start_local(data_port: int, advisory_port: int) -> ServerInfo:
     return info
 
 
-@retry(stop=stop_after_delay(60), wait=wait_exponential(multiplier=0.5, max=5))
+@retry(stop=stop_after_delay(180), wait=wait_exponential(multiplier=0.5, max=5))
 def _wait_for_ready(addr: str) -> None:
-    """Wait until the gRPC server is accepting connections."""
+    """Wait until the gRPC server is accepting connections.
+
+    180s deadline tolerates GitHub-runner-class machines: docker
+    compose restart + redb open + Phase 14e at-rest key derivation
+    on a shared 2-vCPU runner can sit at ~60-90 s. Locally on
+    NVMe + 16-core this returns in ~3 s.
+    """
     channel = grpc.insecure_channel(addr)
     try:
         grpc.channel_ready_future(channel).result(timeout=2)
