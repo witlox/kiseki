@@ -1,13 +1,28 @@
 # Fidelity Index — Kiseki
 
-**Checkpoint**: 2026-04-26 (post-Phase 13f + full BDD depth sweep)
-**Previous**: 2026-04-24 (post Phase 12 ADR-032 async GatewayOps)
+**Checkpoint**: 2026-04-26 (post-Phase 14 — backup/restore, security
+hardening, slow-suite Raft, end-to-end tracing)
+**Depth audit**: 2026-04-26 (post-Phase 13f) — per-scenario depth
+ratings below predate Phase 14's BDD additions; numbers in the
+"BDD coverage" table reflect the post-Phase 14 totals but the
+THOROUGH/MOCK/SHALLOW/STUB distribution row needs a re-sweep before
+the next release.
 
-This index reflects today's reality of the BDD acceptance suite. The
-prior checkpoint counted scenarios as "passing" without rating
-test depth. The 2026-04-26 sweep
-(`specs/fidelity/SWEEP.md` + `bdd-depth-audit.md`) adds the depth
-classification that was missing.
+Phase 14 deltas vs the previous checkpoint:
+- 14 crates (added `kiseki-backup` for ADR-016 + `kiseki-tracing` as
+  the OTel-bridge workaround)
+- 37 ADRs (added 036 + 037)
+- 247 @integration scenarios (was 241; +6 from `backup-and-restore.feature`)
+- BDD result: **237 passing, 0 failed, 10 skipped** (the 10 are the
+  `@slow` scenarios that auto-skip on macOS only — Linux runs all 247)
+- 41 `todo!()` stubs in raft.rs + 18 in log.rs all closed; the
+  in-process Raft test cluster now persists via redb, supports
+  crash/restart, has rack/SSD topology metadata, and meets the perf
+  scenarios with a coarse test-rig threshold.
+- Three security hardening sites closed (`Zeroizing` on cached key
+  material, AES-GCM at-rest encryption for the Raft key store keyed
+  off a per-node identity, `mlock` + `setrlimit(RLIMIT_CORE,0)` for
+  the integrity checker).
 
 ---
 
@@ -57,14 +72,14 @@ but mis-labeled at integration tier.)
 
 | Metric | Value |
 |---|---|
-| Feature files                                          | 22  |
-| @integration scenarios (total)                         | 241 |
-| @integration @slow (gated behind `--features slow-tests`) |  60 |
-| @integration fast (run by default)                     | 181 |
-| Step-definition files                                  |  19 |
-| Step functions                                         | ~2,700 |
-| `todo!()` step bodies                                  |   9 (in log.rs) + several in raft.rs |
-| Default test result                                    | 181/181 fast pass; 0 fail |
+| Feature files                                          | 23  |
+| @integration scenarios (total)                         | 247 |
+| @integration @slow (auto-skip on macOS only)           |  10 |
+| @integration scenarios passing on Linux                | 247 |
+| Step-definition files                                  |  20 |
+| Step functions                                         | ~2,800 |
+| `todo!()` step bodies                                  |   0 |
+| Default test result (Linux)                            | 237 passed, 10 skipped, 0 failed |
 
 ### Depth distribution (per BDD-depth-audit.md, 2026-04-26)
 

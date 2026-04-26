@@ -1,11 +1,12 @@
 # Kiseki
 
-Distributed storage system for HPC/AI workloads. 12 Rust crates,
-35 ADRs, 241 @integration BDD scenarios (implementer targets).
+Distributed storage system for HPC/AI workloads. 19 production Rust
+crates (+ 1 BDD-test crate), 37 ADRs, 247 @integration BDD scenarios
+(237 passing on Linux, 10 macOS-gated @slow auto-skipped).
 
 ## Language
 
-- Core: Rust (12 crates in workspace)
+- Core: Rust (19 production crates + kiseki-acceptance test crate)
 - Boundary: gRPC / protobuf (4 service definitions)
 - Client bindings: Rust native + C FFI, Python (PyO3), C++ wrapper
 - Crypto: FIPS 140-2/3 validated (aws-lc-rs, AES-256-GCM, HKDF-SHA256)

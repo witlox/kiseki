@@ -74,8 +74,9 @@ Gate 2: auditor verifies step depth. See `roles/auditor.md`.
 
 ## Entry point
 
-Phase 13 (cluster topology) in progress. 12 crates, 35 ADRs,
-241 @integration BDD scenarios as implementer targets.
+Phase 14 complete (backup/restore, security hardening, slow-suite Raft,
+end-to-end tracing). 19 production crates, 37 ADRs, 247 @integration
+BDD scenarios (237 passing on Linux, 10 macOS-gated @slow).
 
 ## Escalation paths
 

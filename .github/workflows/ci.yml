@@ -208,7 +208,13 @@ jobs:
       - name: Verify kiseki-control dependency boundary (ADR-027)
         run: |
           set -euo pipefail
-          deps=$(grep '^kiseki-' crates/kiseki-control/Cargo.toml | grep -v 'kiseki-common\|kiseki-proto' | grep -v '^#' || true)
+          # ADR-027: kiseki-control depends ONLY on kiseki-common,
+          # kiseki-proto, and observability shims (kiseki-tracing).
+          # No data-path crates (log/chunk/composition/view/gateway/
+          # client/keymanager/crypto/raft/transport/audit/advisory).
+          deps=$(grep '^kiseki-' crates/kiseki-control/Cargo.toml \
+            | grep -v 'kiseki-common\|kiseki-proto\|kiseki-tracing' \
+            | grep -v '^#' || true)
           if [ -n "$deps" ]; then
             echo "::error::kiseki-control has forbidden dependencies: $deps"
             exit 1
