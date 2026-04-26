@@ -208,6 +208,17 @@ pub struct KisekiWorld {
     /// Per-gateway S3 task handles for graceful shutdown.
     pub s3_tasks: Vec<tokio::task::JoinHandle<()>>,
 
+    // === Tenant KMS providers (ADR-028) ===
+    /// Per-provider-name `TenantKmsProvider` instances. Every named slot
+    /// (`internal`, `vault`, `kmip`, `aws-kms`, `pkcs11`) is backed by a
+    /// distinct `InternalProvider` with its own key — so the BDD exercises
+    /// the trait through real production code rather than a local KEK
+    /// roundtrip in the test body. Cloud-backend impls (vault/azure/gcp/aws)
+    /// exist in `kiseki-keymanager` but require live endpoints; using the
+    /// internal impl keeps the test deterministic without weakening the
+    /// trait contract.
+    pub kms_providers: HashMap<String, Arc<dyn kiseki_keymanager::TenantKmsProvider>>,
+
     // === Telemetry bus (ADR-021, I-WA5) ===
     pub telemetry_bus: Arc<kiseki_advisory::TelemetryBus>,
     /// Receivers cached per workload so subsequent Then steps can drain.
@@ -298,6 +309,26 @@ impl KisekiWorld {
 
         let shard_map_store = Arc::new(NamespaceShardMapStore::new());
         let telemetry_bus = Arc::new(kiseki_advisory::TelemetryBus::new());
+
+        // ADR-028: provider registry with one InternalProvider per backend
+        // name. Each gets its own randomly-generated key so a wrap from
+        // "vault" cannot be unwrapped by "internal" (proves provider
+        // isolation by construction).
+        let mut kms_providers: HashMap<String, Arc<dyn kiseki_keymanager::TenantKmsProvider>> =
+            HashMap::new();
+        for name in ["internal", "vault", "kmip", "aws-kms", "pkcs11"] {
+            let mut key = vec![0u8; 32];
+            // Distinct deterministic key per provider name; not the byte-pattern
+            // KEK from the deprecated `kek_for_provider` test helper.
+            for (i, b) in name.bytes().enumerate() {
+                key[i % 32] ^= b.wrapping_mul(7);
+            }
+            kms_providers.insert(
+                name.to_string(),
+                Arc::new(kiseki_keymanager::InternalProvider::new(key))
+                    as Arc<dyn kiseki_keymanager::TenantKmsProvider>,
+            );
+        }
         let gateway = Arc::new(
             InMemoryGateway::new(gw_comps, Box::new(gw_chunks), gw_master)
                 .with_shard_map(Arc::clone(&shard_map_store)),
@@ -420,6 +451,7 @@ impl KisekiWorld {
             last_inline_key: None,
             last_delta: None,
             telemetry_bus,
+            kms_providers,
             backpressure_subs: HashMap::new(),
             qos_subs: HashMap::new(),
             tcp_endpoints: HashMap::new(),

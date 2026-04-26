@@ -1,27 +1,103 @@
 //! Step definitions for external-kms.feature — 48 scenarios.
 //!
-//! Tests the TenantKmsProvider trait abstraction (ADR-028). Since the
-//! actual provider backends (Vault, KMIP, AWS KMS, PKCS#11) don't exist
-//! yet (Phase K1-K5), we simulate provider behavior using the existing
-//! envelope encryption infrastructure (seal/open_envelope, wrap/unwrap_tenant,
-//! KeyCache, shred).
+//! Routes tenant wrap/unwrap through the production `TenantKmsProvider`
+//! trait (ADR-028). Each provider name is bound to a distinct
+//! `InternalProvider` instance in `KisekiWorld::kms_providers`; assertions
+//! exercise the trait's wrap/unwrap/rotate/health contract rather than
+//! a local AEAD roundtrip in the test body.
+
+use std::sync::Arc;
 
 use crate::KisekiWorld;
 use cucumber::{gherkin::Step, given, then, when};
 use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::aead::Aead;
-use kiseki_crypto::envelope::{open_envelope, seal_envelope, unwrap_tenant, wrap_for_tenant};
+use kiseki_crypto::envelope::{
+    open_envelope, seal_envelope, unwrap_tenant, wrap_for_tenant, Envelope,
+};
 use kiseki_crypto::keys::{MasterKeyCache, SystemMasterKey, TenantKek};
 use kiseki_crypto::shred;
 use kiseki_keymanager::cache::KeyCache;
 use kiseki_keymanager::epoch::KeyManagerOps;
+use kiseki_keymanager::{KmsError, TenantKmsProvider};
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers — every wrap/unwrap routes through the trait, not a local KEK.
 // ---------------------------------------------------------------------------
 
-/// Derive a deterministic test KEK from a provider type string.
+/// Look up the configured `TenantKmsProvider` for a provider name.
+/// Falls back to "internal" when the canonical alias is not found
+/// (covers both `vault`/`Vault`/`hashicorp-vault` style spellings).
+fn provider_for(w: &KisekiWorld, name: &str) -> Arc<dyn TenantKmsProvider> {
+    let canonical = match name {
+        "internal" | "Internal" => "internal",
+        "vault" | "Vault" | "hashicorp-vault" => "vault",
+        "kmip" | "KMIP" | "kmip-2.1" => "kmip",
+        "aws-kms" | "AWS KMS" | "aws" => "aws-kms",
+        "pkcs11" | "PKCS#11" | "PKCS11" => "pkcs11",
+        other => other,
+    };
+    Arc::clone(
+        w.kms_providers
+            .get(canonical)
+            .or_else(|| w.kms_providers.get("internal"))
+            .expect("internal provider always registered"),
+    )
+}
+
+/// Wrap an envelope's system DEK derivation material via the trait.
+/// Mirrors `kiseki_crypto::envelope::wrap_for_tenant` but the wrap call
+/// goes through `TenantKmsProvider::wrap` so the trait is exercised.
+fn provider_wrap_envelope(
+    provider: &dyn TenantKmsProvider,
+    envelope: &mut Envelope,
+) -> Result<(), KmsError> {
+    let mut material = Vec::with_capacity(40);
+    material.extend_from_slice(&envelope.system_epoch.0.to_le_bytes());
+    material.extend_from_slice(&envelope.chunk_id.0);
+    let wrapped = provider.wrap(&material, &envelope.chunk_id.0)?;
+    envelope.tenant_wrapped_material = Some(wrapped);
+    envelope.tenant_epoch = Some(KeyEpoch(1));
+    Ok(())
+}
+
+/// Unwrap the tenant-wrapped material from an envelope through the
+/// trait. Returns the recovered `(system_epoch || chunk_id)` bytes;
+/// callers verify against what was wrapped. AAD mismatch surfaces as
+/// `KmsError::AadMismatch` from the trait impl.
+///
+/// This intentionally does NOT also decrypt the envelope ciphertext —
+/// the trait-level wrap/unwrap is what ADR-028 promises; envelope
+/// decryption is `kiseki-crypto`'s contract and covered separately.
+fn provider_unwrap_material(
+    provider: &dyn TenantKmsProvider,
+    envelope: &Envelope,
+) -> Result<Vec<u8>, KmsError> {
+    let wrapped = envelope
+        .tenant_wrapped_material
+        .as_ref()
+        .ok_or_else(|| KmsError::CryptoError("no tenant wrapping".into()))?;
+    let material = provider.unwrap(wrapped, &envelope.chunk_id.0)?;
+    if material.len() != 40 {
+        return Err(KmsError::CryptoError(format!(
+            "unwrapped material length {}, expected 40",
+            material.len()
+        )));
+    }
+    // Defence-in-depth: trait AAD already binds to chunk_id; this catches
+    // a wrap that targeted a different envelope's chunk_id.
+    if material[8..40] != envelope.chunk_id.0 {
+        return Err(KmsError::CryptoError(
+            "unwrapped chunk_id does not match envelope".into(),
+        ));
+    }
+    Ok(material)
+}
+
+/// Backwards-compatible KEK helper — kept for the few scenarios that
+/// still need a `TenantKek` value (cache + shred unit-style assertions).
+/// New code should call `provider_for` + the helpers above.
 fn kek_for_provider(provider: &str) -> TenantKek {
     let byte = match provider {
         "internal" | "Internal" => 0x11,
@@ -175,19 +251,48 @@ async fn then_health_check(w: &mut KisekiWorld) {
 
 #[then("a test wrap/unwrap round-trip succeeds")]
 async fn then_wrap_unwrap_roundtrip(w: &mut KisekiWorld) {
-    let provider = w.kms_provider_type.as_deref().unwrap_or("internal");
-    let kek = kek_for_provider(provider);
+    let provider_name = w
+        .kms_provider_type
+        .as_deref()
+        .unwrap_or("internal")
+        .to_owned();
+    let provider = provider_for(w, &provider_name);
     let aead = test_aead();
     let master = test_master();
     let chunk_id = ChunkId([0xcc; 32]);
     let mut env = seal_envelope(&aead, &master, &chunk_id, b"roundtrip").unwrap();
-    wrap_for_tenant(&aead, &mut env, &kek).unwrap();
-    let mut cache = MasterKeyCache::new();
-    cache.insert(test_master());
-    let decrypted = unwrap_tenant(&aead, &env, &kek, &cache).unwrap();
+
+    // The wrap goes through the production TenantKmsProvider trait —
+    // not a local TenantKek roundtrip in the test body.
+    provider_wrap_envelope(provider.as_ref(), &mut env).expect("provider wrap should succeed");
+    assert!(
+        env.tenant_wrapped_material.is_some(),
+        "wrap must populate tenant_wrapped_material",
+    );
+
+    // Same provider unwraps; AAD binding to chunk_id is enforced inside
+    // InternalProvider so a swapped envelope would fail.
+    let recovered = provider_unwrap_material(provider.as_ref(), &env)
+        .expect("provider unwrap should recover material");
     assert_eq!(
-        decrypted, b"roundtrip",
-        "wrap/unwrap roundtrip should succeed"
+        recovered.len(),
+        40,
+        "recovered material is system_epoch (8) + chunk_id (32)"
+    );
+    assert_eq!(&recovered[8..], &chunk_id.0, "unwrapped chunk_id matches");
+
+    // Falsifiability check: a different provider's instance MUST NOT
+    // unwrap the same envelope (separate keys per provider name).
+    let other_name = if provider_name == "internal" {
+        "vault"
+    } else {
+        "internal"
+    };
+    let other = provider_for(w, other_name);
+    let cross_unwrap = provider_unwrap_material(other.as_ref(), &env);
+    assert!(
+        cross_unwrap.is_err(),
+        "cross-provider unwrap must fail (provider isolation by construction)",
     );
 }
 
@@ -1019,13 +1124,34 @@ async fn then_other_unaffected(_w: &mut KisekiWorld) {
 
 #[when("the tenant admin triggers key rotation")]
 async fn when_key_rotation(w: &mut KisekiWorld) {
-    // Simulate rotation: increment epoch, create new KEK.
-    match w.key_store.rotate().await {
-        Ok(e) => {
-            w.last_epoch = Some(e.0);
+    // Drive rotation through the production TenantKmsProvider trait
+    // (ADR-028). The system-key store also rotates so the existing
+    // last_epoch assertions still hold.
+    let provider_name = w
+        .kms_provider_type
+        .as_deref()
+        .unwrap_or("internal")
+        .to_owned();
+    let provider = provider_for(w, &provider_name);
+    match provider.rotate() {
+        Ok(epoch_id) => {
+            // Provider epoch is opaque (e.g. "internal-epoch-2"); store
+            // a numeric counterpart so existing assertions on
+            // `w.last_epoch` keep working.
+            let numeric = epoch_id
+                .rsplit('-')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(2);
+            w.last_epoch = Some(numeric);
             w.last_error = None;
         }
-        Err(e) => w.last_error = Some(e.to_string()),
+        Err(e) => w.last_error = Some(format!("provider rotate failed: {e}")),
+    }
+    // Mirror the rotation in the system key store so tests that reach
+    // for `key_store.current_epoch()` still see monotonic progress.
+    if let Ok(e) = w.key_store.rotate().await {
+        w.last_epoch = Some(e.0);
     }
 }
 
@@ -1288,24 +1414,36 @@ async fn then_vault_kek(_w: &mut KisekiWorld) {
 }
 
 #[then("background re-wrap begins: unwrap(Internal) then wrap(Vault) per envelope")]
-async fn then_rewrap_migration(_w: &mut KisekiWorld) {
-    // Migration re-wrap: unwrap with Internal KEK, wrap with Vault KEK.
+async fn then_rewrap_migration(w: &mut KisekiWorld) {
+    // Drive the re-wrap through the production trait: an envelope wrapped
+    // by the Internal provider must be unwrappable by Internal, then
+    // re-wrappable by Vault. The two providers hold distinct keys, so
+    // a swap proves the migration consulted both impls — not a single
+    // local KEK reused across both ends.
+    let internal = provider_for(w, "internal");
+    let vault = provider_for(w, "vault");
     let aead = test_aead();
     let master = test_master();
-    let internal_kek = kek_for_provider("internal");
-    let vault_kek = kek_for_provider("vault");
     let chunk_id = ChunkId([0xab; 32]);
     let mut env = seal_envelope(&aead, &master, &chunk_id, b"migrate-data").unwrap();
-    // Wrap with Internal.
-    wrap_for_tenant(&aead, &mut env, &internal_kek).unwrap();
-    // Unwrap Internal, wrap Vault.
-    let mut cache = MasterKeyCache::new();
-    cache.insert(test_master());
-    let plaintext = unwrap_tenant(&aead, &env, &internal_kek, &cache).unwrap();
-    // Re-seal and wrap with Vault.
-    let mut new_env = seal_envelope(&aead, &master, &chunk_id, &plaintext).unwrap();
-    wrap_for_tenant(&aead, &mut new_env, &vault_kek).unwrap();
-    assert!(new_env.tenant_wrapped_material.is_some());
+    provider_wrap_envelope(internal.as_ref(), &mut env).expect("internal wrap during migration");
+    let recovered = provider_unwrap_material(internal.as_ref(), &env)
+        .expect("internal unwrap during migration");
+    assert_eq!(recovered.len(), 40);
+
+    // Re-wrap with Vault — clears tenant_wrapped_material and rewraps via
+    // the second provider, exactly as the production migration loop would.
+    env.tenant_wrapped_material = None;
+    provider_wrap_envelope(vault.as_ref(), &mut env).expect("vault wrap during migration");
+    assert!(env.tenant_wrapped_material.is_some());
+
+    // Falsifiability: Internal MUST NOT unwrap the Vault-wrapped envelope.
+    assert!(
+        provider_unwrap_material(internal.as_ref(), &env).is_err(),
+        "post-migration envelope must require Vault to unwrap",
+    );
+    // And Vault DOES unwrap it.
+    assert!(provider_unwrap_material(vault.as_ref(), &env).is_ok());
 }
 
 #[then(regex = r#"^progress is tracked \(0/(\d+), then (\d+)/\d+, then \d+/\d+\)$"#)]
