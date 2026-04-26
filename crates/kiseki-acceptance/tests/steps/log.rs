@@ -1206,11 +1206,40 @@ async fn given_ns_with_two_shards(
 
 #[given(regex = r#"^a MergeShard operation is in progress for "([^"]*)" and "([^"]*)"$"#)]
 async fn given_merge_in_progress(w: &mut KisekiWorld, shard1: String, shard2: String) {
-    // Set both shards to Merging state via real state transition.
+    // Set both inputs to Merging state via real state transition.
     let sid1 = w.ensure_shard(&shard1);
     let sid2 = w.ensure_shard(&shard2);
     w.log_store.set_shard_state(sid1, ShardState::Merging);
     w.log_store.set_shard_state(sid2, ShardState::Merging);
+
+    // Pre-register the merged shard under its conventional name so the
+    // "after merge completes, the delta is readable from the merged shard"
+    // Then step can look it up. The name follows the spec convention:
+    // "shard-c1" + "shard-c2" → "shard-c12" (suffixes concatenated).
+    let merged_name = derive_merged_name(&shard1, &shard2);
+    let tenant_id = w.ensure_tenant("org-pharma");
+    let merged_id = kiseki_common::ids::ShardId(uuid::Uuid::new_v4());
+    w.log_store.create_shard(
+        merged_id,
+        tenant_id,
+        kiseki_common::ids::NodeId(1),
+        kiseki_log::shard::ShardConfig::default(),
+    );
+    w.shard_names.insert(merged_name, merged_id);
+}
+
+/// Derive the merged shard's conventional test name from two input names.
+/// "shard-c1" + "shard-c2" → "shard-c12". Falls back to "<a>+<b>" if the
+/// shared prefix is empty.
+fn derive_merged_name(a: &str, b: &str) -> String {
+    // Find the longest common prefix.
+    let prefix_len = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    let prefix = &a[..prefix_len];
+    if prefix.is_empty() {
+        format!("{a}+{b}")
+    } else {
+        format!("{prefix}{}{}", &a[prefix_len..], &b[prefix_len..])
+    }
 }
 
 #[given(regex = r#"^a MergeShard for "([^"]*)" \+ "([^"]*)" has started but not completed$"#)]
