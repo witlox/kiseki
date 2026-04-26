@@ -59,10 +59,12 @@ def start_server(
 def _start_docker(
     data_port: int, advisory_port: int, control_port: int
 ) -> ServerInfo:
-    """Start via docker compose."""
+    """Start via docker compose. Reuses the `kiseki-server:local`
+    image pinned in compose if it already exists; rebuild it
+    out-of-band with `docker build -t kiseki-server:local .`."""
     root = _workspace_root()
     subprocess.run(
-        ["docker", "compose", "up", "--build", "-d"],
+        ["docker", "compose", "up", "-d"],
         cwd=root,
         check=True,
         capture_output=True,
@@ -158,7 +160,7 @@ def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo
         capture_output=True,
     )
     result = subprocess.run(
-        ["docker", "compose", "-f", compose_file, "up", "--build", "-d"],
+        ["docker", "compose", "-f", compose_file, "up", "-d"],
         cwd=root,
         capture_output=True,
         text=True,

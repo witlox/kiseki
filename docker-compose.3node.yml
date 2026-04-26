@@ -9,6 +9,7 @@
 
 services:
   kiseki-node1:
+    image: kiseki-server:local
     build:
       context: .
       dockerfile: Dockerfile.server
@@ -36,6 +37,7 @@ services:
       retries: 15
 
   kiseki-node2:
+    image: kiseki-server:local
     build:
       context: .
       dockerfile: Dockerfile.server
@@ -62,6 +64,7 @@ services:
       retries: 15
 
   kiseki-node3:
+    image: kiseki-server:local
     build:
       context: .
       dockerfile: Dockerfile.server

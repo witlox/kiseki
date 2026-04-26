@@ -9,6 +9,11 @@
 
 services:
   kiseki-server:
+    # Pin a stable tag so `docker compose up -d` reuses an image
+    # built out-of-band (`docker build -t kiseki-server:local .`)
+    # instead of rebuilding each invocation under the auto-generated
+    # `kiseki-kiseki-server` name.
+    image: kiseki-server:local
     build:
       context: .
       dockerfile: Dockerfile.server

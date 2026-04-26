@@ -9,8 +9,10 @@ OUT_DIR="$SCRIPT_DIR/proto"
 
 mkdir -p "$OUT_DIR"
 
-# Use the project venv's grpc_tools
-PYTHON="${WORKSPACE_ROOT}/.venv/bin/python"
+# Use the e2e-test venv (uv sync creates it under tests/e2e/.venv).
+# Falls back to workspace .venv for backwards compatibility.
+PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="${WORKSPACE_ROOT}/.venv/bin/python"
 
 "$PYTHON" -m grpc_tools.protoc \
     --proto_path="$PROTO_ROOT" \
@@ -19,7 +21,8 @@ PYTHON="${WORKSPACE_ROOT}/.venv/bin/python"
     "kiseki/v1/common.proto" \
     "kiseki/v1/log.proto" \
     "kiseki/v1/key.proto" \
-    "kiseki/v1/control.proto"
+    "kiseki/v1/control.proto" \
+    "kiseki/v1/admin.proto"
 
 # Create __init__.py for the generated package
 mkdir -p "$OUT_DIR/kiseki/v1"
