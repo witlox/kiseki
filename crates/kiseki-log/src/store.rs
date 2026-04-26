@@ -37,6 +37,12 @@ pub struct MemShardStore {
     /// Optional inline store — when set, deltas with `has_inline_data: true`
     /// have their payload offloaded on apply (I-SF5, ADR-030).
     inline_store: OnceLock<Arc<dyn InlineStore>>,
+    /// Source shard → destination shard during a Splitting cutover.
+    /// Out-of-range writes against the source are buffered and replayed
+    /// against the target on `drain_split_buffer`.
+    split_targets: Mutex<HashMap<ShardId, ShardId>>,
+    /// Per-source buffer of writes accumulated during cutover.
+    split_buffer: Mutex<HashMap<ShardId, Vec<AppendDeltaRequest>>>,
 }
 
 impl MemShardStore {
@@ -46,6 +52,8 @@ impl MemShardStore {
         Self {
             shards: Mutex::new(HashMap::new()),
             inline_store: OnceLock::new(),
+            split_targets: Mutex::new(HashMap::new()),
+            split_buffer: Mutex::new(HashMap::new()),
         }
     }
 
@@ -57,6 +65,53 @@ impl MemShardStore {
         store: Arc<dyn InlineStore>,
     ) -> Result<(), Arc<dyn InlineStore>> {
         self.inline_store.set(store)
+    }
+
+    /// Link a Splitting source shard to its eventual destination shard.
+    /// While the source is in `ShardState::Splitting`, out-of-range writes
+    /// (key beyond the source's current `range_end`) are buffered for
+    /// later replay against the destination.
+    pub fn set_split_target(&self, source: ShardId, target: ShardId) {
+        self.split_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(source, target);
+    }
+
+    /// Number of buffered writes for a source shard's split cutover.
+    #[must_use]
+    pub fn split_buffer_len(&self, source: ShardId) -> usize {
+        self.split_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&source)
+            .map_or(0, Vec::len)
+    }
+
+    /// Replay all buffered writes for `source` against its split target.
+    /// Returns the number of replayed deltas.
+    pub async fn drain_split_buffer(&self, source: ShardId) -> Result<usize, LogError> {
+        let target = self
+            .split_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&source)
+            .copied()
+            .ok_or(LogError::ShardNotFound(source))?;
+
+        let buffered: Vec<AppendDeltaRequest> = self
+            .split_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&source)
+            .unwrap_or_default();
+
+        let count = buffered.len();
+        for mut req in buffered {
+            req.shard_id = target;
+            self.append_delta(req).await?;
+        }
+        Ok(count)
     }
 
     /// Create a new shard with the given parameters.
@@ -283,6 +338,28 @@ impl LogOps for MemShardStore {
         }
 
         if req.hashed_key < shard.info.range_start || req.hashed_key >= shard.info.range_end {
+            // ADR-034: during a split cutover, out-of-range writes that fall
+            // into the eventual target's range are buffered, not rejected.
+            // Drained by `drain_split_buffer` once the target is ready.
+            if shard.info.state == ShardState::Splitting
+                && self
+                    .split_targets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&req.shard_id)
+            {
+                let source = req.shard_id;
+                drop(shards);
+                self.split_buffer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(source)
+                    .or_default()
+                    .push(req);
+                // Return a placeholder sequence; the real number is assigned
+                // when the buffered request is replayed against the target.
+                return Ok(SequenceNumber(0));
+            }
             return Err(LogError::KeyOutOfRange(req.shard_id));
         }
 
@@ -877,6 +954,56 @@ mod tests {
         fn delete(&self, _k: &[u8; 32]) -> std::io::Result<bool> {
             Ok(false)
         }
+    }
+
+    /// ADR-034: out-of-range writes against a Splitting source are buffered
+    /// and replayed against the linked target shard.
+    #[tokio::test]
+    async fn split_buffer_holds_out_of_range_writes_then_drains_to_target() {
+        let store = MemShardStore::new();
+        let source = ShardId(uuid::Uuid::from_u128(50));
+        let target = ShardId(uuid::Uuid::from_u128(51));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(102));
+        let node_id = NodeId(1);
+
+        store.create_shard(source, tenant_id, node_id, ShardConfig::default());
+        store.create_shard(target, tenant_id, node_id, ShardConfig::default());
+        // Source shrinks to [0x00, 0x80); target inherits [0x80, 0xff].
+        let mut mid = [0u8; 32];
+        mid[0] = 0x80;
+        store.update_shard_range(source, [0u8; 32], mid);
+        store.update_shard_range(target, mid, [0xffu8; 32]);
+        store.set_shard_state(source, ShardState::Splitting);
+        store.set_split_target(source, target);
+
+        // Out-of-range write — buffered (key 0x90 ≥ 0x80 source range_end).
+        let req = AppendDeltaRequest {
+            shard_id: source,
+            tenant_id,
+            operation: OperationType::Create,
+            timestamp: test_timestamp(),
+            hashed_key: [0x90u8; 32],
+            chunk_refs: vec![],
+            payload: vec![0xAB; 64],
+            has_inline_data: false,
+        };
+        let seq = store
+            .append_delta(req)
+            .await
+            .expect("split-buffered write must succeed");
+        assert_eq!(seq, SequenceNumber(0), "buffered writes return placeholder");
+        assert_eq!(store.split_buffer_len(source), 1);
+
+        // Drain — the buffered request commits to the target shard.
+        let drained = store.drain_split_buffer(source).await.unwrap();
+        assert_eq!(drained, 1);
+        assert_eq!(store.split_buffer_len(source), 0);
+
+        let target_health = store.shard_health(target).await.unwrap();
+        assert_eq!(
+            target_health.delta_count, 1,
+            "buffered delta must land in target shard"
+        );
     }
 
     #[tokio::test]

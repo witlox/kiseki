@@ -61,6 +61,10 @@ mod steps;
 pub struct KisekiWorld {
     // === Real implementations (in-memory stores) ===
     pub log_store: Arc<dyn LogOps + Send + Sync>,
+    /// Typed handle to the same in-memory store as `log_store`, exposed
+    /// for step definitions that need access to MemShardStore-only API
+    /// (split buffering, inline store wiring, etc.).
+    pub mem_shard_store: Arc<MemShardStore>,
     pub key_store: MemKeyStore,
     pub audit_log: AuditLog,
     pub chunk_store: ChunkStore,
@@ -207,7 +211,9 @@ impl std::fmt::Debug for KisekiWorld {
 impl KisekiWorld {
     fn new() -> Self {
         let key_store = MemKeyStore::new().unwrap_or_else(|_| MemKeyStore::default());
-        let log_store = Arc::new(MemShardStore::new());
+        let mem_shard_store = Arc::new(MemShardStore::new());
+        let log_store: Arc<dyn LogOps + Send + Sync> =
+            Arc::clone(&mem_shard_store) as Arc<dyn LogOps + Send + Sync>;
 
         // Inline store (ADR-030): redb-backed small_object store wired into
         // the log store so deltas with has_inline_data=true are offloaded
@@ -217,11 +223,10 @@ impl KisekiWorld {
             kiseki_chunk::SmallObjectStore::open(&inline_temp_dir.path().join("objects.redb"))
                 .expect("open small_object store"),
         );
-        let _ = log_store.set_inline_store(
+        let _ = mem_shard_store.set_inline_store(
             Arc::clone(&inline_store) as Arc<dyn kiseki_common::inline_store::InlineStore>
         );
-        let comp_store = CompositionStore::new()
-            .with_log(Arc::clone(&log_store) as Arc<dyn LogOps + Send + Sync>);
+        let comp_store = CompositionStore::new().with_log(Arc::clone(&log_store));
 
         // Integrated pipeline: InMemoryGateway chains encrypt → store → composition.
         let gw_chunks = kiseki_chunk::ChunkStore::new();
@@ -233,7 +238,7 @@ impl KisekiWorld {
         let default_ns = NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
         let default_tenant = OrgId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"org-test"));
         let default_shard = ShardId(uuid::Uuid::from_u128(1));
-        log_store.create_shard(
+        mem_shard_store.create_shard(
             default_shard,
             default_tenant,
             kiseki_common::ids::NodeId(1),
@@ -260,6 +265,7 @@ impl KisekiWorld {
 
         Self {
             log_store,
+            mem_shard_store,
             key_store,
             audit_log: AuditLog::new(),
             chunk_store: ChunkStore::new(),

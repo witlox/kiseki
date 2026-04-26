@@ -935,16 +935,24 @@ async fn then_sp_decrypts(_w: &mut KisekiWorld) {
 
 // Delta append to splitting shard
 #[given(regex = r#"^"(\S+)" is mid-split, creating "(\S+)"$"#)]
-async fn given_mid_split(w: &mut KisekiWorld, name: String, _new_shard: String) {
-    w.ensure_shard(&name);
+async fn given_mid_split(w: &mut KisekiWorld, name: String, new_shard: String) {
+    // Source shard already exists; create the target so the buffer drain
+    // has somewhere to land. Both run with default range until the split
+    // boundary is set in the next Given.
+    let source = w.ensure_shard(&name);
+    let target = w.ensure_shard(&new_shard);
+    // Downcast to the concrete in-memory store to wire the split target.
+    // Production paths use the same MemShardStore in the test harness.
+    let store = w.mem_shard_store.as_ref();
+    store.set_split_target(source, target);
 }
 
 #[given(regex = r#"^the split boundary is at hashed_key 0x(\S+)$"#)]
 async fn given_split_boundary(w: &mut KisekiWorld, hex: String) {
-    // Set the shard's range to end at the split boundary.
-    let sid = w.ensure_shard("shard-alpha");
+    // Source covers [0x00, boundary); target covers [boundary, 0xff..].
+    let source = w.ensure_shard("shard-alpha");
+    let target = w.ensure_shard("shard-alpha-2");
     let mut boundary = [0u8; 32];
-    // Parse hex string byte by byte.
     let hex_bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
         .filter_map(|i| u8::from_str_radix(&hex[i..i.min(hex.len()).max(i + 2)], 16).ok())
@@ -952,14 +960,17 @@ async fn given_split_boundary(w: &mut KisekiWorld, hex: String) {
     for (i, b) in hex_bytes.iter().enumerate().take(32) {
         boundary[i] = *b;
     }
-    // The shard covers [0x00, boundary) — writes at or above boundary are out of range.
-    w.log_store.update_shard_range(sid, [0x00; 32], boundary);
-    w.log_store.set_shard_state(sid, ShardState::Splitting);
+    w.log_store.update_shard_range(source, [0x00; 32], boundary);
+    w.log_store
+        .update_shard_range(target, boundary, [0xffu8; 32]);
+    w.log_store.set_shard_state(source, ShardState::Splitting);
 }
 
 #[when(regex = r#"^a delta with hashed_key 0x(\S+) is appended$"#)]
 async fn when_append_at_key(w: &mut KisekiWorld, _hex: String) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
+    // hashed_key 0x90 (each byte) is past the 0x80 boundary — splits to
+    // the buffer for shard-alpha-2.
     let req = w.make_append_request(sid, 0x90);
     match w.log_store.append_delta(req).await {
         Ok(seq) => {
@@ -971,23 +982,59 @@ async fn when_append_at_key(w: &mut KisekiWorld, _hex: String) {
 }
 
 #[then(regex = r#"^the delta is buffered until "(\S+)" is accepting writes$"#)]
-async fn then_buffered(_w: &mut KisekiWorld, _shard: String) {
-    todo!()
+async fn then_buffered(w: &mut KisekiWorld, _shard: String) {
+    let source = *w.shard_names.get("shard-alpha").unwrap();
+    let store = w.mem_shard_store.as_ref();
+    assert_eq!(
+        store.split_buffer_len(source),
+        1,
+        "out-of-range write must be in the split buffer",
+    );
+    assert!(
+        w.last_error.is_none(),
+        "buffering must not surface as error"
+    );
 }
 
 #[then("a brief write latency bump occurs")]
 async fn then_latency_bump(_w: &mut KisekiWorld) {
-    todo!()
+    // Behavioural — buffering implies a latency bump until the target
+    // shard accepts the write. Verified structurally by the buffer length
+    // in the previous step.
 }
 
 #[then(regex = r#"^the delta is committed to "(\S+)" once ready$"#)]
-async fn then_committed_to(_w: &mut KisekiWorld, _shard: String) {
-    todo!()
+async fn then_committed_to(w: &mut KisekiWorld, target_name: String) {
+    let source = *w.shard_names.get("shard-alpha").unwrap();
+    let target = *w.shard_names.get(&target_name).unwrap();
+    let store = w.mem_shard_store.as_ref();
+
+    // Drain the cutover buffer — the buffered write commits to the target.
+    let drained = store
+        .drain_split_buffer(source)
+        .await
+        .expect("drain succeeds");
+    assert_eq!(drained, 1, "exactly one buffered write must drain");
+
+    let health = w
+        .log_store
+        .shard_health(target)
+        .await
+        .expect("target shard exists");
+    assert_eq!(health.delta_count, 1, "target shard receives the delta");
 }
 
 #[then("no delta is lost, duplicated, or misplaced")]
-async fn then_no_delta_lost(_w: &mut KisekiWorld) {
-    todo!()
+async fn then_no_delta_lost(w: &mut KisekiWorld) {
+    let source = *w.shard_names.get("shard-alpha").unwrap();
+    let target = *w.shard_names.get("shard-alpha-2").unwrap();
+    let store = w.mem_shard_store.as_ref();
+    assert_eq!(store.split_buffer_len(source), 0, "buffer fully drained");
+    let target_health = w.log_store.shard_health(target).await.unwrap();
+    assert_eq!(
+        target_health.delta_count, 1,
+        "exactly one delta — not lost, not duplicated",
+    );
 }
 
 // Concurrent split + compaction
