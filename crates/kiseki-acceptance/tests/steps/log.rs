@@ -44,23 +44,53 @@ async fn then_event_emitted(w: &mut KisekiWorld) {
 // === Scenario 2: inline data ===
 
 #[given(regex = r#"^the (?:inline data|shard inline) threshold is (\d+) bytes"#)]
-async fn given_inline_threshold(_w: &mut KisekiWorld, _bytes: u64) {
-    // No-op at @unit tier — inline threshold configuration is a precondition.
+async fn given_inline_threshold(w: &mut KisekiWorld, bytes: u64) {
+    // Apply the threshold to shard-alpha so the next inline append is
+    // unambiguously below the per-shard limit (ADR-030).
+    let sid = w.ensure_shard("shard-alpha");
+    let mut cfg = kiseki_log::shard::ShardConfig::default();
+    cfg.inline_threshold_bytes = bytes;
+    w.log_store.set_shard_config(sid, cfg);
 }
 
 #[then("the delta is committed with inline data in the payload")]
 async fn then_inline_committed(w: &mut KisekiWorld) {
     assert!(w.last_error.is_none(), "error: {:?}", w.last_error);
+    let delta = w.last_delta.as_ref().expect("last delta should be set");
+    assert!(
+        delta.header.has_inline_data,
+        "delta header must mark inline payload"
+    );
+    assert!(
+        !delta.payload.ciphertext.is_empty(),
+        "inline payload must be present in committed delta"
+    );
 }
 
 #[then(regex = r#"^the payload is offloaded to small/objects.redb on apply"#)]
-async fn then_payload_offloaded(_w: &mut KisekiWorld) {
-    todo!("verify payload is offloaded to small/objects.redb on apply")
+async fn then_payload_offloaded(w: &mut KisekiWorld) {
+    let key = w.last_inline_key.expect("inline key recorded by When step");
+    // Disambiguate from the inherent ChunkId-based get via the trait.
+    let stored = <kiseki_chunk::SmallObjectStore as kiseki_common::inline_store::InlineStore>::get(
+        &w.inline_store,
+        &key,
+    )
+    .expect("inline store get must not error");
+    assert!(
+        stored.is_some(),
+        "payload must be offloaded to small/objects.redb (key={:02x?})",
+        &key[..4]
+    );
 }
 
 #[then("no separate chunk write is required")]
-async fn then_no_chunk_write(_w: &mut KisekiWorld) {
-    todo!("verify no separate chunk write occurred for inline data")
+async fn then_no_chunk_write(w: &mut KisekiWorld) {
+    let delta = w.last_delta.as_ref().expect("last delta should be set");
+    assert!(
+        delta.header.chunk_refs.is_empty(),
+        "inline-only delta must carry no chunk_refs (got {})",
+        delta.header.chunk_refs.len()
+    );
 }
 
 // === Scenario 1: Successful delta append ===
@@ -75,13 +105,49 @@ async fn given_healthy(w: &mut KisekiWorld, name: String) {
 }
 
 #[when("the Composition context appends a delta with:")]
-async fn when_append_table(w: &mut KisekiWorld) {
+async fn when_append_table(w: &mut KisekiWorld, step: &cucumber::gherkin::Step) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let req = w.make_append_request(sid, 0x50);
+    let mut req = w.make_append_request(sid, 0x50);
+
+    // Inspect the data table — if it mentions "inline data" in the
+    // encrypted_payload row, mark the request as carrying inline data
+    // and shrink the payload below the default threshold.
+    if let Some(table) = step.table.as_ref() {
+        for row in &table.rows {
+            if row.len() >= 2 {
+                let field = row[0].trim();
+                let value = row[1].trim();
+                if field == "encrypted_payload" && value.contains("inline data") {
+                    req.has_inline_data = true;
+                    req.payload = vec![0xCD; 1024];
+                    req.chunk_refs = vec![];
+                }
+            }
+        }
+    }
+
+    let key = req.hashed_key;
+    let inline = req.has_inline_data;
+
     match w.log_store.append_delta(req).await {
         Ok(seq) => {
             w.last_sequence = Some(seq);
             w.last_error = None;
+            if inline {
+                w.last_inline_key = Some(key);
+            }
+            // Capture the just-appended delta for downstream Then steps.
+            if let Ok(deltas) = w
+                .log_store
+                .read_deltas(kiseki_log::traits::ReadDeltasRequest {
+                    shard_id: sid,
+                    from: seq,
+                    to: seq,
+                })
+                .await
+            {
+                w.last_delta = deltas.into_iter().next();
+            }
         }
         Err(e) => {
             w.last_error = Some(e.to_string());

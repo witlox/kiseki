@@ -39,6 +39,7 @@ fn to_status(e: &LogError) -> Status {
         | LogError::Unavailable => Status::unavailable(e.to_string()),
         LogError::KeyOutOfRange(_) => Status::out_of_range(e.to_string()),
         LogError::InvalidRange(_) => Status::invalid_argument(e.to_string()),
+        LogError::Io(_) => Status::internal(e.to_string()),
     }
 }
 

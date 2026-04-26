@@ -183,6 +183,16 @@ pub struct KisekiWorld {
 
     // === Raft test cluster (ADR-037) ===
     pub raft_cluster: Option<kiseki_log::raft::test_cluster::RaftTestCluster>,
+
+    // === Inline store (ADR-030, I-SF5) ===
+    pub inline_store: Arc<kiseki_chunk::SmallObjectStore>,
+    /// Owns the redb file backing `inline_store` for this scenario.
+    pub inline_temp_dir: Option<tempfile::TempDir>,
+    /// Hashed key of the most recent inline-payload delta — set by step
+    /// definitions that need to verify offload.
+    pub last_inline_key: Option<[u8; 32]>,
+    /// Most recent appended delta (for inline-data assertions).
+    pub last_delta: Option<kiseki_log::delta::Delta>,
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -198,6 +208,18 @@ impl KisekiWorld {
     fn new() -> Self {
         let key_store = MemKeyStore::new().unwrap_or_else(|_| MemKeyStore::default());
         let log_store = Arc::new(MemShardStore::new());
+
+        // Inline store (ADR-030): redb-backed small_object store wired into
+        // the log store so deltas with has_inline_data=true are offloaded
+        // on apply (I-SF5). Per-scenario tempdir keeps tests hermetic.
+        let inline_temp_dir = tempfile::tempdir().expect("tempdir for inline small_object store");
+        let inline_store = Arc::new(
+            kiseki_chunk::SmallObjectStore::open(&inline_temp_dir.path().join("objects.redb"))
+                .expect("open small_object store"),
+        );
+        let _ = log_store.set_inline_store(
+            Arc::clone(&inline_store) as Arc<dyn kiseki_common::inline_store::InlineStore>
+        );
         let comp_store = CompositionStore::new()
             .with_log(Arc::clone(&log_store) as Arc<dyn LogOps + Send + Sync>);
 
@@ -342,6 +364,10 @@ impl KisekiWorld {
             block_temp_dir: None,
             block_scrub_report: None,
             raft_cluster: None,
+            inline_store,
+            inline_temp_dir: Some(inline_temp_dir),
+            last_inline_key: None,
+            last_delta: None,
         }
     }
 

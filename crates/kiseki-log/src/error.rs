@@ -46,6 +46,10 @@ pub enum LogError {
     /// Raft unavailable (bootstrap, leader election, or consensus failure).
     #[error("raft unavailable")]
     Unavailable,
+
+    /// Backing I/O failure (inline store, persistent log, etc.).
+    #[error("log I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<LogError> for KisekiError {
@@ -70,6 +74,9 @@ impl From<LogError> for KisekiError {
             LogError::Unavailable => {
                 KisekiError::Retriable(RetriableError::ShardUnavailable(ShardId(uuid::Uuid::nil())))
             }
+            LogError::Io(e) => KisekiError::Permanent(PermanentError::InvariantViolation(format!(
+                "log I/O error: {e}"
+            ))),
         }
     }
 }

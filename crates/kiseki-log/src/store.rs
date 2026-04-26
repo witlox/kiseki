@@ -8,9 +8,10 @@
 //! mutations go through the consensus layer).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
+use kiseki_common::inline_store::InlineStore;
 
 use crate::delta::{Delta, DeltaHeader, DeltaPayload};
 use crate::error::LogError;
@@ -33,6 +34,9 @@ struct MemShard {
 /// Interior mutability via `Mutex` matches the `&self` `LogOps` trait.
 pub struct MemShardStore {
     shards: Mutex<HashMap<ShardId, MemShard>>,
+    /// Optional inline store — when set, deltas with `has_inline_data: true`
+    /// have their payload offloaded on apply (I-SF5, ADR-030).
+    inline_store: OnceLock<Arc<dyn InlineStore>>,
 }
 
 impl MemShardStore {
@@ -41,7 +45,18 @@ impl MemShardStore {
     pub fn new() -> Self {
         Self {
             shards: Mutex::new(HashMap::new()),
+            inline_store: OnceLock::new(),
         }
+    }
+
+    /// Attach an inline store. Subsequent `append_delta` calls with
+    /// `has_inline_data: true` will offload payloads via `InlineStore::put`.
+    /// Returns `Err` with the supplied store if one was already attached.
+    pub fn set_inline_store(
+        &self,
+        store: Arc<dyn InlineStore>,
+    ) -> Result<(), Arc<dyn InlineStore>> {
+        self.inline_store.set(store)
     }
 
     /// Create a new shard with the given parameters.
@@ -302,6 +317,26 @@ impl LogOps for MemShardStore {
         shard.info.delta_count += 1;
         shard.info.byte_size += u64::from(payload_size) + 128;
         shard.deltas.push(delta);
+
+        // I-SF5 / ADR-030: offload inline payloads on apply.
+        if req.has_inline_data {
+            if let Some(inline) = self.inline_store.get() {
+                // Drop the shard lock before calling into the inline store —
+                // SmallObjectStore takes its own lock and we don't want a
+                // shard-vs-inline deadlock under contention.
+                let key = req.hashed_key;
+                let payload = shard
+                    .deltas
+                    .last()
+                    .expect("just pushed")
+                    .payload
+                    .ciphertext
+                    .clone();
+                drop(shards);
+                inline.put(&key, &payload).map_err(LogError::Io)?;
+                return Ok(next_seq);
+            }
+        }
 
         Ok(next_seq)
     }
@@ -823,5 +858,59 @@ mod tests {
             .await
             .expect("8KB delta should succeed");
         assert_eq!(seq2, SequenceNumber(2));
+    }
+
+    /// I-SF5 / ADR-030: when an inline store is attached, deltas with
+    /// `has_inline_data: true` have their payload offloaded on apply.
+    #[derive(Default)]
+    struct CapturingInline {
+        puts: std::sync::Mutex<Vec<([u8; 32], Vec<u8>)>>,
+    }
+    impl InlineStore for CapturingInline {
+        fn put(&self, k: &[u8; 32], data: &[u8]) -> std::io::Result<bool> {
+            self.puts.lock().unwrap().push((*k, data.to_vec()));
+            Ok(true)
+        }
+        fn get(&self, _k: &[u8; 32]) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn delete(&self, _k: &[u8; 32]) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn append_delta_offloads_inline_payload_on_apply() {
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(2));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(101));
+        let node_id = NodeId(1);
+        store.create_shard(shard_id, tenant_id, node_id, ShardConfig::default());
+
+        let inline = Arc::new(CapturingInline::default());
+        store
+            .set_inline_store(Arc::clone(&inline) as Arc<dyn InlineStore>)
+            .map_err(|_| ())
+            .expect("inline store can be set once");
+
+        let req = AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation: OperationType::Create,
+            timestamp: test_timestamp(),
+            hashed_key: [0x11u8; 32],
+            chunk_refs: vec![],
+            payload: vec![0xCD; 1024],
+            has_inline_data: true,
+        };
+        store
+            .append_delta(req)
+            .await
+            .expect("inline delta should succeed");
+
+        let puts = inline.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1, "inline store must receive one put");
+        assert_eq!(puts[0].0, [0x11u8; 32], "key matches hashed_key");
+        assert_eq!(puts[0].1.len(), 1024, "payload offloaded verbatim");
     }
 }
