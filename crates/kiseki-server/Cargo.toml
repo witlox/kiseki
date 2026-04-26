@@ -33,8 +33,17 @@ kiseki-client = { workspace = true }
 kiseki-advisory = { workspace = true }
 kiseki-control = { workspace = true }
 kiseki-proto = { workspace = true }
+async-trait = { workspace = true }
+aws-lc-rs = { workspace = true }
 axum = "0.7"
 hyper = { version = "1", features = ["server", "http1"] }
+# Phase 14d: HTTP client for S3-compatible backup backend (ADR-016).
+# Uses our existing rustls + aws-lc-rs stack — no new crypto deps,
+# matches the FIPS posture used for TLS elsewhere.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-manual-roots-no-provider",
+] }
+rustls = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }

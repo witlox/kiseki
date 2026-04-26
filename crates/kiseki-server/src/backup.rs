@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use async_trait::async_trait;
 use tar::{Archive, Builder, Header};
 
 // ---------------------------------------------------------------------------
@@ -37,25 +38,30 @@ use tar::{Archive, Builder, Header};
 
 /// Storage backend for backup snapshots. Implemented by
 /// [`FileSystemBackupBackend`] (local directory) and `S3BackupBackend`
-/// (S3-compatible object store). Production callers wire one or the
-/// other into [`BackupManager`] via [`BackupManager::new`].
+/// (S3-compatible object store, in `backup_s3` module). Production
+/// callers wire one or the other into [`BackupManager`] via
+/// [`BackupManager::new`].
 ///
 /// The interface is a deliberate minimum — no presigned URLs, no
 /// multipart, no streaming. Snapshots are assumed to be small enough
 /// to fit comfortably in memory; if that ever stops being true, add
 /// streaming put/get without breaking this trait.
+///
+/// Async because the production impl is S3 (HTTP). The filesystem impl
+/// happens to be cheap-sync but exposes async to keep one trait shape.
+#[async_trait]
 pub trait ObjectBackupBackend: Send + Sync {
     /// Store `bytes` at `key`, replacing any existing value.
-    fn put_blob(&self, key: &str, bytes: &[u8]) -> io::Result<()>;
+    async fn put_blob(&self, key: &str, bytes: &[u8]) -> io::Result<()>;
 
     /// Retrieve the bytes at `key`. Returns `None` if no such key.
-    fn get_blob(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
+    async fn get_blob(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
 
     /// List every key whose name starts with `prefix`. Order unspecified.
-    fn list_keys(&self, prefix: &str) -> io::Result<Vec<String>>;
+    async fn list_keys(&self, prefix: &str) -> io::Result<Vec<String>>;
 
     /// Delete `key`. Returns `true` if the key existed, `false` otherwise.
-    fn delete_blob(&self, key: &str) -> io::Result<bool>;
+    async fn delete_blob(&self, key: &str) -> io::Result<bool>;
 }
 
 // ---------------------------------------------------------------------------
@@ -82,8 +88,9 @@ impl FileSystemBackupBackend {
     }
 }
 
+#[async_trait]
 impl ObjectBackupBackend for FileSystemBackupBackend {
-    fn put_blob(&self, key: &str, bytes: &[u8]) -> io::Result<()> {
+    async fn put_blob(&self, key: &str, bytes: &[u8]) -> io::Result<()> {
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -91,7 +98,7 @@ impl ObjectBackupBackend for FileSystemBackupBackend {
         std::fs::write(&path, bytes)
     }
 
-    fn get_blob(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+    async fn get_blob(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         let path = self.path_for(key);
         match std::fs::read(&path) {
             Ok(b) => Ok(Some(b)),
@@ -100,7 +107,7 @@ impl ObjectBackupBackend for FileSystemBackupBackend {
         }
     }
 
-    fn list_keys(&self, prefix: &str) -> io::Result<Vec<String>> {
+    async fn list_keys(&self, prefix: &str) -> io::Result<Vec<String>> {
         // The prefix may name an existing directory or be a path
         // fragment. Walk the root and filter — simpler than splitting.
         let mut keys = Vec::new();
@@ -108,7 +115,7 @@ impl ObjectBackupBackend for FileSystemBackupBackend {
         Ok(keys.into_iter().filter(|k| k.starts_with(prefix)).collect())
     }
 
-    fn delete_blob(&self, key: &str) -> io::Result<bool> {
+    async fn delete_blob(&self, key: &str) -> io::Result<bool> {
         let path = self.path_for(key);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
@@ -232,7 +239,10 @@ impl BackupManager {
     /// return the descriptor.
     ///
     /// Concurrent calls are rejected with [`BackupError::InProgress`].
-    pub fn create_snapshot(&self, shards: &[ShardSnapshot]) -> Result<BackupSnapshot, BackupError> {
+    pub async fn create_snapshot(
+        &self,
+        shards: &[ShardSnapshot],
+    ) -> Result<BackupSnapshot, BackupError> {
         if self
             .in_progress
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -240,12 +250,15 @@ impl BackupManager {
         {
             return Err(BackupError::InProgress);
         }
-        let result = self.do_create_snapshot(shards);
+        let result = self.do_create_snapshot(shards).await;
         self.in_progress.store(false, Ordering::SeqCst);
         result
     }
 
-    fn do_create_snapshot(&self, shards: &[ShardSnapshot]) -> Result<BackupSnapshot, BackupError> {
+    async fn do_create_snapshot(
+        &self,
+        shards: &[ShardSnapshot],
+    ) -> Result<BackupSnapshot, BackupError> {
         let start = Instant::now();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -289,8 +302,10 @@ impl BackupManager {
 
         // Write tarball first; if that fails the manifest never lands,
         // so list_snapshots won't surface a half-written snapshot.
-        self.backend.put_blob(&tarball_key, &tarball)?;
-        self.backend.put_blob(&manifest_key, manifest.as_bytes())?;
+        self.backend.put_blob(&tarball_key, &tarball).await?;
+        self.backend
+            .put_blob(&manifest_key, manifest.as_bytes())
+            .await?;
 
         Ok(BackupSnapshot {
             snapshot_id,
@@ -308,11 +323,15 @@ impl BackupManager {
     /// `<shard>.meta.json` (and `<shard>.data` when `include_data` was
     /// set at create time), and returns a `ShardSnapshot` per recovered
     /// shard.
-    pub fn restore_snapshot(&self, snapshot_id: &str) -> Result<Vec<ShardSnapshot>, BackupError> {
+    pub async fn restore_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<ShardSnapshot>, BackupError> {
         let key = format!("{snapshot_id}/snapshot.tar");
         let bytes = self
             .backend
-            .get_blob(&key)?
+            .get_blob(&key)
+            .await?
             .ok_or_else(|| BackupError::SnapshotNotFound(snapshot_id.to_owned()))?;
 
         let mut shards: BTreeMap<String, ShardSnapshot> = BTreeMap::new();
@@ -358,8 +377,8 @@ impl BackupManager {
     }
 
     /// List every snapshot known to the backend.
-    pub fn list_snapshots(&self) -> Vec<BackupSnapshot> {
-        let Ok(keys) = self.backend.list_keys("") else {
+    pub async fn list_snapshots(&self) -> Vec<BackupSnapshot> {
+        let Ok(keys) = self.backend.list_keys("").await else {
             return Vec::new();
         };
         let mut snapshots = Vec::new();
@@ -367,7 +386,7 @@ impl BackupManager {
             if !key.ends_with("/manifest.json") {
                 continue;
             }
-            let Ok(Some(raw)) = self.backend.get_blob(&key) else {
+            let Ok(Some(raw)) = self.backend.get_blob(&key).await else {
                 continue;
             };
             let Ok(s) = std::str::from_utf8(&raw) else {
@@ -381,11 +400,11 @@ impl BackupManager {
     }
 
     /// Delete a snapshot by id.
-    pub fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), BackupError> {
+    pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), BackupError> {
         let manifest_key = format!("{snapshot_id}/manifest.json");
         let tarball_key = format!("{snapshot_id}/snapshot.tar");
-        let existed_m = self.backend.delete_blob(&manifest_key)?;
-        let existed_t = self.backend.delete_blob(&tarball_key)?;
+        let existed_m = self.backend.delete_blob(&manifest_key).await?;
+        let existed_t = self.backend.delete_blob(&tarball_key).await?;
         if !existed_m && !existed_t {
             return Err(BackupError::SnapshotNotFound(snapshot_id.to_owned()));
         }
@@ -395,13 +414,13 @@ impl BackupManager {
     /// Delete every snapshot whose `created_at` is older than
     /// `retention_days`. Returns the number deleted. `retention_days == 0`
     /// means "delete every snapshot" (useful for tear-down).
-    pub fn cleanup_old(&self, retention_days: u32) -> usize {
+    pub async fn cleanup_old(&self, retention_days: u32) -> usize {
         let now_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let snapshots = self.list_snapshots();
+        let snapshots = self.list_snapshots().await;
         let mut deleted = 0;
         for snap in snapshots {
             let should_delete = if retention_days == 0 {
@@ -410,7 +429,7 @@ impl BackupManager {
                 parse_iso_epoch(&snap.created_at)
                     .is_some_and(|c| c + u64::from(retention_days) * 86_400 < now_secs)
             };
-            if should_delete && self.delete_snapshot(&snap.snapshot_id).is_ok() {
+            if should_delete && self.delete_snapshot(&snap.snapshot_id).await.is_ok() {
                 deleted += 1;
             }
         }
@@ -618,8 +637,9 @@ mod tests {
     #[derive(Default)]
     struct InMemoryBackend(Mutex<HashMap<String, Vec<u8>>>);
 
+    #[async_trait]
     impl ObjectBackupBackend for InMemoryBackend {
-        fn put_blob(&self, key: &str, bytes: &[u8]) -> io::Result<()> {
+        async fn put_blob(&self, key: &str, bytes: &[u8]) -> io::Result<()> {
             self.0
                 .lock()
                 .unwrap()
@@ -627,11 +647,11 @@ mod tests {
             Ok(())
         }
 
-        fn get_blob(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        async fn get_blob(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
             Ok(self.0.lock().unwrap().get(key).cloned())
         }
 
-        fn list_keys(&self, prefix: &str) -> io::Result<Vec<String>> {
+        async fn list_keys(&self, prefix: &str) -> io::Result<Vec<String>> {
             Ok(self
                 .0
                 .lock()
@@ -642,17 +662,17 @@ mod tests {
                 .collect())
         }
 
-        fn delete_blob(&self, key: &str) -> io::Result<bool> {
+        async fn delete_blob(&self, key: &str) -> io::Result<bool> {
             Ok(self.0.lock().unwrap().remove(key).is_some())
         }
     }
 
-    #[test]
-    fn create_snapshot_writes_tarball_and_manifest() {
+    #[tokio::test]
+    async fn create_snapshot_writes_tarball_and_manifest() {
         let (_tmp, backend) = fs_backend();
         let mgr = BackupManager::new(backend, config(true));
 
-        let snap = mgr.create_snapshot(&sample_shards()).unwrap();
+        let snap = mgr.create_snapshot(&sample_shards()).await.unwrap();
         assert_eq!(snap.shard_count, 2);
         assert!(snap.metadata_bytes > 0);
         assert!(
@@ -663,13 +683,13 @@ mod tests {
         assert!(snap.manifest_key.ends_with("/manifest.json"));
     }
 
-    #[test]
-    fn restore_recovers_every_shard_metadata_and_data() {
+    #[tokio::test]
+    async fn restore_recovers_every_shard_metadata_and_data() {
         let (_tmp, backend) = fs_backend();
         let mgr = BackupManager::new(backend, config(true));
-        let snap = mgr.create_snapshot(&sample_shards()).unwrap();
+        let snap = mgr.create_snapshot(&sample_shards()).await.unwrap();
 
-        let restored = mgr.restore_snapshot(&snap.snapshot_id).unwrap();
+        let restored = mgr.restore_snapshot(&snap.snapshot_id).await.unwrap();
         assert_eq!(restored.len(), 2);
         let by_id: HashMap<&str, &ShardSnapshot> =
             restored.iter().map(|s| (s.shard_id.as_str(), s)).collect();
@@ -679,64 +699,68 @@ mod tests {
         assert_eq!(by_id["shard-2"].data.as_deref().unwrap(), b"chunk-data");
     }
 
-    #[test]
-    fn restore_unknown_snapshot_id_returns_not_found() {
+    #[tokio::test]
+    async fn restore_unknown_snapshot_id_returns_not_found() {
         let (_tmp, backend) = fs_backend();
         let mgr = BackupManager::new(backend, config(false));
-        let err = mgr.restore_snapshot("nope").unwrap_err();
+        let err = mgr.restore_snapshot("nope").await.unwrap_err();
         assert!(matches!(err, BackupError::SnapshotNotFound(_)));
     }
 
-    #[test]
-    fn list_snapshots_finds_created_via_manifest() {
+    #[tokio::test]
+    async fn list_snapshots_finds_created_via_manifest() {
         let (_tmp, backend) = fs_backend();
         let mgr = BackupManager::new(backend, config(false));
-        let snap = mgr.create_snapshot(&sample_shards()).unwrap();
-        let list = mgr.list_snapshots();
+        let snap = mgr.create_snapshot(&sample_shards()).await.unwrap();
+        let list = mgr.list_snapshots().await;
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].snapshot_id, snap.snapshot_id);
     }
 
-    #[test]
-    fn delete_snapshot_removes_both_blobs() {
+    #[tokio::test]
+    async fn delete_snapshot_removes_both_blobs() {
         let (_tmp, backend_arc) = fs_backend();
         let backend = Arc::clone(&backend_arc);
         let mgr = BackupManager::new(backend_arc, config(false));
-        let snap = mgr.create_snapshot(&sample_shards()).unwrap();
-        mgr.delete_snapshot(&snap.snapshot_id).unwrap();
-        assert!(backend.get_blob(&snap.tarball_key).unwrap().is_none());
-        assert!(backend.get_blob(&snap.manifest_key).unwrap().is_none());
+        let snap = mgr.create_snapshot(&sample_shards()).await.unwrap();
+        mgr.delete_snapshot(&snap.snapshot_id).await.unwrap();
+        assert!(backend.get_blob(&snap.tarball_key).await.unwrap().is_none());
+        assert!(backend
+            .get_blob(&snap.manifest_key)
+            .await
+            .unwrap()
+            .is_none());
     }
 
-    #[test]
-    fn cleanup_removes_expired_snapshots() {
+    #[tokio::test]
+    async fn cleanup_removes_expired_snapshots() {
         let (_tmp, backend) = fs_backend();
         let mgr = BackupManager::new(backend, config(false));
-        mgr.create_snapshot(&sample_shards()).unwrap();
+        mgr.create_snapshot(&sample_shards()).await.unwrap();
         // retention=0 → everything is "old".
-        let deleted = mgr.cleanup_old(0);
+        let deleted = mgr.cleanup_old(0).await;
         assert_eq!(deleted, 1);
     }
 
-    #[test]
-    fn concurrent_backup_rejected() {
+    #[tokio::test]
+    async fn concurrent_backup_rejected() {
         let (_tmp, backend) = fs_backend();
         let mgr = BackupManager::new(backend, config(false));
         mgr.in_progress.store(true, Ordering::SeqCst);
-        let res = mgr.create_snapshot(&sample_shards());
+        let res = mgr.create_snapshot(&sample_shards()).await;
         assert!(matches!(res, Err(BackupError::InProgress)));
         mgr.in_progress.store(false, Ordering::SeqCst);
-        assert!(mgr.create_snapshot(&sample_shards()).is_ok());
+        assert!(mgr.create_snapshot(&sample_shards()).await.is_ok());
     }
 
     /// Same `BackupManager` works against an in-memory backend with no
     /// changes — proves the trait actually isolates the storage layer.
-    #[test]
-    fn in_memory_backend_round_trip() {
+    #[tokio::test]
+    async fn in_memory_backend_round_trip() {
         let backend: Arc<dyn ObjectBackupBackend> = Arc::new(InMemoryBackend::default());
         let mgr = BackupManager::new(backend, config(true));
-        let snap = mgr.create_snapshot(&sample_shards()).unwrap();
-        let restored = mgr.restore_snapshot(&snap.snapshot_id).unwrap();
+        let snap = mgr.create_snapshot(&sample_shards()).await.unwrap();
+        let restored = mgr.restore_snapshot(&snap.snapshot_id).await.unwrap();
         assert_eq!(restored.len(), 2);
     }
 }

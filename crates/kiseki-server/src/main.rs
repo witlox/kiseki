@@ -13,6 +13,7 @@
 
 pub(crate) mod admin;
 pub(crate) mod backup;
+pub(crate) mod backup_s3;
 pub(crate) mod cli;
 mod config;
 mod integrity;
