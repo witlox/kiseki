@@ -436,6 +436,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
     let key_svc = KeyManagerServiceServer::new(KeyManagerGrpc::new(key_store));
     let log_svc = LogServiceServer::new(LogGrpc::new(log_store));
+    let admin_svc = kiseki_proto::v1::admin_service_server::AdminServiceServer::new(
+        crate::admin_grpc::AdminGrpc::from_runtime(),
+    );
 
     let mut builder = tonic::transport::Server::builder();
 
@@ -462,6 +465,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         .add_service(control_svc)
         .add_service(key_svc)
         .add_service(log_svc)
+        .add_service(admin_svc)
         .serve_with_shutdown(cfg.data_addr, shutdown)
         .await?;
 

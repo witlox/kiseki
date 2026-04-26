@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package kiseki.v1;
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+// --- Admin Service ---
+//
+// Cluster-admin operations exposed over gRPC for the `kiseki-admin`
+// CLI (and any other operator tooling). Disjoint from ControlService:
+// ControlService is tenant-facing (org/project/workload lifecycle);
+// AdminService is operator-facing (snapshots, maintenance, etc.).
+//
+// ADR-016: external backup is optional. When backups are not configured
+// the service surfaces an UNAVAILABLE status code so the CLI can print
+// a useful message instead of failing opaquely.
+
+service AdminService {
+  // Backup / restore (ADR-016)
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc RestoreSnapshot(RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+}
+
+// --- Snapshot messages ---
+
+message CreateSnapshotRequest {
+  // Reserved for future filtering (e.g. shard subset). Empty = all shards.
+}
+
+message CreateSnapshotResponse {
+  string snapshot_id = 1;
+  uint64 metadata_bytes = 2;
+  uint64 data_bytes = 3;
+  uint64 shard_count = 4;
+  string created_at = 5;       // ISO 8601
+  uint64 elapsed_millis = 6;
+}
+
+message RestoreSnapshotRequest {
+  string snapshot_id = 1;
+}
+
+message RestoreSnapshotResponse {
+  uint64 shard_count = 1;
+}
+
+message ListSnapshotsRequest {
+  // Reserved for future paging.
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message SnapshotInfo {
+  string snapshot_id = 1;
+  uint64 metadata_bytes = 2;
+  uint64 data_bytes = 3;
+  uint64 shard_count = 4;
+  string created_at = 5;
+}

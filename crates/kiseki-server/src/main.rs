@@ -12,6 +12,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 pub(crate) mod admin;
+pub(crate) mod admin_grpc;
 pub(crate) mod backup;
 pub(crate) mod backup_s3;
 pub(crate) mod cli;
