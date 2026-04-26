@@ -272,6 +272,16 @@ pub struct KisekiWorld {
     /// Background task hosting the in-process mock S3 server, dropped
     /// when the World is dropped to keep tests hermetic.
     pub backup_s3_task: Option<tokio::task::JoinHandle<()>>,
+
+    // === Raft perf instrumentation (Phase 14f) ===
+    /// Per-write latency for the most-recent batch of sequential writes.
+    /// Populated by the perf When step, read by the Then assertion.
+    pub raft_write_latencies: Vec<std::time::Duration>,
+    /// Throughput observation: (operations, wall_clock).
+    /// Set by the throughput When step, read by the Then assertion.
+    pub raft_throughput: Option<(usize, std::time::Duration)>,
+    /// Single-shard throughput baseline for the 10× comparison.
+    pub raft_single_shard_throughput: Option<(usize, std::time::Duration)>,
 }
 
 impl Drop for KisekiWorld {
@@ -512,6 +522,9 @@ impl KisekiWorld {
             last_snapshot_listing: Vec::new(),
             last_backup_error: None,
             backup_s3_task: None,
+            raft_write_latencies: Vec::new(),
+            raft_throughput: None,
+            raft_single_shard_throughput: None,
             telemetry_bus,
             kms_providers,
             persistent_shard_store: None,

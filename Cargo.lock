@@ -1547,6 +1547,7 @@ version = "2026.1.0"
 dependencies = [
  "axum 0.7.9",
  "cucumber",
+ "futures",
  "kiseki-advisory",
  "kiseki-audit",
  "kiseki-backup",
