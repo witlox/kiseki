@@ -806,8 +806,27 @@ async fn when_node1_unreachable(w: &mut KisekiWorld, _shard: String) {
 }
 
 #[when("node-1 sends a heartbeat to node-2")]
-async fn when_heartbeat(_w: &mut KisekiWorld) {
-    todo!("needs transport-level message inspection hook in TestRouter")
+async fn when_heartbeat(w: &mut KisekiWorld) {
+    // The in-process cluster uses mpsc channels for transport, not real
+    // TCP+TLS — there's nothing to inspect on the wire. The behavioural
+    // proof we *can* assert is "a leader-driven message reaches the
+    // follower's state machine". Issuing a write through the leader
+    // fans out as an AppendEntries; if it commits, the heartbeat path
+    // is alive end-to-end. The follow-up Then-steps (TLS-encrypted,
+    // certificate validation) are covered by `kiseki-transport` unit
+    // tests against the real TLS stack.
+    let c = cluster(w);
+    let _ = c
+        .write_delta(0xF0)
+        .await
+        .expect("AppendEntries-bearing write should commit");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // node-2 receives the entry — proof that messages flowed leader → follower.
+    let n2 = c.read_from(2).await;
+    assert!(
+        !n2.is_empty(),
+        "node-2 must observe leader-originated entries (heartbeat path alive)"
+    );
 }
 
 // === Missing step definitions for multi-node-raft.feature ===
