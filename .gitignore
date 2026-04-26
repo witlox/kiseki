@@ -23,6 +23,9 @@
 .env
 .env.*
 
+# Local Claude Code session state (per-machine, never committed)
+.claude/scheduled_tasks.lock
+
 # Keys and secrets
 *.pem
 *.key
