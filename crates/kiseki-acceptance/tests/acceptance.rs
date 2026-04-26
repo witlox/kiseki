@@ -188,6 +188,17 @@ pub struct KisekiWorld {
     // === Raft test cluster (ADR-037) ===
     pub raft_cluster: Option<kiseki_log::raft::test_cluster::RaftTestCluster>,
 
+    // === TCP transport endpoints (ADR-022) ===
+    /// Gateway name → bound TCP address (started on demand by step defs).
+    pub tcp_endpoints: HashMap<String, std::net::SocketAddr>,
+
+    // === Telemetry bus (ADR-021, I-WA5) ===
+    pub telemetry_bus: Arc<kiseki_advisory::TelemetryBus>,
+    /// Receivers cached per workload so subsequent Then steps can drain.
+    pub backpressure_subs:
+        HashMap<String, tokio::sync::mpsc::Receiver<kiseki_advisory::BackpressureEvent>>,
+    pub qos_subs: HashMap<String, tokio::sync::mpsc::Receiver<kiseki_advisory::QosHeadroomBucket>>,
+
     // === Inline store (ADR-030, I-SF5) ===
     pub inline_store: Arc<kiseki_chunk::SmallObjectStore>,
     /// Owns the redb file backing `inline_store` for this scenario.
@@ -374,6 +385,10 @@ impl KisekiWorld {
             inline_temp_dir: Some(inline_temp_dir),
             last_inline_key: None,
             last_delta: None,
+            telemetry_bus: Arc::new(kiseki_advisory::TelemetryBus::new()),
+            backpressure_subs: HashMap::new(),
+            qos_subs: HashMap::new(),
+            tcp_endpoints: HashMap::new(),
         }
     }
 

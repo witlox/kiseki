@@ -1519,6 +1519,7 @@ dependencies = [
 name = "kiseki-acceptance"
 version = "2026.1.0"
 dependencies = [
+ "axum 0.7.9",
  "cucumber",
  "kiseki-advisory",
  "kiseki-audit",

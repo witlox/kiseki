@@ -1188,12 +1188,17 @@ async fn then_same_shape(_w: &mut KisekiWorld) {
     todo!()
 }
 
-// QoS-headroom telemetry
+// QoS-headroom telemetry — When/Then for "QoS-headroom telemetry caller-scoped"
+// live in steps/gateway.rs. This Given subscribes the workload through the
+// shared TelemetryBus so the gateway-side steps observe an active subscription.
 #[given(regex = r#"^workload "(\S+)" is subscribed to QoS-headroom telemetry$"#)]
-async fn given_qos_sub(_w: &mut KisekiWorld, _wl: String) {
-    todo!("subscribe workload to QoS-headroom telemetry")
+async fn given_qos_sub(w: &mut KisekiWorld, wl: String) {
+    let rx = w.telemetry_bus.subscribe_qos_headroom(&wl);
+    w.qos_subs.insert(wl, rx);
 }
 
+// "shard-saturation telemetry" scenario: kept as no-op until that scenario
+// is wired (separate plan item).
 #[when(regex = r#"^the caller queries QoS-headroom for "(\S+)"$"#)]
 async fn when_qos_query(_w: &mut KisekiWorld, _shard: String) {
     todo!("query QoS-headroom for the shard")

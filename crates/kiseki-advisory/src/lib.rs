@@ -22,6 +22,7 @@ pub mod lookup;
 pub mod policy;
 pub mod stream;
 pub mod telemetry;
+pub mod telemetry_bus;
 pub mod workflow;
 
 pub use budget::BudgetEnforcer;
@@ -31,5 +32,8 @@ pub use policy::{AdvisoryState, ProfileAllowList, WorkloadPolicy};
 pub use telemetry::{
     AuditCorrelation, BackpressureSeverity, ContentionLevel, LocalityClass, OwnHotspotEvent,
     PhaseSummaryEvent, StreamWarningKind, TelemetryChannel, TelemetryResponse,
+};
+pub use telemetry_bus::{
+    bucket_retry_after_ms, BackpressureEvent, QosHeadroomBucket, TelemetryBus,
 };
 pub use workflow::{WorkflowEntry, WorkflowTable};
