@@ -5,11 +5,12 @@
 //! leader election triggers, and write/read operations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
-use kiseki_raft::{KisekiNode, MemLogStore};
+use kiseki_raft::{KisekiNode, RedbRaftLogStore};
 use openraft::error::RPCError;
 use openraft::type_config::async_runtime::WatchReceiver;
 use openraft::Raft;
@@ -51,6 +52,12 @@ impl TestRouter {
 
     async fn register(&self, node_id: u64, raft: Arc<Raft<C, ShardStateMachine>>) {
         self.nodes.write().await.insert(node_id, raft);
+    }
+
+    /// Remove a node from the router. Used by `crash_node` /
+    /// `restart_node` to drop the Raft instance before rebuilding.
+    async fn deregister(&self, node_id: u64) {
+        self.nodes.write().await.remove(&node_id);
     }
 
     async fn is_blocked(&self, from: u64, to: u64) -> bool {
@@ -180,11 +187,63 @@ impl openraft::network::v2::RaftNetworkV2<C> for TestNetwork {
     }
 }
 
+/// Construct one Raft node backed by a redb log store at `path`. Used
+/// by both `new` and `restart_node` so the construction recipe is
+/// shared and stays in sync across cold start vs. restart paths.
+async fn build_node(
+    id: u64,
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    path: &std::path::Path,
+    router: Arc<TestRouter>,
+) -> Result<RaftTestNode, LogError> {
+    let log_store = RedbRaftLogStore::<C>::open(path).map_err(|_| LogError::Unavailable)?;
+    let sm_inner = Arc::new(futures::lock::Mutex::new(ShardSmInner::new(
+        shard_id, tenant_id,
+    )));
+    let state_machine = ShardStateMachine::new(Arc::clone(&sm_inner));
+    let network = TestNetworkFactory {
+        router: Arc::clone(&router),
+        source_id: id,
+    };
+    let config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 150,
+            election_timeout_max: 300,
+            ..openraft::Config::default()
+        }
+        .validate()
+        .expect("valid config"),
+    );
+    let raft = Raft::new(id, config, network, log_store, state_machine)
+        .await
+        .map_err(|_| LogError::Unavailable)?;
+    let raft = Arc::new(raft);
+    router.register(id, Arc::clone(&raft)).await;
+    Ok(RaftTestNode {
+        raft,
+        state: sm_inner,
+        node_id: id,
+    })
+}
+
 /// In-process multi-node Raft test cluster.
+///
+/// Uses `RedbRaftLogStore` on a per-cluster tempdir so `restart_node()`
+/// can rebuild a Raft instance against the same on-disk state — proves
+/// log persistence end-to-end without an extra cluster variant.
 pub struct RaftTestCluster {
     router: Arc<TestRouter>,
     nodes: HashMap<u64, RaftTestNode>,
     tenant_id: OrgId,
+    shard_id: ShardId,
+    /// Owns the temp directory backing every node's redb log store.
+    /// Dropped with the cluster — files are gone after the test exits.
+    log_dir: tempfile::TempDir,
+    /// Per-node redb file path under `log_dir` so `restart_node` can
+    /// reopen the same state.
+    log_paths: HashMap<u64, PathBuf>,
 }
 
 impl RaftTestCluster {
@@ -194,46 +253,17 @@ impl RaftTestCluster {
     pub async fn new(node_count: u64, shard_id: ShardId, tenant_id: OrgId) -> Self {
         let router = Arc::new(TestRouter::new());
         let mut nodes = HashMap::new();
-
-        // Fast election config for tests.
-        let config = Arc::new(
-            openraft::Config {
-                heartbeat_interval: 50,
-                election_timeout_min: 150,
-                election_timeout_max: 300,
-                ..openraft::Config::default()
-            }
-            .validate()
-            .expect("valid config"),
-        );
+        let mut log_paths = HashMap::new();
+        let log_dir = tempfile::tempdir().expect("tempdir for raft logs");
 
         // Create all nodes.
         for id in 1..=node_count {
-            let log_store = MemLogStore::<C>::default();
-            let sm_inner = Arc::new(futures::lock::Mutex::new(ShardSmInner::new(
-                shard_id, tenant_id,
-            )));
-            let state_machine = ShardStateMachine::new(Arc::clone(&sm_inner));
-            let network = TestNetworkFactory {
-                router: Arc::clone(&router),
-                source_id: id,
-            };
-
-            let raft = Raft::new(id, Arc::clone(&config), network, log_store, state_machine)
+            let path = log_dir.path().join(format!("node-{id}.redb"));
+            log_paths.insert(id, path.clone());
+            let node = build_node(id, shard_id, tenant_id, &path, Arc::clone(&router))
                 .await
-                .expect("raft node creation");
-
-            let raft = Arc::new(raft);
-            router.register(id, Arc::clone(&raft)).await;
-
-            nodes.insert(
-                id,
-                RaftTestNode {
-                    raft,
-                    state: sm_inner,
-                    node_id: id,
-                },
-            );
+                .expect("build node");
+            nodes.insert(id, node);
         }
 
         // Initialize membership on node 1 (seed).
@@ -259,21 +289,33 @@ impl RaftTestCluster {
             router,
             nodes,
             tenant_id,
+            shard_id,
+            log_dir,
+            log_paths,
         }
     }
 
-    /// Get the current leader node ID.
+    /// Get the current leader node ID — the node agreed on by a
+    /// majority of cluster members. An isolated stale leader will not
+    /// pass the majority filter (it can only vote for itself), so this
+    /// matches what a real client would observe after a partition.
     // Async kept for symmetry with other RaftTestCluster RPC-style helpers
     // and because BDD step definitions await it through generic harness code.
     #[allow(clippy::unused_async)]
     pub async fn leader(&self) -> Option<u64> {
-        for (id, node) in &self.nodes {
+        let total = self.nodes.len();
+        let mut votes: HashMap<u64, usize> = HashMap::new();
+        for node in self.nodes.values() {
             let rx = node.raft.metrics();
-            if rx.borrow_watched().current_leader == Some(*id) {
-                return Some(*id);
+            let leader_id = rx.borrow_watched().current_leader;
+            if let Some(lid) = leader_id {
+                *votes.entry(lid).or_insert(0) += 1;
             }
         }
-        None
+        votes
+            .into_iter()
+            .find(|(_, count)| *count * 2 > total)
+            .map(|(id, _)| id)
     }
 
     /// Wait until a leader is elected, with timeout.
@@ -370,32 +412,16 @@ impl RaftTestCluster {
     /// Spawn an additional node and add it as a learner to the cluster.
     /// Returns once the leader has accepted the learner change.
     pub async fn add_learner(&mut self, new_id: u64) -> Result<(), LogError> {
-        // Build the new node identical to existing nodes.
-        let log_store = MemLogStore::<C>::default();
-        let sm_inner = Arc::new(futures::lock::Mutex::new(ShardSmInner::new(
-            ShardId(uuid::Uuid::nil()),
+        let path = self.log_dir.path().join(format!("node-{new_id}.redb"));
+        let node = build_node(
+            new_id,
+            self.shard_id,
             self.tenant_id,
-        )));
-        let state_machine = ShardStateMachine::new(Arc::clone(&sm_inner));
-        let network = TestNetworkFactory {
-            router: Arc::clone(&self.router),
-            source_id: new_id,
-        };
-        let config = Arc::new(
-            openraft::Config {
-                heartbeat_interval: 50,
-                election_timeout_min: 150,
-                election_timeout_max: 300,
-                ..openraft::Config::default()
-            }
-            .validate()
-            .expect("valid config"),
-        );
-        let raft = Raft::new(new_id, config, network, log_store, state_machine)
-            .await
-            .map_err(|_| LogError::Unavailable)?;
-        let raft = Arc::new(raft);
-        self.router.register(new_id, Arc::clone(&raft)).await;
+            &path,
+            Arc::clone(&self.router),
+        )
+        .await?;
+        self.log_paths.insert(new_id, path);
 
         // Tell the leader to add it as a learner.
         let leader_id = self
@@ -412,14 +438,43 @@ impl RaftTestCluster {
             .await
             .map_err(|_| LogError::Unavailable)?;
 
-        self.nodes.insert(
-            new_id,
-            RaftTestNode {
-                raft,
-                state: sm_inner,
-                node_id: new_id,
-            },
-        );
+        self.nodes.insert(new_id, node);
+        Ok(())
+    }
+
+    /// Simulate a crash of `node_id`: tear down the in-memory Raft
+    /// instance but leave the on-disk log store intact. After this,
+    /// peers will see the node as unreachable and `restart_node` can
+    /// bring it back from the persisted state.
+    pub async fn crash_node(&mut self, node_id: u64) -> Result<(), LogError> {
+        let node = self.nodes.remove(&node_id).ok_or(LogError::Unavailable)?;
+        self.router.deregister(node_id).await;
+        // Polite shutdown: openraft cancels its background workers.
+        let _ = node.raft.shutdown().await;
+        // Drop the Arc explicitly so the inner Raft is dropped here.
+        drop(node);
+        Ok(())
+    }
+
+    /// Bring a previously-crashed node back online by reopening its
+    /// on-disk log store and rebuilding the Raft instance. The
+    /// state machine replays from the log — proves the local log
+    /// survives a process restart (Phase 14f).
+    pub async fn restart_node(&mut self, node_id: u64) -> Result<(), LogError> {
+        let path = self
+            .log_paths
+            .get(&node_id)
+            .ok_or(LogError::Unavailable)?
+            .clone();
+        let node = build_node(
+            node_id,
+            self.shard_id,
+            self.tenant_id,
+            &path,
+            Arc::clone(&self.router),
+        )
+        .await?;
+        self.nodes.insert(node_id, node);
         Ok(())
     }
 

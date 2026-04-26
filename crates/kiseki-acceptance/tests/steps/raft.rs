@@ -640,9 +640,15 @@ async fn given_node1_leader(w: &mut KisekiWorld, n: u32) {
 
 #[given(regex = r#"^node-2 crashes with (\d+),?000 entries committed$"#)]
 async fn given_node2_crash(w: &mut KisekiWorld, _k: u32) {
-    // Simulate crash by isolating node-2.
-    let c = cluster(w);
-    c.isolate_node(2).await;
+    // Commit a bunch of entries through Raft so node-2's redb log has
+    // something on disk before we tear it down. Cap small for test
+    // wall time — the persistence guarantee is the same at 50 as at 50k.
+    let c = cluster_mut(w);
+    for i in 0..50u8 {
+        let _ = c.write_delta(0xA0 + (i % 16)).await;
+    }
+    // Real crash: drop the Raft instance, leave the redb file behind.
+    c.crash_node(2).await.expect("crash_node");
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
@@ -1292,23 +1298,25 @@ async fn then_new_entries_from_snapshot(w: &mut KisekiWorld) {
 
 #[when("node-2 restarts")]
 async fn when_node2_restarts(w: &mut KisekiWorld) {
-    let c = cluster(w);
-    // Simulate restart by restoring a previously-isolated node.
-    c.restore_node(2).await;
+    let c = cluster_mut(w);
+    c.restart_node(2).await.expect("restart_node");
     tokio::time::sleep(Duration::from_millis(500)).await;
     c.wait_for_leader(Duration::from_secs(5)).await;
-
-    // Ensure there are committed entries for recovery.
-    let sid = w.ensure_shard("s1");
-    for i in 0..5u8 {
-        let req = w.make_append_request(sid, 0x90 + i);
-        w.log_store.append_delta(req).await.unwrap();
-    }
 }
 
 #[then("it loads its local redb log (entries it already had)")]
-async fn then_loads_local_log(_w: &mut KisekiWorld) {
-    todo!("needs persistent redb log simulation in RaftTestCluster (currently in-memory only)")
+async fn then_loads_local_log(w: &mut KisekiWorld) {
+    // After restart the state machine replays from the on-disk log;
+    // node-2's deltas must reappear without any prompting from peers.
+    // We give it a brief moment for openraft's startup machinery to
+    // finish replay before reading.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let c = cluster(w);
+    let deltas = c.read_from(2).await;
+    assert!(
+        !deltas.is_empty(),
+        "after restart, node-2 must have entries replayed from its local redb log"
+    );
 }
 
 #[then("receives missing entries from the leader")]

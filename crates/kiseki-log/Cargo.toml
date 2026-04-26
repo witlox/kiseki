@@ -24,9 +24,11 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# Persistent log files for `RaftTestCluster` (Phase 14f) — tempdir
+# survives the cluster lifetime so `restart_node()` can reopen.
+tempfile = "3"
 
 [dev-dependencies]
 proptest = { workspace = true }
-tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
