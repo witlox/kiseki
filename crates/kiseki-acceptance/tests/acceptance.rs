@@ -244,6 +244,34 @@ pub struct KisekiWorld {
     pub last_inline_key: Option<[u8; 32]>,
     /// Most recent appended delta (for inline-data assertions).
     pub last_delta: Option<kiseki_log::delta::Delta>,
+
+    // === Backup / restore (ADR-016, Phase 14d) ===
+    /// Active `BackupManager` for the scenario (built on demand by step
+    /// definitions). Holds an Arc so `last_snapshot_id` lookups can
+    /// reach back without re-binding.
+    pub backup_manager: Option<std::sync::Arc<kiseki_backup::BackupManager>>,
+    /// FS root the manager was bound to — kept alive so the tempdir
+    /// persists for the scenario.
+    pub backup_fs_dir: Option<tempfile::TempDir>,
+    /// Direct trait handle (FS or S3) for assertions that bypass the
+    /// manager — e.g. "the snapshot tarball is reachable through the
+    /// S3 backend".
+    pub backup_backend: Option<std::sync::Arc<dyn kiseki_backup::ObjectBackupBackend>>,
+    /// Address of the in-process axum mock S3 (set when scenario picks S3).
+    pub backup_s3_endpoint: Option<String>,
+    /// Shards staged by Given steps before the When triggers a backup.
+    pub backup_staged_shards: Vec<kiseki_backup::ShardSnapshot>,
+    /// Snapshot returned by the most recent `create_snapshot` call.
+    pub last_backup_snapshot: Option<kiseki_backup::BackupSnapshot>,
+    /// Result of the most recent `restore_snapshot` call.
+    pub last_restored_shards: Option<Vec<kiseki_backup::ShardSnapshot>>,
+    /// All snapshots returned by the most recent `list_snapshots` call.
+    pub last_snapshot_listing: Vec<kiseki_backup::BackupSnapshot>,
+    /// Error captured from a backup operation that was expected to fail.
+    pub last_backup_error: Option<String>,
+    /// Background task hosting the in-process mock S3 server, dropped
+    /// when the World is dropped to keep tests hermetic.
+    pub backup_s3_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for KisekiWorld {
@@ -255,6 +283,10 @@ impl Drop for KisekiWorld {
         // Abort outstanding S3 axum tasks (axum::serve loops forever
         // without a graceful-shutdown future).
         for h in self.s3_tasks.drain(..) {
+            h.abort();
+        }
+        // Same for the backup-feature S3 mock.
+        if let Some(h) = self.backup_s3_task.take() {
             h.abort();
         }
     }
@@ -470,6 +502,16 @@ impl KisekiWorld {
             inline_temp_dir: Some(inline_temp_dir),
             last_inline_key: None,
             last_delta: None,
+            backup_manager: None,
+            backup_fs_dir: None,
+            backup_backend: None,
+            backup_s3_endpoint: None,
+            backup_staged_shards: Vec::new(),
+            last_backup_snapshot: None,
+            last_restored_shards: None,
+            last_snapshot_listing: Vec::new(),
+            last_backup_error: None,
+            backup_s3_task: None,
             telemetry_bus,
             kms_providers,
             persistent_shard_store: None,

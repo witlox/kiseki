@@ -39,6 +39,7 @@ kiseki-gateway = { workspace = true }
 kiseki-transport = { workspace = true }
 kiseki-client = { workspace = true }
 kiseki-block = { workspace = true }
+kiseki-backup = { workspace = true }
 kiseki-raft = { workspace = true }
 tempfile = "3"
 axum = "0.7"

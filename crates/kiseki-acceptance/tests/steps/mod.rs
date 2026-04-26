@@ -7,6 +7,7 @@
 pub mod admin;
 pub mod advisory;
 pub mod auth;
+pub mod backup;
 pub mod block;
 pub mod chunk;
 pub mod client;

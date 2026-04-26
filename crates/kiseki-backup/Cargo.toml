@@ -1,0 +1,28 @@
+[package]
+name = "kiseki-backup"
+description = "Backup/restore for Kiseki — ObjectBackupBackend trait + FS/S3 impls (ADR-016)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+aws-lc-rs = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-manual-roots-no-provider",
+] }
+rustls = { workspace = true }
+tar = "0.4"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+axum = "0.7"
+tempfile = "3"

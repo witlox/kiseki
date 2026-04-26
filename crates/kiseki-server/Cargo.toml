@@ -25,6 +25,7 @@ kiseki-transport = { workspace = true }
 kiseki-log = { workspace = true }
 kiseki-keymanager = { workspace = true }
 kiseki-audit = { workspace = true }
+kiseki-backup = { workspace = true }
 kiseki-chunk = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-view = { workspace = true }
@@ -34,16 +35,8 @@ kiseki-advisory = { workspace = true }
 kiseki-control = { workspace = true }
 kiseki-proto = { workspace = true }
 async-trait = { workspace = true }
-aws-lc-rs = { workspace = true }
 axum = "0.7"
 hyper = { version = "1", features = ["server", "http1"] }
-# Phase 14d: HTTP client for S3-compatible backup backend (ADR-016).
-# Uses our existing rustls + aws-lc-rs stack — no new crypto deps,
-# matches the FIPS posture used for TLS elsewhere.
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls-manual-roots-no-provider",
-] }
-rustls = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
@@ -57,11 +50,6 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-# Phase 14d: tar archives for backup snapshots (ADR-016).
-# `tar` is a small (~3 kLOC) zero-dep wrapper around the POSIX ustar
-# format. We use it to build one tarball per snapshot — much simpler
-# to ship to / restore from S3 than per-shard files.
-tar = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

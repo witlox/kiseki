@@ -14,8 +14,6 @@
 //! - `ListObjectsV2` is parsed by hand from XML — we only need
 //!   `<Key>` text nodes; a full parser would be overkill.
 
-#![allow(dead_code)]
-
 use std::io;
 
 use async_trait::async_trait;
@@ -26,12 +24,11 @@ use aws_lc_rs::{
 use reqwest::{Client, StatusCode, Url};
 use std::time::{Duration, SystemTime};
 
-use crate::backup::ObjectBackupBackend;
+use crate::ObjectBackupBackend;
 
 const SERVICE: &str = "s3";
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const AWS4_REQUEST: &str = "aws4_request";
-const EMPTY_PAYLOAD_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 // ---------------------------------------------------------------------------
 // S3BackupBackend
@@ -732,7 +729,7 @@ mod tests {
     /// not just the FS path.
     #[tokio::test]
     async fn backup_manager_against_s3_backend_round_trip() {
-        use crate::backup::{BackupConfig, BackupManager, ShardSnapshot};
+        use crate::{BackupConfig, BackupManager, ShardSnapshot};
         let (endpoint, _store) = run_mock_server().await;
         let backend: Arc<dyn ObjectBackupBackend> =
             Arc::new(S3BackupBackend::new(test_cfg(&endpoint)).unwrap());

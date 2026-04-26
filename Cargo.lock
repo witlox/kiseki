@@ -1549,6 +1549,7 @@ dependencies = [
  "cucumber",
  "kiseki-advisory",
  "kiseki-audit",
+ "kiseki-backup",
  "kiseki-block",
  "kiseki-chunk",
  "kiseki-client",
@@ -1595,6 +1596,23 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kiseki-backup"
+version = "2026.1.0"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "axum 0.7.9",
+ "reqwest",
+ "rustls",
+ "tar",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1831,11 +1849,11 @@ name = "kiseki-server"
 version = "2026.1.0"
 dependencies = [
  "async-trait",
- "aws-lc-rs",
  "axum 0.7.9",
  "hyper",
  "kiseki-advisory",
  "kiseki-audit",
+ "kiseki-backup",
  "kiseki-chunk",
  "kiseki-client",
  "kiseki-common",
@@ -1852,11 +1870,8 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus",
- "reqwest",
- "rustls",
  "serde",
  "serde_json",
- "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
