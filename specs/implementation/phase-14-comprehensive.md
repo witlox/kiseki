@@ -400,10 +400,14 @@ discovered during the recent grep:
   4. `TestIdentitySource(Vec<u8>)` — raw-bytes impl for unit/BDD tests
   All four feed `HKDF-SHA256(secret, salt=node_id, info="kiseki/at-rest/v1")`
   so derived bytes are domain-separated from any reuse of the source.
-- Backwards compatibility: detect legacy unencrypted entries on load and
-  re-wrap (one-shot migration).
-- TDD: roundtrip test (encrypt → persist → reload → decrypt) per source,
-  plus a legacy-format test, plus a precedence test (SPIFFE > mTLS > file).
+- No legacy migration: Phase 14e ships before any production deployment,
+  so no real data exists in the old plaintext format. If a developer
+  reopens a pre-14e redb, deserialization fails with `InvalidData` and
+  they wipe their data dir — far cleaner than carrying a one-shot
+  migration code path forever.
+- TDD: roundtrip test (encrypt → persist → reload → decrypt), reject test
+  (wrong node identity → AuthenticationFailed), precedence test
+  (SPIFFE > mTLS > file, already done in step 2a).
 
 ### Step 3 — `mlock` the integrity checker's key pages
 

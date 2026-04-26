@@ -19,6 +19,27 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::config::{ServerConfig, TlsFiles};
 
+/// Pick the per-node identity source for the at-rest key store
+/// (Phase 14e). Precedence: SPIFFE > mTLS > file-in-data-dir.
+///
+/// Returns `Err` only if every source is unavailable — which shouldn't
+/// happen here because the file fallback always succeeds when the
+/// data dir exists.
+fn select_node_identity_or_die(
+    cfg: &ServerConfig,
+    data_dir: &std::path::Path,
+) -> Result<Box<dyn kiseki_keymanager::node_identity::NodeIdentitySource>, Box<dyn std::error::Error>>
+{
+    use kiseki_keymanager::node_identity::{select_node_identity, NodeIdentityInputs};
+    let mtls_key = cfg.tls.as_ref().map(|t| t.key_path.as_path());
+    select_node_identity(&NodeIdentityInputs {
+        spiffe_path: cfg.spiffe_socket.as_deref(),
+        mtls_key_path: mtls_key,
+        data_dir: Some(data_dir),
+    })
+    .ok_or_else(|| "no node identity source available".into())
+}
+
 /// Build a tonic `ServerTlsConfig` from PEM files.
 fn build_tls(files: &TlsFiles) -> Result<ServerTlsConfig, Box<dyn std::error::Error>> {
     let ca_pem = std::fs::read(&files.ca_path)
@@ -68,26 +89,36 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     }
 
     // Key Manager: persistent (redb) if KISEKI_DATA_DIR set, otherwise in-memory.
-    // Uses PersistentKeyStore for dual-write (memory + redb) in persistent mode.
-    // Falls back to plain RaftKeyStore (memory-only) otherwise.
-    // Both implement KeyManagerOps; gRPC uses PersistentKeyStore when available.
+    // Phase 14e: every persisted entry is wrapped in AES-GCM keyed off
+    // a per-node identity (SPIFFE > mTLS > file fallback).
+    let salt = cfg.node_id.to_be_bytes();
     let key_store = if let Some(ref dir) = cfg.data_dir {
         std::fs::create_dir_all(dir.join("keys")).ok();
-        let store =
-            kiseki_keymanager::PersistentKeyStore::open(&dir.join("keys").join("epochs.redb"))
-                .map_err(|e| format!("persistent key store: {e}"))?;
+        let identity = select_node_identity_or_die(&cfg, dir)?;
+        tracing::info!(source = identity.kind(), "key store at-rest identity");
+        let store = kiseki_keymanager::PersistentKeyStore::open(
+            &dir.join("keys").join("epochs.redb"),
+            &*identity,
+            &salt,
+        )
+        .map_err(|e| format!("persistent key store: {e}"))?;
         tracing::info!(
             epoch = store.health().current_epoch.unwrap_or(0),
             "key manager: persistent (redb) ready",
         );
         store
     } else {
-        // In-memory: use PersistentKeyStore with a temp path that won't be reused.
-        // This keeps the runtime code uniform (single type for key_store).
+        // In-memory: use a process-scoped tempdir for both the redb file
+        // and the file-based node identity. Ephemeral by design.
         let tmp = std::env::temp_dir().join(format!("kiseki-keys-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok();
-        let store = kiseki_keymanager::PersistentKeyStore::open(&tmp.join("epochs.redb"))
-            .map_err(|e| format!("key store init: {e}"))?;
+        let identity = kiseki_keymanager::node_identity::FileIdentitySource::new(
+            tmp.join("node-identity.key"),
+        )
+        .map_err(|e| format!("ephemeral node identity: {e}"))?;
+        let store =
+            kiseki_keymanager::PersistentKeyStore::open(&tmp.join("epochs.redb"), &identity, &salt)
+                .map_err(|e| format!("key store init: {e}"))?;
         tracing::info!(
             epoch = store.health().current_epoch.unwrap_or(0),
             "key manager: in-memory (ephemeral) ready",

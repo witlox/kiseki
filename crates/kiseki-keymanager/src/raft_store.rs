@@ -5,8 +5,13 @@
 //! via Raft (ADR-007). The state machine itself is Raft-agnostic —
 //! it processes commands and produces state transitions.
 //!
-//! Key material in the command log is encrypted with a node-local key
-//! before persistence (adversary gate WI-2b requirement).
+//! In-memory commands hold plaintext key material — that's the
+//! working set. Per Phase 14e, when this store is wrapped by
+//! [`crate::persistent_store::PersistentKeyStore`], every command
+//! written to the redb log is sealed in an AES-GCM envelope keyed off
+//! the node's identity (`node_identity` module). The Raft transport
+//! between nodes is mTLS (I-Auth1), so plaintext-on-the-wire is also
+//! covered.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,12 +29,13 @@ use crate::health::{KeyManagerHealth, KeyManagerStatus};
 /// encrypted bytes — the node decrypts after reading from the log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum KeyCommand {
-    /// Create a new epoch with the given encrypted key material.
+    /// Create a new epoch with the given key material.
     CreateEpoch {
         /// Epoch number.
         epoch: u64,
-        /// Key material (in production: encrypted with node-local key).
-        /// For the reference implementation: plaintext bytes.
+        /// Key material — plaintext in the in-memory state machine,
+        /// AES-GCM-sealed at the persistence boundary
+        /// (see `persistent_store::EncryptedEntry`).
         key_material: Vec<u8>,
     },
     /// Rotate: mark a new epoch as current.

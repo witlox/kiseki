@@ -39,6 +39,11 @@ pub struct ServerConfig {
     pub raw_devices: Vec<String>,
     /// Optional backup configuration (ADR-016). `None` = backups disabled.
     pub backup: Option<BackupSettings>,
+    /// Optional SPIFFE workload-API socket / SVID-key path
+    /// (`KISEKI_SPIFFE_SOCKET`). When set, takes precedence over
+    /// mTLS-derived node identity for the Raft key store at-rest
+    /// encryption (Phase 14e).
+    pub spiffe_socket: Option<PathBuf>,
 }
 
 /// Backup destination + retention.
@@ -192,6 +197,10 @@ impl ServerConfig {
 
         let backup = parse_backup_from_env();
 
+        let spiffe_socket = std::env::var("KISEKI_SPIFFE_SOCKET")
+            .ok()
+            .map(PathBuf::from);
+
         Self {
             data_addr,
             advisory_addr,
@@ -209,6 +218,7 @@ impl ServerConfig {
             meta_hard_limit_pct,
             raw_devices,
             backup,
+            spiffe_socket,
         }
     }
 }
