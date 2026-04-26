@@ -18,8 +18,10 @@
 //! object (S3 multipart upload, file copy, etc.) without per-shard
 //! roundtrips.
 
-// Wired into runtime in Phase 14d step 3 (admin gRPC + scheduler).
-// Until then the module is exercised only by its own tests.
+// Most types are exposed only via the [`BackupHandle`] indirection so
+// the rest of the crate doesn't see the trait/snapshot machinery
+// directly. They're constructed lazily, so allow dead until the admin
+// gRPC step uses them.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -594,6 +596,83 @@ fn extract_json_number(json: &str, key: &str) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime wiring (Phase 14d step 3)
+// ---------------------------------------------------------------------------
+
+use std::sync::OnceLock;
+
+use crate::backup_s3::{S3BackendConfig, S3BackupBackend};
+use crate::config::{BackupBackend as CfgBackend, BackupSettings};
+
+static RUNTIME_MANAGER: OnceLock<Arc<BackupManager>> = OnceLock::new();
+
+/// The process-wide [`BackupManager`], if backups are enabled.
+///
+/// Returns `None` when `KISEKI_BACKUP_BACKEND` is unset (default), or
+/// before [`init_runtime_backup_manager`] has been called.
+#[must_use]
+pub fn runtime_backup_manager() -> Option<Arc<BackupManager>> {
+    RUNTIME_MANAGER.get().cloned()
+}
+
+/// Build the runtime [`BackupManager`] from the parsed [`BackupSettings`]
+/// and stash it for [`runtime_backup_manager`]. Spawns a periodic
+/// `cleanup_old` task on the current tokio runtime.
+///
+/// Returns the manager so the caller can also use it directly.
+pub fn init_runtime_backup_manager(settings: &BackupSettings) -> io::Result<Arc<BackupManager>> {
+    let backend: Arc<dyn ObjectBackupBackend> = match &settings.backend {
+        CfgBackend::FileSystem { dir } => Arc::new(FileSystemBackupBackend::new(dir.clone())?),
+        CfgBackend::S3 {
+            endpoint,
+            region,
+            bucket,
+            access_key_id,
+            secret_access_key,
+        } => Arc::new(S3BackupBackend::new(S3BackendConfig {
+            endpoint: endpoint.clone(),
+            region: region.clone(),
+            bucket: bucket.clone(),
+            access_key_id: access_key_id.clone(),
+            secret_access_key: secret_access_key.clone(),
+        })?),
+    };
+    let mgr = Arc::new(BackupManager::new(
+        backend,
+        BackupConfig {
+            include_data: settings.include_data,
+            retention_days: settings.retention_days,
+        },
+    ));
+
+    // Idempotent: a second call with a different backend would be a
+    // misconfiguration; we keep the first one and warn so the operator
+    // sees the conflict in logs.
+    if RUNTIME_MANAGER.set(Arc::clone(&mgr)).is_err() {
+        tracing::warn!("backup: init_runtime_backup_manager called twice — keeping the first");
+        return Ok(runtime_backup_manager().expect("set returned Err so a value exists"));
+    }
+
+    let cleanup_mgr = Arc::clone(&mgr);
+    let interval = settings.cleanup_interval_secs;
+    let retention = settings.retention_days;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval));
+        // Skip the first immediate tick — we just started, nothing to clean.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let n = cleanup_mgr.cleanup_old(retention).await;
+            if n > 0 {
+                tracing::info!(deleted = n, "backup: cleanup removed expired snapshots");
+            }
+        }
+    });
+
+    Ok(mgr)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -762,5 +841,30 @@ mod tests {
         let snap = mgr.create_snapshot(&sample_shards()).await.unwrap();
         let restored = mgr.restore_snapshot(&snap.snapshot_id).await.unwrap();
         assert_eq!(restored.len(), 2);
+    }
+
+    /// Runtime wiring: `init_runtime_backup_manager` builds a working
+    /// manager from a parsed FS config, registers it in the `OnceLock`,
+    /// and the cleanup task is reachable. Round-tripping a snapshot via
+    /// the returned manager proves the full chain is alive.
+    #[tokio::test]
+    async fn runtime_wiring_builds_working_fs_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = BackupSettings {
+            backend: CfgBackend::FileSystem {
+                dir: dir.path().to_path_buf(),
+            },
+            retention_days: 7,
+            include_data: false,
+            // Long enough that the cleanup task does not fire during this test.
+            cleanup_interval_secs: 86_400,
+        };
+        let mgr = init_runtime_backup_manager(&settings).expect("init");
+        let snap = mgr.create_snapshot(&sample_shards()).await.unwrap();
+        let restored = mgr.restore_snapshot(&snap.snapshot_id).await.unwrap();
+        assert_eq!(restored.len(), 2);
+        // Same manager is reachable from the global handle.
+        let from_handle = runtime_backup_manager().expect("handle");
+        assert!(Arc::ptr_eq(&mgr, &from_handle));
     }
 }

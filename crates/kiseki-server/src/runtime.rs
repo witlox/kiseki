@@ -411,6 +411,22 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         });
     }
 
+    // Backup manager (ADR-016). Stays None when KISEKI_BACKUP_BACKEND is
+    // unset — the admin gRPC service will surface that as "disabled".
+    if let Some(ref bcfg) = cfg.backup {
+        match crate::backup::init_runtime_backup_manager(bcfg) {
+            Ok(_) => tracing::info!(
+                retention_days = bcfg.retention_days,
+                include_data = bcfg.include_data,
+                cleanup_interval_secs = bcfg.cleanup_interval_secs,
+                "backup: enabled",
+            ),
+            Err(e) => tracing::warn!(error = %e, "backup: init failed — backups disabled"),
+        }
+    } else {
+        tracing::info!("backup: disabled (set KISEKI_BACKUP_BACKEND=fs|s3 to enable)");
+    }
+
     // --- gRPC services ---
 
     // Control plane (ADR-027: Rust-only).

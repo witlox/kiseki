@@ -37,6 +37,50 @@ pub struct ServerConfig {
     /// When set, kiseki manages these devices directly instead of using
     /// the `data_dir` filesystem.
     pub raw_devices: Vec<String>,
+    /// Optional backup configuration (ADR-016). `None` = backups disabled.
+    pub backup: Option<BackupSettings>,
+}
+
+/// Backup destination + retention.
+///
+/// `KISEKI_BACKUP_BACKEND=fs` selects [`BackupBackend::FileSystem`] and
+/// requires `KISEKI_BACKUP_DIR`.
+///
+/// `KISEKI_BACKUP_BACKEND=s3` selects [`BackupBackend::S3`] and requires
+/// `KISEKI_BACKUP_S3_ENDPOINT`, `KISEKI_BACKUP_S3_REGION`,
+/// `KISEKI_BACKUP_S3_BUCKET`, `KISEKI_BACKUP_S3_ACCESS_KEY`, and
+/// `KISEKI_BACKUP_S3_SECRET_KEY`.
+pub struct BackupSettings {
+    /// Where to write snapshots.
+    pub backend: BackupBackend,
+    /// Days to retain snapshots before `cleanup_old` deletes them.
+    pub retention_days: u32,
+    /// Whether snapshots include shard data (vs metadata-only).
+    pub include_data: bool,
+    /// How often the runtime invokes `cleanup_old`. Defaults to 24h.
+    pub cleanup_interval_secs: u64,
+}
+
+/// Where backup snapshots land.
+pub enum BackupBackend {
+    /// Local directory.
+    FileSystem {
+        /// Snapshots live under this directory.
+        dir: PathBuf,
+    },
+    /// S3-compatible object store.
+    S3 {
+        /// Endpoint URL (e.g. `https://s3.us-east-1.amazonaws.com`).
+        endpoint: String,
+        /// Region.
+        region: String,
+        /// Bucket (must already exist).
+        bucket: String,
+        /// Access key id.
+        access_key_id: String,
+        /// Secret access key.
+        secret_access_key: String,
+    },
 }
 
 /// Paths to TLS certificate files.
@@ -146,6 +190,8 @@ impl ServerConfig {
             .map(String::from)
             .collect();
 
+        let backup = parse_backup_from_env();
+
         Self {
             data_addr,
             advisory_addr,
@@ -162,6 +208,47 @@ impl ServerConfig {
             meta_soft_limit_pct,
             meta_hard_limit_pct,
             raw_devices,
+            backup,
         }
     }
+}
+
+fn parse_backup_from_env() -> Option<BackupSettings> {
+    let backend_kind = std::env::var("KISEKI_BACKUP_BACKEND").ok()?;
+    let backend = match backend_kind.as_str() {
+        "fs" => {
+            let dir = std::env::var("KISEKI_BACKUP_DIR").map(PathBuf::from).ok()?;
+            BackupBackend::FileSystem { dir }
+        }
+        "s3" => BackupBackend::S3 {
+            endpoint: std::env::var("KISEKI_BACKUP_S3_ENDPOINT").ok()?,
+            region: std::env::var("KISEKI_BACKUP_S3_REGION").ok()?,
+            bucket: std::env::var("KISEKI_BACKUP_S3_BUCKET").ok()?,
+            access_key_id: std::env::var("KISEKI_BACKUP_S3_ACCESS_KEY").ok()?,
+            secret_access_key: std::env::var("KISEKI_BACKUP_S3_SECRET_KEY").ok()?,
+        },
+        other => {
+            tracing::warn!(
+                backend = other,
+                "ignoring KISEKI_BACKUP_BACKEND: expected 'fs' or 's3'"
+            );
+            return None;
+        }
+    };
+    let retention_days = std::env::var("KISEKI_BACKUP_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+    let include_data =
+        std::env::var("KISEKI_BACKUP_INCLUDE_DATA").is_ok_and(|v| v == "true" || v == "1");
+    let cleanup_interval_secs = std::env::var("KISEKI_BACKUP_CLEANUP_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(86_400); // 24h
+    Some(BackupSettings {
+        backend,
+        retention_days,
+        include_data,
+        cleanup_interval_secs,
+    })
 }
