@@ -1,10 +1,25 @@
 # Phase 14 — Comprehensive Plan
 
-**Status**: PROPOSED
+**Status**: ACCEPTED — execution begins 2026-04-26.
 **Date**: 2026-04-26
 **Predecessor**: Phase 13f (`phase-13f-final-11.md`) — fast suite 167 → 181/181, all
 11 plan items closed, integrator + auditor + audit-sweep follow-ups landed in
 `378e8d3`.
+
+## Decisions locked in (2026-04-26)
+
+Architect/analyst sign-off captured before implementer work begins:
+
+| Decision | Choice |
+|---|---|
+| **14a** TenantKmsProvider trait shape (5 async methods + cfg-gated `inject_failure`) | confirmed as proposed |
+| **14d.1** ObjectBackupBackend location | `kiseki-server` |
+| **14d.2** Backend dependency | minimal in-house trait (no `object_store` crate) |
+| **14d.3** Snapshot format | single tarball per snapshot (not per-shard JSON files) |
+| **14d.4** Restore semantics | snapshot-only (per ADR-016 — full reconstruction from one tarball) |
+| **14d analyst** | implementer authors the 6 backup-and-restore Gherkin scenarios in-band; no separate seed |
+| **14e** Raft key-store at-rest encryption | per-node SPIFFE-derived key; HKDF from SVID private key, re-wrap on epoch rotation |
+| **14f** `KisekiNode` topology metadata | `Topology` enum (`Rack(String)` / `Zone{rack, zone}` / `Custom(HashMap<String,String>)`) |
 
 ## Why this plan exists
 
