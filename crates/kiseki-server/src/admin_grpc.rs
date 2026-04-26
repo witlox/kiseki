@@ -77,6 +77,7 @@ impl AdminService for AdminGrpc {
         &self,
         _request: Request<pb::CreateSnapshotRequest>,
     ) -> Result<Response<pb::CreateSnapshotResponse>, Status> {
+        let _s = kiseki_tracing::span("AdminService.CreateSnapshot");
         let mgr = self.manager_or_unavailable()?;
         let shards = self.shards.collect().await;
         let snap = mgr
@@ -97,6 +98,7 @@ impl AdminService for AdminGrpc {
         &self,
         request: Request<pb::RestoreSnapshotRequest>,
     ) -> Result<Response<pb::RestoreSnapshotResponse>, Status> {
+        let _s = kiseki_tracing::span("AdminService.RestoreSnapshot");
         let mgr = self.manager_or_unavailable()?;
         let id = request.into_inner().snapshot_id;
         if id.is_empty() {
@@ -115,6 +117,7 @@ impl AdminService for AdminGrpc {
         &self,
         _request: Request<pb::ListSnapshotsRequest>,
     ) -> Result<Response<pb::ListSnapshotsResponse>, Status> {
+        let _s = kiseki_tracing::span("AdminService.ListSnapshots");
         let mgr = self.manager_or_unavailable()?;
         let snapshots = mgr
             .list_snapshots()

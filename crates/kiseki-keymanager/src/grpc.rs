@@ -50,6 +50,7 @@ impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerG
         &self,
         request: Request<FetchMasterKeyRequest>,
     ) -> Result<Response<FetchMasterKeyResponse>, Status> {
+        let _s = kiseki_tracing::span("KeyManagerService.FetchMasterKey");
         let req = request.into_inner();
         let epoch_val = req
             .epoch
@@ -77,6 +78,7 @@ impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerG
         &self,
         _request: Request<CurrentEpochRequest>,
     ) -> Result<Response<CurrentEpochResponse>, Status> {
+        let _s = kiseki_tracing::span("KeyManagerService.CurrentEpoch");
         let epoch = self.ops.current_epoch().await.map_err(|e| to_status(&e))?;
         let retained: Vec<kiseki_proto::v1::KeyEpoch> = self
             .ops
@@ -97,6 +99,7 @@ impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerG
         &self,
         _request: Request<RotateSystemKeyRequest>,
     ) -> Result<Response<RotateSystemKeyResponse>, Status> {
+        let _s = kiseki_tracing::span("KeyManagerService.RotateSystemKey");
         let new_epoch = self.ops.rotate().await.map_err(|e| to_status(&e))?;
         Ok(Response::new(RotateSystemKeyResponse {
             new_epoch: Some(to_proto_epoch(new_epoch)),
@@ -107,6 +110,7 @@ impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerG
         &self,
         _request: Request<KeyManagerHealthRequest>,
     ) -> Result<Response<KeyManagerHealthResponse>, Status> {
+        let _s = kiseki_tracing::span("KeyManagerService.Health");
         let epoch = self.ops.current_epoch().await.map_err(|e| to_status(&e))?;
         Ok(Response::new(KeyManagerHealthResponse {
             current_epoch: Some(to_proto_epoch(epoch)),

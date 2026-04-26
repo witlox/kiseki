@@ -1779,6 +1779,7 @@ dependencies = [
  "kiseki-crypto",
  "kiseki-proto",
  "kiseki-raft",
+ "kiseki-tracing",
  "openraft",
  "proptest",
  "serde",
@@ -1801,6 +1802,7 @@ dependencies = [
  "kiseki-common",
  "kiseki-proto",
  "kiseki-raft",
+ "kiseki-tracing",
  "openraft",
  "proptest",
  "serde",
@@ -1865,6 +1867,7 @@ dependencies = [
  "kiseki-keymanager",
  "kiseki-log",
  "kiseki-proto",
+ "kiseki-tracing",
  "kiseki-transport",
  "kiseki-view",
  "libc",
@@ -1882,6 +1885,14 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "kiseki-tracing"
+version = "2026.1.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
 ]
 
 [[package]]

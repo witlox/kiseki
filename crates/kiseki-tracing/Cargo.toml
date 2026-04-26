@@ -1,0 +1,15 @@
+[package]
+name = "kiseki-tracing"
+description = "Tiny OTel-span helper that bypasses the broken tracing-opentelemetry bridge."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }

@@ -60,29 +60,22 @@ fn main() {
     // `opentelemetry` 0.31 was silently dropping spans on this build.
     // Going through the tracer directly is the supported public API
     // and Just Works.
-    // Emit a startup span directly on the OTel tracer so the Jaeger
-    // service registry sees `kiseki-server` immediately on boot. Going
-    // through the OTel API rather than `tracing::info_span!` is
-    // intentional: the `tracing-opentelemetry` 0.32 + `opentelemetry`
-    // 0.31 bridge silently drops spans on this build (the fmt-side
-    // span context is visible but `BatchSpanProcessor.on_end` is
-    // never called for them, so nothing reaches the OTLP queue).
-    // Direct OTel + force_flush bypasses the broken bridge.
+    // Emit a startup span via the kiseki-tracing helper so the Jaeger
+    // service registry sees `kiseki-server` immediately on boot.
+    // Force-flush so the span lands before any e2e probe arrives.
+    {
+        let _s = kiseki_tracing::span("kiseki_server.startup");
+        tracing::info!(
+            data_addr = %cfg.data_addr,
+            advisory_addr = %cfg.advisory_addr,
+            "kiseki-server starting"
+        );
+    }
     if let Some(ref provider) = otel_provider {
-        use opentelemetry::trace::{Span, Tracer, TracerProvider};
-        let tracer = provider.tracer("kiseki-server-startup");
-        let mut span = tracer.start("kiseki_server.startup");
-        span.end();
-        drop(span);
         if let Err(e) = provider.force_flush() {
             tracing::warn!(error = ?e, "OTLP startup-span flush failed");
         }
     }
-    tracing::info!(
-        data_addr = %cfg.data_addr,
-        advisory_addr = %cfg.advisory_addr,
-        "kiseki-server starting"
-    );
 
     // Build the isolated advisory runtime (ADR-021 §1).
     let advisory_rt = tokio::runtime::Builder::new_multi_thread()

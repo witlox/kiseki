@@ -203,6 +203,7 @@ impl LogService for LogGrpc {
         &self,
         request: Request<ProtoAppendReq>,
     ) -> Result<Response<AppendDeltaResponse>, Status> {
+        let _s = kiseki_tracing::span("LogService.AppendDelta");
         let req = request.into_inner();
         let shard_id = extract_shard_id(req.shard_id)?;
         let tenant_id = req
@@ -254,6 +255,7 @@ impl LogService for LogGrpc {
         &self,
         request: Request<ProtoReadReq>,
     ) -> Result<Response<ReadDeltasResponse>, Status> {
+        let _s = kiseki_tracing::span("LogService.ReadDeltas");
         let req = request.into_inner();
         let shard_id = extract_shard_id(req.shard_id)?;
 
@@ -285,6 +287,7 @@ impl LogService for LogGrpc {
         &self,
         request: Request<ShardHealthRequest>,
     ) -> Result<Response<ShardHealthResponse>, Status> {
+        let _s = kiseki_tracing::span("LogService.ShardHealth");
         let req = request.into_inner();
         let shard_id = extract_shard_id(req.shard_id)?;
 
@@ -324,6 +327,7 @@ impl LogService for LogGrpc {
         &self,
         request: Request<SetMaintenanceRequest>,
     ) -> Result<Response<SetMaintenanceResponse>, Status> {
+        let _s = kiseki_tracing::span("LogService.SetMaintenance");
         let req = request.into_inner();
         let shard_id = extract_shard_id(req.shard_id)?;
 

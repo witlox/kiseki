@@ -46,6 +46,12 @@ pub fn init_tracing() -> Option<SdkTracerProvider> {
         }
     }
 
+    // Install for the kiseki-tracing helper. Span call sites become
+    // active here; before this they were no-ops.
+    if let Some(p) = provider.clone() {
+        kiseki_tracing::install_global_provider(p);
+    }
+
     provider
 }
 

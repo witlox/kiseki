@@ -15,6 +15,7 @@ async-trait = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-proto = { workspace = true }
 kiseki-raft = { workspace = true }
+kiseki-tracing = { workspace = true }
 futures = "0.3"
 openraft = { workspace = true }
 serde = { version = "1", features = ["derive"] }

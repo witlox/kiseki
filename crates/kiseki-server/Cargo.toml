@@ -26,6 +26,7 @@ kiseki-log = { workspace = true }
 kiseki-keymanager = { workspace = true }
 kiseki-audit = { workspace = true }
 kiseki-backup = { workspace = true }
+kiseki-tracing = { workspace = true }
 kiseki-chunk = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-view = { workspace = true }

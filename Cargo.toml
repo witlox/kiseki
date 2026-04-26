@@ -18,6 +18,7 @@ members = [
     "crates/kiseki-proto",
     "crates/kiseki-raft",
     "crates/kiseki-server",
+    "crates/kiseki-tracing",
     "crates/kiseki-transport",
     "crates/kiseki-view",
 ]
@@ -71,6 +72,7 @@ kiseki-gateway = { path = "crates/kiseki-gateway", version = "2026.1.0" }
 kiseki-client = { path = "crates/kiseki-client", version = "2026.1.0" }
 kiseki-control = { path = "crates/kiseki-control", version = "2026.1.0" }
 kiseki-server = { path = "crates/kiseki-server", version = "2026.1.0" }
+kiseki-tracing = { path = "crates/kiseki-tracing", version = "2026.1.0" }
 
 # --- Core ---
 async-trait = "0.1"
