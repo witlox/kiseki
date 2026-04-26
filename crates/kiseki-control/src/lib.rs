@@ -26,6 +26,7 @@ pub mod iam;
 pub mod idp;
 pub mod maintenance;
 pub mod namespace;
+pub mod node_lifecycle;
 pub mod policy;
 pub mod replication;
 pub mod retention;

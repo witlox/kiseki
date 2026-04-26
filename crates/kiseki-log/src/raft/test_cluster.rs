@@ -361,6 +361,95 @@ impl RaftTestCluster {
         }
     }
 
+    /// Spawn an additional node and add it as a learner to the cluster.
+    /// Returns once the leader has accepted the learner change.
+    pub async fn add_learner(&mut self, new_id: u64) -> Result<(), LogError> {
+        // Build the new node identical to existing nodes.
+        let log_store = MemLogStore::<C>::default();
+        let sm_inner = Arc::new(futures::lock::Mutex::new(ShardSmInner::new(
+            ShardId(uuid::Uuid::nil()),
+            self.tenant_id,
+        )));
+        let state_machine = ShardStateMachine::new(Arc::clone(&sm_inner));
+        let network = TestNetworkFactory {
+            router: Arc::clone(&self.router),
+            source_id: new_id,
+        };
+        let config = Arc::new(
+            openraft::Config {
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                ..openraft::Config::default()
+            }
+            .validate()
+            .expect("valid config"),
+        );
+        let raft = Raft::new(new_id, config, network, log_store, state_machine)
+            .await
+            .map_err(|_| LogError::Unavailable)?;
+        let raft = Arc::new(raft);
+        self.router.register(new_id, Arc::clone(&raft)).await;
+
+        // Tell the leader to add it as a learner.
+        let leader_id = self
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .ok_or(LogError::Unavailable)?;
+        let leader = &self.nodes[&leader_id];
+        let kn = KisekiNode {
+            addr: format!("127.0.0.1:{}", 9100 + new_id),
+        };
+        leader
+            .raft
+            .add_learner(new_id, kn, true)
+            .await
+            .map_err(|_| LogError::Unavailable)?;
+
+        self.nodes.insert(
+            new_id,
+            RaftTestNode {
+                raft,
+                state: sm_inner,
+                node_id: new_id,
+            },
+        );
+        Ok(())
+    }
+
+    /// Change cluster membership to the given voter set. Promotes any
+    /// listed learners and removes voters not in the new set.
+    pub async fn change_membership(
+        &self,
+        voters: BTreeMap<u64, KisekiNode>,
+    ) -> Result<(), LogError> {
+        let leader_id = self
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .ok_or(LogError::Unavailable)?;
+        let leader = &self.nodes[&leader_id];
+        let voter_ids: std::collections::BTreeSet<u64> = voters.keys().copied().collect();
+        leader
+            .raft
+            .change_membership(voter_ids, false)
+            .await
+            .map_err(|_| LogError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Current voter set as known to the leader.
+    pub async fn voter_ids(&self) -> Vec<u64> {
+        let Some(leader_id) = self.leader().await else {
+            return Vec::new();
+        };
+        let metrics = self.nodes[&leader_id].raft.metrics();
+        let m = metrics.borrow_watched().clone();
+        m.membership_config
+            .membership()
+            .voter_ids()
+            .collect::<Vec<_>>()
+    }
+
     /// Shutdown all nodes.
     pub async fn shutdown(self) {
         for (_, node) in self.nodes {

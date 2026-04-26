@@ -1533,6 +1533,7 @@ dependencies = [
  "kiseki-gateway",
  "kiseki-keymanager",
  "kiseki-log",
+ "kiseki-raft",
  "kiseki-transport",
  "kiseki-view",
  "tempfile",

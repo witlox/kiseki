@@ -188,6 +188,16 @@ pub struct KisekiWorld {
     // === Raft test cluster (ADR-037) ===
     pub raft_cluster: Option<kiseki_log::raft::test_cluster::RaftTestCluster>,
 
+    // === Node lifecycle (ADR-035) ===
+    pub drain_orch: Arc<kiseki_control::node_lifecycle::DrainOrchestrator>,
+    /// Logical name (e.g. "n1", "n7") → NodeId, populated by drain step defs.
+    pub node_names: HashMap<String, NodeId>,
+    /// Most recent drain attempt outcome — Some when refused.
+    pub last_drain_error: Option<String>,
+    /// Per-shard Raft cluster spun up to demonstrate real voter
+    /// replacement during drain orchestration.
+    pub drain_raft: Option<kiseki_log::raft::test_cluster::RaftTestCluster>,
+
     // === TCP transport endpoints (ADR-022) ===
     /// Gateway name → bound TCP address (started on demand by step defs).
     pub tcp_endpoints: HashMap<String, std::net::SocketAddr>,
@@ -389,6 +399,10 @@ impl KisekiWorld {
             backpressure_subs: HashMap::new(),
             qos_subs: HashMap::new(),
             tcp_endpoints: HashMap::new(),
+            drain_orch: Arc::new(kiseki_control::node_lifecycle::DrainOrchestrator::new()),
+            node_names: HashMap::new(),
+            last_drain_error: None,
+            drain_raft: None,
         }
     }
 
