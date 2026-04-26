@@ -18,7 +18,7 @@ Architect/analyst sign-off captured before implementer work begins:
 | **14d.3** Snapshot format | single tarball per snapshot (not per-shard JSON files) |
 | **14d.4** Restore semantics | snapshot-only (per ADR-016 — full reconstruction from one tarball) |
 | **14d analyst** | implementer authors the 6 backup-and-restore Gherkin scenarios in-band; no separate seed |
-| **14e** Raft key-store at-rest encryption | per-node SPIFFE-derived key; HKDF from SVID private key, re-wrap on epoch rotation |
+| **14e** Raft key-store at-rest encryption | per-node identity → HKDF; **default = mTLS-derived** (uses the existing `KISEKI_CERT_PATH/KEY_PATH` already required for the data fabric — A-T-2/I-Auth1); SPIFFE-derived **when `KISEKI_SPIFFE_SOCKET` is set** (assumption A-T-2's "alternative"); file-based `$DATA_DIR/node-identity.key` fallback for dev/single-node (no mTLS configured); HKDF info string `"kiseki/at-rest/v1"` domain-separates derived bytes from any reuse of the source key. Test impl takes raw bytes — no SPIRE socket needed in BDD. |
 | **14f** `KisekiNode` topology metadata | `Topology` enum (`Rack(String)` / `Zone{rack, zone}` / `Custom(HashMap<String,String>)`) |
 
 ## Why this plan exists
@@ -390,10 +390,20 @@ discovered during the recent grep:
 
 - `raft_store.rs` currently serialises plaintext key material. Wrap in an
   AES-GCM envelope using a node-local key at construction time.
+- Node-local key sourcing (per the locked-in 14e decision row above):
+  introduce a small `NodeIdentitySource` trait with selection precedence
+  1. `SpiffeIdentitySource` — when `KISEKI_SPIFFE_SOCKET` is set
+  2. **`MtlsIdentitySource` — default**, derives from the node's existing
+     mTLS private key (the cert/key already loaded for the data fabric)
+  3. `FileIdentitySource` — `$DATA_DIR/node-identity.key` (mode 0600,
+     auto-generated on first boot) when neither SPIFFE nor mTLS is set
+  4. `TestIdentitySource(Vec<u8>)` — raw-bytes impl for unit/BDD tests
+  All four feed `HKDF-SHA256(secret, salt=node_id, info="kiseki/at-rest/v1")`
+  so derived bytes are domain-separated from any reuse of the source.
 - Backwards compatibility: detect legacy unencrypted entries on load and
   re-wrap (one-shot migration).
-- TDD: roundtrip test (encrypt → persist → reload → decrypt), plus a
-  legacy-format test.
+- TDD: roundtrip test (encrypt → persist → reload → decrypt) per source,
+  plus a legacy-format test, plus a precedence test (SPIFFE > mTLS > file).
 
 ### Step 3 — `mlock` the integrity checker's key pages
 

@@ -9,12 +9,17 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use kiseki_common::ids::OrgId;
+use zeroize::Zeroizing;
 
 /// Cached tenant key entry with TTL tracking.
+///
+/// `material` is wrapped in [`Zeroizing`] so the bytes are scrubbed
+/// from memory when the cache entry is dropped or replaced — closes
+/// the "key material survives Drop" finding from Phase 14e.
 #[derive(Debug)]
 pub struct CachedKey {
-    /// Raw key material (would be Zeroizing in production).
-    pub material: [u8; 32],
+    /// Raw key material — zeroed on Drop.
+    pub material: Zeroizing<[u8; 32]>,
     /// When the key was cached.
     pub cached_at: Instant,
     /// TTL in seconds.
@@ -46,12 +51,14 @@ impl KeyCache {
         }
     }
 
-    /// Insert or refresh a tenant's cached key.
+    /// Insert or refresh a tenant's cached key. The bytes are moved
+    /// into a [`Zeroizing`] wrapper so any earlier copy held by the
+    /// caller can be dropped (and scrubbed) immediately.
     pub fn insert(&mut self, tenant: OrgId, material: [u8; 32]) {
         self.entries.insert(
             tenant,
             CachedKey {
-                material,
+                material: Zeroizing::new(material),
                 cached_at: Instant::now(),
                 ttl_secs: self.default_ttl_secs,
             },
@@ -108,6 +115,24 @@ mod tests {
         let mut cache = KeyCache::new(300);
         cache.insert(test_org(), [0x42; 32]);
         assert!(cache.get(&test_org()).is_some());
+    }
+
+    /// Phase 14e: the cached key bytes must be wrapped in a type that
+    /// scrubs them on Drop. Reading freed stack memory to "observe" the
+    /// zeroing is UB (the compiler may elide stores to dead slots), so
+    /// we verify the contract by type rather than by spy: the `material`
+    /// field IS `Zeroizing<[u8; 32]>` and dereferences transparently.
+    /// The `zeroize` crate's own test suite covers the Drop semantics.
+    #[test]
+    fn cached_material_is_wrapped_in_zeroizing() {
+        let mut cache = KeyCache::new(300);
+        cache.insert(test_org(), [0x42; 32]);
+        let entry = cache.get(&test_org()).unwrap();
+        // Compile-time proof of the wrapper type: this assignment only
+        // type-checks if `material` is exactly `Zeroizing<[u8; 32]>`,
+        // and the explicit dereference forces clippy to see the use.
+        let proof: &Zeroizing<[u8; 32]> = &entry.material;
+        assert_eq!(**proof, [0x42; 32]);
     }
 
     #[test]
