@@ -320,7 +320,10 @@ impl NamespaceShardMapStore {
                 requested
             }
         } else {
-            compute_initial_shards(config, u32::try_from(active_nodes.len()).unwrap_or(u32::MAX))
+            compute_initial_shards(
+                config,
+                u32::try_from(active_nodes.len()).unwrap_or(u32::MAX),
+            )
         };
 
         // ADV-033-1: failure injection — simulate partial Raft group failure.
@@ -359,9 +362,7 @@ impl NamespaceShardMapStore {
             .ok_or_else(|| ControlError::NotFound(format!("namespace {namespace_id}")))?;
 
         if map.tenant_id != caller_tenant {
-            return Err(ControlError::NotPermitted(
-                "PermissionDenied".into(),
-            ));
+            return Err(ControlError::NotPermitted("PermissionDenied".into()));
         }
 
         Ok(map.clone())
@@ -390,7 +391,11 @@ impl NamespaceShardMapStore {
         let map = maps.get_mut(namespace_id)?;
 
         let current = u32::try_from(map.shards.len()).unwrap_or(u32::MAX);
-        let target = check_ratio_floor(config, current, u32::try_from(active_nodes.len()).unwrap_or(u32::MAX))?;
+        let target = check_ratio_floor(
+            config,
+            current,
+            u32::try_from(active_nodes.len()).unwrap_or(u32::MAX),
+        )?;
 
         // Split shards until we reach the target.
         // Each split divides the largest shard's key range at its midpoint.
@@ -405,7 +410,10 @@ impl NamespaceShardMapStore {
 
             // Leader placement: round-robin across active nodes.
             let new_leader_idx = map.shards.len() % active_nodes.len();
-            let new_leader = active_nodes.get(new_leader_idx).copied().unwrap_or(NodeId(1));
+            let new_leader = active_nodes
+                .get(new_leader_idx)
+                .copied()
+                .unwrap_or(NodeId(1));
 
             let left = ShardRange {
                 shard_id: old.shard_id,
@@ -434,7 +442,8 @@ impl NamespaceShardMapStore {
     /// Get the current shard count for a namespace (unauthenticated, internal use).
     pub fn shard_count(&self, namespace_id: &str) -> Option<u32> {
         let maps = self.maps.read().unwrap();
-        maps.get(namespace_id).and_then(|m| u32::try_from(m.shards.len()).ok())
+        maps.get(namespace_id)
+            .and_then(|m| u32::try_from(m.shards.len()).ok())
     }
 
     /// Check whether a namespace exists in the store (any state).
@@ -565,7 +574,8 @@ mod tests {
         // Ranges are contiguous: each range_end == next range_start.
         for i in 0..8 {
             assert_eq!(
-                ranges[i].range_end, ranges[i + 1].range_start,
+                ranges[i].range_end,
+                ranges[i + 1].range_start,
                 "gap between range {i} and {}",
                 i + 1
             );
@@ -590,7 +600,10 @@ mod tests {
 
         // Key 0xFF..FF should be in the last shard.
         let key_high = [0xFF; 32];
-        assert_eq!(route_to_shard(&map, &key_high), Some(map.shards[2].shard_id));
+        assert_eq!(
+            route_to_shard(&map, &key_high),
+            Some(map.shards[2].shard_id)
+        );
     }
 
     #[test]
@@ -618,8 +631,8 @@ mod tests {
 
     #[test]
     fn max_concurrent_splits_formula() {
-        assert_eq!(max_concurrent_splits(3), 1);    // max(1, 3/5) = 1
-        assert_eq!(max_concurrent_splits(10), 2);   // max(1, 10/5) = 2
-        assert_eq!(max_concurrent_splits(50), 10);  // max(1, 50/5) = 10
+        assert_eq!(max_concurrent_splits(3), 1); // max(1, 3/5) = 1
+        assert_eq!(max_concurrent_splits(10), 2); // max(1, 10/5) = 2
+        assert_eq!(max_concurrent_splits(50), 10); // max(1, 50/5) = 10
     }
 }

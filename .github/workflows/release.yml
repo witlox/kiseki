@@ -40,9 +40,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --exclude kiseki-acceptance --run-ignored all
-      - name: Run BDD acceptance tests
+      - name: Run full BDD acceptance suite (incl. @slow scenarios)
+        # Release runs the complete suite — `--features slow-tests` enables
+        # the Raft-cluster scenarios that CI excludes for speed.
         run: |
-          output=$(cargo test -p kiseki-acceptance 2>&1)
+          output=$(cargo test -p kiseki-acceptance --features slow-tests 2>&1)
           echo "$output" | tail -10
           if echo "$output" | grep -qE "[1-9][0-9]* failed"; then
             echo "::error::BDD scenarios failed"
@@ -245,11 +247,67 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
+  # E2E: docker compose single-node + 3-node — must pass before publish
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E Integration
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build kiseki-server
+        run: cargo build --bin kiseki-server --locked
+
+      - name: Build Docker image
+        run: docker compose build
+
+      - name: Start server
+        run: docker compose up -d
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose exec -T kiseki-server timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null; then
+              echo "Server healthy after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install Python deps
+        run: pip install --quiet -r tests/e2e/pyproject.toml 2>/dev/null || pip install grpcio grpcio-tools protobuf pytest tenacity pydantic structlog
+
+      - name: Run single-node e2e tests
+        working-directory: tests/e2e
+        run: pytest -ra --tb=short --ignore=test_multi_node.py
+
+      - name: Teardown single-node
+        run: docker compose down -v
+
+      - name: Run multi-node e2e tests
+        working-directory: tests/e2e
+        run: pytest -ra --tb=short test_multi_node.py
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.3node.yml logs 2>/dev/null; docker compose logs 2>/dev/null; true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f docker-compose.3node.yml down -v 2>/dev/null; docker compose down -v 2>/dev/null; true
+
+  # ---------------------------------------------------------------------------
   # Publish: GitHub release with all artifacts
   # ---------------------------------------------------------------------------
   publish:
     name: Publish release
-    needs: [preflight, server, client, docker, crates]
+    needs: [preflight, server, client, docker, crates, e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write

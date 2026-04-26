@@ -111,9 +111,7 @@ async fn when_read_leader(w: &mut KisekiWorld) {
     let c = cluster(w);
     let leader_id = c.leader().await.expect("should have leader");
     let deltas = c.read_from(leader_id).await;
-    w.last_read_data = deltas
-        .last()
-        .map(|d| d.payload.ciphertext.clone());
+    w.last_read_data = deltas.last().map(|d| d.payload.ciphertext.clone());
 }
 
 #[then("the delta is immediately visible (read-after-write on leader)")]
@@ -143,9 +141,7 @@ async fn when_read_follower(w: &mut KisekiWorld) {
     // Pick a follower (any node that is not the leader).
     let follower_id = (1..=3u64).find(|&id| id != leader_id).unwrap();
     let deltas = c.read_from(follower_id).await;
-    w.last_read_data = deltas
-        .last()
-        .map(|d| d.payload.ciphertext.clone());
+    w.last_read_data = deltas.last().map(|d| d.payload.ciphertext.clone());
 }
 
 #[then("the delta may or may not be visible (eventual consistency on followers)")]
@@ -520,7 +516,9 @@ async fn then_rack_spread(_w: &mut KisekiWorld) {
 #[when("a delta is written through Raft consensus")]
 async fn when_raft_write(w: &mut KisekiWorld) {
     let c = cluster(w);
-    c.write_delta(0x60).await.expect("raft write should succeed");
+    c.write_delta(0x60)
+        .await
+        .expect("raft write should succeed");
     // Also write via log_store for steps that use it.
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x60);
@@ -574,7 +572,9 @@ async fn given_100_deltas(w: &mut KisekiWorld, shard: String) {
     // Also write via Raft cluster so deltas survive leader failover.
     let c = cluster(w);
     for i in 0..50u8 {
-        c.write_delta(i + 1).await.expect("raft write should succeed");
+        c.write_delta(i + 1)
+            .await
+            .expect("raft write should succeed");
     }
 }
 
@@ -763,7 +763,10 @@ async fn then_ack_after_majority(w: &mut KisekiWorld) {
             count += 1;
         }
     }
-    assert!(count >= 2, "majority ({count}/3) should have data after ack");
+    assert!(
+        count >= 2,
+        "majority ({count}/3) should have data after ack"
+    );
 }
 
 // --- Scenario: Read after write — consistent on leader ---
@@ -774,9 +777,7 @@ async fn when_immediate_read_leader(w: &mut KisekiWorld, shard: String) {
     let c = cluster(w);
     let leader_id = c.leader().await.unwrap_or(1);
     let deltas = c.read_from(leader_id).await;
-    w.last_read_data = deltas
-        .last()
-        .map(|d| d.payload.ciphertext.clone());
+    w.last_read_data = deltas.last().map(|d| d.payload.ciphertext.clone());
 
     // Also read from log_store for compatibility.
     let sid = w.ensure_shard(&shard);
@@ -791,9 +792,7 @@ async fn when_immediate_read_leader(w: &mut KisekiWorld, shard: String) {
         .await
         .unwrap();
     if w.last_read_data.is_none() {
-        w.last_read_data = ls_deltas
-            .last()
-            .map(|d| d.payload.ciphertext.clone());
+        w.last_read_data = ls_deltas.last().map(|d| d.payload.ciphertext.clone());
     }
 }
 
@@ -812,9 +811,7 @@ async fn when_read_follower_before_repl(w: &mut KisekiWorld) {
     let c = cluster(w);
     // Read from node-2 immediately (before replication may complete).
     let deltas = c.read_from(2).await;
-    w.last_read_data = deltas
-        .last()
-        .map(|d| d.payload.ciphertext.clone());
+    w.last_read_data = deltas.last().map(|d| d.payload.ciphertext.clone());
 }
 
 #[then("the read may not include the latest delta")]

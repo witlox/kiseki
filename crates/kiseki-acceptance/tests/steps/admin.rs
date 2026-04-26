@@ -412,8 +412,9 @@ async fn given_device_transition(w: &mut KisekiWorld) {
 #[when(regex = r"^a device transitions from Healthy to Degraded$")]
 async fn when_device_transition(w: &mut KisekiWorld) {
     // Trigger via real StorageAdminService state transition.
-    let _ = w.control_admin
-        .set_device_status("health-dev", DeviceStatus::Offline, AdminRole::Admin);
+    let _ =
+        w.control_admin
+            .set_device_status("health-dev", DeviceStatus::Offline, AdminRole::Admin);
 }
 
 #[then(regex = r"^the admin receives a DeviceHealthEvent with old_state and new_state$")]
@@ -474,8 +475,14 @@ async fn then_iops_throughput(w: &mut KisekiWorld) {
     let stats = w.control_admin.io_stats("fast-nvme").unwrap();
     assert!(stats.read_iops > 0, "read_iops should be populated");
     assert!(stats.write_iops > 0, "write_iops should be populated");
-    assert!(stats.read_throughput > 0, "read throughput should be populated");
-    assert!(stats.write_throughput > 0, "write throughput should be populated");
+    assert!(
+        stats.read_throughput > 0,
+        "read throughput should be populated"
+    );
+    assert!(
+        stats.write_throughput > 0,
+        "write throughput should be populated"
+    );
 }
 
 // === Shard management ===
@@ -517,9 +524,7 @@ async fn when_split_shard(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
     // Admin-initiated split: force split regardless of thresholds.
     let health = w.log_store.shard_health(shard_id).await.unwrap();
-    let midpoint = kiseki_log::auto_split::compute_midpoint(
-        &health.range_start, &health.range_end,
-    );
+    let midpoint = kiseki_log::auto_split::compute_midpoint(&health.range_start, &health.range_end);
     match midpoint {
         Some(mid) => {
             let plan = kiseki_log::auto_split::SplitPlan {
@@ -536,10 +541,14 @@ async fn when_split_shard(w: &mut KisekiWorld, shard: String) {
                     w.last_shard_id = Some(plan.new_shard);
                     w.last_error = None;
                 }
-                Err(e) => { w.last_error = Some(e.to_string()); }
+                Err(e) => {
+                    w.last_error = Some(e.to_string());
+                }
             }
         }
-        None => { w.last_error = Some("range too narrow to split".into()); }
+        None => {
+            w.last_error = Some("range too narrow to split".into());
+        }
     }
 }
 
@@ -699,7 +708,10 @@ async fn then_rebalance_stops(w: &mut KisekiWorld) {
     // Verify cancellation works via CompactionProgress.
     let progress = CompactionProgress::new();
     progress.cancel();
-    assert!(progress.is_cancelled(), "rebalance must stop when cancelled");
+    assert!(
+        progress.is_cancelled(),
+        "rebalance must stop when cancelled"
+    );
 }
 
 #[then("partially moved chunks remain consistent")]
@@ -943,7 +955,10 @@ async fn then_commit_lag(w: &mut KisekiWorld) {
         // commit_lag is derivable from tip and delta_count.
         let commit_lag = info.tip.0.saturating_sub(info.delta_count);
         // In a healthy in-memory store, lag should be 0.
-        assert!(commit_lag == 0 || true, "commit_lag is reportable: {commit_lag}");
+        assert!(
+            commit_lag == 0 || true,
+            "commit_lag is reportable: {commit_lag}"
+        );
         break;
     }
 }
@@ -985,7 +1000,10 @@ async fn then_alert_investigate(w: &mut KisekiWorld) {
         // In the in-memory store all members are "reachable" by default.
         // The scenario's given-step already verified degradation invariants.
         // Here we confirm the shard is still observable.
-        assert!(!info.raft_members.is_empty(), "shard must be observable for alerting");
+        assert!(
+            !info.raft_members.is_empty(),
+            "shard must be observable for alerting"
+        );
         break;
     }
 }

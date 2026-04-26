@@ -4,13 +4,12 @@
 //! in-memory channel-based transport. Supports partition simulation,
 //! leader election triggers, and write/read operations.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Cursor;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
-use kiseki_raft::{KisekiNode, KisekiRaftConfig, MemLogStore};
+use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
+use kiseki_raft::{KisekiNode, MemLogStore};
 use openraft::error::RPCError;
 use openraft::type_config::async_runtime::WatchReceiver;
 use openraft::Raft;
@@ -21,8 +20,6 @@ use super::types::{LogResponse, LogTypeConfig};
 use crate::delta::Delta;
 use crate::error::LogError;
 use crate::raft_store::LogCommand;
-use crate::shard::{ShardConfig, ShardState};
-use crate::traits::{AppendDeltaRequest, ReadDeltasRequest};
 
 type C = LogTypeConfig;
 
@@ -60,7 +57,7 @@ impl TestRouter {
         self.blocked.read().await.contains(&(from, to))
     }
 
-    /// Dispatch append_entries to target node's Raft handle.
+    /// Dispatch `append_entries` to target node's Raft handle.
     async fn append_entries(
         &self,
         from: u64,
@@ -74,16 +71,16 @@ impl TestRouter {
         }
         let nodes = self.nodes.read().await;
         let target = nodes.get(&to).ok_or_else(|| {
-            RPCError::Unreachable(openraft::error::Unreachable::new(
-                &std::io::Error::new(std::io::ErrorKind::NotFound, "node not found"),
-            ))
-        })?;
-        target
-            .append_entries(rpc)
-            .await
-            .map_err(|e| RPCError::Unreachable(openraft::error::Unreachable::new(
-                &std::io::Error::other(e.to_string()),
+            RPCError::Unreachable(openraft::error::Unreachable::new(&std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "node not found",
             )))
+        })?;
+        target.append_entries(rpc).await.map_err(|e| {
+            RPCError::Unreachable(openraft::error::Unreachable::new(&std::io::Error::other(
+                e.to_string(),
+            )))
+        })
     }
 
     /// Dispatch vote to target node's Raft handle.
@@ -100,16 +97,16 @@ impl TestRouter {
         }
         let nodes = self.nodes.read().await;
         let target = nodes.get(&to).ok_or_else(|| {
-            RPCError::Unreachable(openraft::error::Unreachable::new(
-                &std::io::Error::new(std::io::ErrorKind::NotFound, "node not found"),
-            ))
-        })?;
-        target
-            .vote(rpc)
-            .await
-            .map_err(|e| RPCError::Unreachable(openraft::error::Unreachable::new(
-                &std::io::Error::other(e.to_string()),
+            RPCError::Unreachable(openraft::error::Unreachable::new(&std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "node not found",
             )))
+        })?;
+        target.vote(rpc).await.map_err(|e| {
+            RPCError::Unreachable(openraft::error::Unreachable::new(&std::io::Error::other(
+                e.to_string(),
+            )))
+        })
     }
 }
 
@@ -160,8 +157,7 @@ impl openraft::network::v2::RaftNetworkV2<C> for TestNetwork {
     ) -> Result<openraft::raft::SnapshotResponse<C>, openraft::error::StreamingError<C>> {
         // Snapshot transfer not yet implemented for test cluster.
         Err(openraft::error::StreamingError::Unreachable(
-            openraft::error::Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::Other,
+            openraft::error::Unreachable::new(&std::io::Error::other(
                 "snapshot not implemented in test cluster",
             )),
         ))
@@ -172,9 +168,7 @@ impl openraft::network::v2::RaftNetworkV2<C> for TestNetwork {
         rpc: openraft::raft::VoteRequest<C>,
         _option: openraft::network::RPCOption,
     ) -> Result<openraft::raft::VoteResponse<C>, RPCError<C>> {
-        self.router
-            .vote(self.source_id, self.target_id, rpc)
-            .await
+        self.router.vote(self.source_id, self.target_id, rpc).await
     }
 
     async fn transfer_leader(
@@ -190,7 +184,6 @@ impl openraft::network::v2::RaftNetworkV2<C> for TestNetwork {
 pub struct RaftTestCluster {
     router: Arc<TestRouter>,
     nodes: HashMap<u64, RaftTestNode>,
-    shard_id: ShardId,
     tenant_id: OrgId,
 }
 
@@ -245,7 +238,14 @@ impl RaftTestCluster {
 
         // Initialize membership on node 1 (seed).
         let members: BTreeMap<u64, KisekiNode> = (1..=node_count)
-            .map(|id| (id, KisekiNode { addr: format!("127.0.0.1:{}", 9100 + id) }))
+            .map(|id| {
+                (
+                    id,
+                    KisekiNode {
+                        addr: format!("127.0.0.1:{}", 9100 + id),
+                    },
+                )
+            })
             .collect();
         nodes
             .get(&1)
@@ -258,12 +258,14 @@ impl RaftTestCluster {
         Self {
             router,
             nodes,
-            shard_id,
             tenant_id,
         }
     }
 
     /// Get the current leader node ID.
+    // Async kept for symmetry with other RaftTestCluster RPC-style helpers
+    // and because BDD step definitions await it through generic harness code.
+    #[allow(clippy::unused_async)]
     pub async fn leader(&self) -> Option<u64> {
         for (id, node) in &self.nodes {
             let rx = node.raft.metrics();
@@ -347,6 +349,7 @@ impl RaftTestCluster {
     }
 
     /// Get the number of nodes.
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -388,7 +391,10 @@ mod tests {
         let tenant = OrgId(uuid::Uuid::from_u128(200));
         let cluster = RaftTestCluster::new(3, shard, tenant).await;
 
-        cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+        cluster
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
 
         // Write through leader.
         let seq = cluster.write_delta(0x42).await.unwrap();

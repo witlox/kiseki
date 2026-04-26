@@ -304,10 +304,11 @@ impl LogOps for RaftLogStore {
                 .ok_or(LogError::ShardNotFound(req.shard_id))?;
 
             match sm.info.state {
-                ShardState::Maintenance => return Err(LogError::MaintenanceMode(req.shard_id)),
+                ShardState::Maintenance | ShardState::Retiring => {
+                    return Err(LogError::MaintenanceMode(req.shard_id));
+                }
                 ShardState::Election => return Err(LogError::LeaderUnavailable(req.shard_id)),
                 ShardState::QuorumLost => return Err(LogError::QuorumLost(req.shard_id)),
-                ShardState::Retiring => return Err(LogError::MaintenanceMode(req.shard_id)),
                 ShardState::Healthy | ShardState::Splitting | ShardState::Merging => {}
             }
 
@@ -434,7 +435,10 @@ impl LogOps for RaftLogStore {
     }
 
     fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.range_start = range_start;
             sm.info.range_end = range_end;
@@ -442,29 +446,57 @@ impl LogOps for RaftLogStore {
     }
 
     fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.state = state;
         }
     }
 
     fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.config = config;
         }
     }
 
-    async fn register_consumer(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sm = inner.shards.get_mut(&shard_id).ok_or(LogError::ShardNotFound(shard_id))?;
+    async fn register_consumer(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) -> Result<(), LogError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sm = inner
+            .shards
+            .get_mut(&shard_id)
+            .ok_or(LogError::ShardNotFound(shard_id))?;
         sm.watermarks.register(consumer, position);
         Ok(())
     }
 
-    async fn advance_watermark(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sm = inner.shards.get_mut(&shard_id).ok_or(LogError::ShardNotFound(shard_id))?;
+    async fn advance_watermark(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) -> Result<(), LogError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sm = inner
+            .shards
+            .get_mut(&shard_id)
+            .ok_or(LogError::ShardNotFound(shard_id))?;
         sm.watermarks.advance(consumer, position);
         Ok(())
     }

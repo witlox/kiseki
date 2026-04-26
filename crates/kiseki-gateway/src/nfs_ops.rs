@@ -4,12 +4,13 @@
 //! delegates read/write to `NfsGateway<GatewayOps>`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 
 use crate::error::GatewayError;
 use crate::nfs::{NfsGateway, NfsReadRequest, NfsReadResponse, NfsWriteRequest, NfsWriteResponse};
+use crate::nfs4_server::SessionManager;
 use crate::nfs_dir::DirectoryIndex;
 use crate::nfs_lock::LockManager;
 use crate::ops::GatewayOps;
@@ -136,6 +137,8 @@ pub struct NfsContext<G: GatewayOps> {
     pub handles: HandleRegistry,
     pub dir_index: DirectoryIndex,
     pub locks: LockManager,
+    /// NFSv4 session/state tracker (OPEN, CLOSE, lock stateids).
+    pub sessions: Arc<SessionManager>,
     pub layouts: Mutex<crate::pnfs::LayoutManager>,
     pub tenant_id: OrgId,
     pub namespace_id: NamespaceId,
@@ -184,6 +187,7 @@ impl<G: GatewayOps> NfsContext<G> {
             handles,
             dir_index: DirectoryIndex::new(),
             locks: LockManager::default(),
+            sessions: Arc::new(SessionManager::new()),
             layouts: Mutex::new(crate::pnfs::LayoutManager::new(storage_nodes)),
             tenant_id,
             namespace_id,

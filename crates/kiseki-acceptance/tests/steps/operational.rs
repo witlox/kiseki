@@ -962,7 +962,10 @@ async fn then_audit_catches_up(w: &mut KisekiWorld) {
     };
     w.audit_log.append(event);
     let after = w.audit_log.tip(None);
-    assert!(after.0 > before.0, "audit log tip should advance (catch up)");
+    assert!(
+        after.0 > before.0,
+        "audit log tip should advance (catch up)"
+    );
 }
 
 #[then("no audit gap occurs")]
@@ -1962,7 +1965,8 @@ async fn then_sampling_guarantee(w: &mut KisekiWorld) {
         event_type: AuditEventType::AdvisoryHint,
         tenant_id: None,
         actor: "advisory-sampler".into(),
-        description: "sampling guarantee: at least 1 event per (workflow_id, reason) per second".into(),
+        description: "sampling guarantee: at least 1 event per (workflow_id, reason) per second"
+            .into(),
     };
     w.audit_log.append(event);
     let tip = w.audit_log.tip(None);

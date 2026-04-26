@@ -35,7 +35,8 @@ async fn then_raft_initialize(w: &mut KisekiWorld) {
     if w.raft_cluster.is_none() {
         let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
         let tenant_id = w.ensure_tenant("org-pharma");
-        let cluster = kiseki_log::raft::test_cluster::RaftTestCluster::new(3, shard_id, tenant_id).await;
+        let cluster =
+            kiseki_log::raft::test_cluster::RaftTestCluster::new(3, shard_id, tenant_id).await;
         w.raft_cluster = Some(cluster);
     }
     // Initialization is verified by the cluster being created — node 1 calls initialize() in RaftTestCluster::new.
@@ -44,7 +45,9 @@ async fn then_raft_initialize(w: &mut KisekiWorld) {
 #[then("node-1 becomes leader (single-node quorum until peers join)")]
 async fn then_node1_leader(w: &mut KisekiWorld) {
     let cluster = w.raft_cluster.as_ref().expect("raft cluster should exist");
-    let leader = cluster.wait_for_leader(std::time::Duration::from_secs(5)).await;
+    let leader = cluster
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await;
     assert!(leader.is_some(), "a leader should be elected");
 }
 
@@ -67,7 +70,10 @@ async fn then_accept_rpcs(w: &mut KisekiWorld) {
     // Verify by writing through leader — exercises AppendEntries replication.
     let cluster = w.raft_cluster.as_ref().expect("raft cluster");
     let result = cluster.write_delta(0x01).await;
-    assert!(result.is_ok(), "cluster should accept writes via real Raft RPCs");
+    assert!(
+        result.is_ok(),
+        "cluster should accept writes via real Raft RPCs"
+    );
 }
 
 // === Follower join ===
@@ -112,7 +118,10 @@ async fn then_node2_membership(w: &mut KisekiWorld) {
     cluster.write_delta(0x10).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let deltas = cluster.read_from(2).await;
-    assert!(!deltas.is_empty(), "node-2 should receive deltas via AppendEntries");
+    assert!(
+        !deltas.is_empty(),
+        "node-2 should receive deltas via AppendEntries"
+    );
 }
 
 #[then("node-2 becomes a follower")]
@@ -146,8 +155,14 @@ async fn when_node2_joins(w: &mut KisekiWorld) {
 #[then("node-2 successfully becomes a follower")]
 async fn then_node2_success(w: &mut KisekiWorld) {
     let cluster = w.raft_cluster.as_ref().expect("cluster");
-    let leader = cluster.wait_for_leader(std::time::Duration::from_secs(5)).await;
-    assert!(leader.is_some() && leader != Some(2), "node-2 should be a follower (leader is {:?})", leader);
+    let leader = cluster
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await;
+    assert!(
+        leader.is_some() && leader != Some(2),
+        "node-2 should be a follower (leader is {:?})",
+        leader
+    );
 }
 
 #[then("node-2 receives any committed log entries from the leader")]
@@ -186,7 +201,9 @@ async fn then_all_3_members(w: &mut KisekiWorld) {
 #[then("the cluster has a single leader")]
 async fn then_single_leader(w: &mut KisekiWorld) {
     let cluster = w.raft_cluster.as_ref().expect("cluster");
-    let leader = cluster.wait_for_leader(std::time::Duration::from_secs(5)).await;
+    let leader = cluster
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await;
     assert!(leader.is_some(), "cluster should have exactly one leader");
 }
 
@@ -235,7 +252,9 @@ async fn then_node2_later(w: &mut KisekiWorld) {
 async fn then_3_healthy(w: &mut KisekiWorld) {
     let cluster = w.raft_cluster.as_ref().expect("cluster");
     assert_eq!(cluster.node_count(), 3);
-    let leader = cluster.wait_for_leader(std::time::Duration::from_secs(5)).await;
+    let leader = cluster
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await;
     assert!(leader.is_some());
 }
 
@@ -290,7 +309,10 @@ async fn when_leader_stops(w: &mut KisekiWorld) {
         );
     }
     let cluster = w.raft_cluster.as_ref().expect("cluster");
-    let leader = cluster.wait_for_leader(std::time::Duration::from_secs(5)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     cluster.isolate_node(leader).await;
 }
 
@@ -299,8 +321,13 @@ async fn then_new_leader_elected(w: &mut KisekiWorld) {
     let cluster = w.raft_cluster.as_ref().expect("cluster");
     // Wait for a new leader (the old leader is isolated).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let new_leader = cluster.wait_for_leader(std::time::Duration::from_secs(5)).await;
-    assert!(new_leader.is_some(), "new leader should be elected from remaining nodes");
+    let new_leader = cluster
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await;
+    assert!(
+        new_leader.is_some(),
+        "new leader should be elected from remaining nodes"
+    );
 }
 
 #[then("writes continue on the new leader")]
@@ -349,7 +376,10 @@ async fn then_nodes_wait(w: &mut KisekiWorld) {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let d2 = cluster.read_from(2).await;
     let d3 = cluster.read_from(3).await;
-    assert!(!d2.is_empty() && !d3.is_empty(), "both followers received membership");
+    assert!(
+        !d2.is_empty() && !d3.is_empty(),
+        "both followers received membership"
+    );
 }
 
 // === Error handling ===
@@ -378,7 +408,9 @@ async fn then_node2_retries(w: &mut KisekiWorld) {
     // In RaftTestCluster, connection is immediate (in-memory).
     // The retry behavior is verified structurally: openraft retries internally.
     let cluster = w.raft_cluster.as_ref().expect("cluster");
-    let leader = cluster.wait_for_leader(std::time::Duration::from_secs(5)).await;
+    let leader = cluster
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await;
     assert!(leader.is_some());
 }
 
@@ -404,7 +436,10 @@ async fn when_double_init(w: &mut KisekiWorld) {
 async fn then_idempotent(w: &mut KisekiWorld) {
     // openraft's initialize() is idempotent — verified by the cluster working.
     let cluster = w.raft_cluster.as_ref().expect("cluster");
-    assert!(cluster.leader().await.is_some(), "cluster still operational after double init");
+    assert!(
+        cluster.leader().await.is_some(),
+        "cluster still operational after double init"
+    );
 }
 
 #[then("the cluster continues operating normally")]
@@ -447,13 +482,23 @@ async fn when_tenant_creates_namespace(w: &mut KisekiWorld, tenant: String, ns: 
 
 #[then(regex = r#"^(\d+) shards are created for "([^"]*)"$"#)]
 async fn then_n_shards_created(w: &mut KisekiWorld, expected: u32, ns: String) {
-    let count = w.shard_map_store.shard_count(&ns)
+    let count = w
+        .shard_map_store
+        .shard_count(&ns)
         .expect("namespace should exist in shard map store");
-    assert_eq!(count, expected, "expected {} shards, got {}", expected, count);
+    assert_eq!(
+        count, expected,
+        "expected {} shards, got {}",
+        expected, count
+    );
 
     // Verify we can write through the gateway to this namespace.
     let result = w.gateway_write(&ns, b"topology-test-data").await;
-    assert!(result.is_ok(), "gateway write should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "gateway write should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[then("each shard's leader is placed on a distinct node where possible")]
@@ -464,9 +509,17 @@ async fn then_leaders_distinct(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^no node hosts more than ceil\((\d+) / (\d+)\) = (\d+) leaders for "([^"]*)"$"#)]
-async fn then_max_leaders_per_node(w: &mut KisekiWorld, _shards: u32, _nodes: u32, max: u32, ns: String) {
+async fn then_max_leaders_per_node(
+    w: &mut KisekiWorld,
+    _shards: u32,
+    _nodes: u32,
+    max: u32,
+    ns: String,
+) {
     let tenant_id = w.ensure_tenant("org-pharma");
-    let map = w.shard_map_store.get(&ns, tenant_id)
+    let map = w
+        .shard_map_store
+        .get(&ns, tenant_id)
         .expect("namespace should exist");
     let mut leader_counts: std::collections::HashMap<kiseki_common::ids::NodeId, u32> =
         std::collections::HashMap::new();
@@ -474,30 +527,47 @@ async fn then_max_leaders_per_node(w: &mut KisekiWorld, _shards: u32, _nodes: u3
         *leader_counts.entry(shard.leader_node).or_default() += 1;
     }
     for (&node, &count) in &leader_counts {
-        assert!(count <= max, "node {:?} hosts {} leaders, max {}", node, count, max);
+        assert!(
+            count <= max,
+            "node {:?} hosts {} leaders, max {}",
+            node,
+            count,
+            max
+        );
     }
 }
 
-#[then(regex = r#"^the namespace shard map records all (\d+) shards with disjoint hashed_key ranges covering the full key space$"#)]
+#[then(
+    regex = r#"^the namespace shard map records all (\d+) shards with disjoint hashed_key ranges covering the full key space$"#
+)]
 async fn then_shard_map_disjoint(w: &mut KisekiWorld, expected: u32) {
     // Find the namespace from the last topology operation.
     // We check the shard map store directly — this IS the real store.
     let tenant_id = w.ensure_tenant("org-pharma");
-    let map = w.shard_map_store.get("patient-data", tenant_id)
+    let map = w
+        .shard_map_store
+        .get("patient-data", tenant_id)
         .expect("namespace should exist");
     assert_eq!(map.shards.len() as u32, expected);
     assert_eq!(map.shards[0].range_start, [0u8; 32]);
     assert_eq!(map.shards.last().unwrap().range_end, [0xFF; 32]);
     for i in 0..map.shards.len() - 1 {
-        assert_eq!(map.shards[i].range_end, map.shards[i + 1].range_start,
-            "gap between shard {} and {}", i, i + 1);
+        assert_eq!(
+            map.shards[i].range_end,
+            map.shards[i + 1].range_start,
+            "gap between shard {} and {}",
+            i,
+            i + 1
+        );
     }
 }
 
 #[then("the namespace shard map is persisted in the control plane Raft group (I-L15)")]
 async fn then_shard_map_persisted(w: &mut KisekiWorld) {
     let tenant_id = w.ensure_tenant("org-pharma");
-    let stored = w.shard_map_store.get("patient-data", tenant_id)
+    let stored = w
+        .shard_map_store
+        .get("patient-data", tenant_id)
         .expect("shard map should be retrievable from store");
     assert!(stored.version >= 1);
     assert!(!stored.shards.is_empty());
@@ -516,7 +586,11 @@ async fn then_n_shards_floor(w: &mut KisekiWorld, expected: u32) {
     assert_eq!(count, expected);
     // Verify gateway write works through the real path.
     let result = w.gateway_write("small-ns", b"floor-test").await;
-    assert!(result.is_ok(), "gateway write to floor namespace: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "gateway write to floor namespace: {:?}",
+        result.err()
+    );
 }
 
 #[then(regex = r#"^all (\d+) leaders are on the single node \(.+\)$"#)]
@@ -535,10 +609,13 @@ async fn then_shard_map_persisted_short(w: &mut KisekiWorld) {
     let tenant_id = w.ensure_tenant("org-pharma");
     // Check whichever namespace was most recently created.
     let ns_names = ["small-ns", "big-ns", "ns-x", "tuned-ns"];
-    let found = ns_names.iter().any(|ns| {
-        w.shard_map_store.get(ns, tenant_id).is_ok()
-    });
-    assert!(found, "at least one namespace shard map should be persisted");
+    let found = ns_names
+        .iter()
+        .any(|ns| w.shard_map_store.get(ns, tenant_id).is_ok());
+    assert!(
+        found,
+        "at least one namespace shard map should be persisted"
+    );
 }
 
 #[then(regex = r#"^(\d+) shards are created \(cap: .+\)$"#)]
@@ -546,7 +623,11 @@ async fn then_n_shards_cap(w: &mut KisekiWorld, expected: u32) {
     let count = w.shard_map_store.shard_count("big-ns").unwrap();
     assert_eq!(count, expected);
     let result = w.gateway_write("big-ns", b"cap-test").await;
-    assert!(result.is_ok(), "gateway write to capped namespace: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "gateway write to capped namespace: {:?}",
+        result.err()
+    );
 }
 
 #[then(regex = r#"^the (\d+) leaders are placed best-effort round-robin across the (\d+) nodes$"#)]
@@ -591,18 +672,24 @@ async fn then_n_shards_formula(w: &mut KisekiWorld, expected: u32) {
 
 // --- Scenario 5: Tenant admin overrides ---
 
-#[given(regex = r#"^the cluster admin defines per-tenant initial-shard bounds: min=(\d+), max=(\d+)$"#)]
+#[given(
+    regex = r#"^the cluster admin defines per-tenant initial-shard bounds: min=(\d+), max=(\d+)$"#
+)]
 async fn given_tenant_bounds(w: &mut KisekiWorld, min_shards: u32, max_shards: u32) {
     let tenant_id = w.ensure_tenant("org-pharma");
     w.shard_map_store.set_tenant_bounds(
         &tenant_id.0.to_string(),
-        kiseki_control::shard_topology::TenantShardBounds { min_shards, max_shards },
+        kiseki_control::shard_topology::TenantShardBounds {
+            min_shards,
+            max_shards,
+        },
     );
 }
 
 #[when(regex = r#"^tenant admin requests `initial_shards = (\d+)` for namespace "([^"]*)"$"#)]
 async fn when_tenant_requests_shards(w: &mut KisekiWorld, shards: u32, ns: String) {
-    w.ensure_topology_namespace(&ns, "org-pharma", Some(shards)).await;
+    w.ensure_topology_namespace(&ns, "org-pharma", Some(shards))
+        .await;
 }
 
 #[then(regex = r#"^(\d+) shards are created$"#)]
@@ -625,26 +712,37 @@ async fn then_but_when_tenant_requests(w: &mut KisekiWorld, shards: u32) {
         &w.topology_active_nodes,
         Some(shards),
     ) {
-        Ok(_) => { w.last_error = None; }
-        Err(e) => { w.last_error = Some(e.to_string()); }
+        Ok(_) => {
+            w.last_error = None;
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+        }
     }
 }
 
 #[then(regex = r#"^the request is rejected with "([^"]*)"$"#)]
 async fn then_request_rejected(w: &mut KisekiWorld, expected_msg: String) {
     let err = w.last_error.as_ref().expect("expected an error");
-    assert!(err.contains(&expected_msg), "expected '{}', got '{}'", expected_msg, err);
+    assert!(
+        err.contains(&expected_msg),
+        "expected '{}', got '{}'",
+        expected_msg,
+        err
+    );
 }
-
 
 // --- Scenarios 6-7: Ratio-floor auto-split ---
 
 #[given(regex = r#"^namespace "([^"]*)" has (\d+) shards \(ratio = [^)]+\)$"#)]
 async fn given_ns_with_shards(w: &mut KisekiWorld, ns: String, shard_count: u32) {
-    w.ensure_topology_namespace(&ns, "org-pharma", Some(shard_count)).await;
+    w.ensure_topology_namespace(&ns, "org-pharma", Some(shard_count))
+        .await;
 }
 
-#[when(regex = r#"^(\d+) more nodes? (?:is|are) added (?:to the cluster )?\(now (\d+) Active nodes?;[^)]+\)$"#)]
+#[when(
+    regex = r#"^(\d+) more nodes? (?:is|are) added (?:to the cluster )?\(now (\d+) Active nodes?;[^)]+\)$"#
+)]
 async fn when_nodes_added(w: &mut KisekiWorld, _added: u32, total: u32) {
     w.topology_active_nodes.clear();
     for i in 1..=total {
@@ -659,9 +757,9 @@ async fn then_ratio_violated(w: &mut KisekiWorld) {
     let mut found = false;
     for ns in &["ns-a", "ns-b"] {
         if let Some(count) = w.shard_map_store.shard_count(ns) {
-            if kiseki_control::shard_topology::check_ratio_floor(
-                &w.topology_config, count, active,
-            ).is_some() {
+            if kiseki_control::shard_topology::check_ratio_floor(&w.topology_config, count, active)
+                .is_some()
+            {
                 found = true;
             }
         }
@@ -669,13 +767,21 @@ async fn then_ratio_violated(w: &mut KisekiWorld) {
     assert!(found, "expected ratio floor violation");
 }
 
-#[then(regex = r#"^auto-split fires for "([^"]*)" until shard count reaches at least ceil\([^)]+\) = (\d+)$"#)]
+#[then(
+    regex = r#"^auto-split fires for "([^"]*)" until shard count reaches at least ceil\([^)]+\) = (\d+)$"#
+)]
 async fn then_auto_split_fires(w: &mut KisekiWorld, ns: String, target: u32) {
     // Evaluate ratio floor — this splits shards in the shard map store.
-    let new_count = w.shard_map_store.evaluate_ratio_floor(
-        &ns, &w.topology_config, &w.topology_active_nodes,
-    ).expect("splits should fire");
-    assert!(new_count >= target, "expected >= {} shards, got {}", target, new_count);
+    let new_count = w
+        .shard_map_store
+        .evaluate_ratio_floor(&ns, &w.topology_config, &w.topology_active_nodes)
+        .expect("splits should fire");
+    assert!(
+        new_count >= target,
+        "expected >= {} shards, got {}",
+        target,
+        new_count
+    );
 
     // Sync the UUID-keyed entry so gateway routing sees updated shards.
     if let Some(ns_id) = w.namespace_ids.get(&ns) {
@@ -687,24 +793,40 @@ async fn then_auto_split_fires(w: &mut KisekiWorld, ns: String, target: u32) {
     let map = w.shard_map_store.get(&ns, tenant_id).unwrap();
     for sr in &map.shards {
         // create_shard is idempotent for existing shards.
-        w.log_store.create_shard(sr.shard_id, tenant_id, sr.leader_node,
-            kiseki_log::shard::ShardConfig::default());
-        w.log_store.update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
+        w.log_store.create_shard(
+            sr.shard_id,
+            tenant_id,
+            sr.leader_node,
+            kiseki_log::shard::ShardConfig::default(),
+        );
+        w.log_store
+            .update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
     }
 
     // Verify gateway write still works after split.
     let result = w.gateway_write(&ns, b"post-split-test").await;
-    assert!(result.is_ok(), "gateway write after split: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "gateway write after split: {:?}",
+        result.err()
+    );
 }
 
-#[then(regex = r#"^the new shards are placed best-effort round-robin so leaders distribute across the (\d+) nodes$"#)]
+#[then(
+    regex = r#"^the new shards are placed best-effort round-robin so leaders distribute across the (\d+) nodes$"#
+)]
 async fn then_split_shards_distributed(w: &mut KisekiWorld, _node_count: u32) {
     let tenant_id = w.ensure_tenant("org-pharma");
     if let Ok(map) = w.shard_map_store.get("ns-a", tenant_id) {
         let mut nodes: std::collections::HashSet<kiseki_common::ids::NodeId> =
             std::collections::HashSet::new();
-        for s in &map.shards { nodes.insert(s.leader_node); }
-        assert!(nodes.len() > 1, "leaders should span multiple nodes after split");
+        for s in &map.shards {
+            nodes.insert(s.leader_node);
+        }
+        assert!(
+            nodes.len() > 1,
+            "leaders should span multiple nodes after split"
+        );
     }
 }
 
@@ -722,9 +844,15 @@ async fn then_ratio_satisfied(w: &mut KisekiWorld) {
         if let Some(count) = w.shard_map_store.shard_count(ns) {
             assert!(
                 kiseki_control::shard_topology::check_ratio_floor(
-                    &w.topology_config, count, active,
-                ).is_none(),
-                "{}: ratio floor should be satisfied ({} shards, {} nodes)", ns, count, active
+                    &w.topology_config,
+                    count,
+                    active,
+                )
+                .is_none(),
+                "{}: ratio floor should be satisfied ({} shards, {} nodes)",
+                ns,
+                count,
+                active
             );
         }
     }
@@ -732,9 +860,9 @@ async fn then_ratio_satisfied(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^no auto-split is triggered for "([^"]*)"$"#)]
 async fn then_no_auto_split(w: &mut KisekiWorld, ns: String) {
-    let result = w.shard_map_store.evaluate_ratio_floor(
-        &ns, &w.topology_config, &w.topology_active_nodes,
-    );
+    let result =
+        w.shard_map_store
+            .evaluate_ratio_floor(&ns, &w.topology_config, &w.topology_active_nodes);
     assert!(result.is_none(), "no splits should fire for {}", ns);
 
     // Verify gateway write still works.
@@ -753,10 +881,18 @@ async fn given_node3_unreachable(w: &mut KisekiWorld) {
 async fn when_tenant_creates_ns_with_count(w: &mut KisekiWorld, ns: String, _shards: u32) {
     let tenant_id = w.ensure_tenant("org-pharma");
     match w.shard_map_store.create_namespace(
-        &ns, tenant_id, &w.topology_config, &w.topology_active_nodes, None,
+        &ns,
+        tenant_id,
+        &w.topology_config,
+        &w.topology_active_nodes,
+        None,
     ) {
-        Ok(_) => { w.last_error = None; }
-        Err(e) => { w.last_error = Some(e.to_string()); }
+        Ok(_) => {
+            w.last_error = None;
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+        }
     }
 }
 
@@ -767,20 +903,30 @@ async fn when_shard_fails_quorum(_w: &mut KisekiWorld, _shard: u32, _timeout: u3
 
 #[then(regex = r#"^all (\d+) successfully created Raft groups are torn down$"#)]
 async fn then_raft_groups_torn_down(w: &mut KisekiWorld, _count: u32) {
-    assert!(w.last_error.is_some(), "namespace creation should have failed");
+    assert!(
+        w.last_error.is_some(),
+        "namespace creation should have failed"
+    );
 }
 
 #[then("no namespace shard map entry is committed")]
 async fn then_no_shard_map_committed(w: &mut KisekiWorld) {
     let tenant_id = w.ensure_tenant("org-pharma");
-    assert!(w.shard_map_store.get("partial-ns", tenant_id).is_err(),
-        "namespace should not exist after rollback");
+    assert!(
+        w.shard_map_store.get("partial-ns", tenant_id).is_err(),
+        "namespace should not exist after rollback"
+    );
 }
 
 #[then(regex = r#"^the CreateNamespace call returns error "([^"]*)"$"#)]
 async fn then_create_returns_error(w: &mut KisekiWorld, expected: String) {
     let err = w.last_error.as_ref().expect("expected error");
-    assert!(err.contains(&expected), "expected '{}', got '{}'", expected, err);
+    assert!(
+        err.contains(&expected),
+        "expected '{}', got '{}'",
+        expected,
+        err
+    );
 }
 
 #[then(regex = r#"^a subsequent CreateNamespace for "([^"]*)" succeeds once node-3 recovers$"#)]
@@ -789,7 +935,11 @@ async fn then_subsequent_create_succeeds(w: &mut KisekiWorld, ns: String) {
     w.ensure_topology_namespace(&ns, "org-pharma", None).await;
     // Verify gateway write works through the recovered namespace.
     let result = w.gateway_write(&ns, b"recovery-test").await;
-    assert!(result.is_ok(), "gateway write after recovery: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "gateway write after recovery: {:?}",
+        result.err()
+    );
 }
 
 // --- Scenario 9: ADV-033-1 concurrent create ---
@@ -804,23 +954,38 @@ async fn given_ns_creating(w: &mut KisekiWorld, ns: String) {
 async fn when_second_create(w: &mut KisekiWorld, ns: String) {
     let tenant_id = w.ensure_tenant("org-pharma");
     match w.shard_map_store.create_namespace(
-        &ns, tenant_id, &w.topology_config, &w.topology_active_nodes, None,
+        &ns,
+        tenant_id,
+        &w.topology_config,
+        &w.topology_active_nodes,
+        None,
     ) {
-        Ok(_) => { w.last_error = None; }
-        Err(e) => { w.last_error = Some(e.to_string()); }
+        Ok(_) => {
+            w.last_error = None;
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+        }
     }
 }
 
 #[then(regex = r#"^the second call is rejected with "([^"]*)"$"#)]
 async fn then_second_rejected(w: &mut KisekiWorld, expected: String) {
     let err = w.last_error.as_ref().expect("expected rejection");
-    assert!(err.contains(&expected), "expected '{}', got '{}'", expected, err);
+    assert!(
+        err.contains(&expected),
+        "expected '{}', got '{}'",
+        expected,
+        err
+    );
 }
 
 #[then("the first creation continues")]
 async fn then_first_continues(w: &mut KisekiWorld) {
-    assert!(w.shard_map_store.namespace_exists("dup-ns"),
-        "namespace should still exist in Creating state");
+    assert!(
+        w.shard_map_store.namespace_exists("dup-ns"),
+        "namespace should still exist in Creating state"
+    );
 }
 
 // --- Scenario 11: ADV-033-7 ratio-floor cap ---
@@ -829,7 +994,8 @@ async fn then_first_continues(w: &mut KisekiWorld) {
 async fn given_cluster_scales(w: &mut KisekiWorld) {
     w.topology_active_nodes.clear();
     for i in 1..=50u32 {
-        w.topology_active_nodes.push(kiseki_common::ids::NodeId(i as u64));
+        w.topology_active_nodes
+            .push(kiseki_common::ids::NodeId(i as u64));
     }
 }
 
@@ -840,9 +1006,10 @@ async fn when_ratio_evaluator_fires(_w: &mut KisekiWorld) {
 
 #[then(regex = r#"^splits fire until shard count reaches min\(ceil\([^)]+\), (\d+)\) = (\d+)$"#)]
 async fn then_splits_to_cap(w: &mut KisekiWorld, _cap: u32, target: u32) {
-    let new_count = w.shard_map_store.evaluate_ratio_floor(
-        "big-ns", &w.topology_config, &w.topology_active_nodes,
-    ).expect("splits should fire");
+    let new_count = w
+        .shard_map_store
+        .evaluate_ratio_floor("big-ns", &w.topology_config, &w.topology_active_nodes)
+        .expect("splits should fire");
     assert_eq!(new_count, target);
 
     // Sync the UUID-keyed entry so gateway routing sees the updated shards.
@@ -853,23 +1020,40 @@ async fn then_splits_to_cap(w: &mut KisekiWorld, _cap: u32, target: u32) {
     let tenant_id = w.ensure_tenant("org-pharma");
     let map = w.shard_map_store.get("big-ns", tenant_id).unwrap();
     for sr in &map.shards {
-        w.log_store.create_shard(sr.shard_id, tenant_id, sr.leader_node,
-            kiseki_log::shard::ShardConfig::default());
-        w.log_store.update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
+        w.log_store.create_shard(
+            sr.shard_id,
+            tenant_id,
+            sr.leader_node,
+            kiseki_log::shard::ShardConfig::default(),
+        );
+        w.log_store
+            .update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
     }
     let result = w.gateway_write("big-ns", b"cap-split-test").await;
-    assert!(result.is_ok(), "gateway write after capped split: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "gateway write after capped split: {:?}",
+        result.err()
+    );
 }
 
 #[then(regex = r#"^not (\d+) \(the shard_cap takes precedence\)$"#)]
 async fn then_not_overcapped(w: &mut KisekiWorld, overcapped: u32) {
     let count = w.shard_map_store.shard_count("big-ns").unwrap();
-    assert!(count < overcapped, "{} should be < {} (cap)", count, overcapped);
+    assert!(
+        count < overcapped,
+        "{} should be < {} (cap)",
+        count,
+        overcapped
+    );
 }
 
 #[then(regex = r#"^at most max\(1, (\d+)/(\d+)\) = (\d+) splits are in flight concurrently$"#)]
 async fn then_max_concurrent(_w: &mut KisekiWorld, _nodes: u32, _div: u32, expected: u32) {
-    assert_eq!(kiseki_control::shard_topology::max_concurrent_splits(50), expected);
+    assert_eq!(
+        kiseki_control::shard_topology::max_concurrent_splits(50),
+        expected
+    );
 }
 
 // --- Scenario 12: ADV-033-9 tenant auth ---
@@ -888,8 +1072,12 @@ async fn given_gateway_as_tenant(w: &mut KisekiWorld, tenant: String) {
 async fn when_get_shard_map(w: &mut KisekiWorld, ns: String) {
     let caller = *w.tenant_ids.get("org-beta").expect("org-beta registered");
     match w.shard_map_store.get(&ns, caller) {
-        Ok(_) => { w.last_error = None; }
-        Err(e) => { w.last_error = Some(e.to_string()); }
+        Ok(_) => {
+            w.last_error = None;
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+        }
     }
 }
 
@@ -901,19 +1089,26 @@ async fn then_permission_denied(w: &mut KisekiWorld) {
 
 #[then("no shard topology information is returned")]
 async fn then_no_topology_returned(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some(), "should have error, no topology returned");
+    assert!(
+        w.last_error.is_some(),
+        "should have error, no topology returned"
+    );
 }
 
 // --- Scenario 10: ADV-033-3 KeyOutOfRange via real gateway path ---
 
-#[given(regex = r#"^namespace "([^"]*)" has (\d+) shards covering ranges \[0x00, 0x55\), \[0x55, 0xAA\), \[0xAA, 0xFF\]$"#)]
+#[given(
+    regex = r#"^namespace "([^"]*)" has (\d+) shards covering ranges \[0x00, 0x55\), \[0x55, 0xAA\), \[0xAA, 0xFF\]$"#
+)]
 async fn given_ns_with_specific_ranges(w: &mut KisekiWorld, ns: String, count: u32) {
     if w.topology_active_nodes.is_empty() {
         for i in 1..=3u32 {
-            w.topology_active_nodes.push(kiseki_common::ids::NodeId(i as u64));
+            w.topology_active_nodes
+                .push(kiseki_common::ids::NodeId(i as u64));
         }
     }
-    w.ensure_topology_namespace(&ns, "org-pharma", Some(count)).await;
+    w.ensure_topology_namespace(&ns, "org-pharma", Some(count))
+        .await;
 }
 
 #[given("the gateway has a stale shard map (pre-split, single shard)")]
@@ -927,10 +1122,13 @@ async fn given_stale_shard_map(w: &mut KisekiWorld) {
     let narrow_shard = map.shards[0].shard_id;
     let mut end = [0x00; 32];
     end[31] = 0x01;
-    w.log_store.update_shard_range(narrow_shard, [0x00; 32], end);
+    w.log_store
+        .update_shard_range(narrow_shard, [0x00; 32], end);
 }
 
-#[when(regex = r#"^the gateway sends a delta with hashed_key=0x([0-9a-fA-F]+) to shard-(\d+) \(range .+\)$"#)]
+#[when(
+    regex = r#"^the gateway sends a delta with hashed_key=0x([0-9a-fA-F]+) to shard-(\d+) \(range .+\)$"#
+)]
 async fn when_gateway_sends_to_wrong_shard(w: &mut KisekiWorld, _key_hex: String, _shard_idx: u32) {
     // Write through the real gateway. The gateway will use the namespace's
     // default shard_id (shard 0, now narrowed to [0x00, 0x01)).
@@ -938,15 +1136,26 @@ async fn when_gateway_sends_to_wrong_shard(w: &mut KisekiWorld, _key_hex: String
     // triggering a real KeyOutOfRange from append_delta().
     let result = w.gateway_write("ns-routed", b"misrouted-data").await;
     match result {
-        Ok(_) => { w.last_error = None; }
-        Err(e) => { w.last_error = Some(e.to_string()); }
+        Ok(_) => {
+            w.last_error = None;
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+        }
     }
 }
 
 #[then(regex = r#"^shard-(\d+) rejects the delta with KeyOutOfRange$"#)]
 async fn then_key_out_of_range(w: &mut KisekiWorld, _shard: u32) {
-    let err = w.last_error.as_ref().expect("expected KeyOutOfRange from real path");
-    assert!(err.contains("key out of range"), "expected KeyOutOfRange, got '{}'", err);
+    let err = w
+        .last_error
+        .as_ref()
+        .expect("expected KeyOutOfRange from real path");
+    assert!(
+        err.contains("key out of range"),
+        "expected KeyOutOfRange, got '{}'",
+        err
+    );
 }
 
 #[then("the gateway refreshes its shard map via GetNamespaceShardMap")]
@@ -957,7 +1166,8 @@ async fn then_gateway_refreshes(w: &mut KisekiWorld) {
     let tenant_id = w.ensure_tenant("org-pharma");
     let map = w.shard_map_store.get("ns-routed", tenant_id).unwrap();
     for sr in &map.shards {
-        w.log_store.update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
+        w.log_store
+            .update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
     }
 }
 
@@ -971,6 +1181,8 @@ async fn then_gateway_retries(w: &mut KisekiWorld, _shard_idx: u32) {
 
 #[then("the delta is accepted")]
 async fn then_delta_accepted(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none() || w.last_error.as_deref() == Some(""),
-        "delta should be accepted after retry");
+    assert!(
+        w.last_error.is_none() || w.last_error.as_deref() == Some(""),
+        "delta should be accepted after retry"
+    );
 }

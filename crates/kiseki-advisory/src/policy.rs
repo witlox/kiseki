@@ -138,11 +138,7 @@ impl PriorityCap {
     /// Create a cap from an explicit list of allowed priorities.
     #[must_use]
     pub fn from_allowed(priorities: &[Priority]) -> Self {
-        let max_priority = priorities
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(Priority::Bulk);
+        let max_priority = priorities.iter().copied().max().unwrap_or(Priority::Bulk);
         Self {
             max_priority,
             allowed: priorities.iter().copied().collect(),
@@ -161,11 +157,7 @@ impl PriorityCap {
     /// Narrow the allowed priorities (I-WA18).
     pub fn narrow(&mut self, new_allowed: &[Priority]) {
         self.allowed = new_allowed.iter().copied().collect();
-        self.max_priority = new_allowed
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(Priority::Bulk);
+        self.max_priority = new_allowed.iter().copied().max().unwrap_or(Priority::Bulk);
     }
 
     /// Check whether a priority is still in the allowed set.
@@ -252,9 +244,7 @@ const FORBIDDEN_FIELDS: &[&str] = &[
 /// Check whether a hint target field name is forbidden (I-WA11).
 pub fn check_forbidden_target_field(field_name: &str) -> Result<(), AdvisoryError> {
     if FORBIDDEN_FIELDS.contains(&field_name) {
-        Err(AdvisoryError::ForbiddenTargetField(
-            field_name.to_owned(),
-        ))
+        Err(AdvisoryError::ForbiddenTargetField(field_name.to_owned()))
     } else {
         Ok(())
     }

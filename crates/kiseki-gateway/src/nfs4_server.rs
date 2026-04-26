@@ -84,7 +84,7 @@ struct Session {
 
 /// Stateid — identifies an open file or lock state.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct StateId([u8; 16]);
+pub struct StateId(pub [u8; 16]);
 
 /// Open file state.
 struct OpenState {
@@ -125,7 +125,7 @@ impl SessionManager {
         }
     }
 
-    fn open_file(&self, fh: FileHandle) -> StateId {
+    pub fn open_file(&self, fh: FileHandle) -> StateId {
         let sid = StateId(*uuid::Uuid::new_v4().as_bytes());
         self.open_files.lock().unwrap().insert(
             sid,
@@ -1373,7 +1373,10 @@ mod tests {
 
         let sid1 = create(&sessions);
         let sid2 = create(&sessions);
-        assert_ne!(sid1, sid2, "session_ids should be cryptographically distinct");
+        assert_ne!(
+            sid1, sid2,
+            "session_ids should be cryptographically distinct"
+        );
     }
 
     // ---------- SEQUENCE (§18.46) ----------
@@ -1439,7 +1442,10 @@ mod tests {
 
         let (status, _) = op_putrootfh(&ctx, &mut state);
         assert_eq!(status, nfs4_status::NFS4_OK);
-        assert!(state.current_fh.is_some(), "current_fh should be set after PUTROOTFH");
+        assert!(
+            state.current_fh.is_some(),
+            "current_fh should be set after PUTROOTFH"
+        );
 
         let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
         assert_eq!(state.current_fh.unwrap(), root_fh);
@@ -1559,7 +1565,10 @@ mod tests {
 
         let (status, _) = op_write(&mut reader, &ctx, &sessions, &mut state);
         assert_eq!(status, nfs4_status::NFS4_OK);
-        assert_ne!(state.current_fh, original_fh, "WRITE should update current_fh");
+        assert_ne!(
+            state.current_fh, original_fh,
+            "WRITE should update current_fh"
+        );
     }
 
     // ---------- OPEN (§18.16) ----------
@@ -1602,7 +1611,8 @@ mod tests {
         let sessions = test_sessions();
 
         // First create a file.
-        ctx.write_named("readable.txt", b"content".to_vec()).unwrap();
+        ctx.write_named("readable.txt", b"content".to_vec())
+            .unwrap();
 
         let mut state = CompoundState {
             current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
@@ -1684,7 +1694,10 @@ mod tests {
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         // The stateid should no longer be valid.
-        assert!(!sessions.is_open(&sid), "stateid should be invalidated after CLOSE");
+        assert!(
+            !sessions.is_open(&sid),
+            "stateid should be invalidated after CLOSE"
+        );
     }
 
     #[test]

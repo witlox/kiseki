@@ -55,7 +55,8 @@ pub struct InMemoryGateway {
     /// Shard map store for multi-shard routing (ADR-033).
     /// When present, the gateway routes writes to the correct shard
     /// based on `hashed_key`. When absent, uses the namespace's single `shard_id`.
-    shard_map: std::sync::RwLock<Option<Arc<kiseki_control::shard_topology::NamespaceShardMapStore>>>,
+    shard_map:
+        std::sync::RwLock<Option<Arc<kiseki_control::shard_topology::NamespaceShardMapStore>>>,
 }
 
 impl InMemoryGateway {
@@ -103,7 +104,10 @@ impl InMemoryGateway {
     }
 
     /// Re-attach a shard map store after clearing (simulates cache refresh).
-    pub fn set_shard_map(&self, store: Arc<kiseki_control::shard_topology::NamespaceShardMapStore>) {
+    pub fn set_shard_map(
+        &self,
+        store: Arc<kiseki_control::shard_topology::NamespaceShardMapStore>,
+    ) {
         *self.shard_map.write().unwrap() = Some(store);
     }
 
@@ -439,7 +443,7 @@ impl GatewayOps for InMemoryGateway {
             // ADR-033: route to correct shard via shard map if available.
             let shard_id = if let Some(ref shard_map) = *self.shard_map.read().unwrap() {
                 // Convert NamespaceId to string for shard map lookup.
-                let ns_str = emit_params.2.0.to_string();
+                let ns_str = emit_params.2 .0.to_string();
                 if let Ok(map) = shard_map.get(&ns_str, emit_params.1) {
                     kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)
                         .unwrap_or(emit_params.0)
@@ -469,7 +473,9 @@ impl GatewayOps for InMemoryGateway {
                 Err(e) => {
                     // Rollback: re-acquire lock and remove (PIPE-ADV-1).
                     let _ = self.compositions.lock().await.delete(comp_id).ok();
-                    return Err(GatewayError::Upstream(format!("delta emission failed: {e}")));
+                    return Err(GatewayError::Upstream(format!(
+                        "delta emission failed: {e}"
+                    )));
                 }
             }
         }

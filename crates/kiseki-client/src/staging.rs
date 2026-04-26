@@ -486,13 +486,8 @@ mod tests {
 
         // "Prolog" stages data.
         {
-            let mut mgr =
-                StagingManager::new(Some(pool_dir.clone()), StagingConfig::default());
-            mgr.record_staged(
-                "/training/data".into(),
-                &[test_chunk_id(0xAA)],
-                1024,
-            );
+            let mut mgr = StagingManager::new(Some(pool_dir.clone()), StagingConfig::default());
+            mgr.record_staged("/training/data".into(), &[test_chunk_id(0xAA)], 1024);
         }
 
         // "Workload" adopts the pool (loads manifests from disk).

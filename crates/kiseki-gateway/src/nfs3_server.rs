@@ -918,7 +918,9 @@ mod tests {
         let _create_reply = dispatch_nfs3(&header, &mut reader, &ctx);
 
         // Look up the created file to get its handle.
-        let (file_fh, _) = ctx.lookup_by_name("testfile.txt").expect("file should exist");
+        let (file_fh, _) = ctx
+            .lookup_by_name("testfile.txt")
+            .expect("file should exist");
 
         // WRITE to the file handle.
         let header = make_header(proc::WRITE);
@@ -970,7 +972,9 @@ mod tests {
 
         // Parse — skip RPC header to NFS status.
         let mut r = XdrReader::new(&reply);
-        for _ in 0..6 { r.read_u32().unwrap(); }
+        for _ in 0..6 {
+            r.read_u32().unwrap();
+        }
         let nfs_status = r.read_u32().unwrap();
         // The handler reads fh as default (empty) which becomes data,
         // offset=0 is fine but the write creates a new composition.
@@ -1003,9 +1007,15 @@ mod tests {
         let reply = dispatch_nfs3(&header, &mut reader, &ctx);
 
         let mut r = XdrReader::new(&reply);
-        for _ in 0..6 { r.read_u32().unwrap(); }
+        for _ in 0..6 {
+            r.read_u32().unwrap();
+        }
         let nfs_status = r.read_u32().unwrap();
-        assert_eq!(nfs_status, status::NFS3ERR_IO, "nonzero offset write should return NFS3ERR_IO");
+        assert_eq!(
+            nfs_status,
+            status::NFS3ERR_IO,
+            "nonzero offset write should return NFS3ERR_IO"
+        );
     }
 
     // ---------- CREATE (§3.3.8) ----------
@@ -1022,7 +1032,9 @@ mod tests {
         let reply = dispatch_nfs3(&header, &mut reader, &ctx);
 
         let mut r = XdrReader::new(&reply);
-        for _ in 0..6 { r.read_u32().unwrap(); }
+        for _ in 0..6 {
+            r.read_u32().unwrap();
+        }
         let nfs_status = r.read_u32().unwrap();
         assert_eq!(nfs_status, status::NFS3_OK);
         let handle_follows = r.read_bool().unwrap();
@@ -1045,7 +1057,9 @@ mod tests {
         let reply = dispatch_nfs3(&header, &mut reader, &ctx);
 
         let mut r = XdrReader::new(&reply);
-        for _ in 0..6 { r.read_u32().unwrap(); }
+        for _ in 0..6 {
+            r.read_u32().unwrap();
+        }
         let nfs_status = r.read_u32().unwrap();
         assert_eq!(nfs_status, status::NFS3ERR_NOENT);
     }
@@ -1064,7 +1078,9 @@ mod tests {
         let reply = dispatch_nfs3(&header, &mut reader, &ctx);
 
         let mut r = XdrReader::new(&reply);
-        for _ in 0..6 { r.read_u32().unwrap(); }
+        for _ in 0..6 {
+            r.read_u32().unwrap();
+        }
         let nfs_status = r.read_u32().unwrap();
         assert_eq!(nfs_status, status::NFS3ERR_NOENT);
     }
@@ -1080,7 +1096,9 @@ mod tests {
         let reply = dispatch_nfs3(&header, &mut reader, &ctx);
 
         let mut r = XdrReader::new(&reply);
-        for _ in 0..6 { r.read_u32().unwrap(); }
+        for _ in 0..6 {
+            r.read_u32().unwrap();
+        }
         let nfs_status = r.read_u32().unwrap();
         assert_eq!(nfs_status, status::NFS3_OK);
         let _post_op = r.read_bool().unwrap();
@@ -1108,7 +1126,9 @@ mod tests {
         let reply = dispatch_nfs3(&header, &mut reader, &ctx);
 
         let mut r = XdrReader::new(&reply);
-        for _ in 0..6 { r.read_u32().unwrap(); }
+        for _ in 0..6 {
+            r.read_u32().unwrap();
+        }
         let nfs_status = r.read_u32().unwrap();
         assert_eq!(nfs_status, status::NFS3_OK);
         let _post_op = r.read_bool().unwrap();

@@ -32,7 +32,8 @@ env:
 # Stage 1: fast gates (fmt, clippy, deny) — parallel
 # Stage 2: feature flag compilation matrix — after stage 1 (push only)
 # Stage 3: unit tests — after stage 1 (always)
-#          BDD, e2e, proto, arch — after stage 2 (push only)
+#          BDD, proto, arch — after stage 2 (push only)
+#          (e2e lives in release.yml — too slow for every push)
 # Stage 4: coverage — after stage 3 (push only)
 
 jobs:
@@ -148,7 +149,7 @@ jobs:
       - run: cargo nextest run --workspace --exclude kiseki-acceptance --locked
 
   acceptance:
-    name: BDD Acceptance
+    name: BDD Acceptance (fast suite)
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [feature-check]
@@ -159,7 +160,12 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
-      - name: Run BDD acceptance tests (554+ scenarios, 0 failures required)
+      - name: Run fast BDD acceptance suite (excludes @slow scenarios)
+        # The `slow-tests` Cargo feature is intentionally NOT passed here.
+        # @slow scenarios (Raft clusters, ~1s each) are filtered out by
+        # `tests/acceptance.rs` when the feature is off — keep CI fast.
+        # Run `cargo test -p kiseki-acceptance --features slow-tests` locally
+        # to exercise them.
         run: |
           output=$(cargo test -p kiseki-acceptance --locked 2>&1)
           echo "$output" | tail -10
@@ -169,60 +175,8 @@ jobs:
             exit 1
           fi
 
-  e2e:
-    name: E2E Integration
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    needs: [feature-check]
-    continue-on-error: true  # Runs on release tags only — too slow for every push
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build kiseki-server
-        run: cargo build --bin kiseki-server --locked
-
-      - name: Build Docker image
-        run: docker compose build
-
-      - name: Start server
-        run: docker compose up -d
-
-      - name: Wait for health
-        run: |
-          for i in $(seq 1 30); do
-            if docker compose exec -T kiseki-server timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9100' 2>/dev/null; then
-              echo "Server healthy after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-
-      - name: Install Python deps
-        run: pip install --quiet -r tests/e2e/pyproject.toml 2>/dev/null || pip install grpcio grpcio-tools protobuf pytest tenacity pydantic structlog
-
-      - name: Run single-node e2e tests
-        working-directory: tests/e2e
-        run: pytest -ra --tb=short --ignore=test_multi_node.py
-
-      - name: Teardown single-node
-        run: docker compose down -v
-
-      - name: Run multi-node e2e tests
-        working-directory: tests/e2e
-        run: pytest -ra --tb=short test_multi_node.py
-
-      - name: Collect logs on failure
-        if: failure()
-        run: docker compose -f docker-compose.3node.yml logs 2>/dev/null; docker compose logs 2>/dev/null; true
-
-      - name: Teardown
-        if: always()
-        run: docker compose -f docker-compose.3node.yml down -v 2>/dev/null; docker compose down -v 2>/dev/null; true
+  # E2E moved to release.yml — runs on workflow_dispatch / weekly schedule
+  # and gates `publish`. CI keeps fast-feedback only.
 
   proto-coverage:
     name: Proto Coverage

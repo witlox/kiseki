@@ -567,7 +567,10 @@ mod tests {
         assert!(metrics.read_iops > 0);
         assert!(metrics.write_iops > 0);
         assert!(metrics.avg_read_latency_ms > 0.0);
-        assert_eq!(metrics.window_seconds, 60, "metrics reflect last 60 seconds");
+        assert_eq!(
+            metrics.window_seconds, 60,
+            "metrics reflect last 60 seconds"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -607,10 +610,7 @@ mod tests {
     fn compaction_rate_minimum_guard() {
         let requested: u64 = 0;
         let minimum: u64 = 10;
-        assert!(
-            requested < minimum,
-            "compaction rate must be >= {minimum}"
-        );
+        assert!(requested < minimum, "compaction rate must be >= {minimum}");
 
         let requested_5: u64 = 5;
         assert!(requested_5 < minimum);
@@ -740,14 +740,8 @@ mod tests {
     fn sre_cannot_create_pool() {
         let svc = StorageAdminService::new();
         let result = svc.create_pool(test_pool(), AdminRole::Sre);
-        assert!(
-            result.is_err(),
-            "SRE should not be able to create pools"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            AdminError::Unauthorized
-        ));
+        assert!(result.is_err(), "SRE should not be able to create pools");
+        assert!(matches!(result.unwrap_err(), AdminError::Unauthorized));
     }
 
     // ---------------------------------------------------------------

@@ -140,8 +140,7 @@ mod tests {
         let plaintext = b"compressible data that repeats: data data data data data data";
 
         // Compress with 4KB alignment (as specified for tenant opt-in).
-        let envelope =
-            compress_and_encrypt(&aead, &master, &chunk_id, plaintext, 4096).unwrap();
+        let envelope = compress_and_encrypt(&aead, &master, &chunk_id, plaintext, 4096).unwrap();
 
         // Ciphertext length is a multiple of 4096 (padded).
         assert_eq!(
@@ -152,7 +151,11 @@ mod tests {
 
         // Round-trip: decrypt and decompress recovers original plaintext.
         let recovered = decrypt_and_decompress(&aead, &master, &envelope, 1024 * 1024).unwrap();
-        assert_eq!(recovered.as_slice(), plaintext, "round-trip must recover plaintext");
+        assert_eq!(
+            recovered.as_slice(),
+            plaintext,
+            "round-trip must recover plaintext"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -167,16 +170,14 @@ mod tests {
         // 100KB of compressible data (simulating a scaled-down version).
         let plaintext = vec![0x42u8; 100_000];
 
-        let envelope =
-            compress_and_encrypt(&aead, &master, &chunk_id, &plaintext, 4096).unwrap();
+        let envelope = compress_and_encrypt(&aead, &master, &chunk_id, &plaintext, 4096).unwrap();
 
         // Ciphertext should be padded and NOT equal to plaintext.
         assert_ne!(envelope.ciphertext, plaintext);
         assert_eq!(envelope.ciphertext.len() % 4096, 0);
 
         // Decrypt and decompress recovers original.
-        let recovered =
-            decrypt_and_decompress(&aead, &master, &envelope, 200_000).unwrap();
+        let recovered = decrypt_and_decompress(&aead, &master, &envelope, 200_000).unwrap();
         assert_eq!(recovered, plaintext);
     }
 

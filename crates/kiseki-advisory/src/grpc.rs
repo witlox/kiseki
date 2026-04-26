@@ -55,11 +55,11 @@ fn domain_error_to_proto(e: &AdvisoryError) -> kiseki_proto::v1::AdvisoryError {
         AdvisoryError::WorkflowNotFound
         | AdvisoryError::ScopeViolation
         | AdvisoryError::ScopeNotFound
-        | AdvisoryError::WorkflowUnknown => 14,       // ScopeNotFound / NOT_FOUND
-        AdvisoryError::BudgetExceeded(_) => 5,        // BudgetExceeded
-        AdvisoryError::ProfileNotAllowed(_) => 3,     // ProfileNotAllowed
+        | AdvisoryError::WorkflowUnknown => 14, // ScopeNotFound / NOT_FOUND
+        AdvisoryError::BudgetExceeded(_) => 5, // BudgetExceeded
+        AdvisoryError::ProfileNotAllowed(_) => 3, // ProfileNotAllowed
         AdvisoryError::PhaseNotMonotonic { .. } => 9, // PhaseNotMonotonic
-        AdvisoryError::AdvisoryDisabled => 2,         // AdvisoryDisabled
+        AdvisoryError::AdvisoryDisabled => 2,  // AdvisoryDisabled
         AdvisoryError::ChildExceedsParentCeiling(_) => 6,
         AdvisoryError::RetentionPolicyConflict => 10,
         AdvisoryError::PriorityNotAllowed => 11,

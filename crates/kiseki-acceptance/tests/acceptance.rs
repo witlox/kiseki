@@ -684,9 +684,8 @@ fn main() {
     #[cfg(feature = "slow-tests")]
     let runner = KisekiWorld::cucumber();
     #[cfg(not(feature = "slow-tests"))]
-    let runner = KisekiWorld::cucumber().filter_run("features/", |_, _, sc| {
-        !sc.tags.iter().any(|t| t == "slow")
-    });
+    let runner = KisekiWorld::cucumber()
+        .filter_run("features/", |_, _, sc| !sc.tags.iter().any(|t| t == "slow"));
 
     #[cfg(feature = "slow-tests")]
     rt.block_on(runner.run("features/"));

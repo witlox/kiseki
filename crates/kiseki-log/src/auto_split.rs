@@ -116,7 +116,7 @@ pub fn plan_split(info: &ShardInfo) -> Option<SplitPlan> {
     })
 }
 
-/// Execute a split plan on any LogOps backend.
+/// Execute a split plan on any `LogOps` backend.
 ///
 /// 1. Create the new shard with the upper key range.
 /// 2. Redistribute deltas from the original shard to the new one.

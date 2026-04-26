@@ -259,10 +259,11 @@ impl LogOps for MemShardStore {
             .ok_or(LogError::ShardNotFound(req.shard_id))?;
 
         match shard.info.state {
-            ShardState::Maintenance => return Err(LogError::MaintenanceMode(req.shard_id)),
+            ShardState::Maintenance | ShardState::Retiring => {
+                return Err(LogError::MaintenanceMode(req.shard_id));
+            }
             ShardState::Election => return Err(LogError::LeaderUnavailable(req.shard_id)),
             ShardState::QuorumLost => return Err(LogError::QuorumLost(req.shard_id)),
-            ShardState::Retiring => return Err(LogError::MaintenanceMode(req.shard_id)),
             ShardState::Healthy | ShardState::Splitting | ShardState::Merging => {}
         }
 
@@ -415,12 +416,7 @@ impl LogOps for MemShardStore {
         Self::create_shard(self, shard_id, tenant_id, node_id, config);
     }
 
-    fn update_shard_range(
-        &self,
-        shard_id: ShardId,
-        range_start: [u8; 32],
-        range_end: [u8; 32],
-    ) {
+    fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]) {
         Self::update_shard_range(self, shard_id, range_start, range_end);
     }
 

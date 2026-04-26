@@ -102,6 +102,7 @@ impl ChunkStore {
     }
 
     /// Check if a chunk has an injected fault.
+    #[must_use]
     pub fn is_unavailable(&self, chunk_id: &ChunkId) -> bool {
         self.unavailable.contains(chunk_id)
     }

@@ -1053,10 +1053,7 @@ mod tests {
         let num_processes: u64 = 5;
 
         let total_usage = per_process_usage * (num_processes - 1); // 4 x 45 = 180 GB
-        assert!(
-            total_usage < max_node_cache_bytes,
-            "4 processes should fit"
-        );
+        assert!(total_usage < max_node_cache_bytes, "4 processes should fit");
 
         // 5th process tries to add 45 GB → 225 GB > 200 GB → rejected.
         let new_total = total_usage + per_process_usage;

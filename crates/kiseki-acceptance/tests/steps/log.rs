@@ -323,10 +323,13 @@ async fn given_n_deltas(w: &mut KisekiWorld, name: String, count: u64) {
     }
     // If count > actual, lower the ceiling so check_split still triggers.
     if count > actual_count {
-        w.log_store.set_shard_config(sid, kiseki_log::shard::ShardConfig {
-            max_delta_count: actual_count,
-            ..kiseki_log::shard::ShardConfig::default()
-        });
+        w.log_store.set_shard_config(
+            sid,
+            kiseki_log::shard::ShardConfig {
+                max_delta_count: actual_count,
+                ..kiseki_log::shard::ShardConfig::default()
+            },
+        );
     }
 }
 
@@ -336,7 +339,10 @@ async fn then_split_triggered(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let health = w.log_store.shard_health(sid).await.unwrap();
     let check = auto_split::check_split(&health);
-    assert!(check != auto_split::SplitCheck::Ok, "shard should exceed ceiling");
+    assert!(
+        check != auto_split::SplitCheck::Ok,
+        "shard should exceed ceiling"
+    );
 }
 
 #[then(regex = r#"^a new shard "(\S+)" is created$"#)]
@@ -502,10 +508,12 @@ async fn given_range(w: &mut KisekiWorld, name: String, _from: u64, to: u64) {
 async fn given_watermark(w: &mut KisekiWorld, consumer: String, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     w.log_store
-        .register_consumer(sid, &consumer, SequenceNumber(0)).await
+        .register_consumer(sid, &consumer, SequenceNumber(0))
+        .await
         .unwrap();
     w.log_store
-        .advance_watermark(sid, &consumer, SequenceNumber(seq)).await
+        .advance_watermark(sid, &consumer, SequenceNumber(seq))
+        .await
         .unwrap();
 }
 
@@ -513,10 +521,12 @@ async fn given_watermark(w: &mut KisekiWorld, consumer: String, seq: u64) {
 async fn given_audit_wm(w: &mut KisekiWorld, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     w.log_store
-        .register_consumer(sid, "audit", SequenceNumber(0)).await
+        .register_consumer(sid, "audit", SequenceNumber(0))
+        .await
         .unwrap();
     w.log_store
-        .advance_watermark(sid, "audit", SequenceNumber(seq)).await
+        .advance_watermark(sid, "audit", SequenceNumber(seq))
+        .await
         .unwrap();
 }
 
@@ -566,10 +576,12 @@ async fn given_stalled(w: &mut KisekiWorld, consumer: String, seq: u64) {
         w.log_store.append_delta(req).await.unwrap();
     }
     w.log_store
-        .register_consumer(sid, &consumer, SequenceNumber(0)).await
+        .register_consumer(sid, &consumer, SequenceNumber(0))
+        .await
         .unwrap();
     w.log_store
-        .advance_watermark(sid, &consumer, SequenceNumber(seq)).await
+        .advance_watermark(sid, &consumer, SequenceNumber(seq))
+        .await
         .unwrap();
 }
 
@@ -577,10 +589,12 @@ async fn given_stalled(w: &mut KisekiWorld, consumer: String, seq: u64) {
 async fn given_others(w: &mut KisekiWorld, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     w.log_store
-        .register_consumer(sid, "sp-fast", SequenceNumber(0)).await
+        .register_consumer(sid, "sp-fast", SequenceNumber(0))
+        .await
         .unwrap();
     w.log_store
-        .advance_watermark(sid, "sp-fast", SequenceNumber(seq)).await
+        .advance_watermark(sid, "sp-fast", SequenceNumber(seq))
+        .await
         .unwrap();
 }
 
@@ -867,7 +881,7 @@ async fn given_split_boundary(w: &mut KisekiWorld, hex: String) {
     // Parse hex string byte by byte.
     let hex_bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&hex[i..i.min(hex.len()).max(i+2)], 16).ok())
+        .filter_map(|i| u8::from_str_radix(&hex[i..i.min(hex.len()).max(i + 2)], 16).ok())
         .collect();
     for (i, b) in hex_bytes.iter().enumerate().take(32) {
         boundary[i] = *b;
@@ -1088,10 +1102,13 @@ async fn then_no_cluster_qos(_w: &mut KisekiWorld) {
 async fn given_shard_exceeds_ceiling(w: &mut KisekiWorld, shard_name: String) {
     let sid = w.ensure_shard(&shard_name);
     // Lower the ceiling so existing/new deltas exceed it.
-    w.log_store.set_shard_config(sid, kiseki_log::shard::ShardConfig {
-        max_delta_count: 5,
-        ..kiseki_log::shard::ShardConfig::default()
-    });
+    w.log_store.set_shard_config(
+        sid,
+        kiseki_log::shard::ShardConfig {
+            max_delta_count: 5,
+            ..kiseki_log::shard::ShardConfig::default()
+        },
+    );
     // Append enough deltas to exceed the ceiling.
     for i in 0..6u8 {
         let req = w.make_append_request(sid, i);
@@ -1099,7 +1116,9 @@ async fn given_shard_exceeds_ceiling(w: &mut KisekiWorld, shard_name: String) {
     }
 }
 
-#[given(regex = r#"^namespace "([^"]*)" has shards "([^"]*)" \(range \[([^)]+)\)\) and "([^"]*)" \(range \[([^)]+)\)\)$"#)]
+#[given(
+    regex = r#"^namespace "([^"]*)" has shards "([^"]*)" \(range \[([^)]+)\)\) and "([^"]*)" \(range \[([^)]+)\)\)$"#
+)]
 async fn given_ns_with_two_shards(
     w: &mut KisekiWorld,
     ns: String,
@@ -1168,7 +1187,9 @@ async fn when_append_during_merge(w: &mut KisekiWorld) {
             w.last_sequence = Some(seq);
             w.last_error = None;
         }
-        Err(e) => { w.last_error = Some(e.to_string()); }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+        }
     }
 }
 
@@ -1177,13 +1198,20 @@ async fn then_merge_continues(w: &mut KisekiWorld) {
     // Verify shards are still in Merging state.
     let sid1 = w.ensure_shard("shard-c1");
     let health = w.log_store.shard_health(sid1).await.unwrap();
-    assert_eq!(health.state, ShardState::Merging, "shard should still be Merging");
+    assert_eq!(
+        health.state,
+        ShardState::Merging,
+        "shard should still be Merging"
+    );
 }
 
 #[then(regex = r#"^after merge completes, the delta is readable from the merged shard "([^"]*)"$"#)]
 async fn then_delta_readable_from_merged(w: &mut KisekiWorld, merged_shard: String) {
     // The merged shard was created by then_merge_triggered. Read from it.
-    let sid = *w.shard_names.get(&merged_shard).expect("merged shard should exist");
+    let sid = *w
+        .shard_names
+        .get(&merged_shard)
+        .expect("merged shard should exist");
     let health = w.log_store.shard_health(sid).await.unwrap();
     // After merge copy phase, deltas from input shards are in the merged shard.
     // The delta written during the "Merge does not block writes" When step
@@ -1200,8 +1228,14 @@ async fn when_split_triggered_during_merge(w: &mut KisekiWorld, shard_name: Stri
     let sid = w.ensure_shard(&shard_name);
     let health = w.log_store.shard_health(sid).await.unwrap();
     if health.state.is_busy() {
-        w.last_error = Some(format!("shard busy: {} in progress",
-            if health.state == ShardState::Merging { "merge" } else { "split" }));
+        w.last_error = Some(format!(
+            "shard busy: {} in progress",
+            if health.state == ShardState::Merging {
+                "merge"
+            } else {
+                "split"
+            }
+        ));
     } else {
         w.last_error = None;
     }
@@ -1210,7 +1244,12 @@ async fn when_split_triggered_during_merge(w: &mut KisekiWorld, shard_name: Stri
 #[then(regex = r#"^the split is rejected with "([^"]*)"$"#)]
 async fn then_split_rejected(w: &mut KisekiWorld, expected: String) {
     let err = w.last_error.as_ref().expect("expected split rejection");
-    assert!(err.contains(&expected), "expected '{}', got '{}'", expected, err);
+    assert!(
+        err.contains(&expected),
+        "expected '{}', got '{}'",
+        expected,
+        err
+    );
 }
 
 #[then("the merge proceeds to completion")]
@@ -1267,11 +1306,8 @@ async fn then_merge_triggered(w: &mut KisekiWorld) {
         NodeId(1),
         kiseki_log::shard::ShardConfig::default(),
     );
-    w.log_store.update_shard_range(
-        state.merged_shard,
-        state.range_start,
-        state.range_end,
-    );
+    w.log_store
+        .update_shard_range(state.merged_shard, state.range_start, state.range_end);
 
     // Execute copy phase through real LogOps.
     let copied = merge::copy_phase(w.log_store.as_ref(), &state)
@@ -1279,18 +1315,27 @@ async fn then_merge_triggered(w: &mut KisekiWorld) {
         .expect("copy phase should succeed");
 
     // Store merge state for subsequent Then steps.
-    w.shard_names.insert("shard-c12".to_owned(), state.merged_shard);
+    w.shard_names
+        .insert("shard-c12".to_owned(), state.merged_shard);
     w.last_sequence = Some(SequenceNumber(copied));
 }
 
 #[then(regex = r#"^a new shard "([^"]*)" with range \[([^)]+)\) is created$"#)]
 async fn then_merged_shard_created(w: &mut KisekiWorld, shard_name: String, _range: String) {
-    let sid = *w.shard_names.get(&shard_name)
+    let sid = *w
+        .shard_names
+        .get(&shard_name)
         .expect("merged shard should be registered");
-    let health = w.log_store.shard_health(sid).await
+    let health = w
+        .log_store
+        .shard_health(sid)
+        .await
         .expect("merged shard should exist in log store");
     // Verify it has the combined range.
-    assert_eq!(health.range_start[0], 0x00, "merged range should start at 0x00");
+    assert_eq!(
+        health.range_start[0], 0x00,
+        "merged range should start at 0x00"
+    );
     assert_eq!(health.range_end[0], 0x80, "merged range should end at 0x80");
 }
 
@@ -1299,11 +1344,15 @@ async fn then_total_order_preserved(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-c12").unwrap();
     let health = w.log_store.shard_health(sid).await.unwrap();
     if health.delta_count > 1 {
-        let deltas = w.log_store.read_deltas(ReadDeltasRequest {
-            shard_id: sid,
-            from: SequenceNumber(1),
-            to: health.tip,
-        }).await.unwrap();
+        let deltas = w
+            .log_store
+            .read_deltas(ReadDeltasRequest {
+                shard_id: sid,
+                from: SequenceNumber(1),
+                to: health.tip,
+            })
+            .await
+            .unwrap();
         // Verify monotonic sequence.
         for pair in deltas.windows(2) {
             assert!(
@@ -1339,7 +1388,11 @@ async fn then_shard_merged_event(w: &mut KisekiWorld) {
         input_shards: [sid_a, sid_b],
         merged_shard: merged,
         range_start: [0x00; 32],
-        range_end: { let mut e = [0x00; 32]; e[0] = 0x80; e },
+        range_end: {
+            let mut e = [0x00; 32];
+            e[0] = 0x80;
+            e
+        },
     };
     assert_eq!(event.input_shards[0], sid_a);
     assert_eq!(event.input_shards[1], sid_b);
@@ -1420,8 +1473,14 @@ async fn then_inputs_healthy(w: &mut KisekiWorld, s1: String, s2: String) {
 #[then(regex = r#"^a MergeAborted event is emitted with reason "([^"]*)"$"#)]
 async fn then_merge_aborted_event(w: &mut KisekiWorld, expected_reason: String) {
     let err = w.last_error.as_ref().unwrap();
-    assert!(err.contains(&expected_reason) || err.contains("ConvergenceTimeout") || err.contains("CutoverBudgetExceeded"),
-        "expected reason '{}', got '{}'", expected_reason, err);
+    assert!(
+        err.contains(&expected_reason)
+            || err.contains("ConvergenceTimeout")
+            || err.contains("CutoverBudgetExceeded"),
+        "expected reason '{}', got '{}'",
+        expected_reason,
+        err
+    );
 }
 
 #[then("no writes were lost")]
@@ -1507,25 +1566,41 @@ async fn when_auto_split_fires(w: &mut KisekiWorld) {
 
     // Verify ceiling is exceeded.
     let check = auto_split::check_split(&health);
-    assert!(check != auto_split::SplitCheck::Ok, "shard should exceed ceiling");
+    assert!(
+        check != auto_split::SplitCheck::Ok,
+        "shard should exceed ceiling"
+    );
 
     // Plan and execute split through real LogOps.
     let plan = auto_split::plan_split(&health).expect("split plan should be produced");
-    auto_split::execute_split(w.log_store.as_ref(), &plan).await
+    auto_split::execute_split(w.log_store.as_ref(), &plan)
+        .await
         .expect("split execution should succeed");
 
     // Register the new shard name.
-    w.shard_names.insert("shard-alpha-2".to_owned(), plan.new_shard);
+    w.shard_names
+        .insert("shard-alpha-2".to_owned(), plan.new_shard);
 }
 
-#[then(regex = r#"^a new Raft group is formed for "([^"]*)" with full RF=3 voter set on three distinct surviving nodes$"#)]
+#[then(
+    regex = r#"^a new Raft group is formed for "([^"]*)" with full RF=3 voter set on three distinct surviving nodes$"#
+)]
 async fn then_new_raft_group(w: &mut KisekiWorld, shard_name: String) {
-    let sid = *w.shard_names.get(&shard_name).expect("new shard should be registered");
-    let health = w.log_store.shard_health(sid).await.expect("new shard should exist");
+    let sid = *w
+        .shard_names
+        .get(&shard_name)
+        .expect("new shard should be registered");
+    let health = w
+        .log_store
+        .shard_health(sid)
+        .await
+        .expect("new shard should exist");
     assert_eq!(health.state, ShardState::Healthy);
 }
 
-#[then(regex = r#"^"([^"]*)"'s leader is placed per the best-effort round-robin policy \(I-L12\)$"#)]
+#[then(
+    regex = r#"^"([^"]*)"'s leader is placed per the best-effort round-robin policy \(I-L12\)$"#
+)]
 async fn then_leader_placed(w: &mut KisekiWorld, shard_name: String) {
     let sid = *w.shard_names.get(&shard_name).unwrap();
     let health = w.log_store.shard_health(sid).await.unwrap();
@@ -1539,13 +1614,17 @@ async fn then_ns_shard_map_updated(_w: &mut KisekiWorld) {
     // The split itself (range updates) was verified by execute_split.
 }
 
-#[then("the gateway routing cache is invalidated so subsequent writes resolve to the correct shard")]
+#[then(
+    "the gateway routing cache is invalidated so subsequent writes resolve to the correct shard"
+)]
 async fn then_routing_cache_invalidated(_w: &mut KisekiWorld) {
     // The gateway's shard map will be refreshed on the next write.
     // Verified by the subsequent write step.
 }
 
-#[then(regex = r#"^a write whose hashed_key falls in the new range is committed on "([^"]*)" \(not on "([^"]*)"\)$"#)]
+#[then(
+    regex = r#"^a write whose hashed_key falls in the new range is committed on "([^"]*)" \(not on "([^"]*)"\)$"#
+)]
 async fn then_write_to_new_shard(w: &mut KisekiWorld, new_shard: String, old_shard: String) {
     let new_sid = *w.shard_names.get(&new_shard).unwrap();
     let old_sid = *w.shard_names.get(&old_shard).unwrap();
@@ -1566,7 +1645,11 @@ async fn then_write_to_new_shard(w: &mut KisekiWorld, new_shard: String, old_sha
         has_inline_data: false,
     };
     let result = w.log_store.append_delta(req).await;
-    assert!(result.is_ok(), "write to new shard should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "write to new shard should succeed: {:?}",
+        result.err()
+    );
 
     // Same key should be rejected by old shard (out of range).
     let req_old = AppendDeltaRequest {
@@ -1580,7 +1663,10 @@ async fn then_write_to_new_shard(w: &mut KisekiWorld, new_shard: String, old_sha
         has_inline_data: false,
     };
     let result_old = w.log_store.append_delta(req_old).await;
-    assert!(result_old.is_err(), "write to old shard with new key should fail with KeyOutOfRange");
+    assert!(
+        result_old.is_err(),
+        "write to old shard with new key should fail with KeyOutOfRange"
+    );
 }
 
 #[then("no write returns KeyOutOfRange after the split completes")]
@@ -1602,7 +1688,10 @@ async fn then_no_key_out_of_range(w: &mut KisekiWorld) {
         payload: b"old-range-ok".to_vec(),
         has_inline_data: false,
     };
-    assert!(w.log_store.append_delta(req).await.is_ok(), "write to old shard in-range should succeed");
+    assert!(
+        w.log_store.append_delta(req).await.is_ok(),
+        "write to old shard in-range should succeed"
+    );
 
     // New shard: key in its range.
     let new_health = w.log_store.shard_health(new_sid).await.unwrap();
@@ -1616,5 +1705,8 @@ async fn then_no_key_out_of_range(w: &mut KisekiWorld) {
         payload: b"new-range-ok".to_vec(),
         has_inline_data: false,
     };
-    assert!(w.log_store.append_delta(req).await.is_ok(), "write to new shard in-range should succeed");
+    assert!(
+        w.log_store.append_delta(req).await.is_ok(),
+        "write to new shard in-range should succeed"
+    );
 }

@@ -225,7 +225,8 @@ impl LogOps for PersistentShardStore {
     }
 
     fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]) {
-        self.mem.update_shard_range(shard_id, range_start, range_end);
+        self.mem
+            .update_shard_range(shard_id, range_start, range_end);
     }
 
     fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
@@ -236,11 +237,21 @@ impl LogOps for PersistentShardStore {
         self.mem.set_shard_config(shard_id, config);
     }
 
-    async fn register_consumer(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+    async fn register_consumer(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) -> Result<(), LogError> {
         self.mem.register_consumer(shard_id, consumer, position)
     }
 
-    async fn advance_watermark(&self, shard_id: ShardId, consumer: &str, position: SequenceNumber) -> Result<(), LogError> {
+    async fn advance_watermark(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) -> Result<(), LogError> {
         self.mem.advance_watermark(shard_id, consumer, position)
     }
 }

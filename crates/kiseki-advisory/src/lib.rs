@@ -27,9 +27,7 @@ pub mod workflow;
 pub use budget::BudgetEnforcer;
 pub use error::AdvisoryError;
 pub use lookup::AdvisoryLookup;
-pub use policy::{
-    AdvisoryState, ProfileAllowList, WorkloadPolicy,
-};
+pub use policy::{AdvisoryState, ProfileAllowList, WorkloadPolicy};
 pub use telemetry::{
     AuditCorrelation, BackpressureSeverity, ContentionLevel, LocalityClass, OwnHotspotEvent,
     PhaseSummaryEvent, StreamWarningKind, TelemetryChannel, TelemetryResponse,

@@ -13,7 +13,7 @@ use kiseki_common::ids::{NamespaceId, OrgId};
 
 use crate::nfs::NfsGateway;
 use crate::nfs3_server::handle_nfs3_connection;
-use crate::nfs4_server::{handle_nfs4_connection, SessionManager};
+use crate::nfs4_server::handle_nfs4_connection;
 use crate::nfs_ops::NfsContext;
 use crate::nfs_xdr::{read_rm_message, write_rm_message, RpcCallHeader, XdrReader};
 use crate::ops::GatewayOps;
@@ -45,7 +45,6 @@ pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
         namespace_id,
         storage_nodes,
     ));
-    let sessions = Arc::new(SessionManager::new());
 
     let listener = TcpListener::bind(addr).unwrap_or_else(|e| {
         tracing::error!(addr = %addr, error = %e, "NFS bind failed");
@@ -64,9 +63,8 @@ pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
         };
 
         let ctx = Arc::clone(&ctx);
-        let sessions = Arc::clone(&sessions);
         thread::spawn(move || {
-            if let Err(e) = handle_connection(stream, ctx, sessions) {
+            if let Err(e) = handle_connection(stream, ctx) {
                 tracing::error!(error = %e, "NFS connection error");
             }
         });
@@ -78,7 +76,6 @@ pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
 fn handle_connection<G: GatewayOps>(
     mut stream: TcpStream,
     ctx: Arc<NfsContext<G>>,
-    sessions: Arc<SessionManager>,
 ) -> io::Result<()> {
     // Read first message to determine version.
     let first_msg = read_rm_message(&mut stream)?;
@@ -87,6 +84,7 @@ fn handle_connection<G: GatewayOps>(
 
     if header.version == 4 {
         // NFSv4 — process first COMPOUND, then continue with v4 handler.
+        let sessions = Arc::clone(&ctx.sessions);
         let reply =
             crate::nfs4_server::handle_nfs4_first_compound(&header, &first_msg, &ctx, &sessions);
         write_rm_message(&mut stream, &reply)?;

@@ -450,7 +450,13 @@ mod tests {
 
         // New config's Debug must not contain the old secret.
         let debug = format!("{new_config:?}");
-        assert!(!debug.contains("old-secret"), "old secret must not appear after rotation: {debug}");
-        assert!(!debug.contains("new-secret"), "new secret must not appear in debug either: {debug}");
+        assert!(
+            !debug.contains("old-secret"),
+            "old secret must not appear after rotation: {debug}"
+        );
+        assert!(
+            !debug.contains("new-secret"),
+            "new secret must not appear in debug either: {debug}"
+        );
     }
 }

@@ -722,7 +722,9 @@ mod tests {
         assert_eq!(chunk3, b"abcdef");
 
         // Full-file read (equivalent to mmap of entire file).
-        let full = fs.read(ino, 0, u32::try_from(data.len()).unwrap_or(u32::MAX)).unwrap();
+        let full = fs
+            .read(ino, 0, u32::try_from(data.len()).unwrap_or(u32::MAX))
+            .unwrap();
         assert_eq!(full, data);
     }
 
@@ -782,7 +784,9 @@ mod tests {
         let ino = fs.create("native.bin", data.to_vec()).unwrap();
 
         // Direct read via the FUSE fs (same path as native API).
-        let result = fs.read(ino, 0, u32::try_from(data.len()).unwrap_or(u32::MAX)).unwrap();
+        let result = fs
+            .read(ino, 0, u32::try_from(data.len()).unwrap_or(u32::MAX))
+            .unwrap();
         assert_eq!(result, data, "native API read must return same data");
 
         // Partial read: "native api test data" offset 7 = "pi test"

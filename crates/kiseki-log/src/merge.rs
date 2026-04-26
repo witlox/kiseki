@@ -162,10 +162,7 @@ pub async fn prepare_merge<L: LogOps + ?Sized>(
 /// Execute the copy phase: read all deltas from inputs, write to merged shard.
 ///
 /// Returns the number of deltas copied.
-pub async fn copy_phase<L: LogOps + ?Sized>(
-    log: &L,
-    state: &MergeState,
-) -> Result<u64, LogError> {
+pub async fn copy_phase<L: LogOps + ?Sized>(log: &L, state: &MergeState) -> Result<u64, LogError> {
     // Read all committed deltas from both shards (skip empty shards).
     let deltas_a = if state.hwm_a.0 > 0 {
         log.read_deltas(ReadDeltasRequest {
@@ -231,6 +228,7 @@ pub async fn copy_phase<L: LogOps + ?Sized>(
 }
 
 /// Abort a merge: restore input shards to Healthy, tear down merged shard.
+#[must_use]
 pub fn abort_merge(state: &MergeState, reason: MergeAbortReason) -> MergeAbortedEvent {
     MergeAbortedEvent {
         input_shards: [state.shard_a, state.shard_b],
@@ -239,6 +237,7 @@ pub fn abort_merge(state: &MergeState, reason: MergeAbortReason) -> MergeAborted
 }
 
 /// Complete the merge: emit `ShardMergedEvent`.
+#[must_use]
 pub fn complete_merge(state: &MergeState) -> ShardMergedEvent {
     ShardMergedEvent {
         input_shards: [state.shard_a, state.shard_b],

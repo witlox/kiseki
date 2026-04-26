@@ -142,15 +142,15 @@ pub fn hipaa_retention_hold() -> RetentionHold {
 
 /// Crypto-shred force override audit event.
 #[must_use]
-pub fn crypto_shred_force_override_event(
-    tenant_id: OrgId,
-    reason: &str,
-) -> AuditEvent {
+pub fn crypto_shred_force_override_event(tenant_id: OrgId, reason: &str) -> AuditEvent {
     AuditEvent {
         sequence: SequenceNumber(0), // filled by audit store
         timestamp: DeltaTimestamp {
             hlc: kiseki_common::time::HybridLogicalClock::zero(kiseki_common::ids::NodeId(0)),
-            wall: kiseki_common::time::WallTime { millis_since_epoch: 0, timezone: String::new() },
+            wall: kiseki_common::time::WallTime {
+                millis_since_epoch: 0,
+                timezone: String::new(),
+            },
             quality: kiseki_common::time::ClockQuality::Unsync,
         }, // filled by audit store
         event_type: AuditEventType::KeyDestruction,
@@ -285,7 +285,7 @@ mod tests {
     fn advisory_audit_batching_ratio() {
         let total_events: u64 = 10_000;
         let emitted_events: u64 = 1_000; // after batching
-        // Precision loss is acceptable: these are event counts used for a ratio metric.
+                                         // Precision loss is acceptable: these are event counts used for a ratio metric.
         #[allow(clippy::cast_precision_loss)]
         let batching_ratio = total_events as f64 / emitted_events as f64;
 
@@ -306,7 +306,10 @@ mod tests {
     fn advisory_audit_growth_triggers_safety_valve() {
         // If advisory audit events stall consumer by > 24h, safety valve engages.
         let action = evaluate_safety_valve(25, 24);
-        assert_eq!(action, SafetyValveAction::ProceedWithGap { stall_hours: 25 });
+        assert_eq!(
+            action,
+            SafetyValveAction::ProceedWithGap { stall_hours: 25 }
+        );
     }
 
     // ---------------------------------------------------------------

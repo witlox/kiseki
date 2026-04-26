@@ -73,6 +73,20 @@ impl MemKeyStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.status = status;
     }
+
+    /// Inject an unavailability fault — `fetch_master_key`, `current_epoch`,
+    /// and `rotate` will return [`KeyManagerError::Unavailable`] (which maps
+    /// to a retriable `KisekiError`) until [`Self::recover`] is called.
+    ///
+    /// Used by BDD scenarios that simulate a tenant KMS outage.
+    pub fn inject_unavailable(&self) {
+        self.set_status(KeyManagerStatus::Unavailable);
+    }
+
+    /// Clear an injected fault — restore the store to `Healthy`.
+    pub fn recover(&self) {
+        self.set_status(KeyManagerStatus::Healthy);
+    }
 }
 
 impl Default for MemKeyStore {
@@ -364,5 +378,26 @@ mod tests {
         // Keys themselves are NEVER recorded in the event.
         // (Structural proof: KeyLifecycleEvent has no field that could
         // hold key material — only key_id, event_type, timestamp, actor.)
+    }
+
+    #[tokio::test]
+    async fn inject_unavailable_makes_fetch_return_retriable_unavailable() {
+        let store = MemKeyStore::new().unwrap();
+        let epoch = store.current_epoch().await.unwrap();
+
+        store.inject_unavailable();
+
+        assert!(matches!(
+            store.fetch_master_key(epoch).await,
+            Err(KeyManagerError::Unavailable)
+        ));
+        assert!(matches!(
+            store.current_epoch().await,
+            Err(KeyManagerError::Unavailable)
+        ));
+
+        store.recover();
+        assert!(store.fetch_master_key(epoch).await.is_ok());
+        assert!(store.current_epoch().await.is_ok());
     }
 }

@@ -6,7 +6,7 @@
 //!
 //! ADR-037: test infrastructure for 41 multi-node Raft BDD scenarios.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
@@ -29,6 +29,7 @@ pub struct InMemoryRouter {
 
 impl InMemoryRouter {
     /// Create a new empty router.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             blocked: RwLock::new(HashSet::new()),

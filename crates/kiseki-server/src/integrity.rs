@@ -156,7 +156,11 @@ mod tests {
             // No alerts should be sent regardless of results.
             for status in &results {
                 let _alert = match status {
-                    IntegrityStatus::DebuggerDetected | IntegrityStatus::CoreDumpsEnabled if !dev_mode => true,
+                    IntegrityStatus::DebuggerDetected | IntegrityStatus::CoreDumpsEnabled
+                        if !dev_mode =>
+                    {
+                        true
+                    }
                     _ => false, // dev mode: suppress
                 };
             }

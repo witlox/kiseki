@@ -55,7 +55,10 @@ fn profile_not_in_allow_list_rejected() {
     // BatchEtl is NOT in the allow-list.
     let result = allow_list.check(WorkloadProfile::BatchEtl);
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), AdvisoryError::ProfileNotAllowed(_)));
+    assert!(matches!(
+        result.unwrap_err(),
+        AdvisoryError::ProfileNotAllowed(_)
+    ));
 
     // No workflow handle should be issued — validated by the fact that
     // declare would never be reached after this check.
@@ -63,10 +66,8 @@ fn profile_not_in_allow_list_rejected() {
 
 #[test]
 fn allowed_profile_accepted() {
-    let allow_list = ProfileAllowList::new(&[
-        WorkloadProfile::AiTraining,
-        WorkloadProfile::AiInference,
-    ]);
+    let allow_list =
+        ProfileAllowList::new(&[WorkloadProfile::AiTraining, WorkloadProfile::AiInference]);
     assert!(allow_list.check(WorkloadProfile::AiTraining).is_ok());
 }
 
@@ -220,7 +221,10 @@ fn telemetry_not_existence_oracle() {
     let absent = scope.check("totally-nonexistent");
 
     // Both return the same error variant.
-    assert!(matches!(forbidden.unwrap_err(), AdvisoryError::ScopeNotFound));
+    assert!(matches!(
+        forbidden.unwrap_err(),
+        AdvisoryError::ScopeNotFound
+    ));
     assert!(matches!(absent.unwrap_err(), AdvisoryError::ScopeNotFound));
 
     // The error shapes are identical — no timing/size/code difference.
@@ -310,7 +314,10 @@ fn hint_cannot_elevate_priority_beyond_max() {
     // Interactive > Batch, so rejected.
     let result = cap.check(Priority::Interactive);
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), AdvisoryError::PriorityNotAllowed));
+    assert!(matches!(
+        result.unwrap_err(),
+        AdvisoryError::PriorityNotAllowed
+    ));
 
     // Batch is at the max, allowed.
     assert!(cap.check(Priority::Batch).is_ok());
@@ -468,7 +475,10 @@ fn tenant_admin_disables_advisory() {
     state = AdvisoryState::Disabled;
     let result = state.check_declare();
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), AdvisoryError::AdvisoryDisabled));
+    assert!(matches!(
+        result.unwrap_err(),
+        AdvisoryError::AdvisoryDisabled
+    ));
 }
 
 #[test]
@@ -477,7 +487,10 @@ fn cluster_admin_disables_advisory() {
     let state = AdvisoryState::Disabled;
     let result = state.check_declare();
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), AdvisoryError::AdvisoryDisabled));
+    assert!(matches!(
+        result.unwrap_err(),
+        AdvisoryError::AdvisoryDisabled
+    ));
 }
 
 // =============================================================================
@@ -642,10 +655,8 @@ fn draining_fsm() {
 
 #[test]
 fn policy_revocation_prospective() {
-    let mut allow_list = ProfileAllowList::new(&[
-        WorkloadProfile::AiTraining,
-        WorkloadProfile::AiInference,
-    ]);
+    let mut allow_list =
+        ProfileAllowList::new(&[WorkloadProfile::AiTraining, WorkloadProfile::AiInference]);
 
     // Current phase uses AiTraining — the snapshotted profile is still valid
     // for the current phase even after revocation.
@@ -672,7 +683,14 @@ fn policy_revocation_prospective() {
 fn forbidden_target_fields_rejected() {
     use kiseki_advisory::policy::check_forbidden_target_field;
 
-    let forbidden = ["shard_id", "log_position", "chunk_id", "dedup_hash", "node_id", "device_id"];
+    let forbidden = [
+        "shard_id",
+        "log_position",
+        "chunk_id",
+        "dedup_hash",
+        "node_id",
+        "device_id",
+    ];
 
     for field in &forbidden {
         let result = check_forbidden_target_field(field);
@@ -830,8 +848,12 @@ fn deadline_hint_accepted() {
 #[test]
 fn phase_ring_eviction() {
     let max_history = 4; // Small ring for testing.
-    let mut entry =
-        WorkflowEntry::new(test_ref(0x01), WorkloadProfile::AiTraining, PhaseId(1), max_history);
+    let mut entry = WorkflowEntry::new(
+        test_ref(0x01),
+        WorkloadProfile::AiTraining,
+        PhaseId(1),
+        max_history,
+    );
 
     // Fill the ring: phases 1, 2, 3, 4.
     entry.advance_phase(PhaseId(2)).unwrap();
@@ -1019,13 +1041,7 @@ fn rejection_latency_uniform() {
 #[test]
 fn telemetry_response_size_bucketed() {
     // Different load levels.
-    let low_load = TelemetryResponse::new(
-        None,
-        None,
-        vec![LocalityClass::LocalNode],
-        0.1,
-        10,
-    );
+    let low_load = TelemetryResponse::new(None, None, vec![LocalityClass::LocalNode], 0.1, 10);
 
     let high_load = TelemetryResponse::new(
         Some(BackpressureSeverity::Hard),

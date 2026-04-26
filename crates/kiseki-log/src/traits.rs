@@ -98,12 +98,7 @@ pub trait LogOps: Send + Sync {
     );
 
     /// Update a shard's key range (used during split/merge, ADR-033/034).
-    fn update_shard_range(
-        &self,
-        shard_id: ShardId,
-        range_start: [u8; 32],
-        range_end: [u8; 32],
-    );
+    fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]);
 
     /// Transition a shard's lifecycle state (ADR-034 merge protocol).
     fn set_shard_state(&self, shard_id: ShardId, state: ShardState);
