@@ -10,12 +10,14 @@ repository.workspace = true
 [lints]
 workspace = true
 
-# ADV-3: Dependency firewall — control plane depends ONLY on kiseki-common
-# and kiseki-proto. No data-path crates (log, chunk, composition, view,
-# gateway, client, keymanager, crypto, raft, transport, audit, advisory).
+# ADV-3: Dependency firewall — control plane depends ONLY on kiseki-common,
+# kiseki-proto, and observability shims (kiseki-tracing). No data-path
+# crates (log, chunk, composition, view, gateway, client, keymanager,
+# crypto, raft, transport, audit, advisory).
 [dependencies]
 kiseki-common = { workspace = true }
 kiseki-proto = { workspace = true }
+kiseki-tracing = { workspace = true }
 tonic = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

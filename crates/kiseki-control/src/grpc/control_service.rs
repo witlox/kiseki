@@ -87,6 +87,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::CreateOrganizationRequest>,
     ) -> Result<Response<pb::CreateOrganizationResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.CreateOrganization");
         let req = request.into_inner();
         let id = uuid::Uuid::new_v4().to_string();
         let org = Organization {
@@ -107,6 +108,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::CreateProjectRequest>,
     ) -> Result<Response<pb::CreateProjectResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.CreateProject");
         let req = request.into_inner();
         let org_id = req
             .org_id
@@ -133,6 +135,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::CreateWorkloadRequest>,
     ) -> Result<Response<pb::CreateWorkloadResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.CreateWorkload");
         let req = request.into_inner();
         let org_id = req
             .org_id
@@ -164,6 +167,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::GetOrganizationRequest>,
     ) -> Result<Response<pb::Organization>, Status> {
+        let _s = kiseki_tracing::span("ControlService.GetOrganization");
         let req = request.into_inner();
         let org_id = req.org_id.as_ref().map_or("", |o| o.value.as_str());
         let org = self.tenants.get_org(org_id).map_err(|e| to_status(&e))?;
@@ -182,6 +186,7 @@ impl ControlService for ControlGrpc {
         &self,
         _request: Request<pb::ListOrganizationsRequest>,
     ) -> Result<Response<pb::ListOrganizationsResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.ListOrganizations");
         let orgs = self.tenants.list_orgs();
         let proto_orgs: Vec<pb::Organization> = orgs
             .into_iter()
@@ -204,6 +209,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::CreateNamespaceRequest>,
     ) -> Result<Response<pb::CreateNamespaceResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.CreateNamespace");
         let req = request.into_inner();
         let org_id = req
             .org_id
@@ -234,6 +240,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::AccessRequest>,
     ) -> Result<Response<pb::AccessRequestResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.RequestAccess");
         let req = request.into_inner();
         let id = uuid::Uuid::new_v4().to_string();
         let tenant_id = req
@@ -268,6 +275,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::ApproveAccessRequest>,
     ) -> Result<Response<pb::ApproveAccessResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.ApproveAccess");
         let req = request.into_inner();
         let mut requests = self
             .access_requests
@@ -284,6 +292,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::DenyAccessRequest>,
     ) -> Result<Response<pb::DenyAccessResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.DenyAccess");
         let req = request.into_inner();
         let mut requests = self
             .access_requests
@@ -300,6 +309,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::SetQuotaRequest>,
     ) -> Result<Response<pb::SetQuotaResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.SetQuota");
         super::authz::require_admin(&request)?;
         let req = request.into_inner();
         // Verify the target scope exists.
@@ -324,6 +334,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::SetComplianceTagsRequest>,
     ) -> Result<Response<pb::SetComplianceTagsResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.SetComplianceTags");
         super::authz::require_admin(&request)?;
         let req = request.into_inner();
         // Verify scope exists.
@@ -345,6 +356,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::SetRetentionHoldRequest>,
     ) -> Result<Response<pb::SetRetentionHoldResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.SetRetentionHold");
         super::authz::require_admin(&request)?;
         let req = request.into_inner();
         let ns_id = match req.scope {
@@ -362,6 +374,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::ReleaseRetentionHoldRequest>,
     ) -> Result<Response<pb::ReleaseRetentionHoldResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.ReleaseRetentionHold");
         super::authz::require_admin(&request)?;
         let req = request.into_inner();
         self.retention
@@ -374,6 +387,7 @@ impl ControlService for ControlGrpc {
         &self,
         _request: Request<pb::ListFlavorsRequest>,
     ) -> Result<Response<pb::ListFlavorsResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.ListFlavors");
         super::authz::require_admin(&_request)?;
         let flavors = flavor::default_flavors();
         let proto_flavors: Vec<pb::Flavor> = flavors
@@ -395,6 +409,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::MatchFlavorRequest>,
     ) -> Result<Response<pb::MatchFlavorResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.MatchFlavor");
         super::authz::require_admin(&request)?;
         let req = request.into_inner();
         let available = flavor::default_flavors();
@@ -431,6 +446,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::RegisterPeerRequest>,
     ) -> Result<Response<pb::RegisterPeerResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.RegisterPeer");
         super::authz::require_admin(&request)?;
         let req = request.into_inner();
         let peer_id = uuid::Uuid::new_v4().to_string();
@@ -450,6 +466,7 @@ impl ControlService for ControlGrpc {
         &self,
         _request: Request<pb::ListPeersRequest>,
     ) -> Result<Response<pb::ListPeersResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.ListPeers");
         super::authz::require_admin(&_request)?;
         let peers = self.federation.list_peers();
         let proto_peers = peers
@@ -472,6 +489,7 @@ impl ControlService for ControlGrpc {
         &self,
         request: Request<pb::SetMaintenanceModeRequest>,
     ) -> Result<Response<pb::SetMaintenanceModeResponse>, Status> {
+        let _s = kiseki_tracing::span("ControlService.SetMaintenanceMode");
         super::authz::require_admin(&request)?;
         let req = request.into_inner();
         if req.enabled {

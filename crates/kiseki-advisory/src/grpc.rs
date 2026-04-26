@@ -170,6 +170,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         &self,
         request: Request<DeclareWorkflowRequest>,
     ) -> Result<Response<DeclareWorkflowResponse>, Status> {
+        let _s = kiseki_tracing::span("WorkflowAdvisoryService.DeclareWorkflow");
         let req = request.into_inner();
 
         // Budget check.
@@ -214,6 +215,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         &self,
         request: Request<EndWorkflowRequest>,
     ) -> Result<Response<EndWorkflowResponse>, Status> {
+        let _s = kiseki_tracing::span("WorkflowAdvisoryService.EndWorkflow");
         let req = request.into_inner();
         let wf_ref = extract_wf_ref(req.correlation.as_ref())?;
 
@@ -240,6 +242,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         &self,
         request: Request<PhaseAdvanceRequest>,
     ) -> Result<Response<PhaseAdvanceResponse>, Status> {
+        let _s = kiseki_tracing::span("WorkflowAdvisoryService.PhaseAdvance");
         let req = request.into_inner();
         let wf_ref = extract_wf_ref(req.correlation.as_ref())?;
 
@@ -268,6 +271,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         &self,
         request: Request<GetWorkflowStatusRequest>,
     ) -> Result<Response<GetWorkflowStatusResponse>, Status> {
+        let _s = kiseki_tracing::span("WorkflowAdvisoryService.GetWorkflowStatus");
         let req = request.into_inner();
         let wf_ref = extract_wf_ref(req.correlation.as_ref())?;
 
@@ -299,6 +303,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         &self,
         request: Request<tonic::Streaming<AdvisoryClientMessage>>,
     ) -> Result<Response<Self::AdvisoryStreamStream>, Status> {
+        let _s = kiseki_tracing::span("WorkflowAdvisoryService.AdvisoryStream");
         let mut in_stream = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AdvisoryServerMessage, Status>>(64);
 
