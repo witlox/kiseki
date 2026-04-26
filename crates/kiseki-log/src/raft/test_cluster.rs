@@ -291,6 +291,13 @@ impl RaftTestCluster {
     }
 
     /// Write a delta through the leader.
+    ///
+    /// Bounded by a 5 s timeout — openraft's `client_write` blocks
+    /// indefinitely when quorum cannot commit, which would hang the
+    /// "quorum loss blocks writes" scenario forever (~90 min observed
+    /// before adding this guard). The timeout converts the indefinite
+    /// wait into a `LogError::Unavailable`, which is exactly what the
+    /// scenario asserts.
     pub async fn write_delta(&self, key_byte: u8) -> Result<SequenceNumber, LogError> {
         let leader_id = self
             .wait_for_leader(Duration::from_secs(5))
@@ -307,10 +314,9 @@ impl RaftTestCluster {
             has_inline_data: false,
         };
 
-        let resp = leader
-            .raft
-            .client_write(cmd)
+        let resp = tokio::time::timeout(Duration::from_secs(5), leader.raft.client_write(cmd))
             .await
+            .map_err(|_| LogError::Unavailable)?
             .map_err(|_| LogError::Unavailable)?;
 
         match resp.data {

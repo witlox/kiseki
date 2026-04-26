@@ -208,6 +208,15 @@ pub struct KisekiWorld {
     /// Per-gateway S3 task handles for graceful shutdown.
     pub s3_tasks: Vec<tokio::task::JoinHandle<()>>,
 
+    // === Persistence harness (ADR-022) ===
+    /// Per-scenario `PersistentShardStore` backed by a redb database in a
+    /// tempdir. Persistence-feature steps drive writes through this store
+    /// and call `restart_persistent_store()` between Given and Then to
+    /// drop + reopen — proving the scenario survives a real reload, not
+    /// the no-op that the in-memory `MemShardStore` provides.
+    pub persistent_shard_store: Option<Arc<kiseki_log::persistent_store::PersistentShardStore>>,
+    pub persistent_temp_dir: Option<tempfile::TempDir>,
+
     // === Tenant KMS providers (ADR-028) ===
     /// Per-provider-name `TenantKmsProvider` instances. Every named slot
     /// (`internal`, `vault`, `kmip`, `aws-kms`, `pkcs11`) is backed by a
@@ -452,6 +461,8 @@ impl KisekiWorld {
             last_delta: None,
             telemetry_bus,
             kms_providers,
+            persistent_shard_store: None,
+            persistent_temp_dir: None,
             backpressure_subs: HashMap::new(),
             qos_subs: HashMap::new(),
             tcp_endpoints: HashMap::new(),
@@ -715,6 +726,52 @@ impl KisekiWorld {
             .or_else(|| self.tenant_ids.values().next())
             .copied()
             .unwrap_or(self.nfs_ctx.tenant_id)
+    }
+
+    /// Open or reuse a `PersistentShardStore` for persistence-feature
+    /// scenarios. Creates a tempdir-backed redb on first call; subsequent
+    /// calls return the existing handle until `restart_persistent_store`
+    /// drops it.
+    pub async fn persistent_store(
+        &mut self,
+    ) -> Arc<kiseki_log::persistent_store::PersistentShardStore> {
+        if self.persistent_shard_store.is_none() {
+            let dir = tempfile::tempdir().expect("persistent store tempdir");
+            let path = dir.path().join("raft-log.redb");
+            let store = kiseki_log::persistent_store::PersistentShardStore::open(&path)
+                .await
+                .expect("open persistent store");
+            self.persistent_shard_store = Some(Arc::new(store));
+            self.persistent_temp_dir = Some(dir);
+        }
+        Arc::clone(
+            self.persistent_shard_store
+                .as_ref()
+                .expect("just initialised"),
+        )
+    }
+
+    /// Simulate a server restart: drop the in-memory state of the
+    /// `PersistentShardStore`, then reopen it against the same redb path.
+    /// Anything that wasn't durably committed to redb is lost; anything
+    /// that was survives. The tempdir is preserved so the redb file persists.
+    ///
+    /// No-op when no persistent store has been opened — scenarios that
+    /// don't touch the persistent store (chunk/view/key/inline restart
+    /// scenarios, still wired against in-memory stores) treat the
+    /// "server restart" step as effectively a flush, since their
+    /// in-memory state IS what survives in their world model.
+    pub async fn restart_persistent_store(&mut self) {
+        let Some(dir) = self.persistent_temp_dir.as_ref() else {
+            return;
+        };
+        let path = dir.path().join("raft-log.redb");
+        // Drop the existing handle so we can reopen against the same path.
+        self.persistent_shard_store = None;
+        let store = kiseki_log::persistent_store::PersistentShardStore::open(&path)
+            .await
+            .expect("reopen persistent store");
+        self.persistent_shard_store = Some(Arc::new(store));
     }
 
     /// Write data through the integrated pipeline (gateway → encrypt → store).

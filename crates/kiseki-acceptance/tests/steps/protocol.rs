@@ -1705,84 +1705,175 @@ async fn when_sre_pool_status(w: &mut KisekiWorld, _pool: String) {
 
 // =======================================================================
 // Persistence and crash recovery (persistence.feature)
+//
+// Every Given/When/Then in this section drives a real
+// `kiseki_log::PersistentShardStore` backed by a tempdir-scoped redb.
+// `when_server_restart` actually drops + reopens the store — the
+// "delta survives restart" assertion is now falsifiable: if redb
+// commit were skipped the reload would not see the delta.
 // =======================================================================
+
+/// Stable shard id for a persistence-feature shard name.
+fn persist_shard_id(name: &str) -> kiseki_common::ids::ShardId {
+    kiseki_common::ids::ShardId(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_DNS,
+        name.as_bytes(),
+    ))
+}
+
+async fn persist_ensure_shard(w: &mut KisekiWorld, name: &str) -> kiseki_common::ids::ShardId {
+    let sid = persist_shard_id(name);
+    let tenant = w.ensure_tenant("org-pharma");
+    let store = w.persistent_store().await;
+    // Idempotent under both PersistentShardStore (delegates) and reloads.
+    use kiseki_log::traits::LogOps;
+    store.create_shard(
+        sid,
+        tenant,
+        kiseki_common::ids::NodeId(1),
+        kiseki_log::shard::ShardConfig::default(),
+    );
+    sid
+}
+
+async fn persist_append(w: &mut KisekiWorld, sid: kiseki_common::ids::ShardId, key_byte: u8) {
+    use kiseki_log::traits::{AppendDeltaRequest, LogOps};
+    let tenant = w.ensure_tenant("org-pharma");
+    let timestamp = w.timestamp();
+    let store = w.persistent_store().await;
+    store
+        .append_delta(AppendDeltaRequest {
+            shard_id: sid,
+            tenant_id: tenant,
+            operation: kiseki_log::delta::OperationType::Create,
+            timestamp,
+            hashed_key: [key_byte; 32],
+            chunk_refs: vec![],
+            payload: vec![key_byte; 64],
+            has_inline_data: false,
+        })
+        .await
+        .expect("append to persistent store");
+}
 
 // --- Raft log persistence ---
 
 #[given("a delta was written via LogService AppendDelta")]
 async fn given_delta_written(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("persist-test");
-    let req = w.make_append_request(sid, 0xAA);
-    w.log_store.append_delta(req).await.unwrap();
+    let sid = persist_ensure_shard(w, "persist-test").await;
+    persist_append(w, sid, 0xAA).await;
 }
 
 #[when("the server is restarted")]
-async fn when_server_restart(_w: &mut KisekiWorld) {
-    // In-memory store persists across this step — simulates a clean restart
-    // where all committed state was flushed to disk before shutdown.
+async fn when_server_restart(w: &mut KisekiWorld) {
+    // Real restart: drop the in-memory PersistentShardStore handle and
+    // reopen against the same redb path. Anything not committed to redb
+    // is lost; anything committed survives.
+    w.restart_persistent_store().await;
 }
 
 #[then("the delta is readable via ReadDeltas")]
 async fn then_delta_readable(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("persist-test");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    assert!(health.delta_count > 0, "delta should survive restart");
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("persist-test");
+    let store = w.persistent_store().await;
+    let health = store
+        .shard_health(sid)
+        .await
+        .expect("shard recovered after restart");
+    assert!(
+        health.delta_count > 0,
+        "delta must survive restart (delta_count={})",
+        health.delta_count,
+    );
 }
 
 #[then("the sequence number is preserved")]
 async fn then_seq_preserved(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("persist-test");
-    let health = w.log_store.shard_health(sid).await.unwrap();
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("persist-test");
+    let store = w.persistent_store().await;
+    let health = store.shard_health(sid).await.unwrap();
+    // After restart + reload, tip should match the highest committed seq.
     assert!(
-        health.delta_count > 0,
-        "sequence numbers should be preserved"
+        health.tip.0 >= 1,
+        "sequence number must be preserved across restart (tip={:?})",
+        health.tip,
     );
 }
 
 #[given(regex = r#"^(\d+) deltas were written to shard "([^"]*)"$"#)]
 async fn given_n_deltas(w: &mut KisekiWorld, n: u32, shard: String) {
-    let sid = w.ensure_shard(&shard);
+    let sid = persist_ensure_shard(w, &shard).await;
     for i in 0..n {
-        let req = w.make_append_request(sid, (i & 0xFF) as u8);
-        w.log_store.append_delta(req).await.unwrap();
+        persist_append(w, sid, (i & 0xFF) as u8).await;
     }
 }
 
 #[then(regex = r"^all (\d+) deltas are readable$")]
 async fn then_all_readable(w: &mut KisekiWorld, n: u64) {
-    let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    assert_eq!(health.delta_count, n);
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("s1");
+    let store = w.persistent_store().await;
+    let health = store.shard_health(sid).await.unwrap();
+    assert_eq!(
+        health.delta_count, n,
+        "all {n} deltas must survive restart (got delta_count={})",
+        health.delta_count,
+    );
 }
 
 #[then(regex = r"^their order is preserved \(I-L1\)$")]
 async fn then_order_preserved(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    assert!(health.delta_count > 0, "deltas should be in order");
+    use kiseki_log::traits::{LogOps, ReadDeltasRequest};
+    let sid = persist_shard_id("s1");
+    let store = w.persistent_store().await;
+    let deltas = store
+        .read_deltas(ReadDeltasRequest {
+            shard_id: sid,
+            from: kiseki_common::ids::SequenceNumber(0),
+            to: kiseki_common::ids::SequenceNumber(u64::MAX),
+        })
+        .await
+        .expect("read after restart");
+    assert!(deltas.len() >= 2, "need ≥2 deltas to verify order");
+    for pair in deltas.windows(2) {
+        assert!(
+            pair[0].header.sequence < pair[1].header.sequence,
+            "deltas must be in monotonic sequence order (I-L1)",
+        );
+    }
 }
 
 #[given(regex = r"^the Raft group elected leader at term (\d+)$")]
 async fn given_raft_term(w: &mut KisekiWorld, _term: u64) {
-    // Ensure a shard exists to hold Raft state.
-    let sid = w.ensure_shard("raft-term-test");
-    let req = w.make_append_request(sid, 0xBB);
-    w.log_store.append_delta(req).await.unwrap();
+    let sid = persist_ensure_shard(w, "raft-term-test").await;
+    persist_append(w, sid, 0xBB).await;
 }
 
 #[then(regex = r"^the persisted term is (\d+)$")]
 async fn then_term_persisted(w: &mut KisekiWorld, _term: u64) {
-    let sid = w.ensure_shard("raft-term-test");
-    let health = w.log_store.shard_health(sid).await.unwrap();
-    assert!(health.delta_count > 0, "raft state should be persisted");
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("raft-term-test");
+    let store = w.persistent_store().await;
+    let health = store
+        .shard_health(sid)
+        .await
+        .expect("raft shard recovered after restart");
+    assert!(
+        health.delta_count > 0,
+        "raft state (term/vote stand-in via delta presence) must survive restart",
+    );
 }
 
 #[then("the vote is preserved")]
 async fn then_vote_preserved(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("raft-term-test");
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("raft-term-test");
+    let store = w.persistent_store().await;
     assert!(
-        w.log_store.shard_health(sid).await.is_ok(),
-        "vote state should be preserved"
+        store.shard_health(sid).await.is_ok(),
+        "vote state must be reachable after restart",
     );
 }
 
@@ -1819,77 +1910,84 @@ async fn then_log_truncatable(_w: &mut KisekiWorld) {
 
 #[given(regex = r"^a snapshot exists at log index [\d,]+$")]
 async fn given_snapshot_at_index(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("snapshot-restore");
+    let sid = persist_ensure_shard(w, "snapshot-restore").await;
     for i in 0..50u8 {
-        let req = w.make_append_request(sid, i);
-        w.log_store.append_delta(req).await.unwrap();
+        persist_append(w, sid, i).await;
     }
 }
 
 #[given(regex = r"^(\d+) additional log entries exist.*$")]
 async fn given_additional_entries(w: &mut KisekiWorld, n: u32) {
-    let sid = w.ensure_shard("snapshot-restore");
+    let sid = persist_ensure_shard(w, "snapshot-restore").await;
     let count = std::cmp::min(n, 50);
     for i in 0..count {
-        let req = w.make_append_request(sid, (0x50 + (i & 0xFF)) as u8);
-        w.log_store.append_delta(req).await.unwrap();
+        persist_append(w, sid, (0x50 + (i & 0xFF)) as u8).await;
     }
 }
 
 #[then("the state machine is restored from the snapshot")]
 async fn then_restored_from_snapshot(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("snapshot-restore");
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("snapshot-restore");
+    let store = w.persistent_store().await;
     assert!(
-        w.log_store.shard_health(sid).await.is_ok(),
-        "state machine should be restored"
+        store.shard_health(sid).await.is_ok(),
+        "state machine must be restored from the persistent store after restart",
     );
 }
 
 #[then(regex = r"^entries [\d,]+-[\d,]+ are replayed$")]
 async fn then_entries_replayed(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("snapshot-restore");
-    let health = w.log_store.shard_health(sid).await.unwrap();
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("snapshot-restore");
+    let store = w.persistent_store().await;
+    let health = store.shard_health(sid).await.unwrap();
     assert!(
         health.delta_count > 50,
-        "replayed entries should be present"
+        "replayed entries must be present after restart (delta_count={})",
+        health.delta_count,
     );
 }
 
 #[then("the final state matches pre-restart state")]
 async fn then_final_state_matches(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("snapshot-restore");
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("snapshot-restore");
+    let store = w.persistent_store().await;
     assert!(
-        w.log_store.shard_health(sid).await.is_ok(),
-        "final state should match"
+        store.shard_health(sid).await.is_ok(),
+        "final state must match — shard reachable post-restart",
     );
 }
 
 #[given("a snapshot was taken")]
 async fn given_snapshot_taken(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("snapshot-survive");
+    let sid = persist_ensure_shard(w, "snapshot-survive").await;
     for i in 0..10u8 {
-        let req = w.make_append_request(sid, i);
-        w.log_store.append_delta(req).await.unwrap();
+        persist_append(w, sid, i).await;
     }
 }
 
 #[then("the snapshot is still available in redb")]
 async fn then_snapshot_in_redb(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("snapshot-survive");
+    use kiseki_log::traits::LogOps;
+    let sid = persist_shard_id("snapshot-survive");
+    let store = w.persistent_store().await;
+    let health = store
+        .shard_health(sid)
+        .await
+        .expect("redb-backed shard recoverable after restart");
     assert!(
-        w.log_store.shard_health(sid).await.is_ok(),
-        "snapshot should be available after restart"
+        health.delta_count >= 10,
+        "snapshot must contain pre-restart deltas (got {})",
+        health.delta_count,
     );
 }
 
 #[then("new entries can be appended after the snapshot")]
 async fn then_append_after_snapshot(w: &mut KisekiWorld) {
-    let sid = w.ensure_shard("snapshot-survive");
-    let req = w.make_append_request(sid, 0xCC);
-    assert!(
-        w.log_store.append_delta(req).await.is_ok(),
-        "should append after snapshot"
-    );
+    let sid = persist_shard_id("snapshot-survive");
+    persist_append(w, sid, 0xCC).await;
 }
 
 // --- Chunk data persistence ---
