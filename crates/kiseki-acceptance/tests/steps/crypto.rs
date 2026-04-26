@@ -213,8 +213,24 @@ async fn then_migration(w: &mut KisekiWorld, from: u64, to: u64) {
 }
 
 #[then("the rotation event is recorded in the audit log")]
-async fn then_rotation_audit(_w: &mut KisekiWorld) {
-    // TODO: wire audit infrastructure
+async fn then_rotation_audit(w: &mut KisekiWorld) {
+    // I-K11 / ADR-006: the production `MemKeyStore::rotate()` now
+    // emits a `KeyRotation` event into the World's shared `audit_log`.
+    // The test queries — it does not produce — so this assertion fails
+    // unless the production code path actually emitted.
+    use kiseki_audit::event::AuditEventType;
+    use kiseki_audit::store::{AuditOps, AuditQuery};
+    use kiseki_common::ids::SequenceNumber;
+    let events = w.audit_log.query(&AuditQuery {
+        tenant_id: None,
+        from: SequenceNumber(1),
+        limit: 100,
+        event_type: Some(AuditEventType::KeyRotation),
+    });
+    assert!(
+        !events.is_empty(),
+        "rotate() must have emitted at least one KeyRotation event into the audit log",
+    );
 }
 
 // === Scenario: Tenant KEK wrap details ===

@@ -66,7 +66,7 @@ pub struct KisekiWorld {
     /// (split buffering, inline store wiring, etc.).
     pub mem_shard_store: Arc<MemShardStore>,
     pub key_store: MemKeyStore,
-    pub audit_log: AuditLog,
+    pub audit_log: Arc<AuditLog>,
     pub chunk_store: ChunkStore,
     pub comp_store: CompositionStore,
     pub view_store: ViewStore,
@@ -271,7 +271,18 @@ impl std::fmt::Debug for KisekiWorld {
 
 impl KisekiWorld {
     fn new() -> Self {
+        // Audit log first so key-store rotation / destruction events
+        // can be sunk into it from the start.
+        let audit_log = Arc::new(AuditLog::new());
+
         let key_store = MemKeyStore::new().unwrap_or_else(|_| MemKeyStore::default());
+        // ADR-006 / I-K11: route key-lifecycle events into the shared
+        // audit log so BDD assertions can query for emissions instead
+        // of fabricating events.
+        let _ = key_store.set_audit_log(
+            Arc::clone(&audit_log) as Arc<dyn kiseki_audit::store::AuditOps + Send + Sync>
+        );
+
         let mem_shard_store = Arc::new(MemShardStore::new());
         let log_store: Arc<dyn LogOps + Send + Sync> =
             Arc::clone(&mem_shard_store) as Arc<dyn LogOps + Send + Sync>;
@@ -352,7 +363,7 @@ impl KisekiWorld {
             log_store,
             mem_shard_store,
             key_store,
-            audit_log: AuditLog::new(),
+            audit_log,
             chunk_store: ChunkStore::new(),
             comp_store,
             view_store: ViewStore::new(),

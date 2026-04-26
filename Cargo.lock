@@ -1729,6 +1729,7 @@ dependencies = [
  "aws-lc-rs",
  "base64",
  "futures",
+ "kiseki-audit",
  "kiseki-common",
  "kiseki-crypto",
  "kiseki-proto",

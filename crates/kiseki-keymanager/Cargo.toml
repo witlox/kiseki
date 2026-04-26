@@ -18,6 +18,7 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+kiseki-audit = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }
 thiserror = { workspace = true }

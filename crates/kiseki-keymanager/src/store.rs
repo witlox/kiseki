@@ -3,9 +3,13 @@
 //! Uses `Mutex` for interior mutability so that `KeyManagerOps` methods
 //! can take `&self` (required for Raft-backed implementations).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use kiseki_audit::event::{AuditEvent, AuditEventType};
+use kiseki_audit::store::AuditOps;
+use kiseki_common::ids::{NodeId, SequenceNumber};
 use kiseki_common::tenancy::KeyEpoch;
+use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
 use kiseki_crypto::keys::SystemMasterKey;
 
 use crate::epoch::{EpochInfo, KeyManagerOps};
@@ -28,6 +32,12 @@ struct Inner {
 /// In-memory key store for testing and development.
 pub struct MemKeyStore {
     inner: Mutex<Inner>,
+    /// Optional audit sink for ADR-006 / I-K11 key lifecycle events.
+    /// When attached, `rotate()` and other lifecycle ops emit
+    /// structured events (`AuditEventType::KeyRotation`, etc.) so
+    /// downstream auditors can prove the operation happened without
+    /// the test having to construct the event itself.
+    audit: OnceLock<Arc<dyn AuditOps + Send + Sync>>,
 }
 
 impl MemKeyStore {
@@ -44,7 +54,44 @@ impl MemKeyStore {
         };
         Ok(Self {
             inner: Mutex::new(inner),
+            audit: OnceLock::new(),
         })
+    }
+
+    /// Attach an audit sink. Once attached, key-lifecycle operations
+    /// (rotate, destroy) emit structured `AuditEvent` records into it
+    /// so downstream consumers can verify the operation happened
+    /// without the test fabricating the event. Set-once.
+    pub fn set_audit_log(
+        &self,
+        audit: Arc<dyn AuditOps + Send + Sync>,
+    ) -> Result<(), Arc<dyn AuditOps + Send + Sync>> {
+        self.audit.set(audit)
+    }
+
+    /// Build the canonical audit event for a key-lifecycle operation
+    /// driven by this store. Tenant scope is left as `None` because
+    /// system-wide rotations apply to every tenant.
+    fn audit_event(event_type: AuditEventType, description: String) -> AuditEvent {
+        AuditEvent {
+            sequence: SequenceNumber(0),
+            timestamp: DeltaTimestamp {
+                hlc: HybridLogicalClock {
+                    physical_ms: 0,
+                    logical: 0,
+                    node_id: NodeId(0),
+                },
+                wall: WallTime {
+                    millis_since_epoch: 0,
+                    timezone: "UTC".into(),
+                },
+                quality: ClockQuality::Ntp,
+            },
+            event_type,
+            tenant_id: None,
+            actor: "kiseki-keymanager".into(),
+            description,
+        }
     }
 
     /// Get the health status of this key store.
@@ -96,6 +143,7 @@ impl Default for MemKeyStore {
                 epochs: Vec::new(),
                 status: KeyManagerStatus::Unavailable,
             }),
+            audit: OnceLock::new(),
         })
     }
 }
@@ -168,6 +216,20 @@ impl KeyManagerOps for MemKeyStore {
             is_current: true,
             migration_complete: false,
         });
+        // Drop the inner-state lock before touching the audit sink so a
+        // misbehaving sink can't deadlock the key store.
+        drop(inner);
+
+        // I-K11 / ADR-006: emit a structured KeyRotation event when an
+        // audit sink is wired. No-op when none is attached — production
+        // code (Raft state machine) attaches the cluster audit log;
+        // tests can attach `Arc<AuditLog>` directly.
+        if let Some(audit) = self.audit.get() {
+            audit.append(Self::audit_event(
+                AuditEventType::KeyRotation,
+                format!("system master key rotated to epoch {next_epoch}"),
+            ));
+        }
 
         Ok(new_epoch)
     }
@@ -399,5 +461,50 @@ mod tests {
         store.recover();
         assert!(store.fetch_master_key(epoch).await.is_ok());
         assert!(store.current_epoch().await.is_ok());
+    }
+
+    /// I-K11 / ADR-006: every successful key rotation emits a
+    /// `KeyRotation` audit event into the attached sink. The test
+    /// is the AUDITOR (queries the log), the production code is
+    /// the producer (calls `audit.append` from `rotate()`).
+    #[tokio::test]
+    async fn rotate_emits_key_rotation_audit_event() {
+        use kiseki_audit::store::{AuditLog, AuditQuery};
+        let store = MemKeyStore::new().unwrap();
+        let audit: Arc<AuditLog> = Arc::new(AuditLog::new());
+        store
+            .set_audit_log(Arc::clone(&audit) as Arc<dyn AuditOps + Send + Sync>)
+            .map_err(|_| ())
+            .expect("audit sink can be set once");
+
+        let before_tip = audit.tip(None);
+        let new_epoch = store.rotate().await.expect("rotate succeeds");
+        let after_tip = audit.tip(None);
+        assert!(
+            after_tip > before_tip,
+            "rotate must advance the audit log tip ({before_tip:?} → {after_tip:?})",
+        );
+
+        let events = audit.query(&AuditQuery {
+            tenant_id: None,
+            from: SequenceNumber(before_tip.0 + 1),
+            limit: 10,
+            event_type: Some(AuditEventType::KeyRotation),
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| e.description.contains(&new_epoch.0.to_string())),
+            "audit log must contain a KeyRotation event naming the new epoch",
+        );
+    }
+
+    /// Without an audit sink, rotate must still succeed (production
+    /// must never depend on audit being wired — I-WA1 analogue).
+    #[tokio::test]
+    async fn rotate_works_without_audit_sink() {
+        let store = MemKeyStore::new().unwrap();
+        let epoch = store.rotate().await.expect("rotate succeeds without audit");
+        assert!(epoch.0 >= 2);
     }
 }
