@@ -61,6 +61,6 @@ pub use redb_raft_log_store::RedbRaftLogStore;
 pub mod tcp_transport;
 
 pub use network::{StubNetwork, StubNetworkFactory};
-pub use node::KisekiNode;
+pub use node::{KisekiNode, Topology};
 pub use redb_log_store::RedbLogStore;
 pub use tcp_transport::{TcpNetwork, TcpNetworkFactory};

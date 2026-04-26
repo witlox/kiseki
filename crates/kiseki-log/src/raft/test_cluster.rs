@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
-use kiseki_raft::{KisekiNode, RedbRaftLogStore};
+use kiseki_raft::{KisekiNode, RedbRaftLogStore, Topology};
 use openraft::error::RPCError;
 use openraft::type_config::async_runtime::WatchReceiver;
 use openraft::Raft;
@@ -244,6 +244,9 @@ pub struct RaftTestCluster {
     /// Per-node redb file path under `log_dir` so `restart_node` can
     /// reopen the same state.
     log_paths: HashMap<u64, PathBuf>,
+    /// Topology label per node (Phase 14f). Set via `set_topology`,
+    /// consulted by the placement-spread assertions in BDD scenarios.
+    node_topologies: HashMap<u64, Topology>,
 }
 
 impl RaftTestCluster {
@@ -273,6 +276,7 @@ impl RaftTestCluster {
                     id,
                     KisekiNode {
                         addr: format!("127.0.0.1:{}", 9100 + id),
+                        ..Default::default()
                     },
                 )
             })
@@ -292,7 +296,31 @@ impl RaftTestCluster {
             shard_id,
             log_dir,
             log_paths,
+            node_topologies: HashMap::new(),
         }
+    }
+
+    /// Attach a topology label to `node_id`. Used by placement and
+    /// rack-aware tests to model failure-domain spread.
+    pub fn set_topology(&mut self, node_id: u64, topology: Topology) {
+        self.node_topologies.insert(node_id, topology);
+    }
+
+    /// Topology label for `node_id`, if one has been set.
+    #[must_use]
+    pub fn topology_of(&self, node_id: u64) -> Option<&Topology> {
+        self.node_topologies.get(&node_id)
+    }
+
+    /// Distinct failure domains across the current voters. Used by
+    /// the rack-spread assertion: `>= 2` means the placement avoids
+    /// a single-rack outage.
+    pub async fn voter_failure_domains(&self) -> std::collections::HashSet<String> {
+        self.voter_ids()
+            .await
+            .into_iter()
+            .filter_map(|id| self.node_topologies.get(&id).map(Topology::failure_domain))
+            .collect()
     }
 
     /// Get the current leader node ID — the node agreed on by a
@@ -431,6 +459,7 @@ impl RaftTestCluster {
         let leader = &self.nodes[&leader_id];
         let kn = KisekiNode {
             addr: format!("127.0.0.1:{}", 9100 + new_id),
+            ..Default::default()
         };
         leader
             .raft
@@ -554,6 +583,7 @@ impl kiseki_common::raft_adapter::RaftMembershipAdapter for RaftTestCluster {
                     id,
                     KisekiNode {
                         addr: format!("127.0.0.1:{}", 9100 + id),
+                        ..Default::default()
                     },
                 );
             }
@@ -561,6 +591,7 @@ impl kiseki_common::raft_adapter::RaftMembershipAdapter for RaftTestCluster {
                 replacement.0,
                 KisekiNode {
                     addr: format!("127.0.0.1:{}", 9100 + replacement.0),
+                    ..Default::default()
                 },
             );
             self.change_membership(new_voters)
