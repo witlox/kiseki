@@ -1866,6 +1866,7 @@ dependencies = [
  "kiseki-proto",
  "kiseki-transport",
  "kiseki-view",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
