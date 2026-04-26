@@ -612,6 +612,32 @@ impl KisekiWorld {
         ns_id
     }
 
+    /// Async sibling of `ensure_namespace` that ALSO registers the
+    /// namespace with the gateway. Required for steps that drive
+    /// `gateway_write` directly — the sync `ensure_namespace` only
+    /// touches the standalone comp_store and can't reach the
+    /// gateway's async `add_namespace` API.
+    pub async fn ensure_namespace_in_gateway(
+        &mut self,
+        name: &str,
+        shard_name: &str,
+    ) -> NamespaceId {
+        let ns_id = self.ensure_namespace(name, shard_name);
+        let tenant_id = self.ensure_tenant("org-pharma");
+        let shard_id = self.ensure_shard(shard_name);
+        self.gateway
+            .add_namespace(Namespace {
+                id: ns_id,
+                tenant_id,
+                shard_id,
+                read_only: false,
+                versioning_enabled: false,
+                compliance_tags: Vec::new(),
+            })
+            .await;
+        ns_id
+    }
+
     /// Create a multi-shard namespace via the real shard topology store,
     /// then register each shard in the log store with its key range and
     /// register the namespace in the gateway's composition store.

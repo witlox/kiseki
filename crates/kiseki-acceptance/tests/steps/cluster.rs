@@ -13,6 +13,22 @@ use crate::KisekiWorld;
 
 // === Background ===
 
+/// Lazily ensure a 3-node `RaftTestCluster` exists for cluster-formation
+/// scenarios that ask about RPC servers / membership / convergence.
+async fn ensure_cluster(w: &mut KisekiWorld) {
+    if w.raft_cluster.is_some() {
+        return;
+    }
+    let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+    let tenant_id = w.ensure_tenant("org-pharma");
+    let cluster =
+        kiseki_log::raft::test_cluster::RaftTestCluster::new(3, shard_id, tenant_id).await;
+    let _ = cluster
+        .wait_for_leader(std::time::Duration::from_secs(10))
+        .await;
+    w.raft_cluster = Some(cluster);
+}
+
 #[given("3 Raft-capable nodes with TCP transport")]
 async fn given_3_raft_nodes(w: &mut KisekiWorld) {
     // Establish a 3-node cluster environment. In the in-memory store,
@@ -27,6 +43,18 @@ async fn when_node1_seeds(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("cluster-shard");
     let req = w.make_append_request(sid, 0x01);
     w.log_store.append_delta(req).await.unwrap();
+    // Also seed a real RaftTestCluster so Then-steps that ask about
+    // "node-1's RPC server" / "node-2 joins" have something to inspect.
+    if w.raft_cluster.is_none() {
+        let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+        let tenant_id = w.ensure_tenant("org-pharma");
+        let cluster =
+            kiseki_log::raft::test_cluster::RaftTestCluster::new(3, shard_id, tenant_id).await;
+        let _ = cluster
+            .wait_for_leader(std::time::Duration::from_secs(10))
+            .await;
+        w.raft_cluster = Some(cluster);
+    }
 }
 
 #[then(regex = r#"^node-1 calls raft\.initialize\(\) with all \d+ members$"#)]
@@ -270,6 +298,7 @@ async fn when_quorum_reached(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("cluster-shard");
     let req = w.make_append_request(sid, 0x06);
     w.log_store.append_delta(req).await.unwrap();
+    ensure_cluster(w).await;
 }
 
 #[then("the leader can commit writes (majority = 2)")]
@@ -430,6 +459,7 @@ async fn when_double_init(w: &mut KisekiWorld) {
     // Idempotent initialization: second call is a no-op.
     let req = w.make_append_request(sid, 0x30);
     w.log_store.append_delta(req).await.unwrap();
+    ensure_cluster(w).await;
 }
 
 #[then("the second call is a no-op (idempotent)")]

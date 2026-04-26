@@ -1994,7 +1994,8 @@ async fn then_append_after_snapshot(w: &mut KisekiWorld) {
 
 #[given("a chunk was written via the gateway (encrypt + store)")]
 async fn given_chunk_via_gateway(w: &mut KisekiWorld) {
-    w.ensure_namespace("persist-ns", "persist-shard");
+    w.ensure_namespace_in_gateway("persist-ns", "persist-shard")
+        .await;
     let resp = w
         .gateway_write("persist-ns", b"persistent-chunk-data")
         .await
@@ -2049,7 +2050,8 @@ async fn then_plaintext_matches(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^(\d+) chunks stored in pool file "([^"]*)"$"#)]
 async fn given_n_chunks_in_pool(w: &mut KisekiWorld, n: u32, _pool: String) {
-    w.ensure_namespace("pool-test", "pool-shard");
+    w.ensure_namespace_in_gateway("pool-test", "pool-shard")
+        .await;
     let count = std::cmp::min(n, 50); // Scale down for test speed.
     for i in 0..count {
         let data = format!("chunk-{i}");
