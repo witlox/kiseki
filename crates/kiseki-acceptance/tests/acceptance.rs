@@ -873,35 +873,21 @@ fn main() {
     // to "no extra restriction".
     let scenario_filter = std::env::var("KISEKI_SCENARIO_FILTER").ok();
     let feature_filter = std::env::var("KISEKI_FEATURE_FILTER").ok();
-    let scenario_filter_for_closure = scenario_filter.clone();
-    let feature_filter_for_closure = feature_filter.clone();
 
-    // By default, skip @slow scenarios (Raft clusters take ~1s each).
-    // Include them with: cargo test -p kiseki-acceptance --features slow-tests
-    #[cfg(feature = "slow-tests")]
+    // `@slow` scenarios were genuinely 1-2 s each on macOS (osxfs/virtiofs
+    // fsync overhead + tokio timer coalescing pushing election windows
+    // past the 150-300 ms threshold). On Linux with `epoll` + native fs
+    // they're hundreds of ms tops — see specs/ops/runtimes.md per-feature
+    // table. So skip `@slow` only when the host is macOS AND the
+    // `slow-tests` feature is off; on Linux always include them, and on
+    // macOS include them when the feature is explicitly requested.
+    let skip_slow = cfg!(target_os = "macos") && !cfg!(feature = "slow-tests");
+
     let runner = KisekiWorld::cucumber().filter_run("features/", move |feat, _, sc| {
-        if let Some(ref fname) = feature_filter_for_closure {
-            if !feat
-                .path
-                .as_deref()
-                .is_some_and(|p| p.to_string_lossy().contains(fname))
-            {
-                return false;
-            }
-        }
-        if let Some(ref name) = scenario_filter_for_closure {
-            if !sc.name.contains(name) {
-                return false;
-            }
-        }
-        true
-    });
-    #[cfg(not(feature = "slow-tests"))]
-    let runner = KisekiWorld::cucumber().filter_run("features/", move |feat, _, sc| {
-        if sc.tags.iter().any(|t| t == "slow") {
+        if skip_slow && sc.tags.iter().any(|t| t == "slow") {
             return false;
         }
-        if let Some(ref fname) = feature_filter_for_closure {
+        if let Some(ref fname) = feature_filter {
             if !feat
                 .path
                 .as_deref()
@@ -910,7 +896,7 @@ fn main() {
                 return false;
             }
         }
-        if let Some(ref name) = scenario_filter_for_closure {
+        if let Some(ref name) = scenario_filter {
             if !sc.name.contains(name) {
                 return false;
             }

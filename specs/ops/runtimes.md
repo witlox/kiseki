@@ -7,8 +7,9 @@ right verification step before committing.
 
 | Suite | Cmd | Scenarios | Wall time | Notes |
 |---|---|---:|---:|---|
-| Fast | `cargo test -p kiseki-acceptance --test acceptance` | 181 | **~1m 45s** (measured 2026-04-26) | Default; runs on every CI push. |
-| Slow | `cargo test -p kiseki-acceptance --test acceptance --features slow-tests` | 241 | **~1m 02s** (measured 2026-04-26) | Faster than the fast suite because (a) ~23 scenarios short-circuit on `todo!()` panics (Phase 14f scope) and (b) the `@slow` tag is **pre-Phase-13f legacy**. See "Per-feature measurements" below. **First attempt hung at "Quorum loss blocks writes"** because `RaftTestCluster::write_delta` had no timeout; openraft's `client_write` blocks indefinitely without quorum. Killed at ~90 min wall. Fix landed (5 s `tokio::time::timeout` around `client_write` in `crates/kiseki-log/src/raft/test_cluster.rs`). |
+| Default (Linux) | `cargo test -p kiseki-acceptance --test acceptance` | 241 | **~55s** (measured 2026-04-26) | The `@slow` tag is now `cfg!(target_os = "macos")`-gated in `tests/acceptance.rs::main`. On Linux all 241 scenarios run. Until Phase 14f closes the 23 `todo!()` stubs that happen to be tagged `@slow`, the suite reports 208/241 passing. CI is red on Linux during this window — intentional. |
+| Default (macOS) | `cargo test -p kiseki-acceptance --test acceptance` | 181 | (historical) | macOS still skips `@slow` by default. Use `--features slow-tests` to include them; expect 1-2 s/scenario for Raft + redb. |
+| All (any host) | `cargo test -p kiseki-acceptance --test acceptance --features slow-tests` | 241 | ~55s on Linux | Force-include `@slow` regardless of host. Used by the release workflow. |
 
 ### Per-feature measurements (2026-04-26, Linux, slow-tests on)
 
