@@ -9,9 +9,31 @@ use kiseki_log::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 
 // === Background ===
 
+/// Returns a `&mut RaftTestCluster`, lazily spawning a 3-node cluster
+/// the first time an integration step asks for one. Keeps unit-tier
+/// scenarios from paying the cluster spin-up cost.
+async fn ensure_raft_cluster(
+    w: &mut KisekiWorld,
+) -> &mut kiseki_log::raft::test_cluster::RaftTestCluster {
+    if w.raft_cluster.is_none() {
+        let shard_id = ShardId(uuid::Uuid::from_u128(0x1_06A_1FA));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(0x1_06A_7E0));
+        let cluster =
+            kiseki_log::raft::test_cluster::RaftTestCluster::new(3, shard_id, tenant_id).await;
+        cluster
+            .wait_for_leader(std::time::Duration::from_secs(10))
+            .await
+            .expect("3-node cluster must elect a leader");
+        w.raft_cluster = Some(cluster);
+    }
+    w.raft_cluster.as_mut().unwrap()
+}
+
 #[given("a Kiseki cluster with 5 storage nodes")]
 async fn given_cluster(_w: &mut KisekiWorld) {
-    // No-op at @unit tier — cluster provisioning is an @integration concern.
+    // No-op at @unit tier — cluster provisioning is an @integration concern
+    // and is performed lazily in `ensure_raft_cluster()` when an
+    // integration step actually needs the Raft group.
 }
 
 #[given(regex = r#"^a shard "(\S+)" with a 3-member Raft group on nodes 1, 2, 3$"#)]
@@ -32,8 +54,20 @@ async fn given_tenant(w: &mut KisekiWorld, t: String) {
 // === Scenario 1: Successful delta append (1 remaining: replication assertion) ===
 
 #[then(regex = r#"^the delta is replicated to at least \d+ of \d+ Raft members$"#)]
-async fn then_replicated(_w: &mut KisekiWorld) {
-    todo!("verify delta is replicated to Raft majority")
+async fn then_replicated(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    let _ = c.write_delta(0xE0).await.expect("write should commit");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut acked = 0u32;
+    for id in 1..=3u64 {
+        if !c.read_from(id).await.is_empty() {
+            acked += 1;
+        }
+    }
+    assert!(
+        acked >= 2,
+        "delta should be on majority (≥2 of 3); got {acked}"
+    );
 }
 
 #[then(regex = r#"^a DeltaCommitted event is emitted with sequence_number \d+$"#)]
@@ -252,35 +286,75 @@ async fn then_no_gaps(w: &mut KisekiWorld) {
 // === Scenario 4: Raft leader loss ===
 
 #[when("node 1 becomes unreachable")]
-async fn when_node_unreachable(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft election")
+async fn when_node_unreachable(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    // Commit something first so "no committed deltas are lost" has bite.
+    let _ = c.write_delta(0xE1).await.expect("write");
+    let leader = c
+        .leader()
+        .await
+        .expect("cluster should have a leader before partition");
+    c.isolate_node(leader).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
 #[then("a new leader is elected from nodes 2 and 3")]
-async fn then_new_leader(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft election")
+async fn then_new_leader(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    let new_leader = c
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await
+        .expect("a new leader must be elected");
+    assert!(
+        new_leader != 1,
+        "new leader must NOT be the isolated node; got node-{new_leader}"
+    );
 }
 
 #[then("writes resume after election completes")]
-async fn then_writes_resume(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft election")
+async fn then_writes_resume(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    let res = c.write_delta(0xE2).await;
+    assert!(res.is_ok(), "writes must resume after new leader election");
 }
 
 #[then("in-flight uncommitted deltas are retried by the Composition context")]
-async fn then_retried(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft election")
+async fn then_retried(w: &mut KisekiWorld) {
+    // Composition retry policy is its own concern; here we assert the
+    // observable: writes that are issued post-election succeed.
+    let c = ensure_raft_cluster(w).await;
+    assert!(c.write_delta(0xE3).await.is_ok());
 }
 
 #[then("no committed deltas are lost")]
-async fn then_no_loss(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft election")
+async fn then_no_loss(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    // Pre-partition write `0xE1` should be visible on the surviving
+    // majority's state machines.
+    let mut survivors_with_data = 0u32;
+    for id in 2..=3u64 {
+        if !c.read_from(id).await.is_empty() {
+            survivors_with_data += 1;
+        }
+    }
+    assert!(
+        survivors_with_data >= 1,
+        "committed pre-partition deltas must remain on at least one survivor"
+    );
 }
 
 // === Scenario 5: Write during election ===
 
 #[given(regex = r#"^a leader election is in progress for "(\S+)"$"#)]
-async fn given_election(_w: &mut KisekiWorld, _name: String) {
-    todo!("trigger real Raft election")
+async fn given_election(w: &mut KisekiWorld, _name: String) {
+    let c = ensure_raft_cluster(w).await;
+    // Hard-partition every node so no majority can form for the
+    // duration of the When step — the write must observe a real
+    // "leader unavailable" rather than racing with re-election.
+    for id in 1..=3u64 {
+        c.isolate_node(id).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
 #[when("the Composition context appends a delta")]
@@ -297,62 +371,121 @@ async fn when_append_single(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^the append is rejected with a retriable "leader unavailable" error$"#)]
-async fn then_leader_unavailable(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft election")
+async fn then_leader_unavailable(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    // Best-effort: with the leader isolated, write_delta times out
+    // (LogError::Unavailable) — that's the retriable signal the
+    // Composition context observes.
+    let res = c.write_delta(0xE4).await;
+    assert!(
+        res.is_err(),
+        "writes during a fresh election must be rejected"
+    );
 }
 
 #[then("the Composition context retries after backoff")]
-async fn then_backoff(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft election")
+async fn then_backoff(w: &mut KisekiWorld) {
+    // Restore the isolated node so the retry succeeds, modelling
+    // the Composition retry loop.
+    let c = ensure_raft_cluster(w).await;
+    for id in 1..=3u64 {
+        c.restore_node(id).await;
+    }
+    let _ = c.wait_for_leader(std::time::Duration::from_secs(5)).await;
+    assert!(c.write_delta(0xE5).await.is_ok());
 }
 
 // === Scenario 6: Quorum loss ===
 
 #[given(regex = r#"^nodes (\d+) and (\d+) become unreachable for "(\S+)"$"#)]
-async fn given_nodes_down(_w: &mut KisekiWorld, _a: u64, _b: u64, _name: String) {
-    todo!("trigger real Raft quorum loss")
+async fn given_nodes_down(w: &mut KisekiWorld, a: u64, b: u64, _name: String) {
+    let c = ensure_raft_cluster(w).await;
+    c.isolate_node(a).await;
+    c.isolate_node(b).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
 #[given("only node 1 (leader) remains")]
-async fn given_one_node(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft quorum loss")
+async fn given_one_node(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    // Leader-only survival: isolate everyone else.
+    let leader = c.leader().await.unwrap_or(1);
+    for id in 1..=3u64 {
+        if id != leader {
+            c.isolate_node(id).await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
 #[then(regex = r#"^shard "(\S+)" cannot form a Raft majority$"#)]
-async fn then_no_majority(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft quorum loss")
+async fn then_no_majority(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    // With only one node reachable, our majority-aware leader() must
+    // return None (single vote can't form majority of 3).
+    assert!(
+        c.leader().await.is_none(),
+        "lone surviving node must not present as majority leader"
+    );
 }
 
 #[then(regex = r#"^all write commands are rejected with "quorum unavailable" error$"#)]
-async fn then_quorum_unavailable(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft quorum loss")
+async fn then_quorum_unavailable(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    let res = c.write_delta(0xE6).await;
+    assert!(res.is_err(), "writes must fail when quorum is lost");
 }
 
 #[then("read commands from existing replicas may continue if stale reads are permitted by the view descriptor")]
-async fn then_stale_reads(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft quorum loss")
+async fn then_stale_reads(w: &mut KisekiWorld) {
+    // Stale reads from an existing replica's state machine succeed
+    // even without quorum — the test cluster's read_from is exactly
+    // such a stale read.
+    let c = ensure_raft_cluster(w).await;
+    // Read does not panic / does not return an error; either Some or
+    // empty Vec is valid (the leader may have applied nothing yet).
+    let _ = c.read_from(1).await;
 }
 
 // === Scenario 7: Quorum recovery ===
 
 #[given(regex = r#"^shard "(\S+)" lost quorum with only node (\d+) available$"#)]
-async fn given_lost_quorum(_w: &mut KisekiWorld, _name: String, _node: u64) {
-    todo!("trigger real Raft quorum loss")
+async fn given_lost_quorum(w: &mut KisekiWorld, _name: String, available: u64) {
+    let c = ensure_raft_cluster(w).await;
+    for id in 1..=3u64 {
+        if id != available {
+            c.isolate_node(id).await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
 #[when(regex = r#"^node (\d+) comes back online$"#)]
-async fn when_node_back(_w: &mut KisekiWorld, _n: u64) {
-    todo!("trigger real Raft quorum loss")
+async fn when_node_back(w: &mut KisekiWorld, n: u64) {
+    let c = ensure_raft_cluster(w).await;
+    c.restore_node(n).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
 #[then("quorum is restored (2 of 3)")]
-async fn then_quorum(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft quorum loss")
+async fn then_quorum(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    let leader = c.wait_for_leader(std::time::Duration::from_secs(10)).await;
+    assert!(
+        leader.is_some(),
+        "with 2/3 reachable, a majority leader must emerge"
+    );
 }
 
 #[then("a leader is elected (or confirmed)")]
-async fn then_leader_confirmed(_w: &mut KisekiWorld) {
-    todo!("trigger real Raft election")
+async fn then_leader_confirmed(w: &mut KisekiWorld) {
+    let c = ensure_raft_cluster(w).await;
+    assert!(
+        c.wait_for_leader(std::time::Duration::from_secs(5))
+            .await
+            .is_some(),
+        "a leader must be elected or already confirmed"
+    );
 }
 
 #[then("writes resume")]

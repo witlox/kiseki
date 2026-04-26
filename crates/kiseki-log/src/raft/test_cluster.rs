@@ -300,6 +300,14 @@ impl RaftTestCluster {
         }
     }
 
+    /// Whether `node_id` exists in the cluster (voter or learner). Used
+    /// to make `add_learner` calls idempotent in BDD steps that may
+    /// run after a Given that already added the same node.
+    #[must_use]
+    pub fn has_node(&self, node_id: u64) -> bool {
+        self.nodes.contains_key(&node_id)
+    }
+
     /// Attach a topology label to `node_id`. Used by placement and
     /// rack-aware tests to model failure-domain spread.
     pub fn set_topology(&mut self, node_id: u64, topology: Topology) {
