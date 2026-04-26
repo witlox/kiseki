@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
-use kiseki_common::inline_store::InlineStore;
+use kiseki_common::inline_store::{derive_inline_key, InlineStore};
 
 use crate::delta::{Delta, DeltaHeader, DeltaPayload};
 use crate::error::LogError;
@@ -212,6 +212,13 @@ impl MemShardStore {
         consumer: &str,
         position: SequenceNumber,
     ) -> Result<(), LogError> {
+        // Guard against the buffered-write sentinel returned by
+        // `append_delta` when a write was deferred to a split-cutover
+        // buffer. Advancing past it would collapse the GC boundary to
+        // u64::MAX and discard everything.
+        if position.is_buffered_sentinel() {
+            return Err(LogError::InvalidRange(shard_id));
+        }
         let mut shards = self
             .shards
             .lock()
@@ -356,9 +363,11 @@ impl LogOps for MemShardStore {
                     .entry(source)
                     .or_default()
                     .push(req);
-                // Return a placeholder sequence; the real number is assigned
-                // when the buffered request is replayed against the target.
-                return Ok(SequenceNumber(0));
+                // Return the canonical buffered-write sentinel
+                // (`SequenceNumber::BUFFERED == u64::MAX`). Advancing
+                // a watermark with it is a programming error and is
+                // explicitly rejected by `advance_watermark` below.
+                return Ok(SequenceNumber::BUFFERED);
             }
             return Err(LogError::KeyOutOfRange(req.shard_id));
         }
@@ -366,6 +375,26 @@ impl LogOps for MemShardStore {
         let next_seq = SequenceNumber(shard.info.tip.0 + 1);
         #[allow(clippy::cast_possible_truncation)]
         let payload_size = req.payload.len() as u32;
+
+        // I-SF5 / ADR-030: offload inline payloads on apply BEFORE the
+        // delta lands in the in-memory log. The shards lock is held
+        // across the inline put: SmallObjectStore is a leaf with its
+        // own Mutex and never calls back into MemShardStore, so the
+        // hold is deadlock-free and keeps the (next_seq, key, push)
+        // sequence atomic from a concurrent append's perspective.
+        let in_memory_ciphertext = if req.has_inline_data {
+            if let Some(inline) = self.inline_store.get() {
+                let key = derive_inline_key(&req.hashed_key, next_seq.0);
+                inline.put(&key, &req.payload).map_err(LogError::Io)?;
+                // Mirror the Raft state machine: drop the in-memory
+                // ciphertext now that it lives durably in the inline store.
+                Vec::new()
+            } else {
+                req.payload.clone()
+            }
+        } else {
+            req.payload.clone()
+        };
 
         let delta = Delta {
             header: DeltaHeader {
@@ -381,7 +410,7 @@ impl LogOps for MemShardStore {
                 has_inline_data: req.has_inline_data,
             },
             payload: DeltaPayload {
-                ciphertext: req.payload,
+                ciphertext: in_memory_ciphertext,
                 auth_tag: Vec::new(),
                 nonce: Vec::new(),
                 system_epoch: None,
@@ -394,26 +423,6 @@ impl LogOps for MemShardStore {
         shard.info.delta_count += 1;
         shard.info.byte_size += u64::from(payload_size) + 128;
         shard.deltas.push(delta);
-
-        // I-SF5 / ADR-030: offload inline payloads on apply.
-        if req.has_inline_data {
-            if let Some(inline) = self.inline_store.get() {
-                // Drop the shard lock before calling into the inline store —
-                // SmallObjectStore takes its own lock and we don't want a
-                // shard-vs-inline deadlock under contention.
-                let key = req.hashed_key;
-                let payload = shard
-                    .deltas
-                    .last()
-                    .expect("just pushed")
-                    .payload
-                    .ciphertext
-                    .clone();
-                drop(shards);
-                inline.put(&key, &payload).map_err(LogError::Io)?;
-                return Ok(next_seq);
-            }
-        }
 
         Ok(next_seq)
     }
@@ -476,6 +485,20 @@ impl LogOps for MemShardStore {
             .ok_or(LogError::ShardNotFound(shard_id))?;
 
         let gc_boundary = shard.watermarks.gc_boundary().unwrap_or(SequenceNumber(0));
+
+        // I-SF6: delete inline payloads of deltas being GC'd. Use the
+        // canonical key derivation so the entries match what was put on
+        // append. Errors are swallowed because GC is best-effort —
+        // a stuck inline entry is recoverable but a stalled GC isn't.
+        if let Some(inline) = self.inline_store.get() {
+            for d in &shard.deltas {
+                if d.header.sequence < gc_boundary && d.header.has_inline_data {
+                    let key = derive_inline_key(&d.header.hashed_key, d.header.sequence.0);
+                    let _ = inline.delete(&key);
+                }
+            }
+        }
+
         shard.deltas.retain(|d| d.header.sequence >= gc_boundary);
         shard.gc_floor = gc_boundary;
 
@@ -508,6 +531,19 @@ impl LogOps for MemShardStore {
             .filter(|d| !(d.header.tombstone && d.header.sequence < gc_boundary))
             .cloned()
             .collect();
+
+        // I-SF6: delete inline payloads for deltas that did not survive
+        // compaction. Canonical key derivation matches the apply path.
+        if let Some(inline) = self.inline_store.get() {
+            let surviving_seqs: std::collections::HashSet<u64> =
+                surviving.iter().map(|d| d.header.sequence.0).collect();
+            for d in &shard.deltas {
+                if d.header.has_inline_data && !surviving_seqs.contains(&d.header.sequence.0) {
+                    let key = derive_inline_key(&d.header.hashed_key, d.header.sequence.0);
+                    let _ = inline.delete(&key);
+                }
+            }
+        }
 
         let after_count = surviving.len() as u64;
         shard.deltas = surviving;
@@ -956,6 +992,32 @@ mod tests {
         }
     }
 
+    /// `advance_watermark` MUST reject `SequenceNumber::BUFFERED` so a
+    /// buggy consumer that mistakes the buffered-write sentinel for a
+    /// real sequence cannot collapse the GC boundary to `u64::MAX`.
+    #[tokio::test]
+    async fn advance_watermark_rejects_buffered_sentinel() {
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(99));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(99));
+        store.create_shard(shard_id, tenant_id, NodeId(1), ShardConfig::default());
+        store
+            .register_consumer(shard_id, "sp-test", SequenceNumber(0))
+            .unwrap();
+
+        // Real sequence advances are accepted.
+        store
+            .advance_watermark(shard_id, "sp-test", SequenceNumber(5))
+            .unwrap();
+
+        // The sentinel is rejected — caller cannot leak it into the
+        // watermark and collapse GC.
+        let err = store
+            .advance_watermark(shard_id, "sp-test", SequenceNumber::BUFFERED)
+            .unwrap_err();
+        assert!(matches!(err, LogError::InvalidRange(_)));
+    }
+
     /// ADR-034: out-of-range writes against a Splitting source are buffered
     /// and replayed against the linked target shard.
     #[tokio::test]
@@ -991,7 +1053,12 @@ mod tests {
             .append_delta(req)
             .await
             .expect("split-buffered write must succeed");
-        assert_eq!(seq, SequenceNumber(0), "buffered writes return placeholder");
+        assert_eq!(
+            seq,
+            SequenceNumber::BUFFERED,
+            "buffered writes return the typed sentinel, not a real sequence"
+        );
+        assert!(seq.is_buffered_sentinel());
         assert_eq!(store.split_buffer_len(source), 1);
 
         // Drain — the buffered request commits to the target shard.
@@ -1037,7 +1104,58 @@ mod tests {
 
         let puts = inline.puts.lock().unwrap();
         assert_eq!(puts.len(), 1, "inline store must receive one put");
-        assert_eq!(puts[0].0, [0x11u8; 32], "key matches hashed_key");
+        // Canonical inline-store key derivation (kiseki_common::inline_store)
+        // — last 8 bytes of hashed_key are XOR'd with the assigned sequence
+        // number's little-endian bytes. Sequence is 1 here (first append).
+        let expected_key = derive_inline_key(&[0x11u8; 32], 1);
+        assert_eq!(puts[0].0, expected_key, "key uses canonical derivation");
         assert_eq!(puts[0].1.len(), 1024, "payload offloaded verbatim");
+    }
+
+    /// Inline put failure must not produce a phantom delta — the delta
+    /// is only pushed to the in-memory log if `inline.put` succeeded.
+    #[tokio::test]
+    async fn append_delta_rejects_when_inline_put_fails() {
+        struct FailingInline;
+        impl InlineStore for FailingInline {
+            fn put(&self, _k: &[u8; 32], _data: &[u8]) -> std::io::Result<bool> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn get(&self, _k: &[u8; 32]) -> std::io::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn delete(&self, _k: &[u8; 32]) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+        let store = MemShardStore::new();
+        let shard_id = ShardId(uuid::Uuid::from_u128(3));
+        let tenant_id = OrgId(uuid::Uuid::from_u128(102));
+        store.create_shard(shard_id, tenant_id, NodeId(1), ShardConfig::default());
+        store
+            .set_inline_store(Arc::new(FailingInline) as Arc<dyn InlineStore>)
+            .map_err(|_| ())
+            .expect("inline store can be set once");
+
+        let req = AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation: OperationType::Create,
+            timestamp: test_timestamp(),
+            hashed_key: [0x22u8; 32],
+            chunk_refs: vec![],
+            payload: vec![0xEE; 256],
+            has_inline_data: true,
+        };
+        let res = store.append_delta(req).await;
+        assert!(
+            matches!(res, Err(LogError::Io(_))),
+            "inline-put failure surfaces"
+        );
+
+        // Phantom-delta check: the shard tip must not have advanced.
+        let health = store.shard_health(shard_id).await.unwrap();
+        assert_eq!(health.tip, SequenceNumber(0));
+        assert_eq!(health.delta_count, 0);
     }
 }

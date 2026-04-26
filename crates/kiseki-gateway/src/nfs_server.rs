@@ -39,35 +39,75 @@ pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
     namespace_id: NamespaceId,
     storage_nodes: Vec<String>,
 ) {
+    let listener = TcpListener::bind(addr).unwrap_or_else(|e| {
+        tracing::error!(addr = %addr, error = %e, "NFS bind failed");
+        std::process::exit(1);
+    });
+    serve_nfs_listener(
+        listener,
+        gateway,
+        tenant_id,
+        namespace_id,
+        storage_nodes,
+        None,
+    );
+}
+
+/// Run the NFS server on an already-bound listener with an optional
+/// shutdown signal. Tests can pre-bind on `127.0.0.1:0` and pass the
+/// listener directly (avoiding a bind→drop→rebind race). Production
+/// callers should use [`run_nfs_server`] which binds for them.
+///
+/// When `shutdown` is `Some` and the flag flips to `true`, the accept
+/// loop exits after the current iteration; in-flight per-connection
+/// threads are detached and exit on their own.
+#[allow(clippy::needless_pass_by_value)]
+pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
+    listener: TcpListener,
+    gateway: NfsGateway<G>,
+    tenant_id: OrgId,
+    namespace_id: NamespaceId,
+    storage_nodes: Vec<String>,
+    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     let ctx = Arc::new(NfsContext::with_storage_nodes(
         gateway,
         tenant_id,
         namespace_id,
         storage_nodes,
     ));
+    if let Ok(addr) = listener.local_addr() {
+        tracing::info!(addr = %addr, "NFS server listening (NFSv3 + NFSv4.2)");
+    }
+    // Use a short accept timeout so the shutdown flag is checked
+    // promptly. Without this `incoming()` blocks forever.
+    let _ = listener.set_nonblocking(true);
 
-    let listener = TcpListener::bind(addr).unwrap_or_else(|e| {
-        tracing::error!(addr = %addr, error = %e, "NFS bind failed");
-        std::process::exit(1);
-    });
-
-    tracing::info!(addr = %addr, "NFS server listening (NFSv3 + NFSv4.2)");
-
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
+    loop {
+        if let Some(ref s) = shutdown {
+            if s.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("NFS server shutting down");
+                return;
+            }
+        }
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                let ctx = Arc::clone(&ctx);
+                thread::spawn(move || {
+                    let _ = stream.set_nonblocking(false);
+                    if let Err(e) = handle_connection(stream, ctx) {
+                        tracing::debug!(error = %e, "NFS connection ended");
+                    }
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // No pending connection; sleep briefly and re-check shutdown.
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
             Err(e) => {
                 tracing::error!(error = %e, "NFS accept error");
-                continue;
             }
-        };
-
-        let ctx = Arc::clone(&ctx);
-        thread::spawn(move || {
-            if let Err(e) = handle_connection(stream, ctx) {
-                tracing::error!(error = %e, "NFS connection error");
-            }
-        });
+        }
     }
 }
 

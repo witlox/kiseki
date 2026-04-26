@@ -509,17 +509,27 @@ async fn then_lock_state_maintained(w: &mut KisekiWorld) {
 
 #[then("lock state is gateway-local (not replicated to other gateways)")]
 async fn then_lock_local(w: &mut KisekiWorld) {
-    // A fresh gateway instance has its own LockManager with no locks from
-    // the first gateway — verifying lock state does not propagate.
-    let other = kiseki_gateway::nfs_lock::LockManager::default();
-    assert_eq!(
-        other.lock_count(),
-        0,
-        "fresh gateway must not see locks from another instance"
+    // Build a second NFS context wrapping the SAME backing gateway as the
+    // one that holds client-a's lock. If lock state were replicated/shared
+    // (e.g. via the gateway's storage layer) the second context's LockManager
+    // would observe the existing lock. It must not — locks are scoped to
+    // the per-NfsContext LockManager that handled the original request.
+    let other_ctx = kiseki_gateway::nfs_ops::NfsContext::new(
+        kiseki_gateway::nfs::NfsGateway::new(Arc::clone(&w.gateway)),
+        w.nfs_ctx.tenant_id,
+        w.nfs_ctx.namespace_id,
     );
-    // And the original gateway still owns its lock — proves the locks
-    // live in the per-NfsContext LockManager, not in shared state.
-    assert!(w.nfs_ctx.locks.lock_count() >= 1);
+    assert_eq!(
+        other_ctx.locks.lock_count(),
+        0,
+        "second NfsContext over the same gateway must not see the first context's locks",
+    );
+    // And the original context still owns its lock — proving the locks
+    // live in the per-NfsContext LockManager, not in shared backend state.
+    assert!(
+        w.nfs_ctx.locks.lock_count() >= 1,
+        "original NfsContext must retain its own lock state",
+    );
 }
 
 // === Scenario: S3 conditional write ===
@@ -575,39 +585,48 @@ async fn then_412_precondition(w: &mut KisekiWorld) {
 #[given(regex = r#"^"(\S+)" is configured with transport TCP$"#)]
 async fn given_transport_tcp(w: &mut KisekiWorld, gw: String) {
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
     if gw.starts_with("gw-nfs") {
-        // Start a real NFS TCP listener on an ephemeral port. The
-        // background thread loops on `accept` and dispatches RPCs through
-        // the gateway pipeline (NFSv3 + NFSv4.2 share port 2049 in prod).
+        // Pre-bind the listener and hand it to `serve_nfs_listener` —
+        // avoids the bind→drop→rebind race where another test (or the
+        // OS) could grab the port between drop and rebind. The shutdown
+        // flag lets KisekiWorld::drop reap the accept thread cleanly.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         let addr = listener.local_addr().expect("local_addr");
-        drop(listener); // release port; run_nfs_server will rebind
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = Arc::clone(&shutdown);
 
         let gateway_clone = Arc::clone(&w.gateway);
         let tenant_id = w.nfs_ctx.tenant_id;
         let ns_id = w.nfs_ctx.namespace_id;
         std::thread::spawn(move || {
             let nfs_gw = kiseki_gateway::nfs::NfsGateway::new(gateway_clone);
-            kiseki_gateway::nfs_server::run_nfs_server(addr, nfs_gw, tenant_id, ns_id);
+            kiseki_gateway::nfs_server::serve_nfs_listener(
+                listener,
+                nfs_gw,
+                tenant_id,
+                ns_id,
+                Vec::new(),
+                Some(shutdown_thread),
+            );
         });
-        // Tiny pause to let the listener bind before the When step connects.
-        std::thread::sleep(std::time::Duration::from_millis(50));
         w.tcp_endpoints.insert(gw, addr);
+        w.tcp_shutdowns.push(shutdown);
     } else if gw.starts_with("gw-s3") {
         // S3 — bind an axum router over plain TCP (TLS termination handled
-        // upstream by the transport layer in production; for the integration
-        // test we verify wire-protocol semantics).
+        // upstream by the transport layer in production). The JoinHandle
+        // is captured so KisekiWorld::drop can `.abort()` it.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral");
         let addr = listener.local_addr().expect("local_addr");
         let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&w.gateway));
         let router = kiseki_gateway::s3_server::s3_router(s3_gw, w.nfs_ctx.tenant_id);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         w.tcp_endpoints.insert(gw, addr);
+        w.s3_tasks.push(handle);
     } else {
         panic!("unknown gateway name: {gw}");
     }
@@ -1239,17 +1258,23 @@ async fn then_backpressure_event(w: &mut KisekiWorld) {
 
 #[then("only the caller's own queue state contributes to the signal; neighbour callers do not leak through this channel (I-WA5)")]
 async fn then_caller_queue_only(w: &mut KisekiWorld) {
-    // I-WA5: per-caller scoping — the budget enforcer tracks per-workload state.
-    // Verify hints_used is caller-scoped (fresh enforcer has 0 hints).
-    let fresh = BudgetEnforcer::new(BudgetConfig {
-        hints_per_sec: 100,
-        max_concurrent_workflows: 10,
-        max_phases_per_workflow: 50,
-    });
-    assert_eq!(
-        fresh.hints_used(),
-        0,
-        "fresh enforcer has no neighbour state"
+    // I-WA5: per-caller scoping. Subscribe a NEIGHBOUR workload to the same
+    // bus; emit *only* on training-run-42; assert the neighbour's channel
+    // sees nothing. This is the same pattern as the unit test in
+    // `kiseki-advisory::telemetry_bus::tests`, lifted into BDD so the
+    // assertion exercises the live shared bus rather than a constructor
+    // property of a fresh fixture.
+    let mut neighbour = w.telemetry_bus.subscribe_backpressure("other-workload");
+    w.telemetry_bus.emit_backpressure(
+        "training-run-42",
+        kiseki_advisory::BackpressureEvent {
+            severity: kiseki_advisory::BackpressureSeverity::Soft,
+            retry_after_ms: kiseki_advisory::bucket_retry_after_ms(75),
+        },
+    );
+    assert!(
+        neighbour.try_recv().is_err(),
+        "neighbour workload must not see another caller's backpressure event",
     );
 }
 
@@ -1436,33 +1461,54 @@ async fn then_no_regression(w: &mut KisekiWorld) {
 
 #[when(regex = r#"^the gateway computes headroom within the workload's I-T2 quota$"#)]
 async fn when_gw_computes_headroom(w: &mut KisekiWorld) {
-    // Compute headroom via budget enforcer — real quota check.
+    // Compute headroom and emit it through the live telemetry bus so the
+    // caller's subscription delivers a real bucketed value.
     let used = w.budget_enforcer.hints_used();
-    // Headroom = (budget - used) / budget, bucketed.
-    w.last_error = None; // Reset for Then assertions.
+    let bucket = match used {
+        0..=24 => kiseki_advisory::QosHeadroomBucket::Ample,
+        25..=74 => kiseki_advisory::QosHeadroomBucket::Moderate,
+        75..=99 => kiseki_advisory::QosHeadroomBucket::Tight,
+        _ => kiseki_advisory::QosHeadroomBucket::Exhausted,
+    };
+    w.telemetry_bus.emit_qos_headroom("training-run-42", bucket);
+    w.last_error = None;
 }
 
 #[then(regex = r#"^the value is a bucketed fraction .+ \{ample, moderate, tight, exhausted\}$"#)]
 async fn then_bucketed_fraction(w: &mut KisekiWorld) {
-    // QoS headroom is reported as a bucketed fraction.
-    // Verify the budget enforcer tracks workload state for bucketing.
-    let used = w.budget_enforcer.hints_used();
-    // With 0 hints used of 100/sec budget, headroom is "ample".
-    assert!(used < 100, "headroom should be ample at low usage");
+    // Drain the caller's subscription — the value MUST be one of the four
+    // canonical buckets and nothing else (no raw byte counts, no fractions).
+    let rx = w
+        .qos_subs
+        .get_mut("training-run-42")
+        .expect("workload subscribed in Given");
+    let bucket = rx
+        .try_recv()
+        .expect("QoS-headroom event must have been delivered");
+    use kiseki_advisory::QosHeadroomBucket;
+    assert!(
+        matches!(
+            bucket,
+            QosHeadroomBucket::Ample
+                | QosHeadroomBucket::Moderate
+                | QosHeadroomBucket::Tight
+                | QosHeadroomBucket::Exhausted,
+        ),
+        "QoS-headroom must be a fixed bucket, got {bucket:?}",
+    );
 }
 
 #[then("no neighbour workload's headroom is disclosed (I-WA5)")]
 async fn then_no_neighbour_headroom(w: &mut KisekiWorld) {
-    // I-WA5: headroom is caller-scoped. Fresh enforcer has no neighbour data.
-    let fresh = BudgetEnforcer::new(BudgetConfig {
-        hints_per_sec: 100,
-        max_concurrent_workflows: 10,
-        max_phases_per_workflow: 50,
-    });
-    assert_eq!(fresh.hints_used(), 0, "no neighbour state visible");
-    assert_eq!(
-        fresh.active_workflows(),
-        0,
-        "no neighbour workflows visible"
+    // I-WA5: subscriptions are per-workload. Subscribe a NEIGHBOUR to the
+    // same live bus, emit only on training-run-42, then assert the
+    // neighbour's channel is empty. This exercises the real per-caller
+    // routing rather than a constructor property of a fresh enforcer.
+    let mut neighbour = w.telemetry_bus.subscribe_qos_headroom("other-workload");
+    w.telemetry_bus
+        .emit_qos_headroom("training-run-42", kiseki_advisory::QosHeadroomBucket::Tight);
+    assert!(
+        neighbour.try_recv().is_err(),
+        "neighbour workload must not see another caller's headroom event",
     );
 }

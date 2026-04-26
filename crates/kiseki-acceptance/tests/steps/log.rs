@@ -59,11 +59,15 @@ async fn then_inline_committed(w: &mut KisekiWorld) {
     let delta = w.last_delta.as_ref().expect("last delta should be set");
     assert!(
         delta.header.has_inline_data,
-        "delta header must mark inline payload"
+        "delta header must mark inline payload",
     );
+    // I-SF5 / ADR-030: the in-memory ciphertext is cleared post-offload —
+    // payload lives in the inline store. The header preserves the size so
+    // downstream readers can reconstruct via `inline.get(derive_inline_key)`.
     assert!(
-        !delta.payload.ciphertext.is_empty(),
-        "inline payload must be present in committed delta"
+        delta.header.payload_size > 0,
+        "inline payload size must be recorded in the header (got {})",
+        delta.header.payload_size,
     );
 }
 
@@ -126,7 +130,7 @@ async fn when_append_table(w: &mut KisekiWorld, step: &cucumber::gherkin::Step) 
         }
     }
 
-    let key = req.hashed_key;
+    let raw_key = req.hashed_key;
     let inline = req.has_inline_data;
 
     match w.log_store.append_delta(req).await {
@@ -134,7 +138,11 @@ async fn when_append_table(w: &mut KisekiWorld, step: &cucumber::gherkin::Step) 
             w.last_sequence = Some(seq);
             w.last_error = None;
             if inline {
-                w.last_inline_key = Some(key);
+                // Canonical inline-store key derivation includes the assigned
+                // sequence (kiseki_common::inline_store::derive_inline_key).
+                w.last_inline_key = Some(kiseki_common::inline_store::derive_inline_key(
+                    &raw_key, seq.0,
+                ));
             }
             // Capture the just-appended delta for downstream Then steps.
             if let Ok(deltas) = w

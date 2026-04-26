@@ -262,14 +262,57 @@ impl ChunkOps for ChunkStore {
     }
 
     fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
-        // Fault injection: simulated unavailability (ADR-037).
+        // Fault injection (ADR-037 explicit unavailability).
         if self.unavailable.contains(chunk_id) {
             return Err(ChunkError::DeviceUnavailable(*chunk_id));
         }
-        self.chunks
+        let entry = self
+            .chunks
             .get(chunk_id)
-            .map(|e| e.envelope.clone())
-            .ok_or(ChunkError::NotFound(*chunk_id))
+            .ok_or(ChunkError::NotFound(*chunk_id))?;
+
+        // Replicated chunks: stored envelope is the truth, return it.
+        let Some(ec) = &entry.ec else {
+            return Ok(entry.envelope.clone());
+        };
+
+        // EC chunks: respect per-device online state. If every fragment's
+        // owning device is reachable, the stored envelope's ciphertext is
+        // still authoritative — no reconstruction needed (fast path).
+        // Otherwise rebuild the ciphertext from available fragments via
+        // EC decode, and re-wrap in an Envelope that reuses the original
+        // auth_tag, nonce, and epoch fields.
+        let pool = self
+            .pools
+            .get(&entry.pool)
+            .ok_or(ChunkError::NotFound(*chunk_id))?;
+        let total = ec.data_shards + ec.parity_shards;
+        let mut all_online = true;
+        let mut frags: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
+        for i in 0..total {
+            let dev_idx = ec.device_indices[i];
+            let online = pool.devices.get(dev_idx).is_some_and(|d| d.online);
+            if online {
+                frags.push(Some(ec.fragments[i].clone()));
+            } else {
+                frags.push(None);
+                all_online = false;
+            }
+        }
+        if all_online {
+            return Ok(entry.envelope.clone());
+        }
+        // Degraded read — attempt EC reconstruction.
+        let reconstructed = ec::decode(
+            &mut frags,
+            ec.data_shards,
+            ec.parity_shards,
+            ec.original_len,
+        )?;
+        Ok(Envelope {
+            ciphertext: reconstructed,
+            ..entry.envelope.clone()
+        })
     }
 
     fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
@@ -771,5 +814,56 @@ mod tests {
         // Clear fault: read succeeds again.
         store.clear_faults();
         assert!(store.read_chunk(&chunk_id).is_ok());
+    }
+
+    /// Trait `read_chunk` must respect device online state for EC pools
+    /// (gateway-level reads previously bypassed EC degraded reconstruction
+    /// because they only consulted the `unavailable` `HashSet`).
+    #[test]
+    fn read_chunk_reconstructs_ec_when_devices_offline() {
+        let mut store = ChunkStore::new();
+        store.add_pool(
+            AffinityPool::new(
+                "ec-pool",
+                DurabilityStrategy::ErasureCoding {
+                    data_shards: 4,
+                    parity_shards: 2,
+                },
+                100 * 1024 * 1024,
+            )
+            .with_devices(6),
+        );
+        let env = Envelope {
+            ciphertext: vec![0xab; 64 * 1024],
+            ..test_envelope(0xE1)
+        };
+        let chunk_id = env.chunk_id;
+        store.write_chunk(env.clone(), "ec-pool").unwrap();
+
+        // All devices online — fast path returns the stored envelope.
+        let read = store.read_chunk(&chunk_id).unwrap();
+        assert_eq!(read.ciphertext, env.ciphertext);
+
+        // One device offline — degraded read reconstructs from parity.
+        store
+            .pool_mut("ec-pool")
+            .unwrap()
+            .set_device_online("d3", false);
+        let read = store.read_chunk(&chunk_id).unwrap();
+        assert_eq!(read.ciphertext, env.ciphertext);
+        // Auth-tag/nonce/epoch passed through unchanged.
+        assert_eq!(read.auth_tag, env.auth_tag);
+
+        // Three devices offline — exceeds parity, reconstruction must fail
+        // and the trait-level read must surface the error to the caller.
+        store
+            .pool_mut("ec-pool")
+            .unwrap()
+            .set_device_online("d4", false);
+        store
+            .pool_mut("ec-pool")
+            .unwrap()
+            .set_device_online("d5", false);
+        assert!(store.read_chunk(&chunk_id).is_err());
     }
 }

@@ -190,4 +190,69 @@ mod tests {
         assert_eq!(bucket_retry_after_ms(150), 250);
         assert_eq!(bucket_retry_after_ms(10_000), 500);
     }
+
+    /// Re-subscribing for the same workload replaces the prior channel.
+    /// The old subscriber sees no further events (its sender was dropped).
+    #[tokio::test]
+    async fn re_subscribe_replaces_prior_channel() {
+        let bus = TelemetryBus::new();
+        let mut first = bus.subscribe_backpressure("alice");
+        let mut second = bus.subscribe_backpressure("alice");
+
+        bus.emit_backpressure(
+            "alice",
+            BackpressureEvent {
+                severity: BackpressureSeverity::Soft,
+                retry_after_ms: 100,
+            },
+        );
+
+        // Second (current) subscriber receives the event.
+        let evt = second.recv().await.expect("active subscriber receives");
+        assert_eq!(evt.severity, BackpressureSeverity::Soft);
+
+        // First (replaced) subscriber sees its sender closed — recv resolves
+        // to None rather than hanging forever.
+        assert!(first.recv().await.is_none(), "replaced channel must close");
+    }
+
+    /// Emit on a slow subscriber (channel full) MUST drop the event
+    /// rather than block — advisory delivery never holds up the data
+    /// path (I-WA1, I-WA2).
+    #[tokio::test]
+    async fn emit_drops_when_subscriber_is_full() {
+        let bus = TelemetryBus::new();
+        // Subscribe but never read — fill the bounded buffer.
+        let _rx = bus.subscribe_backpressure("alice");
+        // Saturate well past SUBSCRIBER_CAPACITY.
+        for i in 0..SUBSCRIBER_CAPACITY * 4 {
+            bus.emit_backpressure(
+                "alice",
+                BackpressureEvent {
+                    severity: BackpressureSeverity::Soft,
+                    retry_after_ms: i as u64,
+                },
+            );
+        }
+        // No assertion needed — the test asserts by *not* hanging.
+        // `try_send` inside emit_backpressure returns immediately on full,
+        // so the loop completes synchronously.
+    }
+
+    /// `emit_*` on a workload that has never subscribed is a silent
+    /// no-op (does not allocate a channel, does not panic).
+    #[tokio::test]
+    async fn emit_without_subscription_is_noop() {
+        let bus = TelemetryBus::new();
+        bus.emit_backpressure(
+            "ghost",
+            BackpressureEvent {
+                severity: BackpressureSeverity::Hard,
+                retry_after_ms: 500,
+            },
+        );
+        bus.emit_qos_headroom("ghost", QosHeadroomBucket::Exhausted);
+        assert!(!bus.has_backpressure_subscription("ghost"));
+        assert!(!bus.has_qos_subscription("ghost"));
+    }
 }

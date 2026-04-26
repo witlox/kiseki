@@ -458,6 +458,70 @@ impl RaftTestCluster {
     }
 }
 
+/// `RaftMembershipAdapter` impl so the control-plane drain
+/// orchestrator can drive `RaftTestCluster` directly. This is the
+/// integration glue called out in the integrator review (seam #5):
+/// the orchestrator no longer maintains a parallel narrative of voter
+/// state — it asks Raft.
+impl kiseki_common::raft_adapter::RaftMembershipAdapter for RaftTestCluster {
+    fn add_learner(
+        &mut self,
+        replacement: kiseki_common::ids::NodeId,
+    ) -> kiseki_common::raft_adapter::MembershipFuture<'_, ()> {
+        Box::pin(async move {
+            self.add_learner(replacement.0)
+                .await
+                .map_err(|e| kiseki_common::raft_adapter::MembershipError::Raft(e.to_string()))
+        })
+    }
+
+    fn replace_voter(
+        &mut self,
+        target: kiseki_common::ids::NodeId,
+        replacement: kiseki_common::ids::NodeId,
+    ) -> kiseki_common::raft_adapter::MembershipFuture<'_, ()> {
+        Box::pin(async move {
+            // Build the new voter set: everything currently known minus
+            // the target, plus the replacement.
+            let current = self.voter_ids().await;
+            let mut new_voters: BTreeMap<u64, KisekiNode> = BTreeMap::new();
+            for id in current {
+                if id == target.0 {
+                    continue;
+                }
+                new_voters.insert(
+                    id,
+                    KisekiNode {
+                        addr: format!("127.0.0.1:{}", 9100 + id),
+                    },
+                );
+            }
+            new_voters.insert(
+                replacement.0,
+                KisekiNode {
+                    addr: format!("127.0.0.1:{}", 9100 + replacement.0),
+                },
+            );
+            self.change_membership(new_voters)
+                .await
+                .map_err(|e| kiseki_common::raft_adapter::MembershipError::Raft(e.to_string()))
+        })
+    }
+
+    fn voter_ids(
+        &self,
+    ) -> kiseki_common::raft_adapter::MembershipFuture<'_, Vec<kiseki_common::ids::NodeId>> {
+        Box::pin(async move {
+            Ok(self
+                .voter_ids()
+                .await
+                .into_iter()
+                .map(kiseki_common::ids::NodeId)
+                .collect())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

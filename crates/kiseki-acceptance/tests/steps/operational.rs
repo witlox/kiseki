@@ -2270,37 +2270,24 @@ async fn then_transitions_draining(w: &mut KisekiWorld, name: String) {
 
 #[then(regex = r#"^progress is reported per shard .*$"#)]
 async fn then_progress_per_shard(w: &mut KisekiWorld) {
-    // Drive the actual Raft membership change for the target's single
-    // voter slot: add a learner on the demonstration cluster, then commit
-    // the membership change. This proves the orchestration is wired
-    // through real Raft, not just state-machine flips.
-    let raft = w.drain_raft.as_mut().expect("drain raft cluster present");
-    raft.add_learner(4)
-        .await
-        .expect("add_learner succeeds on demonstration cluster");
-    let mut new_voters: std::collections::BTreeMap<u64, kiseki_raft::KisekiNode> =
-        std::collections::BTreeMap::new();
-    for id in [2u64, 3, 4] {
-        new_voters.insert(
-            id,
-            kiseki_raft::KisekiNode {
-                addr: format!("127.0.0.1:{}", 9100 + id),
-            },
-        );
-    }
-    raft.change_membership(new_voters)
-        .await
-        .expect("change_membership succeeds");
-
-    // Mirror the per-shard completion in the orchestrator audit trail.
+    // Drive the per-shard voter replacements through the orchestrator's
+    // adapter-aware path. The orchestrator calls `add_learner` + the
+    // membership change on the supplied RaftMembershipAdapter
+    // (RaftTestCluster impls it) and records the completion in its own
+    // audit trail — so the orchestrator and Raft are no longer two
+    // independent narratives.
     let target_id = *w.node_names.get("n7").expect("n7 registered");
+    // Replacement must be a node id that's NOT already in the demonstration
+    // Raft cluster's initial voter set ({1,2,3}); n4 satisfies that.
     let replacement_id = *w
         .node_names
         .get("n4")
-        .or_else(|| w.node_names.get("n2"))
         .expect("a replacement candidate exists");
+    let raft = w.drain_raft.as_mut().expect("drain raft cluster present");
     w.drain_orch
-        .record_voter_replaced(target_id, 0, replacement_id, "operator");
+        .drive_voter_replacements(target_id, replacement_id, "operator", raft)
+        .await
+        .expect("drive_voter_replacements succeeds");
 }
 
 #[then(regex = r#"^on completion (\S+) transitions to Evicted$"#)]

@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use kiseki_common::ids::NodeId;
+use kiseki_common::raft_adapter::{MembershipError, RaftMembershipAdapter};
 
 /// Per-node lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -123,6 +124,9 @@ pub enum DrainError {
         /// State the operator tried to move it to.
         to: NodeState,
     },
+    /// The Raft membership adapter rejected a step of the drain.
+    #[error("raft membership: {0}")]
+    Membership(#[from] MembershipError),
 }
 
 /// Replication factor enforced by the orchestrator (I-N4).
@@ -362,6 +366,91 @@ impl DrainOrchestrator {
         }
     }
 
+    /// Refresh the per-node `voter_in_shards` count from the supplied
+    /// adapter. Avoids the stale-snapshot trap (integrator finding 5b)
+    /// where the orchestrator's view of the cluster diverges from the
+    /// actual Raft membership over time.
+    pub async fn resync_from_raft<A: RaftMembershipAdapter + ?Sized>(
+        &self,
+        adapter: &A,
+    ) -> Result<(), DrainError> {
+        let voters = adapter.voter_ids().await?;
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (id, rec) in &mut inner.nodes {
+            // Each shard the adapter reports the node holds adds an entry.
+            // We count occurrences (a node may hold multiple voter slots
+            // across shards in a multi-shard cluster).
+            let count = voters.iter().filter(|v| *v == id).count();
+            rec.voter_in_shards.clear();
+            for i in 0..count {
+                rec.voter_in_shards.push(i as u64);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive every per-shard voter replacement for a node that is
+    /// already in `Draining` state. Calls `add_learner` + `replace_voter`
+    /// on `adapter` once per shard the target holds, records each
+    /// completion via `record_voter_replaced`, and auto-evicts on the
+    /// final step. Operators that pre-stage state via `request_drain`
+    /// (e.g. acceptance tests that need to assert intermediate state)
+    /// invoke this directly; full end-to-end callers use [`Self::execute_drain`].
+    pub async fn drive_voter_replacements<A: RaftMembershipAdapter + ?Sized>(
+        &self,
+        target: NodeId,
+        replacement: NodeId,
+        admin: &str,
+        adapter: &mut A,
+    ) -> Result<(), DrainError> {
+        let shard_count = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .nodes
+            .get(&target)
+            .map_or(0, |n| n.voter_in_shards.len());
+
+        for shard_idx in 0..shard_count {
+            adapter.add_learner(replacement).await?;
+            adapter.replace_voter(target, replacement).await?;
+            self.record_voter_replaced(
+                target,
+                u32::try_from(shard_idx).unwrap_or(u32::MAX),
+                replacement,
+                admin,
+            );
+        }
+        Ok(())
+    }
+
+    /// End-to-end drain orchestration (ADR-035 §3): pre-check, mark
+    /// Draining, drive every per-shard voter replacement through
+    /// `adapter`, record audit, auto-evict on completion.
+    ///
+    /// `replacement` is the operator-chosen target for the new voter
+    /// slots. Production deployments will call this from the control
+    /// service; tests call it from BDD step definitions.
+    pub async fn execute_drain<A: RaftMembershipAdapter + ?Sized>(
+        &self,
+        target: NodeId,
+        replacement: NodeId,
+        admin: &str,
+        adapter: &mut A,
+    ) -> Result<(), DrainError> {
+        // Sync registry from authoritative Raft state first so the I-N4
+        // pre-check sees real voter counts, not the operator's guess.
+        self.resync_from_raft(adapter).await?;
+
+        // State transition + audit (returns InsufficientCapacity on I-N4 fail).
+        self.request_drain(target, admin)?;
+        self.drive_voter_replacements(target, replacement, admin, adapter)
+            .await
+    }
+
     /// Snapshot of the full registry — used by tests to observe state
     /// transitions without exposing the internal mutex.
     #[must_use]
@@ -465,6 +554,153 @@ mod tests {
         assert_eq!(orch.state(n(7)), Some(NodeState::Draining));
         orch.record_voter_replaced(n(7), 1, n(3), "alice");
 
+        assert_eq!(orch.state(n(7)), Some(NodeState::Evicted));
+        let audit = orch.audit();
+        assert!(audit
+            .iter()
+            .any(|e| matches!(e, NodeAuditEvent::Evicted { node_id, .. } if *node_id == n(7))));
+    }
+
+    /// Capturing adapter — records every membership call so the test can
+    /// assert that `execute_drain` actually drove the adapter.
+    #[derive(Default)]
+    struct CapturingAdapter {
+        added: std::sync::Mutex<Vec<NodeId>>,
+        replaced: std::sync::Mutex<Vec<(NodeId, NodeId)>>,
+        voters: Vec<NodeId>,
+    }
+
+    impl RaftMembershipAdapter for CapturingAdapter {
+        fn add_learner(
+            &mut self,
+            replacement: NodeId,
+        ) -> kiseki_common::raft_adapter::MembershipFuture<'_, ()> {
+            Box::pin(async move {
+                self.added.lock().unwrap().push(replacement);
+                Ok(())
+            })
+        }
+
+        fn replace_voter(
+            &mut self,
+            target: NodeId,
+            replacement: NodeId,
+        ) -> kiseki_common::raft_adapter::MembershipFuture<'_, ()> {
+            Box::pin(async move {
+                self.replaced.lock().unwrap().push((target, replacement));
+                Ok(())
+            })
+        }
+
+        fn voter_ids(
+            &self,
+        ) -> kiseki_common::raft_adapter::MembershipFuture<'_, Vec<NodeId>> {
+            let v = self.voters.clone();
+            Box::pin(async move { Ok(v) })
+        }
+    }
+
+    /// ADR-035 §1: a Failed node remains drain-eligible — operator
+    /// decides the node is permanently lost and drives the drain.
+    #[test]
+    fn drain_accepted_for_failed_node() {
+        let orch = DrainOrchestrator::new();
+        for i in 1..=5u128 {
+            orch.register_node(n(i), vec![u64::try_from(i).expect("fits")]);
+        }
+        // Mark target as Failed (heartbeat timeout) — it's still in the
+        // registry, just not reachable.
+        orch.set_state(n(1), NodeState::Failed);
+
+        // Operator drains it. State machine accepts Failed → Draining.
+        orch.request_drain(n(1), "alice")
+            .expect("drain of a Failed node must be accepted");
+        assert_eq!(orch.state(n(1)), Some(NodeState::Draining));
+    }
+
+    /// ADR-035 §4: `cancel_drain` returns the node to Active. Per the
+    /// architect note, completed voter replacements DO NOT roll back
+    /// — the cluster keeps the new placements, the cancelled node just
+    /// stops draining.
+    #[test]
+    fn cancel_drain_does_not_roll_back_completed_replacements() {
+        let orch = DrainOrchestrator::new();
+        for i in 1..=5u128 {
+            orch.register_node(n(i), vec![u64::try_from(i).expect("fits")]);
+        }
+        orch.register_node(n(7), vec![701, 702]);
+
+        orch.request_drain(n(7), "alice").unwrap();
+        // First shard's voter replacement completes BEFORE cancellation.
+        orch.record_voter_replaced(n(7), 0, n(2), "alice");
+
+        // Operator cancels mid-drain.
+        orch.cancel_drain(n(7), "alice").unwrap();
+        assert_eq!(orch.state(n(7)), Some(NodeState::Active));
+
+        // The completed VoterReplaced audit entry MUST still be there —
+        // no rollback. The cluster has new placements that survive cancel.
+        let audit = orch.audit();
+        let kept = audit
+            .iter()
+            .filter(|e| matches!(e, NodeAuditEvent::VoterReplaced { .. }))
+            .count();
+        assert_eq!(kept, 1, "completed VoterReplaced must persist past cancel");
+    }
+
+    /// Audit events MUST be ordered by occurrence so a replay can
+    /// reconstruct the exact transition sequence.
+    #[test]
+    fn audit_event_order_matches_call_order() {
+        let orch = DrainOrchestrator::new();
+        for i in 1..=5u128 {
+            orch.register_node(n(i), vec![u64::try_from(i).expect("fits")]);
+        }
+        orch.register_node(n(7), vec![701]);
+
+        orch.request_drain(n(7), "alice").unwrap();
+        orch.record_voter_replaced(n(7), 0, n(2), "alice");
+
+        let audit = orch.audit();
+        // Order: DrainRequested → VoterReplaced → Evicted (eviction
+        // fires automatically once all replacements complete).
+        assert!(
+            matches!(audit[0], NodeAuditEvent::DrainRequested { .. }),
+            "first event is DrainRequested",
+        );
+        assert!(
+            matches!(audit[1], NodeAuditEvent::VoterReplaced { .. }),
+            "second event is VoterReplaced",
+        );
+        assert!(
+            matches!(audit[2], NodeAuditEvent::Evicted { .. }),
+            "third event is Evicted",
+        );
+        assert_eq!(audit.len(), 3, "no extra events between transitions");
+    }
+
+    #[tokio::test]
+    async fn execute_drain_drives_adapter_and_evicts() {
+        let orch = DrainOrchestrator::new();
+        for i in 1..=4u128 {
+            orch.register_node(n(i), vec![]);
+        }
+        // Target known to hold two shards in the adapter's view (n7
+        // appears twice in the voter list — multi-shard membership).
+        orch.register_node(n(7), vec![]);
+        let mut adapter = CapturingAdapter {
+            voters: vec![n(1), n(2), n(3), n(4), n(7), n(7)],
+            ..CapturingAdapter::default()
+        };
+
+        orch.execute_drain(n(7), n(8), "alice", &mut adapter)
+            .await
+            .expect("drain should complete");
+
+        // Resync populated voter_in_shards from the adapter's voter list.
+        // Two shard slots → two add_learner + two replace_voter calls.
+        assert_eq!(adapter.added.lock().unwrap().len(), 2);
+        assert_eq!(adapter.replaced.lock().unwrap().len(), 2);
         assert_eq!(orch.state(n(7)), Some(NodeState::Evicted));
         let audit = orch.audit();
         assert!(audit

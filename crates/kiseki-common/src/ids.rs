@@ -97,6 +97,13 @@ pub struct ViewId(pub uuid::Uuid);
 pub struct SequenceNumber(pub u64);
 
 impl SequenceNumber {
+    /// Sentinel returned by `LogOps::append_delta` when a write was
+    /// accepted into a split-cutover buffer (ADR-034) and will receive
+    /// its real sequence number once the buffer is drained against the
+    /// new shard. **Never advance a consumer watermark with this value.**
+    /// Implementations of `LogOps::advance_watermark` MUST reject it.
+    pub const BUFFERED: Self = Self(u64::MAX);
+
     /// Return the next sequence number, or `None` if `u64::MAX` is reached.
     #[must_use]
     pub const fn checked_next(self) -> Option<Self> {
@@ -104,5 +111,11 @@ impl SequenceNumber {
             Some(n) => Some(Self(n)),
             None => None,
         }
+    }
+
+    /// Whether this is the buffered-write sentinel ([`Self::BUFFERED`]).
+    #[must_use]
+    pub const fn is_buffered_sentinel(self) -> bool {
+        self.0 == u64::MAX
     }
 }

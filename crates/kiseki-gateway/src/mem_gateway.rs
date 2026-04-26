@@ -57,6 +57,10 @@ pub struct InMemoryGateway {
     /// based on `hashed_key`. When absent, uses the namespace's single `shard_id`.
     shard_map:
         std::sync::RwLock<Option<Arc<kiseki_control::shard_topology::NamespaceShardMapStore>>>,
+    /// Optional telemetry bus (ADR-021). When attached, the gateway emits
+    /// per-workload backpressure events on saturation and QoS-headroom
+    /// updates as quota is consumed (I-WA5: per-caller scoping).
+    telemetry_bus: std::sync::RwLock<Option<Arc<kiseki_advisory::TelemetryBus>>>,
 }
 
 impl InMemoryGateway {
@@ -85,7 +89,39 @@ impl InMemoryGateway {
             inline_threshold: 0, // disabled by default; set via with_inline_threshold
             small_store: None,
             shard_map: std::sync::RwLock::new(None),
+            telemetry_bus: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Attach a telemetry bus (ADR-021). Once attached, the gateway emits
+    /// per-workload backpressure events when a write hits a saturation
+    /// signal (e.g. `LogError::QuorumLost`, `KeyManagerError::Unavailable`)
+    /// so subscribed workloads can react. No-op when the bus is absent
+    /// (data path never blocks on advisory delivery — I-WA1/I-WA2).
+    pub fn set_telemetry_bus(&self, bus: Arc<kiseki_advisory::TelemetryBus>) {
+        *self.telemetry_bus.write().unwrap() = Some(bus);
+    }
+
+    /// Emit a per-workload backpressure event through the attached bus.
+    /// `workload` is opaque (typically the `WorkloadId` from a workflow
+    /// hint header). No-op when no bus is attached. Errors are
+    /// swallowed — advisory must never block the data path (I-WA2).
+    pub fn report_backpressure(
+        &self,
+        workload: &str,
+        severity: kiseki_advisory::BackpressureSeverity,
+        retry_after_ms: u64,
+    ) {
+        let Some(bus) = self.telemetry_bus.read().unwrap().clone() else {
+            return;
+        };
+        bus.emit_backpressure(
+            workload,
+            kiseki_advisory::BackpressureEvent {
+                severity,
+                retry_after_ms: kiseki_advisory::bucket_retry_after_ms(retry_after_ms),
+            },
+        );
     }
 
     /// Attach a shard map store for multi-shard routing (ADR-033).
@@ -378,6 +414,7 @@ impl GatewayOps for InMemoryGateway {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         // Compute content-addressed chunk ID.
         let chunk_id = derive_chunk_id(
@@ -473,8 +510,37 @@ impl GatewayOps for InMemoryGateway {
                 Err(e) => {
                     // Rollback: re-acquire lock and remove (PIPE-ADV-1).
                     let _ = self.compositions.lock().await.delete(comp_id).ok();
+                    // ADR-021 / I-WA5: emit a per-tenant backpressure
+                    // signal whenever the data path returns a retriable
+                    // error. Subscribers (workloads with active workflow
+                    // declarations on this tenant) can react. The emit
+                    // is non-blocking — it never delays the data path
+                    // (I-WA1, I-WA2). Only retriable errors produce a
+                    // signal; permanent errors (KeyOutOfRange, etc.)
+                    // are surfaced via their own typed paths above.
+                    let detail = e.to_string();
+                    let is_retriable = matches!(
+                        e,
+                        kiseki_log::error::LogError::ShardSplitting(_)
+                            | kiseki_log::error::LogError::LeaderUnavailable(_)
+                            | kiseki_log::error::LogError::QuorumLost(_)
+                            | kiseki_log::error::LogError::Unavailable
+                            | kiseki_log::error::LogError::ShardBusy { .. }
+                            | kiseki_log::error::LogError::MaintenanceMode(_)
+                    );
+                    if is_retriable {
+                        // Use the tenant id as the workload key — production
+                        // deployments will swap this for the workflow_ref
+                        // once ADR-021 hint headers reach the data path.
+                        let workload = req.tenant_id.0.to_string();
+                        self.report_backpressure(
+                            &workload,
+                            kiseki_advisory::BackpressureSeverity::Soft,
+                            100,
+                        );
+                    }
                     return Err(GatewayError::Upstream(format!(
-                        "delta emission failed: {e}"
+                        "delta emission failed: {detail}"
                     )));
                 }
             }
@@ -580,5 +646,73 @@ impl GatewayOps for InMemoryGateway {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod telemetry_wiring_tests {
+    use super::*;
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_crypto::keys::SystemMasterKey;
+
+    /// `report_backpressure` is a no-op when no telemetry bus is attached
+    /// — proves the data path doesn't depend on the bus (I-WA1, I-WA2).
+    #[tokio::test]
+    async fn report_backpressure_is_noop_without_bus() {
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            Box::new(ChunkStore::new()),
+            SystemMasterKey::new([0; 32], KeyEpoch(1)),
+        );
+        // Must not panic, must not block, must not allocate a channel.
+        gw.report_backpressure(
+            "any-tenant",
+            kiseki_advisory::BackpressureSeverity::Soft,
+            42,
+        );
+    }
+
+    /// `report_backpressure` delivers a bucketed event to the named
+    /// workload's subscriber — proves the wiring from gateway → bus →
+    /// subscriber works end-to-end.
+    #[tokio::test]
+    async fn report_backpressure_delivers_bucketed_event_to_subscriber() {
+        let bus = Arc::new(kiseki_advisory::TelemetryBus::new());
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            Box::new(ChunkStore::new()),
+            SystemMasterKey::new([0; 32], KeyEpoch(1)),
+        );
+        gw.set_telemetry_bus(Arc::clone(&bus));
+        let mut rx = bus.subscribe_backpressure("tenant-x");
+
+        gw.report_backpressure("tenant-x", kiseki_advisory::BackpressureSeverity::Soft, 75);
+
+        let evt = rx.try_recv().expect("subscriber must receive event");
+        assert_eq!(evt.severity, kiseki_advisory::BackpressureSeverity::Soft);
+        // Raw 75ms must have been bucketed to the next fixed bucket (100).
+        assert_eq!(evt.retry_after_ms, 100);
+    }
+
+    /// A neighbouring tenant's subscriber must NOT see another tenant's
+    /// backpressure (I-WA5: per-caller scoping).
+    #[tokio::test]
+    async fn neighbour_tenant_does_not_see_emit() {
+        let bus = Arc::new(kiseki_advisory::TelemetryBus::new());
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            Box::new(ChunkStore::new()),
+            SystemMasterKey::new([0; 32], KeyEpoch(1)),
+        );
+        gw.set_telemetry_bus(Arc::clone(&bus));
+        let mut alice = bus.subscribe_backpressure("alice");
+        let mut bob = bus.subscribe_backpressure("bob");
+
+        gw.report_backpressure("alice", kiseki_advisory::BackpressureSeverity::Hard, 500);
+
+        assert!(alice.try_recv().is_ok(), "alice receives her event");
+        assert!(bob.try_recv().is_err(), "bob must not see alice's event");
     }
 }

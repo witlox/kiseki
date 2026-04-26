@@ -34,6 +34,10 @@ pub mod chaos;
 // Inline store trait (ADR-030) — shared between kiseki-log and kiseki-chunk.
 pub mod inline_store;
 
+// Raft membership adapter trait (ADR-035) — bridges control-plane drain
+// orchestration to the consensus crates without a dependency cycle.
+pub mod raft_adapter;
+
 // Advisory surface lives here per ADR-021 §2 to preserve the no-cycle rule.
 pub mod advisory;
 

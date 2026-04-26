@@ -201,6 +201,12 @@ pub struct KisekiWorld {
     // === TCP transport endpoints (ADR-022) ===
     /// Gateway name → bound TCP address (started on demand by step defs).
     pub tcp_endpoints: HashMap<String, std::net::SocketAddr>,
+    /// Per-gateway shutdown signals so the NFS accept thread can exit
+    /// cleanly when the World is dropped (no leaked threads under
+    /// parallel cucumber runs).
+    pub tcp_shutdowns: Vec<Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-gateway S3 task handles for graceful shutdown.
+    pub s3_tasks: Vec<tokio::task::JoinHandle<()>>,
 
     // === Telemetry bus (ADR-021, I-WA5) ===
     pub telemetry_bus: Arc<kiseki_advisory::TelemetryBus>,
@@ -218,6 +224,20 @@ pub struct KisekiWorld {
     pub last_inline_key: Option<[u8; 32]>,
     /// Most recent appended delta (for inline-data assertions).
     pub last_delta: Option<kiseki_log::delta::Delta>,
+}
+
+impl Drop for KisekiWorld {
+    fn drop(&mut self) {
+        // Signal every spawned NFS accept thread to exit.
+        for s in &self.tcp_shutdowns {
+            s.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Abort outstanding S3 axum tasks (axum::serve loops forever
+        // without a graceful-shutdown future).
+        for h in self.s3_tasks.drain(..) {
+            h.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for KisekiWorld {
@@ -277,10 +297,14 @@ impl KisekiWorld {
         });
 
         let shard_map_store = Arc::new(NamespaceShardMapStore::new());
+        let telemetry_bus = Arc::new(kiseki_advisory::TelemetryBus::new());
         let gateway = Arc::new(
             InMemoryGateway::new(gw_comps, Box::new(gw_chunks), gw_master)
                 .with_shard_map(Arc::clone(&shard_map_store)),
         );
+        // Wire the telemetry bus into the production gateway so its
+        // write-path retriable errors emit real per-tenant backpressure.
+        gateway.set_telemetry_bus(Arc::clone(&telemetry_bus));
         let nfs_gw = NfsGateway::new(Arc::clone(&gateway));
         let nfs_ctx = Arc::new(NfsContext::new(nfs_gw, default_tenant, default_ns));
 
@@ -395,10 +419,12 @@ impl KisekiWorld {
             inline_temp_dir: Some(inline_temp_dir),
             last_inline_key: None,
             last_delta: None,
-            telemetry_bus: Arc::new(kiseki_advisory::TelemetryBus::new()),
+            telemetry_bus,
             backpressure_subs: HashMap::new(),
             qos_subs: HashMap::new(),
             tcp_endpoints: HashMap::new(),
+            tcp_shutdowns: Vec::new(),
+            s3_tasks: Vec::new(),
             drain_orch: Arc::new(kiseki_control::node_lifecycle::DrainOrchestrator::new()),
             node_names: HashMap::new(),
             last_drain_error: None,

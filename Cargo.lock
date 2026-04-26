@@ -1701,6 +1701,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "kiseki-advisory",
  "kiseki-chunk",
  "kiseki-common",
  "kiseki-composition",
