@@ -592,9 +592,7 @@ mod tests {
             })
         }
 
-        fn voter_ids(
-            &self,
-        ) -> kiseki_common::raft_adapter::MembershipFuture<'_, Vec<NodeId>> {
+        fn voter_ids(&self) -> kiseki_common::raft_adapter::MembershipFuture<'_, Vec<NodeId>> {
             let v = self.voters.clone();
             Box::pin(async move { Ok(v) })
         }

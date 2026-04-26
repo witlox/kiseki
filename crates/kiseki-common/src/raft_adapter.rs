@@ -44,11 +44,7 @@ pub trait RaftMembershipAdapter: Send + Sync {
     /// Replace `target`'s voter slot with `replacement` in the membership
     /// configuration. Implementations must keep the cluster at ≥ RF
     /// voters at every step (promote-then-remove, ADR-035 §3 phase 2).
-    fn replace_voter(
-        &mut self,
-        target: NodeId,
-        replacement: NodeId,
-    ) -> MembershipFuture<'_, ()>;
+    fn replace_voter(&mut self, target: NodeId, replacement: NodeId) -> MembershipFuture<'_, ()>;
 
     /// Current voter set as known to the leader. Used by the orchestrator
     /// to recompute the per-target shard list before each step (avoids
