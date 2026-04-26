@@ -16,6 +16,12 @@ openraft, channel-based transport), fault-injection scenarios with
 close redb databases per-scenario. Per-scenario cost ~1-2s; the spread
 is largely Raft election timing.
 
+## Container builds
+
+| Image | Cmd | Wall time | Size | Notes |
+|---|---|---:|---:|---|
+| `kiseki-server` | `docker build -f Dockerfile.server -t kiseki-server:local .` | ~5 min (cold) | 991 MB | Two-stage: rust:slim builder (cmake/clang/protobuf/golang/perl/nasm) → rust:slim runtime (ca-certificates + binary). FIPS default disabled in the Docker build — the FIPS delocator needs a certified toolchain not available in generic Docker; production FIPS uses a dedicated certified build env. |
+
 ## Workspace tests (excl. acceptance)
 
 | Cmd | Wall time | Notes |
