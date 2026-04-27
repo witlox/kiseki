@@ -107,42 +107,128 @@ impl<'a> XdrReader<'a> {
         self.read_u32().map(|v| v as i32)
     }
 
+    /// Read a strict XDR boolean (RFC 4506 §4.4: encoded as the value
+    /// 0 or 1 — anything else is malformed).
     pub fn read_bool(&mut self) -> io::Result<bool> {
-        self.read_u32().map(|v| v != 0)
+        match self.read_u32()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            v => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RFC 4506 §4.4: bool must be 0 or 1, got {v}"),
+            )),
+        }
     }
 
-    /// Read variable-length opaque data.
+    /// Read variable-length opaque data (RFC 4506 §4.10).
+    /// Length-prefixed payload, padded with zero bytes to a 4-byte
+    /// boundary. Pad bytes are mandatory; truncation past the
+    /// payload but before the pad is a wire error.
     pub fn read_opaque(&mut self) -> io::Result<Vec<u8>> {
         let len = self.read_u32()? as usize;
-        if self.remaining() < len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "xdr: opaque"));
-        }
-        let data = self.data[self.pos..self.pos + len].to_vec();
-        self.pos += len;
         let pad = (4 - (len % 4)) % 4;
-        self.pos += pad;
-        Ok(data)
-    }
-
-    /// Read fixed-length opaque data.
-    pub fn read_opaque_fixed(&mut self, len: usize) -> io::Result<Vec<u8>> {
-        if self.remaining() < len {
+        if self.remaining() < len + pad {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "xdr: fixed opaque",
+                "RFC 4506 §4.10: opaque payload+pad truncated",
             ));
         }
         let data = self.data[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        let pad = (4 - (len % 4)) % 4;
-        self.pos += pad;
+        self.pos += len + pad;
         Ok(data)
     }
 
-    /// Read a string.
+    /// Read fixed-length opaque data (RFC 4506 §4.9). No length
+    /// prefix; pad bytes (0..3) follow to round to a 4-byte boundary
+    /// and MUST be present.
+    pub fn read_opaque_fixed(&mut self, len: usize) -> io::Result<Vec<u8>> {
+        let pad = (4 - (len % 4)) % 4;
+        if self.remaining() < len + pad {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "RFC 4506 §4.9: fixed opaque payload+pad truncated",
+            ));
+        }
+        let data = self.data[self.pos..self.pos + len].to_vec();
+        self.pos += len + pad;
+        Ok(data)
+    }
+
+    /// Read a string (RFC 4506 §4.11 — same wire shape as opaque).
     pub fn read_string(&mut self) -> io::Result<String> {
         let bytes = self.read_opaque()?;
         String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Read a length-bounded XDR string (`string<MAX>` in the spec
+    /// grammar). Errors if the encoded length exceeds `max`.
+    pub fn read_string_max(&mut self, max: usize) -> io::Result<String> {
+        // Peek the length without committing the read.
+        if self.remaining() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "xdr: string len",
+            ));
+        }
+        let len = u32::from_be_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]) as usize;
+        if len > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("xdr: string<{max}> got len={len}"),
+            ));
+        }
+        self.read_string()
+    }
+}
+
+/// RFC 5531 §8.2 — `opaque_auth.body` is `opaque<400>`. The 400-byte
+/// cap is a hard MUST: any longer body is a wire-protocol error.
+pub const RFC5531_OPAQUE_AUTH_BODY_MAX: usize = 400;
+
+/// ONC RPC `opaque_auth` value (RFC 5531 §8.2).
+#[derive(Debug, Clone)]
+pub struct OpaqueAuth {
+    pub flavor: u32,
+    pub body: Vec<u8>,
+}
+
+impl OpaqueAuth {
+    /// Decode an `opaque_auth` per RFC 5531 §8.2. Enforces the hard
+    /// 400-byte cap on the body (`opaque<400>`).
+    pub fn decode(r: &mut XdrReader<'_>) -> io::Result<Self> {
+        let flavor = r.read_u32()?;
+        let body = r.read_opaque()?;
+        if body.len() > RFC5531_OPAQUE_AUTH_BODY_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "RFC 5531 §8.2: opaque_auth body must be \
+                     <= {RFC5531_OPAQUE_AUTH_BODY_MAX} bytes; got {}",
+                    body.len()
+                ),
+            ));
+        }
+        Ok(Self { flavor, body })
+    }
+
+    /// Strict variant: also rejects an `AUTH_NONE` (flavor=0) value
+    /// with a non-empty body, per RFC 1057 §9.1's recommendation.
+    /// Real clients always emit length=0 for `AUTH_NONE`; a non-zero
+    /// length is treated as malformed.
+    pub fn decode_strict(r: &mut XdrReader<'_>) -> io::Result<Self> {
+        let v = Self::decode(r)?;
+        if v.flavor == 0 && !v.body.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RFC 1057 §9.1: AUTH_NONE body must be empty",
+            ));
+        }
+        Ok(v)
     }
 }
 
@@ -163,7 +249,9 @@ pub enum RpcReplyStatus {
 }
 
 impl RpcCallHeader {
-    /// Decode an ONC RPC call header from XDR.
+    /// Decode an ONC RPC call header from XDR (RFC 5531 §9).
+    /// Enforces the 400-byte `opaque_auth.body` cap on both the
+    /// credential and verifier (§8.2).
     pub fn decode(r: &mut XdrReader<'_>) -> io::Result<Self> {
         let xid = r.read_u32()?;
         let msg_type = r.read_u32()?;
@@ -184,11 +272,10 @@ impl RpcCallHeader {
         let version = r.read_u32()?;
         let procedure = r.read_u32()?;
 
-        // Skip auth (credential + verifier).
-        let _cred_flavor = r.read_u32()?;
-        let _cred_body = r.read_opaque()?;
-        let _verf_flavor = r.read_u32()?;
-        let _verf_body = r.read_opaque()?;
+        // Credential + verifier — typed parse enforces the §8.2
+        // 400-byte body cap.
+        let _cred = OpaqueAuth::decode(r)?;
+        let _verf = OpaqueAuth::decode(r)?;
 
         Ok(Self {
             xid,

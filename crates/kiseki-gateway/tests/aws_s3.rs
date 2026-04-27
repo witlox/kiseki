@@ -52,6 +52,7 @@
 //! <https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html>
 //! Error codes:
 //! <https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html>
+#![allow(clippy::doc_markdown)]
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

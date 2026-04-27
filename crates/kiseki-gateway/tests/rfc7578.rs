@@ -40,6 +40,7 @@
 //! "RFC 7578".
 //!
 //! Spec text: <https://www.rfc-editor.org/rfc/rfc7578>.
+#![allow(clippy::doc_markdown)]
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

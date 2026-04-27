@@ -51,6 +51,7 @@
 //! <https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html>
 //! Test suite:
 //! <https://github.com/awsdocs/aws-doc-sdk-examples/tree/main/aws-sig-v4-test-suite>
+#![allow(clippy::doc_markdown)]
 
 use axum::http::{HeaderMap, Method, Uri};
 use kiseki_common::ids::OrgId;

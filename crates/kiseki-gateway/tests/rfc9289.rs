@@ -23,6 +23,28 @@
 //! pin the **NFS-over-TLS-specific** policy: when TLS wrapping is
 //! enabled vs disabled, the keep-alive cadence, and the rejection
 //! cases that must close the TCP connection cleanly.
+#![allow(
+    clippy::doc_markdown,
+    clippy::unreadable_literal,
+    clippy::inconsistent_digit_grouping,
+    clippy::items_after_statements,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::needless_borrows_for_generic_args,
+    clippy::useless_format,
+    clippy::stable_sort_primitive,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::format_in_format_args,
+    clippy::assertions_on_constants,
+    clippy::bool_assert_comparison,
+    clippy::doc_lazy_continuation,
+    clippy::no_effect_underscore_binding,
+    clippy::assertions_on_result_states,
+    clippy::format_collect,
+    clippy::manual_string_new,
+    clippy::manual_range_contains,
+    clippy::unicode_not_nfc
+)]
 
 // ===========================================================================
 // §3 — transport security flavor negotiation

@@ -23,6 +23,7 @@
 //!   - <https://www.rfc-editor.org/rfc/rfc9110>
 //!   - <https://www.rfc-editor.org/rfc/rfc9111>
 //!   - <https://www.rfc-editor.org/rfc/rfc9112>
+#![allow(clippy::doc_markdown)]
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

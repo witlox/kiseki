@@ -21,6 +21,7 @@
 //! ADR-038 §D4.3 supplements §5.1 with the kiseki-specific 76-byte
 //! `nfs_fh4` carried inside `ffds_fh_vers`. The layout body itself is
 //! pure RFC 8435.
+#![allow(clippy::doc_markdown)]
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 use kiseki_gateway::nfs_xdr::{XdrReader, XdrWriter};

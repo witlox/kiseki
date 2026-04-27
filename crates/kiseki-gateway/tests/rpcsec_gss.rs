@@ -35,6 +35,7 @@
 //!   - <https://www.rfc-editor.org/rfc/rfc2203>
 //!   - <https://www.rfc-editor.org/rfc/rfc5403>
 //!   - <https://www.rfc-editor.org/rfc/rfc7204>
+#![allow(clippy::doc_markdown)]
 
 use kiseki_common::ids::OrgId;
 use kiseki_gateway::nfs_auth::{

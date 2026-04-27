@@ -28,6 +28,28 @@
 //! Spec text: <https://www.rfc-editor.org/rfc/rfc3986>.
 //! AWS SigV4 spec referencing the divergence:
 //! <https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html>
+#![allow(
+    clippy::doc_markdown,
+    clippy::unreadable_literal,
+    clippy::inconsistent_digit_grouping,
+    clippy::items_after_statements,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::needless_borrows_for_generic_args,
+    clippy::useless_format,
+    clippy::stable_sort_primitive,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::format_in_format_args,
+    clippy::assertions_on_constants,
+    clippy::bool_assert_comparison,
+    clippy::doc_lazy_continuation,
+    clippy::no_effect_underscore_binding,
+    clippy::assertions_on_result_states,
+    clippy::format_collect,
+    clippy::manual_string_new,
+    clippy::manual_range_contains,
+    clippy::unicode_not_nfc
+)]
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -316,7 +338,8 @@ fn sigv4_canonical_uri_path(raw: &str) -> String {
             out.push(b as char);
         } else {
             // Percent-encode everything else (§2.1).
-            out.push_str(&format!("%{b:02X}"));
+            use std::fmt::Write as _;
+            write!(&mut out, "%{b:02X}").unwrap();
         }
     }
     out

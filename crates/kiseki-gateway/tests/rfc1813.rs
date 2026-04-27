@@ -18,6 +18,29 @@
 //!
 //! Spec text: <https://www.rfc-editor.org/rfc/rfc1813> (no errata
 //! affecting wire format as of 2026-04-27).
+#![allow(
+    clippy::doc_markdown,
+    clippy::unreadable_literal,
+    clippy::inconsistent_digit_grouping,
+    clippy::items_after_statements,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::needless_borrows_for_generic_args,
+    clippy::useless_format,
+    clippy::stable_sort_primitive,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::format_in_format_args,
+    clippy::assertions_on_constants,
+    clippy::bool_assert_comparison,
+    clippy::doc_lazy_continuation,
+    clippy::no_effect_underscore_binding,
+    clippy::assertions_on_result_states,
+    clippy::format_collect,
+    clippy::manual_string_new,
+    clippy::manual_range_contains,
+    clippy::unicode_not_nfc,
+    clippy::unusual_byte_groupings
+)]
 
 use kiseki_chunk::store::ChunkStore;
 use kiseki_common::ids::{NamespaceId, OrgId, ShardId};

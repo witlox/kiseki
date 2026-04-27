@@ -22,6 +22,7 @@
 //! `<asm-generic/errno.h>`); other Unix systems use different
 //! numerics for the same names — see the cross-implementation seed
 //! at the bottom of this file.
+#![allow(clippy::doc_markdown)]
 
 use kiseki_chunk::store::ChunkStore;
 use kiseki_client::fuse_fs::{FileKind, KisekiFuse};

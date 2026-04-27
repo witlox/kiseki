@@ -31,6 +31,28 @@
 //!   — gRPC standard status codes.
 //! - <https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md>
 //!   — gRPC over HTTP/2.
+#![allow(
+    clippy::doc_markdown,
+    clippy::unreadable_literal,
+    clippy::inconsistent_digit_grouping,
+    clippy::items_after_statements,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::needless_borrows_for_generic_args,
+    clippy::useless_format,
+    clippy::stable_sort_primitive,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::format_in_format_args,
+    clippy::assertions_on_constants,
+    clippy::bool_assert_comparison,
+    clippy::doc_lazy_continuation,
+    clippy::no_effect_underscore_binding,
+    clippy::assertions_on_result_states,
+    clippy::format_collect,
+    clippy::manual_string_new,
+    clippy::manual_range_contains,
+    clippy::unicode_not_nfc
+)]
 
 use kiseki_proto::v1::{
     AppendDeltaRequest, AppendDeltaResponse, ChunkId, CreateOrganizationRequest,
@@ -321,7 +343,7 @@ fn advisory_client_message_tag_3_remains_reserved() {
     // `(3 << 3) | 2 == 0x1A`. Other wire-type combinations are
     // similarly forbidden if the field is nested as oneof.
     let forbidden = [
-        (3u32 << 3) | 0, // varint
+        (3u32 << 3),     // varint (wire-type 0)
         (3u32 << 3) | 1, // 64-bit
         (3u32 << 3) | 2, // length-delimited
         (3u32 << 3) | 5, // 32-bit

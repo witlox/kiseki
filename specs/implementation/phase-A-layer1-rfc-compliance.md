@@ -290,9 +290,9 @@ is updated in the same commit as the test/fix landings.
 
 | # | Spec | File | Written? | Tests RED? |
 |---|---|---|---|---|
-| T-01 | RFC 4506 | `crates/kiseki-gateway/tests/rfc4506.rs` | ✅ | 2 of 18 RED (boolean strict-check; opaque pad strict-check) |
-| T-02 | RFC 5531 | `crates/kiseki-gateway/tests/rfc5531.rs` | ✅ | 1 of 8 RED (opaque_auth 400-byte cap) |
-| T-03 | RFC 1057 | `crates/kiseki-gateway/tests/rfc1057.rs` | ✅ | 3 of 15 RED (gids<16> auth-bypass; machinename<255>; AUTH_NONE non-empty body) |
+| T-01 | RFC 4506 | `crates/kiseki-gateway/tests/rfc4506.rs` | ✅ | 0 of 18 RED — Group I closed 2026-04-27 |
+| T-02 | RFC 5531 | `crates/kiseki-gateway/tests/rfc5531.rs` | ✅ | 0 of 8 RED — Group I closed 2026-04-27 |
+| T-03 | RFC 1057 | `crates/kiseki-gateway/tests/rfc1057.rs` | ✅ | 0 of 15 RED — Group I closed 2026-04-27 |
 | T-04 | RPCSEC_GSS family | `crates/kiseki-gateway/tests/rpcsec_gss.rs` | ✅ | 0 of 3 RED (canonical reject path documented) |
 | T-05 | RFC 1813 | `crates/kiseki-gateway/tests/rfc1813.rs` | ✅ | 2 of 12 RED |
 | T-06 | RFC 7530 | `crates/kiseki-gateway/tests/rfc7530.rs` | ✅ | 1 of 7 RED |
@@ -327,7 +327,7 @@ is updated in the same commit as the test/fix landings.
 
 | Group | Files | Status |
 |---|---|---|
-| I — Foundation | `nfs_xdr.rs`, `nfs_auth.rs` | ❌ |
+| I — Foundation | `nfs_xdr.rs`, `nfs_auth.rs` | ✅ — strict bool/opaque pad; `OpaqueAuth` w/ §8.2 400-byte cap; `AuthSysParams::decode` enforcing machinename≤255 + gids≤16 (2026-04-27) |
 | II — NFSv4 family | `nfs4_server.rs` | 🟡 (NULL + EXCHANGE_ID landed; rest pending) |
 | III — pNFS | `pnfs.rs`, `pnfs_ds_server.rs`, `nfs4_server.rs::op_layoutget_ff` | ❌ |
 | IV — NFS transport | `nfs_server.rs` | ❌ |

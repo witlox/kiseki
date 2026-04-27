@@ -59,12 +59,12 @@ For each spec below:
 
 | Spec | Owner | Decoder | Coverage | Critical |
 |---|---|---|---|---|
-| **RFC 4506** — XDR external data representation | `kiseki-gateway` (`nfs_xdr.rs`) | `crates/kiseki-gateway/tests/rfc4506.rs` | ❌ | Y — every NFS XDR field depends on it |
-| **RFC 5531** — ONC RPC v2 (call/reply framing, AUTH discriminant) | `kiseki-gateway` | `crates/kiseki-gateway/tests/rfc5531.rs` | ❌ | Y — wraps every NFSv2/v3/v4 call |
-| **RFC 1057** — ONC RPC v1 AUTH flavors (AUTH_NONE, AUTH_SYS) | `kiseki-gateway` (`nfs_auth.rs`) | `crates/kiseki-gateway/tests/rfc1057.rs` | ❌ | Y — current AUTH_SYS path |
-| **RFC 2203** — RPCSEC_GSS protocol (Kerberos for NFS) | `kiseki-gateway` (`nfs_auth.rs` future) | `crates/kiseki-gateway/tests/rfc2203.rs` | ❌ — not implemented today | N (until enterprise tenants need Kerberos) |
-| **RFC 5403** — RPCSEC_GSS Version 2 | `kiseki-gateway` (`nfs_auth.rs` future) | `crates/kiseki-gateway/tests/rfc5403.rs` | ❌ — not implemented today | N |
-| **RFC 7204** — RPCSEC_GSS contextual definitions | `kiseki-gateway` (`nfs_auth.rs` future) | (folded into 2203/5403) | ❌ — not implemented today | N |
+| **RFC 4506** — XDR external data representation | `kiseki-gateway` (`nfs_xdr.rs`) | `crates/kiseki-gateway/tests/rfc4506.rs` | ✅ — Group I 2026-04-27: strict bool + opaque pad | Y — every NFS XDR field depends on it |
+| **RFC 5531** — ONC RPC v2 (call/reply framing, AUTH discriminant) | `kiseki-gateway` | `crates/kiseki-gateway/tests/rfc5531.rs` | ✅ — Group I 2026-04-27: §8.2 400-byte cap on opaque_auth body | Y — wraps every NFSv2/v3/v4 call |
+| **RFC 1057** — ONC RPC v1 AUTH flavors (AUTH_NONE, AUTH_SYS) | `kiseki-gateway` (`nfs_auth.rs`) | `crates/kiseki-gateway/tests/rfc1057.rs` | ✅ — Group I 2026-04-27: typed `AuthSysParams::decode`, `OpaqueAuth::decode_strict` | Y — current AUTH_SYS path |
+| **RFC 2203** — RPCSEC_GSS protocol (Kerberos for NFS) | `kiseki-gateway` (`nfs_auth.rs` future) | `crates/kiseki-gateway/tests/rpcsec_gss.rs` | ❌ — not implemented today (canonical reject path tested) | N (until enterprise tenants need Kerberos) |
+| **RFC 5403** — RPCSEC_GSS Version 2 | `kiseki-gateway` (`nfs_auth.rs` future) | `crates/kiseki-gateway/tests/rpcsec_gss.rs` | ❌ — not implemented today | N |
+| **RFC 7204** — RPCSEC_GSS contextual definitions | `kiseki-gateway` (`nfs_auth.rs` future) | (folded into rpcsec_gss.rs) | ❌ — not implemented today | N |
 
 ### NFS data path
 
@@ -149,8 +149,7 @@ Adding a new protocol:
 
 ## Cross-reference
 
-- [ADR-039 — Layer 1 RFC compliance test discipline](adr/039-layer-1-rfc-compliance-discipline.md)
-- [ADR-023 — Protocol RFC Compliance Scope (partially superseded)](adr/023-protocol-rfc-compliance.md)
+- [ADR-023 (rev 2) — Protocol RFC Compliance Scope and Test Discipline](adr/023-protocol-rfc-compliance.md) — folds the Layer 1 discipline previously drafted as ADR-039
 - [ADR-013 — POSIX semantics scope](adr/013-posix-semantics-scope.md)
 - [ADR-014 — S3 API scope](adr/014-s3-api-scope.md)
 - [ADR-038 — pNFS layout + DS subprotocol](adr/038-pnfs-layout-and-ds-subprotocol.md)

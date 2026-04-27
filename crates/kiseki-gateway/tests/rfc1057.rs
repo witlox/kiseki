@@ -26,9 +26,31 @@
 //!
 //! Spec text: <https://www.rfc-editor.org/rfc/rfc1057> (no errata
 //! affecting AUTH_NONE / AUTH_SYS body shapes as of 2026-04-27).
+#![allow(
+    clippy::doc_markdown,
+    clippy::unreadable_literal,
+    clippy::inconsistent_digit_grouping,
+    clippy::items_after_statements,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::needless_borrows_for_generic_args,
+    clippy::useless_format,
+    clippy::stable_sort_primitive,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::format_in_format_args,
+    clippy::assertions_on_constants,
+    clippy::bool_assert_comparison,
+    clippy::doc_lazy_continuation,
+    clippy::no_effect_underscore_binding,
+    clippy::assertions_on_result_states,
+    clippy::format_collect,
+    clippy::manual_string_new,
+    clippy::manual_range_contains,
+    clippy::unicode_not_nfc
+)]
 
-use kiseki_gateway::nfs_auth::{NfsAuthMethod, NfsCredentials};
-use kiseki_gateway::nfs_xdr::{XdrReader, XdrWriter};
+use kiseki_gateway::nfs_auth::{AuthSysParams, NfsAuthMethod, NfsCredentials};
+use kiseki_gateway::nfs_xdr::{OpaqueAuth, XdrReader, XdrWriter};
 
 // ===========================================================================
 // Sentinel constants — RFC 1057 §7.2 + IANA RPC Authentication Flavors
@@ -111,12 +133,12 @@ fn s9_1_auth_none_body_is_empty_on_wire() {
 /// protocol-fidelity gap. A strict server SHOULD reject (or at
 /// minimum log) bodies > 0 bytes when flavor=AUTH_NONE.
 ///
-/// Today's `RpcCallHeader::decode` reads the body without inspecting
-/// the flavor, so it does NOT enforce this rule. This test asserts
-/// the spec contract; it is RED until kiseki adds a flavor-aware
-/// auth decoder.
+/// `OpaqueAuth::decode_strict` enforces this; the lenient
+/// `OpaqueAuth::decode` (used by `RpcCallHeader::decode` so we don't
+/// break interop with chatty clients) accepts non-empty bodies and
+/// just enforces the §8.2 400-byte cap.
 #[test]
-fn s9_1_auth_none_with_nonempty_body_should_be_flagged() {
+fn s9_1_auth_none_with_nonempty_body_is_rejected_by_strict_decoder() {
     // Build flavor=AUTH_NONE with a 4-byte body. Spec says body
     // SHOULD be zero-length; a strict server flags this.
     let mut w = XdrWriter::new();
@@ -124,20 +146,20 @@ fn s9_1_auth_none_with_nonempty_body_should_be_flagged() {
     w.write_opaque(&[0xDE, 0xAD, 0xBE, 0xEF]);
     let bytes = w.into_bytes();
 
-    // The XDR decoder will happily read the body — it doesn't know
-    // about flavor semantics. We assert the gap directly.
+    // Lenient decode succeeds (real production path).
+    {
+        let mut r = XdrReader::new(&bytes);
+        let oa = OpaqueAuth::decode(&mut r).expect("lenient decode accepts");
+        assert_eq!(oa.flavor, 0);
+        assert_eq!(oa.body, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    // Strict decode rejects per §9.1 SHOULD.
     let mut r = XdrReader::new(&bytes);
-    let flavor = r.read_u32().unwrap();
-    let body = r.read_opaque().unwrap();
-    assert_eq!(flavor, 0, "AUTH_NONE flavor");
-    // RFC 1057 §9.1: body SHOULD be empty. Production-side strict
-    // check is missing today; this assertion will fire once a typed
-    // AUTH_NONE decoder rejects non-empty bodies.
+    let result = OpaqueAuth::decode_strict(&mut r);
     assert!(
-        body.is_empty(),
-        "RFC 1057 §9.1: AUTH_NONE body must be empty; \
-         got {} bytes — gateway must reject or log",
-        body.len()
+        result.is_err(),
+        "RFC 1057 §9.1: strict AUTH_NONE decode must reject non-empty body"
     );
 }
 
@@ -256,32 +278,19 @@ fn s9_2_machinename_at_max_length_255_accepted() {
 }
 
 /// RFC 1057 §9.2 negative — `machinename` over 255 octets violates
-/// the `string<255>` constraint. A strict decoder MUST reject it.
-///
-/// Today's `XdrReader::read_string` does NOT enforce the 255-octet
-/// cap (it reads any length). This test asserts the spec contract
-/// directly; it will fire once kiseki adds a typed AUTH_SYS decoder
-/// with the 255-byte limit baked in.
+/// the `string<255>` constraint. `AuthSysParams::decode` MUST reject
+/// it with a BADXDR-equivalent error.
 #[test]
 fn s9_2_machinename_over_255_must_error() {
     let oversized = "X".repeat(256); // one byte over the limit
     let bytes = encode_authsys_parms(0, &oversized, 0, 0, &[]);
     let mut r = XdrReader::new(&bytes);
-    let _stamp = r.read_u32().unwrap();
-    // The codec accepts the oversized string today. The strict
-    // assertion: a 256-byte machinename MUST be a wire-side error.
-    let result = r.read_string();
-    match result {
-        Err(_) => { /* desired behavior */ }
-        Ok(name) => {
-            assert!(
-                name.len() <= 255,
-                "RFC 1057 §9.2: machinename has hard cap of 255 octets; \
-                 decoder accepted {} octets (must reject with BADXDR-equivalent)",
-                name.len()
-            );
-        }
-    }
+    let result = AuthSysParams::decode(&mut r);
+    assert!(
+        result.is_err(),
+        "RFC 1057 §9.2: machinename has hard cap of 255 octets; \
+         AuthSysParams::decode must reject 256-octet name"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -366,12 +375,7 @@ fn s9_2_gids_at_max_16_entries_accepted() {
 }
 
 /// RFC 1057 §9.2 negative — an oversized gids array (>16 entries)
-/// violates the `gids<16>` cap. A strict decoder MUST reject.
-///
-/// Today's `RpcCallHeader::decode` reads the cred body as opaque,
-/// so this rule is NOT enforced at the wire layer. This test
-/// asserts the spec contract; it is RED until kiseki adds a typed
-/// AUTH_SYS decoder.
+/// violates the `gids<16>` cap. `AuthSysParams::decode` MUST reject.
 ///
 /// Real-world note: oversized gids arrays are a known auth-bypass
 /// vector — a malicious client could claim membership in an
@@ -381,19 +385,11 @@ fn s9_2_gids_over_16_entries_must_error() {
     let too_many: Vec<u32> = (1000..1017).collect(); // 17 entries — one over cap
     let bytes = encode_authsys_parms(0, "h", 1000, 1000, &too_many);
     let mut r = XdrReader::new(&bytes);
-    let _ = r.read_u32(); // stamp
-    let _ = r.read_string(); // machinename
-    let _ = r.read_u32(); // uid
-    let _ = r.read_u32(); // gid
-    let count = r.read_u32().unwrap();
-    // RFC 1057 §9.2: gids<16> means count MUST be <= 16. A strict
-    // typed decoder would reject here with a BADXDR-equivalent
-    // error before reading the entries. The codec primitive cannot
-    // enforce this; we assert directly.
+    let result = AuthSysParams::decode(&mut r);
     assert!(
-        count <= 16,
+        result.is_err(),
         "RFC 1057 §9.2: gids<16> caps the array at 16 entries; \
-         got {count} (must reject with BADXDR-equivalent)"
+         AuthSysParams::decode must reject 17 entries (BADXDR-equivalent)"
     );
 }
 

@@ -7,7 +7,85 @@
 //!   - I-Auth1 — mTLS on data fabric connections
 //!   - I-Auth2 — optional tenant `IdP` second-stage auth
 
+use std::io;
+
 use kiseki_common::ids::OrgId;
+
+use crate::nfs_xdr::XdrReader;
+
+/// RFC 1057 §9.2 — `machinename` is `string<255>`. Hard cap.
+pub const RFC1057_AUTHSYS_MACHINENAME_MAX: usize = 255;
+
+/// RFC 1057 §9.2 — `gids<16>`. Maximum 16 supplemental gids.
+pub const RFC1057_AUTHSYS_GIDS_MAX: usize = 16;
+
+/// Decoded `AUTH_SYS` (a.k.a. `AUTH_UNIX`) credential body per
+/// RFC 1057 §9.2. Carried inside an `opaque_auth.body` with
+/// `flavor=AUTH_SYS (1)`.
+///
+/// ```xdr
+/// struct authsys_parms {
+///     unsigned int  stamp;
+///     string        machinename<255>;
+///     unsigned int  uid;
+///     unsigned int  gid;
+///     unsigned int  gids<16>;
+/// };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthSysParams {
+    /// Arbitrary client-chosen identifier (RFC 1057 §9.2).
+    pub stamp: u32,
+    /// Client hostname; `string<255>`.
+    pub machinename: String,
+    /// Unix user ID.
+    pub uid: u32,
+    /// Unix primary group ID.
+    pub gid: u32,
+    /// Supplemental group IDs; `gids<16>`.
+    pub gids: Vec<u32>,
+}
+
+impl AuthSysParams {
+    /// Decode and validate an `authsys_parms` from XDR. Enforces:
+    ///   - `machinename` ≤ 255 octets (`string<255>`)
+    ///   - `gids` ≤ 16 entries (`gids<16>`)
+    ///
+    /// Either bound violation is a wire-protocol error — the typical
+    /// auth-bypass vector is a malicious client claiming membership
+    /// in an unbounded number of supplemental groups to evade ACL
+    /// checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` on truncated input or when a length bound
+    /// (`machinename<255>` / `gids<16>`) is exceeded.
+    pub fn decode(r: &mut XdrReader<'_>) -> io::Result<Self> {
+        let stamp = r.read_u32()?;
+        let machinename = r.read_string_max(RFC1057_AUTHSYS_MACHINENAME_MAX)?;
+        let uid = r.read_u32()?;
+        let gid = r.read_u32()?;
+        let gids_len = r.read_u32()? as usize;
+        if gids_len > RFC1057_AUTHSYS_GIDS_MAX {
+            let max = RFC1057_AUTHSYS_GIDS_MAX;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RFC 1057 §9.2: gids<{max}> exceeded — got {gids_len}"),
+            ));
+        }
+        let mut gids = Vec::with_capacity(gids_len);
+        for _ in 0..gids_len {
+            gids.push(r.read_u32()?);
+        }
+        Ok(Self {
+            stamp,
+            machinename,
+            uid,
+            gid,
+            gids,
+        })
+    }
+}
 
 /// NFS authentication method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

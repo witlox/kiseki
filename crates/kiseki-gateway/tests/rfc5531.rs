@@ -12,6 +12,7 @@
 //! "RFC 5531".
 //!
 //! Spec text: <https://www.rfc-editor.org/rfc/rfc5531>.
+#![allow(clippy::doc_markdown)]
 
 use kiseki_gateway::nfs_xdr::{encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter};
 
