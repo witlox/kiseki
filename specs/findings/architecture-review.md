@@ -529,3 +529,414 @@ updated accordingly.
 
 ADV-038-4, -5, -6 are tracked for the implementer/auditor steps and
 do not block code starting now.
+
+---
+
+# Adversary Gate 1 — Protocol RFC compliance (originally ADR-039; folded into ADR-023 rev 2)
+
+**Date**: 2026-04-27
+**Scope**: Architecture mode — `specs/architecture/protocol-compliance.md` catalog + the test-discipline content originally drafted as ADR-039.
+**Stance**: Skeptical. Catalog completeness + ordering checked against the actual code surface.
+
+**Note**: This review's first finding (ADV-039-1) caught that ADR-023
+already existed with overlapping scope. The architect responded by
+folding ADR-039's content into ADR-023 rev 2 and deleting ADR-039.
+Findings retain their original `ADV-039-N` IDs for traceability;
+they apply to ADR-023 rev 2.
+
+## Finding: ADV-039-1 — ADR-023 already exists; ADR-039 must cite it
+Severity: **Critical**
+Category: Correctness > Specification compliance
+Location: `specs/architecture/adr/039-layer-1-rfc-compliance-discipline.md`; `specs/architecture/adr/023-protocol-rfc-compliance.md` (accepted 2026-04-20)
+
+**Description**: ADR-023 ("Protocol RFC Compliance Scope") was
+accepted on 2026-04-20 — about a week ago. It enumerates which
+NFSv3/v4.2/S3 ops are implemented and explicitly defines a
+"compliance testing approach" using BDD scenarios. ADR-039 was
+written without referencing it. The two are complementary
+(ADR-023 = scope, ADR-039 = test discipline) but ADR-039's
+"Decision" section makes no acknowledgment, and the catalog
+duplicates parts of ADR-023's tables without cross-referencing.
+
+Worse: ADR-023 §"Compliance testing approach" §1 says "BDD feature
+files map to RFC sections" as the compliance mechanism. ADR-039
+is, in effect, replacing that mechanism — it explicitly tightens
+the auditor's gate-2 to require Layer 1 reference decoders. ADR-039
+must say so out loud, or future readers will think the two ADRs
+contradict.
+
+**Suggested resolution**: ADR-039 must add a "Relationship to
+ADR-023" subsection that:
+- Cites ADR-023 as the prior art that established protocol scope.
+- Acknowledges ADR-039 SUPERSEDES ADR-023's "Compliance testing
+  approach" section while preserving the implementation-scope tables.
+- Marks ADR-023's status as "Superseded by ADR-039 on test
+  discipline; scope tables remain authoritative" — or moves the
+  implementation-scope tables into the catalog and marks ADR-023
+  as fully superseded.
+
+The catalog must add a "Prior art" cross-reference to ADR-023.
+
+---
+
+## Finding: ADV-039-2 — RFC 8881 supersedes RFC 5661 as canonical NFSv4.1
+Severity: **High**
+Category: Correctness > Specification currency
+Location: `protocol-compliance.md` "RFC 5661" row; ADR-039 every reference to RFC 5661
+
+**Description**: IETF published **RFC 8881** in August 2020 as
+"Network File System (NFS) Version 4 Minor Version 1 Protocol".
+It obsoletes RFC 5661. Every modern Linux kernel client
+implementation references RFC 8881 (with backward-compatible RFC
+5661 wire format). Kiseki's catalog cites RFC 5661 throughout —
+which is technically obsolete. Tests written against "RFC 5661 §
+18.35.4" should cite RFC 8881 §18.35.4 instead (same content,
+authoritative spec).
+
+The wire format is byte-identical between 5661 and 8881; the
+errata in 8881 is mostly editorial. So this is not a code change,
+but the doc references must be right or future readers will
+chase a dead spec.
+
+**Suggested resolution**: catalog row for NFSv4.1 cites "RFC 8881
+(obsoletes RFC 5661)". ADR-039 references update similarly. Test
+doc-comments cite 8881 with a note that 5661 is the predecessor.
+
+---
+
+## Finding: ADV-039-3 — RFC 5662 (NFSv4.1 XDR) folded into 5661 — no separate row
+Severity: **Low**
+Category: Correctness > Catalog completeness
+Location: `protocol-compliance.md` (folded note in 5661 row)
+
+**Description**: RFC 5662 is the companion XDR description for
+NFSv4.1. The catalog folds it into the 5661 row with the note
+"(folded into 5661 module)". That's reasonable — most
+implementations treat them together — but the row's
+**reference-decoder location** still has to import the XDR types
+defined in 5662 (rpcgen-generated). If 5662 has its own errata
+(it does — RFC 8434 errata for 5662), the catalog won't capture
+that.
+
+**Suggested resolution**: add a one-line "Companion specs:
+RFC 5662 (XDR) + applicable errata" to the 5661/8881 row's notes.
+Same treatment for RFC 7863 (XDR companion to RFC 7862).
+
+---
+
+## Finding: ADV-039-4 — RFC 7204 / RFC 5403 / RFC 2203 (RPCSEC_GSS) missing
+Severity: **Medium**
+Category: Correctness > Catalog completeness
+Location: `protocol-compliance.md`
+
+**Description**: Catalog covers AUTH at the TLS level (RFC 8446)
+but doesn't catalog the AUTH flavors that ride inside ONC RPC.
+`crates/kiseki-gateway/src/nfs_auth.rs` references AUTH_SYS,
+AUTH_NONE, and "Kerberos principals" (RPCSEC_GSS). The catalog
+should explicitly list:
+
+- **RFC 1057** — ONC RPC v1 AUTH flavors (AUTH_NONE / AUTH_SYS).
+  Implemented today.
+- **RFC 2203 / RFC 5403 / RFC 7204** — RPCSEC_GSS (Kerberos for
+  NFS). NOT implemented today, but referenced in `nfs_auth.rs`'s
+  doc comment as "future". Catalog should list with status ❌ and
+  critical-path N (until enterprise tenants need Kerberos).
+
+Without these rows, a future reader looks at AUTH_SYS in the code,
+asks "is this RFC-compliant?", and finds no row to consult.
+
+**Suggested resolution**: add three rows under "Foundation":
+RFC 1057, RFC 2203, RFC 5403, RFC 7204. Mark RPCSEC_GSS as ❌
+not-implemented (ADR-009 covers what we DO use for auth).
+
+---
+
+## Finding: ADV-039-5 — Wire-sample fixture provenance is hand-wavy
+Severity: **Medium**
+Category: Robustness > Test maintainability
+Location: ADR-039 §D3, "Cross-implementation seed"
+
+**Description**: §D3 says "captured wire sample from a known-good
+independent implementation … `.pcap` fixtures". Two unspecified
+problems:
+
+1. **Chicken-and-egg**: capturing a known-good NFSv4.1 mount
+   trace requires a working mount — exactly what we couldn't do
+   today. The fix landed via inspection + RFC reading + tcpdump
+   of a *failed* attempt. Where does the first sample come from?
+
+2. **Repo policy**: `.pcap` files are binary blobs that bloat git
+   history. ~1 MB per sample × 18 specs × multiple per spec = 50–
+   200 MB of binary in a repo that's currently tiny. Git LFS? A
+   separate repo? Not addressed.
+
+**Suggested resolution**: amend §D3 with:
+- **Source priority**: (1) RFC examples (text — copy as bytes),
+  (2) public test vectors (e.g. AWS SigV4 official test suite —
+  text), (3) capture from a known-good independent implementation
+  AFTER we have a baseline, (4) hand-crafted from spec for
+  obscure paths.
+- **Storage**: text fixtures in-repo; large binaries (`.pcap`) go
+  under `tests/wire-samples/<rfc>/` with `.gitattributes` LFS
+  pointer-only AND a recorded SHA in the test source so a missing
+  LFS object fails loudly rather than silently skipping.
+
+---
+
+## Finding: ADV-039-6 — RFC 5663 (Block Layout) + RFC 8154 (SCSI Layout) missing as explicit-rejected
+Severity: **Low**
+Category: Correctness > Catalog completeness
+Location: `protocol-compliance.md`; ADR-038 §D1 rejected these but the catalog doesn't show them at all
+
+**Description**: ADR-038 §D1 explicitly rejects Block Layout
+(RFC 5663) and SCSI Layout (RFC 8154) for our pNFS implementation.
+The catalog should list them with status "Rejected — see ADR-038
+§D1" so a future reader doesn't propose adding them or
+mistakenly thinks "no row = not considered".
+
+**Suggested resolution**: add two rows under "NFS data path":
+
+| Spec | Status |
+|---|---|
+| RFC 5663 — pNFS Block Layout | Rejected (ADR-038 §D1) |
+| RFC 8154 — pNFS SCSI Layout | Rejected (ADR-038 §D1) |
+
+---
+
+## Finding: ADV-039-7 — Internal cluster protocols (Raft messages, gRPC services) absent
+Severity: **Medium**
+Category: Correctness > Scope completeness
+Location: `protocol-compliance.md`
+
+**Description**: Catalog covers external client-facing protocols
+but not the cluster-internal ones:
+
+- **gRPC** (RFC-less, but a published spec) — every kiseki gRPC
+  service (LogService, ControlService, KeyManagerService,
+  WorkflowAdvisoryService, StorageAdminService — see ADR-021 §1
+  and ADR-025) carries production traffic. Schema lives in
+  `specs/architecture/proto/kiseki/v1/*.proto`. There's no
+  "compliance" row.
+- **openraft / Raft RPC** — kiseki-raft's TCP transport. Custom
+  framing.
+- **HKDF / HMAC / AES-GCM** — `kiseki-crypto` is FIPS-validated
+  via aws-lc-rs but the catalog doesn't list crypto primitives.
+
+These don't need RFC-compliance tests in the same Layer-1 sense
+(no third-party clients consume them), but the catalog should
+acknowledge them for completeness AND because cross-cutting bugs
+(e.g. wrong Length-prefix in Raft RPC) have the same shape as the
+NFSv4 wire bugs we just fixed.
+
+**Suggested resolution**: add a separate top-level section
+"Internal protocols" listing: gRPC schemas, Raft RPC, FIPS crypto
+primitives. Mark each with appropriate scope (✅ for FIPS — already
+verified by aws-lc-rs's certification; 🟡 for gRPC — protobuf
+gives us schema validation but not semantic validation; ❌ for
+Raft RPC framing).
+
+---
+
+## Finding: ADV-039-8 — POSIX scope — IEEE Std 1003.1-2024 supersedes 2017
+Severity: **Low**
+Category: Correctness > Specification currency
+Location: `protocol-compliance.md` POSIX row; ADR-013 (POSIX semantics scope)
+
+**Description**: IEEE published the **2024 revision of POSIX.1**
+in mid-2024. The catalog cites POSIX-1.2017. Practically the
+filesystem subset hasn't changed materially, but a reader looking
+up "POSIX-1.2017" will find a superseded reference. Same fix as
+RFC 8881 → 5661.
+
+**Suggested resolution**: cite "POSIX.1-2024 (IEEE Std 1003.1-2024)
+— filesystem subset" in the catalog row. Reference ADR-013 for
+implementation scope.
+
+---
+
+## Finding: ADV-039-9 — Order: RFC 8881 cannot be done before RFC 4506 + RFC 5531
+Severity: **Low**
+Category: Correctness > Build-phase ordering
+Location: ADR-039 §D4
+
+**Description**: §D4 lists order as Foundation (4506+5531) →
+Critical-path (5661/8881). Good. But the §D4 list buries the
+ordering inside prose. A small visual ordering table would help
+readers (and the implementer) not mis-read.
+
+**Suggested resolution**: §D4 ends with a "Phase ordering
+visual" — ASCII-tree like the build-phases doc has. Optional but
+high-value cosmetic.
+
+---
+
+## Finding: ADV-039-10 — `@happy-path` BDD downgrade is a process change requiring tooling
+Severity: **Medium**
+Category: Robustness > Process enforceability
+Location: ADR-039 §D5, §D7
+
+**Description**: §D5 says "until [Layer 1 lands], scenarios are
+tagged `@happy-path` and the BDD's RFC references are
+documentation, not assertions." §D7 makes the auditor enforce
+this. But:
+
+1. There's no actual `@happy-path` tag in any feature file today.
+2. The cucumber harness in `crates/kiseki-acceptance/tests/acceptance.rs`
+   doesn't filter on `@happy-path`. If we add the tag, what does
+   it mean operationally? Just a marker for the auditor?
+3. Renaming every NFSv4 BDD scenario from `@integration` to
+   `@happy-path` is itself a sweep that touches dozens of feature
+   files and no compliance tests are written yet — chicken and
+   egg with the catalog rollout.
+
+**Suggested resolution**: amend §D5 with a transition plan:
+
+- Phase A (this ADR): introduce the `@happy-path` tag *as a
+  superset* of `@integration` with no semantic difference yet
+  (cucumber treats them the same).
+- Phase B (per-RFC): when an RFC's row goes ✅, the corresponding
+  feature file is allowed to keep `@integration`. Until then, the
+  tag stays both (so existing CI behavior unchanged).
+- Phase C (catalog all ✅): drop the dual-tag scaffold. Auditor
+  gate-2 enforces: every `@integration` scenario maps to a ✅ row.
+
+This unblocks Layer-1 work without an organization-wide rename.
+
+---
+
+## ADR-039 summary
+
+| Finding | Title | Severity | Blocking? |
+|---|---|---|---|
+| ADV-039-1 | ADR-023 not cited | **Critical** | **Yes — must fix before adversary clears** |
+| ADV-039-2 | RFC 5661 → RFC 8881 | High | Yes — references must be current |
+| ADV-039-3 | RFC 5662 / 7863 (XDR companions) | Low | No — clarification |
+| ADV-039-4 | RPCSEC_GSS family missing | Medium | Yes — incomplete inventory |
+| ADV-039-5 | Wire-sample provenance | Medium | Yes — without this, §D3 is unimplementable |
+| ADV-039-6 | RFC 5663 / 8154 explicit-rejected | Low | No — completeness |
+| ADV-039-7 | Internal protocols absent | Medium | Yes — catalog scope must include them |
+| ADV-039-8 | POSIX-1.2024 supersedes 2017 | Low | No — currency |
+| ADV-039-9 | §D4 order — visual | Low | No — cosmetic |
+| ADV-039-10 | `@happy-path` transition plan | Medium | Yes — process unimplementable without it |
+
+**Blocking gate-clear**: ADV-039-1, -2, -4, -5, -7, -10. Six
+must-fix items before implementer may begin. Estimated 1-2 hours
+of architect time to amend ADR-039 + the catalog.
+
+**Recommendation**: **Gate 1 NOT cleared.** Send back to architect
+for rev 2. Strong path forward; no fundamental redesign required.
+
+---
+
+## Gate 1 re-review (rev 2) — 2026-04-27
+
+Architect produced rev 2 the same day, folding ADR-039 into
+ADR-023 (now ADR-023 rev 2) per the user's decision. Re-checking
+each blocking finding:
+
+**ADV-039-1 (ADR-023 not cited) — RESOLVED.**
+ADR-039 was deleted; its content is now §D2-D6 of ADR-023 rev 2.
+Rev 2's revision-history block at the top documents the rev-1 →
+rev-2 transition explicitly. The catalog's "Prior art" section
+links to ADR-023 (and ADR-013/014). No supersedes-arrow needed.
+
+**ADV-039-2 (RFC 5661 → RFC 8881) — RESOLVED.**
+Catalog row for NFSv4.1 cites "RFC 8881 (Obsoletes RFC 5661)".
+ADR-023 rev 2 references RFC 8881 throughout, with the rev-1 bug
+descriptions explicitly using `RFC 7530/8881 §15.1` (NULL) and
+`RFC 8881 §18.35.4` (EXCHANGE_ID flags). Companion XDR specs
+RFC 5662 (NFSv4.1) and RFC 7863 (NFSv4.2) noted in the catalog
+row. ADV-039-3 also resolved (RFC 5662/7863 noted).
+
+**ADV-039-4 (RPCSEC_GSS family missing) — RESOLVED.**
+Catalog "Foundation" section adds: RFC 1057 (AUTH_NONE/AUTH_SYS,
+implemented today), RFC 2203 (RPCSEC_GSS, ❌ not implemented),
+RFC 5403 (RPCSEC_GSS Version 2, ❌), RFC 7204 (folded into 2203/
+5403). All marked critical-path N until enterprise tenants need
+Kerberos. Sufficient for completeness.
+
+**ADV-039-5 (wire-sample provenance) — RESOLVED.**
+ADR-023 rev 2 §D2.3.1 and §D2.3.2 spell out:
+- 4-tier source priority: (1) RFC text, (2) public test suites,
+  (3) captured `.pcap`, (4) hand-crafted from spec.
+- Storage policy: text fixtures in-repo under
+  `tests/wire-samples/<rfc>/`, binary `.pcap` via Git LFS with
+  embedded SHA-256 sentinels, 200 KiB threshold for LFS,
+  reproduction script per capture.
+The chicken-and-egg concern is addressed: most fixtures come from
+RFC examples (text, no live mount needed); captures are tier-3
+and used only after a baseline exists.
+
+**ADV-039-6 (RFC 5663/8154 explicit-rejected) — RESOLVED.**
+Catalog adds two ⛔ rows under "NFS data path": RFC 5663 (Block
+Layout) and RFC 8154 (SCSI Layout), each with "Rejected (ADR-038
+§D1)" pointer.
+
+**ADV-039-7 (internal protocols absent) — RESOLVED.**
+Catalog adds "Internal protocols" section: gRPC + Protobuf
+(🟡 schema enforced via `tonic`/`prost`, semantic validation
+unpinned), openraft Raft RPC (❌ custom framing), FIPS 140-2/3
+crypto primitives (✅ aws-lc-rs upstream certified, 🟡 our usage
+parameters need section tests). Critical-path Y for all three.
+
+**ADV-039-8 (POSIX-1.2024 supersedes 2017) — RESOLVED.**
+Catalog row for FUSE backend cites "POSIX.1-2024 (IEEE Std
+1003.1-2024) — supersedes POSIX.1-2017".
+
+**ADV-039-9 (visual ordering) — RESOLVED.**
+ADR-023 rev 2 §D3 includes an ASCII-tree showing Phase A → B → C
+→ D in sequence + E and F parallelizable + G as cleanup tail.
+
+**ADV-039-10 (`@happy-path` transition plan) — RESOLVED.**
+ADR-023 rev 2 §D4.1 specifies a three-phase rollout:
+- Phase A (now): `@happy-path` introduced as a *superset* of
+  `@integration` — cucumber treats them the same, no semantic
+  change; new BDD scenarios use both side-by-side.
+- Phase B (per-RFC): when an RFC ✅, the corresponding feature
+  may keep `@integration` alone.
+- Phase C (catalog all ✅): drop the dual-tag scaffold; auditor
+  enforces the catalog mapping.
+
+CI behavior is unchanged throughout. No organization-wide rename
+required.
+
+### Cross-cutting check
+
+Catalog rev 2 contains every blocking-finding keyword (verified by
+grep — 14 hits in catalog, 17 in ADR-023). Phase ordering visual
+matches the catalog's structural sections. ADR-023 rev 2 cites the
+two motivating commits (`5f6fece`, `7b1b4f6`) for traceability.
+
+### Residual concerns (non-blocking, tracked in ADR-023 §"Open")
+
+- **Versioned spec compliance** — RFC 8881 errata tracking
+  policy. Default "8881 + applicable errata as of test write
+  time" is fine for now; revisit when an errata changes a wire
+  format.
+- **Per-section coverage measurement** — no automated lint
+  cross-references doc-comment `§ X.Y.Z` against the spec's TOC.
+  Future work; not blocking Phase A.
+
+### Summary table (rev 2)
+
+| Finding | rev 1 verdict | rev 2 verdict |
+|---|---|---|
+| ADV-039-1 | Critical / blocking | **Resolved** (ADR-039 folded into ADR-023 rev 2) |
+| ADV-039-2 | High / blocking | **Resolved** (RFC 5661 → RFC 8881) |
+| ADV-039-3 | Low / non-blocking | **Resolved** (XDR companions noted) |
+| ADV-039-4 | Medium / blocking | **Resolved** (RPCSEC_GSS family added) |
+| ADV-039-5 | Medium / blocking | **Resolved** (provenance + LFS policy) |
+| ADV-039-6 | Low / non-blocking | **Resolved** (rejected layouts as ⛔ rows) |
+| ADV-039-7 | Medium / blocking | **Resolved** (internal protocols section) |
+| ADV-039-8 | Low / non-blocking | **Resolved** (POSIX.1-2024) |
+| ADV-039-9 | Low / non-blocking | **Resolved** (ASCII visual) |
+| ADV-039-10 | Medium / blocking | **Resolved** (3-phase transition) |
+
+**Recommendation**: **ADR-023 rev 2 cleared.** Implementer may
+proceed to Phase A: RFC 4506 (XDR) + RFC 5531 (ONC RPC v2) +
+RFC 1057 (AUTH flavors) reference decoders.
+
+The Phase 15 e2e remains paused per the user's "pause e2e" call
+2026-04-27. It resumes once the critical-path RFCs (8881, 7862,
+8435) are at least 🟡 — at which point we'll have proper
+diagnostics for whatever blocks the mount next.
