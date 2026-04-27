@@ -57,6 +57,16 @@ use axum::http::{HeaderMap, Method, Uri};
 use kiseki_common::ids::OrgId;
 use kiseki_gateway::s3_auth::{parse_authorization, validate_request, AccessKeyStore, AuthError};
 
+/// Lowercase hex encoding without an extra crate or `format!`-collect.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{b:02x}").expect("write to String");
+    }
+    s
+}
+
 // ===========================================================================
 // Test credentials — straight from the AWS SigV4 test suite README.
 // ===========================================================================
@@ -178,6 +188,57 @@ fn vector_get_vanilla_canonical_request_sentinel() {
     assert_eq!(lines[5], "", "blank line terminating header block");
     assert_eq!(lines[6], "host;x-amz-date");
     assert_eq!(lines[7], EMPTY_PAYLOAD_HASH);
+}
+
+/// AWS SigV4 — vendored fixture comparison. Asserts that the
+/// in-source `GET_VANILLA_CREQ` constant equals the bytes of the
+/// vendored `tests/wire-samples/aws-sigv4/get-vanilla/get-vanilla.creq`
+/// file (BSD-3-licensed mirror of the AWS test suite). Closes
+/// ADV-PA-10: prior to this, the "AWS-published" claim was
+/// transcription-only; now the constant has a verbatim source.
+#[test]
+fn vector_get_vanilla_creq_matches_vendored_fixture() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wire-samples/aws-sigv4/get-vanilla/get-vanilla.creq");
+    let on_disk = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read vendored fixture {}: {e}", path.display()));
+    assert_eq!(
+        GET_VANILLA_CREQ.trim_end_matches('\n'),
+        on_disk.trim_end_matches('\n'),
+        "AWS SigV4 vendored fixture divergence: GET_VANILLA_CREQ \
+         does not match tests/wire-samples/aws-sigv4/get-vanilla/get-vanilla.creq. \
+         Either the test constant was edited or the fixture was \
+         corrupted; provenance.txt sibling has the source URL."
+    );
+}
+
+/// AWS SigV4 — fixture corruption guard. SHA-256 of the .creq file
+/// is pinned; a silent truncation, re-encoding, or replacement of
+/// the vendored fixture surfaces as a hash mismatch (ADR-023 §D2.3.2).
+///
+/// The pinned SHA-256 happens to equal `bb579772…` because that is
+/// SHA-256 of the canonical-request bytes — same hash AWS publishes
+/// in `get-vanilla.sts` step 3. To re-pin after a deliberate fixture
+/// update, run `sha256sum tests/wire-samples/aws-sigv4/get-vanilla/get-vanilla.creq`.
+#[test]
+fn vector_get_vanilla_creq_fixture_sha256_pinned() {
+    use aws_lc_rs::digest;
+    const EXPECTED_SHA256: &str =
+        "bb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63";
+
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wire-samples/aws-sigv4/get-vanilla/get-vanilla.creq");
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("read vendored fixture {}: {e}", path.display()));
+    let h = digest::digest(&digest::SHA256, &bytes);
+    let hex = hex_lower(h.as_ref());
+    assert_eq!(
+        hex, EXPECTED_SHA256,
+        "Fixture SHA-256 mismatch: tests/wire-samples/aws-sigv4/\
+         get-vanilla/get-vanilla.creq has been altered. Re-pin only \
+         if the change is deliberate (verify against the AWS test \
+         suite source per provenance.txt)."
+    );
 }
 
 /// AWS SigV4 — pin the `get-vanilla` string-to-sign shape.

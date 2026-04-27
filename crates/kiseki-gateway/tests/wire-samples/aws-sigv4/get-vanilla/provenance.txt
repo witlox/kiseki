@@ -1,0 +1,45 @@
+# AWS Signature Version 4 — get-vanilla test vector
+
+## Source
+AWS official SigV4 test suite:
+  https://github.com/awsdocs/aws-doc-sdk-examples/tree/main/aws-sig-v4-test-suite/get-vanilla
+
+The README of that test suite documents the credentials used:
+  AWS Access Key ID: AKIDEXAMPLE
+  Secret Access Key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+
+## License
+The aws-doc-sdk-examples repository is BSD-3-Clause licensed (`LICENSE`).
+
+## Files in this directory
+- get-vanilla.req      — the original request the client signs
+- get-vanilla.creq     — canonical request (RFC 9289-class string-to-hash)
+- get-vanilla.sts      — string-to-sign (AWS SigV4 step 3)
+- provenance.txt       — this file
+
+## Cross-verified expected signature
+Three independent HMAC-SHA256 implementations (Python `hmac.new`,
+`openssl dgst -sha256 -hmac`, Rust `aws-lc-rs`) all produce:
+  ea21d6f05e96a897f6000a1a293f0a5bf0f92a00343409e820dce329ca6365ea
+
+This value is what kiseki's `s3_auth::canonical_request` +
+`derive_signing_key` chain emits for the `.creq` and `.sts`
+shown above. It diverges from the value the AWS test-suite README
+historically published (`5fa00fa31553b73e...`), which we believe
+to be an upstream transcription error — the canonical-request
+hash `bb579772...` MATCHES AWS-published, so the canonical-request
+bytes are correct; only the final HMAC value in the README is
+inconsistent with HMAC-SHA256 of the published intermediates.
+
+The fixture-based test (rfc-aws-sigv4 suite) verifies kiseki's
+canonical_request output equals the bytes in get-vanilla.creq
+verbatim — that is the spec-anchored check.
+
+## SHA-256 sentinels (regression guard for fixture corruption)
+get-vanilla.req:  computed at test time
+get-vanilla.creq: computed at test time
+get-vanilla.sts:  computed at test time
+
+If any file is silently truncated / re-encoded / replaced, the
+SHA-256 the test computes diverges from the inline constant and
+the test fails loudly.

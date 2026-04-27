@@ -52,6 +52,16 @@
 use kiseki_gateway::nfs_auth::{AuthSysParams, NfsAuthMethod, NfsCredentials};
 use kiseki_gateway::nfs_xdr::{OpaqueAuth, XdrReader, XdrWriter};
 
+/// Lowercase hex (used by the wire-sample SHA-256 sentinel test).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{b:02x}").expect("write to String");
+    }
+    s
+}
+
 // ===========================================================================
 // Sentinel constants — RFC 1057 §7.2 + IANA RPC Authentication Flavors
 // ===========================================================================
@@ -457,4 +467,36 @@ fn rfc_example_s9_2_authsys_parms_root_unix_credential() {
         "RFC 1057 §9.2: the trivial root AUTH_SYS body must be exactly these 24 bytes"
     );
     assert_eq!(bytes.len(), 24);
+}
+
+/// RFC 1057 §9.2 — vendored fixture comparison (ADR-023 §D2.3.1).
+/// `tests/wire-samples/rfc1057/section-9-2-authsys/trivial-root-credential.bin`
+/// is the byte-for-byte trivial root credential.
+#[test]
+fn s9_2_authsys_root_credential_matches_vendored_fixture() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wire-samples/rfc1057/section-9-2-authsys/trivial-root-credential.bin");
+    let on_disk =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    let emitted = encode_authsys_parms(0, "unix", 0, 0, &[]);
+    assert_eq!(
+        emitted, on_disk,
+        "RFC 1057 §9.2: kiseki's authsys_parms encoding for the \
+         trivial root credential must match the vendored fixture \
+         (provenance.txt sibling)"
+    );
+}
+
+/// RFC 1057 §9.2 fixture corruption guard (ADR-023 §D2.3.2).
+#[test]
+fn s9_2_fixture_sha256_pinned() {
+    use aws_lc_rs::digest;
+    const EXPECTED_SHA256: &str =
+        "d230d66793d45e61ffccea0e656718d210390f9c5b16371193a531b5b647accb";
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wire-samples/rfc1057/section-9-2-authsys/trivial-root-credential.bin");
+    let bytes = std::fs::read(&path).expect("read fixture");
+    let h = digest::digest(&digest::SHA256, &bytes);
+    let hex = hex_lower(h.as_ref());
+    assert_eq!(hex, EXPECTED_SHA256, "fixture SHA-256 drift");
 }

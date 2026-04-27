@@ -133,7 +133,7 @@ fn kiseki_cache_stats_field_order_via_raw_layout() {
     let ptr = std::ptr::addr_of!(stats).cast::<u64>();
     for i in 0..10u64 {
         // SAFETY: KisekiCacheStats is repr(C), 10 contiguous u64 fields.
-        let v = unsafe { *ptr.add(i as usize) };
+        let v = unsafe { *ptr.add(usize::try_from(i).expect("u64 fits usize")) };
         assert_eq!(v, i, "ABI: field at offset {i} reads back as {i}");
     }
 }

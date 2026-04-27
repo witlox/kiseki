@@ -1,0 +1,41 @@
+# RFC 1057 §9.2 — AUTH_SYS / AUTH_UNIX trivial root credential fixture
+
+## Source
+RFC 1057 §9.2 (RPC: Remote Procedure Call Protocol Specification
+Version 2, June 1988):
+  https://www.rfc-editor.org/rfc/rfc1057#section-9.2
+
+The XDR grammar:
+  struct authsys_parms {
+      unsigned int stamp;
+      string       machinename<255>;
+      unsigned int uid;
+      unsigned int gid;
+      unsigned int gids<16>;
+  };
+
+This fixture is the trivial root credential discussed throughout
+the RFC text:
+  stamp        = 0
+  machinename  = "unix" (4 bytes; XDR pads to 4-byte boundary so no pad bytes)
+  uid          = 0 (root)
+  gid          = 0 (root)
+  gids         = []  (empty supplemental gids array)
+
+  Total = 24 bytes (4 + 4 + 4 + 4 + 4 + 4).
+
+## License
+RFC text is published by IETF under the Trust Provisions of RFC 7841.
+
+## Files in this directory
+- trivial-root-credential.bin  — the 24-byte fixture (binary)
+- provenance.txt               — this file
+
+## SHA-256 sentinel
+trivial-root-credential.bin: d230d66793d45e61ffccea0e656718d210390f9c5b16371193a531b5b647accb
+
+## Cross-impl notes
+The byte-for-byte expansion in `tests/rfc1057.rs::rfc_example_s9_2_authsys_parms_root_unix_credential`
+already pins these 24 bytes via inline `expected = vec![...]`. The
+fixture-based test pins the same bytes via vendored file, closing
+ADV-PA-1 (no separate `tests/wire-samples/` evidence).

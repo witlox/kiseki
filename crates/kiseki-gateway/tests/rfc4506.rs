@@ -39,6 +39,16 @@
 
 use kiseki_gateway::nfs_xdr::{XdrReader, XdrWriter};
 
+/// Lowercase hex (used by the wire-sample SHA-256 sentinel test).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{b:02x}").expect("write to String");
+    }
+    s
+}
+
 // ===========================================================================
 // §3 — primitive types
 // ===========================================================================
@@ -355,4 +365,41 @@ fn rfc_example_s4_10_three_bytes_with_one_pad() {
         ],
         "RFC 4506 §4.10 example: n=3 → length(4) + payload(3) + pad(1) = 8"
     );
+}
+
+/// RFC 4506 §4.10 — vendored fixture comparison (ADR-023 §D2.3.1).
+/// `tests/wire-samples/rfc4506/section-4-10/opaque-five-bytes.bin`
+/// is the byte-for-byte spec example for `opaque<5> = {1,2,3,4,5}`.
+/// Verifies kiseki's encoder matches.
+#[test]
+fn s4_10_opaque_matches_vendored_fixture() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wire-samples/rfc4506/section-4-10/opaque-five-bytes.bin");
+    let on_disk =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+
+    let mut w = XdrWriter::new();
+    w.write_opaque(&[1u8, 2, 3, 4, 5]);
+    let emitted = w.into_bytes();
+
+    assert_eq!(
+        emitted, on_disk,
+        "RFC 4506 §4.10: kiseki's encoder output for opaque<5>={{1,2,3,4,5}} \
+         must match the vendored fixture (provenance.txt sibling)"
+    );
+}
+
+/// RFC 4506 §4.10 fixture corruption guard. SHA-256 sentinel; a
+/// silent mutation surfaces as a hash mismatch (ADR-023 §D2.3.2).
+#[test]
+fn s4_10_fixture_sha256_pinned() {
+    use aws_lc_rs::digest;
+    const EXPECTED_SHA256: &str =
+        "1f4ed241f48f960ffacfe6117577d24b2d74e221c11376719d0e0196a096416c";
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wire-samples/rfc4506/section-4-10/opaque-five-bytes.bin");
+    let bytes = std::fs::read(&path).expect("read fixture");
+    let h = digest::digest(&digest::SHA256, &bytes);
+    let hex = hex_lower(h.as_ref());
+    assert_eq!(hex, EXPECTED_SHA256, "fixture SHA-256 drift");
 }

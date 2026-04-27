@@ -10,6 +10,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[lib]
+# Both Rust consumers (rlib) and C/C++/Python wrappers (cdylib) link
+# this crate. cdylib output is required for the FFI ABI link-verify
+# test (ADV-PA-5).
+crate-type = ["lib", "cdylib"]
+
 [features]
 default = []
 ffi = []
@@ -39,6 +45,10 @@ path = "src/bin/kiseki_client.rs"
 
 [[test]]
 name = "native_abi"
+required-features = ["ffi"]
+
+[[test]]
+name = "c_abi_link"
 required-features = ["ffi"]
 
 [dev-dependencies]

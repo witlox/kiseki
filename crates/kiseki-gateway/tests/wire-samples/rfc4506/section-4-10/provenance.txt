@@ -1,0 +1,30 @@
+# RFC 4506 §4.10 — Variable-Length Opaque Data fixture
+
+## Source
+RFC 4506 §4.10 (XDR: External Data Representation, May 2006):
+  https://www.rfc-editor.org/rfc/rfc4506#section-4.10
+
+The section text walks through the encoding of an opaque payload of
+5 bytes. The fixture in this directory IS that example, byte-for-byte:
+
+  length prefix : 00 00 00 05  (uint32 = 5)
+  payload       : 01 02 03 04 05
+  pad           : 00 00 00     (round to 12 = 4*3 boundary)
+  total         : 12 bytes
+
+## License
+RFC text is published by IETF under the Trust Provisions of RFC 7841
+(no copyright restriction on extracted spec examples for testing).
+
+## Files in this directory
+- opaque-five-bytes.bin  — the 12-byte fixture (binary)
+- provenance.txt         — this file
+
+## SHA-256 sentinel
+opaque-five-bytes.bin: 1f4ed241f48f960ffacfe6117577d24b2d74e221c11376719d0e0196a096416c
+
+## Cross-impl notes
+Any compliant XDR encoder MUST produce these exact bytes for the
+input `opaque<5> = {1,2,3,4,5}`. kiseki's `XdrWriter::write_opaque`
+is verified against this fixture in
+`crates/kiseki-gateway/tests/rfc4506.rs::s4_10_opaque_matches_vendored_fixture`.

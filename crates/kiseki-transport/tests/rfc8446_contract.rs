@@ -369,27 +369,38 @@ async fn s4_4_2_4_client_cert_signed_by_unrelated_ca_rejected() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
 
-    // Server task — only declares mTLS bypass if we actually receive
-    // application bytes from the rogue client. accept() returning Ok
-    // is not sufficient evidence by itself: in TLS 1.3, tokio-rustls
-    // can return Ok before the read path surfaces a CertificateVerify
-    // alert (rustls/tokio-rustls #1521 family of timing quirks).
-    let accepted_handle = tokio::spawn(async move {
+    // Server task — produces an explicit verdict via oneshot. Three
+    // outcomes:
+    //   - Rejected: TLS layer or read path failed (the spec-correct
+    //     behaviour for a chain rooted in an unrelated CA).
+    //   - AppBytesReceived: the rogue handshake completed AND the
+    //     server received plaintext bytes through the verified
+    //     channel — that's the mTLS bypass. Test panics.
+    //   - InfraStall: server task stalled (this is a test-infra
+    //     failure, not "fine" — we panic with a clear message
+    //     instead of silently passing).
+    #[derive(Debug)]
+    enum HandshakeVerdict {
+        Rejected,
+        AppBytesReceived,
+    }
+    let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
+    let _accepted_handle = tokio::spawn(async move {
         let Ok((tcp, _peer)) = listener.accept().await else {
-            return Err::<(), &'static str>("listener closed");
+            let _ = verdict_tx.send(HandshakeVerdict::Rejected);
+            return;
         };
-        match acceptor.accept(tcp).await {
+        let v = match acceptor.accept(tcp).await {
             Ok(mut tls) => {
                 let mut buf = [0u8; 1];
                 match tls.read(&mut buf).await {
-                    Ok(0) | Err(_) => Ok(()), // Server alerted / connection closed.
-                    Ok(_) => Err("RFC 8446 §4.4.2.4: server received application \
-                         bytes from a client whose cert was signed by an \
-                         unrelated CA — chain validation FAILED"),
+                    Ok(0) | Err(_) => HandshakeVerdict::Rejected,
+                    Ok(_) => HandshakeVerdict::AppBytesReceived,
                 }
             }
-            Err(_) => Ok(()), // Expected — handshake rejected at TLS layer.
-        }
+            Err(_) => HandshakeVerdict::Rejected,
+        };
+        let _ = verdict_tx.send(v);
     });
 
     // Client uses the UNRELATED CA's cert as its client cert. The
@@ -431,39 +442,97 @@ async fn s4_4_2_4_client_cert_signed_by_unrelated_ca_rejected() {
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
 
-    let handshake_result =
-        tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp)).await;
-
-    // The handshake MAY surface as Err here (server alerted before
-    // client_finished) OR Ok (alert lands during first read). The
-    // authoritative check is on the server task: did it ever receive
-    // application bytes from a rogue client? If yes, that's the
-    // mTLS bypass.
-    match handshake_result {
-        Err(_timeout) => {} // Timeout: server stalled or dropped (RFC 8446 §6.2).
-        Ok(Err(_handshake_err)) => {} // Server rejected mid-handshake.
-        Ok(Ok(mut stream)) => {
-            // Try to send + read; if the server actually accepted the
-            // chain, this round-trip works. If not, we'll get an Alert
-            // here.
-            use tokio::io::AsyncWriteExt;
-            let _ = stream.write_all(b"x").await;
-            let mut buf = [0u8; 1];
-            let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
-            // Don't panic here — leave verdict to the server task,
-            // which has authoritative visibility on whether bytes
-            // crossed the verified-channel boundary.
-        }
+    // Drive the client side: the result is informational only — the
+    // server-side verdict is authoritative.
+    if let Ok(Ok(mut stream)) =
+        tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp)).await
+    {
+        use tokio::io::AsyncWriteExt;
+        let _ = stream.write_all(b"x").await;
+        let mut buf = [0u8; 1];
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
     }
 
-    // Verify the server task didn't accept application bytes from the
-    // rogue client. THIS is the definitive mTLS-bypass test.
-    match tokio::time::timeout(Duration::from_secs(2), accepted_handle).await {
-        Ok(Ok(Ok(()))) => {} // server saw the rejection — good
-        Ok(Ok(Err(msg))) => panic!("{msg}"),
-        Ok(Err(_join_err)) => {} // task panic counts as rejection
-        Err(_timeout) => {}      // server still waiting — also fine
+    // Wait for the server's authoritative verdict. Timeout is a TEST
+    // INFRA FAILURE — DO NOT silently treat it as success (ADV-PA-8:
+    // a deadlocked verifier could otherwise pass this test).
+    let verdict = tokio::time::timeout(Duration::from_secs(10), verdict_rx)
+        .await
+        .expect(
+            "server task did not produce a verdict within 10 s — test infra stalled, NOT a pass",
+        )
+        .expect("server task dropped the verdict channel — test infra failure");
+    assert!(
+        matches!(verdict, HandshakeVerdict::Rejected),
+        "RFC 8446 §4.4.2.4: server received application bytes from a \
+         client whose cert was signed by an unrelated CA — chain \
+         validation FAILED ({verdict:?})"
+    );
+}
+
+/// RFC 8446 §4.4.2.4 — additional negative case: an EXPIRED leaf
+/// cert (signed by the cluster CA but with `not_after` in the past)
+/// must be rejected by the verifier with the same severity as a
+/// rogue-CA chain. This adds a second dimension to the chain-
+/// validation regression guard (ADV-PA-8 cross-product).
+#[test]
+fn s4_4_2_4_verifier_rejects_expired_leaf_directly() {
+    use rcgen::CertificateParams;
+    use rustls::pki_types::{CertificateDer, UnixTime};
+    use std::io::BufReader;
+
+    ensure_crypto_provider();
+
+    let cluster_ca = generate_ca();
+
+    // Build a leaf with `not_after` in the past (expired).
+    let mut params =
+        CertificateParams::new(Vec::<String>::new()).unwrap_or_else(|_| unreachable!());
+    params.is_ca = rcgen::IsCa::NoCa;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "expired-leaf");
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )));
+    let one_year = time::Duration::days(365);
+    params.not_before = time::OffsetDateTime::now_utc() - one_year * 5;
+    params.not_after = time::OffsetDateTime::now_utc() - one_year;
+    let kp = rcgen::KeyPair::generate().unwrap_or_else(|_| unreachable!());
+    let cert = params
+        .signed_by(&kp, &cluster_ca.issuer)
+        .unwrap_or_else(|_| unreachable!());
+
+    let mut roots = rustls::RootCertStore::empty();
+    let cluster_certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(cluster_ca.ca_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse cluster ca");
+    for c in &cluster_certs {
+        roots.add(c.clone()).expect("add ca");
     }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("verifier");
+
+    let leaf_certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(cert.pem().as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse leaf");
+
+    let now = UnixTime::since_unix_epoch(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap(),
+    );
+    let result = verifier.verify_client_cert(&leaf_certs[0], &[], now);
+    assert!(
+        result.is_err(),
+        "RFC 8446 §4.4.2.4: verify_client_cert MUST reject an expired \
+         leaf cert; got Ok which means the verifier ignores notAfter."
+    );
 }
 
 /// Direct verifier-layer diagnostic: bypass tokio-rustls and check

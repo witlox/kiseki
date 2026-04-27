@@ -16,6 +16,16 @@
 
 use kiseki_gateway::nfs_xdr::{encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter};
 
+/// Lowercase hex (used by the wire-sample SHA-256 sentinel test).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{b:02x}").expect("write to String");
+    }
+    s
+}
+
 // ===========================================================================
 // Helpers — build call/reply byte sequences per RFC 5531 §9
 // ===========================================================================
@@ -242,4 +252,36 @@ fn rfc_example_nfsv4_null_call_decodes_correctly() {
         (h.xid, h.program, h.version, h.procedure),
         (0xCAFE_BABE, 100_003, 4, 0)
     );
+}
+
+/// RFC 5531 §9 — vendored fixture comparison (ADR-023 §D2.3.1).
+/// `tests/wire-samples/rfc5531/section-9-call/nfsv4-null-call.bin`
+/// is the byte-for-byte canonical NFSv4 NULL CALL frame. Verifies
+/// kiseki's `build_call` matches.
+#[test]
+fn s9_nfsv4_null_call_matches_vendored_fixture() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wire-samples/rfc5531/section-9-call/nfsv4-null-call.bin");
+    let on_disk =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    let emitted = build_call(0xCAFE_BABE, 100_003, 4, 0, 2);
+    assert_eq!(
+        emitted, on_disk,
+        "RFC 5531 §9: kiseki's CALL frame for NFSv4 NULL must match \
+         vendored fixture (provenance.txt sibling)"
+    );
+}
+
+/// RFC 5531 §9 fixture corruption guard (ADR-023 §D2.3.2).
+#[test]
+fn s9_fixture_sha256_pinned() {
+    use aws_lc_rs::digest;
+    const EXPECTED_SHA256: &str =
+        "8db9c1c9cfe32aa1897c76768cc118ae81e0e2029de3568f7d0de06f92078661";
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wire-samples/rfc5531/section-9-call/nfsv4-null-call.bin");
+    let bytes = std::fs::read(&path).expect("read fixture");
+    let h = digest::digest(&digest::SHA256, &bytes);
+    let hex = hex_lower(h.as_ref());
+    assert_eq!(hex, EXPECTED_SHA256, "fixture SHA-256 drift");
 }

@@ -1,0 +1,44 @@
+# RFC 5531 §9 — ONC RPC v2 CALL message fixture
+
+## Source
+RFC 5531 §9 (Remote Procedure Call Protocol Version 2, May 2009):
+  https://www.rfc-editor.org/rfc/rfc5531#section-9
+
+The section defines the CALL message layout:
+  uint32 xid
+  uint32 msg_type (CALL = 0)
+  uint32 rpcvers (always 2)
+  uint32 program
+  uint32 version
+  uint32 procedure
+  opaque_auth cred (flavor + opaque<400>)
+  opaque_auth verf (flavor + opaque<400>)
+
+The fixture is the byte-for-byte canonical "NFSv4 NULL ping" frame
+that mount.nfs4 emits as its first message after TCP handshake:
+  xid        = 0xCAFEBABE
+  msg_type   = CALL (0)
+  rpcvers    = 2
+  program    = 100003 (NFS)
+  version    = 4
+  procedure  = 0 (NULL)
+  cred       = AUTH_NONE (flavor=0, body=empty)
+  verf       = AUTH_NONE (flavor=0, body=empty)
+
+  Total = 4*9 + 0 (cred body) + 0 (verf body) = 36 bytes.
+
+## License
+RFC text is published by IETF under the Trust Provisions of RFC 7841.
+
+## Files in this directory
+- nfsv4-null-call.bin  — the 36-byte fixture (binary)
+- provenance.txt       — this file
+
+## SHA-256 sentinel
+nfsv4-null-call.bin: 8db9c1c9cfe32aa1897c76768cc118ae81e0e2029de3568f7d0de06f92078661
+
+## Cross-impl notes
+A real Linux 6.x mount.nfs4 emits these exact 36 bytes (verified against
+a captured pcap of `mount.nfs4 -t nfs4 -o vers=4.1 server:/`). kiseki's
+`build_call(0xCAFE_BABE, 100_003, 4, 0, 2)` in `tests/rfc5531.rs` is
+verified against this fixture.
