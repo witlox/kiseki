@@ -292,28 +292,36 @@ is updated in the same commit as the test/fix landings.
 |---|---|---|---|---|
 | T-01 | RFC 4506 | `crates/kiseki-gateway/tests/rfc4506.rs` | ✅ | 2 of 18 RED (boolean strict-check; opaque pad strict-check) |
 | T-02 | RFC 5531 | `crates/kiseki-gateway/tests/rfc5531.rs` | ✅ | 1 of 8 RED (opaque_auth 400-byte cap) |
-| T-03 | RFC 1057 | `crates/kiseki-gateway/tests/rfc1057.rs` | ❌ | — |
-| T-04 | RPCSEC_GSS family | `crates/kiseki-gateway/tests/rpcsec_gss.rs` | ❌ | — |
-| T-05 | RFC 1813 | `crates/kiseki-gateway/tests/rfc1813.rs` | ❌ | — |
-| T-06 | RFC 7530 | `crates/kiseki-gateway/tests/rfc7530.rs` | ❌ | — |
-| T-07 | RFC 8881 | `crates/kiseki-gateway/tests/rfc8881.rs` | ❌ | — |
-| T-08 | RFC 7862 | `crates/kiseki-gateway/tests/rfc7862.rs` | ❌ | — |
-| T-09 | RFC 8435 | `crates/kiseki-gateway/tests/rfc8435.rs` | ❌ | — |
-| T-10 | RFC 5665 | `crates/kiseki-gateway/tests/rfc5665.rs` | ❌ | — |
-| T-11 | RFC 9289 | `crates/kiseki-gateway/tests/rfc9289.rs` | ❌ | — |
-| T-12 | RFC 9110/9111/9112 | `crates/kiseki-gateway/tests/rfc9110.rs` | ❌ | — |
-| T-13 | RFC 3986 | `crates/kiseki-gateway/tests/rfc3986.rs` | ❌ | — |
-| T-14 | RFC 6838 | `crates/kiseki-gateway/tests/rfc6838.rs` | ❌ | — |
-| T-15 | RFC 7578 | `crates/kiseki-gateway/tests/rfc7578.rs` | ❌ | — |
-| T-16 | RFC 8446 | `crates/kiseki-transport/tests/rfc8446_contract.rs` | ❌ | — |
-| T-17 | AWS SigV4 | `crates/kiseki-gateway/tests/aws_sigv4.rs` | ❌ | — |
-| T-18 | AWS S3 REST | `crates/kiseki-gateway/tests/aws_s3.rs` | ❌ | — |
-| T-19 | POSIX.1-2024 | `crates/kiseki-client/tests/posix_semantics.rs` | ❌ | — |
-| T-20 | Linux FUSE | `crates/kiseki-client/tests/fuse_linux.rs` | ❌ | — |
-| T-21 | macOS osxfuse | `crates/kiseki-client/tests/fuse_macos.rs` | ❌ | — |
-| T-22 | gRPC | `crates/kiseki-proto/tests/grpc_contract.rs` | ❌ | — |
-| T-23 | Raft RPC | `crates/kiseki-raft/tests/raft_wire.rs` | ❌ | — |
-| T-24 | FIPS usage | `crates/kiseki-crypto/tests/fips_usage.rs` | ❌ | — |
+| T-03 | RFC 1057 | `crates/kiseki-gateway/tests/rfc1057.rs` | ✅ | 3 of 15 RED (gids<16> auth-bypass; machinename<255>; AUTH_NONE non-empty body) |
+| T-04 | RPCSEC_GSS family | `crates/kiseki-gateway/tests/rpcsec_gss.rs` | ✅ | 0 of 3 RED (canonical reject path documented) |
+| T-05 | RFC 1813 | `crates/kiseki-gateway/tests/rfc1813.rs` | ✅ | 2 of 12 RED |
+| T-06 | RFC 7530 | `crates/kiseki-gateway/tests/rfc7530.rs` | ✅ | 1 of 7 RED |
+| T-07 | RFC 8881 | `crates/kiseki-gateway/tests/rfc8881.rs` | ✅ | 7 of 28 RED (BADHANDLE vs NOFILEHANDLE; NOTSUPP vs OP_ILLEGAL; getattr bitmap) |
+| T-08 | RFC 7862 | `crates/kiseki-gateway/tests/rfc7862.rs` | ✅ | 2 of 12 RED |
+| T-09 | RFC 8435 | `crates/kiseki-gateway/tests/rfc8435.rs` | ✅ | 1 of 20 RED (ffl_flags FF_FLAGS_NO_LAYOUTCOMMIT) |
+| T-10 | RFC 5665 | `crates/kiseki-gateway/tests/rfc5665.rs` | ✅ | 1 of 14 RED (IPv6 form) |
+| T-11 | RFC 9289 | `crates/kiseki-gateway/tests/rfc9289.rs` | ✅ | 1 of 11 RED (no keep-alive timer) |
+| T-12 | RFC 9110/9111/9112 | `crates/kiseki-gateway/tests/rfc9110.rs` | ✅ | 6 of 19 RED (Range ignored; conditional headers) |
+| T-13 | RFC 3986 | `crates/kiseki-gateway/tests/rfc3986.rs` | ✅ | 0 of 11 RED |
+| T-14 | RFC 6838 | `crates/kiseki-gateway/tests/rfc6838.rs` | ✅ | 1 of 5 RED (Content-Type not echoed) |
+| T-15 | RFC 7578 | `crates/kiseki-gateway/tests/rfc7578.rs` | ✅ | 0 of 4 (skeleton — multipart not implemented) |
+| T-16 | RFC 8446 | `crates/kiseki-transport/tests/rfc8446_contract.rs` | ✅ | 2 of 9 RED (CRITICAL: WebPkiClientVerifier mTLS bypass risk) |
+| T-17 | AWS SigV4 | `crates/kiseki-gateway/tests/aws_sigv4.rs` | ✅ | 2 of 9 RED (canonical-request grammar) |
+| T-18 | AWS S3 REST | `crates/kiseki-gateway/tests/aws_s3.rs` | ✅ | 2 of 11 RED (XML error responses) |
+| T-19 | POSIX.1-2024 | `crates/kiseki-client/tests/posix_semantics.rs` | ✅ | 1 of 22 RED (EROFS mapping) |
+| T-20 | Linux FUSE | `crates/kiseki-client/tests/fuse_linux.rs` | ✅ | 0 of 15 RED |
+| T-21 | macOS osxfuse | `crates/kiseki-client/tests/fuse_macos.rs` | ✅ | 0 of 5 RED (cfg-gated) |
+| T-22 | gRPC | `crates/kiseki-proto/tests/grpc_contract.rs` | ✅ | 0 of 12 RED |
+| T-23 | Raft RPC | `crates/kiseki-raft/tests/raft_wire.rs` | ✅ | 0 of 15 RED |
+| T-24 | FIPS usage | `crates/kiseki-crypto/tests/fips_usage.rs` | ✅ | 0 of 12 RED |
+
+**Stage 1 totals**: 24 of 24 files written; ~32 RED across the suite. Critical findings:
+- **T-16 RFC 8446** — `WebPkiClientVerifier` may accept unrelated CA-signed
+  client certs (potential mTLS bypass). Investigate during Group VII.
+- **T-07 RFC 8881** — 7 RED (largest single-RFC failure count); NFSv4.1
+  fidelity gap is broader than the two known bugs.
+- **T-12 RFC 9110** — 6 RED (Range header, conditional headers); S3 GET
+  partial-read semantics are likely not honored.
 
 ### Stage 2 progress
 
