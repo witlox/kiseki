@@ -21,6 +21,15 @@ use crate::ops::GatewayOps;
 
 /// NFSv4 program/version constants.
 const NFS4_PROGRAM: u32 = 100003;
+/// RFC 8881 §20 — NFSv4 callback program. Linux 6.x clients send
+/// CB_NULL on this program (version 1, procedure 0) over the SAME
+/// TCP socket as the forward NFS channel to verify the back-channel
+/// framing decode. kiseki accepts CB_NULL with ACCEPT_OK (empty body)
+/// — it doesn't actually dispatch CB_COMPOUND, but it must not
+/// reject the framing or the kernel marks the back channel broken
+/// and the mount fails with "Operation not supported" (Phase 15
+/// e2e blocker, 2026-04-27).
+const NFS4_CB_PROGRAM: u32 = 400122;
 const NFS4_VERSION: u32 = 4;
 
 /// NFSv4 operation codes (RFC 7530 + RFC 7862).
@@ -56,6 +65,13 @@ pub mod op {
     pub const GETDEVICEINFO: u32 = 47;
     pub const SEQUENCE: u32 = 53;
     pub const IO_ADVISE: u32 = 63;
+    // RFC 8881 v4.1 ops the kernel mount.nfs4 sequence requires:
+    // BIND_CONN_TO_SESSION + SECINFO_NO_NAME + DESTROY_CLIENTID.
+    // Without these, OP_ILLEGAL aborts the kernel's session bring-up
+    // (Phase 15 e2e blocker, surfaced 2026-04-27).
+    pub const BIND_CONN_TO_SESSION: u32 = 41;
+    pub const SECINFO_NO_NAME: u32 = 52;
+    pub const DESTROY_CLIENTID: u32 = 57;
     // RFC 7862 v4.2 ops kiseki recognizes (mostly stubs that emit
     // typed errors; the wire surface area must reach a per-op handler
     // so the dispatcher can return spec-aligned status codes per
@@ -221,6 +237,10 @@ pub fn handle_nfs4_first_compound<G: GatewayOps>(
     // and COMPOUND (1). Linux `mount.nfs4` pings with NULL before
     // any COMPOUND; if we don't reply with an empty ACCEPT_OK the
     // client gives up with EIO at the mount syscall.
+    //
+    // Also accept the back-channel CB_NULL (program=400122,
+    // procedure=0). See the longer comment in
+    // handle_nfs4_connection.
     if header.procedure == 0 {
         let mut w = XdrWriter::new();
         encode_reply_accepted(&mut w, header.xid, 0); // SUCCESS, no body
@@ -255,6 +275,20 @@ pub fn handle_nfs4_connection<G: GatewayOps, S: io::Read + io::Write>(
 
         let mut reader = XdrReader::new(&msg);
         let header = RpcCallHeader::decode(&mut reader)?;
+
+        // RFC 8881 §20 — accept CB_NULL on the back-channel program.
+        // The kernel sends CB_NULL on the SAME TCP connection as the
+        // forward channel after CREATE_SESSION; rejecting it as
+        // PROG_MISMATCH breaks bidirectional channel verification.
+        // For CB_COMPOUND (proc=1) we don't actually dispatch back-
+        // channel ops yet — return PROG_MISMATCH for that path
+        // (Phase 15c follow-up) but ACCEPT_OK for NULL.
+        if header.program == NFS4_CB_PROGRAM && header.procedure == 0 {
+            let mut w = XdrWriter::new();
+            encode_reply_accepted(&mut w, header.xid, 0); // SUCCESS
+            write_rm_message(&mut stream, &w.into_bytes())?;
+            continue;
+        }
 
         if header.program != NFS4_PROGRAM || header.version != NFS4_VERSION {
             let mut w = XdrWriter::new();
@@ -386,6 +420,9 @@ fn process_op<G: GatewayOps>(
         op::GETDEVICEINFO => op_getdeviceinfo(reader, ctx),
         op::SEEK => op_seek(reader),
         op::LAYOUTERROR => op_layouterror(reader),
+        op::BIND_CONN_TO_SESSION => op_bind_conn_to_session(reader),
+        op::SECINFO_NO_NAME => op_secinfo_no_name(reader),
+        op::DESTROY_CLIENTID => op_destroy_clientid(reader),
         // RFC 7862 v4.2 ops kiseki claims to recognize but does not
         // implement — return NFS4ERR_NOTSUPP per §15.5 (the op is in
         // the registry; we just don't do it).
@@ -770,6 +807,70 @@ fn op_layouterror(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     }
     w.write_u32(nfs4_status::NFS4ERR_NOTSUPP);
     (nfs4_status::NFS4ERR_NOTSUPP, w.into_bytes())
+}
+
+/// BIND_CONN_TO_SESSION (RFC 8881 §18.34) — the client claims a
+/// connection for forward / back / both channels of a session.
+/// Linux 6.x mount.nfs4 emits this in some session bring-up paths.
+/// kiseki uses a single bidirectional connection for both channels
+/// implicitly, so we accept the bind without further state.
+fn op_bind_conn_to_session(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+    let sessionid = reader.read_opaque_fixed(16).unwrap_or_default();
+    let dir = reader.read_u32().unwrap_or(0);
+    let _use_rdma = reader.read_bool().unwrap_or(false);
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::BIND_CONN_TO_SESSION);
+    w.write_u32(nfs4_status::NFS4_OK);
+    // BIND_CONN_TO_SESSION4resok: bctsr_sessionid + bctsr_dir +
+    // bctsr_use_conn_in_rdma_mode (RFC 8881 §18.34.2). Echo the
+    // sessionid + agreed direction; we never use RDMA.
+    let mut sid = [0u8; 16];
+    if sessionid.len() == 16 {
+        sid.copy_from_slice(&sessionid);
+    }
+    w.write_opaque_fixed(&sid);
+    w.write_u32(dir); // we agree to whatever direction the client asked for
+    w.write_bool(false);
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+/// SECINFO_NO_NAME (RFC 8881 §18.31) — the client asks "what auth
+/// flavors does the current_fh accept?". Linux 6.x mount.nfs4
+/// emits SEQUENCE+PUTROOTFH+SECINFO_NO_NAME(style=CURRENT_FH) as
+/// the FINAL pre-mount probe; OP_ILLEGAL aborts the mount with
+/// "Operation not supported" (Phase 15 e2e blocker, 2026-04-27).
+///
+/// Reply layout per §18.31.4: secinfo4<>, where secinfo4 = u32
+/// flavor + (if RPCSEC_GSS) sec_oid + qop + service. kiseki only
+/// advertises AUTH_SYS today; emit a single secinfo4 entry with
+/// flavor=1 (AUTH_SYS) and no extra body.
+fn op_secinfo_no_name(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+    let _style = reader.read_u32().unwrap_or(0);
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::SECINFO_NO_NAME);
+    w.write_u32(nfs4_status::NFS4_OK);
+    // secinfo4<> count = 1 — AUTH_SYS.
+    w.write_u32(1);
+    // secinfo4: flavor (u32). For AUTH_SYS (=1) there is no body.
+    w.write_u32(1); // AUTH_SYS
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+/// DESTROY_CLIENTID (RFC 8881 §18.50) — clean up a clientid record.
+/// Linux mount issues DESTROY_SESSION + DESTROY_CLIENTID as the
+/// teardown sequence. kiseki accepts the op as a no-op (clientid
+/// state lives in `SessionManager` and is purged when the last
+/// session for that clientid is destroyed; for the kernel's mount
+/// path this is fire-and-forget).
+fn op_destroy_clientid(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+    let _client_id = reader.read_u64().unwrap_or(0);
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::DESTROY_CLIENTID);
+    w.write_u32(nfs4_status::NFS4_OK);
+    (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
 /// LAYOUTGET (RFC 5661 §18.43, RFC 8435 §5.1) — return pNFS layout

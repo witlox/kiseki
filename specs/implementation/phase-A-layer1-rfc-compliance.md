@@ -344,25 +344,28 @@ is updated in the same commit as the test/fix landings.
    (RFC 5663, RFC 8154) and the explicitly-not-implemented ones
    (RFC 2203 / 5403 / 7204, RFC 7578) is at least 🟡 in the
    catalog.
-2. ❌ The Phase 15 e2e mount paused 2026-04-27 succeeds without
+2. 🟡 The Phase 15 e2e mount paused 2026-04-27 succeeds without
    further server-side fixes (Group II + III exit gates).
-   **Status (2026-04-27 ADV-PA-9 verification)**: e2e `pytest
-   tests/e2e/test_pnfs.py` was actually executed against the
-   3-node `docker-compose.3node.yml` cluster. All three test
-   functions skipped: `test_pnfs_xprtsec_mtls` skipped because the
-   compose runs in plaintext mode (per `KISEKI_ALLOW_PLAINTEXT_NFS`
-   + `KISEKI_INSECURE_NFS`); `test_pnfs_plaintext_fallback` ran
-   the actual mount and observed `mount.nfs4: mount(2): Operation
-   not supported` three times (rc=32). A direct `python3 socket`
-   NULL-CALL probe over TCP/2049 succeeds end-to-end (server
-   replies with the correct 24-byte ACCEPT_OK frame), so kiseki's
-   per-connection handler is reachable. The kernel rejects the
-   mount AFTER TCP connect (a TIME-WAIT socket is visible on the
-   client side), which means kiseki's first-COMPOUND reply
-   (EXCHANGE_ID or earlier) does not satisfy the Linux 6.19
-   `mount.nfs4 / nfs-utils 2.6.4` client. **Concrete next-step
-   bug, not closed by Phase A.** Tracked as a Phase 15c follow-up
-   item (or a "Group X" handler-error sweep — see INT-PA-1).
+   **Status (2026-04-27 first ADV-PA-9 verification)**: kernel
+   mount surfaced `mount(2): Operation not supported` rc=32. pcap
+   analysis identified the missing dispatcher entries (SEQUENCE +
+   PUTROOTFH + SECINFO_NO_NAME(style=CURRENT_FH) returned
+   OP_ILLEGAL on op 52; OP_57 DESTROY_CLIENTID; CB_NULL on
+   program 400122 returned PROG_MISMATCH). All four fixes landed
+   (commit-pending) with corresponding RED-first tests in
+   `rfc8881.rs` (s18_31_secinfo_no_name + s18_34_bind_conn_to_session
+   + s18_50_destroy_clientid). After fix the kernel mount surface
+   advanced from `Operation not supported` → `Input/output
+   error` — meaning session bring-up + SECINFO_NO_NAME + back-
+   channel CB_NULL now succeed. **The remaining e2e blocker is
+   GETATTR**: Linux 6.19 mount asks for FATTR4_SUPPORTED_ATTRS,
+   FATTR4_FH_EXPIRE_TYPE, FATTR4_LEASE_TIME, FATTR4_FSID,
+   FATTR4_RDATTR_ERROR; kiseki's `op_getattr` only emits TYPE +
+   SIZE (bitmap word0 = 0x12). The kernel can't determine
+   filesystem semantics from this minimal set and returns EIO.
+   **Closing the e2e requires substantially expanding op_getattr
+   to honor the kernel's request bitmap** — a large change, not
+   in Phase A scope. Tracked as Phase 15c.2.
 3. ✅ `cargo test --workspace` passes (verified post Group IV–IX).
 4. 🟡 The auditor's gate-2 spec-fidelity check (ADR-023 §D5)
    verifies every `@integration` BDD scenario maps to a 🟡-or-

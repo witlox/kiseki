@@ -1499,6 +1499,98 @@ fn s18_30_setattr_without_current_fh_returns_nofilehandle() {
     );
 }
 
+// ===========================================================================
+// Phase 15c kernel-mount blocker tests (RED first, fix after)
+// ===========================================================================
+//
+// pcap analysis of `mount.nfs4 -o vers=4.1 kiseki-node1:/default` shows
+// the kernel client gives up at three specific server responses:
+//
+//   1. CALL[10] = SEQUENCE+PUTROOTFH+SECINFO_NO_NAME(style=CURRENT_FH)
+//      → kiseki returns OP_ILLEGAL on op 52 because the dispatcher
+//      doesn't have it. Mount fails with "Operation not supported".
+//   2. After CREATE_SESSION, the kernel sends a CB_NULL on the same
+//      socket (program=400122, NFS4_CB). kiseki replies PROG_MISMATCH.
+//      Linux 6.x clients tolerate this (they retry forward calls)
+//      but the kernel ring buffer fills with PROG_MISMATCH alerts.
+//   3. CALL[12] = OP_57 (DESTROY_CLIENTID) — the kernel's cleanup
+//      after giving up. OP_ILLEGAL response works but is noisy.
+//
+// Tests below pin the spec-correct behaviour. RED until production
+// adds the missing dispatcher entries.
+
+/// RFC 8881 §18.31 — SECINFO_NO_NAME is the kernel's question
+/// "what auth flavors does the current_fh accept?". Linux 6.x mount
+/// emits `SEQUENCE+PUTROOTFH+SECINFO_NO_NAME(style=CURRENT_FH)` as
+/// the FINAL pre-mount probe; if the server returns OP_ILLEGAL on
+/// the SECINFO_NO_NAME op, the kernel's mount.nfs4 surfaces
+/// "Operation not supported" because it cannot determine the
+/// auth flavor to use. This is the Phase 15 e2e blocker.
+///
+/// kiseki MUST dispatch the op and return either NFS4_OK with at
+/// least one flavor in `secinfo4<>` (typical: AUTH_SYS = 1) or
+/// NFS4ERR_NOTSUPP per §18.31.4. OP_ILLEGAL is wrong because the
+/// op IS in the v4.1 registry — kiseki just hadn't wired it.
+#[test]
+fn s18_31_secinfo_no_name_dispatched_not_op_illegal() {
+    // SECINFO_STYLE4_CURRENT_FH = 0 per RFC 8881 §18.31.1.
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(52); // op SECINFO_NO_NAME
+        w.write_u32(0); // SECINFO_STYLE4_CURRENT_FH
+    });
+    let reply = drive_compound(0xF001, &body);
+    let mut r = reader_at_compound_result(&reply);
+    let compound_status = r.read_u32().unwrap();
+    assert_ne!(
+        compound_status,
+        nfs4_status::NFS4ERR_OP_ILLEGAL,
+        "RFC 8881 §18.31: SECINFO_NO_NAME (op 52) is in the v4.1 \
+         registry and MUST be dispatched. OP_ILLEGAL here is the \
+         Phase 15 e2e blocker — kernel mount.nfs4 surfaces 'Operation \
+         not supported' to userspace."
+    );
+}
+
+/// RFC 8881 §18.34 — BIND_CONN_TO_SESSION (op 41). Linux clients
+/// emit this in some paths after CREATE_SESSION to claim the
+/// connection for forward / back / both channels.
+#[test]
+fn s18_34_bind_conn_to_session_dispatched_not_op_illegal() {
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
+        w.write_u32(41); // op BIND_CONN_TO_SESSION
+        w.write_opaque_fixed(&[0u8; 16]); // bctsa_sessionid
+        w.write_u32(1); // bctsa_dir = CDFC4_FORE
+        w.write_bool(false); // bctsa_use_conn_in_rdma_mode
+    });
+    let reply = drive_compound(0xF002, &body);
+    let mut r = reader_at_compound_result(&reply);
+    let compound_status = r.read_u32().unwrap();
+    assert_ne!(
+        compound_status,
+        nfs4_status::NFS4ERR_OP_ILLEGAL,
+        "RFC 8881 §18.34: BIND_CONN_TO_SESSION (op 41) is in the v4.1 \
+         registry and MUST be dispatched."
+    );
+}
+
+/// RFC 8881 §18.50 — DESTROY_CLIENTID (op 57). Kernel cleanup op.
+#[test]
+fn s18_50_destroy_clientid_dispatched_not_op_illegal() {
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
+        w.write_u32(57); // op DESTROY_CLIENTID
+        w.write_u64(0xCAFE_BABE_DEAD_BEEF); // dca_clientid
+    });
+    let reply = drive_compound(0xF003, &body);
+    let mut r = reader_at_compound_result(&reply);
+    let compound_status = r.read_u32().unwrap();
+    assert_ne!(
+        compound_status,
+        nfs4_status::NFS4ERR_OP_ILLEGAL,
+        "RFC 8881 §18.50: DESTROY_CLIENTID (op 57) MUST be dispatched."
+    );
+}
+
 /// RFC 8881 §18.27 + RFC 7530 §15.5 — SETCLIENTID is a v4.0-only
 /// op. On a v4.1 COMPOUND it's not in the registry → NFS4ERR_OP_ILLEGAL
 /// (or NOTSUPP if dispatched through a stub). The v4.0 fallback path
