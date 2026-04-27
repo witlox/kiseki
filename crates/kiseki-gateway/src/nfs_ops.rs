@@ -201,6 +201,21 @@ impl<G: GatewayOps> NfsContext<G> {
         namespace_id: NamespaceId,
         storage_nodes: Vec<String>,
     ) -> Self {
+        Self::with_storage_nodes_and_mgr(gateway, tenant_id, namespace_id, storage_nodes, None)
+    }
+
+    /// Phase 15c.4 — same as `with_storage_nodes` plus an optional
+    /// production `MdsLayoutManager`. When `Some`, `op_layoutget`
+    /// routes through the proper Flex Files encoder
+    /// (`op_layoutget_ff`) instead of the legacy FILES-layout stub
+    /// fallback. Required for kernel pNFS dispatch to work.
+    pub fn with_storage_nodes_and_mgr(
+        gateway: NfsGateway<G>,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        storage_nodes: Vec<String>,
+        mds_layout_manager: Option<Arc<crate::pnfs::MdsLayoutManager>>,
+    ) -> Self {
         let handles = HandleRegistry::new();
         // Register root handle.
         handles.root_handle(namespace_id, tenant_id);
@@ -230,7 +245,7 @@ impl<G: GatewayOps> NfsContext<G> {
             locks: LockManager::default(),
             sessions: Arc::new(SessionManager::new()),
             layouts: Mutex::new(crate::pnfs::LayoutManager::new(storage_nodes)),
-            mds_layout_manager: None,
+            mds_layout_manager,
             tenant_id,
             namespace_id,
             rt,

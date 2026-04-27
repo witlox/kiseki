@@ -744,14 +744,15 @@ fn op_getattr<G: GatewayOps>(
             | (1u32 << fattr4::FILEID);
         // FATTR4_LAYOUT_TYPES (bit 30) and FATTR4_FS_LAYOUT_TYPES
         // (bit 62) are NOT yet in the supported_attrs set — Phase
-        // 15c.4 follow-up. Advertising them without a wired
-        // MdsLayoutManager makes Linux issue LAYOUTGET, which our
-        // legacy fallback answers with a malformed FILES-layout body
-        // pointing at gRPC port 9100 (not the DS port 2052) — kernel
-        // can't read via the layout and the COMPOUND hangs. Until
-        // mds_layout_manager is wired into NfsContext + DS endpoints
-        // are reachable from the client, plain NFSv4.1 (no pNFS) is
-        // the only path that works end-to-end.
+        // 15c.4 partial: MdsLayoutManager is wired into NfsContext
+        // (runtime.rs constructs + threads it through) and op_open
+        // handles CLAIM_FH for pNFS-style fh-based opens. Re-enabling
+        // these bits puts the kernel into a tight retry loop that
+        // OOM-kills node1 — the LAYOUTGET dance is still off the
+        // happy path because kernel-side validation of the Flex
+        // Files body needs additional wire-correctness work
+        // (Phase 15c.5 follow-up). Until that lands, plain NFSv4.1
+        // (no pNFS) is the only path that reads end-to-end.
         let supported_word1 = (1u32 << fattr4::MODE_W1)
             | (1u32 << fattr4::NUMLINKS_W1)
             | (1u32 << fattr4::OWNER_W1)
@@ -1397,6 +1398,7 @@ fn op_getdeviceinfo<G: GatewayOps>(
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
+#[allow(clippy::too_many_lines)] // RFC 8881 §18.16.1 args grammar is intrinsically large
 fn op_open<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -1437,6 +1439,7 @@ fn op_open<G: GatewayOps>(
     const EXCLUSIVE4: u32 = 2;
     const EXCLUSIVE4_1: u32 = 3;
     const CLAIM_NULL: u32 = 0;
+    const CLAIM_FH: u32 = 4;
 
     let _seqid = reader.read_u32().unwrap_or(0);
     let _share_access = reader.read_u32().unwrap_or(1); // READ
@@ -1472,13 +1475,14 @@ fn op_open<G: GatewayOps>(
         }
     }
 
-    // open_claim4 — CLAIM_NULL is the only path Linux uses for a
-    // plain `open()` against an existing dentry. Other claim types
-    // are stateid-recovery paths (PREVIOUS/DELEGATE_*) that the
-    // current state machine doesn't grant delegations for; we
-    // tolerate the discriminator and fall through to NOENT for
-    // non-NULL claims.
+    // open_claim4 — CLAIM_NULL is the path Linux uses for a plain
+    // `open()` against an existing dentry. CLAIM_FH (RFC 8881 4.1+)
+    // is what Linux pNFS uses for OPEN-by-current-fh after LOOKUP:
+    // no name on the wire — open the current_fh directly. Other
+    // claim types are stateid-recovery paths (PREVIOUS/DELEGATE_*)
+    // that the current state machine doesn't grant delegations for.
     let claim_type = reader.read_u32().unwrap_or(CLAIM_NULL);
+    let claim_is_fh = claim_type == CLAIM_FH;
     let name = if claim_type == CLAIM_NULL {
         reader.read_string().unwrap_or_default()
     } else {
@@ -1536,6 +1540,23 @@ fn op_open<G: GatewayOps>(
             Err(_) => {
                 w.write_u32(nfs4_status::NFS4ERR_IO);
                 nfs4_status::NFS4ERR_IO
+            }
+        }
+    } else if claim_is_fh {
+        // CLAIM_FH — open the current file handle (no name lookup).
+        // Linux pNFS issues this after LOOKUP has already set
+        // current_fh. The fh must already be registered with the
+        // handle registry; we just bind a new stateid to it.
+        match state.current_fh {
+            Some(fh) if ctx.handles.lookup(&fh).is_some() => {
+                let sid = sessions.open_file(fh);
+                state.current_stateid = Some(sid);
+                write_open_resok(&mut w, &sid, 0);
+                nfs4_status::NFS4_OK
+            }
+            _ => {
+                w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
+                nfs4_status::NFS4ERR_NOFILEHANDLE
             }
         }
     } else {

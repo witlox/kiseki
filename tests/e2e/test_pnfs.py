@@ -264,16 +264,15 @@ def test_pnfs_plaintext_fallback(
     default for Rocky 9 baselines that don't honor `xprtsec=mtls`.
     Skips when the cluster runs TLS-only.
 
-    Phase 15c.4 deferral: pNFS Flexible Files layout dispatch needs
-    `MdsLayoutManager` wired into `NfsContext` (runtime.rs currently
-    leaves it None) AND the kernel-reachable DS subprotocol on port
-    2052. Until both land, this test SKIPS — `test_nfs41_basic_…`
-    covers the plain-NFSv4.1 mount+read path which is the user-facing
-    contract today."""
+    Phase 15c.4 wires `MdsLayoutManager` into `NfsContext` (DS port
+    2052 is shared with the layout encoder). The kernel-side dispatch
+    still loops on LAYOUTGET retry — body validation is the Phase
+    15c.5 follow-up. Skipping until that lands."""
     pytest.skip(
-        "Phase 15c.4 follow-up — pNFS Flexible Files dispatch requires "
-        "MdsLayoutManager wiring + DS subprotocol verification. "
-        "test_nfs41_basic_mount_and_read covers the plain NFSv4.1 path."
+        "Phase 15c.5 follow-up — MdsLayoutManager wiring lands in "
+        "15c.4 but kernel-side LAYOUTGET retry-loop needs Flex Files "
+        "body validation work. test_nfs41_basic_mount_and_read covers "
+        "the plain NFSv4.1 path that reads end-to-end."
     )
     if not _docker_available():
         pytest.skip("docker daemon not reachable")

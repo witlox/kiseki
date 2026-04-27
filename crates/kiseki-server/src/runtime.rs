@@ -438,43 +438,88 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
     let nfs_gw = kiseki_gateway::nfs::NfsGateway::new(Arc::clone(&gw));
     let nfs_addr = cfg.nfs_addr;
-    // Pass peer addresses for pNFS layout delegation (LAYOUTGET).
+
+    // Phase 15c.4 — construct the shared MdsLayoutManager BEFORE
+    // either listener so NFS (MDS) and DS see the same instance and
+    // the same fh4 MAC key. The manager governs:
+    //   * Layout TTL + LRU eviction (§D9)
+    //   * fh4 MAC validation between MDS-issued and DS-presented
+    //     layouts (ADR-038 §D4.1)
+    //   * The recall log that DS subprotocol consults
+    //
+    // DS endpoints are derived from raft peers (host portion) +
+    // ds_addr's port — e.g. raft peer "kiseki-node1:9300" + ds_addr
+    // ":2052" → "kiseki-node1:2052". This is what the kernel pNFS
+    // client connects to after GETDEVICEINFO.
+    let pnfs_layout_mgr: Option<Arc<kiseki_gateway::pnfs::MdsLayoutManager>> = if cfg.pnfs_enabled {
+        let cluster_id_bytes: [u8; 16] = bootstrap_tenant.0.into_bytes();
+        let mac_key = kiseki_gateway::pnfs::derive_pnfs_fh_mac_key(
+            &[0x42; 32], // TODO Phase 15b: pull from kiseki_keymanager
+            &cluster_id_bytes,
+        );
+        let ds_port = cfg.ds_addr.map_or(2052, |a| a.port());
+        let storage_ds_addrs: Vec<String> = cfg
+            .raft_peers
+            .iter()
+            .map(|(_, addr)| {
+                let host = addr.split(':').next().unwrap_or(addr);
+                format!("{host}:{ds_port}")
+            })
+            .collect();
+        let mgr_cfg = kiseki_gateway::pnfs::MdsLayoutConfig {
+            stripe_size_bytes: cfg.pnfs.stripe_size_bytes,
+            layout_ttl_ms: cfg.pnfs.layout_ttl_seconds.saturating_mul(1000),
+            max_entries: cfg.pnfs.layout_cache_max_entries,
+            storage_ds_addrs,
+        };
+        Some(Arc::new(kiseki_gateway::pnfs::MdsLayoutManager::new(
+            mac_key, mgr_cfg,
+        )))
+    } else {
+        None
+    };
+
+    // Storage nodes for the legacy LayoutManager fallback path. With
+    // pnfs_layout_mgr wired (Phase 15c.4), op_layoutget routes via the
+    // production manager; this list is unused but kept for back-compat
+    // with the test harness that doesn't set the manager.
     let nfs_storage_nodes: Vec<String> = cfg
         .raft_peers
         .iter()
         .map(|(_, addr)| {
-            // Raft peer addr is "host:9300" — replace port with NFS port.
             let host = addr.split(':').next().unwrap_or(addr);
-            format!("{host}:9100")
+            format!("{host}:2052")
         })
         .collect();
     let nfs_listener =
         std::net::TcpListener::bind(nfs_addr).map_err(|e| format!("NFS bind {nfs_addr}: {e}"))?;
     let nfs_tls_for_thread = nfs_tls.clone();
+    let pnfs_layout_mgr_for_nfs = pnfs_layout_mgr.clone();
     std::thread::spawn(move || {
-        kiseki_gateway::nfs_server::serve_nfs_listener(
+        kiseki_gateway::nfs_server::serve_nfs_listener_with_mgr(
             nfs_listener,
             nfs_gw,
             bootstrap_tenant,
             bootstrap_ns,
             nfs_storage_nodes,
+            pnfs_layout_mgr_for_nfs,
             None,
             nfs_tls_for_thread,
         );
     });
 
     // pNFS Data Server listener (ADR-038 §D2). Only spawned when pNFS
-    // is enabled AND `ds_addr` is configured.
+    // is enabled AND `ds_addr` is configured. Shares the same
+    // MdsLayoutManager instance as the NFS dispatcher above so DS
+    // reads can validate fh4 stamps + honor recalls.
     if cfg.pnfs_enabled {
         if let Some(ds_addr) = cfg.ds_addr {
-            // Per-cluster fh4 MAC key — derived from the master key +
-            // a stable cluster id. The bootstrap tenant id serves as
-            // the cluster id for now; a separate cluster_id field is
-            // future work (see ADR-038 §D4.1 wording on `salt`).
-            let cluster_id_bytes: [u8; 16] = bootstrap_tenant.0.into_bytes();
-            let mac_key = kiseki_gateway::pnfs::derive_pnfs_fh_mac_key(
-                &[0x42; 32], // TODO Phase 15b: pull from kiseki_keymanager
-                &cluster_id_bytes,
+            let mac_key = pnfs_layout_mgr.as_ref().map_or_else(
+                || {
+                    let cluster_id_bytes: [u8; 16] = bootstrap_tenant.0.into_bytes();
+                    kiseki_gateway::pnfs::derive_pnfs_fh_mac_key(&[0x42; 32], &cluster_id_bytes)
+                },
+                |m| m.current_mac_key(),
             );
             let ds_ctx = Arc::new(kiseki_gateway::pnfs_ds_server::DsContext {
                 gateway: Arc::clone(&gw),
@@ -482,13 +527,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                 stripe_size_bytes: cfg.pnfs.stripe_size_bytes,
                 rt: tokio::runtime::Handle::current(),
                 now_ms: Arc::new(kiseki_gateway::pnfs_ds_server::default_now_ms),
-                // Phase 15c: a wired MDS layout manager would be
-                // shared here so the DS consults the recall list. Not
-                // yet wired in single-node bootstrap — the production
-                // perf cluster picks up Phase 15c via the gateway's
-                // `MdsLayoutManager` once it's threaded through the
-                // gateway's NfsContext (Phase 15c.1, follow-up).
-                mds_layout_manager: None,
+                mds_layout_manager: pnfs_layout_mgr.clone(),
             });
             let ds_tls_for_thread = nfs_tls.clone();
             std::thread::spawn(move || {

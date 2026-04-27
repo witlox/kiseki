@@ -99,11 +99,39 @@ pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     tls: Option<Arc<ServerConfig>>,
 ) {
-    let ctx = Arc::new(NfsContext::with_storage_nodes(
+    serve_nfs_listener_with_mgr(
+        listener,
         gateway,
         tenant_id,
         namespace_id,
         storage_nodes,
+        None,
+        shutdown,
+        tls,
+    );
+}
+
+/// Phase 15c.4 — same as `serve_nfs_listener` plus an optional
+/// production `MdsLayoutManager`. When threaded through, the kernel's
+/// LAYOUTGET path returns Flex Files layouts pointing at real DS
+/// endpoints instead of the legacy FILES-layout stub.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+pub fn serve_nfs_listener_with_mgr<G: GatewayOps + Send + Sync + 'static>(
+    listener: TcpListener,
+    gateway: NfsGateway<G>,
+    tenant_id: OrgId,
+    namespace_id: NamespaceId,
+    storage_nodes: Vec<String>,
+    mds_layout_manager: Option<Arc<crate::pnfs::MdsLayoutManager>>,
+    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+    tls: Option<Arc<ServerConfig>>,
+) {
+    let ctx = Arc::new(NfsContext::with_storage_nodes_and_mgr(
+        gateway,
+        tenant_id,
+        namespace_id,
+        storage_nodes,
+        mds_layout_manager,
     ));
     if let Ok(addr) = listener.local_addr() {
         tracing::info!(addr = %addr, "NFS server listening (NFSv3 + NFSv4.2)");
