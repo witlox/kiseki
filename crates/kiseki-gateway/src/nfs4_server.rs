@@ -376,12 +376,19 @@ pub(crate) fn op_exchange_id(
 
     let client_id = sessions.exchange_id();
 
+    // RFC 5661 §18.35.4 — eir_flags MUST declare server mode.
+    // Kiseki is a pNFS MDS (ADR-038), so emit USE_PNFS_MDS plus
+    // CONFIRMED_R for compatibility with clients that look for a
+    // confirmation bit.
+    const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x0002_0000;
+    const EXCHGID4_FLAG_CONFIRMED_R: u32 = 0x8000_0000;
+
     let mut w = XdrWriter::new();
     w.write_u32(op::EXCHANGE_ID);
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_u64(client_id); // clientid
     w.write_u32(1); // sequenceid
-    w.write_u32(0x01); // flags (CONFIRMED)
+    w.write_u32(EXCHGID4_FLAG_USE_PNFS_MDS | EXCHGID4_FLAG_CONFIRMED_R); // eir_flags
     w.write_u32(0); // state_protect (SP4_NONE)
                     // server_owner
     w.write_u64(1); // minor_id
@@ -1505,7 +1512,14 @@ mod tests {
         assert_ne!(client_id, 0, "client_id should be non-zero");
         let _seqid = r.read_u32().unwrap();
         let flags = r.read_u32().unwrap();
-        assert_eq!(flags & 0x01, 0x01, "CONFIRMED flag should be set");
+        // RFC 5661 §18.35.4: CONFIRMED_R is 0x80000000, not 0x1
+        // (which is SUPP_MOVED_REFER). The earlier assertion was
+        // self-consistent with the buggy production code.
+        assert_eq!(
+            flags & 0x8000_0000,
+            0x8000_0000,
+            "CONFIRMED_R (0x80000000) flag should be set"
+        );
         let _state_protect = r.read_u32().unwrap();
         let _minor_id = r.read_u64().unwrap();
         let major_id = r.read_opaque().unwrap();
@@ -2006,6 +2020,133 @@ mod tests {
             24,
             "NULL reply has no body — got {} bytes after header",
             reply.len() - 24
+        );
+    }
+
+    // ---------- EXCHANGE_ID wire encoding (RFC 5661 §18.35) ----------
+
+    /// Decode `op_exchange_id`'s reply body and verify each field
+    /// against RFC 5661 §18.35 EXCHANGE_ID4resok. Linux's NFSv4.1
+    /// client tail-calls this immediately after a successful NULL,
+    /// so any field-length mismatch leaves the kernel client unable
+    /// to parse the reply and the mount(2) syscall returns EIO with
+    /// no further trace.
+    ///
+    /// EXCHANGE_ID4resok structure:
+    ///   clientid4              eir_clientid;       // u64
+    ///   sequenceid4            eir_sequenceid;     // u32
+    ///   uint32                 eir_flags;
+    ///   state_protect4_r       eir_state_protect;  // u32 spr_how + body
+    ///   server_owner4          eir_server_owner;   // u64 + opaque
+    ///   opaque                 eir_server_scope;
+    ///   nfs_impl_id4           eir_server_impl_id<1>;
+    #[test]
+    fn exchange_id_reply_is_rfc5661_18_35_compliant() {
+        let sessions = test_sessions();
+
+        // Build a minimal EXCHANGE_ID4args body.
+        let mut body = XdrWriter::new();
+        body.write_opaque_fixed(&[0xABu8; 8]); // co_verifier
+        body.write_opaque(b"kernel-client"); // co_ownerid
+        body.write_u32(0); // eia_flags
+        body.write_u32(0); // eia_state_protect (SP4_NONE)
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (status, result) = op_exchange_id(&mut reader, &sessions);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        // Each op result starts with op_code + status.
+        assert_eq!(r.read_u32().expect("op_code"), op::EXCHANGE_ID);
+        assert_eq!(r.read_u32().expect("status"), nfs4_status::NFS4_OK);
+
+        // EXCHANGE_ID4resok body:
+        let clientid = r.read_u64().expect("clientid");
+        assert!(clientid != 0, "clientid must be non-zero");
+
+        let seqid = r.read_u32().expect("sequenceid");
+        assert_eq!(seqid, 1, "first sequenceid must be 1");
+
+        let _flags = r.read_u32().expect("eir_flags");
+
+        let spr_how = r.read_u32().expect("eir_state_protect.spr_how");
+        assert_eq!(spr_how, 0, "expected SP4_NONE (0)");
+
+        // server_owner4: so_minor_id + so_major_id<>
+        let _minor_id = r.read_u64().expect("so_minor_id");
+        let major_id = r.read_opaque().expect("so_major_id");
+        assert!(!major_id.is_empty(), "so_major_id must not be empty");
+
+        // server_scope: opaque<>
+        let scope = r.read_opaque().expect("eir_server_scope");
+        assert!(!scope.is_empty(), "eir_server_scope must not be empty");
+
+        // server_impl_id: opaque-array with at most 1 entry. We
+        // emit count=0 (no impl_id) which is RFC-compliant.
+        let impl_count = r.read_u32().expect("eir_server_impl_id count");
+        assert!(
+            impl_count <= 1,
+            "RFC limits server_impl_id to a 0/1-entry array, got {impl_count}"
+        );
+
+        // After all the structured fields above, the reader should
+        // be exhausted — anything left would be unaccounted-for
+        // bytes that desync the Linux client.
+        let trailing = r.remaining();
+        assert_eq!(
+            trailing, 0,
+            "EXCHANGE_ID reply has {trailing} unaccounted trailing bytes",
+        );
+    }
+
+    /// RFC 5661 §18.35.4: `eir_flags` must contain at least one of
+    /// `EXCHGID4_FLAG_USE_NON_PNFS` (0x00010000),
+    /// `EXCHGID4_FLAG_USE_PNFS_MDS` (0x00020000), or
+    /// `EXCHGID4_FLAG_USE_PNFS_DS` (0x00040000) — the server's
+    /// declaration of its operating mode. Without one of these,
+    /// Linux's NFSv4.1 client rejects the EXCHANGE_ID reply with EIO
+    /// before sending CREATE_SESSION (which is exactly what
+    /// tests/e2e/test_pnfs.py was hitting).
+    ///
+    /// Kiseki is a pNFS MDS, so the bit we expect is `USE_PNFS_MDS`.
+    #[test]
+    fn exchange_id_advertises_pnfs_mds_mode() {
+        let sessions = test_sessions();
+        let mut body = XdrWriter::new();
+        body.write_opaque_fixed(&[0u8; 8]);
+        body.write_opaque(b"client");
+        body.write_u32(0);
+        body.write_u32(0);
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (_status, result) = op_exchange_id(&mut reader, &sessions);
+
+        let mut r = XdrReader::new(&result);
+        // Skip op_code, status, clientid, sequenceid.
+        let _ = r.read_u32();
+        let _ = r.read_u32();
+        let _ = r.read_u64();
+        let _ = r.read_u32();
+        let flags = r.read_u32().expect("eir_flags");
+
+        const EXCHGID4_FLAG_USE_NON_PNFS: u32 = 0x0001_0000;
+        const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x0002_0000;
+        const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x0004_0000;
+        const MODE_MASK: u32 =
+            EXCHGID4_FLAG_USE_NON_PNFS | EXCHGID4_FLAG_USE_PNFS_MDS | EXCHGID4_FLAG_USE_PNFS_DS;
+
+        assert!(
+            flags & MODE_MASK != 0,
+            "eir_flags must declare server mode (NON_PNFS | PNFS_MDS | PNFS_DS), \
+             got 0x{flags:08x}",
+        );
+        // Kiseki is the MDS — the pNFS bit should be set.
+        assert!(
+            flags & EXCHGID4_FLAG_USE_PNFS_MDS != 0,
+            "kiseki is a pNFS MDS — expected USE_PNFS_MDS in eir_flags, \
+             got 0x{flags:08x}",
         );
     }
 }
