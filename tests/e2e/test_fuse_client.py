@@ -305,3 +305,89 @@ wait $DAEMON_PID 2>/dev/null || true
         assert get.content == b"probe-bytes"
     finally:
         stop_cluster(cluster)
+
+
+@pytest.mark.e2e
+def test_fuse_cluster_cross_node_read(
+    fuse_client_image: str,
+) -> None:
+    """Phase 15c.6 multi-node — FUSE writes via node1's S3 listener,
+    reader-side S3 GET hits node2 and node3 successfully. Validates
+    that FUSE→cluster benefits from Raft replication: a write through
+    node1's gateway is visible (and serves bytes) on the other two
+    nodes after Raft commit.
+
+    KNOWN LIMITATION (Phase 16 architectural follow-up): the
+    `InMemoryGateway`'s `compositions` store is **per-node** — only
+    `view_store` is synchronized via the Raft-replicated log stream
+    (kiseki-view's `TrackedStreamProcessor`). The gateway-side
+    composition map that `read()` consults stays local. So a PUT via
+    node1's S3 listener creates a composition known only to node1; a
+    subsequent GET on node2 returns 404 because node2's gateway
+    didn't see the create.
+
+    Closing this requires the stream processor to apply
+    `CompositionCreated` deltas to the gateway's composition store
+    too (not just view_store). That's a kiseki-gateway/kiseki-view
+    boundary change. Until that lands, the FUSE→cluster path works
+    only against a single S3 endpoint (or a load balancer pinned to
+    the leader).
+    """
+    pytest.skip(
+        "Phase 16 follow-up — gateway compositions store is per-node; "
+        "cross-node S3 GET after a different-node PUT returns 404. "
+        "The Raft log replicates, but the stream processor only "
+        "advances view_store, not the gateway compositions map. "
+        "test_fuse_remote_http_cross_protocol_roundtrip covers the "
+        "single-endpoint FUSE→cluster path that works today."
+    )
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    from helpers.cluster import start_cluster, stop_cluster
+
+    cluster = start_cluster()
+    try:
+        # 1. PUT directly via node1's S3 (simulates what RemoteHttpGateway
+        #    does under FUSE). The same code path that
+        #    test_fuse_remote_http_cross_protocol_roundtrip exercises.
+        import requests
+
+        payload = b"kiseki cross-node fuse fixture: " + b"\xa5" * 1024
+        put = requests.put(
+            "http://127.0.0.1:9000/default/cross-node-key",
+            data=payload,
+            timeout=10,
+        )
+        put.raise_for_status()
+        etag = put.headers.get("etag", "").strip('"')
+        assert etag, "node1 S3 PUT did not return an etag"
+
+        # 2. GET from node2 and node3 — Raft must have replicated the
+        #    composition + chunk references before we read.
+        # Brief settle window: Raft commit + view-store apply on the
+        # follower side is typically < 200ms but bounded retries
+        # tolerate cold-cache misses.
+        import time
+
+        for node_label, s3_port in [("node2", 9010), ("node3", 9020)]:
+            last_err: str | None = None
+            for attempt in range(20):  # up to ~10s of retries
+                try:
+                    get = requests.get(
+                        f"http://127.0.0.1:{s3_port}/default/{etag}",
+                        timeout=3,
+                    )
+                    if get.status_code == 200 and get.content == payload:
+                        last_err = None
+                        break
+                    last_err = f"status={get.status_code} bytes={len(get.content)}"
+                except requests.RequestException as e:
+                    last_err = str(e)
+                time.sleep(0.5)
+            assert last_err is None, (
+                f"S3 GET via {node_label} (port {s3_port}) did not return "
+                f"the FUSE-written payload after 10s: {last_err}"
+            )
+    finally:
+        stop_cluster(cluster)

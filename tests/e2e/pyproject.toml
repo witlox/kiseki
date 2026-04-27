@@ -21,6 +21,7 @@ python_functions = ["test_*"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 markers = [
     "e2e: end-to-end tests against real server subprocess",
+    "perf: B-5 perf-baseline measurements (off the default e2e run)",
 ]
 
 [tool.ruff]

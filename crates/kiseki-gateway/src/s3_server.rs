@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -114,6 +115,14 @@ pub fn s3_router_with_keys<G: GatewayOps + Send + Sync + 'static>(
                 .delete(delete_or_abort::<G>)
                 .post(post_multipart::<G>),
         )
+        // S3 single-PUT cap. AWS allows 5 GiB per PutObject; clients
+        // chunk larger objects via multipart upload. axum's default
+        // body limit (2 MiB) is far too small even for a small
+        // training-dataset shard. Set to 5 GiB to match AWS while
+        // letting the gateway's own multipart dispatch handle the
+        // large-object path. Disabling the limit entirely is unsafe
+        // (DoS via memory exhaustion).
+        .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
         .with_state(state)
 }
 

@@ -1,0 +1,51 @@
+# pNFS TLS client — Dockerfile.pnfs-client + tlshd config wired against
+# the test CA in tests/e2e/.tls/. Used by test_nfs41_mtls_basic_mount_and_read
+# and test_pnfs_xprtsec_mtls.
+#
+# Built once per pytest session by the `pnfs_tls_client_image` fixture
+# and tagged `kiseki-pnfs-client-tls:test`.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nfs-common \
+        ktls-utils \
+        curl \
+        ca-certificates \
+        iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bake the test CA + client cert into the image so tlshd can find them.
+# Path layout matches the per-node TLS bind mount on the server side
+# (/tls/ on the cluster, /tls/ here too for symmetry).
+COPY tests/e2e/.tls/ca.pem /tls/ca.pem
+COPY tests/e2e/.tls/client.pem /tls/client.pem
+COPY tests/e2e/.tls/client.key /tls/client.key
+
+# Trust the test CA system-wide so curl + mount.nfs validate server
+# certs without needing per-invocation flags.
+RUN cp /tls/ca.pem /usr/local/share/ca-certificates/kiseki-test-ca.crt \
+    && update-ca-certificates >/dev/null
+
+# tlshd configuration — RFC 9289 §4 mTLS auth. The client identity
+# (client.pem / client.key) is presented during the handshake; the
+# server cert is validated against /tls/ca.pem (now in the system
+# trust store). `[authenticate]` blocks per ktls-utils tlshd.conf(5).
+RUN install -d /etc/tlshd.d
+COPY <<'EOF' /etc/tlshd.conf
+[debug]
+loglevel=0
+tls=0
+nl=0
+
+[authenticate]
+keyrings=
+certificate=/tls/client.pem
+private_key=/tls/client.key
+peerid=
+EOF
+
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["echo 'kiseki-pnfs-client-tls: provide a command'"]

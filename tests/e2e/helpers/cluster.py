@@ -166,6 +166,24 @@ def _wait_for_s3(host: str, port: int = 9000) -> None:
     resp.raise_for_status()
 
 
+@retry(stop=stop_after_delay(60), wait=wait_exponential(multiplier=0.3, max=3))
+def _wait_for_nfs(host: str, port: int = 2049) -> None:
+    """Wait until the NFS listener accepts a TCP connection.
+
+    The NFSv4/v3/MOUNT3 dispatcher binds last in the kiseki-server
+    runtime startup sequence (after gRPC and S3). e2e tests that
+    `mount -t nfs4` immediately after `_wait_for_ready` can race the
+    NFS spawn and surface as `Connection refused`. A simple TCP
+    connect is sufficient — the dispatcher accepts before reading
+    the first RPC, and any malformed first message just closes the
+    connection without state leaks.
+    """
+    import socket
+
+    with socket.create_connection((host, port), timeout=2):
+        pass
+
+
 def stop_server(info: ServerInfo) -> None:
     """Stop the server stack."""
     if info.mode == "docker":
@@ -228,21 +246,43 @@ def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo
     for node in nodes:
         _wait_for_ready(node.data_addr)
 
-    # Phase 15c.5 — also block on the S3 listener of node1 (where the
-    # e2e PUT/GET fixtures point) so a fresh `start_cluster()` is
-    # safe to PUT against immediately on return.
-    _wait_for_s3(nodes[0].data_addr.split(":")[0], 9000)
+    # Phase 15c.5/B-4 — block on the user-facing data planes of node1
+    # so a fresh `start_cluster()` is safe to PUT and `mount.nfs`
+    # against immediately on return. _wait_for_ready only checks the
+    # gRPC port; S3 and NFS bind later in the startup sequence and
+    # have their own readiness criteria (S3 needs the bootstrap
+    # namespace materialized; NFS just needs the dispatcher bound).
+    host = nodes[0].data_addr.split(":")[0]
+    _wait_for_s3(host, 9000)
+    _wait_for_nfs(host, 2049)
 
     return ClusterInfo(nodes=nodes, compose_file=compose_file, mode="docker")
 
 
 def stop_cluster(info: ClusterInfo) -> None:
-    """Stop a multi-node cluster."""
+    """Stop a multi-node cluster — idempotent.
+
+    `docker compose down -v` occasionally fails with
+    `Network ... Resource is still in use` if a privileged client
+    container from the prior test is mid-teardown. We ignore the
+    return code (the volumes-remove step has already started) and
+    fall through to a `network rm` cleanup so the next start_cluster
+    can recreate it without a port collision.
+    """
     root = _workspace_root()
     subprocess.run(
         ["docker", "compose", "-f", info.compose_file, "down", "-v"],
         cwd=root,
         capture_output=True,
+        check=False,
+    )
+    # Best-effort orphan-network cleanup. compose creates
+    # `<project>_default` (e.g. `kiseki_default`); when a transient
+    # container holds it open, the network survives `down -v`.
+    subprocess.run(
+        ["docker", "network", "rm", "kiseki_default"],
+        capture_output=True,
+        check=False,
     )
 
 

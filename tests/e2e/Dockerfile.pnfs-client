@@ -20,6 +20,7 @@ RUN apt-get update \
         curl \
         ca-certificates \
         iproute2 \
+        fio \
     && rm -rf /var/lib/apt/lists/*
 
 # tlshd needs to be running for `xprtsec=mtls` mounts to complete
