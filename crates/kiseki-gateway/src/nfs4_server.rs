@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
 use crate::nfs_ops::{FileHandle, NfsContext};
@@ -26,7 +25,7 @@ const NFS4_VERSION: u32 = 4;
 
 /// NFSv4 operation codes (RFC 7530 + RFC 7862).
 #[allow(dead_code)]
-mod op {
+pub mod op {
     pub const ACCESS: u32 = 3;
     pub const CLOSE: u32 = 4;
     pub const COMMIT: u32 = 5;
@@ -59,7 +58,7 @@ mod op {
 }
 
 /// NFSv4 status codes.
-mod nfs4_status {
+pub mod nfs4_status {
     pub const NFS4_OK: u32 = 0;
     pub const NFS4ERR_NOENT: u32 = 2;
     pub const NFS4ERR_IO: u32 = 5;
@@ -208,9 +207,12 @@ pub fn handle_nfs4_first_compound<G: GatewayOps>(
     dispatch_compound(header, &mut reader, ctx, sessions)
 }
 
-/// Handle one NFSv4 TCP connection (after the first message).
-pub fn handle_nfs4_connection<G: GatewayOps>(
-    mut stream: TcpStream,
+/// Handle one NFSv4 connection (after the first message).
+///
+/// Accepts any `Read + Write` so callers can pass either a raw
+/// `TcpStream` (plaintext fallback) or a TLS-wrapped stream (default).
+pub fn handle_nfs4_connection<G: GatewayOps, S: io::Read + io::Write>(
+    mut stream: S,
     ctx: Arc<NfsContext<G>>,
     sessions: Arc<SessionManager>,
 ) -> io::Result<()> {
@@ -340,7 +342,7 @@ fn process_op<G: GatewayOps>(
     }
 }
 
-fn op_exchange_id(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) fn op_exchange_id(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
     // Skip client owner (verifier + ownerid).
     let _verifier = reader.read_opaque_fixed(8).unwrap_or_default();
     let _owner_id = reader.read_opaque().unwrap_or_default();
@@ -367,7 +369,7 @@ fn op_exchange_id(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-fn op_create_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) fn op_create_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
     let client_id = reader.read_u64().unwrap_or(0);
     let _sequence = reader.read_u32().unwrap_or(0);
     let _flags = reader.read_u32().unwrap_or(0);
@@ -404,7 +406,7 @@ fn op_create_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-fn op_destroy_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) fn op_destroy_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
     let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
     let mut session_id = [0u8; 16];
     if sid_bytes.len() == 16 {
@@ -422,7 +424,7 @@ fn op_destroy_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> 
     }
 }
 
-fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
     let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
     let mut session_id = [0u8; 16];
     if sid_bytes.len() == 16 {

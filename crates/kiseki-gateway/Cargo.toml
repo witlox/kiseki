@@ -26,6 +26,7 @@ kiseki-control = { workspace = true }
 kiseki-crypto = { workspace = true }
 aws-lc-rs = { workspace = true }
 axum = "0.7"
+kiseki-audit = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto", "service"] }
 kiseki-transport = { workspace = true }
@@ -39,6 +40,7 @@ tokio-rustls = "0.26"
 tower = "0.5"
 tracing = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["tokio"] }

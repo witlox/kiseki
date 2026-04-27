@@ -6,7 +6,6 @@
 //! Program: 100003, Version: 3.
 
 use std::io;
-use std::net::TcpStream;
 use std::sync::Arc;
 
 use crate::nfs_ops::NfsContext;
@@ -71,9 +70,12 @@ pub fn handle_nfs3_first_message<G: GatewayOps>(
     dispatch_nfs3(header, &mut reader, ctx)
 }
 
-/// Handle one NFS3 TCP connection (after the first message).
-pub fn handle_nfs3_connection<G: GatewayOps>(
-    mut stream: TcpStream,
+/// Handle one NFS3 connection (after the first message).
+///
+/// Accepts any `Read + Write` so callers can pass either a raw
+/// `TcpStream` (plaintext fallback) or a TLS-wrapped stream (default).
+pub fn handle_nfs3_connection<G: GatewayOps, S: io::Read + io::Write>(
+    mut stream: S,
     ctx: Arc<NfsContext<G>>,
 ) -> io::Result<()> {
     loop {

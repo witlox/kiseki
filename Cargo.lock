@@ -1749,6 +1749,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kiseki-advisory",
+ "kiseki-audit",
  "kiseki-chunk",
  "kiseki-common",
  "kiseki-composition",
@@ -1767,6 +1768,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

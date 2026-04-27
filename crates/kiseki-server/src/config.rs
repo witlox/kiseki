@@ -44,6 +44,45 @@ pub struct ServerConfig {
     /// mTLS-derived node identity for the Raft key store at-rest
     /// encryption (Phase 14e).
     pub spiffe_socket: Option<PathBuf>,
+    /// pNFS Data Server listener address (ADR-038 §D9). Default `:2052`.
+    /// `None` disables the DS endpoint; if pNFS is enabled, must be set.
+    pub ds_addr: Option<SocketAddr>,
+    /// Whether pNFS layout delegation is offered to NFSv4.1 clients
+    /// (ADR-038 §D9). Default `true`.
+    pub pnfs_enabled: bool,
+    /// pNFS configuration knobs (ADR-038 §D9).
+    pub pnfs: PnfsSettings,
+    /// Operator opt-in for the audited plaintext-NFS fallback
+    /// (ADR-038 §D4.2). Has effect only if `KISEKI_INSECURE_NFS=true`
+    /// is also set at process start. Default `false`.
+    pub allow_plaintext_nfs: bool,
+}
+
+/// pNFS configuration (ADR-038 §D9).
+#[derive(Clone)]
+#[allow(dead_code)] // Phase 15a wires `stripe_size_bytes` only; the rest are read in Phase 15b.
+pub struct PnfsSettings {
+    /// Stripe size in bytes (1 MiB default).
+    pub stripe_size_bytes: u64,
+    /// Layout TTL in seconds. Auto-halved to 60s under
+    /// the plaintext-NFS fallback (ADR-038 §D4.2).
+    pub layout_ttl_seconds: u64,
+    /// Maximum live entries in the MDS layout cache (I-PN8).
+    pub layout_cache_max_entries: usize,
+    /// Sweep interval for the layout cache (I-PN8). Defaults to
+    /// `layout_ttl_seconds / 4`.
+    pub layout_cache_sweep_interval_seconds: u64,
+}
+
+impl Default for PnfsSettings {
+    fn default() -> Self {
+        Self {
+            stripe_size_bytes: 1_048_576,
+            layout_ttl_seconds: 300,
+            layout_cache_max_entries: 100_000,
+            layout_cache_sweep_interval_seconds: 75,
+        }
+    }
 }
 
 /// Backup destination + retention.
@@ -107,6 +146,7 @@ impl ServerConfig {
     /// TLS is enabled if `KISEKI_CA_PATH`, `KISEKI_CERT_PATH`, and
     /// `KISEKI_KEY_PATH` are all set. Otherwise the server runs in
     /// plaintext mode (development only — logged as a warning).
+    #[allow(clippy::too_many_lines)] // env-loader: each KISEKI_* var is one line
     pub fn from_env() -> Self {
         let data_addr = std::env::var("KISEKI_DATA_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:9100".into())
@@ -201,6 +241,32 @@ impl ServerConfig {
             .ok()
             .map(PathBuf::from);
 
+        let ds_addr = std::env::var("KISEKI_DS_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:2052".into())
+            .parse()
+            .ok();
+
+        let pnfs_enabled = std::env::var("KISEKI_PNFS_ENABLED")
+            .map_or(true, |v| v == "true" || v == "1");
+
+        let mut pnfs = PnfsSettings::default();
+        if let Some(v) = std::env::var("KISEKI_PNFS_STRIPE_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            pnfs.stripe_size_bytes = v;
+        }
+        if let Some(v) = std::env::var("KISEKI_PNFS_LAYOUT_TTL_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            pnfs.layout_ttl_seconds = v;
+            pnfs.layout_cache_sweep_interval_seconds = (v / 4).max(1);
+        }
+
+        let allow_plaintext_nfs = std::env::var("KISEKI_ALLOW_PLAINTEXT_NFS")
+            .is_ok_and(|v| v == "true" || v == "1");
+
         Self {
             data_addr,
             advisory_addr,
@@ -219,6 +285,10 @@ impl ServerConfig {
             raw_devices,
             backup,
             spiffe_socket,
+            ds_addr,
+            pnfs_enabled,
+            pnfs,
+            allow_plaintext_nfs,
         }
     }
 }

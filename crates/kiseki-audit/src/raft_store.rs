@@ -224,6 +224,7 @@ impl RaftAuditStore {
             AuditEventType::AdvisoryWorkflow => "AdvisoryWorkflow",
             AuditEventType::AdvisoryHint => "AdvisoryHint",
             AuditEventType::AdvisoryBudgetExceeded => "AdvisoryBudgetExceeded",
+            AuditEventType::SecurityDowngradeEnabled => "SecurityDowngradeEnabled",
         }
     }
 }

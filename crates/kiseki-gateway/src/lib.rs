@@ -110,7 +110,13 @@ pub mod nfs_server;
 pub mod nfs_xdr;
 
 #[cfg(feature = "nfs")]
+pub mod nfs_security;
+
+#[cfg(feature = "nfs")]
 pub mod pnfs;
+
+#[cfg(feature = "nfs")]
+pub mod pnfs_ds_server;
 
 #[cfg(feature = "s3")]
 pub mod s3;

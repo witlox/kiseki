@@ -282,6 +282,39 @@ pub struct KisekiWorld {
     pub raft_throughput: Option<(usize, std::time::Duration)>,
     /// Single-shard throughput baseline for the 10× comparison.
     pub raft_single_shard_throughput: Option<(usize, std::time::Duration)>,
+
+    // === pNFS Phase 15a (ADR-038) ===
+    /// fh4 MAC key under test — populated by the K_layout step.
+    pub pnfs_mac_key: Option<kiseki_gateway::pnfs::PnfsFhMacKey>,
+    /// fh4 currently held by the "client" — populated by issue/forge/expire steps.
+    pub pnfs_fh: Option<kiseki_gateway::pnfs::PnfsFileHandle>,
+    /// Most recent DS COMPOUND response — full XDR-decoded result list.
+    /// Each entry is `(op_code, status, payload)` per RFC 5661 §15.2.
+    pub pnfs_last_results: Vec<(u32, u32, Vec<u8>)>,
+    /// Read counter on the tracking gateway (proves I-PN2 stateless +
+    /// I-PN1 short-circuit on bad fh4).
+    pub pnfs_gateway_reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Composition byte payload used by the read scenario — synthesised
+    /// in `given_composition_with_size`.
+    pub pnfs_composition_bytes: Option<Vec<u8>>,
+    /// Outcome of the most recent NFS-security gate evaluation.
+    pub pnfs_security_eval: Option<
+        Result<
+            kiseki_gateway::nfs_security::NfsSecurity,
+            kiseki_gateway::nfs_security::NfsSecurityError,
+        >,
+    >,
+    /// Audit log dedicated to pNFS scenarios (separate from the
+    /// always-on `audit_log` so we can assert exact contents).
+    pub pnfs_audit_log: std::sync::Arc<kiseki_audit::store::AuditLog>,
+    /// Scenario-local DS context. Built lazily so steps can adjust the
+    /// stripe size or clock.
+    pub pnfs_ds_ctx:
+        Option<std::sync::Arc<kiseki_gateway::pnfs_ds_server::DsContext<kiseki_gateway::mem_gateway::InMemoryGateway>>>,
+    /// Bound DS listener address for TLS scenarios.
+    pub pnfs_ds_addr: Option<std::net::SocketAddr>,
+    /// Shutdown flag for the DS listener thread spawned in TLS scenarios.
+    pub pnfs_ds_shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Drop for KisekiWorld {
@@ -525,6 +558,16 @@ impl KisekiWorld {
             raft_write_latencies: Vec::new(),
             raft_throughput: None,
             raft_single_shard_throughput: None,
+            pnfs_mac_key: None,
+            pnfs_fh: None,
+            pnfs_last_results: Vec::new(),
+            pnfs_gateway_reads: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pnfs_composition_bytes: None,
+            pnfs_security_eval: None,
+            pnfs_audit_log: std::sync::Arc::new(kiseki_audit::store::AuditLog::new()),
+            pnfs_ds_ctx: None,
+            pnfs_ds_addr: None,
+            pnfs_ds_shutdown: None,
             telemetry_bus,
             kms_providers,
             persistent_shard_store: None,

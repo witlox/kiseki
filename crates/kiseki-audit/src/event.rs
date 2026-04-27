@@ -53,6 +53,12 @@ pub enum AuditEventType {
     AdvisoryHint,
     /// Budget exceeded.
     AdvisoryBudgetExceeded,
+
+    // --- Security posture (ADR-038 §D4.2 / I-PN7) ---
+    /// Operator opted into a documented security downgrade
+    /// (e.g. plaintext NFS fallback for older kernels). Emitted on
+    /// every server boot while the downgrade is active.
+    SecurityDowngradeEnabled,
 }
 
 /// A single audit event.

@@ -5,11 +5,12 @@
 //! NFSv3 = version 3, NFSv4.x = version 4.
 
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::thread;
 
 use kiseki_common::ids::{NamespaceId, OrgId};
+use rustls::ServerConfig;
 
 use crate::nfs::NfsGateway;
 use crate::nfs3_server::handle_nfs3_connection;
@@ -50,6 +51,7 @@ pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
         namespace_id,
         storage_nodes,
         None,
+        None,
     );
 }
 
@@ -61,6 +63,13 @@ pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
 /// When `shutdown` is `Some` and the flag flips to `true`, the accept
 /// loop exits after the current iteration; in-flight per-connection
 /// threads are detached and exit on their own.
+///
+/// The `tls` parameter wires NFS-over-TLS (RFC 9289 / ADR-038 §D4.1).
+/// When `Some`, every accepted `TcpStream` is wrapped in
+/// `rustls::StreamOwned` before being handed to the per-connection
+/// handler. When `None`, plaintext TCP is used (only allowed under
+/// the audited `[security].allow_plaintext_nfs` fallback per
+/// ADR-038 §D4.2).
 #[allow(clippy::needless_pass_by_value)]
 pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
     listener: TcpListener,
@@ -69,6 +78,7 @@ pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
     namespace_id: NamespaceId,
     storage_nodes: Vec<String>,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+    tls: Option<Arc<ServerConfig>>,
 ) {
     let ctx = Arc::new(NfsContext::with_storage_nodes(
         gateway,
@@ -91,12 +101,25 @@ pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
             }
         }
         match listener.accept() {
-            Ok((stream, _peer)) => {
+            Ok((stream, peer)) => {
                 let ctx = Arc::clone(&ctx);
+                let tls = tls.clone();
                 thread::spawn(move || {
                     let _ = stream.set_nonblocking(false);
-                    if let Err(e) = handle_connection(stream, ctx) {
-                        tracing::debug!(error = %e, "NFS connection ended");
+                    if let Some(tls_cfg) = tls {
+                        match rustls::ServerConnection::new(tls_cfg) {
+                            Ok(conn) => {
+                                let tls_stream = rustls::StreamOwned::new(conn, stream);
+                                if let Err(e) = handle_connection(tls_stream, ctx) {
+                                    tracing::debug!(error = %e, peer = %peer, "NFS-over-TLS connection ended");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, peer = %peer, "TLS server-conn init failed");
+                            }
+                        }
+                    } else if let Err(e) = handle_connection(stream, ctx) {
+                        tracing::debug!(error = %e, peer = %peer, "NFS plaintext connection ended");
                     }
                 });
             }
@@ -113,8 +136,12 @@ pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
 
 /// Handle a connection — peek at the first RPC to determine version,
 /// then delegate to v3 or v4 handler for the rest.
-fn handle_connection<G: GatewayOps>(
-    mut stream: TcpStream,
+///
+/// Generic over the stream type so the same dispatcher serves both
+/// raw `TcpStream` (plaintext fallback) and `rustls::StreamOwned`
+/// (TLS default).
+fn handle_connection<G: GatewayOps, S: io::Read + io::Write>(
+    mut stream: S,
     ctx: Arc<NfsContext<G>>,
 ) -> io::Result<()> {
     // Read first message to determine version.

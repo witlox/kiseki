@@ -22,6 +22,7 @@ pub mod helpers;
 pub mod kms;
 pub mod log;
 pub mod operational;
+pub mod pnfs;
 pub mod protocol;
 pub mod raft;
 pub mod small_file;

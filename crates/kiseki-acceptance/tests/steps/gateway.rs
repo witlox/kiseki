@@ -608,6 +608,7 @@ async fn given_transport_tcp(w: &mut KisekiWorld, gw: String) {
                 ns_id,
                 Vec::new(),
                 Some(shutdown_thread),
+                None, // plaintext — gateway BDD predates ADR-038 TLS default
             );
         });
         w.tcp_endpoints.insert(gw, addr);

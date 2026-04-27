@@ -369,6 +369,74 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     });
 
     // NFS gateway (NFSv3 + NFSv4.2 + pNFS on port 2049).
+    //
+    // ADR-038 §D4 transport gate: TLS by default, audited plaintext
+    // fallback only with both flags set. Gate runs before any listener
+    // binds so the server refuses to start cleanly on misconfiguration.
+    let env_insecure_nfs = std::env::var("KISEKI_INSECURE_NFS")
+        .is_ok_and(|v| v == "true" || v == "1");
+    let security = kiseki_gateway::nfs_security::evaluate(
+        cfg.allow_plaintext_nfs,
+        env_insecure_nfs,
+        cfg.tls.is_some(),
+        cfg.pnfs.layout_ttl_seconds,
+        1, // bootstrap_tenant on this listener — single-tenant default
+    )
+    .map_err(|e| format!("NFS security gate refused start: {e}"))?;
+
+    if security.emit_warn_banner {
+        tracing::warn!(target: "kiseki::nfs::security", "{}", kiseki_gateway::nfs_security::PLAINTEXT_WARN_BANNER);
+    }
+    if let Some(audit_type) = security.audit_event {
+        use kiseki_audit::event::AuditEvent;
+        use kiseki_audit::store::AuditOps;
+        use kiseki_common::time::{
+            ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        audit_store.append(AuditEvent {
+            sequence: kiseki_common::ids::SequenceNumber(0),
+            timestamp: DeltaTimestamp {
+                hlc: HybridLogicalClock {
+                    physical_ms: now_ms,
+                    logical: 0,
+                    node_id: kiseki_common::ids::NodeId(cfg.node_id),
+                },
+                wall: WallTime {
+                    millis_since_epoch: now_ms,
+                    timezone: "UTC".into(),
+                },
+                quality: ClockQuality::Ntp,
+            },
+            event_type: audit_type,
+            tenant_id: None,
+            actor: "kiseki-server".to_string(),
+            description: "plaintext NFS fallback active per ADR-038 §D4.2 — \
+                operator opted in via [security].allow_plaintext_nfs=true \
+                AND KISEKI_INSECURE_NFS=true".to_string(),
+        });
+    }
+    tracing::info!(
+        mode = ?security.mode,
+        layout_ttl_seconds = security.effective_layout_ttl_seconds,
+        "NFS transport posture",
+    );
+
+    let nfs_tls = match security.mode {
+        kiseki_gateway::nfs_security::NfsTransport::Tls => cfg.tls.as_ref().and_then(|files| {
+            let ca = std::fs::read(&files.ca_path).ok()?;
+            let cert = std::fs::read(&files.cert_path).ok()?;
+            let key = std::fs::read(&files.key_path).ok()?;
+            kiseki_transport::TlsConfig::server_config(&ca, &cert, &key)
+                .map(Arc::new)
+                .ok()
+        }),
+        kiseki_gateway::nfs_security::NfsTransport::Plaintext => None,
+    };
+
     let nfs_gw = kiseki_gateway::nfs::NfsGateway::new(Arc::clone(&gw));
     let nfs_addr = cfg.nfs_addr;
     // Pass peer addresses for pNFS layout delegation (LAYOUTGET).
@@ -381,15 +449,53 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             format!("{host}:9100")
         })
         .collect();
+    let nfs_listener = std::net::TcpListener::bind(nfs_addr)
+        .map_err(|e| format!("NFS bind {nfs_addr}: {e}"))?;
+    let nfs_tls_for_thread = nfs_tls.clone();
     std::thread::spawn(move || {
-        kiseki_gateway::nfs_server::run_nfs_server_with_peers(
-            nfs_addr,
+        kiseki_gateway::nfs_server::serve_nfs_listener(
+            nfs_listener,
             nfs_gw,
             bootstrap_tenant,
             bootstrap_ns,
             nfs_storage_nodes,
+            None,
+            nfs_tls_for_thread,
         );
     });
+
+    // pNFS Data Server listener (ADR-038 §D2). Only spawned when pNFS
+    // is enabled AND `ds_addr` is configured.
+    if cfg.pnfs_enabled {
+        if let Some(ds_addr) = cfg.ds_addr {
+            // Per-cluster fh4 MAC key — derived from the master key +
+            // a stable cluster id. The bootstrap tenant id serves as
+            // the cluster id for now; a separate cluster_id field is
+            // future work (see ADR-038 §D4.1 wording on `salt`).
+            let cluster_id_bytes: [u8; 16] = bootstrap_tenant.0.into_bytes();
+            let mac_key = kiseki_gateway::pnfs::derive_pnfs_fh_mac_key(
+                &[0x42; 32], // TODO Phase 15b: pull from kiseki_keymanager
+                &cluster_id_bytes,
+            );
+            let ds_ctx = Arc::new(kiseki_gateway::pnfs_ds_server::DsContext {
+                gateway: Arc::clone(&gw),
+                mac_key,
+                stripe_size_bytes: cfg.pnfs.stripe_size_bytes,
+                rt: tokio::runtime::Handle::current(),
+                now_ms: Arc::new(kiseki_gateway::pnfs_ds_server::default_now_ms),
+            });
+            let ds_tls_for_thread = nfs_tls.clone();
+            std::thread::spawn(move || {
+                kiseki_gateway::pnfs_ds_server::run_ds_server(
+                    ds_addr,
+                    ds_ctx,
+                    None,
+                    ds_tls_for_thread,
+                );
+            });
+            tracing::info!(addr = %ds_addr, "pNFS DS listener spawned");
+        }
+    }
 
     // Stream processor: polls deltas from log → advances view watermarks.
     // Uses block_in_place to hold the std::sync::MutexGuard (not Send)
