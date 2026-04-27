@@ -373,7 +373,7 @@ fn process_op<G: GatewayOps>(
         op::REMOVE => op_remove(reader, ctx),
         op::RENAME => op_rename(reader, ctx),
         op::LINK => op_link(reader, ctx, state),
-        op::READDIR => op_readdir(reader, ctx),
+        op::READDIR => op_readdir(reader, ctx, state),
         op::READLINK => op_readlink(ctx, state),
         op::CREATE => op_create(reader, ctx, state),
         op::COMMIT => op_commit(),
@@ -1238,7 +1238,11 @@ fn op_remove<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> 
     (status, w.into_bytes())
 }
 
-fn op_readdir<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+fn op_readdir<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    state: &CompoundState,
+) -> (u32, Vec<u8>) {
     // Consume READDIR4args: cookie(u64) + cookieverf(8 bytes) + dircount(u32) + maxcount(u32) + attr_request(bitmap).
     let _cookie = reader.read_u64().unwrap_or(0);
     let _cookieverf = reader.read_opaque_fixed(8).unwrap_or_default();
@@ -1251,6 +1255,13 @@ fn op_readdir<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) ->
 
     let mut w = XdrWriter::new();
     w.write_u32(op::READDIR);
+    // RFC 8881 §18.26.4: READDIR with no current filehandle is
+    // NFS4ERR_NOFILEHANDLE. Distinct from NFS4ERR_BADHANDLE (handle
+    // malformed) and NFS4ERR_NOTDIR (handle is a regular file).
+    if state.current_fh.is_none() {
+        w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
+        return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
+    }
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_opaque_fixed(&[0u8; 8]); // cookieverf
 

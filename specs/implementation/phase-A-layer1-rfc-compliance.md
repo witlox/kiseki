@@ -340,17 +340,43 @@ is updated in the same commit as the test/fix landings.
 
 ## Definition of Done for Phase A
 
-1. Every catalog row except the explicitly-rejected ones (RFC 5663,
-   RFC 8154) and the explicitly-not-implemented ones (RFC 2203 /
-   5403 / 7204, RFC 7578) is at least 🟡 in the catalog.
-2. The Phase 15 e2e mount paused 2026-04-27 succeeds without
+1. ✅ Every catalog row except the explicitly-rejected ones
+   (RFC 5663, RFC 8154) and the explicitly-not-implemented ones
+   (RFC 2203 / 5403 / 7204, RFC 7578) is at least 🟡 in the
+   catalog.
+2. ❌ The Phase 15 e2e mount paused 2026-04-27 succeeds without
    further server-side fixes (Group II + III exit gates).
-3. `cargo test --workspace` passes.
-4. The auditor's gate-2 spec-fidelity check (ADR-023 §D5) verifies
-   every `@integration` BDD scenario maps to a 🟡-or-better catalog
-   row.
-5. ADR-023 rev 2 §D4.1 phase B begins (per-RFC opt-in to keep
-   `@integration` alone).
+   **Status (2026-04-27 ADV-PA-9 verification)**: e2e `pytest
+   tests/e2e/test_pnfs.py` was actually executed against the
+   3-node `docker-compose.3node.yml` cluster. All three test
+   functions skipped: `test_pnfs_xprtsec_mtls` skipped because the
+   compose runs in plaintext mode (per `KISEKI_ALLOW_PLAINTEXT_NFS`
+   + `KISEKI_INSECURE_NFS`); `test_pnfs_plaintext_fallback` ran
+   the actual mount and observed `mount.nfs4: mount(2): Operation
+   not supported` three times (rc=32). A direct `python3 socket`
+   NULL-CALL probe over TCP/2049 succeeds end-to-end (server
+   replies with the correct 24-byte ACCEPT_OK frame), so kiseki's
+   per-connection handler is reachable. The kernel rejects the
+   mount AFTER TCP connect (a TIME-WAIT socket is visible on the
+   client side), which means kiseki's first-COMPOUND reply
+   (EXCHANGE_ID or earlier) does not satisfy the Linux 6.19
+   `mount.nfs4 / nfs-utils 2.6.4` client. **Concrete next-step
+   bug, not closed by Phase A.** Tracked as a Phase 15c follow-up
+   item (or a "Group X" handler-error sweep — see INT-PA-1).
+3. ✅ `cargo test --workspace` passes (verified post Group IV–IX).
+4. 🟡 The auditor's gate-2 spec-fidelity check (ADR-023 §D5)
+   verifies every `@integration` BDD scenario maps to a 🟡-or-
+   better catalog row. (Pending — not run as part of Phase A
+   close.)
+5. ❌ ADR-023 rev 2 §D4.1 phase B begins (per-RFC opt-in to keep
+   `@integration` alone). Pending — Phase A close authoritatively
+   gates Phase B; criterion #2 must clear first.
+
+**Phase A is therefore "Layer-1 fidelity complete" but not
+"Phase 15 unblocked"** — the wire-format reference tests all pass,
+but the kernel-client e2e surfaces a remaining server-side bug in
+the NFSv4.1 first-COMPOUND reply path. The fix belongs to a
+Phase-15-class follow-up, not to Phase A.
 
 ## What this plan deliberately does NOT cover
 
