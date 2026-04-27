@@ -288,7 +288,534 @@ pub enum FhValidateError {
 }
 
 // =============================================================================
-// Legacy LayoutManager (replaced in Phase 15b)
+// MDS Layout Manager (Phase 15b — ADR-038 §D6)
+// =============================================================================
+
+/// I/O mode for a layout. RFC 5661 §18.43 LAYOUTIOMODE4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutIoMode {
+    /// `LAYOUTIOMODE4_READ` = 1
+    Read,
+    /// `LAYOUTIOMODE4_RW` = 2
+    ReadWrite,
+}
+
+/// One stripe in a Flexible Files layout. RFC 8435 §5.1.
+#[derive(Clone, Debug)]
+pub struct FlexFileStripe {
+    /// Byte offset in the composition.
+    pub offset: u64,
+    /// Stripe length in bytes.
+    pub length: u64,
+    /// I/O mode this stripe was issued for.
+    pub iomode: LayoutIoMode,
+    /// Per-stripe file handle the DS will receive.
+    pub fh: PnfsFileHandle,
+    /// Network address of the DS for this stripe (e.g. "10.0.0.11:2052").
+    pub ds_addr: String,
+    /// `deviceid4` for this stripe — opaque key into `GETDEVICEINFO`.
+    pub device_id: [u8; 16],
+}
+
+/// Server-side layout cache entry. Spec: I-PN4, I-PN8.
+#[derive(Clone, Debug)]
+pub struct ServerLayout {
+    /// Composition this layout is bound to.
+    pub composition_id: CompositionId,
+    /// Stripes covering the requested byte range.
+    pub stripes: Vec<FlexFileStripe>,
+    /// Layout state id (RFC 5661 §3.3.12).
+    pub stateid: [u8; 16],
+    /// Wall-clock issuance time in ms since Unix epoch.
+    pub issued_at_ms: u64,
+    /// TTL in ms — eviction at `issued_at_ms + ttl_ms`.
+    pub ttl_ms: u64,
+}
+
+/// Reasons the MDS may invalidate a layout. Used by Phase 15c LAYOUTRECALL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecallReason {
+    /// ADR-035 drain hook.
+    NodeDraining,
+    /// ADR-033 split.
+    ShardSplit,
+    /// ADR-034 merge.
+    ShardMerge,
+    /// fh4 MAC key rotation.
+    KeyRotation,
+    /// Composition deletion.
+    CompositionDeleted,
+}
+
+/// Network address per RFC 5665 §5 (`netaddr4`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetAddress {
+    /// Network ID — `tcp` or `tcp6`.
+    pub netid: String,
+    /// Universal address `h1.h2.h3.h4.p1.p2` (IPv4) per RFC 5665 §5.2.3.4.
+    pub uaddr: String,
+}
+
+/// pNFS device info — resolves a `deviceid4` to one or more reachable
+/// addresses. Used for GETDEVICEINFO (op 47). RFC 8435 §5.2.
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    /// 16-byte device id.
+    pub device_id: [u8; 16],
+    /// One entry per network path to the DS (typically 1).
+    pub addresses: Vec<NetAddress>,
+}
+
+/// Convert a `host:port` string to RFC 5665 universal address form.
+/// Returns the original string on parse failure (defensive default).
+#[must_use]
+pub fn host_port_to_uaddr(host_port: &str) -> String {
+    let Some((host, port_str)) = host_port.rsplit_once(':') else {
+        return host_port.to_string();
+    };
+    let Ok(port) = port_str.parse::<u16>() else {
+        return host_port.to_string();
+    };
+    let p1 = port >> 8;
+    let p2 = port & 0xFF;
+    format!("{host}.{p1}.{p2}")
+}
+
+/// MDS layout manager — the production replacement for the legacy
+/// `LayoutManager`. Issues fh4-stamped Flexible Files layouts and
+/// caches them with a capacity cap (LRU on `issued_at_ms`) and TTL
+/// sweeper per ADR-038 §D6 / §D11.
+///
+/// Spec: I-PN4 (TTL ≤ 5 min), I-PN6 (active node set), I-PN8 (cache
+/// bounded), I-PN9 (recall integration deferred to Phase 15c).
+pub struct MdsLayoutManager {
+    inner: std::sync::Mutex<MdsLayoutInner>,
+    config: MdsLayoutConfig,
+    mac_key: PnfsFhMacKey,
+}
+
+struct MdsLayoutInner {
+    cache: std::collections::HashMap<CompositionId, ServerLayout>,
+}
+
+/// Tunables for [`MdsLayoutManager`]. Defaults match ADR-038 §D9.
+#[derive(Clone, Debug)]
+pub struct MdsLayoutConfig {
+    /// Stripe size in bytes (1 MiB default).
+    pub stripe_size_bytes: u64,
+    /// Wall-clock TTL for cached layouts.
+    pub layout_ttl_ms: u64,
+    /// Soft cap on live entries — LRU eviction on overflow.
+    pub max_entries: usize,
+    /// Storage node DS addresses (`host:port` strings).
+    pub storage_ds_addrs: Vec<String>,
+}
+
+impl Default for MdsLayoutConfig {
+    fn default() -> Self {
+        Self {
+            stripe_size_bytes: 1_048_576,
+            layout_ttl_ms: 300_000,
+            max_entries: 100_000,
+            storage_ds_addrs: Vec::new(),
+        }
+    }
+}
+
+impl MdsLayoutManager {
+    /// Create a manager with the given key + config.
+    #[must_use]
+    pub fn new(mac_key: PnfsFhMacKey, config: MdsLayoutConfig) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(MdsLayoutInner {
+                cache: std::collections::HashMap::new(),
+            }),
+            config,
+            mac_key,
+        }
+    }
+
+    /// LAYOUTGET — RFC 5661 §18.43. Returns a `ServerLayout` covering
+    /// at least `[offset, offset+length)`. The cache is keyed by
+    /// `composition_id`; repeated calls return a cloned cached entry.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // mirrors RFC 5661 §18.43.1 LAYOUTGET4args
+    pub fn layout_get(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        composition_id: CompositionId,
+        offset: u64,
+        length: u64,
+        iomode: LayoutIoMode,
+        now_ms: u64,
+    ) -> ServerLayout {
+        // Cache hit (still within TTL).
+        {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(existing) = inner.cache.get(&composition_id) {
+                if now_ms < existing.issued_at_ms.saturating_add(existing.ttl_ms) {
+                    return existing.clone();
+                }
+            }
+        }
+
+        // Build the layout. Storage nodes may be empty — fall back to a
+        // single self-DS-bound layout in that case (in-process tests).
+        let stripe_size = self.config.stripe_size_bytes.max(1);
+        let nodes: Vec<String> = if self.config.storage_ds_addrs.is_empty() {
+            vec!["127.0.0.1:2052".into()]
+        } else {
+            self.config.storage_ds_addrs.clone()
+        };
+        let num_nodes = nodes.len();
+
+        let mut stripes = Vec::new();
+        let mut pos = offset;
+        let end = offset.saturating_add(length).max(stripe_size); // at least 1 stripe
+        let expiry_ms = now_ms.saturating_add(self.config.layout_ttl_ms);
+
+        while pos < end {
+            let seg_len = stripe_size.min(end.saturating_sub(pos));
+            let stripe_index_u64 = pos / stripe_size;
+            let node_idx = usize::try_from(stripe_index_u64)
+                .unwrap_or(usize::MAX)
+                % num_nodes;
+            let stripe_index = u32::try_from(stripe_index_u64).unwrap_or(u32::MAX);
+            let fh = PnfsFileHandle::issue(
+                &self.mac_key,
+                tenant_id,
+                namespace_id,
+                composition_id,
+                stripe_index,
+                expiry_ms,
+            );
+            // device_id derived deterministically from the DS address —
+            // stable across calls so GETDEVICEINFO can resolve it.
+            let mut device_id = [0u8; 16];
+            let bytes = nodes[node_idx].as_bytes();
+            let copy_len = bytes.len().min(16);
+            device_id[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            stripes.push(FlexFileStripe {
+                offset: pos,
+                length: seg_len,
+                iomode,
+                fh,
+                ds_addr: nodes[node_idx].clone(),
+                device_id,
+            });
+            pos = pos.saturating_add(seg_len);
+        }
+
+        // Stateid carries (composition_id_low8 || issued_at_ms_be8).
+        let mut stateid = [0u8; 16];
+        let comp_bytes = composition_id.0.as_bytes();
+        stateid[..8].copy_from_slice(&comp_bytes[..8]);
+        stateid[8..].copy_from_slice(&now_ms.to_be_bytes());
+
+        let layout = ServerLayout {
+            composition_id,
+            stripes,
+            stateid,
+            issued_at_ms: now_ms,
+            ttl_ms: self.config.layout_ttl_ms,
+        };
+
+        // Insert + LRU-evict on capacity (I-PN8).
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.cache.insert(composition_id, layout.clone());
+        if inner.cache.len() > self.config.max_entries {
+            // Evict the entry with the smallest issued_at_ms.
+            if let Some((victim_id, _)) = inner
+                .cache
+                .iter()
+                .min_by_key(|(_, l)| l.issued_at_ms)
+                .map(|(k, v)| (*k, v.issued_at_ms))
+            {
+                inner.cache.remove(&victim_id);
+            }
+        }
+        layout
+    }
+
+    /// LAYOUTRETURN. Returns true if state was present.
+    pub fn layout_return(&self, composition_id: CompositionId) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.cache.remove(&composition_id).is_some()
+    }
+
+    /// GETDEVICEINFO — resolves `device_id` → reachable DS addresses.
+    /// Returns `None` if no live layout references the device.
+    #[must_use]
+    pub fn get_device_info(&self, device_id: &[u8; 16]) -> Option<DeviceInfo> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for layout in inner.cache.values() {
+            for stripe in &layout.stripes {
+                if &stripe.device_id == device_id {
+                    let netid = if stripe.ds_addr.contains('.') {
+                        "tcp"
+                    } else {
+                        "tcp6"
+                    };
+                    return Some(DeviceInfo {
+                        device_id: *device_id,
+                        addresses: vec![NetAddress {
+                            netid: netid.to_string(),
+                            uaddr: host_port_to_uaddr(&stripe.ds_addr),
+                        }],
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// I-PN8 sweeper — remove every entry past its TTL. Returns the
+    /// number of evicted entries. Called periodically by a background
+    /// task (Phase 15c) and directly by tests.
+    pub fn sweep_expired(&self, now_ms: u64) -> usize {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = inner.cache.len();
+        inner
+            .cache
+            .retain(|_, l| now_ms < l.issued_at_ms.saturating_add(l.ttl_ms));
+        before - inner.cache.len()
+    }
+
+    /// Number of entries currently in the cache.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cache
+            .len()
+    }
+}
+
+#[cfg(test)]
+mod mds_layout_tests {
+    use super::*;
+
+    fn fixed_key() -> PnfsFhMacKey {
+        derive_pnfs_fh_mac_key(&[0xab; 32], &[0xcd; 16])
+    }
+
+    fn cfg_with_nodes(nodes: Vec<&str>) -> MdsLayoutConfig {
+        MdsLayoutConfig {
+            stripe_size_bytes: 1_048_576,
+            layout_ttl_ms: 300_000,
+            max_entries: 100,
+            storage_ds_addrs: nodes.into_iter().map(String::from).collect(),
+        }
+    }
+
+    fn comp(idx: u128) -> CompositionId {
+        CompositionId(uuid::Uuid::from_u128(idx))
+    }
+
+    #[test]
+    fn layout_covers_full_requested_range() {
+        let mgr = MdsLayoutManager::new(
+            fixed_key(),
+            cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
+        );
+        let layout = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(1),
+            0,
+            4 * 1_048_576,
+            LayoutIoMode::Read,
+            1000,
+        );
+        assert_eq!(layout.stripes.len(), 4);
+        let total: u64 = layout.stripes.iter().map(|s| s.length).sum();
+        assert_eq!(total, 4 * 1_048_576);
+        // Contiguous coverage.
+        for w in layout.stripes.windows(2) {
+            assert_eq!(w[0].offset + w[0].length, w[1].offset);
+        }
+    }
+
+    #[test]
+    fn stripes_round_robin_across_nodes() {
+        let mgr = MdsLayoutManager::new(
+            fixed_key(),
+            cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
+        );
+        let layout = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(2),
+            0,
+            3 * 1_048_576,
+            LayoutIoMode::Read,
+            1000,
+        );
+        let addrs: Vec<&str> = layout.stripes.iter().map(|s| s.ds_addr.as_str()).collect();
+        assert_eq!(addrs, vec!["n1:2052", "n2:2052", "n3:2052"]);
+    }
+
+    #[test]
+    fn each_stripe_carries_a_unique_fh4() {
+        let mgr = MdsLayoutManager::new(
+            fixed_key(),
+            cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
+        );
+        let layout = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(3),
+            0,
+            3 * 1_048_576,
+            LayoutIoMode::Read,
+            1000,
+        );
+        let s0_idx = layout.stripes[0].fh.stripe_index;
+        let s1_idx = layout.stripes[1].fh.stripe_index;
+        let s2_idx = layout.stripes[2].fh.stripe_index;
+        assert_eq!(s0_idx, 0);
+        assert_eq!(s1_idx, 1);
+        assert_eq!(s2_idx, 2);
+        // fh4 round-trip + mac validate against the same key.
+        for stripe in &layout.stripes {
+            stripe
+                .fh
+                .validate(&fixed_key(), 1000)
+                .expect("fh validates with same key");
+        }
+    }
+
+    #[test]
+    fn layout_cache_returns_clone_on_repeat() {
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
+        let l1 = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(7),
+            0,
+            1_048_576,
+            LayoutIoMode::Read,
+            1000,
+        );
+        let l2 = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(7),
+            0,
+            1_048_576,
+            LayoutIoMode::Read,
+            1000,
+        );
+        assert_eq!(l1.stateid, l2.stateid);
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[test]
+    fn sweeper_removes_expired_entries() {
+        let mgr = MdsLayoutManager::new(
+            fixed_key(),
+            MdsLayoutConfig {
+                layout_ttl_ms: 200,
+                ..cfg_with_nodes(vec!["n1:2052"])
+            },
+        );
+        for i in 0u128..5 {
+            let _ = mgr.layout_get(
+                OrgId(uuid::Uuid::nil()),
+                NamespaceId(uuid::Uuid::nil()),
+                comp(100 + i),
+                0,
+                1_048_576,
+                LayoutIoMode::Read,
+                1000,
+            );
+        }
+        assert_eq!(mgr.active_count(), 5);
+        // 250 ms later — TTL passes for all five.
+        let evicted = mgr.sweep_expired(1250);
+        assert_eq!(evicted, 5);
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[test]
+    fn lru_evicts_smallest_issued_at_ms_on_capacity_hit() {
+        let mgr = MdsLayoutManager::new(
+            fixed_key(),
+            MdsLayoutConfig {
+                max_entries: 3,
+                ..cfg_with_nodes(vec!["n1:2052"])
+            },
+        );
+        for i in 0u64..5 {
+            let _ = mgr.layout_get(
+                OrgId(uuid::Uuid::nil()),
+                NamespaceId(uuid::Uuid::nil()),
+                comp(u128::from(200 + i)),
+                0,
+                1_048_576,
+                LayoutIoMode::Read,
+                1000 + i * 100, // monotonically advancing issued_at
+            );
+        }
+        // Cap is 3 — after 5 inserts only the 3 newest survive.
+        assert_eq!(mgr.active_count(), 3);
+    }
+
+    #[test]
+    fn get_device_info_resolves_active_layout_devices() {
+        let mgr = MdsLayoutManager::new(
+            fixed_key(),
+            cfg_with_nodes(vec!["10.0.0.11:2052"]),
+        );
+        let layout = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(300),
+            0,
+            1_048_576,
+            LayoutIoMode::Read,
+            1000,
+        );
+        let device_id = layout.stripes[0].device_id;
+        let info = mgr.get_device_info(&device_id).expect("device known");
+        assert_eq!(info.addresses.len(), 1);
+        assert_eq!(info.addresses[0].netid, "tcp");
+        // 2052 = 8 * 256 + 4 → ".8.4"
+        assert_eq!(info.addresses[0].uaddr, "10.0.0.11.8.4");
+    }
+
+    #[test]
+    fn get_device_info_returns_none_for_unknown_device() {
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
+        assert!(mgr.get_device_info(&[0xff; 16]).is_none());
+    }
+
+    #[test]
+    fn host_port_to_uaddr_handles_ipv4() {
+        assert_eq!(host_port_to_uaddr("10.0.0.11:2049"), "10.0.0.11.8.1");
+        assert_eq!(host_port_to_uaddr("127.0.0.1:80"), "127.0.0.1.0.80");
+    }
+}
+
+// =============================================================================
+// Legacy LayoutManager (kept until 15b's op_layoutget rewrite)
 // =============================================================================
 
 

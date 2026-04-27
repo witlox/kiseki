@@ -53,6 +53,7 @@ pub mod op {
     pub const RECLAIM_COMPLETE: u32 = 58;
     pub const LAYOUTGET: u32 = 50;
     pub const LAYOUTRETURN: u32 = 51;
+    pub const GETDEVICEINFO: u32 = 47;
     pub const SEQUENCE: u32 = 53;
     pub const IO_ADVISE: u32 = 63;
 }
@@ -333,6 +334,7 @@ fn process_op<G: GatewayOps>(
         op::IO_ADVISE => op_io_advise(reader),
         op::LAYOUTGET => op_layoutget(reader, ctx, state),
         op::LAYOUTRETURN => op_layoutreturn(reader, ctx),
+        op::GETDEVICEINFO => op_getdeviceinfo(reader, ctx),
         _ => {
             let mut w = XdrWriter::new();
             w.write_u32(op_code);
@@ -631,7 +633,10 @@ fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-/// LAYOUTGET (RFC 5661 §18.43) — return pNFS layout for direct I/O.
+/// LAYOUTGET (RFC 5661 §18.43, RFC 8435 §5.1) — return pNFS layout
+/// for direct I/O. Phase 15b emits a Flexible Files Layout
+/// (`ff_layout4`) when `ctx.mds_layout_manager` is wired; older
+/// scenarios fall back to the Phase-14 stub.
 fn op_layoutget<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -639,7 +644,7 @@ fn op_layoutget<G: GatewayOps>(
 ) -> (u32, Vec<u8>) {
     // Parse LAYOUTGET4args.
     let _signal_layout_avail = reader.read_bool().unwrap_or(false);
-    let _layout_type = reader.read_u32().unwrap_or(1); // LAYOUT4_NFSV4_1_FILES = 1
+    let layout_type = reader.read_u32().unwrap_or(LAYOUT4_FLEX_FILES);
     let iomode = reader.read_u32().unwrap_or(1); // LAYOUTIOMODE4_READ = 1
     let offset = reader.read_u64().unwrap_or(0);
     let length = reader.read_u64().unwrap_or(0);
@@ -659,17 +664,19 @@ fn op_layoutget<G: GatewayOps>(
         }
     };
 
-    // Map file handle to a file_id for the layout manager.
-    let file_id = u64::from_le_bytes(fh[..8].try_into().unwrap_or([0; 8]));
+    // Phase 15b path — production MDS layout manager is wired.
+    if let Some(mgr) = ctx.mds_layout_manager.as_ref() {
+        return op_layoutget_ff(w, mgr, ctx, &fh, iomode, offset, length, layout_type);
+    }
 
-    // Map NFS iomode to pNFS IoMode.
+    // Legacy Phase-14 fallback. Kept until the @pnfs-15b BDD scenarios
+    // run with a wired manager.
+    let file_id = u64::from_le_bytes(fh[..8].try_into().unwrap_or([0; 8]));
     let pnfs_iomode = if iomode >= 2 {
         crate::pnfs::IoMode::ReadWrite
     } else {
         crate::pnfs::IoMode::Read
     };
-
-    // Get or create layout.
     let layout = ctx
         .layouts
         .lock()
@@ -678,9 +685,8 @@ fn op_layoutget<G: GatewayOps>(
 
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_bool(true); // return_on_close
-    w.write_opaque_fixed(&layout.stateid); // lo_stateid
-                                           // Layout array (count + segments).
-    w.write_u32(layout.segments.len() as u32);
+    w.write_opaque_fixed(&layout.stateid);
+    w.write_u32(u32::try_from(layout.segments.len()).unwrap_or(0));
     for seg in &layout.segments {
         w.write_u64(seg.offset);
         w.write_u64(seg.length);
@@ -689,12 +695,108 @@ fn op_layoutget<G: GatewayOps>(
         } else {
             1
         });
-        w.write_u32(1); // layout_type = LAYOUT4_NFSV4_1_FILES
-                        // Layout body: device address as opaque.
+        w.write_u32(LAYOUT4_NFSV4_1_FILES);
         w.write_opaque(seg.device_addr.as_bytes());
     }
 
     (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+/// RFC 5661 §3.3.13 + RFC 8435 §3 layout type identifiers.
+const LAYOUT4_NFSV4_1_FILES: u32 = 1;
+const LAYOUT4_FLEX_FILES: u32 = 4;
+/// Encode a Flexible Files Layout (RFC 8435 §5.1). Phase 15b path.
+#[allow(clippy::too_many_arguments)]
+fn op_layoutget_ff<G: GatewayOps>(
+    mut w: XdrWriter,
+    mgr: &std::sync::Arc<crate::pnfs::MdsLayoutManager>,
+    ctx: &NfsContext<G>,
+    fh: &[u8; 32],
+    iomode: u32,
+    offset: u64,
+    length: u64,
+    layout_type: u32,
+) -> (u32, Vec<u8>) {
+    if layout_type != LAYOUT4_FLEX_FILES && layout_type != LAYOUT4_NFSV4_1_FILES {
+        w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
+        return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
+    }
+
+    // For Phase 15b without a real composition lookup table, derive
+    // composition_id from the current_fh's first 16 bytes (the same
+    // path the Phase-14 stub used). Phase 15c hooks composition
+    // metadata properly.
+    let comp_id = kiseki_common::ids::CompositionId(uuid::Uuid::from_bytes(
+        fh[..16].try_into().unwrap_or([0; 16]),
+    ));
+
+    let pnfs_iomode = if iomode >= 2 {
+        crate::pnfs::LayoutIoMode::ReadWrite
+    } else {
+        crate::pnfs::LayoutIoMode::Read
+    };
+    let now_ms = ff_now_ms();
+
+    let layout = mgr.layout_get(
+        ctx.tenant_id,
+        ctx.namespace_id,
+        comp_id,
+        offset,
+        length.max(1),
+        pnfs_iomode,
+        now_ms,
+    );
+
+    w.write_u32(nfs4_status::NFS4_OK);
+    w.write_bool(true); // return_on_close
+    w.write_opaque_fixed(&layout.stateid);
+    w.write_u32(u32::try_from(layout.stripes.len()).unwrap_or(0));
+    for stripe in &layout.stripes {
+        w.write_u64(stripe.offset);
+        w.write_u64(stripe.length);
+        w.write_u32(if matches!(stripe.iomode, crate::pnfs::LayoutIoMode::ReadWrite) {
+            2
+        } else {
+            1
+        });
+        w.write_u32(LAYOUT4_FLEX_FILES);
+
+        // Inline ff_layout4 body for this segment. RFC 8435 §5.1:
+        //   length4 ffl_stripe_unit
+        //   ff_mirror4 ffl_mirrors<>           (1 mirror; tightly_coupled)
+        //     ff_data_server4 ffm_data_servers<>  (1 ds for this stripe)
+        //       deviceid4   ffds_deviceid       (16 bytes)
+        //       uint32      ffds_efficiency
+        //       stateid4    ffds_stateid        (16 bytes)
+        //       nfs_fh4     ffds_fh_vers<>      (1 fh — NFSv4.1)
+        //       fattr4_owner ffds_user
+        //       fattr4_owner_group ffds_group
+        //   ff_ioflags4 ffl_flags
+        //   uint32 ffl_stats_collect_hint
+        let mut body = XdrWriter::new();
+        body.write_u64(stripe.length); // stripe_unit
+        body.write_u32(1); // mirror count
+        body.write_u32(1); // data_servers per mirror
+        body.write_opaque_fixed(&stripe.device_id);
+        body.write_u32(0); // efficiency
+        body.write_opaque_fixed(&[0u8; 16]); // stateid
+        body.write_u32(1); // fh_vers count
+        body.write_opaque(&stripe.fh.encode());
+        body.write_opaque(b"0"); // user
+        body.write_opaque(b"0"); // group
+        body.write_u32(0); // ff_ioflags4
+        body.write_u32(0); // stats_collect_hint
+        w.write_opaque(&body.into_bytes());
+    }
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+fn ff_now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
 }
 
 /// LAYOUTRETURN (RFC 5661 §18.44) — return pNFS layout.
@@ -732,6 +834,92 @@ fn op_layoutreturn<G: GatewayOps>(
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_bool(true); // lrs_present (stateid present)
     w.write_opaque_fixed(&[0u8; 16]); // empty stateid (no new state)
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+/// GETDEVICEINFO (RFC 5661 §18.40 + RFC 8435 §5.2). Resolves a
+/// `deviceid4` → `ff_device_addr4` for the holding pNFS client.
+///
+/// When `ctx.mds_layout_manager` is wired (Phase 15b+), we look up
+/// the device in the live layout cache. Otherwise we return
+/// `NFS4ERR_NOENT` — older deployments (Phase 14 stub) never offered
+/// device-resolution at all.
+fn op_getdeviceinfo<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> (u32, Vec<u8>) {
+    // Parse GETDEVICEINFO4args (RFC 5661 §18.40.1):
+    //   deviceid4         gdia_device_id (16 bytes)
+    //   layouttype4       gdia_layout_type
+    //   count4            gdia_maxcount
+    //   bitmap4           gdia_notify_types
+    let device_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
+    let layout_type = reader.read_u32().unwrap_or(LAYOUT4_FLEX_FILES);
+    let _maxcount = reader.read_u32().unwrap_or(0);
+    let bitmap_len = reader.read_u32().unwrap_or(0);
+    for _ in 0..bitmap_len {
+        let _ = reader.read_u32();
+    }
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::GETDEVICEINFO);
+
+    if layout_type != LAYOUT4_FLEX_FILES && layout_type != LAYOUT4_NFSV4_1_FILES {
+        w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
+        return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
+    }
+
+    let Some(mgr) = ctx.mds_layout_manager.as_ref() else {
+        w.write_u32(nfs4_status::NFS4ERR_NOENT);
+        return (nfs4_status::NFS4ERR_NOENT, w.into_bytes());
+    };
+
+    let mut device_id = [0u8; 16];
+    if device_bytes.len() == 16 {
+        device_id.copy_from_slice(&device_bytes);
+    }
+
+    let Some(info) = mgr.get_device_info(&device_id) else {
+        w.write_u32(nfs4_status::NFS4ERR_NOENT);
+        return (nfs4_status::NFS4ERR_NOENT, w.into_bytes());
+    };
+
+    w.write_u32(nfs4_status::NFS4_OK);
+    w.write_u32(LAYOUT4_FLEX_FILES);
+
+    // GETDEVICEINFO4resok body (RFC 8435 §5.2 ff_device_addr4):
+    //   da_addr_body :: ff_device_addr4 {
+    //     ff_device_versions4 ffda_versions<>;
+    //     multipath_list4     ffda_netaddrs<>;
+    //   }
+    //   bitmap4 gdir_notification (0)
+    //
+    // We pack the body as `opaque<>` per the standard wire shape.
+    let mut body = XdrWriter::new();
+    // ffda_versions: one entry — NFSv4.1.
+    body.write_u32(1);
+    // ff_device_versions4 entry:
+    //   uint32 ffdv_version  (4)
+    //   uint32 ffdv_minorversion (1)
+    //   uint32 ffdv_rsize    (1 MiB)
+    //   uint32 ffdv_wsize    (1 MiB)
+    //   bool   ffdv_tightly_coupled
+    body.write_u32(4);
+    body.write_u32(1);
+    body.write_u32(1_048_576);
+    body.write_u32(1_048_576);
+    body.write_bool(true); // tightly coupled
+
+    // ffda_netaddrs: one multipath_list4 with len = info.addresses.len().
+    body.write_u32(u32::try_from(info.addresses.len()).unwrap_or(0));
+    for addr in &info.addresses {
+        body.write_string(&addr.netid);
+        body.write_string(&addr.uaddr);
+    }
+
+    w.write_opaque(&body.into_bytes());
+    w.write_u32(0); // gdir_notification bitmap (no notifications)
 
     (nfs4_status::NFS4_OK, w.into_bytes())
 }

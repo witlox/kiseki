@@ -315,6 +315,12 @@ pub struct KisekiWorld {
     pub pnfs_ds_addr: Option<std::net::SocketAddr>,
     /// Shutdown flag for the DS listener thread spawned in TLS scenarios.
     pub pnfs_ds_shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// MDS layout manager under test (Phase 15b).
+    pub pnfs_mds_mgr: Option<std::sync::Arc<kiseki_gateway::pnfs::MdsLayoutManager>>,
+    /// Most recent ServerLayout — captured for cache + LAYOUTGET scenarios.
+    pub pnfs_last_layout: Option<kiseki_gateway::pnfs::ServerLayout>,
+    /// Per-scenario monotonic clock so cache TTL tests are deterministic.
+    pub pnfs_clock_ms: u64,
 }
 
 impl Drop for KisekiWorld {
@@ -568,6 +574,9 @@ impl KisekiWorld {
             pnfs_ds_ctx: None,
             pnfs_ds_addr: None,
             pnfs_ds_shutdown: None,
+            pnfs_mds_mgr: None,
+            pnfs_last_layout: None,
+            pnfs_clock_ms: 1_000_000,
             telemetry_bus,
             kms_providers,
             persistent_shard_store: None,

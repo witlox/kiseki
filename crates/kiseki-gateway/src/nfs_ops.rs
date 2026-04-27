@@ -139,7 +139,13 @@ pub struct NfsContext<G: GatewayOps> {
     pub locks: LockManager,
     /// NFSv4 session/state tracker (OPEN, CLOSE, lock stateids).
     pub sessions: Arc<SessionManager>,
+    /// Legacy in-memory layout manager (Phase 14). Kept until fully
+    /// retired once Phase 15c completes. Phase 15b prefers
+    /// `mds_layout_manager` when set.
     pub layouts: Mutex<crate::pnfs::LayoutManager>,
+    /// Production MDS layout manager (ADR-038 Phase 15b). When `Some`,
+    /// `op_layoutget` and `op_getdeviceinfo` route through this.
+    pub mds_layout_manager: Option<Arc<crate::pnfs::MdsLayoutManager>>,
     pub tenant_id: OrgId,
     pub namespace_id: NamespaceId,
     /// Tokio runtime handle for bridging sync NFS → async gateway ops.
@@ -189,6 +195,7 @@ impl<G: GatewayOps> NfsContext<G> {
             locks: LockManager::default(),
             sessions: Arc::new(SessionManager::new()),
             layouts: Mutex::new(crate::pnfs::LayoutManager::new(storage_nodes)),
+            mds_layout_manager: None,
             tenant_id,
             namespace_id,
             rt,
