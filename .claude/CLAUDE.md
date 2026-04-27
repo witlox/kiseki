@@ -77,11 +77,10 @@ Gate 2: auditor verifies step depth. See `roles/auditor.md`.
 Phase 15 complete (pNFS RFC 8435 layout + DS subprotocol, NFS-over-TLS
 default with audited plaintext fallback, TopologyEventBus +
 LAYOUTRECALL). 19 production crates, 38 ADRs, 275 @integration BDD
-scenarios: 264 pass on Linux, 10 skip on undefined steps in
-multi-node-raft.feature (Phase 14f leftover — phrases like
-`"the cluster has 4 Active nodes [...]"` aren't wired to a
-`#[given]` def), 1 deferred to tests/e2e/test_pnfs.py
-(real Linux pNFS client mount).
+scenarios: 274 pass on Linux + 1 deferred to tests/e2e/test_pnfs.py
+(Linux pNFS client mount via xprtsec=mtls + per-DS mountstats
+counter assertion — runs against the docker-compose 3-node cluster
+inside a privileged ubuntu:24.04 client container).
 
 ## Escalation paths
 

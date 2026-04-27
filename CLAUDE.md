@@ -2,10 +2,8 @@
 
 Distributed storage system for HPC/AI workloads. 19 production Rust
 crates (+ 1 BDD-test crate), 38 ADRs, 275 @integration BDD scenarios:
-264 passing on Linux, 10 skipped on undefined steps in
-multi-node-raft.feature (a Phase 14f loose-end — separate
-follow-up to wire those step regexes), 1 deferred to
-tests/e2e/test_pnfs.py.
+274 passing on Linux, 1 deferred to tests/e2e/test_pnfs.py
+(real Linux pNFS client mount).
 
 ## Language
 

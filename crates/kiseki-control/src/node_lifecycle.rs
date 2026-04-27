@@ -184,6 +184,30 @@ impl DrainOrchestrator {
         });
     }
 
+    /// Replace a node's voter-in-shards list. The orchestrator's
+    /// `register_node` is `or_insert`, so callers that need to
+    /// adjust the voter set after registration use this helper.
+    /// No-op if the node is unknown.
+    pub fn set_voters(&self, node_id: NodeId, voter_in_shards: Vec<u64>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rec) = inner.nodes.get_mut(&node_id) {
+            rec.voter_in_shards = voter_in_shards;
+            // If the node was already in Draining, refresh the total
+            // count so subsequent `record_voter_replaced` advances
+            // toward the new totals.
+            if rec.state == NodeState::Draining {
+                let total = u32::try_from(rec.voter_in_shards.len()).unwrap_or(0);
+                rec.drain_progress = Some(DrainProgress {
+                    total_shards: total,
+                    completed_shards: 0,
+                });
+            }
+        }
+    }
+
     /// Mark a node as `Draining` directly (used to set up the
     /// "node in Draining state" precondition for cancel scenarios).
     pub fn set_state(&self, node_id: NodeId, state: NodeState) {

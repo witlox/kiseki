@@ -325,6 +325,15 @@ pub struct KisekiWorld {
     /// Per-scenario monotonic clock so cache TTL tests are deterministic.
     pub pnfs_clock_ms: u64,
 
+    // === Drain orchestration extras (multi-node-raft.feature drain
+    //     scenarios — operational.rs `n1` patterns + this `node-1`
+    //     naming use the same `world.drain_orch`).
+    /// Shard name → owning node name. Drives the leadership-transfer
+    /// assertions; the Raft test cluster doesn't expose per-shard
+    /// "leader of which logical shard" so we maintain a small map
+    /// here.
+    pub shard_leaders: HashMap<String, String>,
+
     // === pNFS Phase 15d (TopologyEventBus) ===
     /// Topology event bus under test.
     pub topology_bus: Option<std::sync::Arc<kiseki_control::topology_events::TopologyEventBus>>,
@@ -586,6 +595,7 @@ impl KisekiWorld {
             pnfs_mds_mgr: None,
             pnfs_last_layout: None,
             pnfs_clock_ms: 1_000_000,
+            shard_leaders: HashMap::new(),
             topology_bus: None,
             topology_sub: None,
             telemetry_bus,
