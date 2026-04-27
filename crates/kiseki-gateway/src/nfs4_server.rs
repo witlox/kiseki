@@ -56,6 +56,16 @@ pub mod op {
     pub const GETDEVICEINFO: u32 = 47;
     pub const SEQUENCE: u32 = 53;
     pub const IO_ADVISE: u32 = 63;
+    // RFC 7862 v4.2 ops kiseki recognizes (mostly stubs that emit
+    // typed errors; the wire surface area must reach a per-op handler
+    // so the dispatcher can return spec-aligned status codes per
+    // §15.5 instead of catch-all NFS4ERR_NOTSUPP / OP_ILLEGAL).
+    pub const ALLOCATE: u32 = 59;
+    pub const COPY: u32 = 60;
+    pub const DEALLOCATE: u32 = 62;
+    pub const LAYOUTERROR: u32 = 64;
+    pub const READ_PLUS: u32 = 68;
+    pub const SEEK: u32 = 69;
 }
 
 /// NFSv4 status codes.
@@ -70,7 +80,12 @@ pub mod nfs4_status {
     pub const NFS4ERR_BAD_STATEID: u32 = 10025;
     pub const NFS4ERR_DENIED: u32 = 10010;
     pub const NFS4ERR_NOFILEHANDLE: u32 = 10020;
+    pub const NFS4ERR_MINOR_VERS_MISMATCH: u32 = 10021;
+    pub const NFS4ERR_BADXDR: u32 = 10036;
+    pub const NFS4ERR_OP_ILLEGAL: u32 = 10044;
+    pub const NFS4ERR_BADIOMODE: u32 = 10049;
     pub const NFS4ERR_LAYOUTUNAVAILABLE: u32 = 10059;
+    pub const NFS4ERR_UNION_NOTSUPP: u32 = 10090;
 }
 
 /// NFSv4 session state.
@@ -276,7 +291,7 @@ fn dispatch_compound<G: GatewayOps>(
     sessions: &SessionManager,
 ) -> Vec<u8> {
     let _tag = reader.read_opaque().unwrap_or_default();
-    let _minor_version = reader.read_u32().unwrap_or(2);
+    let minor_version = reader.read_u32().unwrap_or(2);
     let num_ops = reader.read_u32().unwrap_or(0).min(32); // Cap at 32 ops (C-ADV-3).
 
     let mut op_results: Vec<Vec<u8>> = Vec::new();
@@ -286,6 +301,20 @@ fn dispatch_compound<G: GatewayOps>(
         saved_fh: None,
         current_stateid: None,
     };
+
+    // RFC 8881 §15.1 + RFC 7530 §13.1: kiseki implements minor
+    // versions 1 and 2 only. Anything else (including 0) is
+    // NFS4ERR_MINOR_VERS_MISMATCH for the entire COMPOUND, and the
+    // resarray is empty per §13.1.
+    if !matches!(minor_version, 1 | 2) {
+        compound_status = nfs4_status::NFS4ERR_MINOR_VERS_MISMATCH;
+        let mut w = XdrWriter::new();
+        encode_reply_accepted(&mut w, header.xid, 0);
+        w.write_u32(compound_status);
+        w.write_opaque(&[]); // tag
+        w.write_u32(0); // empty resarray
+        return w.into_bytes();
+    }
 
     for _ in 0..num_ops {
         let op_code = match reader.read_u32() {
@@ -355,11 +384,25 @@ fn process_op<G: GatewayOps>(
         op::LAYOUTGET => op_layoutget(reader, ctx, state),
         op::LAYOUTRETURN => op_layoutreturn(reader, ctx),
         op::GETDEVICEINFO => op_getdeviceinfo(reader, ctx),
-        _ => {
+        op::SEEK => op_seek(reader),
+        op::LAYOUTERROR => op_layouterror(reader),
+        // RFC 7862 v4.2 ops kiseki claims to recognize but does not
+        // implement — return NFS4ERR_NOTSUPP per §15.5 (the op is in
+        // the registry; we just don't do it).
+        op::ALLOCATE | op::COPY | op::DEALLOCATE | op::READ_PLUS => {
             let mut w = XdrWriter::new();
             w.write_u32(op_code);
             w.write_u32(nfs4_status::NFS4ERR_NOTSUPP);
             (nfs4_status::NFS4ERR_NOTSUPP, w.into_bytes())
+        }
+        // RFC 8881 §13.1 + §16.2.4: an op code outside the registry
+        // is NFS4ERR_OP_ILLEGAL. NFS4ERR_NOTSUPP is reserved for
+        // registered-but-unimplemented ops (see arms above).
+        _ => {
+            let mut w = XdrWriter::new();
+            w.write_u32(op_code);
+            w.write_u32(nfs4_status::NFS4ERR_OP_ILLEGAL);
+            (nfs4_status::NFS4ERR_OP_ILLEGAL, w.into_bytes())
         }
     }
 }
@@ -512,8 +555,11 @@ fn op_getfh(state: &CompoundState) -> (u32, Vec<u8>) {
             (nfs4_status::NFS4_OK, w.into_bytes())
         }
         None => {
-            w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
-            (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes())
+            // RFC 8881 §18.8.4: GETFH with no current_fh is
+            // NFS4ERR_NOFILEHANDLE. BADHANDLE is for "the handle you
+            // sent is malformed", a distinct condition.
+            w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
+            (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes())
         }
     }
 }
@@ -533,16 +579,20 @@ fn op_getattr<G: GatewayOps>(
     w.write_u32(op::GETATTR);
 
     let Some(fh) = &state.current_fh else {
-        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
-        return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
+        // RFC 8881 §18.7.4: GETATTR without a current_fh is
+        // NFS4ERR_NOFILEHANDLE, not NFS4ERR_BADHANDLE.
+        w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
+        return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
     };
 
     let status = match ctx.getattr(fh) {
         Ok(attrs) => {
             w.write_u32(nfs4_status::NFS4_OK);
             // Simplified attribute response: bitmap + attr values.
+            // RFC 8881 §5.8.1: bit 1 = FATTR4_TYPE, bit 4 = FATTR4_SIZE.
+            // word0 = (1<<1) | (1<<4) = 0x12.
             w.write_u32(2); // bitmap count
-            w.write_u32(0x0000_0018); // bitmap[0]: type + size
+            w.write_u32(0x0000_0012); // bitmap[0]: TYPE | SIZE
             w.write_u32(0); // bitmap[1]
                             // attr values (opaque)
             let mut attr_w = XdrWriter::new();
@@ -578,8 +628,10 @@ fn op_read<G: GatewayOps>(
     w.write_u32(op::READ);
 
     let Some(fh) = &state.current_fh else {
-        w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
-        return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
+        // RFC 8881 §18.22.4: READ with no current_fh is
+        // NFS4ERR_NOFILEHANDLE.
+        w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
+        return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
     };
 
     let status = match ctx.read(fh, offset, count) {
@@ -667,6 +719,57 @@ fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     w.write_u32(0); // no hints applied
 
     (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+/// SEEK (RFC 7862 §15.11) — kiseki does not implement file-data
+/// holes, so the op itself returns NFS4ERR_NOTSUPP. The wire shape
+/// is parsed only enough to validate the `sa_what` discriminant:
+/// per §15.5 + §11.11 a value outside `{SEEK4_DATA(0), SEEK4_HOLE(1)}`
+/// is NFS4ERR_UNION_NOTSUPP, distinct from "op not implemented".
+fn op_seek(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+    let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
+    let _offset = reader.read_u64().unwrap_or(0);
+    let sa_what = reader.read_u32().unwrap_or(0);
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::SEEK);
+    if sa_what > 1 {
+        w.write_u32(nfs4_status::NFS4ERR_UNION_NOTSUPP);
+        return (nfs4_status::NFS4ERR_UNION_NOTSUPP, w.into_bytes());
+    }
+    w.write_u32(nfs4_status::NFS4ERR_NOTSUPP);
+    (nfs4_status::NFS4ERR_NOTSUPP, w.into_bytes())
+}
+
+/// LAYOUTERROR (RFC 7862 §15.5) — kiseki does not yet act on
+/// device-level error reports. The wire shape is parsed enough to
+/// validate any layoutiomode4 value the client provides; per
+/// §15.5 with §11.6, an iomode outside the set
+/// {READ(1), RW(2), ANY(3)} is `NFS4ERR_BADIOMODE`, distinct from
+/// "op not implemented".
+fn op_layouterror(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+    let _offset = reader.read_u64().unwrap_or(0);
+    let _length = reader.read_u64().unwrap_or(0);
+    let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
+    let n_errors = reader.read_u32().unwrap_or(0);
+    for _ in 0..n_errors {
+        let _devid = reader.read_opaque_fixed(16);
+        let _status = reader.read_u32();
+        let _opnum = reader.read_u32();
+    }
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::LAYOUTERROR);
+    // Trailing iomode (the client may include one to surface the
+    // operation that failed); validate if present.
+    if let Ok(iomode) = reader.read_u32() {
+        if !(1..=3).contains(&iomode) {
+            w.write_u32(nfs4_status::NFS4ERR_BADIOMODE);
+            return (nfs4_status::NFS4ERR_BADIOMODE, w.into_bytes());
+        }
+    }
+    w.write_u32(nfs4_status::NFS4ERR_NOTSUPP);
+    (nfs4_status::NFS4ERR_NOTSUPP, w.into_bytes())
 }
 
 /// LAYOUTGET (RFC 5661 §18.43, RFC 8435 §5.1) — return pNFS layout
@@ -1393,10 +1496,20 @@ fn op_commit() -> (u32, Vec<u8>) {
 }
 
 fn op_putfh(reader: &mut XdrReader<'_>, state: &mut CompoundState) -> (u32, Vec<u8>) {
-    let fh_bytes = reader.read_opaque().unwrap_or_default();
-
     let mut w = XdrWriter::new();
     w.write_u32(op::PUTFH);
+
+    // RFC 8881 §13.1: a truncated op body — here, the nfs_fh4 opaque
+    // is missing entirely — is NFS4ERR_BADXDR, NOT NFS4ERR_BADHANDLE.
+    // The previous `unwrap_or_default()` masked the wire fault as
+    // an empty file-handle, conflating two distinct error semantics.
+    let fh_bytes = match reader.read_opaque() {
+        Ok(b) => b,
+        Err(_) => {
+            w.write_u32(nfs4_status::NFS4ERR_BADXDR);
+            return (nfs4_status::NFS4ERR_BADXDR, w.into_bytes());
+        }
+    };
 
     let status = if fh_bytes.len() == 32 {
         let mut fh = [0u8; 32];
@@ -1727,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn getattr_no_filehandle_returns_badhandle() {
+    fn getattr_no_filehandle_returns_nofilehandle() {
         let ctx = test_ctx();
         let state = CompoundState {
             current_fh: None,
@@ -1741,7 +1854,9 @@ mod tests {
         let mut reader = XdrReader::new(&body_bytes);
 
         let (status, _) = op_getattr(&mut reader, &ctx, &state);
-        assert_eq!(status, nfs4_status::NFS4ERR_BADHANDLE);
+        // RFC 8881 §18.7.4: GETATTR with no current_fh is NOFILEHANDLE,
+        // not BADHANDLE.
+        assert_eq!(status, nfs4_status::NFS4ERR_NOFILEHANDLE);
     }
 
     // ---------- WRITE (§18.38) ----------

@@ -295,9 +295,9 @@ is updated in the same commit as the test/fix landings.
 | T-03 | RFC 1057 | `crates/kiseki-gateway/tests/rfc1057.rs` | ✅ | 0 of 15 RED — Group I closed 2026-04-27 |
 | T-04 | RPCSEC_GSS family | `crates/kiseki-gateway/tests/rpcsec_gss.rs` | ✅ | 0 of 3 RED (canonical reject path documented) |
 | T-05 | RFC 1813 | `crates/kiseki-gateway/tests/rfc1813.rs` | ✅ | 2 of 12 RED |
-| T-06 | RFC 7530 | `crates/kiseki-gateway/tests/rfc7530.rs` | ✅ | 1 of 7 RED |
-| T-07 | RFC 8881 | `crates/kiseki-gateway/tests/rfc8881.rs` | ✅ | 7 of 28 RED (BADHANDLE vs NOFILEHANDLE; NOTSUPP vs OP_ILLEGAL; getattr bitmap) |
-| T-08 | RFC 7862 | `crates/kiseki-gateway/tests/rfc7862.rs` | ✅ | 2 of 12 RED |
+| T-06 | RFC 7530 | `crates/kiseki-gateway/tests/rfc7530.rs` | ✅ | 0 of 7 RED — Group II closed 2026-04-27 |
+| T-07 | RFC 8881 | `crates/kiseki-gateway/tests/rfc8881.rs` | ✅ | 0 of 28 RED — Group II closed 2026-04-27 |
+| T-08 | RFC 7862 | `crates/kiseki-gateway/tests/rfc7862.rs` | ✅ | 0 of 12 RED — Group II closed 2026-04-27 |
 | T-09 | RFC 8435 | `crates/kiseki-gateway/tests/rfc8435.rs` | ✅ | 1 of 20 RED (ffl_flags FF_FLAGS_NO_LAYOUTCOMMIT) |
 | T-10 | RFC 5665 | `crates/kiseki-gateway/tests/rfc5665.rs` | ✅ | 1 of 14 RED (IPv6 form) |
 | T-11 | RFC 9289 | `crates/kiseki-gateway/tests/rfc9289.rs` | ✅ | 1 of 11 RED (no keep-alive timer) |
@@ -328,7 +328,7 @@ is updated in the same commit as the test/fix landings.
 | Group | Files | Status |
 |---|---|---|
 | I — Foundation | `nfs_xdr.rs`, `nfs_auth.rs` | ✅ — strict bool/opaque pad; `OpaqueAuth` w/ §8.2 400-byte cap; `AuthSysParams::decode` enforcing machinename≤255 + gids≤16 (2026-04-27) |
-| II — NFSv4 family | `nfs4_server.rs` | 🟡 (NULL + EXCHANGE_ID landed; rest pending) |
+| II — NFSv4 family | `nfs4_server.rs` | ✅ — minor-vers validation; OP_ILLEGAL/NOTSUPP/BADXDR distinctions; NOFILEHANDLE for missing current_fh; getattr bitmap fix; SEEK + LAYOUTERROR stubs (2026-04-27) |
 | III — pNFS | `pnfs.rs`, `pnfs_ds_server.rs`, `nfs4_server.rs::op_layoutget_ff` | ❌ |
 | IV — NFS transport | `nfs_server.rs` | ❌ |
 | V — NFSv3 | `nfs3_server.rs` | ❌ |
