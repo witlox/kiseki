@@ -483,6 +483,13 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                 stripe_size_bytes: cfg.pnfs.stripe_size_bytes,
                 rt: tokio::runtime::Handle::current(),
                 now_ms: Arc::new(kiseki_gateway::pnfs_ds_server::default_now_ms),
+                // Phase 15c: a wired MDS layout manager would be
+                // shared here so the DS consults the recall list. Not
+                // yet wired in single-node bootstrap — the production
+                // perf cluster picks up Phase 15c via the gateway's
+                // `MdsLayoutManager` once it's threaded through the
+                // gateway's NfsContext (Phase 15c.1, follow-up).
+                mds_layout_manager: None,
             });
             let ds_tls_for_thread = nfs_tls.clone();
             std::thread::spawn(move || {

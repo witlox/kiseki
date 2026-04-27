@@ -391,11 +391,38 @@ pub fn host_port_to_uaddr(host_port: &str) -> String {
 pub struct MdsLayoutManager {
     inner: std::sync::Mutex<MdsLayoutInner>,
     config: MdsLayoutConfig,
-    mac_key: PnfsFhMacKey,
+    mac_key: std::sync::RwLock<PnfsFhMacKey>,
 }
 
 struct MdsLayoutInner {
     cache: std::collections::HashMap<CompositionId, ServerLayout>,
+    /// Recently-revoked fh4 MAC fingerprints (Phase 15c). DS PUTFH
+    /// consults this set before MAC validation — entries here cause
+    /// `NFS4ERR_BADHANDLE` even if the fh4's MAC and expiry are still
+    /// valid against the current `K_layout`.
+    ///
+    /// Entries are added on LAYOUTRECALL and pruned by `sweep_revoked()`
+    /// when their expiry passes (the underlying fh4 is dead anyway).
+    revoked: std::collections::HashMap<[u8; 16], u64>,
+    /// Append-only log of recall events fired by the bus subscriber.
+    /// Each entry records the reason, composition (when relevant), and
+    /// HLC ms-since-epoch. The Phase 15c BDD scenarios assert SLA
+    /// against this log.
+    recall_log: Vec<RecallRecord>,
+}
+
+/// One entry in the recall log.
+#[derive(Clone, Debug)]
+pub struct RecallRecord {
+    /// Why the recall fired.
+    pub reason: RecallReason,
+    /// Affected composition (None for cluster-wide events like key rotation).
+    pub composition: Option<CompositionId>,
+    /// HLC ms at which the underlying topology event committed.
+    pub event_hlc_ms: u64,
+    /// HLC ms at which the recall was sent — `recall_hlc_ms - event_hlc_ms`
+    /// gauges I-PN5's 1-sec SLA.
+    pub recall_hlc_ms: u64,
 }
 
 /// Tunables for [`MdsLayoutManager`]. Defaults match ADR-038 §D9.
@@ -429,10 +456,50 @@ impl MdsLayoutManager {
         Self {
             inner: std::sync::Mutex::new(MdsLayoutInner {
                 cache: std::collections::HashMap::new(),
+                revoked: std::collections::HashMap::new(),
+                recall_log: Vec::new(),
             }),
             config,
-            mac_key,
+            mac_key: std::sync::RwLock::new(mac_key),
         }
+    }
+
+    /// Read access to the live MAC key. Used by the DS to validate
+    /// fh4s and by tests that mint synthetic handles.
+    #[must_use]
+    pub fn current_mac_key(&self) -> PnfsFhMacKey {
+        self.mac_key
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Rotate `K_layout`. After this returns, every fh4 minted under
+    /// the previous key fails MAC validation, so the DS rejects them
+    /// with `NFS4ERR_BADHANDLE`. Records a `KeyRotation` recall in the
+    /// log and clears the layout cache (subsequent LAYOUTGETs mint
+    /// fresh fh4s under the new key).
+    pub fn rotate_mac_key(&self, new_key: PnfsFhMacKey, event_hlc_ms: u64, now_ms: u64) {
+        // Replace the key first — no need to atomically pair this with
+        // cache flush, since fh4s minted under the old key already
+        // would not match the new key after this point.
+        *self
+            .mac_key
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_key;
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.cache.clear();
+        // No need to populate `revoked` — old MACs already fail
+        // validation against the new key.
+        inner.recall_log.push(RecallRecord {
+            reason: RecallReason::KeyRotation,
+            composition: None,
+            event_hlc_ms,
+            recall_hlc_ms: now_ms,
+        });
     }
 
     /// LAYOUTGET — RFC 5661 §18.43. Returns a `ServerLayout` covering
@@ -478,6 +545,7 @@ impl MdsLayoutManager {
         let end = offset.saturating_add(length).max(stripe_size); // at least 1 stripe
         let expiry_ms = now_ms.saturating_add(self.config.layout_ttl_ms);
 
+        let key = self.current_mac_key();
         while pos < end {
             let seg_len = stripe_size.min(end.saturating_sub(pos));
             let stripe_index_u64 = pos / stripe_size;
@@ -486,7 +554,7 @@ impl MdsLayoutManager {
                 % num_nodes;
             let stripe_index = u32::try_from(stripe_index_u64).unwrap_or(u32::MAX);
             let fh = PnfsFileHandle::issue(
-                &self.mac_key,
+                &key,
                 tenant_id,
                 namespace_id,
                 composition_id,
@@ -605,6 +673,132 @@ impl MdsLayoutManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cache
             .len()
+    }
+
+    /// Has the given fh4's MAC been revoked by a recent recall? The DS
+    /// dispatcher consults this before MAC validation (Phase 15c).
+    #[must_use]
+    pub fn is_revoked(&self, fh: &PnfsFileHandle) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.revoked.contains_key(&fh.mac)
+    }
+
+    /// Recall every layout referencing `node_id` as a DS. Adds each
+    /// affected stripe's fh4 MAC to the revoked set, removes the
+    /// layout from the cache, and appends a recall log entry per
+    /// composition. Returns the number of layouts recalled.
+    pub fn recall_for_node(
+        &self,
+        node_id: kiseki_common::ids::NodeId,
+        ds_addr: &str,
+        event_hlc_ms: u64,
+        now_ms: u64,
+    ) -> usize {
+        let _ = node_id; // identity is captured in ds_addr for the bus payload
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let to_remove: Vec<CompositionId> = inner
+            .cache
+            .iter()
+            .filter(|(_, l)| l.stripes.iter().any(|s| s.ds_addr == ds_addr))
+            .map(|(k, _)| *k)
+            .collect();
+        let n = to_remove.len();
+        for comp in &to_remove {
+            if let Some(layout) = inner.cache.remove(comp) {
+                for stripe in &layout.stripes {
+                    inner.revoked.insert(stripe.fh.mac, stripe.fh.expiry_ms);
+                }
+                inner.recall_log.push(RecallRecord {
+                    reason: RecallReason::NodeDraining,
+                    composition: Some(*comp),
+                    event_hlc_ms,
+                    recall_hlc_ms: now_ms,
+                });
+            }
+        }
+        n
+    }
+
+    /// Recall the layout for a specific composition (used on
+    /// `CompositionDeleted`).
+    pub fn recall_composition(
+        &self,
+        comp: CompositionId,
+        reason: RecallReason,
+        event_hlc_ms: u64,
+        now_ms: u64,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(layout) = inner.cache.remove(&comp) else {
+            return false;
+        };
+        for stripe in &layout.stripes {
+            inner.revoked.insert(stripe.fh.mac, stripe.fh.expiry_ms);
+        }
+        inner.recall_log.push(RecallRecord {
+            reason,
+            composition: Some(comp),
+            event_hlc_ms,
+            recall_hlc_ms: now_ms,
+        });
+        true
+    }
+
+    /// Conservative recall covering every cached layout. Used on
+    /// `ShardSplit`/`ShardMerged` (no shard-keyed lookup yet) and on
+    /// subscriber lag (I-PN9).
+    pub fn recall_all(&self, reason: RecallReason, event_hlc_ms: u64, now_ms: u64) -> usize {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let comps: Vec<CompositionId> = inner.cache.keys().copied().collect();
+        let n = comps.len();
+        for comp in &comps {
+            if let Some(layout) = inner.cache.remove(comp) {
+                for stripe in &layout.stripes {
+                    inner.revoked.insert(stripe.fh.mac, stripe.fh.expiry_ms);
+                }
+                inner.recall_log.push(RecallRecord {
+                    reason,
+                    composition: Some(*comp),
+                    event_hlc_ms,
+                    recall_hlc_ms: now_ms,
+                });
+            }
+        }
+        n
+    }
+
+    /// Snapshot of the recall log (cloned).
+    #[must_use]
+    pub fn recall_log(&self) -> Vec<RecallRecord> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recall_log
+            .clone()
+    }
+
+    /// Drop revoked fh4 entries whose underlying expiry has passed —
+    /// they would be rejected on the expiry check anyway.
+    pub fn sweep_revoked(&self, now_ms: u64) -> usize {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = inner.revoked.len();
+        inner.revoked.retain(|_, expiry_ms| now_ms < *expiry_ms);
+        before - inner.revoked.len()
     }
 }
 

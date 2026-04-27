@@ -64,6 +64,23 @@ async fn when_delete(w: &mut KisekiWorld) {
             Ok(_) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
+        // Phase 15d (ADR-038 §D10): if a TopologyEventBus is wired,
+        // emit `CompositionDeleted` AFTER the underlying store commit.
+        // Production path will do this from the apply() callback in
+        // `kiseki-composition`; for now the BDD test wiring is here.
+        if let Some(bus) = w.topology_bus.clone() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+            let _ = bus.emit(
+                kiseki_control::topology_events::TopologyEvent::CompositionDeleted {
+                    tenant: w.nfs_ctx.tenant_id,
+                    namespace: w.nfs_ctx.namespace_id,
+                    composition: id,
+                    hlc_ms: now_ms,
+                },
+            );
+        }
     }
 }
 

@@ -66,6 +66,16 @@ pub struct DsContext<G: GatewayOps + Send + Sync + 'static> {
     /// Pluggable wall clock — `now_ms()`. Production passes
     /// `default_now_ms`; tests can substitute a fixed clock.
     pub now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Optional MDS-published recall list (Phase 15c). When set, the
+    /// DS consults `MdsLayoutManager::is_revoked` BEFORE MAC
+    /// validation; recalled fh4s return `NFS4ERR_BADHANDLE` even if
+    /// the MAC matches and the expiry has not elapsed.
+    ///
+    /// Single-node deployments share the same `Arc` with the MDS; in
+    /// multi-node deployments the production path will publish the
+    /// revoked set via the same `TopologyEventBus` that triggered the
+    /// recall (out of scope for Phase 15c).
+    pub mds_layout_manager: Option<Arc<crate::pnfs::MdsLayoutManager>>,
 }
 
 /// Default wall-clock source: `SystemTime::now()` truncated to ms.
@@ -303,7 +313,24 @@ fn op_putfh_ds<G: GatewayOps + Send + Sync + 'static>(
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    if let Err(err) = fh.validate(&ctx.mac_key, (ctx.now_ms)()) {
+    // Phase 15c: consult the MDS-published recall list before MAC
+    // validation. A revoked fh4 must fail even if MAC + expiry pass
+    // (I-PN1 + ADR-038 §D6).
+    if let Some(mgr) = ctx.mds_layout_manager.as_ref() {
+        if mgr.is_revoked(&fh) {
+            tracing::debug!("DS rejected revoked fh4");
+            w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
+            return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
+        }
+    }
+
+    // When the MDS rotated K_layout, ctx.mac_key is stale by design —
+    // the production path passes the live key via the manager.
+    let live_key = ctx
+        .mds_layout_manager
+        .as_ref()
+        .map_or_else(|| ctx.mac_key.clone(), |m| m.current_mac_key());
+    if let Err(err) = fh.validate(&live_key, (ctx.now_ms)()) {
         // Both MacMismatch and Expired map to BADHANDLE per I-PN1.
         let reason = match err {
             FhValidateError::MacMismatch => "mac_mismatch",
@@ -461,6 +488,7 @@ mod tests {
                     .clone()
             }),
             now_ms: fixed_clock(1_000),
+            mds_layout_manager: None,
         };
         (Arc::new(ctx), key)
     }
