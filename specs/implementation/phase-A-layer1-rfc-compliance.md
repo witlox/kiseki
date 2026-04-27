@@ -290,8 +290,8 @@ is updated in the same commit as the test/fix landings.
 
 | # | Spec | File | Written? | Tests RED? |
 |---|---|---|---|---|
-| T-01 | RFC 4506 | `crates/kiseki-gateway/tests/rfc4506.rs` | ❌ | — |
-| T-02 | RFC 5531 | `crates/kiseki-gateway/tests/rfc5531.rs` | ❌ | — |
+| T-01 | RFC 4506 | `crates/kiseki-gateway/tests/rfc4506.rs` | ✅ | 2 of 18 RED (boolean strict-check; opaque pad strict-check) |
+| T-02 | RFC 5531 | `crates/kiseki-gateway/tests/rfc5531.rs` | ✅ | 1 of 8 RED (opaque_auth 400-byte cap) |
 | T-03 | RFC 1057 | `crates/kiseki-gateway/tests/rfc1057.rs` | ❌ | — |
 | T-04 | RPCSEC_GSS family | `crates/kiseki-gateway/tests/rpcsec_gss.rs` | ❌ | — |
 | T-05 | RFC 1813 | `crates/kiseki-gateway/tests/rfc1813.rs` | ❌ | — |
