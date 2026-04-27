@@ -36,6 +36,11 @@ pub enum GatewayError {
         /// The shard that rejected the key.
         shard_id: ShardId,
     },
+
+    /// Write attempted on a read-only namespace. Maps to POSIX EROFS at
+    /// the FUSE/POSIX boundary (kiseki-client::fuse_fs).
+    #[error("namespace is read-only")]
+    ReadOnlyNamespace,
 }
 
 impl From<GatewayError> for KisekiError {

@@ -37,6 +37,10 @@ zeroize = { workspace = true }
 name = "kiseki-client"
 path = "src/bin/kiseki_client.rs"
 
+[[test]]
+name = "native_abi"
+required-features = ["ffi"]
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = "3"

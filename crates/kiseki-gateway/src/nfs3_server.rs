@@ -166,6 +166,14 @@ fn reply_getattr<G: GatewayOps>(
         }
     };
 
+    // RFC 1813 §2.6: a 32-byte handle that the server has never issued
+    // is NFS3ERR_BADHANDLE, distinct from NFS3ERR_NOENT (the path
+    // component doesn't exist) or NFS3ERR_IO (transient I/O failure).
+    if ctx.handles.lookup(&fh).is_none() {
+        w.write_u32(status::NFS3ERR_BADHANDLE);
+        return w.into_bytes();
+    }
+
     match ctx.getattr(&fh) {
         Ok(attrs) => {
             w.write_u32(status::NFS3_OK);
@@ -215,6 +223,14 @@ fn reply_read<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsCont
 
     let offset = reader.read_u64().unwrap_or(0);
     let count = reader.read_u32().unwrap_or(0);
+
+    // RFC 1813 §2.6 + §3.3.6: never-issued handle → NFS3ERR_BADHANDLE,
+    // not NFS3ERR_IO. NFS3ERR_IO is reserved for transient I/O faults
+    // on a recognized handle.
+    if ctx.handles.lookup(&fh).is_none() {
+        w.write_u32(status::NFS3ERR_BADHANDLE);
+        return w.into_bytes();
+    }
 
     match ctx.read(&fh, offset, count) {
         Ok(resp) => {

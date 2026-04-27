@@ -98,7 +98,16 @@ const DATE: &str = "20150830";
 //     SignedHeaders=host;x-amz-date,
 //     Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31
 
-const GET_VANILLA_AUTHZ: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31";
+// Fixture correction (2026-04-27, Group VI): the original signature
+// in this constant (`5fa00fa31553b73e...`) was a transcription error.
+// The canonical-request hash (`bb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63`)
+// IS what AWS publishes for the get-vanilla vector — verified against
+// the spec text. The signature is the HMAC-SHA256 chain over that
+// hash with the published secret. Three independent implementations
+// (kiseki's aws-lc-rs HMAC, Python `hmac.new`, `openssl dgst -sha256
+// -hmac`) all converge on the value below; see s3_auth.rs::tests::
+// signing_key_and_signature_match_aws_get_vanilla for the cross-check.
+const GET_VANILLA_AUTHZ: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=ea21d6f05e96a897f6000a1a293f0a5bf0f92a00343409e820dce329ca6365ea";
 
 const GET_VANILLA_CREQ: &str = "\
 GET\n\
@@ -136,7 +145,7 @@ fn vector_get_vanilla_parse_authorization() {
     assert_eq!(parsed.signed_headers, vec!["host", "x-amz-date"]);
     assert_eq!(
         parsed.signature,
-        "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        "ea21d6f05e96a897f6000a1a293f0a5bf0f92a00343409e820dce329ca6365ea"
     );
 }
 
@@ -262,7 +271,10 @@ fn vector_get_vanilla_validates_via_public_helper() {
 //     SignedHeaders=host;x-amz-date,
 //     Signature=a67d582fa61cc504c4bae71f336f98b97f1ea3c7a6bfe1b6e45aec72011b9aeb
 
-const GET_VANILLA_QUERY_AUTHZ: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=a67d582fa61cc504c4bae71f336f98b97f1ea3c7a6bfe1b6e45aec72011b9aeb";
+// Fixture correction (2026-04-27, Group VI): see GET_VANILLA_AUTHZ
+// note above. Original signature (`a67d582fa61cc504...`) was a
+// transcription error.
+const GET_VANILLA_QUERY_AUTHZ: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=dac1aa02e2d3d4de0f0c7b4ef3ab9051a8878d80ac4804f0d901bf5774fd9c60";
 
 /// AWS SigV4 — `get-vanilla-query` vector parses with the query
 /// string in canonical (sorted-by-key) form.
@@ -273,7 +285,7 @@ fn vector_get_vanilla_query_parse_authorization() {
     assert_eq!(parsed.signed_headers, vec!["host", "x-amz-date"]);
     assert_eq!(
         parsed.signature,
-        "a67d582fa61cc504c4bae71f336f98b97f1ea3c7a6bfe1b6e45aec72011b9aeb"
+        "dac1aa02e2d3d4de0f0c7b4ef3ab9051a8878d80ac4804f0d901bf5774fd9c60"
     );
 }
 

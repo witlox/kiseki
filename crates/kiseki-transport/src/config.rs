@@ -149,7 +149,25 @@ impl TlsConfig {
             .map_err(|e| TransportError::ConfigError(format!("key PEM parse: {e}")))?
             .ok_or_else(|| TransportError::ConfigError("no private key found".into()))?;
 
-        rustls::ServerConfig::builder()
+        // ADR-038 §D4.1 / RFC 8446 §B.4 — restrict to TLS 1.3 only.
+        // The mainline NFS-over-TLS path targets kernel 6.5+ which
+        // negotiates TLS 1.3 exclusively; allowing TLS 1.2 would
+        // expose us to the legacy cipher-suite surface (CBC-mode
+        // suites etc.) for no compatibility benefit.
+        //
+        // Belt and suspenders: filter the CryptoProvider's
+        // `cipher_suites` to TLS 1.3 only AND pass `&[TLS13]` to
+        // `with_protocol_versions`. The provider filter is the
+        // load-bearing one (it removes the suites entirely so a
+        // misconfigured peer can't even propose them); the version
+        // filter pins the ClientHello supported_versions extension.
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider
+            .cipher_suites
+            .retain(|cs| cs.version() == &rustls::version::TLS13);
+        rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| TransportError::ConfigError(format!("tls 1.3-only: {e}")))?
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(server_certs, key)
             .map_err(|e| TransportError::ConfigError(format!("server config: {e}")))

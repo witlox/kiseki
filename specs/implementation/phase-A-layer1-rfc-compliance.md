@@ -294,26 +294,27 @@ is updated in the same commit as the test/fix landings.
 | T-02 | RFC 5531 | `crates/kiseki-gateway/tests/rfc5531.rs` | ✅ | 0 of 8 RED — Group I closed 2026-04-27 |
 | T-03 | RFC 1057 | `crates/kiseki-gateway/tests/rfc1057.rs` | ✅ | 0 of 15 RED — Group I closed 2026-04-27 |
 | T-04 | RPCSEC_GSS family | `crates/kiseki-gateway/tests/rpcsec_gss.rs` | ✅ | 0 of 3 RED (canonical reject path documented) |
-| T-05 | RFC 1813 | `crates/kiseki-gateway/tests/rfc1813.rs` | ✅ | 2 of 12 RED |
+| T-05 | RFC 1813 | `crates/kiseki-gateway/tests/rfc1813.rs` | ✅ | 0 of 12 RED — Group V closed 2026-04-27 |
 | T-06 | RFC 7530 | `crates/kiseki-gateway/tests/rfc7530.rs` | ✅ | 0 of 7 RED — Group II closed 2026-04-27 |
 | T-07 | RFC 8881 | `crates/kiseki-gateway/tests/rfc8881.rs` | ✅ | 0 of 28 RED — Group II closed 2026-04-27 |
 | T-08 | RFC 7862 | `crates/kiseki-gateway/tests/rfc7862.rs` | ✅ | 0 of 12 RED — Group II closed 2026-04-27 |
 | T-09 | RFC 8435 | `crates/kiseki-gateway/tests/rfc8435.rs` | ✅ | 0 of 20 RED — Group III closed 2026-04-27 |
 | T-10 | RFC 5665 | `crates/kiseki-gateway/tests/rfc5665.rs` | ✅ | 0 of 14 RED — Group III closed 2026-04-27 |
-| T-11 | RFC 9289 | `crates/kiseki-gateway/tests/rfc9289.rs` | ✅ | 1 of 11 RED (no keep-alive timer) |
-| T-12 | RFC 9110/9111/9112 | `crates/kiseki-gateway/tests/rfc9110.rs` | ✅ | 6 of 19 RED (Range ignored; conditional headers) |
+| T-11 | RFC 9289 | `crates/kiseki-gateway/tests/rfc9289.rs` | ✅ | 0 of 11 RED — Group IV closed 2026-04-27 |
+| T-12 | RFC 9110/9111/9112 | `crates/kiseki-gateway/tests/rfc9110.rs` | ✅ | 0 of 19 RED — Group VI closed 2026-04-27 |
 | T-13 | RFC 3986 | `crates/kiseki-gateway/tests/rfc3986.rs` | ✅ | 0 of 11 RED |
-| T-14 | RFC 6838 | `crates/kiseki-gateway/tests/rfc6838.rs` | ✅ | 1 of 5 RED (Content-Type not echoed) |
+| T-14 | RFC 6838 | `crates/kiseki-gateway/tests/rfc6838.rs` | ✅ | 0 of 5 RED — Group VI closed 2026-04-27 |
 | T-15 | RFC 7578 | `crates/kiseki-gateway/tests/rfc7578.rs` | ✅ | 0 of 4 (skeleton — multipart not implemented) |
-| T-16 | RFC 8446 | `crates/kiseki-transport/tests/rfc8446_contract.rs` | ✅ | 2 of 9 RED (CRITICAL: WebPkiClientVerifier mTLS bypass risk) |
-| T-17 | AWS SigV4 | `crates/kiseki-gateway/tests/aws_sigv4.rs` | ✅ | 2 of 9 RED (canonical-request grammar) |
-| T-18 | AWS S3 REST | `crates/kiseki-gateway/tests/aws_s3.rs` | ✅ | 2 of 11 RED (XML error responses) |
-| T-19 | POSIX.1-2024 | `crates/kiseki-client/tests/posix_semantics.rs` | ✅ | 1 of 22 RED (EROFS mapping) |
+| T-16 | RFC 8446 | `crates/kiseki-transport/tests/rfc8446_contract.rs` | ✅ | 0 of 10 RED — Group VII closed 2026-04-27. CRITICAL finding from Stage 1 (mTLS bypass) was a FALSE POSITIVE: original test panicked on `connect().Ok` but TLS 1.3 alerts can race with handshake completion; hardened test verifies authoritative bytes-cross-channel boundary. Direct verifier-layer test added as regression guard. TLS 1.3-only cipher-suite restriction landed in production. |
+| T-17 | AWS SigV4 | `crates/kiseki-gateway/tests/aws_sigv4.rs` | ✅ | 0 of 9 RED — Group VI closed 2026-04-27 (fixture corrected; canonical-request matches AWS-published) |
+| T-18 | AWS S3 REST | `crates/kiseki-gateway/tests/aws_s3.rs` | ✅ | 0 of 11 RED — Group VI closed 2026-04-27 (XML error responses via s3_error_response) |
+| T-19 | POSIX.1-2024 | `crates/kiseki-client/tests/posix_semantics.rs` | ✅ | 0 of 22 RED — Group VIII closed 2026-04-27 (EROFS mapping) |
 | T-20 | Linux FUSE | `crates/kiseki-client/tests/fuse_linux.rs` | ✅ | 0 of 15 RED |
 | T-21 | macOS osxfuse | `crates/kiseki-client/tests/fuse_macos.rs` | ✅ | 0 of 5 RED (cfg-gated) |
-| T-22 | gRPC | `crates/kiseki-proto/tests/grpc_contract.rs` | ✅ | 0 of 12 RED |
-| T-23 | Raft RPC | `crates/kiseki-raft/tests/raft_wire.rs` | ✅ | 0 of 15 RED |
-| T-24 | FIPS usage | `crates/kiseki-crypto/tests/fips_usage.rs` | ✅ | 0 of 12 RED |
+| T-25 | Native client + C FFI ABI (no RFC; representative variant) | `crates/kiseki-client/tests/native_abi.rs` | ✅ | 0 of 4 RED — Group VIII addendum 2026-04-27 (caught by user) |
+| T-22 | gRPC | `crates/kiseki-proto/tests/grpc_contract.rs` | ✅ | 0 of 12 RED — Group IX closed 2026-04-27 |
+| T-23 | Raft RPC | `crates/kiseki-raft/tests/raft_wire.rs` | ✅ | 0 of 15 RED — Group IX closed 2026-04-27 |
+| T-24 | FIPS usage | `crates/kiseki-crypto/tests/fips_usage.rs` | ✅ | 0 of 12 RED — Group IX closed 2026-04-27 |
 
 **Stage 1 totals**: 24 of 24 files written; ~32 RED across the suite. Critical findings:
 - **T-16 RFC 8446** — `WebPkiClientVerifier` may accept unrelated CA-signed
@@ -330,12 +331,12 @@ is updated in the same commit as the test/fix landings.
 | I — Foundation | `nfs_xdr.rs`, `nfs_auth.rs` | ✅ — strict bool/opaque pad; `OpaqueAuth` w/ §8.2 400-byte cap; `AuthSysParams::decode` enforcing machinename≤255 + gids≤16 (2026-04-27) |
 | II — NFSv4 family | `nfs4_server.rs` | ✅ — minor-vers validation; OP_ILLEGAL/NOTSUPP/BADXDR distinctions; NOFILEHANDLE for missing current_fh; getattr bitmap fix; SEEK + LAYOUTERROR stubs (2026-04-27) |
 | III — pNFS | `pnfs.rs`, `pnfs_ds_server.rs`, `nfs4_server.rs::op_layoutget_ff` | ✅ — `host_port_to_uaddr` bracketed IPv6 (`[::1]:2049` → `::1.8.1`); `ff_ioflags4` advertises `FF_FLAGS_NO_LAYOUTCOMMIT` (2026-04-27) |
-| IV — NFS transport | `nfs_server.rs` | ❌ |
-| V — NFSv3 | `nfs3_server.rs` | ❌ |
-| VI — S3 stack | `s3_server.rs`, `s3_auth.rs` | ❌ |
-| VII — TLS contract | `kiseki-transport/src/tcp_tls.rs` | ❌ |
-| VIII — FUSE | `fuse_fs.rs`, `fuse_daemon.rs` | ❌ |
-| IX — Internal | `kiseki-proto`, `kiseki-raft`, `kiseki-crypto` | ❌ |
+| IV — NFS transport | `nfs_server.rs` | ✅ — TCP keep-alive on accepted sockets at RFC 9289 §4.2 60-sec cadence (2026-04-27) |
+| V — NFSv3 | `nfs3_server.rs` | ✅ — never-issued handle pre-check returns BADHANDLE before ctx.getattr/ctx.read (2026-04-27) |
+| VI — S3 stack | `s3_server.rs`, `s3_auth.rs` | ✅ — Range/conditional headers; XML error bodies; Content-Type round-trip; SigV4 implementation cross-checked vs Python+OpenSSL (test fixture corrected) (2026-04-27) |
+| VII — TLS contract | `kiseki-transport/src/config.rs` | ✅ — TLS 1.3-only via cipher-suite filter + `with_protocol_versions(&[TLS13])`; mTLS chain validation verified directly + authoritatively (2026-04-27) |
+| VIII — FUSE / native client | `fuse_fs.rs`, `fuse_daemon.rs`, `ffi.rs` | ✅ — EROFS mapping via typed gateway error; native ABI Layer-1 (T-25) added per user request (2026-04-27) |
+| IX — Internal | `kiseki-proto`, `kiseki-raft`, `kiseki-crypto` | ✅ — Stage 1 tests already at 0 RED; catalog rows updated to ✅ (2026-04-27) |
 
 ## Definition of Done for Phase A
 

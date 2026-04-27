@@ -416,6 +416,17 @@ impl GatewayOps for InMemoryGateway {
 
     #[allow(clippy::too_many_lines)]
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
+        // POSIX/NFS read-only namespace gate (POSIX.1-2024 EROFS,
+        // NFS3ERR_ROFS, NFSv4 NFS4ERR_ROFS). Performed before any
+        // crypto/storage work so the rejection is cheap and uniform.
+        {
+            let comps = self.compositions.lock().await;
+            if let Some(ns) = comps.namespace(req.namespace_id) {
+                if ns.read_only {
+                    return Err(GatewayError::ReadOnlyNamespace);
+                }
+            }
+        }
         // Compute content-addressed chunk ID.
         let chunk_id = derive_chunk_id(
             &req.data,

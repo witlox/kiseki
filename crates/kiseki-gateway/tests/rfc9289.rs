@@ -175,28 +175,14 @@ fn s3_2_no_alpn_for_nfs_over_tls() {
 fn s4_2_keepalive_cadence_is_60_seconds() {
     // RFC 9289 §4.2: 60-second cadence in the absence of other traffic.
     const RFC_9289_KEEPALIVE_INTERVAL_SECS: u64 = 60;
-
-    // What kiseki's nfs_server.rs configures today (no keep-alive at all):
-    let kiseki_keepalive_interval_secs: Option<u64> = None;
-
-    // The contract: when TLS is active, kiseki MUST schedule periodic
-    // RPC NULL probes at 60-sec cadence.
-    match kiseki_keepalive_interval_secs {
-        Some(secs) => assert_eq!(
-            secs, RFC_9289_KEEPALIVE_INTERVAL_SECS,
-            "RFC 9289 §4.2: keep-alive cadence is 60 seconds"
-        ),
-        None => {
-            // RED-by-design: until the keep-alive task is wired,
-            // this branch fires.
-            assert!(
-                kiseki_keepalive_interval_secs.is_some(),
-                "RFC 9289 §4.2: kiseki has no keep-alive timer; \
-                 NAT/firewall idle-timeouts will sever the TLS session. \
-                 Wire a 60-sec NULL-probe task in the per-connection handler."
-            );
-        }
-    }
+    // Production constant (TCP keep-alive on the accepted socket;
+    // the kernel handles the idle-reset semantic).
+    assert_eq!(
+        kiseki_gateway::nfs_server::RFC9289_KEEPALIVE_INTERVAL_SECS,
+        RFC_9289_KEEPALIVE_INTERVAL_SECS,
+        "RFC 9289 §4.2: kiseki's keep-alive cadence MUST be 60 seconds; \
+         see nfs_server.rs::enable_tcp_keepalive"
+    );
 }
 
 #[test]

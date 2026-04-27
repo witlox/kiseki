@@ -70,7 +70,7 @@ For each spec below:
 
 | Spec | Owner | Decoder | Coverage | Critical |
 |---|---|---|---|---|
-| **RFC 1813** — NFSv3 protocol (procedure-based) | `kiseki-gateway` (`nfs3_server.rs`) | `crates/kiseki-gateway/tests/rfc1813.rs` | ❌ — happy-path only | Y for NFSv3 mounts |
+| **RFC 1813** — NFSv3 protocol (procedure-based) | `kiseki-gateway` (`nfs3_server.rs`) | `crates/kiseki-gateway/tests/rfc1813.rs` | ✅ — Group V 2026-04-27: never-issued 32-byte handle → BADHANDLE (was IO/NOENT) | Y for NFSv3 mounts |
 | **RFC 7530** — NFSv4.0 (substrate for 4.1/4.2) | `kiseki-gateway` (`nfs4_server.rs`) | `crates/kiseki-gateway/tests/rfc7530.rs` | ✅ — Group II 2026-04-27: minor=0 → MINOR_VERS_MISMATCH | N — kiseki advertises 4.1+, but a 4.0-only client probe must fall back cleanly |
 | **RFC 8881** — NFSv4.1 (sessions, EXCHANGE_ID, pNFS hooks). **Obsoletes RFC 5661.** Companion XDR: RFC 5662 + applicable errata. | `kiseki-gateway` (`nfs4_server.rs`) | `crates/kiseki-gateway/tests/rfc8881.rs` | ✅ — Group II 2026-04-27: NOFILEHANDLE vs BADHANDLE; OP_ILLEGAL vs NOTSUPP; BADXDR on truncation; minor-vers validation; bitmap word0 = TYPE\|SIZE | Y — the protocol Linux mount.nfs4 uses |
 | **RFC 7862** — NFSv4.2 (extends 5661/8881: ALLOCATE, DEALLOCATE, COPY, READ_PLUS, IO_ADVISE). Companion XDR: RFC 7863. | `kiseki-gateway` (`nfs4_server.rs`) | `crates/kiseki-gateway/tests/rfc7862.rs` | ✅ — Group II 2026-04-27: SEEK→UNION_NOTSUPP; LAYOUTERROR→BADIOMODE; v4.2 op-table coverage | Y for NFSv4.2 mounts |
@@ -78,29 +78,30 @@ For each spec below:
 | **RFC 5663** — pNFS Block Layout | n/a | n/a | ⛔ Rejected (ADR-038 §D1) | N |
 | **RFC 8154** — pNFS SCSI Layout | n/a | n/a | ⛔ Rejected (ADR-038 §D1) | N |
 | **RFC 5665** — Universal Address Format (`netaddr4`, `uaddr`) | `kiseki-gateway` (`pnfs.rs::host_port_to_uaddr`) | `crates/kiseki-gateway/tests/rfc5665.rs` | ✅ — Group III 2026-04-27: bracketed IPv6 form `[ipv6]:port` parsed correctly; tcp/tcp6 netid pinned | Y for pNFS GETDEVICEINFO |
-| **RFC 9289** — NFS-over-TLS (`xprtsec=mtls` handshake, keep-alives) | `kiseki-gateway` (`nfs_server.rs`, `pnfs_ds_server.rs`) | `crates/kiseki-gateway/tests/rfc9289.rs` | ❌ — Phase 15a default, no compliance tests | Y for production NFS |
+| **RFC 9289** — NFS-over-TLS (`xprtsec=mtls` handshake, keep-alives) | `kiseki-gateway` (`nfs_server.rs`, `pnfs_ds_server.rs`) | `crates/kiseki-gateway/tests/rfc9289.rs` | ✅ — Group IV 2026-04-27: TCP keep-alive at 60-sec cadence per §4.2 (kernel handles idle-reset) | Y for production NFS |
 
 ### S3 stack
 
 | Spec | Owner | Decoder | Coverage | Critical |
 |---|---|---|---|---|
-| **RFC 9110** — HTTP semantics (methods, headers, status codes, ETag §8.8.3, Range §14, conditional requests §13) | `kiseki-gateway` (`s3_server.rs`) | `crates/kiseki-gateway/tests/rfc9110.rs` | ❌ | Y for S3 PUT/GET/HEAD/conditional ops |
-| **RFC 9111** — HTTP caching (Cache-Control on responses) | `kiseki-gateway` | (folded into 9110) | ❌ | N — server-side; caches are tenant's concern |
-| **RFC 9112** — HTTP/1.1 syntax (chunked encoding, header line folding) | `kiseki-gateway` | (folded into 9110) | ❌ | Y — chunked uploads |
-| **RFC 3986** — URI generic syntax (percent-encoding) | `kiseki-gateway` (`s3_server.rs::path` parsing) | `crates/kiseki-gateway/tests/rfc3986.rs` | ❌ | Y — S3 keys with arbitrary bytes need correct encoding in path AND in SigV4 canonical request |
-| **RFC 6838** — Media Type Specifications | `kiseki-gateway` | (folded into 9110) | ❌ | N — Content-Type is opaque to us; just round-trip it |
-| **RFC 7578** — multipart/form-data (browser-based POST) | not implemented today | `crates/kiseki-gateway/tests/rfc7578.rs` (skeleton — flag if implementation lands) | ❌ | N for v1 of the perf cluster |
-| **RFC 8446** — TLS 1.3 (HTTPS for S3 + NFS-over-TLS) | `kiseki-transport` (delegates to rustls) | `crates/kiseki-transport/tests/rfc8446_contract.rs` | ❌ — we trust rustls, but pin our cipher-suite + ALPN choices | Y |
-| **AWS SigV4** — request signing (no IETF RFC; AWS published spec with official test vectors) | `kiseki-gateway` (`s3_auth.rs`) | `crates/kiseki-gateway/tests/aws_sigv4.rs` | ❌ — happy-path only; AWS publishes test vectors we should run | Y for any non-anonymous S3 |
-| **AWS S3 REST API** — bucket/object semantics, error codes, XML body shapes | `kiseki-gateway` (`s3_server.rs`) | `crates/kiseki-gateway/tests/aws_s3.rs` | ❌ | Y |
+| **RFC 9110** — HTTP semantics (methods, headers, status codes, ETag §8.8.3, Range §14, conditional requests §13) | `kiseki-gateway` (`s3_server.rs`) | `crates/kiseki-gateway/tests/rfc9110.rs` | ✅ — Group VI 2026-04-27: Range single-/suffix-/multi-range; 416 unsatisfiable; If-Modified-Since/If-Unmodified-Since 304/412 | Y for S3 PUT/GET/HEAD/conditional ops |
+| **RFC 9111** — HTTP caching (Cache-Control on responses) | `kiseki-gateway` | (folded into 9110) | 🟡 — server-side caching is opaque to us; ETag round-trip pinned via 9110 | N — server-side; caches are tenant's concern |
+| **RFC 9112** — HTTP/1.1 syntax (chunked encoding, header line folding) | `kiseki-gateway` | (folded into 9110) | 🟡 — chunked encoding handled by hyper transparently; surface tests in 9110 | Y — chunked uploads |
+| **RFC 3986** — URI generic syntax (percent-encoding) | `kiseki-gateway` (`s3_server.rs::path` parsing) | `crates/kiseki-gateway/tests/rfc3986.rs` | ✅ — Group VI 2026-04-27: percent-encoding round-trip + reserved/unreserved sets pinned (11 tests, 0 RED) | Y — S3 keys with arbitrary bytes need correct encoding in path AND in SigV4 canonical request |
+| **RFC 6838** — Media Type Specifications | `kiseki-gateway` | `crates/kiseki-gateway/tests/rfc6838.rs` | ✅ — Group VI 2026-04-27: Content-Type round-trip captured at PUT, echoed on GET | N — Content-Type is opaque to us; just round-trip it |
+| **RFC 7578** — multipart/form-data (browser-based POST) | not implemented today | `crates/kiseki-gateway/tests/rfc7578.rs` (skeleton — flag if implementation lands) | ❌ — explicitly not implemented; rejection path tested | N for v1 of the perf cluster |
+| **RFC 8446** — TLS 1.3 (HTTPS for S3 + NFS-over-TLS) | `kiseki-transport` (delegates to rustls) | `crates/kiseki-transport/tests/rfc8446_contract.rs` | ✅ — Group VII 2026-04-27: ServerConfig restricted to TLS 1.3 only (cipher-suite filter + protocol versions); WebPkiClientVerifier rejects rogue chains (verified directly + via authoritative bytes-cross-channel test) | Y |
+| **AWS SigV4** — request signing (no IETF RFC; AWS published spec with official test vectors) | `kiseki-gateway` (`s3_auth.rs`) | `crates/kiseki-gateway/tests/aws_sigv4.rs` | ✅ — Group VI 2026-04-27: canonical-request matches AWS-published bytes; HMAC chain cross-checked vs Python+OpenSSL; fixture corrected | Y for any non-anonymous S3 |
+| **AWS S3 REST API** — bucket/object semantics, error codes, XML body shapes | `kiseki-gateway` (`s3_server.rs`) | `crates/kiseki-gateway/tests/aws_s3.rs` | ✅ — Group VI 2026-04-27: NoSuchKey + BucketAlreadyExists XML body shapes via `s3_error_response` helper | Y |
 
 ### FUSE / native client
 
 | Spec | Owner | Decoder | Coverage | Critical |
 |---|---|---|---|---|
-| **POSIX.1-2024 (IEEE Std 1003.1-2024)** — file-system semantics (errno, stat fields, readdir, rename atomicity). Supersedes POSIX.1-2017. ADR-013 is the Kiseki-side scope. | `kiseki-client` (`fuse_fs.rs`) | `crates/kiseki-client/tests/posix_semantics.rs` | ❌ | Y — workloads break silently if our errno mapping is wrong |
-| **Linux FUSE protocol** (kernel `Documentation/filesystems/fuse.rst`) | `kiseki-client` (`fuse_daemon.rs`) | `crates/kiseki-client/tests/fuse_linux.rs` | ❌ — fuser library handles wire; we declare INIT capabilities | Y for native FUSE perf |
-| **macOS FUSE / osxfuse** (different op codes from Linux FUSE) | `kiseki-client` (`fuse_*.rs`) | `crates/kiseki-client/tests/fuse_macos.rs` | ❌ — gated behind macOS @slow | N for primary GCP perf path |
+| **POSIX.1-2024 (IEEE Std 1003.1-2024)** — file-system semantics (errno, stat fields, readdir, rename atomicity). Supersedes POSIX.1-2017. ADR-013 is the Kiseki-side scope. | `kiseki-client` (`fuse_fs.rs`) | `crates/kiseki-client/tests/posix_semantics.rs` | ✅ — Group VIII 2026-04-27: EROFS mapping via typed `GatewayError::ReadOnlyNamespace` + `gateway_err_to_errno` helper | Y — workloads break silently if our errno mapping is wrong |
+| **Linux FUSE protocol** (kernel `Documentation/filesystems/fuse.rst`) | `kiseki-client` (`fuse_daemon.rs`) | `crates/kiseki-client/tests/fuse_linux.rs` | ✅ — fuser library handles wire; INIT cap-flag declarations pinned (15 tests, 0 RED) | Y for native FUSE perf |
+| **macOS FUSE / osxfuse** (different op codes from Linux FUSE) | `kiseki-client` (`fuse_*.rs`) | `crates/kiseki-client/tests/fuse_macos.rs` | 🟡 — cfg-gated `target_os="macos"`; pinned divergent op-codes when run on macOS host | N for primary GCP perf path |
+| **Kiseki native client + C FFI ABI** — `kiseki_open/close/read/write/stat/stage/release/cache_stats` symbols + `KisekiStatus` discriminant + `KisekiCacheStats` struct layout consumed by Python (PyO3) and C++ wrappers. No IETF RFC; this row IS the representative variant. | `kiseki-client` (`ffi.rs`) | `crates/kiseki-client/tests/native_abi.rs` (gated `--features ffi`) | ✅ — Group VIII 2026-04-27 (added per user 2026-04-27): discriminant values pinned (`Ok=0..TimedOut=6`); `KisekiCacheStats` 10×u64 layout + field order verified via raw-pointer read-back | Y — wrapper bindings break on any rename/renumbering |
 
 ### Internal protocols
 
@@ -112,9 +113,9 @@ control both endpoints.
 
 | Spec | Owner | Decoder | Coverage | Critical |
 |---|---|---|---|---|
-| **gRPC + Protobuf** (gRPC over HTTP/2, schemas in `specs/architecture/proto/kiseki/v1/*.proto`) | `kiseki-proto` (build-script generated) | (schema enforcement at compile time via `tonic`/`prost`) | 🟡 — schema is enforced; semantic validation (e.g. all required fields populated, status code mapping) not pinned | Y — every cross-context call rides this |
-| **openraft / Raft RPC** (TCP framing for AppendEntries / Vote / InstallSnapshot) | `kiseki-raft` (`tcp_transport.rs`) | `crates/kiseki-raft/tests/raft_wire.rs` | ❌ — custom framing, no decoder tests | Y — Raft consensus is the consistency core |
-| **FIPS 140-2/3 cryptographic primitives** (AES-256-GCM, HKDF-SHA256, HMAC-SHA256 via `aws-lc-rs`) | `kiseki-crypto` | aws-lc-rs upstream FIPS-validated; pin our usage parameters | ✅ at primitive level (FIPS module certified); 🟡 at usage level (our key-derivation invariants need section tests) | Y |
+| **gRPC + Protobuf** (gRPC over HTTP/2, schemas in `specs/architecture/proto/kiseki/v1/*.proto`) | `kiseki-proto` (build-script generated) | `crates/kiseki-proto/tests/grpc_contract.rs` | ✅ — Group IX 2026-04-27: status-code mapping + reserved-tag invariants + service-method reservations pinned (12 tests, 0 RED) | Y — every cross-context call rides this |
+| **openraft / Raft RPC** (TCP framing for AppendEntries / Vote / InstallSnapshot) | `kiseki-raft` (`tcp_transport.rs`) | `crates/kiseki-raft/tests/raft_wire.rs` | ✅ — Group IX 2026-04-27: length-prefix framing + AppendEntries/Vote/InstallSnapshot round-trip serialization (15 tests, 0 RED) | Y — Raft consensus is the consistency core |
+| **FIPS 140-2/3 cryptographic primitives** (AES-256-GCM, HKDF-SHA256, HMAC-SHA256 via `aws-lc-rs`) | `kiseki-crypto` | `crates/kiseki-crypto/tests/fips_usage.rs` | ✅ — Group IX 2026-04-27: nonce uniqueness, HKDF info-string domain separation, key-purpose binding pinned (12 tests, 0 RED) at usage level; aws-lc-rs upstream FIPS-validated at primitive level | Y |
 
 ## Layer 1 contract — per spec, what "✅" requires
 

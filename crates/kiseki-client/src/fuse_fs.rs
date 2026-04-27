@@ -314,7 +314,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
                 namespace_id: self.namespace_id,
                 data,
             }))
-            .map_err(|_| libc_eio())?;
+            .map_err(|e| gateway_err_to_errno(&e))?;
 
         let ino = self.next_ino;
         self.next_ino += 1;
@@ -544,6 +544,21 @@ fn libc_eio() -> i32 {
 }
 fn libc_eisdir() -> i32 {
     21 // EISDIR
+}
+fn libc_erofs() -> i32 {
+    30 // EROFS — POSIX.1-2024 §<errno.h>; Linux ABI.
+}
+
+/// Map a `GatewayError` to a POSIX errno (Linux ABI).
+fn gateway_err_to_errno(e: &kiseki_gateway::error::GatewayError) -> i32 {
+    use kiseki_gateway::error::GatewayError;
+    match e {
+        GatewayError::ReadOnlyNamespace => libc_erofs(),
+        // Any other gateway failure surfaces as EIO at the FUSE
+        // boundary. Fine-grained mapping (ENOSPC, EACCES) is
+        // future work tracked by the POSIX semantics catalog row.
+        _ => libc_eio(),
+    }
 }
 
 #[cfg(test)]

@@ -5,12 +5,14 @@
 //! NFSv3 = version 3, NFSv4.x = version 4.
 
 use std::io;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use kiseki_common::ids::{NamespaceId, OrgId};
 use rustls::ServerConfig;
+use socket2::{SockRef, TcpKeepalive};
 
 use crate::nfs::NfsGateway;
 use crate::nfs3_server::handle_nfs3_connection;
@@ -18,6 +20,23 @@ use crate::nfs4_server::handle_nfs4_connection;
 use crate::nfs_ops::NfsContext;
 use crate::nfs_xdr::{read_rm_message, write_rm_message, RpcCallHeader, XdrReader};
 use crate::ops::GatewayOps;
+
+/// RFC 9289 §4.2 — recommended keep-alive cadence on a long-lived
+/// NFS-over-TLS session. The 60-second interval is the upper bound
+/// before NAT/firewall idle-timeouts can sever the TLS session in
+/// typical deployments.
+pub const RFC9289_KEEPALIVE_INTERVAL_SECS: u64 = 60;
+
+/// Configure TCP keep-alive on an accepted connection. Per RFC 9289
+/// §4.2 a 60-sec cadence is the default; the kernel handles the
+/// idle-reset semantic (it only fires after `time` seconds of
+/// idleness).
+fn enable_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(RFC9289_KEEPALIVE_INTERVAL_SECS))
+        .with_interval(Duration::from_secs(RFC9289_KEEPALIVE_INTERVAL_SECS));
+    SockRef::from(stream).set_tcp_keepalive(&ka)
+}
 
 /// Start the NFS TCP server supporting both NFSv3 and NFSv4.2.
 ///
@@ -106,6 +125,13 @@ pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
                 let tls = tls.clone();
                 thread::spawn(move || {
                     let _ = stream.set_nonblocking(false);
+                    if let Err(e) = enable_tcp_keepalive(&stream) {
+                        tracing::debug!(
+                            error = %e,
+                            peer = %peer,
+                            "TCP keep-alive setup failed (RFC 9289 §4.2)"
+                        );
+                    }
                     if let Some(tls_cfg) = tls {
                         match rustls::ServerConnection::new(tls_cfg) {
                             Ok(conn) => {
