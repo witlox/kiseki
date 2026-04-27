@@ -392,12 +392,17 @@ impl GatewayOps for InMemoryGateway {
             plaintext.extend_from_slice(&decrypted);
         }
 
+        // Pull Content-Type from the composition for RFC 6838 round-trip
+        // (ADV-PA-4: store-side metadata, not per-instance HashMap).
+        let content_type = comp.content_type.clone();
+
         // Apply offset/length.
         let start = usize::try_from(req.offset).unwrap_or(usize::MAX);
         if start >= plaintext.len() {
             return Ok(ReadResponse {
                 data: Vec::new(),
                 eof: true,
+                content_type,
             });
         }
         let length = usize::try_from(req.length).unwrap_or(usize::MAX);
@@ -411,7 +416,19 @@ impl GatewayOps for InMemoryGateway {
         Ok(ReadResponse {
             data: plaintext[start..end].to_vec(),
             eof,
+            content_type,
         })
+    }
+
+    async fn set_object_content_type(
+        &self,
+        composition_id: kiseki_common::ids::CompositionId,
+        content_type: Option<String>,
+    ) -> Result<(), GatewayError> {
+        let mut comps = self.compositions.lock().await;
+        comps
+            .set_content_type(composition_id, content_type)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
 
     #[allow(clippy::too_many_lines)]

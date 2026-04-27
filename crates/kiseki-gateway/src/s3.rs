@@ -27,6 +27,8 @@ pub struct GetObjectResponse {
     pub body: Vec<u8>,
     /// Content length.
     pub content_length: u64,
+    /// Content-Type carried through from PUT (RFC 6838).
+    pub content_type: Option<String>,
 }
 
 /// S3 `PutObject` request.
@@ -38,6 +40,8 @@ pub struct PutObjectRequest {
     pub namespace_id: NamespaceId,
     /// Object body (plaintext).
     pub body: Vec<u8>,
+    /// Content-Type to attach for round-trip on GET (RFC 6838).
+    pub content_type: Option<String>,
 }
 
 /// S3 `PutObject` response.
@@ -59,7 +63,8 @@ impl<G: GatewayOps> S3Gateway<G> {
         Self { inner }
     }
 
-    /// S3 `GetObject` — reads an object and returns the plaintext body.
+    /// S3 `GetObject` — reads an object and returns the plaintext body
+    /// plus stored Content-Type (RFC 6838 round-trip).
     pub async fn get_object(
         &self,
         req: GetObjectRequest,
@@ -77,11 +82,15 @@ impl<G: GatewayOps> S3Gateway<G> {
 
         Ok(GetObjectResponse {
             content_length: read_resp.data.len() as u64,
+            content_type: read_resp.content_type,
             body: read_resp.data,
         })
     }
 
-    /// S3 `PutObject` — writes an object, returns the `ETag`.
+    /// S3 `PutObject` — writes an object, returns the `ETag`. The
+    /// optional Content-Type is attached to the resulting composition
+    /// so a subsequent GET on any gateway instance round-trips it
+    /// (RFC 6838 / ADV-PA-4).
     pub async fn put_object(
         &self,
         req: PutObjectRequest,
@@ -94,6 +103,12 @@ impl<G: GatewayOps> S3Gateway<G> {
                 data: req.body,
             })
             .await?;
+
+        if req.content_type.is_some() {
+            self.inner
+                .set_object_content_type(write_resp.composition_id, req.content_type)
+                .await?;
+        }
 
         Ok(PutObjectResponse {
             etag: write_resp.composition_id.0.to_string(),

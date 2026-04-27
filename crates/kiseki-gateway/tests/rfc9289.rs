@@ -8,8 +8,10 @@
 //! Owner files:
 //! - `kiseki-gateway::nfs_server::serve_nfs_listener` — accepts an
 //!   `Option<Arc<rustls::ServerConfig>>`; when `Some`, every accepted
-//!   `TcpStream` is wrapped via `rustls::StreamOwned`. When `None`,
-//!   plaintext per ADR-038 §D4.2 audited fallback.
+//!   `TcpStream` is wrapped via `rustls::StreamOwned`.
+//! - `kiseki-gateway::nfs_security::evaluate` — the security-gate
+//!   logic that enforces ADR-038 §D4 (TLS-by-default + audited
+//!   plaintext fallback).
 //! - `kiseki-gateway::pnfs_ds_server::serve_ds_listener` — mirrors the
 //!   MDS listener for the DS endpoint.
 //!
@@ -18,11 +20,10 @@
 //!
 //! Spec text: <https://www.rfc-editor.org/rfc/rfc9289>.
 //!
-//! Note: kiseki's actual TLS handshake is delegated to rustls (see
-//! `kiseki-transport/tests/rfc8446_contract.rs`). Tests in THIS file
-//! pin the **NFS-over-TLS-specific** policy: when TLS wrapping is
-//! enabled vs disabled, the keep-alive cadence, and the rejection
-//! cases that must close the TCP connection cleanly.
+//! All tests in this file invoke production code (the
+//! `nfs_security::evaluate` gate, real `TlsConfig::server_config`,
+//! the published `RFC9289_KEEPALIVE_INTERVAL_SECS` constant). Replaces
+//! the prior local-literal tautology pattern (ADV-PA-2).
 #![allow(
     clippy::doc_markdown,
     clippy::unreadable_literal,
@@ -46,83 +47,42 @@
     clippy::unicode_not_nfc
 )]
 
+use kiseki_audit::event::AuditEventType;
+use kiseki_gateway::nfs_security::{
+    evaluate, NfsSecurityError, NfsTransport, PLAINTEXT_WARN_BANNER,
+};
+
 // ===========================================================================
 // §3 — transport security flavor negotiation
 // ===========================================================================
 //
-// RFC 9289 §3: an NFS client opts into transport security via the
-// `xprtsec=` mount option. Three values:
-//
-//     xprtsec=none    — plaintext (no TLS); equivalent to RFC 5531
-//     xprtsec=tls     — server-auth-only TLS
-//     xprtsec=mtls    — mutual TLS (server AND client present certs)
-//
-// kiseki's policy (ADR-038 §D4.1) requires `mtls` by default; falls
-// back to `none` only with the audited two-flag opt-in
-// (`allow_plaintext_nfs=true` + `KISEKI_INSECURE_NFS=true`). The
-// listener is configured by the caller via the `tls` parameter:
-// `Some(_)` → mtls (the rustls ServerConfig is built with
-// `WebPkiClientVerifier`); `None` → none.
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum XprtSec {
-    None,
-    Tls,
-    Mtls,
-}
-
-impl XprtSec {
-    fn from_mount_option(s: &str) -> Result<Self, &'static str> {
-        // RFC 9289 §3 — these strings are the exact mount-option values.
-        match s {
-            "xprtsec=none" | "none" => Ok(XprtSec::None),
-            "xprtsec=tls" | "tls" => Ok(XprtSec::Tls),
-            "xprtsec=mtls" | "mtls" => Ok(XprtSec::Mtls),
-            _ => Err("RFC 9289 §3: invalid xprtsec value"),
-        }
-    }
-}
+// RFC 9289 §3 + ADR-038 §D4: kiseki's NFS-over-TLS gate is
+// `nfs_security::evaluate(allow_plaintext_nfs, insecure_env_set,
+// tls_bundle_present, default_layout_ttl_seconds, tenant_count)`.
+// All RFC 9289 §3 / ADR-038 §D4 tests below invoke this real
+// production function.
 
 #[test]
-fn s3_xprtsec_mount_option_values() {
-    // RFC 9289 §3: pin the three valid mount-option values.
-    assert_eq!(XprtSec::from_mount_option("none"), Ok(XprtSec::None));
-    assert_eq!(XprtSec::from_mount_option("tls"), Ok(XprtSec::Tls));
-    assert_eq!(XprtSec::from_mount_option("mtls"), Ok(XprtSec::Mtls));
-    // And the leading-keyword forms used in /etc/fstab.
-    assert_eq!(
-        XprtSec::from_mount_option("xprtsec=mtls"),
-        Ok(XprtSec::Mtls)
+fn s3_default_posture_is_tls_when_bundle_present() {
+    // ADR-038 §D4.1 / RFC 9289 §3: defaults yield TLS posture.
+    let security = evaluate(false, false, true, 300, 1).expect("default");
+    assert_eq!(security.mode, NfsTransport::Tls);
+    assert!(
+        security.audit_event.is_none(),
+        "TLS path emits no SecurityDowngrade audit"
     );
-    // Anything else is invalid.
-    assert!(XprtSec::from_mount_option("xprtsec=bogus").is_err());
-    assert!(XprtSec::from_mount_option("xprtsec=ssl").is_err());
+    assert!(!security.emit_warn_banner);
+    assert_eq!(security.effective_layout_ttl_seconds, 300);
 }
 
 #[test]
-fn s3_kiseki_default_policy_is_mtls() {
-    // ADR-038 §D4.1: kiseki defaults to mtls. Plaintext requires the
-    // two-flag opt-in (config + env var), and a startup audit event.
-    //
-    // We assert the policy: when the listener's `tls` argument is
-    // Some(_), the wire is mTLS; when None, plaintext is permitted only
-    // by the audited fallback. The test below is structural — it
-    // exercises the same conditional as `serve_nfs_listener`.
-    let tls_enabled = true; // kiseki default
-    let allow_plaintext_nfs = false; // ADR-038 §D4.2 default
-    let kiseki_insecure_nfs_env = false;
-
-    if tls_enabled {
-        // Path: TLS branch in serve_nfs_listener — every TcpStream
-        // wrapped via rustls::StreamOwned.
-        assert!(true, "TLS path active — RFC 9289 §3 mtls");
-    } else {
-        assert!(
-            allow_plaintext_nfs && kiseki_insecure_nfs_env,
-            "ADR-038 §D4.2: plaintext requires BOTH allow_plaintext_nfs=true \
-             AND KISEKI_INSECURE_NFS=true"
-        );
-    }
+fn s3_no_tls_bundle_refuses_to_start() {
+    // RFC 9289 §3: a server without a TLS bundle and without the
+    // explicit plaintext opt-in MUST refuse to start cleanly — kiseki
+    // returns NfsSecurityError::TlsBundleMissing rather than
+    // silently downgrading.
+    let err = evaluate(false, false, false, 300, 1).unwrap_err();
+    assert_eq!(err, NfsSecurityError::TlsBundleMissing);
 }
 
 // ===========================================================================
@@ -131,190 +91,167 @@ fn s3_kiseki_default_policy_is_mtls() {
 //
 // RFC 9289 §3.2: NFS-over-TLS does NOT use ALPN. The TLS handshake
 // negotiates the cipher suites and certs only; the NFS RPC framing
-// rides on top of TLS records as it would on top of plain TCP. This
-// distinguishes NFS-over-TLS from gRPC-over-TLS (which DOES use ALPN
-// "h2"). Pinning this here so the gRPC vs NFS distinction is
-// explicit.
+// rides on top of TLS records as it would on top of plain TCP.
 
 #[test]
 fn s3_2_no_alpn_for_nfs_over_tls() {
-    // RFC 9289 §3.2: NFS-over-TLS does not negotiate any application
-    // protocol via ALPN. The kiseki ServerConfig used for NFS MUST
-    // therefore have an empty `alpn_protocols` vector.
-    //
-    // We assert against the *contract*: kiseki's NFS path passes the
-    // same ServerConfig used for the MDS listener through
-    // `serve_nfs_listener(..., tls=Some(cfg))`. That cfg comes from
-    // `kiseki_transport::config::TlsConfig::server_config(...)` which
-    // does NOT set alpn_protocols. The contract is "no ALPN for NFS".
-    //
-    // RED if a future refactor accidentally inherits the gRPC
-    // ServerConfig (which DOES set alpn_protocols=["h2"]).
-    let nfs_alpn: Vec<Vec<u8>> = Vec::new();
+    use rcgen::{CertificateParams, KeyPair};
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
+    // Build a real ServerConfig via TlsConfig::server_config and
+    // verify alpn_protocols is empty.
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).unwrap_or_else(|_| unreachable!());
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "kiseki-rfc9289-test-ca");
+    let ca_kp = KeyPair::generate().unwrap_or_else(|_| unreachable!());
+    let ca_cert = ca_params
+        .self_signed(&ca_kp)
+        .unwrap_or_else(|_| unreachable!());
+    let issuer = rcgen::Issuer::new(ca_params, ca_kp);
+
+    let mut leaf_params =
+        CertificateParams::new(Vec::<String>::new()).unwrap_or_else(|_| unreachable!());
+    leaf_params.is_ca = rcgen::IsCa::NoCa;
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "kiseki-nfs-server");
+    leaf_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )));
+    let leaf_kp = KeyPair::generate().unwrap_or_else(|_| unreachable!());
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_kp, &issuer)
+        .unwrap_or_else(|_| unreachable!());
+
+    let server_config = kiseki_transport::config::TlsConfig::server_config(
+        ca_cert.pem().as_bytes(),
+        leaf_cert.pem().as_bytes(),
+        leaf_kp.serialize_pem().as_bytes(),
+    )
+    .expect("server config");
+
     assert!(
-        nfs_alpn.is_empty(),
-        "RFC 9289 §3.2: NFS-over-TLS does NOT use ALPN — alpn_protocols \
-         on the NFS ServerConfig MUST be empty"
+        server_config.alpn_protocols.is_empty(),
+        "RFC 9289 §3.2: NFS-over-TLS ServerConfig MUST have empty \
+         alpn_protocols; got {:?}",
+        server_config.alpn_protocols
     );
 }
 
 // ===========================================================================
 // §4 — Keep-alive cadence
 // ===========================================================================
-//
-// RFC 9289 §4.2: after the TLS handshake completes, the NFS client and
-// server SHOULD exchange RPC NULL probes every 60 seconds when no
-// other RPC traffic has occurred. This keeps middleboxes (NAT, stateful
-// firewalls) from prematurely tearing down the TLS session.
-//
-// kiseki currently has NO keep-alive timer (verified by inspection of
-// nfs_server.rs as of 2026-04-27). This test pins the spec contract;
-// it is RED until a keep-alive task is wired up.
 
 #[test]
 fn s4_2_keepalive_cadence_is_60_seconds() {
     // RFC 9289 §4.2: 60-second cadence in the absence of other traffic.
-    const RFC_9289_KEEPALIVE_INTERVAL_SECS: u64 = 60;
-    // Production constant (TCP keep-alive on the accepted socket;
-    // the kernel handles the idle-reset semantic).
+    // Production constant lives in `nfs_server.rs::enable_tcp_keepalive`;
+    // the kernel handles the idle-reset semantic via SO_KEEPALIVE.
     assert_eq!(
         kiseki_gateway::nfs_server::RFC9289_KEEPALIVE_INTERVAL_SECS,
-        RFC_9289_KEEPALIVE_INTERVAL_SECS,
-        "RFC 9289 §4.2: kiseki's keep-alive cadence MUST be 60 seconds; \
-         see nfs_server.rs::enable_tcp_keepalive"
-    );
-}
-
-#[test]
-fn s4_2_keepalive_only_when_idle() {
-    // RFC 9289 §4.2: the 60-sec timer is reset by ANY traffic on the
-    // connection. Pin the semantics: the keep-alive only fires after
-    // 60 seconds of *idleness* — not unconditionally every 60 seconds.
-    //
-    // When the keep-alive task lands, this test validates the reset
-    // semantic via a fake clock + traffic-injected harness. Today it
-    // asserts the policy as code-comment:
-    let traffic_resets_timer = true; // RFC contract
-    assert!(
-        traffic_resets_timer,
-        "RFC 9289 §4.2: keep-alive timer SHALL reset on any RPC traffic"
+        60,
+        "RFC 9289 §4.2: keep-alive cadence is 60 seconds"
     );
 }
 
 // ===========================================================================
-// §5 — Rejection cases
+// §5 — Plaintext fallback gate (ADR-038 §D4.2)
 // ===========================================================================
-//
-// RFC 9289 §5: the server MUST close a TCP connection cleanly when:
-//
-//   1. A client sends a non-TLS first byte to a TLS-only listener
-//      (handshake failure detected by rustls before any RPC parsing).
-//   2. The TLS handshake itself fails (cert chain invalid, etc.).
-//   3. The peer cert is required (mtls) but absent.
-//
-// In all three cases, no RPC reply is generated; the TCP socket is
-// shut down. The mismatching client gets ECONNRESET / EOF, NOT a
-// PROG_MISMATCH or PROC_UNAVAIL response.
-
-#[test]
-fn s5_tls_required_listener_drops_plaintext_connection() {
-    // The contract: when `serve_nfs_listener` is called with `tls=Some(_)`,
-    // the per-conn handler creates a `rustls::ServerConnection` and
-    // wraps the TcpStream via `rustls::StreamOwned`. If the client
-    // sends a plain RPC fragment header (4 bytes) without doing TLS,
-    // rustls fails the handshake and the connection is dropped.
-    //
-    // We assert the structural contract here. The
-    // `kiseki-transport/tests/rfc8446_contract.rs` file does the
-    // end-to-end TLS-handshake-failure test against rustls.
-    let tls_active = true; // kiseki default per ADR-038 §D4.1
-    if tls_active {
-        // The first byte from a plaintext RPC client is 0x80 (the
-        // top-bit of an RPC fragment header indicating last-fragment).
-        // 0x80 is not a valid TLS ClientHello first byte (which is
-        // 0x16 for TLS records). rustls returns InvalidContentType
-        // and the kiseki handler logs + drops.
-        let plaintext_first_byte = 0x80u8;
-        let tls_record_first_byte = 0x16u8;
-        assert_ne!(
-            plaintext_first_byte, tls_record_first_byte,
-            "RFC 9289 §5: a plaintext RPC fragment header (0x80) is \
-             distinguishable from a TLS ClientHello (0x16) in the \
-             very first byte"
-        );
-    }
-}
-
-#[test]
-fn s5_mtls_listener_rejects_client_without_cert() {
-    // ADR-038 §D4.1 + RFC 9289 §5: when kiseki-transport's
-    // server_config is built with `WebPkiClientVerifier` (the only
-    // path kiseki uses), a client that completes TLS WITHOUT
-    // presenting a cert is rejected by rustls during the handshake's
-    // CertificateVerify step.
-    //
-    // The structural contract: `TlsConfig::server_config` always
-    // requires client auth (no `WebPkiClientVerifier::optional()`
-    // path exists in the kiseki codebase as of 2026-04-27).
-    let kiseki_requires_client_cert = true;
-    assert!(
-        kiseki_requires_client_cert,
-        "ADR-038 §D4.1 / RFC 9289 §5: kiseki NFS-over-TLS is mTLS-only"
-    );
-}
 
 #[test]
 fn s5_plaintext_fallback_requires_two_flag_opt_in() {
-    // ADR-038 §D4.2: the plaintext fallback path is only taken when
-    // BOTH:
-    //   1. `[security].allow_plaintext_nfs = true` in the config file
-    //   2. `KISEKI_INSECURE_NFS=true` in the environment
-    // are set. Setting only one is insufficient.
-    let cfg_only = (true, false);
-    let env_only = (false, true);
-    let both_set = (true, true);
-    let neither = (false, false);
-
-    fn enables_plaintext((cfg, env): (bool, bool)) -> bool {
-        cfg && env
-    }
-
-    assert!(!enables_plaintext(cfg_only));
-    assert!(!enables_plaintext(env_only));
-    assert!(!enables_plaintext(neither));
-    assert!(enables_plaintext(both_set));
+    // ADR-038 §D4.2: BOTH flags (`allow_plaintext_nfs=true` AND
+    // `KISEKI_INSECURE_NFS=true`) required. Single-flag attempts must
+    // refuse to start. We exercise the production gate directly.
+    let cfg_only = evaluate(true, false, false, 300, 1).unwrap_err();
+    assert!(
+        matches!(
+            cfg_only,
+            NfsSecurityError::PartialFlags {
+                config_flag: true,
+                env_flag: false
+            }
+        ),
+        "config flag alone must refuse: got {cfg_only:?}"
+    );
+    let env_only = evaluate(false, true, true, 300, 1).unwrap_err();
+    assert!(
+        matches!(
+            env_only,
+            NfsSecurityError::PartialFlags {
+                config_flag: false,
+                env_flag: true
+            }
+        ),
+        "env flag alone must refuse: got {env_only:?}"
+    );
 }
 
 #[test]
 fn s5_plaintext_fallback_emits_audit_event_on_every_boot() {
-    // ADR-038 §D4.2 step 2: the audit event
-    // `SecurityDowngradeEnabled{reason="plaintext_nfs"}` MUST fire on
-    // every boot, not just the first.
-    //
-    // This pins the spec contract; the actual emission is in the
-    // kiseki-server boot sequence (out of this crate's reach). We
-    // assert the policy as a code-comment-with-asserts so a future
-    // refactor that "optimizes" the audit emission to once-per-cluster
-    // is caught.
-    let emit_on_every_boot = true;
-    assert!(
-        emit_on_every_boot,
-        "ADR-038 §D4.2.2: SecurityDowngradeEnabled audit event fires \
-         on EVERY boot when plaintext NFS is enabled"
+    // ADR-038 §D4.2 step 2: every boot in plaintext mode produces
+    // a SecurityDowngradeEnabled audit event. The gate function
+    // returns `audit_event: Some(...)` so the boot loop emits it
+    // unconditionally — there is no "first-boot only" caching.
+    let s = evaluate(true, true, false, 300, 1).expect("plaintext path");
+    assert_eq!(s.mode, NfsTransport::Plaintext);
+    assert_eq!(
+        s.audit_event,
+        Some(AuditEventType::SecurityDowngradeEnabled),
+        "ADR-038 §D4.2.2: SecurityDowngradeEnabled audit on every boot"
     );
+    assert!(s.emit_warn_banner);
 }
 
 #[test]
 fn s5_plaintext_fallback_halves_layout_ttl_to_60s() {
     // ADR-038 §D4.2 step 3: when plaintext is active, the layout TTL
-    // MUST be halved from 300s → 60s to compensate for the larger
-    // fh4-replay window.
-    let normal_ttl_secs = 300u64;
-    let plaintext_ttl_secs_per_adr = 60u64;
-    assert_eq!(
-        plaintext_ttl_secs_per_adr,
-        normal_ttl_secs / 5,
-        "ADR-038 §D4.2.3: plaintext TTL is 1/5 of TLS TTL — 60s vs 300s"
+    // is halved from default → 60s to compensate for the larger
+    // fh4-replay window. Production gate enforces this regardless of
+    // the configured default_layout_ttl_seconds.
+    for default_ttl in [300u64, 600, 86_400] {
+        let s = evaluate(true, true, false, default_ttl, 1).expect("plaintext");
+        assert_eq!(
+            s.effective_layout_ttl_seconds, 60,
+            "ADR-038 §D4.2.3: plaintext TTL is fixed at 60s regardless of \
+             configured default ({default_ttl}s)"
+        );
+    }
+}
+
+#[test]
+fn s5_plaintext_warn_banner_is_canonical() {
+    // ADR-038 §D4.2 — pin the WARN banner text byte-for-byte. A
+    // future rewording is a deliberate operator-facing change.
+    assert!(
+        PLAINTEXT_WARN_BANNER.contains("NFS path is PLAINTEXT"),
+        "ADR-038 §D4.2: WARN banner must announce plaintext mode"
+    );
+    assert!(
+        PLAINTEXT_WARN_BANNER.contains("I-PN7-default"),
+        "WARN banner must reference the violated invariant"
+    );
+}
+
+#[test]
+fn s5_multi_tenant_plaintext_is_refused() {
+    // ADR-038 §D4.2 — even with both flags, plaintext is refused on
+    // a listener with >1 tenant (data-attribution risk grows with
+    // tenant count). Production gate enforces.
+    let err = evaluate(true, true, false, 300, 5).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            NfsSecurityError::PlaintextMultiTenant { tenant_count: 5 }
+        ),
+        "ADR-038 §D4.2: plaintext + multi-tenant must refuse: got {err:?}"
     );
 }
 
@@ -324,28 +261,24 @@ fn s5_plaintext_fallback_halves_layout_ttl_to_60s() {
 
 /// RFC 8446 §5.1 (cited by RFC 9289 §3): TLS records begin with a
 /// 1-byte content type. Application data (post-handshake RPC) =
-/// `0x17`. Handshake = `0x16`. Alert = `0x15`.
-///
-/// kiseki's NFS-over-TLS path emits RPC fragments inside `0x17`
-/// records once the handshake completes. This pins the byte values
-/// for a future wire-capture-based seed test.
+/// `0x17`. Handshake = `0x16`. Alert = `0x15`. Pin against rustls's
+/// canonical enum so a rustls upgrade that renames or renumbers a
+/// variant is a visible failure.
 #[test]
-fn rfc_seed_tls_record_content_types() {
-    // RFC 8446 §5.1 — cited by RFC 9289 §3.
-    const TLS_HANDSHAKE: u8 = 0x16;
-    const TLS_APPLICATION_DATA: u8 = 0x17;
-    const TLS_ALERT: u8 = 0x15;
+fn rfc_seed_tls_record_content_types_match_rustls() {
+    use rustls::ContentType;
+    // Discriminant values are part of the wire ABI per RFC 8446 §5.1.
+    assert_eq!(u8::from(ContentType::Handshake), 0x16);
+    assert_eq!(u8::from(ContentType::ApplicationData), 0x17);
+    assert_eq!(u8::from(ContentType::Alert), 0x15);
 
-    assert_eq!(TLS_HANDSHAKE, 22);
-    assert_eq!(TLS_APPLICATION_DATA, 23);
-    assert_eq!(TLS_ALERT, 21);
-
-    // Sanity: an RPC fragment header on a plain TCP listener has
-    // top-bit set (0x80). It cannot collide with any TLS record type.
+    // Sanity: an RPC fragment header's top byte (0x80) cannot collide
+    // with any TLS record type. The kiseki dispatcher distinguishes
+    // TLS vs plaintext by inspecting this first byte.
     let rpc_fragment_marker = 0x80u8;
     assert!(
-        rpc_fragment_marker > TLS_APPLICATION_DATA,
-        "RFC 9289 §5: a plaintext RPC client cannot accidentally appear \
-         to be a TLS handshake — first-byte spaces are disjoint"
+        rpc_fragment_marker > u8::from(ContentType::ApplicationData),
+        "RFC 9289 §5: plaintext RPC fragment header (0x80) is disjoint \
+         from any TLS record content type"
     );
 }

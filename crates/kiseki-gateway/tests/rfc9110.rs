@@ -299,7 +299,9 @@ async fn s13_1_3_if_modified_since_far_future_returns_304() {
     let req = Request::builder()
         .method("GET")
         .uri(format!("/rfc9110-bucket/{etag}"))
-        .header("if-modified-since", "Fri, 31 Dec 2099 23:59:59 GMT")
+        // Note: 31 Dec 2099 is a Thursday — RFC 9110 §5.6.7 IMF-fixdate
+        // day-of-week must be consistent with the calendar date.
+        .header("if-modified-since", "Thu, 31 Dec 2099 23:59:59 GMT")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -332,6 +334,36 @@ async fn s13_1_4_if_unmodified_since_distant_past_returns_412() {
         StatusCode::PRECONDITION_FAILED,
         "RFC 9110 §13.1.4: If-Unmodified-Since at epoch must return 412 \
          (currently RED — handler does not inspect the header)"
+    );
+}
+
+/// RFC 9110 §13.1.3 + §5.6.7 — current-decade IMF-fixdate must be
+/// classified correctly relative to `now()`. The previous year-only
+/// parser (replaced 2026-04-27 per ADV-PA-3) used 365-day flat-year
+/// arithmetic; a header dated `Wed, 21 Apr 2026 14:00:00 GMT` got
+/// rounded to "start of 2026" and produced wrong if-modified-since
+/// classification on requests made later in the year. This test
+/// exercises that exact case as a regression guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn s13_1_3_if_modified_since_recent_past_returns_200() {
+    let app = setup_router();
+    let etag = put_and_get_etag(&app, b"data").await;
+
+    // A date a year in the past — every reasonable Last-Modified is
+    // AFTER it, so the resource HAS been modified since → 200 OK.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/rfc9110-bucket/{etag}"))
+        .header("if-modified-since", "Mon, 21 Apr 2025 14:00:00 GMT")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "RFC 9110 §13.1.3 / ADV-PA-3: a current-decade past date \
+         must classify as 'modified since' (200), not be silently \
+         coerced to start-of-year"
     );
 }
 

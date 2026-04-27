@@ -6,7 +6,7 @@
 //! MVP: PUT/GET/HEAD/DELETE on `/:bucket/:key`. No `SigV4` auth.
 //! Supports optional mTLS when TLS files are configured.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -35,9 +35,6 @@ struct S3State<G: GatewayOps> {
     key_store: AccessKeyStore,
     /// In-memory bucket registry (namespace mapping).
     buckets: Mutex<HashSet<String>>,
-    /// Per-object Content-Type (RFC 6838 round-trip). Keyed by
-    /// `(bucket, key)`; populated on PUT, returned on GET/HEAD.
-    object_content_types: Mutex<HashMap<(String, String), String>>,
 }
 
 impl<G: GatewayOps> S3State<G> {
@@ -98,7 +95,6 @@ pub fn s3_router_with_keys<G: GatewayOps + Send + Sync + 'static>(
         fallback_tenant,
         key_store,
         buckets: Mutex::new(HashSet::new()),
-        object_content_types: Mutex::new(HashMap::new()),
     });
 
     Router::new()
@@ -132,7 +128,7 @@ struct PutParams {
 
 async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((bucket, _key)): Path<(String, String)>,
     Query(params): Query<PutParams>,
     headers: HeaderMap,
     body: Bytes,
@@ -165,33 +161,25 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    // Regular PutObject.
+    // Regular PutObject — Content-Type is persisted on the
+    // composition (ADV-PA-4: store-side metadata, not per-instance
+    // HashMap). Survives across gateway instances + restart.
     match state
         .gateway
         .put_object(PutObjectRequest {
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             body: body.to_vec(),
+            content_type,
         })
         .await
     {
-        Ok(resp) => {
-            // Stash the Content-Type indexed by the assigned key
-            // (the etag identifies the composition; tests use
-            // `etag` as the URL key).
-            if let Some(ct) = content_type {
-                if let Ok(mut map) = state.object_content_types.lock() {
-                    map.insert((bucket.clone(), key.clone()), ct.clone());
-                    map.insert((bucket, resp.etag.clone()), ct);
-                }
-            }
-            (
-                StatusCode::OK,
-                [("etag", format!("\"{}\"", resp.etag))],
-                String::new(),
-            )
-                .into_response()
-        }
+        Ok(resp) => (
+            StatusCode::OK,
+            [("etag", format!("\"{}\"", resp.etag))],
+            String::new(),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -258,12 +246,12 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
         .await
     {
         Ok(resp) => {
-            // Restore Content-Type captured at PUT time (RFC 6838).
-            let stored_ct = state
-                .object_content_types
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&(bucket.clone(), key.clone())).cloned());
+            // Content-Type is persisted on the composition (ADV-PA-4).
+            // Both legs of the (bucket, key) URL are now backed by the
+            // same `Composition.content_type` field, so multi-gateway
+            // PUT→GET preserves the header.
+            let stored_ct = resp.content_type.clone();
+            let _ = (&bucket, &key); // path components retained for logs / future routing
             let body_bytes: Vec<u8> = resp.body;
 
             // RFC 9110 §14 — Range support.
@@ -392,27 +380,16 @@ fn is_http_date_in_past(value: &str) -> bool {
 }
 
 /// Convert an HTTP-date (RFC 9110 §5.6.7 / RFC 7231) to a Unix
-/// timestamp. Accepts the IMF-fixdate form
-/// `Day, DD Mon YYYY HH:MM:SS GMT` — the only form the SDKs emit.
+/// timestamp. Delegates to the `httpdate` crate which handles the
+/// three legacy syntaxes (IMF-fixdate, RFC 850, asctime) the spec
+/// allows. The previous in-house year-only parser failed for any
+/// current-decade date (boto3, curl, etc.) — see ADV-PA-3.
 fn httpdate_to_epoch(value: &str) -> Option<u64> {
-    // Try IMF-fixdate via the `httpdate` crate if available; we
-    // don't have it as a dep, so do a minimal hand-roll for the
-    // bounds the tests use (epoch and far-future).
-    let trimmed = value.trim();
-    if let Some(year_str) = trimmed.split_whitespace().nth(3) {
-        if let Ok(year) = year_str.parse::<i32>() {
-            // Approximate epoch for the start of `year` (good
-            // enough for the if-mod/if-unmod past-vs-future
-            // discrimination the tests need).
-            if year <= 1970 {
-                return Some(0);
-            }
-            let secs_per_year = 365 * 86_400u64;
-            let years_since_epoch = u64::try_from(year - 1970).unwrap_or(0);
-            return Some(years_since_epoch * secs_per_year);
-        }
-    }
-    None
+    let parsed = httpdate::parse_http_date(value.trim()).ok()?;
+    parsed
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 fn now_unix_secs() -> u64 {

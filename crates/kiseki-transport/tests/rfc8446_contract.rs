@@ -128,13 +128,36 @@ const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
 
 #[test]
 fn s_b_4_iana_codepoints_pinned() {
-    // Pin the wire codepoints. A future rustls upgrade that
-    // re-numbered these would be a fidelity bug visible here.
-    assert_eq!(TLS_AES_128_GCM_SHA256, 0x1301);
-    assert_eq!(TLS_AES_256_GCM_SHA384, 0x1302);
-    assert_eq!(TLS_CHACHA20_POLY1305_SHA256, 0x1303);
-    assert_eq!(TLS_AES_128_CCM_SHA256, 0x1304);
-    assert_eq!(TLS_AES_128_CCM_8_SHA256, 0x1305);
+    // Pin the wire codepoints by asserting rustls's CipherSuite
+    // enum produces the exact §B.4 values when converted to u16. A
+    // rustls upgrade that re-numbered any of these would surface as a
+    // mismatch here, not as a silent wire-format change.
+    use rustls::CipherSuite;
+    assert_eq!(
+        u16::from(CipherSuite::TLS13_AES_128_GCM_SHA256),
+        TLS_AES_128_GCM_SHA256,
+        "RFC 8446 §B.4: rustls TLS13_AES_128_GCM_SHA256 must be 0x1301"
+    );
+    assert_eq!(
+        u16::from(CipherSuite::TLS13_AES_256_GCM_SHA384),
+        TLS_AES_256_GCM_SHA384,
+        "RFC 8446 §B.4: rustls TLS13_AES_256_GCM_SHA384 must be 0x1302"
+    );
+    assert_eq!(
+        u16::from(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256),
+        TLS_CHACHA20_POLY1305_SHA256,
+        "RFC 8446 §B.4: rustls TLS13_CHACHA20_POLY1305_SHA256 must be 0x1303"
+    );
+    assert_eq!(
+        u16::from(CipherSuite::TLS13_AES_128_CCM_SHA256),
+        TLS_AES_128_CCM_SHA256,
+        "RFC 8446 §B.4: rustls TLS13_AES_128_CCM_SHA256 must be 0x1304"
+    );
+    assert_eq!(
+        u16::from(CipherSuite::TLS13_AES_128_CCM_8_SHA256),
+        TLS_AES_128_CCM_8_SHA256,
+        "RFC 8446 §B.4: rustls TLS13_AES_128_CCM_8_SHA256 must be 0x1305"
+    );
 }
 
 #[test]
@@ -244,39 +267,64 @@ fn s4_2_7_signature_algorithms_includes_ecdsa() {
 // ===========================================================================
 
 #[test]
-fn alpn_grpc_data_path_advertises_h2_only() {
-    // ADR-013 (Protocol gateway) — the gRPC data path runs HTTP/2.
-    // Per RFC 7540 §3.4 + RFC 9113, ALPN identifies HTTP/2 as "h2".
+fn alpn_nfs_server_config_has_no_alpn() {
+    // RFC 9289 §3.2: NFS-over-TLS does NOT negotiate any application
+    // protocol via ALPN. The kiseki ServerConfig used for NFS MUST
+    // therefore have an empty `alpn_protocols` vector.
     //
-    // Pin the contract: when kiseki builds a ServerConfig for the
-    // gRPC path, alpn_protocols MUST contain exactly [b"h2"]. Any
-    // additional protocols (e.g. b"http/1.1") would let a client
-    // negotiate down.
-    let alpn_for_grpc: Vec<Vec<u8>> = vec![b"h2".to_vec()];
-    assert_eq!(alpn_for_grpc.len(), 1);
-    assert_eq!(alpn_for_grpc[0], b"h2");
+    // We assert the contract on a REAL ServerConfig built by
+    // `TlsConfig::server_config`. If a future refactor accidentally
+    // sets alpn_protocols (e.g. via inheriting a gRPC config), this
+    // catches it.
+    ensure_crypto_provider();
+    let ca = generate_ca();
+    let (cert, key) = generate_node_cert(
+        &ca.issuer,
+        "alpn-nfs",
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    );
+    let server_config =
+        TlsConfig::server_config(ca.ca_pem.as_bytes(), cert.as_bytes(), key.as_bytes())
+            .expect("server config");
+    assert!(
+        server_config.alpn_protocols.is_empty(),
+        "RFC 9289 §3.2: NFS ServerConfig MUST have empty alpn_protocols; \
+         got {:?}",
+        server_config.alpn_protocols
+    );
 }
 
 #[test]
-fn alpn_nfs_path_advertises_nothing() {
-    // RFC 9289 §3.2: NFS-over-TLS does NOT use ALPN. The NFS
-    // ServerConfig MUST therefore have an empty alpn_protocols list.
+fn alpn_grpc_path_known_gap_tracked() {
+    // ADR-013 + RFC 7540 §3.4 + RFC 9113: the gRPC data path runs
+    // HTTP/2 and SHOULD advertise ALPN "h2". Today kiseki uses ONE
+    // `TlsConfig::server_config` for both NFS and gRPC paths, which
+    // produces no ALPN — fine for NFS, suboptimal for gRPC (a client
+    // could in principle attempt HTTP/1.1).
     //
-    // Pin the contract: kiseki-transport's `TlsConfig::server_config`
-    // builds a generic ServerConfig with no ALPN; both gRPC and NFS
-    // currently use the SAME ServerConfig, which is itself a fidelity
-    // gap (gRPC-only deployments would benefit from "h2" advertisement
-    // but the NFS path needs none).
-    //
-    // RED-by-design until kiseki splits the two configs.
-    let nfs_alpn: Vec<Vec<u8>> = Vec::new();
-    let grpc_alpn: Vec<Vec<u8>> = Vec::new(); // What kiseki sets today (none).
-    assert_eq!(
-        grpc_alpn, nfs_alpn,
-        "Today, kiseki's TlsConfig::server_config uses one config for \
-         both paths and sets no ALPN. RFC 9289 §3.2 + RFC 7540 §3.4 \
-         require differentiation: gRPC needs ALPN h2, NFS needs no \
-         ALPN. Splitting the two configs is the fix."
+    // This test documents the known gap by introspecting the SAME
+    // ServerConfig and asserting we either DO advertise "h2" (fixed)
+    // OR explicitly have no ALPN list (current state). It will fire
+    // if a future refactor sets alpn_protocols to something OTHER
+    // than empty or [b"h2"].
+    ensure_crypto_provider();
+    let ca = generate_ca();
+    let (cert, key) = generate_node_cert(
+        &ca.issuer,
+        "alpn-grpc",
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    );
+    let server_config =
+        TlsConfig::server_config(ca.ca_pem.as_bytes(), cert.as_bytes(), key.as_bytes())
+            .expect("server config");
+
+    let alpn = &server_config.alpn_protocols;
+    assert!(
+        alpn.is_empty() || (alpn.len() == 1 && alpn[0] == b"h2"),
+        "ALPN policy: kiseki's ServerConfig must be either empty (NFS \
+         shared, current state) or [\"h2\"] (gRPC-only). Got {alpn:?} — \
+         a different value indicates an accidental ALPN set that needs \
+         a deliberate per-protocol split (TODO: ADR-013 follow-up)."
     );
 }
 
@@ -502,25 +550,53 @@ fn s4_4_2_known_good_chain_builds_server_config() {
 // Cross-implementation seed — RFC 8446 §B.4 cipher-suite codepoints
 // ===========================================================================
 
-/// RFC 8446 §B.4 verbatim — pin the IANA registry's TLS 1.3 cipher
-/// suite codepoints. Any future rustls upgrade that re-numbered these
-/// would surface here. This is the "by-the-spec-text" seed.
+/// RFC 8446 §B.4 cross-implementation seed — verify that rustls's
+/// `CipherSuite` enum produces the IANA-registered codepoints. The
+/// previous version of this test iterated a local table and asserted
+/// the high byte against itself (tautology); this version pulls every
+/// codepoint from rustls's enum, so a rustls upgrade that re-numbered
+/// any variant fails here at compile or run time.
 #[test]
 fn rfc_seed_s_b_4_cipher_suite_codepoints() {
-    let registry: &[(&str, [u8; 2])] = &[
-        ("TLS_AES_128_GCM_SHA256", [0x13, 0x01]),
-        ("TLS_AES_256_GCM_SHA384", [0x13, 0x02]),
-        ("TLS_CHACHA20_POLY1305_SHA256", [0x13, 0x03]),
-        ("TLS_AES_128_CCM_SHA256", [0x13, 0x04]),
-        ("TLS_AES_128_CCM_8_SHA256", [0x13, 0x05]),
+    use rustls::CipherSuite;
+    let registry: &[(&str, CipherSuite, [u8; 2])] = &[
+        (
+            "TLS_AES_128_GCM_SHA256",
+            CipherSuite::TLS13_AES_128_GCM_SHA256,
+            [0x13, 0x01],
+        ),
+        (
+            "TLS_AES_256_GCM_SHA384",
+            CipherSuite::TLS13_AES_256_GCM_SHA384,
+            [0x13, 0x02],
+        ),
+        (
+            "TLS_CHACHA20_POLY1305_SHA256",
+            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            [0x13, 0x03],
+        ),
+        (
+            "TLS_AES_128_CCM_SHA256",
+            CipherSuite::TLS13_AES_128_CCM_SHA256,
+            [0x13, 0x04],
+        ),
+        (
+            "TLS_AES_128_CCM_8_SHA256",
+            CipherSuite::TLS13_AES_128_CCM_8_SHA256,
+            [0x13, 0x05],
+        ),
     ];
-    for (name, code) in registry {
-        let codepoint = u16::from_be_bytes(*code);
+    for (name, suite, expected_bytes) in registry {
+        let actual = u16::from(*suite);
+        let expected = u16::from_be_bytes(*expected_bytes);
         assert_eq!(
-            codepoint & 0xFF00,
+            actual, expected,
+            "RFC 8446 §B.4: rustls {name} codepoint must be 0x{expected:04X}; got 0x{actual:04X}"
+        );
+        assert_eq!(
+            actual & 0xFF00,
             0x1300,
-            "RFC 8446 §B.4: every TLS 1.3 cipher suite ('{name}') \
-             has high byte 0x13"
+            "RFC 8446 §B.4: every TLS 1.3 cipher suite ('{name}') has high byte 0x13"
         );
     }
 }

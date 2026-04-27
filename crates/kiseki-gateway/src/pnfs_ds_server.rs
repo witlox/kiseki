@@ -462,6 +462,7 @@ mod tests {
             Ok(crate::ops::ReadResponse {
                 data: self.fixed_response.clone(),
                 eof: false,
+                content_type: None,
             })
         }
         async fn write(

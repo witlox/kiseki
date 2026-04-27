@@ -34,6 +34,11 @@ pub struct Composition {
     pub size: u64,
     /// Whether the composition data is inline in the delta (no chunks).
     pub has_inline_data: bool,
+    /// Optional Content-Type carried through PUT → GET (RFC 6838).
+    /// Stored on the composition so it survives across gateway
+    /// instances (per ADV-PA-4: a per-`S3State` `HashMap` loses the
+    /// header on multi-gateway deployments).
+    pub content_type: Option<String>,
 }
 
 /// Result of a delete operation.
@@ -170,6 +175,28 @@ impl CompositionStore {
             .filter(|c| c.namespace_id == ns_id)
             .collect()
     }
+
+    /// Attach a Content-Type to an existing composition (RFC 6838
+    /// round-trip). Returns `Err(CompositionNotFound)` if the
+    /// composition doesn't exist. Idempotent: overwrites any prior
+    /// value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CompositionError::CompositionNotFound` if `id` is
+    /// not in the store.
+    pub fn set_content_type(
+        &mut self,
+        id: CompositionId,
+        content_type: Option<String>,
+    ) -> Result<(), CompositionError> {
+        let comp = self
+            .compositions
+            .get_mut(&id)
+            .ok_or(CompositionError::CompositionNotFound(id))?;
+        comp.content_type = content_type;
+        Ok(())
+    }
 }
 
 impl Default for CompositionStore {
@@ -205,6 +232,7 @@ impl CompositionOps for CompositionStore {
             version: 1,
             size,
             has_inline_data,
+            content_type: None,
         };
         self.compositions.insert(id, comp);
         Ok(id)

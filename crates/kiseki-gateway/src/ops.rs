@@ -20,12 +20,16 @@ pub struct ReadRequest {
 }
 
 /// A read response.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ReadResponse {
     /// Plaintext data (decrypted by the gateway for protocol clients).
     pub data: Vec<u8>,
     /// Whether end-of-file was reached.
     pub eof: bool,
+    /// Object Content-Type carried through from PUT (RFC 6838).
+    /// Populated from the composition's `content_type` field; `None`
+    /// for compositions written without one (e.g. NFS data path).
+    pub content_type: Option<String>,
 }
 
 /// A write request from a protocol client.
@@ -60,6 +64,19 @@ pub trait GatewayOps: Send + Sync {
 
     /// Write data to a composition (encrypt plaintext from client → store).
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
+
+    /// Attach a Content-Type to a composition (RFC 6838 round-trip via
+    /// composition metadata; survives across gateway instances). Default
+    /// no-op for backends that don't track per-object metadata; the
+    /// in-memory and persistent backends should override.
+    async fn set_object_content_type(
+        &self,
+        composition_id: CompositionId,
+        content_type: Option<String>,
+    ) -> Result<(), GatewayError> {
+        let _ = (composition_id, content_type);
+        Ok(())
+    }
 
     /// List compositions in a namespace. Returns `(composition_id, size)` pairs.
     async fn list(

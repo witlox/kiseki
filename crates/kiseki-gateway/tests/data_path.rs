@@ -231,6 +231,7 @@ mod s3_tests {
                 tenant_id: test_tenant(),
                 namespace_id: test_namespace(),
                 body: b"s3 object data".to_vec(),
+                content_type: None,
             })
             .await
             .unwrap();
