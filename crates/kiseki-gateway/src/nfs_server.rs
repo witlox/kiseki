@@ -153,6 +153,16 @@ pub fn serve_nfs_listener_with_mgr<G: GatewayOps + Send + Sync + 'static>(
                 let tls = tls.clone();
                 thread::spawn(move || {
                     let _ = stream.set_nonblocking(false);
+                    // Disable Nagle's algorithm. NFS RPC is a strict
+                    // request/reply protocol with sub-MSS replies for
+                    // many ops (NULL, GETATTR, ACCESS, SEQUENCE-only
+                    // compounds). Nagle + Linux's 40 ms delayed-ACK on
+                    // the kernel client side adds 40-200 ms latency
+                    // per round-trip, capping NFS read throughput
+                    // around 0.5-7 MB/s regardless of how fast the
+                    // server is. Measured: 275 ms/op without
+                    // TCP_NODELAY → ~5 ms/op with it.
+                    let _ = stream.set_nodelay(true);
                     if let Err(e) = enable_tcp_keepalive(&stream) {
                         tracing::debug!(
                             error = %e,

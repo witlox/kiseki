@@ -61,6 +61,64 @@ pub struct InMemoryGateway {
     /// per-workload backpressure events on saturation and QoS-headroom
     /// updates as quota is consumed (I-WA5: per-caller scoping).
     telemetry_bus: std::sync::RwLock<Option<Arc<kiseki_advisory::TelemetryBus>>>,
+    /// Chunk plaintext cache (Phase 15c.5 perf fix). Chunks are
+    /// content-addressed (`chunk_id` = HMAC over plaintext + salt)
+    /// so caching decrypted bytes by `chunk_id` is correct: the
+    /// same id always yields the same plaintext and chunks are
+    /// immutable.
+    ///
+    /// The cache eliminates re-decryption on sequential NFS reads:
+    /// without it, every NFS3 READ call (kernel chunks at ~1 MiB)
+    /// re-decrypts every chunk in the composition, turning a
+    /// 32 MiB / 32 reads sequence into 32x redundant decrypt work.
+    /// Measured baseline before this cache: 0.7 MB/s `NFSv3`
+    /// `seq-read`.
+    ///
+    /// Bounded eviction: when the cache exceeds `MAX_CACHE_BYTES`
+    /// (256 MiB), oldest entries are dropped FIFO. Memory pressure
+    /// is bounded; correctness is unaffected because the chunk store
+    /// is the source of truth.
+    decrypt_cache: std::sync::Mutex<DecryptCache>,
+}
+
+const MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Default)]
+struct DecryptCache {
+    /// Insertion-ordered (`chunk_id` → plaintext) for FIFO eviction.
+    /// FIFO is good enough — sequential reads on a single composition
+    /// hit the same chunk repeatedly within a short window, so even
+    /// FIFO retains the hot chunk for the duration of a streaming
+    /// read.
+    map: std::collections::HashMap<kiseki_common::ids::ChunkId, Vec<u8>>,
+    /// Eviction queue: front = oldest. Pop here when total exceeds cap.
+    queue: std::collections::VecDeque<kiseki_common::ids::ChunkId>,
+    /// Sum of `plaintext.len()` across the map.
+    total_bytes: usize,
+}
+
+impl DecryptCache {
+    fn get(&self, id: &kiseki_common::ids::ChunkId) -> Option<Vec<u8>> {
+        self.map.get(id).cloned()
+    }
+
+    fn insert(&mut self, id: kiseki_common::ids::ChunkId, plaintext: Vec<u8>) {
+        if self.map.contains_key(&id) {
+            return; // duplicate insert — keep the existing entry
+        }
+        let len = plaintext.len();
+        self.total_bytes += len;
+        self.map.insert(id, plaintext);
+        self.queue.push_back(id);
+        while self.total_bytes > MAX_CACHE_BYTES {
+            let Some(victim) = self.queue.pop_front() else {
+                break;
+            };
+            if let Some(v) = self.map.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(v.len());
+            }
+        }
+    }
 }
 
 impl InMemoryGateway {
@@ -90,6 +148,7 @@ impl InMemoryGateway {
             small_store: None,
             shard_map: std::sync::RwLock::new(None),
             telemetry_bus: std::sync::RwLock::new(None),
+            decrypt_cache: std::sync::Mutex::new(DecryptCache::default()),
         }
     }
 
@@ -363,11 +422,27 @@ impl GatewayOps for InMemoryGateway {
             }
         }
 
-        // Read and decrypt all chunks, concatenate.
-        // Checks inline store first (ADR-030), then block device.
+        // Read and decrypt all chunks, concatenate. Per-chunk plaintext
+        // is cached by content-addressed chunk_id; cache hits skip the
+        // envelope::open_envelope call (the dominant cost on
+        // sequential NFS reads where the kernel issues many small
+        // READs against the same composition).
         let mut plaintext = Vec::new();
         for chunk_id in &comp.chunks {
-            // Try inline store first (small files).
+            // Cache lookup first (cheap mutex; clone is unavoidable
+            // because the cache holds Vec<u8> shared across calls).
+            if let Some(cached) = self
+                .decrypt_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(chunk_id)
+            {
+                plaintext.extend_from_slice(&cached);
+                continue;
+            }
+
+            // Cache miss — read from inline store first (ADR-030),
+            // then block device.
             let inline_hit = if let Some(ref store) = self.small_store {
                 store
                     .get(&chunk_id.0)
@@ -390,6 +465,13 @@ impl GatewayOps for InMemoryGateway {
             let decrypted = envelope::open_envelope(&self.aead, &self.master_key, &env)
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
             plaintext.extend_from_slice(&decrypted);
+
+            // Insert into cache for the next call. Bounded eviction
+            // ensures memory stays under MAX_CACHE_BYTES.
+            self.decrypt_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(*chunk_id, decrypted);
         }
 
         // Pull Content-Type from the composition for RFC 6838 round-trip

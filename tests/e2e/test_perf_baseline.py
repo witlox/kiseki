@@ -117,21 +117,41 @@ def _seed_object(cluster: ClusterInfo, key: str, payload: bytes) -> str:
 
 
 def _parse_fio_bw(stdout: str) -> dict[str, float]:
-    """Pull `bw=` (bandwidth) and `iops=` from a fio summary line.
+    """Pull `bw=` (bandwidth) from a fio summary line.
 
-    fio output looks like:
+    fio output formats vary; the canonical "Run status group" summary
+    line is the most reliable (it's the steady-state mean across the
+    whole run, not a per-sample bw=). Two example shapes:
+
        READ: bw=120MiB/s (126MB/s), 120MiB/s-120MiB/s ...
-       read: IOPS=480, BW=1923KiB/s ...
-    We extract the first MB/s number; that's enough for an O(1)
-    side-by-side table.
+       READ: bw=64.2MiB/s (67.3MB/s), 64.2MiB/s-64.2MiB/s ...
+
+    We prefer the parenthesized `(126MB/s)` form because it's already
+    in MB/s (10^6 bytes/s, what fio calls "decimal" units) — matches
+    standard storage marketing units and avoids MiB→MB conversion
+    arithmetic.
     """
     out: dict[str, float] = {}
     for direction in ("READ", "WRITE"):
-        m = re.search(rf"{direction}:\s+bw=([\d.]+)([KMG]i?B)/s", stdout)
+        # Try the parenthesized "(126MB/s)" form first.
+        m = re.search(
+            rf"{direction}:\s+bw=[^(]+\(([\d.]+)([KMG]B)/s\)",
+            stdout,
+        )
+        if not m:
+            # Fall back to the leading "bw=120MiB/s" form.
+            m = re.search(rf"{direction}:\s+bw=([\d.]+)([KMG]i?B)/s", stdout)
         if m:
             n = float(m.group(1))
             unit = m.group(2)
-            scale = {"KiB": 1 / 1024, "MiB": 1, "GiB": 1024, "KB": 1 / 1000, "MB": 1, "GB": 1000}.get(unit, 1)
+            scale = {
+                "KiB": 1 / 1024,
+                "MiB": 1,
+                "GiB": 1024,
+                "KB": 1 / 1000,
+                "MB": 1,
+                "GB": 1000,
+            }.get(unit, 1)
             out[direction.lower() + "_mbps"] = n * scale
     return out
 
@@ -187,10 +207,12 @@ def test_perf_nfs41_seq_read(
     if not _docker_available():
         pytest.skip("docker daemon not reachable")
 
-    # 32 MiB fixture so fio's first second includes more than 4 reads
-    # (kernel readahead defaults to 4 MiB and a single 8 MiB file
-    # finishes inside the kernel buffer cache, masking the wire path).
-    payload = b"\xa5" * (32 * 1024 * 1024)
+    # 8 MiB fixture — large enough to cover 8 NFS-bs=1M reads (kernel
+    # readahead defaults to 4 MiB, so 8 MiB ensures fio's first
+    # samples include a couple of cold misses + several cache hits).
+    # 32 MiB stretched fio's 10s budget thin under cold-cache and
+    # masked the steady-state throughput we actually want to measure.
+    payload = b"\xa5" * (8 * 1024 * 1024)
     etag = _seed_object(perf_cluster, "perf-nfs41", payload)
 
     script = rf"""
@@ -198,9 +220,13 @@ set -euo pipefail
 mkdir -p /mnt/pnfs
 mount -t nfs4 -o vers=4.1,minorversion=1 kiseki-node1:/default /mnt/pnfs
 trap 'umount /mnt/pnfs 2>/dev/null || true' EXIT
-fio --name=seq-read --rw=read --direct=0 --bs=1M --size=32M \
+# Warm-up read populates the server-side decrypt cache (Phase 15c.5).
+# Without this, fio's first sample includes cold-decrypt cost which
+# dominates the time-based mean and obscures steady-state throughput.
+dd if=/mnt/pnfs/{etag} of=/dev/null bs=1M status=none
+fio --name=seq-read --rw=read --direct=0 --bs=1M --size=8M \
     --filename=/mnt/pnfs/{etag} --runtime=10 --time_based \
-    --output-format=normal 2>&1 | tail -25
+    --output-format=normal 2>&1 | tail -30
 """
     result = _run_in_client(perf_client_image, script, timeout=180)
     if result.returncode != 0:
@@ -229,7 +255,7 @@ def test_perf_nfs3_seq_read(
     if not _docker_available():
         pytest.skip("docker daemon not reachable")
 
-    payload = b"\xa6" * (32 * 1024 * 1024)
+    payload = b"\xa6" * (8 * 1024 * 1024)
     etag = _seed_object(perf_cluster, "perf-nfs3", payload)
 
     script = rf"""
@@ -238,9 +264,10 @@ mkdir -p /mnt/nfs3
 mount -t nfs -o vers=3,proto=tcp,port=2049,mountport=2049,mountproto=tcp,nolock \
     kiseki-node1:/default /mnt/nfs3
 trap 'umount /mnt/nfs3 2>/dev/null || true' EXIT
-fio --name=seq-read --rw=read --direct=0 --bs=1M --size=32M \
+dd if=/mnt/nfs3/{etag} of=/dev/null bs=1M status=none
+fio --name=seq-read --rw=read --direct=0 --bs=1M --size=8M \
     --filename=/mnt/nfs3/{etag} --runtime=10 --time_based \
-    --output-format=normal 2>&1 | tail -25
+    --output-format=normal 2>&1 | tail -30
 """
     result = _run_in_client(perf_client_image, script, timeout=180)
     if result.returncode != 0:
