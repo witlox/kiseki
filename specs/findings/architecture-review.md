@@ -940,3 +940,651 @@ The Phase 15 e2e remains paused per the user's "pause e2e" call
 2026-04-27. It resumes once the critical-path RFCs (8881, 7862,
 8435) are at least 🟡 — at which point we'll have proper
 diagnostics for whatever blocks the mount next.
+
+---
+
+## Phase A close — integrator pass (2026-04-27)
+
+**Scope**: verify the 5 Phase A commits (`1793837..HEAD`) integrate
+cleanly across the rest of the codebase. Phase A landed wire-protocol
+fidelity fixes (XDR strict bool/opaque, ONC RPC AUTH typed decoders,
+NFSv4 BADHANDLE/NOFILEHANDLE/OP_ILLEGAL/BADXDR distinctions, pNFS
+IPv6 uaddr + `FF_FLAGS_NO_LAYOUTCOMMIT`, NFS-over-TLS keep-alive,
+NFSv3 BADHANDLE pre-check, S3 Range/conditional headers + XML error
+bodies + SigV4 cross-checked, TLS 1.3-only, EROFS mapping, native
+ABI pin, gRPC/Raft/FIPS contract pins).
+
+### Build/test status
+
+- `cargo build --workspace --tests` — clean (1 benign warning about
+  the kiseki-acceptance crate's dual-target lib + integration-test;
+  pre-existing, unrelated to Phase A).
+- `cargo test --workspace` — green. Every binary/lib/integration
+  test reports `0 failed`. Per-RFC test files all pass: rfc8881
+  28/28, rfc8446_contract 10/10, rfc7862 12/12, posix_semantics
+  22/22, rfc4506 18/18, rfc1813 12/12, rfc8435 20/20 (sampled).
+- `cargo test -p kiseki-acceptance` — full BDD pass:
+  **275 scenarios, 274 passed, 1 failed**. The 1 failure is the
+  pre-existing deferred scenario "Real Linux pNFS client round-trip
+  (RFC fidelity)" in `pnfs-rfc8435.feature`, which fails at
+  `Given a Linux 6.7+ pNFS client is available with xprtsec=mtls`
+  by design — it's the scenario CLAUDE.md flags as deferred to
+  `tests/e2e/test_pnfs.py`. **No regressions from Phase A.**
+
+### BDD scenario count
+
+- **Before Phase A**: 275 @integration scenarios, 274 pass on Linux
+  + 1 deferred to `tests/e2e/test_pnfs.py` (per CLAUDE.md).
+- **After Phase A**: 275 @integration scenarios, 274 pass on Linux
+  + 1 deferred. **Identical baseline.** `@happy-path` tag count is
+  still 0 — ADR-023 §D4.1 phase A scaffolding hasn't been wired
+  into existing feature files yet (intentional: phase A here means
+  "introduce the dual-tag without semantic change," and per the
+  ADR new BDD scenarios use both tags side-by-side; no new
+  scenarios were added by these commits).
+
+### Phase 15 e2e readiness
+
+Verdict: **unblocked, pending live verification.**
+
+- `tests/e2e/test_pnfs.py` collects clean (3 items:
+  `test_pnfs_xprtsec_mtls`, `test_pnfs_plaintext_fallback`,
+  `test_pnfs_layout_recall_on_drain`).
+- `import test_pnfs` succeeds — no breakage from Phase A's typed
+  errors / wire changes.
+- `tests/e2e/Dockerfile.pnfs-client` is unchanged and unaffected
+  (it builds an Ubuntu 24.04 image with `nfs-common` + `ktls-utils`;
+  no kiseki crate dependency).
+- ADR-023 §D3 says Group III closing unblocks Phase 15. Group III
+  ✅ landed in commit `089da2f`; the catalog rows for RFC 8881,
+  RFC 7862, RFC 8435, RFC 5665, RFC 9289 are all ✅. The hot path
+  (Group I → II → III) is closed.
+- **Live mount verification (kernel ≥6.5 + privileged docker) was
+  NOT executed per integrator scope.** That run is the Phase 15
+  e2e proper and belongs to the user / CI, not to this pass.
+
+### Cross-feature breakage findings
+
+#### INT-PA-1 — `unwrap_or_default` masking strict-XDR errors in NFS handlers
+
+**Severity**: Medium. **Category**: Wire-fidelity (latent).
+**Locations**:
+- `crates/kiseki-gateway/src/nfs3_server.rs` — 35+ call sites
+  (e.g. lines 224-225, 260-264, 299-300, 326-327, 410-413, 509-542,
+  584, 645-649) decode XDR fields with
+  `.read_*().unwrap_or(0)` / `.unwrap_or_default()`.
+- `crates/kiseki-gateway/src/pnfs_ds_server.rs` — ~10 call sites
+  (lines 237-239, 354-356, 417).
+- `crates/kiseki-gateway/src/nfs4_server.rs` — ~30 call sites
+  (lines 293-295, 415-418, 451-453, …).
+
+**Why it matters**: Phase A tightened `XdrReader::read_bool`
+(rejects values other than 0/1) and `read_opaque` (verifies the
+length-prefix padding per RFC 4506 §4.10). A malformed wire
+fragment — short input, illegal bool, broken length prefix — now
+returns `Err(io::Error)` from the primitive. The handler then
+silently swallows the error via `unwrap_or_default()` and proceeds
+with synthetic data (`offset=0`, `count=0`, `name=""`,
+`data=b""`). This means a Phase A-strict primitive **does not
+propagate strictness to the handler**: the handler operates on
+fabricated zeroes instead of returning `NFS3ERR_INV` /
+`NFS4ERR_BADXDR`. The two motivating bugs (NULL ping, EXCHANGE_ID
+flags) are reminders that latent error-swallowing is exactly
+where production wire bugs hide.
+
+**Caveat**: The Layer 1 reference-decoder tests (rfc1813.rs,
+rfc8881.rs, etc.) still pass because they exercise *valid* wire
+fragments. The breakage surface is malformed input — a fuzzer or
+malicious client. The BDD `@integration` suite doesn't cover that
+either (it sends well-formed bytes). So this is **not a blocker
+for Phase A's "all green" claim**, but it is a real fidelity gap
+left open by Phase A.
+
+**Suggested resolution**: file as a follow-up sweep (likely a
+"Group X — handler-level XDR error propagation" task). Convert
+`unwrap_or_default()` on `read_*` calls into either explicit
+`?` propagation with a typed reply (`NFS3ERR_INV` /
+`NFS4ERR_BADXDR`) or `let Ok(x) = … else { return badxdr_reply() }`.
+Add negative-test cases at the BDD layer (one per handler) that
+inject a truncated / malformed request and assert the spec error.
+Does NOT block Phase A close.
+
+#### INT-PA-2 — Asymmetric TLS-version restriction (server-only TLS 1.3)
+
+**Severity**: Low–Medium. **Category**: Defence-in-depth.
+**Location**: `crates/kiseki-transport/src/config.rs`.
+
+The Phase A change (commit `85503d9`, Group VII) restricts
+**`ServerConfig`** to TLS 1.3 only via cipher-suite filter +
+`with_protocol_versions(&[TLS13])` (lines 164-170). The
+**`ClientConfig`** at lines 76-79 still uses
+`rustls::ClientConfig::builder()` with default version negotiation
+(rustls accepts both TLS 1.2 + TLS 1.3 by default).
+
+In a homogeneous in-cluster topology this is mostly benign — every
+TLS client (Raft via `kiseki-raft/src/tcp_transport.rs:103-125`,
+gRPC via `tonic`, S3 backups via `kiseki-backup/src/s3.rs`) talks
+to a kiseki server, and that server now only speaks TLS 1.3 — so
+the handshake will negotiate TLS 1.3 anyway. **No production
+in-cluster RPC silently rides TLS 1.2 today.** The asymmetry would
+matter if (a) a kiseki client ever connects to a non-kiseki TLS
+endpoint that prefers TLS 1.2, or (b) a future kiseki node runs an
+older TlsConfig::server_config build. The catalog row for RFC 8446
+claims "TLS 1.3 only" without qualifying it as server-side; that's
+a small but real fidelity gap.
+
+**Suggested resolution**: mirror the server-side restriction on
+the `ClientConfig` (filter cipher suites + `with_protocol_versions`).
+Trivial diff. Does NOT block Phase A close.
+
+#### INT-PA-3 — `GatewayError::ReadOnlyNamespace` exhaustive-match audit
+
+**Status**: **Clean.** No breakage.
+
+`GatewayError` is consumed by exactly two `match` arms in non-test
+code:
+- `crates/kiseki-gateway/src/error.rs:48-54` — uses wildcard `_ =>`
+  for the `From<GatewayError> for KisekiError` conversion.
+- `crates/kiseki-client/src/fuse_fs.rs:553-562` — uses wildcard
+  `_ => libc_eio()` and explicitly matches the new
+  `ReadOnlyNamespace` arm to `EROFS`.
+
+Both already handle the new variant correctly. No follow-up
+needed.
+
+### Doc / state-of-world updates needed
+
+The user requested "suggest, don't edit." All three are
+**non-blocking** but should land before the next release tag.
+
+1. **`.claude/CLAUDE.md` "Entry point" section is stale.** It still
+   reads:
+
+   > Phase 15 complete (pNFS RFC 8435 layout + DS subprotocol,
+   > NFS-over-TLS default with audited plaintext fallback,
+   > TopologyEventBus + LAYOUTRECALL). 19 production crates, 38 ADRs,
+   > 275 @integration BDD scenarios: 274 pass on Linux + 1 deferred
+   > to tests/e2e/test_pnfs.py …
+
+   Phase 15 was paused (per ADR-023 rev 2 §"Bugs that motivated rev
+   2" and the implementation plan). What just landed is **Phase A
+   (Layer 1 RFC compliance) close**: 24 reference decoders + 9 fix
+   groups, every catalog row except the explicitly-rejected (RFC
+   5663, RFC 8154) and explicitly-not-implemented (RFC 2203 / 5403
+   / 7204, RFC 7578) ones is at ✅ or 🟡. Suggested rewrite:
+
+   > Phase A complete (Layer 1 RFC compliance per ADR-023 rev 2):
+   > 24 reference decoders + 9 fix groups; every non-rejected /
+   > non-not-implemented catalog row at ✅ or 🟡. Phase 15 e2e
+   > unblocked pending live verification (mount.nfs4 with
+   > xprtsec=mtls inside the privileged client container).
+   > 19 production crates, 38 ADRs, 275 @integration BDD scenarios:
+   > 274 pass on Linux + 1 deferred to tests/e2e/test_pnfs.py …
+
+2. **`specs/implementation/phase-A-layer1-rfc-compliance.md`
+   Definition of Done** — items 1, 2, 3 are met. Item 4 (auditor
+   gate-2 spec-fidelity check) and item 5 (begin §D4.1 phase B)
+   are next-up; not part of integrator scope but worth flagging.
+
+3. **Version bump signal**: workspace version is `2026.38.0`. The
+   last release commit (`49f8efa release: v2026.37.394`) was
+   pre-Phase A. A `2026.38.x` release tag covering Phase A is
+   appropriate; the changes are wire-protocol fidelity (no API
+   breakage, but observable correctness improvements that downstream
+   integrators will care about). Suggested release notes anchor:
+   "Layer 1 RFC compliance: NFSv3/v4 / pNFS / S3 / TLS / FUSE
+   reference decoders + per-section unit tests; 9 wire-protocol
+   fidelity fixes (NFSv4 BADHANDLE/NOFILEHANDLE distinctions,
+   pNFS IPv6 uaddr, NFS-over-TLS keep-alive, S3 Range/conditional
+   headers, TLS 1.3-only on server, EROFS errno mapping)."
+
+### Catalog-vs-implementation spot check
+
+Three randomly-chosen ✅ rows verified end-to-end:
+
+| Catalog row | Test file | Result |
+|---|---|---|
+| RFC 8881 (NFSv4.1) | `crates/kiseki-gateway/tests/rfc8881.rs` | 28 passed, 0 failed |
+| RFC 8446 (TLS 1.3) | `crates/kiseki-transport/tests/rfc8446_contract.rs` | 10 passed, 0 failed |
+| POSIX.1-2024 | `crates/kiseki-client/tests/posix_semantics.rs` | 22 passed, 0 failed |
+
+Catalog and code are in sync.
+
+### Verdict
+
+**All clear.** Phase A integrates cleanly. Two non-blocking findings
+(INT-PA-1 handler-level error swallowing, INT-PA-2 client-side TLS
+version asymmetry) and one stale doc string (entry-point summary)
+should be addressed before the next release tag, but neither blocks
+this close. Phase 15 e2e is unblocked pending live mount
+verification.
+
+---
+
+## Phase A close — adversary findings (2026-04-27)
+
+Reviewed: ADR-023 rev 2, the Phase A plan, the catalog, and the
+five Phase A commits (`1e69269..85503d9`). Sweep found the catalog
+status (24 of 25 rows ✅) is over-claimed in several places. The
+Layer 1 reference-decoder + per-section coverage discipline that
+ADR-023 §D2.1 requires is structurally bypassed in roughly a
+quarter of the new test files.
+
+Severity legend: **P0** blocks Phase A close · **P1** must fix
+before Phase B · **P2** real fidelity gap, schedule into Phase B ·
+**P3** cosmetic / non-blocking.
+
+### ADV-PA-1 — `tests/wire-samples/<rfc>/` directory does not exist; no Layer 1 row has the cross-implementation seed §D2.3 / §D2.3.2 demands
+
+- **Where**: filesystem (`crates/*/tests/wire-samples/` is absent
+  workspace-wide); ADR-023 §D2.3.1+§D2.3.2 mandate text fixtures
+  with sibling `.txt` provenance and reproduction scripts.
+- **Severity**: **P0** for the catalog claim "✅"; **P1** for Phase A
+  close.
+- **Argument**: ADR-023 §D2.3 says ✅ requires a "captured wire
+  sample from a known-good independent implementation" with
+  provenance metadata. Every `tests/rfc_<N>.rs` file currently
+  inlines its "seed" as a Rust constant or reproduces RFC text
+  inside a `&str` literal. There is no `tests/wire-samples/`
+  directory in any crate, no `.txt` provenance siblings, no
+  reproduction scripts, no LFS pointers, no SHA-256 sentinels.
+  Per the ADR's own legend (`✅ — Reference decoder + every spec
+  section has at least one assertion. Negative tests for every
+  error code …`) plus §D2.3 ("when the spec defines an encoder
+  shape … cross-implementation seed"), every catalog row that
+  encodes (RFC 4506, 1813, 7530, 8881, 7862, 8435, 5665, 9110,
+  3986, 8446, AWS SigV4, S3 REST, gRPC, Raft RPC) is
+  over-classified.
+- **Repro / verification**:
+  ```
+  find crates -path '*/tests/wire-samples*' -type d  # no output
+  grep -RIn '\.gitattributes\|sha256\|provenance' crates/*/tests/    # nothing
+  ```
+  ADR-023 §D2.3.2 explicitly says "binary `.pcap` captures … with
+  `.gitattributes` declaring them as Git LFS pointers, AND the
+  source file embeds the SHA-256 of the expected blob so a missing
+  LFS object fails loudly" — none of this scaffolding exists.
+
+### ADV-PA-2 — `rfc9289.rs` is largely tautological; "TLS keep-alive" is the only spec-section assertion that touches production code
+
+- **Where**: `crates/kiseki-gateway/tests/rfc9289.rs`. 11 tests
+  total; only `s4_2_keepalive_cadence_is_60_seconds` (lines 174-186)
+  reads a production constant. The remaining 10 are local-state
+  tautologies.
+- **Severity**: **P1**. The catalog row says "RFC 9289 ✅ — Group IV
+  closed 2026-04-27: TCP keep-alive at 60-sec cadence." 1-of-11
+  is not "every spec section that defines a wire structure has at
+  least one positive + one negative test."
+- **Argument**: Concrete examples:
+  - `s3_kiseki_default_policy_is_mtls` (lines 102-126):
+    `let tls_enabled = true; if tls_enabled { assert!(true, …) }`.
+    Branches on a literal it just set; the body is `assert!(true)`.
+  - `s3_2_no_alpn_for_nfs_over_tls` (lines 139-159):
+    `let nfs_alpn: Vec<Vec<u8>> = Vec::new(); assert!(nfs_alpn.is_empty(), …)`.
+    The local empty `Vec` is empty.
+  - `s5_tls_required_listener_drops_plaintext_connection`
+    (lines 219-246): `assert_ne!(0x80u8, 0x16u8, …)`. Two byte
+    literals that differ.
+  - `s5_mtls_listener_rejects_client_without_cert`
+    (lines 248-264): `let kiseki_requires_client_cert = true; assert!(kiseki_requires_client_cert)`.
+  - `s5_plaintext_fallback_emits_audit_event_on_every_boot`,
+    `s5_plaintext_fallback_halves_layout_ttl_to_60s`,
+    `s4_2_keepalive_only_when_idle`,
+    `rfc_seed_tls_record_content_types`: all assert local
+    constants against themselves or trivial arithmetic.
+
+  None of these tests would notice if `serve_nfs_listener` reverted
+  to plaintext, lost mTLS verification, dropped the audit event, or
+  changed the layout TTL.
+- **Repro / verification**: open `tests/rfc9289.rs`. For each
+  function, ask: "what production symbol does this read?" Answer
+  is `RFC9289_KEEPALIVE_INTERVAL_SECS` once, `XprtSec`
+  helper-defined-in-the-test-file once, and nothing else.
+
+### ADV-PA-3 — S3 HTTP-date parser inspects only the year token; ignores month/day/HMS and uses a 365-day flat year — production breaks for boto3-class real headers
+
+- **Where**: `crates/kiseki-gateway/src/s3_server.rs:397-416`
+  (`httpdate_to_epoch`). Used by `is_http_date_in_future` /
+  `_in_past` for `If-Modified-Since` / `If-Unmodified-Since`.
+- **Severity**: **P1** (real correctness bug; conditional GETs
+  return wrong status against any production SDK).
+- **Argument**: The parser does
+  `trimmed.split_whitespace().nth(3)` to grab the year token, then
+  computes `(year - 1970) * 365 * 86400` and compares against
+  `SystemTime::now().duration_since(UNIX_EPOCH).as_secs()`. Two
+  fatal issues:
+  1. Real boto3 / curl `If-Modified-Since` headers carry
+     CURRENT-day timestamps (`Wed, 21 Apr 2026 14:00:00 GMT`).
+     The parser rounds that to "start of 2026" — so a request
+     made one minute after the resource's PUT will report
+     `If-Modified-Since: 2026-04-27T14:00:00Z` ≈
+     `(2026-1970)*31_536_000 = 1_766_016_000`, while
+     `now_unix_secs()` for 2026-04-27 ≈ `1_777_xxx_xxx`. They
+     differ by ~four months. The "in past / in future"
+     classification flips at start-of-year boundaries and on
+     leap-day drift (~15 days off by 2030).
+  2. The "365 × 86400" arithmetic ignores leap years entirely.
+     `now_unix_secs()` is real wall-clock; the comparand is a
+     naïve year-count. The two clocks aren't even on the same
+     time base.
+
+  The rfc9110 tests pass because they use only `Fri, 31 Dec 2099
+  23:59:59 GMT` (far future) and `Thu, 01 Jan 1970 00:00:00 GMT`
+  (epoch) — both extreme boundaries the year-only parser handles
+  by accident. Any test using a current-decade date would expose
+  the bug.
+- **Repro / verification**:
+  ```rust
+  let v = "Wed, 21 Apr 2026 14:00:00 GMT";
+  // httpdate_to_epoch returns 56 * 31_536_000 = 1_766_016_000
+  // SystemTime::now() on 2026-04-27 returns ~1_777_651_200
+  // → is_http_date_in_past returns TRUE for a date that is
+  //   actually in the FUTURE (relative to a request made at
+  //   2026-04-26).
+  ```
+  Verify by adding a test with a current-year date and observing
+  the conditional returns 412 instead of 304 (or vice versa).
+
+### ADV-PA-4 — Content-Type round-trip is per-instance HashMap; multi-gateway deployments lose Content-Type on PUT/GET across instances
+
+- **Where**: `crates/kiseki-gateway/src/s3_server.rs:40, 100-101,
+  182-186, 261-266`. State is
+  `object_content_types: Mutex<HashMap<(String, String), String>>`,
+  scoped to one `S3State<G>` instance.
+- **Severity**: **P1** (correctness against the documented
+  ADR-014 / RFC 6838 round-trip contract for any non-trivial
+  deployment).
+- **Argument**: The catalog claims RFC 6838 ✅ on the basis of
+  this round-trip. But:
+  1. Two gateway instances behind a load-balancer have disjoint
+     maps. PUT to gateway-A then GET from gateway-B drops the
+     Content-Type — the contract test `put_get_content_type_round_trip`
+     passes in single-instance unit-tests and silently fails in
+     production.
+  2. The map is unbounded — a long-running gateway leaks memory
+     proportional to PUT count.
+  3. State is in-process, lost on restart.
+  4. The map is keyed by `(bucket, key)` AND
+     `(bucket, resp.etag)` — two entries per object. Eviction or
+     overwrite isn't handled.
+
+  This is the "satisfies the test but doesn't address the spec
+  rule" pattern the user warned about. The proper fix is to thread
+  Content-Type into the composition store / object metadata
+  (where every gateway sees it).
+- **Repro / verification**: spin up two gateways pointed at the
+  same back-end, PUT through one with `Content-Type: image/png`,
+  GET through the other — the GET response will lack the header.
+
+### ADV-PA-5 — Native ABI test (T-25) does NOT verify `extern "C"` symbol presence; "cross-implementation seed" comment in the test is misleading
+
+- **Where**:
+  `crates/kiseki-client/tests/native_abi.rs:107-139`
+  (`kiseki_cache_stats_field_order_via_raw_layout`).
+- **Severity**: **P2** — current Python/C++ wrappers DO link
+  against these symbols, so the next CI build that exercises them
+  catches a symbol rename. But the catalog-row claim that this
+  Layer 1 test pins the ABI is stronger than the test actually
+  warrants.
+- **Argument**: The doc comment for the test is titled
+  "Cross-implementation seed — wrapper layout matches C header"
+  but the test never reads `kiseki_client.h`, never compares
+  byte sizes against a vendored C-compiled struct, and never
+  invokes any `extern "C"` function. It just instantiates a Rust
+  `KisekiCacheStats`, sets fields to 0..9, casts the address to
+  `*const u64`, and reads back — confirming Rust's
+  field-declaration-order matches Rust's `repr(C)` layout (which
+  the `#[repr(C)]` attribute already guarantees by language
+  rule).
+
+  Worse: the file doc-comment claims "Symbol presence at link time
+  is exercised by the wrappers themselves" (lines 19-22). I could
+  not find the wrappers in the repo (`find /home/witlox/kiseki
+  -path '*/python*' -o -name '*.cpp'` returns only
+  `crates/kiseki-client/include/kiseki_client.h` and
+  `crates/kiseki-client/src/python.rs`). There is no
+  Python-wrapper test in CI that actually dlopens libkiseki and
+  resolves any of `kiseki_open / read / write / stat / stage /
+  release / close / cache_stats`. Renaming any of those with a
+  matching update to `python.rs` (a PyO3 binding, not a separate
+  C consumer) would not surface as a test failure.
+
+  A real Layer 1 ABI test would either:
+  - parse `include/kiseki_client.h` and confirm the offsets +
+    enum values match the Rust `#[repr(C)]` types via
+    `bindgen`-style compile-time reflection, or
+  - compile a tiny C program that links the cdylib and prints
+    `sizeof(KisekiCacheStats)` + `offsetof(...)` for each field,
+    and asserts those values against the Rust side.
+- **Repro / verification**: `nm target/release/libkiseki_client.so
+  | grep ' T kiseki_'` → if the symbol export list is short by
+  one symbol, no Phase A test catches it.
+
+### ADV-PA-6 — RFC 8881 catalog row claims ✅ but only ~17 of ~50+ §18 operations have any wire-side test
+
+- **Where**: `crates/kiseki-gateway/tests/rfc8881.rs` covers
+  sections 13.1, 15.1, 16.1, 18.{2,3,7,8,16,19,21,22,32,35,36,37,
+  40,43,44,46,51}. RFC 8881 §18 defines OP_ACCESS=3, CLOSE=4,
+  COMMIT=5, DELEGPURGE=7, DELEGRETURN=8, GETATTR=9, GETFH=10,
+  LINK=11, LOCK=12 / LOCKT=13 / LOCKU=14, LOOKUP=15, LOOKUPP=16,
+  NVERIFY=17, OPEN=18, OPENATTR=19, OPEN_CONFIRM=20,
+  OPEN_DOWNGRADE=21, PUTFH=22 (covered), PUTPUBFH=23, PUTROOTFH=24
+  (covered), READ=25, READDIR=26, READLINK=27, REMOVE=28,
+  RENAME=29, RENEW=30, RESTOREFH=31, SAVEFH=32 (covered),
+  SECINFO=33, SETATTR=34, SETCLIENTID=35 + 36 (covered),
+  VERIFY=37 (covered), WRITE=38, RELEASE_LOCKOWNER=39, BACKCHANNEL_CTL=40
+  (covered), BIND_CONN_TO_SESSION=41, EXCHANGE_ID=42 (covered),
+  CREATE_SESSION=43 (covered), DESTROY_SESSION=44 (covered),
+  FREE_STATEID=45, GET_DIR_DELEGATION=46, GETDEVICEINFO=47,
+  GETDEVICELIST=48, LAYOUTCOMMIT=49, LAYOUTGET=50, LAYOUTRETURN=51
+  (covered), SECINFO_NO_NAME=52, SEQUENCE=53 (covered),
+  SET_SSV=54, TEST_STATEID=55, WANT_DELEGATION=56,
+  DESTROY_CLIENTID=57, RECLAIM_COMPLETE=58.
+- **Severity**: **P1**. ADR-023 §D2.1 says "every spec section
+  that defines a wire structure" gets positive + negative. ✅
+  here is over-claimed.
+- **Argument**: This is the largest spec in the catalog and the
+  one whose fidelity gap motivated rev 2 in the first place.
+  Operations like OPEN (§18.16, the heart of every NFS read/write
+  flow), READ (§18.22 — only a NOFILEHANDLE negative is tested),
+  SETATTR (§18.30), READDIR (§18.23), and SETCLIENTID/_CONFIRM
+  (§18.27/28 — the v4.0 path that existing v4.0 clients fall back
+  to) have NO positive/negative wire-side test. The rfc7530
+  fallback path goes through SETCLIENTID, not EXCHANGE_ID, and
+  that whole code path has no Layer 1 coverage even though the
+  catalog row for RFC 7530 is also ✅.
+
+  Per ADR-023 rev 2 §D5 the auditor is supposed to verify this at
+  gate 2; that gate hasn't fired for Phase A.
+- **Repro / verification**:
+  ```
+  grep -E '^fn s18_[0-9]+_' crates/kiseki-gateway/tests/rfc8881.rs \
+      | sed -E 's/fn (s18_[0-9]+_).*/\1/' | sort -u | wc -l
+  # → 17  (vs ~50+ ops in §18)
+  ```
+
+### ADV-PA-7 — `rfc8446_contract.rs` ALPN policy tests are empty-Vec tautologies; do not inspect production `ServerConfig.alpn_protocols`
+
+- **Where**:
+  `crates/kiseki-transport/tests/rfc8446_contract.rs:246-281`
+  (`alpn_grpc_data_path_advertises_h2_only` and
+  `alpn_nfs_path_advertises_nothing`).
+- **Severity**: **P1** (real Layer 1 fidelity gap).
+- **Argument**:
+  - `alpn_grpc_data_path_advertises_h2_only` builds
+    `let alpn_for_grpc: Vec<Vec<u8>> = vec![b"h2".to_vec()];` and
+    asserts it has length 1 and contains `b"h2"`. Doesn't call
+    `TlsConfig::server_config(...)` and doesn't read
+    `.alpn_protocols`.
+  - `alpn_nfs_path_advertises_nothing` constructs two empty
+    `Vec<Vec<u8>>` and asserts they're equal. The accompanying
+    comment admits "RED-by-design" but the assertion succeeds.
+    `vec![] == vec![]` regardless of any production behavior.
+  - `s_b_4_iana_codepoints_pinned` (lines 129-138) asserts
+    `TLS_AES_128_GCM_SHA256 == 0x1301` after declaring
+    `const TLS_AES_128_GCM_SHA256: u16 = 0x1301`. That's
+    "constant equals itself."
+  - `rfc_seed_s_b_4_cipher_suite_codepoints` (lines 508-526)
+    iterates a local table and asserts every codepoint has high
+    byte `0x13` — a property of the table the test wrote, not of
+    the IANA registry.
+
+  At least `s_b_4_no_legacy_tls12_only_suites` and
+  `s4_4_2_4_verifier_rejects_rogue_chain_directly` DO inspect
+  production `ServerConfig` and `WebPkiClientVerifier` —
+  acknowledged. But the file's catalog claim ("✅ — Group VII
+  closed 2026-04-27 … verified directly + via authoritative
+  bytes-cross-channel test") is overstated by the four tests
+  above.
+- **Repro / verification**: read the four tests; observe none
+  calls `kiseki_transport::config::TlsConfig::server_config`.
+
+### ADV-PA-8 — mTLS test resolution conflates "rustls #1521 timing race" with "test panicked on `Ok` of TLS handshake"; the rationale doesn't preclude a real bypass under load
+
+- **Where**:
+  `crates/kiseki-transport/tests/rfc8446_contract.rs:293-419`
+  (`s4_4_2_4_client_cert_signed_by_unrelated_ca_rejected`).
+  Commit `85503d9` claims this Stage-1 finding was a false
+  positive.
+- **Severity**: **P2** — the new direct-verifier test
+  (`s4_4_2_4_verifier_rejects_rogue_chain_directly`) IS a useful
+  regression guard at the verifier API level. But the original
+  test's panic on `connect().Ok` was not pure noise either; it's
+  worth one more pass before declaring the bypass closed.
+- **Argument**: The hardened test now reasons about whether
+  application bytes crossed the verified-channel boundary. That's
+  good. But:
+  1. The server task's `tls.read(&mut buf).await` returns
+     `Ok(0) | Err(_)` ⇒ `Ok(())` (treated as rejection). On a
+     loaded test machine, a slow handshake-failure-alert that
+     takes >2 s to surface produces `Err(timeout)` from the
+     `tokio::time::timeout` outer wrapper (line 413) — also
+     treated as `// fine`. So the test passes whether the server
+     rejects, times out, OR fails to surface a rejection within
+     the 2s budget. If the verifier is broken in a way that
+     deadlocks, this test silently passes.
+  2. The per-test 5s connect timeout (line 387) + 2s "did the
+     server reject" timeout (line 413) means a transient CI
+     stall produces a green test for the wrong reason.
+  3. The direct-verifier test at line 426 is the load-bearing
+     one, but it's a single call to `verify_client_cert` with a
+     hand-picked rogue cert — no negative cross-product (e.g.
+     expired cert, key-usage violation, weak signature
+     algorithm) is tested.
+
+  None of this is critical given the in-process verifier check
+  exists; flagged as P2 because the false-positive narrative is
+  cleaner than the actual evidence.
+- **Repro / verification**: introduce a deliberately-broken
+  `WebPkiClientVerifier` (e.g. wrap the inner verifier with one
+  that returns `Ok(())` always) and run the test under
+  `RUSTFLAGS=-Cdebuginfo=0 cargo test
+  s4_4_2_4_client_cert_signed_by_unrelated_ca_rejected -- --nocapture
+  --test-threads=8` on a busy machine — does the test still fail?
+  If it can pass via the `Err(_timeout)` arm, the bypass-detection
+  story is incomplete.
+
+### ADV-PA-9 — Phase A done-criterion #2 ("e2e mount succeeds without further server-side fixes") is claimed but not actually re-verified
+
+- **Where**:
+  `specs/implementation/phase-A-layer1-rfc-compliance.md:346-348`
+  ("The Phase 15 e2e mount paused 2026-04-27 succeeds without
+  further server-side fixes (Group II + III exit gates)") and
+  the Group III commit `089da2f` ("Critical-path Phase 15 e2e is
+  unblocked at the server side; **next step is to re-run**
+  `tests/e2e/test_pnfs.py` to confirm").
+- **Severity**: **P1** for Phase A close. Without a successful
+  e2e re-run, the criterion is asserted, not satisfied.
+- **Argument**: The Group III commit's own message states the
+  e2e was NOT re-run; it would be the "next step." The Phase A
+  close commit (`85503d9`) does not run it either — it lists
+  per-file unit-test counts only. The ADR-023 motivation was
+  precisely that unit-test green is not e2e green; closing Phase
+  A on unit-test green alone reproduces the same fidelity gap
+  rev 2 was created to fix.
+
+  ADR-023 §D3 ASCII tree puts e2e mount unblock as the Phase B
+  exit, not Phase A — so technically Phase A close is
+  defensible without the e2e. But §"Definition of Done for Phase
+  A" item 2 says otherwise.
+- **Repro / verification**: `git -C kiseki log --since='2026-04-27
+  14:00' --grep='e2e\|test_pnfs'` returns nothing other than the
+  fix commits. No CI run record, no `tests/e2e/test_pnfs.py`
+  invocation in the commits.
+
+### ADV-PA-10 — SigV4 fixture correction: kiseki's chain mathematically converges with Python `hmac` and OpenSSL, but the "AWS-published" claim has no verbatim source-file pointer
+
+- **Where**:
+  `crates/kiseki-gateway/tests/aws_sigv4.rs:101-110, 274-277`
+  (the new `ea21d6f0…` and `dac1aa02…` signatures); and
+  `crates/kiseki-gateway/src/s3_auth.rs:418-476`
+  (`signing_key_and_signature_match_aws_get_vanilla`).
+- **Severity**: **P3** — re-derived independently
+  (Python `hmac.new` confirms `ea21d6f05e96…` for these inputs).
+  Mathematically the new fixture is consistent with the canonical
+  request hash `bb579772…` AWS publishes. But the claim "matches
+  AWS-published" is one degree weaker than it appears.
+- **Argument**: The cross-check the commit cites
+  (Python `hmac` + OpenSSL `dgst`) is a check that THREE
+  implementations of HMAC-SHA256 agree on the same input bytes
+  — they will, because the algorithm is deterministic and
+  HMAC-SHA256 has been stable since 2002. What the cross-check
+  does NOT prove is that the canonical-request bytes kiseki
+  computes are the same as AWS's reference canonical-request
+  bytes. The hash `bb579772…` is asserted to match AWS-published
+  in the doc comment, but the test does not vendor
+  `aws-sig-v4-test-suite/get-vanilla/get-vanilla.sreq` (or the
+  corresponding `.creq` / `.authz`) as a text fixture.
+
+  Per ADR-023 §D2.3.1, the source priority for cross-impl seeds
+  is: (1) spec-embedded examples — pure text, (2) public test
+  suites — pure text, vendored as bytes. The `aws-sig-v4-test-suite`
+  is BSD-3 licensed and ~50 KiB total. Vendoring its
+  `get-vanilla/*.{req,creq,sts,authz,sreq}` files into
+  `tests/wire-samples/aws-sigv4/get-vanilla/` and parsing the
+  `.authz` to extract the expected signature would produce a
+  defensible "AWS-published" link. Right now, all the test has
+  is "the kiseki author transcribed `bb579772…` as the
+  expected hash."
+
+  If `bb579772…` itself were a transcription error in the same
+  way the original `5fa00fa31…` signature was, kiseki's
+  canonical-request might be wrong AND the test would still be
+  green.
+- **Repro / verification**: vendor
+  `aws-doc-sdk-examples/aws-sig-v4-test-suite/get-vanilla/get-vanilla.creq`
+  and `get-vanilla.authz` as text fixtures with provenance
+  siblings; assert the test's expected_creq and expected
+  signature equal the file bytes. If the assertion still
+  passes, ADV-PA-10 closes.
+
+---
+
+### Summary
+
+10 findings across the Phase A landing.
+
+| ID | Severity | Title (short) |
+|---|---|---|
+| ADV-PA-1 | P0/P1 | No `tests/wire-samples/` — every "✅" overstates ADR-023 §D2.3 |
+| ADV-PA-2 | P1 | rfc9289.rs is 1-of-11 production-touching tests |
+| ADV-PA-3 | P1 | HTTP-date parser only reads year; SDK-real headers misclassified |
+| ADV-PA-4 | P1 | Content-Type round-trip is per-instance HashMap |
+| ADV-PA-5 | P2 | Native ABI test doesn't verify `extern "C"` symbol presence |
+| ADV-PA-6 | P1 | RFC 8881 ✅ but ~33 of ~50+ §18 ops untested |
+| ADV-PA-7 | P1 | TLS ALPN/codepoint tests are empty-Vec tautologies |
+| ADV-PA-8 | P2 | mTLS test's timeout arms can mask a real bypass |
+| ADV-PA-9 | P1 | Phase A done-criterion #2 (e2e re-run) asserted not verified |
+| ADV-PA-10 | P3 | SigV4 fixture chain mathematically defensible; provenance thin |
+
+**Maximum severity**: P0 (ADV-PA-1) for the catalog-claim
+correctness; P1 for everything that blocks Phase B confidently.
+
+**Recommendation**: Phase A close is **NOT** clear of fidelity
+debt. The `tests/wire-samples/` scaffolding (ADV-PA-1) should
+land before any catalog row keeps its ✅. ADV-PA-2/7 (tautological
+tests) and ADV-PA-3/4 (production logic that satisfies the test
+but breaks under SDK-real or multi-instance traffic) should be
+fixed before declaring "Layer 1 done" and proceeding to Phase B.
+ADV-PA-9 (e2e re-run) is the cleanest pass/fail check; it should
+run before Phase A is signed off in a release tag.
