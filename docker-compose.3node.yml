@@ -28,6 +28,8 @@ services:
       KISEKI_NODE_ID: "1"
       KISEKI_RAFT_PEERS: "1=kiseki-node1:9300,2=kiseki-node2:9300,3=kiseki-node3:9300"
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
+      KISEKI_ALLOW_PLAINTEXT_NFS: "true"
+      KISEKI_INSECURE_NFS: "true"
     volumes:
       - node1-data:/data
     healthcheck:
@@ -55,6 +57,8 @@ services:
       KISEKI_NODE_ID: "2"
       KISEKI_RAFT_PEERS: "1=kiseki-node1:9300,2=kiseki-node2:9300,3=kiseki-node3:9300"
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
+      KISEKI_ALLOW_PLAINTEXT_NFS: "true"
+      KISEKI_INSECURE_NFS: "true"
     volumes:
       - node2-data:/data
     healthcheck:
@@ -82,6 +86,8 @@ services:
       KISEKI_NODE_ID: "3"
       KISEKI_RAFT_PEERS: "1=kiseki-node1:9300,2=kiseki-node2:9300,3=kiseki-node3:9300"
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
+      KISEKI_ALLOW_PLAINTEXT_NFS: "true"
+      KISEKI_INSECURE_NFS: "true"
     volumes:
       - node3-data:/data
     healthcheck:

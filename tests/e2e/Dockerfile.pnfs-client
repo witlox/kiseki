@@ -1,0 +1,29 @@
+# pNFS client — minimal Linux image with nfs-utils + ktls-utils.
+#
+# Used by tests/e2e/test_pnfs.py via `docker run --rm --privileged
+# --network kiseki_default …` to issue mount.nfs4 against the
+# kiseki cluster's internal hostnames (kiseki-node1:2049 etc.).
+# The host can't resolve those names, but a container joined to
+# `kiseki_default` can — which is the only network on which a real
+# pNFS client can reach all DS endpoints from a single namespace.
+#
+# Image is built once per pytest session by the `pnfs_client_image`
+# fixture and tagged `kiseki-pnfs-client:test`.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nfs-common \
+        ktls-utils \
+        curl \
+        ca-certificates \
+        iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# tlshd needs to be running for `xprtsec=mtls` mounts to complete
+# the TLS handshake. The pNFS test harness invokes the entrypoint
+# with explicit commands, so we keep CMD as a no-op.
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["echo 'kiseki-pnfs-client: provide a command'"]

@@ -101,6 +101,12 @@ def _start_local(data_port: int, advisory_port: int) -> ServerInfo:
         "KISEKI_DATA_ADDR": data_addr,
         "KISEKI_ADVISORY_ADDR": advisory_addr,
         "KISEKI_BOOTSTRAP": "true",
+        # ADR-038 §D4.2 — local subprocess has no Cluster CA bundle,
+        # so the audited plaintext-NFS fallback is required for the
+        # NFS path to come up at all. Production deployments wire
+        # real certs.
+        "KISEKI_ALLOW_PLAINTEXT_NFS": "true",
+        "KISEKI_INSECURE_NFS": "true",
     }
 
     process = subprocess.Popen(

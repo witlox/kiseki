@@ -31,6 +31,14 @@ services:
       KISEKI_METRICS_ADDR: "0.0.0.0:9090"
       KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "true"
+      # Dev/test compose has no Cluster CA bundle. ADR-038 §D4.2
+      # plaintext-NFS fallback is the documented dev path: emits a
+      # SecurityDowngradeEnabled audit event each boot, halves the
+      # layout TTL to 60s, refuses to start with > 1 tenant on the
+      # listener. Production deployments wire real certs and drop
+      # both flags.
+      KISEKI_ALLOW_PLAINTEXT_NFS: "true"
+      KISEKI_INSECURE_NFS: "true"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
       OTEL_SERVICE_NAME: "kiseki-server"
       OTEL_TRACES_SAMPLER_ARG: "1.0"
