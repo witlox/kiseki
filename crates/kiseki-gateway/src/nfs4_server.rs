@@ -202,6 +202,20 @@ pub fn handle_nfs4_first_compound<G: GatewayOps>(
     ctx: &NfsContext<G>,
     sessions: &SessionManager,
 ) -> Vec<u8> {
+    // RFC 7530 §15.1: NFSv4 only defines two procedures — NULL (0)
+    // and COMPOUND (1). Linux `mount.nfs4` pings with NULL before
+    // any COMPOUND; if we don't reply with an empty ACCEPT_OK the
+    // client gives up with EIO at the mount syscall.
+    if header.procedure == 0 {
+        let mut w = XdrWriter::new();
+        encode_reply_accepted(&mut w, header.xid, 0); // SUCCESS, no body
+        return w.into_bytes();
+    }
+    if header.procedure != 1 {
+        let mut w = XdrWriter::new();
+        encode_reply_accepted(&mut w, header.xid, 3); // PROC_UNAVAIL
+        return w.into_bytes();
+    }
     let mut reader = XdrReader::new(raw_msg);
     // Skip past the RPC header (already decoded by caller).
     let _ = RpcCallHeader::decode(&mut reader);
@@ -236,7 +250,13 @@ pub fn handle_nfs4_connection<G: GatewayOps, S: io::Read + io::Write>(
             continue;
         }
 
-        // NFSv4 only has procedure 1 (COMPOUND).
+        // RFC 7530 §15.1: NULL ping must succeed with an empty body.
+        if header.procedure == 0 {
+            let mut w = XdrWriter::new();
+            encode_reply_accepted(&mut w, header.xid, 0); // SUCCESS
+            write_rm_message(&mut stream, &w.into_bytes())?;
+            continue;
+        }
         if header.procedure != 1 {
             let mut w = XdrWriter::new();
             encode_reply_accepted(&mut w, header.xid, 3); // PROC_UNAVAIL
@@ -1914,5 +1934,78 @@ mod tests {
 
         // Verify the stateid is invalid.
         assert!(!sessions.is_open(&sid));
+    }
+
+    // ---------- NULL procedure (RFC 7530 §15.1) ----------
+
+    /// Build the bytes that `mount.nfs4 -t nfs4 -o vers=4.x` sends as
+    /// its FIRST RPC: an NFSv4 NULL ping (procedure 0). The Linux
+    /// kernel uses NULL as a liveness probe before any COMPOUND.
+    fn nfsv4_null_call_bytes(xid: u32) -> Vec<u8> {
+        let mut w = XdrWriter::new();
+        // RPC call header — caller, RPC version 2, NFSv4 program.
+        w.write_u32(xid);
+        w.write_u32(0); // CALL
+        w.write_u32(2); // RPC v2
+        w.write_u32(NFS4_PROGRAM);
+        w.write_u32(NFS4_VERSION);
+        w.write_u32(0); // procedure 0 = NULL
+                        // AUTH_NONE creds + verifier.
+        w.write_u32(0);
+        w.write_opaque(&[]);
+        w.write_u32(0);
+        w.write_opaque(&[]);
+        w.into_bytes()
+    }
+
+    /// Decode an ONC RPC reply header from `bytes`. Returns
+    /// `(xid, msg_type, reply_stat, accept_stat)`.
+    fn parse_rpc_reply(bytes: &[u8]) -> (u32, u32, u32, u32) {
+        let mut r = XdrReader::new(bytes);
+        let xid = r.read_u32().expect("xid");
+        let msg_type = r.read_u32().expect("msg_type");
+        let reply_stat = r.read_u32().expect("reply_stat");
+        // Auth verifier: flavor + opaque body.
+        let _ = r.read_u32();
+        let _ = r.read_opaque();
+        let accept_stat = r.read_u32().expect("accept_stat");
+        (xid, msg_type, reply_stat, accept_stat)
+    }
+
+    /// RFC 7530 §15.1 — NFSv4 NULL must succeed with an empty
+    /// ACCEPT_OK reply (no body). Linux `mount.nfs4` pings with NULL
+    /// before any COMPOUND; if we don't reply with `accept_stat = 0`
+    /// the kernel client gives up with `Input/output error` at the
+    /// mount syscall.
+    #[test]
+    fn null_procedure_returns_accept_ok_with_empty_body() {
+        let ctx = test_ctx();
+        let sessions = test_sessions();
+        let xid = 0xCAFE_BABE;
+        let raw = nfsv4_null_call_bytes(xid);
+
+        // Decode the RPC header so we can pass it through the same
+        // path `handle_connection` uses.
+        let mut r = XdrReader::new(&raw);
+        let header = RpcCallHeader::decode(&mut r).expect("decode header");
+        assert_eq!(header.procedure, 0, "we built a NULL call");
+
+        let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+        let (got_xid, msg_type, reply_stat, accept_stat) = parse_rpc_reply(&reply);
+
+        assert_eq!(got_xid, xid);
+        assert_eq!(msg_type, 1, "REPLY");
+        assert_eq!(reply_stat, 0, "MSG_ACCEPTED");
+        assert_eq!(accept_stat, 0, "SUCCESS — NULL must not be rejected");
+
+        // Body after the RPC reply header MUST be empty for NULL.
+        // (Reply header is exactly 24 bytes: xid + msg_type +
+        // reply_stat + verf-flavor + verf-len(0) + accept_stat.)
+        assert_eq!(
+            reply.len(),
+            24,
+            "NULL reply has no body — got {} bytes after header",
+            reply.len() - 24
+        );
     }
 }
