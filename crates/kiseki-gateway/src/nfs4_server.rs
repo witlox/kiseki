@@ -573,7 +573,16 @@ pub(crate) fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionManager)
 }
 
 fn op_putrootfh<G: GatewayOps>(ctx: &NfsContext<G>, state: &mut CompoundState) -> (u32, Vec<u8>) {
-    let fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
+    // RFC 8881 §18.21 + Phase 15c.2: PUTROOTFH returns the server's
+    // pseudo-root, NOT a specific namespace root. The pseudo-root is
+    // a virtual parent directory whose only child is "default", which
+    // resolves (via LOOKUP) to the namespace root. This matches the
+    // semantics `mount.nfs4 server:/default` expects.
+    //
+    // Side-effect: we also pre-register the namespace root so that a
+    // subsequent LOOKUP("default") finds it.
+    let _ = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
+    let fh = ctx.handles.pseudo_root_handle();
     state.current_fh = Some(fh);
 
     let mut w = XdrWriter::new();
@@ -601,16 +610,57 @@ fn op_getfh(state: &CompoundState) -> (u32, Vec<u8>) {
     }
 }
 
+/// FATTR4_* bit positions (RFC 8881 §5.8). Word-0 bits 0..31, with
+/// the kernel-mount-time set covered here. Other bits (mode, owner,
+/// time_*, etc.) can be added when needed.
+mod fattr4 {
+    pub const SUPPORTED_ATTRS: u32 = 0;
+    pub const TYPE: u32 = 1;
+    pub const FH_EXPIRE_TYPE: u32 = 2;
+    pub const CHANGE: u32 = 3;
+    pub const SIZE: u32 = 4;
+    pub const LINK_SUPPORT: u32 = 5;
+    pub const SYMLINK_SUPPORT: u32 = 6;
+    pub const NAMED_ATTR: u32 = 7;
+    pub const FSID: u32 = 8;
+    pub const UNIQUE_HANDLES: u32 = 9;
+    pub const LEASE_TIME: u32 = 10;
+    pub const RDATTR_ERROR: u32 = 11;
+    pub const FILEHANDLE: u32 = 19;
+    pub const FILEID: u32 = 20;
+}
+
+/// `FH4_PERSISTENT` per RFC 8881 §5.8.1.18 — kiseki file handles
+/// outlive a server reboot (the fh4 includes a HMAC over the
+/// composition_id; see ADR-038 §D4.3). The kernel uses this to
+/// decide caching policy.
+const FH4_PERSISTENT: u32 = 0x0;
+
+/// Lease time advertised by kiseki (seconds). Per ADR-038 §D6 the
+/// MDS layout TTL is ≤ 5 minutes; the lease MUST be ≥ that or
+/// clients will renew prematurely. 90 s is the Linux default
+/// expectation.
+const LEASE_TIME_SECS: u32 = 90;
+
+/// `fsid4` major (RFC 8881 §5.8.1.9). One filesystem per kiseki
+/// namespace; we use a single fsid for the root.
+const KISEKI_FSID_MAJOR: u64 = 0xC0FFEE;
+const KISEKI_FSID_MINOR: u64 = 0x1;
+
+#[allow(clippy::too_many_lines)]
 fn op_getattr<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &CompoundState,
 ) -> (u32, Vec<u8>) {
-    // Skip requested attribute bitmap.
+    // Read the request bitmap (RFC 8881 §5.6 + §18.7.1).
     let bitmap_count = reader.read_u32().unwrap_or(0);
+    let mut bitmap_request = Vec::with_capacity(bitmap_count as usize);
     for _ in 0..bitmap_count {
-        let _ = reader.read_u32();
+        bitmap_request.push(reader.read_u32().unwrap_or(0));
     }
+    let req_w0 = bitmap_request.first().copied().unwrap_or(0);
+    let _req_w1 = bitmap_request.get(1).copied().unwrap_or(0);
 
     let mut w = XdrWriter::new();
     w.write_u32(op::GETATTR);
@@ -621,34 +671,133 @@ fn op_getattr<G: GatewayOps>(
         w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
         return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
     };
+    let fh = *fh;
 
-    let status = match ctx.getattr(fh) {
-        Ok(attrs) => {
-            w.write_u32(nfs4_status::NFS4_OK);
-            // Simplified attribute response: bitmap + attr values.
-            // RFC 8881 §5.8.1: bit 1 = FATTR4_TYPE, bit 4 = FATTR4_SIZE.
-            // word0 = (1<<1) | (1<<4) = 0x12.
-            w.write_u32(2); // bitmap count
-            w.write_u32(0x0000_0012); // bitmap[0]: TYPE | SIZE
-            w.write_u32(0); // bitmap[1]
-                            // attr values (opaque)
-            let mut attr_w = XdrWriter::new();
-            let ftype = match attrs.file_type {
-                crate::nfs_ops::FileType::Regular => 1u32,
-                crate::nfs_ops::FileType::Directory => 2u32,
-            };
-            attr_w.write_u32(ftype);
-            attr_w.write_u64(attrs.size);
-            w.write_opaque(&attr_w.into_bytes());
-            nfs4_status::NFS4_OK
+    // Pseudo-root attrs (Phase 15c.2): the kernel asks for attrs on
+    // the pseudo-root after PUTROOTFH. There's no real namespace
+    // backing it, so synthesize the minimum that satisfies the mount
+    // sequence: directory type, fileid=1, size=0.
+    let attrs = if ctx.handles.is_pseudo_root(&fh) {
+        crate::nfs_ops::NfsAttrs {
+            file_type: crate::nfs_ops::FileType::Directory,
+            mode: 0o755,
+            nlink: 2,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            fileid: 1,
         }
-        Err(_) => {
-            w.write_u32(nfs4_status::NFS4ERR_NOENT);
-            nfs4_status::NFS4ERR_NOENT
+    } else {
+        match ctx.getattr(&fh) {
+            Ok(a) => a,
+            Err(_) => {
+                w.write_u32(nfs4_status::NFS4ERR_NOENT);
+                return (nfs4_status::NFS4ERR_NOENT, w.into_bytes());
+            }
         }
     };
 
-    (status, w.into_bytes())
+    // Helper: is the attr requested?
+    let want = |bit: u32| (req_w0 & (1u32 << bit)) != 0;
+
+    // Build the attr-values blob in bit order. Track which bits we
+    // actually populate so the result bitmap reflects only what's
+    // in the value blob (RFC 8881 §5.6 strict).
+    let mut attr_w = XdrWriter::new();
+    let mut result_word0: u32 = 0;
+
+    if want(fattr4::SUPPORTED_ATTRS) {
+        // bitmap4: count + words. Echo the set kiseki actually
+        // supports today (mount-relevant bits).
+        let supported_word0 = (1u32 << fattr4::SUPPORTED_ATTRS)
+            | (1u32 << fattr4::TYPE)
+            | (1u32 << fattr4::FH_EXPIRE_TYPE)
+            | (1u32 << fattr4::CHANGE)
+            | (1u32 << fattr4::SIZE)
+            | (1u32 << fattr4::LINK_SUPPORT)
+            | (1u32 << fattr4::SYMLINK_SUPPORT)
+            | (1u32 << fattr4::NAMED_ATTR)
+            | (1u32 << fattr4::FSID)
+            | (1u32 << fattr4::UNIQUE_HANDLES)
+            | (1u32 << fattr4::LEASE_TIME)
+            | (1u32 << fattr4::RDATTR_ERROR)
+            | (1u32 << fattr4::FILEHANDLE)
+            | (1u32 << fattr4::FILEID);
+        attr_w.write_u32(1); // bitmap word count
+        attr_w.write_u32(supported_word0);
+        result_word0 |= 1 << fattr4::SUPPORTED_ATTRS;
+    }
+    if want(fattr4::TYPE) {
+        let ftype = match attrs.file_type {
+            crate::nfs_ops::FileType::Regular => 1u32,
+            crate::nfs_ops::FileType::Directory => 2u32,
+        };
+        attr_w.write_u32(ftype);
+        result_word0 |= 1 << fattr4::TYPE;
+    }
+    if want(fattr4::FH_EXPIRE_TYPE) {
+        attr_w.write_u32(FH4_PERSISTENT);
+        result_word0 |= 1 << fattr4::FH_EXPIRE_TYPE;
+    }
+    if want(fattr4::CHANGE) {
+        // change_id4 (uint64) — kiseki uses fileid as a stable proxy
+        // until per-composition versioning is wired into the GetAttr
+        // path.
+        attr_w.write_u64(attrs.fileid);
+        result_word0 |= 1 << fattr4::CHANGE;
+    }
+    if want(fattr4::SIZE) {
+        attr_w.write_u64(attrs.size);
+        result_word0 |= 1 << fattr4::SIZE;
+    }
+    if want(fattr4::LINK_SUPPORT) {
+        attr_w.write_bool(true); // kiseki supports hard links
+        result_word0 |= 1 << fattr4::LINK_SUPPORT;
+    }
+    if want(fattr4::SYMLINK_SUPPORT) {
+        attr_w.write_bool(false); // not yet (Phase 16)
+        result_word0 |= 1 << fattr4::SYMLINK_SUPPORT;
+    }
+    if want(fattr4::NAMED_ATTR) {
+        attr_w.write_bool(false); // no named attrs
+        result_word0 |= 1 << fattr4::NAMED_ATTR;
+    }
+    if want(fattr4::FSID) {
+        attr_w.write_u64(KISEKI_FSID_MAJOR);
+        attr_w.write_u64(KISEKI_FSID_MINOR);
+        result_word0 |= 1 << fattr4::FSID;
+    }
+    if want(fattr4::UNIQUE_HANDLES) {
+        attr_w.write_bool(true); // every fh4 is unique (HMAC-stamped)
+        result_word0 |= 1 << fattr4::UNIQUE_HANDLES;
+    }
+    if want(fattr4::LEASE_TIME) {
+        attr_w.write_u32(LEASE_TIME_SECS);
+        result_word0 |= 1 << fattr4::LEASE_TIME;
+    }
+    if want(fattr4::RDATTR_ERROR) {
+        // rdattr_error is meaningful only inside READDIR; for a
+        // GETATTR direct reply we report NFS4_OK (0) for the
+        // current attribute fetch.
+        attr_w.write_u32(0);
+        result_word0 |= 1 << fattr4::RDATTR_ERROR;
+    }
+    if want(fattr4::FILEHANDLE) {
+        attr_w.write_opaque(&fh);
+        result_word0 |= 1 << fattr4::FILEHANDLE;
+    }
+    if want(fattr4::FILEID) {
+        attr_w.write_u64(attrs.fileid);
+        result_word0 |= 1 << fattr4::FILEID;
+    }
+
+    w.write_u32(nfs4_status::NFS4_OK);
+    // Result bitmap — single word covers every attr we encode today.
+    w.write_u32(1);
+    w.write_u32(result_word0);
+    w.write_opaque(&attr_w.into_bytes());
+
+    (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
 fn op_read<G: GatewayOps>(
@@ -1303,6 +1452,21 @@ fn op_lookup<G: GatewayOps>(
     let mut w = XdrWriter::new();
     w.write_u32(op::LOOKUP);
 
+    // Namespace-name alias (Phase 15c.2): from the pseudo-root,
+    // LOOKUP("default") descends into the namespace root. This
+    // satisfies `mount.nfs4 server:/default` without triggering the
+    // kernel's loop-detection (different fileids for /, /default).
+    if name == "default"
+        && state
+            .current_fh
+            .is_some_and(|fh| ctx.handles.is_pseudo_root(&fh))
+    {
+        let ns_root = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
+        state.current_fh = Some(ns_root);
+        w.write_u32(nfs4_status::NFS4_OK);
+        return (nfs4_status::NFS4_OK, w.into_bytes());
+    }
+
     let status = match ctx.lookup_by_name(&name) {
         Some((fh, _attrs)) => {
             state.current_fh = Some(fh);
@@ -1395,6 +1559,20 @@ fn op_access<G: GatewayOps>(
         w.write_u32(nfs4_status::NFS4ERR_BADHANDLE);
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
+
+    // Pseudo-root: synthetic directory; grant lookup+execute (read
+    // for traversal). The kernel needs this to be answerable so it
+    // can enter the mount root.
+    if ctx.handles.is_pseudo_root(fh) {
+        const ACCESS_READ: u32 = 0x01;
+        const ACCESS_LOOKUP: u32 = 0x02;
+        const ACCESS_EXECUTE: u32 = 0x20;
+        let granted = ACCESS_READ | ACCESS_LOOKUP | ACCESS_EXECUTE;
+        w.write_u32(nfs4_status::NFS4_OK);
+        w.write_u32(requested & granted); // supported
+        w.write_u32(requested & granted); // access
+        return (nfs4_status::NFS4_OK, w.into_bytes());
+    }
 
     let status = match ctx.access(fh) {
         Ok(granted) => {
@@ -1910,8 +2088,13 @@ mod tests {
             "current_fh should be set after PUTROOTFH"
         );
 
-        let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
-        assert_eq!(state.current_fh.unwrap(), root_fh);
+        // Phase 15c.2: PUTROOTFH now returns the pseudo-root, not
+        // the namespace root. The pseudo-root is registered (so
+        // GETATTR/ACCESS resolve), and `LOOKUP("default")` from
+        // pseudo-root descends into the namespace root.
+        let pseudo_root = ctx.handles.pseudo_root_handle();
+        assert_eq!(state.current_fh.unwrap(), pseudo_root);
+        assert!(ctx.handles.is_pseudo_root(&pseudo_root));
     }
 
     // ---------- GETATTR (§18.9) ----------
@@ -1925,11 +2108,10 @@ mod tests {
             current_stateid: None,
         };
 
-        // Encode bitmap request.
+        // Request bitmap: TYPE (bit 1) + SIZE (bit 4) = 0x12.
         let mut body = XdrWriter::new();
-        body.write_u32(2); // bitmap count
-        body.write_u32(0x0000_0018); // type + size
-        body.write_u32(0);
+        body.write_u32(1); // bitmap count
+        body.write_u32((1u32 << 1) | (1u32 << 4));
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
@@ -1940,13 +2122,20 @@ mod tests {
         let _op = r.read_u32().unwrap();
         let st = r.read_u32().unwrap();
         assert_eq!(st, nfs4_status::NFS4_OK);
-        // bitmap
         let bm_count = r.read_u32().unwrap();
-        assert_eq!(bm_count, 2);
-        let _bm0 = r.read_u32().unwrap();
-        let _bm1 = r.read_u32().unwrap();
-        // attr values (opaque)
+        assert_eq!(
+            bm_count, 1,
+            "single-word bitmap when only word0 attrs are set"
+        );
+        let bm0 = r.read_u32().unwrap();
+        assert_eq!(
+            bm0,
+            (1u32 << 1) | (1u32 << 4),
+            "result bitmap echoes request"
+        );
         let attr_bytes = r.read_opaque().unwrap();
+        // TYPE (u32) + SIZE (u64) = 12 bytes.
+        assert_eq!(attr_bytes.len(), 12);
         let mut ar = XdrReader::new(&attr_bytes);
         let ftype = ar.read_u32().unwrap();
         assert_eq!(ftype, 2, "root type should be NF4DIR (2)");

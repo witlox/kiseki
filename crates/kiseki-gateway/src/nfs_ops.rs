@@ -45,6 +45,12 @@ pub struct HandleRegistry {
 
 #[derive(Clone, Debug)]
 enum HandleEntry {
+    /// Pseudo-root: the empty parent directory the kernel sees from
+    /// `PUTROOTFH`. Has a single virtual child entry pointing at the
+    /// namespace root via `LOOKUP("default")`. Distinct fileid from
+    /// the namespace root so the kernel doesn't see a path-resolution
+    /// loop (Phase 15c.2 mount fix).
+    PseudoRoot,
     Root {
         namespace_id: NamespaceId,
         tenant_id: OrgId,
@@ -62,6 +68,34 @@ impl HandleRegistry {
             handles: Mutex::new(HashMap::new()),
             root_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The pseudo-root file handle — what `PUTROOTFH` returns. This
+    /// is a stable 32-byte sentinel distinct from any namespace root,
+    /// so the kernel sees a different fileid for "/" vs "/default"
+    /// (Phase 15c.2: avoids `mount(2): Too many levels of symbolic
+    /// links` from kernel loop detection).
+    pub fn pseudo_root_handle(&self) -> FileHandle {
+        // 0xFD-stuffed handle ⇒ fileid bytes differ from any
+        // namespace_id-derived root_handle. Trailing 0xFD also
+        // marks "pseudo-root" for the dispatcher.
+        let mut fh = [0xFDu8; 32];
+        fh[31] = 0xFD;
+        // Idempotent insert.
+        self.handles
+            .lock()
+            .unwrap()
+            .entry(fh)
+            .or_insert(HandleEntry::PseudoRoot);
+        fh
+    }
+
+    /// Whether this handle is the pseudo-root (the parent of the
+    /// namespace alias). Distinguished from `is_root()` (namespace
+    /// root) so dispatch logic can route LOOKUP("default") correctly.
+    pub fn is_pseudo_root(&self, fh: &FileHandle) -> bool {
+        let handles = self.handles.lock().unwrap();
+        matches!(handles.get(fh), Some(HandleEntry::PseudoRoot))
     }
 
     /// Get or create a root directory handle for a namespace.
@@ -108,16 +142,17 @@ impl HandleRegistry {
     /// Look up a handle. Returns `None` if not found.
     pub fn lookup(&self, fh: &FileHandle) -> Option<(NamespaceId, OrgId, Option<CompositionId>)> {
         let handles = self.handles.lock().unwrap();
-        handles.get(fh).map(|entry| match entry {
+        handles.get(fh).and_then(|entry| match entry {
+            HandleEntry::PseudoRoot => None, // pseudo-root has no namespace
             HandleEntry::Root {
                 namespace_id,
                 tenant_id,
-            } => (*namespace_id, *tenant_id, None),
+            } => Some((*namespace_id, *tenant_id, None)),
             HandleEntry::File {
                 namespace_id,
                 tenant_id,
                 composition_id,
-            } => (*namespace_id, *tenant_id, Some(*composition_id)),
+            } => Some((*namespace_id, *tenant_id, Some(*composition_id))),
         })
     }
 

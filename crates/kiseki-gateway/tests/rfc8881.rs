@@ -798,42 +798,41 @@ fn s18_7_getattr_without_current_fh_returns_nofilehandle() {
     );
 }
 
-/// RFC 8881 §18.7 — GETATTR after PUTROOTFH returns a bitmap + attr
-/// blob. The bitmap is a `bitmap4` (variable-length array of u32).
-/// The minimum useful subset for kiseki is `{type, size}` which lives
-/// in word 0 (bit 1 = FATTR4_TYPE, bit 4 = FATTR4_SIZE — bitmap
-/// 0x12), but the production code emits `0x18` (bit 3 = LINK_SUPPORT
-/// + bit 4 = SIZE) which is incorrect. RED — exposes a known gap.
+/// RFC 8881 §5.6 + §18.7 — GETATTR honors the request bitmap. An
+/// explicit request for TYPE | SIZE returns exactly those bits in
+/// the result, with the TYPE u32 + SIZE u64 in attr_vals. (Phase
+/// 15c.2 refactored op_getattr from "always return TYPE|SIZE" to
+/// "honor the request"; this test now asserts the spec-correct
+/// behaviour rather than the previous fixed-set quirk.)
 #[test]
-fn s18_7_getattr_root_bitmap_word0_must_be_type_plus_size() {
+fn s18_7_getattr_root_returns_requested_type_and_size() {
+    let bm = (1u32 << 1) | (1u32 << 4); // TYPE | SIZE
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::GETATTR);
-        w.write_u32(0); // empty request bitmap (we just want defaults)
+        w.write_u32(1); // bitmap_count
+        w.write_u32(bm);
     });
     let reply = drive_compound(0x5302, &body);
     let mut r = reader_at_compound_result(&reply);
-    let _ = r.read_u32(); // compound status
-    let _ = r.read_opaque(); // tag
-    let _ = r.read_u32(); // resarray_len
+    let _ = r.read_u32();
+    let _ = r.read_opaque();
+    let _ = r.read_u32();
     let _ = r.read_u32(); // PUTROOTFH op
     let _ = r.read_u32(); // PUTROOTFH status
     let _ = r.read_u32(); // GETATTR op
     let _ = r.read_u32(); // GETATTR status
     let bm_count = r.read_u32().expect("bitmap word count");
-    assert!(bm_count >= 1, "RFC 8881 §5.6: bitmap4 must have ≥1 word");
+    assert!(bm_count >= 1);
     let word0 = r.read_u32().expect("bitmap word 0");
-    // RFC 8881 §5.8.1.1: FATTR4_TYPE = bit 1, §5.8.1.5: FATTR4_SIZE =
-    // bit 4. Combined: 1<<1 | 1<<4 = 0x12.
-    const FATTR4_TYPE: u32 = 1 << 1;
-    const FATTR4_SIZE: u32 = 1 << 4;
     assert_eq!(
-        word0,
-        FATTR4_TYPE | FATTR4_SIZE,
-        "RFC 8881 §5.8.1: minimal GETATTR bitmap word0 is TYPE|SIZE = 0x{:08x}; \
-         got 0x{word0:08x} — production emits 0x18 (LINK_SUPPORT|SIZE) which is wrong",
-        FATTR4_TYPE | FATTR4_SIZE
+        word0, bm,
+        "RFC 8881 §5.6: result bitmap MUST equal request bitmap when \
+         all requested attrs are supported"
     );
+    let attr_vals = r.read_opaque().expect("attr_vals");
+    // TYPE(u32) + SIZE(u64) = 12 bytes.
+    assert_eq!(attr_vals.len(), 12, "TYPE(4) + SIZE(8) = 12 bytes");
 }
 
 // ===========================================================================
@@ -1496,6 +1495,142 @@ fn s18_30_setattr_without_current_fh_returns_nofilehandle() {
             || compound_status == nfs4_status::NFS4ERR_BADHANDLE,
         "RFC 8881 §18.30.4: SETATTR without current_fh must yield \
          NFS4ERR_NOFILEHANDLE; got {compound_status}"
+    );
+}
+
+/// Phase 15c.2 mount-path alias — kiseki exports a single namespace
+/// per server, named "default". Linux `mount.nfs4 server:/default
+/// /mnt` does PUTROOTFH+LOOKUP("default") expecting a sub-directory
+/// to descend into. kiseki should treat the namespace name as an
+/// alias for the namespace root so the canonical mount path works.
+#[test]
+fn s18_15_lookup_default_namespace_returns_root_handle() {
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::LOOKUP);
+        w.write_string("default"); // the namespace name kiseki uses
+        w.write_u32(v4op::GETFH);
+    });
+    let reply = drive_compound(0x4101, &body);
+    let mut r = reader_at_compound_result(&reply);
+    let compound_status = r.read_u32().unwrap();
+    assert_eq!(
+        compound_status,
+        nfs4_status::NFS4_OK,
+        "LOOKUP('default') after PUTROOTFH MUST succeed — that's the \
+         namespace alias used by `mount.nfs4 server:/default`"
+    );
+}
+
+// ===========================================================================
+// Phase 15c.2 — GETATTR honors the request bitmap (RFC 8881 §5.6)
+// ===========================================================================
+//
+// pcap analysis shows Linux 6.x mount.nfs4 sends two GETATTRs as
+// part of the mount sequence:
+//   CALL[8]:  SEQUENCE+PUTROOTFH+GETATTR  bits=[10]            (LEASE_TIME)
+//   CALL[13]: SEQUENCE+PUTROOTFH+GETFH+GETATTR bits=[1,3,4,8]  (TYPE+CHANGE+SIZE+FSID)
+//
+// kiseki today returns bits=[1,4] (TYPE|SIZE) regardless of the
+// request — that violates RFC 8881 §5.6 "The server MUST NOT return
+// any attributes that are not in the request bitmap". The kernel
+// can't parse the result and surfaces `mount(2): Input/output
+// error` (Phase 15c.2 blocker, 2026-04-27).
+
+/// RFC 8881 §5.7 — `FATTR4_LEASE_TIME` (bit 10) is the lease
+/// validity in seconds. Mount.nfs4 asks for it FIRST after
+/// PUTROOTFH; if the result bitmap doesn't include it, kernel
+/// can't determine lease cadence and returns EIO. kiseki must
+/// honor a bit-10-only request.
+#[test]
+fn s5_7_getattr_lease_time_only_returned_in_result_bitmap() {
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::GETATTR);
+        // Request bitmap: 1 word, only bit 10 set = 0x00000400
+        w.write_u32(1); // bm_count
+        w.write_u32(1u32 << 10);
+    });
+    let reply = drive_compound(0x4001, &body);
+    let mut r = reader_at_compound_result(&reply);
+    let _cs = r.read_u32(); // compound status
+    let _tag = r.read_opaque();
+    let _ra = r.read_u32(); // resarray_len
+    let _ = r.read_u32(); // PUTROOTFH op
+    let _ = r.read_u32(); // PUTROOTFH status
+    let _ = r.read_u32(); // GETATTR op
+    let getattr_status = r.read_u32().unwrap();
+    assert_eq!(
+        getattr_status,
+        nfs4_status::NFS4_OK,
+        "GETATTR(LEASE_TIME) MUST succeed"
+    );
+    let bm_count = r.read_u32().unwrap();
+    let bm_word0 = r.read_u32().unwrap();
+    let bm_word1 = if bm_count >= 2 {
+        r.read_u32().unwrap()
+    } else {
+        0
+    };
+    assert!(
+        bm_word0 & (1u32 << 10) != 0,
+        "RFC 8881 §5.6: result bitmap MUST include FATTR4_LEASE_TIME (bit 10) \
+         when the request asks for it; got word0={bm_word0:#010x} word1={bm_word1:#010x}"
+    );
+    assert_eq!(
+        bm_word0 & !(1u32 << 10),
+        0,
+        "RFC 8881 §5.6: result bitmap MUST NOT include attrs not requested; \
+         word0={bm_word0:#010x} has extra bits set"
+    );
+    let attr_vals = r.read_opaque().unwrap();
+    assert_eq!(
+        attr_vals.len(),
+        4,
+        "FATTR4_LEASE_TIME is a u32 (4 bytes); attr_vals = {} bytes",
+        attr_vals.len()
+    );
+}
+
+/// RFC 8881 §5.6 — GETATTR request `[TYPE, CHANGE, SIZE, FSID]`
+/// (bits 1, 3, 4, 8) MUST return exactly those four attrs in the
+/// result bitmap, in bit-order, with each attr's wire encoding.
+#[test]
+fn s5_6_getattr_type_change_size_fsid_returned_in_request_order() {
+    let bm = (1u32 << 1) | (1u32 << 3) | (1u32 << 4) | (1u32 << 8);
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::GETATTR);
+        w.write_u32(1); // bm_count
+        w.write_u32(bm);
+    });
+    let reply = drive_compound(0x4002, &body);
+    let mut r = reader_at_compound_result(&reply);
+    let _ = r.read_u32(); // compound status
+    let _ = r.read_opaque();
+    let _ = r.read_u32();
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // PUTROOTFH
+    let _ = r.read_u32(); // GETATTR op
+    let st = r.read_u32().unwrap();
+    assert_eq!(st, nfs4_status::NFS4_OK);
+    let bm_count = r.read_u32().unwrap();
+    let bm_word0 = r.read_u32().unwrap();
+    if bm_count >= 2 {
+        let _bm_word1 = r.read_u32().unwrap();
+    }
+    assert_eq!(
+        bm_word0, bm,
+        "RFC 8881 §5.6: result bitmap MUST equal request bitmap when all \
+         requested attrs are supported; got {bm_word0:#010x} expected {bm:#010x}"
+    );
+    let attr_vals = r.read_opaque().unwrap();
+    // Encoded in bit order: TYPE(u32) + CHANGE(u64) + SIZE(u64) + FSID(2 * u64)
+    // = 4 + 8 + 8 + 16 = 36 bytes.
+    assert_eq!(
+        attr_vals.len(),
+        36,
+        "TYPE(4) + CHANGE(8) + SIZE(8) + FSID(16) = 36 bytes"
     );
 }
 
