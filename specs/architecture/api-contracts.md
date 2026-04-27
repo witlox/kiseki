@@ -132,6 +132,16 @@ service backed by the same trait implementation.
 | Type | Operation | Caller | Spec reference |
 |---|---|---|---|
 | NFS | READ, WRITE, CREATE, REMOVE, RENAME, READDIR, OPEN, CLOSE, LOCK | NFS clients | protocol-gateway.feature, ADR-013 |
+| pNFS-MDS | LAYOUTGET, LAYOUTRETURN, LAYOUTRECALL, GETDEVICEINFO (op 47) | NFSv4.1 clients | pnfs-rfc8435.feature, ADR-038 |
+| pNFS-DS  | READ, WRITE, COMMIT (subset; stateless; on `ds_addr` listener) | NFSv4.1 clients | pnfs-rfc8435.feature, ADR-038 |
+
+`LayoutManagerOps` and `DataServerOps` interfaces: see
+`specs/architecture/data-models/pnfs.rs`. DS is co-located with
+`kiseki-server` on `ds_addr` (default `:2052`). DS is stateless;
+fh4s are self-authenticating (HMAC over tenant‖ns‖comp‖stripe‖expiry,
+key derived from master via HKDF info `"kiseki/pnfs-fh/v1"`).
+LAYOUTRECALL is fired from ADR-035 drain hooks, ADR-033/034 shard
+hooks, and key rotation.
 
 ### Protocol Gateway context (S3)
 

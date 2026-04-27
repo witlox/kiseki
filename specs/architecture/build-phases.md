@@ -340,6 +340,110 @@ completed replacements; drain survives orchestrator restart.
 
 ---
 
+## Phase 15: pNFS layout + Data Server subprotocol (ADR-038)
+
+Required before perf-cluster pNFS benchmarks produce meaningful
+numbers. Replaces the stub `LayoutManager` and the malformed
+`op_layoutget` body in `kiseki-gateway/src/{pnfs.rs,nfs4_server.rs}`
+with a RFC 8435 (Flexible Files) layout and a co-located stateless
+DS listener.
+
+### Phase 15a: DS surface
+
+- New `ds_addr` listener in `kiseki-server` config (default `:2052`)
+- `pnfs_ds_server.rs` in `kiseki-gateway`: stateless DS dispatcher
+  (op subset per I-PN7) reusing the XDR codec from `nfs_xdr.rs`
+- `PnfsFileHandle` MAC validate/expiry check (I-PN1)
+- DS handler delegates to `GatewayOps::read`/`write` (I-PN3)
+- mTLS termination via existing `TlsConfig::server_config`
+
+**Exit criteria**: DS listener answers EXCHANGE_ID + READ/WRITE for
+a hand-crafted fh4 with a valid MAC; rejects expired/forged fh4 with
+NFS4ERR_BADHANDLE. DS task can be killed and restarted with no
+client-visible state loss (I-PN2).
+
+### Phase 15b: MDS layout wire-up
+
+- Replace `crates/kiseki-gateway/src/pnfs.rs::LayoutManager` with
+  a `LayoutManagerOps` impl producing `ServerLayout` (RFC 8435 ff_layout4)
+- Replace `op_layoutget` body with `ff_layout4` XDR encoder
+- Add `op_getdeviceinfo` (op 47) handler with `ff_device_addr4`
+- fh4 MAC key derivation via existing `kiseki-crypto` HKDF
+- Layout cache keyed by `(composition_id, byte_range)` with TTL
+  (I-PN4); membership filter against `GetNamespaceShardMap` (I-PN6)
+
+**Exit criteria**: a Linux 5.4+ pNFS client mounts the export and
+`/proc/self/mountstats` shows non-zero `LAYOUTGET`, `GETDEVICEINFO`,
+and per-DS `READ` counters after a 1-MiB read.
+
+### Phase 15a (revised): DS surface — exit gate
+
+In addition to the previously-listed items, Phase 15a now requires:
+
+- NFS-over-TLS termination on **both** MDS (`nfs_addr`) and DS
+  (`ds_addr`) listeners, using the same `TlsConfig::server_config`
+  already in `kiseki-server`.
+- Plaintext fallback gated by `[security].allow_plaintext_nfs` AND
+  `KISEKI_INSECURE_NFS=true`, with mandatory startup banner +
+  `SecurityDowngradeEnabled` audit event + auto-halved TTL +
+  multi-tenant refusal (I-PN7).
+- fh4 wire encoding per ADR-038 §D4.3 (60-byte payload + 16-byte
+  MAC = 76 bytes); MAC input domain-separated with
+  `b"kiseki/pnfs-fh/v1\x00"` prefix.
+
+**Revised exit criteria**: a Linux 6.7+ pNFS client with
+`xprtsec=mtls` mounts the export and reads 1 MB through one DS;
+*and* the same flow with `allow_plaintext_nfs=true` works on a
+single-tenant kernel-5.x client (Rocky 9.5 baseline). Both flows
+verified via `/proc/self/mountstats`.
+
+### Phase 15d: TopologyEventBus (ADR-038 §D10)
+
+Required before 15c can run reliably (resolves ADV-038-3, -8).
+
+- New `TopologyEventBus` in `kiseki-control` with
+  `tokio::sync::broadcast::Sender<TopologyEvent>` (capacity 1024).
+- Wire producers:
+  - `DrainOrchestrator` — emit `NodeDraining` / `NodeRestored` after
+    control-Raft commit of the state transition (ADR-035 §3 §5)
+  - Namespace shard-map mutator — emit `ShardSplit` / `ShardMerged`
+    after the `NamespaceShardMap` Raft commit (ADR-033, ADR-034)
+  - `CompositionStore::delete` — emit `CompositionDeleted` after
+    the delete delta is applied (composition crate)
+  - Key rotation handler — emit `KeyRotation` after the new fh4 MAC
+    key is in service (ADR-005 / `kiseki-keymanager`)
+- Add `pnfs_topology_event_lag_total` Prometheus counter.
+- Unit test: each producer fires exactly one event per commit (not
+  per attempt; aborted Raft commits MUST NOT fire).
+
+**Exit criteria**: integration test starts a fake subscriber, drains
+a node via the production code path, observes a `NodeDraining` event
+on the bus within 100 ms of the drain audit event being recorded.
+Test repeats for split, merge, composition delete, key rotation.
+
+### Phase 15c: LAYOUTRECALL + integration
+
+(Now blocks on 15d, not 15a.)
+
+- `kiseki-gateway::LayoutManager` subscribes to `TopologyEventBus`
+  at startup; per `RecallReason`, walks live layouts and fires
+  recalls.
+- Layout cache eviction (I-PN8) — sweeper task + capacity LRU.
+- BDD: `specs/features/pnfs-rfc8435.feature` (multi-DS, drain-recall,
+  split-recall, merge-recall, deletion-recall, key-rotation-recall,
+  TTL-fallback).
+- e2e: `tests/e2e/test_pnfs.py` (Linux 6.7+ client with
+  `xprtsec=mtls`, multi-DS read, drain-during-IO).
+- Perf benchmark: `infra/gcp/benchmarks/perf-suite.sh` pNFS section
+  asserts ≥ 1.5× single-MDS throughput at 3 storage nodes.
+
+**Exit criteria**: I-PN5 SLA met (≤ 1 sec from event commit to
+recall send-out under non-lagging subscriber). Perf gate ≥ 1.5×
+passes on the GCP cluster. Subscriber-lag-induced cache flush
+verified by injection test.
+
+---
+
 ## Phase dependencies (visual)
 
 ```
