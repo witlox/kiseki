@@ -138,6 +138,11 @@ const REPLICATION_FACTOR: u32 = 3;
 #[derive(Default)]
 pub struct DrainOrchestrator {
     inner: Mutex<Inner>,
+    /// Optional pNFS topology bus (ADR-038 §D10). When set, drain
+    /// state transitions emit `NodeDraining` / `NodeRestored` events
+    /// AFTER the state is recorded — matching the post-Raft-commit
+    /// invariant in production.
+    event_bus: std::sync::OnceLock<std::sync::Arc<crate::topology_events::TopologyEventBus>>,
 }
 
 #[derive(Default)]
@@ -151,6 +156,17 @@ impl DrainOrchestrator {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wire the pNFS topology event bus (ADR-038 §D10). Idempotent
+    /// per `OnceLock` semantics — second call is a no-op.
+    #[must_use]
+    pub fn with_event_bus(
+        self,
+        bus: std::sync::Arc<crate::topology_events::TopologyEventBus>,
+    ) -> Self {
+        let _ = self.event_bus.set(bus);
+        self
     }
 
     /// Register a node in the cluster (typically called when a node
@@ -286,6 +302,18 @@ impl DrainOrchestrator {
             node_id: target,
             admin: admin.to_owned(),
         });
+        // Drop the lock before emitting (avoid holding lock across
+        // subscribers' channel sends).
+        drop(inner);
+        if let Some(bus) = self.event_bus.get() {
+            let hlc_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+            let _ = bus.emit(crate::topology_events::TopologyEvent::NodeDraining {
+                node_id: target,
+                hlc_ms,
+            });
+        }
         Ok(())
     }
 
@@ -312,6 +340,16 @@ impl DrainOrchestrator {
             node_id: target,
             admin: admin.to_owned(),
         });
+        drop(inner);
+        if let Some(bus) = self.event_bus.get() {
+            let hlc_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+            let _ = bus.emit(crate::topology_events::TopologyEvent::NodeRestored {
+                node_id: target,
+                hlc_ms,
+            });
+        }
         Ok(())
     }
 

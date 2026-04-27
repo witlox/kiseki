@@ -34,3 +34,4 @@ pub mod shard_topology;
 pub mod storage_admin;
 pub mod tenant;
 pub mod threshold;
+pub mod topology_events;

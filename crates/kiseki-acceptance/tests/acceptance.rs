@@ -321,6 +321,12 @@ pub struct KisekiWorld {
     pub pnfs_last_layout: Option<kiseki_gateway::pnfs::ServerLayout>,
     /// Per-scenario monotonic clock so cache TTL tests are deterministic.
     pub pnfs_clock_ms: u64,
+
+    // === pNFS Phase 15d (TopologyEventBus) ===
+    /// Topology event bus under test.
+    pub topology_bus: Option<std::sync::Arc<kiseki_control::topology_events::TopologyEventBus>>,
+    /// Active subscriber receiver — one per scenario.
+    pub topology_sub: Option<kiseki_control::topology_events::TopologyEventSubscriber>,
 }
 
 impl Drop for KisekiWorld {
@@ -577,6 +583,8 @@ impl KisekiWorld {
             pnfs_mds_mgr: None,
             pnfs_last_layout: None,
             pnfs_clock_ms: 1_000_000,
+            topology_bus: None,
+            topology_sub: None,
             telemetry_bus,
             kms_providers,
             persistent_shard_store: None,
