@@ -97,10 +97,7 @@ impl PnfsFhMacKey {
 ///
 /// Spec: ADR-038 §D4.1.
 #[must_use]
-pub fn derive_pnfs_fh_mac_key(
-    master_key: &[u8; 32],
-    cluster_id: &[u8; 16],
-) -> PnfsFhMacKey {
+pub fn derive_pnfs_fh_mac_key(master_key: &[u8; 32], cluster_id: &[u8; 16]) -> PnfsFhMacKey {
     use aws_lc_rs::hkdf::{Salt, HKDF_SHA256};
 
     let salt = Salt::new(HKDF_SHA256, cluster_id);
@@ -181,8 +178,7 @@ impl PnfsFileHandle {
         let tenant_id = OrgId(uuid_from_slice(&bytes[0..16]));
         let namespace_id = NamespaceId(uuid_from_slice(&bytes[16..32]));
         let composition_id = CompositionId(uuid_from_slice(&bytes[32..48]));
-        let stripe_index =
-            u32::from_be_bytes(bytes[48..52].try_into().expect("4 bytes"));
+        let stripe_index = u32::from_be_bytes(bytes[48..52].try_into().expect("4 bytes"));
         let expiry_ms = u64::from_be_bytes(bytes[52..60].try_into().expect("8 bytes"));
         let mut mac = [0u8; PNFS_FH_MAC_BYTES];
         mac.copy_from_slice(&bytes[PNFS_FH_PAYLOAD_BYTES..]);
@@ -239,7 +235,10 @@ fn encode_payload(
     out
 }
 
-fn compute_mac(key: &PnfsFhMacKey, payload: &[u8; PNFS_FH_PAYLOAD_BYTES]) -> [u8; PNFS_FH_MAC_BYTES] {
+fn compute_mac(
+    key: &PnfsFhMacKey,
+    payload: &[u8; PNFS_FH_PAYLOAD_BYTES],
+) -> [u8; PNFS_FH_MAC_BYTES] {
     let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key.material());
     let mut ctx = hmac::Context::with_key(&hmac_key);
     ctx.update(PNFS_FH_MAC_DOMAIN);
@@ -549,9 +548,7 @@ impl MdsLayoutManager {
         while pos < end {
             let seg_len = stripe_size.min(end.saturating_sub(pos));
             let stripe_index_u64 = pos / stripe_size;
-            let node_idx = usize::try_from(stripe_index_u64)
-                .unwrap_or(usize::MAX)
-                % num_nodes;
+            let node_idx = usize::try_from(stripe_index_u64).unwrap_or(usize::MAX) % num_nodes;
             let stripe_index = u32::try_from(stripe_index_u64).unwrap_or(u32::MAX);
             let fh = PnfsFileHandle::issue(
                 &key,
@@ -974,10 +971,7 @@ mod mds_layout_tests {
 
     #[test]
     fn get_device_info_resolves_active_layout_devices() {
-        let mgr = MdsLayoutManager::new(
-            fixed_key(),
-            cfg_with_nodes(vec!["10.0.0.11:2052"]),
-        );
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["10.0.0.11:2052"]));
         let layout = mgr.layout_get(
             OrgId(uuid::Uuid::nil()),
             NamespaceId(uuid::Uuid::nil()),
@@ -1011,7 +1005,6 @@ mod mds_layout_tests {
 // =============================================================================
 // Legacy LayoutManager (kept until 15b's op_layoutget rewrite)
 // =============================================================================
-
 
 /// pNFS layout type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

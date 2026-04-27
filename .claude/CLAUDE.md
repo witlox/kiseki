@@ -74,9 +74,11 @@ Gate 2: auditor verifies step depth. See `roles/auditor.md`.
 
 ## Entry point
 
-Phase 14 complete (backup/restore, security hardening, slow-suite Raft,
-end-to-end tracing). 19 production crates, 37 ADRs, 247 @integration
-BDD scenarios (237 passing on Linux, 10 macOS-gated @slow).
+Phase 15 complete (pNFS RFC 8435 layout + DS subprotocol, NFS-over-TLS
+default with audited plaintext fallback, TopologyEventBus +
+LAYOUTRECALL). 19 production crates, 38 ADRs, 275 @integration BDD
+scenarios (264 passing on Linux + 10 macOS-gated @slow + 1 e2e
+Linux pNFS client deferred to tests/e2e/test_pnfs.py).
 
 ## Escalation paths
 

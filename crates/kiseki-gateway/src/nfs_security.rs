@@ -44,9 +44,11 @@ pub enum NfsTransport {
 pub enum NfsSecurityError {
     /// Only one of the two required flags was set. Plaintext NFS is
     /// blocked unless **both** the config flag AND the env var are set.
-    #[error("plaintext NFS requires both flags: \
+    #[error(
+        "plaintext NFS requires both flags: \
 [security].allow_plaintext_nfs=true (config) AND KISEKI_INSECURE_NFS=true (env). \
-Got config={config_flag} env={env_flag}")]
+Got config={config_flag} env={env_flag}"
+    )]
     PartialFlags {
         /// State of `[security].allow_plaintext_nfs` in the config.
         config_flag: bool,

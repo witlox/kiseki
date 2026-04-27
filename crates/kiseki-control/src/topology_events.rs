@@ -165,16 +165,14 @@ impl TopologyEventBus {
     /// regardless of whether subscribers were attached.
     #[must_use]
     pub fn sent_count(&self) -> u64 {
-        self.sent_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.sent_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Cumulative number of `Lag(n)` indications observed by any
     /// subscriber on this bus. Surfaces I-PN9's metric witness.
     #[must_use]
     pub fn lag_count(&self) -> u64 {
-        self.lag_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.lag_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

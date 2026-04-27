@@ -309,8 +309,11 @@ pub struct KisekiWorld {
     pub pnfs_audit_log: std::sync::Arc<kiseki_audit::store::AuditLog>,
     /// Scenario-local DS context. Built lazily so steps can adjust the
     /// stripe size or clock.
-    pub pnfs_ds_ctx:
-        Option<std::sync::Arc<kiseki_gateway::pnfs_ds_server::DsContext<kiseki_gateway::mem_gateway::InMemoryGateway>>>,
+    pub pnfs_ds_ctx: Option<
+        std::sync::Arc<
+            kiseki_gateway::pnfs_ds_server::DsContext<kiseki_gateway::mem_gateway::InMemoryGateway>,
+        >,
+    >,
     /// Bound DS listener address for TLS scenarios.
     pub pnfs_ds_addr: Option<std::net::SocketAddr>,
     /// Shutdown flag for the DS listener thread spawned in TLS scenarios.

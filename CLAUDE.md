@@ -1,8 +1,9 @@
 # Kiseki
 
 Distributed storage system for HPC/AI workloads. 19 production Rust
-crates (+ 1 BDD-test crate), 37 ADRs, 247 @integration BDD scenarios
-(237 passing on Linux, 10 macOS-gated @slow auto-skipped).
+crates (+ 1 BDD-test crate), 38 ADRs, 275 @integration BDD scenarios
+(264 passing on Linux, 10 macOS-gated @slow auto-skipped, 1 deferred
+to tests/e2e/test_pnfs.py).
 
 ## Language
 

@@ -344,7 +344,10 @@ fn process_op<G: GatewayOps>(
     }
 }
 
-pub(crate) fn op_exchange_id(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) fn op_exchange_id(
+    reader: &mut XdrReader<'_>,
+    sessions: &SessionManager,
+) -> (u32, Vec<u8>) {
     // Skip client owner (verifier + ownerid).
     let _verifier = reader.read_opaque_fixed(8).unwrap_or_default();
     let _owner_id = reader.read_opaque().unwrap_or_default();
@@ -371,7 +374,10 @@ pub(crate) fn op_exchange_id(reader: &mut XdrReader<'_>, sessions: &SessionManag
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-pub(crate) fn op_create_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) fn op_create_session(
+    reader: &mut XdrReader<'_>,
+    sessions: &SessionManager,
+) -> (u32, Vec<u8>) {
     let client_id = reader.read_u64().unwrap_or(0);
     let _sequence = reader.read_u32().unwrap_or(0);
     let _flags = reader.read_u32().unwrap_or(0);
@@ -408,7 +414,10 @@ pub(crate) fn op_create_session(reader: &mut XdrReader<'_>, sessions: &SessionMa
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-pub(crate) fn op_destroy_session(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) fn op_destroy_session(
+    reader: &mut XdrReader<'_>,
+    sessions: &SessionManager,
+) -> (u32, Vec<u8>) {
     let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
     let mut session_id = [0u8; 16];
     if sid_bytes.len() == 16 {
@@ -754,11 +763,13 @@ fn op_layoutget_ff<G: GatewayOps>(
     for stripe in &layout.stripes {
         w.write_u64(stripe.offset);
         w.write_u64(stripe.length);
-        w.write_u32(if matches!(stripe.iomode, crate::pnfs::LayoutIoMode::ReadWrite) {
-            2
-        } else {
-            1
-        });
+        w.write_u32(
+            if matches!(stripe.iomode, crate::pnfs::LayoutIoMode::ReadWrite) {
+                2
+            } else {
+                1
+            },
+        );
         w.write_u32(LAYOUT4_FLEX_FILES);
 
         // Inline ff_layout4 body for this segment. RFC 8435 §5.1:

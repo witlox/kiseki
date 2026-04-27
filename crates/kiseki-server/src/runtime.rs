@@ -373,8 +373,8 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // ADR-038 §D4 transport gate: TLS by default, audited plaintext
     // fallback only with both flags set. Gate runs before any listener
     // binds so the server refuses to start cleanly on misconfiguration.
-    let env_insecure_nfs = std::env::var("KISEKI_INSECURE_NFS")
-        .is_ok_and(|v| v == "true" || v == "1");
+    let env_insecure_nfs =
+        std::env::var("KISEKI_INSECURE_NFS").is_ok_and(|v| v == "true" || v == "1");
     let security = kiseki_gateway::nfs_security::evaluate(
         cfg.allow_plaintext_nfs,
         env_insecure_nfs,
@@ -390,9 +390,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     if let Some(audit_type) = security.audit_event {
         use kiseki_audit::event::AuditEvent;
         use kiseki_audit::store::AuditOps;
-        use kiseki_common::time::{
-            ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime,
-        };
+        use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
         use std::time::{SystemTime, UNIX_EPOCH};
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -416,7 +414,8 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             actor: "kiseki-server".to_string(),
             description: "plaintext NFS fallback active per ADR-038 §D4.2 — \
                 operator opted in via [security].allow_plaintext_nfs=true \
-                AND KISEKI_INSECURE_NFS=true".to_string(),
+                AND KISEKI_INSECURE_NFS=true"
+                .to_string(),
         });
     }
     tracing::info!(
@@ -449,8 +448,8 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             format!("{host}:9100")
         })
         .collect();
-    let nfs_listener = std::net::TcpListener::bind(nfs_addr)
-        .map_err(|e| format!("NFS bind {nfs_addr}: {e}"))?;
+    let nfs_listener =
+        std::net::TcpListener::bind(nfs_addr).map_err(|e| format!("NFS bind {nfs_addr}: {e}"))?;
     let nfs_tls_for_thread = nfs_tls.clone();
     std::thread::spawn(move || {
         kiseki_gateway::nfs_server::serve_nfs_listener(

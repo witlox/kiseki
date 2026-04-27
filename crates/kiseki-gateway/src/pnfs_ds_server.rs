@@ -82,9 +82,9 @@ pub struct DsContext<G: GatewayOps + Send + Sync + 'static> {
 #[must_use]
 pub fn default_now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
-        u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
-    })
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 impl<G: GatewayOps + Send + Sync + 'static> DsContext<G> {
@@ -482,7 +482,8 @@ mod tests {
             mac_key: key.clone(),
             stripe_size_bytes: 1_048_576,
             rt: tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-                static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+                static RT: std::sync::OnceLock<tokio::runtime::Runtime> =
+                    std::sync::OnceLock::new();
                 RT.get_or_init(|| tokio::runtime::Runtime::new().expect("rt"))
                     .handle()
                     .clone()
@@ -618,8 +619,7 @@ mod tests {
         assert_eq!(status, nfs4_status::NFS4_OK);
         assert_eq!(ctx.gateway.reads.load(Ordering::SeqCst), 1);
         // Sanity check we'd compute the absolute offset correctly.
-        let expected_abs =
-            u64::from(stripe_index) * ctx.stripe_size_bytes + client_offset;
+        let expected_abs = u64::from(stripe_index) * ctx.stripe_size_bytes + client_offset;
         assert_eq!(expected_abs, 3 * 1_048_576 + 8192);
         // Suppress unused-mut warning since this test mutates state for
         // construction only.

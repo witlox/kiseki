@@ -246,8 +246,8 @@ impl ServerConfig {
             .parse()
             .ok();
 
-        let pnfs_enabled = std::env::var("KISEKI_PNFS_ENABLED")
-            .map_or(true, |v| v == "true" || v == "1");
+        let pnfs_enabled =
+            std::env::var("KISEKI_PNFS_ENABLED").map_or(true, |v| v == "true" || v == "1");
 
         let mut pnfs = PnfsSettings::default();
         if let Some(v) = std::env::var("KISEKI_PNFS_STRIPE_BYTES")
@@ -264,8 +264,8 @@ impl ServerConfig {
             pnfs.layout_cache_sweep_interval_seconds = (v / 4).max(1);
         }
 
-        let allow_plaintext_nfs = std::env::var("KISEKI_ALLOW_PLAINTEXT_NFS")
-            .is_ok_and(|v| v == "true" || v == "1");
+        let allow_plaintext_nfs =
+            std::env::var("KISEKI_ALLOW_PLAINTEXT_NFS").is_ok_and(|v| v == "true" || v == "1");
 
         Self {
             data_addr,

@@ -27,9 +27,7 @@ use kiseki_gateway::pnfs::{
     derive_pnfs_fh_mac_key, LayoutIoMode, MdsLayoutConfig, MdsLayoutManager, PnfsFhMacKey,
     PnfsFileHandle,
 };
-use kiseki_gateway::pnfs_ds_server::{
-    dispatch_ds_compound, DsContext, ALLOWED_DS_OPS,
-};
+use kiseki_gateway::pnfs_ds_server::{dispatch_ds_compound, DsContext, ALLOWED_DS_OPS};
 
 use crate::KisekiWorld;
 
@@ -205,13 +203,10 @@ async fn given_layout_issued(world: &mut KisekiWorld, name: String, stripe: u32)
     world.pnfs_fh = Some(h);
 }
 
-#[when(regex = r#"^a client sends NFSv4\.1 READ to the DS using stripe-(\d+) fh4 with offset (\d+) length (\d+)$"#)]
-async fn when_client_reads_via_ds(
-    world: &mut KisekiWorld,
-    _stripe: u32,
-    offset: u64,
-    length: u32,
-) {
+#[when(
+    regex = r#"^a client sends NFSv4\.1 READ to the DS using stripe-(\d+) fh4 with offset (\d+) length (\d+)$"#
+)]
+async fn when_client_reads_via_ds(world: &mut KisekiWorld, _stripe: u32, offset: u64, length: u32) {
     let key = world.pnfs_mac_key.clone().expect("K_layout");
     let ctx = build_ds_ctx(world, key);
     let fh = world.pnfs_fh.clone().expect("fh4 issued");
@@ -229,8 +224,14 @@ async fn when_client_reads_via_ds(
         &ctx,
         &sessions,
         &[
-            (kiseki_gateway::nfs4_server::op::PUTFH, putfh_args.into_bytes()),
-            (kiseki_gateway::nfs4_server::op::READ, read_args.into_bytes()),
+            (
+                kiseki_gateway::nfs4_server::op::PUTFH,
+                putfh_args.into_bytes(),
+            ),
+            (
+                kiseki_gateway::nfs4_server::op::READ,
+                read_args.into_bytes(),
+            ),
         ],
     );
 }
@@ -239,16 +240,10 @@ async fn when_client_reads_via_ds(
 async fn then_ds_returns_ok_with_bytes(world: &mut KisekiWorld, _n: u32) {
     // We focus on the per-op statuses — a full READ payload assertion is
     // covered by the unit test `read_with_valid_putfh_invokes_gateway_with_translated_offset`.
-    let putfh = world
-        .pnfs_last_results
-        .first()
-        .expect("PUTFH result");
+    let putfh = world.pnfs_last_results.first().expect("PUTFH result");
     assert_eq!(putfh.0, kiseki_gateway::nfs4_server::op::PUTFH);
     assert_eq!(putfh.1, kiseki_gateway::nfs4_server::nfs4_status::NFS4_OK);
-    let read = world
-        .pnfs_last_results
-        .get(1)
-        .expect("READ result");
+    let read = world.pnfs_last_results.get(1).expect("READ result");
     assert_eq!(read.0, kiseki_gateway::nfs4_server::op::READ);
     assert_eq!(read.1, kiseki_gateway::nfs4_server::nfs4_status::NFS4_OK);
 }
@@ -359,7 +354,10 @@ async fn when_compound_putfh_allocate(world: &mut KisekiWorld) {
         &ctx,
         &sessions,
         &[
-            (kiseki_gateway::nfs4_server::op::PUTFH, putfh_args.into_bytes()),
+            (
+                kiseki_gateway::nfs4_server::op::PUTFH,
+                putfh_args.into_bytes(),
+            ),
             (ALLOCATE, allocate_args.into_bytes()),
         ],
     );
@@ -409,9 +407,15 @@ async fn then_no_later_op_parsed(world: &mut KisekiWorld) {
         &ctx,
         &sessions,
         &[
-            (kiseki_gateway::nfs4_server::op::PUTFH, putfh_args.into_bytes()),
+            (
+                kiseki_gateway::nfs4_server::op::PUTFH,
+                putfh_args.into_bytes(),
+            ),
             (ALLOCATE, allocate_args.into_bytes()),
-            (kiseki_gateway::nfs4_server::op::READ, read_args.into_bytes()),
+            (
+                kiseki_gateway::nfs4_server::op::READ,
+                read_args.into_bytes(),
+            ),
         ],
     );
     // Result count caps at 2 — READ never executes.
@@ -423,7 +427,9 @@ async fn when_enumerate_dispatcher(_world: &mut KisekiWorld) {
     // ALLOWED_DS_OPS is a public const — enumeration is the next step.
 }
 
-#[then(regex = r#"^exactly eight op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, PUTFH, READ, WRITE, COMMIT, GETATTR$"#)]
+#[then(
+    regex = r#"^exactly eight op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, PUTFH, READ, WRITE, COMMIT, GETATTR$"#
+)]
 async fn then_eight_ops(_world: &mut KisekiWorld) {
     use kiseki_gateway::nfs4_server::op;
     assert_eq!(ALLOWED_DS_OPS.len(), 8);
@@ -459,7 +465,14 @@ async fn then_every_other_op_notsupp(world: &mut KisekiWorld) {
     let ctx = build_ds_ctx(world, key);
     let sessions = SessionManager::new();
 
-    for op_code in [3u32 /* ACCESS */, 9 /* GETATTR is allowed; skip */, 18 /* OPEN */, 28 /* REMOVE */, 38 /* WRITE — 15a defers */, 59 /* ALLOCATE */] {
+    for op_code in [
+        3u32, /* ACCESS */
+        9,    /* GETATTR is allowed; skip */
+        18,   /* OPEN */
+        28,   /* REMOVE */
+        38,   /* WRITE — 15a defers */
+        59,   /* ALLOCATE */
+    ] {
         if ALLOWED_DS_OPS.contains(&op_code) {
             continue;
         }
@@ -499,8 +512,7 @@ async fn when_ds_listener_started(_world: &mut KisekiWorld) {
 }
 
 #[when(regex = r#"^the MDS NFS listener is started on `nfs_addr`$"#)]
-async fn when_mds_listener_started(_world: &mut KisekiWorld) {
-}
+async fn when_mds_listener_started(_world: &mut KisekiWorld) {}
 
 #[then(regex = r#"^the listener wraps `TcpListener` with `TlsConfig::server_config`$"#)]
 async fn then_listener_wraps_tls(_world: &mut KisekiWorld) {
@@ -550,7 +562,9 @@ async fn then_server_refuses(world: &mut KisekiWorld, msg: String) {
     );
 }
 
-#[given(regex = r#"^both `\[security\]\.allow_plaintext_nfs=true` and `KISEKI_INSECURE_NFS=true`$"#)]
+#[given(
+    regex = r#"^both `\[security\]\.allow_plaintext_nfs=true` and `KISEKI_INSECURE_NFS=true`$"#
+)]
 async fn given_both_flags(world: &mut KisekiWorld) {
     // Cache result for downstream Then steps.
     world.pnfs_security_eval = Some(evaluate(true, true, false, 300, 1));
@@ -561,14 +575,19 @@ async fn given_single_tenant(_world: &mut KisekiWorld) {
     // Default world setup is single-tenant.
 }
 
-#[then(regex = r#"^a `SecurityDowngradeEnabled\{reason="plaintext_nfs"\}` audit event is emitted$"#)]
+#[then(
+    regex = r#"^a `SecurityDowngradeEnabled\{reason="plaintext_nfs"\}` audit event is emitted$"#
+)]
 async fn then_audit_emitted(world: &mut KisekiWorld) {
     let res = world
         .pnfs_security_eval
         .as_ref()
         .expect("security gate must have been evaluated");
     let s = res.as_ref().expect("expected Ok");
-    assert_eq!(s.audit_event, Some(AuditEventType::SecurityDowngradeEnabled));
+    assert_eq!(
+        s.audit_event,
+        Some(AuditEventType::SecurityDowngradeEnabled)
+    );
     // Emit it now into the scenario-local audit log so downstream Thens
     // can also assert presence.
     use kiseki_audit::event::AuditEvent;
@@ -605,10 +624,7 @@ async fn then_audit_emitted(world: &mut KisekiWorld) {
 
 #[then(regex = r#"^the startup log records the WARN banner described in ADR-038 §D4\.2$"#)]
 async fn then_warn_banner(world: &mut KisekiWorld) {
-    let res = world
-        .pnfs_security_eval
-        .as_ref()
-        .expect("evaluated");
+    let res = world.pnfs_security_eval.as_ref().expect("evaluated");
     let s = res.as_ref().expect("expected Ok");
     assert!(s.emit_warn_banner);
     // Banner text is also pinned in `nfs_security::tests::warn_banner_text_is_pinned`.
@@ -617,20 +633,14 @@ async fn then_warn_banner(world: &mut KisekiWorld) {
 
 #[then(regex = r#"^the effective `layout_ttl_seconds` is (\d+)$"#)]
 async fn then_layout_ttl_is(world: &mut KisekiWorld, n: u64) {
-    let res = world
-        .pnfs_security_eval
-        .as_ref()
-        .expect("evaluated");
+    let res = world.pnfs_security_eval.as_ref().expect("evaluated");
     let s = res.as_ref().expect("expected Ok");
     assert_eq!(s.effective_layout_ttl_seconds, n);
 }
 
 #[then(regex = r#"^the NFS listener accepts plaintext TCP connections$"#)]
 async fn then_plaintext_accepts(world: &mut KisekiWorld) {
-    let res = world
-        .pnfs_security_eval
-        .as_ref()
-        .expect("evaluated");
+    let res = world.pnfs_security_eval.as_ref().expect("evaluated");
     let s = res.as_ref().expect("expected Ok");
     assert_eq!(s.mode, NfsTransport::Plaintext);
 }
@@ -704,12 +714,7 @@ fn ensure_mds_mgr(world: &mut KisekiWorld) -> Arc<MdsLayoutManager> {
 }
 
 #[given(regex = r#"^a composition "([^"]+)" of (\d+) MiB exists in "([^"]+)"$"#)]
-async fn given_composition_mib(
-    world: &mut KisekiWorld,
-    name: String,
-    _mib: u32,
-    _ns: String,
-) {
+async fn given_composition_mib(world: &mut KisekiWorld, name: String, _mib: u32, _ns: String) {
     // Wire up the MDS layout manager (Phase 15b) and pin a deterministic
     // composition id keyed by name.
     ensure_mds_mgr(world);
@@ -718,15 +723,13 @@ async fn given_composition_mib(
 }
 
 #[when(regex = r#"^the client sends LAYOUTGET for "([^"]+)" range \[(\d+), (\d+) MiB\)$"#)]
-async fn when_layoutget(
-    world: &mut KisekiWorld,
-    name: String,
-    start: u64,
-    end_mib: u32,
-) {
+async fn when_layoutget(world: &mut KisekiWorld, name: String, start: u64, end_mib: u32) {
     let mgr = ensure_mds_mgr(world);
     let comp = world.last_composition_id.unwrap_or_else(|| {
-        CompositionId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()))
+        CompositionId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            name.as_bytes(),
+        ))
     });
     world.last_composition_id = Some(comp);
     let length = u64::from(end_mib) * 1_048_576 - start;
@@ -769,7 +772,9 @@ async fn then_stripes(world: &mut KisekiWorld, n: u32, mib: u32) {
     }
 }
 
-#[then(regex = r#"^each stripe carries a (\d+)-byte fh4 \((\d+)-byte payload \+ (\d+)-byte MAC\)$"#)]
+#[then(
+    regex = r#"^each stripe carries a (\d+)-byte fh4 \((\d+)-byte payload \+ (\d+)-byte MAC\)$"#
+)]
 async fn then_fh4_size(world: &mut KisekiWorld, total: u32, _payload: u32, _mac: u32) {
     use kiseki_gateway::pnfs::PNFS_FH_BYTES;
     assert_eq!(total, PNFS_FH_BYTES as u32);
@@ -827,7 +832,10 @@ async fn then_ff_device_addr(world: &mut KisekiWorld) {
     }
     for did in &device_ids {
         let info = mgr.get_device_info(did).expect("device known");
-        assert!(!info.addresses.is_empty(), "ff_device_addr4 has ≥1 netaddr4");
+        assert!(
+            !info.addresses.is_empty(),
+            "ff_device_addr4 has ≥1 netaddr4"
+        );
     }
 }
 
@@ -835,11 +843,7 @@ async fn then_ff_device_addr(world: &mut KisekiWorld) {
 async fn then_netaddr_resolves(world: &mut KisekiWorld) {
     let mgr = world.pnfs_mds_mgr.clone().expect("manager wired");
     let layout = world.pnfs_last_layout.as_ref().expect("LAYOUTGET ran");
-    let expected_uaddrs = [
-        "10.0.0.10.8.4",
-        "10.0.0.11.8.4",
-        "10.0.0.12.8.4",
-    ];
+    let expected_uaddrs = ["10.0.0.10.8.4", "10.0.0.11.8.4", "10.0.0.12.8.4"];
     for s in &layout.stripes {
         let info = mgr.get_device_info(&s.device_id).expect("device known");
         let uaddr = &info.addresses[0].uaddr;
@@ -991,9 +995,7 @@ async fn then_bytes_match_canonical(_world: &mut KisekiWorld) {
 // ---------------------------------------------------------------------------
 
 use kiseki_common::ids::{NodeId, ShardId};
-use kiseki_control::topology_events::{
-    TopologyEvent, TopologyEventBus, TopologyRecvResult,
-};
+use kiseki_control::topology_events::{TopologyEvent, TopologyEventBus, TopologyRecvResult};
 
 fn ensure_bus(world: &mut KisekiWorld) -> Arc<TopologyEventBus> {
     if let Some(ref b) = world.topology_bus {
@@ -1010,14 +1012,15 @@ async fn given_topology_subscriber(world: &mut KisekiWorld) {
     world.topology_sub = Some(bus.subscribe());
 }
 
-#[when(regex = r#"^the drain orchestrator commits a state transition to `Draining` for node "([^"]+)"$"#)]
+#[when(
+    regex = r#"^the drain orchestrator commits a state transition to `Draining` for node "([^"]+)"$"#
+)]
 async fn when_drain_commits(world: &mut KisekiWorld, name: String) {
     let bus = ensure_bus(world);
     // Build a fresh orchestrator wired to the bus and a node that
     // can drain (≥3 active replacements per I-N4).
     let orch = Arc::new(
-        kiseki_control::node_lifecycle::DrainOrchestrator::new()
-            .with_event_bus(Arc::clone(&bus)),
+        kiseki_control::node_lifecycle::DrainOrchestrator::new().with_event_bus(Arc::clone(&bus)),
     );
     let target = NodeId(0xD00D);
     orch.register_node(target, vec![1]);
@@ -1063,8 +1066,7 @@ async fn then_event_after_commit(world: &mut KisekiWorld) {
 async fn when_drain_refused(world: &mut KisekiWorld) {
     let bus = ensure_bus(world);
     let orch = Arc::new(
-        kiseki_control::node_lifecycle::DrainOrchestrator::new()
-            .with_event_bus(Arc::clone(&bus)),
+        kiseki_control::node_lifecycle::DrainOrchestrator::new().with_event_bus(Arc::clone(&bus)),
     );
     // Only 3 nodes total — pre-check refuses since RF=3 needs ≥3
     // candidates AFTER the target is removed.
@@ -1194,7 +1196,10 @@ use kiseki_gateway::pnfs::RecallReason;
 #[given(regex = r#"^a layout has been issued referencing node "([^"]+)" as a DS$"#)]
 async fn given_layout_ref_node(world: &mut KisekiWorld, name: String) {
     let mgr = ensure_mds_mgr(world);
-    let comp = CompositionId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"obj-recall"));
+    let comp = CompositionId(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        b"obj-recall",
+    ));
     world.last_composition_id = Some(comp);
     let now = world.pnfs_clock_ms;
     let layout = mgr.layout_get(
@@ -1209,9 +1214,7 @@ async fn given_layout_ref_node(world: &mut KisekiWorld, name: String) {
     world.pnfs_last_layout = Some(layout);
     // Map the name to the DS address that the manager built.
     // ensure_mds_mgr() seeds 10.0.0.10 / .11 / .12 — pick first.
-    world
-        .node_names
-        .insert(name, kiseki_common::ids::NodeId(1));
+    world.node_names.insert(name, kiseki_common::ids::NodeId(1));
 }
 
 #[when(regex = r#"^the drain orchestrator commits drain on "([^"]+)"$"#)]
@@ -1245,10 +1248,7 @@ async fn then_recall_within_1s(world: &mut KisekiWorld) {
 #[then(regex = r#"^subsequent client reads with the recalled fh4 return NFS4ERR_BADHANDLE$"#)]
 async fn then_recalled_fh4_badhandle(world: &mut KisekiWorld) {
     let mgr = world.pnfs_mds_mgr.clone().expect("manager wired");
-    let layout = world
-        .pnfs_last_layout
-        .as_ref()
-        .expect("layout was issued");
+    let layout = world.pnfs_last_layout.as_ref().expect("layout was issued");
     let fh = layout
         .stripes
         .iter()
@@ -1268,7 +1268,10 @@ async fn then_recalled_fh4_badhandle(world: &mut KisekiWorld) {
         world,
         &ctx,
         &sessions,
-        &[(kiseki_gateway::nfs4_server::op::PUTFH, putfh_args.into_bytes())],
+        &[(
+            kiseki_gateway::nfs4_server::op::PUTFH,
+            putfh_args.into_bytes(),
+        )],
     );
     let putfh = world.pnfs_last_results.first().expect("PUTFH result");
     assert_eq!(
@@ -1340,10 +1343,9 @@ async fn then_subsequent_stale(world: &mut KisekiWorld) {
     // the depth witness; this step asserts the recall path is wired.
     let mgr = world.pnfs_mds_mgr.clone().expect("manager wired");
     let log = mgr.recall_log();
-    assert!(log.iter().any(|r| matches!(
-        r.reason,
-        RecallReason::CompositionDeleted
-    )));
+    assert!(log
+        .iter()
+        .any(|r| matches!(r.reason, RecallReason::CompositionDeleted)));
 }
 
 #[given(regex = r#"^(\d+) layouts are outstanding across (\d+) compositions$"#)]
@@ -1464,7 +1466,10 @@ async fn then_subsequent_badhandle(world: &mut KisekiWorld) {
         world,
         &ctx,
         &sessions,
-        &[(kiseki_gateway::nfs4_server::op::PUTFH, putfh_args.into_bytes())],
+        &[(
+            kiseki_gateway::nfs4_server::op::PUTFH,
+            putfh_args.into_bytes(),
+        )],
     );
     let putfh = world.pnfs_last_results.first().expect("PUTFH result");
     // After the TTL elapses, the fh4's expiry_ms is in the past →
