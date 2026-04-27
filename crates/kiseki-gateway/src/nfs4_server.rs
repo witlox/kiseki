@@ -925,7 +925,10 @@ fn op_layoutget_ff<G: GatewayOps>(
         body.write_opaque(&stripe.fh.encode());
         body.write_opaque(b"0"); // user
         body.write_opaque(b"0"); // group
-        body.write_u32(0); // ff_ioflags4
+                                 // RFC 8435 §5.1 + ADR-038 §D3 — kiseki's FFL is tightly_coupled;
+                                 // advertise FF_FLAGS_NO_LAYOUTCOMMIT so clients skip the
+                                 // LAYOUTCOMMIT round trip on close.
+        body.write_u32(crate::pnfs::FF_FLAGS_NO_LAYOUTCOMMIT);
         body.write_u32(0); // stats_collect_hint
         w.write_opaque(&body.into_bytes());
     }

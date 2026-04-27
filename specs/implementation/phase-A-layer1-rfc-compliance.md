@@ -298,8 +298,8 @@ is updated in the same commit as the test/fix landings.
 | T-06 | RFC 7530 | `crates/kiseki-gateway/tests/rfc7530.rs` | ✅ | 0 of 7 RED — Group II closed 2026-04-27 |
 | T-07 | RFC 8881 | `crates/kiseki-gateway/tests/rfc8881.rs` | ✅ | 0 of 28 RED — Group II closed 2026-04-27 |
 | T-08 | RFC 7862 | `crates/kiseki-gateway/tests/rfc7862.rs` | ✅ | 0 of 12 RED — Group II closed 2026-04-27 |
-| T-09 | RFC 8435 | `crates/kiseki-gateway/tests/rfc8435.rs` | ✅ | 1 of 20 RED (ffl_flags FF_FLAGS_NO_LAYOUTCOMMIT) |
-| T-10 | RFC 5665 | `crates/kiseki-gateway/tests/rfc5665.rs` | ✅ | 1 of 14 RED (IPv6 form) |
+| T-09 | RFC 8435 | `crates/kiseki-gateway/tests/rfc8435.rs` | ✅ | 0 of 20 RED — Group III closed 2026-04-27 |
+| T-10 | RFC 5665 | `crates/kiseki-gateway/tests/rfc5665.rs` | ✅ | 0 of 14 RED — Group III closed 2026-04-27 |
 | T-11 | RFC 9289 | `crates/kiseki-gateway/tests/rfc9289.rs` | ✅ | 1 of 11 RED (no keep-alive timer) |
 | T-12 | RFC 9110/9111/9112 | `crates/kiseki-gateway/tests/rfc9110.rs` | ✅ | 6 of 19 RED (Range ignored; conditional headers) |
 | T-13 | RFC 3986 | `crates/kiseki-gateway/tests/rfc3986.rs` | ✅ | 0 of 11 RED |
@@ -329,7 +329,7 @@ is updated in the same commit as the test/fix landings.
 |---|---|---|
 | I — Foundation | `nfs_xdr.rs`, `nfs_auth.rs` | ✅ — strict bool/opaque pad; `OpaqueAuth` w/ §8.2 400-byte cap; `AuthSysParams::decode` enforcing machinename≤255 + gids≤16 (2026-04-27) |
 | II — NFSv4 family | `nfs4_server.rs` | ✅ — minor-vers validation; OP_ILLEGAL/NOTSUPP/BADXDR distinctions; NOFILEHANDLE for missing current_fh; getattr bitmap fix; SEEK + LAYOUTERROR stubs (2026-04-27) |
-| III — pNFS | `pnfs.rs`, `pnfs_ds_server.rs`, `nfs4_server.rs::op_layoutget_ff` | ❌ |
+| III — pNFS | `pnfs.rs`, `pnfs_ds_server.rs`, `nfs4_server.rs::op_layoutget_ff` | ✅ — `host_port_to_uaddr` bracketed IPv6 (`[::1]:2049` → `::1.8.1`); `ff_ioflags4` advertises `FF_FLAGS_NO_LAYOUTCOMMIT` (2026-04-27) |
 | IV — NFS transport | `nfs_server.rs` | ❌ |
 | V — NFSv3 | `nfs3_server.rs` | ❌ |
 | VI — S3 stack | `s3_server.rs`, `s3_auth.rs` | ❌ |

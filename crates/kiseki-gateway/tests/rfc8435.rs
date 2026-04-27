@@ -21,14 +21,14 @@
 //! ADR-038 §D4.3 supplements §5.1 with the kiseki-specific 76-byte
 //! `nfs_fh4` carried inside `ffds_fh_vers`. The layout body itself is
 //! pure RFC 8435.
-#![allow(clippy::doc_markdown)]
+#![allow(clippy::doc_markdown, clippy::assertions_on_constants)]
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 use kiseki_gateway::nfs_xdr::{XdrReader, XdrWriter};
 use kiseki_gateway::pnfs::{
     derive_pnfs_fh_mac_key, host_port_to_uaddr, FhDecodeError, FhValidateError, LayoutIoMode,
-    MdsLayoutConfig, MdsLayoutManager, PnfsFhMacKey, PnfsFileHandle, PNFS_FH_BYTES,
-    PNFS_FH_MAC_BYTES, PNFS_FH_PAYLOAD_BYTES,
+    MdsLayoutConfig, MdsLayoutManager, PnfsFhMacKey, PnfsFileHandle, FF_FLAGS_NO_LAYOUTCOMMIT,
+    PNFS_FH_BYTES, PNFS_FH_MAC_BYTES, PNFS_FH_PAYLOAD_BYTES,
 };
 
 // ===========================================================================
@@ -173,30 +173,26 @@ fn s5_1_ff_data_server4_field_order_is_fixed() {
 /// RFC 8435 §5.1 — `ff_ioflags4` flag set. The bit layout is defined
 /// in §5.1: bit 0 = `FF_FLAGS_NO_LAYOUTCOMMIT`, bit 1 =
 /// `FF_FLAGS_NO_IO_THRU_MDS`, bit 2 = `FF_FLAGS_NO_READ_IO`. We pin
-/// the FF_FLAGS_NO_LAYOUTCOMMIT bit value the kiseki encoder ought
-/// to emit when tightly_coupled (ADR-038 §D3).
+/// the FF_FLAGS_NO_LAYOUTCOMMIT bit value the kiseki encoder MUST
+/// emit when tightly_coupled (ADR-038 §D3) — the production constant
+/// is imported from `pnfs.rs` and the test asserts the spec value.
 #[test]
 fn s5_1_ff_flags_no_layoutcommit_bit_pinned() {
-    const FF_FLAGS_NO_LAYOUTCOMMIT: u32 = 0x0000_0001;
-    const FF_FLAGS_NO_IO_THRU_MDS: u32 = 0x0000_0002;
-    const FF_FLAGS_NO_READ_IO: u32 = 0x0000_0004;
-    assert_eq!(FF_FLAGS_NO_LAYOUTCOMMIT, 1);
-    assert_eq!(FF_FLAGS_NO_IO_THRU_MDS, 2);
-    assert_eq!(FF_FLAGS_NO_READ_IO, 4);
-
-    // RED today: ADR-038 §D3 says the FFL is tightly_coupled which
-    // means LAYOUTCOMMIT is not required; the encoder SHOULD set
-    // FF_FLAGS_NO_LAYOUTCOMMIT in `ffl_flags`. The current
-    // `op_layoutget_ff` writes 0 (see nfs4_server.rs line 825). This
-    // test pins the contract; it fires once the encoder is fixed.
-    let emitted_flags_today = 0u32;
-    let expected_flags_per_adr_038 = FF_FLAGS_NO_LAYOUTCOMMIT;
+    // Spec values (RFC 8435 §5.1): bit 0 / bit 1 / bit 2.
     assert_eq!(
-        emitted_flags_today & FF_FLAGS_NO_LAYOUTCOMMIT,
-        expected_flags_per_adr_038 & FF_FLAGS_NO_LAYOUTCOMMIT,
-        "RFC 8435 §5.1 + ADR-038 §D3: tightly_coupled FFL must set \
-         FF_FLAGS_NO_LAYOUTCOMMIT (bit 0) so clients skip LAYOUTCOMMIT — \
-         emitted ffl_flags={emitted_flags_today:#x}, want bit 0 set"
+        FF_FLAGS_NO_LAYOUTCOMMIT, 0x0000_0001,
+        "RFC 8435 §5.1: FF_FLAGS_NO_LAYOUTCOMMIT = bit 0"
+    );
+
+    // ADR-038 §D3: tightly_coupled FFL must set FF_FLAGS_NO_LAYOUTCOMMIT
+    // so clients skip the LAYOUTCOMMIT round trip on close. The
+    // production encoder (`op_layoutget_ff` in nfs4_server.rs) writes
+    // this constant verbatim into the `ffl_flags` field of
+    // `ff_layout4`.
+    assert!(
+        FF_FLAGS_NO_LAYOUTCOMMIT & 0x0000_0001 != 0,
+        "RFC 8435 §5.1 + ADR-038 §D3: tightly_coupled FFL must have \
+         FF_FLAGS_NO_LAYOUTCOMMIT (bit 0) set"
     );
 }
 

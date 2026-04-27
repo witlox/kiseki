@@ -25,6 +25,19 @@ pub const PNFS_FH_MAC_DOMAIN: &[u8] = b"kiseki/pnfs-fh/v1\x00";
 /// RFC 5661 §5 `NFS4_FHSIZE` max is 128 — well under the cap.
 pub const PNFS_FH_BYTES: usize = 76;
 
+/// RFC 8435 §5.1 — `ff_ioflags4` flag bits.
+///
+/// Kiseki's FFL is *tightly coupled* per ADR-038 §D3 (the MDS owns the
+/// stateid; DS access piggybacks on the same session/identity), which
+/// means clients SHOULD NOT issue `LAYOUTCOMMIT` on close. We advertise
+/// this by setting `FF_FLAGS_NO_LAYOUTCOMMIT` (bit 0) in `ffl_flags`.
+pub const FF_FLAGS_NO_LAYOUTCOMMIT: u32 = 0x0000_0001;
+/// RFC 8435 §5.1 — clients SHOULD NOT fall back to MDS-mediated I/O
+/// on DS errors. Not currently emitted; sentinel for future use.
+pub const FF_FLAGS_NO_IO_THRU_MDS: u32 = 0x0000_0002;
+/// RFC 8435 §5.1 — DS cannot serve READ I/O. Not currently emitted.
+pub const FF_FLAGS_NO_READ_IO: u32 = 0x0000_0004;
+
 /// Size of the unsigned payload (everything except the MAC).
 pub const PNFS_FH_PAYLOAD_BYTES: usize = 60;
 
@@ -367,8 +380,30 @@ pub struct DeviceInfo {
 
 /// Convert a `host:port` string to RFC 5665 universal address form.
 /// Returns the original string on parse failure (defensive default).
+///
+/// RFC 5665 §5.2.5: IPv6 addresses ride bracketed (`[ipv6]:port`); the
+/// bracketed form is the only unambiguous way to attach a port to an
+/// IPv6 host because the address itself contains `:` separators. The
+/// universal address strips the brackets — `[::1]:2049` → `::1.8.1`.
 #[must_use]
 pub fn host_port_to_uaddr(host_port: &str) -> String {
+    // Bracketed IPv6 form: [ipv6-text]:port.
+    if let Some(rest) = host_port.strip_prefix('[') {
+        if let Some(close) = rest.find(']') {
+            let host = &rest[..close];
+            let after = &rest[close + 1..];
+            if let Some(port_str) = after.strip_prefix(':') {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    let p1 = port >> 8;
+                    let p2 = port & 0xFF;
+                    return format!("{host}.{p1}.{p2}");
+                }
+            }
+        }
+        // Malformed bracketed form — return as-is.
+        return host_port.to_string();
+    }
+
     let Some((host, port_str)) = host_port.rsplit_once(':') else {
         return host_port.to_string();
     };

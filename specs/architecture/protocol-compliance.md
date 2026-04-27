@@ -74,10 +74,10 @@ For each spec below:
 | **RFC 7530** — NFSv4.0 (substrate for 4.1/4.2) | `kiseki-gateway` (`nfs4_server.rs`) | `crates/kiseki-gateway/tests/rfc7530.rs` | ✅ — Group II 2026-04-27: minor=0 → MINOR_VERS_MISMATCH | N — kiseki advertises 4.1+, but a 4.0-only client probe must fall back cleanly |
 | **RFC 8881** — NFSv4.1 (sessions, EXCHANGE_ID, pNFS hooks). **Obsoletes RFC 5661.** Companion XDR: RFC 5662 + applicable errata. | `kiseki-gateway` (`nfs4_server.rs`) | `crates/kiseki-gateway/tests/rfc8881.rs` | ✅ — Group II 2026-04-27: NOFILEHANDLE vs BADHANDLE; OP_ILLEGAL vs NOTSUPP; BADXDR on truncation; minor-vers validation; bitmap word0 = TYPE\|SIZE | Y — the protocol Linux mount.nfs4 uses |
 | **RFC 7862** — NFSv4.2 (extends 5661/8881: ALLOCATE, DEALLOCATE, COPY, READ_PLUS, IO_ADVISE). Companion XDR: RFC 7863. | `kiseki-gateway` (`nfs4_server.rs`) | `crates/kiseki-gateway/tests/rfc7862.rs` | ✅ — Group II 2026-04-27: SEEK→UNION_NOTSUPP; LAYOUTERROR→BADIOMODE; v4.2 op-table coverage | Y for NFSv4.2 mounts |
-| **RFC 8435** — pNFS Flexible Files Layout | `kiseki-gateway` (`pnfs.rs`, `nfs4_server.rs`) | `crates/kiseki-gateway/tests/rfc8435.rs` | ❌ — Phase 15b implementation needs verification | Y for pNFS perf |
+| **RFC 8435** — pNFS Flexible Files Layout | `kiseki-gateway` (`pnfs.rs`, `nfs4_server.rs`) | `crates/kiseki-gateway/tests/rfc8435.rs` | ✅ — Group III 2026-04-27: `ffl_flags` advertises `FF_FLAGS_NO_LAYOUTCOMMIT` (tightly_coupled per ADR-038 §D3) | Y for pNFS perf |
 | **RFC 5663** — pNFS Block Layout | n/a | n/a | ⛔ Rejected (ADR-038 §D1) | N |
 | **RFC 8154** — pNFS SCSI Layout | n/a | n/a | ⛔ Rejected (ADR-038 §D1) | N |
-| **RFC 5665** — Universal Address Format (`netaddr4`, `uaddr`) | `kiseki-gateway` (`pnfs.rs::host_port_to_uaddr`) | `crates/kiseki-gateway/tests/rfc5665.rs` | 🟡 — `host_port_to_uaddr_handles_ipv4` tests two cases; spec has many more | Y for pNFS GETDEVICEINFO |
+| **RFC 5665** — Universal Address Format (`netaddr4`, `uaddr`) | `kiseki-gateway` (`pnfs.rs::host_port_to_uaddr`) | `crates/kiseki-gateway/tests/rfc5665.rs` | ✅ — Group III 2026-04-27: bracketed IPv6 form `[ipv6]:port` parsed correctly; tcp/tcp6 netid pinned | Y for pNFS GETDEVICEINFO |
 | **RFC 9289** — NFS-over-TLS (`xprtsec=mtls` handshake, keep-alives) | `kiseki-gateway` (`nfs_server.rs`, `pnfs_ds_server.rs`) | `crates/kiseki-gateway/tests/rfc9289.rs` | ❌ — Phase 15a default, no compliance tests | Y for production NFS |
 
 ### S3 stack
