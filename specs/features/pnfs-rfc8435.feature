@@ -16,7 +16,7 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
   ultimate safety net.
 
   Background:
-    Given a Kiseki cluster with 3 storage nodes
+    Given a 3-node pNFS cluster
     And a bootstrap namespace "default" with tenant "org-test"
     And `K_layout` is derived from the master key
 

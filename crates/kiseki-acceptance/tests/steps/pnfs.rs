@@ -138,12 +138,17 @@ fn run_compound(
 // Background — Phase 15a
 // ---------------------------------------------------------------------------
 
-#[given(regex = r#"^a Kiseki cluster with (\d+) storage nodes$"#)]
-async fn given_cluster_with_n_nodes(world: &mut KisekiWorld, _n: u32) {
+#[given("a 3-node pNFS cluster")]
+async fn given_pnfs_cluster(world: &mut KisekiWorld) {
     // The default world already provides an in-memory gateway. For
     // Phase 15a we don't need an actual multi-node cluster — the
     // scenarios that need one (15b/c/d) re-spec via their own steps.
     // Reset the gateway-read counter so each scenario starts at 0.
+    //
+    // Phrase deliberately avoids the existing literal step
+    // `"a Kiseki cluster with 5 storage nodes"` (steps/log.rs:32) —
+    // a generic regex over `a Kiseki cluster with (\d+) storage
+    // nodes` would otherwise produce an ambiguous-step error there.
     world.pnfs_gateway_reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     world.pnfs_last_results.clear();
 }
