@@ -860,7 +860,13 @@ fn s18_16_open_create_returns_non_zero_stateid() {
         w.write_u32(0); // share_deny
         w.write_u64(1); // clientid
         w.write_opaque(b"owner"); // owner
+                                  // openflag4 = OPEN4_CREATE + createhow4(UNCHECKED4, empty fattr).
         w.write_u32(1); // OPEN4_CREATE
+        w.write_u32(0); // createhow4 = UNCHECKED4
+        w.write_u32(0); // fattr4.bitmap word count = 0
+        w.write_opaque(&[]); // fattr4.attr_vals (empty)
+                             // open_claim4 = CLAIM_NULL + component4 file.
+        w.write_u32(0); // CLAIM_NULL
         w.write_string("rfc8881-newfile");
     });
     let reply = drive_compound(0x6001, &body);
@@ -1365,7 +1371,13 @@ fn s18_22_read_after_open_returns_ok_or_io_with_eof_field() {
         w.write_u32(0); // share_deny
         w.write_u64(1); // clientid
         w.write_opaque(b"owner-read");
+        // openflag4 = OPEN4_CREATE + UNCHECKED4 createhow + empty fattr.
         w.write_u32(1); // OPEN4_CREATE
+        w.write_u32(0); // createhow4 = UNCHECKED4
+        w.write_u32(0); // fattr4.bitmap word count = 0
+        w.write_opaque(&[]); // fattr4.attr_vals (empty)
+                             // open_claim4 = CLAIM_NULL + component4 file.
+        w.write_u32(0); // CLAIM_NULL
         w.write_string("rfc8881-readfile");
         // 3. READ — anonymous stateid, offset=0, count=4096.
         w.write_u32(v4op::READ);
@@ -2073,8 +2085,9 @@ fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
         w.write_u32(0); // share_deny = NONE
         w.write_u64(1); // clientid
         w.write_opaque(b"owner"); // owner
-        w.write_u32(0); // OPEN4_NOCREATE
-        w.write_string(&name);
+        w.write_u32(0); // OPEN4_NOCREATE (no createhow body)
+        w.write_u32(0); // open_claim4 = CLAIM_NULL
+        w.write_string(&name); // component4 file
     });
     let header = make_header(0xCA02, PROC_COMPOUND);
     let raw = build_nfs4_call(0xCA02, PROC_COMPOUND, &body);
@@ -2136,6 +2149,86 @@ fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
         deleg_type <= 4,
         "RFC 8881 §9.1.2: open_delegation_type4 ∈ {{0..4}}; got \
          {deleg_type} — parser is misaligned"
+    );
+}
+
+/// Phase 15c.3 — RFC 8881 §18.16.1 OPEN args **claim discriminator**.
+/// The wire layout per §18.16.1 + §3.2.10 (open_claim4) is:
+///
+///   seqid + share_access + share_deny + owner +
+///   openhow (opentype + createhow-if-create) + claim
+///
+/// The `claim` discriminator is REQUIRED before the file name field.
+/// CLAIM_NULL = 0 is the open-by-parent-name path Linux always uses
+/// for `open()`. The previous op_open AND the previous unit tests
+/// both omitted it — server read the claim_type=0 u32 as the name's
+/// length-prefix, materialized an empty name, and returned
+/// NFS4ERR_NOENT to userspace. THIS is the actual cat ENOENT bug
+/// surfaced by the docker e2e mount; B2's reply structure mattered
+/// too but B3 was the trigger.
+#[test]
+fn s18_16_1_open_args_claim_discriminator_is_required() {
+    let ctx = make_ctx();
+    let sessions = SessionManager::new();
+
+    let comp_id = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let resp = ctx
+                .gateway
+                .write(kiseki_gateway::nfs::NfsWriteRequest {
+                    tenant_id: test_tenant(),
+                    namespace_id: test_namespace(),
+                    data: b"open-claim-fixture".to_vec(),
+                })
+                .await
+                .expect("seed write");
+            resp.composition_id
+        })
+    };
+    let name = comp_id.0.to_string();
+
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::LOOKUP);
+        w.write_string("default");
+        w.write_u32(v4op::OPEN);
+        w.write_u32(0); // seqid
+        w.write_u32(1); // share_access = OPEN4_SHARE_ACCESS_READ
+        w.write_u32(0); // share_deny = OPEN4_SHARE_DENY_NONE
+        w.write_u64(1); // open_owner4.clientid
+        w.write_opaque(b"linux-kernel-owner"); // open_owner4.owner
+                                               // openflag4 — OPEN4_NOCREATE has no body trailer.
+        w.write_u32(0); // OPEN4_NOCREATE
+                        // open_claim4 — CLAIM_NULL takes a `component4 file` body.
+        w.write_u32(0); // CLAIM_NULL
+        w.write_string(&name); // file
+    });
+    let header = make_header(0xCA05, PROC_COMPOUND);
+    let raw = build_nfs4_call(0xCA05, PROC_COMPOUND, &body);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+
+    let mut r = reader_at_compound_result(&reply);
+    let _cs = r.read_u32().unwrap();
+    let _tag = r.read_opaque().unwrap();
+    let _ra = r.read_u32().unwrap();
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // PUTROOTFH
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // LOOKUP("default")
+    let _ = r.read_u32(); // OPEN op
+    let st = r.read_u32().unwrap();
+    assert_eq!(
+        st,
+        nfs4_status::NFS4_OK,
+        "RFC 8881 §18.16.1 + §3.2.10: server MUST parse open_claim4 \
+         discriminator (CLAIM_NULL = 0) before the file name. Without \
+         it, claim_type bytes are mis-read as the name's length-prefix \
+         → empty name → NFS4ERR_NOENT. This is the kernel cat-ENOENT \
+         bug surfaced by the docker e2e mount."
     );
 }
 

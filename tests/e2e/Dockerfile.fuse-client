@@ -1,0 +1,27 @@
+# FUSE client — minimal Linux image with fuse3 + the prebuilt
+# kiseki-client binary. Used by tests/e2e/test_fuse_client.py via
+# `docker run --rm --privileged --device /dev/fuse …`. The host
+# must pass /dev/fuse through (privileged + CAP_SYS_ADMIN).
+#
+# Built once per pytest session by the `fuse_client_image` fixture.
+# Expects `target/release/kiseki-client` to exist (`cargo build
+# --release -p kiseki-client --features fuse` is done outside the
+# image so we don't pay rust-toolchain build cost on every CI run).
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        fuse3 \
+        ca-certificates \
+        coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-built binary (Glibc Ubuntu 24.04 host should match the
+# container's Glibc — both jammy/noble).
+COPY target/release/kiseki-client /usr/local/bin/kiseki-client
+RUN chmod +x /usr/local/bin/kiseki-client
+
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["echo 'kiseki-fuse-client: provide a command'"]

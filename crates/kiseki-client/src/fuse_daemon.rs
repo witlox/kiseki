@@ -18,7 +18,7 @@ use std::path::Path;
 use fuser::{
     Config, Errno, FileAttr as FuserAttr, FileHandle, FileType as FuserFileType, Filesystem,
     FopenFlags, Generation, INodeNo, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, Request,
+    ReplyDirectory, ReplyEntry, Request, WriteFlags,
 };
 
 #[cfg(feature = "fuse")]
@@ -110,6 +110,30 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
         let fs = self.inner.lock().unwrap();
         match fs.read(ino.0, offset, size) {
             Ok(data) => reply.data(&data),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    /// FUSE_WRITE — bridges the kernel's pwrite/write syscalls to
+    /// `KisekiFuse::write`. Without this op the daemon falls back to
+    /// the fuser library's default impl (ENOSYS), so any write
+    /// through a mounted FUSE path returns "Function not implemented"
+    /// to userspace. Phase 15c.3 e2e gap.
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyWrite,
+    ) {
+        let mut fs = self.inner.lock().unwrap();
+        match fs.write(ino.0, offset, data) {
+            Ok(written) => reply.written(written),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -227,18 +251,27 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
 /// Mount a `KisekiFuse` instance at the given path.
 ///
 /// Blocks until the filesystem is unmounted. Feature-gated behind `fuse`.
+/// `read_write = true` flips the mount to RW (default RO matches the
+/// HPC compute-node use case where writes go via S3).
+///
+/// `AutoUnmount` is intentionally NOT set: the fuser 0.17 library
+/// refuses it when the FUSE ACL is `Owner` (the default for
+/// `mount2`), aborting the mount with
+/// `"auto_unmount requires acl != Owner"`. Callers that want
+/// auto-cleanup should arrange `fusermount3 -u` in their teardown.
 #[cfg(feature = "fuse")]
 pub fn mount<G: GatewayOps + Send + Sync + 'static>(
     fs: KisekiFuse<G>,
     mountpoint: &Path,
+    read_write: bool,
 ) -> Result<(), std::io::Error> {
     let daemon = FuseDaemon::new(fs);
     let mut options = Config::default();
-    options.mount_options = vec![
-        MountOption::RO,
-        MountOption::FSName("kiseki".to_owned()),
-        MountOption::AutoUnmount,
-    ];
+    let mut mount_opts = vec![MountOption::FSName("kiseki".to_owned())];
+    if !read_write {
+        mount_opts.push(MountOption::RO);
+    }
+    options.mount_options = mount_opts;
     fuser::mount2(daemon, mountpoint, &options)
         .map_err(|e| std::io::Error::other(format!("FUSE mount failed: {e}")))
 }

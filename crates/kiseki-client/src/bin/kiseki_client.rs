@@ -58,6 +58,7 @@ MOUNT OPTIONS:
     --endpoint <host:port>   Gateway endpoint (required)
     --mountpoint <path>      Local mount path (required)
     --cache-mode <mode>      Cache mode: pinned, organic, bypass (default: organic)
+    --read-write             Mount RW (default: RO — HPC compute-node default)
     --cache-dir <path>       Cache directory (default: /tmp/kiseki-cache)
 
 STAGE OPTIONS:
@@ -95,6 +96,7 @@ fn handle_mount(args: &[String]) {
     let mut mountpoint: Option<String> = None;
     let mut cache_mode = String::from("organic");
     let mut _cache_dir: Option<String> = None;
+    let mut read_write = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -130,6 +132,10 @@ fn handle_mount(args: &[String]) {
                 }
                 _cache_dir = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--read-write" => {
+                read_write = true;
+                i += 1;
             }
             other => {
                 eprintln!("Unknown mount option: {other}");
@@ -177,11 +183,13 @@ fn handle_mount(args: &[String]) {
     #[cfg(feature = "fuse")]
     {
         use std::path::Path;
-        kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint)).expect("FUSE mount failed");
+        kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
+            .expect("FUSE mount failed");
     }
     #[cfg(not(feature = "fuse"))]
     {
         let _ = fuse; // suppress unused warning
+        let _ = read_write;
         eprintln!("FUSE support not compiled — rebuild with --features fuse");
         std::process::exit(1);
     }

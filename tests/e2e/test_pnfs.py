@@ -303,6 +303,71 @@ def test_pnfs_plaintext_fallback(
 
 
 @pytest.mark.e2e
+def test_nfs41_basic_mount_and_read(
+    pnfs_cluster: ClusterInfo,
+    pnfs_client_image: str,
+) -> None:
+    """Phase 15c.3 surface-level proof: mount.nfs4 -o vers=4.1 +
+    dd of a known composition by UUID returns byte-equal output.
+    Asserts the READ counter is non-zero — does NOT require LAYOUTGET
+    (pNFS Flexible Files layout dispatch is `test_pnfs_plaintext_fallback`).
+
+    This is the test that answers "does NFSv4.1 cat/dd work end-to-end
+    against the running cluster?". Today (post-Phase-15c.3) the answer
+    must be yes."""
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    payload = b"\xde\xad\xbe\xef" * 65_536  # 256 KiB
+    etag = _seed_known_object(pnfs_cluster, payload)
+
+    script = r"""
+set -euo pipefail
+MOUNT_POINT=/mnt/pnfs
+mkdir -p "$MOUNT_POINT"
+mount -t nfs4 -o vers=4.1,minorversion=1 {host}:/default "$MOUNT_POINT"
+trap 'umount "$MOUNT_POINT" 2>/dev/null || true' EXIT
+dd if="$MOUNT_POINT/{etag}" of=/tmp/out bs=4k count=64 status=none
+echo '---SHA256---'
+sha256sum /tmp/out
+echo '---MOUNTSTATS---'
+cat /proc/self/mountstats
+""".format(host="kiseki-node1", etag=etag)
+    result = _run_in_client(pnfs_client_image, script, timeout=60)
+
+    if result.returncode != 0:
+        pytest.fail(
+            f"NFSv4.1 mount-and-read failed (rc={result.returncode}):\n"
+            f"stdout: {result.stdout[-2000:]}\n"
+            f"stderr: {result.stderr[-2000:]}"
+        )
+
+    import hashlib
+
+    expected_sha = hashlib.sha256(payload).hexdigest()
+    sha_line = next(
+        (
+            line
+            for line in result.stdout.splitlines()
+            if line and " " in line and len(line.split()[0]) == 64
+        ),
+        "",
+    )
+    assert sha_line, f"no sha256 line in output: {result.stdout[-1000:]}"
+    actual_sha = sha_line.split()[0]
+    assert actual_sha == expected_sha, (
+        f"NFSv4.1 read corrupted bytes: "
+        f"expected sha256={expected_sha}, got {actual_sha}"
+    )
+
+    counters = _parse_op_counters(result.stdout)
+    assert counters["READ"] >= 1, (
+        f"no NFS READs accounted — kernel may have served from cache: "
+        f"counters={counters}"
+    )
+
+
+@pytest.mark.e2e
 def test_pnfs_layout_recall_on_drain(pnfs_cluster: ClusterInfo) -> None:
     """When a storage node enters drain (ADR-035), MDS fires
     LAYOUTRECALL within I-PN5's 1-sec SLA. Phase 15c integration

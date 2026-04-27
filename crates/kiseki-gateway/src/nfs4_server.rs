@@ -1365,16 +1365,87 @@ fn op_open<G: GatewayOps>(
     sessions: &SessionManager,
     state: &mut CompoundState,
 ) -> (u32, Vec<u8>) {
-    // Simplified OPEN: seqid + share_access + share_deny + owner + openhow
+    // RFC 8881 §18.16.1 OPEN4args:
+    //   seqid + share_access + share_deny + open_owner4 +
+    //   openflag4 (opentype + createhow-if-CREATE) + open_claim4
+    //
+    // open_owner4: clientid (u64) + owner (opaque<>)
+    // openflag4 (§3.2.9):
+    //   case OPEN4_CREATE (1): createhow4
+    //     createhow4 (§3.2.8):
+    //       case UNCHECKED4 (0) | GUARDED4 (1): fattr4 (bitmap+attrs)
+    //       case EXCLUSIVE4 (2): verifier4 (8 bytes)
+    //       case EXCLUSIVE4_1 (3): createverfattr4 (verifier + fattr4)
+    //   default (NOCREATE = 0): void
+    // open_claim4 (§3.2.10):
+    //   case CLAIM_NULL (0):           component4 file
+    //   case CLAIM_PREVIOUS (1):       open_delegation_type4
+    //   case CLAIM_DELEGATE_CUR (2):   open_claim_delegate_cur4
+    //   case CLAIM_DELEGATE_PREV (3):  component4 file_delegate_prev
+    //   case CLAIM_FH (4):             void  (4.1+)
+    //   case CLAIM_DELEG_PREV_FH (5):  void  (4.1+)
+    //   case CLAIM_DELEG_CUR_FH (6):   open_claim_delegate_cur_fh4 (4.1+)
+    //
+    // The previous decoder skipped both `createhow` and the `claim`
+    // discriminator. Linux 6.x always sends CLAIM_NULL for plain
+    // open() — its `claim_type=0` u32 was being mis-read as the
+    // name's length-prefix → empty name → NFS4ERR_NOENT (the
+    // kernel cat-ENOENT surfaced by Phase 15c.3 e2e). Fixed by
+    // parsing the full args grammar.
+    const OPEN4_NOCREATE: u32 = 0;
+    const OPEN4_CREATE: u32 = 1;
+    const UNCHECKED4: u32 = 0;
+    const GUARDED4: u32 = 1;
+    const EXCLUSIVE4: u32 = 2;
+    const EXCLUSIVE4_1: u32 = 3;
+    const CLAIM_NULL: u32 = 0;
+
     let _seqid = reader.read_u32().unwrap_or(0);
     let _share_access = reader.read_u32().unwrap_or(1); // READ
     let _share_deny = reader.read_u32().unwrap_or(0); // NONE
-                                                      // Skip owner (clientid + opaque)
     let _clientid = reader.read_u64().unwrap_or(0);
     let _owner = reader.read_opaque().unwrap_or_default();
-    // openhow: opentype
-    let open_type = reader.read_u32().unwrap_or(0); // OPEN4_NOCREATE=0, OPEN4_CREATE=1
-    let name = reader.read_string().unwrap_or_default();
+
+    // openflag4 union — opentype + createhow body (only when CREATE).
+    let open_type = reader.read_u32().unwrap_or(OPEN4_NOCREATE);
+    if open_type == OPEN4_CREATE {
+        let createhow_type = reader.read_u32().unwrap_or(UNCHECKED4);
+        match createhow_type {
+            UNCHECKED4 | GUARDED4 => {
+                // fattr4: bitmap4 (count + words) + opaque attr_vals.
+                let bm_count = reader.read_u32().unwrap_or(0);
+                for _ in 0..bm_count {
+                    let _ = reader.read_u32();
+                }
+                let _attr_vals = reader.read_opaque().unwrap_or_default();
+            }
+            EXCLUSIVE4 => {
+                let _verifier = reader.read_opaque_fixed(8).unwrap_or_default();
+            }
+            EXCLUSIVE4_1 => {
+                let _verifier = reader.read_opaque_fixed(8).unwrap_or_default();
+                let bm_count = reader.read_u32().unwrap_or(0);
+                for _ in 0..bm_count {
+                    let _ = reader.read_u32();
+                }
+                let _attr_vals = reader.read_opaque().unwrap_or_default();
+            }
+            _ => {}
+        }
+    }
+
+    // open_claim4 — CLAIM_NULL is the only path Linux uses for a
+    // plain `open()` against an existing dentry. Other claim types
+    // are stateid-recovery paths (PREVIOUS/DELEGATE_*) that the
+    // current state machine doesn't grant delegations for; we
+    // tolerate the discriminator and fall through to NOENT for
+    // non-NULL claims.
+    let claim_type = reader.read_u32().unwrap_or(CLAIM_NULL);
+    let name = if claim_type == CLAIM_NULL {
+        reader.read_string().unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let mut w = XdrWriter::new();
     w.write_u32(op::OPEN);
@@ -2324,7 +2395,11 @@ mod tests {
         body.write_u64(1); // clientid
         body.write_opaque(b"owner"); // owner
         body.write_u32(1); // OPEN4_CREATE
-        body.write_string("created-file.txt");
+        body.write_u32(0); // createhow4 = UNCHECKED4
+        body.write_u32(0); // fattr4.bitmap word count
+        body.write_opaque(&[]); // fattr4.attr_vals
+        body.write_u32(0); // open_claim4 = CLAIM_NULL
+        body.write_string("created-file.txt"); // file
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
@@ -2360,8 +2435,9 @@ mod tests {
         body.write_u32(0); // share_deny
         body.write_u64(1); // clientid
         body.write_opaque(b"owner");
-        body.write_u32(0); // OPEN4_NOCREATE
-        body.write_string("readable.txt");
+        body.write_u32(0); // OPEN4_NOCREATE (no createhow body)
+        body.write_u32(0); // open_claim4 = CLAIM_NULL
+        body.write_string("readable.txt"); // file
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
@@ -2391,7 +2467,8 @@ mod tests {
         body.write_u32(0);
         body.write_u64(1);
         body.write_opaque(b"owner");
-        body.write_u32(0); // NOCREATE
+        body.write_u32(0); // NOCREATE (no createhow body)
+        body.write_u32(0); // open_claim4 = CLAIM_NULL
         body.write_string("nosuchfile");
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
