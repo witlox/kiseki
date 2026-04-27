@@ -635,6 +635,16 @@ mod fattr4 {
     pub const NUMLINKS_W1: u32 = 35 - 32;
     pub const OWNER_W1: u32 = 36 - 32;
     pub const OWNER_GROUP_W1: u32 = 37 - 32;
+    /// `FATTR4_FS_LAYOUT_TYPES` (bit 62) — a `layouttype4<>` array
+    /// listing every layout type the FS supports. Linux clients
+    /// gate the LAYOUTGET path on this bit + at least one type
+    /// in the array; absence means "no pNFS on this FS, fall
+    /// back to plain NFSv4.1 READ".
+    pub const FS_LAYOUT_TYPES_W1: u32 = 62 - 32;
+    /// `FATTR4_LAYOUT_TYPES` (bit 30) — same but per-file. Some
+    /// kernels also key on this when deciding whether to ask for
+    /// a layout on a specific open.
+    pub const LAYOUT_TYPES: u32 = 30;
 }
 
 /// `FH4_PERSISTENT` per RFC 8881 §5.8.1.18 — kiseki file handles
@@ -732,6 +742,16 @@ fn op_getattr<G: GatewayOps>(
             | (1u32 << fattr4::RDATTR_ERROR)
             | (1u32 << fattr4::FILEHANDLE)
             | (1u32 << fattr4::FILEID);
+        // FATTR4_LAYOUT_TYPES (bit 30) and FATTR4_FS_LAYOUT_TYPES
+        // (bit 62) are NOT yet in the supported_attrs set — Phase
+        // 15c.4 follow-up. Advertising them without a wired
+        // MdsLayoutManager makes Linux issue LAYOUTGET, which our
+        // legacy fallback answers with a malformed FILES-layout body
+        // pointing at gRPC port 9100 (not the DS port 2052) — kernel
+        // can't read via the layout and the COMPOUND hangs. Until
+        // mds_layout_manager is wired into NfsContext + DS endpoints
+        // are reachable from the client, plain NFSv4.1 (no pNFS) is
+        // the only path that works end-to-end.
         let supported_word1 = (1u32 << fattr4::MODE_W1)
             | (1u32 << fattr4::NUMLINKS_W1)
             | (1u32 << fattr4::OWNER_W1)
@@ -804,6 +824,16 @@ fn op_getattr<G: GatewayOps>(
         attr_w.write_u64(attrs.fileid);
         result_word0 |= 1 << fattr4::FILEID;
     }
+    if want(fattr4::LAYOUT_TYPES) {
+        // RFC 8881 §5.8.1.30 — `FATTR4_LAYOUT_TYPES`: per-file
+        // `layouttype4<>`. Some clients also key on this when
+        // deciding whether to ask for a layout on a specific
+        // open. Kiseki advertises the same set as the FS-level
+        // `FATTR4_FS_LAYOUT_TYPES`.
+        attr_w.write_u32(1); // count
+        attr_w.write_u32(LAYOUT4_FLEX_FILES);
+        result_word0 |= 1 << fattr4::LAYOUT_TYPES;
+    }
     // Word 1 attrs (Phase 15c.3): kernel needs MODE for ACCESS check
     // before READDIR; OWNER/OWNER_GROUP for ls -l.
     if want_w1(fattr4::MODE_W1) {
@@ -824,6 +854,14 @@ fn op_getattr<G: GatewayOps>(
     if want_w1(fattr4::OWNER_GROUP_W1) {
         attr_w.write_string("root@kiseki.local");
         result_word1 |= 1 << fattr4::OWNER_GROUP_W1;
+    }
+    if want_w1(fattr4::FS_LAYOUT_TYPES_W1) {
+        // RFC 8881 §5.8.1.12 — `FATTR4_FS_LAYOUT_TYPES`:
+        // `layouttype4<>` listing every layout type the FS supports.
+        // Kiseki implements RFC 8435 Flexible Files Layout (ADR-038).
+        attr_w.write_u32(1); // count
+        attr_w.write_u32(LAYOUT4_FLEX_FILES);
+        result_word1 |= 1 << fattr4::FS_LAYOUT_TYPES_W1;
     }
 
     w.write_u32(nfs4_status::NFS4_OK);

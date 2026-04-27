@@ -91,6 +91,7 @@ fn pool_dir() -> PathBuf {
     cache_dir().join("default-tenant").join("pool")
 }
 
+#[allow(clippy::too_many_lines)] // mount has lots of CLI flag wiring
 fn handle_mount(args: &[String]) {
     let mut endpoint: Option<String> = None;
     let mut mountpoint: Option<String> = None;
@@ -144,7 +145,7 @@ fn handle_mount(args: &[String]) {
         }
     }
 
-    let _endpoint = endpoint.unwrap_or_else(|| {
+    let endpoint = endpoint.unwrap_or_else(|| {
         eprintln!("Error: --endpoint is required");
         std::process::exit(2);
     });
@@ -153,43 +154,61 @@ fn handle_mount(args: &[String]) {
         std::process::exit(2);
     });
 
-    // Create gateway (local in-memory for now — real gRPC gateway connection deferred).
     let tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
     let namespace =
         kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
-    let shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
 
-    let mut compositions = kiseki_composition::composition::CompositionStore::new();
-    compositions.add_namespace(kiseki_composition::namespace::Namespace {
-        id: namespace,
-        tenant_id: tenant,
-        shard_id: shard,
-        read_only: false,
-        versioning_enabled: false,
-        compliance_tags: Vec::new(),
-    });
-
-    let master_key =
-        kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
-    let gw = kiseki_gateway::InMemoryGateway::new(
-        compositions,
-        Box::new(kiseki_chunk::store::ChunkStore::new()),
-        master_key,
-    );
-    let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
+    // When `--endpoint` is an HTTP(S) URL AND the `remote-http`
+    // feature is compiled in, attach to the running cluster's S3
+    // listener. Otherwise fall back to the local in-memory sandbox
+    // (sandbox is the default for development; the remote path is
+    // the actual networked client).
+    let is_http_endpoint = endpoint.starts_with("http://") || endpoint.starts_with("https://");
 
     println!("Mounting at {mountpoint} (cache_mode: {cache_mode})");
+
+    #[cfg(all(feature = "fuse", feature = "remote-http"))]
+    {
+        use std::path::Path;
+        if is_http_endpoint {
+            let gw = kiseki_client::remote_http::RemoteHttpGateway::new(endpoint);
+            let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
+            kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
+                .expect("FUSE mount failed");
+            return;
+        }
+    }
 
     #[cfg(feature = "fuse")]
     {
         use std::path::Path;
+        let _ = is_http_endpoint;
+        let shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+        let mut compositions = kiseki_composition::composition::CompositionStore::new();
+        compositions.add_namespace(kiseki_composition::namespace::Namespace {
+            id: namespace,
+            tenant_id: tenant,
+            shard_id: shard,
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        });
+        let master_key = kiseki_crypto::keys::SystemMasterKey::new(
+            [0x42; 32],
+            kiseki_common::tenancy::KeyEpoch(1),
+        );
+        let gw = kiseki_gateway::InMemoryGateway::new(
+            compositions,
+            Box::new(kiseki_chunk::store::ChunkStore::new()),
+            master_key,
+        );
+        let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
         kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
             .expect("FUSE mount failed");
     }
     #[cfg(not(feature = "fuse"))]
     {
-        let _ = fuse; // suppress unused warning
-        let _ = read_write;
+        let _ = (read_write, endpoint, is_http_endpoint, tenant, namespace);
         eprintln!("FUSE support not compiled — rebuild with --features fuse");
         std::process::exit(1);
     }

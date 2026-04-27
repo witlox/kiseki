@@ -62,6 +62,16 @@ pub mod nfs3_server;
     missing_docs,
     clippy::doc_markdown,
     clippy::must_use_candidate,
+    clippy::cast_possible_truncation,
+    clippy::needless_pass_by_value
+)]
+pub mod nfs3_mount;
+
+#[cfg(feature = "nfs")]
+#[allow(
+    missing_docs,
+    clippy::doc_markdown,
+    clippy::must_use_candidate,
     clippy::new_without_default,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,

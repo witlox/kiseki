@@ -170,10 +170,28 @@ fn handle_connection<G: GatewayOps, S: io::Read + io::Write>(
     mut stream: S,
     ctx: Arc<NfsContext<G>>,
 ) -> io::Result<()> {
-    // Read first message to determine version.
+    // Read first message to determine program + version.
     let first_msg = read_rm_message(&mut stream)?;
     let mut reader = XdrReader::new(&first_msg);
     let header = RpcCallHeader::decode(&mut reader)?;
+    tracing::debug!(
+        program = header.program,
+        version = header.version,
+        procedure = header.procedure,
+        "NFS dispatch first message"
+    );
+
+    // MOUNT3 (program 100005) shares port 2049 with NFS when the
+    // client uses `mountport=2049,mountproto=tcp` — RFC 1813 Appendix
+    // I doesn't reserve a port. The standard portmapper-driven mount
+    // discovers MOUNT's port via RPCBIND, which kiseki doesn't run;
+    // co-locating MOUNT on 2049 is the documented Phase 15c.5
+    // dispatch path.
+    if header.program == crate::nfs3_mount::MOUNT3_PROGRAM {
+        let reply = crate::nfs3_mount::handle_mount3_message(&header, &first_msg, &ctx);
+        write_rm_message(&mut stream, &reply)?;
+        return crate::nfs3_mount::handle_mount3_connection(stream, ctx);
+    }
 
     if header.version == 4 {
         // NFSv4 — process first COMPOUND, then continue with v4 handler.

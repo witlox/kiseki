@@ -39,10 +39,17 @@ mod proc {
     pub const LINK: u32 = 15;
     pub const READDIR: u32 = 16;
     pub const READDIRPLUS: u32 = 17;
-    pub const PATHCONF: u32 = 19;
-    pub const FSINFO: u32 = 20;
-    pub const FSSTAT: u32 = 21;
-    pub const COMMIT: u32 = 22;
+    // RFC 1813 §3.3 — order is FSSTAT=18, FSINFO=19, PATHCONF=20,
+    // COMMIT=21. The previous numbering had FSSTAT/FSINFO/PATHCONF
+    // off-by-one (PATHCONF=19, FSINFO=20, FSSTAT=21 — fully shifted),
+    // which made Linux 6.x mount(2) silently EIO: the kernel issues
+    // proc=19 (FSINFO) to validate the mount, kiseki dispatched it
+    // to reply_pathconf, kernel got a PATHCONF wire structure where
+    // it expected FSINFO and gave up.
+    pub const FSSTAT: u32 = 18;
+    pub const FSINFO: u32 = 19;
+    pub const PATHCONF: u32 = 20;
+    pub const COMMIT: u32 = 21;
 }
 
 /// NFS3 status codes.
@@ -108,6 +115,11 @@ fn dispatch_nfs3<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
 ) -> Vec<u8> {
+    tracing::debug!(
+        xid = header.xid,
+        procedure = header.procedure,
+        "NFSv3 dispatch"
+    );
     match header.procedure {
         proc::NULL => reply_null(header.xid),
         proc::GETATTR => reply_getattr(header.xid, reader, ctx),
@@ -127,7 +139,7 @@ fn dispatch_nfs3<G: GatewayOps>(
         proc::LINK => reply_link(header.xid, reader, ctx),
         proc::READDIR => reply_readdir(header.xid, reader, ctx),
         proc::READDIRPLUS => reply_readdirplus(header.xid, reader, ctx),
-        proc::PATHCONF => reply_pathconf(header.xid),
+        proc::PATHCONF => reply_pathconf(header.xid, reader, ctx),
         proc::FSSTAT => reply_fsstat(header.xid, ctx),
         proc::FSINFO => reply_fsinfo(header.xid, ctx),
         proc::COMMIT => reply_commit(header.xid),
@@ -823,18 +835,67 @@ fn reply_readdirplus<G: GatewayOps>(
     w.into_bytes()
 }
 
-/// PATHCONF returns static filesystem configuration.
-fn reply_pathconf(xid: u32) -> Vec<u8> {
+/// PATHCONF returns static filesystem configuration. RFC 1813 §3.3.19:
+/// `PATHCONF3resok = post_op_attr + 4 u32s + 4 bools`. Post-op attrs
+/// are advisory but Linux 6.x mount(2) populates the root inode from
+/// them; emitting `attributes_follow=false` causes the kernel mount
+/// helper to retry then EIO. We synthesize the namespace-root
+/// directory attrs (the same shape NFSv3 GETATTR returns for root).
+fn reply_pathconf<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
+    // Read the fhandle3 args so we can synthesize matching post-op
+    // attrs. Defensive: a malformed/short fh is treated as the root
+    // fh (the kernel only ever PATHCONFs the mount root in practice).
+    let fh_bytes = reader.read_opaque().unwrap_or_default();
+    let fh = if fh_bytes.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&fh_bytes);
+        arr
+    } else {
+        ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)
+    };
+
     w.write_u32(status::NFS3_OK);
-    w.write_bool(false); // post-op attrs
+    // post_op_attr = TRUE + fattr3.
+    w.write_bool(true);
+    let attrs = ctx.getattr(&fh).unwrap_or(crate::nfs_ops::NfsAttrs {
+        file_type: crate::nfs_ops::FileType::Directory,
+        size: 4096,
+        mode: 0o755,
+        nlink: 2,
+        uid: 0,
+        gid: 0,
+        fileid: 1,
+    });
+    let ftype = match attrs.file_type {
+        crate::nfs_ops::FileType::Regular => 1u32,
+        crate::nfs_ops::FileType::Directory => 2u32,
+    };
+    w.write_u32(ftype);
+    w.write_u32(attrs.mode);
+    w.write_u32(attrs.nlink);
+    w.write_u32(attrs.uid);
+    w.write_u32(attrs.gid);
+    w.write_u64(attrs.size);
+    w.write_u64(attrs.size); // used
+    w.write_u64(0); // rdev (specdata3)
+    w.write_u64(1); // fsid
+    w.write_u64(attrs.fileid);
+    for _ in 0..6 {
+        w.write_u32(0); // atime, mtime, ctime
+    }
+
     w.write_u32(1024); // linkmax
     w.write_u32(255); // name_max
     w.write_bool(true); // no_trunc
     w.write_bool(false); // chown_restricted
-    w.write_bool(true); // case_insensitive = false (we say true = case preserving)
+    w.write_bool(false); // case_insensitive — kiseki paths are case-sensitive
     w.write_bool(true); // case_preserving
 
     w.into_bytes()

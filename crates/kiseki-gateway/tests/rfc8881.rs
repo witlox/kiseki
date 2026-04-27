@@ -2333,3 +2333,135 @@ fn s18_22_read_after_lookup_returns_seeded_bytes() {
         payload.len()
     );
 }
+
+// ===========================================================================
+// Gap 1/3 — pNFS layout negotiation (RFC 8881 §5.12 + RFC 8435 §5)
+// ===========================================================================
+//
+// Kernel pcap: client sends `EXCHANGE_ID` and sees USE_PNFS_MDS in
+// the response, but never sends a LAYOUTGET. Reason: clients only
+// ask for layouts on a filesystem that advertises FATTR4_FS_LAYOUT_TYPES
+// (bit 62 — word1 bit 30) listing at least one layout type the
+// client supports (LAYOUT4_FLEX_FILES = 4 for RFC 8435).
+//
+// The corollary attribute FATTR4_LAYOUT_TYPES (bit 30 — word0 bit 30)
+// is per-file; some clients also key on it to decide whether to
+// LAYOUTGET on a specific open. We expose both.
+
+/// RFC 8881 §5.8.1.12 — `FATTR4_FS_LAYOUT_TYPES` (bit 62) MUST be in
+/// the SUPPORTED_ATTRS bitmap kiseki returns from GETATTR(SUPPORTED_ATTRS),
+/// so the kernel knows pNFS layouts are negotiable on this filesystem.
+///
+/// Currently DISABLED at the wire level — advertising this bit makes
+/// Linux issue LAYOUTGET, but kiseki's legacy `op_layoutget` fallback
+/// returns a malformed FILES-layout body pointing at gRPC port 9100
+/// instead of the DS port 2052. Re-enable by (a) wiring
+/// `MdsLayoutManager` into `NfsContext` from `runtime.rs` and (b)
+/// fixing the legacy fallback or removing it. Phase 15c.4 follow-up.
+#[ignore = "Phase 15c.4 — pNFS layout negotiation requires MdsLayoutManager wiring; \
+            see specs/implementation/phase-15c4-pnfs-mds-wiring.md"]
+#[test]
+fn s5_8_supported_attrs_includes_fs_layout_types_bit_62() {
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::GETATTR);
+        // Request bitmap: bit 0 (SUPPORTED_ATTRS) only.
+        w.write_u32(1);
+        w.write_u32(1u32 << 0);
+    });
+    let reply = drive_compound(0xD001, &body);
+    let mut r = reader_at_compound_result(&reply);
+    let _cs = r.read_u32();
+    let _tag = r.read_opaque();
+    let _ = r.read_u32();
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // PUTROOTFH
+    let _ = r.read_u32(); // GETATTR op
+    let _ = r.read_u32(); // status
+    let _bm_count = r.read_u32().unwrap();
+    let _bm_word0 = r.read_u32().unwrap();
+    // attr_vals: SUPPORTED_ATTRS itself is a bitmap4 (count + words).
+    let attr_vals = r.read_opaque().unwrap();
+    let mut av = XdrReader::new(&attr_vals);
+    let inner_count = av.read_u32().unwrap();
+    assert!(
+        inner_count >= 2,
+        "RFC 8881 §5.8: SUPPORTED_ATTRS MUST report at least 2 \
+         bitmap words to cover word1 attrs (FATTR4_FS_LAYOUT_TYPES \
+         lives at bit 62 = word1 bit 30)"
+    );
+    let _supp_w0 = av.read_u32().unwrap();
+    let supp_w1 = av.read_u32().unwrap();
+    const FATTR4_FS_LAYOUT_TYPES_W1: u32 = 1u32 << (62 - 32);
+    assert!(
+        supp_w1 & FATTR4_FS_LAYOUT_TYPES_W1 != 0,
+        "RFC 8881 §5.12 + ADR-038: SUPPORTED_ATTRS word1 MUST advertise \
+         FATTR4_FS_LAYOUT_TYPES (bit 62), got w1={supp_w1:#010x}. \
+         Without it, Linux kernel never issues LAYOUTGET — the \
+         pNFS path silently degrades to plain NFSv4.1 reads."
+    );
+}
+
+/// RFC 8881 §5.8.1.12 — GETATTR with FATTR4_FS_LAYOUT_TYPES requested
+/// MUST return at least one supported layout type. Kiseki advertises
+/// LAYOUT4_FLEX_FILES (RFC 8435) via the MDS Layout Manager.
+///
+/// Same Phase 15c.4 deferral as `s5_8_supported_attrs_…` above.
+#[ignore = "Phase 15c.4 — pNFS layout negotiation requires MdsLayoutManager wiring; \
+            see specs/implementation/phase-15c4-pnfs-mds-wiring.md"]
+#[test]
+fn s5_12_fs_layout_types_returns_flex_files() {
+    const LAYOUT4_FLEX_FILES: u32 = 4;
+    const FATTR4_FS_LAYOUT_TYPES_BIT_W1: u32 = 62 - 32;
+
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::GETATTR);
+        // Request bitmap: 2 words, only word1 bit 30 set (FATTR4_FS_LAYOUT_TYPES).
+        w.write_u32(2);
+        w.write_u32(0); // word0
+        w.write_u32(1u32 << FATTR4_FS_LAYOUT_TYPES_BIT_W1);
+    });
+    let reply = drive_compound(0xD002, &body);
+    let mut r = reader_at_compound_result(&reply);
+    let _cs = r.read_u32();
+    let _tag = r.read_opaque();
+    let _ = r.read_u32();
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // PUTROOTFH
+    let _ = r.read_u32(); // GETATTR op
+    let _ = r.read_u32(); // status
+    let bm_count = r.read_u32().unwrap();
+    let _bm_w0 = r.read_u32().unwrap();
+    assert!(
+        bm_count >= 2,
+        "result bitmap MUST include word1 to carry FS_LAYOUT_TYPES bit"
+    );
+    let bm_w1 = r.read_u32().unwrap();
+    assert!(
+        bm_w1 & (1u32 << FATTR4_FS_LAYOUT_TYPES_BIT_W1) != 0,
+        "result bitmap MUST echo FATTR4_FS_LAYOUT_TYPES (bit 62) \
+         when requested; got w1={bm_w1:#010x}"
+    );
+    // attr_vals: layouttype4<> = u32 count + count*u32.
+    let attr_vals = r.read_opaque().unwrap();
+    let mut av = XdrReader::new(&attr_vals);
+    let count = av.read_u32().unwrap();
+    assert!(
+        count >= 1,
+        "RFC 8881 §5.12.1: FATTR4_FS_LAYOUT_TYPES MUST list at least \
+         one type when bit 62 is in SUPPORTED_ATTRS; got count=0 \
+         (zero-length array means 'pNFS not supported on this FS')"
+    );
+    let mut found_ff = false;
+    for _ in 0..count {
+        if av.read_u32().unwrap() == LAYOUT4_FLEX_FILES {
+            found_ff = true;
+        }
+    }
+    assert!(
+        found_ff,
+        "RFC 8435 + ADR-038: kiseki advertises Flexible Files Layout \
+         (LAYOUT4_FLEX_FILES = 4) — not present in fs_layout_types"
+    );
+}

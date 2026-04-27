@@ -28,6 +28,9 @@ pub mod scrub;
 pub mod staging;
 pub mod transport_select;
 
+#[cfg(feature = "remote-http")]
+pub mod remote_http;
+
 #[cfg(feature = "ffi")]
 #[allow(missing_docs, unsafe_code, clippy::missing_safety_doc)]
 pub mod ffi;

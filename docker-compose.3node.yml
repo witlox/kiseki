@@ -30,6 +30,7 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node1-data:/data
     healthcheck:
@@ -59,6 +60,7 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node2-data:/data
     healthcheck:
@@ -88,6 +90,7 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node3-data:/data
     healthcheck:

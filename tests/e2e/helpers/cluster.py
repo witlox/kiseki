@@ -144,6 +144,28 @@ def _wait_for_ready(addr: str) -> None:
         channel.close()
 
 
+@retry(stop=stop_after_delay(60), wait=wait_exponential(multiplier=0.3, max=3))
+def _wait_for_s3(host: str, port: int = 9000) -> None:
+    """Wait until the S3 listener actually serves a real PUT.
+
+    The kiseki-server starts gRPC, S3, and NFS listeners in sequence;
+    `_wait_for_ready` only blocks on gRPC. e2e tests that PUT objects
+    via S3 immediately after start_cluster() race the namespace
+    bootstrap — the 9000 socket is up and accepting connections, but
+    early PUTs return 500 because the namespace isn't materialized
+    yet. We poll with a real PUT (a discardable health-probe key) and
+    retry until we get a 2xx; that proves the gateway is fully wired.
+    """
+    import requests
+
+    resp = requests.put(
+        f"http://{host}:{port}/default/__cluster_ready_probe__",
+        data=b"ready",
+        timeout=3,
+    )
+    resp.raise_for_status()
+
+
 def stop_server(info: ServerInfo) -> None:
     """Stop the server stack."""
     if info.mode == "docker":
@@ -205,6 +227,11 @@ def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo
 
     for node in nodes:
         _wait_for_ready(node.data_addr)
+
+    # Phase 15c.5 — also block on the S3 listener of node1 (where the
+    # e2e PUT/GET fixtures point) so a fresh `start_cluster()` is
+    # safe to PUT against immediately on return.
+    _wait_for_s3(nodes[0].data_addr.split(":")[0], 9000)
 
     return ClusterInfo(nodes=nodes, compose_file=compose_file, mode="docker")
 

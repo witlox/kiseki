@@ -21,6 +21,12 @@ default = []
 ffi = []
 fuse = ["fuser"]
 python = ["pyo3"]
+# Network attachment of FUSE/POSIX path to a running kiseki cluster.
+# Adds a `RemoteHttpGateway` that implements `GatewayOps` against the
+# kiseki-server S3 listener (port 9000). Off by default so the
+# kiseki-client crate doesn't pull reqwest+rustls into the FFI/cdylib
+# build path that downstream Python/C++ wrappers consume.
+remote-http = ["reqwest", "async-trait"]
 
 [dependencies]
 kiseki-common = { workspace = true }
@@ -28,9 +34,11 @@ kiseki-chunk = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-crypto = { workspace = true }
 kiseki-gateway = { workspace = true }
+async-trait = { version = "0.1", optional = true }
 fuser = { version = "0.17", optional = true }
 libc = { workspace = true }
 pyo3 = { version = "0.28", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "http2"], optional = true }
 serde = { version = "1", features = ["derive"] }
 tokio = { workspace = true }
 serde_json = "1"
