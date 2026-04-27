@@ -29,9 +29,7 @@ fn ensure_node(world: &mut KisekiWorld, name: &str, voter_in_shards: Vec<u64>) -
         let n: u64 = name
             .trim_start_matches("node-")
             .parse()
-            .unwrap_or_else(|_| {
-                panic!("expected node name like 'node-1', got {name:?}")
-            });
+            .unwrap_or_else(|_| panic!("expected node name like 'node-1', got {name:?}"));
         NodeId(n)
     });
     world.drain_orch.register_node(id, voter_in_shards.clone());
@@ -61,11 +59,7 @@ fn shard_index(name: &str) -> u32 {
     let stripped = name.trim_start_matches('s');
     if let Some((base, suffix)) = stripped.split_once('-') {
         let b: u32 = base.parse().unwrap_or(0);
-        let s_off = suffix
-            .bytes()
-            .next()
-            .map(|c| u32::from(c))
-            .unwrap_or(0);
+        let s_off = suffix.bytes().next().map(|c| u32::from(c)).unwrap_or(0);
         b * 1000 + s_off
     } else {
         stripped.parse().unwrap_or(0)
@@ -102,7 +96,9 @@ async fn given_3_active_with_prior_refusal(world: &mut KisekiWorld) {
     world.last_drain_error = Some(format!("{:?}", res.unwrap_err()));
 }
 
-#[given(regex = r#"^the cluster has 4 nodes: node-1 \(Active\), node-2 \(Active\), node-3 \(Degraded\), node-4 \(Active\)$"#)]
+#[given(
+    regex = r#"^the cluster has 4 nodes: node-1 \(Active\), node-2 \(Active\), node-3 \(Degraded\), node-4 \(Active\)$"#
+)]
 async fn given_4_with_degraded(world: &mut KisekiWorld) {
     ensure_node(world, "node-1", Vec::new());
     ensure_node(world, "node-2", Vec::new());
@@ -192,7 +188,9 @@ async fn given_rf3(_world: &mut KisekiWorld) {
     // [1, 2, 3]; nothing else to do.
 }
 
-#[given(regex = r#"^voter replacement has completed for "([^"]+)" but not yet for "([^"]+)" or "([^"]+)"$"#)]
+#[given(
+    regex = r#"^voter replacement has completed for "([^"]+)" but not yet for "([^"]+)" or "([^"]+)"$"#
+)]
 async fn given_voter_replacement_partial(
     world: &mut KisekiWorld,
     done: String,
@@ -282,7 +280,9 @@ async fn when_drainnode(world: &mut KisekiWorld, target: String) {
     }
 }
 
-#[when(regex = r#"^the cluster admin issues `DrainNode\((node-\d+)\)` without first adding a replacement$"#)]
+#[when(
+    regex = r#"^the cluster admin issues `DrainNode\((node-\d+)\)` without first adding a replacement$"#
+)]
 async fn when_drainnode_no_replacement(world: &mut KisekiWorld, target: String) {
     when_drainnode(world, target).await;
 }
@@ -380,7 +380,9 @@ async fn then_active_to_draining(world: &mut KisekiWorld, n: u64) {
     );
 }
 
-#[then(regex = r#"^leadership for "([^"]+)" is transferred to a voter on another node \(node-2 or node-3 per I-L12\)$"#)]
+#[then(
+    regex = r#"^leadership for "([^"]+)" is transferred to a voter on another node \(node-2 or node-3 per I-L12\)$"#
+)]
 async fn then_leadership_transferred(world: &mut KisekiWorld, shard: String) {
     let owner = world
         .shard_leaders
@@ -397,14 +399,13 @@ async fn then_leadership_similarly_transferred(world: &mut KisekiWorld, shard: S
 #[then(regex = r#"^node-(\d+) holds zero leader assignments$"#)]
 async fn then_zero_leader_assignments(world: &mut KisekiWorld, n: u64) {
     let key = format!("node-{n}");
-    let still_owns = world
-        .shard_leaders
-        .iter()
-        .any(|(_, owner)| *owner == key);
+    let still_owns = world.shard_leaders.iter().any(|(_, owner)| *owner == key);
     assert!(!still_owns, "node-{n} must hold zero leader assignments");
 }
 
-#[then(regex = r#"^for each shard, a learner is added on a surviving node and caught up to the leader's committed index$"#)]
+#[then(
+    regex = r#"^for each shard, a learner is added on a surviving node and caught up to the leader's committed index$"#
+)]
 async fn then_each_shard_learner_added(_world: &mut KisekiWorld) {
     // Witness: each `record_voter_replaced` call (in the When) drove
     // the learner-add → catch-up → promote sequence; the test
@@ -426,7 +427,9 @@ async fn then_node_n_removed_from_voters(world: &mut KisekiWorld, n: u64) {
     assert_eq!(rec.state, NodeState::Evicted);
 }
 
-#[then(regex = r#"^RF=3 is preserved at every intermediate state — no shard observes RF<3 during the drain$"#)]
+#[then(
+    regex = r#"^RF=3 is preserved at every intermediate state — no shard observes RF<3 during the drain$"#
+)]
 async fn then_rf3_preserved(_world: &mut KisekiWorld) {
     // The orchestrator's add-then-remove sequence (learner first,
     // then voter swap, then remove old voter) preserves RF by
@@ -435,7 +438,9 @@ async fn then_rf3_preserved(_world: &mut KisekiWorld) {
     // depth witness.
 }
 
-#[then(regex = r#"^once all three shards have completed voter replacement, node-1 transitions Draining → Evicted$"#)]
+#[then(
+    regex = r#"^once all three shards have completed voter replacement, node-1 transitions Draining → Evicted$"#
+)]
 async fn then_after_all_completed_evicted(world: &mut KisekiWorld) {
     let id = node_id(world, "node-1");
     assert_eq!(
@@ -533,7 +538,9 @@ async fn then_pending_aborted(_world: &mut KisekiWorld, _a: String, _b: String) 
     // the abort. Asserted via the next Then (state == Active).
 }
 
-#[then(regex = r#"^the completed voter replacement for "([^"]+)" is NOT rolled back — node-1 is no longer in "([^"]+)"'s voter set$"#)]
+#[then(
+    regex = r#"^the completed voter replacement for "([^"]+)" is NOT rolled back — node-1 is no longer in "([^"]+)"'s voter set$"#
+)]
 async fn then_completed_not_rolled_back(_world: &mut KisekiWorld, _a: String, _b: String) {
     // I-N7 — the orchestrator's cancel_drain explicitly does NOT
     // touch already-recorded VoterReplaced events.
@@ -556,7 +563,9 @@ async fn then_cancel_audited(world: &mut KisekiWorld) {
     );
 }
 
-#[then(regex = r#"^no more than `max\(1, num_nodes / 10\)` replacements are in flight simultaneously$"#)]
+#[then(
+    regex = r#"^no more than `max\(1, num_nodes / 10\)` replacements are in flight simultaneously$"#
+)]
 async fn then_concurrency_bound(world: &mut KisekiWorld) {
     let snapshot = world.drain_orch.snapshot();
     let active = snapshot.len();
@@ -582,7 +591,9 @@ async fn then_drain_bounded_time(_world: &mut KisekiWorld) {}
 // `^a new shard "(\S+)" is created$` is owned by steps/log.rs
 // (line 555).
 
-#[then(regex = r#"^"([^"]+)"'s leader is placed on a node in \{Active, Degraded\} state — NOT on node-1$"#)]
+#[then(
+    regex = r#"^"([^"]+)"'s leader is placed on a node in \{Active, Degraded\} state — NOT on node-1$"#
+)]
 async fn then_leader_not_on_drainee(world: &mut KisekiWorld, name: String) {
     world.shard_leaders.insert(name, "node-2".into());
 }
