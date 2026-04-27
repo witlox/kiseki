@@ -324,6 +324,7 @@ fn dispatch_compound<G: GatewayOps>(
     ctx: &NfsContext<G>,
     sessions: &SessionManager,
 ) -> Vec<u8> {
+    let t_start = std::time::Instant::now();
     let _tag = reader.read_opaque().unwrap_or_default();
     let minor_version = reader.read_u32().unwrap_or(2);
     let num_ops = reader.read_u32().unwrap_or(0).min(32); // Cap at 32 ops (C-ADV-3).
@@ -335,6 +336,7 @@ fn dispatch_compound<G: GatewayOps>(
         saved_fh: None,
         current_stateid: None,
     };
+    let mut op_codes: Vec<u32> = Vec::with_capacity(num_ops as usize);
 
     // RFC 8881 §15.1 + RFC 7530 §13.1: kiseki implements minor
     // versions 1 and 2 only. Anything else (including 0) is
@@ -355,6 +357,7 @@ fn dispatch_compound<G: GatewayOps>(
             Ok(c) => c,
             Err(_) => break,
         };
+        op_codes.push(op_code);
 
         let (status, result) = process_op(op_code, reader, ctx, sessions, &mut state);
         op_results.push(result);
@@ -376,6 +379,19 @@ fn dispatch_compound<G: GatewayOps>(
     for result in &op_results {
         buf.extend_from_slice(result);
     }
+
+    // One log line per compound. Cheap (no per-op log spam) and lets
+    // an external observer reconstruct the wire trace + per-compound
+    // server cost. Phase 15c.8 NFSv4.1 perf debug.
+    let elapsed_us = t_start.elapsed().as_micros();
+    tracing::debug!(
+        xid = header.xid,
+        ops = ?op_codes,
+        status = compound_status,
+        elapsed_us = elapsed_us as u64,
+        bytes_out = buf.len(),
+        "NFSv4 compound"
+    );
 
     buf
 }
@@ -630,6 +646,26 @@ mod fattr4 {
     pub const RDATTR_ERROR: u32 = 11;
     pub const FILEHANDLE: u32 = 19;
     pub const FILEID: u32 = 20;
+    /// `FATTR4_MAXFILESIZE` (RFC 8881 §5.8.1.21) — max bytes a file
+    /// can grow to. Without this advertised, Linux 6.x clients can
+    /// take conservative defaults that limit the per-file working
+    /// size unnecessarily.
+    pub const MAXFILESIZE: u32 = 27;
+    /// `FATTR4_MAXREAD` (RFC 8881 §5.8.1.22) — server's max bytes
+    /// per READ. Linux 6.x NFSv4.1 derives `rsize` from this; if
+    /// absent, the client falls back to a tiny default (1 KiB
+    /// observed in 6.x), capping read throughput at ~1 KiB / RTT
+    /// regardless of how fast the server is. THIS WAS THE NFSv4.1
+    /// PERF BOTTLENECK (Phase 15c.8).
+    pub const MAXREAD: u32 = 30;
+    /// `FATTR4_MAXWRITE` (RFC 8881 §5.8.1.23) — symmetric `wsize`
+    /// derivation for WRITE.
+    pub const MAXWRITE: u32 = 31;
+    // Note: there is NO per-file FATTR4_LAYOUT_TYPES at word0 bit 30.
+    // RFC 8881 §5.12 puts the layout-types attribute at bit 62
+    // (FS_LAYOUT_TYPES_W1, word1 bit 30). A previous commit
+    // (Phase 15c.4 partial) introduced a bogus `LAYOUT_TYPES = 30`
+    // which collided with MAXREAD; removed.
     // Word 1 — bit positions are (n - 32) within word1.
     pub const MODE_W1: u32 = 33 - 32;
     pub const NUMLINKS_W1: u32 = 35 - 32;
@@ -741,7 +777,10 @@ fn op_getattr<G: GatewayOps>(
             | (1u32 << fattr4::LEASE_TIME)
             | (1u32 << fattr4::RDATTR_ERROR)
             | (1u32 << fattr4::FILEHANDLE)
-            | (1u32 << fattr4::FILEID);
+            | (1u32 << fattr4::FILEID)
+            | (1u32 << fattr4::MAXFILESIZE)
+            | (1u32 << fattr4::MAXREAD)
+            | (1u32 << fattr4::MAXWRITE);
         // FATTR4_LAYOUT_TYPES (bit 30) and FATTR4_FS_LAYOUT_TYPES
         // (bit 62) are NOT yet in the supported_attrs set — Phase
         // 15c.4 partial: MdsLayoutManager is wired into NfsContext
@@ -825,15 +864,25 @@ fn op_getattr<G: GatewayOps>(
         attr_w.write_u64(attrs.fileid);
         result_word0 |= 1 << fattr4::FILEID;
     }
-    if want(fattr4::LAYOUT_TYPES) {
-        // RFC 8881 §5.8.1.30 — `FATTR4_LAYOUT_TYPES`: per-file
-        // `layouttype4<>`. Some clients also key on this when
-        // deciding whether to ask for a layout on a specific
-        // open. Kiseki advertises the same set as the FS-level
-        // `FATTR4_FS_LAYOUT_TYPES`.
-        attr_w.write_u32(1); // count
-        attr_w.write_u32(LAYOUT4_FLEX_FILES);
-        result_word0 |= 1 << fattr4::LAYOUT_TYPES;
+    if want(fattr4::MAXFILESIZE) {
+        // RFC 8881 §5.8.1.21 — uint64. u64::MAX advertises "no
+        // server-imposed cap"; the actual limit is whatever the
+        // chunk store + composition log can carry.
+        attr_w.write_u64(u64::MAX);
+        result_word0 |= 1 << fattr4::MAXFILESIZE;
+    }
+    if want(fattr4::MAXREAD) {
+        // RFC 8881 §5.8.1.22 — uint64. Linux 6.x derives `rsize`
+        // from this; default with no advertisement is 1 KiB which
+        // caps NFSv4.1 read throughput at ~1 KiB / RTT (~1 MB/s
+        // on 1ms RTT). Match NFSv3 FSINFO rtmax = 1 MiB.
+        attr_w.write_u64(1024 * 1024);
+        result_word0 |= 1 << fattr4::MAXREAD;
+    }
+    if want(fattr4::MAXWRITE) {
+        // RFC 8881 §5.8.1.23 — symmetric to MAXREAD for `wsize`.
+        attr_w.write_u64(1024 * 1024);
+        result_word0 |= 1 << fattr4::MAXWRITE;
     }
     // Word 1 attrs (Phase 15c.3): kernel needs MODE for ACCESS check
     // before READDIR; OWNER/OWNER_GROUP for ls -l.
