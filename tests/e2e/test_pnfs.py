@@ -84,10 +84,39 @@ def _tlshd_running() -> bool:
     return shutil.which("tlshd") is not None
 
 
-def _can_mount() -> bool:
-    """Mounting NFS requires CAP_SYS_ADMIN. The cleanest check is
-    UID == 0; non-root will see EPERM from `mount`."""
-    return os.geteuid() == 0
+def _have_passwordless_sudo() -> bool:
+    """Return True iff `sudo -n true` succeeds. Used to avoid blocking
+    on a password prompt when the test isn't already running as root."""
+    try:
+        return (
+            subprocess.run(
+                ["sudo", "-n", "true"],
+                check=False,
+                capture_output=True,
+                timeout=2,
+            ).returncode
+            == 0
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _mount_command(args: list[str]) -> list[str]:
+    """Wrap a mount/umount command in `sudo -n` when we're not root.
+
+    The dev path is "user with passwordless sudo" (Arch laptop, GCP
+    OS Login); the CI path is "container running as root". Only when
+    neither root nor passwordless sudo is available do we genuinely
+    have to skip — and the caller turns that into a pytest.skip with
+    a clear actionable message.
+    """
+    if os.geteuid() == 0:
+        return args
+    return ["sudo", "-n", *args]
+
+
+def _can_invoke_mount() -> bool:
+    return os.geteuid() == 0 or _have_passwordless_sudo()
 
 
 def _read_mountstats(mount_point: Path) -> dict[str, int]:
@@ -148,8 +177,11 @@ def test_pnfs_xprtsec_mtls(pnfs_cluster: ClusterInfo, tmp_path: Path) -> None:
         )
     if not _tlshd_running():
         pytest.skip("tlshd not available — xprtsec=mtls cannot complete handshake")
-    if not _can_mount():
-        pytest.skip("mounting NFS requires CAP_SYS_ADMIN (run as root)")
+    if not _can_invoke_mount():
+        pytest.skip(
+            "no root + no passwordless sudo — try `sudo -v` first or run "
+            "the suite as root"
+        )
 
     payload = b"\xab" * 1_048_576
     etag = _seed_known_object(pnfs_cluster, payload)
@@ -159,7 +191,7 @@ def test_pnfs_xprtsec_mtls(pnfs_cluster: ClusterInfo, tmp_path: Path) -> None:
     mds_host = pnfs_cluster.nodes[0].data_addr.split(":")[0]
     try:
         subprocess.run(
-            [
+            _mount_command([
                 "mount",
                 "-t",
                 "nfs4",
@@ -167,7 +199,7 @@ def test_pnfs_xprtsec_mtls(pnfs_cluster: ClusterInfo, tmp_path: Path) -> None:
                 "vers=4.1,minorversion=1,xprtsec=mtls",
                 f"{mds_host}:/default",
                 str(mount),
-            ],
+            ]),
             check=True,
             capture_output=True,
             text=True,
@@ -191,7 +223,10 @@ def test_pnfs_xprtsec_mtls(pnfs_cluster: ClusterInfo, tmp_path: Path) -> None:
         )
     finally:
         subprocess.run(
-            ["umount", str(mount)], check=False, capture_output=True, timeout=10
+            _mount_command(["umount", str(mount)]),
+            check=False,
+            capture_output=True,
+            timeout=10,
         )
 
 
@@ -202,12 +237,16 @@ def test_pnfs_plaintext_fallback(
     """Audited plaintext-NFS fallback (ADR-038 §D4.2) — the path the
     perf cluster uses for Rocky 9.x baselines without `xprtsec=mtls`.
 
-    Skipped when not root or when the cluster wasn't booted with the
-    plaintext fallback flags (we detect that by attempting the mount
-    and treating EPROTO/ECONNRESET as "TLS-only server, skip").
+    Skipped when neither root nor passwordless sudo is available, or
+    when the cluster wasn't booted with the plaintext fallback flags
+    (detected by attempting the mount and treating EPROTO/ECONNRESET
+    as "TLS-only server, skip").
     """
-    if not _can_mount():
-        pytest.skip("mounting NFS requires CAP_SYS_ADMIN (run as root)")
+    if not _can_invoke_mount():
+        pytest.skip(
+            "no root + no passwordless sudo — try `sudo -v` first or run "
+            "the suite as root"
+        )
 
     payload = b"\xcd" * 1_048_576
     etag = _seed_known_object(pnfs_cluster, payload)
@@ -216,7 +255,7 @@ def test_pnfs_plaintext_fallback(
     mount.mkdir()
     mds_host = pnfs_cluster.nodes[0].data_addr.split(":")[0]
     result = subprocess.run(
-        [
+        _mount_command([
             "mount",
             "-t",
             "nfs4",
@@ -224,7 +263,7 @@ def test_pnfs_plaintext_fallback(
             "vers=4.1,minorversion=1",
             f"{mds_host}:/default",
             str(mount),
-        ],
+        ]),
         capture_output=True,
         text=True,
         timeout=30,
@@ -255,22 +294,21 @@ def test_pnfs_plaintext_fallback(
         )
     finally:
         subprocess.run(
-            ["umount", str(mount)], check=False, capture_output=True, timeout=10
+            _mount_command(["umount", str(mount)]),
+            check=False,
+            capture_output=True,
+            timeout=10,
         )
 
 
 @pytest.mark.e2e
 def test_pnfs_layout_recall_on_drain(pnfs_cluster: ClusterInfo) -> None:
     """When a storage node enters drain (ADR-035), MDS fires
-    LAYOUTRECALL within I-PN5's 1-sec SLA. This test draws the
-    storage node from the live cluster, asserts the layout cache
-    invalidates, and verifies subsequent client ops re-issue
-    LAYOUTGET. Phase 15c integration witness.
-
-    Skipped if not root (admin RPC requires the same auth as a mount).
+    LAYOUTRECALL within I-PN5's 1-sec SLA. Phase 15c integration
+    witness — currently a placeholder; BDD scenario `@pnfs-15c
+    Drain triggers LAYOUTRECALL within 1 second` covers the
+    in-process witness.
     """
-    if not _can_mount():
-        pytest.skip("admin/drain RPCs require CAP_SYS_ADMIN")
     pytest.skip(
         "Phase 15c.1 follow-up — production drain hook in kiseki-server "
         "is not yet wired to the MdsLayoutManager (BDD scenario "
