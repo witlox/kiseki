@@ -1498,6 +1498,127 @@ fn s18_30_setattr_without_current_fh_returns_nofilehandle() {
     );
 }
 
+/// Phase 15c.3 — LOOKUP by composition UUID. After
+/// `mount.nfs4 server:/default`, the kernel resolves
+/// `dd /mnt/pnfs/<uuid>` via `PUTROOTFH+LOOKUP("default")+LOOKUP("<uuid>")`.
+/// kiseki's LOOKUP MUST resolve the composition UUID as a filename
+/// (otherwise every NFS read of an S3-PUT object fails with NOENT).
+/// Today `op_lookup` only consults the NFS-CREATE `dir_index`; this
+/// test asserts the spec/contract behaviour: a composition created
+/// via the gateway write path is reachable via NFS LOOKUP by its
+/// canonical UUID name.
+#[test]
+fn s18_15_lookup_composition_uuid_returns_file_handle() {
+    let ctx = make_ctx();
+    let sessions = SessionManager::new();
+
+    // Seed: write a composition via the gateway path (mimics S3
+    // PUT). dir_index is NOT touched; the LOOKUP must work purely
+    // via the composition store.
+    let payload = b"phase-15c.3-payload".to_vec();
+    let comp_id = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let resp = ctx
+                .gateway
+                .write(kiseki_gateway::nfs::NfsWriteRequest {
+                    tenant_id: test_tenant(),
+                    namespace_id: test_namespace(),
+                    data: payload,
+                })
+                .await
+                .expect("seed write");
+            resp.composition_id
+        })
+    };
+    let name = comp_id.0.to_string();
+
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 4, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::LOOKUP);
+        w.write_string("default");
+        w.write_u32(v4op::LOOKUP);
+        w.write_string(&name);
+    });
+
+    let header = make_header(0x4201, PROC_COMPOUND);
+    let raw = build_nfs4_call(0x4201, PROC_COMPOUND, &body);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let mut r = reader_at_compound_result(&reply);
+    let cs = r.read_u32().unwrap();
+    assert_eq!(
+        cs,
+        nfs4_status::NFS4_OK,
+        "Phase 15c.3: LOOKUP(<composition_uuid>) MUST resolve to the \
+         composition's file handle so `dd /mnt/pnfs/<uuid>` works \
+         after S3 PUT seeded the object; got {cs}"
+    );
+}
+
+/// Phase 15c.3 — READDIR enumerates compositions in the namespace.
+/// After mount, `ls /mnt/pnfs` should list every composition in the
+/// namespace by its UUID. Today `readdir` only emits dir_index
+/// entries (NFS-CREATE'd files); this test asserts the broader
+/// contract: an S3-PUT'd composition shows up in the readdir
+/// response.
+#[test]
+fn s18_26_readdir_lists_compositions_in_namespace() {
+    let ctx = make_ctx();
+    let sessions = SessionManager::new();
+
+    // Seed a composition via the gateway path (S3 PUT-style).
+    let comp_id = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let resp = ctx
+                .gateway
+                .write(kiseki_gateway::nfs::NfsWriteRequest {
+                    tenant_id: test_tenant(),
+                    namespace_id: test_namespace(),
+                    data: b"readdir-fixture".to_vec(),
+                })
+                .await
+                .expect("seed write");
+            resp.composition_id
+        })
+    };
+    let expected_name = comp_id.0.to_string();
+
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::LOOKUP);
+        w.write_string("default");
+        w.write_u32(v4op::READDIR);
+        w.write_u64(0); // cookie
+        w.write_opaque_fixed(&[0u8; 8]); // cookieverf
+        w.write_u32(4096); // dircount
+        w.write_u32(8192); // maxcount
+        w.write_u32(0); // attr_request bitmap len
+    });
+    let header = make_header(0x4202, PROC_COMPOUND);
+    let raw = build_nfs4_call(0x4202, PROC_COMPOUND, &body);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+
+    // Brute-force: assert the composition UUID appears as bytes in
+    // the reply. Rigorous READDIR4resok decoding requires walking
+    // the entry chain; the byte-substring check is sufficient as a
+    // RED guard for "is the composition UUID even in there".
+    let needle = expected_name.as_bytes();
+    let found = reply.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        found,
+        "Phase 15c.3: READDIR on namespace root MUST list compositions \
+         by UUID; '{expected_name}' missing from {} bytes of reply",
+        reply.len()
+    );
+}
+
 /// Phase 15c.2 mount-path alias — kiseki exports a single namespace
 /// per server, named "default". Linux `mount.nfs4 server:/default
 /// /mnt` does PUTROOTFH+LOOKUP("default") expecting a sub-directory
@@ -1754,5 +1875,368 @@ fn s18_27_setclientid_in_v4_1_compound_rejected() {
             || compound_status == nfs4_status::NFS4ERR_NOTSUPP,
         "RFC 8881: SETCLIENTID (v4.0 op) inside a v4.1 COMPOUND must \
          yield OP_ILLEGAL or NOTSUPP; got {compound_status}"
+    );
+}
+
+// ===========================================================================
+// Phase 15c.3 — kernel `cat /mnt/pnfs/<uuid>` end-to-end (RED)
+// ===========================================================================
+//
+// Pcap shows the kernel issues four COMPOUNDs to materialize a read:
+//
+//   C1: SEQUENCE+PUTROOTFH+LOOKUP("default")+LOOKUP(<uuid>)+GETFH
+//                          +GETATTR(TYPE|SIZE|MODE|...)
+//   C2: SEQUENCE+PUTFH(<file_handle>)+ACCESS(...)+GETATTR
+//   C3: SEQUENCE+PUTFH(<dir>)+OPEN(NOCREATE, <uuid>)+GETFH+GETATTR
+//   C4: SEQUENCE+PUTFH(<file_handle>)+READ(stateid, off=0, count)
+//
+// Today every COMPOUND status is NFS4_OK on the wire, yet `cat`
+// surfaces ENOENT to userspace. Three suspected wire-encoding bugs:
+//
+//   B1) GETATTR after LOOKUP returns size=0 regardless of payload —
+//       `nfs_ops::getattr` hardcodes size=0 ("unknown without
+//       reading"). For a known-non-empty composition the kernel
+//       sees a 0-byte file and never issues READ.
+//   B2) OPEN reply emits a 1-element bool for `cinfo` instead of the
+//       17-byte change_info4 (atomic + before + after) per RFC 8881
+//       §18.16.4 — and entirely omits `attrset` (bitmap4) +
+//       `delegation` (open_delegation4 union). Kernel mis-parses
+//       the next op's bytes as cinfo trailers, then walks off the
+//       end of the compound.
+//   B3) End-to-end: a fresh `LOOKUP(<uuid>) → GETFH` followed by a
+//       second-COMPOUND `PUTFH(<file_handle>) → READ` MUST return
+//       the seeded bytes. If B1 reports size=0 the kernel skips
+//       READ; if B2 desyncs the parser, READ never reaches kiseki.
+//
+// These three tests RED-pin each bug independently so we can fix
+// them one at a time and watch the e2e cat path light up.
+
+/// Phase 15c.3 — full GETATTR-after-LOOKUP path. After
+/// `PUTROOTFH+LOOKUP("default")+LOOKUP(<uuid>)+GETFH+GETATTR`, the
+/// GETATTR reply MUST include the actual composition size in
+/// FATTR4_SIZE; today `nfs_ops::getattr` returns 0 unconditionally
+/// for any non-root file handle. This is **B1** above.
+#[test]
+fn s5_8_getattr_after_lookup_returns_actual_composition_size() {
+    let ctx = make_ctx();
+    let sessions = SessionManager::new();
+
+    // Seed a composition so gateway.list returns it with a known
+    // non-zero size (matches the post-S3-PUT state pcap captures).
+    let payload = b"phase-15c.3 cat-enoent payload bytes 0123456789".to_vec();
+    let payload_len = payload.len() as u64;
+    let comp_id = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let resp = ctx
+                .gateway
+                .write(kiseki_gateway::nfs::NfsWriteRequest {
+                    tenant_id: test_tenant(),
+                    namespace_id: test_namespace(),
+                    data: payload,
+                })
+                .await
+                .expect("seed write");
+            resp.composition_id
+        })
+    };
+    let name = comp_id.0.to_string();
+
+    // Request bitmap: TYPE(1) | SIZE(4) — the two attrs `cat` walks
+    // before deciding whether to OPEN+READ or short-circuit.
+    let bm = (1u32 << 1) | (1u32 << 4);
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 5, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::LOOKUP);
+        w.write_string("default");
+        w.write_u32(v4op::LOOKUP);
+        w.write_string(&name);
+        w.write_u32(v4op::GETFH);
+        w.write_u32(v4op::GETATTR);
+        w.write_u32(1); // bm_count
+        w.write_u32(bm);
+    });
+
+    let header = make_header(0xCA01, PROC_COMPOUND);
+    let raw = build_nfs4_call(0xCA01, PROC_COMPOUND, &body);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+
+    let mut r = reader_at_compound_result(&reply);
+    let cs = r.read_u32().unwrap();
+    assert_eq!(cs, nfs4_status::NFS4_OK, "compound MUST succeed");
+    let _tag = r.read_opaque().unwrap();
+    let _ra = r.read_u32().unwrap();
+    // Skip PUTROOTFH, LOOKUP, LOOKUP, GETFH per-op result frames.
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // PUTROOTFH
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // LOOKUP("default")
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // LOOKUP(<uuid>)
+    let _ = r.read_u32(); // GETFH op
+    let getfh_status = r.read_u32().unwrap();
+    assert_eq!(
+        getfh_status,
+        nfs4_status::NFS4_OK,
+        "GETFH after LOOKUP(<uuid>) MUST succeed"
+    );
+    let fh = r.read_opaque().unwrap();
+    assert_eq!(fh.len(), 32, "kiseki file handle is 32 bytes");
+    let _ = r.read_u32(); // GETATTR op
+    let getattr_status = r.read_u32().unwrap();
+    assert_eq!(
+        getattr_status,
+        nfs4_status::NFS4_OK,
+        "GETATTR after LOOKUP(<uuid>) MUST succeed"
+    );
+
+    // Result bitmap MUST equal request bitmap (RFC 8881 §5.6).
+    let bm_count = r.read_u32().unwrap();
+    let bm_word0 = r.read_u32().unwrap();
+    if bm_count >= 2 {
+        let _ = r.read_u32().unwrap();
+    }
+    assert_eq!(
+        bm_word0, bm,
+        "result bitmap MUST equal request {bm:#x}, got {bm_word0:#x}"
+    );
+
+    // attr_vals: TYPE(u32) + SIZE(u64) = 12 bytes.
+    let attr_vals = r.read_opaque().unwrap();
+    assert_eq!(attr_vals.len(), 12, "TYPE(4) + SIZE(8) = 12 bytes");
+    let mut av = XdrReader::new(&attr_vals);
+    let ftype = av.read_u32().unwrap();
+    assert_eq!(
+        ftype, 1,
+        "RFC 8881 §5.8.1.30: NF4REG = 1 — composition is a regular file"
+    );
+    let size = av.read_u64().unwrap();
+    assert_eq!(
+        size, payload_len,
+        "Phase 15c.3 B1: GETATTR after LOOKUP(<uuid>) MUST report the \
+         composition's actual size ({payload_len} bytes), not 0. The \
+         kernel sees size=0 and skips OPEN+READ — that's the cat ENOENT."
+    );
+}
+
+/// Phase 15c.3 — OPEN4resok wire layout. RFC 8881 §18.16.4:
+///
+/// ```ignore
+///   stateid4         stateid;       // 16 bytes (opaque<>)
+///   change_info4     cinfo;         // bool(4) + u64 + u64 = 20 bytes
+///   uint32           rflags;        // 4 bytes
+///   bitmap4          attrset;       // 4 + 4*words bytes
+///   open_delegation4 delegation;    // 4-byte discriminator + body
+/// ```
+///
+/// Today's `op_open` writes only `stateid + write_bool(false) + rflags`
+/// — a 1-element bool for cinfo (4 bytes total), no attrset, no
+/// delegation. Total ~24 bytes vs spec ~36 bytes minimum. This is
+/// **B2** above and is what desyncs the kernel's parser when OPEN is
+/// followed by GETFH+GETATTR in the same compound.
+#[test]
+fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
+    let ctx = make_ctx();
+    let sessions = SessionManager::new();
+
+    // Seed so OPEN(NOCREATE) can resolve.
+    let comp_id = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let resp = ctx
+                .gateway
+                .write(kiseki_gateway::nfs::NfsWriteRequest {
+                    tenant_id: test_tenant(),
+                    namespace_id: test_namespace(),
+                    data: b"open-fixture".to_vec(),
+                })
+                .await
+                .expect("seed write");
+            resp.composition_id
+        })
+    };
+    let name = comp_id.0.to_string();
+
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::LOOKUP);
+        w.write_string("default");
+        w.write_u32(v4op::OPEN);
+        w.write_u32(0); // seqid
+        w.write_u32(1); // share_access = READ
+        w.write_u32(0); // share_deny = NONE
+        w.write_u64(1); // clientid
+        w.write_opaque(b"owner"); // owner
+        w.write_u32(0); // OPEN4_NOCREATE
+        w.write_string(&name);
+    });
+    let header = make_header(0xCA02, PROC_COMPOUND);
+    let raw = build_nfs4_call(0xCA02, PROC_COMPOUND, &body);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+
+    let mut r = reader_at_compound_result(&reply);
+    let _cs = r.read_u32();
+    let _tag = r.read_opaque().unwrap();
+    let _ra = r.read_u32();
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // PUTROOTFH
+    let _ = r.read_u32();
+    let _ = r.read_u32(); // LOOKUP("default")
+    let _ = r.read_u32(); // OPEN op
+    let st = r.read_u32().unwrap();
+    assert_eq!(
+        st,
+        nfs4_status::NFS4_OK,
+        "OPEN(NOCREATE) on seeded composition MUST succeed"
+    );
+    let _stateid = r.read_opaque_fixed(16).unwrap();
+    // change_info4: bool(4) + changeid4(u64) + changeid4(u64) = 20 bytes
+    let cinfo_atomic = r.read_u32().unwrap();
+    assert!(
+        cinfo_atomic == 0 || cinfo_atomic == 1,
+        "RFC 8881 §3.2.6: change_info4.atomic MUST be a valid XDR bool, \
+         got {cinfo_atomic:#x} — likely a wire-decode misalignment"
+    );
+    let cinfo_before = r.read_u64().unwrap();
+    let cinfo_after = r.read_u64().unwrap();
+    // RFC 8881 §3.2.6 — when atomic=true, `before == after - 1` is
+    // a typical post-mutation invariant; for a NOCREATE OPEN there's
+    // no mutation so values are unconstrained. We just assert they
+    // were consumed as 16 well-formed bytes (i.e. the next field
+    // decodes coherently below).
+    let _ = cinfo_before;
+    let _ = cinfo_after;
+    let rflags = r.read_u32().unwrap();
+    assert!(
+        rflags < 0x100,
+        "RFC 8881 §18.16.4: rflags is a small bitmap; got {rflags:#x} — \
+         this almost certainly indicates the parser is reading bytes \
+         from the next field (B2: cinfo+attrset+delegation gap)"
+    );
+    // attrset (bitmap4): u32 count + 4*count bytes of words.
+    let attrset_count = r.read_u32().unwrap();
+    assert!(
+        attrset_count <= 3,
+        "RFC 8881 §3.2.4: bitmap4 word count is small (typically 0..3); \
+         got {attrset_count} — parser is misaligned"
+    );
+    for _ in 0..attrset_count {
+        let _ = r.read_u32().unwrap();
+    }
+    // open_delegation4: 4-byte discriminator (open_delegation_type4).
+    // OPEN_DELEGATE_NONE = 0 has empty body; that's the kiseki path.
+    let deleg_type = r.read_u32().unwrap();
+    assert!(
+        deleg_type <= 4,
+        "RFC 8881 §9.1.2: open_delegation_type4 ∈ {{0..4}}; got \
+         {deleg_type} — parser is misaligned"
+    );
+}
+
+/// Phase 15c.3 — end-to-end LOOKUP→READ. Two compounds: first
+/// navigates to the file and harvests the file handle via GETFH;
+/// second uses PUTFH+READ to fetch the bytes. The READ data MUST
+/// equal the seeded payload. If B1 (size=0) is true, the second
+/// compound's READ returns eof=true with 0 bytes — userspace `cat`
+/// then prints nothing and exits 0 (NOT ENOENT). If B2 has bled
+/// into the file-handle bytes (it shouldn't — OPEN is in C3, not
+/// C1) READ returns ENOENT or BADHANDLE. This test pins the
+/// happy-path contract.
+#[test]
+fn s18_22_read_after_lookup_returns_seeded_bytes() {
+    let ctx = make_ctx();
+    let sessions = SessionManager::new();
+
+    let payload = b"phase-15c.3 end-to-end read fixture: hello, kiseki!".to_vec();
+    let comp_id = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let resp = ctx
+                .gateway
+                .write(kiseki_gateway::nfs::NfsWriteRequest {
+                    tenant_id: test_tenant(),
+                    namespace_id: test_namespace(),
+                    data: payload.clone(),
+                })
+                .await
+                .expect("seed write");
+            resp.composition_id
+        })
+    };
+    let name = comp_id.0.to_string();
+
+    // C1: navigate + GETFH to harvest the file handle bytes.
+    let body1 = encode_compound(b"", NFS4_MINOR_VERSION_1, 4, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::LOOKUP);
+        w.write_string("default");
+        w.write_u32(v4op::LOOKUP);
+        w.write_string(&name);
+        w.write_u32(v4op::GETFH);
+    });
+    let h1 = make_header(0xCA03, PROC_COMPOUND);
+    let raw1 = build_nfs4_call(0xCA03, PROC_COMPOUND, &body1);
+    let reply1 = handle_nfs4_first_compound(&h1, &raw1, &ctx, &sessions);
+    let mut r1 = reader_at_compound_result(&reply1);
+    let _ = r1.read_u32(); // compound status
+    let _ = r1.read_opaque(); // tag
+    let _ = r1.read_u32(); // resarray_len
+    let _ = r1.read_u32();
+    let _ = r1.read_u32(); // PUTROOTFH
+    let _ = r1.read_u32();
+    let _ = r1.read_u32(); // LOOKUP("default")
+    let _ = r1.read_u32();
+    let _ = r1.read_u32(); // LOOKUP(<uuid>)
+    let _ = r1.read_u32(); // GETFH op
+    let getfh_status = r1.read_u32().unwrap();
+    assert_eq!(getfh_status, nfs4_status::NFS4_OK, "GETFH MUST succeed");
+    let fh = r1.read_opaque().unwrap();
+    assert_eq!(fh.len(), 32);
+
+    // C2: PUTFH(fh) + READ(anonymous_stateid, offset=0, count=4096).
+    let body2 = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
+        w.write_u32(v4op::PUTFH);
+        w.write_opaque(&fh);
+        w.write_u32(v4op::READ);
+        w.write_opaque_fixed(&[0u8; 16]); // anonymous stateid
+        w.write_u64(0); // offset
+        w.write_u32(4096); // count
+    });
+    let h2 = make_header(0xCA04, PROC_COMPOUND);
+    let raw2 = build_nfs4_call(0xCA04, PROC_COMPOUND, &body2);
+    let reply2 = handle_nfs4_first_compound(&h2, &raw2, &ctx, &sessions);
+    let mut r2 = reader_at_compound_result(&reply2);
+    let cs = r2.read_u32().unwrap();
+    assert_eq!(cs, nfs4_status::NFS4_OK, "C2 compound MUST be NFS4_OK");
+    let _tag = r2.read_opaque();
+    let _ra = r2.read_u32();
+    let _ = r2.read_u32();
+    let _ = r2.read_u32(); // PUTFH
+    let _ = r2.read_u32(); // READ op
+    let read_status = r2.read_u32().unwrap();
+    assert_eq!(
+        read_status,
+        nfs4_status::NFS4_OK,
+        "Phase 15c.3: READ on a freshly-LOOKUP'd composition handle \
+         MUST succeed"
+    );
+    let _eof = r2.read_bool().unwrap();
+    let data = r2.read_opaque().unwrap();
+    assert_eq!(
+        data,
+        payload,
+        "Phase 15c.3: READ MUST return the seeded payload bytes; \
+         got {} bytes vs expected {}",
+        data.len(),
+        payload.len()
     );
 }

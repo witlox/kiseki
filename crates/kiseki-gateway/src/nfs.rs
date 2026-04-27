@@ -101,4 +101,16 @@ impl<G: GatewayOps> NfsGateway<G> {
             composition_id: write_resp.composition_id,
         })
     }
+
+    /// List compositions in a namespace (Phase 15c.3 — drives the
+    /// NFS LOOKUP-by-UUID + READDIR enumeration paths). Returns
+    /// `(composition_id, size)` pairs for compositions that belong
+    /// to the requested tenant.
+    pub async fn list(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+    ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
+        self.inner.list(tenant_id, namespace_id).await
+    }
 }

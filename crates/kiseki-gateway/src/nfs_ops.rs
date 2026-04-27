@@ -264,7 +264,7 @@ impl<G: GatewayOps> NfsContext<G> {
             });
         }
 
-        let (_ns, _tenant, Some(comp_id)) = self
+        let (ns_id, tenant_id, Some(comp_id)) = self
             .handles
             .lookup(fh)
             .ok_or_else(|| GatewayError::ProtocolError("stale file handle".into()))?
@@ -272,11 +272,25 @@ impl<G: GatewayOps> NfsContext<G> {
             return Err(GatewayError::ProtocolError("expected file handle".into()));
         };
 
-        // For now, return a fixed-size attr. Real implementation would
-        // read composition metadata.
+        // Phase 15c.3 (B1): kernel `cat /mnt/pnfs/<uuid>` short-
+        // circuits to ENOENT-equivalent when GETATTR reports size=0
+        // for a non-empty composition (it skips OPEN+READ on a 0-byte
+        // regular file). Resolve the actual size via gateway.list,
+        // which already filters by tenant.
+        let size = self
+            .block_gateway(self.gateway.list(tenant_id, ns_id))
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .into_iter()
+                    .find(|(cid, _)| *cid == comp_id)
+                    .map(|(_, sz)| sz)
+            })
+            .unwrap_or(0);
+
         Ok(NfsAttrs {
             file_type: FileType::Regular,
-            size: 0, // unknown without reading
+            size,
             mode: 0o644,
             nlink: 1,
             uid: 0,
@@ -345,17 +359,45 @@ impl<G: GatewayOps> NfsContext<G> {
 
     /// Look up a file by name in the namespace. Returns handle + attrs.
     pub fn lookup_by_name(&self, name: &str) -> Option<(FileHandle, NfsAttrs)> {
-        let entry = self.dir_index.lookup(self.namespace_id, name)?;
+        // 1) NFS-CREATE'd files are tracked in `dir_index`.
+        if let Some(entry) = self.dir_index.lookup(self.namespace_id, name) {
+            let attrs = NfsAttrs {
+                file_type: FileType::Regular,
+                size: entry.size,
+                mode: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                fileid: u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+            };
+            return Some((entry.file_handle, attrs));
+        }
+
+        // 2) Phase 15c.3: composition-by-UUID lookup. S3 PUT'd
+        // objects are named by their composition UUID; the kernel
+        // sends `LOOKUP("<uuid>")` for `dd /mnt/pnfs/<uuid>`. Parse
+        // the name as a UUID and consult the gateway list.
+        let uuid = uuid::Uuid::parse_str(name).ok()?;
+        let comp_id = CompositionId(uuid);
+        let entries = self
+            .block_gateway(self.gateway.list(self.tenant_id, self.namespace_id))
+            .ok()?;
+        let (_, size) = entries.iter().find(|(cid, _)| *cid == comp_id).copied()?;
+        // Materialize a file handle for the composition; future
+        // PUTFH/READ requests will resolve through the registry.
+        let fh = self
+            .handles
+            .file_handle(self.namespace_id, self.tenant_id, comp_id);
         let attrs = NfsAttrs {
             file_type: FileType::Regular,
-            size: entry.size,
+            size,
             mode: 0o644,
             nlink: 1,
             uid: 0,
             gid: 0,
-            fileid: u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+            fileid: u64::from_le_bytes(comp_id.0.as_bytes()[..8].try_into().unwrap_or([0; 8])),
         };
-        Some((entry.file_handle, attrs))
+        Some((fh, attrs))
     }
 
     /// List directory entries for READDIR.
@@ -371,11 +413,37 @@ impl<G: GatewayOps> NfsContext<G> {
             },
         ];
 
+        // NFS-CREATE'd files (named via dir_index). Their backing
+        // compositions are tracked here so the Phase 15c.3 enumeration
+        // below can skip them — otherwise `a.txt` (named) and the
+        // composition's UUID would both surface in `ls`.
+        let mut named_comp_ids: std::collections::HashSet<CompositionId> =
+            std::collections::HashSet::new();
         for dir_entry in self.dir_index.list(self.namespace_id) {
+            named_comp_ids.insert(dir_entry.composition_id);
             entries.push(ReadDirEntry {
                 fileid: u64::from_le_bytes(dir_entry.file_handle[..8].try_into().unwrap_or([0; 8])),
                 name: dir_entry.name,
             });
+        }
+
+        // Phase 15c.3: also enumerate compositions stored in the
+        // namespace (S3-PUT'd objects have no dir_index entry but
+        // are visible to NFS as files named by their UUID). Skip
+        // any composition that's already surfaced via a named entry.
+        if let Ok(comps) = self.block_gateway(self.gateway.list(self.tenant_id, self.namespace_id))
+        {
+            for (comp_id, _size) in comps {
+                if named_comp_ids.contains(&comp_id) {
+                    continue;
+                }
+                entries.push(ReadDirEntry {
+                    fileid: u64::from_le_bytes(
+                        comp_id.0.as_bytes()[..8].try_into().unwrap_or([0; 8]),
+                    ),
+                    name: comp_id.0.to_string(),
+                });
+            }
         }
 
         entries

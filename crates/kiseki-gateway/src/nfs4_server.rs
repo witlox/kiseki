@@ -610,10 +610,12 @@ fn op_getfh(state: &CompoundState) -> (u32, Vec<u8>) {
     }
 }
 
-/// FATTR4_* bit positions (RFC 8881 §5.8). Word-0 bits 0..31, with
-/// the kernel-mount-time set covered here. Other bits (mode, owner,
-/// time_*, etc.) can be added when needed.
+/// FATTR4_* bit positions (RFC 8881 §5.8). Word-0 bits 0..31,
+/// word-1 bits 32..63. Phase 15c.3 expanded the set to include
+/// MODE/OWNER/OWNER_GROUP so `ls /mnt/pnfs` doesn't see a 0-mode
+/// directory (which the kernel denies READDIR access to).
 mod fattr4 {
+    // Word 0
     pub const SUPPORTED_ATTRS: u32 = 0;
     pub const TYPE: u32 = 1;
     pub const FH_EXPIRE_TYPE: u32 = 2;
@@ -628,6 +630,11 @@ mod fattr4 {
     pub const RDATTR_ERROR: u32 = 11;
     pub const FILEHANDLE: u32 = 19;
     pub const FILEID: u32 = 20;
+    // Word 1 — bit positions are (n - 32) within word1.
+    pub const MODE_W1: u32 = 33 - 32;
+    pub const NUMLINKS_W1: u32 = 35 - 32;
+    pub const OWNER_W1: u32 = 36 - 32;
+    pub const OWNER_GROUP_W1: u32 = 37 - 32;
 }
 
 /// `FH4_PERSISTENT` per RFC 8881 §5.8.1.18 — kiseki file handles
@@ -660,7 +667,7 @@ fn op_getattr<G: GatewayOps>(
         bitmap_request.push(reader.read_u32().unwrap_or(0));
     }
     let req_w0 = bitmap_request.first().copied().unwrap_or(0);
-    let _req_w1 = bitmap_request.get(1).copied().unwrap_or(0);
+    let req_w1 = bitmap_request.get(1).copied().unwrap_or(0);
 
     let mut w = XdrWriter::new();
     w.write_u32(op::GETATTR);
@@ -699,16 +706,18 @@ fn op_getattr<G: GatewayOps>(
 
     // Helper: is the attr requested?
     let want = |bit: u32| (req_w0 & (1u32 << bit)) != 0;
+    let want_w1 = |bit: u32| (req_w1 & (1u32 << bit)) != 0;
 
     // Build the attr-values blob in bit order. Track which bits we
     // actually populate so the result bitmap reflects only what's
     // in the value blob (RFC 8881 §5.6 strict).
     let mut attr_w = XdrWriter::new();
     let mut result_word0: u32 = 0;
+    let mut result_word1: u32 = 0;
 
     if want(fattr4::SUPPORTED_ATTRS) {
         // bitmap4: count + words. Echo the set kiseki actually
-        // supports today (mount-relevant bits).
+        // supports today (mount-relevant bits across word0 + word1).
         let supported_word0 = (1u32 << fattr4::SUPPORTED_ATTRS)
             | (1u32 << fattr4::TYPE)
             | (1u32 << fattr4::FH_EXPIRE_TYPE)
@@ -723,8 +732,13 @@ fn op_getattr<G: GatewayOps>(
             | (1u32 << fattr4::RDATTR_ERROR)
             | (1u32 << fattr4::FILEHANDLE)
             | (1u32 << fattr4::FILEID);
-        attr_w.write_u32(1); // bitmap word count
+        let supported_word1 = (1u32 << fattr4::MODE_W1)
+            | (1u32 << fattr4::NUMLINKS_W1)
+            | (1u32 << fattr4::OWNER_W1)
+            | (1u32 << fattr4::OWNER_GROUP_W1);
+        attr_w.write_u32(2); // bitmap word count
         attr_w.write_u32(supported_word0);
+        attr_w.write_u32(supported_word1);
         result_word0 |= 1 << fattr4::SUPPORTED_ATTRS;
     }
     if want(fattr4::TYPE) {
@@ -790,11 +804,38 @@ fn op_getattr<G: GatewayOps>(
         attr_w.write_u64(attrs.fileid);
         result_word0 |= 1 << fattr4::FILEID;
     }
+    // Word 1 attrs (Phase 15c.3): kernel needs MODE for ACCESS check
+    // before READDIR; OWNER/OWNER_GROUP for ls -l.
+    if want_w1(fattr4::MODE_W1) {
+        // RFC 8881 §5.8.1.20 — mode4 is the POSIX mode bits.
+        attr_w.write_u32(attrs.mode);
+        result_word1 |= 1 << fattr4::MODE_W1;
+    }
+    if want_w1(fattr4::NUMLINKS_W1) {
+        attr_w.write_u32(attrs.nlink);
+        result_word1 |= 1 << fattr4::NUMLINKS_W1;
+    }
+    if want_w1(fattr4::OWNER_W1) {
+        // RFC 8881 §5.8.1.21 — utf8str_mixed "user@domain". For
+        // kiseki dev mode, "root@kiseki.local".
+        attr_w.write_string("root@kiseki.local");
+        result_word1 |= 1 << fattr4::OWNER_W1;
+    }
+    if want_w1(fattr4::OWNER_GROUP_W1) {
+        attr_w.write_string("root@kiseki.local");
+        result_word1 |= 1 << fattr4::OWNER_GROUP_W1;
+    }
 
     w.write_u32(nfs4_status::NFS4_OK);
-    // Result bitmap — single word covers every attr we encode today.
-    w.write_u32(1);
-    w.write_u32(result_word0);
+    // Result bitmap: 2 words if any word1 attr was populated, else 1.
+    if result_word1 != 0 {
+        w.write_u32(2);
+        w.write_u32(result_word0);
+        w.write_u32(result_word1);
+    } else {
+        w.write_u32(1);
+        w.write_u32(result_word0);
+    }
     w.write_opaque(&attr_w.into_bytes());
 
     (nfs4_status::NFS4_OK, w.into_bytes())
@@ -1338,6 +1379,39 @@ fn op_open<G: GatewayOps>(
     let mut w = XdrWriter::new();
     w.write_u32(op::OPEN);
 
+    // RFC 8881 §18.16.4 — OPEN4resok wire layout:
+    //
+    //   stateid4         stateid;     // 16 bytes
+    //   change_info4     cinfo;       // bool atomic + u64 before + u64 after
+    //   uint32_t         rflags;      // 4 bytes
+    //   bitmap4          attrset;     // u32 count + u32*count words
+    //   open_delegation4 delegation;  // u32 type discriminator + body
+    //
+    // The previous encoding emitted only `stateid + write_bool(cinfo)
+    // + rflags` — missing 16 bytes of cinfo trailer + the entire
+    // attrset and delegation tail. Linux 6.x kernel decoder reads
+    // following compound op bytes as cinfo trailer, which silently
+    // desynchronizes the entire COMPOUND parse. Phase 15c.3 cat-ENOENT.
+    let write_open_resok = |w: &mut XdrWriter, sid: &StateId, rflags: u32| {
+        w.write_u32(nfs4_status::NFS4_OK);
+        w.write_opaque_fixed(&sid.0); // stateid (16 bytes)
+                                      // change_info4 — atomic=false (no atomicity guarantee from
+                                      // an in-memory store); before=after=0 keeps the kernel happy
+                                      // (the semantic is "directory unchanged").
+        w.write_bool(false); // atomic
+        w.write_u64(0); // before changeid4
+        w.write_u64(0); // after changeid4
+        w.write_u32(rflags);
+        // attrset (bitmap4): empty — server didn't set any attrs as
+        // part of the OPEN. Encoded as `count=0` (no words).
+        w.write_u32(0);
+        // open_delegation4: OPEN_DELEGATE_NONE = 0 has an empty body
+        // per §9.1.2 (no per-type fields after the discriminator).
+        // Future grants would emit OPEN_DELEGATE_READ/WRITE.
+        const OPEN_DELEGATE_NONE: u32 = 0;
+        w.write_u32(OPEN_DELEGATE_NONE);
+    };
+
     let status = if open_type == 1 {
         // CREATE: write a new file.
         match ctx.write_named(&name, Vec::new()) {
@@ -1345,10 +1419,9 @@ fn op_open<G: GatewayOps>(
                 let sid = sessions.open_file(fh);
                 state.current_fh = Some(fh);
                 state.current_stateid = Some(sid);
-                w.write_u32(nfs4_status::NFS4_OK);
-                w.write_opaque_fixed(&sid.0); // stateid
-                w.write_bool(false); // cinfo (not implemented)
-                w.write_u32(1); // rflags: OPEN4_RESULT_CONFIRM
+                // OPEN4_RESULT_CONFIRM = 1: kernel knows to confirm
+                // before issuing further state ops on this stateid.
+                write_open_resok(&mut w, &sid, 1);
                 nfs4_status::NFS4_OK
             }
             Err(_) => {
@@ -1363,10 +1436,7 @@ fn op_open<G: GatewayOps>(
                 let sid = sessions.open_file(fh);
                 state.current_fh = Some(fh);
                 state.current_stateid = Some(sid);
-                w.write_u32(nfs4_status::NFS4_OK);
-                w.write_opaque_fixed(&sid.0);
-                w.write_bool(false);
-                w.write_u32(0);
+                write_open_resok(&mut w, &sid, 0);
                 nfs4_status::NFS4_OK
             }
             None => {
@@ -1530,15 +1600,25 @@ fn op_readdir<G: GatewayOps>(
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_opaque_fixed(&[0u8; 8]); // cookieverf
 
+    // RFC 8881 §18.26.3 — entry4 is `cookie + name + fattr4 +
+    // nextentry*`. fattr4 is `bitmap4 attrmask + opaque attr_vals`.
+    // The previous encoding emitted only the bitmap count (no
+    // attr_vals opaque length prefix), which made the kernel
+    // mis-parse the linked-list and silently drop every entry —
+    // the Phase 15c.3 ls-empty bug.
     let entries = ctx.readdir();
     for (i, entry) in entries.iter().enumerate() {
-        w.write_bool(true); // entry follows
+        w.write_bool(true); // nextentry pointer = present
         w.write_u64((i + 1) as u64); // cookie
         w.write_string(&entry.name);
-        w.write_u32(0); // attrs bitmap count (empty)
+        // fattr4: minimal valid encoding — empty attrmask + empty
+        // attr_vals. Both must be on the wire; missing the
+        // attr_vals opaque length prefix de-aligns the decoder.
+        w.write_u32(0); // attrmask bitmap word count
+        w.write_opaque(&[]); // attr_vals (length-prefix = 0)
     }
-    w.write_bool(false); // no more
-    w.write_bool(true); // eof
+    w.write_bool(false); // nextentry pointer = absent (end of list)
+    w.write_bool(true); // dirlist4.eof
 
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
