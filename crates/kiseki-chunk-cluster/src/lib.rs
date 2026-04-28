@@ -110,6 +110,18 @@ pub struct ClusterCfg {
     pub put_timeout: Duration,
     /// Per-peer timeout on `GetFragment`.
     pub get_timeout: Duration,
+    /// Phase 16d step 1: durability strategy for cross-node writes.
+    /// `Replication{copies}` is the 16a default; setting to
+    /// `Ec{data, parity}` switches `write_chunk` / `read_chunk` to
+    /// the Reed-Solomon data path that 16c step 7 built out as
+    /// `write_chunk_ec` / `read_chunk_ec`.
+    pub ec_strategy: crate::ec::EcStrategy,
+    /// Phase 16d step 1: full cluster node-id list, used by the EC
+    /// path to compute placement via [`crate::pick_placement`]. For
+    /// Replication-N writes the existing `peers` Vec is sufficient;
+    /// for EC the placement order matters because `placement[i]`
+    /// holds `fragment_index = i`.
+    pub cluster_nodes: Vec<u64>,
 }
 
 impl ClusterCfg {
@@ -122,6 +134,8 @@ impl ClusterCfg {
             min_acks: 2,
             put_timeout: DEFAULT_PUT_TIMEOUT,
             get_timeout: DEFAULT_GET_TIMEOUT,
+            ec_strategy: crate::ec::EcStrategy::Replication { copies: 3 },
+            cluster_nodes: Vec::new(),
         }
     }
 
@@ -130,6 +144,24 @@ impl ClusterCfg {
     #[must_use]
     pub fn with_min_acks(mut self, min_acks: usize) -> Self {
         self.min_acks = min_acks;
+        self
+    }
+
+    /// Phase 16d step 1: pick the durability strategy. Defaults to
+    /// `Replication{copies: 3}`; runtimes that have computed a
+    /// different `defaults_for(cluster_size)` set this explicitly.
+    #[must_use]
+    pub fn with_ec_strategy(mut self, strategy: crate::ec::EcStrategy) -> Self {
+        self.ec_strategy = strategy;
+        self
+    }
+
+    /// Phase 16d step 1: provide the full cluster node-id list used
+    /// by the EC placement function (rendezvous hashing). For
+    /// Replication-N writes this can be left empty.
+    #[must_use]
+    pub fn with_cluster_nodes(mut self, nodes: Vec<u64>) -> Self {
+        self.cluster_nodes = nodes;
         self
     }
 }
@@ -419,6 +451,42 @@ pub struct DeleteDistributedReport {
 #[async_trait]
 impl AsyncChunkOps for ClusteredChunkStore {
     async fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
+        // Phase 16d step 1: dispatch on cfg.ec_strategy. Replication
+        // path keeps the 16a fan-out semantics; EC path delegates
+        // to write_chunk_ec with a pick_placement-derived placement.
+        if let crate::ec::EcStrategy::Ec { data, parity } = self.cfg.ec_strategy {
+            let total = usize::from(data) + usize::from(parity);
+            // Locally store the envelope first so a leader read does
+            // not require a fabric fetch.
+            let stored = self.local.write_chunk(envelope.clone(), pool).await?;
+            let placement = if self.cfg.cluster_nodes.is_empty() {
+                // Best-effort: derive node ids from peer names. Keeps
+                // unit tests using "p1".."pN" working without
+                // forcing tests to also set cluster_nodes.
+                self.peers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let n = p.name();
+                        n.strip_prefix("node-")
+                            .or_else(|| n.strip_prefix('p'))
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or((i + 1) as u64)
+                    })
+                    .take(total)
+                    .collect::<Vec<_>>()
+            } else {
+                crate::placement::pick_placement(
+                    &envelope.chunk_id,
+                    &self.cfg.cluster_nodes,
+                    total,
+                )
+            };
+            self.write_chunk_ec(envelope, &placement, self.cfg.ec_strategy)
+                .await?;
+            return Ok(stored);
+        }
+
         // 1. Local write — counts as one ack.
         let stored = self.local.write_chunk(envelope.clone(), pool).await?;
         let mut acks: usize = 1;
@@ -990,6 +1058,104 @@ mod tests {
             summary.peers_actually_deleted, 1,
             "p2 dropped the fragment; p3 had nothing to drop"
         );
+    }
+
+    // === Phase 16d step 1: EcStrategy in ClusterCfg + dispatch ==============
+
+    /// RED: when `ClusterCfg::ec_strategy` is set to `EC{4, 2}`, the
+    /// trait-level `write_chunk` (the gateway-facing surface) routes
+    /// through the EC encode-distribute path instead of the
+    /// Replication-N fan-out. Each of 6 peers receives exactly one
+    /// distinct fragment.
+    #[tokio::test]
+    async fn write_chunk_dispatches_to_ec_when_strategy_is_ec() {
+        let local = local_bridge("p");
+        let p1 = MockPeer::new("p1");
+        let p2 = MockPeer::new("p2");
+        let p3 = MockPeer::new("p3");
+        let p4 = MockPeer::new("p4");
+        let p5 = MockPeer::new("p5");
+        let p6 = MockPeer::new("p6");
+        let peers: Vec<Arc<dyn FabricPeer>> = vec![
+            Arc::clone(&p1) as _,
+            Arc::clone(&p2) as _,
+            Arc::clone(&p3) as _,
+            Arc::clone(&p4) as _,
+            Arc::clone(&p5) as _,
+            Arc::clone(&p6) as _,
+        ];
+        let cfg = ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p")
+            .with_ec_strategy(crate::ec::EcStrategy::Ec { data: 4, parity: 2 })
+            .with_cluster_nodes(vec![1, 2, 3, 4, 5, 6]);
+        let store = ClusteredChunkStore::new(local, peers, cfg);
+
+        let env = make_envelope(0xED);
+        store
+            .write_chunk(env, "p")
+            .await
+            .expect("ec write via trait method");
+
+        // Each peer received exactly one PutFragment.
+        for (i, peer) in [&p1, &p2, &p3, &p4, &p5, &p6].iter().enumerate() {
+            assert_eq!(
+                peer.put_calls.load(Ordering::SeqCst),
+                1,
+                "peer {i} should receive exactly one put",
+            );
+        }
+        // Across all 6 peers: exactly 1 has the whole envelope at
+        // index=0 (legacy `store` map), and exactly 5 hold a single
+        // EC fragment in the per-fragment map. Which specific peer
+        // gets which index depends on the HRW hash output — we
+        // don't pin that here.
+        let store_total: usize = [&p1, &p2, &p3, &p4, &p5, &p6]
+            .iter()
+            .map(|p| p.store.lock().unwrap().len())
+            .sum();
+        let frag_total: usize = [&p1, &p2, &p3, &p4, &p5, &p6]
+            .iter()
+            .map(|p| p.fragments.lock().unwrap().len())
+            .sum();
+        assert_eq!(store_total, 1, "exactly one peer holds index=0");
+        assert_eq!(frag_total, 5, "the other five hold index 1..5");
+    }
+
+    /// RED: with `EcStrategy::Replication`, the trait-level
+    /// `write_chunk` keeps using the legacy fan-out (every peer at
+    /// index=0 with the whole envelope). 16a's behavior unchanged.
+    #[tokio::test]
+    async fn write_chunk_keeps_replication_path_when_strategy_is_replication() {
+        let local = local_bridge("p");
+        let p1 = MockPeer::new("p1");
+        let p2 = MockPeer::new("p2");
+        let p3 = MockPeer::new("p3");
+        let peers: Vec<Arc<dyn FabricPeer>> = vec![
+            Arc::clone(&p1) as _,
+            Arc::clone(&p2) as _,
+            Arc::clone(&p3) as _,
+        ];
+        let cfg = ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p")
+            .with_ec_strategy(crate::ec::EcStrategy::Replication { copies: 3 })
+            .with_cluster_nodes(vec![1, 2, 3]);
+        let store = ClusteredChunkStore::new(local, peers, cfg);
+
+        let env = make_envelope(0xEF);
+        let chunk_id = env.chunk_id;
+        store.write_chunk(env, "p").await.expect("rep write");
+
+        // Every peer holds the whole envelope at index=0.
+        for peer in [&p1, &p2, &p3] {
+            assert!(
+                peer.store.lock().unwrap().contains_key(&chunk_id),
+                "{} must have whole envelope in legacy `store`",
+                peer.name()
+            );
+            assert!(
+                peer.fragments.lock().unwrap().is_empty(),
+                "{} must NOT touch the EC fragments map",
+                peer.name()
+            );
+        }
     }
 
     // === Phase 16c step 7: EC data-path round-trip ==========================
