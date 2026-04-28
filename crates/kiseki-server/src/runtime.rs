@@ -442,7 +442,11 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let cluster_placement: Vec<u64> = cfg.raft_peers.iter().map(|(id, _)| *id).collect();
     let mut gw_builder = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
         .with_view_store(Arc::clone(&view_store))
-        .with_cluster_placement(cluster_placement);
+        .with_cluster_placement(cluster_placement)
+        // Phase 16c step 2: cap per-chunk placement at the
+        // size-derived `copies` so a 6-node Replication-3 cluster
+        // doesn't list all 6 nodes in every cluster_chunk_state row.
+        .with_target_copies(usize::from(durability.copies));
     if let Some(ref ss) = small_store {
         gw_builder = gw_builder.with_inline_threshold(
             kiseki_log::ShardConfig::default().inline_threshold_bytes,

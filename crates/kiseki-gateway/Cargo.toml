@@ -21,6 +21,7 @@ kiseki-advisory = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-log = { workspace = true }
 kiseki-chunk = { workspace = true }
+kiseki-chunk-cluster = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-control = { workspace = true }
 kiseki-crypto = { workspace = true }

@@ -61,11 +61,18 @@ pub struct InMemoryGateway {
     /// per-workload backpressure events on saturation and QoS-headroom
     /// updates as quota is consumed (I-WA5: per-caller scoping).
     telemetry_bus: std::sync::RwLock<Option<Arc<kiseki_advisory::TelemetryBus>>>,
-    /// Cluster placement for newly-created chunks (Phase 16b step 2).
-    /// Stamped into `NewChunkMeta.placement` on every fresh chunk write
-    /// so `cluster_chunk_state[(tenant, chunk_id)]` records who holds
-    /// the fragments. Empty in single-node mode (`raft_peers.len() == 1`).
+    /// Candidate cluster nodes used by the placement function
+    /// (Phase 16b step 2). The full set of node ids; the actual
+    /// per-chunk placement is the rendezvous-hashing-selected
+    /// subset of size `target_copies`.
     cluster_placement: Vec<u64>,
+    /// Number of fragments stamped into `NewChunkMeta.placement`
+    /// per fresh write (Phase 16c step 2). 0 means "carry the whole
+    /// `cluster_placement` list" — kept as a backwards-compatible
+    /// fallback for clusters that haven't been updated to set a
+    /// target. Production runtimes set this from the per-cluster-
+    /// size durability defaults table.
+    target_copies: usize,
     /// Chunk plaintext cache (Phase 15c.5 perf fix). Chunks are
     /// content-addressed (`chunk_id` = HMAC over plaintext + salt)
     /// so caching decrypted bytes by `chunk_id` is correct: the
@@ -154,6 +161,7 @@ impl InMemoryGateway {
             shard_map: std::sync::RwLock::new(None),
             telemetry_bus: std::sync::RwLock::new(None),
             cluster_placement: Vec::new(),
+            target_copies: 0,
             decrypt_cache: std::sync::Mutex::new(DecryptCache::default()),
         }
     }
@@ -348,13 +356,23 @@ impl InMemoryGateway {
     }
 
     /// Configure cluster placement for fresh chunks (Phase 16b step 2).
-    /// `placement` lists the node ids that hold each new chunk's
-    /// fragments. Stamped into `NewChunkMeta.placement` so the per-shard
-    /// Raft state machine can drive cross-cluster GC + repair scrub
-    /// without re-discovering topology. Empty list = single-node mode.
+    /// `placement` lists the candidate node ids; the actual per-chunk
+    /// placement is selected via rendezvous hashing in the write path.
+    /// Empty list = single-node mode.
     #[must_use]
     pub fn with_cluster_placement(mut self, placement: Vec<u64>) -> Self {
         self.cluster_placement = placement;
+        self
+    }
+
+    /// Phase 16c step 2: cap the per-chunk placement at `target_copies`
+    /// nodes, picked deterministically via rendezvous hashing. When 0
+    /// (default) the gateway carries the whole `cluster_placement`
+    /// list — preserves the 16b behaviour for clusters that haven't
+    /// been updated to set a target.
+    #[must_use]
+    pub fn with_target_copies(mut self, target_copies: usize) -> Self {
+        self.target_copies = target_copies;
         self
     }
 }
@@ -629,9 +647,21 @@ impl GatewayOps for InMemoryGateway {
             // row atomically with the delta. Dedup-hit writes use the
             // plain `AppendDelta` path.
             let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = if chunk_was_new {
+                // Phase 16c step 2: when target_copies is set, pick
+                // exactly that many nodes via rendezvous hashing. When
+                // 0 (the 16b posture) carry the whole cluster set.
+                let placement = if self.target_copies > 0 {
+                    kiseki_chunk_cluster::pick_placement(
+                        &chunk_id,
+                        &self.cluster_placement,
+                        self.target_copies,
+                    )
+                } else {
+                    self.cluster_placement.clone()
+                };
                 vec![kiseki_log::raft_store::NewChunkMeta {
                     chunk_id: chunk_id.0,
-                    placement: self.cluster_placement.clone(),
+                    placement,
                 }]
             } else {
                 vec![]

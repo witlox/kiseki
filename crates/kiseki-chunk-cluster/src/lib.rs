@@ -62,6 +62,7 @@ pub mod defaults;
 pub mod ec;
 pub mod metrics;
 pub mod peer;
+pub mod placement;
 pub mod scrub;
 pub mod server;
 
@@ -73,6 +74,7 @@ pub use ec::{
 };
 pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
+pub use placement::pick_placement;
 pub use scrub::{
     ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, FragmentAvailabilityOracle,
     OrphanDecision, OrphanDeleter, OrphanScrub, OrphanScrubPolicy, OrphanScrubReport,

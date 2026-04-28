@@ -179,6 +179,15 @@ fn setup_with_placement(
     log: Arc<dyn LogOps + Send + Sync>,
     placement: Vec<u64>,
 ) -> InMemoryGateway {
+    let n = placement.len();
+    setup_with_placement_and_target(log, placement, n)
+}
+
+fn setup_with_placement_and_target(
+    log: Arc<dyn LogOps + Send + Sync>,
+    placement: Vec<u64>,
+    target_copies: usize,
+) -> InMemoryGateway {
     let mut compositions = CompositionStore::new().with_log(log);
     compositions.add_namespace(Namespace {
         id: test_namespace(),
@@ -193,6 +202,7 @@ fn setup_with_placement(
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
     InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key)
         .with_cluster_placement(placement)
+        .with_target_copies(target_copies)
 }
 
 /// RED test #1: a fresh write (no prior dedup) of a chunk-sized
@@ -324,6 +334,44 @@ async fn fresh_chunk_write_carries_configured_placement() {
         proposal.new_chunks[0].placement, placement,
         "ChunkAndDelta must carry the configured cluster placement"
     );
+}
+
+/// Phase 16c step 2: when the cluster has more nodes than the
+/// `target_copies` knob allows, the gateway must pick exactly
+/// `target_copies` of them (via deterministic CRUSH-style hashing)
+/// and put only those in `NewChunkMeta.placement`.
+#[tokio::test(flavor = "multi_thread")]
+async fn placement_is_capped_at_target_copies_when_cluster_is_larger() {
+    let log = Arc::new(RecordingLog::default());
+    // 6-node cluster, but Replication-3 ⇒ each chunk lives on 3.
+    let gw = setup_with_placement_and_target(
+        Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>,
+        vec![1, 2, 3, 4, 5, 6],
+        3,
+    );
+
+    gw.write(kiseki_gateway::WriteRequest {
+        tenant_id: test_tenant(),
+        namespace_id: test_namespace(),
+        data: vec![0xC1u8; 4096],
+    })
+    .await
+    .expect("write");
+
+    let calls = log.chunk_and_delta_calls.lock().unwrap();
+    let placement = &calls[0].new_chunks[0].placement;
+    assert_eq!(
+        placement.len(),
+        3,
+        "6-node cluster + target_copies=3 must yield exactly 3 placement entries; got {placement:?}"
+    );
+    // All entries must be from the cluster set.
+    for n in placement {
+        assert!(
+            [1u64, 2, 3, 4, 5, 6].contains(n),
+            "placement node {n} not in cluster"
+        );
+    }
 }
 
 /// RED: a gateway with an empty placement list (single-node mode)

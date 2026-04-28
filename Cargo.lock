@@ -1780,6 +1780,7 @@ dependencies = [
  "kiseki-advisory",
  "kiseki-audit",
  "kiseki-chunk",
+ "kiseki-chunk-cluster",
  "kiseki-common",
  "kiseki-composition",
  "kiseki-control",
