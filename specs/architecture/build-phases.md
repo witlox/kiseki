@@ -465,11 +465,35 @@ single-node→cluster transition).
   channels populate from `cfg.raft_peers`; a 1-node cluster
   degenerates to local-only (D-6).
 
-- **16b — Defaults table + repair scrub** (deferred). Per-cluster-
-  size durability defaults, EC fragment distribution beyond
-  Replication-N, orphan-fragment-scrub (24h TTL), pNFS DS
-  parallelism that genuinely uses distinct fragment sets per DS,
-  cert revocation / authn-vs-authz tightening.
+- **16b — Metadata foundation + repair primitives**.
+  - Gateway emits `ChunkAndDelta` proposals — closes the 16a
+    Finding 2 gap. `cluster_chunk_state` genuinely populates.
+  - Placement plumbing through to `NewChunkMeta`, runtime takes
+    `cfg.raft_peers` node-id list verbatim.
+  - Composition delete emits `DecrementChunkRefcount` for every
+    released chunk so cluster_chunk_state tombstones.
+  - Per-cluster-size durability defaults table
+    (`defaults_for(size)` → copies + min_acks).
+  - Orphan-fragment-scrub (F-D7 mitigation, 24h TTL) and
+    under-replication scrub (F-D8 / repair after partition) ship
+    as pure-policy + orchestrator-with-trait-objects primitives.
+  - EC fragment distribution primitives (`encode_for_placement` /
+    `decode_from_responses`) wrapping `kiseki_chunk::ec`.
+  - Findings: scrubs not yet wired to a periodic task,
+    `DeleteFragment` fan-out on refcount→0 not yet wired, EC
+    primitives not yet on the data path, placement is "all peers"
+    rather than CRUSH-style. None block production for ≤5-node
+    clusters; tracked for 16c.
+
+- **16c — Scrub orchestration + EC data path** (deferred). Wires
+  the 16b primitives into a runtime scheduler, makes each peer's
+  local `ChunkOps` fragment-aware so EC can encode per-peer,
+  switches `ClusteredChunkStore.write_chunk` to pick EC vs
+  Replication-N from the defaults table, fan-out
+  `DeleteFragment` from leader on refcount→0, CRUSH-style
+  placement at >`target_copies` cluster size. pNFS DS distinct
+  fragment sets per DS rides on the EC switch. Cert revocation /
+  authn-vs-authz tightening.
 
 **Implementation plan**: see
 `specs/implementation/phase-16-cross-node-chunks.md` for the
