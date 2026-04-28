@@ -38,6 +38,34 @@ class ClusterInfo:
     nodes: list[ServerInfo]
     compose_file: str
     mode: str  # "docker"
+    # True when `start_cluster` had to tear down a previously-running
+    # single-node compose to free ports. `stop_cluster` checks this
+    # to decide whether to restore the single-node afterwards so the
+    # session-scoped `kiseki_server` fixture stays alive for the
+    # rest of the pytest session.
+    _restore_single_node: bool = False
+
+
+def _single_node_compose_running(root: Path) -> bool:
+    """Are any containers from the default (single-node) compose up?
+
+    `docker compose ps -q` lists running container IDs from the
+    default compose project; non-empty stdout means at least one is
+    up. Returns False on any docker error (treat as "not running"
+    so we never accidentally bring up a cluster that wasn't there).
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "ps", "-q"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def _workspace_root() -> Path:
@@ -203,8 +231,18 @@ def stop_server(info: ServerInfo) -> None:
 
 
 def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo:
-    """Start a multi-node cluster via docker compose."""
+    """Start a multi-node cluster via docker compose.
+
+    If a single-node compose is currently running (e.g. brought up
+    by the session-scoped `kiseki_server` fixture), it gets torn
+    down here to free the host ports. `stop_cluster` will restore
+    it on teardown so the next test using `kiseki_server` doesn't
+    hit `Connection refused`.
+    """
     root = _workspace_root()
+    # Snapshot single-node state BEFORE we tear it down so we know
+    # whether to restore it later.
+    restore_single_node = _single_node_compose_running(root)
     # Stop any single-node compose that may be running (port conflicts).
     subprocess.run(
         ["docker", "compose", "down", "-v"],
@@ -256,7 +294,12 @@ def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo
     _wait_for_s3(host, 9000)
     _wait_for_nfs(host, 2049)
 
-    return ClusterInfo(nodes=nodes, compose_file=compose_file, mode="docker")
+    return ClusterInfo(
+        nodes=nodes,
+        compose_file=compose_file,
+        mode="docker",
+        _restore_single_node=restore_single_node,
+    )
 
 
 def stop_cluster(info: ClusterInfo) -> None:
@@ -268,6 +311,12 @@ def stop_cluster(info: ClusterInfo) -> None:
     return code (the volumes-remove step has already started) and
     fall through to a `network rm` cleanup so the next start_cluster
     can recreate it without a port collision.
+
+    If `start_cluster` had torn down a previously-running single-node
+    compose, restore it here so the session-scoped `kiseki_server`
+    fixture stays alive for any tests that come after this one.
+    Without this, every `kiseki_server`-using test that runs after a
+    multi-node test fails with `127.0.0.1:9100: Connection refused`.
     """
     root = _workspace_root()
     subprocess.run(
@@ -284,6 +333,21 @@ def stop_cluster(info: ClusterInfo) -> None:
         capture_output=True,
         check=False,
     )
+    if info._restore_single_node:
+        # Bring the single-node compose back up. Best-effort: if it
+        # fails, the next `kiseki_server`-using test surfaces the
+        # connection error directly rather than getting silently
+        # masked here.
+        subprocess.run(
+            ["docker", "compose", "up", "-d"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+        try:
+            _wait_for_ready("127.0.0.1:9100")
+        except Exception:  # pragma: no cover — restore is best-effort
+            pass
 
 
 def stop_node(compose_file: str, service_name: str) -> None:
