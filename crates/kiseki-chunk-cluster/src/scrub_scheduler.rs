@@ -25,9 +25,9 @@ use kiseki_common::ids::{OrgId, ShardId};
 use kiseki_log::traits::LogOps;
 
 use crate::scrub::{
-    ChunkPlacement, FragmentAvailabilityOracle, LogChunkOracle, OrphanDeleter, OrphanScrub,
-    OrphanScrubPolicy, OrphanScrubReport, Repairer, UnderReplicationPolicy,
-    UnderReplicationReport, UnderReplicationScrub,
+    ChunkPlacement, ChunkPlacementWithLen, FragmentAvailabilityOracle, LogChunkOracle,
+    OrphanDeleter, OrphanScrub, OrphanScrubPolicy, OrphanScrubReport, Repairer,
+    UnderReplicationPolicy, UnderReplicationReport, UnderReplicationScrub,
 };
 
 /// Result of one scrub pass — orphan + under-replication combined.
@@ -50,6 +50,11 @@ pub struct ScrubScheduler {
     repairer: Arc<dyn Repairer>,
     orphan_policy: OrphanScrubPolicy,
     under_replication_policy: UnderReplicationPolicy,
+    /// Phase 16e step 3: when set, the under-replication scrub
+    /// uses [`UnderReplicationScrub::run_ec`] + the repairer's
+    /// `repair_ec` method (decode + re-encode). When `None` the
+    /// legacy Replication-N path runs.
+    strategy: Option<crate::ec::EcStrategy>,
     shard_id: ShardId,
     tenant_id: OrgId,
 }
@@ -77,9 +82,20 @@ impl ScrubScheduler {
             repairer,
             orphan_policy,
             under_replication_policy,
+            strategy: None,
             shard_id,
             tenant_id,
         }
+    }
+
+    /// Phase 16e step 3: configure the EC strategy. When set,
+    /// `run_once` builds candidate placements with `original_len`
+    /// from `cluster_chunk_state` and dispatches via
+    /// `UnderReplicationScrub::run_ec`.
+    #[must_use]
+    pub fn with_strategy(mut self, strategy: crate::ec::EcStrategy) -> Self {
+        self.strategy = Some(strategy);
+        self
     }
 
     /// Execute one scrub pass. Reads the local chunk set + the
@@ -104,23 +120,45 @@ impl ScrubScheduler {
             .await;
 
         // Under-replication scrub: walk cluster_chunk_state, ask the
-        // peer oracle about each row's placement.
+        // peer oracle about each row's placement. Phase 16e step 3:
+        // dispatch on configured strategy — EC mode uses run_ec
+        // with original_len from each row, Replication-N uses run.
         let rows = self.log.cluster_chunk_state_iter(self.shard_id).await?;
-        let candidates: Vec<ChunkPlacement> = rows
-            .into_iter()
-            .filter(|(_, _, e)| !e.tombstoned && !e.placement.is_empty())
-            .map(|(_, chunk_id, e)| ChunkPlacement {
-                chunk_id,
-                placement: e.placement,
-            })
-            .collect();
-        let under_replication = UnderReplicationScrub::new(self.under_replication_policy)
-            .run(
-                &candidates,
-                self.peer_oracle.as_ref(),
-                self.repairer.as_ref(),
-            )
-            .await;
+        let under_replication = if let Some(strategy) = self.strategy {
+            let candidates: Vec<ChunkPlacementWithLen> = rows
+                .into_iter()
+                .filter(|(_, _, e)| !e.tombstoned && !e.placement.is_empty())
+                .map(|(_, chunk_id, e)| ChunkPlacementWithLen {
+                    chunk_id,
+                    placement: e.placement,
+                    original_len: usize::try_from(e.original_len).unwrap_or(0),
+                })
+                .collect();
+            UnderReplicationScrub::new(self.under_replication_policy)
+                .with_strategy(strategy)
+                .run_ec(
+                    &candidates,
+                    self.peer_oracle.as_ref(),
+                    self.repairer.as_ref(),
+                )
+                .await
+        } else {
+            let candidates: Vec<ChunkPlacement> = rows
+                .into_iter()
+                .filter(|(_, _, e)| !e.tombstoned && !e.placement.is_empty())
+                .map(|(_, chunk_id, e)| ChunkPlacement {
+                    chunk_id,
+                    placement: e.placement,
+                })
+                .collect();
+            UnderReplicationScrub::new(self.under_replication_policy)
+                .run(
+                    &candidates,
+                    self.peer_oracle.as_ref(),
+                    self.repairer.as_ref(),
+                )
+                .await
+        };
 
         Ok(ScrubReport {
             orphan,

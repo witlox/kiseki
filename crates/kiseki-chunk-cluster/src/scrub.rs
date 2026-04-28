@@ -360,16 +360,46 @@ pub struct ChunkPlacement {
     pub placement: Vec<u64>,
 }
 
+/// Phase 16e step 3: per-chunk input for the EC scrub. Carries
+/// `original_len` from `cluster_chunk_state` (16d step 3) so
+/// `repair_ec` can size the decoded output exactly.
+#[derive(Clone, Debug)]
+pub struct ChunkPlacementWithLen {
+    /// Chunk id.
+    pub chunk_id: ChunkId,
+    /// Peer ids that should hold this chunk's fragments — the
+    /// `i`-th entry holds `fragment_index = i`.
+    pub placement: Vec<u64>,
+    /// Pre-encode ciphertext length, from `cluster_chunk_state`.
+    pub original_len: usize,
+}
+
 /// Orchestrator for the under-replication scrub.
 pub struct UnderReplicationScrub {
     policy: UnderReplicationPolicy,
+    /// Phase 16e step 3: optional EC strategy. When set, [`run_ec`]
+    /// dispatches via [`Repairer::repair_ec`] (decode + re-encode);
+    /// otherwise the legacy [`run`] path uses [`Repairer::repair`]
+    /// (Replication-N copy).
+    strategy: Option<crate::ec::EcStrategy>,
 }
 
 impl UnderReplicationScrub {
     /// Build a scrub with the given policy.
     #[must_use]
     pub fn new(policy: UnderReplicationPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            strategy: None,
+        }
+    }
+
+    /// Phase 16e step 3: configure the EC strategy. Pass to enable
+    /// [`run_ec`]; the legacy [`run`] path remains for Replication-N.
+    #[must_use]
+    pub fn with_strategy(mut self, strategy: crate::ec::EcStrategy) -> Self {
+        self.strategy = Some(strategy);
+        self
     }
 
     /// Run a scrub pass over `candidates`. The oracle answers per-
@@ -416,6 +446,92 @@ impl UnderReplicationScrub {
                                     self.policy.evaluate(&presence),
                                     ReplicationDecision::Critical
                                 ) {
+                                    report.critical += 1;
+                                }
+                                report.repaired += 1;
+                            }
+                            Err(_) => report.repair_errors += 1,
+                        }
+                    } else {
+                        report.lost += 1;
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    /// Phase 16e step 3: EC-aware scrub pass. For each candidate
+    /// chunk, probe per-peer presence; if `healthy < target_copies`
+    /// dispatch to [`Repairer::repair_ec`] with the full healthy
+    /// `(peer, fragment_index)` set + the missing peer + the
+    /// configured strategy + `original_len` from
+    /// `cluster_chunk_state`.
+    ///
+    /// Falls back to the legacy [`Self::run`] path when no strategy
+    /// is configured (Replication-N).
+    pub async fn run_ec<O, R>(
+        &self,
+        candidates: &[ChunkPlacementWithLen],
+        oracle: &O,
+        repairer: &R,
+    ) -> UnderReplicationReport
+    where
+        O: FragmentAvailabilityOracle + ?Sized,
+        R: Repairer + ?Sized,
+    {
+        let Some(strategy) = self.strategy else {
+            // No EC strategy: forward to the Replication-N path.
+            let simple: Vec<ChunkPlacement> = candidates
+                .iter()
+                .map(|c| ChunkPlacement {
+                    chunk_id: c.chunk_id,
+                    placement: c.placement.clone(),
+                })
+                .collect();
+            return self.run(&simple, oracle, repairer).await;
+        };
+
+        let mut report = UnderReplicationReport::default();
+        for cp in candidates {
+            report.scanned += 1;
+            let presence = oracle.check(cp.chunk_id, &cp.placement).await;
+            match self.policy.evaluate(&presence) {
+                ReplicationDecision::Healthy => report.healthy += 1,
+                ReplicationDecision::Lost => report.lost += 1,
+                ReplicationDecision::Repair | ReplicationDecision::Critical => {
+                    let healthy_peers: Vec<(u64, u32)> = cp
+                        .placement
+                        .iter()
+                        .zip(&presence)
+                        .enumerate()
+                        .filter(|(_, (_, p))| **p)
+                        .map(|(i, (id, _))| (*id, u32::try_from(i).unwrap_or(u32::MAX)))
+                        .collect();
+                    let missing: Option<(u64, u32)> = cp
+                        .placement
+                        .iter()
+                        .zip(&presence)
+                        .enumerate()
+                        .find(|(_, (_, p))| !**p)
+                        .map(|(i, (id, _))| (*id, u32::try_from(i).unwrap_or(u32::MAX)));
+                    if let (false, Some(missing)) = (healthy_peers.is_empty(), missing) {
+                        let was_critical = matches!(
+                            self.policy.evaluate(&presence),
+                            ReplicationDecision::Critical
+                        );
+                        match repairer
+                            .repair_ec(
+                                cp.chunk_id,
+                                &healthy_peers,
+                                missing,
+                                strategy,
+                                cp.original_len,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                if was_critical {
                                     report.critical += 1;
                                 }
                                 report.repaired += 1;
@@ -692,9 +808,18 @@ mod tests {
         }
     }
 
+    type EcRepairCall = (
+        ChunkId,
+        Vec<(u64, u32)>,
+        (u64, u32),
+        crate::ec::EcStrategy,
+        usize,
+    );
+
     #[derive(Default)]
     struct FakeRepairer {
         repairs: Mutex<Vec<(ChunkId, u64, u64)>>,
+        ec_repairs: Mutex<Vec<EcRepairCall>>,
         fail_on: Option<ChunkId>,
     }
 
@@ -713,6 +838,27 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((chunk_id, from_peer, to_peer));
+            Ok(())
+        }
+
+        async fn repair_ec(
+            &self,
+            chunk_id: ChunkId,
+            healthy_peers: &[(u64, u32)],
+            missing: (u64, u32),
+            strategy: crate::ec::EcStrategy,
+            original_len: usize,
+        ) -> Result<(), String> {
+            if Some(chunk_id) == self.fail_on {
+                return Err("simulated ec repair failure".into());
+            }
+            self.ec_repairs.lock().unwrap().push((
+                chunk_id,
+                healthy_peers.to_vec(),
+                missing,
+                strategy,
+                original_len,
+            ));
             Ok(())
         }
     }
@@ -1016,5 +1162,59 @@ mod tests {
             .await;
         assert_eq!(report.repaired, 1, "good chunk repaired");
         assert_eq!(report.repair_errors, 1, "bad chunk's failure is counted");
+    }
+
+    /// Phase 16e step 3: when the scrub is configured with an EC
+    /// strategy, missing-fragment repairs go through `repair_ec`
+    /// (not `repair`), and the call carries the full set of healthy
+    /// `(peer, fragment_index)` tuples — required so the EC repair
+    /// can decode + re-encode the missing shard.
+    #[tokio::test]
+    async fn under_replication_scrub_uses_repair_ec_when_strategy_is_ec() {
+        let strategy = crate::ec::EcStrategy::Ec { data: 4, parity: 2 };
+        let policy = UnderReplicationPolicy {
+            target_copies: 6,
+            min_acks: 4,
+        };
+        let scrub = UnderReplicationScrub::new(policy).with_strategy(strategy);
+
+        // Chunk with 6-peer placement, peer at index=3 missing.
+        let chunk = cid(0xEC);
+        let oracle = FakeAvailability {
+            responses: [(chunk, vec![true, true, true, false, true, true])]
+                .into_iter()
+                .collect(),
+        };
+        let repairer = FakeRepairer::default();
+        let placement = ChunkPlacementWithLen {
+            chunk_id: chunk,
+            placement: vec![1, 2, 3, 4, 5, 6],
+            original_len: 512,
+        };
+        scrub
+            .run_ec(std::slice::from_ref(&placement), &oracle, &repairer)
+            .await;
+
+        let plain_calls = repairer.repairs.lock().unwrap();
+        let ec_calls = repairer.ec_repairs.lock().unwrap();
+        assert!(
+            plain_calls.is_empty(),
+            "EC strategy must NOT use the simple repair path"
+        );
+        assert_eq!(
+            ec_calls.len(),
+            1,
+            "EC strategy must dispatch via repair_ec"
+        );
+        let (cid_, healthy, missing, strat, len) = &ec_calls[0];
+        assert_eq!(*cid_, chunk);
+        assert_eq!(
+            healthy,
+            &vec![(1, 0), (2, 1), (3, 2), (5, 4), (6, 5)],
+            "all 5 healthy (peer, index) pairs flow through to repair_ec"
+        );
+        assert_eq!(*missing, (4, 3), "missing peer + its fragment_index");
+        assert_eq!(*strat, strategy);
+        assert_eq!(*len, 512);
     }
 }

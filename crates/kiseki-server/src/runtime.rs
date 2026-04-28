@@ -410,20 +410,27 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                 "default".into(),
             ),
         );
-        let scheduler = Arc::new(kiseki_chunk_cluster::ScrubScheduler::new(
-            scrub_log,
-            scrub_local,
-            scrub_oracle,
-            scrub_deleter,
-            scrub_repairer,
-            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
-            bootstrap_tenant_for_cluster,
-            kiseki_chunk_cluster::OrphanScrubPolicy::default(),
-            kiseki_chunk_cluster::UnderReplicationPolicy {
-                target_copies: durability.copies,
-                min_acks: durability.min_acks,
-            },
-        ));
+        let scheduler = Arc::new(
+            kiseki_chunk_cluster::ScrubScheduler::new(
+                scrub_log,
+                scrub_local,
+                scrub_oracle,
+                scrub_deleter,
+                scrub_repairer,
+                kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+                bootstrap_tenant_for_cluster,
+                kiseki_chunk_cluster::OrphanScrubPolicy::default(),
+                kiseki_chunk_cluster::UnderReplicationPolicy {
+                    target_copies: durability.copies,
+                    min_acks: durability.min_acks,
+                },
+            )
+            // Phase 16e step 3: thread the EC strategy so the scrub
+            // dispatches via repair_ec on EC clusters (≥6 nodes per
+            // the defaults table). Replication-N stays on the legacy
+            // repair() path via the trait default.
+            .with_strategy(durability.strategy),
+        );
         let scrub_handle = scheduler.start_periodic(std::time::Duration::from_secs(600));
         // Detach: the scheduler runs for the lifetime of the
         // process. Graceful shutdown of the scrub task lands when
