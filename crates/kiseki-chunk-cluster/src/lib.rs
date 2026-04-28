@@ -62,7 +62,7 @@ pub mod peer;
 pub mod server;
 
 pub use auth::{verify_fabric_san, FabricAuthError};
-pub use peer::{FabricPeer, FabricPeerError};
+pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use server::{fabric_san_interceptor, ClusterChunkServer};
 
 /// Default per-peer timeout for `PutFragment` (write-side fan-out).

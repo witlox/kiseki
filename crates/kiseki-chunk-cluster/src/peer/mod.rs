@@ -2,12 +2,16 @@
 //!
 //! The gRPC `ClusterChunkService` client lives behind this trait so
 //! [`crate::ClusteredChunkStore`] stays unit-testable with mock peers.
-//! The real gRPC implementation (`peer::grpc`) lands in step 5.
+//! The real gRPC implementation lives in [`grpc`].
 
 use async_trait::async_trait;
 use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_crypto::envelope::Envelope;
 use thiserror::Error;
+
+pub mod grpc;
+
+pub use grpc::{is_retriable_status, status_to_fabric_err, GrpcFabricPeer};
 
 /// Errors a fabric peer call can fail with. Maps onto the gRPC
 /// status codes in the real impl: `NOT_FOUND` → `NotFound`,

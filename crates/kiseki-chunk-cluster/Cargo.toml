@@ -26,4 +26,5 @@ x509-parser = { workspace = true }
 [dev-dependencies]
 rcgen = "0.14"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 uuid = { workspace = true }
