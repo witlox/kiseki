@@ -105,6 +105,25 @@ fn build_fabric_channel(
     Ok(channel)
 }
 
+/// Map a Raft peer address to the fabric endpoint on the same node.
+///
+/// `cfg.raft_peers` carries `host:RAFT_PORT` entries (the addresses
+/// the consensus log uses), but `ClusterChunkService` binds to
+/// `cfg.data_addr`'s port — a different gRPC server on the same
+/// host. Without this remapping, fabric `PutFragment` fan-out lands
+/// on the Raft port and quorum collapses to leader-only.
+///
+/// Strategy: split off the trailing `:port`, keep everything before
+/// it as the host (preserving bracketed IPv6 literals), and append
+/// `:data_port`. Returns the original string if it doesn't carry a
+/// port (defensive — the caller logs and skips).
+fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
+    raft_peer.rsplit_once(':').map_or_else(
+        || raft_peer.to_owned(),
+        |(host, _port)| format!("{host}:{data_port}"),
+    )
+}
+
 /// Run the main data-path server.
 #[allow(clippy::too_many_lines)]
 pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -314,11 +333,13 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // a `spiffe://cluster/fabric/<node-id>` SAN URI.
     let bootstrap_tenant_for_cluster = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
     let mut fabric_peers: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> = Vec::new();
-    for (peer_id, peer_addr) in &cfg.raft_peers {
+    let data_port = cfg.data_addr.port();
+    for (peer_id, raft_peer_addr) in &cfg.raft_peers {
         if *peer_id == cfg.node_id {
             continue; // skip ourselves
         }
-        match build_fabric_channel(peer_addr, cfg.tls.as_ref()) {
+        let fabric_addr = fabric_addr_from_raft_peer(raft_peer_addr, data_port);
+        match build_fabric_channel(&fabric_addr, cfg.tls.as_ref()) {
             Ok(channel) => {
                 let name = format!("node-{peer_id}");
                 fabric_peers.push(Arc::new(
@@ -326,12 +347,12 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                         .with_metrics(Arc::clone(&metrics.fabric)),
                 ));
                 tracing::info!(
-                    peer_id, peer_addr, "fabric peer registered for cross-node chunks",
+                    peer_id, fabric_addr, "fabric peer registered for cross-node chunks",
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    peer_id, peer_addr, error = %e,
+                    peer_id, fabric_addr, error = %e,
                     "fabric peer channel build failed — peer skipped (cluster may run degraded)",
                 );
             }
@@ -1044,5 +1065,44 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Phase 16 e2e fix: fabric peer addresses must point at the
+    /// data-path port (where `ClusterChunkService` listens), not the
+    /// Raft port. Pre-fix: `PutFragment` fan-out hit the Raft gRPC
+    /// server, returned an unimplemented error, and quorum collapsed
+    /// to leader-only.
+    #[test]
+    fn fabric_addr_remaps_raft_port_to_data_port() {
+        assert_eq!(
+            super::fabric_addr_from_raft_peer("kiseki-node2:9300", 9100),
+            "kiseki-node2:9100",
+        );
+        assert_eq!(
+            super::fabric_addr_from_raft_peer("10.0.0.5:9300", 9100),
+            "10.0.0.5:9100",
+        );
+    }
+
+    /// IPv6 host literals are bracketed. `rsplit_once(':')` keeps the
+    /// brackets on the host side, which is the form `tonic::Uri` parses.
+    #[test]
+    fn fabric_addr_preserves_ipv6_brackets() {
+        assert_eq!(
+            super::fabric_addr_from_raft_peer("[2001:db8::1]:9300", 9100),
+            "[2001:db8::1]:9100",
+        );
+    }
+
+    /// Defensive — if the caller passed a port-less string we return
+    /// it verbatim so the existing log-and-skip branch in `run_main`
+    /// fires on the resulting connect error rather than silently
+    /// fabricating an address.
+    #[test]
+    fn fabric_addr_passes_through_when_port_missing() {
+        assert_eq!(
+            super::fabric_addr_from_raft_peer("kiseki-node2", 9100),
+            "kiseki-node2",
+        );
     }
 }
