@@ -13,6 +13,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod async_ops;
 pub mod device;
 pub mod ec;
 pub mod error;
@@ -30,6 +31,7 @@ pub mod small_object_store;
 pub mod store;
 pub mod striping;
 
+pub use async_ops::{AsyncChunkOps, SyncBridge};
 pub use error::ChunkError;
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm", test))]
 pub use gpu_direct::{GpuBackend, GpuDmaAllocator, GpuDmaBuffer, MockDmaAllocator};

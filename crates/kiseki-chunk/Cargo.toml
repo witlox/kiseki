@@ -18,6 +18,7 @@ gpu-cuda = ["libc"]
 gpu-rocm = ["libc"]
 
 [dependencies]
+async-trait = { workspace = true }
 libc = { workspace = true, optional = true }
 kiseki-block = { workspace = true }
 kiseki-common = { workspace = true }
@@ -28,9 +29,11 @@ kiseki-keymanager = { workspace = true }
 redb = "2"
 reed-solomon-erasure = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
