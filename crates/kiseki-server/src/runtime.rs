@@ -362,6 +362,11 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let cluster_cfg =
         kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default")
             .with_min_acks(durability.min_acks);
+    // Phase 16d step 4: clone the peer list before it's moved into
+    // ClusteredChunkStore so the scrub-scheduler adapters can build
+    // a parallel by-id index for HasFragment + repair calls.
+    let fabric_peers_for_scrub: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> =
+        fabric_peers.iter().map(Arc::clone).collect();
     let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
         Arc::new(
             kiseki_chunk_cluster::ClusteredChunkStore::new(
@@ -371,6 +376,53 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             )
             .with_metrics(Arc::clone(&metrics.fabric)),
         );
+
+    // Phase 16d step 4: spawn the periodic scrub scheduler when
+    // running on a real cluster (>=1 peer; in single-node mode
+    // there are no fragments to scrub against and no peers to
+    // probe / repair from). Cadence is currently a fixed 10
+    // minutes per shard — operators can revisit once the
+    // scheduler ships per-shard metrics.
+    if !fabric_peers_for_scrub.is_empty() {
+        let scrub_log = Arc::clone(&log_store) as Arc<dyn kiseki_log::traits::LogOps>;
+        let scrub_local = Arc::clone(&local_chunk_store);
+        let scrub_oracle: Arc<dyn kiseki_chunk_cluster::FragmentAvailabilityOracle> =
+            Arc::new(kiseki_chunk_cluster::FabricAvailabilityOracle::new(
+                &fabric_peers_for_scrub,
+            ));
+        let scrub_deleter: Arc<dyn kiseki_chunk_cluster::OrphanDeleter> = Arc::new(
+            kiseki_chunk_cluster::LocalChunkDeleter::new(Arc::clone(&local_chunk_store)),
+        );
+        let scrub_repairer: Arc<dyn kiseki_chunk_cluster::Repairer> = Arc::new(
+            kiseki_chunk_cluster::FabricRepairer::new(
+                &fabric_peers_for_scrub,
+                bootstrap_tenant_for_cluster,
+                "default".into(),
+            ),
+        );
+        let scheduler = Arc::new(kiseki_chunk_cluster::ScrubScheduler::new(
+            scrub_log,
+            scrub_local,
+            scrub_oracle,
+            scrub_deleter,
+            scrub_repairer,
+            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            bootstrap_tenant_for_cluster,
+            kiseki_chunk_cluster::OrphanScrubPolicy::default(),
+            kiseki_chunk_cluster::UnderReplicationPolicy {
+                target_copies: durability.copies,
+                min_acks: durability.min_acks,
+            },
+        ));
+        let scrub_handle = scheduler.start_periodic(std::time::Duration::from_secs(600));
+        // Detach: the scheduler runs for the lifetime of the
+        // process. Graceful shutdown of the scrub task lands when
+        // the runtime gets a proper shutdown signal hook (16e+).
+        std::mem::drop(scrub_handle);
+        tracing::info!(
+            "scrub scheduler: spawned (orphan + under-replication, 10-min cadence)",
+        );
+    }
 
     // Raw device discovery (KISEKI_RAW_DEVICES).
     // This is the discovery phase — actual device opening via DeviceBackend

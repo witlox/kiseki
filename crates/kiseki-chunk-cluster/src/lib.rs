@@ -64,6 +64,7 @@ pub mod metrics;
 pub mod peer;
 pub mod placement;
 pub mod scrub;
+pub mod scrub_adapters;
 pub mod scrub_scheduler;
 pub mod server;
 
@@ -82,6 +83,7 @@ pub use scrub::{
     OrphanScrubReport, Repairer, ReplicationDecision, UnderReplicationPolicy,
     UnderReplicationReport, UnderReplicationScrub, DEFAULT_ORPHAN_TTL,
 };
+pub use scrub_adapters::{FabricAvailabilityOracle, FabricRepairer, LocalChunkDeleter};
 pub use scrub_scheduler::{ScrubReport, ScrubScheduler};
 pub use server::{fabric_san_interceptor, ClusterChunkServer};
 
