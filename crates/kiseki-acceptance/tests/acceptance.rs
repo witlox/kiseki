@@ -1041,6 +1041,15 @@ fn main() {
         if skip_slow && sc.tags.iter().any(|t| t == "slow") {
             return false;
         }
+        // Scenarios that require a real OS-level mount (privileged
+        // docker container, ktls, kernel pNFS client). The in-process
+        // BDD runner can't provide those primitives; the python e2e
+        // suite (`tests/e2e/test_pnfs.py`) is the witness. Always
+        // skip in the BDD run so a `todo!()` step doesn't fail CI
+        // for work that's verified end-to-end elsewhere.
+        if sc.tags.iter().any(|t| t == "e2e-deferred") {
+            return false;
+        }
         if let Some(ref fname) = feature_filter {
             if !feat
                 .path

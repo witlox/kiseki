@@ -153,7 +153,15 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
     Then exactly 4 entries are live
     And the 2 evicted entries are the 2 with the smallest `issued_at_ms`
 
-  @integration @pnfs-15b
+  # Deferred to the python e2e harness (tests/e2e/test_pnfs.py) —
+  # mounting a real Linux 6.7+ pNFS client requires a privileged
+  # docker container joined to the cluster's docker network, which
+  # the in-process BDD runner can't provide. The `@e2e-deferred`
+  # tag is filtered out by `tests/acceptance.rs::main` so the
+  # scenario shows as skipped here and gets exercised by
+  # `pytest tests/e2e/test_pnfs.py::test_pnfs_plaintext_fallback`
+  # (closed in Phase 15c.5 step 3).
+  @integration @pnfs-15b @e2e-deferred
   Scenario: Real Linux pNFS client round-trip (RFC fidelity)
     Given a Linux 6.7+ pNFS client is available with `xprtsec=mtls`
     When the client mounts the export and reads 1 MiB sequentially through one DS
