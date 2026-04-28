@@ -262,10 +262,12 @@ mod tests {
             NewChunkMeta {
                 chunk_id: chunk_a.0,
                 placement: vec![1, 2, 3],
+                original_len: 0,
             },
             NewChunkMeta {
                 chunk_id: chunk_b.0,
                 placement: vec![1, 2, 3],
+                original_len: 0,
             },
         ];
 

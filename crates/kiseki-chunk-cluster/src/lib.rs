@@ -309,11 +309,19 @@ impl ClusteredChunkStore {
     /// each placement peer's fragment via `GetFragment`, collects
     /// ≥X responses, and decodes back to the original ciphertext.
     /// `placement[i]` is expected to hold `fragment_index = i`.
+    ///
+    /// Phase 16d step 3: `original_len` is the pre-encode ciphertext
+    /// length stored in `cluster_chunk_state`. When `Some` the decode
+    /// produces output of exactly that length. When `None` the
+    /// function falls back to the trim-trailing-zeros heuristic
+    /// (correct for AES-GCM ciphertext, wrong for sparse plaintext);
+    /// callers wire `Some` in production.
     pub async fn read_chunk_ec(
         &self,
         chunk_id: &ChunkId,
         placement: &[u64],
         strategy: crate::ec::EcStrategy,
+        original_len: Option<u64>,
     ) -> Result<Envelope, ChunkError> {
         let by_id: std::collections::HashMap<&str, &Arc<dyn FabricPeer>> = self
             .peers
@@ -352,27 +360,36 @@ impl ClusteredChunkStore {
         if responses.len() < strategy.min_fragments_for_read() {
             return Err(ChunkError::ChunkLost);
         }
-        // Decode. We don't know the original_len; for this iteration
-        // we use the total bytes from the responses padded down.
-        // A production version stores original_len in
-        // cluster_chunk_state; for the test path we use the sum of
-        // data shard sizes as the upper bound and trim trailing zeros.
+        // Phase 16d step 3: prefer the cluster_chunk_state-stored
+        // original_len when the caller supplies it. Heuristic
+        // fallback is preserved for tests / 16c-style callers that
+        // don't yet read the metadata.
         let shard_size = responses[0].bytes.len();
         let data_count = match strategy {
             crate::ec::EcStrategy::Ec { data, .. } => usize::from(data),
             crate::ec::EcStrategy::Replication { .. } => 1,
         };
-        let upper_bound = shard_size * data_count;
-        let plaintext = crate::ec::decode_from_responses(strategy, &responses, upper_bound)
+        let decode_len = original_len
+            .map_or(shard_size * data_count, |n| usize::try_from(n).unwrap_or(usize::MAX));
+        let plaintext = crate::ec::decode_from_responses(strategy, &responses, decode_len)
             .map_err(|e| ChunkError::Io(e.to_string()))?;
-        // Strip trailing zeros — the encoder padded each data shard
-        // to uniform size; the original may have been shorter.
-        let trimmed_len = plaintext
-            .iter()
-            .rposition(|b| *b != 0)
-            .map_or(0, |i| i + 1);
-        let mut bytes = plaintext;
-        bytes.truncate(trimmed_len);
+        let bytes = if original_len.is_some() {
+            // Authoritative length from cluster_chunk_state — no
+            // trimming needed; decode_from_responses already trims
+            // to original_len.
+            plaintext
+        } else {
+            // Fallback: strip trailing zeros (the encoder padded
+            // each data shard to uniform size). Correct for
+            // AES-GCM ciphertext; not safe for sparse plaintext.
+            let trimmed_len = plaintext
+                .iter()
+                .rposition(|b| *b != 0)
+                .map_or(0, |i| i + 1);
+            let mut bytes = plaintext;
+            bytes.truncate(trimmed_len);
+            bytes
+        };
         Ok(Envelope {
             chunk_id: *chunk_id,
             ciphertext: bytes,
@@ -1275,8 +1292,16 @@ mod tests {
         ];
         let store_reader = ClusteredChunkStore::new(local_no_data, peers_for_read, cfg);
 
+        // Pass the actual ciphertext length so 16d's authoritative
+        // `original_len` path is exercised (no trim-trailing-zeros).
+        let original_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let recovered = store_reader
-            .read_chunk_ec(&chunk_id, &[1, 2, 3, 4, 5, 6], strategy)
+            .read_chunk_ec(
+                &chunk_id,
+                &[1, 2, 3, 4, 5, 6],
+                strategy,
+                Some(original_len),
+            )
             .await
             .expect("ec read");
         assert_eq!(

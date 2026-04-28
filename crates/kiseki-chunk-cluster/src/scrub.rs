@@ -896,6 +896,7 @@ mod tests {
             placement: vec![1, 2, 3],
             tombstoned: false,
             created_ms: 0,
+            original_len: 0,
         };
         let log: Arc<dyn kiseki_log::traits::LogOps> = Arc::new(FakeLog {
             responses: [(cid(0xC1), entry)].into_iter().collect(),
@@ -915,6 +916,7 @@ mod tests {
             placement: vec![1, 2, 3],
             tombstoned: true,
             created_ms: 0,
+            original_len: 0,
         };
         let log: Arc<dyn kiseki_log::traits::LogOps> = Arc::new(FakeLog {
             responses: [(cid(0xC2), entry)].into_iter().collect(),

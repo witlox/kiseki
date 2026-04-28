@@ -41,6 +41,13 @@ pub struct ClusterChunkStateEntry {
     /// by the orphan-fragment scrub to compute the 24h TTL
     /// (Risk #5 in the implementation plan).
     pub created_ms: u64,
+    /// Phase 16d step 3: pre-encode ciphertext length. Lets the
+    /// read path size the decoded output exactly under EC mode
+    /// instead of relying on a trim-trailing-zeros heuristic.
+    /// Defaults to 0 for entries created before 16d (round-trip
+    /// safe via serde's default).
+    #[serde(default)]
+    pub original_len: u64,
 }
 
 type C = LogTypeConfig;
@@ -308,6 +315,7 @@ impl ShardSmInner {
                     placement: nc.placement.clone(),
                     tombstoned: false,
                     created_ms: log_index,
+                    original_len: nc.original_len,
                 });
         }
     }
@@ -683,6 +691,7 @@ mod tests {
             new_chunks: vec![NewChunkMeta {
                 chunk_id,
                 placement: vec![1, 2, 3],
+                original_len: 1024,
             }],
         };
 
@@ -700,6 +709,13 @@ mod tests {
         assert_eq!(entry.refcount, 1);
         assert_eq!(entry.placement, vec![1, 2, 3]);
         assert!(!entry.tombstoned);
+        // Phase 16d step 3: original_len round-trips into the
+        // cluster_chunk_state row so read_chunk_ec can decode
+        // without the trim-trailing-zeros heuristic.
+        assert_eq!(
+            entry.original_len, 1024,
+            "original_len must round-trip into cluster_chunk_state"
+        );
     }
 
     /// Separate tenants writing the same `chunk_id` end up with
@@ -724,6 +740,7 @@ mod tests {
                 new_chunks: vec![NewChunkMeta {
                     chunk_id,
                     placement: vec![1, 2, 3],
+                    original_len: 0,
                 }],
             };
             let _ = inner.apply_command(&cmd, 1);
@@ -764,6 +781,7 @@ mod tests {
                 new_chunks: vec![NewChunkMeta {
                     chunk_id,
                     placement: vec![1, 2, 3],
+                    original_len: 0,
                 }],
             },
             1,
@@ -802,6 +820,7 @@ mod tests {
                 new_chunks: vec![NewChunkMeta {
                     chunk_id,
                     placement: vec![1, 2, 3],
+                    original_len: 0,
                 }],
             },
             1,

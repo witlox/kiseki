@@ -112,6 +112,13 @@ pub struct NewChunkMeta {
     /// with 3 peers, all 3 node ids; under EC the placement list
     /// matches the CRUSH derivation in `kiseki-chunk::placement`.
     pub placement: Vec<u64>,
+    /// Phase 16d step 3: pre-encode ciphertext length. Used by
+    /// `ClusteredChunkStore::read_chunk_ec` to size the decoded
+    /// output exactly; without this the read path falls back to a
+    /// trim-trailing-zeros heuristic that's wrong for plaintext
+    /// ending in zeros.
+    #[serde(default)]
+    pub original_len: u64,
 }
 
 impl std::fmt::Display for LogCommand {

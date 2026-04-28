@@ -395,6 +395,7 @@ mod tests {
             placement: vec![1, 2, 3],
             tombstoned: false,
             created_ms: 0,
+            original_len: 0,
         };
         let single: HashMap<_, _> = chunk_ids
             .iter()

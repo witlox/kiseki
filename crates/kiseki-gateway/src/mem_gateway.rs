@@ -573,6 +573,10 @@ impl GatewayOps for InMemoryGateway {
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
         let bytes_written = req.data.len() as u64;
+        // Phase 16d step 3: capture the pre-encode ciphertext length
+        // before `env` is moved into write_chunk. Used by the EC
+        // read path to size the decoded output exactly.
+        let ciphertext_len = env.ciphertext.len() as u64;
 
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
@@ -662,6 +666,7 @@ impl GatewayOps for InMemoryGateway {
                 vec![kiseki_log::raft_store::NewChunkMeta {
                     chunk_id: chunk_id.0,
                     placement,
+                    original_len: ciphertext_len,
                 }]
             } else {
                 vec![]
