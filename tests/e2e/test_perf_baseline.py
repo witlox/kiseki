@@ -280,3 +280,76 @@ fio --name=seq-read --rw=read --direct=0 --bs=1M --size=8M \
     print(
         f"\n[B-5/NFSv3] seq-read = {bw.get('read_mbps', 0):7.1f} MB/s"
     )
+
+
+# ---------------------------------------------------------------------------
+# 4-6. WRITE perf — the symmetric case to the read tests above.
+# ---------------------------------------------------------------------------
+#
+# fio --rw=write writes a fresh file (or overwrites an existing one)
+# at the requested bs. For NFS this exercises the WRITE op + COMMIT.
+# Linux 6.x derives wsize from FATTR4_MAXWRITE (NFSv4) / FSINFO wtmax
+# (NFSv3); both are advertised at 1 MiB so a 1M block size lands in
+# single-RPC writes.
+
+
+@pytest.mark.e2e
+@pytest.mark.perf
+def test_perf_nfs41_seq_write(
+    perf_cluster: ClusterInfo,
+    perf_client_image: str,
+) -> None:
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    script = r"""
+set -euo pipefail
+mkdir -p /mnt/pnfs
+mount -t nfs4 -o vers=4.1,minorversion=1 kiseki-node1:/default /mnt/pnfs
+trap 'umount /mnt/pnfs 2>/dev/null || true' EXIT
+fio --name=seq-write --rw=write --direct=0 --bs=1M --size=8M \
+    --filename=/mnt/pnfs/perf-write-nfs41 --runtime=10 --time_based \
+    --output-format=normal 2>&1 | tail -30
+"""
+    result = _run_in_client(perf_client_image, script, timeout=180)
+    if result.returncode != 0:
+        pytest.fail(
+            "fio NFSv4.1 seq-write failed "
+            f"(rc={result.returncode}):\n"
+            f"stdout: {result.stdout[-2000:]}\n"
+            f"stderr: {result.stderr[-2000:]}"
+        )
+    bw = _parse_fio_bw(result.stdout)
+    print(f"\n[B-5/NFSv4.1] seq-write = {bw.get('write_mbps', 0):7.1f} MB/s")
+
+
+@pytest.mark.e2e
+@pytest.mark.perf
+def test_perf_nfs3_seq_write(
+    perf_cluster: ClusterInfo,
+    perf_client_image: str,
+) -> None:
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    script = r"""
+set -euo pipefail
+mkdir -p /mnt/nfs3
+mount -t nfs -o vers=3,proto=tcp,port=2049,mountport=2049,mountproto=tcp,nolock \
+    kiseki-node1:/default /mnt/nfs3
+trap 'umount /mnt/nfs3 2>/dev/null || true' EXIT
+fio --name=seq-write --rw=write --direct=0 --bs=1M --size=8M \
+    --filename=/mnt/nfs3/perf-write-nfs3 --runtime=10 --time_based \
+    --output-format=normal 2>&1 | tail -30
+"""
+    result = _run_in_client(perf_client_image, script, timeout=180)
+    if result.returncode != 0:
+        pytest.fail(
+            "fio NFSv3 seq-write failed "
+            f"(rc={result.returncode}):\n"
+            f"stdout: {result.stdout[-2000:]}\n"
+            f"stderr: {result.stderr[-2000:]}"
+        )
+    bw = _parse_fio_bw(result.stdout)
+    print(f"\n[B-5/NFSv3] seq-write = {bw.get('write_mbps', 0):7.1f} MB/s")
+
