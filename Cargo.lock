@@ -1668,10 +1668,14 @@ dependencies = [
  "kiseki-chunk",
  "kiseki-common",
  "kiseki-crypto",
+ "kiseki-proto",
+ "rcgen",
  "thiserror 2.0.18",
  "tokio",
+ "tonic",
  "tracing",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

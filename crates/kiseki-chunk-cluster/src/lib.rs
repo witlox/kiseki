@@ -57,9 +57,13 @@ use kiseki_chunk::{AsyncChunkOps, ChunkError};
 use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_crypto::envelope::Envelope;
 
+pub mod auth;
 pub mod peer;
+pub mod server;
 
+pub use auth::{verify_fabric_san, FabricAuthError};
 pub use peer::{FabricPeer, FabricPeerError};
+pub use server::{fabric_san_interceptor, ClusterChunkServer};
 
 /// Default per-peer timeout for `PutFragment` (write-side fan-out).
 pub const DEFAULT_PUT_TIMEOUT: Duration = Duration::from_secs(5);
