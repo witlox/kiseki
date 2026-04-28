@@ -357,11 +357,21 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         cluster_size,
         copies = durability.copies,
         min_acks = durability.min_acks,
+        strategy = ?durability.strategy,
         "cluster durability defaults",
     );
+    // Phase 16e step 1: thread the per-cluster-size strategy into
+    // ClusterCfg.ec_strategy so write_chunk / read_chunk dispatch
+    // (16d steps 1+5) routes a 6+ node cluster through the EC
+    // path, honoring I-C4 ("EC is the default") + I-D1 ("repaired
+    // from EC parity").
+    let cluster_nodes_for_cfg: Vec<u64> =
+        cfg.raft_peers.iter().map(|(id, _)| *id).collect();
     let cluster_cfg =
         kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default")
-            .with_min_acks(durability.min_acks);
+            .with_min_acks(durability.min_acks)
+            .with_ec_strategy(durability.strategy)
+            .with_cluster_nodes(cluster_nodes_for_cfg);
     // Phase 16d step 4: clone the peer list before it's moved into
     // ClusteredChunkStore so the scrub-scheduler adapters can build
     // a parallel by-id index for HasFragment + repair calls.
