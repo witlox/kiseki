@@ -583,6 +583,36 @@ impl Default for MdsLayoutConfig {
     }
 }
 
+/// Does `layout` cover the byte range `[offset, offset + length)`?
+///
+/// "Covers" means: the union of the layout's stripes is a contiguous
+/// range that starts at or before `offset` and ends at or after
+/// `offset + length`. Caller-side cache-hit guard for
+/// `MdsLayoutManager::layout_get` — without it the cache returns
+/// stale layouts that don't match the kernel's requested range and
+/// the kernel hammers LAYOUTGET in a tight retry loop.
+///
+/// Treats `length == 0` as "any single byte at `offset`" (the
+/// kernel sometimes probes with length=0 / length=1) and `length ==
+/// u64::MAX` as "to end of file" — the contract from RFC 5661
+/// §18.43.1: a cached layout that starts at `offset` and reaches
+/// the file end (effectively, has stripes through the cache cap)
+/// satisfies the request.
+fn layout_covers(layout: &ServerLayout, offset: u64, length: u64) -> bool {
+    let Some(first) = layout.stripes.first() else {
+        return false;
+    };
+    let Some(last) = layout.stripes.last() else {
+        return false;
+    };
+    if first.offset > offset {
+        return false;
+    }
+    let layout_end = last.offset.saturating_add(last.length);
+    let probe_end = offset.saturating_add(length.max(1));
+    layout_end >= probe_end
+}
+
 impl MdsLayoutManager {
     /// Create a manager with the given key + config.
     #[must_use]
@@ -651,14 +681,36 @@ impl MdsLayoutManager {
         iomode: LayoutIoMode,
         now_ms: u64,
     ) -> ServerLayout {
-        // Cache hit (still within TTL).
+        // Cache hit (still within TTL AND covers the requested range).
+        //
+        // Phase 15c.8 fix: pre-fix this returned the cached layout
+        // regardless of the (offset, length) the kernel asked for. If
+        // the FIRST LAYOUTGET that populated the cache asked for
+        // offset=0, the cache held a layout starting at offset=0 even
+        // for kernel reads at offset=4 MiB — the response's stripes
+        // didn't cover the kernel's requested range, the kernel
+        // re-issued LAYOUTGET, and the server hit a tight retry
+        // loop (29k LAYOUTGETs in 8 seconds, observed via fio
+        // --time_based against an 8 MiB file). The kernel's own
+        // dmesg trace via `rpcdebug -m nfs -s pnfs xdr` shows
+        // `decode_layoutget roff:3145728` (3 MiB) coming back when
+        // the kernel asked for off:4194304 (4 MiB) — proof of the
+        // mis-aligned cache hit.
+        //
+        // Match-criteria: the cached layout's first stripe must
+        // start at or before `offset`, and its last stripe must
+        // end at or after `offset + length` (clamped to file end
+        // by max_extent). If either condition fails, recompute and
+        // update the cache.
         {
             let inner = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(existing) = inner.cache.get(&composition_id) {
-                if now_ms < existing.issued_at_ms.saturating_add(existing.ttl_ms) {
+                if now_ms < existing.issued_at_ms.saturating_add(existing.ttl_ms)
+                    && layout_covers(existing, offset, length)
+                {
                     return existing.clone();
                 }
             }
@@ -1162,6 +1214,91 @@ mod mds_layout_tests {
         );
         assert_eq!(layout.stripes[0].offset, 8 * 1_048_576);
         assert!(layout.stripes.len() <= 64);
+    }
+
+    /// Phase 15c.8: a cache hit must only short-circuit when the
+    /// cached layout actually covers the kernel's requested
+    /// (offset, length). Pre-fix the cache returned the layout it
+    /// happened to hold for `composition_id`, regardless of range.
+    /// In the bug scenario the FIRST LAYOUTGET asked for offset=0
+    /// (populating the cache with stripes starting at 0); a
+    /// subsequent kernel LAYOUTGET at offset=4 MiB got back the
+    /// stale offset-0 layout, the response didn't cover the
+    /// requested offset, the kernel re-issued LAYOUTGET, infinite
+    /// loop. This test pins the cache-coverage check.
+    #[test]
+    fn cache_recomputes_when_offset_is_outside_cached_range() {
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
+        // First call seeds the cache for composition C with a layout
+        // starting at offset 0, covering one stripe.
+        let l0 = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(0xCACE),
+            0,
+            1_048_576,
+            LayoutIoMode::Read,
+            1000,
+        );
+        assert_eq!(l0.stripes[0].offset, 0);
+        // Second call asks for the SAME composition but at offset
+        // 8 MiB. Pre-fix this returned `l0` (cache hit ignored
+        // offset); post-fix the cache miss recomputes a layout
+        // whose first stripe starts at or before 8 MiB.
+        let l1 = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(0xCACE),
+            8 * 1_048_576,
+            1_048_576,
+            LayoutIoMode::Read,
+            1500, // still within TTL (default 300_000 ms)
+        );
+        let first = l1.stripes.first().unwrap();
+        let last = l1.stripes.last().unwrap();
+        assert!(
+            first.offset <= 8 * 1_048_576,
+            "cache-recomputed layout's first stripe must start at \
+             or before the requested offset; got offset={}",
+            first.offset,
+        );
+        assert!(
+            last.offset.saturating_add(last.length) >= 9 * 1_048_576,
+            "cache-recomputed layout must cover through offset+length; \
+             last stripe ends at {}",
+            last.offset + last.length,
+        );
+    }
+
+    /// A cache hit when the requested range IS contained in the
+    /// cached layout returns the cached layout — the fast path that
+    /// I-PN8 relies on for capacity-bounded layout state.
+    #[test]
+    fn cache_hits_when_offset_is_inside_cached_range() {
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
+        let l0 = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(0xBABE),
+            0,
+            // u64::MAX → bounded to max_stripes_per_layout * stripe = 64 MiB.
+            u64::MAX,
+            LayoutIoMode::Read,
+            2000,
+        );
+        // Probe at offset 4 MiB inside the cached 64 MiB extent.
+        let l1 = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(0xBABE),
+            4 * 1_048_576,
+            1_048_576,
+            LayoutIoMode::Read,
+            2500,
+        );
+        // Same layout object — we got the cache hit.
+        assert_eq!(l0.stripes.len(), l1.stripes.len());
+        assert_eq!(l0.stripes[0].offset, l1.stripes[0].offset);
     }
 
     #[test]
