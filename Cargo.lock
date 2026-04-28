@@ -1642,6 +1642,7 @@ dependencies = [
 name = "kiseki-chunk"
 version = "2026.38.0"
 dependencies = [
+ "async-trait",
  "kiseki-block",
  "kiseki-common",
  "kiseki-crypto",
@@ -1654,6 +1655,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]
