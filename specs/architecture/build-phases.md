@@ -536,10 +536,30 @@ single-node→cluster transition).
     EC clusters. pNFS DS distinct-fragment parallelism rides
     on the EC switch and is pNFS-team scope.
 
-- **16e — Multi-index repair + graceful shutdown** (deferred).
-  Pulls in 16d's two findings + pNFS DS distinct-fragment
-  parallelism if the pNFS team needs it concurrent. Small
-  scope.
+- **16e — EC primary-feature closure**. Caught during 16d
+  close-out: ADR-005 makes EC the **primary** durability mode
+  (I-C4 "EC is the default"; I-D1 "repaired from EC parity"),
+  not opt-in. 16d's audit had EC repair unimplemented and the
+  defaults table still picking Replication-3 even at ≥6 nodes.
+  Run in **integrator mode**:
+  - `defaults_for(≥6) → EcStrategy::Ec{4, 2}`. Production HPC/AI
+    clusters now boot with EC by default (I-C4).
+  - `Repairer::repair_ec` decode + re-encode missing fragment.
+    Closes I-D1 for production. Deterministic re-encode
+    contract verified via RED→GREEN test.
+  - `UnderReplicationScrub::with_strategy` + `run_ec` path
+    threading `original_len` from `cluster_chunk_state` through.
+    Scheduler dispatches based on `cfg.ec_strategy`.
+  - Graceful shutdown for the scrub task via
+    `tokio::sync::watch` channel. JoinHandle joins cleanly
+    within bound on signal.
+  - 4 RED→GREEN tests across the steps; full audit at
+    `specs/findings/phase-16e-adversary-audit.md`.
+
+**Phase 16 status: complete.** All 13 findings from 16a/b/c/d
+closed. Two acknowledged out-of-scope items (pNFS DS distinct-
+fragment parallelism — pNFS team; runtime-wide unified shutdown
+— runtime-wide concern).
 
 **Implementation plan**: see
 `specs/implementation/phase-16-cross-node-chunks.md` for the
