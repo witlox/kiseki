@@ -293,12 +293,45 @@ pub trait FragmentAvailabilityOracle: Send + Sync {
 #[async_trait]
 pub trait Repairer: Send + Sync {
     /// Re-replicate `chunk_id` from `from_peer` to `to_peer`.
+    /// Replication-N semantics — every peer holds the whole envelope
+    /// at `fragment_index = 0`, so this is a simple GET + PUT.
     async fn repair(
         &self,
         chunk_id: ChunkId,
         from_peer: u64,
         to_peer: u64,
     ) -> Result<(), String>;
+
+    /// Phase 16e step 2: EC repair. Gathers ≥X fragments from the
+    /// healthy peer/index pairs, decodes to the original ciphertext
+    /// (using `original_len`), re-encodes via the same EC strategy,
+    /// and writes the missing peer's fragment via `PutFragment`.
+    /// Closes I-D1 ("repaired from EC parity") for production
+    /// 6+ node clusters where EC is the default per I-C4.
+    ///
+    /// `healthy_peers` is a slice of `(peer_id, fragment_index)`
+    /// tuples — the `fragment_index` lets the repairer GET the right
+    /// shard from each source. `missing` is the destination
+    /// `(peer_id, fragment_index)` to populate.
+    ///
+    /// Default impl falls back to [`Self::repair`] from the first
+    /// healthy peer — correct for Replication-N (where every index
+    /// is 0) but wrong for EC (where each peer holds a distinct
+    /// shard). Production EC implementations (e.g. `FabricRepairer`)
+    /// override this.
+    async fn repair_ec(
+        &self,
+        chunk_id: ChunkId,
+        healthy_peers: &[(u64, u32)],
+        missing: (u64, u32),
+        _strategy: crate::ec::EcStrategy,
+        _original_len: usize,
+    ) -> Result<(), String> {
+        let Some(&(src, _)) = healthy_peers.first() else {
+            return Err("no healthy source peers".into());
+        };
+        self.repair(chunk_id, src, missing.0).await
+    }
 }
 
 /// Result of a repair-scrub pass.

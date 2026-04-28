@@ -161,12 +161,8 @@ impl Repairer for FabricRepairer {
             .get(&to_peer)
             .ok_or_else(|| format!("repair destination peer {to_peer} unknown"))?;
 
-        // Today's repair targets fragment_index 0 (Replication-N).
-        // EC mode + multi-index repair lands when we wire the
-        // under-replication scrub against EC fragments — which
-        // requires storing fragment_index per placement entry, not
-        // just node_id. Tracked as a 16e concern; for 16d the
-        // Replication-N path is sufficient to verify the seam.
+        // Replication-N: every peer holds the whole envelope at
+        // fragment_index=0; a simple GET+PUT is sufficient.
         let envelope = src
             .get_fragment(chunk_id, 0)
             .await
@@ -174,6 +170,99 @@ impl Repairer for FabricRepairer {
         dst.put_fragment(chunk_id, 0, self.tenant_id, self.pool.clone(), envelope)
             .await
             .map_err(|e| format!("put_fragment: {e}"))?;
+        Ok(())
+    }
+
+    /// Phase 16e step 2: EC repair via decode + re-encode.
+    ///
+    /// `GetFragment` from each healthy `(peer, index)` → collect
+    /// `crate::ec::FragmentResponse`s →
+    /// `crate::ec::decode_from_responses` reconstructs the original
+    /// ciphertext → `crate::ec::encode_for_placement` re-encodes
+    /// with the *same* deterministic Reed-Solomon code → pick the
+    /// fragment at the missing index → `PutFragment` to the
+    /// destination peer.
+    ///
+    /// Closes **I-D1** ("repaired from EC parity") for the
+    /// production 6+ node default (EC 4+2 per `defaults_for`).
+    async fn repair_ec(
+        &self,
+        chunk_id: ChunkId,
+        healthy_peers: &[(u64, u32)],
+        missing: (u64, u32),
+        strategy: crate::ec::EcStrategy,
+        original_len: usize,
+    ) -> Result<(), String> {
+        // Need at least `min_fragments_for_read()` healthy sources
+        // (= data shards for EC X+Y) to reconstruct.
+        let need = strategy.min_fragments_for_read();
+        if healthy_peers.len() < need {
+            return Err(format!(
+                "ec repair needs ≥{need} healthy peers, got {}",
+                healthy_peers.len()
+            ));
+        }
+
+        // GET each healthy fragment.
+        let mut responses: Vec<crate::ec::FragmentResponse> =
+            Vec::with_capacity(healthy_peers.len());
+        for (peer_id, fragment_index) in healthy_peers {
+            let Some(peer) = self.by_id.get(peer_id) else {
+                continue;
+            };
+            match peer.get_fragment(chunk_id, *fragment_index).await {
+                Ok(env) => responses.push(crate::ec::FragmentResponse {
+                    fragment_index: *fragment_index,
+                    bytes: env.ciphertext,
+                }),
+                Err(e) => {
+                    tracing::warn!(error=%e, peer_id, "ec repair: source get_fragment failed; trying next");
+                }
+            }
+        }
+        if responses.len() < need {
+            return Err(format!(
+                "ec repair: only {} usable sources after gather, need {need}",
+                responses.len()
+            ));
+        }
+
+        // Decode to the original ciphertext.
+        let plaintext = crate::ec::decode_from_responses(strategy, &responses, original_len)
+            .map_err(|e| format!("ec decode: {e}"))?;
+
+        // Re-encode deterministically. The placement here is
+        // synthetic — we only need the fragment at `missing.1` so
+        // build a 0..total placement list; encode_for_placement
+        // assigns shard `i` to position `i`.
+        let total = strategy.total_fragments();
+        let synthetic_placement: Vec<u64> = (0..total as u64).collect();
+        let routes = crate::ec::encode_for_placement(strategy, &plaintext, &synthetic_placement)
+            .map_err(|e| format!("ec re-encode: {e}"))?;
+        let route = routes
+            .into_iter()
+            .find(|r| r.fragment_index == missing.1)
+            .ok_or_else(|| {
+                format!("ec re-encode: missing index {} not in encoded set", missing.1)
+            })?;
+
+        // PUT the recovered fragment to the destination peer.
+        let dst = self
+            .by_id
+            .get(&missing.0)
+            .ok_or_else(|| format!("ec repair: destination peer {} unknown", missing.0))?;
+        let envelope = kiseki_crypto::envelope::Envelope {
+            chunk_id,
+            ciphertext: route.bytes,
+            auth_tag: [0u8; 16],
+            nonce: [0u8; 12],
+            system_epoch: kiseki_common::tenancy::KeyEpoch(1),
+            tenant_epoch: None,
+            tenant_wrapped_material: None,
+        };
+        dst.put_fragment(chunk_id, missing.1, self.tenant_id, self.pool.clone(), envelope)
+            .await
+            .map_err(|e| format!("ec repair put_fragment: {e}"))?;
         Ok(())
     }
 }
@@ -364,6 +453,183 @@ mod tests {
         assert!(
             *p_dst.present.lock().unwrap(),
             "destination now reports present after the repair",
+        );
+    }
+
+    /// Phase 16e step 2: EC repair. Test peer that participates in
+    /// EC fragment storage — answers `get_fragment(chunk, idx)` with
+    /// the bytes it was given via `put_fragment(chunk, idx, ...)`.
+    /// Distinct from `TestPeer` above which only models index=0.
+    struct EcTestPeer {
+        name: &'static str,
+        // (chunk_id, fragment_index) -> bytes
+        store: Mutex<std::collections::HashMap<(ChunkId, u32), Vec<u8>>>,
+        last_put: Mutex<Option<(ChunkId, u32)>>,
+    }
+    impl EcTestPeer {
+        fn new(name: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                store: Mutex::new(std::collections::HashMap::new()),
+                last_put: Mutex::new(None),
+            })
+        }
+        fn preload(&self, chunk_id: ChunkId, index: u32, bytes: Vec<u8>) {
+            self.store.lock().unwrap().insert((chunk_id, index), bytes);
+        }
+    }
+
+    #[async_trait]
+    impl FabricPeer for EcTestPeer {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn put_fragment(
+            &self,
+            chunk_id: ChunkId,
+            fragment_index: u32,
+            _tenant_id: OrgId,
+            _pool_id: String,
+            envelope: Envelope,
+        ) -> Result<bool, FabricPeerError> {
+            *self.last_put.lock().unwrap() = Some((chunk_id, fragment_index));
+            self.store
+                .lock()
+                .unwrap()
+                .insert((chunk_id, fragment_index), envelope.ciphertext);
+            Ok(true)
+        }
+        async fn get_fragment(
+            &self,
+            chunk_id: ChunkId,
+            fragment_index: u32,
+        ) -> Result<Envelope, FabricPeerError> {
+            let bytes = self
+                .store
+                .lock()
+                .unwrap()
+                .get(&(chunk_id, fragment_index))
+                .cloned()
+                .ok_or(FabricPeerError::NotFound)?;
+            Ok(Envelope {
+                chunk_id,
+                ciphertext: bytes,
+                auth_tag: [0u8; 16],
+                nonce: [0u8; 12],
+                system_epoch: kiseki_common::tenancy::KeyEpoch(1),
+                tenant_epoch: None,
+                tenant_wrapped_material: None,
+            })
+        }
+        async fn delete_fragment(
+            &self,
+            _chunk_id: ChunkId,
+            _fragment_index: u32,
+            _tenant_id: OrgId,
+        ) -> Result<bool, FabricPeerError> {
+            Ok(true)
+        }
+        async fn has_fragment(
+            &self,
+            chunk_id: ChunkId,
+            fragment_index: u32,
+        ) -> Result<bool, FabricPeerError> {
+            Ok(self
+                .store
+                .lock()
+                .unwrap()
+                .contains_key(&(chunk_id, fragment_index)))
+        }
+    }
+
+    /// RED: EC 4+2 repair. 6 peers, peer at index=3 is missing its
+    /// fragment. The repairer gathers ≥4 healthy fragments, decodes
+    /// to the original ciphertext, re-encodes, and writes the
+    /// missing index=3 fragment to peer 4. After repair, peer 4
+    /// holds an index=3 fragment matching what an end-to-end EC
+    /// encode would have produced.
+    #[tokio::test]
+    async fn fabric_repairer_ec_decodes_and_reencodes_missing_fragment() {
+        use crate::ec::{encode_for_placement, EcStrategy};
+
+        // Build the 6 peers, then pre-load 5 of them with the
+        // correct EC 4+2 fragments by encoding a known ciphertext.
+        let strategy = EcStrategy::Ec { data: 4, parity: 2 };
+        let chunk_id = cid(0xEC);
+        let payload: Vec<u8> = (0..512u32)
+            .map(|i| u8::try_from(i & 0xff).unwrap_or(0))
+            .collect();
+        let routes =
+            encode_for_placement(strategy, &payload, &[1, 2, 3, 4, 5, 6]).expect("encode");
+
+        let peers_concrete: Vec<Arc<EcTestPeer>> = (1..=6u8)
+            .map(|i| {
+                EcTestPeer::new(match i {
+                    1 => "p1",
+                    2 => "p2",
+                    3 => "p3",
+                    4 => "p4",
+                    5 => "p5",
+                    6 => "p6",
+                    _ => unreachable!(),
+                })
+            })
+            .collect();
+        // Place every fragment EXCEPT the one for placement[3] (peer 4).
+        for route in &routes {
+            if route.peer_id == 4 {
+                continue; // peer 4 is the missing one
+            }
+            let peer = &peers_concrete[usize::try_from(route.peer_id - 1).unwrap_or(0)];
+            peer.preload(chunk_id, route.fragment_index, route.bytes.clone());
+        }
+        let peers: Vec<Arc<dyn FabricPeer>> = peers_concrete
+            .iter()
+            .map(|p| Arc::clone(p) as _)
+            .collect();
+
+        // Healthy peers: ids 1, 2, 3, 5, 6 — at least 4 of them are
+        // needed for EC decode (data shards = 4).
+        let healthy: Vec<(u64, u32)> = vec![(1, 0), (2, 1), (3, 2), (5, 4), (6, 5)];
+        let missing = (4u64, 3u32);
+
+        let repairer = FabricRepairer::new(&peers, OrgId(uuid::Uuid::nil()), "p".into());
+        repairer
+            .repair_ec(
+                chunk_id,
+                &healthy,
+                missing,
+                strategy,
+                payload.len(),
+            )
+            .await
+            .expect("ec repair");
+
+        // The destination peer (id=4) should now hold a fragment
+        // at index=3 matching the original encoded fragment.
+        let p4 = &peers_concrete[3];
+        let last = *p4.last_put.lock().unwrap();
+        assert_eq!(
+            last,
+            Some((chunk_id, 3)),
+            "peer 4 should have received a put for (chunk, index=3)"
+        );
+        let stored = p4
+            .store
+            .lock()
+            .unwrap()
+            .get(&(chunk_id, 3))
+            .cloned()
+            .expect("fragment stored");
+        let original = routes
+            .iter()
+            .find(|r| r.fragment_index == 3)
+            .map(|r| r.bytes.clone())
+            .unwrap();
+        assert_eq!(
+            stored, original,
+            "repaired fragment must equal the original-encoded fragment at index=3 \
+             (deterministic re-encode)"
         );
     }
 }
