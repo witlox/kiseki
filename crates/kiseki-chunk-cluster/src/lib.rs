@@ -77,9 +77,9 @@ pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use placement::pick_placement;
 pub use scrub::{
     ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, FragmentAvailabilityOracle,
-    OrphanDecision, OrphanDeleter, OrphanScrub, OrphanScrubPolicy, OrphanScrubReport,
-    Repairer, ReplicationDecision, UnderReplicationPolicy, UnderReplicationReport,
-    UnderReplicationScrub, DEFAULT_ORPHAN_TTL,
+    LogChunkOracle, OrphanDecision, OrphanDeleter, OrphanScrub, OrphanScrubPolicy,
+    OrphanScrubReport, Repairer, ReplicationDecision, UnderReplicationPolicy,
+    UnderReplicationReport, UnderReplicationScrub, DEFAULT_ORPHAN_TTL,
 };
 pub use server::{fabric_san_interceptor, ClusterChunkServer};
 

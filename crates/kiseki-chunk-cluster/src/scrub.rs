@@ -25,10 +25,11 @@
 //! scrubs share the same iteration plumbing once the runtime wires
 //! them in.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use kiseki_common::ids::ChunkId;
+use kiseki_common::ids::{ChunkId, OrgId, ShardId};
 
 /// Default TTL — chunks younger than this are kept regardless of
 /// metadata state. Per the plan's Risk #5 the leader-crash-mid-write
@@ -163,6 +164,66 @@ impl OrphanScrub {
             }
         }
         report
+    }
+}
+
+// === Phase 16c step 3: LogOps-backed oracle adapter =======================
+
+/// Adapter that turns an `Arc<dyn LogOps>` into a [`ClusterChunkOracle`].
+/// Production wiring uses this against the per-shard Raft state machine;
+/// tests pass any [`LogOps`] mock that returns the desired
+/// `cluster_chunk_state` rows.
+pub struct LogChunkOracle {
+    log: Arc<dyn kiseki_log::traits::LogOps>,
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    /// Wall-clock at construction.
+    started_at: std::time::Instant,
+}
+
+impl LogChunkOracle {
+    /// Build an oracle scoped to one shard + tenant.
+    #[must_use]
+    pub fn new(
+        log: Arc<dyn kiseki_log::traits::LogOps>,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+    ) -> Self {
+        Self {
+            log,
+            shard_id,
+            tenant_id,
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+#[async_trait]
+impl ClusterChunkOracle for LogChunkOracle {
+    async fn check(&self, chunk_id: ChunkId) -> ChunkScrubInfo {
+        let entry = self
+            .log
+            .cluster_chunk_state_get(self.shard_id, self.tenant_id, chunk_id)
+            .await
+            .ok()
+            .flatten();
+        // Phase 16c step 3 tombstone semantics: a tombstoned entry
+        // counts as "no cluster metadata" — the orphan scrub treats
+        // it as eligible for reclaim.
+        let has_cluster_metadata = entry.as_ref().is_some_and(|e| !e.tombstoned);
+        // Age: for chunks the oracle has metadata for, use the
+        // process-uptime delta as a proxy (the apply-log-index stamp
+        // in `created_ms` is a monotonic counter, not wall-clock,
+        // so we can't subtract it from `now`). For chunks with no
+        // metadata, also use uptime — that gives the orphan scrub
+        // a real bound on "how long has this been waiting?". A
+        // smarter age accounting (per-chunk wall-clock stamping)
+        // is a Phase 16c step 4/5 concern.
+        let age = self.started_at.elapsed();
+        ChunkScrubInfo {
+            age,
+            has_cluster_metadata,
+        }
     }
 }
 
@@ -707,6 +768,176 @@ mod tests {
             report.critical, 1,
             "but flagged as critical because healthy < min_acks"
         );
+    }
+
+    // === Phase 16c step 3: LogOps-backed oracle ==========================
+
+    /// Minimal `LogOps` mock that only answers
+    /// `cluster_chunk_state_get`. Everything else returns
+    /// `Unavailable`. Used to drive the `LogChunkOracle` through
+    /// the orphan scrub.
+    struct FakeLog {
+        responses: std::collections::HashMap<
+            ChunkId,
+            kiseki_log::raft::state_machine::ClusterChunkStateEntry,
+        >,
+    }
+
+    #[async_trait]
+    impl kiseki_log::traits::LogOps for FakeLog {
+        async fn append_delta(
+            &self,
+            _req: kiseki_log::traits::AppendDeltaRequest,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            Err(kiseki_log::error::LogError::Unavailable)
+        }
+        async fn read_deltas(
+            &self,
+            _req: kiseki_log::traits::ReadDeltasRequest,
+        ) -> Result<Vec<kiseki_log::delta::Delta>, kiseki_log::error::LogError> {
+            Err(kiseki_log::error::LogError::Unavailable)
+        }
+        async fn shard_health(
+            &self,
+            shard_id: ShardId,
+        ) -> Result<kiseki_log::shard::ShardInfo, kiseki_log::error::LogError> {
+            Err(kiseki_log::error::LogError::ShardNotFound(shard_id))
+        }
+        async fn set_maintenance(
+            &self,
+            _shard_id: ShardId,
+            _enabled: bool,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            Ok(())
+        }
+        async fn truncate_log(
+            &self,
+            _shard_id: ShardId,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            Ok(kiseki_common::ids::SequenceNumber(0))
+        }
+        async fn compact_shard(
+            &self,
+            _shard_id: ShardId,
+        ) -> Result<u64, kiseki_log::error::LogError> {
+            Ok(0)
+        }
+        fn create_shard(
+            &self,
+            _shard_id: ShardId,
+            _tenant_id: OrgId,
+            _node_id: kiseki_common::ids::NodeId,
+            _config: kiseki_log::shard::ShardConfig,
+        ) {
+        }
+        fn update_shard_range(
+            &self,
+            _shard_id: ShardId,
+            _range_start: [u8; 32],
+            _range_end: [u8; 32],
+        ) {
+        }
+        fn set_shard_state(
+            &self,
+            _shard_id: ShardId,
+            _state: kiseki_log::shard::ShardState,
+        ) {
+        }
+        fn set_shard_config(
+            &self,
+            _shard_id: ShardId,
+            _config: kiseki_log::shard::ShardConfig,
+        ) {
+        }
+        async fn register_consumer(
+            &self,
+            _shard_id: ShardId,
+            _consumer: &str,
+            _position: kiseki_common::ids::SequenceNumber,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            Ok(())
+        }
+        async fn advance_watermark(
+            &self,
+            _shard_id: ShardId,
+            _consumer: &str,
+            _position: kiseki_common::ids::SequenceNumber,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            Ok(())
+        }
+
+        async fn cluster_chunk_state_get(
+            &self,
+            _shard_id: ShardId,
+            _tenant_id: OrgId,
+            chunk_id: ChunkId,
+        ) -> Result<
+            Option<kiseki_log::raft::state_machine::ClusterChunkStateEntry>,
+            kiseki_log::error::LogError,
+        > {
+            Ok(self.responses.get(&chunk_id).cloned())
+        }
+    }
+
+    fn shard() -> ShardId {
+        ShardId(uuid::Uuid::from_u128(1))
+    }
+
+    fn tenant() -> OrgId {
+        OrgId(uuid::Uuid::from_u128(2))
+    }
+
+    /// Phase 16c step 3: a chunk with a live `cluster_chunk_state`
+    /// row reports `has_cluster_metadata = true` to the orphan scrub.
+    #[tokio::test]
+    async fn log_oracle_reports_metadata_for_present_rows() {
+        let entry = kiseki_log::raft::state_machine::ClusterChunkStateEntry {
+            refcount: 1,
+            placement: vec![1, 2, 3],
+            tombstoned: false,
+            created_ms: 0,
+        };
+        let log: Arc<dyn kiseki_log::traits::LogOps> = Arc::new(FakeLog {
+            responses: [(cid(0xC1), entry)].into_iter().collect(),
+        });
+        let oracle = LogChunkOracle::new(log, shard(), tenant());
+        let info = oracle.check(cid(0xC1)).await;
+        assert!(info.has_cluster_metadata, "live row → metadata present");
+    }
+
+    /// Phase 16c step 3: tombstoned rows count as "no metadata" so
+    /// the orphan scrub considers them reclaimable once the TTL
+    /// expires.
+    #[tokio::test]
+    async fn log_oracle_treats_tombstoned_as_no_metadata() {
+        let entry = kiseki_log::raft::state_machine::ClusterChunkStateEntry {
+            refcount: 0,
+            placement: vec![1, 2, 3],
+            tombstoned: true,
+            created_ms: 0,
+        };
+        let log: Arc<dyn kiseki_log::traits::LogOps> = Arc::new(FakeLog {
+            responses: [(cid(0xC2), entry)].into_iter().collect(),
+        });
+        let oracle = LogChunkOracle::new(log, shard(), tenant());
+        let info = oracle.check(cid(0xC2)).await;
+        assert!(
+            !info.has_cluster_metadata,
+            "tombstoned row → no metadata (eligible for orphan scrub once age ≥ TTL)"
+        );
+    }
+
+    /// Phase 16c step 3: chunks with no row at all also report
+    /// `has_cluster_metadata = false` — these are F-D7 orphans
+    /// (leader crashed mid-write).
+    #[tokio::test]
+    async fn log_oracle_treats_missing_row_as_no_metadata() {
+        let log: Arc<dyn kiseki_log::traits::LogOps> = Arc::new(FakeLog {
+            responses: std::collections::HashMap::new(),
+        });
+        let oracle = LogChunkOracle::new(log, shard(), tenant());
+        let info = oracle.check(cid(0xC3)).await;
+        assert!(!info.has_cluster_metadata);
     }
 
     #[tokio::test]

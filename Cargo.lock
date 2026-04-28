@@ -1668,6 +1668,7 @@ dependencies = [
  "kiseki-chunk",
  "kiseki-common",
  "kiseki-crypto",
+ "kiseki-log",
  "kiseki-proto",
  "prometheus",
  "rcgen",

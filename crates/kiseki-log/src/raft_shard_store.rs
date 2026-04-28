@@ -18,6 +18,7 @@ use crate::delta::Delta;
 use crate::error::LogError;
 use crate::raft::OpenRaftLogStore;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
+use crate::raft::state_machine::ClusterChunkStateEntry;
 use crate::traits::{
     AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest,
 };
@@ -213,6 +214,24 @@ impl LogOps for RaftShardStore {
     ) -> Result<bool, LogError> {
         let store = self.get_shard(shard_id)?;
         store.decrement_chunk_refcount(tenant_id, chunk_id).await
+    }
+
+    async fn cluster_chunk_state_get(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        chunk_id: ChunkId,
+    ) -> Result<Option<ClusterChunkStateEntry>, LogError> {
+        let store = self.get_shard(shard_id)?;
+        Ok(store.cluster_chunk_state_get(tenant_id, chunk_id).await)
+    }
+
+    async fn cluster_chunk_state_iter(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Vec<(OrgId, ChunkId, ClusterChunkStateEntry)>, LogError> {
+        let store = self.get_shard(shard_id)?;
+        Ok(store.cluster_chunk_state_iter().await)
     }
 
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {

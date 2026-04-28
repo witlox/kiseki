@@ -7,6 +7,7 @@ use kiseki_common::time::DeltaTimestamp;
 
 use crate::delta::{Delta, OperationType};
 use crate::error::LogError;
+use crate::raft::state_machine::ClusterChunkStateEntry;
 use crate::raft_store::NewChunkMeta;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
 
@@ -189,4 +190,29 @@ pub trait LogOps: Send + Sync {
         consumer: &str,
         position: SequenceNumber,
     ) -> Result<(), LogError>;
+
+    /// Phase 16c step 3: read a single `cluster_chunk_state` row.
+    /// Used by the orphan-fragment scrub (does this chunk have any
+    /// metadata?) and the under-replication scrub (is this entry
+    /// tombstoned? what's its placement?). Default returns `None`
+    /// so in-memory stores stay pass-through.
+    async fn cluster_chunk_state_get(
+        &self,
+        _shard_id: ShardId,
+        _tenant_id: OrgId,
+        _chunk_id: ChunkId,
+    ) -> Result<Option<ClusterChunkStateEntry>, LogError> {
+        Ok(None)
+    }
+
+    /// Phase 16c step 3: iterate every `cluster_chunk_state` row on
+    /// the given shard. Used by the under-replication scrub to walk
+    /// the metadata layer and confirm each row's placement is still
+    /// healthy.
+    async fn cluster_chunk_state_iter(
+        &self,
+        _shard_id: ShardId,
+    ) -> Result<Vec<(OrgId, ChunkId, ClusterChunkStateEntry)>, LogError> {
+        Ok(Vec::new())
+    }
 }

@@ -491,6 +491,35 @@ impl OpenRaftLogStore {
         }
     }
 
+    /// Phase 16c step 3: read a single `cluster_chunk_state` row.
+    pub async fn cluster_chunk_state_get(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        chunk_id: kiseki_common::ids::ChunkId,
+    ) -> Option<crate::raft::state_machine::ClusterChunkStateEntry> {
+        let inner = self.state.lock().await;
+        inner
+            .cluster_chunk_state
+            .get(&(tenant_id, chunk_id))
+            .cloned()
+    }
+
+    /// Phase 16c step 3: iterate every `cluster_chunk_state` row.
+    pub async fn cluster_chunk_state_iter(
+        &self,
+    ) -> Vec<(
+        kiseki_common::ids::OrgId,
+        kiseki_common::ids::ChunkId,
+        crate::raft::state_machine::ClusterChunkStateEntry,
+    )> {
+        let inner = self.state.lock().await;
+        inner
+            .cluster_chunk_state
+            .iter()
+            .map(|((t, c), e)| (*t, *c, e.clone()))
+            .collect()
+    }
+
     /// Read deltas in `[from, to]` inclusive from the shard.
     ///
     /// For inline deltas (`has_inline_data=true`), reconstructs the
