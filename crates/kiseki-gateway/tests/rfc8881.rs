@@ -2352,15 +2352,8 @@ fn s18_22_read_after_lookup_returns_seeded_bytes() {
 /// the SUPPORTED_ATTRS bitmap kiseki returns from GETATTR(SUPPORTED_ATTRS),
 /// so the kernel knows pNFS layouts are negotiable on this filesystem.
 ///
-/// Currently DISABLED at the wire level — `MdsLayoutManager` is now
-/// wired into `NfsContext` (Phase 15c.4) but advertising the bits
-/// makes Linux issue LAYOUTGET and enter a tight retry loop that
-/// OOM-kills the server. The kernel-side validation of the Flex
-/// Files body needs additional wire-correctness work to land cleanly.
-/// Phase 15c.5 follow-up.
-#[ignore = "Phase 15c.5 — kernel LAYOUTGET retry-loop OOM under \
-            current Flex Files body encoding; MdsLayoutManager IS \
-            wired (15c.4), follow-up debugs the kernel-side decode."]
+/// Re-enabled in Phase 15c.5 step 2 after step 1 fixed the LAYOUTGET
+/// `loga_length = u64::MAX` OOM by capping `max_stripes_per_layout`.
 #[test]
 fn s5_8_supported_attrs_includes_fs_layout_types_bit_62() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
@@ -2407,8 +2400,7 @@ fn s5_8_supported_attrs_includes_fs_layout_types_bit_62() {
 /// MUST return at least one supported layout type. Kiseki advertises
 /// LAYOUT4_FLEX_FILES (RFC 8435) via the MDS Layout Manager.
 ///
-/// Same Phase 15c.5 deferral as `s5_8_supported_attrs_…` above.
-#[ignore = "Phase 15c.5 — see s5_8_supported_attrs_includes_fs_layout_types_bit_62"]
+/// Re-enabled in Phase 15c.5 step 2 alongside the SUPPORTED_ATTRS bit.
 #[test]
 fn s5_12_fs_layout_types_returns_flex_files() {
     const LAYOUT4_FLEX_FILES: u32 = 4;

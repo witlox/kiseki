@@ -781,21 +781,20 @@ fn op_getattr<G: GatewayOps>(
             | (1u32 << fattr4::MAXFILESIZE)
             | (1u32 << fattr4::MAXREAD)
             | (1u32 << fattr4::MAXWRITE);
-        // FATTR4_LAYOUT_TYPES (bit 30) and FATTR4_FS_LAYOUT_TYPES
-        // (bit 62) are NOT yet in the supported_attrs set — Phase
-        // 15c.4 partial: MdsLayoutManager is wired into NfsContext
-        // (runtime.rs constructs + threads it through) and op_open
-        // handles CLAIM_FH for pNFS-style fh-based opens. Re-enabling
-        // these bits puts the kernel into a tight retry loop that
-        // OOM-kills node1 — the LAYOUTGET dance is still off the
-        // happy path because kernel-side validation of the Flex
-        // Files body needs additional wire-correctness work
-        // (Phase 15c.5 follow-up). Until that lands, plain NFSv4.1
-        // (no pNFS) is the only path that reads end-to-end.
+        // FATTR4_FS_LAYOUT_TYPES (bit 62 = word1 bit 30) tells Linux
+        // clients pNFS layouts are negotiable on this FS. Without it
+        // the kernel never issues LAYOUTGET — pNFS silently degrades
+        // to plain NFSv4.1 reads. Phase 15c.4 wired MdsLayoutManager
+        // into NfsContext + op_open's CLAIM_FH; Phase 15c.5 step 1
+        // capped LAYOUTGET stripe count at `max_stripes_per_layout`
+        // so a kernel `loga_length = u64::MAX` no longer OOM-kills
+        // the server. With both in place, advertising the bit is
+        // safe.
         let supported_word1 = (1u32 << fattr4::MODE_W1)
             | (1u32 << fattr4::NUMLINKS_W1)
             | (1u32 << fattr4::OWNER_W1)
-            | (1u32 << fattr4::OWNER_GROUP_W1);
+            | (1u32 << fattr4::OWNER_GROUP_W1)
+            | (1u32 << fattr4::FS_LAYOUT_TYPES_W1);
         attr_w.write_u32(2); // bitmap word count
         attr_w.write_u32(supported_word0);
         attr_w.write_u32(supported_word1);
