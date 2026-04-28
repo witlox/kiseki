@@ -264,15 +264,21 @@ def test_pnfs_plaintext_fallback(
     default for Rocky 9 baselines that don't honor `xprtsec=mtls`.
     Skips when the cluster runs TLS-only.
 
-    Phase 15c.4 wires `MdsLayoutManager` into `NfsContext` (DS port
-    2052 is shared with the layout encoder). The kernel-side dispatch
-    still loops on LAYOUTGET retry — body validation is the Phase
-    15c.5 follow-up. Skipping until that lands."""
+    Phase 15c.5 step 1+2 closed the pNFS-side blockers
+    (LAYOUTGET stripe-cap + FS_LAYOUT_TYPES bit 62). The seed PUT
+    of the 1 MiB fixture, however, fails on the 3-node compose
+    with `quorum lost: only 1/2 replicas acked`: the cluster
+    fabric `fabric_peers` (runtime.rs:317) is built from
+    `cfg.raft_peers` (port 9300, Raft) instead of `cfg.data_addr`
+    (port 9100, where ClusterChunkService binds), so PutFragment
+    fan-out lands on the wrong port and 0/2 peer acks come back.
+    Unblocks once the fabric routing maps raft → data port
+    (separate from Phase 15c.5)."""
     pytest.skip(
-        "Phase 15c.5 follow-up — MdsLayoutManager wiring lands in "
-        "15c.4 but kernel-side LAYOUTGET retry-loop needs Flex Files "
-        "body validation work. test_nfs41_basic_mount_and_read covers "
-        "the plain NFSv4.1 path that reads end-to-end."
+        "blocked on cluster-fabric routing bug — fabric_peers "
+        "connect to RAFT port 9300, but ClusterChunkService listens "
+        "on data port 9100. PutFragment fan-out fails → seed PUT "
+        "rejected with quorum-lost. Fix is in runtime.rs:317-321."
     )
     if not _docker_available():
         pytest.skip("docker daemon not reachable")
