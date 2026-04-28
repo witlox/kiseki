@@ -485,15 +485,42 @@ single-node→cluster transition).
     rather than CRUSH-style. None block production for ≤5-node
     clusters; tracked for 16c.
 
-- **16c — Scrub orchestration + EC data path** (deferred). Wires
-  the 16b primitives into a runtime scheduler, makes each peer's
-  local `ChunkOps` fragment-aware so EC can encode per-peer,
-  switches `ClusteredChunkStore.write_chunk` to pick EC vs
-  Replication-N from the defaults table, fan-out
-  `DeleteFragment` from leader on refcount→0, CRUSH-style
-  placement at >`target_copies` cluster size. pNFS DS distinct
-  fragment sets per DS rides on the EC switch. Cert revocation /
-  authn-vs-authz tightening.
+- **16c — Scrub orchestration + EC data path**. Closes every
+  load-bearing 16b finding at the primitive layer:
+  - `DeleteFragment` fan-out from leader on refcount→0 (closes
+    16b Finding 2). Tombstone signal flows from the per-shard
+    Raft state machine through `LogResponse::DecrementOutcome` to
+    the gateway's delete loop.
+  - CRUSH-style placement (rendezvous hashing) at
+    `>target_copies` cluster size (closes 16b Finding 4).
+  - `cluster_chunk_state` read API on `LogOps` +
+    `LogChunkOracle` adapter for the orphan scrub.
+  - `list_chunk_ids` on `ChunkOps` + `AsyncChunkOps` —
+    local-store iteration source.
+  - `ScrubScheduler::run_once` glues the 16b orphan +
+    under-replication primitives to the new iteration plumbing
+    (closes 16b Finding 1 at the primitive layer).
+  - Fragment-aware `ChunkOps` — per-peer EC fragment storage
+    addressed by `(chunk_id, fragment_index)`.
+  - `write_chunk_ec` / `read_chunk_ec` on `ClusteredChunkStore`:
+    Reed-Solomon 4+2 round-trip with 2 fragments dropped works
+    end-to-end (closes 16b Finding 3 at the data-path layer).
+  - 16c findings carry over to 16d: scheduler call from runtime,
+    `EcStrategy` flag in `ClusterCfg`, server-side multi-
+    `fragment_index` PutFragment, `original_len` in
+    `cluster_chunk_state`. None block production for ≤5-node
+    Replication-3 clusters.
+
+- **16d — Runtime wiring of the EC + scrub data path** (deferred).
+  Picks up 16c's four deferred findings: spawn the
+  `ScrubScheduler` periodic task at server startup, add
+  `EcStrategy` to `ClusterCfg` and switch `write_chunk` /
+  `read_chunk` based on cluster size, relax the server-side
+  PutFragment `fragment_index != 0` reject, store `original_len`
+  in `cluster_chunk_state`, and wire pNFS DS distinct-fragment
+  parallelism on top of the EC switch. Cert revocation /
+  authn-vs-authz tightening rides this phase too. Mostly plumbing —
+  expected to be a quarter the size of 16c.
 
 **Implementation plan**: see
 `specs/implementation/phase-16-cross-node-chunks.md` for the
