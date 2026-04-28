@@ -16,6 +16,7 @@ kiseki-chunk = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }
 kiseki-proto = { workspace = true }
+prometheus = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

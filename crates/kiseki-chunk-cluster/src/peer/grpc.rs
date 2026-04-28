@@ -17,7 +17,8 @@
 //! - Do **not** retry `PermissionDenied` — that's the SAN
 //!   interceptor rejecting us; retrying won't help.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use kiseki_common::ids::{ChunkId, OrgId};
@@ -27,6 +28,7 @@ use kiseki_proto::v1::cluster_chunk_service_client::ClusterChunkServiceClient;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
+use crate::metrics::{op as op_label, outcome, FabricMetrics};
 use crate::peer::{FabricPeer, FabricPeerError};
 
 /// Backoff before the single retry attempt.
@@ -37,6 +39,7 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 pub struct GrpcFabricPeer {
     name: String,
     client: ClusterChunkServiceClient<Channel>,
+    metrics: Option<Arc<FabricMetrics>>,
 }
 
 impl GrpcFabricPeer {
@@ -47,6 +50,29 @@ impl GrpcFabricPeer {
         Self {
             name: name.into(),
             client: ClusterChunkServiceClient::new(channel),
+            metrics: None,
+        }
+    }
+
+    /// Attach metrics — every RPC will record an outcome + duration.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<FabricMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn record(&self, op: &str, started: Instant, outcome: &str) {
+        if let Some(m) = self.metrics.as_ref() {
+            m.record_op(op, &self.name, outcome, started.elapsed());
+        }
+    }
+
+    fn outcome_for(err: &FabricPeerError) -> &'static str {
+        match err {
+            FabricPeerError::NotFound => outcome::NOT_FOUND,
+            FabricPeerError::Unavailable(_) => outcome::UNAVAILABLE,
+            FabricPeerError::Rejected(_) => outcome::REJECTED,
+            FabricPeerError::Transport(_) => outcome::TRANSPORT,
         }
     }
 
@@ -171,8 +197,9 @@ impl FabricPeer for GrpcFabricPeer {
         pool_id: String,
         envelope: Envelope,
     ) -> Result<bool, FabricPeerError> {
+        let started = Instant::now();
         let env_proto = Self::rust_envelope_to_proto(&envelope);
-        let resp = with_retry(|| {
+        let result = with_retry(|| {
             let mut client = self.client.clone();
             let req = pb::PutFragmentRequest {
                 chunk_id: Some(pb::ChunkId {
@@ -191,8 +218,18 @@ impl FabricPeer for GrpcFabricPeer {
             async move { client.put_fragment(req).await }
         })
         .await
-        .map_err(|s| status_to_fabric_err(&s))?;
-        Ok(resp.into_inner().stored)
+        .map_err(|s| status_to_fabric_err(&s));
+
+        match result {
+            Ok(resp) => {
+                self.record(op_label::PUT, started, outcome::OK);
+                Ok(resp.into_inner().stored)
+            }
+            Err(e) => {
+                self.record(op_label::PUT, started, Self::outcome_for(&e));
+                Err(e)
+            }
+        }
     }
 
     async fn get_fragment(
@@ -200,7 +237,8 @@ impl FabricPeer for GrpcFabricPeer {
         chunk_id: ChunkId,
         fragment_index: u32,
     ) -> Result<Envelope, FabricPeerError> {
-        let resp = with_retry(|| {
+        let started = Instant::now();
+        let result = with_retry(|| {
             let mut client = self.client.clone();
             let req = pb::GetFragmentRequest {
                 chunk_id: Some(pb::ChunkId {
@@ -211,12 +249,36 @@ impl FabricPeer for GrpcFabricPeer {
             async move { client.get_fragment(req).await }
         })
         .await
-        .map_err(|s| status_to_fabric_err(&s))?;
-        let env = resp
+        .map_err(|s| status_to_fabric_err(&s));
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.record(op_label::GET, started, Self::outcome_for(&e));
+                return Err(e);
+            }
+        };
+        let env = match resp
             .into_inner()
             .envelope
-            .ok_or_else(|| FabricPeerError::Transport("response missing envelope".into()))?;
-        Self::proto_envelope_to_rust(env)
+            .ok_or_else(|| FabricPeerError::Transport("response missing envelope".into()))
+        {
+            Ok(e) => e,
+            Err(e) => {
+                self.record(op_label::GET, started, Self::outcome_for(&e));
+                return Err(e);
+            }
+        };
+        match Self::proto_envelope_to_rust(env) {
+            Ok(env) => {
+                self.record(op_label::GET, started, outcome::OK);
+                Ok(env)
+            }
+            Err(e) => {
+                self.record(op_label::GET, started, Self::outcome_for(&e));
+                Err(e)
+            }
+        }
     }
 
     async fn delete_fragment(
@@ -225,7 +287,8 @@ impl FabricPeer for GrpcFabricPeer {
         fragment_index: u32,
         tenant_id: OrgId,
     ) -> Result<bool, FabricPeerError> {
-        let resp = with_retry(|| {
+        let started = Instant::now();
+        let result = with_retry(|| {
             let mut client = self.client.clone();
             let req = pb::DeleteFragmentRequest {
                 chunk_id: Some(pb::ChunkId {
@@ -239,8 +302,18 @@ impl FabricPeer for GrpcFabricPeer {
             async move { client.delete_fragment(req).await }
         })
         .await
-        .map_err(|s| status_to_fabric_err(&s))?;
-        Ok(resp.into_inner().deleted)
+        .map_err(|s| status_to_fabric_err(&s));
+
+        match result {
+            Ok(resp) => {
+                self.record(op_label::DELETE, started, outcome::OK);
+                Ok(resp.into_inner().deleted)
+            }
+            Err(e) => {
+                self.record(op_label::DELETE, started, Self::outcome_for(&e));
+                Err(e)
+            }
+        }
     }
 
     async fn has_fragment(
@@ -248,7 +321,8 @@ impl FabricPeer for GrpcFabricPeer {
         chunk_id: ChunkId,
         fragment_index: u32,
     ) -> Result<bool, FabricPeerError> {
-        let resp = with_retry(|| {
+        let started = Instant::now();
+        let result = with_retry(|| {
             let mut client = self.client.clone();
             let req = pb::HasFragmentRequest {
                 chunk_id: Some(pb::ChunkId {
@@ -259,8 +333,18 @@ impl FabricPeer for GrpcFabricPeer {
             async move { client.has_fragment(req).await }
         })
         .await
-        .map_err(|s| status_to_fabric_err(&s))?;
-        Ok(resp.into_inner().present)
+        .map_err(|s| status_to_fabric_err(&s));
+
+        match result {
+            Ok(resp) => {
+                self.record(op_label::HAS, started, outcome::OK);
+                Ok(resp.into_inner().present)
+            }
+            Err(e) => {
+                self.record(op_label::HAS, started, Self::outcome_for(&e));
+                Err(e)
+            }
+        }
     }
 }
 

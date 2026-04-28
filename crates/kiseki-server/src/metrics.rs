@@ -62,6 +62,12 @@ pub struct KisekiMetrics {
     pub key_rotation_total: IntCounter,
     /// Crypto-shred count.
     pub crypto_shred_total: IntCounter,
+
+    // --- Cluster fabric (Phase 16a) ---
+    /// Cross-node chunk fabric metrics. Wired into
+    /// `ClusteredChunkStore` and `GrpcFabricPeer` via
+    /// `with_metrics(...)` at runtime construction.
+    pub fabric: std::sync::Arc<kiseki_chunk_cluster::FabricMetrics>,
 }
 
 impl KisekiMetrics {
@@ -196,6 +202,11 @@ impl KisekiMetrics {
             .register(Box::new(crypto_shred_total.clone()))
             .expect("register");
 
+        let fabric = std::sync::Arc::new(
+            kiseki_chunk_cluster::FabricMetrics::register(&registry)
+                .expect("fabric metrics register"),
+        );
+
         Self {
             registry,
             raft_commit_latency,
@@ -212,6 +223,7 @@ impl KisekiMetrics {
             shard_delta_count,
             key_rotation_total,
             crypto_shred_total,
+            fabric,
         }
     }
 

@@ -271,6 +271,10 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let audit_store = kiseki_audit::AuditLog::new();
     tracing::info!(events = audit_store.total_events(), "audit log: in-memory",);
 
+    // Metrics — built early so the cluster-fabric Arc<FabricMetrics>
+    // can be threaded into the per-peer client wrappers below.
+    let metrics = crate::metrics::KisekiMetrics::new();
+
     // Local chunk store: persistent (raw block device) if KISEKI_DATA_DIR
     // set, otherwise in-memory. Wrapped via SyncBridge so it satisfies
     // AsyncChunkOps — the cluster fabric and the gateway both consume the
@@ -317,9 +321,10 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         match build_fabric_channel(peer_addr, cfg.tls.as_ref()) {
             Ok(channel) => {
                 let name = format!("node-{peer_id}");
-                fabric_peers.push(Arc::new(kiseki_chunk_cluster::GrpcFabricPeer::new(
-                    name, channel,
-                )));
+                fabric_peers.push(Arc::new(
+                    kiseki_chunk_cluster::GrpcFabricPeer::new(name, channel)
+                        .with_metrics(Arc::clone(&metrics.fabric)),
+                ));
                 tracing::info!(
                     peer_id, peer_addr, "fabric peer registered for cross-node chunks",
                 );
@@ -345,11 +350,14 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let cluster_cfg =
         kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default");
     let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
-        Arc::new(kiseki_chunk_cluster::ClusteredChunkStore::new(
-            Arc::clone(&local_chunk_store),
-            fabric_peers,
-            cluster_cfg,
-        ));
+        Arc::new(
+            kiseki_chunk_cluster::ClusteredChunkStore::new(
+                Arc::clone(&local_chunk_store),
+                fabric_peers,
+                cluster_cfg,
+            )
+            .with_metrics(Arc::clone(&metrics.fabric)),
+        );
 
     // Raw device discovery (KISEKI_RAW_DEVICES).
     // This is the discovery phase — actual device opening via DeviceBackend
@@ -441,8 +449,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         kiseki_gateway::s3_server::run_s3_server(s3_addr, s3_router, s3_tls).await;
     });
 
-    // Prometheus metrics + admin UI server.
-    let metrics = crate::metrics::KisekiMetrics::new();
+    // Prometheus metrics + admin UI server. The KisekiMetrics
+    // registry was built earlier so the cluster fabric could plug
+    // its FabricMetrics in. Reuse it here.
     let metrics_addr = cfg.metrics_addr;
     // Collect peer metrics addresses for the admin UI aggregator.
     let peer_metrics_addrs: Vec<String> = cfg

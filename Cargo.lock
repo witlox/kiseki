@@ -1669,6 +1669,7 @@ dependencies = [
  "kiseki-common",
  "kiseki-crypto",
  "kiseki-proto",
+ "prometheus",
  "rcgen",
  "thiserror 2.0.18",
  "tokio",

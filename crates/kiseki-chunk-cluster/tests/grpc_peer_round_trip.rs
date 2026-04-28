@@ -12,8 +12,11 @@ use std::time::Duration;
 use kiseki_chunk::pool::{AffinityPool, DeviceClass, DurabilityStrategy};
 use kiseki_chunk::store::ChunkStore;
 use kiseki_chunk::{AsyncChunkOps, SyncBridge};
+use kiseki_chunk_cluster::metrics::{op as op_label, outcome};
 use kiseki_chunk_cluster::peer::FabricPeerError;
-use kiseki_chunk_cluster::{ClusterChunkServer, FabricPeer, GrpcFabricPeer};
+use kiseki_chunk_cluster::{
+    ClusterChunkServer, FabricMetrics, FabricPeer, GrpcFabricPeer,
+};
 use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::envelope::Envelope;
@@ -110,6 +113,64 @@ async fn round_trip_put_get_has_delete() {
         .await
         .expect("delete");
     assert!(deleted, "first delete reports deleted=true");
+}
+
+/// Phase 16a step 11. After a successful put + get the
+/// `FabricMetrics` counters for (op=put|get, peer, outcome=ok) must
+/// each be 1.
+#[tokio::test]
+async fn fabric_metrics_record_per_op_outcomes() {
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(FabricMetrics::register(&registry).expect("register"));
+
+    let (_local, base_peer) = start_server_and_client("p").await;
+    // Re-wrap with metrics. `start_server_and_client` returns
+    // GrpcFabricPeer without metrics; reach into base_peer's channel
+    // is cleaner if we expose it, but for now just rebuild a peer
+    // pointing at the server. We need the addr, so do it directly:
+    drop(base_peer);
+    // Spin a fresh server bound to a known port and connect with
+    // metrics attached.
+    let local = local_bridge("p");
+    let server = ClusterChunkServer::new(Arc::clone(&local), "p");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let stream = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ClusterChunkServiceServer::new(server))
+            .serve_with_incoming(stream)
+            .await
+            .expect("server");
+    });
+    let uri: Uri = format!("http://{addr}").parse().expect("uri");
+    let channel = loop {
+        match Channel::builder(uri.clone()).connect().await {
+            Ok(c) => break c,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    let peer =
+        GrpcFabricPeer::new("metrics-test", channel).with_metrics(Arc::clone(&metrics));
+
+    let env = make_envelope(0x99);
+    let chunk_id = env.chunk_id;
+    let tenant = OrgId(uuid::Uuid::nil());
+    peer.put_fragment(chunk_id, 0, tenant, "p".into(), env)
+        .await
+        .expect("put");
+    peer.get_fragment(chunk_id, 0).await.expect("get");
+
+    let put_ok = metrics
+        .ops_total
+        .with_label_values(&[op_label::PUT, "metrics-test", outcome::OK])
+        .get();
+    let get_ok = metrics
+        .ops_total
+        .with_label_values(&[op_label::GET, "metrics-test", outcome::OK])
+        .get();
+    assert_eq!(put_ok, 1, "PutFragment OK should increment exactly once");
+    assert_eq!(get_ok, 1, "GetFragment OK should increment exactly once");
 }
 
 #[tokio::test]

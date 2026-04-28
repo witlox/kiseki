@@ -58,10 +58,12 @@ use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_crypto::envelope::Envelope;
 
 pub mod auth;
+pub mod metrics;
 pub mod peer;
 pub mod server;
 
 pub use auth::{verify_fabric_san, FabricAuthError};
+pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use server::{fabric_san_interceptor, ClusterChunkServer};
 
@@ -116,6 +118,7 @@ pub struct ClusteredChunkStore {
     local: Arc<dyn AsyncChunkOps>,
     peers: Vec<Arc<dyn FabricPeer>>,
     cfg: ClusterCfg,
+    metrics: Option<Arc<FabricMetrics>>,
 }
 
 impl ClusteredChunkStore {
@@ -126,7 +129,19 @@ impl ClusteredChunkStore {
         peers: Vec<Arc<dyn FabricPeer>>,
         cfg: ClusterCfg,
     ) -> Self {
-        Self { local, peers, cfg }
+        Self {
+            local,
+            peers,
+            cfg,
+            metrics: None,
+        }
+    }
+
+    /// Attach a [`FabricMetrics`] — fabric ops will be recorded.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<FabricMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Total replication factor (1 local + N peers).
@@ -192,6 +207,9 @@ impl AsyncChunkOps for ClusteredChunkStore {
         if acks >= self.quorum_required() {
             Ok(stored)
         } else {
+            if let Some(m) = self.metrics.as_ref() {
+                m.record_quorum_lost();
+            }
             Err(ChunkError::QuorumLost {
                 acks,
                 required: self.quorum_required(),
