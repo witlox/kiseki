@@ -51,9 +51,8 @@ impl ClusterChunkServer {
     /// for plaintext / single-node test setups.
     #[must_use]
     pub fn into_tonic_server(self) -> ClusterChunkServiceServer<Self> {
-        ClusterChunkServiceServer::new(self).max_decoding_message_size(
-            crate::peer::FABRIC_MAX_MESSAGE_BYTES,
-        )
+        ClusterChunkServiceServer::new(self)
+            .max_decoding_message_size(crate::peer::FABRIC_MAX_MESSAGE_BYTES)
     }
 
     /// Wrap into a tonic server with the [`fabric_san_interceptor`]
