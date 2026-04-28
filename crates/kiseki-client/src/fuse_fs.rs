@@ -131,6 +131,19 @@ impl<G: GatewayOps> KisekiFuse<G> {
         }
     }
 
+    /// Test-only accessor — verifies that gateway-touching ops
+    /// (`unlink`, `delete`) actually round-trip through the gateway,
+    /// not just the local inode tables.
+    #[cfg(test)]
+    pub(crate) fn gateway_ref(&self) -> &G {
+        &self.gateway
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rt_handle(&self) -> &tokio::runtime::Handle {
+        &self.rt
+    }
+
     /// Block on an async gateway call. Uses `block_in_place` when on a
     /// tokio multi-thread runtime (tests), or `block_on` when on an OS
     /// thread (FUSE daemon).
@@ -337,12 +350,41 @@ impl<G: GatewayOps> KisekiFuse<G> {
     }
 
     /// Remove a file from a specific parent directory.
+    ///
+    /// Phase 15c.7: bridges the FUSE unlink to `gateway.delete()` so
+    /// the composition is removed from the cluster store, not just
+    /// the local inode table. For File entries we capture the
+    /// `composition_id`, drive `gateway.delete(...)` through the
+    /// runtime, and only on success commit the local removal.
+    /// Symlinks and directories don't carry a `composition_id` (the
+    /// directory tree is local in this FUSE adapter), so they only
+    /// need the local removal.
     pub fn unlink_in(&mut self, parent: Ino, name: &str) -> Result<(), i32> {
         self.require_dir(parent)?;
-        let ino = self
+        let ino = *self
             .children
-            .remove(&(parent, name.to_owned()))
+            .get(&(parent, name.to_owned()))
             .ok_or(libc_enoent())?;
+
+        // Capture the composition_id (if this is a File) before we
+        // touch the gateway — we don't want a half-mutated state if
+        // the gateway delete returns an error.
+        let composition_id = match self.inodes.get(&ino) {
+            Some(InodeEntry::File { composition_id, .. }) => Some(*composition_id),
+            Some(_) => None,
+            None => return Err(libc_enoent()),
+        };
+
+        if let Some(composition_id) = composition_id {
+            self.block_gateway(self.gateway.delete(
+                self.tenant_id,
+                self.namespace_id,
+                composition_id,
+            ))
+            .map_err(|e| gateway_err_to_errno(&e))?;
+        }
+
+        self.children.remove(&(parent, name.to_owned()));
         self.inodes.remove(&ino);
         Ok(())
     }
@@ -642,6 +684,40 @@ mod tests {
 
         fs.unlink("deleteme.txt").unwrap();
         assert_eq!(fs.lookup("deleteme.txt").unwrap_err(), 2);
+    }
+
+    /// Phase 15c.7: `unlink` MUST bridge to `gateway.delete()` so the
+    /// composition is removed from the cluster — not just the local
+    /// inode table. Pre-fix, removing the FUSE entry left the
+    /// composition behind in the gateway (visible via `list`),
+    /// silently leaking storage on every unlink. The test creates a
+    /// file, snapshots the gateway's composition list (1 entry),
+    /// unlinks, and verifies the gateway list is empty.
+    #[test]
+    fn unlink_removes_composition_from_gateway() {
+        let mut fs = setup_fuse();
+        fs.create("removeme.txt", b"payload".to_vec()).unwrap();
+
+        let pre = fs.rt_handle().block_on(async {
+            fs.gateway_ref().list(test_tenant(), test_namespace()).await.unwrap()
+        });
+        assert_eq!(
+            pre.len(),
+            1,
+            "precondition: gateway should hold the just-created composition",
+        );
+
+        fs.unlink("removeme.txt").unwrap();
+
+        let post = fs.rt_handle().block_on(async {
+            fs.gateway_ref().list(test_tenant(), test_namespace()).await.unwrap()
+        });
+        assert!(
+            post.is_empty(),
+            "Phase 15c.7: unlink must call gateway.delete() — \
+             gateway still holds {} composition(s) after unlink",
+            post.len(),
+        );
     }
 
     #[test]

@@ -25,8 +25,9 @@
 //!     `write` path. Multipart support would need the S3 multipart
 //!     XML API on the gateway side (kiseki-gateway has it; this
 //!     client doesn't surface it for FUSE workloads yet).
-//!   * `delete` works (DELETE /<namespace>/<uuid>) but `unlink`
-//!     bridging in `KisekiFuse` is a separate hook (Phase 15c.7).
+//!   * `delete` works (DELETE /<namespace>/<uuid>); `unlink`
+//!     bridges to it in `KisekiFuse::unlink_in` so a FUSE rm(1)
+//!     deletes the cluster-side composition (Phase 15c.7 closed).
 //!   * Encryption keys live SERVER-SIDE: the gateway encrypts with
 //!     the namespace's key before chunk store writes, so the FUSE
 //!     client sends plaintext. If the deployment requires E2EE the
