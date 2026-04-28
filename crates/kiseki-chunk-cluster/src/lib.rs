@@ -569,6 +569,38 @@ impl AsyncChunkOps for ClusteredChunkStore {
             Err(other) => return Err(other),
         }
 
+        // Phase 16d step 5: dispatch on cfg.ec_strategy. Replication
+        // path keeps the existing first-success peer ladder; EC
+        // path fetches ≥X fragments + decodes via read_chunk_ec.
+        // Symmetry with the write_chunk dispatch added in step 1.
+        if let crate::ec::EcStrategy::Ec { data, parity } = self.cfg.ec_strategy {
+            let total = usize::from(data) + usize::from(parity);
+            let placement = if self.cfg.cluster_nodes.is_empty() {
+                self.peers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let n = p.name();
+                        n.strip_prefix("node-")
+                            .or_else(|| n.strip_prefix('p'))
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or((i + 1) as u64)
+                    })
+                    .take(total)
+                    .collect::<Vec<_>>()
+            } else {
+                crate::placement::pick_placement(chunk_id, &self.cfg.cluster_nodes, total)
+            };
+            // original_len is read from cluster_chunk_state at the
+            // gateway boundary (16d step 3) and could be threaded
+            // through here; for now the read_chunk_ec heuristic
+            // path covers high-entropy ciphertext correctly. Wiring
+            // a LogOps lookup at this seam is a 16e refinement.
+            return self
+                .read_chunk_ec(chunk_id, &placement, self.cfg.ec_strategy, None)
+                .await;
+        }
+
         // Fabric fallback. Replication-N: any 1 fragment_index=0 is
         // sufficient. Walk peers in order; first success wins.
         for peer in &self.peers {
@@ -1137,6 +1169,72 @@ mod tests {
             .sum();
         assert_eq!(store_total, 1, "exactly one peer holds index=0");
         assert_eq!(frag_total, 5, "the other five hold index 1..5");
+    }
+
+    /// RED: when `cfg.ec_strategy == Ec` and the local read misses,
+    /// `read_chunk` (the trait surface) dispatches into the EC fabric
+    /// fetch + decode path instead of the Replication-N first-success
+    /// peer ladder. With 4 of 6 fragments present the read succeeds.
+    #[tokio::test]
+    async fn read_chunk_dispatches_to_ec_when_strategy_is_ec_on_local_miss() {
+        // Pre-load 6 peers via write_chunk_ec, then build a fresh
+        // ClusteredChunkStore with NO local data and the EC strategy
+        // set — so read_chunk has to take the EC fabric path.
+        let writer_local = local_bridge("p");
+        let p1 = MockPeer::new("p1");
+        let p2 = MockPeer::new("p2");
+        let p3 = MockPeer::new("p3");
+        let p4 = MockPeer::new("p4");
+        let p5 = MockPeer::new("p5");
+        let p6 = MockPeer::new("p6");
+        let writer_peers: Vec<Arc<dyn FabricPeer>> = vec![
+            Arc::clone(&p1) as _,
+            Arc::clone(&p2) as _,
+            Arc::clone(&p3) as _,
+            Arc::clone(&p4) as _,
+            Arc::clone(&p5) as _,
+            Arc::clone(&p6) as _,
+        ];
+        let cfg = ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p")
+            .with_ec_strategy(crate::ec::EcStrategy::Ec { data: 4, parity: 2 })
+            .with_cluster_nodes(vec![1, 2, 3, 4, 5, 6]);
+
+        // Use a non-uniform payload so EC parity isn't all-zeros.
+        let payload: Vec<u8> = (0..256u32)
+            .map(|i| u8::try_from(i & 0xff).unwrap_or(0))
+            .collect();
+        let env = Envelope {
+            chunk_id: ChunkId([0xF7; 32]),
+            ciphertext: payload.clone(),
+            auth_tag: [0u8; 16],
+            nonce: [0u8; 12],
+            system_epoch: kiseki_common::tenancy::KeyEpoch(1),
+            tenant_epoch: None,
+            tenant_wrapped_material: None,
+        };
+        let chunk_id = env.chunk_id;
+        let writer = ClusteredChunkStore::new(writer_local, writer_peers, cfg.clone());
+        writer.write_chunk(env, "p").await.expect("ec write");
+
+        // Reader has no local data — EC fabric fetch is the only path.
+        let reader_local = local_bridge("p");
+        let reader_peers: Vec<Arc<dyn FabricPeer>> = vec![
+            Arc::clone(&p1) as _,
+            Arc::clone(&p2) as _,
+            Arc::clone(&p3) as _,
+            Arc::clone(&p4) as _,
+            Arc::clone(&p5) as _,
+            Arc::clone(&p6) as _,
+        ];
+        let reader = ClusteredChunkStore::new(reader_local, reader_peers, cfg);
+        let recovered = reader
+            .read_chunk(&chunk_id)
+            .await
+            .expect("ec read via dispatch");
+        assert_eq!(
+            recovered.ciphertext, payload,
+            "EC dispatch read must reconstruct the exact original payload",
+        );
     }
 
     /// RED: with `EcStrategy::Replication`, the trait-level

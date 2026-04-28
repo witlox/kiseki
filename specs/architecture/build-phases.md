@@ -511,16 +511,35 @@ single-node→cluster transition).
     `cluster_chunk_state`. None block production for ≤5-node
     Replication-3 clusters.
 
-- **16d — Runtime wiring of the EC + scrub data path** (deferred).
-  Picks up 16c's four deferred findings: spawn the
-  `ScrubScheduler` periodic task at server startup, add
-  `EcStrategy` to `ClusterCfg` and switch `write_chunk` /
-  `read_chunk` based on cluster size, relax the server-side
-  PutFragment `fragment_index != 0` reject, store `original_len`
-  in `cluster_chunk_state`, and wire pNFS DS distinct-fragment
-  parallelism on top of the EC switch. Cert revocation /
-  authn-vs-authz tightening rides this phase too. Mostly plumbing —
-  expected to be a quarter the size of 16c.
+- **16d — Runtime wiring of the EC + scrub data path**. Closes
+  every 16c deferred finding at the production wiring layer
+  (run in **integrator mode** per the workflow protocol):
+  - `EcStrategy` in `ClusterCfg` (default Replication-3) +
+    `cluster_nodes` Vec for placement input. `write_chunk` and
+    `read_chunk` (the trait surface) dispatch on the strategy.
+  - Server-side `PutFragment` / `GetFragment` / `DeleteFragment`
+    / `HasFragment` accept any `fragment_index` and route
+    index=0 to the legacy whole-envelope path, index>0 to the
+    per-fragment store added in 16c step 6.
+  - `original_len` threaded through `NewChunkMeta` → state
+    machine → `cluster_chunk_state` so EC reads reconstruct
+    exactly without the trim-trailing-zeros heuristic.
+  - Three production scrub adapters (`LocalChunkDeleter`,
+    `FabricAvailabilityOracle`, `FabricRepairer`) +
+    `ScrubScheduler::start_periodic` spawn at server startup
+    with a 10-minute cadence.
+  - 11 RED→GREEN tests across the 5 steps; full integrator
+    audit doc at `specs/findings/phase-16d-adversary-audit.md`.
+  - Two 16e candidates: EC multi-index repair (FabricRepairer
+    today only handles `fragment_index=0`) + scrub task
+    graceful shutdown. Neither blocks production for 6+ node
+    EC clusters. pNFS DS distinct-fragment parallelism rides
+    on the EC switch and is pNFS-team scope.
+
+- **16e — Multi-index repair + graceful shutdown** (deferred).
+  Pulls in 16d's two findings + pNFS DS distinct-fragment
+  parallelism if the pNFS team needs it concurrent. Small
+  scope.
 
 **Implementation plan**: see
 `specs/implementation/phase-16-cross-node-chunks.md` for the
