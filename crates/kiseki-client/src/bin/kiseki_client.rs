@@ -199,7 +199,7 @@ fn handle_mount(args: &[String]) {
         );
         let gw = kiseki_gateway::InMemoryGateway::new(
             compositions,
-            Box::new(kiseki_chunk::store::ChunkStore::new()),
+            kiseki_chunk::arc_async(kiseki_chunk::store::ChunkStore::new()),
             master_key,
         );
         let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
