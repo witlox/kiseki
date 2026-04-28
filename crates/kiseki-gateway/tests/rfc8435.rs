@@ -381,6 +381,7 @@ fn s5_3_stateid4_is_exactly_16_bytes() {
             layout_ttl_ms: 300_000,
             max_entries: 100,
             storage_ds_addrs: vec!["10.0.0.11:2052".into()],
+            max_stripes_per_layout: 64,
         },
     );
     let layout = mgr.layout_get(
@@ -536,6 +537,7 @@ fn layoutget_then_getdeviceinfo_round_trip() {
             layout_ttl_ms: 300_000,
             max_entries: 100,
             storage_ds_addrs: vec!["10.0.0.11:2052".into()],
+            max_stripes_per_layout: 64,
         },
     );
 

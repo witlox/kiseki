@@ -712,6 +712,7 @@ fn ensure_mds_mgr(world: &mut KisekiWorld) -> Arc<MdsLayoutManager> {
             "10.0.0.11:2052".into(),
             "10.0.0.12:2052".into(),
         ],
+        max_stripes_per_layout: 64,
     };
     let mgr = Arc::new(MdsLayoutManager::new(key, cfg));
     world.pnfs_mds_mgr = Some(Arc::clone(&mgr));
@@ -878,6 +879,7 @@ async fn given_layout_ttl_ms(world: &mut KisekiWorld, ms: u64) {
         layout_ttl_ms: ms,
         max_entries: 100,
         storage_ds_addrs: vec!["n1:2052".into()],
+        max_stripes_per_layout: 64,
     };
     world.pnfs_mds_mgr = Some(Arc::new(MdsLayoutManager::new(key, cfg)));
 }
@@ -932,6 +934,7 @@ async fn given_max_entries(world: &mut KisekiWorld, n: u32) {
         layout_ttl_ms: 300_000,
         max_entries: n as usize,
         storage_ds_addrs: vec!["n1:2052".into()],
+        max_stripes_per_layout: 64,
     };
     world.pnfs_mds_mgr = Some(Arc::new(MdsLayoutManager::new(key, cfg)));
 }
@@ -1432,6 +1435,7 @@ async fn given_layout_with_ttl(world: &mut KisekiWorld) {
         layout_ttl_ms: 2_000,
         max_entries: 10,
         storage_ds_addrs: vec!["n1:2052".into()],
+        max_stripes_per_layout: 64,
     };
     let mgr = Arc::new(MdsLayoutManager::new(key, cfg));
     let comp = CompositionId(uuid::Uuid::from_u128(0x5_0000));

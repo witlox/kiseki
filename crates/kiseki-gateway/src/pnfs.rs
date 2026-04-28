@@ -470,6 +470,25 @@ pub struct MdsLayoutConfig {
     pub max_entries: usize,
     /// Storage node DS addresses (`host:port` strings).
     pub storage_ds_addrs: Vec<String>,
+    /// Phase 15c.5 step 1: hard cap on the number of stripes
+    /// emitted from a single LAYOUTGET. Linux kernel sends
+    /// `loga_length = u64::MAX` to mean "rest of the file" (RFC
+    /// 5661 §18.43.1); without a cap that produces `u64::MAX` /
+    /// `stripe_size` ≈ 281e12 stripes and OOM-kills the server. The
+    /// kernel re-issues LAYOUTGET if it reads past the covered
+    /// range, so a finite cap is correct — it just bounds per-call
+    /// work and total memory.
+    ///
+    /// Default derivation: Linux NFS readahead is typically
+    /// 16-128 MiB (rsize × `max_readahead`). At the 1 MiB
+    /// `stripe_size_bytes` default that's 16-128 stripes per
+    /// readahead window. We pick **64 stripes (= 64 MiB extent)**:
+    /// roughly 4× the small-rsize readahead, which means a
+    /// sequential reader's LAYOUTGETs amortize to ~1 per 64 MiB
+    /// — small overhead — while keeping per-call cost predictable.
+    /// Memory bound at the I-PN8 100k-entry cache cap:
+    /// `100_000 × 64 × ~200 bytes/stripe ≈ 1.3 GiB` worst case.
+    pub max_stripes_per_layout: usize,
 }
 
 impl Default for MdsLayoutConfig {
@@ -479,6 +498,7 @@ impl Default for MdsLayoutConfig {
             layout_ttl_ms: 300_000,
             max_entries: 100_000,
             storage_ds_addrs: Vec::new(),
+            max_stripes_per_layout: 64,
         }
     }
 }
@@ -574,13 +594,25 @@ impl MdsLayoutManager {
         };
         let num_nodes = nodes.len();
 
+        // Phase 15c.5 step 1: bound the layout extent. Compute end
+        // without overflowing into the u64::MAX trap; cap at
+        // `offset + max_stripes_per_layout * stripe_size`. The
+        // kernel re-issues LAYOUTGET if its read crosses the
+        // covered range, so finite coverage is correct — it just
+        // bounds per-call work. Pre-fix the loop iterated u64::MAX
+        // / stripe_size ≈ 281e12 times for the kernel's "rest of
+        // file" sentinel (loga_length = u64::MAX).
+        let max_extent = (self.config.max_stripes_per_layout as u64).saturating_mul(stripe_size);
+        let bounded_length = length.min(max_extent);
+        let raw_end = offset.saturating_add(bounded_length);
+        let end = raw_end.max(offset.saturating_add(stripe_size)); // ≥ 1 stripe
+
         let mut stripes = Vec::new();
         let mut pos = offset;
-        let end = offset.saturating_add(length).max(stripe_size); // at least 1 stripe
         let expiry_ms = now_ms.saturating_add(self.config.layout_ttl_ms);
 
         let key = self.current_mac_key();
-        while pos < end {
+        while pos < end && stripes.len() < self.config.max_stripes_per_layout {
             let seg_len = stripe_size.min(end.saturating_sub(pos));
             let stripe_index_u64 = pos / stripe_size;
             let node_idx = usize::try_from(stripe_index_u64).unwrap_or(usize::MAX) % num_nodes;
@@ -848,6 +880,7 @@ mod mds_layout_tests {
             layout_ttl_ms: 300_000,
             max_entries: 100,
             storage_ds_addrs: nodes.into_iter().map(String::from).collect(),
+            max_stripes_per_layout: 64,
         }
     }
 
@@ -978,6 +1011,80 @@ mod mds_layout_tests {
         let evicted = mgr.sweep_expired(1250);
         assert_eq!(evicted, 5);
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    /// Phase 15c.5 step 1: when the kernel sends
+    /// `loga_length = u64::MAX` (RFC 5661 §18.43.1 "rest of file"
+    /// sentinel), the MDS must NOT generate trillions of stripes.
+    /// Pre-fix: the `while pos < end` loop iterated `u64::MAX`
+    /// over `stripe_size` = ~281e12 times, OOM-killing the server
+    /// — that's the documented Phase 15c.5 deferral. Post-fix:
+    /// stripe count is bounded by a sane cap.
+    #[test]
+    fn layout_get_with_u64_max_length_does_not_oom() {
+        let mgr = MdsLayoutManager::new(
+            fixed_key(),
+            cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
+        );
+        let layout = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(0xEF),
+            0,
+            u64::MAX, // ← the kernel "to EOF" sentinel
+            LayoutIoMode::Read,
+            1000,
+        );
+        // The contract: "much less than u64::MAX / stripe_size".
+        // `cfg_with_nodes` sets max_stripes_per_layout = 64 (matches
+        // the production default derivation: 4× small-rsize Linux
+        // readahead at 1 MiB stripes). Assert against that explicit
+        // cap so the test pins the contract, not just "anything
+        // bounded".
+        assert!(
+            layout.stripes.len() <= 64,
+            "u64::MAX length must respect max_stripes_per_layout=64; \
+             got {}",
+            layout.stripes.len()
+        );
+        assert!(
+            !layout.stripes.is_empty(),
+            "must produce at least one stripe so the kernel can \
+             actually read"
+        );
+        // First stripe starts at the requested offset.
+        assert_eq!(layout.stripes[0].offset, 0);
+    }
+
+    /// Phase 15c.5 step 1: with a non-zero offset + `u64::MAX`
+    /// length the layout still covers a non-empty range starting
+    /// at `offset`. Pre-fix this returned an empty stripe list
+    /// (because `end = offset.saturating_add(u64::MAX) = u64::MAX`
+    /// AND `pos = offset` already, but the loop generated the
+    /// stripes correctly — actually the bug was the opposite: it
+    /// looped `u64::MAX` times). Either way, post-fix the layout
+    /// is non-empty and starts at the requested offset.
+    #[test]
+    fn layout_get_with_nonzero_offset_and_u64_max_length_starts_at_offset() {
+        let mgr = MdsLayoutManager::new(
+            fixed_key(),
+            cfg_with_nodes(vec!["n1:2052"]),
+        );
+        let layout = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(0xF0),
+            8 * 1_048_576, // 8 MiB offset
+            u64::MAX,
+            LayoutIoMode::Read,
+            1000,
+        );
+        assert!(
+            !layout.stripes.is_empty(),
+            "non-zero offset + u64::MAX length must produce a usable layout"
+        );
+        assert_eq!(layout.stripes[0].offset, 8 * 1_048_576);
+        assert!(layout.stripes.len() <= 64);
     }
 
     #[test]

@@ -695,6 +695,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             layout_ttl_ms: cfg.pnfs.layout_ttl_seconds.saturating_mul(1000),
             max_entries: cfg.pnfs.layout_cache_max_entries,
             storage_ds_addrs,
+            max_stripes_per_layout: cfg.pnfs.max_stripes_per_layout,
         };
         Some(Arc::new(kiseki_gateway::pnfs::MdsLayoutManager::new(
             mac_key, mgr_cfg,

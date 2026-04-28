@@ -72,6 +72,13 @@ pub struct PnfsSettings {
     /// Sweep interval for the layout cache (I-PN8). Defaults to
     /// `layout_ttl_seconds / 4`.
     pub layout_cache_sweep_interval_seconds: u64,
+    /// Phase 15c.5 step 1: cap on stripes emitted per LAYOUTGET.
+    /// Linux kernel sends `loga_length = u64::MAX` (RFC 5661
+    /// §18.43.1 "rest of file" sentinel); without a cap the server
+    /// OOMs trying to emit ~281e12 stripes. Default 64 (= 64 MiB
+    /// extent at 1 MiB stripes), roughly 4× small-rsize Linux NFS
+    /// readahead.
+    pub max_stripes_per_layout: usize,
 }
 
 impl Default for PnfsSettings {
@@ -81,6 +88,7 @@ impl Default for PnfsSettings {
             layout_ttl_seconds: 300,
             layout_cache_max_entries: 100_000,
             layout_cache_sweep_interval_seconds: 75,
+            max_stripes_per_layout: 64,
         }
     }
 }
