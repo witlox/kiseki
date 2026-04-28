@@ -14,6 +14,11 @@ pub enum LogResponse {
     Appended(u64),
     /// Command completed.
     Ok,
+    /// Phase 16c: a `DecrementChunkRefcount` apply observed a refcount
+    /// transition. `true` = the entry just tombstoned (refcount hit 0)
+    /// and the leader should fan `DeleteFragment` out to the placement
+    /// list. `false` = decremented but refcount > 0.
+    DecrementOutcome(bool),
 }
 
 impl std::fmt::Display for LogResponse {
@@ -21,6 +26,7 @@ impl std::fmt::Display for LogResponse {
         match self {
             Self::Appended(seq) => write!(f, "Appended({seq})"),
             Self::Ok => write!(f, "Ok"),
+            Self::DecrementOutcome(tomb) => write!(f, "DecrementOutcome({tomb})"),
         }
     }
 }

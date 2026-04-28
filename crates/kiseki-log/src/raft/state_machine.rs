@@ -379,13 +379,16 @@ impl ShardSmInner {
             } => {
                 let tenant = OrgId(uuid::Uuid::from_bytes(*tenant_id_bytes));
                 let key = (tenant, ChunkId(*chunk_id));
+                let mut tombstoned_now = false;
                 if let Some(entry) = self.cluster_chunk_state.get_mut(&key) {
+                    let was_tombstoned = entry.tombstoned;
                     entry.refcount = entry.refcount.saturating_sub(1);
-                    if entry.refcount == 0 {
+                    if entry.refcount == 0 && !was_tombstoned {
                         entry.tombstoned = true;
+                        tombstoned_now = true;
                     }
                 }
-                LogResponse::Ok
+                LogResponse::DecrementOutcome(tombstoned_now)
             }
             LogCommand::SetMaintenance { enabled } => {
                 self.maintenance = *enabled;

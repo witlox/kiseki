@@ -63,6 +63,20 @@ pub trait AsyncChunkOps: Send + Sync {
 
     /// Get the refcount for a chunk.
     async fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
+
+    /// Phase 16c step 1: fan a `DeleteFragment` out to every cluster
+    /// peer that holds a copy of `chunk_id`. Default no-op so the
+    /// in-memory + persistent stores (which know about no peers) stay
+    /// untouched. The cluster-fabric impl
+    /// (`kiseki_chunk_cluster::ClusteredChunkStore`) overrides this to
+    /// call `peer.delete_fragment` on every configured peer.
+    async fn delete_distributed(
+        &self,
+        _chunk_id: &ChunkId,
+        _tenant_id: kiseki_common::ids::OrgId,
+    ) -> Result<(), ChunkError> {
+        Ok(())
+    }
 }
 
 /// Adapter that exposes any sync [`ChunkOps`] as [`AsyncChunkOps`]

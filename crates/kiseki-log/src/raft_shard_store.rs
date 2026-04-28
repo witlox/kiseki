@@ -210,7 +210,7 @@ impl LogOps for RaftShardStore {
         shard_id: ShardId,
         tenant_id: OrgId,
         chunk_id: ChunkId,
-    ) -> Result<(), LogError> {
+    ) -> Result<bool, LogError> {
         let store = self.get_shard(shard_id)?;
         store.decrement_chunk_refcount(tenant_id, chunk_id).await
     }

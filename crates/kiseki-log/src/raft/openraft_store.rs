@@ -350,7 +350,7 @@ impl OpenRaftLogStore {
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
-            LogResponse::Ok => Err(LogError::Unavailable),
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
         }
     }
 
@@ -399,7 +399,7 @@ impl OpenRaftLogStore {
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
-            LogResponse::Ok => Err(LogError::Unavailable),
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
         }
     }
 
@@ -443,7 +443,7 @@ impl OpenRaftLogStore {
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
-            LogResponse::Ok => Err(LogError::Unavailable),
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
         }
     }
 
@@ -465,20 +465,30 @@ impl OpenRaftLogStore {
     }
 
     /// Decrement a chunk's `cluster_chunk_state` refcount (Phase 16b).
+    /// Phase 16c: returns `true` iff this apply transitioned the entry
+    /// to tombstoned (refcount hit 0); the leader uses that signal to
+    /// fan `DeleteFragment` out to the placement list.
     pub async fn decrement_chunk_refcount(
         &self,
         tenant_id: kiseki_common::ids::OrgId,
         chunk_id: kiseki_common::ids::ChunkId,
-    ) -> Result<(), LogError> {
+    ) -> Result<bool, LogError> {
         let cmd = LogCommand::DecrementChunkRefcount {
             tenant_id_bytes: *tenant_id.0.as_bytes(),
             chunk_id: chunk_id.0,
         };
-        self.raft
+        let resp = self
+            .raft
             .client_write(cmd)
             .await
             .map_err(|_| LogError::Unavailable)?;
-        Ok(())
+        match resp.response() {
+            LogResponse::DecrementOutcome(tomb) => Ok(*tomb),
+            // Older path / unrelated responses: treat as not-tombstoned;
+            // the worst that can happen is a missed fan-out, which the
+            // under-replication scrub eventually catches.
+            _ => Ok(false),
+        }
     }
 
     /// Read deltas in `[from, to]` inclusive from the shard.

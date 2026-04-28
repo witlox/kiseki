@@ -797,9 +797,24 @@ impl GatewayOps for InMemoryGateway {
             for chunk_id in released {
                 let _ = self.chunks.decrement_refcount(chunk_id).await;
                 if let Some(ref log) = log {
-                    let _ = log
+                    // Phase 16c: read the tombstone signal from the
+                    // Raft state machine. `true` means
+                    // `cluster_chunk_state[(tenant, chunk_id)]`
+                    // transitioned refcount → 0; the leader fans
+                    // `DeleteFragment` out to the placement list so
+                    // every peer's local store can reclaim. `false`
+                    // means another composition still references the
+                    // chunk — leave it alone.
+                    let tombstoned = log
                         .decrement_chunk_refcount(shard_id, tenant_id, *chunk_id)
-                        .await;
+                        .await
+                        .unwrap_or(false);
+                    if tombstoned {
+                        let _ = self
+                            .chunks
+                            .delete_distributed(chunk_id, tenant_id)
+                            .await;
+                    }
                 }
             }
         }

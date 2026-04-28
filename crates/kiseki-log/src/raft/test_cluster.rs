@@ -399,7 +399,7 @@ impl RaftTestCluster {
 
         match resp.data {
             LogResponse::Appended(seq) => Ok(SequenceNumber(seq)),
-            LogResponse::Ok => Ok(SequenceNumber(0)),
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Ok(SequenceNumber(0)),
         }
     }
 

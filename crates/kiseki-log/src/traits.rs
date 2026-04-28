@@ -109,15 +109,16 @@ pub trait LogOps: Send + Sync {
     /// Decrement a chunk's `cluster_chunk_state` refcount — Phase 16b.
     /// On reaching zero the entry is tombstoned and the leader is
     /// expected to fan `DeleteFragment` out to its placement list.
-    /// No-op default; production override proposes
-    /// `DecrementChunkRefcount`.
+    /// Phase 16c returns `true` iff this call transitioned the entry
+    /// to tombstoned; default `Ok(false)` keeps existing in-memory
+    /// implementations side-effect-free.
     async fn decrement_chunk_refcount(
         &self,
         _shard_id: ShardId,
         _tenant_id: OrgId,
         _chunk_id: ChunkId,
-    ) -> Result<(), LogError> {
-        Ok(())
+    ) -> Result<bool, LogError> {
+        Ok(false)
     }
 
     /// Read deltas in `[from, to]` inclusive from a shard.

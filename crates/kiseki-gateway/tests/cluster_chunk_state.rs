@@ -11,11 +11,13 @@
 use std::sync::{Arc, Mutex};
 
 use kiseki_chunk::store::ChunkStore;
+use kiseki_chunk::{AsyncChunkOps, ChunkError};
 use kiseki_common::ids::{ChunkId, NamespaceId, NodeId, OrgId, SequenceNumber, ShardId};
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_composition::composition::CompositionStore;
 use kiseki_composition::namespace::Namespace;
 use kiseki_crypto::keys::SystemMasterKey;
+use kiseki_crypto::envelope::Envelope;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
 use kiseki_gateway::ops::GatewayOps;
 use kiseki_log::error::LogError;
@@ -44,6 +46,9 @@ struct RecordingLog {
     chunk_and_delta_calls: Mutex<Vec<AppendChunkAndDeltaRequest>>,
     decrement_calls: Mutex<Vec<(ShardId, OrgId, ChunkId)>>,
     increment_calls: Mutex<Vec<(ShardId, OrgId, ChunkId)>>,
+    /// Phase 16c: what the mock decrement should report. Tests that
+    /// want to exercise the fan-out branch set this to `true`.
+    tombstone_response: Mutex<bool>,
 }
 
 #[async_trait::async_trait]
@@ -82,12 +87,15 @@ impl LogOps for RecordingLog {
         shard_id: ShardId,
         tenant_id: OrgId,
         chunk_id: ChunkId,
-    ) -> Result<(), LogError> {
+    ) -> Result<bool, LogError> {
         self.decrement_calls
             .lock()
             .unwrap()
             .push((shard_id, tenant_id, chunk_id));
-        Ok(())
+        // Test default: no tombstone. Specific tests override via a
+        // separate field (see tombstone_responder below) when they
+        // want the gateway to take the fan-out branch.
+        Ok(*self.tombstone_response.lock().unwrap())
     }
 
     async fn read_deltas(
@@ -382,4 +390,157 @@ async fn composition_delete_emits_decrement_for_each_chunk() {
     assert_eq!(shard, test_shard(), "shard id matches the composition");
     assert_eq!(tenant, test_tenant(), "tenant id matches");
     assert_eq!(cid.0, chunk_id, "decrement targets the right chunk");
+}
+
+// === Phase 16c step 1: DeleteFragment fan-out on tombstone ===============
+
+/// `AsyncChunkOps` wrapper that records `delete_distributed` calls so
+/// the gateway test can assert the tombstone branch was taken.
+struct RecordingChunks {
+    inner: Arc<dyn AsyncChunkOps>,
+    fanout_calls: Mutex<Vec<(ChunkId, OrgId)>>,
+}
+
+impl RecordingChunks {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: kiseki_chunk::arc_async(ChunkStore::new()),
+            fanout_calls: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncChunkOps for RecordingChunks {
+    async fn write_chunk(&self, env: Envelope, pool: &str) -> Result<bool, ChunkError> {
+        self.inner.write_chunk(env, pool).await
+    }
+    async fn read_chunk(&self, id: &ChunkId) -> Result<Envelope, ChunkError> {
+        self.inner.read_chunk(id).await
+    }
+    async fn increment_refcount(&self, id: &ChunkId) -> Result<u64, ChunkError> {
+        self.inner.increment_refcount(id).await
+    }
+    async fn decrement_refcount(&self, id: &ChunkId) -> Result<u64, ChunkError> {
+        self.inner.decrement_refcount(id).await
+    }
+    async fn set_retention_hold(
+        &self,
+        id: &ChunkId,
+        hold: &str,
+    ) -> Result<(), ChunkError> {
+        self.inner.set_retention_hold(id, hold).await
+    }
+    async fn release_retention_hold(
+        &self,
+        id: &ChunkId,
+        hold: &str,
+    ) -> Result<(), ChunkError> {
+        self.inner.release_retention_hold(id, hold).await
+    }
+    async fn gc(&self) -> u64 {
+        self.inner.gc().await
+    }
+    async fn refcount(&self, id: &ChunkId) -> Result<u64, ChunkError> {
+        self.inner.refcount(id).await
+    }
+    async fn delete_distributed(
+        &self,
+        chunk_id: &ChunkId,
+        tenant_id: OrgId,
+    ) -> Result<(), ChunkError> {
+        self.fanout_calls.lock().unwrap().push((*chunk_id, tenant_id));
+        Ok(())
+    }
+}
+
+fn setup_with_chunks(
+    log: Arc<dyn LogOps + Send + Sync>,
+    chunks: Arc<dyn AsyncChunkOps>,
+    placement: Vec<u64>,
+) -> InMemoryGateway {
+    let mut compositions = CompositionStore::new().with_log(log);
+    compositions.add_namespace(Namespace {
+        id: test_namespace(),
+        tenant_id: test_tenant(),
+        shard_id: test_shard(),
+        read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
+    });
+
+    let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+    InMemoryGateway::new(compositions, chunks, master_key).with_cluster_placement(placement)
+}
+
+/// RED: when the log reports the chunk's `cluster_chunk_state` row
+/// transitioned to tombstoned (refcount→0), the gateway calls
+/// `chunks.delete_distributed` exactly once for that chunk so the
+/// leader's fan-out reclaims fragments on every peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn tombstone_decrement_triggers_delete_distributed() {
+    let log = Arc::new(RecordingLog::default());
+    *log.tombstone_response.lock().unwrap() = true;
+    let chunks = RecordingChunks::new();
+    let gw = setup_with_chunks(
+        Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>,
+        Arc::clone(&chunks) as Arc<dyn AsyncChunkOps>,
+        vec![1, 2, 3],
+    );
+
+    let resp = gw
+        .write(kiseki_gateway::WriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: vec![0xAFu8; 4096],
+        })
+        .await
+        .expect("write");
+    let chunk_id = log.chunk_and_delta_calls.lock().unwrap()[0].new_chunks[0].chunk_id;
+
+    gw.delete(test_tenant(), test_namespace(), resp.composition_id)
+        .await
+        .expect("delete");
+
+    let fanouts = chunks.fanout_calls.lock().unwrap();
+    assert_eq!(
+        fanouts.len(),
+        1,
+        "tombstone signal must trigger exactly one fan-out"
+    );
+    assert_eq!(fanouts[0].0 .0, chunk_id);
+    assert_eq!(fanouts[0].1, test_tenant());
+}
+
+/// RED: when the log reports `tombstoned=false` (another composition
+/// still references the chunk), the gateway must NOT fan out — that
+/// would reclaim a still-live chunk and break I-C2.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_tombstone_decrement_does_not_fan_out() {
+    let log = Arc::new(RecordingLog::default());
+    // tombstone_response defaults to false → no fan-out expected.
+    let chunks = RecordingChunks::new();
+    let gw = setup_with_chunks(
+        Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>,
+        Arc::clone(&chunks) as Arc<dyn AsyncChunkOps>,
+        vec![1, 2, 3],
+    );
+
+    let resp = gw
+        .write(kiseki_gateway::WriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: vec![0xB0u8; 4096],
+        })
+        .await
+        .expect("write");
+
+    gw.delete(test_tenant(), test_namespace(), resp.composition_id)
+        .await
+        .expect("delete");
+
+    assert!(
+        chunks.fanout_calls.lock().unwrap().is_empty(),
+        "non-tombstone decrement must NOT trigger fan-out — would break I-C2",
+    );
 }
