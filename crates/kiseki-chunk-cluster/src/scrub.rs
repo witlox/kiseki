@@ -17,6 +17,13 @@
 //!
 //! Spec: `specs/failure-modes.md#F-D7-leader-crash-mid-write-orphan-window`,
 //! `specs/implementation/phase-16-cross-node-chunks.md` Risk #5.
+//!
+//! Phase 16b step 5 layers a sibling scrub: [`UnderReplicationScrub`]
+//! probes the placement set with `HasFragment` and re-replicates from
+//! a healthy peer when fewer than `copies` peers report present. Same
+//! pure-policy + orchestrator-with-trait-objects layering — both
+//! scrubs share the same iteration plumbing once the runtime wires
+//! them in.
 
 use std::time::Duration;
 
@@ -153,6 +160,178 @@ impl OrphanScrub {
                     Ok(_) => report.deleted += 1,
                     Err(_) => report.delete_errors += 1,
                 },
+            }
+        }
+        report
+    }
+}
+
+// === Phase 16b step 5: under-replication scrub ===========================
+
+/// Decision for a single chunk's repair status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplicationDecision {
+    /// Every placement peer holds the fragment — no action.
+    Healthy,
+    /// Fewer than `copies` peers hold the fragment but at least
+    /// one does. Repair from a healthy peer.
+    Repair,
+    /// `min_acks` not satisfied — durability invariant broken.
+    /// Repair if possible; otherwise the chunk is at risk of loss.
+    Critical,
+    /// No peer reports present. F-D5 territory: cannot repair from
+    /// the cluster; the data may be permanently lost.
+    Lost,
+}
+
+/// Pure-function policy for the under-replication scrub.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnderReplicationPolicy {
+    /// Replication factor (`copies` from [`ClusterDurabilityDefaults`]).
+    pub target_copies: u8,
+    /// Minimum healthy copies for the durability invariant
+    /// (`min_acks` from [`ClusterDurabilityDefaults`]).
+    pub min_acks: usize,
+}
+
+impl UnderReplicationPolicy {
+    /// Decide what to do given the per-peer presence vector. The
+    /// length of `present` is the placement-list size (already
+    /// reduced to peers that should hold the fragment).
+    #[must_use]
+    pub fn evaluate(&self, present: &[bool]) -> ReplicationDecision {
+        let healthy = present.iter().filter(|p| **p).count();
+        if healthy == 0 {
+            ReplicationDecision::Lost
+        } else if healthy < self.min_acks {
+            ReplicationDecision::Critical
+        } else if healthy < usize::from(self.target_copies)
+            && healthy < present.len()
+        {
+            ReplicationDecision::Repair
+        } else {
+            ReplicationDecision::Healthy
+        }
+    }
+}
+
+/// Trait for asking each placement peer "do you hold this chunk?".
+/// One call per (chunk, peer); production wiring uses the gRPC
+/// `HasFragment` RPC, tests use a HashMap-backed fake.
+#[async_trait]
+pub trait FragmentAvailabilityOracle: Send + Sync {
+    /// Returns one bool per peer in `peer_ids`, in order. `false`
+    /// covers both "peer reachable + reports absent" and "peer
+    /// unreachable" — both are signals the chunk needs repair.
+    async fn check(&self, chunk_id: ChunkId, peer_ids: &[u64]) -> Vec<bool>;
+}
+
+/// Trait for re-replicating a chunk from a known-good peer onto a
+/// known-missing peer. Production wiring fetches via `GetFragment`
+/// from the source and `PutFragment` on the destination.
+#[async_trait]
+pub trait Repairer: Send + Sync {
+    /// Re-replicate `chunk_id` from `from_peer` to `to_peer`.
+    async fn repair(
+        &self,
+        chunk_id: ChunkId,
+        from_peer: u64,
+        to_peer: u64,
+    ) -> Result<(), String>;
+}
+
+/// Result of a repair-scrub pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UnderReplicationReport {
+    /// Chunks scanned.
+    pub scanned: u64,
+    /// Chunks at full `target_copies`.
+    pub healthy: u64,
+    /// Chunks repaired (re-replicated to at least one missing peer).
+    pub repaired: u64,
+    /// Chunks at risk: too few healthy copies but >0.
+    pub critical: u64,
+    /// Chunks with zero healthy copies — F-D5.
+    pub lost: u64,
+    /// Repair-side errors (counted, not aborted).
+    pub repair_errors: u64,
+}
+
+/// Per-chunk input to the scrub.
+#[derive(Clone, Debug)]
+pub struct ChunkPlacement {
+    /// Chunk id.
+    pub chunk_id: ChunkId,
+    /// Peer ids that should hold this chunk's fragment.
+    pub placement: Vec<u64>,
+}
+
+/// Orchestrator for the under-replication scrub.
+pub struct UnderReplicationScrub {
+    policy: UnderReplicationPolicy,
+}
+
+impl UnderReplicationScrub {
+    /// Build a scrub with the given policy.
+    #[must_use]
+    pub fn new(policy: UnderReplicationPolicy) -> Self {
+        Self { policy }
+    }
+
+    /// Run a scrub pass over `candidates`. The oracle answers per-
+    /// peer presence; the repairer is invoked for chunks that need
+    /// repair AND have at least one healthy source.
+    pub async fn run<O, R>(
+        &self,
+        candidates: &[ChunkPlacement],
+        oracle: &O,
+        repairer: &R,
+    ) -> UnderReplicationReport
+    where
+        O: FragmentAvailabilityOracle,
+        R: Repairer,
+    {
+        let mut report = UnderReplicationReport::default();
+        for cp in candidates {
+            report.scanned += 1;
+            let presence = oracle.check(cp.chunk_id, &cp.placement).await;
+            match self.policy.evaluate(&presence) {
+                ReplicationDecision::Healthy => report.healthy += 1,
+                ReplicationDecision::Lost => report.lost += 1,
+                ReplicationDecision::Repair | ReplicationDecision::Critical => {
+                    let healthy_peers: Vec<u64> = cp
+                        .placement
+                        .iter()
+                        .zip(&presence)
+                        .filter(|(_, p)| **p)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    let missing_peers: Vec<u64> = cp
+                        .placement
+                        .iter()
+                        .zip(&presence)
+                        .filter(|(_, p)| !**p)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if let (Some(&src), Some(&dst)) =
+                        (healthy_peers.first(), missing_peers.first())
+                    {
+                        match repairer.repair(cp.chunk_id, src, dst).await {
+                            Ok(()) => {
+                                if matches!(
+                                    self.policy.evaluate(&presence),
+                                    ReplicationDecision::Critical
+                                ) {
+                                    report.critical += 1;
+                                }
+                                report.repaired += 1;
+                            }
+                            Err(_) => report.repair_errors += 1,
+                        }
+                    } else {
+                        report.lost += 1;
+                    }
+                }
             }
         }
         report
@@ -339,5 +518,237 @@ mod tests {
         assert_eq!(report.scanned, 3);
         assert_eq!(report.deleted, 2, "A and C succeeded");
         assert_eq!(report.delete_errors, 1, "B failed");
+    }
+
+    // === Phase 16b step 5: under-replication scrub ===========================
+
+    #[test]
+    fn replication_policy_all_present_is_healthy() {
+        let p = UnderReplicationPolicy {
+            target_copies: 3,
+            min_acks: 2,
+        };
+        assert_eq!(p.evaluate(&[true, true, true]), ReplicationDecision::Healthy);
+    }
+
+    #[test]
+    fn replication_policy_one_missing_is_repair() {
+        let p = UnderReplicationPolicy {
+            target_copies: 3,
+            min_acks: 2,
+        };
+        // 2 of 3 healthy: still meets min_acks but below target → Repair.
+        assert_eq!(
+            p.evaluate(&[true, true, false]),
+            ReplicationDecision::Repair,
+        );
+    }
+
+    #[test]
+    fn replication_policy_below_min_acks_is_critical() {
+        let p = UnderReplicationPolicy {
+            target_copies: 3,
+            min_acks: 2,
+        };
+        // 1 of 3 healthy: under min_acks, still recoverable.
+        assert_eq!(
+            p.evaluate(&[true, false, false]),
+            ReplicationDecision::Critical,
+        );
+    }
+
+    #[test]
+    fn replication_policy_all_missing_is_lost() {
+        let p = UnderReplicationPolicy {
+            target_copies: 3,
+            min_acks: 2,
+        };
+        assert_eq!(
+            p.evaluate(&[false, false, false]),
+            ReplicationDecision::Lost,
+        );
+    }
+
+    #[test]
+    fn replication_policy_target_met_below_placement_size_is_healthy() {
+        // EC-style edge case: placement might list 4 peers but only
+        // target_copies=3 are required healthy. Today (Replication-N)
+        // placement.len() == target_copies, but the policy must still
+        // return Healthy when healthy >= target_copies.
+        let p = UnderReplicationPolicy {
+            target_copies: 3,
+            min_acks: 2,
+        };
+        assert_eq!(
+            p.evaluate(&[true, true, true, false]),
+            ReplicationDecision::Healthy,
+        );
+    }
+
+    /// Mock availability oracle: returns the bool vector exactly as
+    /// stored, indexed by `chunk_id`'s first byte.
+    struct FakeAvailability {
+        responses: std::collections::HashMap<ChunkId, Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl FragmentAvailabilityOracle for FakeAvailability {
+        async fn check(&self, chunk_id: ChunkId, _peer_ids: &[u64]) -> Vec<bool> {
+            self.responses.get(&chunk_id).cloned().unwrap_or_default()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRepairer {
+        repairs: Mutex<Vec<(ChunkId, u64, u64)>>,
+        fail_on: Option<ChunkId>,
+    }
+
+    #[async_trait]
+    impl Repairer for FakeRepairer {
+        async fn repair(
+            &self,
+            chunk_id: ChunkId,
+            from_peer: u64,
+            to_peer: u64,
+        ) -> Result<(), String> {
+            if Some(chunk_id) == self.fail_on {
+                return Err("simulated repair failure".into());
+            }
+            self.repairs
+                .lock()
+                .unwrap()
+                .push((chunk_id, from_peer, to_peer));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn under_replication_scrub_repairs_missing_peers() {
+        let policy = UnderReplicationPolicy {
+            target_copies: 3,
+            min_acks: 2,
+        };
+        let scrub = UnderReplicationScrub::new(policy);
+
+        let healthy_chunk = cid(0x10);
+        let one_missing = cid(0x20);
+        let all_missing = cid(0x30);
+
+        let oracle = FakeAvailability {
+            responses: [
+                (healthy_chunk, vec![true, true, true]),
+                (one_missing, vec![true, true, false]),
+                (all_missing, vec![false, false, false]),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let repairer = FakeRepairer::default();
+
+        let candidates = vec![
+            ChunkPlacement {
+                chunk_id: healthy_chunk,
+                placement: vec![1, 2, 3],
+            },
+            ChunkPlacement {
+                chunk_id: one_missing,
+                placement: vec![1, 2, 3],
+            },
+            ChunkPlacement {
+                chunk_id: all_missing,
+                placement: vec![1, 2, 3],
+            },
+        ];
+
+        let report = scrub.run(&candidates, &oracle, &repairer).await;
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.healthy, 1, "fully-replicated chunk left alone");
+        assert_eq!(report.repaired, 1, "one-missing chunk got repaired");
+        assert_eq!(report.lost, 1, "all-missing chunk reported as lost");
+        assert_eq!(report.repair_errors, 0);
+
+        let repairs = repairer.repairs.lock().unwrap();
+        assert_eq!(repairs.len(), 1);
+        let (cid_, from, to) = repairs[0];
+        assert_eq!(cid_, one_missing);
+        assert_eq!(from, 1, "first healthy peer drives the repair");
+        assert_eq!(to, 3, "first missing peer is the destination");
+    }
+
+    #[tokio::test]
+    async fn under_replication_scrub_counts_critical_separately() {
+        // critical = healthy < min_acks. The chunk is repaired, but
+        // the report flags it for ops attention.
+        let policy = UnderReplicationPolicy {
+            target_copies: 3,
+            min_acks: 2,
+        };
+        let scrub = UnderReplicationScrub::new(policy);
+
+        let chunk = cid(0x77);
+        let oracle = FakeAvailability {
+            responses: [(chunk, vec![true, false, false])].into_iter().collect(),
+        };
+        let repairer = FakeRepairer::default();
+
+        let report = scrub
+            .run(
+                &[ChunkPlacement {
+                    chunk_id: chunk,
+                    placement: vec![1, 2, 3],
+                }],
+                &oracle,
+                &repairer,
+            )
+            .await;
+        assert_eq!(report.repaired, 1, "still repaired (1 source available)");
+        assert_eq!(
+            report.critical, 1,
+            "but flagged as critical because healthy < min_acks"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_replication_scrub_continues_past_repair_errors() {
+        let policy = UnderReplicationPolicy {
+            target_copies: 3,
+            min_acks: 2,
+        };
+        let scrub = UnderReplicationScrub::new(policy);
+
+        let bad = cid(0xBA);
+        let good = cid(0x60);
+        let oracle = FakeAvailability {
+            responses: [
+                (bad, vec![true, true, false]),
+                (good, vec![true, true, false]),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let repairer = FakeRepairer {
+            fail_on: Some(bad),
+            ..Default::default()
+        };
+
+        let report = scrub
+            .run(
+                &[
+                    ChunkPlacement {
+                        chunk_id: bad,
+                        placement: vec![1, 2, 3],
+                    },
+                    ChunkPlacement {
+                        chunk_id: good,
+                        placement: vec![1, 2, 3],
+                    },
+                ],
+                &oracle,
+                &repairer,
+            )
+            .await;
+        assert_eq!(report.repaired, 1, "good chunk repaired");
+        assert_eq!(report.repair_errors, 1, "bad chunk's failure is counted");
     }
 }

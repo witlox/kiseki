@@ -69,8 +69,10 @@ pub use defaults::{defaults_for, ClusterDurabilityDefaults};
 pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use scrub::{
-    ChunkScrubInfo, ClusterChunkOracle, OrphanDecision, OrphanDeleter, OrphanScrub,
-    OrphanScrubPolicy, OrphanScrubReport, DEFAULT_ORPHAN_TTL,
+    ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, FragmentAvailabilityOracle,
+    OrphanDecision, OrphanDeleter, OrphanScrub, OrphanScrubPolicy, OrphanScrubReport,
+    Repairer, ReplicationDecision, UnderReplicationPolicy, UnderReplicationReport,
+    UnderReplicationScrub, DEFAULT_ORPHAN_TTL,
 };
 pub use server::{fabric_san_interceptor, ClusterChunkServer};
 
