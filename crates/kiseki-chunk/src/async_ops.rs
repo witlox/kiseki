@@ -84,6 +84,39 @@ pub trait AsyncChunkOps: Send + Sync {
     async fn list_chunk_ids(&self) -> Vec<ChunkId> {
         Vec::new()
     }
+
+    /// Phase 16c step 6: write one EC fragment.
+    async fn write_fragment(
+        &self,
+        _chunk_id: &ChunkId,
+        _fragment_index: u32,
+        _bytes: Vec<u8>,
+    ) -> Result<(), ChunkError> {
+        Err(ChunkError::Io("write_fragment not implemented".into()))
+    }
+
+    /// Phase 16c step 6: read one EC fragment.
+    async fn read_fragment(
+        &self,
+        chunk_id: &ChunkId,
+        _fragment_index: u32,
+    ) -> Result<Vec<u8>, ChunkError> {
+        Err(ChunkError::NotFound(*chunk_id))
+    }
+
+    /// Phase 16c step 6: delete one EC fragment. Idempotent.
+    async fn delete_fragment(
+        &self,
+        _chunk_id: &ChunkId,
+        _fragment_index: u32,
+    ) -> Result<bool, ChunkError> {
+        Ok(false)
+    }
+
+    /// Phase 16c step 6: list every `fragment_index` held for a chunk.
+    async fn list_fragments(&self, _chunk_id: &ChunkId) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// Adapter that exposes any sync [`ChunkOps`] as [`AsyncChunkOps`]
@@ -225,6 +258,63 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         tokio::task::spawn_blocking(move || {
             let guard = inner.blocking_lock();
             guard.list_chunk_ids()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn write_fragment(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), ChunkError> {
+        let inner = Arc::clone(&self.inner);
+        let chunk_id = *chunk_id;
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.write_fragment(&chunk_id, fragment_index, bytes)
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn read_fragment(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+    ) -> Result<Vec<u8>, ChunkError> {
+        let inner = Arc::clone(&self.inner);
+        let chunk_id = *chunk_id;
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.blocking_lock();
+            guard.read_fragment(&chunk_id, fragment_index)
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn delete_fragment(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+    ) -> Result<bool, ChunkError> {
+        let inner = Arc::clone(&self.inner);
+        let chunk_id = *chunk_id;
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.delete_fragment(&chunk_id, fragment_index)
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn list_fragments(&self, chunk_id: &ChunkId) -> Vec<u32> {
+        let inner = Arc::clone(&self.inner);
+        let chunk_id = *chunk_id;
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.blocking_lock();
+            guard.list_fragments(&chunk_id)
         })
         .await
         .unwrap_or_default()

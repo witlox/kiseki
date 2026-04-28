@@ -78,6 +78,49 @@ pub trait ChunkOps {
     fn list_chunk_ids(&self) -> Vec<ChunkId> {
         Vec::new()
     }
+
+    /// Phase 16c step 6: write one fragment of a chunk, addressed by
+    /// `(chunk_id, fragment_index)`. Used by the cluster fabric when
+    /// a peer receives a `PutFragment` RPC under EC mode (the chunk
+    /// is split into N fragments, each peer holds one). Default
+    /// returns `Io("not implemented")` so production stores can opt
+    /// in piecewise; the in-memory `ChunkStore` overrides it.
+    fn write_fragment(
+        &mut self,
+        _chunk_id: &ChunkId,
+        _fragment_index: u32,
+        _bytes: Vec<u8>,
+    ) -> Result<(), ChunkError> {
+        Err(ChunkError::Io("write_fragment not implemented".into()))
+    }
+
+    /// Read a fragment by `(chunk_id, fragment_index)`. Returns
+    /// `NotFound` if the (id, index) pair isn't present.
+    fn read_fragment(
+        &self,
+        chunk_id: &ChunkId,
+        _fragment_index: u32,
+    ) -> Result<Vec<u8>, ChunkError> {
+        Err(ChunkError::NotFound(*chunk_id))
+    }
+
+    /// Delete a single fragment. Idempotent — returns `Ok(false)`
+    /// when the fragment was already absent.
+    fn delete_fragment(
+        &mut self,
+        _chunk_id: &ChunkId,
+        _fragment_index: u32,
+    ) -> Result<bool, ChunkError> {
+        Ok(false)
+    }
+
+    /// Phase 16c step 6: list every `fragment_index` currently held
+    /// for `chunk_id`. Used by the under-replication scrub's
+    /// `HasFragment`-style probe and by EC-mode reads to determine
+    /// which fragments this node already has locally.
+    fn list_fragments(&self, _chunk_id: &ChunkId) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// In-memory chunk store.
@@ -86,6 +129,12 @@ pub struct ChunkStore {
     pools: HashMap<String, AffinityPool>,
     /// Simulated unavailable chunks for fault injection (ADR-037).
     unavailable: HashSet<ChunkId>,
+    /// Phase 16c step 6: per-fragment storage for EC mode. Keyed by
+    /// `(chunk_id, fragment_index)` so a 4+2 encoding lays down 6
+    /// rows. Distinct from `chunks` (whole-envelope keyed by
+    /// `chunk_id`) — the data path picks one or the other based on
+    /// `EcStrategy` (Phase 16c step 7).
+    fragments: HashMap<(ChunkId, u32), Vec<u8>>,
 }
 
 impl ChunkStore {
@@ -96,6 +145,7 @@ impl ChunkStore {
             chunks: HashMap::new(),
             pools: HashMap::new(),
             unavailable: HashSet::new(),
+            fragments: HashMap::new(),
         }
     }
 
@@ -401,6 +451,44 @@ impl ChunkOps for ChunkStore {
     fn list_chunk_ids(&self) -> Vec<ChunkId> {
         self.chunks.keys().copied().collect()
     }
+
+    fn write_fragment(
+        &mut self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), ChunkError> {
+        self.fragments.insert((*chunk_id, fragment_index), bytes);
+        Ok(())
+    }
+
+    fn read_fragment(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+    ) -> Result<Vec<u8>, ChunkError> {
+        self.fragments
+            .get(&(*chunk_id, fragment_index))
+            .cloned()
+            .ok_or(ChunkError::NotFound(*chunk_id))
+    }
+
+    fn delete_fragment(
+        &mut self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+    ) -> Result<bool, ChunkError> {
+        Ok(self.fragments.remove(&(*chunk_id, fragment_index)).is_some())
+    }
+
+    fn list_fragments(&self, chunk_id: &ChunkId) -> Vec<u32> {
+        let target = *chunk_id;
+        self.fragments
+            .keys()
+            .filter(|(cid, _)| *cid == target)
+            .map(|(_, idx)| *idx)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +583,58 @@ mod tests {
     fn list_chunk_ids_on_empty_store_is_empty() {
         let store = setup_store();
         assert!(store.list_chunk_ids().is_empty());
+    }
+
+    /// Phase 16c step 6: fragment storage is keyed by
+    /// `(chunk_id, fragment_index)`. The whole-envelope `chunks` map
+    /// and the per-fragment `fragments` map are independent — a
+    /// chunk can have one without the other while the EC switch
+    /// (step 7) is mid-rollout.
+    #[test]
+    fn fragments_round_trip_independently_of_whole_chunks() {
+        let mut store = setup_store();
+        let cid = ChunkId([0x42; 32]);
+        store
+            .write_fragment(&cid, 0, b"frag-zero".to_vec())
+            .unwrap();
+        store
+            .write_fragment(&cid, 5, b"frag-five".to_vec())
+            .unwrap();
+
+        let f0 = store.read_fragment(&cid, 0).unwrap();
+        let f5 = store.read_fragment(&cid, 5).unwrap();
+        assert_eq!(f0, b"frag-zero");
+        assert_eq!(f5, b"frag-five");
+
+        // The whole-envelope map is untouched.
+        assert!(matches!(store.refcount(&cid), Err(ChunkError::NotFound(_))));
+
+        // list_fragments returns just this chunk's indices.
+        let mut idxs = store.list_fragments(&cid);
+        idxs.sort_unstable();
+        assert_eq!(idxs, vec![0, 5]);
+    }
+
+    #[test]
+    fn read_fragment_returns_not_found_for_missing_index() {
+        let store = setup_store();
+        let err = store
+            .read_fragment(&ChunkId([0; 32]), 0)
+            .expect_err("absent fragment");
+        assert!(matches!(err, ChunkError::NotFound(_)));
+    }
+
+    #[test]
+    fn delete_fragment_is_idempotent() {
+        let mut store = setup_store();
+        let cid = ChunkId([0x55; 32]);
+        store.write_fragment(&cid, 1, b"x".to_vec()).unwrap();
+        // First delete: removes.
+        assert!(store.delete_fragment(&cid, 1).unwrap());
+        // Second delete: idempotent no-op.
+        assert!(!store.delete_fragment(&cid, 1).unwrap());
+        // list_fragments now returns empty for that chunk.
+        assert!(store.list_fragments(&cid).is_empty());
     }
 
     #[test]
