@@ -817,6 +817,37 @@ impl MdsLayoutManager {
         inner.cache.remove(&composition_id).is_some()
     }
 
+    /// LAYOUTRETURN by stateid — the kernel-facing variant. The
+    /// kernel sends back the stateid we issued at LAYOUTGET time,
+    /// not the full `composition_id`; this helper scans the live
+    /// cache for the entry that owns the matching stateid and
+    /// removes it. Returns true on a match.
+    ///
+    /// Phase 15c.8: pre-fix the LAYOUTRETURN op handler routed to
+    /// the legacy `LayoutManager`, leaving the production
+    /// `MdsLayoutManager` cache populated forever. Linux's pNFS
+    /// state machine then saw the kernel's local state cleared but
+    /// the server's still serving the (now stale) layout — every
+    /// subsequent LAYOUTGET returned the cached layout, the kernel
+    /// returned it again, and dd hung in `close()`.
+    pub fn layout_return_by_stateid(&self, stateid: &[u8; 16]) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let victim = inner
+            .cache
+            .iter()
+            .find(|(_, layout)| &layout.stateid == stateid)
+            .map(|(comp, _)| *comp);
+        if let Some(comp) = victim {
+            inner.cache.remove(&comp);
+            true
+        } else {
+            false
+        }
+    }
+
     /// GETDEVICEINFO — resolves `device_id` → reachable DS addresses.
     /// Returns `None` if no live layout references the device.
     #[must_use]
@@ -1268,6 +1299,38 @@ mod mds_layout_tests {
              last stripe ends at {}",
             last.offset + last.length,
         );
+    }
+
+    /// Phase 15c.8: the LAYOUTRETURN op handler must invalidate
+    /// the MDS cache by stateid (the kernel echoes back the
+    /// stateid we issued in LAYOUTGET). Without this, the kernel
+    /// clears its local state but the server keeps serving the
+    /// stale cached layout — pnfs read loop deadlocks.
+    #[test]
+    fn layout_return_by_stateid_removes_matching_entry() {
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
+        let layout = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::nil()),
+            comp(0xDEAD),
+            0,
+            1_048_576,
+            LayoutIoMode::Read,
+            1000,
+        );
+        assert_eq!(mgr.active_count(), 1);
+        let removed = mgr.layout_return_by_stateid(&layout.stateid);
+        assert!(removed, "stateid match should remove the entry");
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    /// `layout_return_by_stateid` returns false when the stateid
+    /// matches no live entry — defensive idempotency.
+    #[test]
+    fn layout_return_by_stateid_returns_false_when_unknown() {
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
+        let removed = mgr.layout_return_by_stateid(&[0xAA; 16]);
+        assert!(!removed);
     }
 
     /// A cache hit when the requested range IS contained in the

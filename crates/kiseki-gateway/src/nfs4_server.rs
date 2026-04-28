@@ -1398,11 +1398,25 @@ fn op_layoutreturn<G: GatewayOps>(
         let _length = reader.read_u64().unwrap_or(0);
         let stateid = reader.read_opaque_fixed(16).unwrap_or_default();
         let _lrf_body = reader.read_opaque().unwrap_or_default();
-
-        // Derive file_id from stateid (first 8 bytes, matching layout_get).
-        let file_id = u64::from_le_bytes(stateid[..8].try_into().unwrap_or([0; 8]));
         let _ = offset; // used for partial returns (not implemented)
 
+        // Phase 15c.8 fix: the production MDS layout manager owns
+        // the layout cache that LAYOUTGET populates. Pre-fix only
+        // the legacy `ctx.layouts` (Phase 14 stub) saw the
+        // LAYOUTRETURN, leaving the MDS cache populated. The
+        // kernel cleared its local state, the server kept serving
+        // the stale layout, and the read loop deadlocked. Route
+        // to the MDS manager via stateid match when wired.
+        if let Some(mgr) = ctx.mds_layout_manager.as_ref() {
+            if stateid.len() == 16 {
+                let mut sid = [0u8; 16];
+                sid.copy_from_slice(&stateid);
+                mgr.layout_return_by_stateid(&sid);
+            }
+        }
+        // Legacy path (kept until @pnfs-15b BDD scenarios run with a
+        // wired manager unconditionally).
+        let file_id = u64::from_le_bytes(stateid[..8].try_into().unwrap_or([0; 8]));
         ctx.layouts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1411,8 +1425,27 @@ fn op_layoutreturn<G: GatewayOps>(
     // LAYOUTRETURN4_ALL: no file-specific data to parse.
 
     w.write_u32(nfs4_status::NFS4_OK);
-    w.write_bool(true); // lrs_present (stateid present)
-    w.write_opaque_fixed(&[0u8; 16]); // empty stateid (no new state)
+    // RFC 5661 §18.4.4 LAYOUTRETURN4res:
+    //   union layoutreturn_stateid switch (bool lrs_present) {
+    //       case TRUE: stateid4 lrs_stateid;
+    //       case FALSE: void;
+    //   };
+    //
+    // Phase 15c.8 fix: pre-fix this emitted `lrs_present=true`
+    // followed by an all-zeros stateid — incoherent per the spec
+    // (an all-zeros stateid is the anonymous stateid, which can't
+    // identify a remaining layout). Linux's pNFS state machine
+    // interprets that as "the layout is still partially held with
+    // stateid=ANON" and cannot reconcile, so it loops on
+    // `pnfs_update_layout wait for layoutreturn` (visible in
+    // dmesg via `rpcdebug -m nfs -s pnfs xdr`) and dd hangs on
+    // close().
+    //
+    // Kiseki returns the entire layout on every LAYOUTRETURN
+    // (we don't track partial layout state on the MDS), so the
+    // correct response is `lrs_present=false` — no stateid
+    // follows because no layout state remains.
+    w.write_bool(false); // lrs_present = false: layout fully returned
 
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
