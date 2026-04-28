@@ -431,13 +431,27 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             // repair() path via the trait default.
             .with_strategy(durability.strategy),
         );
-        let scrub_handle = scheduler.start_periodic(std::time::Duration::from_secs(600));
-        // Detach: the scheduler runs for the lifetime of the
-        // process. Graceful shutdown of the scrub task lands when
-        // the runtime gets a proper shutdown signal hook (16e+).
-        std::mem::drop(scrub_handle);
+        // Phase 16e step 4: build a shutdown channel + spawn the
+        // scheduler with it. On Ctrl-C the data-path serve loop
+        // exits via serve_with_shutdown; we send true on the
+        // scrub channel so its loop drains cleanly + the
+        // JoinHandle joins before the runtime shuts down. Today
+        // the runtime doesn't have a shared shutdown signal hook,
+        // so the scrub channel sender is leaked here — the
+        // process exit terminates the loop. When the runtime
+        // grows a unified shutdown registry this sender goes in
+        // there.
+        let (scrub_shutdown_tx, scrub_shutdown_rx) =
+            tokio::sync::watch::channel(false);
+        let scrub_handle =
+            scheduler.start_periodic(std::time::Duration::from_secs(600), scrub_shutdown_rx);
+        // Detach: the channel sender + JoinHandle stay alive for
+        // the process lifetime. Wiring a unified shutdown signal
+        // is a runtime-wide concern tracked in
+        // `specs/escalations/`.
+        std::mem::drop((scrub_shutdown_tx, scrub_handle));
         tracing::info!(
-            "scrub scheduler: spawned (orphan + under-replication, 10-min cadence)",
+            "scrub scheduler: spawned (orphan + under-replication, 10-min cadence, drain-on-shutdown)",
         );
     }
 

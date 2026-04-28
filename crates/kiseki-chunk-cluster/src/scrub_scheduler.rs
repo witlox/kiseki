@@ -167,32 +167,51 @@ impl ScrubScheduler {
     }
 
     /// Spawn a tokio task that calls [`run_once`] every `interval`.
-    /// Returns a `JoinHandle` so the runtime can `.abort()` it on
-    /// shutdown. Errors from `run_once` are logged and the loop
-    /// continues — a one-shard hiccup must not stall the rest.
+    /// Errors from `run_once` are logged and the loop continues —
+    /// a one-shard hiccup must not stall the rest. Phase 16e step 4
+    /// adds graceful shutdown: the loop exits cleanly when
+    /// `shutdown.changed()` fires (caller sends `true`), so the
+    /// returned `JoinHandle` joins normally rather than via abort.
     #[must_use]
-    pub fn start_periodic(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+    pub fn start_periodic(
+        self: Arc<Self>,
+        interval: Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // Skip the immediate fire so the runtime has time to settle.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await; // first tick fires immediately; absorb it
             loop {
-                ticker.tick().await;
-                match self.run_once().await {
-                    Ok(report) => {
-                        if report.orphan.deleted > 0 || report.under_replication.repaired > 0 {
-                            tracing::info!(
-                                orphan_deleted = report.orphan.deleted,
-                                under_repl_repaired = report.under_replication.repaired,
-                                under_repl_critical = report.under_replication.critical,
-                                under_repl_lost = report.under_replication.lost,
-                                "scrub pass made changes",
-                            );
+                tokio::select! {
+                    biased; // check shutdown first so a pending tick + shutdown
+                            // exits cleanly instead of running one more pass
+                    res = shutdown.changed() => {
+                        if res.is_err() || *shutdown.borrow() {
+                            tracing::info!("scrub scheduler: shutdown received, draining");
+                            break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error=%e, "scrub pass failed");
+                    _ = ticker.tick() => {
+                        match self.run_once().await {
+                            Ok(report) => {
+                                if report.orphan.deleted > 0
+                                    || report.under_replication.repaired > 0
+                                {
+                                    tracing::info!(
+                                        orphan_deleted = report.orphan.deleted,
+                                        under_repl_repaired = report.under_replication.repaired,
+                                        under_repl_critical = report.under_replication.critical,
+                                        under_repl_lost = report.under_replication.lost,
+                                        "scrub pass made changes",
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error=%e, "scrub pass failed");
+                            }
+                        }
                     }
                 }
             }
@@ -518,5 +537,52 @@ mod tests {
         assert_eq!(report.orphan.deleted, 1);
         let log_entries = deleter_inner.deleted.lock().unwrap();
         assert!(log_entries.contains(&orphan_chunk));
+    }
+
+    /// Phase 16e step 4: the scrub task exits cleanly when the
+    /// shutdown signal fires. The `JoinHandle` joins normally (not
+    /// via abort) within a small bound so production runtimes can
+    /// drain in-flight work before exiting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_periodic_drains_on_shutdown_signal() {
+        let chunk_ids = vec![cid(0xA1)];
+        let log: Arc<dyn LogOps> = Arc::new(FakeLog {
+            single: HashMap::new(),
+            iter: Vec::new(),
+        });
+        let local: Arc<dyn AsyncChunkOps> = Arc::new(FakeLocalChunks { chunk_ids });
+        let peer_oracle: Arc<dyn FragmentAvailabilityOracle> = Arc::new(FakePeerOracle);
+        let deleter: Arc<dyn OrphanDeleter> = Arc::new(FakeDeleter::default());
+        let repairer: Arc<dyn Repairer> = Arc::new(FakeRepairer::default());
+
+        let scheduler = Arc::new(ScrubScheduler::new(
+            log,
+            local,
+            peer_oracle,
+            deleter,
+            repairer,
+            shard(),
+            tenant(),
+            OrphanScrubPolicy::default(),
+            UnderReplicationPolicy {
+                target_copies: 3,
+                min_acks: 2,
+            },
+        ));
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = scheduler.start_periodic(Duration::from_millis(20), rx);
+
+        // Let one tick happen, then signal shutdown.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(true).expect("send shutdown");
+
+        // The handle must complete cleanly (no abort) within a
+        // small bound — the loop hits the `shutdown.changed()`
+        // arm on the next select iteration.
+        let join_result = tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("scrub task did not exit within 500ms of shutdown signal");
+        join_result.expect("scrub task panicked instead of clean join");
     }
 }
