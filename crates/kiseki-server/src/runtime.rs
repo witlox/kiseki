@@ -347,8 +347,21 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             "cross-node fabric is empty despite raft_peers > 1 — cluster running in local-only mode",
         );
     }
+    // Phase 16b step 3: pick durability defaults (copies + min_acks)
+    // from the cluster size. 1-node → local-only (min_acks=1, won't
+    // deadlock single-node tests). 2-node → Replication-2, both peers
+    // ack. 3+ nodes → Replication-3 with 2-of-3 quorum.
+    let cluster_size = cfg.raft_peers.len().max(1);
+    let durability = kiseki_chunk_cluster::defaults_for(cluster_size);
+    tracing::info!(
+        cluster_size,
+        copies = durability.copies,
+        min_acks = durability.min_acks,
+        "cluster durability defaults",
+    );
     let cluster_cfg =
-        kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default");
+        kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default")
+            .with_min_acks(durability.min_acks);
     let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
         Arc::new(
             kiseki_chunk_cluster::ClusteredChunkStore::new(

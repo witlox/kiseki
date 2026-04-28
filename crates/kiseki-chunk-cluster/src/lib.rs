@@ -58,11 +58,13 @@ use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_crypto::envelope::Envelope;
 
 pub mod auth;
+pub mod defaults;
 pub mod metrics;
 pub mod peer;
 pub mod server;
 
 pub use auth::{verify_fabric_san, FabricAuthError};
+pub use defaults::{defaults_for, ClusterDurabilityDefaults};
 pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use server::{fabric_san_interceptor, ClusterChunkServer};
@@ -105,6 +107,14 @@ impl ClusterCfg {
             put_timeout: DEFAULT_PUT_TIMEOUT,
             get_timeout: DEFAULT_GET_TIMEOUT,
         }
+    }
+
+    /// Override `min_acks` (Phase 16b step 3 — runtime sets this from
+    /// the per-cluster-size defaults table).
+    #[must_use]
+    pub fn with_min_acks(mut self, min_acks: usize) -> Self {
+        self.min_acks = min_acks;
+        self
     }
 }
 
