@@ -64,6 +64,7 @@ pub mod metrics;
 pub mod peer;
 pub mod placement;
 pub mod scrub;
+pub mod scrub_scheduler;
 pub mod server;
 
 pub use auth::{verify_fabric_san, FabricAuthError};
@@ -81,6 +82,7 @@ pub use scrub::{
     OrphanScrubReport, Repairer, ReplicationDecision, UnderReplicationPolicy,
     UnderReplicationReport, UnderReplicationScrub, DEFAULT_ORPHAN_TTL,
 };
+pub use scrub_scheduler::{ScrubReport, ScrubScheduler};
 pub use server::{fabric_san_interceptor, ClusterChunkServer};
 
 /// Default per-peer timeout for `PutFragment` (write-side fan-out).

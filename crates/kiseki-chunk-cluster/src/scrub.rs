@@ -147,8 +147,8 @@ impl OrphanScrub {
         deleter: &D,
     ) -> OrphanScrubReport
     where
-        O: ClusterChunkOracle,
-        D: OrphanDeleter,
+        O: ClusterChunkOracle + ?Sized,
+        D: OrphanDeleter + ?Sized,
     {
         let mut report = OrphanScrubReport::default();
         for cid in candidates {
@@ -349,8 +349,8 @@ impl UnderReplicationScrub {
         repairer: &R,
     ) -> UnderReplicationReport
     where
-        O: FragmentAvailabilityOracle,
-        R: Repairer,
+        O: FragmentAvailabilityOracle + ?Sized,
+        R: Repairer + ?Sized,
     {
         let mut report = UnderReplicationReport::default();
         for cp in candidates {
