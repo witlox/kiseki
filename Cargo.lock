@@ -1892,6 +1892,7 @@ dependencies = [
  "kiseki-audit",
  "kiseki-backup",
  "kiseki-chunk",
+ "kiseki-chunk-cluster",
  "kiseki-client",
  "kiseki-common",
  "kiseki-composition",

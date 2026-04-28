@@ -801,7 +801,7 @@ mod tests {
         let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
         let gw = InMemoryGateway::new(
             CompositionStore::new(),
-            Box::new(ChunkStore::new()),
+            kiseki_chunk::arc_async(ChunkStore::new()),
             master_key,
         );
         let s3gw = S3Gateway::new(gw);

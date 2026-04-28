@@ -93,6 +93,13 @@ impl<T: ChunkOps + Send + 'static> SyncBridge<T> {
     }
 }
 
+/// Wrap any `T: ChunkOps + Send + 'static` as a shared async store.
+/// Convenience for the gateway's `Arc<dyn AsyncChunkOps>` slot — far
+/// shorter at the call site than `Arc::new(SyncBridge::new(...))`.
+pub fn arc_async<T: ChunkOps + Send + 'static>(inner: T) -> Arc<dyn AsyncChunkOps> {
+    Arc::new(SyncBridge::new(inner))
+}
+
 #[async_trait]
 impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
     async fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {

@@ -28,6 +28,7 @@ kiseki-audit = { workspace = true }
 kiseki-backup = { workspace = true }
 kiseki-tracing = { workspace = true }
 kiseki-chunk = { workspace = true }
+kiseki-chunk-cluster = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-view = { workspace = true }
 kiseki-gateway = { workspace = true }

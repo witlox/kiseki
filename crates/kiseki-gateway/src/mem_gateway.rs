@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use kiseki_chunk::store::ChunkOps;
+use kiseki_chunk::AsyncChunkOps;
 use kiseki_common::tenancy::DedupPolicy;
 use kiseki_composition::composition::{CompositionOps, CompositionStore};
 use kiseki_crypto::aead::Aead;
@@ -26,7 +26,7 @@ use crate::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteRespo
 /// take `&self`, enabling concurrent access.
 pub struct InMemoryGateway {
     compositions: Mutex<CompositionStore>,
-    chunks: Mutex<Box<dyn ChunkOps + Send>>,
+    chunks: Arc<dyn AsyncChunkOps>,
     aead: Aead,
     master_key: SystemMasterKey,
     dedup_policy: DedupPolicy,
@@ -129,12 +129,12 @@ impl InMemoryGateway {
     #[must_use]
     pub fn new(
         compositions: CompositionStore,
-        chunks: Box<dyn ChunkOps + Send>,
+        chunks: Arc<dyn AsyncChunkOps>,
         master_key: SystemMasterKey,
     ) -> Self {
         Self {
             compositions: Mutex::new(compositions),
-            chunks: Mutex::new(chunks),
+            chunks,
             aead: Aead::new(),
             master_key,
             dedup_policy: DedupPolicy::CrossTenant,
@@ -290,9 +290,8 @@ impl InMemoryGateway {
         let size = data.len() as u64;
 
         self.chunks
-            .lock()
-            .await
             .write_chunk(env, "default")
+            .await
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
         self.compositions
@@ -372,7 +371,6 @@ impl InMemoryGateway {
 impl GatewayOps for InMemoryGateway {
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
         let compositions = self.compositions.lock().await;
-        let chunks = self.chunks.lock().await;
 
         // Look up the composition.
         let comp = compositions
@@ -457,8 +455,9 @@ impl GatewayOps for InMemoryGateway {
                 env
             } else {
                 // Fall back to chunk store (block device).
-                chunks
+                self.chunks
                     .read_chunk(chunk_id)
+                    .await
                     .map_err(|e| GatewayError::Upstream(e.to_string()))?
             };
 
@@ -555,12 +554,13 @@ impl GatewayOps for InMemoryGateway {
             }
         } else {
             // Chunk path: store encrypted envelope on block device.
-            let mut chunks = self.chunks.lock().await;
-            let is_new = chunks
+            let is_new = self
+                .chunks
                 .write_chunk(env, "default")
+                .await
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
             if !is_new {
-                let _ = chunks.increment_refcount(&chunk_id);
+                let _ = self.chunks.increment_refcount(&chunk_id).await;
             }
         }
 
@@ -749,9 +749,8 @@ impl GatewayOps for InMemoryGateway {
         // Decrement chunk refcounts only when actually removed (not
         // a versioned delete marker). I-C2: GC when refcount reaches 0.
         if let kiseki_composition::DeleteResult::Removed(ref released) = delete_result {
-            let mut chunks = self.chunks.lock().await;
             for chunk_id in released {
-                let _ = chunks.decrement_refcount(chunk_id);
+                let _ = self.chunks.decrement_refcount(chunk_id).await;
             }
         }
 
@@ -773,7 +772,7 @@ mod telemetry_wiring_tests {
     async fn report_backpressure_is_noop_without_bus() {
         let gw = InMemoryGateway::new(
             CompositionStore::new(),
-            Box::new(ChunkStore::new()),
+            kiseki_chunk::arc_async(ChunkStore::new()),
             SystemMasterKey::new([0; 32], KeyEpoch(1)),
         );
         // Must not panic, must not block, must not allocate a channel.
@@ -792,7 +791,7 @@ mod telemetry_wiring_tests {
         let bus = Arc::new(kiseki_advisory::TelemetryBus::new());
         let gw = InMemoryGateway::new(
             CompositionStore::new(),
-            Box::new(ChunkStore::new()),
+            kiseki_chunk::arc_async(ChunkStore::new()),
             SystemMasterKey::new([0; 32], KeyEpoch(1)),
         );
         gw.set_telemetry_bus(Arc::clone(&bus));
@@ -813,7 +812,7 @@ mod telemetry_wiring_tests {
         let bus = Arc::new(kiseki_advisory::TelemetryBus::new());
         let gw = InMemoryGateway::new(
             CompositionStore::new(),
-            Box::new(ChunkStore::new()),
+            kiseki_chunk::arc_async(ChunkStore::new()),
             SystemMasterKey::new([0; 32], KeyEpoch(1)),
         );
         gw.set_telemetry_bus(Arc::clone(&bus));

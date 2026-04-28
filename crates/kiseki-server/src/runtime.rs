@@ -222,25 +222,54 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let audit_store = kiseki_audit::AuditLog::new();
     tracing::info!(events = audit_store.total_events(), "audit log: in-memory",);
 
-    // Chunk store: persistent (raw block device) if KISEKI_DATA_DIR set,
-    // otherwise in-memory. The gateway accepts any ChunkOps implementation.
-    let chunk_store: Box<dyn kiseki_chunk::ChunkOps + Send> = if let Some(ref dir) = cfg.data_dir {
-        std::fs::create_dir_all(dir.join("chunks")).ok();
-        let dev_path = dir.join("chunks").join("data.dev");
-        let meta_path = dir.join("chunks").join("meta.json");
-        let store = if dev_path.exists() {
-            kiseki_chunk::PersistentChunkStore::open(&dev_path, &meta_path)
-                .map_err(|e| format!("persistent chunk store open: {e}"))?
-        } else {
-            kiseki_chunk::PersistentChunkStore::init(&dev_path, &meta_path, 4 * 1024 * 1024 * 1024)
+    // Local chunk store: persistent (raw block device) if KISEKI_DATA_DIR
+    // set, otherwise in-memory. Wrapped via SyncBridge so it satisfies
+    // AsyncChunkOps — the cluster fabric and the gateway both consume the
+    // async surface (Phase 16a, D-7).
+    let local_chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
+        if let Some(ref dir) = cfg.data_dir {
+            std::fs::create_dir_all(dir.join("chunks")).ok();
+            let dev_path = dir.join("chunks").join("data.dev");
+            let meta_path = dir.join("chunks").join("meta.json");
+            let store = if dev_path.exists() {
+                kiseki_chunk::PersistentChunkStore::open(&dev_path, &meta_path)
+                    .map_err(|e| format!("persistent chunk store open: {e}"))?
+            } else {
+                kiseki_chunk::PersistentChunkStore::init(
+                    &dev_path,
+                    &meta_path,
+                    4 * 1024 * 1024 * 1024,
+                )
                 .map_err(|e| format!("persistent chunk store init: {e}"))?
+            };
+            tracing::info!(path = %dir.display(), "chunk store: persistent (raw block)");
+            Arc::new(kiseki_chunk::SyncBridge::new(store))
+        } else {
+            tracing::info!("chunk store: in-memory (no persistence)");
+            Arc::new(kiseki_chunk::SyncBridge::new(kiseki_chunk::ChunkStore::new()))
         };
-        tracing::info!(path = %dir.display(), "chunk store: persistent (raw block)");
-        Box::new(store)
-    } else {
-        tracing::info!("chunk store: in-memory (no persistence)");
-        Box::new(kiseki_chunk::ChunkStore::new())
-    };
+
+    // Cluster chunk fabric (Phase 16a). When raft_peers > 1 we wrap the
+    // local store in a ClusteredChunkStore so writes fan out to peers via
+    // the ClusterChunkService gRPC fabric (D-1, D-5). For a 1-node cluster
+    // peers is empty and the store degenerates to local-only (D-6); the
+    // existing single-node tests stay green by construction.
+    //
+    // 16a step 7 ships the wiring; populating peers from cfg.raft_peers
+    // requires per-peer gRPC channel creation with mTLS, which lands in
+    // step 12 alongside the cert-gen tooling. Until then, a multi-node
+    // cluster degenerates to local-only on each node — losing the
+    // cross-node feature but never breaking correctness.
+    let bootstrap_tenant_for_cluster = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+    let fabric_peers: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> = Vec::new();
+    let cluster_cfg =
+        kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default");
+    let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
+        Arc::new(kiseki_chunk_cluster::ClusteredChunkStore::new(
+            Arc::clone(&local_chunk_store),
+            fabric_peers,
+            cluster_cfg,
+        ));
 
     // Raw device discovery (KISEKI_RAW_DEVICES).
     // This is the discovery phase — actual device opening via DeviceBackend
@@ -621,6 +650,18 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let admin_svc = kiseki_proto::v1::admin_service_server::AdminServiceServer::new(
         crate::admin_grpc::AdminGrpc::from_runtime(),
     );
+    // Phase 16a step 7. The ClusterChunkService gRPC server delegates
+    // to the *local* AsyncChunkOps (NOT the ClusteredChunkStore) so a
+    // PutFragment from a peer leader stores the fragment on this node
+    // without recursing into another fan-out. SAN-role enforcement
+    // lives at the interceptor layer; on plaintext (development) the
+    // server still functions but rejects cross-node writes only when
+    // mTLS is configured (step 12).
+    let cluster_chunk_svc = kiseki_chunk_cluster::ClusterChunkServer::new(
+        Arc::clone(&local_chunk_store),
+        "default",
+    )
+    .into_tonic_server();
 
     let mut builder = tonic::transport::Server::builder();
 
@@ -648,6 +689,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         .add_service(key_svc)
         .add_service(log_svc)
         .add_service(admin_svc)
+        .add_service(cluster_chunk_svc)
         .serve_with_shutdown(cfg.data_addr, shutdown)
         .await?;
 

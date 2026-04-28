@@ -247,7 +247,7 @@ mod tests {
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-        let gw = InMemoryGateway::new(store, Box::new(chunks), master_key);
+        let gw = InMemoryGateway::new(store, kiseki_chunk::arc_async(chunks), master_key);
         let nfs_gw = NfsGateway::new(gw);
         NfsContext::new(nfs_gw, tenant, ns)
     }

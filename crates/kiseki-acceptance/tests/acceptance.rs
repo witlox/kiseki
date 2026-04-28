@@ -449,7 +449,7 @@ impl KisekiWorld {
             );
         }
         let gateway = Arc::new(
-            InMemoryGateway::new(gw_comps, Box::new(gw_chunks), gw_master)
+            InMemoryGateway::new(gw_comps, kiseki_chunk::arc_async(gw_chunks), gw_master)
                 .with_shard_map(Arc::clone(&shard_map_store)),
         );
         // Wire the telemetry bus into the production gateway so its

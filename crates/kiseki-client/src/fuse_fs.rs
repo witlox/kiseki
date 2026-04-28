@@ -592,7 +592,7 @@ mod tests {
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-        let gateway = InMemoryGateway::new(compositions, Box::new(chunks), master_key);
+        let gateway = InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
 
         KisekiFuse::new(gateway, test_tenant(), test_namespace())
     }
@@ -827,7 +827,7 @@ mod tests {
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-        let gateway = InMemoryGateway::new(compositions, Box::new(chunks), master_key);
+        let gateway = InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
         let mut fs = KisekiFuse::new(gateway, test_tenant(), test_namespace());
 
         // Attempt to create a file — should fail with write error.

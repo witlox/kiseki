@@ -37,7 +37,7 @@ fn setup_nfs_gateway() -> Arc<NfsGateway<InMemoryGateway>> {
 
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-    let gw = InMemoryGateway::new(compositions, Box::new(chunks), master_key);
+    let gw = InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
     Arc::new(NfsGateway::new(gw))
 }
 

@@ -92,7 +92,7 @@ fn setup_router() -> axum::Router {
     });
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-    let gw = InMemoryGateway::new(compositions, Box::new(chunks), master_key);
+    let gw = InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
     let s3gw = S3Gateway::new(gw);
     s3_router(s3gw, test_tenant())
 }
