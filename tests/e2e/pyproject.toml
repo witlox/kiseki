@@ -22,6 +22,8 @@ addopts = ["-ra", "--strict-markers", "--strict-config"]
 markers = [
     "e2e: end-to-end tests against real server subprocess",
     "perf: B-5 perf-baseline measurements (off the default e2e run)",
+    "cross_node: Phase 16a cross-node chunk replication tests",
+    "slow: tests that take >5 s (e.g. quorum-loss with peer restart)",
 ]
 
 [tool.ruff]

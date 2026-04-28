@@ -18,11 +18,13 @@ services:
       - "9101:9101"  # advisory gRPC
       - "9000:9000"  # S3
       - "2049:2049"  # NFS
+      - "9090:9090"  # Prometheus metrics + admin UI
     environment:
       KISEKI_DATA_ADDR: "0.0.0.0:9100"
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
       KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
+      KISEKI_METRICS_ADDR: "0.0.0.0:9090"
       KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "true"
       KISEKI_NODE_ID: "1"
@@ -48,11 +50,13 @@ services:
       - "9110:9100"  # data-path gRPC
       - "9111:9101"  # advisory gRPC
       - "9010:9000"  # S3
+      - "9091:9090"  # Prometheus metrics
     environment:
       KISEKI_DATA_ADDR: "0.0.0.0:9100"
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
       KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
+      KISEKI_METRICS_ADDR: "0.0.0.0:9090"
       KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "false"
       KISEKI_NODE_ID: "2"
@@ -78,11 +82,13 @@ services:
       - "9120:9100"  # data-path gRPC
       - "9121:9101"  # advisory gRPC
       - "9020:9000"  # S3
+      - "9092:9090"  # Prometheus metrics
     environment:
       KISEKI_DATA_ADDR: "0.0.0.0:9100"
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
       KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
+      KISEKI_METRICS_ADDR: "0.0.0.0:9090"
       KISEKI_DATA_DIR: "/data"
       KISEKI_BOOTSTRAP: "false"
       KISEKI_NODE_ID: "3"
