@@ -33,7 +33,7 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | Invariant | Enforcement point | Mechanism |
 |---|---|---|
 | I-C1 (chunks immutable) | `kiseki-chunk` write path | No update API; WriteChunk is create-or-dedup only |
-| I-C2 (no GC while refcount > 0) | `kiseki-chunk` GC process | Check refcount before delete; atomic decrement + delete-if-zero |
+| I-C2 (no GC while refcount > 0) | `kiseki-log` Raft state machine + `cluster_chunk_state` apply path (Phase 16a) | Refcount lives in the per-shard `cluster_chunk_state[(tenant_id, chunk_id)]` Raft table; ChunkAndDelta / IncrementChunkRefcount / DecrementChunkRefcount transitions are atomic with the composition delta they reference. Local `kiseki-chunk` GC sweep only fires once cluster_chunk_state.refcount hits 0 and the leader has fanned out DeleteFragment to every peer in the placement list. |
 | I-C2b (no GC while retention hold) | `kiseki-chunk` GC process | Check retention_holds list before delete |
 | I-C3 (placement per affinity policy) | `kiseki-chunk` placement engine | Pool selection from view descriptor's affinity_pool |
 | I-C4 (EC per pool) | `kiseki-chunk` pool config | DurabilityStrategy on AffinityPool; applied at write time |
@@ -44,7 +44,7 @@ architecture it gets enforced. Invariant without enforcement = violation.
 
 | Invariant | Enforcement point | Mechanism |
 |---|---|---|
-| I-D1 (auto-repair on device failure) | `kiseki-chunk` repair subsystem | Device failure event → identify affected chunks → EC reconstruct → re-place |
+| I-D1 (auto-repair on device failure) | `kiseki-chunk` repair subsystem (intra-node) + `kiseki-chunk-cluster` fabric fetch fallback (cross-node, Phase 16a) | Device failure event → identify affected chunks → EC reconstruct → re-place. Phase 16a adds: missing local fragment on read → ClusteredChunkStore walks the placement list and calls `GetFragment` on a healthy peer; the chunk is served degraded rather than failing the read. The 16b repair scrub then re-replicates back to a healthy device. |
 | I-D2 (device state transitions audited) | `kiseki-server` device monitor | State change → audit event to cluster audit shard with timestamp, reason, admin |
 | I-D3 (auto-evacuation on SMART/sectors) | `kiseki-server` device monitor | SMART wear >90% (SSD) or >100 bad sectors (HDD) → background evacuation |
 | I-D4 (EC fragments on distinct devices) | `kiseki-chunk` CRUSH placement | hash(chunk_id, frag_idx) → device; distinct-device constraint enforced |
@@ -71,7 +71,7 @@ architecture it gets enforced. Invariant without enforcement = violation.
 
 | Invariant | Enforcement point | Mechanism |
 |---|---|---|
-| I-T1 (full tenant isolation) | `kiseki-gateway-*` + `kiseki-client` auth | mTLS cert validation; tenant_id checked on every request |
+| I-T1 (full tenant isolation) | `kiseki-gateway-*` + `kiseki-client` auth + `kiseki-chunk-cluster` (Phase 16a) | mTLS cert validation; tenant_id checked on every request. Phase 16a adds two layers: (1) the `cluster_chunk_state` Raft table is keyed by `(tenant_id, chunk_id)` so cross-tenant dedup cannot leak refcount inference between tenants; (2) the SAN-role interceptor on `ClusterChunkService` rejects `spiffe://cluster/org/<uuid>` tenant certs with PermissionDenied, blocking the leaked-tenant-cert exfil path. |
 | I-T2 (quota enforcement) | `control/pkg/policy` + gateway/client | Quota check before write; reject with QuotaExceeded |
 | I-T3 (tenant keys not accessible to others) | `kiseki-crypto` + process isolation | Separate processes per tenant (ADR-012); mlock on key material |
 | I-T4 (cluster admin needs approval) | `control/pkg/iam` | AccessRequest workflow; deny by default |

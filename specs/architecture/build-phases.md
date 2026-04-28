@@ -444,6 +444,49 @@ verified by injection test.
 
 ---
 
+## Phase 16: Cross-node chunk replication (ADR-005, ADR-026)
+
+**Goal**: A 3-node Replication-3 cluster genuinely tolerates
+single-node loss. Pre-Phase 16, each node held its own chunk
+store and a PUT on node-1 left node-2 + node-3 with no copy —
+breaking the basic HA promise (the B-3 gap from the
+single-node→cluster transition).
+
+**Sub-phases**:
+
+- **16a — Replication-N over the cluster fabric.** Ships a
+  per-shard Raft `cluster_chunk_state` table (refcount + placement,
+  keyed by `(tenant_id, chunk_id)`), the new `kiseki-chunk-cluster`
+  crate with `ClusteredChunkStore` (impl `AsyncChunkOps`) + the
+  `ClusterChunkService` gRPC surface (PutFragment / GetFragment /
+  DeleteFragment / HasFragment), an mTLS-gated SAN-role interceptor
+  (`spiffe://cluster/fabric/<node-id>` accepts; tenant SAN
+  rejected → I-Auth4 / I-T1), and Prometheus metrics. Per-peer
+  channels populate from `cfg.raft_peers`; a 1-node cluster
+  degenerates to local-only (D-6).
+
+- **16b — Defaults table + repair scrub** (deferred). Per-cluster-
+  size durability defaults, EC fragment distribution beyond
+  Replication-N, orphan-fragment-scrub (24h TTL), pNFS DS
+  parallelism that genuinely uses distinct fragment sets per DS,
+  cert revocation / authn-vs-authz tightening.
+
+**Implementation plan**: see
+`specs/implementation/phase-16-cross-node-chunks.md` for the
+14-step build sequence (proto → Raft state machine → AsyncChunkOps
+→ ClusteredChunkStore → gRPC server + interceptor → peer channels
+→ runtime wiring → tests → metrics → mTLS SAN → spec docs →
+adversary close-out).
+
+**Exit criteria** (16a): cross-node read after leader-only PUT
+returns the bytes; read survives single-node failure; 2-of-3
+quorum gate surfaces 503 with retry-after when only 1 peer is
+reachable; tenant cert presented to the fabric port is rejected
+with PermissionDenied; `kiseki_fabric_*` metrics surface in
+`/metrics`.
+
+---
+
 ## Phase dependencies (visual)
 
 ```

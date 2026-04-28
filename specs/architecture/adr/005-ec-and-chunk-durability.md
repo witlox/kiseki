@@ -16,6 +16,25 @@ EC parameters are per affinity pool, configured by cluster admin.
 | bulk-nvme (cold data, checkpoints) | EC 8+3 | Higher space efficiency for bulk data |
 | meta-nvme (log SSTables, key manager) | Replication-3 | Lowest latency for consensus-critical data |
 
+### Phase 16a default — Replication-3 below 6 nodes
+
+EC X+Y requires ≥X+Y distinct failure domains (I-D4). A 3-node
+cluster cannot satisfy EC 4+2 (needs 6 distinct nodes) or EC 8+3
+(needs 11). Phase 16a ships **Replication-3 as the only durability
+strategy** until the per-cluster-size defaults table lands in 16b:
+
+| Cluster size | 16a default | 16b candidate |
+|---|---|---|
+| 1 node | local-only (no replication) | unchanged |
+| 2 nodes | Replication-2 (no quorum — read-only HA only) | unchanged |
+| 3-5 nodes | Replication-3 | EC 2+1 (storage-efficient) or stay Rep-3 |
+| ≥6 nodes | Replication-3 | EC 4+2 (matches the original default) |
+
+Replication-3 pays a 3× storage tax vs EC 4+2's 1.5×, but for
+small/medium clusters that's the price of correctness. See
+`specs/implementation/phase-16-cross-node-chunks.md` for the
+ClusteredChunkStore + ClusterChunkService design.
+
 ### Chunk-RDMA alignment (C-ADV-3)
 
 Content-defined chunking produces variable-size chunks. For RDMA:

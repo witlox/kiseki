@@ -54,6 +54,20 @@ Raft replicates delta metadata (~1KB per operation). Chunk ciphertext
 - Raft consensus adds ~30-60µs (RDMA) or ~75-250µs (TCP) per metadata op
 - 50-100k metadata ops/sec per shard, shards in parallel
 
+**Phase 16a refinement.** The cross-node chunk fabric introduced in
+Phase 16a adds a second Raft-replicated metadata table —
+`cluster_chunk_state`, keyed by `(tenant_id, chunk_id)` and carrying
+the per-chunk refcount + placement list (~80 bytes per entry). This
+is *still* metadata, not bytes: the chunk ciphertext travels over the
+dedicated `ClusterChunkService` gRPC fabric (`PutFragment` / etc.)
+and never rides Raft. The "Raft only for metadata" principle holds —
+`cluster_chunk_state` is in scope for Raft because it's a few dozen
+bytes per chunk, sized to the same order as the existing delta
+metadata. See `specs/implementation/phase-16-cross-node-chunks.md`
+D-4 for the atomic `ChunkAndDelta` proposal that keeps the
+cluster_chunk_state and the composition delta consistent across
+replicas.
+
 ### Projected performance vs competition
 
 | Metric | Kiseki (projected) | Lustre | Ceph | GPFS |

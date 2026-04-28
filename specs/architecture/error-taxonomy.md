@@ -42,6 +42,7 @@ No generic errors. No silent swallowing.
 | `RepairFailed` | Retriable | Repair in progress, retry later | F-I4 |
 | `RetentionHoldActive` | Permanent | Cannot delete: hold in place | I-C2b |
 | `RefcountUnderflow` | Permanent | Decrement below zero (invariant violation) | I-C2 |
+| `QuorumLost { acks, required }` | Retriable | Cross-node fragment fan-out reached fewer than `min_acks` peers (Phase 16a, D-5). Maps to `RetriableError::ShardUnavailable` → S3 503 / NFS4ERR_DELAY with retry-after. | I-L2, phase-16-cross-node-chunks.md |
 
 ### kiseki-composition
 

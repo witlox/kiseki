@@ -24,6 +24,7 @@ ADR-027). gRPC is used for inter-process and network boundaries.
 | `WorkflowAdvisoryService` | Rust server (kiseki-advisory) | Rust client (and any tenant-authorized caller) | Data fabric (separate listener, ADR-021 §1) |
 | `LogService` | Rust server (kiseki-log) | Rust client, gateways | Data fabric |
 | `StorageAdminService` | Rust server (kiseki-server) | Cluster admin, SRE | Management network (ADR-025) |
+| `ClusterChunkService` | Rust server (kiseki-chunk-cluster) | **Internal only** — peer Rust servers, never tenants | Data-path port (9100), mTLS, SAN-role gated to `spiffe://cluster/fabric/<node-id>` (Phase 16a, I-Auth4). Operations: `PutFragment` / `GetFragment` / `DeleteFragment` / `HasFragment`. |
 
 ### Services that are intra-process (Rust trait calls)
 

@@ -267,6 +267,39 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 | **Recovery** | Data loss acknowledged. If the data exists in another composition (dedup): recoverable from there. Otherwise: permanent loss. |
 | **Severity** | **P2** (data loss — localized) |
 
+### F-D6: Peer unreachable during cross-node write (Phase 16a)
+
+| Field | Value |
+|---|---|
+| **Description** | Leader's `PutFragment` fan-out can't reach enough peers to satisfy `min_acks` (default 2-of-3 for Replication-3). |
+| **Blast radius** | Single write call fails; cluster as a whole continues serving. |
+| **Detection** | `ChunkError::QuorumLost { acks, required }` mapped to `RetriableError::ShardUnavailable` → S3 503 / NFS4ERR_DELAY with retry-after. `kiseki_fabric_quorum_lost_total` counter increments. |
+| **Degradation** | Write rejected; client retries with backoff. Reads of already-durable chunks unaffected. |
+| **Recovery** | Peer comes back → automatic. 16b's repair scrub re-replicates anything that landed degraded during the window. |
+| **Severity** | **P3** (transient write rejection; no data loss) |
+
+### F-D7: Leader crash mid-write — orphan fragment window (Phase 16a)
+
+| Field | Value |
+|---|---|
+| **Description** | Leader fans out fragments via `PutFragment`, then crashes before the `CombinedProposal` commits to Raft. Fragments are durable on 2-of-3 peers but no `cluster_chunk_state` entry exists referring to them. |
+| **Blast radius** | Wasted local storage on the receiving peers until cleanup. |
+| **Detection** | Orphan-fragment scrub: a fragment present locally but absent from `cluster_chunk_state` after a 24h TTL window (HLC-based age check via `HasFragmentResponse.stored_age_ms`). |
+| **Degradation** | None — the write itself never acked the client (no Raft commit). Storage usage temporarily inflated. |
+| **Recovery** | Scrub reclaims the orphan fragments; metric `kiseki_fabric_orphan_fragments_reclaimed_total` (16b). |
+| **Severity** | **P3** (storage waste; no correctness impact) |
+
+### F-D8: Cross-stream Raft-vs-fabric ordering race (Phase 16a, D-10)
+
+| Field | Value |
+|---|---|
+| **Description** | Composition delta + `cluster_chunk_state` arrive on a follower via Raft *before* the corresponding fragment arrives via `PutFragment`. A concurrent read on that follower finds the chunk absent locally. |
+| **Blast radius** | Single read on the slow follower. |
+| **Detection** | Local `ChunkStore.read_chunk` returns `NotFound` despite `cluster_chunk_state` reporting the chunk as durable. |
+| **Degradation** | None — `ClusteredChunkStore.read_chunk` falls back to `GetFragment` against any peer in the placement list. The kernel sees a slightly slower read, not an error. |
+| **Recovery** | Self-healing — fabric fan-out from the leader catches up within the `put_timeout` window (5s). |
+| **Severity** | **P4** (latency hiccup; no failure) |
+
 ---
 
 ## Operational failures
