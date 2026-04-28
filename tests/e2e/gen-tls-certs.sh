@@ -17,6 +17,12 @@
 # against the SNI from the client. mount.nfs4 uses the hostname from
 # the mount target ('kiseki-node1', etc.) — listing all three node
 # names + 'localhost' as SANs lets the same cert serve every node.
+#
+# Phase 16a step 12 — the cert also carries `spiffe://cluster/fabric/<id>`
+# URI SANs (one per node) so the ClusterChunkService SAN-role
+# interceptor accepts inbound peer-to-peer fabric calls. In production
+# each node would carry its own per-node fabric cert; for the test rig
+# we share one cert with all three node identities listed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,6 +66,9 @@ DNS.2 = kiseki-node2
 DNS.3 = kiseki-node3
 DNS.4 = localhost
 IP.1 = 127.0.0.1
+URI.1 = spiffe://cluster/fabric/kiseki-node1
+URI.2 = spiffe://cluster/fabric/kiseki-node2
+URI.3 = spiffe://cluster/fabric/kiseki-node3
 EOF
 openssl req -new -key server.key -config server.csr.cnf -out server.csr 2>/dev/null
 cat > server.ext.cnf <<'EOF'
@@ -71,6 +80,9 @@ DNS.2 = kiseki-node2
 DNS.3 = kiseki-node3
 DNS.4 = localhost
 IP.1 = 127.0.0.1
+URI.1 = spiffe://cluster/fabric/kiseki-node1
+URI.2 = spiffe://cluster/fabric/kiseki-node2
+URI.3 = spiffe://cluster/fabric/kiseki-node3
 EOF
 openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
     -out server.pem -days 3650 -sha256 -extfile server.ext.cnf 2>/dev/null

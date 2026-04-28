@@ -56,6 +56,55 @@ fn build_tls(files: &TlsFiles) -> Result<ServerTlsConfig, Box<dyn std::error::Er
     Ok(tls)
 }
 
+/// Build a per-peer fabric `Channel` to a peer's data-path gRPC. The
+/// peer endpoint is host:port; this function strips the colon-port,
+/// rewrites the URI scheme to `https://` (or `http://` for plaintext),
+/// and applies mTLS using the shared cluster CA + this node's identity
+/// when `tls_files` is `Some`. Phase 16a step 12.
+fn build_fabric_channel(
+    peer_addr: &str,
+    tls_files: Option<&TlsFiles>,
+) -> Result<tonic::transport::Channel, Box<dyn std::error::Error + Send + Sync>> {
+    use tonic::transport::{ClientTlsConfig, Endpoint};
+
+    let scheme = if tls_files.is_some() { "https" } else { "http" };
+    // Default the SNI to the host portion of peer_addr; the
+    // shared-cluster cert lists all node DNS names as SANs (see
+    // tests/e2e/gen-tls-certs.sh).
+    let host = peer_addr
+        .split(':')
+        .next()
+        .ok_or("peer addr missing host")?
+        .to_owned();
+    let uri: tonic::transport::Uri = format!("{scheme}://{peer_addr}")
+        .parse()
+        .map_err(|e| format!("peer URI parse: {e}"))?;
+
+    let mut endpoint = Endpoint::from(uri)
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5));
+
+    if let Some(files) = tls_files {
+        let ca_pem = std::fs::read(&files.ca_path)
+            .map_err(|e| format!("read fabric CA {}: {e}", files.ca_path.display()))?;
+        let cert_pem = std::fs::read(&files.cert_path)
+            .map_err(|e| format!("read fabric cert {}: {e}", files.cert_path.display()))?;
+        let key_pem = std::fs::read(&files.key_path)
+            .map_err(|e| format!("read fabric key {}: {e}", files.key_path.display()))?;
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&ca_pem))
+            .identity(Identity::from_pem(&cert_pem, &key_pem))
+            .domain_name(host);
+        endpoint = endpoint
+            .tls_config(tls)
+            .map_err(|e| format!("fabric TLS config: {e}"))?;
+    }
+
+    let channel = endpoint
+        .connect_lazy(); // lazy: failed peers don't block startup
+    Ok(channel)
+}
+
 /// Run the main data-path server.
 #[allow(clippy::too_many_lines)]
 pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -249,19 +298,50 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             Arc::new(kiseki_chunk::SyncBridge::new(kiseki_chunk::ChunkStore::new()))
         };
 
-    // Cluster chunk fabric (Phase 16a). When raft_peers > 1 we wrap the
-    // local store in a ClusteredChunkStore so writes fan out to peers via
-    // the ClusterChunkService gRPC fabric (D-1, D-5). For a 1-node cluster
-    // peers is empty and the store degenerates to local-only (D-6); the
+    // Cluster chunk fabric (Phase 16a step 12). For each *other* peer
+    // in raft_peers we open a lazy mTLS gRPC Channel to its data-path
+    // port and wrap it in GrpcFabricPeer. For a 1-node cluster peers
+    // is empty and the store degenerates to local-only (D-6); the
     // existing single-node tests stay green by construction.
     //
-    // 16a step 7 ships the wiring; populating peers from cfg.raft_peers
-    // requires per-peer gRPC channel creation with mTLS, which lands in
-    // step 12 alongside the cert-gen tooling. Until then, a multi-node
-    // cluster degenerates to local-only on each node — losing the
-    // cross-node feature but never breaking correctness.
+    // The data-path port carries both the data services AND the
+    // ClusterChunkService — peers reuse the same port. The SAN-role
+    // interceptor (step 5) gates fabric methods to certs that carry
+    // a `spiffe://cluster/fabric/<node-id>` SAN URI.
     let bootstrap_tenant_for_cluster = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
-    let fabric_peers: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> = Vec::new();
+    let mut fabric_peers: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> = Vec::new();
+    for (peer_id, peer_addr) in &cfg.raft_peers {
+        if *peer_id == cfg.node_id {
+            continue; // skip ourselves
+        }
+        match build_fabric_channel(peer_addr, cfg.tls.as_ref()) {
+            Ok(channel) => {
+                let name = format!("node-{peer_id}");
+                fabric_peers.push(Arc::new(kiseki_chunk_cluster::GrpcFabricPeer::new(
+                    name, channel,
+                )));
+                tracing::info!(
+                    peer_id, peer_addr, "fabric peer registered for cross-node chunks",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer_id, peer_addr, error = %e,
+                    "fabric peer channel build failed — peer skipped (cluster may run degraded)",
+                );
+            }
+        }
+    }
+    if !fabric_peers.is_empty() {
+        tracing::info!(
+            peers = fabric_peers.len(),
+            "cross-node chunk replication enabled (Phase 16a)",
+        );
+    } else if cfg.raft_peers.len() > 1 {
+        tracing::warn!(
+            "cross-node fabric is empty despite raft_peers > 1 — cluster running in local-only mode",
+        );
+    }
     let cluster_cfg =
         kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default");
     let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
