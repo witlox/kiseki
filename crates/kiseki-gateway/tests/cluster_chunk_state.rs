@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 
 use kiseki_chunk::store::ChunkStore;
-use kiseki_common::ids::{NamespaceId, NodeId, OrgId, SequenceNumber, ShardId};
+use kiseki_common::ids::{ChunkId, NamespaceId, NodeId, OrgId, SequenceNumber, ShardId};
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_composition::composition::CompositionStore;
 use kiseki_composition::namespace::Namespace;
@@ -38,9 +38,12 @@ fn test_shard() -> ShardId {
 
 /// Records every `LogOps` proposal so the gateway flow can be asserted.
 #[derive(Default)]
+#[allow(clippy::struct_field_names)]
 struct RecordingLog {
     plain_calls: Mutex<Vec<AppendDeltaRequest>>,
     chunk_and_delta_calls: Mutex<Vec<AppendChunkAndDeltaRequest>>,
+    decrement_calls: Mutex<Vec<(ShardId, OrgId, ChunkId)>>,
+    increment_calls: Mutex<Vec<(ShardId, OrgId, ChunkId)>>,
 }
 
 #[async_trait::async_trait]
@@ -59,6 +62,32 @@ impl LogOps for RecordingLog {
     ) -> Result<SequenceNumber, LogError> {
         self.chunk_and_delta_calls.lock().unwrap().push(req);
         Ok(SequenceNumber(1))
+    }
+
+    async fn increment_chunk_refcount(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        chunk_id: ChunkId,
+    ) -> Result<(), LogError> {
+        self.increment_calls
+            .lock()
+            .unwrap()
+            .push((shard_id, tenant_id, chunk_id));
+        Ok(())
+    }
+
+    async fn decrement_chunk_refcount(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        chunk_id: ChunkId,
+    ) -> Result<(), LogError> {
+        self.decrement_calls
+            .lock()
+            .unwrap()
+            .push((shard_id, tenant_id, chunk_id));
+        Ok(())
     }
 
     async fn read_deltas(
@@ -135,6 +164,13 @@ impl LogOps for RecordingLog {
 }
 
 fn setup(log: Arc<dyn LogOps + Send + Sync>) -> InMemoryGateway {
+    setup_with_placement(log, vec![])
+}
+
+fn setup_with_placement(
+    log: Arc<dyn LogOps + Send + Sync>,
+    placement: Vec<u64>,
+) -> InMemoryGateway {
     let mut compositions = CompositionStore::new().with_log(log);
     compositions.add_namespace(Namespace {
         id: test_namespace(),
@@ -148,6 +184,7 @@ fn setup(log: Arc<dyn LogOps + Send + Sync>) -> InMemoryGateway {
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
     InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key)
+        .with_cluster_placement(placement)
 }
 
 /// RED test #1: a fresh write (no prior dedup) of a chunk-sized
@@ -246,4 +283,103 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         1,
         "the dedup-hit second write should take the plain AppendDelta path"
     );
+}
+
+// === Phase 16b step 2: placement plumbing + decrement on delete ===
+
+/// RED: a gateway configured with a non-empty placement list must
+/// surface that placement in the `ChunkAndDelta` proposal so the
+/// `cluster_chunk_state[(tenant, chunk_id)]` row records who holds
+/// the fragments — required by step 4's repair scrub and the
+/// cross-cluster GC fan-out (step 2 follow-up).
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_chunk_write_carries_configured_placement() {
+    let log = Arc::new(RecordingLog::default());
+    let placement = vec![1u64, 2, 3];
+    let gw = setup_with_placement(
+        Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>,
+        placement.clone(),
+    );
+
+    gw.write(kiseki_gateway::WriteRequest {
+        tenant_id: test_tenant(),
+        namespace_id: test_namespace(),
+        data: vec![0xEEu8; 4096],
+    })
+    .await
+    .expect("write");
+
+    let calls = log.chunk_and_delta_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let proposal = &calls[0];
+    assert_eq!(
+        proposal.new_chunks[0].placement, placement,
+        "ChunkAndDelta must carry the configured cluster placement"
+    );
+}
+
+/// RED: a gateway with an empty placement list (single-node mode)
+/// emits `ChunkAndDelta` with empty placement — same as before this
+/// step, but pinned now so a future regression doesn't accidentally
+/// fill it with bogus values.
+#[tokio::test(flavor = "multi_thread")]
+async fn single_node_gateway_emits_empty_placement() {
+    let log = Arc::new(RecordingLog::default());
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
+
+    gw.write(kiseki_gateway::WriteRequest {
+        tenant_id: test_tenant(),
+        namespace_id: test_namespace(),
+        data: vec![0x77u8; 4096],
+    })
+    .await
+    .expect("write");
+
+    let calls = log.chunk_and_delta_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].new_chunks[0].placement.is_empty(),
+        "single-node gateway must emit empty placement"
+    );
+}
+
+/// RED: composition delete must emit `decrement_chunk_refcount` for
+/// every chunk the composition referenced. This is the cluster-wide
+/// counterpart to the local refcount drop the gateway already does;
+/// without it `cluster_chunk_state` never tombstones and step 4's
+/// scrub has no signal to act on.
+#[tokio::test(flavor = "multi_thread")]
+async fn composition_delete_emits_decrement_for_each_chunk() {
+    let log = Arc::new(RecordingLog::default());
+    let gw = setup_with_placement(
+        Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>,
+        vec![1, 2, 3],
+    );
+
+    let resp = gw
+        .write(kiseki_gateway::WriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: vec![0xAAu8; 4096],
+        })
+        .await
+        .expect("write");
+
+    // Sanity check that the write produced exactly one new chunk.
+    let chunk_id = log.chunk_and_delta_calls.lock().unwrap()[0].new_chunks[0].chunk_id;
+
+    gw.delete(test_tenant(), test_namespace(), resp.composition_id)
+        .await
+        .expect("delete");
+
+    let dec_calls = log.decrement_calls.lock().unwrap();
+    assert_eq!(
+        dec_calls.len(),
+        1,
+        "composition delete must emit one decrement per referenced chunk"
+    );
+    let (shard, tenant, cid) = dec_calls[0];
+    assert_eq!(shard, test_shard(), "shard id matches the composition");
+    assert_eq!(tenant, test_tenant(), "tenant id matches");
+    assert_eq!(cid.0, chunk_id, "decrement targets the right chunk");
 }

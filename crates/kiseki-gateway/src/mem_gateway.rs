@@ -61,6 +61,11 @@ pub struct InMemoryGateway {
     /// per-workload backpressure events on saturation and QoS-headroom
     /// updates as quota is consumed (I-WA5: per-caller scoping).
     telemetry_bus: std::sync::RwLock<Option<Arc<kiseki_advisory::TelemetryBus>>>,
+    /// Cluster placement for newly-created chunks (Phase 16b step 2).
+    /// Stamped into `NewChunkMeta.placement` on every fresh chunk write
+    /// so `cluster_chunk_state[(tenant, chunk_id)]` records who holds
+    /// the fragments. Empty in single-node mode (`raft_peers.len() == 1`).
+    cluster_placement: Vec<u64>,
     /// Chunk plaintext cache (Phase 15c.5 perf fix). Chunks are
     /// content-addressed (`chunk_id` = HMAC over plaintext + salt)
     /// so caching decrypted bytes by `chunk_id` is correct: the
@@ -148,6 +153,7 @@ impl InMemoryGateway {
             small_store: None,
             shard_map: std::sync::RwLock::new(None),
             telemetry_bus: std::sync::RwLock::new(None),
+            cluster_placement: Vec::new(),
             decrypt_cache: std::sync::Mutex::new(DecryptCache::default()),
         }
     }
@@ -338,6 +344,17 @@ impl InMemoryGateway {
     pub fn with_dedup_policy(mut self, policy: DedupPolicy, hmac_key: Option<Vec<u8>>) -> Self {
         self.dedup_policy = policy;
         self.tenant_hmac_key = hmac_key;
+        self
+    }
+
+    /// Configure cluster placement for fresh chunks (Phase 16b step 2).
+    /// `placement` lists the node ids that hold each new chunk's
+    /// fragments. Stamped into `NewChunkMeta.placement` so the per-shard
+    /// Raft state machine can drive cross-cluster GC + repair scrub
+    /// without re-discovering topology. Empty list = single-node mode.
+    #[must_use]
+    pub fn with_cluster_placement(mut self, placement: Vec<u64>) -> Self {
+        self.cluster_placement = placement;
         self
     }
 }
@@ -614,14 +631,7 @@ impl GatewayOps for InMemoryGateway {
             let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = if chunk_was_new {
                 vec![kiseki_log::raft_store::NewChunkMeta {
                     chunk_id: chunk_id.0,
-                    // 16b step 1 leaves placement empty — the
-                    // ClusteredChunkStore's peer list is the
-                    // authoritative placement, but plumbing it
-                    // through AsyncChunkOps is a separate layer
-                    // change. Step 2 (cluster-wide GC) will need
-                    // real placement; until then the entry is still
-                    // useful for refcount tracking.
-                    placement: vec![],
+                    placement: self.cluster_placement.clone(),
                 }]
             } else {
                 vec![]
@@ -753,8 +763,11 @@ impl GatewayOps for InMemoryGateway {
         _namespace_id: kiseki_common::ids::NamespaceId,
         composition_id: kiseki_common::ids::CompositionId,
     ) -> Result<(), GatewayError> {
-        // Verify tenant ownership before deleting.
-        {
+        // Verify tenant ownership and snapshot the routing data
+        // (shard_id, log handle) before deleting. Phase 16b step 2:
+        // we need the shard to emit DecrementChunkRefcount Raft
+        // proposals after the composition is gone.
+        let (shard_id, log) = {
             let compositions = self.compositions.lock().await;
             let comp = compositions
                 .get(composition_id)
@@ -762,7 +775,8 @@ impl GatewayOps for InMemoryGateway {
             if comp.tenant_id != tenant_id {
                 return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
             }
-        }
+            (comp.shard_id, compositions.log().cloned())
+        };
 
         // Delete the composition (sync — no lock held during Raft).
         // Log emission for delete tombstone would go here if needed.
@@ -775,9 +789,18 @@ impl GatewayOps for InMemoryGateway {
 
         // Decrement chunk refcounts only when actually removed (not
         // a versioned delete marker). I-C2: GC when refcount reaches 0.
+        // Two refcount tracks:
+        //   - Local `ChunkStore` refcount drives this node's GC sweep.
+        //   - `cluster_chunk_state` refcount drives cluster-wide GC
+        //     (DeleteFragment fan-out lands in the next step).
         if let kiseki_composition::DeleteResult::Removed(ref released) = delete_result {
             for chunk_id in released {
                 let _ = self.chunks.decrement_refcount(chunk_id).await;
+                if let Some(ref log) = log {
+                    let _ = log
+                        .decrement_chunk_refcount(shard_id, tenant_id, *chunk_id)
+                        .await;
+                }
             }
         }
 
