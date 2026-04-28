@@ -15,9 +15,7 @@
 
 use std::time::Duration;
 
-use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry,
-};
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry};
 
 /// Outcome label values for `kiseki_fabric_ops_total`.
 pub mod outcome {
@@ -112,9 +110,7 @@ impl FabricMetrics {
 
     /// Record a fabric op outcome + duration.
     pub fn record_op(&self, op: &str, peer: &str, outcome: &str, dur: Duration) {
-        self.ops_total
-            .with_label_values(&[op, peer, outcome])
-            .inc();
+        self.ops_total.with_label_values(&[op, peer, outcome]).inc();
         self.op_duration
             .with_label_values(&[op])
             .observe(dur.as_secs_f64());
@@ -135,7 +131,12 @@ mod tests {
         let reg = Registry::new();
         let m = FabricMetrics::register(&reg).expect("register ok");
         m.record_op(op::PUT, "node-2", outcome::OK, Duration::from_millis(7));
-        m.record_op(op::GET, "node-3", outcome::NOT_FOUND, Duration::from_millis(2));
+        m.record_op(
+            op::GET,
+            "node-3",
+            outcome::NOT_FOUND,
+            Duration::from_millis(2),
+        );
         m.record_quorum_lost();
 
         // Scrape — confirm presence + non-zero observations.

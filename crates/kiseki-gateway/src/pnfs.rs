@@ -1146,10 +1146,7 @@ mod mds_layout_tests {
     /// is non-empty and starts at the requested offset.
     #[test]
     fn layout_get_with_nonzero_offset_and_u64_max_length_starts_at_offset() {
-        let mgr = MdsLayoutManager::new(
-            fixed_key(),
-            cfg_with_nodes(vec!["n1:2052"]),
-        );
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
         let layout = mgr.layout_get(
             OrgId(uuid::Uuid::nil()),
             NamespaceId(uuid::Uuid::nil()),

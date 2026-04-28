@@ -86,10 +86,7 @@ impl GrpcFabricPeer {
                 value: e.system_epoch.0,
             }),
             tenant_epoch: e.tenant_epoch.map(|k| pb::KeyEpoch { value: k.0 }),
-            tenant_wrapped_material: e
-                .tenant_wrapped_material
-                .clone()
-                .unwrap_or_default(),
+            tenant_wrapped_material: e.tenant_wrapped_material.clone().unwrap_or_default(),
             chunk_id: Some(pb::ChunkId {
                 value: e.chunk_id.0.to_vec(),
             }),
@@ -105,11 +102,13 @@ impl GrpcFabricPeer {
         if p.nonce.len() != 12 {
             return Err(FabricPeerError::Transport("nonce must be 12 bytes".into()));
         }
-        let cid = p.chunk_id.ok_or_else(|| {
-            FabricPeerError::Transport("envelope missing chunk_id".into())
-        })?;
+        let cid = p
+            .chunk_id
+            .ok_or_else(|| FabricPeerError::Transport("envelope missing chunk_id".into()))?;
         if cid.value.len() != 32 {
-            return Err(FabricPeerError::Transport("chunk_id must be 32 bytes".into()));
+            return Err(FabricPeerError::Transport(
+                "chunk_id must be 32 bytes".into(),
+            ));
         }
         let sys_epoch = p
             .system_epoch

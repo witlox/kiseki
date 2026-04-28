@@ -110,11 +110,7 @@ impl ScrubScheduler {
         // Orphan scrub: walk the local store, ask the LogChunkOracle
         // about each id.
         let local_ids = self.local.list_chunk_ids().await;
-        let oracle = LogChunkOracle::new(
-            Arc::clone(&self.log),
-            self.shard_id,
-            self.tenant_id,
-        );
+        let oracle = LogChunkOracle::new(Arc::clone(&self.log), self.shard_id, self.tenant_id);
         let orphan = OrphanScrub::new(self.orphan_policy)
             .run(&local_ids, &oracle, self.deleter.as_ref())
             .await;
@@ -252,11 +248,7 @@ mod tests {
 
     #[async_trait]
     impl AsyncChunkOps for FakeLocalChunks {
-        async fn write_chunk(
-            &self,
-            _env: Envelope,
-            _pool: &str,
-        ) -> Result<bool, ChunkError> {
+        async fn write_chunk(&self, _env: Envelope, _pool: &str) -> Result<bool, ChunkError> {
             unreachable!("scheduler test does not write")
         }
         async fn read_chunk(&self, _id: &ChunkId) -> Result<Envelope, ChunkError> {
@@ -268,11 +260,7 @@ mod tests {
         async fn decrement_refcount(&self, _id: &ChunkId) -> Result<u64, ChunkError> {
             unreachable!()
         }
-        async fn set_retention_hold(
-            &self,
-            _id: &ChunkId,
-            _hold: &str,
-        ) -> Result<(), ChunkError> {
+        async fn set_retention_hold(&self, _id: &ChunkId, _hold: &str) -> Result<(), ChunkError> {
             Ok(())
         }
         async fn release_retention_hold(
@@ -353,18 +341,8 @@ mod tests {
             _range_end: [u8; 32],
         ) {
         }
-        fn set_shard_state(
-            &self,
-            _shard_id: ShardId,
-            _state: kiseki_log::shard::ShardState,
-        ) {
-        }
-        fn set_shard_config(
-            &self,
-            _shard_id: ShardId,
-            _config: kiseki_log::shard::ShardConfig,
-        ) {
-        }
+        fn set_shard_state(&self, _shard_id: ShardId, _state: kiseki_log::shard::ShardState) {}
+        fn set_shard_config(&self, _shard_id: ShardId, _config: kiseki_log::shard::ShardConfig) {}
         async fn register_consumer(
             &self,
             _shard_id: ShardId,
@@ -430,12 +408,7 @@ mod tests {
 
     #[async_trait]
     impl Repairer for FakeRepairer {
-        async fn repair(
-            &self,
-            _chunk_id: ChunkId,
-            _from: u64,
-            _to: u64,
-        ) -> Result<(), String> {
+        async fn repair(&self, _chunk_id: ChunkId, _from: u64, _to: u64) -> Result<(), String> {
             *self.repairs.lock().unwrap() += 1;
             Ok(())
         }
@@ -454,10 +427,7 @@ mod tests {
             created_ms: 0,
             original_len: 0,
         };
-        let single: HashMap<_, _> = chunk_ids
-            .iter()
-            .map(|id| (*id, entry.clone()))
-            .collect();
+        let single: HashMap<_, _> = chunk_ids.iter().map(|id| (*id, entry.clone())).collect();
         let iter = chunk_ids
             .iter()
             .map(|id| (tenant(), *id, entry.clone()))
@@ -486,10 +456,7 @@ mod tests {
 
         let report = scheduler.run_once().await.expect("ok");
         assert_eq!(report.orphan.scanned, 2, "every local chunk scanned");
-        assert_eq!(
-            report.orphan.deleted, 0,
-            "healthy cluster: nothing deleted"
-        );
+        assert_eq!(report.orphan.deleted, 0, "healthy cluster: nothing deleted");
         assert_eq!(report.under_replication.scanned, 2);
         assert_eq!(report.under_replication.healthy, 2);
         assert_eq!(report.under_replication.repaired, 0);

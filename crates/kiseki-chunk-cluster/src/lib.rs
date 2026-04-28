@@ -71,17 +71,17 @@ pub mod server;
 pub use auth::{verify_fabric_san, FabricAuthError};
 pub use defaults::{defaults_for, ClusterDurabilityDefaults};
 pub use ec::{
-    decode_from_responses, encode_for_placement, EcDistributionError, EcStrategy,
-    FragmentResponse, FragmentRoute,
+    decode_from_responses, encode_for_placement, EcDistributionError, EcStrategy, FragmentResponse,
+    FragmentRoute,
 };
 pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use placement::pick_placement;
 pub use scrub::{
-    ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, FragmentAvailabilityOracle,
-    LogChunkOracle, OrphanDecision, OrphanDeleter, OrphanScrub, OrphanScrubPolicy,
-    OrphanScrubReport, Repairer, ReplicationDecision, UnderReplicationPolicy,
-    UnderReplicationReport, UnderReplicationScrub, DEFAULT_ORPHAN_TTL,
+    ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, FragmentAvailabilityOracle, LogChunkOracle,
+    OrphanDecision, OrphanDeleter, OrphanScrub, OrphanScrubPolicy, OrphanScrubReport, Repairer,
+    ReplicationDecision, UnderReplicationPolicy, UnderReplicationReport, UnderReplicationScrub,
+    DEFAULT_ORPHAN_TTL,
 };
 pub use scrub_adapters::{FabricAvailabilityOracle, FabricRepairer, LocalChunkDeleter};
 pub use scrub_scheduler::{ScrubReport, ScrubScheduler};
@@ -233,21 +233,14 @@ impl ClusteredChunkStore {
         placement: &[u64],
         strategy: crate::ec::EcStrategy,
     ) -> Result<(), ChunkError> {
-        let routes = crate::ec::encode_for_placement(
-            strategy,
-            &envelope.ciphertext,
-            placement,
-        )
-        .map_err(|e| ChunkError::Io(e.to_string()))?;
+        let routes = crate::ec::encode_for_placement(strategy, &envelope.ciphertext, placement)
+            .map_err(|e| ChunkError::Io(e.to_string()))?;
 
         // Build a peer-id → peer-handle index. Caller-supplied
         // peers may be in a different order than `placement`, so we
         // route by id, not by position.
-        let by_id: std::collections::HashMap<&str, &Arc<dyn FabricPeer>> = self
-            .peers
-            .iter()
-            .map(|p| (p.name(), p))
-            .collect();
+        let by_id: std::collections::HashMap<&str, &Arc<dyn FabricPeer>> =
+            self.peers.iter().map(|p| (p.name(), p)).collect();
 
         let mut acks: usize = 0;
         let mut futs = Vec::with_capacity(routes.len());
@@ -325,11 +318,8 @@ impl ClusteredChunkStore {
         strategy: crate::ec::EcStrategy,
         original_len: Option<u64>,
     ) -> Result<Envelope, ChunkError> {
-        let by_id: std::collections::HashMap<&str, &Arc<dyn FabricPeer>> = self
-            .peers
-            .iter()
-            .map(|p| (p.name(), p))
-            .collect();
+        let by_id: std::collections::HashMap<&str, &Arc<dyn FabricPeer>> =
+            self.peers.iter().map(|p| (p.name(), p)).collect();
 
         let mut responses: Vec<crate::ec::FragmentResponse> = Vec::new();
         for (i, peer_id) in placement.iter().enumerate() {
@@ -371,8 +361,9 @@ impl ClusteredChunkStore {
             crate::ec::EcStrategy::Ec { data, .. } => usize::from(data),
             crate::ec::EcStrategy::Replication { .. } => 1,
         };
-        let decode_len = original_len
-            .map_or(shard_size * data_count, |n| usize::try_from(n).unwrap_or(usize::MAX));
+        let decode_len = original_len.map_or(shard_size * data_count, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX)
+        });
         let plaintext = crate::ec::decode_from_responses(strategy, &responses, decode_len)
             .map_err(|e| ChunkError::Io(e.to_string()))?;
         let bytes = if original_len.is_some() {
@@ -384,10 +375,7 @@ impl ClusteredChunkStore {
             // Fallback: strip trailing zeros (the encoder padded
             // each data shard to uniform size). Correct for
             // AES-GCM ciphertext; not safe for sparse plaintext.
-            let trimmed_len = plaintext
-                .iter()
-                .rposition(|b| *b != 0)
-                .map_or(0, |i| i + 1);
+            let trimmed_len = plaintext.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
             let mut bytes = plaintext;
             bytes.truncate(trimmed_len);
             bytes
@@ -495,11 +483,7 @@ impl AsyncChunkOps for ClusteredChunkStore {
                     .take(total)
                     .collect::<Vec<_>>()
             } else {
-                crate::placement::pick_placement(
-                    &envelope.chunk_id,
-                    &self.cfg.cluster_nodes,
-                    total,
-                )
+                crate::placement::pick_placement(&envelope.chunk_id, &self.cfg.cluster_nodes, total)
             };
             self.write_chunk_ec(envelope, &placement, self.cfg.ec_strategy)
                 .await?;
@@ -604,11 +588,7 @@ impl AsyncChunkOps for ClusteredChunkStore {
         // Fabric fallback. Replication-N: any 1 fragment_index=0 is
         // sufficient. Walk peers in order; first success wins.
         for peer in &self.peers {
-            match tokio::time::timeout(
-                self.cfg.get_timeout,
-                peer.get_fragment(*chunk_id, 0),
-            )
-            .await
+            match tokio::time::timeout(self.cfg.get_timeout, peer.get_fragment(*chunk_id, 0)).await
             {
                 Ok(Ok(env)) => return Ok(env),
                 Ok(Err(FabricPeerError::NotFound)) => {}
@@ -884,7 +864,10 @@ mod tests {
         let p3 = MockPeer::new("node3");
         let store = ClusteredChunkStore::new(
             Arc::clone(&local),
-            vec![Arc::clone(&p2) as Arc<dyn FabricPeer>, Arc::clone(&p3) as Arc<dyn FabricPeer>],
+            vec![
+                Arc::clone(&p2) as Arc<dyn FabricPeer>,
+                Arc::clone(&p3) as Arc<dyn FabricPeer>,
+            ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
         let env = make_envelope(0x22);
@@ -904,7 +887,10 @@ mod tests {
         p3.fail_put(FabricPeerError::Unavailable("node3 down".into()));
         let store = ClusteredChunkStore::new(
             local,
-            vec![Arc::clone(&p2) as Arc<dyn FabricPeer>, Arc::clone(&p3) as Arc<dyn FabricPeer>],
+            vec![
+                Arc::clone(&p2) as Arc<dyn FabricPeer>,
+                Arc::clone(&p3) as Arc<dyn FabricPeer>,
+            ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
         let env = make_envelope(0x33);
@@ -923,7 +909,10 @@ mod tests {
         p3.fail_put(FabricPeerError::Unavailable("down".into()));
         let store = ClusteredChunkStore::new(
             local,
-            vec![Arc::clone(&p2) as Arc<dyn FabricPeer>, Arc::clone(&p3) as Arc<dyn FabricPeer>],
+            vec![
+                Arc::clone(&p2) as Arc<dyn FabricPeer>,
+                Arc::clone(&p3) as Arc<dyn FabricPeer>,
+            ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
         let env = make_envelope(0x44);
@@ -932,7 +921,13 @@ mod tests {
             .await
             .expect_err("must fail with quorum lost");
         assert!(
-            matches!(err, ChunkError::QuorumLost { acks: 1, required: 2 }),
+            matches!(
+                err,
+                ChunkError::QuorumLost {
+                    acks: 1,
+                    required: 2
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -947,7 +942,10 @@ mod tests {
         p3.delay_put(Duration::from_secs(30));
         let store = ClusteredChunkStore::new(
             local,
-            vec![Arc::clone(&p2) as Arc<dyn FabricPeer>, Arc::clone(&p3) as Arc<dyn FabricPeer>],
+            vec![
+                Arc::clone(&p2) as Arc<dyn FabricPeer>,
+                Arc::clone(&p3) as Arc<dyn FabricPeer>,
+            ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
         let env = make_envelope(0x55);
@@ -969,7 +967,10 @@ mod tests {
         p3.preload(env.clone()); // only node3 has it
         let store = ClusteredChunkStore::new(
             local,
-            vec![Arc::clone(&p2) as Arc<dyn FabricPeer>, Arc::clone(&p3) as Arc<dyn FabricPeer>],
+            vec![
+                Arc::clone(&p2) as Arc<dyn FabricPeer>,
+                Arc::clone(&p3) as Arc<dyn FabricPeer>,
+            ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
         let got = store.read_chunk(&chunk_id).await.expect("read");
@@ -986,7 +987,10 @@ mod tests {
         let p3 = MockPeer::new("node3");
         let store = ClusteredChunkStore::new(
             local,
-            vec![Arc::clone(&p2) as Arc<dyn FabricPeer>, Arc::clone(&p3) as Arc<dyn FabricPeer>],
+            vec![
+                Arc::clone(&p2) as Arc<dyn FabricPeer>,
+                Arc::clone(&p3) as Arc<dyn FabricPeer>,
+            ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
         let missing = ChunkId([0xEEu8; 32]);
@@ -1001,7 +1005,10 @@ mod tests {
         let local = local_bridge("p");
         let env = make_envelope(0x77);
         let chunk_id = env.chunk_id;
-        local.write_chunk(env.clone(), "p").await.expect("seed local");
+        local
+            .write_chunk(env.clone(), "p")
+            .await
+            .expect("seed local");
 
         let p2 = MockPeer::new("node2");
         let p3 = MockPeer::new("node3");
@@ -1011,7 +1018,10 @@ mod tests {
 
         let store = ClusteredChunkStore::new(
             local,
-            vec![Arc::clone(&p2) as Arc<dyn FabricPeer>, Arc::clone(&p3) as Arc<dyn FabricPeer>],
+            vec![
+                Arc::clone(&p2) as Arc<dyn FabricPeer>,
+                Arc::clone(&p3) as Arc<dyn FabricPeer>,
+            ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
         let got = store.read_chunk(&chunk_id).await.expect("read");
@@ -1034,7 +1044,10 @@ mod tests {
         // Pre-load local + both peers so each has the chunk.
         let env = make_envelope(0xDD);
         let chunk_id = env.chunk_id;
-        local.write_chunk(env.clone(), "p").await.expect("seed local");
+        local
+            .write_chunk(env.clone(), "p")
+            .await
+            .expect("seed local");
         p2.preload(env.clone());
         p3.preload(env);
 
@@ -1085,7 +1098,10 @@ mod tests {
 
         let env = make_envelope(0xEE);
         let chunk_id = env.chunk_id;
-        local.write_chunk(env.clone(), "p").await.expect("seed local");
+        local
+            .write_chunk(env.clone(), "p")
+            .await
+            .expect("seed local");
         p2.preload(env);
         // p3 deliberately NOT preloaded — its delete returns Ok(false)
         // (idempotent on absent), counted but reports nothing was
@@ -1396,12 +1412,7 @@ mod tests {
         // `original_len` path is exercised (no trim-trailing-zeros).
         let original_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let recovered = store_reader
-            .read_chunk_ec(
-                &chunk_id,
-                &[1, 2, 3, 4, 5, 6],
-                strategy,
-                Some(original_len),
-            )
+            .read_chunk_ec(&chunk_id, &[1, 2, 3, 4, 5, 6], strategy, Some(original_len))
             .await
             .expect("ec read");
         assert_eq!(

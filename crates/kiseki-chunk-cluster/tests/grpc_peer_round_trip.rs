@@ -14,9 +14,7 @@ use kiseki_chunk::store::ChunkStore;
 use kiseki_chunk::{AsyncChunkOps, SyncBridge};
 use kiseki_chunk_cluster::metrics::{op as op_label, outcome};
 use kiseki_chunk_cluster::peer::FabricPeerError;
-use kiseki_chunk_cluster::{
-    ClusterChunkServer, FabricMetrics, FabricPeer, GrpcFabricPeer,
-};
+use kiseki_chunk_cluster::{ClusterChunkServer, FabricMetrics, FabricPeer, GrpcFabricPeer};
 use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::envelope::Envelope;
@@ -53,9 +51,7 @@ fn make_envelope(seed: u8) -> Envelope {
 /// Spin up a `ClusterChunkServer` on an ephemeral port and return a
 /// connected `GrpcFabricPeer`. Caller drops the join handle when the
 /// test ends — the server tears down on tokio runtime shutdown.
-async fn start_server_and_client(
-    pool: &str,
-) -> (Arc<dyn AsyncChunkOps>, Arc<GrpcFabricPeer>) {
+async fn start_server_and_client(pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<GrpcFabricPeer>) {
     let local = local_bridge(pool);
     let server = ClusterChunkServer::new(Arc::clone(&local), pool);
 
@@ -150,8 +146,7 @@ async fn fabric_metrics_record_per_op_outcomes() {
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     };
-    let peer =
-        GrpcFabricPeer::new("metrics-test", channel).with_metrics(Arc::clone(&metrics));
+    let peer = GrpcFabricPeer::new("metrics-test", channel).with_metrics(Arc::clone(&metrics));
 
     let env = make_envelope(0x99);
     let chunk_id = env.chunk_id;

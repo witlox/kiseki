@@ -266,9 +266,7 @@ impl UnderReplicationPolicy {
             ReplicationDecision::Lost
         } else if healthy < self.min_acks {
             ReplicationDecision::Critical
-        } else if healthy < usize::from(self.target_copies)
-            && healthy < present.len()
-        {
+        } else if healthy < usize::from(self.target_copies) && healthy < present.len() {
             ReplicationDecision::Repair
         } else {
             ReplicationDecision::Healthy
@@ -295,12 +293,7 @@ pub trait Repairer: Send + Sync {
     /// Re-replicate `chunk_id` from `from_peer` to `to_peer`.
     /// Replication-N semantics — every peer holds the whole envelope
     /// at `fragment_index = 0`, so this is a simple GET + PUT.
-    async fn repair(
-        &self,
-        chunk_id: ChunkId,
-        from_peer: u64,
-        to_peer: u64,
-    ) -> Result<(), String>;
+    async fn repair(&self, chunk_id: ChunkId, from_peer: u64, to_peer: u64) -> Result<(), String>;
 
     /// Phase 16e step 2: EC repair. Gathers ≥X fragments from the
     /// healthy peer/index pairs, decodes to the original ciphertext
@@ -437,8 +430,7 @@ impl UnderReplicationScrub {
                         .filter(|(_, p)| !**p)
                         .map(|(id, _)| *id)
                         .collect();
-                    if let (Some(&src), Some(&dst)) =
-                        (healthy_peers.first(), missing_peers.first())
+                    if let (Some(&src), Some(&dst)) = (healthy_peers.first(), missing_peers.first())
                     {
                         match repairer.repair(cp.chunk_id, src, dst).await {
                             Ok(()) => {
@@ -738,7 +730,10 @@ mod tests {
             target_copies: 3,
             min_acks: 2,
         };
-        assert_eq!(p.evaluate(&[true, true, true]), ReplicationDecision::Healthy);
+        assert_eq!(
+            p.evaluate(&[true, true, true]),
+            ReplicationDecision::Healthy
+        );
     }
 
     #[test]
@@ -1016,18 +1011,8 @@ mod tests {
             _range_end: [u8; 32],
         ) {
         }
-        fn set_shard_state(
-            &self,
-            _shard_id: ShardId,
-            _state: kiseki_log::shard::ShardState,
-        ) {
-        }
-        fn set_shard_config(
-            &self,
-            _shard_id: ShardId,
-            _config: kiseki_log::shard::ShardConfig,
-        ) {
-        }
+        fn set_shard_state(&self, _shard_id: ShardId, _state: kiseki_log::shard::ShardState) {}
+        fn set_shard_config(&self, _shard_id: ShardId, _config: kiseki_log::shard::ShardConfig) {}
         async fn register_consumer(
             &self,
             _shard_id: ShardId,
@@ -1201,11 +1186,7 @@ mod tests {
             plain_calls.is_empty(),
             "EC strategy must NOT use the simple repair path"
         );
-        assert_eq!(
-            ec_calls.len(),
-            1,
-            "EC strategy must dispatch via repair_ec"
-        );
+        assert_eq!(ec_calls.len(), 1, "EC strategy must dispatch via repair_ec");
         let (cid_, healthy, missing, strat, len) = &ec_calls[0];
         assert_eq!(*cid_, chunk);
         assert_eq!(

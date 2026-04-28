@@ -241,9 +241,9 @@ pub fn fabric_san_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
 
     match verify_fabric_san(leaf.as_ref()) {
         Ok(_node_id) => Ok(req),
-        Err(FabricAuthError::NotFabricRole | FabricAuthError::MissingSan) => Err(
-            Status::permission_denied("not a fabric-role certificate"),
-        ),
+        Err(FabricAuthError::NotFabricRole | FabricAuthError::MissingSan) => {
+            Err(Status::permission_denied("not a fabric-role certificate"))
+        }
         Err(e) => Err(Status::permission_denied(format!(
             "fabric SAN check failed: {e}"
         ))),
@@ -302,10 +302,12 @@ fn proto_envelope_to_rust(p: pb::Envelope) -> Result<RustEnvelope, EnvelopeConvE
     let mut cid = [0u8; 32];
     cid.copy_from_slice(&chunk_id_proto.value);
 
-    let system_epoch = p.system_epoch.ok_or(EnvelopeConvError::MissingSystemEpoch)?;
-    let tenant_epoch = p.tenant_epoch.map(|e| {
-        kiseki_common::tenancy::KeyEpoch(e.value)
-    });
+    let system_epoch = p
+        .system_epoch
+        .ok_or(EnvelopeConvError::MissingSystemEpoch)?;
+    let tenant_epoch = p
+        .tenant_epoch
+        .map(|e| kiseki_common::tenancy::KeyEpoch(e.value));
 
     let tenant_wrapped_material = if p.tenant_wrapped_material.is_empty() {
         None
@@ -569,9 +571,7 @@ mod tests {
         assert_eq!(frags, vec![3], "fragment_index=3 stored locally");
 
         // The legacy `chunks` map is untouched.
-        let local_count =
-            kiseki_chunk::AsyncChunkOps::refcount(local.as_ref(), &chunk_id)
-                .await;
+        let local_count = kiseki_chunk::AsyncChunkOps::refcount(local.as_ref(), &chunk_id).await;
         assert!(
             matches!(local_count, Err(kiseki_chunk::ChunkError::NotFound(_))),
             "EC fragment must NOT bump the whole-envelope refcount",
@@ -590,10 +590,7 @@ mod tests {
         let chunk_id = env.chunk_id;
         let mut req = put_req(&env, "p");
         req.fragment_index = 2;
-        server
-            .put_fragment(Request::new(req))
-            .await
-            .expect("put");
+        server.put_fragment(Request::new(req)).await.expect("put");
 
         let resp = server
             .get_fragment(Request::new(pb::GetFragmentRequest {

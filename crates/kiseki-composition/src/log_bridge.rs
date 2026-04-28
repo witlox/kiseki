@@ -122,10 +122,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LogOps for RecordingLog {
-        async fn append_delta(
-            &self,
-            req: AppendDeltaRequest,
-        ) -> Result<SequenceNumber, LogError> {
+        async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
             self.plain_calls.lock().unwrap().push(req);
             Ok(SequenceNumber(1))
         }
@@ -145,10 +142,7 @@ mod tests {
             Err(LogError::Unavailable)
         }
 
-        async fn shard_health(
-            &self,
-            shard_id: ShardId,
-        ) -> Result<ShardInfo, LogError> {
+        async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
             Err(LogError::ShardNotFound(shard_id))
         }
 
@@ -160,10 +154,7 @@ mod tests {
             Ok(())
         }
 
-        async fn truncate_log(
-            &self,
-            _shard_id: ShardId,
-        ) -> Result<SequenceNumber, LogError> {
+        async fn truncate_log(&self, _shard_id: ShardId) -> Result<SequenceNumber, LogError> {
             Ok(SequenceNumber(0))
         }
 

@@ -364,10 +364,7 @@ mod tests {
         let env = make_envelope(0xAA);
         let chunk_id = env.chunk_id;
 
-        let stored = bridge
-            .write_chunk(env, "p")
-            .await
-            .expect("write succeeds");
+        let stored = bridge.write_chunk(env, "p").await.expect("write succeeds");
         assert!(stored, "first write must report newly stored");
 
         // Inspect via inner mutex — the sync store must agree.

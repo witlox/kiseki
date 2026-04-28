@@ -87,9 +87,9 @@ impl From<ChunkError> for KisekiError {
             // by the caller. ShardId is filled at the gateway boundary
             // where the request's shard binding is in scope; here we
             // surface the generic shard-unavailable signal.
-            ChunkError::QuorumLost { .. } => KisekiError::Retriable(
-                RetriableError::ShardUnavailable(ShardId(uuid::Uuid::nil())),
-            ),
+            ChunkError::QuorumLost { .. } => {
+                KisekiError::Retriable(RetriableError::ShardUnavailable(ShardId(uuid::Uuid::nil())))
+            }
         }
     }
 }

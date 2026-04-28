@@ -30,14 +30,10 @@ use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::envelope::Envelope;
 use kiseki_proto::v1::cluster_chunk_service_server::ClusterChunkServiceServer;
-use rcgen::{
-    BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType,
-};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{
-    Certificate, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
-};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig};
 
 #[allow(clippy::struct_field_names)]
 struct TlsBundle {
@@ -58,28 +54,21 @@ fn issue_test_certs() -> TlsBundle {
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "kiseki-test-ca");
-    ca_params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-    ];
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca_cert = ca_params.self_signed(&ca_key).expect("ca self sign");
     let ca_pem = ca_cert.pem();
     let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
 
     // 2. Server cert: localhost + fabric SPIFFE URI.
     let server_key = KeyPair::generate().expect("server key");
-    let mut server_params = CertificateParams::new(vec!["localhost".to_owned()])
-        .expect("server params");
+    let mut server_params =
+        CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
     server_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "kiseki-fabric-server");
     server_params.subject_alt_names = vec![
         SanType::DnsName("localhost".try_into().unwrap()),
-        SanType::URI(
-            "spiffe://cluster/fabric/test-server"
-                .try_into()
-                .unwrap(),
-        ),
+        SanType::URI("spiffe://cluster/fabric/test-server".try_into().unwrap()),
     ];
     let server_cert = server_params
         .signed_by(&server_key, &ca_issuer)
@@ -94,9 +83,7 @@ fn issue_test_certs() -> TlsBundle {
         .distinguished_name
         .push(rcgen::DnType::CommonName, "kiseki-fabric-client");
     fabric_params.subject_alt_names = vec![SanType::URI(
-        "spiffe://cluster/fabric/test-client"
-            .try_into()
-            .unwrap(),
+        "spiffe://cluster/fabric/test-client".try_into().unwrap(),
     )];
     let fabric_cert = fabric_params
         .signed_by(&fabric_key, &ca_issuer)
@@ -240,7 +227,10 @@ async fn fabric_san_client_round_trips_through_mtls() {
         .expect("put through mTLS+SAN");
     assert!(stored, "fragment newly stored over mTLS");
 
-    let got = peer.get_fragment(chunk_id, 0).await.expect("get through mTLS");
+    let got = peer
+        .get_fragment(chunk_id, 0)
+        .await
+        .expect("get through mTLS");
     assert_eq!(got.ciphertext, env.ciphertext);
 }
 

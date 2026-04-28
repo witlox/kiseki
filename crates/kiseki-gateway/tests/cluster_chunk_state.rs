@@ -16,8 +16,8 @@ use kiseki_common::ids::{ChunkId, NamespaceId, NodeId, OrgId, SequenceNumber, Sh
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_composition::composition::CompositionStore;
 use kiseki_composition::namespace::Namespace;
-use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_crypto::envelope::Envelope;
+use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
 use kiseki_gateway::ops::GatewayOps;
 use kiseki_log::error::LogError;
@@ -53,10 +53,7 @@ struct RecordingLog {
 
 #[async_trait::async_trait]
 impl LogOps for RecordingLog {
-    async fn append_delta(
-        &self,
-        req: AppendDeltaRequest,
-    ) -> Result<SequenceNumber, LogError> {
+    async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         self.plain_calls.lock().unwrap().push(req);
         Ok(SequenceNumber(1))
     }
@@ -105,25 +102,15 @@ impl LogOps for RecordingLog {
         Ok(vec![])
     }
 
-    async fn shard_health(
-        &self,
-        _shard_id: ShardId,
-    ) -> Result<ShardInfo, LogError> {
+    async fn shard_health(&self, _shard_id: ShardId) -> Result<ShardInfo, LogError> {
         Err(LogError::Unavailable)
     }
 
-    async fn set_maintenance(
-        &self,
-        _shard_id: ShardId,
-        _enabled: bool,
-    ) -> Result<(), LogError> {
+    async fn set_maintenance(&self, _shard_id: ShardId, _enabled: bool) -> Result<(), LogError> {
         Ok(())
     }
 
-    async fn truncate_log(
-        &self,
-        _shard_id: ShardId,
-    ) -> Result<SequenceNumber, LogError> {
+    async fn truncate_log(&self, _shard_id: ShardId) -> Result<SequenceNumber, LogError> {
         Ok(SequenceNumber(0))
     }
 
@@ -140,12 +127,7 @@ impl LogOps for RecordingLog {
     ) {
     }
 
-    fn update_shard_range(
-        &self,
-        _shard_id: ShardId,
-        _range_start: [u8; 32],
-        _range_end: [u8; 32],
-    ) {
+    fn update_shard_range(&self, _shard_id: ShardId, _range_start: [u8; 32], _range_end: [u8; 32]) {
     }
 
     fn set_shard_state(&self, _shard_id: ShardId, _state: ShardState) {}
@@ -247,8 +229,7 @@ async fn fresh_chunk_write_emits_chunk_and_delta_proposal() {
         "delta must reference the new chunk"
     );
     assert_eq!(
-        proposal.delta.chunk_refs[0].0,
-        proposal.new_chunks[0].chunk_id,
+        proposal.delta.chunk_refs[0].0, proposal.new_chunks[0].chunk_id,
         "chunk_refs and new_chunks must agree on the chunk id"
     );
 }
@@ -472,18 +453,10 @@ impl AsyncChunkOps for RecordingChunks {
     async fn decrement_refcount(&self, id: &ChunkId) -> Result<u64, ChunkError> {
         self.inner.decrement_refcount(id).await
     }
-    async fn set_retention_hold(
-        &self,
-        id: &ChunkId,
-        hold: &str,
-    ) -> Result<(), ChunkError> {
+    async fn set_retention_hold(&self, id: &ChunkId, hold: &str) -> Result<(), ChunkError> {
         self.inner.set_retention_hold(id, hold).await
     }
-    async fn release_retention_hold(
-        &self,
-        id: &ChunkId,
-        hold: &str,
-    ) -> Result<(), ChunkError> {
+    async fn release_retention_hold(&self, id: &ChunkId, hold: &str) -> Result<(), ChunkError> {
         self.inner.release_retention_hold(id, hold).await
     }
     async fn gc(&self) -> u64 {
@@ -497,7 +470,10 @@ impl AsyncChunkOps for RecordingChunks {
         chunk_id: &ChunkId,
         tenant_id: OrgId,
     ) -> Result<(), ChunkError> {
-        self.fanout_calls.lock().unwrap().push((*chunk_id, tenant_id));
+        self.fanout_calls
+            .lock()
+            .unwrap()
+            .push((*chunk_id, tenant_id));
         Ok(())
     }
 }

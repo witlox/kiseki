@@ -634,7 +634,8 @@ mod tests {
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-        let gateway = InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
+        let gateway =
+            InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
 
         KisekiFuse::new(gateway, test_tenant(), test_namespace())
     }
@@ -699,7 +700,10 @@ mod tests {
         fs.create("removeme.txt", b"payload".to_vec()).unwrap();
 
         let pre = fs.rt_handle().block_on(async {
-            fs.gateway_ref().list(test_tenant(), test_namespace()).await.unwrap()
+            fs.gateway_ref()
+                .list(test_tenant(), test_namespace())
+                .await
+                .unwrap()
         });
         assert_eq!(
             pre.len(),
@@ -710,7 +714,10 @@ mod tests {
         fs.unlink("removeme.txt").unwrap();
 
         let post = fs.rt_handle().block_on(async {
-            fs.gateway_ref().list(test_tenant(), test_namespace()).await.unwrap()
+            fs.gateway_ref()
+                .list(test_tenant(), test_namespace())
+                .await
+                .unwrap()
         });
         assert!(
             post.is_empty(),
@@ -903,7 +910,8 @@ mod tests {
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
-        let gateway = InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
+        let gateway =
+            InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
         let mut fs = KisekiFuse::new(gateway, test_tenant(), test_namespace());
 
         // Attempt to create a file — should fail with write error.

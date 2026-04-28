@@ -845,10 +845,7 @@ impl GatewayOps for InMemoryGateway {
                         .await
                         .unwrap_or(false);
                     if tombstoned {
-                        let _ = self
-                            .chunks
-                            .delete_distributed(chunk_id, tenant_id)
-                            .await;
+                        let _ = self.chunks.delete_distributed(chunk_id, tenant_id).await;
                     }
                 }
             }

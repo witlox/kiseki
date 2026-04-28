@@ -98,7 +98,9 @@ impl FragmentAvailabilityOracle for FabricAvailabilityOracle {
         for (i, peer_id) in peer_ids.iter().enumerate() {
             let fragment_index = u32::try_from(i).unwrap_or(u32::MAX);
             let present = if let Some(peer) = self.by_id.get(peer_id) {
-                peer.has_fragment(chunk_id, fragment_index).await.unwrap_or(false)
+                peer.has_fragment(chunk_id, fragment_index)
+                    .await
+                    .unwrap_or(false)
             } else {
                 // Unknown peer id — treat as missing so the
                 // under-replication scrub can repair it.
@@ -146,12 +148,7 @@ impl FabricRepairer {
 
 #[async_trait]
 impl Repairer for FabricRepairer {
-    async fn repair(
-        &self,
-        chunk_id: ChunkId,
-        from_peer: u64,
-        to_peer: u64,
-    ) -> Result<(), String> {
+    async fn repair(&self, chunk_id: ChunkId, from_peer: u64, to_peer: u64) -> Result<(), String> {
         let src = self
             .by_id
             .get(&from_peer)
@@ -243,7 +240,10 @@ impl Repairer for FabricRepairer {
             .into_iter()
             .find(|r| r.fragment_index == missing.1)
             .ok_or_else(|| {
-                format!("ec re-encode: missing index {} not in encoded set", missing.1)
+                format!(
+                    "ec re-encode: missing index {} not in encoded set",
+                    missing.1
+                )
             })?;
 
         // PUT the recovered fragment to the destination peer.
@@ -260,9 +260,15 @@ impl Repairer for FabricRepairer {
             tenant_epoch: None,
             tenant_wrapped_material: None,
         };
-        dst.put_fragment(chunk_id, missing.1, self.tenant_id, self.pool.clone(), envelope)
-            .await
-            .map_err(|e| format!("ec repair put_fragment: {e}"))?;
+        dst.put_fragment(
+            chunk_id,
+            missing.1,
+            self.tenant_id,
+            self.pool.clone(),
+            envelope,
+        )
+        .await
+        .map_err(|e| format!("ec repair put_fragment: {e}"))?;
         Ok(())
     }
 }
@@ -303,9 +309,18 @@ mod tests {
     #[tokio::test]
     async fn local_chunk_deleter_drops_every_fragment_index() {
         let store = local();
-        store.write_fragment(&cid(0xA1), 0, b"f0".to_vec()).await.unwrap();
-        store.write_fragment(&cid(0xA1), 2, b"f2".to_vec()).await.unwrap();
-        store.write_fragment(&cid(0xA1), 5, b"f5".to_vec()).await.unwrap();
+        store
+            .write_fragment(&cid(0xA1), 0, b"f0".to_vec())
+            .await
+            .unwrap();
+        store
+            .write_fragment(&cid(0xA1), 2, b"f2".to_vec())
+            .await
+            .unwrap();
+        store
+            .write_fragment(&cid(0xA1), 5, b"f5".to_vec())
+            .await
+            .unwrap();
 
         let deleter = LocalChunkDeleter::new(Arc::clone(&store));
         let removed = deleter.delete(cid(0xA1)).await.expect("delete");
@@ -436,15 +451,10 @@ mod tests {
     async fn fabric_repairer_round_trips_get_then_put() {
         let p_src = TestPeer::new("p1", true); // has the fragment
         let p_dst = TestPeer::new("p2", false); // missing
-        let peers: Vec<Arc<dyn FabricPeer>> = vec![
-            Arc::clone(&p_src) as _,
-            Arc::clone(&p_dst) as _,
-        ];
+        let peers: Vec<Arc<dyn FabricPeer>> =
+            vec![Arc::clone(&p_src) as _, Arc::clone(&p_dst) as _];
         let repairer = FabricRepairer::new(&peers, OrgId(uuid::Uuid::nil()), "p".into());
-        repairer
-            .repair(cid(0xE1), 1, 2)
-            .await
-            .expect("repair ok");
+        repairer.repair(cid(0xE1), 1, 2).await.expect("repair ok");
         assert_eq!(
             *p_dst.last_put_chunk.lock().unwrap(),
             Some(cid(0xE1)),
@@ -559,8 +569,7 @@ mod tests {
         let payload: Vec<u8> = (0..512u32)
             .map(|i| u8::try_from(i & 0xff).unwrap_or(0))
             .collect();
-        let routes =
-            encode_for_placement(strategy, &payload, &[1, 2, 3, 4, 5, 6]).expect("encode");
+        let routes = encode_for_placement(strategy, &payload, &[1, 2, 3, 4, 5, 6]).expect("encode");
 
         let peers_concrete: Vec<Arc<EcTestPeer>> = (1..=6u8)
             .map(|i| {
@@ -583,10 +592,8 @@ mod tests {
             let peer = &peers_concrete[usize::try_from(route.peer_id - 1).unwrap_or(0)];
             peer.preload(chunk_id, route.fragment_index, route.bytes.clone());
         }
-        let peers: Vec<Arc<dyn FabricPeer>> = peers_concrete
-            .iter()
-            .map(|p| Arc::clone(p) as _)
-            .collect();
+        let peers: Vec<Arc<dyn FabricPeer>> =
+            peers_concrete.iter().map(|p| Arc::clone(p) as _).collect();
 
         // Healthy peers: ids 1, 2, 3, 5, 6 — at least 4 of them are
         // needed for EC decode (data shards = 4).
@@ -595,13 +602,7 @@ mod tests {
 
         let repairer = FabricRepairer::new(&peers, OrgId(uuid::Uuid::nil()), "p".into());
         repairer
-            .repair_ec(
-                chunk_id,
-                &healthy,
-                missing,
-                strategy,
-                payload.len(),
-            )
+            .repair_ec(chunk_id, &healthy, missing, strategy, payload.len())
             .await
             .expect("ec repair");
 

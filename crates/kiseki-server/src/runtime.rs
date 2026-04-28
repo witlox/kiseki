@@ -100,8 +100,7 @@ fn build_fabric_channel(
             .map_err(|e| format!("fabric TLS config: {e}"))?;
     }
 
-    let channel = endpoint
-        .connect_lazy(); // lazy: failed peers don't block startup
+    let channel = endpoint.connect_lazy(); // lazy: failed peers don't block startup
     Ok(channel)
 }
 
@@ -298,28 +297,27 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // set, otherwise in-memory. Wrapped via SyncBridge so it satisfies
     // AsyncChunkOps — the cluster fabric and the gateway both consume the
     // async surface (Phase 16a, D-7).
-    let local_chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
-        if let Some(ref dir) = cfg.data_dir {
-            std::fs::create_dir_all(dir.join("chunks")).ok();
-            let dev_path = dir.join("chunks").join("data.dev");
-            let meta_path = dir.join("chunks").join("meta.json");
-            let store = if dev_path.exists() {
-                kiseki_chunk::PersistentChunkStore::open(&dev_path, &meta_path)
-                    .map_err(|e| format!("persistent chunk store open: {e}"))?
-            } else {
-                kiseki_chunk::PersistentChunkStore::init(
-                    &dev_path,
-                    &meta_path,
-                    4 * 1024 * 1024 * 1024,
-                )
-                .map_err(|e| format!("persistent chunk store init: {e}"))?
-            };
-            tracing::info!(path = %dir.display(), "chunk store: persistent (raw block)");
-            Arc::new(kiseki_chunk::SyncBridge::new(store))
+    let local_chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = if let Some(ref dir) =
+        cfg.data_dir
+    {
+        std::fs::create_dir_all(dir.join("chunks")).ok();
+        let dev_path = dir.join("chunks").join("data.dev");
+        let meta_path = dir.join("chunks").join("meta.json");
+        let store = if dev_path.exists() {
+            kiseki_chunk::PersistentChunkStore::open(&dev_path, &meta_path)
+                .map_err(|e| format!("persistent chunk store open: {e}"))?
         } else {
-            tracing::info!("chunk store: in-memory (no persistence)");
-            Arc::new(kiseki_chunk::SyncBridge::new(kiseki_chunk::ChunkStore::new()))
+            kiseki_chunk::PersistentChunkStore::init(&dev_path, &meta_path, 4 * 1024 * 1024 * 1024)
+                .map_err(|e| format!("persistent chunk store init: {e}"))?
         };
+        tracing::info!(path = %dir.display(), "chunk store: persistent (raw block)");
+        Arc::new(kiseki_chunk::SyncBridge::new(store))
+    } else {
+        tracing::info!("chunk store: in-memory (no persistence)");
+        Arc::new(kiseki_chunk::SyncBridge::new(
+            kiseki_chunk::ChunkStore::new(),
+        ))
+    };
 
     // Cluster chunk fabric (Phase 16a step 12). For each *other* peer
     // in raft_peers we open a lazy mTLS gRPC Channel to its data-path
@@ -347,7 +345,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
                         .with_metrics(Arc::clone(&metrics.fabric)),
                 ));
                 tracing::info!(
-                    peer_id, fabric_addr, "fabric peer registered for cross-node chunks",
+                    peer_id,
+                    fabric_addr,
+                    "fabric peer registered for cross-node chunks",
                 );
             }
             Err(e) => {
@@ -386,8 +386,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // (16d steps 1+5) routes a 6+ node cluster through the EC
     // path, honoring I-C4 ("EC is the default") + I-D1 ("repaired
     // from EC parity").
-    let cluster_nodes_for_cfg: Vec<u64> =
-        cfg.raft_peers.iter().map(|(id, _)| *id).collect();
+    let cluster_nodes_for_cfg: Vec<u64> = cfg.raft_peers.iter().map(|(id, _)| *id).collect();
     let cluster_cfg =
         kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default")
             .with_min_acks(durability.min_acks)
@@ -398,15 +397,14 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // a parallel by-id index for HasFragment + repair calls.
     let fabric_peers_for_scrub: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> =
         fabric_peers.iter().map(Arc::clone).collect();
-    let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
-        Arc::new(
-            kiseki_chunk_cluster::ClusteredChunkStore::new(
-                Arc::clone(&local_chunk_store),
-                fabric_peers,
-                cluster_cfg,
-            )
-            .with_metrics(Arc::clone(&metrics.fabric)),
-        );
+    let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(
+        kiseki_chunk_cluster::ClusteredChunkStore::new(
+            Arc::clone(&local_chunk_store),
+            fabric_peers,
+            cluster_cfg,
+        )
+        .with_metrics(Arc::clone(&metrics.fabric)),
+    );
 
     // Phase 16d step 4: spawn the periodic scrub scheduler when
     // running on a real cluster (>=1 peer; in single-node mode
@@ -417,20 +415,18 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     if !fabric_peers_for_scrub.is_empty() {
         let scrub_log = Arc::clone(&log_store) as Arc<dyn kiseki_log::traits::LogOps>;
         let scrub_local = Arc::clone(&local_chunk_store);
-        let scrub_oracle: Arc<dyn kiseki_chunk_cluster::FragmentAvailabilityOracle> =
-            Arc::new(kiseki_chunk_cluster::FabricAvailabilityOracle::new(
-                &fabric_peers_for_scrub,
-            ));
+        let scrub_oracle: Arc<dyn kiseki_chunk_cluster::FragmentAvailabilityOracle> = Arc::new(
+            kiseki_chunk_cluster::FabricAvailabilityOracle::new(&fabric_peers_for_scrub),
+        );
         let scrub_deleter: Arc<dyn kiseki_chunk_cluster::OrphanDeleter> = Arc::new(
             kiseki_chunk_cluster::LocalChunkDeleter::new(Arc::clone(&local_chunk_store)),
         );
-        let scrub_repairer: Arc<dyn kiseki_chunk_cluster::Repairer> = Arc::new(
-            kiseki_chunk_cluster::FabricRepairer::new(
+        let scrub_repairer: Arc<dyn kiseki_chunk_cluster::Repairer> =
+            Arc::new(kiseki_chunk_cluster::FabricRepairer::new(
                 &fabric_peers_for_scrub,
                 bootstrap_tenant_for_cluster,
                 "default".into(),
-            ),
-        );
+            ));
         let scheduler = Arc::new(
             kiseki_chunk_cluster::ScrubScheduler::new(
                 scrub_log,
@@ -462,8 +458,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         // process exit terminates the loop. When the runtime
         // grows a unified shutdown registry this sender goes in
         // there.
-        let (scrub_shutdown_tx, scrub_shutdown_rx) =
-            tokio::sync::watch::channel(false);
+        let (scrub_shutdown_tx, scrub_shutdown_rx) = tokio::sync::watch::channel(false);
         let scrub_handle =
             scheduler.start_periodic(std::time::Duration::from_secs(600), scrub_shutdown_rx);
         // Detach: the channel sender + JoinHandle stay alive for
@@ -882,10 +877,8 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // mutually exclusive with multi-tenant access on this port, so
     // plaintext-mode is a development-only posture.
     let cluster_chunk_svc_intercepted = cfg.tls.is_some();
-    let cluster_chunk_server = kiseki_chunk_cluster::ClusterChunkServer::new(
-        Arc::clone(&local_chunk_store),
-        "default",
-    );
+    let cluster_chunk_server =
+        kiseki_chunk_cluster::ClusterChunkServer::new(Arc::clone(&local_chunk_store), "default");
 
     let mut builder = tonic::transport::Server::builder();
 
@@ -923,9 +916,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
              cross-node fabric is not protected against tenant certs)",
         );
     }
-    router
-        .serve_with_shutdown(cfg.data_addr, shutdown)
-        .await?;
+    router.serve_with_shutdown(cfg.data_addr, shutdown).await?;
 
     tracing::info!("data-path: shut down");
     Ok(())

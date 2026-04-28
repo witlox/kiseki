@@ -33,7 +33,10 @@ pub fn pick_placement(chunk_id: &ChunkId, nodes: &[u64], target_copies: usize) -
         return Vec::new();
     }
     // Score every node, then take the top `target_copies` by score.
-    let mut scored: Vec<(u64, u64)> = nodes.iter().map(|&n| (rendezvous_score(chunk_id, n), n)).collect();
+    let mut scored: Vec<(u64, u64)> = nodes
+        .iter()
+        .map(|&n| (rendezvous_score(chunk_id, n), n))
+        .collect();
     // Sort by score descending; ties broken by node id ascending so
     // the function stays deterministic across rebuilds. The default
     // tuple-sort handles this naturally if we pre-sort by node id.
@@ -100,8 +103,7 @@ mod tests {
     #[test]
     fn placement_spreads_across_nodes() {
         let nodes = vec![1, 2, 3, 4, 5, 6];
-        let mut hits: std::collections::HashMap<u64, u32> =
-            std::collections::HashMap::new();
+        let mut hits: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for i in 0..100u8 {
             let placement = pick_placement(&cid(i), &nodes, 3);
             for n in placement {

@@ -478,7 +478,10 @@ impl ChunkOps for ChunkStore {
         chunk_id: &ChunkId,
         fragment_index: u32,
     ) -> Result<bool, ChunkError> {
-        Ok(self.fragments.remove(&(*chunk_id, fragment_index)).is_some())
+        Ok(self
+            .fragments
+            .remove(&(*chunk_id, fragment_index))
+            .is_some())
     }
 
     fn list_fragments(&self, chunk_id: &ChunkId) -> Vec<u32> {
@@ -572,8 +575,7 @@ mod tests {
         store.write_chunk(chunk_a, "fast-nvme").unwrap();
         store.write_chunk(chunk_b, "fast-nvme").unwrap();
 
-        let ids: std::collections::HashSet<_> =
-            store.list_chunk_ids().into_iter().collect();
+        let ids: std::collections::HashSet<_> = store.list_chunk_ids().into_iter().collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&id_a));
         assert!(ids.contains(&id_b));

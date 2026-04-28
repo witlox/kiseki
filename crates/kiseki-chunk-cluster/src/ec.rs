@@ -125,11 +125,8 @@ pub fn encode_for_placement(
             })
             .collect()),
         EcStrategy::Ec { data, parity } => {
-            let encoded = kiseki_chunk::ec::encode(
-                ciphertext,
-                usize::from(data),
-                usize::from(parity),
-            )?;
+            let encoded =
+                kiseki_chunk::ec::encode(ciphertext, usize::from(data), usize::from(parity))?;
             Ok(placement
                 .iter()
                 .zip(encoded.fragments)
@@ -254,12 +251,8 @@ mod tests {
 
     #[test]
     fn placement_size_mismatch_is_a_typed_error() {
-        let err = encode_for_placement(
-            EcStrategy::Ec { data: 4, parity: 2 },
-            b"x",
-            &[1, 2, 3],
-        )
-        .expect_err("placement of 3 cannot satisfy 4+2 = 6");
+        let err = encode_for_placement(EcStrategy::Ec { data: 4, parity: 2 }, b"x", &[1, 2, 3])
+            .expect_err("placement of 3 cannot satisfy 4+2 = 6");
         assert!(matches!(
             err,
             EcDistributionError::PlacementSizeMismatch {
@@ -283,12 +276,8 @@ mod tests {
                 bytes: b"hello cluster".to_vec(),
             },
         ];
-        let out = decode_from_responses(
-            EcStrategy::Replication { copies: 3 },
-            &responses,
-            13,
-        )
-        .unwrap();
+        let out =
+            decode_from_responses(EcStrategy::Replication { copies: 3 }, &responses, 13).unwrap();
         assert_eq!(out, b"hello cluster");
     }
 

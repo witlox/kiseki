@@ -939,7 +939,11 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
         });
-        let gw = InMemoryGateway::new(store, kiseki_chunk::arc_async(ChunkStore::new()), master_key);
+        let gw = InMemoryGateway::new(
+            store,
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            master_key,
+        );
         let nfs_gw = NfsGateway::new(gw);
         NfsContext::new(nfs_gw, tenant, ns)
     }

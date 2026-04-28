@@ -82,11 +82,7 @@ mod tests {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "test-cert");
         params.subject_alt_names = sans;
-        params
-            .self_signed(&key)
-            .expect("self-sign")
-            .der()
-            .to_vec()
+        params.self_signed(&key).expect("self-sign").der().to_vec()
     }
 
     #[test]
@@ -118,7 +114,10 @@ mod tests {
         // Either MissingSan or NotFabricRole depending on rcgen
         // (rcgen omits the extension entirely when sans is empty).
         assert!(
-            matches!(err, FabricAuthError::MissingSan | FabricAuthError::NotFabricRole),
+            matches!(
+                err,
+                FabricAuthError::MissingSan | FabricAuthError::NotFabricRole
+            ),
             "got {err:?}"
         );
     }

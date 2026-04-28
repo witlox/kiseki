@@ -16,12 +16,10 @@ use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 
 use crate::delta::Delta;
 use crate::error::LogError;
+use crate::raft::state_machine::ClusterChunkStateEntry;
 use crate::raft::OpenRaftLogStore;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
-use crate::raft::state_machine::ClusterChunkStateEntry;
-use crate::traits::{
-    AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest,
-};
+use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest};
 
 /// Raft-backed shard store for multi-node clusters.
 ///
@@ -193,7 +191,9 @@ impl LogOps for RaftShardStore {
         req: AppendChunkAndDeltaRequest,
     ) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(req.delta.shard_id)?;
-        store.append_chunk_and_delta(req.delta, req.new_chunks).await
+        store
+            .append_chunk_and_delta(req.delta, req.new_chunks)
+            .await
     }
 
     async fn increment_chunk_refcount(
