@@ -746,11 +746,18 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // lives at the interceptor layer; on plaintext (development) the
     // server still functions but rejects cross-node writes only when
     // mTLS is configured (step 12).
-    let cluster_chunk_svc = kiseki_chunk_cluster::ClusterChunkServer::new(
+    //
+    // The interceptor is wired UNCONDITIONALLY when TLS is configured.
+    // Otherwise (development plaintext), we install the unwrapped
+    // server — the SAN check would always fail with "TLS client info
+    // missing" and break local development. The TLS config is
+    // mutually exclusive with multi-tenant access on this port, so
+    // plaintext-mode is a development-only posture.
+    let cluster_chunk_svc_intercepted = cfg.tls.is_some();
+    let cluster_chunk_server = kiseki_chunk_cluster::ClusterChunkServer::new(
         Arc::clone(&local_chunk_store),
         "default",
-    )
-    .into_tonic_server();
+    );
 
     let mut builder = tonic::transport::Server::builder();
 
@@ -773,12 +780,22 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         tracing::info!("data-path: shutdown signal received, draining...");
     };
 
-    builder
+    let mut router = builder
         .add_service(control_svc)
         .add_service(key_svc)
         .add_service(log_svc)
-        .add_service(admin_svc)
-        .add_service(cluster_chunk_svc)
+        .add_service(admin_svc);
+    if cluster_chunk_svc_intercepted {
+        router = router.add_service(cluster_chunk_server.into_tonic_server_with_san_check());
+        tracing::info!("ClusterChunkService: SAN-role interceptor active (mTLS)");
+    } else {
+        router = router.add_service(cluster_chunk_server.into_tonic_server());
+        tracing::warn!(
+            "ClusterChunkService: NO SAN interceptor (plaintext development mode — \
+             cross-node fabric is not protected against tenant certs)",
+        );
+    }
+    router
         .serve_with_shutdown(cfg.data_addr, shutdown)
         .await?;
 

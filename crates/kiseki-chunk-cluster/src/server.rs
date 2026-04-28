@@ -47,11 +47,34 @@ impl ClusterChunkServer {
     }
 
     /// Wrap into a tonic server ready to be added to a `Router`.
+    /// The returned server has **no** SAN-role interceptor — useful
+    /// for plaintext / single-node test setups.
     #[must_use]
     pub fn into_tonic_server(self) -> ClusterChunkServiceServer<Self> {
         ClusterChunkServiceServer::new(self)
     }
+
+    /// Wrap into a tonic server with the [`fabric_san_interceptor`]
+    /// pre-applied. This is the production path: `ClusterChunkService`
+    /// shares the data-path gRPC port with services like `LogService`
+    /// that *do* accept tenant certs, so per-method gating on the
+    /// fabric service is mandatory or a leaked tenant cert gains
+    /// fragment access (Phase 16a I-Auth4 / I-T1).
+    #[must_use]
+    pub fn into_tonic_server_with_san_check(self) -> InterceptedClusterChunkService {
+        ClusterChunkServiceServer::with_interceptor(self, fabric_san_interceptor)
+    }
 }
+
+/// Concrete return type of [`ClusterChunkServer::into_tonic_server_with_san_check`].
+/// The function-pointer-typed interceptor lets the runtime branch
+/// between intercepted (mTLS, production) and non-intercepted
+/// (plaintext development) builds at the same site without leaking a
+/// generic interceptor type into the runtime crate.
+pub type InterceptedClusterChunkService = tonic::service::interceptor::InterceptedService<
+    ClusterChunkServiceServer<ClusterChunkServer>,
+    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+>;
 
 #[tonic::async_trait]
 impl ClusterChunkService for ClusterChunkServer {
