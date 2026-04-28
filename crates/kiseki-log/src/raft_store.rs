@@ -35,6 +35,57 @@ pub enum LogCommand {
         /// Has inline data.
         has_inline_data: bool,
     },
+    /// Atomic combined proposal — appends a delta AND creates one
+    /// or more `cluster_chunk_state` entries in a single state-
+    /// machine apply step. Used by Phase 16a's cross-node chunk
+    /// write path: the gateway fans out fragments to peers (2-of-3
+    /// quorum), then submits this combined proposal to Raft. On
+    /// commit, every replica has both the composition delta AND
+    /// the `cluster_chunk_state` entries.
+    ///
+    /// Atomicity is mandatory: applying this command must produce
+    /// either both effects or neither. The gateway's client ack
+    /// happens after the Raft commit of this command, NOT after
+    /// the fragment fan-out. See specs/implementation/phase-16-
+    /// cross-node-chunks.md D-4 + D-10 for the contract.
+    ChunkAndDelta {
+        /// Tenant ID (delta side).
+        tenant_id_bytes: [u8; 16],
+        /// Operation type code (delta side).
+        operation: u8,
+        /// Hashed key (delta side).
+        hashed_key: [u8; 32],
+        /// Chunk reference IDs (delta side).
+        chunk_refs: Vec<[u8; 32]>,
+        /// Encrypted payload (delta side).
+        payload: Vec<u8>,
+        /// Has inline data (delta side).
+        has_inline_data: bool,
+        /// Chunk metadata to create alongside the delta. Each entry
+        /// becomes a `cluster_chunk_state` row keyed by
+        /// `(tenant_id, chunk_id)`. Empty list means "delta only,
+        /// no new chunks" (e.g., delete operation).
+        new_chunks: Vec<NewChunkMeta>,
+    },
+    /// Increment the refcount of an existing `cluster_chunk_state`
+    /// entry. Used when a second composition references an already-
+    /// stored chunk via dedup (I-C2). No effect on deltas.
+    IncrementChunkRefcount {
+        /// Tenant scope (chunk-meta key).
+        tenant_id_bytes: [u8; 16],
+        /// Chunk identifier.
+        chunk_id: [u8; 32],
+    },
+    /// Decrement the refcount of an existing `cluster_chunk_state`
+    /// entry. When refcount reaches 0, the entry is *tombstoned*
+    /// (kept in the state for compaction-time pruning) and the
+    /// chunk's fragments become eligible for cluster-wide GC.
+    DecrementChunkRefcount {
+        /// Tenant scope (chunk-meta key).
+        tenant_id_bytes: [u8; 16],
+        /// Chunk identifier.
+        chunk_id: [u8; 32],
+    },
     /// Set maintenance mode.
     SetMaintenance {
         /// Whether to enable or disable.
@@ -49,10 +100,35 @@ pub enum LogCommand {
     },
 }
 
+/// New `cluster_chunk_state` entry to be created as part of a
+/// `ChunkAndDelta` combined proposal. The entry's
+/// `(tenant_id, chunk_id)` key is derived from the enclosing
+/// command's tenant + this struct's `chunk_id`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewChunkMeta {
+    /// Content-addressed chunk identifier (32 bytes).
+    pub chunk_id: [u8; 32],
+    /// Node IDs holding fragments for this chunk. For Replication-3
+    /// with 3 peers, all 3 node ids; under EC the placement list
+    /// matches the CRUSH derivation in `kiseki-chunk::placement`.
+    pub placement: Vec<u64>,
+}
+
 impl std::fmt::Display for LogCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AppendDelta { operation, .. } => write!(f, "AppendDelta(op={operation})"),
+            Self::ChunkAndDelta {
+                operation,
+                new_chunks,
+                ..
+            } => write!(
+                f,
+                "ChunkAndDelta(op={operation}, new_chunks={})",
+                new_chunks.len()
+            ),
+            Self::IncrementChunkRefcount { .. } => write!(f, "IncrementChunkRefcount"),
+            Self::DecrementChunkRefcount { .. } => write!(f, "DecrementChunkRefcount"),
             Self::SetMaintenance { enabled } => write!(f, "SetMaintenance({enabled})"),
             Self::AdvanceWatermark { consumer, position } => {
                 write!(f, "AdvanceWatermark({consumer}={position})")
@@ -183,6 +259,7 @@ impl RaftLogStore {
     }
 
     /// Apply a single command to a shard state machine.
+    #[allow(clippy::too_many_lines)] // big match per LogCommand variant
     fn apply_to_sm(sm: &mut ShardStateMachine, shard_id: ShardId, index: u64, cmd: &LogCommand) {
         if index <= sm.last_applied {
             return;
@@ -257,6 +334,83 @@ impl RaftLogStore {
                 sm.info.delta_count += 1;
                 sm.info.byte_size += u64::from(payload_size) + 128;
                 sm.deltas.push(delta);
+            }
+            LogCommand::ChunkAndDelta {
+                tenant_id_bytes,
+                operation,
+                hashed_key,
+                chunk_refs,
+                payload,
+                has_inline_data,
+                new_chunks: _,
+            } => {
+                // The simple in-memory RaftLogStore doesn't track
+                // cluster_chunk_state — that lives in the openraft
+                // ShardStateMachine. For this fallback path we
+                // treat ChunkAndDelta as a plain AppendDelta and
+                // discard the new_chunks list. Production uses
+                // the openraft-backed RaftShardStore which DOES
+                // track cluster_chunk_state.
+                let next_seq = SequenceNumber(sm.info.tip.0 + 1);
+                #[allow(clippy::cast_possible_truncation)]
+                let payload_size = payload.len() as u32;
+                let op = match operation {
+                    0 => crate::delta::OperationType::Create,
+                    1 => crate::delta::OperationType::Update,
+                    2 => crate::delta::OperationType::Delete,
+                    3 => crate::delta::OperationType::Rename,
+                    4 => crate::delta::OperationType::SetAttribute,
+                    _ => crate::delta::OperationType::Finalize,
+                };
+                let timestamp = kiseki_common::time::DeltaTimestamp {
+                    hlc: kiseki_common::time::HybridLogicalClock {
+                        physical_ms: index,
+                        logical: 0,
+                        node_id: NodeId(0),
+                    },
+                    wall: kiseki_common::time::WallTime {
+                        millis_since_epoch: index,
+                        timezone: "UTC".into(),
+                    },
+                    quality: kiseki_common::time::ClockQuality::Ntp,
+                };
+                let delta = Delta {
+                    header: DeltaHeader {
+                        sequence: next_seq,
+                        shard_id,
+                        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_bytes(
+                            *tenant_id_bytes,
+                        )),
+                        operation: op,
+                        timestamp,
+                        hashed_key: *hashed_key,
+                        tombstone: *operation == 2,
+                        chunk_refs: chunk_refs
+                            .iter()
+                            .map(|b| kiseki_common::ids::ChunkId(*b))
+                            .collect(),
+                        payload_size,
+                        has_inline_data: *has_inline_data,
+                    },
+                    payload: DeltaPayload {
+                        ciphertext: payload.clone(),
+                        auth_tag: Vec::new(),
+                        nonce: Vec::new(),
+                        system_epoch: None,
+                        tenant_epoch: None,
+                        tenant_wrapped_material: Vec::new(),
+                    },
+                };
+                sm.info.tip = next_seq;
+                sm.info.delta_count += 1;
+                sm.info.byte_size += u64::from(payload_size) + 128;
+                sm.deltas.push(delta);
+            }
+            LogCommand::IncrementChunkRefcount { .. }
+            | LogCommand::DecrementChunkRefcount { .. } => {
+                // The simple in-memory RaftLogStore doesn't track
+                // cluster_chunk_state. No-op here; production path
+                // is the openraft-backed RaftShardStore.
             }
             LogCommand::SetMaintenance { enabled } => {
                 sm.info.state = if *enabled {

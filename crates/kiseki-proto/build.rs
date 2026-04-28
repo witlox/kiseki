@@ -27,6 +27,7 @@ fn main() -> std::io::Result<()> {
         "kiseki/v1/common.proto",
         "kiseki/v1/log.proto",
         "kiseki/v1/chunk.proto",
+        "kiseki/v1/cluster_chunks.proto",
         "kiseki/v1/composition.proto",
         "kiseki/v1/view.proto",
         "kiseki/v1/key.proto",

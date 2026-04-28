@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+// Cluster Chunk Service — internal cross-node chunk replication
+// (Phase 16a). The service is exposed alongside the existing
+// data-path gRPC on port 9100 with a SAN-role interceptor that
+// rejects tenant clients (only intra-cluster mTLS certs with the
+// `kiseki-fabric/<node-id>` SAN are accepted).
+//
+// Spec: specs/implementation/phase-16-cross-node-chunks.md
+//       specs/invariants.md  I-C2, I-C4, I-D1, I-T1, I-L2
+//       specs/architecture/adr/005-ec-and-chunk-durability.md
+//       specs/architecture/adr/026-raft-topology.md
+//
+// This service replicates *chunk fragments* between cluster nodes.
+// Composition deltas + chunk metadata (`cluster_chunk_state`) ride
+// the existing per-shard Raft log atomically (see D-4 + D-10 in
+// the implementation plan); ClusterChunkService is the dedicated
+// fragment-bytes path so chunk data stays off Raft per ADR-026.
+
+package kiseki.v1;
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+import "kiseki/v1/common.proto";
+import "kiseki/v1/chunk.proto";
+
+// ============================================================================
+// Cluster Chunk Service
+// ============================================================================
+
+service ClusterChunkService {
+  // Place a fragment on this node's local chunk store. Idempotent:
+  // re-PUTting the same (chunk_id, fragment_index) is a no-op (the
+  // ciphertext is content-addressed by `chunk_id`; collisions imply
+  // the same plaintext).
+  rpc PutFragment(PutFragmentRequest) returns (PutFragmentResponse);
+
+  // Read a fragment from this node's local chunk store. Returns
+  // `NOT_FOUND` if the fragment is absent (caller falls back to
+  // another peer per the placement list).
+  rpc GetFragment(GetFragmentRequest) returns (GetFragmentResponse);
+
+  // Delete this node's local fragment for a chunk. Called by the
+  // leader when `cluster_chunk_state` refcount reaches 0 and the
+  // GC sweep drains the placement list. Idempotent: deleting an
+  // absent fragment returns OK (treated as already-deleted).
+  rpc DeleteFragment(DeleteFragmentRequest) returns (DeleteFragmentResponse);
+
+  // Probe whether this node holds a fragment locally. Used by
+  // 16b's repair scrub to detect under-replication; not on the
+  // hot read path.
+  rpc HasFragment(HasFragmentRequest) returns (HasFragmentResponse);
+}
+
+// ============================================================================
+// Requests / responses
+// ============================================================================
+
+message PutFragmentRequest {
+  ChunkId chunk_id = 1;
+  // Fragment index within the chunk (0..N for EC; always 0 for
+  // Replication-N where each peer holds the whole envelope).
+  uint32 fragment_index = 2;
+  // Tenant scope. Required so the receiving node can route to the
+  // correct affinity pool even if `cluster_chunk_state` hasn't yet
+  // applied the proposal (cross-stream ordering — see D-10).
+  OrgId tenant_id = 3;
+  // Affinity pool target. Required for the same reason as
+  // `tenant_id`.
+  AffinityPoolId pool_id = 4;
+  // Encrypted envelope bytes (ciphertext + AEAD tag + nonce, etc.).
+  // Replicated as-is per I-K1 — followers never see plaintext.
+  Envelope envelope = 5;
+  // HLC timestamp of the fragment write on the leader. Used by
+  // the orphan-fragment scrub to compute the 24h TTL (Risk #5
+  // in the implementation plan).
+  DeltaTimestamp leader_ts = 6;
+}
+
+message PutFragmentResponse {
+  // Whether the fragment was newly stored (`true`) or already
+  // present (idempotent re-PUT, `false`).
+  bool stored = 1;
+}
+
+message GetFragmentRequest {
+  ChunkId chunk_id = 1;
+  uint32  fragment_index = 2;
+}
+
+message GetFragmentResponse {
+  Envelope envelope = 1;
+}
+
+message DeleteFragmentRequest {
+  ChunkId chunk_id = 1;
+  uint32  fragment_index = 2;
+  OrgId   tenant_id = 3;
+}
+
+message DeleteFragmentResponse {
+  // Whether a fragment was actually deleted (`true`) or already
+  // absent (`false`).
+  bool deleted = 1;
+}
+
+message HasFragmentRequest {
+  ChunkId chunk_id = 1;
+  uint32  fragment_index = 2;
+}
+
+message HasFragmentResponse {
+  bool present = 1;
+  // Local-only: how old is the fragment relative to the receiving
+  // node's clock. Useful for the orphan-fragment-scrub TTL check
+  // when comparing across peers.
+  uint64 stored_age_ms = 2;
+}

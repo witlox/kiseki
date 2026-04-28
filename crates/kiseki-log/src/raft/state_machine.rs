@@ -13,8 +13,35 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{LogResponse, LogTypeConfig};
 use crate::delta::{Delta, DeltaHeader, DeltaPayload, OperationType};
-use crate::raft_store::LogCommand;
+use crate::raft_store::{LogCommand, NewChunkMeta};
 use crate::watermark::ConsumerWatermarks;
+use kiseki_common::ids::ChunkId;
+use std::collections::HashMap;
+
+/// `cluster_chunk_state` row — Raft-replicated chunk metadata
+/// (Phase 16a, D-4). Keyed by `(tenant_id, chunk_id)` so cross-
+/// tenant dedup doesn't leak refcounts (I-T1; round-2 fix).
+///
+/// Distinct from the local `chunk_meta` redb table in ADR-022:
+/// that one maps `chunk_id → (device_id, offset, size, fragment_idx)`
+/// for the on-disk layout. This one is cluster-wide replication
+/// metadata.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClusterChunkStateEntry {
+    /// Number of compositions referencing this chunk in this tenant.
+    pub refcount: u64,
+    /// Node IDs holding fragments for this chunk. Replication-N has
+    /// N entries; EC X+Y has X+Y entries.
+    pub placement: Vec<u64>,
+    /// True when refcount reached 0 — the entry is held until the
+    /// next compaction prunes it (preserves audit trail across
+    /// concurrent reads in flight when the decrement applied).
+    pub tombstoned: bool,
+    /// Apply-time millisecond stamp from the Raft log index. Used
+    /// by the orphan-fragment scrub to compute the 24h TTL
+    /// (Risk #5 in the implementation plan).
+    pub created_ms: u64,
+}
 
 type C = LogTypeConfig;
 
@@ -146,6 +173,10 @@ pub struct ShardSmInner {
     /// When set, inline payloads are offloaded to this store on apply
     /// and cleared from in-memory deltas.
     pub(crate) inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
+    /// `cluster_chunk_state` table (Phase 16a, D-4).
+    /// Raft-replicated chunk metadata keyed by `(tenant, chunk_id)`.
+    /// See `ClusterChunkStateEntry` doc for the contract.
+    pub cluster_chunk_state: HashMap<(OrgId, ChunkId), ClusterChunkStateEntry>,
 }
 
 impl ShardSmInner {
@@ -161,6 +192,7 @@ impl ShardSmInner {
             last_applied_log: None,
             last_membership: StoredMembershipOf::<C>::default(),
             inline_store: None,
+            cluster_chunk_state: HashMap::new(),
         }
     }
 
@@ -174,6 +206,112 @@ impl ShardSmInner {
         self
     }
 
+    #[allow(clippy::too_many_arguments)] // mirrors delta-args structure on the wire
+    fn append_delta_inner(
+        &mut self,
+        tenant_id_bytes: &[u8; 16],
+        operation: u8,
+        hashed_key: &[u8; 32],
+        chunk_refs: &[[u8; 32]],
+        payload: &[u8],
+        has_inline_data: bool,
+        log_index: u64,
+    ) -> u64 {
+        self.tip += 1;
+        self.delta_count += 1;
+        let next_seq = SequenceNumber(self.tip);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let payload_size = payload.len() as u32;
+
+        let op = u8_to_op(operation);
+
+        let timestamp = kiseki_common::time::DeltaTimestamp {
+            hlc: kiseki_common::time::HybridLogicalClock {
+                physical_ms: log_index,
+                logical: 0,
+                node_id: kiseki_common::ids::NodeId(0),
+            },
+            wall: kiseki_common::time::WallTime {
+                millis_since_epoch: log_index,
+                timezone: "UTC".into(),
+            },
+            quality: kiseki_common::time::ClockQuality::Ntp,
+        };
+
+        // Offload inline content to the store if available (I-SF5).
+        // Key = hashed_key XOR sequence (last 8 bytes), so two deltas
+        // with the same hashed_key but different sequences produce
+        // different inline keys.
+        let inline_key = {
+            let mut k = *hashed_key;
+            let seq_bytes = self.tip.to_le_bytes();
+            for (i, &b) in seq_bytes.iter().enumerate() {
+                k[24 + i] ^= b;
+            }
+            k
+        };
+        let ciphertext = if has_inline_data {
+            if let Some(ref store) = self.inline_store {
+                let _ = store.put(&inline_key, payload);
+                Vec::new()
+            } else {
+                payload.to_vec()
+            }
+        } else {
+            payload.to_vec()
+        };
+
+        let delta = Delta {
+            header: DeltaHeader {
+                sequence: next_seq,
+                shard_id: self.shard_id,
+                tenant_id: OrgId(uuid::Uuid::from_bytes(*tenant_id_bytes)),
+                operation: op,
+                timestamp,
+                hashed_key: *hashed_key,
+                tombstone: operation == 2,
+                chunk_refs: chunk_refs.iter().map(|b| ChunkId(*b)).collect(),
+                payload_size,
+                has_inline_data,
+            },
+            payload: DeltaPayload {
+                ciphertext,
+                auth_tag: Vec::new(),
+                nonce: Vec::new(),
+                system_epoch: None,
+                tenant_epoch: None,
+                tenant_wrapped_material: Vec::new(),
+            },
+        };
+
+        self.deltas.push(delta);
+        self.tip
+    }
+
+    /// Apply Phase 16a `cluster_chunk_state` mutations: create new
+    /// entries for each `NewChunkMeta`. Idempotent on re-apply
+    /// (existing key keeps its current refcount + placement).
+    fn apply_new_chunks(
+        &mut self,
+        tenant_id_bytes: &[u8; 16],
+        new_chunks: &[NewChunkMeta],
+        log_index: u64,
+    ) {
+        let tenant = OrgId(uuid::Uuid::from_bytes(*tenant_id_bytes));
+        for nc in new_chunks {
+            let key = (tenant, ChunkId(nc.chunk_id));
+            self.cluster_chunk_state
+                .entry(key)
+                .or_insert_with(|| ClusterChunkStateEntry {
+                    refcount: 1,
+                    placement: nc.placement.clone(),
+                    tombstoned: false,
+                    created_ms: log_index,
+                });
+        }
+    }
+
     fn apply_command(&mut self, cmd: &LogCommand, log_index: u64) -> LogResponse {
         match cmd {
             LogCommand::AppendDelta {
@@ -184,79 +322,70 @@ impl ShardSmInner {
                 payload,
                 has_inline_data,
             } => {
-                self.tip += 1;
-                self.delta_count += 1;
-                let next_seq = SequenceNumber(self.tip);
-
-                #[allow(clippy::cast_possible_truncation)]
-                let payload_size = payload.len() as u32;
-
-                let op = u8_to_op(*operation);
-
-                let timestamp = kiseki_common::time::DeltaTimestamp {
-                    hlc: kiseki_common::time::HybridLogicalClock {
-                        physical_ms: log_index,
-                        logical: 0,
-                        node_id: kiseki_common::ids::NodeId(0),
-                    },
-                    wall: kiseki_common::time::WallTime {
-                        millis_since_epoch: log_index,
-                        timezone: "UTC".into(),
-                    },
-                    quality: kiseki_common::time::ClockQuality::Ntp,
-                };
-
-                // Offload inline content to the store if available (I-SF5).
-                // Key = sha256(hashed_key || sequence) to ensure uniqueness
-                // per delta (multiple deltas can share the same hashed_key).
-                let inline_key = {
-                    let mut k = *hashed_key;
-                    let seq_bytes = self.tip.to_le_bytes();
-                    for (i, &b) in seq_bytes.iter().enumerate() {
-                        k[24 + i] ^= b; // mix sequence into last 8 bytes
+                let tip = self.append_delta_inner(
+                    tenant_id_bytes,
+                    *operation,
+                    hashed_key,
+                    chunk_refs,
+                    payload,
+                    *has_inline_data,
+                    log_index,
+                );
+                LogResponse::Appended(tip)
+            }
+            LogCommand::ChunkAndDelta {
+                tenant_id_bytes,
+                operation,
+                hashed_key,
+                chunk_refs,
+                payload,
+                has_inline_data,
+                new_chunks,
+            } => {
+                // Atomic per D-4 round 2: chunk_meta entries are
+                // created BEFORE the delta is appended so a reader
+                // observing the delta after this apply step always
+                // finds the corresponding cluster_chunk_state.
+                self.apply_new_chunks(tenant_id_bytes, new_chunks, log_index);
+                let tip = self.append_delta_inner(
+                    tenant_id_bytes,
+                    *operation,
+                    hashed_key,
+                    chunk_refs,
+                    payload,
+                    *has_inline_data,
+                    log_index,
+                );
+                LogResponse::Appended(tip)
+            }
+            LogCommand::IncrementChunkRefcount {
+                tenant_id_bytes,
+                chunk_id,
+            } => {
+                let tenant = OrgId(uuid::Uuid::from_bytes(*tenant_id_bytes));
+                let key = (tenant, ChunkId(*chunk_id));
+                if let Some(entry) = self.cluster_chunk_state.get_mut(&key) {
+                    entry.refcount = entry.refcount.saturating_add(1);
+                    // A new reference revives a tombstoned entry —
+                    // unusual (would mean concurrent decrement +
+                    // re-create) but defensible.
+                    entry.tombstoned = false;
+                }
+                LogResponse::Ok
+            }
+            LogCommand::DecrementChunkRefcount {
+                tenant_id_bytes,
+                chunk_id,
+            } => {
+                let tenant = OrgId(uuid::Uuid::from_bytes(*tenant_id_bytes));
+                let key = (tenant, ChunkId(*chunk_id));
+                if let Some(entry) = self.cluster_chunk_state.get_mut(&key) {
+                    entry.refcount = entry.refcount.saturating_sub(1);
+                    if entry.refcount == 0 {
+                        entry.tombstoned = true;
                     }
-                    k
-                };
-                let ciphertext = if *has_inline_data {
-                    if let Some(ref store) = self.inline_store {
-                        let _ = store.put(&inline_key, payload);
-                        // Clear payload from in-memory delta.
-                        Vec::new()
-                    } else {
-                        payload.clone()
-                    }
-                } else {
-                    payload.clone()
-                };
-
-                let delta = Delta {
-                    header: DeltaHeader {
-                        sequence: next_seq,
-                        shard_id: self.shard_id,
-                        tenant_id: OrgId(uuid::Uuid::from_bytes(*tenant_id_bytes)),
-                        operation: op,
-                        timestamp,
-                        hashed_key: *hashed_key,
-                        tombstone: *operation == 2,
-                        chunk_refs: chunk_refs
-                            .iter()
-                            .map(|b| kiseki_common::ids::ChunkId(*b))
-                            .collect(),
-                        payload_size,
-                        has_inline_data: *has_inline_data,
-                    },
-                    payload: DeltaPayload {
-                        ciphertext,
-                        auth_tag: Vec::new(),
-                        nonce: Vec::new(),
-                        system_epoch: None,
-                        tenant_epoch: None,
-                        tenant_wrapped_material: Vec::new(),
-                    },
-                };
-
-                self.deltas.push(delta);
-                LogResponse::Appended(self.tip)
+                }
+                LogResponse::Ok
             }
             LogCommand::SetMaintenance { enabled } => {
                 self.maintenance = *enabled;
@@ -503,5 +632,191 @@ mod tests {
         assert_eq!(&key[..24], &[0xFF_u8; 24]);
         // Last 8 bytes should differ from original (XOR with non-zero sequence).
         assert_ne!(&key[24..], &[0xFF_u8; 8]);
+    }
+
+    // -----------------------------------------------------------
+    // Phase 16a — cluster_chunk_state Raft state machine.
+    //
+    // Tests the atomic CombinedProposal path that bundles a
+    // composition delta with chunk metadata creation per D-4 + D-10
+    // of specs/implementation/phase-16-cross-node-chunks.md.
+    // -----------------------------------------------------------
+
+    use super::*;
+    use crate::raft_store::{LogCommand, NewChunkMeta};
+    use kiseki_common::ids::{ChunkId, OrgId, ShardId};
+
+    fn fresh_inner() -> ShardSmInner {
+        ShardSmInner::new(
+            ShardId(uuid::Uuid::from_u128(0xabc)),
+            OrgId(uuid::Uuid::from_u128(0xdef)),
+        )
+    }
+
+    fn org(b: u8) -> [u8; 16] {
+        [b; 16]
+    }
+
+    fn chunk(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    /// Combined proposal: delta append + chunk meta create.
+    /// Applying must produce BOTH a new delta AND a new
+    /// `cluster_chunk_state` entry — atomically, in a single apply
+    /// step. This is the I-L2 / I-L5 atomicity contract from D-4.
+    #[test]
+    fn combined_proposal_atomically_appends_delta_and_creates_chunk_meta() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+        let chunk_id = chunk(2);
+        let cmd = LogCommand::ChunkAndDelta {
+            tenant_id_bytes: tenant,
+            operation: 0, // Create
+            hashed_key: [0x55; 32],
+            chunk_refs: vec![chunk_id],
+            payload: vec![0xAA; 16],
+            has_inline_data: false,
+            new_chunks: vec![NewChunkMeta {
+                chunk_id,
+                placement: vec![1, 2, 3],
+            }],
+        };
+
+        let _ = inner.apply_command(&cmd, 1);
+
+        // Delta side observable.
+        assert_eq!(inner.deltas.len(), 1, "delta must be appended");
+        assert_eq!(inner.tip, 1);
+        // Chunk meta side observable in the same apply step.
+        let key = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(chunk_id));
+        let entry = inner
+            .cluster_chunk_state
+            .get(&key)
+            .expect("chunk_meta entry must exist after CombinedProposal apply");
+        assert_eq!(entry.refcount, 1);
+        assert_eq!(entry.placement, vec![1, 2, 3]);
+        assert!(!entry.tombstoned);
+    }
+
+    /// Separate tenants writing the same `chunk_id` end up with
+    /// independent `cluster_chunk_state` entries. Q1.C round-2 fix:
+    /// `(tenant_id, chunk_id)` keying prevents the cross-tenant
+    /// refcount inference leak under cross-tenant dedup.
+    #[test]
+    fn chunk_meta_keyed_by_tenant_isolates_refcount_across_tenants() {
+        let mut inner = fresh_inner();
+        let chunk_id = chunk(7);
+        let tenant_a = org(1);
+        let tenant_b = org(2);
+
+        for tenant in [tenant_a, tenant_b] {
+            let cmd = LogCommand::ChunkAndDelta {
+                tenant_id_bytes: tenant,
+                operation: 0,
+                hashed_key: [0x33; 32],
+                chunk_refs: vec![chunk_id],
+                payload: vec![],
+                has_inline_data: false,
+                new_chunks: vec![NewChunkMeta {
+                    chunk_id,
+                    placement: vec![1, 2, 3],
+                }],
+            };
+            let _ = inner.apply_command(&cmd, 1);
+        }
+
+        let key_a = (OrgId(uuid::Uuid::from_bytes(tenant_a)), ChunkId(chunk_id));
+        let key_b = (OrgId(uuid::Uuid::from_bytes(tenant_b)), ChunkId(chunk_id));
+        assert_eq!(
+            inner.cluster_chunk_state.get(&key_a).map(|e| e.refcount),
+            Some(1),
+            "tenant A has its own refcount=1"
+        );
+        assert_eq!(
+            inner.cluster_chunk_state.get(&key_b).map(|e| e.refcount),
+            Some(1),
+            "tenant B has its own refcount=1, independent of tenant A"
+        );
+    }
+
+    /// `IncrementChunkRefcount` on an existing entry bumps refcount
+    /// (used when a second composition references an already-stored
+    /// chunk via dedup).
+    #[test]
+    fn increment_chunk_refcount_bumps_existing_entry() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+        let chunk_id = chunk(3);
+
+        // Seed via combined proposal.
+        let _ = inner.apply_command(
+            &LogCommand::ChunkAndDelta {
+                tenant_id_bytes: tenant,
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![chunk_id],
+                payload: vec![],
+                has_inline_data: false,
+                new_chunks: vec![NewChunkMeta {
+                    chunk_id,
+                    placement: vec![1, 2, 3],
+                }],
+            },
+            1,
+        );
+
+        // Bump.
+        let _ = inner.apply_command(
+            &LogCommand::IncrementChunkRefcount {
+                tenant_id_bytes: tenant,
+                chunk_id,
+            },
+            2,
+        );
+
+        let key = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(chunk_id));
+        assert_eq!(inner.cluster_chunk_state[&key].refcount, 2);
+    }
+
+    /// Decrement to refcount=0 tombstones the entry (does not
+    /// remove it from the map immediately — compaction prunes
+    /// tombstones later, per D-4 round 2).
+    #[test]
+    fn decrement_to_zero_tombstones_entry_for_compaction_prune() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+        let chunk_id = chunk(4);
+
+        let _ = inner.apply_command(
+            &LogCommand::ChunkAndDelta {
+                tenant_id_bytes: tenant,
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![chunk_id],
+                payload: vec![],
+                has_inline_data: false,
+                new_chunks: vec![NewChunkMeta {
+                    chunk_id,
+                    placement: vec![1, 2, 3],
+                }],
+            },
+            1,
+        );
+        let _ = inner.apply_command(
+            &LogCommand::DecrementChunkRefcount {
+                tenant_id_bytes: tenant,
+                chunk_id,
+            },
+            2,
+        );
+
+        let key = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(chunk_id));
+        let entry = inner
+            .cluster_chunk_state
+            .get(&key)
+            .expect("entry still present (tombstoned, not removed)");
+        assert_eq!(entry.refcount, 0);
+        assert!(entry.tombstoned, "refcount=0 must mark entry tombstoned");
     }
 }
