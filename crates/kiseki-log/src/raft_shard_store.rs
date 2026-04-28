@@ -12,13 +12,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
+use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 
 use crate::delta::Delta;
 use crate::error::LogError;
 use crate::raft::OpenRaftLogStore;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
-use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
+use crate::traits::{
+    AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest,
+};
 
 /// Raft-backed shard store for multi-node clusters.
 ///
@@ -183,6 +185,34 @@ impl LogOps for RaftShardStore {
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(req.shard_id)?;
         store.append_delta(req).await
+    }
+
+    async fn append_chunk_and_delta(
+        &self,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        let store = self.get_shard(req.delta.shard_id)?;
+        store.append_chunk_and_delta(req.delta, req.new_chunks).await
+    }
+
+    async fn increment_chunk_refcount(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        chunk_id: ChunkId,
+    ) -> Result<(), LogError> {
+        let store = self.get_shard(shard_id)?;
+        store.increment_chunk_refcount(tenant_id, chunk_id).await
+    }
+
+    async fn decrement_chunk_refcount(
+        &self,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        chunk_id: ChunkId,
+    ) -> Result<(), LogError> {
+        let store = self.get_shard(shard_id)?;
+        store.decrement_chunk_refcount(tenant_id, chunk_id).await
     }
 
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {

@@ -2,11 +2,12 @@
 //!
 //! Spec: `api-contracts.md` §Log, `data-models/log.rs`.
 
-use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
+use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 use kiseki_common::time::DeltaTimestamp;
 
 use crate::delta::{Delta, OperationType};
 use crate::error::LogError;
+use crate::raft_store::NewChunkMeta;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
 
 /// Request to append a delta to a shard.
@@ -28,6 +29,23 @@ pub struct AppendDeltaRequest {
     pub payload: Vec<u8>,
     /// Whether payload includes inline data.
     pub has_inline_data: bool,
+}
+
+/// Combined "create `cluster_chunk_state` entries + append delta"
+/// request (Phase 16b — gateway emits this whenever the delta
+/// references newly-created chunks). Applied atomically by the
+/// per-shard Raft state machine: `cluster_chunk_state` entries are
+/// created BEFORE the delta is appended, so any reader observing the
+/// delta is guaranteed to find the matching `cluster_chunk_state` row
+/// (D-4).
+#[derive(Clone, Debug)]
+pub struct AppendChunkAndDeltaRequest {
+    /// The delta side — same fields as [`AppendDeltaRequest`].
+    pub delta: AppendDeltaRequest,
+    /// Newly created chunks for this delta. Each entry seeds a
+    /// `cluster_chunk_state[(tenant, chunk_id)]` row with refcount=1
+    /// and the leader-side placement list.
+    pub new_chunks: Vec<NewChunkMeta>,
 }
 
 /// Request to read a range of deltas.
@@ -60,6 +78,47 @@ pub trait LogOps: Send + Sync {
     /// Fails if the shard is in maintenance mode, splitting (for
     /// out-of-range keys), or has lost Raft quorum.
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError>;
+
+    /// Atomic "create `cluster_chunk_state` + append delta" — Phase 16b
+    /// D-4 contract. Same failure modes as `append_delta`. Default
+    /// impl forwards to `append_delta` and ignores `new_chunks` (used
+    /// by the in-memory store and by tests that don't care about
+    /// cluster-wide refcount metadata); the Raft-backed
+    /// implementation overrides this with an atomic `ChunkAndDelta`
+    /// proposal.
+    async fn append_chunk_and_delta(
+        &self,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.append_delta(req.delta).await
+    }
+
+    /// Bump a chunk's `cluster_chunk_state` refcount on an existing
+    /// entry — Phase 16b. No-op default (in-memory store does not
+    /// track `cluster_chunk_state`). Production override proposes
+    /// `IncrementChunkRefcount`.
+    async fn increment_chunk_refcount(
+        &self,
+        _shard_id: ShardId,
+        _tenant_id: OrgId,
+        _chunk_id: ChunkId,
+    ) -> Result<(), LogError> {
+        Ok(())
+    }
+
+    /// Decrement a chunk's `cluster_chunk_state` refcount — Phase 16b.
+    /// On reaching zero the entry is tombstoned and the leader is
+    /// expected to fan `DeleteFragment` out to its placement list.
+    /// No-op default; production override proposes
+    /// `DecrementChunkRefcount`.
+    async fn decrement_chunk_refcount(
+        &self,
+        _shard_id: ShardId,
+        _tenant_id: OrgId,
+        _chunk_id: ChunkId,
+    ) -> Result<(), LogError> {
+        Ok(())
+    }
 
     /// Read deltas in `[from, to]` inclusive from a shard.
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError>;

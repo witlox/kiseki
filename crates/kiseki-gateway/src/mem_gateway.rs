@@ -543,7 +543,11 @@ impl GatewayOps for InMemoryGateway {
         self.bytes_written
             .fetch_add(bytes_written, Ordering::Relaxed);
 
-        // Route: inline (ADR-030) or chunk store.
+        // Route: inline (ADR-030) or chunk store. `chunk_was_new`
+        // tracks whether this write actually created a new chunk
+        // (vs. a dedup hit) so the log proposal below can carry the
+        // right Phase 16b cluster_chunk_state hint.
+        let mut chunk_was_new = false;
         if bytes_written <= self.inline_threshold && self.small_store.is_some() {
             let env_bytes =
                 serde_json::to_vec(&env).map_err(|e| GatewayError::Upstream(e.to_string()))?;
@@ -562,6 +566,7 @@ impl GatewayOps for InMemoryGateway {
             if !is_new {
                 let _ = self.chunks.increment_refcount(&chunk_id).await;
             }
+            chunk_was_new = is_new;
         }
 
         // Create composition (sync, fast) — lock released before Raft.
@@ -601,7 +606,28 @@ impl GatewayOps for InMemoryGateway {
                 emit_params.0
             };
 
-            match kiseki_composition::log_bridge::emit_delta(
+            // Phase 16b D-4: if this write created a new chunk, carry
+            // it in the `new_chunks` list so the per-shard Raft state
+            // machine seeds a `cluster_chunk_state[(tenant, chunk_id)]`
+            // row atomically with the delta. Dedup-hit writes use the
+            // plain `AppendDelta` path.
+            let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = if chunk_was_new {
+                vec![kiseki_log::raft_store::NewChunkMeta {
+                    chunk_id: chunk_id.0,
+                    // 16b step 1 leaves placement empty — the
+                    // ClusteredChunkStore's peer list is the
+                    // authoritative placement, but plumbing it
+                    // through AsyncChunkOps is a separate layer
+                    // change. Step 2 (cluster-wide GC) will need
+                    // real placement; until then the entry is still
+                    // useful for refcount tracking.
+                    placement: vec![],
+                }]
+            } else {
+                vec![]
+            };
+
+            match kiseki_composition::log_bridge::emit_chunk_and_delta(
                 log.as_ref(),
                 shard_id,
                 emit_params.1,
@@ -609,6 +635,7 @@ impl GatewayOps for InMemoryGateway {
                 hashed_key,
                 emit_params.3,
                 comp_id.0.as_bytes().to_vec(),
+                new_chunks,
             )
             .await
             {

@@ -403,6 +403,84 @@ impl OpenRaftLogStore {
         }
     }
 
+    /// Atomic chunk-meta-create + delta-append (Phase 16b D-4).
+    /// Submits a single `ChunkAndDelta` Raft proposal so every replica
+    /// applies the `cluster_chunk_state` seed and the delta together.
+    pub async fn append_chunk_and_delta(
+        &self,
+        req: AppendDeltaRequest,
+        new_chunks: Vec<crate::raft_store::NewChunkMeta>,
+    ) -> Result<SequenceNumber, LogError> {
+        {
+            let inner = self.state.lock().await;
+            if inner.maintenance {
+                return Err(LogError::MaintenanceMode(self.shard_id));
+            }
+        }
+
+        let cmd = LogCommand::ChunkAndDelta {
+            tenant_id_bytes: *req.tenant_id.0.as_bytes(),
+            operation: op_to_u8(req.operation),
+            hashed_key: req.hashed_key,
+            chunk_refs: req.chunk_refs.iter().map(|c| c.0).collect(),
+            payload: req.payload,
+            has_inline_data: req.has_inline_data,
+            new_chunks,
+        };
+
+        let resp = self.raft.client_write(cmd).await.map_err(|e| {
+            if matches!(
+                e,
+                openraft::errors::RaftError::APIError(
+                    openraft::error::ClientWriteError::ForwardToLeader(_)
+                )
+            ) {
+                LogError::LeaderUnavailable(self.shard_id)
+            } else {
+                LogError::Unavailable
+            }
+        })?;
+
+        match resp.response() {
+            LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
+            LogResponse::Ok => Err(LogError::Unavailable),
+        }
+    }
+
+    /// Bump a chunk's `cluster_chunk_state` refcount (Phase 16b).
+    pub async fn increment_chunk_refcount(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        chunk_id: kiseki_common::ids::ChunkId,
+    ) -> Result<(), LogError> {
+        let cmd = LogCommand::IncrementChunkRefcount {
+            tenant_id_bytes: *tenant_id.0.as_bytes(),
+            chunk_id: chunk_id.0,
+        };
+        self.raft
+            .client_write(cmd)
+            .await
+            .map_err(|_| LogError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Decrement a chunk's `cluster_chunk_state` refcount (Phase 16b).
+    pub async fn decrement_chunk_refcount(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        chunk_id: kiseki_common::ids::ChunkId,
+    ) -> Result<(), LogError> {
+        let cmd = LogCommand::DecrementChunkRefcount {
+            tenant_id_bytes: *tenant_id.0.as_bytes(),
+            chunk_id: chunk_id.0,
+        };
+        self.raft
+            .client_write(cmd)
+            .await
+            .map_err(|_| LogError::Unavailable)?;
+        Ok(())
+    }
+
     /// Read deltas in `[from, to]` inclusive from the shard.
     ///
     /// For inline deltas (`has_inline_data=true`), reconstructs the
