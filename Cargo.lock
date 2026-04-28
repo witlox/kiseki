@@ -1661,6 +1661,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-chunk-cluster"
+version = "2026.38.0"
+dependencies = [
+ "async-trait",
+ "kiseki-chunk",
+ "kiseki-common",
+ "kiseki-crypto",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kiseki-client"
 version = "2026.38.0"
 dependencies = [
