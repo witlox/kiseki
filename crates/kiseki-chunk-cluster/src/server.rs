@@ -83,14 +83,6 @@ impl ClusterChunkService for ClusterChunkServer {
         request: Request<pb::PutFragmentRequest>,
     ) -> Result<Response<pb::PutFragmentResponse>, Status> {
         let req = request.into_inner();
-        // 16a Replication-N: only fragment_index=0 is valid. Reject
-        // anything else as InvalidArgument so EC traffic (16b) doesn't
-        // silently land on a 16a node and corrupt placement.
-        if req.fragment_index != 0 {
-            return Err(Status::invalid_argument(
-                "only fragment_index=0 supported (Replication-N, 16a)",
-            ));
-        }
 
         let envelope = req
             .envelope
@@ -103,12 +95,27 @@ impl ClusterChunkService for ClusterChunkServer {
             .as_ref()
             .map_or_else(|| self.default_pool.clone(), proto_pool_to_string);
 
-        let stored = self
-            .local
-            .write_chunk(envelope, &pool)
-            .await
-            .map_err(|e| chunk_err_to_status(&e))?;
-        Ok(Response::new(pb::PutFragmentResponse { stored }))
+        // Phase 16d step 2: route by fragment_index. index=0 keeps
+        // the legacy whole-envelope path (Replication-N + dedup).
+        // index>0 is an EC shard; store via write_fragment so the
+        // bytes are addressed by (chunk_id, fragment_index).
+        if req.fragment_index == 0 {
+            let stored = self
+                .local
+                .write_chunk(envelope, &pool)
+                .await
+                .map_err(|e| chunk_err_to_status(&e))?;
+            Ok(Response::new(pb::PutFragmentResponse { stored }))
+        } else {
+            let chunk_id = envelope.chunk_id;
+            self.local
+                .write_fragment(&chunk_id, req.fragment_index, envelope.ciphertext)
+                .await
+                .map_err(|e| chunk_err_to_status(&e))?;
+            // EC fragment writes don't carry refcount semantics; report
+            // stored=true so callers can count this as a successful ack.
+            Ok(Response::new(pb::PutFragmentResponse { stored: true }))
+        }
     }
 
     async fn get_fragment(
@@ -116,20 +123,39 @@ impl ClusterChunkService for ClusterChunkServer {
         request: Request<pb::GetFragmentRequest>,
     ) -> Result<Response<pb::GetFragmentResponse>, Status> {
         let req = request.into_inner();
-        if req.fragment_index != 0 {
-            return Err(Status::invalid_argument(
-                "only fragment_index=0 supported (Replication-N, 16a)",
-            ));
-        }
         let chunk_id = proto_chunk_id_to_rust(req.chunk_id.as_ref())?;
-        let env = self
-            .local
-            .read_chunk(&chunk_id)
-            .await
-            .map_err(|e| chunk_err_to_status(&e))?;
-        Ok(Response::new(pb::GetFragmentResponse {
-            envelope: Some(rust_envelope_to_proto(&env)),
-        }))
+
+        if req.fragment_index == 0 {
+            let env = self
+                .local
+                .read_chunk(&chunk_id)
+                .await
+                .map_err(|e| chunk_err_to_status(&e))?;
+            Ok(Response::new(pb::GetFragmentResponse {
+                envelope: Some(rust_envelope_to_proto(&env)),
+            }))
+        } else {
+            let bytes = self
+                .local
+                .read_fragment(&chunk_id, req.fragment_index)
+                .await
+                .map_err(|e| chunk_err_to_status(&e))?;
+            // Wrap the shard bytes in a synthetic Envelope — the
+            // proto requires this shape regardless of index. The
+            // caller's `read_chunk_ec` only uses `ciphertext`.
+            let env = kiseki_crypto::envelope::Envelope {
+                chunk_id,
+                ciphertext: bytes,
+                auth_tag: [0u8; 16],
+                nonce: [0u8; 12],
+                system_epoch: kiseki_common::tenancy::KeyEpoch(1),
+                tenant_epoch: None,
+                tenant_wrapped_material: None,
+            };
+            Ok(Response::new(pb::GetFragmentResponse {
+                envelope: Some(rust_envelope_to_proto(&env)),
+            }))
+        }
     }
 
     async fn delete_fragment(
@@ -137,27 +163,30 @@ impl ClusterChunkService for ClusterChunkServer {
         request: Request<pb::DeleteFragmentRequest>,
     ) -> Result<Response<pb::DeleteFragmentResponse>, Status> {
         let req = request.into_inner();
-        if req.fragment_index != 0 {
-            return Err(Status::invalid_argument(
-                "only fragment_index=0 supported (Replication-N, 16a)",
-            ));
-        }
         let chunk_id = proto_chunk_id_to_rust(req.chunk_id.as_ref())?;
-        // Idempotent delete: if the local store reports NotFound,
-        // treat it as already-deleted (deleted=false).
-        match self.local.decrement_refcount(&chunk_id).await {
-            Ok(0) => {
-                // refcount hit zero — caller relies on GC to actually
-                // reclaim space. Reporting `deleted=true` matches the
-                // proto contract: "actually deleted" is at the
-                // refcount-transition level for 16a.
-                Ok(Response::new(pb::DeleteFragmentResponse { deleted: true }))
+
+        if req.fragment_index == 0 {
+            // Whole-envelope path: same as 16a — drop refcount,
+            // report deleted=true on a 0-transition.
+            match self.local.decrement_refcount(&chunk_id).await {
+                Ok(0) => Ok(Response::new(pb::DeleteFragmentResponse { deleted: true })),
+                Ok(_) => Ok(Response::new(pb::DeleteFragmentResponse { deleted: false })),
+                Err(ChunkError::NotFound(_)) => {
+                    Ok(Response::new(pb::DeleteFragmentResponse { deleted: false }))
+                }
+                Err(e) => Err(chunk_err_to_status(&e)),
             }
-            Ok(_) => Ok(Response::new(pb::DeleteFragmentResponse { deleted: false })),
-            Err(ChunkError::NotFound(_)) => {
-                Ok(Response::new(pb::DeleteFragmentResponse { deleted: false }))
-            }
-            Err(e) => Err(chunk_err_to_status(&e)),
+        } else {
+            // EC fragment: idempotent delete via the per-fragment
+            // store. No refcount semantics for individual fragments.
+            let was_present = self
+                .local
+                .delete_fragment(&chunk_id, req.fragment_index)
+                .await
+                .map_err(|e| chunk_err_to_status(&e))?;
+            Ok(Response::new(pb::DeleteFragmentResponse {
+                deleted: was_present,
+            }))
         }
     }
 
@@ -166,21 +195,22 @@ impl ClusterChunkService for ClusterChunkServer {
         request: Request<pb::HasFragmentRequest>,
     ) -> Result<Response<pb::HasFragmentResponse>, Status> {
         let req = request.into_inner();
-        if req.fragment_index != 0 {
-            return Err(Status::invalid_argument(
-                "only fragment_index=0 supported (Replication-N, 16a)",
-            ));
-        }
         let chunk_id = proto_chunk_id_to_rust(req.chunk_id.as_ref())?;
-        let present = match self.local.refcount(&chunk_id).await {
-            Ok(rc) => rc > 0,
-            Err(ChunkError::NotFound(_)) => false,
-            Err(e) => return Err(chunk_err_to_status(&e)),
+
+        let present = if req.fragment_index == 0 {
+            match self.local.refcount(&chunk_id).await {
+                Ok(rc) => rc > 0,
+                Err(ChunkError::NotFound(_)) => false,
+                Err(e) => return Err(chunk_err_to_status(&e)),
+            }
+        } else {
+            self.local
+                .list_fragments(&chunk_id)
+                .await
+                .contains(&req.fragment_index)
         };
         Ok(Response::new(pb::HasFragmentResponse {
             present,
-            // stored_age_ms is wired in step 11 (metrics) once we
-            // track per-chunk insert HLCs locally.
             stored_age_ms: 0,
         }))
     }
@@ -508,17 +538,76 @@ mod tests {
         assert!(resp2.present, "stored fragment must report present=true");
     }
 
+    /// Phase 16d step 2: the server now accepts `fragment_index > 0`
+    /// for EC-mode writes — the 16a `InvalidArgument` reject is
+    /// gone. Index=0 still routes to the legacy `write_chunk` path
+    /// (whole-envelope, refcounted); index>0 stores via
+    /// `write_fragment` keyed by `(chunk_id, fragment_index)`.
     #[tokio::test]
-    async fn put_fragment_rejects_nonzero_fragment_index_in_16a() {
+    async fn put_fragment_at_nonzero_index_stores_via_write_fragment() {
         let local = local_bridge("p");
-        let server = ClusterChunkServer::new(local, "p");
+        let server = ClusterChunkServer::new(Arc::clone(&local), "p");
+
+        // We can't put_req(env, p) directly here because the
+        // make_envelope ciphertext is meant for the whole-envelope
+        // path. For EC fragments the body is just shard bytes.
         let env = make_envelope(0xD4);
+        let chunk_id = env.chunk_id;
         let mut req = put_req(&env, "p");
         req.fragment_index = 3;
-        let status = server
+
+        let resp = server
             .put_fragment(Request::new(req))
             .await
-            .expect_err("16a rejects EC fragment indices");
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            .expect("16d accepts index>0")
+            .into_inner();
+        assert!(resp.stored, "fragment newly stored");
+
+        // The fragment is queryable via list_fragments on the local
+        // store.
+        let frags = local.list_fragments(&chunk_id).await;
+        assert_eq!(frags, vec![3], "fragment_index=3 stored locally");
+
+        // The legacy `chunks` map is untouched.
+        let local_count =
+            kiseki_chunk::AsyncChunkOps::refcount(local.as_ref(), &chunk_id)
+                .await;
+        assert!(
+            matches!(local_count, Err(kiseki_chunk::ChunkError::NotFound(_))),
+            "EC fragment must NOT bump the whole-envelope refcount",
+        );
+    }
+
+    /// Phase 16d step 2: `get_fragment` on index>0 reads from the
+    /// per-fragment store; index=0 keeps reading from the legacy
+    /// `chunks` map.
+    #[tokio::test]
+    async fn get_fragment_at_nonzero_index_reads_via_read_fragment() {
+        let local = local_bridge("p");
+        let server = ClusterChunkServer::new(Arc::clone(&local), "p");
+
+        let env = make_envelope(0xE5);
+        let chunk_id = env.chunk_id;
+        let mut req = put_req(&env, "p");
+        req.fragment_index = 2;
+        server
+            .put_fragment(Request::new(req))
+            .await
+            .expect("put");
+
+        let resp = server
+            .get_fragment(Request::new(pb::GetFragmentRequest {
+                chunk_id: Some(pb::ChunkId {
+                    value: chunk_id.0.to_vec(),
+                }),
+                fragment_index: 2,
+            }))
+            .await
+            .expect("get ok")
+            .into_inner();
+        let proto_env = resp.envelope.expect("envelope present");
+        // The bytes returned ARE the shard body — for the test
+        // envelope the shard body equals the input ciphertext.
+        assert_eq!(proto_env.ciphertext, env.ciphertext);
     }
 }
