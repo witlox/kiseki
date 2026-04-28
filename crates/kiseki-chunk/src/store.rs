@@ -70,6 +70,14 @@ pub trait ChunkOps {
 
     /// Get the refcount for a chunk.
     fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
+
+    /// Phase 16c step 4: enumerate every chunk currently held
+    /// locally. Used by the orphan-fragment scrub to walk the
+    /// candidate set. Default empty so existing impls compile;
+    /// `ChunkStore` overrides with the live keys.
+    fn list_chunk_ids(&self) -> Vec<ChunkId> {
+        Vec::new()
+    }
 }
 
 /// In-memory chunk store.
@@ -389,6 +397,10 @@ impl ChunkOps for ChunkStore {
             .map(|e| e.refcount)
             .ok_or(ChunkError::NotFound(*chunk_id))
     }
+
+    fn list_chunk_ids(&self) -> Vec<ChunkId> {
+        self.chunks.keys().copied().collect()
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +469,32 @@ mod tests {
             store.refcount(&chunk_id).unwrap_or_else(|_| unreachable!()),
             2
         );
+    }
+
+    /// Phase 16c step 4: `list_chunk_ids` enumerates exactly the
+    /// keys the orphan-fragment scrub needs to walk. Pinned so a
+    /// future "lazy iterator" rewrite still satisfies the contract.
+    #[test]
+    fn list_chunk_ids_returns_all_stored_keys() {
+        let mut store = setup_store();
+        let chunk_a = test_envelope(0x10);
+        let chunk_b = test_envelope(0x20);
+        let id_a = chunk_a.chunk_id;
+        let id_b = chunk_b.chunk_id;
+        store.write_chunk(chunk_a, "fast-nvme").unwrap();
+        store.write_chunk(chunk_b, "fast-nvme").unwrap();
+
+        let ids: std::collections::HashSet<_> =
+            store.list_chunk_ids().into_iter().collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&id_a));
+        assert!(ids.contains(&id_b));
+    }
+
+    #[test]
+    fn list_chunk_ids_on_empty_store_is_empty() {
+        let store = setup_store();
+        assert!(store.list_chunk_ids().is_empty());
     }
 
     #[test]

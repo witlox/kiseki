@@ -77,6 +77,13 @@ pub trait AsyncChunkOps: Send + Sync {
     ) -> Result<(), ChunkError> {
         Ok(())
     }
+
+    /// Phase 16c step 4: enumerate every chunk currently held by
+    /// the local store. Used by the orphan-fragment scrub to walk
+    /// the candidate set. Default empty.
+    async fn list_chunk_ids(&self) -> Vec<ChunkId> {
+        Vec::new()
+    }
 }
 
 /// Adapter that exposes any sync [`ChunkOps`] as [`AsyncChunkOps`]
@@ -211,6 +218,16 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         })
         .await
         .expect("spawn_blocking panicked")
+    }
+
+    async fn list_chunk_ids(&self) -> Vec<ChunkId> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.blocking_lock();
+            guard.list_chunk_ids()
+        })
+        .await
+        .unwrap_or_default()
     }
 }
 
