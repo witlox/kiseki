@@ -42,6 +42,17 @@ pub struct GrpcFabricPeer {
     metrics: Option<Arc<FabricMetrics>>,
 }
 
+/// Per-RPC message size cap on the cluster fabric. Tonic defaults
+/// to 4 MiB which is below typical kiseki chunk sizes (the gateway
+/// emits one chunk per S3 PUT today, and a 4 MiB PUT + protobuf +
+/// crypto framing already overruns the default cap, returning
+/// `quorum lost: only 1/2 replicas acked` because every `PutFragment`
+/// fan-out is rejected by the receiver). 64 MiB matches the
+/// practical envelope size we'd see for a single-chunk write while
+/// still bounded so a peer can't send a near-unbounded message
+/// through the fabric.
+pub const FABRIC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 impl GrpcFabricPeer {
     /// Build a fabric peer from a connected tonic channel + a
     /// human-readable name (typically the peer's node id).
@@ -49,7 +60,9 @@ impl GrpcFabricPeer {
     pub fn new(name: impl Into<String>, channel: Channel) -> Self {
         Self {
             name: name.into(),
-            client: ClusterChunkServiceClient::new(channel),
+            client: ClusterChunkServiceClient::new(channel)
+                .max_decoding_message_size(FABRIC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(FABRIC_MAX_MESSAGE_BYTES),
             metrics: None,
         }
     }
@@ -432,5 +445,22 @@ mod tests {
             2,
             "exactly two attempts: original + one retry"
         );
+    }
+
+    /// Phase 15c.8 perf: tonic's default 4 MiB cap is below the
+    /// kiseki single-chunk envelope size for typical S3 PUTs. The
+    /// fabric must lift the cap or any 4+ MiB write returns
+    /// `quorum lost: only 1/2 replicas acked` (the receiver rejects
+    /// the `PutFragment` payload as oversized; the sender sees zero
+    /// peer acks and only the leader's local write counts).
+    /// This test pins the cap so a future "let's tighten this for
+    /// safety" change has to think twice.
+    #[test]
+    fn fabric_max_message_size_exceeds_practical_chunk_size() {
+        // Anything below 8 MiB is too small for a typical S3 PUT
+        // (the perf baseline writes 8 MiB in a single PUT). const-block
+        // assertion evaluates at compile time; this test exists to
+        // give the contract a discoverable name + comment.
+        const _: () = assert!(FABRIC_MAX_MESSAGE_BYTES >= 8 * 1024 * 1024);
     }
 }

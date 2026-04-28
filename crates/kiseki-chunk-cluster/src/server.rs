@@ -51,7 +51,9 @@ impl ClusterChunkServer {
     /// for plaintext / single-node test setups.
     #[must_use]
     pub fn into_tonic_server(self) -> ClusterChunkServiceServer<Self> {
-        ClusterChunkServiceServer::new(self)
+        ClusterChunkServiceServer::new(self).max_decoding_message_size(
+            crate::peer::FABRIC_MAX_MESSAGE_BYTES,
+        )
     }
 
     /// Wrap into a tonic server with the [`fabric_san_interceptor`]
@@ -62,7 +64,12 @@ impl ClusterChunkServer {
     /// fragment access (Phase 16a I-Auth4 / I-T1).
     #[must_use]
     pub fn into_tonic_server_with_san_check(self) -> InterceptedClusterChunkService {
-        ClusterChunkServiceServer::with_interceptor(self, fabric_san_interceptor)
+        // Configure size limits BEFORE wrapping with the interceptor —
+        // tonic's `InterceptedService` doesn't expose
+        // `max_decoding_message_size` on its outer wrapper.
+        let server = ClusterChunkServiceServer::new(self)
+            .max_decoding_message_size(crate::peer::FABRIC_MAX_MESSAGE_BYTES);
+        tonic::service::interceptor::InterceptedService::new(server, fabric_san_interceptor)
     }
 }
 

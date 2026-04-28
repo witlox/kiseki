@@ -11,7 +11,7 @@ use thiserror::Error;
 
 pub mod grpc;
 
-pub use grpc::{is_retriable_status, status_to_fabric_err, GrpcFabricPeer};
+pub use grpc::{is_retriable_status, status_to_fabric_err, GrpcFabricPeer, FABRIC_MAX_MESSAGE_BYTES};
 
 /// Errors a fabric peer call can fail with. Maps onto the gRPC
 /// status codes in the real impl: `NOT_FOUND` → `NotFound`,
