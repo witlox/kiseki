@@ -1,6 +1,6 @@
 # Phase 16 — Cross-Node Chunk Placement
 
-**Status**: Draft (architect, revision 3 — post-adversary round 2)
+**Status**: Draft (architect, revision 4 — post-spec-consistency pass)
 **Date**: 2026-04-28
 **Traces**: I-C4, I-D1, I-D4, ADR-005, ADR-029
 **Supersedes**: B-3 finding (per-node gateway compositions store)
@@ -60,7 +60,7 @@ Per-fragment placement happens at this layer. Local fragments
 delegate to the inner store; remote fragments route through the
 fabric gRPC. The inner `ChunkOps` impl never learns about peers.
 
-**Crate placement**: new `kiseki-fabric-chunk` crate. Keeps the
+**Crate placement**: new `kiseki-chunk-cluster` crate. Keeps the
 gateway focused on protocol mapping; lets future direct-RPC
 clients reuse the clustered store. Depends on `kiseki-chunk`,
 `kiseki-proto`, `kiseki-raft`.
@@ -73,7 +73,7 @@ Adversary correctly noted this multiplies the operational surface
 no security benefit beyond what a namespaced authz on the existing
 data-path port delivers.
 
-Decision: **add `FabricChunkService` to the existing port 9100
+Decision: **add `ClusterChunkService` to the existing port 9100
 gRPC server** with a tonic `Interceptor` that:
 1. Requires mTLS with a Cluster-CA-signed peer cert.
 2. Asserts the peer cert's SAN includes a `kiseki-fabric/` URI
@@ -82,7 +82,7 @@ gRPC server** with a tonic `Interceptor` that:
 3. Rejects with `Unauthenticated` otherwise.
 
 Tenant clients with valid certs can call data-path RPCs but are
-rejected by the fabric interceptor on FabricChunkService. Same
+rejected by the fabric interceptor on ClusterChunkService. Same
 TLS fabric, same port; different authz.
 
 **Trade-off note (post-adversary round 2)**: this is *weaker
@@ -108,7 +108,7 @@ The protobuf service:
 
 ```protobuf
 // specs/architecture/proto/kiseki/v1/fabric.proto
-service FabricChunkService {
+service ClusterChunkService {
     rpc PutFragment(PutFragmentRequest) returns (PutFragmentResponse);
     rpc GetFragment(GetFragmentRequest) returns (GetFragmentResponse);
     rpc DeleteChunk(DeleteChunkRequest) returns (google.protobuf.Empty);
@@ -123,6 +123,16 @@ extends to `"node-{node_id}-disk-{disk_id}"` without API churn.
 A 3-node cluster cannot satisfy I-D4 under EC 4+2 (forces 2
 fragments per node) — Phase 16b's defaults table reflects this.
 
+**Pre-existing inconsistency note (rev 3 spec-consistency pass)**:
+ADR-029 specifies on-disk `device_id: [u8; 16]` (UUID) in the
+device-header struct, while `kiseki-chunk::placement::DeviceInfo`
+and `kiseki-chunk::pool::PoolDevice` use `id: String` for the
+in-memory placement layer. These are at different layers (on-disk
+header vs in-memory placement) and the divergence predates
+Phase 16. This plan aligns with the in-memory String convention,
+which is what the placement code already accepts. Reconciling the
+two is a separate spec audit, not blocking this work.
+
 ### D-4. Refcount + placement metadata via Raft state machine
 
 **Revised post-adversary round 1.** Earlier draft proposed
@@ -131,12 +141,12 @@ leader change: the new leader has zero refcount data, GC blocks,
 disk leaks until the old leader returns.
 
 Decision: **chunk metadata is Raft-replicated state** alongside
-the existing log entries. Each chunk has a `ChunkMetaEntry` keyed
+the existing log entries. Each chunk has a `ClusterChunkStateEntry` keyed
 by **`(tenant_id, chunk_id)`** (not just `chunk_id`):
 
 ```rust
 // Key: (tenant_id, chunk_id) — see "tenant isolation" below.
-struct ChunkMetaEntry {
+struct ClusterChunkStateEntry {
     refcount: u64,
     placement: Vec<NodeId>,        // which peers hold a fragment
     pool: String,                  // affinity pool name
@@ -149,7 +159,7 @@ struct ChunkMetaEntry {
 `(tenant_id, chunk_id)` rather than `chunk_id` alone prevents an
 I-T1 leak. Under `CrossTenant` dedup policy a single chunk_id can
 be referenced from multiple tenants; without per-tenant keying, a
-read of `chunk_meta[chunk_id].refcount` reveals the count across
+read of `cluster_chunk_state[chunk_id].refcount` reveals the count across
 tenants. With per-tenant keying, each tenant's refcount is
 independent — same plaintext yields the same chunk_id (deduped at
 the chunk store) but bills/audits/lifecycles per-tenant. The
@@ -161,12 +171,31 @@ decrement_refcount, add_placement, etc. Reads are local-applied
 state (fast, no quorum).
 
 Implementation: extend `kiseki-log::RaftShardStore` with a
-`chunk_meta` table in the existing redb file (the underlying
-Raft state machine). One `MetaProposal` enum carries
-increment/decrement/place/etc. Apply path mutates the table.
+`cluster_chunk_state` table in the existing redb file (the
+underlying Raft state machine). One `ClusterChunkProposal` enum
+carries increment/decrement/place/etc. Apply path mutates the
+table.
+
+**Naming note (post-adversary round 3 — spec-consistency pass)**:
+the Raft table is `cluster_chunk_state`, NOT `chunk_meta`.
+ADR-022 already defines a *local* redb table called `chunk_meta`
+(keyed by `chunk_id`, mapping to `(device_id, offset, size,
+fragment_index)`) for the local chunk store's on-disk layout.
+The two tables are at different layers — local fragment layout
+vs cluster-wide refcount + placement — and serve different
+queries. Distinct names prevent confusion.
+
+**Relationship to ADR-026 (Raft topology)**: ADR-026 §39-55 says
+"Raft only for metadata" and analyzes bandwidth assuming 1KB
+delta entries. The `cluster_chunk_state` entries are ~80 bytes
+each — well within the same metadata-only scope. Chunk *bytes*
+remain off the Raft path (fan-out via fabric gRPC per D-1/D-5),
+preserving ADR-026's "chunk data does NOT go through Raft"
+intent. Add a one-line note to ADR-026 making this explicit
+(part of the doc-update step in the build sequence).
 
 **Atomicity with composition delta (post-adversary round 2 —
-Q1.F + Q3.E fix)**: a chunk write's `MetaProposal::Create
+Q1.F + Q3.E fix)**: a chunk write's `ClusterChunkProposal::Create
 { refcount: 1, placement, ... }` AND the corresponding
 `DeltaAppend { composition delta }` MUST be carried in a
 **single Raft proposal** — `CombinedProposal { meta, delta }` —
@@ -174,7 +203,7 @@ applied atomically by the state machine. Without this, leader
 crash between the two leaves either:
 
 - Orphan fragments + no composition (meta committed, delta lost)
-- Composition referencing nonexistent chunk_meta (delta committed,
+- Composition referencing nonexistent cluster_chunk_state (delta committed,
   meta lost) — breaks I-L5
 
 The combined proposal is the unit of client ack: the gateway only
@@ -183,7 +212,7 @@ client-facing `OK` to AFTER Raft commit, not after fragment-fan-
 out ack.** This restores I-L2's "durable on Raft majority before
 ack" invariant for the chunk path.
 
-Compaction: chunk_meta entries with `refcount > 0` are held in
+Compaction: cluster_chunk_state entries with `refcount > 0` are held in
 the Raft snapshot. Entries with `refcount == 0` after GC are
 tombstoned and pruned at the next compaction (handled by the
 existing kiseki-log compaction path, which already prunes
@@ -209,8 +238,8 @@ the leader-crash-after-ack-before-Raft case (Q3.E).
 |---|---|
 | Peer down at write, ≥2 peers up | Fragment fan-out succeeds 2-of-3 → CombinedProposal proposed → Raft commits → client ack. Pending replication to the down peer queued (16b scrub) or expires per ADR-035 node lifecycle. |
 | Peer down at write, only 1 peer up | Fragment fan-out fails (1-of-3). No CombinedProposal proposed. Client gets `ChunkError::QuorumLost` → NFS4ERR_DELAY / S3 503 with retry-after. |
-| Leader crashes after fragment fan-out, before CombinedProposal commits | Fragments orphaned on 2-of-3 peers. New leader has no chunk_meta or composition delta — neither was committed. The orphan fragments are reclaimed by the orphan-fragment scrub (24h TTL, see Risks). Client sees the failure via S3/NFS retry path (no ack was issued). |
-| Leader crashes between CombinedProposal Raft commit and client ack | Raft commit means majority of replicas have the proposal; new leader has the chunk_meta + composition delta. Reads succeed. Client retries the write (idempotent under content-addressed dedup — same chunk_id, refcount unchanged). |
+| Leader crashes after fragment fan-out, before CombinedProposal commits | Fragments orphaned on 2-of-3 peers. New leader has no cluster_chunk_state or composition delta — neither was committed. The orphan fragments are reclaimed by the orphan-fragment scrub (24h TTL, see Risks). Client sees the failure via S3/NFS retry path (no ack was issued). |
+| Leader crashes between CombinedProposal Raft commit and client ack | Raft commit means majority of replicas have the proposal; new leader has the cluster_chunk_state + composition delta. Reads succeed. Client retries the write (idempotent under content-addressed dedup — same chunk_id, refcount unchanged). |
 | Peer down at read, ≥1 fragment reachable | Read succeeds. Local fragment if available; else fabric fetch from any healthy peer. (Replication-3 needs 1; EC X+Y needs ≥X.) |
 | Peer down at read, no fragments reachable | Read fails with NFS4ERR_DELAY (transient — kernel retries). Distinct from NFS4ERR_IO (data loss). |
 | Slow peer (write fan-out hangs) | Per-peer write timeout = 5s. Timed-out fragment counts as "down" for quorum. |
@@ -306,7 +335,7 @@ unavailability semantics.
 
 **Revised post-adversary round 2 to reflect D-4's atomic
 proposal.** Two replication paths arrive at peers in undefined
-order: composition delta + chunk_meta via Raft (now combined into
+order: composition delta + cluster_chunk_state via Raft (now combined into
 a single proposal per D-4), and chunk fragments via fabric.
 
 Decision: **leader write sequence is**:
@@ -315,7 +344,7 @@ Decision: **leader write sequence is**:
 3. Wait for Raft commit (majority ack).
 4. Return success to the caller.
 
-After step 3, every Raft majority-replica has both the chunk_meta
+After step 3, every Raft majority-replica has both the cluster_chunk_state
 AND the composition delta atomically. After step 1, at least 2 of
 3 peers have the fragment locally. The peer that didn't ack the
 fabric fan-out (if any) might apply the Raft proposal before
@@ -326,7 +355,7 @@ ordering scenario as an explicit test.
 
 The atomic proposal also makes the I-L5 invariant ("composition
 not visible until referenced chunks durable") trivially enforced
-on followers: applying the proposal means the chunk_meta entry
+on followers: applying the proposal means the cluster_chunk_state entry
 exists with `placement` listing the peers that did ack, so the
 read path knows exactly which peers to fabric-fetch from.
 
@@ -386,7 +415,7 @@ After 24h, log a warning and drop. Operator-tunable per pool.
           │
           ▼
    Raft propose: CombinedProposal {                            ← D-4 atomic
-       meta: ChunkMetaEntry {
+       meta: ClusterChunkStateEntry {
            key: (tenant_id, chunk_id),                          ← D-4 tenant key
            refcount: 1,
            placement: [acked nodes],
@@ -415,7 +444,7 @@ After 24h, log a warning and drop. Operator-tunable per pool.
           ▼  for each chunk_id:
    ClusteredChunkStore.read_chunk(chunk_id)
    │
-   ├─ Raft local-applied: get ChunkMetaEntry
+   ├─ Raft local-applied: get ClusterChunkStateEntry
    ├─ if local fragment available: return ChunkStore.read_chunk
    ├─ else for each peer in placement:
    │      fabric.GetFragment(chunk_id, fragment_idx)  (3s timeout)
@@ -434,12 +463,12 @@ After 24h, log a warning and drop. Operator-tunable per pool.
 
 | Crate | Change |
 |---|---|
-| `kiseki-fabric-chunk` (new) | `ClusteredChunkStore` impl of `AsyncChunkOps`, peer connection pool, retry policy. ~1500 LOC. |
+| `kiseki-chunk-cluster` (new) | `ClusteredChunkStore` impl of `AsyncChunkOps`, peer connection pool, retry policy. ~1500 LOC. |
 | `kiseki-proto` | Add `fabric.proto` definitions. |
 | `kiseki-chunk` | New `AsyncChunkOps` trait + `SyncBridge` adapter. Unchanged otherwise. |
-| `kiseki-log` (Raft state machine) | Extend with `chunk_meta` table + `MetaProposal` variants. |
+| `kiseki-log` (Raft state machine) | Extend with `cluster_chunk_state` table + `ClusterChunkProposal` variants. |
 | `kiseki-keymanager` | No change (already Raft-replicated). |
-| `kiseki-server::runtime` | When `raft_peers > 1`: wrap chunk store in ClusteredChunkStore; register FabricChunkService on existing port-9100 gRPC. ~80 LOC. |
+| `kiseki-server::runtime` | When `raft_peers > 1`: wrap chunk store in ClusteredChunkStore; register ClusterChunkService on existing port-9100 gRPC. ~80 LOC. |
 | `kiseki-gateway::s3_server` / `nfs_server` | Plumb the async chunk store through. Mostly type changes. |
 | `tests/e2e` | Cross-node read after PUT (closes B-3). Kill-leader-then-read. Slow-peer ordering. |
 
@@ -523,10 +552,10 @@ Scenario: Refcount preserved across leader change
 | Step | Effort | Dependency |
 |---|---|---|
 | 1. proto/fabric.proto + codegen | 0.5d | none |
-| 2. Raft state machine extension (chunk_meta + MetaProposal) | 1.5d | none |
+| 2. Raft state machine extension (cluster_chunk_state + ClusterChunkProposal) | 1.5d | none |
 | 3. AsyncChunkOps + SyncBridge in `kiseki-chunk` | 0.5d | none |
-| 4. `kiseki-fabric-chunk` crate skeleton + ClusteredChunkStore impl | 1.5d | steps 1, 2, 3 |
-| 5. FabricChunkService server + interceptor | 1d | step 1 |
+| 4. `kiseki-chunk-cluster` crate skeleton + ClusteredChunkStore impl | 1.5d | steps 1, 2, 3 |
+| 5. ClusterChunkService server + interceptor | 1d | step 1 |
 | 6. Peer connection pool + retry policy | 0.5d | step 5 |
 | 7. Wire into runtime.rs (clustered store + service) | 0.5d | steps 4, 5, 6 |
 | 8. Unit tests | 1.5d | steps 4, 5 |
@@ -534,33 +563,57 @@ Scenario: Refcount preserved across leader change
 | 10. e2e tests | 1d | step 7 |
 | 11. Prometheus metrics for fabric ops + peer-down | 0.5d | step 7 |
 | 12. mTLS SAN updates + cert gen tooling | 0.5d | none (parallel) |
-| 13. Docs: protocol-compliance.md + api-contracts.md + ADR for fabric service | 0.5d | step 7 |
-| 14. Adversarial review pass (round 2) | 0.5d | step 13 |
-| **Total** | **~10d** | |
+| 13. Spec-doc updates (see expanded list below) | 1d | step 7 |
+| 14. Final adversary pass + audit | 0.5d | step 13 |
+| **Total** | **~10.5d** | |
 
-Two extra days vs revision 1 cover the Raft state machine work
-(D-4) + observability + docs that adversary correctly identified
-as missing.
+### Step 13 — spec docs requiring updates
 
-## Open questions resolved post-adversary
+Identified by the rev-3 spec-consistency pass. These land alongside
+the implementation, not as a separate phase, because they document
+behavior the implementation now exhibits.
 
-| Q | Rev 1 answer | Rev 2 answer |
+| Doc | Update |
+|---|---|
+| `specs/architecture/error-taxonomy.md` | Add `ChunkError::PeerUnavailable` (Transient → retry on next call) and `ChunkError::QuorumLost` (Transient → 503 / NFS4ERR_DELAY with retry-after) under the `### kiseki-chunk` section, beside the existing `ChunkNotFound` / `ChunkCorrupted` / `ChunkLost`. |
+| `specs/architecture/enforcement-map.md` | I-C2 enforcement moves from "kiseki-chunk GC process" to **"kiseki-log Raft state machine + cluster_chunk_state apply path"**. I-T1 gains a row for the `(tenant_id, chunk_id)` keying. I-D1 gains a row for the cross-node fragment fetch fallback in `kiseki-chunk-cluster`. |
+| `specs/architecture/api-contracts.md` | New row under "Cross-language boundary (gRPC) → Services exposed via gRPC" for `ClusterChunkService` (PutFragment / GetFragment / DeleteChunk / HasChunk). Note that it's **internal-only** (rejected for tenant clients via SAN-role interceptor). |
+| `specs/architecture/build-phases.md` | New `## Phase 16: Cross-node chunk placement (ADR-005, ADR-026)` section after Phase 15. Lists the build sequence steps from this plan; references this implementation file. |
+| `specs/failure-modes.md` | Three new entries under the data-plane (F-D) family: F-D# peer-unreachable-during-write (covered by 2-of-3 quorum + 16b scrub); F-D# leader-crash-mid-write orphan window (24h TTL); F-D# cross-stream Raft-vs-fabric ordering race (covered by D-10's fragments-before-proposal + read-side fabric fallback). Reference ADR-035 lifecycle integration for permanently-down peers. |
+| `specs/ubiquitous-language.md` | Add **Fragment** entry (one fragment of a chunk under EC or one copy under Replication-N). Add **Replication-N** as an explicit term (currently only mentioned in ADR-005 in passing). Add **Cluster chunk state** as the Raft-replicated metadata layer (distinct from local `chunk_meta`). |
+| `specs/architecture/adr/026-raft-topology.md` | One-line addition under "Key insight: Raft only for metadata" clarifying that `cluster_chunk_state` (Phase 16) is in scope: chunk *bytes* stay off Raft, but chunk replication-metadata (~80 bytes/entry) is in. |
+| `specs/architecture/adr/005-ec-and-chunk-durability.md` | Add a "Phase 16a default" note: 3-node clusters bootstrap with Replication-3 since I-D4 prevents EC 4+2 placement on 3 distinct devices. Reference the per-cluster-size defaults table. |
+| `specs/architecture/protocol-compliance.md` | Add row for `ClusterChunkService` (no external RFC; internal protocol). |
+
+Estimate growth across revisions: rev-1 had 5-6d (under-informed),
+rev-2 bumped to 10d (after adversary's Raft-state-machine + obs +
+docs findings), rev-3 (this) at 10.5d (the larger doc list reflects
+the spec-consistency pass — small adds per doc, but real).
+
+## Open questions resolved across revisions
+
+| Q | Resolution | Where |
 |---|---|---|
-| Refcount durability | redb-on-leader | **Raft state machine** (D-4) |
-| **Refcount keying** | unspecified | **`(tenant_id, chunk_id)` for I-T1** (D-4, round 2) |
-| **Meta + delta atomicity** | unspecified | **single `CombinedProposal`; client ack after Raft commit** (D-4 + D-10, round 2) |
-| Bootstrap pool topology | hardcoded | **config / env var from day 1** (D-11) |
-| Write quorum for Replication-3 | open | **2-of-3** (D-5) |
-| Encryption epoch propagation | open | **Raft-synced; lag = NFS4ERR_DELAY** (D-9) |
-| Cross-stream ordering | not addressed | **fragments before atomic proposal + fabric fallback** (D-10) |
-| pNFS DS interaction | not addressed | **DS reads through ClusteredChunkStore** (D-8) |
-| Sync vs async ChunkOps | not addressed | **parallel AsyncChunkOps trait** (D-7) |
-| New port vs namespaced | port 9400 | **namespaced on existing 9100, defense-in-depth note** (D-2, round 2) |
-| GC on permanently-down peer | indefinite queue | **ADR-035 lifecycle integration + 24h TTL** (D-12) |
-| Cluster-grew migration | scrub deferred | **admin-action; auto in 16b** (D-6) |
-| **Orphan fragments on aborted writes** | unspecified | **24h TTL + Prometheus metric** (Risk #5, round 2) |
-| **chunk_meta compaction** | unspecified | **tombstone-then-prune in existing log compaction** (D-4, round 2) |
-| **Cert revocation / authn vs authz** | unspecified | **16b gap; documented** (D-2, round 2) |
+| Refcount durability | Raft state machine (`cluster_chunk_state`) | D-4 |
+| Refcount keying | `(tenant_id, chunk_id)` for I-T1 | D-4 (rev 2) |
+| Meta + delta atomicity | Single `CombinedProposal`; client ack after Raft commit | D-4 + D-10 (rev 2) |
+| Bootstrap pool topology | config / env var from day 1 | D-11 |
+| Write quorum for Replication-3 | 2-of-3 | D-5 |
+| Encryption epoch propagation | Raft-synced; lag → NFS4ERR_DELAY | D-9 |
+| Cross-stream ordering | Fragments before atomic proposal + read-side fabric fallback | D-10 |
+| pNFS DS interaction | DS reads through `ClusteredChunkStore` | D-8 |
+| Sync vs async `ChunkOps` | Parallel `AsyncChunkOps` trait + `SyncBridge` | D-7 |
+| New port vs namespaced | Namespaced on existing 9100, defense-in-depth note | D-2 (rev 2) |
+| GC on permanently-down peer | ADR-035 lifecycle integration + 24h TTL | D-12 |
+| Cluster-grew migration | Admin-action in 16a; auto via repair scrub in 16b | D-6 |
+| Orphan fragments on aborted writes | 24h TTL + Prometheus metric | Risk #5 (rev 2) |
+| `cluster_chunk_state` compaction | Tombstone-then-prune via existing kiseki-log compaction | D-4 (rev 2) |
+| Cert revocation / authn vs authz | 16b gap; documented | D-2 (rev 2) |
+| **Naming: Raft table vs ADR-022 local `chunk_meta`** | **Renamed to `cluster_chunk_state`** | D-4 (rev 3) |
+| **Naming: new crate vs `kiseki-transport` "fabric"** | **Renamed to `kiseki-chunk-cluster`** | Module changes (rev 3) |
+| **Naming: gRPC service** | **`ClusterChunkService` (consistent with ControlService / AdvisoryService / etc.)** | D-2 (rev 3) |
+| **`device_id` String-vs-UUID divergence** | **Pre-existing; aligned with in-memory String convention; reconciliation deferred** | D-3 (rev 3) |
+| **ADR-026 `cluster_chunk_state` in-Raft scope** | **Add explicit one-line note to ADR-026** | Build step 13 (rev 3) |
 
 ## Risks (revised round 2)
 
@@ -568,7 +621,7 @@ as missing.
    to 5s timeout) + Raft commit. Existing perf numbers (516 MB/s
    NFSv3 write) will drop. Magnitude TBD; new
    `test_perf_cross_node_overhead` measures.
-2. **Raft state machine memory footprint**: chunk_meta entries
+2. **Raft state machine memory footprint**: cluster_chunk_state entries
    are ~80 bytes × N chunks (with `(tenant_id, chunk_id)` keying,
    the dedup overhead per tenant adds ~16 bytes). At 10M chunks
    single-tenant → 800 MB Raft state; ADR-029 budget holds.
@@ -587,7 +640,7 @@ as missing.
    referencing them. They become orphans. Bounded recovery: a
    24-hour orphan-fragment TTL — every fragment carries a
    `created_ms` timestamp; the local chunk store sweeps fragments
-   older than 24h with no `chunk_meta` entry referring to them.
+   older than 24h with no `cluster_chunk_state` entry referring to them.
    Documented operational metric: `kiseki_orphan_fragments_total`
    (Prometheus counter); alert on rising trend. Phase 16b's
    repair scrub additionally reconciles cross-peer.
@@ -598,20 +651,31 @@ as missing.
 
 ## Next step
 
-This plan resolves the four blockers and five concerns from
-adversary round 1, and the four atomicity / isolation /
-trade-off / orphan-bound findings from adversary round 2.
+This plan resolves four blockers + five concerns from adversary
+round 1, four atomicity / isolation / trade-off / orphan-bound
+findings from adversary round 2, and three name-collision +
+ADR-alignment items from the rev-3 spec-consistency pass.
 
-Round-2 adversary findings resolved inline:
+Round-2 adversary findings resolved inline (kept for traceability):
 
 | Finding | Resolution |
 |---|---|
 | Q1.A — orphan fragments (disk leak) | Risk #5 + 24h orphan TTL + Prometheus metric |
-| Q1.B — chunk_meta compaction unspecified | D-4: tombstone-then-prune in existing kiseki-log compaction path |
+| Q1.B — `cluster_chunk_state` compaction unspecified | D-4: tombstone-then-prune in existing kiseki-log compaction path |
 | Q1.C — tenant isolation refcount leak | D-4: `(tenant_id, chunk_id)` key |
 | Q1.F + Q3.E — atomicity gap | D-4: `CombinedProposal { meta, delta }` single Raft proposal; client ack after Raft commit |
 | Q2.A — namespaced authz weaker than firewall | D-2: explicit trade-off note |
 | Q2.D — auth ≠ authz, no revocation | D-2: 16b gap, acknowledged |
 
-No round-3 adversary needed unless implementation surfaces a
-genuinely new question. Proceed to build sequence step 1.
+Rev-3 spec-consistency findings resolved inline:
+
+| Finding | Resolution |
+|---|---|
+| Naming: `chunk_meta` Raft table collides with ADR-022 local table | Renamed to `cluster_chunk_state` (D-4) |
+| Naming: `kiseki-fabric-chunk` crate blurs ADR-001 / kiseki-transport "fabric" | Renamed to `kiseki-chunk-cluster` |
+| Naming: `FabricChunkService` gRPC service | Renamed to `ClusterChunkService` (consistent with ControlService / AdvisoryService) |
+| ADR-026 silence on chunk metadata in Raft | Build step 13 adds a one-line clarifying note |
+| `device_id` String-vs-UUID divergence (ADR-029 vs code) | Pre-existing; documented in D-3; not blocking |
+| Spec-doc updates needed (error-taxonomy, enforcement-map, api-contracts, build-phases, failure-modes, ubiquitous-language, ADR-026, ADR-005, protocol-compliance) | Enumerated in expanded build step 13 |
+
+No round-4 review needed. Proceed to build sequence step 1.
