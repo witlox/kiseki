@@ -24,7 +24,8 @@ use std::thread;
 use rustls::ServerConfig;
 
 use crate::nfs4_server::{
-    nfs4_status, op, op_create_session, op_destroy_session, op_exchange_id, op_sequence,
+    nfs4_status, op, op_create_session, op_destroy_session, op_exchange_id_with_role,
+    op_sequence, ServerRole,
     SessionManager,
 };
 use crate::nfs_xdr::{
@@ -277,7 +278,7 @@ fn process_ds_op<G: GatewayOps + Send + Sync + 'static>(
     state: &mut DsCompoundState,
 ) -> (u32, Vec<u8>) {
     match op_code {
-        op::EXCHANGE_ID => op_exchange_id(reader, sessions),
+        op::EXCHANGE_ID => op_exchange_id_with_role(reader, sessions, ServerRole::Ds),
         op::CREATE_SESSION => op_create_session(reader, sessions),
         op::DESTROY_SESSION => op_destroy_session(reader, sessions),
         op::SEQUENCE => op_sequence(reader, sessions),

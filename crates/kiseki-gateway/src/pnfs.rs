@@ -378,16 +378,98 @@ pub struct DeviceInfo {
     pub addresses: Vec<NetAddress>,
 }
 
-/// Convert a `host:port` string to RFC 5665 universal address form.
-/// Returns the original string on parse failure (defensive default).
+/// Resolved network address — what gets sent in GETDEVICEINFO.
+/// `netid` is `tcp` (IPv4) or `tcp6` (IPv6); `uaddr` is the RFC 5665
+/// §5.2.5 universal-address form `h1.h2.h3.h4.p1.p2` (IPv4) or
+/// `h:h:h:h:h:h:h:h.p1.p2` (IPv6). Phase 15c.5 step 3.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedNetAddress {
+    /// `tcp` for IPv4 endpoints, `tcp6` for IPv6 — the RFC 5665
+    /// netid the kernel matches against its supported transports.
+    pub netid: &'static str,
+    /// Universal address with the host as an IP literal (not a
+    /// hostname): `h1.h2.h3.h4.p1.p2` (IPv4) or `h:h:...:h.p1.p2`
+    /// (IPv6). The kernel `inet_pton`s this directly.
+    pub uaddr: String,
+}
+
+/// Resolve a `host:port` string to a fully-formed `(netid, uaddr)`
+/// tuple. Returns `None` if no DNS resolution succeeded.
 ///
-/// RFC 5665 §5.2.5: IPv6 addresses ride bracketed (`[ipv6]:port`); the
-/// bracketed form is the only unambiguous way to attach a port to an
-/// IPv6 host because the address itself contains `:` separators. The
-/// universal address strips the brackets — `[::1]:2049` → `::1.8.1`.
+/// Phase 15c.5 step 3: pre-fix `host_port_to_uaddr` blindly emitted
+/// the host portion verbatim, so `kiseki-node1:2052` became
+/// `kiseki-node1.8.4` — a string Linux's RPC universal-address
+/// parser rejects (it requires a 6-token IPv4 form `h1.h2.h3.h4.p1.p2`
+/// or the IPv6 colon form). The kernel then had no usable DS
+/// endpoint, returned the layout via LAYOUTRETURN, and fell back
+/// to MDS-direct READs. Resolving the hostname here gives the
+/// kernel a concrete IP literal it can `inet_pton` cleanly.
+///
+/// DNS lookup happens once per call. Callers should cache (e.g.
+/// per-device-info entry, lifetime = layout TTL).
+#[must_use]
+pub fn host_port_to_resolved_uaddr(host_port: &str) -> Option<ResolvedNetAddress> {
+    use std::net::{IpAddr, ToSocketAddrs};
+
+    let (host, port) = parse_host_port(host_port)?;
+
+    // Fast path: host is already an IP literal — no DNS needed.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(format_resolved(ip, port));
+    }
+
+    // DNS path: ask the resolver, take the first answer. Prefer
+    // IPv4 since the typical kiseki deployment is IPv4-only and
+    // the kernel's `tcp` netid is the broadly-supported default.
+    let addrs = (host, port).to_socket_addrs().ok()?;
+    let mut v4 = None;
+    let mut v6 = None;
+    for sa in addrs {
+        match sa.ip() {
+            IpAddr::V4(_) if v4.is_none() => v4 = Some(sa.ip()),
+            IpAddr::V6(_) if v6.is_none() => v6 = Some(sa.ip()),
+            _ => {}
+        }
+    }
+    let ip = v4.or(v6)?;
+    Some(format_resolved(ip, port))
+}
+
+fn parse_host_port(host_port: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = &rest[..close];
+        let after = &rest[close + 1..];
+        let port_str = after.strip_prefix(':')?;
+        let port = port_str.parse::<u16>().ok()?;
+        return Some((host, port));
+    }
+    let (host, port_str) = host_port.rsplit_once(':')?;
+    let port = port_str.parse::<u16>().ok()?;
+    Some((host, port))
+}
+
+fn format_resolved(ip: std::net::IpAddr, port: u16) -> ResolvedNetAddress {
+    let p1 = port >> 8;
+    let p2 = port & 0xFF;
+    match ip {
+        std::net::IpAddr::V4(v4) => ResolvedNetAddress {
+            netid: "tcp",
+            uaddr: format!("{v4}.{p1}.{p2}"),
+        },
+        std::net::IpAddr::V6(v6) => ResolvedNetAddress {
+            netid: "tcp6",
+            uaddr: format!("{v6}.{p1}.{p2}"),
+        },
+    }
+}
+
+/// Convert a `host:port` string to RFC 5665 universal address form
+/// without DNS resolution. Kept for backward compatibility +
+/// hand-built test fixtures; production paths should call
+/// `host_port_to_resolved_uaddr` instead.
 #[must_use]
 pub fn host_port_to_uaddr(host_port: &str) -> String {
-    // Bracketed IPv6 form: [ipv6-text]:port.
     if let Some(rest) = host_port.strip_prefix('[') {
         if let Some(close) = rest.find(']') {
             let host = &rest[..close];
@@ -400,10 +482,8 @@ pub fn host_port_to_uaddr(host_port: &str) -> String {
                 }
             }
         }
-        // Malformed bracketed form — return as-is.
         return host_port.to_string();
     }
-
     let Some((host, port_str)) = host_port.rsplit_once(':') else {
         return host_port.to_string();
     };
@@ -696,16 +776,16 @@ impl MdsLayoutManager {
         for layout in inner.cache.values() {
             for stripe in &layout.stripes {
                 if &stripe.device_id == device_id {
-                    let netid = if stripe.ds_addr.contains('.') {
-                        "tcp"
-                    } else {
-                        "tcp6"
-                    };
+                    // Resolve hostname → IP so the kernel's RPC
+                    // universal-address parser can `inet_pton` it.
+                    // Pre-fix: emitted "kiseki-node1.8.4" verbatim,
+                    // kernel rejected, fell back to MDS reads.
+                    let resolved = host_port_to_resolved_uaddr(&stripe.ds_addr)?;
                     return Some(DeviceInfo {
                         device_id: *device_id,
                         addresses: vec![NetAddress {
-                            netid: netid.to_string(),
-                            uaddr: host_port_to_uaddr(&stripe.ds_addr),
+                            netid: resolved.netid.to_string(),
+                            uaddr: resolved.uaddr,
                         }],
                     });
                 }
@@ -1141,6 +1221,34 @@ mod mds_layout_tests {
     fn host_port_to_uaddr_handles_ipv4() {
         assert_eq!(host_port_to_uaddr("10.0.0.11:2049"), "10.0.0.11.8.1");
         assert_eq!(host_port_to_uaddr("127.0.0.1:80"), "127.0.0.1.0.80");
+    }
+
+    /// Phase 15c.5 step 3: an IP literal must round-trip through
+    /// the resolver without DNS — the fast path that production
+    /// IPv4 deployments rely on.
+    #[test]
+    fn host_port_to_resolved_uaddr_passes_ipv4_literal_through() {
+        let r = host_port_to_resolved_uaddr("10.0.0.11:2052").unwrap();
+        assert_eq!(r.netid, "tcp");
+        assert_eq!(r.uaddr, "10.0.0.11.8.4");
+    }
+
+    /// Phase 15c.5 step 3: an IPv6 literal returns netid=tcp6 and
+    /// the colon-form universal address.
+    #[test]
+    fn host_port_to_resolved_uaddr_passes_ipv6_literal_through() {
+        let r = host_port_to_resolved_uaddr("[::1]:2052").unwrap();
+        assert_eq!(r.netid, "tcp6");
+        assert!(r.uaddr.ends_with(".8.4"));
+    }
+
+    /// Phase 15c.5 step 3: a hostname with no DNS entry returns
+    /// `None` so the GETDEVICEINFO handler can omit the device.
+    /// This is the "kiseki-node1.8.4 fallback" regression check.
+    #[test]
+    fn host_port_to_resolved_uaddr_returns_none_for_unresolvable() {
+        // ".invalid" is reserved by RFC 6761 — guaranteed to fail DNS.
+        assert!(host_port_to_resolved_uaddr("nonexistent.invalid:2052").is_none());
     }
 }
 

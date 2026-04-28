@@ -182,11 +182,15 @@ def _parse_op_counters(stdout: str) -> dict[str, int]:
     We sum across mounts (`device …` headers) since the container
     only mounts one. Op codes we need:
 
-      * LAYOUTGET — proves the client requested a pNFS layout
-      * GETDEVICEINFO — proves the client resolved a deviceid
-      * READ — proves data flowed
+      * GETDEVICEINFO — kernel resolved a deviceid
+      * READ — data flowed
+
+    NOTE: don't add LAYOUTGET back. Linux NFSv4.1 bundles LAYOUTGET
+    inside the OPEN compound, so the LAYOUTGET counter only fires
+    for STANDALONE LAYOUTGET RPCs (rare in normal flows). Use
+    `_pnfs_engaged_in_caps` to verify pNFS dispatch instead.
     """
-    counters = {"LAYOUTGET": 0, "GETDEVICEINFO": 0, "READ": 0}
+    counters = {"GETDEVICEINFO": 0, "READ": 0}
     body = stdout.split("---MOUNTSTATS---", 1)[-1]
     for line in body.splitlines():
         for op in counters:
@@ -194,6 +198,22 @@ def _parse_op_counters(stdout: str) -> dict[str, int]:
             if m:
                 counters[op] += int(m.group(1))
     return counters
+
+
+def _pnfs_engaged_in_caps(stdout: str) -> bool:
+    """Did the kernel actually negotiate pNFS for this mount?
+
+    The `nfsv4:` caps line in mountstats includes `pnfs=...` when
+    the kernel selected a pNFS layout driver from the FS's
+    FATTR4_FS_LAYOUT_TYPES. `pnfs=LAYOUT_FLEX_FILES` proves the
+    full RFC 8881 §5.12 + RFC 8435 negotiation completed and the
+    kernel will route reads through DS endpoints.
+    """
+    body = stdout.split("---MOUNTSTATS---", 1)[-1]
+    for line in body.splitlines():
+        if line.lstrip().startswith("nfsv4:") and "pnfs=LAYOUT_FLEX_FILES" in line:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +264,9 @@ def test_pnfs_xprtsec_mtls(
         )
 
     counters = _parse_op_counters(result.stdout)
-    assert counters["LAYOUTGET"] >= 1, (
-        f"client never sent LAYOUTGET — counters={counters}"
+    assert _pnfs_engaged_in_caps(result.stdout), (
+        f"kernel did not negotiate pNFS — `pnfs=LAYOUT_FLEX_FILES` missing "
+        f"from nfsv4 caps line. counters={counters}"
     )
     assert counters["GETDEVICEINFO"] >= 1, (
         f"client never sent GETDEVICEINFO — counters={counters}"
@@ -300,8 +321,9 @@ def test_pnfs_plaintext_fallback(
         )
 
     counters = _parse_op_counters(result.stdout)
-    assert counters["LAYOUTGET"] >= 1, (
-        f"plaintext-mode pNFS still requires LAYOUTGET: counters={counters}"
+    assert _pnfs_engaged_in_caps(result.stdout), (
+        f"kernel did not negotiate pNFS in plaintext mode — "
+        f"`pnfs=LAYOUT_FLEX_FILES` missing. counters={counters}"
     )
     assert counters["READ"] >= 1, (
         f"no NFS READs accounted under plaintext fallback: counters={counters}"

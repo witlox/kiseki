@@ -464,6 +464,28 @@ pub(crate) fn op_exchange_id(
     reader: &mut XdrReader<'_>,
     sessions: &SessionManager,
 ) -> (u32, Vec<u8>) {
+    op_exchange_id_with_role(reader, sessions, ServerRole::Mds)
+}
+
+/// `EXCHANGE_ID` server role — selects the `EXCHGID4_FLAG_USE_PNFS_*`
+/// flag emitted in `eir_flags`. Phase 15c.5 step 3: the DS server
+/// must advertise `USE_PNFS_DS`, not `USE_PNFS_MDS`. Pre-fix it
+/// reused the MDS handler verbatim, so the kernel saw a DS that
+/// claimed to be an MDS, refused to bind a DS session, and fell
+/// back to MDS-direct READs.
+#[derive(Clone, Copy, Debug)]
+pub enum ServerRole {
+    /// Metadata server — emits `EXCHGID4_FLAG_USE_PNFS_MDS`.
+    Mds,
+    /// Data server — emits `EXCHGID4_FLAG_USE_PNFS_DS`.
+    Ds,
+}
+
+pub(crate) fn op_exchange_id_with_role(
+    reader: &mut XdrReader<'_>,
+    sessions: &SessionManager,
+    role: ServerRole,
+) -> (u32, Vec<u8>) {
     // Skip client owner (verifier + ownerid).
     let _verifier = reader.read_opaque_fixed(8).unwrap_or_default();
     let _owner_id = reader.read_opaque().unwrap_or_default();
@@ -473,18 +495,23 @@ pub(crate) fn op_exchange_id(
     let client_id = sessions.exchange_id();
 
     // RFC 5661 §18.35.4 — eir_flags MUST declare server mode.
-    // Kiseki is a pNFS MDS (ADR-038), so emit USE_PNFS_MDS plus
-    // CONFIRMED_R for compatibility with clients that look for a
-    // confirmation bit.
+    // ADR-038: kiseki is a pNFS MDS by default; `kiseki-gateway`'s
+    // dedicated DS listener overrides the role to `Ds`.
     const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x0002_0000;
+    const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x0004_0000;
     const EXCHGID4_FLAG_CONFIRMED_R: u32 = 0x8000_0000;
+
+    let role_flag = match role {
+        ServerRole::Mds => EXCHGID4_FLAG_USE_PNFS_MDS,
+        ServerRole::Ds => EXCHGID4_FLAG_USE_PNFS_DS,
+    };
 
     let mut w = XdrWriter::new();
     w.write_u32(op::EXCHANGE_ID);
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_u64(client_id); // clientid
     w.write_u32(1); // sequenceid
-    w.write_u32(EXCHGID4_FLAG_USE_PNFS_MDS | EXCHGID4_FLAG_CONFIRMED_R); // eir_flags
+    w.write_u32(role_flag | EXCHGID4_FLAG_CONFIRMED_R); // eir_flags
     w.write_u32(0); // state_protect (SP4_NONE)
                     // server_owner
     w.write_u64(1); // minor_id
@@ -1441,14 +1468,31 @@ fn op_getdeviceinfo<G: GatewayOps>(
     w.write_u32(LAYOUT4_FLEX_FILES);
 
     // GETDEVICEINFO4resok body (RFC 8435 §5.2 ff_device_addr4):
-    //   da_addr_body :: ff_device_addr4 {
-    //     ff_device_versions4 ffda_versions<>;
-    //     multipath_list4     ffda_netaddrs<>;
+    //   struct ff_device_addr4 {
+    //     multipath_list4       ffda_netaddrs;        // FIRST
+    //     ff_device_versions4   ffda_versions<>;      // SECOND
     //   }
     //   bitmap4 gdir_notification (0)
     //
+    // Phase 15c.5 step 3 fix: pre-fix had the fields reversed
+    // (versions then netaddrs) which silently broke kernel-side
+    // ff_device_addr4 decode — the kernel parsed the versions
+    // count as the netaddrs count, the per-version fields as
+    // netaddr4 strings, and ended up with no usable DS endpoints.
+    // Result: kernel got the layout, returned it, fell back to
+    // MDS reads. Mountstats shows LAYOUTGET=0 because the
+    // OPEN-bundled LAYOUTGET RPC counter is per-op, but the
+    // dispatch counter never incremented. RFC 8435 §5.1.1 puts
+    // ffda_netaddrs first.
+    //
     // We pack the body as `opaque<>` per the standard wire shape.
     let mut body = XdrWriter::new();
+    // ffda_netaddrs: one multipath_list4 with len = info.addresses.len().
+    body.write_u32(u32::try_from(info.addresses.len()).unwrap_or(0));
+    for addr in &info.addresses {
+        body.write_string(&addr.netid);
+        body.write_string(&addr.uaddr);
+    }
     // ffda_versions: one entry — NFSv4.1.
     body.write_u32(1);
     // ff_device_versions4 entry:
@@ -1462,13 +1506,6 @@ fn op_getdeviceinfo<G: GatewayOps>(
     body.write_u32(1_048_576);
     body.write_u32(1_048_576);
     body.write_bool(true); // tightly coupled
-
-    // ffda_netaddrs: one multipath_list4 with len = info.addresses.len().
-    body.write_u32(u32::try_from(info.addresses.len()).unwrap_or(0));
-    for addr in &info.addresses {
-        body.write_string(&addr.netid);
-        body.write_string(&addr.uaddr);
-    }
 
     w.write_opaque(&body.into_bytes());
     w.write_u32(0); // gdir_notification bitmap (no notifications)
@@ -2860,6 +2897,51 @@ mod tests {
             flags & EXCHGID4_FLAG_USE_PNFS_MDS != 0,
             "kiseki is a pNFS MDS — expected USE_PNFS_MDS in eir_flags, \
              got 0x{flags:08x}",
+        );
+    }
+
+    /// Phase 15c.5 step 3: the dedicated DS listener
+    /// (`pnfs_ds_server::run_ds_server`) MUST advertise
+    /// `EXCHGID4_FLAG_USE_PNFS_DS`, not `_MDS`. Pre-fix the DS
+    /// dispatcher reused `op_exchange_id` (the MDS variant), which
+    /// emitted `USE_PNFS_MDS` — Linux's pNFS client interpreted
+    /// that as "this DS thinks it's an MDS", refused to bind a DS
+    /// session, and silently fell back to MDS-direct READs.
+    /// Mountstats showed `LAYOUTGET=0` because the kernel walked
+    /// the layout, attempted DS connect, the EXCHANGE_ID handshake
+    /// returned the wrong role, and the kernel invalidated the
+    /// layout segment.
+    #[test]
+    fn exchange_id_with_role_ds_advertises_pnfs_ds_mode() {
+        let sessions = test_sessions();
+        let mut body = XdrWriter::new();
+        body.write_opaque_fixed(&[0u8; 8]);
+        body.write_opaque(b"client");
+        body.write_u32(0);
+        body.write_u32(0);
+        let body_bytes = body.into_bytes();
+        let mut reader = XdrReader::new(&body_bytes);
+
+        let (_status, result) = op_exchange_id_with_role(&mut reader, &sessions, ServerRole::Ds);
+
+        let mut r = XdrReader::new(&result);
+        let _ = r.read_u32();
+        let _ = r.read_u32();
+        let _ = r.read_u64();
+        let _ = r.read_u32();
+        let flags = r.read_u32().expect("eir_flags");
+
+        const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x0002_0000;
+        const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x0004_0000;
+
+        assert!(
+            flags & EXCHGID4_FLAG_USE_PNFS_DS != 0,
+            "DS role must emit USE_PNFS_DS in eir_flags, got 0x{flags:08x}",
+        );
+        assert!(
+            flags & EXCHGID4_FLAG_USE_PNFS_MDS == 0,
+            "DS role MUST NOT emit USE_PNFS_MDS — Linux client uses these \
+             bits to disambiguate the server, got 0x{flags:08x}",
         );
     }
 }
