@@ -61,12 +61,17 @@ pub mod auth;
 pub mod defaults;
 pub mod metrics;
 pub mod peer;
+pub mod scrub;
 pub mod server;
 
 pub use auth::{verify_fabric_san, FabricAuthError};
 pub use defaults::{defaults_for, ClusterDurabilityDefaults};
 pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
+pub use scrub::{
+    ChunkScrubInfo, ClusterChunkOracle, OrphanDecision, OrphanDeleter, OrphanScrub,
+    OrphanScrubPolicy, OrphanScrubReport, DEFAULT_ORPHAN_TTL,
+};
 pub use server::{fabric_san_interceptor, ClusterChunkServer};
 
 /// Default per-peer timeout for `PutFragment` (write-side fan-out).
