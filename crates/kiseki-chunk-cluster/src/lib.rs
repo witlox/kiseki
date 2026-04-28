@@ -59,6 +59,7 @@ use kiseki_crypto::envelope::Envelope;
 
 pub mod auth;
 pub mod defaults;
+pub mod ec;
 pub mod metrics;
 pub mod peer;
 pub mod scrub;
@@ -66,6 +67,10 @@ pub mod server;
 
 pub use auth::{verify_fabric_san, FabricAuthError};
 pub use defaults::{defaults_for, ClusterDurabilityDefaults};
+pub use ec::{
+    decode_from_responses, encode_for_placement, EcDistributionError, EcStrategy,
+    FragmentResponse, FragmentRoute,
+};
 pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use scrub::{
