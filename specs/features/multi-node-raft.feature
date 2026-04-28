@@ -264,3 +264,78 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     When all 10 shards receive concurrent writes
     Then total throughput is approximately 10x single-shard throughput
     And per-shard throughput is not degraded by other shards
+
+  # === Cross-node chunk replication (Phase 16a) ===
+  #
+  # These scenarios verify the ClusterChunkService fabric layer that
+  # makes a 3-node cluster genuinely tolerant of single-node loss.
+  # See specs/implementation/phase-16-cross-node-chunks.md (rev 4)
+  # and ADR-026 for the design rationale (D-1, D-5, D-6, D-7, D-10).
+
+  @integration @cross-node
+  Scenario: Cross-node read after leader-only PUT (closes B-3)
+    Given a 3-node Replication-3 cluster on [node-1, node-2, node-3]
+    When a client PUTs object "obj-x1" via node-1's S3 listener
+    Then the chunk's fragment lands on node-1's local store
+    And `PutFragment` for that chunk lands on node-2 within 5 seconds
+    And `PutFragment` for that chunk lands on node-3 within 5 seconds
+    And a subsequent S3 GET of "obj-x1" via node-2 returns the same bytes
+    And the GET on node-2 served the chunk from its local store, not via fabric
+
+  @integration @cross-node
+  Scenario: Read survives single-node failure (D-1 the whole point)
+    Given a 3-node Replication-3 cluster with composition "obj-x2" stored
+    And every node has acked `PutFragment` for the chunks of "obj-x2"
+    When node-1 is killed
+    Then a client's S3 GET of "obj-x2" via node-2 still returns the bytes
+    And the GET completes within 5 seconds
+    And no NFS4ERR_DELAY or 503 is surfaced — the read is degraded, not failed
+
+  @integration @cross-node
+  Scenario: Write requires 2-of-3 quorum (D-5)
+    Given a 3-node Replication-3 cluster on [node-1, node-2, node-3]
+    And `min_acks = 2` (default for Replication-3)
+    When node-2 and node-3 are both unreachable from node-1
+    And a client attempts a PUT via node-1
+    Then node-1's local write succeeds (1 ack)
+    And `PutFragment` to node-2 fails within the 5s per-peer timeout
+    And `PutFragment` to node-3 fails within the 5s per-peer timeout
+    And the client receives 503 with retry-after metadata
+    And `kiseki_fabric_quorum_lost_total` increments by 1
+
+  @integration @cross-node @ordering
+  Scenario: Composition delta arrives before fragment (D-10 cross-stream)
+    Given a 3-node Replication-3 cluster with a slow node-3
+    And node-3 applies Raft entries 50% faster than it acknowledges fabric `PutFragment`
+    When a PUT lands the composition delta on node-3 before the fragment
+    And a client's S3 GET via node-3 references the new chunk
+    Then node-3's read finds the chunk absent locally
+    And node-3 falls back to `GetFragment` against node-1 or node-2
+    And the read returns the same bytes as the original PUT
+
+  @integration @cross-node @leader-change
+  Scenario: Refcount preserved across leader change (D-4 / cluster_chunk_state)
+    Given a 3-node Replication-3 cluster with composition "obj-x3" (refcount=1)
+    And every replica has applied the `ChunkAndDelta` proposal that created "obj-x3"
+    When the leader is killed and a new leader is elected
+    Then the new leader's `cluster_chunk_state[("default", chunk_of(obj-x3))].refcount` is 1
+    And `kiseki-control inspect-chunk` for that chunk reports refcount=1
+
+  @integration @cross-node
+  Scenario: Tenant cert presented to fabric port is rejected (I-Auth4)
+    Given a 3-node Replication-3 cluster with mTLS enabled
+    And the data-path cert carries `spiffe://cluster/fabric/<node-id>` SAN URIs
+    When a tenant client presents a `spiffe://cluster/org/<uuid>` cert
+    And calls `PutFragment` directly against node-1's data-path port
+    Then the SAN-role interceptor rejects the call with PermissionDenied
+    And the local chunk store is unmodified
+    And no fragment fan-out occurs
+
+  @integration @cross-node @degenerate
+  Scenario: 1-node cluster degenerates to local-only (D-6)
+    Given a single-node cluster with empty `raft_peers`
+    When a client PUTs object "obj-y1" via the node's S3 listener
+    Then the chunk lands on the local store
+    And `min_acks` is capped at the replication factor (1)
+    And no fan-out RPCs are issued (peer list is empty)
+    And the client receives 200 OK without QuorumLost

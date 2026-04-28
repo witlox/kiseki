@@ -90,3 +90,36 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     When the read succeeds from the remaining shards
     Then a repair-degraded warning telemetry event is emitted to the caller's workflow
     And the event contains only { composition_id, degraded: true, severity: advisory } - no device, node, or parity-shard identifiers (I-WA11)
+
+  # --- Cross-node placement and fabric fallback (Phase 16a) ---
+  #
+  # Replication-N is the only durability strategy in 16a; EC fragment
+  # distribution lands in 16b. Each peer holds the whole envelope at
+  # `fragment_index = 0`. Spec: phase-16-cross-node-chunks.md (rev 4),
+  # ADR-005, ADR-026.
+
+  @integration @cross-node
+  Scenario: Replication-N places one fragment per peer
+    Given a 3-node cluster and pool "default" with `Replication { copies: 3 }`
+    When a client writes a chunk to "default"
+    Then exactly 3 fragments exist — one on each of [node-1, node-2, node-3]
+    And every fragment is the same encrypted envelope (content-addressed)
+    And `cluster_chunk_state[("default", chunk_id)].placement` lists all 3 nodes
+
+  @integration @cross-node
+  Scenario: Read falls back to fabric when local fragment is missing
+    Given a chunk replicated to [node-1, node-2, node-3]
+    And node-2's local store is missing the fragment (cross-stream lag)
+    When a read is issued against node-2
+    Then node-2 first tries its local store — miss
+    Then node-2 calls `GetFragment` against node-1
+    And on success returns the envelope to the caller
+    And `kiseki_fabric_ops_total{op="get",peer="node-1",outcome="ok"}` increments
+
+  @integration @cross-node
+  Scenario: GC across peers when refcount reaches 0 (I-C2)
+    Given chunk "c-gc" has refcount=1 on every node
+    When the only composition referencing "c-gc" is deleted
+    Then the cluster_chunk_state refcount transitions to 0
+    And the leader sends `DeleteFragment` to every peer in the placement list
+    And after local GC sweep the chunk is removed from every node's local store
