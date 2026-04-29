@@ -1,8 +1,9 @@
 #!/bin/bash
-# Setup script for Kiseki performance test client nodes.
-# Runs FUSE mount, NFS mount, and benchmark tools.
+# Setup script for Kiseki performance-test CPU client nodes.
+# Used by both the "default" and "transport" profiles. Sets up FUSE+NFS
+# mount points, the L2 cache disk, and a sane S3 endpoint default.
 #
-# Variables: storage_ips, cache_dev, client_id, release_tag
+# Variables: storage_ips, cache_dev, client_id, release_tag, profile
 set -eo pipefail
 
 # GCE metadata runner doesn't set HOME or full PATH — fix it
@@ -46,13 +47,13 @@ if [ -b "${cache_dev}" ]; then
 fi
 mkdir -p /cache
 
-# Set up NFS mount points (all 5 storage nodes)
+# Set up NFS mount points (one per storage node, count determined by profile).
+# fstab entries left as `noauto`-equivalent: the perf suites mount on demand.
 IFS=',' read -ra STORAGES <<< "${storage_ips}"
 for i in "$${!STORAGES[@]}"; do
   ip="$${STORAGES[$i]}"
   mnt="/mnt/kiseki-nfs-$((i+1))"
   mkdir -p "$mnt"
-  echo "$ip:/ $mnt nfs4 defaults,noatime,soft,timeo=30 0 0" >> /etc/fstab
 done
 
 # Set up FUSE mount point
@@ -75,14 +76,17 @@ STORAGE_IPS="${storage_ips}"
 FIRST_STORAGE=$${FIRST_STORAGE}
 CACHE_DIR=/cache
 CLIENT_ID=${client_id}
+KISEKI_CLIENT_PROFILE=${profile}
 KISEKI_CACHE_MODE=organic
 KISEKI_CACHE_DIR=/cache
 KISEKI_CACHE_L2_MAX=85899345920
 KISEKI_CACHE_META_TTL_MS=5000
 EOF
 
+NUM_STORAGES=$${#STORAGES[@]}
 echo "=== Client ${client_id} ready ==="
-echo "  NFS mounts: /mnt/kiseki-nfs-{1..5}"
-echo "  FUSE mount: /mnt/kiseki-fuse"
-echo "  Cache dir:  /cache ($(df -h /cache 2>/dev/null | tail -1 | awk '{print $2}'))"
-echo "  S3 endpoint: http://$${FIRST_STORAGE}:9000"
+echo "  Profile:      ${profile}"
+echo "  NFS mounts:   /mnt/kiseki-nfs-{1..$NUM_STORAGES}"
+echo "  FUSE mount:   /mnt/kiseki-fuse"
+echo "  Cache dir:    /cache ($(df -h /cache 2>/dev/null | tail -1 | awk '{print $2}'))"
+echo "  S3 endpoint:  http://$${FIRST_STORAGE}:9000"

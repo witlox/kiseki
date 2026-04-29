@@ -13,6 +13,10 @@ provider "google" {
   zone    = var.zone
 }
 
+# ============================================================================
+# Variables
+# ============================================================================
+
 variable "project_id" {
   description = "GCP project ID"
   type        = string
@@ -29,29 +33,118 @@ variable "zone" {
 }
 
 variable "release_tag" {
-  description = "GitHub release tag to download binaries from (e.g. 'v2026.1.326')"
+  description = "GitHub release tag for kiseki binaries (e.g. 'v2026.39.501' or 'latest')"
   type        = string
   default     = "latest"
 }
 
-# ---------------------------------------------------------------------------
+variable "profile" {
+  description = <<-EOT
+    Cluster profile — selects the shape *and* which benchmark suite the ctrl runs:
+
+      "default"   — broad coverage. 6 × c3-standard-22 storage with 4 × local NVMe each
+                    (1.5 TB / node), 3 × c3-standard-22 client. 6 nodes ≥ EC-4+2 minimum,
+                    pure-NVMe device pool, Tier_1 50 Gbps. Runs perf-suite.sh.
+      "transport" — protocol/NIC ceiling. 3 × c3-standard-88 storage with 8 × local NVMe
+                    each (3 TB / node), 3 × c3-standard-44 client. Tier_1 100 Gbps, disks
+                    deliberately faster than the wire so any cap is gateway/grpc, not I/O.
+                    Runs perf-suite-transport.sh.
+      "gpu"       — ML training scenario. 3 × c3-standard-44 storage (4 × local NVMe,
+                    Tier_1 50 Gbps), 2 × a2-highgpu-1g GPU clients (1 × A100 each).
+                    Runs perf-suite-gpu.sh against the cuFile/GDS path.
+  EOT
+  type        = string
+  default     = "default"
+  validation {
+    condition     = contains(["default", "transport", "gpu"], var.profile)
+    error_message = "profile must be one of: default, transport, gpu"
+  }
+}
+
+# ============================================================================
+# Profile shapes — every per-profile choice lives in this map
+# ============================================================================
+
+locals {
+  profiles = {
+    default = {
+      label              = "default"
+      storage_count      = 6
+      storage_machine    = "c3-standard-22"
+      storage_local_ssds = 4
+      storage_tier_1     = true
+      client_count       = 3
+      client_machine     = "c3-standard-22"
+      client_cache_gb    = 200
+      client_tier_1      = true
+      client_gpu         = false
+      client_image       = "rocky-linux-cloud/rocky-linux-9"
+      client_setup       = "setup-perf-client.sh"
+      bench_suite        = "perf-suite.sh"
+    }
+    transport = {
+      label              = "transport"
+      storage_count      = 3
+      storage_machine    = "c3-standard-88"
+      storage_local_ssds = 8
+      storage_tier_1     = true
+      client_count       = 3
+      client_machine     = "c3-standard-44"
+      client_cache_gb    = 100
+      client_tier_1      = true
+      client_gpu         = false
+      client_image       = "rocky-linux-cloud/rocky-linux-9"
+      client_setup       = "setup-perf-client.sh"
+      bench_suite        = "perf-suite-transport.sh"
+    }
+    gpu = {
+      label              = "gpu"
+      storage_count      = 3
+      storage_machine    = "c3-standard-44"
+      storage_local_ssds = 4
+      storage_tier_1     = true
+      client_count       = 2
+      client_machine     = "a2-highgpu-1g"
+      client_cache_gb    = 1000
+      client_tier_1      = false # a2-highgpu-1g (12 vCPU) is below the Tier_1 floor
+      client_gpu         = true
+      # Google's Deep Learning VM image: Debian 11 + CUDA 12.3 + nvidia drivers preinstalled.
+      client_image = "deeplearning-platform-release/common-cu123-debian-11"
+      client_setup = "setup-gpu-client.sh"
+      bench_suite  = "perf-suite-gpu.sh"
+    }
+  }
+
+  p = local.profiles[var.profile]
+
+  # Local SSDs appear under stable by-id symlinks regardless of NVMe namespace ordering.
+  raw_devices = join(",", [for i in range(local.p.storage_local_ssds) : "/dev/disk/by-id/google-local-ssd-${i}"])
+
+  storage_ips = [for i in range(local.p.storage_count) : "10.0.0.${10 + i}"]
+  client_ips  = [for i in range(local.p.client_count) : "10.0.0.${30 + i}"]
+
+  raft_port = 9300
+  all_peers = join(",", [for i, ip in local.storage_ips : "${i + 1}=${ip}:${local.raft_port}"])
+}
+
+# ============================================================================
 # Network
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 resource "google_compute_network" "net" {
-  name                    = "kiseki-perf"
+  name                    = "kiseki-perf-${local.p.label}"
   auto_create_subnetworks = false
 }
 
 resource "google_compute_subnetwork" "sub" {
-  name          = "kiseki-perf-sub"
+  name          = "kiseki-perf-${local.p.label}-sub"
   ip_cidr_range = "10.0.0.0/24"
   network       = google_compute_network.net.id
   region        = var.region
 }
 
 resource "google_compute_firewall" "internal" {
-  name    = "kiseki-perf-internal"
+  name    = "kiseki-perf-${local.p.label}-internal"
   network = google_compute_network.net.name
   allow {
     protocol = "tcp"
@@ -68,7 +161,7 @@ resource "google_compute_firewall" "internal" {
 }
 
 resource "google_compute_firewall" "ssh" {
-  name    = "kiseki-perf-ssh"
+  name    = "kiseki-perf-${local.p.label}-ssh"
   network = google_compute_network.net.name
   allow {
     protocol = "tcp"
@@ -78,7 +171,7 @@ resource "google_compute_firewall" "ssh" {
 }
 
 resource "google_compute_firewall" "services" {
-  name    = "kiseki-perf-svc"
+  name    = "kiseki-perf-${local.p.label}-svc"
   network = google_compute_network.net.name
   allow {
     protocol = "tcp"
@@ -88,15 +181,17 @@ resource "google_compute_firewall" "services" {
   target_tags   = ["kiseki-storage"]
 }
 
-# ---------------------------------------------------------------------------
-# HDD nodes: 3 × n2-standard-16, each with 3 × PD-Standard (HDD perf)
-# Disks are raw block devices — NOT mounted. Kiseki DeviceBackend manages them.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Storage nodes
+# ----------------------------------------------------------------------------
+# N × <profile machine> with M × local NVMe SSD as RAW block devices.
+# Disks are NOT mounted — Kiseki DeviceBackend manages them directly.
+# ============================================================================
 
-resource "google_compute_instance" "hdd" {
-  count        = 3
-  name         = "kiseki-hdd-${count.index + 1}"
-  machine_type = "n2-standard-16"
+resource "google_compute_instance" "storage" {
+  count        = local.p.storage_count
+  name         = "kiseki-storage-${count.index + 1}"
+  machine_type = local.p.storage_machine
   zone         = var.zone
   tags         = ["kiseki-storage"]
 
@@ -108,20 +203,25 @@ resource "google_compute_instance" "hdd" {
     }
   }
 
-  # 3 × PD-Standard (HDD performance tier) — raw block, no filesystem
-  dynamic "attached_disk" {
-    for_each = range(3)
+  dynamic "scratch_disk" {
+    for_each = range(local.p.storage_local_ssds)
     content {
-      source      = google_compute_disk.hdd[count.index * 3 + attached_disk.value].id
-      device_name = "kiseki-hdd-${attached_disk.value}"
-      mode        = "READ_WRITE"
+      interface = "NVME"
     }
   }
 
   network_interface {
     subnetwork = google_compute_subnetwork.sub.id
-    network_ip = "10.0.0.${10 + count.index}"
+    network_ip = local.storage_ips[count.index]
+    nic_type   = "GVNIC"
     access_config {}
+  }
+
+  dynamic "network_performance_config" {
+    for_each = local.p.storage_tier_1 ? [1] : []
+    content {
+      total_egress_bandwidth_tier = "TIER_1"
+    }
   }
 
   metadata = {
@@ -129,154 +229,98 @@ resource "google_compute_instance" "hdd" {
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-raw-storage.sh", {
-    node_id   = count.index + 1
-    node_ip   = "10.0.0.${10 + count.index}"
-    all_peers = "1=10.0.0.10:9300,2=10.0.0.11:9300,3=10.0.0.12:9300,4=10.0.0.20:9300,5=10.0.0.21:9300"
-    raft_port = 9300
-    # Raw device paths — Kiseki manages these directly
-    raw_devices  = "/dev/disk/by-id/google-kiseki-hdd-0,/dev/disk/by-id/google-kiseki-hdd-1,/dev/disk/by-id/google-kiseki-hdd-2"
-    device_class = "hdd"
+    node_id      = count.index + 1
+    node_ip      = local.storage_ips[count.index]
+    all_peers    = local.all_peers
+    raft_port    = local.raft_port
+    raw_devices  = local.raw_devices
+    device_class = "nvme"
     meta_dir     = "/var/lib/kiseki"
     release_tag  = var.release_tag
   })
 }
 
-# 9 PD-Standard disks (3 per HDD node)
-resource "google_compute_disk" "hdd" {
-  count = 9
-  name  = "kiseki-data-hdd-${count.index}"
-  type  = "pd-standard"
-  size  = 200 # 200GB each, 600GB per node
-  zone  = var.zone
-}
-
-# ---------------------------------------------------------------------------
-# Fast nodes: 2 × n2-standard-16, each with 1 × local NVMe + 2 × PD-SSD
-# NVMe = metadata tier, PD-SSD = data tier — all raw block
-# ---------------------------------------------------------------------------
-
-resource "google_compute_instance" "fast" {
-  count        = 2
-  name         = "kiseki-fast-${count.index + 1}"
-  machine_type = "n2-standard-16"
-  zone         = var.zone
-  tags         = ["kiseki-storage"]
-
-  boot_disk {
-    initialize_params {
-      image = "rocky-linux-cloud/rocky-linux-9"
-      size  = 50
-      type  = "pd-ssd"
-    }
-  }
-
-  # 2 × local NVMe SSD (GCP requires multiples of 2)
-  scratch_disk {
-    interface = "NVME"
-  }
-  scratch_disk {
-    interface = "NVME"
-  }
-
-  # 2 × PD-SSD (data tier)
-  dynamic "attached_disk" {
-    for_each = range(2)
-    content {
-      source      = google_compute_disk.ssd[count.index * 2 + attached_disk.value].id
-      device_name = "kiseki-ssd-${attached_disk.value}"
-      mode        = "READ_WRITE"
-    }
-  }
-
-  network_interface {
-    subnetwork = google_compute_subnetwork.sub.id
-    network_ip = "10.0.0.${20 + count.index}"
-    access_config {}
-  }
-
-  metadata = {
-    enable-oslogin = "TRUE"
-  }
-
-  metadata_startup_script = templatefile("${path.module}/scripts/setup-raw-storage.sh", {
-    node_id   = count.index + 4
-    node_ip   = "10.0.0.${20 + count.index}"
-    all_peers = "1=10.0.0.10:9300,2=10.0.0.11:9300,3=10.0.0.12:9300,4=10.0.0.20:9300,5=10.0.0.21:9300"
-    raft_port = 9300
-    # NVMe for metadata, PD-SSD for data — all raw
-    raw_devices  = "/dev/nvme0n1,/dev/disk/by-id/google-kiseki-ssd-0,/dev/disk/by-id/google-kiseki-ssd-1"
-    device_class = "nvme+ssd"
-    meta_dir     = "/var/lib/kiseki"
-    release_tag  = var.release_tag
-  })
-}
-
-# 4 PD-SSD disks (2 per fast node)
-resource "google_compute_disk" "ssd" {
-  count = 4
-  name  = "kiseki-ssd-${count.index}"
-  type  = "pd-ssd"
-  size  = 375 # 375GB each, 750GB per node
-  zone  = var.zone
-}
-
-# ---------------------------------------------------------------------------
-# Client nodes: 3 × n2-standard-8 for FUSE + NFS + benchmark
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Client nodes
+# ----------------------------------------------------------------------------
+# Profile-determined: CPU clients for default/transport, GPU clients for gpu.
+# ============================================================================
 
 resource "google_compute_instance" "client" {
-  count        = 3
+  count        = local.p.client_count
   name         = "kiseki-client-${count.index + 1}"
-  machine_type = "n2-standard-8"
+  machine_type = local.p.client_machine
   zone         = var.zone
 
   boot_disk {
     initialize_params {
-      image = "rocky-linux-cloud/rocky-linux-9"
-      size  = 50
+      image = local.p.client_image
+      size  = local.p.client_gpu ? 100 : 50
       type  = "pd-ssd"
     }
   }
 
-  # Client cache disk (L2)
   attached_disk {
     source      = google_compute_disk.cache[count.index].id
     device_name = "kiseki-cache"
     mode        = "READ_WRITE"
   }
 
+  dynamic "guest_accelerator" {
+    for_each = local.p.client_gpu ? [1] : []
+    content {
+      type  = "nvidia-tesla-a100"
+      count = 1
+    }
+  }
+
+  scheduling {
+    on_host_maintenance = local.p.client_gpu ? "TERMINATE" : "MIGRATE"
+    automatic_restart   = true
+  }
+
   network_interface {
     subnetwork = google_compute_subnetwork.sub.id
-    network_ip = "10.0.0.${30 + count.index}"
+    network_ip = local.client_ips[count.index]
+    nic_type   = "GVNIC"
     access_config {}
   }
 
-  metadata = {
-    enable-oslogin = "TRUE"
+  dynamic "network_performance_config" {
+    for_each = local.p.client_tier_1 ? [1] : []
+    content {
+      total_egress_bandwidth_tier = "TIER_1"
+    }
   }
 
-  metadata_startup_script = templatefile("${path.module}/scripts/setup-perf-client.sh", {
-    storage_ips = "10.0.0.10,10.0.0.11,10.0.0.12,10.0.0.20,10.0.0.21"
+  metadata = {
+    enable-oslogin        = "TRUE"
+    install-nvidia-driver = local.p.client_gpu ? "True" : null
+  }
+
+  metadata_startup_script = templatefile("${path.module}/scripts/${local.p.client_setup}", {
+    storage_ips = join(",", local.storage_ips)
     cache_dev   = "/dev/disk/by-id/google-kiseki-cache"
     client_id   = count.index + 1
     release_tag = var.release_tag
+    profile     = local.p.label
   })
 }
 
 resource "google_compute_disk" "cache" {
-  count = 3
+  count = local.p.client_count
   name  = "kiseki-cache-${count.index}"
   type  = "pd-ssd"
-  size  = 100
+  size  = local.p.client_cache_gb
   zone  = var.zone
 }
 
-# ---------------------------------------------------------------------------
-# GCS bucket for performance results
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Results bucket + ctrl service account
+# ============================================================================
 
 resource "google_storage_bucket" "perf_results" {
-  name          = "${var.project_id}-kiseki-perf-results"
+  name          = "${var.project_id}-kiseki-perf-${local.p.label}"
   location      = var.region
   force_destroy = true
 
@@ -292,10 +336,9 @@ resource "google_storage_bucket" "perf_results" {
   uniform_bucket_level_access = true
 }
 
-# Service account for ctrl node (GCS write access)
 resource "google_service_account" "ctrl" {
-  account_id   = "kiseki-bench-ctrl"
-  display_name = "Kiseki benchmark controller"
+  account_id   = "kiseki-bench-${local.p.label}"
+  display_name = "Kiseki benchmark controller (${local.p.label})"
 }
 
 resource "google_project_iam_member" "ctrl_os_login" {
@@ -322,9 +365,9 @@ resource "google_storage_bucket_iam_member" "ctrl_read" {
   member = "serviceAccount:${google_service_account.ctrl.email}"
 }
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Benchmark controller
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 resource "google_compute_instance" "ctrl" {
   name         = "kiseki-ctrl"
@@ -355,27 +398,25 @@ resource "google_compute_instance" "ctrl" {
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-bench-ctrl.sh", {
-    storage_ips = "10.0.0.10,10.0.0.11,10.0.0.12,10.0.0.20,10.0.0.21"
-    client_ips  = "10.0.0.30,10.0.0.31,10.0.0.32"
+    storage_ips = join(",", local.storage_ips)
+    client_ips  = join(",", local.client_ips)
     perf_bucket = "gs://${google_storage_bucket.perf_results.name}"
     release_tag = var.release_tag
+    profile     = local.p.label
+    bench_suite = local.p.bench_suite
   })
 }
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Outputs
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-output "hdd_nodes" {
-  value = [for i in google_compute_instance.hdd : {
-    name = i.name
-    ip   = i.network_interface[0].access_config[0].nat_ip
-    int  = i.network_interface[0].network_ip
-  }]
+output "profile" {
+  value = local.p.label
 }
 
-output "fast_nodes" {
-  value = [for i in google_compute_instance.fast : {
+output "storage_nodes" {
+  value = [for i in google_compute_instance.storage : {
     name = i.name
     ip   = i.network_interface[0].access_config[0].nat_ip
     int  = i.network_interface[0].network_ip
@@ -398,6 +439,10 @@ output "perf_bucket" {
   value = "gs://${google_storage_bucket.perf_results.name}"
 }
 
+output "bench_suite" {
+  value = local.p.bench_suite
+}
+
 output "dashboard" {
-  value = "http://${google_compute_instance.fast[0].network_interface[0].access_config[0].nat_ip}:9090/ui"
+  value = "http://${google_compute_instance.storage[0].network_interface[0].access_config[0].nat_ip}:9090/ui"
 }

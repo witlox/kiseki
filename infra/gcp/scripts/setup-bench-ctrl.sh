@@ -1,6 +1,7 @@
 #!/bin/bash
 # Setup script for benchmark controller node.
-# Templatefile variables: storage_ips, client_ips, perf_bucket
+# Templatefile variables: storage_ips, client_ips, perf_bucket, release_tag,
+#                         profile, bench_suite
 set -eo pipefail
 
 export HOME="$${HOME:-/root}"
@@ -41,12 +42,14 @@ fi
 # Create benchmark directory
 mkdir -p /opt/kiseki-bench/results
 
-# Store cluster info
+# Store cluster info — sourced by every perf-suite-*.sh and metrics-collector.sh
 cat > /etc/kiseki-bench.env <<EOF
 STORAGE_IPS="${storage_ips}"
 CLIENT_IPS="${client_ips}"
 FIRST_STORAGE=$(echo "${storage_ips}" | cut -d',' -f1)
 KISEKI_PERF_BUCKET="${perf_bucket}"
+KISEKI_PROFILE="${profile}"
+KISEKI_BENCH_SUITE="${bench_suite}"
 EOF
 
 # Register SSH key with OS Login for ctrl→node access.
@@ -63,7 +66,9 @@ echo "SSH_USER=$OS_USER" >> /etc/kiseki-bench.env
 echo "SSH key registered (OS Login user: $OS_USER)"
 
 echo "=== Benchmark controller ready ==="
-echo "Storage nodes: ${storage_ips}"
-echo "Client nodes: ${client_ips}"
+echo "Profile:        ${profile}"
+echo "Storage nodes:  ${storage_ips}"
+echo "Client nodes:   ${client_ips}"
 echo "Results bucket: ${perf_bucket}"
-echo "Run: /opt/kiseki-bench/perf-suite.sh"
+echo "Bench suite:    ${bench_suite}"
+echo "Run:            /opt/kiseki-bench/${bench_suite}"

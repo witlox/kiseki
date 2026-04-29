@@ -50,10 +50,19 @@ echo "╚═══════════════════════�
 echo ""
 echo "=== Deploying benchmark scripts ==="
 gcloud_ssh "sudo mkdir -p /opt/kiseki-bench && sudo chmod 777 /opt/kiseki-bench"
-gcloud_scp_to "$SCRIPT_DIR/perf-suite.sh" "/opt/kiseki-bench/perf-suite.sh"
-gcloud_scp_to "$SCRIPT_DIR/metrics-collector.sh" "/opt/kiseki-bench/metrics-collector.sh"
+# Upload all suites + the shared helpers; the ctrl picks based on
+# KISEKI_BENCH_SUITE in /etc/kiseki-bench.env (set by setup-bench-ctrl.sh,
+# which gets it from var.profile in the Terraform).
+for f in perf-common.sh perf-suite.sh perf-suite-transport.sh perf-suite-gpu.sh metrics-collector.sh; do
+  gcloud_scp_to "$SCRIPT_DIR/$f" "/opt/kiseki-bench/$f"
+done
 gcloud_ssh "chmod +x /opt/kiseki-bench/*.sh"
 echo "  Scripts deployed to /opt/kiseki-bench/"
+
+# Resolve which suite this profile runs.
+BENCH_SUITE=$(gcloud_ssh "grep -oP 'KISEKI_BENCH_SUITE=\"\\K[^\"]+' /etc/kiseki-bench.env 2>/dev/null" | head -1)
+BENCH_SUITE="${BENCH_SUITE:-perf-suite.sh}"
+echo "  Suite for this profile: $BENCH_SUITE"
 
 # ---------------------------------------------------------------------------
 # 2. Check cluster health before starting
@@ -61,7 +70,8 @@ echo "  Scripts deployed to /opt/kiseki-bench/"
 echo ""
 echo "=== Pre-flight cluster health ==="
 HEALTH=$(gcloud_ssh "
-  for ip in 10.0.0.10 10.0.0.11 10.0.0.12 10.0.0.20 10.0.0.21; do
+  source /etc/kiseki-bench.env 2>/dev/null
+  for ip in \$(echo \"\$STORAGE_IPS\" | tr ',' ' '); do
     STATUS=\$(curl -sf http://\$ip:9090/health 2>/dev/null || echo 'DOWN')
     echo \"  \$ip: \$STATUS\"
   done
@@ -81,7 +91,7 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Launching benchmark ==="
-gcloud_ssh "nohup bash /opt/kiseki-bench/perf-suite.sh > /tmp/kiseki-perf.log 2>&1 & echo \$!"
+gcloud_ssh "nohup bash /opt/kiseki-bench/$BENCH_SUITE > /tmp/kiseki-perf.log 2>&1 & echo \$!"
 echo "  Benchmark running on ctrl node (output: /tmp/kiseki-perf.log)"
 
 # ---------------------------------------------------------------------------
@@ -97,7 +107,7 @@ while true; do
   sleep 60
 
   # Check if still running
-  RUNNING=$(gcloud_ssh "pgrep -f perf-suite.sh || echo 'done'" 2>/dev/null || echo "error")
+  RUNNING=$(gcloud_ssh "pgrep -f $BENCH_SUITE || echo 'done'" 2>/dev/null || echo "error")
 
   # Get latest output
   CURRENT=$(gcloud_ssh "wc -l < /tmp/kiseki-perf.log 2>/dev/null || echo 0" 2>/dev/null || echo "0")

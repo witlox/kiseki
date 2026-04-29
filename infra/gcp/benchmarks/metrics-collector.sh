@@ -11,7 +11,10 @@
 #        bash metrics-collector.sh --summarize <results_dir>
 set -eo pipefail
 
-ALL_STORAGE="10.0.0.10 10.0.0.11 10.0.0.12 10.0.0.20 10.0.0.21"
+# Storage node IPs come from /etc/kiseki-bench.env (written by setup-bench-ctrl.sh).
+# Fallback: empty list — collector will write empty snapshots, summary still runs.
+source /etc/kiseki-bench.env 2>/dev/null || true
+ALL_STORAGE=$(echo "${STORAGE_IPS:-}" | tr ',' ' ')
 INTERVAL=10
 
 # Key metrics to extract (grep patterns)
