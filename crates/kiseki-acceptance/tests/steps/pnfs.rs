@@ -758,28 +758,45 @@ async fn then_well_formed_ff_layout(world: &mut KisekiWorld) {
         .pnfs_last_layout
         .as_ref()
         .expect("LAYOUTGET must run first");
-    assert!(!layout.stripes.is_empty(), "ff_layout4 must have ≥1 stripe");
-    // Stripes are contiguous and ordered.
-    for w in layout.stripes.windows(2) {
-        assert_eq!(w[0].offset + w[0].length, w[1].offset);
+    // Phase 15c.9: layout = ONE segment + N mirrors. The `stripes`
+    // array is reused as the mirror list; every entry shares the
+    // same (offset, length) since they're peers within one
+    // ff_layout4. Pre-15c.9 the assertion checked contiguous
+    // per-position stripes (`stripe[i].end == stripe[i+1].start`);
+    // the new shape has all mirrors at the same offset.
+    assert!(!layout.stripes.is_empty(), "ff_layout4 must have ≥1 mirror");
+    let head = &layout.stripes[0];
+    for m in &layout.stripes {
+        assert_eq!(
+            (m.offset, m.length),
+            (head.offset, head.length),
+            "all mirrors must share the same (offset, length) — Phase 15c.9 layout shape",
+        );
     }
 }
 
-#[then(regex = r#"^it contains (\d+) stripes of (\d+) MiB each$"#)]
-async fn then_stripes(world: &mut KisekiWorld, n: u32, mib: u32) {
+#[then(regex = r#"^it contains (\d+) mirrors covering the (\d+) MiB segment$"#)]
+async fn then_mirrors(world: &mut KisekiWorld, n: u32, mib: u32) {
     let layout = world
         .pnfs_last_layout
         .as_ref()
         .expect("LAYOUTGET must run first");
-    assert_eq!(layout.stripes.len() as u32, n);
+    assert_eq!(
+        layout.stripes.len() as u32,
+        n,
+        "expected {n} mirrors (one per cluster node)",
+    );
     let bytes = u64::from(mib) * 1_048_576;
-    for s in &layout.stripes {
-        assert_eq!(s.length, bytes);
+    for m in &layout.stripes {
+        assert_eq!(
+            m.length, bytes,
+            "every mirror covers the full segment ({bytes} bytes)",
+        );
     }
 }
 
 #[then(
-    regex = r#"^each stripe carries a (\d+)-byte fh4 \((\d+)-byte payload \+ (\d+)-byte MAC\)$"#
+    regex = r#"^each mirror carries a (\d+)-byte fh4 \((\d+)-byte payload \+ (\d+)-byte MAC\)$"#
 )]
 async fn then_fh4_size(world: &mut KisekiWorld, total: u32, _payload: u32, _mac: u32) {
     use kiseki_gateway::pnfs::PNFS_FH_BYTES;
@@ -789,21 +806,36 @@ async fn then_fh4_size(world: &mut KisekiWorld, total: u32, _payload: u32, _mac:
         .as_ref()
         .expect("LAYOUTGET must run first");
     let key = world.pnfs_mac_key.clone().expect("K_layout");
-    for s in &layout.stripes {
-        assert_eq!(s.fh.encode().len(), PNFS_FH_BYTES);
+    for m in &layout.stripes {
+        assert_eq!(m.fh.encode().len(), PNFS_FH_BYTES);
         // Every fh4 must validate against the issuing key.
-        s.fh.validate(&key, world.pnfs_clock_ms)
+        m.fh.validate(&key, world.pnfs_clock_ms)
             .expect("fh validates");
     }
 }
 
-#[then(regex = r#"^consecutive stripes are assigned to distinct storage nodes \(round-robin\)$"#)]
+#[then(
+    regex = r#"^consecutive mirrors are assigned to distinct storage nodes \(one per cluster node\)$"#
+)]
 async fn then_round_robin(world: &mut KisekiWorld) {
     let layout = world
         .pnfs_last_layout
         .as_ref()
         .expect("LAYOUTGET must run first");
     let addrs: Vec<&str> = layout.stripes.iter().map(|s| s.ds_addr.as_str()).collect();
+    // Phase 15c.9: each mirror points to a distinct cluster node.
+    // The `stripes` array has one entry per node, so we expect
+    // `addrs` to be a set of distinct addresses.
+    let unique: std::collections::HashSet<&str> = addrs.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        addrs.len(),
+        "every mirror must reference a distinct DS address; got {addrs:?}",
+    );
+    // Keep the legacy round-robin window check as an additional
+    // safety net; with one mirror per node it's vacuously true
+    // but stays useful for future layouts that span multiple
+    // segments.
     let n_nodes = 3;
     for (i, a) in addrs.iter().enumerate() {
         if i + n_nodes < addrs.len() {

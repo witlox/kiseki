@@ -121,14 +121,21 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
   # adds GETDEVICEINFO. Layout cache gets explicit eviction (I-PN8).
   # ============================================================================
 
+  # Phase 15c.9: layout shape changed from "N segments × 1 mirror"
+  # to "1 segment × N mirrors" (RFC 8435 §13.2 striping inside one
+  # segment via `ffl_mirrors<>` + `stripe_unit`). The kernel
+  # picks `mirror_idx = (offset / stripe_unit) % num_mirrors` and
+  # dispatches each read to the chosen mirror's DS at the absolute
+  # composition offset. Replication-3 means every node has every
+  # byte, so the mirror index is purely load-balancing.
   @integration @pnfs-15b
   Scenario: LAYOUTGET returns a well-formed ff_layout4 body
     Given a composition "obj-3" of 4 MiB exists in "default"
     When the client sends LAYOUTGET for "obj-3" range [0, 4 MiB)
     Then the response is a well-formed `ff_layout4` per RFC 8435 §5.1
-    And it contains 4 stripes of 1 MiB each
-    And each stripe carries a 76-byte fh4 (60-byte payload + 16-byte MAC)
-    And consecutive stripes are assigned to distinct storage nodes (round-robin)
+    And it contains 3 mirrors covering the 4 MiB segment
+    And each mirror carries a 76-byte fh4 (60-byte payload + 16-byte MAC)
+    And consecutive mirrors are assigned to distinct storage nodes (one per cluster node)
 
   @integration @pnfs-15b
   Scenario: GETDEVICEINFO resolves device_id to reachable DS addresses
