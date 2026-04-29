@@ -546,12 +546,30 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         // size-derived `copies` so a 6-node Replication-3 cluster
         // doesn't list all 6 nodes in every cluster_chunk_state row.
         .with_target_copies(usize::from(durability.copies));
+    // The inline path (mem_gateway.rs PUT path: writes ≤ inline_threshold
+    // go to local small_store keyed by chunk_id) is single-node-only. In a
+    // multi-node cluster the inline write lands on one node's redb and the
+    // Raft-replicated composition metadata leads other nodes to look up
+    // chunk_ids that aren't in their small_store → cross-node GET returns
+    // 404. ADR-026 sketches a "small writes inline in delta → Raft only"
+    // optimization keyed by hashed_key XOR seq, but mem_gateway and the
+    // Raft state-machine apply path use incompatible key spaces, so until
+    // that path is unified we route ALL writes through the chunk/fabric
+    // path when fabric peers are present. Single-node clusters keep the
+    // inline optimization.
+    let multi_node = !fabric_peers_for_scrub.is_empty();
     if let Some(ref ss) = small_store {
-        gw_builder = gw_builder.with_inline_threshold(
-            kiseki_log::ShardConfig::default().inline_threshold_bytes,
-            std::sync::Arc::clone(ss)
-                as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>,
-        );
+        if multi_node {
+            tracing::info!(
+                "inline write path disabled in multi-node cluster — small writes go through fabric (Phase 16a)",
+            );
+        } else {
+            gw_builder = gw_builder.with_inline_threshold(
+                kiseki_log::ShardConfig::default().inline_threshold_bytes,
+                std::sync::Arc::clone(ss)
+                    as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>,
+            );
+        }
     }
     let gw = Arc::new(gw_builder);
 
