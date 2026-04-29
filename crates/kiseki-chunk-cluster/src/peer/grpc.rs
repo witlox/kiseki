@@ -47,11 +47,16 @@ pub struct GrpcFabricPeer {
 /// emits one chunk per S3 PUT today, and a 4 MiB PUT + protobuf +
 /// crypto framing already overruns the default cap, returning
 /// `quorum lost: only 1/2 replicas acked` because every `PutFragment`
-/// fan-out is rejected by the receiver). 64 MiB matches the
-/// practical envelope size we'd see for a single-chunk write while
-/// still bounded so a peer can't send a near-unbounded message
-/// through the fabric.
-pub const FABRIC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// fan-out is rejected by the receiver).
+///
+/// 256 MiB matches the practical envelope size we'd see for a
+/// single-chunk write up to ~256 MiB (the perf baseline uses 64 MiB
+/// fixtures; the gateway stores the whole user payload as one
+/// envelope, so the gRPC message has to fit). Still bounded so a
+/// peer can't send a near-unbounded message through the fabric.
+/// If the gateway later splits writes into smaller chunks (Phase
+/// 16+), this cap can shrink.
+pub const FABRIC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
 impl GrpcFabricPeer {
     /// Build a fabric peer from a connected tonic channel + a
@@ -447,20 +452,25 @@ mod tests {
         );
     }
 
-    /// Phase 15c.8 perf: tonic's default 4 MiB cap is below the
-    /// kiseki single-chunk envelope size for typical S3 PUTs. The
-    /// fabric must lift the cap or any 4+ MiB write returns
+    /// Phase 15c.8 + 15c.10 perf: tonic's default 4 MiB cap is below
+    /// the kiseki single-chunk envelope size for typical S3 PUTs.
+    /// The fabric must lift the cap or any 4+ MiB write returns
     /// `quorum lost: only 1/2 replicas acked` (the receiver rejects
     /// the `PutFragment` payload as oversized; the sender sees zero
     /// peer acks and only the leader's local write counts).
-    /// This test pins the cap so a future "let's tighten this for
-    /// safety" change has to think twice.
+    ///
+    /// Floor: 128 MiB. The gateway stores each S3 PUT as one
+    /// envelope; e2e workloads (model weights, training
+    /// checkpoints, large dataset shards) routinely PUT 100+ MiB
+    /// objects. The e2e witness for the >64 MiB case lives at
+    /// `tests/e2e/test_s3_gateway.py::
+    /// test_s3_large_put_exceeds_64mib_fabric_cap`.
     #[test]
-    fn fabric_max_message_size_exceeds_practical_chunk_size() {
-        // Anything below 8 MiB is too small for a typical S3 PUT
-        // (the perf baseline writes 8 MiB in a single PUT). const-block
-        // assertion evaluates at compile time; this test exists to
-        // give the contract a discoverable name + comment.
-        const _: () = assert!(FABRIC_MAX_MESSAGE_BYTES >= 8 * 1024 * 1024);
+    fn fabric_max_message_size_accommodates_real_workload_chunks() {
+        // const-block assertion evaluates at compile time; this
+        // test exists so the contract has a discoverable name +
+        // comment, and so a future "let's tighten this" change
+        // has to think twice and update the floor in lockstep.
+        const _: () = assert!(FABRIC_MAX_MESSAGE_BYTES >= 128 * 1024 * 1024);
     }
 }
