@@ -1324,49 +1324,72 @@ fn op_layoutget_ff<G: GatewayOps>(
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_bool(true); // return_on_close
     w.write_opaque_fixed(&layout.stateid);
-    w.write_u32(u32::try_from(layout.stripes.len()).unwrap_or(0));
-    for stripe in &layout.stripes {
-        w.write_u64(stripe.offset);
-        w.write_u64(stripe.length);
-        w.write_u32(
-            if matches!(stripe.iomode, crate::pnfs::LayoutIoMode::ReadWrite) {
-                2
-            } else {
-                1
-            },
-        );
-        w.write_u32(LAYOUT4_FLEX_FILES);
+    // Phase 15c.9: ONE layout4 segment, N ff_mirrors inside it.
+    // Pre-15c.9 we emitted N segments × 1 mirror — Linux's flex-
+    // files driver only resolved the FIRST segment's deviceid via
+    // GETDEVICEINFO, then couldn't dispatch reads to the others
+    // and dd hung after the first 1 MiB. RFC 8435 §13.2 striping
+    // happens INSIDE one segment via `ffl_mirrors<>` and
+    // `stripe_unit`: the kernel computes
+    // `mirror_idx = (file_offset / stripe_unit) % num_mirrors`
+    // and sends the read to that mirror's DS at the absolute
+    // file_offset. Replication-3 means every mirror's node has
+    // every byte locally, so the dispatch is just load-balancing.
+    let Some(first_mirror) = layout.stripes.first() else {
+        // No nodes configured — emit zero segments. RFC 5661 says
+        // the layout array can be empty (server didn't grant any
+        // layout); kernel falls back to MDS reads.
+        w.write_u32(0);
+        return (nfs4_status::NFS4_OK, w.into_bytes());
+    };
+    w.write_u32(1); // exactly 1 layout4 segment
+    w.write_u64(first_mirror.offset);
+    w.write_u64(first_mirror.length);
+    w.write_u32(
+        if matches!(first_mirror.iomode, crate::pnfs::LayoutIoMode::ReadWrite) {
+            2
+        } else {
+            1
+        },
+    );
+    w.write_u32(LAYOUT4_FLEX_FILES);
 
-        // Inline ff_layout4 body for this segment. RFC 8435 §5.1:
-        //   length4 ffl_stripe_unit
-        //   ff_mirror4 ffl_mirrors<>           (1 mirror; tightly_coupled)
-        //     ff_data_server4 ffm_data_servers<>  (1 ds for this stripe)
-        //       deviceid4   ffds_deviceid       (16 bytes)
-        //       uint32      ffds_efficiency
-        //       stateid4    ffds_stateid        (16 bytes)
-        //       nfs_fh4     ffds_fh_vers<>      (1 fh — NFSv4.1)
-        //       fattr4_owner ffds_user
-        //       fattr4_owner_group ffds_group
-        //   ff_ioflags4 ffl_flags
-        //   uint32 ffl_stats_collect_hint
-        let mut body = XdrWriter::new();
-        body.write_u64(stripe.length); // stripe_unit
-        body.write_u32(1); // mirror count
-        body.write_u32(1); // data_servers per mirror
-        body.write_opaque_fixed(&stripe.device_id);
+    // ff_layout4 body (RFC 8435 §5.1):
+    //   length4         ffl_stripe_unit
+    //   ff_mirror4      ffl_mirrors<>
+    //     ff_data_server4 ffm_data_servers<>
+    //       deviceid4    ffds_deviceid      (16 bytes)
+    //       uint32       ffds_efficiency
+    //       stateid4     ffds_stateid       (16 bytes)
+    //       nfs_fh4      ffds_fh_vers<>     (1 fh — NFSv4.1)
+    //       fattr4_owner ffds_user
+    //       fattr4_owner_group ffds_group
+    //   ff_ioflags4     ffl_flags
+    //   uint32          ffl_stats_collect_hint
+    let mut body = XdrWriter::new();
+    // stripe_unit drives the kernel's load-balancing across
+    // mirrors. Use the configured stripe size (default 1 MiB) so
+    // mirror_idx = (offset / 1MiB) % num_mirrors — sequential
+    // reads spread evenly across nodes.
+    let stripe_unit = mgr.stripe_size_bytes();
+    body.write_u64(stripe_unit);
+    body.write_u32(u32::try_from(layout.stripes.len()).unwrap_or(0));
+    for mirror in &layout.stripes {
+        body.write_u32(1); // 1 data_server per mirror
+        body.write_opaque_fixed(&mirror.device_id);
         body.write_u32(0); // efficiency
         body.write_opaque_fixed(&[0u8; 16]); // stateid
         body.write_u32(1); // fh_vers count
-        body.write_opaque(&stripe.fh.encode());
+        body.write_opaque(&mirror.fh.encode());
         body.write_opaque(b"0"); // user
         body.write_opaque(b"0"); // group
-                                 // RFC 8435 §5.1 + ADR-038 §D3 — kiseki's FFL is tightly_coupled;
-                                 // advertise FF_FLAGS_NO_LAYOUTCOMMIT so clients skip the
-                                 // LAYOUTCOMMIT round trip on close.
-        body.write_u32(crate::pnfs::FF_FLAGS_NO_LAYOUTCOMMIT);
-        body.write_u32(0); // stats_collect_hint
-        w.write_opaque(&body.into_bytes());
     }
+    // RFC 8435 §5.1 + ADR-038 §D3 — kiseki's FFL is tightly_coupled;
+    // FF_FLAGS_NO_LAYOUTCOMMIT lets clients skip the LAYOUTCOMMIT
+    // round trip on close.
+    body.write_u32(crate::pnfs::FF_FLAGS_NO_LAYOUTCOMMIT);
+    body.write_u32(0); // stats_collect_hint
+    w.write_opaque(&body.into_bytes());
 
     (nfs4_status::NFS4_OK, w.into_bytes())
 }

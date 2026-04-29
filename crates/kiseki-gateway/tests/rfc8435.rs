@@ -550,11 +550,16 @@ fn layoutget_then_getdeviceinfo_round_trip() {
         LayoutIoMode::Read,
         1_000,
     );
-    assert_eq!(layout.stripes.len(), 4);
+    // Phase 15c.9: layout shape = one segment + N mirrors (one per
+    // cluster node). With a single-DS config, that's exactly ONE
+    // mirror covering the full requested range.
+    assert_eq!(layout.stripes.len(), 1, "one mirror per cluster node");
+    assert_eq!(layout.stripes[0].offset, 0);
+    assert_eq!(layout.stripes[0].length, 4 * 1_048_576);
 
-    // Each stripe references a deviceid; GETDEVICEINFO must resolve.
-    for stripe in &layout.stripes {
-        let info = mgr.get_device_info(&stripe.device_id).expect(
+    // Each mirror references a deviceid; GETDEVICEINFO must resolve.
+    for mirror in &layout.stripes {
+        let info = mgr.get_device_info(&mirror.device_id).expect(
             "RFC 8435 §5.2: GETDEVICEINFO MUST resolve every device referenced by an active layout",
         );
         assert_eq!(info.addresses.len(), 1);
@@ -564,8 +569,8 @@ fn layoutget_then_getdeviceinfo_round_trip() {
     }
 
     // Each fh4 in the layout MAC-validates against the live key.
-    for stripe in &layout.stripes {
-        stripe
+    for mirror in &layout.stripes {
+        mirror
             .fh
             .validate(&key, 1_000)
             .expect("ADR-038 §D4.3: every issued fh4 validates against the issuing K_layout");

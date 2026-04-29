@@ -363,12 +363,27 @@ fn op_read_ds<G: GatewayOps + Send + Sync + 'static>(
         return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
     };
 
-    // Translate stripe-relative → absolute offset within the composition.
-    let stripe_base = u64::from(fh.stripe_index) * ctx.stripe_size_bytes;
-    let stripe_end = stripe_base.saturating_add(ctx.stripe_size_bytes);
-    let abs_offset = stripe_base.saturating_add(offset);
-    let max_count = stripe_end.saturating_sub(abs_offset);
-    let bounded_count = u64::from(count).min(max_count);
+    // Translate the kernel's offset to a composition-absolute offset.
+    //
+    // Phase 15c.9: with the new one-segment-N-mirrors layout shape,
+    // the FH represents the whole segment (`stripe_index = 0`) and
+    // the kernel sends FILE offsets directly. The DS reads at
+    // `abs_offset = kernel_offset` and is bounded only by the
+    // kernel's `count` (already ≤ the negotiated rsize).
+    //
+    // Legacy per-stripe FHs (`stripe_index > 0`, pre-15c.9 layouts
+    // still cached at the kernel) keep the old translation: the
+    // kernel's `offset` is stripe-relative, the DS adds
+    // `stripe_index * stripe_size` and bounds reads to one stripe.
+    let (abs_offset, bounded_count) = if fh.stripe_index == 0 {
+        (offset, u64::from(count))
+    } else {
+        let stripe_base = u64::from(fh.stripe_index) * ctx.stripe_size_bytes;
+        let stripe_end = stripe_base.saturating_add(ctx.stripe_size_bytes);
+        let abs = stripe_base.saturating_add(offset);
+        let max_count = stripe_end.saturating_sub(abs);
+        (abs, u64::from(count).min(max_count))
+    };
 
     let req = ReadRequest {
         tenant_id: fh.tenant_id,

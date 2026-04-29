@@ -638,6 +638,14 @@ impl MdsLayoutManager {
             .clone()
     }
 
+    /// Configured `stripe_size_bytes` — used by the LAYOUTGET
+    /// encoder as `ffl_stripe_unit` to drive the kernel's
+    /// mirror-index load-balancing (RFC 8435 §13.2).
+    #[must_use]
+    pub fn stripe_size_bytes(&self) -> u64 {
+        self.config.stripe_size_bytes.max(1)
+    }
+
     /// Rotate `K_layout`. After this returns, every fh4 minted under
     /// the previous key fails MAC validation, so the DS rejects them
     /// with `NFS4ERR_BADHANDLE`. Records a `KeyRotation` recall in the
@@ -739,39 +747,49 @@ impl MdsLayoutManager {
         let raw_end = offset.saturating_add(bounded_length);
         let end = raw_end.max(offset.saturating_add(stripe_size)); // ≥ 1 stripe
 
-        let mut stripes = Vec::new();
-        let mut pos = offset;
+        // Phase 15c.9: layout shape = ONE segment with N mirrors
+        // (one per cluster node), not N segments × 1 mirror as
+        // pre-15c.9. Linux's flex-files driver picks a mirror per
+        // byte via `mirror_index = (offset / stripe_unit) % num_mirrors`
+        // (RFC 8435 §13.2). With Replication-3 every node holds
+        // every byte, so the mirror_index is purely load-balancing
+        // — each mirror's DS reads the requested bytes from its
+        // local store.
+        //
+        // The `stripes` field is reused as "mirrors" — one entry
+        // per cluster node. All entries share the same segment
+        // (offset, length) since they're peers within one ff_layout4.
+        // Each carries its own DS address + deviceid; the FH is
+        // whole-segment (`stripe_index = 0`), so the DS reads at
+        // `abs_offset = 0 + kernel_offset` (i.e., directly the
+        // composition byte the kernel asked for).
+        let segment_length = end.saturating_sub(offset);
         let expiry_ms = now_ms.saturating_add(self.config.layout_ttl_ms);
-
         let key = self.current_mac_key();
-        while pos < end && stripes.len() < self.config.max_stripes_per_layout {
-            let seg_len = stripe_size.min(end.saturating_sub(pos));
-            let stripe_index_u64 = pos / stripe_size;
-            let node_idx = usize::try_from(stripe_index_u64).unwrap_or(usize::MAX) % num_nodes;
-            let stripe_index = u32::try_from(stripe_index_u64).unwrap_or(u32::MAX);
+        let mut stripes = Vec::with_capacity(num_nodes);
+        for node_addr in &nodes {
             let fh = PnfsFileHandle::issue(
                 &key,
                 tenant_id,
                 namespace_id,
                 composition_id,
-                stripe_index,
+                0, // stripe_index = 0 → whole-segment FH
                 expiry_ms,
             );
             // device_id derived deterministically from the DS address —
             // stable across calls so GETDEVICEINFO can resolve it.
             let mut device_id = [0u8; 16];
-            let bytes = nodes[node_idx].as_bytes();
+            let bytes = node_addr.as_bytes();
             let copy_len = bytes.len().min(16);
             device_id[..copy_len].copy_from_slice(&bytes[..copy_len]);
             stripes.push(FlexFileStripe {
-                offset: pos,
-                length: seg_len,
+                offset,
+                length: segment_length,
                 iomode,
                 fh,
-                ds_addr: nodes[node_idx].clone(),
+                ds_addr: node_addr.clone(),
                 device_id,
             });
-            pos = pos.saturating_add(seg_len);
         }
 
         // Stateid carries (composition_id_low8 || issued_at_ms_be8).
@@ -1066,13 +1084,21 @@ mod mds_layout_tests {
             LayoutIoMode::Read,
             1000,
         );
-        assert_eq!(layout.stripes.len(), 4);
-        let total: u64 = layout.stripes.iter().map(|s| s.length).sum();
-        assert_eq!(total, 4 * 1_048_576);
-        // Contiguous coverage.
-        for w in layout.stripes.windows(2) {
-            assert_eq!(w[0].offset + w[0].length, w[1].offset);
-        }
+        // Phase 15c.9: layout shape is one segment + N mirrors.
+        // `stripes` is reused as the mirror array (one entry per
+        // cluster node), all peers within ONE ff_layout4 segment.
+        // So `len() == num_nodes`, every entry shares the same
+        // segment offset, and the segment's length covers the
+        // whole requested range.
+        assert_eq!(layout.stripes.len(), 3, "one mirror per cluster node");
+        assert!(
+            layout.stripes.iter().all(|m| m.offset == 0),
+            "all mirrors share the segment offset"
+        );
+        assert!(
+            layout.stripes.iter().all(|m| m.length == 4 * 1_048_576),
+            "all mirrors share the segment length (covers full request)"
+        );
     }
 
     #[test]
@@ -1094,8 +1120,13 @@ mod mds_layout_tests {
         assert_eq!(addrs, vec!["n1:2052", "n2:2052", "n3:2052"]);
     }
 
+    /// Phase 15c.9: every mirror in the layout carries the same
+    /// whole-segment FH (`stripe_index = 0`) — there's no
+    /// per-stripe addressing anymore. The DS reads at the
+    /// kernel's absolute composition offset directly. Each FH
+    /// MUST still validate against the live MAC key.
     #[test]
-    fn each_stripe_carries_a_unique_fh4() {
+    fn every_mirror_carries_a_whole_segment_fh4() {
         let mgr = MdsLayoutManager::new(
             fixed_key(),
             cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
@@ -1109,15 +1140,12 @@ mod mds_layout_tests {
             LayoutIoMode::Read,
             1000,
         );
-        let s0_idx = layout.stripes[0].fh.stripe_index;
-        let s1_idx = layout.stripes[1].fh.stripe_index;
-        let s2_idx = layout.stripes[2].fh.stripe_index;
-        assert_eq!(s0_idx, 0);
-        assert_eq!(s1_idx, 1);
-        assert_eq!(s2_idx, 2);
-        // fh4 round-trip + mac validate against the same key.
-        for stripe in &layout.stripes {
-            stripe
+        for mirror in &layout.stripes {
+            assert_eq!(
+                mirror.fh.stripe_index, 0,
+                "Phase 15c.9 mirrors carry whole-segment FHs",
+            );
+            mirror
                 .fh
                 .validate(&fixed_key(), 1000)
                 .expect("fh validates with same key");
