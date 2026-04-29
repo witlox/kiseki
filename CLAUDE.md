@@ -1,13 +1,22 @@
 # Kiseki
 
-Distributed storage system for HPC/AI workloads. 19 production Rust
-crates (+ 1 BDD-test crate), 38 ADRs, 275 @integration BDD scenarios:
-274 passing on Linux, 1 deferred to tests/e2e/test_pnfs.py
-(real Linux pNFS client mount).
+Distributed storage system for HPC/AI workloads. 20 production Rust
+crates (+ 1 BDD-test crate), 39 ADRs, 140 invariants, 285
+@integration BDD scenarios: 274 passing + 10 skipped (documentation-
+grade, see `crates/kiseki-acceptance/tests/acceptance.rs`) + 1
+filtered as `@e2e-deferred` (real Linux pNFS client mount, witnessed
+by `tests/e2e/test_pnfs.py`).
+
+Phase 15 (pNFS) complete end-to-end — sustained Linux 6.x flex-files
+reads work against the 3-node docker compose. Layout encoding shape
+revised in 15c.9 (one segment + N mirrors, see ADR-039) and validated
+on the wire via tcpdump. Phase 16 (cross-node chunk replication)
+also complete; cluster fabric routes correctly from gateway through
+3-node fan-out at any practical chunk size.
 
 ## Language
 
-- Core: Rust (19 production crates + kiseki-acceptance test crate)
+- Core: Rust (20 production crates + kiseki-acceptance test crate)
 - Boundary: gRPC / protobuf (4 service definitions)
 - Client bindings: Rust native + C FFI, Python (PyO3), C++ wrapper
 - Crypto: FIPS 140-2/3 validated (aws-lc-rs, AES-256-GCM, HKDF-SHA256)
@@ -20,7 +29,7 @@ Diamond workflow via `.claude/CLAUDE.md`. Role definitions in `.claude/roles/`.
 
 1. `specs/ubiquitous-language.md` — domain terms (read first, always)
 2. `specs/domain-model.md` — 8 bounded contexts and relationships
-3. `specs/invariants.md` — 56 invariants (the rules)
+3. `specs/invariants.md` — 140 invariants (the rules)
 4. `specs/architecture/module-graph.md` — crate/package structure
 5. `specs/architecture/api-contracts.md` — per-context interfaces
 6. `specs/architecture/enforcement-map.md` — invariant → code location

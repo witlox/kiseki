@@ -442,6 +442,66 @@ recall send-out under non-lagging subscriber). Perf gate ≥ 1.5×
 passes on the GCP cluster. Subscriber-lag-induced cache flush
 verified by injection test.
 
+### Phase 15c sub-phase close-out (15c.5 → 15c.10)
+
+After 15c.4 wired `MdsLayoutManager` into `NfsContext`, an
+end-to-end Linux pNFS client mount surfaced a chain of latent
+bugs across the LAYOUTGET → GETDEVICEINFO → DS-direct READ path.
+Fixed in eight sub-phases between 2026-04-28 and 2026-04-29:
+
+- **15c.5 step 1** (`1de407a`) — LAYOUTGET stripe-count cap
+  (`max_stripes_per_layout`, default 64). Without it, the kernel's
+  `loga_length = u64::MAX` "rest of file" sentinel produced
+  `u64::MAX / stripe_size ≈ 281e12` stripes and OOM-killed the
+  server.
+- **15c.5 step 2** (`16aa0a8`) — `FATTR4_FS_LAYOUT_TYPES`
+  (bit 62) added to `SUPPORTED_ATTRS`. Linux clients gate
+  LAYOUTGET on this bit; without it the kernel never engaged
+  pNFS dispatch and silently degraded to plain NFSv4.1 reads.
+- **Phase 16 fabric routing** (`605134e`) — fabric peers now
+  connect to `cfg.data_addr.port()` (where `ClusterChunkService`
+  binds, default 9100) instead of `cfg.raft_peers` port (9300).
+  Pre-fix, every chunk fan-out hit the wrong gRPC server and
+  returned `quorum lost: only 1/2 replicas acked`.
+- **15c.5 step 3** (`d95b3f3`) — three pNFS dispatch fixes
+  bundled: (a) `op_getdeviceinfo` field order swapped to RFC 8435
+  §5.1.1 `ffda_netaddrs` first then `ffda_versions`; (b)
+  universal-address `host_port_to_resolved_uaddr` does DNS lookup
+  so the kernel's RPC parser sees an IP literal; (c) DS server
+  advertises `EXCHGID4_FLAG_USE_PNFS_DS` in `EXCHANGE_ID`. Wire-
+  level pNFS DS-direct reads now work end-to-end.
+- **15c.6** (`972d40f`) — FUSE+remote-http build fix (sandbox
+  path used a stale `Box<ChunkStore>` after Phase 16's
+  `Arc<dyn AsyncChunkOps>` change). `test_fuse_remote_http_cross_protocol_roundtrip`
+  now passes.
+- **15c.7** (`758aae5`) — `KisekiFuse::unlink` bridges to
+  `gateway.delete()` so the cluster-side composition is removed,
+  not just the local inode entry.
+- **15c.8** (`472a846`, `1915203`) — fabric size cap raised
+  from tonic's 4 MiB default → 64 MiB → 256 MiB to fit the
+  envelope around large S3 PUTs (model checkpoints, dataset
+  shards). E2E witness:
+  `test_s3_large_put_exceeds_64mib_fabric_cap` exercises a
+  128 MiB PUT+GET round-trip.
+- **15c.9** (`379a524`) — flex-files layout encoding revised:
+  one segment + N mirrors instead of N segments × 1 mirror. See
+  ADR-039 for the architectural decision; tcpdump witness in
+  `specs/findings/phase-15c8-nfs41-perf-investigation.md`.
+- **15c.10** (`471a3a5`) — perf-investigation findings (the
+  reported 0.3 MB/s NFSv4.1 throughput is a fio `--time_based`
+  + page-cache artifact; wire-level throughput is ~400 MB/s once
+  the DS session is established). Three optimization attempts
+  (`return_on_close=false`, single-mirror pinning,
+  `max_stripes_per_layout=1`) all broke pNFS dispatch and were
+  reverted.
+
+**Sub-phase exit witness**: full e2e suite goes 31 passed, 0
+failed, 3 expected skips against the docker-compose 3-node
+cluster. The pNFS dispatch breakthrough — `pnfs=LAYOUT_FLEX_FILES`
+in `/proc/self/mountstats` caps + DS-direct READs visible on
+port 2052 — is the witness that ADR-038 + ADR-039 are
+implemented end-to-end.
+
 ---
 
 ## Phase 16: Cross-node chunk replication (ADR-005, ADR-026)
