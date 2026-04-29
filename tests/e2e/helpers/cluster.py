@@ -319,6 +319,27 @@ def stop_cluster(info: ClusterInfo) -> None:
     multi-node test fails with `127.0.0.1:9100: Connection refused`.
     """
     root = _workspace_root()
+    # Dump container logs *before* down -v if KISEKI_E2E_LOG_DUMP_DIR is set.
+    # CI sets this so the workflow's upload-artifact step has something to
+    # capture when a multi-node test fails — otherwise `docker ps -a` after
+    # teardown is empty and the failure has no server-side context.
+    log_dir = os.environ.get("KISEKI_E2E_LOG_DUMP_DIR")
+    if log_dir:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            stem = os.path.splitext(os.path.basename(info.compose_file))[0]
+            log_path = os.path.join(log_dir, f"{stem}.log")
+            with open(log_path, "wb") as fh:
+                subprocess.run(
+                    ["docker", "compose", "-f", info.compose_file,
+                     "logs", "--no-color", "--tail=2000"],
+                    cwd=root,
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+        except OSError:
+            pass  # log dumping is best-effort
     subprocess.run(
         ["docker", "compose", "-f", info.compose_file, "down", "-v"],
         cwd=root,

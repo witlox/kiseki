@@ -310,7 +310,14 @@ jobs:
 
       - name: Run multi-node e2e tests
         working-directory: tests/e2e
+        env:
+          # helpers/cluster.py:stop_cluster dumps `docker compose logs` here
+          # *before* `down -v` runs. Without that the post-pytest "Collect
+          # logs" step sees an empty `docker ps -a` because the per-module
+          # fixture has already torn down the cluster.
+          KISEKI_E2E_LOG_DUMP_DIR: /tmp/kiseki-e2e-logs
         run: |
+          mkdir -p /tmp/kiseki-e2e-logs
           pytest -ra --tb=short \
             test_multi_node.py \
             test_multi_node_resilience.py \
@@ -318,17 +325,32 @@ jobs:
 
       - name: Collect logs on failure
         if: failure()
-        # Print logs to stdout so they show up in the workflow output
-        # (the previous version piped both compose calls to /dev/null
-        # for stderr suppression and the result was an empty step).
+        # Two sources of logs: the in-test dumps from KISEKI_E2E_LOG_DUMP_DIR
+        # (captured *before* fixture teardown), and the post-hoc compose logs
+        # if anything is still alive at this point.
         run: |
           set +e
           echo "=== docker ps -a ==="
           docker ps -a
-          echo "=== single-node compose logs ==="
+          echo "=== in-test log dumps ==="
+          ls -la /tmp/kiseki-e2e-logs/ 2>/dev/null || echo "(no dumps written)"
+          for f in /tmp/kiseki-e2e-logs/*.log; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            cat "$f"
+          done
+          echo "=== single-node compose logs (post-hoc) ==="
           docker compose logs --no-color || true
-          echo "=== 3-node compose logs ==="
+          echo "=== 3-node compose logs (post-hoc) ==="
           docker compose -f docker-compose.3node.yml logs --no-color || true
+
+      - name: Upload e2e log dumps
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cluster-logs
+          path: /tmp/kiseki-e2e-logs/
+          if-no-files-found: warn
 
       - name: Teardown
         if: always()
