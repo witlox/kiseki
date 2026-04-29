@@ -75,9 +75,28 @@ pub struct PnfsSettings {
     /// Phase 15c.5 step 1: cap on stripes emitted per LAYOUTGET.
     /// Linux kernel sends `loga_length = u64::MAX` (RFC 5661
     /// §18.43.1 "rest of file" sentinel); without a cap the server
-    /// OOMs trying to emit ~281e12 stripes. Default 64 (= 64 MiB
-    /// extent at 1 MiB stripes), roughly 4× small-rsize Linux NFS
-    /// readahead.
+    /// OOMs trying to emit ~281e12 stripes.
+    ///
+    /// Phase 15c.5 step 1: cap on stripes emitted per LAYOUTGET.
+    /// Default 64 (= 64 MiB extent at 1 MiB stripes), roughly 4×
+    /// small-rsize Linux NFS readahead. Memory bounded at I-PN8
+    /// 100k-entry cache cap × 64 stripes × ~200 bytes/stripe ≈
+    /// 1.3 GiB worst case.
+    ///
+    /// Phase 15c.8 finding: sustained 8+ MiB sequential reads
+    /// from a Linux 6.x kernel pNFS client hang in a
+    /// LAYOUTGET/LAYOUTRETURN loop regardless of this cap (tried
+    /// 1 and 64). The root cause is that our layout encoding
+    /// emits one `layout4` segment per stripe with its own
+    /// `ff_mirror4` carrying a single DS — Linux's flex-files
+    /// driver doesn't dispatch reads efficiently across multiple
+    /// per-stripe segments. The correct RFC 8435 encoding for
+    /// striping uses ONE segment with multiple `ff_mirrors<>`
+    /// driven by `stripe_unit` modulo `num_mirrors`, which would
+    /// require a per-mirror DS that holds every Nth stripe — a
+    /// substantial DS-side change. Tracked as Phase 15c.9 follow-
+    /// up; for now `test_pnfs_plaintext_fallback` (1 MiB) is
+    /// the witness that pNFS dispatch works.
     pub max_stripes_per_layout: usize,
 }
 
