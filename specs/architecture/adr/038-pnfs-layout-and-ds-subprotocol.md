@@ -9,6 +9,12 @@
 
 - rev 1 (2026-04-27): initial proposal. Returned by adversary with 4 blocking findings.
 - rev 2 (2026-04-27): NFS-over-TLS as default + audited plaintext fallback for older kernels; explicit fh4 MAC field encoding; introduced TopologyEvent bus (§D10) and Phase 15d; layout cache eviction explicit (§D11) with new I-PN8; reconciled `expiry_ms` throughout.
+- **§D1 layout encoding superseded by ADR-039 (2026-04-29)**:
+  Phase 15c.5 → 15c.10 found that the "per-stripe `nfsv4_1_file_layout_ds_addr4`-style
+  mirror list" interpretation rendered as N segments × 1 mirror
+  doesn't work with Linux 6.x flex-files driver. The corrected
+  encoding is one segment × N mirrors per RFC 8435 §13.2 — see
+  ADR-039 for the full revision.
 
 ## Problem
 
