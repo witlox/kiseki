@@ -41,6 +41,16 @@ pub enum GatewayError {
     /// the FUSE/POSIX boundary (kiseki-client::fuse_fs).
     #[error("namespace is read-only")]
     ReadOnlyNamespace,
+
+    /// This node is currently unable to resolve the request and the
+    /// caller should retry (potentially against a different node).
+    /// ADR-040 §D7 + I-2: emitted by the read path when a composition
+    /// lookup misses **and** the local persistent hydrator has entered
+    /// halt mode (compaction outran us). The S3 gateway maps this to
+    /// HTTP 503 with a `Retry-After` header so load balancers route
+    /// around the halted node.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl From<GatewayError> for KisekiError {

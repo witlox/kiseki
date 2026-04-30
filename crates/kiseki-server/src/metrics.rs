@@ -260,6 +260,9 @@ pub async fn run_metrics_server(
     peer_addrs: Vec<String>,
     log_store: Option<std::sync::Arc<dyn kiseki_log::LogOps + Send + Sync>>,
     node_info: crate::web::api::NodeInfo,
+    compositions: Option<
+        std::sync::Arc<tokio::sync::Mutex<kiseki_composition::composition::CompositionStore>>,
+    >,
 ) -> std::io::Result<()> {
     use crate::web;
 
@@ -278,6 +281,7 @@ pub async fn run_metrics_server(
         diagnostics: std::sync::Arc::clone(&diagnostics),
         log_store,
         node_info,
+        compositions,
     };
 
     // Build combined router: metrics + health + admin UI.

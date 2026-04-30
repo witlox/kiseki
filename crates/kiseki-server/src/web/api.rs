@@ -25,6 +25,11 @@ pub struct UiState {
     pub log_store: Option<Arc<dyn kiseki_log::LogOps + Send + Sync>>,
     /// This node's identity.
     pub node_info: NodeInfo,
+    /// Shared composition store handle (ADR-040 / I-2): the per-shard
+    /// leader endpoint surfaces the hydrator's halt flag from here so
+    /// load balancers can route around a halted node.
+    pub compositions:
+        Option<Arc<tokio::sync::Mutex<kiseki_composition::composition::CompositionStore>>>,
 }
 
 /// Static node identity exposed via `/cluster/info`.
@@ -395,6 +400,15 @@ async fn shard_leader(
             axum::Json(serde_json::json!({"error": "log store not initialized"})),
         );
     };
+    // ADR-040 §D6.3 / Phase 17 I-2: surface the composition hydrator's
+    // halt flag so load balancers and clients can route around a node
+    // whose composition state can no longer catch up to the cluster.
+    let composition_halted = if let Some(ref comps) = state.compositions {
+        comps.lock().await.storage().halted().unwrap_or(false)
+    } else {
+        false
+    };
+
     match log.shard_health(shard_id).await {
         Ok(info) => (
             axum::http::StatusCode::OK,
@@ -404,6 +418,7 @@ async fn shard_leader(
                 "raft_members": info.raft_members.iter().map(|n| n.0).collect::<Vec<_>>(),
                 "last_committed_seq": info.tip.0,
                 "state": format!("{:?}", info.state),
+                "composition_hydrator_halted": composition_halted,
             })),
         ),
         Err(e) => (

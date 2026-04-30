@@ -489,9 +489,37 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         }
     }
 
-    // Composition: wired to log for delta emission.
-    let mut comp_store = kiseki_composition::composition::CompositionStore::new()
-        .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
+    // Composition: wired to log for delta emission. ADR-040: when
+    // KISEKI_DATA_DIR is set we back the comp_id → Composition map
+    // with a redb file at `<data_dir>/metadata/compositions.redb`,
+    // so hydrated state survives restart and a node that joins late
+    // resumes from durable `last_applied_seq`. Single-node /
+    // no-data-dir deployments keep the in-memory backend (MemoryStorage)
+    // — same behavior as pre-ADR-040.
+    let comp_storage: Box<dyn kiseki_composition::persistent::CompositionStorage> =
+        if let Some(ref dir) = cfg.data_dir {
+            let meta_dir = dir.join("metadata");
+            std::fs::create_dir_all(&meta_dir).map_err(|e| {
+                format!(
+                    "create persistent composition dir {}: {e}",
+                    meta_dir.display()
+                )
+            })?;
+            let path = meta_dir.join("compositions.redb");
+            let store = kiseki_composition::persistent::PersistentRedbStorage::open(&path)
+                .map_err(|e| format!("open persistent composition store: {e}"))?;
+            tracing::info!(
+                path = %path.display(),
+                "composition store: persistent (redb-backed, ADR-040)",
+            );
+            Box::new(store)
+        } else {
+            tracing::info!("composition store: in-memory (no KISEKI_DATA_DIR)");
+            Box::new(kiseki_composition::persistent::MemoryStorage::new())
+        };
+    let mut comp_store =
+        kiseki_composition::composition::CompositionStore::with_storage(comp_storage)
+            .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
 
     // View: shared between gateway (staleness check) and stream processor.
     let view_store = Arc::new(std::sync::Mutex::new(kiseki_view::view::ViewStore::new()));
@@ -618,6 +646,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         raft_peers: cfg.raft_peers.clone(),
     };
     let metrics_log_store = Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>;
+    let metrics_compositions = Some(gw.compositions_handle());
     tokio::spawn(async move {
         if let Err(e) = crate::metrics::run_metrics_server(
             metrics_addr,
@@ -625,6 +654,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             peer_metrics_addrs,
             Some(metrics_log_store),
             node_info,
+            metrics_compositions,
         )
         .await
         {

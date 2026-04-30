@@ -319,6 +319,19 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
             }
             response
         }
+        Err(crate::error::GatewayError::ServiceUnavailable(msg)) => {
+            // ADR-040 §D6.3 + I-2: hydrator halt mode → 503 with
+            // Retry-After. Load balancers route around this node;
+            // the next request lands on a sibling whose hydrator is
+            // still healthy.
+            let mut resp =
+                s3_error_response(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", &msg);
+            if let Ok(v) = axum::http::HeaderValue::try_from("5") {
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, v);
+            }
+            resp
+        }
         Err(e) => {
             if e.to_string().contains("not found") {
                 s3_error_response(

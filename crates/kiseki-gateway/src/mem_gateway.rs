@@ -426,19 +426,40 @@ impl GatewayOps for InMemoryGateway {
     // obscure the read-path data flow more than it would help.
     #[allow(clippy::too_many_lines)]
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        // Phase 16f: on a follower, the hydrator may not have applied
-        // the create-delta yet for a composition the user just PUT on
-        // the leader. Retry briefly so a tight PUT-then-GET pattern
-        // doesn't 404 spuriously. Bound the retry to ~10× the
-        // hydrator's poll interval (100 ms in the runtime spawn) so
-        // genuine NotFound surfaces fast.
-        const COMP_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        // Phase 16f / ADR-040 §D7: on a follower, the hydrator may not
+        // have applied the create-delta yet for a composition the
+        // client just PUT on the leader. Retry briefly so a tight
+        // PUT-then-GET pattern doesn't 404 spuriously.
+        //
+        // Budget is configurable via `KISEKI_GATEWAY_READ_RETRY_BUDGET_MS`
+        // (default 1000). Operators on slow disks or under load can
+        // tune up; the default fits well-provisioned NVMe.
+        //
+        // ADR-040 §D6.3 + I-2: if the persistent hydrator is in halt
+        // mode (compaction outran it), missing-composition lookups
+        // map to `ServiceUnavailable` so the S3 gateway returns 503
+        // and load balancers route around. Existing-composition
+        // lookups (cache or redb hit) still serve normally.
         const COMP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
-        let deadline = std::time::Instant::now() + COMP_RETRY_BUDGET;
+        let budget = std::env::var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1000);
+        let comp_retry_budget = std::time::Duration::from_millis(budget);
+        let deadline = std::time::Instant::now() + comp_retry_budget;
         let compositions = loop {
             let guard = self.compositions.lock().await;
             if guard.get(req.composition_id).is_ok() {
                 break guard;
+            }
+            // Halt-mode short-circuit: if the hydrator can't catch up,
+            // there's no point waiting out the budget. Surface a
+            // retry-elsewhere signal immediately.
+            if guard.storage().halted().unwrap_or(false) {
+                return Err(GatewayError::ServiceUnavailable(format!(
+                    "composition hydrator halted; retry against another node (composition_id={})",
+                    req.composition_id.0
+                )));
             }
             drop(guard);
             if std::time::Instant::now() >= deadline {
