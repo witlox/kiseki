@@ -90,7 +90,7 @@ libc = "0.2"
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
 # Persistent metadata stores (ADR-040): redb is reused from kiseki-chunk;
 # postcard provides deterministic encoding; lru is the hot-tail cache.
-redb = "2"
+redb = "4"
 postcard = { version = "1", features = ["alloc", "use-std"] }
 lru = "0.16"
 
