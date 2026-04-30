@@ -1,4 +1,4 @@
-//! Composition hydrator (Phase 16e).
+//! Composition hydrator (Phase 16f).
 //!
 //! Followers reconstruct their `CompositionStore` from the Raft-replicated
 //! delta log. The hydrator polls the log for new `Create` deltas, decodes
@@ -109,7 +109,7 @@ impl CompositionHydrator {
             }
             // Advance regardless of operation so we don't re-scan the
             // same prefix forever. Update / Delete are out of scope for
-            // Phase 16e; a future iteration adds them symmetrically.
+            // Phase 16f; Phase 17 item 1 adds them symmetrically.
             self.last_applied = delta.header.sequence;
         }
         if applied > 0 {

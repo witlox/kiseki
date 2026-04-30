@@ -616,10 +616,57 @@ single-node→cluster transition).
   - 4 RED→GREEN tests across the steps; full audit at
     `specs/findings/phase-16e-adversary-audit.md`.
 
-**Phase 16 status: complete.** All 13 findings from 16a/b/c/d
-closed. Two acknowledged out-of-scope items (pNFS DS distinct-
-fragment parallelism — pNFS team; runtime-wide unified shutdown
-— runtime-wide concern).
+- **16f — Cross-node correctness for the gateway path**. Caught by
+  `tests/e2e/test_cross_node_replication.py` (added 2026-04-28),
+  which had been failing 4-of-4 on every release attempt. Two
+  stacked bugs:
+  - Inline writes (≤4 KiB) bypassed `ClusteredChunkStore` entirely
+    and landed in a per-node `small_store` redb keyed by `chunk_id`.
+    The Raft-apply path's inline-data offload uses a different key
+    space (`hashed_key XOR seq`), so unifying the two would require
+    plumbing on three layers. Fix: in multi-node clusters, disable
+    the inline write path (`with_inline_threshold` skipped when
+    `fabric_peers > 0`) so every write goes through the chunk /
+    fabric path. Single-node clusters keep the optimization. (See
+    commit `43bb6a9`.)
+  - Even with chunks reaching every node, `CompositionStore` was a
+    per-node `HashMap<CompositionId, Composition>` with no
+    cross-node visibility, so a follower's S3 GET 404'd at the
+    composition layer before consulting the chunk store. Fix:
+    `CompositionHydrator` (sibling of the view stream processor)
+    polls the Raft delta log every 100 ms and installs leader-
+    emitted compositions into the local store via `create_at`.
+    Delta payload extended from 16 bytes (just `comp_id`) to
+    40 bytes (`comp_id` + `namespace_id` + `bytes_written` LE)
+    so followers have everything they need to reconstruct the
+    record. Idempotent and crash-safe via `last_applied`. The
+    gateway read path acquires a 1 s bounded retry on
+    `CompositionNotFound` so a tight PUT-then-GET pattern
+    immediately after a leader-side ack absorbs the ~100 ms
+    hydrator poll lag. (See commit `d6cfe94`.)
+  - Side fix: bootstrap "default" namespace + view installed on
+    every node (deterministic UUIDs), not gated on
+    `cfg.bootstrap`. Required for the hydrator's `create_at`
+    namespace lookup to succeed on followers.
+  - Test result: 4-of-4 cross-node scenarios green locally
+    against `docker-compose.3node.yml`. Three new unit tests in
+    `kiseki-composition::hydrator` cover happy path, idempotency,
+    and legacy-payload-skip.
+
+**Phase 16 status: complete for replication and EC.** All findings
+from 16a/b/c/d/e closed. Two acknowledged out-of-scope items
+(pNFS DS distinct-fragment parallelism — pNFS team; runtime-wide
+unified shutdown — runtime-wide concern).
+
+**Phase 17 — Cross-node follow-ups** (planned). 16f closes
+correctness; the architectural debt 16f deliberately deferred is
+captured in `specs/implementation/phase-17-cross-node-followups.md`:
+update/delete delta hydration (implementer), persistent
+`CompositionStore` + `ViewStore` via redb (architect → ADR-040 →
+implementer), Raft-snapshot integration for the persistent stores
+(architect amendment + implementer), and a per-shard leader endpoint
+(implementer). Items 1 + 4 are independent and small. Items 2 + 3
+share an ADR.
 
 **Implementation plan**: see
 `specs/implementation/phase-16-cross-node-chunks.md` for the

@@ -14,7 +14,7 @@ use crate::namespace::Namespace;
 /// stored inline in the delta payload rather than as a separate chunk.
 pub const INLINE_DATA_THRESHOLD: u64 = 4096;
 
-/// Wire size of the composition-create delta payload (Phase 16e).
+/// Wire size of the composition-create delta payload (Phase 16f).
 ///
 /// Layout, little-endian where applicable:
 ///   `[0..16)`  `composition_id` UUID
@@ -248,7 +248,7 @@ impl CompositionStore {
         Ok(())
     }
 
-    /// Install a composition with a leader-assigned id (Phase 16e
+    /// Install a composition with a leader-assigned id (Phase 16f
     /// follower hydration).
     ///
     /// Mirrors `create()` but uses the supplied `comp_id` instead of

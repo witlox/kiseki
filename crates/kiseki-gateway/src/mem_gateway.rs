@@ -25,7 +25,7 @@ use crate::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteRespo
 /// Uses `tokio::sync::Mutex` for interior mutability so `GatewayOps` methods can
 /// take `&self`, enabling concurrent access.
 pub struct InMemoryGateway {
-    /// Shared with the Phase 16e composition hydrator (`compositions_handle`)
+    /// Shared with the Phase 16f composition hydrator (`compositions_handle`)
     /// so leader-emitted Create deltas land in the same store the gateway
     /// reads from on followers.
     compositions: Arc<Mutex<CompositionStore>>,
@@ -350,7 +350,7 @@ impl InMemoryGateway {
 
     /// Shared handle to the composition store.
     ///
-    /// The Phase 16e composition hydrator (a sibling of the view stream
+    /// The Phase 16f composition hydrator (a sibling of the view stream
     /// processor) holds a clone of this `Arc` so it can install
     /// leader-emitted compositions into the same store the gateway reads
     /// from. The lock is `tokio::sync::Mutex` because the gateway holds
@@ -425,7 +425,7 @@ impl GatewayOps for InMemoryGateway {
     // obscure the read-path data flow more than it would help.
     #[allow(clippy::too_many_lines)]
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        // Phase 16e: on a follower, the hydrator may not have applied
+        // Phase 16f: on a follower, the hydrator may not have applied
         // the create-delta yet for a composition the user just PUT on
         // the leader. Retry briefly so a tight PUT-then-GET pattern
         // doesn't 404 spuriously. Bound the retry to ~10× the
@@ -717,7 +717,7 @@ impl GatewayOps for InMemoryGateway {
                 vec![]
             };
 
-            // Phase 16e: payload encodes (comp_id, namespace_id, size) so
+            // Phase 16f: payload encodes (comp_id, namespace_id, size) so
             // followers can hydrate their CompositionStore from the log.
             // Older clusters that still emit a bare 16-byte UUID payload
             // are handled defensively by the hydrator (skip-and-advance).

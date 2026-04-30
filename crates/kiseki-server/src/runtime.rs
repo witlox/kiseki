@@ -500,7 +500,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // deterministic (UUID-from-u128(1) for shard/view, UUIDv5 of
     // "default" for the namespace), and the records are pure
     // convention — a multi-node cluster's followers need them
-    // installed locally so the Phase 16e composition hydrator can
+    // installed locally so the Phase 16f composition hydrator can
     // resolve their `namespace_id` field. Creating them on every node
     // is idempotent. The Raft-specific seeding (initialize the group
     // vs. join as a follower) is the only thing gated on
@@ -838,7 +838,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         }
     });
 
-    // Phase 16e: composition hydrator — followers reconstruct their
+    // Phase 16f: composition hydrator — followers reconstruct their
     // CompositionStore from the Raft-replicated delta log so cross-node
     // GETs resolve. Sibling of the view stream processor above; both
     // consume the same delta stream with non-overlapping responsibilities
@@ -855,7 +855,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             }
         });
         tracing::info!(
-            "composition hydrator spawned (Phase 16e — followers consume create-deltas)",
+            "composition hydrator spawned (Phase 16f — followers consume create-deltas)",
         );
     }
 
