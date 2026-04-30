@@ -496,6 +496,9 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // resumes from durable `last_applied_seq`. Single-node /
     // no-data-dir deployments keep the in-memory backend (MemoryStorage)
     // — same behavior as pre-ADR-040.
+    // Captures the redb path so the periodic gauge refresher can stat
+    // its size; None when the composition store is in-memory.
+    let mut comp_redb_path: Option<std::path::PathBuf> = None;
     let comp_storage: Box<dyn kiseki_composition::persistent::CompositionStorage> =
         if let Some(ref dir) = cfg.data_dir {
             let meta_dir = dir.join("metadata");
@@ -507,11 +510,13 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             })?;
             let path = meta_dir.join("compositions.redb");
             let store = kiseki_composition::persistent::PersistentRedbStorage::open(&path)
-                .map_err(|e| format!("open persistent composition store: {e}"))?;
+                .map_err(|e| format!("open persistent composition store: {e}"))?
+                .with_metrics(Arc::clone(&metrics.composition));
             tracing::info!(
                 path = %path.display(),
                 "composition store: persistent (redb-backed, ADR-040)",
             );
+            comp_redb_path = Some(path);
             Box::new(store)
         } else {
             tracing::info!("composition store: in-memory (no KISEKI_DATA_DIR)");
@@ -653,6 +658,11 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     };
     let metrics_log_store = Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>;
     let metrics_compositions = Some(gw.compositions_handle());
+    // Pre-clone the §D10 composition metrics handle: the hydrator + the
+    // periodic redb-size refresher (spawned later) both need it after
+    // `metrics` is moved into the metrics-server task.
+    let composition_metrics_for_hydrator = Arc::clone(&metrics.composition);
+    let composition_metrics_for_size_refresh = Arc::clone(&metrics.composition);
     tokio::spawn(async move {
         if let Err(e) = crate::metrics::run_metrics_server(
             metrics_addr,
@@ -883,8 +893,10 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         let hyd_log = Arc::clone(&log_store);
         let hyd_compositions = gw.compositions_handle();
         let hyd_shard = bootstrap_shard;
+        let hyd_metrics = composition_metrics_for_hydrator;
         tokio::spawn(async move {
-            let mut hydrator = kiseki_composition::CompositionHydrator::new(hyd_compositions);
+            let mut hydrator = kiseki_composition::CompositionHydrator::new(hyd_compositions)
+                .with_metrics(hyd_metrics);
             loop {
                 let _applied = hydrator.poll(hyd_log.as_ref(), hyd_shard).await;
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -893,6 +905,30 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         tracing::info!(
             "composition hydrator spawned (Phase 16f — followers consume create-deltas)",
         );
+    }
+
+    // §D10 — periodic stat of `compositions.redb` so the
+    // `kiseki_composition_redb_size_bytes` gauge tracks on-disk growth.
+    // Only spawned when the persistent store is active. Also refreshes
+    // `kiseki_composition_count` from the live store (cheap — single
+    // redb metadata read, no scan).
+    if let Some(path) = comp_redb_path {
+        let size_metrics = composition_metrics_for_size_refresh;
+        let count_compositions = gw.compositions_handle();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    size_metrics
+                        .redb_size_bytes
+                        .set(i64::try_from(meta.len()).unwrap_or(i64::MAX));
+                }
+                let store = count_compositions.lock().await;
+                if let Ok(c) = store.storage().count() {
+                    size_metrics.count.set(i64::try_from(c).unwrap_or(i64::MAX));
+                }
+            }
+        });
     }
 
     // TODO: Wire rotation_monitor::run_rotation_monitor() here.

@@ -108,6 +108,7 @@ fn decode_stuck_state(bytes: &[u8]) -> Result<Option<(SequenceNumber, u32)>, Per
 pub struct PersistentRedbStorage {
     db: Mutex<Database>,
     cache: Mutex<LruCache<CompositionId, Composition>>,
+    metrics: Option<std::sync::Arc<crate::metrics::CompositionMetrics>>,
 }
 
 impl PersistentRedbStorage {
@@ -115,6 +116,19 @@ impl PersistentRedbStorage {
     /// capacity (100,000 entries; tunable via env in a future revision).
     pub fn open(path: &Path) -> Result<Self, PersistentStoreError> {
         Self::open_with_lru_capacity(path, DEFAULT_LRU_CAPACITY)
+    }
+
+    /// Attach the §D10 metrics surface. When set, `get`/`put`/
+    /// `apply_hydration_batch` paths emit hit/miss/evict/commit
+    /// counters and `decode_errors_total{kind}` on failures.
+    /// Tests that don't pass metrics get no-op behavior.
+    #[must_use]
+    pub fn with_metrics(
+        mut self,
+        metrics: std::sync::Arc<crate::metrics::CompositionMetrics>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Open with an explicit LRU capacity (for tests).
@@ -163,7 +177,43 @@ impl PersistentRedbStorage {
         Ok(Self {
             db: Mutex::new(db),
             cache: Mutex::new(cache),
+            metrics: None,
         })
+    }
+
+    fn record_decode_error(&self, e: &PersistentStoreError) {
+        if let Some(ref m) = self.metrics {
+            m.decode_errors_total
+                .with_label_values(&[e.metric_kind()])
+                .inc();
+        }
+    }
+
+    fn record_commit_error(&self) {
+        if let Some(ref m) = self.metrics {
+            m.redb_commit_errors_total.inc();
+        }
+    }
+
+    fn record_eviction(&self, evicted: bool) {
+        if evicted {
+            if let Some(ref m) = self.metrics {
+                m.lru_evicted_total.inc();
+            }
+        }
+    }
+
+    /// Translates `LruCache::push`'s tri-valued return into "was it a
+    /// real capacity eviction?" — `Some((k, _))` with `k != inserted`
+    /// means the LRU pushed out a different key. `Some((k, _))` with
+    /// `k == inserted` is just a same-key replace and isn't an eviction.
+    /// Takes a reference so we don't pay for an unused `Composition`
+    /// clone in the not-evicted hot path.
+    fn is_capacity_eviction(
+        push_result: Option<&(CompositionId, Composition)>,
+        inserted: CompositionId,
+    ) -> bool {
+        matches!(push_result, Some((k, _)) if *k != inserted)
     }
 }
 
@@ -177,7 +227,13 @@ impl CompositionStorage for PersistentRedbStorage {
             .get(&id)
             .cloned()
         {
+            if let Some(ref m) = self.metrics {
+                m.lru_hit_total.inc();
+            }
             return Ok(Some(comp));
+        }
+        if let Some(ref m) = self.metrics {
+            m.lru_miss_total.inc();
         }
         // redb miss path.
         let db = self
@@ -190,13 +246,21 @@ impl CompositionStorage for PersistentRedbStorage {
         let Some(guard) = table.get(key)? else {
             return Ok(None);
         };
-        let comp = decode_composition(guard.value())?;
+        let comp = decode_composition(guard.value()).inspect_err(|e| {
+            self.record_decode_error(e);
+        })?;
         // Populate the LRU under its own mutex (no overlap with the
         // db mutex hold since redb's read txn doesn't need it).
-        self.cache
+        let evicted = self
+            .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .put(id, comp.clone());
+            .push(id, comp.clone());
+        if evicted.is_some() {
+            if let Some(ref m) = self.metrics {
+                m.lru_evicted_total.inc();
+            }
+        }
         Ok(Some(comp))
     }
 
@@ -232,7 +296,9 @@ impl CompositionStorage for PersistentRedbStorage {
 
     fn put(&mut self, comp: Composition) -> Result<(), PersistentStoreError> {
         let id = comp.id;
-        let bytes = encode_composition(&comp)?;
+        let bytes = encode_composition(&comp).inspect_err(|e| {
+            self.record_decode_error(e);
+        })?;
         {
             let db = self
                 .db
@@ -243,14 +309,16 @@ impl CompositionStorage for PersistentRedbStorage {
                 let mut table = txn.open_table(COMPOSITIONS)?;
                 table.insert(id.0.as_bytes().as_slice(), bytes.as_slice())?;
             }
-            txn.commit()?;
+            txn.commit().inspect_err(|_| self.record_commit_error())?;
         }
         // Cache update happens *after* commit so a reader that sees
         // the cache value also sees the durable record (D3).
-        self.cache
+        let push_result = self
+            .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .put(id, comp);
+            .push(id, comp);
+        self.record_eviction(Self::is_capacity_eviction(push_result.as_ref(), id));
         Ok(())
     }
 
@@ -340,7 +408,9 @@ impl CompositionStorage for PersistentRedbStorage {
             {
                 let mut comps = txn.open_table(COMPOSITIONS)?;
                 for comp in &batch.puts {
-                    let bytes = encode_composition(comp)?;
+                    let bytes = encode_composition(comp).inspect_err(|e| {
+                        self.record_decode_error(e);
+                    })?;
                     comps.insert(comp.id.0.as_bytes().as_slice(), bytes.as_slice())?;
                     commit_inserts.push(comp.clone());
                 }
@@ -363,20 +433,32 @@ impl CompositionStorage for PersistentRedbStorage {
                     meta.insert(meta_keys::HALTED, [u8::from(halted)].as_slice())?;
                 }
             }
-            txn.commit()?;
+            txn.commit().inspect_err(|_| self.record_commit_error())?;
         }
 
         // Cache update *after* commit so any reader that observes
         // the cache also observes the durable state (D3).
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for comp in commit_inserts {
-            cache.put(comp.id, comp);
+        let mut evictions: u64 = 0;
+        {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for comp in commit_inserts {
+                let id = comp.id;
+                let push_result = cache.push(id, comp);
+                if Self::is_capacity_eviction(push_result.as_ref(), id) {
+                    evictions += 1;
+                }
+            }
+            for id in commit_invalidations {
+                cache.pop(&id);
+            }
         }
-        for id in commit_invalidations {
-            cache.pop(&id);
+        if evictions > 0 {
+            if let Some(ref m) = self.metrics {
+                m.lru_evicted_total.inc_by(evictions);
+            }
         }
         Ok(())
     }

@@ -47,6 +47,7 @@ use crate::composition::{
     decode_composition_create_payload, decode_composition_delete_payload,
     decode_composition_update_payload, Composition, CompositionStore, INLINE_DATA_THRESHOLD,
 };
+use crate::metrics::{skip_reason, CompositionMetrics};
 use crate::persistent::HydrationBatch;
 
 /// In-progress staging state for a single poll's batch. Lets staging
@@ -122,6 +123,8 @@ pub struct CompositionHydrator {
     /// poll without acquiring the outer Mutex.
     halted_cache: bool,
     transient_retry_threshold: u32,
+    /// §D10 metrics surface. Optional so unit tests get no-op behavior.
+    metrics: Option<Arc<CompositionMetrics>>,
 }
 
 impl CompositionHydrator {
@@ -151,7 +154,29 @@ impl CompositionHydrator {
             last_applied_cache,
             halted_cache,
             transient_retry_threshold: read_transient_retry_threshold(),
+            metrics: None,
         }
+    }
+
+    /// Attach the §D10 metrics surface. Subsequent polls emit
+    /// `apply_duration` / `last_applied_seq{shard}` /
+    /// `skip_total{reason}` / `stalled`. The runtime constructs one
+    /// shared `CompositionMetrics` and clones the Arc into both the
+    /// hydrator and the persistent storage.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<CompositionMetrics>) -> Self {
+        // If we boot already halted, surface the stalled gauge
+        // immediately — the alarm should fire on a halted-at-startup
+        // process before any poll runs.
+        if self.halted_cache {
+            metrics.hydrator_stalled.set(1);
+        }
+        // Same for last_applied: surface the durable seq right away
+        // so dashboards don't show 0 between boot and first apply.
+        // Shard label is unknown at this point (per-shard gauge is set
+        // on first poll), so this is a no-op until poll runs.
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Last applied sequence number (cached; durable copy is in the
@@ -268,6 +293,9 @@ impl CompositionHydrator {
                         seq = delta.header.sequence.0,
                         "composition hydrator: permanent skip",
                     );
+                    if let Some(ref m) = self.metrics {
+                        m.hydrator_skip_total.with_label_values(&[reason]).inc();
+                    }
                     last_applied_in_batch = delta.header.sequence;
                 }
                 DeltaOutcome::TransientSkip { reason } => {
@@ -286,6 +314,11 @@ impl CompositionHydrator {
                         // Permanent skip path: advance past and clear
                         // stuck state. Stalled flag stays — operator
                         // intervention required to fully clear.
+                        if let Some(ref m) = self.metrics {
+                            m.hydrator_skip_total
+                                .with_label_values(&[skip_reason::EXHAUSTED_RETRIES])
+                                .inc();
+                        }
                         last_applied_in_batch = delta.header.sequence;
                         new_stuck_state = None;
                     } else {
@@ -321,10 +354,21 @@ impl CompositionHydrator {
             halted: None,
         };
 
-        if let Err(e) = store.storage_mut().apply_hydration_batch(batch) {
+        // §D10: time the atomic redb commit, labeled by shard. The
+        // PersistentRedbStorage layer separately tracks commit errors
+        // (redb_commit_errors_total) so we don't need to here.
+        let timer = self.metrics.as_ref().map(|m| {
+            m.hydrator_apply_duration
+                .with_label_values(&[&shard_id.0.to_string()])
+                .start_timer()
+        });
+        let apply_result = store.storage_mut().apply_hydration_batch(batch);
+        drop(timer); // Stop the histogram timer before logging.
+        if let Err(e) = apply_result {
             // Commit failed (disk full, redb commit error, etc.). Don't
-            // advance the cache; next poll retries. Surface via metric
-            // when the metrics layer lands (commit 4).
+            // advance the cache; next poll retries. The redb commit
+            // error counter was already incremented by the storage
+            // layer's record_commit_error helper.
             tracing::warn!(error=%e, "composition hydrator: apply batch failed");
             return 0;
         }
@@ -332,6 +376,11 @@ impl CompositionHydrator {
         // Refresh in-memory caches from the durable state we just
         // committed. Keeps the next poll's gap-detection rule honest.
         self.last_applied_cache = last_applied_in_batch;
+        if let Some(ref m) = self.metrics {
+            m.hydrator_last_applied_seq
+                .with_label_values(&[&shard_id.0.to_string()])
+                .set(i64::try_from(last_applied_in_batch.0).unwrap_or(i64::MAX));
+        }
 
         if applied_count > 0 {
             tracing::info!(
@@ -367,6 +416,9 @@ impl CompositionHydrator {
         };
         let _ = store.storage_mut().apply_hydration_batch(batch);
         self.halted_cache = true;
+        if let Some(ref m) = self.metrics {
+            m.hydrator_stalled.set(1);
+        }
         0
     }
 }

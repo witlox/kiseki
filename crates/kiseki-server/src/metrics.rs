@@ -73,6 +73,14 @@ pub struct KisekiMetrics {
     /// Read-path retry counters. Wired into `InMemoryGateway` via
     /// `with_retry_metrics(...)` at runtime construction.
     pub gateway_retry: std::sync::Arc<kiseki_gateway::metrics::GatewayRetryMetrics>,
+
+    // --- Composition persistent store + hydrator (ADR-040 §D10) ---
+    /// 11 metrics covering redb size, LRU hit/miss/evict, hydrator
+    /// apply duration, last-applied-seq per shard, skip counter,
+    /// halt flag, decode and commit error counters. Cloned into
+    /// `PersistentRedbStorage::with_metrics()` and
+    /// `CompositionHydrator::with_metrics()` at runtime construction.
+    pub composition: std::sync::Arc<kiseki_composition::metrics::CompositionMetrics>,
 }
 
 impl KisekiMetrics {
@@ -217,6 +225,11 @@ impl KisekiMetrics {
                 .expect("gateway retry metrics register"),
         );
 
+        let composition = std::sync::Arc::new(
+            kiseki_composition::metrics::CompositionMetrics::register(&registry)
+                .expect("composition metrics register"),
+        );
+
         Self {
             registry,
             raft_commit_latency,
@@ -235,6 +248,7 @@ impl KisekiMetrics {
             crypto_shred_total,
             fabric,
             gateway_retry,
+            composition,
         }
     }
 

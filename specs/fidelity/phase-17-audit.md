@@ -293,3 +293,36 @@ following follow-ups required before the final adversary pass**:
 The implementer can address A1 + A2 + A5 in a single follow-up
 PR (~150 LOC). The auditor recommends not advancing to the
 integrator pass until that PR lands.
+
+---
+
+## Closure log
+
+- **2026-04-29 (commit b685a28)** — A3, A6, A7 closed.
+  - A3: hydrator gap-detection halt-mode now witnessed by 3
+    new tests (`hydrator_halts_when_first_delta_seq_skips_past_expected`,
+    `hydrator_halts_when_empty_response_but_tip_advanced`,
+    `hydrator_does_not_halt_when_caught_up_at_tip`) using a
+    purpose-built `GapInjectingLog` stub.
+  - A6: `KISEKI_GATEWAY_READ_RETRY_BUDGET_MS` env-parsing
+    now exercised by `retry_budget_env_override_is_honored` +
+    `retry_budget_env_malformed_falls_back_to_default`.
+  - A7: I-CP4 `put()`-path cache-after-commit witnessed by
+    `cache_serves_post_commit_value_after_put`.
+- **2026-04-29 (next commit)** — A5 fully closed.
+  - 11-metric §D10 surface (`CompositionMetrics`) registered with
+    the global `prometheus::Registry`, wired through
+    `PersistentRedbStorage::with_metrics()` (LRU hit/miss/evict,
+    decode-error kind, redb commit errors) and
+    `CompositionHydrator::with_metrics()` (apply duration,
+    last-applied-seq{shard}, skip{reason}, stalled). Runtime
+    spawns a 30-s task that stats the on-disk redb file size
+    and refreshes the count gauge. F-4 now fully observable.
+  - A4 (durability across reopen) was already covered by
+    `persistence_across_reopen` in `redb.rs` and
+    `test_persistence_survives_node_restart` in
+    `tests/e2e/test_cross_node_replication.py` from the
+    integrator pass — closing here for completeness.
+
+All Phase 17 audit findings are now closed; no carry-over to
+Phase 18.

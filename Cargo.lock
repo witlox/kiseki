@@ -1815,6 +1815,7 @@ dependencies = [
  "kiseki-view",
  "lru 0.16.4",
  "postcard",
+ "prometheus",
  "proptest",
  "redb",
  "serde",

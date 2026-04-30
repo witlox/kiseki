@@ -17,6 +17,7 @@ pub mod composition;
 pub mod error;
 pub mod hydrator;
 pub mod log_bridge;
+pub mod metrics;
 pub mod multipart;
 pub mod namespace;
 pub mod persistent;
