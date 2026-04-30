@@ -122,7 +122,7 @@ reed-solomon-erasure = "6"
 
 # --- Testing ---
 proptest = "1"
-cucumber = "0.22"
+cucumber = "0.23"
 tokio-test = "0.4"
 
 [profile.release]
