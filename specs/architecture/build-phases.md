@@ -681,17 +681,25 @@ captured in `specs/implementation/phase-17-cross-node-followups.md`.
   rejection) all pass; total cross-node suite is 7/7 green
   locally.
 - **Items 2 + 3 — Persistent metadata stores + snapshot
-  integration** (architect pass complete):
+  integration** (architect rev 2 complete; awaiting rev 2
+  adversary sign-off):
   ADR-040 (`specs/architecture/adr/040-persistent-metadata-stores.md`)
-  drafted. Decisions: redb-backed sibling stores at
+  through two revisions. Rev 1 (commit `a08e479`) drafted
+  redb-backed sibling stores at
   `KISEKI_DATA_DIR/metadata/{compositions,views}.redb`, postcard
   encoding with leading schema-version byte, hot-tail LRU
   cache, sync-only inner locks (never held across await),
   atomic `last_applied + state` redb transactions, two-regime
-  snapshot story (D6.1 works today; D6.2 deferred to a sibling
-  ADR when openraft log compaction is enabled). Five
-  invariants `I-CP1`..`I-CP5` added. **Pending adversary review
-  on the ADR before implementation starts.**
+  snapshot story (D6.1 works today; D6.2 deferred). Rev 1
+  adversary review (`specs/findings/adr-040-adversary-review.md`,
+  commit `a6eec3c`) flagged 3 Critical + 4 High findings; rev 2
+  addresses all seven inline (transient/permanent skip
+  algorithm, drops `last_applied_log_index` conflation,
+  sequence-comparison gap detection, configurable retry budget,
+  typed errors, 13 observability metrics, persistence scope
+  limited to `compositions`). Six invariants `I-CP1`..`I-CP6`
+  added. **Pending rev 2 adversary sign-off before
+  implementation starts.**
 - After all items land: auditor pass (Gate 2 step-depth
   verification), integrator pass (cross-context check), final
   adversary pass, then v2026.39+ release.

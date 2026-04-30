@@ -95,20 +95,34 @@ table); a million compositions is sub-GB and fine, ten million is
 ~3 GB and starting to hurt, a billion is a non-starter. The view
 store has the same shape and the same wall.
 
-### Architect scope (DONE — see ADR-040)
+### Architect scope (DONE — see ADR-040 rev 2)
 
 ADR-040 (`specs/architecture/adr/040-persistent-metadata-stores.md`)
-captures the decisions: redb-backed sibling stores, postcard
-encoding with a leading schema-version byte, hot-tail LRU,
-sync-only inner locks (kept off the await path), atomic
-`last_applied + state` redb transactions, and a two-regime
-snapshot story (D6.1 today, D6.2 deferred for when openraft log
-compaction lands). Five new invariants (`I-CP1`..`I-CP5`) added to
-`specs/invariants.md`.
+captures the decisions across two revisions:
 
-**Adversary review pending** — concerns flagged inside the ADR
-under §"Adversary review". Implementer should not start until that
-review signs off.
+- **rev 1** (commit `a08e479`): initial structural choices —
+  redb-backed sibling stores, postcard encoding with a leading
+  schema-version byte, hot-tail LRU, sync-only inner locks (kept
+  off the await path), atomic `last_applied + state` redb
+  transactions, and a two-regime snapshot story (D6.1 today,
+  D6.2 deferred for when openraft log compaction lands).
+- **rev 2** (this commit): addresses adversary findings F-1..F-7
+  inline. §D5.1 specifies the transient/permanent skip algorithm
+  (new invariant I-CP6); §D5 drops the conflated
+  `last_applied_log_index`; §D6.3 specifies the
+  sequence-comparison gap-detection rule that doesn't need a
+  new `LogOps` API; §D7 makes the gateway read-retry budget
+  configurable + observable; §D8.1 places `PersistentStoreError`
+  in the error taxonomy; §D10 specifies 13 observability
+  metrics; §D11 explicitly scopes persistence to `compositions`
+  only (namespaces + multiparts stay in-memory).
+
+Six invariants `I-CP1`..`I-CP6` added to `specs/invariants.md`.
+
+**Adversary status**: rev 1 findings F-1..F-7 (Critical + High)
+are addressed in rev 2 inline. F-8..F-17 (Medium + Low) are
+deferred to implementation review. Awaiting **rev 2 adversary
+sign-off** before implementer starts.
 
 ### Original architect scope (now satisfied):
 

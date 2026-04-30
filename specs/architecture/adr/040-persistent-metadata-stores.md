@@ -1,13 +1,39 @@
 # ADR-040: Persistent Metadata Stores (CompositionStore, ViewStore)
 
-**Status**: Proposed (pending adversary review)
+**Status**: Proposed — rev 2 (adversary review applied)
 **Date**: 2026-04-30
-**Deciders**: Architect role; implementer to execute after adversary sign-off
+**Deciders**: Architect role; implementer to execute after rev-2 adversary sign-off
 **Context**: Phase 17 items 2 + 3 follow-ups from
 `specs/implementation/phase-17-cross-node-followups.md`
-**Related ADRs**: ADR-026 (Raft topology), ADR-029 (raw block allocator),
+**Related ADRs**: ADR-004 (schema versioning), ADR-011 (crypto-shred
+TTL), ADR-016 (backup/DR), ADR-024 (device management + capacity),
+ADR-026 (Raft topology), ADR-029 (raw block allocator),
 ADR-030 (small-file placement), ADR-032 (async gateway ops),
 ADR-036 (LogOps shard management)
+
+## Revision history
+
+- **rev 1** (2026-04-30, commit `a08e479`): initial draft.
+- **rev 2** (2026-04-30, this revision): incorporates adversary
+  findings F-1..F-7 from
+  `specs/findings/adr-040-adversary-review.md`.
+  - F-1 → §D5 specifies the transient-vs-permanent skip algorithm,
+    new invariant **I-CP6**.
+  - F-2 → §D5 drops `last_applied_log_index`; only
+    `meta.last_applied_seq: SequenceNumber` is stored.
+  - F-3 → §D6.3 specifies the gap-detection mechanism (sequence-
+    comparison; no new `LogOps` API needed).
+  - F-4 → §D7 picks "configurable retry + observability" over
+    write-through on the leader; adds two metrics.
+  - F-5 → new §D8.1 places `PersistentStoreError` in the error
+    taxonomy.
+  - F-6 → new §D10 specifies the observability surface
+    (9 metrics).
+  - F-7 → new §D11 explicitly scopes persistence to
+    `compositions` only; `namespaces` + `multiparts` stay
+    in-memory.
+  - F-8..F-17 acknowledged as Medium / Low — addressed inline
+    during implementation review (auditor + post-impl adversary).
 
 ## Problem
 
@@ -175,20 +201,33 @@ uses.
 
 The hydrator's invariant (Phase 16f, Phase 17 item 1):
 **`last_applied_seq` advances only when the corresponding state
-change has been durably committed.** In-memory this is trivial; on
-disk it requires both updates to land in the same redb transaction.
+change has been durably committed AND the state change either
+applied successfully or is intentionally a no-op for this
+operation type.**
 
-Per hydrator poll:
+The "intentionally a no-op" qualifier closes adversary finding
+F-1 (Phase 17 item 1's hydrator advanced `last_applied` past
+failed `update_at` calls, losing the Update permanently with
+persistence). The transient-vs-permanent skip algorithm in §D5.1
+implements the qualifier.
+
+Per hydrator poll, the durable persistence point:
 
 ```
 begin_write()
-  for each delta in batch:
+  for each delta in this poll's batch (advance scope, see D5.1):
     apply (insert / update / delete in COMPOSITIONS table)
-  meta.put("last_applied_seq", new_seq)
-  meta.put("last_applied_log_index", entry.log_index)
+  meta.put("last_applied_seq", advanced_to_seq)   # SequenceNumber, see F-2
 commit()       <-- single fsync
-update LRU cache
+update LRU cache atomically with the lock window (D3)
 ```
+
+Note: only `last_applied_seq` (the per-shard delta sequence) is
+persisted. The openraft `log_index` is **not** stored — the
+hydrator reads via `LogOps::read_deltas(SequenceNumber)` and has
+no occasion to convert. Any future ADR that needs log-index
+alignment (e.g. snapshot coordination — D6.2) introduces the
+mapping there, not here.
 
 If the process crashes between `apply` and `commit`, redb's
 journaling rolls everything back; on restart, `last_applied_seq`
@@ -198,6 +237,50 @@ redb miss and re-hydrates the cache — correct, just slightly slow.
 
 Bound on lost work: at most one batch (default 1000 deltas) per
 crash. The hydrator picks up where it left off on restart.
+
+#### D5.1. Transient skip vs permanent skip
+
+A delta in the poll batch falls into one of three buckets when
+the hydrator tries to apply it:
+
+| Outcome | What happened | Action |
+|---|---|---|
+| **Applied** | apply method returned Ok | advance `last_applied_seq` past this delta |
+| **Permanent skip** | the delta is structurally un-applyable: bad payload length, unknown OperationType, decode error, etc. | advance `last_applied_seq` past it; increment `kiseki_composition_hydrator_skip_total{reason=...}` at warn level |
+| **Transient skip** | apply returned a `MaybeRecoverable` error (e.g. `update_at` got `CompositionNotFound`, `create_at` got `NamespaceNotFound`) | DO NOT advance past this delta on this poll; bump the per-delta retry counter; return early from this poll |
+
+A transient skip blocks all later deltas in the same poll
+batch. The next poll re-reads from this delta's sequence and
+retries. The retry counter is in-memory (it doesn't have to
+survive a crash — on restart, the loop just retries from
+durable `last_applied_seq + 1` and the counter resets). When the
+counter exceeds `KISEKI_HYDRATOR_TRANSIENT_RETRIES` (default
+**100**, ≈ 10 s at 100 ms poll cadence), the hydrator escalates:
+
+- log at error with the delta's seq + tenant + comp_id;
+- emit `kiseki_composition_hydrator_stalled = 1`;
+- advance past the delta (refusing forever blocks worse failure
+  modes than losing one record);
+- increment `kiseki_composition_hydrator_skip_total{reason="exhausted_retries"}`.
+
+Operators alarming on the stalled gauge or the
+`exhausted_retries` counter can investigate. Common cause:
+namespace not yet replicated to this node (Phase 18 territory) —
+the alarm and the metric label make this diagnosable.
+
+This is the algorithmic shape; the implementer picks the exact
+typed-error mapping. The minimum surface:
+
+```rust
+pub enum HydratorOutcome {
+    Applied,
+    PermanentSkip { reason: &'static str },
+    TransientSkip { reason: &'static str },
+}
+```
+
+`update_at` and `create_at` return enough information for the
+hydrator to map to the right variant. See I-CP6.
 
 ### D6. Snapshot integration
 
@@ -242,13 +325,58 @@ A separate ADR ratifies the bundle format + transfer protocol when
 log compaction is enabled. That ADR is **not** ADR-040; it's a
 sibling that depends on this one.
 
-**D6.3 Self-defense in D6.1 mode.** Persistent
-`last_applied_seq` is checked against the log's earliest visible
-delta on every poll. If `last_applied_seq < earliest_visible_seq`
-(the compaction window), the hydrator emits a `tracing::error!` and
-stops polling. Operator action required: drop the node's metadata
-redbs, restart, let it rehydrate from the snapshot. Document this
-as the "recovery procedure" until D6.2 lands.
+**D6.3 Self-defense — gap detection without a new `LogOps` API.**
+
+The hydrator detects compaction by inspecting the deltas it
+receives, not by querying the log's earliest visible sequence
+directly. (Adversary finding F-3: `LogOps` exposes no
+`earliest_visible_seq` and adding one is more API surface than
+this case justifies.) The detection rule:
+
+After `read_deltas(from = last_applied + 1, to = last_applied + 1000)`:
+
+| Response | Meaning | Action |
+|---|---|---|
+| Non-empty, first delta's `sequence == last_applied + 1` | Normal advance — no gap. | Apply per §D5.1. |
+| Non-empty, first delta's `sequence > last_applied + 1` | **Gap.** Compaction has eaten the deltas in between. | **Halt mode** (see below). |
+| Empty AND `shard_health(shard).tip > last_applied` | **Gap.** Tip is past us but no deltas are visible — they were compacted. | **Halt mode**. |
+| Empty AND `tip <= last_applied` | Steady state — no new deltas yet. | Sleep until next poll. |
+
+**Halt mode**: the hydrator emits one `tracing::error!` per minute
+(throttled — don't spam the log), sets the
+`kiseki_composition_hydrator_stalled` gauge to 1, and stops
+polling for new deltas. It still serves reads from the existing
+persistent store; reads of compositions created before the
+compaction continue to work, reads of compositions created after
+the compaction return 404 (the hydrator can't catch up without
+operator intervention).
+
+**Operator recovery procedure** (until D6.2 lands):
+
+1. Stop the kiseki-server process on this node.
+2. Delete `KISEKI_DATA_DIR/metadata/compositions.redb` and
+   `views.redb`.
+3. Start kiseki-server. The hydrator initializes empty stores
+   (D9 first-boot path), receives the next openraft snapshot
+   (which includes all visible deltas), and re-hydrates from
+   scratch.
+
+This procedure has cluster-side impact (the recovering node
+returns 404 for cross-node reads during re-hydration) but is
+correct. Document as the operational SOP for "a node was offline
+long enough for log compaction to outrun it" until the compaction-
+aware ADR ships.
+
+**Why this is OK as a precondition for ADR-040 and not a blocker
+for the ADR sibling that turns on log compaction:**
+
+- Log compaction is **not** enabled in the codebase today (the
+  Raft state machine's snapshot includes all deltas, see
+  §D6.1). So halt-mode never fires in steady state.
+- When compaction is enabled by a sibling ADR, that ADR's design
+  must address the bundle-transfer protocol; halt-mode is the
+  conservative "fail loud" stance that lets us turn compaction
+  on without first solving D6.2 perfectly.
 
 ### D7. Concurrency
 
@@ -265,19 +393,37 @@ as the "recovery procedure" until D6.2 lands.
   *not* touch the persistent store directly. The leader's local
   state converges via its own hydrator, which sees the deltas the
   gateway just appended to the Raft log. This means a write-then-
-  read on the leader pays the hydrator's poll latency (≤ 100 ms
-  + 25 ms gateway retry = ~125 ms p99). Acceptable for an
-  eventually-consistent design; the existing 1 s gateway retry
-  absorbs it.
+  read on the leader pays the hydrator's poll latency
+  (≤ 100 ms baseline) plus apply time (depends on batch size and
+  redb commit latency). Phase 16f's gateway-side retry budget
+  absorbs this; rev 2 makes the budget configurable and observable
+  to address adversary finding F-4.
 
-  Alternative considered: have the leader's gateway also write
-  directly to its local persistent store on emit-success. Rejected
-  because (a) it's redundant work — the hydrator does it 100 ms
-  later anyway, (b) it bypasses the single-writer assumption and
-  needs explicit write-side conflict handling, (c) it would need
-  rollback on emit failure (mirroring ADR-032's rollback dance for
-  in-memory state), adding complexity. The latency cost is small
-  enough not to justify the duplication.
+  - **`KISEKI_GATEWAY_READ_RETRY_BUDGET_MS`** (env, default 1000):
+    bounds the read-path retry on `CompositionNotFound`. Operators
+    on slow disks or under load can tune up; the default fits
+    well-provisioned NVMe.
+  - **`kiseki_gateway_read_retry_total`** (counter, label `node_id`):
+    every read that exited the retry loop with a hit. Steady-state
+    rate is ~1× the cross-gateway read rate.
+  - **`kiseki_gateway_read_retry_exhausted_total`** (counter, label
+    `node_id`): every read that hit the budget without resolving.
+    A non-zero rate means the budget is too tight for the current
+    hydrator latency. Operators alarm on this and either bump the
+    budget or investigate hydrator stall (which has its own
+    metrics — see §D10).
+
+  Alternative considered: write-through on the leader (gateway
+  also writes to local persistent store on emit-success).
+  **Rejected** because (a) it's redundant — the hydrator does it
+  ~100 ms later anyway, (b) it introduces a partial-success
+  failure mode (emit succeeds, local write fails — which does the
+  client see? the cluster says "yes" but the leader's local state
+  says "no"), (c) it needs rollback on emit failure (mirroring
+  ADR-032's rollback for in-memory state), adding complexity.
+  Sticking with eventual-consistency-plus-bounded-retry preserves
+  the single-consistency-model property: every node sees the
+  composition once the hydrator has applied the delta.
 
 ### D8. Schema versioning
 
@@ -299,6 +445,44 @@ current version is `1`. When a future schema change happens:
 ADR-004 (schema versioning) covers the broader pattern; this
 section says the redb stores opt into it.
 
+### D8.1. Typed errors (`PersistentStoreError`)
+
+Closes adversary finding F-5: the rev 1 ADR named `SchemaTooNew`
+without placing it in the error taxonomy.
+
+A new module `kiseki_composition::persistent::error` introduces:
+
+```rust
+pub enum PersistentStoreError {
+    /// I/O against the underlying redb (open, read, write, fsync).
+    Io(io::Error),
+    /// The on-disk record carries a schema_version this binary
+    /// doesn't know how to decode. Surfaced as "binary too old".
+    SchemaTooNew { found: u8, supported: u8 },
+    /// Postcard decode failure — payload bytes don't match the
+    /// declared schema_version's struct shape.
+    Decode(String),
+    /// A persistent-store call delegated to an in-memory
+    /// `CompositionStore` operation (e.g. `create_at` rule
+    /// validation) and that returned a domain error.
+    Composition(#[from] CompositionError),
+    /// redb commit failed — surfaced separately so operators can
+    /// distinguish from raw I/O.
+    Commit(String),
+}
+```
+
+**Gateway boundary.** `GatewayError` does NOT gain a new variant.
+The persistent-store layer maps every variant to
+`GatewayError::Upstream(format!("..."))` and increments
+`kiseki_composition_decode_errors_total{kind=...}` (see §D10).
+Operators get the metric label for alarm routing; the error
+string carries the human-readable detail. This keeps
+`GatewayError` stable; the type-discriminator lives in metrics.
+
+`error-taxonomy.md` is updated to list `PersistentStoreError` in
+the persistent-store row, mapped to `GatewayError::Upstream`.
+
 ### D9. Migration from in-memory
 
 First-boot detection: opening a path that doesn't exist creates an
@@ -315,6 +499,71 @@ operators should drain reads from a node before upgrading it. This
 is acceptable because the upgrade is a planned operation, not a
 crash recovery.
 
+### D10. Observability surface
+
+Closes adversary finding F-6: rev 1 was silent on metrics, leaving
+operators no way to diagnose F-1 (silent skip), F-4 (RYW retry
+budget exhaustion), or F-8 (commit failure stalls). The
+implementer adds these counters / gauges / histograms to
+`crates/kiseki-server/src/metrics.rs` alongside the existing
+`KisekiMetrics::fabric` block (Phase 16 pattern):
+
+| Metric | Type | Labels | Purpose |
+|---|---|---|---|
+| `kiseki_composition_redb_size_bytes` | gauge | — | disk-fill alarm; ties to ADR-024 budget |
+| `kiseki_composition_count` | gauge | — | growth tracking |
+| `kiseki_composition_lru_capacity` | gauge | — | sizing context |
+| `kiseki_composition_lru_hit_total` | counter | — | tune cache size |
+| `kiseki_composition_lru_miss_total` | counter | — | tune cache size |
+| `kiseki_composition_lru_evicted_total` | counter | — | thrashing detection |
+| `kiseki_composition_hydrator_apply_duration_seconds` | histogram | — | RYW retry budget rationale (F-4) |
+| `kiseki_composition_hydrator_last_applied_seq` | gauge | `shard_id` | replication lag |
+| `kiseki_composition_hydrator_skip_total` | counter | `reason` (∈{`bad_payload`,`unknown_op`,`exhausted_retries`,`schema_too_new`,`decode`}) | catches F-1 |
+| `kiseki_composition_hydrator_stalled` | gauge | — | halt-mode signal (D5.1, D6.3) |
+| `kiseki_composition_redb_commit_errors_total` | counter | — | catches F-8 (disk full, I/O) |
+| `kiseki_composition_redb_read_txn_active` | gauge | — | reader contention (F-11) |
+| `kiseki_composition_decode_errors_total` | counter | `kind` (∈{`schema_too_new`,`postcard`,`length`}) | F-5 typed-error visibility |
+
+Plus the gateway-side retry metrics from §D7:
+
+| Metric | Type | Labels | Purpose |
+|---|---|---|---|
+| `kiseki_gateway_read_retry_total` | counter | — | retry rate baseline |
+| `kiseki_gateway_read_retry_exhausted_total` | counter | — | F-4 alarm |
+
+The same shape applies to the persistent ViewStore (replace
+`composition` with `view` in the metric names). The implementer
+factors a small helper to avoid duplication.
+
+### D11. Persistence scope — only `compositions`
+
+Closes adversary finding F-7: rev 1 said "make CompositionStore
+persistent" without distinguishing the three independent maps
+the struct holds.
+
+Only the **`compositions: HashMap<CompositionId, Composition>`**
+map is moved to redb. The other two stay in-memory:
+
+- **`namespaces: HashMap<NamespaceId, Namespace>`** stays
+  in-memory, recreated on every boot. The bootstrap "default"
+  namespace is installed by `runtime.rs` (Phase 16f §D6.3
+  fix — installed on every node, not gated on
+  `cfg.bootstrap`). Tenant-created namespaces aren't replicated
+  yet; that's Phase 18 territory and gets its own ADR with its
+  own replicate-and-persist path.
+- **`multiparts: HashMap<String, (MultipartUpload, NamespaceId)>`**
+  stays in-memory. In-flight multipart uploads are dropped on
+  restart, consistent with current S3 semantics: an S3 client
+  treats a server-side state loss as an aborted upload and
+  retries (the `Initiate Multipart Upload` returns a fresh
+  `upload_id` on retry). Persisting them across restart
+  resurrects state from a different client session — the wrong
+  semantics.
+
+For ViewStore: the analogous decision is "all of it persists"
+since views aren't transient state. Architect's call; implementer
+follows the same shape (one redb, two tables).
+
 ## Invariants
 
 These get added to `specs/invariants.md` (status `Proposed` until
@@ -322,9 +571,10 @@ the implementation lands, then `Confirmed`):
 
 - **I-CP1**: A persistent `CompositionStore` advances
   `meta.last_applied_seq` only as part of the same redb transaction
-  that applies the corresponding deltas. Crash between batches
-  loses at most one batch's worth of work; on restart the hydrator
-  resumes from the durably-committed `last_applied_seq + 1`.
+  that applies the corresponding state changes (or no-ops, see
+  I-CP6). Crash between batches loses at most one batch's worth of
+  work; on restart the hydrator resumes from the durably-committed
+  `last_applied_seq + 1`.
 
 - **I-CP2**: At most one composition hydrator runs per node at any
   time. Enforced by the runtime spawn; any second hydrator would be
@@ -343,11 +593,41 @@ the implementation lands, then `Confirmed`):
   reflects state at-or-after the last commit.
 
 - **I-CP5**: When the openraft log compaction window advances past
-  `meta.last_applied_seq`, the hydrator stops polling and emits an
-  error log. The operator's recovery action is to drop the
-  node's metadata redbs and restart; the persistent store
-  re-hydrates from the snapshot. Until ADR-XXX lands this is the
-  only correct behavior.
+  `meta.last_applied_seq`, the hydrator detects the gap (see
+  §D6.3's sequence-comparison rule) and enters halt mode: emits
+  one throttled `tracing::error!` per minute, sets
+  `kiseki_composition_hydrator_stalled = 1`, and stops polling.
+  Existing reads continue to be served from the persistent store
+  (compositions created before compaction stay reachable). The
+  operator's recovery action is to drop the node's metadata redbs
+  and restart; the persistent store re-hydrates from the next
+  openraft snapshot. Until the deferred snapshot-bundle ADR lands,
+  this is the only correct behavior.
+
+- **I-CP6**: The hydrator advances `last_applied_seq` past delta
+  `D` if and only if one of:
+  (a) the apply method returned `Ok` (state mutation succeeded);
+  (b) `D` is structurally un-applyable (bad payload length, unknown
+       OperationType, decode error) — this is a *permanent skip*,
+       advances + warns + emits
+       `kiseki_composition_hydrator_skip_total{reason}`;
+  (c) `D` is intentionally a no-op for the hydrator
+       (Rename / SetAttribute / Finalize today) — silent advance.
+
+  A *transient skip* (e.g. `update_at` returning
+  `CompositionNotFound`, `create_at` returning
+  `NamespaceNotFound`) does **not** advance — the hydrator
+  retries on the next poll. After
+  `KISEKI_HYDRATOR_TRANSIENT_RETRIES` consecutive transient skips
+  (default 100, ≈ 10 s at 100 ms poll), the skip is promoted to
+  permanent (case b) with `reason="exhausted_retries"` and the
+  hydrator alarms via `kiseki_composition_hydrator_stalled`.
+
+  This invariant addresses adversary F-1: under in-memory state
+  the no-advance-on-error semantic was implicit and self-healing;
+  under persistence, the hydrator must distinguish so a transient
+  upstream condition (e.g. namespace not yet replicated to this
+  node) doesn't permanently lose deltas.
 
 ## Alternatives considered
 
@@ -456,8 +736,30 @@ the small change first, layer in complexity when needed" call.
 
 ## Adversary review
 
-This ADR requires an adversary pass before implementation. Specific
-concerns to address:
+**Rev 1 review** completed at
+`specs/findings/adr-040-adversary-review.md` (commit `a6eec3c`).
+Verdict: 3 Critical + 4 High findings (F-1..F-7) blocked
+implementation pending revision. **Rev 2 (this revision)**
+addresses all seven inline:
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| F-1 (silent advance past failed Updates) | Critical | §D5.1 transient/permanent skip algorithm; new I-CP6 |
+| F-2 (SequenceNumber vs log_index conflation) | Critical | §D5 drops `last_applied_log_index` |
+| F-3 (no API for earliest_visible_seq) | Critical | §D6.3 sequence-comparison gap detection (no new API) |
+| F-4 (RYW retry budget invisible) | High | §D7 configurable budget + 2 metrics |
+| F-5 (typed error placement) | High | §D8.1 `PersistentStoreError` enum |
+| F-6 (no observability) | High | §D10 13 metrics specified |
+| F-7 (namespaces/multiparts scope) | High | §D11 only `compositions` is persisted |
+
+Six Medium / four Low findings (F-8..F-17) are deferred to
+implementation review (auditor + post-impl adversary pass) per
+the rev 1 reviewer's recommendation; they don't block the
+architect-to-implementer handoff.
+
+**Standing implementation-review concerns** (these are guidance
+for the auditor + post-impl adversary, not blockers for the
+architect handoff):
 
 1. **Cache-coherence under concurrent reads + writes**. D3 claims
    "the hydrator updates the cache after the txn commits, in the
