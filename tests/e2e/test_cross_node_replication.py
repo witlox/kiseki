@@ -427,3 +427,118 @@ def test_per_shard_leader_endpoint_rejects_bad_uuid(cluster):
     assert resp.status_code == 400, (
         f"expected 400 for malformed UUID, got {resp.status_code}: {resp.text!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 integrator-pass: cross-context seams
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cross_node
+def test_phase_17_metrics_surface_includes_gateway_retry_counters(cluster):
+    """ADR-040 §D7 + §D10 / F-4 closure (auditor finding A5).
+
+    Verifies the new gateway-side retry counters
+    (`kiseki_gateway_read_retry_total` and
+    `kiseki_gateway_read_retry_exhausted_total`) actually appear on
+    the `/metrics` endpoint. Without this integration test, a
+    regression that breaks the Prometheus registration (e.g. the
+    runtime forgetting to clone the metrics into the gateway
+    builder) would silently land — operators would see flat zeros
+    in their dashboards and no alerts when the retry budget is
+    exhausted.
+
+    Runs against every node — all three must surface the counters.
+    """
+    for n in (1, 2, 3):
+        _wait_s3(S3[n])
+
+    expected_metrics = [
+        "kiseki_gateway_read_retry_total",
+        "kiseki_gateway_read_retry_exhausted_total",
+    ]
+    for n in (1, 2, 3):
+        resp = requests.get(f"{METRICS[n]}/metrics", timeout=5)
+        assert resp.status_code == 200, (
+            f"node{n}: /metrics returned {resp.status_code}"
+        )
+        body = resp.text
+        for metric_name in expected_metrics:
+            # Look for the `# HELP` or `# TYPE` line followed by a
+            # value line. Just checking the name appears as a
+            # standalone token is enough.
+            assert metric_name in body, (
+                f"node{n}: /metrics missing `{metric_name}` — registration "
+                f"regressed in `KisekiMetrics::new()` or "
+                f"`InMemoryGateway::with_retry_metrics(...)`"
+            )
+
+
+@pytest.mark.cross_node
+def test_persistence_survives_node_restart(cluster):
+    """ADR-040 §D1 / I-CP1 (auditor finding A4 closure).
+
+    Verifies the full integration path for persistent compositions:
+    docker-compose volume → KISEKI_DATA_DIR → metadata/compositions.redb →
+    open-or-init at boot → CompositionStore::with_storage(persistent) →
+    gateway reads through it. The unit tests cover each layer in
+    isolation; this proves they wire together correctly under a real
+    `docker compose stop` + `start` (which preserves the volume).
+
+    Sequence:
+      1. PUT on node-1 → composition created.
+      2. Wait for hydration on node-2 → composition replicates.
+      3. `docker compose stop` node-2 (preserves volume + redb).
+      4. `docker compose start` node-2 → fresh process opens the
+         existing redb at `/data/metadata/compositions.redb`.
+      5. Wait for Raft + S3 to come back up.
+      6. GET via node-2 → must still return 200 with the original
+         bytes. The hydrator's last_applied_seq is durable so it
+         doesn't re-process from seq=1; the composition is served
+         from the persistent store directly.
+    """
+    try:
+        from helpers.cluster import start_node, stop_node
+    except ImportError:
+        pytest.skip("helpers.cluster not importable")
+
+    for n in (1, 2, 3):
+        _wait_s3(S3[n])
+
+    payload = b"phase17-persistence-survives-restart" * 16
+    etag = _put_object(1, "persist-1", payload)
+    time.sleep(1)  # let the Create delta hydrate on node-2 + node-3
+
+    # Pre-condition: cross-node read works on node-2.
+    pre = _get_object(2, etag)
+    assert pre == payload, "pre-restart: node-2 must have the composition"
+
+    # Stop + start node-2. `docker compose stop` (not down) preserves
+    # the named volume `node2-data` and therefore the redb files
+    # under /data/metadata/.
+    stop_node(cluster.compose_file, "kiseki-node2")
+    try:
+        # Brief settle so the leader notices.
+        time.sleep(2)
+        start_node(cluster.compose_file, "kiseki-node2")
+        # Wait for the restarted node to come back online.
+        _wait_s3(S3[2])
+        _wait_for_shard_leader(2, BOOTSTRAP_SHARD_ID)
+
+        # Post-condition: GET on the freshly-restarted node still
+        # serves the bytes. No re-hydration delay needed because
+        # last_applied_seq is durable (I-CP1).
+        post = _get_object(2, etag)
+        assert post == payload, (
+            "post-restart: node-2 lost the composition — "
+            "PersistentRedbStorage didn't survive the restart"
+        )
+    finally:
+        # Make sure the cluster is in a steady state before later
+        # tests in the module run. Defensive: if start_node already
+        # fired, calling start again on a running node is a no-op
+        # in docker compose.
+        try:
+            start_node(cluster.compose_file, "kiseki-node2")
+        except Exception:
+            pass
