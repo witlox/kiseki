@@ -2,6 +2,11 @@
 
 **Checkpoint**: 2026-04-26 (post-Phase 14 — backup/restore, security
 hardening, slow-suite Raft, end-to-end tracing)
+
+**Latest incremental audit**: 2026-04-30, Phase 17 items 2 + 3
+implementation — see `phase-17-audit.md`. Verdict: Gate 2
+conditional pass; 2 High findings (A1, A2) require follow-up tests
+for I-2's halt-mode 503 path before the final adversary pass.
 **Depth audit**: 2026-04-26 (post-Phase 13f) — per-scenario depth
 ratings below predate Phase 14's BDD additions; numbers in the
 "BDD coverage" table reflect the post-Phase 14 totals but the
