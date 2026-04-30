@@ -658,15 +658,43 @@ from 16a/b/c/d/e closed. Two acknowledged out-of-scope items
 (pNFS DS distinct-fragment parallelism — pNFS team; runtime-wide
 unified shutdown — runtime-wide concern).
 
-**Phase 17 — Cross-node follow-ups** (planned). 16f closes
+**Phase 17 — Cross-node follow-ups** (in flight). 16f closes
 correctness; the architectural debt 16f deliberately deferred is
-captured in `specs/implementation/phase-17-cross-node-followups.md`:
-update/delete delta hydration (implementer), persistent
-`CompositionStore` + `ViewStore` via redb (architect → ADR-040 →
-implementer), Raft-snapshot integration for the persistent stores
-(architect amendment + implementer), and a per-shard leader endpoint
-(implementer). Items 1 + 4 are independent and small. Items 2 + 3
-share an ADR.
+captured in `specs/implementation/phase-17-cross-node-followups.md`.
+
+- **Item 1 — Update / Delete delta hydration** (commit `7ef59b1`):
+  the 16f hydrator only handled `OperationType::Create`; this
+  extends it to Update + Delete and wires the gateway's S3 DELETE
+  path to actually emit a Delete delta. Encoding: 40-byte Create,
+  24-byte Update, 16-byte Delete payloads; op-discriminated by
+  the existing delta header field. Lock discipline in the
+  gateway's delete path: hold the compositions tokio Mutex
+  across emit + local delete to prevent the hydrator from race-
+  removing the composition mid-call. Three new hydrator unit
+  tests + one new e2e test all pass.
+- **Item 4 — Per-shard leader endpoint** (commit `19c4a63`):
+  `GET /cluster/shards/{shard_id}/leader` exposes
+  `LogOps::shard_health(shard_id)`. The 30-second elapsed-time
+  retry in `_put_object` becomes a single attempt + a
+  `_wait_for_shard_leader` helper that polls the new endpoint.
+  Two new e2e tests (cluster-wide leader agreement; bad-UUID
+  rejection) all pass; total cross-node suite is 7/7 green
+  locally.
+- **Items 2 + 3 — Persistent metadata stores + snapshot
+  integration** (architect pass complete):
+  ADR-040 (`specs/architecture/adr/040-persistent-metadata-stores.md`)
+  drafted. Decisions: redb-backed sibling stores at
+  `KISEKI_DATA_DIR/metadata/{compositions,views}.redb`, postcard
+  encoding with leading schema-version byte, hot-tail LRU
+  cache, sync-only inner locks (never held across await),
+  atomic `last_applied + state` redb transactions, two-regime
+  snapshot story (D6.1 works today; D6.2 deferred to a sibling
+  ADR when openraft log compaction is enabled). Five
+  invariants `I-CP1`..`I-CP5` added. **Pending adversary review
+  on the ADR before implementation starts.**
+- After all items land: auditor pass (Gate 2 step-depth
+  verification), integrator pass (cross-context check), final
+  adversary pass, then v2026.39+ release.
 
 **Implementation plan**: see
 `specs/implementation/phase-16-cross-node-chunks.md` for the

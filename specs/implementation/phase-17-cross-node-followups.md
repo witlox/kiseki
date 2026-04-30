@@ -95,10 +95,22 @@ table); a million compositions is sub-GB and fine, ten million is
 ~3 GB and starting to hurt, a billion is a non-starter. The view
 store has the same shape and the same wall.
 
-### Architect scope (must come first)
+### Architect scope (DONE — see ADR-040)
 
-Draft **ADR-040: Persistent metadata stores**. Decisions to make
-explicit:
+ADR-040 (`specs/architecture/adr/040-persistent-metadata-stores.md`)
+captures the decisions: redb-backed sibling stores, postcard
+encoding with a leading schema-version byte, hot-tail LRU,
+sync-only inner locks (kept off the await path), atomic
+`last_applied + state` redb transactions, and a two-regime
+snapshot story (D6.1 today, D6.2 deferred for when openraft log
+compaction lands). Five new invariants (`I-CP1`..`I-CP5`) added to
+`specs/invariants.md`.
+
+**Adversary review pending** — concerns flagged inside the ADR
+under §"Adversary review". Implementer should not start until that
+review signs off.
+
+### Original architect scope (now satisfied):
 
 1. **Storage layout.** Reuse the existing redb-backed pattern (one
    `.redb` per logical store, separate from the chunk redb). Keys:

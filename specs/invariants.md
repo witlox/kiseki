@@ -300,6 +300,18 @@ domain expert unless marked otherwise.
 
 ---
 
+## Composition persistence invariants (ADR-040)
+
+| ID | Invariant | Status |
+|---|---|---|
+| I-CP1 | A persistent `CompositionStore` advances `meta.last_applied_seq` only as part of the same redb transaction that applies the corresponding deltas. A crash between batches loses at most one batch's worth of work; on restart the hydrator resumes from the durably-committed `last_applied_seq + 1`. | Proposed |
+| I-CP2 | At most one composition hydrator runs per node at any time. Enforced by the runtime spawn; concurrent writers would also be serialized by redb's single-writer transaction model, but we don't rely on that — the runtime is the gate. | Proposed |
+| I-CP3 | Every persisted composition record is `[1 byte: schema_version][postcard payload]`. Decoders that see an unknown version return a typed `SchemaTooNew` error rather than crashing or interpreting the payload as a different schema (per ADR-004). | Proposed |
+| I-CP4 | The gateway's read path looks up compositions through the persistent store's LRU cache; cache hits do not acquire the redb transaction. Cache invalidation happens inside the same critical section as the redb commit, so a cache hit always reflects state at-or-after the last commit. | Proposed |
+| I-CP5 | When the openraft log compaction window advances past `meta.last_applied_seq`, the hydrator stops polling and emits an error log. The operator's recovery action is to drop the node's metadata redbs and restart; the persistent store re-hydrates from the snapshot. (Until the deferred snapshot-bundle ADR lands, this is the only correct behavior — see ADR-040 §D6.3.) | Proposed |
+
+---
+
 ## Open / deferred
 
 - Maximum pin TTL defaults — needs operational experience
