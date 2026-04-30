@@ -17,7 +17,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use ::redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use ::redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use kiseki_common::ids::{CompositionId, NamespaceId, SequenceNumber};
 use lru::LruCache;
 

@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// Table for Raft log entries: key = log index (u64), value = JSON bytes.

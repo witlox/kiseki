@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kiseki_common::ids::ChunkId;
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 /// Table: `chunk_id` bytes (32) → encrypted content bytes.
 const OBJECTS_TABLE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("small_objects");
