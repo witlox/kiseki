@@ -76,6 +76,13 @@ pub struct InMemoryGateway {
     /// target. Production runtimes set this from the per-cluster-
     /// size durability defaults table.
     target_copies: usize,
+    /// Optional read-path retry metrics (ADR-040 §D7 + §D10 — F-4
+    /// closure). When `Some`, the read path increments
+    /// `read_retry_total` on every retry-loop hit and
+    /// `read_retry_exhausted_total` on every budget-exhausted miss.
+    /// Tests and single-node deployments that don't wire metrics
+    /// get no-op behavior.
+    retry_metrics: Option<Arc<crate::metrics::GatewayRetryMetrics>>,
     /// Chunk plaintext cache (Phase 15c.5 perf fix). Chunks are
     /// content-addressed (`chunk_id` = HMAC over plaintext + salt)
     /// so caching decrypted bytes by `chunk_id` is correct: the
@@ -165,6 +172,7 @@ impl InMemoryGateway {
             telemetry_bus: std::sync::RwLock::new(None),
             cluster_placement: Vec::new(),
             target_copies: 0,
+            retry_metrics: None,
             decrypt_cache: std::sync::Mutex::new(DecryptCache::default()),
         }
     }
@@ -391,6 +399,17 @@ impl InMemoryGateway {
         self.target_copies = target_copies;
         self
     }
+
+    /// Attach Prometheus retry metrics (ADR-040 §D7 / F-4 closure).
+    /// Once wired, every read that exits the retry loop with a hit
+    /// increments `kiseki_gateway_read_retry_total`; every read
+    /// that exhausts the budget increments
+    /// `kiseki_gateway_read_retry_exhausted_total`.
+    #[must_use]
+    pub fn with_retry_metrics(mut self, metrics: Arc<crate::metrics::GatewayRetryMetrics>) -> Self {
+        self.retry_metrics = Some(metrics);
+        self
+    }
 }
 
 impl InMemoryGateway {
@@ -450,6 +469,9 @@ impl GatewayOps for InMemoryGateway {
         let compositions = loop {
             let guard = self.compositions.lock().await;
             if guard.get(req.composition_id).is_ok() {
+                if let Some(ref m) = self.retry_metrics {
+                    m.read_retry_total.inc();
+                }
                 break guard;
             }
             // Halt-mode short-circuit: if the hydrator can't catch up,
@@ -463,6 +485,9 @@ impl GatewayOps for InMemoryGateway {
             }
             drop(guard);
             if std::time::Instant::now() >= deadline {
+                if let Some(ref m) = self.retry_metrics {
+                    m.read_retry_exhausted_total.inc();
+                }
                 // Surface the original error path.
                 let g = self.compositions.lock().await;
                 let _ = g
@@ -1044,5 +1069,137 @@ mod telemetry_wiring_tests {
 
         assert!(alice.try_recv().is_ok(), "alice receives her event");
         assert!(bob.try_recv().is_err(), "bob must not see alice's event");
+    }
+}
+
+/// Phase 17 ADR-040 §D7 + §D6.3 / I-2 closure tests (auditor finding A1).
+///
+/// Verifies that a composition lookup which misses while the local
+/// persistent hydrator is in halt mode returns
+/// `GatewayError::ServiceUnavailable` immediately, without waiting
+/// out the retry budget. The S3-side mapping to HTTP 503 +
+/// `Retry-After` is tested in `s3_server.rs`.
+#[cfg(test)]
+mod halt_mode_tests {
+    use super::*;
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_composition::persistent::{CompositionStorage, HydrationBatch, MemoryStorage};
+    use kiseki_crypto::keys::SystemMasterKey;
+
+    /// Build a `CompositionStore` whose storage has `halted = true`.
+    fn make_halted_store() -> CompositionStore {
+        let mut storage = MemoryStorage::new();
+        storage
+            .apply_hydration_batch(HydrationBatch {
+                puts: Vec::new(),
+                removes: Vec::new(),
+                new_last_applied_seq: kiseki_common::ids::SequenceNumber(0),
+                stuck_state: Some(None),
+                halted: Some(true),
+            })
+            .expect("apply halt batch");
+        CompositionStore::with_storage(Box::new(storage))
+    }
+
+    #[tokio::test]
+    async fn read_returns_service_unavailable_when_storage_halted() {
+        let gw = InMemoryGateway::new(
+            make_halted_store(),
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            SystemMasterKey::new([0; 32], KeyEpoch(1)),
+        );
+
+        let req = ReadRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(2)),
+            composition_id: CompositionId(uuid::Uuid::new_v4()),
+            offset: 0,
+            length: u64::MAX,
+        };
+
+        let started = std::time::Instant::now();
+        let result = gw.read(req).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(GatewayError::ServiceUnavailable(_))),
+            "expected ServiceUnavailable, got {result:?}"
+        );
+        // Halt-mode short-circuit must NOT wait out the 1s budget.
+        // Allow generous slack for CI; the retry interval is 25 ms.
+        assert!(
+            elapsed.as_millis() < 100,
+            "halt-mode read took {elapsed:?} — should short-circuit",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_does_not_short_circuit_when_storage_not_halted() {
+        // Sanity: the same path on a healthy (non-halted) store
+        // surfaces `Upstream(...)` after the budget expires, NOT
+        // `ServiceUnavailable`. The halt-mode branch must be
+        // gated on the flag, not on "composition missing."
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(), // fresh, halted=false by default
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            SystemMasterKey::new([0; 32], KeyEpoch(1)),
+        );
+        // Tighten the retry budget so the test runs fast.
+        std::env::set_var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS", "50");
+
+        let req = ReadRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(2)),
+            composition_id: CompositionId(uuid::Uuid::new_v4()),
+            offset: 0,
+            length: u64::MAX,
+        };
+        let result = gw.read(req).await;
+        std::env::remove_var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS");
+        assert!(
+            matches!(result, Err(GatewayError::Upstream(_))),
+            "expected Upstream(NotFound), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_retry_metrics_increment_on_exhausted_budget() {
+        // Auditor finding A5 — verify the `_exhausted_total` counter
+        // bumps when the budget runs out. Closes F-4 (configurable +
+        // observable retry budget).
+        use prometheus::Registry;
+        let registry = Registry::new();
+        let metrics = std::sync::Arc::new(
+            crate::metrics::GatewayRetryMetrics::register(&registry)
+                .expect("register retry metrics"),
+        );
+
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            SystemMasterKey::new([0; 32], KeyEpoch(1)),
+        )
+        .with_retry_metrics(std::sync::Arc::clone(&metrics));
+
+        std::env::set_var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS", "30");
+        let req = ReadRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(2)),
+            composition_id: CompositionId(uuid::Uuid::new_v4()),
+            offset: 0,
+            length: u64::MAX,
+        };
+        let _ = gw.read(req).await;
+        std::env::remove_var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS");
+
+        assert_eq!(
+            metrics.read_retry_exhausted_total.get(),
+            1,
+            "exhausted counter must bump when budget runs out",
+        );
+        assert_eq!(metrics.read_retry_total.get(), 0, "no successful retry hit");
     }
 }

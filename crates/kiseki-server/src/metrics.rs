@@ -68,6 +68,11 @@ pub struct KisekiMetrics {
     /// `ClusteredChunkStore` and `GrpcFabricPeer` via
     /// `with_metrics(...)` at runtime construction.
     pub fabric: std::sync::Arc<kiseki_chunk_cluster::FabricMetrics>,
+
+    // --- Gateway retry budget (ADR-040 §D7 + §D10 — F-4 closure) ---
+    /// Read-path retry counters. Wired into `InMemoryGateway` via
+    /// `with_retry_metrics(...)` at runtime construction.
+    pub gateway_retry: std::sync::Arc<kiseki_gateway::metrics::GatewayRetryMetrics>,
 }
 
 impl KisekiMetrics {
@@ -207,6 +212,11 @@ impl KisekiMetrics {
                 .expect("fabric metrics register"),
         );
 
+        let gateway_retry = std::sync::Arc::new(
+            kiseki_gateway::metrics::GatewayRetryMetrics::register(&registry)
+                .expect("gateway retry metrics register"),
+        );
+
         Self {
             registry,
             raft_commit_latency,
@@ -224,6 +234,7 @@ impl KisekiMetrics {
             key_rotation_total,
             crypto_shred_total,
             fabric,
+            gateway_retry,
         }
     }
 

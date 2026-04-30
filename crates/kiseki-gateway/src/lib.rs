@@ -21,6 +21,7 @@
 
 pub mod error;
 pub mod mem_gateway;
+pub mod metrics;
 pub mod ops;
 
 #[cfg(feature = "nfs")]

@@ -579,7 +579,13 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         // Phase 16c step 2: cap per-chunk placement at the
         // size-derived `copies` so a 6-node Replication-3 cluster
         // doesn't list all 6 nodes in every cluster_chunk_state row.
-        .with_target_copies(usize::from(durability.copies));
+        .with_target_copies(usize::from(durability.copies))
+        // ADR-040 §D7 + §D10 / F-4 closure: thread the read-path
+        // retry counters (`kiseki_gateway_read_retry_total` and
+        // `kiseki_gateway_read_retry_exhausted_total`) into the
+        // gateway so operators can see whether they're hitting
+        // the configurable budget.
+        .with_retry_metrics(Arc::clone(&metrics.gateway_retry));
     // The inline path (mem_gateway.rs PUT path: writes ≤ inline_threshold
     // go to local small_store keyed by chunk_id) is single-node-only. In a
     // multi-node cluster the inline write lands on one node's redb and the

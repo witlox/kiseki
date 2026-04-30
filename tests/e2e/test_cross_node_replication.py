@@ -398,6 +398,19 @@ def test_per_shard_leader_agrees_across_nodes(cluster):
         assert info["shard_id"] == BOOTSTRAP_SHARD_ID
         assert info["leader_id"] is not None, f"node{n}: no leader reported"
         assert isinstance(info["raft_members"], list)
+        # Phase 17 ADR-040 §D6.3 / I-2 (auditor finding A2): the
+        # per-shard endpoint must surface the composition hydrator
+        # halt flag so load balancers can route around a halted
+        # node. Field always present; always `false` in steady-state
+        # multi-node runs (no compaction).
+        assert "composition_hydrator_halted" in info, (
+            f"node{n}: shard-leader response missing "
+            f"`composition_hydrator_halted` field"
+        )
+        assert info["composition_hydrator_halted"] is False, (
+            f"node{n}: hydrator unexpectedly halted in steady-state — "
+            f"compaction shouldn't fire in this test"
+        )
         leaders.append(info["leader_id"])
 
     assert len(set(leaders)) == 1, (

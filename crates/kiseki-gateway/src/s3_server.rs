@@ -1248,4 +1248,53 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"hello world");
     }
+
+    /// Auditor finding A1 — verify the halt-mode path produces 503
+    /// + Retry-After at the HTTP boundary (the gateway-side
+    /// `ServiceUnavailable` mapping is tested in
+    /// `mem_gateway::halt_mode_tests`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_object_returns_503_when_hydrator_halted() {
+        use kiseki_composition::persistent::{CompositionStorage, HydrationBatch, MemoryStorage};
+
+        // Build a CompositionStore whose backend reports halted=true.
+        let mut storage = MemoryStorage::new();
+        storage
+            .apply_hydration_batch(HydrationBatch {
+                puts: Vec::new(),
+                removes: Vec::new(),
+                new_last_applied_seq: kiseki_common::ids::SequenceNumber(0),
+                stuck_state: Some(None),
+                halted: Some(true),
+            })
+            .unwrap();
+        let comp_store = CompositionStore::with_storage(Box::new(storage));
+
+        let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
+        let gw = InMemoryGateway::new(
+            comp_store,
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            master_key,
+        );
+        let s3gw = S3Gateway::new(gw);
+        let tenant = OrgId(uuid::Uuid::nil());
+        let app = s3_router(s3gw, tenant);
+
+        // Any GET — the comp_id doesn't have to exist; halt-mode
+        // short-circuits before lookup-not-found.
+        let etag = uuid::Uuid::new_v4();
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/halted-bucket/{etag}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Retry-After header must be present so load balancers /
+        // SDK clients treat this as "try elsewhere."
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "503 must include Retry-After header",
+        );
+    }
 }

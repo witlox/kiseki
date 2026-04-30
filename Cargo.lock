@@ -1882,6 +1882,7 @@ dependencies = [
  "kiseki-log",
  "kiseki-transport",
  "kiseki-view",
+ "prometheus",
  "proptest",
  "rcgen",
  "rustls",
