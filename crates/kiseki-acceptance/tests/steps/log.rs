@@ -300,15 +300,26 @@ async fn when_node_unreachable(w: &mut KisekiWorld) {
 
 #[then("a new leader is elected from nodes 2 and 3")]
 async fn then_new_leader(w: &mut KisekiWorld) {
+    // After isolating node-1, openraft's election timeout window can run
+    // longer than the 500ms sleep in the When-step. Poll up to 5s for a
+    // leader that's NOT the isolated node — `wait_for_leader` alone may
+    // briefly observe the stale leader before re-election fires.
     let c = ensure_raft_cluster(w).await;
-    let new_leader = c
-        .wait_for_leader(std::time::Duration::from_secs(5))
-        .await
-        .expect("a new leader must be elected");
-    assert!(
-        new_leader != 1,
-        "new leader must NOT be the isolated node; got node-{new_leader}"
-    );
+    let mut last: u64 = 1;
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(5) {
+        if let Some(l) = c
+            .wait_for_leader(std::time::Duration::from_millis(250))
+            .await
+        {
+            last = l;
+            if l != 1 {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("new leader must NOT be the isolated node; got node-{last}");
 }
 
 #[then("writes resume after election completes")]

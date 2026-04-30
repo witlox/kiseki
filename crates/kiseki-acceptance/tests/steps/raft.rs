@@ -1594,8 +1594,27 @@ async fn then_node_snapshot_catchup(w: &mut KisekiWorld) {
     // Convergence assertion (snapshot transfer protocol not implemented
     // for the in-process cluster, but log replay achieves the same
     // observable state for the new voter).
+    //
+    // openraft can briefly return `Unavailable` while a learner is being
+    // promoted / membership change is committing — retry up to ~1s before
+    // failing the assertion, matching the cluster's settling window.
     let c = cluster(w);
-    let _ = c.write_delta(0xB2).await.expect("write should commit");
+    let mut last_err: Option<String> = None;
+    for _ in 0..10 {
+        match c.write_delta(0xB2).await {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(format!("{e:?}"));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        panic!("write should commit after settling: {e}");
+    }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !c.read_from(4).await.is_empty(),
