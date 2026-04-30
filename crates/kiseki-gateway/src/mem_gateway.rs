@@ -721,7 +721,7 @@ impl GatewayOps for InMemoryGateway {
             // followers can hydrate their CompositionStore from the log.
             // Older clusters that still emit a bare 16-byte UUID payload
             // are handled defensively by the hydrator (skip-and-advance).
-            let comp_payload = kiseki_composition::encode_composition_delta_payload(
+            let comp_payload = kiseki_composition::encode_composition_create_payload(
                 comp_id,
                 emit_params.2,
                 bytes_written,
@@ -852,29 +852,76 @@ impl GatewayOps for InMemoryGateway {
         _namespace_id: kiseki_common::ids::NamespaceId,
         composition_id: kiseki_common::ids::CompositionId,
     ) -> Result<(), GatewayError> {
-        // Verify tenant ownership and snapshot the routing data
-        // (shard_id, log handle) before deleting. Phase 16b step 2:
-        // we need the shard to emit DecrementChunkRefcount Raft
-        // proposals after the composition is gone.
-        let (shard_id, log) = {
-            let compositions = self.compositions.lock().await;
+        // Phase 17 item 1: emit a Delete delta to the Raft log so
+        // followers' composition hydrators can apply `delete_at` and
+        // remove the composition from their local stores. Without
+        // this, an S3 DELETE on the leader was invisible to followers
+        // (the gateway's `compositions` HashMap is per-node).
+        //
+        // Lock discipline: hold the compositions lock across (1) the
+        // tenant check, (2) the delta emit, and (3) the local delete.
+        // The hydrator polls the same Arc<Mutex<...>> so without
+        // lock-spanning we could race: hydrator applies `delete_at`
+        // (composition gone), gateway's `compositions.delete(...)`
+        // then errors with `CompositionNotFound`, S3 sees a 5xx for
+        // a delete that actually succeeded. tokio::sync::Mutex lets
+        // us hold across the emit await; release before chunk-
+        // refcount Raft work since that's a separate transaction.
+        let mut compositions = self.compositions.lock().await;
+        let (shard_id, namespace_id, log) = {
             let comp = compositions
                 .get(composition_id)
                 .map_err(|e| GatewayError::Upstream(e.to_string()))?;
             if comp.tenant_id != tenant_id {
                 return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
             }
-            (comp.shard_id, compositions.log().cloned())
+            (
+                comp.shard_id,
+                comp.namespace_id,
+                compositions.log().cloned(),
+            )
         };
 
-        // Delete the composition (sync — no lock held during Raft).
-        // Log emission for delete tombstone would go here if needed.
-        let delete_result = self
-            .compositions
-            .lock()
+        // Emit the Delete tombstone if a log is attached. If the emit
+        // fails, the local store is left intact so the operation is
+        // re-tryable from the same client. Multi-node clusters depend
+        // on this — without the delta, followers retain stale
+        // compositions until the next operator-driven full re-sync.
+        if let Some(ref log) = log {
+            let hashed_key = kiseki_composition::composition_hash_key(namespace_id, composition_id);
+            // Resolve the actual write-shard the same way as the
+            // Create path (ADR-033 multi-shard routing).
+            let routed_shard = if let Some(ref shard_map) = *self.shard_map.read().unwrap() {
+                let ns_str = namespace_id.0.to_string();
+                if let Ok(map) = shard_map.get(&ns_str, tenant_id) {
+                    kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)
+                        .unwrap_or(shard_id)
+                } else {
+                    shard_id
+                }
+            } else {
+                shard_id
+            };
+            let payload = kiseki_composition::encode_composition_delete_payload(composition_id);
+            kiseki_composition::log_bridge::emit_chunk_and_delta(
+                log.as_ref(),
+                routed_shard,
+                tenant_id,
+                kiseki_log::delta::OperationType::Delete,
+                hashed_key,
+                Vec::new(),
+                payload,
+                Vec::new(),
+            )
             .await
+            .map_err(|e| GatewayError::Upstream(format!("delete delta emit: {e}")))?;
+        }
+
+        // Local delete only after the cluster has the tombstone.
+        let delete_result = compositions
             .delete(composition_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+        drop(compositions); // release lock before chunk-refcount Raft work below
 
         // Decrement chunk refcounts only when actually removed (not
         // a versioned delete marker). I-C2: GC when refcount reaches 0.

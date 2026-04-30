@@ -167,7 +167,7 @@ def test_cross_node_read_after_leader_put(cluster):
     Closes the B-3 gap: prior to Phase 16a a PUT on node-1 left
     node-2 + node-3 with no copy of the chunk → 404 on cross-node
     GET. Phase 16a wires `ClusteredChunkStore` so the leader fans
-    the fragment out, and Phase 16e wires the composition hydrator
+    the fragment out, and Phase 16f wires the composition hydrator
     so followers can resolve the composition_id.
     """
     for n in (1, 2, 3):
@@ -304,3 +304,52 @@ def test_fabric_metrics_present_after_cross_node_write(cluster):
     assert total >= 2, (
         f"expected ≥2 fabric ops (one PUT to each of the 2 peers), got {total}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 item 1: cross-node delete
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cross_node
+def test_delete_visible_on_followers_after_settle(cluster):
+    """An S3 DELETE on node-1 must remove the composition on node-2 and node-3.
+
+    Before Phase 17 item 1, the gateway's delete path had a "log emission
+    for delete tombstone would go here if needed" TODO and never emitted
+    a Delete delta. Followers' compositions stayed alive forever and a
+    cross-node GET returned 200 long after the leader had `forgotten' the
+    object. This test forces the gap.
+    """
+    for n in (1, 2, 3):
+        _wait_s3(S3[n])
+    _wait_for_leader(1)
+
+    payload = b"phase17-delete-bytes" * 32
+    etag = _put_object(1, "delete-1", payload)
+    time.sleep(1)  # let the Create delta hydrate on followers
+
+    # Pre-condition: the composition exists on every node.
+    for n in (1, 2, 3):
+        got = _get_object(n, etag)
+        assert got == payload, f"pre-delete: node{n} disagrees with bytes"
+
+    # Issue the DELETE on the leader. S3 path uses the etag as the
+    # object key (consistent with how _get_object addresses objects).
+    resp = requests.delete(f"{S3[1]}/default/{etag}", timeout=10)
+    assert resp.status_code in (200, 204), (
+        f"DELETE via node1 failed: {resp.status_code} {resp.text!r}"
+    )
+
+    # Allow the Delete delta to hydrate on followers (~100 ms hydrator
+    # poll + apply). 1 s is 10× the budget.
+    time.sleep(1)
+
+    # Post-condition: GET returns 404 on every node, including the
+    # leader (whose compositions store dropped it inline).
+    for n in (1, 2, 3):
+        resp = requests.get(f"{S3[n]}/default/{etag}", timeout=10)
+        assert resp.status_code == 404, (
+            f"post-delete: node{n} still serves the object — "
+            f"got {resp.status_code} (Delete delta not hydrated)"
+        )

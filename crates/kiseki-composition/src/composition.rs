@@ -14,30 +14,48 @@ use crate::namespace::Namespace;
 /// stored inline in the delta payload rather than as a separate chunk.
 pub const INLINE_DATA_THRESHOLD: u64 = 4096;
 
-/// Wire size of the composition-create delta payload (Phase 16f).
+// Composition delta payloads (Phase 16f / 17 item 1).
+//
+// Each operation uses its own fixed-size payload format. The discriminator
+// is the delta header's `operation` field (already present, already
+// decoded by the hydrator), so the payload layouts don't need a leading
+// op byte. Decoders are length-checked and return `None` on mismatch so
+// the hydrator can defensively skip records from a future or legacy
+// encoding without getting stuck.
+
+/// Wire size of the **Create** payload (40 bytes).
 ///
-/// Layout, little-endian where applicable:
+/// Layout (little-endian where applicable):
 ///   `[0..16)`  `composition_id` UUID
 ///   `[16..32)` `namespace_id` UUID
 ///   `[32..40)` `bytes_written` (u64 LE)
+pub const COMPOSITION_CREATE_PAYLOAD_LEN: usize = 40;
+
+/// Wire size of the **Update** payload (24 bytes).
 ///
-/// This is what the gateway emits as the `payload` of the
-/// `AppendDelta`/`AppendChunkAndDelta` log record. Followers decode
-/// it with `decode_composition_delta_payload` and call
-/// `CompositionStore::create_at` to install the composition locally,
-/// so that a cross-node GET can resolve it.
-pub const COMPOSITION_DELTA_PAYLOAD_LEN: usize = 40;
+/// Layout (little-endian where applicable):
+///   `[0..16)` `composition_id` UUID
+///   `[16..24)` `bytes_written` (u64 LE)
+///
+/// `namespace_id` isn't carried because Update doesn't move a
+/// composition between namespaces (rename is its own op). New chunks
+/// ride in the delta header's `chunk_refs` field, same as Create.
+pub const COMPOSITION_UPDATE_PAYLOAD_LEN: usize = 24;
+
+/// Wire size of the **Delete** payload (16 bytes).
+///
+/// Layout: `[0..16)` `composition_id` UUID. No other fields needed —
+/// the follower's local store has the rest already.
+pub const COMPOSITION_DELETE_PAYLOAD_LEN: usize = 16;
 
 /// Encode a composition-create delta payload.
-///
-/// See [`COMPOSITION_DELTA_PAYLOAD_LEN`] for the layout.
 #[must_use]
-pub fn encode_composition_delta_payload(
+pub fn encode_composition_create_payload(
     comp_id: CompositionId,
     namespace_id: NamespaceId,
     bytes_written: u64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(COMPOSITION_DELTA_PAYLOAD_LEN);
+    let mut out = Vec::with_capacity(COMPOSITION_CREATE_PAYLOAD_LEN);
     out.extend_from_slice(comp_id.0.as_bytes());
     out.extend_from_slice(namespace_id.0.as_bytes());
     out.extend_from_slice(&bytes_written.to_le_bytes());
@@ -46,14 +64,13 @@ pub fn encode_composition_delta_payload(
 
 /// Decode a composition-create delta payload.
 ///
-/// Returns `None` if the payload length is wrong (e.g. an older release's
-/// 16-byte UUID-only payload). Callers should treat that as "not a
-/// composition-install record" and skip.
+/// Returns `None` if the payload length doesn't match
+/// [`COMPOSITION_CREATE_PAYLOAD_LEN`].
 #[must_use]
-pub fn decode_composition_delta_payload(
+pub fn decode_composition_create_payload(
     payload: &[u8],
 ) -> Option<(CompositionId, NamespaceId, u64)> {
-    if payload.len() != COMPOSITION_DELTA_PAYLOAD_LEN {
+    if payload.len() != COMPOSITION_CREATE_PAYLOAD_LEN {
         return None;
     }
     let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
@@ -62,6 +79,50 @@ pub fn decode_composition_delta_payload(
     size_bytes.copy_from_slice(&payload[32..40]);
     let size = u64::from_le_bytes(size_bytes);
     Some((CompositionId(comp_uuid), NamespaceId(ns_uuid), size))
+}
+
+/// Encode a composition-update delta payload.
+#[must_use]
+pub fn encode_composition_update_payload(comp_id: CompositionId, bytes_written: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COMPOSITION_UPDATE_PAYLOAD_LEN);
+    out.extend_from_slice(comp_id.0.as_bytes());
+    out.extend_from_slice(&bytes_written.to_le_bytes());
+    out
+}
+
+/// Decode a composition-update delta payload.
+///
+/// Returns `None` if the length doesn't match
+/// [`COMPOSITION_UPDATE_PAYLOAD_LEN`].
+#[must_use]
+pub fn decode_composition_update_payload(payload: &[u8]) -> Option<(CompositionId, u64)> {
+    if payload.len() != COMPOSITION_UPDATE_PAYLOAD_LEN {
+        return None;
+    }
+    let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
+    let mut size_bytes = [0u8; 8];
+    size_bytes.copy_from_slice(&payload[16..24]);
+    let size = u64::from_le_bytes(size_bytes);
+    Some((CompositionId(comp_uuid), size))
+}
+
+/// Encode a composition-delete delta payload.
+#[must_use]
+pub fn encode_composition_delete_payload(comp_id: CompositionId) -> Vec<u8> {
+    comp_id.0.as_bytes().to_vec()
+}
+
+/// Decode a composition-delete delta payload.
+///
+/// Returns `None` if the length doesn't match
+/// [`COMPOSITION_DELETE_PAYLOAD_LEN`].
+#[must_use]
+pub fn decode_composition_delete_payload(payload: &[u8]) -> Option<CompositionId> {
+    if payload.len() != COMPOSITION_DELETE_PAYLOAD_LEN {
+        return None;
+    }
+    let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
+    Some(CompositionId(comp_uuid))
 }
 
 /// A composition — metadata describing how to assemble chunks into a
@@ -289,6 +350,58 @@ impl CompositionStore {
             content_type: None,
         };
         self.compositions.insert(comp_id, comp);
+        Ok(())
+    }
+
+    /// Apply a leader-emitted Update delta to a follower's local store
+    /// (Phase 17 item 1).
+    ///
+    /// Replaces the composition's chunks + size and bumps `version`.
+    /// Idempotent: if the composition already has these exact chunks
+    /// and size, this is a no-op (don't double-bump version on
+    /// re-applied deltas).
+    ///
+    /// # Errors
+    ///
+    /// Returns `CompositionError::CompositionNotFound` if the
+    /// composition isn't present locally — Phase 16f's hydrator
+    /// applies deltas in sequence order, so a follower seeing an
+    /// Update with no prior Create indicates either a missing Create
+    /// (data-loss bug) or a hydrator that started past the Create's
+    /// sequence (operator error). Both should surface, not silently
+    /// swallow.
+    pub fn update_at(
+        &mut self,
+        comp_id: CompositionId,
+        chunks: Vec<ChunkId>,
+        size: u64,
+    ) -> Result<(), CompositionError> {
+        let comp = self
+            .compositions
+            .get_mut(&comp_id)
+            .ok_or(CompositionError::CompositionNotFound(comp_id))?;
+        if comp.chunks == chunks && comp.size == size {
+            return Ok(()); // already at target state — idempotent
+        }
+        comp.chunks = chunks;
+        comp.size = size;
+        comp.version += 1;
+        comp.has_inline_data =
+            comp.chunks.is_empty() && comp.size > 0 && comp.size <= INLINE_DATA_THRESHOLD;
+        Ok(())
+    }
+
+    /// Apply a leader-emitted Delete delta to a follower's local store
+    /// (Phase 17 item 1).
+    ///
+    /// Removes the composition. Idempotent: if the composition is
+    /// already absent (e.g. delta re-applied, or follower missed the
+    /// Create somehow), returns `Ok(())`. Chunk refcount management
+    /// is the leader's responsibility via `decrement_chunk_refcount`
+    /// on the per-shard Raft state machine (Phase 16c); the follower
+    /// just drops the composition record.
+    pub fn delete_at(&mut self, comp_id: CompositionId) -> Result<(), CompositionError> {
+        self.compositions.remove(&comp_id);
         Ok(())
     }
 }

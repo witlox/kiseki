@@ -21,9 +21,11 @@ pub mod multipart;
 pub mod namespace;
 
 pub use composition::{
-    composition_hash_key, decode_composition_delta_payload, encode_composition_delta_payload,
-    Composition, CompositionOps, DeleteResult, COMPOSITION_DELTA_PAYLOAD_LEN,
-    INLINE_DATA_THRESHOLD,
+    composition_hash_key, decode_composition_create_payload, decode_composition_delete_payload,
+    decode_composition_update_payload, encode_composition_create_payload,
+    encode_composition_delete_payload, encode_composition_update_payload, Composition,
+    CompositionOps, DeleteResult, COMPOSITION_CREATE_PAYLOAD_LEN, COMPOSITION_DELETE_PAYLOAD_LEN,
+    COMPOSITION_UPDATE_PAYLOAD_LEN, INLINE_DATA_THRESHOLD,
 };
 pub use error::CompositionError;
 pub use hydrator::CompositionHydrator;
