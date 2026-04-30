@@ -101,14 +101,14 @@ pub fn s3_router_with_keys<G: GatewayOps + Send + Sync + 'static>(
     Router::new()
         .route("/", get(list_buckets::<G>))
         .route(
-            "/:bucket",
+            "/{bucket}",
             get(list_objects::<G>)
                 .put(create_bucket::<G>)
                 .delete(delete_bucket::<G>)
                 .head(head_bucket::<G>),
         )
         .route(
-            "/:bucket/:key",
+            "/{bucket}/{key}",
             put(put_or_upload_part::<G>)
                 .get(get_object::<G>)
                 .head(head_object::<G>)

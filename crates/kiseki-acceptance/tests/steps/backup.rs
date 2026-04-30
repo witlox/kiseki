@@ -92,9 +92,9 @@ async fn handle_list(
 async fn spawn_mock_s3() -> (String, tokio::task::JoinHandle<()>) {
     let store: MockStore = Arc::new(Mutex::new(HashMap::new()));
     let app = Router::new()
-        .route("/:bucket", get(handle_list))
+        .route("/{bucket}", get(handle_list))
         .route(
-            "/:bucket/*key",
+            "/{bucket}/{*key}",
             put(handle_put).get(handle_get).delete(handle_delete),
         )
         .with_state(store);
