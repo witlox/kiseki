@@ -37,7 +37,7 @@ kiseki-advisory = { workspace = true }
 kiseki-control = { workspace = true }
 kiseki-proto = { workspace = true }
 async-trait = { workspace = true }
-axum = "0.7"
+axum = "0.8"
 libc = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
 opentelemetry = { workspace = true }
