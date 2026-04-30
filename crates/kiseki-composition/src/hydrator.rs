@@ -719,99 +719,227 @@ mod tests {
         std::env::remove_var("KISEKI_HYDRATOR_TRANSIENT_RETRIES");
     }
 
+    /// Stub `LogOps` that returns a configurable list of deltas + a
+    /// configurable `tip`. Lets the hydrator-gap-detection test
+    /// trigger §D6.3's halt-mode path without needing a log backend
+    /// that supports compaction (the in-process `MemShardStore`
+    /// doesn't model log truncation).
+    ///
+    /// Closes auditor finding A3.
+    struct GapInjectingLog {
+        deltas: std::sync::Mutex<Vec<Delta>>,
+        tip: kiseki_common::ids::SequenceNumber,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+    }
+
+    use kiseki_log::delta::Delta;
+    use kiseki_log::shard::{ShardConfig as LogShardConfig, ShardInfo, ShardState};
+
+    #[async_trait::async_trait]
+    impl LogOps for GapInjectingLog {
+        async fn append_delta(
+            &self,
+            _req: AppendDeltaRequest,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            unimplemented!("test stub: hydrator never appends")
+        }
+        async fn read_deltas(
+            &self,
+            req: ReadDeltasRequest,
+        ) -> Result<Vec<Delta>, kiseki_log::error::LogError> {
+            let d = self.deltas.lock().unwrap();
+            Ok(d.iter()
+                .filter(|x| x.header.sequence >= req.from && x.header.sequence <= req.to)
+                .cloned()
+                .collect())
+        }
+        async fn shard_health(
+            &self,
+            _shard_id: ShardId,
+        ) -> Result<ShardInfo, kiseki_log::error::LogError> {
+            Ok(ShardInfo {
+                shard_id: self.shard_id,
+                tenant_id: self.tenant_id,
+                raft_members: vec![NodeId(1)],
+                leader: Some(NodeId(1)),
+                tip: self.tip,
+                delta_count: self.deltas.lock().unwrap().len() as u64,
+                byte_size: 0,
+                state: ShardState::Healthy,
+                config: LogShardConfig::default(),
+                range_start: [0u8; 32],
+                range_end: [0xFFu8; 32],
+            })
+        }
+        async fn set_maintenance(
+            &self,
+            _shard_id: ShardId,
+            _enabled: bool,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            unimplemented!()
+        }
+        async fn truncate_log(
+            &self,
+            _shard_id: ShardId,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            unimplemented!()
+        }
+        async fn compact_shard(
+            &self,
+            _shard_id: ShardId,
+        ) -> Result<u64, kiseki_log::error::LogError> {
+            unimplemented!()
+        }
+        fn create_shard(
+            &self,
+            _shard_id: ShardId,
+            _tenant_id: OrgId,
+            _node_id: NodeId,
+            _config: LogShardConfig,
+        ) {
+            unimplemented!()
+        }
+        fn update_shard_range(
+            &self,
+            _shard_id: ShardId,
+            _range_start: [u8; 32],
+            _range_end: [u8; 32],
+        ) {
+            unimplemented!()
+        }
+        fn set_shard_state(&self, _shard_id: ShardId, _state: ShardState) {
+            unimplemented!()
+        }
+        fn set_shard_config(&self, _shard_id: ShardId, _config: LogShardConfig) {
+            unimplemented!()
+        }
+        async fn register_consumer(
+            &self,
+            _shard_id: ShardId,
+            _consumer: &str,
+            _position: kiseki_common::ids::SequenceNumber,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            unimplemented!()
+        }
+        async fn advance_watermark(
+            &self,
+            _shard_id: ShardId,
+            _consumer: &str,
+            _position: kiseki_common::ids::SequenceNumber,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            unimplemented!()
+        }
+    }
+
+    fn build_delta_at_seq(seq: u64, payload: Vec<u8>) -> Delta {
+        Delta {
+            header: kiseki_log::delta::DeltaHeader {
+                sequence: kiseki_common::ids::SequenceNumber(seq),
+                shard_id: ShardId(uuid::Uuid::from_u128(1)),
+                tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+                operation: OperationType::Create,
+                timestamp: now_timestamp(),
+                hashed_key: [0u8; 32],
+                tombstone: false,
+                chunk_refs: Vec::new(),
+                payload_size: payload.len() as u32,
+                has_inline_data: false,
+            },
+            payload: kiseki_log::delta::DeltaPayload {
+                ciphertext: payload,
+                auth_tag: Vec::new(),
+                nonce: Vec::new(),
+                system_epoch: None,
+                tenant_epoch: None,
+                tenant_wrapped_material: Vec::new(),
+            },
+        }
+    }
+
     #[tokio::test]
-    async fn hydrator_enters_halt_mode_on_log_compaction_gap() {
-        // §D6.3: if read_deltas returns first.sequence > last_applied + 1,
-        // log compaction has eaten the deltas in between. Hydrator
-        // stops polling and persists halted=true.
+    async fn hydrator_halts_when_first_delta_seq_skips_past_expected() {
+        // §D6.3 + I-CP5 (A3 closure): after read_deltas, if the first
+        // delta's sequence > last_applied + 1, the log compacted past
+        // us. Hydrator must enter halt mode.
         let store = fresh_store_with_default_ns();
-        let (log, shard_id) = fresh_log();
 
-        // Manually set last_applied to 5 — pretend we processed up to
-        // there in a prior life. Then write deltas starting at seq 100,
-        // simulating a log that's been compacted past us.
+        // Stub log: the only "visible" delta is at seq=10. The
+        // hydrator's last_applied=0, so it polls from seq=1. With no
+        // deltas in [1, 9], the first visible delta has seq=10 — gap.
+        let comp_id = CompositionId(uuid::Uuid::new_v4());
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let log = GapInjectingLog {
+            deltas: std::sync::Mutex::new(vec![build_delta_at_seq(
+                10,
+                encode_composition_create_payload(comp_id, ns_id, 1024),
+            )]),
+            tip: kiseki_common::ids::SequenceNumber(10),
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+        };
+
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
+        assert!(!hydrator.halted(), "fresh hydrator must not be halted");
+
+        let applied = hydrator.poll(&log, ShardId(uuid::Uuid::from_u128(1))).await;
+        assert_eq!(applied, 0, "halt mode must not apply anything");
+        assert!(hydrator.halted(), "hydrator must enter halt mode");
+
+        // Halt is durable — re-reading the storage's flag confirms
+        // it persisted (I-CP5).
+        let s = store.lock().await;
+        assert!(s.storage().halted().unwrap());
+    }
+
+    #[tokio::test]
+    async fn hydrator_halts_when_empty_response_but_tip_advanced() {
+        // §D6.3 second case: read_deltas returns empty AND
+        // shard_health.tip > last_applied → compaction has eaten
+        // everything in [last_applied+1, tip]. Same halt path.
+        let store = fresh_store_with_default_ns();
+
+        let log = GapInjectingLog {
+            deltas: std::sync::Mutex::new(Vec::new()), // nothing visible
+            tip: kiseki_common::ids::SequenceNumber(50), // but tip says 50
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+        };
+
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
+        let applied = hydrator.poll(&log, ShardId(uuid::Uuid::from_u128(1))).await;
+        assert_eq!(applied, 0);
+        assert!(hydrator.halted(), "empty + advanced tip must halt");
+    }
+
+    #[tokio::test]
+    async fn hydrator_does_not_halt_when_caught_up_at_tip() {
+        // Counter-case: empty response AND tip == last_applied →
+        // genuine no-new-deltas. Must NOT halt.
+        let store = fresh_store_with_default_ns();
+        // Move last_applied to 5 first.
         {
             let mut s = store.lock().await;
             s.storage_mut()
                 .apply_hydration_batch(HydrationBatch {
                     puts: Vec::new(),
                     removes: Vec::new(),
-                    new_last_applied_seq: SequenceNumber(5),
+                    new_last_applied_seq: kiseki_common::ids::SequenceNumber(5),
                     stuck_state: Some(None),
                     halted: None,
                 })
                 .unwrap();
         }
-        // Pump 100 deltas into the log to force the visible-tip past 5.
-        for _ in 1..=100 {
-            append_create(
-                &log,
-                shard_id,
-                encode_composition_create_payload(
-                    CompositionId(uuid::Uuid::new_v4()),
-                    NamespaceId(uuid::Uuid::from_u128(2)),
-                    1,
-                ),
-                vec![],
-            )
-            .await;
-        }
-
+        let log = GapInjectingLog {
+            deltas: std::sync::Mutex::new(Vec::new()),
+            tip: kiseki_common::ids::SequenceNumber(5), // we're at tip already
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+        };
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        // The hydrator's last_applied_cache is 5; from = 6. read_deltas
-        // for [6, 1005] returns deltas starting at seq 6 from the
-        // MemShardStore (which never compacts). We need a contrived
-        // case: drop deltas 6..99 from the log to fake a gap.
-        // The MemShardStore doesn't expose a way to drop deltas, so
-        // we test gap detection via a different angle: poll with
-        // last_applied set deliberately past tip.
-        //
-        // Simpler check: confirm the cached halt flag is set after
-        // a poll that detects "first delta's seq > expected".
-        // Trick: with last_applied=5 and the log starting at seq=1,
-        // the hydrator will read deltas 6..1005 — these exist starting
-        // from seq 6 (since deltas were appended in order).
-        //
-        // To actually trigger the gap path here, we set last_applied
-        // to a value past tip — read_deltas returns empty, but
-        // shard_health.tip is > last_applied_cache (which we set
-        // artificially LOW). Reset the durable last_applied_seq to
-        // higher than tip:
-        let true_tip = log.shard_health(shard_id).await.unwrap().tip;
-        {
-            let mut s = store.lock().await;
-            s.storage_mut()
-                .apply_hydration_batch(HydrationBatch {
-                    puts: Vec::new(),
-                    removes: Vec::new(),
-                    // Pretend we're way past the tip — simulates having
-                    // applied deltas that openraft has since compacted.
-                    new_last_applied_seq: SequenceNumber(true_tip.0 + 50),
-                    stuck_state: Some(None),
-                    halted: None,
-                })
-                .unwrap();
-        }
-        // Re-create the hydrator to pick up the new last_applied_cache.
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        // Now read_deltas returns nothing (we're past tip), but
-        // shard_health.tip < cached last_applied so the gap path doesn't
-        // fire. Actually — the test of *gap* detection we want is the
-        // OPPOSITE: pretend we're behind a compacted log.
-        //
-        // Without a way to compact MemShardStore, we can't directly
-        // test the "first.seq > last+1" path. Test the inverse:
-        // halt_cache stays false when no gap is seen.
-        assert!(!hydrator.halted());
-        hydrator.poll(&log, shard_id).await;
-        assert!(
-            !hydrator.halted(),
-            "no gap (we're past tip on a non-compacting log) → no halt"
-        );
-        // The actual gap-detection path is exercised end-to-end in the
-        // e2e tests where openraft's snapshot-install replaces the
-        // delta range under the hydrator. The unit-test stub here
-        // doesn't model log compaction; that's `kiseki-log` territory.
+        let applied = hydrator.poll(&log, ShardId(uuid::Uuid::from_u128(1))).await;
+        assert_eq!(applied, 0);
+        assert!(!hydrator.halted(), "caught-up steady state must not halt");
     }
 
     #[tokio::test]

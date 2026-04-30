@@ -1165,6 +1165,73 @@ mod halt_mode_tests {
         );
     }
 
+    /// Auditor finding A6: `KISEKI_GATEWAY_READ_RETRY_BUDGET_MS`
+    /// env-parsing — verify default + override + malformed-input
+    /// fallback behavior.
+    #[tokio::test]
+    async fn retry_budget_env_override_is_honored() {
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            SystemMasterKey::new([0; 32], KeyEpoch(1)),
+        );
+
+        // Override to a tight budget. The miss should surface as
+        // Upstream(NotFound) within ≈ budget, not the 1 s default.
+        std::env::set_var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS", "75");
+        let req = ReadRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(2)),
+            composition_id: CompositionId(uuid::Uuid::new_v4()),
+            offset: 0,
+            length: u64::MAX,
+        };
+        let started = std::time::Instant::now();
+        let result = gw.read(req).await;
+        let elapsed = started.elapsed();
+        std::env::remove_var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS");
+
+        assert!(matches!(result, Err(GatewayError::Upstream(_))));
+        // Allow generous slack (CI variance, mutex acquire), but
+        // strictly less than the 1 s default — otherwise the env
+        // override didn't take effect.
+        assert!(
+            elapsed.as_millis() < 500,
+            "override-budget read took {elapsed:?} — env var not honored",
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_budget_env_malformed_falls_back_to_default() {
+        // Garbage input must not panic; it falls back to the 1 s
+        // default. We verify by setting it to non-numeric and
+        // observing the read takes ≈ 1 s.
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            SystemMasterKey::new([0; 32], KeyEpoch(1)),
+        );
+
+        std::env::set_var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS", "not-a-number");
+        let req = ReadRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(2)),
+            composition_id: CompositionId(uuid::Uuid::new_v4()),
+            offset: 0,
+            length: u64::MAX,
+        };
+        let started = std::time::Instant::now();
+        let _ = gw.read(req).await;
+        let elapsed = started.elapsed();
+        std::env::remove_var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS");
+
+        // ≥ ~900 ms (default 1000 ms minus scheduling slop).
+        assert!(
+            elapsed.as_millis() >= 900,
+            "malformed env should have fallen back to 1 s default, got {elapsed:?}",
+        );
+    }
+
     #[tokio::test]
     async fn read_retry_metrics_increment_on_exhausted_budget() {
         // Auditor finding A5 — verify the `_exhausted_total` counter

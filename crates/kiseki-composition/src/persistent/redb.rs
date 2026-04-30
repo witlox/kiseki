@@ -557,6 +557,31 @@ mod tests {
         }
     }
 
+    /// Auditor finding A7 — I-CP4 for the `put()` write path.
+    /// Mirror of `cache_serves_post_commit_value_after_apply_batch`
+    /// but for the direct-write entry point. Verifies `put()` updates
+    /// the cache AFTER the redb commit, so a reader following a
+    /// `put()` always sees the new value (never the pre-commit one).
+    #[test]
+    fn cache_serves_post_commit_value_after_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PersistentRedbStorage::open(&dir.path().join("test.redb")).unwrap();
+        let mut comp = make_comp(7);
+        store.put(comp.clone()).unwrap();
+
+        // Read populates the LRU.
+        assert_eq!(store.get(comp.id).unwrap().unwrap(), comp);
+
+        // Direct put with a bumped version (gateway path uses this
+        // in `set_content_type`, `update`, `create_at`).
+        comp.version = 99;
+        store.put(comp.clone()).unwrap();
+
+        // Cache must now serve the bumped version, not the stale one.
+        let got = store.get(comp.id).unwrap().unwrap();
+        assert_eq!(got.version, 99);
+    }
+
     #[test]
     fn cache_serves_post_commit_value_after_apply_batch() {
         let dir = tempfile::tempdir().unwrap();
