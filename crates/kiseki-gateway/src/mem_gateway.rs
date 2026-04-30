@@ -270,6 +270,7 @@ impl InMemoryGateway {
         let compositions = self.compositions.lock().await;
         compositions
             .list_by_namespace(ns_id)
+            .unwrap_or_default()
             .into_iter()
             .map(|c| (c.id, c.size))
             .collect()
@@ -797,6 +798,7 @@ impl GatewayOps for InMemoryGateway {
         let compositions = self.compositions.lock().await;
         Ok(compositions
             .list_by_namespace(namespace_id)
+            .map_err(|e| GatewayError::Upstream(e.to_string()))?
             .into_iter()
             .filter(|c| c.tenant_id == tenant_id)
             .map(|c| (c.id, c.size))

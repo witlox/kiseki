@@ -46,3 +46,16 @@ impl From<CompositionError> for KisekiError {
         KisekiError::Permanent(PermanentError::InvariantViolation(e.to_string()))
     }
 }
+
+// Surface persistent-storage failures up through the composition API
+// as opaque-string `Storage(_)` errors. Callers above the gateway see
+// them via `GatewayError::Upstream(string)`; the discriminator lives
+// in `kiseki_composition_decode_errors_total{kind=...}` (ADR-040 §D10).
+impl From<crate::persistent::PersistentStoreError> for CompositionError {
+    fn from(e: crate::persistent::PersistentStoreError) -> Self {
+        // SchemaTooNew is a "binary too old" boot-time error; surface
+        // its kind label so the metric can route correctly.
+        let kind = e.metric_kind();
+        Self::Storage(format!("{kind}: {e}"))
+    }
+}

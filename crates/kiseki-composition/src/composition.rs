@@ -183,8 +183,10 @@ pub trait CompositionOps {
         size: u64,
     ) -> Result<CompositionId, CompositionError>;
 
-    /// Read a composition by ID.
-    fn get(&self, id: CompositionId) -> Result<&Composition, CompositionError>;
+    /// Read a composition by ID. Returns an owned `Composition`
+    /// (ADR-040 — the persistent backend can't lend across a dropped
+    /// redb txn).
+    fn get(&self, id: CompositionId) -> Result<Composition, CompositionError>;
 
     /// Delete a composition. Returns `DeleteMarker` if versioning is
     /// enabled on the namespace.
@@ -225,27 +227,58 @@ pub trait CompositionOps {
     fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError>;
 }
 
-/// In-memory composition store.
+/// Composition store — wraps a `CompositionStorage` backend.
 ///
-/// When a `LogOps` implementation is attached via `with_log`, mutations
-/// emit deltas to the log shard (Composition → Log data path).
+/// Phase 17 ADR-040 introduces the `CompositionStorage` seam so the
+/// same struct can be backed by either an in-memory `HashMap` (tests,
+/// single-node deployments) or a redb-backed sibling that survives
+/// restart. `namespaces` and `multiparts` stay in-memory regardless
+/// (ADR-040 §D11). When a `LogOps` is attached via `with_log`,
+/// mutations emit deltas to the log shard.
+///
+/// Method semantics that changed in ADR-040:
+///   - `get` and `list_by_namespace` now return owned `Composition`
+///     values (the persistent backend can't lend references across a
+///     dropped redb transaction). All call sites accept this since
+///     `Composition` is `Clone` and the field accesses they perform
+///     work uniformly on owned + borrowed values.
 pub struct CompositionStore {
-    compositions: HashMap<CompositionId, Composition>,
+    storage: Box<dyn crate::persistent::CompositionStorage>,
     namespaces: HashMap<NamespaceId, Namespace>,
     multiparts: HashMap<String, (MultipartUpload, NamespaceId)>,
     log: Option<Arc<dyn LogOps + Send + Sync>>,
 }
 
 impl CompositionStore {
-    /// Create an empty composition store.
+    /// Create an empty composition store with the in-memory backend.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_storage(Box::new(crate::persistent::MemoryStorage::new()))
+    }
+
+    /// Create a composition store with an explicit storage backend
+    /// (e.g. `PersistentRedbStorage` for multi-node deployments).
+    #[must_use]
+    pub fn with_storage(storage: Box<dyn crate::persistent::CompositionStorage>) -> Self {
         Self {
-            compositions: HashMap::new(),
+            storage,
             namespaces: HashMap::new(),
             multiparts: HashMap::new(),
             log: None,
         }
+    }
+
+    /// Borrow the storage backend (used by the hydrator for atomic
+    /// `apply_hydration_batch` and direct meta-state reads).
+    #[must_use]
+    pub fn storage(&self) -> &dyn crate::persistent::CompositionStorage {
+        self.storage.as_ref()
+    }
+
+    /// Borrow the storage backend mutably (hydrator's batch-apply
+    /// path needs `&mut self` on the trait method).
+    pub fn storage_mut(&mut self) -> &mut dyn crate::persistent::CompositionStorage {
+        self.storage.as_mut()
     }
 
     /// Attach a log store for delta emission.
@@ -278,18 +311,27 @@ impl CompositionStore {
     }
 
     /// Total composition count.
-    #[must_use]
-    pub fn count(&self) -> usize {
-        self.compositions.len()
+    ///
+    /// # Errors
+    ///
+    /// Returns `CompositionError::Storage` if the storage backend
+    /// fails (rare; only persistent backends fail this).
+    pub fn count(&self) -> Result<u64, CompositionError> {
+        Ok(self.storage.count()?)
     }
 
-    /// List all compositions in a namespace.
-    #[must_use]
-    pub fn list_by_namespace(&self, ns_id: NamespaceId) -> Vec<&Composition> {
-        self.compositions
-            .values()
-            .filter(|c| c.namespace_id == ns_id)
-            .collect()
+    /// List all compositions in a namespace. Returns owned
+    /// `Composition` values (ADR-040 — the persistent backend can't
+    /// lend across a dropped redb transaction).
+    ///
+    /// # Errors
+    ///
+    /// Returns `CompositionError::Storage` on storage failure.
+    pub fn list_by_namespace(
+        &self,
+        ns_id: NamespaceId,
+    ) -> Result<Vec<Composition>, CompositionError> {
+        Ok(self.storage.list_in_namespace(ns_id)?)
     }
 
     /// Attach a Content-Type to an existing composition (RFC 6838
@@ -300,17 +342,19 @@ impl CompositionStore {
     /// # Errors
     ///
     /// Returns `CompositionError::CompositionNotFound` if `id` is
-    /// not in the store.
+    /// not in the store; `CompositionError::Storage` on backend
+    /// failure.
     pub fn set_content_type(
         &mut self,
         id: CompositionId,
         content_type: Option<String>,
     ) -> Result<(), CompositionError> {
-        let comp = self
-            .compositions
-            .get_mut(&id)
+        let mut comp = self
+            .storage
+            .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.content_type = content_type;
+        self.storage.put(comp)?;
         Ok(())
     }
 
@@ -335,7 +379,7 @@ impl CompositionStore {
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<(), CompositionError> {
-        if self.compositions.contains_key(&comp_id) {
+        if self.storage.get(comp_id)?.is_some() {
             return Ok(()); // already hydrated — idempotent
         }
         let ns = self
@@ -354,7 +398,7 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
         };
-        self.compositions.insert(comp_id, comp);
+        self.storage.put(comp)?;
         Ok(())
     }
 
@@ -381,9 +425,9 @@ impl CompositionStore {
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<(), CompositionError> {
-        let comp = self
-            .compositions
-            .get_mut(&comp_id)
+        let mut comp = self
+            .storage
+            .get(comp_id)?
             .ok_or(CompositionError::CompositionNotFound(comp_id))?;
         if comp.chunks == chunks && comp.size == size {
             return Ok(()); // already at target state — idempotent
@@ -393,6 +437,7 @@ impl CompositionStore {
         comp.version += 1;
         comp.has_inline_data =
             comp.chunks.is_empty() && comp.size > 0 && comp.size <= INLINE_DATA_THRESHOLD;
+        self.storage.put(comp)?;
         Ok(())
     }
 
@@ -405,8 +450,12 @@ impl CompositionStore {
     /// is the leader's responsibility via `decrement_chunk_refcount`
     /// on the per-shard Raft state machine (Phase 16c); the follower
     /// just drops the composition record.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CompositionError::Storage` on backend failure.
     pub fn delete_at(&mut self, comp_id: CompositionId) -> Result<(), CompositionError> {
-        self.compositions.remove(&comp_id);
+        self.storage.remove(comp_id)?;
         Ok(())
     }
 }
@@ -446,13 +495,13 @@ impl CompositionOps for CompositionStore {
             has_inline_data,
             content_type: None,
         };
-        self.compositions.insert(id, comp);
+        self.storage.put(comp)?;
         Ok(id)
     }
 
-    fn get(&self, id: CompositionId) -> Result<&Composition, CompositionError> {
-        self.compositions
-            .get(&id)
+    fn get(&self, id: CompositionId) -> Result<Composition, CompositionError> {
+        self.storage
+            .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))
     }
 
@@ -462,39 +511,37 @@ impl CompositionOps for CompositionStore {
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<u64, CompositionError> {
-        let comp = self
-            .compositions
-            .get_mut(&id)
+        let mut comp = self
+            .storage
+            .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.version += 1;
         comp.chunks.clone_from(&chunks);
         comp.size = size;
-        Ok(comp.version)
+        let version = comp.version;
+        self.storage.put(comp)?;
+        Ok(version)
     }
 
     fn delete(&mut self, id: CompositionId) -> Result<DeleteResult, CompositionError> {
-        let comp = self
-            .compositions
-            .get(&id)
+        let mut comp = self
+            .storage
+            .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
 
-        let ns = self.namespaces.get(&comp.namespace_id);
-        let versioning = ns.is_some_and(|n| n.versioning_enabled);
+        let versioning = self
+            .namespaces
+            .get(&comp.namespace_id)
+            .is_some_and(|n| n.versioning_enabled);
 
         if versioning {
             // Versioned delete: keep all versions, just bump version as
             // a tombstone marker. Chunk refcounts are NOT decremented.
-            let comp = self
-                .compositions
-                .get_mut(&id)
-                .ok_or(CompositionError::CompositionNotFound(id))?;
             comp.version += 1;
+            self.storage.put(comp)?;
             Ok(DeleteResult::DeleteMarker)
         } else {
-            let comp = self
-                .compositions
-                .remove(&id)
-                .ok_or(CompositionError::CompositionNotFound(id))?;
+            self.storage.remove(id)?;
             Ok(DeleteResult::Removed(comp.chunks))
         }
     }
@@ -504,9 +551,9 @@ impl CompositionOps for CompositionStore {
         id: CompositionId,
         target_namespace: NamespaceId,
     ) -> Result<(), CompositionError> {
-        let comp = self
-            .compositions
-            .get(&id)
+        let mut comp = self
+            .storage
+            .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
 
         let target_ns = self
@@ -522,11 +569,8 @@ impl CompositionOps for CompositionStore {
             ));
         }
 
-        let comp = self
-            .compositions
-            .get_mut(&id)
-            .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.namespace_id = target_namespace;
+        self.storage.put(comp)?;
         Ok(())
     }
 
@@ -799,7 +843,7 @@ mod tests {
             .create(test_ns(), vec![ChunkId([0x03; 32])], 300)
             .unwrap_or_else(|_| unreachable!());
 
-        let listed = store.list_by_namespace(test_ns());
+        let listed = store.list_by_namespace(test_ns()).unwrap();
         assert_eq!(listed.len(), 3);
 
         let listed_ids: Vec<CompositionId> = listed.iter().map(|c| c.id).collect();
@@ -811,20 +855,20 @@ mod tests {
     #[test]
     fn count_tracks_compositions() {
         let mut store = setup();
-        assert_eq!(store.count(), 0);
+        assert_eq!(store.count().unwrap(), 0);
 
         store
             .create(test_ns(), vec![], 0)
             .unwrap_or_else(|_| unreachable!());
-        assert_eq!(store.count(), 1);
+        assert_eq!(store.count().unwrap(), 1);
 
         let id2 = store
             .create(test_ns(), vec![], 0)
             .unwrap_or_else(|_| unreachable!());
-        assert_eq!(store.count(), 2);
+        assert_eq!(store.count().unwrap(), 2);
 
         let _ = store.delete(id2).unwrap_or_else(|_| unreachable!());
-        assert_eq!(store.count(), 1);
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     // ===================================================================
@@ -943,7 +987,7 @@ mod tests {
             .unwrap();
 
         // Before finalize: no composition exists for these parts (I-L5).
-        assert_eq!(store.count(), 0);
+        assert_eq!(store.count().unwrap(), 0);
 
         let comp_id = store.finalize_multipart(&upload_id).unwrap();
         let comp = store.get(comp_id).unwrap();
@@ -967,7 +1011,7 @@ mod tests {
         store.abort_multipart(&upload_id).unwrap();
 
         // No composition was created — chunks have refcount 0.
-        assert_eq!(store.count(), 0);
+        assert_eq!(store.count().unwrap(), 0);
 
         // Verify the upload is in Aborted state — cannot finalize.
         let result = store.finalize_multipart(&upload_id);
@@ -1145,19 +1189,19 @@ mod tests {
         // chunk writes. If the caller does not pass chunk IDs (simulating
         // a chunk write failure), no composition is created.
         let mut store = setup();
-        let initial_count = store.count();
+        let initial_count = store.count().unwrap();
 
         // Simulate: chunk write failed, so we never call create().
         // Verify the store has no partial state.
-        assert_eq!(store.count(), initial_count);
+        assert_eq!(store.count().unwrap(), initial_count);
 
         // Also: creating with valid chunks then deleting leaves no trace.
         let id = store
             .create(test_ns(), vec![ChunkId([0xff; 32])], 100)
             .unwrap();
-        assert_eq!(store.count(), initial_count + 1);
+        assert_eq!(store.count().unwrap(), initial_count + 1);
         let _ = store.delete(id).unwrap();
-        assert_eq!(store.count(), initial_count);
+        assert_eq!(store.count().unwrap(), initial_count);
     }
 
     // --- Scenario: Delta commit fails after chunk write succeeds ---
@@ -1228,12 +1272,12 @@ mod tests {
                 .unwrap();
             ids.push(id);
         }
-        assert_eq!(store.count(), 10);
+        assert_eq!(store.count().unwrap(), 10);
 
         for id in &ids[..5] {
             let _ = store.delete(*id).unwrap();
         }
-        assert_eq!(store.count(), 5);
+        assert_eq!(store.count().unwrap(), 5);
     }
 
     // --- Scenario: Hint cannot enable cross-namespace creation (I-WA14) ---

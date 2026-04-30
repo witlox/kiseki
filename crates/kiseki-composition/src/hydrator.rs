@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(hydrator.poll(&log, shard_id).await, 1);
         assert_eq!(hydrator.poll(&log, shard_id).await, 0);
         assert_eq!(hydrator.poll(&log, shard_id).await, 0);
-        assert_eq!(store.lock().await.count(), 1);
+        assert_eq!(store.lock().await.count().unwrap(), 1);
     }
 
     #[tokio::test]
