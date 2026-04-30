@@ -120,9 +120,32 @@ captures the decisions across two revisions:
 Six invariants `I-CP1`..`I-CP6` added to `specs/invariants.md`.
 
 **Adversary status**: rev 1 findings F-1..F-7 (Critical + High)
-are addressed in rev 2 inline. F-8..F-17 (Medium + Low) are
-deferred to implementation review. Awaiting **rev 2 adversary
-sign-off** before implementer starts.
+addressed in rev 2 inline. F-8..F-17 (Medium + Low) deferred to
+implementation review. **Rev 2 adversary sign-off** conditionally
+accepted: two new Medium findings (N-1, N-4) carried as required
+implementation-review tickets I-1 and I-2. Architect rev 3 not
+required; implementer can start.
+
+### Implementation-review tickets carried with the impl PRs
+
+- **I-1 (closes N-1)**: persist the transient-skip retry counter.
+  Add two `meta` keys to the redb (`stuck_at_seq`,
+  `stuck_retries`); on boot, read both — if
+  `stuck_at_seq == last_applied_seq + 1` resume the counter,
+  otherwise reset. Required so I-CP6's exhausted-retries alarm
+  fires reliably in crash-loop scenarios where the in-memory
+  counter resets on every boot. Revise I-CP6 to add: "the retry
+  counter is durable in the same redb transaction as
+  `last_applied_seq`."
+- **I-2 (closes N-4)**: gateway returns HTTP 503 (with
+  `Retry-After`) for composition lookups that miss the local
+  persistent store **when the hydrator is in halt mode**. Phase
+  17 item 4's `/cluster/shards/{id}/leader` endpoint should also
+  surface a halt-mode flag. Required so load balancers and
+  multi-gateway clients route around a halted node instead of
+  caching the spurious 404.
+
+The auditor verifies both tickets are addressed at Gate 2.
 
 ### Original architect scope (now satisfied):
 

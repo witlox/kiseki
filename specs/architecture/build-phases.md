@@ -698,8 +698,12 @@ captured in `specs/implementation/phase-17-cross-node-followups.md`.
   sequence-comparison gap detection, configurable retry budget,
   typed errors, 13 observability metrics, persistence scope
   limited to `compositions`). Six invariants `I-CP1`..`I-CP6`
-  added. **Pending rev 2 adversary sign-off before
-  implementation starts.**
+  added. **Rev 2 adversary sign-off**: conditionally accepted with
+  two new Medium findings (N-1: persist the transient-skip retry
+  counter so a crash-loop alarms; N-4: gateway returns 503 in
+  halt mode so load balancers route around) tracked as required
+  implementation-review tickets I-1 and I-2 — architect rev 3 not
+  required, implementation can start.
 - After all items land: auditor pass (Gate 2 step-depth
   verification), integrator pass (cross-context check), final
   adversary pass, then v2026.39+ release.

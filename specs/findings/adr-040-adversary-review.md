@@ -579,3 +579,271 @@ revision.
 
 **Status**: Block implementation pending architect revision on
 F-1..F-7. Re-review after revision.
+
+---
+
+# Rev 2 sign-off pass
+
+**Reviewer**: Adversary role (same)
+**Date**: 2026-04-30
+**Subject**: ADR-040 rev 2 (commit `7f7c524`) — architect's response
+to the rev 1 findings above
+**Verdict**: **Conditionally accepted.** F-1..F-7 are closed
+cleanly. Two new Medium findings (N-1 and N-4) emerge from the
+resolutions and should be addressed during implementation review,
+not as architect rev-3 blockers. Four new Low findings (N-2, N-3,
+N-5, N-6) are advisory.
+
+## Closure verification
+
+| ID | Resolution location | Verified? |
+|---|---|---|
+| F-1 | §D5.1 + I-CP6 (transient/permanent skip) | ✅ closed; see N-1 follow-up |
+| F-2 | §D5 drops `last_applied_log_index` | ✅ closed |
+| F-3 | §D6.3 sequence-comparison gap detection | ✅ closed; see N-3, N-4 follow-ups |
+| F-4 | §D7 configurable budget + 2 metrics | ✅ closed |
+| F-5 | §D8.1 `PersistentStoreError` enum | ✅ closed; see E2 advisory |
+| F-6 | §D10 13 metrics | ✅ closed; see N-5 advisory |
+| F-7 | §D11 only `compositions` is persisted | ✅ closed; see N-6 follow-up on ViewStore |
+
+## New findings introduced by rev 2
+
+### Finding N-1: Transient-skip retry counter is in-memory; a crash-looping node never alarms
+
+**Severity**: Medium
+**Category**: Robustness > Observability gaps
+**Location**: ADR-040 §D5.1, I-CP6
+**Spec reference**: I-CP6 ("After `KISEKI_HYDRATOR_TRANSIENT_RETRIES`
+consecutive transient skips...")
+
+**Description**: §D5.1 says "The retry counter is in-memory (it
+doesn't have to survive a crash — on restart, the loop just
+retries from durable `last_applied_seq + 1` and the counter
+resets)." This is correct for steady-state uptime but **wrong for
+a crash-loop scenario**.
+
+A node experiencing repeated short-lived crashes (segfault, OOM-
+kill, panic-on-startup-of-a-different-subsystem) restarts the
+hydrator on every boot. Each restart resets the counter to 0.
+A genuinely permanent transient condition (e.g. a tenant-created
+namespace that won't be replicated to this node until Phase 18
+ships) never accumulates 100 consecutive retries within a single
+process lifetime. The
+`kiseki_composition_hydrator_skip_total{reason="exhausted_retries"}`
+counter never increments. The
+`kiseki_composition_hydrator_stalled` gauge resets to 0 on every
+boot. **Operators have no alarm signal.**
+
+The hydrator is stuck — repeatedly retrying the same delta on
+every boot, never advancing — but observably indistinguishable from
+"node has just started, hydrator hasn't ticked yet."
+
+**Evidence**: Trace through a 3-node cluster where node-2's
+kiseki-server is in a panic-on-startup loop. Log has 1000
+deltas; deltas 500-1000 reference a namespace that's missing on
+node-2. node-2's hydrator on each boot:
+1. Reads `last_applied_seq = 499` (durable from previous boot's
+   successful applies of 1-499).
+2. Polls `read_deltas(500, 1499)` → returns deltas 500-1000.
+3. Tries to apply delta 500 → `NamespaceNotFound` → transient
+   skip, counter = 1.
+4. Process crashes (unrelated reason).
+5. Counter resets to 0 on next boot.
+6. Goto 2.
+
+Stalled gauge stays 0, exhausted_retries stays 0, and the
+operator's only signal is the silent absence of advancing
+`last_applied_seq`.
+
+**Suggested resolution**: Persist the retry counter alongside
+`last_applied_seq`. Two extra `meta` keys:
+
+- `meta.stuck_at_seq: SequenceNumber` — the delta the hydrator
+  is currently retrying.
+- `meta.stuck_retries: u32` — accumulated retry count for that
+  delta.
+
+On boot: read both. If `stuck_at_seq == last_applied_seq + 1`,
+resume retrying from the existing counter. If
+`stuck_at_seq != last_applied_seq + 1` (e.g. hydrator advanced
+past the stuck delta in a prior session), reset both. The
+exhausted-retries promotion to permanent skip then triggers
+correctly across restarts.
+
+I-CP6 should be revised to add: "The retry counter is durable in
+the same redb transaction as `last_applied_seq`."
+
+### Finding N-2: F-1 (advance-past) and F-3 (halt) take inconsistent stances on the same trade-off axis
+
+**Severity**: Low
+**Category**: Correctness > Semantic drift
+**Location**: ADR-040 §D5.1 vs §D6.3
+
+**Description**: §D5.1 (F-1 resolution) chooses **advance-past**
+on exhausted retries: lose one record, keep going. §D6.3 (F-3
+resolution) chooses **halt mode** on compaction gap: preserve
+correctness, stall reads. These are inconsistent stances on the
+same trade-off ("does the hydrator preserve all records vs. keep
+serving").
+
+**The architect's defensible argument** (which the ADR doesn't
+make explicitly): F-1's "advance-past" loses *one* record at a
+time, recoverable by operator if they investigate the alarm and
+re-emit the delta. F-3's compaction-gap could be losing *thousands
+to millions* of records — the magnitude justifies the stricter
+halt-mode response.
+
+**Suggested resolution**: Add a one-paragraph note in §D5.1
+explaining why advance-past is OK for transient-exhausted but
+halt is required for compaction-gap. This isn't a bug, it's a
+design choice that needs explicit justification so the next
+maintainer doesn't try to "make them consistent" by changing one
+to match the other.
+
+### Finding N-3: §D6.3's gap detection requires `shard_health()` success, no fallback specified
+
+**Severity**: Low
+**Category**: Robustness > Failure cascades
+**Location**: ADR-040 §D6.3
+
+**Description**: §D6.3's table includes the row "Empty AND
+`shard_health(shard).tip > last_applied` → halt mode". If
+`shard_health()` itself fails (network blip, log_store missing,
+log_store stalled), the hydrator can't distinguish "no new deltas
+yet" from "compaction has eaten the deltas". The ADR doesn't say
+what to do.
+
+Implementer's likely behavior without guidance: log the
+shard_health error and treat as "no new deltas yet" (sleep,
+retry). This is the safe default — never spuriously enter halt
+mode on a transient log_store hiccup.
+
+**Suggested resolution**: One line in §D6.3:
+"`shard_health()` failures are treated as transient (next-poll
+retry); halt mode requires a successful `shard_health()` reading
+that confirms `tip > last_applied`."
+
+### Finding N-4: Halt-mode signals 404 to S3 clients; load balancers can't route around the failed node
+
+**Severity**: Medium
+**Category**: Robustness > Observability gaps
+**Location**: ADR-040 §D6.3 ("operator recovery procedure")
+
+**Description**: When a node enters halt mode, its persistent
+store remains servable for compositions that already exist
+locally; lookups for compositions created during the halted
+window return 404 from the gateway. From an S3 client's
+perspective, **the object "doesn't exist."** A load balancer's
+health check sees the gateway returning 200 OK to other requests
+and keeps routing traffic to the halted node. Different requests
+land on different nodes; clients see flapping 404s based on
+which node served them.
+
+The Phase 16f gateway-side 1-second retry doesn't help here —
+the retry happens against the same node, which still doesn't
+have the composition.
+
+**Suggested resolution**: Add §D6.3.1 specifying the gateway's
+behavior in halt mode:
+
+- Option A: On halt, the gateway returns **HTTP 503 Service
+  Unavailable** with a `Retry-After` header for any
+  composition lookup that misses the local store. Load
+  balancers treat 503 as "try elsewhere" and route around.
+  Existing-composition reads (cache hit or redb hit) still
+  return 200.
+- Option B: Halt-mode is exposed via `/cluster/info` and
+  `/cluster/shards/{id}/leader`. Load balancers and clients
+  scrape this and route around. Doesn't fix in-flight 404s.
+
+Option A is operator-friendlier; Option B is more honest. The
+architect picks one and the implementer wires it.
+
+The current rev 2 ADR is silent on this and leaves the gateway's
+behavior up to the implementer's interpretation.
+
+### Finding N-5: §D10's histogram bucket convention not specified
+
+**Severity**: Low
+**Category**: Robustness > Observability gaps
+**Location**: ADR-040 §D10
+
+**Description**: §D10 lists
+`kiseki_composition_hydrator_apply_duration_seconds` as a
+histogram but doesn't specify buckets. Phase 16's existing
+histograms (e.g. `kiseki_fabric_*`) follow a convention; the
+implementer should match it for consistency in dashboards.
+
+**Suggested resolution**: One sentence: "Histogram buckets follow
+the Phase 16 fabric-metrics convention (TBD by inspecting
+`crates/kiseki-server/src/metrics.rs`)." Or specify
+`prometheus::exponential_buckets(0.0001, 2.0, 16)` covering
+100 µs to 6.5 s.
+
+### Finding N-6: §D11's ViewStore scope underspecified
+
+**Severity**: Low
+**Category**: Correctness > Spec compliance
+**Location**: ADR-040 §D11
+
+**Description**: §D11 says "For ViewStore: the analogous decision
+is 'all of it persists' since views aren't transient state.
+Architect's call; implementer follows the same shape (one redb,
+two tables)." This is a partial deferral. ViewStore has multiple
+internal maps (descriptors, watermarks, view state); the
+implementer might not pick the right shape without explicit
+guidance.
+
+**Suggested resolution**: Either expand §D11 to spec the ViewStore
+schema (mirror the compositions table; add `views` keyed by
+`ViewId` with postcard-encoded `View`), or punt to a separate
+ADR-040.1 once the implementer has the compositions persistence
+working and can ground the ViewStore design in the same code.
+
+The latter is fine — the architect deferring further until the
+compositions side is grounded is a reasonable call. Just be
+explicit that ViewStore implementation can wait for that
+follow-up.
+
+## Standing concerns from rev 1 — still appropriate
+
+The rev 1 "Adversary review" section's six standing concerns
+remain valid as **implementation-review guidance** (auditor
+verifies these at gate 2, post-impl adversary verifies in code):
+
+1. Cache-coherence under concurrent reads + writes — implementer
+   must hold both inner mutexes during the commit-and-update
+   window.
+2. Hydrator restart between commit and cache update — analysis
+   shows no data risk; cache repopulates on next read.
+3. Two hydrators racing at startup — redb single-writer is the
+   safety net; document operator-error symptom.
+4. `install_snapshot` mid-poll — D6.3 covers case (b);
+   case (a) doesn't apply under D6.1.
+5. Postcard non-determinism — implementer verifies no
+   `HashMap`/`HashSet` fields on persisted types.
+6. Snapshot install vs. running hydrator — D6.2 territory.
+
+## Recommendation
+
+**Accept rev 2 conditionally.** The implementer can start, with
+two implementation-review tickets carried alongside the impl PRs:
+
+- **Ticket I-1 (corresponds to N-1)**: persist the transient-skip
+  retry counter. Required to make the I-CP6 alarm reliable across
+  restarts. Implementer adds two meta keys + boot-side reconciliation.
+- **Ticket I-2 (corresponds to N-4)**: gateway returns 503 (or
+  exposes halt-mode status) when the local persistent store is in
+  halt mode. Required for clean load-balancer behavior.
+
+N-2, N-3, N-5, N-6 are advisory; the implementer can choose to
+address them inline or punt to follow-up. The auditor verifies all
+six at gate 2.
+
+**Architect rev 3 not required.** The two new findings are
+implementer-actionable; making the architect take another pass
+would be wasted-cycle ceremony.
+
+**Status**: Sign off rev 2 → unblock implementation → I-1 + I-2
+tracked as required follow-ups during impl → auditor + post-impl
+adversary verify at gates.
