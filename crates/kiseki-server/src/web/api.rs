@@ -54,6 +54,7 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/ui/api/ops/backup", post(ops_backup))
         .route("/ui/api/ops/scrub", post(ops_scrub))
         .route("/cluster/info", get(cluster_info))
+        .route("/cluster/shards/:shard_id/leader", get(shard_leader))
         .with_state(state)
 }
 
@@ -363,6 +364,53 @@ async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
             })
         }).collect::<Vec<_>>(),
     }))
+}
+
+/// Per-shard leader info (Phase 17 item 4).
+///
+/// `cluster/info` reports a cluster-level `leader_id` derived from the
+/// bootstrap shard, but Raft elections are per-shard: a write to a
+/// non-bootstrap shard can fail with `LeaderUnavailable: ShardId(X)`
+/// even when `cluster/info` shows a healthy leader for shard 1.
+/// Clients (and tests) that need to know "is shard X writable right
+/// now?" should poll this endpoint.
+///
+/// Returns 404 if the shard isn't known on this node (the common
+/// non-error reason — the requesting client is asking the wrong node;
+/// the proper response is to retry against another peer).
+async fn shard_leader(
+    State(state): State<UiState>,
+    axum::extract::Path(shard_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Ok(uuid) = uuid::Uuid::parse_str(&shard_id_str) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "shard_id must be a UUID"})),
+        );
+    };
+    let shard_id = kiseki_common::ids::ShardId(uuid);
+    let Some(ref log) = state.log_store else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "log store not initialized"})),
+        );
+    };
+    match log.shard_health(shard_id).await {
+        Ok(info) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "shard_id": info.shard_id.0.to_string(),
+                "leader_id": info.leader.map(|n| n.0),
+                "raft_members": info.raft_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                "last_committed_seq": info.tip.0,
+                "state": format!("{:?}", info.state),
+            })),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
 }
 
 fn chrono_lite() -> String {

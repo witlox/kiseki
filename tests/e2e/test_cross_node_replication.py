@@ -70,57 +70,67 @@ def _wait_s3(base_url: str, timeout: float = 30.0) -> None:
     )
 
 
-def _wait_for_leader(node: int, timeout: float = 30.0) -> None:
-    """Block until the cluster has elected a Raft leader visible on this node.
+BOOTSTRAP_SHARD_ID = "00000000-0000-0000-0000-000000000001"
 
-    `_wait_s3` only confirms the HTTP listener is up; after a node restart
-    the S3 gateway accepts connections before Raft has elected a leader,
-    and writes hit `LeaderUnavailable` until election finishes. Tests that
-    follow a node-restart should call this to avoid a flaky 500."""
+
+def _wait_for_shard_leader(
+    node: int,
+    shard_id: str = BOOTSTRAP_SHARD_ID,
+    timeout: float = 30.0,
+) -> None:
+    """Block until `node` reports a leader for the given Raft shard.
+
+    Phase 17 item 4 added `GET /cluster/shards/{shard_id}/leader` for
+    exactly this — `cluster/info` reports a cluster-level leader, but
+    Raft elections are per-shard, and a write to a non-bootstrap shard
+    can fail with `LeaderUnavailable: ShardId(X)` even when
+    `cluster/info` looks healthy. Tests that follow a node-restart
+    poll this surface to wait for the right thing.
+    """
     deadline = time.monotonic() + timeout
     last_seen: str = ""
     while time.monotonic() < deadline:
         try:
-            metrics_url = METRICS[node]
-            resp = requests.get(f"{metrics_url}/cluster/info", timeout=2)
+            resp = requests.get(
+                f"{METRICS[node]}/cluster/shards/{shard_id}/leader", timeout=2
+            )
             if resp.status_code == 200:
                 info = resp.json()
-                leader_id = info.get("leader_id")
-                if leader_id:
+                if info.get("leader_id") is not None:
                     return
                 last_seen = f"no leader_id in {info}"
+            else:
+                last_seen = f"HTTP {resp.status_code}"
         except requests.RequestException as e:
             last_seen = str(e)
-        time.sleep(0.5)
+        time.sleep(0.25)
     raise RuntimeError(
-        f"Raft leader not elected on node{node} after {timeout}s: {last_seen}"
+        f"Raft leader not elected on node{node} for shard "
+        f"{shard_id} after {timeout}s: {last_seen}"
     )
+
+
+# Backwards-compat name kept while in-flight Phase 17 work lands; new
+# tests should use the shard-specific helper directly.
+def _wait_for_leader(node: int, timeout: float = 30.0) -> None:
+    _wait_for_shard_leader(node, BOOTSTRAP_SHARD_ID, timeout)
 
 
 def _put_object(node: int, key: str, data: bytes) -> str:
-    """PUT an object via the named node's S3 listener; return the etag (=
-    server-assigned object id) used for retrieval.
+    """PUT an object via the named node's S3 listener; return the etag.
 
-    Retries briefly on retriable 5xx so a test arriving in the middle of
-    a Raft re-election (e.g. just after a `stop_node` cleanup elsewhere
-    in this module) doesn't fail with `LeaderUnavailable` for what is a
-    transient gateway-internal condition. The retry window is bounded —
-    a genuine bug surfaces fast."""
-    deadline = time.monotonic() + 30.0
-    last_resp: requests.Response | None = None
-    while time.monotonic() < deadline:
-        last_resp = requests.put(f"{S3[node]}/default/{key}", data=data, timeout=10)
-        if last_resp.status_code in (200, 201):
-            etag = last_resp.headers.get("ETag", "").strip('"')
-            assert etag, f"PUT response missing ETag header: {last_resp.headers}"
-            return etag
-        if last_resp.status_code not in (500, 503, 504):
-            break
-        time.sleep(0.5)
-    assert last_resp is not None
-    raise AssertionError(
-        f"PUT via node{node} failed: {last_resp.status_code} {last_resp.text!r}"
+    Single attempt. Tests that arrive after a node-kill (post-resilience
+    scenarios) must call `_wait_for_shard_leader` first — the
+    Phase 17 item 4 endpoint exposes the per-shard Raft leader so we
+    don't need an elapsed-time retry to absorb election delays.
+    """
+    resp = requests.put(f"{S3[node]}/default/{key}", data=data, timeout=10)
+    assert resp.status_code in (200, 201), (
+        f"PUT via node{node} failed: {resp.status_code} {resp.text!r}"
     )
+    etag = resp.headers.get("ETag", "").strip('"')
+    assert etag, f"PUT response missing ETag header: {resp.headers}"
+    return etag
 
 
 def _get_object(node: int, etag: str) -> bytes:
@@ -353,3 +363,54 @@ def test_delete_visible_on_followers_after_settle(cluster):
             f"post-delete: node{n} still serves the object — "
             f"got {resp.status_code} (Delete delta not hydrated)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 item 4: per-shard leader endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cross_node
+def test_per_shard_leader_agrees_across_nodes(cluster):
+    """`GET /cluster/shards/{shard_id}/leader` reports the same leader on
+    every node — the openraft state machine is consistent across the
+    quorum, so any node's view of the per-shard leader matches.
+
+    Runs last so it exercises the endpoint after the resilience tests
+    have killed and restarted nodes (i.e. with a non-trivial leader
+    history, not just the bootstrap leader). `_wait_for_shard_leader`
+    on each node ensures the cluster is settled before the comparison.
+    """
+    for n in (1, 2, 3):
+        _wait_s3(S3[n])
+        _wait_for_shard_leader(n, BOOTSTRAP_SHARD_ID)
+
+    leaders: list[int] = []
+    for n in (1, 2, 3):
+        resp = requests.get(
+            f"{METRICS[n]}/cluster/shards/{BOOTSTRAP_SHARD_ID}/leader", timeout=2
+        )
+        assert resp.status_code == 200, (
+            f"node{n}: shard-leader endpoint returned {resp.status_code} "
+            f"{resp.text!r}"
+        )
+        info = resp.json()
+        assert info["shard_id"] == BOOTSTRAP_SHARD_ID
+        assert info["leader_id"] is not None, f"node{n}: no leader reported"
+        assert isinstance(info["raft_members"], list)
+        leaders.append(info["leader_id"])
+
+    assert len(set(leaders)) == 1, (
+        f"per-shard leader disagreement: {leaders!r} across nodes"
+    )
+
+
+@pytest.mark.cross_node
+def test_per_shard_leader_endpoint_rejects_bad_uuid(cluster):
+    """Malformed shard_id surfaces a 400, not a panic or a 500."""
+    for n in (1, 2, 3):
+        _wait_s3(S3[n])
+    resp = requests.get(f"{METRICS[1]}/cluster/shards/not-a-uuid/leader", timeout=2)
+    assert resp.status_code == 400, (
+        f"expected 400 for malformed UUID, got {resp.status_code}: {resp.text!r}"
+    )
