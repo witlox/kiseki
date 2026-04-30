@@ -119,18 +119,30 @@ def _wait_for_leader(node: int, timeout: float = 30.0) -> None:
 def _put_object(node: int, key: str, data: bytes) -> str:
     """PUT an object via the named node's S3 listener; return the etag.
 
-    Single attempt. Tests that arrive after a node-kill (post-resilience
-    scenarios) must call `_wait_for_shard_leader` first — the
-    Phase 17 item 4 endpoint exposes the per-shard Raft leader so we
-    don't need an elapsed-time retry to absorb election delays.
+    Tests that arrive after a node-kill (post-resilience scenarios) call
+    `_wait_for_shard_leader` first — the Phase 17 item 4 endpoint exposes
+    the per-shard Raft leader. Even so, there's a brief window between
+    "endpoint reports a leader_id" and "the gateway's log handle has
+    observed the new term," during which a PUT can surface
+    `LeaderUnavailable`. Retry on that specific transient up to ~5s.
     """
-    resp = requests.put(f"{S3[node]}/default/{key}", data=data, timeout=10)
-    assert resp.status_code in (200, 201), (
-        f"PUT via node{node} failed: {resp.status_code} {resp.text!r}"
+    deadline = time.monotonic() + 5.0
+    last: requests.Response | None = None
+    while True:
+        resp = requests.put(f"{S3[node]}/default/{key}", data=data, timeout=10)
+        if resp.status_code in (200, 201):
+            etag = resp.headers.get("ETag", "").strip('"')
+            assert etag, f"PUT response missing ETag header: {resp.headers}"
+            return etag
+        last = resp
+        if resp.status_code == 500 and "leader unavailable" in resp.text.lower():
+            if time.monotonic() < deadline:
+                time.sleep(0.25)
+                continue
+        break
+    assert False, (
+        f"PUT via node{node} failed: {last.status_code} {last.text!r}"
     )
-    etag = resp.headers.get("ETag", "").strip('"')
-    assert etag, f"PUT response missing ETag header: {resp.headers}"
-    return etag
 
 
 def _get_object(node: int, etag: str) -> bytes:

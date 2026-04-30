@@ -71,16 +71,29 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          dnf install -y epel-release
           dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
-            perl-IPC-Cmd git curl unzip tar gzip make findutils cmake \
-            protobuf-compiler
+            perl-IPC-Cmd git curl unzip tar gzip make findutils cmake
 
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install protoc
+        # protobuf-compiler isn't in Rocky 9 BaseOS / AppStream / EPEL 9 —
+        # download the static release binary directly. Same approach for
+        # both x86_64 and aarch64.
+        run: |
+          PROTOC_VERSION=25.1
+          case "$(uname -m)" in
+            x86_64)  PROTOC_ARCH="x86_64" ;;
+            aarch64) PROTOC_ARCH="aarch_64" ;;
+            *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip"
+          unzip -q /tmp/protoc.zip -d /usr/local
+          protoc --version
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -129,16 +142,28 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          dnf install -y epel-release
           dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
             perl-IPC-Cmd git curl unzip tar gzip make findutils cmake \
-            fuse3-devel protobuf-compiler
+            fuse3-devel
 
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install protoc
+        # See server-job sibling — direct GitHub release download.
+        run: |
+          PROTOC_VERSION=25.1
+          case "$(uname -m)" in
+            x86_64)  PROTOC_ARCH="x86_64" ;;
+            aarch64) PROTOC_ARCH="aarch_64" ;;
+            *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip"
+          unzip -q /tmp/protoc.zip -d /usr/local
+          protoc --version
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
