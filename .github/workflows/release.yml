@@ -72,7 +72,8 @@ jobs:
       - name: Install system dependencies
         run: |
           dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
-            perl-IPC-Cmd git curl unzip tar gzip make findutils cmake
+            perl-IPC-Cmd git curl unzip tar gzip make findutils cmake \
+            protobuf-compiler
 
       - uses: actions/checkout@v6
         with:
@@ -80,8 +81,6 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
           key: server-${{ matrix.arch }}
@@ -131,7 +130,7 @@ jobs:
         run: |
           dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
             perl-IPC-Cmd git curl unzip tar gzip make findutils cmake \
-            fuse3-devel
+            fuse3-devel protobuf-compiler
 
       - uses: actions/checkout@v6
         with:
@@ -139,8 +138,6 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
           key: client-${{ matrix.arch }}
