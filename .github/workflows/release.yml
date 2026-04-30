@@ -71,6 +71,7 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
+          dnf install -y epel-release
           dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
             perl-IPC-Cmd git curl unzip tar gzip make findutils cmake \
             protobuf-compiler
@@ -128,6 +129,7 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
+          dnf install -y epel-release
           dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
             perl-IPC-Cmd git curl unzip tar gzip make findutils cmake \
             fuse3-devel protobuf-compiler
