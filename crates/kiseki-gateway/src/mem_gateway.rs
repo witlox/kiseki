@@ -1092,9 +1092,10 @@ mod halt_mode_tests {
     /// Serializes the four tests that mutate `KISEKI_GATEWAY_READ_RETRY_BUDGET_MS`.
     /// Tests in a single binary run in parallel by default, and env vars are
     /// process-shared, so without this lock one test's `set_var` can leak into
-    /// another's read. Held for the full body so no other env-test observes
-    /// the in-flight value.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// another's read. Held for the full body (across `gw.read(...).await`) so
+    /// no other env-test observes the in-flight value — async-aware so clippy's
+    /// `await_holding_lock` lint stays happy.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Build a `CompositionStore` whose storage has `halted = true`.
     fn make_halted_store() -> CompositionStore {
@@ -1149,9 +1150,7 @@ mod halt_mode_tests {
         // surfaces `Upstream(...)` after the budget expires, NOT
         // `ServiceUnavailable`. The halt-mode branch must be
         // gated on the flag, not on "composition missing."
-        let _env_guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_guard = ENV_LOCK.lock().await;
         let gw = InMemoryGateway::new(
             CompositionStore::new(), // fresh, halted=false by default
             kiseki_chunk::arc_async(ChunkStore::new()),
@@ -1180,9 +1179,7 @@ mod halt_mode_tests {
     /// fallback behavior.
     #[tokio::test]
     async fn retry_budget_env_override_is_honored() {
-        let _env_guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_guard = ENV_LOCK.lock().await;
         let gw = InMemoryGateway::new(
             CompositionStore::new(),
             kiseki_chunk::arc_async(ChunkStore::new()),
@@ -1219,9 +1216,7 @@ mod halt_mode_tests {
         // Garbage input must not panic; it falls back to the 1 s
         // default. We verify by setting it to non-numeric and
         // observing the read takes ≈ 1 s.
-        let _env_guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_guard = ENV_LOCK.lock().await;
         let gw = InMemoryGateway::new(
             CompositionStore::new(),
             kiseki_chunk::arc_async(ChunkStore::new()),
@@ -1253,10 +1248,8 @@ mod halt_mode_tests {
         // Auditor finding A5 — verify the `_exhausted_total` counter
         // bumps when the budget runs out. Closes F-4 (configurable +
         // observable retry budget).
-        let _env_guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use prometheus::Registry;
+        let _env_guard = ENV_LOCK.lock().await;
         let registry = Registry::new();
         let metrics = std::sync::Arc::new(
             crate::metrics::GatewayRetryMetrics::register(&registry)

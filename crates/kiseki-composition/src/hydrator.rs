@@ -788,6 +788,14 @@ mod tests {
     use kiseki_log::delta::Delta;
     use kiseki_log::shard::{ShardConfig as LogShardConfig, ShardInfo, ShardState};
 
+    // Test-stub for `LogOps`: only the two methods the hydrator
+    // actually calls (`read_deltas`, `shard_health`) are real. The
+    // rest are `unimplemented!()` because hitting them would mean the
+    // hydrator under test took a code path the gap-detection scenarios
+    // don't exercise. The `restriction` lint forbids `unimplemented!`
+    // in production, but stubbing the trait this way is the cleanest
+    // expression of the intent in test code.
+    #[allow(clippy::unimplemented)]
     #[async_trait::async_trait]
     impl LogOps for GapInjectingLog {
         async fn append_delta(
@@ -895,7 +903,7 @@ mod tests {
                 hashed_key: [0u8; 32],
                 tombstone: false,
                 chunk_refs: Vec::new(),
-                payload_size: payload.len() as u32,
+                payload_size: u32::try_from(payload.len()).unwrap_or(u32::MAX),
                 has_inline_data: false,
             },
             payload: kiseki_log::delta::DeltaPayload {
