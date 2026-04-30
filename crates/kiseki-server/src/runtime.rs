@@ -496,39 +496,45 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // View: shared between gateway (staleness check) and stream processor.
     let view_store = Arc::new(std::sync::Mutex::new(kiseki_view::view::ViewStore::new()));
 
-    // Bootstrap namespace for protocol gateways (maps "default" bucket/export).
+    // Bootstrap namespace + view for protocol gateways. The IDs are
+    // deterministic (UUID-from-u128(1) for shard/view, UUIDv5 of
+    // "default" for the namespace), and the records are pure
+    // convention — a multi-node cluster's followers need them
+    // installed locally so the Phase 16e composition hydrator can
+    // resolve their `namespace_id` field. Creating them on every node
+    // is idempotent. The Raft-specific seeding (initialize the group
+    // vs. join as a follower) is the only thing gated on
+    // `cfg.bootstrap`.
     let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
     let bootstrap_ns =
         kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
-    if cfg.bootstrap {
-        let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
-        comp_store.add_namespace(kiseki_composition::namespace::Namespace {
-            id: bootstrap_ns,
+    let bootstrap_view = kiseki_common::ids::ViewId(uuid::Uuid::from_u128(1));
+    comp_store.add_namespace(kiseki_composition::namespace::Namespace {
+        id: bootstrap_ns,
+        tenant_id: bootstrap_tenant,
+        shard_id: bootstrap_shard,
+        read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
+    });
+    let _ = view_store
+        .lock()
+        .unwrap()
+        .create_view(kiseki_view::ViewDescriptor {
+            view_id: bootstrap_view,
             tenant_id: bootstrap_tenant,
-            shard_id: bootstrap_shard,
-            read_only: false,
-            versioning_enabled: false,
-            compliance_tags: Vec::new(),
+            source_shards: vec![bootstrap_shard],
+            protocol: kiseki_view::ProtocolSemantics::Posix,
+            consistency: kiseki_view::ConsistencyModel::ReadYourWrites,
+            discardable: true,
+            version: 1,
         });
-
-        // Create a bootstrap view for the default namespace.
-        let bootstrap_view = kiseki_common::ids::ViewId(uuid::Uuid::from_u128(1));
-        let _ = view_store
-            .lock()
-            .unwrap()
-            .create_view(kiseki_view::ViewDescriptor {
-                view_id: bootstrap_view,
-                tenant_id: bootstrap_tenant,
-                source_shards: vec![bootstrap_shard],
-                protocol: kiseki_view::ProtocolSemantics::Posix,
-                consistency: kiseki_view::ConsistencyModel::ReadYourWrites,
-                discardable: true,
-                version: 1,
-            });
-        tracing::info!("bootstrap: namespace 'default' + view for gateways");
+    if cfg.bootstrap {
+        tracing::info!("bootstrap: namespace 'default' + view installed (Raft seed node)");
     } else {
-        tracing::warn!("KISEKI_BOOTSTRAP not set — S3/NFS gateways have no namespaces");
-        tracing::warn!("set KISEKI_BOOTSTRAP=true for development/testing");
+        tracing::info!(
+            "bootstrap: namespace 'default' + view installed (Raft follower; will hydrate compositions from log)",
+        );
     }
 
     // Shared gateway: wires composition + chunk + crypto. Used by S3 and NFS.
@@ -831,6 +837,27 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });
+
+    // Phase 16e: composition hydrator — followers reconstruct their
+    // CompositionStore from the Raft-replicated delta log so cross-node
+    // GETs resolve. Sibling of the view stream processor above; both
+    // consume the same delta stream with non-overlapping responsibilities
+    // (views: watermarks, compositions: id→metadata).
+    if multi_node {
+        let hyd_log = Arc::clone(&log_store);
+        let hyd_compositions = gw.compositions_handle();
+        let hyd_shard = bootstrap_shard;
+        tokio::spawn(async move {
+            let mut hydrator = kiseki_composition::CompositionHydrator::new(hyd_compositions);
+            loop {
+                let _applied = hydrator.poll(hyd_log.as_ref(), hyd_shard).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        tracing::info!(
+            "composition hydrator spawned (Phase 16e — followers consume create-deltas)",
+        );
+    }
 
     // TODO: Wire rotation_monitor::run_rotation_monitor() here.
     // The components exist (kiseki_keymanager::rotation_monitor + rewrap_worker)

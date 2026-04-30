@@ -25,7 +25,10 @@ use crate::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteRespo
 /// Uses `tokio::sync::Mutex` for interior mutability so `GatewayOps` methods can
 /// take `&self`, enabling concurrent access.
 pub struct InMemoryGateway {
-    compositions: Mutex<CompositionStore>,
+    /// Shared with the Phase 16e composition hydrator (`compositions_handle`)
+    /// so leader-emitted Create deltas land in the same store the gateway
+    /// reads from on followers.
+    compositions: Arc<Mutex<CompositionStore>>,
     chunks: Arc<dyn AsyncChunkOps>,
     aead: Aead,
     master_key: SystemMasterKey,
@@ -145,7 +148,7 @@ impl InMemoryGateway {
         master_key: SystemMasterKey,
     ) -> Self {
         Self {
-            compositions: Mutex::new(compositions),
+            compositions: Arc::new(Mutex::new(compositions)),
             chunks,
             aead: Aead::new(),
             master_key,
@@ -345,6 +348,18 @@ impl InMemoryGateway {
         self
     }
 
+    /// Shared handle to the composition store.
+    ///
+    /// The Phase 16e composition hydrator (a sibling of the view stream
+    /// processor) holds a clone of this `Arc` so it can install
+    /// leader-emitted compositions into the same store the gateway reads
+    /// from. The lock is `tokio::sync::Mutex` because the gateway holds
+    /// it across awaits in the read path.
+    #[must_use]
+    pub fn compositions_handle(&self) -> Arc<Mutex<CompositionStore>> {
+        Arc::clone(&self.compositions)
+    }
+
     /// Configure the dedup policy (I-X2).
     ///
     /// `TenantIsolated` requires a tenant HMAC key for chunk ID derivation.
@@ -404,8 +419,38 @@ impl InMemoryGateway {
 
 #[async_trait::async_trait]
 impl GatewayOps for InMemoryGateway {
+    // The read path is a single sequence (composition lookup with bounded
+    // retry → per-chunk decrypt with cache → offset/length slice + view
+    // staleness check) that doesn't decompose cleanly. Splitting would
+    // obscure the read-path data flow more than it would help.
+    #[allow(clippy::too_many_lines)]
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        let compositions = self.compositions.lock().await;
+        // Phase 16e: on a follower, the hydrator may not have applied
+        // the create-delta yet for a composition the user just PUT on
+        // the leader. Retry briefly so a tight PUT-then-GET pattern
+        // doesn't 404 spuriously. Bound the retry to ~10× the
+        // hydrator's poll interval (100 ms in the runtime spawn) so
+        // genuine NotFound surfaces fast.
+        const COMP_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        const COMP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+        let deadline = std::time::Instant::now() + COMP_RETRY_BUDGET;
+        let compositions = loop {
+            let guard = self.compositions.lock().await;
+            if guard.get(req.composition_id).is_ok() {
+                break guard;
+            }
+            drop(guard);
+            if std::time::Instant::now() >= deadline {
+                // Surface the original error path.
+                let g = self.compositions.lock().await;
+                let _ = g
+                    .get(req.composition_id)
+                    .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+                // Unreachable: get() failed by contract; the `?` returned.
+                break g;
+            }
+            tokio::time::sleep(COMP_RETRY_INTERVAL).await;
+        };
 
         // Look up the composition.
         let comp = compositions
@@ -672,6 +717,15 @@ impl GatewayOps for InMemoryGateway {
                 vec![]
             };
 
+            // Phase 16e: payload encodes (comp_id, namespace_id, size) so
+            // followers can hydrate their CompositionStore from the log.
+            // Older clusters that still emit a bare 16-byte UUID payload
+            // are handled defensively by the hydrator (skip-and-advance).
+            let comp_payload = kiseki_composition::encode_composition_delta_payload(
+                comp_id,
+                emit_params.2,
+                bytes_written,
+            );
             match kiseki_composition::log_bridge::emit_chunk_and_delta(
                 log.as_ref(),
                 shard_id,
@@ -679,7 +733,7 @@ impl GatewayOps for InMemoryGateway {
                 kiseki_log::delta::OperationType::Create,
                 hashed_key,
                 emit_params.3,
-                comp_id.0.as_bytes().to_vec(),
+                comp_payload,
                 new_chunks,
             )
             .await

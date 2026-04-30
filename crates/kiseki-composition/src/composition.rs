@@ -14,6 +14,56 @@ use crate::namespace::Namespace;
 /// stored inline in the delta payload rather than as a separate chunk.
 pub const INLINE_DATA_THRESHOLD: u64 = 4096;
 
+/// Wire size of the composition-create delta payload (Phase 16e).
+///
+/// Layout, little-endian where applicable:
+///   `[0..16)`  `composition_id` UUID
+///   `[16..32)` `namespace_id` UUID
+///   `[32..40)` `bytes_written` (u64 LE)
+///
+/// This is what the gateway emits as the `payload` of the
+/// `AppendDelta`/`AppendChunkAndDelta` log record. Followers decode
+/// it with `decode_composition_delta_payload` and call
+/// `CompositionStore::create_at` to install the composition locally,
+/// so that a cross-node GET can resolve it.
+pub const COMPOSITION_DELTA_PAYLOAD_LEN: usize = 40;
+
+/// Encode a composition-create delta payload.
+///
+/// See [`COMPOSITION_DELTA_PAYLOAD_LEN`] for the layout.
+#[must_use]
+pub fn encode_composition_delta_payload(
+    comp_id: CompositionId,
+    namespace_id: NamespaceId,
+    bytes_written: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COMPOSITION_DELTA_PAYLOAD_LEN);
+    out.extend_from_slice(comp_id.0.as_bytes());
+    out.extend_from_slice(namespace_id.0.as_bytes());
+    out.extend_from_slice(&bytes_written.to_le_bytes());
+    out
+}
+
+/// Decode a composition-create delta payload.
+///
+/// Returns `None` if the payload length is wrong (e.g. an older release's
+/// 16-byte UUID-only payload). Callers should treat that as "not a
+/// composition-install record" and skip.
+#[must_use]
+pub fn decode_composition_delta_payload(
+    payload: &[u8],
+) -> Option<(CompositionId, NamespaceId, u64)> {
+    if payload.len() != COMPOSITION_DELTA_PAYLOAD_LEN {
+        return None;
+    }
+    let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
+    let ns_uuid = uuid::Uuid::from_slice(&payload[16..32]).ok()?;
+    let mut size_bytes = [0u8; 8];
+    size_bytes.copy_from_slice(&payload[32..40]);
+    let size = u64::from_le_bytes(size_bytes);
+    Some((CompositionId(comp_uuid), NamespaceId(ns_uuid), size))
+}
+
 /// A composition — metadata describing how to assemble chunks into a
 /// coherent data unit (file or object).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +245,50 @@ impl CompositionStore {
             .get_mut(&id)
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.content_type = content_type;
+        Ok(())
+    }
+
+    /// Install a composition with a leader-assigned id (Phase 16e
+    /// follower hydration).
+    ///
+    /// Mirrors `create()` but uses the supplied `comp_id` instead of
+    /// generating a fresh UUID, so a follower can rebuild its store
+    /// from the Raft-replicated delta log. Idempotent — a second call
+    /// with the same id is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CompositionError::NamespaceNotFound` if the namespace
+    /// hasn't been registered on this node yet (the bootstrap
+    /// namespace is registered at server startup; tenant-specific
+    /// namespaces would need their own replication path).
+    pub fn create_at(
+        &mut self,
+        comp_id: CompositionId,
+        namespace_id: NamespaceId,
+        chunks: Vec<ChunkId>,
+        size: u64,
+    ) -> Result<(), CompositionError> {
+        if self.compositions.contains_key(&comp_id) {
+            return Ok(()); // already hydrated — idempotent
+        }
+        let ns = self
+            .namespaces
+            .get(&namespace_id)
+            .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
+        let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
+        let comp = Composition {
+            id: comp_id,
+            tenant_id: ns.tenant_id,
+            namespace_id,
+            shard_id: ns.shard_id,
+            chunks,
+            version: 1,
+            size,
+            has_inline_data,
+            content_type: None,
+        };
+        self.compositions.insert(comp_id, comp);
         Ok(())
     }
 }

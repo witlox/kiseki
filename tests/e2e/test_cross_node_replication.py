@@ -70,16 +70,57 @@ def _wait_s3(base_url: str, timeout: float = 30.0) -> None:
     )
 
 
+def _wait_for_leader(node: int, timeout: float = 30.0) -> None:
+    """Block until the cluster has elected a Raft leader visible on this node.
+
+    `_wait_s3` only confirms the HTTP listener is up; after a node restart
+    the S3 gateway accepts connections before Raft has elected a leader,
+    and writes hit `LeaderUnavailable` until election finishes. Tests that
+    follow a node-restart should call this to avoid a flaky 500."""
+    deadline = time.monotonic() + timeout
+    last_seen: str = ""
+    while time.monotonic() < deadline:
+        try:
+            metrics_url = METRICS[node]
+            resp = requests.get(f"{metrics_url}/cluster/info", timeout=2)
+            if resp.status_code == 200:
+                info = resp.json()
+                leader_id = info.get("leader_id")
+                if leader_id:
+                    return
+                last_seen = f"no leader_id in {info}"
+        except requests.RequestException as e:
+            last_seen = str(e)
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Raft leader not elected on node{node} after {timeout}s: {last_seen}"
+    )
+
+
 def _put_object(node: int, key: str, data: bytes) -> str:
     """PUT an object via the named node's S3 listener; return the etag (=
-    server-assigned object id) used for retrieval."""
-    resp = requests.put(f"{S3[node]}/default/{key}", data=data, timeout=10)
-    assert resp.status_code in (200, 201), (
-        f"PUT via node{node} failed: {resp.status_code} {resp.text!r}"
+    server-assigned object id) used for retrieval.
+
+    Retries briefly on retriable 5xx so a test arriving in the middle of
+    a Raft re-election (e.g. just after a `stop_node` cleanup elsewhere
+    in this module) doesn't fail with `LeaderUnavailable` for what is a
+    transient gateway-internal condition. The retry window is bounded —
+    a genuine bug surfaces fast."""
+    deadline = time.monotonic() + 30.0
+    last_resp: requests.Response | None = None
+    while time.monotonic() < deadline:
+        last_resp = requests.put(f"{S3[node]}/default/{key}", data=data, timeout=10)
+        if last_resp.status_code in (200, 201):
+            etag = last_resp.headers.get("ETag", "").strip('"')
+            assert etag, f"PUT response missing ETag header: {last_resp.headers}"
+            return etag
+        if last_resp.status_code not in (500, 503, 504):
+            break
+        time.sleep(0.5)
+    assert last_resp is not None
+    raise AssertionError(
+        f"PUT via node{node} failed: {last_resp.status_code} {last_resp.text!r}"
     )
-    etag = resp.headers.get("ETag", "").strip('"')
-    assert etag, f"PUT response missing ETag header: {resp.headers}"
-    return etag
 
 
 def _get_object(node: int, etag: str) -> bytes:
@@ -120,27 +161,14 @@ def _scrape_metric(node: int, metric_name: str) -> float | None:
 
 
 @pytest.mark.cross_node
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Phase 16 follow-up: chunk fan-out works (the chunk reaches node-2's "
-        "chunk store), but the gateway's composition lookup is per-node and "
-        "not Raft-replicated, so node-2 returns 404 from the composition "
-        "layer before it ever consults the chunk store. See "
-        "specs/escalations/2026-04-29-cross-node-composition-resolution.md."
-    ),
-)
 def test_cross_node_read_after_leader_put(cluster):
     """A PUT on node-1 must be readable on node-2 and node-3.
 
-    This is the B-3 gap that motivated Phase 16a: in a 3-node cluster
-    each node holds its own chunk store, and prior to Phase 16a a
-    PUT on node-1 left node-2 + node-3 with no copy → a GET on
-    node-2 returned 404, breaking the basic HA promise.
-
-    With ClusteredChunkStore + ClusterChunkService wired in, the
-    leader fans the fragment out to all peers; a GET on any node
-    succeeds — *once* the composition store also replicates.
+    Closes the B-3 gap: prior to Phase 16a a PUT on node-1 left
+    node-2 + node-3 with no copy of the chunk → 404 on cross-node
+    GET. Phase 16a wires `ClusteredChunkStore` so the leader fans
+    the fragment out, and Phase 16e wires the composition hydrator
+    so followers can resolve the composition_id.
     """
     for n in (1, 2, 3):
         _wait_s3(S3[n])
@@ -164,16 +192,6 @@ def test_cross_node_read_after_leader_put(cluster):
 
 
 @pytest.mark.cross_node
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Phase 16 follow-up: same composition-replication gap as "
-        "test_cross_node_read_after_leader_put. The chunk survives node-1's "
-        "failure (it was already fanned out), but node-2's gateway can't "
-        "resolve the composition_id without a replicated CompositionStore. "
-        "See specs/escalations/2026-04-29-cross-node-composition-resolution.md."
-    ),
-)
 def test_read_survives_single_node_failure(cluster):
     """Kill node-1 after a PUT lands; reads on node-2 must still work."""
     try:
@@ -256,6 +274,11 @@ def test_fabric_metrics_present_after_cross_node_write(cluster):
     the leader's /metrics with at least one PUT-OK entry per peer."""
     for n in (1, 2, 3):
         _wait_s3(S3[n])
+    # Prior tests in this module restart nodes (resilience scenarios).
+    # Wait for Raft to settle before issuing a write — otherwise the PUT
+    # races leader election and surfaces a 500 LeaderUnavailable that has
+    # nothing to do with what this test is checking.
+    _wait_for_leader(1)
 
     # Fail-soft when the metrics port isn't host-mapped (older
     # docker-compose configs). Step 10 ships the port mapping in

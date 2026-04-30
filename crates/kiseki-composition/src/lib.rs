@@ -15,13 +15,17 @@
 
 pub mod composition;
 pub mod error;
+pub mod hydrator;
 pub mod log_bridge;
 pub mod multipart;
 pub mod namespace;
 
 pub use composition::{
-    composition_hash_key, Composition, CompositionOps, DeleteResult, INLINE_DATA_THRESHOLD,
+    composition_hash_key, decode_composition_delta_payload, encode_composition_delta_payload,
+    Composition, CompositionOps, DeleteResult, COMPOSITION_DELTA_PAYLOAD_LEN,
+    INLINE_DATA_THRESHOLD,
 };
 pub use error::CompositionError;
+pub use hydrator::CompositionHydrator;
 pub use multipart::{MultipartState, MultipartUpload};
 pub use namespace::{ComplianceTag, Namespace};
