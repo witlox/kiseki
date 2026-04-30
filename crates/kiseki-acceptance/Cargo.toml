@@ -42,7 +42,7 @@ kiseki-block = { workspace = true }
 kiseki-backup = { workspace = true }
 kiseki-raft = { workspace = true }
 tempfile = "3"
-axum = "0.7"
+axum = "0.8"
 
 # BDD framework
 cucumber = { workspace = true }

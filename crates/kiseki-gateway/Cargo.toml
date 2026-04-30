@@ -26,7 +26,7 @@ kiseki-composition = { workspace = true }
 kiseki-control = { workspace = true }
 kiseki-crypto = { workspace = true }
 aws-lc-rs = { workspace = true }
-axum = "0.7"
+axum = "0.8"
 kiseki-audit = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto", "service"] }
@@ -47,7 +47,7 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-axum = { version = "0.7", features = ["tokio"] }
+axum = { version = "0.8", features = ["tokio"] }
 http-body-util = "0.1"
 proptest = { workspace = true }
 rcgen = "0.14"
