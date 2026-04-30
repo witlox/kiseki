@@ -127,7 +127,12 @@ pub fn decode_composition_delete_payload(payload: &[u8]) -> Option<CompositionId
 
 /// A composition — metadata describing how to assemble chunks into a
 /// coherent data unit (file or object).
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Serde derives: ADR-040 stores compositions in a redb-backed
+/// `PersistentCompositionStore` using postcard encoding. All fields are
+/// concrete (no `HashMap` / `HashSet`) so postcard's encoding is
+/// deterministic across runs.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Composition {
     /// Composition identifier.
     pub id: CompositionId,

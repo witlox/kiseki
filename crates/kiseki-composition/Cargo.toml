@@ -21,7 +21,16 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+# Persistent CompositionStore (ADR-040): redb stores `compositions.redb`
+# under KISEKI_DATA_DIR/metadata/, postcard provides deterministic
+# encoding for the `Composition` value bytes, lru is the hot-tail cache.
+redb = { workspace = true }
+postcard = { workspace = true }
+lru = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
 [dev-dependencies]
 kiseki-view = { workspace = true }
 proptest = { workspace = true }
+tempfile = "3"
 uuid = { workspace = true }

@@ -33,6 +33,12 @@ pub enum CompositionError {
     /// Version not found.
     #[error("version not found: {0:?} v{1}")]
     VersionNotFound(CompositionId, u64),
+
+    /// Underlying persistent-storage failure (ADR-040). The string
+    /// carries the typed kind from `PersistentStoreError` for
+    /// metric/log fan-out; opaque to callers above the gateway.
+    #[error("composition storage: {0}")]
+    Storage(String),
 }
 
 impl From<CompositionError> for KisekiError {

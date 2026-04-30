@@ -36,7 +36,7 @@ pub struct WorkloadId(pub uuid::Uuid);
 /// Smallest unit of totally-ordered deltas, backed by one Raft group.
 ///
 /// Spec: `ubiquitous-language.md#Shard`, I-L1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ShardId(pub uuid::Uuid);
 
 /// Content-addressed chunk identifier. 32 raw bytes — `sha256(plaintext)`
@@ -75,20 +75,20 @@ impl fmt::Display for ChunkId {
 /// Composition identifier.
 ///
 /// Spec: `ubiquitous-language.md#Composition`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct CompositionId(pub uuid::Uuid);
 
 /// Namespace identifier (always tenant-scoped — the "tenant namespace"
 /// synonym is retired in favour of this, per ubiquitous-language).
 ///
 /// Spec: `ubiquitous-language.md#Namespace`, I-X1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct NamespaceId(pub uuid::Uuid);
 
 /// View identifier.
 ///
 /// Spec: `ubiquitous-language.md#View`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ViewId(pub uuid::Uuid);
 
 /// Raft-assigned sequence number within a shard. Monotonic, gap-free,

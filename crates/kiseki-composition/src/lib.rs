@@ -19,6 +19,7 @@ pub mod hydrator;
 pub mod log_bridge;
 pub mod multipart;
 pub mod namespace;
+pub mod persistent;
 
 pub use composition::{
     composition_hash_key, decode_composition_create_payload, decode_composition_delete_payload,
