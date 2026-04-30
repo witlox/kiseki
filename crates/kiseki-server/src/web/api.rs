@@ -59,7 +59,7 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/ui/api/ops/backup", post(ops_backup))
         .route("/ui/api/ops/scrub", post(ops_scrub))
         .route("/cluster/info", get(cluster_info))
-        .route("/cluster/shards/:shard_id/leader", get(shard_leader))
+        .route("/cluster/shards/{shard_id}/leader", get(shard_leader))
         .with_state(state)
 }
 
