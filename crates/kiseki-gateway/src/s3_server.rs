@@ -505,6 +505,7 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
         return match state.gateway.complete_multipart_upload(&req).await {
             Ok(resp) => (
                 StatusCode::OK,
+                [("etag", format!("\"{}\"", resp.etag))],
                 axum::Json(serde_json::json!({ "etag": resp.etag })),
             )
                 .into_response(),
