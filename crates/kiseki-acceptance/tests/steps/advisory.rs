@@ -6,7 +6,7 @@ use kiseki_advisory::budget::BudgetConfig;
 use kiseki_common::advisory::*;
 
 #[given("a Kiseki cluster with Workflow Advisory enabled cluster-wide")]
-async fn given_advisory(_w: &mut KisekiWorld) {}
+async fn given_advisory(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when(regex = r#"^workload "(\S+)" declares workflow with profile "(\S+)" phase "(\S+)"$"#)]
 async fn when_declare(w: &mut KisekiWorld, workload: String, _profile: String, _phase: String) {

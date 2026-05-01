@@ -190,7 +190,7 @@ async fn then_small_files_inline(w: &mut KisekiWorld, threshold: u64) {
 }
 
 #[then(regex = r#"^new files between \d+ and \d+ bytes go to chunk store$"#)]
-async fn then_large_files_chunk(_w: &mut KisekiWorld) {}
+async fn then_large_files_chunk(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the (\d+) existing inline files remain"#)]
 async fn then_existing_remain(w: &mut KisekiWorld, count: u64) {
@@ -198,7 +198,7 @@ async fn then_existing_remain(w: &mut KisekiWorld, count: u64) {
 }
 
 #[then("no retroactive migration occurs")]
-async fn then_no_migration(_w: &mut KisekiWorld) {}
+async fn then_no_migration(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("the control plane attempts to increase threshold to 4096")]
 async fn when_increase_threshold(w: &mut KisekiWorld) {
@@ -221,7 +221,7 @@ async fn then_threshold_set(w: &mut KisekiWorld, t: u64) {
 }
 
 #[then(regex = r#"^a maintenance task is optionally queued"#)]
-async fn then_migration_queued(_w: &mut KisekiWorld) {}
+async fn then_migration_queued(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === Small-file data path ===
 
@@ -239,10 +239,10 @@ async fn when_write_file_kb(w: &mut KisekiWorld, kb: u64) {
 }
 
 #[then("the gateway encrypts the file with envelope encryption")]
-async fn then_gateway_encrypts(_w: &mut KisekiWorld) {}
+async fn then_gateway_encrypts(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the gateway encrypts the file")]
-async fn then_gateway_encrypts2(_w: &mut KisekiWorld) {}
+async fn then_gateway_encrypts2(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the encrypted payload is included in the Raft log entry"#)]
 async fn then_payload_in_raft(w: &mut KisekiWorld) {
@@ -250,7 +250,7 @@ async fn then_payload_in_raft(w: &mut KisekiWorld) {
 }
 
 #[then("the log entry is replicated to all voters")]
-async fn then_replicated(_w: &mut KisekiWorld) {}
+async fn then_replicated(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^on apply the state machine offloads the payload"#)]
 async fn then_offloaded(w: &mut KisekiWorld) {
@@ -268,7 +268,7 @@ async fn then_chunk_allocated(w: &mut KisekiWorld) {
 }
 
 #[then("the encrypted data is written via O_DIRECT")]
-async fn then_odirect(_w: &mut KisekiWorld) {}
+async fn then_odirect(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the delta contains only the chunk_ref (no payload)")]
 async fn then_chunk_ref_only(w: &mut KisekiWorld) {
@@ -298,7 +298,7 @@ async fn then_found_in_redb(w: &mut KisekiWorld) {
 }
 
 #[then("returns the encrypted content")]
-async fn then_returns_content(_w: &mut KisekiWorld) {}
+async fn then_returns_content(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when(regex = r#"^a client reads a chunked file"#)]
 async fn when_read_chunked(w: &mut KisekiWorld) {
@@ -311,7 +311,7 @@ async fn then_misses_redb(w: &mut KisekiWorld) {
 }
 
 #[then("reads from the block device extent")]
-async fn then_reads_block(_w: &mut KisekiWorld) {}
+async fn then_reads_block(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === Snapshot ===
 
@@ -321,7 +321,7 @@ async fn given_inline_files(w: &mut KisekiWorld, _shard: String, count: u64) {
 }
 
 #[when("the state machine builds a snapshot")]
-async fn when_build_snapshot(_w: &mut KisekiWorld) {}
+async fn when_build_snapshot(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the snapshot includes all (\d+) inline file contents"#)]
 async fn then_snapshot_includes(w: &mut KisekiWorld, count: u64) {
@@ -329,7 +329,7 @@ async fn then_snapshot_includes(w: &mut KisekiWorld, count: u64) {
 }
 
 #[when("a new learner receives this snapshot")]
-async fn when_learner_receives(_w: &mut KisekiWorld) {}
+async fn when_learner_receives(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the learner's small/objects.redb contains all (\d+) files$"#)]
 async fn then_learner_has_files(w: &mut KisekiWorld, count: u64) {
@@ -337,7 +337,7 @@ async fn then_learner_has_files(w: &mut KisekiWorld, count: u64) {
 }
 
 #[then("reads for those files succeed on the learner")]
-async fn then_learner_reads(_w: &mut KisekiWorld) {}
+async fn then_learner_reads(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === Raft throughput guard ===
 
@@ -358,7 +358,7 @@ async fn then_threshold_drops(w: &mut KisekiWorld, floor: u64) {
 }
 
 #[then("new 3000-byte files are routed to the chunk store")]
-async fn then_routed_to_chunk(_w: &mut KisekiWorld) {}
+async fn then_routed_to_chunk(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when(regex = r#"^the write burst subsides and rate drops below (\d+) MB/s"#)]
 async fn when_burst_subsides(w: &mut KisekiWorld, _limit: u64) {
@@ -388,7 +388,7 @@ async fn then_reports_pressure(w: &mut KisekiWorld) {
 }
 
 #[then("the shard leader recomputes threshold")]
-async fn then_leader_recomputes(_w: &mut KisekiWorld) {}
+async fn then_leader_recomputes(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^threshold decreases"#)]
 async fn then_threshold_decreases(w: &mut KisekiWorld) {
@@ -406,7 +406,7 @@ async fn then_alert_emitted(w: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^the leader commits the threshold change via Raft"#)]
-async fn then_committed_via_raft(_w: &mut KisekiWorld) {}
+async fn then_committed_via_raft(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === Emergency signal ===
 
@@ -431,10 +431,10 @@ async fn then_leader_receives(w: &mut KisekiWorld) {
 }
 
 #[then("commits threshold reduction using votes from node-1 and node-3")]
-async fn then_commits_reduction(_w: &mut KisekiWorld) {}
+async fn then_commits_reduction(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^node-\d+ receives the committed change via Raft replication"#)]
-async fn then_receives_change(_w: &mut KisekiWorld) {}
+async fn then_receives_change(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === GC ===
 
@@ -444,10 +444,10 @@ async fn given_inline_exists(w: &mut KisekiWorld, _id: String) {
 }
 
 #[when("the file is deleted (tombstone delta committed via Raft)")]
-async fn when_file_deleted(_w: &mut KisekiWorld) {}
+async fn when_file_deleted(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("all consumer watermarks advance past the tombstone")]
-async fn when_watermarks_advance(_w: &mut KisekiWorld) {}
+async fn when_watermarks_advance(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("truncate_log or compact_shard runs")]
 async fn when_gc_runs(w: &mut KisekiWorld) {
@@ -470,16 +470,16 @@ async fn given_10k_entries(w: &mut KisekiWorld) {
 }
 
 #[given("the delta log references only 9,990 of them")]
-async fn given_orphans(_w: &mut KisekiWorld) {}
+async fn given_orphans(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("a scrub or consistency check runs")]
-async fn when_scrub_runs(_w: &mut KisekiWorld) {}
+async fn when_scrub_runs(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("10 orphan entries are detected")]
-async fn then_orphans_detected(_w: &mut KisekiWorld) {}
+async fn then_orphans_detected(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("an alert is emitted for investigation")]
-async fn then_alert_investigation(_w: &mut KisekiWorld) {}
+async fn then_alert_investigation(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === Shard placement ===
 
@@ -494,25 +494,25 @@ async fn given_small_ratio(w: &mut KisekiWorld, _shard: String, ratio: f64) {
 }
 
 #[given(regex = r#"^shard "([^"]*)" p99 read latency = (\d+)ms"#)]
-async fn given_latency(w: &mut KisekiWorld, _shard: String, _ms: u64) {}
+async fn given_latency(w: &mut KisekiWorld, _shard: String, _ms: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^node-\d+ has SSD data devices and available capacity"#)]
-async fn given_ssd_available(_w: &mut KisekiWorld) {}
+async fn given_ssd_available(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("the control plane evaluates placement")]
-async fn when_evaluate_placement(_w: &mut KisekiWorld) {}
+async fn when_evaluate_placement(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("it determines threshold cannot be lowered further (at floor)")]
-async fn then_at_floor(_w: &mut KisekiWorld) {}
+async fn then_at_floor(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("shard does not exceed split ceiling")]
-async fn then_no_split(_w: &mut KisekiWorld) {}
+async fn then_no_split(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^node-\d+ is a better fit"#)]
-async fn then_better_fit(_w: &mut KisekiWorld) {}
+async fn then_better_fit(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("a migration is initiated:")]
-async fn then_migration_initiated(_w: &mut KisekiWorld) {}
+async fn then_migration_initiated(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === Homogeneous cluster ===
 
@@ -527,7 +527,7 @@ async fn when_pressure_exceeds(w: &mut KisekiWorld, _shard: String) {
 }
 
 #[then("the control plane lowers the inline threshold")]
-async fn then_lowers_threshold(_w: &mut KisekiWorld) {}
+async fn then_lowers_threshold(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("the threshold is already at floor")]
 async fn when_at_floor(w: &mut KisekiWorld) {
@@ -535,13 +535,13 @@ async fn when_at_floor(w: &mut KisekiWorld) {
 }
 
 #[when("shard exceeds the I-L6 split ceiling")]
-async fn when_exceeds_ceiling(_w: &mut KisekiWorld) {}
+async fn when_exceeds_ceiling(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the shard is split")]
-async fn then_shard_split(_w: &mut KisekiWorld) {}
+async fn then_shard_split(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("the shard does not exceed split ceiling")]
-async fn when_no_split(_w: &mut KisekiWorld) {}
+async fn when_no_split(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^an alert is emitted: "metadata tier at capacity"#)]
 async fn then_alert_capacity(w: &mut KisekiWorld) {
@@ -556,7 +556,7 @@ async fn given_writes(w: &mut KisekiWorld, _shard: String, _ops: u64) {
 }
 
 #[when(regex = r#"^a migration from node-\d+ to node-\d+ is in progress"#)]
-async fn when_migration_in_progress(_w: &mut KisekiWorld) {}
+async fn when_migration_in_progress(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("writes continue on the current leader without interruption")]
 async fn then_writes_continue(w: &mut KisekiWorld) {
@@ -564,10 +564,10 @@ async fn then_writes_continue(w: &mut KisekiWorld) {
 }
 
 #[then("reads continue from existing voters")]
-async fn then_reads_continue(_w: &mut KisekiWorld) {}
+async fn then_reads_continue(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the new voter \(node-\d+\) becomes available after catch-up"#)]
-async fn then_new_voter_available(_w: &mut KisekiWorld) {}
+async fn then_new_voter_available(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[given(regex = r#"^a migration of shard "([^"]*)" to node-\d+ is initiated"#)]
 async fn given_migration_initiated(w: &mut KisekiWorld, _shard: String) {
@@ -580,13 +580,13 @@ async fn given_learner_crash(w: &mut KisekiWorld) {
 }
 
 #[then("the learner is removed from the Raft group")]
-async fn then_learner_removed(_w: &mut KisekiWorld) {}
+async fn then_learner_removed(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("no membership change occurs")]
-async fn then_no_membership_change(_w: &mut KisekiWorld) {}
+async fn then_no_membership_change(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^shard "([^"]*)" continues operating on original voters"#)]
-async fn then_original_voters(_w: &mut KisekiWorld, _shard: String) {}
+async fn then_original_voters(_w: &mut KisekiWorld, _shard: String) { todo!("wire to server") }
 
 // === Rate limiting ===
 
@@ -611,7 +611,7 @@ async fn then_next_blocked(w: &mut KisekiWorld) {
 }
 
 #[then("the backoff continues doubling up to 24h cap")]
-async fn then_backoff_cap(_w: &mut KisekiWorld) {}
+async fn then_backoff_cap(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[given(regex = r#"^shard "([^"]*)" has a backoff of (\d+) hours"#)]
 async fn given_backoff(w: &mut KisekiWorld, _shard: String, hours: u64) {
@@ -619,7 +619,7 @@ async fn given_backoff(w: &mut KisekiWorld, _shard: String, hours: u64) {
 }
 
 #[when(regex = r#"^the workload profile changes significantly"#)]
-async fn when_profile_changes(_w: &mut KisekiWorld) {}
+async fn when_profile_changes(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the backoff resets to (\d+) hours \(floor\)"#)]
 async fn then_backoff_resets(w: &mut KisekiWorld, floor: u64) {
@@ -638,7 +638,7 @@ async fn given_n_node_cluster(w: &mut KisekiWorld, n: u64) {
 }
 
 #[when(regex = r#"^(\d+) shards are candidates for migration simultaneously"#)]
-async fn when_candidates(w: &mut KisekiWorld, _n: u64) {}
+async fn when_candidates(w: &mut KisekiWorld, _n: u64) { todo!("wire to server") }
 
 #[then(regex = r#"^only (\d+) migrations proceed concurrently"#)]
 async fn then_concurrent_limit(w: &mut KisekiWorld, limit: u64) {
@@ -647,7 +647,7 @@ async fn then_concurrent_limit(w: &mut KisekiWorld, limit: u64) {
 }
 
 #[then("the remaining 2 wait until a slot is available")]
-async fn then_remaining_wait(_w: &mut KisekiWorld) {}
+async fn then_remaining_wait(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === SSD learners ===
 
@@ -657,25 +657,25 @@ async fn given_hdd_voters(w: &mut KisekiWorld, _shard: String) {
 }
 
 #[given(regex = r#"^shard "([^"]*)" has high read IOPS for small files"#)]
-async fn given_high_iops(_w: &mut KisekiWorld, _shard: String) {}
+async fn given_high_iops(_w: &mut KisekiWorld, _shard: String) { todo!("wire to server") }
 
 #[when(regex = r#"^an SSD learner is added to shard "([^"]*)"$"#)]
-async fn when_add_learner(_w: &mut KisekiWorld, _shard: String) {}
+async fn when_add_learner(_w: &mut KisekiWorld, _shard: String) { todo!("wire to server") }
 
 #[then("the learner receives the full Raft log")]
-async fn then_learner_receives_log(_w: &mut KisekiWorld) {}
+async fn then_learner_receives_log(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("its small/objects.redb is populated via log replay")]
-async fn then_learner_populated(_w: &mut KisekiWorld) {}
+async fn then_learner_populated(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("read requests can be served from the SSD learner")]
-async fn then_learner_serves_reads(_w: &mut KisekiWorld) {}
+async fn then_learner_serves_reads(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the learner does NOT participate in elections")]
-async fn then_no_elections(_w: &mut KisekiWorld) {}
+async fn then_no_elections(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the learner does NOT count toward commit quorum")]
-async fn then_no_quorum(_w: &mut KisekiWorld) {}
+async fn then_no_quorum(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[given(regex = r#"^shard "([^"]*)" has an SSD learner serving reads for (\d+) hours"#)]
 async fn given_learner_serving(w: &mut KisekiWorld, _shard: String, _hours: u64) {
@@ -683,19 +683,19 @@ async fn given_learner_serving(w: &mut KisekiWorld, _shard: String, _hours: u64)
 }
 
 #[given("the small-file workload persists")]
-async fn given_workload_persists(_w: &mut KisekiWorld) {}
+async fn given_workload_persists(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("the control plane promotes the SSD learner to voter")]
-async fn when_promote_learner(_w: &mut KisekiWorld) {}
+async fn when_promote_learner(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("demotes an HDD voter")]
-async fn when_demote_hdd(_w: &mut KisekiWorld) {}
+async fn when_demote_hdd(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the shard has an SSD voter and improved write latency")]
-async fn then_ssd_voter(_w: &mut KisekiWorld) {}
+async fn then_ssd_voter(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the old HDD voter's data is eventually GC'd")]
-async fn then_old_voter_gc(_w: &mut KisekiWorld) {}
+async fn then_old_voter_gc(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === Bimodal read latency ===
 
@@ -719,18 +719,18 @@ async fn when_threshold_drops(w: &mut KisekiWorld) {
 }
 
 #[when(regex = r#"^(\d+) new files of (\d+)KB are written \(now chunked\)"#)]
-async fn when_new_chunked(_w: &mut KisekiWorld, _count: u64, _kb: u64) {}
+async fn when_new_chunked(_w: &mut KisekiWorld, _count: u64, _kb: u64) { todo!("wire to server") }
 
 #[then(regex = r#"^reading old (\d+)KB files returns data from NVMe"#)]
-async fn then_old_from_nvme(_w: &mut KisekiWorld, _kb: u64) {}
+async fn then_old_from_nvme(_w: &mut KisekiWorld, _kb: u64) { todo!("wire to server") }
 
 #[then(regex = r#"^reading new (\d+)KB files returns data from HDD"#)]
-async fn then_new_from_hdd(_w: &mut KisekiWorld, _kb: u64) {}
+async fn then_new_from_hdd(_w: &mut KisekiWorld, _kb: u64) { todo!("wire to server") }
 
 #[then("this bimodal latency is expected behavior per ADR-030")]
-async fn then_bimodal_expected(_w: &mut KisekiWorld) {}
+async fn then_bimodal_expected(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 // === Install snapshot step (used across scenarios) ===
 
 #[when("installs it via install_snapshot")]
-async fn when_install_snapshot(_w: &mut KisekiWorld) {}
+async fn when_install_snapshot(_w: &mut KisekiWorld) { todo!("wire to server") }

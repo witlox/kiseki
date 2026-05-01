@@ -25,13 +25,13 @@ async fn given_key_manager_epoch(_w: &mut KisekiWorld, _epoch: u64) {
 // === Scenario: ptrace attachment detected ===
 
 #[given(regex = r#"^kiseki-server is running on node (\d+) with PID (\d+)$"#)]
-async fn given_kiseki_server(_w: &mut KisekiWorld, _node: u64, _pid: u64) {}
+async fn given_kiseki_server(_w: &mut KisekiWorld, _node: u64, _pid: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^the integrity monitor is watching PID (\d+)$"#)]
-async fn given_integrity_monitor(_w: &mut KisekiWorld, _pid: u64) {}
+async fn given_integrity_monitor(_w: &mut KisekiWorld, _pid: u64) { todo!("wire to server") }
 
 #[when(regex = r#"^an external process attaches via ptrace to PID (\d+)$"#)]
-async fn when_ptrace_attach(_w: &mut KisekiWorld, _pid: u64) {}
+async fn when_ptrace_attach(_w: &mut KisekiWorld, _pid: u64) { todo!("wire to server") }
 
 #[then(regex = r#"^the monitor detects TracerPid != 0 in /proc/(\d+)/status$"#)]
 async fn then_tracer_detected(_w: &mut KisekiWorld, _pid: u64) {
@@ -123,7 +123,7 @@ async fn then_auto_rotate(w: &mut KisekiWorld) {
 // === Scenario: Core dump attempt blocked ===
 
 #[given("kiseki-server has core dumps disabled (RLIMIT_CORE=0, MADV_DONTDUMP)")]
-async fn given_core_dumps_disabled(_w: &mut KisekiWorld) {}
+async fn given_core_dumps_disabled(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("a SIGABRT is received by the process")]
 async fn when_sigabrt(w: &mut KisekiWorld) {
@@ -179,10 +179,10 @@ async fn then_key_material_safe(_w: &mut KisekiWorld) {
 // === Scenario: Integrity monitor in development mode ===
 
 #[given("the cluster is in development/test mode")]
-async fn given_dev_mode(_w: &mut KisekiWorld) {}
+async fn given_dev_mode(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[given("the integrity monitor is configured as disabled")]
-async fn given_monitor_disabled(_w: &mut KisekiWorld) {}
+async fn given_monitor_disabled(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("ptrace attachments do not trigger alerts")]
 async fn then_no_ptrace_alerts(_w: &mut KisekiWorld) {
@@ -246,7 +246,7 @@ async fn given_sp_format_versions(_w: &mut KisekiWorld, versions: String) {
 }
 
 #[when(regex = r#"^the stream processor consumes deltas from (\S+)$"#)]
-async fn when_sp_consumes(_w: &mut KisekiWorld, _shard: String) {}
+async fn when_sp_consumes(_w: &mut KisekiWorld, _shard: String) { todo!("wire to server") }
 
 #[then(regex = r#"^it reads format version (\d+) deltas successfully$"#)]
 async fn then_reads_format_ok(_w: &mut KisekiWorld, ver: u64) {
@@ -303,7 +303,7 @@ async fn given_sp_limited_formats(_w: &mut KisekiWorld, versions: String) {
 }
 
 #[when(regex = r#"^the stream processor encounters the version (\d+) delta$"#)]
-async fn when_sp_encounters_version(_w: &mut KisekiWorld, _ver: u64) {}
+async fn when_sp_encounters_version(_w: &mut KisekiWorld, _ver: u64) { todo!("wire to server") }
 
 #[then("it skips the delta with a warning log")]
 async fn then_skips_delta(_w: &mut KisekiWorld) {
@@ -432,7 +432,7 @@ async fn given_shard_multi_format(w: &mut KisekiWorld, shard: String, _versions:
 }
 
 #[when("compaction merges these deltas")]
-async fn when_compaction_merges(_w: &mut KisekiWorld) {}
+async fn when_compaction_merges(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("each delta retains its original format version")]
 async fn then_retains_format(_w: &mut KisekiWorld) {
@@ -555,7 +555,7 @@ async fn given_no_hipaa(w: &mut KisekiWorld, tenant: String) {
 }
 
 #[when(regex = r#"^the tenant admin enables compression for "(\S+)"$"#)]
-async fn when_enable_compression(_w: &mut KisekiWorld, _tenant: String) {}
+async fn when_enable_compression(_w: &mut KisekiWorld, _tenant: String) { todo!("wire to server") }
 
 #[then("new chunks are compressed before encryption")]
 async fn then_chunks_compressed(_w: &mut KisekiWorld) {
@@ -617,7 +617,7 @@ async fn given_compression_enabled(w: &mut KisekiWorld, tenant: String) {
 }
 
 #[when("a 10MB plaintext file is written")]
-async fn when_write_10mb(_w: &mut KisekiWorld) {}
+async fn when_write_10mb(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the plaintext is compressed \(e\.g\., zstd\)$"#)]
 async fn then_compressed_zstd(_w: &mut KisekiWorld) {
@@ -680,7 +680,7 @@ async fn then_stored_compressed(_w: &mut KisekiWorld) {
 }
 
 #[when("the chunk is read")]
-async fn when_chunk_read_op(_w: &mut KisekiWorld) {}
+async fn when_chunk_read_op(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the ciphertext is decrypted")]
 async fn then_ciphertext_decrypted(_w: &mut KisekiWorld) {
@@ -735,7 +735,7 @@ async fn given_hipaa_tag(w: &mut KisekiWorld, tenant: String) {
 }
 
 #[when("the tenant admin attempts to enable compression")]
-async fn when_attempt_compression(_w: &mut KisekiWorld) {}
+async fn when_attempt_compression(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(
     regex = r#"^the request is rejected with "compression prohibited by HIPAA compliance tag"$"#
@@ -823,10 +823,10 @@ async fn then_no_compression(_w: &mut KisekiWorld) {
 // === Scenario: Audit export stalls — safety valve triggers GC ===
 
 #[given(regex = r#"^"(\S+)" audit export has stalled for (\d+) hours$"#)]
-async fn given_audit_stalled(_w: &mut KisekiWorld, _tenant: String, _hours: u64) {}
+async fn given_audit_stalled(_w: &mut KisekiWorld, _tenant: String, _hours: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^the safety valve threshold is (\d+) hours$"#)]
-async fn given_safety_valve_threshold(_w: &mut KisekiWorld, _hours: u64) {}
+async fn given_safety_valve_threshold(_w: &mut KisekiWorld, _hours: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^shard "(\S+)" has deltas eligible for GC$"#)]
 async fn given_deltas_eligible_gc(w: &mut KisekiWorld, shard: String) {
@@ -834,7 +834,7 @@ async fn given_deltas_eligible_gc(w: &mut KisekiWorld, shard: String) {
 }
 
 #[when(regex = r#"^the GC process evaluates "(\S+)" for operational GC$"#)]
-async fn when_gc_evaluates_op(_w: &mut KisekiWorld, _shard: String) {}
+async fn when_gc_evaluates_op(_w: &mut KisekiWorld, _shard: String) { todo!("wire to server") }
 
 #[then("GC proceeds despite the stalled audit watermark")]
 async fn then_gc_proceeds(_w: &mut KisekiWorld) {
@@ -919,10 +919,10 @@ async fn given_backpressure_enabled(w: &mut KisekiWorld, tenant: String) {
 }
 
 #[given(regex = r#"^"(\S+)" audit export is falling behind$"#)]
-async fn given_audit_falling_behind(_w: &mut KisekiWorld, _tenant: String) {}
+async fn given_audit_falling_behind(_w: &mut KisekiWorld, _tenant: String) { todo!("wire to server") }
 
 #[when("write pressure exceeds the audit consumption rate")]
-async fn when_write_pressure_exceeds(_w: &mut KisekiWorld) {}
+async fn when_write_pressure_exceeds(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^write throughput for "(\S+)" is throttled$"#)]
 async fn then_write_throttled(w: &mut KisekiWorld, tenant: String) {
@@ -1026,7 +1026,7 @@ async fn given_default_safety_valve(w: &mut KisekiWorld, tenant: String) {
 }
 
 #[when(regex = r#"^"(\S+)" writes data$"#)]
-async fn when_tenant_writes(_w: &mut KisekiWorld, _tenant: String) {}
+async fn when_tenant_writes(_w: &mut KisekiWorld, _tenant: String) { todo!("wire to server") }
 
 #[then(regex = r#"^"(\S+)" writes proceed at full speed$"#)]
 async fn then_writes_full_speed(w: &mut KisekiWorld, tenant: String) {
@@ -1076,7 +1076,7 @@ async fn given_hipaa_namespace(w: &mut KisekiWorld, ns: String) {
 }
 
 #[when("the namespace is created")]
-async fn when_namespace_created(_w: &mut KisekiWorld) {}
+async fn when_namespace_created(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("a default retention hold is automatically created")]
 async fn then_default_retention_hold(w: &mut KisekiWorld) {
@@ -1162,10 +1162,10 @@ async fn then_tenant_notified_hold(w: &mut KisekiWorld) {
 #[given(
     regex = r#"^no explicit retention hold exists \(auto-hold was not created .+ edge case\)$"#
 )]
-async fn given_no_explicit_hold(_w: &mut KisekiWorld) {}
+async fn given_no_explicit_hold(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when(regex = r#"^"(\S+)" attempts crypto-shred$"#)]
-async fn when_attempts_crypto_shred(_w: &mut KisekiWorld, _tenant: String) {}
+async fn when_attempts_crypto_shred(_w: &mut KisekiWorld, _tenant: String) { todo!("wire to server") }
 
 #[then(
     regex = r#"^crypto-shred is blocked with error: "compliance tags imply retention; set hold or use force override"$"#
@@ -1219,10 +1219,10 @@ async fn then_block_audit_logged(w: &mut KisekiWorld) {
 // === Scenario: Crypto-shred with force override ===
 
 #[given(regex = r#"^namespace "(\S+)" has HIPAA tag but no retention hold$"#)]
-async fn given_hipaa_no_hold(_w: &mut KisekiWorld, _ns: String) {}
+async fn given_hipaa_no_hold(_w: &mut KisekiWorld, _ns: String) { todo!("wire to server") }
 
 #[when(regex = r#"^"(\S+)" performs crypto-shred with force_without_hold_check=true$"#)]
-async fn when_force_crypto_shred(_w: &mut KisekiWorld, _tenant: String) {}
+async fn when_force_crypto_shred(_w: &mut KisekiWorld, _tenant: String) { todo!("wire to server") }
 
 #[then("crypto-shred proceeds (KEK destroyed)")]
 async fn then_shred_proceeds(w: &mut KisekiWorld) {
@@ -1290,7 +1290,7 @@ async fn given_components_cache_kek(
 }
 
 #[when(regex = r#"^crypto-shred is executed for "(\S+)"$"#)]
-async fn when_crypto_shred_executed(_w: &mut KisekiWorld, _tenant: String) {}
+async fn when_crypto_shred_executed(_w: &mut KisekiWorld, _tenant: String) { todo!("wire to server") }
 
 #[then(regex = r#"^an invalidation broadcast is sent to \[([^\]]+)\]$"#)]
 async fn then_invalidation_broadcast(_w: &mut KisekiWorld, components: String) {
@@ -1345,16 +1345,16 @@ async fn then_no_ack_wait(_w: &mut KisekiWorld) {
 // === Scenario: Unreachable component — TTL expires naturally ===
 
 #[given(regex = r#"^native client "(\S+)" on an unreachable compute node caches "(\S+)" KEK$"#)]
-async fn given_unreachable_client(_w: &mut KisekiWorld, _client: String, _tenant: String) {}
+async fn given_unreachable_client(_w: &mut KisekiWorld, _client: String, _tenant: String) { todo!("wire to server") }
 
 #[given(regex = r#"^the cache TTL is (\d+) seconds$"#)]
-async fn given_cache_ttl_secs(_w: &mut KisekiWorld, _ttl: u64) {}
+async fn given_cache_ttl_secs(_w: &mut KisekiWorld, _ttl: u64) { todo!("wire to server") }
 
 #[when("crypto-shred is executed and invalidation broadcast sent")]
-async fn when_shred_broadcast(_w: &mut KisekiWorld) {}
+async fn when_shred_broadcast(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when(regex = r#"^"(\S+)" does not receive the broadcast$"#)]
-async fn when_client_misses_broadcast(_w: &mut KisekiWorld, _client: String) {}
+async fn when_client_misses_broadcast(_w: &mut KisekiWorld, _client: String) { todo!("wire to server") }
 
 #[then(regex = r#"^"(\S+)" can still decrypt data for up to (\d+) seconds$"#)]
 async fn then_can_decrypt_window(_w: &mut KisekiWorld, _client: String, secs: u64) {
@@ -1406,7 +1406,7 @@ async fn given_ttl_request(w: &mut KisekiWorld, tenant: String, _ttl: u64, _boun
 }
 
 #[when("the control plane processes the request")]
-async fn when_cp_processes(_w: &mut KisekiWorld) {}
+async fn when_cp_processes(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the TTL is set to (\d+) seconds for all "(\S+)" key caches$"#)]
 async fn then_ttl_set(_w: &mut KisekiWorld, ttl: u64, _tenant: String) {
@@ -1480,10 +1480,10 @@ async fn then_ttl_unchanged(_w: &mut KisekiWorld) {
 // === Scenario: Writable shared mmap returns clear error ===
 
 #[given("a workload opens a file via FUSE mount")]
-async fn given_fuse_file(_w: &mut KisekiWorld) {}
+async fn given_fuse_file(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("the workload calls mmap with PROT_WRITE and MAP_SHARED")]
-async fn when_mmap_write_shared(_w: &mut KisekiWorld) {}
+async fn when_mmap_write_shared(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the native client returns ENOTSUP")]
 async fn then_enotsup(_w: &mut KisekiWorld) {
@@ -1517,7 +1517,7 @@ async fn then_error_immediate(_w: &mut KisekiWorld) {
 // === Scenario: Read-only mmap works ===
 
 #[when("the workload calls mmap with PROT_READ and MAP_PRIVATE")]
-async fn when_mmap_read_private(_w: &mut KisekiWorld) {}
+async fn when_mmap_read_private(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the mmap succeeds")]
 async fn then_mmap_succeeds(_w: &mut KisekiWorld) {
@@ -1572,7 +1572,7 @@ async fn then_useful_for_models(_w: &mut KisekiWorld) {
 // === Scenario: NFS client reconnects after node failure ===
 
 #[given("an NFS client is connected to gateway on node 1")]
-async fn given_nfs_client_connected(_w: &mut KisekiWorld) {}
+async fn given_nfs_client_connected(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[given(regex = r#"^the NFS mount is configured with multiple server addresses \[([^\]]+)\]$"#)]
 async fn given_nfs_multi_server(_w: &mut KisekiWorld, addrs: String) {
@@ -1584,7 +1584,7 @@ async fn given_nfs_multi_server(_w: &mut KisekiWorld, addrs: String) {
 }
 
 #[when("node 1 crashes")]
-async fn when_node1_crashes(_w: &mut KisekiWorld) {}
+async fn when_node1_crashes(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the NFS client detects connection loss")]
 async fn then_nfs_detects_loss(_w: &mut KisekiWorld) {
@@ -1636,13 +1636,13 @@ async fn then_nfs_resumes(_w: &mut KisekiWorld) {
 // === Scenario: S3 client retries to different endpoint on error ===
 
 #[given("an S3 client sends PutObject to node 1")]
-async fn given_s3_putobject(_w: &mut KisekiWorld) {}
+async fn given_s3_putobject(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[given("node 1 returns 503 Service Unavailable")]
-async fn given_503_error(_w: &mut KisekiWorld) {}
+async fn given_503_error(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("the S3 client retries (standard S3 retry behavior)")]
-async fn when_s3_retries(_w: &mut KisekiWorld) {}
+async fn when_s3_retries(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^DNS resolves to \[([^\]]+)\] \(round-robin\)$"#)]
 async fn then_dns_round_robin(_w: &mut KisekiWorld, nodes: String) {
@@ -1673,7 +1673,7 @@ async fn given_shard_splits(w: &mut KisekiWorld, shard: String, _a: String, _b: 
 }
 
 #[when("the native client's discovery cache TTL expires")]
-async fn when_discovery_ttl_expires(_w: &mut KisekiWorld) {}
+async fn when_discovery_ttl_expires(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("it re-queries discovery from a seed endpoint")]
 async fn then_re_queries_discovery(_w: &mut KisekiWorld) {
@@ -1720,14 +1720,13 @@ async fn given_chunk_multi_ref(
     _r1: u64,
     _t2: String,
     _r2: u64,
-) {
-}
+) { todo!("wire to server") }
 
 #[given(regex = r#"^total refcount = (\d+)$"#)]
-async fn given_total_refcount(_w: &mut KisekiWorld, _rc: u64) {}
+async fn given_total_refcount(_w: &mut KisekiWorld, _rc: u64) { todo!("wire to server") }
 
 #[when(regex = r#"^the cluster admin queries ChunkHealth for "(\S+)"$"#)]
-async fn when_query_chunk_health(_w: &mut KisekiWorld, _chunk: String) {}
+async fn when_query_chunk_health(_w: &mut KisekiWorld, _chunk: String) { todo!("wire to server") }
 
 #[then(regex = r#"^the response includes total_refcount: (\d+)$"#)]
 async fn then_total_refcount(_w: &mut KisekiWorld, rc: u64) {
@@ -1804,7 +1803,7 @@ async fn given_dedup_hit(w: &mut KisekiWorld, tenant: String) {
 }
 
 #[when("both write latencies are measured")]
-async fn when_latencies_measured(_w: &mut KisekiWorld) {}
+async fn when_latencies_measured(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the dedup hit is NOT observably faster (optional: random delay normalizes timing)")]
 async fn then_dedup_not_faster(_w: &mut KisekiWorld) {
@@ -1856,10 +1855,10 @@ async fn then_no_timing_leak(_w: &mut KisekiWorld) {
 // === Scenario: Advisory subsystem health reported to cluster admin ===
 
 #[given("the advisory subsystem is running on all storage nodes")]
-async fn given_advisory_running(_w: &mut KisekiWorld) {}
+async fn given_advisory_running(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("the cluster admin queries operational metrics (per ADR-015)")]
-async fn when_query_op_metrics(_w: &mut KisekiWorld) {}
+async fn when_query_op_metrics(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("advisory-specific metrics are exposed, tenant-anonymized:")]
 async fn then_advisory_metrics(_w: &mut KisekiWorld) {
@@ -1902,12 +1901,12 @@ async fn then_bounded_cardinality(_w: &mut KisekiWorld) {
 // === Scenario: Advisory audit event volume and batching ===
 
 #[given("the cluster sustains high advisory-hint traffic")]
-async fn given_high_advisory_traffic(_w: &mut KisekiWorld) {}
+async fn given_high_advisory_traffic(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when(
     "the advisory audit emitter applies I-WA8 batching for hint-accepted and hint-throttled events"
 )]
-async fn when_audit_batching(_w: &mut KisekiWorld) {}
+async fn when_audit_batching(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(
     regex = r#"^the operator metric `advisory_audit_batching_ratio` exposes the ratio of batched:emitted events cluster-wide$"#
@@ -1978,10 +1977,10 @@ async fn then_sampling_guarantee(w: &mut KisekiWorld) {
 #[given(
     regex = r#"^advisory audit events on a tenant's audit shard have stalled \(consumer behind by >(\d+)h\)$"#
 )]
-async fn given_advisory_audit_stalled(_w: &mut KisekiWorld, _hours: u64) {}
+async fn given_advisory_audit_stalled(_w: &mut KisekiWorld, _hours: u64) { todo!("wire to server") }
 
 #[when("the audit safety valve (I-A5) engages")]
-async fn when_safety_valve_engages(_w: &mut KisekiWorld) {}
+async fn when_safety_valve_engages(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("delta GC proceeds with a documented gap for that tenant")]
 async fn then_gc_with_gap(_w: &mut KisekiWorld) {
@@ -2032,10 +2031,10 @@ async fn then_advisory_continues(_w: &mut KisekiWorld) {
 // === Scenario: Advisory subsystem isolation verified operationally ===
 
 #[given("synthetic load drives the advisory subsystem to 100% of its runtime capacity")]
-async fn given_advisory_saturated(_w: &mut KisekiWorld) {}
+async fn given_advisory_saturated(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("data-path operations continue in parallel")]
-async fn when_data_path_parallel(_w: &mut KisekiWorld) {}
+async fn when_data_path_parallel(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("data-path p50 / p99 / p999 latencies remain within their published SLOs (I-WA2)")]
 async fn then_data_path_slos(_w: &mut KisekiWorld) {
@@ -2077,10 +2076,10 @@ async fn then_p0_alert_circuit_break(_w: &mut KisekiWorld) {
 // === Scenario: Advisory subsystem outage F-ADV-1 ===
 
 #[given("the advisory subsystem on one node becomes unresponsive (F-ADV-1)")]
-async fn given_advisory_unresponsive(_w: &mut KisekiWorld) {}
+async fn given_advisory_unresponsive(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("operational health checks run")]
-async fn when_health_checks_run(_w: &mut KisekiWorld) {}
+async fn when_health_checks_run(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^`advisory_health_status` for that node reports "unhealthy"$"#)]
 async fn then_advisory_unhealthy(_w: &mut KisekiWorld) {
@@ -2174,7 +2173,7 @@ async fn when_snapshot_built(w: &mut KisekiWorld, shard: String) {
 }
 
 #[when(regex = r#"^a new node installs this snapshot$"#)]
-async fn when_new_node_installs(_w: &mut KisekiWorld) {}
+async fn when_new_node_installs(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^its small/objects.redb contains all (\d+) entries$"#)]
 async fn then_redb_contains_entries(w: &mut KisekiWorld, count: u64) {

@@ -414,7 +414,7 @@ async fn then_each_shard_learner_added(_world: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^the learner is promoted to voter$"#)]
-async fn then_learner_promoted(_world: &mut KisekiWorld) {}
+async fn then_learner_promoted(_world: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^node-(\d+) is removed from the voter set$"#)]
 async fn then_node_n_removed_from_voters(world: &mut KisekiWorld, n: u64) {
@@ -458,7 +458,7 @@ async fn then_after_all_completed_evicted(world: &mut KisekiWorld) {
 // To make sure our InsufficientCapacity result lands in the field
 // the existing step reads, we mirror it in a small bridging step.
 #[then(regex = r#"^I-N4: drain refusal mirrors to last_error$"#)]
-async fn _drain_error_bridge_unused(_w: &mut KisekiWorld) {}
+async fn _drain_error_bridge_unused(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^node-(\d+) remains in state Active$"#)]
 async fn then_node_remains_active(world: &mut KisekiWorld, n: u64) {
@@ -578,10 +578,10 @@ async fn then_concurrency_bound(world: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^remaining replacements are queued$"#)]
-async fn then_remaining_queued(_world: &mut KisekiWorld) {}
+async fn then_remaining_queued(_world: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the drain completes in bounded time without Raft instability$"#)]
-async fn then_drain_bounded_time(_world: &mut KisekiWorld) {}
+async fn then_drain_bounded_time(_world: &mut KisekiWorld) { todo!("wire to server") }
 
 // `^the request is rejected with "([^"]*)"$` is owned by
 // steps/cluster.rs (line 754) — when_admin_reactivate above
@@ -599,7 +599,7 @@ async fn then_leader_not_on_drainee(world: &mut KisekiWorld, name: String) {
 }
 
 #[then(regex = r#"^the I-L12 placement engine excludes Failed, Draining, and Evicted nodes$"#)]
-async fn then_placement_excludes(_world: &mut KisekiWorld) {}
+async fn then_placement_excludes(_world: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^node-(\d+) \(Degraded\) is eligible as a replacement voter target$"#)]
 async fn then_degraded_eligible(world: &mut KisekiWorld, n: u64) {
@@ -608,7 +608,7 @@ async fn then_degraded_eligible(world: &mut KisekiWorld, n: u64) {
 }
 
 #[then(regex = r#"^voter replacements may be placed on node-(\d+)$"#)]
-async fn then_voter_may_be_on(_world: &mut KisekiWorld, _n: u64) {}
+async fn then_voter_may_be_on(_world: &mut KisekiWorld, _n: u64) { todo!("wire to server") }
 
 #[then(regex = r#"^the drain completes successfully$"#)]
 async fn then_drain_completes_successfully(world: &mut KisekiWorld) {
@@ -636,7 +636,7 @@ async fn then_drain_completes_successfully(world: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^node-(\d+) receives AppendEntries with a higher term showing its removal$"#)]
-async fn then_higher_term_received(_world: &mut KisekiWorld, _n: u64) {}
+async fn then_higher_term_received(_world: &mut KisekiWorld, _n: u64) { todo!("wire to server") }
 
 #[then(regex = r#"^node-(\d+) steps down and does not rejoin any voter set$"#)]
 async fn then_steps_down(world: &mut KisekiWorld, n: u64) {

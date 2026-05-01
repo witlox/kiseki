@@ -517,7 +517,7 @@ async fn when_ds_listener_started(_world: &mut KisekiWorld) {
 }
 
 #[when(regex = r#"^the MDS NFS listener is started on `nfs_addr`$"#)]
-async fn when_mds_listener_started(_world: &mut KisekiWorld) {}
+async fn when_mds_listener_started(_world: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the listener wraps `TcpListener` with `TlsConfig::server_config`$"#)]
 async fn then_listener_wraps_tls(_world: &mut KisekiWorld) {
@@ -670,7 +670,7 @@ async fn when_ds_killed(_world: &mut KisekiWorld) {
 }
 
 #[when(regex = r#"^the DS task is restarted$"#)]
-async fn when_ds_restarted(_world: &mut KisekiWorld) {}
+async fn when_ds_restarted(_world: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when(regex = r#"^the client retries the same op with the same fh4$"#)]
 async fn when_client_retries(world: &mut KisekiWorld) {
@@ -684,7 +684,7 @@ async fn then_op_same_result(world: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^no DS-side recovery state was inspected$"#)]
-async fn then_no_recovery_state(_world: &mut KisekiWorld) {}
+async fn then_no_recovery_state(_world: &mut KisekiWorld) { todo!("wire to server") }
 
 // ---------------------------------------------------------------------------
 // Phase 15b — MDS layout wire-up (still TODO)

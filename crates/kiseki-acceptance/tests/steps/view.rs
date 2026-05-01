@@ -211,10 +211,10 @@ async fn then_nfs_view_reflects(w: &mut KisekiWorld, _seq: u64) {
 // === Scenario: Stream processor respects staleness bound ===
 
 #[given(regex = r#"^the effective staleness bound is (\S+) \(.*\)$"#)]
-async fn given_effective_staleness(_w: &mut KisekiWorld, _bound: String) {}
+async fn given_effective_staleness(_w: &mut KisekiWorld, _bound: String) { todo!("wire to server") }
 
 #[when(regex = r#"^(\d+) seconds have elapsed since watermark (\d+)'s timestamp$"#)]
-async fn when_seconds_elapsed(_w: &mut KisekiWorld, _secs: u64, _wm: u64) {}
+async fn when_seconds_elapsed(_w: &mut KisekiWorld, _secs: u64, _wm: u64) { todo!("wire to server") }
 
 #[then(regex = r#"^"(\S+)" MUST consume available deltas to stay within bound$"#)]
 async fn then_must_consume(w: &mut KisekiWorld, _sp: String) {
@@ -234,13 +234,13 @@ async fn then_view_current(w: &mut KisekiWorld) {
 // === Scenario: POSIX view provides read-your-writes ===
 
 #[given(regex = r#"^the NFS view is at watermark (\d+)$"#)]
-async fn given_nfs_view_at_watermark(_w: &mut KisekiWorld, _wm: u64) {}
+async fn given_nfs_view_at_watermark(_w: &mut KisekiWorld, _wm: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^a new delta \(sequence (\d+)\) is committed by a write through NFS$"#)]
-async fn given_new_delta_committed(_w: &mut KisekiWorld, _seq: u64) {}
+async fn given_new_delta_committed(_w: &mut KisekiWorld, _seq: u64) { todo!("wire to server") }
 
 #[when("a read arrives through the NFS protocol gateway")]
-async fn when_read_through_nfs(_w: &mut KisekiWorld) {}
+async fn when_read_through_nfs(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the stream processor applies delta (\d+) before serving the read$"#)]
 async fn then_sp_applies_delta(w: &mut KisekiWorld, _seq: u64) {
@@ -328,7 +328,7 @@ async fn given_tenant_admin_creates_descriptor(w: &mut KisekiWorld, step: &Step,
 }
 
 #[when("the Control Plane registers the descriptor")]
-async fn when_control_plane_registers(_w: &mut KisekiWorld) {}
+async fn when_control_plane_registers(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^a new stream processor "(\S+)" is spawned$"#)]
 async fn then_sp_spawned(w: &mut KisekiWorld, _sp: String) {
@@ -358,10 +358,10 @@ async fn then_catches_up(w: &mut KisekiWorld) {
 // === Scenario: Discard and rebuild a view ===
 
 #[given(regex = r#"^view "(\S+)" is discardable and occupies (\d+)GB on (\S+)$"#)]
-async fn given_view_discardable(_w: &mut KisekiWorld, _view: String, _gb: u64, _pool: String) {}
+async fn given_view_discardable(_w: &mut KisekiWorld, _view: String, _gb: u64, _pool: String) { todo!("wire to server") }
 
 #[when("the cluster admin (with tenant admin approval) discards the view")]
-async fn when_admin_discards_view(_w: &mut KisekiWorld) {}
+async fn when_admin_discards_view(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the materialized state is deleted from (\S+)$"#)]
 async fn then_materialized_deleted(w: &mut KisekiWorld, _pool: String) {
@@ -403,12 +403,12 @@ async fn then_rematerializes(w: &mut KisekiWorld) {
 // === Scenario: View descriptor version change ===
 
 #[given(regex = r#"^stream processor "(\S+)" is running$"#)]
-async fn given_sp_running(_w: &mut KisekiWorld, _sp: String) {}
+async fn given_sp_running(_w: &mut KisekiWorld, _sp: String) { todo!("wire to server") }
 
 #[when(
     regex = r#"^the tenant admin updates descriptor "(\S+)" to change affinity_pool to "(\S+)"$"#
 )]
-async fn when_update_descriptor(_w: &mut KisekiWorld, _desc: String, _pool: String) {}
+async fn when_update_descriptor(_w: &mut KisekiWorld, _desc: String, _pool: String) { todo!("wire to server") }
 
 #[then("a new descriptor version is stored in the Control Plane")]
 async fn then_new_descriptor_version(w: &mut KisekiWorld) {
@@ -440,7 +440,7 @@ async fn then_reads_continue(w: &mut KisekiWorld) {
 // === Scenario: MVCC read pins a log position ===
 
 #[when("a read operation begins")]
-async fn when_read_begins(_w: &mut KisekiWorld) {}
+async fn when_read_begins(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^it pins a snapshot at position (\d+)$"#)]
 async fn then_pins_snapshot(w: &mut KisekiWorld, _pos: u64) {
@@ -470,13 +470,13 @@ async fn then_consistent_snapshot(w: &mut KisekiWorld) {
 // === Scenario: MVCC pin expires ===
 
 #[given(regex = r#"^a read pinned at position (\d+) has been active for (\d+) seconds$"#)]
-async fn given_read_pinned(_w: &mut KisekiWorld, _pos: u64, _secs: u64) {}
+async fn given_read_pinned(_w: &mut KisekiWorld, _pos: u64, _secs: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^the pin TTL for this view is (\d+) seconds$"#)]
-async fn given_pin_ttl(_w: &mut KisekiWorld, _ttl: u64) {}
+async fn given_pin_ttl(_w: &mut KisekiWorld, _ttl: u64) { todo!("wire to server") }
 
 #[when("the pin expires")]
-async fn when_pin_expires(_w: &mut KisekiWorld) {}
+async fn when_pin_expires(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the snapshot guarantee is revoked")]
 async fn then_snapshot_revoked(w: &mut KisekiWorld) {
@@ -509,7 +509,7 @@ async fn then_compaction_past(w: &mut KisekiWorld, _pos: u64) {
 // === Scenario: View exposes object versions ===
 
 #[given(regex = r#"^namespace "(\S+)" has versioning enabled$"#)]
-async fn given_ns_versioning(_w: &mut KisekiWorld, _ns: String) {}
+async fn given_ns_versioning(_w: &mut KisekiWorld, _ns: String) { todo!("wire to server") }
 
 #[given(regex = r#"^composition "(\S+)" has been written (\d+) times \(([^)]+)\)$"#)]
 async fn given_composition_versions(
@@ -517,11 +517,10 @@ async fn given_composition_versions(
     _comp: String,
     _count: u64,
     _versions: String,
-) {
-}
+) { todo!("wire to server") }
 
 #[when(regex = r#"^the S3 view lists versions for "(\S+)"$"#)]
-async fn when_list_versions(_w: &mut KisekiWorld, _obj: String) {}
+async fn when_list_versions(_w: &mut KisekiWorld, _obj: String) { todo!("wire to server") }
 
 #[then(regex = r#"^it returns \[([^\]]+)\] with their respective log positions$"#)]
 async fn then_returns_versions(_w: &mut KisekiWorld, versions: String) {
@@ -598,13 +597,13 @@ async fn then_current_version(_w: &mut KisekiWorld, _ver: String) {
 // === Scenario: Version read at historical position ===
 
 #[given(regex = r#"^"(\S+)" v1 was committed at log position (\d+)$"#)]
-async fn given_v1_committed(_w: &mut KisekiWorld, _obj: String, _pos: u64) {}
+async fn given_v1_committed(_w: &mut KisekiWorld, _obj: String, _pos: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^v(\d+) at position (\d+), v(\d+) at position (\d+)$"#)]
-async fn given_other_versions(_w: &mut KisekiWorld, _v1: u64, _p1: u64, _v2: u64, _p2: u64) {}
+async fn given_other_versions(_w: &mut KisekiWorld, _v1: u64, _p1: u64, _v2: u64, _p2: u64) { todo!("wire to server") }
 
 #[when("a read requests version v1 specifically")]
-async fn when_read_v1(_w: &mut KisekiWorld) {}
+async fn when_read_v1(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the view returns the state of "(\S+)" at position (\d+)$"#)]
 async fn then_view_returns_state(_w: &mut KisekiWorld, _obj: String, pos: u64) {
@@ -677,16 +676,16 @@ async fn then_no_replay(_w: &mut KisekiWorld) {
 // === Scenario: Write via NFS, read via S3 — bounded staleness ===
 
 #[given(regex = r#"^a write through NFS commits at sequence (\d+)$"#)]
-async fn given_write_nfs_commits(_w: &mut KisekiWorld, _seq: u64) {}
+async fn given_write_nfs_commits(_w: &mut KisekiWorld, _seq: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^the NFS view reflects (\d+) immediately \(read-your-writes\)$"#)]
-async fn given_nfs_reflects(_w: &mut KisekiWorld, _seq: u64) {}
+async fn given_nfs_reflects(_w: &mut KisekiWorld, _seq: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^the S3 view is at watermark (\d+) \(within (\S+) HIPAA floor\)$"#)]
-async fn given_s3_watermark(_w: &mut KisekiWorld, _wm: u64, _bound: String) {}
+async fn given_s3_watermark(_w: &mut KisekiWorld, _wm: u64, _bound: String) { todo!("wire to server") }
 
 #[when("a read arrives through S3 for the same data")]
-async fn when_read_s3(_w: &mut KisekiWorld) {}
+async fn when_read_s3(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the S3 view may NOT reflect (\d+) yet \(staleness within bound\)$"#)]
 async fn then_s3_not_reflect(w: &mut KisekiWorld, _seq: u64) {
@@ -730,7 +729,7 @@ async fn then_compliant_bounded_staleness(w: &mut KisekiWorld) {
 // === Scenario: Write via NFS, read via NFS — read-your-writes ===
 
 #[when("a read arrives through NFS for the same data")]
-async fn when_read_nfs_same(_w: &mut KisekiWorld) {}
+async fn when_read_nfs_same(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the NFS view reflects (\d+) \(read-your-writes guarantee\)$"#)]
 async fn then_nfs_reflects_ryw(w: &mut KisekiWorld, _seq: u64) {
@@ -764,10 +763,10 @@ async fn then_reader_sees_own(w: &mut KisekiWorld) {
 // === Scenario: Stream processor crashes ===
 
 #[given(regex = r#"^stream processor "(\S+)" crashes at watermark (\d+)$"#)]
-async fn given_sp_crashes(_w: &mut KisekiWorld, _sp: String, _wm: u64) {}
+async fn given_sp_crashes(_w: &mut KisekiWorld, _sp: String, _wm: u64) { todo!("wire to server") }
 
 #[when("it restarts")]
-async fn when_sp_restarts(_w: &mut KisekiWorld) {}
+async fn when_sp_restarts(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^it reads its last persisted watermark \((\d+)\) from durable storage$"#)]
 async fn then_reads_last_watermark(w: &mut KisekiWorld, _wm: u64) {
@@ -816,13 +815,13 @@ async fn then_no_data_lost(w: &mut KisekiWorld) {
 // === Scenario: Stream processor cannot decrypt ===
 
 #[given(regex = r#"^"(\S+)" cached tenant KEK expires$"#)]
-async fn given_cached_kek_expires(_w: &mut KisekiWorld, _sp: String) {}
+async fn given_cached_kek_expires(_w: &mut KisekiWorld, _sp: String) { todo!("wire to server") }
 
 #[given("tenant KMS is unreachable")]
-async fn given_tenant_kms_unreachable(_w: &mut KisekiWorld) {}
+async fn given_tenant_kms_unreachable(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[when("new deltas arrive")]
-async fn when_new_deltas_arrive(_w: &mut KisekiWorld) {}
+async fn when_new_deltas_arrive(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the stream processor stalls at its current watermark")]
 async fn then_sp_stalls(w: &mut KisekiWorld) {
@@ -901,13 +900,13 @@ async fn then_kms_resumes(w: &mut KisekiWorld) {
 // === Scenario: Stream processor falls behind ===
 
 #[given(regex = r#"^"(\S+)" is at watermark (\d+)$"#)]
-async fn given_sp_at_wm(_w: &mut KisekiWorld, _sp: String, _wm: u64) {}
+async fn given_sp_at_wm(_w: &mut KisekiWorld, _sp: String, _wm: u64) { todo!("wire to server") }
 
 #[given(regex = r#"^the effective staleness bound is (\S+)$"#)]
-async fn given_effective_staleness_simple(_w: &mut KisekiWorld, _bound: String) {}
+async fn given_effective_staleness_simple(_w: &mut KisekiWorld, _bound: String) { todo!("wire to server") }
 
 #[given(regex = r#"^(\d+) seconds have elapsed since watermark (\d+)$"#)]
-async fn given_seconds_elapsed(_w: &mut KisekiWorld, _secs: u64, _wm: u64) {}
+async fn given_seconds_elapsed(_w: &mut KisekiWorld, _secs: u64, _wm: u64) { todo!("wire to server") }
 
 #[then("the staleness bound is violated")]
 async fn then_staleness_violated(_w: &mut KisekiWorld) {
@@ -1002,10 +1001,10 @@ async fn then_sp_catching_up(w: &mut KisekiWorld) {
 // === Scenario: Source shard unavailable ===
 
 #[given(regex = r#"^shard "(\S+)" loses Raft quorum$"#)]
-async fn given_shard_loses_quorum(_w: &mut KisekiWorld, _shard: String) {}
+async fn given_shard_loses_quorum(_w: &mut KisekiWorld, _shard: String) { todo!("wire to server") }
 
 #[when("the stream processor cannot read new deltas")]
-async fn when_sp_cannot_read(_w: &mut KisekiWorld) {}
+async fn when_sp_cannot_read(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the view continues serving reads from its last materialized state")]
 async fn then_view_serves_last_state(w: &mut KisekiWorld) {
@@ -1068,15 +1067,15 @@ async fn then_no_new_writes(w: &mut KisekiWorld) {
 // === Scenario: Prefetch-range hint ===
 
 #[given(regex = r#"^workload "(\S+)" has an active workflow in phase "(\S+)"$"#)]
-async fn given_wl_active_workflow(_w: &mut KisekiWorld, _wl: String, _phase: String) {}
+async fn given_wl_active_workflow(_w: &mut KisekiWorld, _wl: String, _phase: String) { todo!("wire to server") }
 
 #[given(
     regex = r#"^the workflow has submitted a PrefetchHint of (\d+) \(.*\) tuples into view "(\S+)"$"#
 )]
-async fn given_prefetch_hint(_w: &mut KisekiWorld, _count: u64, _view: String) {}
+async fn given_prefetch_hint(_w: &mut KisekiWorld, _count: u64, _view: String) { todo!("wire to server") }
 
 #[when("the stream processor has idle materialization capacity")]
-async fn when_sp_idle(_w: &mut KisekiWorld) {}
+async fn when_sp_idle(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("it MAY decrypt + cache chunk data for the declared ranges in advance of read requests")]
 async fn then_may_prefetch(w: &mut KisekiWorld) {
@@ -1123,13 +1122,13 @@ async fn then_prefetch_preempted(w: &mut KisekiWorld) {
 // === Scenario: Access-pattern hint { random } suppresses readahead ===
 
 #[given("the stream processor normally performs sequential readahead for POSIX views")]
-async fn given_sp_sequential_readahead(_w: &mut KisekiWorld) {}
+async fn given_sp_sequential_readahead(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[given(regex = r#"^the caller submits hint \{ access_pattern: random \} for view "(\S+)"$"#)]
-async fn given_random_access_hint(_w: &mut KisekiWorld, _view: String) {}
+async fn given_random_access_hint(_w: &mut KisekiWorld, _view: String) { todo!("wire to server") }
 
 #[when("subsequent reads arrive")]
-async fn when_subsequent_reads(_w: &mut KisekiWorld) {}
+async fn when_subsequent_reads(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("the readahead heuristic is disabled for this caller's reads")]
 async fn then_readahead_disabled(w: &mut KisekiWorld) {
@@ -1174,10 +1173,10 @@ async fn then_other_callers_unaffected(w: &mut KisekiWorld) {
 // === Scenario: Phase marker { checkpoint } biases cache retention ===
 
 #[given(regex = r#"^the workflow advances to phase "(\S+)" with profile (\S+)$"#)]
-async fn given_wf_advances_phase(_w: &mut KisekiWorld, _phase: String, _profile: String) {}
+async fn given_wf_advances_phase(_w: &mut KisekiWorld, _phase: String, _profile: String) { todo!("wire to server") }
 
 #[when("the stream processor observes the phase marker on subsequent reads/writes")]
-async fn when_sp_observes_phase(_w: &mut KisekiWorld) {}
+async fn when_sp_observes_phase(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("cache retention for checkpoint-target compositions is extended within policy bounds")]
 async fn then_cache_retention_extended(w: &mut KisekiWorld) {
@@ -1213,13 +1212,13 @@ async fn then_cross_tenant_unaffected(w: &mut KisekiWorld) {
 // === Scenario: Materialization-lag telemetry ===
 
 #[given(regex = r#"^workload "(\S+)" owns views "(\S+)" and "(\S+)"$"#)]
-async fn given_wl_owns_views(_w: &mut KisekiWorld, _wl: String, _v1: String, _v2: String) {}
+async fn given_wl_owns_views(_w: &mut KisekiWorld, _wl: String, _v1: String, _v2: String) { todo!("wire to server") }
 
 #[given(regex = r#"^a neighbour workload owns view "(\S+)"$"#)]
-async fn given_neighbour_view(_w: &mut KisekiWorld, _view: String) {}
+async fn given_neighbour_view(_w: &mut KisekiWorld, _view: String) { todo!("wire to server") }
 
 #[when("the caller subscribes to materialization-lag telemetry")]
-async fn when_subscribe_lag(_w: &mut KisekiWorld) {}
+async fn when_subscribe_lag(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(regex = r#"^the stream returns lag values for "(\S+)" and "(\S+)" only$"#)]
 async fn then_lag_values(w: &mut KisekiWorld, v1: String, v2: String) {
@@ -1268,11 +1267,10 @@ async fn given_view_compliance_floor(
     _view: String,
     _floor: String,
     _pref: String,
-) {
-}
+) { todo!("wire to server") }
 
 #[when("the caller requests staleness telemetry")]
-async fn when_request_staleness(_w: &mut KisekiWorld) {}
+async fn when_request_staleness(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(
     regex = r#"^the reported effective-staleness bound is max\(view_preference, compliance_floor\) = (\S+) \(I-K9\)$"#
@@ -1337,10 +1335,10 @@ async fn then_hints_cannot_lower(_w: &mut KisekiWorld) {
 // === Scenario: Pin-headroom telemetry ===
 
 #[given(regex = r#"^workload "(\S+)" holds (\d+)% of its allowed MVCC pins \(I-V4\)$"#)]
-async fn given_wl_mvcc_pins(_w: &mut KisekiWorld, _wl: String, _pct: u64) {}
+async fn given_wl_mvcc_pins(_w: &mut KisekiWorld, _wl: String, _pct: u64) { todo!("wire to server") }
 
 #[when("the caller subscribes to pin-headroom telemetry")]
-async fn when_subscribe_pin_headroom(_w: &mut KisekiWorld) {}
+async fn when_subscribe_pin_headroom(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then(
     regex = r#"^a bucketed value \("ample" \| "approaching-limit" \| "near-exhaustion"\) is returned$"#
@@ -1401,7 +1399,7 @@ async fn then_no_pin_counts_exposed(w: &mut KisekiWorld) {
 // "tenant admin transitions ... advisory to disabled" step is in advisory.rs
 
 #[when("the stream processor receives no new hints for this workload")]
-async fn when_sp_no_hints(_w: &mut KisekiWorld) {}
+async fn when_sp_no_hints(_w: &mut KisekiWorld) { todo!("wire to server") }
 
 #[then("existing materialization and read paths continue unchanged (I-WA2)")]
 async fn then_materialization_continues(w: &mut KisekiWorld) {
