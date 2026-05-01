@@ -240,6 +240,10 @@ impl GatewayOps for Nfs4Client {
         w.write_string(&filename);
         let open = (op::OPEN, w.into_bytes());
 
+        // GETFH — retrieves the file handle after OPEN sets current_fh.
+        // The handle's first 16 bytes are the composition UUID.
+        let getfh = (op::GETFH, Vec::new());
+
         // WRITE
         let mut w = XdrWriter::new();
         w.write_u32(0); // stateid seqid
@@ -251,34 +255,73 @@ impl GatewayOps for Nfs4Client {
 
         let reply = sess.sequenced_compound(
             self.minor_version,
-            &[putrootfh, open, write],
+            &[putrootfh, open, write, getfh],
         )?;
 
-        // Parse PUTROOTFH: op(4) + status(4)
-        if reply.len() < 8 {
-            return Err(GatewayError::ProtocolError("PUTROOTFH reply short".into()));
-        }
-        let st = u32::from_be_bytes(reply[4..8].try_into().unwrap());
+        // Walk the op results sequentially using XdrReader.
+        let mut r = XdrReader::new(&reply);
+
+        // PUTROOTFH result: op(4) + status(4)
+        let _ = r.read_u32().map_err(xdr_err)?; // op
+        let st = r.read_u32().map_err(xdr_err)?;
         if st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("PUTROOTFH: {st}")));
         }
 
-        // We don't fully parse OPEN result — just verify it's OK
-        // OPEN result starts at byte 8, has variable length.
-        // Check the status field at offset 12 (op=4 + status=4).
-        if reply.len() < 16 {
-            return Err(GatewayError::ProtocolError("OPEN reply short".into()));
-        }
-        let open_st = u32::from_be_bytes(reply[12..16].try_into().unwrap());
+        // OPEN result: op(4) + status(4) + stateid(16) + cinfo(1+8+8=17) +
+        //   rflags(4) + attrset_count(4) + delegation_type(4)
+        let _ = r.read_u32().map_err(xdr_err)?; // op
+        let open_st = r.read_u32().map_err(xdr_err)?;
         if open_st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("OPEN: {open_st}")));
         }
+        // stateid4: seqid(4) + other(12)
+        let _ = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_opaque_fixed(12).map_err(xdr_err)?;
+        // change_info4: atomic(4) + before(8) + after(8)
+        let _ = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u64().map_err(xdr_err)?;
+        let _ = r.read_u64().map_err(xdr_err)?;
+        // rflags
+        let _ = r.read_u32().map_err(xdr_err)?;
+        // attrset bitmap4: count + words
+        let bm_count = r.read_u32().map_err(xdr_err)?;
+        for _ in 0..bm_count {
+            let _ = r.read_u32().map_err(xdr_err)?;
+        }
+        // open_delegation4: type (0=NONE, no body)
+        let _ = r.read_u32().map_err(xdr_err)?;
+
+        // WRITE result: op(4) + status(4) + count(4) + committed(4) + verifier(8)
+        let _ = r.read_u32().map_err(xdr_err)?; // op
+        let write_st = r.read_u32().map_err(xdr_err)?;
+        if write_st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("WRITE: {write_st}")));
+        }
+        let count = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(xdr_err)?; // committed
+        let _ = r.read_opaque_fixed(8).map_err(xdr_err)?; // verifier
+
+        // GETFH result: op(4) + status(4) + fh4(opaque)
+        // GETFH after WRITE picks up the file handle that WRITE set
+        // (which contains the composition UUID for the written data).
+        let _ = r.read_u32().map_err(xdr_err)?; // op
+        let getfh_st = r.read_u32().map_err(xdr_err)?;
+        if getfh_st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("GETFH: {getfh_st}")));
+        }
+        let fh = r.read_opaque().map_err(xdr_err)?;
+
+        // Extract composition UUID from file handle (first 16 bytes).
+        let composition_id = if fh.len() >= 16 {
+            CompositionId(uuid::Uuid::from_slice(&fh[..16]).unwrap_or_else(|_| uuid::Uuid::new_v4()))
+        } else {
+            CompositionId(uuid::Uuid::new_v4())
+        };
 
         Ok(WriteResponse {
-            composition_id: CompositionId(
-                uuid::Uuid::parse_str(&filename).unwrap_or_else(|_| uuid::Uuid::new_v4()),
-            ),
-            bytes_written: req.data.len() as u64,
+            composition_id,
+            bytes_written: count as u64,
         })
     }
 
