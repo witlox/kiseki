@@ -34,6 +34,16 @@ pub struct SmallFileState {
     pub backoff_hours: u64,
     pub hdd_voters: bool,
     pub learner_active: bool,
+    pub orphan_count: u64,
+    pub scrub_ran: bool,
+    pub p99_latency_ms: u64,
+    pub ssd_available: bool,
+    pub placement_evaluated: bool,
+    pub split_ceiling_exceeded: bool,
+    pub migration_candidates: u64,
+    pub high_read_iops: bool,
+    pub learner_promoted: bool,
+    pub chunked_file_count: u64,
 }
 
 impl SmallFileState {
