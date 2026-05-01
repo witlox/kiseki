@@ -113,6 +113,7 @@ mod macos_only {
     /// macFUSE release series independently of the kernel's
     /// `<linux/fuse.h>`.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn macfuse_init_protocol_version_pinned() {
         assert_eq!(
             MACFUSE_KERNEL_VERSION, 7,
@@ -154,7 +155,7 @@ mod macos_only {
 
     /// macOS errno divergence — Linux's `ENOTSUP=95` is `EOPNOTSUPP=102`
     /// on macOS (and they differ from Linux's `EOPNOTSUPP=95` —
-    /// macOS keeps them as separate values). The fuse_fs writable-
+    /// macOS keeps them as separate values). The `fuse_fs` writable-
     /// mmap path uses `ENOTSUP`; the macOS branch must use the
     /// macOS numeric.
     #[test]

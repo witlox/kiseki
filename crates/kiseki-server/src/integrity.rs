@@ -268,7 +268,7 @@ mod tests {
     }
 
     /// On non-Linux platforms both primitives must report
-    /// UnsupportedPlatform — never silently succeed.
+    /// `UnsupportedPlatform` — never silently succeed.
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn hardening_unsupported_off_linux() {

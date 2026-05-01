@@ -350,11 +350,12 @@ impl<G: GatewayOps> NfsContext<G> {
     pub fn buffer_write(&self, fh: &FileHandle, offset: u64, data: &[u8]) {
         let mut buffers = self.write_buffers.lock().unwrap();
         let buf = buffers.entry(*fh).or_default();
-        let end = offset as usize + data.len();
+        let off = usize::try_from(offset).unwrap_or(usize::MAX);
+        let end = off.saturating_add(data.len());
         if buf.len() < end {
             buf.resize(end, 0);
         }
-        buf[offset as usize..end].copy_from_slice(data);
+        buf[off..end].copy_from_slice(data);
     }
 
     /// Flush buffered writes for a file handle. Creates a new

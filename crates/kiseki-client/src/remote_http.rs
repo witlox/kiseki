@@ -13,7 +13,7 @@
 //!     9000) — same code path as `aws s3 cp`. No new gRPC service or
 //!     proto definitions to design.
 //!   * S3 keys ARE composition UUIDs (kiseki returns the etag = the
-//!     composition_id from PUT). Read by composition_id maps directly
+//!     `composition_id` from PUT). Read by `composition_id` maps directly
 //!     to GET `/<namespace>/<uuid>`.
 //!   * mTLS upgrade is one rustls config away when the cluster moves
 //!     off the audited plaintext fallback (ADR-038 §D4.2).
@@ -76,7 +76,7 @@ impl RemoteHttpGateway {
     /// Map a `reqwest::Error` to `GatewayError`. Network errors are
     /// `ProtocolError`; HTTP status codes are recognized as the
     /// closest semantic equivalent.
-    fn map_error(e: reqwest::Error) -> GatewayError {
+    fn map_error(e: &reqwest::Error) -> GatewayError {
         GatewayError::ProtocolError(format!("remote http: {e}"))
     }
 }
@@ -100,7 +100,7 @@ impl GatewayOps for RemoteHttpGateway {
             .header("Range", &range)
             .send()
             .await
-            .map_err(Self::map_error)?;
+            .map_err(|e| Self::map_error(&e))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -122,8 +122,8 @@ impl GatewayOps for RemoteHttpGateway {
         // tail (or 200 OK with a body shorter than requested), mark
         // EOF. The kernel's stat-based EOF check covers most paths
         // but FUSE callers also trust the gateway's eof flag.
-        let bytes = resp.bytes().await.map_err(Self::map_error)?;
-        let eof = bytes.len() < req.length as usize;
+        let bytes = resp.bytes().await.map_err(|e| Self::map_error(&e))?;
+        let eof = bytes.len() < usize::try_from(req.length).unwrap_or(usize::MAX);
 
         Ok(ReadResponse {
             data: bytes.to_vec(),
@@ -149,7 +149,7 @@ impl GatewayOps for RemoteHttpGateway {
             .body(req.data.clone())
             .send()
             .await
-            .map_err(Self::map_error)?;
+            .map_err(|e| Self::map_error(&e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -203,7 +203,7 @@ impl GatewayOps for RemoteHttpGateway {
             .delete(&url)
             .send()
             .await
-            .map_err(Self::map_error)?;
+            .map_err(|e| Self::map_error(&e))?;
         if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
             return Err(GatewayError::ProtocolError(format!(
                 "remote delete returned HTTP {}",
@@ -224,14 +224,14 @@ impl GatewayOps for RemoteHttpGateway {
             .post(&url)
             .send()
             .await
-            .map_err(Self::map_error)?;
+            .map_err(|e| Self::map_error(&e))?;
         if !resp.status().is_success() {
             return Err(GatewayError::ProtocolError(format!(
                 "remote start_multipart returned HTTP {}",
                 resp.status()
             )));
         }
-        let body = resp.text().await.map_err(Self::map_error)?;
+        let body = resp.text().await.map_err(|e| Self::map_error(&e))?;
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             GatewayError::ProtocolError(format!("start_multipart: invalid JSON: {e}"))
         })?;
@@ -263,7 +263,7 @@ impl GatewayOps for RemoteHttpGateway {
             .body(data.to_vec())
             .send()
             .await
-            .map_err(Self::map_error)?;
+            .map_err(|e| Self::map_error(&e))?;
         if !resp.status().is_success() {
             return Err(GatewayError::ProtocolError(format!(
                 "remote upload_part returned HTTP {}",
@@ -294,14 +294,14 @@ impl GatewayOps for RemoteHttpGateway {
             .post(&url)
             .send()
             .await
-            .map_err(Self::map_error)?;
+            .map_err(|e| Self::map_error(&e))?;
         if !resp.status().is_success() {
             return Err(GatewayError::ProtocolError(format!(
                 "remote complete_multipart returned HTTP {}",
                 resp.status()
             )));
         }
-        let body = resp.text().await.map_err(Self::map_error)?;
+        let body = resp.text().await.map_err(|e| Self::map_error(&e))?;
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             GatewayError::ProtocolError(format!("complete_multipart: invalid JSON: {e}"))
         })?;
@@ -327,7 +327,7 @@ impl GatewayOps for RemoteHttpGateway {
             .delete(&url)
             .send()
             .await
-            .map_err(Self::map_error)?;
+            .map_err(|e| Self::map_error(&e))?;
         if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NO_CONTENT {
             return Err(GatewayError::ProtocolError(format!(
                 "remote abort_multipart returned HTTP {}",
@@ -363,7 +363,7 @@ impl GatewayOps for RemoteHttpGateway {
             .put(&url)
             .send()
             .await
-            .map_err(Self::map_error)?;
+            .map_err(|e| Self::map_error(&e))?;
         // 200 = created, 409 = already exists — both are success.
         if !resp.status().is_success()
             && resp.status() != reqwest::StatusCode::CONFLICT

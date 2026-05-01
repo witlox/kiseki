@@ -1,6 +1,7 @@
-//! NFSv3 client (RFC 1813) — stateless RPC procedures over TCP.
+
+//! `NFSv3` client (RFC 1813) — stateless RPC procedures over TCP.
 //!
-//! Each GatewayOps call maps to one or more NFSv3 procedures:
+//! Each `GatewayOps` call maps to one or more `NFSv3` procedures:
 //!   write → CREATE + WRITE
 //!   read  → LOOKUP + READ
 //!   delete → REMOVE
@@ -16,7 +17,9 @@ use kiseki_gateway::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, W
 
 use super::transport::RpcTransport;
 
-const NFS_PROGRAM: u32 = 100003;
+type MultipartBuffer = std::sync::Mutex<HashMap<String, Vec<(u32, Vec<u8>)>>>;
+
+const NFS_PROGRAM: u32 = 100_003;
 const NFS3_VERSION: u32 = 3;
 
 // NFSv3 procedures (RFC 1813 §3)
@@ -30,7 +33,7 @@ const NFSPROC3_FSINFO: u32 = 19;
 
 const NFS3_OK: u32 = 0;
 
-/// NFSv3 client. Stateless — each operation is a single RPC.
+/// `NFSv3` client. Stateless — each operation is a single RPC.
 pub struct Nfs3Client {
     addr: SocketAddr,
     transport: Mutex<Option<RpcTransport>>,
@@ -38,12 +41,13 @@ pub struct Nfs3Client {
     /// Kiseki's FSINFO returns the root handle in `post_op_attr`.
     root_fh: Mutex<Option<Vec<u8>>>,
     /// Client-side multipart upload buffers keyed by upload ID.
-    /// Each value is a list of (part_number, data) pairs assembled
+    /// Each value is a list of (`part_number`, data) pairs assembled
     /// into a single CREATE+WRITE on `complete_multipart`.
-    multipart_buffers: Mutex<HashMap<String, Vec<(u32, Vec<u8>)>>>,
+    multipart_buffers: MultipartBuffer,
 }
 
 impl Nfs3Client {
+    #[must_use]
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -89,7 +93,7 @@ impl Nfs3Client {
         let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_FSINFO, &args.into_bytes())?;
 
         let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(xdr_err)?;
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
         if status != NFS3_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "FSINFO failed: status={status}"
@@ -105,7 +109,7 @@ impl Nfs3Client {
     }
 }
 
-fn xdr_err(e: std::io::Error) -> GatewayError {
+fn xdr_err(e: &std::io::Error) -> GatewayError {
     GatewayError::ProtocolError(format!("XDR: {e}"))
 }
 
@@ -130,16 +134,16 @@ impl GatewayOps for Nfs3Client {
         let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_CREATE, &args.into_bytes())?;
 
         let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(xdr_err)?;
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
         if status != NFS3_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "NFSv3 CREATE failed: status={status}"
             )));
         }
         // post_op_fh3: follows(bool) + handle
-        let has_handle = r.read_u32().map_err(xdr_err)?;
+        let has_handle = r.read_u32().map_err(|e| xdr_err(&e))?;
         let file_fh = if has_handle != 0 {
-            r.read_opaque().map_err(xdr_err)?
+            r.read_opaque().map_err(|e| xdr_err(&e))?
         } else {
             return Err(GatewayError::ProtocolError("CREATE returned no handle".into()));
         };
@@ -154,7 +158,7 @@ impl GatewayOps for Nfs3Client {
         let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_WRITE, &args.into_bytes())?;
 
         let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(xdr_err)?;
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
         if status != NFS3_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "NFSv3 WRITE failed: status={status}"
@@ -183,39 +187,39 @@ impl GatewayOps for Nfs3Client {
         let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_LOOKUP, &args.into_bytes())?;
 
         let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(xdr_err)?;
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
         if status != NFS3_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "NFSv3 LOOKUP failed: status={status}"
             )));
         }
-        let file_fh = r.read_opaque().map_err(xdr_err)?;
+        let file_fh = r.read_opaque().map_err(|e| xdr_err(&e))?;
 
         // READ
         let mut args = XdrWriter::new();
         args.write_opaque(&file_fh);
         args.write_u64(req.offset);
-        args.write_u32(req.length.min(u32::MAX as u64) as u32);
+        args.write_u32(u32::try_from(req.length).unwrap_or(u32::MAX));
         let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_READ, &args.into_bytes())?;
 
         let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(xdr_err)?;
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
         if status != NFS3_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "NFSv3 READ failed: status={status}"
             )));
         }
         // post_op_attr
-        let has_attr = r.read_u32().map_err(xdr_err)?;
+        let has_attr = r.read_u32().map_err(|e| xdr_err(&e))?;
         if has_attr != 0 {
             // Skip fattr3 (84 bytes)
             for _ in 0..21 {
-                let _ = r.read_u32().map_err(xdr_err)?;
+                let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
             }
         }
-        let count = r.read_u32().map_err(xdr_err)?;
-        let eof = r.read_u32().map_err(xdr_err)? != 0;
-        let data = r.read_opaque().map_err(xdr_err)?;
+        let _count = r.read_u32().map_err(|e| xdr_err(&e))?;
+        let eof = r.read_u32().map_err(|e| xdr_err(&e))? != 0;
+        let data = r.read_opaque().map_err(|e| xdr_err(&e))?;
 
         Ok(ReadResponse {
             data,
@@ -248,7 +252,7 @@ impl GatewayOps for Nfs3Client {
         let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_REMOVE, &args.into_bytes())?;
 
         let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(xdr_err)?;
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
         if status != NFS3_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "NFSv3 REMOVE failed: status={status}"

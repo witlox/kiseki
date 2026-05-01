@@ -1,4 +1,5 @@
-//! ONC RPC over TCP transport — shared by NFSv3 and NFSv4 clients.
+
+//! ONC RPC over TCP transport — shared by `NFSv3` and `NFSv4` clients.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -21,7 +22,7 @@ impl RpcTransport {
         stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
         Ok(Self {
             stream,
-            xid: 0x4B495345, // "KISE"
+            xid: 0x4B49_5345, // "KISE"
         })
     }
 

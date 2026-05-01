@@ -1,6 +1,7 @@
+
 //! NFSv4.1/4.2 client (RFC 8881/7862) — session-based COMPOUND RPCs.
 //!
-//! Session lifecycle: EXCHANGE_ID → CREATE_SESSION → per-request
+//! Session lifecycle: `EXCHANGE_ID` → `CREATE_SESSION` → per-request
 //! SEQUENCE + ops. Session established lazily on first use.
 
 use std::collections::HashMap;
@@ -15,7 +16,9 @@ use kiseki_gateway::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, W
 
 use super::transport::RpcTransport;
 
-const NFS_PROGRAM: u32 = 100003;
+type MultipartBuffer = std::sync::Mutex<HashMap<String, Vec<(u32, Vec<u8>)>>>;
+
+const NFS_PROGRAM: u32 = 100_003;
 const NFS_VERSION: u32 = 4;
 const NFS_COMPOUND_PROC: u32 = 1;
 const NFS4_OK: u32 = 0;
@@ -34,11 +37,12 @@ pub struct Nfs4Client {
     session: Mutex<Option<Nfs4Session>>,
     /// Client-side multipart buffers. NFS has no native multipart concept,
     /// so we buffer parts locally and concatenate on complete.
-    multipart_buffers: Mutex<HashMap<String, Vec<(u32, Vec<u8>)>>>,
+    multipart_buffers: MultipartBuffer,
 }
 
 impl Nfs4Client {
     /// Create an NFSv4.1 client.
+    #[must_use]
     pub fn v41(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -49,6 +53,7 @@ impl Nfs4Client {
     }
 
     /// Create an NFSv4.2 client.
+    #[must_use]
     pub fn v42(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -85,7 +90,7 @@ impl Nfs4Client {
 
         let reply = transport.call(NFS_PROGRAM, NFS_VERSION, NFS_COMPOUND_PROC, &body.into_bytes())?;
         let (client_id, _) = parse_compound_single_op(&reply, op::EXCHANGE_ID, |r| {
-            r.read_u64().map_err(xdr_err)
+            r.read_u64().map_err(|e| xdr_err(&e))
         })?;
 
         // CREATE_SESSION
@@ -100,7 +105,7 @@ impl Nfs4Client {
 
         let reply = transport.call(NFS_PROGRAM, NFS_VERSION, NFS_COMPOUND_PROC, &body.into_bytes())?;
         let (session_id, _) = parse_compound_single_op(&reply, op::CREATE_SESSION, |r| {
-            let sid = r.read_opaque_fixed(16).map_err(xdr_err)?;
+            let sid = r.read_opaque_fixed(16).map_err(|e| xdr_err(&e))?;
             let mut arr = [0u8; 16];
             arr.copy_from_slice(&sid);
             Ok(arr)
@@ -153,29 +158,29 @@ impl Nfs4Session {
 
         // Parse COMPOUND header
         let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(xdr_err)?;
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
         if status != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "COMPOUND failed: {status}"
             )));
         }
-        let _tag = r.read_opaque().map_err(xdr_err)?;
-        let _num = r.read_u32().map_err(xdr_err)?;
+        let _tag = r.read_opaque().map_err(|e| xdr_err(&e))?;
+        let _num = r.read_u32().map_err(|e| xdr_err(&e))?;
 
         // Skip SEQUENCE result: op(4) + status(4) + session(16) + seqid(4) + slot(4) + highest(4) + flags(4)
-        let seq_op = r.read_u32().map_err(xdr_err)?;
-        let seq_st = r.read_u32().map_err(xdr_err)?;
+        let _seq_op = r.read_u32().map_err(|e| xdr_err(&e))?;
+        let seq_st = r.read_u32().map_err(|e| xdr_err(&e))?;
         if seq_st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "SEQUENCE failed: {seq_st}"
             )));
         }
-        let _ = r.read_opaque_fixed(16).map_err(xdr_err)?; // session_id echo
-        let _ = r.read_u32().map_err(xdr_err)?; // sequenceid
-        let _ = r.read_u32().map_err(xdr_err)?; // slotid
-        let _ = r.read_u32().map_err(xdr_err)?; // highest_slotid
-        let _ = r.read_u32().map_err(xdr_err)?; // target_highest_slotid
-        let _ = r.read_u32().map_err(xdr_err)?; // status_flags
+        let _ = r.read_opaque_fixed(16).map_err(|e| xdr_err(&e))?; // session_id echo
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // sequenceid
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // slotid
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // highest_slotid
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // target_highest_slotid
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // status_flags
 
         // Return remaining bytes (all subsequent op results)
         let pos = reply.len() - r.remaining();
@@ -183,7 +188,7 @@ impl Nfs4Session {
     }
 }
 
-fn xdr_err(e: std::io::Error) -> GatewayError {
+fn xdr_err(e: &std::io::Error) -> GatewayError {
     GatewayError::ProtocolError(format!("XDR: {e}"))
 }
 
@@ -194,22 +199,22 @@ fn parse_compound_single_op<T>(
     parse_result: impl FnOnce(&mut XdrReader<'_>) -> Result<T, GatewayError>,
 ) -> Result<(T, Vec<u8>), GatewayError> {
     let mut r = XdrReader::new(reply);
-    let status = r.read_u32().map_err(xdr_err)?;
+    let status = r.read_u32().map_err(|e| xdr_err(&e))?;
     if status != NFS4_OK {
         return Err(GatewayError::ProtocolError(format!(
             "COMPOUND failed: {status}"
         )));
     }
-    let _tag = r.read_opaque().map_err(xdr_err)?;
-    let _num = r.read_u32().map_err(xdr_err)?;
+    let _tag = r.read_opaque().map_err(|e| xdr_err(&e))?;
+    let _num = r.read_u32().map_err(|e| xdr_err(&e))?;
 
-    let actual_op = r.read_u32().map_err(xdr_err)?;
+    let actual_op = r.read_u32().map_err(|e| xdr_err(&e))?;
     if actual_op != expected_op {
         return Err(GatewayError::ProtocolError(format!(
             "expected op {expected_op}, got {actual_op}"
         )));
     }
-    let op_status = r.read_u32().map_err(xdr_err)?;
+    let op_status = r.read_u32().map_err(|e| xdr_err(&e))?;
     if op_status != NFS4_OK {
         return Err(GatewayError::ProtocolError(format!(
             "op {expected_op} failed: {op_status}"
@@ -275,64 +280,64 @@ impl GatewayOps for Nfs4Client {
         let mut r = XdrReader::new(&reply);
 
         // PUTROOTFH result: op(4) + status(4)
-        let _ = r.read_u32().map_err(xdr_err)?; // op
-        let st = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // op
+        let st = r.read_u32().map_err(|e| xdr_err(&e))?;
         if st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("PUTROOTFH: {st}")));
         }
 
         // OPEN result: op(4) + status(4) + stateid(16) + cinfo(1+8+8=17) +
         //   rflags(4) + attrset_count(4) + delegation_type(4)
-        let _ = r.read_u32().map_err(xdr_err)?; // op
-        let open_st = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // op
+        let open_st = r.read_u32().map_err(|e| xdr_err(&e))?;
         if open_st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("OPEN: {open_st}")));
         }
         // stateid4: seqid(4) + other(12)
-        let _ = r.read_u32().map_err(xdr_err)?;
-        let _ = r.read_opaque_fixed(12).map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
+        let _ = r.read_opaque_fixed(12).map_err(|e| xdr_err(&e))?;
         // change_info4: atomic(4) + before(8) + after(8)
-        let _ = r.read_u32().map_err(xdr_err)?;
-        let _ = r.read_u64().map_err(xdr_err)?;
-        let _ = r.read_u64().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
+        let _ = r.read_u64().map_err(|e| xdr_err(&e))?;
+        let _ = r.read_u64().map_err(|e| xdr_err(&e))?;
         // rflags
-        let _ = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
         // attrset bitmap4: count + words
-        let bm_count = r.read_u32().map_err(xdr_err)?;
+        let bm_count = r.read_u32().map_err(|e| xdr_err(&e))?;
         for _ in 0..bm_count {
-            let _ = r.read_u32().map_err(xdr_err)?;
+            let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
         }
         // open_delegation4: type (0=NONE, no body)
-        let _ = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
 
         // WRITE result: op(4) + status(4) + count(4) + committed(4) + verifier(8)
-        let _ = r.read_u32().map_err(xdr_err)?; // op
-        let write_st = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // op
+        let write_st = r.read_u32().map_err(|e| xdr_err(&e))?;
         if write_st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("WRITE: {write_st}")));
         }
-        let count = r.read_u32().map_err(xdr_err)?;
-        let _ = r.read_u32().map_err(xdr_err)?; // committed
-        let _ = r.read_opaque_fixed(8).map_err(xdr_err)?; // verifier
+        let count = r.read_u32().map_err(|e| xdr_err(&e))?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // committed
+        let _ = r.read_opaque_fixed(8).map_err(|e| xdr_err(&e))?; // verifier
 
         // COMMIT result: op(4) + status(4) + verifier(8)
         // COMMIT flushes the write buffer to a composition.
-        let _ = r.read_u32().map_err(xdr_err)?; // op
-        let commit_st = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // op
+        let commit_st = r.read_u32().map_err(|e| xdr_err(&e))?;
         if commit_st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("COMMIT: {commit_st}")));
         }
-        let _ = r.read_opaque_fixed(8).map_err(xdr_err)?; // verifier
+        let _ = r.read_opaque_fixed(8).map_err(|e| xdr_err(&e))?; // verifier
 
         // GETFH result: op(4) + status(4) + fh4(opaque)
         // GETFH after COMMIT picks up the file handle that flush_writes
         // set (the composition with the actual data).
-        let _ = r.read_u32().map_err(xdr_err)?; // op
-        let getfh_st = r.read_u32().map_err(xdr_err)?;
+        let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // op
+        let getfh_st = r.read_u32().map_err(|e| xdr_err(&e))?;
         if getfh_st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("GETFH: {getfh_st}")));
         }
-        let fh = r.read_opaque().map_err(xdr_err)?;
+        let fh = r.read_opaque().map_err(|e| xdr_err(&e))?;
 
         // Extract composition UUID from file handle (first 16 bytes).
         let composition_id = if fh.len() >= 16 {
@@ -343,7 +348,7 @@ impl GatewayOps for Nfs4Client {
 
         Ok(WriteResponse {
             composition_id,
-            bytes_written: count as u64,
+            bytes_written: u64::from(count),
         })
     }
 
@@ -372,7 +377,7 @@ impl GatewayOps for Nfs4Client {
         w.write_u32(0);
         w.write_opaque_fixed(&[0u8; 12]);
         w.write_u64(req.offset);
-        w.write_u32(req.length.min(u32::MAX as u64) as u32);
+        w.write_u32(u32::try_from(req.length).unwrap_or(u32::MAX));
         let read = (op::READ, w.into_bytes());
 
         let reply = sess.sequenced_compound(
@@ -445,7 +450,7 @@ impl GatewayOps for Nfs4Client {
         Ok(upload_id)
     }
 
-    /// Buffer a part client-side. Returns the part number as the ETag
+    /// Buffer a part client-side. Returns the part number as the `ETag`
     /// (no server-side tracking for NFS).
     async fn upload_part(
         &self,
