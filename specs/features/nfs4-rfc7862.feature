@@ -30,6 +30,19 @@ Feature: NFSv4.2 wire protocol compliance (RFC 7862)
     And GETATTR returns type directory for the root filehandle
 
   @integration
+  Scenario: NFSv4 sequential write then read — all bytes survive
+    Given a running kiseki-server
+    When a client writes "AAAA" at offset 0 via NFSv4 WRITE
+    And writes "BBBB" at offset 4 via NFSv4 WRITE
+    Then reading 8 bytes at offset 0 returns "AAAABBBB"
+
+  @integration
+  Scenario: NFSv4 write 10KB in 4KB chunks then read back
+    Given a running kiseki-server
+    When a client writes a 10KB file via NFSv4 in 4KB sequential chunks
+    Then reading the full file returns all 10KB with correct content
+
+  @integration
   Scenario: S3 PUT then NFS READ cross-protocol roundtrip
     Given a 1KB object written via S3 PUT to "default/cross-test"
     When a client reads the object via NFSv4 COMPOUND READ

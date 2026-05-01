@@ -83,6 +83,149 @@ async fn then_getattr_dir(w: &mut KisekiWorld) {
     assert!(w.server().last_body.is_some());
 }
 
+// --- Scenario: NFSv4 sequential write then read ---
+
+#[when(regex = r#"^a client writes "([^"]*)" at offset (\d+) via NFSv4 WRITE$"#)]
+async fn when_nfs_write_at_offset(w: &mut KisekiWorld, data: String, offset: u64) {
+    use kiseki_client::remote_nfs::transport::RpcTransport;
+    use kiseki_gateway::nfs4_server::op;
+    use kiseki_gateway::nfs_xdr::XdrWriter;
+
+    // Establish session if not done
+    if w.server().response_state.get("nfs_session_id").is_none() {
+        let port = w.server().ports.nfs_tcp;
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
+
+        // Create file via write at offset 0 using GatewayOps
+        use kiseki_gateway::ops::WriteRequest;
+        let resp = nfs.write(WriteRequest {
+            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+            data: data.into_bytes(),
+        }).await.expect("initial NFS write");
+        w.server_mut().response_state.insert(
+            "seq_write_comp_id".into(),
+            resp.composition_id.0.to_string(),
+        );
+        return;
+    }
+
+    // Subsequent writes at offset > 0 — this is what should work but currently doesn't
+    // Use the existing session to WRITE at non-zero offset
+    let port = w.server().ports.nfs_tcp;
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut transport = RpcTransport::connect(addr).expect("connect");
+
+    // We need to send WRITE with the file's handle at the given offset.
+    // For now, use a fresh connection + session (the server should buffer).
+    let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
+    // This will create a NEW composition — which is the bug.
+    // A real NFS server would append to the same file.
+    use kiseki_gateway::ops::WriteRequest;
+    let resp = nfs.write(WriteRequest {
+        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+        data: data.into_bytes(),
+    }).await.expect("subsequent NFS write");
+    // Store second comp_id
+    w.server_mut().response_state.insert(
+        "seq_write_comp_id_2".into(),
+        resp.composition_id.0.to_string(),
+    );
+}
+
+#[then(regex = r#"^reading (\d+) bytes at offset 0 returns "([^"]*)"$"#)]
+async fn then_nfs_read_sequential(w: &mut KisekiWorld, expected_len: usize, expected: String) {
+    let comp_id_str = w.server().response_state.get("seq_write_comp_id")
+        .cloned().expect("need comp_id from first write");
+    let comp_id = kiseki_common::ids::CompositionId(
+        uuid::Uuid::parse_str(&comp_id_str).unwrap()
+    );
+
+    let port = w.server().ports.nfs_tcp;
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
+
+    use kiseki_gateway::ops::ReadRequest;
+    let resp = nfs.read(ReadRequest {
+        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+        composition_id: comp_id,
+        offset: 0,
+        length: expected_len as u64,
+    }).await.expect("NFS read");
+
+    assert_eq!(
+        resp.data.len(), expected_len,
+        "expected {expected_len} bytes, got {}",
+        resp.data.len()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&resp.data), expected,
+        "sequential write data mismatch"
+    );
+}
+
+#[when("a client writes a 10KB file via NFSv4 in 4KB sequential chunks")]
+async fn when_nfs_write_10kb_chunks(w: &mut KisekiWorld) {
+    let port = w.server().ports.nfs_tcp;
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
+
+    // Write 10KB as: 4KB at offset 0, 4KB at offset 4096, 2KB at offset 8192
+    // Using GatewayOps::write which does offset=0 only — this tests whether
+    // the system can handle a file built from multiple writes.
+    use kiseki_gateway::ops::WriteRequest;
+
+    // First chunk: 4KB of 'A'
+    let chunk1 = vec![b'A'; 4096];
+    let resp = nfs.write(WriteRequest {
+        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+        data: chunk1,
+    }).await.expect("write chunk 1");
+    w.server_mut().response_state.insert(
+        "10kb_comp_id".into(),
+        resp.composition_id.0.to_string(),
+    );
+
+    // The current implementation creates a new composition per write.
+    // A real NFS server would append chunks 2 and 3 to the same file.
+    // This test will FAIL until buffered writes are implemented — that's
+    // the point. It proves the gap exists.
+}
+
+#[then("reading the full file returns all 10KB with correct content")]
+async fn then_nfs_read_10kb(w: &mut KisekiWorld) {
+    let comp_id_str = w.server().response_state.get("10kb_comp_id")
+        .cloned().expect("need comp_id");
+    let comp_id = kiseki_common::ids::CompositionId(
+        uuid::Uuid::parse_str(&comp_id_str).unwrap()
+    );
+
+    let port = w.server().ports.nfs_tcp;
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
+
+    use kiseki_gateway::ops::ReadRequest;
+    let resp = nfs.read(ReadRequest {
+        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+        composition_id: comp_id,
+        offset: 0,
+        length: 10240,
+    }).await.expect("NFS read 10KB");
+
+    // Currently only the first 4KB chunk is stored (offset=0 write).
+    // The full 10KB test will fail until buffered writes land.
+    assert_eq!(
+        resp.data.len(), 10240,
+        "expected 10KB, got {} bytes — NFS sequential write is broken",
+        resp.data.len()
+    );
+}
+
 // --- Cross-protocol: S3 PUT → NFS READ ---
 
 #[given(regex = r#"^a 1KB object written via S3 PUT to "([^"]*)"$"#)]
