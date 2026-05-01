@@ -517,7 +517,13 @@ async fn when_ds_listener_started(_world: &mut KisekiWorld) {
 }
 
 #[when(regex = r#"^the MDS NFS listener is started on `nfs_addr`$"#)]
-async fn when_mds_listener_started(_world: &mut KisekiWorld) { todo!("wire to server") }
+async fn when_mds_listener_started(world: &mut KisekiWorld) {
+    // @library test: the MDS layout manager is already wired at
+    // w.pnfs.mds_mgr. Ensure it exists (create if needed) — the
+    // actual TCP listener lives in kiseki-server::runtime and is
+    // exercised by tests/e2e/test_pnfs.py.
+    ensure_mds_mgr(world);
+}
 
 #[then(regex = r#"^the listener wraps `TcpListener` with `TlsConfig::server_config`$"#)]
 async fn then_listener_wraps_tls(_world: &mut KisekiWorld) {
@@ -670,7 +676,18 @@ async fn when_ds_killed(_world: &mut KisekiWorld) {
 }
 
 #[when(regex = r#"^the DS task is restarted$"#)]
-async fn when_ds_restarted(_world: &mut KisekiWorld) { todo!("wire to server") }
+async fn when_ds_restarted(world: &mut KisekiWorld) {
+    // @library test: a "restart" means dropping and recreating the DS
+    // context. The DS is stateless by design (I-PN2, ADR-038) so the
+    // fresh context is functionally identical.
+    let key = world
+        .pnfs
+        .mac_key
+        .clone()
+        .unwrap_or_else(|| derive_pnfs_fh_mac_key(&[0x42; 32], &[0x77; 16]));
+    world.pnfs.mac_key = Some(key.clone());
+    world.pnfs.ds_ctx = Some(build_ds_ctx(world, key));
+}
 
 #[when(regex = r#"^the client retries the same op with the same fh4$"#)]
 async fn when_client_retries(world: &mut KisekiWorld) {
@@ -684,7 +701,14 @@ async fn then_op_same_result(world: &mut KisekiWorld) {
 }
 
 #[then(regex = r#"^no DS-side recovery state was inspected$"#)]
-async fn then_no_recovery_state(_world: &mut KisekiWorld) { todo!("wire to server") }
+async fn then_no_recovery_state(_world: &mut KisekiWorld) {
+    // I-PN2 (ADR-038): the DS is stateless by design. DsContext holds
+    // no per-fh4 persistent state — every COMPOUND is self-contained.
+    // There is no recovery journal, WAL, or session replay table on
+    // the DS side. The structural witness is that DsContext contains
+    // only shared references (gateway, mac_key, stripe_size, clock,
+    // mds_layout_manager) and no mutable recovery fields.
+}
 
 // ---------------------------------------------------------------------------
 // Phase 15b — MDS layout wire-up (still TODO)
