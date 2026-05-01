@@ -3,6 +3,7 @@
 //! Session lifecycle: EXCHANGE_ID → CREATE_SESSION → per-request
 //! SEQUENCE + ops. Session established lazily on first use.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
@@ -31,6 +32,9 @@ pub struct Nfs4Client {
     addr: SocketAddr,
     minor_version: u32, // 1 for NFSv4.1, 2 for NFSv4.2
     session: Mutex<Option<Nfs4Session>>,
+    /// Client-side multipart buffers. NFS has no native multipart concept,
+    /// so we buffer parts locally and concatenate on complete.
+    multipart_buffers: Mutex<HashMap<String, Vec<(u32, Vec<u8>)>>>,
 }
 
 impl Nfs4Client {
@@ -40,6 +44,7 @@ impl Nfs4Client {
             addr,
             minor_version: 1,
             session: Mutex::new(None),
+            multipart_buffers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -49,6 +54,7 @@ impl Nfs4Client {
             addr,
             minor_version: 2,
             session: Mutex::new(None),
+            multipart_buffers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -408,6 +414,87 @@ impl GatewayOps for Nfs4Client {
         let remove = (op::REMOVE, w.into_bytes());
 
         let _ = sess.sequenced_compound(self.minor_version, &[putrootfh, remove])?;
+        Ok(())
+    }
+
+    /// Start a multipart upload. NFS has no native multipart concept, so
+    /// we return a client-side UUID and buffer parts locally until
+    /// `complete_multipart` concatenates and writes them in one OPEN+WRITE.
+    async fn start_multipart(&self, _namespace_id: NamespaceId) -> Result<String, GatewayError> {
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        let mut buffers = self.multipart_buffers.lock().map_err(|e| {
+            GatewayError::ProtocolError(format!("lock: {e}"))
+        })?;
+        buffers.insert(upload_id.clone(), Vec::new());
+        Ok(upload_id)
+    }
+
+    /// Buffer a part client-side. Returns the part number as the ETag
+    /// (no server-side tracking for NFS).
+    async fn upload_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<String, GatewayError> {
+        let mut buffers = self.multipart_buffers.lock().map_err(|e| {
+            GatewayError::ProtocolError(format!("lock: {e}"))
+        })?;
+        let parts = buffers.get_mut(upload_id).ok_or_else(|| {
+            GatewayError::ProtocolError(format!("unknown upload_id: {upload_id}"))
+        })?;
+        parts.push((part_number, data.to_vec()));
+        Ok(part_number.to_string())
+    }
+
+    /// Concatenate all buffered parts (sorted by part number) and write
+    /// them as a single NFS OPEN+WRITE.
+    async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+        let mut parts = {
+            let mut buffers = self.multipart_buffers.lock().map_err(|e| {
+                GatewayError::ProtocolError(format!("lock: {e}"))
+            })?;
+            buffers.remove(upload_id).ok_or_else(|| {
+                GatewayError::ProtocolError(format!("unknown upload_id: {upload_id}"))
+            })?
+        };
+        parts.sort_by_key(|(n, _)| *n);
+        let data: Vec<u8> = parts.into_iter().flat_map(|(_, d)| d).collect();
+
+        let resp = self
+            .write(WriteRequest {
+                tenant_id: OrgId(uuid::Uuid::nil()),
+                namespace_id: NamespaceId(uuid::Uuid::nil()),
+                data,
+            })
+            .await?;
+        Ok(resp.composition_id)
+    }
+
+    /// Drop the buffered parts for a multipart upload.
+    async fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        let mut buffers = self.multipart_buffers.lock().map_err(|e| {
+            GatewayError::ProtocolError(format!("lock: {e}"))
+        })?;
+        buffers.remove(upload_id);
+        Ok(())
+    }
+
+    /// No-op: NFS has no content-type concept.
+    async fn set_object_content_type(
+        &self,
+        _composition_id: CompositionId,
+        _content_type: Option<String>,
+    ) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
+    /// No-op: NFS namespaces are server-managed.
+    async fn ensure_namespace(
+        &self,
+        _tenant_id: OrgId,
+        _namespace_id: NamespaceId,
+    ) -> Result<(), GatewayError> {
         Ok(())
     }
 }

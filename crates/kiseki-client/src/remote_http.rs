@@ -20,11 +20,11 @@
 //!
 //! Limitations (deliberate — surfaced rather than hidden):
 //!
-//!   * Multipart upload methods stub to `OperationNotSupported` —
-//!     FUSE writes through `fuse_daemon::write` go via the single-PUT
-//!     `write` path. Multipart support would need the S3 multipart
-//!     XML API on the gateway side (kiseki-gateway has it; this
-//!     client doesn't surface it for FUSE workloads yet).
+//!   * Multipart upload methods (`start_multipart`, `upload_part`,
+//!     `complete_multipart`, `abort_multipart`) are wired to the S3
+//!     server's JSON multipart endpoints. FUSE writes still go
+//!     through the single-PUT `write` path; multipart is available
+//!     for programmatic callers that need large-object uploads.
 //!   * `delete` works (DELETE /<namespace>/<uuid>); `unlink`
 //!     bridges to it in `KisekiFuse::unlink_in` so a FUSE rm(1)
 //!     deletes the cluster-side composition (Phase 15c.7 closed).
@@ -207,6 +207,169 @@ impl GatewayOps for RemoteHttpGateway {
         if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
             return Err(GatewayError::ProtocolError(format!(
                 "remote delete returned HTTP {}",
+                resp.status()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, GatewayError> {
+        let ns = Self::ns_to_path(namespace_id);
+        // POST /{bucket}/{key}?uploads — key is a throwaway UUID since
+        // the server ignores it for CreateMultipartUpload.
+        let key = uuid::Uuid::new_v4();
+        let url = format!("{}/{}/{}?uploads=", self.base_url, ns, key);
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .map_err(Self::map_error)?;
+        if !resp.status().is_success() {
+            return Err(GatewayError::ProtocolError(format!(
+                "remote start_multipart returned HTTP {}",
+                resp.status()
+            )));
+        }
+        let body = resp.text().await.map_err(Self::map_error)?;
+        let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            GatewayError::ProtocolError(format!("start_multipart: invalid JSON: {e}"))
+        })?;
+        parsed["uploadId"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                GatewayError::ProtocolError("start_multipart: missing uploadId".into())
+            })
+    }
+
+    async fn upload_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<String, GatewayError> {
+        // PUT /{bucket}/{key}?uploadId=X&partNumber=N
+        // The key is irrelevant; the server routes on the query params.
+        let ns = "default";
+        let key = uuid::Uuid::new_v4();
+        let url = format!(
+            "{}/{}/{}?uploadId={}&partNumber={}",
+            self.base_url, ns, key, upload_id, part_number
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .body(data.to_vec())
+            .send()
+            .await
+            .map_err(Self::map_error)?;
+        if !resp.status().is_success() {
+            return Err(GatewayError::ProtocolError(format!(
+                "remote upload_part returned HTTP {}",
+                resp.status()
+            )));
+        }
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_owned())
+            .ok_or_else(|| {
+                GatewayError::ProtocolError("upload_part response missing etag".into())
+            })?;
+        Ok(etag)
+    }
+
+    async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+        // POST /{bucket}/{key}?uploadId=X
+        let ns = "default";
+        let key = uuid::Uuid::new_v4();
+        let url = format!(
+            "{}/{}/{}?uploadId={}",
+            self.base_url, ns, key, upload_id
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .map_err(Self::map_error)?;
+        if !resp.status().is_success() {
+            return Err(GatewayError::ProtocolError(format!(
+                "remote complete_multipart returned HTTP {}",
+                resp.status()
+            )));
+        }
+        let body = resp.text().await.map_err(Self::map_error)?;
+        let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            GatewayError::ProtocolError(format!("complete_multipart: invalid JSON: {e}"))
+        })?;
+        let etag = parsed["etag"].as_str().ok_or_else(|| {
+            GatewayError::ProtocolError("complete_multipart: missing etag".into())
+        })?;
+        let id = uuid::Uuid::parse_str(etag).map_err(|_| {
+            GatewayError::ProtocolError(format!("complete_multipart: etag is not a UUID: {etag}"))
+        })?;
+        Ok(CompositionId(id))
+    }
+
+    async fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        // DELETE /{bucket}/{key}?uploadId=X
+        let ns = "default";
+        let key = uuid::Uuid::new_v4();
+        let url = format!(
+            "{}/{}/{}?uploadId={}",
+            self.base_url, ns, key, upload_id
+        );
+        let resp = self
+            .client
+            .delete(&url)
+            .send()
+            .await
+            .map_err(Self::map_error)?;
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(GatewayError::ProtocolError(format!(
+                "remote abort_multipart returned HTTP {}",
+                resp.status()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn set_object_content_type(
+        &self,
+        _composition_id: CompositionId,
+        _content_type: Option<String>,
+    ) -> Result<(), GatewayError> {
+        // The S3 server does not expose a dedicated endpoint for
+        // updating Content-Type after initial PUT. Content-Type is set
+        // at write time via the Content-Type header on PutObject.
+        // This is a no-op on the remote HTTP path; the trait's default
+        // would suffice but we override to make the intent explicit.
+        Ok(())
+    }
+
+    async fn ensure_namespace(
+        &self,
+        _tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<(), GatewayError> {
+        // PUT /{bucket} — CreateBucket
+        let ns = Self::ns_to_path(namespace_id);
+        let url = format!("{}/{}", self.base_url, ns);
+        let resp = self
+            .client
+            .put(&url)
+            .send()
+            .await
+            .map_err(Self::map_error)?;
+        // 200 = created, 409 = already exists — both are success.
+        if !resp.status().is_success()
+            && resp.status() != reqwest::StatusCode::CONFLICT
+        {
+            return Err(GatewayError::ProtocolError(format!(
+                "remote ensure_namespace returned HTTP {}",
                 resp.status()
             )));
         }

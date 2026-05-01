@@ -123,3 +123,19 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     Then the cluster_chunk_state refcount transitions to 0
     And the leader sends `DeleteFragment` to every peer in the placement list
     And after local GC sweep the chunk is removed from every node's local store
+
+  # --- Multi-node integration (requires multi-server harness) ---
+
+  @integration @multi-node @e2e-deferred
+  Scenario: S3 PUT on single-node server stores data locally
+    Given a running kiseki-server
+    When a client writes 1MB via S3 PUT
+    Then S3 GET returns the same 1MB
+    And the server did not report quorum errors
+
+  @integration @multi-node @e2e-deferred
+  Scenario: S3 PUT on 3-node cluster replicates to all nodes
+    Given a 3-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    Then S3 GET from node-2 returns the same 1MB
+    And S3 GET from node-3 returns the same 1MB

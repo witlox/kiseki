@@ -456,6 +456,27 @@ async fn then_parts_not_visible(_w: &mut KisekiWorld) {
     // they're not individually addressable. Verified by the protocol.
 }
 
+#[then("the completed object contains all parts' data concatenated")]
+async fn then_multipart_data_complete(w: &mut KisekiWorld) {
+    let etag = w.server().last_etag.clone()
+        .expect("need etag from CompleteMultipartUpload");
+    let url = w.server().s3_url(&format!("default/{}", etag));
+    let resp = w.server().http.get(&url).send().await.unwrap();
+    assert!(resp.status().is_success(), "GET completed object: {}", resp.status());
+    let body = resp.bytes().await.unwrap();
+    // Parts were: "part-1-data" + "part-2-data" + "part-3-data" = 33 bytes
+    let expected = b"part-1-datapart-2-datapart-3-data";
+    assert_eq!(
+        body.len(), expected.len(),
+        "multipart object should contain all parts ({} bytes), got {} bytes",
+        expected.len(), body.len()
+    );
+    assert_eq!(
+        body.as_ref(), expected.as_slice(),
+        "multipart data mismatch — parts not concatenated correctly"
+    );
+}
+
 // === Scenario: NFSv4.1 state management ===
 
 /// Map a path to a deterministic 32-byte NFS file handle for tests.

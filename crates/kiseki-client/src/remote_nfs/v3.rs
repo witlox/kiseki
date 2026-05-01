@@ -5,6 +5,7 @@
 //!   read  → LOOKUP + READ
 //!   delete → REMOVE
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
@@ -36,6 +37,10 @@ pub struct Nfs3Client {
     /// Root file handle — obtained from FSINFO or MOUNT protocol.
     /// Kiseki's FSINFO returns the root handle in `post_op_attr`.
     root_fh: Mutex<Option<Vec<u8>>>,
+    /// Client-side multipart upload buffers keyed by upload ID.
+    /// Each value is a list of (part_number, data) pairs assembled
+    /// into a single CREATE+WRITE on `complete_multipart`.
+    multipart_buffers: Mutex<HashMap<String, Vec<(u32, Vec<u8>)>>>,
 }
 
 impl Nfs3Client {
@@ -44,6 +49,7 @@ impl Nfs3Client {
             addr,
             transport: Mutex::new(None),
             root_fh: Mutex::new(None),
+            multipart_buffers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -249,5 +255,84 @@ impl GatewayOps for Nfs3Client {
             )));
         }
         Ok(())
+    }
+
+    // -- Multipart: client-side buffering, single CREATE+WRITE on complete --
+
+    async fn start_multipart(&self, _namespace_id: NamespaceId) -> Result<String, GatewayError> {
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        self.multipart_buffers
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?
+            .insert(upload_id.clone(), Vec::new());
+        Ok(upload_id)
+    }
+
+    async fn upload_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<String, GatewayError> {
+        let mut buffers = self
+            .multipart_buffers
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
+        let parts = buffers.get_mut(upload_id).ok_or_else(|| {
+            GatewayError::ProtocolError(format!("unknown upload_id: {upload_id}"))
+        })?;
+        parts.push((part_number, data.to_vec()));
+        // Return a synthetic ETag derived from part number.
+        Ok(format!("nfs3-part-{part_number}"))
+    }
+
+    async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+        let mut parts = self
+            .multipart_buffers
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?
+            .remove(upload_id)
+            .ok_or_else(|| {
+                GatewayError::ProtocolError(format!("unknown upload_id: {upload_id}"))
+            })?;
+        // Sort by part number and concatenate.
+        parts.sort_by_key(|(n, _)| *n);
+        let full_data: Vec<u8> = parts.into_iter().flat_map(|(_, d)| d).collect();
+
+        // Delegate to the normal write path (CREATE + WRITE).
+        let resp = self
+            .write(WriteRequest {
+                tenant_id: OrgId(uuid::Uuid::nil()),
+                namespace_id: NamespaceId(uuid::Uuid::nil()),
+                data: full_data,
+            })
+            .await?;
+        Ok(resp.composition_id)
+    }
+
+    async fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
+        self.multipart_buffers
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?
+            .remove(upload_id);
+        Ok(())
+    }
+
+    // -- No-ops for NFSv3 --
+
+    async fn set_object_content_type(
+        &self,
+        _composition_id: CompositionId,
+        _content_type: Option<String>,
+    ) -> Result<(), GatewayError> {
+        Ok(()) // NFSv3 has no per-object Content-Type metadata.
+    }
+
+    async fn ensure_namespace(
+        &self,
+        _tenant_id: OrgId,
+        _namespace_id: NamespaceId,
+    ) -> Result<(), GatewayError> {
+        Ok(()) // NFSv3 namespaces are implicit (directory tree).
     }
 }

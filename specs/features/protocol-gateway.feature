@@ -25,6 +25,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And submits a finalize delta to Composition
     And the object becomes visible only after finalize commits (I-L5)
     And parts are NOT visible individually before completion
+    And the completed object contains all parts' data concatenated
 
   # --- Protocol semantics enforcement ---
 
