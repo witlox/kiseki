@@ -369,14 +369,21 @@ async fn then_visible_after_consume(w: &mut KisekiWorld) {
 // === Scenario: S3 multipart upload ===
 
 #[given(regex = r#"^a client starts S3 CreateMultipartUpload for "(\S+)"$"#)]
-async fn given_s3_multipart(w: &mut KisekiWorld, key: String) {
+async fn given_s3_multipart(w: &mut KisekiWorld, _key: String) {
     // S3 CreateMultipartUpload: POST /<bucket>/<key>?uploads
-    let url = format!("{}?uploads", w.server().s3_url(&format!("default/{key}")));
+    // Use a flat key — axum /{bucket}/{key} captures one path segment.
+    let flat_key = "multipart-epoch100";
+    let url = format!("{}?uploads", w.server().s3_url(&format!("default/{flat_key}")));
     let resp = w.server().http.post(&url).send().await.expect("CreateMultipartUpload");
     assert!(resp.status().is_success(), "CreateMultipartUpload: {}", resp.status());
     let body = resp.text().await.unwrap_or_default();
-    // Extract upload_id from response (XML or plain text)
-    let upload_id = body.trim().to_string();
+    // Server returns JSON {"uploadId": "uuid"} — extract the UUID.
+    let upload_id = body
+        .split("\"uploadId\"")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .map(String::from)
+        .unwrap_or_else(|| body.trim().to_string());
     w.server_mut().response_state.insert("upload_id".into(), upload_id);
 }
 
@@ -391,13 +398,15 @@ async fn when_parts_uploaded(w: &mut KisekiWorld) {
         let part_num = i + 1;
         let url = format!(
             "{}?uploadId={}&partNumber={}",
-            w.server().s3_url("default/multipart-test"),
+            w.server().s3_url("default/multipart-epoch100"),
             upload_id,
             part_num
         );
         let resp = w.server().http.put(&url).body(data.to_vec()).send().await
             .expect("UploadPart");
-        assert!(resp.status().is_success(), "UploadPart {part_num}: {}", resp.status());
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert!(status.is_success(), "UploadPart {part_num}: {status} — {body}");
     }
 }
 
@@ -407,7 +416,7 @@ async fn when_complete_multipart(w: &mut KisekiWorld) {
         .cloned().expect("need upload_id");
     let url = format!(
         "{}?uploadId={}",
-        w.server().s3_url("default/multipart-test"),
+        w.server().s3_url("default/multipart-epoch100"),
         upload_id
     );
     let resp = w.server().http.post(&url).send().await.expect("CompleteMultipartUpload");
