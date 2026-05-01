@@ -1,6 +1,6 @@
 //! Step definitions for multi-node-raft.feature (18 scenarios).
 //!
-//! Steps that can be implemented use `w.raft_cluster` (a real in-process
+//! Steps that can be implemented use `w.raft.cluster` (a real in-process
 //! multi-node Raft cluster via RaftTestCluster). Steps requiring APIs not
 //! yet available (snapshot transfer, membership changes, TLS inspection,
 //! rack-aware placement, drain orchestration) remain `todo!()`.
@@ -20,14 +20,14 @@ use crate::KisekiWorld;
 
 /// Get the raft cluster or panic with a clear message.
 fn cluster(w: &KisekiWorld) -> &RaftTestCluster {
-    w.raft_cluster
+    w.raft.cluster
         .as_ref()
         .expect("raft_cluster not initialised — Background step must run first")
 }
 
 /// Get a `&mut` cluster handle for membership operations.
 fn cluster_mut(w: &mut KisekiWorld) -> &mut RaftTestCluster {
-    w.raft_cluster
+    w.raft.cluster
         .as_mut()
         .expect("raft_cluster not initialised — Background step must run first")
 }
@@ -60,7 +60,7 @@ async fn given_3_nodes(w: &mut KisekiWorld) {
         .await
         .expect("3-node cluster should elect a leader");
     assert!(leader >= 1 && leader <= 3, "leader should be node 1-3");
-    w.raft_cluster = Some(cluster);
+    w.raft.cluster = Some(cluster);
 }
 
 #[given(regex = r#"^shard "([^"]*)" has a Raft group with node-1 as leader$"#)]
@@ -83,7 +83,7 @@ async fn given_shard_raft_group(w: &mut KisekiWorld, shard: String) {
 async fn when_delta_appended(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
     let req = w.make_append_request(shard_id, 0x10);
-    w.log_store.append_delta(req).await.unwrap();
+    w.legacy.log_store.append_delta(req).await.unwrap();
     w.last_error = None;
 }
 
@@ -140,9 +140,9 @@ async fn when_read_leader(w: &mut KisekiWorld) {
 async fn then_read_after_write(w: &mut KisekiWorld) {
     // Read-after-write consistency on the leader.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).await.unwrap();
+    let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .log_store
+        .legacy.log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -258,8 +258,8 @@ async fn then_no_interference(w: &mut KisekiWorld) {
     let sid1 = *w.shard_names.get("shard-election-1").unwrap();
     let req0 = w.make_append_request(sid0, 0x10);
     let req1 = w.make_append_request(sid1, 0x20);
-    assert!(w.log_store.append_delta(req0).await.is_ok());
-    assert!(w.log_store.append_delta(req1).await.is_ok());
+    assert!(w.legacy.log_store.append_delta(req0).await.is_ok());
+    assert!(w.legacy.log_store.append_delta(req1).await.is_ok());
 }
 
 // === Quorum ===
@@ -306,7 +306,7 @@ async fn then_writes_resume(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x30);
     assert!(
-        w.log_store.append_delta(req).await.is_ok(),
+        w.legacy.log_store.append_delta(req).await.is_ok(),
         "writes should resume after recovery"
     );
 }
@@ -324,9 +324,9 @@ async fn then_catches_up(w: &mut KisekiWorld) {
 
     // Also verify via log_store.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).await.unwrap();
+    let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .log_store
+        .legacy.log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -407,7 +407,7 @@ async fn then_quorum_adjusts(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x42);
     assert!(
-        w.log_store.append_delta(req).await.is_ok(),
+        w.legacy.log_store.append_delta(req).await.is_ok(),
         "quorum should adjust"
     );
 }
@@ -477,7 +477,7 @@ async fn then_majority_continues(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x50);
     assert!(
-        w.log_store.append_delta(req).await.is_ok(),
+        w.legacy.log_store.append_delta(req).await.is_ok(),
         "majority should continue operating"
     );
 }
@@ -490,7 +490,7 @@ async fn given_large_shard(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     for i in 0..50u8 {
         let req = w.make_append_request(sid, i + 1);
-        w.log_store.append_delta(req).await.unwrap();
+        w.legacy.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -523,9 +523,9 @@ async fn when_read_local(_w: &mut KisekiWorld) {
 async fn then_local_replay(w: &mut KisekiWorld) {
     // After restart, committed entries are replayed from the local store.
     let sid = w.ensure_shard("shard-alpha");
-    let health = w.log_store.shard_health(sid).await.unwrap();
+    let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .log_store
+        .legacy.log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -589,7 +589,7 @@ async fn when_raft_write(w: &mut KisekiWorld) {
     // Also write via log_store for steps that use it.
     let sid = w.ensure_shard("shard-alpha");
     let req = w.make_append_request(sid, 0x60);
-    w.log_store.append_delta(req).await.unwrap();
+    w.legacy.log_store.append_delta(req).await.unwrap();
 }
 
 #[then(regex = r"^the write latency is under 500.s \(TCP\) or 100.s \(RDMA\)$")]
@@ -610,7 +610,7 @@ async fn when_concurrent_writes(w: &mut KisekiWorld) {
         let name = format!("shard-perf-{i}");
         let sid = *w.shard_names.get(&name).unwrap();
         let req = w.make_append_request(sid, (i + 1) as u8);
-        w.log_store.append_delta(req).await.unwrap();
+        w.legacy.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -634,7 +634,7 @@ async fn given_100_deltas(w: &mut KisekiWorld, shard: String) {
     // Write via log_store.
     for i in 0..50u8 {
         let req = w.make_append_request(sid, i + 1);
-        w.log_store.append_delta(req).await.unwrap();
+        w.legacy.log_store.append_delta(req).await.unwrap();
     }
     // Also write via Raft cluster so deltas survive leader failover.
     let c = cluster(w);
@@ -688,7 +688,7 @@ async fn given_shard_entries(w: &mut KisekiWorld, shard: String, _k: u32) {
     // Cap at 50 for test speed.
     for i in 0..50u8 {
         let req = w.make_append_request(sid, i + 1);
-        w.log_store.append_delta(req).await.unwrap();
+        w.legacy.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -741,7 +741,7 @@ async fn when_sequential_writes(w: &mut KisekiWorld, n: u32) {
             .expect("Raft write");
         latencies.push(start.elapsed());
     }
-    w.raft_write_latencies = latencies;
+    w.raft.write_latencies = latencies;
 }
 
 #[when(regex = r#"^a client writes a delta to shard "([^"]*)" via node-1 \(leader\)$"#)]
@@ -758,7 +758,7 @@ async fn when_write_via_leader(w: &mut KisekiWorld, shard: String) {
     }
     // Also write via log_store for steps that read from it.
     let req = w.make_append_request(sid, 0x70);
-    let _ = w.log_store.append_delta(req).await;
+    let _ = w.legacy.log_store.append_delta(req).await;
 }
 
 #[when(regex = r#"^a client writes delta to shard "([^"]*)" via leader node-1$"#)]
@@ -774,7 +774,7 @@ async fn when_write_delta_leader(w: &mut KisekiWorld, shard: String) {
         Err(e) => w.last_error = Some(e.to_string()),
     }
     let req = w.make_append_request(sid, 0x71);
-    let _ = w.log_store.append_delta(req).await;
+    let _ = w.legacy.log_store.append_delta(req).await;
 }
 
 #[when(regex = r#"^a client writes delta with payload "([^"]*)" to shard "([^"]*)"$"#)]
@@ -790,7 +790,7 @@ async fn when_write_payload(w: &mut KisekiWorld, _payload: String, shard: String
         Err(e) => w.last_error = Some(e.to_string()),
     }
     let req = w.make_append_request(sid, 0x72);
-    let _ = w.log_store.append_delta(req).await;
+    let _ = w.legacy.log_store.append_delta(req).await;
 }
 
 #[when("a shard is created with replication factor 3")]
@@ -902,9 +902,9 @@ async fn when_immediate_read_leader(w: &mut KisekiWorld, shard: String) {
 
     // Also read from log_store for compatibility.
     let sid = w.ensure_shard(&shard);
-    let health = w.log_store.shard_health(sid).await.unwrap();
+    let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let ls_deltas = w
-        .log_store
+        .legacy.log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -983,7 +983,7 @@ async fn then_writes_resume_new_leader(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     let req = w.make_append_request(sid, 0x80);
     assert!(
-        w.log_store.append_delta(req).await.is_ok(),
+        w.legacy.log_store.append_delta(req).await.is_ok(),
         "writes should resume on the new leader"
     );
 }
@@ -1021,9 +1021,9 @@ async fn then_100_deltas_present(w: &mut KisekiWorld) {
 async fn then_seq_continuous(w: &mut KisekiWorld) {
     // I-L1: committed deltas survive with continuous sequence numbers.
     let sid = w.ensure_shard("s1");
-    let health = w.log_store.shard_health(sid).await.unwrap();
+    let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .log_store
+        .legacy.log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -1067,12 +1067,12 @@ async fn then_no_overlap(w: &mut KisekiWorld) {
     let sid0 = *w.shard_names.get("shard-election-0").unwrap();
     let sid1 = *w.shard_names.get("shard-election-1").unwrap();
     assert!(w
-        .log_store
+        .legacy.log_store
         .append_delta(w.make_append_request(sid0, 0xa0))
         .await
         .is_ok());
     assert!(w
-        .log_store
+        .legacy.log_store
         .append_delta(w.make_append_request(sid1, 0xa1))
         .await
         .is_ok());
@@ -1131,7 +1131,7 @@ async fn then_writes_to_shard_resume(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     let req = w.make_append_request(sid, 0x81);
     assert!(
-        w.log_store.append_delta(req).await.is_ok(),
+        w.legacy.log_store.append_delta(req).await.is_ok(),
         "writes should resume after quorum restored"
     );
 }
@@ -1226,7 +1226,7 @@ async fn then_quorum_adjusts_accordingly(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     let req = w.make_append_request(sid, 0x84);
     assert!(
-        w.log_store.append_delta(req).await.is_ok(),
+        w.legacy.log_store.append_delta(req).await.is_ok(),
         "quorum should adjust"
     );
 }
@@ -1319,7 +1319,7 @@ async fn then_full_state(w: &mut KisekiWorld) {
     // This step text appears in both multi-node-raft.feature (snapshot
     // transfer convergence) and persistence.feature (redb snapshot
     // contents). Branch on whether a RaftTestCluster is initialised.
-    if let Some(c) = w.raft_cluster.as_ref() {
+    if let Some(c) = w.raft.cluster.as_ref() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let Some(leader_id) = c.leader().await else {
             return; // Cluster transient state — the convergence Then below also runs.
@@ -1440,7 +1440,7 @@ async fn then_rack_spread_2(w: &mut KisekiWorld) {
 
 #[then(regex = r"^the p99 write latency is under 500.s \(TCP\) or 100.s \(RDMA\)$")]
 async fn then_p99_latency(w: &mut KisekiWorld) {
-    let mut latencies = w.raft_write_latencies.clone();
+    let mut latencies = w.raft.write_latencies.clone();
     assert!(
         !latencies.is_empty(),
         "no per-write latencies were recorded by the When step"
@@ -1479,7 +1479,7 @@ async fn when_10_concurrent(w: &mut KisekiWorld) {
         }
         (baseline_n, baseline_start.elapsed())
     };
-    w.raft_single_shard_throughput = Some(baseline);
+    w.raft.single_shard_throughput = Some(baseline);
 
     // Concurrent batch — 10 producers feed the same Raft group via
     // join_all (not spawn) so the futures share the cluster reference
@@ -1499,16 +1499,16 @@ async fn when_10_concurrent(w: &mut KisekiWorld) {
         futures::future::join_all(futs).await;
         (total, start.elapsed())
     };
-    w.raft_throughput = Some(throughput);
+    w.raft.throughput = Some(throughput);
 }
 
 #[then("total throughput is approximately 10x single-shard throughput")]
 async fn then_10x_throughput(w: &mut KisekiWorld) {
     let (concurrent_n, concurrent_dur) = w
-        .raft_throughput
+        .raft.throughput
         .expect("the When step must have recorded throughput");
     let (baseline_n, baseline_dur) = w
-        .raft_single_shard_throughput
+        .raft.single_shard_throughput
         .expect("the When step must have recorded a single-shard baseline");
     let concurrent_ops_per_sec = concurrent_n as f64 / concurrent_dur.as_secs_f64();
     let baseline_ops_per_sec = baseline_n as f64 / baseline_dur.as_secs_f64();
@@ -1530,7 +1530,7 @@ async fn then_no_degradation(w: &mut KisekiWorld) {
     // Single-shard baseline measured in the When step. Verify it was
     // recorded — that's the proof we measured what we claimed.
     assert!(
-        w.raft_single_shard_throughput.is_some(),
+        w.raft.single_shard_throughput.is_some(),
         "baseline single-shard throughput should have been recorded"
     );
 }
@@ -1658,7 +1658,7 @@ async fn then_writes_throughout(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     let req = w.make_append_request(sid, 0xB1);
     assert!(
-        w.log_store.append_delta(req).await.is_ok(),
+        w.legacy.log_store.append_delta(req).await.is_ok(),
         "writes should continue during migration"
     );
 }
@@ -1709,7 +1709,7 @@ async fn then_removing_no_quorum_impact(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     let req = w.make_append_request(sid, 0xB2);
     assert!(
-        w.log_store.append_delta(req).await.is_ok(),
+        w.legacy.log_store.append_delta(req).await.is_ok(),
         "removing learner should not affect write quorum"
     );
 }

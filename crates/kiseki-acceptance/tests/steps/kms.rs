@@ -39,9 +39,9 @@ fn provider_for(w: &KisekiWorld, name: &str) -> Arc<dyn TenantKmsProvider> {
         other => other,
     };
     Arc::clone(
-        w.kms_providers
+        w.kms.providers
             .get(canonical)
-            .or_else(|| w.kms_providers.get("internal"))
+            .or_else(|| w.kms.providers.get("internal"))
             .expect("internal provider always registered"),
     )
 }
@@ -149,7 +149,7 @@ fn table_field(step: &Step, field: &str) -> Option<String> {
 #[given("system master key in epoch 1")]
 async fn given_system_master_epoch1(w: &mut KisekiWorld) {
     // Ensure the key store has epoch 1 (it does by default via MemKeyStore::new).
-    let epoch = w.key_store.current_epoch().await.unwrap();
+    let epoch = w.legacy.key_store.current_epoch().await.unwrap();
     assert_eq!(
         epoch,
         KeyEpoch(1),
@@ -165,13 +165,13 @@ async fn given_system_master_epoch1(w: &mut KisekiWorld) {
 async fn when_tenant_no_kms(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
     // No explicit KMS config = Internal provider by default.
-    w.kms_provider_type = Some("internal".to_string());
+    w.kms.provider_type = Some("internal".to_string());
 }
 
 #[then("the tenant is assigned the Internal KMS provider")]
 async fn then_internal_provider(w: &mut KisekiWorld) {
     assert_eq!(
-        w.kms_provider_type.as_deref(),
+        w.kms.provider_type.as_deref(),
         Some("internal"),
         "default provider should be Internal"
     );
@@ -198,9 +198,9 @@ async fn then_kek_in_raft(_w: &mut KisekiWorld) {
     // Internal provider stores in Raft group. Verified by MemKeyStore having
     // epoch keys accessible.
     // MemKeyStore is the test stand-in for the Raft-backed key store.
-    let epoch = _w.key_store.current_epoch().await.unwrap();
+    let epoch = _w.legacy.key_store.current_epoch().await.unwrap();
     assert!(
-        _w.key_store.fetch_master_key(epoch).await.is_ok(),
+        _w.legacy.key_store.fetch_master_key(epoch).await.is_ok(),
         "key should be in the Raft group (MemKeyStore)"
     );
 }
@@ -230,13 +230,13 @@ async fn when_configure_kms(w: &mut KisekiWorld, step: &Step, tenant: String) {
     let key_name = table_field(step, "key_name").unwrap_or_default();
 
     // Store config in world state.
-    w.kms_provider_type = Some(provider.clone());
+    w.kms.provider_type = Some(provider.clone());
     w.last_error = None;
 
     // Simulate validation: "nonexistent" endpoints fail.
     if endpoint.contains("nonexistent") {
         w.last_error = Some("KMS provider unreachable".to_string());
-        w.kms_provider_type = None; // Rejected — no partial config.
+        w.kms.provider_type = None; // Rejected — no partial config.
     }
 }
 
@@ -244,7 +244,7 @@ async fn when_configure_kms(w: &mut KisekiWorld, step: &Step, tenant: String) {
 async fn then_health_check(w: &mut KisekiWorld) {
     assert!(w.last_error.is_none(), "health check should pass");
     assert!(
-        w.kms_provider_type.is_some(),
+        w.kms.provider_type.is_some(),
         "provider should be configured"
     );
 }
@@ -252,7 +252,7 @@ async fn then_health_check(w: &mut KisekiWorld) {
 #[then("a test wrap/unwrap round-trip succeeds")]
 async fn then_wrap_unwrap_roundtrip(w: &mut KisekiWorld) {
     let provider_name = w
-        .kms_provider_type
+        .kms.provider_type
         .as_deref()
         .unwrap_or("internal")
         .to_owned();
@@ -299,7 +299,7 @@ async fn then_wrap_unwrap_roundtrip(w: &mut KisekiWorld) {
 #[then("the configuration is stored in the control plane")]
 async fn then_config_stored(w: &mut KisekiWorld) {
     assert!(
-        w.kms_provider_type.is_some(),
+        w.kms.provider_type.is_some(),
         "provider config should be stored"
     );
 }
@@ -307,16 +307,16 @@ async fn then_config_stored(w: &mut KisekiWorld) {
 #[then("the configuration event is recorded in the audit log")]
 async fn then_config_audit(w: &mut KisekiWorld) {
     // Audit log records the event.
-    w.control_audit_events.push("kms_config_change".into());
+    w.control.audit_events.push("kms_config_change".into());
     assert!(
-        !w.control_audit_events.is_empty(),
+        !w.control.audit_events.is_empty(),
         "audit log should contain the config event"
     );
 }
 
 #[then("the provider connects via mTLS with TTLV encoding")]
 async fn then_kmip_mtls(w: &mut KisekiWorld) {
-    assert_eq!(w.kms_provider_type.as_deref(), Some("kmip"));
+    assert_eq!(w.kms.provider_type.as_deref(), Some("kmip"));
     // KMIP provider uses mTLS + TTLV — simulated by successful config.
     assert!(w.last_error.is_none());
 }
@@ -325,14 +325,14 @@ async fn then_kmip_mtls(w: &mut KisekiWorld) {
 async fn then_kmip_key_located(w: &mut KisekiWorld) {
     // KMIP Locate operation finds the key by name. Simulated by provider config.
     assert!(
-        w.kms_provider_type.is_some(),
+        w.kms.provider_type.is_some(),
         "KMIP key should be locatable"
     );
 }
 
 #[then("the provider authenticates via IAM role assumption")]
 async fn then_aws_iam(w: &mut KisekiWorld) {
-    assert_eq!(w.kms_provider_type.as_deref(), Some("aws-kms"));
+    assert_eq!(w.kms.provider_type.as_deref(), Some("aws-kms"));
     assert!(w.last_error.is_none());
 }
 
@@ -344,7 +344,7 @@ async fn then_aws_no_local_kek(_w: &mut KisekiWorld) {
 
 #[then("the PKCS#11 library is loaded via FFI")]
 async fn then_pkcs11_ffi(w: &mut KisekiWorld) {
-    assert_eq!(w.kms_provider_type.as_deref(), Some("pkcs11"));
+    assert_eq!(w.kms.provider_type.as_deref(), Some("pkcs11"));
     assert!(w.last_error.is_none());
 }
 
@@ -395,7 +395,7 @@ async fn then_config_rejected(w: &mut KisekiWorld, expected_msg: String) {
 #[then("no partial configuration is stored")]
 async fn then_no_partial_config(w: &mut KisekiWorld) {
     assert!(
-        w.kms_provider_type.is_none(),
+        w.kms.provider_type.is_none(),
         "no provider should be configured after rejection"
     );
 }
@@ -407,36 +407,36 @@ async fn then_no_partial_config(w: &mut KisekiWorld) {
 #[given(regex = r#"^tenant "(\S+)" with Vault(?: KMS)? provider$"#)]
 async fn given_vault_provider(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
-    w.kms_provider_type = Some("vault".to_string());
+    w.kms.provider_type = Some("vault".to_string());
 }
 
 #[given(regex = r#"^tenant "(\S+)" with AWS KMS provider$"#)]
 async fn given_aws_provider(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
-    w.kms_provider_type = Some("aws-kms".to_string());
+    w.kms.provider_type = Some("aws-kms".to_string());
 }
 
 #[given(regex = r#"^tenant "(\S+)" with PKCS#11 provider$"#)]
 async fn given_pkcs11_provider(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
-    w.kms_provider_type = Some("pkcs11".to_string());
+    w.kms.provider_type = Some("pkcs11".to_string());
 }
 
 #[given(regex = r#"^tenant "(\S+)" with Internal(?: KMS)? provider$"#)]
 async fn given_internal_provider(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
-    w.kms_provider_type = Some("internal".to_string());
+    w.kms.provider_type = Some("internal".to_string());
 }
 
 #[given(regex = r#"^tenant "(\S+)" with KMIP 2\.1 provider$"#)]
 async fn given_kmip_provider(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
-    w.kms_provider_type = Some("kmip".to_string());
+    w.kms.provider_type = Some("kmip".to_string());
 }
 
 #[when(regex = r#"^a chunk is written with chunk_id "(\S+)"$"#)]
 async fn when_chunk_written_with_id(w: &mut KisekiWorld, cid: String) {
-    let provider = w.kms_provider_type.as_deref().unwrap_or("internal");
+    let provider = w.kms.provider_type.as_deref().unwrap_or("internal");
     let kek = kek_for_provider(provider);
     let aead = test_aead();
     let master = test_master();
@@ -450,7 +450,7 @@ async fn when_chunk_written_with_id(w: &mut KisekiWorld, cid: String) {
 #[then("the derivation parameters (epoch + chunk_id) are wrapped")]
 async fn then_params_wrapped(w: &mut KisekiWorld) {
     let chunk_id = w.last_chunk_id.unwrap_or(ChunkId([0xab; 32]));
-    let provider = w.kms_provider_type.as_deref().unwrap_or("internal");
+    let provider = w.kms.provider_type.as_deref().unwrap_or("internal");
     let kek = kek_for_provider(provider);
     let aead = test_aead();
     let master = test_master();
@@ -483,7 +483,7 @@ async fn then_aad_chunk_id(_w: &mut KisekiWorld) {
 #[then("the wrapped ciphertext is stored in the envelope")]
 async fn then_wrapped_in_envelope(w: &mut KisekiWorld) {
     let chunk_id = w.last_chunk_id.unwrap_or(ChunkId([0xab; 32]));
-    let provider = w.kms_provider_type.as_deref().unwrap_or("internal");
+    let provider = w.kms.provider_type.as_deref().unwrap_or("internal");
     let kek = kek_for_provider(provider);
     let aead = test_aead();
     let master = test_master();
@@ -522,7 +522,7 @@ async fn then_opaque(_w: &mut KisekiWorld) {
 
 #[given("a chunk exists with wrapped derivation parameters")]
 async fn given_chunk_with_wrapped(w: &mut KisekiWorld) {
-    let provider = w.kms_provider_type.as_deref().unwrap_or("vault");
+    let provider = w.kms.provider_type.as_deref().unwrap_or("vault");
     let kek = kek_for_provider(provider);
     let aead = test_aead();
     let master = test_master();
@@ -538,7 +538,7 @@ async fn given_chunk_with_wrapped(w: &mut KisekiWorld) {
 
 #[when("a chunk is read")]
 async fn when_a_chunk_read(w: &mut KisekiWorld) {
-    let provider = w.kms_provider_type.as_deref().unwrap_or("internal");
+    let provider = w.kms.provider_type.as_deref().unwrap_or("internal");
     let kek = kek_for_provider(provider);
     let aead = test_aead();
     let master = test_master();
@@ -640,8 +640,8 @@ async fn then_auth_failed(w: &mut KisekiWorld) {
 
 #[then("the tamper attempt is recorded in the audit log")]
 async fn then_tamper_audit(w: &mut KisekiWorld) {
-    w.control_audit_events.push("tamper_detected".into());
-    assert!(!w.control_audit_events.is_empty());
+    w.control.audit_events.push("tamper_detected".into());
+    assert!(!w.control.audit_events.is_empty());
 }
 
 // --- Cloud KMS unwrap ---
@@ -724,8 +724,8 @@ async fn when_kek_generated(_w: &mut KisekiWorld) {
 #[then("it is stored in the tenant key Raft group")]
 async fn then_stored_in_tenant_raft(w: &mut KisekiWorld) {
     // MemKeyStore represents the Raft group.
-    let epoch = w.key_store.current_epoch().await.unwrap();
-    assert!(w.key_store.fetch_master_key(epoch).await.is_ok());
+    let epoch = w.legacy.key_store.current_epoch().await.unwrap();
+    assert!(w.legacy.key_store.fetch_master_key(epoch).await.is_ok());
 }
 
 #[then("NOT in the system key manager Raft group")]
@@ -820,7 +820,7 @@ async fn given_cached_ago(_w: &mut KisekiWorld, _ago: u64, _ttl: u64) {
 #[when("a read request arrives")]
 async fn when_read_request(w: &mut KisekiWorld) {
     // Simulate a read that checks the cache.
-    let provider = w.kms_provider_type.as_deref().unwrap_or("vault");
+    let provider = w.kms.provider_type.as_deref().unwrap_or("vault");
     let kek = kek_for_provider(provider);
     let aead = test_aead();
     let master = test_master();
@@ -872,13 +872,13 @@ async fn then_cache_refreshed(_w: &mut KisekiWorld) {
 async fn when_configure_ttl(w: &mut KisekiWorld, _tenant: String, ttl: u64) {
     // Clamp TTL per I-K15: min=5, max=300.
     let clamped = ttl.clamp(5, 300);
-    w.kms_concurrent_count = clamped as u32; // Reuse field for TTL storage in test.
+    w.kms.concurrent_count = clamped as u32; // Reuse field for TTL storage in test.
 }
 
 #[then(regex = r#"^the TTL is clamped to (\d+) seconds \(minimum per I-K15\)$"#)]
 async fn then_ttl_clamped_min(w: &mut KisekiWorld, expected: u32) {
     assert_eq!(
-        w.kms_concurrent_count, expected,
+        w.kms.concurrent_count, expected,
         "TTL should be clamped to minimum"
     );
 }
@@ -886,7 +886,7 @@ async fn then_ttl_clamped_min(w: &mut KisekiWorld, expected: u32) {
 #[then(regex = r#"^the TTL is clamped to (\d+) seconds \(maximum per I-K15\)$"#)]
 async fn then_ttl_clamped_max(w: &mut KisekiWorld, expected: u32) {
     assert_eq!(
-        w.kms_concurrent_count, expected,
+        w.kms.concurrent_count, expected,
         "TTL should be clamped to maximum"
     );
 }
@@ -961,20 +961,20 @@ async fn then_cached_zeroizing(_w: &mut KisekiWorld) {
 async fn when_consecutive_failures(w: &mut KisekiWorld, count: u32) {
     // Simulate consecutive failures opening the circuit breaker.
     // After `count` failures, circuit opens.
-    w.kms_circuit_open = count >= 5;
-    if w.kms_circuit_open {
+    w.kms.circuit_open = count >= 5;
+    if w.kms.circuit_open {
         w.last_error = Some("circuit open".to_string());
     }
 }
 
 #[then(regex = r#"^the circuit breaker opens for "(\S+)" provider$"#)]
 async fn then_circuit_open(w: &mut KisekiWorld, _tenant: String) {
-    assert!(w.kms_circuit_open, "circuit breaker should be open");
+    assert!(w.kms.circuit_open, "circuit breaker should be open");
 }
 
 #[then(regex = r#"^subsequent calls fail immediately with "circuit open" error$"#)]
 async fn then_circuit_open_error(w: &mut KisekiWorld) {
-    assert!(w.kms_circuit_open, "circuit should be open");
+    assert!(w.kms.circuit_open, "circuit should be open");
     let err = w.last_error.as_ref().expect("should have error");
     assert!(
         err.contains("circuit open"),
@@ -990,25 +990,25 @@ async fn then_half_open(_w: &mut KisekiWorld) {
 #[then("when the probe succeeds, the circuit closes")]
 async fn then_circuit_closes(w: &mut KisekiWorld) {
     // Simulate probe success: circuit closes.
-    w.kms_circuit_open = false;
+    w.kms.circuit_open = false;
     w.last_error = None;
 }
 
 #[then("operations resume normally")]
 async fn then_ops_resume(w: &mut KisekiWorld) {
-    assert!(!w.kms_circuit_open, "circuit should be closed");
+    assert!(!w.kms.circuit_open, "circuit should be closed");
     assert!(w.last_error.is_none(), "no error after circuit close");
 }
 
 #[given(regex = r#"^max concurrent KMS requests is (\d+) per storage node$"#)]
 async fn given_max_concurrent(w: &mut KisekiWorld, max: u32) {
-    w.kms_concurrent_count = max;
+    w.kms.concurrent_count = max;
 }
 
 #[when(regex = r#"^(\d+) simultaneous unwrap requests arrive$"#)]
 async fn when_simultaneous_requests(w: &mut KisekiWorld, count: u32) {
     // Simulate concurrency limiting: only kms_concurrent_count are dispatched.
-    let max = w.kms_concurrent_count;
+    let max = w.kms.concurrent_count;
     if count > max {
         w.last_error = Some("KMS concurrency limit reached".to_string());
     }
@@ -1017,7 +1017,7 @@ async fn when_simultaneous_requests(w: &mut KisekiWorld, count: u32) {
 #[then(regex = r#"^(\d+) are dispatched to Vault$"#)]
 async fn then_dispatched(w: &mut KisekiWorld, expected: u32) {
     assert_eq!(
-        w.kms_concurrent_count, expected,
+        w.kms.concurrent_count, expected,
         "dispatched count should match concurrency limit"
     );
 }
@@ -1033,7 +1033,7 @@ async fn then_backpressure(w: &mut KisekiWorld, _expected: u32) {
 
 #[then(regex = r#"^no more than (\d+) connections are open to Vault simultaneously$"#)]
 async fn then_max_connections(w: &mut KisekiWorld, max: u32) {
-    assert_eq!(w.kms_concurrent_count, max);
+    assert_eq!(w.kms.concurrent_count, max);
 }
 
 #[when(regex = r#"^Vault takes (\d+) seconds to respond to an unwrap call$"#)]
@@ -1041,7 +1041,7 @@ async fn when_vault_slow(w: &mut KisekiWorld, response_time: u64) {
     // Timeout is 5 seconds. If response > 5, timeout.
     if response_time > 5 {
         w.last_error = Some("KMS timeout".to_string());
-        w.kms_circuit_open = false; // One timeout doesn't open circuit yet.
+        w.kms.circuit_open = false; // One timeout doesn't open circuit yet.
     }
 }
 
@@ -1067,7 +1067,7 @@ async fn then_timeout_counts(_w: &mut KisekiWorld) {
 
 #[given("Vault is unreachable")]
 async fn given_vault_unreachable(w: &mut KisekiWorld) {
-    w.kms_circuit_open = true;
+    w.kms.circuit_open = true;
     w.last_error = Some("tenant KMS unavailable".to_string());
 }
 
@@ -1078,7 +1078,7 @@ async fn given_cache_expired(_w: &mut KisekiWorld) {
 
 #[when(regex = r#"^a write request arrives for "(\S+)"$"#)]
 async fn when_write_for_tenant(w: &mut KisekiWorld, _tenant: String) {
-    if w.kms_circuit_open {
+    if w.kms.circuit_open {
         w.last_error = Some("tenant KMS unavailable".to_string());
     }
 }
@@ -1091,7 +1091,7 @@ async fn then_write_kms_unavailable(w: &mut KisekiWorld) {
 
 #[when(regex = r#"^a read request arrives for "(\S+)"$"#)]
 async fn when_read_for_tenant(w: &mut KisekiWorld, _tenant: String) {
-    if w.kms_circuit_open {
+    if w.kms.circuit_open {
         w.last_error = Some("tenant KMS unavailable, cache expired".to_string());
     }
 }
@@ -1128,7 +1128,7 @@ async fn when_key_rotation(w: &mut KisekiWorld) {
     // (ADR-028). The system-key store also rotates so the existing
     // last_epoch assertions still hold.
     let provider_name = w
-        .kms_provider_type
+        .kms.provider_type
         .as_deref()
         .unwrap_or("internal")
         .to_owned();
@@ -1150,7 +1150,7 @@ async fn when_key_rotation(w: &mut KisekiWorld) {
     }
     // Mirror the rotation in the system key store so tests that reach
     // for `key_store.current_epoch()` still see monotonic progress.
-    if let Ok(e) = w.key_store.rotate().await {
+    if let Ok(e) = w.legacy.key_store.rotate().await {
         w.last_epoch = Some(e.0);
     }
 }
@@ -1263,7 +1263,7 @@ async fn then_hsm_rewrap(_w: &mut KisekiWorld) {
 async fn then_old_key_retained(_w: &mut KisekiWorld) {
     // Old epoch key retained for migration. MemKeyStore keeps all epoch keys.
     assert!(
-        _w.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok(),
+        _w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok(),
         "old epoch key should be retained"
     );
 }
@@ -1279,7 +1279,7 @@ async fn then_destroy_object(_w: &mut KisekiWorld) {
 
 #[when("crypto-shred is performed")]
 async fn when_crypto_shred(w: &mut KisekiWorld) {
-    let provider = w.kms_provider_type.as_deref().unwrap_or("internal");
+    let provider = w.kms.provider_type.as_deref().unwrap_or("internal");
     let kek = kek_for_provider(provider);
     let aead = test_aead();
     let master = test_master();
@@ -1320,8 +1320,8 @@ async fn then_data_unreadable(_w: &mut KisekiWorld) {
 
 #[then("the shred event is recorded in the audit log")]
 async fn then_shred_audit(w: &mut KisekiWorld) {
-    w.control_audit_events.push("crypto_shred".into());
-    assert!(!w.control_audit_events.is_empty());
+    w.control.audit_events.push("crypto_shred".into());
+    assert!(!w.control.audit_events.is_empty());
 }
 
 #[then("Vault key deletion is enabled (deletion_allowed=true)")]
@@ -1392,13 +1392,13 @@ async fn when_migrate_to_vault(w: &mut KisekiWorld, step: &Step) {
     let provider = table_field(step, "provider").unwrap_or_default();
     assert_eq!(provider, "vault");
     // Migration: configure new provider as "pending".
-    w.kms_provider_type = Some("vault".to_string());
+    w.kms.provider_type = Some("vault".to_string());
     w.last_error = None;
 }
 
 #[then(regex = r#"^the new Vault provider is configured as "pending"$"#)]
 async fn then_vault_pending(w: &mut KisekiWorld) {
-    assert_eq!(w.kms_provider_type.as_deref(), Some("vault"));
+    assert_eq!(w.kms.provider_type.as_deref(), Some("vault"));
 }
 
 #[then("a new KEK is provisioned in Vault")]
@@ -1478,7 +1478,7 @@ async fn then_dual_read(_w: &mut KisekiWorld) {
 
 #[then("when 100% re-wrapped, the active provider switches to Vault atomically")]
 async fn then_atomic_switch(w: &mut KisekiWorld) {
-    assert_eq!(w.kms_provider_type.as_deref(), Some("vault"));
+    assert_eq!(w.kms.provider_type.as_deref(), Some("vault"));
 }
 
 #[then("the old Internal KEK is decommissioned")]
@@ -1500,14 +1500,14 @@ async fn then_operator_only(w: &mut KisekiWorld) {
 
 #[then("the provider remains Internal")]
 async fn then_remains_internal(w: &mut KisekiWorld) {
-    assert_eq!(w.kms_provider_type.as_deref(), Some("internal"));
+    assert_eq!(w.kms.provider_type.as_deref(), Some("internal"));
 }
 
 #[given(regex = r#"^tenant "(\S+)" migration from Internal to Vault is at (\d+)%$"#)]
 async fn given_migration_progress(w: &mut KisekiWorld, tenant: String, _pct: u32) {
     w.ensure_tenant(&tenant);
     // Both providers active during migration.
-    w.kms_provider_type = Some("internal+vault".to_string());
+    w.kms.provider_type = Some("internal+vault".to_string());
 }
 
 #[when("a read arrives for a chunk still wrapped with Internal provider")]
@@ -1563,7 +1563,7 @@ async fn then_vault_unwrap(w: &mut KisekiWorld) {
 #[then("both providers are active during migration")]
 async fn then_both_active(w: &mut KisekiWorld) {
     // During migration, the provider type indicates both are active.
-    let provider = w.kms_provider_type.as_deref().unwrap_or("");
+    let provider = w.kms.provider_type.as_deref().unwrap_or("");
     assert!(
         provider.contains("internal") || provider.contains("vault"),
         "both providers should be active"
@@ -1613,7 +1613,7 @@ async fn then_no_secret_in_logs(_w: &mut KisekiWorld) {
 #[given(regex = r#"^tenant "(\S+)" with AppRole auth configuration$"#)]
 async fn given_approle_config(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
-    w.kms_provider_type = Some("vault".to_string());
+    w.kms.provider_type = Some("vault".to_string());
 }
 
 #[when("the KmsAuthConfig is formatted for debug logging")]
@@ -1746,7 +1746,7 @@ async fn then_unaffected(_w: &mut KisekiWorld, _tenant: String) {
 
 #[then("system master keys are unaffected")]
 async fn then_system_keys_safe(w: &mut KisekiWorld) {
-    assert!(w.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
 }
 
 #[then(regex = r#"^the compromise is contained to "(\S+)" boundary$"#)]
@@ -1801,7 +1801,7 @@ async fn then_params_zeroizing(_w: &mut KisekiWorld) {
 #[given(regex = r#"^tenant "(\S+)" with Vault AppRole auth$"#)]
 async fn given_vault_approle(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
-    w.kms_provider_type = Some("vault".to_string());
+    w.kms.provider_type = Some("vault".to_string());
 }
 
 #[when("the secret_id is rotated to a new value")]
@@ -1829,19 +1829,19 @@ async fn then_old_not_in_logs(_w: &mut KisekiWorld) {
 
 #[given("migration from Internal to Vault at 50%")]
 async fn given_migration_50(w: &mut KisekiWorld) {
-    w.kms_provider_type = Some("internal+vault".to_string());
+    w.kms.provider_type = Some("internal+vault".to_string());
 }
 
 #[when("the operator cancels the migration")]
 async fn when_cancel_migration(w: &mut KisekiWorld) {
     // Cancel: revert to Internal.
-    w.kms_provider_type = Some("internal".to_string());
+    w.kms.provider_type = Some("internal".to_string());
     w.last_error = None;
 }
 
 #[then("re-wrapped envelopes revert to Internal provider")]
 async fn then_revert_internal(w: &mut KisekiWorld) {
-    assert_eq!(w.kms_provider_type.as_deref(), Some("internal"));
+    assert_eq!(w.kms.provider_type.as_deref(), Some("internal"));
     // Re-wrapped envelopes: re-wrap back to Internal KEK.
     let aead = test_aead();
     let master = test_master();

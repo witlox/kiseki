@@ -25,7 +25,7 @@ fn test_envelope(id_byte: u8) -> Envelope {
 
 #[given(regex = r#"^a Kiseki cluster with \d+ affinity pools:$"#)]
 async fn given_pools(w: &mut KisekiWorld) {
-    w.chunk_store.add_pool(
+    w.legacy.chunk_store.add_pool(
         AffinityPool::new(
             "fast-nvme",
             DurabilityStrategy::default(),
@@ -33,7 +33,7 @@ async fn given_pools(w: &mut KisekiWorld) {
         )
         .with_devices(6),
     );
-    w.chunk_store.add_pool(
+    w.legacy.chunk_store.add_pool(
         AffinityPool::new(
             "bulk-nvme",
             DurabilityStrategy::default(),
@@ -41,7 +41,7 @@ async fn given_pools(w: &mut KisekiWorld) {
         )
         .with_devices(12),
     );
-    w.chunk_store.add_pool(
+    w.legacy.chunk_store.add_pool(
         AffinityPool::new(
             "bulk-hdd",
             DurabilityStrategy::ErasureCoding {
@@ -81,7 +81,7 @@ async fn when_encrypt(_w: &mut KisekiWorld) {}
 async fn when_store(w: &mut KisekiWorld, pool: String) {
     let env = test_envelope(0x01);
     w.last_chunk_id = Some(env.chunk_id);
-    let is_new = w.chunk_store.write_chunk(env, &pool).unwrap();
+    let is_new = w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
     assert!(is_new, "first write should be new");
 }
 
@@ -93,7 +93,7 @@ async fn then_stored(w: &mut KisekiWorld) {
 #[then(regex = r#"^the chunk's refcount is initialized to 1$"#)]
 async fn then_refcount_1(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    assert_eq!(w.chunk_store.refcount(&id).unwrap(), 1);
+    assert_eq!(w.legacy.chunk_store.refcount(&id).unwrap(), 1);
 }
 
 #[then(
@@ -101,7 +101,7 @@ async fn then_refcount_1(w: &mut KisekiWorld) {
 )]
 async fn then_envelope_contains(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    let envelope = w.chunk_store.read_chunk(&id).unwrap();
+    let envelope = w.legacy.chunk_store.read_chunk(&id).unwrap();
     assert!(
         !envelope.ciphertext.is_empty(),
         "envelope must have ciphertext"
@@ -125,14 +125,14 @@ async fn when_hmac(_w: &mut KisekiWorld) {}
 #[when(regex = r#"^a second composition references the same plaintext data$"#)]
 async fn when_dedup_ref(w: &mut KisekiWorld) {
     let env = test_envelope(0x01); // same chunk ID
-    let is_new = w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    let is_new = w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     assert!(!is_new, "dedup should detect existing chunk");
 }
 
 #[then(regex = r#"^the existing chunk's refcount is incremented to (\d+)$"#)]
 async fn then_refcount(w: &mut KisekiWorld, expected: u64) {
     let id = w.last_chunk_id.unwrap();
-    assert_eq!(w.chunk_store.refcount(&id).unwrap(), expected);
+    assert_eq!(w.legacy.chunk_store.refcount(&id).unwrap(), expected);
 }
 
 // === Scenario: GC with refcount ===
@@ -141,15 +141,15 @@ async fn then_refcount(w: &mut KisekiWorld, expected: u64) {
 async fn given_chunk_refcount(w: &mut KisekiWorld, _name: String, count: u64) {
     let env = test_envelope(0x42);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     // write_chunk starts with refcount 1; adjust to the requested count.
     if count == 0 {
-        w.chunk_store
+        w.legacy.chunk_store
             .decrement_refcount(&ChunkId([0x42; 32]))
             .unwrap();
     } else {
         for _ in 1..count {
-            w.chunk_store
+            w.legacy.chunk_store
                 .increment_refcount(&ChunkId([0x42; 32]))
                 .unwrap();
         }
@@ -159,22 +159,22 @@ async fn given_chunk_refcount(w: &mut KisekiWorld, _name: String, count: u64) {
 #[when(regex = r#"^all compositions referencing "(\S+)" are deleted$"#)]
 async fn when_all_deleted(w: &mut KisekiWorld, _name: String) {
     let id = w.last_chunk_id.unwrap();
-    let rc = w.chunk_store.refcount(&id).unwrap();
+    let rc = w.legacy.chunk_store.refcount(&id).unwrap();
     for _ in 0..rc {
-        w.chunk_store.decrement_refcount(&id).unwrap();
+        w.legacy.chunk_store.decrement_refcount(&id).unwrap();
     }
 }
 
 #[when("chunk GC runs")]
 async fn when_gc(w: &mut KisekiWorld) {
-    w.last_sequence = Some(SequenceNumber(w.chunk_store.gc()));
+    w.last_sequence = Some(SequenceNumber(w.legacy.chunk_store.gc()));
 }
 
 #[then(regex = r#"^"(\S+)" is physically deleted$"#)]
 async fn then_deleted(w: &mut KisekiWorld, _name: String) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_err(),
+        w.legacy.chunk_store.read_chunk(&id).is_err(),
         "chunk should be GC'd"
     );
 }
@@ -184,7 +184,7 @@ async fn then_deleted(w: &mut KisekiWorld, _name: String) {
 #[given(regex = r#"^a retention hold "(\S+)" is active on.*chunk.*$"#)]
 async fn given_hold(w: &mut KisekiWorld, hold_name: String) {
     if let Some(id) = w.last_chunk_id {
-        w.chunk_store.set_retention_hold(&id, &hold_name).unwrap();
+        w.legacy.chunk_store.set_retention_hold(&id, &hold_name).unwrap();
     }
 }
 
@@ -192,7 +192,7 @@ async fn given_hold(w: &mut KisekiWorld, hold_name: String) {
 async fn then_not_deleted(w: &mut KisekiWorld, _name: String) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "retention hold should prevent GC"
     );
 }
@@ -201,7 +201,7 @@ async fn then_not_deleted(w: &mut KisekiWorld, _name: String) {
 async fn then_not_deleted_short(w: &mut KisekiWorld, _name: String) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "retention hold should prevent GC (chunk still readable)"
     );
 }
@@ -212,14 +212,14 @@ async fn then_not_deleted_short(w: &mut KisekiWorld, _name: String) {
 async fn when_store_pool(w: &mut KisekiWorld, pool: String) {
     let env = test_envelope(0x02);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, &pool).unwrap();
+    w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
 }
 
 #[then(regex = r#"^the chunk_id is unique to "(\S+)"$"#)]
 async fn then_unique_id(w: &mut KisekiWorld, _t: String) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "HMAC-derived chunk should be stored"
     );
 }
@@ -229,14 +229,14 @@ async fn then_diff_id(w: &mut KisekiWorld) {
     // HMAC with different tenant key produces different chunk_id.
     // Verify original chunk exists — different ID means a different chunk.
     let id = w.last_chunk_id.unwrap();
-    assert!(w.chunk_store.read_chunk(&id).is_ok());
+    assert!(w.legacy.chunk_store.read_chunk(&id).is_ok());
 }
 
 #[then("cross-tenant dedup cannot match this chunk")]
 async fn then_no_cross_dedup(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
     assert_eq!(
-        w.chunk_store.refcount(&id).unwrap(),
+        w.legacy.chunk_store.refcount(&id).unwrap(),
         1,
         "HMAC chunk should have refcount 1 (no cross-tenant dedup)"
     );
@@ -249,9 +249,9 @@ async fn given_chunk_with_id(w: &mut KisekiWorld, tenant: String, _name: String,
     w.ensure_tenant(&tenant);
     let env = test_envelope(0x01);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     for _ in 1..count {
-        w.chunk_store
+        w.legacy.chunk_store
             .increment_refcount(&ChunkId([0x01; 32]))
             .unwrap();
     }
@@ -260,7 +260,7 @@ async fn given_chunk_with_id(w: &mut KisekiWorld, tenant: String, _name: String,
 #[when(regex = r#"^a new composition in "(\S+)" references the same plaintext$"#)]
 async fn when_new_comp_ref(w: &mut KisekiWorld, _tenant: String) {
     let env = test_envelope(0x01);
-    let is_new = w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    let is_new = w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     assert!(!is_new, "dedup should detect existing chunk");
 }
 
@@ -274,7 +274,7 @@ async fn then_no_new_chunk(w: &mut KisekiWorld) {
         .last_chunk_id
         .expect("last_chunk_id must be set by a prior Given step");
     let rc = w
-        .chunk_store
+        .legacy.chunk_store
         .refcount(&id)
         .unwrap_or_else(|e| panic!("refcount lookup failed for {id}: {e}"));
     assert!(
@@ -287,7 +287,7 @@ async fn then_no_new_chunk(w: &mut KisekiWorld) {
 async fn then_ref(w: &mut KisekiWorld, _name: String) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "referenced chunk should be readable"
     );
 }
@@ -299,9 +299,9 @@ async fn given_chunk_rc(w: &mut KisekiWorld, tenant: String, _name: String, coun
     w.ensure_tenant(&tenant);
     let env = test_envelope(0x01);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     for _ in 1..count {
-        w.chunk_store
+        w.legacy.chunk_store
             .increment_refcount(&ChunkId([0x01; 32]))
             .unwrap();
     }
@@ -311,14 +311,14 @@ async fn given_chunk_rc(w: &mut KisekiWorld, tenant: String, _name: String, coun
 async fn given_other_tenant_writes(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
     let env = test_envelope(0x01);
-    let is_new = w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    let is_new = w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     assert!(!is_new);
 }
 
 #[then(regex = r#"^chunk "(\S+)" refcount is incremented to (\d+)$"#)]
 async fn then_chunk_rc(w: &mut KisekiWorld, _name: String, expected: u64) {
     let id = w.last_chunk_id.unwrap();
-    assert_eq!(w.chunk_store.refcount(&id).unwrap(), expected);
+    assert_eq!(w.legacy.chunk_store.refcount(&id).unwrap(), expected);
 }
 
 #[then(regex = r#"^"(\S+)" receives a tenant KEK wrapping of the system DEK.*$"#)]
@@ -361,13 +361,13 @@ async fn then_independent(_w: &mut KisekiWorld, _a: String, _b: String) {
 async fn given_chunk_in_pool(w: &mut KisekiWorld, _name: String, pool: String) {
     let env = test_envelope(0x42);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, &pool).unwrap();
+    w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
 }
 
 #[when(regex = r#"^a stream processor requests ReadChunk for "(\S+)"$"#)]
 async fn when_read_chunk(w: &mut KisekiWorld, _name: String) {
     let id = w.last_chunk_id.unwrap();
-    match w.chunk_store.read_chunk(&id) {
+    match w.legacy.chunk_store.read_chunk(&id) {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -402,7 +402,7 @@ async fn then_no_plaintext_wire(w: &mut KisekiWorld) {
     // Envelope ciphertext differs from plaintext — verified by the
     // fact that seal_envelope encrypts before storing.
     let id = w.last_chunk_id.unwrap();
-    let env = w.chunk_store.read_chunk(&id).unwrap();
+    let env = w.legacy.chunk_store.read_chunk(&id).unwrap();
     // Ciphertext should not equal any obvious plaintext pattern.
     assert!(!env.ciphertext.is_empty());
     assert!(env.ciphertext != vec![0u8; env.ciphertext.len()]);
@@ -417,14 +417,14 @@ async fn given_affinity_tier(_w: &mut KisekiWorld, _pool: String) {}
 async fn when_chunk_for_comp(w: &mut KisekiWorld) {
     let env = test_envelope(0x55);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
 }
 
 #[then(regex = r#"^the chunk is placed in pool "(\S+)"$"#)]
 async fn then_placed_in(w: &mut KisekiWorld, _pool: String) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "chunk should be readable from its placement pool"
     );
 }
@@ -432,7 +432,7 @@ async fn then_placed_in(w: &mut KisekiWorld, _pool: String) {
 #[then(regex = r#"^EC \d\+\d+ encoding is applied per pool policy$"#)]
 async fn then_ec(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    if let Some(ec) = w.chunk_store.ec_meta(&id) {
+    if let Some(ec) = w.legacy.chunk_store.ec_meta(&id) {
         assert!(ec.data_shards > 0 && ec.parity_shards > 0);
     }
 }
@@ -440,7 +440,7 @@ async fn then_ec(w: &mut KisekiWorld) {
 #[then("the chunk's fragments are distributed across devices in the pool")]
 async fn then_distributed(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    if let Some(ec) = w.chunk_store.ec_meta(&id) {
+    if let Some(ec) = w.legacy.chunk_store.ec_meta(&id) {
         let mut indices = ec.device_indices.clone();
         indices.sort_unstable();
         indices.dedup();
@@ -464,14 +464,14 @@ async fn given_pool_capacity(w: &mut KisekiWorld, pool: String, _pct: u64) {
 async fn when_new_target(w: &mut KisekiWorld, pool: String) {
     let env = test_envelope(0x66);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, &pool).unwrap();
+    w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
 }
 
 #[then(regex = r#"^the chunk is placed in "(\S+)" if space exists after cleanup$"#)]
 async fn then_placed_if_space(w: &mut KisekiWorld, _pool: String) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "chunk should be placed and readable"
     );
 }
@@ -485,7 +485,7 @@ async fn then_migration_notified(_w: &mut KisekiWorld) {
 async fn then_no_redirect(w: &mut KisekiWorld) {
     // Chunk was written to the intended pool (fast-nvme), not redirected.
     let id = w.last_chunk_id.unwrap();
-    assert!(w.chunk_store.read_chunk(&id).is_ok());
+    assert!(w.legacy.chunk_store.read_chunk(&id).is_ok());
 }
 
 // === GC no retention hold ===
@@ -498,23 +498,23 @@ async fn given_no_hold(w: &mut KisekiWorld, _name: String) {
 #[when(regex = r#"^the last composition referencing "(\S+)" is deleted$"#)]
 async fn when_last_ref_deleted(w: &mut KisekiWorld, _name: String) {
     let id = w.last_chunk_id.unwrap();
-    let rc = w.chunk_store.refcount(&id).unwrap();
+    let rc = w.legacy.chunk_store.refcount(&id).unwrap();
     for _ in 0..rc {
-        w.chunk_store.decrement_refcount(&id).unwrap();
+        w.legacy.chunk_store.decrement_refcount(&id).unwrap();
     }
 }
 
 #[then("refcount drops to 0")]
 async fn then_rc_zero(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    assert_eq!(w.chunk_store.refcount(&id).unwrap(), 0);
+    assert_eq!(w.legacy.chunk_store.refcount(&id).unwrap(), 0);
 }
 
 #[then(regex = r#"^"(\S+)" becomes eligible for physical GC$"#)]
 async fn then_gc_eligible(w: &mut KisekiWorld, _name: String) {
     let id = w.last_chunk_id.unwrap();
     assert_eq!(
-        w.chunk_store.refcount(&id).unwrap(),
+        w.legacy.chunk_store.refcount(&id).unwrap(),
         0,
         "chunk must have refcount 0 to be GC-eligible"
     );
@@ -522,23 +522,23 @@ async fn then_gc_eligible(w: &mut KisekiWorld, _name: String) {
 
 #[then("the GC process eventually deletes the ciphertext from storage")]
 async fn then_gc_deletes(w: &mut KisekiWorld) {
-    w.chunk_store.gc();
+    w.legacy.chunk_store.gc();
     let id = w.last_chunk_id.unwrap();
-    assert!(w.chunk_store.read_chunk(&id).is_err());
+    assert!(w.legacy.chunk_store.read_chunk(&id).is_err());
 }
 
 // === GC blocked by hold ===
 
 #[when(regex = r#"^the GC process evaluates "(\S+)"$"#)]
 async fn when_gc_eval(w: &mut KisekiWorld, _name: String) {
-    w.chunk_store.gc();
+    w.legacy.chunk_store.gc();
 }
 
 #[then("it remains on storage as system-encrypted ciphertext")]
 async fn then_remains(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "chunk should remain on storage (retention hold blocks GC)"
     );
 }
@@ -554,12 +554,12 @@ async fn then_gc_reevaluates(w: &mut KisekiWorld) {
         "hipaa-litigation-2026".into(),
     ];
     for hold in &holds {
-        let _ = w.chunk_store.release_retention_hold(&id, hold);
+        let _ = w.legacy.chunk_store.release_retention_hold(&id, hold);
     }
-    let deleted = w.chunk_store.gc();
+    let deleted = w.legacy.chunk_store.gc();
     assert!(deleted > 0, "GC should delete chunk after hold released");
     assert!(
-        w.chunk_store.read_chunk(&id).is_err(),
+        w.legacy.chunk_store.read_chunk(&id).is_err(),
         "chunk should be gone after hold release + GC"
     );
 }
@@ -573,14 +573,14 @@ async fn given_tenant_chunks(w: &mut KisekiWorld, tenant: String, chunks: String
     for i in 0..count {
         let b = (i as u8) + 1;
         let env = test_envelope(b);
-        w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+        w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     }
 }
 
 #[given(regex = r#"^a retention hold "(\S+)" is set on namespace "(\S+)"$"#)]
 async fn given_ns_hold(w: &mut KisekiWorld, hold: String, _ns: String) {
     for b in [0x01u8, 0x02, 0x03] {
-        w.chunk_store
+        w.legacy.chunk_store
             .set_retention_hold(&ChunkId([b; 32]), &hold)
             .unwrap();
     }
@@ -607,9 +607,9 @@ async fn then_rc_decrement(w: &mut KisekiWorld) {
     // After shred, refcounts should be decrementable.
     for b in [0x01u8, 0x02, 0x03] {
         let id = ChunkId([b; 32]);
-        if let Ok(rc) = w.chunk_store.refcount(&id) {
+        if let Ok(rc) = w.legacy.chunk_store.refcount(&id) {
             if rc > 0 {
-                w.chunk_store.decrement_refcount(&id).unwrap();
+                w.legacy.chunk_store.decrement_refcount(&id).unwrap();
             }
         }
     }
@@ -618,7 +618,7 @@ async fn then_rc_decrement(w: &mut KisekiWorld) {
 #[then(regex = r#"^chunks with refcount 0 are NOT GC'd due to retention hold$"#)]
 async fn then_hold_blocks_gc(w: &mut KisekiWorld) {
     for b in [0x01u8, 0x02, 0x03] {
-        assert!(w.chunk_store.read_chunk(&ChunkId([b; 32])).is_ok());
+        assert!(w.legacy.chunk_store.read_chunk(&ChunkId([b; 32])).is_ok());
     }
 }
 
@@ -627,7 +627,7 @@ async fn then_hold_persists(w: &mut KisekiWorld) {
     // Verify chunks are still readable (hold prevents GC).
     for b in [0x01u8, 0x02, 0x03] {
         assert!(
-            w.chunk_store.read_chunk(&ChunkId([b; 32])).is_ok(),
+            w.legacy.chunk_store.read_chunk(&ChunkId([b; 32])).is_ok(),
             "chunk 0x{:02x} should persist due to retention hold",
             b
         );
@@ -650,12 +650,12 @@ async fn then_rcs_zero(w: &mut KisekiWorld) {
     // After crypto-shred, decrement all tenant chunk refcounts to 0.
     for b in [0x01u8, 0x02, 0x03] {
         let id = ChunkId([b; 32]);
-        if let Ok(rc) = w.chunk_store.refcount(&id) {
+        if let Ok(rc) = w.legacy.chunk_store.refcount(&id) {
             for _ in 0..rc {
-                w.chunk_store.decrement_refcount(&id).unwrap();
+                w.legacy.chunk_store.decrement_refcount(&id).unwrap();
             }
             assert_eq!(
-                w.chunk_store.refcount(&id).unwrap(),
+                w.legacy.chunk_store.refcount(&id).unwrap(),
                 0,
                 "refcount should be 0 for chunk 0x{:02x}",
                 b
@@ -669,7 +669,7 @@ async fn then_chunks_gc(w: &mut KisekiWorld) {
     // Chunks with refcount 0 and no retention holds are GC-eligible.
     for b in [0x01u8, 0x02, 0x03] {
         let id = ChunkId([b; 32]);
-        if let Ok(rc) = w.chunk_store.refcount(&id) {
+        if let Ok(rc) = w.legacy.chunk_store.refcount(&id) {
             assert_eq!(
                 rc, 0,
                 "chunk 0x{:02x} must have refcount 0 to be GC-eligible",
@@ -681,12 +681,12 @@ async fn then_chunks_gc(w: &mut KisekiWorld) {
 
 #[then("GC eventually reclaims storage")]
 async fn then_gc_reclaims(w: &mut KisekiWorld) {
-    let deleted = w.chunk_store.gc();
+    let deleted = w.legacy.chunk_store.gc();
     assert!(deleted > 0, "GC should reclaim chunks with refcount 0");
     for b in [0x01u8, 0x02, 0x03] {
         let id = ChunkId([b; 32]);
         assert!(
-            w.chunk_store.read_chunk(&id).is_err(),
+            w.legacy.chunk_store.read_chunk(&id).is_err(),
             "chunk 0x{:02x} should be reclaimed by GC",
             b
         );
@@ -705,7 +705,7 @@ async fn given_ec_frags(w: &mut KisekiWorld, chunks: String, _dev: String) {
         let b = (i as u8) + 0xd0;
         let env = test_envelope(b);
         w.last_chunk_id = Some(env.chunk_id);
-        let _ = w.chunk_store.write_chunk(env, "bulk-hdd");
+        let _ = w.legacy.chunk_store.write_chunk(env, "bulk-hdd");
     }
 }
 
@@ -773,7 +773,7 @@ async fn then_availability(w: &mut KisekiWorld) {
     // After EC repair, chunk should still be readable via the store.
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "chunk should be available after repair"
     );
 }
@@ -888,7 +888,7 @@ async fn then_aborted(w: &mut KisekiWorld) {
     // If seal succeeds, the write would proceed; if it fails, write is aborted.
     // Either way, verify no chunk was written for this ID.
     assert!(
-        w.chunk_store.read_chunk(&cid).is_err(),
+        w.legacy.chunk_store.read_chunk(&cid).is_err(),
         "chunk must not be persisted when encryption fails"
     );
 }
@@ -898,7 +898,7 @@ async fn then_no_data(w: &mut KisekiWorld) {
     // After an aborted write, verify no chunk was stored.
     let cid = ChunkId([0xee; 32]);
     assert!(
-        w.chunk_store.read_chunk(&cid).is_err(),
+        w.legacy.chunk_store.read_chunk(&cid).is_err(),
         "no data should be persisted after aborted write"
     );
 }
@@ -926,13 +926,13 @@ async fn then_retriable_error(_w: &mut KisekiWorld) {
 async fn given_chunk_read(w: &mut KisekiWorld, _name: String) {
     let env = test_envelope(0x42);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
 }
 
 #[when("the authenticated encryption tag is verified")]
 async fn when_verify_tag(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    match w.chunk_store.read_chunk(&id) {
+    match w.legacy.chunk_store.read_chunk(&id) {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -989,7 +989,7 @@ async fn given_concurrent_writes(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
     let env1 = test_envelope(0x01);
     w.last_chunk_id = Some(env1.chunk_id);
-    let is_new1 = w.chunk_store.write_chunk(env1, "fast-nvme").unwrap();
+    let is_new1 = w.legacy.chunk_store.write_chunk(env1, "fast-nvme").unwrap();
     assert!(is_new1);
 }
 
@@ -999,7 +999,7 @@ async fn given_both_compute(_w: &mut KisekiWorld, _id: String) {}
 #[then("chunk writes are idempotent:")]
 async fn then_idempotent(w: &mut KisekiWorld) {
     let env2 = test_envelope(0x01);
-    let is_new2 = w.chunk_store.write_chunk(env2, "fast-nvme").unwrap();
+    let is_new2 = w.legacy.chunk_store.write_chunk(env2, "fast-nvme").unwrap();
     assert!(!is_new2, "second write should dedup");
 }
 
@@ -1008,7 +1008,7 @@ async fn then_no_rejection(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
     // After concurrent dedup, chunk should exist with refcount 2.
     assert_eq!(
-        w.chunk_store.refcount(&id).unwrap(),
+        w.legacy.chunk_store.refcount(&id).unwrap(),
         2,
         "concurrent writes should both succeed via dedup (refcount 2)"
     );
@@ -1019,7 +1019,7 @@ async fn then_no_dup(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
     // Single chunk with refcount > 1 means no duplicate.
     assert!(
-        w.chunk_store.refcount(&id).unwrap() >= 2,
+        w.legacy.chunk_store.refcount(&id).unwrap() >= 2,
         "single chunk with refcount >= 2 means no duplication"
     );
 }
@@ -1033,7 +1033,7 @@ async fn given_rebalancing(_w: &mut KisekiWorld, _from: String, _to: String) {}
 async fn then_written_if_capacity(w: &mut KisekiWorld, _pool: String) {
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "chunk should be written and readable"
     );
 }
@@ -1044,7 +1044,7 @@ async fn then_rebalance_continues(w: &mut KisekiWorld) {
     // Verify the last written chunk is readable regardless of rebalance state.
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "new chunk should be readable independently of rebalance"
     );
 }
@@ -1054,12 +1054,12 @@ async fn then_not_migrated(w: &mut KisekiWorld) {
     // The newly written chunk should remain in its original pool, not migrated.
     let id = w.last_chunk_id.unwrap();
     assert_eq!(
-        w.chunk_store.refcount(&id).unwrap(),
+        w.legacy.chunk_store.refcount(&id).unwrap(),
         1,
         "new chunk refcount should be 1 (not moved by migration)"
     );
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "new chunk should still be in original location"
     );
 }
@@ -1069,7 +1069,7 @@ async fn then_not_migrated(w: &mut KisekiWorld) {
 #[given(regex = r#"^workload "(\S+)" is authorised for pools \[([^\]]+)\]$"#)]
 async fn given_wl_pools(w: &mut KisekiWorld, wl: String, pools: String) {
     // Register authorized pools for this workload.
-    w.control_pool_authorized.insert(wl, pools);
+    w.control.pool_authorized.insert(wl, pools);
 }
 
 #[given(regex = r#"^a new chunk is being placed for composition "(\S+)"$"#)]
@@ -1084,7 +1084,7 @@ async fn given_hint(_w: &mut KisekiWorld) {}
 #[when("the placement engine runs")]
 async fn when_placement(w: &mut KisekiWorld) {
     let env = test_envelope(0x77);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
 }
 
 #[then(regex = r#"^the chunk MAY be placed in.*$"#)]
@@ -1092,7 +1092,7 @@ async fn then_may_place(w: &mut KisekiWorld) {
     // Hint is advisory: chunk was placed somewhere valid.
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "chunk should be placed in a valid pool"
     );
 }
@@ -1103,7 +1103,7 @@ async fn then_may_override(w: &mut KisekiWorld) {
     // Verify chunk exists (placed somewhere, possibly not the hinted pool).
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "chunk should exist regardless of hint override"
     );
 }
@@ -1116,7 +1116,7 @@ async fn then_policy_enforced(w: &mut KisekiWorld) {
     let env = test_envelope(0x78);
     // "nonexistent-pool" is not authorized — write should still succeed
     // in the actual pool, but the unauthorized pool has no entry.
-    let result = w.chunk_store.write_chunk(env, "fast-nvme");
+    let result = w.legacy.chunk_store.write_chunk(env, "fast-nvme");
     assert!(result.is_ok(), "write to authorized pool should succeed");
 }
 
@@ -1132,7 +1132,7 @@ async fn given_per_rank_hint(_w: &mut KisekiWorld) {}
 async fn when_chunk_presented(w: &mut KisekiWorld) {
     let env = test_envelope(0x88);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
 }
 
 #[then(regex = r#"^the dedup refcount path is bypassed.*$"#)]
@@ -1140,7 +1140,7 @@ async fn then_dedup_bypassed(w: &mut KisekiWorld) {
     // Per-rank hint: each write is independent, refcount stays at 1.
     let id = w.last_chunk_id.unwrap();
     assert_eq!(
-        w.chunk_store.refcount(&id).unwrap(),
+        w.legacy.chunk_store.refcount(&id).unwrap(),
         1,
         "per-rank dedup bypass: refcount should be 1 (no coalescing)"
     );
@@ -1167,7 +1167,7 @@ async fn then_no_coalesce(w: &mut KisekiWorld) {
     // With per-rank hint, identical plaintext should produce separate chunks
     // (different envelope IDs). We model this by writing with a different ID byte.
     let env = test_envelope(0x89); // different chunk ID than 0x88
-    let is_new = w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    let is_new = w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     assert!(
         is_new,
         "per-rank writes must not coalesce — each write is new"
@@ -1200,14 +1200,14 @@ async fn given_ensemble_hint(_w: &mut KisekiWorld) {}
 async fn then_dedup_normal(w: &mut KisekiWorld) {
     // Shared-ensemble: normal dedup applies — write same chunk, refcount increments.
     let env = test_envelope(0x88); // same ID as the original write
-    let is_new = w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    let is_new = w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     assert!(
         !is_new,
         "shared-ensemble hint: dedup should detect existing chunk"
     );
     let id = ChunkId([0x88; 32]);
     assert!(
-        w.chunk_store.refcount(&id).unwrap() >= 2,
+        w.legacy.chunk_store.refcount(&id).unwrap() >= 2,
         "shared-ensemble: refcount should increase via normal dedup path"
     );
 }
@@ -1350,8 +1350,8 @@ async fn then_no_k_leak(_w: &mut KisekiWorld) {
 async fn given_retention_comp(w: &mut KisekiWorld, _name: String, _years: u64) {
     let env = test_envelope(0x99);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    w.chunk_store
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store
         .set_retention_hold(&ChunkId([0x99; 32]), "retention-hold")
         .unwrap();
 }
@@ -1365,10 +1365,10 @@ async fn then_gc_urgency(w: &mut KisekiWorld) {
     // Verify it was stored and has refcount 1 (no special treatment changes storage).
     let id = w.last_chunk_id.unwrap();
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "temp chunk should be placed"
     );
-    assert_eq!(w.chunk_store.refcount(&id).unwrap(), 1);
+    assert_eq!(w.legacy.chunk_store.refcount(&id).unwrap(), 1);
 }
 
 #[then(regex = r#"^the retention hold \(I-C2b\) still blocks GC regardless of the hint.*$"#)]
@@ -1376,18 +1376,18 @@ async fn then_hold_blocks(w: &mut KisekiWorld) {
     // I-C2b: retention hold blocks GC even with temp hint.
     let id = w.last_chunk_id.unwrap();
     // Decrement refcount to 0.
-    let rc = w.chunk_store.refcount(&id).unwrap();
+    let rc = w.legacy.chunk_store.refcount(&id).unwrap();
     for _ in 0..rc {
-        w.chunk_store.decrement_refcount(&id).unwrap();
+        w.legacy.chunk_store.decrement_refcount(&id).unwrap();
     }
     // GC should NOT delete because retention hold is active.
-    let deleted = w.chunk_store.gc();
+    let deleted = w.legacy.chunk_store.gc();
     assert_eq!(
         deleted, 0,
         "retention hold must block GC regardless of hint"
     );
     assert!(
-        w.chunk_store.read_chunk(&id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&id).is_ok(),
         "chunk must persist due to retention hold (I-C2b)"
     );
 }

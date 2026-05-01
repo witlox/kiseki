@@ -11,7 +11,7 @@ async fn given_advisory(_w: &mut KisekiWorld) {}
 #[when(regex = r#"^workload "(\S+)" declares workflow with profile "(\S+)" phase "(\S+)"$"#)]
 async fn when_declare(w: &mut KisekiWorld, workload: String, _profile: String, _phase: String) {
     let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-    w.advisory_table
+    w.legacy.advisory_table
         .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
     w.last_workflow_ref = Some(wf_ref);
     w.workflow_names.insert(workload, wf_ref);
@@ -19,13 +19,13 @@ async fn when_declare(w: &mut KisekiWorld, workload: String, _profile: String, _
 
 #[then("the workflow is declared")]
 async fn then_declared(w: &mut KisekiWorld) {
-    assert!(w.advisory_table.active_count() > 0);
+    assert!(w.legacy.advisory_table.active_count() > 0);
 }
 
 #[when(regex = r#"^the workflow advances to phase (\d+)$"#)]
 async fn when_phase(w: &mut KisekiWorld, phase: u64) {
     let wf_ref = w.last_workflow_ref.unwrap();
-    let entry = w.advisory_table.get_mut(&wf_ref).unwrap();
+    let entry = w.legacy.advisory_table.get_mut(&wf_ref).unwrap();
     match entry.advance_phase(PhaseId(phase)) {
         Ok(()) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
@@ -40,7 +40,7 @@ async fn then_phase_ok(w: &mut KisekiWorld) {
 #[when(regex = r#"^the workflow tries to go back to phase (\d+)$"#)]
 async fn when_phase_back(w: &mut KisekiWorld, phase: u64) {
     let wf_ref = w.last_workflow_ref.unwrap();
-    let entry = w.advisory_table.get_mut(&wf_ref).unwrap();
+    let entry = w.legacy.advisory_table.get_mut(&wf_ref).unwrap();
     match entry.advance_phase(PhaseId(phase)) {
         Ok(()) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
@@ -59,9 +59,9 @@ async fn then_non_monotonic(w: &mut KisekiWorld) {
 async fn when_budget_exceeded(w: &mut KisekiWorld) {
     // Exhaust hint budget
     for _ in 0..101 {
-        let _ = w.budget_enforcer.try_hint();
+        let _ = w.legacy.budget_enforcer.try_hint();
     }
-    match w.budget_enforcer.try_hint() {
+    match w.legacy.budget_enforcer.try_hint() {
         Ok(()) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -75,14 +75,14 @@ async fn then_budget(w: &mut KisekiWorld) {
 #[when(regex = r#"^the workflow "(\S+)" is ended$"#)]
 async fn when_end(w: &mut KisekiWorld, name: String) {
     if let Some(&wf_ref) = w.workflow_names.get(&name) {
-        w.advisory_table.end(&wf_ref);
+        w.legacy.advisory_table.end(&wf_ref);
     }
 }
 
 #[then("the workflow is removed from the active table")]
 async fn then_removed(w: &mut KisekiWorld) {
     if let Some(wf_ref) = w.last_workflow_ref {
-        assert!(w.advisory_table.get(&wf_ref).is_none());
+        assert!(w.legacy.advisory_table.get(&wf_ref).is_none());
     }
 }
 
@@ -131,7 +131,7 @@ async fn given_hint_budget(w: &mut KisekiWorld, step: &Step) {
         }
     }
 
-    w.budget_enforcer = kiseki_advisory::budget::BudgetEnforcer::new(BudgetConfig {
+    w.legacy.budget_enforcer = kiseki_advisory::budget::BudgetEnforcer::new(BudgetConfig {
         hints_per_sec,
         max_concurrent_workflows: max_concurrent,
         max_phases_per_workflow: max_phases,
@@ -164,7 +164,7 @@ async fn given_workflow_in_phase_with_id(w: &mut KisekiWorld, _phase_name: Strin
     // Ensure a workflow exists and set its current phase.
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(phase_id));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -256,7 +256,7 @@ async fn given_max_priority(_w: &mut KisekiWorld, _priority: String) {
 async fn given_workflow_phase_profile(w: &mut KisekiWorld, _phase: String, _profile: String) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -271,7 +271,7 @@ async fn given_prefetch_budget(_w: &mut KisekiWorld, _budget: String) {
 async fn given_phase_active_profile(w: &mut KisekiWorld, _phase: String, _profile: String) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -291,7 +291,7 @@ async fn given_pool_hard_budget(_w: &mut KisekiWorld) {
 async fn given_workload_active_workflow(w: &mut KisekiWorld, workload: String, _wf_id: String) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
         w.workflow_names.insert(workload, wf_ref);
@@ -341,7 +341,7 @@ async fn given_sustained_throttled_hints(_w: &mut KisekiWorld, _total: u32, _thr
 async fn given_two_threads_same_handle(w: &mut KisekiWorld, phase_id: u64) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(phase_id));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -364,9 +364,9 @@ async fn given_two_active_workflows(
     // Two concurrent workflows for draining tests.
     let wf1 = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
     let wf2 = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-    w.advisory_table
+    w.legacy.advisory_table
         .declare(wf1, WorkloadProfile::AiTraining, PhaseId(3));
-    w.advisory_table
+    w.legacy.advisory_table
         .declare(wf2, WorkloadProfile::AiTraining, PhaseId(7));
     w.workflow_names.insert(format!("{workload}-wf1"), wf1);
     w.workflow_names.insert(format!("{workload}-wf2"), wf2);
@@ -381,7 +381,7 @@ async fn given_workflow_phase_profile_priority(
 ) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -415,7 +415,7 @@ async fn given_workflow_fan_in_composition(_w: &mut KisekiWorld, _wf: String, _c
 async fn given_active_phase_priority_batch(w: &mut KisekiWorld) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -430,7 +430,7 @@ async fn given_phase_ring_entries(_w: &mut KisekiWorld, _entries: u32) {
 async fn given_current_phase_priority_batch(w: &mut KisekiWorld) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -440,7 +440,7 @@ async fn given_current_phase_priority_batch(w: &mut KisekiWorld) {
 async fn given_workflow_active_bidi_stream(w: &mut KisekiWorld) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -450,7 +450,7 @@ async fn given_workflow_active_bidi_stream(w: &mut KisekiWorld) {
 async fn given_idle_bidi_stream(w: &mut KisekiWorld) {
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -493,7 +493,7 @@ async fn when_native_declare_workflow_table(w: &mut KisekiWorld, step: &Step) {
     }
 
     let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-    w.advisory_table.declare(wf_ref, profile, phase_id);
+    w.legacy.advisory_table.declare(wf_ref, profile, phase_id);
     w.last_workflow_ref = Some(wf_ref);
 }
 
@@ -512,7 +512,7 @@ async fn when_client_performs_workflow_steps(w: &mut KisekiWorld, step: &Step) {
     // DataTable of sequential advisory actions for audit completeness test.
     if w.last_workflow_ref.is_none() {
         let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-        w.advisory_table
+        w.legacy.advisory_table
             .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
         w.last_workflow_ref = Some(wf_ref);
     }
@@ -623,7 +623,7 @@ async fn when_phase_advance_tagged(
     _tag: String,
 ) {
     let wf_ref = w.last_workflow_ref.unwrap();
-    let entry = w.advisory_table.get_mut(&wf_ref).unwrap();
+    let entry = w.legacy.advisory_table.get_mut(&wf_ref).unwrap();
     match entry.advance_phase(PhaseId(phase_id)) {
         Ok(()) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
@@ -633,7 +633,7 @@ async fn when_phase_advance_tagged(
 #[when(regex = r#"^the client calls PhaseAdvance with phase_id (\d+)$"#)]
 async fn when_phase_advance_by_id(w: &mut KisekiWorld, phase_id: u64) {
     let wf_ref = w.last_workflow_ref.unwrap();
-    let entry = w.advisory_table.get_mut(&wf_ref).unwrap();
+    let entry = w.legacy.advisory_table.get_mut(&wf_ref).unwrap();
     match entry.advance_phase(PhaseId(phase_id)) {
         Ok(()) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
@@ -648,7 +648,7 @@ async fn when_advance_many_times(_w: &mut KisekiWorld, _count: u64) {
 #[when("the client calls EndWorkflow")]
 async fn when_end_workflow(w: &mut KisekiWorld) {
     if let Some(wf_ref) = w.last_workflow_ref {
-        w.advisory_table.end(&wf_ref);
+        w.legacy.advisory_table.end(&wf_ref);
     }
 }
 
@@ -682,7 +682,7 @@ async fn when_hint_priority_interactive_read(w: &mut KisekiWorld) {
 #[when(regex = r#"^the client pinned under "(\S+)" calls DeclareWorkflow$"#)]
 async fn when_pinned_client_declare(w: &mut KisekiWorld, _workload: String) {
     let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-    w.advisory_table
+    w.legacy.advisory_table
         .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
     w.last_workflow_ref = Some(wf_ref);
 }
@@ -826,7 +826,7 @@ async fn when_measured_60s(_w: &mut KisekiWorld) {
 async fn when_concurrent_phase_advance(w: &mut KisekiWorld, phase_id: u64) {
     // Simulate concurrent PhaseAdvance — one succeeds, one fails.
     if let Some(wf_ref) = w.last_workflow_ref {
-        if let Some(entry) = w.advisory_table.get_mut(&wf_ref) {
+        if let Some(entry) = w.legacy.advisory_table.get_mut(&wf_ref) {
             match entry.advance_phase(PhaseId(phase_id)) {
                 Ok(()) => {}
                 Err(e) => {
@@ -851,7 +851,7 @@ async fn when_remove_from_allowlist(_w: &mut KisekiWorld, _profile: String) {
 #[when("the client calls DeclareWorkflow with profile ai-training")]
 async fn when_declare_ai_training(w: &mut KisekiWorld) {
     let wf_ref = WorkflowRef(uuid::Uuid::new_v4().into_bytes());
-    w.advisory_table
+    w.legacy.advisory_table
         .declare(wf_ref, WorkloadProfile::AiTraining, PhaseId(1));
     w.last_workflow_ref = Some(wf_ref);
 }
@@ -930,7 +930,7 @@ async fn then_workflow_handle(w: &mut KisekiWorld) {
 async fn then_workflow_scoped(w: &mut KisekiWorld, _workload: String) {
     let wf_ref = w.last_workflow_ref.expect("workflow must exist");
     assert!(
-        w.advisory_table.get(&wf_ref).is_some(),
+        w.legacy.advisory_table.get(&wf_ref).is_some(),
         "workflow should be retrievable from advisory table"
     );
 }
@@ -944,7 +944,7 @@ async fn then_audit_event_written(_w: &mut KisekiWorld, _event: String) {
 async fn then_current_phase(w: &mut KisekiWorld, _phase: String) {
     let wf_ref = w.last_workflow_ref.expect("workflow must exist");
     assert!(
-        w.advisory_table.get(&wf_ref).is_some(),
+        w.legacy.advisory_table.get(&wf_ref).is_some(),
         "workflow should still be active to check phase"
     );
     assert!(
@@ -999,7 +999,7 @@ async fn then_phase_becomes(w: &mut KisekiWorld, _phase: String) {
     );
     let wf_ref = w.last_workflow_ref.expect("workflow must exist");
     assert!(
-        w.advisory_table.get(&wf_ref).is_some(),
+        w.legacy.advisory_table.get(&wf_ref).is_some(),
         "workflow should still be active after phase advance"
     );
 }
@@ -1018,7 +1018,7 @@ async fn then_audit_event(_w: &mut KisekiWorld, _event: String) {
 async fn then_wf_id_rejected(w: &mut KisekiWorld) {
     if let Some(wf_ref) = w.last_workflow_ref {
         assert!(
-            w.advisory_table.get(&wf_ref).is_none(),
+            w.legacy.advisory_table.get(&wf_ref).is_none(),
             "ended workflow should not be in advisory table"
         );
     }
@@ -1028,7 +1028,7 @@ async fn then_wf_id_rejected(w: &mut KisekiWorld) {
 async fn then_telemetry_closed(w: &mut KisekiWorld) {
     if let Some(wf_ref) = w.last_workflow_ref {
         assert!(
-            w.advisory_table.get(&wf_ref).is_none(),
+            w.legacy.advisory_table.get(&wf_ref).is_none(),
             "workflow must be ended for telemetry streams to close"
         );
     }
@@ -1038,7 +1038,7 @@ async fn then_telemetry_closed(w: &mut KisekiWorld) {
 async fn then_steering_dropped(w: &mut KisekiWorld) {
     if let Some(wf_ref) = w.last_workflow_ref {
         assert!(
-            w.advisory_table.get(&wf_ref).is_none(),
+            w.legacy.advisory_table.get(&wf_ref).is_none(),
             "steering state should be dropped after workflow end"
         );
     }
@@ -1615,7 +1615,7 @@ async fn then_opaque_handle(w: &mut KisekiWorld) {
         "workflow handle must be 128 bits (16 bytes)"
     );
     assert!(
-        w.advisory_table.get(&wf_ref).is_some(),
+        w.legacy.advisory_table.get(&wf_ref).is_some(),
         "workflow handle should resolve in advisory table"
     );
 }

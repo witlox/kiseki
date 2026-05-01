@@ -37,7 +37,7 @@ async fn given_admin_auth(w: &mut KisekiWorld) {
 
 #[when(regex = r#"^the admin adds device "([^"]*)" to pool "([^"]*)"$"#)]
 async fn when_add_device(w: &mut KisekiWorld, dev_path: String, pool: String) {
-    if let Some(p) = w.chunk_store.pool_mut(&pool) {
+    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.devices.push(PoolDevice {
             id: dev_path.clone(),
             online: true,
@@ -49,7 +49,7 @@ async fn when_add_device(w: &mut KisekiWorld, dev_path: String, pool: String) {
 
 #[then("the device appears in the pool device list")]
 async fn then_device_in_list(w: &mut KisekiWorld) {
-    let pool = w.chunk_store.pool("fast-nvme").unwrap();
+    let pool = w.legacy.chunk_store.pool("fast-nvme").unwrap();
     assert!(pool.devices.len() > 6, "device should be added");
 }
 
@@ -124,12 +124,12 @@ async fn then_consistent(w: &mut KisekiWorld) {
 async fn given_chunk_ec_fragments(w: &mut KisekiWorld, _chunk: String, _devices: String) {
     let env = dev_envelope(0xc1);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
 }
 
 #[when(regex = r#"^device "([^"]*)" fails \(unresponsive\)$"#)]
 async fn when_device_fails(w: &mut KisekiWorld, dev: String) {
-    if let Some(pool) = w.chunk_store.pool_mut("fast-nvme") {
+    if let Some(pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
         pool.set_device_online(&dev, false);
     }
 }
@@ -145,7 +145,7 @@ async fn then_ec_repair(w: &mut KisekiWorld, _dev: String) {
 #[then(regex = r#"^chunk "([^"]*)" is reconstructed from fragments on \[([^\]]*)\]$"#)]
 async fn then_chunk_reconstructed(w: &mut KisekiWorld, _chunk: String, _devices: String) {
     if let Some(id) = w.last_chunk_id {
-        let result = w.chunk_store.read_chunk_ec(&id);
+        let result = w.legacy.chunk_store.read_chunk_ec(&id);
         assert!(
             result.is_ok(),
             "chunk should be reconstructable with 1 device offline"
@@ -187,10 +187,10 @@ async fn then_remove_rejected(w: &mut KisekiWorld) {
 #[when(regex = r"^a write brings it to (\d+)%$")]
 async fn when_write_brings(w: &mut KisekiWorld, pct: u64) {
     // Simulate capacity increase by adjusting used_bytes.
-    if let Some(p) = w.chunk_store.pool_mut("fast-nvme") {
+    if let Some(p) = w.legacy.chunk_store.pool_mut("fast-nvme") {
         p.used_bytes = p.capacity_bytes * pct / 100;
     }
-    if let Some(p) = w.chunk_store.pool_mut("bulk-hdd") {
+    if let Some(p) = w.legacy.chunk_store.pool_mut("bulk-hdd") {
         p.used_bytes = p.capacity_bytes * pct / 100;
     }
 }
@@ -198,7 +198,7 @@ async fn when_write_brings(w: &mut KisekiWorld, pct: u64) {
 #[then(regex = r#"^the pool health transitions to "([^"]*)"$"#)]
 async fn then_pool_health(w: &mut KisekiWorld, expected: String) {
     // Check NVMe thresholds for fast-nvme.
-    if let Some(p) = w.chunk_store.pool("fast-nvme") {
+    if let Some(p) = w.legacy.chunk_store.pool("fast-nvme") {
         let pct = ((p.used_bytes as f64 / p.capacity_bytes as f64) * 100.0) as u8;
         let health = CapacityThresholds::nvme().health(pct);
         if health.to_string() == expected {
@@ -206,7 +206,7 @@ async fn then_pool_health(w: &mut KisekiWorld, expected: String) {
         }
     }
     // Check HDD thresholds for bulk-hdd.
-    if let Some(p) = w.chunk_store.pool("bulk-hdd") {
+    if let Some(p) = w.legacy.chunk_store.pool("bulk-hdd") {
         let pct = ((p.used_bytes as f64 / p.capacity_bytes as f64) * 100.0) as u8;
         let health = CapacityThresholds::hdd().health(pct);
         assert_eq!(health.to_string(), expected);
@@ -237,7 +237,7 @@ async fn then_redirect(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^the pool health is still "([^"]*)"$"#)]
 async fn then_pool_still(w: &mut KisekiWorld, expected: String) {
-    if let Some(p) = w.chunk_store.pool("bulk-hdd") {
+    if let Some(p) = w.legacy.chunk_store.pool("bulk-hdd") {
         let pct = ((p.used_bytes as f64 / p.capacity_bytes as f64) * 100.0) as u8;
         let health = CapacityThresholds::hdd().health(pct);
         assert_eq!(health.to_string(), expected);
@@ -248,7 +248,7 @@ async fn then_pool_still(w: &mut KisekiWorld, expected: String) {
 
 #[given(regex = r#"^pool "([^"]*)" is at (\d+)% \(Full for NVMe\)$"#)]
 async fn given_pool_full(w: &mut KisekiWorld, pool: String, pct: u64) {
-    if let Some(p) = w.chunk_store.pool_mut(&pool) {
+    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.used_bytes = p.capacity_bytes * pct / 100;
     }
 }
@@ -256,7 +256,7 @@ async fn given_pool_full(w: &mut KisekiWorld, pool: String, pct: u64) {
 #[when("a client attempts to write a chunk")]
 async fn when_client_writes(w: &mut KisekiWorld) {
     // Check pool health before writing — Full rejects with ENOSPC.
-    if let Some(p) = w.chunk_store.pool("fast-nvme") {
+    if let Some(p) = w.legacy.chunk_store.pool("fast-nvme") {
         let pct = ((p.used_bytes as f64 / p.capacity_bytes as f64) * 100.0) as u8;
         let health = CapacityThresholds::nvme().health(pct);
         if health == PoolHealth::Full {
@@ -265,7 +265,7 @@ async fn when_client_writes(w: &mut KisekiWorld) {
         }
     }
     let env = dev_envelope(0xf0);
-    match w.chunk_store.write_chunk(env, "fast-nvme") {
+    match w.legacy.chunk_store.write_chunk(env, "fast-nvme") {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -281,8 +281,8 @@ async fn then_enospc(w: &mut KisekiWorld) {
 #[given(regex = r#"^pool "([^"]*)" is Critical$"#)]
 async fn given_pool_critical(w: &mut KisekiWorld, pool: String) {
     // Add pool if not already present.
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool,
                 DurabilityStrategy::ErasureCoding {
@@ -294,15 +294,15 @@ async fn given_pool_critical(w: &mut KisekiWorld, pool: String) {
             .with_devices(6),
         );
     }
-    if let Some(p) = w.chunk_store.pool_mut(&pool) {
+    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.used_bytes = p.capacity_bytes * 90 / 100; // Above critical.
     }
 }
 
 #[given(regex = r#"^pool "([^"]*)" is Healthy$"#)]
 async fn given_pool_healthy(w: &mut KisekiWorld, pool: String) {
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool,
                 DurabilityStrategy::ErasureCoding {
@@ -323,7 +323,7 @@ async fn when_chunk_targets(w: &mut KisekiWorld, _pool: String) {
 
 #[then(regex = r#"^the placement engine redirects to "([^"]*)"$"#)]
 async fn then_redirects_to(w: &mut KisekiWorld, target: String) {
-    assert!(w.chunk_store.pool(&target).is_some());
+    assert!(w.legacy.chunk_store.pool(&target).is_some());
 }
 
 #[then("the chunk is never placed on a HDD pool")]
@@ -335,7 +335,7 @@ async fn then_no_hdd(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^pool "([^"]*)" is the only NVMe pool and is Critical$"#)]
 async fn given_only_nvme_critical(w: &mut KisekiWorld, pool: String) {
-    if let Some(p) = w.chunk_store.pool_mut(&pool) {
+    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.used_bytes = p.capacity_bytes * 90 / 100;
     }
 }
@@ -422,20 +422,20 @@ async fn then_audit_entry(w: &mut KisekiWorld) {
 async fn when_chunk_ec_write(w: &mut KisekiWorld, pool: String) {
     let env = dev_envelope(0xe0);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, &pool).unwrap();
+    w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
 }
 
 #[then("6 fragments are created")]
 async fn then_six_fragments(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).unwrap();
+    let ec = w.legacy.chunk_store.ec_meta(&id).unwrap();
     assert_eq!(ec.fragments.len(), 6);
 }
 
 #[then("each fragment is on a different device")]
 async fn then_different_devices(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).unwrap();
+    let ec = w.legacy.chunk_store.ec_meta(&id).unwrap();
     let mut indices = ec.device_indices.clone();
     indices.sort_unstable();
     indices.dedup();
@@ -451,7 +451,7 @@ async fn then_no_sharing(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^pool "([^"]*)" has only (\d+) healthy devices$"#)]
 async fn given_few_devices(w: &mut KisekiWorld, pool: String, n: usize) {
-    if let Some(p) = w.chunk_store.pool_mut(&pool) {
+    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
         // Keep only n devices online.
         for (i, d) in p.devices.iter_mut().enumerate() {
             d.online = i < n;
@@ -467,7 +467,7 @@ async fn given_ec_requires(w: &mut KisekiWorld) {
 #[when("a chunk write is attempted")]
 async fn when_chunk_write_attempted(w: &mut KisekiWorld) {
     let env = dev_envelope(0xe1);
-    match w.chunk_store.write_chunk(env, "fast-nvme") {
+    match w.legacy.chunk_store.write_chunk(env, "fast-nvme") {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }

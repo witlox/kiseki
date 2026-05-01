@@ -177,7 +177,7 @@ async fn when_idp_token(_w: &mut KisekiWorld) {}
 async fn then_idp_validated(w: &mut KisekiWorld) {
     // Token validation uses the IAM subsystem. Verify the control plane
     // tenant store has the tenant registered (IdP config lives there).
-    let org = w.control_tenant_store.get_org("org-pharma");
+    let org = w.control.tenant_store.get_org("org-pharma");
     assert!(org.is_ok(), "tenant must exist for IdP validation");
 }
 
@@ -237,7 +237,7 @@ async fn given_no_idp(w: &mut KisekiWorld, t: String) {
 async fn then_org_identity(w: &mut KisekiWorld) {
     // Without IdP, org-level identity is sufficient for connection.
     // Verify the tenant exists in the control-plane store.
-    let org = w.control_tenant_store.get_org("org-pharma");
+    let org = w.control.tenant_store.get_org("org-pharma");
     assert!(org.is_ok(), "org-level identity should be sufficient");
     assert!(w.last_error.is_none(), "connection should be accepted");
 }
@@ -297,7 +297,7 @@ async fn then_cluster_access(w: &mut KisekiWorld) {
     // Cluster admin has access to cluster-level operations via the control plane.
     // Verify the StorageAdminService is accessible.
     assert!(
-        w.control_plane_up,
+        w.control.plane_up,
         "control plane should be up for admin access"
     );
 }
@@ -337,7 +337,7 @@ async fn then_admin_rejected(w: &mut KisekiWorld) {
     // On the data fabric, only tenant certificates are valid.
     // Verify the data fabric requires tenant identity.
     assert!(
-        w.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()),
+        w.legacy.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()),
         "data fabric requires tenant identity, not admin creds"
     );
 }
@@ -345,7 +345,7 @@ async fn then_admin_rejected(w: &mut KisekiWorld) {
 #[then("admin must use the Control Plane API on the management network")]
 async fn then_use_mgmt(w: &mut KisekiWorld) {
     // The control plane is the only path for admin operations.
-    assert!(w.control_plane_up, "admin must use the control plane API");
+    assert!(w.control.plane_up, "admin must use the control plane API");
 }
 
 // === Scenario: NFS gateway auth ===
@@ -364,7 +364,7 @@ async fn then_gw_validates(w: &mut KisekiWorld) {
     // Gateway validates identity against its configured tenant.
     // The NFS context is bound to a specific tenant_id at creation.
     assert!(
-        w.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()),
+        w.legacy.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()),
         "gateway should be bound to a tenant"
     );
 }
@@ -373,14 +373,14 @@ async fn then_gw_validates(w: &mut KisekiWorld) {
 async fn then_maps_identity(w: &mut KisekiWorld) {
     // Identity mapping: NFS client identity → tenant authorization model.
     // Verify the tenant exists in the control plane for authorization.
-    let org = w.control_tenant_store.get_org("org-pharma");
+    let org = w.control.tenant_store.get_org("org-pharma");
     assert!(org.is_ok(), "tenant must exist for identity mapping");
 }
 
 #[then("the NFS session is established")]
 async fn then_nfs_session(w: &mut KisekiWorld) {
     // NFS session: gateway can serve NFS operations after authentication.
-    let entries = w.nfs_ctx.readdir();
+    let entries = w.legacy.nfs_ctx.readdir();
     // Successful readdir means the NFS session is established.
     assert!(w.last_error.is_none());
 }
@@ -397,7 +397,7 @@ async fn when_s3_validate(_w: &mut KisekiWorld, _gw: String) {}
 async fn then_key_resolved(w: &mut KisekiWorld) {
     // Access key resolution maps to a tenant ID.
     // Verify the tenant store can look up the org.
-    let org = w.control_tenant_store.get_org("org-pharma");
+    let org = w.control.tenant_store.get_org("org-pharma");
     assert!(org.is_ok(), "access key should resolve to a known tenant");
 }
 
@@ -545,7 +545,7 @@ async fn then_wf_rejected(w: &mut KisekiWorld) {
     // A stolen workflow_id won't be found in the caller's scope.
     // Verify the workflow table rejects lookups for non-existent workflows.
     let fake_ref = kiseki_common::advisory::WorkflowRef([0x99; 16]);
-    let found = w.advisory_table.get(&fake_ref);
+    let found = w.legacy.advisory_table.get(&fake_ref);
     assert!(
         found.is_none(),
         "stolen workflow_id should not be found in scope"
@@ -559,8 +559,8 @@ async fn then_uniform_error(w: &mut KisekiWorld) {
     // Constant-time rejection: same error shape for stolen vs non-existent IDs.
     let fake_ref1 = kiseki_common::advisory::WorkflowRef([0x99; 16]);
     let fake_ref2 = kiseki_common::advisory::WorkflowRef([0xaa; 16]);
-    let r1 = w.advisory_table.get(&fake_ref1);
-    let r2 = w.advisory_table.get(&fake_ref2);
+    let r1 = w.legacy.advisory_table.get(&fake_ref1);
+    let r2 = w.legacy.advisory_table.get(&fake_ref2);
     // Both return None — identical error shape.
     assert_eq!(
         r1.is_none(),
@@ -573,7 +573,7 @@ async fn then_uniform_error(w: &mut KisekiWorld) {
 async fn then_no_info_leaked(w: &mut KisekiWorld, _wl: String) {
     // The lookup returns None with no distinguishing information.
     let fake_ref = kiseki_common::advisory::WorkflowRef([0x99; 16]);
-    let result = w.advisory_table.get(&fake_ref);
+    let result = w.legacy.advisory_table.get(&fake_ref);
     assert!(
         result.is_none(),
         "no workflow state information should be leaked"

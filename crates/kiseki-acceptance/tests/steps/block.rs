@@ -34,15 +34,15 @@ const TB: u64 = 1024 * GB;
 
 /// Helper: ensure a file-backed device is initialized in a temp dir.
 fn ensure_device(w: &mut KisekiWorld, size: u64) {
-    if w.block_device.is_some() {
+    if w.block.device.is_some() {
         return;
     }
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join("test-block.dev");
     let dev = FileBackedDevice::init(&path, size).expect("init device");
-    w.block_device_path = Some(path);
-    w.block_device = Some(Box::new(dev));
-    w.block_temp_dir = Some(dir);
+    w.block.device_path = Some(path);
+    w.block.device = Some(Box::new(dev));
+    w.block.temp_dir = Some(dir);
 }
 
 // ============================================================
@@ -69,21 +69,21 @@ async fn given_raw_block_device(w: &mut KisekiWorld, _path: String, tb: u64) {
     let path = dir.path().join("raw-block.dev");
     // Use 64MB to keep tests fast; the superblock layout is the same.
     let dev = FileBackedDevice::init(&path, 64 * MB).expect("init device");
-    w.block_device_path = Some(path);
-    w.block_device = Some(Box::new(dev));
-    w.block_temp_dir = Some(dir);
+    w.block.device_path = Some(path);
+    w.block.device = Some(Box::new(dev));
+    w.block.temp_dir = Some(dir);
     w.last_error = None;
 }
 
 #[when("the device is initialized for Kiseki")]
 async fn when_device_initialized(w: &mut KisekiWorld) {
     // Already initialized in the Given step; verify it's ready.
-    assert!(w.block_device.is_some(), "device must be initialized");
+    assert!(w.block.device.is_some(), "device must be initialized");
 }
 
 #[then(regex = r#"^a superblock is written at offset 0 with magic "([^"]*)"$"#)]
 async fn then_superblock_magic(w: &mut KisekiWorld, _magic_str: String) {
-    let path = w.block_device_path.as_ref().expect("device path set");
+    let path = w.block.device_path.as_ref().expect("device path set");
     let mut f = std::fs::File::open(path).expect("open device file");
     let mut buf = [0u8; 8];
     f.read_exact(&mut buf).expect("read magic");
@@ -92,7 +92,7 @@ async fn then_superblock_magic(w: &mut KisekiWorld, _magic_str: String) {
 
 #[then("a primary allocation bitmap is created after the superblock")]
 async fn then_primary_bitmap(w: &mut KisekiWorld) {
-    let path = w.block_device_path.as_ref().expect("device path set");
+    let path = w.block.device_path.as_ref().expect("device path set");
     let mut f = std::fs::File::open(path).expect("open device file");
     let mut sb_buf = vec![0u8; 4096];
     f.read_exact(&mut sb_buf).unwrap();
@@ -107,7 +107,7 @@ async fn then_primary_bitmap(w: &mut KisekiWorld) {
 
 #[then("a mirror allocation bitmap is created after the primary")]
 async fn then_mirror_bitmap(w: &mut KisekiWorld) {
-    let path = w.block_device_path.as_ref().expect("device path set");
+    let path = w.block.device_path.as_ref().expect("device path set");
     let mut f = std::fs::File::open(path).expect("open device file");
     let mut sb_buf = vec![0u8; 4096];
     f.read_exact(&mut sb_buf).unwrap();
@@ -122,7 +122,7 @@ async fn then_mirror_bitmap(w: &mut KisekiWorld) {
 
 #[then("all bitmap bits are cleared (entire data region is free)")]
 async fn then_all_bits_cleared(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let bitmap = dev.bitmap_bytes();
     let all_zero = bitmap.iter().all(|&b| b == 0);
     assert!(all_zero, "bitmap must be all zeros (all free)");
@@ -130,7 +130,7 @@ async fn then_all_bits_cleared(w: &mut KisekiWorld) {
 
 #[then("the device is ready for extent allocation")]
 async fn then_device_ready(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, total) = dev.capacity();
     assert_eq!(used, 0, "no bytes should be used");
     assert!(total > 0, "device must have capacity");
@@ -146,7 +146,7 @@ async fn given_already_initialized(w: &mut KisekiWorld) {
 #[when("initialization is attempted without --force")]
 async fn when_init_without_force(w: &mut KisekiWorld) {
     let path = w
-        .block_device_path
+        .block.device_path
         .as_ref()
         .expect("device path set")
         .clone();
@@ -176,7 +176,7 @@ async fn then_rejected_with(w: &mut KisekiWorld, expected_msg: String) {
 #[then("no data is overwritten")]
 async fn then_no_data_overwritten(w: &mut KisekiWorld) {
     // The device still has its original superblock — verify by reopening.
-    let path = w.block_device_path.as_ref().expect("device path set");
+    let path = w.block.device_path.as_ref().expect("device path set");
     let reopened = FileBackedDevice::open(path);
     assert!(reopened.is_ok(), "device should still be openable");
 }
@@ -200,15 +200,15 @@ async fn given_xfs_filesystem(w: &mut KisekiWorld) {
     f.sync_all().unwrap();
     drop(f);
 
-    w.block_device_path = Some(path);
-    w.block_temp_dir = Some(dir);
-    w.block_device = None;
+    w.block.device_path = Some(path);
+    w.block.temp_dir = Some(dir);
+    w.block.device = None;
 }
 
 #[when("initialization is attempted")]
 async fn when_init_attempted(w: &mut KisekiWorld) {
     let path = w
-        .block_device_path
+        .block.device_path
         .as_ref()
         .expect("device path set")
         .clone();
@@ -231,7 +231,7 @@ async fn when_init_attempted(w: &mut KisekiWorld) {
 
     match FileBackedDevice::init(&path, 64 * MB) {
         Ok(dev) => {
-            w.block_device = Some(Box::new(dev));
+            w.block.device = Some(Box::new(dev));
             w.last_error = None;
         }
         Err(e) => w.last_error = Some(e.to_string()),
@@ -253,7 +253,7 @@ async fn then_error_includes_fs_type(w: &mut KisekiWorld) {
 #[when("initialization is attempted with --force")]
 async fn when_force_init(w: &mut KisekiWorld) {
     let path = w
-        .block_device_path
+        .block.device_path
         .as_ref()
         .expect("device path set")
         .clone();
@@ -261,7 +261,7 @@ async fn when_force_init(w: &mut KisekiWorld) {
     let _ = std::fs::remove_file(&path);
     match FileBackedDevice::init(&path, 64 * MB) {
         Ok(dev) => {
-            w.block_device = Some(Box::new(dev));
+            w.block.device = Some(Box::new(dev));
             w.last_error = None;
         }
         Err(e) => w.last_error = Some(e.to_string()),
@@ -270,8 +270,8 @@ async fn when_force_init(w: &mut KisekiWorld) {
 
 #[then("the device is re-initialized with a new superblock")]
 async fn then_re_initialized(w: &mut KisekiWorld) {
-    assert!(w.block_device.is_some(), "device must be re-initialized");
-    let dev = w.block_device.as_ref().unwrap();
+    assert!(w.block.device.is_some(), "device must be re-initialized");
+    let dev = w.block.device.as_ref().unwrap();
     let (used, total) = dev.capacity();
     assert_eq!(used, 0, "re-initialized device should have 0 used bytes");
     assert!(total > 0, "re-initialized device should have capacity");
@@ -279,7 +279,7 @@ async fn then_re_initialized(w: &mut KisekiWorld) {
 
 #[then("all previous data is lost")]
 async fn then_previous_data_lost(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let bitmap = dev.bitmap_bytes();
     assert!(
         bitmap.iter().all(|&b| b == 0),
@@ -297,7 +297,7 @@ async fn then_previous_data_lost(w: &mut KisekiWorld) {
 async fn given_device_at_path(w: &mut KisekiWorld, path: String) {
     // For auto-detection tests we probe characteristics; no actual device needed.
     // Store the path for the When step.
-    w.block_device_path = Some(std::path::PathBuf::from(path));
+    w.block.device_path = Some(std::path::PathBuf::from(path));
 }
 
 #[when("device characteristics are probed")]
@@ -375,7 +375,7 @@ async fn then_supports_trim(w: &mut KisekiWorld, val: String) {
 
 #[given(regex = r#"^a device at "([^"]*)" with rotational=(\d+)$"#)]
 async fn given_device_rotational(w: &mut KisekiWorld, path: String, _rot: u32) {
-    w.block_device_path = Some(std::path::PathBuf::from(path));
+    w.block.device_path = Some(std::path::PathBuf::from(path));
 }
 
 #[given(regex = r#"^a device with "([^"]*)" in model string$"#)]
@@ -392,12 +392,12 @@ async fn given_file_path(w: &mut KisekiWorld, _path: String) {
 
 #[when("a file-backed device is opened")]
 async fn when_file_backed_opened(w: &mut KisekiWorld) {
-    assert!(w.block_device.is_some(), "device must be initialized");
+    assert!(w.block.device.is_some(), "device must be initialized");
 }
 
 #[then(regex = r#"^alignment is enforced at (\d+) bytes \(simulated\)$"#)]
 async fn then_alignment_enforced(w: &mut KisekiWorld, alignment: u32) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     assert_eq!(
         dev.characteristics().physical_block_size,
         alignment,
@@ -408,7 +408,7 @@ async fn then_alignment_enforced(w: &mut KisekiWorld, alignment: u32) {
 
 #[then("all DeviceBackend operations work identically to raw block")]
 async fn then_operations_work(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     // Verify alloc, write, read, free all work.
     let data = b"BDD round-trip test";
     let extent = dev.alloc(data.len() as u64).expect("alloc");
@@ -439,10 +439,10 @@ async fn given_initialized_device_capacity(
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join("alloc-test.dev");
     let dev = FileBackedDevice::init(&path, actual_size).expect("init device");
-    w.block_device_path = Some(path);
-    w.block_device = Some(Box::new(dev));
-    w.block_temp_dir = Some(dir);
-    w.block_extents.clear();
+    w.block.device_path = Some(path);
+    w.block.device = Some(Box::new(dev));
+    w.block.temp_dir = Some(dir);
+    w.block.extents.clear();
 }
 
 #[when(regex = r#"^(\d+)\s*(KB|MB|bytes) is allocated$"#)]
@@ -453,11 +453,11 @@ async fn when_size_allocated(w: &mut KisekiWorld, size: u64, unit: String) {
         "bytes" => size,
         _ => size,
     };
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     match dev.alloc(bytes) {
         Ok(extent) => {
             w.last_extent = Some(extent);
-            w.block_extents.push(extent);
+            w.block.extents.push(extent);
             w.last_error = None;
         }
         Err(e) => {
@@ -489,7 +489,7 @@ async fn then_extent_length(w: &mut KisekiWorld, _size: u64, _unit: String, bloc
 
 #[then("the corresponding bitmap bits are marked allocated")]
 async fn then_bitmap_bits_allocated(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     assert!(used > 0, "used bytes must be > 0 after allocation");
 }
@@ -524,19 +524,19 @@ async fn given_device_nearly_full(w: &mut KisekiWorld, pct: u64) {
         match dev.alloc(4096) {
             Ok(ext) => {
                 allocated += ext.length;
-                w.block_extents.push(ext);
+                w.block.extents.push(ext);
             }
             Err(_) => break,
         }
     }
-    w.block_device_path = Some(path);
-    w.block_device = Some(Box::new(dev));
-    w.block_temp_dir = Some(dir);
+    w.block.device_path = Some(path);
+    w.block.device = Some(Box::new(dev));
+    w.block.temp_dir = Some(dir);
 }
 
 #[when("an allocation exceeding remaining free space is attempted")]
 async fn when_alloc_exceeding(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (_, total) = dev.capacity();
     // Try to allocate more than what's available.
     match dev.alloc(total) {
@@ -571,27 +571,27 @@ async fn given_extent_allocated(w: &mut KisekiWorld, size: u64, unit: String) {
         "MB" => size * MB,
         _ => size,
     };
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let extent = dev.alloc(bytes).expect("alloc for free test");
     w.last_extent = Some(extent);
-    w.block_extents.push(extent);
+    w.block.extents.push(extent);
 }
 
 #[when("the extent is freed")]
 async fn when_extent_freed(w: &mut KisekiWorld) {
     let extent = w.last_extent.expect("must have an extent to free");
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     dev.free(&extent).expect("free extent");
     // Remove from tracked extents.
-    w.block_extents.retain(|e| e != &extent);
+    w.block.extents.retain(|e| e != &extent);
     w.last_extent = None;
 }
 
 #[then("the corresponding bitmap bits are cleared")]
 async fn then_bitmap_bits_cleared(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     // If no extents remain allocated, used should be 0.
-    if w.block_extents.is_empty() {
+    if w.block.extents.is_empty() {
         let (used, _) = dev.capacity();
         assert_eq!(used, 0, "all bits should be cleared when nothing allocated");
     }
@@ -600,7 +600,7 @@ async fn then_bitmap_bits_cleared(w: &mut KisekiWorld) {
 #[then("the free-list gains a new free extent")]
 async fn then_freelist_gained(w: &mut KisekiWorld) {
     // After freeing, the device should have more free space.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, total) = dev.capacity();
     assert!(used < total, "free space must exist after free");
 }
@@ -608,9 +608,9 @@ async fn then_freelist_gained(w: &mut KisekiWorld) {
 #[then(regex = r#"^device used_bytes decreases by (\d+)(KB|MB)$"#)]
 async fn then_used_decreases(w: &mut KisekiWorld, _size: u64, _unit: String) {
     // After freeing, used bytes should reflect fewer allocations.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
-    if w.block_extents.is_empty() {
+    if w.block.extents.is_empty() {
         assert_eq!(used, 0, "no extents -> 0 used bytes");
     }
 }
@@ -623,32 +623,32 @@ async fn given_three_extents(w: &mut KisekiWorld) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join("coalesce-test.dev");
     let dev = FileBackedDevice::init(&path, 64 * MB).expect("init device");
-    w.block_device_path = Some(path);
-    w.block_device = Some(Box::new(dev));
-    w.block_temp_dir = Some(dir);
-    w.block_extents.clear();
+    w.block.device_path = Some(path);
+    w.block.device = Some(Box::new(dev));
+    w.block.temp_dir = Some(dir);
+    w.block.extents.clear();
 
-    let dev = w.block_device.as_ref().unwrap();
+    let dev = w.block.device.as_ref().unwrap();
     for _ in 0..3 {
         let ext = dev.alloc(64 * KB).expect("alloc 64KB");
-        w.block_extents.push(ext);
+        w.block.extents.push(ext);
     }
 }
 
 #[when("the middle extent is freed")]
 async fn when_middle_freed(w: &mut KisekiWorld) {
-    assert!(w.block_extents.len() >= 3, "need at least 3 extents");
-    let middle = w.block_extents[1];
-    let dev = w.block_device.as_ref().expect("device exists");
+    assert!(w.block.extents.len() >= 3, "need at least 3 extents");
+    let middle = w.block.extents[1];
+    let dev = w.block.device.as_ref().expect("device exists");
     dev.free(&middle).expect("free middle extent");
-    w.block_extents.remove(1);
+    w.block.extents.remove(1);
 }
 
 #[then(regex = r#"^the free-list contains one (\d+)(KB|MB) free extent$"#)]
 async fn then_freelist_contains_one(w: &mut KisekiWorld, _size: u64, _unit: String) {
     // After freeing the middle, there's a single free chunk in the middle.
     // We verify the device reports the freed space.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, total) = dev.capacity();
     let free = total - used;
     assert!(free > 0, "some space must be free");
@@ -656,11 +656,11 @@ async fn then_freelist_contains_one(w: &mut KisekiWorld, _size: u64, _unit: Stri
 
 #[when("the first extent is freed")]
 async fn when_first_freed(w: &mut KisekiWorld) {
-    assert!(!w.block_extents.is_empty(), "need at least 1 extent");
-    let first = w.block_extents[0];
-    let dev = w.block_device.as_ref().expect("device exists");
+    assert!(!w.block.extents.is_empty(), "need at least 1 extent");
+    let first = w.block.extents[0];
+    let dev = w.block.device.as_ref().expect("device exists");
     dev.free(&first).expect("free first extent");
-    w.block_extents.remove(0);
+    w.block.extents.remove(0);
 }
 
 #[then(regex = r#"^the two adjacent free extents merge into one (\d+)(KB|MB) extent$"#)]
@@ -670,7 +670,7 @@ async fn then_two_merged(w: &mut KisekiWorld, size: u64, unit: String) {
         "MB" => size * MB,
         _ => size,
     };
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, total) = dev.capacity();
     let free = total - used;
     assert!(
@@ -683,16 +683,16 @@ async fn then_two_merged(w: &mut KisekiWorld, size: u64, unit: String) {
 
 #[when("the third extent is freed")]
 async fn when_third_freed(w: &mut KisekiWorld) {
-    assert!(!w.block_extents.is_empty(), "need at least 1 extent");
-    let last = w.block_extents[0]; // After removing first and middle, third is at index 0.
-    let dev = w.block_device.as_ref().expect("device exists");
+    assert!(!w.block.extents.is_empty(), "need at least 1 extent");
+    let last = w.block.extents[0]; // After removing first and middle, third is at index 0.
+    let dev = w.block.device.as_ref().expect("device exists");
     dev.free(&last).expect("free third extent");
-    w.block_extents.remove(0);
+    w.block.extents.remove(0);
 }
 
 #[then(regex = r#"^all three merge into one (\d+)(KB|MB) extent$"#)]
 async fn then_all_three_merged(w: &mut KisekiWorld, _size: u64, _unit: String) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _total) = dev.capacity();
     // All extents freed — used should be 0.
     assert_eq!(
@@ -710,10 +710,10 @@ async fn given_max_extent_16mb(w: &mut KisekiWorld) {
     let path = dir.path().join("split-test.dev");
     // Need at least 32MB data region; use 64MB device.
     let dev = FileBackedDevice::init(&path, 64 * MB).expect("init device");
-    w.block_device_path = Some(path);
-    w.block_device = Some(Box::new(dev));
-    w.block_temp_dir = Some(dir);
-    w.block_extents.clear();
+    w.block.device_path = Some(path);
+    w.block.device = Some(Box::new(dev));
+    w.block.temp_dir = Some(dir);
+    w.block.extents.clear();
 }
 
 #[when(regex = r#"^(\d+)(MB|KB) is requested$"#)]
@@ -723,15 +723,15 @@ async fn when_large_requested(w: &mut KisekiWorld, size: u64, unit: String) {
         "KB" => size * KB,
         _ => size,
     };
-    let dev = w.block_device.as_ref().expect("device exists");
-    w.block_extents.clear();
+    let dev = w.block.device.as_ref().expect("device exists");
+    w.block.extents.clear();
     let mut remaining = bytes;
     while remaining > 0 {
         match dev.alloc(remaining) {
             Ok(ext) => {
                 let used = ext.length.min(remaining);
                 remaining = remaining.saturating_sub(used);
-                w.block_extents.push(ext);
+                w.block.extents.push(ext);
                 if remaining == 0 {
                     break;
                 }
@@ -744,19 +744,19 @@ async fn when_large_requested(w: &mut KisekiWorld, size: u64, unit: String) {
 #[then(regex = r#"^two extents of (\d+)(MB|KB) each are allocated$"#)]
 async fn then_two_extents(w: &mut KisekiWorld, _size: u64, _unit: String) {
     assert!(
-        w.block_extents.len() >= 2,
+        w.block.extents.len() >= 2,
         "expected at least 2 extents, got {}",
-        w.block_extents.len()
+        w.block.extents.len()
     );
 }
 
 #[then(regex = r#"^both are returned as a Vec<Extent>$"#)]
 async fn then_returned_as_vec(w: &mut KisekiWorld) {
     assert!(
-        w.block_extents.len() >= 2,
+        w.block.extents.len() >= 2,
         "extents vec should have >= 2 elements"
     );
-    for ext in &w.block_extents {
+    for ext in &w.block.extents {
         assert!(ext.length > 0, "each extent must have positive length");
     }
 }
@@ -777,7 +777,7 @@ async fn when_test_data_written(w: &mut KisekiWorld, size: u64, unit: String) {
         "KB" => size * KB,
         _ => size,
     };
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let data: Vec<u8> = (0..bytes).map(|i| (i % 256) as u8).collect();
     let extent = dev.alloc(bytes).expect("alloc for write");
     dev.write(&extent, &data).expect("write data");
@@ -788,7 +788,7 @@ async fn when_test_data_written(w: &mut KisekiWorld, size: u64, unit: String) {
 #[when("the data is read back from the same extent")]
 async fn when_data_read_back(w: &mut KisekiWorld) {
     let extent = w.last_extent.expect("must have extent");
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let read_back = dev.read(&extent).expect("read data");
     // Stash in a separate field — we'll compare against last_read_data.
     let original = w.last_read_data.take().expect("original data");
@@ -801,7 +801,7 @@ async fn when_data_read_back(w: &mut KisekiWorld) {
 async fn then_data_matches(w: &mut KisekiWorld) {
     // Already verified in the When step; double-check by re-reading.
     let extent = w.last_extent.expect("must have extent");
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let read_back = dev.read(&extent).expect("read data");
     let original = w.last_read_data.as_ref().expect("original data");
     assert_eq!(&read_back, original, "data must match on re-read");
@@ -811,7 +811,7 @@ async fn then_data_matches(w: &mut KisekiWorld) {
 
 #[when("data is written to an extent")]
 async fn when_data_written_to_extent(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let data = b"CRC32 test payload for BDD scenario";
     let extent = dev.alloc(data.len() as u64).expect("alloc");
     dev.write(&extent, data).expect("write");
@@ -823,7 +823,7 @@ async fn when_data_written_to_extent(w: &mut KisekiWorld) {
 async fn then_crc32_appended(w: &mut KisekiWorld) {
     // The write method appends header (4 bytes) + data + CRC32 (4 bytes).
     // We verify by reading the raw file at the extent offset.
-    let path = w.block_device_path.as_ref().expect("device path");
+    let path = w.block.device_path.as_ref().expect("device path");
     let extent = w.last_extent.expect("must have extent");
     let data = w.last_read_data.as_ref().expect("original data");
 
@@ -879,7 +879,7 @@ async fn then_stored_size_includes_crc(w: &mut KisekiWorld) {
 #[given("data was written to an extent with CRC32 trailer")]
 async fn given_data_with_crc(w: &mut KisekiWorld) {
     ensure_device(w, 64 * MB);
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let data = b"data with CRC32 for read verification";
     let extent = dev.alloc(data.len() as u64).expect("alloc");
     dev.write(&extent, data).expect("write");
@@ -890,7 +890,7 @@ async fn given_data_with_crc(w: &mut KisekiWorld) {
 #[when("the extent is read")]
 async fn when_extent_is_read(w: &mut KisekiWorld) {
     let extent = w.last_extent.expect("extent");
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     match dev.read(&extent) {
         Ok(data) => {
             w.last_read_data = Some(data);
@@ -925,7 +925,7 @@ async fn then_crc32_stripped(w: &mut KisekiWorld) {
 #[given("data was written to an extent")]
 async fn given_data_written(w: &mut KisekiWorld) {
     ensure_device(w, 64 * MB);
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let data = b"corruption detection test payload";
     let extent = dev.alloc(data.len() as u64).expect("alloc");
     dev.write(&extent, data).expect("write");
@@ -935,7 +935,7 @@ async fn given_data_written(w: &mut KisekiWorld) {
 
 #[when("a bit flip is simulated in the stored data")]
 async fn when_bit_flip(w: &mut KisekiWorld) {
-    let path = w.block_device_path.as_ref().expect("device path");
+    let path = w.block.device_path.as_ref().expect("device path");
     let extent = w.last_extent.expect("extent");
 
     // Read superblock for data_offset.
@@ -987,7 +987,7 @@ async fn given_io_strategy(w: &mut KisekiWorld, _strategy: String) {
 
 #[when("data is written")]
 async fn when_data_is_written(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let data = b"io strategy test data";
     let extent = dev.alloc(data.len() as u64).expect("alloc");
     dev.write(&extent, data).expect("write");
@@ -999,14 +999,14 @@ async fn then_o_direct(w: &mut KisekiWorld) {
     // File-backed device uses regular I/O, not O_DIRECT.
     // In production, DirectAligned strategy would use O_DIRECT.
     // We verify the device's io_strategy is file-backed (our test device).
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let _strategy = dev.characteristics().io_strategy;
     // Acceptance: file-backed device always uses FileBacked strategy.
 }
 
 #[then("the write buffer is aligned to physical_block_size")]
 async fn then_buffer_aligned(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let extent = w.last_extent.expect("extent");
     // Extent offset is always block-aligned (multiple of 4096).
     assert_eq!(
@@ -1019,7 +1019,7 @@ async fn then_buffer_aligned(w: &mut KisekiWorld) {
 #[then("the write does NOT use O_DIRECT")]
 async fn then_no_o_direct(w: &mut KisekiWorld) {
     // File-backed device never uses O_DIRECT — verified by strategy.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     assert_eq!(
         dev.characteristics().io_strategy,
         IoStrategy::FileBacked,
@@ -1030,7 +1030,7 @@ async fn then_no_o_direct(w: &mut KisekiWorld) {
 #[then("fdatasync is called after write")]
 async fn then_fdatasync(w: &mut KisekiWorld) {
     // Sync is available and works.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     dev.sync().expect("sync should succeed");
 }
 
@@ -1041,30 +1041,30 @@ async fn then_fdatasync(w: &mut KisekiWorld) {
 #[given("an allocation was journaled in redb")]
 async fn given_allocation_journaled(w: &mut KisekiWorld) {
     ensure_device(w, 64 * MB);
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let extent = dev.alloc(4096).expect("alloc");
     dev.write(&extent, b"journaled data").expect("write");
     w.last_extent = Some(extent);
-    w.block_extents.push(extent);
+    w.block.extents.push(extent);
 }
 
 #[given("the bitmap was NOT updated (simulated crash)")]
 async fn given_bitmap_not_updated(w: &mut KisekiWorld) {
     // Simulate crash: sync the device (persisting data) but the bitmap
     // on the next reopen may be stale. We just note the state.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     dev.sync().expect("sync before simulated crash");
 }
 
 #[when("the device is reopened")]
 async fn when_device_reopened(w: &mut KisekiWorld) {
-    let path = w.block_device_path.as_ref().expect("device path").clone();
+    let path = w.block.device_path.as_ref().expect("device path").clone();
     // Drop current device.
-    w.block_device = None;
+    w.block.device = None;
     // Reopen.
     match FileBackedDevice::open(&path) {
         Ok(dev) => {
-            w.block_device = Some(Box::new(dev));
+            w.block.device = Some(Box::new(dev));
             w.last_error = None;
         }
         Err(e) => {
@@ -1078,14 +1078,14 @@ async fn then_journal_replayed(w: &mut KisekiWorld) {
     // After reopen, the device reads the bitmap from disk.
     // The file-backed device persists bitmap via sync/flush_bitmap.
     assert!(
-        w.block_device.is_some(),
+        w.block.device.is_some(),
         "device should be open after replay"
     );
 }
 
 #[then("the bitmap is updated to match the journal")]
 async fn then_bitmap_matches_journal(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     // After reopening a synced device, the bitmap should reflect allocations.
     assert!(
@@ -1096,7 +1096,7 @@ async fn then_bitmap_matches_journal(w: &mut KisekiWorld) {
 
 #[then("the free-list is rebuilt from the corrected bitmap")]
 async fn then_freelist_rebuilt(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, total) = dev.capacity();
     assert!(total > used, "free-list must show free space after rebuild");
 }
@@ -1106,7 +1106,7 @@ async fn then_freelist_rebuilt(w: &mut KisekiWorld) {
 #[given("an extent was allocated and data was written")]
 async fn given_extent_allocated_data_written(w: &mut KisekiWorld) {
     ensure_device(w, 64 * MB);
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let extent = dev.alloc(8192).expect("alloc");
     dev.write(&extent, &[0xAB; 8192]).expect("write");
     dev.sync().expect("sync");
@@ -1121,29 +1121,29 @@ async fn given_chunk_meta_not_committed(w: &mut KisekiWorld) {
 
 #[when("the device is reopened and scrub runs")]
 async fn when_reopened_and_scrub(w: &mut KisekiWorld) {
-    let path = w.block_device_path.as_ref().expect("device path").clone();
-    w.block_device = None;
+    let path = w.block.device_path.as_ref().expect("device path").clone();
+    w.block.device = None;
     let dev = FileBackedDevice::open(&path).expect("reopen device");
     // Scrub: in the file-backed device, we detect orphans by checking bitmap
     // vs known metadata. For BDD, we simulate by freeing the orphan.
     let orphan = w.last_extent.expect("orphan extent");
     dev.free(&orphan).expect("free orphan on scrub");
     dev.sync().expect("sync after scrub");
-    w.block_device = Some(Box::new(dev));
-    w.block_scrub_report = Some("orphan extent freed".to_string());
+    w.block.device = Some(Box::new(dev));
+    w.block.scrub_report = Some("orphan extent freed".to_string());
 }
 
 #[then(regex = r#"^the orphan extent is detected \(bitmap set, no chunk_meta\)$"#)]
 async fn then_orphan_detected(w: &mut KisekiWorld) {
     assert!(
-        w.block_scrub_report.is_some(),
+        w.block.scrub_report.is_some(),
         "scrub should have run and detected orphan"
     );
 }
 
 #[then(regex = r#"^the extent is freed \(bitmap cleared, journal entry removed\)$"#)]
 async fn then_extent_freed_scrub(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     assert_eq!(used, 0, "orphan extent should be freed");
 }
@@ -1152,7 +1152,7 @@ async fn then_extent_freed_scrub(w: &mut KisekiWorld) {
 async fn then_no_data_loss(w: &mut KisekiWorld) {
     // The write was never acknowledged to the client (no chunk_meta commit).
     // The extent was reclaimed. This is correct behavior.
-    assert!(w.block_device.is_some());
+    assert!(w.block.device.is_some());
 }
 
 // === Bitmap primary/mirror mismatch ===
@@ -1160,13 +1160,13 @@ async fn then_no_data_loss(w: &mut KisekiWorld) {
 #[given("the primary bitmap was updated but the mirror was not (crash)")]
 async fn given_bitmap_mismatch(w: &mut KisekiWorld) {
     ensure_device(w, 64 * MB);
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let extent = dev.alloc(4096).expect("alloc");
     dev.sync().expect("sync");
     w.last_extent = Some(extent);
 
     // Simulate mismatch by corrupting the mirror bitmap on disk.
-    let path = w.block_device_path.as_ref().expect("path");
+    let path = w.block.device_path.as_ref().expect("path");
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1182,7 +1182,7 @@ async fn given_bitmap_mismatch(w: &mut KisekiWorld) {
     f.write_all(&zeros).unwrap();
     f.sync_all().unwrap();
     drop(f);
-    w.block_device = None; // Force reopen.
+    w.block.device = None; // Force reopen.
 }
 
 #[then("the mismatch is detected")]
@@ -1190,14 +1190,14 @@ async fn then_mismatch_detected(w: &mut KisekiWorld) {
     // FileBackedDevice::open detects mismatch and prints a warning.
     // The device is still usable (uses primary).
     assert!(
-        w.block_device.is_some(),
+        w.block.device.is_some(),
         "device should open despite mismatch"
     );
 }
 
 #[then("the bitmap consistent with the redb journal is used")]
 async fn then_consistent_bitmap_used(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     // Primary bitmap (with the allocation) is used.
     assert!(
@@ -1209,7 +1209,7 @@ async fn then_consistent_bitmap_used(w: &mut KisekiWorld) {
 #[then("the other copy is repaired to match")]
 async fn then_other_copy_repaired(w: &mut KisekiWorld) {
     // After sync, both copies match.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     dev.sync().expect("sync repairs mirror");
     // Verify by checking the bitmap bytes are consistent.
     let bitmap = dev.bitmap_bytes();
@@ -1221,10 +1221,10 @@ async fn then_other_copy_repaired(w: &mut KisekiWorld) {
 #[given("the superblock checksum does not match its contents")]
 async fn given_superblock_corrupt(w: &mut KisekiWorld) {
     ensure_device(w, 64 * MB);
-    let path = w.block_device_path.as_ref().expect("path").clone();
-    let dev = w.block_device.as_ref().expect("device");
+    let path = w.block.device_path.as_ref().expect("path").clone();
+    let dev = w.block.device.as_ref().expect("device");
     dev.sync().expect("sync");
-    w.block_device = None;
+    w.block.device = None;
 
     // Corrupt the superblock magic.
     let mut f = std::fs::OpenOptions::new()
@@ -1239,11 +1239,11 @@ async fn given_superblock_corrupt(w: &mut KisekiWorld) {
 
 #[when(regex = r#"^(?:a|the) device is opened$"#)]
 async fn when_device_opened(w: &mut KisekiWorld) {
-    let path = w.block_device_path.as_ref().expect("device path").clone();
-    w.block_device = None;
+    let path = w.block.device_path.as_ref().expect("device path").clone();
+    w.block.device = None;
     match FileBackedDevice::open(&path) {
         Ok(dev) => {
-            w.block_device = Some(Box::new(dev));
+            w.block.device = Some(Box::new(dev));
             w.last_error = None;
         }
         Err(e) => {
@@ -1263,7 +1263,7 @@ async fn then_device_corrupted(w: &mut KisekiWorld) {
 #[then("no allocations or I/O are permitted")]
 async fn then_no_io_permitted(w: &mut KisekiWorld) {
     assert!(
-        w.block_device.is_none(),
+        w.block.device.is_none(),
         "device should not be open when corrupted"
     );
 }
@@ -1282,21 +1282,21 @@ async fn then_alert_raised(w: &mut KisekiWorld) {
 #[given(regex = r#"^(\d+) extents are allocated in bitmap but have no chunk_meta in redb$"#)]
 async fn given_orphan_extents(w: &mut KisekiWorld, count: u64) {
     ensure_device(w, 64 * MB);
-    let dev = w.block_device.as_ref().expect("device exists");
-    w.block_extents.clear();
+    let dev = w.block.device.as_ref().expect("device exists");
+    w.block.extents.clear();
     for _ in 0..count {
         let ext = dev.alloc(256 * KB).expect("alloc orphan");
         dev.write(&ext, &vec![0xCC; 256 * 1024])
             .expect("write orphan data");
-        w.block_extents.push(ext);
+        w.block.extents.push(ext);
     }
     dev.sync().expect("sync");
 }
 
 #[when("periodic scrub runs")]
 async fn when_scrub_runs(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
-    let orphans = w.block_extents.clone();
+    let dev = w.block.device.as_ref().expect("device exists");
+    let orphans = w.block.extents.clone();
     let count = orphans.len();
     let mut freed_bytes = 0u64;
     for ext in &orphans {
@@ -1304,31 +1304,31 @@ async fn when_scrub_runs(w: &mut KisekiWorld) {
         freed_bytes += ext.length;
     }
     dev.sync().expect("sync after scrub");
-    w.block_scrub_report = Some(format!(
+    w.block.scrub_report = Some(format!(
         "{} orphan extents reclaimed, {}KB freed",
         count,
         freed_bytes / KB
     ));
-    w.block_extents.clear();
+    w.block.extents.clear();
 }
 
 #[then("all 3 orphan extents are freed")]
 async fn then_orphans_freed(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     assert_eq!(used, 0, "all orphan extents should be freed");
 }
 
 #[then("bitmap bits are cleared")]
 async fn then_bitmap_cleared(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     assert_eq!(used, 0, "bitmap should show all free after clearing");
 }
 
 #[then(regex = r#"^scrub reports "([^"]*)"$"#)]
 async fn then_scrub_reports(w: &mut KisekiWorld, expected: String) {
-    let report = w.block_scrub_report.as_ref().expect("scrub report");
+    let report = w.block.scrub_report.as_ref().expect("scrub report");
     // Check for key numbers in the report.
     let expected_count = if expected.contains("3 orphan") {
         "3 orphan"
@@ -1352,7 +1352,7 @@ async fn given_bitmap_inconsistency(w: &mut KisekiWorld, _block: u64) {
     ensure_device(w, 64 * MB);
     // Simulate: allocate an extent, then the bitmap says it's free but
     // metadata says it's used. In real code, scrub corrects this.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let ext = dev.alloc(4096).expect("alloc");
     dev.write(&ext, b"inconsistency test").expect("write");
     dev.free(&ext).expect("free to simulate bitmap=free");
@@ -1363,15 +1363,15 @@ async fn given_bitmap_inconsistency(w: &mut KisekiWorld, _block: u64) {
 #[when("scrub runs")]
 async fn when_scrub_corrective(w: &mut KisekiWorld) {
     // Re-allocate the extent to correct the bitmap (mark it as used).
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let ext = dev.alloc(4096).expect("re-alloc to correct bitmap");
     w.last_extent = Some(ext);
-    w.block_scrub_report = Some("1 bitmap inconsistency corrected".to_string());
+    w.block.scrub_report = Some("1 bitmap inconsistency corrected".to_string());
 }
 
 #[then(regex = r#"^the bitmap is corrected \(block (\d+) marked allocated\)$"#)]
 async fn then_bitmap_corrected(w: &mut KisekiWorld, _block: u64) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     assert!(used > 0, "bitmap should show allocation after correction");
 }
@@ -1382,14 +1382,14 @@ async fn then_bitmap_corrected(w: &mut KisekiWorld, _block: u64) {
 async fn then_initial_scrub(w: &mut KisekiWorld) {
     // FileBackedDevice::open reads and validates bitmaps, which is the
     // equivalent of an initial scrub.
-    assert!(w.block_device.is_some(), "device should be open");
+    assert!(w.block.device.is_some(), "device should be open");
 }
 
 #[then(regex = r#"^subsequent scrubs run every (\d+) hours by default$"#)]
 async fn then_periodic_scrub(w: &mut KisekiWorld, _hours: u64) {
     // Periodic scrub scheduling is a runtime concern, not block-level.
     // We verify the device supports the operations that scrub needs.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let _ = dev.bitmap_bytes();
     let _ = dev.capacity();
 }
@@ -1405,7 +1405,7 @@ async fn given_trim_device(w: &mut KisekiWorld, _val: String) {
 
 #[when(regex = r#"^(\d+) small extents are freed in rapid succession$"#)]
 async fn when_free_rapid(w: &mut KisekiWorld, count: u64) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     // Allocate and immediately free many small extents.
     for _ in 0..count {
         let ext = dev.alloc(4096).expect("alloc small");
@@ -1416,7 +1416,7 @@ async fn when_free_rapid(w: &mut KisekiWorld, count: u64) {
 #[then("no TRIM commands are issued immediately")]
 async fn then_no_trim_immediate(w: &mut KisekiWorld) {
     // File-backed devices don't support TRIM. In production, TRIM is batched.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     assert!(!dev.characteristics().supports_trim, "file-backed: no TRIM");
 }
 
@@ -1429,14 +1429,14 @@ async fn then_trim_queue(w: &mut KisekiWorld) {
 #[when(regex = r#"^the TRIM flush interval fires \((\d+) seconds\)$"#)]
 async fn when_trim_flush(w: &mut KisekiWorld, _secs: u64) {
     // Simulate TRIM flush by syncing the device.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     dev.sync().expect("sync (TRIM flush simulation)");
 }
 
 #[then(regex = r#"^a single batched BLKDISCARD covers all (\d+) extents$"#)]
 async fn then_batched_discard(w: &mut KisekiWorld, _count: u64) {
     // File-backed device doesn't issue BLKDISCARD. Verify device is healthy.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     assert_eq!(used, 0, "all extents freed, device should show 0 used");
 }
@@ -1467,40 +1467,40 @@ async fn given_device_with_allocated(
     let (_, total) = dev.capacity();
     let target = alloc_bytes.min(total / 2); // Don't fill more than half.
     let mut allocated = 0u64;
-    w.block_extents.clear();
+    w.block.extents.clear();
     while allocated < target {
         match dev.alloc(4096) {
             Ok(ext) => {
                 allocated += ext.length;
-                w.block_extents.push(ext);
+                w.block.extents.push(ext);
             }
             Err(_) => break,
         }
     }
 
-    w.block_device_path = Some(path);
-    w.block_device = Some(Box::new(dev));
-    w.block_temp_dir = Some(dir);
+    w.block.device_path = Some(path);
+    w.block.device = Some(Box::new(dev));
+    w.block.temp_dir = Some(dir);
 }
 
 #[when("capacity is queried")]
 async fn when_capacity_queried(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, total) = dev.capacity();
     // Stash for assertions.
-    w.control_org_capacity_used = used;
-    w.control_org_capacity_total = total;
+    w.control.org_capacity_used = used;
+    w.control.org_capacity_total = total;
 }
 
 #[then(regex = r#"^used_bytes is (\d+)(TB|GB|MB) minus superblock and bitmap overhead$"#)]
 async fn then_used_bytes(w: &mut KisekiWorld, _size: u64, _unit: String) {
-    assert!(w.control_org_capacity_used > 0, "used_bytes should be > 0");
+    assert!(w.control.org_capacity_used > 0, "used_bytes should be > 0");
 }
 
 #[then(regex = r#"^total_bytes is (\d+)(TB|GB|MB)$"#)]
 async fn then_total_bytes(w: &mut KisekiWorld, _size: u64, _unit: String) {
     assert!(
-        w.control_org_capacity_total > 0,
+        w.control.org_capacity_total > 0,
         "total_bytes should be > 0"
     );
 }
@@ -1509,12 +1509,12 @@ async fn then_total_bytes(w: &mut KisekiWorld, _size: u64, _unit: String) {
 async fn then_values_account_overhead(w: &mut KisekiWorld) {
     // Total reported by capacity() is the data region only (excludes
     // superblock and bitmaps). Verify it's less than the file size.
-    let path = w.block_device_path.as_ref().expect("path");
+    let path = w.block.device_path.as_ref().expect("path");
     let file_size = std::fs::metadata(path).unwrap().len();
     assert!(
-        w.control_org_capacity_total < file_size,
+        w.control.org_capacity_total < file_size,
         "data region total ({}) must be less than file size ({}) due to overhead",
-        w.control_org_capacity_total,
+        w.control.org_capacity_total,
         file_size
     );
 }
@@ -1526,7 +1526,7 @@ async fn then_values_account_overhead(w: &mut KisekiWorld) {
 #[given("an extent was allocated with a WAL intent entry")]
 async fn given_wal_intent(w: &mut KisekiWorld) {
     ensure_device(w, 64 * MB);
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let extent = dev.alloc(4096).expect("alloc WAL intent");
     dev.sync().expect("sync");
     w.last_extent = Some(extent);
@@ -1540,7 +1540,7 @@ async fn given_no_chunk_meta(w: &mut KisekiWorld) {
 #[then("the WAL intent entry is detected during startup scrub")]
 async fn then_wal_intent_detected(w: &mut KisekiWorld) {
     // On reopen, bitmap is loaded and shows the allocation.
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, _) = dev.capacity();
     assert!(used > 0, "WAL intent allocation visible in bitmap");
 }
@@ -1549,7 +1549,7 @@ async fn then_wal_intent_detected(w: &mut KisekiWorld) {
 async fn then_extent_freed_bitmap_cleared(w: &mut KisekiWorld) {
     // Simulate scrub freeing the orphan.
     if let Some(ext) = w.last_extent.take() {
-        let dev = w.block_device.as_ref().expect("device exists");
+        let dev = w.block.device.as_ref().expect("device exists");
         dev.free(&ext).expect("free orphan WAL intent extent");
         let (used, _) = dev.capacity();
         assert_eq!(used, 0, "bitmap should be cleared after freeing orphan");
@@ -1569,7 +1569,7 @@ async fn then_superblock_checksum_verified(w: &mut KisekiWorld) {
     // FileBackedDevice::open calls Superblock::from_bytes which validates
     // the magic and version. If open succeeded, checksum was verified.
     assert!(
-        w.block_device.is_some() || w.last_error.is_some(),
+        w.block.device.is_some() || w.last_error.is_some(),
         "either device opened or error reported"
     );
 }
@@ -1587,20 +1587,20 @@ async fn given_device_with_n_extents(w: &mut KisekiWorld, count: u64) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join("rebuild-test.dev");
     let dev = FileBackedDevice::init(&path, 64 * MB).expect("init device");
-    w.block_extents.clear();
+    w.block.extents.clear();
     for _ in 0..count {
         let ext = dev.alloc(4096).expect("alloc");
-        w.block_extents.push(ext);
+        w.block.extents.push(ext);
     }
     dev.sync().expect("sync");
-    w.block_device_path = Some(path);
-    w.block_device = Some(Box::new(dev));
-    w.block_temp_dir = Some(dir);
+    w.block.device_path = Some(path);
+    w.block.device = Some(Box::new(dev));
+    w.block.temp_dir = Some(dir);
 }
 
 #[then("the free-list is rebuilt from the bitmap")]
 async fn then_freelist_rebuilt_from_bitmap(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     let (used, total) = dev.capacity();
     assert!(used > 0, "reopened device should show prior allocations");
     assert!(total > used, "free-list should show remaining free space");
@@ -1608,7 +1608,7 @@ async fn then_freelist_rebuilt_from_bitmap(w: &mut KisekiWorld) {
 
 #[then("allocations work correctly after rebuild")]
 async fn then_allocations_work_after_rebuild(w: &mut KisekiWorld) {
-    let dev = w.block_device.as_ref().expect("device exists");
+    let dev = w.block.device.as_ref().expect("device exists");
     // Allocate, write, read after rebuild.
     let data = b"post-rebuild allocation test";
     let ext = dev.alloc(data.len() as u64).expect("alloc after rebuild");
@@ -1638,9 +1638,9 @@ async fn given_bad_version(w: &mut KisekiWorld) {
     f.write_all(&99u32.to_le_bytes()).unwrap();
     f.sync_all().unwrap();
 
-    w.block_device_path = Some(path);
-    w.block_device = None;
-    w.block_temp_dir = Some(dir);
+    w.block.device_path = Some(path);
+    w.block.device = None;
+    w.block.temp_dir = Some(dir);
 }
 
 #[then(regex = r#"^the open fails with "([^"]*)" error$"#)]

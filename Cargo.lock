@@ -1607,11 +1607,15 @@ dependencies = [
  "kiseki-gateway",
  "kiseki-keymanager",
  "kiseki-log",
+ "kiseki-proto",
  "kiseki-raft",
  "kiseki-transport",
  "kiseki-view",
+ "prost",
+ "reqwest",
  "tempfile",
  "tokio",
+ "tonic",
  "uuid",
 ]
 

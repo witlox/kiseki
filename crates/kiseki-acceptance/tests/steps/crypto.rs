@@ -34,8 +34,8 @@ async fn when_chunk_write(_w: &mut KisekiWorld) {}
 
 #[then(regex = r#"^a system DEK is generated.*$"#)]
 async fn then_dek(w: &mut KisekiWorld) {
-    let epoch = w.key_store.current_epoch().await.unwrap();
-    let key = w.key_store.fetch_master_key(epoch).await.unwrap();
+    let epoch = w.legacy.key_store.current_epoch().await.unwrap();
+    let key = w.legacy.key_store.fetch_master_key(epoch).await.unwrap();
     let chunk_id = ChunkId([0x42; 32]);
     let dek = derive_system_dek(&key, &chunk_id);
     assert!(dek.is_ok(), "DEK derivation should succeed");
@@ -61,7 +61,7 @@ async fn given_kek_epoch(_w: &mut KisekiWorld, _k: String, _e: u64) {}
 
 #[when("the cluster admin triggers system KEK rotation")]
 async fn when_rotate(w: &mut KisekiWorld) {
-    match w.key_store.rotate().await {
+    match w.legacy.key_store.rotate().await {
         Ok(e) => {
             w.last_epoch = Some(e.0);
             w.last_error = None;
@@ -77,14 +77,14 @@ async fn then_new_epoch(w: &mut KisekiWorld, _k: String, expected: u64) {
 
 #[then(regex = r#"^existing chunks retain epoch (\d+) wrapping$"#)]
 async fn then_retain(w: &mut KisekiWorld, epoch: u64) {
-    assert!(w.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
+    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
 }
 
 #[then(regex = r#"^both epochs are valid.*$"#)]
 async fn then_both(w: &mut KisekiWorld) {
-    assert!(w.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
     if let Some(e) = w.last_epoch {
-        assert!(w.key_store.fetch_master_key(KeyEpoch(e)).await.is_ok());
+        assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(e)).await.is_ok());
     }
 }
 
@@ -124,9 +124,9 @@ async fn given_old_epoch(_w: &mut KisekiWorld, _c: String, _e: u64) {}
 
 #[given(regex = r#"^the current epoch is (\d+)$"#)]
 async fn given_current_epoch(w: &mut KisekiWorld, target: u64) {
-    let current = w.key_store.current_epoch().await.unwrap();
+    let current = w.legacy.key_store.current_epoch().await.unwrap();
     for _ in current.0..target {
-        w.key_store.rotate().await.unwrap();
+        w.legacy.key_store.rotate().await.unwrap();
     }
 }
 
@@ -139,22 +139,22 @@ async fn when_read(_w: &mut KisekiWorld, _c: String) {}
 #[then(regex = r#"^the system retrieves the epoch (\d+) tenant KEK wrapping$"#)]
 async fn then_old_wrap(w: &mut KisekiWorld, epoch: u64) {
     // Verify old epoch key is still accessible
-    assert!(w.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
+    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
 }
 
 #[then("the read succeeds")]
 async fn then_read_ok(w: &mut KisekiWorld) {
     // Old epoch key accessible means read can proceed.
-    assert!(w.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
 }
 
 #[then("the chunk is flagged for background re-wrapping to epoch 3")]
 async fn then_flagged_rewrap(w: &mut KisekiWorld) {
     // Background re-wrapping: old epoch chunks are flagged for migration.
     // Verify both old and new epoch keys are accessible (needed for re-wrapping).
-    assert!(w.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
     assert!(
-        w.key_store.current_epoch().await.unwrap().0 >= 2,
+        w.legacy.key_store.current_epoch().await.unwrap().0 >= 2,
         "current epoch should be ahead of chunk epoch"
     );
 }
@@ -195,7 +195,7 @@ async fn then_dek_in_memory(_w: &mut KisekiWorld) {
 
 #[then(regex = r#"^new chunks use system DEKs wrapped with "(\S+)"$"#)]
 async fn then_new_chunks_epoch(w: &mut KisekiWorld, _kek: String) {
-    let epoch = w.key_store.current_epoch().await.unwrap();
+    let epoch = w.legacy.key_store.current_epoch().await.unwrap();
     assert!(epoch.0 >= 2);
 }
 
@@ -203,11 +203,11 @@ async fn then_new_chunks_epoch(w: &mut KisekiWorld, _kek: String) {
 async fn then_migration(w: &mut KisekiWorld, from: u64, to: u64) {
     // Background re-wrapping: verify both epoch keys exist for migration.
     assert!(
-        w.key_store.fetch_master_key(KeyEpoch(from)).await.is_ok(),
+        w.legacy.key_store.fetch_master_key(KeyEpoch(from)).await.is_ok(),
         "source epoch key should exist"
     );
     assert!(
-        w.key_store.fetch_master_key(KeyEpoch(to)).await.is_ok(),
+        w.legacy.key_store.fetch_master_key(KeyEpoch(to)).await.is_ok(),
         "target epoch key should exist"
     );
 }
@@ -221,7 +221,7 @@ async fn then_rotation_audit(w: &mut KisekiWorld) {
     use kiseki_audit::event::AuditEventType;
     use kiseki_audit::store::{AuditOps, AuditQuery};
     use kiseki_common::ids::SequenceNumber;
-    let events = w.audit_log.query(&AuditQuery {
+    let events = w.legacy.audit_log.query(&AuditQuery {
         tenant_id: None,
         from: SequenceNumber(1),
         limit: 100,
@@ -343,7 +343,7 @@ async fn then_new_wrapping(_w: &mut KisekiWorld, epoch: u64) {
 
 #[then(regex = r#"^existing chunks retain epoch (\d+) tenant KEK wrapping$"#)]
 async fn then_retain_tenant(w: &mut KisekiWorld, epoch: u64) {
-    assert!(w.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
+    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
 }
 
 #[then(regex = r#"^background re-wrapping migrates epoch (\d+) wrappings to epoch (\d+)$"#)]
@@ -1005,5 +1005,5 @@ async fn then_deterministic(_w: &mut KisekiWorld) {
 
 #[then(regex = r#"^unwraps the system DEK using epoch (\d+) material$"#)]
 async fn then_unwrap_epoch(w: &mut KisekiWorld, epoch: u64) {
-    assert!(w.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
+    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
 }

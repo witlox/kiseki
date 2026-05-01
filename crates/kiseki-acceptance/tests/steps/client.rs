@@ -77,7 +77,7 @@ async fn then_discovers(_w: &mut KisekiWorld) {
 #[then("it authenticates with tenant credentials")]
 async fn then_auth(_w: &mut KisekiWorld) {
     // Verify key store is healthy (authentication prerequisite).
-    let health = _w.key_store.health();
+    let health = _w.legacy.key_store.health();
     assert!(
         health.current_epoch.is_some(),
         "key store must have a current epoch for auth"
@@ -87,7 +87,7 @@ async fn then_auth(_w: &mut KisekiWorld) {
 #[then("it obtains tenant KEK material from the tenant KMS")]
 async fn then_kek(_w: &mut KisekiWorld) {
     // Verify key store has a valid current epoch (KEK material available).
-    let health = _w.key_store.health();
+    let health = _w.legacy.key_store.health();
     let epoch = health.current_epoch.expect("must have current epoch");
     assert!(epoch > 0, "KEK epoch must be positive");
 }
@@ -96,7 +96,7 @@ async fn then_kek(_w: &mut KisekiWorld) {
 async fn then_ready(_w: &mut KisekiWorld) {
     // Verify end-to-end readiness: write through the NFS context path.
     _w.ensure_gateway_ns().await;
-    let result = _w.nfs_ctx.write(b"readiness-probe".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"readiness-probe".to_vec());
     assert!(
         result.is_ok(),
         "gateway must accept writes when ready: {:?}",
@@ -502,7 +502,7 @@ async fn then_fetch_encrypted(_w: &mut KisekiWorld) {
 async fn then_unwrap_inprocess(_w: &mut KisekiWorld) {
     // The gateway's InMemoryGateway uses SystemMasterKey for encryption.
     // Verify the key store has a valid current epoch (DEK unwrap via KEK).
-    let health = _w.key_store.health();
+    let health = _w.legacy.key_store.health();
     let epoch = health
         .current_epoch
         .expect("key store must have current epoch");
@@ -1286,7 +1286,7 @@ async fn then_others_unaffected(_w: &mut KisekiWorld) {
 async fn then_no_cluster_impact(_w: &mut KisekiWorld) {
     // Gateway remains operational after client crash.
     _w.ensure_gateway_ns().await;
-    let result = _w.nfs_ctx.write(b"cluster-ok".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"cluster-ok".to_vec());
     assert!(
         result.is_ok(),
         "cluster must remain operational after client crash: {:?}",
@@ -1338,7 +1338,7 @@ async fn then_eio(_w: &mut KisekiWorld) {
 async fn then_ops_resume(_w: &mut KisekiWorld) {
     // After KMS recovery, the gateway can serve reads/writes again.
     _w.ensure_gateway_ns().await;
-    let result = _w.nfs_ctx.write(b"resumed".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"resumed".to_vec());
     assert!(
         result.is_ok(),
         "operations must resume when KMS is reachable: {:?}",
@@ -1787,7 +1787,7 @@ async fn then_annotated(_w: &mut KisekiWorld) {
 async fn then_unchanged(_w: &mut KisekiWorld) {
     // Operations work without a workflow session — verify gateway write with no session.
     _w.ensure_gateway_ns().await;
-    let result = _w.nfs_ctx.write(b"no-session".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"no-session".to_vec());
     assert!(
         result.is_ok(),
         "operations without session must work unchanged: {:?}",

@@ -46,13 +46,13 @@ async fn when_request_processed(w: &mut KisekiWorld) {
         compression_enabled: false,
     };
 
-    match w.control_tenant_store.create_org(org) {
+    match w.control.tenant_store.create_org(org) {
         Ok(()) => {
-            w.control_last_org_id = Some("org-genomics".into());
-            w.control_last_error = None;
+            w.control.last_org_id = Some("org-genomics".into());
+            w.control.last_error = None;
         }
         Err(e) => {
-            w.control_last_error = Some(e.to_string());
+            w.control.last_error = Some(e.to_string());
         }
     }
 }
@@ -60,11 +60,11 @@ async fn when_request_processed(w: &mut KisekiWorld) {
 #[then(regex = r#"^organization "([^"]*)" is created$"#)]
 async fn then_org_created(w: &mut KisekiWorld, org_name: String) {
     assert!(
-        w.control_last_error.is_none(),
+        w.control.last_error.is_none(),
         "org creation failed: {:?}",
-        w.control_last_error
+        w.control.last_error
     );
-    let org = w.control_tenant_store.get_org(&org_name);
+    let org = w.control.tenant_store.get_org(&org_name);
     assert!(org.is_ok(), "org {org_name} not found: {:?}", org.err());
 }
 
@@ -75,8 +75,8 @@ async fn then_admin_provisioned(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^compliance tags \[([^\]]*)\] are set at org level$"#)]
 async fn then_compliance_tags(w: &mut KisekiWorld, tags_str: String) {
-    let org_id = w.control_last_org_id.as_ref().expect("no org created yet");
-    let org = w.control_tenant_store.get_org(org_id).unwrap();
+    let org_id = w.control.last_org_id.as_ref().expect("no org created yet");
+    let org = w.control.tenant_store.get_org(org_id).unwrap();
 
     for tag in tags_str.split(", ") {
         let expected = match tag.trim() {
@@ -95,14 +95,14 @@ async fn then_compliance_tags(w: &mut KisekiWorld, tags_str: String) {
 
 #[then("quotas are enforced from creation")]
 async fn then_quotas_enforced(w: &mut KisekiWorld) {
-    let org_id = w.control_last_org_id.as_ref().expect("no org created yet");
-    let org = w.control_tenant_store.get_org(org_id).unwrap();
+    let org_id = w.control.last_org_id.as_ref().expect("no org created yet");
+    let org = w.control.tenant_store.get_org(org_id).unwrap();
     assert!(org.quota.capacity_bytes > 0, "quota not set");
 }
 
 #[then("the tenant creation is recorded in the audit log")]
 async fn then_tenant_creation_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("audit-event".into());
+    w.control.audit_events.push("audit-event".into());
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +123,7 @@ async fn given_tenant_admin_for(w: &mut KisekiWorld, _admin: String, org_name: S
         },
         compression_enabled: false,
     };
-    let _ = w.control_tenant_store.create_org(org); // Ignore if exists
+    let _ = w.control.tenant_store.create_org(org); // Ignore if exists
 }
 
 #[when(regex = r#"^they create project "([^"]*)":$"#)]
@@ -140,13 +140,13 @@ async fn when_create_project(w: &mut KisekiWorld, proj_name: String) {
         },
     };
 
-    match w.control_tenant_store.create_project(proj) {
+    match w.control.tenant_store.create_project(proj) {
         Ok(()) => {
-            w.control_last_project_id = Some(proj_name);
-            w.control_last_error = None;
+            w.control.last_project_id = Some(proj_name);
+            w.control.last_error = None;
         }
         Err(e) => {
-            w.control_last_error = Some(e.to_string());
+            w.control.last_error = Some(e.to_string());
         }
     }
 }
@@ -154,11 +154,11 @@ async fn when_create_project(w: &mut KisekiWorld, proj_name: String) {
 #[then(regex = r#"^project "([^"]*)" is created under "([^"]*)"$"#)]
 async fn then_project_created(w: &mut KisekiWorld, proj_name: String, _org_name: String) {
     assert!(
-        w.control_last_error.is_none(),
+        w.control.last_error.is_none(),
         "project creation failed: {:?}",
-        w.control_last_error
+        w.control.last_error
     );
-    let proj = w.control_tenant_store.get_project(&proj_name);
+    let proj = w.control.tenant_store.get_project(&proj_name);
     assert!(
         proj.is_ok(),
         "project {proj_name} not found: {:?}",
@@ -168,12 +168,12 @@ async fn then_project_created(w: &mut KisekiWorld, proj_name: String, _org_name:
 
 #[then(regex = r#"^it inherits org-level tags \[([^\]]*)\] plus its own \[([^\]]*)\]$"#)]
 async fn then_inherits_tags(w: &mut KisekiWorld, _org_tags: String, _proj_tags: String) {
-    let org = w.control_tenant_store.get_org("org-pharma").unwrap();
+    let org = w.control.tenant_store.get_org("org-pharma").unwrap();
     let proj_id = w
-        .control_last_project_id
+        .control.last_project_id
         .as_ref()
         .expect("no project created");
-    let proj = w.control_tenant_store.get_project(proj_id).unwrap();
+    let proj = w.control.tenant_store.get_project(proj_id).unwrap();
     let effective = effective_compliance_tags(&org, Some(&proj));
     assert!(
         effective.len() >= 3,
@@ -228,13 +228,13 @@ async fn when_workload_configured(w: &mut KisekiWorld) {
         },
     };
 
-    match w.control_tenant_store.create_workload(wl) {
+    match w.control.tenant_store.create_workload(wl) {
         Ok(()) => {
-            w.control_last_workload_id = Some("training-run-42".into());
-            w.control_last_error = None;
+            w.control.last_workload_id = Some("training-run-42".into());
+            w.control.last_error = None;
         }
         Err(e) => {
-            w.control_last_error = Some(e.to_string());
+            w.control.last_error = Some(e.to_string());
         }
     }
 }
@@ -242,11 +242,11 @@ async fn when_workload_configured(w: &mut KisekiWorld) {
 #[then(regex = r#"^workload "([^"]*)" is created$"#)]
 async fn then_workload_created(w: &mut KisekiWorld, wl_name: String) {
     assert!(
-        w.control_last_error.is_none(),
+        w.control.last_error.is_none(),
         "workload creation failed: {:?}",
-        w.control_last_error
+        w.control.last_error
     );
-    let wl = w.control_tenant_store.get_workload(&wl_name);
+    let wl = w.control.tenant_store.get_workload(&wl_name);
     assert!(wl.is_ok(), "workload {wl_name} not found: {:?}", wl.err());
 }
 
@@ -278,13 +278,13 @@ async fn given_create_namespace(w: &mut KisekiWorld, ns_name: String, org_name: 
         compliance_tags: vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr],
         read_only: false,
     };
-    match w.control_namespace_store.create(ns) {
+    match w.control.namespace_store.create(ns) {
         Ok(()) => {
-            w.control_last_error = None;
+            w.control.last_error = None;
             // Also register in data-path namespace_ids so shared steps work.
             w.ensure_namespace(&ns_name, "shard-cp");
         }
-        Err(e) => w.control_last_error = Some(e.to_string()),
+        Err(e) => w.control.last_error = Some(e.to_string()),
     }
 }
 
@@ -311,26 +311,26 @@ async fn then_shard_placed(w: &mut KisekiWorld) {
 
 #[given("cluster admin sets the cluster to maintenance mode")]
 async fn given_maintenance_mode(w: &mut KisekiWorld) {
-    w.control_maintenance.enable();
+    w.control.maintenance.enable();
 }
 
 #[then("all shards enter read-only mode")]
 async fn then_shards_read_only(w: &mut KisekiWorld) {
-    assert!(w.control_maintenance.is_enabled());
-    w.control_namespace_store.set_read_only(true);
+    assert!(w.control.maintenance.is_enabled());
+    w.control.namespace_store.set_read_only(true);
 }
 
 #[then(regex = r"^ShardMaintenanceEntered events are emitted$")]
 async fn then_maintenance_events(w: &mut KisekiWorld) {
-    w.control_audit_events
+    w.control.audit_events
         .push("ShardMaintenanceEntered".into());
 }
 
 #[then("all write commands are rejected with retriable errors")]
 async fn then_writes_rejected_retriable(w: &mut KisekiWorld) {
-    assert!(w.control_maintenance.is_enabled());
+    assert!(w.control.maintenance.is_enabled());
     let result = w
-        .control_namespace_store
+        .control.namespace_store
         .create(kiseki_control::namespace::Namespace {
             id: "test-write-rejected".into(),
             org_id: "org-test".into(),
@@ -344,41 +344,41 @@ async fn then_writes_rejected_retriable(w: &mut KisekiWorld) {
 
 #[then("reads continue from existing views")]
 async fn then_reads_from_views(w: &mut KisekiWorld) {
-    let _ = w.control_namespace_store.list();
-    assert!(w.control_maintenance.is_enabled());
+    let _ = w.control.namespace_store.list();
+    assert!(w.control.maintenance.is_enabled());
 }
 
 #[then("the maintenance window is recorded in the audit log")]
 async fn then_maintenance_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("audit-event".into());
+    w.control.audit_events.push("audit-event".into());
 }
 
 // --- Scenario: Control plane unavailable ---
 
 #[given("the Control Plane service is down")]
 async fn given_cp_down(w: &mut KisekiWorld) {
-    w.control_plane_up = false;
+    w.control.plane_up = false;
 }
 
 #[then("existing data path continues (Log, Chunks, Views work with last-known config)")]
 async fn then_data_path_continues(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
-    let _ = w.control_namespace_store.list(); // still works
+    assert!(!w.control.plane_up);
+    let _ = w.control.namespace_store.list(); // still works
 }
 
 #[then("no new tenants can be created")]
 async fn then_no_new_tenants(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
+    assert!(!w.control.plane_up);
 }
 
 #[then("no policy changes take effect")]
 async fn then_no_policy_changes(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
+    assert!(!w.control.plane_up);
 }
 
 #[then("no placement decisions can be made for new shards")]
 async fn then_no_placement(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
+    assert!(!w.control.plane_up);
 }
 
 // "the cluster admin is alerted" step reused from chunk.rs.
@@ -387,32 +387,32 @@ async fn then_no_placement(w: &mut KisekiWorld) {
 
 #[given("the Control Plane is unavailable")]
 async fn given_cp_unavailable(w: &mut KisekiWorld) {
-    w.control_plane_up = false;
+    w.control.plane_up = false;
 }
 
 #[given("quotas are cached locally by gateways and native clients")]
 async fn given_quotas_cached(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
+    assert!(!w.control.plane_up);
 }
 
 #[when("writes continue")]
 async fn when_writes_continue(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
+    assert!(!w.control.plane_up);
 }
 
 #[then("quotas are enforced using last-known cached values")]
 async fn then_cached_quotas(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
+    assert!(!w.control.plane_up);
 }
 
 #[then("actual usage may drift slightly from quota during outage")]
 async fn then_usage_may_drift(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
+    assert!(!w.control.plane_up);
 }
 
 #[then("reconciliation occurs when Control Plane recovers")]
 async fn then_reconciliation(w: &mut KisekiWorld) {
-    assert!(!w.control_plane_up);
+    assert!(!w.control.plane_up);
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +427,7 @@ async fn given_admin_needs_diag(w: &mut KisekiWorld, _admin: String, _tenant: St
 #[when(regex = r#"^"([^"]*)" submits an access request for "([^"]*)" config/logs$"#)]
 async fn when_submit_access_request(w: &mut KisekiWorld, admin: String, tenant: String) {
     use kiseki_control::iam::{AccessLevel, AccessRequest, AccessScope};
-    w.control_last_access_req = Some(AccessRequest::new(
+    w.control.last_access_req = Some(AccessRequest::new(
         "req-1",
         &admin,
         &tenant,
@@ -441,7 +441,7 @@ async fn when_submit_access_request(w: &mut KisekiWorld, admin: String, tenant: 
 #[then(regex = r#"^the request is queued for tenant admin "([^"]*)" approval$"#)]
 async fn then_queued(w: &mut KisekiWorld, _admin: String) {
     let req = w
-        .control_last_access_req
+        .control.last_access_req
         .as_ref()
         .expect("no access request");
     assert_eq!(
@@ -453,7 +453,7 @@ async fn then_queued(w: &mut KisekiWorld, _admin: String) {
 
 #[then(regex = r#"^"([^"]*)" cannot access tenant data until approved$"#)]
 async fn then_cannot_access(w: &mut KisekiWorld, _admin: String) {
-    if let Some(ref req) = w.control_last_access_req {
+    if let Some(ref req) = w.control.last_access_req {
         assert!(
             !req.is_active(),
             "access should not be active while pending"
@@ -463,7 +463,7 @@ async fn then_cannot_access(w: &mut KisekiWorld, _admin: String) {
 
 #[then("the request and its outcome are recorded in the audit log")]
 async fn then_request_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("audit-event".into());
+    w.control.audit_events.push("audit-event".into());
 }
 
 // --- Scenario: Access approved ---
@@ -471,8 +471,8 @@ async fn then_request_audited(w: &mut KisekiWorld) {
 #[given(regex = r#"^"([^"]*)" approves "([^"]*)" access request$"#)]
 async fn given_approves(w: &mut KisekiWorld, _tenant_admin: String, cluster_admin: String) {
     use kiseki_control::iam::{AccessLevel, AccessRequest, AccessScope};
-    if w.control_last_access_req.is_none() {
-        w.control_last_access_req = Some(AccessRequest::new(
+    if w.control.last_access_req.is_none() {
+        w.control.last_access_req = Some(AccessRequest::new(
             "req-approval",
             &cluster_admin,
             "org-pharma",
@@ -482,7 +482,7 @@ async fn given_approves(w: &mut KisekiWorld, _tenant_admin: String, cluster_admi
             4,
         ));
     }
-    w.control_last_access_req
+    w.control.last_access_req
         .as_mut()
         .unwrap()
         .approve()
@@ -497,7 +497,7 @@ async fn when_approval_processed(w: &mut KisekiWorld) {
 #[then(regex = r#"^"([^"]*)" can read tenant config/logs for "([^"]*)" namespace only$"#)]
 async fn then_can_read(w: &mut KisekiWorld, _admin: String, _namespace: String) {
     let req = w
-        .control_last_access_req
+        .control.last_access_req
         .as_ref()
         .expect("no access request");
     assert!(req.is_active(), "access should be active after approval");
@@ -506,7 +506,7 @@ async fn then_can_read(w: &mut KisekiWorld, _admin: String, _namespace: String) 
 #[then(regex = r"^access expires after (\d+) hours automatically$")]
 async fn then_expires(w: &mut KisekiWorld, hours: u32) {
     let req = w
-        .control_last_access_req
+        .control.last_access_req
         .as_ref()
         .expect("no access request");
     assert_eq!(req.duration_hours, hours);
@@ -514,7 +514,7 @@ async fn then_expires(w: &mut KisekiWorld, hours: u32) {
 
 #[then("all access during the window is recorded in the tenant audit export")]
 async fn then_access_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("audit-event".into());
+    w.control.audit_events.push("audit-event".into());
 }
 
 // --- Scenario: Access denied ---
@@ -522,8 +522,8 @@ async fn then_access_audited(w: &mut KisekiWorld) {
 #[given(regex = r#"^"([^"]*)" denies "([^"]*)" access request$"#)]
 async fn given_denies(w: &mut KisekiWorld, _tenant_admin: String, cluster_admin: String) {
     use kiseki_control::iam::{AccessLevel, AccessRequest, AccessScope};
-    if w.control_last_access_req.is_none() {
-        w.control_last_access_req = Some(AccessRequest::new(
+    if w.control.last_access_req.is_none() {
+        w.control.last_access_req = Some(AccessRequest::new(
             "req-deny",
             &cluster_admin,
             "org-pharma",
@@ -533,7 +533,7 @@ async fn given_denies(w: &mut KisekiWorld, _tenant_admin: String, cluster_admin:
             4,
         ));
     }
-    w.control_last_access_req
+    w.control.last_access_req
         .as_mut()
         .unwrap()
         .deny()
@@ -543,7 +543,7 @@ async fn given_denies(w: &mut KisekiWorld, _tenant_admin: String, cluster_admin:
 #[then(regex = r#"^"([^"]*)" cannot access any "([^"]*)" tenant data$"#)]
 async fn then_still_denied(w: &mut KisekiWorld, _admin: String, _tenant: String) {
     let req = w
-        .control_last_access_req
+        .control.last_access_req
         .as_ref()
         .expect("no access request");
     assert!(!req.is_active(), "access should not be active after denial");
@@ -552,7 +552,7 @@ async fn then_still_denied(w: &mut KisekiWorld, _admin: String, _tenant: String)
 
 #[then("the denial is recorded in the audit log")]
 async fn then_denial_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("audit-event".into());
+    w.control.audit_events.push("audit-event".into());
 }
 
 #[then(
@@ -566,13 +566,13 @@ async fn then_cluster_metrics_only(w: &mut KisekiWorld, _admin: String) {
 
 #[when(regex = r#"^"([^"]*)" attempts to access "([^"]*)" configuration$"#)]
 async fn when_cross_tenant_access(w: &mut KisekiWorld, _admin: String, _target_org: String) {
-    w.control_last_error = Some("access denied: full tenant isolation".into());
+    w.control.last_error = Some("access denied: full tenant isolation".into());
 }
 
 #[then(regex = r"^the request is denied \(full tenant isolation\)$")]
 async fn then_tenant_isolation(w: &mut KisekiWorld) {
     assert!(
-        w.control_last_error.is_some(),
+        w.control.last_error.is_some(),
         "expected tenant isolation denial"
     );
 }
@@ -586,25 +586,25 @@ async fn then_tenant_isolation(w: &mut KisekiWorld) {
 #[given(regex = r#"^"([^"]*)" has used (\d+)TB of (\d+)TB capacity quota$"#)]
 async fn given_org_capacity_used(w: &mut KisekiWorld, org_name: String, used: u64, total: u64) {
     w.ensure_control_tenant(&org_name);
-    w.control_org_capacity_used = used * 1_000_000_000_000;
-    w.control_org_capacity_total = total * 1_000_000_000_000;
+    w.control.org_capacity_used = used * 1_000_000_000_000;
+    w.control.org_capacity_total = total * 1_000_000_000_000;
 }
 
 #[when(regex = r"^a (\d+)TB write is attempted$")]
 async fn when_write_attempted(w: &mut KisekiWorld, size_tb: u64) {
     let write_bytes = size_tb * 1_000_000_000_000;
-    if w.control_org_capacity_used + write_bytes > w.control_org_capacity_total {
-        w.control_last_write_error = Some("quota exceeded".into());
+    if w.control.org_capacity_used + write_bytes > w.control.org_capacity_total {
+        w.control.last_write_error = Some("quota exceeded".into());
     } else {
-        w.control_last_write_error = None;
-        w.control_org_capacity_used += write_bytes;
+        w.control.last_write_error = None;
+        w.control.org_capacity_used += write_bytes;
     }
 }
 
 #[then(regex = r#"^the write is rejected with "quota exceeded" error$"#)]
 async fn then_write_rejected_quota(w: &mut KisekiWorld) {
     assert!(
-        w.control_last_write_error.is_some(),
+        w.control.last_write_error.is_some(),
         "expected write to be rejected"
     );
 }
@@ -621,37 +621,37 @@ async fn then_rejection_reported(w: &mut KisekiWorld) {
 #[given(regex = r#"^"([^"]*)" has (\d+)TB capacity, (\d+)TB used$"#)]
 async fn given_org_capacity_headroom(w: &mut KisekiWorld, org_name: String, total: u64, used: u64) {
     w.ensure_control_tenant(&org_name);
-    w.control_org_capacity_total = total * 1_000_000_000_000;
-    w.control_org_capacity_used = used * 1_000_000_000_000;
+    w.control.org_capacity_total = total * 1_000_000_000_000;
+    w.control.org_capacity_used = used * 1_000_000_000_000;
 }
 
 #[given(regex = r#"^workload "([^"]*)" has (\d+)TB quota, (\d+)TB used$"#)]
 async fn given_workload_capacity(w: &mut KisekiWorld, _wl: String, quota: u64, used: u64) {
-    w.control_workload_cap_total = quota * 1_000_000_000_000;
-    w.control_workload_cap_used = used * 1_000_000_000_000;
+    w.control.workload_cap_total = quota * 1_000_000_000_000;
+    w.control.workload_cap_used = used * 1_000_000_000_000;
 }
 
 #[when(regex = r#"^a (\d+)TB write is attempted by "([^"]*)"$"#)]
 async fn when_workload_write(w: &mut KisekiWorld, size_tb: u64, _wl: String) {
     let write_bytes = size_tb * 1_000_000_000_000;
-    if w.control_workload_cap_used + write_bytes > w.control_workload_cap_total {
-        w.control_last_write_error = Some(format!(
+    if w.control.workload_cap_used + write_bytes > w.control.workload_cap_total {
+        w.control.last_write_error = Some(format!(
             "workload quota exceeded: {} + {} > {}",
-            w.control_workload_cap_used / 1_000_000_000_000,
+            w.control.workload_cap_used / 1_000_000_000_000,
             write_bytes / 1_000_000_000_000,
-            w.control_workload_cap_total / 1_000_000_000_000
+            w.control.workload_cap_total / 1_000_000_000_000
         ));
-    } else if w.control_org_capacity_used + write_bytes > w.control_org_capacity_total {
-        w.control_last_write_error = Some("quota exceeded".into());
+    } else if w.control.org_capacity_used + write_bytes > w.control.org_capacity_total {
+        w.control.last_write_error = Some("quota exceeded".into());
     } else {
-        w.control_last_write_error = None;
+        w.control.last_write_error = None;
     }
 }
 
 #[then(regex = r"^the write is rejected \(workload quota exceeded: (\d+) \+ (\d+) > (\d+)\)$")]
 async fn then_workload_write_rejected(w: &mut KisekiWorld, _used: u64, _write: u64, _quota: u64) {
     assert!(
-        w.control_last_write_error.is_some(),
+        w.control.last_write_error.is_some(),
         "expected workload write to be rejected"
     );
 }
@@ -659,7 +659,7 @@ async fn then_workload_write_rejected(w: &mut KisekiWorld, _used: u64, _write: u
 #[then("org-level quota still has headroom")]
 async fn then_org_has_headroom(w: &mut KisekiWorld) {
     assert!(
-        w.control_org_capacity_used < w.control_org_capacity_total,
+        w.control.org_capacity_used < w.control.org_capacity_total,
         "org should have headroom"
     );
 }
@@ -668,34 +668,34 @@ async fn then_org_has_headroom(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^tenant admin increases workload "([^"]*)" quota to (\d+)TB$"#)]
 async fn given_quota_adjustment(w: &mut KisekiWorld, _wl: String, new_tb: u64) {
-    w.control_workload_cap_total = new_tb * 1_000_000_000_000;
-    w.control_last_quota_adjustment = true;
-    if w.control_org_capacity_total == 0 {
-        w.control_org_capacity_total = 500_000_000_000_000;
+    w.control.workload_cap_total = new_tb * 1_000_000_000_000;
+    w.control.last_quota_adjustment = true;
+    if w.control.org_capacity_total == 0 {
+        w.control.org_capacity_total = 500_000_000_000_000;
     }
 }
 
 #[when("the adjustment is within org ceiling")]
 async fn when_adjustment_within_ceiling(w: &mut KisekiWorld) {
-    if w.control_org_capacity_total > 0
-        && w.control_workload_cap_total > w.control_org_capacity_total
+    if w.control.org_capacity_total > 0
+        && w.control.workload_cap_total > w.control.org_capacity_total
     {
-        w.control_last_write_error = Some("quota exceeds org ceiling".into());
-        w.control_last_quota_adjustment = false;
+        w.control.last_write_error = Some("quota exceeds org ceiling".into());
+        w.control.last_quota_adjustment = false;
     }
 }
 
 #[then("the new quota takes effect immediately")]
 async fn then_new_quota_effective(w: &mut KisekiWorld) {
     assert!(
-        w.control_last_quota_adjustment,
+        w.control.last_quota_adjustment,
         "quota adjustment did not take effect"
     );
 }
 
 #[then("the change is recorded in the audit log")]
 async fn then_change_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("audit-event".into());
+    w.control.audit_events.push("audit-event".into());
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +706,7 @@ async fn then_change_audited(w: &mut KisekiWorld) {
 
 #[given(regex = r"^the cluster offers flavors:$")]
 async fn given_cluster_flavors(w: &mut KisekiWorld) {
-    w.control_flavor_list = kiseki_control::flavor::default_flavors();
+    w.control.flavor_list = kiseki_control::flavor::default_flavors();
 }
 
 #[when(regex = r#"^"([^"]*)" requests flavor "([^"]*)"$"#)]
@@ -717,14 +717,14 @@ async fn when_requests_flavor(w: &mut KisekiWorld, _org: String, flavor_name: St
         transport: String::new(),
         topology: String::new(),
     };
-    match kiseki_control::flavor::match_best_fit(&w.control_flavor_list, &requested) {
+    match kiseki_control::flavor::match_best_fit(&w.control.flavor_list, &requested) {
         Some(f) => {
-            w.control_last_flavor_match = Some(f);
-            w.control_last_flavor_error = None;
+            w.control.last_flavor_match = Some(f);
+            w.control.last_flavor_error = None;
         }
         None => {
-            w.control_last_flavor_match = None;
-            w.control_last_flavor_error = Some("no matching flavor available".into());
+            w.control.last_flavor_match = None;
+            w.control.last_flavor_error = Some("no matching flavor available".into());
         }
     }
 }
@@ -737,7 +737,7 @@ async fn when_cluster_capability(w: &mut KisekiWorld, _topology: String) {
 #[then("the system provides best-fit: CXI transport, closest available topology")]
 async fn then_best_fit_provided(w: &mut KisekiWorld) {
     assert!(
-        w.control_last_flavor_match.is_some() || w.control_last_flavor_error.is_some(),
+        w.control.last_flavor_match.is_some() || w.control.last_flavor_error.is_some(),
         "expected a best-fit result"
     );
 }
@@ -757,8 +757,8 @@ async fn then_mismatch_logged(w: &mut KisekiWorld) {
 #[given(regex = r#"^tenant requests flavor "([^"]*)" which doesn't match any cluster capability$"#)]
 async fn given_flavor_unavailable(w: &mut KisekiWorld, flavor_name: String) {
     // Populate defaults if not set by a prior step in this scenario.
-    if w.control_flavor_list.is_empty() {
-        w.control_flavor_list = kiseki_control::flavor::default_flavors();
+    if w.control.flavor_list.is_empty() {
+        w.control.flavor_list = kiseki_control::flavor::default_flavors();
     }
     let requested = kiseki_control::flavor::Flavor {
         name: flavor_name,
@@ -766,14 +766,14 @@ async fn given_flavor_unavailable(w: &mut KisekiWorld, flavor_name: String) {
         transport: String::new(),
         topology: String::new(),
     };
-    match kiseki_control::flavor::match_best_fit(&w.control_flavor_list, &requested) {
+    match kiseki_control::flavor::match_best_fit(&w.control.flavor_list, &requested) {
         Some(f) => {
-            w.control_last_flavor_match = Some(f);
-            w.control_last_flavor_error = None;
+            w.control.last_flavor_match = Some(f);
+            w.control.last_flavor_error = None;
         }
         None => {
-            w.control_last_flavor_match = None;
-            w.control_last_flavor_error = Some("no matching flavor available".into());
+            w.control.last_flavor_match = None;
+            w.control.last_flavor_error = Some("no matching flavor available".into());
         }
     }
 }
@@ -781,14 +781,14 @@ async fn given_flavor_unavailable(w: &mut KisekiWorld, flavor_name: String) {
 #[then(regex = r#"^the request is rejected with "no matching flavor available"$"#)]
 async fn then_flavor_rejected(w: &mut KisekiWorld) {
     assert!(
-        w.control_last_flavor_error.is_some(),
+        w.control.last_flavor_error.is_some(),
         "expected flavor rejection"
     );
 }
 
 #[then("available flavors are listed in the response")]
 async fn then_flavors_listed(w: &mut KisekiWorld) {
-    let names = kiseki_control::flavor::list_flavors(&w.control_flavor_list);
+    let names = kiseki_control::flavor::list_flavors(&w.control.flavor_list);
     assert!(!names.is_empty(), "expected available flavors");
 }
 
@@ -809,7 +809,7 @@ async fn given_org_has_tags(w: &mut KisekiWorld, org_name: String, tags: String)
         },
         compression_enabled: false,
     };
-    let _ = w.control_tenant_store.create_org(org);
+    let _ = w.control.tenant_store.create_org(org);
 }
 
 #[given(regex = r#"^project "([^"]*)" has tag \[([^\]]*)\]$"#)]
@@ -826,7 +826,7 @@ async fn given_project_has_tag(w: &mut KisekiWorld, proj_name: String, tags: Str
             metadata_ops_per_sec: 5_000,
         },
     };
-    let _ = w.control_tenant_store.create_project(proj);
+    let _ = w.control.tenant_store.create_project(proj);
 }
 
 #[given(regex = r#"^namespace "([^"]*)" has tag \[([^\]]*)\]$"#)]
@@ -839,17 +839,17 @@ async fn given_ns_has_tag(w: &mut KisekiWorld, ns_name: String, tags: String) {
         compliance_tags: parse_tags(&tags),
         read_only: false,
     };
-    let _ = w.control_namespace_store.create(ns);
+    let _ = w.control.namespace_store.create(ns);
 }
 
 #[then(regex = r#"^effective tags for "([^"]*)" are \[([^\]]*)\]$"#)]
 async fn then_effective_tags(w: &mut KisekiWorld, ns_name: String, expected_tags: String) {
-    let org = w.control_tenant_store.get_org("org-pharma").unwrap();
-    let proj = w.control_tenant_store.get_project("clinical-trials").ok();
+    let org = w.control.tenant_store.get_org("org-pharma").unwrap();
+    let proj = w.control.tenant_store.get_project("clinical-trials").ok();
     let mut effective = kiseki_control::tenant::effective_compliance_tags(&org, proj.as_ref());
 
     // Add namespace-level tags to the union.
-    if let Ok(ns) = w.control_namespace_store.get(&ns_name) {
+    if let Ok(ns) = w.control.namespace_store.get(&ns_name) {
         for tag in &ns.compliance_tags {
             if !effective.contains(tag) {
                 effective.push(tag.clone());
@@ -900,23 +900,23 @@ async fn given_ns_with_data(w: &mut KisekiWorld, ns_name: String, tags: String) 
         compliance_tags: parse_tags(&tags),
         read_only: false,
     };
-    let _ = w.control_namespace_store.create(ns);
+    let _ = w.control.namespace_store.create(ns);
 }
 
 #[when("tenant admin attempts to remove the HIPAA tag")]
 async fn when_remove_tag(w: &mut KisekiWorld) {
-    w.control_last_error =
+    w.control.last_error =
         Some("cannot remove compliance tag with existing data; migrate or delete first".into());
 }
 
 #[then("the removal is rejected")]
 async fn then_removal_rejected(w: &mut KisekiWorld) {
-    assert!(w.control_last_error.is_some(), "expected removal rejection");
+    assert!(w.control.last_error.is_some(), "expected removal rejection");
 }
 
 #[then(regex = r#"^the reason: "([^"]*)"$"#)]
 async fn then_removal_reason(w: &mut KisekiWorld, _reason: String) {
-    assert!(w.control_last_error.is_some(), "expected error with reason");
+    assert!(w.control.last_error.is_some(), "expected error with reason");
 }
 
 // --- Retention holds ---
@@ -924,14 +924,14 @@ async fn then_removal_reason(w: &mut KisekiWorld, _reason: String) {
 #[given(regex = r#"^tenant admin sets retention hold on namespace "([^"]*)":$"#)]
 async fn given_retention_hold(w: &mut KisekiWorld, ns_name: String) {
     let _ = w
-        .control_retention_store
+        .control.retention_store
         .set_hold("hipaa-litigation-2026", &ns_name);
 }
 
 #[then(regex = r#"^the hold is active on all chunks referenced by compositions in "([^"]*)"$"#)]
 async fn then_hold_active(w: &mut KisekiWorld, ns_name: String) {
     assert!(
-        w.control_retention_store.is_held(&ns_name),
+        w.control.retention_store.is_held(&ns_name),
         "hold should be active"
     );
 }
@@ -953,21 +953,21 @@ async fn given_hold_expired(w: &mut KisekiWorld, _hold: String) {
 #[when("the hold is released")]
 async fn when_hold_released(w: &mut KisekiWorld) {
     let _ = w
-        .control_retention_store
+        .control.retention_store
         .release_hold("hipaa-litigation-2026");
 }
 
 #[then("chunks with refcount 0 become eligible for physical GC")]
 async fn then_chunks_eligible(w: &mut KisekiWorld) {
     assert!(
-        !w.control_retention_store.is_held("trials"),
+        !w.control.retention_store.is_held("trials"),
         "namespace should not be held after release"
     );
 }
 
 #[then("the release is recorded in the audit log")]
 async fn then_release_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("audit-event".into());
+    w.control.audit_events.push("audit-event".into());
 }
 
 // ---------------------------------------------------------------------------
@@ -985,7 +985,7 @@ async fn given_register_peer(w: &mut KisekiWorld, site_a: String, _site_b: Strin
         config_sync: true,
         data_cipher_only: true,
     };
-    let _ = w.control_federation_reg.register(peer);
+    let _ = w.control.federation_reg.register(peer);
 }
 
 #[when(regex = r"^the peering is established:$")]
@@ -995,7 +995,7 @@ async fn when_peering_established(w: &mut KisekiWorld) {
 
 #[then("tenant config and discovery metadata replicate async between sites")]
 async fn then_config_replicates(w: &mut KisekiWorld) {
-    let peers = w.control_federation_reg.list_peers();
+    let peers = w.control.federation_reg.list_peers();
     assert!(!peers.is_empty(), "expected at least one peer");
     for p in &peers {
         assert!(p.config_sync, "config sync not enabled for {}", p.peer_id);
@@ -1004,7 +1004,7 @@ async fn then_config_replicates(w: &mut KisekiWorld) {
 
 #[then("data replication carries ciphertext (no key material)")]
 async fn then_data_cipher_only(w: &mut KisekiWorld) {
-    let peers = w.control_federation_reg.list_peers();
+    let peers = w.control.federation_reg.list_peers();
     for p in &peers {
         assert!(
             p.data_cipher_only,
@@ -1016,7 +1016,7 @@ async fn then_data_cipher_only(w: &mut KisekiWorld) {
 
 #[then("both sites connect to the same tenant KMS per tenant")]
 async fn then_same_kms(w: &mut KisekiWorld) {
-    let peers = w.control_federation_reg.list_peers();
+    let peers = w.control.federation_reg.list_peers();
     assert!(!peers.is_empty());
     for p in &peers {
         assert!(p.connected(), "peer {} not connected", p.peer_id);
@@ -1041,7 +1041,7 @@ async fn given_residency_namespace(
         compliance_tags: parse_tags(&tags),
         read_only: false,
     };
-    let _ = w.control_namespace_store.create(ns);
+    let _ = w.control.namespace_store.create(ns);
 }
 
 #[given("the residency policy requires data to stay in Switzerland")]
@@ -1051,35 +1051,35 @@ async fn given_residency_policy(w: &mut KisekiWorld) {
 
 #[when(regex = r#"^data replication to (\S+) is attempted for "([^"]*)"$"#)]
 async fn when_replication_attempted(w: &mut KisekiWorld, _site: String, ns_name: String) {
-    if let Ok(ns) = w.control_namespace_store.get(&ns_name) {
+    if let Ok(ns) = w.control.namespace_store.get(&ns_name) {
         for tag in &ns.compliance_tags {
             if *tag == ComplianceTag::SwissResidency {
-                w.control_last_error =
+                w.control.last_error =
                     Some("replication blocked: data residency constraint".into());
                 return;
             }
         }
     }
     // If namespace doesn't exist yet, assume residency constraint from Given step.
-    w.control_last_error = Some("replication blocked: data residency constraint".into());
+    w.control.last_error = Some("replication blocked: data residency constraint".into());
 }
 
 #[then("the replication is blocked")]
 async fn then_replication_blocked(w: &mut KisekiWorld) {
     assert!(
-        w.control_last_error.is_some(),
+        w.control.last_error.is_some(),
         "expected replication to be blocked"
     );
 }
 
 #[then("only data without residency constraints replicates")]
 async fn then_unconstrained_replicates(w: &mut KisekiWorld) {
-    assert!(w.control_last_error.is_some());
+    assert!(w.control.last_error.is_some());
 }
 
 #[then("the blocked replication attempt is recorded in the audit log")]
 async fn then_blocked_replication_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("audit-event".into());
+    w.control.audit_events.push("audit-event".into());
 }
 
 // --- Config sync across sites ---
@@ -1096,7 +1096,7 @@ async fn given_org_both_sites(w: &mut KisekiWorld, _org: String, site_a: String,
             config_sync: true,
             data_cipher_only: true,
         };
-        let _ = w.control_federation_reg.register(peer);
+        let _ = w.control.federation_reg.register(peer);
     }
 }
 
@@ -1108,7 +1108,7 @@ async fn when_quota_updated_at_site(w: &mut KisekiWorld, _site: String) {
 #[then(regex = r"^the config change replicates async to (\S+)$")]
 async fn then_config_replicates_to(w: &mut KisekiWorld, site: String) {
     assert!(
-        w.control_federation_reg.is_connected(&site),
+        w.control.federation_reg.is_connected(&site),
         "{site} not connected for config replication"
     );
 }
@@ -1116,7 +1116,7 @@ async fn then_config_replicates_to(w: &mut KisekiWorld, site: String) {
 #[then(regex = r"^(\S+) enforces the new quota after sync$")]
 async fn then_site_enforces_quota(w: &mut KisekiWorld, site: String) {
     assert!(
-        w.control_federation_reg.is_connected(&site),
+        w.control.federation_reg.is_connected(&site),
         "{site} not connected"
     );
 }
@@ -1134,27 +1134,27 @@ use kiseki_control::advisory_policy::{
 
 #[given(regex = r#"^cluster admin "([^"]*)" sets cluster-wide Workflow Advisory ceilings:$"#)]
 async fn given_cluster_ceilings(w: &mut KisekiWorld, _admin: String) {
-    w.control_cluster_ceiling = HintBudget {
+    w.control.cluster_ceiling = HintBudget {
         hints_per_sec: 1000,
         max_concurrent_flows: 64,
         phases_per_workflow: 0,
         prefetch_bytes_max: 256 * 1024 * 1024 * 1024,
     };
-    w.control_audit_events.push("cluster-ceiling-set".into());
+    w.control.audit_events.push("cluster-ceiling-set".into());
 }
 
 #[then("these values are enforced as upper bounds for all org-level settings")]
 async fn then_ceilings_enforced(w: &mut KisekiWorld) {
     let exceeding = HintBudget {
-        hints_per_sec: w.control_cluster_ceiling.hints_per_sec + 1,
+        hints_per_sec: w.control.cluster_ceiling.hints_per_sec + 1,
         ..Default::default()
     };
-    assert!(validate_budget_inheritance(&w.control_cluster_ceiling, &exceeding).is_err());
+    assert!(validate_budget_inheritance(&w.control.cluster_ceiling, &exceeding).is_err());
     let within = HintBudget {
-        hints_per_sec: w.control_cluster_ceiling.hints_per_sec - 1,
+        hints_per_sec: w.control.cluster_ceiling.hints_per_sec - 1,
         ..Default::default()
     };
-    assert!(validate_budget_inheritance(&w.control_cluster_ceiling, &within).is_ok());
+    assert!(validate_budget_inheritance(&w.control.cluster_ceiling, &within).is_ok());
 }
 
 #[then(
@@ -1162,22 +1162,22 @@ async fn then_ceilings_enforced(w: &mut KisekiWorld) {
 )]
 async fn then_exceeds_rejected(w: &mut KisekiWorld) {
     let exceeding = HintBudget {
-        hints_per_sec: w.control_cluster_ceiling.hints_per_sec + 1,
+        hints_per_sec: w.control.cluster_ceiling.hints_per_sec + 1,
         ..Default::default()
     };
-    assert!(validate_budget_inheritance(&w.control_cluster_ceiling, &exceeding).is_err());
+    assert!(validate_budget_inheritance(&w.control.cluster_ceiling, &exceeding).is_err());
 }
 
 #[then("the change is recorded in the cluster audit trail")]
 async fn then_cluster_audit(w: &mut KisekiWorld) {
-    assert!(!w.control_audit_events.is_empty());
+    assert!(!w.control.audit_events.is_empty());
 }
 
 // --- Scenario 25: Profile allow-list narrows ---
 
 #[given(regex = r#"^tenant admin "([^"]*)" for "([^"]*)" sets allowed profiles \[([^\]]*)\]$"#)]
 async fn given_org_profiles(w: &mut KisekiWorld, _admin: String, org: String, profiles: String) {
-    w.control_org_policy = Some(ScopePolicy {
+    w.control.org_policy = Some(ScopePolicy {
         scope_id: org,
         parent_id: String::new(),
         budget: HintBudget::default(),
@@ -1193,9 +1193,9 @@ async fn given_project_narrows(w: &mut KisekiWorld, proj: String, profiles: Stri
     let proj_profiles = ProfilePolicy {
         allowed_profiles: split_profiles(&profiles),
     };
-    let org = w.control_org_policy.as_ref().expect("org policy not set");
+    let org = w.control.org_policy.as_ref().expect("org policy not set");
     validate_profile_inheritance(&org.profiles, &proj_profiles).expect("profile validation failed");
-    w.control_project_policy = Some(ScopePolicy {
+    w.control.project_policy = Some(ScopePolicy {
         scope_id: proj,
         parent_id: org.scope_id.clone(),
         budget: HintBudget::default(),
@@ -1210,12 +1210,12 @@ async fn given_wl_profiles(w: &mut KisekiWorld, wl: String, proj: String, profil
         allowed_profiles: split_profiles(&profiles),
     };
     let proj_policy = w
-        .control_project_policy
+        .control.project_policy
         .as_ref()
         .expect("project policy not set");
     validate_profile_inheritance(&proj_policy.profiles, &wl_profiles)
         .expect("wl profile validation failed");
-    w.control_workload_policy = Some(ScopePolicy {
+    w.control.workload_policy = Some(ScopePolicy {
         scope_id: wl,
         parent_id: proj,
         budget: HintBudget::default(),
@@ -1229,7 +1229,7 @@ async fn given_wl_profiles(w: &mut KisekiWorld, wl: String, proj: String, profil
 )]
 async fn then_effective_profiles(w: &mut KisekiWorld, _wl: String, expected: String) {
     let wl = w
-        .control_workload_policy
+        .control.workload_policy
         .as_ref()
         .expect("workload policy not set");
     let expected_list = split_profiles(&expected);
@@ -1244,7 +1244,7 @@ async fn then_effective_profiles(w: &mut KisekiWorld, _wl: String, expected: Str
     let bad = ProfilePolicy {
         allowed_profiles: vec!["not-in-parent-scope".into()],
     };
-    let org = w.control_org_policy.as_ref().unwrap();
+    let org = w.control.org_policy.as_ref().unwrap();
     assert!(validate_profile_inheritance(&org.profiles, &bad).is_err());
 }
 
@@ -1255,7 +1255,7 @@ async fn then_profile_not_in_parent(w: &mut KisekiWorld) {
     let bad = ProfilePolicy {
         allowed_profiles: vec!["not-in-parent".into()],
     };
-    let org = w.control_org_policy.as_ref().unwrap();
+    let org = w.control.org_policy.as_ref().unwrap();
     assert!(validate_profile_inheritance(&org.profiles, &bad).is_err());
 }
 
@@ -1263,7 +1263,7 @@ async fn then_profile_not_in_parent(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^project "([^"]*)" ceiling sets hints_per_sec (\d+)$"#)]
 async fn given_project_ceiling(w: &mut KisekiWorld, proj: String, hps: u32) {
-    w.control_project_policy = Some(ScopePolicy {
+    w.control.project_policy = Some(ScopePolicy {
         scope_id: proj,
         parent_id: String::new(),
         budget: HintBudget {
@@ -1282,17 +1282,17 @@ async fn when_wl_budget_exceeds(w: &mut KisekiWorld, _wl: String, hps: u32) {
         ..Default::default()
     };
     let proj = w
-        .control_project_policy
+        .control.project_policy
         .as_ref()
         .expect("project policy not set");
     match validate_budget_inheritance(&proj.budget, &child) {
         Ok(()) => {
-            w.control_last_policy_error = None;
+            w.control.last_policy_error = None;
             w.last_error = None;
         }
         Err(e) => {
             let msg = e.to_string();
-            w.control_last_policy_error = Some(msg.clone());
+            w.control.last_policy_error = Some(msg.clone());
             w.last_error = Some(msg);
         }
     }
@@ -1300,63 +1300,63 @@ async fn when_wl_budget_exceeds(w: &mut KisekiWorld, _wl: String, hps: u32) {
 
 #[then(regex = r#"^the update is rejected with "child_exceeds_parent_ceiling"$"#)]
 async fn then_child_exceeds(w: &mut KisekiWorld) {
-    assert!(w.control_last_policy_error.is_some(), "expected rejection");
+    assert!(w.control.last_policy_error.is_some(), "expected rejection");
 }
 
 // "the workload's effective budget remains its last-valid value" reused from advisory.rs.
 
 #[then("the rejected change is audited")]
 async fn then_rejected_audited(w: &mut KisekiWorld) {
-    w.control_audit_events.push("budget-rejected".into());
+    w.control.audit_events.push("budget-rejected".into());
 }
 
 // --- Scenario 27: Three-state opt-out transition ---
 
 #[given(regex = r#"^"([^"]*)" has Workflow Advisory enabled with (\d+) active workflows$"#)]
 async fn given_advisory_enabled(w: &mut KisekiWorld, _wl: String, active: u32) {
-    w.control_advisory_state = OptOutState::Enabled;
-    w.control_active_workflows = active;
+    w.control.advisory_state = OptOutState::Enabled;
+    w.control.active_workflows = active;
 }
 
 #[when(regex = r#"^tenant admin transitions advisory state to "draining"$"#)]
 async fn when_transition_draining(w: &mut KisekiWorld) {
-    assert_eq!(w.control_advisory_state, OptOutState::Enabled);
-    w.control_advisory_state = OptOutState::Draining;
+    assert_eq!(w.control.advisory_state, OptOutState::Enabled);
+    w.control.advisory_state = OptOutState::Draining;
 }
 
 #[then(regex = r#"^new DeclareWorkflow calls from "([^"]*)" clients return ADVISORY_DISABLED$"#)]
 async fn then_declare_disabled(w: &mut KisekiWorld, _wl: String) {
-    assert_eq!(w.control_advisory_state, OptOutState::Draining);
+    assert_eq!(w.control.advisory_state, OptOutState::Draining);
 }
 
 #[then(
     regex = r"^the (\d+) active workflows continue accepting hints within their current phases$"
 )]
 async fn then_active_continue(w: &mut KisekiWorld, count: u32) {
-    assert!(w.control_active_workflows >= count);
+    assert!(w.control.active_workflows >= count);
 }
 
 #[then("when each active workflow ends or TTLs, it is audit-ended")]
 async fn then_workflows_audit_ended(w: &mut KisekiWorld) {
-    w.control_audit_events.push("workflow-audit-ended".into());
+    w.control.audit_events.push("workflow-audit-ended".into());
 }
 
 #[when("the tenant admin subsequently transitions draining -> disabled")]
 async fn when_transition_disabled(w: &mut KisekiWorld) {
-    assert_eq!(w.control_advisory_state, OptOutState::Draining);
-    w.control_advisory_state = OptOutState::Disabled;
-    w.control_active_workflows = 0;
+    assert_eq!(w.control.advisory_state, OptOutState::Draining);
+    w.control.advisory_state = OptOutState::Disabled;
+    w.control.active_workflows = 0;
 }
 
 #[then("all hint processing ends, active telemetry subscriptions close")]
 async fn then_hints_end(w: &mut KisekiWorld) {
-    assert_eq!(w.control_advisory_state, OptOutState::Disabled);
-    assert_eq!(w.control_active_workflows, 0);
+    assert_eq!(w.control.advisory_state, OptOutState::Disabled);
+    assert_eq!(w.control.active_workflows, 0);
 }
 
 #[then("data-path operations remain fully correct throughout (I-WA12)")]
 async fn then_data_path_correct(w: &mut KisekiWorld) {
-    assert!(w.control_last_error.is_none());
+    assert!(w.control.last_error.is_none());
 }
 
 // --- Scenario 28: Cluster-wide emergency disable ---
@@ -1368,62 +1368,62 @@ async fn given_suspected_issue(w: &mut KisekiWorld) {
 
 #[when(regex = r#"^cluster admin transitions cluster-wide state directly to "disabled"$"#)]
 async fn when_cluster_disabled(w: &mut KisekiWorld) {
-    w.control_advisory_state = OptOutState::Disabled;
-    w.control_active_workflows = 0;
+    w.control.advisory_state = OptOutState::Disabled;
+    w.control.active_workflows = 0;
 }
 
 #[then("all tenants observe ADVISORY_DISABLED on new DeclareWorkflow calls")]
 async fn then_all_disabled(w: &mut KisekiWorld) {
-    assert_eq!(w.control_advisory_state, OptOutState::Disabled);
+    assert_eq!(w.control.advisory_state, OptOutState::Disabled);
 }
 
 #[then("active workflows across tenants are audit-ended")]
 async fn then_tenants_audit_ended(w: &mut KisekiWorld) {
-    w.control_audit_events
+    w.control.audit_events
         .push("cluster-workflow-audit-ended".into());
 }
 
 #[then("no data-path operation is blocked, slowed, or fails (I-WA2)")]
 async fn then_no_data_impact(w: &mut KisekiWorld) {
-    assert!(w.control_last_error.is_none());
-    assert_eq!(w.control_advisory_state, OptOutState::Disabled);
+    assert!(w.control.last_error.is_none());
+    assert_eq!(w.control.advisory_state, OptOutState::Disabled);
 }
 
 #[then("the cluster-wide transition is recorded in the cluster audit trail")]
 async fn then_cluster_transition_audited(w: &mut KisekiWorld) {
-    assert!(!w.control_audit_events.is_empty());
+    assert!(!w.control.audit_events.is_empty());
 }
 
 // --- Scenario 29: Prospective policy changes ---
 
 #[given(regex = r#"^workflow "([^"]*)" is active in phase "([^"]*)" under profile (\S+)$"#)]
 async fn given_active_workflow(w: &mut KisekiWorld, _wf: String, _phase: String, _profile: String) {
-    w.control_active_workflows = 1;
+    w.control.active_workflows = 1;
 }
 
 #[when(regex = r#"^tenant admin removes "([^"]*)" from the workload's allow-list$"#)]
 async fn when_profile_removed(w: &mut KisekiWorld, _profile: String) {
-    w.control_last_policy_error = Some("profile_revoked".into());
+    w.control.last_policy_error = Some("profile_revoked".into());
 }
 
 #[then(
     regex = r#"^"([^"]*)" continues its current phase under the policy effective at DeclareWorkflow \(I-WA18\)$"#
 )]
 async fn then_continues_phase(w: &mut KisekiWorld, _wf: String) {
-    assert!(w.control_active_workflows >= 1);
-    assert!(w.control_last_policy_error.is_some());
+    assert!(w.control.active_workflows >= 1);
+    assert!(w.control.last_policy_error.is_some());
 }
 
 #[then(
     regex = r#"^the next PhaseAdvance is rejected with "profile_revoked" and the workflow remains on its current phase$"#
 )]
 async fn then_phase_rejected(w: &mut KisekiWorld) {
-    assert!(w.control_last_policy_error.is_some());
+    assert!(w.control.last_policy_error.is_some());
 }
 
 #[then("budget reductions take effect prospectively from the next second")]
 async fn then_budget_prospective(w: &mut KisekiWorld) {
-    assert!(w.control_active_workflows >= 1);
+    assert!(w.control.active_workflows >= 1);
 }
 
 // --- Scenario 30: Audit export includes advisory events ---
@@ -1444,13 +1444,13 @@ async fn when_export_generated(w: &mut KisekiWorld) {
         "hint-accepted-aggregate",
         "hint-throttled-aggregate",
     ] {
-        w.control_audit_events.push((*event).into());
+        w.control.audit_events.push((*event).into());
     }
 }
 
 #[then(regex = r"^it includes advisory-audit events: .*$")]
 async fn then_includes_advisory_events(w: &mut KisekiWorld) {
-    assert!(!w.control_audit_events.is_empty());
+    assert!(!w.control.audit_events.is_empty());
 }
 
 #[then(
@@ -1459,7 +1459,7 @@ async fn then_includes_advisory_events(w: &mut KisekiWorld) {
 async fn then_events_have_correlation(w: &mut KisekiWorld) {
     let required = ["declare-workflow", "end-workflow", "phase-advance"];
     for r in &required {
-        assert!(w.control_audit_events.iter().any(|e| e == r), "missing {r}");
+        assert!(w.control.audit_events.iter().any(|e| e == r), "missing {r}");
     }
 }
 
@@ -1467,7 +1467,7 @@ async fn then_events_have_correlation(w: &mut KisekiWorld) {
     regex = r"^cluster-admin exports over the same window see workflow_id and phase_tag as opaque hashes only \(I-A3, I-WA8\)$"
 )]
 async fn then_opaque_hashes(w: &mut KisekiWorld) {
-    assert!(!w.control_audit_events.is_empty());
+    assert!(!w.control.audit_events.is_empty());
 }
 
 // --- Scenario 31: Federation does NOT replicate advisory state ---
@@ -1476,7 +1476,7 @@ async fn then_opaque_hashes(w: &mut KisekiWorld) {
 async fn given_federated_org(w: &mut KisekiWorld, _org: String) {
     use kiseki_control::federation::Peer;
     for site in ["site-A", "site-B"] {
-        let _ = w.control_federation_reg.register(Peer {
+        let _ = w.control.federation_reg.register(Peer {
             site_id: site.into(),
             endpoint: format!("https://{site}.kiseki.internal:443"),
             connected: false,
@@ -1489,31 +1489,31 @@ async fn given_federated_org(w: &mut KisekiWorld, _org: String) {
 
 #[when("a workflow is declared at site A")]
 async fn when_wf_declared_site_a(w: &mut KisekiWorld) {
-    w.control_active_workflows += 1;
+    w.control.active_workflows += 1;
 }
 
 #[then("the workflow handle and in-memory state are local to site A")]
 async fn then_wf_local(w: &mut KisekiWorld) {
-    assert!(w.control_active_workflows >= 1);
+    assert!(w.control.active_workflows >= 1);
 }
 
 #[then("no workflow_id is replicated to site B")]
 async fn then_no_wf_replicated(w: &mut KisekiWorld) {
-    assert!(w.control_active_workflows >= 1);
+    assert!(w.control.active_workflows >= 1);
 }
 
 #[then(
     "profile allow-lists, hint budgets, and opt-out state (which are config) ARE replicated async"
 )]
 async fn then_config_replicated(w: &mut KisekiWorld) {
-    for p in w.control_federation_reg.list_peers() {
+    for p in w.control.federation_reg.list_peers() {
         assert!(p.config_sync, "config sync not enabled for {}", p.peer_id);
     }
 }
 
 #[then("the advisory subsystem is independent per site")]
 async fn then_advisory_independent(w: &mut KisekiWorld) {
-    assert!(w.control_active_workflows >= 1);
+    assert!(w.control.active_workflows >= 1);
 }
 
 // --- Scenario 32: Pool authorization ---
@@ -1525,10 +1525,10 @@ async fn then_advisory_independent(w: &mut KisekiWorld) {
 async fn when_pool_handles_minted(w: &mut KisekiWorld) {
     // Pool authorization happens in the Given step (client.rs).
     // Populate control_pool_authorized for our assertions.
-    if w.control_pool_authorized.is_empty() {
-        w.control_pool_authorized
+    if w.control.pool_authorized.is_empty() {
+        w.control.pool_authorized
             .insert("fast-nvme".into(), "pool-0af7".into());
-        w.control_pool_authorized
+        w.control.pool_authorized
             .insert("bulk-nvme".into(), "pool-921c".into());
     }
 }
@@ -1549,7 +1549,7 @@ async fn then_opaque_label(w: &mut KisekiWorld) {
 async fn then_internal_pool_hidden(w: &mut KisekiWorld) {
     // The pool_authorized map has opaque_label -> internal_pool, and
     // we verify they differ (opaque label != internal pool ID).
-    for (label, pool) in &w.control_pool_authorized {
+    for (label, pool) in &w.control.pool_authorized {
         assert_ne!(
             label, pool,
             "opaque label should differ from internal pool ID"
@@ -1616,13 +1616,13 @@ async fn given_cluster_max_cache(_w: &mut KisekiWorld, _max: String) {}
 
 #[when(regex = r#"^org "([^"]*)" attempts to set max_cache_bytes to (\S+)$"#)]
 async fn when_org_exceeds_cache(w: &mut KisekiWorld, _org: String, _max: String) {
-    w.control_last_error = Some("exceeds_parent_ceiling".into());
+    w.control.last_error = Some("exceeds_parent_ceiling".into());
 }
 
 #[then(regex = r#"^the request is rejected with "exceeds_parent_ceiling"$"#)]
 async fn then_exceeds_ceiling_rejected(w: &mut KisekiWorld) {
     assert!(
-        w.control_last_error.is_some(),
+        w.control.last_error.is_some(),
         "expected exceeds_parent_ceiling rejection"
     );
 }
@@ -1669,7 +1669,7 @@ async fn given_no_tenant_config(_w: &mut KisekiWorld) {}
 
 #[given("the Control Plane and all storage nodes are unreachable")]
 async fn given_all_unreachable(w: &mut KisekiWorld) {
-    w.control_plane_up = false;
+    w.control.plane_up = false;
 }
 
 #[then("the client uses conservative defaults: organic, 10GB, 5s TTL (I-CC9)")]

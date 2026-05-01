@@ -86,7 +86,7 @@ async fn given_view_descriptor(w: &mut KisekiWorld, step: &Step, name: String) {
         discardable,
         version: 1,
     };
-    let id = w.view_store.create_view(desc).unwrap();
+    let id = w.legacy.view_store.create_view(desc).unwrap();
     w.view_ids.insert(name, id);
     w.last_view_id = Some(id);
 }
@@ -99,7 +99,7 @@ async fn given_hipaa_floor(_w: &mut KisekiWorld, _bound: String) {
 #[when(regex = r#"^a view "(\S+)" is created from descriptor$"#)]
 async fn when_create_view(w: &mut KisekiWorld, name: String) {
     let desc = test_descriptor(&name);
-    let id = w.view_store.create_view(desc).unwrap();
+    let id = w.legacy.view_store.create_view(desc).unwrap();
     w.last_view_id = Some(id);
     w.view_ids.insert(name, id);
 }
@@ -108,7 +108,7 @@ async fn when_create_view(w: &mut KisekiWorld, name: String) {
 async fn then_view_state(w: &mut KisekiWorld, expected: String) {
     let id = w.last_view_id.expect("view must exist");
     let view = w
-        .view_store
+        .legacy.view_store
         .get_view(id)
         .expect("view should be retrievable");
     let state_str = match view.state {
@@ -118,7 +118,7 @@ async fn then_view_state(w: &mut KisekiWorld, expected: String) {
     };
     assert_eq!(state_str, expected, "view state mismatch");
     assert!(
-        w.view_store.count() > 0,
+        w.legacy.view_store.count() > 0,
         "view store should have at least one view"
     );
 }
@@ -126,7 +126,7 @@ async fn then_view_state(w: &mut KisekiWorld, expected: String) {
 #[when(regex = r#"^the watermark is advanced to (\d+)$"#)]
 async fn when_advance(w: &mut KisekiWorld, pos: u64) {
     let id = w.last_view_id.unwrap();
-    w.view_store
+    w.legacy.view_store
         .advance_watermark(id, SequenceNumber(pos), 1000)
         .unwrap();
 }
@@ -134,21 +134,21 @@ async fn when_advance(w: &mut KisekiWorld, pos: u64) {
 #[when(regex = r#"^the view "(\S+)" is discarded$"#)]
 async fn when_discard(w: &mut KisekiWorld, name: String) {
     let id = *w.view_ids.get(&name).unwrap();
-    w.view_store.discard_view(id).unwrap();
+    w.legacy.view_store.discard_view(id).unwrap();
     w.last_view_id = Some(id);
 }
 
 #[when(regex = r#"^an MVCC read pin is acquired with TTL (\d+)ms$"#)]
 async fn when_pin(w: &mut KisekiWorld, ttl: u64) {
     let id = w.last_view_id.unwrap();
-    let pin_id = w.view_store.acquire_pin(id, ttl, 1000).unwrap();
+    let pin_id = w.legacy.view_store.acquire_pin(id, ttl, 1000).unwrap();
     w.last_sequence = Some(SequenceNumber(pin_id));
 }
 
 #[then(regex = r#"^the pin holds a snapshot at the current watermark$"#)]
 async fn then_pin_holds(w: &mut KisekiWorld) {
     let id = w.last_view_id.unwrap();
-    let view = w.view_store.get_view(id).unwrap();
+    let view = w.legacy.view_store.get_view(id).unwrap();
     assert!(!view.pins.is_empty());
 }
 
@@ -160,9 +160,9 @@ async fn when_time_passes(_w: &mut KisekiWorld, _ms: u64) {
 #[then("the pin expires")]
 async fn then_pin_expires(w: &mut KisekiWorld) {
     let id = w.last_view_id.unwrap();
-    let expired = w.view_store.expire_pins(id, 100_000); // far future
+    let expired = w.legacy.view_store.expire_pins(id, 100_000); // far future
     assert!(expired > 0, "pin should have expired");
-    let view = w.view_store.get_view(id).unwrap();
+    let view = w.legacy.view_store.get_view(id).unwrap();
     assert!(view.pins.is_empty(), "all pins should be expired");
 }
 
@@ -176,10 +176,10 @@ async fn given_sp_at_watermark(_w: &mut KisekiWorld, _sp: String, _wm: u64) {
 #[when(regex = r#"^new deltas \[(\d+)\.\.(\d+)\] are available in "(\S+)"$"#)]
 async fn when_new_deltas(w: &mut KisekiWorld, _from: u64, to: u64, shard: String) {
     let sid = w.ensure_shard(&shard);
-    let current = w.log_store.shard_health(sid).await.unwrap().tip.0;
+    let current = w.legacy.log_store.shard_health(sid).await.unwrap().tip.0;
     for i in current..to {
         let req = w.make_append_request(sid, ((i % 254) + 1) as u8);
-        w.log_store.append_delta(req).await.unwrap();
+        w.legacy.log_store.append_delta(req).await.unwrap();
     }
 }
 
@@ -252,7 +252,7 @@ async fn then_reader_sees_write(w: &mut KisekiWorld) {
     w.poll_views().await;
     for &vid in w.view_ids.values() {
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "view should exist after write"
         );
     }
@@ -322,7 +322,7 @@ async fn given_tenant_admin_creates_descriptor(w: &mut KisekiWorld, step: &Step,
         discardable,
         version: 1,
     };
-    let id = w.view_store.create_view(desc).unwrap();
+    let id = w.legacy.view_store.create_view(desc).unwrap();
     w.view_ids.insert(name, id);
     w.last_view_id = Some(id);
 }
@@ -334,7 +334,7 @@ async fn when_control_plane_registers(_w: &mut KisekiWorld) {}
 async fn then_sp_spawned(w: &mut KisekiWorld, _sp: String) {
     assert!(w.last_view_id.is_some());
     let vid = w.last_view_id.unwrap();
-    assert!(w.view_store.get_view(vid).is_ok());
+    assert!(w.legacy.view_store.get_view(vid).is_ok());
 }
 
 #[then(regex = r#"^it begins consuming from (\S+) at position (\d+)$"#)]
@@ -350,7 +350,7 @@ async fn then_materializes_from_beginning(w: &mut KisekiWorld) {
 #[then("it catches up to the current log tip over time")]
 async fn then_catches_up(w: &mut KisekiWorld) {
     assert!(
-        w.view_store.count() > 0,
+        w.legacy.view_store.count() > 0,
         "view store should have at least one view"
     );
 }
@@ -366,14 +366,14 @@ async fn when_admin_discards_view(_w: &mut KisekiWorld) {}
 #[then(regex = r#"^the materialized state is deleted from (\S+)$"#)]
 async fn then_materialized_deleted(w: &mut KisekiWorld, _pool: String) {
     if let Some(vid) = w.last_view_id {
-        let _ = w.view_store.discard_view(vid);
+        let _ = w.legacy.view_store.discard_view(vid);
     }
 }
 
 #[then("the stream processor is stopped")]
 async fn then_sp_stopped(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        if let Ok(v) = w.view_store.get_view(vid) {
+        if let Ok(v) = w.legacy.view_store.get_view(vid) {
             assert_eq!(v.state, kiseki_view::ViewState::Discarded);
         }
     }
@@ -383,7 +383,7 @@ async fn then_sp_stopped(w: &mut KisekiWorld) {
 async fn then_descriptor_retained(w: &mut KisekiWorld) {
     let id = w.last_view_id.unwrap();
     assert!(
-        w.view_store.get_view(id).is_ok(),
+        w.legacy.view_store.get_view(id).is_ok(),
         "view descriptor should be retained after discard"
     );
 }
@@ -391,7 +391,7 @@ async fn then_descriptor_retained(w: &mut KisekiWorld) {
 #[then("later, the view can be rebuilt by restarting the stream processor")]
 async fn then_view_can_rebuild(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        assert!(w.view_store.get_view(vid).is_ok());
+        assert!(w.legacy.view_store.get_view(vid).is_ok());
     }
 }
 
@@ -412,7 +412,7 @@ async fn when_update_descriptor(_w: &mut KisekiWorld, _desc: String, _pool: Stri
 
 #[then("a new descriptor version is stored in the Control Plane")]
 async fn then_new_descriptor_version(w: &mut KisekiWorld) {
-    assert!(w.view_store.count() > 0);
+    assert!(w.legacy.view_store.count() > 0);
 }
 
 #[then(regex = r#"^on the next materialization cycle, "(\S+)" detects the new version$"#)]
@@ -433,7 +433,7 @@ async fn then_migrates_data(w: &mut KisekiWorld) {
 #[then("reads continue from old materialization until migration completes")]
 async fn then_reads_continue(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        assert!(w.view_store.get_view(vid).is_ok());
+        assert!(w.legacy.view_store.get_view(vid).is_ok());
     }
 }
 
@@ -445,7 +445,7 @@ async fn when_read_begins(_w: &mut KisekiWorld) {}
 #[then(regex = r#"^it pins a snapshot at position (\d+)$"#)]
 async fn then_pins_snapshot(w: &mut KisekiWorld, _pos: u64) {
     if let Some(vid) = w.last_view_id {
-        let pin = w.view_store.acquire_pin(vid, 30_000, 1000);
+        let pin = w.legacy.view_store.acquire_pin(vid, 30_000, 1000);
         assert!(pin.is_ok(), "pin acquisition should succeed");
     }
 }
@@ -453,7 +453,7 @@ async fn then_pins_snapshot(w: &mut KisekiWorld, _pos: u64) {
 #[then(regex = r#"^concurrent writes \(position (\d+), (\d+)\) are invisible to this read$"#)]
 async fn then_concurrent_invisible(w: &mut KisekiWorld, _a: u64, _b: u64) {
     if let Some(vid) = w.last_view_id {
-        assert!(w.view_store.get_view(vid).is_ok());
+        assert!(w.legacy.view_store.get_view(vid).is_ok());
     }
 }
 
@@ -461,7 +461,7 @@ async fn then_concurrent_invisible(w: &mut KisekiWorld, _a: u64, _b: u64) {
 async fn then_consistent_snapshot(w: &mut KisekiWorld) {
     if let Some(id) = w.last_view_id {
         assert!(
-            w.view_store.get_view(id).is_ok(),
+            w.legacy.view_store.get_view(id).is_ok(),
             "view must exist for consistent snapshot reads"
         );
     }
@@ -481,14 +481,14 @@ async fn when_pin_expires(_w: &mut KisekiWorld) {}
 #[then("the snapshot guarantee is revoked")]
 async fn then_snapshot_revoked(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        w.view_store.expire_pins(vid, u64::MAX);
+        w.legacy.view_store.expire_pins(vid, u64::MAX);
     }
 }
 
 #[then(regex = r#"^the read receives a "snapshot expired" error if still in progress$"#)]
 async fn then_snapshot_expired(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).unwrap();
+        let view = w.legacy.view_store.get_view(vid).unwrap();
         assert!(view.pins.is_empty(), "pins should be expired");
     }
 }
@@ -501,7 +501,7 @@ async fn then_caller_restarts(_w: &mut KisekiWorld) {
 #[then(regex = r#"^compaction can now proceed past position (\d+)$"#)]
 async fn then_compaction_past(w: &mut KisekiWorld, _pos: u64) {
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).unwrap();
+        let view = w.legacy.view_store.get_view(vid).unwrap();
         assert!(view.pins.is_empty());
     }
 }
@@ -692,7 +692,7 @@ async fn when_read_s3(_w: &mut KisekiWorld) {}
 async fn then_s3_not_reflect(w: &mut KisekiWorld, _seq: u64) {
     // S3 views use BoundedStaleness — they may lag behind the NFS view.
     for &vid in w.view_ids.values() {
-        if let Ok(view) = w.view_store.get_view(vid) {
+        if let Ok(view) = w.legacy.view_store.get_view(vid) {
             if let ConsistencyModel::BoundedStaleness { .. } = view.descriptor.consistency {
                 assert!(
                     view.check_staleness(view.last_advanced_ms + 1000).is_ok(),
@@ -706,7 +706,7 @@ async fn then_s3_not_reflect(w: &mut KisekiWorld, _seq: u64) {
 #[then(regex = r#"^the reader sees state as of (\d+)$"#)]
 async fn then_reader_sees_state(w: &mut KisekiWorld, _wm: u64) {
     for &vid in w.view_ids.values() {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         let _ = view.watermark;
     }
 }
@@ -714,7 +714,7 @@ async fn then_reader_sees_state(w: &mut KisekiWorld, _wm: u64) {
 #[then("this is compliant because S3 declares bounded-staleness")]
 async fn then_compliant_bounded_staleness(w: &mut KisekiWorld) {
     let has_bounded = w.view_ids.values().any(|&vid| {
-        w.view_store.get_view(vid).map_or(false, |v| {
+        w.legacy.view_store.get_view(vid).map_or(false, |v| {
             matches!(
                 v.descriptor.consistency,
                 ConsistencyModel::BoundedStaleness { .. }
@@ -736,7 +736,7 @@ async fn when_read_nfs_same(_w: &mut KisekiWorld) {}
 async fn then_nfs_reflects_ryw(w: &mut KisekiWorld, _seq: u64) {
     w.poll_views().await;
     for &vid in w.view_ids.values() {
-        if let Ok(view) = w.view_store.get_view(vid) {
+        if let Ok(view) = w.legacy.view_store.get_view(vid) {
             if view.descriptor.consistency == ConsistencyModel::ReadYourWrites {
                 assert!(
                     view.state != ViewState::Discarded,
@@ -751,7 +751,7 @@ async fn then_nfs_reflects_ryw(w: &mut KisekiWorld, _seq: u64) {
 async fn then_reader_sees_own(w: &mut KisekiWorld) {
     w.poll_views().await;
     for &vid in w.view_ids.values() {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         if view.descriptor.consistency == ConsistencyModel::ReadYourWrites {
             assert!(
                 view.state != ViewState::Discarded,
@@ -773,7 +773,7 @@ async fn when_sp_restarts(_w: &mut KisekiWorld) {}
 async fn then_reads_last_watermark(w: &mut KisekiWorld, _wm: u64) {
     if let Some(vid) = w.last_view_id {
         let view = w
-            .view_store
+            .legacy.view_store
             .get_view(vid)
             .expect("view must exist after restart");
         let _ = view.watermark;
@@ -785,7 +785,7 @@ async fn then_resumes_consuming(w: &mut KisekiWorld, _pos: u64) {
     w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "view must exist to resume consuming"
         );
     }
@@ -795,7 +795,7 @@ async fn then_resumes_consuming(w: &mut KisekiWorld, _pos: u64) {
 async fn then_rematerializes_deltas(w: &mut KisekiWorld, _from: u64) {
     w.poll_views().await;
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         assert!(
             view.state != ViewState::Discarded,
             "view should be building or active after re-materialization"
@@ -807,7 +807,7 @@ async fn then_rematerializes_deltas(w: &mut KisekiWorld, _from: u64) {
 async fn then_no_data_lost(w: &mut KisekiWorld) {
     if let Some(id) = w.last_view_id {
         assert!(
-            w.view_store.get_view(id).is_ok(),
+            w.legacy.view_store.get_view(id).is_ok(),
             "view should still exist after SP restart (no data loss)"
         );
     }
@@ -829,7 +829,7 @@ async fn then_sp_stalls(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
         w.poll_views().await;
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "view must still exist when SP stalls"
         );
     }
@@ -892,7 +892,7 @@ async fn then_kms_resumes(w: &mut KisekiWorld) {
     w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "view must exist after KMS recovery"
         );
     }
@@ -993,7 +993,7 @@ async fn then_sp_catching_up(w: &mut KisekiWorld) {
     w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "view must exist while SP catches up"
         );
     }
@@ -1010,7 +1010,7 @@ async fn when_sp_cannot_read(_w: &mut KisekiWorld) {}
 #[then("the view continues serving reads from its last materialized state")]
 async fn then_view_serves_last_state(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         assert!(
             view.state != ViewState::Discarded,
             "view must remain active to serve reads from last materialized state"
@@ -1048,13 +1048,13 @@ async fn then_reads_potentially_stale(_w: &mut KisekiWorld) {
 async fn then_no_new_writes(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
         let wm_before = w
-            .view_store
+            .legacy.view_store
             .get_view(vid)
             .map(|v| v.watermark)
             .unwrap_or(SequenceNumber(0));
         w.poll_views().await;
         let wm_after = w
-            .view_store
+            .legacy.view_store
             .get_view(vid)
             .map(|v| v.watermark)
             .unwrap_or(SequenceNumber(0));
@@ -1082,16 +1082,16 @@ async fn when_sp_idle(_w: &mut KisekiWorld) {}
 async fn then_may_prefetch(w: &mut KisekiWorld) {
     // Prefetch is advisory (MAY). Verify view store is operational.
     w.poll_views().await;
-    let _ = w.view_store.count();
+    let _ = w.legacy.view_store.count();
 }
 
 #[then("MUST NOT advance its public watermark past its normal rules (I-V2)")]
 async fn then_must_not_advance_watermark(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         let wm = view.watermark;
         w.poll_views().await;
-        let view_after = w.view_store.get_view(vid).expect("view must exist");
+        let view_after = w.legacy.view_store.get_view(vid).expect("view must exist");
         assert!(
             view_after.watermark >= wm,
             "watermark must follow normal rules (I-V2) — never regresses"
@@ -1102,7 +1102,7 @@ async fn then_must_not_advance_watermark(w: &mut KisekiWorld) {
 #[then("MUST NOT decrypt payloads outside the caller's tenant scope (I-T1)")]
 async fn then_must_not_decrypt_other_tenant(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         assert!(
             !view.descriptor.tenant_id.0.is_nil(),
             "view must be scoped to a specific tenant (I-T1)"
@@ -1114,7 +1114,7 @@ async fn then_must_not_decrypt_other_tenant(w: &mut KisekiWorld) {
 async fn then_prefetch_preempted(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "view must remain queryable — reads preempt prefetch"
         );
     }
@@ -1135,7 +1135,7 @@ async fn when_subsequent_reads(_w: &mut KisekiWorld) {}
 async fn then_readahead_disabled(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "view must remain operational with random access hint"
         );
     }
@@ -1144,7 +1144,7 @@ async fn then_readahead_disabled(w: &mut KisekiWorld) {
 #[then("cache residency policy shifts toward per-chunk LRU rather than sequential warm-forward")]
 async fn then_cache_policy_shifts(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         assert!(
             view.descriptor.protocol == ProtocolSemantics::Posix
                 || view.descriptor.protocol == ProtocolSemantics::S3,
@@ -1156,14 +1156,14 @@ async fn then_cache_policy_shifts(w: &mut KisekiWorld) {
 #[then("other callers' reads on the same view are unaffected (steering is caller-scoped)")]
 async fn then_other_callers_unaffected(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        let pin1 = w.view_store.acquire_pin(vid, 30_000, 1000);
-        let pin2 = w.view_store.acquire_pin(vid, 30_000, 1000);
+        let pin1 = w.legacy.view_store.acquire_pin(vid, 30_000, 1000);
+        let pin2 = w.legacy.view_store.acquire_pin(vid, 30_000, 1000);
         assert!(pin1.is_ok(), "first caller's pin must succeed");
         assert!(
             pin2.is_ok(),
             "second caller's pin must succeed (unaffected)"
         );
-        let view = w.view_store.get_view(vid).unwrap();
+        let view = w.legacy.view_store.get_view(vid).unwrap();
         assert!(
             view.pins.len() >= 2,
             "multiple callers can read concurrently"
@@ -1182,7 +1182,7 @@ async fn when_sp_observes_phase(_w: &mut KisekiWorld) {}
 #[then("cache retention for checkpoint-target compositions is extended within policy bounds")]
 async fn then_cache_retention_extended(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         let _ = view.descriptor.discardable;
     }
 }
@@ -1190,7 +1190,7 @@ async fn then_cache_retention_extended(w: &mut KisekiWorld) {
 #[then("cache eviction preferentially targets non-checkpoint compositions of the same caller")]
 async fn then_cache_eviction_targets(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         assert!(
             !view.descriptor.tenant_id.0.is_nil(),
             "tenant_id required for caller-scoped eviction targeting"
@@ -1201,7 +1201,7 @@ async fn then_cache_eviction_targets(w: &mut KisekiWorld) {
 #[then("cross-tenant cache state is not affected (I-T1)")]
 async fn then_cross_tenant_unaffected(w: &mut KisekiWorld) {
     for &vid in w.view_ids.values() {
-        if let Ok(view) = w.view_store.get_view(vid) {
+        if let Ok(view) = w.legacy.view_store.get_view(vid) {
             assert!(
                 !view.descriptor.tenant_id.0.is_nil(),
                 "each view must be scoped to a single tenant (I-T1)"
@@ -1226,7 +1226,7 @@ async fn then_lag_values(w: &mut KisekiWorld, v1: String, v2: String) {
     for name in [&v1, &v2] {
         if let Some(&vid) = w.view_ids.get(name.as_str()) {
             let view = w
-                .view_store
+                .legacy.view_store
                 .get_view(vid)
                 .expect("owned view must exist for lag telemetry");
             let _ = view.last_advanced_ms;
@@ -1239,7 +1239,7 @@ async fn then_lag_values(w: &mut KisekiWorld, v1: String, v2: String) {
 )]
 async fn then_not_found_identical(_w: &mut KisekiWorld, _view: String) {
     let fake_id = ViewId(uuid::Uuid::from_u128(0xDEAD_BEEF));
-    let result = _w.view_store.get_view(fake_id);
+    let result = _w.legacy.view_store.get_view(fake_id);
     assert!(
         result.is_err(),
         "neighbour view must return not_found (I-WA6)"
@@ -1251,7 +1251,7 @@ async fn then_not_found_identical(_w: &mut KisekiWorld, _view: String) {
 )]
 async fn then_lag_bucketed(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        if let Ok(view) = w.view_store.get_view(vid) {
+        if let Ok(view) = w.legacy.view_store.get_view(vid) {
             let now_ms = 10_000u64;
             let lag_ms = now_ms.saturating_sub(view.last_advanced_ms);
             let bucketed = (lag_ms / 100) * 100;
@@ -1379,7 +1379,7 @@ async fn then_bucketed_value(_w: &mut KisekiWorld) {
 #[then("no absolute pin counts or neighbour-workload pin state is exposed (I-WA5)")]
 async fn then_no_pin_counts_exposed(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
-        if let Ok(view) = w.view_store.get_view(vid) {
+        if let Ok(view) = w.legacy.view_store.get_view(vid) {
             let pin_count = view.pins.len();
             let bucket = if pin_count < 50 {
                 "ample"
@@ -1408,7 +1408,7 @@ async fn then_materialization_continues(w: &mut KisekiWorld) {
     w.poll_views().await;
     for &vid in w.view_ids.values() {
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "materialization must continue unchanged after advisory opt-out (I-WA2)"
         );
     }
@@ -1419,7 +1419,7 @@ async fn then_prefetch_abandoned(w: &mut KisekiWorld) {
     w.poll_views().await;
     if let Some(vid) = w.last_view_id {
         assert!(
-            w.view_store.get_view(vid).is_ok(),
+            w.legacy.view_store.get_view(vid).is_ok(),
             "view must remain operational after prefetch abandonment"
         );
     }
@@ -1429,7 +1429,7 @@ async fn then_prefetch_abandoned(w: &mut KisekiWorld) {
 async fn then_correctness_unaffected(w: &mut KisekiWorld) {
     w.poll_views().await;
     for &vid in w.view_ids.values() {
-        let view = w.view_store.get_view(vid).expect("view must exist");
+        let view = w.legacy.view_store.get_view(vid).expect("view must exist");
         assert!(
             view.state == ViewState::Building
                 || view.state == ViewState::Active

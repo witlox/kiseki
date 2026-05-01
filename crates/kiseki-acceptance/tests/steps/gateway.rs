@@ -39,7 +39,7 @@ async fn given_nfs_view(w: &mut KisekiWorld, name: String, _wm: u64) {
         discardable: true,
         version: 1,
     };
-    let id = w.view_store.create_view(desc).unwrap();
+    let id = w.legacy.view_store.create_view(desc).unwrap();
     w.view_ids.insert(name, id);
 }
 
@@ -61,7 +61,7 @@ async fn given_s3_view(w: &mut KisekiWorld, name: String, _wm: u64) {
         discardable: true,
         version: 1,
     };
-    let id = w.view_store.create_view(desc).unwrap();
+    let id = w.legacy.view_store.create_view(desc).unwrap();
     w.view_ids.insert(name, id);
 }
 
@@ -158,7 +158,7 @@ async fn then_reads_dir_listing(w: &mut KisekiWorld) {
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).await;
+    let listing = w.legacy.gateway.list(tenant_id, ns_id).await;
     assert!(listing.is_ok());
 }
 
@@ -304,7 +304,7 @@ async fn then_reads_s3_listing(w: &mut KisekiWorld) {
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).await.unwrap();
+    let listing = w.legacy.gateway.list(tenant_id, ns_id).await.unwrap();
     assert!(
         !listing.is_empty(),
         "listing should have at least one object"
@@ -356,7 +356,7 @@ async fn then_visible_after_consume(w: &mut KisekiWorld) {
 async fn given_s3_multipart(w: &mut KisekiWorld, _key: String) {
     w.ensure_namespace("default", "shard-default");
     let ns_id = *w.namespace_ids.get("default").unwrap();
-    let upload_id = w.gateway.start_multipart(ns_id).await.unwrap();
+    let upload_id = w.legacy.gateway.start_multipart(ns_id).await.unwrap();
     // Store upload_id in workflow_names map for subsequent steps.
     w.workflow_names.insert(
         "multipart-upload".to_owned(),
@@ -384,7 +384,7 @@ async fn when_parts_uploaded(w: &mut KisekiWorld) {
         .iter()
         .enumerate()
     {
-        w.gateway
+        w.legacy.gateway
             .upload_part(&upload_id, (i + 1) as u32, data)
             .await
             .unwrap();
@@ -395,7 +395,7 @@ async fn when_parts_uploaded(w: &mut KisekiWorld) {
 async fn when_complete_multipart(w: &mut KisekiWorld) {
     let upload_sid = w.shard_names.get("_multipart_upload_id").unwrap();
     let upload_id = upload_sid.0.to_string();
-    match w.gateway.complete_multipart(&upload_id).await {
+    match w.legacy.gateway.complete_multipart(&upload_id).await {
         Ok(comp_id) => {
             w.last_composition_id = Some(comp_id);
             w.last_error = None;
@@ -451,13 +451,13 @@ const LOCK_PATH: &str = "/trials/shared.log";
 async fn given_nfs_open(w: &mut KisekiWorld, path: String) {
     // Track the OPEN state through SessionManager (now exposed on NfsContext).
     let fh = fh_from_path(&path);
-    let _stateid = w.nfs_ctx.sessions.open_file(fh);
+    let _stateid = w.legacy.nfs_ctx.sessions.open_file(fh);
 }
 
 #[given("acquires an NFS byte-range lock on bytes 0-1024")]
 async fn given_nfs_lock(w: &mut KisekiWorld) {
     let fh = fh_from_path(LOCK_PATH);
-    w.nfs_ctx
+    w.legacy.nfs_ctx
         .locks
         .lock(
             fh,
@@ -473,7 +473,7 @@ async fn given_nfs_lock(w: &mut KisekiWorld) {
 #[when("another client attempts to lock the same range")]
 async fn when_another_lock(w: &mut KisekiWorld) {
     let fh = fh_from_path(LOCK_PATH);
-    match w.nfs_ctx.locks.lock(
+    match w.legacy.nfs_ctx.locks.lock(
         fh,
         "client-b",
         kiseki_gateway::nfs_lock::LockType::Write,
@@ -502,7 +502,7 @@ async fn then_lock_denied(w: &mut KisekiWorld) {
 async fn then_lock_state_maintained(w: &mut KisekiWorld) {
     // The first lock from client-a is still held in this gateway's LockManager.
     assert!(
-        w.nfs_ctx.locks.lock_count() >= 1,
+        w.legacy.nfs_ctx.locks.lock_count() >= 1,
         "gateway must retain client-a's lock state"
     );
 }
@@ -515,9 +515,9 @@ async fn then_lock_local(w: &mut KisekiWorld) {
     // would observe the existing lock. It must not — locks are scoped to
     // the per-NfsContext LockManager that handled the original request.
     let other_ctx = kiseki_gateway::nfs_ops::NfsContext::new(
-        kiseki_gateway::nfs::NfsGateway::new(Arc::clone(&w.gateway)),
-        w.nfs_ctx.tenant_id,
-        w.nfs_ctx.namespace_id,
+        kiseki_gateway::nfs::NfsGateway::new(Arc::clone(&w.legacy.gateway)),
+        w.legacy.nfs_ctx.tenant_id,
+        w.legacy.nfs_ctx.namespace_id,
     );
     assert_eq!(
         other_ctx.locks.lock_count(),
@@ -527,7 +527,7 @@ async fn then_lock_local(w: &mut KisekiWorld) {
     // And the original context still owns its lock — proving the locks
     // live in the per-NfsContext LockManager, not in shared backend state.
     assert!(
-        w.nfs_ctx.locks.lock_count() >= 1,
+        w.legacy.nfs_ctx.locks.lock_count() >= 1,
         "original NfsContext must retain its own lock state",
     );
 }
@@ -576,7 +576,7 @@ async fn then_412_precondition(w: &mut KisekiWorld) {
         .tenant_ids
         .get("org-pharma")
         .unwrap_or(&kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)));
-    let listing = w.gateway.list(tenant_id, ns_id).await;
+    let listing = w.legacy.gateway.list(tenant_id, ns_id).await;
     assert!(listing.is_ok(), "gateway should be able to check existence");
 }
 
@@ -596,9 +596,9 @@ async fn given_transport_tcp(w: &mut KisekiWorld, gw: String) {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_thread = Arc::clone(&shutdown);
 
-        let gateway_clone = Arc::clone(&w.gateway);
-        let tenant_id = w.nfs_ctx.tenant_id;
-        let ns_id = w.nfs_ctx.namespace_id;
+        let gateway_clone = Arc::clone(&w.legacy.gateway);
+        let tenant_id = w.legacy.nfs_ctx.tenant_id;
+        let ns_id = w.legacy.nfs_ctx.namespace_id;
         std::thread::spawn(move || {
             let nfs_gw = kiseki_gateway::nfs::NfsGateway::new(gateway_clone);
             kiseki_gateway::nfs_server::serve_nfs_listener(
@@ -611,8 +611,8 @@ async fn given_transport_tcp(w: &mut KisekiWorld, gw: String) {
                 None, // plaintext — gateway BDD predates ADR-038 TLS default
             );
         });
-        w.tcp_endpoints.insert(gw, addr);
-        w.tcp_shutdowns.push(shutdown);
+        w.legacy.tcp_endpoints.insert(gw, addr);
+        w.legacy.tcp_shutdowns.push(shutdown);
     } else if gw.starts_with("gw-s3") {
         // S3 — bind an axum router over plain TCP (TLS termination handled
         // upstream by the transport layer in production). The JoinHandle
@@ -621,13 +621,13 @@ async fn given_transport_tcp(w: &mut KisekiWorld, gw: String) {
             .await
             .expect("bind ephemeral");
         let addr = listener.local_addr().expect("local_addr");
-        let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&w.gateway));
-        let router = kiseki_gateway::s3_server::s3_router(s3_gw, w.nfs_ctx.tenant_id);
+        let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&w.legacy.gateway));
+        let router = kiseki_gateway::s3_server::s3_router(s3_gw, w.legacy.nfs_ctx.tenant_id);
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
-        w.tcp_endpoints.insert(gw, addr);
-        w.s3_tasks.push(handle);
+        w.legacy.tcp_endpoints.insert(gw, addr);
+        w.legacy.s3_tasks.push(handle);
     } else {
         panic!("unknown gateway name: {gw}");
     }
@@ -638,7 +638,7 @@ async fn when_client_connects(w: &mut KisekiWorld) {
     // Pick whichever endpoint the Given just registered. The two
     // Background-installed scenarios each register exactly one.
     let (_name, addr) = w
-        .tcp_endpoints
+        .legacy.tcp_endpoints
         .iter()
         .next()
         .map(|(n, a)| (n.clone(), *a))
@@ -657,7 +657,7 @@ async fn then_nfs_tcp_tls(w: &mut KisekiWorld) {
     // mTLS-enabled transport layer (kiseki-transport); the in-process
     // test verifies the TCP framing path is wired end-to-end.
     let addr = w
-        .tcp_endpoints
+        .legacy.tcp_endpoints
         .get("gw-nfs-pharma")
         .expect("NFS endpoint registered");
     assert_ne!(
@@ -674,7 +674,7 @@ async fn then_nfs_rpc_framing(w: &mut KisekiWorld) {
     // the server reads the ONC RPC record marker.
     use std::io::Write;
     let addr = w
-        .tcp_endpoints
+        .legacy.tcp_endpoints
         .get("gw-nfs-pharma")
         .expect("NFS endpoint registered");
     let mut stream = std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(2))
@@ -692,7 +692,7 @@ async fn then_s3_https(w: &mut KisekiWorld) {
     // (kiseki-transport with rustls); the test asserts the S3 router is
     // bound and reachable over TCP.
     let addr = w
-        .tcp_endpoints
+        .legacy.tcp_endpoints
         .get("gw-s3-pharma")
         .expect("S3 endpoint registered");
     assert_ne!(addr.port(), 0, "S3 gateway must be listening on a TCP port");
@@ -721,7 +721,7 @@ async fn then_s3_rest_semantics(w: &mut KisekiWorld) {
 #[given(regex = r#"^"(\S+)" crashes$"#)]
 async fn given_gw_crashes(w: &mut KisekiWorld, _gw: String) {
     // Real gateway crash: drop all ephemeral state via crash().
-    w.gateway.crash().await;
+    w.legacy.gateway.crash().await;
 }
 
 #[when("the gateway is restarted (or a new instance spun up)")]
@@ -767,7 +767,7 @@ async fn then_clients_reconnect(w: &mut KisekiWorld) {
     // The log store (durability layer) survives gateway crashes.
     let sid = w.ensure_shard("shard-default");
     assert!(
-        w.log_store.shard_health(sid).await.is_ok(),
+        w.legacy.log_store.shard_health(sid).await.is_ok(),
         "log store survives gateway crash"
     );
 }
@@ -777,7 +777,7 @@ async fn then_nfs_state_lost(w: &mut KisekiWorld) {
     // After crash(), the gateway's composition store has no namespaces.
     // NFS opens and locks are gateway-local ephemeral state — lost on crash.
     // Verify by checking the NFS context returns only . and .. (no user files).
-    let entries = w.nfs_ctx.readdir();
+    let entries = w.legacy.nfs_ctx.readdir();
     assert!(
         entries.len() <= 2,
         "NFS state should be cleared after crash"
@@ -789,7 +789,7 @@ async fn then_no_committed_data_lost(w: &mut KisekiWorld) {
     // Committed data lives in the log store, not the gateway.
     // Verify previously written data is still accessible through the log.
     let sid = w.ensure_shard("shard-default");
-    let health = w.log_store.shard_health(sid).await.unwrap();
+    let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     // Log store retains all committed deltas independent of gateway state.
     assert!(health.state == kiseki_log::shard::ShardState::Healthy);
 }
@@ -799,7 +799,7 @@ async fn then_uncommitted_lost(w: &mut KisekiWorld) {
     // After crash, the gateway's request counter is reset — any in-flight
     // writes that hadn't committed to the log are lost.
     assert_eq!(
-        w.gateway
+        w.legacy.gateway
             .requests_total
             .load(std::sync::atomic::Ordering::Relaxed),
         0,
@@ -823,7 +823,7 @@ async fn given_tenant_kms_unreachable_gw(w: &mut KisekiWorld, _tenant: String) {
 
     // Inject the KMS fault — fetch_master_key / current_epoch will now
     // return KeyManagerError::Unavailable (which maps to retriable).
-    w.key_store.inject_unavailable();
+    w.legacy.key_store.inject_unavailable();
 }
 
 #[given("cached KEK has expired")]
@@ -839,7 +839,7 @@ async fn when_write_arrives(w: &mut KisekiWorld, _gw: String) {
     // Probe the keystore directly to capture the retriable error.
     use kiseki_keymanager::epoch::KeyManagerOps;
     match w
-        .key_store
+        .legacy.key_store
         .fetch_master_key(kiseki_common::tenancy::KeyEpoch(1))
         .await
     {
@@ -924,8 +924,8 @@ async fn then_tenant_admin_alerted(w: &mut KisekiWorld) {
         actor: "kiseki-gateway".into(),
         description: "tenant KMS unreachable — writes rejected".into(),
     };
-    w.audit_log.append(evt);
-    let events = w.audit_log.query(&kiseki_audit::store::AuditQuery {
+    w.legacy.audit_log.append(evt);
+    let events = w.legacy.audit_log.query(&kiseki_audit::store::AuditQuery {
         tenant_id: Some(tenant_id),
         from: SequenceNumber(1),
         limit: 100,
@@ -940,7 +940,7 @@ async fn then_tenant_admin_alerted(w: &mut KisekiWorld) {
 
     // Restore the keystore so subsequent scenarios sharing this World
     // (none today, but defensive) start from a healthy baseline.
-    w.key_store.recover();
+    w.legacy.key_store.recover();
 }
 
 // === Scenario: Gateway cannot reach Chunk Storage ===
@@ -979,18 +979,18 @@ async fn given_chunk_storage_partial(w: &mut KisekiWorld) {
         100 * 1024 * 1024 * 1024,
     )
     .with_devices(6);
-    w.chunk_store.add_pool(pool);
+    w.legacy.chunk_store.add_pool(pool);
 
     // Write two EC-encoded chunks: one repairable, one we'll exhaust parity on.
-    w.chunk_store
+    w.legacy.chunk_store
         .write_chunk(ec_envelope_for(REPAIRABLE_CID), EC_POOL)
         .expect("write repairable chunk");
-    w.chunk_store
+    w.legacy.chunk_store
         .write_chunk(ec_envelope_for(UNREPAIRABLE_CID), EC_POOL)
         .expect("write unrepairable chunk");
 
     // Take one device offline — parity (2) still covers it; repair succeeds.
-    w.chunk_store
+    w.legacy.chunk_store
         .pool_mut(EC_POOL)
         .expect("pool exists")
         .set_device_online("d3", false);
@@ -1001,7 +1001,7 @@ async fn given_chunk_storage_partial(w: &mut KisekiWorld) {
 async fn when_read_unavailable_device(w: &mut KisekiWorld) {
     // EC-aware read pulls the missing fragment from parity.
     let cid = w.last_chunk_id.expect("repairable chunk staged");
-    match w.chunk_store.read_chunk_ec(&cid) {
+    match w.legacy.chunk_store.read_chunk_ec(&cid) {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -1023,7 +1023,7 @@ async fn then_ec_repair_attempted(w: &mut KisekiWorld) {
 async fn then_repair_completes(w: &mut KisekiWorld) {
     let cid = w.last_chunk_id.expect("repairable chunk staged");
     let data = w
-        .chunk_store
+        .legacy.chunk_store
         .read_chunk_ec(&cid)
         .expect("repair succeeds so read completes");
     assert_eq!(data.len(), 64 * 1024, "reconstructed payload size matches");
@@ -1034,12 +1034,12 @@ async fn then_repair_fails_error(w: &mut KisekiWorld) {
     // Take three devices offline — exceeds parity count (2), reconstruction
     // is mathematically impossible, so EC read must fail.
     {
-        let pool = w.chunk_store.pool_mut(EC_POOL).expect("pool exists");
+        let pool = w.legacy.chunk_store.pool_mut(EC_POOL).expect("pool exists");
         pool.set_device_online("d3", false);
         pool.set_device_online("d5", false);
         pool.set_device_online("d6", false);
     }
-    let res = w.chunk_store.read_chunk_ec(&UNREPAIRABLE_CID);
+    let res = w.legacy.chunk_store.read_chunk_ec(&UNREPAIRABLE_CID);
     assert!(
         res.is_err(),
         "EC repair must fail when too many devices are offline",
@@ -1082,7 +1082,7 @@ async fn then_auth_rejected(w: &mut KisekiWorld) {
     // Verify the gateway's tenant isolation via the composition store.
     let wrong_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(999));
     let ns_id = kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(999));
-    let listing = w.gateway.list(wrong_tenant, ns_id).await;
+    let listing = w.legacy.gateway.list(wrong_tenant, ns_id).await;
     // Listing with a wrong tenant/namespace returns empty or error — no data exposed.
     match listing {
         Ok(items) => assert!(items.is_empty(), "wrong tenant should get no data"),
@@ -1097,7 +1097,7 @@ async fn then_no_data_exposed(w: &mut KisekiWorld, tenant: String) {
     // Verify the gateway doesn't expose data for a different tenant.
     let wrong_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(888));
     let ns_id = kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(888));
-    let listing = w.gateway.list(wrong_tenant, ns_id).await;
+    let listing = w.legacy.gateway.list(wrong_tenant, ns_id).await;
     match listing {
         Ok(items) => assert!(
             items.is_empty(),
@@ -1113,7 +1113,7 @@ async fn then_no_data_exposed(w: &mut KisekiWorld, tenant: String) {
 async fn given_s3_client_workflow(w: &mut KisekiWorld, wl: String) {
     // Create a workflow via the real WorkflowTable.
     let wf_ref = kiseki_common::advisory::WorkflowRef(*uuid::Uuid::new_v4().as_bytes());
-    w.advisory_table.declare(
+    w.legacy.advisory_table.declare(
         wf_ref,
         kiseki_common::advisory::WorkloadProfile::AiTraining,
         kiseki_common::advisory::PhaseId(0),
@@ -1134,7 +1134,7 @@ async fn then_validates_ref(w: &mut KisekiWorld) {
     // Verify the workflow ref exists in the advisory table (real validation).
     let wf = w.last_workflow_ref.expect("workflow_ref should exist");
     assert!(
-        w.advisory_table.get(&wf).is_some(),
+        w.legacy.advisory_table.get(&wf).is_some(),
         "workflow_ref should be valid"
     );
 }
@@ -1164,7 +1164,7 @@ async fn given_priority_classes(w: &mut KisekiWorld, _wl: String, _classes: Stri
     // The budget enforcer tracks per-workload limits.
     // Priority classes are tracked by the budget enforcer.
     assert!(
-        w.budget_enforcer.hints_used() == 0,
+        w.legacy.budget_enforcer.hints_used() == 0,
         "budget enforcer should start fresh"
     );
 }
@@ -1172,7 +1172,7 @@ async fn given_priority_classes(w: &mut KisekiWorld, _wl: String, _classes: Stri
 #[given(regex = r#"^the client's hint carries \{ priority: (\S+) \}$"#)]
 async fn given_priority_hint(w: &mut KisekiWorld, _priority: String) {
     // Attach hint via budget enforcer — real hint submission.
-    let result = w.budget_enforcer.try_hint();
+    let result = w.legacy.budget_enforcer.try_hint();
     assert!(result.is_ok(), "hint should be accepted");
 }
 
@@ -1188,7 +1188,7 @@ async fn when_gw_schedules(w: &mut KisekiWorld) {
 async fn then_qos_class(w: &mut KisekiWorld, _class: String) {
     // QoS class scheduling is advisory — the request is still processed.
     // Verify the budget enforcer accepts hints.
-    let result = w.budget_enforcer.try_hint();
+    let result = w.legacy.budget_enforcer.try_hint();
     assert!(result.is_ok(), "hint should be accepted within budget");
 }
 
@@ -1218,8 +1218,8 @@ async fn given_gw_concurrent(w: &mut KisekiWorld, _wl: String, count: u64) {
 
 #[given("the workload has subscribed to backpressure telemetry")]
 async fn given_backpressure_sub(w: &mut KisekiWorld) {
-    let rx = w.telemetry_bus.subscribe_backpressure("training-run-42");
-    w.backpressure_subs.insert("training-run-42".to_owned(), rx);
+    let rx = w.legacy.telemetry_bus.subscribe_backpressure("training-run-42");
+    w.legacy.backpressure_subs.insert("training-run-42".to_owned(), rx);
 }
 
 #[when("the gateway's per-caller queue depth crosses the soft threshold")]
@@ -1230,7 +1230,7 @@ async fn when_queue_crosses_threshold(w: &mut KisekiWorld) {
         severity: kiseki_advisory::BackpressureSeverity::Soft,
         retry_after_ms: kiseki_advisory::bucket_retry_after_ms(75),
     };
-    w.telemetry_bus.emit_backpressure("training-run-42", event);
+    w.legacy.telemetry_bus.emit_backpressure("training-run-42", event);
 }
 
 #[then(
@@ -1238,7 +1238,7 @@ async fn when_queue_crosses_threshold(w: &mut KisekiWorld) {
 )]
 async fn then_backpressure_event(w: &mut KisekiWorld) {
     let rx = w
-        .backpressure_subs
+        .legacy.backpressure_subs
         .get_mut("training-run-42")
         .expect("workload was subscribed in Given step");
     let event = rx
@@ -1265,8 +1265,8 @@ async fn then_caller_queue_only(w: &mut KisekiWorld) {
     // `kiseki-advisory::telemetry_bus::tests`, lifted into BDD so the
     // assertion exercises the live shared bus rather than a constructor
     // property of a fresh fixture.
-    let mut neighbour = w.telemetry_bus.subscribe_backpressure("other-workload");
-    w.telemetry_bus.emit_backpressure(
+    let mut neighbour = w.legacy.telemetry_bus.subscribe_backpressure("other-workload");
+    w.legacy.telemetry_bus.emit_backpressure(
         "training-run-42",
         kiseki_advisory::BackpressureEvent {
             severity: kiseki_advisory::BackpressureSeverity::Soft,
@@ -1297,7 +1297,7 @@ async fn then_data_path_accepts(w: &mut KisekiWorld) {
 )]
 async fn given_nfs_io_advise(w: &mut KisekiWorld) {
     // NFS io_advise is protocol-level metadata. Simulate by recording the hint.
-    w.budget_enforcer.try_hint().ok();
+    w.legacy.budget_enforcer.try_hint().ok();
 }
 
 #[when(
@@ -1305,14 +1305,14 @@ async fn given_nfs_io_advise(w: &mut KisekiWorld) {
 )]
 async fn when_gw_maps_advisory(w: &mut KisekiWorld) {
     // Gateway maps NFS io_advise → advisory hint. Verify budget allows it.
-    let result = w.budget_enforcer.try_hint();
+    let result = w.legacy.budget_enforcer.try_hint();
     assert!(result.is_ok(), "advisory hint should be accepted");
 }
 
 #[then("the advisory is submitted asynchronously (I-WA2) and the NFS read is served normally")]
 async fn then_advisory_async(w: &mut KisekiWorld) {
     // I-WA2: advisory is async, read proceeds. Verify via NFS readdir.
-    let entries = w.nfs_ctx.readdir();
+    let entries = w.legacy.nfs_ctx.readdir();
     assert!(entries.len() >= 2, "NFS read should complete normally");
 }
 
@@ -1357,7 +1357,7 @@ async fn given_nfs_no_native_header(_w: &mut KisekiWorld) {
 async fn when_nfs_mount(w: &mut KisekiWorld, _gw: String) {
     // NFS mount = NfsContext is already created in World::new().
     // Verify it's functional.
-    let entries = w.nfs_ctx.readdir();
+    let entries = w.legacy.nfs_ctx.readdir();
     assert!(entries.len() >= 2, "NFS mount should be functional");
 }
 
@@ -1366,7 +1366,7 @@ async fn then_workflow_per_mount(w: &mut KisekiWorld) {
     // Per-mount workflow correlation: NFS gateway associates workflow_ref at mount time.
     // Verify the NFS context is bound to a specific tenant (per-mount scope).
     assert!(
-        w.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()),
+        w.legacy.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()),
         "NFS context should be bound to a tenant"
     );
 }
@@ -1375,7 +1375,7 @@ async fn then_workflow_per_mount(w: &mut KisekiWorld) {
 async fn then_rpcs_inherit_ref(w: &mut KisekiWorld) {
     // Per-mount workflow_ref inheritance is a gateway-internal concern.
     // Verified structurally: NfsContext binds tenant_id at mount time.
-    assert!(w.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()));
+    assert!(w.legacy.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()));
 }
 
 #[then("mounts without `workflow-ref` proceed with no advisory correlation — data-path behavior is identical to pre-advisory NFS (I-WA1, I-WA2)")]
@@ -1395,7 +1395,7 @@ async fn then_may_refuse_mount(w: &mut KisekiWorld) {
     // MAY refuse = optional behavior. The key invariant is that any refusal
     // happens at mount time, not mid-session.
     // Verify mount-time tenant binding is enforced.
-    assert!(w.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()));
+    assert!(w.legacy.nfs_ctx.tenant_id != kiseki_common::ids::OrgId(uuid::Uuid::nil()));
 }
 
 // === Scenario: Advisory disabled at workload — gateway ===
@@ -1464,14 +1464,14 @@ async fn then_no_regression(w: &mut KisekiWorld) {
 async fn when_gw_computes_headroom(w: &mut KisekiWorld) {
     // Compute headroom and emit it through the live telemetry bus so the
     // caller's subscription delivers a real bucketed value.
-    let used = w.budget_enforcer.hints_used();
+    let used = w.legacy.budget_enforcer.hints_used();
     let bucket = match used {
         0..=24 => kiseki_advisory::QosHeadroomBucket::Ample,
         25..=74 => kiseki_advisory::QosHeadroomBucket::Moderate,
         75..=99 => kiseki_advisory::QosHeadroomBucket::Tight,
         _ => kiseki_advisory::QosHeadroomBucket::Exhausted,
     };
-    w.telemetry_bus.emit_qos_headroom("training-run-42", bucket);
+    w.legacy.telemetry_bus.emit_qos_headroom("training-run-42", bucket);
     w.last_error = None;
 }
 
@@ -1480,7 +1480,7 @@ async fn then_bucketed_fraction(w: &mut KisekiWorld) {
     // Drain the caller's subscription — the value MUST be one of the four
     // canonical buckets and nothing else (no raw byte counts, no fractions).
     let rx = w
-        .qos_subs
+        .legacy.qos_subs
         .get_mut("training-run-42")
         .expect("workload subscribed in Given");
     let bucket = rx
@@ -1505,8 +1505,8 @@ async fn then_no_neighbour_headroom(w: &mut KisekiWorld) {
     // same live bus, emit only on training-run-42, then assert the
     // neighbour's channel is empty. This exercises the real per-caller
     // routing rather than a constructor property of a fresh enforcer.
-    let mut neighbour = w.telemetry_bus.subscribe_qos_headroom("other-workload");
-    w.telemetry_bus
+    let mut neighbour = w.legacy.telemetry_bus.subscribe_qos_headroom("other-workload");
+    w.legacy.telemetry_bus
         .emit_qos_headroom("training-run-42", kiseki_advisory::QosHeadroomBucket::Tight);
     assert!(
         neighbour.try_recv().is_err(),

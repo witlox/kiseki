@@ -50,6 +50,12 @@ futures = "0.3"
 tokio = { workspace = true }
 uuid = { workspace = true }
 
+# Server harness — steps talk to a running kiseki-server via network
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
+tonic = { workspace = true }
+kiseki-proto = { workspace = true }
+prost = { workspace = true }
+
 # BDD step definitions are test code — relax lints.
 [lints.clippy]
 all = "allow"

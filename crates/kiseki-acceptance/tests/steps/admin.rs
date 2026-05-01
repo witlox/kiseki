@@ -34,8 +34,8 @@ fn admin_envelope(byte: u8) -> Envelope {
 
 #[given(regex = r#"^a Kiseki cluster with pools "([^"]*)" and "([^"]*)"$"#)]
 async fn given_cluster_pools(w: &mut KisekiWorld, pool_a: String, pool_b: String) {
-    if w.chunk_store.pool(&pool_a).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool_a).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool_a,
                 DurabilityStrategy::default(),
@@ -44,8 +44,8 @@ async fn given_cluster_pools(w: &mut KisekiWorld, pool_a: String, pool_b: String
             .with_devices(6),
         );
     }
-    if w.chunk_store.pool(&pool_b).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool_b).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool_b,
                 DurabilityStrategy::ErasureCoding {
@@ -58,7 +58,7 @@ async fn given_cluster_pools(w: &mut KisekiWorld, pool_a: String, pool_b: String
         );
     }
     // Also register in StorageAdminService for admin operations.
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: pool_a.clone(),
             media_type: MediaType::Nvme,
@@ -70,7 +70,7 @@ async fn given_cluster_pools(w: &mut KisekiWorld, pool_a: String, pool_b: String
         },
         AdminRole::Admin,
     );
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: pool_b.clone(),
             media_type: MediaType::Nvme,
@@ -95,7 +95,7 @@ async fn given_admin_mtls(_w: &mut KisekiWorld) {
     regex = r#"^the admin creates pool "([^"]*)" with device class "([^"]*)" and EC (\d+)\+(\d+)$"#
 )]
 async fn when_create_pool(w: &mut KisekiWorld, pool: String, _class: String, data: u8, parity: u8) {
-    w.chunk_store.add_pool(AffinityPool::new(
+    w.legacy.chunk_store.add_pool(AffinityPool::new(
         &pool,
         DurabilityStrategy::ErasureCoding {
             data_shards: data,
@@ -108,29 +108,29 @@ async fn when_create_pool(w: &mut KisekiWorld, pool: String, _class: String, dat
 #[then(regex = r#"^the pool appears in ListPools response$"#)]
 async fn then_pool_in_list(w: &mut KisekiWorld) {
     assert!(
-        w.chunk_store.pool("warm-ssd").is_some(),
+        w.legacy.chunk_store.pool("warm-ssd").is_some(),
         "pool should exist"
     );
 }
 
 #[then("the pool has zero capacity (no devices assigned yet)")]
 async fn then_zero_capacity(w: &mut KisekiWorld) {
-    if let Some(p) = w.chunk_store.pool("warm-ssd") {
+    if let Some(p) = w.legacy.chunk_store.pool("warm-ssd") {
         assert_eq!(p.capacity_bytes, 0);
     }
 }
 
 #[given(regex = r#"^pool "([^"]*)" exists with no devices$"#)]
 async fn given_pool_no_devices(w: &mut KisekiWorld, pool: String) {
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store
             .add_pool(AffinityPool::new(&pool, DurabilityStrategy::default(), 0));
     }
 }
 
 #[when(regex = r#"^the admin adds devices \[([^\]]*)\]$"#)]
 async fn when_add_devices(w: &mut KisekiWorld, _devices: String) {
-    if let Some(p) = w.chunk_store.pool_mut("warm-ssd") {
+    if let Some(p) = w.legacy.chunk_store.pool_mut("warm-ssd") {
         for i in 1..=3 {
             p.devices.push(kiseki_chunk::pool::PoolDevice {
                 id: format!("dev-{i}"),
@@ -143,7 +143,7 @@ async fn when_add_devices(w: &mut KisekiWorld, _devices: String) {
 
 #[then("the pool capacity equals the sum of device sizes")]
 async fn then_capacity_sum(w: &mut KisekiWorld) {
-    if let Some(p) = w.chunk_store.pool("warm-ssd") {
+    if let Some(p) = w.legacy.chunk_store.pool("warm-ssd") {
         assert!(p.capacity_bytes > 0);
     }
 }
@@ -151,7 +151,7 @@ async fn then_capacity_sum(w: &mut KisekiWorld) {
 #[then(regex = r#"^the pool health is "([^"]*)"$"#)]
 async fn then_pool_health_is(w: &mut KisekiWorld, expected: String) {
     // After adding devices, the pool has capacity but zero used_bytes → 0% used → Healthy.
-    if let Some(p) = w.chunk_store.pool("warm-ssd") {
+    if let Some(p) = w.legacy.chunk_store.pool("warm-ssd") {
         let used_pct = if p.capacity_bytes > 0 {
             ((p.used_bytes * 100) / p.capacity_bytes) as u8
         } else {
@@ -172,7 +172,7 @@ async fn then_pool_health_is(w: &mut KisekiWorld, expected: String) {
 #[given(regex = r#"^pool "([^"]*)" has stored chunks$"#)]
 async fn given_pool_has_chunks(w: &mut KisekiWorld, pool: String) {
     let env = admin_envelope(0xa0);
-    w.chunk_store.write_chunk(env, &pool).unwrap();
+    w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
 }
 
 #[when(
@@ -291,7 +291,7 @@ async fn then_inline_new(w: &mut KisekiWorld, kb: u64) {
     let mut req = w.make_append_request(shard_id, 0x50);
     req.has_inline_data = true;
     req.payload = vec![0xab; (kb * 1024 - 1) as usize]; // just under threshold
-    let result = w.log_store.append_delta(req).await;
+    let result = w.legacy.log_store.append_delta(req).await;
     assert!(result.is_ok(), "inline delta write should succeed");
 }
 
@@ -300,7 +300,7 @@ async fn then_inline_prospective(w: &mut KisekiWorld) {
     // Verify we can still read existing deltas — the threshold change
     // is prospective and doesn't modify already-stored data.
     let shard_id = w.ensure_shard("inline-test-shard");
-    let info = w.log_store.shard_health(shard_id).await.unwrap();
+    let info = w.legacy.log_store.shard_health(shard_id).await.unwrap();
     assert!(
         info.delta_count >= 1,
         "existing deltas should still be present"
@@ -316,7 +316,7 @@ async fn given_gc_interval(w: &mut KisekiWorld, _sec: u64) {
 async fn when_set_gc_interval(w: &mut KisekiWorld, pool: String, sec: u64) {
     // Verify pool exists and GC interval is valid.
     assert!(
-        w.chunk_store.pool(&pool).is_some(),
+        w.legacy.chunk_store.pool(&pool).is_some(),
         "pool {pool} must exist"
     );
     assert!(sec > 0, "gc_interval_s must be positive");
@@ -326,7 +326,7 @@ async fn when_set_gc_interval(w: &mut KisekiWorld, pool: String, sec: u64) {
 #[then(regex = r#"^"([^"]*)" runs GC every (\d+)s$"#)]
 async fn then_gc_interval(w: &mut KisekiWorld, pool: String, sec: u64) {
     // Verify pool is accessible and the configured interval is valid.
-    let p = w.chunk_store.pool(&pool).expect("pool must exist");
+    let p = w.legacy.chunk_store.pool(&pool).expect("pool must exist");
     assert!(sec > 0, "GC interval must be positive");
     assert!(w.last_error.is_none());
 }
@@ -335,7 +335,7 @@ async fn then_gc_interval(w: &mut KisekiWorld, pool: String, sec: u64) {
 async fn then_gc_default(w: &mut KisekiWorld, pool: String, sec: u64) {
     // The other pool retains the cluster-wide default GC interval.
     let p = w
-        .chunk_store
+        .legacy.chunk_store
         .pool(&pool)
         .expect("pool must exist for GC default check");
     assert!(sec > 0, "default GC interval must be positive");
@@ -356,7 +356,7 @@ async fn then_response_includes_table(w: &mut KisekiWorld) {
 #[when(regex = r#"^the admin requests PoolStatus for "([^"]*)"$"#)]
 async fn when_pool_status(w: &mut KisekiWorld, pool: String) {
     // Query the pool via StorageAdminService.
-    let p = w.control_admin.get_pool(&pool);
+    let p = w.control.admin.get_pool(&pool);
     assert!(p.is_some(), "pool {pool} must exist for PoolStatus query");
 }
 
@@ -374,7 +374,7 @@ async fn then_60s_window(w: &mut KisekiWorld) {
 async fn when_subscribe_device_health(w: &mut KisekiWorld) {
     // Verify the admin service can record and return health events.
     // Trigger a device transition to generate an event.
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: "health-pool".into(),
             media_type: MediaType::Nvme,
@@ -386,7 +386,7 @@ async fn when_subscribe_device_health(w: &mut KisekiWorld) {
         },
         AdminRole::Admin,
     );
-    let _ = w.control_admin.add_device(
+    let _ = w.control.admin.add_device(
         DeviceInfo {
             device_id: "health-dev".into(),
             pool: "health-pool".into(),
@@ -396,7 +396,7 @@ async fn when_subscribe_device_health(w: &mut KisekiWorld) {
         },
         AdminRole::Admin,
     );
-    w.control_admin
+    w.control.admin
         .set_device_status("health-dev", DeviceStatus::Draining, AdminRole::Admin)
         .unwrap();
 }
@@ -404,7 +404,7 @@ async fn when_subscribe_device_health(w: &mut KisekiWorld) {
 #[given(regex = r"^a device transitions from Healthy to Degraded$")]
 async fn given_device_transition(w: &mut KisekiWorld) {
     // Trigger a real device transition (Online→Draining maps to Healthy→Degraded).
-    w.control_admin
+    w.control.admin
         .set_device_status("health-dev", DeviceStatus::Offline, AdminRole::Admin)
         .ok(); // May fail if already transitioned — that's fine.
 }
@@ -413,7 +413,7 @@ async fn given_device_transition(w: &mut KisekiWorld) {
 async fn when_device_transition(w: &mut KisekiWorld) {
     // Trigger via real StorageAdminService state transition.
     let _ =
-        w.control_admin
+        w.control.admin
             .set_device_status("health-dev", DeviceStatus::Offline, AdminRole::Admin);
 }
 
@@ -422,7 +422,7 @@ async fn then_health_event(w: &mut KisekiWorld) {
     // Simulate device state transition using StorageAdminService and verify
     // the state machine allows valid transitions.
     // Add a pool and device, then transition Online->Draining (valid transition).
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: "health-test".into(),
             media_type: MediaType::Nvme,
@@ -434,7 +434,7 @@ async fn then_health_event(w: &mut KisekiWorld) {
         },
         AdminRole::Admin,
     );
-    let _ = w.control_admin.add_device(
+    let _ = w.control.admin.add_device(
         DeviceInfo {
             device_id: "health-dev-1".into(),
             pool: "health-test".into(),
@@ -446,11 +446,11 @@ async fn then_health_event(w: &mut KisekiWorld) {
     );
     // Transition: Online -> Draining (analogous to Healthy -> Degraded).
     let result =
-        w.control_admin
+        w.control.admin
             .set_device_status("health-dev-1", DeviceStatus::Draining, AdminRole::Admin);
     assert!(result.is_ok(), "device transition should succeed");
     // Verify the new state.
-    let devices = w.control_admin.list_devices("health-test");
+    let devices = w.control.admin.list_devices("health-test");
     assert_eq!(devices[0].status, DeviceStatus::Draining);
 }
 
@@ -458,7 +458,7 @@ async fn then_health_event(w: &mut KisekiWorld) {
 async fn when_subscribe_io_stats(w: &mut KisekiWorld, pool: String) {
     // Verify pool exists for subscription.
     assert!(
-        w.control_admin.get_pool(&pool).is_some() || w.chunk_store.pool(&pool).is_some(),
+        w.control.admin.get_pool(&pool).is_some() || w.legacy.chunk_store.pool(&pool).is_some(),
         "pool {pool} must exist for IO stats subscription"
     );
 }
@@ -466,13 +466,13 @@ async fn when_subscribe_io_stats(w: &mut KisekiWorld, pool: String) {
 #[then("the admin receives periodic IOStatsEvent messages")]
 async fn then_io_events(w: &mut KisekiWorld) {
     // Query IO stats from the real StorageAdminService.
-    let stats = w.control_admin.io_stats("fast-nvme");
+    let stats = w.control.admin.io_stats("fast-nvme");
     assert!(stats.is_some(), "IO stats should be available for the pool");
 }
 
 #[then("each event contains read/write IOPS and throughput")]
 async fn then_iops_throughput(w: &mut KisekiWorld) {
-    let stats = w.control_admin.io_stats("fast-nvme").unwrap();
+    let stats = w.control.admin.io_stats("fast-nvme").unwrap();
     assert!(stats.read_iops > 0, "read_iops should be populated");
     assert!(stats.write_iops > 0, "write_iops should be populated");
     assert!(
@@ -515,7 +515,7 @@ async fn given_shard_near_ceiling(
     for i in 0..std::cmp::min(count_val, 20) {
         let mut req = w.make_append_request(shard_id, (i & 0xFF) as u8);
         req.payload = vec![0xab; 64];
-        let _ = w.log_store.append_delta(req).await;
+        let _ = w.legacy.log_store.append_delta(req).await;
     }
 }
 
@@ -523,7 +523,7 @@ async fn given_shard_near_ceiling(
 async fn when_split_shard(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
     // Admin-initiated split: force split regardless of thresholds.
-    let health = w.log_store.shard_health(shard_id).await.unwrap();
+    let health = w.legacy.log_store.shard_health(shard_id).await.unwrap();
     let midpoint = kiseki_log::auto_split::compute_midpoint(&health.range_start, &health.range_end);
     match midpoint {
         Some(mid) => {
@@ -536,7 +536,7 @@ async fn when_split_shard(w: &mut KisekiWorld, shard: String) {
                 range_end: health.range_end,
                 initial_node: health.leader.unwrap_or(NodeId(1)),
             };
-            match kiseki_log::auto_split::execute_split(w.log_store.as_ref(), &plan).await {
+            match kiseki_log::auto_split::execute_split(w.legacy.log_store.as_ref(), &plan).await {
                 Ok(()) => {
                     w.last_shard_id = Some(plan.new_shard);
                     w.last_error = None;
@@ -562,7 +562,7 @@ async fn then_split_midpoint(w: &mut KisekiWorld) {
     assert!(w.last_error.is_none(), "split should succeed");
     // Verify the new shard is queryable.
     let new_id = w.last_shard_id.unwrap();
-    let health = w.log_store.shard_health(new_id).await;
+    let health = w.legacy.log_store.shard_health(new_id).await;
     assert!(health.is_ok(), "new shard should be queryable after split");
 }
 
@@ -572,7 +572,7 @@ async fn then_two_shards(w: &mut KisekiWorld) {
     let new_id = w
         .last_shard_id
         .expect("split should have produced a new shard");
-    let new_info = w.log_store.shard_health(new_id).await.unwrap();
+    let new_info = w.legacy.log_store.shard_health(new_id).await.unwrap();
     assert_eq!(new_info.state, ShardState::Healthy);
 }
 
@@ -582,7 +582,7 @@ async fn then_latency_bump(w: &mut KisekiWorld) {
     let new_id = w
         .last_shard_id
         .expect("split should have produced a new shard");
-    let new_info = w.log_store.shard_health(new_id).await.unwrap();
+    let new_info = w.legacy.log_store.shard_health(new_id).await.unwrap();
     // The shard should be in Healthy state (not Splitting), accepting writes.
     assert_eq!(new_info.state, ShardState::Healthy);
 }
@@ -591,7 +591,7 @@ async fn then_latency_bump(w: &mut KisekiWorld) {
 async fn when_trigger_scrub(w: &mut KisekiWorld, pool: String) {
     // Write a chunk with EC to the pool, then verify EC integrity via read_chunk_ec.
     let env = admin_envelope(0xc0);
-    let _ = w.chunk_store.write_chunk(env, &pool);
+    let _ = w.legacy.chunk_store.write_chunk(env, &pool);
     w.last_error = None;
 }
 
@@ -599,7 +599,7 @@ async fn when_trigger_scrub(w: &mut KisekiWorld, pool: String) {
 async fn then_ec_verified(w: &mut KisekiWorld) {
     // Verify EC integrity by reading the chunk back through the EC path.
     let chunk_id = ChunkId([0xc0; 32]);
-    let result = w.chunk_store.read_chunk_ec(&chunk_id);
+    let result = w.legacy.chunk_store.read_chunk_ec(&chunk_id);
     assert!(result.is_ok(), "EC integrity check (read) should succeed");
 }
 
@@ -608,7 +608,7 @@ async fn then_corrupted_repaired(w: &mut KisekiWorld) {
     // EC read succeeds even with degraded devices — parity handles repair.
     // Verify the read returns the original data length.
     let chunk_id = ChunkId([0xc0; 32]);
-    let data = w.chunk_store.read_chunk_ec(&chunk_id).unwrap();
+    let data = w.legacy.chunk_store.read_chunk_ec(&chunk_id).unwrap();
     assert!(!data.is_empty(), "repaired data should not be empty");
 }
 
@@ -621,7 +621,7 @@ async fn then_scrub_result(w: &mut KisekiWorld) {
     );
     let chunk_id = ChunkId([0xc0; 32]);
     assert!(
-        w.chunk_store.read_chunk(&chunk_id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&chunk_id).is_ok(),
         "chunk should remain readable after scrub"
     );
 }
@@ -678,8 +678,8 @@ async fn then_audit_records(w: &mut KisekiWorld) {
 #[given(regex = r#"^a rebalance is in progress on pool "([^"]*)"$"#)]
 async fn given_rebalance(w: &mut KisekiWorld, pool: String) {
     // Set up pool with data for rebalance testing.
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool,
                 DurabilityStrategy::default(),
@@ -690,7 +690,7 @@ async fn given_rebalance(w: &mut KisekiWorld, pool: String) {
     }
     // Write some chunks so the pool has data to "rebalance".
     let env = admin_envelope(0xd0);
-    let _ = w.chunk_store.write_chunk(env, &pool);
+    let _ = w.legacy.chunk_store.write_chunk(env, &pool);
 }
 
 #[when("the admin cancels the rebalance")]
@@ -718,14 +718,14 @@ async fn then_rebalance_stops(w: &mut KisekiWorld) {
 async fn then_consistent_chunks(w: &mut KisekiWorld) {
     // After cancellation, chunks written to the pool remain readable.
     let chunk_id = ChunkId([0xd0; 32]);
-    let result = w.chunk_store.read_chunk(&chunk_id);
+    let result = w.legacy.chunk_store.read_chunk(&chunk_id);
     assert!(result.is_ok(), "chunks must remain consistent after cancel");
 }
 
 #[then("the pool is left in a valid state")]
 async fn then_valid_state(w: &mut KisekiWorld) {
     // Verify pool structural integrity after rebalance cancellation.
-    if let Some(pool) = w.chunk_store.pool("fast-nvme") {
+    if let Some(pool) = w.legacy.chunk_store.pool("fast-nvme") {
         assert!(
             pool.capacity_bytes >= pool.used_bytes,
             "pool must be consistent: capacity >= used"
@@ -751,7 +751,7 @@ async fn then_iops_per_tenant(w: &mut KisekiWorld) {
 #[then("no tenant can see other tenants' usage")]
 async fn then_tenant_isolation_usage(w: &mut KisekiWorld) {
     // Verify unauthorized role cannot list pools.
-    let result = w.control_admin.create_pool(
+    let result = w.control.admin.create_pool(
         StoragePool {
             name: "isolation-test".into(),
             media_type: MediaType::Nvme,
@@ -792,7 +792,7 @@ async fn then_only_org_data(w: &mut KisekiWorld, org: String) {
         "org {org} must be registered"
     );
     // Unauthorized access is rejected.
-    let result = w.control_admin.create_pool(
+    let result = w.control.admin.create_pool(
         StoragePool {
             name: "org-isolation-probe".into(),
             media_type: MediaType::Nvme,
@@ -820,7 +820,7 @@ async fn then_no_breakdown(w: &mut KisekiWorld) {
 #[when(regex = r#"^the admin subscribes to DeviceIOStats for device "([^"]*)"$"#)]
 async fn when_device_io_stats(w: &mut KisekiWorld, dev: String) {
     // Create a pool and device for IO stats subscription.
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: "io-stats-pool".into(),
             media_type: MediaType::Nvme,
@@ -832,7 +832,7 @@ async fn when_device_io_stats(w: &mut KisekiWorld, dev: String) {
         },
         AdminRole::Admin,
     );
-    let _ = w.control_admin.add_device(
+    let _ = w.control.admin.add_device(
         DeviceInfo {
             device_id: dev.clone(),
             pool: "io-stats-pool".into(),
@@ -847,7 +847,7 @@ async fn when_device_io_stats(w: &mut KisekiWorld, dev: String) {
 #[then(regex = r"^the stream includes read_iops, write_iops, read_latency_p50_ms, p99_ms$")]
 async fn then_device_io_fields(w: &mut KisekiWorld) {
     // Verify device exists and has the structural fields for IO reporting.
-    let devices = w.control_admin.list_devices("io-stats-pool");
+    let devices = w.control.admin.list_devices("io-stats-pool");
     assert!(!devices.is_empty(), "device must exist for IO stats");
     let dev = &devices[0];
     assert_eq!(dev.status, DeviceStatus::Online);
@@ -858,7 +858,7 @@ async fn then_device_io_fields(w: &mut KisekiWorld) {
 async fn then_5s_interval(w: &mut KisekiWorld) {
     // Streaming interval is a runtime concern. Verify the device is online
     // and capable of producing events.
-    let devices = w.control_admin.list_devices("io-stats-pool");
+    let devices = w.control.admin.list_devices("io-stats-pool");
     assert!(
         devices.iter().any(|d| d.status == DeviceStatus::Online),
         "at least one device must be online to produce events"
@@ -868,7 +868,7 @@ async fn then_5s_interval(w: &mut KisekiWorld) {
 #[given(regex = r#"^device "([^"]*)" serves (\d+)k read IOPS and device "([^"]*)" serves (\d+)k$"#)]
 async fn given_skew(w: &mut KisekiWorld, d1: String, iops1: u64, d2: String, iops2: u64) {
     // Create devices with different utilization levels to model IO skew.
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: "skew-pool".into(),
             media_type: MediaType::Nvme,
@@ -881,7 +881,7 @@ async fn given_skew(w: &mut KisekiWorld, d1: String, iops1: u64, d2: String, iop
         AdminRole::Admin,
     );
     // Device with high IOPS — used_bytes reflects higher utilization.
-    let _ = w.control_admin.add_device(
+    let _ = w.control.admin.add_device(
         DeviceInfo {
             device_id: d1,
             pool: "skew-pool".into(),
@@ -892,7 +892,7 @@ async fn given_skew(w: &mut KisekiWorld, d1: String, iops1: u64, d2: String, iop
         AdminRole::Admin,
     );
     // Device with low IOPS.
-    let _ = w.control_admin.add_device(
+    let _ = w.control.admin.add_device(
         DeviceInfo {
             device_id: d2,
             pool: "skew-pool".into(),
@@ -907,7 +907,7 @@ async fn given_skew(w: &mut KisekiWorld, d1: String, iops1: u64, d2: String, iop
 #[when("the admin views DeviceIOStats for both")]
 async fn when_view_both_stats(w: &mut KisekiWorld) {
     // Query devices via StorageAdminService to view their utilization.
-    let devices = w.control_admin.list_devices("skew-pool");
+    let devices = w.control.admin.list_devices("skew-pool");
     assert_eq!(devices.len(), 2, "must have 2 devices for comparison");
     // The then-step verifies the skew is visible in used_bytes.
 }
@@ -915,7 +915,7 @@ async fn when_view_both_stats(w: &mut KisekiWorld) {
 #[then("the 10x skew is visible in the metrics")]
 async fn then_skew_visible(w: &mut KisekiWorld) {
     // Verify the two devices have visibly different utilization.
-    let devices = w.control_admin.list_devices("skew-pool");
+    let devices = w.control.admin.list_devices("skew-pool");
     assert_eq!(devices.len(), 2, "must have exactly 2 devices");
     let usages: Vec<u64> = devices.iter().map(|d| d.used_bytes).collect();
     let max = *usages.iter().max().unwrap();
@@ -929,7 +929,7 @@ async fn then_skew_visible(w: &mut KisekiWorld) {
 #[when(regex = r#"^the admin requests GetShardHealth for (?:shard )?"([^"]*)"$"#)]
 async fn when_shard_health(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
-    let info = w.log_store.shard_health(shard_id).await;
+    let info = w.legacy.log_store.shard_health(shard_id).await;
     assert!(info.is_ok(), "shard health query should succeed");
 }
 
@@ -938,7 +938,7 @@ async fn then_shard_health_fields(w: &mut KisekiWorld) {
     // Verify ShardInfo has leader, raft_members (replica_count), and all are queryable.
     // Use the most recently created shard.
     for &shard_id in w.shard_names.values() {
-        let info = w.log_store.shard_health(shard_id).await.unwrap();
+        let info = w.legacy.log_store.shard_health(shard_id).await.unwrap();
         assert!(info.leader.is_some(), "leader_node_id must be present");
         assert!(!info.raft_members.is_empty(), "replica_count must be > 0");
         // reachable_count = raft_members.len() in healthy state.
@@ -951,7 +951,7 @@ async fn then_commit_lag(w: &mut KisekiWorld) {
     // ShardInfo includes tip (highest committed seq) and delta_count.
     // Commit lag = tip.0 - delta_count (in a healthy shard, lag is 0).
     for &shard_id in w.shard_names.values() {
-        let info = w.log_store.shard_health(shard_id).await.unwrap();
+        let info = w.legacy.log_store.shard_health(shard_id).await.unwrap();
         // commit_lag is derivable from tip and delta_count.
         let commit_lag = info.tip.0.saturating_sub(info.delta_count);
         // In a healthy in-memory store, lag should be 0.
@@ -985,7 +985,7 @@ async fn then_reachable_count(w: &mut KisekiWorld, reachable: u8, total: u8) {
     );
     // Verify shard health is still queryable even in degraded state.
     for &shard_id in w.shard_names.values() {
-        let info = w.log_store.shard_health(shard_id).await;
+        let info = w.legacy.log_store.shard_health(shard_id).await;
         assert!(info.is_ok(), "shard must be queryable even when degraded");
         break;
     }
@@ -996,7 +996,7 @@ async fn then_alert_investigate(w: &mut KisekiWorld) {
     // When reachable < total, the admin should be alerted.
     // Verify the shard health is still queryable (alerting is a side-effect).
     for &shard_id in w.shard_names.values() {
-        let info = w.log_store.shard_health(shard_id).await.unwrap();
+        let info = w.legacy.log_store.shard_health(shard_id).await.unwrap();
         // In the in-memory store all members are "reachable" by default.
         // The scenario's given-step already verified degradation invariants.
         // Here we confirm the shard is still observable.
@@ -1011,7 +1011,7 @@ async fn then_alert_investigate(w: &mut KisekiWorld) {
 #[given(regex = r#"^pool "([^"]*)" has existing chunks with EC (\d+)\+(\d+)$"#)]
 async fn given_existing_ec(w: &mut KisekiWorld, pool: String, _d: u8, _p: u8) {
     let env = admin_envelope(0xb0);
-    w.chunk_store.write_chunk(env, &pool).unwrap();
+    w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
 }
 
 #[when(regex = r#"^the admin attempts SetPoolDurability to EC (\d+)\+(\d+)$"#)]
@@ -1023,7 +1023,7 @@ async fn when_set_durability(w: &mut KisekiWorld, _d: u8, _p: u8) {
 async fn then_new_chunks_only(w: &mut KisekiWorld) {
     // Existing chunks retain their EC config. Verify existing chunk is still readable.
     let chunk_id = ChunkId([0xb0; 32]);
-    let result = w.chunk_store.read_chunk(&chunk_id);
+    let result = w.legacy.chunk_store.read_chunk(&chunk_id);
     assert!(
         result.is_ok(),
         "existing chunk must remain readable after durability change"
@@ -1034,19 +1034,19 @@ async fn then_new_chunks_only(w: &mut KisekiWorld) {
 async fn then_retain_ec(w: &mut KisekiWorld, d: u8, p: u8) {
     // Verify the existing chunk's EC metadata matches the original config.
     let chunk_id = ChunkId([0xb0; 32]);
-    if let Some(ec) = w.chunk_store.ec_meta(&chunk_id) {
+    if let Some(ec) = w.legacy.chunk_store.ec_meta(&chunk_id) {
         // EC metadata should reflect the pool's original durability strategy.
         assert!(ec.data_shards > 0, "data shards must be positive");
         assert!(ec.parity_shards > 0, "parity shards must be positive");
     }
     // Chunk is still readable regardless.
-    assert!(w.chunk_store.read_chunk(&chunk_id).is_ok());
+    assert!(w.legacy.chunk_store.read_chunk(&chunk_id).is_ok());
 }
 
 #[given(regex = r#"^pool "([^"]*)" has chunks with EC (\d+)\+(\d+)$"#)]
 async fn given_pool_ec_chunks(w: &mut KisekiWorld, pool: String, _d: u8, _p: u8) {
     let env = admin_envelope(0xb1);
-    let _ = w.chunk_store.write_chunk(env, &pool);
+    let _ = w.legacy.chunk_store.write_chunk(env, &pool);
 }
 
 #[when(regex = r#"^the admin triggers ReencodePool to EC (\d+)\+(\d+)$"#)]
@@ -1057,7 +1057,7 @@ async fn when_reencode(w: &mut KisekiWorld, d: u8, p: u8) {
     // Verify pool exists and has chunks to re-encode.
     let chunk_id = ChunkId([0xb1; 32]);
     assert!(
-        w.chunk_store.read_chunk(&chunk_id).is_ok(),
+        w.legacy.chunk_store.read_chunk(&chunk_id).is_ok(),
         "pool must have existing chunks to re-encode"
     );
     w.last_error = None;
@@ -1149,11 +1149,11 @@ async fn then_existing_inline(w: &mut KisekiWorld) {
     let mut req = w.make_append_request(shard_id, 0x60);
     req.payload = vec![0xab; 4096]; // 4KB inline
     req.has_inline_data = true;
-    let _ = w.log_store.append_delta(req).await;
+    let _ = w.legacy.log_store.append_delta(req).await;
 
     // Read it back and verify size is unchanged.
     let deltas = w
-        .log_store
+        .legacy.log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id,
             from: SequenceNumber(0),
@@ -1174,14 +1174,14 @@ async fn then_new_inline(w: &mut KisekiWorld) {
     let mut req = w.make_append_request(shard_id, 0x61);
     req.payload = vec![0xab; 65536]; // 64KB
     req.has_inline_data = true;
-    let result = w.log_store.append_delta(req).await;
+    let result = w.legacy.log_store.append_delta(req).await;
     assert!(result.is_ok(), "64KB inline delta should be accepted");
 }
 
 #[given(regex = r#"^device "([^"]*)" has chunks stored$"#)]
 async fn given_dev_has_chunks(w: &mut KisekiWorld, dev: String) {
     // Register the device in StorageAdminService with used_bytes > 0.
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: "dev-chunks-pool".into(),
             media_type: MediaType::Nvme,
@@ -1193,7 +1193,7 @@ async fn given_dev_has_chunks(w: &mut KisekiWorld, dev: String) {
         },
         AdminRole::Admin,
     );
-    let _ = w.control_admin.add_device(
+    let _ = w.control.admin.add_device(
         DeviceInfo {
             device_id: dev,
             pool: "dev-chunks-pool".into(),
@@ -1209,8 +1209,8 @@ async fn given_dev_has_chunks(w: &mut KisekiWorld, dev: String) {
 async fn when_remove_device(w: &mut KisekiWorld, dev: String) {
     // Check all pools for this device. RemoveDevice requires the device
     // to be fully evacuated (Decommissioned state, used_bytes == 0).
-    let devices = w.control_admin.list_devices("dev-chunks-pool");
-    let evac_devices = w.control_admin.list_devices("evac-pool");
+    let devices = w.control.admin.list_devices("dev-chunks-pool");
+    let evac_devices = w.control.admin.list_devices("evac-pool");
     let all_devices: Vec<_> = devices.iter().chain(evac_devices.iter()).collect();
 
     if let Some(d) = all_devices.iter().find(|d| d.device_id == dev) {
@@ -1240,7 +1240,7 @@ async fn then_not_evacuated(w: &mut KisekiWorld) {
 #[given(regex = r#"^device "([^"]*)" was evacuated \(state = Removed\)$"#)]
 async fn given_device_evacuated(w: &mut KisekiWorld, dev: String) {
     // Create device in Online state, transition through Draining -> Decommissioned.
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: "evac-pool".into(),
             media_type: MediaType::Nvme,
@@ -1252,7 +1252,7 @@ async fn given_device_evacuated(w: &mut KisekiWorld, dev: String) {
         },
         AdminRole::Admin,
     );
-    let _ = w.control_admin.add_device(
+    let _ = w.control.admin.add_device(
         DeviceInfo {
             device_id: dev.clone(),
             pool: "evac-pool".into(),
@@ -1263,10 +1263,10 @@ async fn given_device_evacuated(w: &mut KisekiWorld, dev: String) {
         AdminRole::Admin,
     );
     // Transition: Online -> Draining -> Decommissioned.
-    w.control_admin
+    w.control.admin
         .set_device_status(&dev, DeviceStatus::Draining, AdminRole::Admin)
         .unwrap();
-    w.control_admin
+    w.control.admin
         .set_device_status(&dev, DeviceStatus::Decommissioned, AdminRole::Admin)
         .unwrap();
 }
@@ -1274,7 +1274,7 @@ async fn given_device_evacuated(w: &mut KisekiWorld, dev: String) {
 #[then("the device is removed from the pool")]
 async fn then_device_removed(w: &mut KisekiWorld) {
     // Verify the evacuated device reached Decommissioned state.
-    let devices = w.control_admin.list_devices("evac-pool");
+    let devices = w.control.admin.list_devices("evac-pool");
     assert!(
         devices
             .iter()
@@ -1287,8 +1287,8 @@ async fn then_device_removed(w: &mut KisekiWorld) {
 async fn given_pool_tenant_data(w: &mut KisekiWorld, pool: String, tenant: String) {
     // Ensure pool exists and tenant is registered.
     w.ensure_tenant(&tenant);
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool,
                 DurabilityStrategy::default(),
@@ -1299,7 +1299,7 @@ async fn given_pool_tenant_data(w: &mut KisekiWorld, pool: String, tenant: Strin
     }
     // Write a chunk to represent tenant data in the pool.
     let env = admin_envelope(0xe0);
-    let _ = w.chunk_store.write_chunk(env, &pool);
+    let _ = w.legacy.chunk_store.write_chunk(env, &pool);
 }
 
 #[when("the cluster admin changes pool durability")]
@@ -1333,17 +1333,17 @@ async fn given_many_events(w: &mut KisekiWorld, k: u64) {
     use kiseki_control::storage_admin::DeviceHealthEvent;
     let count = k * 1000;
     for i in 0..count {
-        let events = w.control_admin.health_events();
+        let events = w.control.admin.health_events();
         // Push via a device transition cycle if possible, or note the count.
         drop(events);
     }
     // Record that we attempted to generate this many events.
-    w.control_org_capacity_used = count; // Repurpose field for event count tracking.
+    w.control.org_capacity_used = count; // Repurpose field for event count tracking.
 }
 
 #[when(regex = r"^(\d+),?000 events are generated before the client reads$")]
 async fn when_many_events(w: &mut KisekiWorld, k: u64) {
-    w.control_org_capacity_used = k * 1000;
+    w.control.org_capacity_used = k * 1000;
 }
 
 #[then(regex = r"^the oldest events are dropped \(buffer capped at (\d+),?000\)$")]
@@ -1352,7 +1352,7 @@ async fn then_events_dropped(w: &mut KisekiWorld, cap_k: u64) {
     // Verify the concept: if more events than cap were generated,
     // a bounded buffer would drop the oldest.
     assert!(
-        w.control_org_capacity_used > cap,
+        w.control.org_capacity_used > cap,
         "should have generated more events than buffer cap"
     );
 }
@@ -1361,7 +1361,7 @@ async fn then_events_dropped(w: &mut KisekiWorld, cap_k: u64) {
 async fn then_overflow_warning(w: &mut KisekiWorld) {
     // Verify overflow would be detected: generated count > cap.
     assert!(
-        w.control_org_capacity_used > 10_000,
+        w.control.org_capacity_used > 10_000,
         "overflow warning expected when events exceed buffer cap"
     );
 }
@@ -1369,8 +1369,8 @@ async fn then_overflow_warning(w: &mut KisekiWorld) {
 #[given(regex = r#"^a rebalance is in progress on pool "([^"]*)" at (\d+)%$"#)]
 async fn given_rebalance_progress(w: &mut KisekiWorld, pool: String, pct: u8) {
     // Set up pool and use CompactionProgress to track rebalance progress.
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool,
                 DurabilityStrategy::default(),
@@ -1381,7 +1381,7 @@ async fn given_rebalance_progress(w: &mut KisekiWorld, pool: String, pct: u8) {
     }
     // Write data to give the pool something to rebalance.
     let env = admin_envelope(0xd1);
-    let _ = w.chunk_store.write_chunk(env, &pool);
+    let _ = w.legacy.chunk_store.write_chunk(env, &pool);
 }
 
 #[when("the admin calls CancelRebalance")]
@@ -1410,7 +1410,7 @@ async fn then_chunks_stay(w: &mut KisekiWorld) {
     // After cancellation, chunks that were already moved are consistent.
     // Verify a chunk written to the pool is still readable.
     let chunk_id = ChunkId([0xd1; 32]);
-    let result = w.chunk_store.read_chunk(&chunk_id);
+    let result = w.legacy.chunk_store.read_chunk(&chunk_id);
     assert!(
         result.is_ok(),
         "chunks should remain accessible after cancel"
@@ -1422,7 +1422,7 @@ async fn then_pool_consistent(w: &mut KisekiWorld) {
     // Verify pool structural integrity after cancellation.
     // Check all pools that exist.
     for pool_name in ["fast-nvme", "bulk-nvme"] {
-        if let Some(pool) = w.chunk_store.pool(pool_name) {
+        if let Some(pool) = w.legacy.chunk_store.pool(pool_name) {
             assert!(
                 pool.capacity_bytes >= pool.used_bytes,
                 "pool {pool_name} must be consistent"
@@ -1434,8 +1434,8 @@ async fn then_pool_consistent(w: &mut KisekiWorld) {
 #[given("a rebalance is in progress")]
 async fn given_rebalance_active(w: &mut KisekiWorld) {
     // Set up a pool with data and model an active rebalance via CompactionProgress.
-    if w.chunk_store.pool("fast-nvme").is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool("fast-nvme").is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 "fast-nvme",
                 DurabilityStrategy::default(),
@@ -1445,7 +1445,7 @@ async fn given_rebalance_active(w: &mut KisekiWorld) {
         );
     }
     let env = admin_envelope(0xd2);
-    let _ = w.chunk_store.write_chunk(env, "fast-nvme");
+    let _ = w.legacy.chunk_store.write_chunk(env, "fast-nvme");
 }
 
 #[when("the admin calls GetRebalanceProgress")]
@@ -1490,9 +1490,9 @@ async fn given_shard_splitting(w: &mut KisekiWorld, shard: String) {
 async fn when_split_shard_again(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
     // Set the shard to Splitting state to simulate a split in progress.
-    w.log_store.set_shard_state(shard_id, ShardState::Splitting);
+    w.legacy.log_store.set_shard_state(shard_id, ShardState::Splitting);
     // Now attempt another split — should be rejected because shard is busy.
-    let health = w.log_store.shard_health(shard_id).await.unwrap();
+    let health = w.legacy.log_store.shard_health(shard_id).await.unwrap();
     if health.state.is_busy() {
         w.last_error = Some("SPLIT_IN_PROGRESS".into());
     } else {
@@ -1541,8 +1541,8 @@ async fn given_sre_incident(_w: &mut KisekiWorld) {
 async fn when_sre_scrub(w: &mut KisekiWorld, pool: String) {
     // SRE incident-response can trigger scrub. Verify pool exists and
     // write a test chunk to scrub.
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool,
                 DurabilityStrategy::default(),
@@ -1552,7 +1552,7 @@ async fn when_sre_scrub(w: &mut KisekiWorld, pool: String) {
         );
     }
     let env = admin_envelope(0xc1);
-    let _ = w.chunk_store.write_chunk(env, &pool);
+    let _ = w.legacy.chunk_store.write_chunk(env, &pool);
     w.last_error = None;
 }
 
@@ -1560,7 +1560,7 @@ async fn when_sre_scrub(w: &mut KisekiWorld, pool: String) {
 async fn then_scrub_ok(w: &mut KisekiWorld) {
     // Verify the scrub chunk is readable (EC integrity intact).
     let chunk_id = ChunkId([0xc1; 32]);
-    let result = w.chunk_store.read_chunk(&chunk_id);
+    let result = w.legacy.chunk_store.read_chunk(&chunk_id);
     assert!(
         result.is_ok(),
         "scrub should succeed — chunk must be readable"
@@ -1575,8 +1575,8 @@ async fn given_multi_tenant_pool(w: &mut KisekiWorld, pool: String) {
     // Ensure pool exists and register both tenants.
     w.ensure_tenant("A");
     w.ensure_tenant("B");
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool,
                 DurabilityStrategy::default(),
@@ -1585,7 +1585,7 @@ async fn given_multi_tenant_pool(w: &mut KisekiWorld, pool: String) {
             .with_devices(6),
         );
     }
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: pool,
             media_type: MediaType::Nvme,
@@ -1619,7 +1619,7 @@ async fn then_no_attribution(w: &mut KisekiWorld) {
 #[given(regex = r#"^node "([^"]*)" has (\d+) devices in pool "([^"]*)"$"#)]
 async fn given_node_devices(w: &mut KisekiWorld, node: String, count: u64, pool: String) {
     // Create pool and devices via StorageAdminService.
-    let _ = w.control_admin.create_pool(
+    let _ = w.control.admin.create_pool(
         StoragePool {
             name: pool.clone(),
             media_type: MediaType::Nvme,
@@ -1632,7 +1632,7 @@ async fn given_node_devices(w: &mut KisekiWorld, node: String, count: u64, pool:
         AdminRole::Admin,
     );
     for i in 0..count {
-        let _ = w.control_admin.add_device(
+        let _ = w.control.admin.add_device(
             DeviceInfo {
                 device_id: format!("{node}-dev-{i}"),
                 pool: pool.clone(),
@@ -1651,10 +1651,10 @@ async fn when_drain_node(w: &mut KisekiWorld, node: String) {
     // Find devices whose ID starts with the node name.
     // We iterate known pool names.
     for pool_name in ["fast-nvme", "bulk-nvme", "drain-pool"] {
-        let devices = w.control_admin.list_devices(pool_name);
+        let devices = w.control.admin.list_devices(pool_name);
         for dev in &devices {
             if dev.device_id.starts_with(&node) && dev.status == DeviceStatus::Online {
-                let _ = w.control_admin.set_device_status(
+                let _ = w.control.admin.set_device_status(
                     &dev.device_id,
                     DeviceStatus::Draining,
                     AdminRole::Admin,
@@ -1670,7 +1670,7 @@ async fn then_parallel_evac(w: &mut KisekiWorld, count: u64) {
     // Verify the expected number of devices are now Draining.
     let mut draining = 0u64;
     for pool_name in ["fast-nvme", "bulk-nvme", "drain-pool"] {
-        let devices = w.control_admin.list_devices(pool_name);
+        let devices = w.control.admin.list_devices(pool_name);
         draining += devices
             .iter()
             .filter(|d| d.status == DeviceStatus::Draining)
@@ -1688,7 +1688,7 @@ async fn then_per_device_progress(w: &mut KisekiWorld) {
     // Per-device progress is modeled as the device transitioning through states
     // with used_bytes tracking bytes remaining to migrate.
     for pool_name in ["fast-nvme", "bulk-nvme", "drain-pool"] {
-        let devices = w.control_admin.list_devices(pool_name);
+        let devices = w.control.admin.list_devices(pool_name);
         for dev in &devices {
             if dev.status == DeviceStatus::Draining {
                 // used_bytes represents bytes remaining to evacuate.
@@ -1707,10 +1707,10 @@ async fn then_per_device_progress(w: &mut KisekiWorld) {
 async fn then_all_removed(w: &mut KisekiWorld) {
     // Complete the drain: transition Draining -> Decommissioned for all draining devices.
     for pool_name in ["fast-nvme", "bulk-nvme", "drain-pool"] {
-        let devices = w.control_admin.list_devices(pool_name);
+        let devices = w.control.admin.list_devices(pool_name);
         for dev in &devices {
             if dev.status == DeviceStatus::Draining {
-                let _ = w.control_admin.set_device_status(
+                let _ = w.control.admin.set_device_status(
                     &dev.device_id,
                     DeviceStatus::Decommissioned,
                     AdminRole::Admin,
@@ -1720,7 +1720,7 @@ async fn then_all_removed(w: &mut KisekiWorld) {
     }
     // Verify all previously-draining devices are now Decommissioned.
     for pool_name in ["fast-nvme", "bulk-nvme", "drain-pool"] {
-        let devices = w.control_admin.list_devices(pool_name);
+        let devices = w.control.admin.list_devices(pool_name);
         for dev in &devices {
             assert_ne!(
                 dev.status,
@@ -1735,8 +1735,8 @@ async fn then_all_removed(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^pool "([^"]*)" is at (\d+)% \(Warning\)$"#)]
 async fn given_pool_at_warning(w: &mut KisekiWorld, pool: String, pct: u64) {
-    if w.chunk_store.pool(&pool).is_none() {
-        w.chunk_store.add_pool(
+    if w.legacy.chunk_store.pool(&pool).is_none() {
+        w.legacy.chunk_store.add_pool(
             AffinityPool::new(
                 &pool,
                 DurabilityStrategy::default(),
@@ -1745,7 +1745,7 @@ async fn given_pool_at_warning(w: &mut KisekiWorld, pool: String, pct: u64) {
             .with_devices(6),
         );
     }
-    if let Some(p) = w.chunk_store.pool_mut(&pool) {
+    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.used_bytes = p.capacity_bytes * pct / 100;
     }
 }
@@ -1753,7 +1753,7 @@ async fn given_pool_at_warning(w: &mut KisekiWorld, pool: String, pct: u64) {
 #[when(regex = r#"^rebalance tries to move chunks from "([^"]*)" to "([^"]*)"$"#)]
 async fn when_rebalance_move(w: &mut KisekiWorld, from: String, to: String) {
     // Check if the target pool is near capacity using CapacityThresholds.
-    if let Some(pool) = w.chunk_store.pool(&to) {
+    if let Some(pool) = w.legacy.chunk_store.pool(&to) {
         let used_pct = if pool.capacity_bytes > 0 {
             ((pool.used_bytes * 100) / pool.capacity_bytes) as u8
         } else {

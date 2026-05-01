@@ -42,7 +42,7 @@ async fn given_ec_pool(
         100 * 1024 * 1024 * 1024, // 100GB
     )
     .with_devices(n_devices);
-    w.chunk_store.add_pool(pool);
+    w.legacy.chunk_store.add_pool(pool);
 }
 
 #[given(regex = r#"^(?:a )?pool "([^"]*)" with replication-(\d+)$"#)]
@@ -53,7 +53,7 @@ async fn given_replication_pool(w: &mut KisekiWorld, pool_name: String, copies: 
         100 * 1024 * 1024 * 1024,
     )
     .with_devices(usize::from(copies));
-    w.chunk_store.add_pool(pool);
+    w.legacy.chunk_store.add_pool(pool);
 }
 
 // === Write path ===
@@ -67,27 +67,27 @@ async fn when_chunk_written(w: &mut KisekiWorld, size_val: usize, unit: String, 
     };
     let env = ec_envelope(0x42, size);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, &pool).unwrap();
+    w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
 }
 
 #[then(regex = r"^the chunk is split into (\d+) data fragments \((\S+) each\)$")]
 async fn then_data_fragments(w: &mut KisekiWorld, n_data: usize, _size: String) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).expect("no EC metadata");
+    let ec = w.legacy.chunk_store.ec_meta(&id).expect("no EC metadata");
     assert_eq!(ec.data_shards, n_data);
 }
 
 #[then(regex = r"^(\d+) parity fragments are computed$")]
 async fn then_parity_fragments(w: &mut KisekiWorld, n_parity: usize) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).expect("no EC metadata");
+    let ec = w.legacy.chunk_store.ec_meta(&id).expect("no EC metadata");
     assert_eq!(ec.parity_shards, n_parity);
 }
 
 #[then(regex = r"^all (\d+) fragments are written to distinct devices \(I-D4\)$")]
 async fn then_distinct_devices(w: &mut KisekiWorld, total: usize) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).expect("no EC metadata");
+    let ec = w.legacy.chunk_store.ec_meta(&id).expect("no EC metadata");
     assert_eq!(ec.fragments.len(), total);
     let mut indices = ec.device_indices.clone();
     indices.sort_unstable();
@@ -98,7 +98,7 @@ async fn then_distinct_devices(w: &mut KisekiWorld, total: usize) {
 #[then(regex = r"^(\d+) data fragments \+ (\d+) parity fragments are created$")]
 async fn then_data_parity_count(w: &mut KisekiWorld, n_data: usize, n_parity: usize) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).expect("no EC metadata");
+    let ec = w.legacy.chunk_store.ec_meta(&id).expect("no EC metadata");
     assert_eq!(ec.data_shards, n_data);
     assert_eq!(ec.parity_shards, n_parity);
 }
@@ -106,14 +106,14 @@ async fn then_data_parity_count(w: &mut KisekiWorld, n_data: usize, n_parity: us
 #[then(regex = r"^all (\d+) fragments are on distinct devices$")]
 async fn then_all_distinct(w: &mut KisekiWorld, total: usize) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).expect("no EC metadata");
+    let ec = w.legacy.chunk_store.ec_meta(&id).expect("no EC metadata");
     assert_eq!(ec.fragments.len(), total);
 }
 
 #[then(regex = r"^EC is still applied \(4 .+ 1KB data \+ 2 .+ 1KB parity\)$")]
 async fn then_small_ec(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).expect("no EC metadata");
+    let ec = w.legacy.chunk_store.ec_meta(&id).expect("no EC metadata");
     assert_eq!(ec.data_shards, 4);
     assert_eq!(ec.parity_shards, 2);
     assert_eq!(ec.fragments[0].len(), 1024);
@@ -122,7 +122,7 @@ async fn then_small_ec(w: &mut KisekiWorld) {
 #[then(regex = r"^(\d+) fragments are stored$")]
 async fn then_n_fragments(w: &mut KisekiWorld, n: usize) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).expect("no EC metadata");
+    let ec = w.legacy.chunk_store.ec_meta(&id).expect("no EC metadata");
     assert_eq!(ec.fragments.len(), n);
 }
 
@@ -133,9 +133,9 @@ async fn given_ec_chunk(w: &mut KisekiWorld) {
     let env = ec_envelope(0x50, 1024 * 1024);
     let chunk_id = env.chunk_id;
     w.last_chunk_id = Some(chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     // Pre-read for the When step (which is a no-op from operational.rs).
-    match w.chunk_store.read_chunk_ec(&chunk_id) {
+    match w.legacy.chunk_store.read_chunk_ec(&chunk_id) {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -166,12 +166,12 @@ async fn given_d3_offline(w: &mut KisekiWorld) {
     let env = ec_envelope(0x51, 1024 * 1024);
     let chunk_id = env.chunk_id;
     w.last_chunk_id = Some(chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    w.chunk_store
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    w.legacy.chunk_store
         .pool_mut("fast-nvme")
         .unwrap()
         .set_device_online("d3", false);
-    match w.chunk_store.read_chunk_ec(&chunk_id) {
+    match w.legacy.chunk_store.read_chunk_ec(&chunk_id) {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -199,11 +199,11 @@ async fn given_d3_d5_offline(w: &mut KisekiWorld) {
     let env = ec_envelope(0x52, 1024 * 1024);
     let chunk_id = env.chunk_id;
     w.last_chunk_id = Some(chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    let pool = w.chunk_store.pool_mut("fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    let pool = w.legacy.chunk_store.pool_mut("fast-nvme").unwrap();
     pool.set_device_online("d3", false);
     pool.set_device_online("d5", false);
-    match w.chunk_store.read_chunk_ec(&chunk_id) {
+    match w.legacy.chunk_store.read_chunk_ec(&chunk_id) {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -231,12 +231,12 @@ async fn given_three_offline(w: &mut KisekiWorld) {
     let env = ec_envelope(0x53, 1024 * 1024);
     let chunk_id = env.chunk_id;
     w.last_chunk_id = Some(chunk_id);
-    w.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    let pool = w.chunk_store.pool_mut("fast-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
+    let pool = w.legacy.chunk_store.pool_mut("fast-nvme").unwrap();
     pool.set_device_online("d3", false);
     pool.set_device_online("d5", false);
     pool.set_device_online("d6", false);
-    match w.chunk_store.read_chunk_ec(&chunk_id) {
+    match w.legacy.chunk_store.read_chunk_ec(&chunk_id) {
         Ok(_) => w.last_error = None,
         Err(e) => w.last_error = Some(e.to_string()),
     }
@@ -256,7 +256,7 @@ async fn then_chunk_lost_error(w: &mut KisekiWorld) {
 
 #[given("device d3 fails")]
 async fn given_d3_fails(w: &mut KisekiWorld) {
-    if let Some(pool) = w.chunk_store.pool_mut("fast-nvme") {
+    if let Some(pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
         pool.set_device_online("d3", false);
     }
 }
@@ -266,7 +266,7 @@ async fn when_repair_triggered(w: &mut KisekiWorld) {
     // Repair: read with degraded path, reconstruct, place on healthy device.
     // For BDD: verify the degraded read path works (repair = read + rewrite).
     if let Some(id) = w.last_chunk_id {
-        match w.chunk_store.read_chunk_ec(&id) {
+        match w.legacy.chunk_store.read_chunk_ec(&id) {
             Ok(_) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
@@ -306,13 +306,13 @@ async fn given_repair_in_progress_d3(w: &mut KisekiWorld) {
 async fn when_new_writes(w: &mut KisekiWorld, pool: String) {
     let env = ec_envelope(0x60, 1024 * 1024);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, &pool).unwrap();
+    w.legacy.chunk_store.write_chunk(env, &pool).unwrap();
 }
 
 #[then(regex = r"^new writes succeed \(placed on healthy devices, skipping d3\)$")]
 async fn then_writes_skip_d3(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    let ec = w.chunk_store.ec_meta(&id).expect("no EC metadata");
+    let ec = w.legacy.chunk_store.ec_meta(&id).expect("no EC metadata");
     // d3 is device index 2 — verify it's not in placement.
     // Note: placement is hash-based and may not use d3 anyway.
     assert_eq!(ec.fragments.len(), 6);
@@ -365,7 +365,7 @@ async fn given_pool_devices(w: &mut KisekiWorld, _pool: String, _n: usize) {
 
 #[when("device d7 is added")]
 async fn when_device_added(w: &mut KisekiWorld) {
-    if let Some(pool) = w.chunk_store.pool_mut("fast-nvme") {
+    if let Some(pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
         pool.devices.push(kiseki_chunk::pool::PoolDevice {
             id: "d7".into(),
             online: true,
@@ -376,7 +376,7 @@ async fn when_device_added(w: &mut KisekiWorld) {
 #[then("some fragments are migrated to d7 (rebalance)")]
 async fn then_rebalance(w: &mut KisekiWorld) {
     // With 7 devices, new placements may include d7.
-    let pool = w.chunk_store.pool("fast-nvme").unwrap();
+    let pool = w.legacy.chunk_store.pool("fast-nvme").unwrap();
     assert_eq!(pool.devices.len(), 7);
 }
 
@@ -409,7 +409,7 @@ async fn then_efficiency(w: &mut KisekiWorld, pct: u64) {
 async fn when_chunk_written_repl(w: &mut KisekiWorld) {
     let env = ec_envelope(0x70, 1024);
     w.last_chunk_id = Some(env.chunk_id);
-    w.chunk_store.write_chunk(env, "meta-nvme").unwrap();
+    w.legacy.chunk_store.write_chunk(env, "meta-nvme").unwrap();
 }
 
 #[then("3 identical copies are stored on 3 distinct devices")]
@@ -417,7 +417,7 @@ async fn then_three_copies(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
     // Replication mode: no EC metadata (envelope stored directly).
     assert!(
-        w.chunk_store.ec_meta(&id).is_none(),
+        w.legacy.chunk_store.ec_meta(&id).is_none(),
         "replication should not have EC metadata"
     );
 }
@@ -425,5 +425,5 @@ async fn then_three_copies(w: &mut KisekiWorld) {
 #[then("any single copy can serve reads (no reconstruction needed)")]
 async fn then_no_reconstruction(w: &mut KisekiWorld) {
     let id = w.last_chunk_id.unwrap();
-    assert!(w.chunk_store.read_chunk(&id).is_ok());
+    assert!(w.legacy.chunk_store.read_chunk(&id).is_ok());
 }

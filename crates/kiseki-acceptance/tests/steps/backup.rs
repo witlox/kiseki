@@ -114,15 +114,15 @@ async fn spawn_mock_s3() -> (String, tokio::task::JoinHandle<()>) {
 async fn given_capable_cluster(w: &mut KisekiWorld) {
     // Reset backup state — defensive; cucumber should give a fresh world per
     // scenario but this makes step ordering robust.
-    w.backup_manager = None;
-    w.backup_backend = None;
-    w.backup_fs_dir = None;
-    w.backup_s3_endpoint = None;
-    w.backup_staged_shards.clear();
-    w.last_backup_snapshot = None;
-    w.last_restored_shards = None;
-    w.last_snapshot_listing.clear();
-    w.last_backup_error = None;
+    w.backup.manager = None;
+    w.backup.backend = None;
+    w.backup.fs_dir = None;
+    w.backup.s3_endpoint = None;
+    w.backup.staged_shards.clear();
+    w.backup.last_snapshot = None;
+    w.backup.last_restored_shards = None;
+    w.backup.last_snapshot_listing.clear();
+    w.backup.last_error = None;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,9 +141,9 @@ async fn given_fs_backend(w: &mut KisekiWorld) {
             retention_days: 7,
         },
     ));
-    w.backup_fs_dir = Some(dir);
-    w.backup_backend = Some(backend);
-    w.backup_manager = Some(mgr);
+    w.backup.fs_dir = Some(dir);
+    w.backup.backend = Some(backend);
+    w.backup.manager = Some(mgr);
 }
 
 #[given("an S3-compatible backup backend is configured")]
@@ -166,10 +166,10 @@ async fn given_s3_backend(w: &mut KisekiWorld) {
             retention_days: 7,
         },
     ));
-    w.backup_s3_endpoint = Some(endpoint);
-    w.backup_s3_task = Some(handle);
-    w.backup_backend = Some(backend);
-    w.backup_manager = Some(mgr);
+    w.backup.s3_endpoint = Some(endpoint);
+    w.backup.s3_task = Some(handle);
+    w.backup.backend = Some(backend);
+    w.backup.manager = Some(mgr);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ async fn given_s3_backend(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^shard "([^"]+)" with (\d+) bytes of metadata$"#)]
 async fn given_shard_with_metadata(w: &mut KisekiWorld, name: String, n: usize) {
-    w.backup_staged_shards.push(ShardSnapshot {
+    w.backup.staged_shards.push(ShardSnapshot {
         shard_id: name,
         metadata: vec![0xab; n],
         data: None,
@@ -187,7 +187,7 @@ async fn given_shard_with_metadata(w: &mut KisekiWorld, name: String, n: usize) 
 
 #[given(regex = r#"^shard "([^"]+)" with (\d+) bytes of metadata and chunk data$"#)]
 async fn given_shard_with_metadata_and_data(w: &mut KisekiWorld, name: String, n: usize) {
-    w.backup_staged_shards.push(ShardSnapshot {
+    w.backup.staged_shards.push(ShardSnapshot {
         shard_id: name,
         metadata: vec![0xab; n],
         data: Some(b"chunk-bytes".to_vec()),
@@ -201,7 +201,7 @@ async fn given_shard_with_metadata_and_data(w: &mut KisekiWorld, name: String, n
 #[given("a backup is already in progress")]
 async fn given_backup_in_progress(w: &mut KisekiWorld) {
     let mgr = w
-        .backup_manager
+        .backup.manager
         .as_ref()
         .expect("backup manager configured");
     mgr.force_in_progress(true);
@@ -210,7 +210,7 @@ async fn given_backup_in_progress(w: &mut KisekiWorld) {
 #[given(regex = r"^the operator created (\d+) snapshots$")]
 async fn given_operator_created_snapshots(w: &mut KisekiWorld, n: usize) {
     let mgr = Arc::clone(
-        w.backup_manager
+        w.backup.manager
             .as_ref()
             .expect("backup manager configured"),
     );
@@ -231,19 +231,19 @@ async fn given_operator_created_snapshots(w: &mut KisekiWorld, n: usize) {
 #[when("the operator triggers a backup")]
 async fn when_trigger_backup(w: &mut KisekiWorld) {
     let mgr = Arc::clone(
-        w.backup_manager
+        w.backup.manager
             .as_ref()
             .expect("backup manager configured"),
     );
-    let shards = std::mem::take(&mut w.backup_staged_shards);
+    let shards = std::mem::take(&mut w.backup.staged_shards);
     match mgr.create_snapshot(&shards).await {
         Ok(snap) => {
-            w.last_backup_snapshot = Some(snap);
+            w.backup.last_snapshot = Some(snap);
         }
         Err(e) => {
             // Re-stage so a follow-up When can retry from the same shards.
-            w.backup_staged_shards = shards;
-            w.last_backup_error = Some(match e {
+            w.backup.staged_shards = shards;
+            w.backup.last_error = Some(match e {
                 BackupError::InProgress => "InProgress".into(),
                 other => format!("{other:?}"),
             });
@@ -254,12 +254,12 @@ async fn when_trigger_backup(w: &mut KisekiWorld) {
 #[when("the operator restores the most recent snapshot")]
 async fn when_restore_last(w: &mut KisekiWorld) {
     let mgr = Arc::clone(
-        w.backup_manager
+        w.backup.manager
             .as_ref()
             .expect("backup manager configured"),
     );
     let id = w
-        .last_backup_snapshot
+        .backup.last_snapshot
         .as_ref()
         .expect("a snapshot was created")
         .snapshot_id
@@ -268,21 +268,21 @@ async fn when_restore_last(w: &mut KisekiWorld) {
         .restore_snapshot(&id)
         .await
         .expect("restore should succeed");
-    w.last_restored_shards = Some(shards);
+    w.backup.last_restored_shards = Some(shards);
 }
 
 #[when(regex = r"^retention is enforced with a (\d+)-day window$")]
 async fn when_enforce_retention(w: &mut KisekiWorld, days: u32) {
     let mgr = Arc::clone(
-        w.backup_manager
+        w.backup.manager
             .as_ref()
             .expect("backup manager configured"),
     );
     let n = mgr.cleanup_old(days).await;
-    w.last_backup_snapshot = None; // legitimately gone now
-    w.last_snapshot_listing = mgr.list_snapshots().await;
+    w.backup.last_snapshot = None; // legitimately gone now
+    w.backup.last_snapshot_listing = mgr.list_snapshots().await;
     // Stash the deleted count in the error slot so a Then can compare.
-    w.last_backup_error = Some(format!("cleaned={n}"));
+    w.backup.last_error = Some(format!("cleaned={n}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -292,10 +292,10 @@ async fn when_enforce_retention(w: &mut KisekiWorld, days: u32) {
 #[then("a snapshot tarball lands in the backup directory")]
 async fn then_tarball_lands(w: &mut KisekiWorld) {
     let snap = w
-        .last_backup_snapshot
+        .backup.last_snapshot
         .as_ref()
         .expect("a snapshot was created");
-    let backend = w.backup_backend.as_ref().expect("backend configured");
+    let backend = w.backup.backend.as_ref().expect("backend configured");
     let blob = backend
         .get_blob(&snap.tarball_key)
         .await
@@ -307,7 +307,7 @@ async fn then_tarball_lands(w: &mut KisekiWorld) {
 #[then(regex = r"^the snapshot manifest records (\d+) shards$")]
 async fn then_manifest_shard_count(w: &mut KisekiWorld, n: usize) {
     let snap = w
-        .last_backup_snapshot
+        .backup.last_snapshot
         .as_ref()
         .expect("a snapshot was created");
     assert_eq!(snap.shard_count, n, "snapshot.shard_count");
@@ -315,7 +315,7 @@ async fn then_manifest_shard_count(w: &mut KisekiWorld, n: usize) {
 
 #[then(regex = r"^(\d+) shard is recovered with metadata and chunk data intact$")]
 async fn then_shard_recovered(w: &mut KisekiWorld, n: usize) {
-    let restored = w.last_restored_shards.as_ref().expect("restore was issued");
+    let restored = w.backup.last_restored_shards.as_ref().expect("restore was issued");
     assert_eq!(restored.len(), n);
     let s = &restored[0];
     assert_eq!(s.shard_id, "alpha");
@@ -326,10 +326,10 @@ async fn then_shard_recovered(w: &mut KisekiWorld, n: usize) {
 #[then("the snapshot tarball is reachable through the S3 backend")]
 async fn then_tarball_reachable_s3(w: &mut KisekiWorld) {
     let snap = w
-        .last_backup_snapshot
+        .backup.last_snapshot
         .as_ref()
         .expect("a snapshot was created");
-    let backend = w.backup_backend.as_ref().expect("backend configured");
+    let backend = w.backup.backend.as_ref().expect("backend configured");
     let blob = backend
         .get_blob(&snap.tarball_key)
         .await
@@ -341,10 +341,10 @@ async fn then_tarball_reachable_s3(w: &mut KisekiWorld) {
 #[then("the manifest is reachable through the S3 backend")]
 async fn then_manifest_reachable_s3(w: &mut KisekiWorld) {
     let snap = w
-        .last_backup_snapshot
+        .backup.last_snapshot
         .as_ref()
         .expect("a snapshot was created");
-    let backend = w.backup_backend.as_ref().expect("backend configured");
+    let backend = w.backup.backend.as_ref().expect("backend configured");
     let blob = backend
         .get_blob(&snap.manifest_key)
         .await
@@ -357,19 +357,19 @@ async fn then_manifest_reachable_s3(w: &mut KisekiWorld) {
 #[then(regex = r"^listing snapshots returns (\d+) entries$")]
 async fn then_listing_returns_n(w: &mut KisekiWorld, n: usize) {
     let mgr = Arc::clone(
-        w.backup_manager
+        w.backup.manager
             .as_ref()
             .expect("backup manager configured"),
     );
     let list = mgr.list_snapshots().await;
     assert_eq!(list.len(), n, "list_snapshots count");
-    w.last_snapshot_listing = list;
+    w.backup.last_snapshot_listing = list;
 }
 
 #[then("the second backup is rejected with InProgress")]
 async fn then_second_rejected(w: &mut KisekiWorld) {
     let err = w
-        .last_backup_error
+        .backup.last_error
         .as_deref()
         .expect("a backup attempt failed");
     assert_eq!(err, "InProgress");
@@ -378,30 +378,30 @@ async fn then_second_rejected(w: &mut KisekiWorld) {
 #[then("the in-progress flag can be cleared and a new backup succeeds")]
 async fn then_clear_and_retry(w: &mut KisekiWorld) {
     let mgr = Arc::clone(
-        w.backup_manager
+        w.backup.manager
             .as_ref()
             .expect("backup manager configured"),
     );
     mgr.force_in_progress(false);
-    let shards = std::mem::take(&mut w.backup_staged_shards);
+    let shards = std::mem::take(&mut w.backup.staged_shards);
     let snap = mgr
         .create_snapshot(&shards)
         .await
         .expect("retry must succeed");
-    w.last_backup_snapshot = Some(snap);
+    w.backup.last_snapshot = Some(snap);
 }
 
 #[then(regex = r"^all (\d+) snapshots are deleted$")]
 async fn then_all_deleted(w: &mut KisekiWorld, expected: usize) {
     let cleaned = w
-        .last_backup_error
+        .backup.last_error
         .as_deref()
         .and_then(|s| s.strip_prefix("cleaned="))
         .and_then(|s| s.parse::<usize>().ok())
         .expect("retention step recorded a cleaned count");
     assert_eq!(cleaned, expected, "cleanup count");
     assert!(
-        w.last_snapshot_listing.is_empty(),
+        w.backup.last_snapshot_listing.is_empty(),
         "listing should be empty after retention 0",
     );
 }

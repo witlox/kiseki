@@ -20,7 +20,7 @@ async fn given_ns(w: &mut KisekiWorld, ns: String, shard: String, tenant: String
 #[when(regex = r#"^a composition is created in namespace "(\S+)"$"#)]
 async fn when_create(w: &mut KisekiWorld, ns: String) {
     let ns_id = *w.namespace_ids.get(&ns).unwrap();
-    match w.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -34,9 +34,9 @@ async fn then_created(w: &mut KisekiWorld) {
     assert!(w.last_composition_id.is_some(), "error: {:?}", w.last_error);
 
     // Cross-context: verify a Create delta was emitted to the log.
-    let comp = w.comp_store.get(w.last_composition_id.unwrap()).unwrap();
+    let comp = w.legacy.comp_store.get(w.last_composition_id.unwrap()).unwrap();
     let deltas = w
-        .log_store
+        .legacy.log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: comp.shard_id,
             from: SequenceNumber(1),
@@ -60,7 +60,7 @@ async fn then_created(w: &mut KisekiWorld) {
 #[when(regex = r#"^the composition is deleted$"#)]
 async fn when_delete(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
-        match w.comp_store.delete(id) {
+        match w.legacy.comp_store.delete(id) {
             Ok(_) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
@@ -68,14 +68,14 @@ async fn when_delete(w: &mut KisekiWorld) {
         // emit `CompositionDeleted` AFTER the underlying store commit.
         // Production path will do this from the apply() callback in
         // `kiseki-composition`; for now the BDD test wiring is here.
-        if let Some(bus) = w.topology_bus.clone() {
+        if let Some(bus) = w.legacy.topology_bus.clone() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
             let _ = bus.emit(
                 kiseki_control::topology_events::TopologyEvent::CompositionDeleted {
-                    tenant: w.nfs_ctx.tenant_id,
-                    namespace: w.nfs_ctx.namespace_id,
+                    tenant: w.legacy.nfs_ctx.tenant_id,
+                    namespace: w.legacy.nfs_ctx.namespace_id,
                     composition: id,
                     hlc_ms: now_ms,
                 },
@@ -87,13 +87,13 @@ async fn when_delete(w: &mut KisekiWorld) {
 #[then("the composition no longer exists")]
 async fn then_gone(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
-        assert!(w.comp_store.get(id).is_err());
+        assert!(w.legacy.comp_store.get(id).is_err());
 
         // Cross-context: verify a Delete delta was emitted to the log.
         // We check all shards since the composition is already gone.
         for &shard_id in w.shard_names.values() {
             let deltas = w
-                .log_store
+                .legacy.log_store
                 .read_deltas(ReadDeltasRequest {
                     shard_id,
                     from: SequenceNumber(1),
@@ -122,7 +122,7 @@ async fn given_other_ns(w: &mut KisekiWorld, ns: String) {
         &uuid::Uuid::NAMESPACE_DNS,
         ns.as_bytes(),
     ));
-    w.comp_store.add_namespace(Namespace {
+    w.legacy.comp_store.add_namespace(Namespace {
         id: ns_id,
         tenant_id,
         shard_id: other_shard,
@@ -137,7 +137,7 @@ async fn given_other_ns(w: &mut KisekiWorld, ns: String) {
 async fn when_rename(w: &mut KisekiWorld, target_ns: String) {
     if let Some(id) = w.last_composition_id {
         let ns_id = *w.namespace_ids.get(&target_ns).unwrap();
-        match w.comp_store.rename(id, ns_id) {
+        match w.legacy.comp_store.rename(id, ns_id) {
             Ok(()) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
@@ -165,7 +165,7 @@ async fn given_readonly(w: &mut KisekiWorld, ns: String) {
         &uuid::Uuid::NAMESPACE_DNS,
         ns.as_bytes(),
     ));
-    w.comp_store.add_namespace(Namespace {
+    w.legacy.comp_store.add_namespace(Namespace {
         id: ns_id,
         tenant_id,
         shard_id,
@@ -193,7 +193,7 @@ async fn then_readonly(w: &mut KisekiWorld) {
 async fn when_update(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         match w
-            .comp_store
+            .legacy.comp_store
             .update(id, vec![ChunkId([0x02; 32]), ChunkId([0x03; 32])], 2048)
         {
             Ok(v) => {
@@ -211,9 +211,9 @@ async fn then_version(w: &mut KisekiWorld, expected: u64) {
 
     // Cross-context: verify an Update delta was emitted.
     if let Some(comp_id) = w.last_composition_id {
-        if let Ok(comp) = w.comp_store.get(comp_id) {
+        if let Ok(comp) = w.legacy.comp_store.get(comp_id) {
             let deltas = w
-                .log_store
+                .legacy.log_store
                 .read_deltas(ReadDeltasRequest {
                     shard_id: comp.shard_id,
                     from: SequenceNumber(1),
@@ -236,7 +236,7 @@ async fn then_version(w: &mut KisekiWorld, expected: u64) {
 #[when("the Composition context processes the create:")]
 async fn when_comp_ctx_processes_create_table(w: &mut KisekiWorld) {
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-    match w.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -249,7 +249,7 @@ async fn when_comp_ctx_processes_create_table(w: &mut KisekiWorld) {
 async fn when_comp_ctx_processes_create(w: &mut KisekiWorld) {
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
     // Small/inline file — create with no chunks
-    match w.comp_store.create(ns_id, vec![], 512) {
+    match w.legacy.comp_store.create(ns_id, vec![], 512) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -262,7 +262,7 @@ async fn when_comp_ctx_processes_create(w: &mut KisekiWorld) {
 async fn when_append_64mb(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         let new_chunks = vec![ChunkId([0x03; 32]), ChunkId([0x04; 32])];
-        match w.comp_store.update(id, new_chunks, 128 * 1024 * 1024) {
+        match w.legacy.comp_store.update(id, new_chunks, 128 * 1024 * 1024) {
             Ok(v) => {
                 w.last_epoch = Some(v);
                 w.last_error = None;
@@ -282,7 +282,7 @@ async fn when_write_modifies_byte_range(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         // Overwrite produces a new chunk c2' replacing c2
         let new_chunks = vec![ChunkId([0x0a; 32])];
-        match w.comp_store.update(id, new_chunks, 128 * 1024 * 1024) {
+        match w.legacy.comp_store.update(id, new_chunks, 128 * 1024 * 1024) {
             Ok(v) => {
                 w.last_epoch = Some(v);
                 w.last_error = None;
@@ -307,7 +307,7 @@ async fn when_complete_multipart_upload(w: &mut KisekiWorld) {
         ChunkId([0x11; 32]),
         ChunkId([0x12; 32]),
     ];
-    match w.comp_store.create(ns_id, chunks, 3 * 64 * 1024 * 1024) {
+    match w.legacy.comp_store.create(ns_id, chunks, 3 * 64 * 1024 * 1024) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -336,7 +336,7 @@ async fn given_c6_refcount_1(_w: &mut KisekiWorld) {
 #[when("the Composition context processes a DELETE")]
 async fn when_comp_ctx_delete(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
-        match w.comp_store.delete(id) {
+        match w.legacy.comp_store.delete(id) {
             Ok(_) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
@@ -348,7 +348,7 @@ async fn given_comp_versions(w: &mut KisekiWorld, _name: String, _versions: Stri
     // Versioning setup — ensure composition exists with version history.
     if w.last_composition_id.is_none() {
         let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-        if let Ok(id) = w.comp_store.create(ns_id, vec![ChunkId([0x20; 32])], 4096) {
+        if let Ok(id) = w.legacy.comp_store.create(ns_id, vec![ChunkId([0x20; 32])], 4096) {
             w.last_composition_id = Some(id);
         }
     }
@@ -357,7 +357,7 @@ async fn given_comp_versions(w: &mut KisekiWorld, _name: String, _versions: Stri
 #[when(regex = r#"^a DELETE is issued for "([^"]+)"$"#)]
 async fn when_delete_issued(w: &mut KisekiWorld, _name: String) {
     if let Some(id) = w.last_composition_id {
-        match w.comp_store.delete(id) {
+        match w.legacy.comp_store.delete(id) {
             Ok(_) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
@@ -367,7 +367,7 @@ async fn when_delete_issued(w: &mut KisekiWorld, _name: String) {
 #[given("later writes file B with the same plaintext P")]
 async fn given_later_writes_same_plaintext(w: &mut KisekiWorld) {
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-    match w.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -381,7 +381,7 @@ async fn when_later_writes_same_plaintext(w: &mut KisekiWorld) {
     // Dedup: second file referencing same chunk_id.
     // The chunk already exists; composition references it.
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-    match w.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -436,7 +436,7 @@ async fn when_posix_rename_targets(w: &mut KisekiWorld, ns: String, shard: Strin
         &uuid::Uuid::NAMESPACE_DNS,
         ns.as_bytes(),
     ));
-    w.comp_store.add_namespace(Namespace {
+    w.legacy.comp_store.add_namespace(Namespace {
         id: ns_id,
         tenant_id,
         shard_id: other_shard,
@@ -447,7 +447,7 @@ async fn when_posix_rename_targets(w: &mut KisekiWorld, ns: String, shard: Strin
     w.namespace_ids.insert(ns.clone(), ns_id);
 
     if let Some(id) = w.last_composition_id {
-        match w.comp_store.rename(id, ns_id) {
+        match w.legacy.comp_store.rename(id, ns_id) {
             Ok(()) => w.last_error = None,
             Err(e) => w.last_error = Some(e.to_string()),
         }
@@ -486,7 +486,7 @@ async fn when_create_unauthorized_ns(w: &mut KisekiWorld, ns: String) {
 #[when("the workload creates, updates, and finalizes compositions")]
 async fn when_workload_creates_updates_finalizes(w: &mut KisekiWorld) {
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-    match w.comp_store.create(ns_id, vec![ChunkId([0x30; 32])], 2048) {
+    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x30; 32])], 2048) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -548,7 +548,7 @@ async fn then_comp_references(w: &mut KisekiWorld, _chunks: String) {
         .last_composition_id
         .expect("composition must exist to check references");
     assert!(
-        w.comp_store.get(id).is_ok(),
+        w.legacy.comp_store.get(id).is_ok(),
         "composition should be retrievable"
     );
 }
@@ -594,7 +594,7 @@ async fn then_visible_after_finalize(w: &mut KisekiWorld) {
         .last_composition_id
         .expect("composition must exist after finalize");
     assert!(
-        w.comp_store.get(id).is_ok(),
+        w.legacy.comp_store.get(id).is_ok(),
         "composition should be retrievable after finalize"
     );
 }
@@ -640,7 +640,7 @@ async fn then_c6_refcount_0(w: &mut KisekiWorld) {
 #[then("the composition is no longer visible in the namespace")]
 async fn then_comp_not_visible(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
-        assert!(w.comp_store.get(id).is_err());
+        assert!(w.legacy.comp_store.get(id).is_err());
     }
 }
 
@@ -654,7 +654,7 @@ async fn then_current_version_delete_marker(w: &mut KisekiWorld) {
     // After delete in versioned namespace, the composition should no longer be retrievable.
     if let Some(id) = w.last_composition_id {
         assert!(
-            w.comp_store.get(id).is_err(),
+            w.legacy.comp_store.get(id).is_err(),
             "current version should be a delete marker (not retrievable)"
         );
     }
@@ -674,7 +674,7 @@ async fn then_chunk_refcounts_not_decremented(w: &mut KisekiWorld) {
 async fn then_file_b_refs_chunk(w: &mut KisekiWorld, _chunk: String) {
     let id = w.last_composition_id.expect("composition B must exist");
     assert!(
-        w.comp_store.get(id).is_ok(),
+        w.legacy.comp_store.get(id).is_ok(),
         "file B's composition should be retrievable"
     );
 }
@@ -684,7 +684,7 @@ async fn then_chunk_refcount_is(w: &mut KisekiWorld, _chunk: String, count: u64)
     // Verify chunk refcount via chunk store.
     if let Some(id) = w.last_chunk_id {
         use kiseki_chunk::store::ChunkOps;
-        let rc = w.chunk_store.refcount(&id).unwrap_or(0);
+        let rc = w.legacy.chunk_store.refcount(&id).unwrap_or(0);
         assert_eq!(rc, count, "chunk refcount mismatch");
     }
 }
@@ -694,7 +694,7 @@ async fn then_chunk_refcount_increments_to(w: &mut KisekiWorld, _chunk: String, 
     // Cross-tenant dedup: refcount should have incremented.
     if let Some(id) = w.last_chunk_id {
         use kiseki_chunk::store::ChunkOps;
-        let rc = w.chunk_store.refcount(&id).unwrap_or(0);
+        let rc = w.legacy.chunk_store.refcount(&id).unwrap_or(0);
         assert_eq!(rc, count, "refcount should have incremented to {count}");
     }
 }
@@ -763,7 +763,7 @@ async fn then_compliance_tags_inherited(w: &mut KisekiWorld) {
     // the real effective_compliance_tags function.
     use kiseki_control::tenant::effective_compliance_tags;
     let org = w
-        .control_tenant_store
+        .control.tenant_store
         .get_org("org-pharma")
         .expect("org should exist");
     let tags = effective_compliance_tags(&org, None);
@@ -811,7 +811,7 @@ async fn then_no_partial_state(w: &mut KisekiWorld) {
     // Atomicity: after a failed create, no composition should exist.
     assert!(
         w.last_composition_id.is_none()
-            || w.comp_store.get(w.last_composition_id.unwrap()).is_err(),
+            || w.legacy.comp_store.get(w.last_composition_id.unwrap()).is_err(),
         "no partial composition should remain after failure"
     );
 }
@@ -986,7 +986,7 @@ async fn given_comp_with_chunks(w: &mut KisekiWorld, name: String, chunks_str: S
         .map(|i| ChunkId([(i as u8) + 1; 32]))
         .collect();
     let size = chunk_count as u64 * 64 * 1024 * 1024;
-    match w.comp_store.create(ns_id, chunks, size) {
+    match w.legacy.comp_store.create(ns_id, chunks, size) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -1018,7 +1018,7 @@ async fn given_comp_refs_chunks(w: &mut KisekiWorld, _name: String, chunks_str: 
         .map(|i| ChunkId([(i as u8) + 5; 32]))
         .collect();
     let size = chunk_count as u64 * 64 * 1024 * 1024;
-    match w.comp_store.create(ns_id, chunks, size) {
+    match w.legacy.comp_store.create(ns_id, chunks, size) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -1100,7 +1100,7 @@ async fn given_chunk_written_with_refcount(w: &mut KisekiWorld, chunk_num: u64, 
 async fn given_comp_in_ns_shard(w: &mut KisekiWorld, _name: String, ns: String, shard: String) {
     let ns_id = w.ensure_namespace(&ns, &shard);
     let chunks = vec![ChunkId([0x10; 32])];
-    match w.comp_store.create(ns_id, chunks, 4096) {
+    match w.legacy.comp_store.create(ns_id, chunks, 4096) {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
