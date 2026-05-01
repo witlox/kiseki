@@ -1,18 +1,24 @@
 # Kiseki
 
 Distributed storage system for HPC/AI workloads. 20 production Rust
-crates (+ 1 BDD-test crate), 39 ADRs, 140 invariants, 285
-@integration BDD scenarios: 274 passing + 10 skipped (documentation-
-grade, see `crates/kiseki-acceptance/tests/acceptance.rs`) + 1
-filtered as `@e2e-deferred` (real Linux pNFS client mount, witnessed
-by `tests/e2e/test_pnfs.py`).
+crates (+ 1 BDD-test crate), 40 ADRs, 140 invariants.
 
-Phase 15 (pNFS) complete end-to-end — sustained Linux 6.x flex-files
-reads work against the 3-node docker compose. Layout encoding shape
-revised in 15c.9 (one segment + N mirrors, see ADR-039) and validated
-on the wire via tcpdump. Phase 16 (cross-node chunk replication)
-also complete; cluster fabric routes correctly from gateway through
-3-node fan-out at any practical chunk size.
+BDD acceptance: 216 scenarios (214 pass, 10 skip). Under active
+fidelity fix — World restructured into sub-structs, server harness
+proven with 2 smoke tests against real `kiseki-server` binary.
+@integration steps migrating from in-memory mocks to gRPC/HTTP calls.
+See `specs/implementation/bdd-fidelity-fix.md`.
+
+E2e tests: 18 Python test files via docker compose (real server, real
+protocols — these are the ground truth).
+
+GCP perf cluster: 3 Terraform profiles (default/transport/gpu) in
+`infra/gcp/`. Deployed 2026-05-01; found chunk replication quorum
+issue and NFS write-path gaps not caught by BDD.
+
+Phase 16 (cross-node chunk replication) complete in code. Phase 17
+follow-ups partially done (ADR-040 persistent CompositionStore,
+per-shard leader endpoint, delta hydration).
 
 ## Language
 
