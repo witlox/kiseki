@@ -948,6 +948,10 @@ async fn then_guarantees_unchanged_iwa2(w: &mut KisekiWorld) {
 #[given(regex = r#"^a Kiseki cluster with tenant "(\S+)"$"#)]
 async fn given_cluster_tenant(w: &mut KisekiWorld, tenant: String) {
     w.ensure_tenant(&tenant);
+    // Also start the real server for @integration steps that use it.
+    // Idempotent — no-op if already running or if binary not found
+    // (graceful degradation for CI without a pre-built server).
+    let _ = w.ensure_server().await;
 }
 
 #[given(regex = r#"^namespace "(\S+)" in shard "(\S+)"$"#)]

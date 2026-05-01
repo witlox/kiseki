@@ -23,6 +23,7 @@ pub mod harness;
 pub mod helpers;
 pub mod kms;
 pub mod log;
+pub mod nfs_integration;
 pub mod operational;
 pub mod pnfs;
 pub mod protocol;

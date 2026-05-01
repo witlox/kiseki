@@ -31,6 +31,10 @@ pub mod transport_select;
 #[cfg(feature = "remote-http")]
 pub mod remote_http;
 
+#[cfg(feature = "remote-nfs")]
+#[allow(missing_docs, clippy::cast_possible_truncation)]
+pub mod remote_nfs;
+
 #[cfg(feature = "ffi")]
 #[allow(missing_docs, unsafe_code, clippy::missing_safety_doc)]
 pub mod ffi;

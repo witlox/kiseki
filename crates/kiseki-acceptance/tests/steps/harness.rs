@@ -167,6 +167,160 @@ impl ServerHarness {
         format!("{}/{}", self.s3_base, path.trim_start_matches('/'))
     }
 
+    /// Send an ONC RPC call over TCP to the NFS port and return the
+    /// reply body (after the record marker and RPC accept header).
+    /// This is the building block for NFS @integration steps.
+    pub fn nfs_rpc_call(
+        &self,
+        program: u32,
+        version: u32,
+        procedure: u32,
+        body: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let addr = format!("127.0.0.1:{}", self.ports.nfs_tcp);
+        let mut stream = TcpStream::connect_timeout(
+            &addr.parse().unwrap(),
+            Duration::from_secs(5),
+        )
+        .map_err(|e| format!("NFS TCP connect to {addr}: {e}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Build ONC RPC call message (RFC 5531 §8)
+        let xid: u32 = 0x4b495345; // "KISE"
+        let mut rpc = Vec::new();
+        rpc.extend_from_slice(&xid.to_be_bytes()); // xid
+        rpc.extend_from_slice(&0u32.to_be_bytes()); // msg_type = CALL
+        rpc.extend_from_slice(&2u32.to_be_bytes()); // rpc_vers = 2
+        rpc.extend_from_slice(&program.to_be_bytes()); // prog
+        rpc.extend_from_slice(&version.to_be_bytes()); // vers
+        rpc.extend_from_slice(&procedure.to_be_bytes()); // proc
+        // AUTH_NONE credentials + verifier
+        rpc.extend_from_slice(&0u32.to_be_bytes()); // cred flavor = AUTH_NONE
+        rpc.extend_from_slice(&0u32.to_be_bytes()); // cred length = 0
+        rpc.extend_from_slice(&0u32.to_be_bytes()); // verf flavor = AUTH_NONE
+        rpc.extend_from_slice(&0u32.to_be_bytes()); // verf length = 0
+        rpc.extend_from_slice(body);
+
+        // Record marker: last fragment flag + length
+        let marker = 0x8000_0000 | (rpc.len() as u32);
+        stream
+            .write_all(&marker.to_be_bytes())
+            .map_err(|e| format!("write marker: {e}"))?;
+        stream
+            .write_all(&rpc)
+            .map_err(|e| format!("write rpc: {e}"))?;
+        stream.flush().map_err(|e| format!("flush: {e}"))?;
+
+        // Read reply record marker
+        let mut hdr = [0u8; 4];
+        stream
+            .read_exact(&mut hdr)
+            .map_err(|e| format!("read reply marker: {e}"))?;
+        let reply_marker = u32::from_be_bytes(hdr);
+        let reply_len = (reply_marker & 0x7FFF_FFFF) as usize;
+
+        // Read reply body
+        let mut reply = vec![0u8; reply_len];
+        stream
+            .read_exact(&mut reply)
+            .map_err(|e| format!("read reply body: {e}"))?;
+
+        // Parse RPC reply header: xid(4) + msg_type(4) + reply_stat(4)
+        // + verifier(8) + accept_stat(4) = 24 bytes minimum
+        if reply.len() < 24 {
+            return Err(format!("reply too short: {} bytes", reply.len()));
+        }
+        let reply_xid = u32::from_be_bytes(reply[0..4].try_into().unwrap());
+        if reply_xid != xid {
+            return Err(format!("xid mismatch: expected {xid:#x}, got {reply_xid:#x}"));
+        }
+        let accept_stat = u32::from_be_bytes(reply[20..24].try_into().unwrap());
+        if accept_stat != 0 {
+            return Err(format!("RPC rejected: accept_stat={accept_stat}"));
+        }
+
+        // Return everything after the 24-byte RPC accept header
+        Ok(reply[24..].to_vec())
+    }
+
+    /// Establish an NFSv4.1 session: EXCHANGE_ID → CREATE_SESSION.
+    /// Returns (client_id, session_id) for use in subsequent COMPOUNDs.
+    pub fn nfs4_establish_session(&self) -> Result<(u64, [u8; 16]), String> {
+        // --- Step 1: EXCHANGE_ID ---
+        let mut exid_body = Vec::new();
+        // COMPOUND: tag(0) + minor_version(1) + 1 op
+        exid_body.extend_from_slice(&0u32.to_be_bytes()); // tag len
+        exid_body.extend_from_slice(&1u32.to_be_bytes()); // minor_version = 1
+        exid_body.extend_from_slice(&1u32.to_be_bytes()); // 1 op
+        exid_body.extend_from_slice(&42u32.to_be_bytes()); // op EXCHANGE_ID
+        // verifier (8 bytes)
+        exid_body.extend_from_slice(&[0u8; 8]);
+        // owner_id (opaque): length + data
+        let owner = b"bdd-test-client";
+        exid_body.extend_from_slice(&(owner.len() as u32).to_be_bytes());
+        exid_body.extend_from_slice(owner);
+        // Pad to 4-byte boundary
+        let pad = (4 - owner.len() % 4) % 4;
+        exid_body.extend_from_slice(&vec![0u8; pad]);
+        // flags = 0
+        exid_body.extend_from_slice(&0u32.to_be_bytes());
+        // state_protect = SP4_NONE (0)
+        exid_body.extend_from_slice(&0u32.to_be_bytes());
+        // impl_id array count = 0
+        exid_body.extend_from_slice(&0u32.to_be_bytes());
+
+        let reply = self.nfs_rpc_call(100003, 4, 1, &exid_body)?;
+        // Parse: status(4) + tag_len(4) + numresults(4) + op(4) + status(4) + client_id(8)
+        if reply.len() < 24 {
+            return Err(format!("EXCHANGE_ID reply too short: {}", reply.len()));
+        }
+        let cmp_status = u32::from_be_bytes(reply[0..4].try_into().unwrap());
+        if cmp_status != 0 {
+            return Err(format!("EXCHANGE_ID COMPOUND failed: status={cmp_status}"));
+        }
+        let tag_len = u32::from_be_bytes(reply[4..8].try_into().unwrap()) as usize;
+        let base = 8 + tag_len + ((4 - tag_len % 4) % 4) + 4; // after numresults
+        let op_status = u32::from_be_bytes(reply[base + 4..base + 8].try_into().unwrap());
+        if op_status != 0 {
+            return Err(format!("EXCHANGE_ID op failed: status={op_status}"));
+        }
+        let client_id = u64::from_be_bytes(reply[base + 8..base + 16].try_into().unwrap());
+
+        // --- Step 2: CREATE_SESSION ---
+        let mut cs_body = Vec::new();
+        cs_body.extend_from_slice(&0u32.to_be_bytes()); // tag len
+        cs_body.extend_from_slice(&1u32.to_be_bytes()); // minor_version = 1
+        cs_body.extend_from_slice(&1u32.to_be_bytes()); // 1 op
+        cs_body.extend_from_slice(&43u32.to_be_bytes()); // op CREATE_SESSION
+        cs_body.extend_from_slice(&client_id.to_be_bytes());
+        cs_body.extend_from_slice(&1u32.to_be_bytes()); // sequence = 1
+        cs_body.extend_from_slice(&0u32.to_be_bytes()); // flags = 0
+
+        let reply = self.nfs_rpc_call(100003, 4, 1, &cs_body)?;
+        if reply.len() < 24 {
+            return Err(format!("CREATE_SESSION reply too short: {}", reply.len()));
+        }
+        let cmp_status = u32::from_be_bytes(reply[0..4].try_into().unwrap());
+        if cmp_status != 0 {
+            return Err(format!("CREATE_SESSION COMPOUND failed: status={cmp_status}"));
+        }
+        let tag_len = u32::from_be_bytes(reply[4..8].try_into().unwrap()) as usize;
+        let base = 8 + tag_len + ((4 - tag_len % 4) % 4) + 4;
+        let op_status = u32::from_be_bytes(reply[base + 4..base + 8].try_into().unwrap());
+        if op_status != 0 {
+            return Err(format!("CREATE_SESSION op failed: status={op_status}"));
+        }
+        let mut session_id = [0u8; 16];
+        session_id.copy_from_slice(&reply[base + 8..base + 24]);
+
+        Ok((client_id, session_id))
+    }
+
     /// Find the kiseki-server binary.
     fn find_binary() -> Result<PathBuf, String> {
         if let Ok(p) = std::env::var("KISEKI_SERVER_BIN") {
