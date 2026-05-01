@@ -26,7 +26,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- Happy path: incremental materialization ---
 
-  @integration
+  @library
   Scenario: Stream processor consumes deltas and updates NFS view
     Given stream processor "sp-nfs-trials" is at watermark 4990
     When new deltas [4991..5000] are available in "shard-trials-1"
@@ -36,7 +36,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And advances its watermark to 5000
     And the NFS view reflects state as of sequence 5000
 
-  @integration
+  @library
   Scenario: POSIX view provides read-your-writes
     Given the NFS view is at watermark 5000
     And a new delta (sequence 5001) is committed by a write through NFS
@@ -47,7 +47,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- View lifecycle ---
 
-  @integration
+  @library
   Scenario: Create a new view
     Given tenant admin creates view descriptor "analytics-trials":
       | field             | value              |
@@ -63,7 +63,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And it materializes the view from the beginning of the log
     And it catches up to the current log tip over time
 
-  @integration
+  @library
   Scenario: Discard and rebuild a view
     Given view "s3-trials" is discardable and occupies 500GB on bulk-nvme
     When the cluster admin (with tenant admin approval) discards the view
@@ -73,7 +73,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And later, the view can be rebuilt by restarting the stream processor
     And it re-materializes from the log (position 0)
 
-  @integration
+  @library
   Scenario: View descriptor version change — pull-based propagation
     Given stream processor "sp-nfs-trials" is running
     When the tenant admin updates descriptor "nfs-trials" to change affinity_pool to "bulk-nvme"
@@ -85,7 +85,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
 
   # --- Failure paths ---
 
-  @integration
+  @library
   Scenario: Stream processor crashes — recovery from last watermark
     Given stream processor "sp-nfs-trials" crashes at watermark 4500
     When it restarts
@@ -94,7 +94,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And re-materializes deltas [4501..current] into the view
     And no data is lost or duplicated (idempotent application)
 
-  @integration
+  @library
   Scenario: Stream processor cannot decrypt — tenant key unavailable
     Given "sp-nfs-trials" cached tenant KEK expires
     And tenant KMS is unreachable
@@ -104,7 +104,7 @@ Feature: View Materialization — Stream processors maintaining protocol-shaped 
     And alerts are raised to cluster admin (view stalled) and tenant admin (KMS issue)
     And when KMS becomes reachable, the processor resumes and catches up
 
-  @integration
+  @library
   Scenario: Source shard unavailable — view serves last known state
     Given shard "shard-trials-1" loses Raft quorum
     When the stream processor cannot read new deltas

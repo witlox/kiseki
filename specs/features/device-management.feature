@@ -12,14 +12,14 @@ Feature: Device management and pool capacity (ADR-024)
 
   # === Device lifecycle ===
 
-  @integration
+  @library
   Scenario: Add device to pool
     When the admin adds device "/dev/nvme2n1" to pool "fast-nvme"
     Then the device appears in the pool device list
     And the pool capacity increases by the device size
     And the device state is "Healthy"
 
-  @integration
+  @library
   Scenario: Evacuate device — chunks migrate to other pool members
     Given device "dev-1" in pool "fast-nvme" has 100 chunks
     When the admin initiates evacuation of "dev-1"
@@ -28,14 +28,14 @@ Feature: Device management and pool capacity (ADR-024)
     And when migration completes, the device state is "Removed"
     And all 100 chunks remain accessible
 
-  @integration
+  @library
   Scenario: Cancel evacuation
     Given device "dev-1" is in state "Evacuating" at 30% progress
     When the admin cancels the evacuation
     Then the device state returns to "Degraded"
     And partially migrated chunks are consistent (no duplicates)
 
-  @integration
+  @library
   Scenario: Device failure triggers automatic EC repair
     Given chunk "c1" has EC 4+2 fragments on devices [d1, d2, d3, d4, d5, d6]
     When device "d3" fails (unresponsive)
@@ -47,7 +47,7 @@ Feature: Device management and pool capacity (ADR-024)
 
   # === Capacity thresholds (per device class) ===
 
-  @integration
+  @library
   Scenario: NVMe pool enters Warning state at 75%
     Given pool "fast-nvme" is at 74% capacity
     When a write brings it to 76%
@@ -55,7 +55,7 @@ Feature: Device management and pool capacity (ADR-024)
     And a telemetry event is emitted
     And writes continue to succeed
 
-  @integration
+  @library
   Scenario: NVMe pool enters Critical state at 85% — new placements rejected
     Given pool "fast-nvme" is at 84% capacity
     When a write brings it to 86%
@@ -63,14 +63,14 @@ Feature: Device management and pool capacity (ADR-024)
     And new chunk placements to "fast-nvme" are rejected
     And the placement engine redirects to a sibling NVMe pool if available
 
-  @integration
+  @library
   Scenario: HDD pool tolerates higher fill — Warning at 85%
     Given pool "bulk-hdd" is at 84% capacity
     Then the pool health is still "Healthy"
     When a write brings it to 86%
     Then the pool health transitions to "Warning"
 
-  @integration
+  @library
   Scenario: Pool at Full returns ENOSPC
     Given pool "fast-nvme" is at 97% (Full for NVMe)
     When a client attempts to write a chunk
@@ -82,14 +82,14 @@ Feature: Device management and pool capacity (ADR-024)
 
   # === Automatic evacuation on health warnings ===
 
-  @integration
+  @library
   Scenario: SSD SMART wear triggers auto-evacuation
     Given device "dev-1" in pool "fast-nvme" reports SMART wear 92%
     Then the device is automatically marked "Evacuating"
     And background migration begins without admin intervention
     And an alert is emitted for the cluster admin
 
-  @integration
+  @library
   Scenario: HDD bad sectors trigger auto-evacuation
     Given device "dev-5" in pool "bulk-hdd" reports 150 reallocated sectors
     Then the device is automatically marked "Evacuating"
@@ -101,7 +101,7 @@ Feature: Device management and pool capacity (ADR-024)
 
   # === System partition monitoring ===
 
-  @integration
+  @library
   Scenario: System partition RAID-1 degraded — warning
     Given the system partition is RAID-1 on 2 SSDs
     When one SSD fails
@@ -109,7 +109,7 @@ Feature: Device management and pool capacity (ADR-024)
     And Kiseki continues operating normally
     And the cluster admin is alerted to replace the drive
 
-  @integration
+  @library
   Scenario: System partition both drives failed — refuse to start
     Given both system RAID-1 drives have failed
     When Kiseki attempts to start

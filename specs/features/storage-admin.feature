@@ -10,7 +10,7 @@ Feature: Storage administration API (ADR-025)
 
   # === Pool management ===
 
-  @integration
+  @library
   Scenario: Add devices to pool
     Given pool "warm-ssd" exists with no devices
     When the admin adds devices ["/dev/sda", "/dev/sdb", "/dev/sdc"]
@@ -33,13 +33,13 @@ Feature: Storage administration API (ADR-025)
 
   # @unit scenario "Pool status shows performance metrics" → kiseki-control/src/storage_admin.rs::pool_status_includes_metrics
 
-  @integration
+  @library
   Scenario: Device health streaming
     When the admin subscribes to DeviceHealth events
     And a device transitions from Healthy to Degraded
     Then the admin receives a DeviceHealthEvent with old_state and new_state
 
-  @integration
+  @library
   Scenario: IO stats streaming
     When the admin subscribes to IOStats for pool "fast-nvme"
     Then the admin receives periodic IOStatsEvent messages
@@ -47,7 +47,7 @@ Feature: Storage administration API (ADR-025)
 
   # === Shard management ===
 
-  @integration
+  @library
   Scenario: Split shard when approaching ceiling
     Given shard "s1" has 900,000 deltas (ceiling is 1,000,000)
     When the admin triggers SplitShard for "s1"
@@ -55,7 +55,7 @@ Feature: Storage administration API (ADR-025)
     And two new shards exist with approximately equal delta counts
     And client writes continue with brief latency bump
 
-  @integration
+  @library
   Scenario: Trigger integrity scrub
     When the admin triggers a scrub on pool "fast-nvme"
     Then each chunk's EC integrity is verified
@@ -68,7 +68,7 @@ Feature: Storage administration API (ADR-025)
 
   # === Operational safety ===
 
-  @integration
+  @library
   Scenario: Rebalance is cancellable
     Given a rebalance is in progress on pool "fast-nvme"
     When the admin cancels the rebalance
@@ -84,26 +84,26 @@ Feature: Storage administration API (ADR-025)
   # @unit scenario "Tenant admin views own usage" → kiseki-control/src/storage_admin.rs::tenant_admin_own_usage
 
   # C2: Per-device I/O stats
-  @integration
+  @library
   Scenario: Device I/O stats streaming
     When the admin subscribes to DeviceIOStats for device "dev-1"
     Then the stream includes read_iops, write_iops, read_latency_p50_ms, p99_ms
     And events arrive at least every 5 seconds
 
-  @integration
+  @library
   Scenario: Per-device stats reveal load skew
     Given device "dev-1" serves 50k read IOPS and device "dev-2" serves 5k
     When the admin views DeviceIOStats for both
     Then the 10x skew is visible in the metrics
 
   # C3: Shard health observability
-  @integration
+  @library
   Scenario: Shard health shows replication status
     When the admin requests GetShardHealth for shard "s1"
     Then the response includes leader_node_id, replica_count, reachable_count
     And commit_lag_entries is reported
 
-  @integration
+  @library
   Scenario: Shard health detects degraded replication
     Given shard "s1" has 3 replicas but only 2 are reachable
     When the admin requests GetShardHealth for "s1"
@@ -113,7 +113,7 @@ Feature: Storage administration API (ADR-025)
   # C4: EC parameter immutability
   # @unit scenario "EC parameters cannot be changed" → kiseki-control/src/storage_admin.rs::ec_immutability_existing_chunks
 
-  @integration
+  @library
   Scenario: ReencodePool explicitly migrates EC parameters
     Given pool "fast-nvme" has chunks with EC 4+2
     When the admin triggers ReencodePool to EC 8+3
@@ -130,13 +130,13 @@ Feature: Storage administration API (ADR-025)
   # @unit scenario → kiseki-control/src/storage_admin.rs::inline_threshold_prospective
 
   # C7: RemoveDevice requires evacuation
-  @integration
+  @library
   Scenario: RemoveDevice blocked if device has data
     Given device "dev-1" has chunks stored
     When the admin calls RemoveDevice for "dev-1"
     Then the operation fails with DEVICE_NOT_EVACUATED
 
-  @integration
+  @library
   Scenario: RemoveDevice succeeds after evacuation
     Given device "dev-1" was evacuated (state = Removed)
     When the admin calls RemoveDevice for "dev-1"
@@ -149,7 +149,7 @@ Feature: Storage administration API (ADR-025)
   # @unit scenario "All tuning parameter changes" → kiseki-control/src/storage_admin.rs::all_tuning_params_audited
 
   # H1: Streaming buffer semantics
-  @integration
+  @library
   Scenario: Streaming events have bounded buffer
     When the admin subscribes to DeviceHealth events
     And 20,000 events are generated before the client reads
@@ -157,7 +157,7 @@ Feature: Storage administration API (ADR-025)
     And a StreamOverflowWarning is sent to the client
 
   # H2: Rebalance cancellation
-  @integration
+  @library
   Scenario: Rebalance can be cancelled mid-operation
     Given a rebalance is in progress on pool "fast-nvme" at 40%
     When the admin calls CancelRebalance
@@ -165,14 +165,14 @@ Feature: Storage administration API (ADR-025)
     And already-moved chunks remain in their new locations
     And the pool is in a valid, consistent state
 
-  @integration
+  @library
   Scenario: Rebalance progress is observable
     Given a rebalance is in progress
     When the admin calls GetRebalanceProgress
     Then the response includes progress_percent, chunks_moved, estimated_time
 
   # H3: SplitShard safety
-  @integration
+  @library
   Scenario: SplitShard rejected if split already in progress
     Given shard "s1" is currently splitting
     When the admin calls SplitShard for "s1"
@@ -183,7 +183,7 @@ Feature: Storage administration API (ADR-025)
   # "SRE on-call can view cluster status" → kiseki-control/src/storage_admin.rs::sre_can_view_cluster_status
   # "SRE on-call cannot modify pool settings" → kiseki-control/src/storage_admin.rs::sre_cannot_create_pool
 
-  @integration
+  @library
   Scenario: SRE incident-response can trigger scrub
     Given an SRE authenticated with sre-incident-response certificate
     When they call TriggerScrub on pool "fast-nvme"
@@ -193,7 +193,7 @@ Feature: Storage administration API (ADR-025)
   # @unit scenario "Pool stats are aggregate" → kiseki-control/src/storage_admin.rs::pool_status_has_only_aggregate_fields
 
   # M4: DrainNode
-  @integration
+  @library
   Scenario: Drain all devices on a node
     Given node "node-3" has 4 devices in pool "fast-nvme"
     When the admin calls DrainNode for "node-3"
@@ -202,7 +202,7 @@ Feature: Storage administration API (ADR-025)
     And when complete, all devices are in state "Removed"
 
   # M5: Rebalance respects capacity thresholds
-  @integration
+  @library
   Scenario: Rebalance does not push destination pool to ReadOnly
     Given pool "fast-nvme-b" is at 90% (Warning)
     When rebalance tries to move chunks from "fast-nvme-a" to "fast-nvme-b"

@@ -14,7 +14,7 @@ Feature: External backup and restore (ADR-016)
 
   # === Filesystem backend ===
 
-  @integration
+  @unit
   Scenario: Snapshot persisted on filesystem backend
     Given a filesystem backup backend is configured
     And shard "s1" with 1024 bytes of metadata
@@ -23,7 +23,7 @@ Feature: External backup and restore (ADR-016)
     Then a snapshot tarball lands in the backup directory
     And the snapshot manifest records 2 shards
 
-  @integration
+  @unit
   Scenario: Snapshot round-trips back to live shards
     Given a filesystem backup backend is configured
     And shard "alpha" with 512 bytes of metadata and chunk data
@@ -33,7 +33,7 @@ Feature: External backup and restore (ADR-016)
 
   # === S3 backend ===
 
-  @integration
+  @unit
   Scenario: Snapshot persisted on S3 backend through SigV4
     Given an S3-compatible backup backend is configured
     And shard "s1" with 1024 bytes of metadata
@@ -41,7 +41,7 @@ Feature: External backup and restore (ADR-016)
     Then the snapshot tarball is reachable through the S3 backend
     And the manifest is reachable through the S3 backend
 
-  @integration
+  @unit
   Scenario: List surfaces every snapshot regardless of backend
     Given a filesystem backup backend is configured
     When the operator triggers a backup
@@ -50,7 +50,7 @@ Feature: External backup and restore (ADR-016)
 
   # === Operational guarantees ===
 
-  @integration
+  @unit
   Scenario: Concurrent backups are rejected
     Given a filesystem backup backend is configured
     And a backup is already in progress
@@ -58,7 +58,7 @@ Feature: External backup and restore (ADR-016)
     Then the second backup is rejected with InProgress
     And the in-progress flag can be cleared and a new backup succeeds
 
-  @integration
+  @unit
   Scenario: Retention cleanup removes expired snapshots
     Given a filesystem backup backend is configured
     And the operator created 3 snapshots

@@ -10,7 +10,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Namespace management ---
 
-  @integration
+  @library
   Scenario: Create namespace triggers shard creation
     Given tenant admin creates namespace "patient-data" under "org-pharma"
     When the Control Plane processes the request
@@ -21,7 +21,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Federation ---
 
-  @integration
+  @library
   Scenario: Register federation peer
     Given cluster admin registers site-CH as a federation peer to site-EU
     When the peering is established:
@@ -34,7 +34,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And data replication carries ciphertext (no key material)
     And both sites connect to the same tenant KMS per tenant
 
-  @integration
+  @library
   Scenario: Data residency enforcement in federation
     Given org "org-pharma" has namespace "swiss-patients" tagged [swiss-residency]
     And the residency policy requires data to stay in Switzerland
@@ -43,7 +43,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And only data without residency constraints replicates
     And the blocked replication attempt is recorded in the audit log
 
-  @integration
+  @library
   Scenario: Tenant config sync across federated sites
     Given org "org-pharma" exists at both site-EU and site-CH
     When tenant admin updates a quota at site-EU
@@ -52,7 +52,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Failure paths ---
 
-  @integration
+  @library
   Scenario: Control plane unavailable - data path continues
     Given the Control Plane service is down
     Then existing data path continues (Log, Chunks, Views work with last-known config)
@@ -61,7 +61,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
     And no placement decisions can be made for new shards
     And the cluster admin is alerted
 
-  @integration
+  @library
   Scenario: Quota enforcement during control plane outage
     Given the Control Plane is unavailable
     And quotas are cached locally by gateways and native clients
@@ -72,7 +72,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Workflow Advisory policy (ADR-020) ---
 
-  @integration
+  @library
   Scenario: Federation does NOT replicate advisory state
     Given "org-pharma" is federated across two sites with async config replication
     When a workflow is declared at site A
@@ -83,7 +83,7 @@ Feature: Control Plane - Tenancy, IAM, policy, placement, federation
 
   # --- Client-side cache policy (ADR-031) ---
 
-  @integration
+  @library
   Scenario: Cache policy resolved during control plane outage
     Given the Control Plane is unavailable
     And a client connects to a storage node via data-path gRPC

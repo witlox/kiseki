@@ -12,7 +12,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Crypto-shred ---
 
-  @integration
+  @library
   Scenario: Crypto-shred destroys tenant KEK
     Given "org-pharma" has chunks [c1, c2, c3] with refcounts [2, 1, 1]
     When the tenant admin performs crypto-shred for "org-pharma"
@@ -23,7 +23,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And refcounts for "org-pharma"'s references are decremented
     And the crypto-shred event is recorded in the audit log (system + tenant export)
 
-  @integration
+  @library
   Scenario: Crypto-shred with retention hold preserves ciphertext
     Given a retention hold "hipaa-7yr" is active on "org-pharma" namespace "trials"
     When crypto-shred is performed for "org-pharma"
@@ -32,7 +32,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
     And system-encrypted ciphertext is retained until hold expires
     And the hold-preserving-after-shred state is recorded in the audit log
 
-  @integration
+  @library
   Scenario: Crypto-shred does not affect other tenants' access
     Given chunk "shared-99" has refcount 2 (org-pharma and org-biotech, cross-tenant dedup)
     When "org-pharma" performs crypto-shred
@@ -44,7 +44,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- KMS connectivity ---
 
-  @integration
+  @library
   Scenario: Tenant KMS reachable from federated site
     Given "org-pharma" has data at site-EU and site-CH
     And tenant KMS is at "kms.pharma.internal"
@@ -63,7 +63,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Failure modes ---
 
-  @integration
+  @library
   Scenario: System key manager failure
     Given the system key manager is an internal HA Kiseki service
     And the system key manager loses quorum
@@ -76,7 +76,7 @@ Feature: Key Management — Two-layer encryption, key lifecycle, crypto-shred
 
   # --- Edge cases ---
 
-  @integration
+  @library
   Scenario: Concurrent key rotation and crypto-shred
     Given "org-pharma" tenant admin initiates key rotation
     And simultaneously another admin initiates crypto-shred

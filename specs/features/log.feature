@@ -11,7 +11,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Happy path: delta append ---
 
-  @integration @slow @slow
+  @library @slow @slow
   Scenario: Successful delta append
     Given shard "shard-alpha" is healthy with all 3 replicas online
     When the Composition context appends a delta with:
@@ -25,7 +25,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a DeltaCommitted event is emitted with sequence_number 1001
     And the commit_ack is returned to the Composition context
 
-  @integration
+  @library
   Scenario: Delta with inline data below threshold (I-L9, ADR-030)
     Given the shard inline threshold is 4096 bytes (per-shard, dynamic — ADR-030)
     When the Composition context appends a delta with:
@@ -36,7 +36,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the payload is offloaded to small/objects.redb on apply (I-SF5)
     And no separate chunk write is required
 
-  @integration
+  @library
   Scenario: Deltas maintain total order within shard
     Given shard "shard-alpha" has committed deltas with sequence_numbers [1000, 1001, 1002]
     When two deltas are appended concurrently
@@ -46,7 +46,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Failure: Raft leader loss ---
 
-  @integration @slow @slow
+  @library @slow @slow
   Scenario: Raft leader loss triggers election
     Given node 1 is the Raft leader for "shard-alpha"
     When node 1 becomes unreachable
@@ -55,7 +55,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And in-flight uncommitted deltas are retried by the Composition context
     And no committed deltas are lost
 
-  @integration @slow @slow
+  @library @slow @slow
   Scenario: Write during leader election is rejected with retriable error
     Given a leader election is in progress for "shard-alpha"
     When the Composition context appends a delta
@@ -64,7 +64,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Failure: Raft quorum loss ---
 
-  @integration @slow @slow
+  @library @slow @slow
   Scenario: Quorum loss makes shard unavailable for writes
     Given nodes 2 and 3 become unreachable for "shard-alpha"
     And only node 1 (leader) remains
@@ -72,7 +72,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And all write commands are rejected with "quorum unavailable" error
     And read commands from existing replicas may continue if stale reads are permitted by the view descriptor
 
-  @integration @slow @slow
+  @library @slow @slow
   Scenario: Quorum recovery resumes normal operation
     Given shard "shard-alpha" lost quorum with only node 1 available
     When node 2 comes back online
@@ -83,7 +83,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Shard split ---
 
-  @integration
+  @library
   Scenario: Shard split triggered by hard ceiling (I-L6)
     Given the hard ceiling for "shard-alpha" is:
       | dimension    | threshold  |
@@ -96,7 +96,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And "shard-alpha" continues serving reads for its existing range
     And a ShardSplit event is emitted
 
-  @integration
+  @library
   Scenario: Split fully wires the new shard end-to-end (I-L6, I-L12, I-L15 — ADR-033)
     Given "shard-alpha" exceeds its hard ceiling
     When the auto-split trigger fires
@@ -107,7 +107,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a write whose hashed_key falls in the new range is committed on "shard-alpha-2" (not on "shard-alpha")
     And no write returns KeyOutOfRange after the split completes
 
-  @integration
+  @library
   Scenario: Shard split does not block writes
     Given a SplitShard operation is in progress for "shard-alpha"
     When the Composition context appends a delta to "shard-alpha"
@@ -116,7 +116,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Shard merge (I-L13, I-L14 — ADR-034, spec-only) ---
 
-  @integration
+  @library
   Scenario: Adjacent shards merge when sustained underutilization is observed
     Given namespace "ns-c" has shards "shard-c1" (range [0x0000, 0x4000)) and "shard-c2" (range [0x4000, 0x8000))
     And both shards have been below 25% of every split-ceiling dimension for the past 24 hours
@@ -128,7 +128,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a ShardMerged event is emitted recording the input IDs, output ID, range, and merge HLC
     And the namespace shard map is updated atomically (I-L15)
 
-  @integration
+  @library
   Scenario: Merge does not block writes (consistent with A-O1, I-O1)
     Given a MergeShard operation is in progress for "shard-c1" and "shard-c2"
     When the Composition context appends a delta whose hashed_key falls in either input range
@@ -136,7 +136,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the merge operation continues in the background
     And after merge completes, the delta is readable from the merged shard "shard-c12"
 
-  @integration
+  @library
   Scenario: Concurrent merge and split on the same range is rejected
     Given a MergeShard for "shard-c1" + "shard-c2" has started but not completed
     When a SplitShard is triggered for "shard-c1"
@@ -144,7 +144,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the merge proceeds to completion
     And the split may be re-evaluated against "shard-c12" after merge completes
 
-  @integration
+  @library
   Scenario: Merge aborted when tail-chase does not converge (ADV-034-2)
     Given a MergeShard is in progress for "shard-e1" and "shard-e2"
     And both input shards are receiving sustained high write traffic
@@ -155,7 +155,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And a MergeAborted event is emitted with reason "convergence_timeout"
     And no writes were lost
 
-  @integration
+  @library
   Scenario: Merge cutover aborted when tail exceeds budget (ADV-034-2)
     Given a MergeShard has entered cutover (input shards set to read-only)
     And the remaining tail has more than 200 deltas
@@ -167,7 +167,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
 
   # --- Edge cases ---
 
-  @integration
+  @library
   Scenario: Delta append to a shard that is splitting
     Given "shard-alpha" is mid-split, creating "shard-alpha-2"
     And the split boundary is at hashed_key 0x8000
@@ -177,7 +177,7 @@ Feature: Log — Delta ordering, replication, and shard lifecycle
     And the delta is committed to "shard-alpha-2" once ready
     And no delta is lost, duplicated, or misplaced
 
-  @integration
+  @library
   Scenario: Concurrent split and compaction
     Given "shard-alpha" is being compacted
     And a SplitShard is triggered during compaction

@@ -9,7 +9,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
 
   # === Repair ===
 
-  @integration
+  @library
   Scenario: Device failure triggers automatic repair (I-D1)
     Given device d3 fails
     When repair is triggered
@@ -18,7 +18,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
     And write reconstructed fragment to a healthy device
     And update chunk metadata with new placement
 
-  @integration
+  @library
   Scenario: Repair during normal I/O
     Given a repair is in progress for device d3
     When new writes target pool "fast-nvme"
@@ -27,7 +27,7 @@ Feature: Erasure coding — chunk durability across devices (ADR-005, ADR-024)
 
   # === Placement (CRUSH-like, I-D4) ===
 
-  @integration
+  @library
   Scenario: Device addition triggers rebalance
     Given pool "fast-nvme" has 6 devices
     When device d7 is added

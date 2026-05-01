@@ -12,7 +12,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # --- Bootstrap and discovery ---
 
-  @integration
+  @library
   Scenario: Client bootstraps without control plane access
     Given the compute node is on the SAN fabric only (no control plane network)
     When the native client initializes
@@ -22,7 +22,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And it is ready to serve reads and writes
     And no direct control plane connectivity was required
 
-  @integration
+  @library
   Scenario: Client selects best available transport
     Given the compute node has:
       | transport    | available |
@@ -43,7 +43,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # --- RDMA path ---
 
-  @integration
+  @library
   Scenario: One-sided RDMA read for pre-encrypted chunks
     Given the transport is libfabric/CXI with one-sided RDMA capability
     And chunk "c50" is stored as system-encrypted ciphertext on a storage node
@@ -57,7 +57,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # @unit scenario "Native client process crashes" → kiseki-client/src/fuse_fs.rs::crash_semantics_committed_survives
 
-  @integration
+  @library
   Scenario: Storage node unreachable — chunk read fails
     Given the native client requests chunk "c50" from a storage node
     And the storage node is unreachable
@@ -65,7 +65,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And if an alternative source exists, the read succeeds
     And if no alternative exists, the read fails with EIO
 
-  @integration
+  @library
   Scenario: Transport failover — CXI to TCP
     Given the native client is using libfabric/CXI
     When the CXI transport fails (NIC issue, fabric partition)
@@ -76,7 +76,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # --- Discovery protocol (ADR-008) ---
 
-  @integration
+  @library
   Scenario: All seed endpoints unreachable — discovery fails
     Given the native client is configured with seed list [node1:9100, node2:9100]
     And both seed endpoints are unreachable
@@ -85,7 +85,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
     And the client retries with exponential backoff
     And the workload receives EIO until discovery succeeds
 
-  @integration
+  @library
   Scenario: Discovery returns shard and view topology
     Given the native client connects to seed endpoint node1:9100
     When it sends a discovery request
@@ -100,7 +100,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # --- Edge cases ---
 
-  @integration
+  @library
   Scenario: Multiple clients writing to the same file concurrently
     Given two native client instances on different compute nodes
     And both write to /mnt/kiseki/trials/shared-log.txt
@@ -127,7 +127,7 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
   # "Staging handoff" → kiseki-client/src/staging.rs::staging_handoff_pool_adoption
   # "Staging beyond capacity" → kiseki-client/src/staging.rs::staging_beyond_capacity_no_eviction
 
-  @integration
+  @library
   Scenario: Cache policy resolved via data-path gRPC
     Given a compute node with no gateway or control plane access
     And the client connects to a storage node via data-path gRPC

@@ -25,7 +25,7 @@ Feature: Workflow Advisory & Client Telemetry — bidirectional steering for HPC
     And the workload's allowed profiles are [ai-training, ai-inference, hpc-checkpoint]
     And workflow_declares_per_sec is 10 and max_prefetch_tuples_per_hint is 4096
 
-  @integration
+  @library
   Scenario: Advisory channel outage does not affect data path
     Given the advisory subsystem on the client's serving node becomes unresponsive
     When the client issues reads and writes for "checkpoint.pt"

@@ -15,7 +15,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Schema versioning (ADR-004) ---
 
-  @integration
+  @library
   Scenario: Rolling upgrade — mixed version cluster
     Given nodes [1, 2, 3] are running kiseki-server v1.0 (format version 1)
     When node 1 is upgraded to v1.1 (supports format versions [1, 2])
@@ -45,7 +45,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Crypto-shred invalidation broadcast (ADR-011, I-K15) ---
 
-  @integration
+  @library
   Scenario: Crypto-shred triggers invalidation broadcast
     Given gateways [gw-1, gw-2] and stream processors [sp-1, sp-2] cache "org-pharma" KEK
     When crypto-shred is executed for "org-pharma"
@@ -54,7 +54,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And crypto-shred returns success after KEK destruction + broadcast
     And it does NOT wait for all acknowledgments
 
-  @integration
+  @library
   Scenario: Unreachable component — TTL expires naturally
     Given native client "client-1" on an unreachable compute node caches "org-pharma" KEK
     And the cache TTL is 60 seconds
@@ -71,7 +71,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Multi-endpoint client resilience (ADR-019, I-O9) ---
 
-  @integration
+  @library
   Scenario: NFS client reconnects after node failure
     Given an NFS client is connected to gateway on node 1
     And the NFS mount is configured with multiple server addresses [node1, node2, node3]
@@ -80,7 +80,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And reconnects to node 2 or node 3 automatically
     And NFS operations resume (session state re-established)
 
-  @integration
+  @library
   Scenario: S3 client retries to different endpoint on error
     Given an S3 client sends PutObject to node 1
     And node 1 returns 503 Service Unavailable
@@ -88,7 +88,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     Then DNS resolves to [node2, node3] (round-robin)
     And the retry succeeds on a healthy node
 
-  @integration
+  @library
   Scenario: Native client discovery updates after shard split
     Given the native client has cached discovery results
     And shard "shard-1" splits into "shard-1" and "shard-1b"
@@ -99,7 +99,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
 
   # --- Node lifecycle / operator drain workflow (ADR-035, spec-only) ---
 
-  @integration
+  @library
   Scenario: Operator workflow — graceful node retirement
     Given the cluster admin needs to retire node "n7" for hardware refresh
     And the cluster has 5 Active nodes [n1..n5] including n7
@@ -111,7 +111,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the operator is signalled completion with a per-shard summary
     And every state transition is recorded in the cluster audit shard (I-N6)
 
-  @integration
+  @library
   Scenario: Operator workflow — drain refused, replacement added, drain re-issued
     Given the cluster has exactly 3 Active nodes [n1, n2, n3]
     When the operator runs `kiseki-admin node drain n1`
@@ -121,7 +121,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     Then the drain is accepted and proceeds per the standard protocol
     And the audit log records both the refusal and the successful drain
 
-  @integration
+  @library
   Scenario: Operator workflow — drain cancellation
     Given node n1 is Draining with voter replacement in progress
     When the operator runs `kiseki-admin node drain-cancel n1`
@@ -140,7 +140,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
   # "Advisory audit batching" → kiseki-audit/src/event.rs::advisory_audit_batching_ratio
   # "Advisory audit growth triggers safety valve" → kiseki-audit/src/event.rs::advisory_audit_growth_triggers_safety_valve
 
-  @integration
+  @library
   Scenario: Advisory subsystem isolation verified operationally
     Given synthetic load drives the advisory subsystem to 100% of its runtime capacity
     When data-path operations continue in parallel
@@ -148,7 +148,7 @@ Feature: Operational — Integrity monitoring, schema versioning, compression, o
     And the operational metric `data_path_blocked_on_advisory_total` remains 0
     And if the metric ever rises above 0, a P0 alert fires and the advisory subsystem is candidate for circuit-break
 
-  @integration
+  @library
   Scenario: Advisory subsystem outage F-ADV-1 — operator-visible state
     Given the advisory subsystem on one node becomes unresponsive (F-ADV-1)
     When operational health checks run

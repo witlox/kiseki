@@ -19,7 +19,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Placement and affinity ---
 
-  @integration
+  @library
   Scenario: Pool capacity exhausted triggers rebalance
     Given pool "fast-nvme" is at 95% capacity
     When a new chunk targets "fast-nvme"
@@ -31,7 +31,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Repair and failure ---
 
-  @integration
+  @library
   Scenario: Device failure triggers chunk repair
     Given device "nvme-17" in pool "fast-nvme" fails
     And chunks [c10, c11, c12] had EC fragments on "nvme-17"
@@ -41,7 +41,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And repaired fragments are placed on healthy devices in the pool
     And chunk availability is restored
 
-  @integration
+  @library
   Scenario: Chunk unrecoverable - insufficient EC parity
     Given chunk "c99" has EC 4+2 encoding
     And 3 of 6 fragments are lost (exceeds parity tolerance of 2)
@@ -51,7 +51,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And the Composition context is notified that compositions referencing "c99" have data loss
     And the cluster admin is alerted
 
-  @integration
+  @library
   Scenario: Admin-triggered chunk repair
     Given the cluster admin suspects corruption on device "nvme-22"
     When the admin triggers RepairChunk for all chunks on "nvme-22"
@@ -63,7 +63,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Edge cases ---
 
-  @integration
+  @library
   Scenario: Chunk write during pool rebalance
     Given pool "fast-nvme" is rebalancing (migrating chunks to "bulk-nvme")
     When a new chunk targets "fast-nvme"
@@ -84,7 +84,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # "Locality-class telemetry" → kiseki-chunk/src/store.rs::locality_class_telemetry_shape
   # "Pool backpressure k-anonymity" → kiseki-chunk/src/store.rs::pool_backpressure_k_anonymity_sentinel
 
-  @integration
+  @library
   Scenario: Repair-degraded read emits telemetry without leaking topology
     Given a chunk in the caller's composition is being read while EC repair is in progress
     When the read succeeds from the remaining shards
@@ -98,7 +98,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # `fragment_index = 0`. Spec: phase-16-cross-node-chunks.md (rev 4),
   # ADR-005, ADR-026.
 
-  @integration @cross-node
+  @library @cross-node
   Scenario: Replication-N places one fragment per peer
     Given a 3-node cluster and pool "default" with `Replication { copies: 3 }`
     When a client writes a chunk to "default"
@@ -106,7 +106,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And every fragment is the same encrypted envelope (content-addressed)
     And `cluster_chunk_state[("default", chunk_id)].placement` lists all 3 nodes
 
-  @integration @cross-node
+  @library @cross-node
   Scenario: Read falls back to fabric when local fragment is missing
     Given a chunk replicated to [node-1, node-2, node-3]
     And node-2's local store is missing the fragment (cross-stream lag)
@@ -116,7 +116,7 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And on success returns the envelope to the caller
     And `kiseki_fabric_ops_total{op="get",peer="node-1",outcome="ok"}` increments
 
-  @integration @cross-node
+  @library @cross-node
   Scenario: GC across peers when refcount reaches 0 (I-C2)
     Given chunk "c-gc" has refcount=1 on every node
     When the only composition referencing "c-gc" is deleted

@@ -9,7 +9,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === Device initialization ===
 
-  @integration
+  @unit
   Scenario: Initialize a raw block device
     Given a raw block device at "/dev/nvme0n1" with 4TB capacity
     When the device is initialized for Kiseki
@@ -19,21 +19,21 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     And all bitmap bits are cleared (entire data region is free)
     And the device is ready for extent allocation
 
-  @integration
+  @unit
   Scenario: Refuse to initialize device with existing Kiseki superblock
     Given a device already initialized with Kiseki superblock
     When initialization is attempted without --force
     Then the operation is rejected with "device already initialized"
     And no data is overwritten
 
-  @integration
+  @unit
   Scenario: Refuse to initialize device with existing filesystem
     Given a device with XFS filesystem signature
     When initialization is attempted
     Then the operation is rejected with "existing filesystem detected"
     And the error message includes the detected filesystem type
 
-  @integration
+  @unit
   Scenario: Force-initialize over existing superblock
     Given a device already initialized with Kiseki superblock
     When initialization is attempted with --force
@@ -43,7 +43,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === Auto-detection ===
 
-  @integration
+  @unit
   Scenario: Auto-detect NVMe SSD characteristics
     Given a device at "/dev/nvme0n1"
     When device characteristics are probed
@@ -53,7 +53,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     And io_strategy is "DirectAligned"
     And supports_trim is true
 
-  @integration
+  @unit
   Scenario: Auto-detect HDD characteristics
     Given a device at "/dev/sda" with rotational=1
     When device characteristics are probed
@@ -61,14 +61,14 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     And rotational is true
     And io_strategy is "BufferedSequential"
 
-  @integration
+  @unit
   Scenario: Auto-detect virtual device (VM)
     Given a device with "virtio" in model string
     When device characteristics are probed
     Then medium is detected as "Virtual"
     And io_strategy is "FileBacked"
 
-  @integration
+  @unit
   Scenario: File-backed fallback when no block device
     Given a file path "/tmp/kiseki-test-device"
     When a file-backed device is opened
@@ -80,28 +80,28 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === Data I/O ===
 
-  @integration
+  @unit
   Scenario: Write and read data round-trip
     Given an initialized device
     When 1MB of test data is written to an allocated extent
     And the data is read back from the same extent
     Then the read data matches the written data exactly
 
-  @integration
+  @unit
   Scenario: Write includes CRC32 trailer
     Given an initialized device
     When data is written to an extent
     Then a CRC32 checksum is appended as a 4-byte trailer
     And the total stored size includes the CRC32
 
-  @integration
+  @unit
   Scenario: Read verifies CRC32 on every read
     Given data was written to an extent with CRC32 trailer
     When the extent is read
     Then the CRC32 is verified before returning data
     And the CRC32 trailer is stripped from the returned data
 
-  @integration
+  @unit
   Scenario: CRC32 mismatch detected as corruption
     Given data was written to an extent
     When a bit flip is simulated in the stored data
@@ -109,14 +109,14 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     Then the CRC32 verification fails
     And a "data corruption" error is returned (not "authentication failure")
 
-  @integration
+  @unit
   Scenario: O_DIRECT write on NVMe (DirectAligned strategy)
     Given a device with io_strategy "DirectAligned"
     When data is written
     Then the write uses O_DIRECT flag (bypasses page cache)
     And the write buffer is aligned to physical_block_size
 
-  @integration
+  @unit
   Scenario: Buffered write on HDD (BufferedSequential strategy)
     Given a device with io_strategy "BufferedSequential"
     When data is written
@@ -125,7 +125,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === Crash recovery ===
 
-  @integration
+  @unit
   Scenario: Crash between journal and bitmap — recovered on restart
     Given an allocation was journaled in redb
     But the bitmap was NOT updated (simulated crash)
@@ -134,7 +134,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     And the bitmap is updated to match the journal
     And the free-list is rebuilt from the corrected bitmap
 
-  @integration
+  @unit
   Scenario: Crash between data write and chunk_meta — extent reclaimed
     Given an extent was allocated and data was written
     But chunk_meta was NOT committed to redb (simulated crash)
@@ -143,7 +143,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     And the extent is freed (bitmap cleared, journal entry removed)
     And no data loss occurs (the write was never acknowledged)
 
-  @integration
+  @unit
   Scenario: Bitmap primary/mirror mismatch — resolved from journal
     Given the primary bitmap was updated but the mirror was not (crash)
     When the device is reopened
@@ -151,7 +151,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     And the bitmap consistent with the redb journal is used
     And the other copy is repaired to match
 
-  @integration
+  @unit
   Scenario: Superblock corruption detected on open
     Given the superblock checksum does not match its contents
     When the device is opened
@@ -161,7 +161,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === Periodic scrub ===
 
-  @integration
+  @unit
   Scenario: Scrub detects orphan extents
     Given 3 extents are allocated in bitmap but have no chunk_meta in redb
     When periodic scrub runs
@@ -169,14 +169,14 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     And bitmap bits are cleared
     And scrub reports "3 orphan extents reclaimed, 768KB freed"
 
-  @integration
+  @unit
   Scenario: Scrub detects bitmap inconsistency
     Given bitmap shows block 1000 as free but redb has a chunk_meta pointing to it
     When scrub runs
     Then the bitmap is corrected (block 1000 marked allocated)
     And scrub reports "1 bitmap inconsistency corrected"
 
-  @integration
+  @unit
   Scenario: Scrub runs on device startup and periodically
     When a device is opened
     Then an initial scrub runs during startup
@@ -184,7 +184,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === TRIM batching ===
 
-  @integration
+  @unit
   Scenario: TRIM commands are batched, not immediate
     Given a device with supports_trim = true
     When 100 small extents are freed in rapid succession
@@ -195,7 +195,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === Capacity reporting ===
 
-  @integration
+  @unit
   Scenario: Device reports accurate capacity
     Given an initialized 1TB device with 100GB allocated
     When capacity is queried
@@ -205,7 +205,7 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
 
   # === Additional crash recovery and validation scenarios ===
 
-  @integration
+  @unit
   Scenario: WAL intent entry detected on restart — extent freed if no chunk_meta
     Given an extent was allocated with a WAL intent entry
     But no chunk_meta was committed for that extent
@@ -214,21 +214,21 @@ Feature: Block Storage — raw device I/O, allocation, crash recovery (ADR-029)
     And the extent is freed (bitmap cleared)
     And the WAL intent entry is removed
 
-  @integration
+  @unit
   Scenario: Superblock checksum verified on every open
     Given an initialized device
     When the device is opened
     Then the superblock checksum is verified against its contents
     And any mismatch prevents the device from being used
 
-  @integration
+  @unit
   Scenario: Free-list rebuilt from bitmap on restart
     Given a device with 50 extents allocated
     When the device is reopened
     Then the free-list is rebuilt from the bitmap
     And allocations work correctly after rebuild
 
-  @integration
+  @unit
   Scenario: Unknown superblock version rejected
     Given a device with superblock version 99
     When the device is opened

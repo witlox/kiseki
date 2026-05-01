@@ -11,7 +11,7 @@ Feature: Composition — Tenant-scoped data assembly and namespace management
 
   # --- Namespace management ---
 
-  @integration
+  @library
   Scenario: Create namespace
     Given tenant admin for "org-pharma" requests new namespace "genomics"
     When the Control Plane approves (quota, policy check)

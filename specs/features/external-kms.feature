@@ -11,7 +11,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Provider configuration ===
 
-  @integration
+  @library
   Scenario: Tenant configures Vault provider
     When tenant "org-pharma" configures KMS:
       | field     | value                              |
@@ -25,7 +25,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the configuration is stored in the control plane
     And the configuration event is recorded in the audit log
 
-  @integration
+  @library
   Scenario: Tenant configures KMIP 2.1 provider
     When tenant "org-defense" configures KMS:
       | field     | value                              |
@@ -37,7 +37,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the KMIP server's Symmetric Key object is located
     And a test wrap/unwrap round-trip succeeds
 
-  @integration
+  @library
   Scenario: Tenant configures AWS KMS provider
     When tenant "org-cloud" configures KMS:
       | field     | value                              |
@@ -49,7 +49,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And a test wrap/unwrap round-trip succeeds
     And KEK material never leaves the AWS KMS boundary
 
-  @integration
+  @library
   Scenario: Tenant configures PKCS#11 HSM provider
     When tenant "org-bank" configures KMS:
       | field        | value                           |
@@ -64,7 +64,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Wrap/unwrap operations ===
 
-  @integration
+  @library
   Scenario: HSM unwrap — material stays in hardware
     Given tenant "org-bank" with PKCS#11 provider
     When a chunk is read
@@ -75,7 +75,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Internal provider ===
 
-  @integration
+  @library
   Scenario: Internal provider KEK isolation from system master keys
     Given tenant "org-internal" with Internal KMS provider
     When the tenant KEK is generated
@@ -99,7 +99,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Key rotation via provider ===
 
-  @integration
+  @library
   Scenario: Vault provider key rotation
     Given tenant "org-pharma" with Vault KMS provider
     When the tenant admin triggers key rotation
@@ -109,7 +109,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And old envelopes remain readable during migration
     And the rotation event is recorded in the audit log
 
-  @integration
+  @library
   Scenario: AWS KMS provider key rotation
     Given tenant "org-cloud" with AWS KMS provider
     When the tenant admin triggers key rotation
@@ -118,7 +118,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And background re-wrap uses ReEncrypt (server-side, no plaintext)
     And old envelopes remain readable during migration
 
-  @integration
+  @library
   Scenario: PKCS#11 provider key rotation
     Given tenant "org-bank" with PKCS#11 provider
     When the tenant admin triggers key rotation
@@ -130,7 +130,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Crypto-shred per provider ===
 
-  @integration
+  @library
   Scenario: Internal provider crypto-shred
     Given tenant "org-internal" with Internal KMS provider
     When crypto-shred is performed
@@ -139,7 +139,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And all tenant data becomes unreadable
     And the shred event is recorded in the audit log
 
-  @integration
+  @library
   Scenario: Vault provider crypto-shred
     Given tenant "org-pharma" with Vault KMS provider
     When crypto-shred is performed
@@ -148,7 +148,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the local cache is purged immediately
     And all tenant data becomes unreadable
 
-  @integration
+  @library
   Scenario: AWS KMS crypto-shred — immediate disable + deferred delete
     Given tenant "org-cloud" with AWS KMS provider
     When crypto-shred is performed
@@ -158,7 +158,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And all tenant data becomes unreadable from the moment DisableKey fires
     And the 7-day window is for permanent deletion only (key is already dead)
 
-  @integration
+  @library
   Scenario: KMIP provider crypto-shred
     Given tenant "org-defense" with KMIP 2.1 provider
     When crypto-shred is performed
@@ -166,7 +166,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And the key state transitions to "Destroyed" (irrecoverable)
     And the local cache is purged immediately
 
-  @integration
+  @library
   Scenario: PKCS#11 provider crypto-shred
     Given tenant "org-bank" with PKCS#11 provider
     When crypto-shred is performed
@@ -176,7 +176,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Provider migration ===
 
-  @integration
+  @library
   Scenario: Migrate from Internal to Vault provider
     Given tenant "org-growing" with Internal KMS provider
     And 1000 chunks exist with Internal-wrapped envelopes
@@ -193,7 +193,7 @@ Feature: External Tenant KMS Providers (ADR-028)
     And when 100% re-wrapped, the active provider switches to Vault atomically
     And the old Internal KEK is decommissioned
 
-  @integration
+  @library
   Scenario: Provider migration preserves data availability
     Given tenant "org-growing" migration from Internal to Vault is at 50%
     When a read arrives for a chunk still wrapped with Internal provider
@@ -210,7 +210,7 @@ Feature: External Tenant KMS Providers (ADR-028)
 
   # === Mixed provider cluster ===
 
-  @integration
+  @library
   Scenario: Three tenants with three different providers
     Given tenant "org-alpha" with Internal KMS provider
     And tenant "org-beta" with Vault KMS provider
@@ -226,7 +226,7 @@ Feature: External Tenant KMS Providers (ADR-028)
   # "Internal provider trade-off documented" → kiseki-keymanager/src/provider.rs::internal_provider_trade_off_documented
   # "KMS credential rotation does not leak old secrets" → kiseki-keymanager/src/provider.rs::credential_rotation_old_secret_not_in_debug
 
-  @integration
+  @library
   Scenario: Provider migration can be cancelled mid-operation
     Given migration from Internal to Vault at 50%
     When the operator cancels the migration
