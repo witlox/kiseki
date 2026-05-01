@@ -1,7 +1,7 @@
 # ADR-037: Test Infrastructure — Raft Harness and Subsystem Trait Boundaries
 
-**Status**: Accepted
-**Date**: 2026-04-25
+**Status**: Accepted (rev 2 — adds server harness + kiseki-client as BDD interface)
+**Date**: 2026-04-25 (rev 1) / **Revised**: 2026-05-01 (rev 2)
 **Deciders**: Architect (diamond workflow: analyst → architect → adversary)
 **Context**: 96 remaining @integration scenarios, ADR-026 (Raft), ADR-025 (StorageAdmin)
 
@@ -96,6 +96,33 @@ No architect input required — implementer wires directly:
 6. **Raft test harness** — largest piece, unblocks most scenarios
 7. **AdvisoryOps** — most complex, integrates with gateway data path
 
+### 4. Server harness + kiseki-client as BDD interface (rev 2 — 2026-05-01)
+
+The in-memory `KisekiWorld` (InMemoryGateway, MemShardStore) failed to
+catch production bugs: GCP deployment showed NFS write failures, S3
+chunk replication errors, and FUSE connectivity issues — none caught
+by BDD because steps called domain objects directly.
+
+**Fix**: `KisekiWorld` now holds a running `kiseki-server` process
+(spawned per feature file) and BDD @integration steps interact with
+it through `kiseki-client`:
+
+- `kiseki-client` with `remote-http` feature → S3 HTTP to port 9000
+- `kiseki-client` with `remote-nfs` feature → NFSv4 RPC to port 2049
+- Both implement `GatewayOps` → same step code, different transport
+
+The `world/` sub-struct a step touches reveals its tier:
+- `world/legacy.rs` imports production crates → @unit tier
+- Steps using `kiseki-client` (via `world.server()`) → @integration tier
+
+**Server lifecycle** (`steps/harness.rs`):
+- `ServerHarness::start()` — spawn binary, allocate ports, wait for readiness
+- gRPC channel (tonic) + HTTP client (reqwest) + NFS addr for `kiseki-client`
+- One server per feature file; cleanup between scenarios
+
+**Replaces**: the in-memory approach in rev 1 sections 2-3. The Raft
+test harness (section 1) is retained for @unit Raft scenarios.
+
 ## Consequences
 
 ### Positive
@@ -103,8 +130,12 @@ No architect input required — implementer wires directly:
 - Each subsystem trait can be implemented independently
 - Raft harness reusable for kiseki-keymanager Raft groups
 - No production code changes needed for Tier 2
+- @integration steps catch real deployment bugs (proven by GCP findings)
+- `kiseki-client` is a product artifact, not test plumbing
 
 ### Negative
 - Raft harness is significant implementation effort
 - 5 new trait definitions add API surface
 - AdvisoryOps integrates with the gateway data path (cross-cutting)
+- Server startup adds ~2-3s per feature file (~25 features = ~60s overhead)
+- `kiseki-server` binary must be built before acceptance tests run

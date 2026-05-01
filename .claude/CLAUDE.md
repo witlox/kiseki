@@ -1,5 +1,7 @@
 # Workflow Router
 
+Correctness over velocity. Every shortcut becomes debt.
+
 Role definitions in `.claude/roles/`. Read the relevant role file when
 activating a mode. These are behavioral constraints.
 

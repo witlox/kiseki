@@ -1,7 +1,7 @@
 # ADR-023: Protocol RFC Compliance Scope and Test Discipline
 
-**Status**: Accepted (rev 2 — addresses ADV-023-2/3/4/5/6/7/8/10).
-**Date**: 2026-04-20 (rev 1) / **Revised**: 2026-04-27 (rev 2)
+**Status**: Accepted (rev 3 — adds D7 client-side protocol library).
+**Date**: 2026-04-20 (rev 1) / **Revised**: 2026-04-27 (rev 2) / 2026-05-01 (rev 3)
 **Deciders**: Architect + implementer (rev 1); Architect → adversary
 gate 1 → implementer (rev 2).
 
@@ -310,6 +310,42 @@ Adding a new protocol surface:
   source priority + storage policy.
 - **`@happy-path` tag rollout chicken-and-egg** — D4.1 transition
   plan keeps existing CI green throughout.
+
+### D7. Client-side protocol library (rev 3 — 2026-05-01)
+
+`kiseki-client` provides client-side implementations for all three
+protocol paths the cluster exposes:
+
+| Feature flag | Transport | Target port | Interface |
+|---|---|---|---|
+| `remote-http` (exists) | HTTP/S3 | 9000 | `GatewayOps` |
+| `remote-nfs` (new) | NFSv4 ONC RPC over TCP | 2049 | `GatewayOps` |
+| `fuse` (exists) | `/dev/fuse` kernel | — | `KisekiFuse` |
+
+The NFS client reuses `kiseki-gateway::nfs_xdr::{XdrWriter, XdrReader}`
+and `kiseki-gateway::nfs4_server::op` constants for COMPOUND
+construction. It manages an NFSv4.1 session (EXCHANGE_ID →
+CREATE_SESSION → SEQUENCE-bound ops) over a single TCP connection.
+
+Both `remote-http` and `remote-nfs` implement `GatewayOps`, so BDD
+@integration steps use the same trait interface regardless of
+protocol:
+
+```rust
+let s3 = KisekiClient::s3(server.s3_url(""));
+s3.write(req).await?;  // HTTP PUT
+
+let nfs = KisekiClient::nfs(server.nfs_addr());
+nfs.write(req).await?; // NFSv4 OPEN+WRITE COMPOUND
+```
+
+Cross-protocol tests exercise both clients against the same server:
+write via S3, read via NFS (and vice versa).
+
+This closes the gap identified by the GCP deployment (2026-05-01):
+BDD tests used in-memory domain objects instead of real protocol
+clients. With `kiseki-client` as the BDD interface, every
+@integration step exercises the full wire protocol stack.
 
 ## Open
 
