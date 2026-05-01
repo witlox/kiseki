@@ -167,6 +167,24 @@ impl ServerHarness {
         format!("{}/{}", self.s3_base, path.trim_start_matches('/'))
     }
 
+    /// Get an S3 client (kiseki-client RemoteHttpGateway) connected to
+    /// the running server. Implements GatewayOps.
+    pub fn s3_client(&self) -> kiseki_client::remote_http::RemoteHttpGateway {
+        kiseki_client::remote_http::RemoteHttpGateway::new(&self.s3_base)
+    }
+
+    /// Get an NFSv4.1 client connected to the running server.
+    pub fn nfs4_client(&self) -> kiseki_client::remote_nfs::v4::Nfs4Client {
+        let addr = format!("127.0.0.1:{}", self.ports.nfs_tcp).parse().unwrap();
+        kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr)
+    }
+
+    /// Get an NFSv3 client connected to the running server.
+    pub fn nfs3_client(&self) -> kiseki_client::remote_nfs::v3::Nfs3Client {
+        let addr = format!("127.0.0.1:{}", self.ports.nfs_tcp).parse().unwrap();
+        kiseki_client::remote_nfs::v3::Nfs3Client::new(addr)
+    }
+
     /// Send an ONC RPC call over TCP to the NFS port and return the
     /// reply body (after the record marker and RPC accept header).
     /// This is the building block for NFS @integration steps.

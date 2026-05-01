@@ -28,7 +28,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
 
   # --- Protocol semantics enforcement ---
 
-  @integration
+  @library
   Scenario: NFSv4.1 state management — open/lock
     Given a client opens "/trials/shared.log" with NFS OPEN
     And acquires an NFS byte-range lock on bytes 0-1024
@@ -62,7 +62,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
 
   # --- Failure paths ---
 
-  @integration
+  @library
   Scenario: Gateway crash — client reconnects
     Given "gw-nfs-pharma" crashes
     When the gateway is restarted (or a new instance spun up)
@@ -72,7 +72,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And no committed data is lost (durability is in the Log + Chunk Storage)
     And in-flight uncommitted writes are lost
 
-  @integration
+  @library
   Scenario: Gateway cannot reach tenant KMS — writes fail
     Given tenant KMS for "org-pharma" is unreachable
     And cached KEK has expired
@@ -82,7 +82,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And reads of previously cached/materialized data may still work
     And the tenant admin is alerted
 
-  @integration
+  @library
   Scenario: Gateway cannot reach Chunk Storage — read fails
     Given Chunk Storage is partially unavailable
     When a read requests a chunk on an unavailable device
@@ -106,7 +106,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And on success, annotates the write path for advisory correlation
     And on mismatch or unknown ref, ignores the header silently and processes the request unchanged (I-WA1)
 
-  @integration
+  @library
   Scenario: Priority-class hint applied to request scheduling within policy
     Given workload "training-run-42"'s allowed priority classes are [batch, bulk]
     And the client's hint carries { priority: batch }
@@ -114,7 +114,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     Then the request is placed in the batch QoS class
     And a hint requesting { priority: interactive } is rejected with hint-rejected reason "priority_not_allowed" without affecting the underlying request (I-WA14)
 
-  @integration
+  @library
   Scenario: Request-level backpressure telemetry emitted on sustained saturation
     Given the gateway serves "training-run-42" with 200 concurrent in-flight requests
     And the workload has subscribed to backpressure telemetry
@@ -123,14 +123,14 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And only the caller's own queue state contributes to the signal; neighbour callers do not leak through this channel (I-WA5)
     And data-path requests continue to be accepted
 
-  @integration
+  @library
   Scenario: Access-pattern hint routed from protocol metadata
     Given an NFSv4.1 client submits read with `io_advise` hints indicating sequential access
     When the gateway maps the advisory to a Workflow Advisory hint { access_pattern: sequential }
     Then the advisory is submitted asynchronously (I-WA2) and the NFS read is served normally
     And the View Materialization subsystem MAY readahead for subsequent reads of the same caller
 
-  @integration
+  @library
   Scenario: NFS workflow_ref carriage model (v1)
     Given NFSv4.1 is a POSIX-oriented protocol with no native header for workflow correlation
     When a workload mounts an NFS export via "gw-nfs-pharma"
@@ -142,7 +142,7 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And mounts without `workflow-ref` proceed with no advisory correlation — data-path behavior is identical to pre-advisory NFS (I-WA1, I-WA2)
     And the gateway MAY refuse a mount whose workflow_ref is unknown or belongs to a different workload; that refusal is a mount-time error, not mid-session
 
-  @integration
+  @library
   Scenario: QoS-headroom telemetry caller-scoped
     Given workload "training-run-42" is subscribed to QoS-headroom telemetry
     When the gateway computes headroom within the workload's I-T2 quota
