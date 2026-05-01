@@ -44,7 +44,11 @@ SSH_KEY=""
 
 node_ssh() {
   local host=$1; shift
-  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $SSH_KEY "$SSH_USER@$host" "$@"
+  # OS Login service-account user needs sudo for mount/fio/kiseki-client.
+  # Pipe the command via stdin to avoid quoting hell with multi-line
+  # scripts that contain single quotes (python -c '...').
+  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $SSH_KEY \
+    "$SSH_USER@$host" "sudo bash -s" <<< "$*"
 }
 
 # ----------------------------------------------------------------------------

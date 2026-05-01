@@ -105,6 +105,10 @@ Environment=KISEKI_RAW_DEVICES=${raw_devices}
 # blocking on redb I/O in the state machine apply path.
 Environment=KISEKI_RAFT_THREADS=64
 
+# ADR-038 §D4.2: plaintext NFS fallback (no TLS bundle in perf-test env)
+Environment=KISEKI_INSECURE_NFS=true
+Environment=KISEKI_ALLOW_PLAINTEXT_NFS=true
+
 Environment=RUST_LOG=info
 
 [Install]

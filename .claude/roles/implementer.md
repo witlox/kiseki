@@ -31,16 +31,58 @@ implementer makes them green. Two layers of testing work together:
 
 When production code already exists, skip to BDD directly.
 
-**BDD (integration level)** — verify the pieces work together:
+**BDD (integration level)** — verify via the RUNNING SERVER:
 1. Pick an @integration Gherkin scenario (already red/todo)
-2. Wire production code through the real integrated path
-   (gateway→composition→log, real backends, real error types)
-3. Run — green
-4. Next scenario
+2. The step body MUST interact with the system through a NETWORK PROTOCOL:
+   - gRPC via `world.grpc_channel` (tonic client stubs)
+   - HTTP via `world.http_client` (reqwest, to the S3 gateway)
+   - TCP socket to port 2049 (NFS wire framing)
+3. The step body MUST NOT:
+   - Call domain objects directly (`w.gateway.write()`, `w.log_store.append()`)
+   - Have an empty body `{}` (use `todo!("description")` — empty bodies silently pass)
+   - Set World fields as the sole assertion (tautology)
+   - Construct domain types inline just to satisfy an assertion
+4. Run — green (the server binary must be running for the step to pass)
+5. Next scenario
 
-One scenario at a time. TDD builds what's missing, BDD proves it
-integrates. The analyst already specified WHAT; the architect already
-designed HOW. The implementer builds and wires.
+One scenario at a time. TDD builds what's missing, BDD proves the
+SERVER works end-to-end. The analyst already specified WHAT; the
+architect already designed HOW. The implementer builds and wires.
+
+### The litmus test for real integration
+
+A step definition is REAL if and only if:
+
+1. Removing all `kiseki-*` crate dependencies from `kiseki-acceptance/Cargo.toml`
+   (except `kiseki-proto` for gRPC stubs and `kiseki-common` for shared IDs)
+   would still let the step COMPILE. If it compiles without production
+   crates, it talks to the server over the network. If it doesn't compile,
+   it's calling library code directly — a unit test masquerading as integration.
+2. The step communicates ONLY through `world.grpc_channel`, `world.http_client`,
+   or a TCP socket. Never through `world.gateway`, `world.log_store`,
+   `world.key_store`, or any other in-process domain object.
+3. The assertion checks a RESPONSE from the network call (status code, body,
+   gRPC status), not a field set by another step in the same scenario.
+4. Killing the `kiseki-server` process makes the step FAIL. If the step
+   passes without a running server, it is fake.
+
+### Banned patterns (automatic gate 2 failure)
+
+| Pattern | Why it is wrong | Correct alternative |
+|---------|----------------|---------------------|
+| `async fn step(_w: &mut KisekiWorld) {}` | Empty body — proves nothing | `todo!("description")` or real network call |
+| `w.gateway.write(WriteRequest { .. })` | Direct domain call bypasses server | `w.http_client.put(s3_url).body(data).send()` |
+| `w.log_store.append_delta(req)` | Direct domain call bypasses server | `w.log_stub.append_delta(grpc_req).await` |
+| `w.key_store.rotate()` | Direct domain call bypasses server | `w.key_stub.rotate_key(grpc_req).await` |
+| `w.last_error = None; assert!(w.last_error.is_none())` | Tautology — step sets then checks own field | Assert on gRPC/HTTP response status |
+| `w.ensure_namespace("ns"); assert!(w.namespace_ids.contains_key("ns"))` | Tests the test harness, not the system | Create namespace via gRPC, verify via gRPC |
+
+### @unit exceptions
+
+Some scenarios genuinely test pure domain logic (crypto primitives,
+EC encode/decode, budget rate limiting). These MUST be tagged `@unit`
+and MAY call domain objects directly. They MUST NOT be tagged
+`@integration`. If unsure, it's `@integration` and needs network calls.
 
 ## Constraints
 

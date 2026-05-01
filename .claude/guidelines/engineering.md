@@ -41,10 +41,30 @@
 ### BDD — verify integration (system level)
 
 - Gherkin scenarios written by analyst BEFORE implementation
-- Implementer makes them green by wiring production code through real
-  integrated paths (gateway→composition→log, real backends)
-- @integration scenarios exercise cross-context behavior end-to-end
+- Implementer makes them green by running a REAL `kiseki-server` binary
+  and making REAL network calls (gRPC, HTTP, TCP) in step definitions
+- @integration scenarios exercise cross-context behavior through the
+  server's actual protocol endpoints — never through in-process mocks
 - Fidelity tracking: each scenario rated by depth (see `roles/auditor.md`)
+
+### BDD Step Fidelity
+
+@integration BDD steps MUST exercise the system through network protocols.
+The `KisekiWorld` struct holds a running `kiseki-server` process and
+network clients (gRPC channel, HTTP client). Step definitions use ONLY
+these clients to interact with the system.
+
+**Forbidden in @integration steps:**
+- Importing production crate types other than `kiseki-proto` (gRPC stubs)
+  and `kiseki-common` (shared IDs/types for request construction)
+- Calling any method on an in-process domain object (`gateway`, `log_store`,
+  `key_store`, `comp_store`, `chunk_store`, `view_store`)
+- Empty step bodies `{}` (use `todo!("description")` — empty bodies silently pass)
+- Setting World fields as the sole means of passing data between steps
+
+**The test for whether a step is real:**
+If you deleted the `kiseki-server` binary, would the step fail?
+If yes: real. If no: fake.
 
 ### Test Organization
 
@@ -59,7 +79,8 @@
 - Table-driven tests with named cases
 - Arrange-Act-Assert structure
 - Mock external dependencies at boundaries, not internal logic
-- Use in-memory implementations over mocks where possible (more realistic)
+- BDD @integration steps use network clients (gRPC/HTTP), never in-process mocks
+- In-memory implementations are acceptable for @unit crate tests only
 - Test edge cases and error paths, not just happy paths
 
 ## Architecture Decision Records

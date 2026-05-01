@@ -70,13 +70,14 @@ locals {
     default = {
       label              = "default"
       storage_count      = 6
-      storage_machine    = "c3-standard-22"
-      storage_local_ssds = 4
-      storage_tier_1     = true
+      storage_machine    = "c3-standard-22-lssd" # bundled NVMe (no scratch_disk blocks)
+      storage_scratch     = 0                     # lssd: SSDs are bundled, not scratch
+      storage_nvme_count  = 4                     # device path count for raw_devices
+      storage_tier_1     = false # c3-standard-22-lssd (22 vCPU) is below Tier_1 floor; 6×23 Gbps aggregate
       client_count       = 3
       client_machine     = "c3-standard-22"
       client_cache_gb    = 200
-      client_tier_1      = true
+      client_tier_1      = false # c3-standard-22 (22 vCPU) is below the Tier_1 floor
       client_gpu         = false
       client_image       = "rocky-linux-cloud/rocky-linux-9"
       client_setup       = "setup-perf-client.sh"
@@ -85,8 +86,9 @@ locals {
     transport = {
       label              = "transport"
       storage_count      = 3
-      storage_machine    = "c3-standard-88"
-      storage_local_ssds = 8
+      storage_machine    = "c3-standard-88-lssd" # bundled NVMe
+      storage_scratch     = 0
+      storage_nvme_count  = 16 # c3-standard-88-lssd bundles 16 partitions
       storage_tier_1     = true
       client_count       = 3
       client_machine     = "c3-standard-44"
@@ -100,8 +102,9 @@ locals {
     gpu = {
       label              = "gpu"
       storage_count      = 3
-      storage_machine    = "c3-standard-44"
-      storage_local_ssds = 4
+      storage_machine    = "c3-standard-44-lssd" # bundled NVMe
+      storage_scratch     = 0
+      storage_nvme_count  = 8 # c3-standard-44-lssd bundles 8 partitions
       storage_tier_1     = true
       client_count       = 2
       client_machine     = "a2-highgpu-1g"
@@ -118,7 +121,9 @@ locals {
   p = local.profiles[var.profile]
 
   # Local SSDs appear under stable by-id symlinks regardless of NVMe namespace ordering.
-  raw_devices = join(",", [for i in range(local.p.storage_local_ssds) : "/dev/disk/by-id/google-local-ssd-${i}"])
+  # lssd machines use "google-local-nvme-ssd-N"; scratch-disk machines use "google-local-ssd-N".
+  ssd_prefix  = local.p.storage_scratch > 0 ? "google-local-ssd" : "google-local-nvme-ssd"
+  raw_devices = join(",", [for i in range(local.p.storage_nvme_count) : "/dev/disk/by-id/${local.ssd_prefix}-${i}"])
 
   storage_ips = [for i in range(local.p.storage_count) : "10.0.0.${10 + i}"]
   client_ips  = [for i in range(local.p.client_count) : "10.0.0.${30 + i}"]
@@ -204,7 +209,7 @@ resource "google_compute_instance" "storage" {
   }
 
   dynamic "scratch_disk" {
-    for_each = range(local.p.storage_local_ssds)
+    for_each = range(local.p.storage_scratch)
     content {
       interface = "NVME"
     }

@@ -9,31 +9,47 @@ Every step function is classified by what it actually exercises:
 
 | Depth | Definition | Acceptable for |
 |-------|-----------|----------------|
-| STUB | Empty body or comment-only | Nothing — use `todo!()` instead |
-| SHALLOW | Checks a flag/boolean without exercising real code | `@unit` non-critical only |
-| MOCK | Exercises real logic against in-memory backends | `@unit` scenarios |
-| THOROUGH | Exercises real code with real backends, meaningful assertions | `@integration` scenarios |
+| STUB | Empty body `{}` or comment-only | Nothing — use `todo!()` instead |
+| SHALLOW | Sets/checks a World field without any real call | Nothing — rewrite or delete |
+| MOCK | Calls domain object directly (w.gateway, w.log_store) | `@unit` scenarios ONLY |
+| NETWORK | Communicates via gRPC/HTTP/TCP to a running kiseki-server | `@integration` (REQUIRED) |
 
 ### @integration depth requirement
 
-@integration scenarios exercise the real integrated code path
-(gateway→composition→log). Every assertion verifies real state
-produced by real operations. Errors flow from actual operations
-through the system, producing real error types.
+@integration steps MUST achieve NETWORK depth. Every step
+communicates with the system EXCLUSIVELY through network protocols:
+`world.grpc_channel` (tonic), `world.http_client` (reqwest), or a
+TCP socket. Assertions verify the RESPONSE from the network call
+(status code, body, gRPC status), not a World field set by another step.
 
-Example: KeyOutOfRange comes from `MemShardStore::append_delta()`
-rejecting a hashed_key, propagated through `emit_delta()` and
-returned as `GatewayError::KeyOutOfRange` — the step definition
-calls `gateway.write()` and checks the error type.
+A step that calls `w.gateway.write()` or `w.log_store.append_delta()`
+is MOCK depth — acceptable for `@unit` scenarios only. Any
+`@integration` step at MOCK depth or below is an automatic gate 2
+FAILURE.
+
+Example of NETWORK depth: S3 PUT returns 200, step asserts on
+`response.status() == 200` and `response.headers()["etag"]` is a
+valid UUID. The response came from a running kiseki-server over HTTP.
+
+Example of MOCK depth (FAILS gate 2 for @integration):
+`w.gateway.write(WriteRequest{..})` returns `Ok(response)` — this
+calls an in-process `InMemoryGateway`, never touches the server binary.
 
 ## Gate 2 checks
 
 Before approving gate 2, verify:
 
-1. **Every step body**: executable code or `todo!()` — grep for `async fn.*\{\}`
+1. **Empty body scan**: `grep -rn 'async fn.*\{\s*\}' steps/` — MUST return zero results
 2. **Every assertion**: falsifiable — check for `assert!(true)`, `>= 0` on unsigned
-3. **@integration uses real backends**: distributed behavior against `PersistentShardStore` or `RaftShardStore`
-4. **Errors from real operations**: through the actual code path, producing real error types
+3. **Domain import scan**: @integration step files MUST NOT import `kiseki_gateway::`,
+   `kiseki_log::store::`, `kiseki_chunk::store::`, `kiseki_keymanager::store::`,
+   or any production crate except `kiseki_proto` and `kiseki_common`
+4. **Tautology scan**: flag steps where the sole assertion checks a World field
+   set by a previous step (e.g., `w.last_error = None` then `assert!(w.last_error.is_none())`)
+5. **World-field-only scan**: flag steps whose body only sets World fields with
+   no network call and no assertion on a response
+6. **Server dependency**: kill the kiseki-server process → @integration tests MUST fail.
+   If they pass without a server, the harness is broken
 
 ## Audit protocol
 
