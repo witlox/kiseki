@@ -25,6 +25,16 @@ pub struct ServerConfig {
     pub node_id: u64,
     /// Raft peer addresses (comma-separated "id=addr" pairs).
     pub raft_peers: Vec<(u64, String)>,
+    /// Optional override for fabric (chunk-fetch) peer addresses.
+    /// Same `id=host:port` format as `raft_peers`. When unset, fabric
+    /// addresses are derived from `raft_peers` by substituting the
+    /// local node's `data_addr` port — which assumes every node binds
+    /// the same data-path port. That holds in containerized/hostnamed
+    /// deployments (docker-compose) but breaks for localhost
+    /// multi-node where every node has a distinct `data_addr` port.
+    /// The BDD `ClusterHarness` (and any single-host integration test)
+    /// sets this explicitly.
+    pub fabric_peers: Vec<(u64, String)>,
     /// Raft RPC listen address.
     pub raft_addr: Option<SocketAddr>,
     /// Create a well-known bootstrap shard on startup (for e2e tests).
@@ -239,6 +249,17 @@ impl ServerConfig {
             })
             .collect();
 
+        let fabric_peers = std::env::var("KISEKI_FABRIC_PEERS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|entry| {
+                let (id_str, addr) = entry.split_once('=')?;
+                let id: u64 = id_str.parse().ok()?;
+                Some((id, addr.to_owned()))
+            })
+            .collect();
+
         let raft_addr = std::env::var("KISEKI_RAFT_ADDR")
             .ok()
             .and_then(|v| v.parse().ok());
@@ -305,6 +326,7 @@ impl ServerConfig {
             data_dir,
             node_id,
             raft_peers,
+            fabric_peers,
             raft_addr,
             bootstrap,
             meta_soft_limit_pct,

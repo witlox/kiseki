@@ -16,6 +16,7 @@
 
 pub mod backup;
 pub mod block;
+pub mod cluster;
 pub mod control;
 pub mod kms;
 pub mod legacy;

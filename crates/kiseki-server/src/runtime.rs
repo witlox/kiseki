@@ -332,11 +332,23 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     let bootstrap_tenant_for_cluster = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
     let mut fabric_peers: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> = Vec::new();
     let data_port = cfg.data_addr.port();
+    // Build a peer-id → fabric address map. `KISEKI_FABRIC_PEERS`
+    // (cfg.fabric_peers) overrides the per-port derivation below,
+    // which is the only path that works when every node binds a
+    // distinct data-path port (e.g. localhost multi-node, BDD).
+    let fabric_override: std::collections::HashMap<u64, &str> = cfg
+        .fabric_peers
+        .iter()
+        .map(|(id, addr)| (*id, addr.as_str()))
+        .collect();
     for (peer_id, raft_peer_addr) in &cfg.raft_peers {
         if *peer_id == cfg.node_id {
             continue; // skip ourselves
         }
-        let fabric_addr = fabric_addr_from_raft_peer(raft_peer_addr, data_port);
+        let fabric_addr = fabric_override.get(peer_id).map_or_else(
+            || fabric_addr_from_raft_peer(raft_peer_addr, data_port),
+            |s| (*s).to_owned(),
+        );
         match build_fabric_channel(&fabric_addr, cfg.tls.as_ref()) {
             Ok(channel) => {
                 let name = format!("node-{peer_id}");

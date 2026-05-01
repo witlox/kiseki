@@ -126,16 +126,25 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
 
   # --- Multi-node integration (requires multi-server harness) ---
 
-  @integration @multi-node @e2e-deferred
+  @integration
   Scenario: S3 PUT on single-node server stores data locally
     Given a running kiseki-server
     When a client writes 1MB via S3 PUT
     Then S3 GET returns the same 1MB
     And the server did not report quorum errors
 
-  @integration @multi-node @e2e-deferred
+  @integration @multi-node
   Scenario: S3 PUT on 3-node cluster replicates to all nodes
     Given a 3-node kiseki cluster
     When a client writes 1MB via S3 PUT to node-1
     Then S3 GET from node-2 returns the same 1MB
     And S3 GET from node-3 returns the same 1MB
+
+  @integration @multi-node
+  Scenario: Writes resume on new leader after leader kill
+    Given a 3-node kiseki cluster
+    When the current leader is killed
+    Then a new leader is elected within 15 seconds
+    When a client writes 1MB via S3 PUT to the cluster
+    Then S3 GET from any surviving node returns the same 1MB
+    And the killed node is restarted and rejoins the cluster

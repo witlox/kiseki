@@ -80,6 +80,9 @@ pub struct KisekiWorld {
     pub pnfs: world::pnfs::PnfsState,
     /// Backup/restore state (ADR-016).
     pub backup: world::backup::BackupState,
+    /// Per-scenario state for `@multi-node` cluster steps. The cluster
+    /// itself is a process-level singleton in `steps::cluster_harness`.
+    pub cluster: world::cluster::ClusterState,
 
     // --- Shared test state (used across step files) ---
 
@@ -139,6 +142,7 @@ impl KisekiWorld {
             kms: world::kms::KmsState::new(),
             pnfs: world::pnfs::PnfsState::new(),
             backup: world::backup::BackupState::new(),
+            cluster: world::cluster::ClusterState::default(),
             last_error: None,
             last_read_data: None,
             last_epoch: None,

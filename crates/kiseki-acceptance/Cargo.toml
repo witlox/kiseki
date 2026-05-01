@@ -51,10 +51,16 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 # Server harness — steps talk to a running kiseki-server via network
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
 tonic = { workspace = true }
 kiseki-proto = { workspace = true }
 prost = { workspace = true }
+serde_json = { workspace = true }
+
+# Cluster harness — child processes are killed when the test binary exits
+# (via prctl(PR_SET_PDEATHSIG) on Linux).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 # BDD step definitions are test code — relax lints.
 [lints.clippy]
