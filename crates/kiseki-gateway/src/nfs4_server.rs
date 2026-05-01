@@ -416,7 +416,7 @@ fn process_op<G: GatewayOps>(
         op::SETATTR => op_setattr(reader, ctx, state),
         op::LOOKUP => op_lookup(reader, ctx, state),
         op::OPEN => op_open(reader, ctx, sessions, state),
-        op::CLOSE => op_close(reader, sessions, state),
+        op::CLOSE => op_close(reader, ctx, sessions, state),
         op::LOCK => op_lock(reader, sessions, state),
         op::READ => op_read(reader, ctx, state),
         op::WRITE => op_write(reader, ctx, sessions, state),
@@ -426,7 +426,7 @@ fn process_op<G: GatewayOps>(
         op::READDIR => op_readdir(reader, ctx, state),
         op::READLINK => op_readlink(ctx, state),
         op::CREATE => op_create(reader, ctx, state),
-        op::COMMIT => op_commit(),
+        op::COMMIT => op_commit(reader, ctx, state),
         op::SAVEFH => op_savefh(state),
         op::RESTOREFH => op_restorefh(state),
         op::RECLAIM_COMPLETE => op_reclaim_complete(reader),
@@ -1020,51 +1020,22 @@ fn op_write<G: GatewayOps>(
     let _ = sessions;
     let _ = sid_bytes;
 
-    // RFC 8881 §18.32 WRITE semantics: write `data` at `offset`
-    // within the file referenced by current_fh. Kiseki compositions
-    // are immutable, so true offset-based mutation requires
-    // buffered-write-then-flush-on-COMMIT plumbing — Phase 16
-    // architectural work.
-    //
-    // Until that lands we have a pragmatic choice: reject
-    // non-zero offsets (correct but breaks every sequential-write
-    // workload — kernel retries forever) or accept-and-discard-bytes
-    // for non-zero offsets (lets sequential writes complete with
-    // honest throughput numbers; data after the first 1M is lost).
-    //
-    // Choice: accept-and-buffer the offset=0 case (still creates a
-    // composition, persists), accept-but-discard for offset>0.
-    // fio --rw=write doesn't verify content, so the perf tests
-    // measure protocol throughput cleanly. Real workloads requiring
-    // true sequential writes will hit this limit and need the
-    // Phase 16 fix.
-    let status = if offset == 0 {
-        match ctx.write(data) {
-            Ok((new_fh, resp)) => {
-                state.current_fh = Some(new_fh);
-                w.write_u32(nfs4_status::NFS4_OK);
-                w.write_u32(resp.count);
-                w.write_u32(2); // FILE_SYNC
-                w.write_opaque_fixed(&[0u8; 8]); // verifier
-                nfs4_status::NFS4_OK
-            }
-            Err(_) => {
-                w.write_u32(nfs4_status::NFS4ERR_IO);
-                nfs4_status::NFS4ERR_IO
-            }
-        }
-    } else {
-        // Phase 15c.8 perf-only path: report the bytes as written
-        // without actually persisting them. Required so the kernel's
-        // sequential-write loop doesn't enter retry-with-backoff
-        // when it sees NFS4ERR_IO (which we'd otherwise return).
-        w.write_u32(nfs4_status::NFS4_OK);
+    // Buffer the write data at the given offset. All writes for a
+    // file handle are accumulated and flushed as a single composition
+    // on CLOSE or COMMIT. This supports sequential NFS writes
+    // (offset 0, 4096, 8192, ...) correctly.
+    let status = if let Some(fh) = state.current_fh {
+        ctx.buffer_write(&fh, offset, &data);
         #[allow(clippy::cast_possible_truncation)]
         let count = data.len() as u32;
+        w.write_u32(nfs4_status::NFS4_OK);
         w.write_u32(count);
         w.write_u32(2); // FILE_SYNC
         w.write_opaque_fixed(&[0u8; 8]); // verifier
         nfs4_status::NFS4_OK
+    } else {
+        w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
+        nfs4_status::NFS4ERR_NOFILEHANDLE
     };
 
     (status, w.into_bytes())
@@ -1750,13 +1721,21 @@ fn op_open<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_close(
+fn op_close<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
     sessions: &SessionManager,
     state: &mut CompoundState,
 ) -> (u32, Vec<u8>) {
     let _seqid = reader.read_u32().unwrap_or(0);
     let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
+
+    // Flush buffered writes before closing the file.
+    if let Some(fh) = state.current_fh {
+        if let Ok(Some((new_fh, _resp))) = ctx.flush_writes(&fh) {
+            state.current_fh = Some(new_fh);
+        }
+    }
 
     let mut w = XdrWriter::new();
     w.write_u32(op::CLOSE);
@@ -2161,7 +2140,22 @@ fn op_create<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_commit() -> (u32, Vec<u8>) {
+fn op_commit<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+    state: &mut CompoundState,
+) -> (u32, Vec<u8>) {
+    // RFC 8881 §18.3 COMMIT4args: offset(8) + count(4)
+    let _offset = reader.read_u64().unwrap_or(0);
+    let _count = reader.read_u32().unwrap_or(0);
+
+    // Flush buffered writes on COMMIT.
+    if let Some(fh) = state.current_fh {
+        if let Ok(Some((new_fh, _resp))) = ctx.flush_writes(&fh) {
+            state.current_fh = Some(new_fh);
+        }
+    }
+
     let mut w = XdrWriter::new();
     w.write_u32(op::COMMIT);
     w.write_u32(nfs4_status::NFS4_OK);
@@ -2735,7 +2729,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, _) = op_close(&mut reader, &sessions, &mut state);
+        let (status, _) = op_close(&mut reader, &ctx, &sessions, &mut state);
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         // The stateid should no longer be valid.

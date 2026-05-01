@@ -61,6 +61,16 @@ impl DirectoryIndex {
         );
     }
 
+    /// Reverse-lookup: find the name for a file handle in a namespace.
+    pub fn name_for(&self, ns: NamespaceId, fh: &FileHandle) -> Option<String> {
+        let entries = self.entries.lock().unwrap();
+        entries.get(&ns).and_then(|dir| {
+            dir.values()
+                .find(|e| &e.file_handle == fh)
+                .map(|e| e.name.clone())
+        })
+    }
+
     /// Look up a file by name in a namespace.
     pub fn lookup(&self, ns: NamespaceId, name: &str) -> Option<DirEntry> {
         let entries = self.entries.lock().unwrap();

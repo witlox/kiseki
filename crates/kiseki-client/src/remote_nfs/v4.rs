@@ -259,9 +259,16 @@ impl GatewayOps for Nfs4Client {
         w.write_opaque(&req.data);
         let write = (op::WRITE, w.into_bytes());
 
+        // COMMIT — flushes buffered writes to a composition.
+        // No arguments needed (RFC 8881 §18.3: offset=0, count=0 = flush all).
+        let mut w = XdrWriter::new();
+        w.write_u64(0); // offset
+        w.write_u32(0); // count
+        let commit = (op::COMMIT, w.into_bytes());
+
         let reply = sess.sequenced_compound(
             self.minor_version,
-            &[putrootfh, open, write, getfh],
+            &[putrootfh, open, write, commit, getfh],
         )?;
 
         // Walk the op results sequentially using XdrReader.
@@ -308,9 +315,18 @@ impl GatewayOps for Nfs4Client {
         let _ = r.read_u32().map_err(xdr_err)?; // committed
         let _ = r.read_opaque_fixed(8).map_err(xdr_err)?; // verifier
 
+        // COMMIT result: op(4) + status(4) + verifier(8)
+        // COMMIT flushes the write buffer to a composition.
+        let _ = r.read_u32().map_err(xdr_err)?; // op
+        let commit_st = r.read_u32().map_err(xdr_err)?;
+        if commit_st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("COMMIT: {commit_st}")));
+        }
+        let _ = r.read_opaque_fixed(8).map_err(xdr_err)?; // verifier
+
         // GETFH result: op(4) + status(4) + fh4(opaque)
-        // GETFH after WRITE picks up the file handle that WRITE set
-        // (which contains the composition UUID for the written data).
+        // GETFH after COMMIT picks up the file handle that flush_writes
+        // set (the composition with the actual data).
         let _ = r.read_u32().map_err(xdr_err)?; // op
         let getfh_st = r.read_u32().map_err(xdr_err)?;
         if getfh_st != NFS4_OK {

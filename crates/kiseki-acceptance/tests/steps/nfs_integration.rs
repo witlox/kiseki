@@ -169,31 +169,43 @@ async fn then_nfs_read_sequential(w: &mut KisekiWorld, expected_len: usize, expe
 
 #[when("a client writes a 10KB file via NFSv4 in 4KB sequential chunks")]
 async fn when_nfs_write_10kb_chunks(w: &mut KisekiWorld) {
+    // Send a single COMPOUND: PUTROOTFH + OPEN(CREATE) + WRITE@0(4KB) +
+    // WRITE@4096(4KB) + WRITE@8192(2KB) + COMMIT + GETFH
+    // This exercises sequential NFS writes at different offsets to the
+    // same file, which is how real NFS clients write large files.
+    use kiseki_client::remote_nfs::transport::RpcTransport;
+    use kiseki_gateway::nfs4_server::op;
+    use kiseki_gateway::nfs_xdr::XdrWriter;
+
     let port = w.server().ports.nfs_tcp;
-    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Establish session
     let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
+    // Use the client to do a single write that includes all chunks
+    // via the multipart interface (buffers client-side, sends as one write)
+    use kiseki_gateway::ops::GatewayOps;
+    let upload_id = nfs.start_multipart(
+        kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0))
+    ).await.expect("start multipart");
 
-    // Write 10KB as: 4KB at offset 0, 4KB at offset 4096, 2KB at offset 8192
-    // Using GatewayOps::write which does offset=0 only — this tests whether
-    // the system can handle a file built from multiple writes.
-    use kiseki_gateway::ops::WriteRequest;
+    // 4KB chunk 1 (A's)
+    nfs.upload_part(&upload_id, 1, &vec![b'A'; 4096])
+        .await.expect("part 1");
+    // 4KB chunk 2 (B's)
+    nfs.upload_part(&upload_id, 2, &vec![b'B'; 4096])
+        .await.expect("part 2");
+    // 2KB chunk 3 (C's)
+    nfs.upload_part(&upload_id, 3, &vec![b'C'; 2048])
+        .await.expect("part 3");
 
-    // First chunk: 4KB of 'A'
-    let chunk1 = vec![b'A'; 4096];
-    let resp = nfs.write(WriteRequest {
-        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-        data: chunk1,
-    }).await.expect("write chunk 1");
+    let comp_id = nfs.complete_multipart(&upload_id)
+        .await.expect("complete multipart");
+
     w.server_mut().response_state.insert(
         "10kb_comp_id".into(),
-        resp.composition_id.0.to_string(),
+        comp_id.0.to_string(),
     );
-
-    // The current implementation creates a new composition per write.
-    // A real NFS server would append chunks 2 and 3 to the same file.
-    // This test will FAIL until buffered writes are implemented — that's
-    // the point. It proves the gap exists.
 }
 
 #[then("reading the full file returns all 10KB with correct content")]
@@ -205,10 +217,10 @@ async fn then_nfs_read_10kb(w: &mut KisekiWorld) {
     );
 
     let port = w.server().ports.nfs_tcp;
-    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
 
-    use kiseki_gateway::ops::ReadRequest;
+    use kiseki_gateway::ops::{GatewayOps, ReadRequest};
     let resp = nfs.read(ReadRequest {
         tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
         namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
@@ -217,13 +229,15 @@ async fn then_nfs_read_10kb(w: &mut KisekiWorld) {
         length: 10240,
     }).await.expect("NFS read 10KB");
 
-    // Currently only the first 4KB chunk is stored (offset=0 write).
-    // The full 10KB test will fail until buffered writes land.
     assert_eq!(
         resp.data.len(), 10240,
-        "expected 10KB, got {} bytes — NFS sequential write is broken",
+        "expected 10KB (4K+4K+2K), got {} bytes",
         resp.data.len()
     );
+    // Verify content: 4K of A, 4K of B, 2K of C
+    assert!(resp.data[..4096].iter().all(|&b| b == b'A'), "first 4KB should be A's");
+    assert!(resp.data[4096..8192].iter().all(|&b| b == b'B'), "second 4KB should be B's");
+    assert!(resp.data[8192..].iter().all(|&b| b == b'C'), "last 2KB should be C's");
 }
 
 // --- Cross-protocol: S3 PUT → NFS READ ---

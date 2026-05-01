@@ -185,6 +185,10 @@ pub struct NfsContext<G: GatewayOps> {
     pub namespace_id: NamespaceId,
     /// Tokio runtime handle for bridging sync NFS → async gateway ops.
     pub rt: tokio::runtime::Handle,
+    /// Per-file write buffer. NFS clients write sequentially at
+    /// increasing offsets; the buffer accumulates all writes and
+    /// flushes to a single composition on CLOSE or COMMIT.
+    pub write_buffers: Mutex<HashMap<FileHandle, Vec<u8>>>,
 }
 
 impl<G: GatewayOps> NfsContext<G> {
@@ -249,6 +253,7 @@ impl<G: GatewayOps> NfsContext<G> {
             tenant_id,
             namespace_id,
             rt,
+            write_buffers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -338,6 +343,52 @@ impl<G: GatewayOps> NfsContext<G> {
             offset,
             count,
         }))
+    }
+
+    /// Buffer a write at the given offset for the given file handle.
+    /// Data is accumulated and flushed on `flush_writes`.
+    pub fn buffer_write(&self, fh: &FileHandle, offset: u64, data: &[u8]) {
+        let mut buffers = self.write_buffers.lock().unwrap();
+        let buf = buffers.entry(*fh).or_default();
+        let end = offset as usize + data.len();
+        if buf.len() < end {
+            buf.resize(end, 0);
+        }
+        buf[offset as usize..end].copy_from_slice(data);
+    }
+
+    /// Flush buffered writes for a file handle. Creates a new
+    /// composition with the accumulated data, updates the file handle
+    /// and directory index. Returns the new file handle.
+    pub fn flush_writes(
+        &self,
+        fh: &FileHandle,
+    ) -> Result<Option<(FileHandle, NfsWriteResponse)>, GatewayError> {
+        let data = {
+            let mut buffers = self.write_buffers.lock().unwrap();
+            buffers.remove(fh)
+        };
+        let Some(data) = data else {
+            return Ok(None);
+        };
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let (new_fh, resp) = self.write(data)?;
+
+        // Update dir_index: if the old fh had a name, re-map it to the
+        // new composition.
+        if let Some(name) = self.dir_index.name_for(self.namespace_id, fh) {
+            self.dir_index.insert(
+                self.namespace_id,
+                name,
+                new_fh,
+                resp.composition_id,
+                u64::from(resp.count),
+            );
+        }
+
+        Ok(Some((new_fh, resp)))
     }
 
     /// Write to create a new named file (NFS CREATE).
