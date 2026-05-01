@@ -30,6 +30,10 @@ pub struct UiState {
     /// load balancers can route around a halted node.
     pub compositions:
         Option<Arc<tokio::sync::Mutex<kiseki_composition::composition::CompositionStore>>>,
+    /// Local chunk store — `/admin/chunk/{id}` reports per-node fragment
+    /// presence by calling `list_fragments` on this handle. Operators
+    /// use the endpoint to debug placement / GC / under-replication.
+    pub local_chunk_store: Option<Arc<dyn kiseki_chunk::AsyncChunkOps>>,
 }
 
 /// Static node identity exposed via `/cluster/info`.
@@ -60,6 +64,11 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/ui/api/ops/scrub", post(ops_scrub))
         .route("/cluster/info", get(cluster_info))
         .route("/cluster/shards/{shard_id}/leader", get(shard_leader))
+        .route("/admin/chunk/{chunk_id}", get(admin_inspect_chunk))
+        .route(
+            "/admin/composition/{composition_id}",
+            get(admin_inspect_composition),
+        )
         .with_state(state)
 }
 
@@ -426,6 +435,150 @@ async fn shard_leader(
             axum::Json(serde_json::json!({"error": e.to_string()})),
         ),
     }
+}
+
+/// `GET /admin/chunk/{chunk_id}` — debug a single chunk's cluster
+/// state and per-node fragment presence.
+///
+/// `chunk_id` is the 64-hex-char content-addressed chunk identifier
+/// (the 32-byte HMAC). Returns the row this node holds in
+/// `cluster_chunk_state` (refcount + placement + tombstone bit) and
+/// the indices of fragments present in the local chunk store.
+/// Operators (and the BDD acceptance suite) query each node and merge
+/// the results to reason about replication and GC. Read-only; reads
+/// the *local* Raft state-machine view — followers may report a
+/// slightly stale `cluster_chunk_state` while their hydrator catches
+/// up.
+async fn admin_inspect_chunk(
+    State(state): State<UiState>,
+    axum::extract::Path(chunk_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(chunk_id) = parse_chunk_id_hex(&chunk_id_str) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "chunk_id must be 64 hex characters (32-byte HMAC)",
+            })),
+        );
+    };
+    // Bootstrap shard + tenant — every cluster_chunk_state row in the
+    // current build is keyed under these. When multi-tenant clusters
+    // ship, the endpoint should accept ?tenant=... and ?shard=... query
+    // params; for now operators only have one shard.
+    let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+    let tenant_id = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+
+    let cluster_state = if let Some(ref log) = state.log_store {
+        match log
+            .cluster_chunk_state_get(shard_id, tenant_id, chunk_id)
+            .await
+        {
+            Ok(Some(entry)) => Some(serde_json::json!({
+                "refcount": entry.refcount,
+                "placement": entry.placement,
+                "tombstoned": entry.tombstoned,
+                "created_ms": entry.created_ms,
+                "original_len": entry.original_len,
+            })),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let (has_chunk, fragments_local) = match state.local_chunk_store.as_ref() {
+        Some(store) => {
+            let has = store.list_chunk_ids().await.contains(&chunk_id);
+            // EC mode tracks fragment indices separately; Replication
+            // mode stores the whole chunk under one key (so this is
+            // empty even when has_chunk == true). Both are useful for
+            // operators — emit both.
+            let frags = store.list_fragments(&chunk_id).await;
+            (has, frags)
+        }
+        None => (false, Vec::new()),
+    };
+
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "node_id": state.node_info.node_id,
+            "chunk_id": chunk_id_str,
+            "cluster_state": cluster_state,
+            "has_chunk_local": has_chunk,
+            "fragments_local": fragments_local,
+        })),
+    )
+}
+
+/// `GET /admin/composition/{composition_id}` — return the chunk-id
+/// list for a given composition. Used by tooling to chain into
+/// `/admin/chunk/{chunk_id}` (operators rarely have a chunk id at
+/// hand; they have the S3 etag, which is the composition id).
+async fn admin_inspect_composition(
+    State(state): State<UiState>,
+    axum::extract::Path(comp_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Ok(uuid) = uuid::Uuid::parse_str(&comp_id_str) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "composition_id must be a UUID"})),
+        );
+    };
+    let comp_id = kiseki_common::ids::CompositionId(uuid);
+    let Some(ref store) = state.compositions else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "composition store not initialized"})),
+        );
+    };
+    let guard = store.lock().await;
+    match guard.storage().get(comp_id) {
+        Ok(Some(comp)) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "node_id": state.node_info.node_id,
+                "composition_id": comp_id_str,
+                "found": true,
+                "namespace_id": comp.namespace_id.0.to_string(),
+                "shard_id": comp.shard_id.0.to_string(),
+                "size": comp.size,
+                "version": comp.version,
+                "has_inline_data": comp.has_inline_data,
+                "chunk_ids": comp.chunks.iter().map(hex_chunk_id).collect::<Vec<_>>(),
+            })),
+        ),
+        _ => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "node_id": state.node_info.node_id,
+                "composition_id": comp_id_str,
+                "found": false,
+            })),
+        ),
+    }
+}
+
+fn parse_chunk_id_hex(s: &str) -> Option<kiseki_common::ids::ChunkId> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+        let hi = u8::try_from((pair[0] as char).to_digit(16)?).ok()?;
+        let lo = u8::try_from((pair[1] as char).to_digit(16)?).ok()?;
+        bytes[i] = (hi << 4) | lo;
+    }
+    Some(kiseki_common::ids::ChunkId(bytes))
+}
+
+fn hex_chunk_id(id: &kiseki_common::ids::ChunkId) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in id.0 {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn chrono_lite() -> String {

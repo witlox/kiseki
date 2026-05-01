@@ -18,4 +18,13 @@ pub struct ClusterState {
     pub quorum_errors: Vec<String>,
     /// Node id of the leader that was killed mid-scenario, if any.
     pub killed_leader: Option<u64>,
+    /// Owned lock on the cluster, held for the lifetime of the
+    /// scenario. cucumber-rs runs scenarios concurrently by default
+    /// and our destructive ops (`kill_node`) would interleave
+    /// catastrophically with non-destructive ones if every step
+    /// individually re-locked. The Given step takes this lock; the
+    /// World's Drop releases it so the next scenario gets a clean
+    /// (post-restart-if-any) cluster.
+    pub cluster_guard:
+        Option<tokio::sync::OwnedMutexGuard<crate::steps::cluster_harness::ClusterHarness>>,
 }

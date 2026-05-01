@@ -272,25 +272,29 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # See specs/implementation/phase-16-cross-node-chunks.md (rev 4)
   # and ADR-026 for the design rationale (D-1, D-5, D-6, D-7, D-10).
 
-  @library @cross-node
+  @integration @multi-node @cross-node
   Scenario: Cross-node read after leader-only PUT (closes B-3)
-    Given a 3-node Replication-3 cluster on [node-1, node-2, node-3]
-    When a client PUTs object "obj-x1" via node-1's S3 listener
-    Then the chunk's fragment lands on node-1's local store
-    And `PutFragment` for that chunk lands on node-2 within 5 seconds
-    And `PutFragment` for that chunk lands on node-3 within 5 seconds
-    And a subsequent S3 GET of "obj-x1" via node-2 returns the same bytes
-    And the GET on node-2 served the chunk from its local store, not via fabric
+    Given a 3-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    And every follower has received the fragment
+    Then S3 GET from node-2 returns the same 1MB
+    And the GET on node-2 was served from its local store, not via fabric
 
-  @library @cross-node
-  Scenario: Read survives single-node failure (D-1 the whole point)
-    Given a 3-node Replication-3 cluster with composition "obj-x2" stored
-    And every node has acked `PutFragment` for the chunks of "obj-x2"
-    When node-1 is killed
-    Then a client's S3 GET of "obj-x2" via node-2 still returns the bytes
-    And the GET completes within 5 seconds
-    And no NFS4ERR_DELAY or 503 is surfaced — the read is degraded, not failed
+  @integration @multi-node @cross-node
+  Scenario: Read survives leader failure (D-1)
+    Given a 3-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    And every follower has received the fragment
+    And the current leader is killed
+    Then a new leader is elected within 15 seconds
+    And S3 GET from any surviving node returns the same 1MB within 5 seconds
+    And the killed node is restarted and rejoins the cluster
 
+  # DEFERRED — driving "fabric quorum lost without Raft quorum loss" needs
+  # either fabric-port-only blocking (iptables / netns) or an admin
+  # `disable-fabric` action that doesn't currently exist. Killing 2 of 3
+  # nodes loses Raft quorum first, so the failure mode under test is
+  # masked. Promote when one of those primitives lands.
   @library @cross-node
   Scenario: Write requires 2-of-3 quorum (D-5)
     Given a 3-node Replication-3 cluster on [node-1, node-2, node-3]
@@ -303,6 +307,12 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And the client receives 503 with retry-after metadata
     And `kiseki_fabric_quorum_lost_total` increments by 1
 
+  # DEFERRED — needs deterministic slow-node injection. The race
+  # between the Raft commit stream and the fabric ack stream isn't
+  # something an unmodified server exposes a knob for, and faking it
+  # via timing alone is flaky. Promote when (a) we add a test-only
+  # `KISEKI_TEST_FABRIC_SLOW_MS` env or (b) the chunk-fabric path
+  # gains an admin-throttle that operators legitimately use.
   @library @cross-node @ordering
   Scenario: Composition delta arrives before fragment (D-10 cross-stream)
     Given a 3-node Replication-3 cluster with a slow node-3
@@ -313,14 +323,20 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And node-3 falls back to `GetFragment` against node-1 or node-2
     And the read returns the same bytes as the original PUT
 
-  @library @cross-node @leader-change
-  Scenario: Refcount preserved across leader change (D-4 / cluster_chunk_state)
-    Given a 3-node Replication-3 cluster with composition "obj-x3" (refcount=1)
-    And every replica has applied the `ChunkAndDelta` proposal that created "obj-x3"
-    When the leader is killed and a new leader is elected
-    Then the new leader's `cluster_chunk_state[("default", chunk_of(obj-x3))].refcount` is 1
-    And `kiseki-control inspect-chunk` for that chunk reports refcount=1
+  @integration @multi-node @cross-node @leader-change
+  Scenario: Refcount preserved across leader change (D-4)
+    Given a 3-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    And every follower has received the fragment
+    And the current leader is killed
+    Then a new leader is elected within 15 seconds
+    And every chunk of the composition has refcount 1 on the new leader
+    And the killed node is restarted and rejoins the cluster
 
+  # DEFERRED — needs an mTLS fixture (cluster CA + per-node SAN-bearing
+  # certs + a tenant cert). The ClusterHarness today launches plaintext.
+  # Promote when we add an mTLS-mode harness or wire the e2e suite's
+  # gen-tls-certs.sh into the BDD test fixture.
   @library @cross-node
   Scenario: Tenant cert presented to fabric port is rejected (I-Auth4)
     Given a 3-node Replication-3 cluster with mTLS enabled
@@ -331,11 +347,10 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And the local chunk store is unmodified
     And no fragment fan-out occurs
 
-  @library @cross-node @degenerate
+  @integration @degenerate
   Scenario: 1-node cluster degenerates to local-only (D-6)
-    Given a single-node cluster with empty `raft_peers`
-    When a client PUTs object "obj-y1" via the node's S3 listener
-    Then the chunk lands on the local store
-    And `min_acks` is capped at the replication factor (1)
-    And no fan-out RPCs are issued (peer list is empty)
-    And the client receives 200 OK without QuorumLost
+    Given a running kiseki-server
+    When a client writes 1MB via S3 PUT
+    Then S3 GET returns the same 1MB
+    And no fabric fan-out RPCs were issued
+    And the server did not report quorum errors

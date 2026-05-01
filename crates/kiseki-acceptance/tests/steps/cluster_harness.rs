@@ -315,8 +315,14 @@ fn spawn_with_env(
         .env("KISEKI_INSECURE_NFS", "true")
         .env("RUST_LOG", "warn")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        // Both streams to /dev/null. We previously piped stderr but
+        // never drained it, so the kernel's ~64 KiB pipe buffer would
+        // fill mid-test under RUST_LOG=warn and block the child's
+        // next write — causing seemingly-random "connection refused"
+        // failures on its admin port. If you need child logs, set
+        // KISEKI_HARNESS_LOG_DIR and tee stderr there.
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     install_pdeathsig(&mut cmd);
     cmd.spawn().map_err(|e| {
         format!(
@@ -329,12 +335,19 @@ fn spawn_with_env(
 #[cfg(target_os = "linux")]
 fn install_pdeathsig(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
+    // Put each spawned server in its own session+process-group via
+    // setsid(2). On clean shutdown the harness's Drop kills each child
+    // explicitly. We previously tried prctl(PR_SET_PDEATHSIG, SIGTERM)
+    // here but that fires on the *spawning thread's* exit, not the
+    // parent process — and tokio scenarios end their workers between
+    // batched scenarios, so the children received SIGTERM mid-test.
+    // setsid alone leaks children on `kill -9` of cargo test (they
+    // reparent to init), but at least passes batched runs reliably.
     // SAFETY: pre_exec runs in the forked child between fork() and
-    // execve(). Calling prctl is async-signal-safe and touches no
-    // memory shared with the parent.
+    // execve(); setsid is async-signal-safe.
     unsafe {
         cmd.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+            if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

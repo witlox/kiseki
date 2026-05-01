@@ -670,6 +670,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     };
     let metrics_log_store = Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>;
     let metrics_compositions = Some(gw.compositions_handle());
+    let metrics_local_chunk_store = Some(Arc::clone(&local_chunk_store));
     // Pre-clone the §D10 composition metrics handle: the hydrator + the
     // periodic redb-size refresher (spawned later) both need it after
     // `metrics` is moved into the metrics-server task.
@@ -683,6 +684,7 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             Some(metrics_log_store),
             node_info,
             metrics_compositions,
+            metrics_local_chunk_store,
         )
         .await
         {

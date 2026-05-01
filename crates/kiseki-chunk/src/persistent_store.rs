@@ -413,6 +413,17 @@ impl ChunkOps for PersistentChunkStore {
             .map(|e| e.envelope_meta.refcount)
             .ok_or(ChunkError::NotFound(*chunk_id))
     }
+
+    /// Enumerate every chunk whose envelope metadata is currently
+    /// loaded for this node. Used by the orphan-fragment scrub and by
+    /// `/admin/chunk/{id}` to answer "is this chunk present locally?".
+    fn list_chunk_ids(&self) -> Vec<ChunkId> {
+        let chunks = self
+            .chunks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        chunks.keys().copied().collect()
+    }
 }
 
 #[cfg(test)]

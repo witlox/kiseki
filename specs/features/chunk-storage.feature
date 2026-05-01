@@ -98,14 +98,22 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # `fragment_index = 0`. Spec: phase-16-cross-node-chunks.md (rev 4),
   # ADR-005, ADR-026.
 
-  @library @cross-node
-  Scenario: Replication-N places one fragment per peer
-    Given a 3-node cluster and pool "default" with `Replication { copies: 3 }`
-    When a client writes a chunk to "default"
-    Then exactly 3 fragments exist — one on each of [node-1, node-2, node-3]
-    And every fragment is the same encrypted envelope (content-addressed)
-    And `cluster_chunk_state[("default", chunk_id)].placement` lists all 3 nodes
+  @integration @multi-node @cross-node
+  Scenario: Replication-3 places one fragment on each node
+    Given a 3-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    And every follower has received the fragment
+    Then every chunk of the composition has a fragment on node-1
+    And every chunk of the composition has a fragment on node-2
+    And every chunk of the composition has a fragment on node-3
+    And the cluster placement for every chunk lists all 3 nodes
 
+  # DEFERRED — needs deterministic missing-fragment induction (delete
+  # a single fragment from one node's local store mid-test). Driving
+  # this naturally via cross-stream lag is flaky. Promote when
+  # `kiseki-control inspect-chunk` (task in progress) gains a
+  # `--drop-local` debug action OR the local-store gains a fault-injection
+  # knob that operators use for chaos drills.
   @library @cross-node
   Scenario: Read falls back to fabric when local fragment is missing
     Given a chunk replicated to [node-1, node-2, node-3]
@@ -116,13 +124,14 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And on success returns the envelope to the caller
     And `kiseki_fabric_ops_total{op="get",peer="node-1",outcome="ok"}` increments
 
-  @library @cross-node
-  Scenario: GC across peers when refcount reaches 0 (I-C2)
-    Given chunk "c-gc" has refcount=1 on every node
-    When the only composition referencing "c-gc" is deleted
-    Then the cluster_chunk_state refcount transitions to 0
-    And the leader sends `DeleteFragment` to every peer in the placement list
-    And after local GC sweep the chunk is removed from every node's local store
+  @integration @multi-node @cross-node
+  Scenario: GC removes chunk from every node when refcount drops to 0 (I-C2)
+    Given a 3-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    And every follower has received the fragment
+    And the composition is deleted via S3 DELETE on node-1
+    Then within 30 seconds every chunk's refcount on the leader drops to 0
+    And eventually every chunk is gone from every node's local store
 
   # --- Multi-node integration (requires multi-server harness) ---
 

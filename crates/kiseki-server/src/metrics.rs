@@ -288,6 +288,7 @@ pub async fn run_metrics_server(
     compositions: Option<
         std::sync::Arc<tokio::sync::Mutex<kiseki_composition::composition::CompositionStore>>,
     >,
+    local_chunk_store: Option<std::sync::Arc<dyn kiseki_chunk::AsyncChunkOps>>,
 ) -> std::io::Result<()> {
     use crate::web;
 
@@ -307,6 +308,7 @@ pub async fn run_metrics_server(
         log_store,
         node_info,
         compositions,
+        local_chunk_store,
     };
 
     // Build combined router: metrics + health + admin UI.
