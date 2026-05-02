@@ -68,24 +68,24 @@ pub mod scrub_adapters;
 pub mod scrub_scheduler;
 pub mod server;
 
-pub use auth::{FabricAuthError, verify_fabric_san};
-pub use defaults::{ClusterDurabilityDefaults, defaults_for};
+pub use auth::{verify_fabric_san, FabricAuthError};
+pub use defaults::{defaults_for, ClusterDurabilityDefaults};
 pub use ec::{
-    EcDistributionError, EcStrategy, FragmentResponse, FragmentRoute, decode_from_responses,
-    encode_for_placement,
+    decode_from_responses, encode_for_placement, EcDistributionError, EcStrategy, FragmentResponse,
+    FragmentRoute,
 };
 pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use placement::pick_placement;
 pub use scrub::{
-    ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, DEFAULT_ORPHAN_TTL,
-    FragmentAvailabilityOracle, LogChunkOracle, OrphanDecision, OrphanDeleter, OrphanScrub,
-    OrphanScrubPolicy, OrphanScrubReport, Repairer, ReplicationDecision, UnderReplicationPolicy,
-    UnderReplicationReport, UnderReplicationScrub,
+    ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, FragmentAvailabilityOracle, LogChunkOracle,
+    OrphanDecision, OrphanDeleter, OrphanScrub, OrphanScrubPolicy, OrphanScrubReport, Repairer,
+    ReplicationDecision, UnderReplicationPolicy, UnderReplicationReport, UnderReplicationScrub,
+    DEFAULT_ORPHAN_TTL,
 };
 pub use scrub_adapters::{FabricAvailabilityOracle, FabricRepairer, LocalChunkDeleter};
 pub use scrub_scheduler::{ScrubReport, ScrubScheduler};
-pub use server::{ChunkEnvelopeRegistry, ClusterChunkServer, fabric_san_interceptor};
+pub use server::{fabric_san_interceptor, ChunkEnvelopeRegistry, ClusterChunkServer};
 
 /// Default per-peer timeout for `PutFragment` (write-side fan-out).
 pub const DEFAULT_PUT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -799,13 +799,13 @@ impl AsyncChunkOps for ClusteredChunkStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
-    use kiseki_chunk::SyncBridge;
     use kiseki_chunk::pool::{AffinityPool, DeviceClass, DurabilityStrategy};
     use kiseki_chunk::store::ChunkStore;
+    use kiseki_chunk::SyncBridge;
     use kiseki_common::ids::{ChunkId, OrgId};
     use kiseki_common::tenancy::KeyEpoch;
     use kiseki_crypto::envelope::Envelope;

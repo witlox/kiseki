@@ -275,12 +275,12 @@ impl Repairer for FabricRepairer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
-    use kiseki_chunk::SyncBridge;
     use kiseki_chunk::pool::{AffinityPool, DeviceClass, DurabilityStrategy};
     use kiseki_chunk::store::ChunkStore;
+    use kiseki_chunk::SyncBridge;
     use kiseki_crypto::envelope::Envelope;
 
     use super::*;
@@ -560,7 +560,7 @@ mod tests {
     /// encode would have produced.
     #[tokio::test]
     async fn fabric_repairer_ec_decodes_and_reencodes_missing_fragment() {
-        use crate::ec::{EcStrategy, encode_for_placement};
+        use crate::ec::{encode_for_placement, EcStrategy};
 
         // Build the 6 peers, then pre-load 5 of them with the
         // correct EC 4+2 fragments by encoding a known ciphertext.

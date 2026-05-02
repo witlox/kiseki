@@ -30,7 +30,7 @@ fn select_node_identity_or_die(
     data_dir: &std::path::Path,
 ) -> Result<Box<dyn kiseki_keymanager::node_identity::NodeIdentitySource>, Box<dyn std::error::Error>>
 {
-    use kiseki_keymanager::node_identity::{NodeIdentityInputs, select_node_identity};
+    use kiseki_keymanager::node_identity::{select_node_identity, NodeIdentityInputs};
     let mtls_key = cfg.tls.as_ref().map(|t| t.key_path.as_path());
     select_node_identity(&NodeIdentityInputs {
         spiffe_path: cfg.spiffe_socket.as_deref(),

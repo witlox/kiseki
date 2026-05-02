@@ -25,7 +25,7 @@ use kiseki_proto::v1::cluster_chunk_service_server::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::auth::{FabricAuthError, verify_fabric_san};
+use crate::auth::{verify_fabric_san, FabricAuthError};
 
 /// gRPC handler wrapping a *local* async chunk store.
 pub struct ClusterChunkServer {
@@ -564,9 +564,9 @@ fn chunk_err_to_status(e: &ChunkError) -> Status {
 mod tests {
     use std::sync::Arc;
 
-    use kiseki_chunk::SyncBridge;
     use kiseki_chunk::pool::{AffinityPool, DeviceClass, DurabilityStrategy};
     use kiseki_chunk::store::ChunkStore;
+    use kiseki_chunk::SyncBridge;
     use kiseki_common::ids::ChunkId;
     use kiseki_common::tenancy::KeyEpoch;
     use kiseki_crypto::envelope::Envelope;

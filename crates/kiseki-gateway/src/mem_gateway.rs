@@ -726,7 +726,7 @@ impl GatewayOps for InMemoryGateway {
             // ADR-033: route to correct shard via shard map if available.
             let shard_id = if let Some(ref shard_map) = *self.shard_map.read().unwrap() {
                 // Convert NamespaceId to string for shard map lookup.
-                let ns_str = emit_params.2.0.to_string();
+                let ns_str = emit_params.2 .0.to_string();
                 if let Ok(map) = shard_map.get(&ns_str, emit_params.1) {
                     kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)
                         .unwrap_or(emit_params.0)

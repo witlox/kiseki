@@ -1343,12 +1343,10 @@ async fn when_n_put_get_cycles(w: &mut KisekiWorld, n: u64, target: u64) {
             let mut last_body_text = String::new();
             let mut got_match = false;
             loop {
-                let resp = reader
-                    .http
-                    .get(&url)
-                    .send()
-                    .await
-                    .unwrap_or_else(|e| panic!("cycle {cycle} node-{reader_id} GET error: {e}"));
+                let resp =
+                    reader.http.get(&url).send().await.unwrap_or_else(|e| {
+                        panic!("cycle {cycle} node-{reader_id} GET error: {e}")
+                    });
                 last_status = resp.status();
                 if last_status.is_success() {
                     let bytes = resp.bytes().await.expect("read body").to_vec();
@@ -1390,7 +1388,12 @@ async fn then_every_cycle_returned_bytes(w: &mut KisekiWorld) {
          likely the GCP 2026-05-02 leader-local-fragment crypto pattern \
          (or a regression of it). First failures:\n  {}",
         failures.len(),
-        failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n  "),
+        failures
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  "),
     );
 }
 

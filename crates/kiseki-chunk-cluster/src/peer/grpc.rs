@@ -28,7 +28,7 @@ use kiseki_proto::v1::cluster_chunk_service_client::ClusterChunkServiceClient;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
-use crate::metrics::{FabricMetrics, op as op_label, outcome};
+use crate::metrics::{op as op_label, outcome, FabricMetrics};
 use crate::peer::{FabricPeer, FabricPeerError};
 
 /// Backoff before the single retry attempt.
