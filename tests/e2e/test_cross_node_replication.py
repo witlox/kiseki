@@ -1,9 +1,22 @@
-"""E2E: Cross-node chunk replication (Phase 16a).
+"""E2E: Cross-node chunk replication — Docker-witnessed paths.
 
-Verifies that the cluster fabric (ClusterChunkService gRPC) actually
-replicates chunks across nodes — closes the B-3 gap from the single-
-node→multi-node-cluster transition. Each test PUTs via one node and
-GETs via another to prove the fabric layer is wired end-to-end.
+The BDD `ClusterHarness` covers the cross-node S3 PUT/GET roundtrip
+(see `Cross-node read after leader-only PUT` and `Replication-3
+places one fragment on each node` in chunk-storage.feature). This
+file's remaining tests cover what BDD genuinely can't:
+
+  * Quorum-loss with peers down — BDD deferred this scenario; the
+    docker stop_node primitive is the working witness.
+  * S3-client view of cross-node DELETE — BDD asserts via
+    /admin/chunk has_chunk_local; the e2e GET-returns-404 witness is
+    the client-facing contract.
+  * `/cluster/shards/{id}/leader` agreement across nodes — Phase 17
+    item 4; no BDD coverage.
+  * Metric-registration regression guards (gateway retry counters)
+    that wouldn't surface as test failures elsewhere.
+  * Real-disk persistence across `docker compose stop+start` (volume
+    preserved) — BDD's tempdir-based restart_node is fair simulation
+    but doesn't witness the docker-volume integration path.
 
 Requires docker-compose.3node.yml (or .3node-tls.yml). On each node:
   - S3 gateway:  9000 (host port 9000 / 9010 / 9020)
@@ -154,62 +167,21 @@ def _get_object(node: int, etag: str) -> bytes:
     return resp.content
 
 
-def _scrape_metric(node: int, metric_name: str) -> float | None:
-    """Scrape Prometheus /metrics, return the sum across all label sets,
-    or None if the metric isn't present yet."""
-    try:
-        resp = requests.get(f"{METRICS[node]}/metrics", timeout=5)
-    except requests.RequestException:
-        return None
-    if resp.status_code != 200:
-        return None
-    total = 0.0
-    found = False
-    for line in resp.text.splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
-        if line.split()[0].split("{")[0] == metric_name:
-            try:
-                total += float(line.rsplit(" ", 1)[1])
-                found = True
-            except (IndexError, ValueError):
-                pass
-    return total if found else None
-
-
 # ---------------------------------------------------------------------------
-# B-3 closure: cross-node read after a single-node PUT
+# Removed (BDD covers via the @multi-node ClusterHarness):
+#   * test_cross_node_read_after_leader_put
+#       → BDD `Cross-node read after leader-only PUT` in
+#         specs/features/multi-node-raft.feature
+#   * test_fabric_metrics_present_after_cross_node_write
+#       → BDD `every follower has received the fragment` step scrapes
+#         the same `kiseki_fabric_ops_total{op="put",peer=...}` per peer.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.cross_node
-def test_cross_node_read_after_leader_put(cluster):
-    """A PUT on node-1 must be readable on node-2 and node-3.
-
-    Closes the B-3 gap: prior to Phase 16a a PUT on node-1 left
-    node-2 + node-3 with no copy of the chunk → 404 on cross-node
-    GET. Phase 16a wires `ClusteredChunkStore` so the leader fans
-    the fragment out, and Phase 16f wires the composition hydrator
-    so followers can resolve the composition_id.
-    """
-    for n in (1, 2, 3):
-        _wait_s3(S3[n])
-
-    payload = b"phase16-cross-node-roundtrip" * 64
-    etag = _put_object(1, "cross-node-1", payload)
-
-    # Allow Raft commit + fabric fan-out to settle.
-    time.sleep(1)
-
-    for n in (2, 3):
-        got = _get_object(n, etag)
-        assert got == payload, (
-            f"node{n} returned different bytes — fabric replication broken"
-        )
-
-
 # ---------------------------------------------------------------------------
-# Single-node-failure survival — D-1, the whole point of Phase 16a
+# Single-node-failure survival — D-1, Docker-network witness.
+# (BDD's process-kill in `Read survives leader failure` is fair
+# simulation; this is the docker compose stop/start path.)
 # ---------------------------------------------------------------------------
 
 
@@ -283,49 +255,6 @@ def test_write_quorum_lost_returns_503(cluster):
         start_node(cluster.compose_file, "kiseki-node2")
         start_node(cluster.compose_file, "kiseki-node3")
         time.sleep(5)
-
-
-# ---------------------------------------------------------------------------
-# Metrics surface
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.cross_node
-def test_fabric_metrics_present_after_cross_node_write(cluster):
-    """After a cross-node PUT, kiseki_fabric_ops_total must appear on
-    the leader's /metrics with at least one PUT-OK entry per peer."""
-    for n in (1, 2, 3):
-        _wait_s3(S3[n])
-    # Prior tests in this module restart nodes (resilience scenarios).
-    # Wait for Raft to settle before issuing a write — otherwise the PUT
-    # races leader election and surfaces a 500 LeaderUnavailable that has
-    # nothing to do with what this test is checking.
-    _wait_for_leader(1)
-
-    # Fail-soft when the metrics port isn't host-mapped (older
-    # docker-compose configs). Step 10 ships the port mapping in
-    # docker-compose.3node.yml; older clusters skip this assertion.
-    try:
-        ping = requests.get(f"{METRICS[1]}/health", timeout=2)
-        if ping.status_code != 200:
-            pytest.skip(f"metrics endpoint not healthy: {ping.status_code}")
-    except requests.RequestException as e:
-        pytest.skip(f"metrics endpoint not reachable: {e}")
-
-    payload = b"phase16-metrics-witness"
-    _put_object(1, "metrics-1", payload)
-    time.sleep(1)
-
-    # The metric exposition format puts label sets on each line. We
-    # don't dissect labels here — we just assert the family appears
-    # with a non-zero sum, which means at least one fabric RPC fired.
-    total = _scrape_metric(1, "kiseki_fabric_ops_total")
-    assert total is not None, (
-        "kiseki_fabric_ops_total missing from node-1 /metrics — step 11 wiring broken"
-    )
-    assert total >= 2, (
-        f"expected ≥2 fabric ops (one PUT to each of the 2 peers), got {total}"
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,20 @@
-"""E2E: 3-node Raft cluster — consensus, replication, and failover.
+"""E2E: 3-node Raft cluster — direct gRPC log API + Docker container restart.
 
-Tests multi-node Docker compose deployment with Raft consensus.
-Each node runs with a unique KISEKI_NODE_ID and shared KISEKI_RAFT_PEERS.
+The BDD `ClusterHarness` (crates/kiseki-acceptance) covers the
+S3-client view of cluster behavior using process-kill failover. This
+file's remaining tests cover what BDD genuinely can't:
 
-Phase I2: validates cross-node replication, leader election, and
-failover recovery.
+  * Direct gRPC `LogService` API (AppendDelta / ReadDeltas) — BDD
+    only exercises the S3 / NFS gateways, not the raw log surface.
+  * Docker-container failover — `docker compose stop` re-associates
+    the virtual NIC and re-resolves DNS hostnames; a process kill
+    inside one host does not.
+  * The no-follower-forwarding invariant (kiseki-log/src/raft/openraft_store.rs:344
+    collapses ForwardToLeader → LeaderUnavailable). Test_follower_rejects_writes
+    is the canonical witness that this is intentional.
+
+Trivial health / leader-discovery tests removed — see ClusterHarness's
+`given_3_node_cluster` step for the equivalent assertion.
 
 Requires docker compose. Run with:
     pytest tests/e2e/test_multi_node.py -v
@@ -188,30 +198,10 @@ def _find_leader_with_retry(nodes: list, exclude_id: int | None = None) -> tuple
 
 
 # --- Tests ---
-
-
-@pytest.mark.e2e
-def test_all_nodes_healthy(cluster: ClusterInfo) -> None:
-    """All 3 nodes accept gRPC connections and report healthy bootstrap shard."""
-    for i, node in enumerate(cluster.nodes):
-        channel = grpc.insecure_channel(node.data_addr)
-        stub = log_pb2_grpc.LogServiceStub(channel)
-        resp = stub.ShardHealth(
-            log_pb2.ShardHealthRequest(
-                shard_id=common_pb2.ShardId(value=BOOTSTRAP_SHARD_UUID),
-            )
-        )
-        assert resp.info is not None, f"node {i+1} shard health returned None"
-        assert resp.info.state == 1, f"node {i+1} shard not healthy: state={resp.info.state}"
-        channel.close()
-
-
-@pytest.mark.e2e
-def test_leader_elected(cluster: ClusterInfo) -> None:
-    """A leader is elected within the election timeout."""
-    leader_id, leader_addr = _find_leader(cluster.nodes)
-    assert leader_id in (1, 2, 3), f"unexpected leader id: {leader_id}"
-    assert leader_addr in NODE_ADDRS.values(), f"unexpected leader addr: {leader_addr}"
+#
+# Removed (BDD covers via `Given a 3-node kiseki cluster` + readiness probe):
+#   * test_all_nodes_healthy
+#   * test_leader_elected
 
 
 @pytest.mark.e2e
