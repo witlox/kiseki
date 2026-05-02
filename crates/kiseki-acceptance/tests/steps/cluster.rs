@@ -266,7 +266,12 @@ async fn when_node3_first(w: &mut KisekiWorld) {
 #[then("node-3 becomes a follower")]
 async fn then_node3_follower(w: &mut KisekiWorld) {
     let cluster = w.raft.cluster.as_ref().expect("cluster");
-    let leader = cluster.leader().await;
+    // `leader()` returns the current snapshot — racy if the election
+    // hasn't converged yet on a slower runner. Use `wait_for_leader`
+    // with the same 5s budget the sibling `then_3_healthy` step uses.
+    let leader = cluster
+        .wait_for_leader(std::time::Duration::from_secs(5))
+        .await;
     assert!(leader.is_some(), "should have leader; node-3 is a follower");
 }
 
