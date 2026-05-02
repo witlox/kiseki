@@ -340,3 +340,130 @@ async fn then_s3_get_matches(w: &mut KisekiWorld, expected: String) {
         "S3 GET body mismatch"
     );
 }
+
+// ===========================================================================
+// NFSv3 @integration — exercises the running server's NFSv3 wire stack via
+// the high-level Nfs3Client from kiseki-client. The unit tests in
+// kiseki-gateway/src/nfs3_server.rs cover wire-format edge cases; these
+// scenarios prove the assembled client→server path works end-to-end.
+// ===========================================================================
+
+#[when("a client sends NFSv3 NULL RPC to the server")]
+async fn when_nfs3_null(w: &mut KisekiWorld) {
+    use kiseki_client::remote_nfs::transport::RpcTransport;
+
+    let port = w.server().ports.nfs_tcp;
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut transport = RpcTransport::connect(addr).expect("TCP connect to NFS port");
+    // NFSv3 NULL = program 100003, version 3, procedure 0
+    let result = transport.call(100003, 3, 0, &[]);
+    match result {
+        Ok(_) => w.last_error = None,
+        Err(e) => w.last_error = Some(format!("{e}")),
+    }
+}
+
+#[when(regex = r#"^a client writes "([^"]*)" via NFSv3$"#)]
+async fn when_nfs3_write_str(w: &mut KisekiWorld, payload: String) {
+    nfs3_write_helper(w, payload.into_bytes()).await;
+}
+
+#[when("a client writes a 1MB file via NFSv3")]
+async fn when_nfs3_write_1mb(w: &mut KisekiWorld) {
+    // Deterministic content so a partial-write bug surfaces as a body
+    // mismatch, not a length-only mismatch.
+    let mut buf = Vec::with_capacity(1024 * 1024);
+    let mut x: u32 = 0xDEAD_BEEF;
+    for _ in 0..(1024 * 1024) {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        buf.push((x >> 16) as u8);
+    }
+    nfs3_write_helper(w, buf).await;
+}
+
+async fn nfs3_write_helper(w: &mut KisekiWorld, data: Vec<u8>) {
+    use kiseki_common::ids::{NamespaceId, OrgId};
+    use kiseki_gateway::ops::WriteRequest;
+
+    let nfs = w.server().nfs3_client();
+    let resp = nfs
+        .write(WriteRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(0)),
+            data: data.clone(),
+        })
+        .await
+        .expect("NFSv3 write failed");
+    w.server_mut().last_etag = Some(resp.composition_id.0.to_string());
+    w.server_mut().last_body = Some(data);
+}
+
+#[then(regex = r#"^reading via NFSv3 returns "([^"]*)"$"#)]
+async fn then_nfs3_read_str(w: &mut KisekiWorld, expected: String) {
+    let got = nfs3_read_back(w).await;
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        expected,
+        "NFSv3 read body mismatch",
+    );
+}
+
+#[then("reading via NFSv3 returns all 1MB with correct content")]
+async fn then_nfs3_read_1mb(w: &mut KisekiWorld) {
+    let expected = w
+        .server()
+        .last_body
+        .clone()
+        .expect("write step must have stored expected payload");
+    let got = nfs3_read_back(w).await;
+    assert_eq!(got.len(), expected.len(), "NFSv3 read length mismatch");
+    assert_eq!(got, expected, "NFSv3 read content mismatch");
+}
+
+async fn nfs3_read_back(w: &KisekiWorld) -> Vec<u8> {
+    use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
+    use kiseki_gateway::ops::ReadRequest;
+
+    let etag = w
+        .server()
+        .last_etag
+        .clone()
+        .expect("write step must have captured composition_id");
+    let comp_id = CompositionId(uuid::Uuid::parse_str(&etag).expect("etag is UUID"));
+    let nfs = w.server().nfs3_client();
+    let resp = nfs
+        .read(ReadRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(0)),
+            composition_id: comp_id,
+            offset: 0,
+            length: u64::MAX,
+        })
+        .await
+        .expect("NFSv3 read failed");
+    resp.data
+}
+
+#[then(regex = r#"^reading the same composition via S3 returns "([^"]*)"$"#)]
+async fn then_s3_read_after_nfs3(w: &mut KisekiWorld, expected: String) {
+    let etag = w.server().last_etag.clone().expect("need composition_id");
+    let url = w.server().s3_url(&format!("default/{etag}"));
+    let resp = w
+        .server()
+        .http
+        .get(&url)
+        .send()
+        .await
+        .expect("S3 GET failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "S3 GET should return 200 for an NFSv3-written composition",
+    );
+    let body = resp.bytes().await.expect("read body").to_vec();
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        expected,
+        "S3 GET body mismatch — gateway is not sharing the composition store",
+    );
+}

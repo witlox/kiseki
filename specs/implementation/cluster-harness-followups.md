@@ -103,6 +103,31 @@ Outputs:
 This is validation, not code. Captures a baseline for the next
 performance-focused cycle.
 
+### I5 — NFSv3 CREATE+WRITE binding (bug discovered by I2)
+
+While wiring the NFSv3 @integration scenarios (I2), the write-then-read
+roundtrip surfaced a real bug:
+
+`crates/kiseki-gateway/src/nfs3_server.rs:272` reads the file handle from
+the WRITE RPC into `_fh` and discards it, then calls `ctx.write(data)`
+which creates a *fresh* composition. The handle returned by the prior
+CREATE never gets data attached, so a subsequent LOOKUP+READ on that
+filename returns 0 bytes.
+
+The unit tests in `nfs3_server::tests` cover WRITE-returns-OK in
+isolation and don't catch this — only the end-to-end CREATE→WRITE→
+LOOKUP→READ roundtrip surfaces it.
+
+Fix options:
+- Bind WRITE's data to the composition referenced by the supplied file
+  handle (matches RFC 1813 §3.3.7 expectations).
+- Have CREATE allocate a composition_id that WRITE then targets via
+  the file-handle → composition_id table (`ctx.handles`).
+
+Bugfix protocol: re-enable the 3 deferred NFSv3 scenarios in
+`specs/features/nfs3-rfc1813.feature` (text preserved as comments) once
+the binding lands.
+
 ### I4 — Pre-existing @library flake fixes
 
 Two flakes were already present on `main` before this session and
@@ -158,14 +183,18 @@ Defer entirely until either:
 
 ## Suggested order
 
-1. **I1** Python e2e dedup — fast win, reduces test drift
+1. **I1** Python e2e dedup — fast win, reduces test drift  *(done 5225146)*
 2. **I2** NFSv3 @integration scenarios — closes a known coverage gap
-3. **I3** GCP perf re-run — captures a baseline number
-4. **F1** Follower → leader S3 forwarding — diamond, one ADR
-5. **C1** mTLS fixture — likely diamond
-6. **C2** revisit after #1–5 land
+   *(NULL scenario landed; 3 roundtrip scenarios deferred — see I5)*
+3. **I5** NFSv3 CREATE+WRITE binding — surfaced by I2, prerequisite for the
+   3 deferred roundtrip scenarios
+4. **I3** GCP perf re-run — captures a baseline number
+5. **F1** Follower → leader S3 forwarding — diamond, one ADR
+6. **I4** Pre-existing flake fixes — narrow-scope test diagnosis
+7. **C1** mTLS fixture — likely diamond
+8. **C2** revisit after #1–7 land
 
-I1 + I2 + I4 can run in parallel (different files, different domains).
+I3 + I4 + F1 can run in parallel (different domains).
 
 ## What NOT to do
 
