@@ -1261,6 +1261,139 @@ async fn then_get_fails_chunk_lost(w: &mut KisekiWorld, target: u64) {
     }
 }
 
+/// Multi-cycle PUT/GET-from-every-node driver. Each iteration: PUT a
+/// random 1 MiB body via the leader (forwarding from `node-1` if it
+/// isn't currently leader, same as the single-PUT step), then issue
+/// a GET against EVERY alive node and compare bytes. Any divergence
+/// is appended to `cluster.round_trip_failures` and the matching
+/// `then` step asserts that vector stays empty — failing the
+/// scenario on the first cycle to surface a regression of the GCP
+/// 2026-05-02 "leader-fragment crypto missing" pattern.
+#[when(regex = r"^the client performs (\d+) 1MB PUT/GET-from-every-node cycles via node-(\d+)$")]
+async fn when_n_put_get_cycles(w: &mut KisekiWorld, n: u64, target: u64) {
+    let bucket = w
+        .cluster
+        .bucket
+        .clone()
+        .unwrap_or_else(|| "default".to_owned());
+    let guard = cluster(w);
+    let entry_node = guard.node(target);
+    let alive_node_ids: Vec<u64> = guard.nodes().map(|nh| nh.node_id).collect();
+    let mut failures: Vec<String> = Vec::new();
+    let mut last_etag: Option<String> = None;
+    let mut last_body: Option<Vec<u8>> = None;
+
+    for cycle in 1..=n {
+        let body = megabyte_payload();
+        let key = format!("bdd-cycle-{cycle}-{}", uuid::Uuid::new_v4().simple());
+
+        // PUT — try the named entry node first, follow leader hint
+        // on LeaderUnavailable (mirrors when_client_writes_1mb_to_node1).
+        let put_url = format!("{}/{bucket}/{key}", entry_node.s3_base);
+        let put_resp = entry_node
+            .http
+            .put(&put_url)
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle}: PUT transport error: {e}"));
+        let etag = if put_resp.status().is_success() {
+            put_resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim_matches('"').to_owned())
+                .expect("PUT must carry ETag")
+        } else if let Some(leader_id) = leader_id_via(entry_node).await {
+            let leader = guard.node(leader_id);
+            let url2 = format!("{}/{bucket}/{key}", leader.s3_base);
+            let resp2 = leader
+                .http
+                .put(&url2)
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("cycle {cycle}: leader PUT transport error: {e}"));
+            assert!(
+                resp2.status().is_success(),
+                "cycle {cycle}: leader PUT returned {}",
+                resp2.status(),
+            );
+            resp2
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim_matches('"').to_owned())
+                .expect("leader PUT must carry ETag")
+        } else {
+            panic!(
+                "cycle {cycle}: PUT to node-{target} returned {} and no leader discoverable",
+                put_resp.status(),
+            )
+        };
+
+        // GET from every alive node. Each follower may need a few
+        // hundred ms of hydration lag tolerance — but a 5xx that
+        // persists past 10s is the bug the scenario hunts for.
+        for &reader_id in &alive_node_ids {
+            let reader = guard.node(reader_id);
+            let url = format!("{}/{bucket}/{etag}", reader.s3_base);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut last_status: reqwest::StatusCode;
+            let mut last_body_text = String::new();
+            let mut got_match = false;
+            loop {
+                let resp = reader
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("cycle {cycle} node-{reader_id} GET error: {e}"));
+                last_status = resp.status();
+                if last_status.is_success() {
+                    let bytes = resp.bytes().await.expect("read body").to_vec();
+                    if bytes == body {
+                        got_match = true;
+                        break;
+                    }
+                    last_body_text = format!("body mismatch len={}", bytes.len());
+                    break;
+                }
+                last_body_text = resp.text().await.unwrap_or_default();
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            if !got_match {
+                failures.push(format!(
+                    "cycle {cycle} etag={etag} node-{reader_id}: status={last_status} body={last_body_text}",
+                ));
+            }
+        }
+        last_etag = Some(etag);
+        last_body = Some(body);
+    }
+
+    w.cluster.round_trip_failures = failures;
+    w.cluster.bucket = Some(bucket);
+    w.cluster.last_etag = last_etag;
+    w.cluster.expected_body = last_body;
+}
+
+#[then("every cycle returned the original bytes from every node")]
+async fn then_every_cycle_returned_bytes(w: &mut KisekiWorld) {
+    let failures = std::mem::take(&mut w.cluster.round_trip_failures);
+    assert!(
+        failures.is_empty(),
+        "{} of the PUT/GET cycles failed across the 6-node EC fabric — \
+         likely the GCP 2026-05-02 leader-local-fragment crypto pattern \
+         (or a regression of it). First failures:\n  {}",
+        failures.len(),
+        failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n  "),
+    );
+}
+
 #[then(regex = r"^node-(\d+) issued at least (\d+) fabric GetFragment calls for the read$")]
 async fn then_node_issued_n_get_calls(w: &mut KisekiWorld, node_id: u64, expected: u64) {
     let baseline_key = baseline_key_fabric_get(node_id);

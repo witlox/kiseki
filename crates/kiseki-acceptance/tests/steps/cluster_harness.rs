@@ -431,29 +431,36 @@ fn spawn_with_env(
             std::env::var("KISEKI_HARNESS_RUST_LOG").unwrap_or_else(|_| "warn".to_owned()),
         )
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        // stdout → /dev/null. stderr → tempfile when KISEKI_HARNESS_LOG_DIR
-        // is set, otherwise /dev/null. We previously piped stderr but
-        // never drained it, so the kernel's ~64 KiB pipe buffer would
-        // fill mid-test under RUST_LOG=warn and block the child's next
-        // write — causing seemingly-random "connection refused"
-        // failures on the admin port. The file path avoids that.
-        .stdout(Stdio::null());
+        // stdout AND stderr → tempfile when KISEKI_HARNESS_LOG_DIR is
+        // set, otherwise /dev/null. kiseki-server's tracing-subscriber
+        // fmt::layer() defaults to stdout, so a previous "stderr-only"
+        // capture would silently drop every tracing log line — making
+        // post-mortem debugging impossible (e.g. when chasing the GCP
+        // 2026-05-02 leader-fragment crypto bug). We previously piped
+        // stderr but never drained it, so the kernel's ~64 KiB pipe
+        // buffer would fill mid-test under RUST_LOG=warn and block the
+        // child's next write — the file path avoids that.
+        ;
     if let Ok(dir) = std::env::var("KISEKI_HARNESS_LOG_DIR") {
         let _ = std::fs::create_dir_all(&dir);
         let path = format!("{dir}/node-{node_id}.log");
-        match std::fs::OpenOptions::new()
+        let opened = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
-        {
+            .open(&path);
+        match opened {
             Ok(f) => {
-                cmd.stderr(Stdio::from(f));
+                let f2 = f.try_clone().expect("dup log fd");
+                cmd.stdout(Stdio::from(f));
+                cmd.stderr(Stdio::from(f2));
             }
             Err(_) => {
+                cmd.stdout(Stdio::null());
                 cmd.stderr(Stdio::null());
             }
         }
     } else {
+        cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
     }
     install_pdeathsig(&mut cmd);

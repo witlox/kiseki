@@ -679,10 +679,24 @@ impl AsyncChunkOps for ClusteredChunkStore {
     }
 
     async fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
-        match self.local.read_chunk(chunk_id).await {
-            Ok(env) => return Ok(env),
-            Err(ChunkError::NotFound(_)) => {} // fall through to fabric
-            Err(other) => return Err(other),
+        // GCP 2026-05-02: in EC mode, the local fast path returns the
+        // wrong thing. A peer that received `PutFragment(idx=0, env)`
+        // stored the WHOLE envelope (server.rs branches on
+        // `fragment_index == 0` to take the legacy `write_chunk` path),
+        // but the envelope's ciphertext is only ONE shard's worth
+        // (~ciphertext_len / data_count bytes). Returning that here
+        // skips EC reconstruction entirely; the caller sees a
+        // shard-sized ciphertext and AES-GCM verify fails as
+        // "AEAD authentication failed". The EC path below correctly
+        // collects ≥data shards from peers and decodes the original
+        // ciphertext. Replication mode keeps the local fast-path —
+        // there the local store has the WHOLE chunk by construction.
+        if !matches!(self.cfg.ec_strategy, crate::ec::EcStrategy::Ec { .. }) {
+            match self.local.read_chunk(chunk_id).await {
+                Ok(env) => return Ok(env),
+                Err(ChunkError::NotFound(_)) => {} // fall through to fabric
+                Err(other) => return Err(other),
+            }
         }
 
         // Phase 16d step 5: dispatch on cfg.ec_strategy. Replication

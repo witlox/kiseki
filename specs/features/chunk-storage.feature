@@ -231,3 +231,20 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And 3 follower nodes are killed
     Then a S3 GET from node-1 fails with chunk lost
     And the killed nodes are restarted and rejoin the cluster
+
+  # Witness for the GCP 2026-05-02 "1 of 6 readers fails AEAD" bug
+  # (leader's local-fragment write bypassed the chunk_envelope_meta
+  # side table, so peers fetching the leader's fragment received
+  # zero crypto). A single PUT/GET pair has only ~33% chance of
+  # reproducing it (the bug fires when rendezvous-hash placement
+  # puts the leader at index 0 or 1) and reading from a single
+  # follower roulettes inside that. N=10 PUT/GET cycles reading
+  # from every alive node deterministically (~98%) catches the same
+  # asymmetry: any chunk where the leader sits at placement[0..1]
+  # surfaces a 5xx on at least one follower's read. Bumping N would
+  # close the residual flake further at the cost of test time.
+  @integration @multi-node @ec
+  Scenario: 6-node EC PUT/GET round-trips preserve crypto on every node
+    Given a 6-node kiseki cluster
+    When the client performs 10 1MB PUT/GET-from-every-node cycles via node-1
+    Then every cycle returned the original bytes from every node

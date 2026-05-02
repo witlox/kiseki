@@ -28,6 +28,12 @@ pub struct ClusterState {
     /// asserts ("ticked at least 1") would be polluted by anything an
     /// earlier scenario incremented. Keyed by `node-{id}/<metric_label>`.
     pub metric_baselines: std::collections::BTreeMap<String, f64>,
+    /// Records of any failed PUT/GET round-trips collected during a
+    /// multi-cycle scenario — populated by `when_n_put_get_cycles`.
+    /// The matching `then` step asserts this stays empty so the test
+    /// fails on the first cycle that surfaces an issue (e.g. an
+    /// AEAD verification miss on a single follower).
+    pub round_trip_failures: Vec<String>,
     /// Owned lock on the cluster, held for the lifetime of the
     /// scenario. cucumber-rs runs scenarios concurrently by default
     /// and our destructive ops (`kill_node`) would interleave
