@@ -2577,7 +2577,13 @@ mod tests {
     }
 
     #[test]
-    fn write_updates_current_filehandle() {
+    fn write_buffers_against_current_filehandle() {
+        // Post-40cac2b semantics: WRITE buffers data against the
+        // current file handle and the handle is unchanged. Composition
+        // creation is deferred to COMMIT/CLOSE via flush_writes — the
+        // earlier per-WRITE composition path produced one chunk per
+        // 4 KiB NFS block, blowing up the dedup table on sequential
+        // writes (Phase 16a perf regression).
         let ctx = test_ctx();
         let sessions = test_sessions();
         let mut state = CompoundState {
@@ -2585,7 +2591,6 @@ mod tests {
             saved_fh: None,
             current_stateid: None,
         };
-
         let original_fh = state.current_fh;
 
         let mut body = XdrWriter::new();
@@ -2598,10 +2603,20 @@ mod tests {
 
         let (status, _) = op_write(&mut reader, &ctx, &sessions, &mut state);
         assert_eq!(status, nfs4_status::NFS4_OK);
-        assert_ne!(
+        assert_eq!(
             state.current_fh, original_fh,
-            "WRITE should update current_fh"
+            "WRITE must not rotate current_fh — composition is created on COMMIT/CLOSE",
         );
+        let (flushed_fh, resp) = ctx
+            .flush_writes(&original_fh.unwrap())
+            .expect("flush_writes infallible on buffered data")
+            .expect("flush should produce a new composition");
+        assert_ne!(
+            Some(flushed_fh),
+            original_fh,
+            "flush_writes is the path that mints a new composition handle",
+        );
+        assert_eq!(resp.count, 9, "buffered length must equal the WRITE payload");
     }
 
     // ---------- OPEN (§18.16) ----------
