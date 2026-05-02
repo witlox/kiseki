@@ -176,6 +176,15 @@ jobs:
           if echo "$output" | grep -qE "[1-9][0-9]* failed"; then
             echo "::error::BDD scenarios failed"
             echo "$output" | grep -E "[1-9][0-9]* failed"
+            echo "::group::Failed scenarios"
+            # Cucumber prints `Step failed:` then `Defined:` then the
+            # step-impl path on the next two lines, then `Step
+            # panicked. Captured output: <message>`. Grab a 6-line
+            # context window around each failure so we see the
+            # scenario name, the step that failed, AND the panic
+            # message — the full triage payload in one block.
+            echo "$output" | grep -B 4 -A 2 "Step failed:" || true
+            echo "::endgroup::"
             exit 1
           fi
 
