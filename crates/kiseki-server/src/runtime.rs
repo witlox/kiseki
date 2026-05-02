@@ -403,7 +403,8 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         kiseki_chunk_cluster::ClusterCfg::new(bootstrap_tenant_for_cluster, "default")
             .with_min_acks(durability.min_acks)
             .with_ec_strategy(durability.strategy)
-            .with_cluster_nodes(cluster_nodes_for_cfg);
+            .with_cluster_nodes(cluster_nodes_for_cfg)
+            .with_self_node_id(cfg.node_id);
     // Phase 16d step 4: clone the peer list before it's moved into
     // ClusteredChunkStore so the scrub-scheduler adapters can build
     // a parallel by-id index for HasFragment + repair calls.

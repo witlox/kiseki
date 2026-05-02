@@ -124,6 +124,16 @@ pub struct ClusterCfg {
     /// for EC the placement order matters because `placement[i]`
     /// holds `fragment_index = i`.
     pub cluster_nodes: Vec<u64>,
+    /// This node's own id. Required by the EC path to write/read its
+    /// own fragment to/from the local store — `peers` excludes self,
+    /// so without this, the leader's slot in `placement` is silently
+    /// dropped. Surfaced 2026-05-02 on the GCP perf cluster: 6-node
+    /// EC 4+2 wrote 5 of 6 fragments (the leader's own fragment lost),
+    /// and reads short of `min_fragments_for_read` after a single
+    /// peer outage. Default 0 means "local-only / not in cluster" —
+    /// the EC path treats it as "skip the self-write" so 1-node and
+    /// in-process tests don't regress.
+    pub self_node_id: u64,
 }
 
 impl ClusterCfg {
@@ -138,7 +148,16 @@ impl ClusterCfg {
             get_timeout: DEFAULT_GET_TIMEOUT,
             ec_strategy: crate::ec::EcStrategy::Replication { copies: 3 },
             cluster_nodes: Vec::new(),
+            self_node_id: 0,
         }
+    }
+
+    /// Override the local node's id (Phase 16e — required for the EC
+    /// path so the leader's own fragment lands in its local store).
+    #[must_use]
+    pub fn with_self_node_id(mut self, id: u64) -> Self {
+        self.self_node_id = id;
+        self
     }
 
     /// Override `min_acks` (Phase 16b step 3 — runtime sets this from
@@ -245,6 +264,26 @@ impl ClusteredChunkStore {
         let mut acks: usize = 0;
         let mut futs = Vec::with_capacity(routes.len());
         for route in routes {
+            // Local-fragment path: when a route targets THIS node, write
+            // it to the local store rather than skipping. Pre-Phase-16e
+            // dropped the leader's own fragment, leaving the cluster one
+            // ack short on min_acks and one fragment short on the read
+            // side (surfaced as "insufficient fragments for
+            // reconstruction" on the GCP perf cluster).
+            if self.cfg.self_node_id != 0 && route.peer_id == self.cfg.self_node_id {
+                let chunk_id = envelope.chunk_id;
+                let local = Arc::clone(&self.local);
+                let bytes = route.bytes;
+                let fragment_index = route.fragment_index;
+                if local
+                    .write_fragment(&chunk_id, fragment_index, bytes)
+                    .await
+                    .is_ok()
+                {
+                    acks += 1;
+                }
+                continue;
+            }
             // Look up by node-id rendered into the same name format
             // the runtime uses (`node-{id}`); MockPeer in tests
             // names itself "p1".."p6" so we match by matching
@@ -322,7 +361,28 @@ impl ClusteredChunkStore {
             self.peers.iter().map(|p| (p.name(), p)).collect();
 
         let mut responses: Vec<crate::ec::FragmentResponse> = Vec::new();
+        // Capture chunk-level crypto fields (auth_tag, nonce, epochs,
+        // tenant-wrapped material) from the first peer response. Every
+        // peer's GetFragment carries the same fields (server-side
+        // captured them via `chunk_envelope_meta` on the corresponding
+        // PutFragment). Without these, the assembled envelope below
+        // would have zeroed crypto fields and AES-GCM verify on the
+        // gateway side fails with "AEAD authentication failed".
+        let mut crypto: Option<Envelope> = None;
         for (i, peer_id) in placement.iter().enumerate() {
+            let fragment_index = u32::try_from(i).unwrap_or(u32::MAX);
+            // Local-fragment path: if a placement slot targets this
+            // node, read from local store. Pre-Phase-16e skipped self,
+            // missing one fragment per chunk on every read.
+            if self.cfg.self_node_id != 0 && *peer_id == self.cfg.self_node_id {
+                if let Ok(bytes) = self.local.read_fragment(chunk_id, fragment_index).await {
+                    responses.push(crate::ec::FragmentResponse {
+                        fragment_index,
+                        bytes,
+                    });
+                }
+                continue;
+            }
             let label = format!("node-{peer_id}");
             let alt_label = format!("p{peer_id}");
             let Some(peer) = by_id
@@ -331,13 +391,15 @@ impl ClusteredChunkStore {
             else {
                 continue;
             };
-            let fragment_index = u32::try_from(i).unwrap_or(u32::MAX);
             if let Ok(Ok(env)) = tokio::time::timeout(
                 self.cfg.get_timeout,
                 peer.get_fragment(*chunk_id, fragment_index),
             )
             .await
             {
+                if crypto.is_none() {
+                    crypto = Some(env.clone());
+                }
                 responses.push(crate::ec::FragmentResponse {
                     fragment_index,
                     bytes: env.ciphertext,
@@ -380,14 +442,27 @@ impl ClusteredChunkStore {
             bytes.truncate(trimmed_len);
             bytes
         };
+        let (auth_tag, nonce, system_epoch, tenant_epoch, tenant_wrapped_material) =
+            crypto.map_or_else(
+                || ([0u8; 16], [0u8; 12], kiseki_common::tenancy::KeyEpoch(1), None, None),
+                |e| {
+                    (
+                        e.auth_tag,
+                        e.nonce,
+                        e.system_epoch,
+                        e.tenant_epoch,
+                        e.tenant_wrapped_material,
+                    )
+                },
+            );
         Ok(Envelope {
             chunk_id: *chunk_id,
             ciphertext: bytes,
-            auth_tag: [0u8; 16],
-            nonce: [0u8; 12],
-            system_epoch: kiseki_common::tenancy::KeyEpoch(1),
-            tenant_epoch: None,
-            tenant_wrapped_material: None,
+            auth_tag,
+            nonce,
+            system_epoch,
+            tenant_epoch,
+            tenant_wrapped_material,
         })
     }
 
@@ -463,9 +538,17 @@ impl AsyncChunkOps for ClusteredChunkStore {
         // to write_chunk_ec with a pick_placement-derived placement.
         if let crate::ec::EcStrategy::Ec { data, parity } = self.cfg.ec_strategy {
             let total = usize::from(data) + usize::from(parity);
-            // Locally store the envelope first so a leader read does
-            // not require a fabric fetch.
-            let stored = self.local.write_chunk(envelope.clone(), pool).await?;
+            // Pre-Phase-16e: leader stored the *whole* envelope here
+            // for local read short-circuiting. That's wrong under EC
+            // — get_fragment(idx=0) on a leader configured with the
+            // legacy whole-envelope chunk returns the full ciphertext
+            // (~1MB), but the EC decoder expects shards of equal
+            // ~ciphertext_len/data size. Mixing full envelope + EC
+            // shards on the read side made reed-solomon-erasure
+            // refuse to reconstruct ("insufficient fragments"). The
+            // leader's fragment is now written via write_chunk_ec
+            // below, addressed by (chunk_id, fragment_index).
+            let stored = true;
             let placement = if self.cfg.cluster_nodes.is_empty() {
                 // Best-effort: derive node ids from peer names. Keeps
                 // unit tests using "p1".."pN" working without

@@ -52,16 +52,54 @@ struct ChunkEntry {
     extent: Extent,
 }
 
+/// Metadata for a persisted EC fragment. Distinct from
+/// `PersistedChunkMeta` because EC fragments don't carry per-fragment
+/// envelope crypto state — they're slices of one chunk's ciphertext
+/// addressed by `(chunk_id, fragment_index)`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedFragmentMeta {
+    chunk_id: [u8; 32],
+    fragment_index: u32,
+    extent_offset: u64,
+    extent_length: u64,
+    data_bytes: u64,
+}
+
+struct FragmentEntry {
+    meta: PersistedFragmentMeta,
+    extent: Extent,
+}
+
 /// Persistent chunk store — in-memory index + device backend for data.
 pub struct PersistentChunkStore {
     /// In-memory index: `chunk_id` → metadata + extent.
     chunks: Mutex<HashMap<ChunkId, ChunkEntry>>,
+    /// EC fragment index: `(chunk_id, fragment_index)` → metadata +
+    /// extent. Used by EC X+Y mode (`defaults_for(>=6)` selects
+    /// EC 4+2). Replication-N writes go through `chunks` instead.
+    /// Discovered missing 2026-05-02 — local repro of the GCP perf
+    /// cluster's "quorum lost: only 1/4 replicas acked" — every EC
+    /// fragment with `fragment_index > 0` returned `Status::unavailable`
+    /// because the inherited default trait impl returned
+    /// `Io("write_fragment not implemented")`.
+    fragments: Mutex<HashMap<(ChunkId, u32), FragmentEntry>>,
     /// Pools (same as in-memory `ChunkStore`).
     pools: Mutex<HashMap<String, AffinityPool>>,
     /// Device backend for chunk data storage.
     device: Box<dyn DeviceBackend>,
     /// Path to metadata file (JSON, for crash recovery).
     meta_path: std::path::PathBuf,
+    /// Path to fragment metadata file. Defaults to `meta_path` with
+    /// `.frag` appended — kept separate from the chunks file so the
+    /// existing on-disk format stays back-compat for chunk-only
+    /// deployments.
+    frag_meta_path: std::path::PathBuf,
+}
+
+fn frag_path_for(meta: &Path) -> std::path::PathBuf {
+    let mut s = meta.as_os_str().to_owned();
+    s.push(".frag");
+    std::path::PathBuf::from(s)
 }
 
 impl PersistentChunkStore {
@@ -80,11 +118,14 @@ impl PersistentChunkStore {
 
         let store = Self {
             chunks: Mutex::new(HashMap::new()),
+            fragments: Mutex::new(HashMap::new()),
             pools: Mutex::new(HashMap::new()),
             device: Box::new(device),
             meta_path: meta_path.to_owned(),
+            frag_meta_path: frag_path_for(meta_path),
         };
         store.save_meta()?;
+        store.save_frag_meta()?;
         Ok(store)
     }
 
@@ -115,11 +156,31 @@ impl PersistentChunkStore {
             HashMap::new()
         };
 
+        let frag_meta_path = frag_path_for(meta_path);
+        let fragments = if frag_meta_path.exists() {
+            let data = std::fs::read_to_string(&frag_meta_path)
+                .map_err(|e| ChunkError::Io(e.to_string()))?;
+            let metas: Vec<PersistedFragmentMeta> = serde_json::from_str(&data)
+                .map_err(|e| ChunkError::Io(format!("fragment metadata parse error: {e}")))?;
+            let mut map = HashMap::new();
+            for meta in metas {
+                let chunk_id = ChunkId(meta.chunk_id);
+                let extent = Extent::new(meta.extent_offset, meta.extent_length);
+                let key = (chunk_id, meta.fragment_index);
+                map.insert(key, FragmentEntry { meta, extent });
+            }
+            map
+        } else {
+            HashMap::new()
+        };
+
         Ok(Self {
             chunks: Mutex::new(chunks),
+            fragments: Mutex::new(fragments),
             pools: Mutex::new(HashMap::new()),
             device: Box::new(device),
             meta_path: meta_path.to_owned(),
+            frag_meta_path,
         })
     }
 
@@ -142,6 +203,22 @@ impl PersistentChunkStore {
         let tmp_path = self.meta_path.with_extension("tmp");
         std::fs::write(&tmp_path, json).map_err(|e| ChunkError::Io(e.to_string()))?;
         std::fs::rename(&tmp_path, &self.meta_path).map_err(|e| ChunkError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist the fragment index. Same crash-safe write+rename
+    /// pattern as `save_meta` but on `frag_meta_path`.
+    fn save_frag_meta(&self) -> Result<(), ChunkError> {
+        let fragments = self.fragments.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in save_frag_meta, recovering");
+            e.into_inner()
+        });
+        let metas: Vec<&PersistedFragmentMeta> = fragments.values().map(|e| &e.meta).collect();
+        let json = serde_json::to_string(&metas).map_err(|e| ChunkError::Io(e.to_string()))?;
+        let tmp_path = self.frag_meta_path.with_extension("tmp");
+        std::fs::write(&tmp_path, json).map_err(|e| ChunkError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, &self.frag_meta_path)
+            .map_err(|e| ChunkError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -423,6 +500,117 @@ impl ChunkOps for PersistentChunkStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         chunks.keys().copied().collect()
+    }
+
+    /// EC fragment write — addresses bytes by `(chunk_id, fragment_index)`
+    /// in a separate index from the legacy `chunks` map. The default
+    /// trait impl returned `Io("not implemented")` which the gRPC
+    /// fabric server mapped to `Status::unavailable`, surfacing on a
+    /// 6-node cluster as `quorum lost: only 1/4 replicas acked`
+    /// (every fragment with `fragment_index > 0` failed; only the
+    /// `index=0` ack went through the legacy `write_chunk` path).
+    /// Idempotent — re-writing the same `(chunk_id, fragment_index)`
+    /// frees the old extent before allocating a new one so the
+    /// device doesn't accumulate orphan extents on retries.
+    fn write_fragment(
+        &mut self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), ChunkError> {
+        let key = (*chunk_id, fragment_index);
+        let data_bytes = bytes.len() as u64;
+
+        // Allocate device space + write before touching the in-memory
+        // index so a write failure leaves no half-state. If a prior
+        // entry exists for this key, free its extent after the new
+        // write succeeds.
+        let extent = self
+            .device
+            .alloc(data_bytes)
+            .map_err(|e| ChunkError::Io(e.to_string()))?;
+        self.device
+            .write(&extent, &bytes)
+            .map_err(|e| ChunkError::Io(e.to_string()))?;
+
+        let old_extent = {
+            let mut fragments = self
+                .fragments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let old = fragments.remove(&key).map(|e| e.extent);
+            let meta = PersistedFragmentMeta {
+                chunk_id: chunk_id.0,
+                fragment_index,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+                data_bytes,
+            };
+            fragments.insert(key, FragmentEntry { meta, extent });
+            old
+        };
+        if let Some(old) = old_extent {
+            // Best-effort — if free fails, we leak an extent (the
+            // periodic scrub will reclaim). Don't fail the write.
+            let _ = self.device.free(&old);
+        }
+        self.save_frag_meta()?;
+        Ok(())
+    }
+
+    fn read_fragment(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+    ) -> Result<Vec<u8>, ChunkError> {
+        let key = (*chunk_id, fragment_index);
+        let extent = {
+            let fragments = self
+                .fragments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            fragments
+                .get(&key)
+                .map(|e| e.extent)
+                .ok_or(ChunkError::NotFound(*chunk_id))?
+        };
+        self.device
+            .read(&extent)
+            .map_err(|e| ChunkError::Io(e.to_string()))
+    }
+
+    fn delete_fragment(
+        &mut self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+    ) -> Result<bool, ChunkError> {
+        let key = (*chunk_id, fragment_index);
+        let removed = {
+            let mut fragments = self
+                .fragments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            fragments.remove(&key)
+        };
+        let Some(entry) = removed else {
+            return Ok(false);
+        };
+        let _ = self.device.free(&entry.extent);
+        self.save_frag_meta()?;
+        Ok(true)
+    }
+
+    fn list_fragments(&self, chunk_id: &ChunkId) -> Vec<u32> {
+        let target = *chunk_id;
+        let fragments = self
+            .fragments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fragments
+            .keys()
+            .filter(|(cid, _)| *cid == target)
+            .map(|(_, idx)| *idx)
+            .collect()
     }
 }
 

@@ -34,6 +34,27 @@ pub struct ClusterChunkServer {
     /// 16a ships a single pool per node; 16b's defaults table makes
     /// this per-tenant.
     default_pool: String,
+    /// Per-chunk envelope crypto fields (`auth_tag`, `nonce`, epochs,
+    /// optional tenant-wrapped material). EC fragments persist only
+    /// the ciphertext slice — the chunk-level crypto fields would
+    /// otherwise be lost across the fabric, and the read path
+    /// reconstructs ciphertext from EC shards but can't validate AEAD
+    /// without the original tag/nonce. Every `PutFragment` for the
+    /// same chunk carries identical crypto fields so writing them N
+    /// times is idempotent. Discovered 2026-05-02 — without this, a
+    /// 6-node EC 4+2 read returns "AEAD authentication failed" even
+    /// though every fragment fetch succeeds.
+    chunk_envelope_meta:
+        std::sync::Mutex<std::collections::HashMap<RustChunkId, EnvelopeMeta>>,
+}
+
+#[derive(Clone)]
+struct EnvelopeMeta {
+    auth_tag: [u8; 16],
+    nonce: [u8; 12],
+    system_epoch: kiseki_common::tenancy::KeyEpoch,
+    tenant_epoch: Option<kiseki_common::tenancy::KeyEpoch>,
+    tenant_wrapped_material: Option<Vec<u8>>,
 }
 
 impl ClusterChunkServer {
@@ -43,6 +64,7 @@ impl ClusterChunkServer {
         Self {
             local,
             default_pool: default_pool.into(),
+            chunk_envelope_meta: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -53,6 +75,44 @@ impl ClusterChunkServer {
     pub fn into_tonic_server(self) -> ClusterChunkServiceServer<Self> {
         ClusterChunkServiceServer::new(self)
             .max_decoding_message_size(crate::peer::FABRIC_MAX_MESSAGE_BYTES)
+    }
+
+    /// Build an `Envelope` for a fragment-shard read by combining the
+    /// raw shard bytes with the chunk-level crypto fields the server
+    /// captured on the corresponding `PutFragment`. Falls back to a
+    /// zeroed envelope only when the chunk's metadata isn't in the
+    /// side table (older Replication-N writes that hit the legacy
+    /// path before the side-table existed) — in that case AEAD
+    /// validation on the caller will fail loudly, which is the right
+    /// signal.
+    fn envelope_from_bytes(&self, chunk_id: RustChunkId, bytes: Vec<u8>) -> RustEnvelope {
+        let meta = self
+            .chunk_envelope_meta
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&chunk_id)
+            .cloned();
+        if let Some(m) = meta {
+            RustEnvelope {
+                chunk_id,
+                ciphertext: bytes,
+                auth_tag: m.auth_tag,
+                nonce: m.nonce,
+                system_epoch: m.system_epoch,
+                tenant_epoch: m.tenant_epoch,
+                tenant_wrapped_material: m.tenant_wrapped_material,
+            }
+        } else {
+            RustEnvelope {
+                chunk_id,
+                ciphertext: bytes,
+                auth_tag: [0u8; 16],
+                nonce: [0u8; 12],
+                system_epoch: kiseki_common::tenancy::KeyEpoch(1),
+                tenant_epoch: None,
+                tenant_wrapped_material: None,
+            }
+        }
     }
 
     /// Wrap into a tonic server with the [`fabric_san_interceptor`]
@@ -101,6 +161,24 @@ impl ClusterChunkService for ClusterChunkServer {
             .as_ref()
             .map_or_else(|| self.default_pool.clone(), proto_pool_to_string);
 
+        // Capture chunk-level crypto fields before envelope is moved
+        // into the storage path. Idempotent across fragments — every
+        // fragment of the same chunk carries identical metadata.
+        let chunk_id = envelope.chunk_id;
+        {
+            let mut meta = self
+                .chunk_envelope_meta
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            meta.entry(chunk_id).or_insert_with(|| EnvelopeMeta {
+                auth_tag: envelope.auth_tag,
+                nonce: envelope.nonce,
+                system_epoch: envelope.system_epoch,
+                tenant_epoch: envelope.tenant_epoch,
+                tenant_wrapped_material: envelope.tenant_wrapped_material.clone(),
+            });
+        }
+
         // Phase 16d step 2: route by fragment_index. index=0 keeps
         // the legacy whole-envelope path (Replication-N + dedup).
         // index>0 is an EC shard; store via write_fragment so the
@@ -113,7 +191,6 @@ impl ClusterChunkService for ClusterChunkServer {
                 .map_err(|e| chunk_err_to_status(&e))?;
             Ok(Response::new(pb::PutFragmentResponse { stored }))
         } else {
-            let chunk_id = envelope.chunk_id;
             self.local
                 .write_fragment(&chunk_id, req.fragment_index, envelope.ciphertext)
                 .await
@@ -132,6 +209,28 @@ impl ClusterChunkService for ClusterChunkServer {
         let chunk_id = proto_chunk_id_to_rust(req.chunk_id.as_ref())?;
 
         if req.fragment_index == 0 {
+            // index=0 has two storage shapes depending on the mode the
+            // leader used: Replication-N stores the WHOLE envelope at
+            // chunk_id (via write_chunk), EC stores ONE shard at
+            // (chunk_id, 0) (via write_fragment). The server doesn't
+            // know which mode the leader used, so try the fragment
+            // path first and fall back to the whole-envelope path. If
+            // the fragment exists, return it as a synthetic envelope
+            // (the EC decoder reads only `ciphertext`; the auth_tag /
+            // nonce / epoch fields are leader-side state and irrelevant
+            // for fragment reconstruction).
+            //
+            // Discovered 2026-05-02 — the prior unconditional
+            // read_chunk path returned NotFound for EC chunks (leader
+            // never wrote a whole envelope under EC) which surfaced
+            // as `chunk lost: insufficient fragments for reconstruction`
+            // on cross-node reads.
+            if let Ok(bytes) = self.local.read_fragment(&chunk_id, 0).await {
+                let env = self.envelope_from_bytes(chunk_id, bytes);
+                return Ok(Response::new(pb::GetFragmentResponse {
+                    envelope: Some(rust_envelope_to_proto(&env)),
+                }));
+            }
             let env = self
                 .local
                 .read_chunk(&chunk_id)
@@ -146,18 +245,7 @@ impl ClusterChunkService for ClusterChunkServer {
                 .read_fragment(&chunk_id, req.fragment_index)
                 .await
                 .map_err(|e| chunk_err_to_status(&e))?;
-            // Wrap the shard bytes in a synthetic Envelope — the
-            // proto requires this shape regardless of index. The
-            // caller's `read_chunk_ec` only uses `ciphertext`.
-            let env = kiseki_crypto::envelope::Envelope {
-                chunk_id,
-                ciphertext: bytes,
-                auth_tag: [0u8; 16],
-                nonce: [0u8; 12],
-                system_epoch: kiseki_common::tenancy::KeyEpoch(1),
-                tenant_epoch: None,
-                tenant_wrapped_material: None,
-            };
+            let env = self.envelope_from_bytes(chunk_id, bytes);
             Ok(Response::new(pb::GetFragmentResponse {
                 envelope: Some(rust_envelope_to_proto(&env)),
             }))
