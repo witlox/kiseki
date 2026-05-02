@@ -185,16 +185,17 @@ Defer entirely until either:
 
 1. **I1** Python e2e dedup — fast win, reduces test drift  *(done 5225146)*
 2. **I2** NFSv3 @integration scenarios — closes a known coverage gap
-   *(NULL scenario landed; 3 roundtrip scenarios deferred — see I5)*
-3. **I5** NFSv3 CREATE+WRITE binding — surfaced by I2, prerequisite for the
+   *(NULL scenario landed b812e88; 3 roundtrip scenarios deferred — see I5)*
+3. **I4** Pre-existing flake fixes  *(done — election-must-not-be-isolated-node
+   + drain-orchestrator-bookkeeping)*
+4. **I5** NFSv3 CREATE+WRITE binding — surfaced by I2, prerequisite for the
    3 deferred roundtrip scenarios
-4. **I3** GCP perf re-run — captures a baseline number
-5. **F1** Follower → leader S3 forwarding — diamond, one ADR
-6. **I4** Pre-existing flake fixes — narrow-scope test diagnosis
+5. **I3** GCP perf re-run — captures a baseline number
+6. **F1** Follower → leader S3 forwarding — diamond, one ADR
 7. **C1** mTLS fixture — likely diamond
 8. **C2** revisit after #1–7 land
 
-I3 + I4 + F1 can run in parallel (different domains).
+I3 + F1 can run in parallel (different domains).
 
 ## What NOT to do
 

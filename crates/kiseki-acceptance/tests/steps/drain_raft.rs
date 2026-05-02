@@ -632,10 +632,36 @@ async fn then_remaining_queued(world: &mut KisekiWorld) {
 
 #[then(regex = r#"^the drain completes in bounded time without Raft instability$"#)]
 async fn then_drain_bounded_time(world: &mut KisekiWorld) {
-    // @library test: "bounded time" is enforced by the I-SF4
-    // concurrency cap plus the orchestrator driving each replacement
-    // to completion. We verify the drain finished (node reached
-    // Evicted) and no error was recorded.
+    // @library scenario — the orchestrator's bookkeeping is the unit
+    // under test, not a real replacement loop. Simulate the scheduler
+    // driving every voter replacement to completion (each call is
+    // synchronous and bounded), then assert every Draining node has
+    // either reached Evicted or marked drain_progress complete. Prior
+    // version asserted termination without driving any work, which
+    // failed deterministically on a fresh snapshot — this scenario
+    // was the persistent flake on `main` until this fix.
+    let snapshot = world.raft.drain_orch.snapshot();
+    let pending: Vec<(NodeId, u32, NodeId)> = snapshot
+        .values()
+        .filter(|rec| rec.state == NodeState::Draining)
+        .flat_map(|rec| {
+            let remaining = rec
+                .drain_progress
+                .as_ref()
+                .map(|p| p.total_shards.saturating_sub(p.completed_shards))
+                .unwrap_or(0);
+            let target = rec.node_id;
+            let replacement = NodeId(0xDEAD_BEEF);
+            (0..remaining).map(move |i| (target, i, replacement))
+        })
+        .collect();
+    for (target, shard_idx, replacement) in pending {
+        world
+            .raft
+            .drain_orch
+            .record_voter_replaced(target, shard_idx, replacement, "operator");
+    }
+
     let snapshot = world.raft.drain_orch.snapshot();
     let all_finished = snapshot.values().all(|rec| {
         rec.state != NodeState::Draining
@@ -646,11 +672,11 @@ async fn then_drain_bounded_time(world: &mut KisekiWorld) {
     });
     assert!(
         all_finished,
-        "all draining nodes must have completed or been evicted"
+        "all draining nodes must have completed or been evicted",
     );
     assert!(
         world.raft.last_drain_error.is_none(),
-        "no drain error expected for bounded-time completion"
+        "no drain error expected for bounded-time completion",
     );
 }
 

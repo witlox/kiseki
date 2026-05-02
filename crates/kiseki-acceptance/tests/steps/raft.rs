@@ -948,17 +948,27 @@ async fn then_may_not_include(_w: &mut KisekiWorld) {
 #[then("an election begins among node-2 and node-3")]
 async fn then_election_begins(w: &mut KisekiWorld) {
     let c = cluster(w);
-    // After node-1 is isolated, remaining nodes should start an election.
-    let new_leader = c.wait_for_leader(Duration::from_secs(5)).await;
-    assert!(
-        new_leader.is_some(),
-        "election should begin and complete among remaining nodes"
-    );
-    let lid = new_leader.unwrap();
-    assert!(
-        lid == 2 || lid == 3,
-        "new leader should be node-2 or node-3, got node-{lid}"
-    );
+    // After node-1 is isolated, remaining nodes should elect one of
+    // themselves. `wait_for_leader` returns the *first* node it sees
+    // claiming leadership — which can be the now-isolated node-1 for
+    // a short window before its heartbeats fail and it steps down.
+    // Poll specifically for a leader in {2, 3}.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(lid) = c.wait_for_leader(Duration::from_millis(100)).await {
+            if lid == 2 || lid == 3 {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let last = c.wait_for_leader(Duration::from_millis(50)).await;
+            panic!(
+                "no new leader among node-2 / node-3 within 5s; last sighting={last:?} \
+                 (likely the isolated node-1 still self-reports leadership)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[then("a new leader is elected within 300-600ms")]
