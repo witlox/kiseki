@@ -5,7 +5,7 @@ Feature: Persistence and crash recovery (ADR-022)
 
   Background:
     Given a Kiseki server with KISEKI_DATA_DIR configured
-    And redb database at $DATA_DIR/raft/db.redb
+    And redb database at $DATA_DIR/raft/log.redb
     And pool files at $DATA_DIR/pools/
 
   # === Raft log persistence ===

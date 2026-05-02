@@ -455,7 +455,13 @@ impl KisekiWorld {
     ) -> Arc<kiseki_log::persistent_store::PersistentShardStore> {
         if self.legacy.persistent_shard_store.is_none() {
             let dir = tempfile::tempdir().expect("persistent store tempdir");
-            let path = dir.path().join("raft-log.redb");
+            // Path matches production layout
+            // (`runtime.rs`: `dir.join("raft").join("log.redb")`) so
+            // persistence.feature's Background step can assert against
+            // the same on-disk shape that `kiseki-server` produces.
+            let raft_dir = dir.path().join("raft");
+            std::fs::create_dir_all(&raft_dir).expect("mkdir <data_dir>/raft");
+            let path = raft_dir.join("log.redb");
             let store = kiseki_log::persistent_store::PersistentShardStore::open(&path)
                 .await
                 .expect("open persistent store");
@@ -468,6 +474,19 @@ impl KisekiWorld {
                 .as_ref()
                 .expect("just initialised"),
         )
+    }
+
+    /// Path the harness uses for the persistent shard log (mirrors
+    /// the production runtime: `<DATA_DIR>/raft/log.redb`). Returns
+    /// `None` until `persistent_store()` has been called at least
+    /// once. Used by the persistence.feature Background step to
+    /// assert the on-disk layout the spec documents.
+    #[must_use]
+    pub fn persistent_store_path(&self) -> Option<std::path::PathBuf> {
+        self.legacy
+            .persistent_temp_dir
+            .as_ref()
+            .map(|d| d.path().join("raft").join("log.redb"))
     }
 
     /// Simulate a server restart: drop the in-memory state of the
@@ -484,7 +503,7 @@ impl KisekiWorld {
         let Some(dir) = self.legacy.persistent_temp_dir.as_ref() else {
             return;
         };
-        let path = dir.path().join("raft-log.redb");
+        let path = dir.path().join("raft").join("log.redb");
         // Drop the existing handle so we can reopen against the same path.
         self.legacy.persistent_shard_store = None;
         let store = kiseki_log::persistent_store::PersistentShardStore::open(&path)

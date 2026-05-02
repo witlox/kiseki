@@ -1449,16 +1449,24 @@ async fn then_nfs4_badsession_status(w: &mut KisekiWorld) {
 
 // --- Persistence ---
 
-#[given("redb database at $DATA_DIR/raft/db.redb")]
-async fn given_redb(_w: &mut KisekiWorld) {
-    // Declarative — every persistence scenario instantiates a real
-    // persistent log store via `world.persistent_store()` (which
-    // creates `<DATA_DIR>/raft/db.redb` on demand). This step
-    // documents the path layout the scenarios assume; verifying the
-    // file actually exists would require touching the store before
-    // the scenario uses it, which would fight the lazy-open the
-    // store relies on. Left as a no-op so the Background completes
-    // and the wired Then-steps can run.
+#[given("redb database at $DATA_DIR/raft/log.redb")]
+async fn given_redb(w: &mut KisekiWorld) {
+    // Force the harness to open its persistent shard store so the
+    // on-disk redb file is materialised at the production-shaped
+    // path (`<data_dir>/raft/log.redb`, mirroring `runtime.rs`'s
+    // `dir.join("raft").join("log.redb")`). Then assert the file
+    // exists — proves the layout the spec documents matches what
+    // both the test harness and `kiseki-server` actually produce.
+    let _ = w.persistent_store().await;
+    let path = w
+        .persistent_store_path()
+        .expect("persistent_store() materialises the redb path");
+    assert!(
+        path.exists(),
+        "redb log file not created at {} — persistent store harness \
+         is out of sync with the spec's documented layout",
+        path.display(),
+    );
 }
 
 #[given("pool files at $DATA_DIR/pools/")]
