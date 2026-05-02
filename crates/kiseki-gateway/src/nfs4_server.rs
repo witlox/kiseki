@@ -2616,7 +2616,10 @@ mod tests {
             original_fh,
             "flush_writes is the path that mints a new composition handle",
         );
-        assert_eq!(resp.count, 9, "buffered length must equal the WRITE payload");
+        assert_eq!(
+            resp.count, 9,
+            "buffered length must equal the WRITE payload"
+        );
     }
 
     // ---------- OPEN (§18.16) ----------
