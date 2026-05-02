@@ -622,7 +622,22 @@ fn main() {
     // macOS include them when the feature is explicitly requested.
     let skip_slow = cfg!(target_os = "macos") && !cfg!(feature = "slow-tests");
 
-    let runner = KisekiWorld::cucumber().filter_run("features/", move |feat, _, sc| {
+    // Limit scenario concurrency. The default (one scenario per CPU
+    // thread) lets ~16 scenarios run in parallel on a beefy laptop, and
+    // each `@multi-node` scenario spawns 3-20 `kiseki-server` children
+    // via the cluster harness singletons. Three singletons (3 + 6 + 20
+    // nodes = 29 children) plus a dozen concurrent in-flight scenarios
+    // saturate file descriptors and ports, deadlocking some scenarios
+    // mid-step (observed locally as a 50%-completion hang on
+    // 2026-05-02). Cap at 4 — enough parallelism that fast unit-style
+    // scenarios don't bottleneck on slower @multi-node ones, but few
+    // enough that the harness singletons can serve their per-scenario
+    // mutex without resource starvation. Each cluster singleton is
+    // already serialized by its `OwnedMutexGuard`, so the cap only
+    // gates the *cross-singleton* concurrency.
+    let runner = KisekiWorld::cucumber()
+        .max_concurrent_scenarios(4)
+        .filter_run("features/", move |feat, _, sc| {
         if skip_slow && sc.tags.iter().any(|t| t == "slow") {
             return false;
         }
