@@ -10,7 +10,9 @@
 
 use cucumber::{given, then, when};
 
-use crate::steps::cluster_harness::{acquire_cluster, NodeHandle};
+use crate::steps::cluster_harness::{
+    acquire_cluster, acquire_cluster_20, acquire_cluster_6, NodeHandle,
+};
 use crate::KisekiWorld;
 
 /// 1 MiB — the size every "1MB" step in this file uses. Keeping the
@@ -174,6 +176,63 @@ async fn given_3_node_cluster(w: &mut KisekiWorld) {
     w.cluster.key = Some(unique_key());
 }
 
+#[given("a 6-node kiseki cluster")]
+async fn given_6_node_cluster(w: &mut KisekiWorld) {
+    // Same shape as the 3-node Given but using the 6-node singleton.
+    // 6 nodes selects the EC 4+2 default in `defaults_for(>=6)` —
+    // mirrors the GCP perf cluster's `default` profile and exercises
+    // the production-scale fan-out that the 3-node Replication-3 path
+    // does not.
+    let cluster_arc = acquire_cluster_6()
+        .await
+        .expect("failed to start 6-node cluster");
+    let guard = cluster_arc.lock_owned().await;
+    let leader = guard.leader_id().await;
+    assert!(leader.is_some(), "6-node cluster has no elected leader",);
+    w.cluster.cluster_guard = Some(guard);
+    w.cluster.bucket = Some("default".to_owned());
+    w.cluster.key = Some(unique_key());
+}
+
+#[given("a 20-node kiseki cluster")]
+async fn given_20_node_cluster(w: &mut KisekiWorld) {
+    // 20 nodes uses EC 4+2 (same as 6-node) but `pick_placement` now
+    // picks 6 of 20 by rendezvous hash — different chunk_id → different
+    // 6-node subset. Catches placement-routing bugs that the 6-node
+    // case can't (where placement is always the full set).
+    let cluster_arc = acquire_cluster_20()
+        .await
+        .expect("failed to start 20-node cluster");
+    let guard = cluster_arc.lock_owned().await;
+    let leader = guard.leader_id().await;
+    assert!(leader.is_some(), "20-node cluster has no elected leader",);
+    w.cluster.cluster_guard = Some(guard);
+    w.cluster.bucket = Some("default".to_owned());
+    w.cluster.key = Some(unique_key());
+}
+
+#[then("the leader's fabric_quorum_lost_total stays at zero")]
+async fn then_no_quorum_lost(w: &mut KisekiWorld) {
+    let guard = cluster(w);
+    let leader_id = guard
+        .leader_id()
+        .await
+        .expect("cluster has no leader");
+    let leader = guard.node(leader_id);
+    let text = scrape_metrics(leader).await;
+    let lost = sum_counter_matching_all(
+        &text,
+        "kiseki_fabric_quorum_lost_total",
+        &[],
+    );
+    assert!(
+        lost < 0.5,
+        "kiseki_fabric_quorum_lost_total = {lost} on leader (node-{leader_id}) — \
+         the cross-node fabric is dropping fragments without recovering. \
+         GCP 2026-05-02 saw 1760 of these events with zero log lines emitted.",
+    );
+}
+
 /// Borrow the cluster guard installed by `given_3_node_cluster`.
 /// Panics if the Given step hasn't run — every multi-node step relies
 /// on the scenario-level lock.
@@ -274,12 +333,14 @@ async fn then_s3_get_from_node(w: &mut KisekiWorld, node_id: u64) {
         .expect("expected body missing");
     // Followers serve reads from their local CompositionStore, which
     // lags the leader via Raft delta hydration (ADR-040). Allow up to
-    // 10s for the hydrator to catch up — a real client would retry the
-    // same way after a routing-to-follower 404.
+    // 30s — at scale (6+ node EC clusters), the first read after a
+    // PUT pays for both composition hydration AND EC fragment fan-out
+    // discovery; 10s consistently misses on a cold cluster. A real
+    // client retries the same way after a routing-to-follower 404.
     let body = {
         let node = cluster(w).node(node_id);
         let url = format!("{}/{bucket}/{etag}", node.s3_base);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let resp = node
                 .http

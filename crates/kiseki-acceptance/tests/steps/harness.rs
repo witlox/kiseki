@@ -23,21 +23,68 @@ pub struct ServerPorts {
 
 impl ServerPorts {
     /// Bind ephemeral TCP sockets, record ports, close immediately.
+    ///
+    /// **Single-node only.** Multi-node callers must use
+    /// [`PortReservation::allocate`] + [`PortReservation::release`] to
+    /// hold all ports open across allocations — without that, the
+    /// kernel can recycle a freshly-released ephemeral port to a
+    /// later `allocate()` call, and the child whose port was reused
+    /// dies on bind with `EADDRINUSE`. Surfaced when scaling
+    /// `ClusterHarness` from 3 → 6 nodes (36 ports/cluster).
     pub fn allocate() -> Self {
-        let mut ports = Vec::new();
+        PortReservation::allocate().release()
+    }
+}
+
+/// Holds 6 bound `TcpListener`s for the lifetime of the reservation.
+/// `release()` drops the listeners and hands back the port numbers
+/// for immediate child-process binding. The window between
+/// `release()` and the child's `bind()` is microseconds; concurrent
+/// reservations across multiple nodes never collide because each
+/// reservation keeps its own listeners alive until release.
+pub struct PortReservation {
+    _listeners: Vec<std::net::TcpListener>,
+    ports: ServerPorts,
+}
+
+impl PortReservation {
+    /// Bind 6 ephemeral TCP sockets and hold them open.
+    pub fn allocate() -> Self {
+        let mut listeners = Vec::with_capacity(6);
+        let mut ports = Vec::with_capacity(6);
         for _ in 0..6 {
             let sock =
                 std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
             ports.push(sock.local_addr().unwrap().port());
+            listeners.push(sock);
         }
         Self {
-            grpc_data: ports[0],
-            grpc_advisory: ports[1],
-            s3_http: ports[2],
-            nfs_tcp: ports[3],
-            metrics: ports[4],
-            raft: ports[5],
+            _listeners: listeners,
+            ports: ServerPorts {
+                grpc_data: ports[0],
+                grpc_advisory: ports[1],
+                s3_http: ports[2],
+                nfs_tcp: ports[3],
+                metrics: ports[4],
+                raft: ports[5],
+            },
         }
+    }
+
+    /// Drop the held listeners and return the port numbers. Call
+    /// this immediately before spawning the child.
+    #[must_use]
+    pub fn release(self) -> ServerPorts {
+        // `_listeners` drops here, freeing the ports for the child to bind.
+        self.ports
+    }
+
+    /// Borrow the port numbers without releasing the listeners.
+    /// Used to build env strings (KISEKI_RAFT_PEERS, etc.) that
+    /// reference every node's ports while reservations are still live.
+    #[must_use]
+    pub fn ports(&self) -> &ServerPorts {
+        &self.ports
     }
 }
 

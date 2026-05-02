@@ -162,3 +162,28 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     When a client writes 1MB via S3 PUT to the cluster
     Then S3 GET from any surviving node returns the same 1MB
     And the killed node is restarted and rejoins the cluster
+
+  # Regression witness for the GCP 2026-05-02 perf-cluster failure: a
+  # 6-node cluster takes the EC 4+2 code path (defaults_for(>=6)),
+  # which 3-node tests don't exercise. The GCP run surfaced ~83%
+  # PutFragment unavailable + 1760 quorum-lost events + zero log lines.
+  # This scenario must succeed on the same configuration before we
+  # claim cross-node fabric is production-ready at scale.
+  @integration @multi-node @ec
+  Scenario: 6-node cluster — PUT lands EC 4+2 fragments without quorum loss
+    Given a 6-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    Then the leader's fabric_quorum_lost_total stays at zero
+    And S3 GET from node-2 returns the same 1MB
+
+  # Scale-out witness. The 6-node case is degenerate for EC: every
+  # chunk's placement is the full {1..6} set, so the rendezvous-hash
+  # placement selector is never exercised. 20 nodes pick 6 of 20 per
+  # chunk — the placement-routing path that hides bugs the 6-node
+  # test can't surface.
+  @integration @multi-node @ec @slow
+  Scenario: 20-node cluster — PUT routes via rendezvous-hash placement
+    Given a 20-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    Then the leader's fabric_quorum_lost_total stays at zero
+    And S3 GET from node-2 returns the same 1MB

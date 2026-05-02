@@ -19,11 +19,24 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, OnceCell};
 
-use super::harness::ServerPorts;
+use super::harness::{PortReservation, ServerPorts};
 
-/// Cluster size — fixed at 3 to mirror the docker-compose.3node.yml
-/// topology and to give us a real 2-of-3 quorum.
-const NODE_COUNT: u64 = 3;
+/// 3-node cluster — Replication-3 (`defaults_for(3..=5)` selects this);
+/// matches docker-compose.3node.yml.
+const NODE_COUNT_3: u64 = 3;
+
+/// 6-node cluster — EC 4+2 (`defaults_for(>=6)` selects this);
+/// matches the GCP `default` perf profile and exercises the
+/// production-scale code path that 3-node tests don't reach.
+const NODE_COUNT_6: u64 = 6;
+
+/// 20-node cluster — same EC 4+2 strategy as 6-node but with
+/// non-degenerate placement (`pick_placement` chooses 6 of 20 by
+/// rendezvous hash, so each chunk lands on a different subset). The
+/// 6-node case is a degenerate special case where placement is
+/// always the full set; 20-node exercises the real placement-routing
+/// code path. Catches scaling bugs the 6-node test can't.
+const NODE_COUNT_20: u64 = 20;
 
 /// One running `kiseki-server` instance plus its S3 client.
 pub struct NodeHandle {
@@ -54,6 +67,23 @@ impl NodeHandle {
 
 impl Drop for NodeHandle {
     fn drop(&mut self) {
+        // SIGTERM first so libc flushes stdio buffers — without this,
+        // any tracing/log output buffered in the child is lost on
+        // SIGKILL, which makes post-mortem debugging impossible when
+        // the child only logs at info/warn level.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            if let Ok(pid) = i32::try_from(self.process.id()) {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        // Brief grace window for graceful shutdown.
+        for _ in 0..20 {
+            if matches!(self.process.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
@@ -74,39 +104,65 @@ pub struct ClusterHarness {
 }
 
 impl ClusterHarness {
-    /// Spawn all 3 nodes. Node 1 bootstraps the Raft group; 2 and 3
-    /// join. Returns once every node reports the same non-zero
-    /// `leader_id` (30s deadline) — i.e. an election has converged.
-    pub async fn start() -> Result<Self, String> {
+    /// Spawn `node_count` kiseki-server children. Node 1 bootstraps the
+    /// Raft group; 2..N join. Returns once every node reports the
+    /// same non-zero `leader_id` (30s deadline) — i.e. an election
+    /// has converged.
+    pub async fn start(node_count: u64) -> Result<Self, String> {
         let binary = find_server_binary()?;
 
-        // Allocate all ports up-front — `KISEKI_RAFT_PEERS` is the same
-        // env var on every child, so peers must be known before we
-        // spawn any of them.
-        let mut ports: BTreeMap<u64, ServerPorts> = BTreeMap::new();
-        for id in 1..=NODE_COUNT {
-            ports.insert(id, ServerPorts::allocate());
+        // Reserve all ports up-front and HOLD the listeners for every
+        // node. KISEKI_RAFT_PEERS / KISEKI_FABRIC_PEERS are the same
+        // env vars on every child, so peers must be known before we
+        // spawn any of them. Reservations are released one-at-a-time
+        // immediately before each child spawn — without this, the
+        // kernel recycles a freshly-released ephemeral port to a
+        // later allocation and the unlucky child dies on bind.
+        // Surfaced when scaling 3 → 6 nodes.
+        let mut reservations: BTreeMap<u64, PortReservation> = BTreeMap::new();
+        for id in 1..=node_count {
+            reservations.insert(id, PortReservation::allocate());
         }
 
-        let raft_peers_env = ports
+        let raft_peers_env = reservations
             .iter()
-            .map(|(id, p)| format!("{id}=127.0.0.1:{}", p.raft))
+            .map(|(id, r)| format!("{id}=127.0.0.1:{}", r.ports().raft))
             .collect::<Vec<_>>()
             .join(",");
-        let fabric_peers_env = ports
+        let fabric_peers_env = reservations
             .iter()
-            .map(|(id, p)| format!("{id}=127.0.0.1:{}", p.grpc_data))
+            .map(|(id, r)| format!("{id}=127.0.0.1:{}", r.ports().grpc_data))
             .collect::<Vec<_>>()
             .join(",");
 
+        // Write a port map for out-of-band probing. With
+        // KISEKI_HARNESS_LOG_DIR set, an external process (curl, ss,
+        // python) can read this and probe each node's /metrics + S3
+        // ports while the test is running.
+        if let Ok(dir) = std::env::var("KISEKI_HARNESS_LOG_DIR") {
+            let _ = std::fs::create_dir_all(&dir);
+            let lines: Vec<String> = reservations
+                .iter()
+                .map(|(id, r)| {
+                    let p = r.ports();
+                    format!(
+                        "node-{id} grpc_data={} grpc_advisory={} s3={} nfs={} metrics={} raft={}",
+                        p.grpc_data, p.grpc_advisory, p.s3_http, p.nfs_tcp, p.metrics, p.raft,
+                    )
+                })
+                .collect();
+            let _ = std::fs::write(format!("{dir}/ports.txt"), lines.join("\n") + "\n");
+        }
+
         // Spawn node 1 first (bootstrap). Wait for its bootstrap shard
-        // to come up before starting 2/3 — followers that race past the
-        // leader's `initialize` call get stuck waiting for a vote.
+        // to come up before starting 2..N — followers that race past
+        // the leader's `initialize` call get stuck waiting for a vote.
         let mut nodes = BTreeMap::new();
+        let ports1 = reservations.remove(&1).expect("node 1 reservation").release();
         let n1 = spawn_node(
             &binary,
             1,
-            &ports[&1],
+            &ports1,
             &raft_peers_env,
             &fabric_peers_env,
             true,
@@ -114,11 +170,15 @@ impl ClusterHarness {
         wait_for_admin(&n1, Duration::from_secs(60)).await?;
         nodes.insert(1, n1);
 
-        for id in 2..=NODE_COUNT {
+        for id in 2..=node_count {
+            let ports = reservations
+                .remove(&id)
+                .expect("node reservation")
+                .release();
             let node = spawn_node(
                 &binary,
                 id,
-                &ports[&id],
+                &ports,
                 &raft_peers_env,
                 &fabric_peers_env,
                 false,
@@ -233,17 +293,50 @@ impl ClusterHarness {
 }
 
 // ---------------------------------------------------------------------------
-// Process-level singleton
+// Process-level singletons (one per cluster size)
 // ---------------------------------------------------------------------------
 
-static CLUSTER: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
+static CLUSTER_3: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
+static CLUSTER_6: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
 
-/// Acquire the shared cluster handle. First caller pays the ~5-15s
-/// startup; subsequent callers get the cached `Arc` immediately.
+/// Acquire the shared 3-node cluster handle (Replication-3 path).
+/// First caller pays the ~5-15s startup.
 pub async fn acquire_cluster() -> Result<Arc<Mutex<ClusterHarness>>, String> {
-    CLUSTER
+    CLUSTER_3
         .get_or_try_init(|| async {
-            ClusterHarness::start()
+            ClusterHarness::start(NODE_COUNT_3)
+                .await
+                .map(|c| Arc::new(Mutex::new(c)))
+        })
+        .await
+        .cloned()
+}
+
+/// Acquire the shared 6-node cluster handle (EC 4+2 path) — mirrors
+/// the GCP `default` perf profile, the production-scale configuration
+/// where `defaults_for(6)` selects EC. Different singleton from the
+/// 3-node cluster so both can coexist within one test binary.
+pub async fn acquire_cluster_6() -> Result<Arc<Mutex<ClusterHarness>>, String> {
+    CLUSTER_6
+        .get_or_try_init(|| async {
+            ClusterHarness::start(NODE_COUNT_6)
+                .await
+                .map(|c| Arc::new(Mutex::new(c)))
+        })
+        .await
+        .cloned()
+}
+
+static CLUSTER_20: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
+
+/// Acquire the shared 20-node cluster handle. Same EC 4+2 strategy
+/// as the 6-node singleton but exercises the non-degenerate
+/// placement-routing path: each chunk lands on a `pick_placement`-
+/// chosen subset of 6 from 20 (vs the full set on 6-node).
+pub async fn acquire_cluster_20() -> Result<Arc<Mutex<ClusterHarness>>, String> {
+    CLUSTER_20
+        .get_or_try_init(|| async {
+            ClusterHarness::start(NODE_COUNT_20)
                 .await
                 .map(|c| Arc::new(Mutex::new(c)))
         })
@@ -313,16 +406,36 @@ fn spawn_with_env(
         .env("KISEKI_BOOTSTRAP", if bootstrap { "true" } else { "false" })
         .env("KISEKI_ALLOW_PLAINTEXT_NFS", "true")
         .env("KISEKI_INSECURE_NFS", "true")
-        .env("RUST_LOG", "warn")
+        .env(
+            "RUST_LOG",
+            std::env::var("KISEKI_HARNESS_RUST_LOG").unwrap_or_else(|_| "warn".to_owned()),
+        )
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        // Both streams to /dev/null. We previously piped stderr but
+        // stdout → /dev/null. stderr → tempfile when KISEKI_HARNESS_LOG_DIR
+        // is set, otherwise /dev/null. We previously piped stderr but
         // never drained it, so the kernel's ~64 KiB pipe buffer would
-        // fill mid-test under RUST_LOG=warn and block the child's
-        // next write — causing seemingly-random "connection refused"
-        // failures on its admin port. If you need child logs, set
-        // KISEKI_HARNESS_LOG_DIR and tee stderr there.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // fill mid-test under RUST_LOG=warn and block the child's next
+        // write — causing seemingly-random "connection refused"
+        // failures on the admin port. The file path avoids that.
+        .stdout(Stdio::null());
+    if let Ok(dir) = std::env::var("KISEKI_HARNESS_LOG_DIR") {
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{dir}/node-{node_id}.log");
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(f) => {
+                cmd.stderr(Stdio::from(f));
+            }
+            Err(_) => {
+                cmd.stderr(Stdio::null());
+            }
+        }
+    } else {
+        cmd.stderr(Stdio::null());
+    }
     install_pdeathsig(&mut cmd);
     cmd.spawn().map_err(|e| {
         format!(
