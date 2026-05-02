@@ -158,7 +158,10 @@ impl ClusterHarness {
         // to come up before starting 2..N — followers that race past
         // the leader's `initialize` call get stuck waiting for a vote.
         let mut nodes = BTreeMap::new();
-        let ports1 = reservations.remove(&1).expect("node 1 reservation").release();
+        let ports1 = reservations
+            .remove(&1)
+            .expect("node 1 reservation")
+            .release();
         let n1 = spawn_node(
             &binary,
             1,
@@ -236,6 +239,24 @@ impl ClusterHarness {
     /// Respawn a previously-killed node with the same node_id, ports,
     /// and data dir. The new child rejoins via the existing peer config.
     pub async fn restart_node(&mut self, id: u64) -> Result<(), String> {
+        self.restart_node_inner(id).await?;
+        self.wait_for_quorum(Duration::from_secs(30)).await
+    }
+
+    /// Restart a batch of previously-killed nodes. Spawns each child
+    /// sequentially, waits for admin readiness on each, then performs
+    /// a single `wait_for_quorum`. Calling `restart_node` per id would
+    /// deadlock at the first quorum check — wait_for_quorum scrapes
+    /// EVERY node, and the still-dead ones return None for leader_id,
+    /// so consensus is never observed.
+    pub async fn restart_nodes(&mut self, ids: &[u64]) -> Result<(), String> {
+        for id in ids {
+            self.restart_node_inner(*id).await?;
+        }
+        self.wait_for_quorum(Duration::from_secs(30)).await
+    }
+
+    async fn restart_node_inner(&mut self, id: u64) -> Result<(), String> {
         let node = self
             .nodes
             .get_mut(&id)
@@ -258,8 +279,7 @@ impl ClusterHarness {
         // Old child already reaped; drop it explicitly to be tidy.
         drop(old_child);
         let id_for_log = node.node_id;
-        wait_for_admin(self.node(id_for_log), Duration::from_secs(60)).await?;
-        self.wait_for_quorum(Duration::from_secs(30)).await
+        wait_for_admin(self.node(id_for_log), Duration::from_secs(60)).await
     }
 
     /// Wait until every live node reports the same non-zero `leader_id`.

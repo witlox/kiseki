@@ -187,3 +187,47 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     When a client writes 1MB via S3 PUT to node-1
     Then the leader's fabric_quorum_lost_total stays at zero
     And S3 GET from node-2 returns the same 1MB
+
+  # Promotion of the @library "Read falls back to fabric" scenario —
+  # in EC 4+2 mode every reader naturally fans out (only owns 1 of 6
+  # fragments locally), so the fabric-fetch path is the steady-state
+  # read path. Asserting on the per-peer GET metric is the
+  # observable replacement for the @library "first tries local, miss"
+  # narrative which can't be expressed without a fault-injection knob.
+  @integration @multi-node @ec
+  Scenario: 6-node EC read fans out fragments via fabric
+    Given a 6-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    And every follower has received the fragment
+    Then S3 GET from node-2 returns the same 1MB
+    And node-2 issued at least 4 fabric GetFragment calls for the read
+
+  # Promotion of the @library "Write requires 2-of-3 quorum (D-5)"
+  # scenario, reframed for EC 4+2: at 6 nodes, killing 3 followers
+  # leaves Raft with 3-of-6 (still has quorum) but only 1 leader-local
+  # + 2 remote peers can ack a fabric write, short of min_acks=4. The
+  # 3-node Replication-3 case couldn't disentangle Raft loss from
+  # fabric-quorum loss — EC 4+2 separates them cleanly.
+  @integration @multi-node @ec
+  Scenario: 6-node EC write fails when 3 of 5 followers are down (D-5)
+    Given a 6-node kiseki cluster
+    When 3 follower nodes are killed
+    Then a 1MB S3 PUT to node-1 fails with quorum lost
+    And the leader's fabric_quorum_lost_total ticked at least 1
+    And the killed nodes are restarted and rejoin the cluster
+
+  # Promotion of the @library "Chunk unrecoverable - insufficient EC
+  # parity" scenario. EC 4+2 tolerates loss of 2 fragments; 3 lost is
+  # past the parity floor and must surface as ChunkLost on the
+  # client. Writes BEFORE the kill so the fragments exist; the kill
+  # destroys 3 of the 5 fragments held by remote peers (plus the
+  # leader's own = 1 local fragment surviving). Read needs ≥4
+  # fragments → fails.
+  @integration @multi-node @ec
+  Scenario: 6-node EC read fails when 3 fragments are unrecoverable
+    Given a 6-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    And every follower has received the fragment
+    And 3 follower nodes are killed
+    Then a S3 GET from node-1 fails with chunk lost
+    And the killed nodes are restarted and rejoin the cluster

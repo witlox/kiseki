@@ -10,10 +10,10 @@
 
 use cucumber::{given, then, when};
 
-use crate::steps::cluster_harness::{
-    acquire_cluster, acquire_cluster_20, acquire_cluster_6, NodeHandle,
-};
 use crate::KisekiWorld;
+use crate::steps::cluster_harness::{
+    NodeHandle, acquire_cluster, acquire_cluster_6, acquire_cluster_20,
+};
 
 /// 1 MiB — the size every "1MB" step in this file uses. Keeping the
 /// constant lets us tweak the scenario boundary in one place if we
@@ -28,8 +28,9 @@ fn megabyte_payload() -> Vec<u8> {
     // the shared chunk before the leader-change scenario ran.
     let seed_uuid = uuid::Uuid::new_v4();
     let seed_bytes = seed_uuid.as_bytes();
-    let mut x: u32 = u32::from_le_bytes([seed_bytes[0], seed_bytes[1], seed_bytes[2], seed_bytes[3]])
-        .wrapping_add(0x9E37_79B9);
+    let mut x: u32 =
+        u32::from_le_bytes([seed_bytes[0], seed_bytes[1], seed_bytes[2], seed_bytes[3]])
+            .wrapping_add(0x9E37_79B9);
     let mut buf = Vec::with_capacity(ONE_MEBIBYTE);
     for _ in 0..ONE_MEBIBYTE {
         x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
@@ -174,6 +175,7 @@ async fn given_3_node_cluster(w: &mut KisekiWorld) {
     // bootstrap; per-scenario isolation comes from the random key.
     w.cluster.bucket = Some("default".to_owned());
     w.cluster.key = Some(unique_key());
+    snapshot_quorum_lost_baseline(w).await;
 }
 
 #[given("a 6-node kiseki cluster")]
@@ -192,6 +194,7 @@ async fn given_6_node_cluster(w: &mut KisekiWorld) {
     w.cluster.cluster_guard = Some(guard);
     w.cluster.bucket = Some("default".to_owned());
     w.cluster.key = Some(unique_key());
+    snapshot_quorum_lost_baseline(w).await;
 }
 
 #[given("a 20-node kiseki cluster")]
@@ -209,27 +212,34 @@ async fn given_20_node_cluster(w: &mut KisekiWorld) {
     w.cluster.cluster_guard = Some(guard);
     w.cluster.bucket = Some("default".to_owned());
     w.cluster.key = Some(unique_key());
+    snapshot_quorum_lost_baseline(w).await;
 }
 
 #[then("the leader's fabric_quorum_lost_total stays at zero")]
 async fn then_no_quorum_lost(w: &mut KisekiWorld) {
+    // Cluster singletons are shared across scenarios; an earlier
+    // destructive scenario may have ticked the absolute counter. We
+    // assert that no NEW quorum-loss events landed during this
+    // scenario by diffing against the baseline captured in the Given
+    // step (`snapshot_quorum_lost_baseline`).
+    let baseline_key = baseline_key_quorum_lost();
+    let baseline = w
+        .cluster
+        .metric_baselines
+        .get(&baseline_key)
+        .copied()
+        .unwrap_or(0.0);
     let guard = cluster(w);
-    let leader_id = guard
-        .leader_id()
-        .await
-        .expect("cluster has no leader");
+    let leader_id = guard.leader_id().await.expect("cluster has no leader");
     let leader = guard.node(leader_id);
     let text = scrape_metrics(leader).await;
-    let lost = sum_counter_matching_all(
-        &text,
-        "kiseki_fabric_quorum_lost_total",
-        &[],
-    );
+    let lost = sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[]);
+    let delta = lost - baseline;
     assert!(
-        lost < 0.5,
-        "kiseki_fabric_quorum_lost_total = {lost} on leader (node-{leader_id}) — \
-         the cross-node fabric is dropping fragments without recovering. \
-         GCP 2026-05-02 saw 1760 of these events with zero log lines emitted.",
+        delta < 0.5,
+        "kiseki_fabric_quorum_lost_total ticked by {delta} on leader (node-{leader_id}) \
+         this scenario (baseline={baseline}, now={lost}) — the cross-node fabric is \
+         dropping fragments without recovering. GCP 2026-05-02 saw 1760 of these events.",
     );
 }
 
@@ -556,32 +566,40 @@ async fn when_every_follower_has_fragment(w: &mut KisekiWorld) {
     // Wait until node-1's per-peer put-ok counter has incremented at
     // least once for *both* followers — proving the fan-out reached
     // node-2 AND node-3 (not just `min_acks=2` worth of any two).
-    let guard = cluster(w);
-    let leader = guard.node(1);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let text = scrape_metrics(leader).await;
-        let to_n2 = sum_counter_matching_all(
-            &text,
-            "kiseki_fabric_ops_total",
-            &[r#"op="put""#, r#"peer="node-2""#, r#"outcome="ok""#],
-        );
-        let to_n3 = sum_counter_matching_all(
-            &text,
-            "kiseki_fabric_ops_total",
-            &[r#"op="put""#, r#"peer="node-3""#, r#"outcome="ok""#],
-        );
-        if to_n2 >= 1.0 && to_n3 >= 1.0 {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "fabric replication did not reach both followers within 15s: \
-                 to-node-2={to_n2}, to-node-3={to_n3}",
+    {
+        let guard = cluster(w);
+        let leader = guard.node(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let text = scrape_metrics(leader).await;
+            let to_n2 = sum_counter_matching_all(
+                &text,
+                "kiseki_fabric_ops_total",
+                &[r#"op="put""#, r#"peer="node-2""#, r#"outcome="ok""#],
             );
+            let to_n3 = sum_counter_matching_all(
+                &text,
+                "kiseki_fabric_ops_total",
+                &[r#"op="put""#, r#"peer="node-3""#, r#"outcome="ok""#],
+            );
+            if to_n2 >= 1.0 && to_n3 >= 1.0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "fabric replication did not reach both followers within 15s: \
+                     to-node-2={to_n2}, to-node-3={to_n3}",
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+    // Snapshot per-node fabric `op="get"` baseline NOW — the next step
+    // will issue a S3 GET that fans out via fabric on EC clusters, and
+    // the "issued at least N fabric GetFragment calls" then-step diffs
+    // against this baseline to filter out increments from earlier
+    // scenarios that share the singleton.
+    snapshot_fabric_get_baselines(w).await;
 }
 
 #[then("the GET on node-2 was served from its local store, not via fabric")]
@@ -1016,6 +1034,300 @@ fn sum_counter_matching_all(text: &str, name: &str, label_fragments: &[&str]) ->
         }
     }
     total
+}
+
+// ---------------------------------------------------------------------------
+// EC failure-injection (multi-follower kill) — promotes the @library
+// "Write requires N-of-M quorum" and "Chunk unrecoverable - insufficient
+// EC parity" scenarios onto the 6-node EC harness.
+// ---------------------------------------------------------------------------
+
+#[when(regex = r"^(\d+) follower nodes are killed$")]
+async fn when_kill_n_followers(w: &mut KisekiWorld, n: u64) {
+    // Pick the first N non-leader nodes (deterministic — sorted by id).
+    // EC 4+2 on 6 nodes survives loss of 2 fragments; killing 3
+    // followers leaves only 3 of 6 fragments online (leader's local +
+    // the 2 surviving followers) — past the parity floor.
+    let leader_id = {
+        let guard = cluster(w);
+        guard
+            .leader_id()
+            .await
+            .expect("cluster has no leader before kill")
+    };
+    let victims: Vec<u64> = {
+        let guard = cluster(w);
+        guard
+            .nodes()
+            .map(|nh| nh.node_id)
+            .filter(|id| *id != leader_id)
+            .take(n as usize)
+            .collect()
+    };
+    assert_eq!(
+        victims.len() as u64,
+        n,
+        "wanted to kill {n} followers but only {} are non-leader",
+        victims.len(),
+    );
+    let guard = cluster_mut(w);
+    for id in &victims {
+        guard
+            .kill_node(*id)
+            .await
+            .unwrap_or_else(|e| panic!("kill follower node-{id}: {e}"));
+    }
+    w.cluster.killed_nodes = victims;
+}
+
+#[then(regex = r"^a (\d+)MB S3 PUT to node-(\d+) fails with quorum lost$")]
+async fn then_put_fails_quorum_lost(w: &mut KisekiWorld, mb: usize, target: u64) {
+    let body = vec![0u8; mb * ONE_MEBIBYTE];
+    let bucket = w
+        .cluster
+        .bucket
+        .clone()
+        .unwrap_or_else(|| "default".to_owned());
+    let key = format!("bdd-quorum-lost-{}", uuid::Uuid::new_v4().simple());
+    let killed: std::collections::HashSet<u64> = w.cluster.killed_nodes.iter().copied().collect();
+    let guard = cluster(w);
+    // The PUT may bounce off node-{target} with "leader unavailable"
+    // (gateway has no internal forwarding). Try once on the named node;
+    // if it returns leader-unavailable, follow the redirect to the
+    // current leader and require *that* attempt to surface "quorum
+    // lost" — that is the failure the scenario is asserting on.
+    let primary = guard.node(target);
+    let url1 = format!("{}/{bucket}/{key}", primary.s3_base);
+    let resp1 = primary
+        .http
+        .put(&url1)
+        .body(body.clone())
+        .send()
+        .await
+        .expect("HTTP PUT failed at transport layer");
+    let status1 = resp1.status();
+    let body1 = resp1.text().await.unwrap_or_default();
+    if !status1.is_success() && body1.contains("quorum lost") {
+        return;
+    }
+    if status1.is_success() {
+        panic!(
+            "S3 PUT to node-{target} succeeded ({status1}) but the scenario \
+             killed {} followers and required the write to fail with \
+             quorum lost — fabric quorum may be too lenient",
+            killed.len(),
+        );
+    }
+    // Discover the live leader from a known-alive non-killed node and
+    // retry there; the gateway may have masked the underlying error
+    // behind LeaderUnavailable when the request lacked a local leader.
+    let alive = guard
+        .nodes()
+        .find(|n| !killed.contains(&n.node_id))
+        .expect("at least one alive node");
+    let leader_id = leader_id_via(alive).await;
+    if let Some(lid) = leader_id {
+        if !killed.contains(&lid) && lid != target {
+            let leader = guard.node(lid);
+            let url2 = format!("{}/{bucket}/{key}", leader.s3_base);
+            let resp2 = leader
+                .http
+                .put(&url2)
+                .body(body)
+                .send()
+                .await
+                .expect("HTTP PUT to leader failed at transport layer");
+            let status2 = resp2.status();
+            let body2 = resp2.text().await.unwrap_or_default();
+            if !status2.is_success() && body2.contains("quorum lost") {
+                return;
+            }
+            panic!(
+                "follow-up PUT to leader (node-{lid}) returned {status2} body={body2:?}; \
+                 wanted 5xx with `quorum lost`",
+            );
+        }
+    }
+    panic!(
+        "PUT to node-{target} returned {status1} body={body1:?}; \
+         wanted 5xx with `quorum lost`",
+    );
+}
+
+#[then(regex = r"^the leader's fabric_quorum_lost_total ticked at least (\d+)$")]
+async fn then_quorum_lost_ticked(w: &mut KisekiWorld, expected_ticks: u64) {
+    let baseline_key = baseline_key_quorum_lost();
+    let baseline = w
+        .cluster
+        .metric_baselines
+        .get(&baseline_key)
+        .copied()
+        .unwrap_or(0.0);
+    let guard = cluster(w);
+    // The leader may have changed if the quorum-lost cascade triggered
+    // a re-election; ask any alive (non-killed) node for the current id.
+    let killed: std::collections::HashSet<u64> = w.cluster.killed_nodes.iter().copied().collect();
+    let alive = guard
+        .nodes()
+        .find(|n| !killed.contains(&n.node_id))
+        .expect("at least one alive node");
+    let leader_id = leader_id_via(alive).await.unwrap_or(alive.node_id);
+    let leader = guard.node(leader_id);
+    // Counter increments asynchronously after the failing PUT returns;
+    // poll briefly to absorb that lag rather than racing the metric path.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let text = scrape_metrics(leader).await;
+        let now = sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[]);
+        let delta = now - baseline;
+        if delta >= expected_ticks as f64 - 0.5 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "kiseki_fabric_quorum_lost_total ticked by {delta} on node-{leader_id} \
+                 (baseline={baseline}, now={now}); wanted ≥ {expected_ticks}",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+#[then("the killed nodes are restarted and rejoin the cluster")]
+async fn then_killed_nodes_restarted(w: &mut KisekiWorld) {
+    let killed = std::mem::take(&mut w.cluster.killed_nodes);
+    assert!(
+        !killed.is_empty(),
+        "no nodes recorded as killed — `N follower nodes are killed` must run first",
+    );
+    let guard = cluster_mut(w);
+    guard
+        .restart_nodes(&killed)
+        .await
+        .unwrap_or_else(|e| panic!("restart killed nodes {killed:?}: {e}"));
+    let leader = guard.leader_id().await;
+    assert!(
+        leader.is_some(),
+        "cluster has no leader after restarting killed nodes {killed:?}",
+    );
+}
+
+#[then(regex = r"^a S3 GET from node-(\d+) fails with chunk lost$")]
+async fn then_get_fails_chunk_lost(w: &mut KisekiWorld, target: u64) {
+    let bucket = w.cluster.bucket.clone().expect("bucket missing");
+    let etag = w.cluster.last_etag.clone().expect("etag missing");
+    let killed: std::collections::HashSet<u64> = w.cluster.killed_nodes.iter().copied().collect();
+    assert!(
+        !killed.contains(&target),
+        "scenario asks GET from node-{target} but it was killed",
+    );
+    let guard = cluster(w);
+    let node = guard.node(target);
+    let url = format!("{}/{bucket}/{etag}", node.s3_base);
+    // Past the EC parity floor, GET should fail deterministically — no
+    // amount of retrying recovers a chunk with insufficient fragments.
+    // Allow a brief settle window (the read may still pay one fabric
+    // probe round-trip per missing peer before failing).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let resp = node
+            .http
+            .get(&url)
+            .send()
+            .await
+            .expect("HTTP GET failed at transport layer");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success()
+            && (body.contains("chunk lost") || body.contains("insufficient fragments"))
+        {
+            return;
+        }
+        if status.is_success() {
+            panic!(
+                "S3 GET from node-{target} succeeded ({status}) but the scenario \
+                 killed {} followers (past EC 4+2 parity floor) — read should \
+                 have failed with `chunk lost`",
+                killed.len(),
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "S3 GET from node-{target} returned {status} body={body:?} for 10s; \
+                 wanted 5xx with `chunk lost` / `insufficient fragments`",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+#[then(regex = r"^node-(\d+) issued at least (\d+) fabric GetFragment calls for the read$")]
+async fn then_node_issued_n_get_calls(w: &mut KisekiWorld, node_id: u64, expected: u64) {
+    let baseline_key = baseline_key_fabric_get(node_id);
+    let baseline = w
+        .cluster
+        .metric_baselines
+        .get(&baseline_key)
+        .copied()
+        .unwrap_or(0.0);
+    let guard = cluster(w);
+    let node = guard.node(node_id);
+    let text = scrape_metrics(node).await;
+    let now = sum_counter_matching_all(&text, "kiseki_fabric_ops_total", &[r#"op="get""#]);
+    let delta = now - baseline;
+    assert!(
+        delta >= expected as f64 - 0.5,
+        "node-{node_id} issued {delta} fabric GET calls during the read \
+         (baseline={baseline}, now={now}); wanted ≥ {expected}. EC 4+2 \
+         requires 4 fragments — a reader holding only its own local \
+         shard MUST fan out to ≥3 peers, so anything below this means \
+         the read was served from a non-EC code path.",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Baseline-snapshot helpers (singleton-aware metric assertions)
+// ---------------------------------------------------------------------------
+
+fn baseline_key_quorum_lost() -> String {
+    "leader/kiseki_fabric_quorum_lost_total".to_owned()
+}
+
+fn baseline_key_fabric_get(node_id: u64) -> String {
+    format!("node-{node_id}/kiseki_fabric_ops_total{{op=get}}")
+}
+
+async fn snapshot_quorum_lost_baseline(w: &mut KisekiWorld) {
+    let value = {
+        let guard = cluster(w);
+        let Some(leader_id) = guard.leader_id().await else {
+            return;
+        };
+        let leader = guard.node(leader_id);
+        let text = scrape_metrics(leader).await;
+        sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[])
+    };
+    w.cluster
+        .metric_baselines
+        .insert(baseline_key_quorum_lost(), value);
+}
+
+async fn snapshot_fabric_get_baselines(w: &mut KisekiWorld) {
+    let pairs: Vec<(u64, f64)> = {
+        let guard = cluster(w);
+        let mut out = Vec::new();
+        for n in guard.nodes() {
+            let text = scrape_metrics(n).await;
+            let v = sum_counter_matching_all(&text, "kiseki_fabric_ops_total", &[r#"op="get""#]);
+            out.push((n.node_id, v));
+        }
+        out
+    };
+    for (id, v) in pairs {
+        w.cluster
+            .metric_baselines
+            .insert(baseline_key_fabric_get(id), v);
+    }
 }
 
 /// Sum every line that matches `<name>{...} N` or `<name> N` in

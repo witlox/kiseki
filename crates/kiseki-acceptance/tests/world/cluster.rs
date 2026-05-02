@@ -18,6 +18,16 @@ pub struct ClusterState {
     pub quorum_errors: Vec<String>,
     /// Node id of the leader that was killed mid-scenario, if any.
     pub killed_leader: Option<u64>,
+    /// Node ids killed by `Nfollower nodes are killed` — used by the EC
+    /// failure-injection scenarios (kill 3 of 5 followers on a 6-node
+    /// cluster). Restart-and-rejoin runs at scenario teardown via the
+    /// `the killed nodes are restarted and rejoin the cluster` step.
+    pub killed_nodes: Vec<u64>,
+    /// Per-metric baselines snapshotted at scenario entry. Cluster
+    /// singletons are shared across scenarios, so absolute counter
+    /// asserts ("ticked at least 1") would be polluted by anything an
+    /// earlier scenario incremented. Keyed by `node-{id}/<metric_label>`.
+    pub metric_baselines: std::collections::BTreeMap<String, f64>,
     /// Owned lock on the cluster, held for the lifetime of the
     /// scenario. cucumber-rs runs scenarios concurrently by default
     /// and our destructive ops (`kill_node`) would interleave
