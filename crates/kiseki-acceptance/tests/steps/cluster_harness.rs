@@ -426,6 +426,11 @@ fn spawn_with_env(
         .env("KISEKI_BOOTSTRAP", if bootstrap { "true" } else { "false" })
         .env("KISEKI_ALLOW_PLAINTEXT_NFS", "true")
         .env("KISEKI_INSECURE_NFS", "true")
+        // Enables `/admin/test/...` endpoints (drop fragment, fabric
+        // slow-down, fabric deny-incoming) on the spawned server.
+        // Only set in the BDD harness — production deployments leave
+        // it unset, so the test endpoints respond 403.
+        .env("KISEKI_ENABLE_TEST_KNOBS", "1")
         .env(
             "RUST_LOG",
             std::env::var("KISEKI_HARNESS_RUST_LOG").unwrap_or_else(|_| "warn".to_owned()),

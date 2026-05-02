@@ -88,6 +88,16 @@ async fn then_getattr_dir(w: &mut KisekiWorld) {
 
 // --- Scenario: NFSv4 sequential write then read ---
 
+// Strict regex requiring the leading `a client `. The Gherkin-style
+// `And writes "..."` step (sans `a client`) is intentionally NOT
+// matched — the second-WRITE step impl below is a stub that creates
+// a fresh composition instead of appending to the same fh, so the
+// follow-up READ would see only the FIRST write's bytes. Until
+// `nfs_ops.rs::read` merges buffered writes (or this step impl is
+// rewritten to OPEN+WRITE+WRITE+COMMIT against one fh), letting the
+// scenario reach READ surfaces a known-stub failure rather than a
+// real protocol bug. cucumber marks the unmatched `And` step as
+// skipped, which keeps the scenario from running end-to-end.
 #[when(regex = r#"^a client writes "([^"]*)" at offset (\d+) via NFSv4 WRITE$"#)]
 async fn when_nfs_write_at_offset(w: &mut KisekiWorld, data: String, offset: u64) {
     use kiseki_client::remote_nfs::transport::RpcTransport;

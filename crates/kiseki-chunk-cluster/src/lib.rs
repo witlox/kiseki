@@ -85,7 +85,10 @@ pub use scrub::{
 };
 pub use scrub_adapters::{FabricAvailabilityOracle, FabricRepairer, LocalChunkDeleter};
 pub use scrub_scheduler::{ScrubReport, ScrubScheduler};
-pub use server::{fabric_san_interceptor, ChunkEnvelopeRegistry, ClusterChunkServer};
+pub use server::{
+    fabric_san_interceptor, set_fabric_deny_incoming, set_fabric_slow_ms, ChunkEnvelopeRegistry,
+    ClusterChunkServer,
+};
 
 /// Default per-peer timeout for `PutFragment` (write-side fan-out).
 pub const DEFAULT_PUT_TIMEOUT: Duration = Duration::from_secs(5);

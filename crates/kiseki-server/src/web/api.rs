@@ -69,6 +69,25 @@ pub fn ui_router(state: UiState) -> Router {
             "/admin/composition/{composition_id}",
             get(admin_inspect_composition),
         )
+        // Test-only knobs (gated by `KISEKI_ENABLE_TEST_KNOBS=1` at
+        // request time). Used by BDD scenarios that need
+        // deterministic fault injection without iptables/netfilter:
+        //   POST /admin/test/fabric/slow-ms/{ms}     — set per-RPC sleep on incoming PutFragment
+        //   POST /admin/test/fabric/deny-incoming/{0|1}  — refuse all incoming PutFragment
+        //   DELETE /admin/test/chunk/{id}/fragment/{idx} — drop a single
+        //                                                  local fragment file
+        .route(
+            "/admin/test/fabric/slow-ms/{ms}",
+            post(admin_test_fabric_slow),
+        )
+        .route(
+            "/admin/test/fabric/deny-incoming/{enabled}",
+            post(admin_test_fabric_deny),
+        )
+        .route(
+            "/admin/test/chunk/{chunk_id}/fragment/{fragment_index}",
+            axum::routing::delete(admin_test_drop_fragment),
+        )
         .with_state(state)
 }
 
@@ -621,5 +640,94 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only knobs — gated by KISEKI_ENABLE_TEST_KNOBS=1 at request time.
+// Used by BDD scenarios that need deterministic fault injection
+// (chunk-storage::"Read falls back to fabric…", multi-node-raft::
+// "Write requires 2-of-3 quorum (D-5)" and "Composition delta arrives
+// before fragment (D-10)"). The runtime guard means a production
+// deployment that doesn't set the env var ignores these endpoints
+// regardless of how it was built.
+// ---------------------------------------------------------------------------
+
+fn test_knobs_enabled() -> bool {
+    std::env::var("KISEKI_ENABLE_TEST_KNOBS").as_deref() == Ok("1")
+}
+
+fn test_knobs_disabled_response() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": "test knobs disabled — set KISEKI_ENABLE_TEST_KNOBS=1",
+        })),
+    )
+}
+
+async fn admin_test_fabric_slow(
+    axum::extract::Path(ms): axum::extract::Path<u64>,
+) -> impl IntoResponse {
+    if !test_knobs_enabled() {
+        return test_knobs_disabled_response();
+    }
+    kiseki_chunk_cluster::set_fabric_slow_ms(ms);
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({ "fabric_slow_ms": ms })),
+    )
+}
+
+async fn admin_test_fabric_deny(
+    axum::extract::Path(enabled): axum::extract::Path<u8>,
+) -> impl IntoResponse {
+    if !test_knobs_enabled() {
+        return test_knobs_disabled_response();
+    }
+    let deny = enabled != 0;
+    kiseki_chunk_cluster::set_fabric_deny_incoming(deny);
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({ "fabric_deny_incoming": deny })),
+    )
+}
+
+async fn admin_test_drop_fragment(
+    State(state): State<UiState>,
+    axum::extract::Path((chunk_id_str, fragment_index)): axum::extract::Path<(String, u32)>,
+) -> impl IntoResponse {
+    if !test_knobs_enabled() {
+        return test_knobs_disabled_response();
+    }
+    let Some(chunk_id) = parse_chunk_id_hex(&chunk_id_str) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "chunk_id must be 64 hex characters (32-byte HMAC)",
+            })),
+        );
+    };
+    let Some(local) = state.local_chunk_store.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "local chunk store not wired into UiState",
+            })),
+        );
+    };
+    match local.delete_fragment(&chunk_id, fragment_index).await {
+        Ok(removed) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "chunk_id": chunk_id_str,
+                "fragment_index": fragment_index,
+                "removed": removed,
+            })),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }

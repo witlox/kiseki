@@ -27,6 +27,29 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::{verify_fabric_san, FabricAuthError};
 
+/// Test-only knobs surfaced via admin endpoints (see
+/// `kiseki-server::admin`). Process-global because the chunk-cluster
+/// server is per-process. Keep them OFF in production — admin
+/// endpoints that toggle them are gated behind a debug build / env
+/// flag at the runtime layer.
+pub(crate) static FABRIC_SLOW_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FABRIC_DENY_INCOMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the per-RPC slow-down for incoming `PutFragment` calls.
+/// `ms = 0` disables. Test-only — the admin endpoint that toggles
+/// this is gated by `KISEKI_ENABLE_TEST_KNOBS`.
+pub fn set_fabric_slow_ms(ms: u64) {
+    FABRIC_SLOW_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Toggle whether incoming `PutFragment` is refused with
+/// `Unavailable`. Test-only.
+pub fn set_fabric_deny_incoming(deny: bool) {
+    FABRIC_DENY_INCOMING.store(deny, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// gRPC handler wrapping a *local* async chunk store.
 pub struct ClusterChunkServer {
     local: Arc<dyn AsyncChunkOps>,
@@ -251,6 +274,27 @@ impl ClusterChunkService for ClusterChunkServer {
         &self,
         request: Request<pb::PutFragmentRequest>,
     ) -> Result<Response<pb::PutFragmentResponse>, Status> {
+        // Test-only slow-down knob. When the runtime atomic is set
+        // (via admin POST `/admin/fabric/slow-ms/{ms}`), sleep that
+        // many ms before accepting the fragment. Lets BDD scenarios
+        // deterministically induce "Raft applies faster than fabric
+        // acks" (the D-10 cross-stream ordering test in
+        // `multi-node-raft.feature`) without fragile timing or
+        // platform-specific iptables. Atomic so toggling is per-step.
+        let slow_ms = FABRIC_SLOW_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if slow_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(slow_ms)).await;
+        }
+        // Test-only deny knob — when set, every `PutFragment` is
+        // refused with `Unavailable` (mirroring "fabric port is
+        // blocked but Raft is alive"). Lets BDD scenarios isolate
+        // fabric-quorum failure from Raft-quorum failure (the D-5
+        // 3-node Replication-3 scenario in `multi-node-raft.feature`).
+        if FABRIC_DENY_INCOMING.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Status::unavailable(
+                "fabric incoming disabled (test-only knob)",
+            ));
+        }
         let req = request.into_inner();
 
         let envelope = req
