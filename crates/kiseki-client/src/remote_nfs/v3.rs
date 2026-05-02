@@ -165,9 +165,37 @@ impl GatewayOps for Nfs3Client {
             )));
         }
 
-        let composition_id = CompositionId(
-            uuid::Uuid::parse_str(&filename).unwrap_or_else(|_| uuid::Uuid::new_v4()),
-        );
+        // Re-LOOKUP to discover the server-assigned composition_id.
+        // Under FILE_SYNC the server flushes the buffered write into a
+        // fresh composition (kiseki compositions are write-once-immutable
+        // — see nfs3_server::reply_write) and re-maps the directory
+        // entry to the new file handle. The new fh's first 16 bytes
+        // ARE the new composition's UUID, so we can decode it directly
+        // without a second round trip... except we need the new fh,
+        // which means a LOOKUP. One extra RPC for the canonical id.
+        let mut args = XdrWriter::new();
+        args.write_opaque(&root_fh);
+        args.write_string(&filename);
+        let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_LOOKUP, &args.into_bytes())?;
+        let mut r = XdrReader::new(&reply);
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
+        if status != NFS3_OK {
+            return Err(GatewayError::ProtocolError(format!(
+                "NFSv3 LOOKUP-after-WRITE failed: status={status}"
+            )));
+        }
+        let new_fh = r.read_opaque().map_err(|e| xdr_err(&e))?;
+        let composition_id = if new_fh.len() >= 16 {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&new_fh[..16]);
+            CompositionId(uuid::Uuid::from_bytes(bytes))
+        } else {
+            // Defensive fallback — server should always return a
+            // 32-byte handle, but if it doesn't, parse the filename.
+            CompositionId(
+                uuid::Uuid::parse_str(&filename).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+            )
+        };
 
         Ok(WriteResponse {
             composition_id,

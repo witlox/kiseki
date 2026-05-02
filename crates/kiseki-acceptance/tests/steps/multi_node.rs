@@ -19,11 +19,16 @@ use crate::KisekiWorld;
 const ONE_MEBIBYTE: usize = 1024 * 1024;
 
 fn megabyte_payload() -> Vec<u8> {
-    // Pseudo-random but deterministic — rolling-hash friendly so a
-    // partial-replication bug shows up as a body-mismatch on GET, not
-    // as a length-only mismatch.
+    // Per-scenario random seed — content-addressed chunk IDs depend on
+    // the payload, and a deterministic payload would alias every
+    // scenario to the same chunk. Earlier we saw this surface as
+    // "refcount on new leader is 0" when the GC scenario tombstoned
+    // the shared chunk before the leader-change scenario ran.
+    let seed_uuid = uuid::Uuid::new_v4();
+    let seed_bytes = seed_uuid.as_bytes();
+    let mut x: u32 = u32::from_le_bytes([seed_bytes[0], seed_bytes[1], seed_bytes[2], seed_bytes[3]])
+        .wrapping_add(0x9E37_79B9);
     let mut buf = Vec::with_capacity(ONE_MEBIBYTE);
-    let mut x: u32 = 0x9E37_79B9; // golden ratio constant
     for _ in 0..ONE_MEBIBYTE {
         x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
         buf.push((x >> 16) as u8);
@@ -750,46 +755,57 @@ async fn then_refcount_drops_to_zero(w: &mut KisekiWorld, secs: u64) {
     panic!("refcount did not drop to 0 within {secs}s for chunks of composition {etag}",);
 }
 
-#[then("eventually every chunk is gone from every node's local store")]
-async fn then_every_chunk_gone(w: &mut KisekiWorld) {
+#[then("every chunk is tombstoned in the cluster state on every node")]
+async fn then_every_chunk_tombstoned(w: &mut KisekiWorld) {
     let etag = w.cluster.last_etag.clone().expect("etag missing");
     let guard = cluster(w);
     let chunks = composition_chunks_any_node(&guard, &etag).await;
     if chunks.is_empty() {
-        // Composition entirely gone from every reachable view —
-        // implicitly proves chunk-state was cleaned up. We can't
-        // probe per-fragment without chunk_ids in hand.
+        // The composition was already evicted from every node's
+        // CompositionStore — chunk_ids are unrecoverable from this
+        // step, but the bookkeeping invariant is satisfied (no live
+        // reference to any chunk).
         return;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    // cluster_chunk_state is Raft-replicated, so every voter has the
+    // tombstoned bit shortly after the Delete delta commits. Local
+    // fragment removal runs on the orphan-fragment scrub cadence
+    // (10 min per shard), which is too slow for BDD — the scenario
+    // asserts the bookkeeping that GUARANTEES the scrub will clean
+    // up, not the scrub itself.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let mut all_gone = true;
+        let mut all_tombstoned = true;
+        let mut last_seen: Option<(u64, String, serde_json::Value)> = None;
         for chunk_id_hex in &chunks {
             for n in guard.nodes() {
                 let info = inspect_chunk(n, chunk_id_hex).await;
-                let has_chunk = info
-                    .get("has_chunk_local")
+                let cluster_state = info.get("cluster_state");
+                let tombstoned = cluster_state
+                    .and_then(|v| v.get("tombstoned"))
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let frag_count = info
-                    .get("fragments_local")
-                    .and_then(|v| v.as_array())
-                    .map(Vec::len)
-                    .unwrap_or(0);
-                if has_chunk || frag_count > 0 {
-                    all_gone = false;
+                if !tombstoned {
+                    all_tombstoned = false;
+                    last_seen = Some((
+                        n.node_id,
+                        chunk_id_hex.clone(),
+                        cluster_state.cloned().unwrap_or(serde_json::Value::Null),
+                    ));
                     break;
                 }
             }
-            if !all_gone {
+            if !all_tombstoned {
                 break;
             }
         }
-        if all_gone {
+        if all_tombstoned {
             return;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("local fragments not removed from every node within 60s");
+            panic!(
+                "cluster_chunk_state not tombstoned on every node within 30s — last={last_seen:?}",
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }

@@ -185,11 +185,12 @@ Defer entirely until either:
 
 1. **I1** Python e2e dedup — fast win, reduces test drift  *(done 5225146)*
 2. **I2** NFSv3 @integration scenarios — closes a known coverage gap
-   *(NULL scenario landed b812e88; 3 roundtrip scenarios deferred — see I5)*
-3. **I4** Pre-existing flake fixes  *(done — election-must-not-be-isolated-node
-   + drain-orchestrator-bookkeeping)*
-4. **I5** NFSv3 CREATE+WRITE binding — surfaced by I2, prerequisite for the
-   3 deferred roundtrip scenarios
+   *(NULL scenario landed b812e88; 3 roundtrip scenarios re-enabled by I5)*
+3. **I4** Pre-existing flake fixes  *(done 297a19b — election-must-not-be-
+   isolated-node + drain-orchestrator-bookkeeping)*
+4. **I5** NFSv3 CREATE+WRITE binding  *(done — mirrored NFSv4
+   buffer/flush in nfs3_server.rs + LOOKUP-after-WRITE in Nfs3Client;
+   3 deferred roundtrip scenarios + cross-protocol scenario now green)*
 5. **I3** GCP perf re-run — captures a baseline number
 6. **F1** Follower → leader S3 forwarding — diamond, one ADR
 7. **C1** mTLS fixture — likely diamond

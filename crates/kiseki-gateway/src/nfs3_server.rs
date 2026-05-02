@@ -142,7 +142,7 @@ fn dispatch_nfs3<G: GatewayOps>(
         proc::PATHCONF => reply_pathconf(header.xid, reader, ctx),
         proc::FSSTAT => reply_fsstat(header.xid, ctx),
         proc::FSINFO => reply_fsinfo(header.xid, ctx),
-        proc::COMMIT => reply_commit(header.xid),
+        proc::COMMIT => reply_commit(header.xid, reader, ctx),
         _ => {
             // Unsupported procedure — reply PROC_UNAVAIL.
             let mut w = XdrWriter::new();
@@ -269,33 +269,50 @@ fn reply_write<G: GatewayOps>(
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
-    let _fh = reader.read_opaque().unwrap_or_default();
+    let fh_bytes = reader.read_opaque().unwrap_or_default();
     let offset = reader.read_u64().unwrap_or(0);
     let _count = reader.read_u32().unwrap_or(0);
-    let _stable = reader.read_u32().unwrap_or(0); // FILE_SYNC=2
+    let stable = reader.read_u32().unwrap_or(0); // 0=UNSTABLE, 1=DATA_SYNC, 2=FILE_SYNC
     let data = reader.read_opaque().unwrap_or_default();
 
-    // Kiseki compositions are immutable — writes at nonzero offsets are not
-    // supported. Return NFS3ERR_IO for append/modify; offset 0 creates new.
-    if offset != 0 {
+    let Ok(fh) = <[u8; 32]>::try_from(fh_bytes.as_slice()) else {
+        w.write_u32(status::NFS3ERR_BADHANDLE);
+        return w.into_bytes();
+    };
+
+    // RFC 1813 §2.6 + §3.3.7: the supplied file handle MUST be one
+    // we issued (CREATE returned it). Reject unknown handles before
+    // touching any data path.
+    if ctx.handles.lookup(&fh).is_none() {
+        w.write_u32(status::NFS3ERR_BADHANDLE);
+        return w.into_bytes();
+    }
+
+    let count = u32::try_from(data.len()).unwrap_or(u32::MAX);
+
+    // Mirror the NFSv4 path (Phase 14e fix 40cac2b): buffer the write
+    // per-handle and flush on COMMIT (or immediately on stable >=
+    // DATA_SYNC). Prior code called ctx.write(data) which created a
+    // *fresh* composition and discarded the supplied handle, so
+    // CREATE → WRITE → LOOKUP → READ returned 0 bytes from the
+    // empty composition CREATE allocated.
+    ctx.buffer_write(&fh, offset, &data);
+
+    // FILE_SYNC (2) and DATA_SYNC (1) require the data to be on
+    // stable storage before we ack. UNSTABLE (0) allows lazy flush
+    // on COMMIT — we still buffer the data either way.
+    if stable >= 1 && ctx.flush_writes(&fh).is_err() {
         w.write_u32(status::NFS3ERR_IO);
         return w.into_bytes();
     }
 
-    match ctx.write(data) {
-        Ok((_new_fh, resp)) => {
-            w.write_u32(status::NFS3_OK);
-            // wcc_data (before + after attributes, both absent)
-            w.write_bool(false); // pre-op
-            w.write_bool(false); // post-op
-            w.write_u32(resp.count); // count
-            w.write_u32(2); // committed = FILE_SYNC
-            w.write_opaque_fixed(&[0u8; 8]); // write verifier
-        }
-        Err(_) => {
-            w.write_u32(status::NFS3ERR_IO);
-        }
-    }
+    w.write_u32(status::NFS3_OK);
+    // wcc_data (before + after attributes, both absent)
+    w.write_bool(false); // pre-op
+    w.write_bool(false); // post-op
+    w.write_u32(count);
+    w.write_u32(stable);
+    w.write_opaque_fixed(&[0u8; 8]); // write verifier
 
     w.into_bytes()
 }
@@ -902,14 +919,39 @@ fn reply_pathconf<G: GatewayOps>(
 }
 
 /// COMMIT flushes pending writes to stable storage.
-fn reply_commit(xid: u32) -> Vec<u8> {
+fn reply_commit<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
-    w.write_u32(status::NFS3_OK);
-    w.write_bool(false); // pre wcc
-    w.write_bool(false); // post wcc
-    w.write_opaque_fixed(&[0u8; 8]); // write verifier
+    let fh_bytes = reader.read_opaque().unwrap_or_default();
+    let _offset = reader.read_u64().unwrap_or(0);
+    let _count = reader.read_u32().unwrap_or(0);
+
+    let Ok(fh) = <[u8; 32]>::try_from(fh_bytes.as_slice()) else {
+        w.write_u32(status::NFS3ERR_BADHANDLE);
+        return w.into_bytes();
+    };
+
+    // Flush any UNSTABLE writes buffered for this handle. `flush_writes`
+    // returns `Ok(None)` if nothing was buffered — that's a fast path,
+    // not an error.
+    match ctx.flush_writes(&fh) {
+        Ok(_) => {
+            w.write_u32(status::NFS3_OK);
+            w.write_bool(false); // pre wcc
+            w.write_bool(false); // post wcc
+            w.write_opaque_fixed(&[0u8; 8]); // write verifier
+        }
+        Err(_) => {
+            w.write_u32(status::NFS3ERR_IO);
+            w.write_bool(false);
+            w.write_bool(false);
+        }
+    }
 
     w.into_bytes()
 }
@@ -1059,29 +1101,30 @@ mod tests {
             r.read_u32().unwrap();
         }
         let nfs_status = r.read_u32().unwrap();
-        // The handler reads fh as default (empty) which becomes data,
-        // offset=0 is fine but the write creates a new composition.
-        // Actually, reply_write does unwrap_or_default on read_opaque,
-        // so a short handle won't produce BADHANDLE. Let's verify
-        // what actually happens: offset 0 + ctx.write(data) should work
-        // OR fail with IO. The scenario says "invalid handle" but the
-        // NFS3 WRITE handler doesn't validate handle length. The status
-        // depends on whether the write succeeds with empty fh.
-        // For a truly invalid (unregistered) 32-byte handle:
-        assert!(
-            nfs_status == status::NFS3_OK || nfs_status == status::NFS3ERR_IO,
-            "short handle write should not panic"
+        // RFC 1813 §2.6: any non-32-byte handle is malformed → BADHANDLE.
+        assert_eq!(
+            nfs_status,
+            status::NFS3ERR_BADHANDLE,
+            "short handle should be rejected with NFS3ERR_BADHANDLE",
         );
     }
 
     #[test]
-    fn write_unregistered_handle_at_nonzero_offset_returns_io_error() {
+    fn write_unregistered_handle_returns_badhandle() {
+        // Used to be `..._at_nonzero_offset_returns_io_error` — the old
+        // contract rejected nonzero offsets unconditionally because
+        // compositions were treated as immutable. After the
+        // CREATE→WRITE binding fix (mirrors NFSv4 buffer/flush), nonzero
+        // offsets are buffered and applied on COMMIT (or immediately
+        // under FILE_SYNC). The remaining wire-format invariant is
+        // simpler: an unregistered 32-byte handle must surface as
+        // NFS3ERR_BADHANDLE regardless of offset.
         let ctx = test_ctx();
         let header = make_header(proc::WRITE);
         let mut body = XdrWriter::new();
         // 32-byte handle that's not registered.
         body.write_opaque(&[0xBBu8; 32]);
-        body.write_u64(100); // nonzero offset
+        body.write_u64(100); // nonzero offset — should not influence status
         body.write_u32(3);
         body.write_u32(2);
         body.write_opaque(b"bad");
@@ -1096,8 +1139,8 @@ mod tests {
         let nfs_status = r.read_u32().unwrap();
         assert_eq!(
             nfs_status,
-            status::NFS3ERR_IO,
-            "nonzero offset write should return NFS3ERR_IO"
+            status::NFS3ERR_BADHANDLE,
+            "unregistered handle must return NFS3ERR_BADHANDLE",
         );
     }
 

@@ -125,13 +125,18 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And `kiseki_fabric_ops_total{op="get",peer="node-1",outcome="ok"}` increments
 
   @integration @multi-node @cross-node
-  Scenario: GC removes chunk from every node when refcount drops to 0 (I-C2)
+  Scenario: GC marks chunks tombstoned on every node when refcount drops to 0 (I-C2)
     Given a 3-node kiseki cluster
     When a client writes 1MB via S3 PUT to node-1
     And every follower has received the fragment
     And the composition is deleted via S3 DELETE on node-1
     Then within 30 seconds every chunk's refcount on the leader drops to 0
-    And eventually every chunk is gone from every node's local store
+    And every chunk is tombstoned in the cluster state on every node
+    # Local fragment deletion is on the orphan-fragment scrub
+    # cadence (10 min per shard) — too slow for BDD. The tombstone
+    # invariant is what guarantees the scrub will eventually clean
+    # up; the periodic e2e perf cluster catches any stuck-fragment
+    # regressions in real time.
 
   # --- Multi-node integration (requires multi-server harness) ---
 
