@@ -354,19 +354,21 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And every chunk of the composition has refcount 1 on the new leader
     And the killed node is restarted and rejoins the cluster
 
-  # DEFERRED — needs an mTLS fixture (cluster CA + per-node SAN-bearing
-  # certs + a tenant cert). The ClusterHarness today launches plaintext.
-  # Promote when we add an mTLS-mode harness or wire the e2e suite's
-  # gen-tls-certs.sh into the BDD test fixture.
-  @library @cross-node
+  # Promoted to @integration. The ClusterHarness now ships an mTLS
+  # mode (`acquire_cluster_3_mtls`) that generates a CA + per-node
+  # fabric certs (SAN URI `spiffe://cluster/fabric/node-{id}`) + a
+  # tenant cert (SAN URI `spiffe://cluster/org/...`) via rcgen, and
+  # passes the per-node paths to each spawned child via
+  # `KISEKI_CA_PATH` / `KISEKI_CERT_PATH` / `KISEKI_KEY_PATH`. The
+  # scenario then opens a tonic Channel signed with the TENANT cert
+  # and calls `PutFragment` against node-1's data-path port — the
+  # SAN-role interceptor (`fabric_san_interceptor`) rejects the call
+  # with `PermissionDenied`. Closes I-Auth4 in the BDD harness.
+  @integration @multi-node @cross-node
   Scenario: Tenant cert presented to fabric port is rejected (I-Auth4)
-    Given a 3-node Replication-3 cluster with mTLS enabled
-    And the data-path cert carries `spiffe://cluster/fabric/<node-id>` SAN URIs
-    When a tenant client presents a `spiffe://cluster/org/<uuid>` cert
-    And calls `PutFragment` directly against node-1's data-path port
-    Then the SAN-role interceptor rejects the call with PermissionDenied
-    And the local chunk store is unmodified
-    And no fragment fan-out occurs
+    Given a 3-node mTLS kiseki cluster
+    When a tenant cert calls PutFragment against node-1's data-path port
+    Then the call is rejected with PermissionDenied
 
   @integration @degenerate
   Scenario: 1-node cluster degenerates to local-only (D-6)

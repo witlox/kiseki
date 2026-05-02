@@ -1613,6 +1613,7 @@ dependencies = [
  "kiseki-view",
  "libc",
  "prost",
+ "rcgen",
  "reqwest",
  "serde_json",
  "tempfile",

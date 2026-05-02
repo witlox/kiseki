@@ -43,6 +43,10 @@ kiseki-backup = { workspace = true }
 kiseki-raft = { workspace = true }
 tempfile = "3"
 axum = "0.8"
+# Cert generation for the @mtls cluster harness mode (multi-node-raft
+# "tenant cert is rejected at fabric port" scenario). Same version as
+# the transport crate's tls_handshake test.
+rcgen = "0.14"
 
 # BDD framework
 cucumber = { workspace = true }

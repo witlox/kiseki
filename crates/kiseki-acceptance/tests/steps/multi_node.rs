@@ -11,7 +11,7 @@
 use cucumber::{given, then, when};
 
 use crate::steps::cluster_harness::{
-    acquire_cluster, acquire_cluster_20, acquire_cluster_6, NodeHandle,
+    acquire_cluster, acquire_cluster_20, acquire_cluster_3_mtls, acquire_cluster_6, NodeHandle,
 };
 use crate::KisekiWorld;
 
@@ -1510,6 +1510,104 @@ async fn when_drop_local_fragment(w: &mut KisekiWorld, node_id: u64) {
     // at least 1 fabric GetFragment` assertion measures only the
     // upcoming read's fan-out.
     snapshot_fabric_get_baselines(w).await;
+}
+
+// ---------------------------------------------------------------------------
+// mTLS scenario — "Tenant cert presented to fabric port is rejected"
+// (I-Auth4). Acquires the dedicated mtls cluster singleton (separate
+// from the plaintext 3-node singleton so both can coexist), then
+// builds a tonic channel signed with the tenant cert and asserts
+// the SAN-role interceptor rejects with PermissionDenied.
+// ---------------------------------------------------------------------------
+
+#[given("a 3-node mTLS kiseki cluster")]
+async fn given_3_node_mtls_cluster(w: &mut KisekiWorld) {
+    let cluster_arc = acquire_cluster_3_mtls()
+        .await
+        .expect("failed to start 3-node mTLS cluster");
+    let guard = cluster_arc.lock_owned().await;
+    let leader = guard.leader_id().await;
+    assert!(
+        leader.is_some(),
+        "3-node mTLS cluster has no elected leader",
+    );
+    w.cluster.cluster_guard = Some(guard);
+    w.cluster.bucket = Some("default".to_owned());
+    w.cluster.key = Some(unique_key());
+    snapshot_quorum_lost_baseline(w).await;
+}
+
+#[when("a tenant cert calls PutFragment against node-1's data-path port")]
+async fn when_tenant_cert_put_fragment(w: &mut KisekiWorld) {
+    use kiseki_proto::v1 as pb;
+    use kiseki_proto::v1::cluster_chunk_service_client::ClusterChunkServiceClient;
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+    let guard = cluster(w);
+    let certs = guard
+        .mtls_certs()
+        .expect("mTLS cluster must have certs (use `Given a 3-node mTLS kiseki cluster`)");
+    let ca_pem = std::fs::read(certs.ca_path()).expect("read CA");
+    let tenant_cert_pem = std::fs::read(certs.tenant_cert_path()).expect("read tenant cert");
+    let tenant_key_pem = std::fs::read(certs.tenant_key_path()).expect("read tenant key");
+
+    let node = guard.node(1);
+    let port = node.ports.grpc_data;
+    // The cluster's per-node fabric cert lists `localhost` as a
+    // DNS SAN; matching domain_name keeps the TLS handshake itself
+    // valid so the rejection happens on the SAN-role interceptor
+    // (the property we want), not on the TLS layer.
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(&ca_pem))
+        .identity(Identity::from_pem(&tenant_cert_pem, &tenant_key_pem))
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://localhost:{port}"))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("tls config");
+    let channel = endpoint
+        .connect()
+        .await
+        .expect("tenant cert TLS handshake must succeed (rejection happens at SAN check)");
+    let mut client = ClusterChunkServiceClient::new(channel);
+    let req = pb::PutFragmentRequest {
+        chunk_id: Some(pb::ChunkId {
+            value: vec![0x42u8; 32],
+        }),
+        fragment_index: 0,
+        tenant_id: Some(pb::OrgId {
+            value: "00000000-0000-0000-0000-000000000042".into(),
+        }),
+        pool_id: Some(pb::AffinityPoolId {
+            value: b"default".to_vec(),
+        }),
+        envelope: Some(pb::Envelope {
+            chunk_id: Some(pb::ChunkId {
+                value: vec![0x42u8; 32],
+            }),
+            ciphertext: vec![0u8; 16],
+            auth_tag: vec![0u8; 16],
+            nonce: vec![0u8; 12],
+            algorithm: pb::EncryptionAlgorithm::Aes256Gcm as i32,
+            system_epoch: Some(pb::KeyEpoch { value: 1 }),
+            tenant_epoch: None,
+            tenant_wrapped_material: vec![],
+        }),
+        leader_ts: None,
+    };
+    let result = client.put_fragment(tonic::Request::new(req)).await;
+    let status = match result {
+        Ok(_) => panic!(
+            "tenant-cert PutFragment unexpectedly succeeded — SAN-role interceptor is missing or off",
+        ),
+        Err(s) => s,
+    };
+    // Stash a string the existing `the call is rejected with
+    // PermissionDenied` step (cluster.rs::then_permission_denied)
+    // can match against — it does a substring contains-check on
+    // `w.last_error`. Use the tonic Code's Debug name so the
+    // assertion is precise about the code, not just any error.
+    w.last_error = Some(format!("{:?}: {}", status.code(), status.message()));
 }
 
 async fn set_node_fabric_deny(w: &mut KisekiWorld, node_id: u64, deny: bool) {

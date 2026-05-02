@@ -24,6 +24,7 @@ pub mod harness;
 pub mod helpers;
 pub mod kms;
 pub mod log;
+pub mod mtls_certs;
 pub mod multi_node;
 pub mod nfs_integration;
 pub mod operational;

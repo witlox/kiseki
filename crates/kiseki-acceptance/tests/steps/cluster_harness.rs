@@ -101,6 +101,13 @@ pub struct ClusterHarness {
     fabric_peers_env: String,
     /// Path to the `kiseki-server` binary — resolved once.
     binary: PathBuf,
+    /// Optional mTLS material. When `Some`, each spawned child gets
+    /// `KISEKI_CA_PATH` / `KISEKI_CERT_PATH` / `KISEKI_KEY_PATH` set
+    /// to per-node paths so the data-path gRPC server uses TLS and
+    /// the SAN-role interceptor is wired. The harness keeps the
+    /// `MtlsCerts` (and its `TempDir`) alive for the cluster's
+    /// lifetime so the cert files survive every spawn / restart.
+    mtls_certs: Option<Arc<crate::steps::mtls_certs::MtlsCerts>>,
 }
 
 impl ClusterHarness {
@@ -109,6 +116,32 @@ impl ClusterHarness {
     /// same non-zero `leader_id` (30s deadline) — i.e. an election
     /// has converged.
     pub async fn start(node_count: u64) -> Result<Self, String> {
+        Self::start_inner(node_count, None).await
+    }
+
+    /// Variant that wires mTLS for the data-path / fabric layer.
+    /// Generates a CA + per-node fabric certs (with
+    /// `spiffe://cluster/fabric/node-{id}` SAN URIs) + a tenant cert
+    /// (with `spiffe://cluster/org/...` SAN URI). Used by the
+    /// "Tenant cert presented to fabric port is rejected" scenario.
+    pub async fn start_mtls(node_count: u64) -> Result<Self, String> {
+        let node_ids: Vec<u64> = (1..=node_count).collect();
+        let certs = Arc::new(crate::steps::mtls_certs::MtlsCerts::generate(&node_ids));
+        Self::start_inner(node_count, Some(certs)).await
+    }
+
+    /// Borrow the harness's mTLS certs (if any). The negative
+    /// "tenant cert rejected" step uses this to construct a tonic
+    /// Channel signed with the TENANT cert.
+    #[must_use]
+    pub fn mtls_certs(&self) -> Option<&crate::steps::mtls_certs::MtlsCerts> {
+        self.mtls_certs.as_deref()
+    }
+
+    async fn start_inner(
+        node_count: u64,
+        mtls_certs: Option<Arc<crate::steps::mtls_certs::MtlsCerts>>,
+    ) -> Result<Self, String> {
         let binary = find_server_binary()?;
 
         // Reserve all ports up-front and HOLD the listeners for every
@@ -169,6 +202,7 @@ impl ClusterHarness {
             &raft_peers_env,
             &fabric_peers_env,
             true,
+            mtls_certs.as_deref(),
         )?;
         wait_for_admin(&n1, Duration::from_secs(60)).await?;
         nodes.insert(1, n1);
@@ -185,6 +219,7 @@ impl ClusterHarness {
                 &raft_peers_env,
                 &fabric_peers_env,
                 false,
+                mtls_certs.as_deref(),
             )?;
             wait_for_admin(&node, Duration::from_secs(60)).await?;
             nodes.insert(id, node);
@@ -195,6 +230,7 @@ impl ClusterHarness {
             raft_peers_env,
             fabric_peers_env,
             binary,
+            mtls_certs,
         };
         cluster
             .wait_for_quorum(Duration::from_secs(30))
@@ -272,6 +308,7 @@ impl ClusterHarness {
             &self.fabric_peers_env,
             false,
             node.data_dir.path(),
+            self.mtls_certs.as_deref(),
         )?;
         // Replace in place — Drop on the old Child has already run via
         // `kill`+`wait` above; we just need to swap the field.
@@ -347,6 +384,24 @@ pub async fn acquire_cluster_6() -> Result<Arc<Mutex<ClusterHarness>>, String> {
         .cloned()
 }
 
+static CLUSTER_3_MTLS: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
+
+/// Acquire the shared 3-node cluster handle in mTLS mode. Used by
+/// the multi-node-raft "Tenant cert presented to fabric port is
+/// rejected" scenario. Distinct singleton from the plaintext
+/// 3-node cluster so mTLS-mode and plaintext-mode scenarios can
+/// coexist within one test binary.
+pub async fn acquire_cluster_3_mtls() -> Result<Arc<Mutex<ClusterHarness>>, String> {
+    CLUSTER_3_MTLS
+        .get_or_try_init(|| async {
+            ClusterHarness::start_mtls(NODE_COUNT_3)
+                .await
+                .map(|c| Arc::new(Mutex::new(c)))
+        })
+        .await
+        .cloned()
+}
+
 static CLUSTER_20: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
 
 /// Acquire the shared 20-node cluster handle. Same EC 4+2 strategy
@@ -375,6 +430,7 @@ fn spawn_node(
     raft_peers_env: &str,
     fabric_peers_env: &str,
     bootstrap: bool,
+    mtls_certs: Option<&crate::steps::mtls_certs::MtlsCerts>,
 ) -> Result<NodeHandle, String> {
     let data_dir = tempfile::tempdir().map_err(|e| format!("tempdir for node-{node_id}: {e}"))?;
     let child = spawn_with_env(
@@ -385,6 +441,7 @@ fn spawn_node(
         fabric_peers_env,
         bootstrap,
         data_dir.path(),
+        mtls_certs,
     )?;
     Ok(NodeHandle {
         node_id,
@@ -404,6 +461,7 @@ fn spawn_with_env(
     fabric_peers_env: &str,
     bootstrap: bool,
     data_dir: &Path,
+    mtls_certs: Option<&crate::steps::mtls_certs::MtlsCerts>,
 ) -> Result<Child, String> {
     let mut cmd = Command::new(binary);
     cmd.env_clear()
@@ -430,7 +488,14 @@ fn spawn_with_env(
         // slow-down, fabric deny-incoming) on the spawned server.
         // Only set in the BDD harness — production deployments leave
         // it unset, so the test endpoints respond 403.
-        .env("KISEKI_ENABLE_TEST_KNOBS", "1")
+        .env("KISEKI_ENABLE_TEST_KNOBS", "1");
+    if let Some(certs) = mtls_certs {
+        let node = certs.node(node_id);
+        cmd.env("KISEKI_CA_PATH", &node.ca)
+            .env("KISEKI_CERT_PATH", &node.cert)
+            .env("KISEKI_KEY_PATH", &node.key);
+    }
+    cmd
         .env(
             "RUST_LOG",
             std::env::var("KISEKI_HARNESS_RUST_LOG").unwrap_or_else(|_| "warn".to_owned()),
