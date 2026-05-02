@@ -6,6 +6,7 @@
 
 # Rust
 /target/
+/target-rocky9/
 **/*.rs.bk
 # Cargo.lock is committed — workspace contains binaries (kiseki-server, kiseki-keyserver, kiseki-client-fuse).
 

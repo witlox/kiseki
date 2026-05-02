@@ -25,7 +25,7 @@ use kiseki_proto::v1::cluster_chunk_service_server::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::auth::{verify_fabric_san, FabricAuthError};
+use crate::auth::{FabricAuthError, verify_fabric_san};
 
 /// gRPC handler wrapping a *local* async chunk store.
 pub struct ClusterChunkServer {
@@ -44,11 +44,63 @@ pub struct ClusterChunkServer {
     /// times is idempotent. Discovered 2026-05-02 — without this, a
     /// 6-node EC 4+2 read returns "AEAD authentication failed" even
     /// though every fragment fetch succeeds.
-    chunk_envelope_meta: std::sync::Mutex<std::collections::HashMap<RustChunkId, EnvelopeMeta>>,
+    ///
+    /// The map is wrapped in an `Arc` so the leader's client-side
+    /// (`ClusteredChunkStore`) can deposit crypto for chunks it
+    /// wrote locally without going through the `PutFragment` RPC.
+    /// See `record_local_envelope_crypto` and the GCP 2026-05-02
+    /// "1 of 6 readers fails AEAD" finding.
+    chunk_envelope_meta: ChunkEnvelopeRegistry,
+}
+
+/// Shared handle to the per-chunk envelope crypto side table. Cloning
+/// this is cheap (single `Arc` bump). Hand the same registry to the
+/// `ClusterChunkServer` (server side, populated by `PutFragment`) and
+/// to the `ClusteredChunkStore` (client side, populated by the leader's
+/// own local-write path) so reads always see consistent crypto fields
+/// regardless of which node wrote the fragment.
+#[derive(Clone, Default)]
+pub struct ChunkEnvelopeRegistry {
+    inner: Arc<std::sync::Mutex<std::collections::HashMap<RustChunkId, EnvelopeMeta>>>,
+}
+
+impl ChunkEnvelopeRegistry {
+    /// Insert envelope crypto for `chunk_id` if not already present.
+    /// First write wins — every fragment of the same chunk carries
+    /// identical crypto, so re-recording is a no-op.
+    pub fn record(
+        &self,
+        chunk_id: RustChunkId,
+        auth_tag: [u8; 16],
+        nonce: [u8; 12],
+        system_epoch: kiseki_common::tenancy::KeyEpoch,
+        tenant_epoch: Option<kiseki_common::tenancy::KeyEpoch>,
+        tenant_wrapped_material: Option<Vec<u8>>,
+    ) {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(chunk_id).or_insert(EnvelopeMeta {
+            auth_tag,
+            nonce,
+            system_epoch,
+            tenant_epoch,
+            tenant_wrapped_material,
+        });
+    }
+
+    fn lookup(&self, chunk_id: &RustChunkId) -> Option<EnvelopeMeta> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(chunk_id)
+            .cloned()
+    }
 }
 
 #[derive(Clone)]
-struct EnvelopeMeta {
+pub(crate) struct EnvelopeMeta {
     auth_tag: [u8; 16],
     nonce: [u8; 12],
     system_epoch: kiseki_common::tenancy::KeyEpoch,
@@ -57,14 +109,40 @@ struct EnvelopeMeta {
 }
 
 impl ClusterChunkServer {
-    /// Build a server delegating to `local`.
+    /// Build a server delegating to `local`. Allocates a private
+    /// envelope registry; for the production wiring where the leader's
+    /// client-side needs to deposit crypto for its own local writes,
+    /// use `with_envelope_registry` and pass the same handle to
+    /// `ClusteredChunkStore::with_envelope_registry`.
     #[must_use]
     pub fn new(local: Arc<dyn AsyncChunkOps>, default_pool: impl Into<String>) -> Self {
+        Self::with_envelope_registry(local, default_pool, ChunkEnvelopeRegistry::default())
+    }
+
+    /// Build a server with an externally-supplied envelope registry.
+    /// Cloning the same `ChunkEnvelopeRegistry` and handing it to the
+    /// leader's `ClusteredChunkStore` is what makes the leader's
+    /// own local-fragment writes visible to peers fetching via this
+    /// server (closing the GCP 2026-05-02 zero-crypto gap).
+    #[must_use]
+    pub fn with_envelope_registry(
+        local: Arc<dyn AsyncChunkOps>,
+        default_pool: impl Into<String>,
+        registry: ChunkEnvelopeRegistry,
+    ) -> Self {
         Self {
             local,
             default_pool: default_pool.into(),
-            chunk_envelope_meta: std::sync::Mutex::new(std::collections::HashMap::new()),
+            chunk_envelope_meta: registry,
         }
+    }
+
+    /// Borrow the envelope registry — typically to clone it and hand
+    /// the clone to a `ClusteredChunkStore` so the leader records
+    /// crypto for its own local fragment writes here.
+    #[must_use]
+    pub fn envelope_registry(&self) -> ChunkEnvelopeRegistry {
+        self.chunk_envelope_meta.clone()
     }
 
     /// Wrap into a tonic server ready to be added to a `Router`.
@@ -76,6 +154,37 @@ impl ClusterChunkServer {
             .max_decoding_message_size(crate::peer::FABRIC_MAX_MESSAGE_BYTES)
     }
 
+    /// Deposit chunk-level crypto fields for a chunk this node is
+    /// going to (or just did) write a local fragment for. The leader
+    /// of an EC write fans out `PutFragment` RPCs to peers — those
+    /// RPCs naturally populate the registry on each peer's server.
+    /// The leader's OWN fragment goes directly to the local store via
+    /// `local.write_fragment`, bypassing the RPC. Without this method,
+    /// the registry stays empty for chunks the leader wrote, and any
+    /// peer that later fetches the leader's fragment via `get_fragment`
+    /// receives an envelope with ZERO `auth_tag` / `nonce` / epochs.
+    /// Readers that capture crypto from that response then fail
+    /// AES-GCM verify with "AEAD authentication failed" — the GCP
+    /// 2026-05-02 finding.
+    pub fn record_local_envelope_crypto(
+        &self,
+        chunk_id: RustChunkId,
+        auth_tag: [u8; 16],
+        nonce: [u8; 12],
+        system_epoch: kiseki_common::tenancy::KeyEpoch,
+        tenant_epoch: Option<kiseki_common::tenancy::KeyEpoch>,
+        tenant_wrapped_material: Option<Vec<u8>>,
+    ) {
+        self.chunk_envelope_meta.record(
+            chunk_id,
+            auth_tag,
+            nonce,
+            system_epoch,
+            tenant_epoch,
+            tenant_wrapped_material,
+        );
+    }
+
     /// Build an `Envelope` for a fragment-shard read by combining the
     /// raw shard bytes with the chunk-level crypto fields the server
     /// captured on the corresponding `PutFragment`. Falls back to a
@@ -85,12 +194,7 @@ impl ClusterChunkServer {
     /// validation on the caller will fail loudly, which is the right
     /// signal.
     fn envelope_from_bytes(&self, chunk_id: RustChunkId, bytes: Vec<u8>) -> RustEnvelope {
-        let meta = self
-            .chunk_envelope_meta
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&chunk_id)
-            .cloned();
+        let meta = self.chunk_envelope_meta.lookup(&chunk_id);
         if let Some(m) = meta {
             RustEnvelope {
                 chunk_id,
@@ -164,19 +268,14 @@ impl ClusterChunkService for ClusterChunkServer {
         // into the storage path. Idempotent across fragments — every
         // fragment of the same chunk carries identical metadata.
         let chunk_id = envelope.chunk_id;
-        {
-            let mut meta = self
-                .chunk_envelope_meta
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            meta.entry(chunk_id).or_insert_with(|| EnvelopeMeta {
-                auth_tag: envelope.auth_tag,
-                nonce: envelope.nonce,
-                system_epoch: envelope.system_epoch,
-                tenant_epoch: envelope.tenant_epoch,
-                tenant_wrapped_material: envelope.tenant_wrapped_material.clone(),
-            });
-        }
+        self.chunk_envelope_meta.record(
+            chunk_id,
+            envelope.auth_tag,
+            envelope.nonce,
+            envelope.system_epoch,
+            envelope.tenant_epoch,
+            envelope.tenant_wrapped_material.clone(),
+        );
 
         // Phase 16d step 2: route by fragment_index. index=0 keeps
         // the legacy whole-envelope path (Replication-N + dedup).
@@ -465,9 +564,9 @@ fn chunk_err_to_status(e: &ChunkError) -> Status {
 mod tests {
     use std::sync::Arc;
 
+    use kiseki_chunk::SyncBridge;
     use kiseki_chunk::pool::{AffinityPool, DeviceClass, DurabilityStrategy};
     use kiseki_chunk::store::ChunkStore;
-    use kiseki_chunk::SyncBridge;
     use kiseki_common::ids::ChunkId;
     use kiseki_common::tenancy::KeyEpoch;
     use kiseki_crypto::envelope::Envelope;
@@ -699,5 +798,217 @@ mod tests {
         // The bytes returned ARE the shard body — for the test
         // envelope the shard body equals the input ciphertext.
         assert_eq!(proto_env.ciphertext, env.ciphertext);
+    }
+
+    // In-process `FabricPeer` that records every put and serves
+    // gets from its own map. Distinct from the lib.rs `MockPeer`
+    // to keep the bug repro self-contained inside `server.rs`.
+    struct TestPeer {
+        name: &'static str,
+        store: std::sync::Mutex<std::collections::HashMap<(ChunkId, u32), Envelope>>,
+    }
+
+    impl TestPeer {
+        fn new(name: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                store: std::sync::Mutex::new(std::collections::HashMap::new()),
+            })
+        }
+    }
+
+    #[tonic::async_trait]
+    impl crate::FabricPeer for TestPeer {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn put_fragment(
+            &self,
+            chunk_id: ChunkId,
+            fragment_index: u32,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _pool_id: String,
+            envelope: Envelope,
+        ) -> Result<bool, crate::peer::FabricPeerError> {
+            self.store
+                .lock()
+                .unwrap()
+                .insert((chunk_id, fragment_index), envelope);
+            Ok(true)
+        }
+        async fn get_fragment(
+            &self,
+            chunk_id: ChunkId,
+            fragment_index: u32,
+        ) -> Result<Envelope, crate::peer::FabricPeerError> {
+            self.store
+                .lock()
+                .unwrap()
+                .get(&(chunk_id, fragment_index))
+                .cloned()
+                .ok_or(crate::peer::FabricPeerError::NotFound)
+        }
+        async fn delete_fragment(
+            &self,
+            _chunk_id: ChunkId,
+            _fragment_index: u32,
+            _tenant_id: kiseki_common::ids::OrgId,
+        ) -> Result<bool, crate::peer::FabricPeerError> {
+            Ok(false)
+        }
+        async fn has_fragment(
+            &self,
+            chunk_id: ChunkId,
+            fragment_index: u32,
+        ) -> Result<bool, crate::peer::FabricPeerError> {
+            Ok(self
+                .store
+                .lock()
+                .unwrap()
+                .contains_key(&(chunk_id, fragment_index)))
+        }
+    }
+
+    /// GCP 2026-05-02 regression: in a multi-node EC cluster the
+    /// leader writes its own fragment locally via the chunk store,
+    /// bypassing the server-side `put_fragment` RPC that would
+    /// otherwise capture chunk-level crypto fields (`auth_tag`,
+    /// `nonce`, epochs) into the server's envelope registry. When a
+    /// peer later asks the leader's server for that fragment via
+    /// `get_fragment`, the response carries ZERO crypto. The reader's
+    /// `read_chunk_ec` captures crypto from the first peer response;
+    /// if that response is the leader's, AES-GCM verify on the
+    /// reassembled ciphertext fails with "AEAD authentication failed"
+    /// even though every fragment fetch succeeded. Surfaced on the
+    /// GCP 6-node EC 4+2 perf cluster as exactly 1 of 6 readers
+    /// failing per chunk.
+    ///
+    /// This test drives the existing production-path APIs only: the
+    /// leader's `ClusteredChunkStore::write_chunk` performs the real
+    /// EC encode + local-fragment write, then a peer-side
+    /// `ClusterChunkServer::get_fragment` (the real RPC handler) runs
+    /// against the same local store. The bug manifests because the
+    /// two halves don't share the envelope registry — the fix wires
+    /// a shared `ChunkEnvelopeRegistry` handle into both.
+    #[tokio::test]
+    async fn leader_local_fragment_carries_crypto_through_get_fragment() {
+        use kiseki_chunk::AsyncChunkOps;
+
+        // 1. Shared local store — leader's client and leader's server
+        //    both wrap it. In production they're separate Arcs onto
+        //    the same `local_chunk_store` (see runtime.rs).
+        let local = local_bridge("p");
+
+        // 2. The shared crypto registry. The fix must wire this so a
+        //    leader-local `write_fragment` deposits crypto here too;
+        //    today, only the server-side `put_fragment` RPC writes
+        //    to it.
+        let registry = ChunkEnvelopeRegistry::default();
+        let server =
+            ClusterChunkServer::with_envelope_registry(Arc::clone(&local), "p", registry.clone());
+
+        // 3. The leader's client (`ClusteredChunkStore`). Configured
+        //    as `node-1` with one MockPeer (`node-2`) so EC 1+1
+        //    placement spans exactly two slots. The MockPeer is the
+        //    *receiver* of the leader's fan-out write — it has no
+        //    role in this test's read assertion.
+        let p2 = TestPeer::new("node-2");
+        let cfg = crate::ClusterCfg::new(kiseki_common::ids::OrgId(uuid::Uuid::nil()), "p")
+            .with_min_acks(1)
+            .with_self_node_id(1)
+            .with_cluster_nodes(vec![1, 2])
+            .with_ec_strategy(crate::ec::EcStrategy::Ec { data: 1, parity: 1 });
+        let client = crate::ClusteredChunkStore::new(
+            Arc::clone(&local),
+            vec![Arc::clone(&p2) as Arc<dyn crate::FabricPeer>],
+            cfg,
+        )
+        .with_envelope_registry(registry);
+
+        // 4. A real envelope with non-zero crypto. AES-GCM auth_tag is
+        //    16 bytes, nonce is 12 bytes; both must survive the
+        //    leader-local-write → peer-get_fragment round-trip.
+        let chunk_id = ChunkId([0xF1; 32]);
+        let envelope = Envelope {
+            chunk_id,
+            ciphertext: (0u8..64).collect(),
+            auth_tag: [0xAAu8; 16],
+            nonce: [0xBBu8; 12],
+            system_epoch: KeyEpoch(7),
+            tenant_epoch: Some(KeyEpoch(3)),
+            tenant_wrapped_material: Some(b"wrapped-key-bytes".to_vec()),
+        };
+
+        // 5. Production write path. write_chunk → write_chunk_ec →
+        //    for placement[i] == self_node_id, calls
+        //    `local.write_fragment` (no crypto captured); for the
+        //    other slot, fans out to `p2`.
+        client
+            .write_chunk(envelope.clone(), "p")
+            .await
+            .expect("leader write_chunk must succeed");
+
+        // 6. Discover which fragment_index the leader holds locally.
+        //    Use the same placement function the client used.
+        let placement = crate::placement::pick_placement(&chunk_id, &[1u64, 2u64], 2);
+        let leader_idx = placement
+            .iter()
+            .position(|&n| n == 1)
+            .map(|i| u32::try_from(i).unwrap())
+            .expect("leader (node 1) is in placement");
+        // Sanity: local store actually has that fragment.
+        let stored_indices = local.list_fragments(&chunk_id).await;
+        assert!(
+            stored_indices.contains(&leader_idx),
+            "leader wrote fragment {leader_idx} locally; have {stored_indices:?}",
+        );
+
+        // 7. Production read path: simulate a peer's fabric client
+        //    asking the leader's server for the leader's local
+        //    fragment. The bug surfaces because the server's
+        //    envelope registry was never populated for this chunk.
+        let resp = server
+            .get_fragment(Request::new(pb::GetFragmentRequest {
+                chunk_id: Some(pb::ChunkId {
+                    value: chunk_id.0.to_vec(),
+                }),
+                fragment_index: leader_idx,
+            }))
+            .await
+            .expect("get_fragment must succeed")
+            .into_inner();
+        let proto_env = resp.envelope.expect("envelope present");
+
+        // 8. The crypto must round-trip. Today, without the fix
+        //    wiring the registry, these assertions fail because the
+        //    leader's client never deposits crypto on the leader's
+        //    server registry — get_fragment falls through to the
+        //    zero-fill envelope.
+        assert_eq!(
+            proto_env.auth_tag.as_slice(),
+            envelope.auth_tag.as_slice(),
+            "auth_tag must round-trip via leader's local-write path",
+        );
+        assert_eq!(
+            proto_env.nonce.as_slice(),
+            envelope.nonce.as_slice(),
+            "nonce must round-trip — a zero nonce on the reader makes \
+             AES-GCM verify fail with `AEAD authentication failed`",
+        );
+        assert_eq!(
+            proto_env.system_epoch.map(|e| e.value),
+            Some(envelope.system_epoch.0),
+            "system_epoch must round-trip",
+        );
+        assert_eq!(
+            proto_env.tenant_epoch.map(|e| e.value),
+            envelope.tenant_epoch.map(|e| e.0),
+            "tenant_epoch must round-trip",
+        );
+        assert_eq!(
+            proto_env.tenant_wrapped_material,
+            envelope.tenant_wrapped_material.clone().unwrap_or_default(),
+            "tenant_wrapped_material must round-trip",
+        );
     }
 }

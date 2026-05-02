@@ -12,7 +12,7 @@ use thiserror::Error;
 pub mod grpc;
 
 pub use grpc::{
-    is_retriable_status, status_to_fabric_err, GrpcFabricPeer, FABRIC_MAX_MESSAGE_BYTES,
+    FABRIC_MAX_MESSAGE_BYTES, GrpcFabricPeer, is_retriable_status, status_to_fabric_err,
 };
 
 /// Errors a fabric peer call can fail with. Maps onto the gRPC

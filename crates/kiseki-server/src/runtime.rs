@@ -30,7 +30,7 @@ fn select_node_identity_or_die(
     data_dir: &std::path::Path,
 ) -> Result<Box<dyn kiseki_keymanager::node_identity::NodeIdentitySource>, Box<dyn std::error::Error>>
 {
-    use kiseki_keymanager::node_identity::{select_node_identity, NodeIdentityInputs};
+    use kiseki_keymanager::node_identity::{NodeIdentityInputs, select_node_identity};
     let mtls_key = cfg.tls.as_ref().map(|t| t.key_path.as_path());
     select_node_identity(&NodeIdentityInputs {
         spiffe_path: cfg.spiffe_socket.as_deref(),
@@ -410,13 +410,21 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // a parallel by-id index for HasFragment + repair calls.
     let fabric_peers_for_scrub: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> =
         fabric_peers.iter().map(Arc::clone).collect();
+    // GCP 2026-05-02 fix: share one envelope registry between the
+    // local-node ClusterChunkServer (populated by incoming
+    // PutFragment RPCs) and the local-node ClusteredChunkStore
+    // (populated by the leader's own local-fragment writes). Without
+    // this, peers fetching the leader's local fragment receive an
+    // envelope with zero auth_tag/nonce — AES-GCM verify fails.
+    let envelope_registry = kiseki_chunk_cluster::ChunkEnvelopeRegistry::default();
     let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(
         kiseki_chunk_cluster::ClusteredChunkStore::new(
             Arc::clone(&local_chunk_store),
             fabric_peers,
             cluster_cfg,
         )
-        .with_metrics(Arc::clone(&metrics.fabric)),
+        .with_metrics(Arc::clone(&metrics.fabric))
+        .with_envelope_registry(envelope_registry.clone()),
     );
 
     // Phase 16d step 4: spawn the periodic scrub scheduler when
@@ -1009,8 +1017,11 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
     // mutually exclusive with multi-tenant access on this port, so
     // plaintext-mode is a development-only posture.
     let cluster_chunk_svc_intercepted = cfg.tls.is_some();
-    let cluster_chunk_server =
-        kiseki_chunk_cluster::ClusterChunkServer::new(Arc::clone(&local_chunk_store), "default");
+    let cluster_chunk_server = kiseki_chunk_cluster::ClusterChunkServer::with_envelope_registry(
+        Arc::clone(&local_chunk_store),
+        "default",
+        envelope_registry.clone(),
+    );
 
     let mut builder = tonic::transport::Server::builder();
 

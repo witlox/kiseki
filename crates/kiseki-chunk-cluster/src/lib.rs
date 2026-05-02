@@ -68,24 +68,24 @@ pub mod scrub_adapters;
 pub mod scrub_scheduler;
 pub mod server;
 
-pub use auth::{verify_fabric_san, FabricAuthError};
-pub use defaults::{defaults_for, ClusterDurabilityDefaults};
+pub use auth::{FabricAuthError, verify_fabric_san};
+pub use defaults::{ClusterDurabilityDefaults, defaults_for};
 pub use ec::{
-    decode_from_responses, encode_for_placement, EcDistributionError, EcStrategy, FragmentResponse,
-    FragmentRoute,
+    EcDistributionError, EcStrategy, FragmentResponse, FragmentRoute, decode_from_responses,
+    encode_for_placement,
 };
 pub use metrics::FabricMetrics;
 pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
 pub use placement::pick_placement;
 pub use scrub::{
-    ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, FragmentAvailabilityOracle, LogChunkOracle,
-    OrphanDecision, OrphanDeleter, OrphanScrub, OrphanScrubPolicy, OrphanScrubReport, Repairer,
-    ReplicationDecision, UnderReplicationPolicy, UnderReplicationReport, UnderReplicationScrub,
-    DEFAULT_ORPHAN_TTL,
+    ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, DEFAULT_ORPHAN_TTL,
+    FragmentAvailabilityOracle, LogChunkOracle, OrphanDecision, OrphanDeleter, OrphanScrub,
+    OrphanScrubPolicy, OrphanScrubReport, Repairer, ReplicationDecision, UnderReplicationPolicy,
+    UnderReplicationReport, UnderReplicationScrub,
 };
 pub use scrub_adapters::{FabricAvailabilityOracle, FabricRepairer, LocalChunkDeleter};
 pub use scrub_scheduler::{ScrubReport, ScrubScheduler};
-pub use server::{fabric_san_interceptor, ClusterChunkServer};
+pub use server::{ChunkEnvelopeRegistry, ClusterChunkServer, fabric_san_interceptor};
 
 /// Default per-peer timeout for `PutFragment` (write-side fan-out).
 pub const DEFAULT_PUT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -198,6 +198,14 @@ pub struct ClusteredChunkStore {
     peers: Vec<Arc<dyn FabricPeer>>,
     cfg: ClusterCfg,
     metrics: Option<Arc<FabricMetrics>>,
+    /// Shared registry for chunk-level envelope crypto. Hand the same
+    /// `ChunkEnvelopeRegistry` to the local-node `ClusterChunkServer`
+    /// so peer fetches of the leader's local fragment carry the right
+    /// `auth_tag` / `nonce` / epochs. Without this, the GCP 6-node EC
+    /// 4+2 reader sees "AEAD authentication failed" for chunks whose
+    /// first peer fetch lands on the leader. See
+    /// `crate::server::ChunkEnvelopeRegistry`.
+    envelope_registry: Option<crate::server::ChunkEnvelopeRegistry>,
 }
 
 impl ClusteredChunkStore {
@@ -213,6 +221,7 @@ impl ClusteredChunkStore {
             peers,
             cfg,
             metrics: None,
+            envelope_registry: None,
         }
     }
 
@@ -220,6 +229,19 @@ impl ClusteredChunkStore {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<FabricMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attach the shared envelope registry. The same registry handle
+    /// must be passed to the local-node `ClusterChunkServer` (via
+    /// `with_envelope_registry`) so leader-local-write crypto fields
+    /// are visible to subsequent peer `GetFragment` requests.
+    #[must_use]
+    pub fn with_envelope_registry(
+        mut self,
+        registry: crate::server::ChunkEnvelopeRegistry,
+    ) -> Self {
+        self.envelope_registry = Some(registry);
         self
     }
 
@@ -281,6 +303,25 @@ impl ClusteredChunkStore {
                     .is_ok()
                 {
                     acks += 1;
+                    // GCP 2026-05-02 fix: leader's local-write
+                    // path must mirror the peer-side put_fragment
+                    // RPC's side-effect of recording chunk-level
+                    // crypto in the envelope registry. Without
+                    // this, peers fetching the leader's local
+                    // fragment via GetFragment receive an envelope
+                    // with zero auth_tag/nonce/epochs and AES-GCM
+                    // verify on the reassembled ciphertext fails
+                    // with "AEAD authentication failed".
+                    if let Some(reg) = &self.envelope_registry {
+                        reg.record(
+                            chunk_id,
+                            envelope.auth_tag,
+                            envelope.nonce,
+                            envelope.system_epoch,
+                            envelope.tenant_epoch,
+                            envelope.tenant_wrapped_material.clone(),
+                        );
+                    }
                 }
                 continue;
             }
@@ -744,13 +785,13 @@ impl AsyncChunkOps for ClusteredChunkStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use kiseki_chunk::SyncBridge;
     use kiseki_chunk::pool::{AffinityPool, DeviceClass, DurabilityStrategy};
     use kiseki_chunk::store::ChunkStore;
-    use kiseki_chunk::SyncBridge;
     use kiseki_common::ids::{ChunkId, OrgId};
     use kiseki_common::tenancy::KeyEpoch;
     use kiseki_crypto::envelope::Envelope;
