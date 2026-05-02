@@ -38,6 +38,24 @@ variable "release_tag" {
   default     = "latest"
 }
 
+variable "binary_url_base" {
+  description = <<-EOT
+    Base URL for kiseki tarballs. When empty, defaults to
+    `https://github.com/witlox/kiseki/releases/download/<release_tag>`.
+    Override with a GCS bucket URL (e.g.
+    `https://storage.googleapis.com/my-bucket/path`) to deploy a
+    locally-built binary without waiting for the release pipeline.
+    The setup scripts append `/kiseki-server-<arch>.tar.gz` and
+    `/kiseki-client-<arch>.tar.gz` to whatever you set here.
+  EOT
+  type        = string
+  default     = ""
+}
+
+locals {
+  binary_url_base = var.binary_url_base != "" ? var.binary_url_base : "https://github.com/witlox/kiseki/releases/download/${var.release_tag}"
+}
+
 variable "profile" {
   description = <<-EOT
     Cluster profile — selects the shape *and* which benchmark suite the ctrl runs:
@@ -238,10 +256,11 @@ resource "google_compute_instance" "storage" {
     node_ip      = local.storage_ips[count.index]
     all_peers    = local.all_peers
     raft_port    = local.raft_port
-    raw_devices  = local.raw_devices
-    device_class = "nvme"
-    meta_dir     = "/var/lib/kiseki"
-    release_tag  = var.release_tag
+    raw_devices     = local.raw_devices
+    device_class    = "nvme"
+    meta_dir        = "/var/lib/kiseki"
+    release_tag     = var.release_tag
+    binary_url_base = local.binary_url_base
   })
 }
 
@@ -304,11 +323,12 @@ resource "google_compute_instance" "client" {
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/${local.p.client_setup}", {
-    storage_ips = join(",", local.storage_ips)
-    cache_dev   = "/dev/disk/by-id/google-kiseki-cache"
-    client_id   = count.index + 1
-    release_tag = var.release_tag
-    profile     = local.p.label
+    storage_ips     = join(",", local.storage_ips)
+    cache_dev       = "/dev/disk/by-id/google-kiseki-cache"
+    client_id       = count.index + 1
+    release_tag     = var.release_tag
+    binary_url_base = local.binary_url_base
+    profile         = local.p.label
   })
 }
 
@@ -403,12 +423,13 @@ resource "google_compute_instance" "ctrl" {
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-bench-ctrl.sh", {
-    storage_ips = join(",", local.storage_ips)
-    client_ips  = join(",", local.client_ips)
-    perf_bucket = "gs://${google_storage_bucket.perf_results.name}"
-    release_tag = var.release_tag
-    profile     = local.p.label
-    bench_suite = local.p.bench_suite
+    storage_ips     = join(",", local.storage_ips)
+    client_ips      = join(",", local.client_ips)
+    perf_bucket     = "gs://${google_storage_bucket.perf_results.name}"
+    release_tag     = var.release_tag
+    binary_url_base = local.binary_url_base
+    profile         = local.p.label
+    bench_suite     = local.p.bench_suite
   })
 }
 

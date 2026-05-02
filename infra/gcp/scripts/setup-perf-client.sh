@@ -3,7 +3,7 @@
 # Used by both the "default" and "transport" profiles. Sets up FUSE+NFS
 # mount points, the L2 cache disk, and a sane S3 endpoint default.
 #
-# Variables: storage_ips, cache_dev, client_id, release_tag, profile
+# Variables: storage_ips, cache_dev, client_id, release_tag, binary_url_base, profile
 set -eo pipefail
 
 # GCE metadata runner doesn't set HOME or full PATH — fix it
@@ -20,22 +20,22 @@ pip3 install --break-system-packages boto3 awscli 2>/dev/null || true
 # Download pre-built release binaries
 if [ ! -f /usr/local/bin/kiseki-client ]; then
   ARCH=$(uname -m)
-  echo "Downloading kiseki-client ($${ARCH}) from ${release_tag}..."
-  curl -sfL "https://github.com/witlox/kiseki/releases/download/${release_tag}/kiseki-client-$${ARCH}.tar.gz" \
+  echo "Downloading kiseki-client ($${ARCH}) from ${binary_url_base} ..."
+  curl -sfL "${binary_url_base}/kiseki-client-$${ARCH}.tar.gz" \
     -o /tmp/kiseki-client.tar.gz || {
-    echo "ERROR: Failed to download client release"
+    echo "ERROR: Failed to download client tarball"
     exit 1
   }
   tar xzf /tmp/kiseki-client.tar.gz -C /usr/local/bin/
   chmod +x /usr/local/bin/kiseki-client 2>/dev/null || true
 
   # Also grab kiseki-admin for diagnostics
-  curl -sfL "https://github.com/witlox/kiseki/releases/download/${release_tag}/kiseki-server-$${ARCH}.tar.gz" \
+  curl -sfL "${binary_url_base}/kiseki-server-$${ARCH}.tar.gz" \
     -o /tmp/kiseki-server.tar.gz || true
   if [ -f /tmp/kiseki-server.tar.gz ]; then
     tar xzf /tmp/kiseki-server.tar.gz -C /usr/local/bin/ kiseki-admin 2>/dev/null || true
   fi
-  echo "Installed kiseki-client and kiseki-admin from release"
+  echo "Installed kiseki-client and kiseki-admin"
 fi
 
 # Format cache disk (this one IS a filesystem — for L2 cache)

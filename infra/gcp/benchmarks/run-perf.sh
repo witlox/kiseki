@@ -25,16 +25,37 @@ done
 GC_ARGS="--zone=$ZONE"
 [ -n "$PROJECT" ] && GC_ARGS="$GC_ARGS --project=$PROJECT"
 
+# Optional: KISEKI_SSH_KEY_FILE / KISEKI_SSH_FLAG — let the caller
+# supply a non-default SSH identity (e.g. a per-test ephemeral key
+# under .gcp-build/) and override OpenSSH's system config (useful
+# when /etc/ssh/ssh_config has a permission-mismatched include that
+# would otherwise abort every gcloud-driven SSH call).
+[ -n "${KISEKI_SSH_KEY_FILE:-}" ] && GC_ARGS="$GC_ARGS --ssh-key-file=$KISEKI_SSH_KEY_FILE"
+# `--ssh-flag` / `--scp-flag` each accept a single ssh argument; use
+# an env list with `;` separators to pass multiple (e.g.
+# KISEKI_SSH_FLAGS="-F;/dev/null"). Build separate per-tool arg
+# strings since `gcloud compute ssh` and `gcloud compute scp` reject
+# each other's flag names.
+SSH_FLAG_ARGS=""
+SCP_FLAG_ARGS=""
+if [ -n "${KISEKI_SSH_FLAGS:-}" ]; then
+  IFS=';' read -ra _flags <<< "$KISEKI_SSH_FLAGS"
+  for f in "${_flags[@]}"; do
+    SSH_FLAG_ARGS="$SSH_FLAG_ARGS --ssh-flag=$f"
+    SCP_FLAG_ARGS="$SCP_FLAG_ARGS --scp-flag=$f"
+  done
+fi
+
 gcloud_ssh() {
-  gcloud compute ssh "$CTRL_NAME" $GC_ARGS --command="$1" 2>/dev/null
+  gcloud compute ssh "$CTRL_NAME" $GC_ARGS $SSH_FLAG_ARGS --command="$1" 2>/dev/null
 }
 
 gcloud_scp_to() {
-  gcloud compute scp "$1" "$CTRL_NAME:$2" $GC_ARGS 2>/dev/null
+  gcloud compute scp "$1" "$CTRL_NAME:$2" $GC_ARGS $SCP_FLAG_ARGS 2>/dev/null
 }
 
 gcloud_scp_from() {
-  gcloud compute scp "$CTRL_NAME:$1" "$2" $GC_ARGS 2>/dev/null
+  gcloud compute scp "$CTRL_NAME:$1" "$2" $GC_ARGS $SCP_FLAG_ARGS 2>/dev/null
 }
 
 echo "╔═══════════════════════════════════════════════════════════════╗"
@@ -91,7 +112,7 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Launching benchmark ==="
-gcloud_ssh "nohup bash /opt/kiseki-bench/$BENCH_SUITE > /tmp/kiseki-perf.log 2>&1 & echo \$!"
+gcloud_ssh "sudo nohup bash /opt/kiseki-bench/$BENCH_SUITE > /tmp/kiseki-perf.log 2>&1 & echo \$!"
 echo "  Benchmark running on ctrl node (output: /tmp/kiseki-perf.log)"
 
 # ---------------------------------------------------------------------------
