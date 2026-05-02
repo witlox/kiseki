@@ -290,29 +290,50 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And S3 GET from any surviving node returns the same 1MB within 5 seconds
     And the killed node is restarted and rejoins the cluster
 
-  # DEFERRED — driving "fabric quorum lost without Raft quorum loss" needs
-  # either fabric-port-only blocking (iptables / netns) or an admin
-  # `disable-fabric` action that doesn't currently exist. Killing 2 of 3
-  # nodes loses Raft quorum first, so the failure mode under test is
-  # masked. Promote when one of those primitives lands.
-  @library @cross-node
+  # Promoted to @integration via the test-only fabric-deny knob
+  # (POST /admin/test/fabric/deny-incoming/1; gated by
+  # KISEKI_ENABLE_TEST_KNOBS=1). Setting deny on node-2 and node-3
+  # makes their PutFragment handler return Unavailable WITHOUT
+  # touching Raft — so the cluster still has Raft quorum (3 alive,
+  # 3 voters) but only 1 fabric ack reaches the leader. Distinct
+  # failure mode from the EC 4+2 6-node D-5 promotion (which
+  # conflates fabric and Raft loss because killing 3 of 6 also
+  # breaks Raft majority).
+  @integration @multi-node @cross-node
   Scenario: Write requires 2-of-3 quorum (D-5)
-    Given a 3-node Replication-3 cluster on [node-1, node-2, node-3]
-    And `min_acks = 2` (default for Replication-3)
-    When node-2 and node-3 are both unreachable from node-1
-    And a client attempts a PUT via node-1
-    Then node-1's local write succeeds (1 ack)
-    And `PutFragment` to node-2 fails within the 5s per-peer timeout
-    And `PutFragment` to node-3 fails within the 5s per-peer timeout
-    And the client receives 503 with retry-after metadata
-    And `kiseki_fabric_quorum_lost_total` increments by 1
+    Given a 3-node kiseki cluster
+    And node-2's incoming fabric is denied
+    And node-3's incoming fabric is denied
+    Then a 1MB S3 PUT to node-1 fails with quorum lost
+    And the leader's fabric_quorum_lost_total ticked at least 1
+    And node-2's incoming fabric is allowed
+    And node-3's incoming fabric is allowed
 
-  # DEFERRED — needs deterministic slow-node injection. The race
-  # between the Raft commit stream and the fabric ack stream isn't
-  # something an unmodified server exposes a knob for, and faking it
-  # via timing alone is flaky. Promote when (a) we add a test-only
-  # `KISEKI_TEST_FABRIC_SLOW_MS` env or (b) the chunk-fabric path
-  # gains an admin-throttle that operators legitimately use.
+  # NOT REPRODUCIBLE WITH CURRENT WRITE SEMANTICS — `write_chunk`
+  # (and `write_chunk_ec`) await ALL spawned peer-put futures
+  # before returning to the caller, not just `min_acks` of them.
+  # So by the time the client sees PUT success, every healthy
+  # peer (including any "slow" one) has already received the
+  # fragment. The cross-stream race the scenario describes
+  # (composition delta visible on a peer that lacks the fragment
+  # locally) cannot happen at the client-visible boundary today.
+  # Verified empirically 2026-05-02 with the test-only
+  # fabric-slow-ms knob — node-3 read had 0 fabric GET calls
+  # because its local store had the fragment by GET time.
+  #
+  # Two paths to make this scenario meaningful:
+  # 1. Add early-exit to write_chunk on min_acks (bigger
+  #    architectural change; would also speed up tail-latency).
+  # 2. Drive the race via cross-node Raft hydrator timing —
+  #    when the composition delta is replicated faster than the
+  #    fragment, the read on the lagging node should fall back to
+  #    fabric. Requires Raft + fabric to be on independent
+  #    transports with controllable timing skew.
+  #
+  # Until either lands, the local-miss-fallback property is
+  # implicitly covered by the EC read path (which has no local
+  # fast path; every read goes through `read_chunk_ec` which
+  # collects fragments from peers).
   @library @cross-node @ordering
   Scenario: Composition delta arrives before fragment (D-10 cross-stream)
     Given a 3-node Replication-3 cluster with a slow node-3

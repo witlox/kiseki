@@ -108,21 +108,19 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
     And every chunk of the composition has a fragment on node-3
     And the cluster placement for every chunk lists all 3 nodes
 
-  # DEFERRED — needs deterministic missing-fragment induction (delete
-  # a single fragment from one node's local store mid-test). Driving
-  # this naturally via cross-stream lag is flaky. Promote when
-  # `kiseki-control inspect-chunk` (task in progress) gains a
-  # `--drop-local` debug action OR the local-store gains a fault-injection
-  # knob that operators use for chaos drills.
-  @library @cross-node
+  # Promoted to @integration via the test-only drop-fragment knob
+  # (DELETE /admin/test/chunk/{id}/fragment/{idx}; gated by
+  # KISEKI_ENABLE_TEST_KNOBS=1). Drops node-2's local fragment
+  # AFTER the PUT lands (so dedup isn't an issue), then reads
+  # via node-2 — local miss must fall back to fabric.
+  @integration @multi-node @cross-node
   Scenario: Read falls back to fabric when local fragment is missing
-    Given a chunk replicated to [node-1, node-2, node-3]
-    And node-2's local store is missing the fragment (cross-stream lag)
-    When a read is issued against node-2
-    Then node-2 first tries its local store — miss
-    Then node-2 calls `GetFragment` against node-1
-    And on success returns the envelope to the caller
-    And `kiseki_fabric_ops_total{op="get",peer="node-1",outcome="ok"}` increments
+    Given a 3-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    And every follower has received the fragment
+    And node-2's local fragment for the chunk is dropped
+    Then S3 GET from node-2 returns the same 1MB
+    And node-2 issued at least 1 fabric GetFragment calls for the read
 
   @integration @multi-node @cross-node
   Scenario: GC marks chunks tombstoned on every node when refcount drops to 0 (I-C2)

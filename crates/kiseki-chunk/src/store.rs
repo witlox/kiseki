@@ -114,6 +114,20 @@ pub trait ChunkOps {
         Ok(false)
     }
 
+    /// Test-only: hard-remove a chunk regardless of refcount.
+    /// Removes both the whole-envelope entry (chunks map / `write_chunk`
+    /// path) and any per-fragment entries (`write_fragment` path).
+    /// Returns `Ok(true)` if anything was removed. Used only by the
+    /// `DELETE /admin/test/chunk/...` endpoint, which is itself
+    /// gated by `KISEKI_ENABLE_TEST_KNOBS=1`. Default impl errors so
+    /// stores that don't implement it can't be used as a fault
+    /// surface accidentally.
+    fn delete_chunk_force(&mut self, _chunk_id: &ChunkId) -> Result<bool, ChunkError> {
+        Err(ChunkError::Io(
+            "delete_chunk_force not implemented for this store".into(),
+        ))
+    }
+
     /// Phase 16c step 6: list every `fragment_index` currently held
     /// for `chunk_id`. Used by the under-replication scrub's
     /// `HasFragment`-style probe and by EC-mode reads to determine
@@ -482,6 +496,21 @@ impl ChunkOps for ChunkStore {
             .fragments
             .remove(&(*chunk_id, fragment_index))
             .is_some())
+    }
+
+    fn delete_chunk_force(&mut self, chunk_id: &ChunkId) -> Result<bool, ChunkError> {
+        let chunk_removed = self.chunks.remove(chunk_id).is_some();
+        let frag_keys: Vec<_> = self
+            .fragments
+            .keys()
+            .filter(|(c, _)| c == chunk_id)
+            .copied()
+            .collect();
+        let frag_removed = !frag_keys.is_empty();
+        for key in frag_keys {
+            self.fragments.remove(&key);
+        }
+        Ok(chunk_removed || frag_removed)
     }
 
     fn list_fragments(&self, chunk_id: &ChunkId) -> Vec<u32> {

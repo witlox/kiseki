@@ -1422,6 +1422,115 @@ async fn then_node_issued_n_get_calls(w: &mut KisekiWorld, node_id: u64, expecte
 }
 
 // ---------------------------------------------------------------------------
+// Test-only knob steps — admin endpoints gated by
+// KISEKI_ENABLE_TEST_KNOBS=1 (set on every harness child). Used by
+// the D-5 / D-10 / "fabric fallback" scenarios that need
+// deterministic fault injection without iptables/netfilter.
+// ---------------------------------------------------------------------------
+
+#[given(regex = r"^node-(\d+)'s incoming fabric PutFragment is slowed to (\d+) ms per call$")]
+async fn given_node_fabric_slow(w: &mut KisekiWorld, node_id: u64, ms: u64) {
+    let guard = cluster(w);
+    let node = guard.node(node_id);
+    let url = node.admin_url(&format!("admin/test/fabric/slow-ms/{ms}"));
+    let resp = node
+        .http
+        .post(&url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST {url}: {e}"));
+    assert!(
+        resp.status().is_success(),
+        "set fabric slow on node-{node_id}: {}",
+        resp.status(),
+    );
+    // Snapshot baseline now so the matching `node-N issued at
+    // least N fabric GetFragment calls` assertion (used in the
+    // D-10 scenario) measures only THIS scenario's reads.
+    snapshot_fabric_get_baselines(w).await;
+}
+
+#[then(regex = r"^node-(\d+)'s incoming fabric slow-down is removed$")]
+async fn then_node_fabric_slow_removed(w: &mut KisekiWorld, node_id: u64) {
+    let guard = cluster(w);
+    let node = guard.node(node_id);
+    let url = node.admin_url("admin/test/fabric/slow-ms/0");
+    let resp = node
+        .http
+        .post(&url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST {url}: {e}"));
+    assert!(
+        resp.status().is_success(),
+        "clear fabric slow on node-{node_id}: {}",
+        resp.status(),
+    );
+}
+
+#[given(regex = r"^node-(\d+)'s incoming fabric is denied$")]
+async fn given_node_fabric_deny(w: &mut KisekiWorld, node_id: u64) {
+    set_node_fabric_deny(w, node_id, true).await;
+    // Snapshot quorum-lost baseline so the matching `ticked at
+    // least N` assertion measures only THIS scenario's PUTs.
+    snapshot_quorum_lost_baseline(w).await;
+}
+
+#[then(regex = r"^node-(\d+)'s incoming fabric is allowed$")]
+async fn then_node_fabric_allow(w: &mut KisekiWorld, node_id: u64) {
+    set_node_fabric_deny(w, node_id, false).await;
+}
+
+/// Drops every local fragment of the most-recently-written chunk
+/// on `node_id` via the test-only `DELETE
+/// /admin/test/chunk/{id}/fragment/{idx}` endpoint. Discovers the
+/// chunk_ids by asking the leader for the composition tied to
+/// `cluster.last_etag`; iterates fragment_index 0..=15 (covers all
+/// data+parity for any EC strategy currently shipped). Used by the
+/// chunk-storage "Read falls back to fabric" scenario.
+#[when(regex = r"^node-(\d+)'s local fragment for the chunk is dropped$")]
+async fn when_drop_local_fragment(w: &mut KisekiWorld, node_id: u64) {
+    let etag = w.cluster.last_etag.clone().expect("etag missing");
+    let guard = cluster(w);
+    let chunks = composition_chunks_any_node(guard, &etag).await;
+    assert!(
+        !chunks.is_empty(),
+        "no chunks found for composition {etag} — PUT must run before drop",
+    );
+    let node = guard.node(node_id);
+    for chunk_id_hex in &chunks {
+        for fragment_index in 0u32..=15 {
+            let url = node.admin_url(&format!(
+                "admin/test/chunk/{chunk_id_hex}/fragment/{fragment_index}"
+            ));
+            let _ = node.http.delete(&url).send().await;
+        }
+    }
+    // Snapshot fabric-GET baselines so the matching `node-N issued
+    // at least 1 fabric GetFragment` assertion measures only the
+    // upcoming read's fan-out.
+    snapshot_fabric_get_baselines(w).await;
+}
+
+async fn set_node_fabric_deny(w: &mut KisekiWorld, node_id: u64, deny: bool) {
+    let guard = cluster(w);
+    let node = guard.node(node_id);
+    let flag = if deny { "1" } else { "0" };
+    let url = node.admin_url(&format!("admin/test/fabric/deny-incoming/{flag}"));
+    let resp = node
+        .http
+        .post(&url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST {url}: {e}"));
+    assert!(
+        resp.status().is_success(),
+        "set fabric deny={deny} on node-{node_id}: {}",
+        resp.status(),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Baseline-snapshot helpers (singleton-aware metric assertions)
 // ---------------------------------------------------------------------------
 

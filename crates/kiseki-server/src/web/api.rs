@@ -716,18 +716,23 @@ async fn admin_test_drop_fragment(
             })),
         );
     };
-    match local.delete_fragment(&chunk_id, fragment_index).await {
-        Ok(removed) => (
-            axum::http::StatusCode::OK,
-            axum::Json(serde_json::json!({
-                "chunk_id": chunk_id_str,
-                "fragment_index": fragment_index,
-                "removed": removed,
-            })),
-        ),
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
+    // Two storage paths: per-fragment (EC, write_fragment) AND
+    // whole-envelope (Replication-N, write_chunk for fragment_index=0).
+    // The named index targets the per-fragment table; the
+    // delete_chunk_force pass also drains the chunks-map entry so
+    // a Replication-3 reader actually misses on local read.
+    let frag_removed = local
+        .delete_fragment(&chunk_id, fragment_index)
+        .await
+        .unwrap_or(false);
+    let chunk_removed = local.delete_chunk_force(&chunk_id).await.unwrap_or(false);
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "chunk_id": chunk_id_str,
+            "fragment_index": fragment_index,
+            "fragment_removed": frag_removed,
+            "chunk_removed": chunk_removed,
+        })),
+    )
 }

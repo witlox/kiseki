@@ -600,6 +600,49 @@ impl ChunkOps for PersistentChunkStore {
         Ok(true)
     }
 
+    fn delete_chunk_force(&mut self, chunk_id: &ChunkId) -> Result<bool, ChunkError> {
+        let mut anything_removed = false;
+        // Whole-envelope path (Replication-N + dedup, server.put_fragment
+        // for fragment_index=0). Removes from chunks map AND frees the
+        // device extent, bypassing refcount (test-only).
+        let chunk_entry = {
+            let mut chunks = self
+                .chunks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            chunks.remove(chunk_id)
+        };
+        if let Some(entry) = chunk_entry {
+            let _ = self.device.free(&entry.extent);
+            anything_removed = true;
+        }
+        // Per-fragment path (EC, server.put_fragment for fragment_index>0).
+        // Drain every (chunk_id, *) tuple.
+        let frag_entries: Vec<_> = {
+            let mut fragments = self
+                .fragments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let keys: Vec<_> = fragments
+                .keys()
+                .filter(|(c, _)| c == chunk_id)
+                .copied()
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| fragments.remove(&k).map(|e| e.extent))
+                .collect()
+        };
+        for extent in frag_entries {
+            let _ = self.device.free(&extent);
+            anything_removed = true;
+        }
+        if anything_removed {
+            self.save_meta()?;
+            self.save_frag_meta()?;
+        }
+        Ok(anything_removed)
+    }
+
     fn list_fragments(&self, chunk_id: &ChunkId) -> Vec<u32> {
         let target = *chunk_id;
         let fragments = self

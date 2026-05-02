@@ -117,6 +117,18 @@ pub trait AsyncChunkOps: Send + Sync {
     async fn list_fragments(&self, _chunk_id: &ChunkId) -> Vec<u32> {
         Vec::new()
     }
+
+    /// Test-only: hard-remove a chunk from local storage regardless
+    /// of refcount and irrespective of which write path
+    /// (`write_chunk` whole-envelope or `write_fragment` shard) was
+    /// used. See `ChunkOps::delete_chunk_force` for the rationale —
+    /// only callable through the `DELETE /admin/test/chunk/...`
+    /// endpoint, which is itself gated by `KISEKI_ENABLE_TEST_KNOBS=1`.
+    async fn delete_chunk_force(&self, _chunk_id: &ChunkId) -> Result<bool, ChunkError> {
+        Err(ChunkError::Io(
+            "delete_chunk_force not implemented for this AsyncChunkOps".into(),
+        ))
+    }
 }
 
 /// Adapter that exposes any sync [`ChunkOps`] as [`AsyncChunkOps`]
@@ -304,6 +316,17 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
             guard.delete_fragment(&chunk_id, fragment_index)
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn delete_chunk_force(&self, chunk_id: &ChunkId) -> Result<bool, ChunkError> {
+        let inner = Arc::clone(&self.inner);
+        let chunk_id = *chunk_id;
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.delete_chunk_force(&chunk_id)
         })
         .await
         .expect("spawn_blocking panicked")
