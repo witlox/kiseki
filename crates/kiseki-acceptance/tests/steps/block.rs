@@ -146,7 +146,8 @@ async fn given_already_initialized(w: &mut KisekiWorld) {
 #[when("initialization is attempted without --force")]
 async fn when_init_without_force(w: &mut KisekiWorld) {
     let path = w
-        .block.device_path
+        .block
+        .device_path
         .as_ref()
         .expect("device path set")
         .clone();
@@ -208,7 +209,8 @@ async fn given_xfs_filesystem(w: &mut KisekiWorld) {
 #[when("initialization is attempted")]
 async fn when_init_attempted(w: &mut KisekiWorld) {
     let path = w
-        .block.device_path
+        .block
+        .device_path
         .as_ref()
         .expect("device path set")
         .clone();
@@ -253,7 +255,8 @@ async fn then_error_includes_fs_type(w: &mut KisekiWorld) {
 #[when("initialization is attempted with --force")]
 async fn when_force_init(w: &mut KisekiWorld) {
     let path = w
-        .block.device_path
+        .block
+        .device_path
         .as_ref()
         .expect("device path set")
         .clone();

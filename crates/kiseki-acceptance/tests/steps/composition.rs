@@ -20,7 +20,11 @@ async fn given_ns(w: &mut KisekiWorld, ns: String, shard: String, tenant: String
 #[when(regex = r#"^a composition is created in namespace "(\S+)"$"#)]
 async fn when_create(w: &mut KisekiWorld, ns: String) {
     let ns_id = *w.namespace_ids.get(&ns).unwrap();
-    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+    match w
+        .legacy
+        .comp_store
+        .create(ns_id, vec![ChunkId([0x01; 32])], 1024)
+    {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -34,9 +38,14 @@ async fn then_created(w: &mut KisekiWorld) {
     assert!(w.last_composition_id.is_some(), "error: {:?}", w.last_error);
 
     // Cross-context: verify a Create delta was emitted to the log.
-    let comp = w.legacy.comp_store.get(w.last_composition_id.unwrap()).unwrap();
+    let comp = w
+        .legacy
+        .comp_store
+        .get(w.last_composition_id.unwrap())
+        .unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: comp.shard_id,
             from: SequenceNumber(1),
@@ -93,7 +102,8 @@ async fn then_gone(w: &mut KisekiWorld) {
         // We check all shards since the composition is already gone.
         for &shard_id in w.shard_names.values() {
             let deltas = w
-                .legacy.log_store
+                .legacy
+                .log_store
                 .read_deltas(ReadDeltasRequest {
                     shard_id,
                     from: SequenceNumber(1),
@@ -193,7 +203,8 @@ async fn then_readonly(w: &mut KisekiWorld) {
 async fn when_update(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         match w
-            .legacy.comp_store
+            .legacy
+            .comp_store
             .update(id, vec![ChunkId([0x02; 32]), ChunkId([0x03; 32])], 2048)
         {
             Ok(v) => {
@@ -213,7 +224,8 @@ async fn then_version(w: &mut KisekiWorld, expected: u64) {
     if let Some(comp_id) = w.last_composition_id {
         if let Ok(comp) = w.legacy.comp_store.get(comp_id) {
             let deltas = w
-                .legacy.log_store
+                .legacy
+                .log_store
                 .read_deltas(ReadDeltasRequest {
                     shard_id: comp.shard_id,
                     from: SequenceNumber(1),
@@ -236,7 +248,11 @@ async fn then_version(w: &mut KisekiWorld, expected: u64) {
 #[when("the Composition context processes the create:")]
 async fn when_comp_ctx_processes_create_table(w: &mut KisekiWorld) {
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+    match w
+        .legacy
+        .comp_store
+        .create(ns_id, vec![ChunkId([0x01; 32])], 1024)
+    {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -262,7 +278,11 @@ async fn when_comp_ctx_processes_create(w: &mut KisekiWorld) {
 async fn when_append_64mb(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         let new_chunks = vec![ChunkId([0x03; 32]), ChunkId([0x04; 32])];
-        match w.legacy.comp_store.update(id, new_chunks, 128 * 1024 * 1024) {
+        match w
+            .legacy
+            .comp_store
+            .update(id, new_chunks, 128 * 1024 * 1024)
+        {
             Ok(v) => {
                 w.last_epoch = Some(v);
                 w.last_error = None;
@@ -282,7 +302,11 @@ async fn when_write_modifies_byte_range(w: &mut KisekiWorld) {
     if let Some(id) = w.last_composition_id {
         // Overwrite produces a new chunk c2' replacing c2
         let new_chunks = vec![ChunkId([0x0a; 32])];
-        match w.legacy.comp_store.update(id, new_chunks, 128 * 1024 * 1024) {
+        match w
+            .legacy
+            .comp_store
+            .update(id, new_chunks, 128 * 1024 * 1024)
+        {
             Ok(v) => {
                 w.last_epoch = Some(v);
                 w.last_error = None;
@@ -307,7 +331,11 @@ async fn when_complete_multipart_upload(w: &mut KisekiWorld) {
         ChunkId([0x11; 32]),
         ChunkId([0x12; 32]),
     ];
-    match w.legacy.comp_store.create(ns_id, chunks, 3 * 64 * 1024 * 1024) {
+    match w
+        .legacy
+        .comp_store
+        .create(ns_id, chunks, 3 * 64 * 1024 * 1024)
+    {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -348,7 +376,11 @@ async fn given_comp_versions(w: &mut KisekiWorld, _name: String, _versions: Stri
     // Versioning setup — ensure composition exists with version history.
     if w.last_composition_id.is_none() {
         let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-        if let Ok(id) = w.legacy.comp_store.create(ns_id, vec![ChunkId([0x20; 32])], 4096) {
+        if let Ok(id) = w
+            .legacy
+            .comp_store
+            .create(ns_id, vec![ChunkId([0x20; 32])], 4096)
+        {
             w.last_composition_id = Some(id);
         }
     }
@@ -367,7 +399,11 @@ async fn when_delete_issued(w: &mut KisekiWorld, _name: String) {
 #[given("later writes file B with the same plaintext P")]
 async fn given_later_writes_same_plaintext(w: &mut KisekiWorld) {
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+    match w
+        .legacy
+        .comp_store
+        .create(ns_id, vec![ChunkId([0x01; 32])], 1024)
+    {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -381,7 +417,11 @@ async fn when_later_writes_same_plaintext(w: &mut KisekiWorld) {
     // Dedup: second file referencing same chunk_id.
     // The chunk already exists; composition references it.
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x01; 32])], 1024) {
+    match w
+        .legacy
+        .comp_store
+        .create(ns_id, vec![ChunkId([0x01; 32])], 1024)
+    {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -486,7 +526,11 @@ async fn when_create_unauthorized_ns(w: &mut KisekiWorld, ns: String) {
 #[when("the workload creates, updates, and finalizes compositions")]
 async fn when_workload_creates_updates_finalizes(w: &mut KisekiWorld) {
     let ns_id = w.ensure_namespace("trials", "shard-trials-1");
-    match w.legacy.comp_store.create(ns_id, vec![ChunkId([0x30; 32])], 2048) {
+    match w
+        .legacy
+        .comp_store
+        .create(ns_id, vec![ChunkId([0x30; 32])], 2048)
+    {
         Ok(id) => {
             w.last_composition_id = Some(id);
             w.last_error = None;
@@ -763,7 +807,8 @@ async fn then_compliance_tags_inherited(w: &mut KisekiWorld) {
     // the real effective_compliance_tags function.
     use kiseki_control::tenant::effective_compliance_tags;
     let org = w
-        .control.tenant_store
+        .control
+        .tenant_store
         .get_org("org-pharma")
         .expect("org should exist");
     let tags = effective_compliance_tags(&org, None);
@@ -811,7 +856,10 @@ async fn then_no_partial_state(w: &mut KisekiWorld) {
     // Atomicity: after a failed create, no composition should exist.
     assert!(
         w.last_composition_id.is_none()
-            || w.legacy.comp_store.get(w.last_composition_id.unwrap()).is_err(),
+            || w.legacy
+                .comp_store
+                .get(w.last_composition_id.unwrap())
+                .is_err(),
         "no partial composition should remain after failure"
     );
 }

@@ -1,4 +1,3 @@
-
 //! NFSv4.1/4.2 client (RFC 8881/7862) — session-based COMPOUND RPCs.
 //!
 //! Session lifecycle: `EXCHANGE_ID` → `CREATE_SESSION` → per-request
@@ -63,10 +62,13 @@ impl Nfs4Client {
         }
     }
 
-    fn ensure_session(&self) -> Result<std::sync::MutexGuard<'_, Option<Nfs4Session>>, GatewayError> {
-        let mut guard = self.session.lock().map_err(|e| {
-            GatewayError::ProtocolError(format!("lock: {e}"))
-        })?;
+    fn ensure_session(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<Nfs4Session>>, GatewayError> {
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
         if guard.is_none() {
             *guard = Some(self.establish_session()?);
         }
@@ -88,7 +90,12 @@ impl Nfs4Client {
         body.write_u32(0); // SP4_NONE
         body.write_u32(0); // impl_id count
 
-        let reply = transport.call(NFS_PROGRAM, NFS_VERSION, NFS_COMPOUND_PROC, &body.into_bytes())?;
+        let reply = transport.call(
+            NFS_PROGRAM,
+            NFS_VERSION,
+            NFS_COMPOUND_PROC,
+            &body.into_bytes(),
+        )?;
         let (client_id, _) = parse_compound_single_op(&reply, op::EXCHANGE_ID, |r| {
             r.read_u64().map_err(|e| xdr_err(&e))
         })?;
@@ -103,7 +110,12 @@ impl Nfs4Client {
         body.write_u32(1); // sequence
         body.write_u32(0); // flags
 
-        let reply = transport.call(NFS_PROGRAM, NFS_VERSION, NFS_COMPOUND_PROC, &body.into_bytes())?;
+        let reply = transport.call(
+            NFS_PROGRAM,
+            NFS_VERSION,
+            NFS_COMPOUND_PROC,
+            &body.into_bytes(),
+        )?;
         let (session_id, _) = parse_compound_single_op(&reply, op::CREATE_SESSION, |r| {
             let sid = r.read_opaque_fixed(16).map_err(|e| xdr_err(&e))?;
             let mut arr = [0u8; 16];
@@ -271,10 +283,8 @@ impl GatewayOps for Nfs4Client {
         w.write_u32(0); // count
         let commit = (op::COMMIT, w.into_bytes());
 
-        let reply = sess.sequenced_compound(
-            self.minor_version,
-            &[putrootfh, open, write, commit, getfh],
-        )?;
+        let reply =
+            sess.sequenced_compound(self.minor_version, &[putrootfh, open, write, commit, getfh])?;
 
         // Walk the op results sequentially using XdrReader.
         let mut r = XdrReader::new(&reply);
@@ -341,7 +351,9 @@ impl GatewayOps for Nfs4Client {
 
         // Extract composition UUID from file handle (first 16 bytes).
         let composition_id = if fh.len() >= 16 {
-            CompositionId(uuid::Uuid::from_slice(&fh[..16]).unwrap_or_else(|_| uuid::Uuid::new_v4()))
+            CompositionId(
+                uuid::Uuid::from_slice(&fh[..16]).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+            )
         } else {
             CompositionId(uuid::Uuid::new_v4())
         };
@@ -380,10 +392,7 @@ impl GatewayOps for Nfs4Client {
         w.write_u32(u32::try_from(req.length).unwrap_or(u32::MAX));
         let read = (op::READ, w.into_bytes());
 
-        let reply = sess.sequenced_compound(
-            self.minor_version,
-            &[putrootfh, open, read],
-        )?;
+        let reply = sess.sequenced_compound(self.minor_version, &[putrootfh, open, read])?;
 
         // Find READ result — scan for the op code
         let read_bytes = op::READ.to_be_bytes();
@@ -443,9 +452,10 @@ impl GatewayOps for Nfs4Client {
     /// `complete_multipart` concatenates and writes them in one OPEN+WRITE.
     async fn start_multipart(&self, _namespace_id: NamespaceId) -> Result<String, GatewayError> {
         let upload_id = uuid::Uuid::new_v4().to_string();
-        let mut buffers = self.multipart_buffers.lock().map_err(|e| {
-            GatewayError::ProtocolError(format!("lock: {e}"))
-        })?;
+        let mut buffers = self
+            .multipart_buffers
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
         buffers.insert(upload_id.clone(), Vec::new());
         Ok(upload_id)
     }
@@ -458,9 +468,10 @@ impl GatewayOps for Nfs4Client {
         part_number: u32,
         data: &[u8],
     ) -> Result<String, GatewayError> {
-        let mut buffers = self.multipart_buffers.lock().map_err(|e| {
-            GatewayError::ProtocolError(format!("lock: {e}"))
-        })?;
+        let mut buffers = self
+            .multipart_buffers
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
         let parts = buffers.get_mut(upload_id).ok_or_else(|| {
             GatewayError::ProtocolError(format!("unknown upload_id: {upload_id}"))
         })?;
@@ -472,9 +483,10 @@ impl GatewayOps for Nfs4Client {
     /// them as a single NFS OPEN+WRITE.
     async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
         let mut parts = {
-            let mut buffers = self.multipart_buffers.lock().map_err(|e| {
-                GatewayError::ProtocolError(format!("lock: {e}"))
-            })?;
+            let mut buffers = self
+                .multipart_buffers
+                .lock()
+                .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
             buffers.remove(upload_id).ok_or_else(|| {
                 GatewayError::ProtocolError(format!("unknown upload_id: {upload_id}"))
             })?
@@ -494,9 +506,10 @@ impl GatewayOps for Nfs4Client {
 
     /// Drop the buffered parts for a multipart upload.
     async fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
-        let mut buffers = self.multipart_buffers.lock().map_err(|e| {
-            GatewayError::ProtocolError(format!("lock: {e}"))
-        })?;
+        let mut buffers = self
+            .multipart_buffers
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
         buffers.remove(upload_id);
         Ok(())
     }

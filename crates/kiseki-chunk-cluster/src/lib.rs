@@ -442,9 +442,17 @@ impl ClusteredChunkStore {
             bytes.truncate(trimmed_len);
             bytes
         };
-        let (auth_tag, nonce, system_epoch, tenant_epoch, tenant_wrapped_material) =
-            crypto.map_or_else(
-                || ([0u8; 16], [0u8; 12], kiseki_common::tenancy::KeyEpoch(1), None, None),
+        let (auth_tag, nonce, system_epoch, tenant_epoch, tenant_wrapped_material) = crypto
+            .map_or_else(
+                || {
+                    (
+                        [0u8; 16],
+                        [0u8; 12],
+                        kiseki_common::tenancy::KeyEpoch(1),
+                        None,
+                        None,
+                    )
+                },
                 |e| {
                     (
                         e.auth_tag,

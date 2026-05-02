@@ -167,7 +167,8 @@ async fn given_d3_offline(w: &mut KisekiWorld) {
     let chunk_id = env.chunk_id;
     w.last_chunk_id = Some(chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    w.legacy.chunk_store
+    w.legacy
+        .chunk_store
         .pool_mut("fast-nvme")
         .unwrap()
         .set_device_online("d3", false);

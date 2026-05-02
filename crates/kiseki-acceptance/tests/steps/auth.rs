@@ -316,7 +316,10 @@ async fn then_accepted(_w: &mut KisekiWorld) {
 #[given(regex = r#"^cluster admin "(\S+)" connects to the Control Plane API$"#)]
 async fn given_admin_connects(w: &mut KisekiWorld, _admin: String) {
     // Precondition: cluster admin connects to the Control Plane API.
-    assert!(w.control.plane_up, "control plane must be up for admin connection");
+    assert!(
+        w.control.plane_up,
+        "control plane must be up for admin connection"
+    );
 }
 
 #[given("the Control Plane is on the management network (not data fabric)")]
@@ -327,7 +330,10 @@ async fn given_mgmt_network(_w: &mut KisekiWorld) {
 #[when(regex = r#"^"(\S+)" authenticates with admin credentials$"#)]
 async fn when_admin_auth(w: &mut KisekiWorld, _admin: String) {
     // Admin authenticates with credentials on the management network.
-    assert!(w.control.plane_up, "control plane must be up for admin auth");
+    assert!(
+        w.control.plane_up,
+        "control plane must be up for admin auth"
+    );
 }
 
 #[then("access to cluster-level operations is granted")]

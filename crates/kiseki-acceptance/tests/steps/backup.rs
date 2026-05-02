@@ -201,7 +201,8 @@ async fn given_shard_with_metadata_and_data(w: &mut KisekiWorld, name: String, n
 #[given("a backup is already in progress")]
 async fn given_backup_in_progress(w: &mut KisekiWorld) {
     let mgr = w
-        .backup.manager
+        .backup
+        .manager
         .as_ref()
         .expect("backup manager configured");
     mgr.force_in_progress(true);
@@ -210,7 +211,8 @@ async fn given_backup_in_progress(w: &mut KisekiWorld) {
 #[given(regex = r"^the operator created (\d+) snapshots$")]
 async fn given_operator_created_snapshots(w: &mut KisekiWorld, n: usize) {
     let mgr = Arc::clone(
-        w.backup.manager
+        w.backup
+            .manager
             .as_ref()
             .expect("backup manager configured"),
     );
@@ -231,7 +233,8 @@ async fn given_operator_created_snapshots(w: &mut KisekiWorld, n: usize) {
 #[when("the operator triggers a backup")]
 async fn when_trigger_backup(w: &mut KisekiWorld) {
     let mgr = Arc::clone(
-        w.backup.manager
+        w.backup
+            .manager
             .as_ref()
             .expect("backup manager configured"),
     );
@@ -254,12 +257,14 @@ async fn when_trigger_backup(w: &mut KisekiWorld) {
 #[when("the operator restores the most recent snapshot")]
 async fn when_restore_last(w: &mut KisekiWorld) {
     let mgr = Arc::clone(
-        w.backup.manager
+        w.backup
+            .manager
             .as_ref()
             .expect("backup manager configured"),
     );
     let id = w
-        .backup.last_snapshot
+        .backup
+        .last_snapshot
         .as_ref()
         .expect("a snapshot was created")
         .snapshot_id
@@ -274,7 +279,8 @@ async fn when_restore_last(w: &mut KisekiWorld) {
 #[when(regex = r"^retention is enforced with a (\d+)-day window$")]
 async fn when_enforce_retention(w: &mut KisekiWorld, days: u32) {
     let mgr = Arc::clone(
-        w.backup.manager
+        w.backup
+            .manager
             .as_ref()
             .expect("backup manager configured"),
     );
@@ -292,7 +298,8 @@ async fn when_enforce_retention(w: &mut KisekiWorld, days: u32) {
 #[then("a snapshot tarball lands in the backup directory")]
 async fn then_tarball_lands(w: &mut KisekiWorld) {
     let snap = w
-        .backup.last_snapshot
+        .backup
+        .last_snapshot
         .as_ref()
         .expect("a snapshot was created");
     let backend = w.backup.backend.as_ref().expect("backend configured");
@@ -307,7 +314,8 @@ async fn then_tarball_lands(w: &mut KisekiWorld) {
 #[then(regex = r"^the snapshot manifest records (\d+) shards$")]
 async fn then_manifest_shard_count(w: &mut KisekiWorld, n: usize) {
     let snap = w
-        .backup.last_snapshot
+        .backup
+        .last_snapshot
         .as_ref()
         .expect("a snapshot was created");
     assert_eq!(snap.shard_count, n, "snapshot.shard_count");
@@ -315,7 +323,11 @@ async fn then_manifest_shard_count(w: &mut KisekiWorld, n: usize) {
 
 #[then(regex = r"^(\d+) shard is recovered with metadata and chunk data intact$")]
 async fn then_shard_recovered(w: &mut KisekiWorld, n: usize) {
-    let restored = w.backup.last_restored_shards.as_ref().expect("restore was issued");
+    let restored = w
+        .backup
+        .last_restored_shards
+        .as_ref()
+        .expect("restore was issued");
     assert_eq!(restored.len(), n);
     let s = &restored[0];
     assert_eq!(s.shard_id, "alpha");
@@ -326,7 +338,8 @@ async fn then_shard_recovered(w: &mut KisekiWorld, n: usize) {
 #[then("the snapshot tarball is reachable through the S3 backend")]
 async fn then_tarball_reachable_s3(w: &mut KisekiWorld) {
     let snap = w
-        .backup.last_snapshot
+        .backup
+        .last_snapshot
         .as_ref()
         .expect("a snapshot was created");
     let backend = w.backup.backend.as_ref().expect("backend configured");
@@ -341,7 +354,8 @@ async fn then_tarball_reachable_s3(w: &mut KisekiWorld) {
 #[then("the manifest is reachable through the S3 backend")]
 async fn then_manifest_reachable_s3(w: &mut KisekiWorld) {
     let snap = w
-        .backup.last_snapshot
+        .backup
+        .last_snapshot
         .as_ref()
         .expect("a snapshot was created");
     let backend = w.backup.backend.as_ref().expect("backend configured");
@@ -357,7 +371,8 @@ async fn then_manifest_reachable_s3(w: &mut KisekiWorld) {
 #[then(regex = r"^listing snapshots returns (\d+) entries$")]
 async fn then_listing_returns_n(w: &mut KisekiWorld, n: usize) {
     let mgr = Arc::clone(
-        w.backup.manager
+        w.backup
+            .manager
             .as_ref()
             .expect("backup manager configured"),
     );
@@ -369,7 +384,8 @@ async fn then_listing_returns_n(w: &mut KisekiWorld, n: usize) {
 #[then("the second backup is rejected with InProgress")]
 async fn then_second_rejected(w: &mut KisekiWorld) {
     let err = w
-        .backup.last_error
+        .backup
+        .last_error
         .as_deref()
         .expect("a backup attempt failed");
     assert_eq!(err, "InProgress");
@@ -378,7 +394,8 @@ async fn then_second_rejected(w: &mut KisekiWorld) {
 #[then("the in-progress flag can be cleared and a new backup succeeds")]
 async fn then_clear_and_retry(w: &mut KisekiWorld) {
     let mgr = Arc::clone(
-        w.backup.manager
+        w.backup
+            .manager
             .as_ref()
             .expect("backup manager configured"),
     );
@@ -394,7 +411,8 @@ async fn then_clear_and_retry(w: &mut KisekiWorld) {
 #[then(regex = r"^all (\d+) snapshots are deleted$")]
 async fn then_all_deleted(w: &mut KisekiWorld, expected: usize) {
     let cleaned = w
-        .backup.last_error
+        .backup
+        .last_error
         .as_deref()
         .and_then(|s| s.strip_prefix("cleaned="))
         .and_then(|s| s.parse::<usize>().ok())

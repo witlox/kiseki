@@ -487,7 +487,8 @@ async fn then_cluster_normal(w: &mut KisekiWorld) {
 async fn given_active_nodes(w: &mut KisekiWorld, count: u32) {
     w.legacy.topology_active_nodes.clear();
     for i in 1..=count {
-        w.legacy.topology_active_nodes
+        w.legacy
+            .topology_active_nodes
             .push(kiseki_common::ids::NodeId(i as u64));
     }
 }
@@ -513,7 +514,8 @@ async fn when_tenant_creates_namespace(w: &mut KisekiWorld, tenant: String, ns: 
 #[then(regex = r#"^(\d+) shards are created for "([^"]*)"$"#)]
 async fn then_n_shards_created(w: &mut KisekiWorld, expected: u32, ns: String) {
     let count = w
-        .legacy.shard_map_store
+        .legacy
+        .shard_map_store
         .shard_count(&ns)
         .expect("namespace should exist in shard map store");
     assert_eq!(
@@ -548,7 +550,8 @@ async fn then_max_leaders_per_node(
 ) {
     let tenant_id = w.ensure_tenant("org-pharma");
     let map = w
-        .legacy.shard_map_store
+        .legacy
+        .shard_map_store
         .get(&ns, tenant_id)
         .expect("namespace should exist");
     let mut leader_counts: std::collections::HashMap<kiseki_common::ids::NodeId, u32> =
@@ -575,7 +578,8 @@ async fn then_shard_map_disjoint(w: &mut KisekiWorld, expected: u32) {
     // We check the shard map store directly — this IS the real store.
     let tenant_id = w.ensure_tenant("org-pharma");
     let map = w
-        .legacy.shard_map_store
+        .legacy
+        .shard_map_store
         .get("patient-data", tenant_id)
         .expect("namespace should exist");
     assert_eq!(map.shards.len() as u32, expected);
@@ -596,7 +600,8 @@ async fn then_shard_map_disjoint(w: &mut KisekiWorld, expected: u32) {
 async fn then_shard_map_persisted(w: &mut KisekiWorld) {
     let tenant_id = w.ensure_tenant("org-pharma");
     let stored = w
-        .legacy.shard_map_store
+        .legacy
+        .shard_map_store
         .get("patient-data", tenant_id)
         .expect("shard map should be retrievable from store");
     assert!(stored.version >= 1);
@@ -776,7 +781,8 @@ async fn given_ns_with_shards(w: &mut KisekiWorld, ns: String, shard_count: u32)
 async fn when_nodes_added(w: &mut KisekiWorld, _added: u32, total: u32) {
     w.legacy.topology_active_nodes.clear();
     for i in 1..=total {
-        w.legacy.topology_active_nodes
+        w.legacy
+            .topology_active_nodes
             .push(kiseki_common::ids::NodeId(i as u64));
     }
 }
@@ -787,8 +793,12 @@ async fn then_ratio_violated(w: &mut KisekiWorld) {
     let mut found = false;
     for ns in &["ns-a", "ns-b"] {
         if let Some(count) = w.legacy.shard_map_store.shard_count(ns) {
-            if kiseki_control::shard_topology::check_ratio_floor(&w.legacy.topology_config, count, active)
-                .is_some()
+            if kiseki_control::shard_topology::check_ratio_floor(
+                &w.legacy.topology_config,
+                count,
+                active,
+            )
+            .is_some()
             {
                 found = true;
             }
@@ -803,8 +813,13 @@ async fn then_ratio_violated(w: &mut KisekiWorld) {
 async fn then_auto_split_fires(w: &mut KisekiWorld, ns: String, target: u32) {
     // Evaluate ratio floor — this splits shards in the shard map store.
     let new_count = w
-        .legacy.shard_map_store
-        .evaluate_ratio_floor(&ns, &w.legacy.topology_config, &w.legacy.topology_active_nodes)
+        .legacy
+        .shard_map_store
+        .evaluate_ratio_floor(
+            &ns,
+            &w.legacy.topology_config,
+            &w.legacy.topology_active_nodes,
+        )
         .expect("splits should fire");
     assert!(
         new_count >= target,
@@ -829,7 +844,8 @@ async fn then_auto_split_fires(w: &mut KisekiWorld, ns: String, target: u32) {
             sr.leader_node,
             kiseki_log::shard::ShardConfig::default(),
         );
-        w.legacy.log_store
+        w.legacy
+            .log_store
             .update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
     }
 
@@ -890,9 +906,11 @@ async fn then_ratio_satisfied(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^no auto-split is triggered for "([^"]*)"$"#)]
 async fn then_no_auto_split(w: &mut KisekiWorld, ns: String) {
-    let result =
-        w.legacy.shard_map_store
-            .evaluate_ratio_floor(&ns, &w.legacy.topology_config, &w.legacy.topology_active_nodes);
+    let result = w.legacy.shard_map_store.evaluate_ratio_floor(
+        &ns,
+        &w.legacy.topology_config,
+        &w.legacy.topology_active_nodes,
+    );
     assert!(result.is_none(), "no splits should fire for {}", ns);
 
     // Verify gateway write still works.
@@ -943,7 +961,10 @@ async fn then_raft_groups_torn_down(w: &mut KisekiWorld, _count: u32) {
 async fn then_no_shard_map_committed(w: &mut KisekiWorld) {
     let tenant_id = w.ensure_tenant("org-pharma");
     assert!(
-        w.legacy.shard_map_store.get("partial-ns", tenant_id).is_err(),
+        w.legacy
+            .shard_map_store
+            .get("partial-ns", tenant_id)
+            .is_err(),
         "namespace should not exist after rollback"
     );
 }
@@ -1024,7 +1045,8 @@ async fn then_first_continues(w: &mut KisekiWorld) {
 async fn given_cluster_scales(w: &mut KisekiWorld) {
     w.legacy.topology_active_nodes.clear();
     for i in 1..=50u32 {
-        w.legacy.topology_active_nodes
+        w.legacy
+            .topology_active_nodes
             .push(kiseki_common::ids::NodeId(i as u64));
     }
 }
@@ -1037,14 +1059,21 @@ async fn when_ratio_evaluator_fires(_w: &mut KisekiWorld) {
 #[then(regex = r#"^splits fire until shard count reaches min\(ceil\([^)]+\), (\d+)\) = (\d+)$"#)]
 async fn then_splits_to_cap(w: &mut KisekiWorld, _cap: u32, target: u32) {
     let new_count = w
-        .legacy.shard_map_store
-        .evaluate_ratio_floor("big-ns", &w.legacy.topology_config, &w.legacy.topology_active_nodes)
+        .legacy
+        .shard_map_store
+        .evaluate_ratio_floor(
+            "big-ns",
+            &w.legacy.topology_config,
+            &w.legacy.topology_active_nodes,
+        )
         .expect("splits should fire");
     assert_eq!(new_count, target);
 
     // Sync the UUID-keyed entry so gateway routing sees the updated shards.
     let ns_id = w.namespace_ids.get("big-ns").unwrap();
-    w.legacy.shard_map_store.alias(&ns_id.0.to_string(), "big-ns");
+    w.legacy
+        .shard_map_store
+        .alias(&ns_id.0.to_string(), "big-ns");
 
     // Register new shards and verify gateway write.
     let tenant_id = w.ensure_tenant("org-pharma");
@@ -1056,7 +1085,8 @@ async fn then_splits_to_cap(w: &mut KisekiWorld, _cap: u32, target: u32) {
             sr.leader_node,
             kiseki_log::shard::ShardConfig::default(),
         );
-        w.legacy.log_store
+        w.legacy
+            .log_store
             .update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
     }
     let result = w.gateway_write("big-ns", b"cap-split-test").await;
@@ -1133,7 +1163,8 @@ async fn then_no_topology_returned(w: &mut KisekiWorld) {
 async fn given_ns_with_specific_ranges(w: &mut KisekiWorld, ns: String, count: u32) {
     if w.legacy.topology_active_nodes.is_empty() {
         for i in 1..=3u32 {
-            w.legacy.topology_active_nodes
+            w.legacy
+                .topology_active_nodes
                 .push(kiseki_common::ids::NodeId(i as u64));
         }
     }
@@ -1148,11 +1179,16 @@ async fn given_stale_shard_map(w: &mut KisekiWorld) {
     w.legacy.gateway.clear_shard_map();
     // Narrow shard 0's range so most keys miss — triggers real KeyOutOfRange.
     let tenant_id = w.ensure_tenant("org-pharma");
-    let map = w.legacy.shard_map_store.get("ns-routed", tenant_id).unwrap();
+    let map = w
+        .legacy
+        .shard_map_store
+        .get("ns-routed", tenant_id)
+        .unwrap();
     let narrow_shard = map.shards[0].shard_id;
     let mut end = [0x00; 32];
     end[31] = 0x01;
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .update_shard_range(narrow_shard, [0x00; 32], end);
 }
 
@@ -1191,12 +1227,19 @@ async fn then_key_out_of_range(w: &mut KisekiWorld, _shard: u32) {
 #[then("the gateway refreshes its shard map via GetNamespaceShardMap")]
 async fn then_gateway_refreshes(w: &mut KisekiWorld) {
     // Re-attach the shard map store (simulates cache refresh).
-    w.legacy.gateway.set_shard_map(Arc::clone(&w.legacy.shard_map_store));
+    w.legacy
+        .gateway
+        .set_shard_map(Arc::clone(&w.legacy.shard_map_store));
     // Restore the correct ranges on all shards.
     let tenant_id = w.ensure_tenant("org-pharma");
-    let map = w.legacy.shard_map_store.get("ns-routed", tenant_id).unwrap();
+    let map = w
+        .legacy
+        .shard_map_store
+        .get("ns-routed", tenant_id)
+        .unwrap();
     for sr in &map.shards {
-        w.legacy.log_store
+        w.legacy
+            .log_store
             .update_shard_range(sr.shard_id, sr.range_start, sr.range_end);
     }
 }

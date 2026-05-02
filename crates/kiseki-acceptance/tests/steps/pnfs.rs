@@ -65,7 +65,8 @@ fn build_ds_ctx(
 
 fn issue_handle(world: &mut KisekiWorld, expiry_ms: u64, stripe: u32) -> PnfsFileHandle {
     let key = world
-        .pnfs.mac_key
+        .pnfs
+        .mac_key
         .clone()
         .expect("K_layout must be derived before issuing handles");
     let tenant = world.legacy.nfs_ctx.tenant_id;
@@ -463,7 +464,8 @@ async fn then_eight_ops(_world: &mut KisekiWorld) {
 async fn then_every_other_op_notsupp(world: &mut KisekiWorld) {
     // Drive a sample of disallowed ops and assert each gets NOTSUPP.
     let key = world
-        .pnfs.mac_key
+        .pnfs
+        .mac_key
         .clone()
         .unwrap_or_else(|| derive_pnfs_fh_mac_key(&[0x42; 32], &[0x77; 16]));
     world.pnfs.mac_key = Some(key.clone());
@@ -562,7 +564,8 @@ async fn when_server_boots(_world: &mut KisekiWorld) {
 #[then(regex = r#"^the server refuses to start with a "([^"]+)" error$"#)]
 async fn then_server_refuses(world: &mut KisekiWorld, msg: String) {
     let res = world
-        .pnfs.security_eval
+        .pnfs
+        .security_eval
         .take()
         .expect("security gate must have been evaluated");
     let err = res.expect_err("expected gate to refuse");
@@ -591,7 +594,8 @@ async fn given_single_tenant(_world: &mut KisekiWorld) {
 )]
 async fn then_audit_emitted(world: &mut KisekiWorld) {
     let res = world
-        .pnfs.security_eval
+        .pnfs
+        .security_eval
         .as_ref()
         .expect("security gate must have been evaluated");
     let s = res.as_ref().expect("expected Ok");
@@ -723,7 +727,8 @@ fn ensure_mds_mgr(world: &mut KisekiWorld) -> Arc<MdsLayoutManager> {
         return Arc::clone(m);
     }
     let key = world
-        .pnfs.mac_key
+        .pnfs
+        .mac_key
         .clone()
         .unwrap_or_else(|| derive_pnfs_fh_mac_key(&[0x42; 32], &[0x77; 16]));
     world.pnfs.mac_key = Some(key.clone());
@@ -779,7 +784,8 @@ async fn when_layoutget(world: &mut KisekiWorld, name: String, start: u64, end_m
 #[then(regex = r#"^the response is a well-formed `ff_layout4` per RFC 8435 §5\.1$"#)]
 async fn then_well_formed_ff_layout(world: &mut KisekiWorld) {
     let layout = world
-        .pnfs.last_layout
+        .pnfs
+        .last_layout
         .as_ref()
         .expect("LAYOUTGET must run first");
     // Phase 15c.9: layout = ONE segment + N mirrors. The `stripes`
@@ -802,7 +808,8 @@ async fn then_well_formed_ff_layout(world: &mut KisekiWorld) {
 #[then(regex = r#"^it contains (\d+) mirrors covering the (\d+) MiB segment$"#)]
 async fn then_mirrors(world: &mut KisekiWorld, n: u32, mib: u32) {
     let layout = world
-        .pnfs.last_layout
+        .pnfs
+        .last_layout
         .as_ref()
         .expect("LAYOUTGET must run first");
     assert_eq!(
@@ -826,7 +833,8 @@ async fn then_fh4_size(world: &mut KisekiWorld, total: u32, _payload: u32, _mac:
     use kiseki_gateway::pnfs::PNFS_FH_BYTES;
     assert_eq!(total, PNFS_FH_BYTES as u32);
     let layout = world
-        .pnfs.last_layout
+        .pnfs
+        .last_layout
         .as_ref()
         .expect("LAYOUTGET must run first");
     let key = world.pnfs.mac_key.clone().expect("K_layout");
@@ -843,7 +851,8 @@ async fn then_fh4_size(world: &mut KisekiWorld, total: u32, _payload: u32, _mac:
 )]
 async fn then_round_robin(world: &mut KisekiWorld) {
     let layout = world
-        .pnfs.last_layout
+        .pnfs
+        .last_layout
         .as_ref()
         .expect("LAYOUTGET must run first");
     let addrs: Vec<&str> = layout.stripes.iter().map(|s| s.ds_addr.as_str()).collect();
@@ -926,7 +935,8 @@ async fn then_versions(_world: &mut KisekiWorld) {
 #[given(regex = r#"^the layout cache TTL is set to (\d+) ms for the test$"#)]
 async fn given_layout_ttl_ms(world: &mut KisekiWorld, ms: u64) {
     let key = world
-        .pnfs.mac_key
+        .pnfs
+        .mac_key
         .clone()
         .unwrap_or_else(|| derive_pnfs_fh_mac_key(&[0x42; 32], &[0x77; 16]));
     world.pnfs.mac_key = Some(key.clone());
@@ -981,7 +991,8 @@ async fn then_no_recall_on_ttl(_world: &mut KisekiWorld) {
 #[given(regex = r#"^`layout_cache_max_entries=(\d+)`$"#)]
 async fn given_max_entries(world: &mut KisekiWorld, n: u32) {
     let key = world
-        .pnfs.mac_key
+        .pnfs
+        .mac_key
         .clone()
         .unwrap_or_else(|| derive_pnfs_fh_mac_key(&[0x42; 32], &[0x77; 16]));
     world.pnfs.mac_key = Some(key.clone());
@@ -1098,11 +1109,13 @@ async fn when_drain_commits(world: &mut KisekiWorld, name: String) {
 #[then(regex = r#"^exactly one `NodeDraining\{node_id=([^}]+)\}` event is observed on the bus$"#)]
 async fn then_one_draining_event(world: &mut KisekiWorld, name: String) {
     let sub = world
-        .legacy.topology_sub
+        .legacy
+        .topology_sub
         .as_mut()
         .expect("subscriber must be attached");
     let target = world
-        .raft.node_names
+        .raft
+        .node_names
         .get(&name)
         .copied()
         .expect("node name registered");
@@ -1145,7 +1158,8 @@ async fn when_drain_refused(world: &mut KisekiWorld) {
 #[then(regex = r#"^no `NodeDraining` event is observed on the bus$"#)]
 async fn then_no_draining_event(world: &mut KisekiWorld) {
     let sub = world
-        .legacy.topology_sub
+        .legacy
+        .topology_sub
         .as_mut()
         .expect("subscriber must be attached");
     assert!(matches!(sub.try_recv(), None));
@@ -1192,7 +1206,8 @@ async fn given_comp_exists(world: &mut KisekiWorld, _name: String) {
     use kiseki_composition::composition::CompositionOps;
     let chunk = ChunkId([0xAB; 32]);
     let comp_id = world
-        .legacy.comp_store
+        .legacy
+        .comp_store
         .create(world.legacy.nfs_ctx.namespace_id, vec![chunk], 64)
         .expect("comp_store.create");
     world.last_composition_id = Some(comp_id);
@@ -1278,7 +1293,10 @@ async fn given_layout_ref_node(world: &mut KisekiWorld, name: String) {
     world.pnfs.last_layout = Some(layout);
     // Map the name to the DS address that the manager built.
     // ensure_mds_mgr() seeds 10.0.0.10 / .11 / .12 — pick first.
-    world.raft.node_names.insert(name, kiseki_common::ids::NodeId(1));
+    world
+        .raft
+        .node_names
+        .insert(name, kiseki_common::ids::NodeId(1));
 }
 
 #[when(regex = r#"^the drain orchestrator commits drain on "([^"]+)"$"#)]
@@ -1482,7 +1500,8 @@ async fn given_subscriber_killed(_world: &mut KisekiWorld) {
 #[given(regex = r#"^a layout was issued with a 2-second TTL \(test override\)$"#)]
 async fn given_layout_with_ttl(world: &mut KisekiWorld) {
     let key = world
-        .pnfs.mac_key
+        .pnfs
+        .mac_key
         .clone()
         .unwrap_or_else(|| derive_pnfs_fh_mac_key(&[0x42; 32], &[0x77; 16]));
     world.pnfs.mac_key = Some(key.clone());

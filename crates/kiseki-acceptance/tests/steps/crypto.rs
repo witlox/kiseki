@@ -91,14 +91,29 @@ async fn then_new_epoch(w: &mut KisekiWorld, _k: String, expected: u64) {
 
 #[then(regex = r#"^existing chunks retain epoch (\d+) wrapping$"#)]
 async fn then_retain(w: &mut KisekiWorld, epoch: u64) {
-    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
+    assert!(w
+        .legacy
+        .key_store
+        .fetch_master_key(KeyEpoch(epoch))
+        .await
+        .is_ok());
 }
 
 #[then(regex = r#"^both epochs are valid.*$"#)]
 async fn then_both(w: &mut KisekiWorld) {
-    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+    assert!(w
+        .legacy
+        .key_store
+        .fetch_master_key(KeyEpoch(1))
+        .await
+        .is_ok());
     if let Some(e) = w.last_epoch {
-        assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(e)).await.is_ok());
+        assert!(w
+            .legacy
+            .key_store
+            .fetch_master_key(KeyEpoch(e))
+            .await
+            .is_ok());
     }
 }
 
@@ -165,20 +180,35 @@ async fn when_read(_w: &mut KisekiWorld, _c: String) {
 #[then(regex = r#"^the system retrieves the epoch (\d+) tenant KEK wrapping$"#)]
 async fn then_old_wrap(w: &mut KisekiWorld, epoch: u64) {
     // Verify old epoch key is still accessible
-    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
+    assert!(w
+        .legacy
+        .key_store
+        .fetch_master_key(KeyEpoch(epoch))
+        .await
+        .is_ok());
 }
 
 #[then("the read succeeds")]
 async fn then_read_ok(w: &mut KisekiWorld) {
     // Old epoch key accessible means read can proceed.
-    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+    assert!(w
+        .legacy
+        .key_store
+        .fetch_master_key(KeyEpoch(1))
+        .await
+        .is_ok());
 }
 
 #[then("the chunk is flagged for background re-wrapping to epoch 3")]
 async fn then_flagged_rewrap(w: &mut KisekiWorld) {
     // Background re-wrapping: old epoch chunks are flagged for migration.
     // Verify both old and new epoch keys are accessible (needed for re-wrapping).
-    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+    assert!(w
+        .legacy
+        .key_store
+        .fetch_master_key(KeyEpoch(1))
+        .await
+        .is_ok());
     assert!(
         w.legacy.key_store.current_epoch().await.unwrap().0 >= 2,
         "current epoch should be ahead of chunk epoch"
@@ -229,11 +259,19 @@ async fn then_new_chunks_epoch(w: &mut KisekiWorld, _kek: String) {
 async fn then_migration(w: &mut KisekiWorld, from: u64, to: u64) {
     // Background re-wrapping: verify both epoch keys exist for migration.
     assert!(
-        w.legacy.key_store.fetch_master_key(KeyEpoch(from)).await.is_ok(),
+        w.legacy
+            .key_store
+            .fetch_master_key(KeyEpoch(from))
+            .await
+            .is_ok(),
         "source epoch key should exist"
     );
     assert!(
-        w.legacy.key_store.fetch_master_key(KeyEpoch(to)).await.is_ok(),
+        w.legacy
+            .key_store
+            .fetch_master_key(KeyEpoch(to))
+            .await
+            .is_ok(),
         "target epoch key should exist"
     );
 }
@@ -380,7 +418,12 @@ async fn then_new_wrapping(_w: &mut KisekiWorld, epoch: u64) {
 
 #[then(regex = r#"^existing chunks retain epoch (\d+) tenant KEK wrapping$"#)]
 async fn then_retain_tenant(w: &mut KisekiWorld, epoch: u64) {
-    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
+    assert!(w
+        .legacy
+        .key_store
+        .fetch_master_key(KeyEpoch(epoch))
+        .await
+        .is_ok());
 }
 
 #[then(regex = r#"^background re-wrapping migrates epoch (\d+) wrappings to epoch (\d+)$"#)]
@@ -1105,5 +1148,10 @@ async fn then_deterministic(_w: &mut KisekiWorld) {
 
 #[then(regex = r#"^unwraps the system DEK using epoch (\d+) material$"#)]
 async fn then_unwrap_epoch(w: &mut KisekiWorld, epoch: u64) {
-    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(epoch)).await.is_ok());
+    assert!(w
+        .legacy
+        .key_store
+        .fetch_master_key(KeyEpoch(epoch))
+        .await
+        .is_ok());
 }

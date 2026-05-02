@@ -433,7 +433,9 @@ async fn then_different_ids(w: &mut KisekiWorld) {
 // --- CREATE_SESSION ---
 
 #[given("a client_id from EXCHANGE_ID")]
-async fn given_client_id(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_client_id(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[when("the client sends COMPOUND with CREATE_SESSION for that client_id")]
 async fn when_create_session(w: &mut KisekiWorld) {
@@ -589,7 +591,9 @@ async fn then_readdir_includes(w: &mut KisekiWorld, a: String, b: String) {
 // --- LOCK ---
 
 #[given("an open stateid for a file")]
-async fn given_open_stateid(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_open_stateid(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[when("the client sends COMPOUND with LOCK (WRITE_LT, offset 0, length 1024)")]
 async fn when_lock(w: &mut KisekiWorld) {
@@ -626,7 +630,9 @@ async fn then_conflict_info(w: &mut KisekiWorld) {
 // --- SEQUENCE ---
 
 #[given("an active session")]
-async fn given_active_session(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_active_session(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[when(regex = r"^the client sends COMPOUND with SEQUENCE \(slot (\d+), seq (\d+)\)$")]
 async fn when_sequence(w: &mut KisekiWorld, _slot: u32, _seq: u32) {
@@ -704,7 +710,9 @@ async fn then_access_fields(w: &mut KisekiWorld) {
 // --- SETATTR ---
 
 #[given("an open stateid for a writable file")]
-async fn given_writable(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_writable(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[when("the client sends COMPOUND with SETATTR(mode=0644)")]
 async fn when_setattr(w: &mut KisekiWorld) {
@@ -888,7 +896,8 @@ async fn then_contents(w: &mut KisekiWorld, _a: String, _b: String) {
 async fn given_empty_bucket(w: &mut KisekiWorld, bucket: String) {
     // Create the namespace (bucket) with no objects.
     w.ensure_namespace(&bucket, "shard-default");
-    w.legacy.gateway
+    w.legacy
+        .gateway
         .add_namespace(kiseki_composition::namespace::Namespace {
             id: *w
                 .namespace_ids
@@ -1114,7 +1123,8 @@ async fn then_object_metadata(w: &mut KisekiWorld) {
 #[when(regex = r"^the client sends GET /([a-z][-a-z0-9]*)$")]
 async fn when_get_bucket(w: &mut KisekiWorld, bucket: String) {
     w.ensure_namespace(&bucket, "shard-default");
-    w.legacy.gateway
+    w.legacy
+        .gateway
         .add_namespace(kiseki_composition::namespace::Namespace {
             id: *w
                 .namespace_ids
@@ -1440,7 +1450,9 @@ async fn then_nfs4_badsession_status(w: &mut KisekiWorld) {
 // --- Persistence ---
 
 #[given("redb database at $DATA_DIR/raft/db.redb")]
-async fn given_redb(_w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_redb(_w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[given("pool files at $DATA_DIR/pools/")]
 async fn given_pool_files(_w: &mut KisekiWorld) {
@@ -1450,7 +1462,9 @@ async fn given_pool_files(_w: &mut KisekiWorld) {
 // --- NFS4 additional ---
 
 #[given("a file was created via COMPOUND WRITE")]
-async fn given_file_compound(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_file_compound(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[given("a small file exists")]
 async fn given_small_file(w: &mut KisekiWorld) {
@@ -1470,22 +1484,34 @@ async fn given_file_exists_short(w: &mut KisekiWorld, name: String) {
 }
 
 #[given("a file has a WRITE lock on bytes 0-1024")]
-async fn given_write_lock(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_write_lock(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[given("a file is opened with a valid stateid")]
-async fn given_file_stateid(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_file_stateid(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[given("an active session and a file handle")]
-async fn given_session_handle(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_session_handle(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[given("the current filehandle is a writable file")]
-async fn given_writable_fh(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_writable_fh(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[given("the current filehandle is the root")]
-async fn given_root_fh_nfs4(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_root_fh_nfs4(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[given("two sessions are created")]
-async fn given_two_sessions(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_two_sessions(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 #[given(regex = r#"^files "([^"]*)" and "([^"]*)" exist$"#)]
 async fn given_files_exist(w: &mut KisekiWorld, a: String, b: String) {
@@ -1597,7 +1623,8 @@ async fn given_object_bytes(w: &mut KisekiWorld, bytes: u64) {
 #[given(regex = r#"^bucket "([^"]*)" has no objects$"#)]
 async fn given_bucket_no_objects(w: &mut KisekiWorld, bucket: String) {
     w.ensure_namespace(&bucket, "shard-default");
-    w.legacy.gateway
+    w.legacy
+        .gateway
         .add_namespace(kiseki_composition::namespace::Namespace {
             id: *w
                 .namespace_ids
@@ -1682,14 +1709,18 @@ async fn given_retention_active(w: &mut KisekiWorld, hold: String, _chunk: Strin
 }
 
 #[given(regex = r"^refcounts for .+ are initialized to 1$")]
-async fn given_refcounts(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_refcounts(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 // "later writes file B" handled by composition.rs When step.
 
 // Removed — now handled by then_unwrap_epoch in crypto.rs
 
 #[given(regex = r#"^the caller submits hint \{.*\}$"#)]
-async fn given_hint_collective(w: &mut KisekiWorld) { todo!("wire to server") }
+async fn given_hint_collective(w: &mut KisekiWorld) {
+    todo!("wire to server")
+}
 
 // "requests cache TTL" reused from operational.rs.
 
@@ -2086,7 +2117,8 @@ async fn then_offsets_correct(_w: &mut KisekiWorld) {
 async fn given_view_watermark(w: &mut KisekiWorld, view_name: String, watermark: u64) {
     use kiseki_common::ids::SequenceNumber;
     let vid = w.ensure_view(&view_name);
-    w.legacy.view_store
+    w.legacy
+        .view_store
         .advance_watermark(vid, SequenceNumber(watermark), 1000)
         .unwrap();
 }

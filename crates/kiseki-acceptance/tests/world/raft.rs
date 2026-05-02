@@ -1,8 +1,8 @@
 //! Raft cluster + perf state (ADR-037).
 
+use kiseki_common::ids::NodeId;
 use std::collections::HashMap;
 use std::sync::Arc;
-use kiseki_common::ids::NodeId;
 
 pub struct RaftState {
     pub cluster: Option<kiseki_log::raft::test_cluster::RaftTestCluster>,

@@ -1,14 +1,14 @@
 //! Control-plane state (ADR-027).
 
-use std::collections::HashMap;
+use kiseki_control::federation::FederationRegistry;
 use kiseki_control::flavor::Flavor;
 use kiseki_control::iam::AccessRequest;
 use kiseki_control::maintenance::MaintenanceState;
 use kiseki_control::namespace::NamespaceStore;
 use kiseki_control::retention::RetentionStore;
-use kiseki_control::federation::FederationRegistry;
 use kiseki_control::storage_admin::StorageAdminService;
 use kiseki_control::tenant::TenantStore;
+use std::collections::HashMap;
 
 pub struct ControlState {
     pub tenant_store: TenantStore,

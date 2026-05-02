@@ -53,8 +53,7 @@ impl PortReservation {
         let mut listeners = Vec::with_capacity(6);
         let mut ports = Vec::with_capacity(6);
         for _ in 0..6 {
-            let sock =
-                std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            let sock = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
             ports.push(sock.local_addr().unwrap().port());
             listeners.push(sock);
         }
@@ -246,11 +245,8 @@ impl ServerHarness {
         use std::net::TcpStream;
 
         let addr = format!("127.0.0.1:{}", self.ports.nfs_tcp);
-        let mut stream = TcpStream::connect_timeout(
-            &addr.parse().unwrap(),
-            Duration::from_secs(5),
-        )
-        .map_err(|e| format!("NFS TCP connect to {addr}: {e}"))?;
+        let mut stream = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5))
+            .map_err(|e| format!("NFS TCP connect to {addr}: {e}"))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -264,7 +260,7 @@ impl ServerHarness {
         rpc.extend_from_slice(&program.to_be_bytes()); // prog
         rpc.extend_from_slice(&version.to_be_bytes()); // vers
         rpc.extend_from_slice(&procedure.to_be_bytes()); // proc
-        // AUTH_NONE credentials + verifier
+                                                         // AUTH_NONE credentials + verifier
         rpc.extend_from_slice(&0u32.to_be_bytes()); // cred flavor = AUTH_NONE
         rpc.extend_from_slice(&0u32.to_be_bytes()); // cred length = 0
         rpc.extend_from_slice(&0u32.to_be_bytes()); // verf flavor = AUTH_NONE
@@ -302,7 +298,9 @@ impl ServerHarness {
         }
         let reply_xid = u32::from_be_bytes(reply[0..4].try_into().unwrap());
         if reply_xid != xid {
-            return Err(format!("xid mismatch: expected {xid:#x}, got {reply_xid:#x}"));
+            return Err(format!(
+                "xid mismatch: expected {xid:#x}, got {reply_xid:#x}"
+            ));
         }
         let accept_stat = u32::from_be_bytes(reply[20..24].try_into().unwrap());
         if accept_stat != 0 {
@@ -323,7 +321,7 @@ impl ServerHarness {
         exid_body.extend_from_slice(&1u32.to_be_bytes()); // minor_version = 1
         exid_body.extend_from_slice(&1u32.to_be_bytes()); // 1 op
         exid_body.extend_from_slice(&42u32.to_be_bytes()); // op EXCHANGE_ID
-        // verifier (8 bytes)
+                                                           // verifier (8 bytes)
         exid_body.extend_from_slice(&[0u8; 8]);
         // owner_id (opaque): length + data
         let owner = b"bdd-test-client";
@@ -372,7 +370,9 @@ impl ServerHarness {
         }
         let cmp_status = u32::from_be_bytes(reply[0..4].try_into().unwrap());
         if cmp_status != 0 {
-            return Err(format!("CREATE_SESSION COMPOUND failed: status={cmp_status}"));
+            return Err(format!(
+                "CREATE_SESSION COMPOUND failed: status={cmp_status}"
+            ));
         }
         let tag_len = u32::from_be_bytes(reply[4..8].try_into().unwrap()) as usize;
         let base = 8 + tag_len + ((4 - tag_len % 4) % 4) + 4;
@@ -400,18 +400,13 @@ impl ServerHarness {
             .find(|p| p.join("Cargo.lock").exists())
             .unwrap_or(manifest.as_path());
         for profile in ["release", "debug"] {
-            let candidate = workspace
-                .join("target")
-                .join(profile)
-                .join("kiseki-server");
+            let candidate = workspace.join("target").join(profile).join("kiseki-server");
             if candidate.exists() {
                 return Ok(candidate);
             }
         }
-        Err(
-            "kiseki-server binary not found. Build first: \
+        Err("kiseki-server binary not found. Build first: \
              `cargo build -p kiseki-server` or set KISEKI_SERVER_BIN"
-                .into(),
-        )
+            .into())
     }
 }

@@ -17,8 +17,7 @@ async fn when_nfs_null(w: &mut KisekiWorld) {
 
     let port = w.server().ports.nfs_tcp;
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut transport = RpcTransport::connect(addr)
-        .expect("TCP connect to NFS port");
+    let mut transport = RpcTransport::connect(addr).expect("TCP connect to NFS port");
     // NULL = program 100003, version 4, procedure 0
     let result = transport.call(100003, 4, 0, &[]);
     match result {
@@ -70,7 +69,11 @@ async fn when_compound_putrootfh_getattr(w: &mut KisekiWorld) {
 
 #[then("the COMPOUND reply contains NFS4_OK for both operations")]
 async fn then_compound_both_ok(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none(), "COMPOUND failed: {:?}", w.last_error);
+    assert!(
+        w.last_error.is_none(),
+        "COMPOUND failed: {:?}",
+        w.last_error
+    );
     let body = w.server().last_body.as_ref().expect("no reply");
     let status = u32::from_be_bytes(body[0..4].try_into().unwrap());
     assert_eq!(status, 0, "COMPOUND top-level status should be NFS4_OK");
@@ -99,11 +102,14 @@ async fn when_nfs_write_at_offset(w: &mut KisekiWorld, data: String, offset: u64
 
         // Create file via write at offset 0 using GatewayOps
         use kiseki_gateway::ops::WriteRequest;
-        let resp = nfs.write(WriteRequest {
-            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-            data: data.into_bytes(),
-        }).await.expect("initial NFS write");
+        let resp = nfs
+            .write(WriteRequest {
+                tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+                namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+                data: data.into_bytes(),
+            })
+            .await
+            .expect("initial NFS write");
         w.server_mut().response_state.insert(
             "seq_write_comp_id".into(),
             resp.composition_id.0.to_string(),
@@ -123,11 +129,14 @@ async fn when_nfs_write_at_offset(w: &mut KisekiWorld, data: String, offset: u64
     // This will create a NEW composition — which is the bug.
     // A real NFS server would append to the same file.
     use kiseki_gateway::ops::WriteRequest;
-    let resp = nfs.write(WriteRequest {
-        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-        data: data.into_bytes(),
-    }).await.expect("subsequent NFS write");
+    let resp = nfs
+        .write(WriteRequest {
+            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+            data: data.into_bytes(),
+        })
+        .await
+        .expect("subsequent NFS write");
     // Store second comp_id
     w.server_mut().response_state.insert(
         "seq_write_comp_id_2".into(),
@@ -137,32 +146,39 @@ async fn when_nfs_write_at_offset(w: &mut KisekiWorld, data: String, offset: u64
 
 #[then(regex = r#"^reading (\d+) bytes at offset 0 returns "([^"]*)"$"#)]
 async fn then_nfs_read_sequential(w: &mut KisekiWorld, expected_len: usize, expected: String) {
-    let comp_id_str = w.server().response_state.get("seq_write_comp_id")
-        .cloned().expect("need comp_id from first write");
-    let comp_id = kiseki_common::ids::CompositionId(
-        uuid::Uuid::parse_str(&comp_id_str).unwrap()
-    );
+    let comp_id_str = w
+        .server()
+        .response_state
+        .get("seq_write_comp_id")
+        .cloned()
+        .expect("need comp_id from first write");
+    let comp_id = kiseki_common::ids::CompositionId(uuid::Uuid::parse_str(&comp_id_str).unwrap());
 
     let port = w.server().ports.nfs_tcp;
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
     let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
 
     use kiseki_gateway::ops::ReadRequest;
-    let resp = nfs.read(ReadRequest {
-        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-        composition_id: comp_id,
-        offset: 0,
-        length: expected_len as u64,
-    }).await.expect("NFS read");
+    let resp = nfs
+        .read(ReadRequest {
+            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+            composition_id: comp_id,
+            offset: 0,
+            length: expected_len as u64,
+        })
+        .await
+        .expect("NFS read");
 
     assert_eq!(
-        resp.data.len(), expected_len,
+        resp.data.len(),
+        expected_len,
         "expected {expected_len} bytes, got {}",
         resp.data.len()
     );
     assert_eq!(
-        String::from_utf8_lossy(&resp.data), expected,
+        String::from_utf8_lossy(&resp.data),
+        expected,
         "sequential write data mismatch"
     );
 }
@@ -185,59 +201,79 @@ async fn when_nfs_write_10kb_chunks(w: &mut KisekiWorld) {
     // Use the client to do a single write that includes all chunks
     // via the multipart interface (buffers client-side, sends as one write)
     use kiseki_gateway::ops::GatewayOps;
-    let upload_id = nfs.start_multipart(
-        kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0))
-    ).await.expect("start multipart");
+    let upload_id = nfs
+        .start_multipart(kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)))
+        .await
+        .expect("start multipart");
 
     // 4KB chunk 1 (A's)
     nfs.upload_part(&upload_id, 1, &vec![b'A'; 4096])
-        .await.expect("part 1");
+        .await
+        .expect("part 1");
     // 4KB chunk 2 (B's)
     nfs.upload_part(&upload_id, 2, &vec![b'B'; 4096])
-        .await.expect("part 2");
+        .await
+        .expect("part 2");
     // 2KB chunk 3 (C's)
     nfs.upload_part(&upload_id, 3, &vec![b'C'; 2048])
-        .await.expect("part 3");
+        .await
+        .expect("part 3");
 
-    let comp_id = nfs.complete_multipart(&upload_id)
-        .await.expect("complete multipart");
+    let comp_id = nfs
+        .complete_multipart(&upload_id)
+        .await
+        .expect("complete multipart");
 
-    w.server_mut().response_state.insert(
-        "10kb_comp_id".into(),
-        comp_id.0.to_string(),
-    );
+    w.server_mut()
+        .response_state
+        .insert("10kb_comp_id".into(), comp_id.0.to_string());
 }
 
 #[then("reading the full file returns all 10KB with correct content")]
 async fn then_nfs_read_10kb(w: &mut KisekiWorld) {
-    let comp_id_str = w.server().response_state.get("10kb_comp_id")
-        .cloned().expect("need comp_id");
-    let comp_id = kiseki_common::ids::CompositionId(
-        uuid::Uuid::parse_str(&comp_id_str).unwrap()
-    );
+    let comp_id_str = w
+        .server()
+        .response_state
+        .get("10kb_comp_id")
+        .cloned()
+        .expect("need comp_id");
+    let comp_id = kiseki_common::ids::CompositionId(uuid::Uuid::parse_str(&comp_id_str).unwrap());
 
     let port = w.server().ports.nfs_tcp;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
 
     use kiseki_gateway::ops::{GatewayOps, ReadRequest};
-    let resp = nfs.read(ReadRequest {
-        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-        composition_id: comp_id,
-        offset: 0,
-        length: 10240,
-    }).await.expect("NFS read 10KB");
+    let resp = nfs
+        .read(ReadRequest {
+            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+            composition_id: comp_id,
+            offset: 0,
+            length: 10240,
+        })
+        .await
+        .expect("NFS read 10KB");
 
     assert_eq!(
-        resp.data.len(), 10240,
+        resp.data.len(),
+        10240,
         "expected 10KB (4K+4K+2K), got {} bytes",
         resp.data.len()
     );
     // Verify content: 4K of A, 4K of B, 2K of C
-    assert!(resp.data[..4096].iter().all(|&b| b == b'A'), "first 4KB should be A's");
-    assert!(resp.data[4096..8192].iter().all(|&b| b == b'B'), "second 4KB should be B's");
-    assert!(resp.data[8192..].iter().all(|&b| b == b'C'), "last 2KB should be C's");
+    assert!(
+        resp.data[..4096].iter().all(|&b| b == b'A'),
+        "first 4KB should be A's"
+    );
+    assert!(
+        resp.data[4096..8192].iter().all(|&b| b == b'B'),
+        "second 4KB should be B's"
+    );
+    assert!(
+        resp.data[8192..].iter().all(|&b| b == b'C'),
+        "last 2KB should be C's"
+    );
 }
 
 // --- Cross-protocol: S3 PUT → NFS READ ---
@@ -246,12 +282,17 @@ async fn then_nfs_read_10kb(w: &mut KisekiWorld) {
 async fn given_s3_put_for_cross(w: &mut KisekiWorld, key: String) {
     let data = vec![0xAB; 1024];
     let url = w.server().s3_url(&key);
-    let resp = w.server().http.put(&url).body(data).send().await
+    let resp = w
+        .server()
+        .http
+        .put(&url)
+        .body(data)
+        .send()
+        .await
         .expect("S3 PUT failed");
     assert!(resp.status().is_success(), "S3 PUT: {}", resp.status());
     if let Some(etag) = resp.headers().get("etag") {
-        w.server_mut().last_etag =
-            Some(etag.to_str().unwrap_or("").trim_matches('"').to_string());
+        w.server_mut().last_etag = Some(etag.to_str().unwrap_or("").trim_matches('"').to_string());
     }
 }
 
@@ -268,13 +309,16 @@ async fn when_nfs_read_cross(w: &mut KisekiWorld) {
     let etag = w.server().last_etag.clone().expect("need etag from S3 PUT");
     let comp_id = CompositionId(uuid::Uuid::parse_str(&etag).expect("etag is UUID"));
 
-    match nfs.read(ReadRequest {
-        tenant_id: OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: NamespaceId(uuid::Uuid::from_u128(0)),
-        composition_id: comp_id,
-        offset: 0,
-        length: 2048,
-    }).await {
+    match nfs
+        .read(ReadRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(0)),
+            composition_id: comp_id,
+            offset: 0,
+            length: 2048,
+        })
+        .await
+    {
         Ok(resp) => {
             w.server_mut().last_body = Some(resp.data);
             w.last_error = None;
@@ -285,7 +329,11 @@ async fn when_nfs_read_cross(w: &mut KisekiWorld) {
 
 #[then("the NFS READ returns the same bytes as the S3 PUT")]
 async fn then_nfs_read_matches(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none(), "NFS READ failed: {:?}", w.last_error);
+    assert!(
+        w.last_error.is_none(),
+        "NFS READ failed: {:?}",
+        w.last_error
+    );
     let data = w.server().last_body.as_ref().expect("no read data");
     assert_eq!(data.len(), 1024, "expected 1KB");
     assert!(data.iter().all(|&b| b == 0xAB), "data mismatch");
@@ -303,11 +351,14 @@ async fn given_nfs_write_cross(w: &mut KisekiWorld, payload: String) {
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
     let nfs = Nfs4Client::v41(addr);
 
-    match nfs.write(WriteRequest {
-        tenant_id: OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: NamespaceId(uuid::Uuid::from_u128(0)),
-        data: payload.into_bytes(),
-    }).await {
+    match nfs
+        .write(WriteRequest {
+            tenant_id: OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: NamespaceId(uuid::Uuid::from_u128(0)),
+            data: payload.into_bytes(),
+        })
+        .await
+    {
         Ok(resp) => {
             w.server_mut().last_etag = Some(resp.composition_id.0.to_string());
             w.last_error = None;
@@ -318,9 +369,19 @@ async fn given_nfs_write_cross(w: &mut KisekiWorld, payload: String) {
 
 #[when("a client reads the object via S3 GET")]
 async fn when_s3_get_cross(w: &mut KisekiWorld) {
-    let etag = w.server().last_etag.clone().expect("need composition_id from NFS WRITE");
+    let etag = w
+        .server()
+        .last_etag
+        .clone()
+        .expect("need composition_id from NFS WRITE");
     let url = w.server().s3_url(&format!("default/{}", etag));
-    let resp = w.server().http.get(&url).send().await.expect("S3 GET failed");
+    let resp = w
+        .server()
+        .http
+        .get(&url)
+        .send()
+        .await
+        .expect("S3 GET failed");
     w.server_mut().last_status = Some(resp.status().as_u16());
     let body = resp.bytes().await.unwrap_or_default();
     w.server_mut().last_body = Some(body.to_vec());

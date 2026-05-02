@@ -238,9 +238,7 @@ impl GatewayOps for RemoteHttpGateway {
         parsed["uploadId"]
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| {
-                GatewayError::ProtocolError("start_multipart: missing uploadId".into())
-            })
+            .ok_or_else(|| GatewayError::ProtocolError("start_multipart: missing uploadId".into()))
     }
 
     async fn upload_part(
@@ -285,10 +283,7 @@ impl GatewayOps for RemoteHttpGateway {
         // POST /{bucket}/{key}?uploadId=X
         let ns = "default";
         let key = uuid::Uuid::new_v4();
-        let url = format!(
-            "{}/{}/{}?uploadId={}",
-            self.base_url, ns, key, upload_id
-        );
+        let url = format!("{}/{}/{}?uploadId={}", self.base_url, ns, key, upload_id);
         let resp = self
             .client
             .post(&url)
@@ -318,10 +313,7 @@ impl GatewayOps for RemoteHttpGateway {
         // DELETE /{bucket}/{key}?uploadId=X
         let ns = "default";
         let key = uuid::Uuid::new_v4();
-        let url = format!(
-            "{}/{}/{}?uploadId={}",
-            self.base_url, ns, key, upload_id
-        );
+        let url = format!("{}/{}/{}?uploadId={}", self.base_url, ns, key, upload_id);
         let resp = self
             .client
             .delete(&url)
@@ -365,9 +357,7 @@ impl GatewayOps for RemoteHttpGateway {
             .await
             .map_err(|e| Self::map_error(&e))?;
         // 200 = created, 409 = already exists — both are success.
-        if !resp.status().is_success()
-            && resp.status() != reqwest::StatusCode::CONFLICT
-        {
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::CONFLICT {
             return Err(GatewayError::ProtocolError(format!(
                 "remote ensure_namespace returned HTTP {}",
                 resp.status()

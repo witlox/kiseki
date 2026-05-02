@@ -108,7 +108,8 @@ async fn when_create_view(w: &mut KisekiWorld, name: String) {
 async fn then_view_state(w: &mut KisekiWorld, expected: String) {
     let id = w.last_view_id.expect("view must exist");
     let view = w
-        .legacy.view_store
+        .legacy
+        .view_store
         .get_view(id)
         .expect("view should be retrievable");
     let state_str = match view.state {
@@ -126,7 +127,8 @@ async fn then_view_state(w: &mut KisekiWorld, expected: String) {
 #[when(regex = r#"^the watermark is advanced to (\d+)$"#)]
 async fn when_advance(w: &mut KisekiWorld, pos: u64) {
     let id = w.last_view_id.unwrap();
-    w.legacy.view_store
+    w.legacy
+        .view_store
         .advance_watermark(id, SequenceNumber(pos), 1000)
         .unwrap();
 }
@@ -240,7 +242,10 @@ async fn then_view_current(w: &mut KisekiWorld) {
 #[given(regex = r#"^the NFS view is at watermark (\d+)$"#)]
 async fn given_nfs_view_at_watermark(w: &mut KisekiWorld, wm: u64) {
     if let Some(vid) = w.last_view_id {
-        w.legacy.view_store.advance_watermark(vid, SequenceNumber(wm), 1000).unwrap();
+        w.legacy
+            .view_store
+            .advance_watermark(vid, SequenceNumber(wm), 1000)
+            .unwrap();
     }
 }
 
@@ -847,7 +852,8 @@ async fn when_sp_restarts(w: &mut KisekiWorld) {
 async fn then_reads_last_watermark(w: &mut KisekiWorld, _wm: u64) {
     if let Some(vid) = w.last_view_id {
         let view = w
-            .legacy.view_store
+            .legacy
+            .view_store
             .get_view(vid)
             .expect("view must exist after restart");
         let _ = view.watermark;
@@ -984,7 +990,10 @@ async fn then_kms_resumes(w: &mut KisekiWorld) {
 #[given(regex = r#"^"(\S+)" is at watermark (\d+)$"#)]
 async fn given_sp_at_wm(w: &mut KisekiWorld, _sp: String, wm: u64) {
     if let Some(vid) = w.last_view_id {
-        w.legacy.view_store.advance_watermark(vid, SequenceNumber(wm), 1000).unwrap();
+        w.legacy
+            .view_store
+            .advance_watermark(vid, SequenceNumber(wm), 1000)
+            .unwrap();
     }
 }
 
@@ -1141,13 +1150,15 @@ async fn then_reads_potentially_stale(_w: &mut KisekiWorld) {
 async fn then_no_new_writes(w: &mut KisekiWorld) {
     if let Some(vid) = w.last_view_id {
         let wm_before = w
-            .legacy.view_store
+            .legacy
+            .view_store
             .get_view(vid)
             .map(|v| v.watermark)
             .unwrap_or(SequenceNumber(0));
         w.poll_views().await;
         let wm_after = w
-            .legacy.view_store
+            .legacy
+            .view_store
             .get_view(vid)
             .map(|v| v.watermark)
             .unwrap_or(SequenceNumber(0));
@@ -1349,7 +1360,8 @@ async fn then_lag_values(w: &mut KisekiWorld, v1: String, v2: String) {
     for name in [&v1, &v2] {
         if let Some(&vid) = w.view_ids.get(name.as_str()) {
             let view = w
-                .legacy.view_store
+                .legacy
+                .view_store
                 .get_view(vid)
                 .expect("owned view must exist for lag telemetry");
             let _ = view.last_advanced_ms;

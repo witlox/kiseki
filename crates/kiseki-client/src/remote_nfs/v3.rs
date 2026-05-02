@@ -1,4 +1,3 @@
-
 //! `NFSv3` client (RFC 1813) — stateless RPC procedures over TCP.
 //!
 //! Each `GatewayOps` call maps to one or more `NFSv3` procedures:
@@ -57,10 +56,13 @@ impl Nfs3Client {
         }
     }
 
-    fn ensure_transport(&self) -> Result<std::sync::MutexGuard<'_, Option<RpcTransport>>, GatewayError> {
-        let mut guard = self.transport.lock().map_err(|e| {
-            GatewayError::ProtocolError(format!("lock: {e}"))
-        })?;
+    fn ensure_transport(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<RpcTransport>>, GatewayError> {
+        let mut guard = self
+            .transport
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
         if guard.is_none() {
             *guard = Some(RpcTransport::connect(self.addr)?);
         }
@@ -69,9 +71,10 @@ impl Nfs3Client {
 
     fn ensure_root_fh(&self) -> Result<Vec<u8>, GatewayError> {
         {
-            let fh = self.root_fh.lock().map_err(|e| {
-                GatewayError::ProtocolError(format!("lock: {e}"))
-            })?;
+            let fh = self
+                .root_fh
+                .lock()
+                .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
             if let Some(ref h) = *fh {
                 return Ok(h.clone());
             }
@@ -90,7 +93,12 @@ impl Nfs3Client {
         // Use the bootstrap namespace/tenant UUID format.
         let bootstrap_handle = vec![0u8; 16]; // Kiseki maps all-zero to root
         args.write_opaque(&bootstrap_handle);
-        let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_FSINFO, &args.into_bytes())?;
+        let reply = t.call(
+            NFS_PROGRAM,
+            NFS3_VERSION,
+            NFSPROC3_FSINFO,
+            &args.into_bytes(),
+        )?;
 
         let mut r = XdrReader::new(&reply);
         let status = r.read_u32().map_err(|e| xdr_err(&e))?;
@@ -101,9 +109,10 @@ impl Nfs3Client {
         }
         // post_op_attr follows — we need the handle from it.
         // For now, store the bootstrap handle as root.
-        let mut fh = self.root_fh.lock().map_err(|e| {
-            GatewayError::ProtocolError(format!("lock: {e}"))
-        })?;
+        let mut fh = self
+            .root_fh
+            .lock()
+            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
         *fh = Some(bootstrap_handle.clone());
         Ok(bootstrap_handle)
     }
@@ -127,11 +136,16 @@ impl GatewayOps for Nfs3Client {
         args.write_opaque(&root_fh); // dir handle
         args.write_string(&filename); // name
         args.write_u32(0); // createmode = UNCHECKED
-        // sattr3 (all unset)
+                           // sattr3 (all unset)
         for _ in 0..6 {
             args.write_u32(0); // mode, uid, gid, size, atime, mtime — all "don't set"
         }
-        let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_CREATE, &args.into_bytes())?;
+        let reply = t.call(
+            NFS_PROGRAM,
+            NFS3_VERSION,
+            NFSPROC3_CREATE,
+            &args.into_bytes(),
+        )?;
 
         let mut r = XdrReader::new(&reply);
         let status = r.read_u32().map_err(|e| xdr_err(&e))?;
@@ -145,7 +159,9 @@ impl GatewayOps for Nfs3Client {
         let file_fh = if has_handle != 0 {
             r.read_opaque().map_err(|e| xdr_err(&e))?
         } else {
-            return Err(GatewayError::ProtocolError("CREATE returned no handle".into()));
+            return Err(GatewayError::ProtocolError(
+                "CREATE returned no handle".into(),
+            ));
         };
 
         // WRITE
@@ -155,7 +171,12 @@ impl GatewayOps for Nfs3Client {
         args.write_u32(req.data.len() as u32); // count
         args.write_u32(2); // stable = FILE_SYNC
         args.write_opaque(&req.data);
-        let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_WRITE, &args.into_bytes())?;
+        let reply = t.call(
+            NFS_PROGRAM,
+            NFS3_VERSION,
+            NFSPROC3_WRITE,
+            &args.into_bytes(),
+        )?;
 
         let mut r = XdrReader::new(&reply);
         let status = r.read_u32().map_err(|e| xdr_err(&e))?;
@@ -176,7 +197,12 @@ impl GatewayOps for Nfs3Client {
         let mut args = XdrWriter::new();
         args.write_opaque(&root_fh);
         args.write_string(&filename);
-        let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_LOOKUP, &args.into_bytes())?;
+        let reply = t.call(
+            NFS_PROGRAM,
+            NFS3_VERSION,
+            NFSPROC3_LOOKUP,
+            &args.into_bytes(),
+        )?;
         let mut r = XdrReader::new(&reply);
         let status = r.read_u32().map_err(|e| xdr_err(&e))?;
         if status != NFS3_OK {
@@ -192,9 +218,7 @@ impl GatewayOps for Nfs3Client {
         } else {
             // Defensive fallback — server should always return a
             // 32-byte handle, but if it doesn't, parse the filename.
-            CompositionId(
-                uuid::Uuid::parse_str(&filename).unwrap_or_else(|_| uuid::Uuid::new_v4()),
-            )
+            CompositionId(uuid::Uuid::parse_str(&filename).unwrap_or_else(|_| uuid::Uuid::new_v4()))
         };
 
         Ok(WriteResponse {
@@ -212,7 +236,12 @@ impl GatewayOps for Nfs3Client {
         let mut args = XdrWriter::new();
         args.write_opaque(&root_fh);
         args.write_string(&req.composition_id.0.to_string());
-        let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_LOOKUP, &args.into_bytes())?;
+        let reply = t.call(
+            NFS_PROGRAM,
+            NFS3_VERSION,
+            NFSPROC3_LOOKUP,
+            &args.into_bytes(),
+        )?;
 
         let mut r = XdrReader::new(&reply);
         let status = r.read_u32().map_err(|e| xdr_err(&e))?;
@@ -277,7 +306,12 @@ impl GatewayOps for Nfs3Client {
         let mut args = XdrWriter::new();
         args.write_opaque(&root_fh);
         args.write_string(&composition_id.0.to_string());
-        let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_REMOVE, &args.into_bytes())?;
+        let reply = t.call(
+            NFS_PROGRAM,
+            NFS3_VERSION,
+            NFSPROC3_REMOVE,
+            &args.into_bytes(),
+        )?;
 
         let mut r = XdrReader::new(&reply);
         let status = r.read_u32().map_err(|e| xdr_err(&e))?;

@@ -2350,7 +2350,11 @@ async fn given_five_active_including(w: &mut KisekiWorld, target: String) {
 
 #[when(regex = r#"^the operator runs `kiseki-admin node drain (\S+)`$"#)]
 async fn when_operator_drains(w: &mut KisekiWorld, target: String) {
-    let id = *w.raft.node_names.get(&target).expect("target node registered");
+    let id = *w
+        .raft
+        .node_names
+        .get(&target)
+        .expect("target node registered");
     match w.raft.drain_orch.request_drain(id, "operator") {
         Ok(()) => w.raft.last_drain_error = None,
         Err(e) => w.raft.last_drain_error = Some(e.to_string()),
@@ -2392,11 +2396,17 @@ async fn then_progress_per_shard(w: &mut KisekiWorld) {
     // Replacement must be a node id that's NOT already in the demonstration
     // Raft cluster's initial voter set ({1,2,3}); n4 satisfies that.
     let replacement_id = *w
-        .raft.node_names
+        .raft
+        .node_names
         .get("n4")
         .expect("a replacement candidate exists");
-    let raft = w.raft.drain_raft.as_mut().expect("drain raft cluster present");
-    w.raft.drain_orch
+    let raft = w
+        .raft
+        .drain_raft
+        .as_mut()
+        .expect("drain raft cluster present");
+    w.raft
+        .drain_orch
         .drive_voter_replacements(target_id, replacement_id, "operator", raft)
         .await
         .expect("drive_voter_replacements succeeds");
@@ -2462,7 +2472,8 @@ async fn given_exactly_three_active(w: &mut KisekiWorld) {
 #[then(regex = r#"^the request is refused with "([^"]+)".*$"#)]
 async fn then_request_refused_with(w: &mut KisekiWorld, expected: String) {
     let err = w
-        .raft.last_drain_error
+        .raft
+        .last_drain_error
         .as_ref()
         .expect("drain attempt must have produced an error");
     assert!(

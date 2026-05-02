@@ -90,7 +90,11 @@ async fn given_inline_threshold(w: &mut KisekiWorld, bytes: u64) {
 #[then("the delta is committed with inline data in the payload")]
 async fn then_inline_committed(w: &mut KisekiWorld) {
     assert!(w.last_error.is_none(), "error: {:?}", w.last_error);
-    let delta = w.legacy.last_delta.as_ref().expect("last delta should be set");
+    let delta = w
+        .legacy
+        .last_delta
+        .as_ref()
+        .expect("last delta should be set");
     assert!(
         delta.header.has_inline_data,
         "delta header must mark inline payload",
@@ -107,7 +111,10 @@ async fn then_inline_committed(w: &mut KisekiWorld) {
 
 #[then(regex = r#"^the payload is offloaded to small/objects.redb on apply"#)]
 async fn then_payload_offloaded(w: &mut KisekiWorld) {
-    let key = w.legacy.last_inline_key.expect("inline key recorded by When step");
+    let key = w
+        .legacy
+        .last_inline_key
+        .expect("inline key recorded by When step");
     // Disambiguate from the inherent ChunkId-based get via the trait.
     let stored = <kiseki_chunk::SmallObjectStore as kiseki_common::inline_store::InlineStore>::get(
         &w.legacy.inline_store,
@@ -123,7 +130,11 @@ async fn then_payload_offloaded(w: &mut KisekiWorld) {
 
 #[then("no separate chunk write is required")]
 async fn then_no_chunk_write(w: &mut KisekiWorld) {
-    let delta = w.legacy.last_delta.as_ref().expect("last delta should be set");
+    let delta = w
+        .legacy
+        .last_delta
+        .as_ref()
+        .expect("last delta should be set");
     assert!(
         delta.header.chunk_refs.is_empty(),
         "inline-only delta must carry no chunk_refs (got {})",
@@ -180,7 +191,8 @@ async fn when_append_table(w: &mut KisekiWorld, step: &cucumber::gherkin::Step) 
             }
             // Capture the just-appended delta for downstream Then steps.
             if let Ok(deltas) = w
-                .legacy.log_store
+                .legacy
+                .log_store
                 .read_deltas(kiseki_log::traits::ReadDeltasRequest {
                     shard_id: sid,
                     from: seq,
@@ -239,7 +251,8 @@ async fn then_order(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let tip = w.legacy.log_store.shard_health(sid).await.unwrap().tip;
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -264,7 +277,8 @@ async fn then_no_gaps(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let tip = w.legacy.log_store.shard_health(sid).await.unwrap().tip;
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -513,7 +527,8 @@ async fn then_catchup(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -570,10 +585,16 @@ async fn then_new_shard(w: &mut KisekiWorld, name: String) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let info = w.legacy.log_store.shard_health(sid).await.unwrap();
     if let Some(plan) = plan_split(&info) {
-        execute_split(w.legacy.log_store.as_ref(), &plan).await.unwrap();
+        execute_split(w.legacy.log_store.as_ref(), &plan)
+            .await
+            .unwrap();
         w.shard_names.insert(name, plan.new_shard);
         assert!(
-            w.legacy.log_store.shard_health(plan.new_shard).await.is_ok(),
+            w.legacy
+                .log_store
+                .shard_health(plan.new_shard)
+                .await
+                .is_ok(),
             "new shard should exist after split"
         );
     } else {
@@ -604,7 +625,8 @@ async fn then_serves_reads(w: &mut KisekiWorld, name: String) {
     );
     // Verify reads actually work.
     assert!(w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -688,14 +710,23 @@ async fn when_compact(w: &mut KisekiWorld) {
 #[then(regex = r#"^SSTables are merged by hashed_key and sequence_number$"#)]
 async fn then_merged(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    assert!(w.legacy.log_store.shard_health(sid).await.unwrap().delta_count < 20);
+    assert!(
+        w.legacy
+            .log_store
+            .shard_health(sid)
+            .await
+            .unwrap()
+            .delta_count
+            < 20
+    );
 }
 
 #[then("newer deltas (higher sequence_number) supersede older ones")]
 async fn then_newer(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -725,11 +756,13 @@ async fn given_range(w: &mut KisekiWorld, name: String, _from: u64, to: u64) {
 #[given(regex = r#"^stream processor "(\S+)" has consumed up to sequence (\d+)$"#)]
 async fn given_watermark(w: &mut KisekiWorld, consumer: String, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .register_consumer(sid, &consumer, SequenceNumber(0))
         .await
         .unwrap();
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .advance_watermark(sid, &consumer, SequenceNumber(seq))
         .await
         .unwrap();
@@ -738,11 +771,13 @@ async fn given_watermark(w: &mut KisekiWorld, consumer: String, seq: u64) {
 #[given(regex = r#"^the audit log has consumed up to sequence (\d+)$"#)]
 async fn given_audit_wm(w: &mut KisekiWorld, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .register_consumer(sid, "audit", SequenceNumber(0))
         .await
         .unwrap();
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .advance_watermark(sid, "audit", SequenceNumber(seq))
         .await
         .unwrap();
@@ -764,7 +799,8 @@ async fn then_retained(w: &mut KisekiWorld, from: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let tip = w.legacy.log_store.shard_health(sid).await.unwrap().tip;
     let remaining = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(from),
@@ -793,11 +829,13 @@ async fn given_stalled(w: &mut KisekiWorld, consumer: String, seq: u64) {
         let req = w.make_append_request(sid, 0x60 + i);
         w.legacy.log_store.append_delta(req).await.unwrap();
     }
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .register_consumer(sid, &consumer, SequenceNumber(0))
         .await
         .unwrap();
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .advance_watermark(sid, &consumer, SequenceNumber(seq))
         .await
         .unwrap();
@@ -806,11 +844,13 @@ async fn given_stalled(w: &mut KisekiWorld, consumer: String, seq: u64) {
 #[given(regex = r#"^all other consumers have advanced past sequence (\d+)$"#)]
 async fn given_others(w: &mut KisekiWorld, seq: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .register_consumer(sid, "sp-fast", SequenceNumber(0))
         .await
         .unwrap();
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .advance_watermark(sid, "sp-fast", SequenceNumber(seq))
         .await
         .unwrap();
@@ -840,7 +880,8 @@ async fn then_rejected(w: &mut KisekiWorld) {
 async fn then_reads(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     assert!(w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -868,7 +909,11 @@ async fn given_in_maint(w: &mut KisekiWorld, name: String) {
 #[when("the cluster admin clears maintenance mode")]
 async fn when_clear(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    w.legacy.log_store.set_maintenance(sid, false).await.unwrap();
+    w.legacy
+        .log_store
+        .set_maintenance(sid, false)
+        .await
+        .unwrap();
 }
 
 #[then("AppendDelta commands are accepted again")]
@@ -884,7 +929,8 @@ async fn then_accepted(w: &mut KisekiWorld) {
 async fn when_read_range(w: &mut KisekiWorld, from: u64, to: u64) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(from),
@@ -946,9 +992,21 @@ async fn then_no_pacing(w: &mut KisekiWorld) {
 async fn then_tombstones(w: &mut KisekiWorld) {
     // compact_shard removes tombstones below GC boundary.
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    let before = w.legacy.log_store.shard_health(sid).await.unwrap().delta_count;
+    let before = w
+        .legacy
+        .log_store
+        .shard_health(sid)
+        .await
+        .unwrap()
+        .delta_count;
     let removed = w.legacy.log_store.compact_shard(sid).await.unwrap();
-    let after = w.legacy.log_store.shard_health(sid).await.unwrap().delta_count;
+    let after = w
+        .legacy
+        .log_store
+        .shard_health(sid)
+        .await
+        .unwrap()
+        .delta_count;
     // Compaction should not increase count.
     assert!(after <= before, "compaction should not increase deltas");
 }
@@ -961,7 +1019,15 @@ async fn then_opaque(_w: &mut KisekiWorld) {
 #[then("the resulting SSTable count is reduced")]
 async fn then_reduced(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
-    assert!(w.legacy.log_store.shard_health(sid).await.unwrap().delta_count < 20);
+    assert!(
+        w.legacy
+            .log_store
+            .shard_health(sid)
+            .await
+            .unwrap()
+            .delta_count
+            < 20
+    );
 }
 
 // Admin compaction
@@ -1025,7 +1091,8 @@ async fn then_maint_event(w: &mut KisekiWorld) {
     assert_eq!(health.state, ShardState::Maintenance);
     // Verify reads still work in maintenance.
     assert!(w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -1049,7 +1116,8 @@ async fn then_split_if_needed(w: &mut KisekiWorld, name: String) {
 async fn then_full_envelope(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -1112,10 +1180,15 @@ async fn given_split_boundary(w: &mut KisekiWorld, hex: String) {
     for (i, b) in hex_bytes.iter().enumerate().take(32) {
         boundary[i] = *b;
     }
-    w.legacy.log_store.update_shard_range(source, [0x00; 32], boundary);
-    w.legacy.log_store
+    w.legacy
+        .log_store
+        .update_shard_range(source, [0x00; 32], boundary);
+    w.legacy
+        .log_store
         .update_shard_range(target, boundary, [0xffu8; 32]);
-    w.legacy.log_store.set_shard_state(source, ShardState::Splitting);
+    w.legacy
+        .log_store
+        .set_shard_state(source, ShardState::Splitting);
 }
 
 #[when(regex = r#"^a delta with hashed_key 0x(\S+) is appended$"#)]
@@ -1169,7 +1242,8 @@ async fn then_committed_to(w: &mut KisekiWorld, target_name: String) {
     assert_eq!(drained, 1, "exactly one buffered write must drain");
 
     let health = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .shard_health(target)
         .await
         .expect("target shard exists");
@@ -1199,7 +1273,9 @@ async fn given_compacting(w: &mut KisekiWorld, name: String) {
 async fn given_split_during_compact(w: &mut KisekiWorld) {
     // Set the shard to Splitting state — compaction should still proceed.
     let sid = w.ensure_shard("shard-alpha");
-    w.legacy.log_store.set_shard_state(sid, ShardState::Splitting);
+    w.legacy
+        .log_store
+        .set_shard_state(sid, ShardState::Splitting);
 }
 
 #[then("both operations proceed")]
@@ -1231,8 +1307,15 @@ async fn then_split_new_compact(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let info = w.legacy.log_store.shard_health(sid).await.unwrap();
     if let Some(plan) = plan_split(&info) {
-        execute_split(w.legacy.log_store.as_ref(), &plan).await.unwrap();
-        let new_health = w.legacy.log_store.shard_health(plan.new_shard).await.unwrap();
+        execute_split(w.legacy.log_store.as_ref(), &plan)
+            .await
+            .unwrap();
+        let new_health = w
+            .legacy
+            .log_store
+            .shard_health(plan.new_shard)
+            .await
+            .unwrap();
         // New shard exists with its own state.
         assert_eq!(new_health.state, ShardState::Healthy);
     }
@@ -1292,7 +1375,8 @@ async fn then_hint_no_effect(w: &mut KisekiWorld) {
     let sid = *w.shard_names.get("shard-alpha").unwrap();
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(ReadDeltasRequest {
             shard_id: sid,
             from: SequenceNumber(1),
@@ -1413,8 +1497,12 @@ async fn given_merge_in_progress(w: &mut KisekiWorld, shard1: String, shard2: St
     // Set both inputs to Merging state via real state transition.
     let sid1 = w.ensure_shard(&shard1);
     let sid2 = w.ensure_shard(&shard2);
-    w.legacy.log_store.set_shard_state(sid1, ShardState::Merging);
-    w.legacy.log_store.set_shard_state(sid2, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid1, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid2, ShardState::Merging);
 
     // Pre-register the merged shard under its conventional name so the
     // "after merge completes, the delta is readable from the merged shard"
@@ -1451,8 +1539,12 @@ async fn given_merge_started(w: &mut KisekiWorld, shard1: String, shard2: String
     // Set both shards to Merging — same as above, used for concurrent test.
     let sid1 = w.ensure_shard(&shard1);
     let sid2 = w.ensure_shard(&shard2);
-    w.legacy.log_store.set_shard_state(sid1, ShardState::Merging);
-    w.legacy.log_store.set_shard_state(sid2, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid1, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid2, ShardState::Merging);
 }
 
 #[given(regex = r#"^a MergeShard is in progress for "([^"]*)" and "([^"]*)"$"#)]
@@ -1460,8 +1552,12 @@ async fn given_merge_in_progress_alt(w: &mut KisekiWorld, shard1: String, shard2
     // Create shards and set to Merging state.
     let sid1 = w.ensure_shard(&shard1);
     let sid2 = w.ensure_shard(&shard2);
-    w.legacy.log_store.set_shard_state(sid1, ShardState::Merging);
-    w.legacy.log_store.set_shard_state(sid2, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid1, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid2, ShardState::Merging);
 }
 
 #[given(regex = r#"^a MergeShard has entered cutover \(input shards set to read-only\)$"#)]
@@ -1469,8 +1565,12 @@ async fn given_merge_cutover(w: &mut KisekiWorld) {
     // Create shards in cutover state (read-only via Maintenance).
     let sid1 = w.ensure_shard("shard-f1");
     let sid2 = w.ensure_shard("shard-f2");
-    w.legacy.log_store.set_shard_state(sid1, ShardState::Maintenance);
-    w.legacy.log_store.set_shard_state(sid2, ShardState::Maintenance);
+    w.legacy
+        .log_store
+        .set_shard_state(sid1, ShardState::Maintenance);
+    w.legacy
+        .log_store
+        .set_shard_state(sid2, ShardState::Maintenance);
 }
 
 // --- Scenario: Merge does not block writes ---
@@ -1595,8 +1695,12 @@ async fn then_merge_triggered(w: &mut KisekiWorld) {
         .expect("merge preparation should succeed");
 
     // Set shards to Merging state (prepare validates adjacency + not-busy).
-    w.legacy.log_store.set_shard_state(sid_a, ShardState::Merging);
-    w.legacy.log_store.set_shard_state(sid_b, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid_a, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid_b, ShardState::Merging);
 
     // Create the merged shard in the log store with combined range.
     w.legacy.log_store.create_shard(
@@ -1605,7 +1709,8 @@ async fn then_merge_triggered(w: &mut KisekiWorld) {
         NodeId(1),
         kiseki_log::shard::ShardConfig::default(),
     );
-    w.legacy.log_store
+    w.legacy
+        .log_store
         .update_shard_range(state.merged_shard, state.range_start, state.range_end);
 
     // Execute copy phase through real LogOps.
@@ -1626,7 +1731,8 @@ async fn then_merged_shard_created(w: &mut KisekiWorld, shard_name: String, _ran
         .get(&shard_name)
         .expect("merged shard should be registered");
     let health = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .shard_health(sid)
         .await
         .expect("merged shard should exist in log store");
@@ -1644,7 +1750,8 @@ async fn then_total_order_preserved(w: &mut KisekiWorld) {
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     if health.delta_count > 1 {
         let deltas = w
-            .legacy.log_store
+            .legacy
+            .log_store
             .read_deltas(ReadDeltasRequest {
                 shard_id: sid,
                 from: SequenceNumber(1),
@@ -1667,8 +1774,12 @@ async fn then_shards_retired(w: &mut KisekiWorld, shard1: String, shard2: String
     let sid1 = w.ensure_shard(&shard1);
     let sid2 = w.ensure_shard(&shard2);
     // Transition input shards to Retiring.
-    w.legacy.log_store.set_shard_state(sid1, ShardState::Retiring);
-    w.legacy.log_store.set_shard_state(sid2, ShardState::Retiring);
+    w.legacy
+        .log_store
+        .set_shard_state(sid1, ShardState::Retiring);
+    w.legacy
+        .log_store
+        .set_shard_state(sid2, ShardState::Retiring);
     // Verify state.
     let h1 = w.legacy.log_store.shard_health(sid1).await.unwrap();
     let h2 = w.legacy.log_store.shard_health(sid2).await.unwrap();
@@ -1744,8 +1855,12 @@ async fn when_convergence_timeout(w: &mut KisekiWorld) {
     );
     w.last_error = Some(format!("{:?}", event.reason));
     // Restore input shards to Healthy.
-    w.legacy.log_store.set_shard_state(sid_a, ShardState::Healthy);
-    w.legacy.log_store.set_shard_state(sid_b, ShardState::Healthy);
+    w.legacy
+        .log_store
+        .set_shard_state(sid_a, ShardState::Healthy);
+    w.legacy
+        .log_store
+        .set_shard_state(sid_b, ShardState::Healthy);
 }
 
 #[then("the merge is aborted")]
@@ -1807,8 +1922,12 @@ async fn when_cutover_budget_exceeded(w: &mut KisekiWorld) {
     // We need two shards in Merging state with a lot of traffic.
     let sid_a = w.ensure_shard("shard-f1");
     let sid_b = w.ensure_shard("shard-f2");
-    w.legacy.log_store.set_shard_state(sid_a, ShardState::Merging);
-    w.legacy.log_store.set_shard_state(sid_b, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid_a, ShardState::Merging);
+    w.legacy
+        .log_store
+        .set_shard_state(sid_b, ShardState::Merging);
 
     let event = merge::abort_merge(
         &merge::MergeState {
@@ -1828,8 +1947,12 @@ async fn when_cutover_budget_exceeded(w: &mut KisekiWorld) {
     w.last_error = Some(format!("{:?}", event.reason));
 
     // Restore shards.
-    w.legacy.log_store.set_shard_state(sid_a, ShardState::Healthy);
-    w.legacy.log_store.set_shard_state(sid_b, ShardState::Healthy);
+    w.legacy
+        .log_store
+        .set_shard_state(sid_a, ShardState::Healthy);
+    w.legacy
+        .log_store
+        .set_shard_state(sid_b, ShardState::Healthy);
 }
 
 #[then("the cutover is aborted")]
@@ -1890,7 +2013,8 @@ async fn then_new_raft_group(w: &mut KisekiWorld, shard_name: String) {
         .get(&shard_name)
         .expect("new shard should be registered");
     let health = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .shard_health(sid)
         .await
         .expect("new shard should exist");

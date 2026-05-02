@@ -259,17 +259,23 @@ async fn given_s3_getobject(w: &mut KisekiWorld, _key: String) {
     // Write via kiseki-client S3 so there's something to GET.
     use kiseki_gateway::ops::WriteRequest;
     let s3 = w.server().s3_client();
-    let resp = s3.write(WriteRequest {
-        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-        data: b"s3-object-data".to_vec(),
-    }).await.expect("S3 write");
+    let resp = s3
+        .write(WriteRequest {
+            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+            data: b"s3-object-data".to_vec(),
+        })
+        .await
+        .expect("S3 write");
     w.last_composition_id = Some(resp.composition_id);
 }
 
 #[then(regex = r#"^it resolves the object key in the S3 view "(\S+)"$"#)]
 async fn then_resolves_key(w: &mut KisekiWorld, _view: String) {
-    assert!(w.last_composition_id.is_some(), "should have composition_id from write");
+    assert!(
+        w.last_composition_id.is_some(),
+        "should have composition_id from write"
+    );
 }
 
 #[then(regex = r#"^decrypts using tenant KEK .+ system DEK$"#)]
@@ -278,13 +284,16 @@ async fn then_decrypts_tenant_system(w: &mut KisekiWorld) {
     use kiseki_gateway::ops::ReadRequest;
     let s3 = w.server().s3_client();
     let comp_id = w.last_composition_id.expect("need composition_id");
-    let resp = s3.read(ReadRequest {
-        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-        composition_id: comp_id,
-        offset: 0,
-        length: u64::MAX,
-    }).await.expect("S3 read");
+    let resp = s3
+        .read(ReadRequest {
+            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+            composition_id: comp_id,
+            offset: 0,
+            length: u64::MAX,
+        })
+        .await
+        .expect("S3 read");
     assert_eq!(resp.data, b"s3-object-data", "decrypt roundtrip");
 }
 
@@ -299,7 +308,14 @@ async fn then_returns_s3_tls(w: &mut KisekiWorld) {
 async fn given_s3_list(w: &mut KisekiWorld, _bucket: String, _prefix: String) {
     // PUT so listing is non-empty.
     let url = w.server().s3_url("default/list-fixture");
-    let resp = w.server().http.put(&url).body(b"list-data".to_vec()).send().await.unwrap();
+    let resp = w
+        .server()
+        .http
+        .put(&url)
+        .body(b"list-data".to_vec())
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success());
 }
 
@@ -308,7 +324,11 @@ async fn then_reads_s3_listing(w: &mut KisekiWorld) {
     // GET the listing via S3 HTTP — bucket-level GET.
     let url = w.server().s3_url("default");
     let resp = w.server().http.get(&url).send().await.unwrap();
-    assert!(resp.status().is_success(), "listing GET failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "listing GET failed: {}",
+        resp.status()
+    );
     let body = resp.text().await.unwrap();
     // Server returns XML or JSON listing — just verify non-empty.
     assert!(!body.is_empty(), "listing should be non-empty");
@@ -337,18 +357,24 @@ async fn given_s3_putobject(_w: &mut KisekiWorld, _key: String, _size: String) {
 async fn then_gw_write_pipeline(w: &mut KisekiWorld) {
     use kiseki_gateway::ops::WriteRequest;
     let s3 = w.server().s3_client();
-    let resp = s3.write(WriteRequest {
-        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-        data: b"s3-put-object-body".to_vec(),
-    }).await.expect("S3 write");
+    let resp = s3
+        .write(WriteRequest {
+            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+            data: b"s3-put-object-body".to_vec(),
+        })
+        .await
+        .expect("S3 write");
     assert!(resp.bytes_written > 0);
     w.last_composition_id = Some(resp.composition_id);
 }
 
 #[then("returns S3 200 OK with ETag")]
 async fn then_s3_200(w: &mut KisekiWorld) {
-    assert!(w.last_composition_id.is_some(), "should have composition_id (ETag)");
+    assert!(
+        w.last_composition_id.is_some(),
+        "should have composition_id (ETag)"
+    );
 }
 
 #[then("the object is visible in the S3 view after the stream processor consumes the delta")]
@@ -356,13 +382,16 @@ async fn then_visible_after_consume(w: &mut KisekiWorld) {
     use kiseki_gateway::ops::ReadRequest;
     let s3 = w.server().s3_client();
     let comp_id = w.last_composition_id.expect("need composition_id");
-    let resp = s3.read(ReadRequest {
-        tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-        namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-        composition_id: comp_id,
-        offset: 0,
-        length: u64::MAX,
-    }).await.expect("object should be visible");
+    let resp = s3
+        .read(ReadRequest {
+            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
+            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
+            composition_id: comp_id,
+            offset: 0,
+            length: u64::MAX,
+        })
+        .await
+        .expect("object should be visible");
     assert_eq!(resp.data, b"s3-put-object-body");
 }
 
@@ -373,9 +402,22 @@ async fn given_s3_multipart(w: &mut KisekiWorld, _key: String) {
     // S3 CreateMultipartUpload: POST /<bucket>/<key>?uploads
     // Use a flat key — axum /{bucket}/{key} captures one path segment.
     let flat_key = "multipart-epoch100";
-    let url = format!("{}?uploads", w.server().s3_url(&format!("default/{flat_key}")));
-    let resp = w.server().http.post(&url).send().await.expect("CreateMultipartUpload");
-    assert!(resp.status().is_success(), "CreateMultipartUpload: {}", resp.status());
+    let url = format!(
+        "{}?uploads",
+        w.server().s3_url(&format!("default/{flat_key}"))
+    );
+    let resp = w
+        .server()
+        .http
+        .post(&url)
+        .send()
+        .await
+        .expect("CreateMultipartUpload");
+    assert!(
+        resp.status().is_success(),
+        "CreateMultipartUpload: {}",
+        resp.status()
+    );
     let body = resp.text().await.unwrap_or_default();
     // Server returns JSON {"uploadId": "uuid"} — extract the UUID.
     let upload_id = body
@@ -384,13 +426,19 @@ async fn given_s3_multipart(w: &mut KisekiWorld, _key: String) {
         .and_then(|s| s.split('"').nth(1))
         .map(String::from)
         .unwrap_or_else(|| body.trim().to_string());
-    w.server_mut().response_state.insert("upload_id".into(), upload_id);
+    w.server_mut()
+        .response_state
+        .insert("upload_id".into(), upload_id);
 }
 
 #[when("parts are uploaded:")]
 async fn when_parts_uploaded(w: &mut KisekiWorld) {
-    let upload_id = w.server().response_state.get("upload_id")
-        .cloned().expect("need upload_id");
+    let upload_id = w
+        .server()
+        .response_state
+        .get("upload_id")
+        .cloned()
+        .expect("need upload_id");
     for (i, data) in [b"part-1-data".as_slice(), b"part-2-data", b"part-3-data"]
         .iter()
         .enumerate()
@@ -402,29 +450,50 @@ async fn when_parts_uploaded(w: &mut KisekiWorld) {
             upload_id,
             part_num
         );
-        let resp = w.server().http.put(&url).body(data.to_vec()).send().await
+        let resp = w
+            .server()
+            .http
+            .put(&url)
+            .body(data.to_vec())
+            .send()
+            .await
             .expect("UploadPart");
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        assert!(status.is_success(), "UploadPart {part_num}: {status} — {body}");
+        assert!(
+            status.is_success(),
+            "UploadPart {part_num}: {status} — {body}"
+        );
     }
 }
 
 #[when("the client sends CompleteMultipartUpload")]
 async fn when_complete_multipart(w: &mut KisekiWorld) {
-    let upload_id = w.server().response_state.get("upload_id")
-        .cloned().expect("need upload_id");
+    let upload_id = w
+        .server()
+        .response_state
+        .get("upload_id")
+        .cloned()
+        .expect("need upload_id");
     let url = format!(
         "{}?uploadId={}",
         w.server().s3_url("default/multipart-epoch100"),
         upload_id
     );
-    let resp = w.server().http.post(&url).send().await.expect("CompleteMultipartUpload");
+    let resp = w
+        .server()
+        .http
+        .post(&url)
+        .send()
+        .await
+        .expect("CompleteMultipartUpload");
     w.server_mut().last_status = Some(resp.status().as_u16());
     if let Some(etag) = resp.headers().get("etag") {
         w.server_mut().last_etag = Some(etag.to_str().unwrap_or("").trim_matches('"').to_string());
     }
-    w.last_error = if resp.status().is_success() { None } else {
+    w.last_error = if resp.status().is_success() {
+        None
+    } else {
         Some(format!("CompleteMultipartUpload: {}", resp.status()))
     };
 }
@@ -432,7 +501,11 @@ async fn when_complete_multipart(w: &mut KisekiWorld) {
 #[then("the gateway verifies all chunks are durable")]
 async fn then_verifies_durable(w: &mut KisekiWorld) {
     // Complete succeeded → chunks are durable.
-    assert!(w.last_error.is_none(), "multipart should succeed: {:?}", w.last_error);
+    assert!(
+        w.last_error.is_none(),
+        "multipart should succeed: {:?}",
+        w.last_error
+    );
 }
 
 #[then("submits a finalize delta to Composition")]
@@ -446,7 +519,10 @@ async fn then_visible_after_finalize(w: &mut KisekiWorld) {
     if let Some(etag) = w.server().last_etag.clone() {
         let url = w.server().s3_url(&format!("default/{}", etag));
         let resp = w.server().http.get(&url).send().await.unwrap();
-        assert!(resp.status().is_success(), "object not visible after finalize");
+        assert!(
+            resp.status().is_success(),
+            "object not visible after finalize"
+        );
     }
 }
 
@@ -458,21 +534,31 @@ async fn then_parts_not_visible(_w: &mut KisekiWorld) {
 
 #[then("the completed object contains all parts' data concatenated")]
 async fn then_multipart_data_complete(w: &mut KisekiWorld) {
-    let etag = w.server().last_etag.clone()
+    let etag = w
+        .server()
+        .last_etag
+        .clone()
         .expect("need etag from CompleteMultipartUpload");
     let url = w.server().s3_url(&format!("default/{}", etag));
     let resp = w.server().http.get(&url).send().await.unwrap();
-    assert!(resp.status().is_success(), "GET completed object: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "GET completed object: {}",
+        resp.status()
+    );
     let body = resp.bytes().await.unwrap();
     // Parts were: "part-1-data" + "part-2-data" + "part-3-data" = 33 bytes
     let expected = b"part-1-datapart-2-datapart-3-data";
     assert_eq!(
-        body.len(), expected.len(),
+        body.len(),
+        expected.len(),
         "multipart object should contain all parts ({} bytes), got {} bytes",
-        expected.len(), body.len()
+        expected.len(),
+        body.len()
     );
     assert_eq!(
-        body.as_ref(), expected.as_slice(),
+        body.as_ref(),
+        expected.as_slice(),
         "multipart data mismatch — parts not concatenated correctly"
     );
 }
@@ -501,7 +587,8 @@ async fn given_nfs_open(w: &mut KisekiWorld, path: String) {
 #[given("acquires an NFS byte-range lock on bytes 0-1024")]
 async fn given_nfs_lock(w: &mut KisekiWorld) {
     let fh = fh_from_path(LOCK_PATH);
-    w.legacy.nfs_ctx
+    w.legacy
+        .nfs_ctx
         .locks
         .lock(
             fh,
@@ -604,11 +691,20 @@ async fn when_put_if_none_match(w: &mut KisekiWorld) {
 async fn then_write_succeeds_gw(w: &mut KisekiWorld) {
     // S3 PUT with If-None-Match: * to a new key should succeed.
     let url = w.server().s3_url("default/conditional-test");
-    let resp = w.server().http.put(&url)
+    let resp = w
+        .server()
+        .http
+        .put(&url)
         .header("If-None-Match", "*")
         .body(b"conditional-data".to_vec())
-        .send().await.unwrap();
-    assert!(resp.status().is_success(), "conditional write: {}", resp.status());
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "conditional write: {}",
+        resp.status()
+    );
     w.server_mut().last_status = Some(resp.status().as_u16());
 }
 
@@ -634,16 +730,18 @@ async fn given_transport_tcp(w: &mut KisekiWorld, gw: String) {
     } else {
         panic!("unknown gateway: {gw}");
     };
-    w.server_mut().response_state.insert(
-        format!("tcp_{gw}"),
-        format!("127.0.0.1:{port}"),
-    );
+    w.server_mut()
+        .response_state
+        .insert(format!("tcp_{gw}"), format!("127.0.0.1:{port}"));
 }
 
 #[when("a client connects")]
 async fn when_client_connects(w: &mut KisekiWorld) {
     // Connect to whichever port the Given registered.
-    let addr_str = w.server().response_state.values()
+    let addr_str = w
+        .server()
+        .response_state
+        .values()
         .find(|v| v.starts_with("127.0.0.1:"))
         .cloned()
         .expect("a TCP endpoint must have been configured");
@@ -694,7 +792,14 @@ async fn then_s3_https(w: &mut KisekiWorld) {
 async fn then_s3_rest_semantics(w: &mut KisekiWorld) {
     // PUT + GET roundtrip via the server's S3 endpoint.
     let url = w.server().s3_url("default/s3-rest-test");
-    let resp = w.server().http.put(&url).body(b"s3-semantics".to_vec()).send().await.unwrap();
+    let resp = w
+        .server()
+        .http
+        .put(&url)
+        .body(b"s3-semantics".to_vec())
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success(), "S3 PUT: {}", resp.status());
 }
 
@@ -781,7 +886,8 @@ async fn then_uncommitted_lost(w: &mut KisekiWorld) {
     // After crash, the gateway's request counter is reset — any in-flight
     // writes that hadn't committed to the log are lost.
     assert_eq!(
-        w.legacy.gateway
+        w.legacy
+            .gateway
             .requests_total
             .load(std::sync::atomic::Ordering::Relaxed),
         0,
@@ -821,7 +927,8 @@ async fn when_write_arrives(w: &mut KisekiWorld, _gw: String) {
     // Probe the keystore directly to capture the retriable error.
     use kiseki_keymanager::epoch::KeyManagerOps;
     match w
-        .legacy.key_store
+        .legacy
+        .key_store
         .fetch_master_key(kiseki_common::tenancy::KeyEpoch(1))
         .await
     {
@@ -964,15 +1071,18 @@ async fn given_chunk_storage_partial(w: &mut KisekiWorld) {
     w.legacy.chunk_store.add_pool(pool);
 
     // Write two EC-encoded chunks: one repairable, one we'll exhaust parity on.
-    w.legacy.chunk_store
+    w.legacy
+        .chunk_store
         .write_chunk(ec_envelope_for(REPAIRABLE_CID), EC_POOL)
         .expect("write repairable chunk");
-    w.legacy.chunk_store
+    w.legacy
+        .chunk_store
         .write_chunk(ec_envelope_for(UNREPAIRABLE_CID), EC_POOL)
         .expect("write unrepairable chunk");
 
     // Take one device offline — parity (2) still covers it; repair succeeds.
-    w.legacy.chunk_store
+    w.legacy
+        .chunk_store
         .pool_mut(EC_POOL)
         .expect("pool exists")
         .set_device_online("d3", false);
@@ -1005,7 +1115,8 @@ async fn then_ec_repair_attempted(w: &mut KisekiWorld) {
 async fn then_repair_completes(w: &mut KisekiWorld) {
     let cid = w.last_chunk_id.expect("repairable chunk staged");
     let data = w
-        .legacy.chunk_store
+        .legacy
+        .chunk_store
         .read_chunk_ec(&cid)
         .expect("repair succeeds so read completes");
     assert_eq!(data.len(), 64 * 1024, "reconstructed payload size matches");
@@ -1200,8 +1311,13 @@ async fn given_gw_concurrent(w: &mut KisekiWorld, _wl: String, count: u64) {
 
 #[given("the workload has subscribed to backpressure telemetry")]
 async fn given_backpressure_sub(w: &mut KisekiWorld) {
-    let rx = w.legacy.telemetry_bus.subscribe_backpressure("training-run-42");
-    w.legacy.backpressure_subs.insert("training-run-42".to_owned(), rx);
+    let rx = w
+        .legacy
+        .telemetry_bus
+        .subscribe_backpressure("training-run-42");
+    w.legacy
+        .backpressure_subs
+        .insert("training-run-42".to_owned(), rx);
 }
 
 #[when("the gateway's per-caller queue depth crosses the soft threshold")]
@@ -1212,7 +1328,9 @@ async fn when_queue_crosses_threshold(w: &mut KisekiWorld) {
         severity: kiseki_advisory::BackpressureSeverity::Soft,
         retry_after_ms: kiseki_advisory::bucket_retry_after_ms(75),
     };
-    w.legacy.telemetry_bus.emit_backpressure("training-run-42", event);
+    w.legacy
+        .telemetry_bus
+        .emit_backpressure("training-run-42", event);
 }
 
 #[then(
@@ -1220,7 +1338,8 @@ async fn when_queue_crosses_threshold(w: &mut KisekiWorld) {
 )]
 async fn then_backpressure_event(w: &mut KisekiWorld) {
     let rx = w
-        .legacy.backpressure_subs
+        .legacy
+        .backpressure_subs
         .get_mut("training-run-42")
         .expect("workload was subscribed in Given step");
     let event = rx
@@ -1247,7 +1366,10 @@ async fn then_caller_queue_only(w: &mut KisekiWorld) {
     // `kiseki-advisory::telemetry_bus::tests`, lifted into BDD so the
     // assertion exercises the live shared bus rather than a constructor
     // property of a fresh fixture.
-    let mut neighbour = w.legacy.telemetry_bus.subscribe_backpressure("other-workload");
+    let mut neighbour = w
+        .legacy
+        .telemetry_bus
+        .subscribe_backpressure("other-workload");
     w.legacy.telemetry_bus.emit_backpressure(
         "training-run-42",
         kiseki_advisory::BackpressureEvent {
@@ -1453,7 +1575,9 @@ async fn when_gw_computes_headroom(w: &mut KisekiWorld) {
         75..=99 => kiseki_advisory::QosHeadroomBucket::Tight,
         _ => kiseki_advisory::QosHeadroomBucket::Exhausted,
     };
-    w.legacy.telemetry_bus.emit_qos_headroom("training-run-42", bucket);
+    w.legacy
+        .telemetry_bus
+        .emit_qos_headroom("training-run-42", bucket);
     w.last_error = None;
 }
 
@@ -1462,7 +1586,8 @@ async fn then_bucketed_fraction(w: &mut KisekiWorld) {
     // Drain the caller's subscription — the value MUST be one of the four
     // canonical buckets and nothing else (no raw byte counts, no fractions).
     let rx = w
-        .legacy.qos_subs
+        .legacy
+        .qos_subs
         .get_mut("training-run-42")
         .expect("workload subscribed in Given");
     let bucket = rx
@@ -1487,8 +1612,12 @@ async fn then_no_neighbour_headroom(w: &mut KisekiWorld) {
     // same live bus, emit only on training-run-42, then assert the
     // neighbour's channel is empty. This exercises the real per-caller
     // routing rather than a constructor property of a fresh enforcer.
-    let mut neighbour = w.legacy.telemetry_bus.subscribe_qos_headroom("other-workload");
-    w.legacy.telemetry_bus
+    let mut neighbour = w
+        .legacy
+        .telemetry_bus
+        .subscribe_qos_headroom("other-workload");
+    w.legacy
+        .telemetry_bus
         .emit_qos_headroom("training-run-42", kiseki_advisory::QosHeadroomBucket::Tight);
     assert!(
         neighbour.try_recv().is_err(),

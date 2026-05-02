@@ -170,7 +170,8 @@ async fn then_project_created(w: &mut KisekiWorld, proj_name: String, _org_name:
 async fn then_inherits_tags(w: &mut KisekiWorld, _org_tags: String, _proj_tags: String) {
     let org = w.control.tenant_store.get_org("org-pharma").unwrap();
     let proj_id = w
-        .control.last_project_id
+        .control
+        .last_project_id
         .as_ref()
         .expect("no project created");
     let proj = w.control.tenant_store.get_project(proj_id).unwrap();
@@ -322,7 +323,8 @@ async fn then_shards_read_only(w: &mut KisekiWorld) {
 
 #[then(regex = r"^ShardMaintenanceEntered events are emitted$")]
 async fn then_maintenance_events(w: &mut KisekiWorld) {
-    w.control.audit_events
+    w.control
+        .audit_events
         .push("ShardMaintenanceEntered".into());
 }
 
@@ -330,7 +332,8 @@ async fn then_maintenance_events(w: &mut KisekiWorld) {
 async fn then_writes_rejected_retriable(w: &mut KisekiWorld) {
     assert!(w.control.maintenance.is_enabled());
     let result = w
-        .control.namespace_store
+        .control
+        .namespace_store
         .create(kiseki_control::namespace::Namespace {
             id: "test-write-rejected".into(),
             org_id: "org-test".into(),
@@ -441,7 +444,8 @@ async fn when_submit_access_request(w: &mut KisekiWorld, admin: String, tenant: 
 #[then(regex = r#"^the request is queued for tenant admin "([^"]*)" approval$"#)]
 async fn then_queued(w: &mut KisekiWorld, _admin: String) {
     let req = w
-        .control.last_access_req
+        .control
+        .last_access_req
         .as_ref()
         .expect("no access request");
     assert_eq!(
@@ -482,7 +486,8 @@ async fn given_approves(w: &mut KisekiWorld, _tenant_admin: String, cluster_admi
             4,
         ));
     }
-    w.control.last_access_req
+    w.control
+        .last_access_req
         .as_mut()
         .unwrap()
         .approve()
@@ -497,7 +502,8 @@ async fn when_approval_processed(w: &mut KisekiWorld) {
 #[then(regex = r#"^"([^"]*)" can read tenant config/logs for "([^"]*)" namespace only$"#)]
 async fn then_can_read(w: &mut KisekiWorld, _admin: String, _namespace: String) {
     let req = w
-        .control.last_access_req
+        .control
+        .last_access_req
         .as_ref()
         .expect("no access request");
     assert!(req.is_active(), "access should be active after approval");
@@ -506,7 +512,8 @@ async fn then_can_read(w: &mut KisekiWorld, _admin: String, _namespace: String) 
 #[then(regex = r"^access expires after (\d+) hours automatically$")]
 async fn then_expires(w: &mut KisekiWorld, hours: u32) {
     let req = w
-        .control.last_access_req
+        .control
+        .last_access_req
         .as_ref()
         .expect("no access request");
     assert_eq!(req.duration_hours, hours);
@@ -533,7 +540,8 @@ async fn given_denies(w: &mut KisekiWorld, _tenant_admin: String, cluster_admin:
             4,
         ));
     }
-    w.control.last_access_req
+    w.control
+        .last_access_req
         .as_mut()
         .unwrap()
         .deny()
@@ -543,7 +551,8 @@ async fn given_denies(w: &mut KisekiWorld, _tenant_admin: String, cluster_admin:
 #[then(regex = r#"^"([^"]*)" cannot access any "([^"]*)" tenant data$"#)]
 async fn then_still_denied(w: &mut KisekiWorld, _admin: String, _tenant: String) {
     let req = w
-        .control.last_access_req
+        .control
+        .last_access_req
         .as_ref()
         .expect("no access request");
     assert!(!req.is_active(), "access should not be active after denial");
@@ -924,7 +933,8 @@ async fn then_removal_reason(w: &mut KisekiWorld, _reason: String) {
 #[given(regex = r#"^tenant admin sets retention hold on namespace "([^"]*)":$"#)]
 async fn given_retention_hold(w: &mut KisekiWorld, ns_name: String) {
     let _ = w
-        .control.retention_store
+        .control
+        .retention_store
         .set_hold("hipaa-litigation-2026", &ns_name);
 }
 
@@ -953,7 +963,8 @@ async fn given_hold_expired(w: &mut KisekiWorld, _hold: String) {
 #[when("the hold is released")]
 async fn when_hold_released(w: &mut KisekiWorld) {
     let _ = w
-        .control.retention_store
+        .control
+        .retention_store
         .release_hold("hipaa-litigation-2026");
 }
 
@@ -1210,7 +1221,8 @@ async fn given_wl_profiles(w: &mut KisekiWorld, wl: String, proj: String, profil
         allowed_profiles: split_profiles(&profiles),
     };
     let proj_policy = w
-        .control.project_policy
+        .control
+        .project_policy
         .as_ref()
         .expect("project policy not set");
     validate_profile_inheritance(&proj_policy.profiles, &wl_profiles)
@@ -1229,7 +1241,8 @@ async fn given_wl_profiles(w: &mut KisekiWorld, wl: String, proj: String, profil
 )]
 async fn then_effective_profiles(w: &mut KisekiWorld, _wl: String, expected: String) {
     let wl = w
-        .control.workload_policy
+        .control
+        .workload_policy
         .as_ref()
         .expect("workload policy not set");
     let expected_list = split_profiles(&expected);
@@ -1282,7 +1295,8 @@ async fn when_wl_budget_exceeds(w: &mut KisekiWorld, _wl: String, hps: u32) {
         ..Default::default()
     };
     let proj = w
-        .control.project_policy
+        .control
+        .project_policy
         .as_ref()
         .expect("project policy not set");
     match validate_budget_inheritance(&proj.budget, &child) {
@@ -1379,7 +1393,8 @@ async fn then_all_disabled(w: &mut KisekiWorld) {
 
 #[then("active workflows across tenants are audit-ended")]
 async fn then_tenants_audit_ended(w: &mut KisekiWorld) {
-    w.control.audit_events
+    w.control
+        .audit_events
         .push("cluster-workflow-audit-ended".into());
 }
 
@@ -1526,9 +1541,11 @@ async fn when_pool_handles_minted(w: &mut KisekiWorld) {
     // Pool authorization happens in the Given step (client.rs).
     // Populate control_pool_authorized for our assertions.
     if w.control.pool_authorized.is_empty() {
-        w.control.pool_authorized
+        w.control
+            .pool_authorized
             .insert("fast-nvme".into(), "pool-0af7".into());
-        w.control.pool_authorized
+        w.control
+            .pool_authorized
             .insert("bulk-nvme".into(), "pool-921c".into());
     }
 }
@@ -1599,7 +1616,10 @@ async fn then_resolve_policy(_w: &mut KisekiWorld) {
     // Native clients resolve cache policy via data-path gRPC or gateway.
     // Structural guarantee: policy resolution functions exist in kiseki_control::cache_policy.
     let defaults = kiseki_control::cache_policy::conservative_defaults();
-    assert!(defaults.cache_enabled, "default policy should have caching enabled");
+    assert!(
+        defaults.cache_enabled,
+        "default policy should have caching enabled"
+    );
 }
 
 #[given(regex = r#"^cluster allows cache modes \{([^}]*)\}$"#)]
@@ -1617,7 +1637,7 @@ async fn given_org_sets_modes(w: &mut KisekiWorld, org: String, _modes: String) 
 #[then(regex = r#"^workloads under "([^"]*)" cannot use pinned mode$"#)]
 async fn then_cannot_use_pinned(_w: &mut KisekiWorld, _org: String) {
     // Verify that pinned mode is clamped when not in the allowed set.
-    use kiseki_control::cache_policy::{CacheMode, clamp_cache_mode};
+    use kiseki_control::cache_policy::{clamp_cache_mode, CacheMode};
     let org_allowed = vec![CacheMode::Organic, CacheMode::Bypass];
     let clamped = clamp_cache_mode(&CacheMode::Pinned, &org_allowed);
     assert_ne!(clamped, CacheMode::Pinned, "pinned should be disallowed");
@@ -1662,7 +1682,7 @@ async fn when_disable_cache_workload(_w: &mut KisekiWorld, _wl: String) {
 #[then(regex = r#"^clients running as "([^"]*)" operate with cache disabled \(bypass\)$"#)]
 async fn then_cache_disabled_bypass(_w: &mut KisekiWorld, _wl: String) {
     // With cache disabled, effective mode resolves to Bypass.
-    use kiseki_control::cache_policy::{CacheMode, CachePolicy, resolve_effective_mode};
+    use kiseki_control::cache_policy::{resolve_effective_mode, CacheMode, CachePolicy};
     let disabled_policy = CachePolicy {
         cache_enabled: false,
         allowed_modes: vec![CacheMode::Organic],
@@ -1672,7 +1692,11 @@ async fn then_cache_disabled_bypass(_w: &mut KisekiWorld, _wl: String) {
         staging_enabled: false,
     };
     let mode = resolve_effective_mode(&disabled_policy);
-    assert_eq!(mode, CacheMode::Bypass, "disabled cache must resolve to bypass");
+    assert_eq!(
+        mode,
+        CacheMode::Bypass,
+        "disabled cache must resolve to bypass"
+    );
 }
 
 #[then("no plaintext is written to local NVMe for that workload")]
@@ -1762,7 +1786,10 @@ async fn then_data_path_proceeds(_w: &mut KisekiWorld) {
     // Data-path operations proceed normally even with conservative defaults.
     // Structural guarantee: conservative_defaults() always returns a valid policy.
     let defaults = kiseki_control::cache_policy::conservative_defaults();
-    assert!(defaults.cache_enabled, "conservative defaults enable data-path operations");
+    assert!(
+        defaults.cache_enabled,
+        "conservative defaults enable data-path operations"
+    );
 }
 
 // --- Helpers ---

@@ -34,8 +34,7 @@ async fn when_s3_put(w: &mut KisekiWorld, body: String, key: String) {
     );
     // Capture etag from response headers.
     if let Some(etag) = resp.headers().get("etag") {
-        w.server_mut().last_etag =
-            Some(etag.to_str().unwrap_or("").trim_matches('"').to_string());
+        w.server_mut().last_etag = Some(etag.to_str().unwrap_or("").trim_matches('"').to_string());
     }
 }
 

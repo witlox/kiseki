@@ -25,14 +25,21 @@ use crate::KisekiWorld;
 /// `set_voters` to make the voter list reflect the most recent
 /// Given regardless of registration order.
 fn ensure_node(world: &mut KisekiWorld, name: &str, voter_in_shards: Vec<u64>) -> NodeId {
-    let id = *world.raft.node_names.entry(name.to_owned()).or_insert_with(|| {
-        let n: u64 = name
-            .trim_start_matches("node-")
-            .parse()
-            .unwrap_or_else(|_| panic!("expected node name like 'node-1', got {name:?}"));
-        NodeId(n)
-    });
-    world.raft.drain_orch.register_node(id, voter_in_shards.clone());
+    let id = *world
+        .raft
+        .node_names
+        .entry(name.to_owned())
+        .or_insert_with(|| {
+            let n: u64 = name
+                .trim_start_matches("node-")
+                .parse()
+                .unwrap_or_else(|_| panic!("expected node name like 'node-1', got {name:?}"));
+            NodeId(n)
+        });
+    world
+        .raft
+        .drain_orch
+        .register_node(id, voter_in_shards.clone());
     if !voter_in_shards.is_empty() {
         world.raft.drain_orch.set_voters(id, voter_in_shards);
     }
@@ -41,7 +48,8 @@ fn ensure_node(world: &mut KisekiWorld, name: &str, voter_in_shards: Vec<u64>) -
 
 fn node_id(world: &KisekiWorld, name: &str) -> NodeId {
     *world
-        .raft.node_names
+        .raft
+        .node_names
         .get(name)
         .unwrap_or_else(|| panic!("node {name} not registered — Given missing?"))
 }
@@ -132,7 +140,8 @@ async fn given_node1_draining_no_leader(world: &mut KisekiWorld) {
     world.raft.drain_orch.set_state(id, NodeState::Draining);
     // Strip leadership: anything node-1 led now belongs to node-2.
     let owned: Vec<String> = world
-        .raft.shard_leaders
+        .raft
+        .shard_leaders
         .iter()
         .filter(|(_, owner)| *owner == "node-1")
         .map(|(s, _)| s.clone())
@@ -247,7 +256,8 @@ async fn when_drainnode(world: &mut KisekiWorld, target: String) {
             // Strip leadership on success — production drain
             // orchestrator does this via leadership transfer.
             let owned: Vec<String> = world
-                .raft.shard_leaders
+                .raft
+                .shard_leaders
                 .iter()
                 .filter(|(_, owner)| **owner == target)
                 .map(|(s, _)| s.clone())
@@ -316,7 +326,8 @@ async fn when_run_voter_replacements(world: &mut KisekiWorld) {
     let total = u32::try_from(rec.voter_in_shards.len()).unwrap_or(0);
     for i in 0..total {
         world
-            .raft.drain_orch
+            .raft
+            .drain_orch
             .record_voter_replaced(target, i, replacement, "operator");
     }
 }
@@ -355,7 +366,8 @@ async fn when_admin_reactivate(world: &mut KisekiWorld) {
 #[when(regex = r#"^the auto-split trigger fires for "([^"]+)"$"#)]
 async fn when_auto_split_fires(world: &mut KisekiWorld, name: String) {
     world
-        .control.audit_events
+        .control
+        .audit_events
         .push(format!("AutoSplitFired:{name}"));
 }
 
@@ -385,7 +397,8 @@ async fn then_active_to_draining(world: &mut KisekiWorld, n: u64) {
 )]
 async fn then_leadership_transferred(world: &mut KisekiWorld, shard: String) {
     let owner = world
-        .raft.shard_leaders
+        .raft
+        .shard_leaders
         .get(&shard)
         .expect("shard had a leader assignment");
     assert_ne!(owner, "node-1", "leader for {shard} must move off node-1");
@@ -399,7 +412,11 @@ async fn then_leadership_similarly_transferred(world: &mut KisekiWorld, shard: S
 #[then(regex = r#"^node-(\d+) holds zero leader assignments$"#)]
 async fn then_zero_leader_assignments(world: &mut KisekiWorld, n: u64) {
     let key = format!("node-{n}");
-    let still_owns = world.raft.shard_leaders.iter().any(|(_, owner)| *owner == key);
+    let still_owns = world
+        .raft
+        .shard_leaders
+        .iter()
+        .any(|(_, owner)| *owner == key);
     assert!(!still_owns, "node-{n} must hold zero leader assignments");
 }
 
@@ -507,7 +524,8 @@ async fn then_node_remains_evicted(world: &mut KisekiWorld, n: u64) {
 #[then(regex = r#"^no leadership transfer or voter replacement is attempted$"#)]
 async fn then_no_transfer_attempted(world: &mut KisekiWorld) {
     let still_node1 = world
-        .raft.shard_leaders
+        .raft
+        .shard_leaders
         .iter()
         .any(|(_, owner)| owner == "node-1");
     // If a previous Given placed leaders on node-1 and the request
@@ -555,7 +573,8 @@ async fn then_drain_completes_standard(world: &mut KisekiWorld) {
     let replacement = node_id(world, "node-4");
     for i in 0..target_total {
         world
-            .raft.drain_orch
+            .raft
+            .drain_orch
             .record_voter_replaced(id, i, replacement, "operator");
     }
     assert_eq!(world.raft.drain_orch.state(id), Some(NodeState::Evicted));
@@ -764,10 +783,14 @@ async fn then_drain_completes_successfully(world: &mut KisekiWorld) {
         let total = u32::try_from(voter_count).unwrap_or(0);
         for i in 0..total {
             world
-                .raft.drain_orch
+                .raft
+                .drain_orch
                 .record_voter_replaced(target, i, replacement, "operator");
         }
-        assert_eq!(world.raft.drain_orch.state(target), Some(NodeState::Evicted));
+        assert_eq!(
+            world.raft.drain_orch.state(target),
+            Some(NodeState::Evicted)
+        );
     }
 }
 

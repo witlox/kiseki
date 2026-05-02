@@ -54,8 +54,7 @@ pub struct LegacyState {
     pub telemetry_bus: Arc<kiseki_advisory::TelemetryBus>,
     pub backpressure_subs:
         HashMap<String, tokio::sync::mpsc::Receiver<kiseki_advisory::BackpressureEvent>>,
-    pub qos_subs:
-        HashMap<String, tokio::sync::mpsc::Receiver<kiseki_advisory::QosHeadroomBucket>>,
+    pub qos_subs: HashMap<String, tokio::sync::mpsc::Receiver<kiseki_advisory::QosHeadroomBucket>>,
 
     // Inline store (ADR-030)
     pub inline_store: Arc<kiseki_chunk::SmallObjectStore>,
@@ -64,8 +63,7 @@ pub struct LegacyState {
     pub last_delta: Option<kiseki_log::delta::Delta>,
 
     // Persistence harness
-    pub persistent_shard_store:
-        Option<Arc<kiseki_log::persistent_store::PersistentShardStore>>,
+    pub persistent_shard_store: Option<Arc<kiseki_log::persistent_store::PersistentShardStore>>,
     pub persistent_temp_dir: Option<tempfile::TempDir>,
 
     // TCP transport endpoints
@@ -74,10 +72,8 @@ pub struct LegacyState {
     pub s3_tasks: Vec<tokio::task::JoinHandle<()>>,
 
     // Topology events (ADR-038 Phase 15d)
-    pub topology_bus:
-        Option<Arc<kiseki_control::topology_events::TopologyEventBus>>,
-    pub topology_sub:
-        Option<kiseki_control::topology_events::TopologyEventSubscriber>,
+    pub topology_bus: Option<Arc<kiseki_control::topology_events::TopologyEventBus>>,
+    pub topology_sub: Option<kiseki_control::topology_events::TopologyEventSubscriber>,
 }
 
 impl Drop for LegacyState {
@@ -96,40 +92,30 @@ impl LegacyState {
         let audit_log = Arc::new(AuditLog::new());
         let key_store = MemKeyStore::new().unwrap_or_else(|_| MemKeyStore::default());
         let _ = key_store.set_audit_log(
-            Arc::clone(&audit_log)
-                as Arc<dyn kiseki_audit::store::AuditOps + Send + Sync>,
+            Arc::clone(&audit_log) as Arc<dyn kiseki_audit::store::AuditOps + Send + Sync>
         );
 
         let mem_shard_store = Arc::new(MemShardStore::new());
         let log_store: Arc<dyn LogOps + Send + Sync> =
             Arc::clone(&mem_shard_store) as Arc<dyn LogOps + Send + Sync>;
 
-        let inline_temp_dir =
-            tempfile::tempdir().expect("tempdir for inline small_object store");
+        let inline_temp_dir = tempfile::tempdir().expect("tempdir for inline small_object store");
         let inline_store = Arc::new(
-            kiseki_chunk::SmallObjectStore::open(
-                &inline_temp_dir.path().join("objects.redb"),
-            )
-            .expect("open small_object store"),
+            kiseki_chunk::SmallObjectStore::open(&inline_temp_dir.path().join("objects.redb"))
+                .expect("open small_object store"),
         );
         let _ = mem_shard_store.set_inline_store(
-            Arc::clone(&inline_store)
-                as Arc<dyn kiseki_common::inline_store::InlineStore>,
+            Arc::clone(&inline_store) as Arc<dyn kiseki_common::inline_store::InlineStore>
         );
         let comp_store = CompositionStore::new().with_log(Arc::clone(&log_store));
 
         let gw_chunks = kiseki_chunk::ChunkStore::new();
         let mut gw_comps = CompositionStore::new()
             .with_log(Arc::clone(&log_store) as Arc<dyn LogOps + Send + Sync>);
-        let gw_master =
-            kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let gw_master = kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], KeyEpoch(1));
 
-        let default_ns = NamespaceId(uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_DNS,
-            b"default",
-        ));
-        let default_tenant =
-            OrgId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"org-test"));
+        let default_ns = NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
+        let default_tenant = OrgId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"org-test"));
         let default_shard = ShardId(uuid::Uuid::from_u128(1));
         mem_shard_store.create_shard(
             default_shard,
@@ -150,17 +136,12 @@ impl LegacyState {
         let telemetry_bus = Arc::new(kiseki_advisory::TelemetryBus::new());
 
         let gateway = Arc::new(
-            InMemoryGateway::new(
-                gw_comps,
-                kiseki_chunk::arc_async(gw_chunks),
-                gw_master,
-            )
-            .with_shard_map(Arc::clone(&shard_map_store)),
+            InMemoryGateway::new(gw_comps, kiseki_chunk::arc_async(gw_chunks), gw_master)
+                .with_shard_map(Arc::clone(&shard_map_store)),
         );
         gateway.set_telemetry_bus(Arc::clone(&telemetry_bus));
         let nfs_gw = NfsGateway::new(Arc::clone(&gateway));
-        let nfs_ctx =
-            Arc::new(NfsContext::new(nfs_gw, default_tenant, default_ns));
+        let nfs_ctx = Arc::new(NfsContext::new(nfs_gw, default_tenant, default_ns));
 
         Self {
             log_store,

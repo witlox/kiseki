@@ -44,8 +44,7 @@ pub struct ClusterChunkServer {
     /// times is idempotent. Discovered 2026-05-02 — without this, a
     /// 6-node EC 4+2 read returns "AEAD authentication failed" even
     /// though every fragment fetch succeeds.
-    chunk_envelope_meta:
-        std::sync::Mutex<std::collections::HashMap<RustChunkId, EnvelopeMeta>>,
+    chunk_envelope_meta: std::sync::Mutex<std::collections::HashMap<RustChunkId, EnvelopeMeta>>,
 }
 
 #[derive(Clone)]

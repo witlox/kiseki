@@ -39,7 +39,8 @@ fn provider_for(w: &KisekiWorld, name: &str) -> Arc<dyn TenantKmsProvider> {
         other => other,
     };
     Arc::clone(
-        w.kms.providers
+        w.kms
+            .providers
             .get(canonical)
             .or_else(|| w.kms.providers.get("internal"))
             .expect("internal provider always registered"),
@@ -252,7 +253,8 @@ async fn then_health_check(w: &mut KisekiWorld) {
 #[then("a test wrap/unwrap round-trip succeeds")]
 async fn then_wrap_unwrap_roundtrip(w: &mut KisekiWorld) {
     let provider_name = w
-        .kms.provider_type
+        .kms
+        .provider_type
         .as_deref()
         .unwrap_or("internal")
         .to_owned();
@@ -1128,7 +1130,8 @@ async fn when_key_rotation(w: &mut KisekiWorld) {
     // (ADR-028). The system-key store also rotates so the existing
     // last_epoch assertions still hold.
     let provider_name = w
-        .kms.provider_type
+        .kms
+        .provider_type
         .as_deref()
         .unwrap_or("internal")
         .to_owned();
@@ -1263,7 +1266,11 @@ async fn then_hsm_rewrap(_w: &mut KisekiWorld) {
 async fn then_old_key_retained(_w: &mut KisekiWorld) {
     // Old epoch key retained for migration. MemKeyStore keeps all epoch keys.
     assert!(
-        _w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok(),
+        _w.legacy
+            .key_store
+            .fetch_master_key(KeyEpoch(1))
+            .await
+            .is_ok(),
         "old epoch key should be retained"
     );
 }
@@ -1746,7 +1753,12 @@ async fn then_unaffected(_w: &mut KisekiWorld, _tenant: String) {
 
 #[then("system master keys are unaffected")]
 async fn then_system_keys_safe(w: &mut KisekiWorld) {
-    assert!(w.legacy.key_store.fetch_master_key(KeyEpoch(1)).await.is_ok());
+    assert!(w
+        .legacy
+        .key_store
+        .fetch_master_key(KeyEpoch(1))
+        .await
+        .is_ok());
 }
 
 #[then(regex = r#"^the compromise is contained to "(\S+)" boundary$"#)]

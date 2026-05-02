@@ -150,12 +150,14 @@ async fn given_chunk_refcount(w: &mut KisekiWorld, _name: String, count: u64) {
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     // write_chunk starts with refcount 1; adjust to the requested count.
     if count == 0 {
-        w.legacy.chunk_store
+        w.legacy
+            .chunk_store
             .decrement_refcount(&ChunkId([0x42; 32]))
             .unwrap();
     } else {
         for _ in 1..count {
-            w.legacy.chunk_store
+            w.legacy
+                .chunk_store
                 .increment_refcount(&ChunkId([0x42; 32]))
                 .unwrap();
         }
@@ -190,7 +192,10 @@ async fn then_deleted(w: &mut KisekiWorld, _name: String) {
 #[given(regex = r#"^a retention hold "(\S+)" is active on.*chunk.*$"#)]
 async fn given_hold(w: &mut KisekiWorld, hold_name: String) {
     if let Some(id) = w.last_chunk_id {
-        w.legacy.chunk_store.set_retention_hold(&id, &hold_name).unwrap();
+        w.legacy
+            .chunk_store
+            .set_retention_hold(&id, &hold_name)
+            .unwrap();
     }
 }
 
@@ -257,7 +262,8 @@ async fn given_chunk_with_id(w: &mut KisekiWorld, tenant: String, _name: String,
     w.last_chunk_id = Some(env.chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     for _ in 1..count {
-        w.legacy.chunk_store
+        w.legacy
+            .chunk_store
             .increment_refcount(&ChunkId([0x01; 32]))
             .unwrap();
     }
@@ -282,7 +288,8 @@ async fn then_no_new_chunk(w: &mut KisekiWorld) {
         .last_chunk_id
         .expect("last_chunk_id must be set by a prior Given step");
     let rc = w
-        .legacy.chunk_store
+        .legacy
+        .chunk_store
         .refcount(&id)
         .unwrap_or_else(|e| panic!("refcount lookup failed for {id}: {e}"));
     assert!(
@@ -309,7 +316,8 @@ async fn given_chunk_rc(w: &mut KisekiWorld, tenant: String, _name: String, coun
     w.last_chunk_id = Some(env.chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     for _ in 1..count {
-        w.legacy.chunk_store
+        w.legacy
+            .chunk_store
             .increment_refcount(&ChunkId([0x01; 32]))
             .unwrap();
     }
@@ -590,7 +598,8 @@ async fn given_tenant_chunks(w: &mut KisekiWorld, tenant: String, chunks: String
 #[given(regex = r#"^a retention hold "(\S+)" is set on namespace "(\S+)"$"#)]
 async fn given_ns_hold(w: &mut KisekiWorld, hold: String, _ns: String) {
     for b in [0x01u8, 0x02, 0x03] {
-        w.legacy.chunk_store
+        w.legacy
+            .chunk_store
             .set_retention_hold(&ChunkId([b; 32]), &hold)
             .unwrap();
     }
@@ -1433,7 +1442,8 @@ async fn given_retention_comp(w: &mut KisekiWorld, _name: String, _years: u64) {
     let env = test_envelope(0x99);
     w.last_chunk_id = Some(env.chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    w.legacy.chunk_store
+    w.legacy
+        .chunk_store
         .set_retention_hold(&ChunkId([0x99; 32]), "retention-hold")
         .unwrap();
 }

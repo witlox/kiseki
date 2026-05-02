@@ -20,14 +20,16 @@ use crate::KisekiWorld;
 
 /// Get the raft cluster or panic with a clear message.
 fn cluster(w: &KisekiWorld) -> &RaftTestCluster {
-    w.raft.cluster
+    w.raft
+        .cluster
         .as_ref()
         .expect("raft_cluster not initialised — Background step must run first")
 }
 
 /// Get a `&mut` cluster handle for membership operations.
 fn cluster_mut(w: &mut KisekiWorld) -> &mut RaftTestCluster {
-    w.raft.cluster
+    w.raft
+        .cluster
         .as_mut()
         .expect("raft_cluster not initialised — Background step must run first")
 }
@@ -142,7 +144,8 @@ async fn then_read_after_write(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -326,7 +329,8 @@ async fn then_catches_up(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -525,7 +529,8 @@ async fn then_local_replay(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("shard-alpha");
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -904,7 +909,8 @@ async fn when_immediate_read_leader(w: &mut KisekiWorld, shard: String) {
     let sid = w.ensure_shard(&shard);
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let ls_deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -1033,7 +1039,8 @@ async fn then_seq_continuous(w: &mut KisekiWorld) {
     let sid = w.ensure_shard("s1");
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id: sid,
             from: kiseki_common::ids::SequenceNumber(1),
@@ -1077,12 +1084,14 @@ async fn then_no_overlap(w: &mut KisekiWorld) {
     let sid0 = *w.shard_names.get("shard-election-0").unwrap();
     let sid1 = *w.shard_names.get("shard-election-1").unwrap();
     assert!(w
-        .legacy.log_store
+        .legacy
+        .log_store
         .append_delta(w.make_append_request(sid0, 0xa0))
         .await
         .is_ok());
     assert!(w
-        .legacy.log_store
+        .legacy
+        .log_store
         .append_delta(w.make_append_request(sid1, 0xa1))
         .await
         .is_ok());
@@ -1515,10 +1524,12 @@ async fn when_10_concurrent(w: &mut KisekiWorld) {
 #[then("total throughput is approximately 10x single-shard throughput")]
 async fn then_10x_throughput(w: &mut KisekiWorld) {
     let (concurrent_n, concurrent_dur) = w
-        .raft.throughput
+        .raft
+        .throughput
         .expect("the When step must have recorded throughput");
     let (baseline_n, baseline_dur) = w
-        .raft.single_shard_throughput
+        .raft
+        .single_shard_throughput
         .expect("the When step must have recorded a single-shard baseline");
     let concurrent_ops_per_sec = concurrent_n as f64 / concurrent_dur.as_secs_f64();
     let baseline_ops_per_sec = baseline_n as f64 / baseline_dur.as_secs_f64();

@@ -123,7 +123,8 @@ async fn then_zero_capacity(w: &mut KisekiWorld) {
 #[given(regex = r#"^pool "([^"]*)" exists with no devices$"#)]
 async fn given_pool_no_devices(w: &mut KisekiWorld, pool: String) {
     if w.legacy.chunk_store.pool(&pool).is_none() {
-        w.legacy.chunk_store
+        w.legacy
+            .chunk_store
             .add_pool(AffinityPool::new(&pool, DurabilityStrategy::default(), 0));
     }
 }
@@ -335,7 +336,8 @@ async fn then_gc_interval(w: &mut KisekiWorld, pool: String, sec: u64) {
 async fn then_gc_default(w: &mut KisekiWorld, pool: String, sec: u64) {
     // The other pool retains the cluster-wide default GC interval.
     let p = w
-        .legacy.chunk_store
+        .legacy
+        .chunk_store
         .pool(&pool)
         .expect("pool must exist for GC default check");
     assert!(sec > 0, "default GC interval must be positive");
@@ -396,7 +398,8 @@ async fn when_subscribe_device_health(w: &mut KisekiWorld) {
         },
         AdminRole::Admin,
     );
-    w.control.admin
+    w.control
+        .admin
         .set_device_status("health-dev", DeviceStatus::Draining, AdminRole::Admin)
         .unwrap();
 }
@@ -404,7 +407,8 @@ async fn when_subscribe_device_health(w: &mut KisekiWorld) {
 #[given(regex = r"^a device transitions from Healthy to Degraded$")]
 async fn given_device_transition(w: &mut KisekiWorld) {
     // Trigger a real device transition (Online→Draining maps to Healthy→Degraded).
-    w.control.admin
+    w.control
+        .admin
         .set_device_status("health-dev", DeviceStatus::Offline, AdminRole::Admin)
         .ok(); // May fail if already transitioned — that's fine.
 }
@@ -413,7 +417,8 @@ async fn given_device_transition(w: &mut KisekiWorld) {
 async fn when_device_transition(w: &mut KisekiWorld) {
     // Trigger via real StorageAdminService state transition.
     let _ =
-        w.control.admin
+        w.control
+            .admin
             .set_device_status("health-dev", DeviceStatus::Offline, AdminRole::Admin);
 }
 
@@ -446,7 +451,8 @@ async fn then_health_event(w: &mut KisekiWorld) {
     );
     // Transition: Online -> Draining (analogous to Healthy -> Degraded).
     let result =
-        w.control.admin
+        w.control
+            .admin
             .set_device_status("health-dev-1", DeviceStatus::Draining, AdminRole::Admin);
     assert!(result.is_ok(), "device transition should succeed");
     // Verify the new state.
@@ -1153,7 +1159,8 @@ async fn then_existing_inline(w: &mut KisekiWorld) {
 
     // Read it back and verify size is unchanged.
     let deltas = w
-        .legacy.log_store
+        .legacy
+        .log_store
         .read_deltas(kiseki_log::traits::ReadDeltasRequest {
             shard_id,
             from: SequenceNumber(0),
@@ -1263,10 +1270,12 @@ async fn given_device_evacuated(w: &mut KisekiWorld, dev: String) {
         AdminRole::Admin,
     );
     // Transition: Online -> Draining -> Decommissioned.
-    w.control.admin
+    w.control
+        .admin
         .set_device_status(&dev, DeviceStatus::Draining, AdminRole::Admin)
         .unwrap();
-    w.control.admin
+    w.control
+        .admin
         .set_device_status(&dev, DeviceStatus::Decommissioned, AdminRole::Admin)
         .unwrap();
 }
@@ -1490,7 +1499,9 @@ async fn given_shard_splitting(w: &mut KisekiWorld, shard: String) {
 async fn when_split_shard_again(w: &mut KisekiWorld, shard: String) {
     let shard_id = w.ensure_shard(&shard);
     // Set the shard to Splitting state to simulate a split in progress.
-    w.legacy.log_store.set_shard_state(shard_id, ShardState::Splitting);
+    w.legacy
+        .log_store
+        .set_shard_state(shard_id, ShardState::Splitting);
     // Now attempt another split — should be rejected because shard is busy.
     let health = w.legacy.log_store.shard_health(shard_id).await.unwrap();
     if health.state.is_busy() {

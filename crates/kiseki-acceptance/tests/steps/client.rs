@@ -45,7 +45,10 @@ async fn given_tenant_kek(_w: &mut KisekiWorld, _kek: String) {
     // is initialised with a master key in LegacyState::new(); this step
     // documents the scenario context.
     let health = _w.legacy.key_store.health();
-    assert!(health.current_epoch.is_some(), "key store must have a current epoch (KEK available)");
+    assert!(
+        health.current_epoch.is_some(),
+        "key store must have a current epoch (KEK available)"
+    );
 }
 
 #[given("native client library linked into the workload process")]
@@ -202,7 +205,11 @@ async fn when_reads(_w: &mut KisekiWorld, _path: String) {
     // Then steps can verify the read path.
     _w.ensure_gateway_ns().await;
     let result = _w.legacy.nfs_ctx.write(b"test-read-data".to_vec());
-    assert!(result.is_ok(), "write for read test must succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "write for read test must succeed: {:?}",
+        result.err()
+    );
 }
 
 #[then(regex = r#"^the native client resolves the path in its cached view.*$"#)]
@@ -309,7 +316,11 @@ async fn given_write_data(_w: &mut KisekiWorld, _data_desc: String, _path: Strin
     _w.ensure_gateway_ns().await;
     let data = format!("test-data-{}", _data_desc);
     let result = _w.legacy.nfs_ctx.write(data.into_bytes());
-    assert!(result.is_ok(), "write precondition must succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "write precondition must succeed: {:?}",
+        result.err()
+    );
 }
 
 // === Native API ===
@@ -745,7 +756,11 @@ async fn given_write_committed(_w: &mut KisekiWorld) {
     // Write through the gateway to produce a committed composition.
     _w.ensure_gateway_ns().await;
     let result = _w.legacy.nfs_ctx.write(b"committed-write".to_vec());
-    assert!(result.is_ok(), "committed write must succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "committed write must succeed: {:?}",
+        result.err()
+    );
 }
 
 #[when(regex = r#"^the workload immediately reads (\S+)$"#)]
@@ -945,7 +960,11 @@ async fn when_nc_write(_w: &mut KisekiWorld) {
     // Execute a write through the gateway pipeline.
     _w.ensure_gateway_ns().await;
     let result = _w.legacy.nfs_ctx.write(b"nc-write-data".to_vec());
-    assert!(result.is_ok(), "native client write must succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "native client write must succeed: {:?}",
+        result.err()
+    );
 }
 
 #[then("the write is acknowledged to the workload via FUSE")]
@@ -2514,7 +2533,11 @@ async fn when_client_writes_file(_w: &mut KisekiWorld, _path: String) {
     // Client writes a file. Execute through gateway pipeline.
     _w.ensure_gateway_ns().await;
     let result = _w.legacy.nfs_ctx.write(b"client-write-data".to_vec());
-    assert!(result.is_ok(), "client write must succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "client write must succeed: {:?}",
+        result.err()
+    );
 }
 
 #[when("the client reads any file")]
@@ -2630,7 +2653,10 @@ async fn then_stored_l1_l2(_w: &mut KisekiWorld) {
     let mut cache = ClientCache::new(5000, 100);
     let chunk_id = ChunkId([0x55; 32]);
     cache.insert(chunk_id, vec![1, 2, 3, 4], 1000);
-    assert!(cache.get(&chunk_id, 2000).is_some(), "data must be stored in cache");
+    assert!(
+        cache.get(&chunk_id, 2000).is_some(),
+        "data must be stored in cache"
+    );
 }
 
 #[then("cache_misses counter increments")]
@@ -2657,7 +2683,10 @@ async fn then_corrupt_deleted(_w: &mut KisekiWorld) {
     let chunk_id = ChunkId([0x66; 32]);
     cache.insert(chunk_id, vec![1, 2, 3], 1000);
     cache.invalidate(&chunk_id);
-    assert!(cache.get(&chunk_id, 2000).is_none(), "corrupt entry must be deleted");
+    assert!(
+        cache.get(&chunk_id, 2000).is_none(),
+        "corrupt entry must be deleted"
+    );
 }
 
 #[then("cache_errors counter increments")]
@@ -2672,7 +2701,10 @@ async fn then_meta_refetched(_w: &mut KisekiWorld) {
     let mut cache = ClientCache::new(1000, 100); // 1s TTL
     let chunk_id = ChunkId([0x77; 32]);
     cache.insert(chunk_id, vec![1], 1000);
-    assert!(cache.get(&chunk_id, 3000).is_none(), "expired metadata must trigger refetch");
+    assert!(
+        cache.get(&chunk_id, 3000).is_none(),
+        "expired metadata must trigger refetch"
+    );
 }
 
 #[then("cache_meta_misses counter increments")]
@@ -2686,7 +2718,10 @@ async fn then_served_from_cache(_w: &mut KisekiWorld) {
     let mut cache = ClientCache::new(5000, 100);
     let chunk_id = ChunkId([0x88; 32]);
     cache.insert(chunk_id, vec![10, 20, 30], 1000);
-    assert!(cache.get(&chunk_id, 2000).is_some(), "data must be served from cache");
+    assert!(
+        cache.get(&chunk_id, 2000).is_some(),
+        "data must be served from cache"
+    );
 }
 
 #[then("cache_meta_hits counter increments")]
@@ -2703,7 +2738,11 @@ async fn then_meta_updated(_w: &mut KisekiWorld) {
     cache.insert(chunk_id, vec![1], 1000);
     cache.invalidate(&chunk_id);
     cache.insert(chunk_id, vec![2], 2000);
-    assert_eq!(cache.get(&chunk_id, 2500), Some(&[2u8][..]), "metadata must reflect update");
+    assert_eq!(
+        cache.get(&chunk_id, 2500),
+        Some(&[2u8][..]),
+        "metadata must reflect update"
+    );
 }
 
 #[then(regex = r#"^a subsequent read of "([^"]*)" serves the written data \(read-your-writes\)$"#)]
@@ -2711,7 +2750,11 @@ async fn then_read_your_writes_cache(_w: &mut KisekiWorld, _path: String) {
     // Read-your-writes via cache: write then read returns written data.
     _w.ensure_gateway_ns().await;
     let result = _w.legacy.nfs_ctx.write(b"ryw-cache-data".to_vec());
-    assert!(result.is_ok(), "write for RYW must succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "write for RYW must succeed: {:?}",
+        result.err()
+    );
 }
 
 #[then("the read goes directly to canonical")]
@@ -2720,7 +2763,10 @@ async fn then_direct_canonical(_w: &mut KisekiWorld) {
     // cache miss on empty cache — forces canonical fetch.
     let cache = ClientCache::new(5000, 100);
     let chunk_id = ChunkId([0xAA; 32]);
-    assert!(cache.get(&chunk_id, 1000).is_none(), "bypass must go to canonical");
+    assert!(
+        cache.get(&chunk_id, 1000).is_none(),
+        "bypass must go to canonical"
+    );
 }
 
 #[then("no L1 or L2 entries are created")]
@@ -2729,7 +2775,10 @@ async fn then_no_cache_entries(_w: &mut KisekiWorld) {
     // empty cache — no entries present.
     let cache = ClientCache::new(5000, 100);
     let chunk_id = ChunkId([0xBB; 32]);
-    assert!(cache.get(&chunk_id, 1000).is_none(), "no cache entries in bypass mode");
+    assert!(
+        cache.get(&chunk_id, 1000).is_none(),
+        "no cache entries in bypass mode"
+    );
 }
 
 #[then("cache_bypasses counter increments")]

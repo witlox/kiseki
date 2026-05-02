@@ -61,7 +61,6 @@ mod world;
 #[world(init = Self::new)]
 pub struct KisekiWorld {
     // --- Domain sub-structs (grouped by concern) ---
-
     /// In-memory domain objects for @unit steps. Will shrink as steps
     /// migrate to the server harness. @integration steps should NOT
     /// access this — if a step file imports from `legacy`, it's @unit.
@@ -85,7 +84,6 @@ pub struct KisekiWorld {
     pub cluster: world::cluster::ClusterState,
 
     // --- Shared test state (used across step files) ---
-
     pub last_error: Option<String>,
     pub last_read_data: Option<Vec<u8>>,
     pub last_epoch: Option<u64>,
@@ -100,7 +98,6 @@ pub struct KisekiWorld {
     pub reads_working: bool,
 
     // --- Name → ID mappings (Gherkin readability) ---
-
     pub shard_names: HashMap<String, ShardId>,
     pub tenant_ids: HashMap<String, OrgId>,
     pub namespace_ids: HashMap<String, NamespaceId>,
@@ -108,7 +105,6 @@ pub struct KisekiWorld {
     pub workflow_names: HashMap<String, WorkflowRef>,
 
     // --- Server harness (@integration steps only) ---
-
     /// Running kiseki-server + network clients. Started lazily.
     pub server: Option<steps::harness::ServerHarness>,
 }
@@ -171,7 +167,8 @@ impl KisekiWorld {
         }
         let id = ShardId(uuid::Uuid::new_v4());
         let tenant = self.ensure_tenant("org-pharma");
-        self.legacy.log_store
+        self.legacy
+            .log_store
             .create_shard(id, tenant, NodeId(1), ShardConfig::default());
         self.shard_names.insert(name.to_owned(), id);
         id
@@ -248,7 +245,8 @@ impl KisekiWorld {
         let ns_id = self.ensure_namespace(name, shard_name);
         let tenant_id = self.ensure_tenant("org-pharma");
         let shard_id = self.ensure_shard(shard_name);
-        self.legacy.gateway
+        self.legacy
+            .gateway
             .add_namespace(Namespace {
                 id: ns_id,
                 tenant_id,
@@ -285,7 +283,8 @@ impl KisekiWorld {
         // store an alias under the human name for step definition lookups.
         let ns_key = ns_id.0.to_string();
         let map = self
-            .legacy.shard_map_store
+            .legacy
+            .shard_map_store
             .create_namespace(
                 &ns_key,
                 tenant_id,
@@ -375,7 +374,8 @@ impl KisekiWorld {
             kiseki_common::ids::NodeId(1),
             ShardConfig::default(),
         );
-        self.legacy.gateway
+        self.legacy
+            .gateway
             .add_namespace(Namespace {
                 id: ns_id,
                 tenant_id,
@@ -406,7 +406,10 @@ impl KisekiWorld {
     /// Run the stream processor to advance all tracked views from the log.
     pub async fn poll_views(&mut self) {
         use kiseki_view::stream_processor::TrackedStreamProcessor;
-        let mut proc = TrackedStreamProcessor::new(self.legacy.log_store.as_ref(), &mut self.legacy.view_store);
+        let mut proc = TrackedStreamProcessor::new(
+            self.legacy.log_store.as_ref(),
+            &mut self.legacy.view_store,
+        );
         for &view_id in self.view_ids.values() {
             proc.track(view_id);
         }
@@ -460,7 +463,8 @@ impl KisekiWorld {
             self.legacy.persistent_temp_dir = Some(dir);
         }
         Arc::clone(
-            self.legacy.persistent_shard_store
+            self.legacy
+                .persistent_shard_store
                 .as_ref()
                 .expect("just initialised"),
         )
@@ -517,7 +521,8 @@ impl KisekiWorld {
                 kiseki_common::ids::NodeId(1),
                 ShardConfig::default(),
             );
-            self.legacy.gateway
+            self.legacy
+                .gateway
                 .add_namespace(Namespace {
                     id: ns_id,
                     tenant_id,
@@ -529,7 +534,8 @@ impl KisekiWorld {
                 .await;
         }
 
-        self.legacy.gateway
+        self.legacy
+            .gateway
             .write(WriteRequest {
                 namespace_id: ns_id,
                 tenant_id,
@@ -550,7 +556,8 @@ impl KisekiWorld {
             .namespace_ids
             .get(ns_name)
             .unwrap_or(&NamespaceId(uuid::Uuid::from_u128(1)));
-        self.legacy.gateway
+        self.legacy
+            .gateway
             .read(ReadRequest {
                 tenant_id,
                 namespace_id: ns_id,

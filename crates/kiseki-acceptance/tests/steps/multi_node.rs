@@ -10,10 +10,10 @@
 
 use cucumber::{given, then, when};
 
-use crate::KisekiWorld;
 use crate::steps::cluster_harness::{
-    NodeHandle, acquire_cluster, acquire_cluster_6, acquire_cluster_20,
+    acquire_cluster, acquire_cluster_20, acquire_cluster_6, NodeHandle,
 };
+use crate::KisekiWorld;
 
 /// 1 MiB — the size every "1MB" step in this file uses. Keeping the
 /// constant lets us tweak the scenario boundary in one place if we
