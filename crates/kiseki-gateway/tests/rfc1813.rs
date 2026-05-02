@@ -50,9 +50,9 @@ use kiseki_composition::namespace::Namespace;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
 use kiseki_gateway::nfs::NfsGateway;
-use kiseki_gateway::nfs3_server::handle_nfs3_first_message;
 use kiseki_gateway::nfs_ops::NfsContext;
 use kiseki_gateway::nfs_xdr::{RpcCallHeader, XdrReader, XdrWriter};
+use kiseki_gateway::nfs3_server::handle_nfs3_first_message;
 
 // ===========================================================================
 // Sentinel constants — pin the wire registry per RFC 1813 §3.0
@@ -377,9 +377,12 @@ fn s3_3_6_read_unknown_handle_yields_io_or_badhandle() {
 
 /// RFC 1813 §3.3.7 — WRITE(file_fh, offset, count, stable, data):
 /// successful write returns `NFS3_OK` then `wcc_data` (pre+post) then
-/// `count4`, `stable_how`, `writeverf3(8)`. Kiseki only supports
-/// offset=0 (immutable composition); a full WRITE happy path:
-/// CREATE → LOOKUP → WRITE @ offset 0.
+/// `count4`, `stable_how`, `writeverf3(8)`. Full WRITE happy path:
+/// CREATE → LOOKUP → WRITE @ offset 0. Sequential WRITEs at higher
+/// offsets are accumulated in the per-handle buffer and flushed on
+/// COMMIT/CLOSE (see `s3_3_7_write_at_nonzero_offset_buffers_data`
+/// for the offset > 0 witness; the buffered-write rewrite landed in
+/// commit 40cac2b).
 #[test]
 fn s3_3_7_write_at_offset_zero_returns_ok_and_count() {
     let ctx = make_ctx();
@@ -526,17 +529,34 @@ fn s3_3_16_readdir_root_returns_ok_with_cookieverf() {
 // Wire-level error: NFS3ERR_IO via offset-violating WRITE
 // ===========================================================================
 
-/// RFC 1813 §3.3.7 — kiseki's compositions are immutable. Any WRITE
-/// with `offset != 0` on a file handle MUST surface as `NFS3ERR_IO`
-/// (RFC 1813 §2.6). Negative test for the IO error code.
+/// RFC 1813 §3.3.7 — WRITE at offset > 0 on a known handle is
+/// accepted and accumulated in the per-handle buffer. The buffered
+/// data is materialized as a single composition on COMMIT/CLOSE
+/// (commit 40cac2b: pre-rewrite, kiseki rejected nonzero offsets
+/// because each WRITE was forced to mint its own composition; the
+/// 4 KiB-block compositions blew up the dedup table on sequential
+/// writes and silently dropped data past offset 0).
 #[test]
-fn s3_3_7_write_at_nonzero_offset_returns_nfs3err_io() {
+fn s3_3_7_write_at_nonzero_offset_buffers_data() {
     let ctx = make_ctx();
+    let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
+
+    // CREATE first to obtain a known handle.
     let mut body = XdrWriter::new();
-    body.write_opaque(&[0xBBu8; 32]); // 32-byte handle (any value)
-    body.write_u64(100); // nonzero offset
+    body.write_opaque(&root_fh);
+    body.write_string("buffered-write.txt");
+    let raw = build_nfs3_call(90, proc::CREATE, &body.into_bytes());
+    let _ = handle_nfs3_first_message(&make_header(90, proc::CREATE), &raw, &ctx);
+    let (file_fh, _) = ctx
+        .lookup_by_name("buffered-write.txt")
+        .expect("CREATE must have registered the handle");
+
+    // WRITE at offset 100, UNSTABLE — must be buffered, not rejected.
+    let mut body = XdrWriter::new();
+    body.write_opaque(&file_fh);
+    body.write_u64(100);
     body.write_u32(3);
-    body.write_u32(2);
+    body.write_u32(0); // UNSTABLE — flush deferred to COMMIT
     body.write_opaque(b"abc");
     let raw = build_nfs3_call(91, proc::WRITE, &body.into_bytes());
 
@@ -545,8 +565,8 @@ fn s3_3_7_write_at_nonzero_offset_returns_nfs3err_io() {
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(
         nfs_status,
-        status::NFS3ERR_IO,
-        "RFC 1813 §3.3.7: WRITE @ nonzero offset on immutable composition MUST yield NFS3ERR_IO"
+        status::NFS3_OK,
+        "RFC 1813 §3.3.7: WRITE @ nonzero offset on a known handle MUST be buffered (NFS3_OK)",
     );
 }
 
@@ -579,7 +599,7 @@ fn rfc_1813_seed_canonical_getattr_call_frame_decodes() {
     w.write_u32(NFS3_PROGRAM); // 100003
     w.write_u32(NFS3_VERSION); // 3
     w.write_u32(proc::GETATTR); // 1
-                                // AUTH_NONE creds + verifier (RFC 1057 §9.1).
+    // AUTH_NONE creds + verifier (RFC 1057 §9.1).
     w.write_u32(0);
     w.write_opaque(&[]);
     w.write_u32(0);
