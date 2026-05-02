@@ -50,9 +50,9 @@ use kiseki_composition::namespace::Namespace;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
 use kiseki_gateway::nfs::NfsGateway;
+use kiseki_gateway::nfs3_server::handle_nfs3_first_message;
 use kiseki_gateway::nfs_ops::NfsContext;
 use kiseki_gateway::nfs_xdr::{RpcCallHeader, XdrReader, XdrWriter};
-use kiseki_gateway::nfs3_server::handle_nfs3_first_message;
 
 // ===========================================================================
 // Sentinel constants — pin the wire registry per RFC 1813 §3.0
@@ -599,7 +599,7 @@ fn rfc_1813_seed_canonical_getattr_call_frame_decodes() {
     w.write_u32(NFS3_PROGRAM); // 100003
     w.write_u32(NFS3_VERSION); // 3
     w.write_u32(proc::GETATTR); // 1
-    // AUTH_NONE creds + verifier (RFC 1057 §9.1).
+                                // AUTH_NONE creds + verifier (RFC 1057 §9.1).
     w.write_u32(0);
     w.write_opaque(&[]);
     w.write_u32(0);
