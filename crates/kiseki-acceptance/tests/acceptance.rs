@@ -657,34 +657,34 @@ fn main() {
     let runner = KisekiWorld::cucumber()
         .max_concurrent_scenarios(4)
         .filter_run("features/", move |feat, _, sc| {
-        if skip_slow && sc.tags.iter().any(|t| t == "slow") {
-            return false;
-        }
-        // Scenarios that require a real OS-level mount (privileged
-        // docker container, ktls, kernel pNFS client). The in-process
-        // BDD runner can't provide those primitives; the python e2e
-        // suite (`tests/e2e/test_pnfs.py`) is the witness. Always
-        // skip in the BDD run so a `todo!()` step doesn't fail CI
-        // for work that's verified end-to-end elsewhere.
-        if sc.tags.iter().any(|t| t == "e2e-deferred") {
-            return false;
-        }
-        if let Some(ref fname) = feature_filter {
-            if !feat
-                .path
-                .as_deref()
-                .is_some_and(|p| p.to_string_lossy().contains(fname))
-            {
+            if skip_slow && sc.tags.iter().any(|t| t == "slow") {
                 return false;
             }
-        }
-        if let Some(ref name) = scenario_filter {
-            if !sc.name.contains(name) {
+            // Scenarios that require a real OS-level mount (privileged
+            // docker container, ktls, kernel pNFS client). The in-process
+            // BDD runner can't provide those primitives; the python e2e
+            // suite (`tests/e2e/test_pnfs.py`) is the witness. Always
+            // skip in the BDD run so a `todo!()` step doesn't fail CI
+            // for work that's verified end-to-end elsewhere.
+            if sc.tags.iter().any(|t| t == "e2e-deferred") {
                 return false;
             }
-        }
-        true
-    });
+            if let Some(ref fname) = feature_filter {
+                if !feat
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| p.to_string_lossy().contains(fname))
+                {
+                    return false;
+                }
+            }
+            if let Some(ref name) = scenario_filter {
+                if !sc.name.contains(name) {
+                    return false;
+                }
+            }
+            true
+        });
 
     rt.block_on(runner);
 }
