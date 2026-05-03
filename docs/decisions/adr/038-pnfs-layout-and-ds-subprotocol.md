@@ -1,7 +1,7 @@
 # ADR-038: pNFS Layout and Data Server Subprotocol
 
-**Status**: Proposed (rev 2 — addresses ADV-038-1/2/3/7)
-**Date**: 2026-04-27
+**Status**: Accepted (rev 2 — code landed in kiseki-gateway::pnfs + pnfs_ds_server; LAYOUTGET / GETDEVICEINFO / DS-side READ end-to-end via Linux 6.x pNFS client; tests in pnfs-rfc8435.feature)
+**Date**: 2026-04-27 (proposed); 2026-05-03 (status update — code fully shipped)
 **Deciders**: Architect (diamond workflow: architect → adversary gate 1 → implementer)
 **Context**: Phase 14 closed; perf-cluster spin-up gated on pNFS completeness (ADR-013, RFC 5661, RFC 8435, RFC 9289)
 
