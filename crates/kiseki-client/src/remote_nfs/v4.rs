@@ -250,6 +250,11 @@ impl Nfs4Client {
     /// overlay/extend earlier ones in the per-fh buffer (per
     /// `nfs_ops.rs::buffer_write`). Returns the composition id of
     /// the merged result.
+    // Async even though no `.await` runs today — `RpcTransport` is
+    // currently sync but is on the path to becoming async (Phase 16
+    // fabric work uses `tokio::net::TcpStream` already). Keeping the
+    // signature async means callers don't change when that lands.
+    #[allow(clippy::unused_async)]
     pub async fn write_at_offsets(
         &self,
         parts: &[(u64, Vec<u8>)],
