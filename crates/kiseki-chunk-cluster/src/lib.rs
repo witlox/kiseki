@@ -53,6 +53,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use kiseki_chunk::{AsyncChunkOps, ChunkError};
 use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_crypto::envelope::Envelope;
@@ -271,6 +272,7 @@ impl ClusteredChunkStore {
     ///
     /// `placement[i]` receives `fragment_index = i`. Caller chooses
     /// the placement order (typically via [`crate::pick_placement`]).
+    #[allow(clippy::too_many_lines)]
     pub async fn write_chunk_ec(
         &self,
         envelope: Envelope,
@@ -287,7 +289,7 @@ impl ClusteredChunkStore {
             self.peers.iter().map(|p| (p.name(), p)).collect();
 
         let mut acks: usize = 0;
-        let mut futs = Vec::with_capacity(routes.len());
+        let mut futs: FuturesUnordered<tokio::task::JoinHandle<_>> = FuturesUnordered::new();
         for route in routes {
             // Local-fragment path: when a route targets THIS node, write
             // it to the local store rather than skipping. Pre-Phase-16e
@@ -357,20 +359,58 @@ impl ClusteredChunkStore {
             };
             let put_timeout = self.cfg.put_timeout;
             let fragment_index = route.fragment_index;
+            let peer_name = peer.name().to_owned();
             futs.push(tokio::spawn(async move {
-                tokio::time::timeout(
+                let result = tokio::time::timeout(
                     put_timeout,
                     peer.put_fragment(chunk_id, fragment_index, tenant, pool, env),
                 )
-                .await
+                .await;
+                // Self-log on failure so post-quorum (early-exit'd)
+                // tasks still surface their failures in tracing.
+                // Without this, `write_chunk_ec` returning success
+                // after `min_acks` would silently lose visibility on
+                // the remaining peer puts that fail in flight.
+                match &result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        peer = %peer_name,
+                        ?chunk_id,
+                        fragment_index,
+                        error = %e,
+                        "fabric PutFragment failed"
+                    ),
+                    Err(_) => tracing::warn!(
+                        peer = %peer_name,
+                        ?chunk_id,
+                        fragment_index,
+                        "fabric PutFragment timed out"
+                    ),
+                }
+                result
             }));
         }
-        for fut in futs {
-            if matches!(fut.await, Ok(Ok(Ok(_)))) {
+        let required = self.cfg.min_acks.max(strategy.min_fragments_for_read());
+        // Drain completions in arrival order. Return success the
+        // moment we've collected `required` acks — remaining tasks
+        // continue running on the runtime (tokio::spawn detaches
+        // execution from the JoinHandle, so dropping the
+        // FuturesUnordered doesn't abort them) and self-log any
+        // late failures. Cuts tail-latency proportional to the
+        // slowest peer; necessary to make the D-10 cross-stream
+        // ordering scenario actually witness-able (committed
+        // composition delta visible on a follower whose fragment
+        // hasn't landed yet).
+        while let Some(joined) = futs.next().await {
+            if matches!(joined, Ok(Ok(Ok(_)))) {
                 acks += 1;
+                if acks >= required {
+                    drop(futs);
+                    return Ok(());
+                }
             }
         }
-        if acks >= self.cfg.min_acks.max(strategy.min_fragments_for_read()) {
+        if acks >= required {
             Ok(())
         } else {
             if let Some(m) = self.metrics.as_ref() {
@@ -637,31 +677,47 @@ impl AsyncChunkOps for ClusteredChunkStore {
             let put_timeout = self.cfg.put_timeout;
             let pool_id = self.cfg.pool.clone();
 
-            let mut futs = Vec::with_capacity(self.peers.len());
+            let mut futs: FuturesUnordered<tokio::task::JoinHandle<_>> = FuturesUnordered::new();
             for peer in &self.peers {
                 let peer = Arc::clone(peer);
                 let env = envelope.clone();
                 let pool_id = pool_id.clone();
+                let peer_name = peer.name().to_owned();
                 futs.push(tokio::spawn(async move {
-                    tokio::time::timeout(
+                    let result = tokio::time::timeout(
                         put_timeout,
                         peer.put_fragment(chunk_id, 0, tenant_id, pool_id, env),
                     )
-                    .await
+                    .await;
+                    // Self-log so post-quorum (early-exit'd) failures
+                    // are still visible. The outer loop drops `futs`
+                    // after enough acks; tasks continue on the runtime.
+                    match &result {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            peer = %peer_name,
+                            ?chunk_id,
+                            error = %e,
+                            "peer PutFragment failed"
+                        ),
+                        Err(_) => tracing::warn!(
+                            peer = %peer_name,
+                            ?chunk_id,
+                            "peer PutFragment timed out"
+                        ),
+                    }
+                    result
                 }));
             }
-
-            for fut in futs {
-                match fut.await {
-                    Ok(Ok(Ok(_))) => acks += 1,
-                    Ok(Ok(Err(e))) => {
-                        tracing::warn!(error=%e, "peer PutFragment failed");
-                    }
-                    Ok(Err(_)) => {
-                        tracing::warn!("peer PutFragment timed out");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error=%e, "peer PutFragment join error");
+            // Early-exit on `quorum_required`. See `write_chunk_ec`
+            // for the full rationale; same pattern.
+            let required = self.quorum_required();
+            while let Some(joined) = futs.next().await {
+                if matches!(joined, Ok(Ok(Ok(_)))) {
+                    acks += 1;
+                    if acks >= required {
+                        drop(futs);
+                        return Ok(stored);
                     }
                 }
             }

@@ -217,28 +217,28 @@ async fn given_20_node_cluster(w: &mut KisekiWorld) {
 
 #[then("the leader's fabric_quorum_lost_total stays at zero")]
 async fn then_no_quorum_lost(w: &mut KisekiWorld) {
-    // Cluster singletons are shared across scenarios; an earlier
-    // destructive scenario may have ticked the absolute counter. We
-    // assert that no NEW quorum-loss events landed during this
-    // scenario by diffing against the baseline captured in the Given
-    // step (`snapshot_quorum_lost_baseline`).
-    let baseline_key = baseline_key_quorum_lost();
-    let baseline = w
+    // Sums per-node baselines (snapshotted in the Given step) and
+    // compares against the cluster-wide current sum. Any tick on
+    // any node fails the assertion. Stronger than checking only
+    // the Raft leader's metric — the request can land on any node.
+    let baseline_total: f64 = w
         .cluster
         .metric_baselines
-        .get(&baseline_key)
-        .copied()
-        .unwrap_or(0.0);
+        .iter()
+        .filter(|(k, _)| k.ends_with("/kiseki_fabric_quorum_lost_total"))
+        .map(|(_, v)| *v)
+        .sum();
     let guard = cluster(w);
-    let leader_id = guard.leader_id().await.expect("cluster has no leader");
-    let leader = guard.node(leader_id);
-    let text = scrape_metrics(leader).await;
-    let lost = sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[]);
-    let delta = lost - baseline;
+    let mut total: f64 = 0.0;
+    for n in guard.nodes() {
+        let text = scrape_metrics(n).await;
+        total += sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[]);
+    }
+    let delta = total - baseline_total;
     assert!(
         delta < 0.5,
-        "kiseki_fabric_quorum_lost_total ticked by {delta} on leader (node-{leader_id}) \
-         this scenario (baseline={baseline}, now={lost}) — the cross-node fabric is \
+        "kiseki_fabric_quorum_lost_total ticked cluster-wide by {delta} this scenario \
+         (sum-baseline={baseline_total}, sum-now={total}) — the cross-node fabric is \
          dropping fragments without recovering. GCP 2026-05-02 saw 1760 of these events.",
     );
 }
@@ -1156,37 +1156,39 @@ async fn then_put_fails_quorum_lost(w: &mut KisekiWorld, mb: usize, target: u64)
 
 #[then(regex = r"^the leader's fabric_quorum_lost_total ticked at least (\d+)$")]
 async fn then_quorum_lost_ticked(w: &mut KisekiWorld, expected_ticks: u64) {
-    let baseline_key = baseline_key_quorum_lost();
-    let baseline = w
+    // Sum the metric across EVERY alive node, not just the Raft
+    // leader. The PUT runs on whichever node received the S3 request
+    // (which may not be the Raft leader — gateways don't forward
+    // chunk writes for fabric-only failures), and that's where the
+    // counter ticks. Asking the Raft leader for it would miss the
+    // tick when the request landed on a follower (D-5 scenario).
+    let killed: std::collections::HashSet<u64> = w.cluster.killed_nodes.iter().copied().collect();
+    let baselines: f64 = w
         .cluster
         .metric_baselines
-        .get(&baseline_key)
-        .copied()
-        .unwrap_or(0.0);
+        .iter()
+        .filter(|(k, _)| k.ends_with("/kiseki_fabric_quorum_lost_total"))
+        .map(|(_, v)| *v)
+        .sum();
     let guard = cluster(w);
-    // The leader may have changed if the quorum-lost cascade triggered
-    // a re-election; ask any alive (non-killed) node for the current id.
-    let killed: std::collections::HashSet<u64> = w.cluster.killed_nodes.iter().copied().collect();
-    let alive = guard
-        .nodes()
-        .find(|n| !killed.contains(&n.node_id))
-        .expect("at least one alive node");
-    let leader_id = leader_id_via(alive).await.unwrap_or(alive.node_id);
-    let leader = guard.node(leader_id);
-    // Counter increments asynchronously after the failing PUT returns;
-    // poll briefly to absorb that lag rather than racing the metric path.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let text = scrape_metrics(leader).await;
-        let now = sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[]);
-        let delta = now - baseline;
+        let mut total: f64 = 0.0;
+        for n in guard.nodes() {
+            if killed.contains(&n.node_id) {
+                continue;
+            }
+            let text = scrape_metrics(n).await;
+            total += sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[]);
+        }
+        let delta = total - baselines;
         if delta >= expected_ticks as f64 - 0.5 {
             return;
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "kiseki_fabric_quorum_lost_total ticked by {delta} on node-{leader_id} \
-                 (baseline={baseline}, now={now}); wanted ≥ {expected_ticks}",
+                "kiseki_fabric_quorum_lost_total cluster-wide ticked by {delta} \
+                 (sum-baseline={baselines}, sum-now={total}); wanted ≥ {expected_ticks}",
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1632,27 +1634,30 @@ async fn set_node_fabric_deny(w: &mut KisekiWorld, node_id: u64, deny: bool) {
 // Baseline-snapshot helpers (singleton-aware metric assertions)
 // ---------------------------------------------------------------------------
 
-fn baseline_key_quorum_lost() -> String {
-    "leader/kiseki_fabric_quorum_lost_total".to_owned()
-}
-
 fn baseline_key_fabric_get(node_id: u64) -> String {
     format!("node-{node_id}/kiseki_fabric_ops_total{{op=get}}")
 }
 
 async fn snapshot_quorum_lost_baseline(w: &mut KisekiWorld) {
-    let value = {
+    // Snapshot per-node so the matching `then_quorum_lost_ticked`
+    // assertion can sum across all alive nodes (the PUT may run on
+    // any node, not just the Raft leader; D-5 specifically lands
+    // its quorum loss on whichever node received the S3 request).
+    let pairs: Vec<(u64, f64)> = {
         let guard = cluster(w);
-        let Some(leader_id) = guard.leader_id().await else {
-            return;
-        };
-        let leader = guard.node(leader_id);
-        let text = scrape_metrics(leader).await;
-        sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[])
+        let mut out = Vec::new();
+        for n in guard.nodes() {
+            let text = scrape_metrics(n).await;
+            let v = sum_counter_matching_all(&text, "kiseki_fabric_quorum_lost_total", &[]);
+            out.push((n.node_id, v));
+        }
+        out
     };
-    w.cluster
-        .metric_baselines
-        .insert(baseline_key_quorum_lost(), value);
+    for (id, v) in pairs {
+        w.cluster
+            .metric_baselines
+            .insert(format!("node-{id}/kiseki_fabric_quorum_lost_total"), v);
+    }
 }
 
 async fn snapshot_fabric_get_baselines(w: &mut KisekiWorld) {

@@ -309,40 +309,24 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And node-2's incoming fabric is allowed
     And node-3's incoming fabric is allowed
 
-  # NOT REPRODUCIBLE WITH CURRENT WRITE SEMANTICS — `write_chunk`
-  # (and `write_chunk_ec`) await ALL spawned peer-put futures
-  # before returning to the caller, not just `min_acks` of them.
-  # So by the time the client sees PUT success, every healthy
-  # peer (including any "slow" one) has already received the
-  # fragment. The cross-stream race the scenario describes
-  # (composition delta visible on a peer that lacks the fragment
-  # locally) cannot happen at the client-visible boundary today.
-  # Verified empirically 2026-05-02 with the test-only
-  # fabric-slow-ms knob — node-3 read had 0 fabric GET calls
-  # because its local store had the fragment by GET time.
-  #
-  # Two paths to make this scenario meaningful:
-  # 1. Add early-exit to write_chunk on min_acks (bigger
-  #    architectural change; would also speed up tail-latency).
-  # 2. Drive the race via cross-node Raft hydrator timing —
-  #    when the composition delta is replicated faster than the
-  #    fragment, the read on the lagging node should fall back to
-  #    fabric. Requires Raft + fabric to be on independent
-  #    transports with controllable timing skew.
-  #
-  # Until either lands, the local-miss-fallback property is
-  # implicitly covered by the EC read path (which has no local
-  # fast path; every read goes through `read_chunk_ec` which
-  # collects fragments from peers).
-  @library @cross-node @ordering
+  # Promoted to @integration. Now reproducible: `write_chunk`
+  # early-exits on `min_acks` (the slow peer's PutFragment is
+  # still in flight when PUT returns success), so a follower can
+  # have the Raft-committed composition delta but not yet the
+  # fragment. Read on that follower must local-miss + fabric-fetch.
+  # Uses the test-only `POST /admin/test/fabric/slow-ms/{ms}` knob
+  # to delay node-3's incoming fabric ack by 1.5s; the PUT returns
+  # via min_acks=2 (leader local + node-2) within ~50 ms, then
+  # the GET on node-3 races ahead of the in-flight PutFragment
+  # and exercises the fabric fallback.
+  @integration @multi-node @cross-node @ordering
   Scenario: Composition delta arrives before fragment (D-10 cross-stream)
-    Given a 3-node Replication-3 cluster with a slow node-3
-    And node-3 applies Raft entries 50% faster than it acknowledges fabric `PutFragment`
-    When a PUT lands the composition delta on node-3 before the fragment
-    And a client's S3 GET via node-3 references the new chunk
-    Then node-3's read finds the chunk absent locally
-    And node-3 falls back to `GetFragment` against node-1 or node-2
-    And the read returns the same bytes as the original PUT
+    Given a 3-node kiseki cluster
+    And node-3's incoming fabric PutFragment is slowed to 1500 ms per call
+    When a client writes 1MB via S3 PUT to node-1
+    Then S3 GET from node-3 returns the same 1MB
+    And node-3 issued at least 1 fabric GetFragment calls for the read
+    And node-3's incoming fabric slow-down is removed
 
   @integration @multi-node @cross-node @leader-change
   Scenario: Refcount preserved across leader change (D-4)
