@@ -19,6 +19,46 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::config::{ServerConfig, TlsFiles};
 
+/// Pick the DS uaddrs the MDS will advertise via GETDEVICEINFO.
+///
+/// Precedence:
+/// 1. `KISEKI_DS_PEERS` (explicit per-node DS endpoints) — required
+///    for localhost-multi-node where each node binds a distinct
+///    ephemeral DS port.
+/// 2. `raft_peers` host-substitution + `ds_addr.port()` — the
+///    containerized/hostnamed case where every node uses the same
+///    DS port (typically 2052).
+/// 3. Single-node fallback: when no peers are known but the local
+///    node has a `ds_addr` configured, advertise *that* address.
+///    Without this branch single-node clusters with an ephemeral
+///    DS port (e.g. the profile harness) silently advertised the
+///    hard-coded `127.0.0.1:2052` from `MdsLayoutConfig::default()`,
+///    so every pNFS read got `Connection refused`.
+fn compute_storage_ds_addrs(
+    ds_peers: &[(u64, String)],
+    raft_peers: &[(u64, String)],
+    ds_addr: Option<SocketAddr>,
+) -> Vec<String> {
+    if !ds_peers.is_empty() {
+        return ds_peers.iter().map(|(_, addr)| addr.clone()).collect();
+    }
+    if !raft_peers.is_empty() {
+        let ds_port = ds_addr.map_or(2052, |a| a.port());
+        return raft_peers
+            .iter()
+            .map(|(_, addr)| {
+                let host = addr.split(':').next().unwrap_or(addr);
+                format!("{host}:{ds_port}")
+            })
+            .collect();
+    }
+    // Single-node: the local node *is* the storage DS.
+    if let Some(addr) = ds_addr {
+        return vec![addr.to_string()];
+    }
+    Vec::new()
+}
+
 /// Pick the per-node identity source for the at-rest key store
 /// (Phase 14e). Precedence: SPIFFE > mTLS > file-in-data-dir.
 ///
@@ -820,28 +860,8 @@ pub async fn run_main(
             &[0x42; 32], // TODO Phase 15b: pull from kiseki_keymanager
             &cluster_id_bytes,
         );
-        let ds_port = cfg.ds_addr.map_or(2052, |a| a.port());
-        // ds_peers (KISEKI_DS_PEERS) is the explicit per-node DS-addr
-        // override. Required for localhost-multi-node where each node
-        // binds a distinct ephemeral DS port — the host-substitution
-        // fallback below would emit identical uaddrs and pNFS clients
-        // would round-robin to the wrong DS. When unset (containerized
-        // / hostnamed deployments where ds_port is shared), fall back
-        // to deriving DS addrs from raft_peers.
-        let storage_ds_addrs: Vec<String> = if cfg.ds_peers.is_empty() {
-            cfg.raft_peers
-                .iter()
-                .map(|(_, addr)| {
-                    let host = addr.split(':').next().unwrap_or(addr);
-                    format!("{host}:{ds_port}")
-                })
-                .collect()
-        } else {
-            cfg.ds_peers
-                .iter()
-                .map(|(_, addr)| addr.clone())
-                .collect()
-        };
+        let storage_ds_addrs =
+            compute_storage_ds_addrs(&cfg.ds_peers, &cfg.raft_peers, cfg.ds_addr);
         let mgr_cfg = kiseki_gateway::pnfs::MdsLayoutConfig {
             stripe_size_bytes: cfg.pnfs.stripe_size_bytes,
             layout_ttl_ms: cfg.pnfs.layout_ttl_seconds.saturating_mul(1000),
@@ -1326,5 +1346,68 @@ mod tests {
             super::fabric_addr_from_raft_peer("kiseki-node2", 9100),
             "kiseki-node2",
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // compute_storage_ds_addrs — what the MDS will hand out via
+    // GETDEVICEINFO. Wrong answers here send pNFS clients to the wrong
+    // host:port and every read fails with `Connection refused`.
+    // ---------------------------------------------------------------------
+
+    /// `KISEKI_DS_PEERS` wins outright — it's the only mode that can
+    /// represent localhost-multi-node where every peer has a distinct
+    /// ephemeral DS port.
+    #[test]
+    fn ds_peers_take_priority() {
+        let ds_peers = vec![
+            (1, "127.0.0.1:40001".to_string()),
+            (2, "127.0.0.1:40002".to_string()),
+        ];
+        let raft_peers = vec![(1, "127.0.0.1:9301".to_string())];
+        let local: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let got = super::compute_storage_ds_addrs(&ds_peers, &raft_peers, Some(local));
+        assert_eq!(got, vec!["127.0.0.1:40001", "127.0.0.1:40002"]);
+    }
+
+    /// No `ds_peers` but `raft_peers` present → host-substitute each
+    /// peer with the local DS port. The container/hostnamed deployment.
+    #[test]
+    fn raft_peers_substitute_local_ds_port() {
+        let raft_peers = vec![
+            (1, "kiseki-node1:9300".to_string()),
+            (2, "kiseki-node2:9300".to_string()),
+        ];
+        let local: std::net::SocketAddr = "127.0.0.1:2052".parse().unwrap();
+        let got = super::compute_storage_ds_addrs(&[], &raft_peers, Some(local));
+        assert_eq!(got, vec!["kiseki-node1:2052", "kiseki-node2:2052"]);
+    }
+
+    /// Single-node with no peers but a configured `ds_addr` MUST
+    /// advertise that address. Regression: pre-fix this returned an
+    /// empty Vec, MdsLayoutManager defaulted to `127.0.0.1:2052`, and
+    /// every pNFS read failed with `Connection refused` whenever the
+    /// real DS bound to a different port (e.g. ephemeral in tests).
+    #[test]
+    fn single_node_advertises_local_ds() {
+        let local: std::net::SocketAddr = "127.0.0.1:40577".parse().unwrap();
+        let got = super::compute_storage_ds_addrs(&[], &[], Some(local));
+        assert_eq!(got, vec!["127.0.0.1:40577"]);
+    }
+
+    /// Single-node with the canonical port still advertises it — the
+    /// fix doesn't special-case 2052.
+    #[test]
+    fn single_node_default_port_still_advertised() {
+        let local: std::net::SocketAddr = "127.0.0.1:2052".parse().unwrap();
+        let got = super::compute_storage_ds_addrs(&[], &[], Some(local));
+        assert_eq!(got, vec!["127.0.0.1:2052"]);
+    }
+
+    /// No peers and no `ds_addr` → empty Vec. The caller upstack
+    /// (MdsLayoutManager) makes its own decision; we don't fabricate.
+    #[test]
+    fn no_peers_no_local_addr_returns_empty() {
+        let got = super::compute_storage_ds_addrs(&[], &[], None);
+        assert!(got.is_empty());
     }
 }

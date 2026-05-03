@@ -244,7 +244,13 @@ async fn worker(
         let dt = start.elapsed();
         match result {
             Ok(()) => stats.record(dt),
-            Err(_) => stats.record_error(),
+            Err(e) => {
+                static FIRST: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if FIRST.set(()).is_ok() {
+                    eprintln!("[error] first failure: {e}");
+                }
+                stats.record_error();
+            }
         }
     }
 }
