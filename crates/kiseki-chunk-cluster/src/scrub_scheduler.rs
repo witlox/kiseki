@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kiseki_chunk::AsyncChunkOps;
-use kiseki_common::ids::{OrgId, ShardId};
+use kiseki_common::ids::{ChunkId, OrgId, ShardId};
 use kiseki_log::traits::LogOps;
 
 use crate::scrub::{
@@ -160,6 +160,102 @@ impl ScrubScheduler {
             orphan,
             under_replication,
         })
+    }
+
+    /// Trigger a scrub pass *now* without disrupting the periodic
+    /// schedule (ADR-025 W4 — `TriggerScrub`). Spawns a tokio task
+    /// that calls [`run_once`] once and returns immediately so the
+    /// admin RPC can hand back a `scrub_id` without waiting for the
+    /// pass to complete. Returns the spawned `JoinHandle` for
+    /// callers that want to await completion in tests.
+    #[must_use]
+    pub fn trigger_now(self: Arc<Self>) -> tokio::task::JoinHandle<ScrubReport> {
+        tokio::spawn(async move {
+            match self.run_once().await {
+                Ok(r) => {
+                    tracing::info!(
+                        orphan_deleted = r.orphan.deleted,
+                        under_repl_repaired = r.under_replication.repaired,
+                        under_repl_critical = r.under_replication.critical,
+                        under_repl_lost = r.under_replication.lost,
+                        "scrub triggered manually completed"
+                    );
+                    r
+                }
+                Err(e) => {
+                    tracing::warn!(error=%e, "manual scrub trigger failed");
+                    ScrubReport::default()
+                }
+            }
+        })
+    }
+
+    /// Repair a specific chunk on demand (ADR-025 W4 — `RepairChunk`).
+    /// Looks up the chunk's placement in `cluster_chunk_state`,
+    /// probes peers via the configured oracle, and triggers
+    /// repair via the configured `Repairer` if any fragment is
+    /// missing.
+    ///
+    /// Returns `Ok(true)` if the chunk was already healthy at the
+    /// time of the call (caller's `RepairChunkResponse.already_healthy`),
+    /// `Ok(false)` if a repair was attempted (caller can poll
+    /// `ListRepairs` for outcome), or `Err(...)` on a hard failure
+    /// (chunk not in `cluster_chunk_state`, log read error).
+    pub async fn repair_one_chunk(&self, chunk_id: ChunkId) -> Result<bool, String> {
+        let rows = self
+            .log
+            .cluster_chunk_state_iter(self.shard_id)
+            .await
+            .map_err(|e| format!("cluster_chunk_state read: {e}"))?;
+        let row = rows.into_iter().find(|(_, cid, _)| *cid == chunk_id);
+        let Some((_, _, entry)) = row else {
+            return Err(format!(
+                "chunk {chunk_id:?} not found in cluster_chunk_state",
+            ));
+        };
+        if entry.tombstoned {
+            return Err(format!("chunk {chunk_id:?} is tombstoned"));
+        }
+        if entry.placement.is_empty() {
+            return Err(format!("chunk {chunk_id:?} has empty placement"));
+        }
+        // Reuse the under-replication scrub on a one-element
+        // candidate list so the dispatch + repair logic stays in
+        // one place.
+        let chunk_id_local = chunk_id;
+        let placement = entry.placement.clone();
+        let outcome_pre_repaired = if let Some(strategy) = self.strategy {
+            let candidates = vec![ChunkPlacementWithLen {
+                chunk_id: chunk_id_local,
+                placement,
+                original_len: usize::try_from(entry.original_len).unwrap_or(0),
+            }];
+            UnderReplicationScrub::new(self.under_replication_policy)
+                .with_strategy(strategy)
+                .run_ec(
+                    &candidates,
+                    self.peer_oracle.as_ref(),
+                    self.repairer.as_ref(),
+                )
+                .await
+                .repaired
+        } else {
+            let candidates = vec![ChunkPlacement {
+                chunk_id: chunk_id_local,
+                placement,
+            }];
+            UnderReplicationScrub::new(self.under_replication_policy)
+                .run(
+                    &candidates,
+                    self.peer_oracle.as_ref(),
+                    self.repairer.as_ref(),
+                )
+                .await
+                .repaired
+        };
+        // `repaired == 0` means the under-replication scrub didn't
+        // need to do anything → already healthy.
+        Ok(outcome_pre_repaired == 0)
     }
 
     /// Spawn a tokio task that calls [`run_once`] every `interval`.

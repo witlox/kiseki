@@ -3,11 +3,14 @@
 //! Plans and tracks the evacuation of chunks from a device that is being
 //! decommissioned or has been flagged unhealthy.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use kiseki_common::ids::ChunkId;
 
 /// Live progress tracker for an in-flight evacuation.
+#[derive(Debug)]
 pub struct EvacuationProgress {
     /// Number of chunks evacuated so far.
     pub chunks_evacuated: AtomicU64,
@@ -78,6 +81,75 @@ pub fn plan_evacuation(
     }
 }
 
+/// Registry of in-flight evacuations, keyed by `evacuation_id`
+/// (a UUID). Storage admin's `EvacuateDevice` (W5) inserts an
+/// entry on start; the in-flight worker shares the
+/// [`EvacuationProgress`] handle so it sees `cancel()` flipping
+/// `cancelled` between chunks and can stop cleanly. ADR-025 W4
+/// `CancelEvacuation` looks up by id and triggers cancellation.
+#[derive(Debug, Default)]
+pub struct EvacuationRegistry {
+    inner: Mutex<HashMap<String, Arc<EvacuationProgress>>>,
+}
+
+impl EvacuationRegistry {
+    /// Construct an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a new in-flight evacuation. The registry holds an
+    /// `Arc` clone so the worker thread can drop its handle when
+    /// it finishes — a subsequent `cancel()` becomes a no-op once
+    /// the only reference is the worker's already-dropped one.
+    pub fn register(&self, id: String, progress: Arc<EvacuationProgress>) {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.insert(id, progress);
+    }
+
+    /// Cancel the evacuation identified by `id`. Returns `true` if
+    /// the registry held an entry (whether or not `cancel()` had
+    /// already been called); `false` if the id was unknown — the
+    /// admin RPC translates `false` into `NotFound`.
+    pub fn cancel(&self, id: &str) -> bool {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(p) = g.get(id) {
+            p.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Snapshot the current set of evacuation ids. Test helper
+    /// today; W5's `ListEvacuations` will use it (or a
+    /// progress-projection variant).
+    #[must_use]
+    pub fn ids(&self) -> Vec<String> {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.keys().cloned().collect()
+    }
+
+    /// Remove an entry once its worker has finished. Idempotent.
+    pub fn unregister(&self, id: &str) {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.remove(id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +193,47 @@ mod tests {
 
         progress.chunks_evacuated.store(3, Ordering::Release);
         assert!(progress.is_complete());
+    }
+
+    #[test]
+    fn registry_cancel_flips_progress_flag() {
+        let r = EvacuationRegistry::new();
+        let p = Arc::new(EvacuationProgress::new([0x03; 16], 5));
+        r.register("ev-1".to_owned(), Arc::clone(&p));
+        let cancelled = r.cancel("ev-1");
+        assert!(cancelled, "registered id must report success");
+        assert!(p.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn registry_cancel_unknown_id_returns_false() {
+        let r = EvacuationRegistry::new();
+        assert!(!r.cancel("no-such-id"));
+    }
+
+    #[test]
+    fn registry_unregister_removes_entry() {
+        let r = EvacuationRegistry::new();
+        let p = Arc::new(EvacuationProgress::new([0x04; 16], 1));
+        r.register("ev-2".to_owned(), p);
+        r.unregister("ev-2");
+        assert!(!r.cancel("ev-2"), "after unregister id must be absent");
+        assert!(r.ids().is_empty());
+    }
+
+    #[test]
+    fn registry_ids_lists_all_entries() {
+        let r = EvacuationRegistry::new();
+        r.register(
+            "a".to_owned(),
+            Arc::new(EvacuationProgress::new([1; 16], 1)),
+        );
+        r.register(
+            "b".to_owned(),
+            Arc::new(EvacuationProgress::new([2; 16], 1)),
+        );
+        let mut ids = r.ids();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_owned(), "b".to_owned()]);
     }
 }

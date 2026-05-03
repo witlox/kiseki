@@ -61,6 +61,7 @@ use kiseki_crypto::envelope::Envelope;
 pub mod auth;
 pub mod defaults;
 pub mod ec;
+pub mod maintenance;
 pub mod metrics;
 pub mod peer;
 pub mod placement;

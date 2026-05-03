@@ -491,64 +491,71 @@ pub async fn run_main(
     // probe / repair from). Cadence is currently a fixed 10
     // minutes per shard — operators can revisit once the
     // scheduler ships per-shard metrics.
-    if !fabric_peers_for_scrub.is_empty() {
-        let scrub_log = Arc::clone(&log_store) as Arc<dyn kiseki_log::traits::LogOps>;
-        let scrub_local = Arc::clone(&local_chunk_store);
-        let scrub_oracle: Arc<dyn kiseki_chunk_cluster::FragmentAvailabilityOracle> = Arc::new(
-            kiseki_chunk_cluster::FabricAvailabilityOracle::new(&fabric_peers_for_scrub),
-        );
-        let scrub_deleter: Arc<dyn kiseki_chunk_cluster::OrphanDeleter> = Arc::new(
-            kiseki_chunk_cluster::LocalChunkDeleter::new(Arc::clone(&local_chunk_store)),
-        );
-        let scrub_repairer: Arc<dyn kiseki_chunk_cluster::Repairer> =
-            Arc::new(kiseki_chunk_cluster::FabricRepairer::new(
-                &fabric_peers_for_scrub,
-                bootstrap_tenant_for_cluster,
-                "default".into(),
-            ));
-        let scheduler = Arc::new(
-            kiseki_chunk_cluster::ScrubScheduler::new(
-                scrub_log,
-                scrub_local,
-                scrub_oracle,
-                scrub_deleter,
-                scrub_repairer,
-                kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
-                bootstrap_tenant_for_cluster,
-                kiseki_chunk_cluster::OrphanScrubPolicy::default(),
-                kiseki_chunk_cluster::UnderReplicationPolicy {
-                    target_copies: durability.copies,
-                    min_acks: durability.min_acks,
-                },
-            )
-            // Phase 16e step 3: thread the EC strategy so the scrub
-            // dispatches via repair_ec on EC clusters (≥6 nodes per
-            // the defaults table). Replication-N stays on the legacy
-            // repair() path via the trait default.
-            .with_strategy(durability.strategy),
-        );
-        // Phase 16e step 4: build a shutdown channel + spawn the
-        // scheduler with it. On Ctrl-C the data-path serve loop
-        // exits via serve_with_shutdown; we send true on the
-        // scrub channel so its loop drains cleanly + the
-        // JoinHandle joins before the runtime shuts down. Today
-        // the runtime doesn't have a shared shutdown signal hook,
-        // so the scrub channel sender is leaked here — the
-        // process exit terminates the loop. When the runtime
-        // grows a unified shutdown registry this sender goes in
-        // there.
-        let (scrub_shutdown_tx, scrub_shutdown_rx) = tokio::sync::watch::channel(false);
-        let scrub_handle =
-            scheduler.start_periodic(std::time::Duration::from_secs(600), scrub_shutdown_rx);
-        // Detach: the channel sender + JoinHandle stay alive for
-        // the process lifetime. Wiring a unified shutdown signal
-        // is a runtime-wide concern tracked in
-        // `specs/escalations/`.
-        std::mem::drop((scrub_shutdown_tx, scrub_handle));
-        tracing::info!(
-            "scrub scheduler: spawned (orphan + under-replication, 10-min cadence, drain-on-shutdown)",
-        );
-    }
+    let scrub_scheduler_handle: Option<Arc<kiseki_chunk_cluster::ScrubScheduler>> =
+        if fabric_peers_for_scrub.is_empty() {
+            None
+        } else {
+            let scrub_log = Arc::clone(&log_store) as Arc<dyn kiseki_log::traits::LogOps>;
+            let scrub_local = Arc::clone(&local_chunk_store);
+            let scrub_oracle: Arc<dyn kiseki_chunk_cluster::FragmentAvailabilityOracle> = Arc::new(
+                kiseki_chunk_cluster::FabricAvailabilityOracle::new(&fabric_peers_for_scrub),
+            );
+            let scrub_deleter: Arc<dyn kiseki_chunk_cluster::OrphanDeleter> = Arc::new(
+                kiseki_chunk_cluster::LocalChunkDeleter::new(Arc::clone(&local_chunk_store)),
+            );
+            let scrub_repairer: Arc<dyn kiseki_chunk_cluster::Repairer> =
+                Arc::new(kiseki_chunk_cluster::FabricRepairer::new(
+                    &fabric_peers_for_scrub,
+                    bootstrap_tenant_for_cluster,
+                    "default".into(),
+                ));
+            let scheduler = Arc::new(
+                kiseki_chunk_cluster::ScrubScheduler::new(
+                    scrub_log,
+                    scrub_local,
+                    scrub_oracle,
+                    scrub_deleter,
+                    scrub_repairer,
+                    kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+                    bootstrap_tenant_for_cluster,
+                    kiseki_chunk_cluster::OrphanScrubPolicy::default(),
+                    kiseki_chunk_cluster::UnderReplicationPolicy {
+                        target_copies: durability.copies,
+                        min_acks: durability.min_acks,
+                    },
+                )
+                // Phase 16e step 3: thread the EC strategy so the scrub
+                // dispatches via repair_ec on EC clusters (≥6 nodes per
+                // the defaults table). Replication-N stays on the legacy
+                // repair() path via the trait default.
+                .with_strategy(durability.strategy),
+            );
+            // Phase 16e step 4: build a shutdown channel + spawn the
+            // scheduler with it. On Ctrl-C the data-path serve loop
+            // exits via serve_with_shutdown; we send true on the
+            // scrub channel so its loop drains cleanly + the
+            // JoinHandle joins before the runtime shuts down. Today
+            // the runtime doesn't have a shared shutdown signal hook,
+            // so the scrub channel sender is leaked here — the
+            // process exit terminates the loop. When the runtime
+            // grows a unified shutdown registry this sender goes in
+            // there.
+            let (scrub_shutdown_tx, scrub_shutdown_rx) = tokio::sync::watch::channel(false);
+            let scrub_handle = Arc::clone(&scheduler)
+                .start_periodic(std::time::Duration::from_secs(600), scrub_shutdown_rx);
+            // Detach: the channel sender + JoinHandle stay alive for
+            // the process lifetime. Wiring a unified shutdown signal
+            // is a runtime-wide concern tracked in
+            // `specs/escalations/`.
+            std::mem::drop((scrub_shutdown_tx, scrub_handle));
+            tracing::info!(
+                "scrub scheduler: spawned (orphan + under-replication, 10-min cadence, drain-on-shutdown)",
+            );
+            // ADR-025 W4: also hand the scheduler to
+            // `StorageAdminGrpc::with_scrub` so the admin RPC can
+            // call `trigger_now()` and `repair_one_chunk()`.
+            Some(scheduler)
+        };
 
     // Raw device discovery (KISEKI_RAW_DEVICES).
     // This is the discovery phase — actual device opening via DeviceBackend
@@ -1149,13 +1156,25 @@ pub async fn run_main(
             }
         });
     }
-    let storage_admin_handler = crate::storage_admin::StorageAdminGrpc::from_runtime()
+    // ADR-025 W4 deps. Same `Arc<MaintenanceMode>` is wired into
+    // both the storage admin handler (flips the flag) and the
+    // ClusterChunkServer (consults it on every PutFragment).
+    // EvacuationRegistry is admin-only today; W5's EvacuateDevice
+    // will be the producer.
+    let maintenance_mode = Arc::new(kiseki_chunk_cluster::maintenance::MaintenanceMode::new());
+    let evacuation_registry = Arc::new(kiseki_chunk::evacuation::EvacuationRegistry::new());
+    let mut storage_admin_handler = crate::storage_admin::StorageAdminGrpc::from_runtime()
         .with_chunk_store(Arc::clone(&local_chunk_store))
         .with_cluster(cluster_member_ids, cfg.node_id)
         .with_bootstrap_shard(bootstrap_shard)
         .with_repair_tracker(Arc::clone(&repair_tracker))
         .with_tuning_store(tuning_store)
+        .with_maintenance(Arc::clone(&maintenance_mode))
+        .with_evacuations(Arc::clone(&evacuation_registry))
         .with_metrics(Arc::clone(&storage_admin_calls_counter));
+    if let Some(ref s) = scrub_scheduler_handle {
+        storage_admin_handler = storage_admin_handler.with_scrub(Arc::clone(s));
+    }
     let storage_admin_svc =
         kiseki_proto::v1::storage_admin_service_server::StorageAdminServiceServer::new(
             storage_admin_handler,
@@ -1179,7 +1198,11 @@ pub async fn run_main(
         Arc::clone(&local_chunk_store),
         "default",
         envelope_registry.clone(),
-    );
+    )
+    // ADR-025 W4 — same `Arc<MaintenanceMode>` shared with
+    // `StorageAdminGrpc` above so the admin-flipped flag is
+    // visible on this node's data path.
+    .with_maintenance(Arc::clone(&maintenance_mode), bootstrap_shard);
 
     let mut builder = tonic::transport::Server::builder()
         // HTTP/2 flow-control windows. Match the fabric Channel

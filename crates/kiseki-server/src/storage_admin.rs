@@ -16,9 +16,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use kiseki_chunk::evacuation::EvacuationRegistry;
 use kiseki_chunk::pool::DurabilityStrategy;
-use kiseki_chunk_cluster::repair_tracker::RepairTracker;
-use kiseki_common::ids::ShardId;
+use kiseki_chunk_cluster::maintenance::MaintenanceMode;
+use kiseki_chunk_cluster::repair_tracker::{
+    RepairRecord, RepairState, RepairTracker, RepairTrigger,
+};
+use kiseki_chunk_cluster::scrub_scheduler::ScrubScheduler;
+use kiseki_common::ids::{ChunkId, ShardId};
 use kiseki_proto::v1 as pb;
 use kiseki_proto::v1::storage_admin_service_server::StorageAdminService;
 use prometheus::IntCounterVec;
@@ -56,6 +61,17 @@ pub struct StorageAdminGrpc {
     /// `Unimplemented` so the caller knows the dep is missing
     /// rather than the RPC.
     tuning: Option<crate::tuning::TuningStore>,
+    /// Per-shard maintenance flag store (ADR-025 W4). `None` =
+    /// `SetShardMaintenance` returns `FailedPrecondition`.
+    maintenance: Option<Arc<MaintenanceMode>>,
+    /// In-flight evacuation registry (ADR-025 W4). `None` =
+    /// `CancelEvacuation` returns `FailedPrecondition`.
+    evacuations: Option<Arc<EvacuationRegistry>>,
+    /// On-demand scrub trigger (ADR-025 W4). `None` =
+    /// `TriggerScrub` / `RepairChunk` return `FailedPrecondition`
+    /// (which is what a single-node cluster sees today since the
+    /// scrub scheduler is wired only when fabric peers exist).
+    scrub: Option<Arc<ScrubScheduler>>,
     /// `kiseki_storage_admin_calls_total{rpc, outcome}` counter,
     /// shared with the global Prometheus registry. `None` in unit
     /// tests — RPC handlers no-op the counter bump in that case.
@@ -91,6 +107,9 @@ impl StorageAdminGrpc {
             bootstrap_shard: ShardId(uuid::Uuid::nil()),
             repair_tracker: None,
             tuning: None,
+            maintenance: None,
+            evacuations: None,
+            scrub: None,
             calls_total: None,
         }
     }
@@ -136,6 +155,35 @@ impl StorageAdminGrpc {
     #[must_use]
     pub fn with_tuning_store(mut self, tuning: crate::tuning::TuningStore) -> Self {
         self.tuning = Some(tuning);
+        self
+    }
+
+    /// Builder: attach the per-shard maintenance flag store
+    /// (ADR-025 W4). Same handle is wired into
+    /// `ClusterChunkServer::with_maintenance` so the admin RPC
+    /// flips the same atomic the write path consults.
+    #[must_use]
+    pub fn with_maintenance(mut self, m: Arc<MaintenanceMode>) -> Self {
+        self.maintenance = Some(m);
+        self
+    }
+
+    /// Builder: attach the in-flight evacuation registry
+    /// (ADR-025 W4). The orchestrator that starts an evacuation
+    /// (W5 `EvacuateDevice`) registers each progress handle here;
+    /// the admin RPC looks up by id to cancel.
+    #[must_use]
+    pub fn with_evacuations(mut self, r: Arc<EvacuationRegistry>) -> Self {
+        self.evacuations = Some(r);
+        self
+    }
+
+    /// Builder: attach the scrub scheduler (ADR-025 W4). Required
+    /// for `TriggerScrub` and `RepairChunk` — both return
+    /// `FailedPrecondition` without it.
+    #[must_use]
+    pub fn with_scrub(mut self, s: Arc<ScrubScheduler>) -> Self {
+        self.scrub = Some(s);
         self
     }
 
@@ -393,13 +441,29 @@ impl StorageAdminService for StorageAdminGrpc {
 
     async fn cancel_evacuation(
         &self,
-        _req: Request<pb::CancelEvacuationRequest>,
+        req: Request<pb::CancelEvacuationRequest>,
     ) -> Result<Response<pb::CancelEvacuationResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.CancelEvacuation",
-            "W4",
-            "node-local flag flip on the drain orchestrator",
-        ))
+        self.with_obs("StorageAdminService.CancelEvacuation", || async move {
+            let registry = self.evacuations.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.CancelEvacuation: evacuation registry dep not wired",
+                )
+            })?;
+            let id = req.into_inner().evacuation_id;
+            if id.is_empty() {
+                return Err(Status::invalid_argument("evacuation_id is required"));
+            }
+            if !registry.cancel(&id) {
+                return Err(Status::not_found(format!("evacuation {id} not found",)));
+            }
+            // committed_at_log_index = 0 — node-local mutation;
+            // W5 will replicate the cancellation via Raft if it
+            // turns out cluster-wide visibility is needed.
+            Ok(Response::new(pb::CancelEvacuationResponse {
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     // --- Pool management ---
@@ -732,37 +796,139 @@ impl StorageAdminService for StorageAdminGrpc {
 
     async fn set_shard_maintenance(
         &self,
-        _req: Request<pb::SetShardMaintenanceRequest>,
+        req: Request<pb::SetShardMaintenanceRequest>,
     ) -> Result<Response<pb::SetShardMaintenanceResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.SetShardMaintenance",
-            "W4",
-            "atomic flag in ClusterChunkServer; gates writes, allows reads",
-        ))
+        self.with_obs("StorageAdminService.SetShardMaintenance", || async move {
+            let m = self.maintenance.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.SetShardMaintenance: maintenance dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.shard_id.is_empty() {
+                return Err(Status::invalid_argument("shard_id is required"));
+            }
+            // Today only the bootstrap shard exists; the admin RPC
+            // accepts that single id (or any id matching it) and
+            // rejects everything else with NotFound. W5's
+            // SplitShard makes this dynamic.
+            let shard = parse_shard_id(&r.shard_id)?;
+            if shard != self.bootstrap_shard {
+                return Err(Status::not_found(
+                    format!("shard {} not found", r.shard_id,),
+                ));
+            }
+            m.set(shard, r.enabled);
+            // committed_at_log_index = 0 — node-local mutation;
+            // W5 will replicate via Raft for cluster-wide effect.
+            Ok(Response::new(pb::SetShardMaintenanceResponse {
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     // --- Repair and scrub ---
 
     async fn trigger_scrub(
         &self,
-        _req: Request<pb::TriggerScrubRequest>,
+        req: Request<pb::TriggerScrubRequest>,
     ) -> Result<Response<pb::TriggerScrubResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.TriggerScrub",
-            "W4",
-            "scrub_scheduler.trigger_now(); reports flow into ListRepairs",
-        ))
+        self.with_obs("StorageAdminService.TriggerScrub", || async move {
+            let scrub = self.scrub.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.TriggerScrub: scrub scheduler dep not wired \
+                     (single-node cluster — no fabric peers to scrub against)",
+                )
+            })?;
+            let pool_filter = req.into_inner().pool_name;
+            let scrub_id = uuid::Uuid::new_v4().to_string();
+            // Record the trigger in the repair tracker so
+            // operators see it on `ListRepairs`. The scrub-pass
+            // outcome lands as additional records when the
+            // scheduler runs; this entry covers the trigger
+            // itself (in_progress → succeeded on completion).
+            if let Some(t) = self.repair_tracker.as_ref() {
+                let detail = if pool_filter.is_empty() {
+                    format!("scrub_id={scrub_id} pool=*")
+                } else {
+                    format!("scrub_id={scrub_id} pool={pool_filter}")
+                };
+                let id = t.start(RepairTrigger::Scrub, ChunkId([0; 32]), detail);
+                let t_clone = Arc::clone(t);
+                let scrub_handle = Arc::clone(scrub).trigger_now();
+                tokio::spawn(async move {
+                    let report = scrub_handle.await.unwrap_or_default();
+                    let detail = format!(
+                        "orphan_deleted={} repaired={} critical={} lost={}",
+                        report.orphan.deleted,
+                        report.under_replication.repaired,
+                        report.under_replication.critical,
+                        report.under_replication.lost,
+                    );
+                    t_clone.update_state(&id, RepairState::Succeeded, Some(detail));
+                });
+            } else {
+                // No tracker — fire-and-forget the scrub. The
+                // returned JoinHandle is dropped intentionally; the
+                // scrub task continues running detached.
+                drop(Arc::clone(scrub).trigger_now());
+            }
+            Ok(Response::new(pb::TriggerScrubResponse { scrub_id }))
+        })
+        .await
     }
 
     async fn repair_chunk(
         &self,
-        _req: Request<pb::AdminRepairChunkRequest>,
+        req: Request<pb::AdminRepairChunkRequest>,
     ) -> Result<Response<pb::RepairChunkResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.RepairChunk",
-            "W4",
-            "direct GrpcFabricPeer::put_fragment for missing fragments",
-        ))
+        self.with_obs("StorageAdminService.RepairChunk", || async move {
+            let scrub = self.scrub.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.RepairChunk: scrub scheduler dep not wired \
+                     (single-node cluster — no fabric peers to repair from)",
+                )
+            })?;
+            let chunk_id_hex = req.into_inner().chunk_id_hex;
+            let chunk_id = parse_chunk_id_hex(&chunk_id_hex)?;
+            let repair_id = if let Some(t) = self.repair_tracker.as_ref() {
+                t.record(RepairRecord {
+                    repair_id: String::new(),
+                    chunk_id,
+                    trigger: RepairTrigger::Manual,
+                    state: RepairState::InProgress,
+                    started_at_ms: now_ms(),
+                    finished_at_ms: None,
+                    detail: format!("manual repair of {chunk_id_hex}"),
+                })
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            let already_healthy = scrub.repair_one_chunk(chunk_id).await.map_err(|e| {
+                if let Some(t) = self.repair_tracker.as_ref() {
+                    t.update_state(&repair_id, RepairState::Failed, Some(e.clone()));
+                }
+                if e.contains("not found") {
+                    Status::not_found(e)
+                } else {
+                    Status::internal(e)
+                }
+            })?;
+            if let Some(t) = self.repair_tracker.as_ref() {
+                let detail = if already_healthy {
+                    "already healthy — no fragments missing".to_owned()
+                } else {
+                    "repair triggered — see scrub scheduler logs".to_owned()
+                };
+                t.update_state(&repair_id, RepairState::Succeeded, Some(detail));
+            }
+            Ok(Response::new(pb::RepairChunkResponse {
+                repair_id,
+                already_healthy,
+            }))
+        })
+        .await
     }
 
     async fn list_repairs(
@@ -847,6 +1013,42 @@ fn hex_encode_chunk(bytes: [u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Decode a 64-char hex string into a `ChunkId`. Returns
+/// `InvalidArgument` on length or character errors so the admin
+/// RPC surfaces the real reason instead of `Internal`.
+fn parse_chunk_id_hex(s: &str) -> Result<ChunkId, Status> {
+    if s.len() != 64 {
+        return Err(Status::invalid_argument(format!(
+            "chunk_id_hex must be 64 chars (32 bytes hex); got {}",
+            s.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte_out) in out.iter_mut().enumerate() {
+        let off = i * 2;
+        *byte_out = u8::from_str_radix(&s[off..off + 2], 16)
+            .map_err(|e| Status::invalid_argument(format!("chunk_id_hex byte {i}: {e}")))?;
+    }
+    Ok(ChunkId(out))
+}
+
+/// Parse a `ShardId` from its textual UUID form. `InvalidArgument`
+/// on a malformed string.
+fn parse_shard_id(s: &str) -> Result<ShardId, Status> {
+    let u =
+        uuid::Uuid::parse_str(s).map_err(|e| Status::invalid_argument(format!("shard_id: {e}")))?;
+    Ok(ShardId(u))
+}
+
+/// Wall-clock now in Unix-millis. Shared with `RepairTracker` —
+/// keep the function here so `RepairChunk` can stamp records
+/// without pulling in another crate's helper.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 // ===========================================================================
@@ -1380,38 +1582,194 @@ mod tests {
         assert_eq!(err.code(), Code::InvalidArgument);
     }
 
-    // -- W4 --
+    // -- W4 (Simple mutations) — landed --
 
-    #[tokio::test]
-    async fn cancel_evacuation_unimplemented_until_w4() {
-        let r = fixture_empty()
-            .cancel_evacuation(Request::new(pb::CancelEvacuationRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("CancelEvacuation", "W4", r);
+    fn fixture_with_maintenance() -> (StorageAdminGrpc, Arc<MaintenanceMode>) {
+        let m = Arc::new(MaintenanceMode::new());
+        let grpc = StorageAdminGrpc::for_tests()
+            .with_bootstrap_shard(ShardId(uuid::Uuid::from_u128(99)))
+            .with_maintenance(Arc::clone(&m));
+        (grpc, m)
+    }
+
+    fn fixture_with_evacuations() -> (StorageAdminGrpc, Arc<EvacuationRegistry>) {
+        let r = Arc::new(EvacuationRegistry::new());
+        let grpc = StorageAdminGrpc::for_tests().with_evacuations(Arc::clone(&r));
+        (grpc, r)
     }
 
     #[tokio::test]
-    async fn set_shard_maintenance_unimplemented_until_w4() {
-        let r = fixture_empty()
-            .set_shard_maintenance(Request::new(pb::SetShardMaintenanceRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("SetShardMaintenance", "W4", r);
+    async fn set_shard_maintenance_flips_flag_in_shared_store() {
+        let (grpc, store) = fixture_with_maintenance();
+        let shard = grpc.bootstrap_shard;
+        assert!(!store.is_in_maintenance(shard));
+        grpc.set_shard_maintenance(Request::new(pb::SetShardMaintenanceRequest {
+            shard_id: shard.0.to_string(),
+            enabled: true,
+        }))
+        .await
+        .expect("ok");
+        assert!(
+            store.is_in_maintenance(shard),
+            "admin RPC must flip the same atomic the data path consults"
+        );
     }
 
     #[tokio::test]
-    async fn trigger_scrub_unimplemented_until_w4() {
+    async fn set_shard_maintenance_disable_clears_flag() {
+        let (grpc, store) = fixture_with_maintenance();
+        store.set(grpc.bootstrap_shard, true);
+        grpc.set_shard_maintenance(Request::new(pb::SetShardMaintenanceRequest {
+            shard_id: grpc.bootstrap_shard.0.to_string(),
+            enabled: false,
+        }))
+        .await
+        .expect("ok");
+        assert!(!store.is_in_maintenance(grpc.bootstrap_shard));
+    }
+
+    #[tokio::test]
+    async fn set_shard_maintenance_unknown_shard_returns_not_found() {
+        let (grpc, _) = fixture_with_maintenance();
+        let r = grpc
+            .set_shard_maintenance(Request::new(pb::SetShardMaintenanceRequest {
+                shard_id: uuid::Uuid::from_u128(7).to_string(),
+                enabled: true,
+            }))
+            .await;
+        let err = r.expect_err("must error");
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn set_shard_maintenance_invalid_uuid_returns_invalid_argument() {
+        let (grpc, _) = fixture_with_maintenance();
+        let r = grpc
+            .set_shard_maintenance(Request::new(pb::SetShardMaintenanceRequest {
+                shard_id: "not-a-uuid".into(),
+                enabled: true,
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn set_shard_maintenance_empty_id_returns_invalid_argument() {
+        let (grpc, _) = fixture_with_maintenance();
+        let r = grpc
+            .set_shard_maintenance(Request::new(pb::SetShardMaintenanceRequest {
+                shard_id: String::new(),
+                enabled: false,
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn set_shard_maintenance_without_dep_returns_failed_precondition() {
+        let r = fixture_empty()
+            .set_shard_maintenance(Request::new(pb::SetShardMaintenanceRequest {
+                shard_id: uuid::Uuid::nil().to_string(),
+                enabled: true,
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn cancel_evacuation_cancels_registered_progress() {
+        use kiseki_chunk::evacuation::EvacuationProgress;
+        let (grpc, registry) = fixture_with_evacuations();
+        let progress = Arc::new(EvacuationProgress::new([0xAB; 16], 100));
+        registry.register("evac-001".into(), Arc::clone(&progress));
+        grpc.cancel_evacuation(Request::new(pb::CancelEvacuationRequest {
+            evacuation_id: "evac-001".into(),
+        }))
+        .await
+        .expect("ok");
+        assert!(progress
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancel_evacuation_unknown_id_returns_not_found() {
+        let (grpc, _) = fixture_with_evacuations();
+        let r = grpc
+            .cancel_evacuation(Request::new(pb::CancelEvacuationRequest {
+                evacuation_id: "no-such-evac".into(),
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_evacuation_empty_id_returns_invalid_argument() {
+        let (grpc, _) = fixture_with_evacuations();
+        let r = grpc
+            .cancel_evacuation(Request::new(pb::CancelEvacuationRequest {
+                evacuation_id: String::new(),
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn cancel_evacuation_without_dep_returns_failed_precondition() {
+        let r = fixture_empty()
+            .cancel_evacuation(Request::new(pb::CancelEvacuationRequest {
+                evacuation_id: "x".into(),
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn trigger_scrub_without_dep_returns_failed_precondition() {
         let r = fixture_empty()
             .trigger_scrub(Request::new(pb::TriggerScrubRequest::default()))
             .await;
-        assert_unimplemented_with_workstream("TriggerScrub", "W4", r);
+        assert_eq!(r.expect_err("err").code(), Code::FailedPrecondition);
     }
 
     #[tokio::test]
-    async fn repair_chunk_unimplemented_until_w4() {
+    async fn repair_chunk_without_dep_returns_failed_precondition() {
         let r = fixture_empty()
             .repair_chunk(Request::new(pb::AdminRepairChunkRequest::default()))
             .await;
-        assert_unimplemented_with_workstream("RepairChunk", "W4", r);
+        assert_eq!(r.expect_err("err").code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn repair_chunk_invalid_hex_returns_invalid_argument() {
+        // We need a fixture with scrub wired to even get past the
+        // dep check. The scrub scheduler is heavy to construct in
+        // a unit test, so the cheapest path is to set up a fake by
+        // testing parse_chunk_id_hex directly.
+        let r = parse_chunk_id_hex("not-32-bytes");
+        assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_chunk_id_hex_round_trips_with_hex_encode() {
+        let bytes: [u8; 32] = [0x42; 32];
+        let s = hex_encode_chunk(bytes);
+        let parsed = parse_chunk_id_hex(&s).expect("ok");
+        assert_eq!(parsed.0, bytes);
+    }
+
+    #[test]
+    fn parse_chunk_id_hex_rejects_non_hex_chars() {
+        // Right length, but contains a non-hex char.
+        let bad = "g".repeat(64);
+        assert!(parse_chunk_id_hex(&bad).is_err());
+    }
+
+    #[test]
+    fn parse_shard_id_round_trips_with_uuid() {
+        let u = uuid::Uuid::from_u128(0xdead_beef);
+        let s = parse_shard_id(&u.to_string()).expect("ok");
+        assert_eq!(s.0, u);
     }
 
     // -- W5 --
@@ -1657,20 +2015,15 @@ mod tests {
     #[tokio::test]
     async fn metrics_increment_on_unimplemented_outcome() {
         let (grpc, counter) = fixture_with_counter();
-        // Pick a still-unimplemented RPC (W4) so this test
-        // continues to exercise the `unimplemented` bucket as
-        // workstreams land. When W4 lands real impls of these,
-        // swap to a W5 RPC.
+        // Pick a still-unimplemented RPC (W5 territory) so this
+        // test continues to exercise the `unimplemented` bucket
+        // as workstreams land.
         let r = grpc
-            .trigger_scrub(Request::new(pb::TriggerScrubRequest::default()))
+            .add_device(Request::new(pb::AddDeviceRequest::default()))
             .await;
         assert!(r.is_err());
         assert_eq!(
-            counter_value(
-                &counter,
-                "StorageAdminService.TriggerScrub",
-                "unimplemented",
-            ),
+            counter_value(&counter, "StorageAdminService.AddDevice", "unimplemented"),
             1,
         );
     }
@@ -1756,6 +2109,11 @@ mod tests {
             // ADR-025 W3 — TuningParams.
             "get_tuning_params",
             "set_tuning_params",
+            // ADR-025 W4 — simple mutations.
+            "set_shard_maintenance",
+            "cancel_evacuation",
+            "trigger_scrub",
+            "repair_chunk",
         ];
         for rpc in implemented {
             // Locate the `async fn <rpc>` line, then look ahead a

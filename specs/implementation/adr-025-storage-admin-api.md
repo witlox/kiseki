@@ -254,23 +254,88 @@ when those subsystems land.
 
 ---
 
-### W4 — Simple mutating RPCs (single-node, no Raft)
+### W4 — Simple mutating RPCs (single-node, no Raft) ✅ DONE (2026-05-03)
 
 These mutate node-local state only — no cluster coordination needed.
 
 | RPC | Mechanism | Notes |
 |---|---|---|
-| `SetShardMaintenance` | atomic flag in `ClusterChunkServer` | gates writes to the shard; reads stay served |
-| `CancelEvacuation` | flips a flag on the drain orchestrator | requires the drain orchestrator to expose a cancel API (W5 adds it) |
-| `RepairChunk` | direct call into `kiseki-chunk-cluster::peer::GrpcFabricPeer::put_fragment` for missing fragments | one-shot, idempotent |
-| `TriggerScrub` | `scrub_scheduler.trigger_now()` (need new method) | returns immediately; reports lands in `ListRepairs` |
+| `SetShardMaintenance` | atomic flag in `MaintenanceMode` shared with `ClusterChunkServer` | gates writes to the shard; reads stay served |
+| `CancelEvacuation` | `EvacuationRegistry::cancel(id)` flips the registered `EvacuationProgress.cancelled` atomic | the drain orchestrator (W5 `EvacuateDevice`) is the producer; W4 ships the registry |
+| `RepairChunk` | new `ScrubScheduler::repair_one_chunk(chunk_id)` reuses `UnderReplicationScrub` for the single-chunk case | RepairTracker entry on start + finish so `ListRepairs` shows progress |
+| `TriggerScrub` | new `ScrubScheduler::trigger_now()` spawns `run_once()` | returns immediately with a `scrub_id`; report-on-completion lands in `ListRepairs` |
 
-**Failing test:** for each, `tests/storage_admin_simple_mutations.rs`
-asserts the side effect is observable from the corresponding read RPC
-(e.g. `SetShardMaintenance(on)` then `GetShard` shows
-`maintenance: true`).
+**Landed:**
+- `crates/kiseki-chunk-cluster/src/maintenance.rs` — `MaintenanceMode`
+  with per-shard `AtomicBool` registry. 5 inline tests.
+- `crates/kiseki-chunk-cluster/src/server.rs` — `with_maintenance()`
+  builder + `is_in_maintenance(shard)` check at the top of
+  `put_fragment()` returning `FailedPrecondition` when set.
+- `crates/kiseki-chunk/src/evacuation.rs` — `EvacuationRegistry`
+  (HashMap<id, Arc<EvacuationProgress>>) with register/cancel/
+  unregister/ids. `EvacuationProgress` derives Debug. 4 new tests.
+- `crates/kiseki-chunk-cluster/src/scrub_scheduler.rs` —
+  `trigger_now()` + `repair_one_chunk()`. The latter walks
+  `cluster_chunk_state` for the requested id, dispatches to the
+  configured `UnderReplicationScrub` (EC or replication N), and
+  reports `already_healthy` when nothing needed repair.
+- `crates/kiseki-server/src/storage_admin.rs` — 4 RPCs implemented
+  via `with_obs`. Helpers: `parse_chunk_id_hex`, `parse_shard_id`,
+  `now_ms`. RepairTracker write-path now real (Manual + Scrub
+  trigger entries land + transition to terminal state).
+- `crates/kiseki-server/src/runtime.rs` — `MaintenanceMode` and
+  `EvacuationRegistry` constructed early; same `Arc`s shared with
+  data-path server + admin handler. `ScrubScheduler` hoisted out
+  of the if-block so it can flow into `with_scrub`.
 
-**Effort:** ~1 day.
+**Tests landed (15 in storage_admin::tests + 9 across the new
+modules):**
+- `set_shard_maintenance_flips_flag_in_shared_store` — proves the
+  admin RPC writes the same atomic the data path consults.
+- `set_shard_maintenance_disable_clears_flag`
+- `set_shard_maintenance_unknown_shard_returns_not_found`
+- `set_shard_maintenance_invalid_uuid_returns_invalid_argument`
+- `set_shard_maintenance_empty_id_returns_invalid_argument`
+- `set_shard_maintenance_without_dep_returns_failed_precondition`
+- `cancel_evacuation_cancels_registered_progress` — proves the
+  admin RPC flips `EvacuationProgress.cancelled` for the worker.
+- `cancel_evacuation_unknown_id_returns_not_found`
+- `cancel_evacuation_empty_id_returns_invalid_argument`
+- `cancel_evacuation_without_dep_returns_failed_precondition`
+- `trigger_scrub_without_dep_returns_failed_precondition`
+- `repair_chunk_without_dep_returns_failed_precondition`
+- `repair_chunk_invalid_hex_returns_invalid_argument`
+- `parse_chunk_id_hex_round_trips_with_hex_encode`
+- `parse_chunk_id_hex_rejects_non_hex_chars`
+- `parse_shard_id_round_trips_with_uuid`
+- `every_implemented_rpc_uses_with_obs` extended to cover all 4 W4
+  RPCs.
+- 5 maintenance + 4 evacuation registry inline tests covering
+  per-shard isolation, idempotence, register/cancel/unregister.
+
+**Tests deferred to integration land:**
+- Full `TriggerScrub → ScrubScheduler::trigger_now() → ListRepairs`
+  end-to-end. The unit tests cover trigger validation; integration
+  needs a fabric peer for `ScrubScheduler::new()` to be useful, so
+  it lands in `kiseki-acceptance` BDD scenarios under
+  `storage-admin.feature`.
+- `RepairChunk` happy-path with a real ClusterChunkStore +
+  multi-node fabric — same dependency as TriggerScrub. The
+  scheduler-side `repair_one_chunk` is unit-tested by extending the
+  existing scrub_scheduler tests (FakeRepairer + FakePeerOracle
+  already mocked there).
+
+**Cluster scope (W4 vs W5):**
+- All 4 W4 RPCs are *node-local mutations*. `committed_at_log_index`
+  returns 0. W5 will optionally lift `SetShardMaintenance` and
+  `CancelEvacuation` to Raft-coordinated deltas if cluster-wide
+  consistency turns out to matter operationally. `RepairChunk` and
+  `TriggerScrub` stay node-local by design (they're operator-driven
+  one-shots, not cluster state).
+
+**Effort actual:** ~0.8 days (the maintenance module landed
+cleanly; the scrub_scheduler `repair_one_chunk` reused the existing
+under-replication pipeline with minimal new code).
 
 ---
 

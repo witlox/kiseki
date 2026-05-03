@@ -57,6 +57,15 @@ pub struct ClusterChunkServer {
     /// 16a ships a single pool per node; 16b's defaults table makes
     /// this per-tenant.
     default_pool: String,
+    /// ADR-025 W4 — per-shard maintenance flag store. When set,
+    /// `PutFragment` returns `FailedPrecondition` so operators can
+    /// drain in-flight work before reconfiguration. `None` (default)
+    /// means no maintenance gating (back-compat for callers that
+    /// haven't wired the W4 flag).
+    maintenance: Option<(
+        Arc<crate::maintenance::MaintenanceMode>,
+        kiseki_common::ids::ShardId,
+    )>,
     /// Per-chunk envelope crypto fields (`auth_tag`, `nonce`, epochs,
     /// optional tenant-wrapped material). EC fragments persist only
     /// the ciphertext slice — the chunk-level crypto fields would
@@ -157,7 +166,23 @@ impl ClusterChunkServer {
             local,
             default_pool: default_pool.into(),
             chunk_envelope_meta: registry,
+            maintenance: None,
         }
+    }
+
+    /// Builder: attach the per-shard maintenance flag store
+    /// (ADR-025 W4). `shard` is the shard id served by this
+    /// node — `PutFragment` is gated on
+    /// `maintenance.is_in_maintenance(shard)`. Without this
+    /// builder, write gating is a no-op.
+    #[must_use]
+    pub fn with_maintenance(
+        mut self,
+        maintenance: Arc<crate::maintenance::MaintenanceMode>,
+        shard: kiseki_common::ids::ShardId,
+    ) -> Self {
+        self.maintenance = Some((maintenance, shard));
+        self
     }
 
     /// Borrow the envelope registry — typically to clone it and hand
@@ -294,6 +319,17 @@ impl ClusterChunkService for ClusterChunkServer {
             return Err(Status::unavailable(
                 "fabric incoming disabled (test-only knob)",
             ));
+        }
+        // ADR-025 W4 — per-shard maintenance mode. When set,
+        // reject writes with `FailedPrecondition` so operators can
+        // drain the data path before reconfiguration. Reads are
+        // unaffected (they walk the same `local` ops directly).
+        if let Some((m, shard)) = self.maintenance.as_ref() {
+            if m.is_in_maintenance(*shard) {
+                return Err(Status::failed_precondition(
+                    "shard is in maintenance mode (StorageAdminService.SetShardMaintenance)",
+                ));
+            }
         }
         let req = request.into_inner();
 
