@@ -35,6 +35,7 @@ fn main() -> std::io::Result<()> {
         "kiseki/v1/audit.proto",
         "kiseki/v1/advisory.proto",
         "kiseki/v1/admin.proto",
+        "kiseki/v1/storage_admin.proto",
     ];
 
     let proto_paths: Vec<PathBuf> = protos.iter().map(|p| proto_root.join(p)).collect();

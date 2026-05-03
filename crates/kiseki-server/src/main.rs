@@ -25,6 +25,7 @@ pub(crate) mod metrics;
 #[allow(dead_code)] // Wired at startup when data-dir migration is integrated.
 pub(crate) mod migration;
 mod runtime;
+pub(crate) mod storage_admin;
 mod system_disk;
 mod telemetry;
 #[allow(dead_code)] // Wired when metrics server integrates UI router.

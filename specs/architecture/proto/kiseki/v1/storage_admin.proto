@@ -1,0 +1,348 @@
+syntax = "proto3";
+
+package kiseki.v1;
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1";
+
+// --- Storage Administration Service (ADR-025) ---
+//
+// Operator-facing API for storage subsystem management: devices,
+// pools, shards, tuning parameters, observability streams, and
+// repair / scrub. Disjoint from `AdminService` (snapshots, ADR-016)
+// and `ControlService` (tenant-facing).
+//
+// Implementation rolled out across workstreams W1-W7 per
+// `specs/implementation/adr-025-storage-admin-api.md`. RPCs that
+// haven't landed yet return UNIMPLEMENTED with a descriptive
+// message naming the workstream they're scheduled for.
+
+service StorageAdminService {
+  // === Device management (W5) ===
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  rpc GetDevice(GetDeviceRequest) returns (DeviceInfo);
+  rpc AddDevice(AddDeviceRequest) returns (AddDeviceResponse);
+  rpc RemoveDevice(RemoveDeviceRequest) returns (RemoveDeviceResponse);
+  rpc EvacuateDevice(EvacuateDeviceRequest) returns (EvacuateDeviceResponse);
+  rpc CancelEvacuation(CancelEvacuationRequest) returns (CancelEvacuationResponse);
+
+  // === Pool management (W2 read, W5 mutate) ===
+  rpc ListPools(ListPoolsRequest) returns (ListPoolsResponse);
+  rpc GetPool(GetPoolRequest) returns (PoolInfo);
+  rpc CreatePool(CreatePoolRequest) returns (CreatePoolResponse);
+  rpc SetPoolDurability(SetPoolDurabilityRequest) returns (SetPoolDurabilityResponse);
+  rpc SetPoolThresholds(SetPoolThresholdsRequest) returns (SetPoolThresholdsResponse);
+  rpc RebalancePool(RebalancePoolRequest) returns (RebalancePoolResponse);
+
+  // === Performance tuning (W3) ===
+  rpc GetTuningParams(GetTuningParamsRequest) returns (TuningParams);
+  rpc SetTuningParams(SetTuningParamsRequest) returns (SetTuningParamsResponse);
+
+  // === Cluster observability (W2 ClusterStatus/PoolStatus, W7 streams) ===
+  rpc ClusterStatus(ClusterStatusRequest) returns (AdminClusterStatus);
+  rpc PoolStatus(PoolStatusRequest) returns (AdminPoolStatus);
+  rpc DeviceHealth(DeviceHealthRequest) returns (stream DeviceHealthEvent);
+  rpc IOStats(IOStatsRequest) returns (stream IOStatsEvent);
+
+  // === Shard management (W2 read, W5 mutate, W4 maintenance) ===
+  rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+  rpc GetShard(GetShardRequest) returns (AdminShardInfo);
+  rpc SplitShard(SplitShardRequest) returns (SplitShardResponse);
+  // ADR-034 follow-up: included so we don't have to revisit the proto
+  // boundary when merge lands (see W5 in the implementation plan).
+  rpc MergeShards(MergeShardsRequest) returns (MergeShardsResponse);
+  rpc SetShardMaintenance(SetShardMaintenanceRequest) returns (SetShardMaintenanceResponse);
+
+  // === Repair and scrub (W4 trigger, W2 list) ===
+  rpc TriggerScrub(TriggerScrubRequest) returns (TriggerScrubResponse);
+  rpc RepairChunk(AdminRepairChunkRequest) returns (RepairChunkResponse);
+  rpc ListRepairs(ListRepairsRequest) returns (ListRepairsResponse);
+}
+
+// === Device messages =======================================================
+
+message ListDevicesRequest {
+  // Filter: only devices in this pool. Empty = every pool.
+  string pool_name = 1;
+}
+message ListDevicesResponse { repeated DeviceInfo devices = 1; }
+
+message GetDeviceRequest { string device_id = 1; }
+
+message DeviceInfo {
+  string device_id = 1;
+  string pool_name = 2;
+  string device_class = 3;        // "nvme_ssd" | "sata_ssd" | "hdd" | "nvme_zns"
+  uint64 capacity_bytes = 4;
+  uint64 used_bytes = 5;
+  bool   online = 6;
+  bool   evacuating = 7;
+  // 0 when not evacuating; 1..100 progress % during evacuation.
+  uint32 evacuation_pct = 8;
+  // Wall-clock when this DeviceInfo was sampled, ISO 8601.
+  string sampled_at = 9;
+}
+
+message AddDeviceRequest {
+  string pool_name = 1;
+  string device_id = 2;
+  uint64 capacity_bytes = 3;
+  string device_class = 4;
+}
+message AddDeviceResponse {
+  // Raft log index at which the addition committed.
+  uint64 committed_at_log_index = 1;
+}
+
+message RemoveDeviceRequest { string device_id = 1; }
+message RemoveDeviceResponse { uint64 committed_at_log_index = 1; }
+
+message EvacuateDeviceRequest {
+  string device_id = 1;
+  // Throttle the evacuation throughput. 0 = use cluster default
+  // (`rebalance_rate_mb_s` tuning param).
+  uint64 throughput_mb_s = 2;
+}
+message EvacuateDeviceResponse {
+  string evacuation_id = 1;
+  uint64 committed_at_log_index = 2;
+}
+
+message CancelEvacuationRequest { string evacuation_id = 1; }
+message CancelEvacuationResponse { uint64 committed_at_log_index = 1; }
+
+// === Pool messages =========================================================
+
+message ListPoolsRequest {}
+message ListPoolsResponse { repeated PoolInfo pools = 1; }
+
+message GetPoolRequest { string pool_name = 1; }
+
+message PoolInfo {
+  string pool_name = 1;
+  // "replication" | "erasure_coding"
+  string durability_kind = 2;
+  // For replication: copies; for EC: data_shards. Other field zero.
+  uint32 replication_copies = 3;
+  uint32 ec_data_shards = 4;
+  uint32 ec_parity_shards = 5;
+  uint64 capacity_bytes = 6;
+  uint64 used_bytes = 7;
+  uint32 device_count = 8;
+  // Capacity thresholds as percentages (0-100). See ADR-024.
+  uint32 warning_threshold_pct = 9;
+  uint32 critical_threshold_pct = 10;
+  uint32 readonly_threshold_pct = 11;
+  uint32 target_fill_pct = 12;
+}
+
+message CreatePoolRequest {
+  string pool_name = 1;
+  string device_class = 2;
+  string durability_kind = 3;
+  uint32 replication_copies = 4;
+  uint32 ec_data_shards = 5;
+  uint32 ec_parity_shards = 6;
+  uint64 initial_capacity_bytes = 7;
+}
+message CreatePoolResponse { uint64 committed_at_log_index = 1; }
+
+message SetPoolDurabilityRequest {
+  string pool_name = 1;
+  string durability_kind = 2;
+  uint32 replication_copies = 3;
+  uint32 ec_data_shards = 4;
+  uint32 ec_parity_shards = 5;
+}
+message SetPoolDurabilityResponse { uint64 committed_at_log_index = 1; }
+
+message SetPoolThresholdsRequest {
+  string pool_name = 1;
+  uint32 warning_threshold_pct = 2;
+  uint32 critical_threshold_pct = 3;
+  uint32 readonly_threshold_pct = 4;
+  uint32 target_fill_pct = 5;
+}
+message SetPoolThresholdsResponse { uint64 committed_at_log_index = 1; }
+
+message RebalancePoolRequest {
+  string pool_name = 1;
+  uint64 throughput_mb_s = 2;     // 0 = use tuning default
+}
+message RebalancePoolResponse { string rebalance_id = 1; }
+
+// === Tuning parameter messages =============================================
+
+message GetTuningParamsRequest {}
+
+message TuningParams {
+  // Cluster-wide
+  uint32 compaction_rate_mb_s = 1;       // default 100, range 10-1000
+  uint32 gc_interval_s = 2;              // default 300, range 60-3600
+  uint32 rebalance_rate_mb_s = 3;        // default 50, range 0-500
+  uint32 scrub_interval_h = 4;           // default 168 (7d), range 24-720
+  uint32 max_concurrent_repairs = 5;     // default 4, range 1-32
+  uint32 stream_proc_poll_ms = 6;        // default 100, range 10-1000
+  uint32 inline_threshold_bytes = 7;     // default 4096, range 512-65536
+  uint32 raft_snapshot_interval = 8;     // default 10000, range 1000-100000
+  // Per-pool tuning lives under PoolInfo for reads;
+  // SetPoolThresholds covers the mutating side of per-pool params.
+}
+
+message SetTuningParamsRequest { TuningParams params = 1; }
+message SetTuningParamsResponse { uint64 committed_at_log_index = 1; }
+
+// === Cluster observability messages ========================================
+
+message ClusterStatusRequest {}
+
+message AdminClusterStatus {
+  uint32 node_count = 1;
+  uint32 shard_count = 2;
+  uint32 pool_count = 3;
+  uint64 total_capacity_bytes = 4;
+  uint64 used_capacity_bytes = 5;
+  bool maintenance_mode = 6;
+  // Current Raft leader for the cluster control shard, "" if no
+  // election yet.
+  string leader_node = 7;
+  string sampled_at = 8;
+}
+
+message PoolStatusRequest { string pool_name = 1; }
+
+message AdminPoolStatus {
+  PoolInfo pool = 1;
+  // Devices in this pool with current per-device fill %.
+  repeated DeviceInfo devices = 2;
+  // "ok" | "warning" | "critical" | "readonly"
+  string capacity_state = 3;
+  uint64 chunk_count = 4;
+  uint64 fragments_total = 5;
+}
+
+message DeviceHealthRequest {
+  // Empty = every device. Filter to one device by id when set.
+  string device_id = 1;
+}
+
+message DeviceHealthEvent {
+  string device_id = 1;
+  string event = 2;       // "online" | "offline" | "io_error" | "smart_warning"
+  string detail = 3;
+  string at = 4;          // ISO 8601
+}
+
+message IOStatsRequest {
+  // Snapshot interval. Server clamps to [100ms, 60s].
+  uint32 sample_interval_ms = 1;
+}
+
+message IOStatsEvent {
+  string sampled_at = 1;
+  // Aggregated across all pools in this snapshot.
+  uint64 reads_per_sec = 2;
+  uint64 writes_per_sec = 3;
+  uint64 read_bytes_per_sec = 4;
+  uint64 write_bytes_per_sec = 5;
+  // Per-pool breakdown.
+  repeated PoolIOStats pool_stats = 6;
+}
+
+message PoolIOStats {
+  string pool_name = 1;
+  uint64 reads_per_sec = 2;
+  uint64 writes_per_sec = 3;
+  uint64 read_bytes_per_sec = 4;
+  uint64 write_bytes_per_sec = 5;
+}
+
+// === Shard messages ========================================================
+
+message ListShardsRequest {
+  // Filter to one tenant; empty = every tenant.
+  string tenant_id = 1;
+}
+message ListShardsResponse { repeated AdminShardInfo shards = 1; }
+
+message GetShardRequest { string shard_id = 1; }
+
+message AdminShardInfo {
+  string shard_id = 1;
+  string tenant_id = 2;
+  // Current Raft leader node id, "" if unknown.
+  string leader_node = 3;
+  // Voting member node ids.
+  repeated string members = 4;
+  uint64 last_applied_log_index = 5;
+  bool maintenance = 6;
+  uint64 entry_count = 7;
+}
+
+message SplitShardRequest {
+  string shard_id = 1;
+  // Optional: explicit pivot key. Empty = engine picks.
+  string pivot_key = 2;
+}
+message SplitShardResponse {
+  string left_shard_id = 1;
+  string right_shard_id = 2;
+  uint64 committed_at_log_index = 3;
+}
+
+message MergeShardsRequest {
+  string left_shard_id = 1;
+  string right_shard_id = 2;
+}
+message MergeShardsResponse {
+  string merged_shard_id = 1;
+  uint64 committed_at_log_index = 2;
+}
+
+message SetShardMaintenanceRequest {
+  string shard_id = 1;
+  bool enabled = 2;
+}
+message SetShardMaintenanceResponse {
+  uint64 committed_at_log_index = 1;
+}
+
+// === Repair and scrub messages =============================================
+
+message TriggerScrubRequest {
+  // Limit scrub to a single pool. Empty = every pool.
+  string pool_name = 1;
+}
+message TriggerScrubResponse {
+  string scrub_id = 1;
+}
+
+message AdminRepairChunkRequest {
+  // 32-byte chunk id, hex-encoded.
+  string chunk_id_hex = 1;
+}
+message RepairChunkResponse {
+  string repair_id = 1;
+  // True if the chunk was already healthy at the time of the call.
+  bool already_healthy = 2;
+}
+
+message ListRepairsRequest {
+  // Page limit. Server clamps to [1, 1000].
+  uint32 limit = 1;
+}
+
+message ListRepairsResponse {
+  repeated RepairRecord repairs = 1;
+}
+
+message RepairRecord {
+  string repair_id = 1;
+  string chunk_id_hex = 2;
+  // "scrub" | "manual" | "under_replication"
+  string trigger = 3;
+  // "in_progress" | "succeeded" | "failed"
+  string state = 4;
+  string started_at = 5;
+  string finished_at = 6;
+  string detail = 7;
+}

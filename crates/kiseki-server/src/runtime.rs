@@ -1093,6 +1093,13 @@ pub async fn run_main(
     let admin_svc = kiseki_proto::v1::admin_service_server::AdminServiceServer::new(
         crate::admin_grpc::AdminGrpc::from_runtime(),
     );
+    // ADR-025 W1: scaffolding only — every RPC returns UNIMPLEMENTED
+    // with the workstream that will land it. W2-W7 replace each body
+    // with a real impl and remove the matching test assertion.
+    let storage_admin_svc =
+        kiseki_proto::v1::storage_admin_service_server::StorageAdminServiceServer::new(
+            crate::storage_admin::StorageAdminGrpc::from_runtime(),
+        );
     // Phase 16a step 7. The ClusterChunkService gRPC server delegates
     // to the *local* AsyncChunkOps (NOT the ClusteredChunkStore) so a
     // PutFragment from a peer leader stores the fragment on this node
@@ -1166,7 +1173,8 @@ pub async fn run_main(
         .add_service(control_svc)
         .add_service(key_svc)
         .add_service(log_svc)
-        .add_service(admin_svc);
+        .add_service(admin_svc)
+        .add_service(storage_admin_svc);
     if cluster_chunk_svc_intercepted {
         router = router.add_service(cluster_chunk_server.into_tonic_server_with_san_check());
         tracing::info!("ClusterChunkService: SAN-role interceptor active (mTLS)");
