@@ -137,7 +137,13 @@ async fn run(args: RunArgs) -> Result<(), String> {
         server.s3_base, server.nfs_addr, server.ds_addr, server.metrics_url(),
     );
 
-    let driver: Arc<dyn protocols::Driver> = protocols::build(args.protocol, &server).await?;
+    // Size the NFS connection pool to match concurrency: each
+    // worker gets its own session, no FIFO queueing on a shared
+    // connection. Capped at 32 to avoid runaway server-side
+    // session memory if someone runs at extreme concurrency.
+    let pool_size = args.concurrency.clamp(1, 32);
+    let driver: Arc<dyn protocols::Driver> =
+        protocols::build(args.protocol, &server, pool_size).await?;
 
     let warmup_keys = if !matches!(args.shape, Shape::PutHeavy) {
         eprintln!(

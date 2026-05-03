@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -36,13 +37,19 @@ const NFS3_OK: u32 = 0;
 /// `NFSv3` client. Stateless — each operation is a single RPC.
 pub struct Nfs3Client {
     addr: SocketAddr,
-    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) — every
-    /// `read`/`write` holds this across blocking sync TCP IO inside
-    /// an `async fn`, and a std mutex would block the tokio worker
-    /// thread for every concurrent acquirer. Same fix and rationale
-    /// as `Nfs4Client::session` — see that comment for the
-    /// measurement.
-    transport: AsyncMutex<Option<RpcTransport>>,
+    /// Pool of independent TCP transports. Each slot is an
+    /// `AsyncMutex<Option<RpcTransport>>` lazily connected on first
+    /// use. Calls pick a slot via the `next` round-robin counter,
+    /// so N concurrent operations use N different connections —
+    /// throughput scales with `pool_size`. NFSv3 is wire-stateless,
+    /// so any slot can serve any request.
+    ///
+    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) — same reason
+    /// as `Nfs4Client::sessions`: holds across blocking sync TCP IO
+    /// inside an `async fn`.
+    transports: Vec<AsyncMutex<Option<RpcTransport>>>,
+    /// Round-robin slot selector.
+    next: AtomicUsize,
     /// Root file handle — obtained from FSINFO or MOUNT protocol.
     /// Kiseki's FSINFO returns the root handle in `post_op_attr`.
     /// Held only across cheap clones, not network IO, so std::Mutex
@@ -55,11 +62,27 @@ pub struct Nfs3Client {
 }
 
 impl Nfs3Client {
+    /// Create a NFSv3 client with a single connection (= prior
+    /// behavior). Use [`Self::with_pool`] for concurrent workloads.
     #[must_use]
     pub fn new(addr: SocketAddr) -> Self {
+        Self::with_pool(addr, 1)
+    }
+
+    /// Create a NFSv3 client with `pool_size` independent TCP
+    /// connections. Throughput scales linearly until either the
+    /// server or the wire becomes the bottleneck.
+    #[must_use]
+    pub fn with_pool(addr: SocketAddr, pool_size: usize) -> Self {
+        let pool_size = pool_size.max(1);
+        let mut transports = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            transports.push(AsyncMutex::new(None));
+        }
         Self {
             addr,
-            transport: AsyncMutex::new(None),
+            transports,
+            next: AtomicUsize::new(0),
             root_fh: Mutex::new(None),
             multipart_buffers: Mutex::new(HashMap::new()),
         }
@@ -68,7 +91,8 @@ impl Nfs3Client {
     async fn ensure_transport(
         &self,
     ) -> Result<tokio::sync::MutexGuard<'_, Option<RpcTransport>>, GatewayError> {
-        let mut guard = self.transport.lock().await;
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.transports.len();
+        let mut guard = self.transports[idx].lock().await;
         if guard.is_none() {
             *guard = Some(RpcTransport::connect(self.addr)?);
         }

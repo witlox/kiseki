@@ -35,12 +35,16 @@ pub trait Driver: Send + Sync {
     async fn get(&self, key: &Key) -> Result<usize, String>;
 }
 
-pub async fn build(protocol: Protocol, server: &ProfileServer) -> Result<Arc<dyn Driver>, String> {
+pub async fn build(
+    protocol: Protocol,
+    server: &ProfileServer,
+    pool_size: usize,
+) -> Result<Arc<dyn Driver>, String> {
     match protocol {
         Protocol::S3 => Ok(Arc::new(S3Driver::new(&server.s3_base))),
-        Protocol::Nfs3 => Ok(Arc::new(Nfs3Driver::new(server.nfs_addr))),
-        Protocol::Nfs4 => Ok(Arc::new(Nfs4Driver::new(server.nfs_addr))),
-        Protocol::Pnfs => Ok(Arc::new(PnfsDriver::new(server.nfs_addr))),
+        Protocol::Nfs3 => Ok(Arc::new(Nfs3Driver::new(server.nfs_addr, pool_size))),
+        Protocol::Nfs4 => Ok(Arc::new(Nfs4Driver::new(server.nfs_addr, pool_size))),
+        Protocol::Pnfs => Ok(Arc::new(PnfsDriver::new(server.nfs_addr, pool_size))),
         Protocol::Fuse => Ok(Arc::new(FuseDriver::new(&server.s3_base))),
     }
 }
@@ -116,9 +120,9 @@ struct Nfs3Driver {
 }
 
 impl Nfs3Driver {
-    fn new(nfs_addr: SocketAddr) -> Self {
+    fn new(nfs_addr: SocketAddr, pool_size: usize) -> Self {
         Self {
-            inner: Arc::new(Nfs3Client::new(nfs_addr)),
+            inner: Arc::new(Nfs3Client::with_pool(nfs_addr, pool_size)),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
             namespace_id: NamespaceId(uuid::Uuid::new_v5(
                 &uuid::Uuid::NAMESPACE_DNS,
@@ -176,9 +180,9 @@ struct Nfs4Driver {
 }
 
 impl Nfs4Driver {
-    fn new(nfs_addr: SocketAddr) -> Self {
+    fn new(nfs_addr: SocketAddr, pool_size: usize) -> Self {
         Self {
-            inner: Arc::new(Nfs4Client::v41(nfs_addr)),
+            inner: Arc::new(Nfs4Client::v41_with_pool(nfs_addr, pool_size)),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
             namespace_id: NamespaceId(uuid::Uuid::new_v5(
                 &uuid::Uuid::NAMESPACE_DNS,
@@ -273,10 +277,10 @@ struct PnfsDriver {
 }
 
 impl PnfsDriver {
-    fn new(nfs_addr: SocketAddr) -> Self {
+    fn new(nfs_addr: SocketAddr, pool_size: usize) -> Self {
         Self {
             nfs_addr,
-            writer: Arc::new(Nfs4Client::v41(nfs_addr)),
+            writer: Arc::new(Nfs4Client::v41_with_pool(nfs_addr, pool_size)),
             mds_session: tokio::sync::Mutex::new(None),
             ds_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             layout_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
