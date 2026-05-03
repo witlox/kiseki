@@ -36,6 +36,24 @@ struct S3State<G: GatewayOps> {
     key_store: AccessKeyStore,
     /// In-memory bucket registry (namespace mapping).
     buckets: Mutex<HashSet<String>>,
+    /// Optional `kiseki_gateway_requests_total{method,status}`
+    /// counter. Wired by the runtime so `/metrics` scrapes reflect
+    /// every PUT/GET/HEAD/DELETE/LIST. Tests + library users
+    /// without metrics configured leave this `None` and the bump
+    /// is a no-op.
+    requests_total_metric: Option<Arc<prometheus::IntCounterVec>>,
+}
+
+impl<G: GatewayOps> S3State<G> {
+    /// `inc()` the `kiseki_gateway_requests_total{method, status}`
+    /// counter when wired. The status string is the numeric HTTP
+    /// status (e.g. "200", "412", "500") — keeps cardinality
+    /// bounded even with arbitrary client behavior.
+    fn record_request(&self, method: &str, status: u16) {
+        if let Some(c) = self.requests_total_metric.as_ref() {
+            c.with_label_values(&[method, &status.to_string()]).inc();
+        }
+    }
 }
 
 impl<G: GatewayOps> S3State<G> {
@@ -82,7 +100,7 @@ pub fn s3_router<G: GatewayOps + Send + Sync + 'static>(
     gateway: S3Gateway<G>,
     fallback_tenant: OrgId,
 ) -> Router {
-    s3_router_with_keys(gateway, fallback_tenant, AccessKeyStore::new())
+    s3_router_full(gateway, fallback_tenant, AccessKeyStore::new(), None)
 }
 
 /// Build an axum router with an explicit access key store.
@@ -91,12 +109,48 @@ pub fn s3_router_with_keys<G: GatewayOps + Send + Sync + 'static>(
     fallback_tenant: OrgId,
     key_store: AccessKeyStore,
 ) -> Router {
+    s3_router_full(gateway, fallback_tenant, key_store, None)
+}
+
+/// Build an axum router with both an access key store and a wired
+/// Prometheus counter for `kiseki_gateway_requests_total`. The
+/// runtime calls this with the registered counter so `/metrics`
+/// reflects every request — without it the counter stays at 0
+/// even under load, which is exactly what the GCP 2026-05-02
+/// perf cluster surfaced.
+pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
+    gateway: S3Gateway<G>,
+    fallback_tenant: OrgId,
+    key_store: AccessKeyStore,
+    requests_total: Option<Arc<prometheus::IntCounterVec>>,
+) -> Router {
     let state = Arc::new(S3State {
         gateway,
         fallback_tenant,
         key_store,
         buckets: Mutex::new(HashSet::new()),
+        requests_total_metric: requests_total,
     });
+
+    // Per-request middleware that records `kiseki_gateway_requests_
+    // total{method, status}` on every response. Wrapping at the
+    // router level means every PUT/GET/HEAD/DELETE/LIST/POST is
+    // counted exactly once without each handler having to remember
+    // to record. The PUT handler additionally records on its
+    // pre-routing 412 path because the conditional-write helper
+    // returns before reaching the middleware (outermost).
+    let metric_state = state.clone();
+    let metric_layer = axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let metric_state = metric_state.clone();
+            async move {
+                let method = req.method().as_str().to_owned();
+                let response = next.run(req).await;
+                metric_state.record_request(&method, response.status().as_u16());
+                response
+            }
+        },
+    );
 
     Router::new()
         .route("/", get(list_buckets::<G>))
@@ -115,6 +169,7 @@ pub fn s3_router_with_keys<G: GatewayOps + Send + Sync + 'static>(
                 .delete(delete_or_abort::<G>)
                 .post(post_multipart::<G>),
         )
+        .layer(metric_layer)
         // S3 single-PUT cap. AWS allows 5 GiB per PutObject; clients
         // chunk larger objects via multipart upload. axum's default
         // body limit (2 MiB) is far too small even for a small
@@ -137,7 +192,7 @@ struct PutParams {
 
 async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
-    Path((bucket, _key)): Path<(String, String)>,
+    Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<PutParams>,
     headers: HeaderMap,
     body: Bytes,
@@ -170,27 +225,87 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
+    // Resolve HTTP-derived conditional headers. RFC 9110 §13:
+    //   - `If-None-Match: *` → succeed only if no current binding.
+    //   - `If-None-Match: <etag>` and `If-Match: <etag>` are also
+    //     valid; we honor `*` and explicit etag values.
+    //   - `If-Match: <etag>` → succeed only if current binding matches.
+    let conditional = parse_write_conditional(&headers);
+
+    // ADR-021: optional workflow correlation header.
+    // `x-kiseki-workflow-ref: <uuid>` lets a tenant tag a write so
+    // the advisory subsystem can correlate it with an active
+    // workflow. Validated by the gateway against its shared
+    // WorkflowTable; the result becomes a counter tick. Per I-WA1
+    // the header is advisory and never blocks the write.
+    let workflow_ref = headers
+        .get("x-kiseki-workflow-ref")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        .map(|u| u.into_bytes());
+
     // Regular PutObject — Content-Type is persisted on the
     // composition (ADV-PA-4: store-side metadata, not per-instance
-    // HashMap). Survives across gateway instances + restart.
-    match state
+    // HashMap). Survives across gateway instances + restart. The
+    // URL `key` becomes the bucket-scoped name binding so subsequent
+    // GET / HEAD / DELETE / LIST against the same key resolve to
+    // this composition.
+    let result = state
         .gateway
         .put_object(PutObjectRequest {
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             body: body.to_vec(),
             content_type,
+            key: Some(key),
+            conditional,
+            workflow_ref,
         })
-        .await
-    {
+        .await;
+    match result {
         Ok(resp) => (
             StatusCode::OK,
             [("etag", format!("\"{}\"", resp.etag))],
             String::new(),
         )
             .into_response(),
+        Err(crate::error::GatewayError::PreconditionFailed(msg)) => {
+            tracing::debug!(error = %msg, "S3 PUT: precondition failed → 412");
+            (StatusCode::PRECONDITION_FAILED, msg).into_response()
+        }
+        Err(crate::error::GatewayError::ReadOnlyNamespace) => {
+            (StatusCode::FORBIDDEN, "namespace is read-only").into_response()
+        }
+        Err(crate::error::GatewayError::NotFound(msg)) => {
+            (StatusCode::NOT_FOUND, msg).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Parse `If-None-Match` / `If-Match` HTTP headers into a
+/// `WriteConditional`. Returns `None` when neither header is present
+/// or both fail to parse — the caller treats this as an unconditional
+/// write. `*` is the only conditional we honor today; explicit etag
+/// values are recognized and parsed (16-byte UUID), but a malformed
+/// etag is silently ignored to preserve back-compat with clients that
+/// send junk headers.
+fn parse_write_conditional(headers: &HeaderMap) -> Option<crate::ops::WriteConditional> {
+    if let Some(v) = headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+    {
+        if v.trim() == "*" {
+            return Some(crate::ops::WriteConditional::IfNoneMatch);
+        }
+    }
+    if let Some(v) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
+        let trimmed = v.trim().trim_matches('"');
+        if let Ok(u) = uuid::Uuid::parse_str(trimmed) {
+            return Some(crate::ops::WriteConditional::IfMatch(CompositionId(u)));
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_lines)]
@@ -200,9 +315,23 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
-    let comp_id = match uuid::Uuid::parse_str(&key) {
-        Ok(u) => CompositionId(u),
-        Err(_) => return (StatusCode::NOT_FOUND, "invalid key (must be UUID)").into_response(),
+    // Two addressing modes coexist:
+    //   1. Per-key naming (S3 PUT URL key was bound by put_object): the
+    //      gateway's name index resolves `key` → composition_id.
+    //   2. UUID-by-id (back-compat / programmatic callers): when the
+    //      URL key parses as a UUID and the name index doesn't bind
+    //      it, fall back to treating it as a composition_id directly.
+    let comp_id = match state
+        .gateway
+        .lookup_object_by_name(state.fallback_tenant, ns_id, &key)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => match uuid::Uuid::parse_str(&key) {
+            Ok(u) => CompositionId(u),
+            Err(_) => return (StatusCode::NOT_FOUND, "object not found").into_response(),
+        },
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let etag = format!("\"{}\"", comp_id.0);
@@ -441,9 +570,17 @@ async fn head_object<G: GatewayOps + Send + Sync + 'static>(
     Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
-    let comp_id = match uuid::Uuid::parse_str(&key) {
-        Ok(u) => CompositionId(u),
-        Err(_) => return (StatusCode::NOT_FOUND).into_response(),
+    let comp_id = match state
+        .gateway
+        .lookup_object_by_name(state.fallback_tenant, ns_id, &key)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => match uuid::Uuid::parse_str(&key) {
+            Ok(u) => CompositionId(u),
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        },
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
     match state
@@ -457,7 +594,10 @@ async fn head_object<G: GatewayOps + Send + Sync + 'static>(
     {
         Ok(resp) => (
             StatusCode::OK,
-            [("content-length", resp.content_length.to_string())],
+            [
+                ("content-length", resp.content_length.to_string()),
+                ("etag", format!("\"{}\"", comp_id.0)),
+            ],
         )
             .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -474,7 +614,7 @@ struct PostParams {
 
 async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
-    Path((bucket, _key)): Path<(String, String)>,
+    Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<PostParams>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
@@ -495,12 +635,18 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
         };
     }
 
-    // POST ?uploadId=X → CompleteMultipartUpload
+    // POST ?uploadId=X → CompleteMultipartUpload. Pass the URL key
+    // through so the resulting composition is bound in the per-bucket
+    // name index — without this multipart-uploaded objects would be
+    // addressable only by their composition UUID, while plain PUTs
+    // are addressable by their URL key. That asymmetry would silently
+    // break GET/DELETE/LIST for the multipart-upload code path.
     if let Some(upload_id) = params.upload_id {
         let req = CompleteMultipartUploadRequest {
             tenant_id: state.fallback_tenant,
             namespace_id: ns_id,
             upload_id,
+            key: Some(key),
         };
         return match state.gateway.complete_multipart_upload(&req).await {
             Ok(resp) => (
@@ -539,10 +685,22 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
         };
     }
 
-    // Regular DeleteObject.
-    let comp_id = match uuid::Uuid::parse_str(&key) {
-        Ok(u) => CompositionId(u),
-        Err(_) => return StatusCode::NO_CONTENT.into_response(),
+    // Regular DeleteObject. Same dual-addressing as GET:
+    //   1. Per-key naming via the gateway's name index.
+    //   2. UUID-by-id fallback when the key parses as a UUID and is
+    //      not bound by name.
+    // S3 DELETE is idempotent — a no-op on missing keys returns 204.
+    let comp_id = match state
+        .gateway
+        .lookup_object_by_name(state.fallback_tenant, ns_id, &key)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => match uuid::Uuid::parse_str(&key) {
+            Ok(u) => CompositionId(u),
+            Err(_) => return StatusCode::NO_CONTENT.into_response(),
+        },
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     match state
@@ -684,53 +842,87 @@ async fn list_objects<G: GatewayOps + Send + Sync + 'static>(
     Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
-    match state
+    let max_keys = params.max_keys.unwrap_or(1000);
+    let prefix = params.prefix.clone().unwrap_or_default();
+    let prefix_opt = if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix.as_str())
+    };
+
+    // Pull from the per-key name index first. Anything bound by name
+    // (i.e. all S3-PUT'd objects since the per-key naming feature
+    // landed) shows up with its real `key` here. Then merge with the
+    // legacy UUID-only listing for back-compat with composition_id-
+    // addressed callers (programmatic clients that PUT without a key
+    // pre-naming, or NFS-written compositions surfaced via S3 LIST).
+    let named = match state
+        .gateway
+        .list_named(state.fallback_tenant, ns_id, prefix_opt)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let unnamed = match state
         .gateway
         .list_objects(state.fallback_tenant, ns_id)
         .await
     {
-        Ok(objects) => {
-            let max_keys = params.max_keys.unwrap_or(1000);
-            let prefix = params.prefix.unwrap_or_default();
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // Index named compositions by id so we can drop them from the
+    // unnamed list (they'd appear twice otherwise — once as
+    // `{"key": "user-key", ...}` and once as `{"key": "<uuid>", ...}`).
+    let named_ids: std::collections::HashSet<CompositionId> =
+        named.iter().map(|(_, id, _)| *id).collect();
 
-            // Filter by prefix.
-            let filtered: Vec<_> = objects
-                .into_iter()
-                .filter(|(id, _)| id.0.to_string().starts_with(&prefix))
-                .collect();
-
-            // Pagination: continuation token is the index to start from.
-            let start = params
-                .continuation_token
-                .and_then(|t| t.parse::<usize>().ok())
-                .unwrap_or(0);
-            let page: Vec<_> = filtered.iter().skip(start).take(max_keys).collect();
-            let is_truncated = start + page.len() < filtered.len();
-
-            let items: Vec<serde_json::Value> = page
-                .iter()
-                .map(|(id, size)| {
-                    serde_json::json!({
-                        "key": id.0.to_string(),
-                        "size": size,
-                    })
-                })
-                .collect();
-
-            let mut body = serde_json::json!({
-                "contents": items,
-                "key_count": items.len(),
-                "is_truncated": is_truncated,
-            });
-
-            if is_truncated {
-                body["next_continuation_token"] = serde_json::json!((start + max_keys).to_string());
-            }
-
-            (StatusCode::OK, axum::Json(body)).into_response()
+    let mut combined: Vec<(String, u64)> = named
+        .into_iter()
+        .map(|(name, _, size)| (name, size))
+        .collect();
+    for (id, size) in unnamed {
+        if named_ids.contains(&id) {
+            continue;
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        let key = id.0.to_string();
+        if !prefix.is_empty() && !key.starts_with(&prefix) {
+            continue;
+        }
+        combined.push((key, size));
     }
+    combined.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Pagination: continuation token is the index to start from.
+    let start = params
+        .continuation_token
+        .and_then(|t| t.parse::<usize>().ok())
+        .unwrap_or(0);
+    let page: Vec<_> = combined.iter().skip(start).take(max_keys).collect();
+    let is_truncated = start + page.len() < combined.len();
+
+    let items: Vec<serde_json::Value> = page
+        .iter()
+        .map(|(key, size)| {
+            serde_json::json!({
+                "key": key,
+                "size": size,
+            })
+        })
+        .collect();
+
+    let mut body = serde_json::json!({
+        "contents": items,
+        "key_count": items.len(),
+        "is_truncated": is_truncated,
+    });
+
+    if is_truncated {
+        body["next_continuation_token"] = serde_json::json!((start + max_keys).to_string());
+    }
+
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 /// Map S3 bucket name to a deterministic `NamespaceId`.

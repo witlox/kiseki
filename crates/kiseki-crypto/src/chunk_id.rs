@@ -18,6 +18,7 @@ use crate::error::CryptoError;
 ///
 /// The `tenant_hmac_key` must be provided when `policy` is
 /// `TenantIsolated`; it is ignored for `CrossTenant`.
+#[tracing::instrument(skip(plaintext, tenant_hmac_key), fields(plaintext_len = plaintext.len(), policy = ?policy))]
 pub fn derive_chunk_id(
     plaintext: &[u8],
     policy: DedupPolicy,
@@ -32,6 +33,9 @@ pub fn derive_chunk_id(
         }
         DedupPolicy::TenantIsolated => {
             let key_bytes = tenant_hmac_key.ok_or_else(|| {
+                tracing::warn!(
+                    "derive_chunk_id: TenantIsolated dedup but no tenant HMAC key supplied",
+                );
                 CryptoError::InvalidEnvelope(
                     "tenant HMAC key required for TenantIsolated dedup".into(),
                 )

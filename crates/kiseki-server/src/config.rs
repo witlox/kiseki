@@ -57,6 +57,16 @@ pub struct ServerConfig {
     /// pNFS Data Server listener address (ADR-038 §D9). Default `:2052`.
     /// `None` disables the DS endpoint; if pNFS is enabled, must be set.
     pub ds_addr: Option<SocketAddr>,
+    /// Optional override for per-peer DS endpoints. Same
+    /// `id=host:port` format as `raft_peers`. When unset, the
+    /// runtime derives DS addrs from `raft_peers` by substituting
+    /// `ds_addr`'s port — which assumes every node binds the same
+    /// DS port (true for containerized/hostnamed deployments). For
+    /// localhost-multi-node where every node has a distinct DS
+    /// port (the BDD `ClusterHarness`), set this explicitly so
+    /// `MdsLayoutManager` advertises the right per-node DS uaddrs
+    /// in LAYOUTGET / GETDEVICEINFO replies.
+    pub ds_peers: Vec<(u64, String)>,
     /// Whether pNFS layout delegation is offered to NFSv4.1 clients
     /// (ADR-038 §D9). Default `true`.
     pub pnfs_enabled: bool,
@@ -294,6 +304,17 @@ impl ServerConfig {
             .parse()
             .ok();
 
+        let ds_peers = std::env::var("KISEKI_DS_PEERS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|entry| {
+                let (id_str, addr) = entry.split_once('=')?;
+                let id: u64 = id_str.parse().ok()?;
+                Some((id, addr.to_owned()))
+            })
+            .collect();
+
         let pnfs_enabled =
             std::env::var("KISEKI_PNFS_ENABLED").map_or(true, |v| v == "true" || v == "1");
 
@@ -335,6 +356,7 @@ impl ServerConfig {
             backup,
             spiffe_socket,
             ds_addr,
+            ds_peers,
             pnfs_enabled,
             pnfs,
             allow_plaintext_nfs,

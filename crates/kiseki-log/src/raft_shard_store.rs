@@ -181,19 +181,30 @@ impl RaftShardStore {
 
 #[async_trait::async_trait]
 impl LogOps for RaftShardStore {
+    #[tracing::instrument(skip(self, req), fields(shard_id = %req.shard_id.0, tenant_id = %req.tenant_id.0, op = ?req.operation))]
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
-        let store = self.get_shard(req.shard_id)?;
-        store.append_delta(req).await
+        let store = self.get_shard(req.shard_id).inspect_err(|e| {
+            tracing::warn!(error = %e, "log append_delta: shard lookup failed");
+        })?;
+        store.append_delta(req).await.inspect_err(|e| {
+            tracing::warn!(error = %e, "log append_delta: shard append failed");
+        })
     }
 
+    #[tracing::instrument(skip(self, req), fields(shard_id = %req.delta.shard_id.0, tenant_id = %req.delta.tenant_id.0, op = ?req.delta.operation, new_chunks = req.new_chunks.len()))]
     async fn append_chunk_and_delta(
         &self,
         req: AppendChunkAndDeltaRequest,
     ) -> Result<SequenceNumber, LogError> {
-        let store = self.get_shard(req.delta.shard_id)?;
+        let store = self.get_shard(req.delta.shard_id).inspect_err(|e| {
+            tracing::warn!(error = %e, "log append_chunk_and_delta: shard lookup failed");
+        })?;
         store
             .append_chunk_and_delta(req.delta, req.new_chunks)
             .await
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "log append_chunk_and_delta: shard append failed");
+            })
     }
 
     async fn increment_chunk_refcount(
@@ -234,9 +245,14 @@ impl LogOps for RaftShardStore {
         Ok(store.cluster_chunk_state_iter().await)
     }
 
+    #[tracing::instrument(skip(self, req), fields(shard_id = %req.shard_id.0, from = req.from.0, to = req.to.0))]
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
-        let store = self.get_shard(req.shard_id)?;
-        store.read_deltas(req).await
+        let store = self.get_shard(req.shard_id).inspect_err(|e| {
+            tracing::warn!(error = %e, "log read_deltas: shard lookup failed");
+        })?;
+        store.read_deltas(req).await.inspect_err(|e| {
+            tracing::warn!(error = %e, "log read_deltas: shard read failed");
+        })
     }
 
     async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {

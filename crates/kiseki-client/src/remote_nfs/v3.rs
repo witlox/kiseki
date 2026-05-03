@@ -352,7 +352,7 @@ impl GatewayOps for Nfs3Client {
         Ok(format!("nfs3-part-{part_number}"))
     }
 
-    async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+    async fn complete_multipart(&self, upload_id: &str, _name: Option<&str>) -> Result<CompositionId, GatewayError> {
         let mut parts = self
             .multipart_buffers
             .lock()
@@ -371,6 +371,9 @@ impl GatewayOps for Nfs3Client {
                 tenant_id: OrgId(uuid::Uuid::nil()),
                 namespace_id: NamespaceId(uuid::Uuid::nil()),
                 data: full_data,
+                name: None,
+                conditional: None,
+                workflow_ref: None,
             })
             .await?;
         Ok(resp.composition_id)

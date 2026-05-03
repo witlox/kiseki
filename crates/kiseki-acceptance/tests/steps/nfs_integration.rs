@@ -215,7 +215,7 @@ async fn when_nfs_write_10kb_chunks(w: &mut KisekiWorld) {
         .expect("part 3");
 
     let comp_id = nfs
-        .complete_multipart(&upload_id)
+        .complete_multipart(&upload_id, None)
         .await
         .expect("complete multipart");
 
@@ -351,6 +351,9 @@ async fn given_nfs_write_cross(w: &mut KisekiWorld, payload: String) {
             tenant_id: OrgId(uuid::Uuid::from_u128(0)),
             namespace_id: NamespaceId(uuid::Uuid::from_u128(0)),
             data: payload.into_bytes(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
     {
@@ -447,6 +450,9 @@ async fn nfs3_write_helper(w: &mut KisekiWorld, data: Vec<u8>) {
             tenant_id: OrgId(uuid::Uuid::from_u128(0)),
             namespace_id: NamespaceId(uuid::Uuid::from_u128(0)),
             data: data.clone(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .expect("NFSv3 write failed");

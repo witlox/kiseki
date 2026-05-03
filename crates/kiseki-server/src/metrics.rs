@@ -40,6 +40,14 @@ pub struct KisekiMetrics {
     pub gateway_requests_total: IntCounterVec,
     /// Gateway request duration in seconds.
     pub gateway_request_duration: HistogramVec,
+    /// `x-kiseki-workflow-ref` header validation outcome counter.
+    /// Labels: `result` ∈ {`absent`, `valid`, `invalid`}. Wired in
+    /// `runtime.rs` to scrape from
+    /// `InMemoryGateway::workflow_ref_writes_total()` on each
+    /// metrics gather; ADR-021 / I-WA1 makes the header advisory so
+    /// `invalid` writes still succeed — operators use this counter
+    /// to spot misconfigured clients.
+    pub gateway_workflow_ref_writes_total: IntCounterVec,
 
     // --- Pool ---
     /// Pool capacity bytes (total).
@@ -154,6 +162,18 @@ impl KisekiMetrics {
             .register(Box::new(gateway_request_duration.clone()))
             .expect("register");
 
+        let gateway_workflow_ref_writes_total = IntCounterVec::new(
+            Opts::new(
+                "kiseki_gateway_workflow_ref_writes_total",
+                "S3 PUTs by x-kiseki-workflow-ref validation outcome (ADR-021 / I-WA1)",
+            ),
+            &["result"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(gateway_workflow_ref_writes_total.clone()))
+            .expect("register");
+
         let pool_capacity_total = IntGaugeVec::new(
             Opts::new("kiseki_pool_capacity_total_bytes", "Pool total capacity"),
             &["pool"],
@@ -239,6 +259,7 @@ impl KisekiMetrics {
             chunk_ec_encode_latency,
             gateway_requests_total,
             gateway_request_duration,
+            gateway_workflow_ref_writes_total,
             pool_capacity_total,
             pool_capacity_used,
             transport_connections_active,

@@ -44,11 +44,12 @@ use kiseki_log::traits::{LogOps, ReadDeltasRequest};
 use tokio::sync::Mutex;
 
 use crate::composition::{
-    decode_composition_create_payload, decode_composition_delete_payload,
+    decode_composition_create_payload_named, decode_composition_delete_payload,
     decode_composition_update_payload, Composition, CompositionStore, INLINE_DATA_THRESHOLD,
 };
 use crate::metrics::{skip_reason, CompositionMetrics};
 use crate::persistent::HydrationBatch;
+use kiseki_common::ids::NamespaceId;
 
 /// In-progress staging state for a single poll's batch. Lets staging
 /// functions see the effects of earlier deltas in the same batch
@@ -62,6 +63,13 @@ struct Staging {
     puts: HashMap<CompositionId, Composition>,
     /// Composition ids scheduled for delete in this batch.
     removes: HashSet<CompositionId>,
+    /// Name bindings to insert on commit. Populated from Create
+    /// deltas that carry a v2 name field.
+    name_inserts: Vec<(NamespaceId, String, CompositionId)>,
+    /// Name bindings to remove on commit. Populated from Delete
+    /// deltas — looked up via reverse index since the Delete payload
+    /// itself carries only the composition_id.
+    name_removes: Vec<(NamespaceId, String)>,
 }
 
 impl Staging {
@@ -85,6 +93,14 @@ impl Staging {
     fn remove(&mut self, id: CompositionId) {
         self.puts.remove(&id);
         self.removes.insert(id);
+    }
+
+    fn bind_name(&mut self, ns: NamespaceId, name: String, id: CompositionId) {
+        self.name_inserts.push((ns, name, id));
+    }
+
+    fn unbind_name(&mut self, ns: NamespaceId, name: String) {
+        self.name_removes.push((ns, name));
     }
 }
 
@@ -276,7 +292,7 @@ impl CompositionHydrator {
             let outcome = match delta.header.operation {
                 OperationType::Create => stage_create(&store, &mut staging, delta),
                 OperationType::Update => stage_update(&store, &mut staging, delta),
-                OperationType::Delete => stage_delete(&mut staging, delta),
+                OperationType::Delete => stage_delete(&store, &mut staging, delta),
                 // Rename, SetAttribute, Finalize aren't installed by
                 // the hydrator. Treat as Applied so the seq advances
                 // and we don't infinite-loop.
@@ -349,6 +365,8 @@ impl CompositionHydrator {
         let batch = HydrationBatch {
             puts: staging.puts.into_values().collect(),
             removes: staging.removes.into_iter().collect(),
+            name_inserts: staging.name_inserts,
+            name_removes: staging.name_removes,
             new_last_applied_seq: last_applied_in_batch,
             stuck_state: stuck_state_update,
             halted: None,
@@ -410,6 +428,8 @@ impl CompositionHydrator {
         let batch = HydrationBatch {
             puts: Vec::new(),
             removes: Vec::new(),
+            name_inserts: Vec::new(),
+            name_removes: Vec::new(),
             new_last_applied_seq: self.last_applied_cache,
             stuck_state: None,
             halted: Some(true),
@@ -433,16 +453,21 @@ fn stage_create(
     staging: &mut Staging,
     delta: &kiseki_log::delta::Delta,
 ) -> DeltaOutcome {
-    let Some((comp_id, namespace_id, size)) =
-        decode_composition_create_payload(&delta.payload.ciphertext)
+    let Some((comp_id, namespace_id, size, name)) =
+        decode_composition_create_payload_named(&delta.payload.ciphertext)
     else {
         return DeltaOutcome::PermanentSkip {
             reason: "create_payload_decode",
         };
     };
     // Idempotent: if the comp is already visible (durable or in-batch
-    // from a previous create in the same poll), nothing to do.
+    // from a previous create in the same poll), nothing to do — but
+    // still re-bind the name so a follower that re-applies a Create
+    // delta after a name index has been wiped converges.
     if staging.view(store, comp_id).is_some() {
+        if let Some(name) = name {
+            staging.bind_name(namespace_id, name, comp_id);
+        }
         return DeltaOutcome::Applied;
     }
     // Look up the namespace in-memory; if missing, transient
@@ -465,6 +490,9 @@ fn stage_create(
         has_inline_data,
         content_type: None,
     });
+    if let Some(name) = name {
+        staging.bind_name(namespace_id, name, comp_id);
+    }
     DeltaOutcome::Applied
 }
 
@@ -501,12 +529,23 @@ fn stage_update(
     DeltaOutcome::Applied
 }
 
-fn stage_delete(staging: &mut Staging, delta: &kiseki_log::delta::Delta) -> DeltaOutcome {
+fn stage_delete(
+    store: &CompositionStore,
+    staging: &mut Staging,
+    delta: &kiseki_log::delta::Delta,
+) -> DeltaOutcome {
     let Some(comp_id) = decode_composition_delete_payload(&delta.payload.ciphertext) else {
         return DeltaOutcome::PermanentSkip {
             reason: "delete_payload_decode",
         };
     };
+    // Resolve the name binding (if any) so the follower's name index
+    // unbinds atomically with the composition row. Without this, a
+    // GET-by-key after the delete would still resolve to a vanished
+    // composition_id until the next compaction.
+    if let Ok(Some((ns, name))) = store.storage().name_for(comp_id) {
+        staging.unbind_name(ns, name);
+    }
     staging.remove(comp_id);
     DeltaOutcome::Applied
 }
@@ -984,6 +1023,8 @@ mod tests {
                 .apply_hydration_batch(HydrationBatch {
                     puts: Vec::new(),
                     removes: Vec::new(),
+                    name_inserts: Vec::new(),
+                    name_removes: Vec::new(),
                     new_last_applied_seq: kiseki_common::ids::SequenceNumber(5),
                     stuck_state: Some(None),
                     halted: None,

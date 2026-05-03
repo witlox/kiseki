@@ -287,6 +287,9 @@ async fn then_no_plaintext(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: plaintext.to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -625,6 +628,9 @@ async fn then_fetch_encrypted(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"encrypted-on-wire".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -673,6 +679,9 @@ async fn then_decrypt_inprocess(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: plain.to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -732,6 +741,9 @@ async fn then_no_plaintext_leak(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"no-leak-test".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -792,6 +804,9 @@ async fn then_ryw(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: data.to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -862,6 +877,9 @@ async fn then_no_fuse_overhead(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"native-api".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -899,6 +917,9 @@ async fn then_lower_latency(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"sm".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -935,6 +956,9 @@ async fn then_buffer(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"buffer-contents".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1009,6 +1033,9 @@ async fn then_plaintext_only_mem(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: secret.to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1046,6 +1073,9 @@ async fn then_encrypted_wire(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"wire-encrypted".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1332,6 +1362,9 @@ async fn then_decrypt_inprocess2(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"rdma-decrypt".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1381,6 +1414,9 @@ async fn then_pre_encrypted(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"pre-encrypted-wire".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1425,6 +1461,9 @@ async fn then_committed_durable(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"committed-durable".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1473,6 +1512,9 @@ async fn then_others_unaffected(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"from-client2".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1791,6 +1833,9 @@ async fn then_serialized(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"client-a".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1799,6 +1844,9 @@ async fn then_serialized(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"client-b".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1828,6 +1876,9 @@ async fn then_total_order(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"first".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1836,6 +1887,9 @@ async fn then_total_order(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"second".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1883,6 +1937,9 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"write-a".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1891,6 +1948,9 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"write-b".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1945,6 +2005,9 @@ async fn then_reads_ok(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"readable".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -1981,6 +2044,9 @@ async fn then_erofs(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"should-fail".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await;
     assert!(result.is_err(), "write to read-only namespace must fail");
@@ -2227,6 +2293,9 @@ async fn then_quota_enforcement(_w: &mut KisekiWorld) {
             tenant_id: tenant,
             namespace_id: ns,
             data: b"over-quota".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await;
     assert!(result.is_err(), "data path must enforce restrictions");

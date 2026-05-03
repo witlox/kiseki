@@ -41,16 +41,22 @@ pub struct Envelope {
 /// Encrypt plaintext into an envelope using the system master key.
 ///
 /// The chunk ID is used as HKDF salt (ADR-003) and as AAD for the AEAD.
+#[tracing::instrument(skip(aead_ctx, master, plaintext), fields(plaintext_len = plaintext.len(), epoch = master.epoch.0))]
 pub fn seal_envelope(
     aead_ctx: &Aead,
     master: &SystemMasterKey,
     chunk_id: &ChunkId,
     plaintext: &[u8],
 ) -> Result<Envelope, CryptoError> {
-    let dek = derive_system_dek(master, chunk_id)?;
+    let dek = derive_system_dek(master, chunk_id).inspect_err(|e| {
+        tracing::warn!(error = %e, "seal_envelope: derive_system_dek failed");
+    })?;
 
     // AAD = chunk_id bytes — binds ciphertext to this specific chunk.
-    let (ciphertext_with_tag, nonce) = aead_ctx.seal(&dek, plaintext, &chunk_id.0)?;
+    let (ciphertext_with_tag, nonce) =
+        aead_ctx.seal(&dek, plaintext, &chunk_id.0).inspect_err(|e| {
+            tracing::warn!(error = %e, "seal_envelope: AEAD seal failed");
+        })?;
 
     // Split tag from ciphertext. aws-lc-rs appends the tag.
     let tag_start = ciphertext_with_tag.len() - GCM_TAG_LEN;
@@ -58,6 +64,7 @@ pub fn seal_envelope(
     let mut auth_tag = [0u8; GCM_TAG_LEN];
     auth_tag.copy_from_slice(&ciphertext_with_tag[tag_start..]);
 
+    tracing::trace!(ciphertext_len = ciphertext.len(), "seal_envelope: ok");
     Ok(Envelope {
         ciphertext,
         auth_tag,
@@ -70,23 +77,36 @@ pub fn seal_envelope(
 }
 
 /// Decrypt an envelope using the system master key (system-layer only).
+#[tracing::instrument(skip(aead_ctx, master, envelope), fields(ciphertext_len = envelope.ciphertext.len(), epoch = envelope.system_epoch.0))]
 pub fn open_envelope(
     aead_ctx: &Aead,
     master: &SystemMasterKey,
     envelope: &Envelope,
 ) -> Result<Vec<u8>, CryptoError> {
-    let dek = derive_system_dek(master, &envelope.chunk_id)?;
+    let dek = derive_system_dek(master, &envelope.chunk_id).inspect_err(|e| {
+        tracing::warn!(error = %e, "open_envelope: derive_system_dek failed");
+    })?;
 
     // Reconstruct ciphertext+tag for aws-lc-rs.
     let mut ciphertext_with_tag = envelope.ciphertext.clone();
     ciphertext_with_tag.extend_from_slice(&envelope.auth_tag);
 
-    aead_ctx.open(
-        &dek,
-        &envelope.nonce,
-        &ciphertext_with_tag,
-        &envelope.chunk_id.0,
-    )
+    aead_ctx
+        .open(
+            &dek,
+            &envelope.nonce,
+            &ciphertext_with_tag,
+            &envelope.chunk_id.0,
+        )
+        .inspect_err(|e| {
+            // AEAD verify failures are security-relevant (tampering or
+            // key/epoch confusion). Warn-level so operators see them
+            // without enabling debug.
+            tracing::warn!(
+                error = %e,
+                "open_envelope: AEAD verify failed (tampering, wrong key, or wrong epoch)",
+            );
+        })
 }
 
 /// Wrap the system DEK derivation material with a tenant KEK so the
@@ -95,6 +115,7 @@ pub fn open_envelope(
 /// What we wrap: `(system_epoch || chunk_id)` — the tenant unwraps
 /// this, then uses HKDF to re-derive the DEK. The actual DEK bytes
 /// never leave the system boundary.
+#[tracing::instrument(skip(aead_ctx, envelope, tenant_kek), fields(epoch = envelope.system_epoch.0, tenant_epoch = tenant_kek.epoch.0))]
 pub fn wrap_for_tenant(
     aead_ctx: &Aead,
     envelope: &mut Envelope,
@@ -107,7 +128,11 @@ pub fn wrap_for_tenant(
 
     let key = Zeroizing::new(*tenant_kek.material());
     // AAD for the wrapping: "kiseki-tenant-wrap-v1" to distinguish from chunk AEAD.
-    let (wrapped, nonce) = aead_ctx.seal(&key, &material, b"kiseki-tenant-wrap-v1")?;
+    let (wrapped, nonce) = aead_ctx
+        .seal(&key, &material, b"kiseki-tenant-wrap-v1")
+        .inspect_err(|e| {
+            tracing::warn!(error = %e, "wrap_for_tenant: AEAD seal of tenant material failed");
+        })?;
 
     // Store nonce + wrapped material together.
     let mut combined = Vec::with_capacity(aead::GCM_NONCE_LEN + wrapped.len());
@@ -122,6 +147,7 @@ pub fn wrap_for_tenant(
 
 /// Unwrap the tenant-wrapped material, re-derive the system DEK, and
 /// decrypt the envelope. This is the tenant read path.
+#[tracing::instrument(skip(aead_ctx, envelope, tenant_kek, master_cache), fields(epoch = envelope.system_epoch.0, tenant_epoch = tenant_kek.epoch.0))]
 pub fn unwrap_tenant(
     aead_ctx: &Aead,
     envelope: &Envelope,
@@ -131,9 +157,16 @@ pub fn unwrap_tenant(
     let wrapped = envelope
         .tenant_wrapped_material
         .as_ref()
-        .ok_or_else(|| CryptoError::InvalidEnvelope("no tenant wrapping".into()))?;
+        .ok_or_else(|| {
+            tracing::warn!("unwrap_tenant: envelope has no tenant wrapping");
+            CryptoError::InvalidEnvelope("no tenant wrapping".into())
+        })?;
 
     if wrapped.len() < aead::GCM_NONCE_LEN {
+        tracing::warn!(
+            len = wrapped.len(),
+            "unwrap_tenant: wrapped material too short to contain nonce",
+        );
         return Err(CryptoError::InvalidEnvelope(
             "wrapped material too short".into(),
         ));
@@ -145,7 +178,14 @@ pub fn unwrap_tenant(
     let wrapped_ct = &wrapped[aead::GCM_NONCE_LEN..];
 
     let key = Zeroizing::new(*tenant_kek.material());
-    let material = aead_ctx.open(&key, &nonce, wrapped_ct, b"kiseki-tenant-wrap-v1")?;
+    let material = aead_ctx
+        .open(&key, &nonce, wrapped_ct, b"kiseki-tenant-wrap-v1")
+        .inspect_err(|e| {
+            tracing::warn!(
+                error = %e,
+                "unwrap_tenant: AEAD verify of tenant-wrapped material failed",
+            );
+        })?;
 
     // Parse unwrapped material: epoch (8 bytes) + chunk_id (32 bytes).
     if material.len() != 40 {

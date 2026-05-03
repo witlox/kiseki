@@ -264,6 +264,9 @@ async fn given_s3_getobject(w: &mut KisekiWorld, _key: String) {
             tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
             namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
             data: b"s3-object-data".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .expect("S3 write");
@@ -362,6 +365,9 @@ async fn then_gw_write_pipeline(w: &mut KisekiWorld) {
             tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
             namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
             data: b"s3-put-object-body".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .expect("S3 write");
@@ -666,31 +672,32 @@ async fn then_lock_local(w: &mut KisekiWorld) {
 // === Scenario: S3 conditional write ===
 
 #[given(regex = r#"^object "(\S+)" does not exist$"#)]
-async fn given_object_not_exist(_w: &mut KisekiWorld, _key: String) {
-    // No-op at @unit tier — object non-existence is a precondition.
+async fn given_object_not_exist(w: &mut KisekiWorld, key: String) {
+    // Stash the key on the harness so When/Then steps target the same
+    // URL. Use a flat key (axum captures one path segment).
+    let flat = key.replace('/', "-");
+    let url = w.server().s3_url(&format!("default/{flat}"));
+    // Best-effort: ensure the running server has no prior object at
+    // this key. The harness uses a per-process unique data dir so a
+    // fresh boot is empty, but if the singleton is reused across
+    // scenarios we don't want stale state. DELETE then move on.
+    let _ = w.server().http.delete(&url).send().await;
+    w.server_mut()
+        .response_state
+        .insert("if_none_match_url".into(), url);
 }
 
 #[when(regex = r#"^a client issues PutObject with header If-None-Match: \*$"#)]
 async fn when_put_if_none_match(w: &mut KisekiWorld) {
-    // Conditional write: If-None-Match: * means "create only if not exists".
-    // The object doesn't exist (Given step), so this write should succeed.
-    w.ensure_namespace("default", "shard-default");
-    let result = w.gateway_write("default", b"conditional-data").await;
-    match result {
-        Ok(resp) => {
-            w.last_composition_id = Some(resp.composition_id);
-            w.last_error = None;
-        }
-        Err(e) => {
-            w.last_error = Some(e);
-        }
-    }
-}
-
-#[then("the write succeeds")]
-async fn then_write_succeeds_gw(w: &mut KisekiWorld) {
-    // S3 PUT with If-None-Match: * to a new key should succeed.
-    let url = w.server().s3_url("default/conditional-test");
+    // Conditional write goes through the running server's S3 HTTP
+    // gateway, not an in-process gateway, so the conditional-write
+    // code path is actually exercised over the wire.
+    let url = w
+        .server()
+        .response_state
+        .get("if_none_match_url")
+        .cloned()
+        .expect("Given step must set if_none_match_url");
     let resp = w
         .server()
         .http
@@ -699,22 +706,200 @@ async fn then_write_succeeds_gw(w: &mut KisekiWorld) {
         .body(b"conditional-data".to_vec())
         .send()
         .await
-        .unwrap();
+        .expect("HTTP PUT failed");
+    let status = resp.status().as_u16();
+    w.server_mut().last_status = Some(status);
+}
+
+#[then("the write succeeds")]
+async fn then_write_succeeds_gw(w: &mut KisekiWorld) {
+    let status = w
+        .server()
+        .last_status
+        .expect("When step must set last_status");
     assert!(
-        resp.status().is_success(),
-        "conditional write: {}",
-        resp.status()
+        (200..300).contains(&status),
+        "S3 PUT with If-None-Match: * should succeed; got {status}",
     );
-    w.server_mut().last_status = Some(resp.status().as_u16());
 }
 
 #[then("if the object already existed, the write would return 412 Precondition Failed")]
 async fn then_412_precondition(w: &mut KisekiWorld) {
-    // The previous step wrote the object. A second PUT with If-None-Match: *
-    // should return 412 if the server implements conditional writes.
-    // Current behavior: server may not implement If-None-Match yet —
-    // assert the first write succeeded at minimum.
-    assert_eq!(w.server().last_status, Some(200));
+    // Previous step wrote the object. A second PUT with If-None-Match: *
+    // to the same key MUST be rejected with 412 — that's the whole
+    // point of the conditional. If the running server doesn't enforce
+    // 412 yet, this scenario fails honestly rather than silently
+    // passing on a no-op.
+    let url = w
+        .server()
+        .response_state
+        .get("if_none_match_url")
+        .cloned()
+        .expect("Given step must set if_none_match_url");
+    let resp = w
+        .server()
+        .http
+        .put(&url)
+        .header("If-None-Match", "*")
+        .body(b"conditional-data-second".to_vec())
+        .send()
+        .await
+        .expect("HTTP PUT failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        412,
+        "second PUT with If-None-Match: * to existing key must return 412 \
+         Precondition Failed; got {}",
+        resp.status(),
+    );
+}
+
+// === Scenario: S3 round-trip by URL key (PUT, GET, HEAD, DELETE) ===
+
+fn s3_key_url(w: &KisekiWorld, key: &str) -> String {
+    let bucket_key = format!("default/{}", key.replace('/', "-"));
+    w.server().s3_url(&bucket_key)
+}
+
+#[when(regex = r#"^a client S3 PUTs "([^"]*)" to key "([^"]*)"$"#)]
+async fn when_s3_put_keyed(w: &mut KisekiWorld, body: String, key: String) {
+    let url = s3_key_url(w, &key);
+    let resp = w
+        .server()
+        .http
+        .put(&url)
+        .body(body.into_bytes())
+        .send()
+        .await
+        .expect("HTTP PUT failed");
+    let status = resp.status().as_u16();
+    w.server_mut().last_status = Some(status);
+    assert!(
+        (200..300).contains(&status),
+        "S3 PUT to key {key:?} should succeed; got {status}",
+    );
+}
+
+#[then(regex = r#"^a S3 GET on "([^"]*)" returns "([^"]*)"$"#)]
+async fn then_s3_get_keyed_returns(w: &mut KisekiWorld, key: String, expected: String) {
+    let url = s3_key_url(w, &key);
+    let resp = w
+        .server()
+        .http
+        .get(&url)
+        .send()
+        .await
+        .expect("HTTP GET failed");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        (200..300).contains(&status),
+        "S3 GET on key {key:?} should succeed; got {status}: {body}",
+    );
+    assert_eq!(body, expected, "S3 GET body mismatch for key {key:?}");
+}
+
+#[then(regex = r#"^a S3 HEAD on "([^"]*)" returns content-length (\d+)$"#)]
+async fn then_s3_head_keyed_content_length(w: &mut KisekiWorld, key: String, expected_len: u64) {
+    let url = s3_key_url(w, &key);
+    let resp = w
+        .server()
+        .http
+        .head(&url)
+        .send()
+        .await
+        .expect("HTTP HEAD failed");
+    assert!(
+        resp.status().is_success(),
+        "S3 HEAD on key {key:?} should succeed; got {}",
+        resp.status(),
+    );
+    let cl = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("content-length header");
+    assert_eq!(
+        cl, expected_len,
+        "S3 HEAD content-length mismatch for key {key:?}",
+    );
+}
+
+#[then(regex = r#"^a S3 DELETE on "([^"]*)" returns (\d+)$"#)]
+async fn then_s3_delete_keyed(w: &mut KisekiWorld, key: String, expected_status: u16) {
+    let url = s3_key_url(w, &key);
+    let resp = w
+        .server()
+        .http
+        .delete(&url)
+        .send()
+        .await
+        .expect("HTTP DELETE failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        expected_status,
+        "S3 DELETE on key {key:?}",
+    );
+}
+
+#[then(regex = r#"^a S3 GET on "([^"]*)" returns (\d+)$"#)]
+async fn then_s3_get_keyed_status(w: &mut KisekiWorld, key: String, expected_status: u16) {
+    let url = s3_key_url(w, &key);
+    let resp = w
+        .server()
+        .http
+        .get(&url)
+        .send()
+        .await
+        .expect("HTTP GET failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        expected_status,
+        "S3 GET on key {key:?} status mismatch",
+    );
+}
+
+#[then(regex = r#"^a S3 LIST with prefix "([^"]*)" returns keys "([^"]*)"$"#)]
+async fn then_s3_list_with_prefix(w: &mut KisekiWorld, prefix: String, expected_csv: String) {
+    // The flat-key URL convention this scenario uses replaces `/` with
+    // `-` in the URL path component; the LIST view (gateway → name
+    // index) returns the original URL path. Apply the same flattening
+    // to the prefix and the expected list so the assertion compares
+    // apples to apples.
+    let flat_prefix = prefix.replace('/', "-");
+    let url = w.server().s3_url("default");
+    let resp = w
+        .server()
+        .http
+        .get(&url)
+        .query(&[("prefix", flat_prefix.as_str())])
+        .send()
+        .await
+        .expect("HTTP LIST failed");
+    assert!(
+        resp.status().is_success(),
+        "S3 LIST should succeed; got {}",
+        resp.status(),
+    );
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    let actual: Vec<String> = body
+        .get("contents")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("key").and_then(|k| k.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let expected: Vec<String> = expected_csv
+        .split(',')
+        .map(|s| s.trim().replace('/', "-"))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "S3 LIST with prefix {prefix:?} returned {actual:?}, want {expected:?}",
+    );
 }
 
 // === Scenarios: NFS gateway over TCP / S3 gateway over TCP (HTTPS) ===
@@ -1200,53 +1385,166 @@ async fn then_no_data_exposed(w: &mut KisekiWorld, tenant: String) {
     }
 }
 
-// === Scenario: S3 request carries workflow_ref header ===
+// === Scenario: S3 request carries workflow_ref header (ADR-021) ===
 
-#[given(regex = r#"^S3 client under workload "(\S+)" has an active workflow$"#)]
-async fn given_s3_client_workflow(w: &mut KisekiWorld, wl: String) {
-    // Create a workflow via the real WorkflowTable.
-    let wf_ref = kiseki_common::advisory::WorkflowRef(*uuid::Uuid::new_v4().as_bytes());
-    w.legacy.advisory_table.declare(
-        wf_ref,
-        kiseki_common::advisory::WorkloadProfile::AiTraining,
-        kiseki_common::advisory::PhaseId(0),
+/// Snapshot a workflow_ref result counter from the running server's
+/// `/metrics` endpoint. Returns 0 when the metric isn't present yet
+/// (server hasn't seen any writes for that bucket). Parses Prometheus
+/// text format inline — no external dep needed for "find one line and
+/// extract the trailing number".
+async fn workflow_ref_counter(w: &KisekiWorld, result: &str) -> u64 {
+    let body = w.server().scrape_metrics().await.unwrap_or_default();
+    let needle = format!("kiseki_gateway_workflow_ref_writes_total{{result=\"{result}\"}}");
+    body.lines()
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|line| {
+            if line.starts_with(&needle) {
+                line.split_whitespace()
+                    .next_back()
+                    .and_then(|n| n.parse::<f64>().ok())
+                    .map(|f| f as u64)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// Issue an S3 PUT to a unique key and return the response status.
+/// Optional `workflow_ref` is sent as the `x-kiseki-workflow-ref`
+/// header when `Some`. Each call uses a new key so writes don't
+/// interfere with conditional-write tests in the same suite.
+async fn s3_put_with_optional_workflow_ref(w: &KisekiWorld, ref_uuid: Option<uuid::Uuid>) -> u16 {
+    let key = format!("default/wf-{}", uuid::Uuid::new_v4().simple());
+    let url = w.server().s3_url(&key);
+    let mut req = w
+        .server()
+        .http
+        .put(&url)
+        .body(b"workflow-correlated-write".to_vec());
+    if let Some(u) = ref_uuid {
+        req = req.header("x-kiseki-workflow-ref", u.to_string());
+    }
+    let resp = req.send().await.expect("HTTP PUT failed");
+    resp.status().as_u16()
+}
+
+#[given(regex = r#"^a workflow "([^"]*)" declared via advisory gRPC$"#)]
+async fn given_workflow_declared_via_grpc(w: &mut KisekiWorld, _name: String) {
+    use kiseki_proto::v1::{declare_workflow_response, DeclareWorkflowRequest};
+    let mut client = w
+        .server()
+        .advisory_grpc_client()
+        .await
+        .expect("advisory gRPC client");
+    let req = DeclareWorkflowRequest {
+        client_id: None,
+        // 1 = AiTraining (proto enum). Profile here doesn't matter for
+        // header-validation; any valid profile lets the workflow exist.
+        profile: 1,
+        initial_phase_id: 0,
+        initial_phase_tag: "warmup".into(),
+        ttl_seconds: 600,
+    };
+    let resp = client
+        .declare_workflow(req)
+        .await
+        .expect("DeclareWorkflow")
+        .into_inner();
+    let wf_ref = match resp.outcome.expect("outcome") {
+        declare_workflow_response::Outcome::Success(s) => s.workflow_ref.expect("workflow_ref"),
+        declare_workflow_response::Outcome::Error(e) => {
+            panic!("DeclareWorkflow returned error: {e:?}")
+        }
+    };
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&wf_ref.handle[..16]);
+    w.server_mut().response_state.insert(
+        "workflow_ref_uuid".into(),
+        uuid::Uuid::from_bytes(buf).to_string(),
     );
-    w.last_workflow_ref = Some(wf_ref);
 }
 
-#[when(regex = r#"^a PutObject arrives with header `x-kiseki-workflow-ref: <opaque>`$"#)]
-async fn when_putobject_workflow_ref(w: &mut KisekiWorld) {
-    // Write through gateway with workflow context active.
-    w.ensure_namespace("default", "shard-default");
-    let result = w.gateway_write("default", b"workflow-annotated-data").await;
-    assert!(result.is_ok(), "PutObject with workflow_ref should succeed");
+#[when("a S3 PUT arrives with the workflow_ref header set to the declared workflow")]
+async fn when_s3_put_with_declared_workflow_ref(w: &mut KisekiWorld) {
+    let baseline = workflow_ref_counter(w, "valid").await;
+    let uuid_str = w
+        .server()
+        .response_state
+        .get("workflow_ref_uuid")
+        .cloned()
+        .expect("Given step must set workflow_ref_uuid");
+    let u = uuid::Uuid::parse_str(&uuid_str).expect("uuid parse");
+    let status = s3_put_with_optional_workflow_ref(w, Some(u)).await;
+    assert!((200..300).contains(&status), "S3 PUT should succeed; got {status}");
+    w.server_mut()
+        .response_state
+        .insert("wf_valid_baseline".into(), baseline.to_string());
 }
 
-#[then("the gateway validates the ref against the authenticated tenant identity (I-WA3)")]
-async fn then_validates_ref(w: &mut KisekiWorld) {
-    // Verify the workflow ref exists in the advisory table (real validation).
-    let wf = w.last_workflow_ref.expect("workflow_ref should exist");
+#[then(regex = r#"^the metric kiseki_gateway_workflow_ref_writes_total\{result="(\S+)"\} increments$"#)]
+async fn then_workflow_ref_counter_incremented(w: &mut KisekiWorld, label: String) {
+    let baseline_key = format!("wf_{label}_baseline");
+    let baseline: u64 = w
+        .server()
+        .response_state
+        .get(&baseline_key)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // Poll briefly: prometheus counters are updated synchronously on
+    // the request path, but giving the metric scrape a few retries
+    // smooths over rare races between the PUT response acknowledgment
+    // and the gather call.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let now = workflow_ref_counter(w, &label).await;
+        if now > baseline {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "kiseki_gateway_workflow_ref_writes_total{{result=\"{label}\"}} did not increment \
+                 (baseline={baseline}, now={now}) — header path is not wired"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[when("a S3 PUT arrives with the workflow_ref header set to a random uuid")]
+async fn when_s3_put_with_random_workflow_ref(w: &mut KisekiWorld) {
+    let baseline = workflow_ref_counter(w, "invalid").await;
+    let status = s3_put_with_optional_workflow_ref(w, Some(uuid::Uuid::new_v4())).await;
+    w.server_mut()
+        .response_state
+        .insert("wf_invalid_last_status".into(), status.to_string());
+    w.server_mut()
+        .response_state
+        .insert("wf_invalid_baseline".into(), baseline.to_string());
+}
+
+#[then("the write succeeds (header is advisory — I-WA1)")]
+async fn then_write_succeeds_advisory(w: &mut KisekiWorld) {
+    let status: u16 = w
+        .server()
+        .response_state
+        .get("wf_invalid_last_status")
+        .and_then(|s| s.parse().ok())
+        .expect("previous When must set wf_invalid_last_status");
     assert!(
-        w.legacy.advisory_table.get(&wf).is_some(),
-        "workflow_ref should be valid"
+        (200..300).contains(&status),
+        "I-WA1: invalid workflow_ref must NOT block the write; got {status}",
     );
 }
 
-#[then("on success, annotates the write path for advisory correlation")]
-async fn then_annotates_write(w: &mut KisekiWorld) {
-    // The write path is annotated with workflow_ref metadata.
-    // Verify the gateway can complete a write (annotation is internal).
-    w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"annotated-write").await;
-    assert!(resp.is_ok(), "write should succeed with annotation");
-}
-
-#[then("on mismatch or unknown ref, ignores the header silently and processes the request unchanged (I-WA1)")]
-async fn then_ignores_mismatch(w: &mut KisekiWorld) {
-    // I-WA1: unknown workflow_ref is silently ignored — data-path unaffected.
-    w.ensure_namespace("default", "shard-default");
-    let resp = w.gateway_write("default", b"no-advisory-write").await;
-    assert!(resp.is_ok(), "write should succeed even with unknown ref");
+#[when("a S3 PUT arrives without the workflow_ref header")]
+async fn when_s3_put_no_workflow_ref(w: &mut KisekiWorld) {
+    let baseline = workflow_ref_counter(w, "absent").await;
+    let status = s3_put_with_optional_workflow_ref(w, None).await;
+    assert!((200..300).contains(&status), "S3 PUT should succeed; got {status}");
+    w.server_mut()
+        .response_state
+        .insert("wf_absent_baseline".into(), baseline.to_string());
 }
 
 // === Scenario: Priority-class hint applied to request scheduling ===
@@ -1623,4 +1921,345 @@ async fn then_no_neighbour_headroom(w: &mut KisekiWorld) {
         neighbour.try_recv().is_err(),
         "neighbour workload must not see another caller's headroom event",
     );
+}
+
+// === Scenario: FUSE → GatewayOps → S3 wire roundtrip ===
+//
+// Exercises the FUSE filesystem (kiseki_client::fuse_fs::KisekiFuse)
+// against a RemoteHttpGateway pointed at the running server's S3
+// port. Closes the GCP "FUSE didn't connect" gap at the
+// FUSE→GatewayOps→wire layer without needing a kernel mount —
+// kernel-mount coverage stays in python e2e.
+
+#[when(regex = r#"^the FUSE filesystem \(backed by RemoteHttpGateway\) creates "([^"]*)" with payload "([^"]*)"$"#)]
+async fn when_fuse_creates(w: &mut KisekiWorld, path: String, payload: String) {
+    use kiseki_client::fuse_fs::KisekiFuse;
+    use kiseki_client::remote_http::RemoteHttpGateway;
+    let gateway = RemoteHttpGateway::new(&w.server().s3_base);
+    // Bootstrap tenant + namespace IDs match the running server's
+    // (kiseki-server::runtime — bootstrap_tenant = uuid::from_u128(1),
+    // bootstrap_ns = uuid::new_v5(NAMESPACE_DNS, "default")). The
+    // FUSE helper sends each write through the gateway; the gateway
+    // records `name_index_state["fuse_ino"]` so subsequent reads
+    // resolve the same inode.
+    let tenant_id = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+    let namespace_id = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_DNS,
+        b"default",
+    ));
+    // Move the gateway+fs onto a separate thread so the inner
+    // tokio runtime KisekiFuse spawns doesn't conflict with the
+    // outer cucumber runtime.
+    let fs_path = path.clone();
+    let payload_bytes = payload.into_bytes();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut fs = KisekiFuse::new(gateway, tenant_id, namespace_id);
+        let name = fs_path.trim_start_matches('/').to_owned();
+        fs.create(&name, payload_bytes.clone())?;
+        // Round-trip read to verify the gateway accepted the write
+        // and the lookup → composition_id binding works.
+        let attr = fs.lookup(&name)?;
+        let bytes = fs.read(attr.ino, 0, attr.size as u32)?;
+        Ok::<Vec<u8>, i32>(bytes)
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    match result {
+        Ok(bytes) => {
+            w.last_read_data = Some(bytes);
+            w.last_error = None;
+        }
+        Err(errno) => {
+            w.last_error = Some(format!("FUSE create returned errno {errno}"));
+        }
+    }
+    w.server_mut()
+        .response_state
+        .insert("fuse_path".into(), path);
+}
+
+#[then(regex = r#"^the FUSE filesystem read of "([^"]*)" returns "([^"]*)"$"#)]
+async fn then_fuse_read(w: &mut KisekiWorld, _path: String, expected: String) {
+    let bytes = w
+        .last_read_data
+        .clone()
+        .expect("FUSE create step must populate last_read_data");
+    let actual = String::from_utf8(bytes).expect("FUSE read returned non-utf8");
+    assert_eq!(actual, expected, "FUSE read body mismatch");
+}
+
+#[then(regex = r#"^the FUSE filesystem unlink of "([^"]*)" succeeds$"#)]
+async fn then_fuse_unlink(w: &mut KisekiWorld, path: String) {
+    use kiseki_client::fuse_fs::KisekiFuse;
+    use kiseki_client::remote_http::RemoteHttpGateway;
+    let gateway = RemoteHttpGateway::new(&w.server().s3_base);
+    let tenant_id = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+    let namespace_id = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_DNS,
+        b"default",
+    ));
+    // KisekiFuse holds an in-process inode table — re-creating the
+    // fs gives us a fresh table, so we re-create the file via the
+    // gateway, then unlink. This loop also proves that two FUSE
+    // sessions sharing a server can each see the other's writes by
+    // way of the gateway's name index.
+    let path_clone = path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut fs = KisekiFuse::new(gateway, tenant_id, namespace_id);
+        let name = path_clone.trim_start_matches('/').to_owned();
+        // Re-create so this fs has the inode mapping (gateway
+        // already has the binding; lookup_by_name on the gateway
+        // would resolve cleanly but the FUSE inode table is local).
+        fs.create(&name, b"unlink-target".to_vec())?;
+        fs.unlink(&name)?;
+        Ok::<(), i32>(())
+    })
+    .await
+    .expect("spawn_blocking join");
+    assert!(
+        result.is_ok(),
+        "FUSE unlink should succeed; got errno {result:?}",
+    );
+    w.server_mut()
+        .response_state
+        .insert("fuse_unlinked_path".into(), path);
+}
+
+#[then(regex = r#"^the FUSE filesystem read of "([^"]*)" returns ENOENT$"#)]
+async fn then_fuse_enoent(w: &mut KisekiWorld, path: String) {
+    use kiseki_client::fuse_fs::KisekiFuse;
+    use kiseki_client::remote_http::RemoteHttpGateway;
+    let gateway = RemoteHttpGateway::new(&w.server().s3_base);
+    let tenant_id = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+    let namespace_id = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_DNS,
+        b"default",
+    ));
+    let result = tokio::task::spawn_blocking(move || {
+        let fs = KisekiFuse::new(gateway, tenant_id, namespace_id);
+        let name = path.trim_start_matches('/').to_owned();
+        fs.lookup(&name)
+    })
+    .await
+    .expect("spawn_blocking join");
+    match result {
+        Ok(_) => panic!("expected ENOENT after unlink; lookup returned Ok"),
+        Err(errno) => assert_eq!(errno, 2, "expected ENOENT(2); got {errno}"),
+    }
+}
+
+// === Scenario: Operational metrics smoke ===
+//
+// Closes the GCP "kiseki_gateway_requests_total = 0 after 1 GB" gap.
+// Baselines each counter, runs a real PUT/GET, asserts the counter
+// has gone up. Counters that don't move on the wire would have
+// silently passed before this scenario.
+
+/// Parse a Prometheus-text counter (with optional labels). Returns 0
+/// when the metric line isn't present yet — that's fine for baselines.
+fn metric_value(body: &str, name: &str) -> u64 {
+    let mut total: u64 = 0;
+    for line in body.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let line = line.trim();
+        if !line.starts_with(name) {
+            continue;
+        }
+        let rest = if line.as_bytes().get(name.len()) == Some(&b'{') {
+            line.split_once('}')
+                .map(|(_, r)| r.trim_start())
+                .unwrap_or(line)
+        } else {
+            line[name.len()..].trim_start()
+        };
+        if let Some(v) = rest.split_whitespace().next() {
+            if let Ok(n) = v.parse::<f64>() {
+                total = total.saturating_add(n as u64);
+            }
+        }
+    }
+    total
+}
+
+#[given("the gateway counters are baselined")]
+async fn given_metrics_baseline(w: &mut KisekiWorld) {
+    // Triggers the harness so the server is up; otherwise the metric
+    // scrape would panic.
+    w.ensure_server().await.expect("ensure_server");
+    let body = w.server().scrape_metrics().await.expect("metrics");
+    for name in [
+        "kiseki_gateway_requests_total",
+        "kiseki_chunk_write_bytes_total",
+        "kiseki_chunk_read_bytes_total",
+    ] {
+        let v = metric_value(&body, name);
+        w.server_mut()
+            .response_state
+            .insert(format!("metric_baseline_{name}"), v.to_string());
+    }
+}
+
+#[when("a 4KB object is PUT and immediately GET via S3")]
+async fn when_4kb_put_get(w: &mut KisekiWorld) {
+    let key = format!("default/metrics-{}", uuid::Uuid::new_v4().simple());
+    let body = vec![0xa5u8; 4096];
+    let url = w.server().s3_url(&key);
+    let put_resp = w
+        .server()
+        .http
+        .put(&url)
+        .body(body.clone())
+        .send()
+        .await
+        .expect("HTTP PUT failed");
+    assert!(
+        put_resp.status().is_success(),
+        "PUT returned {}",
+        put_resp.status(),
+    );
+    let etag = put_resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"').to_owned())
+        .expect("ETag");
+    // GET-by-key first (uses the new name index); if that 404s on a
+    // server build without per-key naming, fall back to GET-by-uuid.
+    let get_url = w.server().s3_url(&key);
+    let mut get_resp = w
+        .server()
+        .http
+        .get(&get_url)
+        .send()
+        .await
+        .expect("GET");
+    if !get_resp.status().is_success() {
+        let uuid_url = w.server().s3_url(&format!("default/{etag}"));
+        get_resp = w
+            .server()
+            .http
+            .get(&uuid_url)
+            .send()
+            .await
+            .expect("GET by uuid");
+    }
+    assert!(
+        get_resp.status().is_success(),
+        "GET returned {}",
+        get_resp.status(),
+    );
+}
+
+async fn then_metric_incremented(w: &KisekiWorld, name: &str) {
+    let baseline_key = format!("metric_baseline_{name}");
+    let baseline: u64 = w
+        .server()
+        .response_state
+        .get(&baseline_key)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // Brief poll: prometheus is updated on the request path but
+    // gives the gather call a moment to observe.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let body = w.server().scrape_metrics().await.unwrap_or_default();
+        let now = metric_value(&body, name);
+        if now > baseline {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{name} did not increment after the workload (baseline={baseline}, now={now})",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[then("kiseki_gateway_requests_total has incremented since the baseline")]
+async fn then_gateway_requests_incremented(w: &mut KisekiWorld) {
+    then_metric_incremented(w, "kiseki_gateway_requests_total").await;
+}
+
+#[then("kiseki_chunk_write_bytes_total has incremented since the baseline")]
+async fn then_chunk_write_incremented(w: &mut KisekiWorld) {
+    then_metric_incremented(w, "kiseki_chunk_write_bytes_total").await;
+}
+
+#[then("kiseki_chunk_read_bytes_total has incremented since the baseline")]
+async fn then_chunk_read_incremented(w: &mut KisekiWorld) {
+    then_metric_incremented(w, "kiseki_chunk_read_bytes_total").await;
+}
+
+// === Scenario: S3 multipart upload binds the URL key ===
+
+#[when(regex = r#"^a client multipart-uploads "([^"]*)" to key "([^"]*)" in (\d+) parts$"#)]
+async fn when_multipart_to_key(
+    w: &mut KisekiWorld,
+    body: String,
+    key: String,
+    parts: usize,
+) {
+    assert!(parts > 0, "parts must be positive");
+    let flat = key.replace('/', "-");
+    let url = w.server().s3_url(&format!("default/{flat}"));
+
+    // CreateMultipartUpload
+    let resp = w
+        .server()
+        .http
+        .post(format!("{url}?uploads"))
+        .send()
+        .await
+        .expect("CreateMultipartUpload");
+    assert!(resp.status().is_success(), "CreateMultipartUpload: {}", resp.status());
+    let json: serde_json::Value = resp.json().await.expect("upload_id JSON");
+    let upload_id = json
+        .get("uploadId")
+        .and_then(|v| v.as_str())
+        .expect("uploadId")
+        .to_owned();
+
+    // Split body into `parts` chunks (last chunk takes the remainder).
+    let chunk = body.len() / parts;
+    let mut offset = 0usize;
+    for i in 1..=parts {
+        let end = if i == parts { body.len() } else { offset + chunk };
+        let part_body = &body[offset..end];
+        let resp = w
+            .server()
+            .http
+            .put(format!("{url}?partNumber={i}&uploadId={upload_id}"))
+            .body(part_body.as_bytes().to_vec())
+            .send()
+            .await
+            .expect("UploadPart");
+        assert!(
+            resp.status().is_success(),
+            "UploadPart {i}: {}",
+            resp.status(),
+        );
+        offset = end;
+    }
+
+    // CompleteMultipartUpload — key is in the URL so the gateway
+    // binds it to the new composition.
+    let resp = w
+        .server()
+        .http
+        .post(format!("{url}?uploadId={upload_id}"))
+        .send()
+        .await
+        .expect("CompleteMultipartUpload");
+    assert!(
+        resp.status().is_success(),
+        "CompleteMultipartUpload: {}",
+        resp.status(),
+    );
+    w.server_mut()
+        .response_state
+        .insert("multipart_key".into(), key);
 }

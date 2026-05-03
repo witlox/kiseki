@@ -44,6 +44,55 @@ pub trait CompositionStorage: Send + Sync {
     /// Remove a composition. Returns `true` if it existed.
     fn remove(&mut self, id: CompositionId) -> Result<bool, PersistentStoreError>;
 
+    // -- Name index (per-bucket key → composition_id, S3 semantics) --
+    //
+    // The name index gives the S3 PUT/GET/DELETE/LIST path real
+    // key-based naming on top of the composition store. Without it,
+    // every PUT just creates a fresh composition UUID and the URL
+    // `key` is ignored — making `If-None-Match: *`, GET-by-key and
+    // DELETE-by-key impossible to express. The hydrator updates the
+    // index from the Create delta's optional `name` field so
+    // followers see the same key→id mapping as the leader.
+
+    /// Resolve `(namespace_id, name)` → composition_id. Returns
+    /// `None` if no composition is bound to that name in the namespace.
+    fn name_lookup(
+        &self,
+        ns: NamespaceId,
+        name: &str,
+    ) -> Result<Option<CompositionId>, PersistentStoreError>;
+
+    /// Reverse lookup: composition_id → `(namespace_id, name)`.
+    /// Returns `None` if the composition was created without a name
+    /// (internal / NFS path) or has been unbound.
+    fn name_for(
+        &self,
+        id: CompositionId,
+    ) -> Result<Option<(NamespaceId, String)>, PersistentStoreError>;
+
+    /// Bind `name` to `id` in `ns`. Overwrites any existing binding
+    /// (S3 PUT-overwrite semantics — the caller is responsible for
+    /// having checked conditional headers like `If-None-Match: *`
+    /// before calling this).
+    fn name_insert(
+        &mut self,
+        ns: NamespaceId,
+        name: String,
+        id: CompositionId,
+    ) -> Result<(), PersistentStoreError>;
+
+    /// Unbind `name` in `ns`. Returns `true` if a binding existed.
+    fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError>;
+
+    /// Enumerate `(name, composition_id)` bindings in a namespace.
+    /// `prefix` filters by string prefix when `Some` (S3 LIST with
+    /// `?prefix=`).
+    fn name_list(
+        &self,
+        ns: NamespaceId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, CompositionId)>, PersistentStoreError>;
+
     // -- Hydrator meta state (ADR-040 §D5, §D5.1, §D6.3, I-CP1, I-CP6) --
 
     /// Highest delta sequence whose state has been durably applied
@@ -81,6 +130,17 @@ pub struct HydrationBatch {
     pub puts: Vec<Composition>,
     /// Composition ids to remove (Delete deltas).
     pub removes: Vec<CompositionId>,
+    /// Name bindings to insert: `(namespace_id, name, composition_id)`.
+    /// Populated from Create deltas that carry a name (S3 PUT path).
+    /// Followers replay these so GET-by-key + LIST work uniformly
+    /// across nodes.
+    pub name_inserts: Vec<(NamespaceId, String, CompositionId)>,
+    /// Name bindings to remove: `(namespace_id, name)`. Populated
+    /// from Delete deltas via reverse-lookup of the composition's
+    /// current name binding. The hydrator resolves the name on the
+    /// leader (or via its own local `name_for` lookup) before
+    /// emitting the batch.
+    pub name_removes: Vec<(NamespaceId, String)>,
     /// Advance `last_applied_seq` to this value. Always set; the
     /// hydrator never commits a batch without advancing.
     pub new_last_applied_seq: SequenceNumber,
@@ -99,6 +159,8 @@ impl HydrationBatch {
         Self {
             puts: Vec::new(),
             removes: Vec::new(),
+            name_inserts: Vec::new(),
+            name_removes: Vec::new(),
             new_last_applied_seq,
             stuck_state: Some(None),
             halted: None,
@@ -108,7 +170,10 @@ impl HydrationBatch {
     /// True if the batch has any data changes (vs. just meta updates).
     #[must_use]
     pub fn has_data_changes(&self) -> bool {
-        !self.puts.is_empty() || !self.removes.is_empty()
+        !self.puts.is_empty()
+            || !self.removes.is_empty()
+            || !self.name_inserts.is_empty()
+            || !self.name_removes.is_empty()
     }
 }
 
@@ -121,6 +186,16 @@ impl HydrationBatch {
 #[derive(Debug)]
 pub struct MemoryStorage {
     compositions: HashMap<CompositionId, Composition>,
+    /// Name index forward: (namespace_id, name) → composition_id.
+    /// Maintained alongside the composition table; persisted as part
+    /// of `apply_hydration_batch` on the leader and updated atomically
+    /// with the underlying composition mutations on followers via
+    /// `name_inserts` / `name_removes`.
+    names: HashMap<(NamespaceId, String), CompositionId>,
+    /// Name index reverse: composition_id → (namespace_id, name). Used
+    /// by Delete deltas to find what to unbind. A composition without
+    /// a name (NFS path, internal use) has no entry here.
+    names_reverse: HashMap<CompositionId, (NamespaceId, String)>,
     last_applied_seq: SequenceNumber,
     stuck_state: Option<(SequenceNumber, u32)>,
     halted: bool,
@@ -132,6 +207,8 @@ impl MemoryStorage {
     pub fn new() -> Self {
         Self {
             compositions: HashMap::new(),
+            names: HashMap::new(),
+            names_reverse: HashMap::new(),
             last_applied_seq: SequenceNumber(0),
             stuck_state: None,
             halted: false,
@@ -169,7 +246,81 @@ impl CompositionStorage for MemoryStorage {
     }
 
     fn remove(&mut self, id: CompositionId) -> Result<bool, PersistentStoreError> {
+        // Drop the name binding when the composition goes away —
+        // otherwise a future PUT to the same key would resolve to a
+        // dangling composition_id. The reverse map stays consistent.
+        if let Some((ns, name)) = self.names_reverse.remove(&id) {
+            self.names.remove(&(ns, name));
+        }
         Ok(self.compositions.remove(&id).is_some())
+    }
+
+    fn name_lookup(
+        &self,
+        ns: NamespaceId,
+        name: &str,
+    ) -> Result<Option<CompositionId>, PersistentStoreError> {
+        Ok(self.names.get(&(ns, name.to_owned())).copied())
+    }
+
+    fn name_for(
+        &self,
+        id: CompositionId,
+    ) -> Result<Option<(NamespaceId, String)>, PersistentStoreError> {
+        Ok(self.names_reverse.get(&id).cloned())
+    }
+
+    fn name_insert(
+        &mut self,
+        ns: NamespaceId,
+        name: String,
+        id: CompositionId,
+    ) -> Result<(), PersistentStoreError> {
+        // Overwrite-replace: if name already binds to a different
+        // composition, drop the old reverse entry. If id already has a
+        // name, drop its old forward entry. Caller is responsible for
+        // pre-flight conditional checks (If-None-Match etc.).
+        if let Some(old_id) = self.names.get(&(ns, name.clone())).copied() {
+            if old_id != id {
+                self.names_reverse.remove(&old_id);
+            }
+        }
+        if let Some((old_ns, old_name)) = self.names_reverse.get(&id).cloned() {
+            if old_ns != ns || old_name != name {
+                self.names.remove(&(old_ns, old_name));
+            }
+        }
+        self.names.insert((ns, name.clone()), id);
+        self.names_reverse.insert(id, (ns, name));
+        Ok(())
+    }
+
+    fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
+        let key = (ns, name.to_owned());
+        if let Some(id) = self.names.remove(&key) {
+            self.names_reverse.remove(&id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn name_list(
+        &self,
+        ns: NamespaceId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, CompositionId)>, PersistentStoreError> {
+        let mut out: Vec<(String, CompositionId)> = self
+            .names
+            .iter()
+            .filter(|((n, name), _)| {
+                *n == ns && prefix.is_none_or(|p| name.starts_with(p))
+            })
+            .map(|((_, name), id)| (name.clone(), *id))
+            .collect();
+        // Stable order — S3 LIST ordering is alphabetical.
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
 
     fn last_applied_seq(&self) -> Result<SequenceNumber, PersistentStoreError> {
@@ -189,7 +340,35 @@ impl CompositionStorage for MemoryStorage {
             self.compositions.insert(comp.id, comp);
         }
         for id in batch.removes {
+            // Drop any name binding for the removed composition first
+            // so the forward index can't outlive the data row.
+            if let Some((ns, name)) = self.names_reverse.remove(&id) {
+                self.names.remove(&(ns, name));
+            }
             self.compositions.remove(&id);
+        }
+        for (ns, name, id) in batch.name_inserts {
+            // Reuse the same overwrite-replace semantics as
+            // `name_insert` so a redo of the same Create delta on a
+            // restarted hydrator stays idempotent.
+            if let Some(old_id) = self.names.get(&(ns, name.clone())).copied() {
+                if old_id != id {
+                    self.names_reverse.remove(&old_id);
+                }
+            }
+            if let Some((old_ns, old_name)) = self.names_reverse.get(&id).cloned() {
+                if old_ns != ns || old_name != name {
+                    self.names.remove(&(old_ns, old_name));
+                }
+            }
+            self.names.insert((ns, name.clone()), id);
+            self.names_reverse.insert(id, (ns, name));
+        }
+        for (ns, name) in batch.name_removes {
+            let key = (ns, name);
+            if let Some(id) = self.names.remove(&key) {
+                self.names_reverse.remove(&id);
+            }
         }
         self.last_applied_seq = batch.new_last_applied_seq;
         if let Some(stuck) = batch.stuck_state {

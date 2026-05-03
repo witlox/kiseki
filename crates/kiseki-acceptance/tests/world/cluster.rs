@@ -34,6 +34,12 @@ pub struct ClusterState {
     /// fails on the first cycle that surfaces an issue (e.g. an
     /// AEAD verification miss on a single follower).
     pub round_trip_failures: Vec<String>,
+    /// Free-form scratch state shared across the When/Then steps of
+    /// a single multi-node scenario. Used when a scenario needs to
+    /// pass values that don't fit the typed fields above (e.g. the
+    /// pNFS LAYOUTGET scenario stashing the new composition's UUID
+    /// and the parsed netaddr list).
+    pub name_index_state: std::collections::HashMap<String, String>,
     /// Owned lock on the cluster, held for the lifetime of the
     /// scenario. cucumber-rs runs scenarios concurrently by default
     /// and our destructive ops (`kill_node`) would interleave

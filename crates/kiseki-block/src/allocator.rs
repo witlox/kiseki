@@ -77,6 +77,7 @@ impl BitmapAllocator {
         let blocks_needed = blocks_needed.min(self.max_extent_blocks);
 
         if blocks_needed == 0 {
+            tracing::warn!("block alloc: zero-size allocation requested");
             return Err(AllocError::Inconsistency("zero-size allocation".into()));
         }
 
@@ -90,6 +91,12 @@ impl BitmapAllocator {
 
         let Some((offset, free_len)) = best else {
             let largest = self.free_list.values().max().copied().unwrap_or(0);
+            tracing::warn!(
+                requested = size_bytes,
+                largest_free_blocks = largest,
+                block_size = self.block_size,
+                "block alloc: device full",
+            );
             return Err(AllocError::DeviceFull {
                 requested: size_bytes,
                 available: largest * u64::from(self.block_size),
@@ -122,6 +129,12 @@ impl BitmapAllocator {
         let block_count = extent.length / u64::from(self.block_size);
 
         if block_offset + block_count > self.total_blocks {
+            tracing::warn!(
+                block_offset,
+                block_count,
+                total_blocks = self.total_blocks,
+                "block free: extent beyond device",
+            );
             return Err(AllocError::Inconsistency(format!(
                 "free beyond device: offset={}, count={}, total={}",
                 block_offset, block_count, self.total_blocks

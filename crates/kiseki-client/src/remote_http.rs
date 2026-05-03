@@ -279,7 +279,7 @@ impl GatewayOps for RemoteHttpGateway {
         Ok(etag)
     }
 
-    async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+    async fn complete_multipart(&self, upload_id: &str, _name: Option<&str>) -> Result<CompositionId, GatewayError> {
         // POST /{bucket}/{key}?uploadId=X
         let ns = "default";
         let key = uuid::Uuid::new_v4();

@@ -19,6 +19,11 @@ pub struct ServerPorts {
     pub nfs_tcp: u16,
     pub metrics: u16,
     pub raft: u16,
+    /// pNFS Data Server port (ADR-038 §D9). The production default
+    /// is `:2052`; the harness allocates an ephemeral port per node
+    /// so multiple servers in a multi-node cluster can each bind
+    /// their own DS listener without colliding on 2052.
+    pub ds_tcp: u16,
 }
 
 impl ServerPorts {
@@ -48,11 +53,11 @@ pub struct PortReservation {
 }
 
 impl PortReservation {
-    /// Bind 6 ephemeral TCP sockets and hold them open.
+    /// Bind 7 ephemeral TCP sockets and hold them open.
     pub fn allocate() -> Self {
-        let mut listeners = Vec::with_capacity(6);
-        let mut ports = Vec::with_capacity(6);
-        for _ in 0..6 {
+        let mut listeners = Vec::with_capacity(7);
+        let mut ports = Vec::with_capacity(7);
+        for _ in 0..7 {
             let sock = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
             ports.push(sock.local_addr().unwrap().port());
             listeners.push(sock);
@@ -66,6 +71,7 @@ impl PortReservation {
                 nfs_tcp: ports[3],
                 metrics: ports[4],
                 raft: ports[5],
+                ds_tcp: ports[6],
             },
         }
     }
@@ -137,6 +143,10 @@ impl ServerHarness {
             )
             .env("KISEKI_S3_ADDR", format!("127.0.0.1:{}", ports.s3_http))
             .env("KISEKI_NFS_ADDR", format!("127.0.0.1:{}", ports.nfs_tcp))
+            // ADR-038 §D9: pNFS Data Server port. Default in
+            // production is 2052; here we use the harness-allocated
+            // ephemeral port so multiple servers don't collide.
+            .env("KISEKI_DS_ADDR", format!("127.0.0.1:{}", ports.ds_tcp))
             .env(
                 "KISEKI_METRICS_ADDR",
                 format!("127.0.0.1:{}", ports.metrics),
@@ -229,6 +239,51 @@ impl ServerHarness {
     pub fn nfs3_client(&self) -> kiseki_client::remote_nfs::v3::Nfs3Client {
         let addr = format!("127.0.0.1:{}", self.ports.nfs_tcp).parse().unwrap();
         kiseki_client::remote_nfs::v3::Nfs3Client::new(addr)
+    }
+
+    /// Build an `AdvisoryServiceClient` over a fresh tonic Channel to
+    /// the running server's advisory port. ADR-021 §3.b — the data-
+    /// path workflow_ref validation needs a workflow declared via this
+    /// service to find a hit.
+    ///
+    /// Returns `Err` when the channel can't be established (advisory
+    /// port not bound, server crashed, etc.); the caller should treat
+    /// any failure as scenario-fatal.
+    pub async fn advisory_grpc_client(
+        &self,
+    ) -> Result<
+        kiseki_proto::v1::workflow_advisory_service_client::WorkflowAdvisoryServiceClient<
+            tonic::transport::Channel,
+        >,
+        String,
+    > {
+        let addr = format!("http://127.0.0.1:{}", self.ports.grpc_advisory);
+        let channel = tonic::transport::Channel::from_shared(addr.clone())
+            .map_err(|e| format!("invalid advisory addr {addr}: {e}"))?
+            .connect()
+            .await
+            .map_err(|e| format!("advisory connect {addr}: {e}"))?;
+        Ok(
+            kiseki_proto::v1::workflow_advisory_service_client::WorkflowAdvisoryServiceClient::new(
+                channel,
+            ),
+        )
+    }
+
+    /// Scrape the server's `/metrics` endpoint and return the body.
+    /// Used by integration steps that assert on metrics surfaces
+    /// (e.g. `kiseki_gateway_workflow_ref_writes_total`).
+    pub async fn scrape_metrics(&self) -> Result<String, String> {
+        let url = format!("http://127.0.0.1:{}/metrics", self.ports.metrics);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("metrics scrape {url}: {e}"))?;
+        resp.text()
+            .await
+            .map_err(|e| format!("metrics body: {e}"))
     }
 
     /// Send an ONC RPC call over TCP to the NFS port and return the

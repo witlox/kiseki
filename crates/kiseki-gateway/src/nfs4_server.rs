@@ -1669,6 +1669,7 @@ fn op_open<G: GatewayOps>(
 
     let status = if open_type == 1 {
         // CREATE: write a new file.
+        tracing::debug!(name = %name, "nfs4 op_open: CREATE path");
         match ctx.write_named(&name, Vec::new()) {
             Ok((fh, _resp)) => {
                 let sid = sessions.open_file(fh);
@@ -1677,9 +1678,15 @@ fn op_open<G: GatewayOps>(
                 // OPEN4_RESULT_CONFIRM = 1: kernel knows to confirm
                 // before issuing further state ops on this stateid.
                 write_open_resok(&mut w, &sid, 1);
+                tracing::debug!(name = %name, "nfs4 op_open: CREATE success");
                 nfs4_status::NFS4_OK
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!(
+                    name = %name,
+                    error = %e,
+                    "nfs4 op_open: CREATE failed → NFS4ERR_IO",
+                );
                 w.write_u32(nfs4_status::NFS4ERR_IO);
                 nfs4_status::NFS4ERR_IO
             }
@@ -1689,6 +1696,7 @@ fn op_open<G: GatewayOps>(
         // Linux pNFS issues this after LOOKUP has already set
         // current_fh. The fh must already be registered with the
         // handle registry; we just bind a new stateid to it.
+        tracing::debug!("nfs4 op_open: CLAIM_FH path");
         match state.current_fh {
             Some(fh) if ctx.handles.lookup(&fh).is_some() => {
                 let sid = sessions.open_file(fh);
@@ -1697,12 +1705,17 @@ fn op_open<G: GatewayOps>(
                 nfs4_status::NFS4_OK
             }
             _ => {
+                tracing::warn!(
+                    has_fh = state.current_fh.is_some(),
+                    "nfs4 op_open: CLAIM_FH with stale/missing current_fh → NFS4ERR_NOFILEHANDLE",
+                );
                 w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
                 nfs4_status::NFS4ERR_NOFILEHANDLE
             }
         }
     } else {
         // NOCREATE: open existing file by name.
+        tracing::debug!(name = %name, "nfs4 op_open: NOCREATE (lookup) path");
         match ctx.lookup_by_name(&name) {
             Some((fh, _attrs)) => {
                 let sid = sessions.open_file(fh);
@@ -1712,6 +1725,10 @@ fn op_open<G: GatewayOps>(
                 nfs4_status::NFS4_OK
             }
             None => {
+                tracing::debug!(
+                    name = %name,
+                    "nfs4 op_open: NOCREATE — file not found → NFS4ERR_NOENT",
+                );
                 w.write_u32(nfs4_status::NFS4ERR_NOENT);
                 nfs4_status::NFS4ERR_NOENT
             }

@@ -273,14 +273,31 @@ impl ClusteredChunkStore {
     /// `placement[i]` receives `fragment_index = i`. Caller chooses
     /// the placement order (typically via [`crate::pick_placement`]).
     #[allow(clippy::too_many_lines)]
+    #[tracing::instrument(
+        skip(self, envelope, placement),
+        fields(
+            chunk_id = ?envelope.chunk_id,
+            ciphertext_len = envelope.ciphertext.len(),
+            placement_size = placement.len(),
+            strategy = ?strategy,
+        ),
+    )]
     pub async fn write_chunk_ec(
         &self,
         envelope: Envelope,
         placement: &[u64],
         strategy: crate::ec::EcStrategy,
     ) -> Result<(), ChunkError> {
+        tracing::debug!("write_chunk_ec: entry");
         let routes = crate::ec::encode_for_placement(strategy, &envelope.ciphertext, placement)
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
+            .map_err(|e| {
+                tracing::warn!(error = %e, "write_chunk_ec: encode_for_placement failed");
+                ChunkError::Io(e.to_string())
+            })?;
+        tracing::debug!(
+            routes = routes.len(),
+            "write_chunk_ec: encoded → fanning out PutFragment",
+        );
 
         // Build a peer-id → peer-handle index. Caller-supplied
         // peers may be in a different order than `placement`, so we
@@ -434,6 +451,15 @@ impl ClusteredChunkStore {
     /// function falls back to the trim-trailing-zeros heuristic
     /// (correct for AES-GCM ciphertext, wrong for sparse plaintext);
     /// callers wire `Some` in production.
+    #[tracing::instrument(
+        skip(self, placement),
+        fields(
+            chunk_id = ?chunk_id,
+            placement_size = placement.len(),
+            strategy = ?strategy,
+            original_len,
+        ),
+    )]
     pub async fn read_chunk_ec(
         &self,
         chunk_id: &ChunkId,
@@ -441,6 +467,7 @@ impl ClusteredChunkStore {
         strategy: crate::ec::EcStrategy,
         original_len: Option<u64>,
     ) -> Result<Envelope, ChunkError> {
+        tracing::debug!("read_chunk_ec: entry");
         let by_id: std::collections::HashMap<&str, &Arc<dyn FabricPeer>> =
             self.peers.iter().map(|p| (p.name(), p)).collect();
 
@@ -496,8 +523,17 @@ impl ClusteredChunkStore {
             }
         }
         if responses.len() < strategy.min_fragments_for_read() {
+            tracing::warn!(
+                got = responses.len(),
+                required = strategy.min_fragments_for_read(),
+                "read_chunk_ec: insufficient fragments — ChunkLost",
+            );
             return Err(ChunkError::ChunkLost);
         }
+        tracing::debug!(
+            fragments = responses.len(),
+            "read_chunk_ec: collected fragments → decoding",
+        );
         // Phase 16d step 3: prefer the cluster_chunk_state-stored
         // original_len when the caller supplies it. Heuristic
         // fallback is preserved for tests / 16c-style callers that
@@ -510,8 +546,11 @@ impl ClusteredChunkStore {
         let decode_len = original_len.map_or(shard_size * data_count, |n| {
             usize::try_from(n).unwrap_or(usize::MAX)
         });
-        let plaintext = crate::ec::decode_from_responses(strategy, &responses, decode_len)
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
+        let plaintext =
+            crate::ec::decode_from_responses(strategy, &responses, decode_len).map_err(|e| {
+                tracing::warn!(error = %e, decode_len, "read_chunk_ec: decode failed");
+                ChunkError::Io(e.to_string())
+            })?;
         let bytes = if original_len.is_some() {
             // Authoritative length from cluster_chunk_state — no
             // trimming needed; decode_from_responses already trims

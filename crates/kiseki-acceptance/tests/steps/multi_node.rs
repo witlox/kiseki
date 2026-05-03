@@ -1707,3 +1707,178 @@ fn parse_counter(text: &str, name: &str) -> u64 {
     }
     total
 }
+
+// ---------------------------------------------------------------------------
+// S3 per-key naming on multi-node (proves the v2 Create-delta payload's
+// `name` field replicates via the hydrator and the redb name index)
+// ---------------------------------------------------------------------------
+
+/// Build a per-node S3 URL that points at the bootstrap "default"
+/// bucket and a flat key (axum `/{bucket}/{key}` captures one path
+/// segment, so any `/` in the user-supplied key gets flattened to
+/// `-`). Mirrors what `gateway.rs::s3_key_url` does for single-node
+/// scenarios so the assertion uses the same flattening.
+fn s3_node_url(node: &NodeHandle, key: &str) -> String {
+    let flat = key.replace('/', "-");
+    format!("{}/default/{flat}", node.s3_base)
+}
+
+#[when(regex = r#"^a client S3 PUTs "([^"]*)" to key "([^"]*)" on node-(\d+)$"#)]
+async fn when_s3_put_keyed_to_node(
+    w: &mut KisekiWorld,
+    body: String,
+    key: String,
+    node_id: u64,
+) {
+    let guard = cluster(w);
+    let node = guard.node(node_id);
+    let url = s3_node_url(node, &key);
+    // Leader-aware retry: per the existing pattern in this file,
+    // kiseki-log surfaces "leader unavailable" rather than forwarding
+    // — a fresh client retries against the discovered leader.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let resp = node
+            .http
+            .put(&url)
+            .body(body.clone().into_bytes())
+            .send()
+            .await
+            .expect("HTTP PUT failed");
+        if resp.status().is_success() {
+            return;
+        }
+        if let Some(leader_id) = leader_id_via(node).await {
+            if leader_id != node_id {
+                let leader = guard.node(leader_id);
+                let url_l = s3_node_url(leader, &key);
+                if let Ok(r2) = leader
+                    .http
+                    .put(&url_l)
+                    .body(body.clone().into_bytes())
+                    .send()
+                    .await
+                {
+                    if r2.status().is_success() {
+                        return;
+                    }
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("S3 PUT to node-{node_id} for key {key:?} did not succeed within 30s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[then(regex = r#"^a S3 GET for key "([^"]*)" on node-(\d+) returns "([^"]*)"$"#)]
+async fn then_s3_get_keyed_on_node(
+    w: &mut KisekiWorld,
+    key: String,
+    node_id: u64,
+    expected: String,
+) {
+    let guard = cluster(w);
+    let node = guard.node(node_id);
+    let url = s3_node_url(node, &key);
+    // Hydrator delay: followers see Create deltas via the Raft poll
+    // loop, which on a healthy cluster is sub-second but isn't free.
+    // Poll briefly so this scenario doesn't flake on CI under load.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let resp = node
+            .http
+            .get(&url)
+            .send()
+            .await
+            .expect("HTTP GET failed");
+        if resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            assert_eq!(
+                body, expected,
+                "GET on node-{node_id} for key {key:?} returned wrong body",
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            panic!(
+                "GET on node-{node_id} for key {key:?} did not return success within 10s; \
+                 last status={status}, body={body:?} — name index isn't replicating",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[when(regex = r#"^a client multipart-uploads "([^"]*)" to key "([^"]*)" in (\d+) parts on node-(\d+)$"#)]
+async fn when_multipart_to_key_on_node(
+    w: &mut KisekiWorld,
+    body: String,
+    key: String,
+    parts: usize,
+    node_id: u64,
+) {
+    assert!(parts > 0, "parts must be positive");
+    let flat = key.replace('/', "-");
+    let guard = cluster(w);
+    let node = guard.node(node_id);
+    let url = format!("{}/default/{flat}", node.s3_base);
+
+    // CreateMultipartUpload — POST /<bucket>/<key>?uploads
+    let resp = node
+        .http
+        .post(format!("{url}?uploads"))
+        .send()
+        .await
+        .expect("CreateMultipartUpload");
+    assert!(
+        resp.status().is_success(),
+        "CreateMultipartUpload on node-{node_id}: {}",
+        resp.status(),
+    );
+    let json: serde_json::Value = resp.json().await.expect("upload_id JSON");
+    let upload_id = json
+        .get("uploadId")
+        .and_then(|v| v.as_str())
+        .expect("uploadId")
+        .to_owned();
+
+    // Split body into `parts` slices — last takes the remainder.
+    let chunk = body.len() / parts;
+    let mut offset = 0usize;
+    for i in 1..=parts {
+        let end = if i == parts { body.len() } else { offset + chunk };
+        let part_body = &body[offset..end];
+        let resp = node
+            .http
+            .put(format!("{url}?partNumber={i}&uploadId={upload_id}"))
+            .body(part_body.as_bytes().to_vec())
+            .send()
+            .await
+            .expect("UploadPart");
+        assert!(
+            resp.status().is_success(),
+            "UploadPart {i} on node-{node_id}: {}",
+            resp.status(),
+        );
+        offset = end;
+    }
+
+    // CompleteMultipartUpload — POST /<bucket>/<key>?uploadId=...
+    // Server uses the URL key as the name binding + emits the Raft
+    // Create-delta with the v2 payload so followers replay it.
+    let resp = node
+        .http
+        .post(format!("{url}?uploadId={upload_id}"))
+        .send()
+        .await
+        .expect("CompleteMultipartUpload");
+    assert!(
+        resp.status().is_success(),
+        "CompleteMultipartUpload on node-{node_id}: {}",
+        resp.status(),
+    );
+}

@@ -93,6 +93,13 @@ impl<G: GatewayOps> NfsGateway<G> {
                 tenant_id: req.tenant_id,
                 namespace_id: req.namespace_id,
                 data: req.data,
+                // NFS path doesn't address files by S3-style key — the
+                // file handle is the addressing token. The dir_index in
+                // NfsContext layers a name on top of the bare composition
+                // for LOOKUP, separate from the gateway's name index.
+                name: None,
+                conditional: None,
+                workflow_ref: None,
             })
             .await?;
 

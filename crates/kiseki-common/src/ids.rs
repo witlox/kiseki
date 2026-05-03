@@ -18,7 +18,7 @@ pub struct NodeId(pub u64);
 /// quotas, and data (I-T1, I-T3).
 ///
 /// Spec: `ubiquitous-language.md#Organization`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct OrgId(pub uuid::Uuid);
 
 /// Optional project within an organization.
@@ -82,7 +82,7 @@ pub struct CompositionId(pub uuid::Uuid);
 /// synonym is retired in favour of this, per ubiquitous-language).
 ///
 /// Spec: `ubiquitous-language.md#Namespace`, I-X1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct NamespaceId(pub uuid::Uuid);
 
 /// View identifier.

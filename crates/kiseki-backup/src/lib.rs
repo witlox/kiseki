@@ -232,6 +232,7 @@ impl BackupManager {
     /// return the descriptor.
     ///
     /// Concurrent calls are rejected with [`BackupError::InProgress`].
+    #[tracing::instrument(skip(self, shards), fields(shard_count = shards.len()))]
     pub async fn create_snapshot(
         &self,
         shards: &[ShardSnapshot],
@@ -241,10 +242,22 @@ impl BackupManager {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
+            tracing::warn!("backup: create_snapshot rejected — another snapshot is in progress");
             return Err(BackupError::InProgress);
         }
+        tracing::info!("backup: create_snapshot start");
         let result = self.do_create_snapshot(shards).await;
         self.in_progress.store(false, Ordering::SeqCst);
+        match &result {
+            Ok(s) => tracing::info!(
+                snapshot_id = %s.snapshot_id,
+                metadata_bytes = s.metadata_bytes,
+                data_bytes = s.data_bytes,
+                elapsed_ms = s.elapsed.as_millis() as u64,
+                "backup: create_snapshot success",
+            ),
+            Err(e) => tracing::warn!(error = %e, "backup: create_snapshot failed"),
+        }
         result
     }
 
@@ -316,16 +329,24 @@ impl BackupManager {
     /// `<shard>.meta.json` (and `<shard>.data` when `include_data` was
     /// set at create time), and returns a `ShardSnapshot` per recovered
     /// shard.
+    #[tracing::instrument(skip(self), fields(snapshot_id))]
     pub async fn restore_snapshot(
         &self,
         snapshot_id: &str,
     ) -> Result<Vec<ShardSnapshot>, BackupError> {
+        tracing::info!("backup: restore_snapshot start");
         let key = format!("{snapshot_id}/snapshot.tar");
         let bytes = self
             .backend
             .get_blob(&key)
-            .await?
-            .ok_or_else(|| BackupError::SnapshotNotFound(snapshot_id.to_owned()))?;
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "backup: restore — backend get_blob failed");
+            })?
+            .ok_or_else(|| {
+                tracing::warn!("backup: restore — snapshot not found");
+                BackupError::SnapshotNotFound(snapshot_id.to_owned())
+            })?;
 
         let mut shards: BTreeMap<String, ShardSnapshot> = BTreeMap::new();
         let mut archive = Archive::new(&bytes[..]);
@@ -366,6 +387,10 @@ impl BackupManager {
                     .data = Some(buf);
             }
         }
+        tracing::info!(
+            recovered_shards = shards.len(),
+            "backup: restore_snapshot success",
+        );
         Ok(shards.into_values().collect())
     }
 

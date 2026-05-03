@@ -51,6 +51,19 @@ pub enum GatewayError {
     /// around the halted node.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// HTTP-style conditional request failed. Maps to S3 `412
+    /// Precondition Failed` for `If-None-Match: *` against an existing
+    /// key, `If-Match: <etag>` mismatch, or related conditional checks.
+    /// The composition store is unchanged; the caller can retry with
+    /// different conditions or unconditionally.
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
+
+    /// Resource (object key, composition) wasn't found. Distinct from
+    /// `Upstream` so HTTP layers can map it cleanly to 404.
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 impl From<GatewayError> for KisekiError {

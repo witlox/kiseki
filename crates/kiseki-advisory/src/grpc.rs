@@ -94,18 +94,40 @@ fn proto_profile_to_domain(val: i32) -> Result<WorkloadProfile, Status> {
 
 /// gRPC handler for the Workflow Advisory service.
 pub struct AdvisoryGrpc {
-    table: Mutex<WorkflowTable>,
+    table: Arc<Mutex<WorkflowTable>>,
     budget: Arc<Mutex<BudgetEnforcer>>,
 }
 
 impl AdvisoryGrpc {
-    /// Create a new advisory gRPC handler.
+    /// Create a new advisory gRPC handler with a fresh internal
+    /// workflow table. Used by callers that don't need to share the
+    /// table with another subsystem.
     #[must_use]
     pub fn new(budget_config: BudgetConfig) -> Self {
+        Self::with_table(
+            Arc::new(Mutex::new(WorkflowTable::new())),
+            budget_config,
+        )
+    }
+
+    /// Create an advisory gRPC handler over a pre-shared workflow
+    /// table. The data-path gateway holds the same `Arc` so its
+    /// `x-kiseki-workflow-ref` header validation observes workflows
+    /// declared via this gRPC service in real time (no out-of-band
+    /// sync, no eventual consistency window).
+    #[must_use]
+    pub fn with_table(table: Arc<Mutex<WorkflowTable>>, budget_config: BudgetConfig) -> Self {
         Self {
-            table: Mutex::new(WorkflowTable::new()),
+            table,
             budget: Arc::new(Mutex::new(BudgetEnforcer::new(budget_config))),
         }
+    }
+
+    /// Borrow the shared workflow table — used by the runtime to wire
+    /// the same `Arc` into the gateway's S3 path.
+    #[must_use]
+    pub fn workflow_table(&self) -> Arc<Mutex<WorkflowTable>> {
+        self.table.clone()
     }
 }
 

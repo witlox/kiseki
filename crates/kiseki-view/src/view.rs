@@ -46,6 +46,12 @@ impl MaterializedView {
         {
             let lag = now_ms.saturating_sub(self.last_advanced_ms);
             if lag > max_staleness_ms {
+                tracing::warn!(
+                    view_id = %self.descriptor.view_id.0,
+                    lag_ms = lag,
+                    max_staleness_ms,
+                    "view: BoundedStaleness violation",
+                );
                 return Err(ViewError::StalenessViolation(self.descriptor.view_id, lag));
             }
         }
@@ -116,6 +122,7 @@ impl Default for ViewStore {
 }
 
 impl ViewOps for ViewStore {
+    #[tracing::instrument(skip(self, descriptor), fields(view_id = %descriptor.view_id.0, tenant_id = %descriptor.tenant_id.0))]
     fn create_view(&mut self, descriptor: ViewDescriptor) -> Result<ViewId, ViewError> {
         let view_id = descriptor.view_id;
         self.views.insert(
@@ -129,35 +136,44 @@ impl ViewOps for ViewStore {
                 next_pin_id: 1,
             },
         );
+        tracing::debug!("view: created in Building state");
         Ok(view_id)
     }
 
+    #[tracing::instrument(skip(self), fields(view_id = %view_id.0))]
     fn get_view(&self, view_id: ViewId) -> Result<&MaterializedView, ViewError> {
-        self.views.get(&view_id).ok_or(ViewError::NotFound(view_id))
+        self.views.get(&view_id).ok_or_else(|| {
+            tracing::warn!("view: get_view — not found");
+            ViewError::NotFound(view_id)
+        })
     }
 
+    #[tracing::instrument(skip(self), fields(view_id = %view_id.0))]
     fn discard_view(&mut self, view_id: ViewId) -> Result<(), ViewError> {
-        let view = self
-            .views
-            .get_mut(&view_id)
-            .ok_or(ViewError::NotFound(view_id))?;
+        let view = self.views.get_mut(&view_id).ok_or_else(|| {
+            tracing::warn!("view: discard_view — not found");
+            ViewError::NotFound(view_id)
+        })?;
         view.state = ViewState::Discarded;
         view.pins.clear();
+        tracing::debug!("view: discarded");
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(view_id = %view_id.0, position = position.0, now_ms))]
     fn advance_watermark(
         &mut self,
         view_id: ViewId,
         position: SequenceNumber,
         now_ms: u64,
     ) -> Result<(), ViewError> {
-        let view = self
-            .views
-            .get_mut(&view_id)
-            .ok_or(ViewError::NotFound(view_id))?;
+        let view = self.views.get_mut(&view_id).ok_or_else(|| {
+            tracing::warn!("view: advance_watermark — view not found");
+            ViewError::NotFound(view_id)
+        })?;
 
         if view.state == ViewState::Discarded {
+            tracing::warn!("view: advance_watermark on discarded view");
             return Err(ViewError::Discarded(view_id));
         }
 
@@ -168,6 +184,7 @@ impl ViewOps for ViewStore {
 
         // Transition from Building → Active once we have a non-zero watermark.
         if view.state == ViewState::Building && view.watermark.0 > 0 {
+            tracing::debug!("view: Building → Active");
             view.state = ViewState::Active;
         }
 

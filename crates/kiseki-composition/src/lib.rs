@@ -23,10 +23,12 @@ pub mod namespace;
 pub mod persistent;
 
 pub use composition::{
-    composition_hash_key, decode_composition_create_payload, decode_composition_delete_payload,
+    composition_hash_key, decode_composition_create_payload,
+    decode_composition_create_payload_named, decode_composition_delete_payload,
     decode_composition_update_payload, encode_composition_create_payload,
-    encode_composition_delete_payload, encode_composition_update_payload, Composition,
-    CompositionOps, DeleteResult, COMPOSITION_CREATE_PAYLOAD_LEN, COMPOSITION_DELETE_PAYLOAD_LEN,
+    encode_composition_create_payload_named, encode_composition_delete_payload,
+    encode_composition_update_payload, Composition, CompositionOps, DeleteResult,
+    COMPOSITION_CREATE_PAYLOAD_LEN, COMPOSITION_DELETE_PAYLOAD_LEN,
     COMPOSITION_UPDATE_PAYLOAD_LEN, INLINE_DATA_THRESHOLD,
 };
 pub use error::CompositionError;

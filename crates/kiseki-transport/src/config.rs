@@ -100,6 +100,7 @@ impl TlsConfig {
     }
 
     /// Build a server TLS configuration with optional CRL checking.
+    #[tracing::instrument(skip(ca_pem, cert_pem, key_pem, crl_pem), fields(ca_pem_len = ca_pem.len(), cert_pem_len = cert_pem.len(), has_crl = crl_pem.is_some()))]
     pub fn server_config_with_crl(
         ca_pem: &[u8],
         cert_pem: &[u8],
@@ -112,13 +113,17 @@ impl TlsConfig {
         let ca_certs: Vec<CertificateDer<'static>> =
             rustls_pemfile::certs(&mut BufReader::new(ca_pem))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| TransportError::ConfigError(format!("CA PEM parse: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "TlsConfig: CA PEM parse failed");
+                    TransportError::ConfigError(format!("CA PEM parse: {e}"))
+                })?;
 
         let mut root_store = rustls::RootCertStore::empty();
         for cert in &ca_certs {
-            root_store
-                .add(cert.clone())
-                .map_err(|e| TransportError::ConfigError(format!("CA add: {e}")))?;
+            root_store.add(cert.clone()).map_err(|e| {
+                tracing::warn!(error = %e, "TlsConfig: failed to add CA cert to root store");
+                TransportError::ConfigError(format!("CA add: {e}"))
+            })?;
         }
 
         let mut verifier_builder =

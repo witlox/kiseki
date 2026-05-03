@@ -42,6 +42,23 @@ pub struct PutObjectRequest {
     pub body: Vec<u8>,
     /// Content-Type to attach for round-trip on GET (RFC 6838).
     pub content_type: Option<String>,
+    /// User-supplied object key (URL path component). The S3 PUT
+    /// path passes this through to the gateway's `name` field so the
+    /// composition is bound in the namespace's secondary index. When
+    /// `None`, the object is unnamed (UUID-only) — useful for tests
+    /// or programmatic callers that address by composition_id only.
+    pub key: Option<String>,
+    /// Optional HTTP-derived conditional check applied against the
+    /// existing key binding. `IfNoneMatch` corresponds to the S3
+    /// `x-amz-` and HTTP `If-None-Match: *` semantics; `IfMatch`
+    /// corresponds to `If-Match: <etag>`.
+    pub conditional: Option<crate::ops::WriteConditional>,
+    /// Optional workflow correlation token — the S3 layer parses
+    /// `x-kiseki-workflow-ref: <uuid>` from the PUT headers and
+    /// passes the 16-byte handle through. The gateway validates it
+    /// against its shared `WorkflowTable` and emits per-result
+    /// counter ticks; the request itself proceeds either way (I-WA1).
+    pub workflow_ref: Option<[u8; 16]>,
 }
 
 /// S3 `PutObject` response.
@@ -101,6 +118,9 @@ impl<G: GatewayOps> S3Gateway<G> {
                 tenant_id: req.tenant_id,
                 namespace_id: req.namespace_id,
                 data: req.body,
+                name: req.key,
+                conditional: req.conditional,
+                workflow_ref: req.workflow_ref,
             })
             .await?;
 
@@ -115,13 +135,52 @@ impl<G: GatewayOps> S3Gateway<G> {
         })
     }
 
-    /// S3 `ListObjectsV2` — lists objects in a bucket.
+    /// S3 `ListObjectsV2` — lists objects in a bucket by composition_id.
     pub async fn list_objects(
         &self,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
     ) -> Result<Vec<(CompositionId, u64)>, GatewayError> {
         self.inner.list(tenant_id, namespace_id).await
+    }
+
+    /// S3 `ListObjectsV2` — lists objects in a bucket by URL key.
+    /// Returns only objects with a name binding; complementary to
+    /// `list_objects` (which surfaces all compositions). The HTTP
+    /// LIST handler merges both for full coverage.
+    pub async fn list_named(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, CompositionId, u64)>, GatewayError> {
+        self.inner.list_named(tenant_id, namespace_id, prefix).await
+    }
+
+    /// Resolve a URL key to a composition_id via the per-bucket name
+    /// index. Returns `None` when no composition is bound to the key.
+    pub async fn lookup_object_by_name(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<Option<CompositionId>, GatewayError> {
+        self.inner
+            .lookup_object_by_name(tenant_id, namespace_id, name)
+            .await
+    }
+
+    /// Delete an object by URL key (S3 DELETE-by-key). Resolves the
+    /// name to a composition_id then routes through the standard
+    /// delete path so chunk refcounts and the Raft Delete delta are
+    /// emitted normally.
+    pub async fn delete_by_name(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<bool, GatewayError> {
+        self.inner.delete_by_name(tenant_id, namespace_id, name).await
     }
 
     /// Ensure a namespace exists for a bucket.
@@ -220,6 +279,13 @@ pub struct CompleteMultipartUploadRequest {
     pub tenant_id: OrgId,
     pub namespace_id: NamespaceId,
     pub upload_id: String,
+    /// URL key the multipart upload was issued against. When `Some`,
+    /// the gateway binds the resulting composition to this name in
+    /// the per-bucket index so subsequent GET / DELETE / LIST by
+    /// key resolve cleanly. Without this, multipart-uploaded
+    /// objects would only be addressable by their UUID — a
+    /// regression of the per-key naming work for plain PUT.
+    pub key: Option<String>,
 }
 
 /// S3 `CompleteMultipartUpload` response.
@@ -258,12 +324,20 @@ impl<G: GatewayOps> S3Gateway<G> {
         Ok(UploadPartResponse { etag })
     }
 
-    /// S3 `CompleteMultipartUpload`.
+    /// S3 `CompleteMultipartUpload`. When the request carries a
+    /// `key`, the resulting composition is bound to it in the
+    /// gateway's name index so subsequent GET-by-key / DELETE-by-key
+    /// / LIST behave the same as for plain PUT — and the binding is
+    /// emitted via the Raft Create-delta so followers replay it
+    /// (multi-node correctness, vs. the prior local-only bind).
     pub async fn complete_multipart_upload(
         &self,
         req: &CompleteMultipartUploadRequest,
     ) -> Result<CompleteMultipartUploadResponse, GatewayError> {
-        let comp_id = self.inner.complete_multipart(&req.upload_id).await?;
+        let comp_id = self
+            .inner
+            .complete_multipart(&req.upload_id, req.key.as_deref())
+            .await?;
         Ok(CompleteMultipartUploadResponse {
             etag: comp_id.0.to_string(),
         })

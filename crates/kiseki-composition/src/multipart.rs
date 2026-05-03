@@ -36,6 +36,15 @@ pub struct MultipartPart {
     pub chunk_id: ChunkId,
     /// Size in bytes.
     pub size: u64,
+    /// Whether this part's chunk was a new write (not a dedup hit).
+    /// Tracked through the upload lifecycle so
+    /// `complete_multipart_internal` can build the `new_chunks`
+    /// list it hands to the Raft Create-delta. Without this,
+    /// followers wouldn't seed `cluster_chunk_state` for the
+    /// freshly-uploaded chunks and cross-node reads via the fabric
+    /// fan-out path would `ChunkLost` because no peer has the
+    /// expected fragment placement recorded.
+    pub was_new: bool,
 }
 
 impl MultipartUpload {

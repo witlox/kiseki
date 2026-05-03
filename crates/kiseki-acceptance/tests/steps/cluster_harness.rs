@@ -99,6 +99,14 @@ pub struct ClusterHarness {
     /// shared data port (containerized deployments) and can't reach
     /// the right peer otherwise.
     fabric_peers_env: String,
+    /// pNFS DS peer override. Same shape + reasoning as
+    /// `fabric_peers_env` — every harnessed node binds a distinct
+    /// ephemeral DS port so the runtime's host-substitution
+    /// fallback (which assumes a shared DS port) can't produce
+    /// correct uaddrs. Without this, LAYOUTGET would hand the
+    /// kernel pNFS client a list of identical addrs that all
+    /// resolve to one node.
+    ds_peers_env: String,
     /// Path to the `kiseki-server` binary — resolved once.
     binary: PathBuf,
     /// Optional mTLS material. When `Some`, each spawned child gets
@@ -167,6 +175,11 @@ impl ClusterHarness {
             .map(|(id, r)| format!("{id}=127.0.0.1:{}", r.ports().grpc_data))
             .collect::<Vec<_>>()
             .join(",");
+        let ds_peers_env = reservations
+            .iter()
+            .map(|(id, r)| format!("{id}=127.0.0.1:{}", r.ports().ds_tcp))
+            .collect::<Vec<_>>()
+            .join(",");
 
         // Write a port map for out-of-band probing. With
         // KISEKI_HARNESS_LOG_DIR set, an external process (curl, ss,
@@ -179,8 +192,8 @@ impl ClusterHarness {
                 .map(|(id, r)| {
                     let p = r.ports();
                     format!(
-                        "node-{id} grpc_data={} grpc_advisory={} s3={} nfs={} metrics={} raft={}",
-                        p.grpc_data, p.grpc_advisory, p.s3_http, p.nfs_tcp, p.metrics, p.raft,
+                        "node-{id} grpc_data={} grpc_advisory={} s3={} nfs={} metrics={} raft={} ds={}",
+                        p.grpc_data, p.grpc_advisory, p.s3_http, p.nfs_tcp, p.metrics, p.raft, p.ds_tcp,
                     )
                 })
                 .collect();
@@ -201,6 +214,7 @@ impl ClusterHarness {
             &ports1,
             &raft_peers_env,
             &fabric_peers_env,
+            &ds_peers_env,
             true,
             mtls_certs.as_deref(),
         )?;
@@ -218,6 +232,7 @@ impl ClusterHarness {
                 &ports,
                 &raft_peers_env,
                 &fabric_peers_env,
+                &ds_peers_env,
                 false,
                 mtls_certs.as_deref(),
             )?;
@@ -229,6 +244,7 @@ impl ClusterHarness {
             nodes,
             raft_peers_env,
             fabric_peers_env,
+            ds_peers_env,
             binary,
             mtls_certs,
         };
@@ -306,6 +322,7 @@ impl ClusterHarness {
             &node.ports,
             &self.raft_peers_env,
             &self.fabric_peers_env,
+            &self.ds_peers_env,
             false,
             node.data_dir.path(),
             self.mtls_certs.as_deref(),
@@ -429,6 +446,7 @@ fn spawn_node(
     ports: &ServerPorts,
     raft_peers_env: &str,
     fabric_peers_env: &str,
+    ds_peers_env: &str,
     bootstrap: bool,
     mtls_certs: Option<&crate::steps::mtls_certs::MtlsCerts>,
 ) -> Result<NodeHandle, String> {
@@ -439,6 +457,7 @@ fn spawn_node(
         ports,
         raft_peers_env,
         fabric_peers_env,
+        ds_peers_env,
         bootstrap,
         data_dir.path(),
         mtls_certs,
@@ -453,12 +472,14 @@ fn spawn_node(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // peer-config trio + bootstrap + tls bundle is intrinsically wide
 fn spawn_with_env(
     binary: &Path,
     node_id: u64,
     ports: &ServerPorts,
     raft_peers_env: &str,
     fabric_peers_env: &str,
+    ds_peers_env: &str,
     bootstrap: bool,
     data_dir: &Path,
     mtls_certs: Option<&crate::steps::mtls_certs::MtlsCerts>,
@@ -472,6 +493,7 @@ fn spawn_with_env(
         )
         .env("KISEKI_S3_ADDR", format!("127.0.0.1:{}", ports.s3_http))
         .env("KISEKI_NFS_ADDR", format!("127.0.0.1:{}", ports.nfs_tcp))
+        .env("KISEKI_DS_ADDR", format!("127.0.0.1:{}", ports.ds_tcp))
         .env(
             "KISEKI_METRICS_ADDR",
             format!("127.0.0.1:{}", ports.metrics),
@@ -481,6 +503,7 @@ fn spawn_with_env(
         .env("KISEKI_NODE_ID", node_id.to_string())
         .env("KISEKI_RAFT_PEERS", raft_peers_env)
         .env("KISEKI_FABRIC_PEERS", fabric_peers_env)
+        .env("KISEKI_DS_PEERS", ds_peers_env)
         .env("KISEKI_BOOTSTRAP", if bootstrap { "true" } else { "false" })
         .env("KISEKI_ALLOW_PLAINTEXT_NFS", "true")
         .env("KISEKI_INSECURE_NFS", "true")

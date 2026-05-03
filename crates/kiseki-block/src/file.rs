@@ -174,8 +174,10 @@ impl DeviceBackend for FileBackedDevice {
         alloc.alloc(total)
     }
 
+    #[tracing::instrument(skip(self, data), fields(offset = extent.offset, length = extent.length, bytes = data.len()))]
     fn write(&self, extent: &Extent, data: &[u8]) -> Result<(), BlockError> {
         if data.len() > u32::MAX as usize {
+            tracing::warn!(bytes = data.len(), "block file write: data exceeds 4 GiB");
             return Err(BlockError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "data exceeds 4GB",
@@ -191,17 +193,26 @@ impl DeviceBackend for FileBackedDevice {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        file.seek(SeekFrom::Start(abs_offset))?;
-        file.write_all(&data_len.to_le_bytes())?; // 4-byte length header
-        file.write_all(data)?; // payload
-                               // Note: partial CRC32 on crash is handled by WAL intent journal
-                               // (ADR-029 F-I6). If chunk_meta is not committed, the orphan extent
-                               // is freed by scrub.
-        file.write_all(&crc.to_le_bytes())?; // 4-byte CRC32 trailer
+        file.seek(SeekFrom::Start(abs_offset)).inspect_err(|e| {
+            tracing::warn!(error = %e, "block file write: seek failed");
+        })?;
+        file.write_all(&data_len.to_le_bytes()).inspect_err(|e| {
+            tracing::warn!(error = %e, "block file write: header write failed");
+        })?;
+        file.write_all(data).inspect_err(|e| {
+            tracing::warn!(error = %e, "block file write: payload write failed");
+        })?;
+        // Note: partial CRC32 on crash is handled by WAL intent journal
+        // (ADR-029 F-I6). If chunk_meta is not committed, the orphan extent
+        // is freed by scrub.
+        file.write_all(&crc.to_le_bytes()).inspect_err(|e| {
+            tracing::warn!(error = %e, "block file write: CRC write failed");
+        })?;
 
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(offset = extent.offset, length = extent.length))]
     fn read(&self, extent: &Extent) -> Result<Vec<u8>, BlockError> {
         let abs_offset = self.superblock.data_offset + extent.offset;
 
@@ -212,20 +223,34 @@ impl DeviceBackend for FileBackedDevice {
 
         // Read length header (4 bytes).
         let mut len_buf = [0u8; HEADER_SIZE];
-        file.seek(SeekFrom::Start(abs_offset))?;
-        file.read_exact(&mut len_buf)?;
+        file.seek(SeekFrom::Start(abs_offset)).inspect_err(|e| {
+            tracing::warn!(error = %e, "block file read: seek failed");
+        })?;
+        file.read_exact(&mut len_buf).inspect_err(|e| {
+            tracing::warn!(error = %e, "block file read: header read failed");
+        })?;
         let data_len = u32::from_le_bytes(len_buf) as usize;
 
         // Read data + CRC32.
         let mut data = vec![0u8; data_len];
-        file.read_exact(&mut data)?;
+        file.read_exact(&mut data).inspect_err(|e| {
+            tracing::warn!(error = %e, data_len, "block file read: payload read failed");
+        })?;
 
         let mut crc_buf = [0u8; CRC_SIZE];
-        file.read_exact(&mut crc_buf)?;
+        file.read_exact(&mut crc_buf).inspect_err(|e| {
+            tracing::warn!(error = %e, "block file read: CRC read failed");
+        })?;
         let stored_crc = u32::from_le_bytes(crc_buf);
         let computed_crc = crc32c(&data);
 
         if stored_crc != computed_crc {
+            tracing::warn!(
+                offset = extent.offset,
+                expected = stored_crc,
+                actual = computed_crc,
+                "block file read: CRC mismatch — corruption",
+            );
             return Err(BlockError::Corruption {
                 offset: extent.offset,
                 expected: stored_crc,

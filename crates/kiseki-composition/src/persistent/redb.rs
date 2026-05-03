@@ -37,6 +37,18 @@ const COMPOSITIONS: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("co
 /// Meta: see `meta_keys` for the namespace.
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 
+/// Name index forward: 16-byte ns_id || name → 16-byte composition_id.
+/// Encoding the namespace as a fixed prefix gives us free
+/// per-namespace range scans for `name_list` (and future
+/// LIST-with-prefix). Lexicographic order on `name` is the natural S3
+/// LIST ordering.
+const NAMES: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("names");
+
+/// Name index reverse: 16-byte composition_id → 16-byte ns_id || name.
+/// Used by Delete to drop the forward binding without scanning.
+const NAMES_REVERSE: TableDefinition<'_, &[u8], &[u8]> =
+    TableDefinition::new("names_reverse");
+
 mod meta_keys {
     pub const SCHEMA_VERSION: &str = "schema_version";
     pub const LAST_APPLIED_SEQ: &str = "last_applied_seq";
@@ -80,6 +92,30 @@ fn encode_stuck_state(state: Option<(SequenceNumber, u32)>) -> Vec<u8> {
             out
         }
     }
+}
+
+/// Encode a (namespace_id, name) tuple as a flat key for the NAMES
+/// table. Layout: 16 bytes ns_id || UTF-8 name. Namespace prefix
+/// gives free per-namespace range scans.
+fn name_key(ns: NamespaceId, name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + name.len());
+    out.extend_from_slice(ns.0.as_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+/// Decode a flat key from the NAMES_REVERSE value field back into
+/// `(NamespaceId, name)`. Mirror of `name_key`.
+fn decode_name_key(bytes: &[u8]) -> Result<(NamespaceId, String), String> {
+    if bytes.len() < 16 {
+        return Err(format!("name key too short: {}", bytes.len()));
+    }
+    let mut ns_buf = [0u8; 16];
+    ns_buf.copy_from_slice(&bytes[..16]);
+    let name = std::str::from_utf8(&bytes[16..])
+        .map_err(|e| format!("name utf8: {e}"))?
+        .to_owned();
+    Ok((NamespaceId(uuid::Uuid::from_bytes(ns_buf)), name))
 }
 
 fn decode_stuck_state(bytes: &[u8]) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError> {
@@ -142,6 +178,8 @@ impl PersistentRedbStorage {
         let txn = db.begin_write()?;
         {
             let _ = txn.open_table(COMPOSITIONS)?;
+            let _ = txn.open_table(NAMES)?;
+            let _ = txn.open_table(NAMES_REVERSE)?;
             let mut meta = txn.open_table(META)?;
             if meta.get(meta_keys::SCHEMA_VERSION)?.is_none() {
                 meta.insert(
@@ -334,6 +372,20 @@ impl CompositionStorage for PersistentRedbStorage {
                 let removed = table.remove(id.0.as_bytes().as_slice())?;
                 removed.is_some()
             };
+            // Drop the name binding atomically with the composition
+            // row so a forward `name_lookup` after the txn can't see
+            // a key pointing at a vanished composition.
+            {
+                let mut names = txn.open_table(NAMES)?;
+                let mut names_rev = txn.open_table(NAMES_REVERSE)?;
+                let composite = names_rev
+                    .get(id.0.as_bytes().as_slice())?
+                    .map(|guard| guard.value().to_vec());
+                if let Some(composite) = composite {
+                    names.remove(composite.as_slice())?;
+                    names_rev.remove(id.0.as_bytes().as_slice())?;
+                }
+            }
             txn.commit()?;
             existed
         };
@@ -342,6 +394,170 @@ impl CompositionStorage for PersistentRedbStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop(&id);
         Ok(existed)
+    }
+
+    fn name_lookup(
+        &self,
+        ns: NamespaceId,
+        name: &str,
+    ) -> Result<Option<CompositionId>, PersistentStoreError> {
+        let key = name_key(ns, name);
+        let db = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = db.begin_read()?;
+        let table = txn.open_table(NAMES)?;
+        let Some(guard) = table.get(key.as_slice())? else {
+            return Ok(None);
+        };
+        let bytes = guard.value();
+        if bytes.len() != 16 {
+            return Err(PersistentStoreError::Decode(format!(
+                "name index value has wrong length: {}",
+                bytes.len(),
+            )));
+        }
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(bytes);
+        Ok(Some(CompositionId(uuid::Uuid::from_bytes(buf))))
+    }
+
+    fn name_for(
+        &self,
+        id: CompositionId,
+    ) -> Result<Option<(NamespaceId, String)>, PersistentStoreError> {
+        let db = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = db.begin_read()?;
+        let table = txn.open_table(NAMES_REVERSE)?;
+        let Some(guard) = table.get(id.0.as_bytes().as_slice())? else {
+            return Ok(None);
+        };
+        decode_name_key(guard.value())
+            .map(Some)
+            .map_err(|e| PersistentStoreError::Decode(format!("name reverse decode: {e}")))
+    }
+
+    fn name_insert(
+        &mut self,
+        ns: NamespaceId,
+        name: String,
+        id: CompositionId,
+    ) -> Result<(), PersistentStoreError> {
+        let new_key = name_key(ns, &name);
+        let db = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = db.begin_write()?;
+        {
+            let mut names = txn.open_table(NAMES)?;
+            let mut names_rev = txn.open_table(NAMES_REVERSE)?;
+            // If the new (ns, name) already maps to a different id,
+            // drop that id's reverse entry (it's about to be orphaned).
+            // Materialize the bytes before any mutation so the
+            // immutable read borrow is gone before the mutable remove.
+            let prev_id_bytes = names
+                .get(new_key.as_slice())?
+                .map(|guard| guard.value().to_vec());
+            if let Some(prev) = prev_id_bytes {
+                if prev.len() == 16 && prev != id.0.as_bytes().as_slice() {
+                    names_rev.remove(prev.as_slice())?;
+                }
+            }
+            // If `id` already had a name in some namespace, drop that
+            // forward entry so the reverse map is single-valued.
+            let prev_composite = names_rev
+                .get(id.0.as_bytes().as_slice())?
+                .map(|guard| guard.value().to_vec());
+            if let Some(prev) = prev_composite {
+                if prev.as_slice() != new_key.as_slice() {
+                    names.remove(prev.as_slice())?;
+                }
+            }
+            names.insert(new_key.as_slice(), id.0.as_bytes().as_slice())?;
+            names_rev.insert(id.0.as_bytes().as_slice(), new_key.as_slice())?;
+        }
+        txn.commit().inspect_err(|_| self.record_commit_error())?;
+        Ok(())
+    }
+
+    fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
+        let key = name_key(ns, name);
+        let db = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = db.begin_write()?;
+        let removed = {
+            let mut names = txn.open_table(NAMES)?;
+            let mut names_rev = txn.open_table(NAMES_REVERSE)?;
+            let removed_id_bytes = names
+                .remove(key.as_slice())?
+                .map(|guard| guard.value().to_vec());
+            if let Some(ref id_bytes) = removed_id_bytes {
+                names_rev.remove(id_bytes.as_slice())?;
+            }
+            removed_id_bytes.is_some()
+        };
+        txn.commit().inspect_err(|_| self.record_commit_error())?;
+        Ok(removed)
+    }
+
+    fn name_list(
+        &self,
+        ns: NamespaceId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, CompositionId)>, PersistentStoreError> {
+        let db = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let txn = db.begin_read()?;
+        let table = txn.open_table(NAMES)?;
+        // Range scan over the namespace prefix. Keys are
+        // 16-byte ns_id || name; for a fixed namespace the iteration
+        // is naturally lexicographic on name (S3 LIST ordering).
+        let ns_prefix = ns.0.as_bytes();
+        let mut start = ns_prefix.to_vec();
+        if let Some(p) = prefix {
+            start.extend_from_slice(p.as_bytes());
+        }
+        // Upper bound: bump the last byte; if all bytes are 0xff,
+        // fall back to "ns_prefix + 0xff..." to cover the full
+        // namespace. For simplicity we scan the whole namespace and
+        // filter by prefix in-process — keys are short.
+        let mut out: Vec<(String, CompositionId)> = Vec::new();
+        let scan_upper = {
+            let mut v = ns_prefix.to_vec();
+            v.push(0xff);
+            v
+        };
+        for entry in table.range(ns_prefix.as_slice()..scan_upper.as_slice())? {
+            let (k, v) = entry?;
+            let key_bytes = k.value();
+            if key_bytes.len() < 16 || &key_bytes[..16] != ns_prefix {
+                continue;
+            }
+            let name = std::str::from_utf8(&key_bytes[16..])
+                .map_err(|e| PersistentStoreError::Decode(format!("name index utf8: {e}")))?;
+            if let Some(p) = prefix {
+                if !name.starts_with(p) {
+                    continue;
+                }
+            }
+            let id_bytes = v.value();
+            if id_bytes.len() != 16 {
+                continue;
+            }
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(id_bytes);
+            out.push((name.to_owned(), CompositionId(uuid::Uuid::from_bytes(buf))));
+        }
+        Ok(out)
     }
 
     fn last_applied_seq(&self) -> Result<SequenceNumber, PersistentStoreError> {
@@ -407,6 +623,8 @@ impl CompositionStorage for PersistentRedbStorage {
             let txn = db.begin_write()?;
             {
                 let mut comps = txn.open_table(COMPOSITIONS)?;
+                let mut names = txn.open_table(NAMES)?;
+                let mut names_rev = txn.open_table(NAMES_REVERSE)?;
                 for comp in &batch.puts {
                     let bytes = encode_composition(comp).inspect_err(|e| {
                         self.record_decode_error(e);
@@ -416,7 +634,49 @@ impl CompositionStorage for PersistentRedbStorage {
                 }
                 for id in &batch.removes {
                     comps.remove(id.0.as_bytes().as_slice())?;
+                    // Drop any name binding for the removed composition
+                    // atomically — same rationale as the standalone
+                    // `remove`. Belt-and-braces: the hydrator should
+                    // also include the binding in `name_removes` if it
+                    // wants the unbind to propagate by name.
+                    let composite = names_rev
+                        .get(id.0.as_bytes().as_slice())?
+                        .map(|guard| guard.value().to_vec());
+                    if let Some(composite) = composite {
+                        names.remove(composite.as_slice())?;
+                        names_rev.remove(id.0.as_bytes().as_slice())?;
+                    }
                     commit_invalidations.push(*id);
+                }
+                for (ns, name, id) in &batch.name_inserts {
+                    let new_key = name_key(*ns, name);
+                    let prev_id_bytes = names
+                        .get(new_key.as_slice())?
+                        .map(|guard| guard.value().to_vec());
+                    if let Some(prev) = prev_id_bytes {
+                        if prev.len() == 16 && prev != id.0.as_bytes().as_slice() {
+                            names_rev.remove(prev.as_slice())?;
+                        }
+                    }
+                    let prev_composite = names_rev
+                        .get(id.0.as_bytes().as_slice())?
+                        .map(|guard| guard.value().to_vec());
+                    if let Some(prev) = prev_composite {
+                        if prev.as_slice() != new_key.as_slice() {
+                            names.remove(prev.as_slice())?;
+                        }
+                    }
+                    names.insert(new_key.as_slice(), id.0.as_bytes().as_slice())?;
+                    names_rev.insert(id.0.as_bytes().as_slice(), new_key.as_slice())?;
+                }
+                for (ns, name) in &batch.name_removes {
+                    let key = name_key(*ns, name);
+                    let removed_id_bytes = names
+                        .remove(key.as_slice())?
+                        .map(|guard| guard.value().to_vec());
+                    if let Some(id_bytes) = removed_id_bytes {
+                        names_rev.remove(id_bytes.as_slice())?;
+                    }
                 }
             }
             {

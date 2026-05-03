@@ -186,6 +186,9 @@ async fn given_composition_with_size(
         tenant_id: world.legacy.nfs_ctx.tenant_id,
         namespace_id: world.legacy.nfs_ctx.namespace_id,
         data: bytes,
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     };
     let resp = kiseki_gateway::ops::GatewayOps::write(&*world.legacy.gateway, req)
         .await

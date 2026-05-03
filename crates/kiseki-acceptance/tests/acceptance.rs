@@ -559,6 +559,9 @@ impl KisekiWorld {
                 namespace_id: ns_id,
                 tenant_id,
                 data: data.to_vec(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
             })
             .await
             .map_err(|e| e.to_string())
@@ -667,6 +670,15 @@ fn main() {
             // skip in the BDD run so a `todo!()` step doesn't fail CI
             // for work that's verified end-to-end elsewhere.
             if sc.tags.iter().any(|t| t == "e2e-deferred") {
+                return false;
+            }
+            // Scenarios that document intended behavior for a feature
+            // not yet implemented in the running server. Currently no
+            // scenarios use this tag (S3 per-key naming +
+            // workflow_ref header validation are both wired); the
+            // filter stays so a future deferred-feature scenario can
+            // be tagged without re-introducing the helper.
+            if sc.tags.iter().any(|t| t == "deferred-feature") {
                 return false;
             }
             if let Some(ref fname) = feature_filter {

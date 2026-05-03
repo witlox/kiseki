@@ -48,29 +48,72 @@ pub const COMPOSITION_UPDATE_PAYLOAD_LEN: usize = 24;
 /// the follower's local store has the rest already.
 pub const COMPOSITION_DELETE_PAYLOAD_LEN: usize = 16;
 
-/// Encode a composition-create delta payload.
+/// Encode a composition-create delta payload (legacy v1: 40 bytes,
+/// no name).
 #[must_use]
 pub fn encode_composition_create_payload(
     comp_id: CompositionId,
     namespace_id: NamespaceId,
     bytes_written: u64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(COMPOSITION_CREATE_PAYLOAD_LEN);
+    encode_composition_create_payload_named(comp_id, namespace_id, bytes_written, None)
+}
+
+/// Encode a composition-create delta payload with an optional name
+/// (S3 PUT key).
+///
+/// Wire format:
+/// - Legacy v1 (no name): 40 bytes — `[comp_id 16][ns_id 16][size 8]`.
+/// - v2 (with name): 44 + name_len bytes — `[comp_id 16][ns_id 16][size 8]
+///   [name_len 4][name name_len bytes]`.
+///
+/// Length-based dispatch (no magic byte) keeps backwards compatibility
+/// with existing on-the-wire deltas the hydrator may still see during
+/// rolling upgrades.
+#[must_use]
+pub fn encode_composition_create_payload_named(
+    comp_id: CompositionId,
+    namespace_id: NamespaceId,
+    bytes_written: u64,
+    name: Option<&str>,
+) -> Vec<u8> {
+    let name_bytes = name.unwrap_or("").as_bytes();
+    let cap = if name.is_some() {
+        COMPOSITION_CREATE_PAYLOAD_LEN + 4 + name_bytes.len()
+    } else {
+        COMPOSITION_CREATE_PAYLOAD_LEN
+    };
+    let mut out = Vec::with_capacity(cap);
     out.extend_from_slice(comp_id.0.as_bytes());
     out.extend_from_slice(namespace_id.0.as_bytes());
     out.extend_from_slice(&bytes_written.to_le_bytes());
+    if name.is_some() {
+        let name_len = u32::try_from(name_bytes.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(name_bytes);
+    }
     out
 }
 
-/// Decode a composition-create delta payload.
-///
-/// Returns `None` if the payload length doesn't match
-/// [`COMPOSITION_CREATE_PAYLOAD_LEN`].
+/// Decode a composition-create delta payload (legacy 3-tuple form,
+/// drops the optional name). Kept for callers that don't yet care
+/// about the name field; new callers should use
+/// [`decode_composition_create_payload_named`].
 #[must_use]
 pub fn decode_composition_create_payload(
     payload: &[u8],
 ) -> Option<(CompositionId, NamespaceId, u64)> {
-    if payload.len() != COMPOSITION_CREATE_PAYLOAD_LEN {
+    decode_composition_create_payload_named(payload).map(|(c, n, s, _)| (c, n, s))
+}
+
+/// Decode a composition-create delta payload, including the optional
+/// name. Recognizes both the legacy 40-byte form (returns `name = None`)
+/// and the v2 form (returns `name = Some(...)`).
+#[must_use]
+pub fn decode_composition_create_payload_named(
+    payload: &[u8],
+) -> Option<(CompositionId, NamespaceId, u64, Option<String>)> {
+    if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN {
         return None;
     }
     let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
@@ -78,7 +121,23 @@ pub fn decode_composition_create_payload(
     let mut size_bytes = [0u8; 8];
     size_bytes.copy_from_slice(&payload[32..40]);
     let size = u64::from_le_bytes(size_bytes);
-    Some((CompositionId(comp_uuid), NamespaceId(ns_uuid), size))
+    let name = if payload.len() == COMPOSITION_CREATE_PAYLOAD_LEN {
+        None
+    } else {
+        // v2: must have at least 4 bytes for name_len.
+        if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN + 4 {
+            return None;
+        }
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&payload[40..44]);
+        let name_len = u32::from_le_bytes(len_bytes) as usize;
+        if payload.len() != COMPOSITION_CREATE_PAYLOAD_LEN + 4 + name_len {
+            return None;
+        }
+        let name_bytes = &payload[44..44 + name_len];
+        Some(std::str::from_utf8(name_bytes).ok()?.to_owned())
+    };
+    Some((CompositionId(comp_uuid), NamespaceId(ns_uuid), size, name))
 }
 
 /// Encode a composition-update delta payload.
@@ -211,13 +270,19 @@ pub trait CompositionOps {
     /// Start a multipart upload.
     fn start_multipart(&mut self, namespace_id: NamespaceId) -> Result<String, CompositionError>;
 
-    /// Upload a single part of a multipart upload.
+    /// Upload a single part of a multipart upload. `was_new` is the
+    /// `is_new` bool returned by the chunk store's `write_chunk` —
+    /// `true` when the part's chunk was a fresh write, `false` on
+    /// a dedup hit. The complete-multipart path uses this to build
+    /// the `new_chunks` list for the Raft Create-delta so followers'
+    /// `cluster_chunk_state` is seeded for cross-node fabric reads.
     fn upload_part(
         &mut self,
         upload_id: &str,
         part_number: u32,
         chunk_id: ChunkId,
         size: u64,
+        was_new: bool,
     ) -> Result<(), CompositionError>;
 
     /// Abort a multipart upload — marks parts for GC.
@@ -400,6 +465,91 @@ impl CompositionStore {
         };
         self.storage.put(comp)?;
         Ok(())
+    }
+
+    // -- Name index facades (S3 per-key naming) --
+    //
+    // The S3 PUT/GET/DELETE/LIST path needs to address compositions
+    // by user-supplied key, not just by composition_id UUID. These
+    // facades route through `CompositionStorage`'s name index,
+    // keeping the storage trait the single source of truth so
+    // followers replay name changes via the hydration batch.
+
+    /// Resolve `(namespace_id, name)` → composition_id.
+    ///
+    /// # Errors
+    /// Returns `CompositionError::Storage` on backend failure.
+    pub fn lookup_by_name(
+        &self,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<Option<CompositionId>, CompositionError> {
+        Ok(self.storage.name_lookup(namespace_id, name)?)
+    }
+
+    /// Reverse-lookup: composition_id → `(namespace_id, name)` if the
+    /// composition was created with a name.
+    ///
+    /// # Errors
+    /// Returns `CompositionError::Storage` on backend failure.
+    pub fn name_for(
+        &self,
+        id: CompositionId,
+    ) -> Result<Option<(NamespaceId, String)>, CompositionError> {
+        Ok(self.storage.name_for(id)?)
+    }
+
+    /// Bind `name` to `id` in `ns`. Overwrites any existing binding;
+    /// the caller is responsible for pre-flight conditional checks.
+    ///
+    /// # Errors
+    /// Returns `CompositionError::Storage` on backend failure.
+    pub fn bind_name(
+        &mut self,
+        namespace_id: NamespaceId,
+        name: String,
+        id: CompositionId,
+    ) -> Result<(), CompositionError> {
+        Ok(self.storage.name_insert(namespace_id, name, id)?)
+    }
+
+    /// Unbind `name` in `ns`. Returns `true` if a binding existed.
+    ///
+    /// # Errors
+    /// Returns `CompositionError::Storage` on backend failure.
+    pub fn unbind_name(
+        &mut self,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<bool, CompositionError> {
+        Ok(self.storage.name_remove(namespace_id, name)?)
+    }
+
+    /// Enumerate `(name, composition_id)` bindings in a namespace,
+    /// optionally filtered by `prefix`. Returns alphabetically by name
+    /// (S3 LIST ordering).
+    ///
+    /// # Errors
+    /// Returns `CompositionError::Storage` on backend failure.
+    pub fn list_names(
+        &self,
+        namespace_id: NamespaceId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, CompositionId)>, CompositionError> {
+        Ok(self.storage.name_list(namespace_id, prefix)?)
+    }
+
+    /// Return a snapshot of the parts uploaded for a multipart
+    /// upload. Returns an empty Vec if the upload doesn't exist.
+    /// Used by `complete_multipart` to build the `new_chunks` list
+    /// for the Raft Create-delta from each part's tracked
+    /// `was_new` bit.
+    #[must_use]
+    pub fn multipart_parts(&self, upload_id: &str) -> Vec<crate::multipart::MultipartPart> {
+        self.multiparts
+            .get(upload_id)
+            .map(|(u, _)| u.parts.clone())
+            .unwrap_or_default()
     }
 
     /// Apply a leader-emitted Update delta to a follower's local store
@@ -592,6 +742,7 @@ impl CompositionOps for CompositionStore {
         part_number: u32,
         chunk_id: ChunkId,
         size: u64,
+        was_new: bool,
     ) -> Result<(), CompositionError> {
         let (upload, _ns_id) = self
             .multiparts
@@ -602,6 +753,7 @@ impl CompositionOps for CompositionStore {
             part_number,
             chunk_id,
             size,
+            was_new,
         }) {
             return Err(CompositionError::MultipartNotFinalized(
                 upload_id.to_owned(),
@@ -768,11 +920,13 @@ mod tests {
                 part_number: 1,
                 chunk_id: ChunkId([0x01; 32]),
                 size: 512,
+                was_new: true,
             });
             upload.add_part(crate::multipart::MultipartPart {
                 part_number: 2,
                 chunk_id: ChunkId([0x02; 32]),
                 size: 512,
+                was_new: true,
             });
         }
 

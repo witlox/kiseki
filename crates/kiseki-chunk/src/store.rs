@@ -254,12 +254,14 @@ impl Default for ChunkStore {
 }
 
 impl ChunkOps for ChunkStore {
+    #[tracing::instrument(skip(self, envelope), fields(chunk_id = ?envelope.chunk_id, pool, ciphertext_len = envelope.ciphertext.len()))]
     fn write_chunk(&mut self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
         let chunk_id = envelope.chunk_id;
 
         // Dedup: if chunk already exists, just bump refcount.
         if let Some(entry) = self.chunks.get_mut(&chunk_id) {
             entry.refcount += 1;
+            tracing::debug!(refcount = entry.refcount, "chunk write: dedup hit");
             return Ok(false); // not a new write
         }
 
@@ -313,6 +315,11 @@ impl ChunkOps for ChunkStore {
 
         if let Some(p) = self.pools.get_mut(pool) {
             if !p.has_capacity(storage_size) {
+                tracing::warn!(
+                    storage_size,
+                    used_bytes = p.used_bytes,
+                    "chunk write: pool full",
+                );
                 return Err(ChunkError::PoolFull(pool.to_owned()));
             }
             p.used_bytes += storage_size;
@@ -330,12 +337,15 @@ impl ChunkOps for ChunkStore {
             },
         );
 
+        tracing::debug!(storage_size, "chunk write: success");
         Ok(true) // new write
     }
 
+    #[tracing::instrument(skip(self), fields(chunk_id = ?chunk_id))]
     fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
         // Fault injection (ADR-037 explicit unavailability).
         if self.unavailable.contains(chunk_id) {
+            tracing::warn!("chunk read: device unavailable (fault injected)");
             return Err(ChunkError::DeviceUnavailable(*chunk_id));
         }
         let entry = self

@@ -602,7 +602,7 @@ impl GatewayOps for Nfs4Client {
 
     /// Concatenate all buffered parts (sorted by part number) and write
     /// them as a single NFS OPEN+WRITE.
-    async fn complete_multipart(&self, upload_id: &str) -> Result<CompositionId, GatewayError> {
+    async fn complete_multipart(&self, upload_id: &str, _name: Option<&str>) -> Result<CompositionId, GatewayError> {
         let mut parts = {
             let mut buffers = self
                 .multipart_buffers
@@ -620,6 +620,9 @@ impl GatewayOps for Nfs4Client {
                 tenant_id: OrgId(uuid::Uuid::nil()),
                 namespace_id: NamespaceId(uuid::Uuid::nil()),
                 data,
+                name: None,
+                conditional: None,
+                workflow_ref: None,
             })
             .await?;
         Ok(resp.composition_id)

@@ -285,6 +285,9 @@ impl<G: GatewayOps> KisekiFuse<G> {
                 tenant_id: self.tenant_id,
                 namespace_id: self.namespace_id,
                 data: buf,
+                name: None,
+                conditional: None,
+                workflow_ref: None,
             }))
             .map_err(|_| libc_eio())?;
 
@@ -326,6 +329,9 @@ impl<G: GatewayOps> KisekiFuse<G> {
                 tenant_id: self.tenant_id,
                 namespace_id: self.namespace_id,
                 data,
+                name: None,
+                conditional: None,
+                workflow_ref: None,
             }))
             .map_err(|e| gateway_err_to_errno(&e))?;
 

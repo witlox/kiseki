@@ -38,12 +38,105 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And the gateway maintains lock state per client session
     And lock state is gateway-local (not replicated to other gateways)
 
+  # S3 PUT honors `If-None-Match: *` over the wire: a second PUT to
+  # the same key returns 412 Precondition Failed. Backed by the
+  # gateway's per-bucket name index (kiseki_composition::
+  # CompositionStorage name index — forward + reverse maps,
+  # replicated to followers via the Create delta's v2 payload's
+  # `name` field).
   @integration
   Scenario: S3 conditional write — If-None-Match
     Given object "results/v2.json" does not exist
     When a client issues PutObject with header If-None-Match: *
     Then the write succeeds
     And if the object already existed, the write would return 412 Precondition Failed
+
+  # GET-by-key + DELETE-by-key + LIST require per-key naming. The
+  # in-memory test path used to fake these by parsing the URL key as
+  # a UUID; the real product needs a per-bucket key→composition_id
+  # index. Each step issues HTTP against w.server() and asserts on
+  # the wire behavior of the running kiseki-server.
+  @integration
+  Scenario: S3 round-trip by URL key — PUT, GET, HEAD, DELETE
+    When a client S3 PUTs "alpha-payload" to key "alpha/file.bin"
+    Then a S3 GET on "alpha/file.bin" returns "alpha-payload"
+    And a S3 HEAD on "alpha/file.bin" returns content-length 13
+    And a S3 DELETE on "alpha/file.bin" returns 204
+    And a S3 GET on "alpha/file.bin" returns 404
+
+  # Multi-node read-after-write by URL key. The Create delta carries
+  # the name field (v2 payload), the hydrator on every follower
+  # replays it into the redb name index, and a GET on a non-leader
+  # node resolves the same key. Failure here means the v2 payload
+  # isn't being decoded or the name_inserts batch isn't being
+  # committed atomically with the composition put — both of which
+  # would silently break key-based addressing on a multi-node cluster.
+  @integration @multi-node
+  Scenario: 6-node cluster — S3 GET-by-key resolves on follower after PUT to leader
+    Given a 6-node kiseki cluster
+    When a client S3 PUTs "cross-node-payload" to key "x/replicated.bin" on node-1
+    Then a S3 GET for key "x/replicated.bin" on node-2 returns "cross-node-payload"
+    And a S3 GET for key "x/replicated.bin" on node-3 returns "cross-node-payload"
+
+  @integration
+  Scenario: S3 LIST returns bucket contents by URL key
+    When a client S3 PUTs "one" to key "lst/one.txt"
+    And a client S3 PUTs "two" to key "lst/two.txt"
+    And a client S3 PUTs "three" to key "lst/three.txt"
+    Then a S3 LIST with prefix "lst/" returns keys "lst/one.txt, lst/three.txt, lst/two.txt"
+
+  # FUSE in BDD without a kernel mount: drive `KisekiFuse` (the
+  # POSIX → GatewayOps translator) against a `RemoteHttpGateway`
+  # pointed at the running server's S3 port. Proves the
+  # client-side FUSE→gateway→wire path end-to-end. Kernel-mount
+  # coverage stays in python e2e (`tests/e2e/test_fuse.py`) per
+  # the @e2e-deferred convention.
+  @integration
+  Scenario: FUSE → GatewayOps → S3 wire roundtrip
+    When the FUSE filesystem (backed by RemoteHttpGateway) creates "/fuse-rt.bin" with payload "fuse-payload"
+    Then the FUSE filesystem read of "/fuse-rt.bin" returns "fuse-payload"
+    And the FUSE filesystem unlink of "/fuse-rt.bin" succeeds
+    And the FUSE filesystem read of "/fuse-rt.bin" returns ENOENT
+
+  # Operational metrics smoke. The GCP 2026-05-02 perf cluster
+  # reported `kiseki_gateway_requests_total = 0` after 1 GB of
+  # writes — i.e. the metric was not wired. Asserts the counter
+  # increments on every PUT (and chunk metrics on every payload
+  # > 0) so a future regression of the wiring fails the BDD suite
+  # before the GCP perf run.
+  @integration
+  Scenario: Server /metrics surfaces non-zero counters after a real workload
+    Given the gateway counters are baselined
+    When a 4KB object is PUT and immediately GET via S3
+    Then kiseki_gateway_requests_total has incremented since the baseline
+    And kiseki_chunk_write_bytes_total has incremented since the baseline
+    And kiseki_chunk_read_bytes_total has incremented since the baseline
+
+  # Multipart upload + per-key naming. Without per-key naming on
+  # CompleteMultipartUpload, multipart-uploaded objects would be
+  # addressable only by their composition UUID — the per-key code
+  # path for plain PUT would silently bypass them. This scenario
+  # PUTs three parts via the multipart API and asserts subsequent
+  # GET-by-key resolves the same content. Closes the asymmetry.
+  @integration
+  Scenario: S3 multipart upload binds the URL key
+    When a client multipart-uploads "alpha-bravo-charlie" to key "mp/composed.bin" in 3 parts
+    Then a S3 GET on "mp/composed.bin" returns "alpha-bravo-charlie"
+    And a S3 DELETE on "mp/composed.bin" returns 204
+    And a S3 GET on "mp/composed.bin" returns 404
+
+  # Multi-node multipart correctness: the leader's multipart
+  # upload's name binding + every part's chunk_state must replicate
+  # to followers via the Raft Create-delta (v2 payload + new_chunks
+  # list). Without that, a GET-by-key on a follower would 404 (no
+  # name binding) or `ChunkLost` (no cluster_chunk_state seed for
+  # the multipart's chunks).
+  @integration @multi-node
+  Scenario: 6-node cluster — multipart upload by key resolves on followers
+    Given a 6-node kiseki cluster
+    When a client multipart-uploads "leader-mp-payload" to key "mp/multi.bin" in 3 parts on node-1
+    Then a S3 GET for key "mp/multi.bin" on node-2 returns "leader-mp-payload"
+    And a S3 GET for key "mp/multi.bin" on node-3 returns "leader-mp-payload"
 
   # --- Transport pluggability ---
 
@@ -99,13 +192,22 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
   # via a lightweight header; correlation to a workflow is optional and
   # never a precondition for the request (I-WA1, I-WA2).
 
+  # ADR-021 / I-WA1: `x-kiseki-workflow-ref` is an advisory header.
+  # The data-path validates it against the running server's
+  # `WorkflowTable` (shared with the AdvisoryService gRPC). Three
+  # outcomes — `valid`, `invalid`, `absent` — each tick a labeled
+  # counter on `/metrics`. Per I-WA1, an unknown ref must NOT block
+  # the write — only the counter result differs.
   @integration
   Scenario: S3 request carries workflow_ref header to advisory
-    Given S3 client under workload "training-run-42" has an active workflow
-    When a PutObject arrives with header `x-kiseki-workflow-ref: <opaque>`
-    Then the gateway validates the ref against the authenticated tenant identity (I-WA3)
-    And on success, annotates the write path for advisory correlation
-    And on mismatch or unknown ref, ignores the header silently and processes the request unchanged (I-WA1)
+    Given a workflow "training-run-42" declared via advisory gRPC
+    When a S3 PUT arrives with the workflow_ref header set to the declared workflow
+    Then the metric kiseki_gateway_workflow_ref_writes_total{result="valid"} increments
+    When a S3 PUT arrives with the workflow_ref header set to a random uuid
+    Then the write succeeds (header is advisory — I-WA1)
+    And the metric kiseki_gateway_workflow_ref_writes_total{result="invalid"} increments
+    When a S3 PUT arrives without the workflow_ref header
+    Then the metric kiseki_gateway_workflow_ref_writes_total{result="absent"} increments
 
   @library
   Scenario: Priority-class hint applied to request scheduling within policy

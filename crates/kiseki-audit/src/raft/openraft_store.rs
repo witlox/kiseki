@@ -120,6 +120,7 @@ impl OpenRaftAuditStore {
     }
 
     /// Append an audit event through Raft consensus.
+    #[tracing::instrument(skip(self, description), fields(event_type, actor, has_tenant = tenant_id.is_some()))]
     pub async fn append_event(
         &self,
         event_type: &str,
@@ -135,7 +136,10 @@ impl OpenRaftAuditStore {
                 description: description.to_owned(),
             })
             .await
-            .map_err(|_| AuditError::Unavailable)?;
+            .map_err(|e| {
+                tracing::warn!(error = ?e, "audit append_event: Raft client_write failed");
+                AuditError::Unavailable
+            })?;
 
         Ok(())
     }
