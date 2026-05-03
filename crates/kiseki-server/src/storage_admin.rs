@@ -83,6 +83,10 @@ pub struct StorageAdminGrpc {
     /// (ADR-025 W5). `None` = those RPCs return
     /// `FailedPrecondition`.
     log_store: Option<Arc<dyn LogOps + Send + Sync>>,
+    /// Event broker channels for `DeviceHealth` / `IOStats`
+    /// (ADR-025 W7). `None` = both streaming RPCs return
+    /// `FailedPrecondition`.
+    event_streams: Option<crate::event_streams::EventStreams>,
     /// `kiseki_storage_admin_calls_total{rpc, outcome}` counter,
     /// shared with the global Prometheus registry. `None` in unit
     /// tests — RPC handlers no-op the counter bump in that case.
@@ -123,6 +127,7 @@ impl StorageAdminGrpc {
             scrub: None,
             pool_mutations: None,
             log_store: None,
+            event_streams: None,
             calls_total: None,
         }
     }
@@ -218,6 +223,18 @@ impl StorageAdminGrpc {
         self
     }
 
+    /// Builder: attach the event broker channels for the
+    /// streaming RPCs (ADR-025 W7). The same `EventStreams`
+    /// handle is given to data-path producers
+    /// (chunk-cluster's `IOStats` sampler, chunk's device-state
+    /// observer) so events fan out to every connected admin
+    /// client.
+    #[must_use]
+    pub fn with_event_streams(mut self, streams: crate::event_streams::EventStreams) -> Self {
+        self.event_streams = Some(streams);
+        self
+    }
+
     /// Builder: attach the global
     /// `kiseki_storage_admin_calls_total{rpc, outcome}` counter so
     /// every RPC bump is visible on `/metrics`. Skip in unit tests.
@@ -282,6 +299,12 @@ impl StorageAdminGrpc {
     /// `with_obs` span/metric labels emitted by the implemented
     /// handlers — keeps the `(rpc, outcome)` label cardinality
     /// uniform across implemented and pending RPCs.
+    /// Post-W7 every RPC has a real implementation. The helper
+    /// stays on the surface for future stubs (`#[allow(dead_code)]`
+    /// to keep production clippy clean) and is exercised by the
+    /// `metrics_increment_on_unimplemented_outcome_via_unimpl_helper`
+    /// test which calls it directly.
+    #[allow(dead_code)]
     fn unimpl(&self, rpc: &'static str, workstream: &str, what: &str) -> Status {
         let _span = kiseki_tracing::span(rpc);
         self.record_outcome(rpc, "unimplemented");
@@ -968,24 +991,41 @@ impl StorageAdminService for StorageAdminGrpc {
 
     async fn device_health(
         &self,
-        _req: Request<pb::DeviceHealthRequest>,
+        req: Request<pb::DeviceHealthRequest>,
     ) -> Result<Response<Self::DeviceHealthStream>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.DeviceHealth",
-            "W7",
-            "server-streaming; broadcast(1024) channel from chunk subsystem",
-        ))
+        const RPC: &str = "StorageAdminService.DeviceHealth";
+        let _span = kiseki_tracing::span(RPC);
+        let Some(streams) = self.event_streams.as_ref() else {
+            self.record_outcome(RPC, "client_error");
+            return Err(Status::failed_precondition(
+                "StorageAdminService.DeviceHealth: event_streams dep not wired",
+            ));
+        };
+        let device_filter = req.into_inner().device_id;
+        let rx = streams.device_health.subscribe();
+        let stream = broadcast_to_stream_filtered(rx, move |ev: &pb::DeviceHealthEvent| {
+            device_filter.is_empty() || ev.device_id == device_filter
+        });
+        self.record_outcome(RPC, "ok");
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn io_stats(
         &self,
         _req: Request<pb::IoStatsRequest>,
     ) -> Result<Response<Self::IOStatsStream>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.IOStats",
-            "W7",
-            "server-streaming; broadcast(1024) channel from chunk-cluster",
-        ))
+        const RPC: &str = "StorageAdminService.IOStats";
+        let _span = kiseki_tracing::span(RPC);
+        let Some(streams) = self.event_streams.as_ref() else {
+            self.record_outcome(RPC, "client_error");
+            return Err(Status::failed_precondition(
+                "StorageAdminService.IOStats: event_streams dep not wired",
+            ));
+        };
+        let rx = streams.io_stats.subscribe();
+        let stream = broadcast_to_stream_filtered(rx, |_: &pb::IoStatsEvent| true);
+        self.record_outcome(RPC, "ok");
+        Ok(Response::new(Box::pin(stream)))
     }
 
     // --- Shard management ---
@@ -1418,6 +1458,36 @@ fn parse_durability(
 /// Wall-clock now in Unix-millis. Shared with `RepairTracker` —
 /// keep the function here so `RepairChunk` can stamp records
 /// without pulling in another crate's helper.
+/// Wrap a `broadcast::Receiver<T>` into a tonic-compatible
+/// `Stream<Item = Result<T, Status>>`. Filtered: items for which
+/// `keep` returns `false` are silently skipped. On `Lagged`, the
+/// stream emits one `ResourceExhausted` and closes (operator
+/// reconnects to resume). On `Closed`, the stream ends.
+fn broadcast_to_stream_filtered<T, F>(
+    rx: tokio::sync::broadcast::Receiver<T>,
+    keep: F,
+) -> impl tokio_stream::Stream<Item = Result<T, Status>> + Send
+where
+    T: Clone + Send + 'static,
+    F: Fn(&T) -> bool + Send + 'static,
+{
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::StreamExt as _;
+    BroadcastStream::new(rx).filter_map(move |r| match r {
+        Ok(v) => {
+            if keep(&v) {
+                Some(Ok(v))
+            } else {
+                None
+            }
+        }
+        Err(BroadcastStreamRecvError::Lagged(n)) => Some(Err(Status::resource_exhausted(format!(
+            "subscriber lagged by {n} events; reconnect"
+        )))),
+    })
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1493,6 +1563,10 @@ mod tests {
         StorageAdminGrpc::for_tests()
     }
 
+    /// Post-W7 every RPC is implemented; this helper is kept on
+    /// the test surface so future stubs can plug in without
+    /// rewriting the assertion shape.
+    #[allow(dead_code)]
     fn assert_unimplemented_with_workstream<T>(
         label: &str,
         workstream: &str,
@@ -2522,22 +2596,132 @@ mod tests {
         assert_eq!(r.merged_shard_id, left.0.to_string());
     }
 
-    // -- W7 --
+    // -- W7 (Streaming) — landed --
 
-    #[tokio::test]
-    async fn device_health_unimplemented_until_w7() {
-        let r = fixture_empty()
-            .device_health(Request::new(pb::DeviceHealthRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("DeviceHealth", "W7", r);
+    use tokio_stream::StreamExt as _;
+
+    fn fixture_with_streams() -> (StorageAdminGrpc, crate::event_streams::EventStreams) {
+        let streams = crate::event_streams::EventStreams::new();
+        let grpc = StorageAdminGrpc::for_tests().with_event_streams(streams.clone());
+        (grpc, streams)
     }
 
     #[tokio::test]
-    async fn io_stats_unimplemented_until_w7() {
+    async fn device_health_subscribers_see_published_event() {
+        let (grpc, streams) = fixture_with_streams();
+        let resp = grpc
+            .device_health(Request::new(pb::DeviceHealthRequest {
+                device_id: String::new(),
+            }))
+            .await
+            .expect("ok");
+        let mut s = resp.into_inner();
+        // Publish on a background task so the receive doesn't
+        // race the subscribe — broadcast subscribers only see
+        // events published AFTER subscribe.
+        let publisher = streams.device_health.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            publisher.publish(pb::DeviceHealthEvent {
+                device_id: "dev-x".into(),
+                event: "io_error".into(),
+                detail: "bad sector".into(),
+                at: "ms:0".into(),
+            });
+        });
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), s.next())
+            .await
+            .expect("timeout")
+            .expect("end of stream")
+            .expect("err");
+        assert_eq!(ev.device_id, "dev-x");
+    }
+
+    #[tokio::test]
+    async fn device_health_filter_drops_other_devices() {
+        let (grpc, streams) = fixture_with_streams();
+        let resp = grpc
+            .device_health(Request::new(pb::DeviceHealthRequest {
+                device_id: "dev-target".into(),
+            }))
+            .await
+            .expect("ok");
+        let mut s = resp.into_inner();
+        let publisher = streams.device_health.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            publisher.publish(pb::DeviceHealthEvent {
+                device_id: "dev-other".into(),
+                event: "online".into(),
+                detail: String::new(),
+                at: "ms:0".into(),
+            });
+            publisher.publish(pb::DeviceHealthEvent {
+                device_id: "dev-target".into(),
+                event: "offline".into(),
+                detail: String::new(),
+                at: "ms:0".into(),
+            });
+        });
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), s.next())
+            .await
+            .expect("timeout")
+            .expect("end of stream")
+            .expect("err");
+        // Filter should have dropped dev-other; the next event is
+        // the dev-target one.
+        assert_eq!(ev.device_id, "dev-target");
+    }
+
+    #[tokio::test]
+    async fn device_health_without_dep_returns_failed_precondition() {
+        let r = fixture_empty()
+            .device_health(Request::new(pb::DeviceHealthRequest::default()))
+            .await;
+        // Stream Response doesn't implement Debug; map err early
+        // so assert_eq has something to format.
+        let err = r.map(|_| ()).expect_err("err");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn io_stats_subscribers_see_published_event() {
+        let (grpc, streams) = fixture_with_streams();
+        let resp = grpc
+            .io_stats(Request::new(pb::IoStatsRequest {
+                sample_interval_ms: 1000,
+            }))
+            .await
+            .expect("ok");
+        let mut s = resp.into_inner();
+        let publisher = streams.io_stats.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            publisher.publish(pb::IoStatsEvent {
+                sampled_at: "1970-01-01T00:00:00Z".into(),
+                reads_per_sec: 100,
+                writes_per_sec: 200,
+                read_bytes_per_sec: 1024 * 100,
+                write_bytes_per_sec: 1024 * 200,
+                pool_stats: vec![],
+            });
+        });
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), s.next())
+            .await
+            .expect("timeout")
+            .expect("end of stream")
+            .expect("err");
+        assert_eq!(ev.reads_per_sec, 100);
+        assert_eq!(ev.writes_per_sec, 200);
+    }
+
+    #[tokio::test]
+    async fn io_stats_without_dep_returns_failed_precondition() {
         let r = fixture_empty()
             .io_stats(Request::new(pb::IoStatsRequest::default()))
             .await;
-        assert_unimplemented_with_workstream("IOStats", "W7", r);
+        let err = r.map(|_| ()).expect_err("err");
+        assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
     // -- Cardinality cross-checks --
@@ -2688,21 +2872,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn metrics_increment_on_unimplemented_outcome() {
-        let (grpc, counter) = fixture_with_counter();
-        // Pick a still-unimplemented RPC (W7 territory — streaming
-        // RPCs land last) so this test continues to exercise the
-        // `unimplemented` bucket.
-        let r = grpc
-            .device_health(Request::new(pb::DeviceHealthRequest::default()))
-            .await;
-        assert!(r.is_err());
+    #[test]
+    fn metrics_increment_on_unimplemented_outcome_via_unimpl_helper() {
+        // Post-W7 every RPC is implemented, so no live RPC routes
+        // through `unimpl()`. Test the helper directly to keep
+        // coverage of the `unimplemented` outcome bucket — future
+        // PRs that re-introduce a stub will fail this guard if
+        // they don't go through `self.unimpl(...)`.
+        let counter = Arc::new(
+            IntCounterVec::new(
+                prometheus::Opts::new("kiseki_storage_admin_unimpl_test", "test"),
+                &["rpc", "outcome"],
+            )
+            .expect("metric"),
+        );
+        let grpc = StorageAdminGrpc::for_tests().with_metrics(Arc::clone(&counter));
+        let _ = grpc.unimpl("StorageAdminService.SomeFutureRpc", "WX", "not yet");
         assert_eq!(
             counter_value(
                 &counter,
-                "StorageAdminService.DeviceHealth",
-                "unimplemented"
+                "StorageAdminService.SomeFutureRpc",
+                "unimplemented",
             ),
             1,
         );
@@ -2768,15 +2958,17 @@ mod tests {
     }
 
     /// Mechanical guard: every implemented (non-`unimpl`) RPC body
-    /// must call `with_obs(...)` so spans + metric bumps are
-    /// uniform. The unimplemented stubs go through `self.unimpl(...)`
-    /// which itself bumps the counter, so they're covered without
-    /// `with_obs`.
+    /// must invoke either `with_obs(...)` (unary RPCs) or call
+    /// `kiseki_tracing::span(...)` + `record_outcome(...)` inline
+    /// (streaming RPCs, where the closure pattern doesn't compose
+    /// with the `Response<Stream>` return type). The unimplemented
+    /// stubs go through `self.unimpl(...)` which bumps the counter
+    /// itself, so they're covered without either.
     #[test]
     fn every_implemented_rpc_uses_with_obs() {
         let src = include_str!("storage_admin.rs");
-        // Names of the 9 W2 implemented RPCs (snake_case).
         let implemented: &[&str] = &[
+            // ADR-025 W2 — read-only.
             "list_devices",
             "get_device",
             "list_pools",
@@ -2804,21 +2996,29 @@ mod tests {
             "rebalance_pool",
             "split_shard",
             "merge_shards",
+            // ADR-025 W7 — streaming (uses inline pattern).
+            "device_health",
+            "io_stats",
         ];
         for rpc in implemented {
             // Locate the `async fn <rpc>` line, then look ahead a
-            // bounded number of lines for `self.with_obs(`. Bound is
-            // generous to allow long signatures + doc comments.
+            // bounded number of lines for either the `with_obs`
+            // pattern OR the inline `kiseki_tracing::span` +
+            // `record_outcome` pattern.
             let lines: Vec<&str> = src.lines().collect();
             let idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with(&format!("async fn {rpc}(")))
                 .unwrap_or_else(|| panic!("no `async fn {rpc}(` in storage_admin.rs"));
-            let window = &lines[idx..(idx + 20).min(lines.len())];
+            let window = &lines[idx..(idx + 30).min(lines.len())];
             let uses_with_obs = window.iter().any(|l| l.contains("self.with_obs("));
+            let uses_inline = window.iter().any(|l| l.contains("kiseki_tracing::span"))
+                && window.iter().any(|l| l.contains("record_outcome"));
             assert!(
-                uses_with_obs,
-                "RPC `{rpc}` body must invoke `self.with_obs(...)` for tracing + metrics",
+                uses_with_obs || uses_inline,
+                "RPC `{rpc}` body must invoke `self.with_obs(...)` OR \
+                 `kiseki_tracing::span(...)` + `record_outcome(...)` \
+                 for tracing + metrics",
             );
         }
     }

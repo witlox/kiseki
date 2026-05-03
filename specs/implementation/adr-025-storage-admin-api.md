@@ -493,20 +493,70 @@ the dispatch arms are 1:1 with the parser variants (mechanical).
 
 ---
 
-### W7 — Streaming RPCs
+### W7 — Streaming RPCs ✅ DONE (2026-05-03)
 
-`DeviceHealth` and `IOStats` are server-streaming. Pattern:
+`DeviceHealth` and `IOStats` are server-streaming.
 
-- Server: spin a `tokio::sync::broadcast` channel inside the relevant
-  subsystem (chunk-cluster for IOStats, chunk for DeviceHealth);
-  RPC handler subscribes and forwards into a tonic `Streaming`.
-- Client: reads frames in a loop, prints each one.
+**Landed:**
+- `crates/kiseki-server/src/event_streams.rs` — `DeviceHealthBroker`
+  + `IoStatsBroker` wrap `tokio::sync::broadcast::channel(1024)`
+  with a `publish/subscribe/receiver_count` API. `EventStreams`
+  bundles both for the builder. 9 inline tests covering
+  publish/subscribe round-trip, no-subscribers no-op,
+  multi-subscriber fan-out, lag reporting, and channel
+  independence.
+- `crates/kiseki-server/src/storage_admin.rs` — `device_health` /
+  `io_stats` RPCs subscribe to the broker, wrap the
+  `broadcast::Receiver` via `tokio_stream::wrappers::BroadcastStream`,
+  and emit the events as a `tonic::Streaming`. Lag → one
+  `Status::resource_exhausted("subscriber lagged by N events;
+  reconnect")` frame, then end-of-stream. Server-side filter by
+  `device_id` for `DeviceHealth`.
+- `crates/kiseki-server/src/runtime.rs` — `EventStreams::new()`
+  constructed at boot and wired via `with_event_streams`. Same
+  handles will be cloned into chunk subsystem (DeviceHealth
+  producer on device-state transitions) and chunk-cluster
+  (IOStats periodic sampler) when those producers land.
+- `crates/kiseki-server/src/storage_admin_cli.rs` already covers
+  the W6 verbs `device-health` and `io-stats` for client-side
+  subscription.
 
-**Failing test:** `tests/storage_admin_streams.rs` — start the stream,
-trigger an event (e.g. write a chunk so IOStats produces output),
-assert the client sees at least one frame within 1 s.
+**Tests landed (5 new in storage_admin::tests + 9 in
+event_streams::tests):**
+- `device_health_subscribers_see_published_event` — proves the
+  full subscribe → publish → receive path through the RPC's
+  Streaming response.
+- `device_health_filter_drops_other_devices` — proves
+  server-side `device_id` filtering.
+- `device_health_without_dep_returns_failed_precondition` —
+  missing event_streams dep → `FailedPrecondition`.
+- `io_stats_subscribers_see_published_event` — same shape as
+  device_health for `IOStatsEvent`.
+- `io_stats_without_dep_returns_failed_precondition`.
+- 9 broker-level tests in event_streams::tests covering
+  receiver_count tracking, multi-subscriber fan-out,
+  no-subscribers silent publish, broadcast lag reporting.
+- `metrics_increment_on_unimplemented_outcome_via_unimpl_helper` —
+  post-W7 every RPC is implemented; this guard exercises the
+  helper directly so future stubs that reintroduce `Unimplemented`
+  fail the assertion.
+- `every_implemented_rpc_uses_with_obs` extended to recognise
+  the streaming inline pattern (`kiseki_tracing::span` +
+  `record_outcome`) — the closure-based `with_obs` doesn't
+  compose cleanly with `Response<Stream>`.
 
-**Effort:** ~1 day.
+**Producer wiring (deferred):**
+- The chunk subsystem doesn't yet emit device-state transition
+  events (online → degraded, etc). `DeviceHealthBroker.publish()`
+  is `#[allow(dead_code)]` until that subsystem ships the hook.
+- The chunk-cluster doesn't yet run a periodic IOStats sampler.
+  `IoStatsBroker.publish()` is `#[allow(dead_code)]` for the
+  same reason. The W7 channel + RPC handler + CLI are ready;
+  events arrive once the producers wire up.
+
+**Effort actual:** ~0.4 days. The `tokio_stream::BroadcastStream`
+adapter handles the heavy lifting; the RPC handlers are short
+adapters.
 
 ---
 

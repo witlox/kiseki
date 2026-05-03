@@ -833,7 +833,7 @@ mod tests {
         for parts in invocations {
             let v = args(parts);
             let parsed = parse_storage_admin_args(&v);
-            assert!(parsed.is_ok(), "parse failed for {parts:?}: {parsed:?}",);
+            assert!(parsed.is_ok(), "parse failed for {parts:?}: {parsed:?}");
             assert!(
                 parsed.unwrap().is_some(),
                 "no command produced for {parts:?}",

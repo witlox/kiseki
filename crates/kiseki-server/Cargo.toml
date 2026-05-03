@@ -64,6 +64,7 @@ prometheus = { workspace = true }
 postcard = { workspace = true }
 redb = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { workspace = true }
 thiserror = { workspace = true }
 serde = { version = "1", features = ["derive"] }

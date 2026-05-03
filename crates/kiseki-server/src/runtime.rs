@@ -1170,6 +1170,12 @@ pub async fn run_main(
     // ADR-025 W5 deps: pool overrides (thresholds + rebalance
     // tracker) and the log-store handle for SplitShard/MergeShards.
     let pool_mutations = crate::pool_overrides::PoolMutationDeps::new();
+    // ADR-025 W7: event broker channels for the streaming RPCs.
+    // Same handles will be wired into chunk subsystem (DeviceHealth
+    // producer) and chunk-cluster (IOStats sampler) as those
+    // producers land. Today the channels exist + the admin RPCs
+    // can subscribe; events arrive once producers wire up.
+    let event_streams = crate::event_streams::EventStreams::new();
     let mut storage_admin_handler = crate::storage_admin::StorageAdminGrpc::from_runtime()
         .with_chunk_store(Arc::clone(&local_chunk_store))
         .with_cluster(cluster_member_ids, cfg.node_id)
@@ -1180,6 +1186,7 @@ pub async fn run_main(
         .with_evacuations(Arc::clone(&evacuation_registry))
         .with_pool_mutations(pool_mutations)
         .with_log_store(log_for_admin)
+        .with_event_streams(event_streams)
         .with_metrics(Arc::clone(&storage_admin_calls_counter));
     if let Some(ref s) = scrub_scheduler_handle {
         storage_admin_handler = storage_admin_handler.with_scrub(Arc::clone(s));
