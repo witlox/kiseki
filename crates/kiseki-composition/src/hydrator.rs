@@ -68,7 +68,7 @@ struct Staging {
     name_inserts: Vec<(NamespaceId, String, CompositionId)>,
     /// Name bindings to remove on commit. Populated from Delete
     /// deltas — looked up via reverse index since the Delete payload
-    /// itself carries only the composition_id.
+    /// itself carries only the `composition_id`.
     name_removes: Vec<(NamespaceId, String)>,
 }
 

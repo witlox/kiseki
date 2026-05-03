@@ -281,9 +281,7 @@ impl ServerHarness {
             .send()
             .await
             .map_err(|e| format!("metrics scrape {url}: {e}"))?;
-        resp.text()
-            .await
-            .map_err(|e| format!("metrics body: {e}"))
+        resp.text().await.map_err(|e| format!("metrics body: {e}"))
     }
 
     /// Send an ONC RPC call over TCP to the NFS port and return the

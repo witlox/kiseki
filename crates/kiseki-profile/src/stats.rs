@@ -3,7 +3,7 @@
 //! Latency is recorded as a flat `Vec<u32>` of microseconds under a
 //! short-lived mutex per record. For the workloads this driver runs
 //! (16-256 concurrency, 30 s) the contention is negligible compared
-//! to the network round-trip cost; HdrHistogram would be nicer but
+//! to the network round-trip cost; `HdrHistogram` would be nicer but
 //! adds a dep we don't need at this scale.
 
 use std::sync::Mutex;
@@ -36,20 +36,18 @@ impl Stats {
     }
 
     pub fn report(&self, object_size: usize, elapsed: Duration) -> Report {
-        let mut samples = self
-            .samples
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default();
+        let mut samples = self.samples.lock().map(|s| s.clone()).unwrap_or_default();
         samples.sort_unstable();
         let ops = samples.len() as u64;
-        let errors = self
-            .errors
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let errors = self.errors.load(std::sync::atomic::Ordering::Relaxed);
         let secs = elapsed.as_secs_f64().max(1e-9);
+        // Casts here are statistical-display only — losing the bottom
+        // bits of a 53-bit-mantissa float for ops/MiB throughput is
+        // benign at any realistic scale.
+        #[allow(clippy::cast_precision_loss)]
         let ops_per_sec = ops as f64 / secs;
-        let mib_per_sec =
-            (ops as f64 * object_size as f64) / secs / (1024.0 * 1024.0);
+        #[allow(clippy::cast_precision_loss)]
+        let mib_per_sec = (ops as f64 * object_size as f64) / secs / (1024.0 * 1024.0);
         let p50_us = pct(&samples, 50);
         let p95_us = pct(&samples, 95);
         let p99_us = pct(&samples, 99);

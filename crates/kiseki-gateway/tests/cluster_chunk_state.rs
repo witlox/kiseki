@@ -202,6 +202,9 @@ async fn fresh_chunk_write_emits_chunk_and_delta_proposal() {
         tenant_id: test_tenant(),
         namespace_id: test_namespace(),
         data: plaintext,
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     })
     .await
     .expect("write");
@@ -252,6 +255,9 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         tenant_id: test_tenant(),
         namespace_id: test_namespace(),
         data: plaintext.clone(),
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     })
     .await
     .expect("write 1");
@@ -261,6 +267,9 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         tenant_id: test_tenant(),
         namespace_id: test_namespace(),
         data: plaintext,
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     })
     .await
     .expect("write 2");
@@ -304,6 +313,9 @@ async fn fresh_chunk_write_carries_configured_placement() {
         tenant_id: test_tenant(),
         namespace_id: test_namespace(),
         data: vec![0xEEu8; 4096],
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     })
     .await
     .expect("write");
@@ -335,6 +347,9 @@ async fn placement_is_capped_at_target_copies_when_cluster_is_larger() {
         tenant_id: test_tenant(),
         namespace_id: test_namespace(),
         data: vec![0xC1u8; 4096],
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     })
     .await
     .expect("write");
@@ -368,6 +383,9 @@ async fn single_node_gateway_emits_empty_placement() {
         tenant_id: test_tenant(),
         namespace_id: test_namespace(),
         data: vec![0x77u8; 4096],
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     })
     .await
     .expect("write");
@@ -398,6 +416,9 @@ async fn composition_delete_emits_decrement_for_each_chunk() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: vec![0xAAu8; 4096],
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .expect("write");
@@ -517,6 +538,9 @@ async fn tombstone_decrement_triggers_delete_distributed() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: vec![0xAFu8; 4096],
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .expect("write");
@@ -555,6 +579,9 @@ async fn non_tombstone_decrement_does_not_fan_out() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: vec![0xB0u8; 4096],
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .expect("write");

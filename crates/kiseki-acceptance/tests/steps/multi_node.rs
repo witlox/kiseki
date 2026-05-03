@@ -1724,12 +1724,7 @@ fn s3_node_url(node: &NodeHandle, key: &str) -> String {
 }
 
 #[when(regex = r#"^a client S3 PUTs "([^"]*)" to key "([^"]*)" on node-(\d+)$"#)]
-async fn when_s3_put_keyed_to_node(
-    w: &mut KisekiWorld,
-    body: String,
-    key: String,
-    node_id: u64,
-) {
+async fn when_s3_put_keyed_to_node(w: &mut KisekiWorld, body: String, key: String, node_id: u64) {
     let guard = cluster(w);
     let node = guard.node(node_id);
     let url = s3_node_url(node, &key);
@@ -1787,12 +1782,7 @@ async fn then_s3_get_keyed_on_node(
     // Poll briefly so this scenario doesn't flake on CI under load.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let resp = node
-            .http
-            .get(&url)
-            .send()
-            .await
-            .expect("HTTP GET failed");
+        let resp = node.http.get(&url).send().await.expect("HTTP GET failed");
         if resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             assert_eq!(
@@ -1813,7 +1803,9 @@ async fn then_s3_get_keyed_on_node(
     }
 }
 
-#[when(regex = r#"^a client multipart-uploads "([^"]*)" to key "([^"]*)" in (\d+) parts on node-(\d+)$"#)]
+#[when(
+    regex = r#"^a client multipart-uploads "([^"]*)" to key "([^"]*)" in (\d+) parts on node-(\d+)$"#
+)]
 async fn when_multipart_to_key_on_node(
     w: &mut KisekiWorld,
     body: String,
@@ -1850,7 +1842,11 @@ async fn when_multipart_to_key_on_node(
     let chunk = body.len() / parts;
     let mut offset = 0usize;
     for i in 1..=parts {
-        let end = if i == parts { body.len() } else { offset + chunk };
+        let end = if i == parts {
+            body.len()
+        } else {
+            offset + chunk
+        };
         let part_body = &body[offset..end];
         let resp = node
             .http

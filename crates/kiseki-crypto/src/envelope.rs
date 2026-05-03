@@ -54,9 +54,11 @@ pub fn seal_envelope(
 
     // AAD = chunk_id bytes — binds ciphertext to this specific chunk.
     let (ciphertext_with_tag, nonce) =
-        aead_ctx.seal(&dek, plaintext, &chunk_id.0).inspect_err(|e| {
-            tracing::warn!(error = %e, "seal_envelope: AEAD seal failed");
-        })?;
+        aead_ctx
+            .seal(&dek, plaintext, &chunk_id.0)
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "seal_envelope: AEAD seal failed");
+            })?;
 
     // Split tag from ciphertext. aws-lc-rs appends the tag.
     let tag_start = ciphertext_with_tag.len() - GCM_TAG_LEN;
@@ -154,13 +156,10 @@ pub fn unwrap_tenant(
     tenant_kek: &TenantKek,
     master_cache: &crate::keys::MasterKeyCache,
 ) -> Result<Vec<u8>, CryptoError> {
-    let wrapped = envelope
-        .tenant_wrapped_material
-        .as_ref()
-        .ok_or_else(|| {
-            tracing::warn!("unwrap_tenant: envelope has no tenant wrapping");
-            CryptoError::InvalidEnvelope("no tenant wrapping".into())
-        })?;
+    let wrapped = envelope.tenant_wrapped_material.as_ref().ok_or_else(|| {
+        tracing::warn!("unwrap_tenant: envelope has no tenant wrapping");
+        CryptoError::InvalidEnvelope("no tenant wrapping".into())
+    })?;
 
     if wrapped.len() < aead::GCM_NONCE_LEN {
         tracing::warn!(

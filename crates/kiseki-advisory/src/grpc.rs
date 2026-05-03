@@ -104,10 +104,7 @@ impl AdvisoryGrpc {
     /// table with another subsystem.
     #[must_use]
     pub fn new(budget_config: BudgetConfig) -> Self {
-        Self::with_table(
-            Arc::new(Mutex::new(WorkflowTable::new())),
-            budget_config,
-        )
+        Self::with_table(Arc::new(Mutex::new(WorkflowTable::new())), budget_config)
     }
 
     /// Create an advisory gRPC handler over a pre-shared workflow

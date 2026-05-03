@@ -54,7 +54,7 @@ pub trait CompositionStorage: Send + Sync {
     // index from the Create delta's optional `name` field so
     // followers see the same key→id mapping as the leader.
 
-    /// Resolve `(namespace_id, name)` → composition_id. Returns
+    /// Resolve `(namespace_id, name)` → `composition_id`. Returns
     /// `None` if no composition is bound to that name in the namespace.
     fn name_lookup(
         &self,
@@ -62,7 +62,7 @@ pub trait CompositionStorage: Send + Sync {
         name: &str,
     ) -> Result<Option<CompositionId>, PersistentStoreError>;
 
-    /// Reverse lookup: composition_id → `(namespace_id, name)`.
+    /// Reverse lookup: `composition_id` → `(namespace_id, name)`.
     /// Returns `None` if the composition was created without a name
     /// (internal / NFS path) or has been unbound.
     fn name_for(
@@ -186,13 +186,13 @@ impl HydrationBatch {
 #[derive(Debug)]
 pub struct MemoryStorage {
     compositions: HashMap<CompositionId, Composition>,
-    /// Name index forward: (namespace_id, name) → composition_id.
+    /// Name index forward: (`namespace_id`, name) → `composition_id`.
     /// Maintained alongside the composition table; persisted as part
     /// of `apply_hydration_batch` on the leader and updated atomically
     /// with the underlying composition mutations on followers via
     /// `name_inserts` / `name_removes`.
     names: HashMap<(NamespaceId, String), CompositionId>,
-    /// Name index reverse: composition_id → (namespace_id, name). Used
+    /// Name index reverse: `composition_id` → (`namespace_id`, name). Used
     /// by Delete deltas to find what to unbind. A composition without
     /// a name (NFS path, internal use) has no entry here.
     names_reverse: HashMap<CompositionId, (NamespaceId, String)>,
@@ -313,9 +313,7 @@ impl CompositionStorage for MemoryStorage {
         let mut out: Vec<(String, CompositionId)> = self
             .names
             .iter()
-            .filter(|((n, name), _)| {
-                *n == ns && prefix.is_none_or(|p| name.starts_with(p))
-            })
+            .filter(|((n, name), _)| *n == ns && prefix.is_none_or(|p| name.starts_with(p)))
             .map(|((_, name), id)| (name.clone(), *id))
             .collect();
         // Stable order — S3 LIST ordering is alphabetical.

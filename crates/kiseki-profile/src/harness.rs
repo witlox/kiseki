@@ -60,8 +60,7 @@ impl ProfileServer {
             Some(p) => p.to_path_buf(),
             None => find_server_binary()?,
         };
-        let data_dir =
-            tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let data_dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let ports = Ports::allocate();
         let mut cmd = Command::new(&binary);
         cmd.env_clear()
@@ -73,7 +72,10 @@ impl ProfileServer {
             .env("KISEKI_S3_ADDR", format!("127.0.0.1:{}", ports.s3_http))
             .env("KISEKI_NFS_ADDR", format!("127.0.0.1:{}", ports.nfs_tcp))
             .env("KISEKI_DS_ADDR", format!("127.0.0.1:{}", ports.ds_tcp))
-            .env("KISEKI_METRICS_ADDR", format!("127.0.0.1:{}", ports.metrics))
+            .env(
+                "KISEKI_METRICS_ADDR",
+                format!("127.0.0.1:{}", ports.metrics),
+            )
             .env("KISEKI_RAFT_ADDR", format!("127.0.0.1:{}", ports.raft))
             .env("KISEKI_DATA_DIR", data_dir.path())
             .env("KISEKI_NODE_ID", "1")
@@ -100,12 +102,9 @@ impl ProfileServer {
             .map_err(|e| format!("spawn kiseki-server at {}: {e}", binary.display()))?;
 
         let s3_base = format!("http://127.0.0.1:{}", ports.s3_http);
-        let nfs_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ports.nfs_tcp)
-            .parse()
-            .unwrap();
-        let ds_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ports.ds_tcp)
-            .parse()
-            .unwrap();
+        let nfs_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", ports.nfs_tcp).parse().unwrap();
+        let ds_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ports.ds_tcp).parse().unwrap();
         let mut server = Self {
             process: child,
             _data_dir: data_dir,
@@ -217,9 +216,7 @@ fn find_server_binary() -> Result<PathBuf, String> {
             return Ok(candidate);
         }
     }
-    Err(
-        "kiseki-server binary not found. Build first: \
+    Err("kiseki-server binary not found. Build first: \
          `cargo build -p kiseki-server` or set KISEKI_SERVER_BIN"
-            .into(),
-    )
+        .into())
 }

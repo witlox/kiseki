@@ -460,6 +460,7 @@ impl ClusteredChunkStore {
             original_len,
         ),
     )]
+    #[allow(clippy::too_many_lines)]
     pub async fn read_chunk_ec(
         &self,
         chunk_id: &ChunkId,
@@ -546,8 +547,8 @@ impl ClusteredChunkStore {
         let decode_len = original_len.map_or(shard_size * data_count, |n| {
             usize::try_from(n).unwrap_or(usize::MAX)
         });
-        let plaintext =
-            crate::ec::decode_from_responses(strategy, &responses, decode_len).map_err(|e| {
+        let plaintext = crate::ec::decode_from_responses(strategy, &responses, decode_len)
+            .map_err(|e| {
                 tracing::warn!(error = %e, decode_len, "read_chunk_ec: decode failed");
                 ChunkError::Io(e.to_string())
             })?;

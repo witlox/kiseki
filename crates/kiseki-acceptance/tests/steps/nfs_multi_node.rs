@@ -19,9 +19,7 @@ fn cluster<'a>(w: &'a KisekiWorld) -> &'a crate::steps::cluster_harness::Cluster
 
 fn nfs_addr_for_node(w: &KisekiWorld, node_id: u64) -> std::net::SocketAddr {
     let port = cluster(w).node(node_id).ports.nfs_tcp;
-    format!("127.0.0.1:{port}")
-        .parse()
-        .expect("nfs addr parse")
+    format!("127.0.0.1:{port}").parse().expect("nfs addr parse")
 }
 
 #[when(regex = r"^a client opens-and-creates an empty file via NFSv4 on node-(\d+)$")]
@@ -44,9 +42,7 @@ async fn when_open_create_empty(w: &mut KisekiWorld, node_id: u64) {
     }
 }
 
-#[when(
-    regex = r#"^a client opens-creates-and-writes "([^"]*)" via NFSv4 on node-(\d+)$"#
-)]
+#[when(regex = r#"^a client opens-creates-and-writes "([^"]*)" via NFSv4 on node-(\d+)$"#)]
 async fn when_open_create_and_write(w: &mut KisekiWorld, payload: String, node_id: u64) {
     let addr = nfs_addr_for_node(w, node_id);
     let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
@@ -142,9 +138,7 @@ async fn when_1kb_put_to_node1(w: &mut KisekiWorld) {
                 }
             }
             if std::time::Instant::now() >= deadline {
-                panic!(
-                    "leader-warmup GET for composition {etag} did not succeed within 10s",
-                );
+                panic!("leader-warmup GET for composition {etag} did not succeed within 10s",);
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -248,7 +242,9 @@ async fn when_layoutget_against_node1(w: &mut KisekiWorld) {
     // Parse: COMPOUND status + tag + numops + (op + status)*4
     let mut r = XdrReader::new(&reply);
     let compound_status = r.read_u32().expect("status");
-    w.cluster.name_index_state.insert("pnfs_compound_status".into(), compound_status.to_string());
+    w.cluster
+        .name_index_state
+        .insert("pnfs_compound_status".into(), compound_status.to_string());
     if compound_status != 0 {
         return;
     }
@@ -260,7 +256,9 @@ async fn when_layoutget_against_node1(w: &mut KisekiWorld) {
     let _ = r.read_u32();
     let seq_st = r.read_u32().expect("seq status");
     if seq_st != 0 {
-        w.cluster.name_index_state.insert("pnfs_compound_status".into(), seq_st.to_string());
+        w.cluster
+            .name_index_state
+            .insert("pnfs_compound_status".into(), seq_st.to_string());
         return;
     }
     let _ = r.read_opaque_fixed(16);
@@ -274,7 +272,9 @@ async fn when_layoutget_against_node1(w: &mut KisekiWorld) {
     let _ = r.read_u32();
     let pr_st = r.read_u32().expect("putrootfh status");
     if pr_st != 0 {
-        w.cluster.name_index_state.insert("pnfs_compound_status".into(), pr_st.to_string());
+        w.cluster
+            .name_index_state
+            .insert("pnfs_compound_status".into(), pr_st.to_string());
         return;
     }
 
@@ -282,14 +282,18 @@ async fn when_layoutget_against_node1(w: &mut KisekiWorld) {
     let _ = r.read_u32();
     let lk_st = r.read_u32().expect("lookup status");
     if lk_st != 0 {
-        w.cluster.name_index_state.insert("pnfs_compound_status".into(), lk_st.to_string());
+        w.cluster
+            .name_index_state
+            .insert("pnfs_compound_status".into(), lk_st.to_string());
         return;
     }
 
     // LAYOUTGET: op + status + return_on_close + stateid + segments...
     let _ = r.read_u32();
     let lg_st = r.read_u32().expect("layoutget status");
-    w.cluster.name_index_state.insert("pnfs_layoutget_status".into(), lg_st.to_string());
+    w.cluster
+        .name_index_state
+        .insert("pnfs_layoutget_status".into(), lg_st.to_string());
     if lg_st != 0 {
         return;
     }
@@ -337,9 +341,7 @@ async fn when_layoutget_against_node1(w: &mut KisekiWorld) {
                     // first one have a stable insertion order in the
                     // FF layout body.
                     let key = format!("pnfs_mirror_{}_fh", device_ids.len() - 1);
-                    w.cluster
-                        .name_index_state
-                        .insert(key, bytes_to_hex(&fh));
+                    w.cluster.name_index_state.insert(key, bytes_to_hex(&fh));
                     let key = format!("pnfs_mirror_{}_device_id", device_ids.len() - 1);
                     w.cluster.name_index_state.insert(key, bytes_to_hex(&buf));
                 }
@@ -437,11 +439,12 @@ async fn when_layoutget_against_node1(w: &mut KisekiWorld) {
         }
     }
     // Total mirror count for the DS-read step's iteration.
-    w.cluster.name_index_state.insert(
-        "pnfs_mirror_count".into(),
-        device_ids.len().to_string(),
-    );
-    w.cluster.name_index_state.insert("pnfs_uaddrs".into(), uaddrs.join("\n"));
+    w.cluster
+        .name_index_state
+        .insert("pnfs_mirror_count".into(), device_ids.len().to_string());
+    w.cluster
+        .name_index_state
+        .insert("pnfs_uaddrs".into(), uaddrs.join("\n"));
 }
 
 /// Hex-encode arbitrary bytes for stashing in the cluster scratch
@@ -509,7 +512,10 @@ async fn then_layoutget_ok(w: &mut KisekiWorld) {
         .get("pnfs_compound_status")
         .and_then(|s| s.parse().ok())
         .expect("compound status not captured");
-    assert_eq!(compound, 0, "COMPOUND status should be NFS4_OK; got {compound}");
+    assert_eq!(
+        compound, 0,
+        "COMPOUND status should be NFS4_OK; got {compound}"
+    );
     let lg: u32 = w
         .cluster
         .name_index_state
@@ -616,8 +622,7 @@ async fn try_ds_read(addr: std::net::SocketAddr, fh: &[u8]) -> Result<Vec<u8>, S
     use kiseki_gateway::nfs4_server::op;
     use kiseki_gateway::nfs_xdr::{XdrReader, XdrWriter};
 
-    let mut transport =
-        RpcTransport::connect(addr).map_err(|e| format!("DS TCP connect: {e}"))?;
+    let mut transport = RpcTransport::connect(addr).map_err(|e| format!("DS TCP connect: {e}"))?;
 
     // EXCHANGE_ID — DS distinguishes itself via ServerRole::Ds, but
     // the wire shape is identical.
@@ -639,7 +644,9 @@ async fn try_ds_read(addr: std::net::SocketAddr, fh: &[u8]) -> Result<Vec<u8>, S
     let _ = r.read_opaque();
     let _ = r.read_u32();
     let _ = r.read_u32();
-    let op_st = r.read_u32().map_err(|e| format!("EXCHANGE_ID op_st: {e}"))?;
+    let op_st = r
+        .read_u32()
+        .map_err(|e| format!("EXCHANGE_ID op_st: {e}"))?;
     if op_st != 0 {
         return Err(format!("EXCHANGE_ID returned {op_st}"));
     }
@@ -744,6 +751,10 @@ async fn then_ds_bytes_match(w: &mut KisekiWorld) {
         .expect("DS-read step must stash pnfs_ds_read_data");
     let actual = hex_to_bytes(&actual_hex);
     let expected = vec![0xabu8; 1024];
-    assert_eq!(actual.len(), expected.len(), "DS read returned wrong length");
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "DS read returned wrong length"
+    );
     assert_eq!(actual, expected, "DS read returned wrong bytes");
 }

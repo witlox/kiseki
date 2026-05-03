@@ -64,7 +64,7 @@ pub fn encode_composition_create_payload(
 ///
 /// Wire format:
 /// - Legacy v1 (no name): 40 bytes — `[comp_id 16][ns_id 16][size 8]`.
-/// - v2 (with name): 44 + name_len bytes — `[comp_id 16][ns_id 16][size 8]
+/// - v2 (with name): 44 + `name_len` bytes — `[comp_id 16][ns_id 16][size 8]
 ///   [name_len 4][name name_len bytes]`.
 ///
 /// Length-based dispatch (no magic byte) keeps backwards compatibility
@@ -475,7 +475,7 @@ impl CompositionStore {
     // keeping the storage trait the single source of truth so
     // followers replay name changes via the hydration batch.
 
-    /// Resolve `(namespace_id, name)` → composition_id.
+    /// Resolve `(namespace_id, name)` → `composition_id`.
     ///
     /// # Errors
     /// Returns `CompositionError::Storage` on backend failure.
@@ -487,7 +487,7 @@ impl CompositionStore {
         Ok(self.storage.name_lookup(namespace_id, name)?)
     }
 
-    /// Reverse-lookup: composition_id → `(namespace_id, name)` if the
+    /// Reverse-lookup: `composition_id` → `(namespace_id, name)` if the
     /// composition was created with a name.
     ///
     /// # Errors
@@ -1131,13 +1131,13 @@ mod tests {
         let upload_id = store.start_multipart(test_ns()).unwrap();
 
         store
-            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 1024)
+            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 1024, true)
             .unwrap();
         store
-            .upload_part(&upload_id, 2, ChunkId([0x11; 32]), 1024)
+            .upload_part(&upload_id, 2, ChunkId([0x11; 32]), 1024, true)
             .unwrap();
         store
-            .upload_part(&upload_id, 3, ChunkId([0x12; 32]), 1024)
+            .upload_part(&upload_id, 3, ChunkId([0x12; 32]), 1024, true)
             .unwrap();
 
         // Before finalize: no composition exists for these parts (I-L5).
@@ -1156,10 +1156,10 @@ mod tests {
         let upload_id = store.start_multipart(test_ns()).unwrap();
 
         store
-            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 1024)
+            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 1024, true)
             .unwrap();
         store
-            .upload_part(&upload_id, 2, ChunkId([0x11; 32]), 1024)
+            .upload_part(&upload_id, 2, ChunkId([0x11; 32]), 1024, true)
             .unwrap();
 
         store.abort_multipart(&upload_id).unwrap();
@@ -1178,7 +1178,7 @@ mod tests {
         let upload_id = store.start_multipart(test_ns()).unwrap();
         store.abort_multipart(&upload_id).unwrap();
 
-        let result = store.upload_part(&upload_id, 1, ChunkId([0x10; 32]), 512);
+        let result = store.upload_part(&upload_id, 1, ChunkId([0x10; 32]), 512, true);
         assert!(result.is_err());
     }
 
@@ -1398,10 +1398,10 @@ mod tests {
         let upload_id = store.start_multipart(test_ns()).unwrap();
 
         store
-            .upload_part(&upload_id, 1, ChunkId([0xa0; 32]), 512)
+            .upload_part(&upload_id, 1, ChunkId([0xa0; 32]), 512, true)
             .unwrap();
         store
-            .upload_part(&upload_id, 2, ChunkId([0xa1; 32]), 512)
+            .upload_part(&upload_id, 2, ChunkId([0xa1; 32]), 512, true)
             .unwrap();
 
         let comp_id = store.finalize_multipart(&upload_id).unwrap();
@@ -1467,7 +1467,7 @@ mod tests {
         // Multipart.
         let upload_id = store.start_multipart(test_ns()).unwrap();
         store
-            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 512)
+            .upload_part(&upload_id, 1, ChunkId([0x10; 32]), 512, true)
             .unwrap();
         let mp_id = store.finalize_multipart(&upload_id).unwrap();
         assert!(store.get(mp_id).is_ok());

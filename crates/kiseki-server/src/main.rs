@@ -30,6 +30,7 @@ mod telemetry;
 #[allow(dead_code)] // Wired when metrics server integrates UI router.
 pub(crate) mod web;
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     // Heap-profile guard. When `--features dhat` AND the binary is
     // run normally, this writes `dhat-heap.json` to CWD on exit.
@@ -128,9 +129,8 @@ fn main() {
     // gateway reads it for `x-kiseki-workflow-ref` validation. Both
     // hold the same `Arc` so a `DeclareWorkflow` RPC is observable
     // to the next S3 PUT immediately (ADR-021 §3.b).
-    let shared_workflow_table = std::sync::Arc::new(std::sync::Mutex::new(
-        kiseki_advisory::WorkflowTable::new(),
-    ));
+    let shared_workflow_table =
+        std::sync::Arc::new(std::sync::Mutex::new(kiseki_advisory::WorkflowTable::new()));
 
     // Start advisory gRPC on the isolated runtime.
     // Clone TLS files ref for the advisory thread (both runtimes use

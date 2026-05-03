@@ -253,7 +253,7 @@ impl BackupManager {
                 snapshot_id = %s.snapshot_id,
                 metadata_bytes = s.metadata_bytes,
                 data_bytes = s.data_bytes,
-                elapsed_ms = s.elapsed.as_millis() as u64,
+                elapsed_ms = u64::try_from(s.elapsed.as_millis()).unwrap_or(u64::MAX),
                 "backup: create_snapshot success",
             ),
             Err(e) => tracing::warn!(error = %e, "backup: create_snapshot failed"),

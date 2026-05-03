@@ -31,6 +31,16 @@ allow = [
     "BSD-3-Clause",
     "BSL-1.0",
     "CC0-1.0",
+    # CDDL is weak-copyleft at the file level. Used here only by
+    # `inferno` (transitive of `pprof`), which is feature-gated
+    # (`kiseki-server --features pprof`, `kiseki-profile` only) and
+    # not part of the default release artifact. Distributing the
+    # CDDL'd files unmodified alongside Apache-2.0 code is permitted.
+    "CDDL-1.0",
+    # CDLA-Permissive-2.0 is for data, not code. Used by
+    # `webpki-roots` (Mozilla CA cert bundle pulled by reqwest →
+    # rustls). Permissive, no patent or copyleft obligations.
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",

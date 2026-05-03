@@ -242,7 +242,7 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
         .get("x-kiseki-workflow-ref")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
-        .map(|u| u.into_bytes());
+        .map(uuid::Uuid::into_bytes);
 
     // Regular PutObject — Content-Type is persisted on the
     // composition (ADV-PA-4: store-side metadata, not per-instance
@@ -291,10 +291,7 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
 /// etag is silently ignored to preserve back-compat with clients that
 /// send junk headers.
 fn parse_write_conditional(headers: &HeaderMap) -> Option<crate::ops::WriteConditional> {
-    if let Some(v) = headers
-        .get("if-none-match")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(v) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
         if v.trim() == "*" {
             return Some(crate::ops::WriteConditional::IfNoneMatch);
         }
@@ -1456,6 +1453,8 @@ mod tests {
             .apply_hydration_batch(HydrationBatch {
                 puts: Vec::new(),
                 removes: Vec::new(),
+                name_inserts: Vec::new(),
+                name_removes: Vec::new(),
                 new_last_applied_seq: kiseki_common::ids::SequenceNumber(0),
                 stuck_state: Some(None),
                 halted: Some(true),

@@ -71,20 +71,20 @@ pub struct InMemoryGateway {
     /// {result}` (`valid` / `invalid` / `absent`). Misses fall through
     /// to a normal write (I-WA1: header is advisory, never blocks the
     /// data path). The gateway never mutates the table — only reads.
-    workflow_table: std::sync::RwLock<Option<Arc<std::sync::Mutex<kiseki_advisory::WorkflowTable>>>>,
-    /// Per-result counter for workflow_ref header validation.
+    workflow_table:
+        std::sync::RwLock<Option<Arc<std::sync::Mutex<kiseki_advisory::WorkflowTable>>>>,
+    /// Per-result counter for `workflow_ref` header validation.
     /// Indexed `[absent, valid, invalid]` — three buckets keep us out
-    /// of a HashMap on the hot path. Reset to 0 on construction;
+    /// of a `HashMap` on the hot path. Reset to 0 on construction;
     /// scraped via `workflow_ref_writes_total(result)`.
     workflow_ref_writes: [AtomicU64; 3],
     /// Optional Prometheus counter mirror (`kiseki_gateway_workflow_
-    /// ref_writes_total{result=...}`). When set, every workflow_ref
+    /// ref_writes_total{result=...}`). When set, every `workflow_ref`
     /// validation also `.inc()`s the labeled counter so the
     /// `/metrics` endpoint scrapes the live count without polling
     /// the atomic. Tests + single-node deployments without metrics
     /// wiring leave this `None` and fall back to the atomic.
-    workflow_ref_writes_metric:
-        std::sync::RwLock<Option<Arc<prometheus::IntCounterVec>>>,
+    workflow_ref_writes_metric: std::sync::RwLock<Option<Arc<prometheus::IntCounterVec>>>,
     /// Optional Prometheus counter mirror for `kiseki_chunk_write_
     /// bytes` (cumulative bytes the gateway has written through the
     /// chunk store, including the inline + chunk + EC paths). The
@@ -205,11 +205,7 @@ impl InMemoryGateway {
             shard_map: std::sync::RwLock::new(None),
             telemetry_bus: std::sync::RwLock::new(None),
             workflow_table: std::sync::RwLock::new(None),
-            workflow_ref_writes: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
+            workflow_ref_writes: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             workflow_ref_writes_metric: std::sync::RwLock::new(None),
             chunk_write_bytes_metric: std::sync::RwLock::new(None),
             chunk_read_bytes_metric: std::sync::RwLock::new(None),
@@ -226,14 +222,11 @@ impl InMemoryGateway {
     /// runtime wires the same `Arc` into both `AdvisoryGrpc` and the
     /// gateway so a `DeclareWorkflow` RPC is observable to the next
     /// S3 PUT immediately, without an out-of-band sync window.
-    pub fn set_workflow_table(
-        &self,
-        table: Arc<std::sync::Mutex<kiseki_advisory::WorkflowTable>>,
-    ) {
+    pub fn set_workflow_table(&self, table: Arc<std::sync::Mutex<kiseki_advisory::WorkflowTable>>) {
         *self.workflow_table.write().unwrap() = Some(table);
     }
 
-    /// Snapshot the workflow_ref counters as
+    /// Snapshot the `workflow_ref` counters as
     /// `[absent, valid, invalid]`. Used by metrics/observability —
     /// the BDD harness scrapes these to assert end-to-end behavior of
     /// the header validation path.
@@ -246,7 +239,7 @@ impl InMemoryGateway {
         ]
     }
 
-    /// Attach a Prometheus counter for workflow_ref outcomes. The
+    /// Attach a Prometheus counter for `workflow_ref` outcomes. The
     /// runtime wires the registered `kiseki_gateway_workflow_ref_
     /// writes_total` counter so metrics scrapes return live values.
     pub fn set_workflow_ref_writes_metric(&self, counter: Arc<prometheus::IntCounterVec>) {
@@ -254,7 +247,7 @@ impl InMemoryGateway {
     }
 
     /// Attach Prometheus counters for chunk byte traffic. The
-    /// gateway's existing `bytes_written`/`bytes_read` AtomicU64s
+    /// gateway's existing `bytes_written`/`bytes_read` `AtomicU64s`
     /// are mirrored to these counters per-request so `/metrics`
     /// scrapes always reflect the live values.
     pub fn set_chunk_byte_metrics(
@@ -713,6 +706,7 @@ impl GatewayOps for InMemoryGateway {
         // map to `ServiceUnavailable` so the S3 gateway returns 503
         // and load balancers route around. Existing-composition
         // lookups (cache or redb hit) still serve normally.
+        #[allow(clippy::items_after_statements)]
         const COMP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
         let budget = std::env::var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS")
             .ok()
@@ -916,11 +910,7 @@ impl GatewayOps for InMemoryGateway {
             c.inc_by(returned);
         }
 
-        tracing::debug!(
-            returned_bytes = end - start,
-            eof,
-            "gateway read: success",
-        );
+        tracing::debug!(returned_bytes = end - start, eof, "gateway read: success",);
         Ok(ReadResponse {
             data: plaintext[start..end].to_vec(),
             eof,
@@ -971,7 +961,9 @@ impl GatewayOps for InMemoryGateway {
                     .clone();
                 match table_arc {
                     None => {
-                        tracing::debug!("gateway write: workflow_ref present but no table → absent");
+                        tracing::debug!(
+                            "gateway write: workflow_ref present but no table → absent"
+                        );
                         0
                     }
                     Some(table) => {
@@ -1133,19 +1125,18 @@ impl GatewayOps for InMemoryGateway {
                 ciphertext_len,
                 "gateway write: chunk path → chunks.write_chunk",
             );
-            let is_new = self
-                .chunks
-                .write_chunk(env, "default")
-                .await
-                .map_err(|e| {
-                    tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
-                    GatewayError::Upstream(e.to_string())
-                })?;
-            if !is_new {
-                tracing::debug!(?chunk_id, "gateway write: dedup hit — incrementing refcount");
-                let _ = self.chunks.increment_refcount(&chunk_id).await;
-            } else {
+            let is_new = self.chunks.write_chunk(env, "default").await.map_err(|e| {
+                tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
+                GatewayError::Upstream(e.to_string())
+            })?;
+            if is_new {
                 tracing::debug!(?chunk_id, "gateway write: new chunk landed");
+            } else {
+                tracing::debug!(
+                    ?chunk_id,
+                    "gateway write: dedup hit — incrementing refcount"
+                );
+                let _ = self.chunks.increment_refcount(&chunk_id).await;
             }
             chunk_was_new = is_new;
         }
@@ -1398,20 +1389,25 @@ impl GatewayOps for InMemoryGateway {
         upload_id: &str,
         name: Option<&str>,
     ) -> Result<kiseki_common::ids::CompositionId, GatewayError> {
-        let comp_id = self.complete_multipart_internal(upload_id, name).await.map_err(|e| {
-            tracing::warn!(error = %e, "gateway complete_multipart: failed");
-            e
-        })?;
+        let comp_id = self
+            .complete_multipart_internal(upload_id, name)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "gateway complete_multipart: failed");
+                e
+            })?;
         tracing::debug!(comp_id = %comp_id.0, "gateway complete_multipart: success");
         Ok(comp_id)
     }
 
     #[tracing::instrument(skip(self), fields(upload_id = upload_id))]
     async fn abort_multipart(&self, upload_id: &str) -> Result<(), GatewayError> {
-        self.abort_multipart_internal(upload_id).await.map_err(|e| {
-            tracing::warn!(error = %e, "gateway abort_multipart: failed");
-            e
-        })?;
+        self.abort_multipart_internal(upload_id)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "gateway abort_multipart: failed");
+                e
+            })?;
         tracing::debug!("gateway abort_multipart: success");
         Ok(())
     }
@@ -1646,15 +1642,12 @@ impl GatewayOps for InMemoryGateway {
         // are emitted. The hydrator will drop the name binding via
         // the reverse-lookup in stage_delete on every follower; we
         // also drop it locally here for the leader.
-        let comp_id = match self
+        let Some(comp_id) = self
             .lookup_object_by_name(tenant_id, namespace_id, name)
             .await?
-        {
-            Some(id) => id,
-            None => {
-                tracing::debug!(name = %name, "gateway delete_by_name: name not bound");
-                return Ok(false);
-            }
+        else {
+            tracing::debug!(name = %name, "gateway delete_by_name: name not bound");
+            return Ok(false);
         };
         self.delete(tenant_id, namespace_id, comp_id).await?;
         // The standard delete path's storage.remove drops the name
@@ -1789,6 +1782,8 @@ mod halt_mode_tests {
             .apply_hydration_batch(HydrationBatch {
                 puts: Vec::new(),
                 removes: Vec::new(),
+                name_inserts: Vec::new(),
+                name_removes: Vec::new(),
                 new_last_applied_seq: kiseki_common::ids::SequenceNumber(0),
                 stuck_state: Some(None),
                 halted: Some(true),

@@ -28,8 +28,8 @@ pub use composition::{
     decode_composition_update_payload, encode_composition_create_payload,
     encode_composition_create_payload_named, encode_composition_delete_payload,
     encode_composition_update_payload, Composition, CompositionOps, DeleteResult,
-    COMPOSITION_CREATE_PAYLOAD_LEN, COMPOSITION_DELETE_PAYLOAD_LEN,
-    COMPOSITION_UPDATE_PAYLOAD_LEN, INLINE_DATA_THRESHOLD,
+    COMPOSITION_CREATE_PAYLOAD_LEN, COMPOSITION_DELETE_PAYLOAD_LEN, COMPOSITION_UPDATE_PAYLOAD_LEN,
+    INLINE_DATA_THRESHOLD,
 };
 pub use error::CompositionError;
 pub use hydrator::CompositionHydrator;

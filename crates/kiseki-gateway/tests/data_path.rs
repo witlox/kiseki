@@ -45,6 +45,9 @@ async fn write_then_read_roundtrip() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: plaintext.to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -77,6 +80,9 @@ async fn read_with_offset_and_length() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: plaintext.to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -106,6 +112,9 @@ async fn read_past_eof_returns_empty() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: b"short".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -134,6 +143,9 @@ async fn tenant_mismatch_rejected() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: b"secret".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
         })
         .await
         .unwrap();
@@ -191,6 +203,9 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         tenant_id: tenant,
         namespace_id: ns1,
         data: b"object-in-bucket1".to_vec(),
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     })
     .await
     .unwrap();
@@ -200,6 +215,9 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         tenant_id: tenant,
         namespace_id: ns2,
         data: b"object-in-bucket2".to_vec(),
+        name: None,
+        conditional: None,
+        workflow_ref: None,
     })
     .await
     .unwrap();
@@ -232,6 +250,9 @@ mod s3_tests {
                 namespace_id: test_namespace(),
                 body: b"s3 object data".to_vec(),
                 content_type: None,
+                key: None,
+                conditional: None,
+                workflow_ref: None,
             })
             .await
             .unwrap();

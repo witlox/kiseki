@@ -57,7 +57,7 @@ pub struct WriteRequest {
     /// (a clone of the advisory subsystem's table). Per I-WA1 the
     /// header is advisory: an unknown ref or a mismatched tenant
     /// **never** blocks the write — it is simply recorded as
-    /// `invalid` in the workflow_ref counter and the write proceeds.
+    /// `invalid` in the `workflow_ref` counter and the write proceeds.
     pub workflow_ref: Option<[u8; 16]>,
 }
 
@@ -70,7 +70,7 @@ pub enum WriteConditional {
     /// none-match: *` semantics.
     IfNoneMatch,
     /// `If-Match: <etag>` — succeed only if the named composition
-    /// exists and currently maps to the given composition_id.
+    /// exists and currently maps to the given `composition_id`.
     IfMatch(CompositionId),
 }
 
@@ -131,7 +131,7 @@ pub trait GatewayOps: Send + Sync {
         Err(GatewayError::ProtocolError("delete not supported".into()))
     }
 
-    /// Resolve `(namespace_id, name)` → composition_id via the per-
+    /// Resolve `(namespace_id, name)` → `composition_id` via the per-
     /// bucket secondary index. Returns `None` if no composition is
     /// bound to that name. Used by the S3 GET/HEAD path to map URL
     /// `key` to a real composition.
@@ -343,9 +343,7 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<bool, GatewayError> {
-        (**self)
-            .delete_by_name(tenant_id, namespace_id, name)
-            .await
+        (**self).delete_by_name(tenant_id, namespace_id, name).await
     }
     async fn list_named(
         &self,

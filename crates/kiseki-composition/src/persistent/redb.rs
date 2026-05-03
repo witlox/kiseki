@@ -37,17 +37,16 @@ const COMPOSITIONS: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("co
 /// Meta: see `meta_keys` for the namespace.
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 
-/// Name index forward: 16-byte ns_id || name → 16-byte composition_id.
+/// Name index forward: 16-byte `ns_id` || name → 16-byte `composition_id`.
 /// Encoding the namespace as a fixed prefix gives us free
 /// per-namespace range scans for `name_list` (and future
 /// LIST-with-prefix). Lexicographic order on `name` is the natural S3
 /// LIST ordering.
 const NAMES: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("names");
 
-/// Name index reverse: 16-byte composition_id → 16-byte ns_id || name.
+/// Name index reverse: 16-byte `composition_id` → 16-byte `ns_id` || name.
 /// Used by Delete to drop the forward binding without scanning.
-const NAMES_REVERSE: TableDefinition<'_, &[u8], &[u8]> =
-    TableDefinition::new("names_reverse");
+const NAMES_REVERSE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("names_reverse");
 
 mod meta_keys {
     pub const SCHEMA_VERSION: &str = "schema_version";
@@ -94,8 +93,8 @@ fn encode_stuck_state(state: Option<(SequenceNumber, u32)>) -> Vec<u8> {
     }
 }
 
-/// Encode a (namespace_id, name) tuple as a flat key for the NAMES
-/// table. Layout: 16 bytes ns_id || UTF-8 name. Namespace prefix
+/// Encode a (`namespace_id`, name) tuple as a flat key for the NAMES
+/// table. Layout: 16 bytes `ns_id` || UTF-8 name. Namespace prefix
 /// gives free per-namespace range scans.
 fn name_key(ns: NamespaceId, name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + name.len());
@@ -104,7 +103,7 @@ fn name_key(ns: NamespaceId, name: &str) -> Vec<u8> {
     out
 }
 
-/// Decode a flat key from the NAMES_REVERSE value field back into
+/// Decode a flat key from the `NAMES_REVERSE` value field back into
 /// `(NamespaceId, name)`. Mirror of `name_key`.
 fn decode_name_key(bytes: &[u8]) -> Result<(NamespaceId, String), String> {
     if bytes.len() < 16 {
@@ -806,6 +805,8 @@ mod tests {
         let batch = HydrationBatch {
             puts: vec![comp.clone()],
             removes: vec![],
+            name_inserts: vec![],
+            name_removes: vec![],
             new_last_applied_seq: SequenceNumber(42),
             stuck_state: Some(Some((SequenceNumber(40), 7))),
             halted: Some(true),
@@ -827,6 +828,8 @@ mod tests {
             .apply_hydration_batch(HydrationBatch {
                 puts: vec![],
                 removes: vec![],
+                name_inserts: vec![],
+                name_removes: vec![],
                 new_last_applied_seq: SequenceNumber(10),
                 stuck_state: Some(Some((SequenceNumber(9), 1))),
                 halted: None,
@@ -852,6 +855,8 @@ mod tests {
             s.apply_hydration_batch(HydrationBatch {
                 puts: vec![],
                 removes: vec![],
+                name_inserts: vec![],
+                name_removes: vec![],
                 new_last_applied_seq: SequenceNumber(100),
                 stuck_state: Some(Some((SequenceNumber(99), 5))),
                 halted: Some(true),
@@ -940,6 +945,8 @@ mod tests {
             .apply_hydration_batch(HydrationBatch {
                 puts: vec![comp.clone()],
                 removes: vec![],
+                name_inserts: vec![],
+                name_removes: vec![],
                 new_last_applied_seq: SequenceNumber(1),
                 stuck_state: Some(None),
                 halted: None,

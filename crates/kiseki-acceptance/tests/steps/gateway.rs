@@ -1476,13 +1476,18 @@ async fn when_s3_put_with_declared_workflow_ref(w: &mut KisekiWorld) {
         .expect("Given step must set workflow_ref_uuid");
     let u = uuid::Uuid::parse_str(&uuid_str).expect("uuid parse");
     let status = s3_put_with_optional_workflow_ref(w, Some(u)).await;
-    assert!((200..300).contains(&status), "S3 PUT should succeed; got {status}");
+    assert!(
+        (200..300).contains(&status),
+        "S3 PUT should succeed; got {status}"
+    );
     w.server_mut()
         .response_state
         .insert("wf_valid_baseline".into(), baseline.to_string());
 }
 
-#[then(regex = r#"^the metric kiseki_gateway_workflow_ref_writes_total\{result="(\S+)"\} increments$"#)]
+#[then(
+    regex = r#"^the metric kiseki_gateway_workflow_ref_writes_total\{result="(\S+)"\} increments$"#
+)]
 async fn then_workflow_ref_counter_incremented(w: &mut KisekiWorld, label: String) {
     let baseline_key = format!("wf_{label}_baseline");
     let baseline: u64 = w
@@ -1541,7 +1546,10 @@ async fn then_write_succeeds_advisory(w: &mut KisekiWorld) {
 async fn when_s3_put_no_workflow_ref(w: &mut KisekiWorld) {
     let baseline = workflow_ref_counter(w, "absent").await;
     let status = s3_put_with_optional_workflow_ref(w, None).await;
-    assert!((200..300).contains(&status), "S3 PUT should succeed; got {status}");
+    assert!(
+        (200..300).contains(&status),
+        "S3 PUT should succeed; got {status}"
+    );
     w.server_mut()
         .response_state
         .insert("wf_absent_baseline".into(), baseline.to_string());
@@ -1931,7 +1939,9 @@ async fn then_no_neighbour_headroom(w: &mut KisekiWorld) {
 // FUSE→GatewayOps→wire layer without needing a kernel mount —
 // kernel-mount coverage stays in python e2e.
 
-#[when(regex = r#"^the FUSE filesystem \(backed by RemoteHttpGateway\) creates "([^"]*)" with payload "([^"]*)"$"#)]
+#[when(
+    regex = r#"^the FUSE filesystem \(backed by RemoteHttpGateway\) creates "([^"]*)" with payload "([^"]*)"$"#
+)]
 async fn when_fuse_creates(w: &mut KisekiWorld, path: String, payload: String) {
     use kiseki_client::fuse_fs::KisekiFuse;
     use kiseki_client::remote_http::RemoteHttpGateway;
@@ -1943,10 +1953,8 @@ async fn when_fuse_creates(w: &mut KisekiWorld, path: String, payload: String) {
     // records `name_index_state["fuse_ino"]` so subsequent reads
     // resolve the same inode.
     let tenant_id = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
-    let namespace_id = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_DNS,
-        b"default",
-    ));
+    let namespace_id =
+        kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
     // Move the gateway+fs onto a separate thread so the inner
     // tokio runtime KisekiFuse spawns doesn't conflict with the
     // outer cucumber runtime.
@@ -1995,10 +2003,8 @@ async fn then_fuse_unlink(w: &mut KisekiWorld, path: String) {
     use kiseki_client::remote_http::RemoteHttpGateway;
     let gateway = RemoteHttpGateway::new(&w.server().s3_base);
     let tenant_id = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
-    let namespace_id = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_DNS,
-        b"default",
-    ));
+    let namespace_id =
+        kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
     // KisekiFuse holds an in-process inode table — re-creating the
     // fs gives us a fresh table, so we re-create the file via the
     // gateway, then unlink. This loop also proves that two FUSE
@@ -2032,10 +2038,8 @@ async fn then_fuse_enoent(w: &mut KisekiWorld, path: String) {
     use kiseki_client::remote_http::RemoteHttpGateway;
     let gateway = RemoteHttpGateway::new(&w.server().s3_base);
     let tenant_id = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
-    let namespace_id = kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_DNS,
-        b"default",
-    ));
+    let namespace_id =
+        kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
     let result = tokio::task::spawn_blocking(move || {
         let fs = KisekiFuse::new(gateway, tenant_id, namespace_id);
         let name = path.trim_start_matches('/').to_owned();
@@ -2129,13 +2133,7 @@ async fn when_4kb_put_get(w: &mut KisekiWorld) {
     // GET-by-key first (uses the new name index); if that 404s on a
     // server build without per-key naming, fall back to GET-by-uuid.
     let get_url = w.server().s3_url(&key);
-    let mut get_resp = w
-        .server()
-        .http
-        .get(&get_url)
-        .send()
-        .await
-        .expect("GET");
+    let mut get_resp = w.server().http.get(&get_url).send().await.expect("GET");
     if !get_resp.status().is_success() {
         let uuid_url = w.server().s3_url(&format!("default/{etag}"));
         get_resp = w
@@ -2171,9 +2169,7 @@ async fn then_metric_incremented(w: &KisekiWorld, name: &str) {
             return;
         }
         if std::time::Instant::now() >= deadline {
-            panic!(
-                "{name} did not increment after the workload (baseline={baseline}, now={now})",
-            );
+            panic!("{name} did not increment after the workload (baseline={baseline}, now={now})",);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -2197,12 +2193,7 @@ async fn then_chunk_read_incremented(w: &mut KisekiWorld) {
 // === Scenario: S3 multipart upload binds the URL key ===
 
 #[when(regex = r#"^a client multipart-uploads "([^"]*)" to key "([^"]*)" in (\d+) parts$"#)]
-async fn when_multipart_to_key(
-    w: &mut KisekiWorld,
-    body: String,
-    key: String,
-    parts: usize,
-) {
+async fn when_multipart_to_key(w: &mut KisekiWorld, body: String, key: String, parts: usize) {
     assert!(parts > 0, "parts must be positive");
     let flat = key.replace('/', "-");
     let url = w.server().s3_url(&format!("default/{flat}"));
@@ -2215,7 +2206,11 @@ async fn when_multipart_to_key(
         .send()
         .await
         .expect("CreateMultipartUpload");
-    assert!(resp.status().is_success(), "CreateMultipartUpload: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "CreateMultipartUpload: {}",
+        resp.status()
+    );
     let json: serde_json::Value = resp.json().await.expect("upload_id JSON");
     let upload_id = json
         .get("uploadId")
@@ -2227,7 +2222,11 @@ async fn when_multipart_to_key(
     let chunk = body.len() / parts;
     let mut offset = 0usize;
     for i in 1..=parts {
-        let end = if i == parts { body.len() } else { offset + chunk };
+        let end = if i == parts {
+            body.len()
+        } else {
+            offset + chunk
+        };
         let part_body = &body[offset..end];
         let resp = w
             .server()

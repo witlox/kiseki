@@ -46,7 +46,7 @@ pub struct PutObjectRequest {
     /// path passes this through to the gateway's `name` field so the
     /// composition is bound in the namespace's secondary index. When
     /// `None`, the object is unnamed (UUID-only) — useful for tests
-    /// or programmatic callers that address by composition_id only.
+    /// or programmatic callers that address by `composition_id` only.
     pub key: Option<String>,
     /// Optional HTTP-derived conditional check applied against the
     /// existing key binding. `IfNoneMatch` corresponds to the S3
@@ -135,7 +135,7 @@ impl<G: GatewayOps> S3Gateway<G> {
         })
     }
 
-    /// S3 `ListObjectsV2` — lists objects in a bucket by composition_id.
+    /// S3 `ListObjectsV2` — lists objects in a bucket by `composition_id`.
     pub async fn list_objects(
         &self,
         tenant_id: OrgId,
@@ -157,7 +157,7 @@ impl<G: GatewayOps> S3Gateway<G> {
         self.inner.list_named(tenant_id, namespace_id, prefix).await
     }
 
-    /// Resolve a URL key to a composition_id via the per-bucket name
+    /// Resolve a URL key to a `composition_id` via the per-bucket name
     /// index. Returns `None` when no composition is bound to the key.
     pub async fn lookup_object_by_name(
         &self,
@@ -171,7 +171,7 @@ impl<G: GatewayOps> S3Gateway<G> {
     }
 
     /// Delete an object by URL key (S3 DELETE-by-key). Resolves the
-    /// name to a composition_id then routes through the standard
+    /// name to a `composition_id` then routes through the standard
     /// delete path so chunk refcounts and the Raft Delete delta are
     /// emitted normally.
     pub async fn delete_by_name(
@@ -180,7 +180,9 @@ impl<G: GatewayOps> S3Gateway<G> {
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<bool, GatewayError> {
-        self.inner.delete_by_name(tenant_id, namespace_id, name).await
+        self.inner
+            .delete_by_name(tenant_id, namespace_id, name)
+            .await
     }
 
     /// Ensure a namespace exists for a bucket.

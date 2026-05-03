@@ -1,7 +1,7 @@
 //! Standalone profiling driver for Kiseki data paths.
 //!
 //! Spawns a real `kiseki-server` (single-node), then drives a
-//! configurable concurrent workload against one of S3, NFSv3,
+//! configurable concurrent workload against one of S3, `NFSv3`,
 //! NFSv4.1, pNFS, or FUSE. Reports throughput + p50/p95/p99
 //! latency. Designed to be wrapped by `cargo flamegraph` for CPU
 //! profiles and `--features dhat` for heap profiles.
@@ -39,7 +39,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 enum Protocol {
     /// S3 HTTP gateway.
     S3,
-    /// NFSv3 (RFC 1813) over TCP — client-side library.
+    /// `NFSv3` (RFC 1813) over TCP — client-side library.
     Nfs3,
     /// NFSv4.1 (RFC 8881) — single-COMPOUND OPEN+WRITE+COMMIT for
     /// create, COMPOUND OPEN+READ for read.
@@ -47,7 +47,7 @@ enum Protocol {
     /// pNFS Flexible Files (RFC 8435) — write via NFSv4.1 to the MDS,
     /// read via the per-stripe DS endpoint advertised by LAYOUTGET.
     Pnfs,
-    /// FUSE → GatewayOps → S3 wire. Drives `KisekiFuse` against a
+    /// FUSE → `GatewayOps` → S3 wire. Drives `KisekiFuse` against a
     /// `RemoteHttpGateway` connected to the running server.
     Fuse,
 }
@@ -134,7 +134,10 @@ async fn run(args: RunArgs) -> Result<(), String> {
     let server = harness::ProfileServer::start(args.server_bin.as_deref()).await?;
     eprintln!(
         "[harness] server up; s3={} nfs={} ds={} metrics={}",
-        server.s3_base, server.nfs_addr, server.ds_addr, server.metrics_url(),
+        server.s3_base,
+        server.nfs_addr,
+        server.ds_addr,
+        server.metrics_url(),
     );
 
     // Size the NFS connection pool to match concurrency: each
@@ -145,7 +148,9 @@ async fn run(args: RunArgs) -> Result<(), String> {
     let driver: Arc<dyn protocols::Driver> =
         protocols::build(args.protocol, &server, pool_size).await?;
 
-    let warmup_keys = if !matches!(args.shape, Shape::PutHeavy) {
+    let warmup_keys = if matches!(args.shape, Shape::PutHeavy) {
+        Arc::new(Vec::new())
+    } else {
         eprintln!(
             "[warmup] pre-creating {} objects of {} bytes",
             args.warmup_objects, args.object_size,
@@ -160,8 +165,6 @@ async fn run(args: RunArgs) -> Result<(), String> {
             keys.push(key);
         }
         Arc::new(keys)
-    } else {
-        Arc::new(Vec::new())
     };
 
     eprintln!(
@@ -181,7 +184,16 @@ async fn run(args: RunArgs) -> Result<(), String> {
         let stats = stats.clone();
         let shape = args.shape;
         handles.push(tokio::spawn(async move {
-            worker(worker_id, driver, payload, warmup_keys, shape, stats, deadline).await;
+            worker(
+                worker_id,
+                driver,
+                payload,
+                warmup_keys,
+                shape,
+                stats,
+                deadline,
+            )
+            .await;
         }));
     }
     for h in handles {
@@ -190,8 +202,9 @@ async fn run(args: RunArgs) -> Result<(), String> {
 
     let elapsed = (deadline - Instant::now())
         .checked_sub(Duration::from_secs(0))
-        .map(|_| Duration::from_secs(args.duration_secs))
-        .unwrap_or(Duration::from_secs(args.duration_secs));
+        .map_or(Duration::from_secs(args.duration_secs), |_| {
+            Duration::from_secs(args.duration_secs)
+        });
     let report = stats.report(args.object_size, elapsed);
 
     println!(
@@ -242,7 +255,7 @@ async fn worker(
             }
             let n = counter.get();
             counter.set(n.wrapping_add(1));
-            let key = &warmup_keys[(n as usize) % warmup_keys.len()];
+            let key = &warmup_keys[usize::try_from(n).unwrap_or(0) % warmup_keys.len()];
             driver.get(key).await.map(|_| ())
         } else {
             driver.put(&payload).await.map(|_| ())

@@ -1,8 +1,8 @@
 //! Per-protocol workload drivers. Every driver exposes the same
 //! `put` / `get` shape so the worker loop in `main` is protocol-
 //! agnostic; the actual wire path is whatever the underlying client
-//! does (HTTP, NFSv3 RPCs, NFSv4 COMPOUNDs, pNFS LAYOUTGET → DS,
-//! FUSE → GatewayOps → S3).
+//! does (HTTP, `NFSv3` RPCs, `NFSv4` COMPOUNDs, pNFS LAYOUTGET → DS,
+//! FUSE → `GatewayOps` → S3).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use crate::harness::ProfileServer;
 use crate::Protocol;
 
 /// Opaque per-driver handle for a previously-PUT object. Most drivers
-/// just stash the composition_id; FUSE additionally tracks its own
+/// just stash the `composition_id`; FUSE additionally tracks its own
 /// inode → name mapping but the workload loop treats `Key` as opaque.
 #[derive(Clone, Debug)]
 pub struct Key {
@@ -35,6 +35,7 @@ pub trait Driver: Send + Sync {
     async fn get(&self, key: &Key) -> Result<usize, String>;
 }
 
+#[allow(clippy::unused_async)] // build is async to leave room for future driver setup that needs awaits
 pub async fn build(
     protocol: Protocol,
     server: &ProfileServer,
@@ -64,10 +65,7 @@ impl S3Driver {
         Self {
             inner: RemoteHttpGateway::new(s3_base),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_DNS,
-                b"default",
-            )),
+            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
         }
     }
 }
@@ -124,10 +122,7 @@ impl Nfs3Driver {
         Self {
             inner: Arc::new(Nfs3Client::with_pool(nfs_addr, pool_size)),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_DNS,
-                b"default",
-            )),
+            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
         }
     }
 }
@@ -184,10 +179,7 @@ impl Nfs4Driver {
         Self {
             inner: Arc::new(Nfs4Client::v41_with_pool(nfs_addr, pool_size)),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_DNS,
-                b"default",
-            )),
+            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
         }
     }
 }
@@ -266,7 +258,7 @@ struct PnfsDriver {
     /// One session per DS address. Map under a sync mutex (lookups
     /// are O(1) and brief); the per-session mutex serializes wire
     /// access. Without this cache every GET paid 2 fresh RTTs for
-    /// EXCHANGE_ID + CREATE_SESSION before the actual READ.
+    /// `EXCHANGE_ID` + `CREATE_SESSION` before the actual READ.
     ds_sessions: std::sync::Mutex<
         std::collections::HashMap<SocketAddr, Arc<tokio::sync::Mutex<PnfsSession>>>,
     >,
@@ -285,10 +277,7 @@ impl PnfsDriver {
             ds_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             layout_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_DNS,
-                b"default",
-            )),
+            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
         }
     }
 
@@ -307,7 +296,10 @@ impl PnfsDriver {
     fn ds_session(&self, addr: SocketAddr) -> Result<Arc<tokio::sync::Mutex<PnfsSession>>, String> {
         // Fast path — already cached.
         {
-            let m = self.ds_sessions.lock().map_err(|e| format!("ds map: {e}"))?;
+            let m = self
+                .ds_sessions
+                .lock()
+                .map_err(|e| format!("ds map: {e}"))?;
             if let Some(s) = m.get(&addr) {
                 return Ok(Arc::clone(s));
             }
@@ -318,17 +310,17 @@ impl PnfsDriver {
         // the loser drops their freshly-built session, which is fine.
         let sess = Self::open_session(addr, b"pnfs-profile-ds")?;
         let arc = Arc::new(tokio::sync::Mutex::new(sess));
-        let mut m = self.ds_sessions.lock().map_err(|e| format!("ds map: {e}"))?;
+        let mut m = self
+            .ds_sessions
+            .lock()
+            .map_err(|e| format!("ds map: {e}"))?;
         Ok(Arc::clone(m.entry(addr).or_insert(arc)))
     }
 
     /// LAYOUTGET against the MDS for `comp_id`, then GETDEVICEINFO
     /// per device. Returns the first (uaddr, fh) pair so the caller
     /// can connect to the DS directly.
-    async fn fetch_layout(
-        &self,
-        comp_id: CompositionId,
-    ) -> Result<(SocketAddr, Vec<u8>), String> {
+    async fn fetch_layout(&self, comp_id: CompositionId) -> Result<(SocketAddr, Vec<u8>), String> {
         let mut guard = self.mds_session.lock().await;
         if guard.is_none() {
             *guard = Some(Self::open_session(self.nfs_addr, b"pnfs-profile-mds")?);
@@ -483,7 +475,10 @@ impl Driver for PnfsDriver {
             v
         } else {
             let v = self.fetch_layout(key.composition_id).await?;
-            self.layout_cache.lock().await.insert(key.composition_id, v.clone());
+            self.layout_cache
+                .lock()
+                .await
+                .insert(key.composition_id, v.clone());
             v
         };
         // The DS GET via the Linux kernel reads u32::MAX → server
@@ -508,7 +503,7 @@ struct FuseDriver {
     /// serializes the `&mut self` POSIX ops (create/write/unlink) —
     /// this matches a real kernel-mounted FUSE which has one inode
     /// table per mount and per-inode locking. Re-creating the FS
-    /// per call would spawn a new runtime thread per op (KisekiFuse
+    /// per call would spawn a new runtime thread per op (`KisekiFuse`
     /// owns a dedicated runtime) and quickly hit thread-spawn EAGAIN
     /// at any non-trivial concurrency.
     ///
@@ -526,10 +521,7 @@ impl FuseDriver {
         let fs = kiseki_client::fuse_fs::KisekiFuse::new(
             gateway,
             OrgId(uuid::Uuid::from_u128(1)),
-            NamespaceId(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_DNS,
-                b"default",
-            )),
+            NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
         );
         Self {
             fs: tokio::sync::Mutex::new(fs),
@@ -562,9 +554,11 @@ impl Driver for FuseDriver {
             .clone()
             .ok_or_else(|| "fuse get: key missing name".to_owned())?;
         let fs = self.fs.lock().await;
-        let attr = fs.lookup(&name).map_err(|e| format!("fuse lookup errno {e}"))?;
+        let attr = fs
+            .lookup(&name)
+            .map_err(|e| format!("fuse lookup errno {e}"))?;
         let bytes = fs
-            .read(attr.ino, 0, attr.size as u32)
+            .read(attr.ino, 0, u32::try_from(attr.size).unwrap_or(u32::MAX))
             .map_err(|e| format!("fuse read errno {e}"))?;
         Ok(bytes.len())
     }
@@ -574,10 +568,7 @@ impl Driver for FuseDriver {
 // NFSv4.1 helpers shared by Pnfs driver
 // ---------------------------------------------------------------------------
 
-fn exchange_id(
-    transport: &mut RpcTransport,
-    owner: &[u8],
-) -> Result<(u64, [u8; 16]), String> {
+fn exchange_id(transport: &mut RpcTransport, owner: &[u8]) -> Result<(u64, [u8; 16]), String> {
     let mut body = XdrWriter::new();
     body.write_u32(0);
     body.write_u32(1);

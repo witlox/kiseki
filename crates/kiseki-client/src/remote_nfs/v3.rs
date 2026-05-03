@@ -41,7 +41,7 @@ pub struct Nfs3Client {
     /// `AsyncMutex<Option<RpcTransport>>` lazily connected on first
     /// use. Calls pick a slot via the `next` round-robin counter,
     /// so N concurrent operations use N different connections —
-    /// throughput scales with `pool_size`. NFSv3 is wire-stateless,
+    /// throughput scales with `pool_size`. `NFSv3` is wire-stateless,
     /// so any slot can serve any request.
     ///
     /// `tokio::sync::Mutex` (not `std::sync::Mutex`) — same reason
@@ -52,7 +52,7 @@ pub struct Nfs3Client {
     next: AtomicUsize,
     /// Root file handle — obtained from FSINFO or MOUNT protocol.
     /// Kiseki's FSINFO returns the root handle in `post_op_attr`.
-    /// Held only across cheap clones, not network IO, so std::Mutex
+    /// Held only across cheap clones, not network IO, so `std::Mutex`
     /// is fine here.
     root_fh: Mutex<Option<Vec<u8>>>,
     /// Client-side multipart upload buffers keyed by upload ID.
@@ -62,14 +62,14 @@ pub struct Nfs3Client {
 }
 
 impl Nfs3Client {
-    /// Create a NFSv3 client with a single connection (= prior
+    /// Create a `NFSv3` client with a single connection (= prior
     /// behavior). Use [`Self::with_pool`] for concurrent workloads.
     #[must_use]
     pub fn new(addr: SocketAddr) -> Self {
         Self::with_pool(addr, 1)
     }
 
-    /// Create a NFSv3 client with `pool_size` independent TCP
+    /// Create a `NFSv3` client with `pool_size` independent TCP
     /// connections. Throughput scales linearly until either the
     /// server or the wire becomes the bottleneck.
     #[must_use]
@@ -382,7 +382,11 @@ impl GatewayOps for Nfs3Client {
         Ok(format!("nfs3-part-{part_number}"))
     }
 
-    async fn complete_multipart(&self, upload_id: &str, _name: Option<&str>) -> Result<CompositionId, GatewayError> {
+    async fn complete_multipart(
+        &self,
+        upload_id: &str,
+        _name: Option<&str>,
+    ) -> Result<CompositionId, GatewayError> {
         let mut parts = self
             .multipart_buffers
             .lock()

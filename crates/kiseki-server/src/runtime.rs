@@ -691,9 +691,7 @@ pub async fn run_main(
     // this the gateway's atomic counters tick but `/metrics` shows
     // zero — and the BDD harness has nothing to assert on.
     gw.set_workflow_table(workflow_table.clone());
-    gw.set_workflow_ref_writes_metric(Arc::new(
-        metrics.gateway_workflow_ref_writes_total.clone(),
-    ));
+    gw.set_workflow_ref_writes_metric(Arc::new(metrics.gateway_workflow_ref_writes_total.clone()));
     // Mirror the gateway's atomic byte counters into the registered
     // Prometheus counters so `/metrics` scrapes show live throughput.
     // The GCP 2026-05-02 perf cluster reported these as 0 after
@@ -1203,15 +1201,12 @@ pub async fn run_advisory(
     // SIGTERM the binary hangs after a `kill <pid>` and (on
     // `--features pprof` builds) the flamegraph SVG never renders.
     let shutdown = async {
-        let mut sigterm = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("advisory: SIGINT received, draining...");
-                return;
-            }
+        let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("advisory: SIGINT received, draining...");
+            return;
         };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -1384,7 +1379,7 @@ mod tests {
 
     /// Single-node with no peers but a configured `ds_addr` MUST
     /// advertise that address. Regression: pre-fix this returned an
-    /// empty Vec, MdsLayoutManager defaulted to `127.0.0.1:2052`, and
+    /// empty Vec, `MdsLayoutManager` defaulted to `127.0.0.1:2052`, and
     /// every pNFS read failed with `Connection refused` whenever the
     /// real DS bound to a different port (e.g. ephemeral in tests).
     #[test]
@@ -1404,7 +1399,7 @@ mod tests {
     }
 
     /// No peers and no `ds_addr` → empty Vec. The caller upstack
-    /// (MdsLayoutManager) makes its own decision; we don't fabricate.
+    /// (`MdsLayoutManager`) makes its own decision; we don't fabricate.
     #[test]
     fn no_peers_no_local_addr_returns_empty() {
         let got = super::compute_storage_ds_addrs(&[], &[], None);
