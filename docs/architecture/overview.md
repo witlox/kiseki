@@ -7,28 +7,33 @@ pluggable HPC transports (CXI/Slingshot, InfiniBand, RoCEv2).
 
 ## Workspace structure
 
-The codebase is a single Rust workspace with 18 crates:
+The codebase is a single Rust workspace with 22 crates (20 production
++ 2 test-only):
 
 | Crate | Purpose |
 |---|---|
 | `kiseki-common` | Shared types, HLC, identifiers, errors |
 | `kiseki-proto` | Generated protobuf/gRPC code |
+| `kiseki-tracing` | OpenTelemetry tracing helpers (span macros, exporter glue) |
 | `kiseki-crypto` | FIPS AEAD (AES-256-GCM), envelope encryption, tenant KMS providers |
 | `kiseki-raft` | Shared Raft config, redb log store, TCP transport |
 | `kiseki-transport` | Transport abstraction: TCP+TLS, RDMA verbs, CXI/libfabric |
 | `kiseki-log` | Log context: delta ordering, shard lifecycle, Raft consensus |
 | `kiseki-block` | Raw block device I/O, bitmap allocator, superblock (ADR-029) |
 | `kiseki-chunk` | Chunk storage: placement, erasure coding, GC, device management |
-| `kiseki-composition` | Composition context: namespace, refcount, multipart |
+| `kiseki-chunk-cluster` | Cross-node chunk replication: gRPC fabric peers, EC fan-out, scrub (Phase 16) |
+| `kiseki-composition` | Composition context: namespace, refcount, multipart, persistent CompositionStore (ADR-040) |
 | `kiseki-view` | View materialization: stream processors, MVCC pins |
-| `kiseki-gateway` | Protocol gateway: NFS and S3 translation |
-| `kiseki-client` | Native client: FUSE, transport selection, client-side cache |
+| `kiseki-gateway` | Protocol gateway: NFSv3/v4.1, pNFS Flex Files (ADR-038/039), S3 |
+| `kiseki-client` | Native client: FUSE, transport selection, client-side cache, pooled NFSv3/v4 clients |
 | `kiseki-keymanager` | System key manager with Raft HA |
 | `kiseki-audit` | Append-only audit log with per-tenant shards |
 | `kiseki-advisory` | Workflow advisory: hints, telemetry, budgets (ADR-020/021) |
+| `kiseki-backup` | Snapshot + restore: FS / S3 backends, AES-GCM-sealed (ADR-016) |
 | `kiseki-control` | Control plane: tenancy, IAM, policy, federation |
 | `kiseki-server` | Storage node binary (composes all server-side crates) |
-| `kiseki-acceptance` | BDD acceptance tests (cucumber-rs) |
+| `kiseki-acceptance` | BDD acceptance tests (cucumber-rs) — test-only |
+| `kiseki-profile` | Single-node profile-driver matrix (5 protocols × 3 shapes) — test-only |
 
 ## Bounded contexts
 

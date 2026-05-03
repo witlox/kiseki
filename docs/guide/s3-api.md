@@ -20,8 +20,10 @@ Kiseki supports **AWS Signature Version 4** authentication:
 
 - **Authorization header** -- standard SigV4 signing for aws-cli, boto3,
   and other SDK clients.
-- **Presigned URLs** -- planned for a future release (not yet
-  implemented).
+- **Presigned URLs** -- inbound validation is implemented (a
+  presigned URL minted by an external service is accepted on the
+  signed-headers + expiry checks). Server-side *generation* of
+  presigned URLs is not yet exposed via an endpoint.
 
 In development mode (Docker Compose), any access key and secret key
 values are accepted.

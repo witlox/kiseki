@@ -53,18 +53,19 @@ replication, and caching transparently.
 
 ## Architecture at a Glance
 
-Kiseki is a single-language Rust system organized as 19 production
-crates in a Cargo workspace (plus a BDD-test crate, total 20):
+Kiseki is a single-language Rust system organized as 20 production
+crates in a Cargo workspace, plus 2 test-only crates (total 22):
 
 | Layer | Crates |
 |-------|--------|
 | Foundation | `kiseki-common`, `kiseki-proto`, `kiseki-crypto`, `kiseki-transport`, `kiseki-tracing` |
-| Data path | `kiseki-log`, `kiseki-block`, `kiseki-chunk`, `kiseki-composition`, `kiseki-view` |
+| Data path | `kiseki-log`, `kiseki-block`, `kiseki-chunk`, `kiseki-chunk-cluster`, `kiseki-composition`, `kiseki-view` |
 | Backup / DR | `kiseki-backup` (ADR-016: FS + S3 backends, AES-GCM-sealed snapshots) |
 | Protocol | `kiseki-gateway` (NFS + S3) |
 | Client | `kiseki-client` (FUSE, FFI, Python via PyO3) |
 | Infrastructure | `kiseki-raft`, `kiseki-keymanager`, `kiseki-audit`, `kiseki-advisory`, `kiseki-control` |
-| Integration | `kiseki-server`, `kiseki-acceptance` (test-only) |
+| Integration | `kiseki-server` |
+| Test-only | `kiseki-acceptance` (BDD/cucumber), `kiseki-profile` (perf-driver) |
 
 The data model is log-structured: mutations are recorded as **deltas**
 appended to per-shard Raft logs. **Compositions** describe how
