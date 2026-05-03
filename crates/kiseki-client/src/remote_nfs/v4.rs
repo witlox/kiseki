@@ -237,6 +237,122 @@ fn parse_compound_single_op<T>(
     Ok((result, remaining))
 }
 
+impl Nfs4Client {
+    /// Drive a real NFSv4.1 OPEN(CREATE) + WRITE×N + COMMIT + GETFH
+    /// COMPOUND against a single fresh file. Mirrors what a Linux
+    /// `mount.nfs4` client does for a `dd if=/dev/urandom of=file
+    /// bs=4K count=N`-style sequential write — every WRITE targets
+    /// the same fh that OPEN created, the COMMIT flushes the
+    /// per-fh buffer to one composition, and GETFH retrieves the
+    /// resulting fh whose first 16 bytes carry the composition id.
+    ///
+    /// Parts are written in order; later parts at higher offsets
+    /// overlay/extend earlier ones in the per-fh buffer (per
+    /// `nfs_ops.rs::buffer_write`). Returns the composition id of
+    /// the merged result.
+    pub async fn write_at_offsets(
+        &self,
+        parts: &[(u64, Vec<u8>)],
+    ) -> Result<CompositionId, GatewayError> {
+        let mut guard = self.ensure_session()?;
+        let sess = guard.as_mut().unwrap();
+
+        let filename = uuid::Uuid::new_v4().to_string();
+        let putrootfh = (op::PUTROOTFH, Vec::new());
+
+        let mut w = XdrWriter::new();
+        w.write_u32(0); // seqid
+        w.write_u32(2); // share_access = WRITE
+        w.write_u32(0); // share_deny
+        w.write_u64(sess.client_id);
+        w.write_opaque(b"kiseki-client");
+        w.write_u32(1); // OPEN4_CREATE
+        w.write_u32(0); // UNCHECKED4
+        w.write_u32(0); // fattr4 bitmap count = 0
+        w.write_opaque(&[]); // fattr4 vals
+        w.write_u32(0); // CLAIM_NULL
+        w.write_string(&filename);
+        let open = (op::OPEN, w.into_bytes());
+
+        let mut compound: Vec<(u32, Vec<u8>)> = vec![putrootfh, open];
+        for (offset, data) in parts {
+            let mut w = XdrWriter::new();
+            w.write_u32(0); // stateid seqid
+            w.write_opaque_fixed(&[0u8; 12]); // anonymous stateid
+            w.write_u64(*offset);
+            w.write_u32(2); // FILE_SYNC
+            w.write_opaque(data);
+            compound.push((op::WRITE, w.into_bytes()));
+        }
+        let mut w = XdrWriter::new();
+        w.write_u64(0); // commit offset
+        w.write_u32(0); // commit count (0 = flush all)
+        compound.push((op::COMMIT, w.into_bytes()));
+        compound.push((op::GETFH, Vec::new()));
+
+        let reply = sess.sequenced_compound(self.minor_version, &compound)?;
+        let mut r = XdrReader::new(&reply);
+
+        // PUTROOTFH
+        r.read_u32().map_err(|e| xdr_err(&e))?;
+        let st = r.read_u32().map_err(|e| xdr_err(&e))?;
+        if st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("PUTROOTFH: {st}")));
+        }
+        // OPEN
+        r.read_u32().map_err(|e| xdr_err(&e))?;
+        let st = r.read_u32().map_err(|e| xdr_err(&e))?;
+        if st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("OPEN: {st}")));
+        }
+        // stateid + change_info + rflags + attrset + delegation_type
+        r.read_u32().map_err(|e| xdr_err(&e))?;
+        r.read_opaque_fixed(12).map_err(|e| xdr_err(&e))?;
+        r.read_u32().map_err(|e| xdr_err(&e))?;
+        r.read_u64().map_err(|e| xdr_err(&e))?;
+        r.read_u64().map_err(|e| xdr_err(&e))?;
+        r.read_u32().map_err(|e| xdr_err(&e))?;
+        let bm = r.read_u32().map_err(|e| xdr_err(&e))?;
+        for _ in 0..bm {
+            r.read_u32().map_err(|e| xdr_err(&e))?;
+        }
+        r.read_u32().map_err(|e| xdr_err(&e))?; // delegation_type=NONE
+                                                // WRITEs
+        for (i, _) in parts.iter().enumerate() {
+            r.read_u32().map_err(|e| xdr_err(&e))?; // op
+            let st = r.read_u32().map_err(|e| xdr_err(&e))?;
+            if st != NFS4_OK {
+                return Err(GatewayError::ProtocolError(format!("WRITE[{i}]: {st}")));
+            }
+            r.read_u32().map_err(|e| xdr_err(&e))?; // count
+            r.read_u32().map_err(|e| xdr_err(&e))?; // committed
+            r.read_opaque_fixed(8).map_err(|e| xdr_err(&e))?; // verifier
+        }
+        // COMMIT
+        r.read_u32().map_err(|e| xdr_err(&e))?;
+        let st = r.read_u32().map_err(|e| xdr_err(&e))?;
+        if st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("COMMIT: {st}")));
+        }
+        r.read_opaque_fixed(8).map_err(|e| xdr_err(&e))?;
+        // GETFH
+        r.read_u32().map_err(|e| xdr_err(&e))?;
+        let st = r.read_u32().map_err(|e| xdr_err(&e))?;
+        if st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("GETFH: {st}")));
+        }
+        let fh = r.read_opaque().map_err(|e| xdr_err(&e))?;
+        let composition_id = if fh.len() >= 16 {
+            CompositionId(
+                uuid::Uuid::from_slice(&fh[..16]).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+            )
+        } else {
+            CompositionId(uuid::Uuid::new_v4())
+        };
+        Ok(composition_id)
+    }
+}
+
 #[async_trait::async_trait]
 impl GatewayOps for Nfs4Client {
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {

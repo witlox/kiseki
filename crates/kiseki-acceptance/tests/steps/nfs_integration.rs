@@ -88,87 +88,68 @@ async fn then_getattr_dir(w: &mut KisekiWorld) {
 
 // --- Scenario: NFSv4 sequential write then read ---
 
-// Strict regex requiring the leading `a client `. The Gherkin-style
-// `And writes "..."` step (sans `a client`) is intentionally NOT
-// matched — the second-WRITE step impl below is a stub that creates
-// a fresh composition instead of appending to the same fh, so the
-// follow-up READ would see only the FIRST write's bytes. Until
-// `nfs_ops.rs::read` merges buffered writes (or this step impl is
-// rewritten to OPEN+WRITE+WRITE+COMMIT against one fh), letting the
-// scenario reach READ surfaces a known-stub failure rather than a
-// real protocol bug. cucumber marks the unmatched `And` step as
-// skipped, which keeps the scenario from running end-to-end.
-#[when(regex = r#"^a client writes "([^"]*)" at offset (\d+) via NFSv4 WRITE$"#)]
+/// Buffer the (offset, data) parts in the World until the matching
+/// `then reading N bytes at offset 0 returns "..."` step fires the
+/// real OPEN+WRITE×N+COMMIT COMPOUND. Buffering rather than
+/// per-step-issuing the COMPOUND is necessary because each call
+/// would mint a new composition — the scenario semantically wants
+/// TWO writes against ONE file's fh, which is a single COMPOUND.
+///
+/// The Gherkin ships ASCII strings ("AAAA", "BBBB") so we encode
+/// parts as plain `offset:data` pairs joined by `;` — the chunked
+/// scenario uses `0:AAAA;4:BBBB`. No binary safe-ness concerns
+/// for this one in-memory test fixture; for binary-typed scenarios
+/// add a separate Vec field to ServerHarness.
+#[when(regex = r#"^(?:a client )?writes "([^"]*)" at offset (\d+) via NFSv4 WRITE$"#)]
 async fn when_nfs_write_at_offset(w: &mut KisekiWorld, data: String, offset: u64) {
-    use kiseki_client::remote_nfs::transport::RpcTransport;
-    use kiseki_gateway::nfs4_server::op;
-    use kiseki_gateway::nfs_xdr::XdrWriter;
-
-    // Establish session if not done
-    if w.server().response_state.get("nfs_session_id").is_none() {
-        let port = w.server().ports.nfs_tcp;
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
-
-        // Create file via write at offset 0 using GatewayOps
-        use kiseki_gateway::ops::WriteRequest;
-        let resp = nfs
-            .write(WriteRequest {
-                tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-                namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-                data: data.into_bytes(),
-            })
-            .await
-            .expect("initial NFS write");
-        w.server_mut().response_state.insert(
-            "seq_write_comp_id".into(),
-            resp.composition_id.0.to_string(),
-        );
-        return;
-    }
-
-    // Subsequent writes at offset > 0 — this is what should work but currently doesn't
-    // Use the existing session to WRITE at non-zero offset
-    let port = w.server().ports.nfs_tcp;
-    let addr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut transport = RpcTransport::connect(addr).expect("connect");
-
-    // We need to send WRITE with the file's handle at the given offset.
-    // For now, use a fresh connection + session (the server should buffer).
-    let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
-    // This will create a NEW composition — which is the bug.
-    // A real NFS server would append to the same file.
-    use kiseki_gateway::ops::WriteRequest;
-    let resp = nfs
-        .write(WriteRequest {
-            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
-            namespace_id: kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0)),
-            data: data.into_bytes(),
-        })
-        .await
-        .expect("subsequent NFS write");
-    // Store second comp_id
-    w.server_mut().response_state.insert(
-        "seq_write_comp_id_2".into(),
-        resp.composition_id.0.to_string(),
+    assert!(
+        !data.contains(';') && !data.contains(':'),
+        "step encoding can't carry ';' or ':' in data — got {data:?}",
     );
+    let parts = w
+        .server_mut()
+        .response_state
+        .entry("nfs4_seq_parts".into())
+        .or_insert_with(String::new);
+    if !parts.is_empty() {
+        parts.push(';');
+    }
+    parts.push_str(&format!("{offset}:{data}"));
 }
 
 #[then(regex = r#"^reading (\d+) bytes at offset 0 returns "([^"]*)"$"#)]
 async fn then_nfs_read_sequential(w: &mut KisekiWorld, expected_len: usize, expected: String) {
-    let comp_id_str = w
+    let parts_str = w
         .server()
         .response_state
-        .get("seq_write_comp_id")
+        .get("nfs4_seq_parts")
         .cloned()
-        .expect("need comp_id from first write");
-    let comp_id = kiseki_common::ids::CompositionId(uuid::Uuid::parse_str(&comp_id_str).unwrap());
-
+        .expect("when_nfs_write_at_offset must run first to buffer parts");
+    let parts: Vec<(u64, Vec<u8>)> = parts_str
+        .split(';')
+        .map(|item| {
+            let (off, data) = item.split_once(':').expect("part must be offset:data");
+            (
+                off.parse::<u64>().expect("offset is u64"),
+                data.as_bytes().to_vec(),
+            )
+        })
+        .collect();
     let port = w.server().ports.nfs_tcp;
-    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
 
-    use kiseki_gateway::ops::ReadRequest;
+    // Real NFSv4.1 protocol: one COMPOUND with PUTROOTFH +
+    // OPEN(CREATE) + WRITE@off1 + WRITE@off2 + COMMIT + GETFH.
+    // The COMMIT flushes both buffered writes to a single
+    // composition; GETFH returns the new fh whose first 16 bytes
+    // are the composition_id.
+    let comp_id = nfs
+        .write_at_offsets(&parts)
+        .await
+        .expect("NFSv4 write_at_offsets COMPOUND");
+
+    use kiseki_gateway::ops::{GatewayOps, ReadRequest};
     let resp = nfs
         .read(ReadRequest {
             tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(0)),
@@ -180,16 +161,20 @@ async fn then_nfs_read_sequential(w: &mut KisekiWorld, expected_len: usize, expe
         .await
         .expect("NFS read");
 
+    // Clear buffered parts so a subsequent scenario doesn't inherit
+    // them (the World is per-scenario, but be defensive).
+    w.server_mut().response_state.remove("nfs4_seq_parts");
+
     assert_eq!(
         resp.data.len(),
         expected_len,
         "expected {expected_len} bytes, got {}",
-        resp.data.len()
+        resp.data.len(),
     );
     assert_eq!(
         String::from_utf8_lossy(&resp.data),
         expected,
-        "sequential write data mismatch"
+        "sequential write data mismatch",
     );
 }
 
