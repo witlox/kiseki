@@ -1099,6 +1099,10 @@ pub async fn run_main(
     tracing::info!("control plane: in-process (ControlService on data-path gRPC)");
 
     let key_svc = KeyManagerServiceServer::new(KeyManagerGrpc::new(key_store));
+    // ADR-025 W5: pre-clone the log store handle for the admin
+    // service (`SplitShard` / `MergeShards`) before LogGrpc takes
+    // ownership.
+    let log_for_admin: Arc<dyn kiseki_log::traits::LogOps + Send + Sync> = Arc::clone(&log_store);
     let log_svc = LogServiceServer::new(LogGrpc::new(log_store));
     let admin_svc = kiseki_proto::v1::admin_service_server::AdminServiceServer::new(
         crate::admin_grpc::AdminGrpc::from_runtime(),
@@ -1163,6 +1167,9 @@ pub async fn run_main(
     // will be the producer.
     let maintenance_mode = Arc::new(kiseki_chunk_cluster::maintenance::MaintenanceMode::new());
     let evacuation_registry = Arc::new(kiseki_chunk::evacuation::EvacuationRegistry::new());
+    // ADR-025 W5 deps: pool overrides (thresholds + rebalance
+    // tracker) and the log-store handle for SplitShard/MergeShards.
+    let pool_mutations = crate::pool_overrides::PoolMutationDeps::new();
     let mut storage_admin_handler = crate::storage_admin::StorageAdminGrpc::from_runtime()
         .with_chunk_store(Arc::clone(&local_chunk_store))
         .with_cluster(cluster_member_ids, cfg.node_id)
@@ -1171,6 +1178,8 @@ pub async fn run_main(
         .with_tuning_store(tuning_store)
         .with_maintenance(Arc::clone(&maintenance_mode))
         .with_evacuations(Arc::clone(&evacuation_registry))
+        .with_pool_mutations(pool_mutations)
+        .with_log_store(log_for_admin)
         .with_metrics(Arc::clone(&storage_admin_calls_counter));
     if let Some(ref s) = scrub_scheduler_handle {
         storage_admin_handler = storage_admin_handler.with_scrub(Arc::clone(s));

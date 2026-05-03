@@ -167,6 +167,39 @@ pub trait LogOps: Send + Sync {
     /// Update a shard's split thresholds.
     fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig);
 
+    /// Split a shard at the midpoint of its key range, returning
+    /// the id of the newly created shard. Mirrors
+    /// `LogStore::split_shard` so the storage admin RPC has a
+    /// trait-level seam (ADR-025 W5 — `SplitShard`). Default impl
+    /// returns `Err(LogError::ShardNotFound)` so stores that don't
+    /// implement split signal the gap clearly.
+    fn split_shard(
+        &self,
+        shard_id: ShardId,
+        new_shard_id: ShardId,
+        node_id: NodeId,
+    ) -> Result<ShardId, LogError> {
+        let _ = (new_shard_id, node_id);
+        Err(LogError::ShardNotFound(shard_id))
+    }
+
+    /// Merge `source_shard_id` into `target_shard_id`. Returns
+    /// `Ok(())` on success. Mirrors the ADR-034 merge protocol —
+    /// `LogStore` provides the building blocks
+    /// (`update_shard_range` + `set_shard_state`) but no single
+    /// `merge_shards()` method exists today, so this trait method
+    /// stitches them together (ADR-025 W5 — `MergeShards`).
+    /// Default impl errors so stores that don't implement merge
+    /// signal the gap.
+    fn merge_shards(
+        &self,
+        target_shard_id: ShardId,
+        source_shard_id: ShardId,
+    ) -> Result<(), LogError> {
+        let _ = source_shard_id;
+        Err(LogError::ShardNotFound(target_shard_id))
+    }
+
     // --- Consumer watermarks (ADR-036, I-L4) ---
 
     /// Register a consumer at a starting position.

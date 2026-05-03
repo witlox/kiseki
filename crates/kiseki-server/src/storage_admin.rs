@@ -16,19 +16,22 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kiseki_chunk::evacuation::EvacuationRegistry;
-use kiseki_chunk::pool::DurabilityStrategy;
+use kiseki_chunk::evacuation::{EvacuationProgress, EvacuationRegistry};
+use kiseki_chunk::pool::{AffinityPool, DeviceClass, DurabilityStrategy, PoolDevice};
 use kiseki_chunk_cluster::maintenance::MaintenanceMode;
 use kiseki_chunk_cluster::repair_tracker::{
     RepairRecord, RepairState, RepairTracker, RepairTrigger,
 };
 use kiseki_chunk_cluster::scrub_scheduler::ScrubScheduler;
 use kiseki_common::ids::{ChunkId, ShardId};
+use kiseki_log::traits::LogOps;
 use kiseki_proto::v1 as pb;
 use kiseki_proto::v1::storage_admin_service_server::StorageAdminService;
 use prometheus::IntCounterVec;
 use tonic::codegen::tokio_stream::Stream;
 use tonic::{Code, Request, Response, Status};
+
+use crate::pool_overrides::{PoolMutationDeps, PoolThresholds};
 
 /// Handler for `StorageAdminService`. Holds `Arc` deps each RPC
 /// needs. Optional fields cover the W4-W7 surfaces — left `None`
@@ -72,6 +75,14 @@ pub struct StorageAdminGrpc {
     /// (which is what a single-node cluster sees today since the
     /// scrub scheduler is wired only when fabric peers exist).
     scrub: Option<Arc<ScrubScheduler>>,
+    /// Per-pool overrides + rebalance tracker (ADR-025 W5).
+    /// `None` = `SetPoolThresholds` / `RebalancePool` return
+    /// `FailedPrecondition`.
+    pool_mutations: Option<PoolMutationDeps>,
+    /// Log store handle for `SplitShard` / `MergeShards`
+    /// (ADR-025 W5). `None` = those RPCs return
+    /// `FailedPrecondition`.
+    log_store: Option<Arc<dyn LogOps + Send + Sync>>,
     /// `kiseki_storage_admin_calls_total{rpc, outcome}` counter,
     /// shared with the global Prometheus registry. `None` in unit
     /// tests — RPC handlers no-op the counter bump in that case.
@@ -110,6 +121,8 @@ impl StorageAdminGrpc {
             maintenance: None,
             evacuations: None,
             scrub: None,
+            pool_mutations: None,
+            log_store: None,
             calls_total: None,
         }
     }
@@ -184,6 +197,24 @@ impl StorageAdminGrpc {
     #[must_use]
     pub fn with_scrub(mut self, s: Arc<ScrubScheduler>) -> Self {
         self.scrub = Some(s);
+        self
+    }
+
+    /// Builder: attach the per-pool overrides + rebalance tracker
+    /// (ADR-025 W5). Required for `SetPoolThresholds` and
+    /// `RebalancePool`.
+    #[must_use]
+    pub fn with_pool_mutations(mut self, deps: PoolMutationDeps) -> Self {
+        self.pool_mutations = Some(deps);
+        self
+    }
+
+    /// Builder: attach the log store handle for shard split /
+    /// merge (ADR-025 W5). Required for `SplitShard` and
+    /// `MergeShards`.
+    #[must_use]
+    pub fn with_log_store(mut self, log: Arc<dyn LogOps + Send + Sync>) -> Self {
+        self.log_store = Some(log);
         self
     }
 
@@ -270,7 +301,13 @@ impl StorageAdminGrpc {
 
 // Map an `AffinityPool` to the wire-level `PoolInfo`. Pure / total
 // fn so the per-pool RPCs share the encoding with `ClusterStatus`.
-fn pool_to_proto(pool: &kiseki_chunk::pool::AffinityPool) -> pb::PoolInfo {
+// `overrides` (W5) merges admin-set per-pool thresholds; pass
+// `None` for callers that don't have access to the overrides
+// store (`ClusterStatus`, BDD harnesses).
+fn pool_to_proto_with_overrides(
+    pool: &kiseki_chunk::pool::AffinityPool,
+    overrides: Option<PoolThresholds>,
+) -> pb::PoolInfo {
     let (durability_kind, replication_copies, ec_data_shards, ec_parity_shards) =
         match pool.durability {
             DurabilityStrategy::Replication { copies } => {
@@ -286,6 +323,7 @@ fn pool_to_proto(pool: &kiseki_chunk::pool::AffinityPool) -> pb::PoolInfo {
                 u32::from(parity_shards),
             ),
         };
+    let o = overrides.unwrap_or_default();
     pb::PoolInfo {
         pool_name: pool.name.clone(),
         durability_kind,
@@ -295,15 +333,19 @@ fn pool_to_proto(pool: &kiseki_chunk::pool::AffinityPool) -> pb::PoolInfo {
         capacity_bytes: pool.capacity_bytes,
         used_bytes: pool.used_bytes,
         device_count: u32::try_from(pool.devices.len()).unwrap_or(u32::MAX),
-        // Thresholds aren't stored on `AffinityPool` today — ADR-024
-        // numbers come from `kiseki-server::metrics`. W5 will surface
-        // per-pool overrides when SetPoolThresholds lands; for now
-        // emit zeros so the field is wire-present but unset.
-        warning_threshold_pct: 0,
-        critical_threshold_pct: 0,
-        readonly_threshold_pct: 0,
-        target_fill_pct: 0,
+        // ADR-024 defaults when no override is set; admin override
+        // wins via the `overrides` arg.
+        warning_threshold_pct: o.warning_pct.filter(|v| *v != 0).unwrap_or(70),
+        critical_threshold_pct: o.critical_pct.filter(|v| *v != 0).unwrap_or(85),
+        readonly_threshold_pct: o.readonly_pct.filter(|v| *v != 0).unwrap_or(95),
+        target_fill_pct: o.target_fill_pct.filter(|v| *v != 0).unwrap_or(70),
     }
+}
+
+/// Back-compat wrapper for callers that don't have access to a
+/// pool-overrides store (cluster-status flat list, BDD harnesses).
+fn pool_to_proto(pool: &kiseki_chunk::pool::AffinityPool) -> pb::PoolInfo {
+    pool_to_proto_with_overrides(pool, None)
 }
 
 fn device_class_to_wire(class: kiseki_chunk::pool::DeviceClass) -> &'static str {
@@ -408,35 +450,118 @@ impl StorageAdminService for StorageAdminGrpc {
 
     async fn add_device(
         &self,
-        _req: Request<pb::AddDeviceRequest>,
+        req: Request<pb::AddDeviceRequest>,
     ) -> Result<Response<pb::AddDeviceResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.AddDevice",
-            "W5",
-            "Raft-coordinated; DeviceAdded delta on cluster control shard",
-        ))
+        self.with_obs("StorageAdminService.AddDevice", || async move {
+            let store = self.chunk_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.AddDevice: chunk_store dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.pool_name.is_empty() {
+                return Err(Status::invalid_argument("pool_name is required"));
+            }
+            if r.device_id.is_empty() {
+                return Err(Status::invalid_argument("device_id is required"));
+            }
+            let device = PoolDevice {
+                id: r.device_id,
+                online: true,
+            };
+            store
+                .add_device_to_pool(&r.pool_name, device)
+                .await
+                .map_err(|e| {
+                    if e.contains("not found") {
+                        Status::not_found(e)
+                    } else if e.contains("already") {
+                        Status::already_exists(e)
+                    } else {
+                        Status::internal(e)
+                    }
+                })?;
+            Ok(Response::new(pb::AddDeviceResponse {
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     async fn remove_device(
         &self,
-        _req: Request<pb::RemoveDeviceRequest>,
+        req: Request<pb::RemoveDeviceRequest>,
     ) -> Result<Response<pb::RemoveDeviceResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.RemoveDevice",
-            "W5",
-            "Raft-coordinated; FailedPrecondition when device has chunks",
-        ))
+        self.with_obs("StorageAdminService.RemoveDevice", || async move {
+            let store = self.chunk_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.RemoveDevice: chunk_store dep not wired",
+                )
+            })?;
+            let id = req.into_inner().device_id;
+            if id.is_empty() {
+                return Err(Status::invalid_argument("device_id is required"));
+            }
+            store.remove_device(&id).await.map_err(|e| {
+                if e.contains("not found") {
+                    Status::not_found(e)
+                } else {
+                    Status::internal(e)
+                }
+            })?;
+            Ok(Response::new(pb::RemoveDeviceResponse {
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     async fn evacuate_device(
         &self,
-        _req: Request<pb::EvacuateDeviceRequest>,
+        req: Request<pb::EvacuateDeviceRequest>,
     ) -> Result<Response<pb::EvacuateDeviceResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.EvacuateDevice",
-            "W5",
-            "Raft-coordinated; hands off to drain orchestrator (ADR-035)",
-        ))
+        self.with_obs("StorageAdminService.EvacuateDevice", || async move {
+            let store = self.chunk_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.EvacuateDevice: chunk_store dep not wired",
+                )
+            })?;
+            let registry = self.evacuations.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.EvacuateDevice: evacuation registry dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.device_id.is_empty() {
+                return Err(Status::invalid_argument("device_id is required"));
+            }
+            // Confirm the device exists before registering an
+            // evacuation entry — otherwise CancelEvacuation has
+            // a dangling id with no worker to cancel.
+            let _ = store
+                .find_device(&r.device_id)
+                .await
+                .ok_or_else(|| Status::not_found(format!("device {} not found", r.device_id)))?;
+            // Stable evac id; the drain orchestrator (ADR-035 +
+            // future Raft delta) will be the producer of the
+            // actual progress updates.
+            let evacuation_id = uuid::Uuid::new_v4().to_string();
+            // Stub progress: 16-byte device id (we synthesize
+            // since the API uses a string id; pad/truncate via
+            // a hash so cancel correlation works without coupling
+            // to a specific id format).
+            let mut dev_bytes = [0u8; 16];
+            for (i, b) in r.device_id.as_bytes().iter().take(16).enumerate() {
+                dev_bytes[i] = *b;
+            }
+            let progress = Arc::new(EvacuationProgress::new(dev_bytes, 0));
+            registry.register(evacuation_id.clone(), progress);
+            Ok(Response::new(pb::EvacuateDeviceResponse {
+                evacuation_id,
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     async fn cancel_evacuation(
@@ -454,7 +579,7 @@ impl StorageAdminService for StorageAdminGrpc {
                 return Err(Status::invalid_argument("evacuation_id is required"));
             }
             if !registry.cancel(&id) {
-                return Err(Status::not_found(format!("evacuation {id} not found",)));
+                return Err(Status::not_found(format!("evacuation {id} not found")));
             }
             // committed_at_log_index = 0 — node-local mutation;
             // W5 will replicate the cancellation via Raft if it
@@ -509,53 +634,181 @@ impl StorageAdminService for StorageAdminGrpc {
                 .into_iter()
                 .find(|p| p.name == name)
                 .ok_or_else(|| Status::not_found(format!("pool {name} not found")))?;
-            Ok(Response::new(pool_to_proto(&pool)))
+            // Merge ADR-025 W5 admin-set per-pool thresholds.
+            let overrides = self
+                .pool_mutations
+                .as_ref()
+                .and_then(|d| d.thresholds.get(&name));
+            Ok(Response::new(pool_to_proto_with_overrides(
+                &pool, overrides,
+            )))
         })
         .await
     }
 
     async fn create_pool(
         &self,
-        _req: Request<pb::CreatePoolRequest>,
+        req: Request<pb::CreatePoolRequest>,
     ) -> Result<Response<pb::CreatePoolResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.CreatePool",
-            "W5",
-            "Raft-coordinated; PoolCreated delta on cluster control shard",
-        ))
+        self.with_obs("StorageAdminService.CreatePool", || async move {
+            let store = self.chunk_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.CreatePool: chunk_store dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.pool_name.is_empty() {
+                return Err(Status::invalid_argument("pool_name is required"));
+            }
+            let device_class = parse_device_class(&r.device_class)?;
+            let durability = parse_durability(
+                &r.durability_kind,
+                r.replication_copies,
+                r.ec_data_shards,
+                r.ec_parity_shards,
+            )?;
+            let pool = AffinityPool {
+                name: r.pool_name.clone(),
+                durability,
+                device_class,
+                capacity_bytes: r.initial_capacity_bytes,
+                used_bytes: 0,
+                devices: Vec::new(),
+            };
+            store.add_pool(pool).await.map_err(|e| {
+                if e.contains("already exists") {
+                    Status::already_exists(e)
+                } else {
+                    Status::internal(e)
+                }
+            })?;
+            Ok(Response::new(pb::CreatePoolResponse {
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     async fn set_pool_durability(
         &self,
-        _req: Request<pb::SetPoolDurabilityRequest>,
+        req: Request<pb::SetPoolDurabilityRequest>,
     ) -> Result<Response<pb::SetPoolDurabilityResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.SetPoolDurability",
-            "W5",
-            "Raft-coordinated; FailedPrecondition when pool non-empty (v1)",
-        ))
+        self.with_obs("StorageAdminService.SetPoolDurability", || async move {
+            let store = self.chunk_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.SetPoolDurability: chunk_store dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.pool_name.is_empty() {
+                return Err(Status::invalid_argument("pool_name is required"));
+            }
+            let strategy = parse_durability(
+                &r.durability_kind,
+                r.replication_copies,
+                r.ec_data_shards,
+                r.ec_parity_shards,
+            )?;
+            store
+                .set_pool_durability(&r.pool_name, strategy)
+                .await
+                .map_err(|e| {
+                    if e.contains("not found") {
+                        Status::not_found(e)
+                    } else if e.contains("non-empty") {
+                        Status::failed_precondition(e)
+                    } else {
+                        Status::internal(e)
+                    }
+                })?;
+            Ok(Response::new(pb::SetPoolDurabilityResponse {
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     async fn set_pool_thresholds(
         &self,
-        _req: Request<pb::SetPoolThresholdsRequest>,
+        req: Request<pb::SetPoolThresholdsRequest>,
     ) -> Result<Response<pb::SetPoolThresholdsResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.SetPoolThresholds",
-            "W5",
-            "Raft-coordinated; PoolThresholdsChanged delta",
-        ))
+        self.with_obs("StorageAdminService.SetPoolThresholds", || async move {
+            let deps = self.pool_mutations.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.SetPoolThresholds: pool_mutations dep not wired",
+                )
+            })?;
+            let store = self.chunk_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.SetPoolThresholds: chunk_store dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.pool_name.is_empty() {
+                return Err(Status::invalid_argument("pool_name is required"));
+            }
+            // Confirm the pool exists before storing overrides —
+            // operators expect an explicit NotFound rather than
+            // silently creating a record for a missing pool.
+            if store
+                .snapshot_pools()
+                .await
+                .iter()
+                .all(|p| p.name != r.pool_name)
+            {
+                return Err(Status::not_found(format!("pool {} not found", r.pool_name)));
+            }
+            let thresholds = PoolThresholds {
+                warning_pct: Some(r.warning_threshold_pct),
+                critical_pct: Some(r.critical_threshold_pct),
+                readonly_pct: Some(r.readonly_threshold_pct),
+                target_fill_pct: Some(r.target_fill_pct),
+            };
+            deps.thresholds
+                .set(&r.pool_name, thresholds)
+                .map_err(Status::invalid_argument)?;
+            Ok(Response::new(pb::SetPoolThresholdsResponse {
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     async fn rebalance_pool(
         &self,
-        _req: Request<pb::RebalancePoolRequest>,
+        req: Request<pb::RebalancePoolRequest>,
     ) -> Result<Response<pb::RebalancePoolResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.RebalancePool",
-            "W5",
-            "Raft-coordinated; spawns long-running task; status via PoolStatus",
-        ))
+        self.with_obs("StorageAdminService.RebalancePool", || async move {
+            let deps = self.pool_mutations.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.RebalancePool: pool_mutations dep not wired",
+                )
+            })?;
+            let store = self.chunk_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.RebalancePool: chunk_store dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.pool_name.is_empty() {
+                return Err(Status::invalid_argument("pool_name is required"));
+            }
+            if store
+                .snapshot_pools()
+                .await
+                .iter()
+                .all(|p| p.name != r.pool_name)
+            {
+                return Err(Status::not_found(format!("pool {} not found", r.pool_name)));
+            }
+            // Real rebalance worker isn't implemented in this
+            // crate; the tracker hands back a stable id so
+            // operators can correlate logs and a future
+            // ListRebalances RPC has a backing store.
+            let rebalance_id = deps.rebalance.record(r.pool_name, r.throughput_mb_s);
+            Ok(Response::new(pb::RebalancePoolResponse { rebalance_id }))
+        })
+        .await
     }
 
     // --- Performance tuning ---
@@ -672,7 +925,11 @@ impl StorageAdminService for StorageAdminGrpc {
                 .into_iter()
                 .find(|p| p.name == name)
                 .ok_or_else(|| Status::not_found(format!("pool {name} not found")))?;
-            let pool_proto = pool_to_proto(&pool);
+            let overrides = self
+                .pool_mutations
+                .as_ref()
+                .and_then(|d| d.thresholds.get(&name));
+            let pool_proto = pool_to_proto_with_overrides(&pool, overrides);
             let devices = pool
                 .devices
                 .iter()
@@ -774,24 +1031,83 @@ impl StorageAdminService for StorageAdminGrpc {
 
     async fn split_shard(
         &self,
-        _req: Request<pb::SplitShardRequest>,
+        req: Request<pb::SplitShardRequest>,
     ) -> Result<Response<pb::SplitShardResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.SplitShard",
-            "W5",
-            "reuses ADR-033 split machinery; RPC just triggers it",
-        ))
+        self.with_obs("StorageAdminService.SplitShard", || async move {
+            let log = self.log_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.SplitShard: log_store dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.shard_id.is_empty() {
+                return Err(Status::invalid_argument("shard_id is required"));
+            }
+            let shard = parse_shard_id(&r.shard_id)?;
+            let new_shard = ShardId(uuid::Uuid::new_v4());
+            // Delegate to the trait. node_id 0 here is fine for
+            // single-node mode; multi-node clusters land split
+            // ownership via the cluster control shard's Raft.
+            let _returned = log
+                .split_shard(shard, new_shard, kiseki_common::ids::NodeId(0))
+                .map_err(|e| {
+                    if matches!(e, kiseki_log::error::LogError::ShardNotFound(_)) {
+                        Status::not_found(format!("shard {} not found", r.shard_id))
+                    } else {
+                        Status::internal(format!("split: {e}"))
+                    }
+                })?;
+            // Proto convention: original shard becomes "left" (the
+            // lower half of the key range after the split); new
+            // shard is "right". `LogStore::split_shard` returns the
+            // new shard id; we wire it as `right_shard_id`.
+            Ok(Response::new(pb::SplitShardResponse {
+                left_shard_id: shard.0.to_string(),
+                right_shard_id: new_shard.0.to_string(),
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     async fn merge_shards(
         &self,
-        _req: Request<pb::MergeShardsRequest>,
+        req: Request<pb::MergeShardsRequest>,
     ) -> Result<Response<pb::MergeShardsResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.MergeShards",
-            "W5",
-            "reuses ADR-034 merge; rejects cross-tenant with InvalidArgument",
-        ))
+        self.with_obs("StorageAdminService.MergeShards", || async move {
+            let log = self.log_store.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.MergeShards: log_store dep not wired",
+                )
+            })?;
+            let r = req.into_inner();
+            if r.left_shard_id.is_empty() || r.right_shard_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "left_shard_id and right_shard_id are required",
+                ));
+            }
+            let left = parse_shard_id(&r.left_shard_id)?;
+            let right = parse_shard_id(&r.right_shard_id)?;
+            if left == right {
+                return Err(Status::invalid_argument(
+                    "left and right shards must differ",
+                ));
+            }
+            // Convention: merge "right into left" → left becomes the
+            // surviving target, right is decommissioned.
+            log.merge_shards(left, right).map_err(|e| {
+                if matches!(e, kiseki_log::error::LogError::ShardNotFound(_)) {
+                    Status::not_found(format!("merge: {e}"))
+                } else {
+                    Status::internal(format!("merge: {e}"))
+                }
+            })?;
+            Ok(Response::new(pb::MergeShardsResponse {
+                merged_shard_id: left.0.to_string(),
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     async fn set_shard_maintenance(
@@ -814,9 +1130,7 @@ impl StorageAdminService for StorageAdminGrpc {
             // SplitShard makes this dynamic.
             let shard = parse_shard_id(&r.shard_id)?;
             if shard != self.bootstrap_shard {
-                return Err(Status::not_found(
-                    format!("shard {} not found", r.shard_id,),
-                ));
+                return Err(Status::not_found(format!("shard {} not found", r.shard_id)));
             }
             m.set(shard, r.enabled);
             // committed_at_log_index = 0 — node-local mutation;
@@ -1040,6 +1354,65 @@ fn parse_shard_id(s: &str) -> Result<ShardId, Status> {
     let u =
         uuid::Uuid::parse_str(s).map_err(|e| Status::invalid_argument(format!("shard_id: {e}")))?;
     Ok(ShardId(u))
+}
+
+/// Parse the `device_class` wire string into [`DeviceClass`].
+/// Mirrors `device_class_to_wire`.
+fn parse_device_class(s: &str) -> Result<DeviceClass, Status> {
+    match s.to_ascii_lowercase().as_str() {
+        "" | "nvme_ssd" | "nvme" => Ok(DeviceClass::NvmeSsd),
+        "ssd" | "sata_ssd" => Ok(DeviceClass::Ssd),
+        "hdd" => Ok(DeviceClass::Hdd),
+        "mixed" => Ok(DeviceClass::Mixed),
+        other => Err(Status::invalid_argument(format!(
+            "device_class {other} not recognized; expected one of nvme_ssd / ssd / hdd / mixed",
+        ))),
+    }
+}
+
+/// Parse a (`durability_kind`, `replication_copies`,
+/// `ec_data_shards`, `ec_parity_shards`) tuple into
+/// [`DurabilityStrategy`]. Validates per ADR-005 / ADR-025:
+/// replication copies in 2..=5; EC data shards in 2..=16; EC
+/// parity shards in 1..=8.
+fn parse_durability(
+    kind: &str,
+    replication_copies: u32,
+    ec_data_shards: u32,
+    ec_parity_shards: u32,
+) -> Result<DurabilityStrategy, Status> {
+    match kind {
+        "replication" => {
+            if !(2..=5).contains(&replication_copies) {
+                return Err(Status::invalid_argument(format!(
+                    "replication_copies = {replication_copies} out of [2, 5]",
+                )));
+            }
+            // Bounds-checked above → fits in u8.
+            Ok(DurabilityStrategy::Replication {
+                copies: u8::try_from(replication_copies).expect("validated"),
+            })
+        }
+        "erasure_coding" | "ec" => {
+            if !(2..=16).contains(&ec_data_shards) {
+                return Err(Status::invalid_argument(format!(
+                    "ec_data_shards = {ec_data_shards} out of [2, 16]",
+                )));
+            }
+            if !(1..=8).contains(&ec_parity_shards) {
+                return Err(Status::invalid_argument(format!(
+                    "ec_parity_shards = {ec_parity_shards} out of [1, 8]",
+                )));
+            }
+            Ok(DurabilityStrategy::ErasureCoding {
+                data_shards: u8::try_from(ec_data_shards).expect("validated"),
+                parity_shards: u8::try_from(ec_parity_shards).expect("validated"),
+            })
+        }
+        other => Err(Status::invalid_argument(format!(
+            "durability_kind {other} not recognized; expected `replication` or `erasure_coding`",
+        ))),
+    }
 }
 
 /// Wall-clock now in Unix-millis. Shared with `RepairTracker` —
@@ -1772,78 +2145,381 @@ mod tests {
         assert_eq!(s.0, u);
     }
 
-    // -- W5 --
+    // -- W5 (Pool / device / shard mutations) — landed --
 
-    #[tokio::test]
-    async fn add_device_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .add_device(Request::new(pb::AddDeviceRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("AddDevice", "W5", r);
+    /// Build a fixture with `chunk_store` + `evacuations` +
+    /// `pool_mutations` all wired (W5 needs all three for the
+    /// full surface). Returns the chunk store handle for tests
+    /// that want to inspect post-RPC state.
+    fn fixture_for_w5() -> (
+        StorageAdminGrpc,
+        Arc<dyn kiseki_chunk::AsyncChunkOps>,
+        Arc<EvacuationRegistry>,
+    ) {
+        let mut store = ChunkStore::new();
+        store.add_pool(AffinityPool {
+            name: "primary".into(),
+            durability: DurabilityStrategy::Replication { copies: 3 },
+            capacity_bytes: 10_000,
+            used_bytes: 0,
+            device_class: kiseki_chunk::pool::DeviceClass::NvmeSsd,
+            devices: vec![PoolDevice {
+                id: "dev-1".into(),
+                online: true,
+            }],
+        });
+        let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(SyncBridge::new(store));
+        let evacuations = Arc::new(EvacuationRegistry::new());
+        let grpc = StorageAdminGrpc::for_tests()
+            .with_chunk_store(Arc::clone(&chunk_store))
+            .with_evacuations(Arc::clone(&evacuations))
+            .with_pool_mutations(crate::pool_overrides::PoolMutationDeps::new());
+        (grpc, chunk_store, evacuations)
     }
 
     #[tokio::test]
-    async fn remove_device_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .remove_device(Request::new(pb::RemoveDeviceRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("RemoveDevice", "W5", r);
+    async fn add_device_appends_to_pool_visible_via_list_devices() {
+        let (grpc, _store, _) = fixture_for_w5();
+        grpc.add_device(Request::new(pb::AddDeviceRequest {
+            pool_name: "primary".into(),
+            device_id: "new-dev".into(),
+            capacity_bytes: 0,
+            device_class: String::new(),
+        }))
+        .await
+        .expect("ok");
+        let r = grpc
+            .list_devices(Request::new(pb::ListDevicesRequest::default()))
+            .await
+            .expect("ok");
+        let ids: Vec<String> = r
+            .into_inner()
+            .devices
+            .into_iter()
+            .map(|d| d.device_id)
+            .collect();
+        assert!(ids.iter().any(|i| i == "new-dev"));
     }
 
     #[tokio::test]
-    async fn evacuate_device_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .evacuate_device(Request::new(pb::EvacuateDeviceRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("EvacuateDevice", "W5", r);
+    async fn add_device_duplicate_returns_already_exists() {
+        let (grpc, _, _) = fixture_for_w5();
+        grpc.add_device(Request::new(pb::AddDeviceRequest {
+            pool_name: "primary".into(),
+            device_id: "dev-1".into(), // already present in fixture
+            capacity_bytes: 0,
+            device_class: String::new(),
+        }))
+        .await
+        .expect_err("should already exist");
     }
 
     #[tokio::test]
-    async fn create_pool_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .create_pool(Request::new(pb::CreatePoolRequest::default()))
+    async fn add_device_unknown_pool_returns_not_found() {
+        let (grpc, _, _) = fixture_for_w5();
+        let r = grpc
+            .add_device(Request::new(pb::AddDeviceRequest {
+                pool_name: "no-such".into(),
+                device_id: "x".into(),
+                capacity_bytes: 0,
+                device_class: String::new(),
+            }))
             .await;
-        assert_unimplemented_with_workstream("CreatePool", "W5", r);
+        assert_eq!(r.expect_err("err").code(), Code::NotFound);
     }
 
     #[tokio::test]
-    async fn set_pool_durability_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .set_pool_durability(Request::new(pb::SetPoolDurabilityRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("SetPoolDurability", "W5", r);
+    async fn remove_device_strips_from_pool() {
+        let (grpc, _, _) = fixture_for_w5();
+        grpc.remove_device(Request::new(pb::RemoveDeviceRequest {
+            device_id: "dev-1".into(),
+        }))
+        .await
+        .expect("ok");
+        let r = grpc
+            .list_devices(Request::new(pb::ListDevicesRequest::default()))
+            .await
+            .expect("ok");
+        assert!(r.into_inner().devices.is_empty());
     }
 
     #[tokio::test]
-    async fn set_pool_thresholds_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .set_pool_thresholds(Request::new(pb::SetPoolThresholdsRequest::default()))
+    async fn remove_device_unknown_returns_not_found() {
+        let (grpc, _, _) = fixture_for_w5();
+        let r = grpc
+            .remove_device(Request::new(pb::RemoveDeviceRequest {
+                device_id: "no-such".into(),
+            }))
             .await;
-        assert_unimplemented_with_workstream("SetPoolThresholds", "W5", r);
+        assert_eq!(r.expect_err("err").code(), Code::NotFound);
     }
 
     #[tokio::test]
-    async fn rebalance_pool_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .rebalance_pool(Request::new(pb::RebalancePoolRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("RebalancePool", "W5", r);
+    async fn evacuate_device_registers_in_evacuations() {
+        let (grpc, _, registry) = fixture_for_w5();
+        let r = grpc
+            .evacuate_device(Request::new(pb::EvacuateDeviceRequest {
+                device_id: "dev-1".into(),
+                throughput_mb_s: 0,
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert!(!r.evacuation_id.is_empty());
+        assert!(registry.cancel(&r.evacuation_id), "id must be registered");
     }
 
     #[tokio::test]
-    async fn split_shard_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .split_shard(Request::new(pb::SplitShardRequest::default()))
+    async fn evacuate_device_unknown_returns_not_found() {
+        let (grpc, _, _) = fixture_for_w5();
+        let r = grpc
+            .evacuate_device(Request::new(pb::EvacuateDeviceRequest {
+                device_id: "no-such".into(),
+                throughput_mb_s: 0,
+            }))
             .await;
-        assert_unimplemented_with_workstream("SplitShard", "W5", r);
+        assert_eq!(r.expect_err("err").code(), Code::NotFound);
     }
 
     #[tokio::test]
-    async fn merge_shards_unimplemented_until_w5() {
-        let r = fixture_empty()
-            .merge_shards(Request::new(pb::MergeShardsRequest::default()))
+    async fn create_pool_then_get_pool_round_trips() {
+        let (grpc, _, _) = fixture_for_w5();
+        grpc.create_pool(Request::new(pb::CreatePoolRequest {
+            pool_name: "secondary".into(),
+            device_class: "ssd".into(),
+            durability_kind: "replication".into(),
+            replication_copies: 3,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            initial_capacity_bytes: 1_000_000,
+        }))
+        .await
+        .expect("ok");
+        let r = grpc
+            .get_pool(Request::new(pb::GetPoolRequest {
+                pool_name: "secondary".into(),
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(r.replication_copies, 3);
+        assert_eq!(r.capacity_bytes, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn create_pool_duplicate_returns_already_exists() {
+        let (grpc, _, _) = fixture_for_w5();
+        let r = grpc
+            .create_pool(Request::new(pb::CreatePoolRequest {
+                pool_name: "primary".into(),
+                device_class: "nvme".into(),
+                durability_kind: "replication".into(),
+                replication_copies: 2,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                initial_capacity_bytes: 0,
+            }))
             .await;
-        assert_unimplemented_with_workstream("MergeShards", "W5", r);
+        assert_eq!(r.expect_err("err").code(), Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn create_pool_invalid_durability_returns_invalid_argument() {
+        let (grpc, _, _) = fixture_for_w5();
+        let r = grpc
+            .create_pool(Request::new(pb::CreatePoolRequest {
+                pool_name: "x".into(),
+                device_class: "nvme".into(),
+                durability_kind: "fast-and-loose".into(),
+                replication_copies: 1,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                initial_capacity_bytes: 0,
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn set_pool_durability_swaps_strategy_on_empty_pool() {
+        let (grpc, _, _) = fixture_for_w5();
+        grpc.set_pool_durability(Request::new(pb::SetPoolDurabilityRequest {
+            pool_name: "primary".into(),
+            durability_kind: "erasure_coding".into(),
+            replication_copies: 0,
+            ec_data_shards: 4,
+            ec_parity_shards: 2,
+        }))
+        .await
+        .expect("ok");
+        let r = grpc
+            .get_pool(Request::new(pb::GetPoolRequest {
+                pool_name: "primary".into(),
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(r.durability_kind, "erasure_coding");
+        assert_eq!(r.ec_data_shards, 4);
+        assert_eq!(r.ec_parity_shards, 2);
+    }
+
+    #[tokio::test]
+    async fn set_pool_thresholds_writes_through_to_get_pool() {
+        let (grpc, _, _) = fixture_for_w5();
+        grpc.set_pool_thresholds(Request::new(pb::SetPoolThresholdsRequest {
+            pool_name: "primary".into(),
+            warning_threshold_pct: 60,
+            critical_threshold_pct: 80,
+            readonly_threshold_pct: 90,
+            target_fill_pct: 75,
+        }))
+        .await
+        .expect("ok");
+        let r = grpc
+            .get_pool(Request::new(pb::GetPoolRequest {
+                pool_name: "primary".into(),
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(r.warning_threshold_pct, 60);
+        assert_eq!(r.critical_threshold_pct, 80);
+        assert_eq!(r.readonly_threshold_pct, 90);
+        assert_eq!(r.target_fill_pct, 75);
+    }
+
+    #[tokio::test]
+    async fn set_pool_thresholds_validates_ordering() {
+        let (grpc, _, _) = fixture_for_w5();
+        let r = grpc
+            .set_pool_thresholds(Request::new(pb::SetPoolThresholdsRequest {
+                pool_name: "primary".into(),
+                warning_threshold_pct: 90,
+                critical_threshold_pct: 80, // less than warning — invalid
+                readonly_threshold_pct: 95,
+                target_fill_pct: 70,
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn rebalance_pool_returns_unique_id_per_call() {
+        let (grpc, _, _) = fixture_for_w5();
+        let a = grpc
+            .rebalance_pool(Request::new(pb::RebalancePoolRequest {
+                pool_name: "primary".into(),
+                throughput_mb_s: 0,
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        let b = grpc
+            .rebalance_pool(Request::new(pb::RebalancePoolRequest {
+                pool_name: "primary".into(),
+                throughput_mb_s: 50,
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_ne!(a.rebalance_id, b.rebalance_id);
+    }
+
+    #[tokio::test]
+    async fn rebalance_pool_unknown_returns_not_found() {
+        let (grpc, _, _) = fixture_for_w5();
+        let r = grpc
+            .rebalance_pool(Request::new(pb::RebalancePoolRequest {
+                pool_name: "no-such".into(),
+                throughput_mb_s: 0,
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::NotFound);
+    }
+
+    /// Spin a `MemShardStore` and wire it into the admin handler;
+    /// `SplitShard` needs a real `LogOps` so the trait method
+    /// dispatches to `LogStore::split_shard`.
+    fn fixture_with_log() -> (StorageAdminGrpc, ShardId) {
+        use kiseki_log::{shard::ShardConfig, MemShardStore};
+        let log: Arc<dyn LogOps + Send + Sync> = Arc::new(MemShardStore::new());
+        let shard = ShardId(uuid::Uuid::from_u128(42));
+        log.create_shard(
+            shard,
+            kiseki_common::ids::OrgId(uuid::Uuid::nil()),
+            kiseki_common::ids::NodeId(0),
+            ShardConfig::default(),
+        );
+        let grpc = StorageAdminGrpc::for_tests().with_log_store(log);
+        (grpc, shard)
+    }
+
+    #[tokio::test]
+    async fn split_shard_returns_new_shard_id() {
+        let (grpc, shard) = fixture_with_log();
+        let r = grpc
+            .split_shard(Request::new(pb::SplitShardRequest {
+                shard_id: shard.0.to_string(),
+                pivot_key: String::new(),
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(r.left_shard_id, shard.0.to_string());
+        assert!(!r.right_shard_id.is_empty());
+        assert_ne!(r.left_shard_id, r.right_shard_id);
+    }
+
+    #[tokio::test]
+    async fn split_shard_unknown_returns_not_found() {
+        let (grpc, _) = fixture_with_log();
+        let r = grpc
+            .split_shard(Request::new(pb::SplitShardRequest {
+                shard_id: uuid::Uuid::from_u128(999).to_string(),
+                pivot_key: String::new(),
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn merge_shards_validates_distinct_shards() {
+        let (grpc, shard) = fixture_with_log();
+        let r = grpc
+            .merge_shards(Request::new(pb::MergeShardsRequest {
+                left_shard_id: shard.0.to_string(),
+                right_shard_id: shard.0.to_string(),
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn merge_shards_returns_left_as_merged_id() {
+        // Build a log with two shards.
+        use kiseki_log::{shard::ShardConfig, MemShardStore};
+        let log: Arc<dyn LogOps + Send + Sync> = Arc::new(MemShardStore::new());
+        let left = ShardId(uuid::Uuid::from_u128(1));
+        let right = ShardId(uuid::Uuid::from_u128(2));
+        for s in [left, right] {
+            log.create_shard(
+                s,
+                kiseki_common::ids::OrgId(uuid::Uuid::nil()),
+                kiseki_common::ids::NodeId(0),
+                ShardConfig::default(),
+            );
+        }
+        let grpc = StorageAdminGrpc::for_tests().with_log_store(log);
+        let r = grpc
+            .merge_shards(Request::new(pb::MergeShardsRequest {
+                left_shard_id: left.0.to_string(),
+                right_shard_id: right.0.to_string(),
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(r.merged_shard_id, left.0.to_string());
     }
 
     // -- W7 --
@@ -2015,15 +2691,19 @@ mod tests {
     #[tokio::test]
     async fn metrics_increment_on_unimplemented_outcome() {
         let (grpc, counter) = fixture_with_counter();
-        // Pick a still-unimplemented RPC (W5 territory) so this
-        // test continues to exercise the `unimplemented` bucket
-        // as workstreams land.
+        // Pick a still-unimplemented RPC (W7 territory — streaming
+        // RPCs land last) so this test continues to exercise the
+        // `unimplemented` bucket.
         let r = grpc
-            .add_device(Request::new(pb::AddDeviceRequest::default()))
+            .device_health(Request::new(pb::DeviceHealthRequest::default()))
             .await;
         assert!(r.is_err());
         assert_eq!(
-            counter_value(&counter, "StorageAdminService.AddDevice", "unimplemented"),
+            counter_value(
+                &counter,
+                "StorageAdminService.DeviceHealth",
+                "unimplemented"
+            ),
             1,
         );
     }
@@ -2114,6 +2794,16 @@ mod tests {
             "cancel_evacuation",
             "trigger_scrub",
             "repair_chunk",
+            // ADR-025 W5 — pool/device/shard mutations.
+            "add_device",
+            "remove_device",
+            "evacuate_device",
+            "create_pool",
+            "set_pool_durability",
+            "set_pool_thresholds",
+            "rebalance_pool",
+            "split_shard",
+            "merge_shards",
         ];
         for rpc in implemented {
             // Locate the `async fn <rpc>` line, then look ahead a

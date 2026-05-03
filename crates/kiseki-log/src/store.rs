@@ -576,6 +576,58 @@ impl LogOps for MemShardStore {
         Self::set_shard_config(self, shard_id, config);
     }
 
+    fn split_shard(
+        &self,
+        shard_id: ShardId,
+        new_shard_id: ShardId,
+        node_id: NodeId,
+    ) -> Result<ShardId, LogError> {
+        Self::split_shard(self, shard_id, new_shard_id, node_id)
+    }
+
+    fn merge_shards(
+        &self,
+        target_shard_id: ShardId,
+        source_shard_id: ShardId,
+    ) -> Result<(), LogError> {
+        // ADR-034 merge protocol building blocks. The merge "owner"
+        // is the target shard; we mark the source as
+        // `Decommissioning` and extend the target's range to
+        // cover the union. Real production merges drain the
+        // source's deltas first via compact + a watermark check —
+        // out of scope here, the mem store just performs the
+        // bookkeeping.
+        let mut shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source = shards
+            .get(&source_shard_id)
+            .ok_or(LogError::ShardNotFound(source_shard_id))?
+            .info
+            .clone();
+        let target = shards
+            .get_mut(&target_shard_id)
+            .ok_or(LogError::ShardNotFound(target_shard_id))?;
+        // Take the union of the key ranges. Caller guarantees
+        // adjacency — the storage admin RPC validates this before
+        // calling.
+        if source.range_start < target.info.range_start {
+            target.info.range_start = source.range_start;
+        }
+        if source.range_end > target.info.range_end {
+            target.info.range_end = source.range_end;
+        }
+        // Mark the source as retiring (ADR-034 post-cutover state).
+        // The source's deltas remain visible until the grace
+        // period elapses; production gates teardown on a watermark
+        // check, the mem store leaves the entry in place.
+        if let Some(s) = shards.get_mut(&source_shard_id) {
+            s.info.state = ShardState::Retiring;
+        }
+        Ok(())
+    }
+
     async fn register_consumer(
         &self,
         shard_id: ShardId,

@@ -24,6 +24,7 @@ mod integrity;
 pub(crate) mod metrics;
 #[allow(dead_code)] // Wired at startup when data-dir migration is integrated.
 pub(crate) mod migration;
+pub(crate) mod pool_overrides;
 mod runtime;
 pub(crate) mod storage_admin;
 mod system_disk;

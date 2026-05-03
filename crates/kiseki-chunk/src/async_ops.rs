@@ -152,6 +152,45 @@ pub trait AsyncChunkOps: Send + Sync {
         }
         None
     }
+
+    /// Add a brand-new pool (ADR-025 W5 — `CreatePool`). Returns
+    /// `Err` with a human-readable reason if a pool by that name
+    /// already exists; default impl rejects everything (test-only
+    /// stubs opt into the no-op behavior). `ChunkStore` /
+    /// `PersistentChunkStore` override to actually mutate.
+    async fn add_pool(&self, _pool: crate::pool::AffinityPool) -> Result<(), String> {
+        Err("add_pool not supported by this AsyncChunkOps impl".to_owned())
+    }
+
+    /// Append a device to an existing pool (ADR-025 W5 —
+    /// `AddDevice`). Returns `Err` if `pool_name` doesn't exist or
+    /// if a device with the same id is already in the pool.
+    /// Default impl returns `Err`; concrete stores override.
+    async fn add_device_to_pool(
+        &self,
+        _pool_name: &str,
+        _device: crate::pool::PoolDevice,
+    ) -> Result<(), String> {
+        Err("add_device_to_pool not supported by this AsyncChunkOps impl".to_owned())
+    }
+
+    /// Remove a device from its pool (ADR-025 W5 — `RemoveDevice`).
+    /// Returns `Err` if the device isn't found. Default impl
+    /// returns `Err`; concrete stores override.
+    async fn remove_device(&self, _device_id: &str) -> Result<(), String> {
+        Err("remove_device not supported by this AsyncChunkOps impl".to_owned())
+    }
+
+    /// Replace a pool's durability strategy (ADR-025 W5 —
+    /// `SetPoolDurability`). Returns `Err` if pool doesn't exist
+    /// or the pool isn't empty (`used_bytes > 0`).
+    async fn set_pool_durability(
+        &self,
+        _pool_name: &str,
+        _strategy: crate::pool::DurabilityStrategy,
+    ) -> Result<(), String> {
+        Err("set_pool_durability not supported by this AsyncChunkOps impl".to_owned())
+    }
 }
 
 /// Adapter that exposes any sync [`ChunkOps`] as [`AsyncChunkOps`]
@@ -374,6 +413,57 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         })
         .await
         .unwrap_or_default()
+    }
+
+    async fn add_pool(&self, pool: crate::pool::AffinityPool) -> Result<(), String> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut g = inner.blocking_lock();
+            g.add_pool_checked(pool)
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?
+    }
+
+    async fn add_device_to_pool(
+        &self,
+        pool_name: &str,
+        device: crate::pool::PoolDevice,
+    ) -> Result<(), String> {
+        let inner = Arc::clone(&self.inner);
+        let pool_name = pool_name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut g = inner.blocking_lock();
+            g.add_device(&pool_name, device)
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?
+    }
+
+    async fn remove_device(&self, device_id: &str) -> Result<(), String> {
+        let inner = Arc::clone(&self.inner);
+        let device_id = device_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut g = inner.blocking_lock();
+            g.remove_device(&device_id)
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?
+    }
+
+    async fn set_pool_durability(
+        &self,
+        pool_name: &str,
+        strategy: crate::pool::DurabilityStrategy,
+    ) -> Result<(), String> {
+        let inner = Arc::clone(&self.inner);
+        let pool_name = pool_name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut g = inner.blocking_lock();
+            g.set_pool_durability(&pool_name, strategy)
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?
     }
 }
 

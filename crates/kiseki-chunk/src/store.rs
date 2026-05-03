@@ -143,6 +143,38 @@ pub trait ChunkOps {
     fn snapshot_pools(&self) -> Vec<AffinityPool> {
         Vec::new()
     }
+
+    /// ADR-025 W5 — `CreatePool`. Returns `Err(human-readable
+    /// reason)` on duplicate name. Default returns `Err`; pool-
+    /// aware stores override.
+    fn add_pool_checked(&mut self, _pool: AffinityPool) -> Result<(), String> {
+        Err("add_pool_checked not supported by this store".to_owned())
+    }
+
+    /// ADR-025 W5 — `AddDevice`. Append `device` to the pool's
+    /// device list. `Err` if pool is missing or device id already
+    /// exists in that pool.
+    fn add_device(&mut self, _pool_name: &str, _device: PoolDevice) -> Result<(), String> {
+        Err("add_device not supported by this store".to_owned())
+    }
+
+    /// ADR-025 W5 — `RemoveDevice`. Remove the device with the
+    /// given id from whichever pool owns it. `Err` if not found.
+    fn remove_device(&mut self, _device_id: &str) -> Result<(), String> {
+        Err("remove_device not supported by this store".to_owned())
+    }
+
+    /// ADR-025 W5 — `SetPoolDurability`. Replace the pool's
+    /// durability strategy. `Err` if pool missing or
+    /// `used_bytes > 0` (durability change while data exists is
+    /// out of scope until a separate ADR lands the migration plan).
+    fn set_pool_durability(
+        &mut self,
+        _pool_name: &str,
+        _strategy: DurabilityStrategy,
+    ) -> Result<(), String> {
+        Err("set_pool_durability not supported by this store".to_owned())
+    }
 }
 
 /// In-memory chunk store.
@@ -562,6 +594,56 @@ impl ChunkOps for ChunkStore {
 
     fn snapshot_pools(&self) -> Vec<AffinityPool> {
         self.pools.values().cloned().collect()
+    }
+
+    fn add_pool_checked(&mut self, pool: AffinityPool) -> Result<(), String> {
+        if self.pools.contains_key(&pool.name) {
+            return Err(format!("pool {} already exists", pool.name));
+        }
+        self.pools.insert(pool.name.clone(), pool);
+        Ok(())
+    }
+
+    fn add_device(&mut self, pool_name: &str, device: PoolDevice) -> Result<(), String> {
+        let pool = self
+            .pools
+            .get_mut(pool_name)
+            .ok_or_else(|| format!("pool {pool_name} not found"))?;
+        if pool.devices.iter().any(|d| d.id == device.id) {
+            return Err(format!("device {} already in pool {pool_name}", device.id));
+        }
+        pool.devices.push(device);
+        Ok(())
+    }
+
+    fn remove_device(&mut self, device_id: &str) -> Result<(), String> {
+        for pool in self.pools.values_mut() {
+            if let Some(idx) = pool.devices.iter().position(|d| d.id == device_id) {
+                pool.devices.remove(idx);
+                return Ok(());
+            }
+        }
+        Err(format!("device {device_id} not found"))
+    }
+
+    fn set_pool_durability(
+        &mut self,
+        pool_name: &str,
+        strategy: DurabilityStrategy,
+    ) -> Result<(), String> {
+        let pool = self
+            .pools
+            .get_mut(pool_name)
+            .ok_or_else(|| format!("pool {pool_name} not found"))?;
+        if pool.used_bytes > 0 {
+            return Err(format!(
+                "pool {pool_name} is non-empty (used_bytes={}); durability \
+                 change while data exists requires a separate migration plan",
+                pool.used_bytes
+            ));
+        }
+        pool.durability = strategy;
+        Ok(())
     }
 }
 

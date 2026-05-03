@@ -664,6 +664,74 @@ impl ChunkOps for PersistentChunkStore {
             .cloned()
             .collect()
     }
+
+    fn add_pool_checked(&mut self, pool: crate::pool::AffinityPool) -> Result<(), String> {
+        let mut g = self
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.contains_key(&pool.name) {
+            return Err(format!("pool {} already exists", pool.name));
+        }
+        g.insert(pool.name.clone(), pool);
+        Ok(())
+    }
+
+    fn add_device(
+        &mut self,
+        pool_name: &str,
+        device: crate::pool::PoolDevice,
+    ) -> Result<(), String> {
+        let mut g = self
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pool = g
+            .get_mut(pool_name)
+            .ok_or_else(|| format!("pool {pool_name} not found"))?;
+        if pool.devices.iter().any(|d| d.id == device.id) {
+            return Err(format!("device {} already in pool {pool_name}", device.id));
+        }
+        pool.devices.push(device);
+        Ok(())
+    }
+
+    fn remove_device(&mut self, device_id: &str) -> Result<(), String> {
+        let mut g = self
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for pool in g.values_mut() {
+            if let Some(idx) = pool.devices.iter().position(|d| d.id == device_id) {
+                pool.devices.remove(idx);
+                return Ok(());
+            }
+        }
+        Err(format!("device {device_id} not found"))
+    }
+
+    fn set_pool_durability(
+        &mut self,
+        pool_name: &str,
+        strategy: crate::pool::DurabilityStrategy,
+    ) -> Result<(), String> {
+        let mut g = self
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pool = g
+            .get_mut(pool_name)
+            .ok_or_else(|| format!("pool {pool_name} not found"))?;
+        if pool.used_bytes > 0 {
+            return Err(format!(
+                "pool {pool_name} is non-empty (used_bytes={}); durability \
+                 change while data exists requires a separate migration plan",
+                pool.used_bytes
+            ));
+        }
+        pool.durability = strategy;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
