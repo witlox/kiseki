@@ -1,0 +1,338 @@
+# ADR-025 Storage Administration API — Implementation Plan
+
+**Created:** 2026-05-03
+**Owner:** implementer (diamond workflow)
+**Tracks:** `kiseki-server::admin_grpc`, `kiseki-proto::v1::storage_admin`,
+`kiseki-server::bin::kiseki_admin`, `kiseki-chunk` / `kiseki-chunk-cluster`
+mutation surfaces.
+
+## Context
+
+[ADR-025](../architecture/adr/025-storage-admin-api.md) proposes a 25-RPC
+`StorageAdminService` covering device management, pool management,
+performance tuning, observability, shard management, and repair / scrub.
+Status today is **Proposed** — the proto schema doesn't exist and only
+the snapshot RPCs from ADR-016 (`AdminService`) ship in
+`kiseki-server::admin_grpc`. The user wants ADR-025 fully closed
+(option **B** from the loop where this plan was scoped).
+
+Sibling ADRs already shipped this plan must respect:
+
+- ADR-016 — `AdminService` (snapshots) keeps its own gRPC service. New
+  storage-admin endpoints live on a separate `StorageAdminService` so
+  permissions can split.
+- ADR-024 — Device management + capacity thresholds. `AddDevice` /
+  `RemoveDevice` / `EvacuateDevice` mutate state ADR-024 already defines.
+- ADR-026 — Per-shard Raft groups. Every cluster-wide mutation
+  (AddDevice, CreatePool, SplitShard, SetTuningParams) goes through
+  Raft on the cluster control shard — never bare in-memory state.
+- ADR-029 / ADR-030 — Block allocator + small-file placement own the
+  device + pool data model.
+- ADR-033 — Initial shard topology. `SplitShard` is a non-trivial
+  operation already defined here.
+- ADR-034 — Shard merge mechanism. Surfaced as `MergeShards`
+  (extension below).
+- ADR-035 — Drain protocol. `EvacuateDevice` plumbs into the existing
+  drain orchestrator.
+- ADR-040 — Persistent metadata. New tuning-param state goes through
+  the persistent CompositionStore meta table, not a fresh redb.
+
+## Existing surfaces to build on
+
+| Where | What's there | Reuse for |
+|---|---|---|
+| `kiseki-server/src/admin.rs` | pure `cluster_status() -> ClusterStatus` returning zeros + `to_table()` | `ClusterStatus` RPC body — needs real wiring |
+| `kiseki-server/src/admin_grpc.rs` | tonic service impl pattern (3 ADR-016 RPCs) | template for `StorageAdminService` impl |
+| `kiseki-server/src/cli.rs` | `parse_admin_args` recognises `status / pool list / device list / shard list / maintenance {on,off}` | wire the parser's stub branches to actual gRPC calls |
+| `kiseki-server/src/bin/kiseki_admin.rs` | remote CLI binary (HTTP today, ~700 LOC — uses `--endpoint http://...`) | extend with `--grpc-endpoint` for the new service |
+| `specs/architecture/proto/kiseki/v1/admin.proto` | snapshot RPCs only | leave as-is; `storage_admin.proto` is a new file |
+| `kiseki-chunk/src/store.rs` | `ChunkStore::add_pool / pool / pool_mut` | back the read-only pool RPCs immediately |
+| `kiseki-chunk-cluster/src/scrub*.rs` | scrub scheduler + `OrphanScrub` + `UnderReplicationPolicy` | back `TriggerScrub` / `ListRepairs` |
+| `kiseki-chunk-cluster/src/placement.rs` | placement engine | back `RebalancePool` |
+| `kiseki-control/src/grpc.rs` | tonic Server::builder pattern + interceptor wiring | template for the Server::builder bind |
+| `kiseki-server/src/runtime.rs:1098` | data-path Server already lists existing services | adds `StorageAdminService` to the same builder |
+
+## Scope
+
+**In scope** (the full 25 RPCs from ADR-025 §"Admin API surface"):
+
+| Group | RPCs |
+|---|---|
+| Device | `ListDevices` `GetDevice` `AddDevice` `RemoveDevice` `EvacuateDevice` `CancelEvacuation` |
+| Pool | `ListPools` `GetPool` `CreatePool` `SetPoolDurability` `SetPoolThresholds` `RebalancePool` |
+| Tuning | `GetTuningParams` `SetTuningParams` |
+| Cluster obs | `ClusterStatus` `PoolStatus` `DeviceHealth` (stream) `IOStats` (stream) |
+| Shard | `ListShards` `GetShard` `SplitShard` `SetShardMaintenance` |
+| Repair | `TriggerScrub` `RepairChunk` `ListRepairs` |
+
+**Extension** (from ADR-034 sibling decisions — adding so we don't have
+to revisit later): `MergeShards`.
+
+**Out of scope** (deferred to their own ADRs):
+- Authentication / RBAC for admin RPCs — ADR-025 §"Audit + auth" lists
+  these and there's already an mTLS interceptor pattern from
+  `fabric_san_interceptor`. Reuse but don't widen.
+- Web UI surface — separate, lives in `docs/admin/dashboard`.
+
+## Non-goals
+
+1. Re-implementing snapshot RPCs — `AdminService` keeps them.
+2. Changing the existing `cluster_status` table format — `to_table()` stays.
+3. Backwards-incompatible CLI changes — every existing `kiseki-admin`
+   subcommand keeps working; new ones are additive.
+
+## Workstreams (TDD-ordered, dependency-respecting)
+
+Each workstream lands as its own commit with the failing test FIRST,
+then the implementation, then the CLI wiring.
+
+### W1 — Proto schema + service scaffolding
+
+**Failing test:** `crates/kiseki-proto/build.rs` includes
+`kiseki/v1/storage_admin.proto`; `cargo build -p kiseki-proto` regen
+produces `kiseki::v1::storage_admin_service_server::StorageAdminService`.
+Compile-time test asserts the trait exists.
+
+**Implementation:**
+- New `specs/architecture/proto/kiseki/v1/storage_admin.proto` —
+  every message + service definition from ADR-025 §"Admin API surface"
+  copy-pasted into protobuf. Include the `MergeShards` extension.
+- Register the proto in `crates/kiseki-proto/build.rs` (audit ADR's CI
+  Proto-Coverage check passes).
+- Skeleton `crates/kiseki-server/src/storage_admin.rs` — wires a
+  `StorageAdminGrpc` struct that holds `Arc` handles to:
+  `chunk_store`, `cluster_chunk_store`, `view_store`, `audit_store`,
+  `tuning_state`, `raft_handle`. Every RPC method `Status::unimplemented`.
+- Service registered on the data-path `Server::builder` in
+  `kiseki-server::runtime::run_main` next to the existing
+  `AdminServiceServer`.
+
+**Done when:** `grpcurl <node>:9000 list kiseki.v1.StorageAdminService`
+shows all 26 RPCs (25 + MergeShards). Existing snapshot RPCs still work.
+
+**Effort:** ~1 day. Pure mechanical.
+
+---
+
+### W2 — Read-only observability RPCs
+
+These don't mutate state — they project existing in-memory or
+persistent data. They land first because they're independent of W4/W5.
+
+| RPC | Source | Notes |
+|---|---|---|
+| `ClusterStatus` | aggregate from `cluster_chunk_store.cluster_nodes()` + `chunk_store.pools()` + raft membership | replaces the stub `cluster_status()`; preserve the `to_table()` consumer |
+| `PoolStatus` | `chunk_store.pool(name)` + per-pool capacity from device manager | adds `used_bytes`, `device_count`, `target_fill_pct` |
+| `ListPools` | `chunk_store.pools()` (need to add `pub fn pools()` getter) | currently only `pool / pool_mut(name)` exist |
+| `GetPool` | `chunk_store.pool(name)` | exists |
+| `ListDevices` | `chunk_store.pool(name)` → iterate `pool.devices` | flatten across all pools when no filter |
+| `GetDevice` | scan pools for matching device id | needs new `chunk_store.find_device(id)` helper |
+| `ListShards` | `cluster_chunk_store.cluster_shards()` (already used elsewhere) | maps `Vec<ShardId>` → `Vec<ShardInfo>` with leader + member counts |
+| `GetShard` | as above + raft state for the shard | per-shard leader_id, last_applied, voters |
+| `GetTuningParams` | new `TuningState` (W3 lays the foundation) | reads-only; W3 introduces the type |
+| `ListRepairs` | `scrub_scheduler.recent_reports(limit)` (need new method) | streams `ListRepairsResponse` page |
+
+**Failing test:** for each RPC, an integration test in
+`crates/kiseki-server/tests/storage_admin_readonly.rs` (new) spawns the
+server (reuse `bdd-fidelity-fix` server-spawn helper), connects via
+gRPC, and asserts the response shape matches what the populated
+in-memory state produced. Failing on stub returns from W1.
+
+**Implementation:** wire each RPC body to its source. Add the missing
+`pub fn pools()` / `find_device(id)` / `recent_reports(limit)` helpers
+to the underlying crates.
+
+**CLI wiring:** flip `cli.rs` → `parse_admin_args("status")` /
+`"pool list"` / `"device list"` / `"shard list"` from "wire to gRPC"
+stub to actually call the new RPCs via a tonic client. Update
+`bin/kiseki_admin.rs` to use the gRPC endpoint for those subcommands;
+keep the HTTP `/admin/test/*` endpoints for BDD fault injection.
+
+**Done when:** every read-only RPC + matching CLI subcommand returns
+real data on a live cluster, with the table format unchanged.
+
+**Effort:** ~1.5 days. Helpers + service-impl bodies.
+
+---
+
+### W3 — Tuning parameter state + management
+
+**Failing test:** `tests/storage_admin_tuning.rs` — `SetTuningParams`
+with `compaction_rate_mb_s = 200` then `GetTuningParams` returns 200.
+After a server restart (`KISEKI_DATA_DIR` set), `GetTuningParams`
+still returns 200.
+
+**Implementation:**
+- New `crates/kiseki-server/src/tuning.rs` — `TuningParams` struct
+  with the 8 cluster-wide + 9 per-pool parameters from ADR-025
+  §"Tuning parameters". Every field is a typed `Range<T>` enforced
+  at deserialization (return `InvalidArgument` on out-of-range).
+- Persistence — write-through to the persistent CompositionStore's
+  meta table under the `tuning_params` key (postcard-encoded). Reads
+  cache in-memory; writes go disk-first then refresh cache. Same
+  pattern as ADR-040 §D5 atomic-batch.
+- `SetTuningParams` is **Raft-coordinated**: the leader's
+  `apply_command` step seals the new params into a `TuningParamsSet`
+  delta on the cluster control shard; followers apply the same way
+  via the existing CompositionStore hydrator (the meta key, not the
+  `compositions` table — small extension to `HydrationBatch`).
+- Each tuning param needs a per-subsystem hook (e.g.
+  `compaction_rate_mb_s` → ChunkStore's compaction throttle). Wire
+  one hook per param; default-value fallback if not yet set.
+
+**Audit gates:** auditor verifies bounds-checking on every param and
+the per-subsystem hook actually applies the value (not just stores it).
+
+**Effort:** ~2 days (state model + Raft delta + 17 hooks).
+
+---
+
+### W4 — Simple mutating RPCs (single-node, no Raft)
+
+These mutate node-local state only — no cluster coordination needed.
+
+| RPC | Mechanism | Notes |
+|---|---|---|
+| `SetShardMaintenance` | atomic flag in `ClusterChunkServer` | gates writes to the shard; reads stay served |
+| `CancelEvacuation` | flips a flag on the drain orchestrator | requires the drain orchestrator to expose a cancel API (W5 adds it) |
+| `RepairChunk` | direct call into `kiseki-chunk-cluster::peer::GrpcFabricPeer::put_fragment` for missing fragments | one-shot, idempotent |
+| `TriggerScrub` | `scrub_scheduler.trigger_now()` (need new method) | returns immediately; reports lands in `ListRepairs` |
+
+**Failing test:** for each, `tests/storage_admin_simple_mutations.rs`
+asserts the side effect is observable from the corresponding read RPC
+(e.g. `SetShardMaintenance(on)` then `GetShard` shows
+`maintenance: true`).
+
+**Effort:** ~1 day.
+
+---
+
+### W5 — Raft-coordinated mutating RPCs
+
+The hard ones. Each needs a delta type, a leader-side validation,
+follower apply, audit emission, and recovery semantics.
+
+| RPC | Delta | Coordination |
+|---|---|---|
+| `AddDevice` | `DeviceAdded { pool, device }` | leader validates capacity range; followers add to local `ChunkStore::pool_mut(pool).devices`. ADR-024 / ADR-029 already define the device shape. |
+| `RemoveDevice` | `DeviceRemoved { pool, device_id }` | requires device empty-check (no chunks placed). Returns `FailedPrecondition` with chunk count if not. |
+| `EvacuateDevice` | `EvacuationStarted { pool, device_id }` | hands off to existing drain orchestrator (ADR-035). Returns immediately with `evacuation_id`. Progress polled via `GetDevice`. |
+| `CreatePool` | `PoolCreated { pool: AffinityPool }` | followers add via `add_pool`. Validates name uniqueness. |
+| `SetPoolDurability` | `PoolDurabilityChanged { pool, strategy }` | requires pool empty OR a one-time chunk migration plan. v1 rejects with `FailedPrecondition` when pool has chunks; migration is a separate ADR. |
+| `SetPoolThresholds` | `PoolThresholdsChanged { pool, warning_pct, critical_pct, readonly_pct }` | followers update; Capacity engine watches. |
+| `RebalancePool` | leader-only; spawns a long-running task | returns `rebalance_id`; status via `PoolStatus`. |
+| `SplitShard` | reuses ADR-033 split machinery | RPC just triggers it; the heavy lifting already exists. |
+| `MergeShards` | reuses ADR-034 merge | same shape as Split. |
+
+**Failing test:** for each, `tests/storage_admin_raft_mutations.rs`
+spawns a 3-node `ClusterHarness`, calls the RPC on the leader,
+asserts both the leader AND a follower see the mutation via the
+matching read RPC after raft commit.
+
+**Implementation pattern (per RPC):**
+1. Add the delta variant to the cluster control-shard delta enum
+2. Leader-side validation in the RPC handler before proposing
+3. Follower apply in the hydrator
+4. Audit event (ADR-009 / ADR-015 contract — admin-action mutations
+   are auditable)
+5. Recovery: idempotent on duplicate apply (Raft replay safe)
+
+**Effort:** ~3-4 days for the 9 RPCs at this tier. The infrastructure
+(W1-W4) does most of the wiring; this is per-RPC body work.
+
+---
+
+### W6 — kiseki-admin CLI parity + UX polish
+
+**Failing test:** `tests/cli_admin_subcommands.rs` walks every
+ADR-025 RPC via the CLI binary against a live cluster and confirms
+the response is rendered.
+
+**Implementation:**
+- New subcommands: `pool create / set-durability / set-thresholds /
+  rebalance`, `device add / remove / evacuate / cancel-evac`,
+  `shard split / merge / maintenance {on,off}`, `tuning {get,set}`,
+  `scrub trigger`, `repair {chunk,list}`.
+- Output formatting: tabular by default, `--format=json` for
+  scripting, `--watch` for the streaming RPCs (`DeviceHealth`,
+  `IOStats`).
+
+**Effort:** ~1 day.
+
+---
+
+### W7 — Streaming RPCs
+
+`DeviceHealth` and `IOStats` are server-streaming. Pattern:
+
+- Server: spin a `tokio::sync::broadcast` channel inside the relevant
+  subsystem (chunk-cluster for IOStats, chunk for DeviceHealth);
+  RPC handler subscribes and forwards into a tonic `Streaming`.
+- Client: reads frames in a loop, prints each one.
+
+**Failing test:** `tests/storage_admin_streams.rs` — start the stream,
+trigger an event (e.g. write a chunk so IOStats produces output),
+assert the client sees at least one frame within 1 s.
+
+**Effort:** ~1 day.
+
+---
+
+## Audit gates
+
+Per the diamond workflow:
+
+- **Adversary review** before W3 (tuning param Raft delta is the most
+  risky piece — get adversary sign-off on bounds/range/coordination).
+- **Auditor review** between W4 and W5 (verify the simple mutating
+  RPCs aren't smuggling cluster-state through node-local paths).
+- **Auditor review** after W5 (verify Raft delta safety + replay
+  idempotence + audit emission for each mutating RPC).
+- **Integrator** at the end (cross-cuts: CLI / docs / metrics).
+
+## Risks + open questions
+
+1. **`SetPoolDurability` on a non-empty pool** — ADR-025 says
+   "tunable", ADR-005 + ADR-024 say "static at creation". W5 picks
+   `FailedPrecondition` for v1. Architect to confirm before we ship
+   migration as a separate ADR.
+2. **`EvacuateDevice` resume** — drain orchestrator (ADR-035) doesn't
+   currently survive restart. If the leader restarts mid-evacuate,
+   the operation aborts. v1 returns the partial state via `GetDevice`;
+   user re-issues.
+3. **`MergeShards` cross-tenant** — ADR-034 only covers single-tenant
+   merges. Reject merges across tenants with `InvalidArgument`.
+4. **Streaming RPC backpressure** — slow consumer can stall the
+   subsystem if we use unbounded channels. Plan: bounded
+   `broadcast(1024)` with `BroadcastStream::new` and a `dropped`
+   counter exposed via Prometheus.
+5. **Auth / RBAC** — out of scope here per Non-goals. Today the
+   AdminService relies on the data-path TLS interceptor; same applies
+   to StorageAdminService. Production deployments should add an
+   admin-cert SAN check before exposing this.
+
+## Estimated effort summary
+
+| Workstream | Days | Cumulative |
+|---|---|---|
+| W1 — proto + scaffolding | 1.0 | 1.0 |
+| W2 — 10 read-only RPCs | 1.5 | 2.5 |
+| W3 — tuning state + 2 RPCs | 2.0 | 4.5 |
+| W4 — 4 simple mutating RPCs | 1.0 | 5.5 |
+| W5 — 9 Raft-coordinated RPCs | 3.5 | 9.0 |
+| W6 — CLI parity | 1.0 | 10.0 |
+| W7 — 2 streaming RPCs | 1.0 | 11.0 |
+
+**Total: ~11 dev-days end to end** for Accepted (fully implemented).
+
+After completion, ADR-025 status flips:
+`Proposed` → `Accepted (CompositionStore landed in commit 9e55e64;
+StorageAdminService landed across W1-W7 commits, see this plan)`
+in both `specs/architecture/adr/` and `docs/decisions/adr/`.
+
+## Tracking
+
+Each workstream lands as one or more commits referenced by header
+in this file as it's done. Tasks (TaskCreate ids) tracked in the
+session task list and crossed off when the corresponding workstream
+ships.
