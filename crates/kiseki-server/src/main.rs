@@ -27,6 +27,12 @@ pub(crate) mod migration;
 pub(crate) mod pool_overrides;
 mod runtime;
 pub(crate) mod storage_admin;
+// `storage_admin_cli` is consumed by the `kiseki-storage` binary
+// via `#[path]` (separate compilation unit), so the kiseki-server
+// binary sees its symbols only via the in-module test fns. Mark
+// dead_code so the production-only main bin's clippy stays clean.
+#[allow(dead_code)]
+pub(crate) mod storage_admin_cli;
 mod system_disk;
 mod telemetry;
 pub(crate) mod tuning;
