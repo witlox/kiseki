@@ -28,6 +28,7 @@ mod runtime;
 pub(crate) mod storage_admin;
 mod system_disk;
 mod telemetry;
+pub(crate) mod tuning;
 #[allow(dead_code)] // Wired when metrics server integrates UI router.
 pub(crate) mod web;
 

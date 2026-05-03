@@ -1106,11 +1106,55 @@ pub async fn run_main(
     // shared handle here means the admin endpoint always returns a
     // stable empty list rather than UNIMPLEMENTED while we wire those.
     let repair_tracker = Arc::new(kiseki_chunk_cluster::repair_tracker::RepairTracker::new());
+    // ADR-025 W3: cluster-wide tuning store. Persistent (redb)
+    // when KISEKI_DATA_DIR is set, in-memory otherwise. Loaded
+    // values rehydrate on boot — server defaults apply only on
+    // first install or when persistence is unavailable.
+    let tuning_store = if let Some(ref dir) = cfg.data_dir {
+        let p = Arc::new(
+            crate::tuning::RedbTuningPersistence::open(&dir.join("tuning"))
+                .map_err(|e| format!("tuning store open: {e}"))?,
+        );
+        tracing::info!(path = %dir.join("tuning").display(), "tuning store: persistent (redb)");
+        crate::tuning::TuningStore::with_persistence(p)
+    } else {
+        tracing::info!("tuning store: in-memory (no persistence)");
+        crate::tuning::TuningStore::in_memory()
+    };
+    // ADR-025 W3 live-hook: tuning-change observer. W4/W5 will add
+    // per-subsystem subscribers (compaction throttle, scrub
+    // scheduler, raft snapshot interval). For W3 we land the wiring
+    // skeleton — a single `tracing` subscriber so operators see
+    // every SetTuningParams in the audit log even before subsystem
+    // hooks are connected. This also keeps `subscribe()` exercised
+    // in production so future hooks have a known-working channel.
+    {
+        let mut rx = tuning_store.subscribe();
+        tokio::spawn(async move {
+            // Skip the initial value; only log changes.
+            let _ = rx.borrow_and_update();
+            while rx.changed().await.is_ok() {
+                let p = *rx.borrow();
+                tracing::info!(
+                    compaction_rate_mb_s = p.compaction_rate_mb_s,
+                    gc_interval_s = p.gc_interval_s,
+                    rebalance_rate_mb_s = p.rebalance_rate_mb_s,
+                    scrub_interval_h = p.scrub_interval_h,
+                    max_concurrent_repairs = p.max_concurrent_repairs,
+                    stream_proc_poll_ms = p.stream_proc_poll_ms,
+                    inline_threshold_bytes = p.inline_threshold_bytes,
+                    raft_snapshot_interval = p.raft_snapshot_interval,
+                    "tuning: SetTuningParams applied"
+                );
+            }
+        });
+    }
     let storage_admin_handler = crate::storage_admin::StorageAdminGrpc::from_runtime()
         .with_chunk_store(Arc::clone(&local_chunk_store))
         .with_cluster(cluster_member_ids, cfg.node_id)
         .with_bootstrap_shard(bootstrap_shard)
         .with_repair_tracker(Arc::clone(&repair_tracker))
+        .with_tuning_store(tuning_store)
         .with_metrics(Arc::clone(&storage_admin_calls_counter));
     let storage_admin_svc =
         kiseki_proto::v1::storage_admin_service_server::StorageAdminServiceServer::new(

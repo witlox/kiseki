@@ -175,35 +175,82 @@ helper landed cleanly, RepairTracker was straightforward).
 
 ---
 
-### W3 — Tuning parameter state + management
+### W3 — Tuning parameter state + management ✅ DONE (2026-05-03)
 
 **Failing test:** `tests/storage_admin_tuning.rs` — `SetTuningParams`
 with `compaction_rate_mb_s = 200` then `GetTuningParams` returns 200.
 After a server restart (`KISEKI_DATA_DIR` set), `GetTuningParams`
 still returns 200.
 
-**Implementation:**
-- New `crates/kiseki-server/src/tuning.rs` — `TuningParams` struct
-  with the 8 cluster-wide + 9 per-pool parameters from ADR-025
-  §"Tuning parameters". Every field is a typed `Range<T>` enforced
-  at deserialization (return `InvalidArgument` on out-of-range).
-- Persistence — write-through to the persistent CompositionStore's
-  meta table under the `tuning_params` key (postcard-encoded). Reads
-  cache in-memory; writes go disk-first then refresh cache. Same
-  pattern as ADR-040 §D5 atomic-batch.
-- `SetTuningParams` is **Raft-coordinated**: the leader's
-  `apply_command` step seals the new params into a `TuningParamsSet`
-  delta on the cluster control shard; followers apply the same way
-  via the existing CompositionStore hydrator (the meta key, not the
-  `compositions` table — small extension to `HydrationBatch`).
-- Each tuning param needs a per-subsystem hook (e.g.
-  `compaction_rate_mb_s` → ChunkStore's compaction throttle). Wire
-  one hook per param; default-value fallback if not yet set.
+**Status:** the 2 RPCs (`GetTuningParams` / `SetTuningParams`) and
+their backing state model landed; persistence rehydrates across
+restart. Raft replication and most subsystem hooks are deferred
+(see "Deferred" below).
 
-**Audit gates:** auditor verifies bounds-checking on every param and
-the per-subsystem hook actually applies the value (not just stores it).
+**Landed:**
+- `crates/kiseki-server/src/tuning.rs` — `TuningParams` (8 cluster
+  parameters from ADR-025 §"Cluster-wide tuning"), per-field bounds
+  via `validate()`, proto round-trip helpers, postcard
+  Serialize/Deserialize.
+- `TuningStore` — `tokio::sync::RwLock` snapshot + `watch::Sender`
+  for live subscribers. `set()` validates → persists → swaps →
+  broadcasts. Validation failure leaves backing state intact (no
+  partial updates possible because the snapshot is replaced
+  atomically).
+- `TuningPersistence` trait + `InMemoryTuningPersistence` (default)
+  + `RedbTuningPersistence` (own `<dir>/tuning.redb` file, single
+  postcard row keyed by `"current"`).
+- `with_persistence()` rehydrates on construction; out-of-range
+  loaded values fall back to defaults with a warning log so a
+  schema-tightening release boots cleanly across version skew.
+- `crates/kiseki-server/src/storage_admin.rs` — `with_tuning_store()`
+  builder; `get_tuning_params` / `set_tuning_params` go through
+  `with_obs` (tracing + metrics); missing dep returns
+  `FailedPrecondition` (not `Unimplemented`).
+- `crates/kiseki-server/src/runtime.rs` — wires the redb-backed
+  store under `cfg.data_dir/tuning/` when `KISEKI_DATA_DIR` is set,
+  falls back to in-memory otherwise. Spawns a `subscribe()` observer
+  task that logs every applied SetTuningParams at `tracing::info`
+  (operator audit trail; W4/W5 hooks reuse the same channel).
 
-**Effort:** ~2 days (state model + Raft delta + 17 hooks).
+**Tests landed (17 in `tuning::tests` + 7 in `storage_admin::tests`):**
+- `defaults_are_in_range`, `defaults_match_adr_025_table`
+- `proto_round_trip_preserves_all_fields`
+- `validate_rejects_under_minimum`, `_over_maximum`,
+  `_zero_for_non_zero_lower_bound_fields`,
+  `_accepts_exact_boundaries`
+- `store_get_returns_default_when_empty`,
+  `_set_then_get_round_trips`,
+  `_set_rejects_out_of_range_without_persisting`,
+  `_subscribe_receives_change_notifications`
+- `redb_persistence_round_trips_across_open`,
+  `_load_empty_returns_none`
+- `store_with_redb_persistence_rehydrates_on_restart`
+  (the failing-test from the plan)
+- `store_with_corrupted_persistence_falls_back_to_defaults`
+- 7 RPC-level tests covering happy-path round-trip, missing dep,
+  out-of-range rejection, missing `params` field, zero-init reject,
+  `every_implemented_rpc_uses_with_obs` updated to require both
+  RPCs use `with_obs`.
+
+**Deferred to W5 / future workstreams (with rationale):**
+- **Raft replication.** ADR-025 calls SetTuningParams "Raft-coordinated"
+  but the necessary delta type (TuningParamsSet) sits naturally
+  alongside the other cluster-control mutations in W5. The
+  TuningStore API is shaped to support it without churn —
+  followers will call the same `set()` from their hydrator step.
+  Today `committed_at_log_index` returns 0 (single-node
+  semantics) per the proto field's W5 note.
+- **Per-subsystem hooks** (compaction throttle, scrub interval,
+  etc.). The `subscribe()` channel + observer log lands in W3 so
+  the wire-up surface exists; each subsystem's actual hook lands
+  with that subsystem's W4/W5 work (e.g. scrub_interval_h hook
+  lands alongside W4's TriggerScrub which already wires the scrub
+  scheduler).
+
+**Effort actual:** ~0.6 days (state model + persistence + 2 RPCs +
+24 tests). The deferred Raft + hooks bundle into ~1 day of W5 work
+when those subsystems land.
 
 ---
 

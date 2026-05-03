@@ -49,6 +49,13 @@ pub struct StorageAdminGrpc {
     /// wired the scrub scheduler — in that case `ListRepairs`
     /// returns an empty list (no records yet, not "unimplemented").
     repair_tracker: Option<Arc<RepairTracker>>,
+    /// Cluster-wide tuning parameters store (ADR-025 W3). `None`
+    /// in unit tests / `from_runtime` callers that pre-date the
+    /// wiring — `GetTuningParams` / `SetTuningParams` then return
+    /// `FailedPrecondition` instead of falling through to
+    /// `Unimplemented` so the caller knows the dep is missing
+    /// rather than the RPC.
+    tuning: Option<crate::tuning::TuningStore>,
     /// `kiseki_storage_admin_calls_total{rpc, outcome}` counter,
     /// shared with the global Prometheus registry. `None` in unit
     /// tests — RPC handlers no-op the counter bump in that case.
@@ -83,6 +90,7 @@ impl StorageAdminGrpc {
             self_node_id: 0,
             bootstrap_shard: ShardId(uuid::Uuid::nil()),
             repair_tracker: None,
+            tuning: None,
             calls_total: None,
         }
     }
@@ -118,6 +126,16 @@ impl StorageAdminGrpc {
     #[must_use]
     pub fn with_repair_tracker(mut self, tracker: Arc<RepairTracker>) -> Self {
         self.repair_tracker = Some(tracker);
+        self
+    }
+
+    /// Builder: attach the cluster-wide tuning parameters store
+    /// (ADR-025 W3). Required for `GetTuningParams` /
+    /// `SetTuningParams` — without it both RPCs return
+    /// `FailedPrecondition`.
+    #[must_use]
+    pub fn with_tuning_store(mut self, tuning: crate::tuning::TuningStore) -> Self {
+        self.tuning = Some(tuning);
         self
     }
 
@@ -198,7 +216,7 @@ impl StorageAdminGrpc {
         // Cheap RFC 3339-ish — chrono would be heavier than the
         // single-line render is worth. Operators get the precision
         // they need from the underlying epoch + their timezone.
-        format!("1970-01-01T00:00:00Z+{secs}s",)
+        format!("1970-01-01T00:00:00Z+{secs}s")
     }
 }
 
@@ -482,22 +500,43 @@ impl StorageAdminService for StorageAdminGrpc {
         &self,
         _req: Request<pb::GetTuningParamsRequest>,
     ) -> Result<Response<pb::TuningParams>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.GetTuningParams",
-            "W3",
-            "reads from TuningState meta key in CompositionStore",
-        ))
+        self.with_obs("StorageAdminService.GetTuningParams", || async move {
+            let tuning = self.tuning.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.GetTuningParams: tuning store dep not wired",
+                )
+            })?;
+            Ok(Response::new(tuning.get().await.to_proto()))
+        })
+        .await
     }
 
     async fn set_tuning_params(
         &self,
-        _req: Request<pb::SetTuningParamsRequest>,
+        req: Request<pb::SetTuningParamsRequest>,
     ) -> Result<Response<pb::SetTuningParamsResponse>, Status> {
-        Err(self.unimpl(
-            "StorageAdminService.SetTuningParams",
-            "W3",
-            "Raft-coordinated; bounds-checked at deserialize",
-        ))
+        self.with_obs("StorageAdminService.SetTuningParams", || async move {
+            let tuning = self.tuning.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "StorageAdminService.SetTuningParams: tuning store dep not wired",
+                )
+            })?;
+            let pb_params = req
+                .into_inner()
+                .params
+                .ok_or_else(|| Status::invalid_argument("params is required"))?;
+            let params = crate::tuning::TuningParams::from_proto(&pb_params);
+            // `set` runs validate() first; bounds errors map to
+            // InvalidArgument naming the offending field.
+            tuning.set(params).await?;
+            // Raft replication lands in W5 — until then the
+            // committed_at_log_index is best-effort 0 (single-node
+            // local apply). Documented in ADR-025 W3 plan.
+            Ok(Response::new(pb::SetTuningParamsResponse {
+                committed_at_log_index: 0,
+            }))
+        })
+        .await
     }
 
     // --- Cluster observability ---
@@ -1231,22 +1270,114 @@ mod tests {
     // Pending workstreams — Unimplemented ledger
     // ====================================================================
 
-    // -- W3 --
+    // -- W3 (TuningParams) — landed --
 
-    #[tokio::test]
-    async fn get_tuning_params_unimplemented_until_w3() {
-        let r = fixture_empty()
-            .get_tuning_params(Request::new(pb::GetTuningParamsRequest::default()))
-            .await;
-        assert_unimplemented_with_workstream("GetTuningParams", "W3", r);
+    /// Build a fixture with a wired in-memory tuning store.
+    fn fixture_with_tuning() -> StorageAdminGrpc {
+        StorageAdminGrpc::for_tests().with_tuning_store(crate::tuning::TuningStore::in_memory())
     }
 
     #[tokio::test]
-    async fn set_tuning_params_unimplemented_until_w3() {
+    async fn get_tuning_params_returns_defaults_on_fresh_store() {
+        let r = fixture_with_tuning()
+            .get_tuning_params(Request::new(pb::GetTuningParamsRequest::default()))
+            .await
+            .expect("ok");
+        let p = r.into_inner();
+        // Spot-check 3 fields against ADR-025 defaults; the
+        // tuning module's tests assert all 8.
+        assert_eq!(p.compaction_rate_mb_s, 100);
+        assert_eq!(p.scrub_interval_h, 168);
+        assert_eq!(p.raft_snapshot_interval, 10_000);
+    }
+
+    #[tokio::test]
+    async fn get_tuning_params_without_dep_returns_failed_precondition() {
         let r = fixture_empty()
-            .set_tuning_params(Request::new(pb::SetTuningParamsRequest::default()))
+            .get_tuning_params(Request::new(pb::GetTuningParamsRequest::default()))
             .await;
-        assert_unimplemented_with_workstream("SetTuningParams", "W3", r);
+        let err = r.expect_err("must error");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn set_tuning_params_round_trips_through_get() {
+        let grpc = fixture_with_tuning();
+        let new_params = pb::TuningParams {
+            compaction_rate_mb_s: 250,
+            gc_interval_s: 600,
+            rebalance_rate_mb_s: 100,
+            scrub_interval_h: 48,
+            max_concurrent_repairs: 8,
+            stream_proc_poll_ms: 50,
+            inline_threshold_bytes: 8192,
+            raft_snapshot_interval: 25_000,
+        };
+        grpc.set_tuning_params(Request::new(pb::SetTuningParamsRequest {
+            params: Some(new_params),
+        }))
+        .await
+        .expect("ok");
+        let g = grpc
+            .get_tuning_params(Request::new(pb::GetTuningParamsRequest::default()))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(g, new_params);
+    }
+
+    #[tokio::test]
+    async fn set_tuning_params_rejects_out_of_range_with_invalid_argument() {
+        let grpc = fixture_with_tuning();
+        let bad = pb::TuningParams {
+            compaction_rate_mb_s: 5, // min 10
+            ..pb::TuningParams::default()
+        };
+        let r = grpc
+            .set_tuning_params(Request::new(pb::SetTuningParamsRequest {
+                params: Some(bad),
+            }))
+            .await;
+        let err = r.expect_err("must reject");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("compaction_rate_mb_s"));
+    }
+
+    #[tokio::test]
+    async fn set_tuning_params_without_params_returns_invalid_argument() {
+        let grpc = fixture_with_tuning();
+        let r = grpc
+            .set_tuning_params(Request::new(pb::SetTuningParamsRequest { params: None }))
+            .await;
+        let err = r.expect_err("must reject");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn set_tuning_params_without_dep_returns_failed_precondition() {
+        let r = fixture_empty()
+            .set_tuning_params(Request::new(pb::SetTuningParamsRequest {
+                params: Some(pb::TuningParams::default()),
+            }))
+            .await;
+        let err = r.expect_err("must error");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// Cardinality cross-check: every default-valued protobuf
+    /// field is treated as "out of range" (most have lower bounds
+    /// > 0). This catches the bug where a client forgets to
+    /// populate one field and gets silent zero-init behavior.
+    #[tokio::test]
+    async fn set_tuning_params_rejects_unset_proto_default() {
+        let grpc = fixture_with_tuning();
+        let r = grpc
+            .set_tuning_params(Request::new(pb::SetTuningParamsRequest {
+                params: Some(pb::TuningParams::default()),
+            }))
+            .await;
+        let err = r.expect_err("zero-init should reject");
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     // -- W4 --
@@ -1526,14 +1657,18 @@ mod tests {
     #[tokio::test]
     async fn metrics_increment_on_unimplemented_outcome() {
         let (grpc, counter) = fixture_with_counter();
+        // Pick a still-unimplemented RPC (W4) so this test
+        // continues to exercise the `unimplemented` bucket as
+        // workstreams land. When W4 lands real impls of these,
+        // swap to a W5 RPC.
         let r = grpc
-            .get_tuning_params(Request::new(pb::GetTuningParamsRequest::default()))
+            .trigger_scrub(Request::new(pb::TriggerScrubRequest::default()))
             .await;
         assert!(r.is_err());
         assert_eq!(
             counter_value(
                 &counter,
-                "StorageAdminService.GetTuningParams",
+                "StorageAdminService.TriggerScrub",
                 "unimplemented",
             ),
             1,
@@ -1618,6 +1753,9 @@ mod tests {
             "list_shards",
             "get_shard",
             "list_repairs",
+            // ADR-025 W3 — TuningParams.
+            "get_tuning_params",
+            "set_tuning_params",
         ];
         for rpc in implemented {
             // Locate the `async fn <rpc>` line, then look ahead a

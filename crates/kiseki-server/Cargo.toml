@@ -57,6 +57,8 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 prometheus = { workspace = true }
+postcard = { workspace = true }
+redb = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 thiserror = { workspace = true }
