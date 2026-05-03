@@ -8,7 +8,7 @@ use kiseki_crypto::envelope::Envelope;
 use crate::ec;
 use crate::error::ChunkError;
 use crate::placement::{self, DeviceInfo};
-use crate::pool::{AffinityPool, DurabilityStrategy};
+use crate::pool::{AffinityPool, DurabilityStrategy, PoolDevice};
 
 /// EC metadata for a stored chunk.
 #[derive(Clone, Debug)]
@@ -135,6 +135,14 @@ pub trait ChunkOps {
     fn list_fragments(&self, _chunk_id: &ChunkId) -> Vec<u32> {
         Vec::new()
     }
+
+    /// Snapshot every affinity pool with its current device list.
+    /// Drives the storage-admin RPCs (ADR-025 W2). Default impl is
+    /// empty — pool-aware stores (`ChunkStore`, `PersistentChunkStore`)
+    /// override.
+    fn snapshot_pools(&self) -> Vec<AffinityPool> {
+        Vec::new()
+    }
 }
 
 /// In-memory chunk store.
@@ -205,6 +213,26 @@ impl ChunkStore {
     #[must_use]
     pub fn pool(&self, name: &str) -> Option<&AffinityPool> {
         self.pools.get(name)
+    }
+
+    /// Iterate over all pools. Order is unspecified (`HashMap`).
+    /// Used by the storage-admin RPCs (`ListPools`, `ClusterStatus`).
+    pub fn pools(&self) -> impl Iterator<Item = &AffinityPool> {
+        self.pools.values()
+    }
+
+    /// Find a device by id. Returns the owning pool's name + the
+    /// device, since `PoolDevice::id` is only unique within a pool
+    /// in principle but the storage-admin RPC takes a flat id.
+    /// Linear scan — pool count is small (typically <10).
+    #[must_use]
+    pub fn find_device(&self, device_id: &str) -> Option<(&str, &PoolDevice)> {
+        self.pools.values().find_map(|pool| {
+            pool.devices
+                .iter()
+                .find(|d| d.id == device_id)
+                .map(|d| (pool.name.as_str(), d))
+        })
     }
 
     /// Read a chunk with EC-aware degraded read.
@@ -530,6 +558,10 @@ impl ChunkOps for ChunkStore {
             .filter(|(cid, _)| *cid == target)
             .map(|(_, idx)| *idx)
             .collect()
+    }
+
+    fn snapshot_pools(&self) -> Vec<AffinityPool> {
+        self.pools.values().cloned().collect()
     }
 }
 

@@ -64,6 +64,7 @@ pub mod ec;
 pub mod metrics;
 pub mod peer;
 pub mod placement;
+pub mod repair_tracker;
 pub mod scrub;
 pub mod scrub_adapters;
 pub mod scrub_scheduler;

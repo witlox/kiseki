@@ -129,6 +129,29 @@ pub trait AsyncChunkOps: Send + Sync {
             "delete_chunk_force not implemented for this AsyncChunkOps".into(),
         ))
     }
+
+    /// Snapshot every affinity pool with its current device list.
+    /// Used by the storage-admin RPCs (ADR-025 W2 `ListPools` /
+    /// `ListDevices` / `ClusterStatus`).
+    ///
+    /// The default impl returns an empty vec — implementations that
+    /// don't track pools (e.g. test-only stubs) opt out by leaving
+    /// it. `ChunkStore` and `PersistentChunkStore` both override.
+    async fn snapshot_pools(&self) -> Vec<crate::pool::AffinityPool> {
+        Vec::new()
+    }
+
+    /// Find a single device by id across every pool. Returns the
+    /// pool name + device. Used by `GetDevice`.
+    /// Default impl scans `snapshot_pools()`.
+    async fn find_device(&self, device_id: &str) -> Option<(String, crate::pool::PoolDevice)> {
+        for pool in self.snapshot_pools().await {
+            if let Some(d) = pool.devices.iter().find(|d| d.id == device_id).cloned() {
+                return Some((pool.name, d));
+            }
+        }
+        None
+    }
 }
 
 /// Adapter that exposes any sync [`ChunkOps`] as [`AsyncChunkOps`]
@@ -338,6 +361,16 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         tokio::task::spawn_blocking(move || {
             let guard = inner.blocking_lock();
             guard.list_fragments(&chunk_id)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn snapshot_pools(&self) -> Vec<crate::pool::AffinityPool> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.blocking_lock();
+            guard.snapshot_pools()
         })
         .await
         .unwrap_or_default()

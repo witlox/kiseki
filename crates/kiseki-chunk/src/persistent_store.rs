@@ -655,6 +655,15 @@ impl ChunkOps for PersistentChunkStore {
             .map(|(_, idx)| *idx)
             .collect()
     }
+
+    fn snapshot_pools(&self) -> Vec<crate::pool::AffinityPool> {
+        self.pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]

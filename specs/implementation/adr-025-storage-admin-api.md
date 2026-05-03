@@ -114,7 +114,7 @@ shows all 26 RPCs (25 + MergeShards). Existing snapshot RPCs still work.
 
 ---
 
-### W2 — Read-only observability RPCs
+### W2 — Read-only observability RPCs ✅ DONE (2026-05-03)
 
 These don't mutate state — they project existing in-memory or
 persistent data. They land first because they're independent of W4/W5.
@@ -129,29 +129,49 @@ persistent data. They land first because they're independent of W4/W5.
 | `GetDevice` | scan pools for matching device id | needs new `chunk_store.find_device(id)` helper |
 | `ListShards` | `cluster_chunk_store.cluster_shards()` (already used elsewhere) | maps `Vec<ShardId>` → `Vec<ShardInfo>` with leader + member counts |
 | `GetShard` | as above + raft state for the shard | per-shard leader_id, last_applied, voters |
-| `GetTuningParams` | new `TuningState` (W3 lays the foundation) | reads-only; W3 introduces the type |
-| `ListRepairs` | `scrub_scheduler.recent_reports(limit)` (need new method) | streams `ListRepairsResponse` page |
+| `GetTuningParams` | new `TuningState` (W3 lays the foundation) | reads-only; W3 introduces the type — kept UNIMPLEMENTED in W2 |
+| `ListRepairs` | `RepairTracker` ring buffer (new) | scrub_scheduler write-side lands in W4; W2 returns honest empty list |
 
-**Failing test:** for each RPC, an integration test in
-`crates/kiseki-server/tests/storage_admin_readonly.rs` (new) spawns the
-server (reuse `bdd-fidelity-fix` server-spawn helper), connects via
-gRPC, and asserts the response shape matches what the populated
-in-memory state produced. Failing on stub returns from W1.
+**Status:** 9 of 10 read-only RPCs implemented (`GetTuningParams`
+deferred to W3 since it depends on the `TuningState` model).
 
-**Implementation:** wire each RPC body to its source. Add the missing
-`pub fn pools()` / `find_device(id)` / `recent_reports(limit)` helpers
-to the underlying crates.
+**Landed:**
+- `crates/kiseki-server/src/storage_admin.rs` — `StorageAdminGrpc`
+  builder pattern with `with_chunk_store` / `with_cluster` /
+  `with_bootstrap_shard` / `with_repair_tracker` / `with_metrics`
+- `crates/kiseki-chunk-cluster/src/repair_tracker.rs` — `RepairTracker`
+  ring buffer (4096 cap), wire-format string contracts pinned
+- `crates/kiseki-chunk/src/store.rs` — `pools()` + `find_device()`
+- `crates/kiseki-chunk/src/async_ops.rs` — async trait surface
+- `crates/kiseki-server/src/runtime.rs` — full wiring incl. counter
 
-**CLI wiring:** flip `cli.rs` → `parse_admin_args("status")` /
-`"pool list"` / `"device list"` / `"shard list"` from "wire to gRPC"
-stub to actually call the new RPCs via a tonic client. Update
-`bin/kiseki_admin.rs` to use the gRPC endpoint for those subcommands;
-keep the HTTP `/admin/test/*` endpoints for BDD fault injection.
+**Tracing + metrics (added during W2):**
+- Every implemented handler wraps its body in `with_obs(rpc_name, ...)`
+  which emits an OTEL span via `kiseki_tracing::span()` and bumps
+  `kiseki_storage_admin_calls_total{rpc, outcome}` (Prometheus
+  IntCounterVec, registered in `KisekiMetrics`)
+- Outcome buckets: `ok`, `client_error` (4xx-equivalent codes),
+  `server_error` (5xx-equivalent), `unimplemented` (W3-W7 stubs)
+- The 17 unimplemented RPCs route through `self.unimpl(...)` which
+  also emits a span + bumps the counter — operators see traffic to
+  not-yet-implemented endpoints on `/metrics` without surprises
+- A mechanical guard test (`every_implemented_rpc_uses_with_obs`)
+  walks the source and asserts every implemented handler uses the
+  helper — prevents regressions in W3-W7
 
-**Done when:** every read-only RPC + matching CLI subcommand returns
-real data on a live cluster, with the table format unchanged.
+**Tests landed (48 in `mod tests`):** 40 per-RPC behavioural tests
+(real-impl assertions for the 9 implemented + `_unimplemented_until_w*`
+for the 17 stubs); 6 metrics outcome-bucket tests; 2 cardinality
+guards (`proto_declares_exactly_26_rpcs`, `rpc_test_coverage_is_complete`)
+keeping the proto / impl / test counts in lockstep.
 
-**Effort:** ~1.5 days. Helpers + service-impl bodies.
+**CLI wiring (deferred):** the `parse_admin_args("status")` / etc.
+wiring lives in W6. The CLI today still uses the legacy HTTP admin
+endpoints — switching to the new gRPC service is a single workstream
+once W3-W5 land their mutating counterparts.
+
+**Effort actual:** ~1 day (vs ~1.5 day estimate; the chunk_store
+helper landed cleanly, RepairTracker was straightforward).
 
 ---
 

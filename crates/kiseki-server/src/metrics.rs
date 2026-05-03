@@ -89,6 +89,14 @@ pub struct KisekiMetrics {
     /// `PersistentRedbStorage::with_metrics()` and
     /// `CompositionHydrator::with_metrics()` at runtime construction.
     pub composition: std::sync::Arc<kiseki_composition::metrics::CompositionMetrics>,
+
+    // --- Storage admin gRPC (ADR-025) ---
+    /// `StorageAdminService` per-RPC call counter. Labels:
+    /// `rpc` (RPC method name, e.g. `ListPools`) and `outcome`
+    /// (`ok`, `client_error`, `server_error`, `unimplemented`).
+    /// Cloned into `StorageAdminGrpc::with_metrics()` at runtime
+    /// construction.
+    pub storage_admin_calls_total: IntCounterVec,
 }
 
 impl KisekiMetrics {
@@ -250,6 +258,18 @@ impl KisekiMetrics {
                 .expect("composition metrics register"),
         );
 
+        let storage_admin_calls_total = IntCounterVec::new(
+            Opts::new(
+                "kiseki_storage_admin_calls_total",
+                "StorageAdminService gRPC calls (ADR-025) by RPC and outcome",
+            ),
+            &["rpc", "outcome"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(storage_admin_calls_total.clone()))
+            .expect("register");
+
         Self {
             registry,
             raft_commit_latency,
@@ -270,6 +290,7 @@ impl KisekiMetrics {
             fabric,
             gateway_retry,
             composition,
+            storage_admin_calls_total,
         }
     }
 

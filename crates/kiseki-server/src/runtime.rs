@@ -783,6 +783,9 @@ pub async fn run_main(
     // `metrics` is moved into the metrics-server task.
     let composition_metrics_for_hydrator = Arc::clone(&metrics.composition);
     let composition_metrics_for_size_refresh = Arc::clone(&metrics.composition);
+    // Pre-clone the ADR-025 admin RPC counter; storage_admin_handler
+    // is constructed below after `metrics` moves into the spawn.
+    let storage_admin_calls_counter = Arc::new(metrics.storage_admin_calls_total.clone());
     tokio::spawn(async move {
         if let Err(e) = crate::metrics::run_metrics_server(
             metrics_addr,
@@ -1093,12 +1096,25 @@ pub async fn run_main(
     let admin_svc = kiseki_proto::v1::admin_service_server::AdminServiceServer::new(
         crate::admin_grpc::AdminGrpc::from_runtime(),
     );
-    // ADR-025 W1: scaffolding only — every RPC returns UNIMPLEMENTED
-    // with the workstream that will land it. W2-W7 replace each body
-    // with a real impl and remove the matching test assertion.
+    // ADR-025 W2: read-only RPCs (ListPools / GetPool / ListDevices /
+    // GetDevice / ClusterStatus / PoolStatus / ListShards / GetShard /
+    // ListRepairs) are wired through to the live runtime state.
+    // Mutating RPCs still return UNIMPLEMENTED until W3-W7.
+    let cluster_member_ids: Vec<u64> = cfg.raft_peers.iter().map(|(id, _)| *id).collect();
+    // RepairTracker is constructed empty; the scrub-scheduler /
+    // RepairChunk paths (W4) will start writing to it. Keeping the
+    // shared handle here means the admin endpoint always returns a
+    // stable empty list rather than UNIMPLEMENTED while we wire those.
+    let repair_tracker = Arc::new(kiseki_chunk_cluster::repair_tracker::RepairTracker::new());
+    let storage_admin_handler = crate::storage_admin::StorageAdminGrpc::from_runtime()
+        .with_chunk_store(Arc::clone(&local_chunk_store))
+        .with_cluster(cluster_member_ids, cfg.node_id)
+        .with_bootstrap_shard(bootstrap_shard)
+        .with_repair_tracker(Arc::clone(&repair_tracker))
+        .with_metrics(Arc::clone(&storage_admin_calls_counter));
     let storage_admin_svc =
         kiseki_proto::v1::storage_admin_service_server::StorageAdminServiceServer::new(
-            crate::storage_admin::StorageAdminGrpc::from_runtime(),
+            storage_admin_handler,
         );
     // Phase 16a step 7. The ClusterChunkService gRPC server delegates
     // to the *local* AsyncChunkOps (NOT the ClusteredChunkStore) so a
