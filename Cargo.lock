@@ -2202,7 +2202,11 @@ version = "2026.40.0"
 dependencies = [
  "kiseki-common",
  "kiseki-log",
+ "postcard",
  "proptest",
+ "redb",
+ "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "uuid",

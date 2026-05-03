@@ -3,7 +3,7 @@
 use kiseki_common::ids::{OrgId, ShardId, ViewId};
 
 /// Protocol semantics for the view.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ProtocolSemantics {
     /// POSIX filesystem semantics.
     Posix,
@@ -12,7 +12,7 @@ pub enum ProtocolSemantics {
 }
 
 /// Consistency model for the view.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ConsistencyModel {
     /// Read-your-writes — strong consistency for the writing session.
     ReadYourWrites,
@@ -26,7 +26,7 @@ pub enum ConsistencyModel {
 }
 
 /// Declarative specification of a view's shape and behavior.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ViewDescriptor {
     /// View identifier.
     pub view_id: ViewId,

@@ -1,7 +1,7 @@
 # ADR-040: Persistent Metadata Stores (CompositionStore, ViewStore)
 
-**Status**: Proposed — rev 2 (adversary review applied)
-**Date**: 2026-04-30
+**Status**: Accepted (CompositionStore landed in commit 9e55e64; ViewStore landed in commit ${THIS_COMMIT})
+**Date**: 2026-04-30 (proposed); 2026-05-03 (fully implemented)
 **Deciders**: Architect role; implementer to execute after rev-2 adversary sign-off
 **Context**: Phase 17 items 2 + 3 follow-ups from
 `specs/implementation/phase-17-cross-node-followups.md`

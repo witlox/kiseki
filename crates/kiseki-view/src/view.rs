@@ -9,7 +9,7 @@ use crate::error::ViewError;
 use crate::pin::ReadPin;
 
 /// View lifecycle state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ViewState {
     /// Materializing from the log — catching up.
     Building,
@@ -88,17 +88,61 @@ pub trait ViewOps {
     fn expire_pins(&mut self, view_id: ViewId, now_ms: u64) -> u64;
 }
 
-/// In-memory view store.
+/// View store. In-memory by default; backed by a
+/// [`crate::persistent::ViewStorage`] when constructed via
+/// [`Self::with_storage`] (ADR-040).
+///
+/// The in-memory `views` map is the hot path — `get_view`,
+/// `acquire_pin`, `release_pin`, etc. all serve from it. Mutations
+/// that should survive restart (`create_view`, `discard_view`,
+/// `advance_watermark`) are written through to `storage` *before*
+/// the in-memory map is updated, so a crash mid-write leaves the
+/// on-disk state consistent.
+///
+/// Pins are NOT persisted — they're session state with millisecond
+/// TTLs. After restart, clients re-pin (ADR-040 §D11).
 pub struct ViewStore {
     views: HashMap<ViewId, MaterializedView>,
+    storage: Option<Box<dyn crate::persistent::ViewStorage>>,
 }
 
 impl ViewStore {
-    /// Create an empty view store.
+    /// Create an empty in-memory view store. No durability across
+    /// restart — use [`Self::with_storage`] for that.
     #[must_use]
     pub fn new() -> Self {
         Self {
             views: HashMap::new(),
+            storage: None,
+        }
+    }
+
+    /// Create a view store backed by the given persistent storage.
+    /// Rehydrates the in-memory `views` map from `storage.list_all()`
+    /// on construction so reads see the same state that was on disk
+    /// at last write.
+    #[must_use]
+    pub fn with_storage(storage: Box<dyn crate::persistent::ViewStorage>) -> Self {
+        let mut views = HashMap::new();
+        if let Ok(persisted) = storage.list_all() {
+            for p in persisted {
+                let view_id = p.descriptor.view_id;
+                views.insert(
+                    view_id,
+                    MaterializedView {
+                        descriptor: p.descriptor,
+                        state: p.state,
+                        watermark: p.watermark,
+                        pins: Vec::new(), // pins are session state, not persisted
+                        last_advanced_ms: p.last_advanced_ms,
+                        next_pin_id: p.next_pin_id,
+                    },
+                );
+            }
+        }
+        Self {
+            views,
+            storage: Some(storage),
         }
     }
 
@@ -113,6 +157,28 @@ impl ViewStore {
     pub fn view_ids(&self) -> Vec<ViewId> {
         self.views.keys().copied().collect()
     }
+
+    /// Persist a single view through to the backing storage if any.
+    /// Best-effort: errors are logged but not propagated, so a
+    /// transient redb hiccup doesn't take the gateway down. The
+    /// in-memory `views` map remains the source of truth at runtime;
+    /// recovery happens at next reopen via `with_storage`.
+    fn persist(&mut self, view_id: ViewId) {
+        if let (Some(ref mut storage), Some(view)) =
+            (self.storage.as_mut(), self.views.get(&view_id))
+        {
+            let p = crate::persistent::storage::PersistedView {
+                descriptor: view.descriptor.clone(),
+                state: view.state,
+                watermark: view.watermark,
+                last_advanced_ms: view.last_advanced_ms,
+                next_pin_id: view.next_pin_id,
+            };
+            if let Err(e) = storage.put(p) {
+                tracing::warn!(view_id = %view_id.0, error = %e, "view persist failed");
+            }
+        }
+    }
 }
 
 impl Default for ViewStore {
@@ -125,6 +191,15 @@ impl ViewOps for ViewStore {
     #[tracing::instrument(skip(self, descriptor), fields(view_id = %descriptor.view_id.0, tenant_id = %descriptor.tenant_id.0))]
     fn create_view(&mut self, descriptor: ViewDescriptor) -> Result<ViewId, ViewError> {
         let view_id = descriptor.view_id;
+        // If a view at this id already exists (idempotent re-create —
+        // e.g. the bootstrap path on every node startup), return Ok
+        // without disturbing the persisted state. This matters for
+        // restart: rehydrated views have their watermark intact, and
+        // a naive overwrite-on-create would reset it to 0.
+        if self.views.contains_key(&view_id) {
+            tracing::debug!("view: create_view — already exists, leaving as-is");
+            return Ok(view_id);
+        }
         self.views.insert(
             view_id,
             MaterializedView {
@@ -136,6 +211,7 @@ impl ViewOps for ViewStore {
                 next_pin_id: 1,
             },
         );
+        self.persist(view_id);
         tracing::debug!("view: created in Building state");
         Ok(view_id)
     }
@@ -156,6 +232,7 @@ impl ViewOps for ViewStore {
         })?;
         view.state = ViewState::Discarded;
         view.pins.clear();
+        self.persist(view_id);
         tracing::debug!("view: discarded");
         Ok(())
     }
@@ -177,15 +254,22 @@ impl ViewOps for ViewStore {
             return Err(ViewError::Discarded(view_id));
         }
 
+        let mut changed = false;
         if position > view.watermark {
             view.watermark = position;
             view.last_advanced_ms = now_ms;
+            changed = true;
         }
 
         // Transition from Building → Active once we have a non-zero watermark.
         if view.state == ViewState::Building && view.watermark.0 > 0 {
             tracing::debug!("view: Building → Active");
             view.state = ViewState::Active;
+            changed = true;
+        }
+
+        if changed {
+            self.persist(view_id);
         }
 
         Ok(())

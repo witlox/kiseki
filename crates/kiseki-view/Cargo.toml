@@ -16,6 +16,14 @@ kiseki-log = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# Persistent ViewStore (ADR-040): redb stores `views.redb`
+# (descriptor + state + watermark + last_advanced_ms + meta).
+# postcard matches the encoding used by the persistent
+# CompositionStore (deterministic, version-prefixed).
+redb = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+postcard = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+tempfile = "3"

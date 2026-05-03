@@ -605,8 +605,27 @@ pub async fn run_main(
         kiseki_composition::composition::CompositionStore::with_storage(comp_storage)
             .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
 
-    // View: shared between gateway (staleness check) and stream processor.
-    let view_store = Arc::new(std::sync::Mutex::new(kiseki_view::view::ViewStore::new()));
+    // View: shared between gateway (staleness check) and stream
+    // processor. With KISEKI_DATA_DIR set, persist views via the
+    // ADR-040 sibling so descriptors + watermarks survive restart;
+    // otherwise fall back to in-memory.
+    let view_storage: Box<dyn kiseki_view::persistent::ViewStorage> =
+        if let Some(ref dir) = cfg.data_dir {
+            let meta_dir = dir.join("metadata");
+            std::fs::create_dir_all(&meta_dir)
+                .map_err(|e| format!("create persistent view dir {}: {e}", meta_dir.display()))?;
+            let path = meta_dir.join("views.redb");
+            let store = kiseki_view::persistent::PersistentRedbStorage::open(&path)
+                .map_err(|e| format!("open persistent view store: {e}"))?;
+            tracing::info!(path = %path.display(), "view store: persistent (redb-backed, ADR-040)");
+            Box::new(store)
+        } else {
+            tracing::info!("view store: in-memory (no KISEKI_DATA_DIR)");
+            Box::new(kiseki_view::persistent::MemoryStorage::new())
+        };
+    let view_store = Arc::new(std::sync::Mutex::new(
+        kiseki_view::view::ViewStore::with_storage(view_storage),
+    ));
 
     // Bootstrap namespace + view for protocol gateways. The IDs are
     // deterministic (UUID-from-u128(1) for shard/view, UUIDv5 of

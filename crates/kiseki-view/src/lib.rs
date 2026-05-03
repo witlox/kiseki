@@ -14,6 +14,7 @@
 
 pub mod descriptor;
 pub mod error;
+pub mod persistent;
 pub mod pin;
 pub mod stream_processor;
 pub mod versioning;
