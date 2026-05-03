@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 use kiseki_gateway::error::GatewayError;
@@ -35,9 +36,17 @@ const NFS3_OK: u32 = 0;
 /// `NFSv3` client. Stateless — each operation is a single RPC.
 pub struct Nfs3Client {
     addr: SocketAddr,
-    transport: Mutex<Option<RpcTransport>>,
+    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) — every
+    /// `read`/`write` holds this across blocking sync TCP IO inside
+    /// an `async fn`, and a std mutex would block the tokio worker
+    /// thread for every concurrent acquirer. Same fix and rationale
+    /// as `Nfs4Client::session` — see that comment for the
+    /// measurement.
+    transport: AsyncMutex<Option<RpcTransport>>,
     /// Root file handle — obtained from FSINFO or MOUNT protocol.
     /// Kiseki's FSINFO returns the root handle in `post_op_attr`.
+    /// Held only across cheap clones, not network IO, so std::Mutex
+    /// is fine here.
     root_fh: Mutex<Option<Vec<u8>>>,
     /// Client-side multipart upload buffers keyed by upload ID.
     /// Each value is a list of (`part_number`, data) pairs assembled
@@ -50,26 +59,23 @@ impl Nfs3Client {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
-            transport: Mutex::new(None),
+            transport: AsyncMutex::new(None),
             root_fh: Mutex::new(None),
             multipart_buffers: Mutex::new(HashMap::new()),
         }
     }
 
-    fn ensure_transport(
+    async fn ensure_transport(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, Option<RpcTransport>>, GatewayError> {
-        let mut guard = self
-            .transport
-            .lock()
-            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<RpcTransport>>, GatewayError> {
+        let mut guard = self.transport.lock().await;
         if guard.is_none() {
             *guard = Some(RpcTransport::connect(self.addr)?);
         }
         Ok(guard)
     }
 
-    fn ensure_root_fh(&self) -> Result<Vec<u8>, GatewayError> {
+    async fn ensure_root_fh(&self) -> Result<Vec<u8>, GatewayError> {
         {
             let fh = self
                 .root_fh
@@ -81,7 +87,7 @@ impl Nfs3Client {
         }
         // Get root handle via FSINFO with a synthetic root handle.
         // Kiseki's NFSv3 uses a well-known root handle format.
-        let mut guard = self.ensure_transport()?;
+        let mut guard = self.ensure_transport().await?;
         let t = guard.as_mut().unwrap();
 
         // NULL first — verify server is alive
@@ -125,8 +131,8 @@ fn xdr_err(e: &std::io::Error) -> GatewayError {
 #[async_trait::async_trait]
 impl GatewayOps for Nfs3Client {
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
-        let root_fh = self.ensure_root_fh()?;
-        let mut guard = self.ensure_transport()?;
+        let root_fh = self.ensure_root_fh().await?;
+        let mut guard = self.ensure_transport().await?;
         let t = guard.as_mut().unwrap();
 
         let filename = uuid::Uuid::new_v4().to_string();
@@ -228,8 +234,8 @@ impl GatewayOps for Nfs3Client {
     }
 
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        let root_fh = self.ensure_root_fh()?;
-        let mut guard = self.ensure_transport()?;
+        let root_fh = self.ensure_root_fh().await?;
+        let mut guard = self.ensure_transport().await?;
         let t = guard.as_mut().unwrap();
 
         // LOOKUP to get the file handle
@@ -299,8 +305,8 @@ impl GatewayOps for Nfs3Client {
         _namespace_id: NamespaceId,
         composition_id: CompositionId,
     ) -> Result<(), GatewayError> {
-        let root_fh = self.ensure_root_fh()?;
-        let mut guard = self.ensure_transport()?;
+        let root_fh = self.ensure_root_fh().await?;
+        let mut guard = self.ensure_transport().await?;
         let t = guard.as_mut().unwrap();
 
         let mut args = XdrWriter::new();

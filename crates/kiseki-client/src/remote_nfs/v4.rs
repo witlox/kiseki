@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 use kiseki_gateway::error::GatewayError;
@@ -33,7 +34,15 @@ struct Nfs4Session {
 pub struct Nfs4Client {
     addr: SocketAddr,
     minor_version: u32, // 1 for NFSv4.1, 2 for NFSv4.2
-    session: Mutex<Option<Nfs4Session>>,
+    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) — `read`/`write`
+    /// hold this across blocking sync TCP IO inside an `async fn`,
+    /// and a std mutex would block the tokio worker thread for
+    /// every concurrent acquirer. Measured: 16-way concurrent reads
+    /// with `std::sync::Mutex` had p99 = 30 s (= benchmark deadline)
+    /// because the runtime starved; with `tokio::sync::Mutex` the
+    /// lock acquisition yields and p99 stays bounded by the
+    /// per-op serial cost × queue depth.
+    session: AsyncMutex<Option<Nfs4Session>>,
     /// Client-side multipart buffers. NFS has no native multipart concept,
     /// so we buffer parts locally and concatenate on complete.
     multipart_buffers: MultipartBuffer,
@@ -46,7 +55,7 @@ impl Nfs4Client {
         Self {
             addr,
             minor_version: 1,
-            session: Mutex::new(None),
+            session: AsyncMutex::new(None),
             multipart_buffers: Mutex::new(HashMap::new()),
         }
     }
@@ -57,18 +66,15 @@ impl Nfs4Client {
         Self {
             addr,
             minor_version: 2,
-            session: Mutex::new(None),
+            session: AsyncMutex::new(None),
             multipart_buffers: Mutex::new(HashMap::new()),
         }
     }
 
-    fn ensure_session(
+    async fn ensure_session(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, Option<Nfs4Session>>, GatewayError> {
-        let mut guard = self
-            .session
-            .lock()
-            .map_err(|e| GatewayError::ProtocolError(format!("lock: {e}")))?;
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<Nfs4Session>>, GatewayError> {
+        let mut guard = self.session.lock().await;
         if guard.is_none() {
             *guard = Some(self.establish_session()?);
         }
@@ -259,7 +265,7 @@ impl Nfs4Client {
         &self,
         parts: &[(u64, Vec<u8>)],
     ) -> Result<CompositionId, GatewayError> {
-        let mut guard = self.ensure_session()?;
+        let mut guard = self.ensure_session().await?;
         let sess = guard.as_mut().unwrap();
 
         let filename = uuid::Uuid::new_v4().to_string();
@@ -361,7 +367,7 @@ impl Nfs4Client {
 #[async_trait::async_trait]
 impl GatewayOps for Nfs4Client {
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
-        let mut guard = self.ensure_session()?;
+        let mut guard = self.ensure_session().await?;
         let sess = guard.as_mut().unwrap();
 
         let filename = uuid::Uuid::new_v4().to_string();
@@ -486,7 +492,7 @@ impl GatewayOps for Nfs4Client {
     }
 
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        let mut guard = self.ensure_session()?;
+        let mut guard = self.ensure_session().await?;
         let sess = guard.as_mut().unwrap();
 
         let filename = req.composition_id.0.to_string();
@@ -555,7 +561,7 @@ impl GatewayOps for Nfs4Client {
         _namespace_id: NamespaceId,
         composition_id: CompositionId,
     ) -> Result<(), GatewayError> {
-        let mut guard = self.ensure_session()?;
+        let mut guard = self.ensure_session().await?;
         let sess = guard.as_mut().unwrap();
 
         let putrootfh = (op::PUTROOTFH, Vec::new());
