@@ -40,6 +40,15 @@ All architectural decisions are recorded as ADRs in
 | [ADR-029](adr/029-raw-block-device-allocator.md) | Raw Block Device Allocator | Accepted |
 | [ADR-030](adr/030-dynamic-small-file-placement.md) | Dynamic Small-File Placement and Metadata Capacity Management | Accepted |
 | [ADR-031](adr/031-client-side-cache.md) | Client-Side Cache | Accepted |
+| [ADR-032](adr/032-async-gateway-ops.md) | Async GatewayOps | Accepted |
+| [ADR-033](adr/033-initial-shard-topology.md) | Initial Shard Topology, Ratio-Floor Splits, and Persistent Namespace Shard Map | Accepted |
+| [ADR-034](adr/034-shard-merge.md) | Shard Merge Mechanism | Accepted |
+| [ADR-035](adr/035-node-lifecycle-drain.md) | Node Lifecycle and Drain Protocol | Accepted |
+| [ADR-036](adr/036-logops-shard-management.md) | LogOps Trait — Shard Management and Consumer Watermarks | Accepted |
+| [ADR-037](adr/037-test-infrastructure.md) | Test Infrastructure — Raft Harness and Subsystem Trait Boundaries | Accepted |
+| [ADR-038](adr/038-pnfs-layout-and-ds-subprotocol.md) | pNFS Layout and Data Server Subprotocol | Accepted |
+| [ADR-039](adr/039-flex-files-mirror-list-encoding.md) | Flexible Files Layout — Mirror-List Encoding | Accepted |
+| [ADR-040](adr/040-persistent-metadata-stores.md) | Persistent Metadata Stores (CompositionStore, ViewStore) | Accepted |
 
 ---
 
@@ -86,12 +95,16 @@ What else was evaluated and why it was rejected.
 - ADR-007: System key manager HA via Raft
 - ADR-026: Per-shard Raft groups on fabric (Strategy A)
 - ADR-009: Audit log sharding and GC
+- ADR-033: Initial shard topology and ratio-floor splits
+- ADR-034: Shard merge mechanism
+- ADR-036: LogOps trait — shard management and consumer watermarks
 
 ### Storage
 - ADR-005: Erasure coding and chunk durability
 - ADR-006: Inline data threshold
 - ADR-029: Raw block device allocator
 - ADR-030: Dynamic small-file placement
+- ADR-040: Persistent metadata stores (CompositionStore, ViewStore)
 
 ### Protocols and access
 - ADR-008: Native client fabric discovery
@@ -99,12 +112,16 @@ What else was evaluated and why it was rejected.
 - ADR-014: S3 API compatibility scope
 - ADR-019: Gateway deployment model
 - ADR-023: Protocol RFC compliance scope
+- ADR-032: Async GatewayOps
+- ADR-038: pNFS layout and DS subprotocol
+- ADR-039: Flexible Files mirror-list encoding
 
 ### Operations
 - ADR-015: Observability contract
 - ADR-016: Backup and disaster recovery
 - ADR-024: Device management and capacity thresholds
 - ADR-025: Storage administration API
+- ADR-035: Node lifecycle and drain protocol
 
 ### Advisory
 - ADR-020: Workflow advisory and client telemetry
@@ -112,3 +129,6 @@ What else was evaluated and why it was rejected.
 
 ### Client
 - ADR-031: Client-side cache
+
+### Testing
+- ADR-037: Test infrastructure — Raft harness and subsystem trait boundaries

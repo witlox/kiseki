@@ -3,22 +3,39 @@
 Distributed storage system for HPC/AI workloads. 20 production Rust
 crates (+ 1 BDD-test crate), 40 ADRs, 140 invariants.
 
-BDD acceptance: 216 scenarios (214 pass, 10 skip). Under active
-fidelity fix — World restructured into sub-structs, server harness
-proven with 2 smoke tests against real `kiseki-server` binary.
-@integration steps migrating from in-memory mocks to gRPC/HTTP calls.
-See `specs/implementation/bdd-fidelity-fix.md`.
+BDD acceptance: 316 scenarios (CI: 315 pass, 1 occasionally flaky on
+multi-node-raft D-10 cross-stream). Fidelity fix landed —
+@integration steps now drive real multi-node clusters via
+ClusterHarness against spawned `kiseki-server` binaries; in-memory
+mocks retired for the cross-node paths.
+
+Workspace tests: ~1650 unit + integration via cargo nextest. CI
+splits Unit Tests into two invocations (workspace minus
+kiseki-chunk-cluster, then chunk-cluster alone) to dodge a
+process-wide rustls CryptoProvider clash in the gRPC TLS
+round-trip tests. See `.config/nextest.toml`.
 
 E2e tests: 18 Python test files via docker compose (real server, real
 protocols — these are the ground truth).
 
 GCP perf cluster: 3 Terraform profiles (default/transport/gpu) in
-`infra/gcp/`. Deployed 2026-05-01; found chunk replication quorum
-issue and NFS write-path gaps not caught by BDD.
+`infra/gcp/`. **`transport` requires europe-west1**
+(c3-standard-88-lssd is not available in west6 default). Last run
+2026-05-03 surfaced a fabric write quorum-loss bug — cross-node
+PutFragment averaging 2 s on a 28 Gbps wire. Suspected cause:
+`build_fabric_channel` in `kiseki-server::runtime` missing
+`tcp_nodelay(true)` on the tonic Channel. See
+`docs/performance/README.md`.
 
 Phase 16 (cross-node chunk replication) complete in code. Phase 17
-follow-ups partially done (ADR-040 persistent CompositionStore,
-per-shard leader endpoint, delta hydration).
+follow-ups landed: ADR-040 persistent CompositionStore, per-shard
+leader endpoint, delta hydration with `name_inserts` / `name_removes`
+on followers.
+
+May 2026 perf-fix sweep (commits b0f048d, 56ec297, e058ded, 59cab58):
+local single-node matrix shows NFSv4 GET went from 24 op/s · p99 30 s
+to 27 291 op/s · p99 4 ms, pNFS GET fixed from 100 % errors to 16 549
+op/s, and S3 GET 5.6× — see `docs/performance/README.md`.
 
 ## Language
 

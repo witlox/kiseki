@@ -1,204 +1,268 @@
-# Performance Tests
+# Performance
 
-Benchmark results for kiseki on GCP infrastructure.
+Last refreshed: **2026-05-03** (after the May 2026 perf-fix sweep).
 
-## Test Environment
+Two data sources currently:
 
-| Component | Spec |
-|-----------|------|
-| **HDD nodes** (3) | n2-standard-16, 3 x PD-Standard 200GB each |
-| **Fast nodes** (2) | n2-standard-16, 2 x local NVMe + 2 x PD-SSD 375GB |
-| **Client nodes** (3) | n2-standard-8, 100GB SSD cache |
-| **Ctrl node** (1) | e2-standard-4, orchestrator |
-| **Network** | GCP VPC, single subnet 10.0.0.0/24 |
-| **Region** | europe-west6-c (Zurich) |
-| **Raft** | Single group, 5 nodes, node 1 bootstrap |
-| **Release** | v2026.1.352 (async GatewayOps, ADR-032) |
+1. **[Local single-node matrix](#local-single-node-matrix)** — `kiseki-profile`
+   driving 5 protocols × 3 workload shapes against a fresh `kiseki-server`
+   process on one host. Captures both CPU (pprof flamegraphs) and heap
+   (dhat). Used to drive the perf fixes below.
+2. **[GCP transport profile (2026-05-03)](#gcp-transport-profile-2026-05-03)** —
+   3-storage + 3-client cluster on `c3-standard-88-lssd` /
+   `c3-standard-44`. **Partial**: the run surfaced a fabric write
+   quorum-loss bug (cross-node `PutFragment` averaging 2 s on a
+   28 Gbps wire). Throughput data from this run is not representative
+   until the bug is fixed — see [Open issues](#open-issues).
 
-## Results (2026-04-24)
+## Perf-fix history (May 2026)
 
-### Network Bandwidth
+| Commit | Change | Local matrix impact |
+|---|---|---|
+| `b0f048d` | server: single-node MDS advertises local DS uaddr | pNFS GET 0 op/s · 3528 errors → 62 op/s · 0 errors |
+| `56ec297` | client/nfs: `tokio::sync::Mutex` on session — std mutex starved tokio runtime under concurrency | NFSv4 c=16 read p99: 30 s → 667 ms |
+| `e058ded` | client+gateway: TCP_NODELAY on NFS RpcTransport + pNFS DS listener | NFSv4 c=1 GET: 24 op/s · 41 ms → 9285 op/s · 199 µs |
+| `eebc7f0` | profile harness: tokio mutex on FuseDriver + pNFS session pool *(harness-only)* | n/a — measurement fix |
+| `59cab58` | client/nfs: connection pool — N parallel sessions per Nfs3/Nfs4Client | NFSv4 c=16 GET: 9 k → 27 k op/s |
 
-| Path | Throughput |
-|------|-----------|
-| Client → Leader (n2-standard-8 → n2-standard-16) | 15.2 - 15.3 Gbps |
-| HDD → Fast cross-tier (n2-standard-16 → n2-standard-16) | 18.3 - 20.4 Gbps |
+Each commit references the metric it was driven by; the local-matrix
+section below is the post-fix snapshot.
 
-### S3 Gateway
+## Local single-node matrix
 
-All S3 tests run from client nodes (n2-standard-8) with 8-way parallelism.
+Run via `kiseki-profile`; outputs land in `/tmp/kiseki-prof/`. See
+[`reference_profile_matrix`](../../crates/kiseki-profile/) for usage.
 
-#### Write Throughput (single client → leader)
+### Configuration
 
-| Object Size | Count | Parallelism | Time | Throughput |
-|-------------|-------|-------------|------|------------|
-| 1 MB | 200 | 8 | 1,624 ms | 123.2 MB/s |
-| 4 MB | 50 | 8 | 239 ms | 836.8 MB/s |
-| 16 MB | 25 | 8 | 363 ms | 1,101.9 MB/s |
+| | |
+|---|---|
+| Machine | dev workstation (Linux, x86_64, 16 cores) |
+| Cluster | single-node (1 × `kiseki-server`, ephemeral ports) |
+| Object size | 64 KiB |
+| Concurrency | 16 (matches NFS connection-pool default cap) |
+| Duration | 30 s per scenario |
+| Warmup | 256 objects pre-created for get-heavy / mixed |
 
-#### Read Throughput
+### Throughput post-fixes (concurrency=16, 64 KiB)
 
-| Object Size | Count | Parallelism | Time | Throughput |
-|-------------|-------|-------------|------|------------|
-| 1 MB | 200 | 8 | 176 ms | 1,136.4 MB/s |
+| Protocol | put-heavy | get-heavy | mixed (70 P / 30 G) |
+|---|---:|---:|---:|
+| **S3 (HTTP)** | 7124 op/s · 445 MiB/s | **25 843 op/s · 1.6 GiB/s** | 8470 op/s · 529 MiB/s |
+| **NFSv3** | 2042 op/s · 128 MiB/s | 26 615 op/s · 1.6 GiB/s | 778 op/s · 49 MiB/s |
+| **NFSv4.1** | 8327 op/s · 520 MiB/s | **27 291 op/s · 1.7 GiB/s** | 808 op/s · 50 MiB/s |
+| **pNFS Flex Files** | 8327 op/s · 520 MiB/s | 16 549 op/s · 1.0 GiB/s | 2254 op/s · 141 MiB/s |
+| **FUSE** | 2790 op/s · 174 MiB/s | 10 789 op/s · 674 MiB/s | 3375 op/s · 211 MiB/s |
 
-#### PUT Latency (1 KB objects, sequential)
+### Tail latencies post-fixes (p99 µs, c=16)
 
-| Percentile | Latency |
-|------------|---------|
-| p50 | 7.6 ms |
-| p99 | 8.6 ms |
-| avg | 7.7 ms |
-| max | 9.7 ms |
+| Protocol | put-heavy | get-heavy | mixed |
+|---|---:|---:|---:|
+| S3 | 3 297 | 6 205 | 3 102 |
+| NFSv3 | 11 277 | 4 038 | 49 157 |
+| NFSv4.1 | 10 528 | 4 234 | 46 076 |
+| pNFS | 10 540 | 21 116 | 23 493 |
+| FUSE | 159 613* | 134 | 126 747* |
 
-#### Aggregate Write (3 clients, parallel)
+*FUSE put p99 tail (160 ms) is the next investigation target. p50 is
+0.35 ms; the bimodal distribution suggests batched composition flush
+or redb checkpoint contention. Not blocking — the median is fast.
 
-| Workload | Time | Aggregate Throughput |
-|----------|------|---------------------|
-| 3 x 100 x 1 MB (8 concurrent/client) | 2,205 ms | 136.1 MB/s |
+### Total trajectory across the May fix sweep
 
-### NFS / pNFS / FUSE
+| | starting matrix | after the 5 fixes | gain |
+|---|---:|---:|---:|
+| NFSv3 GET (c=16) | 12 op/s · p99 31 s | 26 615 op/s · p99 4 ms | **2 220×** throughput / 7 700× p99 |
+| NFSv4.1 GET (c=16) | 24 op/s · p99 30 s | 27 291 op/s · p99 4 ms | **1 137×** / 7 100× |
+| pNFS GET (c=16) | **0 op/s · 100 % errors** | 16 549 op/s · p99 21 ms | broken → working |
+| pNFS PUT (c=16) | 583 op/s · p99 553 ms | 8 327 op/s · p99 11 ms | 14× / 50× |
+| S3 GET (c=16) | 4 580 op/s | 25 843 op/s | 5.6× |
 
-Not yet tested on GCP. NFS mount from client nodes requires SSH key
-distribution from the ctrl node (OS Login configuration pending).
-FUSE requires the kiseki-client binary installed on client nodes.
+Numbers above are server-side ceiling on a single host. Multi-node
+ceilings (and EC) are pending the GCP run.
 
-Local testing (3-node cluster on localhost) confirms all protocols
-functional via unit and integration tests.
+### Captured profiles
 
-### Prometheus Metrics
+- `/tmp/kiseki-prof/cpu-{protocol}-{shape}.svg` — pprof flamegraphs
+- `/tmp/kiseki-prof/heap-{protocol}-{shape}.json` — dhat heap
 
-Gateway request counters showed 0 during the test. The
-`requests_total` atomic counter in `InMemoryGateway` is not wired
-to the Prometheus metrics exporter yet.
+Hot stacks in the post-fix S3 PUT path (server side):
+- 22 % SHA256 in `kiseki_crypto::chunk_id::derive_chunk_id`
+- 17 % redb `name_insert` in `CompositionStore::bind_name`
+- 13 % AEAD seal envelope
+- 13 % Raft `append_delta`
 
-## Local Test Results (same binary, localhost)
+These are the candidates for the next round of optimization.
 
-For comparison, local 3-node cluster results (loopback network,
-no disk I/O latency, 32-way parallelism):
+## GCP transport profile (2026-05-03)
 
-| Test | Result |
-|------|--------|
-| S3 Write 1 MB x 200 (32 parallel) | 380.2 MB/s |
-| S3 Write 4 MB x 50 (32 parallel) | 349.7 MB/s |
-| S3 Write 16 MB x 25 (32 parallel) | 340.7 MB/s |
-| S3 Read 1 MB x 200 (32 parallel) | 913.2 MB/s |
-| 32 concurrent PUTs | 50 ms (no deadlock) |
+### Cluster
 
-## Observations
+| | |
+|---|---|
+| Profile | `transport` (`infra/gcp/perf-cluster.tf`) |
+| Storage | 3 × `c3-standard-88-lssd` (88 vCPU, 8 × local NVMe) |
+| Clients | 3 × `c3-standard-44` (44 vCPU) |
+| Ctrl | 1 × `e2-standard-4` |
+| Region / zone | europe-west1-b (NOT west6 — `c3-...-lssd` is west1-only) |
+| Tier_1 NIC | 100 Gbps egress on storage; ~50 Gbps on clients |
 
-1. **Small object writes improved 9.6x** after ADR-032 (async
-   GatewayOps + lock-free composition writes). The composition
-   lock is no longer held during Raft consensus, allowing
-   concurrent writes to proceed in parallel.
+### Run timing
 
-2. **Read throughput exceeds write.** Reads bypass Raft consensus
-   (served from the local composition + chunk store) and hit 1.1 GB/s
-   even for 1 MB objects.
+- Apply: ~2 min after binaries on GCS
+- Setup scripts: ~3 min on storage / client / ctrl
+- Suite (`perf-suite-transport.sh`): ~3 min for sections 1-4, hung in section 5 (pNFS) until killed
 
-3. **GCP outperforms localhost for large objects.** The GCP network
-   (15+ Gbps) and n2-standard-16 nodes have more bandwidth than
-   localhost loopback under contention. 16 MB writes: 1,102 MB/s
-   (GCP) vs 341 MB/s (local).
+### What the run measured (sections 1–4 only)
 
-4. **Latency is network-bound.** p50 latency on GCP (7.6 ms)
-   includes network RTT + Raft consensus (5-node quorum). Local
-   latency is dominated by CPU contention on shared machine.
+iperf3 baseline (4 stream, 30 s):
 
-5. **Single Raft group is the write bottleneck.** All writes go
-   through one leader. Multi-shard deployment would distribute
-   leaders across nodes, scaling write throughput linearly.
+| client → storage-1 | Gbps |
+|---|---:|
+| 10.0.0.30 → 10.0.0.10 | 28.2 |
+| 10.0.0.31 → 10.0.0.10 | 28.0 |
+| 10.0.0.32 → 10.0.0.10 | 28.6 |
 
-## Known Issues
+(The 4-stream count under-saturates the 100 Gbps wire; not enough
+streams to compete with TCP slow-start ramp-up.)
 
-- **Concurrent write deadlock (fixed in ADR-032).** The sync→async
-  bridge (`run_on_raft`) caused thread starvation under concurrent
-  load. Fixed by making GatewayOps and LogOps fully async, and
-  moving log emission out of the composition lock scope. Result:
-  1 MB writes improved from 39.5 to 380.2 MB/s (9.6x).
+S3 PUT concurrency sweep (64 MB objects, against the leader):
 
-- **NFS mount on GCP.** Requires SSH key distribution from ctrl to
-  client nodes. The ctrl service account needs `osAdminLogin` role
-  and OS Login key registration.
+| streams | throughput |
+|---:|---:|
+| 1 | 1.4 Gbps |
+| 4 | 4.4 Gbps |
+| 16 | 10.0 Gbps |
+| 64 | 11.4 Gbps |
+| 256 | 16.4 Gbps (cap) |
 
-- **Prometheus counters.** `gateway_requests_total` not exported to
-  `/metrics` endpoint.
+S3 GET sweep:
 
-## Running the Benchmark
+| streams | throughput |
+|---:|---:|
+| 1 | 7.2 Gbps |
+| 4 | 10.0 Gbps |
+| 16 | 10.1 Gbps |
+| 64 | 10.3 Gbps |
+| 256 | 110.3 Gbps (page-cache effect) |
 
-```bash
-# Local 3-node test
-cargo build --release --bin kiseki-server
-# Start 3 nodes (see examples/cluster-3node.env.node{1,2,3})
-# Run: bash infra/gcp/benchmarks/perf-suite.sh
+**These numbers are not trustworthy as-is** — see next section.
 
-# GCP deployment
-cd infra/gcp
-terraform apply -var="project_id=PROJECT" -var="zone=ZONE" \
-  -var="release_tag=v2026.1.332"
-# Deploy perf-suite.sh to ctrl node and run
+### What the run actually surfaced: fabric write quorum loss
+
+During the S3 PUT sweep, storage-1's `/metrics` showed:
+
+```
+kiseki_fabric_quorum_lost_total       1940       ← matches the PUT-500 count
+kiseki_fabric_op_duration_seconds     count=1552 sum=3177 s
+                                                  → avg fabric PUT = 2.05 s
+                                                  → 75 % of fabric PUTs > 1 s
 ```
 
-See `infra/gcp/benchmarks/perf-suite.sh` for the full benchmark
-script and `infra/gcp/benchmarks/run-perf.sh` for the local
-deployment wrapper.
+Storage-1's logs:
 
-## Comparison with Ceph and Lustre
+```
+WARN kiseki_chunk_cluster: peer PutFragment timed out peer=node-2
+WARN gateway write: chunks.write_chunk failed
+       error=quorum lost: only 1/2 replicas acked
+```
 
-### Single-Leader Kiseki vs Typical Deployments (similar hardware scale)
+So the cap of "16.4 Gbps PUT throughput" is misleading: half the
+PUTs are actually 500-ing because cross-node `PutFragment` times
+out at the 5 s default. **The reported throughput is throughput of
+successful writes only**, not the cluster's actual write capacity.
 
-| Metric | Kiseki (1 leader) | Ceph RGW (S3) | Lustre |
-|--------|-------------------|---------------|--------|
-| Large object write | 1.1 GB/s (16 MB) | 0.5-2 GB/s | 1-2 GB/s per OST |
-| Small object write | 122 MB/s (1 MB) | 50-200 MB/s | 200-500 MB/s |
-| Read throughput | 1.1 GB/s | 1-3 GB/s | 2-10 GB/s |
-| PUT latency | p50: 7.6 ms | p50: 2-5 ms | p50: <1 ms (POSIX) |
-| Aggregate 3-client | 133 MB/s | 300-800 MB/s | 1-5 GB/s |
-| Encryption | Always (AES-256-GCM) | Optional (rarely on) | No |
+Until the underlying cause is fixed, all GCP throughput numbers in
+this section should be considered indicative, not authoritative.
 
-### Why aggregate throughput is lower
+### Suspected cause
 
-All writes go through a single Raft leader (single Raft group).
-Ceph distributes across PGs/OSDs, Lustre stripes across OSTs. They
-parallelize writes across all nodes; kiseki serializes through one
-leader. This is a deployment constraint, not an architectural limit.
+`kiseki-server::runtime::build_fabric_channel` (runtime.rs:104) builds
+the per-peer fabric `tonic::transport::Channel` without
+`tcp_nodelay(true)`. Same Nagle / 40 ms-delayed-ACK problem fixed for
+the NFS clients in `e058ded`, but the cross-node fabric path still
+has it. A single-call round trip with Nagle on a 64 MB chunk involves
+many ack windows; combined with chunk encoding it plausibly explains
+the 2 s avg.
 
-### Where kiseki is strong
+Local single-node profiling never exercised this path — single-node
+clusters don't fan out fragments to peers. The only way to catch
+this kind of bug is multi-node testing.
 
-1. **Per-leader throughput is excellent.** 1.1 GB/s per leader with
-   full AES-256-GCM encryption is comparable to Ceph RGW *without*
-   encryption. The crypto overhead is nearly invisible (aws-lc-rs
-   with AES-NI).
+## Open issues
 
-2. **Read throughput matches.** Reads bypass Raft consensus entirely
-   and serve from local composition + chunk store. Multi-node reads
-   scale linearly since any node can serve.
+- [ ] **Fabric channel missing `tcp_nodelay`** (`runtime.rs:build_fabric_channel`) —
+  prime suspect for the GCP `quorum_lost_total` regression. Fix
+  pattern: same as `e058ded`, just on the tonic `Endpoint`.
+- [ ] **Re-run GCP transport profile after the fabric fix** to get
+  trustworthy multi-node throughput.
+- [ ] **`perf-suite-transport.sh` mount option `pnfs` is rejected by
+  modern kernels** (silently — `mount.nfs4` returns 0 with an
+  "incorrect mount option" message). Already patched in the
+  in-cluster copy of the script for the 2026-05-03 run; not yet
+  back-merged to `infra/gcp/benchmarks/`.
+- [ ] **`perf-suite-transport.sh` mounts at `/`** but kiseki's
+  pseudo-root is non-writable; should mount `/default`. Caused the
+  pNFS aggregate test to hang on a 0-byte fio write. Same back-merge.
+- [ ] **FUSE put-heavy p99 = 160 ms tail** — local single-node, c=16.
+  p50 is 0.35 ms; bimodal. Likely a redb checkpoint or batched
+  composition flush. Not blocking but worth a flamegraph dive.
 
-3. **Latency is reasonable.** 7.6 ms includes Raft consensus over
-   network + encryption. Ceph's 2-5 ms S3 latency is lower but
-   typically without encryption. Lustre's sub-ms is POSIX (kernel
-   bypass), not comparable to HTTP/S3.
+## Running the matrix locally
 
-### Bottleneck analysis
+```bash
+# Build server with profiling features
+cargo build --release -p kiseki-server --features pprof
+CARGO_TARGET_DIR=target-dhat cargo build --release \
+  -p kiseki-server --features dhat
 
-- **Not bottlenecked by crypto** -- AES-256-GCM at 1.1 GB/s means
-  the CPU encrypts faster than the network/Raft can deliver.
-- **Not bottlenecked by network** -- 15 Gbps available, using <10
-  Gbps.
-- **Bottlenecked by Raft consensus** -- 7.6 ms per round-trip for
-  small objects, amortized for large ones.
-- **Multi-shard is the path to parity** -- linear scaling with shard
-  count, same model as Ceph PGs and Lustre OSTs.
+# Build the driver
+cargo build --release -p kiseki-profile
 
-### Projected multi-shard performance
+# Full 5×3 matrix (CPU + heap, ~30 min)
+bash crates/kiseki-profile/run-all.sh
 
-| Shards | 1 MB Write | 16 MB Write | Read |
-|--------|------------|-------------|------|
-| 1 | 122 MB/s | 1.1 GB/s | 1.1 GB/s |
-| 3 | ~366 MB/s | ~3.4 GB/s | ~3.4 GB/s |
-| 5 | ~610 MB/s | ~5.7 GB/s | ~5.7 GB/s |
+# Resume only missing combinations (idempotent)
+bash crates/kiseki-profile/resume.sh
+```
 
-At 5 shards on the same hardware, kiseki reaches parity with Ceph
-and approaches Lustre -- while encrypting all data at rest and in
-transit, on commodity GCP VMs with network-attached storage (not
-local NVMe or InfiniBand).
+## Running on GCP
+
+```bash
+cd infra/gcp
+terraform init
+
+# Build VM-target binaries (rocky9 container)
+docker run --rm \
+  -v $PWD/../..:/src \
+  -v $PWD/../../.gcp-build/cache-target:/src/target \
+  -v $PWD/../../.gcp-build/cache-cargo:/root/.cargo \
+  -v $PWD/../../.gcp-build/dist:/out \
+  -w /src rockylinux:9 \
+  bash /src/.gcp-build/build.sh
+
+gcloud storage cp ../../.gcp-build/dist/kiseki-{server,client}-x86_64.tar.gz \
+  gs://kiseki-bench-binaries-pwitlox-20260502/
+
+# transport profile must run in europe-west1 (c3-standard-88-lssd
+# is not available in west6 as of 2026-05-03)
+terraform apply \
+  -var=project_id=cscs-400112 \
+  -var=region=europe-west1 -var=zone=europe-west1-b \
+  -var=profile=transport \
+  -var=binary_url_base=https://storage.googleapis.com/kiseki-bench-binaries-pwitlox-20260502
+
+# Drive each phase manually rather than running the full suite at
+# once — that way you stop at the first error instead of carrying
+# on for several minutes through 500-class failures.
+bash .gcp-build/ssh-helper.sh kiseki-ctrl
+# on ctrl: source /etc/kiseki-bench.env, then run individual sections
+```
+
+Tear down when done — `c3-standard-88-lssd` is ~$22-30/hr.
+
+```bash
+terraform destroy -var=project_id=cscs-400112 \
+  -var=region=europe-west1 -var=zone=europe-west1-b \
+  -var=profile=transport
+```

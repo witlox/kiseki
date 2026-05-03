@@ -144,7 +144,8 @@ mdbook serve  # http://localhost:3000
 | [Architecture](https://witlox.github.io/kiseki/architecture/overview.html) | System design, bounded contexts, data flow, encryption, Raft |
 | [Security](https://witlox.github.io/kiseki/security/model.html) | Security model, STRIDE analysis, authentication, tenant isolation |
 | [API Reference](https://witlox.github.io/kiseki/api/grpc.html) | gRPC, REST, CLI, environment variables |
-| [Decisions](https://witlox.github.io/kiseki/decisions/index.html) | 39 Architecture Decision Records |
+| [Decisions](https://witlox.github.io/kiseki/decisions/index.html) | 40 Architecture Decision Records |
+| [Performance](https://witlox.github.io/kiseki/performance/) | Local profile-driver matrix and GCP perf-cluster results |
 
 ## Development
 
@@ -152,8 +153,12 @@ mdbook serve  # http://localhost:3000
 # Build
 cargo build --workspace
 
-# Test (~1500 unit + integration tests)
-cargo test --workspace --exclude kiseki-acceptance
+# Test (~1650 unit + integration tests; CI splits into two
+# nextest invocations to dodge a process-wide rustls global-state
+# clash in kiseki-chunk-cluster's gRPC + TLS round-trip tests)
+cargo nextest run --workspace --exclude kiseki-acceptance \
+  --exclude kiseki-chunk-cluster --locked --profile ci
+cargo nextest run -p kiseki-chunk-cluster --locked --profile ci
 
 # BDD acceptance tests
 cargo test -p kiseki-acceptance
@@ -163,7 +168,8 @@ docker compose up -d
 cd tests/e2e && pytest -ra
 
 # Lint
-cargo fmt --check && cargo clippy -- -D warnings
+cargo fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo deny check
 ```
 
 ## License
