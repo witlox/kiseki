@@ -241,9 +241,31 @@ impl Driver for Nfs4Driver {
 // skip LAYOUTGET. Without the cache we'd be measuring 3 RPCs per
 // read instead of 1.
 
+/// Cached NFSv4.1 session — reusable across calls. The `sequence`
+/// counter must be monotonically increasing per the protocol, so
+/// each call increments it under the same mutex that serializes
+/// the wire write. Real kernel pNFS keeps one session per (client,
+/// MDS or DS) pair; the harness mirrors that for accurate
+/// throughput measurements.
+struct PnfsSession {
+    transport: RpcTransport,
+    session_id: [u8; 16],
+    sequence: u32,
+}
+
 struct PnfsDriver {
     nfs_addr: SocketAddr,
     writer: Arc<Nfs4Client>,
+    /// One MDS session shared by all workers — protocol allows it
+    /// because the SEQUENCE op serializes through `sequence`.
+    mds_session: tokio::sync::Mutex<Option<PnfsSession>>,
+    /// One session per DS address. Map under a sync mutex (lookups
+    /// are O(1) and brief); the per-session mutex serializes wire
+    /// access. Without this cache every GET paid 2 fresh RTTs for
+    /// EXCHANGE_ID + CREATE_SESSION before the actual READ.
+    ds_sessions: std::sync::Mutex<
+        std::collections::HashMap<SocketAddr, Arc<tokio::sync::Mutex<PnfsSession>>>,
+    >,
     layout_cache:
         tokio::sync::Mutex<std::collections::HashMap<CompositionId, (SocketAddr, Vec<u8>)>>,
     tenant_id: OrgId,
@@ -255,6 +277,8 @@ impl PnfsDriver {
         Self {
             nfs_addr,
             writer: Arc::new(Nfs4Client::v41(nfs_addr)),
+            mds_session: tokio::sync::Mutex::new(None),
+            ds_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             layout_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
             namespace_id: NamespaceId(uuid::Uuid::new_v5(
@@ -264,6 +288,36 @@ impl PnfsDriver {
         }
     }
 
+    fn open_session(addr: SocketAddr, owner: &[u8]) -> Result<PnfsSession, String> {
+        let mut transport =
+            RpcTransport::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+        let (client_id, _) = exchange_id(&mut transport, owner)?;
+        let session_id = create_session(&mut transport, client_id)?;
+        Ok(PnfsSession {
+            transport,
+            session_id,
+            sequence: 1,
+        })
+    }
+
+    fn ds_session(&self, addr: SocketAddr) -> Result<Arc<tokio::sync::Mutex<PnfsSession>>, String> {
+        // Fast path — already cached.
+        {
+            let m = self.ds_sessions.lock().map_err(|e| format!("ds map: {e}"))?;
+            if let Some(s) = m.get(&addr) {
+                return Ok(Arc::clone(s));
+            }
+        }
+        // Slow path — create a session outside the map lock so
+        // concurrent first-time-misses on different addrs don't
+        // serialize through it. Last writer wins on duplicate inserts;
+        // the loser drops their freshly-built session, which is fine.
+        let sess = Self::open_session(addr, b"pnfs-profile-ds")?;
+        let arc = Arc::new(tokio::sync::Mutex::new(sess));
+        let mut m = self.ds_sessions.lock().map_err(|e| format!("ds map: {e}"))?;
+        Ok(Arc::clone(m.entry(addr).or_insert(arc)))
+    }
+
     /// LAYOUTGET against the MDS for `comp_id`, then GETDEVICEINFO
     /// per device. Returns the first (uaddr, fh) pair so the caller
     /// can connect to the DS directly.
@@ -271,19 +325,22 @@ impl PnfsDriver {
         &self,
         comp_id: CompositionId,
     ) -> Result<(SocketAddr, Vec<u8>), String> {
-        let mut transport =
-            RpcTransport::connect(self.nfs_addr).map_err(|e| format!("MDS connect: {e}"))?;
-        let (client_id, _) = exchange_id(&mut transport, b"pnfs-profile-mds")?;
-        let session_id = create_session(&mut transport, client_id)?;
+        let mut guard = self.mds_session.lock().await;
+        if guard.is_none() {
+            *guard = Some(Self::open_session(self.nfs_addr, b"pnfs-profile-mds")?);
+        }
+        let sess = guard.as_mut().unwrap();
 
         // SEQUENCE + PUTROOTFH + LOOKUP + LAYOUTGET.
+        let seq = sess.sequence;
+        sess.sequence += 1;
         let mut body = XdrWriter::new();
         body.write_u32(0);
         body.write_u32(1);
         body.write_u32(4);
         body.write_u32(op::SEQUENCE);
-        body.write_opaque_fixed(&session_id);
-        body.write_u32(2);
+        body.write_opaque_fixed(&sess.session_id);
+        body.write_u32(seq);
         body.write_u32(0);
         body.write_u32(0);
         body.write_u32(0);
@@ -300,19 +357,22 @@ impl PnfsDriver {
         body.write_opaque_fixed(&[0u8; 16]);
         body.write_u32(65_536);
 
-        let reply = transport
+        let reply = sess
+            .transport
             .call(100_003, 4, 1, &body.into_bytes())
             .map_err(|e| format!("LAYOUTGET COMPOUND: {e}"))?;
         let (device_id, fh) = parse_layoutget_first(&reply)?;
 
         // GETDEVICEINFO for that device.
+        let seq = sess.sequence;
+        sess.sequence += 1;
         let mut body = XdrWriter::new();
         body.write_u32(0);
         body.write_u32(1);
         body.write_u32(2);
         body.write_u32(op::SEQUENCE);
-        body.write_opaque_fixed(&session_id);
-        body.write_u32(3);
+        body.write_opaque_fixed(&sess.session_id);
+        body.write_u32(seq);
         body.write_u32(0);
         body.write_u32(0);
         body.write_u32(0);
@@ -321,7 +381,8 @@ impl PnfsDriver {
         body.write_u32(4);
         body.write_u32(65_536);
         body.write_u32(0);
-        let reply = transport
+        let reply = sess
+            .transport
             .call(100_003, 4, 1, &body.into_bytes())
             .map_err(|e| format!("GETDEVICEINFO COMPOUND: {e}"))?;
         let uaddr = parse_getdeviceinfo_first(&reply)?;
@@ -329,19 +390,19 @@ impl PnfsDriver {
         Ok((addr, fh))
     }
 
-    async fn ds_read(addr: SocketAddr, fh: &[u8], length: usize) -> Result<usize, String> {
-        let mut transport =
-            RpcTransport::connect(addr).map_err(|e| format!("DS connect {addr}: {e}"))?;
-        let (client_id, _) = exchange_id(&mut transport, b"pnfs-profile-ds")?;
-        let session_id = create_session(&mut transport, client_id)?;
+    async fn ds_read(&self, addr: SocketAddr, fh: &[u8], length: usize) -> Result<usize, String> {
+        let arc = self.ds_session(addr)?;
+        let mut sess = arc.lock().await;
 
+        let seq = sess.sequence;
+        sess.sequence += 1;
         let mut body = XdrWriter::new();
         body.write_u32(0);
         body.write_u32(1);
         body.write_u32(3);
         body.write_u32(op::SEQUENCE);
-        body.write_opaque_fixed(&session_id);
-        body.write_u32(2);
+        body.write_opaque_fixed(&sess.session_id);
+        body.write_u32(seq);
         body.write_u32(0);
         body.write_u32(0);
         body.write_u32(0);
@@ -352,7 +413,8 @@ impl PnfsDriver {
         body.write_u64(0);
         body.write_u32(u32::try_from(length).unwrap_or(u32::MAX));
 
-        let reply = transport
+        let reply = sess
+            .transport
             .call(100_003, 4, 1, &body.into_bytes())
             .map_err(|e| format!("DS READ COMPOUND: {e}"))?;
         let mut r = XdrReader::new(&reply);
@@ -422,7 +484,7 @@ impl Driver for PnfsDriver {
         };
         // The DS GET via the Linux kernel reads u32::MAX → server
         // bounded by composition size. Mirror that here.
-        Self::ds_read(addr, &fh, 4 * 1024 * 1024).await
+        self.ds_read(addr, &fh, 4 * 1024 * 1024).await
     }
 }
 
@@ -445,7 +507,13 @@ struct FuseDriver {
     /// per call would spawn a new runtime thread per op (KisekiFuse
     /// owns a dedicated runtime) and quickly hit thread-spawn EAGAIN
     /// at any non-trivial concurrency.
-    fs: std::sync::Mutex<kiseki_client::fuse_fs::KisekiFuse<RemoteHttpGateway>>,
+    ///
+    /// `tokio::sync::Mutex`, not `std::sync::Mutex` — `put`/`get`
+    /// hold this across `KisekiFuse`'s internal `block_on`, so a
+    /// std mutex would block tokio worker threads under concurrency
+    /// (same starvation pattern fixed for `Nfs4Client`). Measured
+    /// pre-fix: c=1 p99 = 630µs, c=16 p99 = 218 ms.
+    fs: tokio::sync::Mutex<kiseki_client::fuse_fs::KisekiFuse<RemoteHttpGateway>>,
 }
 
 impl FuseDriver {
@@ -460,7 +528,7 @@ impl FuseDriver {
             )),
         );
         Self {
-            fs: std::sync::Mutex::new(fs),
+            fs: tokio::sync::Mutex::new(fs),
         }
     }
 }
@@ -471,15 +539,11 @@ impl Driver for FuseDriver {
         let payload = payload.to_vec();
         let name = format!("fuse-prof-{}", uuid::Uuid::new_v4().simple());
         let name_for_return = name.clone();
-        let mut fs = self
-            .fs
-            .lock()
-            .map_err(|e| format!("fuse lock: {e}"))?;
+        let mut fs = self.fs.lock().await;
         // KisekiFuse handles the gateway round-trip on a dedicated
         // tokio runtime via block_on, so this `create` is sync from
-        // our perspective. We're already inside the outer worker's
-        // async context but block_in_place isn't safe to use from
-        // the std mutex guard — KisekiFuse uses block_on directly.
+        // our perspective. The outer mutex is tokio::sync::Mutex so
+        // contended acquirers yield instead of blocking workers.
         fs.create(&name, payload)
             .map_err(|e| format!("fuse create errno {e}"))?;
         Ok(Key {
@@ -493,10 +557,7 @@ impl Driver for FuseDriver {
             .name
             .clone()
             .ok_or_else(|| "fuse get: key missing name".to_owned())?;
-        let fs = self
-            .fs
-            .lock()
-            .map_err(|e| format!("fuse lock: {e}"))?;
+        let fs = self.fs.lock().await;
         let attr = fs.lookup(&name).map_err(|e| format!("fuse lookup errno {e}"))?;
         let bytes = fs
             .read(attr.ino, 0, attr.size as u32)
