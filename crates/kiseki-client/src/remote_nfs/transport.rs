@@ -19,6 +19,12 @@ impl RpcTransport {
             .map_err(|e| GatewayError::ProtocolError(format!("NFS connect to {addr}: {e}")))?;
         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+        // Disable Nagle. NFS RPC is strict request/reply with sub-MSS
+        // bodies; the kernel's 40 ms delayed-ACK + Nagle on either
+        // peer adds 40 ms to every round-trip. The server already
+        // sets TCP_NODELAY on its accept side; both sides need it.
+        // Measured impact on NFSv4 64 KiB GET: 41 ms/op → ~5 ms/op.
+        stream.set_nodelay(true).ok();
         Ok(Self {
             stream,
             xid: 0x4B49_5345, // "KISE"

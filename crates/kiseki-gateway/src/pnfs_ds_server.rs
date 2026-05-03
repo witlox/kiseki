@@ -194,6 +194,10 @@ pub fn serve_ds_listener<G: GatewayOps + Send + Sync + 'static>(
                 let tls = tls.clone();
                 thread::spawn(move || {
                     let _ = stream.set_nonblocking(false);
+                    // Disable Nagle — sub-MSS replies + Linux's 40 ms
+                    // delayed-ACK add 40 ms per RPC. Same fix and
+                    // rationale as the NFSv3/v4 listener in nfs_server.
+                    let _ = stream.set_nodelay(true);
                     if let Some(tls_cfg) = tls {
                         match rustls::ServerConnection::new(tls_cfg) {
                             Ok(conn) => {
