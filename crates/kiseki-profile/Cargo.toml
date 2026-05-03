@@ -1,0 +1,40 @@
+[package]
+name = "kiseki-profile"
+description = "Standalone CPU + memory profiling driver for Kiseki data paths."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables dhat-rs for heap profiling (writes a dhat-heap.json on exit).
+# Build with `--features dhat` and run normally; the profile shows
+# allocation hot spots.
+dhat = ["dep:dhat"]
+
+[[bin]]
+name = "kiseki-profile"
+path = "src/main.rs"
+
+[dependencies]
+kiseki-client = { workspace = true, features = ["remote-http", "remote-nfs"] }
+kiseki-common = { workspace = true }
+kiseki-gateway = { workspace = true }
+
+async-trait = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+libc = { workspace = true }
+pprof = { version = "0.14", features = ["flamegraph"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+dhat = { version = "0.3", optional = true }

@@ -11,6 +11,10 @@
 // Binary crate: allow expect/unwrap for startup and top-level error handling.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 pub(crate) mod admin;
 pub(crate) mod admin_grpc;
 pub(crate) mod backup;
@@ -27,6 +31,40 @@ mod telemetry;
 pub(crate) mod web;
 
 fn main() {
+    // Heap-profile guard. When `--features dhat` AND the binary is
+    // run normally, this writes `dhat-heap.json` to CWD on exit.
+    // The instrumented allocator slows the data path by ~5×; only
+    // build with `--features dhat` for one-off captures.
+    // `DHAT_OUTPUT_FILE` overrides the output path so a profile
+    // matrix can write per-run JSON files without overwriting.
+    #[cfg(feature = "dhat")]
+    let _dhat = match std::env::var("DHAT_OUTPUT_FILE").ok() {
+        Some(path) => dhat::Profiler::builder().file_name(path).build(),
+        None => dhat::Profiler::new_heap(),
+    };
+
+    // CPU-profile guard. When `--features pprof` AND
+    // `KISEKI_PPROF_OUT=/path/to.svg` is set, the server runs a
+    // pprof sampling profiler at 99 Hz for the lifetime of the
+    // process and writes a flamegraph SVG on graceful shutdown.
+    // perf-event-paranoid bypass: pprof uses `setitimer` so it
+    // works even when `perf_event_open` is locked down.
+    #[cfg(feature = "pprof")]
+    let _pprof_guard = match std::env::var("KISEKI_PPROF_OUT").ok() {
+        Some(out) => match pprof::ProfilerGuardBuilder::default()
+            .frequency(99)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+        {
+            Ok(g) => Some((g, out)),
+            Err(e) => {
+                eprintln!("pprof: failed to build profiler guard: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
     // Check for admin subcommand before starting the server runtime.
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] != "--help" {
@@ -85,6 +123,15 @@ fn main() {
         .build()
         .expect("failed to build advisory tokio runtime");
 
+    // Construct the shared workflow table BEFORE spawning either
+    // runtime. The advisory gRPC service mutates it; the data-path
+    // gateway reads it for `x-kiseki-workflow-ref` validation. Both
+    // hold the same `Arc` so a `DeclareWorkflow` RPC is observable
+    // to the next S3 PUT immediately (ADR-021 §3.b).
+    let shared_workflow_table = std::sync::Arc::new(std::sync::Mutex::new(
+        kiseki_advisory::WorkflowTable::new(),
+    ));
+
     // Start advisory gRPC on the isolated runtime.
     // Clone TLS files ref for the advisory thread (both runtimes use
     // the same cert — they're the same node).
@@ -96,17 +143,24 @@ fn main() {
         key_path: t.key_path.clone(),
         crl_path: t.crl_path.clone(),
     });
+    let advisory_table_for_grpc = shared_workflow_table.clone();
     let advisory_handle = advisory_rt.spawn(async move {
-        if let Err(e) =
-            runtime::run_advisory(advisory_addr, advisory_stream_addr, advisory_tls.as_ref()).await
+        if let Err(e) = runtime::run_advisory(
+            advisory_addr,
+            advisory_stream_addr,
+            advisory_tls.as_ref(),
+            advisory_table_for_grpc,
+        )
+        .await
         {
             tracing::error!(error = %e, "advisory runtime error");
         }
     });
 
     // Run the main server on the main runtime.
+    let main_workflow_table = shared_workflow_table.clone();
     main_rt.block_on(async move {
-        if let Err(e) = runtime::run_main(cfg).await {
+        if let Err(e) = runtime::run_main(cfg, main_workflow_table).await {
             tracing::error!(error = %e, "server error");
             std::process::exit(1);
         }
@@ -114,6 +168,27 @@ fn main() {
 
     // Clean shutdown.
     advisory_rt.block_on(async { advisory_handle.await.ok() });
+
+    // Render the pprof flamegraph BEFORE telemetry shutdown so the
+    // file lands even if OTLP flush hangs. The guard is dropped
+    // here automatically when the function returns.
+    #[cfg(feature = "pprof")]
+    if let Some((guard, out_path)) = _pprof_guard {
+        match guard.report().build() {
+            Ok(report) => match std::fs::File::create(&out_path) {
+                Ok(file) => {
+                    if let Err(e) = report.flamegraph(file) {
+                        eprintln!("pprof: flamegraph render failed: {e}");
+                    } else {
+                        eprintln!("pprof: flamegraph written to {out_path}");
+                    }
+                }
+                Err(e) => eprintln!("pprof: cannot create {out_path}: {e}"),
+            },
+            Err(e) => eprintln!("pprof: report build failed: {e}"),
+        }
+    }
+
     tracing::info!("kiseki-server shut down");
     telemetry::shutdown_tracing(otel_provider);
 }

@@ -10,6 +10,19 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Self-CPU-profiling. When enabled (`KISEKI_PPROF_OUT=/path/to.svg`),
+# the server starts a pprof sampling guard at boot and writes a
+# flamegraph SVG to the given path on SIGTERM. Off by default —
+# pprof's perf-event-free sampler has measurable overhead.
+pprof = ["dep:pprof"]
+# Self-heap-profiling via dhat-rs. When enabled the server replaces
+# its global allocator with `dhat::Alloc` and writes `dhat-heap.json`
+# on exit. The instrumented allocator is significantly slower; only
+# build with this feature for one-off heap captures.
+dhat = ["dep:dhat"]
+
 [[bin]]
 name = "kiseki-server"
 path = "src/main.rs"
@@ -53,6 +66,9 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

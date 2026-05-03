@@ -7,8 +7,13 @@
 # Rust
 /target/
 /target-rocky9/
+/target-dhat/
 **/*.rs.bk
 # Cargo.lock is committed — workspace contains binaries (kiseki-server, kiseki-keyserver, kiseki-client-fuse).
+
+# Self-profiling artifacts (dhat default output, profile-matrix scratch dir)
+dhat-heap.json
+/tmp/kiseki-prof/
 
 # Go
 /control/vendor/

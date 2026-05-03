@@ -124,8 +124,15 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
 }
 
 /// Run the main data-path server.
+///
+/// `workflow_table` is shared with the advisory runtime — see
+/// `main.rs`. The data-path gateway uses it to validate the
+/// `x-kiseki-workflow-ref` header (ADR-021 §3.b / I-WA1).
 #[allow(clippy::too_many_lines)]
-pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_main(
+    cfg: ServerConfig,
+    workflow_table: std::sync::Arc<std::sync::Mutex<kiseki_advisory::WorkflowTable>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // --- Context construction ---
 
     // System disk detection (ADR-030).
@@ -638,10 +645,33 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         }
     }
     let gw = Arc::new(gw_builder);
+    // Wire the shared workflow table + Prometheus counter so the
+    // gateway's `x-kiseki-workflow-ref` header validation
+    // (mem_gateway::write) is fully observable end-to-end. Without
+    // this the gateway's atomic counters tick but `/metrics` shows
+    // zero — and the BDD harness has nothing to assert on.
+    gw.set_workflow_table(workflow_table.clone());
+    gw.set_workflow_ref_writes_metric(Arc::new(
+        metrics.gateway_workflow_ref_writes_total.clone(),
+    ));
+    // Mirror the gateway's atomic byte counters into the registered
+    // Prometheus counters so `/metrics` scrapes show live throughput.
+    // The GCP 2026-05-02 perf cluster reported these as 0 after
+    // 1 GB of writes — i.e. the wiring was missing. Asserted by the
+    // protocol-gateway BDD "operational metrics smoke" scenario.
+    gw.set_chunk_byte_metrics(
+        Arc::new(metrics.chunk_write_bytes.clone()),
+        Arc::new(metrics.chunk_read_bytes.clone()),
+    );
 
     // S3 gateway.
     let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&gw));
-    let s3_router = kiseki_gateway::s3_server::s3_router(s3_gw, bootstrap_tenant);
+    let s3_router = kiseki_gateway::s3_server::s3_router_full(
+        s3_gw,
+        bootstrap_tenant,
+        kiseki_gateway::s3_auth::AccessKeyStore::new(),
+        Some(Arc::new(metrics.gateway_requests_total.clone())),
+    );
     let s3_addr = cfg.s3_addr;
     let s3_tls = cfg.tls.as_ref().and_then(|files| {
         let ca = std::fs::read(&files.ca_path).ok()?;
@@ -791,14 +821,27 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
             &cluster_id_bytes,
         );
         let ds_port = cfg.ds_addr.map_or(2052, |a| a.port());
-        let storage_ds_addrs: Vec<String> = cfg
-            .raft_peers
-            .iter()
-            .map(|(_, addr)| {
-                let host = addr.split(':').next().unwrap_or(addr);
-                format!("{host}:{ds_port}")
-            })
-            .collect();
+        // ds_peers (KISEKI_DS_PEERS) is the explicit per-node DS-addr
+        // override. Required for localhost-multi-node where each node
+        // binds a distinct ephemeral DS port — the host-substitution
+        // fallback below would emit identical uaddrs and pNFS clients
+        // would round-robin to the wrong DS. When unset (containerized
+        // / hostnamed deployments where ds_port is shared), fall back
+        // to deriving DS addrs from raft_peers.
+        let storage_ds_addrs: Vec<String> = if cfg.ds_peers.is_empty() {
+            cfg.raft_peers
+                .iter()
+                .map(|(_, addr)| {
+                    let host = addr.split(':').next().unwrap_or(addr);
+                    format!("{host}:{ds_port}")
+                })
+                .collect()
+        } else {
+            cfg.ds_peers
+                .iter()
+                .map(|(_, addr)| addr.clone())
+                .collect()
+        };
         let mgr_cfg = kiseki_gateway::pnfs::MdsLayoutConfig {
             stripe_size_bytes: cfg.pnfs.stripe_size_bytes,
             layout_ttl_ms: cfg.pnfs.layout_ttl_seconds.saturating_mul(1000),
@@ -1039,9 +1082,30 @@ pub async fn run_main(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error
         );
     }
 
+    // Wait for SIGINT (ctrl-c) OR SIGTERM (kill <pid>) so the
+    // server cleans up — and on a `--features pprof` build the
+    // outer main can render a flamegraph SVG before exit. The BDD
+    // harness sends SIGTERM; the profile driver does too.
     let shutdown = async {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("data-path: shutdown signal received, draining...");
+        let mut sigterm = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "data-path: SIGTERM listener failed; falling back to SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("data-path: SIGINT received, draining...");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("data-path: SIGINT received, draining...");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("data-path: SIGTERM received, draining...");
+            }
+        }
     };
 
     let mut router = builder
@@ -1075,6 +1139,7 @@ pub async fn run_advisory(
     addr: SocketAddr,
     stream_addr: SocketAddr,
     tls_files: Option<&TlsFiles>,
+    workflow_table: Arc<std::sync::Mutex<kiseki_advisory::WorkflowTable>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let budget = BudgetConfig {
         hints_per_sec: 100,
@@ -1082,7 +1147,10 @@ pub async fn run_advisory(
         max_phases_per_workflow: 50,
     };
 
-    let advisory_svc = WorkflowAdvisoryServiceServer::new(AdvisoryGrpc::new(budget.clone()));
+    let advisory_svc = WorkflowAdvisoryServiceServer::new(AdvisoryGrpc::with_table(
+        workflow_table,
+        budget.clone(),
+    ));
 
     // Shared budget enforcer for the TCP stream server.
     let stream_budget = Arc::new(std::sync::Mutex::new(kiseki_advisory::BudgetEnforcer::new(
@@ -1110,9 +1178,29 @@ pub async fn run_advisory(
         tracing::warn!(%addr, "advisory gRPC listening (PLAINTEXT — development only)");
     }
 
+    // Wait for SIGINT or SIGTERM. The advisory runtime is awaited
+    // by `main` after the data-path completes; if it doesn't honor
+    // SIGTERM the binary hangs after a `kill <pid>` and (on
+    // `--features pprof` builds) the flamegraph SVG never renders.
     let shutdown = async {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("advisory: shutdown signal received, draining...");
+        let mut sigterm = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("advisory: SIGINT received, draining...");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("advisory: SIGINT received, draining...");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("advisory: SIGTERM received, draining...");
+            }
+        }
     };
 
     builder
