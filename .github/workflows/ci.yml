@@ -143,7 +143,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --exclude kiseki-acceptance --locked
+      # Two invocations because the kiseki-chunk-cluster gRPC + TLS
+      # tests hang under any workspace-parallel load (process-wide
+      # rustls CryptoProvider conflict with other tests' tonic
+      # clients). Running them in a separate nextest process gives
+      # them a fresh `rustls::crypto` install and they pass in 80 ms.
+      - run: cargo nextest run --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked --profile ci
+      - run: cargo nextest run -p kiseki-chunk-cluster --locked --profile ci
 
   acceptance:
     name: BDD Acceptance (fast suite)

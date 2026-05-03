@@ -1,0 +1,43 @@
+# cargo-nextest config — workspace defaults.
+#
+# Why a config:
+#   The default `test-threads = num_cpus` over-subscribes when many
+#   of our tests build their own multi-thread tokio runtime (each
+#   spawning ~num_cpus worker threads). With ~1650 tests across the
+#   workspace and several integration tests doing real TCP+TLS
+#   handshakes, the parallelism causes resource starvation: tests
+#   that pass in 80 ms in isolation take >180 s under workspace
+#   load (observed: `kiseki-chunk-cluster::grpc_tls_san_round_trip`
+#   and similar). nextest then marks them as failed.
+#
+#   Capping `test-threads` to half the host CPU count keeps
+#   per-test parallelism but leaves headroom for each test's own
+#   runtime threads, eliminating the starvation.
+
+[profile.default]
+# Default profile inherits these settings unless overridden by the
+# CI profile below.
+slow-timeout = { period = "30s", terminate-after = 8 }
+
+[profile.ci]
+# GitHub-hosted Linux runners are 4 vCPU. Cap test concurrency
+# at 2 so each test still has a CPU to share with whatever its
+# own multi-thread tokio runtime spawns. The slow-timeout
+# extension lets a contended test ride out a brief CPU spike
+# without being marked as failed.
+test-threads = 2
+slow-timeout = { period = "60s", terminate-after = 6 }
+fail-fast = false
+
+# The kiseki-chunk-cluster gRPC + TLS tests hang under workspace-
+# parallel load (process-wide rustls CryptoProvider conflict with
+# other tests' tonic clients). The CI workflow runs them in a
+# separate nextest invocation; this group keeps them serial WITHIN
+# that invocation just to be safe.
+[[profile.ci.overrides]]
+filter = 'binary(grpc_tls_san_round_trip) | binary(grpc_peer_round_trip)'
+test-group = 'tls-server'
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[test-groups]
+tls-server = { max-threads = 1 }
