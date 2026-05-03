@@ -13,6 +13,8 @@
 //! [cs]: crate::ClusteredChunkStore
 //! [gp]: crate::peer::GrpcFabricPeer
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry};
@@ -52,10 +54,16 @@ pub struct FabricMetrics {
     /// Per-op latency histogram, labeled by op.
     pub op_duration: HistogramVec,
     /// Healthy peer count (peers that have answered at least one
-    /// successful RPC since the last failure).
+    /// successful RPC since the last failure). Updated on every
+    /// `record_op` from the per-peer state in [`Self::peer_state`].
     pub peers_up: IntGauge,
     /// Total quorum-lost events at the leader's write fan-out path.
     pub quorum_lost_total: prometheus::IntCounter,
+    /// Per-peer current health: `true` after a successful op, `false`
+    /// after a non-OK / non-NOT_FOUND outcome. Drives the
+    /// `peers_up` gauge. Lock is held only across very short
+    /// `HashMap` reads/writes — never across IO.
+    peer_state: std::sync::Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl FabricMetrics {
@@ -105,15 +113,28 @@ impl FabricMetrics {
             op_duration,
             peers_up,
             quorum_lost_total,
+            peer_state: std::sync::Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Record a fabric op outcome + duration.
+    ///
+    /// Side-effect: refreshes the per-peer health map and re-counts
+    /// `peers_up`. `OK` and `NOT_FOUND` count as healthy (the peer
+    /// responded — `NOT_FOUND` is the protocol's "I don't have this
+    /// fragment" response, not a failure). `UNAVAILABLE`,
+    /// `REJECTED`, and `TRANSPORT` mark the peer as down.
     pub fn record_op(&self, op: &str, peer: &str, outcome: &str, dur: Duration) {
         self.ops_total.with_label_values(&[op, peer, outcome]).inc();
         self.op_duration
             .with_label_values(&[op])
             .observe(dur.as_secs_f64());
+        let healthy = matches!(outcome, outcome::OK | outcome::NOT_FOUND);
+        if let Ok(mut state) = self.peer_state.lock() {
+            state.insert(peer.to_owned(), healthy);
+            let up = state.values().filter(|v| **v).count();
+            self.peers_up.set(i64::try_from(up).unwrap_or(i64::MAX));
+        }
     }
 
     /// Record a quorum-lost write.
@@ -148,6 +169,34 @@ mod tests {
         assert!(names.contains("kiseki_fabric_peers_up"));
         assert!(names.contains("kiseki_fabric_quorum_lost_total"));
         assert_eq!(m.quorum_lost_total.get(), 1);
+    }
+
+    /// `kiseki_fabric_peers_up` should reflect the count of peers
+    /// that have responded successfully recently. Currently it is
+    /// stuck at 0 — the gauge is registered but never written. The
+    /// 2026-05-03 GCP transport-profile run reported `peers_up=0`
+    /// even while ~1500 successful peer ops were happening, because
+    /// `record_op` doesn't track per-peer state and never touches
+    /// the gauge. Pin the contract here: a successful op must move
+    /// `peers_up` above 0.
+    #[test]
+    fn peers_up_reflects_successful_peer_ops() {
+        let reg = Registry::new();
+        let m = FabricMetrics::register(&reg).expect("register ok");
+        // No ops yet → no peers up.
+        assert_eq!(m.peers_up.get(), 0);
+
+        // Two distinct peers each get a successful op. The gauge
+        // should now read 2.
+        m.record_op(op::PUT, "node-2", outcome::OK, Duration::from_millis(5));
+        m.record_op(op::PUT, "node-3", outcome::OK, Duration::from_millis(5));
+        assert_eq!(
+            m.peers_up.get(),
+            2,
+            "after one successful PUT to node-2 and one to node-3 the \
+             gauge should report 2 peers up; got {}",
+            m.peers_up.get(),
+        );
     }
 
     #[test]

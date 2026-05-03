@@ -122,7 +122,18 @@ fn build_fabric_channel(
 
     let mut endpoint = Endpoint::from(uri)
         .timeout(std::time::Duration::from_secs(10))
-        .connect_timeout(std::time::Duration::from_secs(5));
+        .connect_timeout(std::time::Duration::from_secs(5))
+        // HTTP/2 flow-control windows. Tonic / hyper default is
+        // 64 KiB per stream — for kiseki's 64+ MiB fabric envelopes
+        // that's 1024+ WINDOW_UPDATE round-trips per call. On a
+        // cross-AZ link with ~1 ms RTT that adds ≥1 s of pure
+        // bookkeeping latency. The 2026-05-03 GCP transport-profile
+        // run measured 2 s avg fabric PutFragment on a 28 Gbps
+        // wire, with 71 % of S3 PUTs hitting `quorum_lost` because
+        // peer ops missed the 5 s timeout. 16 MiB stream window
+        // collapses the round-trip count for a 64 MiB body to 4.
+        .initial_stream_window_size(16 * 1024 * 1024)
+        .initial_connection_window_size(32 * 1024 * 1024);
 
     if let Some(files) = tls_files {
         let ca_pem = std::fs::read(&files.ca_path)
@@ -1084,7 +1095,13 @@ pub async fn run_main(
         envelope_registry.clone(),
     );
 
-    let mut builder = tonic::transport::Server::builder();
+    let mut builder = tonic::transport::Server::builder()
+        // HTTP/2 flow-control windows. Match the fabric Channel
+        // settings — both peers need to grant a large window for
+        // 64+ MiB envelopes to flow without WINDOW_UPDATE round-trip
+        // storm. 2026-05-03 GCP fabric quorum-loss root cause.
+        .initial_stream_window_size(16 * 1024 * 1024)
+        .initial_connection_window_size(32 * 1024 * 1024);
 
     // Wire mTLS if configured.
     if let Some(ref tls_files) = cfg.tls {

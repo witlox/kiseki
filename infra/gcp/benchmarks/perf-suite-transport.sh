@@ -159,7 +159,7 @@ log "  should approach 3 × per-client baseline."
 node_ssh "${CLIENT_ARRAY[0]}" "
   mkdir -p /mnt/kiseki-pnfs
   umount /mnt/kiseki-pnfs 2>/dev/null || true
-  mount -t nfs4 -o vers=4.2,pnfs,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/ /mnt/kiseki-pnfs
+  mount -t nfs4 -o vers=4.2,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/default /mnt/kiseki-pnfs
   if mountpoint -q /mnt/kiseki-pnfs; then
     fio --name=pnfs-seed --directory=/mnt/kiseki-pnfs --rw=write --bs=1m \
       --size=16G --numjobs=1 --direct=1 --output-format=json 2>/dev/null >/dev/null
@@ -175,7 +175,7 @@ for idx in 0 1 2; do
   node_ssh "$CIP" "
     mkdir -p /mnt/kiseki-pnfs
     umount /mnt/kiseki-pnfs 2>/dev/null || true
-    mount -t nfs4 -o vers=4.2,pnfs,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/ /mnt/kiseki-pnfs 2>/dev/null
+    mount -t nfs4 -o vers=4.2,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/default /mnt/kiseki-pnfs 2>/dev/null
     if mountpoint -q /mnt/kiseki-pnfs; then
       fio --name=pnfs-agg --directory=/mnt/kiseki-pnfs --rw=read --bs=1m \
         --size=16G --numjobs=4 --direct=1 --group_reporting \
