@@ -255,11 +255,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      # Two passes to dodge the rustls global-state hang in
+      # kiseki-chunk-cluster's gRPC TLS tests under workspace-
+      # parallel cargo runs (same pattern as the Unit Tests job).
+      # `--no-report` skips report emission per-pass; the final
+      # `report` step merges both passes' coverage.
       - run: >
-          cargo llvm-cov --workspace
+          cargo llvm-cov --no-report --workspace
           --exclude kiseki-acceptance
+          --exclude kiseki-chunk-cluster
           --locked
-          --lcov --output-path lcov.info
+      - run: >
+          cargo llvm-cov --no-report --no-clean
+          -p kiseki-chunk-cluster
+          --locked
+      - run: cargo llvm-cov report --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v6
         with:
           files: lcov.info
