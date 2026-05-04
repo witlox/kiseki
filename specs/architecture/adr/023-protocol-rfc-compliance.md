@@ -1,7 +1,7 @@
 # ADR-023: Protocol RFC Compliance Scope and Test Discipline
 
-**Status**: Accepted (rev 3 — adds D7 client-side protocol library).
-**Date**: 2026-04-20 (rev 1) / **Revised**: 2026-04-27 (rev 2) / 2026-05-01 (rev 3)
+**Status**: Accepted (rev 4 — drops NFSv4.0 from scope).
+**Date**: 2026-04-20 (rev 1) / **Revised**: 2026-04-27 (rev 2) / 2026-05-01 (rev 3) / 2026-05-04 (rev 4)
 **Deciders**: Architect + implementer (rev 1); Architect → adversary
 gate 1 → implementer (rev 2).
 
@@ -22,6 +22,14 @@ gate 1 → implementer (rev 2).
   - Adds Layer 1 reference-decoder + per-spec-section unit-test
     requirement; rev 1's "Compliance testing approach" §
     superseded.
+- **rev 4 (2026-05-04)**: NFSv4.0 (RFC 7530) dropped from scope.
+  GCP perf-cluster mount with `vers=4.0` returned "Protocol not
+  supported"; the server only handles MINOR_VERSION ≥ 1. Rather
+  than implement v4.0 (no sessions, no callback channel, no real-
+  world clients that prefer it over 4.1/4.2), the supported
+  minimum NFSv4 minor version is now **4.1**. Modern Linux
+  defaults to 4.2 with 4.1 fallback; macOS/Solaris likewise.
+  Operator-facing docs document the floor.
 
 ## Context
 
@@ -186,7 +194,6 @@ Phase C:│  Critical-path data plane         │
         ┌───────────────────────────────────┐
 Phase D:│  NFSv3 path                       │
         │  RFC 1813                         │
-        │  RFC 7530 (4.0 fallback)          │
         └─────────────────┬─────────────────┘
                           ▼
         ┌───────────────────────────────────┐
@@ -367,7 +374,7 @@ The catalog at
 is the authoritative list. Highlights:
 
 - RFC 4506 (XDR), RFC 5531 (ONC RPC v2), RFC 1057 (AUTH flavors)
-- RFC 1813 (NFSv3), RFC 7530 (NFSv4.0), RFC 8881 (NFSv4.1,
+- RFC 1813 (NFSv3), RFC 8881 (NFSv4.1,
   obsoletes RFC 5661), RFC 7862 (NFSv4.2)
 - RFC 8435 (pNFS FFL), RFC 5665 (uaddr), RFC 9289 (NFS-over-TLS)
 - RFC 9110/9111/9112 (HTTP/1.1), RFC 3986 (URI), RFC 8446 (TLS 1.3)
