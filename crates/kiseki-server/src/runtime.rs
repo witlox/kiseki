@@ -799,6 +799,9 @@ pub async fn run_main(
     // Pre-clone the ADR-025 admin RPC counter; storage_admin_handler
     // is constructed below after `metrics` moves into the spawn.
     let storage_admin_calls_counter = Arc::new(metrics.storage_admin_calls_total.clone());
+    // Pre-clone the fabric metrics for the ClusterChunkServer wired
+    // further down; same reason — `metrics` moves into the spawn.
+    let cluster_chunk_server_fabric = Arc::clone(&metrics.fabric);
     tokio::spawn(async move {
         if let Err(e) = crate::metrics::run_metrics_server(
             metrics_addr,
@@ -1256,7 +1259,11 @@ pub async fn run_main(
     // ADR-025 W4 — same `Arc<MaintenanceMode>` shared with
     // `StorageAdminGrpc` above so the admin-flipped flag is
     // visible on this node's data path.
-    .with_maintenance(Arc::clone(&maintenance_mode), bootstrap_shard);
+    .with_maintenance(Arc::clone(&maintenance_mode), bootstrap_shard)
+    // Receiver-side fabric phase histograms — every incoming
+    // PutFragment observes its decode + write_chunk latency on
+    // `kiseki_fabric_put_recv_phase_duration_seconds`.
+    .with_metrics(cluster_chunk_server_fabric);
 
     let mut builder = tonic::transport::Server::builder()
         // HTTP/2 flow-control windows. Match the fabric Channel

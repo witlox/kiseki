@@ -59,6 +59,20 @@ pub struct FabricMetrics {
     pub peers_up: IntGauge,
     /// Total quorum-lost events at the leader's write fan-out path.
     pub quorum_lost_total: prometheus::IntCounter,
+    /// Sender-side `PutFragment` phase latency. Labels:
+    /// `phase` ∈ {`proto_encode`, `transport`}. The 2026-05-04 GCP
+    /// findings showed fabric PUT averaging 65–119 ms per 16 MiB
+    /// extent without telling us *where* the time went; with this
+    /// split + the receiver-side histogram below, an operator can
+    /// subtract to derive the network-only component:
+    /// `network ≈ send.transport - (recv.decode + recv.write_chunk)`.
+    pub put_send_phase_duration: HistogramVec,
+    /// Receiver-side `PutFragment` phase latency. Labels:
+    /// `phase` ∈ {`decode`, `write_chunk`}. `decode` covers
+    /// `proto_envelope_to_rust` plus the chunk-envelope-registry
+    /// record (memory copies); `write_chunk` covers the local
+    /// `AsyncChunkOps::write_chunk` / `write_fragment` call.
+    pub put_recv_phase_duration: HistogramVec,
     /// Per-peer current health: `true` after a successful op, `false`
     /// after a non-OK / non-NOT_FOUND outcome. Drives the
     /// `peers_up` gauge. Lock is held only across very short
@@ -108,13 +122,55 @@ impl FabricMetrics {
         )?;
         registry.register(Box::new(quorum_lost_total.clone()))?;
 
+        let put_send_phase_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "kiseki_fabric_put_send_phase_duration_seconds",
+                "Sender-side PutFragment phase latency: proto_encode, transport.",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["phase"],
+        )?;
+        registry.register(Box::new(put_send_phase_duration.clone()))?;
+
+        let put_recv_phase_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "kiseki_fabric_put_recv_phase_duration_seconds",
+                "Receiver-side PutFragment phase latency: decode, write_chunk.",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["phase"],
+        )?;
+        registry.register(Box::new(put_recv_phase_duration.clone()))?;
+
         Ok(Self {
             ops_total,
             op_duration,
             peers_up,
             quorum_lost_total,
+            put_send_phase_duration,
+            put_recv_phase_duration,
             peer_state: std::sync::Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Record a sender-side `PutFragment` phase observation.
+    /// `phase` is one of `"proto_encode"`, `"transport"`.
+    pub fn observe_put_send(&self, phase: &str, dur: Duration) {
+        self.put_send_phase_duration
+            .with_label_values(&[phase])
+            .observe(dur.as_secs_f64());
+    }
+
+    /// Record a receiver-side `PutFragment` phase observation.
+    /// `phase` is one of `"decode"`, `"write_chunk"`.
+    pub fn observe_put_recv(&self, phase: &str, dur: Duration) {
+        self.put_recv_phase_duration
+            .with_label_values(&[phase])
+            .observe(dur.as_secs_f64());
     }
 
     /// Record a fabric op outcome + duration.
@@ -159,6 +215,11 @@ mod tests {
             Duration::from_millis(2),
         );
         m.record_quorum_lost();
+        // Touch the put-phase histograms so the registry gathers
+        // them. `prometheus::Registry::gather` skips histograms
+        // with zero observations on at least one label set.
+        m.observe_put_send("proto_encode", Duration::from_micros(50));
+        m.observe_put_recv("decode", Duration::from_micros(50));
 
         // Scrape — confirm presence + non-zero observations.
         let families = reg.gather();
@@ -168,7 +229,51 @@ mod tests {
         assert!(names.contains("kiseki_fabric_op_duration_seconds"));
         assert!(names.contains("kiseki_fabric_peers_up"));
         assert!(names.contains("kiseki_fabric_quorum_lost_total"));
+        assert!(names.contains("kiseki_fabric_put_send_phase_duration_seconds"));
+        assert!(names.contains("kiseki_fabric_put_recv_phase_duration_seconds"));
         assert_eq!(m.quorum_lost_total.get(), 1);
+    }
+
+    /// The 2026-05-04 GCP perf cluster found fabric PUTs averaging
+    /// 65–119 ms per 16 MiB extent without telling us where the time
+    /// went. Pin the contract: a sender-side `proto_encode` /
+    /// `transport` observation must reach the histogram, and the
+    /// receiver-side `decode` / `write_chunk` observations must land
+    /// on their separate histogram. Without this, an operator scraping
+    /// `/metrics` cannot decompose the fabric PUT cost into its
+    /// network-versus-CPU-versus-IO components.
+    #[test]
+    fn put_phase_histograms_observe_per_label() {
+        let reg = Registry::new();
+        let m = FabricMetrics::register(&reg).expect("register ok");
+
+        m.observe_put_send("proto_encode", Duration::from_micros(150));
+        m.observe_put_send("transport", Duration::from_millis(25));
+        m.observe_put_recv("decode", Duration::from_micros(80));
+        m.observe_put_recv("write_chunk", Duration::from_millis(15));
+
+        for phase in ["proto_encode", "transport"] {
+            let count = m
+                .put_send_phase_duration
+                .with_label_values(&[phase])
+                .get_sample_count();
+            assert!(
+                count >= 1,
+                "kiseki_fabric_put_send_phase_duration_seconds{{phase={phase}}} \
+                 must observe at least one sample (got {count})",
+            );
+        }
+        for phase in ["decode", "write_chunk"] {
+            let count = m
+                .put_recv_phase_duration
+                .with_label_values(&[phase])
+                .get_sample_count();
+            assert!(
+                count >= 1,
+                "kiseki_fabric_put_recv_phase_duration_seconds{{phase={phase}}} \
+                 must observe at least one sample (got {count})",
+            );
+        }
     }
 
     /// `kiseki_fabric_peers_up` should reflect the count of peers

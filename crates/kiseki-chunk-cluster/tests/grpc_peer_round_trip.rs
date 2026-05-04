@@ -169,6 +169,72 @@ async fn fabric_metrics_record_per_op_outcomes() {
     assert_eq!(get_ok, 1, "GetFragment OK should increment exactly once");
 }
 
+/// The 2026-05-04 baseline showed fabric PUT averaging 65–119 ms
+/// per 16 MiB extent without telling us where the time went —
+/// `kiseki_fabric_op_duration_seconds` is one number per RPC. The
+/// new send/recv phase histograms decompose that into `proto_encode`
+/// + `transport` on the sender and `decode` + `write_chunk` on the
+/// receiver, so an operator can subtract to derive the network-only
+/// component. This test pins that one fabric PUT lands at least one
+/// observation on every phase label of both histograms.
+#[tokio::test]
+async fn put_phase_histograms_observe_on_real_round_trip() {
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(FabricMetrics::register(&registry).expect("register"));
+
+    let local = local_bridge("p");
+    let server =
+        ClusterChunkServer::new(Arc::clone(&local), "p").with_metrics(Arc::clone(&metrics));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let stream = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ClusterChunkServiceServer::new(server))
+            .serve_with_incoming(stream)
+            .await
+            .expect("server");
+    });
+    let uri: Uri = format!("http://{addr}").parse().expect("uri");
+    let channel = loop {
+        match Channel::builder(uri.clone()).connect().await {
+            Ok(c) => break c,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    let peer = GrpcFabricPeer::new("phase-test", channel).with_metrics(Arc::clone(&metrics));
+
+    let env = make_envelope(0x77);
+    let chunk_id = env.chunk_id;
+    let tenant = OrgId(uuid::Uuid::nil());
+    peer.put_fragment(chunk_id, 0, tenant, "p".into(), env)
+        .await
+        .expect("put");
+
+    for phase in ["proto_encode", "transport"] {
+        let count = metrics
+            .put_send_phase_duration
+            .with_label_values(&[phase])
+            .get_sample_count();
+        assert!(
+            count >= 1,
+            "kiseki_fabric_put_send_phase_duration_seconds{{phase={phase}}} \
+             must observe at least one sample after a fabric PUT (got {count})",
+        );
+    }
+    for phase in ["decode", "write_chunk"] {
+        let count = metrics
+            .put_recv_phase_duration
+            .with_label_values(&[phase])
+            .get_sample_count();
+        assert!(
+            count >= 1,
+            "kiseki_fabric_put_recv_phase_duration_seconds{{phase={phase}}} \
+             must observe at least one sample after a fabric PUT (got {count})",
+        );
+    }
+}
+
 #[tokio::test]
 async fn get_missing_chunk_maps_to_fabric_not_found() {
     let (_local, peer) = start_server_and_client("p").await;

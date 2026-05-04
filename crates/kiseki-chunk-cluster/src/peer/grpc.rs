@@ -240,7 +240,12 @@ impl FabricPeer for GrpcFabricPeer {
         envelope: Envelope,
     ) -> Result<bool, FabricPeerError> {
         let started = Instant::now();
+        let proto_encode_started = Instant::now();
         let env_proto = Self::rust_envelope_to_proto(&envelope);
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe_put_send("proto_encode", proto_encode_started.elapsed());
+        }
+        let transport_started = Instant::now();
         let result = with_retry(|| {
             let mut client = self.client.clone();
             let req = pb::PutFragmentRequest {
@@ -261,6 +266,9 @@ impl FabricPeer for GrpcFabricPeer {
         })
         .await
         .map_err(|s| status_to_fabric_err(&s));
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe_put_send("transport", transport_started.elapsed());
+        }
 
         match result {
             Ok(resp) => {

@@ -84,6 +84,13 @@ pub struct ClusterChunkServer {
     /// See `record_local_envelope_crypto` and the GCP 2026-05-02
     /// "1 of 6 readers fails AEAD" finding.
     chunk_envelope_meta: ChunkEnvelopeRegistry,
+    /// Optional fabric metrics — when wired, every `PutFragment`
+    /// observes its `decode` and `write_chunk` phase durations on
+    /// the server side. The 2026-05-04 GCP perf cluster left fabric
+    /// PUT latency invisible at the receiver; with this set, an
+    /// operator can subtract receiver phases from the sender's
+    /// `transport` phase to derive the network-only component.
+    metrics: Option<Arc<crate::FabricMetrics>>,
 }
 
 /// Shared handle to the per-chunk envelope crypto side table. Cloning
@@ -165,7 +172,21 @@ impl ClusterChunkServer {
             default_pool: default_pool.into(),
             chunk_envelope_meta: registry,
             maintenance: None,
+            metrics: None,
         }
+    }
+
+    /// Builder: attach the fabric metrics so receiver-side
+    /// `PutFragment` phases (`decode`, `write_chunk`) populate
+    /// `kiseki_fabric_put_recv_phase_duration_seconds`. Without
+    /// this, the histogram registers but never observes — exactly
+    /// the trap that `gateway_request_duration` fell into before
+    /// the 2026-05-04 wiring sweep. Tests + library callers that
+    /// don't wire metrics see a no-op.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<crate::FabricMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Builder: attach the per-shard maintenance flag store
@@ -329,6 +350,7 @@ impl ClusterChunkService for ClusterChunkServer {
                 ));
             }
         }
+        let decode_started = std::time::Instant::now();
         let req = request.into_inner();
 
         let envelope = req
@@ -354,23 +376,33 @@ impl ClusterChunkService for ClusterChunkServer {
             envelope.tenant_epoch,
             envelope.tenant_wrapped_material.clone(),
         );
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe_put_recv("decode", decode_started.elapsed());
+        }
 
         // Phase 16d step 2: route by fragment_index. index=0 keeps
         // the legacy whole-envelope path (Replication-N + dedup).
         // index>0 is an EC shard; store via write_fragment so the
         // bytes are addressed by (chunk_id, fragment_index).
+        let write_started = std::time::Instant::now();
         if req.fragment_index == 0 {
             let stored = self
                 .local
                 .write_chunk(envelope, &pool)
                 .await
                 .map_err(|e| chunk_err_to_status(&e))?;
+            if let Some(m) = self.metrics.as_ref() {
+                m.observe_put_recv("write_chunk", write_started.elapsed());
+            }
             Ok(Response::new(pb::PutFragmentResponse { stored }))
         } else {
             self.local
                 .write_fragment(&chunk_id, req.fragment_index, envelope.ciphertext)
                 .await
                 .map_err(|e| chunk_err_to_status(&e))?;
+            if let Some(m) = self.metrics.as_ref() {
+                m.observe_put_recv("write_chunk", write_started.elapsed());
+            }
             // EC fragment writes don't carry refcount semantics; report
             // stored=true so callers can count this as a successful ack.
             Ok(Response::new(pb::PutFragmentResponse { stored: true }))
