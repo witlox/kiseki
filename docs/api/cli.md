@@ -1,155 +1,178 @@
 # CLI Reference
 
-Kiseki provides two binaries with CLI interfaces: `kiseki-server` (which
-doubles as the admin CLI) and `kiseki-client` (native client with staging
-and cache commands).
+Kiseki ships three binaries:
 
-All admin operations use these CLIs. The underlying gRPC API is also
-available for programmatic access (see [gRPC](grpc.md)), but the CLI is
-the primary admin interface.
+| Binary | Purpose |
+|---|---|
+| `kiseki-server` | Storage node daemon. No subcommands — configuration is via environment variables (see [Environment Variables](environment.md)). |
+| `kiseki-admin` | Lightweight HTTP-based cluster summary CLI. Connects to any node's metrics port (default `:9090`). Zero external dependencies — safe to run from a workstation. |
+| `kiseki-storage` | Full `StorageAdminService` gRPC client (ADR-025). 26 verbs covering every storage admin RPC: pools, devices, shards, tuning, repair, scrub, streaming events. |
+
+The native client (`kiseki-client`) is documented at the end for dataset staging and cache management on compute nodes.
 
 ---
 
 ## kiseki-server
 
-The server binary starts the storage node when invoked without arguments.
-When invoked with a subcommand, it acts as an admin CLI that connects to
-the local node's gRPC endpoint.
-
-### Server mode
-
 ```
 kiseki-server
 ```
 
-Starts the storage node. Configuration is via environment variables (see
-[Environment Variables](environment.md)).
+Starts the storage node. All configuration is via environment variables — there are no positional arguments or subcommands. Run with `KISEKI_DATA_DIR=/var/lib/kiseki` (or unset for in-memory mode), `KISEKI_DATA_ADDR=0.0.0.0:50051`, etc. Full list in [Environment Variables](environment.md).
+
+---
+
+## kiseki-admin (HTTP cluster summary)
+
+Standalone remote administration CLI. Talks to any node's metrics+admin HTTP port (default `:9090`). No mTLS required (the metrics port is plaintext); intended for read-only cluster summaries and a small set of cluster-wide ops (maintenance, backup trigger, scrub trigger). For per-pool / per-device / per-shard mutations, use `kiseki-storage`.
+
+Default endpoint: `KISEKI_ENDPOINT` env var, or `http://localhost:9090`.
 
 ### status
 
 ```
-kiseki-server status
+kiseki-admin --endpoint http://storage-node:9090 status
 ```
 
-Display cluster status summary: node count, shard count, device health,
-Raft leadership, and pool utilization.
-
-### Node management
+Cluster status summary: node count, Raft entries, gateway requests, data written/read, and active connections.
 
 ```
-kiseki-server node add --node-id <id>
-kiseki-server node drain --node-id <id>
-kiseki-server node remove --node-id <id>
+Cluster Status
+══════════════
+Nodes:       3/3 healthy
+Raft:        42,567 entries
+Requests:    1,234 served
+Written:     12.5 GB
+Read:        8.2 GB
+Connections: 15 active
 ```
 
-Add, drain, or remove a node from the cluster. Drain migrates shard
-assignments before removal. See
-[Cluster Management](../admin/cluster-management.md).
-
-### Shard management
+### nodes
 
 ```
-kiseki-server shard list
-kiseki-server shard info --shard-id <id>
-kiseki-server shard health --shard-id <id>
-kiseki-server shard split --shard-id <id> [--boundary <key>]
-kiseki-server shard maintenance --shard-id <id> --enabled
-kiseki-server shard maintenance --shard-id <id> --disabled
+kiseki-admin nodes
 ```
 
-List shards, inspect details, check health, trigger manual splits, and
-toggle per-shard maintenance mode (I-O6).
+Per-node table with health badges + per-node metrics aggregated across the cluster.
 
-### Pool management
-
-```
-kiseki-server pool list
-kiseki-server pool status --pool-id <id>
-kiseki-server pool create --pool-id <id> --device-class <class> --ec-data <n> --ec-parity <n>
-kiseki-server pool set-durability --pool-id <id> --ec-data <n> --ec-parity <n>
-kiseki-server pool rebalance --pool-id <id>
-kiseki-server pool cancel-rebalance --pool-id <id>
-kiseki-server pool set-thresholds --pool-id <id> --warning-pct <n> --critical-pct <n>
-```
-
-Manage affinity pools: create, inspect capacity, set EC parameters,
-rebalance data, and adjust capacity thresholds (I-C5, I-C6).
-
-### Device management
+### events
 
 ```
-kiseki-server device list
-kiseki-server device info --device-id <id>
-kiseki-server device evacuate --device-id <id>
-kiseki-server device cancel-evacuation --device-id <id>
-kiseki-server device scrub --device-id <id>
+kiseki-admin events [--severity {info|warning|error|critical}] [--hours N]
 ```
 
-List devices, check health and SMART status, trigger evacuation or
-integrity scrub, and cancel in-progress evacuations (I-D2, I-D3, I-D5).
+Filtered event log. `--hours` defaults to 3.
 
-### Maintenance mode
-
-```
-kiseki-server maintenance on
-kiseki-server maintenance off
-```
-
-Enable or disable cluster-wide maintenance mode. Sets all shards to
-read-only. Write commands are rejected with a retriable error. Shard
-splits, compaction, and GC for in-progress operations continue but no
-new triggers fire from write pressure (I-O6).
-
-### Backup and recovery
+### history
 
 ```
-kiseki-server backup create
-kiseki-server backup list
-kiseki-server backup delete --backup-id <id>
-kiseki-server repair list
-kiseki-server compact
+kiseki-admin history [--hours N]
 ```
 
-Create, list, and delete backup snapshots. List active repairs and
-evacuations. Trigger Raft log compaction.
+Metric history time series (default 3 h).
 
-### Key management
-
-```
-kiseki-server keymanager health
-kiseki-server keymanager check-kms
-kiseki-server keymanager check-kms --tenant-id <id>
-```
-
-Check system key manager health and tenant KMS connectivity.
-
-### S3 credentials
+### maintenance / backup / scrub
 
 ```
-kiseki-server s3-credentials create --tenant-id <id> --workload-id <id>
+kiseki-admin maintenance on
+kiseki-admin maintenance off
+kiseki-admin backup
+kiseki-admin scrub
 ```
 
-Provision S3-compatible access keys for a tenant workload via the
-control plane.
+Toggle cluster-wide maintenance mode (sets all shards read-only — write commands return a retriable error per I-O6), trigger an immediate backup snapshot (ADR-016), or kick off an integrity scrub.
 
-### Tuning parameters
+---
+
+## kiseki-storage (gRPC StorageAdminService)
+
+Full client for the `StorageAdminService` defined in ADR-025. 26 verbs — one per RPC. Connects via tonic gRPC (mTLS-aware once the server is configured for it). Exhaustive coverage of pool / device / shard / tuning / repair / scrub admin surface.
+
+Default endpoint: `KISEKI_STORAGE_ENDPOINT` env var, or `http://localhost:50051` (the data-path gRPC port). Override with `--endpoint <url>`.
+
+### Devices
 
 ```
-kiseki-server tuning set --inline-threshold-bytes <n>
-kiseki-server tuning set --raft-snapshot-interval <n>
-kiseki-server tuning set --compaction-rate-mb-s <n>
-kiseki-server tuning set --stream-proc-poll-ms <n>
+kiseki-storage devices list [--pool <name>]
+kiseki-storage devices get <device-id>
+kiseki-storage devices add <pool> <device-id> [--capacity <bytes>] [--class {nvme_ssd|ssd|hdd|mixed}]
+kiseki-storage devices remove <device-id>
+kiseki-storage devices evacuate <device-id> [--throughput <mb/s>]
+kiseki-storage devices cancel-evacuation <evac-id>
 ```
 
-Adjust cluster-wide tuning parameters. See
-[Performance Tuning](../operations/performance.md) for guidance.
+`evacuate` returns an `evacuation_id` that the matching `cancel-evacuation` consumes. The drain orchestrator (ADR-035) is the consumer of progress updates.
+
+### Pools
+
+```
+kiseki-storage pools list
+kiseki-storage pools get <name>
+kiseki-storage pools status <name>
+kiseki-storage pools create <name> --class <kind> --durability {replication|erasure_coding} \
+                                   [--copies N | --data-shards N --parity-shards N] \
+                                   [--capacity <bytes>]
+kiseki-storage pools set-durability <name> --durability <kind> [--copies N | --data-shards N --parity-shards N]
+kiseki-storage pools set-thresholds <name> [--warn N] [--critical N] [--readonly N] [--target N]
+kiseki-storage pools rebalance <name> [--throughput <mb/s>]
+```
+
+`create` / `set-durability` validate per ADR-005: replication copies in `[2, 5]`, EC data shards `[2, 16]`, EC parity shards `[1, 8]`. `set-durability` rejects when the pool is non-empty (`used_bytes > 0`) — durability change while data exists requires a separate migration plan.
+
+`set-thresholds` validates per ADR-024: warning ∈ `[50, 95]`, critical ∈ `[60, 98]`, readonly ∈ `[70, 99]`, target_fill ∈ `[50, 90]`, with cross-field ordering `warning < critical < readonly`. Zero is treated as "unset" (uses ADR-024 defaults).
+
+### Tuning
+
+```
+kiseki-storage tuning get
+kiseki-storage tuning set KEY=VALUE [KEY=VALUE...]
+```
+
+`tuning get` returns the 8 cluster-wide parameters from ADR-025 §"Cluster-wide tuning". `tuning set` accepts one or more `KEY=VALUE` overrides; the rest of the params keep their current values. Recognised keys: `compaction_rate_mb_s` (10..=1000), `gc_interval_s` (60..=3600), `rebalance_rate_mb_s` (0..=500), `scrub_interval_h` (24..=720), `max_concurrent_repairs` (1..=32), `stream_proc_poll_ms` (10..=1000), `inline_threshold_bytes` (512..=65536), `raft_snapshot_interval` (1000..=100000).
+
+Persisted to `<KISEKI_DATA_DIR>/tuning/tuning.redb` when the data dir is set; in-memory otherwise. Survives server restart.
+
+### Cluster + observability
+
+```
+kiseki-storage cluster status
+kiseki-storage device-health [--device <id>]
+kiseki-storage io-stats [--pool <name>]
+```
+
+`cluster status` returns aggregated node count, total/used capacity, leader node, and a sampled-at timestamp. `device-health` and `io-stats` are server-streaming RPCs — they consume one event per invocation today (a `--watch` mode lands once the data-path producers ship). The producers (chunk-store device-state observer, chunk-cluster IOStats sampler) are wired in follow-on PRs; until then both streams hold open subscriptions but emit nothing.
+
+### Shards
+
+```
+kiseki-storage shards list [--tenant <id>]
+kiseki-storage shards get <id>
+kiseki-storage shards split <id> [--pivot <key>]
+kiseki-storage shards merge <left-id> <right-id>
+kiseki-storage shards maintenance <id> {on|off}
+```
+
+`split` returns `(left_shard_id, right_shard_id)` — the original shard becomes "left" (lower half of the key range), the new shard is "right". `merge` is right-into-left: the left id survives, the right is decommissioned (ADR-034 protocol; `Retiring` state). `maintenance` flips a per-shard atomic that gates writes (`PutFragment` returns `FailedPrecondition`) while leaving reads served.
+
+### Repair / scrub
+
+```
+kiseki-storage scrub [--pool <name>]
+kiseki-storage repair-chunk <chunk-id-hex>
+kiseki-storage repairs list [--limit N]
+```
+
+`scrub` triggers an on-demand pass via `ScrubScheduler::trigger_now()` — returns a `scrub_id` immediately; the pass runs async and writes a record into the repair tracker. `repair-chunk` reuses the under-replication scrub on a single-chunk candidate list and reports `already_healthy` when the placement matched the policy. `repairs list` returns up to N (default 100, max 1000) most-recent records — newest first.
+
+### Observability
+
+Every `kiseki-storage` RPC emits an OpenTelemetry span named `StorageAdminService.<RpcName>` and bumps the Prometheus counter `kiseki_storage_admin_calls_total{rpc, outcome}` where `outcome` is one of `ok`, `client_error`, `server_error`, `unimplemented`. Operator audit log: every `tuning set` is also logged at `tracing::info` with the full parameter set.
 
 ---
 
 ## kiseki-client
 
-The native client binary provides dataset staging and cache management
-commands for compute nodes.
+The native client binary provides dataset staging and cache management commands for compute nodes.
 
 ### stage --dataset
 
@@ -157,13 +180,9 @@ commands for compute nodes.
 kiseki-client stage --dataset <path> [--timeout <seconds>]
 ```
 
-Pre-fetch a dataset's chunks into the L2 cache with pinned retention.
-Recursively enumerates compositions under the given namespace path, fetches
-all chunks from canonical, verifies by content-address (SHA-256), and
-stores in the L2 cache pool.
+Pre-fetch a dataset's chunks into the L2 cache with pinned retention. Recursively enumerates compositions under the given namespace path, fetches all chunks from canonical, verifies by content-address (SHA-256), and stores in the L2 cache pool.
 
-Staging is idempotent and resumable. Produces a manifest file listing
-staged compositions and chunk IDs.
+Staging is idempotent and resumable. Produces a manifest file listing staged compositions and chunk IDs.
 
 Limits: `max_staging_depth` (10 levels), `max_staging_files` (100,000).
 
@@ -173,8 +192,7 @@ Limits: `max_staging_depth` (10 levels), `max_staging_files` (100,000).
 kiseki-client stage --status
 ```
 
-Show the status of the current staging operation: progress, number of
-chunks fetched, total size, and any errors.
+Show the status of the current staging operation: progress, number of chunks fetched, total size, and any errors.
 
 ### stage --release
 
@@ -182,8 +200,7 @@ chunks fetched, total size, and any errors.
 kiseki-client stage --release <path>
 ```
 
-Release a staged dataset. Unpins cached chunks, making them eligible for
-LRU eviction. To pick up updates from canonical, release and re-stage.
+Release a staged dataset. Unpins cached chunks, making them eligible for LRU eviction. To pick up updates from canonical, release and re-stage.
 
 ### stage --release-all
 
@@ -199,8 +216,7 @@ Release all staged datasets.
 kiseki-client cache --stats
 ```
 
-Print cache statistics: mode, L1/L2 bytes used, hit/miss counts, errors,
-metadata cache stats, and wipe count.
+Print cache statistics: mode, L1/L2 bytes used, hit/miss counts, errors, metadata cache stats, and wipe count.
 
 ### cache --wipe
 
@@ -208,8 +224,7 @@ metadata cache stats, and wipe count.
 kiseki-client cache --wipe
 ```
 
-Wipe all cached data (L1 + L2 + metadata). Zeroizes data before deletion
-(I-CC2).
+Wipe all cached data (L1 + L2 + metadata). Zeroizes data before deletion (I-CC2).
 
 ### version
 
@@ -232,112 +247,12 @@ Print the client version.
 
 ---
 
-## kiseki-admin
-
-Standalone remote administration CLI. Runs from an admin workstation
-and connects to any Kiseki node via the REST API (port 9090). No server
-dependencies are needed on the workstation.
-
-Default endpoint: `KISEKI_ENDPOINT` env var, or `http://localhost:9090`.
-
-### status
-
-```
-kiseki-admin --endpoint http://storage-node:9090 status
-```
-
-Cluster status summary: node count, Raft entries, gateway requests,
-data written/read, and active connections.
-
-Example output:
-
-```
-Cluster Status
-══════════════
-Nodes:       3/3 healthy
-Raft:        42,567 entries
-Requests:    1,234 served
-Written:     12.5 GB
-Read:        8.2 GB
-Connections: 15 active
-```
-
-### nodes
-
-```
-kiseki-admin nodes
-```
-
-Node list with health badges and per-node metrics.
-
-Example output:
-
-```
-NODE              STATUS    RAFT     REQUESTS  WRITTEN   READ      CONNS
-10.0.0.1:9090     healthy   14,189   411       4.2 GB    2.7 GB    5
-10.0.0.2:9090     healthy   14,189   412       4.2 GB    2.8 GB    5
-10.0.0.3:9090     healthy   14,189   411       4.1 GB    2.7 GB    5
-```
-
-### events
-
-```
-kiseki-admin events [--severity error] [--hours 1]
-```
-
-Filtered event log. Optional `--severity` (info, warning, error,
-critical) and `--hours` (default: 3).
-
-Example output:
-
-```
-TIME      SEVERITY  CATEGORY  SOURCE    MESSAGE
-12:34:56  ERROR     node      node-3    unreachable
-12:35:12  ERROR     device    nvme0n1   CRC mismatch detected
-```
-
-### history
-
-```
-kiseki-admin history [--hours 3]
-```
-
-Metric history time series for the specified number of hours (default: 3).
-
-### maintenance
-
-```
-kiseki-admin maintenance on
-kiseki-admin maintenance off
-```
-
-Toggle cluster-wide maintenance mode. Enables read-only on all shards.
-Write commands return a retriable error (I-O6).
-
-### backup
-
-```
-kiseki-admin backup
-```
-
-Trigger a background backup operation (ADR-016).
-
-### scrub
-
-```
-kiseki-admin scrub
-```
-
-Trigger a background data integrity scrub.
-
----
-
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | General error |
+| 1 | General error (incl. RPC `server_error` outcome) |
 | 2 | Invalid arguments |
 | 3 | Connection failure (server unreachable) |
 | 4 | Authentication failure (mTLS) |

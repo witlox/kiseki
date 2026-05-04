@@ -142,27 +142,34 @@ tenant KEK operations require network calls (ADR-003).
 
 ## StorageAdminService (ADR-025)
 
-**Port**: Management network
+**Port**: Same as the data-path gRPC server (default `:50051`)
 **Provider**: `kiseki-server`
-**Consumers**: Cluster admin, SRE (read-only role)
+**Consumers**: Cluster admin via `kiseki-storage` CLI; programmatic admin tooling
+**Status**: 26 of 26 RPCs implemented end-to-end (W2-W7 landed 2026-05-03)
 
 | RPC | Type | Description |
 |---|---|---|
-| `ClusterStatus` | Unary | Cluster-wide status summary |
+| `ClusterStatus` | Unary | Cluster-wide status summary (node/shard/pool counts, total/used capacity, leader) |
 | `ListDevices` / `GetDevice` | Unary | Query storage devices |
-| `AddDevice` / `RemoveDevice` | Unary | Add or remove a device (removal requires Removed state) |
+| `AddDevice` / `RemoveDevice` | Unary | Add a device to a pool / remove a device from its pool |
 | `EvacuateDevice` / `CancelEvacuation` | Unary | Trigger or cancel device evacuation |
-| `ListPools` / `GetPool` / `PoolStatus` | Unary | Query affinity pools |
-| `CreatePool` / `SetPoolDurability` / `SetPoolThresholds` | Unary | Manage pool configuration |
-| `RebalancePool` / `CancelRebalance` | Unary | Trigger or cancel pool rebalance |
-| `ListShards` / `GetShard` / `GetShardHealth` | Unary | Query shard state |
-| `SplitShard` / `SetShardMaintenance` | Unary | Shard management |
-| `SetTuningParams` / `GetTuningParams` | Unary | Runtime tuning parameters |
-| `DrainNode` | Unary | Drain all shards and chunks from a node |
-| `TriggerScrub` / `RepairChunk` / `ListRepairs` | Unary | Data integrity operations |
-| `DeviceHealth` | Server streaming | Live device health events |
-| `IOStats` | Server streaming | Live I/O statistics |
-| `DeviceIOStats` | Server streaming | Per-device I/O statistics |
+| `ListPools` / `GetPool` / `PoolStatus` | Unary | Query affinity pools (PoolStatus also returns capacity_state ∈ ok/warning/critical/readonly) |
+| `CreatePool` / `SetPoolDurability` | Unary | Pool lifecycle (durability change rejected when pool is non-empty) |
+| `SetPoolThresholds` | Unary | Per-pool capacity thresholds; ADR-024 defaults when unset |
+| `RebalancePool` | Unary | Trigger pool rebalance; returns rebalance_id |
+| `ListShards` / `GetShard` | Unary | Query shard state (members, leader, last_applied) |
+| `SplitShard` / `MergeShards` | Unary | Shard split/merge per ADR-033/034 |
+| `SetShardMaintenance` | Unary | Per-shard atomic flag — gates writes (`PutFragment` returns `FailedPrecondition`); reads stay served |
+| `GetTuningParams` / `SetTuningParams` | Unary | Cluster-wide tuning (8 parameters; persisted to redb when KISEKI_DATA_DIR is set) |
+| `TriggerScrub` / `RepairChunk` / `ListRepairs` | Unary | On-demand integrity ops + history ring (4096 records) |
+| `DeviceHealth` | Server streaming | Live device-state-transition events (broadcast(1024)) |
+| `IOStats` | Server streaming | Periodic I/O stats samples (broadcast(1024)) |
+
+**Observability**: every RPC emits `StorageAdminService.<RpcName>` OTEL span and bumps `kiseki_storage_admin_calls_total{rpc, outcome}` (outcome ∈ ok / client_error / server_error / unimplemented).
+
+**Cluster scope**: W4/W5 mutations are *node-local* today (`committed_at_log_index = 0` in responses). Multi-node Raft replication of these mutations via the cluster control shard's delta enum is documented as a follow-up in `specs/implementation/adr-025-storage-admin-api.md`.
+
+**Producer wiring (W7 streams)**: the `DeviceHealth` and `IOStats` channels exist and admin clients can subscribe today, but the data-path producers (chunk-store device-state observer, chunk-cluster periodic IOStats sampler) land in follow-on PRs. Until then the streams hold open subscriptions but emit nothing.
 
 ---
 
