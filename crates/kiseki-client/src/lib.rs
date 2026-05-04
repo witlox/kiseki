@@ -10,6 +10,7 @@
 //!   - I-Auth1 — mTLS with Cluster CA for data fabric connections
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod advisory;
 pub mod batching;

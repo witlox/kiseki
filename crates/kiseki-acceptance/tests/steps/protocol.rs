@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for protocol RFC features:
 //! - nfs3-rfc1813.feature (18 scenarios)
 //! - nfs4-rfc7862.feature (27 scenarios)

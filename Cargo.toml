@@ -51,8 +51,18 @@ missing_panics_doc = "allow"
 float_cmp = "deny"
 todo = "deny"
 unimplemented = "deny"
-# unwrap/expect/panic: not lint-enforced (review-enforced in production code).
-# Tests and integration code use these freely. Matches pact pattern.
+# Storage-system safety: `.unwrap()` in production code is forbidden.
+# Use one of:
+#   - `kiseki_common::locks::LockOrDie::lock_or_die("name")` for data-path
+#     locks (panic with structured tracing on poison; cluster routes
+#     around via Raft + advisory).
+#   - `kiseki_common::locks::LockOrWarn::lock_or_warn("name")` for
+#     telemetry / metrics locks (recover, but warn-trace so the
+#     upstream panic is observable).
+#   - `.expect("invariant message")` for safe-by-construction sites
+#     where the panic message documents WHY this never fires.
+# `#[cfg(test)]` modules are exempt — tests use unwrap freely.
+unwrap_used = "deny"
 
 [workspace.dependencies]
 # --- Internal crates ---

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **AWS S3 REST API** (no IETF RFC;
 //! AWS publishes the REST API reference + error code list).
 //!

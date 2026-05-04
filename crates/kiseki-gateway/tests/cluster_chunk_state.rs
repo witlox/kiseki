@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Phase 16b step 1 — gateway-side `ChunkAndDelta` emission.
 //!
 //! Verifies that when a chunk is freshly written through the gateway,

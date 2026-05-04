@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Steps for `@integration @multi-node` scenarios.
 //!
 //! Cluster-aware scenarios acquire the process-level singleton from

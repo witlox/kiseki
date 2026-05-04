@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! kiseki-admin -- remote cluster administration CLI.
 //!
 //! Connects to any Kiseki node via the REST API at `:9090`.

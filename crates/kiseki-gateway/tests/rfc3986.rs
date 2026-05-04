@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 3986 — Uniform Resource
 //! Identifier (URI): Generic Syntax** (January 2005).
 //!

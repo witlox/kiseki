@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Per-scenario state for `@multi-node` cluster steps.
 //!
 //! The 3-node cluster itself is a process-level singleton (see

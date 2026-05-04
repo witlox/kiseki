@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Smoke tests for generated protobuf types.
 //!
 //! Verifies the Phase 0 exit criterion "protobuf generates cleanly": a

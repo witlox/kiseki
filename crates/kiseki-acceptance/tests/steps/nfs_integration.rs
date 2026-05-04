@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! @integration NFS step definitions — real TCP RPC to running server
 //! via kiseki-client's NFS protocol library.
 //!

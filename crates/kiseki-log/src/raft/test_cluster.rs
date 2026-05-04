@@ -283,7 +283,7 @@ impl RaftTestCluster {
             .collect();
         nodes
             .get(&1)
-            .unwrap()
+            .expect("node 1 must exist in the test cluster — caller's invariant")
             .raft
             .initialize(members)
             .await

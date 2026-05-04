@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for erasure-coding.feature — EC BDD scenarios.
 
 use cucumber::{given, then, when};

@@ -15,6 +15,7 @@ use kiseki_crypto::keys::SystemMasterKey;
 use crate::epoch::{EpochInfo, KeyManagerOps};
 use crate::error::KeyManagerError;
 use crate::health::{KeyManagerHealth, KeyManagerStatus};
+use kiseki_common::locks::LockOrDie;
 
 /// Entry for a single epoch in the key store.
 struct EpochEntry {
@@ -100,7 +101,7 @@ impl MemKeyStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.inner");
         KeyManagerHealth {
             status: inner.status,
             epoch_count: inner.epochs.len(),
@@ -117,7 +118,7 @@ impl MemKeyStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.inner");
         inner.status = status;
     }
 
@@ -157,7 +158,7 @@ impl KeyManagerOps for MemKeyStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.inner");
         if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -173,7 +174,7 @@ impl KeyManagerOps for MemKeyStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.inner");
         if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -189,7 +190,7 @@ impl KeyManagerOps for MemKeyStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.inner");
         if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -238,7 +239,7 @@ impl KeyManagerOps for MemKeyStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.inner");
         let entry = inner
             .epochs
             .iter_mut()
@@ -252,7 +253,7 @@ impl KeyManagerOps for MemKeyStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.inner");
         inner
             .epochs
             .iter()

@@ -11,6 +11,7 @@ use std::sync::RwLock;
 use kiseki_common::tenancy::{ComplianceTag, DedupPolicy, Quota};
 
 use crate::error::ControlError;
+use kiseki_common::locks::LockOrDie;
 
 /// Organization — top-level tenant (I-T1, I-T3).
 #[derive(Clone, Debug)]
@@ -132,7 +133,7 @@ impl TenantStore {
 
     /// Create a new organization.
     pub fn create_org(&self, org: Organization) -> Result<(), ControlError> {
-        let mut orgs = self.orgs.write().unwrap();
+        let mut orgs = self.orgs.write().lock_or_die("tenant.unknown");
         if orgs.contains_key(&org.id) {
             return Err(ControlError::AlreadyExists(format!(
                 "organization {}",
@@ -145,7 +146,7 @@ impl TenantStore {
 
     /// Get an organization by ID.
     pub fn get_org(&self, id: &str) -> Result<Organization, ControlError> {
-        let orgs = self.orgs.read().unwrap();
+        let orgs = self.orgs.read().lock_or_die("tenant.unknown");
         orgs.get(id)
             .cloned()
             .ok_or_else(|| ControlError::NotFound(format!("organization {id}")))
@@ -154,7 +155,7 @@ impl TenantStore {
     /// List all organizations.
     #[must_use]
     pub fn list_orgs(&self) -> Vec<Organization> {
-        let orgs = self.orgs.read().unwrap();
+        let orgs = self.orgs.read().lock_or_die("tenant.unknown");
         orgs.values().cloned().collect()
     }
 
@@ -163,21 +164,21 @@ impl TenantStore {
     /// Holds org read lock during quota validation and project insert
     /// to prevent TOCTOU (G-ADV-4).
     pub fn create_project(&self, proj: Project) -> Result<(), ControlError> {
-        let orgs = self.orgs.read().unwrap();
+        let orgs = self.orgs.read().lock_or_die("tenant.unknown");
         let org = orgs
             .get(&proj.org_id)
             .ok_or_else(|| ControlError::NotFound(format!("organization {}", proj.org_id)))?;
         validate_quota(&org.quota, &proj.quota)?;
 
         // Hold org lock while inserting project — prevents TOCTOU.
-        let mut projects = self.projects.write().unwrap();
+        let mut projects = self.projects.write().lock_or_die("tenant.unknown");
         projects.insert(proj.id.clone(), proj);
         Ok(())
     }
 
     /// Get a project by ID.
     pub fn get_project(&self, id: &str) -> Result<Project, ControlError> {
-        let projects = self.projects.read().unwrap();
+        let projects = self.projects.read().lock_or_die("tenant.unknown");
         projects
             .get(id)
             .cloned()
@@ -186,20 +187,20 @@ impl TenantStore {
 
     /// Create a workload within an organization.
     pub fn create_workload(&self, wl: Workload) -> Result<(), ControlError> {
-        let orgs = self.orgs.read().unwrap();
+        let orgs = self.orgs.read().lock_or_die("tenant.unknown");
         let org = orgs
             .get(&wl.org_id)
             .ok_or_else(|| ControlError::NotFound(format!("organization {}", wl.org_id)))?;
         validate_quota(&org.quota, &wl.quota)?;
 
-        let mut workloads = self.workloads.write().unwrap();
+        let mut workloads = self.workloads.write().lock_or_die("tenant.unknown");
         workloads.insert(wl.id.clone(), wl);
         Ok(())
     }
 
     /// Get a workload by ID.
     pub fn get_workload(&self, id: &str) -> Result<Workload, ControlError> {
-        let workloads = self.workloads.read().unwrap();
+        let workloads = self.workloads.read().lock_or_die("tenant.unknown");
         workloads
             .get(id)
             .cloned()

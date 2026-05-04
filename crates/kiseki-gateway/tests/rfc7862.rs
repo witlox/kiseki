@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 7862 — Network File System
 //! (NFS) Version 4 Minor Version 2 Protocol** (November 2016, extends
 //! RFC 5661 / RFC 8881).

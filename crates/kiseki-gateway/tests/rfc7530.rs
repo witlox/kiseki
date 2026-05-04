@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 7530 — Network File System
 //! (NFS) Version 4 Protocol** (March 2015).
 //!

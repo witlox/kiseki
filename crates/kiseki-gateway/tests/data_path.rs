@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! End-to-end data path tests: write via gateway → encrypt → store → read back → decrypt.
 
 use kiseki_chunk::store::ChunkStore;

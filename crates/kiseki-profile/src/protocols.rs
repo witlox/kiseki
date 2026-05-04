@@ -325,7 +325,7 @@ impl PnfsDriver {
         if guard.is_none() {
             *guard = Some(Self::open_session(self.nfs_addr, b"pnfs-profile-mds")?);
         }
-        let sess = guard.as_mut().unwrap();
+        let sess = guard.as_mut().expect("transport not initialized — call connect() first");
 
         // SEQUENCE + PUTROOTFH + LOOKUP + LAYOUTGET.
         let seq = sess.sequence;

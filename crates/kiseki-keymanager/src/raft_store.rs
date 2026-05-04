@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::epoch::{EpochInfo, KeyManagerOps};
 use crate::error::KeyManagerError;
 use crate::health::{KeyManagerHealth, KeyManagerStatus};
+use kiseki_common::locks::LockOrDie;
 
 /// Commands that can be applied to the key manager state machine.
 ///
@@ -181,7 +182,7 @@ impl RaftKeyStore {
         let mut log = self
             .log
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.log");
         let index = log.len() as u64 + 1;
         log.push((index, cmd.clone()));
         drop(log);
@@ -189,7 +190,7 @@ impl RaftKeyStore {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.state");
         state.apply(index, &cmd);
         index
     }
@@ -199,7 +200,7 @@ impl RaftKeyStore {
     pub fn command_log(&self) -> Vec<(u64, KeyCommand)> {
         self.log
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("raft_store.log")
             .clone()
     }
 
@@ -216,14 +217,14 @@ impl RaftKeyStore {
             let mut log = store
                 .log
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("raft_store.log");
             log.push((idx, cmd.clone()));
             drop(log);
 
             let mut state = store
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("raft_store.state");
             state.apply(idx, &cmd);
         }
         Ok(store)
@@ -234,7 +235,7 @@ impl RaftKeyStore {
     pub fn log_length(&self) -> usize {
         self.log
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("raft_store.log")
             .len()
     }
 
@@ -244,7 +245,7 @@ impl RaftKeyStore {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.state");
         KeyManagerHealth {
             status: state.status,
             epoch_count: state.epochs.len(),
@@ -261,11 +262,11 @@ impl RaftKeyStore {
         let log = self
             .log
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.log");
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.state");
         *state = StateMachine::new();
         for (index, cmd) in log.iter() {
             state.apply(*index, cmd);
@@ -282,7 +283,7 @@ impl KeyManagerOps for RaftKeyStore {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.state");
         if state.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -298,7 +299,7 @@ impl KeyManagerOps for RaftKeyStore {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.state");
         if state.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -320,7 +321,7 @@ impl KeyManagerOps for RaftKeyStore {
             let state = self
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("raft_store.state");
             if state.status == KeyManagerStatus::Unavailable {
                 return Err(KeyManagerError::Unavailable);
             }
@@ -346,7 +347,7 @@ impl KeyManagerOps for RaftKeyStore {
             let state = self
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("raft_store.state");
             if !state.epochs.iter().any(|e| e.key.epoch == epoch) {
                 return Err(KeyManagerError::EpochNotFound(epoch));
             }
@@ -359,7 +360,7 @@ impl KeyManagerOps for RaftKeyStore {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.state");
         state
             .epochs
             .iter()

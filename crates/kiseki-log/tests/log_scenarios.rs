@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Tests for log.feature scenarios against the in-memory shard store.
 //!
 //! Maps Gherkin scenarios to unit tests covering the `LogOps` semantics.

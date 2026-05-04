@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kiseki_common::ids::ChunkId;
+use kiseki_common::locks::LockOrDie;
 
 /// Live progress tracker for an in-flight evacuation.
 #[derive(Debug)]
@@ -107,7 +108,7 @@ impl EvacuationRegistry {
         let mut g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("evacuation.inner");
         g.insert(id, progress);
     }
 
@@ -119,7 +120,7 @@ impl EvacuationRegistry {
         let g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("evacuation.inner");
         if let Some(p) = g.get(id) {
             p.cancel();
             true
@@ -136,7 +137,7 @@ impl EvacuationRegistry {
         let g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("evacuation.inner");
         g.keys().cloned().collect()
     }
 
@@ -145,7 +146,7 @@ impl EvacuationRegistry {
         let mut g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("evacuation.inner");
         g.remove(id);
     }
 }

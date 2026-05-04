@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! mTLS + SAN-role end-to-end smoke test (Phase 16a step 12).
 //!
 //! Spins up a `ClusterChunkServer` over real TLS with the SAN

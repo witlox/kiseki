@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for the drain-orchestration scenarios in
 //! `specs/features/multi-node-raft.feature` (Phase 14f).
 //!

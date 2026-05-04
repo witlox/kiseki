@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **macOS osxfuse** (a.k.a.
 //! macFUSE) protocol divergence from Linux FUSE.
 //!

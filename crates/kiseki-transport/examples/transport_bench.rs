@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 // Benchmark tool — relax pedantic lints for measurement code.
 #![allow(
     clippy::cast_possible_truncation,

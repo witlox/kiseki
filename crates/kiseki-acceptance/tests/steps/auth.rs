@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for authentication.feature.
 //! Auth scenarios exercise mTLS + cert validation. In the in-memory harness
 //! these are setup/no-ops — real validation is at the transport layer

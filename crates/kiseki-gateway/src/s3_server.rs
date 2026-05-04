@@ -25,6 +25,7 @@ use crate::s3::{
     DeleteObjectRequest, GetObjectRequest, PutObjectRequest, S3Gateway, UploadPartRequest,
 };
 use crate::s3_auth::AccessKeyStore;
+use kiseki_common::locks::LockOrDie;
 
 /// Shared state for S3 HTTP handlers.
 struct S3State<G: GatewayOps> {
@@ -734,7 +735,7 @@ async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
         let mut buckets = state
             .buckets
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("s3_server.buckets");
         if buckets.contains(&bucket) {
             true
         } else {
@@ -773,7 +774,7 @@ async fn delete_bucket<G: GatewayOps + Send + Sync + 'static>(
     let mut buckets = state
         .buckets
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock_or_die("s3_server.buckets");
     if buckets.remove(&bucket) {
         StatusCode::NO_CONTENT
     } else {
@@ -789,7 +790,7 @@ async fn head_bucket<G: GatewayOps + Send + Sync + 'static>(
     let buckets = state
         .buckets
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock_or_die("s3_server.buckets");
     if buckets.contains(&bucket) {
         StatusCode::OK
     } else {
@@ -804,7 +805,7 @@ async fn list_buckets<G: GatewayOps + Send + Sync + 'static>(
     let buckets = state
         .buckets
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock_or_die("s3_server.buckets");
 
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\

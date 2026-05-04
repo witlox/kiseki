@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! gRPC integration test: write a delta via `LogService`, read it back.
 
 use std::sync::Arc;

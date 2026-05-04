@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Backup/restore state (ADR-016, Phase 14d).
 
 pub struct BackupState {

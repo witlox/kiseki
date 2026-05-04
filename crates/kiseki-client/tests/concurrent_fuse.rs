@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests: concurrent FUSE native client operations.
 //!
 //! Tests the `KisekiFuse` filesystem under concurrent access patterns

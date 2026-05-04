@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
+use kiseki_common::locks::LockOrDie;
 
 /// Table for Raft log entries: key = log index (u64), value = JSON bytes.
 const LOG_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("raft_log");
@@ -48,7 +49,7 @@ impl RedbLogStore {
 
     /// Append a log entry (serialized as JSON).
     pub fn append<T: Serialize>(&self, index: u64, entry: &T) -> io::Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let data =
             serde_json::to_vec(entry).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let txn = db
@@ -69,7 +70,7 @@ impl RedbLogStore {
 
     /// Read a log entry by index.
     pub fn get<T: DeserializeOwned>(&self, index: u64) -> io::Result<Option<T>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let txn = db
             .begin_read()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -89,7 +90,7 @@ impl RedbLogStore {
 
     /// Read all entries in range [from, to] inclusive.
     pub fn range<T: DeserializeOwned>(&self, from: u64, to: u64) -> io::Result<Vec<(u64, T)>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let txn = db
             .begin_read()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -112,7 +113,7 @@ impl RedbLogStore {
 
     /// Truncate log entries before the given index (exclusive).
     pub fn truncate_before(&self, before: u64) -> io::Result<u64> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let txn = db
             .begin_write()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -144,7 +145,7 @@ impl RedbLogStore {
 
     /// Store a metadata value (e.g., vote, committed index).
     pub fn set_meta<T: Serialize>(&self, key: &str, value: &T) -> io::Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let data =
             serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let txn = db
@@ -165,7 +166,7 @@ impl RedbLogStore {
 
     /// Read a metadata value.
     pub fn get_meta<T: DeserializeOwned>(&self, key: &str) -> io::Result<Option<T>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let txn = db
             .begin_read()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -189,7 +190,7 @@ impl RedbLogStore {
     /// `truncate` operation when a leader overwrites a follower's
     /// conflicting log suffix.
     pub fn truncate_after(&self, after: u64) -> io::Result<u64> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let txn = db
             .begin_write()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -220,7 +221,7 @@ impl RedbLogStore {
 
     /// Get the last (highest index) log entry key, or None if empty.
     pub fn last_index(&self) -> io::Result<Option<u64>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let txn = db
             .begin_read()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -240,7 +241,7 @@ impl RedbLogStore {
 
     /// Count of log entries.
     pub fn len(&self) -> io::Result<u64> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("redb_log_store.unknown");
         let txn = db
             .begin_read()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;

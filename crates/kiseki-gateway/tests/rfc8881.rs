@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 8881 — Network File System
 //! (NFS) Version 4 Minor Version 1 Protocol** (August 2020,
 //! obsoletes RFC 5661).

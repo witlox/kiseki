@@ -20,6 +20,7 @@
 // Allow unsafe only for mlock/madvise key-material memory protection.
 // Every unsafe block has a SAFETY comment.
 #![allow(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod aead;
 pub mod chunk_id;

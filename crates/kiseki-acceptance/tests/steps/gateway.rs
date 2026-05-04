@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for protocol-gateway.feature — background and testable scenarios.
 
 use std::sync::Arc;

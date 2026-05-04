@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! World sub-structs — decompose the monolithic `KisekiWorld` into
 //! focused groups. Each group owns the fields and Default for its
 //! domain. `KisekiWorld` composes them.

@@ -31,6 +31,7 @@ use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::budget::BudgetEnforcer;
+use kiseki_common::locks::LockOrWarn;
 
 /// Maximum message size (64 KiB, per I-WA16).
 const MAX_MSG_SIZE: usize = 65_536;
@@ -151,7 +152,7 @@ fn process_hint_json(
     // Budget check.
     let mut b = budget
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock_or_warn("stream.budget");
     match b.try_hint() {
         Ok(()) => (true, None),
         Err(e) => (false, Some(format!("budget_exceeded: {e}"))),

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for `pnfs-rfc8435.feature` (ADR-038, Phase 15a/b/c/d).
 //!
 //! TDD progression: every step starts as `todo!()` so the @integration

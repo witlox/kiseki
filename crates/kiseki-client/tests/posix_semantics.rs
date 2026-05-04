@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **POSIX.1-2024 (IEEE Std 1003.1-2024)**
 //! file-system semantics, as exposed through `kiseki-client::fuse_fs`.
 //!

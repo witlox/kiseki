@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Network failure scenario tests (Phase E — WS 7.3).
 //!
 //! Validates:

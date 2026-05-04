@@ -11,6 +11,7 @@ use std::sync::RwLock;
 use kiseki_common::ids::{NodeId, OrgId, ShardId};
 
 use crate::error::ControlError;
+use kiseki_common::locks::LockOrDie;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -270,12 +271,12 @@ impl NamespaceShardMapStore {
     /// Inject a failure at the N-th shard during creation (1-indexed).
     /// Used for testing atomic rollback (ADV-033-1).
     pub fn inject_failure_at_shard(&self, shard_number: u32) {
-        *self.fail_at_shard.write().unwrap() = Some(shard_number);
+        *self.fail_at_shard.write().lock_or_die("shard_topology.unknown") = Some(shard_number);
     }
 
     /// Clear failure injection.
     pub fn clear_failure_injection(&self) {
-        *self.fail_at_shard.write().unwrap() = None;
+        *self.fail_at_shard.write().lock_or_die("shard_topology.unknown") = None;
     }
 
     /// Create a namespace with the computed shard topology.
@@ -290,7 +291,7 @@ impl NamespaceShardMapStore {
         active_nodes: &[NodeId],
         requested_shards: Option<u32>,
     ) -> Result<NamespaceShardMap, ControlError> {
-        let mut maps = self.maps.write().unwrap();
+        let mut maps = self.maps.write().lock_or_die("shard_topology.unknown");
 
         // ADV-033-1: reject concurrent creation.
         if let Some(existing) = maps.get(namespace_id) {
@@ -307,7 +308,7 @@ impl NamespaceShardMapStore {
         // Determine shard count.
         let shard_count = if let Some(requested) = requested_shards {
             // Validate against tenant bounds if set.
-            let bounds = self.tenant_bounds.read().unwrap();
+            let bounds = self.tenant_bounds.read().lock_or_die("shard_topology.unknown");
             if let Some(b) = bounds.get(&tenant_id.0.to_string()) {
                 if requested > b.max_shards {
                     return Err(ControlError::Rejected(format!(
@@ -327,7 +328,7 @@ impl NamespaceShardMapStore {
         };
 
         // ADV-033-1: failure injection — simulate partial Raft group failure.
-        let fail_at = *self.fail_at_shard.read().unwrap();
+        let fail_at = *self.fail_at_shard.read().lock_or_die("shard_topology.unknown");
         if let Some(fail_shard) = fail_at {
             if fail_shard <= shard_count {
                 return Err(ControlError::Rejected(format!(
@@ -356,7 +357,7 @@ impl NamespaceShardMapStore {
         namespace_id: &str,
         caller_tenant: OrgId,
     ) -> Result<NamespaceShardMap, ControlError> {
-        let maps = self.maps.read().unwrap();
+        let maps = self.maps.read().lock_or_die("shard_topology.unknown");
         let map = maps
             .get(namespace_id)
             .ok_or_else(|| ControlError::NotFound(format!("namespace {namespace_id}")))?;
@@ -372,7 +373,7 @@ impl NamespaceShardMapStore {
     pub fn set_tenant_bounds(&self, tenant_id: &str, bounds: TenantShardBounds) {
         self.tenant_bounds
             .write()
-            .unwrap()
+            .lock_or_die("shard_topology.unknown")
             .insert(tenant_id.to_owned(), bounds);
     }
 
@@ -387,7 +388,7 @@ impl NamespaceShardMapStore {
         config: &ShardTopologyConfig,
         active_nodes: &[NodeId],
     ) -> Option<u32> {
-        let mut maps = self.maps.write().unwrap();
+        let mut maps = self.maps.write().lock_or_die("shard_topology.unknown");
         let map = maps.get_mut(namespace_id)?;
 
         let current = u32::try_from(map.shards.len()).unwrap_or(u32::MAX);
@@ -441,23 +442,23 @@ impl NamespaceShardMapStore {
 
     /// Get the current shard count for a namespace (unauthenticated, internal use).
     pub fn shard_count(&self, namespace_id: &str) -> Option<u32> {
-        let maps = self.maps.read().unwrap();
+        let maps = self.maps.read().lock_or_die("shard_topology.unknown");
         maps.get(namespace_id)
             .and_then(|m| u32::try_from(m.shards.len()).ok())
     }
 
     /// Check whether a namespace exists in the store (any state).
     pub fn namespace_exists(&self, namespace_id: &str) -> bool {
-        self.maps.read().unwrap().contains_key(namespace_id)
+        self.maps.read().lock_or_die("shard_topology.unknown").contains_key(namespace_id)
     }
 
     /// Create an alias: lookups for `alias` resolve to `target`.
     pub fn alias(&self, alias: &str, target: &str) {
-        let maps = self.maps.read().unwrap();
+        let maps = self.maps.read().lock_or_die("shard_topology.unknown");
         if let Some(map) = maps.get(target) {
             let aliased = map.clone();
             drop(maps);
-            self.maps.write().unwrap().insert(alias.to_owned(), aliased);
+            self.maps.write().lock_or_die("shard_topology.unknown").insert(alias.to_owned(), aliased);
         }
     }
 
@@ -472,7 +473,7 @@ impl NamespaceShardMapStore {
         };
         self.maps
             .write()
-            .unwrap()
+            .lock_or_die("shard_topology.unknown")
             .insert(namespace_id.to_owned(), map);
     }
 }
@@ -488,8 +489,8 @@ fn find_widest_shard(shards: &[ShardRange]) -> usize {
 
 /// Approximate range width for comparison (first 8 bytes as u64).
 fn range_width(start: &[u8; 32], end: &[u8; 32]) -> u64 {
-    let s = u64::from_be_bytes(start[..8].try_into().unwrap());
-    let e = u64::from_be_bytes(end[..8].try_into().unwrap());
+    let s = u64::from_be_bytes(start[..8].try_into().expect("byte slice has the exact fixed length required"));
+    let e = u64::from_be_bytes(end[..8].try_into().expect("byte slice has the exact fixed length required"));
     e.saturating_sub(s)
 }
 

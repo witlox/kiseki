@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Property tests for `HybridLogicalClock`.
 //!
 //! Verifies the load-bearing invariants from I-T5, I-T7, and

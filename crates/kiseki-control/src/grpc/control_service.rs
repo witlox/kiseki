@@ -17,6 +17,7 @@ use crate::maintenance::MaintenanceState;
 use crate::namespace::{Namespace, NamespaceStore};
 use crate::retention::RetentionStore;
 use crate::tenant::{Organization, Project, TenantStore, Workload};
+use kiseki_common::locks::LockOrDie;
 
 /// gRPC handler wrapping the control-plane stores.
 pub struct ControlGrpc {
@@ -266,7 +267,7 @@ impl ControlService for ControlGrpc {
         );
         self.access_requests
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("control_service.access_requests")
             .insert(id.clone(), access_req);
         Ok(Response::new(pb::AccessRequestResponse { request_id: id }))
     }
@@ -280,7 +281,7 @@ impl ControlService for ControlGrpc {
         let mut requests = self
             .access_requests
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("control_service.access_requests");
         let ar = requests
             .get_mut(&req.request_id)
             .ok_or_else(|| Status::not_found("access request not found"))?;
@@ -297,7 +298,7 @@ impl ControlService for ControlGrpc {
         let mut requests = self
             .access_requests
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("control_service.access_requests");
         let ar = requests
             .get_mut(&req.request_id)
             .ok_or_else(|| Status::not_found("access request not found"))?;

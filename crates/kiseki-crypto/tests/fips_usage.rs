@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **FIPS 140-2 / 140-3 cryptographic
 //! primitives** as kiseki uses them.
 //!

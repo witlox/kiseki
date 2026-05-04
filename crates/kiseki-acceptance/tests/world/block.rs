@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Block storage device state (ADR-029).
 
 use kiseki_block::{DeviceBackend, Extent};

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Small-file placement state (ADR-030).
 
 #[derive(Default)]

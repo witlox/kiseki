@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for workflow-advisory.feature.
 
 use crate::KisekiWorld;

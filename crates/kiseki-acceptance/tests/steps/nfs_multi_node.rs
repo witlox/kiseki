@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Steps for `@integration @multi-node @nfs` scenarios.
 //!
 //! Wire-level NFSv4 against a real multi-node `kiseki-server` cluster.

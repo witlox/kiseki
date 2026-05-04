@@ -16,6 +16,7 @@ use crate::error::LogError;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
 use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 use crate::watermark::ConsumerWatermarks;
+use kiseki_common::locks::LockOrDie;
 
 /// Commands applied to a shard's state machine via the Raft log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,7 +187,7 @@ impl RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let info = ShardInfo {
             shard_id,
             tenant_id,
@@ -222,7 +223,7 @@ impl RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)
@@ -237,7 +238,7 @@ impl RaftLogStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         inner.logs.get(&shard_id).map_or(0, Vec::len)
     }
 
@@ -247,7 +248,7 @@ impl RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
 
         let log = inner
             .logs
@@ -458,7 +459,7 @@ impl LogOps for RaftLogStore {
             let inner = self
                 .inner
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("raft_store.inner");
             let sm = inner
                 .shards
                 .get(&req.shard_id)
@@ -492,7 +493,7 @@ impl LogOps for RaftLogStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         Ok(inner.shards[&req.shard_id].info.tip)
     }
 
@@ -500,7 +501,7 @@ impl LogOps for RaftLogStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get(&req.shard_id)
@@ -522,7 +523,7 @@ impl LogOps for RaftLogStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         inner
             .shards
             .get(&shard_id)
@@ -538,7 +539,7 @@ impl LogOps for RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)
@@ -554,7 +555,7 @@ impl LogOps for RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)
@@ -599,7 +600,7 @@ impl LogOps for RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.range_start = range_start;
             sm.info.range_end = range_end;
@@ -610,7 +611,7 @@ impl LogOps for RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.state = state;
         }
@@ -620,7 +621,7 @@ impl LogOps for RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.config = config;
         }
@@ -635,7 +636,7 @@ impl LogOps for RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)
@@ -653,7 +654,7 @@ impl LogOps for RaftLogStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)

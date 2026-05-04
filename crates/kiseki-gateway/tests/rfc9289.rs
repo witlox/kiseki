@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 9289 — Towards Remote Procedure
 //! Call Encryption By Default** (June 2022).
 //!

@@ -18,6 +18,7 @@ use kiseki_view::ViewOps;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::config::{ServerConfig, TlsFiles};
+use kiseki_common::locks::LockOrDie;
 
 /// Pick the DS uaddrs the MDS will advertise via GETDEVICEINFO.
 ///
@@ -657,7 +658,7 @@ pub async fn run_main(
     });
     let _ = view_store
         .lock()
-        .unwrap()
+        .lock_or_die("runtime.view_store")
         .create_view(kiseki_view::ViewDescriptor {
             view_id: bootstrap_view,
             tenant_id: bootstrap_tenant,
@@ -1027,7 +1028,7 @@ pub async fn run_main(
             tokio::task::block_in_place(|| {
                 let mut vs = sp_views
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .lock_or_die("runtime.sp_views");
                 let mut sp = kiseki_view::stream_processor::TrackedStreamProcessor::new(
                     sp_log.as_ref(),
                     &mut *vs,

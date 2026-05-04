@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! External KMS state (ADR-028).
 
 use std::collections::HashMap;

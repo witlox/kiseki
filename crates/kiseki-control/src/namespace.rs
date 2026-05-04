@@ -12,6 +12,7 @@ use std::sync::RwLock;
 use kiseki_common::tenancy::ComplianceTag;
 
 use crate::error::ControlError;
+use kiseki_common::locks::LockOrDie;
 
 /// Namespace within a tenant hierarchy.
 #[derive(Clone, Debug)]
@@ -50,19 +51,19 @@ impl NamespaceStore {
 
     /// Create a new namespace, auto-assigning a shard if none provided.
     pub fn create(&self, mut ns: Namespace) -> Result<(), ControlError> {
-        if *self.read_only.read().unwrap() {
+        if *self.read_only.read().lock_or_die("namespace.unknown") {
             return Err(ControlError::Rejected(
                 "store is read-only: writes rejected (retriable)".into(),
             ));
         }
 
-        let mut namespaces = self.namespaces.write().unwrap();
+        let mut namespaces = self.namespaces.write().lock_or_die("namespace.unknown");
         if namespaces.contains_key(&ns.id) {
             return Err(ControlError::AlreadyExists(format!("namespace {}", ns.id)));
         }
 
         if ns.shard_id.is_empty() {
-            let mut seq = self.shard_seq.write().unwrap();
+            let mut seq = self.shard_seq.write().lock_or_die("namespace.unknown");
             *seq += 1;
             ns.shard_id = format!("shard-{seq:04}");
         }
@@ -73,7 +74,7 @@ impl NamespaceStore {
 
     /// Get a namespace by ID.
     pub fn get(&self, id: &str) -> Result<Namespace, ControlError> {
-        let namespaces = self.namespaces.read().unwrap();
+        let namespaces = self.namespaces.read().lock_or_die("namespace.unknown");
         namespaces
             .get(id)
             .cloned()
@@ -83,7 +84,7 @@ impl NamespaceStore {
     /// List all namespaces.
     #[must_use]
     pub fn list(&self) -> Vec<Namespace> {
-        let namespaces = self.namespaces.read().unwrap();
+        let namespaces = self.namespaces.read().lock_or_die("namespace.unknown");
         namespaces.values().cloned().collect()
     }
 
@@ -98,7 +99,7 @@ impl NamespaceStore {
         composition_count: u64,
     ) -> Result<(), ControlError> {
         // Verify namespace exists.
-        let namespaces = self.namespaces.read().unwrap();
+        let namespaces = self.namespaces.read().lock_or_die("namespace.unknown");
         if !namespaces.contains_key(namespace_id) {
             return Err(ControlError::NotFound(format!("namespace {namespace_id}")));
         }
@@ -112,8 +113,8 @@ impl NamespaceStore {
 
     /// Set read-only mode on the store and all existing namespaces.
     pub fn set_read_only(&self, read_only: bool) {
-        *self.read_only.write().unwrap() = read_only;
-        let mut namespaces = self.namespaces.write().unwrap();
+        *self.read_only.write().lock_or_die("namespace.unknown") = read_only;
+        let mut namespaces = self.namespaces.write().lock_or_die("namespace.unknown");
         for ns in namespaces.values_mut() {
             ns.read_only = read_only;
         }

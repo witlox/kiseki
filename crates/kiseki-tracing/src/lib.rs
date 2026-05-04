@@ -28,6 +28,7 @@
 //! this crate alone.
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::sync::OnceLock;
 

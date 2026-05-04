@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for block-storage.feature — ADR-029 raw block device I/O.
 
 use std::io::{Read, Seek, SeekFrom, Write};

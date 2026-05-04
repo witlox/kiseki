@@ -12,6 +12,7 @@
 //!   - I-K12 — system key manager HA (Raft, ADR-007) — deferred to Raft integration
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod cache;
 pub mod epoch;

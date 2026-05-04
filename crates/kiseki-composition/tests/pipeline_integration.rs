@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! End-to-end pipeline test: Composition store operations + log/view plumbing.
 //!
 //! Composition mutations are now sync (in-memory only). Log emission is the

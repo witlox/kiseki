@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+use kiseki_common::locks::LockOrDie;
 
 /// Per-pool capacity threshold overrides. `None` fields fall
 /// back to the ADR-024 defaults at read time.
@@ -115,7 +116,7 @@ impl PoolOverridesStore {
         let mut g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pool_overrides.inner");
         g.insert(pool_name.to_owned(), thresholds);
         Ok(())
     }
@@ -127,7 +128,7 @@ impl PoolOverridesStore {
         let g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pool_overrides.inner");
         g.get(pool_name).copied()
     }
 }
@@ -182,7 +183,7 @@ impl RebalanceTracker {
         let mut g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pool_overrides.inner");
         if g.len() >= 64 {
             g.remove(0);
         }
@@ -199,7 +200,7 @@ impl RebalanceTracker {
         let g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pool_overrides.inner");
         g.clone()
     }
 }

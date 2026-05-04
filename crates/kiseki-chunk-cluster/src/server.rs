@@ -26,6 +26,7 @@ use kiseki_proto::v1::cluster_chunk_service_server::{
 use tonic::{Request, Response, Status};
 
 use crate::auth::{verify_fabric_san, FabricAuthError};
+use kiseki_common::locks::LockOrDie;
 
 /// Test-only knobs surfaced via admin endpoints (see
 /// `kiseki-server::admin`). Process-global because the chunk-cluster
@@ -112,7 +113,7 @@ impl ChunkEnvelopeRegistry {
         let mut map = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("server.inner");
         map.entry(chunk_id).or_insert(EnvelopeMeta {
             auth_tag,
             nonce,
@@ -125,7 +126,7 @@ impl ChunkEnvelopeRegistry {
     fn lookup(&self, chunk_id: &RustChunkId) -> Option<EnvelopeMeta> {
         self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("server.inner")
             .get(chunk_id)
             .cloned()
     }

@@ -27,6 +27,7 @@ use crate::error::LogError;
 use crate::raft_store::LogCommand;
 use crate::shard::{ShardInfo, ShardState};
 use crate::traits::{AppendDeltaRequest, ReadDeltasRequest};
+use kiseki_common::locks::LockOrDie;
 
 type C = LogTypeConfig;
 
@@ -284,7 +285,7 @@ impl OpenRaftLogStore {
     pub fn inline_rate_exceeded(&self) -> bool {
         self.inline_rate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("openraft_store.inline_rate")
             .is_exceeded()
     }
 
@@ -292,7 +293,7 @@ impl OpenRaftLogStore {
     pub fn record_inline_write(&self, bytes: u64) -> bool {
         self.inline_rate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("openraft_store.inline_rate")
             .record(bytes)
     }
 

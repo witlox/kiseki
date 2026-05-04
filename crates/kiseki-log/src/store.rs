@@ -18,6 +18,7 @@ use crate::error::LogError;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
 use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 use crate::watermark::ConsumerWatermarks;
+use kiseki_common::locks::LockOrDie;
 
 /// A single in-memory shard.
 struct MemShard {
@@ -74,7 +75,7 @@ impl MemShardStore {
     pub fn set_split_target(&self, source: ShardId, target: ShardId) {
         self.split_targets
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("store.split_targets")
             .insert(source, target);
     }
 
@@ -83,7 +84,7 @@ impl MemShardStore {
     pub fn split_buffer_len(&self, source: ShardId) -> usize {
         self.split_buffer
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("store.split_buffer")
             .get(&source)
             .map_or(0, Vec::len)
     }
@@ -94,7 +95,7 @@ impl MemShardStore {
         let target = self
             .split_targets
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("store.split_targets")
             .get(&source)
             .copied()
             .ok_or(LogError::ShardNotFound(source))?;
@@ -102,7 +103,7 @@ impl MemShardStore {
         let buffered: Vec<AppendDeltaRequest> = self
             .split_buffer
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("store.split_buffer")
             .remove(&source)
             .unwrap_or_default();
 
@@ -138,7 +139,7 @@ impl MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         // Idempotent: don't overwrite if shard already exists (e.g., restored from redb).
         shards.entry(shard_id).or_insert(MemShard {
             info,
@@ -153,7 +154,7 @@ impl MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         if let Some(shard) = shards.get_mut(&shard_id) {
             shard.info.config = config;
         }
@@ -164,7 +165,7 @@ impl MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         if let Some(shard) = shards.get_mut(&shard_id) {
             shard.info.state = state;
         }
@@ -180,7 +181,7 @@ impl MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         if let Some(shard) = shards.get_mut(&shard_id) {
             shard.info.range_start = range_start;
             shard.info.range_end = range_end;
@@ -197,7 +198,7 @@ impl MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -222,7 +223,7 @@ impl MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -236,7 +237,7 @@ impl MemShardStore {
         let shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         shards.get(&shard_id).is_some_and(|s| {
             s.info.delta_count >= s.info.config.max_delta_count
                 || s.info.byte_size >= s.info.config.max_byte_size
@@ -253,7 +254,7 @@ impl MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -330,7 +331,7 @@ impl LogOps for MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let shard = shards
             .get_mut(&req.shard_id)
             .ok_or(LogError::ShardNotFound(req.shard_id))?;
@@ -352,14 +353,14 @@ impl LogOps for MemShardStore {
                 && self
                     .split_targets
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .lock_or_die("store.split_targets")
                     .contains_key(&req.shard_id)
             {
                 let source = req.shard_id;
                 drop(shards);
                 self.split_buffer
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .lock_or_die("store.split_buffer")
                     .entry(source)
                     .or_default()
                     .push(req);
@@ -431,7 +432,7 @@ impl LogOps for MemShardStore {
         let shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let shard = shards
             .get(&req.shard_id)
             .ok_or(LogError::ShardNotFound(req.shard_id))?;
@@ -452,7 +453,7 @@ impl LogOps for MemShardStore {
         let shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         shards
             .get(&shard_id)
             .map(|s| s.info.clone())
@@ -463,7 +464,7 @@ impl LogOps for MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -479,7 +480,7 @@ impl LogOps for MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -509,7 +510,7 @@ impl LogOps for MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -600,7 +601,7 @@ impl LogOps for MemShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("store.shards");
         let source = shards
             .get(&source_shard_id)
             .ok_or(LogError::ShardNotFound(source_shard_id))?

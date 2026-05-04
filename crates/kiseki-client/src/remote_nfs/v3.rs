@@ -112,7 +112,7 @@ impl Nfs3Client {
         // Get root handle via FSINFO with a synthetic root handle.
         // Kiseki's NFSv3 uses a well-known root handle format.
         let mut guard = self.ensure_transport().await?;
-        let t = guard.as_mut().unwrap();
+        let t = guard.as_mut().expect("transport not initialized — call connect() first");
 
         // NULL first — verify server is alive
         let _ = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_NULL, &[])?;
@@ -157,7 +157,7 @@ impl GatewayOps for Nfs3Client {
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         let root_fh = self.ensure_root_fh().await?;
         let mut guard = self.ensure_transport().await?;
-        let t = guard.as_mut().unwrap();
+        let t = guard.as_mut().expect("transport not initialized — call connect() first");
 
         let filename = uuid::Uuid::new_v4().to_string();
 
@@ -260,7 +260,7 @@ impl GatewayOps for Nfs3Client {
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
         let root_fh = self.ensure_root_fh().await?;
         let mut guard = self.ensure_transport().await?;
-        let t = guard.as_mut().unwrap();
+        let t = guard.as_mut().expect("transport not initialized — call connect() first");
 
         // LOOKUP to get the file handle
         let mut args = XdrWriter::new();
@@ -331,7 +331,7 @@ impl GatewayOps for Nfs3Client {
     ) -> Result<(), GatewayError> {
         let root_fh = self.ensure_root_fh().await?;
         let mut guard = self.ensure_transport().await?;
-        let t = guard.as_mut().unwrap();
+        let t = guard.as_mut().expect("transport not initialized — call connect() first");
 
         let mut args = XdrWriter::new();
         args.write_opaque(&root_fh);

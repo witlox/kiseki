@@ -14,6 +14,7 @@
 //!   - I-WA13 — phase monotonicity
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod budget;
 pub mod error;

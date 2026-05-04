@@ -48,6 +48,7 @@
 //! Invariants: I-C2, I-C4, I-D1, I-T1, I-L2, I-L5
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::sync::Arc;
 use std::time::Duration;

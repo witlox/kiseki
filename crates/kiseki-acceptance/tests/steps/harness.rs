@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Server harness — spawns a real `kiseki-server` binary and provides
 //! network clients for @integration BDD steps.
 //!

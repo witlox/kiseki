@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! BDD acceptance tests for Kiseki.
 //!
 //! Uses cucumber-rs to run Gherkin feature files from `specs/features/`.

@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Standalone profiling driver for Kiseki data paths.
 //!
 //! Spawns a real `kiseki-server` (single-node), then drives a

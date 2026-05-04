@@ -22,6 +22,7 @@ use tonic::{Request, Response, Status};
 use crate::budget::{BudgetConfig, BudgetEnforcer};
 use crate::error::AdvisoryError;
 use crate::workflow::WorkflowTable;
+use kiseki_common::locks::LockOrWarn;
 
 // ============================================================================
 // Conversion helpers
@@ -156,7 +157,7 @@ impl AdvisoryGrpc {
         let outcome = {
             let mut b = budget
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_warn("grpc.budget");
             match b.try_hint() {
                 Ok(()) => {
                     tracing::debug!("advisory hint accepted");
@@ -197,7 +198,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
             let mut budget = self
                 .budget
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_warn("grpc.budget");
             if let Err(e) = budget.try_declare() {
                 return Ok(Response::new(DeclareWorkflowResponse {
                     outcome: Some(declare_workflow_response::Outcome::Error(
@@ -217,7 +218,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         let mut table = self
             .table
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_warn("grpc.table");
         table.declare(wf_ref, profile, phase);
 
         Ok(Response::new(DeclareWorkflowResponse {
@@ -241,14 +242,14 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         let mut table = self
             .table
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_warn("grpc.table");
         let ended = table.end(&wf_ref);
 
         if ended {
             let mut budget = self
                 .budget
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_warn("grpc.budget");
             budget.release_workflow();
         }
 
@@ -268,7 +269,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         let mut table = self
             .table
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_warn("grpc.table");
         let entry = table
             .get_mut(&wf_ref)
             .ok_or_else(|| Status::not_found("workflow not found"))?;
@@ -297,7 +298,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         let table = self
             .table
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_warn("grpc.table");
         let entry = table
             .get(&wf_ref)
             .ok_or_else(|| Status::not_found("workflow not found"))?;
@@ -346,7 +347,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
             let tbl = self
                 .table
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_warn("grpc.table");
             if tbl.get(&bound_wf_ref).is_none() {
                 return Err(Status::not_found("workflow not found"));
             }

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Unit tests for the 41 @unit scenarios in `specs/features/workflow-advisory.feature`.
 //!
 //! Grouped by theme to avoid duplication. Each scenario is cross-referenced

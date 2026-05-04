@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for the **Linux FUSE protocol** as
 //! documented in the kernel tree (`Documentation/filesystems/fuse.rst`)
 //! and the on-wire header (`<linux/fuse.h>`).

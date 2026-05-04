@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for the **openraft RPC framing** kiseki
 //! uses for inter-node Raft traffic.
 //!

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Property tests for cryptographic invariants.
 //!
 //! Verifies:

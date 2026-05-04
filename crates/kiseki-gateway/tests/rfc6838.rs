@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 6838 — Media Type Specifications
 //! and Registration Procedures** (January 2013).
 //!

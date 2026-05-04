@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Cross-node fabric throughput under simulated cross-AZ RTT.
 //!
 //! Reproduces (locally, in-process) the 2026-05-03 GCP transport-

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for the **kiseki native client + C FFI ABI**.
 //!
 //! Kiseki ships a stable C ABI (`kiseki_open`, `kiseki_read`,

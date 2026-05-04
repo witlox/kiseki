@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! In-process cert generation for the @mtls cluster harness.
 //!
 //! Used by the multi-node-raft "Tenant cert presented to fabric

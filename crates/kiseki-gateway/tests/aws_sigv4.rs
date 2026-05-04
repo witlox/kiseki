@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **AWS Signature Version 4** (no
 //! IETF RFC; AWS publishes the spec + test vectors).
 //!

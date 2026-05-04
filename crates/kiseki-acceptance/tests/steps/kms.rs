@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for external-kms.feature — 48 scenarios.
 //!
 //! Routes tenant wrap/unwrap through the production `TenantKmsProvider`

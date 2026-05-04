@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for view-materialization.feature.
 
 use crate::KisekiWorld;

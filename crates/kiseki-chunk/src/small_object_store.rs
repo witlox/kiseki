@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use kiseki_common::ids::ChunkId;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use kiseki_common::locks::LockOrDie;
 
 /// Table: `chunk_id` bytes (32) → encrypted content bytes.
 const OBJECTS_TABLE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("small_objects");
@@ -46,7 +47,7 @@ impl SmallObjectStore {
     /// Returns `true` if this is a new entry, `false` if it already existed
     /// (dedup hit — content not overwritten).
     pub fn put(&self, chunk_id: &ChunkId, data: &[u8]) -> io::Result<bool> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("small_object_store.unknown");
         let txn = db
             .begin_write()
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -71,7 +72,7 @@ impl SmallObjectStore {
 
     /// Retrieve inline content for a chunk.
     pub fn get(&self, chunk_id: &ChunkId) -> io::Result<Option<Vec<u8>>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("small_object_store.unknown");
         let txn = db
             .begin_read()
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -89,7 +90,7 @@ impl SmallObjectStore {
     ///
     /// Returns `true` if the entry existed and was removed.
     pub fn delete(&self, chunk_id: &ChunkId) -> io::Result<bool> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("small_object_store.unknown");
         let txn = db
             .begin_write()
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -109,7 +110,7 @@ impl SmallObjectStore {
 
     /// Check if a chunk exists in the inline store.
     pub fn contains(&self, chunk_id: &ChunkId) -> io::Result<bool> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("small_object_store.unknown");
         let txn = db
             .begin_read()
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -125,7 +126,7 @@ impl SmallObjectStore {
 
     /// Count of inline objects.
     pub fn len(&self) -> io::Result<u64> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().lock_or_die("small_object_store.unknown");
         let txn = db
             .begin_read()
             .map_err(|e| io::Error::other(e.to_string()))?;

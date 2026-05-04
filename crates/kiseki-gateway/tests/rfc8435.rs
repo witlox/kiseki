@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 8435 — Parallel NFS (pNFS)
 //! Flexible File Layout** (August 2018).
 //!

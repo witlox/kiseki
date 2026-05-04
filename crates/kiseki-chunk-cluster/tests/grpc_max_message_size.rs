@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Regression for the 2026-05-04 GCP transport-profile fabric
 //! quorum-loss finding.
 //!

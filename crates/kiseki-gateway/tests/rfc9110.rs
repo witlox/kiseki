@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 9110 — HTTP Semantics** (June
 //! 2022), **RFC 9111 — HTTP Caching**, and **RFC 9112 — HTTP/1.1**.
 //! These three obsolete RFC 7230-7235 and are the live HTTP/1.1

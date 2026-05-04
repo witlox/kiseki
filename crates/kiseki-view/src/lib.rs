@@ -11,6 +11,7 @@
 //!   - I-V4 — MVCC read pins with bounded TTL
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod descriptor;
 pub mod error;

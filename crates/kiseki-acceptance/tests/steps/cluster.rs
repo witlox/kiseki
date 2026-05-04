@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for cluster-formation.feature.
 //!
 //! Raft bootstrap steps (scenarios 1-11) and ADR-033 topology steps

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for multi-node-raft.feature (18 scenarios).
 //!
 //! Steps that can be implemented use `w.raft.cluster` (a real in-process

@@ -13,6 +13,7 @@
 //!   - I-L7 — header/payload structural separation
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod auto_split;
 pub mod compaction_worker;

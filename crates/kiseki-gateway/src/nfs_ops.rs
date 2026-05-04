@@ -14,6 +14,7 @@ use crate::nfs4_server::SessionManager;
 use crate::nfs_dir::DirectoryIndex;
 use crate::nfs_lock::LockManager;
 use crate::ops::GatewayOps;
+use kiseki_common::locks::LockOrDie;
 
 /// NFS file handle — 32-byte opaque identifier.
 pub type FileHandle = [u8; 32];
@@ -84,7 +85,7 @@ impl HandleRegistry {
         // Idempotent insert.
         self.handles
             .lock()
-            .unwrap()
+            .lock_or_die("nfs_ops.unknown")
             .entry(fh)
             .or_insert(HandleEntry::PseudoRoot);
         fh
@@ -94,13 +95,13 @@ impl HandleRegistry {
     /// namespace alias). Distinguished from `is_root()` (namespace
     /// root) so dispatch logic can route LOOKUP("default") correctly.
     pub fn is_pseudo_root(&self, fh: &FileHandle) -> bool {
-        let handles = self.handles.lock().unwrap();
+        let handles = self.handles.lock().lock_or_die("nfs_ops.unknown");
         matches!(handles.get(fh), Some(HandleEntry::PseudoRoot))
     }
 
     /// Get or create a root directory handle for a namespace.
     pub fn root_handle(&self, namespace_id: NamespaceId, tenant_id: OrgId) -> FileHandle {
-        let mut roots = self.root_handles.lock().unwrap();
+        let mut roots = self.root_handles.lock().lock_or_die("nfs_ops.unknown");
         if let Some(&fh) = roots.get(&namespace_id) {
             return fh;
         }
@@ -109,7 +110,7 @@ impl HandleRegistry {
         fh[16] = 0xFF; // marker for root handle
 
         roots.insert(namespace_id, fh);
-        self.handles.lock().unwrap().insert(
+        self.handles.lock().lock_or_die("nfs_ops.unknown").insert(
             fh,
             HandleEntry::Root {
                 namespace_id,
@@ -128,7 +129,7 @@ impl HandleRegistry {
     ) -> FileHandle {
         let mut fh = [0u8; 32];
         fh[..16].copy_from_slice(composition_id.0.as_bytes());
-        self.handles.lock().unwrap().insert(
+        self.handles.lock().lock_or_die("nfs_ops.unknown").insert(
             fh,
             HandleEntry::File {
                 namespace_id,
@@ -141,7 +142,7 @@ impl HandleRegistry {
 
     /// Look up a handle. Returns `None` if not found.
     pub fn lookup(&self, fh: &FileHandle) -> Option<(NamespaceId, OrgId, Option<CompositionId>)> {
-        let handles = self.handles.lock().unwrap();
+        let handles = self.handles.lock().lock_or_die("nfs_ops.unknown");
         handles.get(fh).and_then(|entry| match entry {
             HandleEntry::PseudoRoot => None, // pseudo-root has no namespace
             HandleEntry::Root {
@@ -158,7 +159,7 @@ impl HandleRegistry {
 
     /// Check if a handle is a root directory.
     pub fn is_root(&self, fh: &FileHandle) -> bool {
-        let handles = self.handles.lock().unwrap();
+        let handles = self.handles.lock().lock_or_die("nfs_ops.unknown");
         matches!(handles.get(fh), Some(HandleEntry::Root { .. }))
     }
 }
@@ -348,7 +349,7 @@ impl<G: GatewayOps> NfsContext<G> {
     /// Buffer a write at the given offset for the given file handle.
     /// Data is accumulated and flushed on `flush_writes`.
     pub fn buffer_write(&self, fh: &FileHandle, offset: u64, data: &[u8]) {
-        let mut buffers = self.write_buffers.lock().unwrap();
+        let mut buffers = self.write_buffers.lock().lock_or_die("nfs_ops.unknown");
         let buf = buffers.entry(*fh).or_default();
         let off = usize::try_from(offset).unwrap_or(usize::MAX);
         let end = off.saturating_add(data.len());
@@ -366,7 +367,7 @@ impl<G: GatewayOps> NfsContext<G> {
         fh: &FileHandle,
     ) -> Result<Option<(FileHandle, NfsWriteResponse)>, GatewayError> {
         let data = {
-            let mut buffers = self.write_buffers.lock().unwrap();
+            let mut buffers = self.write_buffers.lock().lock_or_die("nfs_ops.unknown");
             buffers.remove(fh)
         };
         let Some(data) = data else {

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! C-ABI link verification (ADV-PA-5).
 //!
 //! Compiles `c-abi-shim/abi_check.c` against the Kiseki C header

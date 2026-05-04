@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Storage failure validation tests (Phase 6 — WS 7.2).
 //!
 //! Validates failure modes F-D1 through F-D4 from specs/failure-modes.md.

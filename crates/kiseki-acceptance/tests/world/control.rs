@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Control-plane state (ADR-027).
 
 use kiseki_control::federation::FederationRegistry;

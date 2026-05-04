@@ -9,6 +9,7 @@
 //! Spec: `ubiquitous-language.md`, I-T1..I-T4, `control-plane.feature`.
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod advisory_policy;
 pub mod cache_policy;

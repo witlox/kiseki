@@ -12,6 +12,7 @@
 
 use aws_lc_rs::{constant_time, hmac};
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
+use kiseki_common::locks::LockOrDie;
 
 // =============================================================================
 // pNFS File Handle (ADR-038 §D4.3)
@@ -634,7 +635,7 @@ impl MdsLayoutManager {
     pub fn current_mac_key(&self) -> PnfsFhMacKey {
         self.mac_key
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("pnfs.mac_key")
             .clone()
     }
 
@@ -658,11 +659,11 @@ impl MdsLayoutManager {
         *self
             .mac_key
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_key;
+            .lock_or_die("pnfs.mac_key") = new_key;
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         inner.cache.clear();
         // No need to populate `revoked` — old MACs already fail
         // validation against the new key.
@@ -714,7 +715,7 @@ impl MdsLayoutManager {
             let inner = self
                 .inner
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("pnfs.inner");
             if let Some(existing) = inner.cache.get(&composition_id) {
                 if now_ms < existing.issued_at_ms.saturating_add(existing.ttl_ms)
                     && layout_covers(existing, offset, length)
@@ -810,7 +811,7 @@ impl MdsLayoutManager {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         inner.cache.insert(composition_id, layout.clone());
         if inner.cache.len() > self.config.max_entries {
             // Evict the entry with the smallest issued_at_ms.
@@ -831,7 +832,7 @@ impl MdsLayoutManager {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         inner.cache.remove(&composition_id).is_some()
     }
 
@@ -852,7 +853,7 @@ impl MdsLayoutManager {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         let victim = inner
             .cache
             .iter()
@@ -873,7 +874,7 @@ impl MdsLayoutManager {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         for layout in inner.cache.values() {
             for stripe in &layout.stripes {
                 if &stripe.device_id == device_id {
@@ -902,7 +903,7 @@ impl MdsLayoutManager {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         let before = inner.cache.len();
         inner
             .cache
@@ -915,7 +916,7 @@ impl MdsLayoutManager {
     pub fn active_count(&self) -> usize {
         self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("pnfs.inner")
             .cache
             .len()
     }
@@ -927,7 +928,7 @@ impl MdsLayoutManager {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         inner.revoked.contains_key(&fh.mac)
     }
 
@@ -946,7 +947,7 @@ impl MdsLayoutManager {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         let to_remove: Vec<CompositionId> = inner
             .cache
             .iter()
@@ -982,7 +983,7 @@ impl MdsLayoutManager {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         let Some(layout) = inner.cache.remove(&comp) else {
             return false;
         };
@@ -1005,7 +1006,7 @@ impl MdsLayoutManager {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         let comps: Vec<CompositionId> = inner.cache.keys().copied().collect();
         let n = comps.len();
         for comp in &comps {
@@ -1029,7 +1030,7 @@ impl MdsLayoutManager {
     pub fn recall_log(&self) -> Vec<RecallRecord> {
         self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("pnfs.inner")
             .recall_log
             .clone()
     }
@@ -1040,7 +1041,7 @@ impl MdsLayoutManager {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("pnfs.inner");
         let before = inner.revoked.len();
         inner.revoked.retain(|_, expiry_ms| now_ms < *expiry_ms);
         before - inner.revoked.len()

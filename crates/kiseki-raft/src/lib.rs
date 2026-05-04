@@ -8,6 +8,7 @@
 //! Spec: ADR-007 (key manager HA), I-L2 (log durability).
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod config;
 pub mod log_store;

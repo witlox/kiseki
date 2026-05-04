@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use kiseki_common::ids::ShardId;
+use kiseki_common::locks::LockOrDie;
 
 /// Per-shard maintenance-mode flag store. Cheap to clone via
 /// `Arc`. See module docs for cluster-scope caveats.
@@ -55,7 +56,7 @@ impl MaintenanceMode {
         let mut g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("maintenance.inner");
         let entry = g.entry(shard).or_insert_with(|| AtomicBool::new(false));
         // SeqCst across reads/writes — operators flipping
         // maintenance want immediate global visibility on the
@@ -70,7 +71,7 @@ impl MaintenanceMode {
         let g = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("maintenance.inner");
         g.get(&shard).is_some_and(|f| f.load(Ordering::SeqCst))
     }
 }

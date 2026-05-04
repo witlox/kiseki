@@ -6,6 +6,7 @@
 //! Spec: `ubiquitous-language.md#MaintenanceMode`.
 
 use std::sync::RwLock;
+use kiseki_common::locks::LockOrDie;
 
 /// Cluster maintenance mode state.
 pub struct MaintenanceState {
@@ -23,18 +24,18 @@ impl MaintenanceState {
 
     /// Enable maintenance mode.
     pub fn enable(&self) {
-        *self.enabled.write().unwrap() = true;
+        *self.enabled.write().lock_or_die("maintenance.unknown") = true;
     }
 
     /// Disable maintenance mode.
     pub fn disable(&self) {
-        *self.enabled.write().unwrap() = false;
+        *self.enabled.write().lock_or_die("maintenance.unknown") = false;
     }
 
     /// Check if maintenance mode is active.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        *self.enabled.read().unwrap()
+        *self.enabled.read().lock_or_die("maintenance.unknown")
     }
 }
 

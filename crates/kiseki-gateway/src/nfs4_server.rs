@@ -18,6 +18,7 @@ use crate::nfs_xdr::{
     encode_reply_accepted, read_rm_message, write_rm_message, RpcCallHeader, XdrReader, XdrWriter,
 };
 use crate::ops::GatewayOps;
+use kiseki_common::locks::LockOrDie;
 
 /// NFSv4 program/version constants.
 const NFS4_PROGRAM: u32 = 100003;
@@ -158,7 +159,7 @@ impl SessionManager {
 
     pub fn open_file(&self, fh: FileHandle) -> StateId {
         let sid = StateId(*uuid::Uuid::new_v4().as_bytes());
-        self.open_files.lock().unwrap().insert(
+        self.open_files.lock().lock_or_die("nfs4_server.unknown").insert(
             sid,
             OpenState {
                 stateid: sid,
@@ -169,15 +170,15 @@ impl SessionManager {
     }
 
     fn close_file(&self, sid: &StateId) -> bool {
-        self.open_files.lock().unwrap().remove(sid).is_some()
+        self.open_files.lock().lock_or_die("nfs4_server.unknown").remove(sid).is_some()
     }
 
     fn is_open(&self, sid: &StateId) -> bool {
-        self.open_files.lock().unwrap().contains_key(sid)
+        self.open_files.lock().lock_or_die("nfs4_server.unknown").contains_key(sid)
     }
 
     fn add_lock(&self, sid: StateId, offset: u64, length: u64, write: bool) -> Result<StateId, ()> {
-        let mut locks = self.locks.lock().unwrap();
+        let mut locks = self.locks.lock().lock_or_die("nfs4_server.unknown");
         // Check for conflicting locks (saturating to prevent overflow).
         let req_end = offset.saturating_add(length);
         for lock in locks.iter() {
@@ -213,16 +214,16 @@ impl SessionManager {
             sequence_ids: vec![0; slots as usize],
         };
 
-        self.sessions.lock().unwrap().insert(session_id, session);
+        self.sessions.lock().lock_or_die("nfs4_server.unknown").insert(session_id, session);
         session_id
     }
 
     fn get_session(&self, session_id: &[u8; 16]) -> Option<Session> {
-        self.sessions.lock().unwrap().get(session_id).cloned()
+        self.sessions.lock().lock_or_die("nfs4_server.unknown").get(session_id).cloned()
     }
 
     fn destroy_session(&self, session_id: &[u8; 16]) -> bool {
-        self.sessions.lock().unwrap().remove(session_id).is_some()
+        self.sessions.lock().lock_or_die("nfs4_server.unknown").remove(session_id).is_some()
     }
 }
 
@@ -1281,7 +1282,7 @@ fn op_layoutget<G: GatewayOps>(
     let layout = ctx
         .layouts
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_or_die("nfs4_server.layouts")
         .layout_get(file_id, offset, length, pnfs_iomode);
 
     w.write_u32(nfs4_status::NFS4_OK);
@@ -1469,7 +1470,7 @@ fn op_layoutreturn<G: GatewayOps>(
         let file_id = u64::from_le_bytes(stateid[..8].try_into().unwrap_or([0; 8]));
         ctx.layouts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("nfs4_server.layouts")
             .layout_return(file_id);
     }
     // LAYOUTRETURN4_ALL: no file-specific data to parse.

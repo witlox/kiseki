@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{AuditEvent, AuditEventType};
 use crate::store::{AuditOps, AuditQuery};
+use kiseki_common::locks::LockOrDie;
 
 /// Audit commands — append-only by construction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,7 +81,7 @@ impl RaftAuditStore {
     pub fn log_length(&self) -> usize {
         self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("raft_store.inner")
             .log
             .len()
     }
@@ -90,7 +91,7 @@ impl RaftAuditStore {
     pub fn command_log(&self) -> Vec<(u64, AuditCommand)> {
         self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("raft_store.inner")
             .log
             .clone()
     }
@@ -110,7 +111,7 @@ impl RaftAuditStore {
             let mut inner = store
                 .inner
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("raft_store.inner");
             for (idx, cmd) in commands {
                 inner.log.push((idx, cmd));
             }
@@ -124,7 +125,7 @@ impl RaftAuditStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
 
         let log = inner.log.clone();
         inner.shards.clear();
@@ -240,7 +241,7 @@ impl AuditOps for RaftAuditStore {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
 
         let cmd = AuditCommand::AppendEvent {
             tenant_id: event.tenant_id.map(|o| *o.0.as_bytes()),
@@ -271,7 +272,7 @@ impl AuditOps for RaftAuditStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let key = q.tenant_id.map_or(ShardKey::System, ShardKey::Tenant);
         let Some(shard) = inner.shards.get(&key) else {
             return Vec::new();
@@ -291,7 +292,7 @@ impl AuditOps for RaftAuditStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let key = tenant_id.map_or(ShardKey::System, ShardKey::Tenant);
         inner.shards.get(&key).map_or(SequenceNumber(0), |s| s.tip)
     }
@@ -300,7 +301,7 @@ impl AuditOps for RaftAuditStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         inner.shards.values().map(|s| s.events.len()).sum()
     }
 
@@ -308,7 +309,7 @@ impl AuditOps for RaftAuditStore {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_store.inner");
         let mut events = Vec::new();
         if let Some(shard) = inner.shards.get(&ShardKey::Tenant(tenant_id)) {
             events.extend(shard.events.iter().cloned());

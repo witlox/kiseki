@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests: multi-node Raft cluster formation over TCP.
 //!
 //! These tests spin up real Raft instances with TCP transport to verify

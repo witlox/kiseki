@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 4506 — XDR: External Data
 //! Representation Standard** (May 2006).
 //!

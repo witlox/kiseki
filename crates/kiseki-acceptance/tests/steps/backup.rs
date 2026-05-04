@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for backup-and-restore.feature (ADR-016, Phase 14d).
 //!
 //! Drives the production [`kiseki_backup::BackupManager`] against either

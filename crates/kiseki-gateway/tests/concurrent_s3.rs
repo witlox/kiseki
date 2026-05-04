@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test: concurrent S3 writes through the HTTP server.
 //!
 //! Verifies that multiple simultaneous PUT requests complete without

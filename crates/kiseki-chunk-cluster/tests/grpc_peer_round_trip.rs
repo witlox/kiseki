@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! End-to-end smoke test: real `GrpcFabricPeer` ↔ real
 //! `ClusterChunkServer` over a tonic Channel on an ephemeral local
 //! socket. Confirms the proto-conversion glue (16a step 5) and the

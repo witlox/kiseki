@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for native-client.feature.
 //! Native client scenarios exercise transport/FUSE/discovery behavior.
 //! Steps exercise real domain code from kiseki-client: TransportSelector,

@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::telemetry::BackpressureSeverity;
+use kiseki_common::locks::LockOrWarn;
 
 /// Bucketed `QoS` headroom — k-anonymous (I-WA5/I-WA6) representation of
 /// remaining capacity within the workload's I-T2 quota.
@@ -77,7 +78,7 @@ impl TelemetryBus {
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CAPACITY);
         self.backpressure
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_warn("telemetry_bus.backpressure")
             .insert(workload.to_owned(), tx);
         rx
     }
@@ -88,7 +89,7 @@ impl TelemetryBus {
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CAPACITY);
         self.qos_headroom
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_warn("telemetry_bus.qos_headroom")
             .insert(workload.to_owned(), tx);
         rx
     }
@@ -98,7 +99,7 @@ impl TelemetryBus {
     pub fn has_backpressure_subscription(&self, workload: &str) -> bool {
         self.backpressure
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_warn("telemetry_bus.backpressure")
             .get(workload)
             .is_some_and(|tx| !tx.is_closed())
     }
@@ -108,7 +109,7 @@ impl TelemetryBus {
     pub fn has_qos_subscription(&self, workload: &str) -> bool {
         self.qos_headroom
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_warn("telemetry_bus.qos_headroom")
             .get(workload)
             .is_some_and(|tx| !tx.is_closed())
     }
@@ -120,7 +121,7 @@ impl TelemetryBus {
         if let Some(tx) = self
             .backpressure
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_warn("telemetry_bus.backpressure")
             .get(workload)
             .cloned()
         {
@@ -134,7 +135,7 @@ impl TelemetryBus {
         if let Some(tx) = self
             .qos_headroom
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_warn("telemetry_bus.qos_headroom")
             .get(workload)
             .cloned()
         {

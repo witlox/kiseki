@@ -14,6 +14,7 @@
 // unsafe_code is denied crate-wide except in feature-gated FFI modules
 // (verbs.rs, cxi.rs) which have per-block SAFETY comments.
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod config;
 pub mod error;

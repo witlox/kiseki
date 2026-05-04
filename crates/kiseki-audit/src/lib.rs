@@ -14,6 +14,7 @@
 //!   - I-A4 — audit log is a GC consumer (blocks delta GC)
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod error;
 pub mod event;

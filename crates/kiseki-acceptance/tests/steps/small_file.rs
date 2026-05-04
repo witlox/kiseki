@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for small-file-placement.feature (ADR-030).
 //!
 //! Tests inline threshold routing, system disk detection, metadata

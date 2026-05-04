@@ -14,6 +14,7 @@ use std::sync::Mutex;
 
 use kiseki_common::ids::NodeId;
 use kiseki_common::raft_adapter::{MembershipError, RaftMembershipAdapter};
+use kiseki_common::locks::LockOrDie;
 
 /// Per-node lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -175,7 +176,7 @@ impl DrainOrchestrator {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("node_lifecycle.inner");
         inner.nodes.entry(node_id).or_insert(NodeRecord {
             node_id,
             state: NodeState::Active,
@@ -192,7 +193,7 @@ impl DrainOrchestrator {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("node_lifecycle.inner");
         if let Some(rec) = inner.nodes.get_mut(&node_id) {
             rec.voter_in_shards = voter_in_shards;
             // If the node was already in Draining, refresh the total
@@ -214,7 +215,7 @@ impl DrainOrchestrator {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("node_lifecycle.inner");
         if let Some(rec) = inner.nodes.get_mut(&node_id) {
             rec.state = state;
             if state == NodeState::Draining && rec.drain_progress.is_none() {
@@ -232,7 +233,7 @@ impl DrainOrchestrator {
     pub fn state(&self, node_id: NodeId) -> Option<NodeState> {
         self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("node_lifecycle.inner")
             .nodes
             .get(&node_id)
             .map(|n| n.state)
@@ -242,7 +243,7 @@ impl DrainOrchestrator {
     pub fn audit(&self) -> Vec<NodeAuditEvent> {
         self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("node_lifecycle.inner")
             .audit
             .clone()
     }
@@ -292,7 +293,7 @@ impl DrainOrchestrator {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("node_lifecycle.inner");
         if !inner.nodes.contains_key(&target) {
             return Err(DrainError::UnknownNode(target));
         }
@@ -347,7 +348,7 @@ impl DrainOrchestrator {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("node_lifecycle.inner");
         let rec = inner
             .nodes
             .get_mut(&target)
@@ -390,7 +391,7 @@ impl DrainOrchestrator {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("node_lifecycle.inner");
 
         // Compute the state transition first, then push audit events,
         // to keep two disjoint mutable borrows on `inner` from
@@ -440,7 +441,7 @@ impl DrainOrchestrator {
         let mut inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("node_lifecycle.inner");
         for (id, rec) in &mut inner.nodes {
             // Each shard the adapter reports the node holds adds an entry.
             // We count occurrences (a node may hold multiple voter slots
@@ -471,7 +472,7 @@ impl DrainOrchestrator {
         let shard_count = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("node_lifecycle.inner")
             .nodes
             .get(&target)
             .map_or(0, |n| n.voter_in_shards.len());
@@ -520,7 +521,7 @@ impl DrainOrchestrator {
         let inner = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("node_lifecycle.inner");
         inner.nodes.iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 }

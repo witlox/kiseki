@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 1813 — NFS Version 3 Protocol
 //! Specification** (June 1995).
 //!

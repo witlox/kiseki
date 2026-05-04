@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for storage-admin.feature — 46 scenarios.
 
 use std::sync::atomic::Ordering;

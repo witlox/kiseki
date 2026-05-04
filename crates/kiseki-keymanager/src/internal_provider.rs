@@ -10,6 +10,7 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LE
 use zeroize::Zeroizing;
 
 use crate::provider::{KmsEpochId, KmsError, KmsHealth, TenantKmsProvider};
+use kiseki_common::locks::LockOrDie;
 
 /// Nonce length for AES-256-GCM (96 bits).
 const GCM_NONCE_LEN: usize = NONCE_LEN;
@@ -63,7 +64,7 @@ impl TenantKmsProvider for InternalProvider {
         let state = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("internal_provider.inner");
 
         let sealing_key = Self::make_aead_key(&state.key)?;
 
@@ -94,7 +95,7 @@ impl TenantKmsProvider for InternalProvider {
         let state = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("internal_provider.inner");
 
         let (nonce_bytes, ct_with_tag) = ciphertext.split_at(GCM_NONCE_LEN);
         let mut nonce_arr = [0u8; GCM_NONCE_LEN];
@@ -115,7 +116,7 @@ impl TenantKmsProvider for InternalProvider {
         let mut state = self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("internal_provider.inner");
 
         let mut new_key = vec![0u8; 32];
         aws_lc_rs::rand::fill(&mut new_key)

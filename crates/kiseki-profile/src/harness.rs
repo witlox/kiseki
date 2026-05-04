@@ -26,7 +26,11 @@ impl Ports {
         let mut ports = Vec::with_capacity(7);
         for _ in 0..7 {
             let sock = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-            ports.push(sock.local_addr().unwrap().port());
+            ports.push(
+                sock.local_addr()
+                    .expect("freshly-bound socket must have a local addr")
+                    .port(),
+            );
             listeners.push(sock);
         }
         // Listeners drop here; the kernel may recycle these ports
@@ -102,9 +106,12 @@ impl ProfileServer {
             .map_err(|e| format!("spawn kiseki-server at {}: {e}", binary.display()))?;
 
         let s3_base = format!("http://127.0.0.1:{}", ports.s3_http);
-        let nfs_addr: std::net::SocketAddr =
-            format!("127.0.0.1:{}", ports.nfs_tcp).parse().unwrap();
-        let ds_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ports.ds_tcp).parse().unwrap();
+        let nfs_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ports.nfs_tcp)
+            .parse()
+            .expect("static 127.0.0.1:port format always parses as SocketAddr");
+        let ds_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ports.ds_tcp)
+            .parse()
+            .expect("static 127.0.0.1:port format always parses as SocketAddr");
         let mut server = Self {
             process: child,
             _data_dir: data_dir,

@@ -11,6 +11,7 @@
 
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::restriction)]
 #![allow(missing_docs, rust_2018_idioms)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 /// v1 protobuf types and gRPC services.
 pub mod v1 {

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for Kiseki acceptance tests.
 //!
 //! Only steps with REAL behavioral assertions are defined here.

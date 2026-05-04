@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! 3-node cluster harness — process-level singleton.
 //!
 //! Spawns three `kiseki-server` children once per test binary lifetime

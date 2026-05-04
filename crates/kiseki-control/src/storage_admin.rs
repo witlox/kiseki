@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use kiseki_common::ids::ShardId;
+use kiseki_common::locks::LockOrDie;
 
 /// Storage pool definition.
 #[derive(Clone, Debug)]
@@ -141,12 +142,12 @@ impl StorageAdminService {
 
     /// Get recorded device health events.
     pub fn health_events(&self) -> Vec<DeviceHealthEvent> {
-        self.health_events.read().unwrap().clone()
+        self.health_events.read().lock_or_die("storage_admin.unknown").clone()
     }
 
     /// Generate a synthetic IO stats event for a pool.
     pub fn io_stats(&self, pool: &str) -> Option<IOStatsEvent> {
-        let pools = self.pools.read().unwrap();
+        let pools = self.pools.read().lock_or_die("storage_admin.unknown");
         pools.get(pool).map(|p| IOStatsEvent {
             pool: p.name.clone(),
             read_iops: 1000,
@@ -159,13 +160,13 @@ impl StorageAdminService {
     /// Set the inline data threshold in bytes (ADR-030).
     /// Changes are prospective only — existing deltas are not affected (I-L9).
     pub fn set_inline_threshold(&self, bytes: u64) {
-        *self.inline_threshold_bytes.write().unwrap() = bytes;
+        *self.inline_threshold_bytes.write().lock_or_die("storage_admin.unknown") = bytes;
     }
 
     /// Get the current inline data threshold in bytes.
     #[must_use]
     pub fn inline_threshold(&self) -> u64 {
-        *self.inline_threshold_bytes.read().unwrap()
+        *self.inline_threshold_bytes.read().lock_or_die("storage_admin.unknown")
     }
 
     /// Attempt to change a tenant quota via `StorageAdminService`.
@@ -184,7 +185,7 @@ impl StorageAdminService {
     /// Create a storage pool. Requires admin role.
     pub fn create_pool(&self, pool: StoragePool, role: AdminRole) -> Result<(), AdminError> {
         require_admin(role)?;
-        let mut pools = self.pools.write().unwrap();
+        let mut pools = self.pools.write().lock_or_die("storage_admin.unknown");
         if pools.contains_key(&pool.name) {
             return Err(AdminError::AlreadyExists(pool.name));
         }
@@ -195,26 +196,26 @@ impl StorageAdminService {
     /// Get pool info.
     #[must_use]
     pub fn get_pool(&self, name: &str) -> Option<StoragePool> {
-        self.pools.read().unwrap().get(name).cloned()
+        self.pools.read().lock_or_die("storage_admin.unknown").get(name).cloned()
     }
 
     /// List all pools.
     #[must_use]
     pub fn list_pools(&self) -> Vec<StoragePool> {
-        self.pools.read().unwrap().values().cloned().collect()
+        self.pools.read().lock_or_die("storage_admin.unknown").values().cloned().collect()
     }
 
     /// Delete a pool (must be empty). Requires admin role.
     pub fn delete_pool(&self, name: &str, role: AdminRole) -> Result<(), AdminError> {
         require_admin(role)?;
         // Acquire devices lock first (consistent order: devices before pools).
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.read().lock_or_die("storage_admin.unknown");
         let has_devices = devices.values().any(|d| d.pool == name);
         if has_devices {
             return Err(AdminError::PoolNotEmpty(name.to_owned()));
         }
         // Hold devices lock while removing pool to prevent concurrent add_device.
-        let mut pools = self.pools.write().unwrap();
+        let mut pools = self.pools.write().lock_or_die("storage_admin.unknown");
         pools
             .remove(name)
             .ok_or_else(|| AdminError::NotFound(name.to_owned()))?;
@@ -226,12 +227,12 @@ impl StorageAdminService {
     /// Add a device to a pool. Requires SRE or admin role.
     pub fn add_device(&self, device: DeviceInfo, role: AdminRole) -> Result<(), AdminError> {
         require_sre(role)?;
-        let pools = self.pools.read().unwrap();
+        let pools = self.pools.read().lock_or_die("storage_admin.unknown");
         if !pools.contains_key(&device.pool) {
             return Err(AdminError::NotFound(device.pool.clone()));
         }
         // Hold pools lock while inserting device.
-        let mut devices = self.devices.write().unwrap();
+        let mut devices = self.devices.write().lock_or_die("storage_admin.unknown");
         devices.insert(device.device_id.clone(), device);
         drop(devices);
         drop(pools);
@@ -246,7 +247,7 @@ impl StorageAdminService {
         role: AdminRole,
     ) -> Result<(), AdminError> {
         require_sre(role)?;
-        let mut devices = self.devices.write().unwrap();
+        let mut devices = self.devices.write().lock_or_die("storage_admin.unknown");
         let dev = devices
             .get_mut(device_id)
             .ok_or_else(|| AdminError::NotFound(device_id.to_owned()))?;
@@ -268,7 +269,7 @@ impl StorageAdminService {
         let old_status = dev.status;
         dev.status = status;
         // Record health event.
-        self.health_events.write().unwrap().push(DeviceHealthEvent {
+        self.health_events.write().lock_or_die("storage_admin.unknown").push(DeviceHealthEvent {
             device_id: device_id.to_owned(),
             old_status,
             new_status: status,
@@ -281,7 +282,7 @@ impl StorageAdminService {
     pub fn list_devices(&self, pool: &str) -> Vec<DeviceInfo> {
         self.devices
             .read()
-            .unwrap()
+            .lock_or_die("storage_admin.unknown")
             .values()
             .filter(|d| d.pool == pool)
             .cloned()
@@ -296,13 +297,13 @@ impl StorageAdminService {
         role: AdminRole,
     ) -> Result<(), AdminError> {
         require_admin(role)?;
-        let pools = self.pools.read().unwrap();
+        let pools = self.pools.read().lock_or_die("storage_admin.unknown");
         if !pools.contains_key(pool) {
             return Err(AdminError::NotFound(pool.to_owned()));
         }
         self.shard_assignments
             .write()
-            .unwrap()
+            .lock_or_die("storage_admin.pools")
             .insert(shard_id, pool.to_owned());
         drop(pools);
         Ok(())
@@ -313,7 +314,7 @@ impl StorageAdminService {
     pub fn shard_pool(&self, shard_id: ShardId) -> Option<String> {
         self.shard_assignments
             .read()
-            .unwrap()
+            .lock_or_die("storage_admin.unknown")
             .get(&shard_id)
             .cloned()
     }

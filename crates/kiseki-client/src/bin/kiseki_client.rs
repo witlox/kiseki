@@ -1,4 +1,5 @@
 #![allow(clippy::cast_precision_loss)] // format_bytes: display-only f64 cast is fine
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Kiseki client CLI -- staging, cache management, FUSE mount, diagnostics.
 //!
 //! Usage:

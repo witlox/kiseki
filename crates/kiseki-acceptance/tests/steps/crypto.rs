@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for key-management.feature — scenarios with real assertions.
 
 use crate::KisekiWorld;

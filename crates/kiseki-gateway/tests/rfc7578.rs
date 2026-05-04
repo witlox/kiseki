@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 7578 — Returning Values from
 //! Forms: multipart/form-data** (July 2015).
 //!

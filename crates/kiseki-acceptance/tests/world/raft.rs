@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Raft cluster + perf state (ADR-037).
 
 use kiseki_common::ids::NodeId;

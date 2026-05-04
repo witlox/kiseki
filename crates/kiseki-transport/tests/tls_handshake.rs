@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests for TCP+TLS transport with mTLS.
 //!
 //! Uses `rcgen` to generate self-signed CA and node certificates for

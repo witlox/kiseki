@@ -12,6 +12,7 @@
 //!   - I-L8 — cross-shard rename returns EXDEV
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod composition;
 pub mod error;

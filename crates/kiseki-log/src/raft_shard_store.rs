@@ -20,6 +20,7 @@ use crate::raft::state_machine::ClusterChunkStateEntry;
 use crate::raft::OpenRaftLogStore;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
 use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest};
+use kiseki_common::locks::LockOrDie;
 
 /// Raft-backed shard store for multi-node clusters.
 ///
@@ -162,7 +163,7 @@ impl RaftShardStore {
         let mut shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_shard_store.shards");
         shards.insert(shard_id, store);
     }
 
@@ -171,7 +172,7 @@ impl RaftShardStore {
         let shards = self
             .shards
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("raft_shard_store.shards");
         shards
             .get(&shard_id)
             .cloned()

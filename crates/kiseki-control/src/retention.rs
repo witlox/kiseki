@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::error::ControlError;
+use kiseki_common::locks::LockOrDie;
 
 /// A retention hold on a namespace.
 #[derive(Clone, Debug)]
@@ -40,7 +41,7 @@ impl RetentionStore {
         if name.is_empty() {
             return Err(ControlError::Rejected("hold name required".into()));
         }
-        let mut holds = self.holds.write().unwrap();
+        let mut holds = self.holds.write().lock_or_die("retention.unknown");
         holds.insert(
             name.to_owned(),
             Hold {
@@ -54,7 +55,7 @@ impl RetentionStore {
 
     /// Deactivate a retention hold.
     pub fn release_hold(&self, name: &str) -> Result<(), ControlError> {
-        let mut holds = self.holds.write().unwrap();
+        let mut holds = self.holds.write().lock_or_die("retention.unknown");
         let hold = holds
             .get_mut(name)
             .ok_or_else(|| ControlError::NotFound(format!("hold {name}")))?;
@@ -65,7 +66,7 @@ impl RetentionStore {
     /// Check if any active hold exists for the given namespace.
     #[must_use]
     pub fn is_held(&self, namespace_id: &str) -> bool {
-        let holds = self.holds.read().unwrap();
+        let holds = self.holds.read().lock_or_die("retention.unknown");
         holds
             .values()
             .any(|h| h.namespace_id == namespace_id && h.active)
@@ -95,7 +96,7 @@ mod tests {
         );
 
         // Verify the hold exists with correct metadata
-        let holds = store.holds.read().unwrap();
+        let holds = store.holds.read().lock_or_die("retention.unknown");
         let hold = holds.get("hipaa-litigation-2026").unwrap();
         assert!(hold.active);
         assert_eq!(hold.namespace_id, "trials");
@@ -119,7 +120,7 @@ mod tests {
         );
 
         // Verify hold is inactive
-        let holds = store.holds.read().unwrap();
+        let holds = store.holds.read().lock_or_die("retention.unknown");
         let hold = holds.get("hipaa-litigation-2026").unwrap();
         assert!(!hold.active);
     }

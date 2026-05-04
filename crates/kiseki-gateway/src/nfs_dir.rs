@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use kiseki_common::ids::{CompositionId, NamespaceId};
 
 use super::nfs_ops::FileHandle;
+use kiseki_common::locks::LockOrDie;
 
 /// A directory entry mapping a name to a file handle and composition.
 #[derive(Clone, Debug)]
@@ -49,7 +50,7 @@ impl DirectoryIndex {
         composition_id: CompositionId,
         size: u64,
     ) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
         entries.entry(ns).or_default().insert(
             name.clone(),
             DirEntry {
@@ -63,7 +64,7 @@ impl DirectoryIndex {
 
     /// Reverse-lookup: find the name for a file handle in a namespace.
     pub fn name_for(&self, ns: NamespaceId, fh: &FileHandle) -> Option<String> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
         entries.get(&ns).and_then(|dir| {
             dir.values()
                 .find(|e| &e.file_handle == fh)
@@ -73,13 +74,13 @@ impl DirectoryIndex {
 
     /// Look up a file by name in a namespace.
     pub fn lookup(&self, ns: NamespaceId, name: &str) -> Option<DirEntry> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
         entries.get(&ns).and_then(|dir| dir.get(name).cloned())
     }
 
     /// List all files in a namespace.
     pub fn list(&self, ns: NamespaceId) -> Vec<DirEntry> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
         entries
             .get(&ns)
             .map(|dir| dir.values().cloned().collect())
@@ -88,7 +89,7 @@ impl DirectoryIndex {
 
     /// Remove a file from the namespace directory.
     pub fn remove(&self, ns: NamespaceId, name: &str) -> bool {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
         entries
             .get_mut(&ns)
             .map(|dir| dir.remove(name).is_some())
@@ -97,7 +98,7 @@ impl DirectoryIndex {
 
     /// Rename a file within a namespace.
     pub fn rename(&self, ns: NamespaceId, old_name: &str, new_name: &str) -> bool {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
         let Some(dir) = entries.get_mut(&ns) else {
             return false;
         };
@@ -111,7 +112,7 @@ impl DirectoryIndex {
 
     /// Number of files in a namespace.
     pub fn count(&self, ns: NamespaceId) -> usize {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
         entries.get(&ns).map_or(0, HashMap::len)
     }
 }

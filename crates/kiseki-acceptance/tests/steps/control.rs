@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Step definitions for control-plane BDD scenarios.
 //!
 //! Ports the Go godog steps from `control/tests/acceptance/steps_tenant.go`

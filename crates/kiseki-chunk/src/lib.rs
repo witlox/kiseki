@@ -12,6 +12,7 @@
 //!   - I-C4 — EC per pool (durability strategy)
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod async_ops;
 pub mod device;

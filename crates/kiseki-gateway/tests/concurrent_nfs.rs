@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests: concurrent NFS and pNFS operations.
 //!
 //! Tests NFS gateway under concurrent load (multi-threaded, matching

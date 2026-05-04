@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 1057 — RPC: Remote Procedure
 //! Call Protocol Specification Version 2** (June 1988).
 //!

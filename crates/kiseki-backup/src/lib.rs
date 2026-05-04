@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Cluster backup and disaster recovery (ADR-016).
 //!
 //! Owns the [`ObjectBackupBackend`] trait, the [`BackupManager`], and

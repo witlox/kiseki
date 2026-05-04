@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 5531 — Remote Procedure Call
 //! Protocol Specification Version 2** (May 2009).
 //!

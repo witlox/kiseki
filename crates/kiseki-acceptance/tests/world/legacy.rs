@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Legacy in-memory domain objects.
 //!
 //! These exist for @unit step definitions that test domain logic

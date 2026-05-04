@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! pNFS Flexible Files state (ADR-038, Phase 15).
 
 use std::sync::Arc;

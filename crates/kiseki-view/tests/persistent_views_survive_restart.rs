@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! ADR-040: persistent `ViewStore` must survive process restart.
 //!
 //! Pins the contract that the symmetric ADR-040 §D11 line ("`ViewStore`:

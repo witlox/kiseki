@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for **RFC 5665 — IANA Considerations for
 //! Remote Procedure Call (RPC) Network Identifiers and Universal
 //! Address Formats** (January 2010).

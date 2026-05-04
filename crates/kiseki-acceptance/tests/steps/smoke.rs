@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Smoke-test steps for the server harness.
 //!
 //! These steps exercise the real `kiseki-server` binary through

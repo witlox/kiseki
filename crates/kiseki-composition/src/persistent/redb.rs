@@ -24,6 +24,7 @@ use lru::LruCache;
 use super::error::PersistentStoreError;
 use super::storage::{CompositionStorage, HydrationBatch};
 use crate::composition::Composition;
+use kiseki_common::locks::LockOrDie;
 
 // -- Schema -----------------------------------------------------------------
 
@@ -208,8 +209,9 @@ impl PersistentRedbStorage {
         txn.commit()?;
 
         let cache = LruCache::new(
-            std::num::NonZeroUsize::new(lru_capacity)
-                .unwrap_or(std::num::NonZeroUsize::new(1).unwrap()),
+            std::num::NonZeroUsize::new(lru_capacity).unwrap_or(
+                std::num::NonZeroUsize::new(1).expect("1 is non-zero by construction"),
+            ),
         );
         Ok(Self {
             db: Mutex::new(db),
@@ -260,7 +262,7 @@ impl CompositionStorage for PersistentRedbStorage {
         if let Some(comp) = self
             .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("redb.cache")
             .get(&id)
             .cloned()
         {
@@ -276,7 +278,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(COMPOSITIONS)?;
         let key = id.0.as_bytes().as_slice();
@@ -291,7 +293,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let evicted = self
             .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("redb.cache")
             .push(id, comp.clone());
         if evicted.is_some() {
             if let Some(ref m) = self.metrics {
@@ -305,7 +307,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(COMPOSITIONS)?;
         Ok(table.len()?)
@@ -317,7 +319,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(COMPOSITIONS)?;
         let mut out = Vec::new();
@@ -340,7 +342,7 @@ impl CompositionStorage for PersistentRedbStorage {
             let db = self
                 .db
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("redb.db");
             let txn = db.begin_write()?;
             {
                 let mut table = txn.open_table(COMPOSITIONS)?;
@@ -353,7 +355,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let push_result = self
             .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("redb.cache")
             .push(id, comp);
         self.record_eviction(Self::is_capacity_eviction(push_result.as_ref(), id));
         Ok(())
@@ -364,7 +366,7 @@ impl CompositionStorage for PersistentRedbStorage {
             let db = self
                 .db
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("redb.db");
             let txn = db.begin_write()?;
             let existed = {
                 let mut table = txn.open_table(COMPOSITIONS)?;
@@ -390,7 +392,7 @@ impl CompositionStorage for PersistentRedbStorage {
         };
         self.cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("redb.cache")
             .pop(&id);
         Ok(existed)
     }
@@ -404,7 +406,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(NAMES)?;
         let Some(guard) = table.get(key.as_slice())? else {
@@ -429,7 +431,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(NAMES_REVERSE)?;
         let Some(guard) = table.get(id.0.as_bytes().as_slice())? else {
@@ -450,7 +452,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_write()?;
         {
             let mut names = txn.open_table(NAMES)?;
@@ -489,7 +491,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_write()?;
         let removed = {
             let mut names = txn.open_table(NAMES)?;
@@ -514,7 +516,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(NAMES)?;
         // Range scan over the namespace prefix. Keys are
@@ -563,7 +565,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(META)?;
         let Some(guard) = table.get(meta_keys::LAST_APPLIED_SEQ)? else {
@@ -585,7 +587,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(META)?;
         let Some(guard) = table.get(meta_keys::STUCK_STATE)? else {
@@ -598,7 +600,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let db = self
             .db
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(META)?;
         let Some(guard) = table.get(meta_keys::HALTED)? else {
@@ -618,7 +620,7 @@ impl CompositionStorage for PersistentRedbStorage {
             let db = self
                 .db
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("redb.db");
             let txn = db.begin_write()?;
             {
                 let mut comps = txn.open_table(COMPOSITIONS)?;
@@ -702,7 +704,7 @@ impl CompositionStorage for PersistentRedbStorage {
             let mut cache = self
                 .cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("redb.cache");
             for comp in commit_inserts {
                 let id = comp.id;
                 let push_result = cache.push(id, comp);

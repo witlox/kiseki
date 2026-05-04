@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! `kiseki-storage` — gRPC client for the `StorageAdminService`
 //! (ADR-025 W6). 26 verbs covering every RPC.
 //!

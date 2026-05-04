@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Layer 1 reference tests for the **RPCSEC_GSS family**:
 //!   - RFC 2203 — RPCSEC_GSS Protocol Specification (Sept 1997)
 //!   - RFC 5403 — RPCSEC_GSS Version 2 (Feb 2010)
