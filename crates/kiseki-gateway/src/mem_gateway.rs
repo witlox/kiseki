@@ -13,6 +13,26 @@ use kiseki_common::tenancy::DedupPolicy;
 use kiseki_composition::composition::{CompositionOps, CompositionStore};
 use kiseki_crypto::aead::Aead;
 use kiseki_crypto::chunk_id::derive_chunk_id;
+
+/// Per-chunk landing record used by `MemGateway::write` to track each
+/// piece of a multi-chunk composition for the post-write Raft delta.
+struct ChunkLanded {
+    id: kiseki_common::ids::ChunkId,
+    ciphertext_len: u64,
+    was_new: bool,
+}
+
+/// Maximum plaintext bytes per chunk on the write path.
+///
+/// Bug 4 (GCP 2026-05-04): without this cap the gateway emitted one
+/// envelope per S3 PUT, so any payload larger than the fabric's
+/// per-envelope cap (`FABRIC_CIPHERTEXT_MAX_BYTES = 256 MiB`) failed
+/// cross-node replication with an h2 / "quorum lost" error. Splitting
+/// at this boundary keeps every fabric envelope well under the cap
+/// (AES-256-GCM ciphertext == plaintext length + headroom for the
+/// envelope wrapper) while keeping per-PUT chunk count bounded for
+/// metadata / refcount overhead.
+pub const MAX_PLAINTEXT_PER_CHUNK: usize = 64 * 1024 * 1024;
 use kiseki_crypto::envelope;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_view::view::{ViewOps, ViewStore};
@@ -1056,30 +1076,7 @@ impl GatewayOps for InMemoryGateway {
                 }
             }
         }
-        // Compute content-addressed chunk ID.
-        let chunk_id = derive_chunk_id(
-            &req.data,
-            self.dedup_policy,
-            self.tenant_hmac_key.as_deref(),
-        )
-        .map_err(|e| {
-            tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
-            GatewayError::Upstream(e.to_string())
-        })?;
-
-        // Encrypt the data (I-K1: no plaintext past the gateway boundary).
-        let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, &req.data)
-            .map_err(|e| {
-                tracing::warn!(?chunk_id, error = %e, "gateway write: seal_envelope failed");
-                GatewayError::Upstream(e.to_string())
-            })?;
-
         let bytes_written = req.data.len() as u64;
-        // Phase 16d step 3: capture the pre-encode ciphertext length
-        // before `env` is moved into write_chunk. Used by the EC
-        // read path to size the decoded output exactly.
-        let ciphertext_len = env.ciphertext.len() as u64;
-
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(bytes_written, Ordering::Relaxed);
@@ -1092,54 +1089,93 @@ impl GatewayOps for InMemoryGateway {
             c.inc_by(bytes_written);
         }
 
-        // Route: inline (ADR-030) or chunk store. `chunk_was_new`
-        // tracks whether this write actually created a new chunk
-        // (vs. a dedup hit) so the log proposal below can carry the
-        // right Phase 16b cluster_chunk_state hint. The 0-byte path
-        // (POSIX `touch` / NFSv4 OPEN-CREATE on an empty file) flows
-        // through here unchanged: derive_chunk_id, seal_envelope, and
-        // chunks.write_chunk all support empty payloads natively, and
-        // the EC encoder owns the empty-input contract (kiseki_chunk::
-        // ec::encode short-circuits and emits zero-length fragments).
-        let mut chunk_was_new = false;
-        if bytes_written <= self.inline_threshold && self.small_store.is_some() {
-            tracing::debug!(
-                ?chunk_id,
-                inline_threshold = self.inline_threshold,
-                "gateway write: inline path",
-            );
-            let env_bytes = serde_json::to_vec(&env).map_err(|e| {
-                tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
+        // Bug 4 fix: split payloads larger than MAX_PLAINTEXT_PER_CHUNK
+        // across multiple chunks. Smaller payloads (the common case)
+        // get a single-chunk composition, identical to the pre-fix
+        // shape. The 0-byte case yields a 1-chunk composition with an
+        // empty-payload chunk (POSIX `touch` / NFSv4 OPEN-CREATE).
+        let raw_pieces: Vec<&[u8]> = if req.data.is_empty() {
+            vec![&req.data[..]]
+        } else {
+            req.data.chunks(MAX_PLAINTEXT_PER_CHUNK).collect()
+        };
+        let pieces_len = raw_pieces.len();
+
+        let mut landed: Vec<ChunkLanded> = Vec::with_capacity(pieces_len);
+
+        for piece in raw_pieces {
+            let chunk_id = derive_chunk_id(
+                piece,
+                self.dedup_policy,
+                self.tenant_hmac_key.as_deref(),
+            )
+            .map_err(|e| {
+                tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
                 GatewayError::Upstream(e.to_string())
             })?;
-            if let Some(ref store) = self.small_store {
-                store.put(&chunk_id.0, &env_bytes).map_err(|e| {
-                    tracing::warn!(?chunk_id, error = %e, "gateway write: small_store.put failed");
+
+            let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, piece)
+                .map_err(|e| {
+                    tracing::warn!(?chunk_id, error = %e, "gateway write: seal_envelope failed");
                     GatewayError::Upstream(e.to_string())
                 })?;
-            }
-        } else {
-            // Chunk path: store encrypted envelope on block device.
-            tracing::debug!(
-                ?chunk_id,
-                ciphertext_len,
-                "gateway write: chunk path → chunks.write_chunk",
-            );
-            let is_new = self.chunks.write_chunk(env, "default").await.map_err(|e| {
-                tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
-                GatewayError::Upstream(e.to_string())
-            })?;
-            if is_new {
-                tracing::debug!(?chunk_id, "gateway write: new chunk landed");
+            let ciphertext_len = env.ciphertext.len() as u64;
+
+            let piece_len = piece.len() as u64;
+            // Inline path eligibility is per-chunk: a multi-chunk PUT
+            // never goes inline (each chunk is large by definition).
+            // Single-chunk PUTs ≤ inline_threshold still take the
+            // fast path so small-object storage is unchanged.
+            let mut chunk_was_new = false;
+            if pieces_len == 1
+                && piece_len <= self.inline_threshold
+                && self.small_store.is_some()
+            {
+                tracing::debug!(
+                    ?chunk_id,
+                    inline_threshold = self.inline_threshold,
+                    "gateway write: inline path",
+                );
+                let env_bytes = serde_json::to_vec(&env).map_err(|e| {
+                    tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
+                    GatewayError::Upstream(e.to_string())
+                })?;
+                if let Some(ref store) = self.small_store {
+                    store.put(&chunk_id.0, &env_bytes).map_err(|e| {
+                        tracing::warn!(?chunk_id, error = %e, "gateway write: small_store.put failed");
+                        GatewayError::Upstream(e.to_string())
+                    })?;
+                }
             } else {
                 tracing::debug!(
                     ?chunk_id,
-                    "gateway write: dedup hit — incrementing refcount"
+                    ciphertext_len,
+                    "gateway write: chunk path → chunks.write_chunk",
                 );
-                let _ = self.chunks.increment_refcount(&chunk_id).await;
+                let is_new = self.chunks.write_chunk(env, "default").await.map_err(|e| {
+                    tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
+                    GatewayError::Upstream(e.to_string())
+                })?;
+                if is_new {
+                    tracing::debug!(?chunk_id, "gateway write: new chunk landed");
+                    chunk_was_new = true;
+                } else {
+                    tracing::debug!(
+                        ?chunk_id,
+                        "gateway write: dedup hit — incrementing refcount"
+                    );
+                    let _ = self.chunks.increment_refcount(&chunk_id).await;
+                }
             }
-            chunk_was_new = is_new;
+
+            landed.push(ChunkLanded {
+                id: chunk_id,
+                ciphertext_len,
+                was_new: chunk_was_new,
+            });
         }
+        let chunk_ids: Vec<kiseki_common::ids::ChunkId> =
+            landed.iter().map(|l| l.id).collect();
 
         // Create composition (sync, fast) — lock released before Raft.
         // Log emission happens after lock release to avoid holding the
@@ -1147,7 +1183,7 @@ impl GatewayOps for InMemoryGateway {
         let (comp_id, log, emit_params) = {
             let mut comps = self.compositions.lock().await;
             let comp_id = comps
-                .create(req.namespace_id, vec![chunk_id], bytes_written)
+                .create(req.namespace_id, chunk_ids.clone(), bytes_written)
                 .map_err(|e| {
                     tracing::warn!(error = %e, "gateway write: compositions.create failed");
                     GatewayError::Upstream(e.to_string())
@@ -1204,27 +1240,29 @@ impl GatewayOps for InMemoryGateway {
             // machine seeds a `cluster_chunk_state[(tenant, chunk_id)]`
             // row atomically with the delta. Dedup-hit writes use the
             // plain `AppendDelta` path.
-            let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = if chunk_was_new {
-                // Phase 16c step 2: when target_copies is set, pick
-                // exactly that many nodes via rendezvous hashing. When
-                // 0 (the 16b posture) carry the whole cluster set.
-                let placement = if self.target_copies > 0 {
-                    kiseki_chunk_cluster::pick_placement(
-                        &chunk_id,
-                        &self.cluster_placement,
-                        self.target_copies,
-                    )
-                } else {
-                    self.cluster_placement.clone()
-                };
-                vec![kiseki_log::raft_store::NewChunkMeta {
-                    chunk_id: chunk_id.0,
-                    placement,
-                    original_len: ciphertext_len,
-                }]
-            } else {
-                vec![]
-            };
+            let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = landed
+                .iter()
+                .filter(|l| l.was_new)
+                .map(|l| {
+                    // Phase 16c step 2: when target_copies is set, pick
+                    // exactly that many nodes via rendezvous hashing. When
+                    // 0 (the 16b posture) carry the whole cluster set.
+                    let placement = if self.target_copies > 0 {
+                        kiseki_chunk_cluster::pick_placement(
+                            &l.id,
+                            &self.cluster_placement,
+                            self.target_copies,
+                        )
+                    } else {
+                        self.cluster_placement.clone()
+                    };
+                    kiseki_log::raft_store::NewChunkMeta {
+                        chunk_id: l.id.0,
+                        placement,
+                        original_len: l.ciphertext_len,
+                    }
+                })
+                .collect();
 
             // Phase 16f: payload encodes (comp_id, namespace_id, size) so
             // followers can hydrate their CompositionStore from the log.
@@ -1960,5 +1998,116 @@ mod halt_mode_tests {
             "exhausted counter must bump when budget runs out",
         );
         assert_eq!(metrics.read_retry_total.get(), 0, "no successful retry hit");
+    }
+}
+
+/// Bug 4 (GCP 2026-05-04): the gateway emitted exactly one envelope
+/// per S3 PUT, regardless of size. Combined with Bug 1's fabric
+/// envelope cap (256 MiB ciphertext), any PUT > ~256 MB returned 500
+/// with the h2 protocol error / "quorum lost" symptom.
+///
+/// The fix is a chunking policy at the gateway: PUTs larger than
+/// `MAX_PLAINTEXT_PER_CHUNK` are split into N chunks, each sealed
+/// with its own envelope, and the resulting composition references
+/// all of them in order.
+#[cfg(test)]
+mod chunking_tests {
+    use super::*;
+    use crate::ops::WriteRequest;
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::ids::{NamespaceId, OrgId};
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_crypto::keys::SystemMasterKey;
+
+    async fn build_gateway() -> (InMemoryGateway, OrgId, NamespaceId) {
+        let tenant = OrgId(uuid::Uuid::from_u128(900));
+        let namespace = NamespaceId(uuid::Uuid::from_u128(901));
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            SystemMasterKey::new([0xCC; 32], KeyEpoch(1)),
+        );
+        gw.ensure_namespace_exists(tenant, namespace).await.unwrap();
+        (gw, tenant, namespace)
+    }
+
+    /// Composition for a 384 MiB write must reference at least 2 chunks.
+    /// Today this fails: the gateway derives a single `chunk_id` over
+    /// the entire payload and creates a 1-chunk composition. With the
+    /// Bug 1 fabric cap in place, any subsequent fabric round-trip
+    /// (replication, cross-node read) of that single chunk fails.
+    #[tokio::test]
+    async fn write_above_chunk_cap_yields_multi_chunk_composition() {
+        let (gw, tenant, namespace) = build_gateway().await;
+
+        // Use a deterministic payload pattern so dedup never collapses
+        // separate chunks into one (different bytes per chunk position).
+        let mut data = vec![0u8; 384 * 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from(i % 251).unwrap();
+        }
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data,
+                name: Some("big-object".to_owned()),
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .expect("write must succeed");
+
+        let comps = gw.compositions.lock().await;
+        let comp = comps.get(resp.composition_id).expect("composition exists");
+        assert!(
+            comp.chunks.len() >= 2,
+            "384 MiB PUT produced a single-chunk composition; gateway is \
+             not chunking large payloads. chunks.len()={}",
+            comp.chunks.len(),
+        );
+    }
+
+    /// A multi-chunk composition must round-trip through `read` with
+    /// the same plaintext as the original PUT.
+    #[tokio::test]
+    async fn write_then_read_round_trips_multi_chunk_composition() {
+        let (gw, tenant, namespace) = build_gateway().await;
+
+        let mut data = vec![0u8; 96 * 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from((i * 17 + 3) % 251).unwrap();
+        }
+        let original = data.clone();
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data,
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .unwrap();
+
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: 0,
+                length: original.len() as u64,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read.data.len(),
+            original.len(),
+            "round-trip length mismatch",
+        );
+        assert_eq!(read.data, original, "round-trip bytes diverged");
     }
 }
