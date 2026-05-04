@@ -315,14 +315,26 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # have the Raft-committed composition delta but not yet the
   # fragment. Read on that follower must local-miss + fabric-fetch.
   # Uses the test-only `POST /admin/test/fabric/slow-ms/{ms}` knob
-  # to delay node-3's incoming fabric ack by 1.5s; the PUT returns
-  # via min_acks=2 (leader local + node-2) within ~50 ms, then
-  # the GET on node-3 races ahead of the in-flight PutFragment
-  # and exercises the fabric fallback.
+  # to delay node-3's incoming fabric ack; the PUT returns via
+  # min_acks=2 (leader local + node-2) within ~50 ms, then the
+  # GET on node-3 races ahead of the in-flight PutFragment and
+  # exercises the fabric fallback.
+  #
+  # Slow-down sized at 60 s — well above the S3 GET step's
+  # internal 30-second retry deadline (which polls every 200 ms
+  # while a follower hydrates its CompositionStore). The earlier
+  # 1.5 s value left a race window where on slow CI runners the
+  # GET retry loop could outlast the slow-down → node-3's local
+  # fragment landed before GET succeeded → no fabric fan-out →
+  # the assertion below saw 0 GET calls and flaked. The
+  # `slow-down is removed` step at scenario end clears the
+  # atomic so subsequent PUTs are not affected; any still-
+  # sleeping PutFragment from this scenario completes harmlessly
+  # (idempotent) outside the test window.
   @integration @multi-node @cross-node @ordering
   Scenario: Composition delta arrives before fragment (D-10 cross-stream)
     Given a 3-node kiseki cluster
-    And node-3's incoming fabric PutFragment is slowed to 1500 ms per call
+    And node-3's incoming fabric PutFragment is slowed to 60000 ms per call
     When a client writes 1MB via S3 PUT to node-1
     Then S3 GET from node-3 returns the same 1MB
     And node-3 issued at least 1 fabric GetFragment calls for the read

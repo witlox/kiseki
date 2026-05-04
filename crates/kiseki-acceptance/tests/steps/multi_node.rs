@@ -1408,18 +1408,37 @@ async fn then_node_issued_n_get_calls(w: &mut KisekiWorld, node_id: u64, expecte
         .get(&baseline_key)
         .copied()
         .unwrap_or(0.0);
+    // Poll the /metrics endpoint for up to 5 s. The metric IS
+    // incremented synchronously inside the gRPC client path on
+    // the reader, so by the time the S3 GET response returns
+    // the counter should already reflect the fan-out. Polling
+    // closes any residual race between metric increment and the
+    // localhost HTTP scrape's buffer flush — a bounded loop is
+    // strictly more reliable than a single read and still bails
+    // fast on success.
+    let want = expected as f64 - 0.5;
     let guard = cluster(w);
     let node = guard.node(node_id);
-    let text = scrape_metrics(node).await;
-    let now = sum_counter_matching_all(&text, "kiseki_fabric_ops_total", &[r#"op="get""#]);
-    let delta = now - baseline;
-    assert!(
-        delta >= expected as f64 - 0.5,
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let last_now = loop {
+        let text = scrape_metrics(node).await;
+        let now = sum_counter_matching_all(&text, "kiseki_fabric_ops_total", &[r#"op="get""#]);
+        if now - baseline >= want {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break now;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let delta = last_now - baseline;
+    panic!(
         "node-{node_id} issued {delta} fabric GET calls during the read \
-         (baseline={baseline}, now={now}); wanted ≥ {expected}. EC 4+2 \
-         requires 4 fragments — a reader holding only its own local \
-         shard MUST fan out to ≥3 peers, so anything below this means \
-         the read was served from a non-EC code path.",
+         (baseline={baseline}, now={last_now}); wanted ≥ {expected} after \
+         5 s of polling. Either the read was served from a non-fabric \
+         code path (e.g. local fragment cache hit because the slow \
+         PutFragment completed before the GET retry succeeded) or the \
+         fabric metric pipeline is broken.",
     );
 }
 
