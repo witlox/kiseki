@@ -258,15 +258,19 @@ jobs:
       # Two passes to dodge the rustls global-state hang in
       # kiseki-chunk-cluster's gRPC TLS tests under workspace-
       # parallel cargo runs (same pattern as the Unit Tests job).
-      # `--no-report` skips report emission per-pass; the final
-      # `report` step merges both passes' coverage.
+      # `--no-report` skips report emission per-pass AND implies
+      # preserving prior coverage data (i.e. `--no-clean` is now
+      # baked in). Newer cargo-llvm-cov rejects `--no-report
+      # --no-clean` together as an explicit conflict — drop the
+      # redundant flag. The final `report` step merges both
+      # passes' accumulated coverage.
       - run: >
           cargo llvm-cov --no-report --workspace
           --exclude kiseki-acceptance
           --exclude kiseki-chunk-cluster
           --locked
       - run: >
-          cargo llvm-cov --no-report --no-clean
+          cargo llvm-cov --no-report
           -p kiseki-chunk-cluster
           --locked
       - run: cargo llvm-cov report --lcov --output-path lcov.info
