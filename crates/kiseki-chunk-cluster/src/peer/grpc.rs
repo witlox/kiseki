@@ -42,21 +42,46 @@ pub struct GrpcFabricPeer {
     metrics: Option<Arc<FabricMetrics>>,
 }
 
-/// Per-RPC message size cap on the cluster fabric. Tonic defaults
-/// to 4 MiB which is below typical kiseki chunk sizes (the gateway
-/// emits one chunk per S3 PUT today, and a 4 MiB PUT + protobuf +
-/// crypto framing already overruns the default cap, returning
-/// `quorum lost: only 1/2 replicas acked` because every `PutFragment`
-/// fan-out is rejected by the receiver).
+/// Application contract: maximum ciphertext bytes per envelope.
+/// The gateway's chunking policy MUST keep envelopes at or below
+/// this size — anything larger is split into multiple chunks
+/// before fan-out.
+pub const FABRIC_CIPHERTEXT_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Wrapper overhead headroom: prost field tags + length varints
+/// for the envelope's `chunk_id` (32 B), `auth_tag` (16 B),
+/// `nonce` (12 B), `system_epoch` + `tenant_epoch` varints, and
+/// the outer `PutFragmentRequest` fields (`chunk_id`,
+/// `fragment_index`, `org_id`, `pool_id`). Measured at ~120 bytes
+/// for the current schema; bumped to 64 KiB for safety so a
+/// future field add can't quietly push us back into the
+/// 2026-05-04 "h2 protocol error: http2 error" failure mode
+/// (see `tests/grpc_max_message_size.rs`).
+pub const FABRIC_WRAPPER_HEADROOM_BYTES: usize = 64 * 1024;
+
+/// Per-RPC message size cap on the cluster fabric — both
+/// directions.
 ///
-/// 256 MiB matches the practical envelope size we'd see for a
-/// single-chunk write up to ~256 MiB (the perf baseline uses 64 MiB
-/// fixtures; the gateway stores the whole user payload as one
-/// envelope, so the gRPC message has to fit). Still bounded so a
-/// peer can't send a near-unbounded message through the fabric.
-/// If the gateway later splits writes into smaller chunks (Phase
-/// 16+), this cap can shrink.
-pub const FABRIC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+/// Sized as `FABRIC_CIPHERTEXT_MAX_BYTES + FABRIC_WRAPPER_HEADROOM_BYTES`
+/// so a near-cap envelope round-trips through tonic without
+/// hitting the underlying h2 `RST_STREAM`.
+///
+/// History: 2026-05-04 GCP transport-profile run discovered this
+/// constant was sized at exactly 256 MiB with no headroom — every
+/// 256 MB S3 PUT failed with `quorum lost: only 1/2 replicas acked`
+/// because the leader's `PutFragment` fan-out hit the receiver-
+/// side decoder cap. tonic returned `Status::resource_exhausted` →
+/// h2 emitted `RST_STREAM` with `INTERNAL_ERROR` → the leader's
+/// transport layer surfaced "h2 protocol error: http2 error".
+/// Tonic's default of 4 MiB is far below kiseki's chunk sizes;
+/// the original sizing was correct in spirit (256 MiB ciphertext
+/// cap) but failed to account for the wrapper bytes.
+///
+/// Tonic defaults to 4 MiB for both decoding and encoding sizes;
+/// kiseki replaces both with this constant on every fabric
+/// `Channel` (`GrpcFabricPeer::new`) and `Server` (`runtime`).
+pub const FABRIC_MAX_MESSAGE_BYTES: usize =
+    FABRIC_CIPHERTEXT_MAX_BYTES + FABRIC_WRAPPER_HEADROOM_BYTES;
 
 impl GrpcFabricPeer {
     /// Build a fabric peer from a connected tonic channel + a
@@ -472,5 +497,19 @@ mod tests {
         // comment, and so a future "let's tighten this" change
         // has to think twice and update the floor in lockstep.
         const _: () = assert!(FABRIC_MAX_MESSAGE_BYTES >= 128 * 1024 * 1024);
+    }
+
+    /// The transport cap MUST be strictly larger than the
+    /// ciphertext cap. Without headroom the prost wrapper's
+    /// field tags + length varints push the encoded request just
+    /// over the limit; tonic returns
+    /// `Status::resource_exhausted` and the leader's transport
+    /// layer surfaces it as "h2 protocol error: http2 error".
+    /// Captured live on the 2026-05-04 GCP transport-profile
+    /// run — see `.gcp-build/findings/2026-05-04-fabric-256mib-cap/`.
+    #[test]
+    fn fabric_message_cap_has_strict_headroom_above_ciphertext_cap() {
+        const _: () = assert!(FABRIC_MAX_MESSAGE_BYTES > FABRIC_CIPHERTEXT_MAX_BYTES);
+        const _: () = assert!(FABRIC_WRAPPER_HEADROOM_BYTES >= 1024);
     }
 }
