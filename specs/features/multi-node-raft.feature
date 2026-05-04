@@ -320,25 +320,35 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # GET on node-3 races ahead of the in-flight PutFragment and
   # exercises the fabric fallback.
   #
-  # Slow-down sized at 60 s — well above the S3 GET step's
-  # internal 30-second retry deadline (which polls every 200 ms
-  # while a follower hydrates its CompositionStore). The earlier
-  # 1.5 s value left a race window where on slow CI runners the
-  # GET retry loop could outlast the slow-down → node-3's local
-  # fragment landed before GET succeeded → no fabric fan-out →
-  # the assertion below saw 0 GET calls and flaked. The
-  # `slow-down is removed` step at scenario end clears the
-  # atomic so subsequent PUTs are not affected; any still-
-  # sleeping PutFragment from this scenario completes harmlessly
-  # (idempotent) outside the test window.
+  # Switched from a "slow PutFragment" knob to "deny" — same
+  # test intent (node-3 never has the local fragment so GET must
+  # fan out), but race-free. Sizing history:
+  #   - 1.5 s slow-down: S3 GET retry loop (30 s deadline,
+  #     200 ms cadence) routinely outlasted it.
+  #   - 60 s slow-down: composition-delta hydration + S3 GET
+  #     retry sometimes pushed total elapsed past 60 s on slow
+  #     CI runners; the slow PutFragment landed locally and the
+  #     assertion saw 0 fabric GET calls.
+  #   - 600 s slow-down: still raced against the leader's 10 s
+  #     Endpoint timeout — once the leader timed out the slow
+  #     call, retried via a different path, OR the slow handler
+  #     landed somehow.
+  # Deny semantics are deterministic: node-3's PutFragment
+  # returns `Status::unavailable` synchronously. With min_acks=2
+  # in 3-node Replication-3, leader-self + node-2 still meet
+  # quorum, so the PUT returns OK. node-3 NEVER has the local
+  # fragment for the rest of the test, so the GET on node-3
+  # MUST fan out and the metric MUST tick. The matching
+  # `incoming fabric is allowed` step at scenario end clears
+  # the deny flag.
   @integration @multi-node @cross-node @ordering
   Scenario: Composition delta arrives before fragment (D-10 cross-stream)
     Given a 3-node kiseki cluster
-    And node-3's incoming fabric PutFragment is slowed to 60000 ms per call
+    And node-3's incoming fabric is denied
     When a client writes 1MB via S3 PUT to node-1
     Then S3 GET from node-3 returns the same 1MB
     And node-3 issued at least 1 fabric GetFragment calls for the read
-    And node-3's incoming fabric slow-down is removed
+    And node-3's incoming fabric is allowed
 
   @integration @multi-node @cross-node @leader-change
   Scenario: Refcount preserved across leader change (D-4)
