@@ -17,3 +17,17 @@ Feature: S3 API wire protocol compliance
   #   s3_server::tests::delete_object_returns_204
   #   s3_server::tests::list_objects_prefix_filtering
   #   s3_server::tests::list_objects_pagination
+
+  # GCP transport-profile run 2026-05-04 (3rd attempt): the bench
+  # ran `PUT /<bucket>/<key>` against a bucket name that hadn't
+  # been registered via `PUT /<bucket>` first. The gateway
+  # returned 500 with body "upstream error: namespace not found:
+  # NamespaceId(...)" — operationally opaque, looks like a server
+  # failure when it's actually operator error. The contract is now
+  # explicit: the S3 layer maps unregistered-bucket writes to the
+  # standard S3 404 NoSuchBucket. Sample observability: the
+  # gateway's tracing::warn still records the namespace UUID for
+  # debugging.
+  #
+  # Unit scenario covering the contract:
+  #   s3_server::tests::put_to_unregistered_bucket_returns_404_no_such_bucket

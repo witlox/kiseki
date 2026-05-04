@@ -2245,3 +2245,4 @@ async fn then_no_corrupt_snapshot(w: &mut KisekiWorld) {
     let health = w.legacy.log_store.shard_health(sid).await.unwrap();
     assert!(health.delta_count > 0, "no corrupted data should be loaded");
 }
+

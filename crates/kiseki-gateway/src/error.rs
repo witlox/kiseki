@@ -64,6 +64,18 @@ pub enum GatewayError {
     /// `Upstream` so HTTP layers can map it cleanly to 404.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// The bucket / namespace named in the request hasn't been
+    /// registered. Distinct from [`Self::NotFound`] (object missing
+    /// inside a known namespace) so the HTTP layer maps cleanly to
+    /// S3 `404 NoSuchBucket` rather than the operationally-opaque
+    /// 500 `Upstream("namespace not found: ...")` the gateway
+    /// returned previously. The 3rd GCP perf run (2026-05-04) hit
+    /// the 500 path when the bench did `PUT /<unregistered-bucket>`
+    /// without first calling `PUT /<bucket>`; the upgrade to a typed
+    /// 404 makes the operator's mistake obvious.
+    #[error("bucket / namespace not registered: {0}")]
+    NamespaceNotFound(String),
 }
 
 impl From<GatewayError> for KisekiError {

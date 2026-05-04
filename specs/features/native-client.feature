@@ -100,6 +100,19 @@ Feature: Native Client — Client-side library with FUSE, encryption, and transp
 
   # --- Edge cases ---
 
+  # GCP transport-profile run 2026-05-04 (3rd attempt): the chunk-store
+  # multi-extent path (commit 973d331) panicked with "index out of bounds"
+  # when called with empty data. A FUSE `create` on a brand-new file
+  # passes Vec::new() down through gateway.write → chunks.write_chunk;
+  # the new alloc-loop returned an empty extents Vec and the next line
+  # indexed [0]. Documents the contract: empty files are valid and must
+  # round-trip without panic.
+  @library
+  Scenario: FUSE create on empty file round-trips (Bug 5 regression guard)
+    Given the native client mounts namespace "default" at /mnt/kiseki
+    When the workload creates an empty file "touch-target" via FUSE
+    Then the create returns success and reading the file returns zero bytes
+
   @library
   Scenario: Multiple clients writing to the same file concurrently
     Given two native client instances on different compute nodes

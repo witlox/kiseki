@@ -3010,3 +3010,52 @@ fn make_test_gateway() -> InMemoryGateway {
         kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
     InMemoryGateway::new(comp_store, kiseki_chunk::arc_async(chunk_store), master_key)
 }
+
+// =====================================================================
+// Bug 5 regression — FUSE create on empty file
+// =====================================================================
+//
+// Tracks the empty-data write path through KisekiFuse → gateway →
+// ChunkOps. The in-memory ChunkStore used here doesn't reproduce the
+// PersistentChunkStore index-out-of-bounds bug directly (the unit
+// test in kiseki-chunk/src/persistent_store.rs covers that), but
+// this scenario documents the contract: empty files round-trip
+// without panic. Combined with the persistent_store unit test, the
+// regression is covered at both layers.
+
+#[when(regex = r#"^the workload creates an empty file "(\S+)" via FUSE$"#)]
+async fn when_create_empty_file_via_fuse(w: &mut KisekiWorld, name: String) {
+    let tenant = test_tenant();
+    let ns = test_namespace();
+    let gw = make_test_gateway();
+    gw.add_namespace(Namespace {
+        id: ns,
+        tenant_id: tenant,
+        shard_id: ShardId(uuid::Uuid::from_u128(1)),
+        read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
+    })
+    .await;
+    let mut fuse = KisekiFuse::new(gw, tenant, ns);
+    let ino = fuse
+        .create(&name, Vec::new())
+        .expect("FUSE create on empty file must succeed");
+    let bytes = fuse
+        .read(ino, 0, 1024)
+        .expect("FUSE read on empty file must succeed");
+    w.last_read_data = Some(bytes);
+}
+
+#[then("the create returns success and reading the file returns zero bytes")]
+async fn then_create_and_read_zero(w: &mut KisekiWorld) {
+    let bytes = w
+        .last_read_data
+        .as_ref()
+        .expect("create+read step did not run");
+    assert!(
+        bytes.is_empty(),
+        "expected zero bytes, got {} bytes",
+        bytes.len(),
+    );
+}

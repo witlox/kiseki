@@ -1187,7 +1187,17 @@ impl GatewayOps for InMemoryGateway {
                 .create(req.namespace_id, chunk_ids.clone(), bytes_written)
                 .map_err(|e| {
                     tracing::warn!(error = %e, "gateway write: compositions.create failed");
-                    GatewayError::Upstream(e.to_string())
+                    // Map the typed NamespaceNotFound through to the
+                    // gateway's typed variant so the HTTP layer can
+                    // return 404 NoSuchBucket instead of an opaque 500.
+                    if matches!(
+                        e,
+                        kiseki_composition::error::CompositionError::NamespaceNotFound(_)
+                    ) {
+                        GatewayError::NamespaceNotFound(e.to_string())
+                    } else {
+                        GatewayError::Upstream(e.to_string())
+                    }
                 })?;
             // Bind the name to the new composition_id (S3 PUT URL key).
             // The conditional check above (or its absence) means the

@@ -280,6 +280,11 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
         Err(crate::error::GatewayError::NotFound(msg)) => {
             (StatusCode::NOT_FOUND, msg).into_response()
         }
+        Err(crate::error::GatewayError::NamespaceNotFound(_)) => s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -1011,6 +1016,39 @@ mod tests {
         let s3gw = S3Gateway::new(gw);
         let tenant = OrgId(uuid::Uuid::nil());
         s3_router(s3gw, tenant)
+    }
+
+    /// Bug 12 (GCP 2026-05-04 3rd run): PUT object to a bucket that
+    /// hasn't been registered first via `PUT /<bucket>` previously
+    /// returned 500 with body
+    /// `"upstream error: namespace not found: NamespaceId(...)"` —
+    /// operationally opaque, looks like a server failure when it's
+    /// actually operator error. The contract is now: a typed
+    /// `GatewayError::NamespaceNotFound` from the gateway maps to S3
+    /// 404 with body `NoSuchBucket`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_to_unregistered_bucket_returns_404_no_such_bucket() {
+        let app = test_router();
+
+        // PUT object to a bucket that was never created via PUT /bucket.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/absent-bucket/some-key")
+            .body(Body::from(&b"payload"[..]))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PUT to unregistered bucket must return 404, not 500",
+        );
+        let body_bytes =
+            axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("NoSuchBucket"),
+            "response body must carry the standard S3 NoSuchBucket code; got: {body}",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
