@@ -43,16 +43,30 @@ struct S3State<G: GatewayOps> {
     /// without metrics configured leave this `None` and the bump
     /// is a no-op.
     requests_total_metric: Option<Arc<prometheus::IntCounterVec>>,
+    /// Optional `kiseki_gateway_request_duration_seconds{method}`
+    /// histogram. Same shape as `requests_total_metric` — wired by
+    /// the runtime, `None` in tests. The 2026-05-04 GCP perf cluster
+    /// surfaced this as registered-but-never-observed: the histogram
+    /// existed in `/metrics` with always-zero counts, leaving the
+    /// read-path latency invisible. Wiring it here closes that gap.
+    request_duration_metric: Option<Arc<prometheus::HistogramVec>>,
 }
 
 impl<G: GatewayOps> S3State<G> {
-    /// `inc()` the `kiseki_gateway_requests_total{method, status}`
-    /// counter when wired. The status string is the numeric HTTP
-    /// status (e.g. "200", "412", "500") — keeps cardinality
-    /// bounded even with arbitrary client behavior.
-    fn record_request(&self, method: &str, status: u16) {
+    /// Record a completed S3 request.
+    ///
+    /// Bumps `kiseki_gateway_requests_total{method, status}` and
+    /// observes `kiseki_gateway_request_duration_seconds{method}`.
+    /// `status` is the numeric HTTP status as a string ("200", "412",
+    /// "500") — keeps cardinality bounded even with arbitrary client
+    /// behavior. Either metric being absent is a no-op.
+    fn record_request(&self, method: &str, status: u16, duration: std::time::Duration) {
         if let Some(c) = self.requests_total_metric.as_ref() {
             c.with_label_values(&[method, &status.to_string()]).inc();
+        }
+        if let Some(h) = self.request_duration_metric.as_ref() {
+            h.with_label_values(&[method])
+                .observe(duration.as_secs_f64());
         }
     }
 }
@@ -101,7 +115,7 @@ pub fn s3_router<G: GatewayOps + Send + Sync + 'static>(
     gateway: S3Gateway<G>,
     fallback_tenant: OrgId,
 ) -> Router {
-    s3_router_full(gateway, fallback_tenant, AccessKeyStore::new(), None)
+    s3_router_full(gateway, fallback_tenant, AccessKeyStore::new(), None, None)
 }
 
 /// Build an axum router with an explicit access key store.
@@ -110,20 +124,21 @@ pub fn s3_router_with_keys<G: GatewayOps + Send + Sync + 'static>(
     fallback_tenant: OrgId,
     key_store: AccessKeyStore,
 ) -> Router {
-    s3_router_full(gateway, fallback_tenant, key_store, None)
+    s3_router_full(gateway, fallback_tenant, key_store, None, None)
 }
 
-/// Build an axum router with both an access key store and a wired
-/// Prometheus counter for `kiseki_gateway_requests_total`. The
-/// runtime calls this with the registered counter so `/metrics`
-/// reflects every request — without it the counter stays at 0
-/// even under load, which is exactly what the GCP 2026-05-02
-/// perf cluster surfaced.
+/// Build an axum router with an access key store, a wired counter for
+/// `kiseki_gateway_requests_total`, and a wired histogram for
+/// `kiseki_gateway_request_duration_seconds`. The runtime passes both;
+/// tests pass `None`. Without the wiring the metrics stay at zero
+/// observations under load — the 2026-05-02 / 05-04 GCP perf clusters
+/// both saw this and the read-path latency stayed invisible.
 pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
     gateway: S3Gateway<G>,
     fallback_tenant: OrgId,
     key_store: AccessKeyStore,
     requests_total: Option<Arc<prometheus::IntCounterVec>>,
+    request_duration: Option<Arc<prometheus::HistogramVec>>,
 ) -> Router {
     let state = Arc::new(S3State {
         gateway,
@@ -131,6 +146,7 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
         key_store,
         buckets: Mutex::new(HashSet::new()),
         requests_total_metric: requests_total,
+        request_duration_metric: request_duration,
     });
 
     // Per-request middleware that records `kiseki_gateway_requests_
@@ -146,8 +162,13 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
             let metric_state = metric_state.clone();
             async move {
                 let method = req.method().as_str().to_owned();
+                let started = std::time::Instant::now();
                 let response = next.run(req).await;
-                metric_state.record_request(&method, response.status().as_u16());
+                metric_state.record_request(
+                    &method,
+                    response.status().as_u16(),
+                    started.elapsed(),
+                );
                 response
             }
         },
@@ -1229,6 +1250,71 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Pin the `kiseki_gateway_request_duration_seconds` wiring.
+    /// The metric is registered in `kiseki-server::metrics`, but
+    /// before this commit it had no observation site — `/metrics`
+    /// always emitted zero counts and the GCP perf clusters had
+    /// no read-path latency signal. Confirm a request through the
+    /// router increments the histogram count for the matching
+    /// method label.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_duration_histogram_is_observed() {
+        use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry};
+
+        let registry = Registry::new();
+        let counter = Arc::new(
+            IntCounterVec::new(
+                Opts::new("kiseki_gateway_requests_total_test", "test"),
+                &["method", "status"],
+            )
+            .unwrap(),
+        );
+        registry.register(Box::new((*counter).clone())).unwrap();
+        let histogram = Arc::new(
+            HistogramVec::new(
+                HistogramOpts::new("kiseki_gateway_request_duration_seconds_test", "test")
+                    .buckets(vec![0.001, 0.01, 0.1, 1.0]),
+                &["method"],
+            )
+            .unwrap(),
+        );
+        registry.register(Box::new((*histogram).clone())).unwrap();
+
+        let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            master_key,
+        );
+        let s3gw = S3Gateway::new(gw);
+        let tenant = OrgId(uuid::Uuid::nil());
+        let app = s3_router_full(
+            s3gw,
+            tenant,
+            crate::s3_auth::AccessKeyStore::new(),
+            Some(Arc::clone(&counter)),
+            Some(Arc::clone(&histogram)),
+        );
+
+        // Any request — a GET on a missing bucket — must move the
+        // GET histogram count above zero.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/no-such-bucket/00000000-0000-0000-0000-000000000099")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+
+        let get_count = histogram.with_label_values(&["GET"]).get_sample_count();
+        assert!(
+            get_count >= 1,
+            "kiseki_gateway_request_duration_seconds{{method=GET}} \
+             must observe at least one sample after a GET request \
+             (got {get_count}); without this wiring the histogram \
+             stays at zero forever",
+        );
     }
 
     // ---------- S3 GetObject — invalid UUID key returns 404 ----------

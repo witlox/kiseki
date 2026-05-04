@@ -739,6 +739,10 @@ pub async fn run_main(
         Arc::new(metrics.chunk_write_bytes.clone()),
         Arc::new(metrics.chunk_read_bytes.clone()),
     );
+    gw.set_phase_duration_metrics(
+        Arc::new(metrics.gateway_get_phase_duration.clone()),
+        Arc::new(metrics.gateway_put_phase_duration.clone()),
+    );
 
     // S3 gateway.
     let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&gw));
@@ -747,6 +751,7 @@ pub async fn run_main(
         bootstrap_tenant,
         kiseki_gateway::s3_auth::AccessKeyStore::new(),
         Some(Arc::new(metrics.gateway_requests_total.clone())),
+        Some(Arc::new(metrics.gateway_request_duration.clone())),
     );
     let s3_addr = cfg.s3_addr;
     let s3_tls = cfg.tls.as_ref().and_then(|files| {

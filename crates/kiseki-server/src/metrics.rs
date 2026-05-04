@@ -40,6 +40,19 @@ pub struct KisekiMetrics {
     pub gateway_requests_total: IntCounterVec,
     /// Gateway request duration in seconds.
     pub gateway_request_duration: HistogramVec,
+    /// GET-path phase latency histogram. Labels:
+    /// `phase` ∈ {`composition_lookup`, `chunk_fetch`, `decrypt`}.
+    /// Wired into `InMemoryGateway` via `set_phase_duration_metrics`
+    /// so each GET surfaces where its time actually goes — separating
+    /// metadata-lookup latency, chunk-store fetch (local + cluster
+    /// fabric) latency, and per-chunk decrypt cost. Buckets cover
+    /// 100 µs — 5 s, the range observed across local/distributed runs.
+    pub gateway_get_phase_duration: HistogramVec,
+    /// PUT-path phase latency histogram. Labels:
+    /// `phase` ∈ {`encrypt`, `chunk_write`, `composition_record`}.
+    /// `composition_record` covers the `CompositionStore::create` +
+    /// `bind_name` + Raft-replicated delta emission round trip.
+    pub gateway_put_phase_duration: HistogramVec,
     /// `x-kiseki-workflow-ref` header validation outcome counter.
     /// Labels: `result` ∈ {`absent`, `valid`, `invalid`}. Wired in
     /// `runtime.rs` to scrape from
@@ -170,6 +183,36 @@ impl KisekiMetrics {
             .register(Box::new(gateway_request_duration.clone()))
             .expect("register");
 
+        let gateway_get_phase_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "kiseki_gateway_get_phase_duration_seconds",
+                "Gateway GET phase latency: composition_lookup, chunk_fetch, decrypt",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["phase"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(gateway_get_phase_duration.clone()))
+            .expect("register");
+
+        let gateway_put_phase_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "kiseki_gateway_put_phase_duration_seconds",
+                "Gateway PUT phase latency: encrypt, chunk_write, composition_record",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["phase"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(gateway_put_phase_duration.clone()))
+            .expect("register");
+
         let gateway_workflow_ref_writes_total = IntCounterVec::new(
             Opts::new(
                 "kiseki_gateway_workflow_ref_writes_total",
@@ -279,6 +322,8 @@ impl KisekiMetrics {
             chunk_ec_encode_latency,
             gateway_requests_total,
             gateway_request_duration,
+            gateway_get_phase_duration,
+            gateway_put_phase_duration,
             gateway_workflow_ref_writes_total,
             pool_capacity_total,
             pool_capacity_used,

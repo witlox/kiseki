@@ -119,6 +119,19 @@ pub struct InMemoryGateway {
     /// Optional Prometheus counter mirror for `kiseki_chunk_read_
     /// bytes` — same shape as `chunk_write_bytes_metric`.
     chunk_read_bytes_metric: std::sync::RwLock<Option<Arc<prometheus::IntCounter>>>,
+    /// Optional histogram for `kiseki_gateway_get_phase_duration_
+    /// seconds{phase}` (phases: `composition_lookup`, `chunk_fetch`,
+    /// `decrypt`). Wired by the runtime so an operator can read off
+    /// where time goes inside a single GET. Without this the only
+    /// signal is end-to-end request duration and we can't separate
+    /// metadata-lookup time from chunk-fetch time from decrypt time.
+    /// `None` in tests + library callers that don't wire metrics.
+    get_phase_duration_metric: std::sync::RwLock<Option<Arc<prometheus::HistogramVec>>>,
+    /// Optional histogram for `kiseki_gateway_put_phase_duration_
+    /// seconds{phase}` (phases: `encrypt`, `chunk_write`,
+    /// `composition_record`). Symmetric to `get_phase_duration_metric`
+    /// for the write path.
+    put_phase_duration_metric: std::sync::RwLock<Option<Arc<prometheus::HistogramVec>>>,
     /// Candidate cluster nodes used by the placement function
     /// (Phase 16b step 2). The full set of node ids; the actual
     /// per-chunk placement is the rendezvous-hashing-selected
@@ -230,6 +243,8 @@ impl InMemoryGateway {
             workflow_ref_writes_metric: std::sync::RwLock::new(None),
             chunk_write_bytes_metric: std::sync::RwLock::new(None),
             chunk_read_bytes_metric: std::sync::RwLock::new(None),
+            get_phase_duration_metric: std::sync::RwLock::new(None),
+            put_phase_duration_metric: std::sync::RwLock::new(None),
             cluster_placement: Vec::new(),
             target_copies: 0,
             retry_metrics: None,
@@ -278,6 +293,45 @@ impl InMemoryGateway {
     ) {
         *self.chunk_write_bytes_metric.write().lock_or_die("mem_gateway.unknown") = Some(write_bytes);
         *self.chunk_read_bytes_metric.write().lock_or_die("mem_gateway.unknown") = Some(read_bytes);
+    }
+
+    /// Attach the GET/PUT phase-duration histograms. Once set, the
+    /// gateway records per-phase latency so an operator can see
+    /// where a single request actually spends its time
+    /// (composition lookup vs chunk fetch vs decrypt on the read
+    /// side; encrypt vs chunk write vs composition record on the
+    /// write side). Tests + library users that don't wire metrics
+    /// see no observation overhead — both slots stay `None` and the
+    /// observe helpers short-circuit.
+    pub fn set_phase_duration_metrics(
+        &self,
+        get_phase: Arc<prometheus::HistogramVec>,
+        put_phase: Arc<prometheus::HistogramVec>,
+    ) {
+        *self.get_phase_duration_metric.write().lock_or_die("mem_gateway.unknown") = Some(get_phase);
+        *self.put_phase_duration_metric.write().lock_or_die("mem_gateway.unknown") = Some(put_phase);
+    }
+
+    fn observe_get_phase(&self, phase: &str, dur: std::time::Duration) {
+        if let Some(h) = self
+            .get_phase_duration_metric
+            .read()
+            .lock_or_die("mem_gateway.get_phase_duration_metric")
+            .as_ref()
+        {
+            h.with_label_values(&[phase]).observe(dur.as_secs_f64());
+        }
+    }
+
+    fn observe_put_phase(&self, phase: &str, dur: std::time::Duration) {
+        if let Some(h) = self
+            .put_phase_duration_metric
+            .read()
+            .lock_or_die("mem_gateway.put_phase_duration_metric")
+            .as_ref()
+        {
+            h.with_label_values(&[phase]).observe(dur.as_secs_f64());
+        }
     }
 
     /// Attach a telemetry bus (ADR-021). Once attached, the gateway emits
@@ -771,6 +825,7 @@ impl GatewayOps for InMemoryGateway {
     )]
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
         tracing::debug!("gateway read: entry");
+        let composition_lookup_started = std::time::Instant::now();
         // Phase 16f / ADR-040 §D7: on a follower, the hydrator may not
         // have applied the create-delta yet for a composition the
         // client just PUT on the leader. Retry briefly so a tight
@@ -839,6 +894,10 @@ impl GatewayOps for InMemoryGateway {
             tracing::warn!(error = %e, "gateway read: compositions.get failed");
             GatewayError::Upstream(e.to_string())
         })?;
+        self.observe_get_phase(
+            "composition_lookup",
+            composition_lookup_started.elapsed(),
+        );
 
         // Verify tenant ownership (I-T1).
         if comp.tenant_id != req.tenant_id {
@@ -919,6 +978,7 @@ impl GatewayOps for InMemoryGateway {
 
             // Cache miss — read from inline store first (ADR-030),
             // then block device.
+            let chunk_fetch_started = std::time::Instant::now();
             let inline_hit = if let Some(ref store) = self.small_store {
                 store
                     .get(&chunk_id.0)
@@ -940,12 +1000,15 @@ impl GatewayOps for InMemoryGateway {
                     GatewayError::Upstream(e.to_string())
                 })?
             };
+            self.observe_get_phase("chunk_fetch", chunk_fetch_started.elapsed());
 
+            let decrypt_started = std::time::Instant::now();
             let decrypted =
                 envelope::open_envelope(&self.aead, &self.master_key, &env).map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway read: open_envelope failed");
                     GatewayError::Upstream(e.to_string())
                 })?;
+            self.observe_get_phase("decrypt", decrypt_started.elapsed());
             plaintext.extend_from_slice(&decrypted);
 
             // Insert into cache for the next call. Bounded eviction
@@ -1173,11 +1236,13 @@ impl GatewayOps for InMemoryGateway {
                 GatewayError::Upstream(e.to_string())
             })?;
 
+            let encrypt_started = std::time::Instant::now();
             let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, piece)
                 .map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: seal_envelope failed");
                     GatewayError::Upstream(e.to_string())
                 })?;
+            self.observe_put_phase("encrypt", encrypt_started.elapsed());
             let ciphertext_len = env.ciphertext.len() as u64;
 
             let piece_len = piece.len() as u64;
@@ -1186,6 +1251,7 @@ impl GatewayOps for InMemoryGateway {
             // Single-chunk PUTs ≤ inline_threshold still take the
             // fast path so small-object storage is unchanged.
             let mut chunk_was_new = false;
+            let chunk_write_started = std::time::Instant::now();
             if pieces_len == 1
                 && piece_len <= self.inline_threshold
                 && self.small_store.is_some()
@@ -1226,6 +1292,7 @@ impl GatewayOps for InMemoryGateway {
                     let _ = self.chunks.increment_refcount(&chunk_id).await;
                 }
             }
+            self.observe_put_phase("chunk_write", chunk_write_started.elapsed());
 
             landed.push(ChunkLanded {
                 id: chunk_id,
@@ -1239,6 +1306,7 @@ impl GatewayOps for InMemoryGateway {
         // Create composition (sync, fast) — lock released before Raft.
         // Log emission happens after lock release to avoid holding the
         // Mutex across Raft consensus (ADR-032).
+        let composition_record_started = std::time::Instant::now();
         let (comp_id, log, emit_params) = {
             let mut comps = self.compositions.lock().await;
             let comp_id = comps
@@ -1427,6 +1495,10 @@ impl GatewayOps for InMemoryGateway {
             }
         }
 
+        self.observe_put_phase(
+            "composition_record",
+            composition_record_started.elapsed(),
+        );
         tracing::debug!(comp_id = %comp_id.0, bytes_written, "gateway write: success");
         Ok(WriteResponse {
             composition_id: comp_id,
@@ -2237,5 +2309,98 @@ mod chunking_tests {
             "round-trip length mismatch",
         );
         assert_eq!(read.data, original, "round-trip bytes diverged");
+    }
+}
+
+/// Pin the GET/PUT phase-duration histograms (`kiseki_gateway_*_
+/// phase_duration_seconds`). These were added after the 2026-05-04
+/// GCP perf cluster left us blind on read-path latency: end-to-end
+/// duration alone could not separate composition lookup from chunk
+/// fetch from decrypt. Without observation, the histograms would
+/// register but never tick — exactly the trap that
+/// `gateway_request_duration` fell into until the same run.
+#[cfg(test)]
+mod phase_duration_tests {
+    use super::*;
+    use crate::ops::{ReadRequest, WriteRequest};
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::ids::{NamespaceId, OrgId};
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_crypto::keys::SystemMasterKey;
+    use prometheus::{HistogramOpts, HistogramVec};
+
+    fn make_phase_histogram(name: &str) -> Arc<HistogramVec> {
+        Arc::new(
+            HistogramVec::new(
+                HistogramOpts::new(name, "test").buckets(vec![0.0001, 0.001, 0.01, 0.1, 1.0]),
+                &["phase"],
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A round-trip PUT then GET must move every phase histogram
+    /// for both `get` and `put` above zero observations. If any
+    /// label stays at 0 after a successful round-trip, the
+    /// observation is missing at that phase boundary and an
+    /// operator scraping `/metrics` would still be flying blind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_then_get_observes_every_phase() {
+        let tenant = OrgId(uuid::Uuid::from_u128(0xC0DE_C0DE));
+        let namespace = NamespaceId(uuid::Uuid::from_u128(0xBEEF_BEEF));
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            SystemMasterKey::new([0xAA; 32], KeyEpoch(1)),
+        );
+        gw.ensure_namespace_exists(tenant, namespace).await.unwrap();
+
+        let get_phase = make_phase_histogram("kiseki_gateway_get_phase_duration_seconds_test");
+        let put_phase = make_phase_histogram("kiseki_gateway_put_phase_duration_seconds_test");
+        gw.set_phase_duration_metrics(Arc::clone(&get_phase), Arc::clone(&put_phase));
+
+        // PUT.
+        let payload = vec![0x42u8; 1024];
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data: payload.clone(),
+                name: Some("phase-test".to_owned()),
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .expect("write must succeed");
+
+        // GET.
+        let _ = gw
+            .read(ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: 0,
+                length: payload.len() as u64,
+            })
+            .await
+            .expect("read must succeed");
+
+        for phase in ["encrypt", "chunk_write", "composition_record"] {
+            let count = put_phase.with_label_values(&[phase]).get_sample_count();
+            assert!(
+                count >= 1,
+                "kiseki_gateway_put_phase_duration_seconds{{phase={phase}}} \
+                 must observe at least one sample after a PUT (got {count})",
+            );
+        }
+        for phase in ["composition_lookup", "chunk_fetch", "decrypt"] {
+            let count = get_phase.with_label_values(&[phase]).get_sample_count();
+            assert!(
+                count >= 1,
+                "kiseki_gateway_get_phase_duration_seconds{{phase={phase}}} \
+                 must observe at least one sample after a GET (got {count})",
+            );
+        }
     }
 }
