@@ -1022,14 +1022,17 @@ async fn then_nfs_detect_loss(_w: &mut KisekiWorld) {
         kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)),
         kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(1)),
     );
-    // Fresh gateway has no user files — only "." and ".." directory entries.
-    // Clients must reconnect and re-establish sessions.
+    // Fresh gateway has no user files. As of 2026-05-04, readdir()
+    // no longer emits `.` / `..` (kernel synthesizes them locally —
+    // see `nfs_ops::readdir` doc + `nfs4_server::tests::
+    // readdir_response_omits_dot_and_dotdot`). The structural
+    // assertion is "no user-visible files survived the crash".
     let entries = fresh_gw.readdir();
-    assert_eq!(
+    assert!(
+        entries.is_empty(),
+        "fresh gateway should have no user files, got {} entries: {:?}",
         entries.len(),
-        2,
-        "fresh gateway should only have . and .. entries, got {}",
-        entries.len()
+        entries.iter().map(|e| &e.name).collect::<Vec<_>>(),
     );
 }
 
@@ -1721,9 +1724,13 @@ async fn when_gw_maps_advisory(w: &mut KisekiWorld) {
 
 #[then("the advisory is submitted asynchronously (I-WA2) and the NFS read is served normally")]
 async fn then_advisory_async(w: &mut KisekiWorld) {
-    // I-WA2: advisory is async, read proceeds. Verify via NFS readdir.
-    let entries = w.legacy.nfs_ctx.readdir();
-    assert!(entries.len() >= 2, "NFS read should complete normally");
+    // I-WA2: advisory is async, read proceeds. The smoke check is
+    // "readdir didn't error out" — readdir() returns a Vec<…>
+    // unconditionally, so a non-panicking call IS the assertion.
+    // Pre-2026-05-04 this used `entries.len() >= 2` to
+    // smuggle in a check that `.` and `..` were emitted; that's
+    // no longer true (kernel synthesizes them locally).
+    let _entries = w.legacy.nfs_ctx.readdir();
 }
 
 #[then("the View Materialization subsystem MAY readahead for subsequent reads of the same caller")]
@@ -1766,9 +1773,12 @@ async fn given_nfs_no_native_header(_w: &mut KisekiWorld) {
 #[when(regex = r#"^a workload mounts an NFS export via "(\S+)"$"#)]
 async fn when_nfs_mount(w: &mut KisekiWorld, _gw: String) {
     // NFS mount = NfsContext is already created in World::new().
-    // Verify it's functional.
-    let entries = w.legacy.nfs_ctx.readdir();
-    assert!(entries.len() >= 2, "NFS mount should be functional");
+    // Verify it's functional — readdir() returning a Vec without
+    // panicking IS the assertion. As of 2026-05-04, an empty
+    // namespace's readdir returns 0 entries (no `.` / `..`); the
+    // earlier `>= 2` check was a now-stale proxy for "the dot
+    // entries showed up".
+    let _entries = w.legacy.nfs_ctx.readdir();
 }
 
 #[then("workflow correlation for NFS clients is attached per-mount by the gateway:")]
