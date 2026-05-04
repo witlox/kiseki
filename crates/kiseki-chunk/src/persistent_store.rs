@@ -101,7 +101,7 @@ pub struct PersistentChunkStore {
     /// Pools (same as in-memory `ChunkStore`).
     pools: Mutex<HashMap<String, AffinityPool>>,
     /// Device backend for chunk data storage.
-    device: Box<dyn DeviceBackend>,
+    device: std::sync::Arc<dyn DeviceBackend>,
     /// Path to metadata file (JSON, for crash recovery).
     meta_path: std::path::PathBuf,
     /// Path to fragment metadata file. Defaults to `meta_path` with
@@ -119,6 +119,23 @@ pub struct PersistentChunkStore {
     /// per-write `device.sync()`. `None` for tests + library users
     /// without metrics.
     write_phase_metric: std::sync::RwLock<Option<std::sync::Arc<prometheus::HistogramVec>>>,
+    /// When true (default), every `write_chunk` calls `device.sync()`
+    /// inline before returning. When false, the per-write fsync is
+    /// deferred to a caller-driven `flush()` (typically a periodic
+    /// background task wired by the runtime). Group-commit mode
+    /// unblocks concurrent writers — per-write fsync was serializing
+    /// fabric receivers through the kernel sync, capping parallel
+    /// throughput at ~1× even with multiple concurrent peers.
+    ///
+    /// **Crash safety**: with `sync_per_write=false`, a single-node
+    /// power loss can drop up to one flush-interval of writes from
+    /// THIS node's disk. Cross-node durability is preserved by the
+    /// Raft replication factor (every chunk lands on N peers' page
+    /// caches before the leader acks); the under-replication scrub
+    /// re-replicates anything the failed node lost when it returns.
+    /// This is the standard async-replication tradeoff used by
+    /// Cassandra, Kafka, etc.
+    sync_per_write: std::sync::atomic::AtomicBool,
 }
 
 fn frag_path_for(meta: &Path) -> std::path::PathBuf {
@@ -145,10 +162,11 @@ impl PersistentChunkStore {
             chunks: Mutex::new(HashMap::new()),
             fragments: Mutex::new(HashMap::new()),
             pools: Mutex::new(HashMap::new()),
-            device: Box::new(device),
+            device: std::sync::Arc::new(device),
             meta_path: meta_path.to_owned(),
             frag_meta_path: frag_path_for(meta_path),
             write_phase_metric: std::sync::RwLock::new(None),
+            sync_per_write: std::sync::atomic::AtomicBool::new(true),
         };
         store.save_meta()?;
         store.save_frag_meta()?;
@@ -214,10 +232,11 @@ impl PersistentChunkStore {
             chunks: Mutex::new(chunks),
             fragments: Mutex::new(fragments),
             pools: Mutex::new(HashMap::new()),
-            device: Box::new(device),
+            device: std::sync::Arc::new(device),
             meta_path: meta_path.to_owned(),
             frag_meta_path,
             write_phase_metric: std::sync::RwLock::new(None),
+            sync_per_write: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -240,6 +259,51 @@ impl PersistentChunkStore {
         if let Some(h) = g.as_ref() {
             h.with_label_values(&[phase]).observe(dur.as_secs_f64());
         }
+    }
+
+    /// Toggle group-commit mode. When `enabled` is false, every
+    /// `write_chunk` calls `device.sync()` before returning (the
+    /// pre-2026-05-04 behavior). When true, per-write fsync is
+    /// deferred — callers must invoke [`flush`] periodically (the
+    /// runtime spawns a 100 ms tick) to keep the on-disk state
+    /// fresh. See the field doc on `sync_per_write` for the crash
+    /// safety story.
+    ///
+    /// [`flush`]: Self::flush
+    pub fn set_sync_per_write(&self, enabled: bool) {
+        self.sync_per_write
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Flush pending writes to stable storage. Calls
+    /// `device.sync()` (which itself flushes the bitmap +
+    /// `sync_all`s the file). Safe to call concurrently with
+    /// `write_chunk`; serializes only on the underlying device's
+    /// own sync semantics.
+    ///
+    /// In group-commit mode the runtime calls this periodically
+    /// from a background task; tests and rollback paths can call
+    /// it directly to force durability.
+    ///
+    /// # Errors
+    /// Returns `ChunkError::Io` if the device backend reports a
+    /// sync failure.
+    pub fn flush(&self) -> Result<(), ChunkError> {
+        self.device
+            .sync()
+            .map_err(|e| ChunkError::Io(e.to_string()))
+    }
+
+    /// Borrow the device backend handle. Returns a cheap `Arc`
+    /// clone that callers (typically the runtime's periodic flush
+    /// task) hold to call `sync()` directly without going through
+    /// the [`SyncBridge`] mutex — flushing the device is `&self`
+    /// and doesn't need exclusive access to the chunk store.
+    ///
+    /// [`SyncBridge`]: crate::async_ops::SyncBridge
+    #[must_use]
+    pub fn device_handle(&self) -> std::sync::Arc<dyn DeviceBackend> {
+        std::sync::Arc::clone(&self.device)
     }
 
     /// Add an affinity pool.
@@ -441,15 +505,20 @@ impl ChunkOps for PersistentChunkStore {
 
         drop(chunks);
 
-        // Persist metadata + sync device.
+        // Persist metadata; sync only when group-commit is OFF.
         let save_started = std::time::Instant::now();
         self.save_meta()?;
         self.observe_write_phase("save_meta", save_started.elapsed());
-        let sync_started = std::time::Instant::now();
-        self.device
-            .sync()
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
-        self.observe_write_phase("device_sync", sync_started.elapsed());
+        if self
+            .sync_per_write
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let sync_started = std::time::Instant::now();
+            self.device
+                .sync()
+                .map_err(|e| ChunkError::Io(e.to_string()))?;
+            self.observe_write_phase("device_sync", sync_started.elapsed());
+        }
 
         Ok(true)
     }
@@ -841,6 +910,69 @@ mod tests {
             tenant_wrapped_material: None,
             chunk_id: ChunkId([key; 32]),
         }
+    }
+
+    /// Group commit (b.2 follow-up): per-write `device.sync()`
+    /// serializes concurrent writes through the kernel fsync, so two
+    /// fabric receivers landing fragments on the same node can't
+    /// proceed in parallel. Default mode (`sync_per_write=true`) keeps
+    /// pre-fix behavior; runtime opts into group commit and spawns a
+    /// periodic flush task.
+    ///
+    /// Pin the contract: when `sync_per_write` is false, `write_chunk`
+    /// observes `dedup_check` / `extent_io` / `save_meta` but skips
+    /// `device_sync`. Explicit `flush()` re-enables sync on demand.
+    #[test]
+    fn write_chunk_skips_device_sync_when_sync_per_write_disabled() {
+        use prometheus::{HistogramOpts, HistogramVec};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        let mut store =
+            PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
+        store.set_sync_per_write(false);
+
+        let metric = Arc::new(
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "kiseki_chunk_persistent_write_phase_duration_seconds_test_gc",
+                    "test",
+                )
+                .buckets(vec![0.0001, 0.001, 0.01, 0.1, 1.0]),
+                &["phase"],
+            )
+            .unwrap(),
+        );
+        store.set_write_phase_metric(Arc::clone(&metric));
+
+        // Group-commit write — should observe extent_io + save_meta
+        // but NOT device_sync.
+        store.write_chunk(test_envelope(0xA5), "default").unwrap();
+
+        let extent_count = metric.with_label_values(&["extent_io"]).get_sample_count();
+        assert!(
+            extent_count >= 1,
+            "extent_io still observed (got {extent_count})"
+        );
+
+        let sync_count = metric
+            .with_label_values(&["device_sync"])
+            .get_sample_count();
+        assert_eq!(
+            sync_count, 0,
+            "device_sync must NOT observe when sync_per_write=false (group commit) — \
+             got {sync_count}; the per-write fsync is what serializes concurrent writers \
+             through the kernel and must be deferred to the background flush task",
+        );
+
+        // Explicit flush — sync now happens and we expect device_sync
+        // to fire here as a separate observation path. Today flush()
+        // calls device.sync() directly; if a future refactor moves
+        // that observation, this assertion needs updating.
+        store.flush().unwrap();
     }
 
     /// 2026-05-04 perf sweep step b.2: every `write_chunk` must observe

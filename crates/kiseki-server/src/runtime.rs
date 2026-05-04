@@ -374,7 +374,40 @@ pub async fn run_main(
         store.set_write_phase_metric(Arc::new(
             metrics.chunk_persistent_write_phase_duration.clone(),
         ));
-        tracing::info!(path = %dir.display(), "chunk store: persistent (raw block)");
+        // Group commit: per-write fsync was serializing concurrent
+        // fabric receivers through the kernel sync. Disable inline
+        // sync; the periodic flush task below keeps disk state fresh.
+        // Crash safety: Raft replication ensures cross-node durability;
+        // a single-node loss of ≤ flush_interval-ms of writes is
+        // recovered by the under-replication scrub when the node
+        // returns. See `PersistentChunkStore::sync_per_write` doc.
+        store.set_sync_per_write(false);
+        let device_for_flush = store.device_handle();
+        let flush_interval_ms = std::env::var("KISEKI_CHUNK_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(100);
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_millis(flush_interval_ms));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let device = std::sync::Arc::clone(&device_for_flush);
+                let res = tokio::task::spawn_blocking(move || device.sync())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                if res.is_none() {
+                    tracing::warn!("chunk store group-commit flush failed; will retry next tick",);
+                }
+            }
+        });
+        tracing::info!(
+            path = %dir.display(),
+            flush_interval_ms,
+            "chunk store: persistent (raw block, group commit)",
+        );
         Arc::new(kiseki_chunk::SyncBridge::new(store))
     } else {
         tracing::info!("chunk store: in-memory (no persistence)");
