@@ -17,6 +17,12 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# CRC32C with SSE4.2 / ARM CRC intrinsics — replaces the hand-rolled
+# bit-by-bit loop that capped fabric write_chunk at ~470 MiB/s in
+# release builds (2026-05-04 docker compose baseline). The 0.6 series
+# auto-detects HW support at runtime and falls back to a fast software
+# table on platforms without the intrinsic.
+crc32c = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
