@@ -369,6 +369,11 @@ pub async fn run_main(
             kiseki_chunk::PersistentChunkStore::init(&dev_path, &meta_path, 4 * 1024 * 1024 * 1024)
                 .map_err(|e| format!("persistent chunk store init: {e}"))?
         };
+        // Receiver-side write_chunk phase histogram so /metrics shows
+        // dedup_check / extent_io / save_meta / device_sync per write.
+        store.set_write_phase_metric(Arc::new(
+            metrics.chunk_persistent_write_phase_duration.clone(),
+        ));
         tracing::info!(path = %dir.display(), "chunk store: persistent (raw block)");
         Arc::new(kiseki_chunk::SyncBridge::new(store))
     } else {

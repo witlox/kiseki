@@ -109,6 +109,16 @@ pub struct PersistentChunkStore {
     /// existing on-disk format stays back-compat for chunk-only
     /// deployments.
     frag_meta_path: std::path::PathBuf,
+    /// Optional `kiseki_chunk_persistent_write_phase_duration_seconds
+    /// {phase}` histogram. Phases observed in `write_chunk`:
+    /// `dedup_check`, `extent_io`, `save_meta`, `device_sync`. The
+    /// 2026-05-04 docker compose run with the CRC32C fix landed
+    /// pinned receiver-side `write_chunk` at ~17.5 ms / 16 MiB; this
+    /// breakdown lets us see whether the remaining cost is in the
+    /// extent I/O, the JSON-rewrite-all-metadata `save_meta`, or the
+    /// per-write `device.sync()`. `None` for tests + library users
+    /// without metrics.
+    write_phase_metric: std::sync::RwLock<Option<std::sync::Arc<prometheus::HistogramVec>>>,
 }
 
 fn frag_path_for(meta: &Path) -> std::path::PathBuf {
@@ -138,6 +148,7 @@ impl PersistentChunkStore {
             device: Box::new(device),
             meta_path: meta_path.to_owned(),
             frag_meta_path: frag_path_for(meta_path),
+            write_phase_metric: std::sync::RwLock::new(None),
         };
         store.save_meta()?;
         store.save_frag_meta()?;
@@ -206,7 +217,29 @@ impl PersistentChunkStore {
             device: Box::new(device),
             meta_path: meta_path.to_owned(),
             frag_meta_path,
+            write_phase_metric: std::sync::RwLock::new(None),
         })
+    }
+
+    /// Attach the per-phase write-duration histogram. Once set, every
+    /// `write_chunk` records its `dedup_check`, `extent_io`,
+    /// `save_meta`, and `device_sync` phase latencies on
+    /// `kiseki_chunk_persistent_write_phase_duration_seconds{phase}`.
+    /// Without this, the histogram registers but never observes — the
+    /// 2026-05-04 perf sweep saw the same trap multiple times.
+    pub fn set_write_phase_metric(&self, metric: std::sync::Arc<prometheus::HistogramVec>) {
+        if let Ok(mut g) = self.write_phase_metric.write() {
+            *g = Some(metric);
+        }
+    }
+
+    fn observe_write_phase(&self, phase: &str, dur: std::time::Duration) {
+        let Ok(g) = self.write_phase_metric.read() else {
+            return;
+        };
+        if let Some(h) = g.as_ref() {
+            h.with_label_values(&[phase]).observe(dur.as_secs_f64());
+        }
     }
 
     /// Add an affinity pool.
@@ -320,6 +353,7 @@ impl ChunkOps for PersistentChunkStore {
         // Hold the chunks lock for the entire operation to prevent a race
         // where two concurrent writes for the same chunk_id both pass the
         // dedup check. The I/O is the bottleneck, not the lock.
+        let dedup_started = std::time::Instant::now();
         let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
 
         // Dedup: if chunk already exists, just bump refcount.
@@ -330,9 +364,13 @@ impl ChunkOps for PersistentChunkStore {
                 .checked_add(1)
                 .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
             drop(chunks);
+            self.observe_write_phase("dedup_check", dedup_started.elapsed());
+            let save_started = std::time::Instant::now();
             self.save_meta()?;
+            self.observe_write_phase("save_meta", save_started.elapsed());
             return Ok(false);
         }
+        self.observe_write_phase("dedup_check", dedup_started.elapsed());
 
         // Allocate + write ciphertext, splitting across multiple
         // extents if it exceeds the per-extent cap (Bug 5 fix). On
@@ -347,11 +385,13 @@ impl ChunkOps for PersistentChunkStore {
         // touching the device.
         let data = &envelope.ciphertext;
         let data_bytes = data.len() as u64;
+        let extent_io_started = std::time::Instant::now();
         let extents: Vec<Extent> = if data.is_empty() {
             Vec::new()
         } else {
             self.alloc_and_write_chunked(data)?
         };
+        self.observe_write_phase("extent_io", extent_io_started.elapsed());
         let stored_bytes: u64 = extents.iter().map(|e| e.length).sum();
 
         // Build metadata. The first extent goes into the legacy
@@ -402,10 +442,14 @@ impl ChunkOps for PersistentChunkStore {
         drop(chunks);
 
         // Persist metadata + sync device.
+        let save_started = std::time::Instant::now();
         self.save_meta()?;
+        self.observe_write_phase("save_meta", save_started.elapsed());
+        let sync_started = std::time::Instant::now();
         self.device
             .sync()
             .map_err(|e| ChunkError::Io(e.to_string()))?;
+        self.observe_write_phase("device_sync", sync_started.elapsed());
 
         Ok(true)
     }
@@ -796,6 +840,49 @@ mod tests {
             tenant_epoch: None,
             tenant_wrapped_material: None,
             chunk_id: ChunkId([key; 32]),
+        }
+    }
+
+    /// 2026-05-04 perf sweep step b.2: every `write_chunk` must observe
+    /// each phase histogram so `/metrics` reflects where the call's
+    /// time actually goes. Pin the contract — without this, fixing
+    /// the dominant phase (likely `save_meta` from its O(N) JSON
+    /// rewrite) would have no signal to validate against.
+    #[test]
+    fn write_chunk_observes_each_phase_when_metric_is_wired() {
+        use prometheus::{HistogramOpts, HistogramVec};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        let mut store =
+            PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
+
+        let metric = Arc::new(
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "kiseki_chunk_persistent_write_phase_duration_seconds_test",
+                    "test",
+                )
+                .buckets(vec![0.0001, 0.001, 0.01, 0.1, 1.0]),
+                &["phase"],
+            )
+            .unwrap(),
+        );
+        store.set_write_phase_metric(Arc::clone(&metric));
+
+        let env = test_envelope(0x42);
+        store.write_chunk(env, "default").unwrap();
+
+        for phase in ["dedup_check", "extent_io", "save_meta", "device_sync"] {
+            let count = metric.with_label_values(&[phase]).get_sample_count();
+            assert!(
+                count >= 1,
+                "kiseki_chunk_persistent_write_phase_duration_seconds{{phase={phase}}} \
+                 must observe at least one sample after a write_chunk (got {count})",
+            );
         }
     }
 

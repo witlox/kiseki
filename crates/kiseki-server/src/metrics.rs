@@ -34,6 +34,16 @@ pub struct KisekiMetrics {
     pub chunk_read_bytes: IntCounter,
     /// EC encode latency in seconds.
     pub chunk_ec_encode_latency: HistogramVec,
+    /// `PersistentChunkStore::write_chunk` per-phase latency. Phases:
+    /// `dedup_check` (`HashMap` lookup + refcount path), `extent_io`
+    /// (alloc + `device.write` per extent — includes per-extent CRC),
+    /// `save_meta` (full-state JSON rewrite + atomic rename),
+    /// `device_sync` (`flush_bitmap` + `sync_all`). Wired into
+    /// `PersistentChunkStore::set_write_phase_metric` from runtime.
+    /// The 2026-05-04 perf sweep removed the bit-loop CRC bottleneck
+    /// (~36 ms → ~3 ms on 16 MiB) but left ~14 ms unaccounted for in
+    /// the receiver-side `write_chunk`; this histogram splits that.
+    pub chunk_persistent_write_phase_duration: HistogramVec,
 
     // --- Gateway ---
     /// S3/NFS request count by method and status.
@@ -159,6 +169,21 @@ impl KisekiMetrics {
         .expect("metric");
         registry
             .register(Box::new(chunk_ec_encode_latency.clone()))
+            .expect("register");
+
+        let chunk_persistent_write_phase_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "kiseki_chunk_persistent_write_phase_duration_seconds",
+                "PersistentChunkStore write_chunk phase latency: dedup_check, extent_io, save_meta, device_sync",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["phase"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(chunk_persistent_write_phase_duration.clone()))
             .expect("register");
 
         let gateway_requests_total = IntCounterVec::new(
@@ -320,6 +345,7 @@ impl KisekiMetrics {
             chunk_write_bytes,
             chunk_read_bytes,
             chunk_ec_encode_latency,
+            chunk_persistent_write_phase_duration,
             gateway_requests_total,
             gateway_request_duration,
             gateway_get_phase_duration,

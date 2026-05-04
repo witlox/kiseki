@@ -1867,6 +1867,7 @@ dependencies = [
  "kiseki-crypto",
  "kiseki-keymanager",
  "libc",
+ "prometheus",
  "proptest",
  "redb",
  "reed-solomon-erasure",
