@@ -32,6 +32,14 @@ use kiseki_common::locks::LockOrDie;
 ///
 /// When `data_dir` is set, uses `RedbRaftLogStore` for persistent
 /// Raft state (Phase 12b). When `None`, uses in-memory `MemLogStore`.
+///
+/// **ADR-041 multiplexed transport.** All shards on this node share
+/// a single `RaftRpcListener`, lazily initialized on the first
+/// `create_shard(... raft_addr=Some(addr) ...)` call. Subsequent
+/// shards register their `Raft` handle with the same listener via
+/// the cloned `RegistryHandle`. Pre-ADR-041, each shard tried to
+/// `spawn_rpc_server` on its own — the second call hit `EADDRINUSE`
+/// silently and that shard's cross-node messages never arrived.
 pub struct RaftShardStore {
     shards: Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>,
     node_id: u64,
@@ -42,6 +50,10 @@ pub struct RaftShardStore {
     rt: tokio::runtime::Runtime,
     data_dir: Option<PathBuf>,
     inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
+    /// Per-node Raft RPC listener registry handle. `None` until the
+    /// first `create_shard` with `Some(raft_addr)` lazily binds the
+    /// listener; from then on all shards on this node register here.
+    listener_registry: Mutex<Option<kiseki_raft::tcp_transport::RegistryHandle>>,
 }
 
 impl RaftShardStore {
@@ -82,6 +94,7 @@ impl RaftShardStore {
             rt,
             data_dir,
             inline_store: None,
+            listener_registry: Mutex::new(None),
         }
     }
 
@@ -121,7 +134,35 @@ impl RaftShardStore {
         let data_dir = self.data_dir.clone();
         let inline_store = self.inline_store.clone();
 
-        let raft_addr_owned = raft_addr.map(str::to_owned);
+        // Lazy-init the per-node Raft RPC listener on the first call
+        // with `raft_addr=Some(...)`. Subsequent shards register
+        // through the same listener via the cloned `RegistryHandle`
+        // — ADR-041 §"Lifecycle".
+        let registry = if let Some(addr) = raft_addr {
+            let mut guard = self
+                .listener_registry
+                .lock()
+                .lock_or_die("raft_shard_store.listener_registry");
+            if let Some(existing) = guard.as_ref() {
+                Some(existing.clone())
+            } else {
+                let listener =
+                    kiseki_raft::tcp_transport::RaftRpcListener::new(addr.to_owned(), None);
+                let reg = listener.registry();
+                let handle = self.rt.handle().clone();
+                handle.spawn(async move {
+                    if let Err(e) = listener.run().await {
+                        tracing::warn!(error = %e, "Raft RPC listener exited");
+                    }
+                });
+                tracing::info!(addr = %addr, "Raft RPC listener spawned (multiplexed, ADR-041)");
+                *guard = Some(reg.clone());
+                Some(reg)
+            }
+        } else {
+            None
+        };
+
         let handle = self.rt.handle().clone();
         let store = std::thread::spawn(move || {
             handle.block_on(async {
@@ -148,18 +189,18 @@ impl RaftShardStore {
                     .await
                     .expect("failed to create Raft log store (follower)")
                 };
-
-                // Spawn RPC server for this shard's Raft group.
-                if let Some(addr) = raft_addr_owned {
-                    tracing::info!(shard_id = %shard_id.0, %addr, "Raft RPC server started for shard");
-                    std::mem::drop(store.spawn_rpc_server(addr));
-                }
-
                 Arc::new(store)
             })
         })
         .join()
         .expect("Raft shard creation thread panicked");
+
+        // Register this shard's Raft handle with the listener so
+        // inbound multiplexed RPCs route here.
+        if let Some(reg) = registry {
+            reg.register_shard(shard_id, store.raft_handle());
+            tracing::info!(shard_id = %shard_id.0, "shard registered with Raft RPC listener");
+        }
 
         let mut shards = self.shards.lock().lock_or_die("raft_shard_store.shards");
         shards.insert(shard_id, store);

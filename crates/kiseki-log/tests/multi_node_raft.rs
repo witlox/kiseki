@@ -13,9 +13,25 @@ use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
 use kiseki_log::raft::OpenRaftLogStore;
 use kiseki_log::traits::{AppendDeltaRequest, ReadDeltasRequest};
 use kiseki_log::OperationType;
+use kiseki_raft::tcp_transport::RaftRpcListener;
 
 fn test_shard() -> ShardId {
     ShardId(uuid::Uuid::from_u128(0xCAFE))
+}
+
+/// Spawn the per-node Raft RPC listener and register the test shard's
+/// Raft handle. ADR-041 multiplexed transport — listener owns the
+/// port, shards register their handles for inbound RPC routing.
+fn spawn_listener_with_shard(
+    addr: String,
+    store: &OpenRaftLogStore,
+) -> tokio::task::JoinHandle<()> {
+    let raft = store.raft_handle();
+    tokio::spawn(async move {
+        let listener = RaftRpcListener::new(addr, None);
+        listener.registry().register_shard(test_shard(), raft);
+        let _ = listener.run().await;
+    })
 }
 
 fn test_tenant() -> OrgId {
@@ -78,19 +94,19 @@ async fn three_node_cluster_formation() {
     let node1 = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc1 = node1.spawn_rpc_server(format!("127.0.0.1:{}", ports[0]));
+    let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
 
     // Node 2: follower — does NOT call initialize().
     let node2 = OpenRaftLogStore::new_follower(2, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc2 = node2.spawn_rpc_server(format!("127.0.0.1:{}", ports[1]));
+    let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
 
     // Node 3: follower.
     let node3 = OpenRaftLogStore::new_follower(3, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc3 = node3.spawn_rpc_server(format!("127.0.0.1:{}", ports[2]));
+    let _rpc3 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[2]), &node3);
 
     // Wait for leader election (need quorum = 2 of 3).
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -132,17 +148,17 @@ async fn writes_replicate_to_followers() {
     let node1 = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc1 = node1.spawn_rpc_server(format!("127.0.0.1:{}", ports[0]));
+    let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
 
     let node2 = OpenRaftLogStore::new_follower(2, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc2 = node2.spawn_rpc_server(format!("127.0.0.1:{}", ports[1]));
+    let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
 
     let node3 = OpenRaftLogStore::new_follower(3, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc3 = node3.spawn_rpc_server(format!("127.0.0.1:{}", ports[2]));
+    let _rpc3 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[2]), &node3);
 
     // Wait for cluster formation + leader election.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -190,12 +206,12 @@ async fn follower_joins_late_and_catches_up() {
     let node1 = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc1 = node1.spawn_rpc_server(format!("127.0.0.1:{}", ports[0]));
+    let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
 
     let node2 = OpenRaftLogStore::new_follower(2, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc2 = node2.spawn_rpc_server(format!("127.0.0.1:{}", ports[1]));
+    let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
 
     // Wait for leader election with 2 nodes.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -210,7 +226,7 @@ async fn follower_joins_late_and_catches_up() {
     let node3 = OpenRaftLogStore::new_follower(3, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc3 = node3.spawn_rpc_server(format!("127.0.0.1:{}", ports[2]));
+    let _rpc3 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[2]), &node3);
 
     // Wait for node 3 to catch up.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -237,13 +253,13 @@ async fn follower_skips_initialize() {
     let node1 = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc1 = node1.spawn_rpc_server(format!("127.0.0.1:{}", ports[0]));
+    let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
 
     // Follower: does NOT initialize — should not panic.
     let node2 = OpenRaftLogStore::new_follower(2, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
-    let _rpc2 = node2.spawn_rpc_server(format!("127.0.0.1:{}", ports[1]));
+    let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
 
     // Wait for cluster.
     tokio::time::sleep(Duration::from_secs(4)).await;

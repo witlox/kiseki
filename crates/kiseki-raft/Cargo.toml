@@ -12,6 +12,9 @@ workspace = true
 
 [dependencies]
 kiseki-common = { workspace = true }
+arc-swap = "1.7"
+async-trait = { workspace = true }
+dashmap = "6"
 futures = "0.3"
 openraft = { workspace = true }
 redb = "4"
@@ -23,6 +26,7 @@ tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

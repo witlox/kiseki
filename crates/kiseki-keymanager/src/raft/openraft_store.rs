@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use kiseki_common::ids::ShardId;
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_raft::{
@@ -14,6 +15,17 @@ use kiseki_raft::{
     TcpNetworkFactory,
 };
 use openraft::Raft;
+use uuid::Uuid;
+
+/// Constant `ShardId` for the key-manager Raft group. The group is
+/// cluster-wide (one per cluster, not per log shard) but the
+/// multiplexed Raft transport (ADR-041) requires every Raft group to
+/// register under a `ShardId`. Pick a deterministic UUID derived
+/// from the literal "kiseki-keymanager" so client and server agree
+/// without configuration.
+pub const KEYMANAGER_RAFT_GROUP_ID: ShardId = ShardId(Uuid::from_u128(
+    0x6b65_794d_676d_725f_5261_6674_4772_6f70_u128, // "keyMgmr_RaftGrop" ASCII
+));
 
 use super::state_machine::{KeyStateMachine, StateMachineInner};
 use super::types::KeyTypeConfig;
@@ -68,7 +80,7 @@ impl OpenRaftKeyStore {
                 .map_err(|_| KeyManagerError::Unavailable)?;
             let has_state = log_store.has_state();
             let raft = if peers.len() > 1 {
-                let network = TcpNetworkFactory::<C>::new();
+                let network = TcpNetworkFactory::<C>::new(KEYMANAGER_RAFT_GROUP_ID);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
                     .map_err(|_e| KeyManagerError::Unavailable)?
@@ -82,7 +94,7 @@ impl OpenRaftKeyStore {
         } else {
             let log_store = MemLogStore::<C>::new();
             let raft = if peers.len() > 1 {
-                let network = TcpNetworkFactory::<C>::new();
+                let network = TcpNetworkFactory::<C>::new(KEYMANAGER_RAFT_GROUP_ID);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
                     .map_err(|_e| KeyManagerError::Unavailable)?
@@ -124,15 +136,23 @@ impl OpenRaftKeyStore {
     }
 
     /// Spawn the Raft RPC server for the key manager Raft group.
+    /// Uses the multiplexed transport (ADR-041) with a single
+    /// registered shard at `KEYMANAGER_RAFT_GROUP_ID`.
     #[must_use]
     pub fn spawn_rpc_server(
         &self,
         addr: String,
     ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
         let raft = Arc::new(self.raft.clone());
-        tokio::spawn(
-            async move { tcp_transport::run_raft_rpc_server::<C>(&addr, raft, None).await },
-        )
+        tokio::spawn(async move {
+            tcp_transport::run_single_raft_group_listener::<C>(
+                &addr,
+                KEYMANAGER_RAFT_GROUP_ID,
+                raft,
+                None,
+            )
+            .await
+        })
     }
 
     /// Get health status.

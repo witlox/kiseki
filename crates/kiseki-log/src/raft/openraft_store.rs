@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
 use kiseki_raft::{
-    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, RedbRaftLogStore, StubNetworkFactory,
+    KisekiNode, KisekiRaftConfig, MemLogStore, RedbRaftLogStore, StubNetworkFactory,
     TcpNetworkFactory,
 };
 use openraft::type_config::async_runtime::WatchReceiver;
@@ -228,7 +228,7 @@ impl OpenRaftLogStore {
             let has_state = log_store.has_state();
 
             let raft = if peers.len() > 1 {
-                let network = TcpNetworkFactory::<C>::new();
+                let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
                     .map_err(|_e| LogError::Unavailable)?
@@ -242,7 +242,7 @@ impl OpenRaftLogStore {
         } else {
             let log_store = MemLogStore::<C>::new();
             let raft = if peers.len() > 1 {
-                let network = TcpNetworkFactory::<C>::new();
+                let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
                     .map_err(|_e| LogError::Unavailable)?
@@ -298,20 +298,16 @@ impl OpenRaftLogStore {
             .record(bytes)
     }
 
-    /// Spawn the Raft RPC server for this shard's Raft group.
+    /// Get a shareable handle to this shard's `Raft` instance.
     ///
-    /// Listens on `addr` for incoming Raft RPCs (`AppendEntries`, `Vote`)
-    /// from peer nodes. Only needed in multi-node mode.
-    /// Returns a `JoinHandle` for the server task.
+    /// Per ADR-041, the per-node `RaftRpcListener` owns the TCP
+    /// listener; each shard registers its `Raft` handle into the
+    /// listener's `RegistryHandle` so inbound RPCs route correctly.
+    /// This method returns the handle that goes into
+    /// `RegistryHandle::register_shard(shard_id, raft_handle)`.
     #[must_use]
-    pub fn spawn_rpc_server(
-        &self,
-        addr: String,
-    ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
-        let raft = Arc::new(self.raft.clone());
-        tokio::spawn(
-            async move { tcp_transport::run_raft_rpc_server::<C>(&addr, raft, None).await },
-        )
+    pub fn raft_handle(&self) -> Arc<openraft::Raft<C, ShardStateMachine>> {
+        Arc::new(self.raft.clone())
     }
 
     /// Append a delta through Raft consensus.

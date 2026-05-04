@@ -13,7 +13,17 @@ use kiseki_raft::{
 };
 use openraft::Raft;
 
-use kiseki_common::ids::{OrgId, SequenceNumber};
+use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
+use uuid::Uuid;
+
+/// Constant `ShardId` for the audit-log Raft group. Per-tenant
+/// audit shards are still distinct logical groups (ADR-009); the
+/// `ShardId` here represents the multiplexed-transport routing key
+/// for ALL audit Raft traffic on a single node, distinct from the
+/// log shards. Pick a deterministic UUID derived from `audit_RG`.
+pub const AUDIT_RAFT_GROUP_ID: ShardId = ShardId(Uuid::from_u128(
+    0x6175_6469_745f_5261_6674_4772_6f75_7000_u128, // "audit_RaftGroup" ASCII
+));
 
 use super::state_machine::{AuditSmInner, AuditStateMachine};
 use super::types::AuditTypeConfig;
@@ -68,7 +78,7 @@ impl OpenRaftAuditStore {
                 RedbRaftLogStore::<C>::open(&redb_path).map_err(|_| AuditError::Unavailable)?;
             let has_state = log_store.has_state();
             let raft = if peers.len() > 1 {
-                let network = TcpNetworkFactory::<C>::new();
+                let network = TcpNetworkFactory::<C>::new(AUDIT_RAFT_GROUP_ID);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
                     .map_err(|_e| AuditError::Unavailable)?
@@ -82,7 +92,7 @@ impl OpenRaftAuditStore {
         } else {
             let log_store = MemLogStore::<C>::new();
             let raft = if peers.len() > 1 {
-                let network = TcpNetworkFactory::<C>::new();
+                let network = TcpNetworkFactory::<C>::new(AUDIT_RAFT_GROUP_ID);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
                     .map_err(|_e| AuditError::Unavailable)?
@@ -108,15 +118,23 @@ impl OpenRaftAuditStore {
     }
 
     /// Spawn the Raft RPC server for the audit Raft group.
+    /// Uses the multiplexed transport (ADR-041) with a single
+    /// registered shard at `AUDIT_RAFT_GROUP_ID`.
     #[must_use]
     pub fn spawn_rpc_server(
         &self,
         addr: String,
     ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
         let raft = Arc::new(self.raft.clone());
-        tokio::spawn(
-            async move { tcp_transport::run_raft_rpc_server::<C>(&addr, raft, None).await },
-        )
+        tokio::spawn(async move {
+            tcp_transport::run_single_raft_group_listener::<C>(
+                &addr,
+                AUDIT_RAFT_GROUP_ID,
+                raft,
+                None,
+            )
+            .await
+        })
     }
 
     /// Append an audit event through Raft consensus.
