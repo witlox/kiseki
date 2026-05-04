@@ -921,9 +921,8 @@ async fn then_refcount_one_on_new_leader(w: &mut KisekiWorld) {
     // stalled" intermittently. The bounded loop closes that
     // race without weakening the assertion.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut last_chunks: Vec<String> = Vec::new();
     let mut last_refcounts: Vec<(String, u64)> = Vec::new();
-    loop {
+    let last_chunks = loop {
         let chunks = composition_chunks_via(leader, &etag).await;
         if !chunks.is_empty() {
             let mut all_ok = true;
@@ -945,12 +944,11 @@ async fn then_refcount_one_on_new_leader(w: &mut KisekiWorld) {
             }
             last_refcounts = snapshot;
         }
-        last_chunks = chunks;
         if std::time::Instant::now() >= deadline {
-            break;
+            break chunks;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    };
     if last_chunks.is_empty() {
         panic!(
             "new leader (node-{leader_id}) has no record of composition \
