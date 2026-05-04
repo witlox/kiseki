@@ -3,7 +3,7 @@
 **Type**: Implementer → Architect
 **Date**: 2026-05-04
 **Author**: implementer
-**Status**: open — code landed (commit-id-pending), spec amendment pending
+**Status**: closed 2026-05-04 — I-L5 amended in `specs/invariants.md`, ADR-029 amended with sync-cadence row and amendment note. Pool-level policy (per-pool durability mode) deferred to a follow-up ADR-024 amendment.
 **Risk**: low (gated by `KISEKI_CHUNK_FLUSH_INTERVAL_MS` env knob)
 
 ## Background

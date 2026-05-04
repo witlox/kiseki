@@ -210,11 +210,23 @@ already supports multiple extents per chunk via `Vec<FragmentLocation>`.
 
 ### I/O strategy per device type
 
-| Strategy | Open flags | Alignment | Sync | Use case |
-|----------|-----------|-----------|------|----------|
-| `DirectAligned` | `O_DIRECT \| O_DSYNC` | `physical_block_size` | Implicit (O_DSYNC) | NVMe, SATA SSD |
-| `BufferedSequential` | `O_SYNC` | 512B | `fdatasync()` | HDD |
-| `FileBacked` | default | 4K (simulated) | `fsync()` | VM, dev, CI |
+| Strategy | Open flags | Alignment | Sync method | Sync cadence | Use case |
+|----------|-----------|-----------|-------------|--------------|----------|
+| `DirectAligned` | `O_DIRECT \| O_DSYNC` | `physical_block_size` | Implicit (O_DSYNC) | per-write (free) | NVMe, SATA SSD |
+| `BufferedSequential` | `O_SYNC` | 512B | `fdatasync()` | per-write (or grouped) | HDD |
+| `FileBacked` | default | 4K (simulated) | `fsync()` | grouped (default) | VM, dev, CI |
+
+**Sync cadence (amendment 2026-05-04)**: `BufferedSequential` and
+`FileBacked` may defer the `fdatasync()`/`fsync()` call to a periodic
+flush task instead of running it inline on every write — group
+commit. The `kiseki_chunk` runtime spawns a background flush at
+`KISEKI_CHUNK_FLUSH_INTERVAL_MS` (default 100 ms). `DirectAligned`
+under `O_DSYNC` already syncs at the device level on every write, so
+group commit is a no-op for it. The cross-node durability story
+(I-L5, I-L2) is satisfied by the pool's replication strategy; the
+single-node fsync was belt-and-suspenders. See
+`specs/escalations/2026-05-04-group-commit-i-l5-durability-window.md`
+for the rationale and the I-L5 amendment.
 
 **FileBacked alignment**: `FileBackedDevice` enforces the same 4K
 alignment as `RawBlockDevice` to ensure tests faithfully reproduce
