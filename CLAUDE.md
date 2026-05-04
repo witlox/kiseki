@@ -3,11 +3,13 @@
 Distributed storage system for HPC/AI workloads. 20 production Rust
 crates (+ 1 BDD-test crate), 40 ADRs, 140 invariants.
 
-BDD acceptance: 316 scenarios (CI: 315 pass, 1 occasionally flaky on
-multi-node-raft D-10 cross-stream). Fidelity fix landed —
-@integration steps now drive real multi-node clusters via
-ClusterHarness against spawned `kiseki-server` binaries; in-memory
-mocks retired for the cross-node paths.
+BDD acceptance: 316 scenarios (CI: all 316 pass; D-10 cross-stream
+de-flake landed 2026-05-04 — bumped scenario slow-down from 1.5 s
+to 60 s above the GET retry deadline + bounded poll on the metric
+assertion). Fidelity fix landed — @integration steps now drive
+real multi-node clusters via ClusterHarness against spawned
+`kiseki-server` binaries; in-memory mocks retired for the
+cross-node paths.
 
 Workspace tests: ~1650 unit + integration via cargo nextest. CI
 splits Unit Tests into two invocations (workspace minus
