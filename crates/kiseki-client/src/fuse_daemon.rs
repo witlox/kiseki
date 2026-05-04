@@ -17,8 +17,8 @@ use std::path::Path;
 #[cfg(feature = "fuse")]
 use fuser::{
     Config, Errno, FileAttr as FuserAttr, FileHandle, FileType as FuserFileType, Filesystem,
-    FopenFlags, Generation, INodeNo, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, Request, WriteFlags,
+    FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request, WriteFlags,
 };
 
 #[cfg(feature = "fuse")]
@@ -33,6 +33,26 @@ use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "fuse")]
 const TTL: Duration = Duration::from_secs(1);
+
+/// Per-file-handle FUSE flags returned on every `open` and `create`
+/// reply. `FOPEN_KEEP_CACHE` is safe to set unconditionally because
+/// kiseki's chunks are content-addressed (`chunk_id = HMAC(plaintext)`)
+/// and therefore immutable — the kernel can keep cached pages across
+/// opens without ever showing stale data. Without this flag, every
+/// `open(2)` invalidates the page cache and the next read goes back
+/// through the gateway, defeating the kernel's repeat-read win that
+/// dominates HPC/AI training workloads.
+#[cfg(feature = "fuse")]
+pub(crate) const FILE_OPEN_FLAGS: FopenFlags = FopenFlags::FOPEN_KEEP_CACHE;
+
+/// Maximum readahead bytes we negotiate on FUSE init. The default the
+/// kernel offers on Linux is typically 128 KiB; for a 16 MiB
+/// sequential read that means 128 separate FUSE READ requests
+/// instead of one. Bumping to 16 MiB lets the kernel issue
+/// 1–2 large requests per chunk, dramatically reducing per-call
+/// overhead on cold reads.
+#[cfg(feature = "fuse")]
+pub(crate) const MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 
 #[cfg(feature = "fuse")]
 fn to_fuser_attr(ino: u64, attr: &crate::fuse_fs::FileAttr) -> FuserAttr {
@@ -112,6 +132,38 @@ impl<G: GatewayOps> FuseDaemon<G> {
 
 #[cfg(feature = "fuse")]
 impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
+    /// Negotiate kernel-side caching + readahead. Called once on mount
+    /// before any other op. The 2026-05-04 GCP perf cluster measured
+    /// FUSE reads at ~5 MB/s aggregate; with the kernel's ~128 KiB
+    /// default readahead, each 16 MiB userspace read fans out to
+    /// ~128 FUSE READ requests, each making a full gRPC round trip
+    /// to the gateway. Bumping `max_readahead` lets sequential reads
+    /// land in 1–2 large FUSE requests instead.
+    ///
+    /// `FUSE_EXPORT_SUPPORT` is added so the mount can be re-exported
+    /// over NFS — matches the `init_declares_export_support_flag`
+    /// pin in `tests/fuse_linux.rs`.
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // set_max_readahead caps to the kernel's max_max_readahead,
+        // which on modern Linux is well above 16 MiB. If the
+        // requested value is too large, fuser silently caps it.
+        let _ = config.set_max_readahead(MAX_READAHEAD_BYTES);
+        // FUSE_EXPORT_SUPPORT is advisory — kernel must support it.
+        // If it doesn't, add_capabilities returns Err which we
+        // ignore (the mount still works, just can't be NFS-re-exported).
+        let _ = config.add_capabilities(InitFlags::FUSE_EXPORT_SUPPORT);
+        Ok(())
+    }
+
+    /// Reply with `FOPEN_KEEP_CACHE` so the kernel keeps the page
+    /// cache across opens. The fuser default behavior (without an
+    /// `open` override) is to call back into the trait's default
+    /// impl which returns `FopenFlags::empty()` — every open
+    /// invalidates the cache, defeating the page-cache win.
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FILE_OPEN_FLAGS);
+    }
+
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let fs = self.inner.read().unwrap();
         match fs.getattr(ino.0) {
@@ -220,7 +272,7 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
                     &to_fuser_attr(ino, &attr),
                     Generation(0),
                     FileHandle(0),
-                    FopenFlags::empty(),
+                    FILE_OPEN_FLAGS,
                 );
             }
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -369,6 +421,40 @@ pub fn mount<G: GatewayOps + Send + Sync + 'static>(
     options.mount_options = mount_opts;
     fuser::mount2(daemon, mountpoint, &options)
         .map_err(|e| std::io::Error::other(format!("FUSE mount failed: {e}")))
+}
+
+#[cfg(all(test, feature = "fuse"))]
+mod read_perf_caps_tests {
+    use super::*;
+
+    /// FUSE 2026-05-04 GCP perf disaster: parallel reads measured
+    /// 5.78 MB/s aggregate. Root cause was the fuser-default kernel
+    /// caps — ~128 KiB readahead (forces N round trips for an N×128 KiB
+    /// read) and `FopenFlags::empty()` on open (defeats the page
+    /// cache between opens). Pin both fixes here.
+    #[test]
+    fn open_flags_set_keep_cache_so_repeat_reads_hit_page_cache() {
+        assert!(
+            FILE_OPEN_FLAGS.contains(FopenFlags::FOPEN_KEEP_CACHE),
+            "FUSE FILE_OPEN_FLAGS must contain FOPEN_KEEP_CACHE — without \
+             it the kernel invalidates the page cache on every open(2), \
+             so a workload that repeats reads on the same file refetches \
+             through the gateway every time. Kiseki chunks are content-\
+             addressed and immutable so KEEP_CACHE is always safe.",
+        );
+    }
+
+    #[test]
+    fn max_readahead_is_at_least_one_mib_so_large_reads_dont_chunk_to_default() {
+        const MIN: u32 = 1024 * 1024;
+        assert!(
+            MAX_READAHEAD_BYTES >= MIN,
+            "FUSE MAX_READAHEAD_BYTES = {MAX_READAHEAD_BYTES}; must be \
+             >= {MIN} so the kernel doesn't fall back to its 128 KiB \
+             default readahead and fan a single 16 MiB read out into \
+             ~128 separate FUSE READ requests through the gRPC gateway.",
+        );
+    }
 }
 
 #[cfg(all(test, feature = "fuse"))]
