@@ -468,17 +468,22 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// List directory entries for READDIR.
+    ///
+    /// Does NOT emit `.` and `..` — the Linux NFSv4 kernel client
+    /// synthesizes them locally for every directory (POSIX
+    /// abstraction) using the mountpoint's local inode. Emitting
+    /// them server-side as well surfaces them twice in the user-
+    /// visible listing because their fileids differ (server returns
+    /// fileid=1 with no real attrs; kernel synthesizes from the
+    /// real local inode). 2026-05-04 GCP transport-profile run
+    /// captured the duplicate-entry symptom in
+    /// `.gcp-build/findings/2026-05-04-fabric-256mib-cap/client-1-nfs-state.txt`.
+    /// RFC 8881 §18.26.4 says the server SHOULD include them, but
+    /// every production NFSv4 server (NFS-Ganesha, knfsd, EFS)
+    /// omits them for the same reason. Wire-test guard:
+    /// `nfs4_server::tests::readdir_response_omits_dot_and_dotdot`.
     pub fn readdir(&self) -> Vec<ReadDirEntry> {
-        let mut entries = vec![
-            ReadDirEntry {
-                fileid: 1,
-                name: ".".into(),
-            },
-            ReadDirEntry {
-                fileid: 1,
-                name: "..".into(),
-            },
-        ];
+        let mut entries: Vec<ReadDirEntry> = Vec::new();
 
         // NFS-CREATE'd files (named via dir_index). Their backing
         // compositions are tracked here so the Phase 15c.3 enumeration

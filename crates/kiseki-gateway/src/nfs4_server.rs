@@ -708,6 +708,19 @@ mod fattr4 {
     /// kernels also key on this when deciding whether to ask for
     /// a layout on a specific open.
     pub const LAYOUT_TYPES: u32 = 30;
+
+    /// `FATTR4_TIME_ACCESS` (RFC 8881 §5.8.2.5, bit 47).
+    /// Word 1 bit position = 47 - 32 = 15.
+    pub const TIME_ACCESS_W1: u32 = 47 - 32;
+    /// `FATTR4_TIME_METADATA` (RFC 8881 §5.8.2.13, bit 52).
+    /// Word 1 bit position = 52 - 32 = 20.
+    pub const TIME_METADATA_W1: u32 = 52 - 32;
+    /// `FATTR4_TIME_MODIFY` (RFC 8881 §5.8.2.14, bit 53).
+    /// Word 1 bit position = 53 - 32 = 21. Without this advertised
+    /// the kernel defaults the user-visible mtime to epoch 0
+    /// ("Jan  1  1970" in `ls -la`). Captured 2026-05-04 on the
+    /// GCP transport-profile run.
+    pub const TIME_MODIFY_W1: u32 = 53 - 32;
 }
 
 /// `FH4_PERSISTENT` per RFC 8881 §5.8.1.18 — kiseki file handles
@@ -821,6 +834,9 @@ fn op_getattr<G: GatewayOps>(
             | (1u32 << fattr4::NUMLINKS_W1)
             | (1u32 << fattr4::OWNER_W1)
             | (1u32 << fattr4::OWNER_GROUP_W1)
+            | (1u32 << fattr4::TIME_ACCESS_W1)
+            | (1u32 << fattr4::TIME_METADATA_W1)
+            | (1u32 << fattr4::TIME_MODIFY_W1)
             | (1u32 << fattr4::FS_LAYOUT_TYPES_W1);
         attr_w.write_u32(2); // bitmap word count
         attr_w.write_u32(supported_word0);
@@ -930,6 +946,46 @@ fn op_getattr<G: GatewayOps>(
     if want_w1(fattr4::OWNER_GROUP_W1) {
         attr_w.write_string("root@kiseki.local");
         result_word1 |= 1 << fattr4::OWNER_GROUP_W1;
+    }
+    // Time attributes (RFC 8881 §3.4.2 — `nfstime4 = i64 seconds + u32 nseconds`).
+    //
+    // 2026-05-04 GCP perf-run finding: without these, the kernel
+    // shows `Jan  1  1970` in `ls -la` for every regular file and
+    // can't reason about cache freshness. We use
+    // `SystemTime::now()` as a placeholder source — every GETATTR
+    // returns "the current wall clock". Per-composition mtime
+    // (so a file's mtime tracks its last write) is plumbed in a
+    // follow-on; until then the wall-clock source still removes
+    // the user-visible 1970 bug AND keeps mtime monotonic so the
+    // kernel doesn't believe stale cached data.
+    let wall_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let wall_seconds = wall_now.as_secs();
+    let wall_nanos = wall_now.subsec_nanos();
+    let write_nfstime4 = |w: &mut XdrWriter, secs: u64, nsecs: u32| {
+        // i64 seconds — split into two u32 words, big-endian.
+        #[allow(clippy::cast_possible_wrap)] // dates < year 2038 + far future
+        let secs_i64 = secs as i64;
+        #[allow(clippy::cast_sign_loss)]
+        let high = ((secs_i64 >> 32) & 0xffff_ffff) as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let low = (secs_i64 & 0xffff_ffff) as u32;
+        w.write_u32(high);
+        w.write_u32(low);
+        w.write_u32(nsecs);
+    };
+    if want_w1(fattr4::TIME_ACCESS_W1) {
+        write_nfstime4(&mut attr_w, wall_seconds, wall_nanos);
+        result_word1 |= 1 << fattr4::TIME_ACCESS_W1;
+    }
+    if want_w1(fattr4::TIME_METADATA_W1) {
+        write_nfstime4(&mut attr_w, wall_seconds, wall_nanos);
+        result_word1 |= 1 << fattr4::TIME_METADATA_W1;
+    }
+    if want_w1(fattr4::TIME_MODIFY_W1) {
+        write_nfstime4(&mut attr_w, wall_seconds, wall_nanos);
+        result_word1 |= 1 << fattr4::TIME_MODIFY_W1;
     }
     if want_w1(fattr4::FS_LAYOUT_TYPES_W1) {
         // RFC 8881 §5.8.1.12 — `FATTR4_FS_LAYOUT_TYPES`:
@@ -3032,5 +3088,276 @@ mod tests {
             "DS role MUST NOT emit USE_PNFS_MDS — Linux client uses these \
              bits to disambiguate the server, got 0x{flags:08x}",
         );
+    }
+
+    // ---------- READDIR (§18.26) ----------
+
+    /// Decode a single entry from an `op_readdir` response body
+    /// stream. Returns `(name, fileid)` or `None` on EOF.
+    /// Mirrors the wire layout we emit: `nextentry(bool) cookie(u64)
+    /// name(string) attrmask(bitmap) attr_vals(opaque)`.
+    fn read_readdir_entry(r: &mut XdrReader<'_>) -> Option<(String, u64)> {
+        let nextentry = r.read_bool().expect("nextentry bool");
+        if !nextentry {
+            return None;
+        }
+        let cookie = r.read_u64().expect("cookie");
+        let name = r.read_string().expect("name");
+        let attrmask_count = r.read_u32().expect("attrmask count");
+        for _ in 0..attrmask_count {
+            let _ = r.read_u32().expect("attrmask word");
+        }
+        let _attr_vals = r.read_opaque().expect("attr_vals");
+        Some((name, cookie))
+    }
+
+    /// Drain the entire `op_readdir` response into a Vec of names.
+    /// Captures: status word, cookieverf, all entries until
+    /// `nextentry=false`, then the final `eof` bool.
+    fn drain_readdir_entries(result: &[u8]) -> (u32, Vec<String>, bool) {
+        let mut r = XdrReader::new(result);
+        let _op = r.read_u32().expect("op code");
+        let status = r.read_u32().expect("status");
+        if status != nfs4_status::NFS4_OK {
+            return (status, Vec::new(), false);
+        }
+        let _cookieverf = r.read_opaque_fixed(8).expect("cookieverf");
+        let mut names = Vec::new();
+        while let Some((name, _cookie)) = read_readdir_entry(&mut r) {
+            names.push(name);
+        }
+        let eof = r.read_bool().expect("eof");
+        (status, names, eof)
+    }
+
+    fn make_readdir_args() -> Vec<u8> {
+        // READDIR4args: cookie(u64) + cookieverf(8) + dircount(u32)
+        // + maxcount(u32) + attr_request(bitmap empty).
+        let mut w = XdrWriter::new();
+        w.write_u64(0); // cookie
+        w.write_opaque_fixed(&[0u8; 8]); // cookieverf
+        w.write_u32(8192); // dircount
+        w.write_u32(8192); // maxcount
+        w.write_u32(0); // attr_request bitmap word count = 0
+        w.into_bytes()
+    }
+
+    /// 2026-05-04 GCP transport-profile finding: an NFSv4.2 mount
+    /// of a kiseki export emits `.` and `..` TWICE each in directory
+    /// listings. Captured in
+    /// `.gcp-build/findings/2026-05-04-fabric-256mib-cap/client-1-nfs-state.txt`.
+    /// The kernel client synthesizes `.` and `..` locally for every
+    /// directory (POSIX abstraction), AND the server emits them in
+    /// the READDIR response per a long-standing `readdir()` impl
+    /// in `nfs_ops.rs`. The two surface side-by-side in the user-
+    /// visible listing because their fileids differ (server returns
+    /// fileid=1 with no real attrs; kernel synthesizes from the
+    /// mountpoint's local inode).
+    ///
+    /// RFC 8881 §18.26.4 says the server SHOULD include `.` and
+    /// `..`, but the practical Linux NFSv4 client behavior makes
+    /// that produce duplicates. Best practice (matches NFS-Ganesha,
+    /// knfsd, and Amazon EFS) is to NOT emit `.` and `..` from the
+    /// READDIR response — the kernel handles them locally.
+    ///
+    /// Failing test: assert the server's READDIR response contains
+    /// no `.` and no `..` entries.
+    #[test]
+    fn readdir_response_omits_dot_and_dotdot() {
+        let ctx = test_ctx();
+        let state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+        let args = make_readdir_args();
+        let mut reader = XdrReader::new(&args);
+
+        let (status, result) = op_readdir(&mut reader, &ctx, &state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let (_, names, eof) = drain_readdir_entries(&result);
+        assert!(eof, "READDIR over an empty namespace must report eof");
+        assert!(
+            !names.iter().any(|n| n == "."),
+            "READDIR must NOT emit `.` — the kernel client \
+             synthesizes it locally; emitting it produces \
+             duplicate entries in the user-visible listing \
+             (2026-05-04 GCP finding). Got: {names:?}",
+        );
+        assert!(
+            !names.iter().any(|n| n == ".."),
+            "READDIR must NOT emit `..` — same reason as `.` \
+             above. Got: {names:?}",
+        );
+    }
+
+    // ---------- GETATTR time attributes (§5.8.2) ----------
+
+    /// 2026-05-04 GCP transport-profile finding: every NFS-served
+    /// file shows `Jan  1  1970` mtime in `ls -la`. The
+    /// `NfsAttrs` struct has no time fields, the
+    /// `SUPPORTED_ATTRS` bitmap doesn't advertise TIME_MODIFY /
+    /// TIME_ACCESS / TIME_CREATE / TIME_METADATA, and the
+    /// `op_getattr` encoder doesn't emit them. Linux defaults the
+    /// missing values to epoch 0.
+    ///
+    /// Bit positions per RFC 8881 §5.8.2:
+    ///   - TIME_ACCESS   = 47 (word 1 bit 15)
+    ///   - TIME_METADATA = 52 (word 1 bit 20)
+    ///   - TIME_MODIFY   = 53 (word 1 bit 21)
+    ///
+    /// Failing test: the SUPPORTED_ATTRS bitmap returned by
+    /// GETATTR must include at least TIME_MODIFY. Once that's
+    /// advertised, kernel behavior will improve immediately
+    /// (clients use it for caching, version detection, and the
+    /// user-visible `ls -la` mtime).
+    #[test]
+    fn getattr_advertises_time_modify_in_supported_attrs() {
+        let ctx = test_ctx();
+        let state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+        // Request just SUPPORTED_ATTRS so the response is small
+        // and the bitmap is at a known offset.
+        let mut args = XdrWriter::new();
+        args.write_u32(1); // bitmap word count
+        args.write_u32(1u32 << 0); // SUPPORTED_ATTRS at bit 0 of word 0
+        let args_bytes = args.into_bytes();
+        let mut reader = XdrReader::new(&args_bytes);
+
+        let (status, result) = op_getattr(&mut reader, &ctx, &state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        // Response shape (RFC 8881 §18.7.2):
+        //   op_code(u32) status(u32) attrmask(bitmap) attr_vals(opaque)
+        // attr_vals for SUPPORTED_ATTRS = bitmap of all supported
+        // attrs (length-prefixed bitmap inside the opaque).
+        let mut r = XdrReader::new(&result);
+        let _op = r.read_u32().expect("op");
+        let _status = r.read_u32().expect("status");
+        let resp_mask_count = r.read_u32().expect("resp mask count");
+        let mut resp_mask = Vec::with_capacity(resp_mask_count as usize);
+        for _ in 0..resp_mask_count {
+            resp_mask.push(r.read_u32().expect("resp mask word"));
+        }
+        // Echo of what attrs the server returned a value for. Must
+        // contain SUPPORTED_ATTRS.
+        let echoed_supported = resp_mask
+            .first()
+            .copied()
+            .is_some_and(|w0| w0 & (1u32 << 0) != 0);
+        assert!(echoed_supported, "response must echo SUPPORTED_ATTRS");
+
+        // The opaque attr_vals starts with a u32 length prefix,
+        // then the bitmap-of-supported-attrs. Decode that bitmap
+        // and check TIME_MODIFY (bit 53 = word 1 bit 21).
+        let attr_vals = r.read_opaque().expect("attr_vals");
+        let mut a = XdrReader::new(&attr_vals);
+        let supported_count = a.read_u32().expect("supported count");
+        let mut supported = Vec::with_capacity(supported_count as usize);
+        for _ in 0..supported_count {
+            supported.push(a.read_u32().expect("supported word"));
+        }
+        let supports_time_modify = supported
+            .get(1)
+            .copied()
+            .is_some_and(|w1| w1 & (1u32 << (53 - 32)) != 0);
+        assert!(
+            supports_time_modify,
+            "GETATTR must advertise TIME_MODIFY in SUPPORTED_ATTRS \
+             so the kernel doesn't default the user-visible mtime to \
+             epoch 0 (2026-05-04 GCP finding). Got supported word1 = \
+             0b{:032b}",
+            supported.get(1).copied().unwrap_or(0),
+        );
+    }
+
+    /// When the kernel asks for TIME_MODIFY directly, the response
+    /// must echo it in the attrmask AND emit a non-zero
+    /// `nfstime4 = (seconds: i64, nseconds: u32)` value.
+    #[test]
+    fn getattr_returns_nonzero_time_modify_when_requested() {
+        let ctx = test_ctx();
+        let state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+        // Request word1 with bit 21 (TIME_MODIFY). Word 0 = 0.
+        let mut args = XdrWriter::new();
+        args.write_u32(2); // bitmap word count
+        args.write_u32(0); // word 0 — nothing
+        args.write_u32(1u32 << (53 - 32)); // word 1 — TIME_MODIFY
+        let args_bytes = args.into_bytes();
+        let mut reader = XdrReader::new(&args_bytes);
+
+        let (status, result) = op_getattr(&mut reader, &ctx, &state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&result);
+        let _op = r.read_u32().expect("op");
+        let _status = r.read_u32().expect("status");
+        let resp_mask_count = r.read_u32().expect("resp mask count");
+        let mut resp_mask = Vec::with_capacity(resp_mask_count as usize);
+        for _ in 0..resp_mask_count {
+            resp_mask.push(r.read_u32().expect("resp mask word"));
+        }
+        let echoed = resp_mask
+            .get(1)
+            .copied()
+            .is_some_and(|w1| w1 & (1u32 << (53 - 32)) != 0);
+        assert!(
+            echoed,
+            "response must echo TIME_MODIFY in the attrmask when \
+             the client requested it; got word1 = {:?}",
+            resp_mask.get(1),
+        );
+
+        let attr_vals = r.read_opaque().expect("attr_vals");
+        let mut a = XdrReader::new(&attr_vals);
+        // nfstime4 (RFC 8881 §3.4.2) = i64 seconds + u32 nseconds.
+        // We allow an i64 reader; if the server emitted the i64
+        // as zero we surface that with a clear failure message.
+        let seconds_high = a.read_u32().expect("nfstime4 seconds high");
+        let seconds_low = a.read_u32().expect("nfstime4 seconds low");
+        let nseconds = a.read_u32().expect("nfstime4 nseconds");
+        let seconds = (u64::from(seconds_high) << 32) | u64::from(seconds_low);
+        assert!(
+            seconds > 0,
+            "TIME_MODIFY must be a real non-zero timestamp \
+             (kiseki processes started after 1970-01-01); got \
+             seconds={seconds} nseconds={nseconds}. The 2026-05-04 \
+             GCP run captured `Jan  1  1970` mtimes in `ls -la` \
+             for every regular file because the encoder fills 0.",
+        );
+    }
+
+    /// Companion: every emitted entry is unique (no duplicates of
+    /// real names either, in case a future change reintroduces
+    /// the same class of bug for non-dot entries).
+    #[test]
+    fn readdir_emits_each_entry_at_most_once() {
+        let ctx = test_ctx();
+        let state = CompoundState {
+            current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
+            saved_fh: None,
+            current_stateid: None,
+        };
+        let args = make_readdir_args();
+        let mut reader = XdrReader::new(&args);
+        let (status, result) = op_readdir(&mut reader, &ctx, &state);
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let (_, names, _eof) = drain_readdir_entries(&result);
+        let mut seen = std::collections::HashSet::new();
+        for name in &names {
+            assert!(
+                seen.insert(name.clone()),
+                "READDIR returned duplicate entry `{name}` (got: {names:?})",
+            );
+        }
     }
 }
