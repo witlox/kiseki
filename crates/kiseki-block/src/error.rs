@@ -51,6 +51,18 @@ pub enum AllocError {
         available: u64,
     },
 
+    /// Single-extent request exceeds the per-extent cap. Caller must
+    /// split the payload across multiple extents.
+    #[error(
+        "request {requested} bytes exceeds per-extent cap {max}; caller must split across extents"
+    )]
+    RequestTooLarge {
+        /// Requested allocation size.
+        requested: u64,
+        /// Maximum bytes (including overhead) per single extent.
+        max: u64,
+    },
+
     /// Internal allocator inconsistency.
     #[error("allocator inconsistency: {0}")]
     Inconsistency(String),

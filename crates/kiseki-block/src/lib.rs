@@ -12,6 +12,7 @@
 //!   - I-C8 — bitmap is ground truth, journaled in redb
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod allocator;
 pub mod backend;
@@ -23,11 +24,11 @@ pub mod probe;
 pub mod superblock;
 pub mod trim;
 
-pub use allocator::BitmapAllocator;
+pub use allocator::{BitmapAllocator, MAX_EXTENT_BYTES};
 pub use backend::DeviceBackend;
 pub use error::{AllocError, BlockError};
 pub use extent::Extent;
-pub use file::FileBackedDevice;
+pub use file::{FileBackedDevice, MAX_EXTENT_PAYLOAD_BYTES};
 pub use journal::Journal;
 pub use probe::{DetectedMedium, DeviceCharacteristics, IoStrategy};
 pub use superblock::Superblock;

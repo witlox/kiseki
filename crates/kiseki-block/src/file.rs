@@ -8,12 +8,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::allocator::BitmapAllocator;
+use crate::allocator::{BitmapAllocator, MAX_EXTENT_BYTES};
 use crate::backend::{crc32c, DeviceBackend};
 use crate::error::{AllocError, BlockError};
 use crate::extent::Extent;
 use crate::probe::DeviceCharacteristics;
 use crate::superblock::Superblock;
+use kiseki_common::locks::LockOrDie;
 
 /// Header: 4-byte data length prefix.
 const HEADER_SIZE: usize = 4;
@@ -21,6 +22,14 @@ const HEADER_SIZE: usize = 4;
 const CRC_SIZE: usize = 4;
 /// Total overhead per extent: header + trailer.
 const OVERHEAD: usize = HEADER_SIZE + CRC_SIZE;
+
+/// Maximum payload bytes (ciphertext) that fit in a single extent
+/// after subtracting the per-extent header + CRC trailer overhead.
+///
+/// Callers writing payloads larger than this MUST split into multiple
+/// extents — `alloc()` caps any single allocation at
+/// [`MAX_EXTENT_BYTES`].
+pub const MAX_EXTENT_PAYLOAD_BYTES: u64 = MAX_EXTENT_BYTES - OVERHEAD as u64;
 
 /// File-backed device — uses a sparse file on the host filesystem.
 ///
@@ -144,12 +153,12 @@ impl FileBackedDevice {
         let alloc = self
             .allocator
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.allocator");
         let bitmap = alloc.bitmap_bytes();
         let mut file = self
             .file
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.file");
 
         // Write primary.
         file.seek(SeekFrom::Start(self.superblock.bitmap_offset))?;
@@ -170,7 +179,7 @@ impl DeviceBackend for FileBackedDevice {
         let mut alloc = self
             .allocator
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.allocator");
         alloc.alloc(total)
     }
 
@@ -183,6 +192,29 @@ impl DeviceBackend for FileBackedDevice {
                 "data exceeds 4GB",
             )));
         }
+        // Bug 5 (GCP 2026-05-04): without this guard, an oversized
+        // payload silently writes past the extent boundary into the
+        // next allocator region, corrupting whatever chunk lives
+        // there. The bitmap allocator caps any single extent at
+        // MAX_EXTENT_BYTES; callers writing larger payloads must split
+        // across multiple extents.
+        let payload_capacity = extent.length.saturating_sub(OVERHEAD as u64);
+        if data.len() as u64 > payload_capacity {
+            tracing::warn!(
+                bytes = data.len(),
+                extent_length = extent.length,
+                payload_capacity,
+                "block file write: data exceeds extent payload capacity",
+            );
+            return Err(BlockError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "data ({} bytes) exceeds extent payload capacity ({} bytes)",
+                    data.len(),
+                    payload_capacity
+                ),
+            )));
+        }
         let crc = crc32c(data);
         let abs_offset = self.superblock.data_offset + extent.offset;
         #[allow(clippy::cast_possible_truncation)] // guarded by check above
@@ -191,7 +223,7 @@ impl DeviceBackend for FileBackedDevice {
         let mut file = self
             .file
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.file");
 
         file.seek(SeekFrom::Start(abs_offset)).inspect_err(|e| {
             tracing::warn!(error = %e, "block file write: seek failed");
@@ -219,7 +251,7 @@ impl DeviceBackend for FileBackedDevice {
         let mut file = self
             .file
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.file");
 
         // Read length header (4 bytes).
         let mut len_buf = [0u8; HEADER_SIZE];
@@ -230,6 +262,27 @@ impl DeviceBackend for FileBackedDevice {
             tracing::warn!(error = %e, "block file read: header read failed");
         })?;
         let data_len = u32::from_le_bytes(len_buf) as usize;
+
+        // Bug 5 sibling guard: refuse to read beyond extent boundaries.
+        // If the header claims a length larger than the extent can
+        // hold, treat as corruption rather than reading into adjacent
+        // extents (which would mask the underlying bug and pollute
+        // returned data).
+        let payload_capacity = extent.length.saturating_sub(OVERHEAD as u64);
+        if data_len as u64 > payload_capacity {
+            tracing::warn!(
+                offset = extent.offset,
+                extent_length = extent.length,
+                claimed_len = data_len,
+                payload_capacity,
+                "block file read: header claims length beyond extent — corruption",
+            );
+            return Err(BlockError::Corruption {
+                offset: extent.offset,
+                expected: 0,
+                actual: 0,
+            });
+        }
 
         // Read data + CRC32.
         let mut data = vec![0u8; data_len];
@@ -265,7 +318,7 @@ impl DeviceBackend for FileBackedDevice {
         let mut alloc = self
             .allocator
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.allocator");
         alloc.free(extent)
     }
 
@@ -274,7 +327,7 @@ impl DeviceBackend for FileBackedDevice {
         let file = self
             .file
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.file");
         file.sync_all()?;
         Ok(())
     }
@@ -283,7 +336,7 @@ impl DeviceBackend for FileBackedDevice {
         let alloc = self
             .allocator
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.allocator");
         (alloc.used_bytes(), alloc.total_bytes())
     }
 
@@ -299,7 +352,7 @@ impl DeviceBackend for FileBackedDevice {
         let alloc = self
             .allocator
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("file.allocator");
         alloc.bitmap_bytes().to_vec()
     }
 }
@@ -422,6 +475,66 @@ mod tests {
     fn alignment_enforced() {
         let chars = DeviceCharacteristics::file_backed_defaults();
         assert_eq!(chars.physical_block_size, 4096);
+    }
+
+    /// Bug 5 (GCP 2026-05-04): the bitmap allocator silently truncates
+    /// any single request to `MAX_EXTENT_BYTES = 16 MiB`. Combined with
+    /// `write` not enforcing `data.len() <= extent.length`, oversized
+    /// payloads overran into adjacent extent space. Subsequent writes
+    /// then overwrote the first chunk's data, surfacing as a
+    /// `BlockError::Corruption` on read.
+    ///
+    /// Contract: `alloc(N)` returns an extent that fits `N` bytes of
+    /// payload, OR errors. Silent truncation is forbidden.
+    #[test]
+    fn alloc_refuses_request_larger_than_extent_cap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.dev");
+        let dev = FileBackedDevice::init(&path, 256 * MB).unwrap();
+
+        // 64 MiB exceeds the 16 MiB per-extent cap. Caller must learn
+        // this and split into multiple alloc + write pairs.
+        let result = dev.alloc(64 * MB);
+        match result {
+            Err(AllocError::RequestTooLarge { requested, max }) => {
+                assert!(
+                    requested >= 64 * MB,
+                    "requested={requested} should be >= asked size",
+                );
+                assert!(max <= 64 * MB, "max={max} should be <= requested");
+            }
+            Err(other) => panic!("expected RequestTooLarge, got {other:?}"),
+            Ok(extent) => panic!(
+                "alloc({}) silently returned {}-byte extent; this lets \
+                 callers overrun into adjacent extents",
+                64 * MB,
+                extent.length,
+            ),
+        }
+    }
+
+    /// Bug 5 (defensive layer): even if a caller passes an oversized
+    /// `data` for the extent it holds, `write` must refuse rather than
+    /// overrun. Without this guard a single buggy callsite can corrupt
+    /// any device.
+    #[test]
+    fn write_refuses_data_larger_than_extent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.dev");
+        let dev = FileBackedDevice::init(&path, 64 * MB).unwrap();
+
+        // Allocate a small extent.
+        let extent = dev.alloc(4096).unwrap();
+        // Try to write more than the extent can hold.
+        let oversize: Vec<u8> = vec![0xAB; usize::try_from(extent.length).unwrap() + 1];
+        let result = dev.write(&extent, &oversize);
+        assert!(
+            result.is_err(),
+            "write of {} bytes into a {}-byte extent should fail, not \
+             overrun into adjacent space",
+            oversize.len(),
+            extent.length
+        );
     }
 
     #[test]

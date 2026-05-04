@@ -25,8 +25,15 @@ pub struct BitmapAllocator {
     max_extent_blocks: u64,
 }
 
-/// Maximum extent size: 16MB.
-const MAX_EXTENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum extent size: 16 MiB.
+///
+/// Public so chunk-store callers can pre-chunk payloads larger than
+/// one extent. A single `alloc()` call returns at most this many
+/// bytes; for larger payloads, callers must loop. See
+/// [`crate::file::FileBackedDevice::write`] for the per-extent
+/// header + CRC trailer overhead the caller must subtract from this
+/// to size each chunk.
+pub const MAX_EXTENT_BYTES: u64 = 16 * 1024 * 1024;
 
 impl BitmapAllocator {
     /// Create a new allocator for a device.
@@ -70,15 +77,33 @@ impl BitmapAllocator {
 
     /// Allocate an extent of at least `size_bytes`.
     ///
-    /// Returns a single extent up to `max_extent_blocks`. For larger
-    /// requests, the caller must call `alloc` multiple times.
+    /// Returns one contiguous extent. For payloads larger than
+    /// [`MAX_EXTENT_BYTES`], returns
+    /// [`AllocError::RequestTooLarge`] — callers must split into
+    /// multiple extents themselves.
     pub fn alloc(&mut self, size_bytes: u64) -> Result<Extent, AllocError> {
         let blocks_needed = size_bytes.div_ceil(u64::from(self.block_size));
-        let blocks_needed = blocks_needed.min(self.max_extent_blocks);
 
         if blocks_needed == 0 {
             tracing::warn!("block alloc: zero-size allocation requested");
             return Err(AllocError::Inconsistency("zero-size allocation".into()));
+        }
+
+        // Bug 5 (GCP 2026-05-04): silently truncating oversized
+        // requests to the per-extent cap led the chunk store to write
+        // payloads beyond the allocated extent, corrupting neighbors.
+        // Surface a clear error so callers split into multiple extents
+        // explicitly.
+        if blocks_needed > self.max_extent_blocks {
+            tracing::warn!(
+                requested = size_bytes,
+                max_per_extent = MAX_EXTENT_BYTES,
+                "block alloc: request exceeds per-extent cap",
+            );
+            return Err(AllocError::RequestTooLarge {
+                requested: size_bytes,
+                max: MAX_EXTENT_BYTES,
+            });
         }
 
         // Best-fit: find smallest free extent >= blocks_needed.

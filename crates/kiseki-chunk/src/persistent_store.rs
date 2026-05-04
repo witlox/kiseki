@@ -11,13 +11,14 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kiseki_block::file::FileBackedDevice;
-use kiseki_block::{DeviceBackend, Extent};
+use kiseki_block::{DeviceBackend, Extent, MAX_EXTENT_PAYLOAD_BYTES};
 use kiseki_common::ids::ChunkId;
 use kiseki_crypto::envelope::Envelope;
 
 use crate::error::ChunkError;
 use crate::pool::AffinityPool;
 use crate::store::ChunkOps;
+use kiseki_common::locks::LockOrDie;
 
 /// Compile-time assertion: `ChunkId` must be exactly 32 bytes.
 const _: () = assert!(std::mem::size_of::<ChunkId>() == 32);
@@ -34,9 +35,20 @@ struct PersistedChunkMeta {
     /// Used for accurate capacity accounting in pool usage.
     #[serde(default)]
     data_bytes: u64,
-    /// Device extent where ciphertext + envelope is stored.
+    /// First extent (legacy single-extent layout). For chunks that fit
+    /// in a single extent, this is the only extent. Kept for
+    /// backward-compat with metadata files written before Bug 5's
+    /// multi-extent fix landed.
     extent_offset: u64,
     extent_length: u64,
+    /// Additional extents holding the rest of the ciphertext, in
+    /// order. Empty for single-extent chunks (the common case;
+    /// ciphertext ≤ `MAX_EXTENT_PAYLOAD_BYTES`). Bug 5
+    /// (GCP 2026-05-04): chunks larger than the per-extent cap
+    /// silently corrupted; the fix splits oversize chunks across
+    /// multiple extents.
+    #[serde(default)]
+    extra_extents: Vec<(u64, u64)>,
     /// Serialized envelope metadata (nonce, `auth_tag`, epochs, etc.)
     /// Ciphertext is on the device; this is just the crypto fields.
     nonce: [u8; 12],
@@ -49,7 +61,10 @@ struct PersistedChunkMeta {
 /// In-memory chunk entry for the persistent store.
 struct ChunkEntry {
     envelope_meta: PersistedChunkMeta,
-    extent: Extent,
+    /// All extents holding this chunk's ciphertext, in order.
+    /// `extents[0]` is the legacy single extent; for chunks that
+    /// exceed the per-extent cap, additional extents follow.
+    extents: Vec<Extent>,
 }
 
 /// Metadata for a persisted EC fragment. Distinct from
@@ -142,12 +157,15 @@ impl PersistentChunkStore {
             let mut map = HashMap::new();
             for meta in metas {
                 let chunk_id = ChunkId(meta.chunk_id);
-                let extent = Extent::new(meta.extent_offset, meta.extent_length);
+                let mut extents = vec![Extent::new(meta.extent_offset, meta.extent_length)];
+                for &(off, len) in &meta.extra_extents {
+                    extents.push(Extent::new(off, len));
+                }
                 map.insert(
                     chunk_id,
                     ChunkEntry {
                         envelope_meta: meta,
-                        extent,
+                        extents,
                     },
                 );
             }
@@ -188,7 +206,7 @@ impl PersistentChunkStore {
     pub fn add_pool(&self, pool: AffinityPool) {
         self.pools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("persistent_store.pools")
             .insert(pool.name.clone(), pool);
     }
 
@@ -223,15 +241,24 @@ impl PersistentChunkStore {
     }
 
     /// Reconstruct an Envelope from persisted metadata + device data.
+    ///
+    /// Reads each extent in order and concatenates the ciphertext.
+    /// Single-extent chunks (the common case) read one extent; chunks
+    /// that exceeded the per-extent cap at write time read all of them.
     fn reconstruct_envelope(
         &self,
         meta: &PersistedChunkMeta,
-        extent: &Extent,
+        extents: &[Extent],
     ) -> Result<Envelope, ChunkError> {
-        let ciphertext = self
-            .device
-            .read(extent)
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
+        let mut ciphertext: Vec<u8> =
+            Vec::with_capacity(usize::try_from(meta.data_bytes).unwrap_or(0));
+        for extent in extents {
+            let part = self
+                .device
+                .read(extent)
+                .map_err(|e| ChunkError::Io(e.to_string()))?;
+            ciphertext.extend_from_slice(&part);
+        }
 
         Ok(Envelope {
             ciphertext,
@@ -242,6 +269,40 @@ impl PersistentChunkStore {
             tenant_wrapped_material: meta.tenant_wrapped_material.clone(),
             chunk_id: ChunkId(meta.chunk_id),
         })
+    }
+
+    /// Allocate + write a payload across one or more extents.
+    ///
+    /// Returns the list of extents holding the payload, in order. On
+    /// any failure, all extents allocated by this call are freed
+    /// best-effort so the device doesn't leak space.
+    fn alloc_and_write_chunked(&self, data: &[u8]) -> Result<Vec<Extent>, ChunkError> {
+        #[allow(clippy::cast_possible_truncation)]
+        let max_payload = MAX_EXTENT_PAYLOAD_BYTES as usize;
+        let mut extents: Vec<Extent> = Vec::new();
+        let mut written = 0;
+        while written < data.len() {
+            let take = (data.len() - written).min(max_payload);
+            let extent = match self.device.alloc(take as u64) {
+                Ok(e) => e,
+                Err(e) => {
+                    for ext in &extents {
+                        let _ = self.device.free(ext);
+                    }
+                    return Err(ChunkError::Io(e.to_string()));
+                }
+            };
+            if let Err(e) = self.device.write(&extent, &data[written..written + take]) {
+                let _ = self.device.free(&extent);
+                for ext in &extents {
+                    let _ = self.device.free(ext);
+                }
+                return Err(ChunkError::Io(e.to_string()));
+            }
+            extents.push(extent);
+            written += take;
+        }
+        Ok(extents)
     }
 }
 
@@ -255,7 +316,7 @@ impl ChunkOps for PersistentChunkStore {
         let mut chunks = self
             .chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.chunks");
 
         // Dedup: if chunk already exists, just bump refcount.
         if let Some(entry) = chunks.get_mut(&chunk_id) {
@@ -269,31 +330,34 @@ impl ChunkOps for PersistentChunkStore {
             return Ok(false);
         }
 
-        // Allocate extent on device.
+        // Allocate + write ciphertext, splitting across multiple
+        // extents if it exceeds the per-extent cap (Bug 5 fix). On
+        // crash between writes and metadata persist, orphan extents
+        // are reclaimed by periodic scrub (ADR-029 F-I6).
         let data = &envelope.ciphertext;
         let data_bytes = data.len() as u64;
-        let extent = self
-            .device
-            .alloc(data.len() as u64)
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
+        let extents = self.alloc_and_write_chunked(data)?;
+        let stored_bytes: u64 = extents.iter().map(|e| e.length).sum();
 
-        // Write ciphertext to device (includes CRC32).
-        // If crash occurs between device write and metadata persist, the orphan
-        // extent is detected and freed by periodic scrub (ADR-029 F-I6).
-        self.device
-            .write(&extent, data)
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
-
-        // Build metadata.
+        // Build metadata. The first extent goes into the legacy
+        // `extent_offset/extent_length` pair; any additional extents
+        // go into `extra_extents`. Old metadata files (single extent
+        // only) deserialize unchanged.
+        let first = &extents[0];
+        let extra_extents: Vec<(u64, u64)> = extents[1..]
+            .iter()
+            .map(|e| (e.offset, e.length))
+            .collect();
         let meta = PersistedChunkMeta {
             chunk_id: chunk_id.0,
             refcount: 1,
             retention_holds: Vec::new(),
             pool_name: pool.to_owned(),
-            stored_bytes: extent.length,
+            stored_bytes,
             data_bytes,
-            extent_offset: extent.offset,
-            extent_length: extent.length,
+            extent_offset: first.offset,
+            extent_length: first.length,
+            extra_extents,
             nonce: envelope.nonce,
             auth_tag: envelope.auth_tag,
             system_epoch: envelope.system_epoch.0,
@@ -306,7 +370,7 @@ impl ChunkOps for PersistentChunkStore {
             let mut pools = self
                 .pools
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("persistent_store.pools");
             if let Some(p) = pools.get_mut(pool) {
                 p.used_bytes += data_bytes;
             }
@@ -317,7 +381,7 @@ impl ChunkOps for PersistentChunkStore {
             chunk_id,
             ChunkEntry {
                 envelope_meta: meta,
-                extent,
+                extents,
             },
         );
 
@@ -336,18 +400,18 @@ impl ChunkOps for PersistentChunkStore {
         let chunks = self
             .chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
-        self.reconstruct_envelope(&entry.envelope_meta, &entry.extent)
+        self.reconstruct_envelope(&entry.envelope_meta, &entry.extents)
     }
 
     fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
         let mut chunks = self
             .chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -366,7 +430,7 @@ impl ChunkOps for PersistentChunkStore {
         let mut chunks = self
             .chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -388,7 +452,7 @@ impl ChunkOps for PersistentChunkStore {
         let mut chunks = self
             .chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -415,7 +479,7 @@ impl ChunkOps for PersistentChunkStore {
         let mut chunks = self
             .chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -434,7 +498,7 @@ impl ChunkOps for PersistentChunkStore {
             e.into_inner()
         });
 
-        let to_remove: Vec<(ChunkId, Extent, String, u64)> = chunks
+        let to_remove: Vec<(ChunkId, Vec<Extent>, String, u64)> = chunks
             .iter()
             .filter(|(_, e)| {
                 e.envelope_meta.refcount == 0 && e.envelope_meta.retention_holds.is_empty()
@@ -442,7 +506,7 @@ impl ChunkOps for PersistentChunkStore {
             .map(|(id, e)| {
                 (
                     *id,
-                    e.extent,
+                    e.extents.clone(),
                     e.envelope_meta.pool_name.clone(),
                     e.envelope_meta.data_bytes,
                 )
@@ -451,24 +515,28 @@ impl ChunkOps for PersistentChunkStore {
 
         let mut freed_count: u64 = 0;
 
-        for (id, extent, pool_name, data_bytes) in &to_remove {
-            // Only remove chunk from metadata if device.free() succeeds.
-            // If free fails, skip this chunk (leave it for next GC cycle).
-            match self.device.free(extent) {
-                Ok(()) => {
-                    chunks.remove(id);
-                    freed_count += 1;
-                    // Update pool usage.
-                    let mut pools = self.pools.lock().unwrap_or_else(|e| {
-                        tracing::warn!("mutex poisoned in gc pool update, recovering");
-                        e.into_inner()
-                    });
-                    if let Some(p) = pools.get_mut(pool_name.as_str()) {
-                        p.used_bytes = p.used_bytes.saturating_sub(*data_bytes);
-                    }
-                }
-                Err(e) => {
+        for (id, extents, pool_name, data_bytes) in &to_remove {
+            // Free every extent for this chunk; only drop metadata if
+            // ALL frees succeed. A partial-free leaves the in-memory
+            // entry in place so a future GC retries cleanly.
+            let mut all_freed = true;
+            for ext in extents {
+                if let Err(e) = self.device.free(ext) {
                     tracing::warn!(chunk_id = %id, error = %e, "gc free failed, skipping");
+                    all_freed = false;
+                    break;
+                }
+            }
+            if all_freed {
+                chunks.remove(id);
+                freed_count += 1;
+                // Update pool usage.
+                let mut pools = self.pools.lock().unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned in gc pool update, recovering");
+                    e.into_inner()
+                });
+                if let Some(p) = pools.get_mut(pool_name.as_str()) {
+                    p.used_bytes = p.used_bytes.saturating_sub(*data_bytes);
                 }
             }
         }
@@ -484,7 +552,7 @@ impl ChunkOps for PersistentChunkStore {
         let chunks = self
             .chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.chunks");
         chunks
             .get(chunk_id)
             .map(|e| e.envelope_meta.refcount)
@@ -498,7 +566,7 @@ impl ChunkOps for PersistentChunkStore {
         let chunks = self
             .chunks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.chunks");
         chunks.keys().copied().collect()
     }
 
@@ -537,7 +605,7 @@ impl ChunkOps for PersistentChunkStore {
             let mut fragments = self
                 .fragments
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("persistent_store.fragments");
             let old = fragments.remove(&key).map(|e| e.extent);
             let meta = PersistedFragmentMeta {
                 chunk_id: chunk_id.0,
@@ -568,7 +636,7 @@ impl ChunkOps for PersistentChunkStore {
             let fragments = self
                 .fragments
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("persistent_store.fragments");
             fragments
                 .get(&key)
                 .map(|e| e.extent)
@@ -589,7 +657,7 @@ impl ChunkOps for PersistentChunkStore {
             let mut fragments = self
                 .fragments
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("persistent_store.fragments");
             fragments.remove(&key)
         };
         let Some(entry) = removed else {
@@ -609,11 +677,13 @@ impl ChunkOps for PersistentChunkStore {
             let mut chunks = self
                 .chunks
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("persistent_store.chunks");
             chunks.remove(chunk_id)
         };
         if let Some(entry) = chunk_entry {
-            let _ = self.device.free(&entry.extent);
+            for ext in &entry.extents {
+                let _ = self.device.free(ext);
+            }
             anything_removed = true;
         }
         // Per-fragment path (EC, server.put_fragment for fragment_index>0).
@@ -622,7 +692,7 @@ impl ChunkOps for PersistentChunkStore {
             let mut fragments = self
                 .fragments
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_or_die("persistent_store.fragments");
             let keys: Vec<_> = fragments
                 .keys()
                 .filter(|(c, _)| c == chunk_id)
@@ -648,7 +718,7 @@ impl ChunkOps for PersistentChunkStore {
         let fragments = self
             .fragments
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.fragments");
         fragments
             .keys()
             .filter(|(cid, _)| *cid == target)
@@ -659,7 +729,7 @@ impl ChunkOps for PersistentChunkStore {
     fn snapshot_pools(&self) -> Vec<crate::pool::AffinityPool> {
         self.pools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_die("persistent_store.pools")
             .values()
             .cloned()
             .collect()
@@ -669,7 +739,7 @@ impl ChunkOps for PersistentChunkStore {
         let mut g = self
             .pools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.pools");
         if g.contains_key(&pool.name) {
             return Err(format!("pool {} already exists", pool.name));
         }
@@ -685,7 +755,7 @@ impl ChunkOps for PersistentChunkStore {
         let mut g = self
             .pools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.pools");
         let pool = g
             .get_mut(pool_name)
             .ok_or_else(|| format!("pool {pool_name} not found"))?;
@@ -700,7 +770,7 @@ impl ChunkOps for PersistentChunkStore {
         let mut g = self
             .pools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.pools");
         for pool in g.values_mut() {
             if let Some(idx) = pool.devices.iter().position(|d| d.id == device_id) {
                 pool.devices.remove(idx);
@@ -718,7 +788,7 @@ impl ChunkOps for PersistentChunkStore {
         let mut g = self
             .pools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_or_die("persistent_store.pools");
         let pool = g
             .get_mut(pool_name)
             .ok_or_else(|| format!("pool {pool_name} not found"))?;
@@ -878,5 +948,96 @@ mod tests {
                 assert_eq!(env.ciphertext, vec![i; 256]);
             }
         }
+    }
+
+    /// Bug 5 (GCP 2026-05-04): chunks larger than the bitmap allocator's
+    /// per-extent cap (16 MiB) silently overran into adjacent extent
+    /// space. Subsequent chunk writes overwrote the first chunk's data,
+    /// surfacing as `kiseki_block::file: CRC mismatch — corruption` on
+    /// every read.
+    ///
+    /// Contract: a chunk written to the store must round-trip
+    /// byte-for-byte through `read_chunk`, regardless of size.
+    #[test]
+    fn write_chunk_larger_than_extent_cap_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        let mut store =
+            PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
+
+        // 64 MiB chunk — exceeds the 16 MiB per-extent cap by 4×.
+        let big_ciphertext: Vec<u8> = (0..64usize * 1024 * 1024)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let env = Envelope {
+            ciphertext: big_ciphertext.clone(),
+            auth_tag: [0xAA; 16],
+            nonce: [0xBB; 12],
+            system_epoch: KeyEpoch(1),
+            tenant_epoch: None,
+            tenant_wrapped_material: None,
+            chunk_id: ChunkId([0xC0; 32]),
+        };
+        let chunk_id = env.chunk_id;
+        store.write_chunk(env, "default").unwrap();
+
+        let read_back = store.read_chunk(&chunk_id).unwrap();
+        assert_eq!(
+            read_back.ciphertext.len(),
+            big_ciphertext.len(),
+            "ciphertext length mismatch after round-trip"
+        );
+        assert_eq!(
+            read_back.ciphertext, big_ciphertext,
+            "ciphertext bytes corrupted after round-trip"
+        );
+    }
+
+    /// Bug 5 (sibling write): the GCP repro showed that writing a
+    /// second chunk after a large one corrupts the first. This test
+    /// reproduces that exact pattern.
+    #[test]
+    fn write_large_chunk_then_neighbor_does_not_corrupt_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        let mut store =
+            PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
+
+        let big: Vec<u8> = (0..40usize * 1024 * 1024)
+            .map(|i| u8::try_from(i % 241).unwrap())
+            .collect();
+        let env_a = Envelope {
+            ciphertext: big.clone(),
+            auth_tag: [0xAA; 16],
+            nonce: [0xBB; 12],
+            system_epoch: KeyEpoch(1),
+            tenant_epoch: None,
+            tenant_wrapped_material: None,
+            chunk_id: ChunkId([0xA1; 32]),
+        };
+        store.write_chunk(env_a, "default").unwrap();
+
+        let env_b = Envelope {
+            ciphertext: vec![0x77u8; 8 * 1024 * 1024],
+            auth_tag: [0xCC; 16],
+            nonce: [0xDD; 12],
+            system_epoch: KeyEpoch(1),
+            tenant_epoch: None,
+            tenant_wrapped_material: None,
+            chunk_id: ChunkId([0xB2; 32]),
+        };
+        store.write_chunk(env_b, "default").unwrap();
+
+        let read_a = store.read_chunk(&ChunkId([0xA1; 32])).unwrap();
+        assert_eq!(
+            read_a.ciphertext, big,
+            "first chunk corrupted by neighbor write"
+        );
+        let read_b = store.read_chunk(&ChunkId([0xB2; 32])).unwrap();
+        assert_eq!(read_b.ciphertext, vec![0x77u8; 8 * 1024 * 1024]);
     }
 }
