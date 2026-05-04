@@ -5,8 +5,8 @@
 //!
 //! Spec: `ubiquitous-language.md#MaintenanceMode`.
 
-use std::sync::RwLock;
 use kiseki_common::locks::LockOrDie;
+use std::sync::RwLock;
 
 /// Cluster maintenance mode state.
 pub struct MaintenanceState {

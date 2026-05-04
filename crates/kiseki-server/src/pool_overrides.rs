@@ -27,10 +27,10 @@
 //! `rebalance_id` and operators can see active jobs via
 //! `ListRebalances` (W5 follow-up if needed).
 
+use kiseki_common::locks::LockOrDie;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use kiseki_common::locks::LockOrDie;
 
 /// Per-pool capacity threshold overrides. `None` fields fall
 /// back to the ADR-024 defaults at read time.
@@ -113,10 +113,7 @@ impl PoolOverridesStore {
     /// before writing so a partial set never lands.
     pub fn set(&self, pool_name: &str, thresholds: PoolThresholds) -> Result<(), String> {
         thresholds.validate()?;
-        let mut g = self
-            .inner
-            .lock()
-            .lock_or_die("pool_overrides.inner");
+        let mut g = self.inner.lock().lock_or_die("pool_overrides.inner");
         g.insert(pool_name.to_owned(), thresholds);
         Ok(())
     }
@@ -125,10 +122,7 @@ impl PoolOverridesStore {
     /// set one (callers fall back to ADR-024 defaults).
     #[must_use]
     pub fn get(&self, pool_name: &str) -> Option<PoolThresholds> {
-        let g = self
-            .inner
-            .lock()
-            .lock_or_die("pool_overrides.inner");
+        let g = self.inner.lock().lock_or_die("pool_overrides.inner");
         g.get(pool_name).copied()
     }
 }
@@ -180,10 +174,7 @@ impl RebalanceTracker {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         };
-        let mut g = self
-            .inner
-            .lock()
-            .lock_or_die("pool_overrides.inner");
+        let mut g = self.inner.lock().lock_or_die("pool_overrides.inner");
         if g.len() >= 64 {
             g.remove(0);
         }
@@ -197,10 +188,7 @@ impl RebalanceTracker {
     #[allow(dead_code)]
     #[must_use]
     pub fn snapshot(&self) -> Vec<RebalanceEntry> {
-        let g = self
-            .inner
-            .lock()
-            .lock_or_die("pool_overrides.inner");
+        let g = self.inner.lock().lock_or_die("pool_overrides.inner");
         g.clone()
     }
 }

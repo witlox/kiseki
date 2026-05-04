@@ -159,22 +159,32 @@ impl SessionManager {
 
     pub fn open_file(&self, fh: FileHandle) -> StateId {
         let sid = StateId(*uuid::Uuid::new_v4().as_bytes());
-        self.open_files.lock().lock_or_die("nfs4_server.unknown").insert(
-            sid,
-            OpenState {
-                stateid: sid,
-                file_handle: fh,
-            },
-        );
+        self.open_files
+            .lock()
+            .lock_or_die("nfs4_server.unknown")
+            .insert(
+                sid,
+                OpenState {
+                    stateid: sid,
+                    file_handle: fh,
+                },
+            );
         sid
     }
 
     fn close_file(&self, sid: &StateId) -> bool {
-        self.open_files.lock().lock_or_die("nfs4_server.unknown").remove(sid).is_some()
+        self.open_files
+            .lock()
+            .lock_or_die("nfs4_server.unknown")
+            .remove(sid)
+            .is_some()
     }
 
     fn is_open(&self, sid: &StateId) -> bool {
-        self.open_files.lock().lock_or_die("nfs4_server.unknown").contains_key(sid)
+        self.open_files
+            .lock()
+            .lock_or_die("nfs4_server.unknown")
+            .contains_key(sid)
     }
 
     fn add_lock(&self, sid: StateId, offset: u64, length: u64, write: bool) -> Result<StateId, ()> {
@@ -214,16 +224,27 @@ impl SessionManager {
             sequence_ids: vec![0; slots as usize],
         };
 
-        self.sessions.lock().lock_or_die("nfs4_server.unknown").insert(session_id, session);
+        self.sessions
+            .lock()
+            .lock_or_die("nfs4_server.unknown")
+            .insert(session_id, session);
         session_id
     }
 
     fn get_session(&self, session_id: &[u8; 16]) -> Option<Session> {
-        self.sessions.lock().lock_or_die("nfs4_server.unknown").get(session_id).cloned()
+        self.sessions
+            .lock()
+            .lock_or_die("nfs4_server.unknown")
+            .get(session_id)
+            .cloned()
     }
 
     fn destroy_session(&self, session_id: &[u8; 16]) -> bool {
-        self.sessions.lock().lock_or_die("nfs4_server.unknown").remove(session_id).is_some()
+        self.sessions
+            .lock()
+            .lock_or_die("nfs4_server.unknown")
+            .remove(session_id)
+            .is_some()
     }
 }
 

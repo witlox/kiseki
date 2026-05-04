@@ -250,11 +250,7 @@ impl ServerConfig {
             .unwrap_or("0.0.0.0:111")
         {
             "disabled" | "" => None,
-            other => Some(
-                other
-                    .parse()
-                    .expect("invalid KISEKI_PORTMAP_ADDR"),
-            ),
+            other => Some(other.parse().expect("invalid KISEKI_PORTMAP_ADDR")),
         };
 
         let metrics_addr = std::env::var("KISEKI_METRICS_ADDR")

@@ -164,11 +164,7 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
                 let method = req.method().as_str().to_owned();
                 let started = std::time::Instant::now();
                 let response = next.run(req).await;
-                metric_state.record_request(
-                    &method,
-                    response.status().as_u16(),
-                    started.elapsed(),
-                );
+                metric_state.record_request(&method, response.status().as_u16(), started.elapsed());
                 response
             }
         },
@@ -758,10 +754,7 @@ async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
     // Check and insert bucket — scope the MutexGuard so it is dropped
     // before any `.await` point, keeping the future `Send`.
     let already_exists = {
-        let mut buckets = state
-            .buckets
-            .lock()
-            .lock_or_die("s3_server.buckets");
+        let mut buckets = state.buckets.lock().lock_or_die("s3_server.buckets");
         if buckets.contains(&bucket) {
             true
         } else {
@@ -797,10 +790,7 @@ async fn delete_bucket<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
     Path(bucket): Path<String>,
 ) -> impl IntoResponse {
-    let mut buckets = state
-        .buckets
-        .lock()
-        .lock_or_die("s3_server.buckets");
+    let mut buckets = state.buckets.lock().lock_or_die("s3_server.buckets");
     if buckets.remove(&bucket) {
         StatusCode::NO_CONTENT
     } else {
@@ -813,10 +803,7 @@ async fn head_bucket<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
     Path(bucket): Path<String>,
 ) -> impl IntoResponse {
-    let buckets = state
-        .buckets
-        .lock()
-        .lock_or_die("s3_server.buckets");
+    let buckets = state.buckets.lock().lock_or_die("s3_server.buckets");
     if buckets.contains(&bucket) {
         StatusCode::OK
     } else {
@@ -828,10 +815,7 @@ async fn head_bucket<G: GatewayOps + Send + Sync + 'static>(
 async fn list_buckets<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
 ) -> impl IntoResponse {
-    let buckets = state
-        .buckets
-        .lock()
-        .lock_or_die("s3_server.buckets");
+    let buckets = state.buckets.lock().lock_or_die("s3_server.buckets");
 
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -1063,8 +1047,9 @@ mod tests {
             StatusCode::NOT_FOUND,
             "PUT to unregistered bucket must return 404, not 500",
         );
-        let body_bytes =
-            axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let body = String::from_utf8_lossy(&body_bytes);
         assert!(
             body.contains("NoSuchBucket"),

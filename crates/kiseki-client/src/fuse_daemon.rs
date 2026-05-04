@@ -400,7 +400,6 @@ mod attr_time_tests {
     }
 }
 
-
 #[cfg(all(test, feature = "fuse"))]
 mod concurrency_tests {
     use super::*;
@@ -466,11 +465,8 @@ mod concurrency_tests {
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0xCC; 32], KeyEpoch(1));
-        let backing = InMemoryGateway::new(
-            compositions,
-            kiseki_chunk::arc_async(chunks),
-            master_key,
-        );
+        let backing =
+            InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let max_in_flight = Arc::new(AtomicUsize::new(0));
         let cur_in_flight = Arc::new(AtomicUsize::new(0));
@@ -508,7 +504,10 @@ mod concurrency_tests {
         let r2 = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("second reader timed out — daemon serialized reads behind one lock");
-        assert!(r1.is_ok() && r2.is_ok(), "reads must succeed: {r1:?}, {r2:?}");
+        assert!(
+            r1.is_ok() && r2.is_ok(),
+            "reads must succeed: {r1:?}, {r2:?}"
+        );
         assert!(
             max_in_flight.load(Ordering::SeqCst) >= 2,
             "max in-flight = {}; expected >= 2 for parallel reads",

@@ -61,10 +61,7 @@ impl core::fmt::Debug for InternalProvider {
 
 impl TenantKmsProvider for InternalProvider {
     fn wrap(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, KmsError> {
-        let state = self
-            .inner
-            .lock()
-            .lock_or_die("internal_provider.inner");
+        let state = self.inner.lock().lock_or_die("internal_provider.inner");
 
         let sealing_key = Self::make_aead_key(&state.key)?;
 
@@ -92,10 +89,7 @@ impl TenantKmsProvider for InternalProvider {
             return Err(KmsError::CryptoError("ciphertext too short".into()));
         }
 
-        let state = self
-            .inner
-            .lock()
-            .lock_or_die("internal_provider.inner");
+        let state = self.inner.lock().lock_or_die("internal_provider.inner");
 
         let (nonce_bytes, ct_with_tag) = ciphertext.split_at(GCM_NONCE_LEN);
         let mut nonce_arr = [0u8; GCM_NONCE_LEN];
@@ -113,10 +107,7 @@ impl TenantKmsProvider for InternalProvider {
     }
 
     fn rotate(&self) -> Result<KmsEpochId, KmsError> {
-        let mut state = self
-            .inner
-            .lock()
-            .lock_or_die("internal_provider.inner");
+        let mut state = self.inner.lock().lock_or_die("internal_provider.inner");
 
         let mut new_key = vec![0u8; 32];
         aws_lc_rs::rand::fill(&mut new_key)

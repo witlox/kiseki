@@ -967,10 +967,7 @@ pub async fn run_main(
                     "portmapper listening (NFS3 + MOUNT3 → NFS port)",
                 );
                 std::thread::spawn(move || {
-                    kiseki_gateway::portmap::serve_portmap_listener(
-                        &listener,
-                        advertised_port,
-                    );
+                    kiseki_gateway::portmap::serve_portmap_listener(&listener, advertised_port);
                 });
             }
             Err(e) => {
@@ -1031,9 +1028,7 @@ pub async fn run_main(
     tokio::spawn(async move {
         loop {
             tokio::task::block_in_place(|| {
-                let mut vs = sp_views
-                    .lock()
-                    .lock_or_die("runtime.sp_views");
+                let mut vs = sp_views.lock().lock_or_die("runtime.sp_views");
                 let mut sp = kiseki_view::stream_processor::TrackedStreamProcessor::new(
                     sp_log.as_ref(),
                     &mut *vs,

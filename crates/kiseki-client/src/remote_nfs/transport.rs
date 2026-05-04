@@ -88,7 +88,11 @@ impl RpcTransport {
                 reply.len()
             )));
         }
-        let accept = u32::from_be_bytes(reply[20..24].try_into().expect("byte slice has the exact fixed length required"));
+        let accept = u32::from_be_bytes(
+            reply[20..24]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
         if accept != 0 {
             return Err(GatewayError::ProtocolError(format!(
                 "RPC rejected: accept_stat={accept}"

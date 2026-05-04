@@ -160,19 +160,13 @@ impl RaftShardStore {
         .join()
         .expect("Raft shard creation thread panicked");
 
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("raft_shard_store.shards");
+        let mut shards = self.shards.lock().lock_or_die("raft_shard_store.shards");
         shards.insert(shard_id, store);
     }
 
     /// Look up a shard's Raft store.
     fn get_shard(&self, shard_id: ShardId) -> Result<Arc<OpenRaftLogStore>, LogError> {
-        let shards = self
-            .shards
-            .lock()
-            .lock_or_die("raft_shard_store.shards");
+        let shards = self.shards.lock().lock_or_die("raft_shard_store.shards");
         shards
             .get(&shard_id)
             .cloned()

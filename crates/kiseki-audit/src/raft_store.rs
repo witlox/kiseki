@@ -79,11 +79,7 @@ impl RaftAuditStore {
     /// Get the command log length.
     #[must_use]
     pub fn log_length(&self) -> usize {
-        self.inner
-            .lock()
-            .lock_or_die("raft_store.inner")
-            .log
-            .len()
+        self.inner.lock().lock_or_die("raft_store.inner").log.len()
     }
 
     /// Get a snapshot of the current command log.
@@ -108,10 +104,7 @@ impl RaftAuditStore {
     pub fn from_commands(commands: impl Iterator<Item = (u64, AuditCommand)>) -> Self {
         let store = Self::new();
         {
-            let mut inner = store
-                .inner
-                .lock()
-                .lock_or_die("raft_store.inner");
+            let mut inner = store.inner.lock().lock_or_die("raft_store.inner");
             for (idx, cmd) in commands {
                 inner.log.push((idx, cmd));
             }
@@ -122,10 +115,7 @@ impl RaftAuditStore {
 
     /// Replay the command log to rebuild state (e.g., after snapshot restore).
     pub fn replay(&self) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
 
         let log = inner.log.clone();
         inner.shards.clear();
@@ -238,10 +228,7 @@ impl Default for RaftAuditStore {
 
 impl AuditOps for RaftAuditStore {
     fn append(&self, event: AuditEvent) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
 
         let cmd = AuditCommand::AppendEvent {
             tenant_id: event.tenant_id.map(|o| *o.0.as_bytes()),
@@ -269,10 +256,7 @@ impl AuditOps for RaftAuditStore {
     }
 
     fn query(&self, q: &AuditQuery) -> Vec<AuditEvent> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let inner = self.inner.lock().lock_or_die("raft_store.inner");
         let key = q.tenant_id.map_or(ShardKey::System, ShardKey::Tenant);
         let Some(shard) = inner.shards.get(&key) else {
             return Vec::new();
@@ -289,27 +273,18 @@ impl AuditOps for RaftAuditStore {
     }
 
     fn tip(&self, tenant_id: Option<OrgId>) -> SequenceNumber {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let inner = self.inner.lock().lock_or_die("raft_store.inner");
         let key = tenant_id.map_or(ShardKey::System, ShardKey::Tenant);
         inner.shards.get(&key).map_or(SequenceNumber(0), |s| s.tip)
     }
 
     fn total_events(&self) -> usize {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let inner = self.inner.lock().lock_or_die("raft_store.inner");
         inner.shards.values().map(|s| s.events.len()).sum()
     }
 
     fn tenant_export(&self, tenant_id: OrgId) -> Vec<AuditEvent> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let inner = self.inner.lock().lock_or_die("raft_store.inner");
         let mut events = Vec::new();
         if let Some(shard) = inner.shards.get(&ShardKey::Tenant(tenant_id)) {
             events.extend(shard.events.iter().cloned());

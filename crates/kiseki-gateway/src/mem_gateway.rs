@@ -259,7 +259,10 @@ impl InMemoryGateway {
     /// gateway so a `DeclareWorkflow` RPC is observable to the next
     /// S3 PUT immediately, without an out-of-band sync window.
     pub fn set_workflow_table(&self, table: Arc<std::sync::Mutex<kiseki_advisory::WorkflowTable>>) {
-        *self.workflow_table.write().lock_or_die("mem_gateway.unknown") = Some(table);
+        *self
+            .workflow_table
+            .write()
+            .lock_or_die("mem_gateway.unknown") = Some(table);
     }
 
     /// Snapshot the `workflow_ref` counters as
@@ -279,7 +282,10 @@ impl InMemoryGateway {
     /// runtime wires the registered `kiseki_gateway_workflow_ref_
     /// writes_total` counter so metrics scrapes return live values.
     pub fn set_workflow_ref_writes_metric(&self, counter: Arc<prometheus::IntCounterVec>) {
-        *self.workflow_ref_writes_metric.write().lock_or_die("mem_gateway.unknown") = Some(counter);
+        *self
+            .workflow_ref_writes_metric
+            .write()
+            .lock_or_die("mem_gateway.unknown") = Some(counter);
     }
 
     /// Attach Prometheus counters for chunk byte traffic. The
@@ -291,8 +297,14 @@ impl InMemoryGateway {
         write_bytes: Arc<prometheus::IntCounter>,
         read_bytes: Arc<prometheus::IntCounter>,
     ) {
-        *self.chunk_write_bytes_metric.write().lock_or_die("mem_gateway.unknown") = Some(write_bytes);
-        *self.chunk_read_bytes_metric.write().lock_or_die("mem_gateway.unknown") = Some(read_bytes);
+        *self
+            .chunk_write_bytes_metric
+            .write()
+            .lock_or_die("mem_gateway.unknown") = Some(write_bytes);
+        *self
+            .chunk_read_bytes_metric
+            .write()
+            .lock_or_die("mem_gateway.unknown") = Some(read_bytes);
     }
 
     /// Attach the GET/PUT phase-duration histograms. Once set, the
@@ -308,8 +320,14 @@ impl InMemoryGateway {
         get_phase: Arc<prometheus::HistogramVec>,
         put_phase: Arc<prometheus::HistogramVec>,
     ) {
-        *self.get_phase_duration_metric.write().lock_or_die("mem_gateway.unknown") = Some(get_phase);
-        *self.put_phase_duration_metric.write().lock_or_die("mem_gateway.unknown") = Some(put_phase);
+        *self
+            .get_phase_duration_metric
+            .write()
+            .lock_or_die("mem_gateway.unknown") = Some(get_phase);
+        *self
+            .put_phase_duration_metric
+            .write()
+            .lock_or_die("mem_gateway.unknown") = Some(put_phase);
     }
 
     fn observe_get_phase(&self, phase: &str, dur: std::time::Duration) {
@@ -340,7 +358,10 @@ impl InMemoryGateway {
     /// so subscribed workloads can react. No-op when the bus is absent
     /// (data path never blocks on advisory delivery — I-WA1/I-WA2).
     pub fn set_telemetry_bus(&self, bus: Arc<kiseki_advisory::TelemetryBus>) {
-        *self.telemetry_bus.write().lock_or_die("mem_gateway.unknown") = Some(bus);
+        *self
+            .telemetry_bus
+            .write()
+            .lock_or_die("mem_gateway.unknown") = Some(bus);
     }
 
     /// Emit a per-workload backpressure event through the attached bus.
@@ -353,7 +374,12 @@ impl InMemoryGateway {
         severity: kiseki_advisory::BackpressureSeverity,
         retry_after_ms: u64,
     ) {
-        let Some(bus) = self.telemetry_bus.read().lock_or_die("mem_gateway.unknown").clone() else {
+        let Some(bus) = self
+            .telemetry_bus
+            .read()
+            .lock_or_die("mem_gateway.unknown")
+            .clone()
+        else {
             return;
         };
         bus.emit_backpressure(
@@ -397,7 +423,10 @@ impl InMemoryGateway {
         // Clear composition namespace cache (ephemeral).
         self.compositions.lock().await.clear_namespaces();
         // Clear session tracking.
-        self.last_written_seq.lock().lock_or_die("mem_gateway.unknown").clear();
+        self.last_written_seq
+            .lock()
+            .lock_or_die("mem_gateway.unknown")
+            .clear();
         // Reset counters.
         self.requests_total.store(0, Ordering::Relaxed);
         self.bytes_written.store(0, Ordering::Relaxed);
@@ -578,7 +607,9 @@ impl InMemoryGateway {
         // both code paths.
         if let Some(ref log) = log {
             let hashed_key = kiseki_composition::composition_hash_key(emit_params.2, comp_id);
-            let shard_id = if let Some(ref shard_map) = *self.shard_map.read().lock_or_die("mem_gateway.unknown") {
+            let shard_id = if let Some(ref shard_map) =
+                *self.shard_map.read().lock_or_die("mem_gateway.unknown")
+            {
                 let ns_str = emit_params.2 .0.to_string();
                 if let Ok(map) = shard_map.get(&ns_str, emit_params.1) {
                     kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)
@@ -894,10 +925,7 @@ impl GatewayOps for InMemoryGateway {
             tracing::warn!(error = %e, "gateway read: compositions.get failed");
             GatewayError::Upstream(e.to_string())
         })?;
-        self.observe_get_phase(
-            "composition_lookup",
-            composition_lookup_started.elapsed(),
-        );
+        self.observe_get_phase("composition_lookup", composition_lookup_started.elapsed());
 
         // Verify tenant ownership (I-T1).
         if comp.tenant_id != req.tenant_id {
@@ -1110,9 +1138,7 @@ impl GatewayOps for InMemoryGateway {
                     }
                     Some(table) => {
                         let wf_ref = kiseki_common::advisory::WorkflowRef(handle);
-                        let table = table
-                            .lock()
-                            .lock_or_die("mem_gateway.table");
+                        let table = table.lock().lock_or_die("mem_gateway.table");
                         if table.get(&wf_ref).is_some() {
                             tracing::debug!(
                                 workflow_ref = %uuid::Uuid::from_bytes(handle),
@@ -1226,15 +1252,12 @@ impl GatewayOps for InMemoryGateway {
         let mut landed: Vec<ChunkLanded> = Vec::with_capacity(pieces_len);
 
         for piece in raw_pieces {
-            let chunk_id = derive_chunk_id(
-                piece,
-                self.dedup_policy,
-                self.tenant_hmac_key.as_deref(),
-            )
-            .map_err(|e| {
-                tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
-                GatewayError::Upstream(e.to_string())
-            })?;
+            let chunk_id =
+                derive_chunk_id(piece, self.dedup_policy, self.tenant_hmac_key.as_deref())
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
+                        GatewayError::Upstream(e.to_string())
+                    })?;
 
             let encrypt_started = std::time::Instant::now();
             let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, piece)
@@ -1252,10 +1275,7 @@ impl GatewayOps for InMemoryGateway {
             // fast path so small-object storage is unchanged.
             let mut chunk_was_new = false;
             let chunk_write_started = std::time::Instant::now();
-            if pieces_len == 1
-                && piece_len <= self.inline_threshold
-                && self.small_store.is_some()
-            {
+            if pieces_len == 1 && piece_len <= self.inline_threshold && self.small_store.is_some() {
                 tracing::debug!(
                     ?chunk_id,
                     inline_threshold = self.inline_threshold,
@@ -1300,8 +1320,7 @@ impl GatewayOps for InMemoryGateway {
                 was_new: chunk_was_new,
             });
         }
-        let chunk_ids: Vec<kiseki_common::ids::ChunkId> =
-            landed.iter().map(|l| l.id).collect();
+        let chunk_ids: Vec<kiseki_common::ids::ChunkId> = landed.iter().map(|l| l.id).collect();
 
         // Create composition (sync, fast) — lock released before Raft.
         // Log emission happens after lock release to avoid holding the
@@ -1361,7 +1380,9 @@ impl GatewayOps for InMemoryGateway {
             let hashed_key = kiseki_composition::composition_hash_key(emit_params.2, comp_id);
 
             // ADR-033: route to correct shard via shard map if available.
-            let shard_id = if let Some(ref shard_map) = *self.shard_map.read().lock_or_die("mem_gateway.unknown") {
+            let shard_id = if let Some(ref shard_map) =
+                *self.shard_map.read().lock_or_die("mem_gateway.unknown")
+            {
                 // Convert NamespaceId to string for shard map lookup.
                 let ns_str = emit_params.2 .0.to_string();
                 if let Ok(map) = shard_map.get(&ns_str, emit_params.1) {
@@ -1495,10 +1516,7 @@ impl GatewayOps for InMemoryGateway {
             }
         }
 
-        self.observe_put_phase(
-            "composition_record",
-            composition_record_started.elapsed(),
-        );
+        self.observe_put_phase("composition_record", composition_record_started.elapsed());
         tracing::debug!(comp_id = %comp_id.0, bytes_written, "gateway write: success");
         Ok(WriteResponse {
             composition_id: comp_id,
@@ -1665,7 +1683,9 @@ impl GatewayOps for InMemoryGateway {
             let hashed_key = kiseki_composition::composition_hash_key(namespace_id, composition_id);
             // Resolve the actual write-shard the same way as the
             // Create path (ADR-033 multi-shard routing).
-            let routed_shard = if let Some(ref shard_map) = *self.shard_map.read().lock_or_die("mem_gateway.unknown") {
+            let routed_shard = if let Some(ref shard_map) =
+                *self.shard_map.read().lock_or_die("mem_gateway.unknown")
+            {
                 let ns_str = namespace_id.0.to_string();
                 if let Ok(map) = shard_map.get(&ns_str, tenant_id) {
                     kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)

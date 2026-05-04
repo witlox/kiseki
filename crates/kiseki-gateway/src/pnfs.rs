@@ -633,10 +633,7 @@ impl MdsLayoutManager {
     /// fh4s and by tests that mint synthetic handles.
     #[must_use]
     pub fn current_mac_key(&self) -> PnfsFhMacKey {
-        self.mac_key
-            .read()
-            .lock_or_die("pnfs.mac_key")
-            .clone()
+        self.mac_key.read().lock_or_die("pnfs.mac_key").clone()
     }
 
     /// Configured `stripe_size_bytes` — used by the LAYOUTGET
@@ -656,14 +653,8 @@ impl MdsLayoutManager {
         // Replace the key first — no need to atomically pair this with
         // cache flush, since fh4s minted under the old key already
         // would not match the new key after this point.
-        *self
-            .mac_key
-            .write()
-            .lock_or_die("pnfs.mac_key") = new_key;
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        *self.mac_key.write().lock_or_die("pnfs.mac_key") = new_key;
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         inner.cache.clear();
         // No need to populate `revoked` — old MACs already fail
         // validation against the new key.
@@ -712,10 +703,7 @@ impl MdsLayoutManager {
         // by max_extent). If either condition fails, recompute and
         // update the cache.
         {
-            let inner = self
-                .inner
-                .lock()
-                .lock_or_die("pnfs.inner");
+            let inner = self.inner.lock().lock_or_die("pnfs.inner");
             if let Some(existing) = inner.cache.get(&composition_id) {
                 if now_ms < existing.issued_at_ms.saturating_add(existing.ttl_ms)
                     && layout_covers(existing, offset, length)
@@ -808,10 +796,7 @@ impl MdsLayoutManager {
         };
 
         // Insert + LRU-evict on capacity (I-PN8).
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         inner.cache.insert(composition_id, layout.clone());
         if inner.cache.len() > self.config.max_entries {
             // Evict the entry with the smallest issued_at_ms.
@@ -829,10 +814,7 @@ impl MdsLayoutManager {
 
     /// LAYOUTRETURN. Returns true if state was present.
     pub fn layout_return(&self, composition_id: CompositionId) -> bool {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         inner.cache.remove(&composition_id).is_some()
     }
 
@@ -850,10 +832,7 @@ impl MdsLayoutManager {
     /// subsequent LAYOUTGET returned the cached layout, the kernel
     /// returned it again, and dd hung in `close()`.
     pub fn layout_return_by_stateid(&self, stateid: &[u8; 16]) -> bool {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         let victim = inner
             .cache
             .iter()
@@ -871,10 +850,7 @@ impl MdsLayoutManager {
     /// Returns `None` if no live layout references the device.
     #[must_use]
     pub fn get_device_info(&self, device_id: &[u8; 16]) -> Option<DeviceInfo> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let inner = self.inner.lock().lock_or_die("pnfs.inner");
         for layout in inner.cache.values() {
             for stripe in &layout.stripes {
                 if &stripe.device_id == device_id {
@@ -900,10 +876,7 @@ impl MdsLayoutManager {
     /// number of evicted entries. Called periodically by a background
     /// task (Phase 15c) and directly by tests.
     pub fn sweep_expired(&self, now_ms: u64) -> usize {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         let before = inner.cache.len();
         inner
             .cache
@@ -914,21 +887,14 @@ impl MdsLayoutManager {
     /// Number of entries currently in the cache.
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.inner
-            .lock()
-            .lock_or_die("pnfs.inner")
-            .cache
-            .len()
+        self.inner.lock().lock_or_die("pnfs.inner").cache.len()
     }
 
     /// Has the given fh4's MAC been revoked by a recent recall? The DS
     /// dispatcher consults this before MAC validation (Phase 15c).
     #[must_use]
     pub fn is_revoked(&self, fh: &PnfsFileHandle) -> bool {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let inner = self.inner.lock().lock_or_die("pnfs.inner");
         inner.revoked.contains_key(&fh.mac)
     }
 
@@ -944,10 +910,7 @@ impl MdsLayoutManager {
         now_ms: u64,
     ) -> usize {
         let _ = node_id; // identity is captured in ds_addr for the bus payload
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         let to_remove: Vec<CompositionId> = inner
             .cache
             .iter()
@@ -980,10 +943,7 @@ impl MdsLayoutManager {
         event_hlc_ms: u64,
         now_ms: u64,
     ) -> bool {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         let Some(layout) = inner.cache.remove(&comp) else {
             return false;
         };
@@ -1003,10 +963,7 @@ impl MdsLayoutManager {
     /// `ShardSplit`/`ShardMerged` (no shard-keyed lookup yet) and on
     /// subscriber lag (I-PN9).
     pub fn recall_all(&self, reason: RecallReason, event_hlc_ms: u64, now_ms: u64) -> usize {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         let comps: Vec<CompositionId> = inner.cache.keys().copied().collect();
         let n = comps.len();
         for comp in &comps {
@@ -1038,10 +995,7 @@ impl MdsLayoutManager {
     /// Drop revoked fh4 entries whose underlying expiry has passed —
     /// they would be rejected on the expiry check anyway.
     pub fn sweep_revoked(&self, now_ms: u64) -> usize {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("pnfs.inner");
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
         let before = inner.revoked.len();
         inner.revoked.retain(|_, expiry_ms| now_ms < *expiry_ms);
         before - inner.revoked.len()

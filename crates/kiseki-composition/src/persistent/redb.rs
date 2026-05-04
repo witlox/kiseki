@@ -209,9 +209,8 @@ impl PersistentRedbStorage {
         txn.commit()?;
 
         let cache = LruCache::new(
-            std::num::NonZeroUsize::new(lru_capacity).unwrap_or(
-                std::num::NonZeroUsize::new(1).expect("1 is non-zero by construction"),
-            ),
+            std::num::NonZeroUsize::new(lru_capacity)
+                .unwrap_or(std::num::NonZeroUsize::new(1).expect("1 is non-zero by construction")),
         );
         Ok(Self {
             db: Mutex::new(db),
@@ -275,10 +274,7 @@ impl CompositionStorage for PersistentRedbStorage {
             m.lru_miss_total.inc();
         }
         // redb miss path.
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(COMPOSITIONS)?;
         let key = id.0.as_bytes().as_slice();
@@ -304,10 +300,7 @@ impl CompositionStorage for PersistentRedbStorage {
     }
 
     fn count(&self) -> Result<u64, PersistentStoreError> {
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(COMPOSITIONS)?;
         Ok(table.len()?)
@@ -316,10 +309,7 @@ impl CompositionStorage for PersistentRedbStorage {
     fn list_in_namespace(&self, ns: NamespaceId) -> Result<Vec<Composition>, PersistentStoreError> {
         // v1: full table scan. ADR-040 calls out that a future
         // revision adds a (namespace_id → comp_id) secondary index.
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(COMPOSITIONS)?;
         let mut out = Vec::new();
@@ -339,10 +329,7 @@ impl CompositionStorage for PersistentRedbStorage {
             self.record_decode_error(e);
         })?;
         {
-            let db = self
-                .db
-                .lock()
-                .lock_or_die("redb.db");
+            let db = self.db.lock().lock_or_die("redb.db");
             let txn = db.begin_write()?;
             {
                 let mut table = txn.open_table(COMPOSITIONS)?;
@@ -352,21 +339,14 @@ impl CompositionStorage for PersistentRedbStorage {
         }
         // Cache update happens *after* commit so a reader that sees
         // the cache value also sees the durable record (D3).
-        let push_result = self
-            .cache
-            .lock()
-            .lock_or_die("redb.cache")
-            .push(id, comp);
+        let push_result = self.cache.lock().lock_or_die("redb.cache").push(id, comp);
         self.record_eviction(Self::is_capacity_eviction(push_result.as_ref(), id));
         Ok(())
     }
 
     fn remove(&mut self, id: CompositionId) -> Result<bool, PersistentStoreError> {
         let existed = {
-            let db = self
-                .db
-                .lock()
-                .lock_or_die("redb.db");
+            let db = self.db.lock().lock_or_die("redb.db");
             let txn = db.begin_write()?;
             let existed = {
                 let mut table = txn.open_table(COMPOSITIONS)?;
@@ -390,10 +370,7 @@ impl CompositionStorage for PersistentRedbStorage {
             txn.commit()?;
             existed
         };
-        self.cache
-            .lock()
-            .lock_or_die("redb.cache")
-            .pop(&id);
+        self.cache.lock().lock_or_die("redb.cache").pop(&id);
         Ok(existed)
     }
 
@@ -403,10 +380,7 @@ impl CompositionStorage for PersistentRedbStorage {
         name: &str,
     ) -> Result<Option<CompositionId>, PersistentStoreError> {
         let key = name_key(ns, name);
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(NAMES)?;
         let Some(guard) = table.get(key.as_slice())? else {
@@ -428,10 +402,7 @@ impl CompositionStorage for PersistentRedbStorage {
         &self,
         id: CompositionId,
     ) -> Result<Option<(NamespaceId, String)>, PersistentStoreError> {
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(NAMES_REVERSE)?;
         let Some(guard) = table.get(id.0.as_bytes().as_slice())? else {
@@ -449,10 +420,7 @@ impl CompositionStorage for PersistentRedbStorage {
         id: CompositionId,
     ) -> Result<(), PersistentStoreError> {
         let new_key = name_key(ns, &name);
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_write()?;
         {
             let mut names = txn.open_table(NAMES)?;
@@ -488,10 +456,7 @@ impl CompositionStorage for PersistentRedbStorage {
 
     fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
         let key = name_key(ns, name);
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_write()?;
         let removed = {
             let mut names = txn.open_table(NAMES)?;
@@ -513,10 +478,7 @@ impl CompositionStorage for PersistentRedbStorage {
         ns: NamespaceId,
         prefix: Option<&str>,
     ) -> Result<Vec<(String, CompositionId)>, PersistentStoreError> {
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(NAMES)?;
         // Range scan over the namespace prefix. Keys are
@@ -562,10 +524,7 @@ impl CompositionStorage for PersistentRedbStorage {
     }
 
     fn last_applied_seq(&self) -> Result<SequenceNumber, PersistentStoreError> {
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(META)?;
         let Some(guard) = table.get(meta_keys::LAST_APPLIED_SEQ)? else {
@@ -584,10 +543,7 @@ impl CompositionStorage for PersistentRedbStorage {
     }
 
     fn stuck_state(&self) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError> {
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(META)?;
         let Some(guard) = table.get(meta_keys::STUCK_STATE)? else {
@@ -597,10 +553,7 @@ impl CompositionStorage for PersistentRedbStorage {
     }
 
     fn halted(&self) -> Result<bool, PersistentStoreError> {
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("redb.db");
+        let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(META)?;
         let Some(guard) = table.get(meta_keys::HALTED)? else {
@@ -617,10 +570,7 @@ impl CompositionStorage for PersistentRedbStorage {
         let mut commit_inserts: Vec<Composition> = Vec::new();
 
         {
-            let db = self
-                .db
-                .lock()
-                .lock_or_die("redb.db");
+            let db = self.db.lock().lock_or_die("redb.db");
             let txn = db.begin_write()?;
             {
                 let mut comps = txn.open_table(COMPOSITIONS)?;
@@ -701,10 +651,7 @@ impl CompositionStorage for PersistentRedbStorage {
         // the cache also observes the durable state (D3).
         let mut evictions: u64 = 0;
         {
-            let mut cache = self
-                .cache
-                .lock()
-                .lock_or_die("redb.cache");
+            let mut cache = self.cache.lock().lock_or_die("redb.cache");
             for comp in commit_inserts {
                 let id = comp.id;
                 let push_result = cache.push(id, comp);

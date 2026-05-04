@@ -98,10 +98,7 @@ impl MemKeyStore {
     /// Get the health status of this key store.
     #[must_use]
     pub fn health(&self) -> KeyManagerHealth {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("store.inner");
+        let inner = self.inner.lock().lock_or_die("store.inner");
         KeyManagerHealth {
             status: inner.status,
             epoch_count: inner.epochs.len(),
@@ -115,10 +112,7 @@ impl MemKeyStore {
 
     /// Set the status (for testing failure scenarios).
     pub fn set_status(&self, status: KeyManagerStatus) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("store.inner");
+        let mut inner = self.inner.lock().lock_or_die("store.inner");
         inner.status = status;
     }
 
@@ -155,10 +149,7 @@ impl KeyManagerOps for MemKeyStore {
         &self,
         epoch: KeyEpoch,
     ) -> Result<Arc<SystemMasterKey>, KeyManagerError> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("store.inner");
+        let inner = self.inner.lock().lock_or_die("store.inner");
         if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -171,10 +162,7 @@ impl KeyManagerOps for MemKeyStore {
     }
 
     async fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("store.inner");
+        let inner = self.inner.lock().lock_or_die("store.inner");
         if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -187,10 +175,7 @@ impl KeyManagerOps for MemKeyStore {
     }
 
     async fn rotate(&self) -> Result<KeyEpoch, KeyManagerError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("store.inner");
+        let mut inner = self.inner.lock().lock_or_die("store.inner");
         if inner.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -236,10 +221,7 @@ impl KeyManagerOps for MemKeyStore {
     }
 
     async fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("store.inner");
+        let mut inner = self.inner.lock().lock_or_die("store.inner");
         let entry = inner
             .epochs
             .iter_mut()
@@ -250,10 +232,7 @@ impl KeyManagerOps for MemKeyStore {
     }
 
     async fn list_epochs(&self) -> Vec<EpochInfo> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("store.inner");
+        let inner = self.inner.lock().lock_or_die("store.inner");
         inner
             .epochs
             .iter()

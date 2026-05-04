@@ -110,10 +110,7 @@ impl ChunkEnvelopeRegistry {
         tenant_epoch: Option<kiseki_common::tenancy::KeyEpoch>,
         tenant_wrapped_material: Option<Vec<u8>>,
     ) {
-        let mut map = self
-            .inner
-            .lock()
-            .lock_or_die("server.inner");
+        let mut map = self.inner.lock().lock_or_die("server.inner");
         map.entry(chunk_id).or_insert(EnvelopeMeta {
             auth_tag,
             nonce,

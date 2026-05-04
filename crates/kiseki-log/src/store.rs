@@ -136,10 +136,7 @@ impl MemShardStore {
             range_start: [0u8; 32],
             range_end: [0xff; 32],
         };
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         // Idempotent: don't overwrite if shard already exists (e.g., restored from redb).
         shards.entry(shard_id).or_insert(MemShard {
             info,
@@ -151,10 +148,7 @@ impl MemShardStore {
 
     /// Update a shard's split thresholds (for testing auto-split).
     pub fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         if let Some(shard) = shards.get_mut(&shard_id) {
             shard.info.config = config;
         }
@@ -162,10 +156,7 @@ impl MemShardStore {
 
     /// Set a shard's lifecycle state (ADR-034: merge state transitions).
     pub fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         if let Some(shard) = shards.get_mut(&shard_id) {
             shard.info.state = state;
         }
@@ -178,10 +169,7 @@ impl MemShardStore {
         range_start: [u8; 32],
         range_end: [u8; 32],
     ) {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         if let Some(shard) = shards.get_mut(&shard_id) {
             shard.info.range_start = range_start;
             shard.info.range_end = range_end;
@@ -195,10 +183,7 @@ impl MemShardStore {
         consumer: &str,
         position: SequenceNumber,
     ) -> Result<(), LogError> {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -220,10 +205,7 @@ impl MemShardStore {
         if position.is_buffered_sentinel() {
             return Err(LogError::InvalidRange(shard_id));
         }
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -234,10 +216,7 @@ impl MemShardStore {
     /// Check if the shard should split based on its config (I-L6).
     #[must_use]
     pub fn should_split(&self, shard_id: ShardId) -> bool {
-        let shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let shards = self.shards.lock().lock_or_die("store.shards");
         shards.get(&shard_id).is_some_and(|s| {
             s.info.delta_count >= s.info.config.max_delta_count
                 || s.info.byte_size >= s.info.config.max_byte_size
@@ -251,10 +230,7 @@ impl MemShardStore {
         new_shard_id: ShardId,
         node_id: NodeId,
     ) -> Result<ShardId, LogError> {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -328,10 +304,7 @@ impl Default for MemShardStore {
 #[async_trait::async_trait]
 impl LogOps for MemShardStore {
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
             .get_mut(&req.shard_id)
             .ok_or(LogError::ShardNotFound(req.shard_id))?;
@@ -429,10 +402,7 @@ impl LogOps for MemShardStore {
     }
 
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
-        let shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
             .get(&req.shard_id)
             .ok_or(LogError::ShardNotFound(req.shard_id))?;
@@ -450,10 +420,7 @@ impl LogOps for MemShardStore {
     }
 
     async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
-        let shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let shards = self.shards.lock().lock_or_die("store.shards");
         shards
             .get(&shard_id)
             .map(|s| s.info.clone())
@@ -461,10 +428,7 @@ impl LogOps for MemShardStore {
     }
 
     async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -477,10 +441,7 @@ impl LogOps for MemShardStore {
     }
 
     async fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -507,10 +468,7 @@ impl LogOps for MemShardStore {
     }
 
     async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
             .get_mut(&shard_id)
             .ok_or(LogError::ShardNotFound(shard_id))?;
@@ -598,10 +556,7 @@ impl LogOps for MemShardStore {
         // source's deltas first via compact + a watermark check —
         // out of scope here, the mem store just performs the
         // bookkeeping.
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let source = shards
             .get(&source_shard_id)
             .ok_or(LogError::ShardNotFound(source_shard_id))?

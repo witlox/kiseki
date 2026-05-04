@@ -184,10 +184,7 @@ impl RaftLogStore {
         node_id: NodeId,
         config: ShardConfig,
     ) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         let info = ShardInfo {
             shard_id,
             tenant_id,
@@ -220,10 +217,7 @@ impl RaftLogStore {
         consumer: &str,
         position: SequenceNumber,
     ) -> Result<(), LogError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)
@@ -235,20 +229,14 @@ impl RaftLogStore {
     /// Get the command log length for a shard.
     #[must_use]
     pub fn log_length(&self, shard_id: ShardId) -> usize {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let inner = self.inner.lock().lock_or_die("raft_store.inner");
         inner.logs.get(&shard_id).map_or(0, Vec::len)
     }
 
     /// Apply a command to a shard: append to log, apply to state machine.
     #[allow(clippy::needless_pass_by_value)]
     fn apply_command(&self, shard_id: ShardId, cmd: LogCommand) -> Result<(), LogError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
 
         let log = inner
             .logs
@@ -459,10 +447,7 @@ impl LogOps for RaftLogStore {
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         // Pre-check state and key range.
         {
-            let inner = self
-                .inner
-                .lock()
-                .lock_or_die("raft_store.inner");
+            let inner = self.inner.lock().lock_or_die("raft_store.inner");
             let sm = inner
                 .shards
                 .get(&req.shard_id)
@@ -493,18 +478,12 @@ impl LogOps for RaftLogStore {
 
         self.apply_command(req.shard_id, cmd)?;
 
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let inner = self.inner.lock().lock_or_die("raft_store.inner");
         Ok(inner.shards[&req.shard_id].info.tip)
     }
 
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let inner = self.inner.lock().lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get(&req.shard_id)
@@ -523,10 +502,7 @@ impl LogOps for RaftLogStore {
     }
 
     async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let inner = self.inner.lock().lock_or_die("raft_store.inner");
         inner
             .shards
             .get(&shard_id)
@@ -539,10 +515,7 @@ impl LogOps for RaftLogStore {
     }
 
     async fn truncate_log(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)
@@ -555,10 +528,7 @@ impl LogOps for RaftLogStore {
     }
 
     async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)
@@ -600,10 +570,7 @@ impl LogOps for RaftLogStore {
     }
 
     fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.range_start = range_start;
             sm.info.range_end = range_end;
@@ -611,20 +578,14 @@ impl LogOps for RaftLogStore {
     }
 
     fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.state = state;
         }
     }
 
     fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         if let Some(sm) = inner.shards.get_mut(&shard_id) {
             sm.info.config = config;
         }
@@ -636,10 +597,7 @@ impl LogOps for RaftLogStore {
         consumer: &str,
         position: SequenceNumber,
     ) -> Result<(), LogError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)
@@ -654,10 +612,7 @@ impl LogOps for RaftLogStore {
         consumer: &str,
         position: SequenceNumber,
     ) -> Result<(), LogError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("raft_store.inner");
+        let mut inner = self.inner.lock().lock_or_die("raft_store.inner");
         let sm = inner
             .shards
             .get_mut(&shard_id)

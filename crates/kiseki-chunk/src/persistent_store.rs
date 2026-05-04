@@ -320,10 +320,7 @@ impl ChunkOps for PersistentChunkStore {
         // Hold the chunks lock for the entire operation to prevent a race
         // where two concurrent writes for the same chunk_id both pass the
         // dedup check. The I/O is the bottleneck, not the lock.
-        let mut chunks = self
-            .chunks
-            .lock()
-            .lock_or_die("persistent_store.chunks");
+        let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
 
         // Dedup: if chunk already exists, just bump refcount.
         if let Some(entry) = chunks.get_mut(&chunk_id) {
@@ -362,9 +359,7 @@ impl ChunkOps for PersistentChunkStore {
         // go into `extra_extents`. Empty chunks keep the legacy fields
         // at (0, 0); old metadata files (single extent only)
         // deserialize unchanged.
-        let (first_offset, first_length) = extents
-            .first()
-            .map_or((0, 0), |e| (e.offset, e.length));
+        let (first_offset, first_length) = extents.first().map_or((0, 0), |e| (e.offset, e.length));
         let extra_extents: Vec<(u64, u64)> = extents
             .iter()
             .skip(1)
@@ -389,10 +384,7 @@ impl ChunkOps for PersistentChunkStore {
 
         // Update pool usage (use data_bytes for accurate capacity accounting).
         {
-            let mut pools = self
-                .pools
-                .lock()
-                .lock_or_die("persistent_store.pools");
+            let mut pools = self.pools.lock().lock_or_die("persistent_store.pools");
             if let Some(p) = pools.get_mut(pool) {
                 p.used_bytes += data_bytes;
             }
@@ -419,10 +411,7 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
-        let chunks = self
-            .chunks
-            .lock()
-            .lock_or_die("persistent_store.chunks");
+        let chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -430,10 +419,7 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        let mut chunks = self
-            .chunks
-            .lock()
-            .lock_or_die("persistent_store.chunks");
+        let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -449,10 +435,7 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn decrement_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        let mut chunks = self
-            .chunks
-            .lock()
-            .lock_or_die("persistent_store.chunks");
+        let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -471,10 +454,7 @@ impl ChunkOps for PersistentChunkStore {
         chunk_id: &ChunkId,
         hold_name: &str,
     ) -> Result<(), ChunkError> {
-        let mut chunks = self
-            .chunks
-            .lock()
-            .lock_or_die("persistent_store.chunks");
+        let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -498,10 +478,7 @@ impl ChunkOps for PersistentChunkStore {
         chunk_id: &ChunkId,
         hold_name: &str,
     ) -> Result<(), ChunkError> {
-        let mut chunks = self
-            .chunks
-            .lock()
-            .lock_or_die("persistent_store.chunks");
+        let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
@@ -571,10 +548,7 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        let chunks = self
-            .chunks
-            .lock()
-            .lock_or_die("persistent_store.chunks");
+        let chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         chunks
             .get(chunk_id)
             .map(|e| e.envelope_meta.refcount)
@@ -585,10 +559,7 @@ impl ChunkOps for PersistentChunkStore {
     /// loaded for this node. Used by the orphan-fragment scrub and by
     /// `/admin/chunk/{id}` to answer "is this chunk present locally?".
     fn list_chunk_ids(&self) -> Vec<ChunkId> {
-        let chunks = self
-            .chunks
-            .lock()
-            .lock_or_die("persistent_store.chunks");
+        let chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         chunks.keys().copied().collect()
     }
 
@@ -696,10 +667,7 @@ impl ChunkOps for PersistentChunkStore {
         // for fragment_index=0). Removes from chunks map AND frees the
         // device extent, bypassing refcount (test-only).
         let chunk_entry = {
-            let mut chunks = self
-                .chunks
-                .lock()
-                .lock_or_die("persistent_store.chunks");
+            let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
             chunks.remove(chunk_id)
         };
         if let Some(entry) = chunk_entry {
@@ -758,10 +726,7 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn add_pool_checked(&mut self, pool: crate::pool::AffinityPool) -> Result<(), String> {
-        let mut g = self
-            .pools
-            .lock()
-            .lock_or_die("persistent_store.pools");
+        let mut g = self.pools.lock().lock_or_die("persistent_store.pools");
         if g.contains_key(&pool.name) {
             return Err(format!("pool {} already exists", pool.name));
         }
@@ -774,10 +739,7 @@ impl ChunkOps for PersistentChunkStore {
         pool_name: &str,
         device: crate::pool::PoolDevice,
     ) -> Result<(), String> {
-        let mut g = self
-            .pools
-            .lock()
-            .lock_or_die("persistent_store.pools");
+        let mut g = self.pools.lock().lock_or_die("persistent_store.pools");
         let pool = g
             .get_mut(pool_name)
             .ok_or_else(|| format!("pool {pool_name} not found"))?;
@@ -789,10 +751,7 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn remove_device(&mut self, device_id: &str) -> Result<(), String> {
-        let mut g = self
-            .pools
-            .lock()
-            .lock_or_die("persistent_store.pools");
+        let mut g = self.pools.lock().lock_or_die("persistent_store.pools");
         for pool in g.values_mut() {
             if let Some(idx) = pool.devices.iter().position(|d| d.id == device_id) {
                 pool.devices.remove(idx);
@@ -807,10 +766,7 @@ impl ChunkOps for PersistentChunkStore {
         pool_name: &str,
         strategy: crate::pool::DurabilityStrategy,
     ) -> Result<(), String> {
-        let mut g = self
-            .pools
-            .lock()
-            .lock_or_die("persistent_store.pools");
+        let mut g = self.pools.lock().lock_or_die("persistent_store.pools");
         let pool = g
             .get_mut(pool_name)
             .ok_or_else(|| format!("pool {pool_name} not found"))?;
@@ -1043,7 +999,10 @@ mod tests {
         let chunk_id = env.chunk_id;
         store.write_chunk(env, "default").unwrap();
         let read_back = store.read_chunk(&chunk_id).unwrap();
-        assert!(read_back.ciphertext.is_empty(), "empty chunk must round-trip empty");
+        assert!(
+            read_back.ciphertext.is_empty(),
+            "empty chunk must round-trip empty"
+        );
     }
 
     /// Bug 5 (sibling write): the GCP repro showed that writing a

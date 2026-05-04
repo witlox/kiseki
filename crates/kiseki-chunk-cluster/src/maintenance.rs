@@ -53,10 +53,7 @@ impl MaintenanceMode {
     /// the per-shard entry on first call. Returns the previous
     /// value (default `false`).
     pub fn set(&self, shard: ShardId, enabled: bool) -> bool {
-        let mut g = self
-            .inner
-            .lock()
-            .lock_or_die("maintenance.inner");
+        let mut g = self.inner.lock().lock_or_die("maintenance.inner");
         let entry = g.entry(shard).or_insert_with(|| AtomicBool::new(false));
         // SeqCst across reads/writes — operators flipping
         // maintenance want immediate global visibility on the
@@ -68,10 +65,7 @@ impl MaintenanceMode {
     /// the shard has never been touched (default).
     #[must_use]
     pub fn is_in_maintenance(&self, shard: ShardId) -> bool {
-        let g = self
-            .inner
-            .lock()
-            .lock_or_die("maintenance.inner");
+        let g = self.inner.lock().lock_or_die("maintenance.inner");
         g.get(&shard).is_some_and(|f| f.load(Ordering::SeqCst))
     }
 }

@@ -150,15 +150,9 @@ impl FileBackedDevice {
 
     /// Flush the bitmap to both primary and mirror regions on the file.
     fn flush_bitmap(&self) -> Result<(), BlockError> {
-        let alloc = self
-            .allocator
-            .lock()
-            .lock_or_die("file.allocator");
+        let alloc = self.allocator.lock().lock_or_die("file.allocator");
         let bitmap = alloc.bitmap_bytes();
-        let mut file = self
-            .file
-            .lock()
-            .lock_or_die("file.file");
+        let mut file = self.file.lock().lock_or_die("file.file");
 
         // Write primary.
         file.seek(SeekFrom::Start(self.superblock.bitmap_offset))?;
@@ -176,10 +170,7 @@ impl DeviceBackend for FileBackedDevice {
     fn alloc(&self, size: u64) -> Result<Extent, AllocError> {
         // Add overhead (length header + CRC32 trailer).
         let total = size + OVERHEAD as u64;
-        let mut alloc = self
-            .allocator
-            .lock()
-            .lock_or_die("file.allocator");
+        let mut alloc = self.allocator.lock().lock_or_die("file.allocator");
         alloc.alloc(total)
     }
 
@@ -220,10 +211,7 @@ impl DeviceBackend for FileBackedDevice {
         #[allow(clippy::cast_possible_truncation)] // guarded by check above
         let data_len = data.len() as u32;
 
-        let mut file = self
-            .file
-            .lock()
-            .lock_or_die("file.file");
+        let mut file = self.file.lock().lock_or_die("file.file");
 
         file.seek(SeekFrom::Start(abs_offset)).inspect_err(|e| {
             tracing::warn!(error = %e, "block file write: seek failed");
@@ -248,10 +236,7 @@ impl DeviceBackend for FileBackedDevice {
     fn read(&self, extent: &Extent) -> Result<Vec<u8>, BlockError> {
         let abs_offset = self.superblock.data_offset + extent.offset;
 
-        let mut file = self
-            .file
-            .lock()
-            .lock_or_die("file.file");
+        let mut file = self.file.lock().lock_or_die("file.file");
 
         // Read length header (4 bytes).
         let mut len_buf = [0u8; HEADER_SIZE];
@@ -315,28 +300,19 @@ impl DeviceBackend for FileBackedDevice {
     }
 
     fn free(&self, extent: &Extent) -> Result<(), AllocError> {
-        let mut alloc = self
-            .allocator
-            .lock()
-            .lock_or_die("file.allocator");
+        let mut alloc = self.allocator.lock().lock_or_die("file.allocator");
         alloc.free(extent)
     }
 
     fn sync(&self) -> Result<(), BlockError> {
         self.flush_bitmap()?;
-        let file = self
-            .file
-            .lock()
-            .lock_or_die("file.file");
+        let file = self.file.lock().lock_or_die("file.file");
         file.sync_all()?;
         Ok(())
     }
 
     fn capacity(&self) -> (u64, u64) {
-        let alloc = self
-            .allocator
-            .lock()
-            .lock_or_die("file.allocator");
+        let alloc = self.allocator.lock().lock_or_die("file.allocator");
         (alloc.used_bytes(), alloc.total_bytes())
     }
 
@@ -349,10 +325,7 @@ impl DeviceBackend for FileBackedDevice {
     }
 
     fn bitmap_bytes(&self) -> Vec<u8> {
-        let alloc = self
-            .allocator
-            .lock()
-            .lock_or_die("file.allocator");
+        let alloc = self.allocator.lock().lock_or_die("file.allocator");
         alloc.bitmap_bytes().to_vec()
     }
 }

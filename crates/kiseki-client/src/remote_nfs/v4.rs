@@ -300,7 +300,9 @@ impl Nfs4Client {
         parts: &[(u64, Vec<u8>)],
     ) -> Result<CompositionId, GatewayError> {
         let mut guard = self.ensure_session().await?;
-        let sess = guard.as_mut().expect("session not initialized — call connect_v41() first");
+        let sess = guard
+            .as_mut()
+            .expect("session not initialized — call connect_v41() first");
 
         let filename = uuid::Uuid::new_v4().to_string();
         let putrootfh = (op::PUTROOTFH, Vec::new());
@@ -402,7 +404,9 @@ impl Nfs4Client {
 impl GatewayOps for Nfs4Client {
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         let mut guard = self.ensure_session().await?;
-        let sess = guard.as_mut().expect("session not initialized — call connect_v41() first");
+        let sess = guard
+            .as_mut()
+            .expect("session not initialized — call connect_v41() first");
 
         let filename = uuid::Uuid::new_v4().to_string();
 
@@ -527,7 +531,9 @@ impl GatewayOps for Nfs4Client {
 
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
         let mut guard = self.ensure_session().await?;
-        let sess = guard.as_mut().expect("session not initialized — call connect_v41() first");
+        let sess = guard
+            .as_mut()
+            .expect("session not initialized — call connect_v41() first");
 
         let filename = req.composition_id.0.to_string();
 
@@ -566,12 +572,24 @@ impl GatewayOps for Nfs4Client {
         if r.len() < 16 {
             return Err(GatewayError::ProtocolError("READ reply short".into()));
         }
-        let st = u32::from_be_bytes(r[4..8].try_into().expect("byte slice has the exact fixed length required"));
+        let st = u32::from_be_bytes(
+            r[4..8]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
         if st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("READ: {st}")));
         }
-        let eof = u32::from_be_bytes(r[8..12].try_into().expect("byte slice has the exact fixed length required")) != 0;
-        let data_len = u32::from_be_bytes(r[12..16].try_into().expect("byte slice has the exact fixed length required")) as usize;
+        let eof = u32::from_be_bytes(
+            r[8..12]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        ) != 0;
+        let data_len = u32::from_be_bytes(
+            r[12..16]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        ) as usize;
         let data = r[16..16 + data_len].to_vec();
 
         Ok(ReadResponse {
@@ -596,7 +614,9 @@ impl GatewayOps for Nfs4Client {
         composition_id: CompositionId,
     ) -> Result<(), GatewayError> {
         let mut guard = self.ensure_session().await?;
-        let sess = guard.as_mut().expect("session not initialized — call connect_v41() first");
+        let sess = guard
+            .as_mut()
+            .expect("session not initialized — call connect_v41() first");
 
         let putrootfh = (op::PUTROOTFH, Vec::new());
 

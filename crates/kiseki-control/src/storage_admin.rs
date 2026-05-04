@@ -142,7 +142,10 @@ impl StorageAdminService {
 
     /// Get recorded device health events.
     pub fn health_events(&self) -> Vec<DeviceHealthEvent> {
-        self.health_events.read().lock_or_die("storage_admin.unknown").clone()
+        self.health_events
+            .read()
+            .lock_or_die("storage_admin.unknown")
+            .clone()
     }
 
     /// Generate a synthetic IO stats event for a pool.
@@ -160,13 +163,19 @@ impl StorageAdminService {
     /// Set the inline data threshold in bytes (ADR-030).
     /// Changes are prospective only — existing deltas are not affected (I-L9).
     pub fn set_inline_threshold(&self, bytes: u64) {
-        *self.inline_threshold_bytes.write().lock_or_die("storage_admin.unknown") = bytes;
+        *self
+            .inline_threshold_bytes
+            .write()
+            .lock_or_die("storage_admin.unknown") = bytes;
     }
 
     /// Get the current inline data threshold in bytes.
     #[must_use]
     pub fn inline_threshold(&self) -> u64 {
-        *self.inline_threshold_bytes.read().lock_or_die("storage_admin.unknown")
+        *self
+            .inline_threshold_bytes
+            .read()
+            .lock_or_die("storage_admin.unknown")
     }
 
     /// Attempt to change a tenant quota via `StorageAdminService`.
@@ -196,13 +205,22 @@ impl StorageAdminService {
     /// Get pool info.
     #[must_use]
     pub fn get_pool(&self, name: &str) -> Option<StoragePool> {
-        self.pools.read().lock_or_die("storage_admin.unknown").get(name).cloned()
+        self.pools
+            .read()
+            .lock_or_die("storage_admin.unknown")
+            .get(name)
+            .cloned()
     }
 
     /// List all pools.
     #[must_use]
     pub fn list_pools(&self) -> Vec<StoragePool> {
-        self.pools.read().lock_or_die("storage_admin.unknown").values().cloned().collect()
+        self.pools
+            .read()
+            .lock_or_die("storage_admin.unknown")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Delete a pool (must be empty). Requires admin role.
@@ -269,11 +287,14 @@ impl StorageAdminService {
         let old_status = dev.status;
         dev.status = status;
         // Record health event.
-        self.health_events.write().lock_or_die("storage_admin.unknown").push(DeviceHealthEvent {
-            device_id: device_id.to_owned(),
-            old_status,
-            new_status: status,
-        });
+        self.health_events
+            .write()
+            .lock_or_die("storage_admin.unknown")
+            .push(DeviceHealthEvent {
+                device_id: device_id.to_owned(),
+                old_status,
+                new_status: status,
+            });
         Ok(())
     }
 

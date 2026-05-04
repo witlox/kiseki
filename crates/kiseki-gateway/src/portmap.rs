@@ -334,6 +334,10 @@ mod tests {
         for _ in 0..6 {
             let _ = r.read_u32().unwrap();
         }
-        assert_eq!(r.read_u32().unwrap(), 0, "unmapped programs must return port 0");
+        assert_eq!(
+            r.read_u32().unwrap(),
+            0,
+            "unmapped programs must return port 0"
+        );
     }
 }

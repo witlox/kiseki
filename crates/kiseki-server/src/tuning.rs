@@ -44,10 +44,10 @@
 
 use std::sync::Arc;
 
+use kiseki_common::locks::LockOrDie;
 use kiseki_proto::v1 as pb;
 use tokio::sync::{watch, RwLock};
 use tonic::Status;
-use kiseki_common::locks::LockOrDie;
 
 /// All 8 cluster-wide tuning parameters from ADR-025. Defaults
 /// match the proto comments verbatim.
@@ -348,10 +348,7 @@ impl TuningPersistence for RedbTuningPersistence {
     fn persist(&self, params: &TuningParams) -> Result<(), TuningStoreError> {
         let bytes =
             postcard::to_allocvec(params).map_err(|e| TuningStoreError::Decode(e.to_string()))?;
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("tuning.db");
+        let db = self.db.lock().lock_or_die("tuning.db");
         let txn = db
             .begin_write()
             .map_err(|e| TuningStoreError::Redb(e.to_string()))?;
@@ -369,10 +366,7 @@ impl TuningPersistence for RedbTuningPersistence {
 
     fn load(&self) -> Result<Option<TuningParams>, TuningStoreError> {
         use ::redb::ReadableDatabase;
-        let db = self
-            .db
-            .lock()
-            .lock_or_die("tuning.db");
+        let db = self.db.lock().lock_or_die("tuning.db");
         let txn = db
             .begin_read()
             .map_err(|e| TuningStoreError::Redb(e.to_string()))?;

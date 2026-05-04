@@ -150,9 +150,7 @@ fn process_hint_json(
     }
 
     // Budget check.
-    let mut b = budget
-        .lock()
-        .lock_or_warn("stream.budget");
+    let mut b = budget.lock().lock_or_warn("stream.budget");
     match b.try_hint() {
         Ok(()) => (true, None),
         Err(e) => (false, Some(format!("budget_exceeded: {e}"))),

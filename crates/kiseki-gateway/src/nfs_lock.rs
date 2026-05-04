@@ -8,9 +8,9 @@
 //! concurrent readers. Write locks are exclusive — no other locks
 //! (read or write) may overlap.
 
+use kiseki_common::locks::LockOrDie;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use kiseki_common::locks::LockOrDie;
 
 /// Lock type per `NFSv4` spec.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,10 +203,7 @@ impl LockManager {
             acquired_at_ms: now_ms,
             lease_ms: self.default_lease_ms,
         };
-        let mut state = self
-            .state
-            .lock()
-            .lock_or_die("nfs_lock.state");
+        let mut state = self.state.lock().lock_or_die("nfs_lock.state");
         state.entry(file_handle).or_default().try_lock(lock, now_ms)
     }
 
@@ -218,10 +215,7 @@ impl LockManager {
         offset: u64,
         length: u64,
     ) -> Result<(), LockError> {
-        let mut state = self
-            .state
-            .lock()
-            .lock_or_die("nfs_lock.state");
+        let mut state = self.state.lock().lock_or_die("nfs_lock.state");
         state
             .entry(file_handle)
             .or_default()
@@ -239,10 +233,7 @@ impl LockManager {
         owner: &str,
         now_ms: u64,
     ) -> Option<ByteRangeLock> {
-        let state = self
-            .state
-            .lock()
-            .lock_or_die("nfs_lock.state");
+        let state = self.state.lock().lock_or_die("nfs_lock.state");
         state.get(&file_handle).and_then(|fs| {
             fs.test_lock(lock_type, offset, length, owner, now_ms)
                 .cloned()
@@ -251,10 +242,7 @@ impl LockManager {
 
     /// Expire all stale locks across all files. Returns total expired.
     pub fn expire_all(&self, now_ms: u64) -> u64 {
-        let mut state = self
-            .state
-            .lock()
-            .lock_or_die("nfs_lock.state");
+        let mut state = self.state.lock().lock_or_die("nfs_lock.state");
         let mut total = 0;
         for fs in state.values_mut() {
             total += fs.expire(now_ms);
@@ -267,10 +255,7 @@ impl LockManager {
     /// Count total active locks.
     #[must_use]
     pub fn lock_count(&self) -> usize {
-        let state = self
-            .state
-            .lock()
-            .lock_or_die("nfs_lock.state");
+        let state = self.state.lock().lock_or_die("nfs_lock.state");
         state.values().map(|fs| fs.locks.len()).sum()
     }
 }

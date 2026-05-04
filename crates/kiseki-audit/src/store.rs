@@ -83,10 +83,7 @@ impl Default for AuditLog {
 
 impl AuditOps for AuditLog {
     fn append(&self, mut event: AuditEvent) {
-        let mut shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
         let key = event.tenant_id.map_or(ShardKey::System, ShardKey::Tenant);
         let shard = shards.entry(key).or_insert_with(|| AuditShard {
             events: Vec::new(),
@@ -100,10 +97,7 @@ impl AuditOps for AuditLog {
     }
 
     fn query(&self, q: &AuditQuery) -> Vec<AuditEvent> {
-        let shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let shards = self.shards.lock().lock_or_die("store.shards");
         let key = q.tenant_id.map_or(ShardKey::System, ShardKey::Tenant);
         let Some(shard) = shards.get(&key) else {
             return Vec::new();
@@ -120,27 +114,18 @@ impl AuditOps for AuditLog {
     }
 
     fn tip(&self, tenant_id: Option<OrgId>) -> SequenceNumber {
-        let shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let shards = self.shards.lock().lock_or_die("store.shards");
         let key = tenant_id.map_or(ShardKey::System, ShardKey::Tenant);
         shards.get(&key).map_or(SequenceNumber(0), |s| s.tip)
     }
 
     fn total_events(&self) -> usize {
-        let shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let shards = self.shards.lock().lock_or_die("store.shards");
         shards.values().map(|s| s.events.len()).sum()
     }
 
     fn tenant_export(&self, tenant_id: OrgId) -> Vec<AuditEvent> {
-        let shards = self
-            .shards
-            .lock()
-            .lock_or_die("store.shards");
+        let shards = self.shards.lock().lock_or_die("store.shards");
         let mut events = Vec::new();
 
         if let Some(shard) = shards.get(&ShardKey::Tenant(tenant_id)) {

@@ -155,9 +155,7 @@ impl AdvisoryGrpc {
 
         // Budget check.
         let outcome = {
-            let mut b = budget
-                .lock()
-                .lock_or_warn("grpc.budget");
+            let mut b = budget.lock().lock_or_warn("grpc.budget");
             match b.try_hint() {
                 Ok(()) => {
                     tracing::debug!("advisory hint accepted");
@@ -195,10 +193,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
 
         // Budget check.
         {
-            let mut budget = self
-                .budget
-                .lock()
-                .lock_or_warn("grpc.budget");
+            let mut budget = self.budget.lock().lock_or_warn("grpc.budget");
             if let Err(e) = budget.try_declare() {
                 return Ok(Response::new(DeclareWorkflowResponse {
                     outcome: Some(declare_workflow_response::Outcome::Error(
@@ -215,10 +210,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         let handle = uuid::Uuid::new_v4().into_bytes();
         let wf_ref = WorkflowRef(handle);
 
-        let mut table = self
-            .table
-            .lock()
-            .lock_or_warn("grpc.table");
+        let mut table = self.table.lock().lock_or_warn("grpc.table");
         table.declare(wf_ref, profile, phase);
 
         Ok(Response::new(DeclareWorkflowResponse {
@@ -239,17 +231,11 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         let req = request.into_inner();
         let wf_ref = extract_wf_ref(req.correlation.as_ref())?;
 
-        let mut table = self
-            .table
-            .lock()
-            .lock_or_warn("grpc.table");
+        let mut table = self.table.lock().lock_or_warn("grpc.table");
         let ended = table.end(&wf_ref);
 
         if ended {
-            let mut budget = self
-                .budget
-                .lock()
-                .lock_or_warn("grpc.budget");
+            let mut budget = self.budget.lock().lock_or_warn("grpc.budget");
             budget.release_workflow();
         }
 
@@ -266,10 +252,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         let req = request.into_inner();
         let wf_ref = extract_wf_ref(req.correlation.as_ref())?;
 
-        let mut table = self
-            .table
-            .lock()
-            .lock_or_warn("grpc.table");
+        let mut table = self.table.lock().lock_or_warn("grpc.table");
         let entry = table
             .get_mut(&wf_ref)
             .ok_or_else(|| Status::not_found("workflow not found"))?;
@@ -295,10 +278,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
         let req = request.into_inner();
         let wf_ref = extract_wf_ref(req.correlation.as_ref())?;
 
-        let table = self
-            .table
-            .lock()
-            .lock_or_warn("grpc.table");
+        let table = self.table.lock().lock_or_warn("grpc.table");
         let entry = table
             .get(&wf_ref)
             .ok_or_else(|| Status::not_found("workflow not found"))?;
@@ -344,10 +324,7 @@ impl WorkflowAdvisoryService for AdvisoryGrpc {
 
         // Verify the workflow exists.
         {
-            let tbl = self
-                .table
-                .lock()
-                .lock_or_warn("grpc.table");
+            let tbl = self.table.lock().lock_or_warn("grpc.table");
             if tbl.get(&bound_wf_ref).is_none() {
                 return Err(Status::not_found("workflow not found"));
             }

@@ -103,7 +103,11 @@ impl Superblock {
             return Err(BlockError::NotInitialized);
         }
 
-        let version = u32::from_le_bytes(buf[8..12].try_into().expect("byte slice has the exact fixed length required"));
+        let version = u32::from_le_bytes(
+            buf[8..12]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
         if version != FORMAT_VERSION {
             return Err(BlockError::InvalidSuperblock(format!(
                 "unsupported version {version}"
@@ -113,13 +117,41 @@ impl Superblock {
         let mut device_id = [0u8; 16];
         device_id.copy_from_slice(&buf[12..28]);
 
-        let block_size = u32::from_le_bytes(buf[28..32].try_into().expect("byte slice has the exact fixed length required"));
-        let total_blocks = u64::from_le_bytes(buf[32..40].try_into().expect("byte slice has the exact fixed length required"));
-        let bitmap_offset = u64::from_le_bytes(buf[40..48].try_into().expect("byte slice has the exact fixed length required"));
-        let bitmap_mirror_offset = u64::from_le_bytes(buf[48..56].try_into().expect("byte slice has the exact fixed length required"));
-        let bitmap_blocks = u64::from_le_bytes(buf[56..64].try_into().expect("byte slice has the exact fixed length required"));
-        let data_offset = u64::from_le_bytes(buf[64..72].try_into().expect("byte slice has the exact fixed length required"));
-        let generation = u64::from_le_bytes(buf[72..80].try_into().expect("byte slice has the exact fixed length required"));
+        let block_size = u32::from_le_bytes(
+            buf[28..32]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
+        let total_blocks = u64::from_le_bytes(
+            buf[32..40]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
+        let bitmap_offset = u64::from_le_bytes(
+            buf[40..48]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
+        let bitmap_mirror_offset = u64::from_le_bytes(
+            buf[48..56]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
+        let bitmap_blocks = u64::from_le_bytes(
+            buf[56..64]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
+        let data_offset = u64::from_le_bytes(
+            buf[64..72]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
+        let generation = u64::from_le_bytes(
+            buf[72..80]
+                .try_into()
+                .expect("byte slice has the exact fixed length required"),
+        );
 
         // Validate parsed fields.
         if block_size == 0 || !block_size.is_power_of_two() {

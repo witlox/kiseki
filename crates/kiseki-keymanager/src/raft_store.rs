@@ -179,18 +179,12 @@ impl RaftKeyStore {
     /// Returns the log index assigned to this command.
     #[allow(clippy::needless_pass_by_value)] // cmd is logged + applied; taking by value is clearer
     pub fn apply_command(&self, cmd: KeyCommand) -> u64 {
-        let mut log = self
-            .log
-            .lock()
-            .lock_or_die("raft_store.log");
+        let mut log = self.log.lock().lock_or_die("raft_store.log");
         let index = log.len() as u64 + 1;
         log.push((index, cmd.clone()));
         drop(log);
 
-        let mut state = self
-            .state
-            .lock()
-            .lock_or_die("raft_store.state");
+        let mut state = self.state.lock().lock_or_die("raft_store.state");
         state.apply(index, &cmd);
         index
     }
@@ -198,10 +192,7 @@ impl RaftKeyStore {
     /// Get a snapshot of the current command log.
     #[must_use]
     pub fn command_log(&self) -> Vec<(u64, KeyCommand)> {
-        self.log
-            .lock()
-            .lock_or_die("raft_store.log")
-            .clone()
+        self.log.lock().lock_or_die("raft_store.log").clone()
     }
 
     /// Reconstruct a `RaftKeyStore` from a persisted command log.
@@ -214,17 +205,11 @@ impl RaftKeyStore {
             log: Mutex::new(Vec::new()),
         };
         for (idx, cmd) in commands {
-            let mut log = store
-                .log
-                .lock()
-                .lock_or_die("raft_store.log");
+            let mut log = store.log.lock().lock_or_die("raft_store.log");
             log.push((idx, cmd.clone()));
             drop(log);
 
-            let mut state = store
-                .state
-                .lock()
-                .lock_or_die("raft_store.state");
+            let mut state = store.state.lock().lock_or_die("raft_store.state");
             state.apply(idx, &cmd);
         }
         Ok(store)
@@ -233,19 +218,13 @@ impl RaftKeyStore {
     /// Get the command log length.
     #[must_use]
     pub fn log_length(&self) -> usize {
-        self.log
-            .lock()
-            .lock_or_die("raft_store.log")
-            .len()
+        self.log.lock().lock_or_die("raft_store.log").len()
     }
 
     /// Get health status.
     #[must_use]
     pub fn health(&self) -> KeyManagerHealth {
-        let state = self
-            .state
-            .lock()
-            .lock_or_die("raft_store.state");
+        let state = self.state.lock().lock_or_die("raft_store.state");
         KeyManagerHealth {
             status: state.status,
             epoch_count: state.epochs.len(),
@@ -259,14 +238,8 @@ impl RaftKeyStore {
 
     /// Replay the log to rebuild state (e.g., after snapshot restore).
     pub fn replay(&self) {
-        let log = self
-            .log
-            .lock()
-            .lock_or_die("raft_store.log");
-        let mut state = self
-            .state
-            .lock()
-            .lock_or_die("raft_store.state");
+        let log = self.log.lock().lock_or_die("raft_store.log");
+        let mut state = self.state.lock().lock_or_die("raft_store.state");
         *state = StateMachine::new();
         for (index, cmd) in log.iter() {
             state.apply(*index, cmd);
@@ -280,10 +253,7 @@ impl KeyManagerOps for RaftKeyStore {
         &self,
         epoch: KeyEpoch,
     ) -> Result<Arc<SystemMasterKey>, KeyManagerError> {
-        let state = self
-            .state
-            .lock()
-            .lock_or_die("raft_store.state");
+        let state = self.state.lock().lock_or_die("raft_store.state");
         if state.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -296,10 +266,7 @@ impl KeyManagerOps for RaftKeyStore {
     }
 
     async fn current_epoch(&self) -> Result<KeyEpoch, KeyManagerError> {
-        let state = self
-            .state
-            .lock()
-            .lock_or_die("raft_store.state");
+        let state = self.state.lock().lock_or_die("raft_store.state");
         if state.status == KeyManagerStatus::Unavailable {
             return Err(KeyManagerError::Unavailable);
         }
@@ -318,10 +285,7 @@ impl KeyManagerOps for RaftKeyStore {
             .map_err(|_| KeyManagerError::KeyGenerationFailed)?;
 
         let next_epoch = {
-            let state = self
-                .state
-                .lock()
-                .lock_or_die("raft_store.state");
+            let state = self.state.lock().lock_or_die("raft_store.state");
             if state.status == KeyManagerStatus::Unavailable {
                 return Err(KeyManagerError::Unavailable);
             }
@@ -344,10 +308,7 @@ impl KeyManagerOps for RaftKeyStore {
 
     async fn mark_migration_complete(&self, epoch: KeyEpoch) -> Result<(), KeyManagerError> {
         {
-            let state = self
-                .state
-                .lock()
-                .lock_or_die("raft_store.state");
+            let state = self.state.lock().lock_or_die("raft_store.state");
             if !state.epochs.iter().any(|e| e.key.epoch == epoch) {
                 return Err(KeyManagerError::EpochNotFound(epoch));
             }
@@ -357,10 +318,7 @@ impl KeyManagerOps for RaftKeyStore {
     }
 
     async fn list_epochs(&self) -> Vec<EpochInfo> {
-        let state = self
-            .state
-            .lock()
-            .lock_or_die("raft_store.state");
+        let state = self.state.lock().lock_or_die("raft_store.state");
         state
             .epochs
             .iter()

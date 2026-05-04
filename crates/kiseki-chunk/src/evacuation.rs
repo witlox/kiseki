@@ -105,10 +105,7 @@ impl EvacuationRegistry {
     /// it finishes — a subsequent `cancel()` becomes a no-op once
     /// the only reference is the worker's already-dropped one.
     pub fn register(&self, id: String, progress: Arc<EvacuationProgress>) {
-        let mut g = self
-            .inner
-            .lock()
-            .lock_or_die("evacuation.inner");
+        let mut g = self.inner.lock().lock_or_die("evacuation.inner");
         g.insert(id, progress);
     }
 
@@ -117,10 +114,7 @@ impl EvacuationRegistry {
     /// already been called); `false` if the id was unknown — the
     /// admin RPC translates `false` into `NotFound`.
     pub fn cancel(&self, id: &str) -> bool {
-        let g = self
-            .inner
-            .lock()
-            .lock_or_die("evacuation.inner");
+        let g = self.inner.lock().lock_or_die("evacuation.inner");
         if let Some(p) = g.get(id) {
             p.cancel();
             true
@@ -134,19 +128,13 @@ impl EvacuationRegistry {
     /// progress-projection variant).
     #[must_use]
     pub fn ids(&self) -> Vec<String> {
-        let g = self
-            .inner
-            .lock()
-            .lock_or_die("evacuation.inner");
+        let g = self.inner.lock().lock_or_die("evacuation.inner");
         g.keys().cloned().collect()
     }
 
     /// Remove an entry once its worker has finished. Idempotent.
     pub fn unregister(&self, id: &str) {
-        let mut g = self
-            .inner
-            .lock()
-            .lock_or_die("evacuation.inner");
+        let mut g = self.inner.lock().lock_or_die("evacuation.inner");
         g.remove(id);
     }
 }

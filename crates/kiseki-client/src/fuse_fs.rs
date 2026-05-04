@@ -1041,7 +1041,9 @@ mod tests {
                 namespace_id: NamespaceId,
                 composition_id: CompositionId,
             ) -> Result<(), kiseki_gateway::error::GatewayError> {
-                self.inner.delete(tenant_id, namespace_id, composition_id).await
+                self.inner
+                    .delete(tenant_id, namespace_id, composition_id)
+                    .await
             }
         }
 

@@ -2037,5 +2037,8 @@ async fn then_s3_get_from_any_follower_fresh_bucket(w: &mut KisekiWorld) {
         assert_eq!(body, expected, "follower node-{node_id} body mismatch");
         verified += 1;
     }
-    assert!(verified >= 1, "no followers to verify against — leader was the only node?");
+    assert!(
+        verified >= 1,
+        "no followers to verify against — leader was the only node?"
+    );
 }

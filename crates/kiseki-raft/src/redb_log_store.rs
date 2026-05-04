@@ -8,9 +8,9 @@ use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
+use kiseki_common::locks::LockOrDie;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
-use kiseki_common::locks::LockOrDie;
 
 /// Table for Raft log entries: key = log index (u64), value = JSON bytes.
 const LOG_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("raft_log");

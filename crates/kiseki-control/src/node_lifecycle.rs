@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use kiseki_common::ids::NodeId;
-use kiseki_common::raft_adapter::{MembershipError, RaftMembershipAdapter};
 use kiseki_common::locks::LockOrDie;
+use kiseki_common::raft_adapter::{MembershipError, RaftMembershipAdapter};
 
 /// Per-node lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -173,10 +173,7 @@ impl DrainOrchestrator {
     /// Register a node in the cluster (typically called when a node
     /// joins). Idempotent on the node id.
     pub fn register_node(&self, node_id: NodeId, voter_in_shards: Vec<u64>) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("node_lifecycle.inner");
+        let mut inner = self.inner.lock().lock_or_die("node_lifecycle.inner");
         inner.nodes.entry(node_id).or_insert(NodeRecord {
             node_id,
             state: NodeState::Active,
@@ -190,10 +187,7 @@ impl DrainOrchestrator {
     /// adjust the voter set after registration use this helper.
     /// No-op if the node is unknown.
     pub fn set_voters(&self, node_id: NodeId, voter_in_shards: Vec<u64>) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("node_lifecycle.inner");
+        let mut inner = self.inner.lock().lock_or_die("node_lifecycle.inner");
         if let Some(rec) = inner.nodes.get_mut(&node_id) {
             rec.voter_in_shards = voter_in_shards;
             // If the node was already in Draining, refresh the total
@@ -212,10 +206,7 @@ impl DrainOrchestrator {
     /// Mark a node as `Draining` directly (used to set up the
     /// "node in Draining state" precondition for cancel scenarios).
     pub fn set_state(&self, node_id: NodeId, state: NodeState) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("node_lifecycle.inner");
+        let mut inner = self.inner.lock().lock_or_die("node_lifecycle.inner");
         if let Some(rec) = inner.nodes.get_mut(&node_id) {
             rec.state = state;
             if state == NodeState::Draining && rec.drain_progress.is_none() {
@@ -290,10 +281,7 @@ impl DrainOrchestrator {
     /// Request a drain on `target`. Records `DrainRequested` on success
     /// or `DrainRefused` on capacity failure (both visible via `audit()`).
     pub fn request_drain(&self, target: NodeId, admin: &str) -> Result<(), DrainError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("node_lifecycle.inner");
+        let mut inner = self.inner.lock().lock_or_die("node_lifecycle.inner");
         if !inner.nodes.contains_key(&target) {
             return Err(DrainError::UnknownNode(target));
         }
@@ -345,10 +333,7 @@ impl DrainOrchestrator {
     /// Cancel an in-progress drain (I-N7). Already-completed voter
     /// replacements stay where they are — see ADR-035 §4.
     pub fn cancel_drain(&self, target: NodeId, admin: &str) -> Result<(), DrainError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("node_lifecycle.inner");
+        let mut inner = self.inner.lock().lock_or_die("node_lifecycle.inner");
         let rec = inner
             .nodes
             .get_mut(&target)
@@ -388,10 +373,7 @@ impl DrainOrchestrator {
         replacement: NodeId,
         admin: &str,
     ) {
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("node_lifecycle.inner");
+        let mut inner = self.inner.lock().lock_or_die("node_lifecycle.inner");
 
         // Compute the state transition first, then push audit events,
         // to keep two disjoint mutable borrows on `inner` from
@@ -438,10 +420,7 @@ impl DrainOrchestrator {
         adapter: &A,
     ) -> Result<(), DrainError> {
         let voters = adapter.voter_ids().await?;
-        let mut inner = self
-            .inner
-            .lock()
-            .lock_or_die("node_lifecycle.inner");
+        let mut inner = self.inner.lock().lock_or_die("node_lifecycle.inner");
         for (id, rec) in &mut inner.nodes {
             // Each shard the adapter reports the node holds adds an entry.
             // We count occurrences (a node may hold multiple voter slots
@@ -518,10 +497,7 @@ impl DrainOrchestrator {
     /// transitions without exposing the internal mutex.
     #[must_use]
     pub fn snapshot(&self) -> BTreeMap<NodeId, NodeRecord> {
-        let inner = self
-            .inner
-            .lock()
-            .lock_or_die("node_lifecycle.inner");
+        let inner = self.inner.lock().lock_or_die("node_lifecycle.inner");
         inner.nodes.iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 }

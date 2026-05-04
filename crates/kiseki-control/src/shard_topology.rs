@@ -271,12 +271,18 @@ impl NamespaceShardMapStore {
     /// Inject a failure at the N-th shard during creation (1-indexed).
     /// Used for testing atomic rollback (ADV-033-1).
     pub fn inject_failure_at_shard(&self, shard_number: u32) {
-        *self.fail_at_shard.write().lock_or_die("shard_topology.unknown") = Some(shard_number);
+        *self
+            .fail_at_shard
+            .write()
+            .lock_or_die("shard_topology.unknown") = Some(shard_number);
     }
 
     /// Clear failure injection.
     pub fn clear_failure_injection(&self) {
-        *self.fail_at_shard.write().lock_or_die("shard_topology.unknown") = None;
+        *self
+            .fail_at_shard
+            .write()
+            .lock_or_die("shard_topology.unknown") = None;
     }
 
     /// Create a namespace with the computed shard topology.
@@ -308,7 +314,10 @@ impl NamespaceShardMapStore {
         // Determine shard count.
         let shard_count = if let Some(requested) = requested_shards {
             // Validate against tenant bounds if set.
-            let bounds = self.tenant_bounds.read().lock_or_die("shard_topology.unknown");
+            let bounds = self
+                .tenant_bounds
+                .read()
+                .lock_or_die("shard_topology.unknown");
             if let Some(b) = bounds.get(&tenant_id.0.to_string()) {
                 if requested > b.max_shards {
                     return Err(ControlError::Rejected(format!(
@@ -328,7 +337,10 @@ impl NamespaceShardMapStore {
         };
 
         // ADV-033-1: failure injection — simulate partial Raft group failure.
-        let fail_at = *self.fail_at_shard.read().lock_or_die("shard_topology.unknown");
+        let fail_at = *self
+            .fail_at_shard
+            .read()
+            .lock_or_die("shard_topology.unknown");
         if let Some(fail_shard) = fail_at {
             if fail_shard <= shard_count {
                 return Err(ControlError::Rejected(format!(
@@ -449,7 +461,10 @@ impl NamespaceShardMapStore {
 
     /// Check whether a namespace exists in the store (any state).
     pub fn namespace_exists(&self, namespace_id: &str) -> bool {
-        self.maps.read().lock_or_die("shard_topology.unknown").contains_key(namespace_id)
+        self.maps
+            .read()
+            .lock_or_die("shard_topology.unknown")
+            .contains_key(namespace_id)
     }
 
     /// Create an alias: lookups for `alias` resolve to `target`.
@@ -458,7 +473,10 @@ impl NamespaceShardMapStore {
         if let Some(map) = maps.get(target) {
             let aliased = map.clone();
             drop(maps);
-            self.maps.write().lock_or_die("shard_topology.unknown").insert(alias.to_owned(), aliased);
+            self.maps
+                .write()
+                .lock_or_die("shard_topology.unknown")
+                .insert(alias.to_owned(), aliased);
         }
     }
 
@@ -489,8 +507,16 @@ fn find_widest_shard(shards: &[ShardRange]) -> usize {
 
 /// Approximate range width for comparison (first 8 bytes as u64).
 fn range_width(start: &[u8; 32], end: &[u8; 32]) -> u64 {
-    let s = u64::from_be_bytes(start[..8].try_into().expect("byte slice has the exact fixed length required"));
-    let e = u64::from_be_bytes(end[..8].try_into().expect("byte slice has the exact fixed length required"));
+    let s = u64::from_be_bytes(
+        start[..8]
+            .try_into()
+            .expect("byte slice has the exact fixed length required"),
+    );
+    let e = u64::from_be_bytes(
+        end[..8]
+            .try_into()
+            .expect("byte slice has the exact fixed length required"),
+    );
     e.saturating_sub(s)
 }
 

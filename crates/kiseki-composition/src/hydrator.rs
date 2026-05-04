@@ -301,9 +301,7 @@ impl CompositionHydrator {
                 OperationType::Create => stage_create(&store, &mut staging, delta),
                 OperationType::Update => stage_update(&store, &mut staging, delta),
                 OperationType::Delete => stage_delete(&store, &mut staging, delta),
-                OperationType::NamespaceCreate => {
-                    stage_namespace_create(&mut staging, delta)
-                }
+                OperationType::NamespaceCreate => stage_namespace_create(&mut staging, delta),
                 // Rename, SetAttribute, Finalize aren't installed by
                 // the hydrator. Treat as Applied so the seq advances
                 // and we don't infinite-loop.
@@ -590,10 +588,7 @@ fn stage_delete(
 }
 
 /// ADR-040 Phase 18 — register a namespace on this follower.
-fn stage_namespace_create(
-    staging: &mut Staging,
-    delta: &kiseki_log::delta::Delta,
-) -> DeltaOutcome {
+fn stage_namespace_create(staging: &mut Staging, delta: &kiseki_log::delta::Delta) -> DeltaOutcome {
     let Some(ns) = crate::composition::decode_namespace_create_payload(&delta.payload.ciphertext)
     else {
         return DeltaOutcome::PermanentSkip {
