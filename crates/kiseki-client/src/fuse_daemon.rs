@@ -36,14 +36,25 @@ const TTL: Duration = Duration::from_secs(1);
 
 #[cfg(feature = "fuse")]
 fn to_fuser_attr(ino: u64, attr: &crate::fuse_fs::FileAttr) -> FuserAttr {
+    // Bug 7 (GCP 2026-05-04): the prior implementation hard-coded
+    // `UNIX_EPOCH` for atime/mtime/ctime/crtime, so every FUSE
+    // `getattr` reported "Jan 1 1970" — the kernel then defaulted
+    // user-visible mtimes to the same and `ls -l` showed all files
+    // dated 1970. Source from the wall clock as a placeholder, same
+    // shape as the Bug 3 fix in `nfs4_server::op_getattr`.
+    // Per-inode mtime that tracks the last write is a follow-on;
+    // the wall-clock placeholder removes the user-visible 1970 bug
+    // and keeps mtime monotonic so the kernel doesn't believe stale
+    // cached data.
+    let now = SystemTime::now();
     FuserAttr {
         ino: INodeNo(ino),
         size: attr.size,
         blocks: attr.size.div_ceil(512),
-        atime: SystemTime::UNIX_EPOCH,
-        mtime: SystemTime::UNIX_EPOCH,
-        ctime: SystemTime::UNIX_EPOCH,
-        crtime: SystemTime::UNIX_EPOCH,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        crtime: now,
         kind: match attr.kind {
             FileKind::Directory => FuserFileType::Directory,
             FileKind::Regular => FuserFileType::RegularFile,
@@ -359,6 +370,36 @@ pub fn mount<G: GatewayOps + Send + Sync + 'static>(
     fuser::mount2(daemon, mountpoint, &options)
         .map_err(|e| std::io::Error::other(format!("FUSE mount failed: {e}")))
 }
+
+#[cfg(all(test, feature = "fuse"))]
+mod attr_time_tests {
+    use super::*;
+    use crate::fuse_fs::{FileAttr, FileKind};
+
+    /// Bug 7 (GCP 2026-05-04): FUSE getattr returned `mtime = Jan 1 1970`
+    /// because `to_fuser_attr` hard-coded UNIX_EPOCH for every time
+    /// field. The fix uses `SystemTime::now()` as a placeholder.
+    #[test]
+    fn to_fuser_attr_does_not_return_unix_epoch() {
+        let attr = FileAttr {
+            ino: 42,
+            size: 1024,
+            kind: FileKind::Regular,
+            mode: 0o644,
+            nlink: 1,
+        };
+        let f = to_fuser_attr(attr.ino, &attr);
+        assert_ne!(
+            f.mtime,
+            SystemTime::UNIX_EPOCH,
+            "FUSE mtime must not be epoch 0",
+        );
+        assert_ne!(f.ctime, SystemTime::UNIX_EPOCH);
+        assert_ne!(f.atime, SystemTime::UNIX_EPOCH);
+        assert_ne!(f.crtime, SystemTime::UNIX_EPOCH);
+    }
+}
+
 
 #[cfg(all(test, feature = "fuse"))]
 mod concurrency_tests {
