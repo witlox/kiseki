@@ -157,7 +157,14 @@ impl PersistentChunkStore {
             let mut map = HashMap::new();
             for meta in metas {
                 let chunk_id = ChunkId(meta.chunk_id);
-                let mut extents = vec![Extent::new(meta.extent_offset, meta.extent_length)];
+                // Empty chunks (data_bytes == 0) skip the device
+                // entirely — extent_length stays 0. Don't push a
+                // sentinel (0, 0) Extent: reconstruct_envelope must
+                // never call device.read on a zero-length extent.
+                let mut extents = Vec::new();
+                if meta.extent_length > 0 {
+                    extents.push(Extent::new(meta.extent_offset, meta.extent_length));
+                }
                 for &(off, len) in &meta.extra_extents {
                     extents.push(Extent::new(off, len));
                 }
@@ -334,18 +341,33 @@ impl ChunkOps for PersistentChunkStore {
         // extents if it exceeds the per-extent cap (Bug 5 fix). On
         // crash between writes and metadata persist, orphan extents
         // are reclaimed by periodic scrub (ADR-029 F-I6).
+        //
+        // Empty payloads (POSIX `touch` / NFSv4 OPEN-CREATE on a
+        // zero-byte file) skip device allocation entirely. The
+        // metadata stores `extents = []`, `extent_offset = 0`,
+        // `extent_length = 0` — `reconstruct_envelope` returns the
+        // empty ciphertext from the empty extents Vec without
+        // touching the device.
         let data = &envelope.ciphertext;
         let data_bytes = data.len() as u64;
-        let extents = self.alloc_and_write_chunked(data)?;
+        let extents: Vec<Extent> = if data.is_empty() {
+            Vec::new()
+        } else {
+            self.alloc_and_write_chunked(data)?
+        };
         let stored_bytes: u64 = extents.iter().map(|e| e.length).sum();
 
         // Build metadata. The first extent goes into the legacy
         // `extent_offset/extent_length` pair; any additional extents
-        // go into `extra_extents`. Old metadata files (single extent
-        // only) deserialize unchanged.
-        let first = &extents[0];
-        let extra_extents: Vec<(u64, u64)> = extents[1..]
+        // go into `extra_extents`. Empty chunks keep the legacy fields
+        // at (0, 0); old metadata files (single extent only)
+        // deserialize unchanged.
+        let (first_offset, first_length) = extents
+            .first()
+            .map_or((0, 0), |e| (e.offset, e.length));
+        let extra_extents: Vec<(u64, u64)> = extents
             .iter()
+            .skip(1)
             .map(|e| (e.offset, e.length))
             .collect();
         let meta = PersistedChunkMeta {
@@ -355,8 +377,8 @@ impl ChunkOps for PersistentChunkStore {
             pool_name: pool.to_owned(),
             stored_bytes,
             data_bytes,
-            extent_offset: first.offset,
-            extent_length: first.length,
+            extent_offset: first_offset,
+            extent_length: first_length,
             extra_extents,
             nonce: envelope.nonce,
             auth_tag: envelope.auth_tag,
@@ -993,6 +1015,35 @@ mod tests {
             read_back.ciphertext, big_ciphertext,
             "ciphertext bytes corrupted after round-trip"
         );
+    }
+
+    /// Bug 5 regression discovered during the 3rd GCP run: the
+    /// multi-extent path panicked with "index out of bounds" when
+    /// called with an empty payload (POSIX `touch` / NFSv4 OPEN-CREATE
+    /// on a zero-byte file). Empty chunks must skip device allocation
+    /// and round-trip cleanly with empty ciphertext.
+    #[test]
+    fn write_chunk_with_empty_ciphertext_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        let mut store =
+            PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
+
+        let env = Envelope {
+            ciphertext: Vec::new(),
+            auth_tag: [0xAA; 16],
+            nonce: [0xBB; 12],
+            system_epoch: KeyEpoch(1),
+            tenant_epoch: None,
+            tenant_wrapped_material: None,
+            chunk_id: ChunkId([0xE0; 32]),
+        };
+        let chunk_id = env.chunk_id;
+        store.write_chunk(env, "default").unwrap();
+        let read_back = store.read_chunk(&chunk_id).unwrap();
+        assert!(read_back.ciphertext.is_empty(), "empty chunk must round-trip empty");
     }
 
     /// Bug 5 (sibling write): the GCP repro showed that writing a
