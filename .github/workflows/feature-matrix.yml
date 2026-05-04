@@ -1,0 +1,98 @@
+name: Feature Matrix
+
+# Compiles every named feature flag combination across the
+# workspace. 14 jobs in parallel; each one is a `cargo check`
+# (~30-60 s with cache, 2-3 min cold).
+#
+# Triggers — designed to keep CI fast on the common path while
+# still catching feature-flag bitrot:
+#
+# - PR / push touching anything that could change the dependency
+#   graph (Cargo.toml, Cargo.lock, build.rs, .cargo/) — this is
+#   when a feature flag could plausibly newly fail to compile.
+# - Nightly schedule — covers transitive dep bumps in
+#   stable-toolchain releases that don't touch our manifests.
+# - workflow_dispatch — manual rerun.
+# - From release.yml (workflow_call) — runs as part of release
+#   preflight even when the trigger doesn't touch Cargo.toml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "**/build.rs"
+      - ".cargo/**"
+      - ".github/workflows/feature-matrix.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "**/build.rs"
+      - ".cargo/**"
+      - ".github/workflows/feature-matrix.yml"
+  schedule:
+    - cron: "0 5 * * *" # Daily 05:00 UTC (one hour before the weekly release run)
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: feature-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  feature-check:
+    name: Feature Check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: crypto-fips
+            cmd: cargo check -p kiseki-crypto --features fips --locked
+          - name: crypto-compression
+            cmd: cargo check -p kiseki-crypto --features compression --locked
+          - name: gateway-nfs-only
+            cmd: cargo check -p kiseki-gateway --no-default-features --features nfs --locked
+          - name: gateway-s3-only
+            cmd: cargo check -p kiseki-gateway --no-default-features --features s3 --locked
+          - name: gateway-all
+            cmd: cargo check -p kiseki-gateway --all-features --locked
+          - name: client-fuse
+            cmd: cargo check -p kiseki-client --features fuse --locked
+          - name: server-default
+            cmd: cargo check -p kiseki-server --locked
+          - name: transport-verbs
+            cmd: cargo check -p kiseki-transport --features verbs --locked
+          - name: transport-cxi
+            cmd: cargo check -p kiseki-transport --features cxi --locked
+          - name: chunk-gpu-cuda
+            cmd: cargo check -p kiseki-chunk --features gpu-cuda --locked
+          - name: chunk-gpu-rocm
+            cmd: cargo check -p kiseki-chunk --features gpu-rocm --locked
+          - name: kms-vault
+            cmd: cargo check -p kiseki-keymanager --features kms-vault --locked
+          - name: kms-aws
+            cmd: cargo check -p kiseki-keymanager --features kms-aws --locked
+          - name: kms-azure
+            cmd: cargo check -p kiseki-keymanager --features kms-azure --locked
+          - name: kms-gcp
+            cmd: cargo check -p kiseki-keymanager --features kms-gcp --locked
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.name }}
+      - name: Install libfuse3-dev (for client-fuse feature)
+        if: matrix.name == 'client-fuse'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - run: ${{ matrix.cmd }}

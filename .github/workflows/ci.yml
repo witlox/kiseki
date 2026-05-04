@@ -27,14 +27,18 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 # PRs:   Stage 1 (fast gates) + unit tests
-# Push:  All stages
+# Push:  + BDD acceptance + proto/arch checks
 #
 # Stage 1: fast gates (fmt, clippy, deny) — parallel
-# Stage 2: feature flag compilation matrix — after stage 1 (push only)
-# Stage 3: unit tests — after stage 1 (always)
-#          BDD, proto, arch — after stage 2 (push only)
-#          (e2e lives in release.yml — too slow for every push)
-# Stage 4: coverage — after stage 3 (push only)
+# Stage 2: unit tests — after stage 1 (always)
+#          BDD, proto, arch — after stage 1 (push only)
+#
+# The 14-job feature-flag compilation matrix lives in
+# `feature-matrix.yml` — paths-filtered (Cargo.toml / build.rs)
+# + nightly + workflow_dispatch + run-on-release.
+#
+# Coverage + e2e + slow BDD live in `release.yml` (weekly +
+# workflow_dispatch). CI is fast-feedback only.
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -73,63 +77,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # ---------------------------------------------------------------------------
-  # Stage 2 — feature flag compilation (needs stage 1)
-  # ---------------------------------------------------------------------------
-
-  feature-check:
-    name: Feature Check (${{ matrix.name }})
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    needs: [fmt, clippy, deny]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: crypto-fips
-            cmd: cargo check -p kiseki-crypto --features fips --locked
-          - name: crypto-compression
-            cmd: cargo check -p kiseki-crypto --features compression --locked
-          - name: gateway-nfs-only
-            cmd: cargo check -p kiseki-gateway --no-default-features --features nfs --locked
-          - name: gateway-s3-only
-            cmd: cargo check -p kiseki-gateway --no-default-features --features s3 --locked
-          - name: gateway-all
-            cmd: cargo check -p kiseki-gateway --all-features --locked
-          - name: client-fuse
-            cmd: cargo check -p kiseki-client --features fuse --locked
-          - name: server-default
-            cmd: cargo check -p kiseki-server --locked
-          - name: transport-verbs
-            cmd: cargo check -p kiseki-transport --features verbs --locked
-          - name: transport-cxi
-            cmd: cargo check -p kiseki-transport --features cxi --locked
-          - name: chunk-gpu-cuda
-            cmd: cargo check -p kiseki-chunk --features gpu-cuda --locked
-          - name: chunk-gpu-rocm
-            cmd: cargo check -p kiseki-chunk --features gpu-rocm --locked
-          - name: kms-vault
-            cmd: cargo check -p kiseki-keymanager --features kms-vault --locked
-          - name: kms-aws
-            cmd: cargo check -p kiseki-keymanager --features kms-aws --locked
-          - name: kms-azure
-            cmd: cargo check -p kiseki-keymanager --features kms-azure --locked
-          - name: kms-gcp
-            cmd: cargo check -p kiseki-keymanager --features kms-gcp --locked
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: features-${{ matrix.name }}
-      - name: Install libfuse3-dev (for client-fuse feature)
-        if: matrix.name == 'client-fuse'
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
-      - run: ${{ matrix.cmd }}
-
-  # ---------------------------------------------------------------------------
-  # Stage 3 — test suites (needs stage 2, all parallel)
+  # Stage 2 — test suites (needs stage 1, all parallel)
   # ---------------------------------------------------------------------------
 
   test:
@@ -155,7 +103,7 @@ jobs:
     name: BDD Acceptance (fast suite)
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    needs: [feature-check]
+    needs: [fmt, clippy, deny]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -201,7 +149,7 @@ jobs:
     name: Proto Coverage
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    needs: [feature-check]
+    needs: [fmt, clippy, deny]
     steps:
       - uses: actions/checkout@v6
       - name: Check every .proto is in build.rs
@@ -221,7 +169,7 @@ jobs:
     name: Architecture Check
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    needs: [feature-check]
+    needs: [fmt, clippy, deny]
     steps:
       - uses: actions/checkout@v6
       - name: Verify kiseki-control dependency boundary (ADR-027)
@@ -239,42 +187,6 @@ jobs:
             exit 1
           fi
 
-  # ---------------------------------------------------------------------------
-  # Stage 4 — coverage (needs stage 3)
-  # ---------------------------------------------------------------------------
-
-  coverage:
-    name: Coverage
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    needs: [test, acceptance]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      # Two passes to dodge the rustls global-state hang in
-      # kiseki-chunk-cluster's gRPC TLS tests under workspace-
-      # parallel cargo runs (same pattern as the Unit Tests job).
-      # `--no-report` skips report emission per-pass AND implies
-      # preserving prior coverage data (i.e. `--no-clean` is now
-      # baked in). Newer cargo-llvm-cov rejects `--no-report
-      # --no-clean` together as an explicit conflict — drop the
-      # redundant flag. The final `report` step merges both
-      # passes' accumulated coverage.
-      - run: >
-          cargo llvm-cov --no-report --workspace
-          --exclude kiseki-acceptance
-          --exclude kiseki-chunk-cluster
-          --locked
-      - run: >
-          cargo llvm-cov --no-report
-          -p kiseki-chunk-cluster
-          --locked
-      - run: cargo llvm-cov report --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v6
-        with:
-          files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
+  # Coverage moved to release.yml (weekly + workflow_dispatch) —
+  # the codecov upload is a trend signal, not a merge gate, and
+  # adding ~4 min to every push isn't worth the spend.
