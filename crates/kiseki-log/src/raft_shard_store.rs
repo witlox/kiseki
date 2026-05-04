@@ -54,6 +54,10 @@ pub struct RaftShardStore {
     /// first `create_shard` with `Some(raft_addr)` lazily binds the
     /// listener; from then on all shards on this node register here.
     listener_registry: Mutex<Option<kiseki_raft::tcp_transport::RegistryHandle>>,
+    /// Optional Raft transport metrics. When set via
+    /// `with_transport_metrics`, the lazy listener init wires them
+    /// in via `RaftRpcListener::with_metrics(...)`.
+    transport_metrics: Mutex<Option<Arc<kiseki_raft::transport_metrics::RaftTransportMetrics>>>,
 }
 
 impl RaftShardStore {
@@ -95,7 +99,23 @@ impl RaftShardStore {
             data_dir,
             inline_store: None,
             listener_registry: Mutex::new(None),
+            transport_metrics: Mutex::new(None),
         }
+    }
+
+    /// Attach the per-node Raft transport metrics. Must be called
+    /// BEFORE the first `create_shard` with `Some(raft_addr)` —
+    /// otherwise the lazy-init listener spawns without metrics.
+    /// The runtime wires this from `KisekiMetrics::raft_transport`.
+    pub fn set_transport_metrics(
+        &self,
+        metrics: Arc<kiseki_raft::transport_metrics::RaftTransportMetrics>,
+    ) {
+        let mut guard = self
+            .transport_metrics
+            .lock()
+            .lock_or_die("raft_shard_store.transport_metrics");
+        *guard = Some(metrics);
     }
 
     /// Set the inline store for small-file content (ADR-030).
@@ -146,8 +166,18 @@ impl RaftShardStore {
             if let Some(existing) = guard.as_ref() {
                 Some(existing.clone())
             } else {
-                let listener =
+                let mut listener =
                     kiseki_raft::tcp_transport::RaftRpcListener::new(addr.to_owned(), None);
+                // Attach transport metrics if the runtime wired them
+                // before the first create_shard.
+                if let Some(m) = self
+                    .transport_metrics
+                    .lock()
+                    .lock_or_die("raft_shard_store.transport_metrics")
+                    .as_ref()
+                {
+                    listener = listener.with_metrics(Arc::clone(m));
+                }
                 let reg = listener.registry();
                 let handle = self.rt.handle().clone();
                 handle.spawn(async move {

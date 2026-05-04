@@ -270,6 +270,13 @@ pub async fn run_main(
         None
     };
 
+    // Metrics: built early so per-shard `RaftRpcListener` metrics
+    // (ADR-041 §"Observability") are wired into the listener BEFORE
+    // the first shard's lazy-init binds. Other subsystems (fabric,
+    // gateway, etc.) thread `Arc<...>` clones from this same struct
+    // throughout setup.
+    let metrics = crate::metrics::KisekiMetrics::new();
+
     // Log store: Raft (multi-node), persistent (redb), or in-memory.
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
     let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
@@ -288,6 +295,9 @@ pub async fn run_main(
             store = store.with_inline_store(std::sync::Arc::clone(ss)
                 as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>);
         }
+        // ADR-041 §"Observability": wire transport metrics BEFORE the
+        // first create_shard so the lazy-init listener picks them up.
+        store.set_transport_metrics(std::sync::Arc::clone(&metrics.raft_transport));
         // All nodes in the cluster create the shard. The bootstrap flag
         // controls whether this node seeds the Raft group (calls initialize)
         // or joins as a follower (receives membership from the leader).
@@ -350,7 +360,11 @@ pub async fn run_main(
 
     // Metrics — built early so the cluster-fabric Arc<FabricMetrics>
     // can be threaded into the per-peer client wrappers below.
-    let metrics = crate::metrics::KisekiMetrics::new();
+    // (KisekiMetrics is also constructed before the log-store
+    // creation above so `raft_transport` metrics can be wired into
+    // the multiplexed listener BEFORE its first `create_shard` call.
+    // See `metrics.raft_transport` plumbing in the multi-node path.)
+    let _ = &metrics;
 
     // Local chunk store: persistent (raw block device) if KISEKI_DATA_DIR
     // set, otherwise in-memory. Wrapped via SyncBridge so it satisfies

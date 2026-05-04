@@ -100,6 +100,13 @@ pub struct KisekiMetrics {
     /// `with_metrics(...)` at runtime construction.
     pub fabric: std::sync::Arc<kiseki_chunk_cluster::FabricMetrics>,
 
+    // --- Multiplexed Raft RPC transport (ADR-041) ---
+    /// 8 metrics covering per-shard RPC count + duration + outcomes,
+    /// registry size, listener restarts, dispatcher panics, per-peer
+    /// connection cap, active connections. Wired into the per-node
+    /// `RaftRpcListener` via `with_metrics(...)`.
+    pub raft_transport: std::sync::Arc<kiseki_raft::transport_metrics::RaftTransportMetrics>,
+
     // --- Gateway retry budget (ADR-040 §D7 + §D10 — F-4 closure) ---
     /// Read-path retry counters. Wired into `InMemoryGateway` via
     /// `with_retry_metrics(...)` at runtime construction.
@@ -316,6 +323,11 @@ impl KisekiMetrics {
                 .expect("fabric metrics register"),
         );
 
+        let raft_transport = std::sync::Arc::new(
+            kiseki_raft::transport_metrics::RaftTransportMetrics::register(&registry)
+                .expect("raft transport metrics register"),
+        );
+
         let gateway_retry = std::sync::Arc::new(
             kiseki_gateway::metrics::GatewayRetryMetrics::register(&registry)
                 .expect("gateway retry metrics register"),
@@ -359,6 +371,7 @@ impl KisekiMetrics {
             key_rotation_total,
             crypto_shred_total,
             fabric,
+            raft_transport,
             gateway_retry,
             composition,
             storage_admin_calls_total,

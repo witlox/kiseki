@@ -60,6 +60,7 @@ pub use redb_raft_log_store::RedbRaftLogStore;
     dead_code
 )]
 pub mod tcp_transport;
+pub mod transport_metrics;
 
 pub use network::{StubNetwork, StubNetworkFactory};
 pub use node::{KisekiNode, Topology};

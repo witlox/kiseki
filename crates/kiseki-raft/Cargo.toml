@@ -17,6 +17,7 @@ async-trait = { workspace = true }
 dashmap = "6"
 futures = "0.3"
 openraft = { workspace = true }
+prometheus = { workspace = true }
 redb = "4"
 serde = { version = "1", features = ["derive"] }
 thiserror = { workspace = true }

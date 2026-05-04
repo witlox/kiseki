@@ -40,6 +40,7 @@ kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }
 kiseki-transport = { workspace = true }
 kiseki-log = { workspace = true }
+kiseki-raft = { workspace = true }
 kiseki-keymanager = { workspace = true }
 kiseki-audit = { workspace = true }
 kiseki-backup = { workspace = true }

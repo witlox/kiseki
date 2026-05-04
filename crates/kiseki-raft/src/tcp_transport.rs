@@ -479,6 +479,9 @@ pub enum DispatchOutcome {
 #[derive(Clone)]
 pub struct RegistryHandle {
     inner: Arc<DashMap<ShardId, ShardDispatch>>,
+    /// Optional metrics handle — when set, register/unregister
+    /// updates `kiseki_raft_transport_registry_size`.
+    metrics: Option<Arc<crate::transport_metrics::RaftTransportMetrics>>,
 }
 
 impl RegistryHandle {
@@ -560,6 +563,10 @@ impl RegistryHandle {
             },
         );
         self.inner.insert(shard_id, dispatch);
+        if let Some(m) = &self.metrics {
+            #[allow(clippy::cast_possible_wrap)]
+            m.registry_size.set(self.inner.len() as i64);
+        }
     }
 
     /// Remove a shard from the registry. Subsequent RPCs for that
@@ -568,6 +575,10 @@ impl RegistryHandle {
     /// longest in-flight RPC (gate-1 F-L2).
     pub fn unregister_shard(&self, shard_id: ShardId) {
         self.inner.remove(&shard_id);
+        if let Some(m) = &self.metrics {
+            #[allow(clippy::cast_possible_wrap)]
+            m.registry_size.set(self.inner.len() as i64);
+        }
     }
 
     /// Number of shards currently registered. Exposed for the
@@ -589,6 +600,10 @@ pub struct RaftRpcListener {
     /// address string for now — once mTLS is wired through this
     /// listener, switch to the cert subject.
     active_per_peer: Arc<DashMap<String, AtomicU32>>,
+    /// Optional metrics handle. None in unit tests; production wires
+    /// the `KisekiMetrics`-owned `RaftTransportMetrics` via
+    /// `with_metrics`.
+    metrics: Option<Arc<crate::transport_metrics::RaftTransportMetrics>>,
 }
 
 impl RaftRpcListener {
@@ -600,9 +615,28 @@ impl RaftRpcListener {
             tls_acceptor: ArcSwap::from_pointee(acceptor),
             registry: RegistryHandle {
                 inner: Arc::new(DashMap::new()),
+                metrics: None,
             },
             active_per_peer: Arc::new(DashMap::new()),
+            metrics: None,
         }
+    }
+
+    /// Builder: attach the per-node Raft transport metrics. Once set,
+    /// every inbound RPC ticks per-(shard, op, outcome) counters,
+    /// observes server-side latency, and updates the
+    /// `registry_size` / `active_connections` gauges. Without this,
+    /// the listener still functions — observation is just absent.
+    #[must_use]
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<crate::transport_metrics::RaftTransportMetrics>,
+    ) -> Self {
+        // Push the same handle into the registry so register/unregister
+        // can update the registry_size gauge.
+        self.registry.metrics = Some(Arc::clone(&metrics));
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Get a clonable handle to the shard registry. Callers MUST
@@ -644,6 +678,7 @@ impl RaftRpcListener {
             let acceptor = self.tls_acceptor.load_full();
             let per_peer = Arc::clone(&self.active_per_peer);
             let peer_key = peer_addr.ip().to_string();
+            let metrics = self.metrics.clone();
 
             // Per-peer cap (gate-1 F-M5).
             let counter = per_peer
@@ -655,14 +690,31 @@ impl RaftRpcListener {
                 if let Some(c) = per_peer.get(&peer_key) {
                     c.fetch_sub(1, Ordering::Relaxed);
                 }
+                if let Some(m) = &metrics {
+                    m.record_connection_cap_exceeded(&peer_key);
+                }
                 tracing::warn!(peer = %peer_key, active, "rejecting Raft RPC connection — per-peer cap exceeded");
                 drop(tcp_stream);
                 continue;
             }
+            if let Some(m) = &metrics {
+                #[allow(clippy::cast_possible_wrap)]
+                m.active_connections.set(
+                    self.active_per_peer
+                        .iter()
+                        .map(|e| e.value().load(Ordering::Relaxed) as i64)
+                        .sum(),
+                );
+            }
 
             tokio::spawn(async move {
-                let result =
-                    handle_one_connection(tcp_stream, acceptor.as_ref().clone(), &registry).await;
+                let result = handle_one_connection(
+                    tcp_stream,
+                    acceptor.as_ref().clone(),
+                    &registry,
+                    metrics.as_deref(),
+                )
+                .await;
                 if let Some(c) = per_peer.get(&peer_key) {
                     c.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -728,6 +780,7 @@ async fn handle_one_connection(
     tcp_stream: tokio::net::TcpStream,
     acceptor: Option<TlsAcceptor>,
     registry: &RegistryHandle,
+    metrics: Option<&crate::transport_metrics::RaftTransportMetrics>,
 ) -> io::Result<()> {
     if let Some(acc) = acceptor {
         let tls = acc
@@ -735,17 +788,22 @@ async fn handle_one_connection(
             .await
             .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
         let mut s = tls;
-        serve_one_request(&mut s, registry).await
+        serve_one_request(&mut s, registry, metrics).await
     } else {
         let mut s = tcp_stream;
-        serve_one_request(&mut s, registry).await
+        serve_one_request(&mut s, registry, metrics).await
     }
 }
 
-async fn serve_one_request<S>(stream: &mut S, registry: &RegistryHandle) -> io::Result<()>
+async fn serve_one_request<S>(
+    stream: &mut S,
+    registry: &RegistryHandle,
+    metrics: Option<&crate::transport_metrics::RaftTransportMetrics>,
+) -> io::Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    let started = std::time::Instant::now();
     let mut len_buf = [0u8; 4];
     if stream.read_exact(&mut len_buf).await.is_err() {
         return Ok(()); // peer closed
@@ -754,6 +812,14 @@ where
     if req_len > MAX_RAFT_RPC_SIZE {
         tracing::warn!(req_len, max = MAX_RAFT_RPC_SIZE, "Raft RPC oversized");
         write_response(stream, DispatchStatus::ParseError, Vec::new()).await?;
+        if let Some(m) = metrics {
+            m.record_rpc(
+                "unknown",
+                crate::transport_metrics::op::UNKNOWN,
+                crate::transport_metrics::outcome::PARSE_ERROR,
+                started.elapsed(),
+            );
+        }
         return Ok(());
     }
     let mut req_buf = vec![0u8; req_len];
@@ -763,11 +829,33 @@ where
 
     let Some((shard_id, tag, payload_value)) = decode_request_body(&req_buf) else {
         write_response(stream, DispatchStatus::ParseError, Vec::new()).await?;
+        if let Some(m) = metrics {
+            m.record_rpc(
+                "unknown",
+                crate::transport_metrics::op::UNKNOWN,
+                crate::transport_metrics::outcome::PARSE_ERROR,
+                started.elapsed(),
+            );
+        }
         return Ok(());
     };
 
     let Some(dispatch) = registry.inner.get(&shard_id).map(|e| Arc::clone(&*e)) else {
         write_response(stream, DispatchStatus::UnknownShard, Vec::new()).await?;
+        let shard_str = shard_id.0.to_string();
+        if let Some(m) = metrics {
+            m.record_rpc(
+                &shard_str,
+                normalize_op(&tag),
+                crate::transport_metrics::outcome::UNKNOWN_SHARD,
+                started.elapsed(),
+            );
+        }
+        tracing::debug!(
+            shard = %shard_str,
+            tag = %tag,
+            "Raft RPC: unknown_shard (peer cache stale or shard retired)",
+        );
         return Ok(());
     };
 
@@ -776,12 +864,49 @@ where
     // closure's deserialization path.
     let payload_bytes = serde_json::to_vec(&payload_value).unwrap_or_default();
     let outcome = dispatch(&tag, &payload_bytes).await;
-    let (status, body) = match outcome {
-        DispatchOutcome::Ok(b) => (DispatchStatus::Ok, b),
-        DispatchOutcome::ParseError => (DispatchStatus::ParseError, Vec::new()),
-        DispatchOutcome::Panicked => (DispatchStatus::DispatcherPanic, Vec::new()),
+    let (status, body, outcome_label) = match outcome {
+        DispatchOutcome::Ok(b) => (DispatchStatus::Ok, b, crate::transport_metrics::outcome::OK),
+        DispatchOutcome::ParseError => (
+            DispatchStatus::ParseError,
+            Vec::new(),
+            crate::transport_metrics::outcome::PARSE_ERROR,
+        ),
+        DispatchOutcome::Panicked => (
+            DispatchStatus::DispatcherPanic,
+            Vec::new(),
+            crate::transport_metrics::outcome::DISPATCHER_PANIC,
+        ),
     };
+    let shard_str = shard_id.0.to_string();
+    let op_label = normalize_op(&tag);
+    if let Some(m) = metrics {
+        m.record_rpc(&shard_str, op_label, outcome_label, started.elapsed());
+        if matches!(
+            outcome_label,
+            crate::transport_metrics::outcome::DISPATCHER_PANIC
+        ) {
+            m.record_dispatcher_panic(&shard_str, op_label);
+            tracing::warn!(
+                shard = %shard_str,
+                tag = %tag,
+                "Raft RPC dispatcher panicked — listener stayed up; \
+                 caller sees status 0x03",
+            );
+        }
+    }
     write_response(stream, status, body).await
+}
+
+/// Map a free-form tag string to the bounded label set used by the
+/// metrics. Unknown tags collapse to `op::UNKNOWN` so cardinality
+/// stays bounded.
+fn normalize_op(tag: &str) -> &'static str {
+    match tag {
+        "append_entries" => crate::transport_metrics::op::APPEND_ENTRIES,
+        "vote" => crate::transport_metrics::op::VOTE,
+        "full_snapshot" => crate::transport_metrics::op::FULL_SNAPSHOT,
+        _ => crate::transport_metrics::op::UNKNOWN,
+    }
 }
 
 async fn write_response<S>(stream: &mut S, status: DispatchStatus, body: Vec<u8>) -> io::Result<()>
