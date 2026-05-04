@@ -2069,6 +2069,63 @@ mod chunking_tests {
         );
     }
 
+    /// Bug 6 (GCP 2026-05-04): NFS READ measured exactly 5.12 s
+    /// per call regardless of object size, capping NFS read
+    /// throughput at <1 MB/s. The fixed timing strongly implies a
+    /// hidden ~5 s waiter on the read path.
+    ///
+    /// This test bounds the time of `MemGateway::read` against an
+    /// in-memory backend where every dependency is fast: the chunk
+    /// store is in-process, no fabric, no real I/O. If the call
+    /// exceeds 200 ms there's a hidden timer/sleep on the gateway
+    /// read path. If it returns fast, the bug is upstream of the
+    /// gateway (fabric retry budget, NFS dispatch overhead, kernel-
+    /// side retransmit) and must be hunted separately.
+    #[tokio::test]
+    async fn read_completes_under_200ms_on_fast_in_memory_backend() {
+        let (gw, tenant, namespace) = build_gateway().await;
+
+        // 4 MiB object — within a single chunk; same shape as the GCP
+        // measurement (`4 MB read: 5.12 s`).
+        let mut data = vec![0u8; 4 * 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from(i % 251).unwrap();
+        }
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data: data.clone(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: 0,
+                length: data.len() as u64,
+            })
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(read.data.len(), data.len());
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "gateway read of 4 MiB took {elapsed:?}; expected <200 ms on \
+             a fast in-memory backend. If this fails the 5 s NFS floor \
+             is on the gateway read path; if it passes the floor must \
+             be upstream (chunk-cluster fabric or NFS dispatch).",
+        );
+    }
+
     /// A multi-chunk composition must round-trip through `read` with
     /// the same plaintext as the original PUT.
     #[tokio::test]
