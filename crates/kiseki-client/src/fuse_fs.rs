@@ -93,6 +93,12 @@ pub struct KisekiFuse<G: GatewayOps> {
     /// Maps `(parent_ino, child_name)` to child inode.
     children: HashMap<(Ino, String), Ino>,
     next_ino: Ino,
+    /// Per-inode dirty buffer (Bug 9 fix): kernel pwrites mutate this
+    /// in place; only [`Self::flush`] (or implicit close via
+    /// [`Self::release`]) ships bytes to the gateway. Without this,
+    /// every pwrite read-modify-wrote the entire file, producing
+    /// O(N²) wire traffic under streaming writes.
+    dirty: HashMap<Ino, Vec<u8>>,
     /// Tokio runtime handle for bridging sync FUSE → async gateway ops.
     rt: tokio::runtime::Handle,
 }
@@ -127,6 +133,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
             inodes,
             children: HashMap::new(),
             next_ino: 2,
+            dirty: HashMap::new(),
             rt,
         }
     }
@@ -217,11 +224,22 @@ impl<G: GatewayOps> KisekiFuse<G> {
     }
 
     /// Read from a file.
+    ///
+    /// If the inode has a dirty buffer (uncommitted writes), serve
+    /// from that buffer so reads see the in-flight modifications.
+    /// Otherwise fall through to the gateway read.
     pub fn read(&self, ino: Ino, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
         let entry = self.inodes.get(&ino).ok_or(libc_enoent())?;
         let InodeEntry::File { composition_id, .. } = entry else {
             return Err(libc_eisdir());
         };
+
+        if let Some(buf) = self.dirty.get(&ino) {
+            #[allow(clippy::cast_possible_truncation)]
+            let start = (offset as usize).min(buf.len());
+            let end = (start + size as usize).min(buf.len());
+            return Ok(buf[start..end].to_vec());
+        }
 
         self.block_gateway(self.gateway.read(ReadRequest {
             tenant_id: self.tenant_id,
@@ -236,9 +254,16 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
     /// Write data to an existing file at a given offset.
     ///
-    /// Performs a read-modify-write: reads the full file, splices the
-    /// new data at `offset`, then writes the result as a new composition,
-    /// updating the inode to point at the new composition.
+    /// Mutates a per-inode dirty buffer in place. The first write to
+    /// a clean inode populates the buffer (lazy-loading the existing
+    /// composition once if non-empty); subsequent writes splice into
+    /// the buffer locally with no gateway traffic. Bytes are shipped
+    /// to the gateway only on [`Self::flush`] (or implicit close via
+    /// [`Self::release`]).
+    ///
+    /// Bug 9 (GCP 2026-05-04): the previous implementation
+    /// round-tripped the entire file through the gateway on every
+    /// kernel pwrite, producing O(N²) wire traffic.
     pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32, i32> {
         let entry = self.inodes.get(&ino).ok_or(libc_enoent())?;
         let (old_size, old_composition_id) = match entry {
@@ -250,36 +275,53 @@ impl<G: GatewayOps> KisekiFuse<G> {
             _ => return Err(libc_eisdir()),
         };
 
-        // Read existing data.
-        let mut buf = if old_size > 0 {
-            self.block_gateway(self.gateway.read(ReadRequest {
-                tenant_id: self.tenant_id,
-                namespace_id: self.namespace_id,
-                composition_id: old_composition_id,
-                offset: 0,
-                length: old_size,
-            }))
-            .map(|r| r.data)
-            .map_err(|_| libc_eio())?
-        } else {
-            Vec::new()
-        };
+        // Lazy-load the existing file content into the dirty buffer
+        // on first write. Empty files start with an empty buffer.
+        if !self.dirty.contains_key(&ino) {
+            let initial = if old_size > 0 {
+                self.block_gateway(self.gateway.read(ReadRequest {
+                    tenant_id: self.tenant_id,
+                    namespace_id: self.namespace_id,
+                    composition_id: old_composition_id,
+                    offset: 0,
+                    length: old_size,
+                }))
+                .map(|r| r.data)
+                .map_err(|_| libc_eio())?
+            } else {
+                Vec::new()
+            };
+            self.dirty.insert(ino, initial);
+        }
+        let buf = self.dirty.get_mut(&ino).expect("inserted above");
 
-        // Extend buffer if offset + data goes beyond current size.
         #[allow(clippy::cast_possible_truncation)]
-        let end = offset as usize + data.len();
+        let start = offset as usize;
+        let end = start + data.len();
         if end > buf.len() {
             buf.resize(end, 0);
         }
-
-        // Splice new data in.
-        #[allow(clippy::cast_possible_truncation)]
-        let start = offset as usize;
         buf[start..end].copy_from_slice(data);
 
         let new_size = buf.len() as u64;
+        if let Some(InodeEntry::File { size, .. }) = self.inodes.get_mut(&ino) {
+            *size = new_size;
+        }
 
-        // Write the full buffer as a new composition.
+        #[allow(clippy::cast_possible_truncation)]
+        let written = data.len() as u32;
+        Ok(written)
+    }
+
+    /// Flush a file's dirty buffer to the gateway as a new composition,
+    /// updating the inode's `composition_id`. No-op if the inode has
+    /// no dirty data.
+    ///
+    /// Called by the FUSE daemon on `FUSE_FLUSH` and `FUSE_RELEASE`.
+    pub fn flush(&mut self, ino: Ino) -> Result<(), i32> {
+        let Some(buf) = self.dirty.remove(&ino) else {
+            return Ok(());
+        };
         let resp = self
             .block_gateway(self.gateway.write(WriteRequest {
                 tenant_id: self.tenant_id,
@@ -290,21 +332,10 @@ impl<G: GatewayOps> KisekiFuse<G> {
                 workflow_ref: None,
             }))
             .map_err(|_| libc_eio())?;
-
-        // Update inode.
-        if let Some(InodeEntry::File {
-            composition_id,
-            size,
-            ..
-        }) = self.inodes.get_mut(&ino)
-        {
+        if let Some(InodeEntry::File { composition_id, .. }) = self.inodes.get_mut(&ino) {
             *composition_id = resp.composition_id;
-            *size = new_size;
         }
-
-        #[allow(clippy::cast_possible_truncation)]
-        let written = data.len() as u32;
-        Ok(written)
+        Ok(())
     }
 
     /// Write a new file (create + write) under the given parent directory.
@@ -392,6 +423,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
         self.children.remove(&(parent, name.to_owned()));
         self.inodes.remove(&ino);
+        self.dirty.remove(&ino);
         Ok(())
     }
 
@@ -498,6 +530,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
         }
         self.children.remove(&(parent, name.to_owned()));
         self.inodes.remove(&ino);
+        self.dirty.remove(&ino);
         Ok(())
     }
 
@@ -958,6 +991,116 @@ mod tests {
         // The FUSE layer does not support writable shared mmap.
         // We verify the constant is defined and usable.
         const { assert!(ENOTSUP > 0, "ENOTSUP must be a valid errno") };
+    }
+
+    /// Bug 9 (GCP 2026-05-04): every FUSE write read-modify-writes
+    /// the entire file. A 1-byte pwrite at offset 0 of a 64 MiB file
+    /// shipped 64 MiB across the wire (read) + 64 MiB (write) = 128 MiB.
+    /// O(N²) wire amplification under streaming writes. After the fix
+    /// the dirty buffer absorbs writes locally; only `flush()` (or
+    /// implicit close) ships bytes to the gateway.
+    ///
+    /// Spy gateway counts bytes shipped through `read`/`write`. The
+    /// assertion: between create + reset + 1-byte write, we must NOT
+    /// transfer the entire file.
+    #[test]
+    fn small_write_does_not_re_ship_whole_file() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        struct SpyGateway {
+            inner: InMemoryGateway,
+            write_bytes: Arc<AtomicU64>,
+            read_bytes: Arc<AtomicU64>,
+        }
+
+        #[async_trait::async_trait]
+        impl GatewayOps for SpyGateway {
+            async fn read(
+                &self,
+                req: ReadRequest,
+            ) -> Result<kiseki_gateway::ops::ReadResponse, kiseki_gateway::error::GatewayError>
+            {
+                let resp = self.inner.read(req).await?;
+                self.read_bytes
+                    .fetch_add(resp.data.len() as u64, Ordering::Relaxed);
+                Ok(resp)
+            }
+            async fn write(
+                &self,
+                req: WriteRequest,
+            ) -> Result<kiseki_gateway::ops::WriteResponse, kiseki_gateway::error::GatewayError>
+            {
+                self.write_bytes
+                    .fetch_add(req.data.len() as u64, Ordering::Relaxed);
+                self.inner.write(req).await
+            }
+            async fn delete(
+                &self,
+                tenant_id: OrgId,
+                namespace_id: NamespaceId,
+                composition_id: CompositionId,
+            ) -> Result<(), kiseki_gateway::error::GatewayError> {
+                self.inner.delete(tenant_id, namespace_id, composition_id).await
+            }
+        }
+
+        let mut compositions = CompositionStore::new();
+        compositions.add_namespace(Namespace {
+            id: test_namespace(),
+            tenant_id: test_tenant(),
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        });
+        let chunks = ChunkStore::new();
+        let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let inner = InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
+
+        let read_bytes = Arc::new(AtomicU64::new(0));
+        let write_bytes = Arc::new(AtomicU64::new(0));
+        let spy = SpyGateway {
+            inner,
+            read_bytes: Arc::clone(&read_bytes),
+            write_bytes: Arc::clone(&write_bytes),
+        };
+        let mut fs = KisekiFuse::new(spy, test_tenant(), test_namespace());
+
+        // Mimic the kernel splitting a user-issued 4 MiB write into
+        // 32 × 128 KiB FUSE pwrite ops on a fresh file.
+        let ino = fs.create("big.bin", Vec::new()).unwrap();
+
+        read_bytes.store(0, Ordering::Relaxed);
+        write_bytes.store(0, Ordering::Relaxed);
+
+        let chunk = vec![0u8; 128 * 1024];
+        let total_bytes = 4 * 1024 * 1024u64;
+        let chunks = usize::try_from(total_bytes).unwrap() / chunk.len();
+        for i in 0..chunks {
+            fs.write(ino, (i * chunk.len()) as u64, &chunk).unwrap();
+        }
+        // Single explicit flush at the end of the open (matches what
+        // the FUSE daemon does on FUSE_FLUSH / FUSE_RELEASE).
+        fs.flush(ino).unwrap();
+
+        let r = read_bytes.load(Ordering::Relaxed);
+        let w = write_bytes.load(Ordering::Relaxed);
+        // Ideal: r=0 (file was empty), w=total_bytes (one composition
+        // write at flush). Pre-fix: w grew quadratically — e.g. for
+        // 32 pwrites of 128 KiB each, write traffic ≈ 32 × avg(2 MiB)
+        // = 64 MiB+. Cap at 1.5× total to leave headroom for envelope
+        // overhead but reject the O(N²) shape.
+        assert_eq!(
+            r, 0,
+            "writes to a fresh empty file should not trigger reads",
+        );
+        let limit = (total_bytes * 3) / 2;
+        assert!(
+            w <= limit,
+            "{chunks} sequential pwrites shipped {w} bytes (>{limit}); \
+             FUSE is amplifying writes — N pwrites should ship ≈ file size, not N × file size",
+        );
     }
 
     #[test]

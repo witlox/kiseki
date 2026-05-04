@@ -64,5 +64,6 @@ name = "c_abi_link"
 required-features = ["ffi"]
 
 [dev-dependencies]
+async-trait = "0.1"
 proptest = { workspace = true }
 tempfile = "3"

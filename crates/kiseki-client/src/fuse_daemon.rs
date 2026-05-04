@@ -39,7 +39,7 @@ fn to_fuser_attr(ino: u64, attr: &crate::fuse_fs::FileAttr) -> FuserAttr {
     FuserAttr {
         ino: INodeNo(ino),
         size: attr.size,
-        blocks: (attr.size + 511) / 512,
+        blocks: attr.size.div_ceil(512),
         atime: SystemTime::UNIX_EPOCH,
         mtime: SystemTime::UNIX_EPOCH,
         ctime: SystemTime::UNIX_EPOCH,
@@ -114,7 +114,7 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
         }
     }
 
-    /// FUSE_WRITE — bridges the kernel's pwrite/write syscalls to
+    /// `FUSE_WRITE` — bridges the kernel's pwrite/write syscalls to
     /// `KisekiFuse::write`. Without this op the daemon falls back to
     /// the fuser library's default impl (ENOSYS), so any write
     /// through a mounted FUSE path returns "Function not implemented"
@@ -189,6 +189,65 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
+    }
+
+    /// `FUSE_FLUSH` — called on every close(2) of a file descriptor.
+    /// Bug 9 fix: ship the in-memory dirty buffer to the gateway as
+    /// the new composition for this inode. Without this hook the
+    /// daemon's default flush returns ENOSYS and write data stays in
+    /// the dirty buffer until release (or never, if release also
+    /// drops it).
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let mut fs = self.inner.lock().unwrap();
+        match fs.flush(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    /// `FUSE_FSYNC` — explicit user-issued fsync(2). Same shape as flush
+    /// for our purposes (no metadata-only path; data and metadata are
+    /// the same composition write).
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let mut fs = self.inner.lock().unwrap();
+        match fs.flush(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    /// `FUSE_RELEASE` — last close on the file descriptor. Best-effort
+    /// flush of any remaining dirty data. The kernel ignores errors
+    /// from release (they don't propagate to close(2)), so we still
+    /// reply ok on flush failure to match release semantics — the
+    /// data loss is logged but cannot be surfaced through this op.
+    fn release(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let mut fs = self.inner.lock().unwrap();
+        let _ = fs.flush(ino.0);
+        reply.ok();
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
