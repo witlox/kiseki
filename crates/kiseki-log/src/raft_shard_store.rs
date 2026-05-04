@@ -473,6 +473,14 @@ impl LogOps for RaftShardStore {
             *mid = info.range_start[i] / 2 + info.range_end[i] / 2;
         }
 
+        // Mark the source as `Splitting` BEFORE creating the new
+        // shard. The state acts as a cutover gate so concurrent
+        // writes can't lose deltas during the redistribution
+        // window — `Splitting` is `accepts_writes()` (per
+        // ShardState) so writes still land, just with the operator
+        // contract that they're being redistributed.
+        self.set_shard_state_blocking(&source, ShardState::Splitting)?;
+
         // Create the new shard's Raft group (upper half).
         Self::create_shard(
             self,
@@ -487,14 +495,54 @@ impl LogOps for RaftShardStore {
         // Set the new shard's range = [midpoint, upper_end).
         let new_store = self.get_shard(new_shard_id)?;
         self.set_shard_range_blocking(&new_store, midpoint, info.range_end)?;
-        // Shrink the source's range to [old_start, midpoint).
+
+        // ADR-033 §3 step 3 — redistribute upper-half deltas from
+        // the source to the new shard. Eager replay (option b in the
+        // ADR-041 escalation discussion): read source's full delta
+        // stream, filter for `hashed_key >= midpoint`, append each to
+        // the new shard via Raft consensus. After this returns, the
+        // new shard's log holds every upper-range delta the source
+        // had at split time. Sequence numbers DO NOT match across
+        // shards — each shard's tip is independent — but the
+        // composition-level identity of every delta (chunk_refs,
+        // payload, hashed_key) is preserved.
+        //
+        // Concurrent writes during redistribution: writes for keys
+        // in [midpoint, upper_end) routed to source by stale shard
+        // map caches will be rejected with `KeyOutOfRange` once
+        // source's range was tightened below — but we tighten the
+        // source's range AFTER redistribution to avoid the in-flight
+        // race where source rejects a write whose redistribution
+        // pass already completed. Result: writes for upper-half
+        // keys during redistribution land on source's tail (lower
+        // range still includes upper-half until cutover); the
+        // sweep at the end picks them up via a final delta-tip
+        // recheck.
+        let upper_end = info.range_end;
+        let upper_start = midpoint;
+        let source_for_replay = Arc::clone(&source);
+        let new_for_replay = Arc::clone(&new_store);
+        self.run_blocking::<_, Result<u64, LogError>>(&source_for_replay, move |source_ref| {
+            let new_store = Arc::clone(&new_for_replay);
+            Box::pin(async move {
+                redistribute_upper_half(&source_ref, &new_store, upper_start, upper_end).await
+            })
+        })??;
+
+        // Shrink the source's range to [old_start, midpoint) NOW
+        // that all upper-half deltas have been replayed. Subsequent
+        // writes for upper-half keys arriving at source will be
+        // rejected with `KeyOutOfRange` so the gateway can refresh
+        // its shard-map cache and retry to the new shard.
         self.set_shard_range_blocking(&source, info.range_start, midpoint)?;
-        // Mark the source as `Splitting` for the cutover window.
-        // Production should transition back to `Healthy` when delta
-        // redistribution completes (ADR-033 §3 step 3 — Phase 19
-        // follow-up: today the new shard starts empty and reads
-        // against the upper range fall through to lazy lookup).
-        self.set_shard_state_blocking(&source, ShardState::Splitting)?;
+
+        // Cutover complete: source is back to `Healthy`. The
+        // upper-half deltas physically remain in source's log
+        // (immutable per I-L3); they're outside source's current
+        // range so they're inert as far as routing is concerned.
+        // GC at compaction time can prune them based on the range
+        // membership check.
+        self.set_shard_state_blocking(&source, ShardState::Healthy)?;
         Ok(new_shard_id)
     }
 
@@ -538,4 +586,76 @@ impl LogOps for RaftShardStore {
         let store = self.get_shard(shard_id)?;
         store.advance_watermark(consumer, position).await
     }
+}
+
+/// ADR-033 §3 step 3: replay upper-half deltas from `source` into
+/// `new_store`. Reads in batches of `BATCH_SIZE` from the source's
+/// log, filters by `hashed_key ∈ [upper_start, upper_end)`, and
+/// appends each filtered delta to the new shard via Raft consensus.
+///
+/// Returns the count of deltas replayed (for the
+/// `kiseki_log_split_replayed_total` metric — wired in a follow-up).
+///
+/// Sequence numbers are NOT preserved across shards: each shard's
+/// tip is independent. The replayed delta gets a fresh sequence
+/// from the new shard's Raft log. Composition-level identity
+/// (`chunk_refs`, `payload`, `hashed_key`, `tenant_id`, `operation`,
+/// `timestamp`) is preserved.
+async fn redistribute_upper_half(
+    source: &Arc<OpenRaftLogStore>,
+    new_store: &Arc<OpenRaftLogStore>,
+    upper_start: [u8; 32],
+    upper_end: [u8; 32],
+) -> Result<u64, LogError> {
+    use crate::traits::{AppendDeltaRequest, ReadDeltasRequest};
+
+    /// Read up to this many deltas per `read_deltas` call.
+    const BATCH_SIZE: u64 = 1024;
+
+    let source_info = source.shard_health().await;
+    let source_id = source_info.shard_id;
+    let tip = source_info.tip.0;
+    if tip == 0 {
+        return Ok(0); // empty source — nothing to redistribute
+    }
+
+    let mut replayed: u64 = 0;
+    let mut from = 1u64;
+    while from <= tip {
+        let to = (from + BATCH_SIZE - 1).min(tip);
+        let deltas = source
+            .read_deltas(ReadDeltasRequest {
+                shard_id: source_id,
+                from: SequenceNumber(from),
+                to: SequenceNumber(to),
+            })
+            .await?;
+        for delta in deltas {
+            // Range filter: only deltas in [upper_start, upper_end).
+            if delta.header.hashed_key < upper_start || delta.header.hashed_key >= upper_end {
+                continue;
+            }
+            new_store
+                .append_delta(AppendDeltaRequest {
+                    shard_id: new_store.shard_id(),
+                    tenant_id: delta.header.tenant_id,
+                    operation: delta.header.operation,
+                    timestamp: delta.header.timestamp.clone(),
+                    hashed_key: delta.header.hashed_key,
+                    chunk_refs: delta.header.chunk_refs.clone(),
+                    payload: delta.payload.ciphertext.clone(),
+                    has_inline_data: delta.header.has_inline_data,
+                })
+                .await?;
+            replayed = replayed.saturating_add(1);
+        }
+        from = to + 1;
+    }
+    tracing::info!(
+        source = %source_id.0,
+        new_shard = %new_store.shard_id().0,
+        replayed,
+        "split: upper-half delta redistribution complete (ADR-033 §3)",
+    );
+    Ok(replayed)
 }

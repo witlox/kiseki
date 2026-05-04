@@ -236,6 +236,155 @@ fn adr_033_default_for_3_node_cluster_yields_at_least_3_shards() {
     );
 }
 
+/// ADR-033 §3 step 3 — delta redistribution. After
+/// `LogOps::split_shard`, deltas in the upper half of the original
+/// range MUST appear in the new shard's log. Pre-redistribution
+/// (commit f60d5fc and earlier) the new shard started empty and
+/// reads against upper-half keys returned NotFound regardless of
+/// what the source had previously committed.
+///
+/// Test shape:
+/// 1. Create a shard and append two deltas: one with `hashed_key`
+///    in the lower half and one in the upper half (relative to the
+///    midpoint that `split_shard` will compute).
+/// 2. Call `split_shard`.
+/// 3. Verify the original shard still has the lower-half delta
+///    (it stays in the now-restricted range) AND the new shard has
+///    the upper-half delta replayed.
+#[test]
+fn split_shard_redistributes_upper_half_deltas_to_new_shard() {
+    use kiseki_common::ids::ChunkId;
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+    use kiseki_log::traits::{AppendDeltaRequest, ReadDeltasRequest};
+    use kiseki_log::OperationType;
+
+    let rt = make_runtime();
+    let (store, shard_id) = single_node_with_shard_and_addr(&rt);
+
+    let make_req = |hashed_key: [u8; 32]| AppendDeltaRequest {
+        shard_id,
+        tenant_id: test_tenant(),
+        operation: OperationType::Create,
+        timestamp: DeltaTimestamp {
+            hlc: HybridLogicalClock {
+                physical_ms: 1000,
+                logical: 0,
+                node_id: NodeId(1),
+            },
+            wall: WallTime {
+                millis_since_epoch: 1000,
+                timezone: "UTC".into(),
+            },
+            quality: ClockQuality::Ntp,
+        },
+        hashed_key,
+        chunk_refs: vec![ChunkId([0xab; 32])],
+        payload: vec![0xab; 64],
+        has_inline_data: false,
+    };
+
+    // Default range is [0; 32]..[0xff; 32]. Midpoint (per the
+    // big-endian average formula) starts at 0x7f. Lower-half key
+    // < 0x7f, upper-half >= 0x80.
+    let lower_half_key = [0x10u8; 32];
+    let upper_half_key = [0xa0u8; 32];
+
+    rt.block_on(async {
+        LogOps::append_delta(&store, make_req(lower_half_key))
+            .await
+            .expect("append lower-half delta");
+        LogOps::append_delta(&store, make_req(upper_half_key))
+            .await
+            .expect("append upper-half delta");
+    });
+
+    let new_shard = make_shard_id(50);
+    LogOps::split_shard(&store, shard_id, new_shard, NodeId(1)).expect("split succeeds");
+    rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
+
+    // Original shard: read its full log via the trait. The
+    // lower-half delta MUST still be there.
+    let orig_health = rt
+        .block_on(store.shard_health(shard_id))
+        .expect("orig health");
+    let orig_deltas = rt
+        .block_on(LogOps::read_deltas(
+            &store,
+            ReadDeltasRequest {
+                shard_id,
+                from: kiseki_common::ids::SequenceNumber(1),
+                to: orig_health.tip,
+            },
+        ))
+        .expect("orig read");
+    assert!(
+        orig_deltas
+            .iter()
+            .any(|d| d.header.hashed_key == lower_half_key),
+        "original shard lost the lower-half delta during split — \
+         redistribution should NOT touch lower-half deltas",
+    );
+
+    // New shard: read its log. The upper-half delta MUST be there
+    // (replayed from the source).
+    let new_health = rt
+        .block_on(store.shard_health(new_shard))
+        .expect("new shard health");
+    assert!(
+        new_health.tip.0 >= 1,
+        "new shard tip is {}; expected ≥ 1 after upper-half delta \
+         redistribution. ADR-033 §3 step 3.",
+        new_health.tip.0,
+    );
+    let new_deltas = rt
+        .block_on(LogOps::read_deltas(
+            &store,
+            ReadDeltasRequest {
+                shard_id: new_shard,
+                from: kiseki_common::ids::SequenceNumber(1),
+                to: new_health.tip,
+            },
+        ))
+        .expect("new shard read");
+    assert!(
+        new_deltas
+            .iter()
+            .any(|d| d.header.hashed_key == upper_half_key),
+        "new shard does not have the upper-half delta after split — \
+         redistribution failed. ADR-033 §3 step 3 requires source's \
+         upper-half deltas to be replayed into the new shard.",
+    );
+    assert!(
+        !new_deltas
+            .iter()
+            .any(|d| d.header.hashed_key == lower_half_key),
+        "new shard has a lower-half delta — redistribution leaked \
+         a delta that should have stayed in source.",
+    );
+}
+
+/// Helper: build a `RaftShardStore` + a single shard with a real
+/// listener address (so `split_shard` can spawn a new Raft group
+/// on the multiplexed listener).
+fn single_node_with_shard_and_addr(rt: &tokio::runtime::Runtime) -> (RaftShardStore, ShardId) {
+    let port = find_port();
+    let mut peers = BTreeMap::new();
+    peers.insert(1u64, format!("127.0.0.1:{port}"));
+
+    let store = RaftShardStore::new(1, peers, None);
+    let shard_id = make_shard_id(40);
+    store.create_shard(
+        shard_id,
+        test_tenant(),
+        NodeId(1),
+        ShardConfig::default(),
+        Some(&format!("127.0.0.1:{port}")),
+        true,
+    );
+    rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
+    (store, shard_id)
+}
+
 /// `LogOps::set_shard_state` was a no-op stub. Now wired through
 /// `LogCommand::SetShardState` so cutover transitions
 /// (`Healthy` → `Splitting`/`Merging` → `Healthy`/`Retiring`) are
