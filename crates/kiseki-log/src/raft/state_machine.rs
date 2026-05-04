@@ -151,6 +151,7 @@ fn op_to_u8(op: OperationType) -> u8 {
         OperationType::Rename => 3,
         OperationType::SetAttribute => 4,
         OperationType::Finalize => 5,
+        OperationType::NamespaceCreate => 6,
     }
 }
 
@@ -161,7 +162,8 @@ fn u8_to_op(v: u8) -> OperationType {
         2 => OperationType::Delete,
         3 => OperationType::Rename,
         4 => OperationType::SetAttribute,
-        _ => OperationType::Finalize,
+        5 => OperationType::Finalize,
+        _ => OperationType::NamespaceCreate,
     }
 }
 

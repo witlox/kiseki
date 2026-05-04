@@ -280,6 +280,24 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     Then S3 GET from node-2 returns the same 1MB
     And the GET on node-2 was served from its local store, not via fabric
 
+  # ADR-040 Phase 18 closure. The 3rd GCP perf run (2026-05-04) hit
+  # this gap directly: `PUT /<fresh-bucket>` registered the
+  # namespace ONLY on the contacted node, follower hydrators saw
+  # the Create delta for an unregistered namespace and skipped in
+  # transient retry forever (`reason="namespace_not_registered"`).
+  # The scenario above uses the bootstrap "default" bucket where
+  # every node pre-registers the namespace at boot, so the symptom
+  # never surfaced in tests. This one exercises a fresh bucket
+  # where only the new `OperationType::NamespaceCreate` delta makes
+  # cross-node visibility work.
+  @integration @multi-node @cross-node
+  Scenario: Cross-node read after leader-only bucket-CREATE-and-PUT (Phase 18)
+    Given a 3-node kiseki cluster
+    When a client creates a fresh bucket on node-1
+    And a client writes 1MB to that fresh bucket on node-1
+    And every follower has received the fragment
+    Then S3 GET from any follower in the fresh bucket returns the same 1MB
+
   @integration @multi-node @cross-node
   Scenario: Read survives leader failure (D-1)
     Given a 3-node kiseki cluster

@@ -93,7 +93,8 @@ impl PersistentShardStore {
                     2 => crate::delta::OperationType::Delete,
                     3 => crate::delta::OperationType::Rename,
                     4 => crate::delta::OperationType::SetAttribute,
-                    _ => crate::delta::OperationType::Finalize,
+                    5 => crate::delta::OperationType::Finalize,
+                    _ => crate::delta::OperationType::NamespaceCreate,
                 };
                 let timestamp = DeltaTimestamp {
                     hlc: HybridLogicalClock {
@@ -172,6 +173,7 @@ impl LogOps for PersistentShardStore {
                 crate::delta::OperationType::Rename => 3,
                 crate::delta::OperationType::SetAttribute => 4,
                 crate::delta::OperationType::Finalize => 5,
+                crate::delta::OperationType::NamespaceCreate => 6,
             },
             hashed_key: req.hashed_key,
             payload: req.payload,

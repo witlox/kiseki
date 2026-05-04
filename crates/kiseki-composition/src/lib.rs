@@ -26,11 +26,12 @@ pub mod persistent;
 pub use composition::{
     composition_hash_key, decode_composition_create_payload,
     decode_composition_create_payload_named, decode_composition_delete_payload,
-    decode_composition_update_payload, encode_composition_create_payload,
-    encode_composition_create_payload_named, encode_composition_delete_payload,
-    encode_composition_update_payload, Composition, CompositionOps, DeleteResult,
+    decode_composition_update_payload, decode_namespace_create_payload,
+    encode_composition_create_payload, encode_composition_create_payload_named,
+    encode_composition_delete_payload, encode_composition_update_payload,
+    encode_namespace_create_payload, Composition, CompositionOps, DeleteResult,
     COMPOSITION_CREATE_PAYLOAD_LEN, COMPOSITION_DELETE_PAYLOAD_LEN, COMPOSITION_UPDATE_PAYLOAD_LEN,
-    INLINE_DATA_THRESHOLD,
+    INLINE_DATA_THRESHOLD, NAMESPACE_CREATE_PAYLOAD_LEN,
 };
 pub use error::CompositionError;
 pub use hydrator::CompositionHydrator;

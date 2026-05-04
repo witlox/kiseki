@@ -293,7 +293,8 @@ impl RaftLogStore {
                     2 => crate::delta::OperationType::Delete,
                     3 => crate::delta::OperationType::Rename,
                     4 => crate::delta::OperationType::SetAttribute,
-                    _ => crate::delta::OperationType::Finalize,
+                    5 => crate::delta::OperationType::Finalize,
+                    _ => crate::delta::OperationType::NamespaceCreate,
                 };
 
                 // Construct a minimal timestamp for the state machine.
@@ -368,7 +369,8 @@ impl RaftLogStore {
                     2 => crate::delta::OperationType::Delete,
                     3 => crate::delta::OperationType::Rename,
                     4 => crate::delta::OperationType::SetAttribute,
-                    _ => crate::delta::OperationType::Finalize,
+                    5 => crate::delta::OperationType::Finalize,
+                    _ => crate::delta::OperationType::NamespaceCreate,
                 };
                 let timestamp = kiseki_common::time::DeltaTimestamp {
                     hlc: kiseki_common::time::HybridLogicalClock {
@@ -448,6 +450,7 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
         crate::delta::OperationType::Rename => 3,
         crate::delta::OperationType::SetAttribute => 4,
         crate::delta::OperationType::Finalize => 5,
+        crate::delta::OperationType::NamespaceCreate => 6,
     }
 }
 

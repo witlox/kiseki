@@ -52,6 +52,7 @@ fn proto_op_to_domain(op: i32) -> Result<crate::delta::OperationType, Status> {
         4 => Ok(crate::delta::OperationType::Rename),
         5 => Ok(crate::delta::OperationType::SetAttribute),
         6 => Ok(crate::delta::OperationType::Finalize),
+        7 => Ok(crate::delta::OperationType::NamespaceCreate),
         _ => Err(Status::invalid_argument(format!(
             "unknown operation type: {op}"
         ))),
@@ -66,6 +67,7 @@ fn domain_op_to_proto(op: crate::delta::OperationType) -> i32 {
         crate::delta::OperationType::Rename => 4,
         crate::delta::OperationType::SetAttribute => 5,
         crate::delta::OperationType::Finalize => 6,
+        crate::delta::OperationType::NamespaceCreate => 7,
     }
 }
 

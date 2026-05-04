@@ -70,6 +70,14 @@ struct Staging {
     /// deltas — looked up via reverse index since the Delete payload
     /// itself carries only the `composition_id`.
     name_removes: Vec<(NamespaceId, String)>,
+    /// ADR-040 Phase 18 — namespaces to register in the in-memory
+    /// `CompositionStore` wrapper before applying any Create deltas
+    /// that reference them. Populated from
+    /// `OperationType::NamespaceCreate` deltas. Applied via
+    /// `CompositionStore::add_namespace` directly (not via the
+    /// storage trait) since the namespace map lives outside the
+    /// per-composition durable layer.
+    namespace_inserts: Vec<crate::namespace::Namespace>,
 }
 
 impl Staging {
@@ -293,6 +301,9 @@ impl CompositionHydrator {
                 OperationType::Create => stage_create(&store, &mut staging, delta),
                 OperationType::Update => stage_update(&store, &mut staging, delta),
                 OperationType::Delete => stage_delete(&store, &mut staging, delta),
+                OperationType::NamespaceCreate => {
+                    stage_namespace_create(&mut staging, delta)
+                }
                 // Rename, SetAttribute, Finalize aren't installed by
                 // the hydrator. Treat as Applied so the seq advances
                 // and we don't infinite-loop.
@@ -361,6 +372,19 @@ impl CompositionHydrator {
             // state. (If there was none, this is a no-op.)
             Some(None)
         };
+
+        // ADR-040 Phase 18 — apply staged namespaces to the in-memory
+        // CompositionStore wrapper BEFORE the storage batch commits.
+        // The namespace map lives on the wrapper (not the per-
+        // composition durable layer), so subsequent Create deltas in
+        // the same poll see the registered namespace via
+        // `store.namespace(...)`. `add_namespace` is idempotent —
+        // re-applying the same NamespaceCreate after a hydrator
+        // restart is safe (it overwrites with identical metadata).
+        let namespace_inserts = std::mem::take(&mut staging.namespace_inserts);
+        for ns in namespace_inserts {
+            store.add_namespace(ns);
+        }
 
         let batch = HydrationBatch {
             puts: staging.puts.into_values().collect(),
@@ -470,9 +494,24 @@ fn stage_create(
         }
         return DeltaOutcome::Applied;
     }
-    // Look up the namespace in-memory; if missing, transient
-    // (Phase 18 will replicate tenant-created namespaces).
-    let Some(ns) = store.namespace(namespace_id) else {
+    // Look up the namespace — first in this batch's staged
+    // namespace_inserts (ADR-040 Phase 18: a NamespaceCreate delta
+    // may immediately precede the Create delta in the same poll),
+    // then in the durable in-memory store. If neither has it, fall
+    // back to the transient skip — the producer side either hasn't
+    // emitted the NamespaceCreate yet (rolling upgrade), or there's
+    // a delta-ordering bug. Either way the next poll will retry and
+    // the exhausted-retries promotion turns into a permanent skip
+    // if it never resolves.
+    let (tenant_id_for_comp, shard_id_for_comp) = if let Some(ns) = staging
+        .namespace_inserts
+        .iter()
+        .find(|n| n.id == namespace_id)
+    {
+        (ns.tenant_id, ns.shard_id)
+    } else if let Some(ns) = store.namespace(namespace_id) {
+        (ns.tenant_id, ns.shard_id)
+    } else {
         return DeltaOutcome::TransientSkip {
             reason: "namespace_not_registered",
         };
@@ -481,9 +520,9 @@ fn stage_create(
     let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
     staging.put(Composition {
         id: comp_id,
-        tenant_id: ns.tenant_id,
+        tenant_id: tenant_id_for_comp,
         namespace_id,
-        shard_id: ns.shard_id,
+        shard_id: shard_id_for_comp,
         chunks,
         version: 1,
         size,
@@ -547,6 +586,21 @@ fn stage_delete(
         staging.unbind_name(ns, name);
     }
     staging.remove(comp_id);
+    DeltaOutcome::Applied
+}
+
+/// ADR-040 Phase 18 — register a namespace on this follower.
+fn stage_namespace_create(
+    staging: &mut Staging,
+    delta: &kiseki_log::delta::Delta,
+) -> DeltaOutcome {
+    let Some(ns) = crate::composition::decode_namespace_create_payload(&delta.payload.ciphertext)
+    else {
+        return DeltaOutcome::PermanentSkip {
+            reason: "namespace_create_payload_decode",
+        };
+    };
+    staging.namespace_inserts.push(ns);
     DeltaOutcome::Applied
 }
 

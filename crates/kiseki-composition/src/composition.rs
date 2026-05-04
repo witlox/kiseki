@@ -48,6 +48,66 @@ pub const COMPOSITION_UPDATE_PAYLOAD_LEN: usize = 24;
 /// the follower's local store has the rest already.
 pub const COMPOSITION_DELETE_PAYLOAD_LEN: usize = 16;
 
+/// Wire size of the **`NamespaceCreate`** payload (49 bytes).
+///
+/// ADR-040 Phase 18 — closes the namespace-replication hop.
+///
+/// Layout:
+///   `[0..16)`  `namespace_id` UUID
+///   `[16..32)` `tenant_id` (`OrgId`) UUID
+///   `[32..48)` `shard_id` UUID
+///   `[48]`     flags byte:
+///                 bit 0 = `read_only`
+///                 bit 1 = `versioning_enabled`
+///                 bits 2-7 reserved (must be 0 for v1)
+///
+/// `compliance_tags` is intentionally not in this payload — operators
+/// who need namespace-scoped compliance tags should configure them
+/// via the control plane after the namespace is registered. A future
+/// v2 payload can extend the wire with a length-prefixed tag array
+/// using the same length-based dispatch as Create's optional name.
+pub const NAMESPACE_CREATE_PAYLOAD_LEN: usize = 49;
+
+/// Encode a `NamespaceCreate` delta payload.
+#[must_use]
+pub fn encode_namespace_create_payload(ns: &crate::namespace::Namespace) -> Vec<u8> {
+    let mut out = Vec::with_capacity(NAMESPACE_CREATE_PAYLOAD_LEN);
+    out.extend_from_slice(ns.id.0.as_bytes());
+    out.extend_from_slice(ns.tenant_id.0.as_bytes());
+    out.extend_from_slice(ns.shard_id.0.as_bytes());
+    let mut flags = 0u8;
+    if ns.read_only {
+        flags |= 0b0000_0001;
+    }
+    if ns.versioning_enabled {
+        flags |= 0b0000_0010;
+    }
+    out.push(flags);
+    out
+}
+
+/// Decode a `NamespaceCreate` delta payload. Returns `None` if the
+/// length doesn't match [`NAMESPACE_CREATE_PAYLOAD_LEN`] or any UUID
+/// fails to parse. `compliance_tags` is always empty in v1.
+#[must_use]
+pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespace::Namespace> {
+    if payload.len() != NAMESPACE_CREATE_PAYLOAD_LEN {
+        return None;
+    }
+    let ns_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
+    let tenant_uuid = uuid::Uuid::from_slice(&payload[16..32]).ok()?;
+    let shard_uuid = uuid::Uuid::from_slice(&payload[32..48]).ok()?;
+    let flags = payload[48];
+    Some(crate::namespace::Namespace {
+        id: NamespaceId(ns_uuid),
+        tenant_id: kiseki_common::ids::OrgId(tenant_uuid),
+        shard_id: kiseki_common::ids::ShardId(shard_uuid),
+        read_only: flags & 0b0000_0001 != 0,
+        versioning_enabled: flags & 0b0000_0010 != 0,
+        compliance_tags: Vec::new(),
+    })
+}
+
 /// Encode a composition-create delta payload (legacy v1: 40 bytes,
 /// no name).
 #[must_use]
@@ -362,6 +422,13 @@ impl CompositionStore {
     /// Register a namespace.
     pub fn add_namespace(&mut self, ns: Namespace) {
         self.namespaces.insert(ns.id, ns);
+    }
+
+    /// Remove a namespace registration. Used by `ensure_namespace_exists`
+    /// to roll back after a Raft replication failure (ADR-040 Phase 18).
+    /// Returns the removed namespace if it was registered.
+    pub fn remove_namespace(&mut self, id: NamespaceId) -> Option<Namespace> {
+        self.namespaces.remove(&id)
     }
 
     /// Clear all namespace registrations (gateway crash simulation).

@@ -42,6 +42,36 @@ pub async fn emit_delta<L: LogOps + ?Sized>(
     log.append_delta(req).await
 }
 
+/// ADR-040 Phase 18 — emit a `NamespaceCreate` delta to replicate a
+/// namespace registration to followers. The leader's caller has
+/// already added the namespace locally (so the follow-on PUT of the
+/// first object can succeed immediately on the leader); this delta
+/// brings followers' in-memory namespace map up to date.
+pub async fn emit_namespace_create<L: LogOps + ?Sized>(
+    log: &L,
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    namespace: &crate::namespace::Namespace,
+) -> Result<SequenceNumber, LogError> {
+    // Hash the namespace_id as the delta's key. NamespaceCreate isn't
+    // routed by hashed_key today (the hydrator applies it
+    // unconditionally), but we set a stable value so compaction's
+    // key-range invariants remain intact.
+    let mut hashed_key = [0u8; 32];
+    hashed_key[..16].copy_from_slice(namespace.id.0.as_bytes());
+    let payload = crate::composition::encode_namespace_create_payload(namespace);
+    emit_delta(
+        log,
+        shard_id,
+        tenant_id,
+        OperationType::NamespaceCreate,
+        hashed_key,
+        Vec::new(),
+        payload,
+    )
+    .await
+}
+
 /// Phase 16b D-4: emit a `ChunkAndDelta` proposal so the
 /// `cluster_chunk_state` rows for the new chunks land in the per-shard
 /// Raft state machine atomically with the delta itself. Falls back to

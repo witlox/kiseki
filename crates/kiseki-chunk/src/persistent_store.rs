@@ -1019,7 +1019,7 @@ mod tests {
 
     /// Bug 5 regression discovered during the 3rd GCP run: the
     /// multi-extent path panicked with "index out of bounds" when
-    /// called with an empty payload (POSIX `touch` / NFSv4 OPEN-CREATE
+    /// called with an empty payload (POSIX `touch` / `NFSv4` OPEN-CREATE
     /// on a zero-byte file). Empty chunks must skip device allocation
     /// and round-trip cleanly with empty ciphertext.
     #[test]

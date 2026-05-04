@@ -122,6 +122,7 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
         crate::delta::OperationType::Rename => 3,
         crate::delta::OperationType::SetAttribute => 4,
         crate::delta::OperationType::Finalize => 5,
+        crate::delta::OperationType::NamespaceCreate => 6,
     }
 }
 

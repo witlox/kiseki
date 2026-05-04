@@ -1932,3 +1932,110 @@ async fn when_multipart_to_key_on_node(
         resp.status(),
     );
 }
+
+// ============================================================================
+// ADR-040 Phase 18 — bucket-create-and-PUT against a fresh (non-bootstrap)
+// bucket. The Phase 16f composition hydrator was already wired; the gap was
+// that bucket creation didn't go through Raft, so followers' hydrators saw
+// Create deltas for an unregistered namespace and skipped them in transient
+// retry forever. Phase 18 emits a `NamespaceCreate` delta on bucket-create
+// so followers register the namespace before applying the subsequent
+// Create deltas. These steps exercise the fresh-bucket path.
+// ============================================================================
+
+#[when("a client creates a fresh bucket on node-1")]
+async fn when_create_fresh_bucket_on_node1(w: &mut KisekiWorld) {
+    // Unique per scenario so we never collide with the bootstrap
+    // `default` bucket or any prior scenario's leftover state.
+    let bucket = format!("phase18-{}", uuid::Uuid::new_v4().simple());
+    let put_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let guard = cluster(w);
+    let n1 = guard.node(1);
+    let url1 = format!("{}/{bucket}", n1.s3_base);
+    loop {
+        let resp = n1
+            .http
+            .put(&url1)
+            .send()
+            .await
+            .expect("HTTP PUT /bucket to node-1");
+        if resp.status().is_success() {
+            break;
+        }
+        // Same leader-fallback shape as the existing PUT step.
+        if let Some(leader_id) = leader_id_via(n1).await {
+            if leader_id != 1 {
+                let leader = guard.node(leader_id);
+                let url_l = format!("{}/{bucket}", leader.s3_base);
+                if let Ok(r2) = leader.http.put(&url_l).send().await {
+                    if r2.status().is_success() {
+                        break;
+                    }
+                }
+            }
+        }
+        if std::time::Instant::now() >= put_deadline {
+            panic!(
+                "PUT /{bucket} (bucket-create) to node-1 kept failing for 30s: {}",
+                resp.status()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    w.cluster.bucket = Some(bucket);
+    w.cluster.key = Some(super::multi_node::unique_key());
+}
+
+#[when("a client writes 1MB to that fresh bucket on node-1")]
+async fn when_client_writes_1mb_to_fresh_bucket(w: &mut KisekiWorld) {
+    when_client_writes_1mb_to_node1(w).await;
+}
+
+#[then("S3 GET from any follower in the fresh bucket returns the same 1MB")]
+async fn then_s3_get_from_any_follower_fresh_bucket(w: &mut KisekiWorld) {
+    // Determine which nodes are followers.
+    let leader_id = {
+        let n1 = cluster(w).node(1);
+        leader_id_via(n1).await.unwrap_or(1)
+    };
+    let bucket = w.cluster.bucket.clone().expect("bucket missing");
+    let etag = w.cluster.last_etag.clone().expect("etag missing");
+    let expected = w
+        .cluster
+        .expected_body
+        .clone()
+        .expect("expected body missing");
+    let mut verified = 0;
+    for node_id in 1..=3 {
+        if node_id == leader_id {
+            continue;
+        }
+        // Same retry shape as the existing then_s3_get_from_node.
+        let body = {
+            let node = cluster(w).node(node_id);
+            let url = format!("{}/{bucket}/{etag}", node.s3_base);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let resp = node
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("HTTP GET from node-{node_id} failed: {e}"));
+                if resp.status().is_success() {
+                    break resp.bytes().await.expect("read body").to_vec();
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "S3 GET from follower node-{node_id} kept failing: last status {}",
+                        resp.status()
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        };
+        assert_eq!(body, expected, "follower node-{node_id} body mismatch");
+        verified += 1;
+    }
+    assert!(verified >= 1, "no followers to verify against — leader was the only node?");
+}

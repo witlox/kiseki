@@ -24,6 +24,17 @@ pub enum OperationType {
     SetAttribute,
     /// Finalize a multipart upload — gates reader visibility (I-L5).
     Finalize,
+    /// Register a new namespace in the per-shard `CompositionStore`.
+    /// ADR-040 Phase 18: closes the namespace-replication hop —
+    /// previously namespace registration mutated the leader's
+    /// `CompositionStore` locally, so followers' hydrators saw create
+    /// deltas for unknown namespaces and skipped them in transient
+    /// retry forever. The new variant encodes the namespace metadata
+    /// in the delta payload so followers register the namespace
+    /// before applying any composition deltas that reference it.
+    /// Tenant + shard + composition-store flags travel in the
+    /// payload (see `kiseki-composition::namespace_create_payload`).
+    NamespaceCreate,
 }
 
 /// System-visible delta header — cleartext metadata.

@@ -674,23 +674,81 @@ impl InMemoryGateway {
     ///
     /// Used by `create_bucket` so the composition store has a registered
     /// namespace before any object write targets it.
+    ///
+    /// ADR-040 Phase 18 — when running with a Raft log attached, the
+    /// new namespace is replicated to followers via a `NamespaceCreate`
+    /// delta. Without this, follower hydrators see Create deltas for an
+    /// unregistered namespace and skip them indefinitely
+    /// (`reason="namespace_not_registered"`), producing the cross-node
+    /// 404 symptom we hit on the GCP perf cluster. The local
+    /// registration happens *first* (and is idempotent) so subsequent
+    /// writes on the same node don't race the Raft round-trip; the
+    /// emitted delta then catches followers up. If the Raft emit
+    /// itself fails (`KeyOutOfRange`, `LeaderUnavailable`, etc.), the
+    /// local registration is rolled back so the next call can retry
+    /// against the actual leader rather than serving locally with no
+    /// follower visibility.
     pub async fn ensure_namespace_exists(
         &self,
         tenant_id: kiseki_common::ids::OrgId,
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<(), GatewayError> {
-        let mut comps = self.compositions.lock().await;
-        if comps.namespace(namespace_id).is_none() {
-            comps.add_namespace(kiseki_composition::namespace::Namespace {
-                id: namespace_id,
+        let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+        let ns = kiseki_composition::namespace::Namespace {
+            id: namespace_id,
+            tenant_id,
+            shard_id,
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        };
+        // Phase 1: local mutation + capture log handle. Scope the
+        // MutexGuard so it drops before any .await point.
+        let log = {
+            let mut comps = self.compositions.lock().await;
+            if comps.namespace(namespace_id).is_some() {
+                return Ok(()); // already registered locally; no-op
+            }
+            comps.add_namespace(ns.clone());
+            comps.log().cloned()
+        };
+        // Phase 2: replicate to followers if a Raft log is attached.
+        if let Some(log) = log {
+            match kiseki_composition::log_bridge::emit_namespace_create(
+                log.as_ref(),
+                shard_id,
                 tenant_id,
-                shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
-                read_only: false,
-                versioning_enabled: false,
-                compliance_tags: Vec::new(),
-            });
+                &ns,
+            )
+            .await
+            {
+                Ok(_seq) => {
+                    tracing::debug!(
+                        namespace_id = %namespace_id.0,
+                        "ensure_namespace_exists: NamespaceCreate replicated via Raft",
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    // Roll back the local registration — without
+                    // follower visibility this would be a stealth
+                    // single-node namespace.
+                    let mut comps = self.compositions.lock().await;
+                    comps.remove_namespace(namespace_id);
+                    tracing::warn!(
+                        namespace_id = %namespace_id.0,
+                        error = %e,
+                        "ensure_namespace_exists: Raft emit failed — rolled back local registration",
+                    );
+                    Err(GatewayError::Upstream(format!(
+                        "namespace replication failed: {e}"
+                    )))
+                }
+            }
+        } else {
+            // Single-node / no-Raft mode: local-only is the contract.
+            Ok(())
         }
-        Ok(())
     }
 }
 

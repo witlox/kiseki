@@ -333,14 +333,14 @@ def test_fuse_cluster_cross_node_read(
     only against a single S3 endpoint (or a load balancer pinned to
     the leader).
     """
-    pytest.skip(
-        "Phase 16 follow-up — gateway compositions store is per-node; "
-        "cross-node S3 GET after a different-node PUT returns 404. "
-        "The Raft log replicates, but the stream processor only "
-        "advances view_store, not the gateway compositions map. "
-        "test_fuse_remote_http_cross_protocol_roundtrip covers the "
-        "single-endpoint FUSE→cluster path that works today."
-    )
+    # ADR-040 Phase 18 closure (commit landing this test): bucket
+    # creation now goes through Raft via `OperationType::NamespaceCreate`
+    # so followers' hydrators register the namespace before applying
+    # subsequent Create deltas. Cross-node S3 GET after a different-
+    # node PUT now returns 200 with the same body. The original skip
+    # text described the Phase 16f composition-hydrator gap that has
+    # since been closed; the actual gap was one layer up (namespace
+    # registration not Raft-replicated), now fixed.
     if not _docker_available():
         pytest.skip("docker daemon not reachable")
 
