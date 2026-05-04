@@ -18,6 +18,7 @@
 //!   - I-Auth2 — optional tenant `IdP` second-stage auth
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod error;
 pub mod mem_gateway;
@@ -130,6 +131,9 @@ pub mod pnfs;
 
 #[cfg(feature = "nfs")]
 pub mod pnfs_ds_server;
+
+#[cfg(feature = "nfs")]
+pub mod portmap;
 
 #[cfg(feature = "s3")]
 pub mod s3;

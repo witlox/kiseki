@@ -15,6 +15,15 @@ pub struct ServerConfig {
     pub s3_addr: SocketAddr,
     /// NFS server address.
     pub nfs_addr: SocketAddr,
+    /// Optional portmapper (RFC 1057) listener address. When set, the
+    /// server binds a minimal portmapper that resolves NFS3 / MOUNT3
+    /// over TCP to `nfs_addr`'s port. Required for unmodified Linux
+    /// `mount -t nfs -o vers=3` clients (Bug 10). `None` disables the
+    /// listener — clients must then mount with explicit
+    /// `mountport=2049,port=2049,mountproto=tcp`. Conventional
+    /// production binding is `0.0.0.0:111`, which requires
+    /// `CAP_NET_BIND_SERVICE` or root.
+    pub portmap_addr: Option<SocketAddr>,
     /// Prometheus metrics HTTP address.
     pub metrics_addr: SocketAddr,
     /// TLS configuration paths (None = plaintext, for development only).
@@ -234,6 +243,20 @@ impl ServerConfig {
             .parse()
             .expect("invalid KISEKI_NFS_ADDR");
 
+        // KISEKI_PORTMAP_ADDR=disabled disables the listener; otherwise
+        // defaults to 0.0.0.0:111 (privileged — needs CAP_NET_BIND_SERVICE).
+        let portmap_addr = match std::env::var("KISEKI_PORTMAP_ADDR")
+            .as_deref()
+            .unwrap_or("0.0.0.0:111")
+        {
+            "disabled" | "" => None,
+            other => Some(
+                other
+                    .parse()
+                    .expect("invalid KISEKI_PORTMAP_ADDR"),
+            ),
+        };
+
         let metrics_addr = std::env::var("KISEKI_METRICS_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:9090".into())
             .parse()
@@ -342,6 +365,7 @@ impl ServerConfig {
             advisory_stream_addr,
             s3_addr,
             nfs_addr,
+            portmap_addr,
             metrics_addr,
             tls,
             data_dir,

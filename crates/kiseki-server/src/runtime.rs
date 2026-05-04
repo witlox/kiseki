@@ -943,6 +943,43 @@ pub async fn run_main(
         );
     });
 
+    // Bug 10 fix: minimal portmapper / RPCBIND listener (RFC 1057).
+    // Without this, unmodified Linux `mount -t nfs -o vers=3` clients
+    // fail with "Connection refused" before any NFS RPC because the
+    // kernel client first hits portmapper on TCP/111 to discover the
+    // NFS / MOUNT port. We always advertise `nfs_addr.port()` for both
+    // NFS3 and MOUNT3 since both are dispatched off the same NFS
+    // listener by program number.
+    if let Some(portmap_addr) = cfg.portmap_addr {
+        match std::net::TcpListener::bind(portmap_addr) {
+            Ok(listener) => {
+                let listener = std::sync::Arc::new(listener);
+                let advertised_port = nfs_addr.port();
+                tracing::info!(
+                    addr = %portmap_addr,
+                    advertised_nfs_port = advertised_port,
+                    "portmapper listening (NFS3 + MOUNT3 → NFS port)",
+                );
+                std::thread::spawn(move || {
+                    kiseki_gateway::portmap::serve_portmap_listener(
+                        &listener,
+                        advertised_port,
+                    );
+                });
+            }
+            Err(e) => {
+                // Don't fail server startup if 111 is taken by a host
+                // rpcbind or unavailable; log and continue. NFSv4 still
+                // works without portmapper.
+                tracing::warn!(
+                    addr = %portmap_addr,
+                    error = %e,
+                    "portmapper bind failed — NFSv3 mounts will need explicit mountport=",
+                );
+            }
+        }
+    }
+
     // pNFS Data Server listener (ADR-038 §D2). Only spawned when pNFS
     // is enabled AND `ds_addr` is configured. Shares the same
     // MdsLayoutManager instance as the NFS dispatcher above so DS
