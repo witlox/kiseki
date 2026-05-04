@@ -186,6 +186,24 @@ pub struct ShardSmInner {
     /// Raft-replicated chunk metadata keyed by `(tenant, chunk_id)`.
     /// See `ClusterChunkStateEntry` doc for the contract.
     pub cluster_chunk_state: HashMap<(OrgId, ChunkId), ClusterChunkStateEntry>,
+    /// Inclusive lower bound of the shard's hashed-key range
+    /// (ADR-033 §4). Mutated through `LogCommand::UpdateShardRange`
+    /// so every replica converges on the same range.
+    pub(crate) range_start: [u8; 32],
+    /// Exclusive upper bound of the shard's hashed-key range.
+    pub(crate) range_end: [u8; 32],
+    /// Shard lifecycle state (ADR-033 §3 / ADR-034). Mutated through
+    /// `LogCommand::SetShardState`. `maintenance` (above) is the
+    /// distinct W4 maintenance-mode flag — both can be set
+    /// independently; the merged report in `shard_health` prefers
+    /// `Maintenance` over the lifecycle state when the W4 flag is on.
+    pub(crate) state: crate::shard::ShardState,
+    /// Shard `ShardConfig` (delta + byte ceilings, inline
+    /// thresholds). Mutated through `LogCommand::SetShardConfig`.
+    /// The Raft-replicated copy makes auto-split triggers consistent
+    /// across replicas (otherwise nodes disagree on when a shard
+    /// crosses the I-L6 ceiling).
+    pub(crate) config: crate::shard::ShardConfig,
 }
 
 impl ShardSmInner {
@@ -202,6 +220,12 @@ impl ShardSmInner {
             last_membership: StoredMembershipOf::<C>::default(),
             inline_store: None,
             cluster_chunk_state: HashMap::new(),
+            // Default range covers the full 256-bit key space — a
+            // single-shard cluster owns everything until split.
+            range_start: [0u8; 32],
+            range_end: [0xFFu8; 32],
+            state: crate::shard::ShardState::Healthy,
+            config: crate::shard::ShardConfig::default(),
         }
     }
 
@@ -322,6 +346,7 @@ impl ShardSmInner {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Big match per LogCommand variant
     fn apply_command(&mut self, cmd: &LogCommand, log_index: u64) -> LogResponse {
         match cmd {
             LogCommand::AppendDelta {
@@ -406,6 +431,42 @@ impl ShardSmInner {
             }
             LogCommand::AdvanceWatermark { consumer, position } => {
                 self.watermarks.advance(consumer, SequenceNumber(*position));
+                LogResponse::Ok
+            }
+            LogCommand::SetShardState { state } => {
+                if let Some(s) = crate::shard::ShardState::from_u8(*state) {
+                    self.state = s;
+                } else {
+                    tracing::warn!(
+                        byte = state,
+                        "SetShardState: unknown ShardState byte; \
+                         leaving state unchanged",
+                    );
+                }
+                LogResponse::Ok
+            }
+            LogCommand::UpdateShardRange {
+                range_start,
+                range_end,
+            } => {
+                self.range_start = *range_start;
+                self.range_end = *range_end;
+                LogResponse::Ok
+            }
+            LogCommand::SetShardConfig {
+                max_delta_count,
+                max_byte_size,
+                inline_threshold_bytes,
+                inline_floor_bytes,
+                inline_ceiling_bytes,
+            } => {
+                self.config = crate::shard::ShardConfig {
+                    max_delta_count: *max_delta_count,
+                    max_byte_size: *max_byte_size,
+                    inline_threshold_bytes: *inline_threshold_bytes,
+                    inline_floor_bytes: *inline_floor_bytes,
+                    inline_ceiling_bytes: *inline_ceiling_bytes,
+                };
                 LogResponse::Ok
             }
         }

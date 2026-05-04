@@ -30,6 +30,7 @@ uuid = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+kiseki-control = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"

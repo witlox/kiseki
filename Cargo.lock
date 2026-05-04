@@ -2066,6 +2066,7 @@ dependencies = [
  "async-trait",
  "futures",
  "kiseki-common",
+ "kiseki-control",
  "kiseki-proto",
  "kiseki-raft",
  "kiseki-tracing",

@@ -582,6 +582,102 @@ impl OpenRaftLogStore {
         Ok(())
     }
 
+    /// Update the shard's `[range_start, range_end)` key range
+    /// through Raft consensus (ADR-033 §4). Used by `split_shard`
+    /// (shrinks source range, sets new shard's range) and
+    /// `merge_shards` (extends target's range to cover the union).
+    ///
+    /// # Errors
+    /// `LogError::LeaderUnavailable` if the local replica is not
+    /// the leader; `LogError::Unavailable` for other write failures.
+    pub async fn set_shard_range(
+        &self,
+        range_start: [u8; 32],
+        range_end: [u8; 32],
+    ) -> Result<(), LogError> {
+        self.raft
+            .client_write(LogCommand::UpdateShardRange {
+                range_start,
+                range_end,
+            })
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    openraft::errors::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_)
+                    )
+                ) {
+                    LogError::LeaderUnavailable(self.shard_id)
+                } else {
+                    LogError::Unavailable
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Transition the shard's lifecycle state through Raft consensus
+    /// (ADR-033 §3 / ADR-034 cutover gates). The W4 maintenance
+    /// flag is a separate field — use `set_maintenance` for that.
+    ///
+    /// # Errors
+    /// As `set_shard_range`.
+    pub async fn set_shard_state(&self, state: ShardState) -> Result<(), LogError> {
+        self.raft
+            .client_write(LogCommand::SetShardState {
+                state: state.as_u8(),
+            })
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    openraft::errors::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_)
+                    )
+                ) {
+                    LogError::LeaderUnavailable(self.shard_id)
+                } else {
+                    LogError::Unavailable
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Replace the shard's `ShardConfig` through Raft consensus.
+    /// Auto-split triggers (`max_delta_count`, `max_byte_size`) read
+    /// from this — every replica must agree on the thresholds or
+    /// they'll fire on different writes.
+    ///
+    /// # Errors
+    /// As `set_shard_range`.
+    pub async fn set_shard_config(
+        &self,
+        config: crate::shard::ShardConfig,
+    ) -> Result<(), LogError> {
+        self.raft
+            .client_write(LogCommand::SetShardConfig {
+                max_delta_count: config.max_delta_count,
+                max_byte_size: config.max_byte_size,
+                inline_threshold_bytes: config.inline_threshold_bytes,
+                inline_floor_bytes: config.inline_floor_bytes,
+                inline_ceiling_bytes: config.inline_ceiling_bytes,
+            })
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    openraft::errors::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_)
+                    )
+                ) {
+                    LogError::LeaderUnavailable(self.shard_id)
+                } else {
+                    LogError::Unavailable
+                }
+            })?;
+        Ok(())
+    }
+
     /// Get the current tip sequence number from the state machine.
     pub async fn current_tip(&self) -> SequenceNumber {
         let inner = self.state.lock().await;
@@ -628,14 +724,18 @@ impl OpenRaftLogStore {
                 .iter()
                 .map(|d| u64::from(d.header.payload_size) + 128)
                 .sum(),
+            // W4 maintenance overrides the lifecycle state in the
+            // health report — it's the operator's "drain in
+            // progress" signal and must be visible regardless of
+            // whether the shard happens to be Splitting/Merging.
             state: if inner.maintenance {
                 ShardState::Maintenance
             } else {
-                ShardState::Healthy
+                inner.state
             },
-            config: crate::shard::ShardConfig::default(),
-            range_start: [0u8; 32],
-            range_end: [0xff; 32],
+            config: inner.config.clone(),
+            range_start: inner.range_start,
+            range_end: inner.range_end,
         }
     }
 

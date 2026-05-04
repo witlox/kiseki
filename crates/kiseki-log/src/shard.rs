@@ -45,6 +45,42 @@ pub enum ShardState {
 }
 
 impl ShardState {
+    /// Encode as a single byte for Raft `LogCommand` payloads.
+    /// Stable byte values — adding a variant must use a fresh code,
+    /// never re-use a retired one.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Healthy => 0,
+            Self::Election => 1,
+            Self::QuorumLost => 2,
+            Self::Splitting => 3,
+            Self::Merging => 4,
+            Self::Retiring => 5,
+            Self::Maintenance => 6,
+        }
+    }
+
+    /// Decode from the stable byte values produced by [`as_u8`].
+    /// Returns `None` if the byte does not match a known variant —
+    /// callers map this to a typed error rather than crashing on an
+    /// unknown code (forward-compat with future variants).
+    ///
+    /// [`as_u8`]: Self::as_u8
+    #[must_use]
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Self::Healthy,
+            1 => Self::Election,
+            2 => Self::QuorumLost,
+            3 => Self::Splitting,
+            4 => Self::Merging,
+            5 => Self::Retiring,
+            6 => Self::Maintenance,
+            _ => return None,
+        })
+    }
+
     /// Whether this shard accepts writes.
     #[must_use]
     pub fn accepts_writes(self) -> bool {

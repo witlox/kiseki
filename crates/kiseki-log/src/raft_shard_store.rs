@@ -9,6 +9,7 @@
 //! (`MemLogStore`). Durability via Raft replication to majority.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -172,6 +173,65 @@ impl RaftShardStore {
             .cloned()
             .ok_or(LogError::ShardNotFound(shard_id))
     }
+
+    /// Run an async store call on the Raft runtime from a sync trait
+    /// method. Spawns a transient OS thread + `block_on` so the call
+    /// neither nests inside the calling tokio runtime nor borrows
+    /// `&self` past the closure body.
+    fn run_blocking<F, T>(&self, store: &Arc<OpenRaftLogStore>, f: F) -> Result<T, LogError>
+    where
+        F: FnOnce(Arc<OpenRaftLogStore>) -> std::pin::Pin<Box<dyn Future<Output = T> + Send>>
+            + Send
+            + 'static,
+        T: Send + 'static,
+    {
+        let s = Arc::clone(store);
+        let handle = self.rt.handle().clone();
+        std::thread::spawn(move || handle.block_on(f(s)))
+            .join()
+            .map_err(|_| LogError::Unavailable)
+    }
+
+    /// Sync helper for `OpenRaftLogStore::shard_health` from sync
+    /// trait methods.
+    fn shard_health_blocking(&self, store: &Arc<OpenRaftLogStore>) -> Result<ShardInfo, LogError> {
+        self.run_blocking(store, |s| Box::pin(async move { s.shard_health().await }))
+    }
+
+    /// Sync helper for `OpenRaftLogStore::set_shard_range` from sync
+    /// trait methods. Errors from the Raft write are logged but
+    /// swallowed — the trait method has no error channel; production
+    /// callers needing strict propagation should use
+    /// `LogOps::split_shard` / `merge_shards` which return `Result`.
+    fn set_shard_range_blocking(
+        &self,
+        store: &Arc<OpenRaftLogStore>,
+        range_start: [u8; 32],
+        range_end: [u8; 32],
+    ) -> Result<(), LogError> {
+        self.run_blocking(store, move |s| {
+            Box::pin(async move {
+                if let Err(e) = s.set_shard_range(range_start, range_end).await {
+                    tracing::warn!(error = %e, "set_shard_range_blocking: Raft write failed");
+                }
+            })
+        })
+    }
+
+    /// Sync helper for `OpenRaftLogStore::set_shard_state`.
+    fn set_shard_state_blocking(
+        &self,
+        store: &Arc<OpenRaftLogStore>,
+        state: ShardState,
+    ) -> Result<(), LogError> {
+        self.run_blocking(store, move |s| {
+            Box::pin(async move {
+                if let Err(e) = s.set_shard_state(state).await {
+                    tracing::warn!(error = %e, "set_shard_state_blocking: Raft write failed");
+                }
+            })
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -278,24 +338,114 @@ impl LogOps for RaftShardStore {
         node_id: NodeId,
         config: ShardConfig,
     ) {
-        // For RaftShardStore, create a new per-shard Raft store.
-        // Simplified: just create through the inner store mechanism.
-        let _ = (shard_id, tenant_id, node_id, config);
-        // Full implementation would create a Raft group here.
+        // Delegate to the inherent `create_shard` (which spawns a real
+        // Raft group). The trait method has no `raft_addr` /
+        // `bootstrap` plumbing — pass `None` / `true` so a single-node
+        // bootstrap path works. Production callers that need explicit
+        // RPC addresses or follower placement use the inherent method
+        // directly (see `kiseki-server::runtime`). The new shard
+        // inherits the cluster's configured peer set; future ADR-033
+        // §2 placement-engine work narrows this down per shard.
+        Self::create_shard(self, shard_id, tenant_id, node_id, config, None, true);
     }
 
-    fn update_shard_range(&self, shard_id: ShardId, _range_start: [u8; 32], _range_end: [u8; 32]) {
-        // Raft shard range updates go through the control plane Raft group,
-        // not the shard's Raft group. This is a local metadata update.
-        let _ = shard_id;
+    fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]) {
+        // Raft-replicated mutation: every replica converges on the
+        // new range so routing stays consistent across follower
+        // reads. Errors are logged — the trait is sync and can't
+        // surface them. Production splits/merges use the
+        // `LogOps::split_shard` / `merge_shards` methods which wrap
+        // this with full error handling.
+        let Ok(store) = self.get_shard(shard_id) else {
+            tracing::warn!(shard_id = %shard_id.0, "update_shard_range: shard not found");
+            return;
+        };
+        let _ = self.set_shard_range_blocking(&store, range_start, range_end);
     }
 
-    fn set_shard_state(&self, shard_id: ShardId, _state: ShardState) {
-        let _ = shard_id;
+    fn set_shard_state(&self, shard_id: ShardId, state: ShardState) {
+        let Ok(store) = self.get_shard(shard_id) else {
+            tracing::warn!(shard_id = %shard_id.0, "set_shard_state: shard not found");
+            return;
+        };
+        let _ = self.set_shard_state_blocking(&store, state);
     }
 
-    fn set_shard_config(&self, shard_id: ShardId, _config: ShardConfig) {
-        let _ = shard_id;
+    fn set_shard_config(&self, shard_id: ShardId, config: ShardConfig) {
+        let Ok(store) = self.get_shard(shard_id) else {
+            tracing::warn!(shard_id = %shard_id.0, "set_shard_config: shard not found");
+            return;
+        };
+        let _ = self.run_blocking(&store, move |s| {
+            Box::pin(async move {
+                if let Err(e) = s.set_shard_config(config).await {
+                    tracing::warn!(error = %e, "set_shard_config: Raft write failed");
+                }
+            })
+        });
+    }
+
+    fn split_shard(
+        &self,
+        shard_id: ShardId,
+        new_shard_id: ShardId,
+        node_id: NodeId,
+    ) -> Result<ShardId, LogError> {
+        // Verify source exists.
+        let source = self.get_shard(shard_id)?;
+        let info = self.shard_health_blocking(&source)?;
+
+        let mut midpoint = [0u8; 32];
+        for (i, mid) in midpoint.iter_mut().enumerate() {
+            // Big-endian 256-bit average — same formula as
+            // MemShardStore::split_shard at store.rs:240.
+            *mid = info.range_start[i] / 2 + info.range_end[i] / 2;
+        }
+
+        // Create the new shard's Raft group (upper half).
+        Self::create_shard(
+            self,
+            new_shard_id,
+            info.tenant_id,
+            node_id,
+            info.config.clone(),
+            None,
+            true,
+        );
+
+        // Set the new shard's range = [midpoint, upper_end).
+        let new_store = self.get_shard(new_shard_id)?;
+        self.set_shard_range_blocking(&new_store, midpoint, info.range_end)?;
+        // Shrink the source's range to [old_start, midpoint).
+        self.set_shard_range_blocking(&source, info.range_start, midpoint)?;
+        // Mark the source as `Splitting` for the cutover window.
+        // Production should transition back to `Healthy` when delta
+        // redistribution completes (ADR-033 §3 step 3 — Phase 19
+        // follow-up: today the new shard starts empty and reads
+        // against the upper range fall through to lazy lookup).
+        self.set_shard_state_blocking(&source, ShardState::Splitting)?;
+        Ok(new_shard_id)
+    }
+
+    fn merge_shards(
+        &self,
+        target_shard_id: ShardId,
+        source_shard_id: ShardId,
+    ) -> Result<(), LogError> {
+        // Verify both shards exist.
+        let target = self.get_shard(target_shard_id)?;
+        let source = self.get_shard(source_shard_id)?;
+        let target_info = self.shard_health_blocking(&target)?;
+        let source_info = self.shard_health_blocking(&source)?;
+
+        let new_start = target_info.range_start.min(source_info.range_start);
+        let new_end = target_info.range_end.max(source_info.range_end);
+
+        // Extend the target's range to the union; mark source as
+        // `Retiring` (ADR-034 post-cutover state).
+        self.set_shard_range_blocking(&target, new_start, new_end)?;
+        self.set_shard_state_blocking(&source, ShardState::Retiring)?;
+        Ok(())
     }
 
     async fn register_consumer(

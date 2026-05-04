@@ -99,6 +99,39 @@ pub enum LogCommand {
         /// New position.
         position: u64,
     },
+    /// Set the shard's lifecycle state (`Healthy`, `Splitting`,
+    /// `Merging`, `Retiring`, `Maintenance`). ADR-033 §3 / ADR-034
+    /// gate splits and merges on this transition; setting it through
+    /// Raft consensus ensures every replica agrees on the cutover.
+    SetShardState {
+        /// State code per `crate::shard::ShardState` (`u8` repr).
+        state: u8,
+    },
+    /// Update the shard's `[range_start, range_end)` key range. Splits
+    /// shrink the source range and create a new shard for the upper
+    /// half; merges extend the target's range to the union. Both
+    /// operations write this command on each affected shard.
+    UpdateShardRange {
+        /// New inclusive lower bound.
+        range_start: [u8; 32],
+        /// New exclusive upper bound.
+        range_end: [u8; 32],
+    },
+    /// Replace the shard's `ShardConfig` (delta-count + byte-size
+    /// ceilings, inline thresholds). Sent through Raft so every
+    /// replica sees the same auto-split trigger thresholds.
+    SetShardConfig {
+        /// `ShardConfig::max_delta_count`.
+        max_delta_count: u64,
+        /// `ShardConfig::max_byte_size`.
+        max_byte_size: u64,
+        /// `ShardConfig::inline_threshold_bytes`.
+        inline_threshold_bytes: u64,
+        /// `ShardConfig::inline_floor_bytes`.
+        inline_floor_bytes: u64,
+        /// `ShardConfig::inline_ceiling_bytes`.
+        inline_ceiling_bytes: u64,
+    },
 }
 
 /// New `cluster_chunk_state` entry to be created as part of a
@@ -141,6 +174,11 @@ impl std::fmt::Display for LogCommand {
             Self::AdvanceWatermark { consumer, position } => {
                 write!(f, "AdvanceWatermark({consumer}={position})")
             }
+            Self::SetShardState { state } => write!(f, "SetShardState({state})"),
+            Self::UpdateShardRange { .. } => write!(f, "UpdateShardRange"),
+            Self::SetShardConfig {
+                max_delta_count, ..
+            } => write!(f, "SetShardConfig(max_delta_count={max_delta_count})"),
         }
     }
 }
@@ -419,6 +457,33 @@ impl RaftLogStore {
             }
             LogCommand::AdvanceWatermark { consumer, position } => {
                 sm.watermarks.advance(consumer, SequenceNumber(*position));
+            }
+            LogCommand::SetShardState { state } => {
+                if let Some(s) = ShardState::from_u8(*state) {
+                    sm.info.state = s;
+                }
+            }
+            LogCommand::UpdateShardRange {
+                range_start,
+                range_end,
+            } => {
+                sm.info.range_start = *range_start;
+                sm.info.range_end = *range_end;
+            }
+            LogCommand::SetShardConfig {
+                max_delta_count,
+                max_byte_size,
+                inline_threshold_bytes,
+                inline_floor_bytes,
+                inline_ceiling_bytes,
+            } => {
+                sm.info.config = crate::shard::ShardConfig {
+                    max_delta_count: *max_delta_count,
+                    max_byte_size: *max_byte_size,
+                    inline_threshold_bytes: *inline_threshold_bytes,
+                    inline_floor_bytes: *inline_floor_bytes,
+                    inline_ceiling_bytes: *inline_ceiling_bytes,
+                };
             }
         }
     }
