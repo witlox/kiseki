@@ -909,23 +909,59 @@ async fn then_refcount_one_on_new_leader(w: &mut KisekiWorld) {
         .await
         .unwrap_or(new_leader);
     let leader = guard.node(leader_id);
-    let chunks = composition_chunks_via(leader, &etag).await;
-    assert!(
-        !chunks.is_empty(),
-        "new leader has no record of composition {etag} — hydration may have stalled",
-    );
-    for chunk_id_hex in &chunks {
-        let info = inspect_chunk(leader, chunk_id_hex).await;
-        let refcount = info
-            .get("cluster_state")
-            .and_then(|v| v.get("refcount"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        assert_eq!(
-            refcount, 1,
-            "chunk {chunk_id_hex} refcount on new leader (node-{leader_id}) is {refcount}, want 1",
+
+    // Poll for up to 10 s. Hydration after a leader change is
+    // asynchronous: the new leader's CompositionStore + cluster
+    // chunk_state rows arrive via Raft delta replay + the
+    // composition hydrator (ADR-040 §D10), and on slow CI
+    // runners the gap between the previous "Then a new leader is
+    // elected" step and this one is sometimes shorter than the
+    // hydrator's apply tick. Pre-poll, this step would read the
+    // empty chunk list and fail with "hydration may have
+    // stalled" intermittently. The bounded loop closes that
+    // race without weakening the assertion.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last_chunks: Vec<String> = Vec::new();
+    let mut last_refcounts: Vec<(String, u64)> = Vec::new();
+    loop {
+        let chunks = composition_chunks_via(leader, &etag).await;
+        if !chunks.is_empty() {
+            let mut all_ok = true;
+            let mut snapshot = Vec::with_capacity(chunks.len());
+            for chunk_id_hex in &chunks {
+                let info = inspect_chunk(leader, chunk_id_hex).await;
+                let refcount = info
+                    .get("cluster_state")
+                    .and_then(|v| v.get("refcount"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                snapshot.push((chunk_id_hex.clone(), refcount));
+                if refcount != 1 {
+                    all_ok = false;
+                }
+            }
+            if all_ok {
+                return;
+            }
+            last_refcounts = snapshot;
+        }
+        last_chunks = chunks;
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if last_chunks.is_empty() {
+        panic!(
+            "new leader (node-{leader_id}) has no record of composition \
+             {etag} after 10 s of polling — hydration appears stalled, \
+             not just delayed",
         );
     }
+    panic!(
+        "new leader (node-{leader_id}) returned chunks but refcount \
+         never converged to 1 within 10 s. Last snapshot: {last_refcounts:?}",
+    );
 }
 
 // ---------------------------------------------------------------------------
