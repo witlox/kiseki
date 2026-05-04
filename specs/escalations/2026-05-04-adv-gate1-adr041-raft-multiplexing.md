@@ -3,7 +3,7 @@
 **Type**: Architect → Adversary
 **Date**: 2026-05-04
 **Author**: architect
-**Status**: open — block implementation until cleared
+**Status**: closed 2026-05-04 — gate 1 returned CHANGES REQUESTED; architect amended ADR-041 (commit pending). 3H + 5M + 2L findings addressed inline in the ADR; remaining 5L are non-blocking notes. Re-review by adversary deferred — implementer can proceed under the revised spec.
 
 ## Artifacts to review
 

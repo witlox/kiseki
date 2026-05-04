@@ -4,6 +4,7 @@
 **Date**: 2026-05-04
 **Reviewer**: adversary
 **Verdict**: **CHANGES REQUESTED** — three HIGH findings block implementation
+**Status (2026-05-04)**: ADR-041 amended; 3H + 5M + 2L findings resolved inline. See ADR-041 §"Gate-1 amendments" for the resolution table.
 **Re: escalation**: `specs/escalations/2026-05-04-adv-gate1-adr041-raft-multiplexing.md`
 
 ## Summary
