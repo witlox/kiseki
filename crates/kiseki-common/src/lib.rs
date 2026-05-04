@@ -18,6 +18,7 @@
 
 #![deny(unsafe_code)]
 #![forbid(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod error;
 pub mod ids;
@@ -40,6 +41,11 @@ pub mod raft_adapter;
 
 // Advisory surface lives here per ADR-021 §2 to preserve the no-cycle rule.
 pub mod advisory;
+
+// Lock-poison helpers — see module docs for the storage-system rationale
+// (data-path locks fail-stop, telemetry locks recover; both emit
+// structured tracing so the upstream panic is observable).
+pub mod locks;
 
 // Re-export the flat public surface for convenience. Match
 // ubiquitous-language.md names exactly.
