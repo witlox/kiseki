@@ -351,11 +351,19 @@ mod nfs_tests {
 
         let entries = ctx.readdir();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"."));
-        assert!(names.contains(&".."));
+        // 2026-05-04: `readdir()` no longer emits `.` / `..`. The
+        // Linux NFS client (v3 and v4) synthesizes them locally
+        // for every directory; emitting them server-side as well
+        // produces duplicate entries in `ls -la`. Wire-test guard:
+        // `nfs4_server::tests::readdir_response_omits_dot_and_dotdot`.
+        assert!(!names.contains(&"."), "must not emit `.` (got: {names:?})");
+        assert!(
+            !names.contains(&".."),
+            "must not emit `..` (got: {names:?})"
+        );
         assert!(names.contains(&"a.txt"));
         assert!(names.contains(&"b.txt"));
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]
