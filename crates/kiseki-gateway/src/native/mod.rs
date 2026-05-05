@@ -17,6 +17,7 @@
 
 pub mod dek_fetch_ticket;
 pub mod handle_token;
+pub mod lease_store;
 pub mod multipart_upload_id;
 pub mod signing_keys;
 
