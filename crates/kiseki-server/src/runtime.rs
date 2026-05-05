@@ -1020,6 +1020,20 @@ pub async fn run_main(
     // Shared gateway: wires composition + chunk + crypto. Used by S3 and NFS.
     let master_key =
         kiseki_crypto::keys::SystemMasterKey::new([0x42; 32], kiseki_common::tenancy::KeyEpoch(1));
+    // ADR-042 §9.1: derive the native-service signing keys (handle
+    // tokens, DEK fetch tickets, multipart upload IDs) from the master
+    // key BEFORE moving it into the gateway. The grace window is
+    // tunable via KISEKI_MASTER_KEY_ROTATION_GRACE_MS (default 5 min).
+    let native_grace_ms: u64 = std::env::var("KISEKI_MASTER_KEY_ROTATION_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300_000);
+    let native_signing_keys = std::sync::Arc::new(
+        kiseki_gateway::native::signing_keys::SigningKeys::new(
+            &master_key,
+            native_grace_ms,
+        ),
+    );
     // Phase 16b step 2: pass the cluster's node-id list as the
     // placement for every fresh chunk. In a 1-node cluster this is
     // empty (the gateway carries vec![] in NewChunkMeta), matching
@@ -1735,6 +1749,37 @@ pub async fn run_main(
              cross-node fabric is not protected against tenant certs)",
         );
     }
+    // ADR-042 Phase 4: register the native GatewayDataService alongside
+    // the other data-path services. The interceptor wraps the same
+    // tower stack; in plaintext development mode it falls through to a
+    // synthetic dev principal (the runtime is single-tenant in that
+    // posture). Audit emission uses NullAuditSink today; Phase 4
+    // follow-up replaces it with the real `kiseki-audit` adapter.
+    let native_audit: std::sync::Arc<
+        dyn kiseki_gateway::native::san_interceptor::AuditSink,
+    > = std::sync::Arc::new(
+        kiseki_gateway::native::san_interceptor::NullAuditSink,
+    );
+    let native_intercept = std::sync::Arc::new(
+        kiseki_gateway::native::san_interceptor::SanInterceptor::new(
+            native_audit,
+            cfg.tls.is_some(),
+        ),
+    );
+    let native_server = kiseki_gateway::native::ServerImpl::new(
+        std::sync::Arc::clone(&gw) as std::sync::Arc<dyn kiseki_gateway::ops::GatewayOps>,
+        native_signing_keys,
+    );
+    let native_intercept_for_tonic = std::sync::Arc::clone(&native_intercept);
+    let native_svc = kiseki_proto::v1::native::gateway_data_service_server::GatewayDataServiceServer::with_interceptor(
+        native_server,
+        move |req| native_intercept_for_tonic.intercept(req),
+    );
+    router = router.add_service(native_svc);
+    tracing::info!(
+        require_tls = cfg.tls.is_some(),
+        "native GatewayDataService registered (ADR-042)",
+    );
     router.serve_with_shutdown(cfg.data_addr, shutdown).await?;
 
     tracing::info!("data-path: shut down");
