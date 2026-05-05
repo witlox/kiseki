@@ -11,9 +11,13 @@ repository.workspace = true
 workspace = true
 
 [features]
-default = ["nfs", "s3"]
+default = ["nfs", "s3", "native"]
 nfs = []
 s3 = []
+# Native gRPC GatewayDataService (ADR-042). Optional so embedded
+# gateway-only consumers (FUSE shim, NFS-only deployments) don't pay
+# the tonic / kiseki-proto compile cost.
+native = ["dep:kiseki-proto", "dep:tonic", "dep:prost", "dep:postcard"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -25,6 +29,10 @@ kiseki-chunk-cluster = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-control = { workspace = true }
 kiseki-crypto = { workspace = true }
+kiseki-proto = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }
 aws-lc-rs = { workspace = true }
 axum = "0.8"
 kiseki-audit = { workspace = true }

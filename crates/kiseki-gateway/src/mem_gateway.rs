@@ -2,6 +2,16 @@
 //!
 //! Handles the full data path: plaintext from protocol client → encrypt →
 //! chunk store → composition metadata, and reverse for reads.
+//!
+//! Several `pub async fn` here became await-free after the 2026-05-05
+//! `tokio::sync::Mutex` → `parking_lot::Mutex` conversion (the perf
+//! spike). Their signatures stay async so the wide `.await` caller set
+//! (BDD steps, profile drivers, `complete_multipart_internal` chain)
+//! does not have to flip in lockstep — and any future re-introduction
+//! of awaitable inner state would not become a breaking change.
+
+#![allow(clippy::unused_async)]
+#![allow(clippy::similar_names)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

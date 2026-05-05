@@ -483,7 +483,7 @@ impl ChunkOps for ChunkStore {
     }
 
     /// Single-critical-section dedup pre-flight. Halves the round-
-    /// trips through the AsyncChunkOps SyncBridge mutex on dedup-
+    /// trips through the `AsyncChunkOps` `SyncBridge` mutex on dedup-
     /// hit writes, the dominant write-path bottleneck observed in
     /// the 2026-05-05 in-process flamegraph.
     fn try_increment_if_exists(

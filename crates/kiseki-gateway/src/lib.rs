@@ -144,6 +144,12 @@ pub mod s3_auth;
 #[cfg(feature = "s3")]
 pub mod s3_server;
 
+/// Native gRPC `GatewayDataService` (ADR-042). Off behind the `native`
+/// feature so embedded gateway-only consumers don't pay the
+/// tonic / kiseki-proto compile cost.
+#[cfg(feature = "native")]
+pub mod native;
+
 pub use error::GatewayError;
 pub use mem_gateway::InMemoryGateway;
 pub use ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};

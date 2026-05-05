@@ -261,15 +261,13 @@ impl CompositionHydrator {
         // ate the deltas in between; or empty + tip > last means same.
         if let Some(first) = deltas.first() {
             if first.header.sequence.0 > from.0 {
-                return self
-                    .enter_halt_mode(shard_id, from.0, first.header.sequence.0)
-                    .await;
+                return self.enter_halt_mode(shard_id, from.0, first.header.sequence.0);
             }
         } else {
             // Empty: check shard tip via shard_health.
             if let Ok(info) = log.shard_health(shard_id).await {
                 if info.tip.0 > self.last_applied_cache.0 {
-                    return self.enter_halt_mode(shard_id, from.0, info.tip.0 + 1).await;
+                    return self.enter_halt_mode(shard_id, from.0, info.tip.0 + 1);
                 }
             }
             // Transient `shard_health` failure or genuine no-new-deltas:
@@ -432,7 +430,7 @@ impl CompositionHydrator {
         applied_count
     }
 
-    async fn enter_halt_mode(
+    fn enter_halt_mode(
         &mut self,
         shard_id: ShardId,
         expected_seq: u64,

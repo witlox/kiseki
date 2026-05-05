@@ -11,12 +11,12 @@
 //! for in-memory work that takes microseconds.
 //!
 //! Trade-off: if the inner store does slow IO (redb fsync under
-//! contention), the parking_lot guard is held across that IO and
+//! contention), the `parking_lot` guard is held across that IO and
 //! other writers park. For the single-node persistent backend that
 //! ships today, redb commits are sub-millisecond at the workloads
 //! we measure. If a production deployment shows reactor stalls
 //! under sustained-fsync contention, revisit by reintroducing the
-//! spawn_blocking path selectively.
+//! `spawn_blocking` path selectively.
 
 use std::sync::Arc;
 
