@@ -57,6 +57,7 @@ uuid = { workspace = true }
 # Server harness — steps talk to a running kiseki-server via network
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
 tonic = { workspace = true }
+tokio-stream = "0.1"
 kiseki-proto = { workspace = true }
 prost = { workspace = true }
 serde_json = { workspace = true }

@@ -14,21 +14,17 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
 
   Background:
     Given a Kiseki cluster with tenant "org-pharma"
-    And tenant "org-pharma" has a client mTLS cert with SAN URI
-      "spiffe://kiseki/tenant/org-pharma"
+    And tenant "org-pharma" has a client mTLS cert with SAN URI "spiffe://kiseki/tenant/org-pharma"
     And namespace "trials" registered in tenant "org-pharma"
     And the cluster's data-path gRPC port serves GatewayDataService
-    And native client "client-a" is configured with the tenant cert
-      and the cluster's fabric discovery seed addresses
+    And native client "client-a" is configured with the tenant cert and the cluster's fabric discovery seed addresses
 
   # --- Authentication and tenant binding (I-NG1) ---
 
   @native @auth
   Scenario: Native PUT — cert SAN matches payload tenant_id
-    When client-a sends a native Write with payload
-      tenant_id="org-pharma" and namespace_id="trials"
-    Then the proto-handler validates the SAN URI carries
-      "spiffe://kiseki/tenant/org-pharma"
+    When client-a sends a native Write with payload tenant_id="org-pharma" and namespace_id="trials"
+    Then the proto-handler validates the SAN URI carries "spiffe://kiseki/tenant/org-pharma"
     And the SAN-derived tenant matches the payload tenant_id
     And the request proceeds to the gateway
     And the write completes successfully
@@ -37,10 +33,8 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   Scenario: Native PUT — cert SAN does NOT match payload tenant_id
     Given client-a's cert SAN URI is "spiffe://kiseki/tenant/org-pharma"
     When client-a sends a native Write with payload tenant_id="org-bank"
-    Then the proto-handler rejects the request with
-      PermissionDenied at the boundary
-    And no gateway work runs (no audit event for the gateway op,
-      but a security-failure audit event IS emitted)
+    Then the proto-handler rejects the request with PermissionDenied at the boundary
+    And no gateway work runs (no audit event for the gateway op, but a security-failure audit event IS emitted)
     And the rejection happens before any composition or chunk lookup
 
   # --- Object-flavored writes (I-NG2) ---
@@ -48,8 +42,7 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   @native @objects
   Scenario: Native object PUT — small payload (≤ inline threshold)
     Given the inline threshold is 8 KiB
-    When client-a sends a unary Write of 4 KiB to namespace "trials"
-      with idempotency_key="put-001"
+    When client-a sends a unary Write of 4 KiB to namespace "trials" with idempotency_key="put-001"
     Then the request is a single unary gRPC call (no streaming)
     And the server returns Ok with the new composition_id
     And a follow-up native Read returns the same 4 KiB
@@ -70,17 +63,14 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     And streams 8 MiB
     And the connection drops before CommitStream
     Then the partial state is never visible to any reader (I-NG2)
-    And the server reclaims the partial state within the
-      idempotency-key dedup window (5 min)
+    And the server reclaims the partial state within the idempotency-key dedup window (5 min)
     When client-a retries with the same idempotency_key
     Then the server treats it as a fresh write, not a duplicate
 
   @native @objects
   Scenario: Native object PUT — retry with the same idempotency_key
-    When client-a writes 4 KiB to "trials/checkpoint.pt" with
-      idempotency_key="ck-42" and the response is lost in transit
-    And client-a retries with the same idempotency_key="ck-42"
-      within 5 minutes
+    When client-a writes 4 KiB to "trials/checkpoint.pt" with idempotency_key="ck-42" and the response is lost in transit
+    And client-a retries with the same idempotency_key="ck-42" within 5 minutes
     Then the server recognizes the duplicate
     And returns the original composition_id, not a new one
     And the chunk store sees only one underlying write
@@ -92,16 +82,13 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     When client-a opens inode for "trials/run.log" in Write mode
     And writes 4 KiB at offset 0
     And writes 4 KiB at offset 4096
-    Then a concurrent reader opening the same inode does NOT yet see
-      the 8 KiB
+    Then a concurrent reader opening the same inode does NOT yet see the 8 KiB
     When client-a calls Fsync on the inode
-    Then the concurrent reader's next Read sees the 8 KiB
-      (matches POSIX fsync(2) semantics)
+    Then the concurrent reader's next Read sees the 8 KiB (matches POSIX fsync(2) semantics)
 
   @native @posix
   Scenario: Native POSIX rename within shard — atomic
-    Given namespace "trials" maps to shard S1 covering both
-      "src/" and "dst/" directories
+    Given namespace "trials" maps to shard S1 covering both "src/" and "dst/" directories
     When client-a calls RenameWithinShard from "src/file" to "dst/file"
     Then the rename commits as a single delta on shard S1
     And no reader observes a state where neither name exists
@@ -120,15 +107,13 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     Then the server returns a lease with TTL=30s
     And client-a writes locally without per-op coordination
     When client-b calls AcquireLease(inode="run.log", mode=Write)
-    Then the server returns LeaseHeld with the lease holder identity
-      and ttl_remaining_ms
+    Then the server returns LeaseHeld with the lease holder identity and ttl_remaining_ms
     When client-a calls ReleaseLease
     Then a subsequent AcquireLease from client-b succeeds
 
   @native @posix
   Scenario: Native POSIX lease — holder dies, lease expires
-    Given client-a holds a Write lease on inode "run.log" with the
-      configured lease TTL
+    Given client-a holds a Write lease on inode "run.log" with the configured lease TTL
     And client-a stops sending RenewLease
     When the configured lease TTL plus the renewal grace window elapses
     Then the lease expires server-side
@@ -137,15 +122,12 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
 
   @native @posix
   Scenario: Native POSIX lease — partition-heal split-brain rejected by fencing
-    Given client-a holds a Write lease on inode "run.log" with
-      fencing_token=42
+    Given client-a holds a Write lease on inode "run.log" with fencing_token=42
     And a network partition isolates client-a from the cluster
     And the lease expires server-side after the configured TTL
     And client-b acquires the lease with fencing_token=43
-    When the partition heals and client-a (still believing it holds
-      the lease) issues a Write with fencing_token=42
-    Then the server rejects the write with LeaseFenced{current=43}
-      (I-NG12)
+    When the partition heals and client-a (still believing it holds the lease) issues a Write with fencing_token=42
+    Then the server rejects the write with LeaseFenced{current=43} (I-NG12)
     And client-a's audit event records the fenced write attempt
     And no data was written under the stale token
 
@@ -162,11 +144,9 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   Scenario: Native client receives NotLeader and refreshes topology
     Given client-a's topology cache says shard S1's leader is node-2
     But the leader has actually migrated to node-3
-    And node-2 is configured with the proxy-fallback path disabled
-      (client-side discovery only)
+    And node-2 is configured with the proxy-fallback path disabled (client-side discovery only)
     When client-a sends a Write to node-2
-    Then node-2 responds with NotLeader{leader=node-3} (one round-trip
-      cost paid by the client)
+    Then node-2 responds with NotLeader{leader=node-3} (one round-trip cost paid by the client)
     And client-a's topology cache is refreshed to identify node-3 as leader
     And client-a re-issues the Write to node-3
     And the Write commits successfully
@@ -180,20 +160,15 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     Then node-2 proxies the request in-process to node-3
     And node-2 returns the write outcome to client-a in a single round-trip
     And the trailing metadata carries the new topology_version
-    And client-a's topology cache is refreshed to identify node-3 as leader
-      via the topology_version mismatch path (I-NG13)
+    And client-a's topology cache is refreshed to identify node-3 as leader via the topology_version mismatch path (I-NG13)
 
   @native @routing
   Scenario: Server-side proxy fallback — proxying node fails mid-proxy
-    Given client-a issues a Write to node-2 which is acting as a proxy
-      to leader node-3
-    When node-2 crashes between (a) committing the proxied request on
-      node-3 and (b) returning the response to client-a
+    Given client-a issues a Write to node-2 which is acting as a proxy to leader node-3
+    When node-2 crashes between (a) committing the proxied request on node-3 and (b) returning the response to client-a
     Then client-a's RPC fails with Aborted{proxy_failure}
-    When client-a refreshes topology, dials node-3 directly, and
-      retries with the same idempotency_key
-    Then the server returns the original outcome (idempotency dedup
-      via I-NG5 + A-NG10) and the write commits exactly once
+    When client-a refreshes topology, dials node-3 directly, and retries with the same idempotency_key
+    Then the server returns the original outcome (idempotency dedup via I-NG5 + A-NG10) and the write commits exactly once
 
   # --- Streaming boundary (I-NG9) ---
 
@@ -229,24 +204,16 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   @native @audit
   Scenario: Native data op — audit event uses cert SAN as principal
     When client-a sends a native Write to namespace "trials"
-    Then the audit pipeline emits an event with
-      principal="spiffe://kiseki/tenant/org-pharma"
-      tenant_id="org-pharma"
-      namespace_id="trials"
-      workflow_ref=<the workflow_ref carried in the request>
-    And the event is shape-identical to S3 / NFS / FUSE audit events
-      for the same logical op
+    Then the audit pipeline emits an event with principal="spiffe://kiseki/tenant/org-pharma" tenant_id="org-pharma" namespace_id="trials" workflow_ref=<the workflow_ref carried in the request>
+    And the event is shape-identical to S3 / NFS / FUSE audit events for the same logical op
 
   # --- Performance witness (A-NG11) ---
 
   @native @perf @smoke
   Scenario: Native object 64 KiB GET — per-node throughput target
     Given a single-node cluster with the native gateway data service
-    And the in-process gateway floor measurement (graduation gate,
-      A-NG11) sustained 114 995 op/s on this hardware (≥100 000
-      threshold cleared 2026-05-05)
-    When kiseki-profile drives 16 concurrent clients issuing 64 KiB
-      native Reads against pre-warmed objects for 30 seconds
+    And the in-process gateway floor measurement (graduation gate, A-NG11) sustained 114 995 op/s on this hardware (≥100 000 threshold cleared 2026-05-05)
+    When kiseki-profile drives 16 concurrent clients issuing 64 KiB native Reads against pre-warmed objects for 30 seconds
     Then the sustained throughput is at least 80 000 op/s
     And the p99 latency is below 10 ms
     And the error rate is below 0.01% (≤ ~1 in 10 000 ops)
@@ -254,13 +221,9 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   @native @perf @smoke
   Scenario: Native object 64 KiB PUT — per-node throughput target
     Given a single-node cluster with the native gateway data service
-    And the in-process gateway floor for 64 KiB PUT was measured at
-      20 089 op/s on this hardware (the gateway-internal write path
-      is the binder, not the protocol layer)
-    When kiseki-profile drives 16 concurrent clients issuing 64 KiB
-      native Writes for 30 seconds
-    Then the sustained throughput is at least 14 000 op/s
-      (the in-process PUT floor × 0.7 gRPC tax)
+    And the in-process gateway floor for 64 KiB PUT was measured at 20 089 op/s on this hardware (the gateway-internal write path is the binder, not the protocol layer)
+    When kiseki-profile drives 16 concurrent clients issuing 64 KiB native Writes for 30 seconds
+    Then the sustained throughput is at least 14 000 op/s (the in-process PUT floor × 0.7 gRPC tax)
     And the p99 latency is below 10 ms
     And the error rate is below 0.01% (≤ ~1 in 10 000 ops)
     # Higher PUT throughput requires gateway-internal-write-path
@@ -273,8 +236,7 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   Scenario Outline: Native PUT — SAN URI near-miss is rejected
     Given client-a's cert SAN URI is "<actual_san>"
     When client-a sends a native Write with payload tenant_id="<payload_tenant>"
-    Then the proto-handler rejects the request with
-      PermissionDenied{san_canonicalization_mismatch}
+    Then the proto-handler rejects the request with PermissionDenied{san_canonicalization_mismatch}
 
     Examples:
       | actual_san                                     | payload_tenant     | rejection_reason             |
@@ -290,23 +252,17 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   @native @encryption @config
   Scenario: TrustedCompute requested without best-effort shred — rejected
     Given namespace "trials-gpu" exists with crypto_boundary=ServerOnly
-    When the operator calls UpdateNamespace setting
-      crypto_boundary=TrustedCompute (and leaves crypto_shred_policy
-      at its default "enforced")
-    Then the server rejects the update with
-      InvalidArgument{crypto_shred_policy_required}
+    When the operator calls UpdateNamespace setting crypto_boundary=TrustedCompute (and leaves crypto_shred_policy at its default "enforced")
+    Then the server rejects the update with InvalidArgument{crypto_shred_policy_required}
     And the namespace remains in ServerOnly mode
 
   @native @encryption @config
   Scenario: TrustedCompute with explicit best-effort shred — accepted
     Given namespace "trials-gpu" exists with crypto_boundary=ServerOnly
-    When the operator calls UpdateNamespace setting BOTH
-      crypto_boundary=TrustedCompute AND crypto_shred_policy=best_effort
+    When the operator calls UpdateNamespace setting BOTH crypto_boundary=TrustedCompute AND crypto_shred_policy=best_effort
     Then the server accepts the update
-    And subsequent native reads of trials-gpu return sealed envelopes
-      and DEK references (client-decrypt mode active)
-    And the namespace metadata reflects both flags so tenants and
-      auditors can detect the residual exposure window
+    And subsequent native reads of trials-gpu return sealed envelopes and DEK references (client-decrypt mode active)
+    And the namespace metadata reflects both flags so tenants and auditors can detect the residual exposure window
 
   # --- I-NG11 concurrent stream cap ---
 
@@ -315,8 +271,7 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     Given the per-tenant concurrent-stream cap for "org-pharma" is 256
     And client-a already has 256 in-flight streaming Writes open
     When client-a issues a 257th OpenStream
-    Then the server rejects with ResourceExhausted{native_concurrent_stream_cap}
-      BEFORE allocating any server-side staging buffer (I-NG11)
+    Then the server rejects with ResourceExhausted{native_concurrent_stream_cap} BEFORE allocating any server-side staging buffer (I-NG11)
     And the rejection emits a security-failure audit event (I-NG7)
     When one of the in-flight streams completes via CommitStream
     Then the next OpenStream succeeds (cap counter decremented)
@@ -325,23 +280,18 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
 
   @native @posix @audit
   Scenario: Fencing token recorded in audit event
-    Given client-a holds a Write lease on inode "run.log" with
-      fencing_token=99
+    Given client-a holds a Write lease on inode "run.log" with fencing_token=99
     When client-a writes 4 KiB under the lease
-    Then the audit event for the write records
-      lease_fencing_token=99 alongside the principal and workflow_ref
+    Then the audit event for the write records lease_fencing_token=99 alongside the principal and workflow_ref
 
   # --- I-NG13 topology_version push-based invalidation ---
 
   @native @routing
   Scenario: Topology cache refreshed on topology_version mismatch
     Given client-a's cached topology_version is 100
-    And the cluster topology_version has advanced to 101 due to a
-      leader change for shard S2
-    When client-a sends a native Read whose response trailing metadata
-      carries topology_version=101
-    Then client-a refreshes its topology cache before the next Write
-      (push-based, no waiting for the 30 s TTL)
+    And the cluster topology_version has advanced to 101 due to a leader change for shard S2
+    When client-a sends a native Read whose response trailing metadata carries topology_version=101
+    Then client-a refreshes its topology cache before the next Write (push-based, no waiting for the 30 s TTL)
 
   # --- I-NG14 lease + drain interaction ---
 
@@ -353,49 +303,38 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     Then the drain protocol does NOT forcibly revoke client-a's lease
     And the drain progress reports "waiting for outstanding leases"
     When client-a's lease expires (or is voluntarily released)
-    Then the drain proceeds: leadership is transferred off node-2
-      and a replacement voter is added (per ADR-035)
+    Then the drain proceeds: leadership is transferred off node-2 and a replacement voter is added (per ADR-035)
 
   @native @posix @drain
   Scenario: New AcquireLease against a draining node — rejected
     Given node-2 hosts the leader for shard S1 and is in Draining state
     And the drain quiesce window remaining is 10 seconds
-    When client-b calls AcquireLease(inode in S1, mode=Write,
-      requested_ttl=30s)
-    Then the server rejects with Unavailable{node_draining} because
-      the requested TTL would outlast the quiesce window (I-NG14)
+    When client-b calls AcquireLease(inode in S1, mode=Write, requested_ttl=30s)
+    Then the server rejects with Unavailable{node_draining} because the requested TTL would outlast the quiesce window (I-NG14)
 
   # --- F-NG8 cert revocation mid-session (A-NG17) ---
 
   @native @auth
   Scenario: Long-running stream torn down on cert revocation
-    Given client-a is in the middle of a 60 MiB streaming Write
-      (stream open for 45 seconds, halfway through)
+    Given client-a is in the middle of a 60 MiB streaming Write (stream open for 45 seconds, halfway through)
     And the cluster's CRL is updated to revoke client-a's cert
     When the server's periodic cert re-validation runs (default 60 s)
-    Then the server tears down the stream with
-      Unauthenticated{reason=cert_revoked}
-    And the partial stream state is reclaimed within the
-      idempotency-key dedup window
+    Then the server tears down the stream with Unauthenticated{reason=cert_revoked}
+    And the partial stream state is reclaimed within the idempotency-key dedup window
     And no commit-on-close visibility leak occurs
 
   # --- A-NG18 clock skew bound ---
 
   @native @posix @clock
   Scenario: Clock skew within tolerance — leases work
-    Given client-a's clock is 4 seconds ahead of the cluster's clocks
-      (within the 5-second I-T1/I-T2 / A-NG18 tolerance)
-    When client-a acquires a 30-second lease and renews at +25 seconds
-      by client clock
-    Then the server processes the renewal at +21 seconds by server
-      clock and accepts (lease still alive)
+    Given client-a's clock is 4 seconds ahead of the cluster's clocks (within the 5-second I-T1/I-T2 / A-NG18 tolerance)
+    When client-a acquires a 30-second lease and renews at +25 seconds by client clock
+    Then the server processes the renewal at +21 seconds by server clock and accepts (lease still alive)
     And no spurious lease expiry occurs
 
   @native @posix @clock @observability
   Scenario: Clock skew exceeds tolerance — alarm raised
     Given client-a's clock is 30 seconds ahead of the cluster's clocks
     When client-a issues any native op
-    Then the metric kiseki_clock_skew_seconds exceeds the alarm
-      threshold (5s) and an operator alert fires
-    And the op itself proceeds (correctness preserved by the existing
-      time invariants and clock-quality observability)
+    Then the metric kiseki_clock_skew_seconds exceeds the alarm threshold (5s) and an operator alert fires
+    And the op itself proceeds (correctness preserved by the existing time invariants and clock-quality observability)

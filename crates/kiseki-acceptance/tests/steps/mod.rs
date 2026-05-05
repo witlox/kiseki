@@ -28,6 +28,7 @@ pub mod log;
 pub mod mtls_certs;
 pub mod multi_node;
 pub mod multi_node_admin;
+pub mod native_gateway;
 pub mod nfs_integration;
 pub mod nfs_multi_node;
 pub mod operational;
