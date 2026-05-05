@@ -193,6 +193,45 @@ fn org_from_proto(o: Option<&kiseki_proto::v1::OrgId>) -> Result<OrgId, Status> 
     Ok(OrgId(uuid))
 }
 
+/// Cross-check the payload `tenant_id` against the canonical SAN URI
+/// stashed in the request's tonic extensions by `SanInterceptor`
+/// (gate-1 F-H1 — second half: the proto handler is responsible for
+/// the SAN ↔ payload binding; the interceptor only stashes).
+///
+/// The canonical SAN URI carries the tenant id as the trailing
+/// `/<tenant_id>` path segment. We require byte-equality between
+/// that segment and the payload's UUID-stringified `OrgId` value.
+///
+/// In plaintext development mode the interceptor installs a synthetic
+/// `dev` SAN; the cross-check is then a no-op (production runtimes
+/// flip `require_tls = true` and the dev SAN never appears).
+#[allow(clippy::result_large_err)]
+fn enforce_san_payload_tenant_match(
+    canonical: Option<&super::canonical_san::CanonicalSanUri>,
+    payload_tenant: &OrgId,
+) -> Result<(), Status> {
+    let Some(canonical) = canonical else {
+        // Interceptor not installed (e.g. unit tests on the bare
+        // ServerImpl). Skip the check rather than fail-closed; the
+        // test harness is responsible for installing a real or
+        // synthetic SAN when behavior depends on it.
+        return Ok(());
+    };
+    if canonical.tenant_id() == "dev" {
+        // Plaintext development principal — single-tenant posture.
+        return Ok(());
+    }
+    let payload_str = payload_tenant.0.to_string();
+    if canonical.tenant_id() == payload_str {
+        return Ok(());
+    }
+    Err(Status::permission_denied(format!(
+        "san_payload_tenant_mismatch: cert SAN tenant {:?} != payload tenant {:?}",
+        canonical.tenant_id(),
+        payload_str,
+    )))
+}
+
 #[allow(clippy::result_large_err)]
 fn ns_from_proto(o: Option<&kiseki_proto::v1::NamespaceId>) -> Result<NamespaceId, Status> {
     let s = o.ok_or_else(|| Status::invalid_argument("namespace_id required"))?;
@@ -322,10 +361,15 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::PutObjectRequest>,
     ) -> Result<Response<np::PutObjectResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let conditional = write_conditional_from(cf)?;
         let workflow_ref = workflow_ref_bytes(&cf.workflow_ref)?;
@@ -407,10 +451,15 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::GetObjectRequest>,
     ) -> Result<Response<np::GetObjectResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let comp = match req.key {
             Some(np::get_object_request::Key::CompositionId(id)) => {
@@ -483,10 +532,15 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::DeleteObjectRequest>,
     ) -> Result<Response<np::DeleteObjectResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let comp = comp_from_proto(req.composition_id.as_ref())?;
         match self.ops.delete(tenant, ns, comp).await {
@@ -502,10 +556,15 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::HeadObjectRequest>,
     ) -> Result<Response<np::HeadObjectResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let comp = match req.key {
             Some(np::head_object_request::Key::CompositionId(id)) => {
@@ -544,10 +603,15 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::ListObjectsRequest>,
     ) -> Result<Response<np::ListObjectsResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let prefix = if req.prefix.is_empty() {
             None
@@ -583,10 +647,15 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::LookupByNameRequest>,
     ) -> Result<Response<np::LookupByNameResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name required"));
@@ -608,10 +677,16 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::InitMultipartRequest>,
     ) -> Result<Response<np::InitMultipartResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
-        let _tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        let _ = tenant; // multipart impls don't need the tenant directly
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let upload_id = self
             .ops
@@ -667,9 +742,16 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::CompleteMultipartRequest>,
     ) -> Result<Response<np::CompleteMultipartResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
+        let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        let _ = tenant;
         let comp = self
             .ops
             .complete_multipart(&req.upload_id, None)
@@ -686,9 +768,16 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::AbortMultipartRequest>,
     ) -> Result<Response<np::AbortMultipartResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
+        let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        let _ = tenant;
         self.ops
             .abort_multipart(&req.upload_id)
             .await
@@ -818,17 +907,25 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::AcquireLeaseRequest>,
     ) -> Result<Response<np::AcquireLeaseResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         // Cap TTL at 5 min (300_000 ms) per ADR-042 §7.
         let ttl_ms = req.requested_ttl_ms.min(300_000);
         let lease_id_seed: [u8; 16] = uuid::Uuid::new_v4().into_bytes();
-        // Principal = the tenant UUID (cert SAN canonical form will be
-        // wired through in Phase 3 once `SanInterceptor` lands).
-        let principal = tenant.0.to_string();
+        // Principal = the canonical SAN URI when available (production
+        // mTLS posture), otherwise fall back to the tenant UUID string
+        // (unit tests / plaintext dev mode).
+        let principal = canonical
+            .as_ref()
+            .map_or_else(|| tenant.0.to_string(), |c| c.as_str().to_string());
         let outcome = self.lease_store.acquire(
             tenant,
             ns,
@@ -873,11 +970,18 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::RenewLeaseRequest>,
     ) -> Result<Response<np::RenewLeaseResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        let principal = tenant.0.to_string();
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        let principal = canonical
+            .as_ref()
+            .map_or_else(|| tenant.0.to_string(), |c| c.as_str().to_string());
         if req.lease_id.len() != 16 {
             return Err(Status::invalid_argument("lease_id must be 16 bytes"));
         }
@@ -914,11 +1018,18 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::ReleaseLeaseRequest>,
     ) -> Result<Response<np::ReleaseLeaseResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        let principal = tenant.0.to_string();
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        let principal = canonical
+            .as_ref()
+            .map_or_else(|| tenant.0.to_string(), |c| c.as_str().to_string());
         if req.lease_id.len() != 16 {
             return Err(Status::invalid_argument("lease_id must be 16 bytes"));
         }
@@ -944,10 +1055,15 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::FetchDekRequest>,
     ) -> Result<Response<np::FetchDekResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let outcome = match super::dek_fetch_ticket::verify_and_decode(
             &self.signing_keys,
             &req.dek_fetch_ticket,
@@ -974,10 +1090,15 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::BatchFetchDekRequest>,
     ) -> Result<Response<np::BatchFetchDekResponse>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         if req.dek_fetch_tickets.len() > MAX_BATCH_DEK_TICKETS {
             return Err(Status::invalid_argument(format!(
                 "batch_too_large: max {MAX_BATCH_DEK_TICKETS} tickets per request"
@@ -1014,8 +1135,13 @@ impl GatewayDataService for ServerImpl {
         &self,
         request: Request<np::GetTopologyRequest>,
     ) -> Result<Response<np::TopologyInfo>, Status> {
+        let canonical = request
+            .extensions()
+            .get::<super::canonical_san::CanonicalSanUri>()
+            .cloned();
         let req = request.into_inner();
         let tenant = org_from_proto(req.tenant_id.as_ref())?;
+        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
         let current = self.topology.version.load(Ordering::SeqCst);
         if req.known_topology_version > 0 && req.known_topology_version == current {
             // 304-equivalent — empty payload, just the version stamp.
@@ -1179,6 +1305,45 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(lresp.composition_id, put_resp.composition_id);
+    }
+
+    #[tokio::test]
+    async fn put_object_rejects_when_san_tenant_mismatches_payload() {
+        let (gw, server) = make_server();
+        register_namespace(&gw).await;
+        // Install a canonical SAN whose tenant id != the payload's
+        // tenant id. The handler must reject before any gateway work.
+        let san = super::super::canonical_san::CanonicalSanUri::from_canonical_for_tests(
+            "spiffe://kiseki/tenant/00000000-0000-0000-0000-000000000999",
+        );
+        let mut req = Request::new(np::PutObjectRequest {
+            control: Some(ctrl()),
+            namespace_id: Some(ns_to_proto(ns())),
+            name: "x".into(),
+            data: b"y".to_vec(),
+        });
+        req.extensions_mut().insert(san);
+        let err = server.put_object(req).await.expect_err("mismatch");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("san_payload_tenant_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn put_object_accepts_when_san_tenant_matches_payload() {
+        let (gw, server) = make_server();
+        register_namespace(&gw).await;
+        let san = super::super::canonical_san::CanonicalSanUri::from_canonical_for_tests(
+            &format!("spiffe://kiseki/tenant/{}", org().0),
+        );
+        let mut req = Request::new(np::PutObjectRequest {
+            control: Some(ctrl()),
+            namespace_id: Some(ns_to_proto(ns())),
+            name: "x".into(),
+            data: b"y".to_vec(),
+        });
+        req.extensions_mut().insert(san);
+        let resp = server.put_object(req).await.unwrap().into_inner();
+        assert!(resp.composition_id.is_some());
     }
 
     #[tokio::test]

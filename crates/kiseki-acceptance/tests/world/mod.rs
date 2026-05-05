@@ -21,6 +21,7 @@ pub mod cluster;
 pub mod control;
 pub mod kms;
 pub mod legacy;
+pub mod native;
 pub mod pnfs;
 pub mod raft;
 pub mod small_file;

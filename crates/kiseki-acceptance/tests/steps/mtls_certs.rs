@@ -23,6 +23,7 @@
 //! — the harness sets exactly those.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rcgen::{CertificateParams, Issuer, KeyPair};
 use tempfile::TempDir;
@@ -35,16 +36,39 @@ pub struct NodeCertPaths {
     pub key: PathBuf,
 }
 
-/// One CA + N per-node fabric certs + 1 tenant cert. Generated once
-/// per harness; the `TempDir` keeps the files alive for the harness's
-/// lifetime.
+/// In-memory PEMs for one tenant's mTLS material. Ownership stays in
+/// the `MtlsCerts` struct; callers borrow `&[u8]` slices to feed into
+/// rustls / tonic configuration.
+pub struct TenantClientCert {
+    /// SAN URI carried by this cert (e.g. `spiffe://kiseki/tenant/org-pharma`).
+    pub san_uri: String,
+    /// Cert PEM, signed by the harness CA.
+    pub cert_pem: String,
+    /// Key PEM (private). Held in process memory, never on disk —
+    /// scenarios mint fresh tenants frequently and we want each
+    /// drop-of-the-harness to wipe everything.
+    pub key_pem: String,
+}
+
+/// One CA + N per-node fabric certs + 1 (legacy) cluster-tenant cert
+/// + a dynamic registry of kiseki-tenant client certs minted on
+/// demand by the native-gateway BDD scenarios. Generated once per
+/// harness; the `TempDir` keeps the on-disk files alive for the
+/// harness's lifetime.
 pub struct MtlsCerts {
     _dir: TempDir,
     ca_pem_path: PathBuf,
+    ca_pem_text: String,
     /// `node_id` → (cert_pem_path, key_pem_path)
     nodes: std::collections::BTreeMap<u64, NodeCertPaths>,
     tenant_cert_path: PathBuf,
     tenant_key_path: PathBuf,
+    /// CA issuer kept around so additional kiseki-tenant certs can be
+    /// minted at scenario time without re-deriving the chain.
+    ca_issuer: Mutex<Issuer<'static, KeyPair>>,
+    /// Registry of `tenant_id → TenantClientCert`. Filled by
+    /// `mint_kiseki_tenant_cert(tenant_id)`.
+    kiseki_tenant_certs: Mutex<std::collections::HashMap<String, TenantClientCert>>,
 }
 
 impl MtlsCerts {
@@ -68,7 +92,8 @@ impl MtlsCerts {
         let ca_key = KeyPair::generate().unwrap();
         let ca_cert = ca_params.clone().self_signed(&ca_key).unwrap();
         let ca_pem_path = dir_path.join("ca.pem");
-        std::fs::write(&ca_pem_path, ca_cert.pem()).unwrap();
+        let ca_pem_text = ca_cert.pem();
+        std::fs::write(&ca_pem_path, &ca_pem_text).unwrap();
         let issuer = Issuer::new(ca_params, ca_key);
 
         // 2. Per-node fabric certs.
@@ -136,9 +161,113 @@ impl MtlsCerts {
         Self {
             _dir: dir,
             ca_pem_path,
+            ca_pem_text,
             nodes,
             tenant_cert_path,
             tenant_key_path,
+            ca_issuer: Mutex::new(issuer),
+            kiseki_tenant_certs: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// CA PEM text — used to configure rustls clients with this CA as
+    /// the only trust anchor (the harness's CA isn't in the system root
+    /// store).
+    #[must_use]
+    pub fn ca_pem_text(&self) -> &str {
+        &self.ca_pem_text
+    }
+
+    /// Mint (or reuse) a kiseki-tenant client cert. Idempotent on
+    /// `tenant_id` — the second call for the same id returns the same
+    /// cert. The cert is signed by the harness CA and carries the SAN
+    /// URI `spiffe://kiseki/tenant/<tenant_id>` PLUS the standard
+    /// `localhost` / `127.0.0.1` DNS/IP SANs so the rustls handshake
+    /// doesn't reject on the server-name comparison.
+    ///
+    /// # Panics
+    /// Panics if `tenant_id` doesn't satisfy the
+    /// `kiseki-gateway::native::canonical_san` rules (lowercase ASCII,
+    /// no slashes / percent-encoded unreserved bytes). The native
+    /// gateway's interceptor would reject such a cert anyway, so
+    /// failing fast here keeps test bugs from masking server bugs.
+    pub fn mint_kiseki_tenant_cert(&self, tenant_id: &str) -> TenantClientCert {
+        let san_uri = format!("spiffe://kiseki/tenant/{tenant_id}");
+        // Sanity-check via the gateway's canonicalizer so a typo in
+        // the test fixture surfaces as a panic, not a runtime
+        // canonicalization-mismatch reject from the server.
+        kiseki_gateway::native::canonical_san::canonicalize(&san_uri)
+            .unwrap_or_else(|e| {
+                panic!("non-canonical kiseki tenant SAN in test fixture: {san_uri:?}: {e}")
+            });
+
+        let mut cache = self.kiseki_tenant_certs.lock().unwrap();
+        if let Some(c) = cache.get(tenant_id) {
+            return TenantClientCert {
+                san_uri: c.san_uri.clone(),
+                cert_pem: c.cert_pem.clone(),
+                key_pem: c.key_pem.clone(),
+            };
+        }
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::NoCa;
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("kiseki-tenant-{tenant_id}"));
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::URI(san_uri.clone().try_into().unwrap()));
+        let key = KeyPair::generate().unwrap();
+        let cert = params
+            .signed_by(&key, &*self.ca_issuer.lock().unwrap())
+            .unwrap();
+        let entry = TenantClientCert {
+            san_uri: san_uri.clone(),
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        };
+        cache.insert(tenant_id.to_string(), TenantClientCert {
+            san_uri: entry.san_uri.clone(),
+            cert_pem: entry.cert_pem.clone(),
+            key_pem: entry.key_pem.clone(),
+        });
+        entry
+    }
+
+    /// Mint a cert with an arbitrary SAN URI string. Used for the
+    /// canonicalization near-miss outline (trailing slash, mixed case,
+    /// percent-encoded, IDN homograph) — those URIs would fail the
+    /// `mint_kiseki_tenant_cert` canonicalizer so they need a back
+    /// door. **Test-only.**
+    pub fn mint_cert_with_raw_san(&self, common_name: &str, san_uri: &str) -> TenantClientCert {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::NoCa;
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::URI(san_uri.try_into().unwrap()));
+        let key = KeyPair::generate().unwrap();
+        let cert = params
+            .signed_by(&key, &*self.ca_issuer.lock().unwrap())
+            .unwrap();
+        TenantClientCert {
+            san_uri: san_uri.to_string(),
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
         }
     }
 

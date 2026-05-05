@@ -83,6 +83,11 @@ pub struct KisekiWorld {
     /// Per-scenario state for `@multi-node` cluster steps. The cluster
     /// itself is a process-level singleton in `steps::cluster_harness`.
     pub cluster: world::cluster::ClusterState,
+    /// Per-scenario state for `@native` (ADR-042) scenarios. The
+    /// 1-node mTLS cluster is a process-level singleton; this
+    /// struct holds the per-named-client registry and the
+    /// scenario's typed mappings.
+    pub native: world::native::NativeWorld,
 
     // --- Shared test state (used across step files) ---
     pub last_error: Option<String>,
@@ -140,6 +145,7 @@ impl KisekiWorld {
             pnfs: world::pnfs::PnfsState::new(),
             backup: world::backup::BackupState::new(),
             cluster: world::cluster::ClusterState::default(),
+            native: world::native::NativeWorld::default(),
             last_error: None,
             last_read_data: None,
             last_epoch: None,

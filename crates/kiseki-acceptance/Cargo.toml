@@ -35,9 +35,9 @@ kiseki-composition = { workspace = true }
 kiseki-view = { workspace = true }
 kiseki-advisory = { workspace = true }
 kiseki-control = { workspace = true }
-kiseki-gateway = { workspace = true }
+kiseki-gateway = { workspace = true, features = ["native"] }
 kiseki-transport = { workspace = true }
-kiseki-client = { workspace = true, features = ["remote-nfs", "remote-http"] }
+kiseki-client = { workspace = true, features = ["remote-nfs", "remote-http", "native"] }
 kiseki-block = { workspace = true }
 kiseki-backup = { workspace = true }
 kiseki-raft = { workspace = true }

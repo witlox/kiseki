@@ -420,6 +420,25 @@ pub async fn acquire_cluster_3_mtls() -> Result<Arc<Mutex<ClusterHarness>>, Stri
         .cloned()
 }
 
+static CLUSTER_1_MTLS: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
+
+/// Acquire the shared single-node cluster handle in mTLS mode. Used
+/// by the @native scenarios — the SAN-canonicalization checks at the
+/// proto-handler boundary only fire when TLS material is present, and
+/// the test surface for ADR-042 is single-tenant single-node by
+/// default (multi-tenant routing is exercised via per-cert dialing
+/// against the same 1-node cluster).
+pub async fn acquire_cluster_1_mtls() -> Result<Arc<Mutex<ClusterHarness>>, String> {
+    CLUSTER_1_MTLS
+        .get_or_try_init(|| async {
+            ClusterHarness::start_mtls(1)
+                .await
+                .map(|c| Arc::new(Mutex::new(c)))
+        })
+        .await
+        .cloned()
+}
+
 static CLUSTER_20: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
 
 /// Acquire the shared 20-node cluster handle. Same EC 4+2 strategy
