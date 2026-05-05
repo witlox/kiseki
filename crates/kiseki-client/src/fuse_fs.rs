@@ -154,6 +154,10 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// Borrow the gateway. Used by [`crate::fuse_daemon::FuseDaemon`]
     /// to issue gateway calls outside the daemon's `RwLock` write
     /// section — see the prep / apply method pairs below.
+    ///
+    /// `#[cfg(feature = "fuse")]` because the only caller is the
+    /// FUSE daemon. Without the feature this method is dead code.
+    #[cfg(feature = "fuse")]
     pub(crate) fn gateway(&self) -> &G {
         &self.gateway
     }
@@ -177,6 +181,8 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// `pub(crate)` mirror of [`Self::block_gateway`] so the
     /// daemon-orchestrated flush / create paths can invoke gateway
     /// futures without holding the daemon's `RwLock` for write.
+    /// Same `#[cfg(feature = "fuse")]` rationale as [`Self::gateway`].
+    #[cfg(feature = "fuse")]
     pub(crate) fn block_gateway_pub<F, T>(&self, f: F) -> T
     where
         F: std::future::Future<Output = T>,
