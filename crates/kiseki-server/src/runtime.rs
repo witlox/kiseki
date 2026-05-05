@@ -576,6 +576,16 @@ pub async fn run_main(
     // See `metrics.raft_transport` plumbing in the multi-node path.)
     let _ = &metrics;
 
+    // Captures the chunk-store device handle + composition redb
+    // flusher when their respective group-commit modes are on, so
+    // the gateway's `fsync_pending` hook can drive explicit fsyncs
+    // from FUSE / NFS `fsync(2)` callers (POSIX-compliance for
+    // the eventual-durability optimization). Declared up here so
+    // both the chunk-store section below and the composition-store
+    // section further down can write into the same scope.
+    let mut comp_flusher_for_fsync: Option<kiseki_composition::persistent::RedbFlusher> = None;
+    let mut chunk_device_for_fsync: Option<std::sync::Arc<dyn kiseki_block::DeviceBackend>> = None;
+
     // Local chunk store: persistent (raw block device) if KISEKI_DATA_DIR
     // set, otherwise in-memory. Wrapped via SyncBridge so it satisfies
     // AsyncChunkOps — the cluster fabric and the gateway both consume the
@@ -607,6 +617,10 @@ pub async fn run_main(
         // returns. See `PersistentChunkStore::sync_per_write` doc.
         store.set_sync_per_write(false);
         let device_for_flush = store.device_handle();
+        // Capture for the gateway `fsync_pending` hook so explicit
+        // `fsync(2)` from FUSE / NFS clients forces a real device
+        // sync rather than waiting for the periodic task.
+        chunk_device_for_fsync = Some(std::sync::Arc::clone(&device_for_flush));
         let flush_interval_ms = std::env::var("KISEKI_CHUNK_FLUSH_INTERVAL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -848,6 +862,11 @@ pub async fn run_main(
     // Captures the redb path so the periodic gauge refresher can stat
     // its size; None when the composition store is in-memory.
     let mut comp_redb_path: Option<std::path::PathBuf> = None;
+    // Composition redb flusher, set when group-commit env var is on.
+    // `comp_flusher_for_fsync` declared at the runtime scope above
+    // (before chunk-store construction) so both the chunk and
+    // composition sections can populate it for the gateway
+    // `fsync_pending` hook registration further down.
     let comp_storage: Box<dyn kiseki_composition::persistent::CompositionStorage> =
         if let Some(ref dir) = cfg.data_dir {
             let meta_dir = dir.join("metadata");
@@ -858,13 +877,62 @@ pub async fn run_main(
                 )
             })?;
             let path = meta_dir.join("compositions.redb");
-            let store = kiseki_composition::persistent::PersistentRedbStorage::open(&path)
+            // Group commit (FUSE p99 fix): every put / bind_name
+            // currently triggers an inline fsync via redb's
+            // `Durability::Immediate`. With composition writes at
+            // ~1k/s on FUSE put-heavy, that's the same per-write
+            // fsync serialization the chunk store hit pre-`681de37`.
+            // `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS` enables eventual
+            // durability + a periodic flusher; the loss window on a
+            // single-node hard crash is bounded by the interval.
+            // Multi-node deployments are safe because Raft re-
+            // replicates lost compositions via the under-
+            // replication scrub on restart.
+            let flush_interval_ms = std::env::var("KISEKI_COMPOSITION_FLUSH_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok());
+            let mut store = kiseki_composition::persistent::PersistentRedbStorage::open(&path)
                 .map_err(|e| format!("open persistent composition store: {e}"))?
                 .with_metrics(Arc::clone(&metrics.composition));
-            tracing::info!(
-                path = %path.display(),
-                "composition store: persistent (redb-backed, ADR-040)",
-            );
+            if flush_interval_ms.is_some() {
+                store = store.with_eventual_durability(true);
+                let flusher = store.flusher();
+                // Hand the same flusher to the gateway via
+                // `register_fsync_hook` further below, so explicit
+                // `fsync(2)` from FUSE / NFS clients forces a real
+                // fsync rather than waiting up to `interval_ms` for
+                // the periodic task.
+                comp_flusher_for_fsync = Some(flusher.clone());
+                let interval_ms = flush_interval_ms.unwrap_or(100);
+                tokio::spawn(async move {
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let f = flusher.clone();
+                        let res = tokio::task::spawn_blocking(move || f.flush())
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                        if res.is_none() {
+                            tracing::warn!(
+                                "composition redb group-commit flush failed; retry next tick",
+                            );
+                        }
+                    }
+                });
+                tracing::info!(
+                    path = %path.display(),
+                    interval_ms,
+                    "composition store: persistent (redb-backed, group commit)",
+                );
+            } else {
+                tracing::info!(
+                    path = %path.display(),
+                    "composition store: persistent (redb-backed, ADR-040, immediate fsync)",
+                );
+            }
             comp_redb_path = Some(path);
             Box::new(store)
         } else {
@@ -991,6 +1059,31 @@ pub async fn run_main(
     // this the gateway's atomic counters tick but `/metrics` shows
     // zero — and the BDD harness has nothing to assert on.
     gw.set_workflow_table(workflow_table.clone());
+
+    // FUSE / NFS `fsync(2)` correctness under the eventual-durability
+    // optimization. Each registered hook drives a real fsync on its
+    // backing store. Without these, callers that explicitly issue
+    // `fsync(2)` would silently get the periodic-task SLA (≤100 ms
+    // window) instead of POSIX's "data is on disk now" guarantee.
+    if let Some(flusher) = comp_flusher_for_fsync {
+        gw.register_fsync_hook(std::sync::Arc::new(move || {
+            flusher.flush().map_err(|e| {
+                kiseki_gateway::error::GatewayError::Upstream(format!(
+                    "composition redb fsync: {e}"
+                ))
+            })
+        }));
+        tracing::info!("fsync hook: composition redb registered");
+    }
+    if let Some(device) = chunk_device_for_fsync {
+        gw.register_fsync_hook(std::sync::Arc::new(move || {
+            device.sync().map_err(|e| {
+                kiseki_gateway::error::GatewayError::Upstream(format!("chunk fsync: {e}"))
+            })
+        }));
+        tracing::info!("fsync hook: chunk-store device registered");
+    }
+
     gw.set_workflow_ref_writes_metric(Arc::new(metrics.gateway_workflow_ref_writes_total.clone()));
     // Mirror the gateway's atomic byte counters into the registered
     // Prometheus counters so `/metrics` scrapes show live throughput.

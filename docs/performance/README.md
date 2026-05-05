@@ -2,6 +2,12 @@
 
 Last refreshed: **2026-05-03** (after the May 2026 perf-fix sweep).
 
+> Operators tuning a deployment for throughput should also read
+> [`docs/operations/durability.md`](../operations/durability.md) —
+> the group-commit flags described below trade durability for
+> throughput, and the matrix in that doc spells out the loss
+> windows under each failure mode.
+
 Two data sources currently:
 
 1. **[Local single-node matrix](#local-single-node-matrix)** — `kiseki-profile`

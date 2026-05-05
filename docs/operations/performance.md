@@ -4,6 +4,12 @@ Kiseki is designed for HPC and AI workloads running at 200+ Gbps per
 NIC. This guide covers tuning levers for maximizing throughput and
 minimizing latency.
 
+> **Read [`durability.md`](durability.md) before enabling any
+> `KISEKI_*_FLUSH_INTERVAL_MS` knob below.** Group-commit flags
+> shift latency from per-write fsync to a periodic background flush
+> — they're safe under multi-node Raft replication, lossy on
+> single-node power loss.
+
 ---
 
 ## Transport selection

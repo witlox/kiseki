@@ -115,6 +115,58 @@ impl<G: GatewayOps> FuseDaemon<G> {
         }
     }
 
+    /// Three-phase flush so the `RwLock` write is dropped across the
+    /// gateway call (FUSE p99 fix). Pre-fix, every other FUSE op
+    /// queued behind the flush's exclusive lock for the full
+    /// gateway latency (160 ms p99 in the local single-node matrix
+    /// — root cause: composition redb fsync stall).
+    ///
+    /// Phase 1: write lock — pop the dirty buffer + build request.
+    /// Phase 2: read lock — issue the gateway call. Read lock
+    ///          allows concurrent gateway calls (other flushes,
+    ///          `create_build_request`) to run in parallel.
+    /// Phase 3: write lock — record the new `composition_id`.
+    /// Phase 4 (when `force_fsync`): read lock — call
+    ///          `gateway.fsync_pending()` to force durability of
+    ///          the just-written composition + any other pending
+    ///          writes. Honors POSIX `fsync(2)` semantics under
+    ///          the eventual-durability optimization.
+    ///
+    /// `force_fsync = false` for `FUSE_FLUSH` (POSIX says close
+    /// has no durability guarantee), `true` for `FUSE_FSYNC`.
+    ///
+    /// Returns `Ok(())` on no-op flush (no dirty buffer for `ino`)
+    /// and on success. Returns the gateway's mapped errno on
+    /// failure.
+    fn flush_dirty_buffer(&self, ino: INodeNo, force_fsync: bool) -> Result<(), i32> {
+        // Phase 1: pop dirty buffer.
+        let req = self.inner.write().unwrap().flush_take_buffer(ino.0);
+        if let Some(req) = req {
+            // Phase 2: gateway call (no exclusive lock).
+            let resp = {
+                let fs = self.inner.read().unwrap();
+                fs.block_gateway_pub(fs.gateway().write(req))
+                    .map_err(|_| crate::fuse_fs::libc_eio())?
+            };
+            // Phase 3: persist composition_id.
+            self.inner
+                .write()
+                .unwrap()
+                .flush_apply_response(ino.0, &resp);
+        }
+        // Phase 4: durability barrier for `fsync(2)` callers. Even
+        // when there was no dirty buffer (no-op flush) we still
+        // honor the durability call — the user's `fsync(2)` may
+        // be sequencing prior writes by other handles on the
+        // same file.
+        if force_fsync {
+            let fs = self.inner.read().unwrap();
+            fs.block_gateway_pub(fs.gateway().fsync_pending())
+                .map_err(|_| crate::fuse_fs::libc_eio())?;
+        }
+        Ok(())
+    }
+
     /// Test-only: invoke the read path through the same lock the
     /// `Filesystem::read` callback uses. Lets concurrency tests
     /// exercise the lock without the fuser kernel surface.
@@ -262,9 +314,45 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
             reply.error(Errno::ENOENT);
             return;
         }
+        let file_name = name.to_str().unwrap_or("").to_owned();
+
+        // Phase 1: build the WriteRequest under a SHARED read lock —
+        // multiple `create` calls validate + clone request data in
+        // parallel; only `flush_take_buffer` and `*_apply_response`
+        // need exclusive access.
+        let req = match self
+            .inner
+            .read()
+            .unwrap()
+            .create_build_request(1, &file_name, Vec::new())
+        {
+            Ok(req) => req,
+            Err(e) => {
+                reply.error(Errno::from_i32(e));
+                return;
+            }
+        };
+        let size = req.data.len() as u64;
+
+        // Phase 2: gateway call — NO LOCK held. Other FUSE ops
+        // (write, read, unlink) proceed concurrently. This is the
+        // FUSE p99 fix: pre-fix, every other op queued behind this
+        // call's exclusive lock for the full gateway latency.
+        let fut_resp = {
+            let fs = self.inner.read().unwrap();
+            fs.block_gateway_pub(fs.gateway().write(req))
+        };
+        let resp = match fut_resp {
+            Ok(r) => r,
+            Err(e) => {
+                reply.error(Errno::from_i32(crate::fuse_fs::gateway_err_to_errno(&e)));
+                return;
+            }
+        };
+
+        // Phase 3: register the inode under exclusive write lock.
         let mut fs = self.inner.write().unwrap();
-        let file_name = name.to_str().unwrap_or("");
-        match fs.create(file_name, Vec::new()) {
+        match fs.create_apply_response(1, &file_name, size, &resp) {
             Ok(ino) => {
                 let attr = fs.getattr(ino).unwrap();
                 reply.created(
@@ -285,6 +373,11 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
     /// daemon's default flush returns ENOSYS and write data stays in
     /// the dirty buffer until release (or never, if release also
     /// drops it).
+    ///
+    /// `force_fsync = false`: POSIX `close(2)` does NOT guarantee
+    /// durability. Forcing fsync here would penalize the common
+    /// case (most apps don't `fsync` before close). Apps that need
+    /// durability call `fsync(2)` explicitly → `FUSE_FSYNC` below.
     fn flush(
         &self,
         _req: &Request,
@@ -293,16 +386,19 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
         _lock_owner: fuser::LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
-        let mut fs = self.inner.write().unwrap();
-        match fs.flush(ino.0) {
+        match self.flush_dirty_buffer(ino, false) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    /// `FUSE_FSYNC` — explicit user-issued fsync(2). Same shape as flush
-    /// for our purposes (no metadata-only path; data and metadata are
-    /// the same composition write).
+    /// `FUSE_FSYNC` — explicit user-issued fsync(2). MUST guarantee
+    /// durability per POSIX, so `force_fsync = true`: drains the
+    /// dirty buffer through the gateway AND drives every registered
+    /// gateway fsync hook (composition redb commit at Immediate,
+    /// chunk-store device.sync). The call only returns once data is
+    /// stable — preserving POSIX semantics under the
+    /// eventual-durability optimization.
     fn fsync(
         &self,
         _req: &Request,
@@ -311,8 +407,7 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let mut fs = self.inner.write().unwrap();
-        match fs.flush(ino.0) {
+        match self.flush_dirty_buffer(ino, true) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -323,6 +418,8 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
     /// from release (they don't propagate to close(2)), so we still
     /// reply ok on flush failure to match release semantics — the
     /// data loss is logged but cannot be surfaced through this op.
+    ///
+    /// Same `force_fsync = false` rationale as `FUSE_FLUSH`.
     fn release(
         &self,
         _req: &Request,
@@ -333,8 +430,7 @@ impl<G: GatewayOps + Send + Sync + 'static> Filesystem for FuseDaemon<G> {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let mut fs = self.inner.write().unwrap();
-        let _ = fs.flush(ino.0);
+        let _ = self.flush_dirty_buffer(ino, false);
         reply.ok();
     }
 

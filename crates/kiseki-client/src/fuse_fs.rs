@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
-use kiseki_gateway::ops::{GatewayOps, ReadRequest, WriteRequest};
+use kiseki_gateway::ops::{GatewayOps, ReadRequest, WriteRequest, WriteResponse};
 
 /// Inode number type.
 pub type Ino = u64;
@@ -151,6 +151,13 @@ impl<G: GatewayOps> KisekiFuse<G> {
         &self.rt
     }
 
+    /// Borrow the gateway. Used by [`crate::fuse_daemon::FuseDaemon`]
+    /// to issue gateway calls outside the daemon's `RwLock` write
+    /// section — see the prep / apply method pairs below.
+    pub(crate) fn gateway(&self) -> &G {
+        &self.gateway
+    }
+
     /// Block on an async gateway call. Uses `block_in_place` when on a
     /// tokio multi-thread runtime (tests), or `block_on` when on an OS
     /// thread (FUSE daemon).
@@ -165,6 +172,16 @@ impl<G: GatewayOps> KisekiFuse<G> {
             // On an OS thread (FUSE daemon) — block_on directly.
             self.rt.block_on(f)
         }
+    }
+
+    /// `pub(crate)` mirror of [`Self::block_gateway`] so the
+    /// daemon-orchestrated flush / create paths can invoke gateway
+    /// futures without holding the daemon's `RwLock` for write.
+    pub(crate) fn block_gateway_pub<F, T>(&self, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.block_gateway(f)
     }
 
     /// Validate that `ino` is a directory (Root or Dir). Returns error if not.
@@ -317,24 +334,75 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// updating the inode's `composition_id`. No-op if the inode has
     /// no dirty data.
     ///
-    /// Called by the FUSE daemon on `FUSE_FLUSH` and `FUSE_RELEASE`.
+    /// Called directly by tests and the in-process kiseki-client API.
+    /// The FUSE daemon uses [`Self::flush_take_buffer`] +
+    /// [`Self::flush_apply_response`] instead so the daemon can drop
+    /// its `RwLock` across the slow gateway call (FUSE p99 fix).
     pub fn flush(&mut self, ino: Ino) -> Result<(), i32> {
-        let Some(buf) = self.dirty.remove(&ino) else {
+        let Some(req) = self.flush_take_buffer(ino) else {
             return Ok(());
         };
         let resp = self
-            .block_gateway(self.gateway.write(WriteRequest {
-                tenant_id: self.tenant_id,
-                namespace_id: self.namespace_id,
-                data: buf,
-                name: None,
-                conditional: None,
-                workflow_ref: None,
-            }))
+            .block_gateway(self.gateway.write(req))
             .map_err(|_| libc_eio())?;
+        self.flush_apply_response(ino, &resp);
+        Ok(())
+    }
+
+    /// Phase 1 of the daemon-orchestrated flush: pop the dirty
+    /// buffer (under exclusive lock) and return a ready-to-send
+    /// `WriteRequest`. `None` when the inode has no buffered data
+    /// (no-op flush).
+    ///
+    /// The daemon calls this with the `RwLock` write lock held for
+    /// the few microseconds it takes to mutate `self.dirty`, then
+    /// drops the lock before [`Self::block_gateway`] / the gateway
+    /// call. See `kiseki_client::fuse_daemon::FuseDaemon::flush`.
+    pub(crate) fn flush_take_buffer(&mut self, ino: Ino) -> Option<WriteRequest> {
+        let buf = self.dirty.remove(&ino)?;
+        Some(WriteRequest {
+            tenant_id: self.tenant_id,
+            namespace_id: self.namespace_id,
+            data: buf,
+            name: None,
+            conditional: None,
+            workflow_ref: None,
+        })
+    }
+
+    /// Phase 3 of the daemon-orchestrated flush: persist the
+    /// gateway's `composition_id` onto the inode (under exclusive
+    /// lock). No-op if the inode is gone or not a file (e.g. it was
+    /// unlinked between take-buffer and apply).
+    pub(crate) fn flush_apply_response(&mut self, ino: Ino, resp: &WriteResponse) {
         if let Some(InodeEntry::File { composition_id, .. }) = self.inodes.get_mut(&ino) {
             *composition_id = resp.composition_id;
         }
+    }
+
+    /// POSIX `fsync(2)` semantics: drain the dirty buffer through
+    /// the gateway AND force the gateway's backing stores
+    /// (composition redb, chunk-store device) to fsync. Distinct
+    /// from `flush(2)` (called on `close(2)`), which has no
+    /// durability guarantee per POSIX.
+    ///
+    /// Without this method, the eventual-durability optimization
+    /// (composition redb at `Durability::None`, chunk store with
+    /// `sync_per_write=false`) would silently weaken `fsync(2)` —
+    /// the call would return before bytes hit stable storage.
+    /// `gateway.fsync_pending()` triggers all registered fsync
+    /// hooks server-side, so the call only returns after every
+    /// backing store has fsynced.
+    pub fn fsync(&mut self, ino: Ino) -> Result<(), i32> {
+        // Phase 1: same as flush — drain dirty buffer through the
+        // gateway. After this returns, the composition is in the
+        // server's redb (perhaps still in the WAL if eventual).
+        self.flush(ino)?;
+        // Phase 2: force durability of the just-written composition
+        // and any other recent writes. One fsync call covers all
+        // pending writes — redb's flush is global, not per-row.
+        self.block_gateway(self.gateway.fsync_pending())
+            .map_err(|_| libc_eio())?;
         Ok(())
     }
 
@@ -347,25 +415,70 @@ impl<G: GatewayOps> KisekiFuse<G> {
     }
 
     /// Create a file under a specific parent directory.
+    ///
+    /// Direct path used by tests / in-process callers. The FUSE
+    /// daemon goes through [`Self::create_build_request`] +
+    /// [`Self::create_apply_response`] so the daemon can drop its
+    /// `RwLock` across the gateway call.
     pub fn create_in(&mut self, parent: Ino, name: &str, data: Vec<u8>) -> Result<Ino, i32> {
-        self.require_dir(parent)?;
+        let req = self.create_build_request(parent, name, data)?;
+        let size = req.data.len() as u64;
+        let resp = self
+            .block_gateway(self.gateway.write(req))
+            .map_err(|e| gateway_err_to_errno(&e))?;
+        self.create_apply_response(parent, name, size, &resp)
+    }
 
+    /// Phase 1 of the daemon-orchestrated create: validate parent +
+    /// uniqueness and build the `WriteRequest` (under shared lock).
+    /// **No state change** — `self.next_ino`, `inodes`, `children`
+    /// are mutated only in [`Self::create_apply_response`] after
+    /// the gateway succeeds.
+    ///
+    /// The daemon takes the `RwLock` for read here so concurrent
+    /// `flush_take_buffer` callers (which need exclusive write
+    /// lock) wait, but parallel `create_build_request` callers
+    /// proceed concurrently. The actual gateway call runs lock-free.
+    pub(crate) fn create_build_request(
+        &self,
+        parent: Ino,
+        name: &str,
+        data: Vec<u8>,
+    ) -> Result<WriteRequest, i32> {
+        self.require_dir(parent)?;
         if self.children.contains_key(&(parent, name.to_owned())) {
             return Err(17); // EEXIST
         }
+        Ok(WriteRequest {
+            tenant_id: self.tenant_id,
+            namespace_id: self.namespace_id,
+            data,
+            name: None,
+            conditional: None,
+            workflow_ref: None,
+        })
+    }
 
-        let size = data.len() as u64;
-        let resp = self
-            .block_gateway(self.gateway.write(WriteRequest {
-                tenant_id: self.tenant_id,
-                namespace_id: self.namespace_id,
-                data,
-                name: None,
-                conditional: None,
-                workflow_ref: None,
-            }))
-            .map_err(|e| gateway_err_to_errno(&e))?;
-
+    /// Phase 3 of the daemon-orchestrated create: assign an inode +
+    /// register the parent → child link with the `composition_id`
+    /// the gateway just returned (under exclusive lock).
+    ///
+    /// Re-checks uniqueness because between the `build_request`
+    /// (read lock) and `apply_response` (write lock) another
+    /// concurrent caller may have created the same name. Returns
+    /// `EEXIST` in that case; caller is responsible for surfacing
+    /// it (the orphaned composition the gateway minted will be
+    /// GC'd by the chunk-refcount sweep).
+    pub(crate) fn create_apply_response(
+        &mut self,
+        parent: Ino,
+        name: &str,
+        size: u64,
+        resp: &WriteResponse,
+    ) -> Result<Ino, i32> {
+        if self.children.contains_key(&(parent, name.to_owned())) {
+            return Err(17); // EEXIST raced
+        }
         let ino = self.next_ino;
         self.next_ino += 1;
         self.inodes.insert(
@@ -620,7 +733,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
 fn libc_enoent() -> i32 {
     2 // ENOENT
 }
-fn libc_eio() -> i32 {
+pub(crate) fn libc_eio() -> i32 {
     5 // EIO
 }
 fn libc_eisdir() -> i32 {
@@ -631,7 +744,7 @@ fn libc_erofs() -> i32 {
 }
 
 /// Map a `GatewayError` to a POSIX errno (Linux ABI).
-fn gateway_err_to_errno(e: &kiseki_gateway::error::GatewayError) -> i32 {
+pub(crate) fn gateway_err_to_errno(e: &kiseki_gateway::error::GatewayError) -> i32 {
     use kiseki_gateway::error::GatewayError;
     match e {
         GatewayError::ReadOnlyNamespace => libc_erofs(),

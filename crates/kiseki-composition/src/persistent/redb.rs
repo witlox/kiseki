@@ -141,10 +141,61 @@ fn decode_stuck_state(bytes: &[u8]) -> Result<Option<(SequenceNumber, u32)>, Per
 // -- Storage struct ---------------------------------------------------------
 
 /// redb-backed `CompositionStorage`.
+///
+/// `eventual_durability` controls whether `txn.commit()` calls
+/// downgrade to `Durability::Eventual` (no inline fsync). When set,
+/// the runtime spawns a periodic flush task that issues a real
+/// fsync via [`Self::flush`] so disk state stays at most
+/// `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS` behind the in-memory
+/// state. Mirrors the chunk-store group-commit pattern from
+/// `681de37` — same FUSE p99 fix rationale, just on the
+/// composition redb instead of the chunk-store device.
+///
+/// Crash safety: in multi-node deployments Raft replication
+/// recovers ≤ flush_interval-ms of recently-committed compositions
+/// via the under-replication scrub on restart. Single-node
+/// deployments lose them — `eventual_durability` should stay off
+/// for those (default).
 pub struct PersistentRedbStorage {
-    db: Mutex<Database>,
+    db: std::sync::Arc<Mutex<Database>>,
     cache: Mutex<LruCache<CompositionId, Composition>>,
     metrics: Option<std::sync::Arc<crate::metrics::CompositionMetrics>>,
+    eventual_durability: bool,
+}
+
+/// Shared, clone-able handle for forcing a real fsync on the
+/// composition redb. Built via [`PersistentRedbStorage::flusher`]
+/// and handed to the runtime's periodic flush task.
+///
+/// Holds an `Arc<Mutex<Database>>` clone — same database as the
+/// owning storage. The `flush()` call takes the mutex briefly,
+/// issues a no-op `Immediate`-durability commit, and releases.
+#[derive(Clone)]
+pub struct RedbFlusher {
+    db: std::sync::Arc<Mutex<Database>>,
+    metrics: Option<std::sync::Arc<crate::metrics::CompositionMetrics>>,
+}
+
+impl RedbFlusher {
+    /// Force an `Immediate`-durability commit on the underlying
+    /// redb so any pending `Durability::None` commits land on
+    /// disk. The runtime's periodic flush task calls this.
+    ///
+    /// # Errors
+    /// Returns `PersistentStoreError` if the redb commit fails.
+    pub fn flush(&self) -> Result<(), PersistentStoreError> {
+        let db = self.db.lock().lock_or_die("redb.db");
+        let txn = db.begin_write()?;
+        // No mutation — the commit-with-Immediate is the fsync
+        // trigger. redb's commit path handles the WAL flush.
+        if let Err(e) = txn.commit() {
+            if let Some(m) = self.metrics.as_ref() {
+                m.redb_commit_errors_total.inc();
+            }
+            return Err(e.into());
+        }
+        Ok(())
+    }
 }
 
 impl PersistentRedbStorage {
@@ -165,6 +216,61 @@ impl PersistentRedbStorage {
     ) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Enable group-commit durability — every `txn.commit()` runs at
+    /// `Durability::Eventual` (no inline fsync). The runtime is
+    /// expected to drive a periodic [`Self::flush`] (default 100 ms)
+    /// to keep disk state fresh.
+    ///
+    /// Mirrors the chunk-store `set_sync_per_write(false)` knob
+    /// from `681de37`. Same crash-safety contract: in multi-node
+    /// deployments, Raft replication recovers ≤ flush_interval-ms
+    /// of compositions via the under-replication scrub. Single-
+    /// node deployments lose them on hard crash — only enable when
+    /// the cluster has ≥2 replicas of the composition delta.
+    #[must_use]
+    pub fn with_eventual_durability(mut self, enabled: bool) -> Self {
+        self.eventual_durability = enabled;
+        self
+    }
+
+    /// Build a clone-able [`RedbFlusher`] handle for the periodic
+    /// flush task. The returned handle shares the underlying redb
+    /// `Database` (via `Arc<Mutex<…>>`) so concurrent flushes from
+    /// the spawn task and writes from the data path serialize on
+    /// the same mutex.
+    #[must_use]
+    pub fn flusher(&self) -> RedbFlusher {
+        RedbFlusher {
+            db: std::sync::Arc::clone(&self.db),
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    /// Apply the configured durability mode to a freshly-begun
+    /// write transaction. Called immediately after `db.begin_write`
+    /// in every mutating method. Centralizes the policy so adding
+    /// a new mutating method only needs one call.
+    ///
+    /// redb 4.x exposes only `None` and `Immediate` — `None` is
+    /// the "skip the fsync, persisted on next `Immediate` commit"
+    /// mode, semantically identical to the older `Eventual`. The
+    /// runtime's periodic `flush()` task issues an `Immediate`
+    /// commit at the configured cadence to bound the loss window.
+    fn apply_durability(&self, txn: &mut redb::WriteTransaction) {
+        if self.eventual_durability {
+            // `set_durability` returns Result in redb 4.x — only
+            // errors when the txn is already committed/aborted,
+            // which can't happen on a freshly-begun transaction.
+            // Log + continue rather than fail the put.
+            if let Err(e) = txn.set_durability(redb::Durability::None) {
+                tracing::warn!(
+                    error = %e,
+                    "redb set_durability(None) failed — falling back to Immediate",
+                );
+            }
+        }
     }
 
     /// Open with an explicit LRU capacity (for tests).
@@ -213,9 +319,10 @@ impl PersistentRedbStorage {
                 .unwrap_or(std::num::NonZeroUsize::new(1).expect("1 is non-zero by construction")),
         );
         Ok(Self {
-            db: Mutex::new(db),
+            db: std::sync::Arc::new(Mutex::new(db)),
             cache: Mutex::new(cache),
             metrics: None,
+            eventual_durability: false,
         })
     }
 
@@ -330,7 +437,8 @@ impl CompositionStorage for PersistentRedbStorage {
         })?;
         {
             let db = self.db.lock().lock_or_die("redb.db");
-            let txn = db.begin_write()?;
+            let mut txn = db.begin_write()?;
+            self.apply_durability(&mut txn);
             {
                 let mut table = txn.open_table(COMPOSITIONS)?;
                 table.insert(id.0.as_bytes().as_slice(), bytes.as_slice())?;
@@ -347,7 +455,8 @@ impl CompositionStorage for PersistentRedbStorage {
     fn remove(&mut self, id: CompositionId) -> Result<bool, PersistentStoreError> {
         let existed = {
             let db = self.db.lock().lock_or_die("redb.db");
-            let txn = db.begin_write()?;
+            let mut txn = db.begin_write()?;
+            self.apply_durability(&mut txn);
             let existed = {
                 let mut table = txn.open_table(COMPOSITIONS)?;
                 let removed = table.remove(id.0.as_bytes().as_slice())?;
@@ -421,7 +530,8 @@ impl CompositionStorage for PersistentRedbStorage {
     ) -> Result<(), PersistentStoreError> {
         let new_key = name_key(ns, &name);
         let db = self.db.lock().lock_or_die("redb.db");
-        let txn = db.begin_write()?;
+        let mut txn = db.begin_write()?;
+        self.apply_durability(&mut txn);
         {
             let mut names = txn.open_table(NAMES)?;
             let mut names_rev = txn.open_table(NAMES_REVERSE)?;
@@ -457,7 +567,8 @@ impl CompositionStorage for PersistentRedbStorage {
     fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
         let key = name_key(ns, name);
         let db = self.db.lock().lock_or_die("redb.db");
-        let txn = db.begin_write()?;
+        let mut txn = db.begin_write()?;
+        self.apply_durability(&mut txn);
         let removed = {
             let mut names = txn.open_table(NAMES)?;
             let mut names_rev = txn.open_table(NAMES_REVERSE)?;
@@ -571,7 +682,8 @@ impl CompositionStorage for PersistentRedbStorage {
 
         {
             let db = self.db.lock().lock_or_die("redb.db");
-            let txn = db.begin_write()?;
+            let mut txn = db.begin_write()?;
+            self.apply_durability(&mut txn);
             {
                 let mut comps = txn.open_table(COMPOSITIONS)?;
                 let mut names = txn.open_table(NAMES)?;

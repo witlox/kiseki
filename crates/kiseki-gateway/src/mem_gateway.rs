@@ -151,6 +151,21 @@ pub struct InMemoryGateway {
     /// Tests and single-node deployments that don't wire metrics
     /// get no-op behavior.
     retry_metrics: Option<Arc<crate::metrics::GatewayRetryMetrics>>,
+    /// Optional fsync-pending hooks. When set, `GatewayOps::fsync_pending`
+    /// invokes them in order; each one is responsible for forcing a
+    /// real fsync on its store (composition redb, chunk-store
+    /// device, etc.). Wired by the runtime when group-commit is on
+    /// so FUSE / NFS clients calling `fsync(2)` get POSIX-compliant
+    /// durability under the eventual-durability optimization.
+    ///
+    /// `Vec` rather than `Option<Box>` so the runtime can register
+    /// multiple subsystems independently without re-entrancy.
+    /// Each closure runs synchronously on a `spawn_blocking` worker
+    /// inside the RPC; failures propagate as `GatewayError`.
+    #[allow(clippy::type_complexity)]
+    fsync_hooks: std::sync::RwLock<
+        Vec<Arc<dyn Fn() -> Result<(), crate::error::GatewayError> + Send + Sync>>,
+    >,
     /// Chunk plaintext cache (Phase 15c.5 perf fix). Chunks are
     /// content-addressed (`chunk_id` = HMAC over plaintext + salt)
     /// so caching decrypted bytes by `chunk_id` is correct: the
@@ -248,6 +263,7 @@ impl InMemoryGateway {
             cluster_placement: Vec::new(),
             target_copies: 0,
             retry_metrics: None,
+            fsync_hooks: std::sync::RwLock::new(Vec::new()),
             decrypt_cache: std::sync::Mutex::new(DecryptCache::default()),
         }
     }
@@ -263,6 +279,22 @@ impl InMemoryGateway {
             .workflow_table
             .write()
             .lock_or_die("mem_gateway.unknown") = Some(table);
+    }
+
+    /// Register a fsync-pending hook. Called by the runtime when
+    /// group-commit is enabled on a backing store (composition
+    /// redb, chunk-store device). Each hook runs synchronously
+    /// inside `GatewayOps::fsync_pending` to honor POSIX
+    /// `fsync(2)` semantics for FUSE / NFS clients.
+    #[allow(clippy::type_complexity)]
+    pub fn register_fsync_hook(
+        &self,
+        hook: Arc<dyn Fn() -> Result<(), crate::error::GatewayError> + Send + Sync>,
+    ) {
+        self.fsync_hooks
+            .write()
+            .lock_or_die("mem_gateway.fsync_hooks")
+            .push(hook);
     }
 
     /// Snapshot the `workflow_ref` counters as
@@ -839,6 +871,29 @@ impl InMemoryGateway {
 
 #[async_trait::async_trait]
 impl GatewayOps for InMemoryGateway {
+    /// Run all registered fsync hooks. Each drives a real `fsync(2)`
+    /// on its backing store (composition redb, chunk-store block
+    /// device). FUSE / NFS callers invoke this from their
+    /// `fsync(2)` handlers when group-commit is enabled — without
+    /// it the eventual-durability optimization would silently
+    /// weaken POSIX `fsync(2)` semantics.
+    async fn fsync_pending(&self) -> Result<(), GatewayError> {
+        let hooks: Vec<_> = self
+            .fsync_hooks
+            .read()
+            .lock_or_die("mem_gateway.fsync_hooks")
+            .clone();
+        for hook in hooks {
+            // Run on a blocking worker — fsync may block for
+            // milliseconds, and we don't want to stall the tokio
+            // executor on an OS-level call.
+            tokio::task::spawn_blocking(move || hook())
+                .await
+                .map_err(|e| GatewayError::Upstream(format!("fsync hook join: {e}")))??;
+        }
+        Ok(())
+    }
+
     // The read path is a single sequence (composition lookup with bounded
     // retry → per-chunk decrypt with cache → offset/length slice + view
     // staleness check) that doesn't decompose cleanly. Splitting would

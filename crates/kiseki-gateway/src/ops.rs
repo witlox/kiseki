@@ -96,6 +96,25 @@ pub trait GatewayOps: Send + Sync {
     /// Write data to a composition (encrypt plaintext from client → store).
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
 
+    /// Force durability of all writes the gateway has accepted.
+    ///
+    /// Honors POSIX `fsync(2)` semantics under the group-commit
+    /// optimization: when the persistent composition store runs at
+    /// `Durability::None` (set via `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS`)
+    /// and the chunk store runs with `sync_per_write=false`, individual
+    /// `write` calls return before the bytes hit stable storage. A
+    /// FUSE / NFS client invoking `fsync(2)` needs an explicit
+    /// "now please flush everything" signal — this RPC.
+    ///
+    /// Default: no-op (`Ok(())`). Persistent gateway impls override
+    /// to drive `composition.flusher().flush()` plus
+    /// `chunk_device.sync()`. The cost is one fsync per call;
+    /// callers should batch (e.g. only invoke on actual `fsync(2)`,
+    /// not on `close(2)`).
+    async fn fsync_pending(&self) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
     /// Attach a Content-Type to a composition (RFC 6838 round-trip via
     /// composition metadata; survives across gateway instances). Default
     /// no-op for backends that don't track per-object metadata; the
