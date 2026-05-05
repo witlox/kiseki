@@ -19,6 +19,12 @@ provides:
 The system key manager also runs its own Raft group for high availability
 (ADR-007), as do audit log shards (ADR-009).
 
+All shard groups (plus the control-plane group) share **one TCP listener
+per node** via the multiplexed transport defined in ADR-041 — every
+Raft RPC carries the target shard id, the listener routes to the
+right openraft handle, and split/merge re-registers the group on the
+existing port without binding a new one.
+
 ---
 
 ## openraft integration

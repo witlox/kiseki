@@ -372,7 +372,12 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # MUST fan out and the metric MUST tick. The matching
   # `incoming fabric is allowed` step at scenario end clears
   # the deny flag.
-  @integration @multi-node @cross-node @ordering
+  # @flaky: GET retry races against in-flight PutFragment; the GET can
+  # win the race and serve from the local fragment cache before the
+  # slow PutFragment completes, missing the fabric fan-out the
+  # assertion expects. The 60 s slow-down (CLAUDE.md) reduced the
+  # flake rate but didn't eliminate it. Cucumber retries up to 2x.
+  @integration @multi-node @cross-node @ordering @flaky
   Scenario: Composition delta arrives before fragment (D-10 cross-stream)
     Given a 3-node kiseki cluster
     And node-3's incoming fabric is denied

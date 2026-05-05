@@ -49,6 +49,7 @@ All architectural decisions are recorded as ADRs in
 | [ADR-038](adr/038-pnfs-layout-and-ds-subprotocol.md) | pNFS Layout and Data Server Subprotocol | Accepted |
 | [ADR-039](adr/039-flex-files-mirror-list-encoding.md) | Flexible Files Layout — Mirror-List Encoding | Accepted |
 | [ADR-040](adr/040-persistent-metadata-stores.md) | Persistent Metadata Stores (CompositionStore, ViewStore) | Accepted |
+| [ADR-041](adr/041-raft-transport-shard-multiplexing.md) | Raft Transport — Shard Multiplexing on a Single Node Port | Accepted |
 
 ---
 
@@ -98,6 +99,7 @@ What else was evaluated and why it was rejected.
 - ADR-033: Initial shard topology and ratio-floor splits
 - ADR-034: Shard merge mechanism
 - ADR-036: LogOps trait — shard management and consumer watermarks
+- ADR-041: Raft transport — shard multiplexing on a single node port
 
 ### Storage
 - ADR-005: Erasure coding and chunk durability

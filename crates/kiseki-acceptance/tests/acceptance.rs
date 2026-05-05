@@ -671,8 +671,21 @@ fn main() {
     // mutex without resource starvation. Each cluster singleton is
     // already serialized by its `OwnedMutexGuard`, so the cap only
     // gates the *cross-singleton* concurrency.
+    // `@flaky`-tagged scenarios get up to 2 retries each. cucumber-rs
+    // 0.23 retries the *whole* scenario when any step fails, so the
+    // post-Given setup runs again — we use this for known-stochastic
+    // multi-node scenarios where the harness's process-level
+    // singleton has occasional resource-contention flakes (6-node
+    // boot under concurrent compose pressure, D-10's GET retry race
+    // against in-flight PutFragment, etc.). Real bugs surface as
+    // failures across all 3 attempts; flakes pass on at least one.
+    let flaky_filter: cucumber::gherkin::tagexpr::TagOperation =
+        "@flaky".parse().expect("@flaky tag expression parses");
     let runner = KisekiWorld::cucumber()
         .max_concurrent_scenarios(4)
+        .retries(2)
+        .retry_after(std::time::Duration::from_secs(1))
+        .retry_filter(flaky_filter)
         .filter_run("features/", move |feat, _, sc| {
             if skip_slow && sc.tags.iter().any(|t| t == "slow") {
                 return false;

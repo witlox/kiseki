@@ -167,7 +167,12 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # PutFragment unavailable + 1760 quorum-lost events + zero log lines.
   # This scenario must succeed on the same configuration before we
   # claim cross-node fabric is production-ready at scale.
-  @integration @multi-node @ec
+  #
+  # @flaky: the 6-node harness occasionally hits node-1 /health timeout
+  # when the BDD process is concurrently spinning up 3-node + 6-node +
+  # 20-node singletons (each with their own port allotments). Passes
+  # in isolation. Cucumber retries up to 2× per acceptance.rs config.
+  @integration @multi-node @ec @flaky
   Scenario: 6-node cluster — PUT lands EC 4+2 fragments without quorum loss
     Given a 6-node kiseki cluster
     When a client writes 1MB via S3 PUT to node-1

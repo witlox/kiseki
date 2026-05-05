@@ -38,7 +38,7 @@ Key Management   Internal · Vault · AWS KMS · Azure Key Vault · GCP Cloud KM
 Transports       CXI / InfiniBand / RoCEv2 / TCP+TLS
 ```
 
-21 Rust crates (20 production + 1 BDD-test), ~1500 unit/integration tests, 72 e2e tests, 285 BDD scenarios, 39 ADRs, 140 invariants.
+21 Rust crates (20 production + 1 BDD-test), ~1650 unit/integration tests, 31 e2e tests, 321 BDD scenarios, 41 ADRs, 140 invariants.
 
 Integrates with [Lattice](https://github.com/witlox/lattice) (workload scheduling),
 [Pact](https://github.com/witlox/pact) (node configuration), and
@@ -144,7 +144,7 @@ mdbook serve  # http://localhost:3000
 | [Architecture](https://witlox.github.io/kiseki/architecture/overview.html) | System design, bounded contexts, data flow, encryption, Raft |
 | [Security](https://witlox.github.io/kiseki/security/model.html) | Security model, STRIDE analysis, authentication, tenant isolation |
 | [API Reference](https://witlox.github.io/kiseki/api/grpc.html) | gRPC, REST, CLI, environment variables |
-| [Decisions](https://witlox.github.io/kiseki/decisions/index.html) | 40 Architecture Decision Records |
+| [Decisions](https://witlox.github.io/kiseki/decisions/index.html) | 41 Architecture Decision Records |
 | [Performance](https://witlox.github.io/kiseki/performance/) | Local profile-driver matrix and GCP perf-cluster results |
 
 ## Development

@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-acceptance"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "axum",
  "cucumber",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-advisory"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "kiseki-audit",
  "kiseki-common",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-audit"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "futures",
  "kiseki-common",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-backup"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-block"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "crc32c",
  "kiseki-common",
@@ -1889,7 +1889,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-chunk"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "kiseki-block",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-chunk-cluster"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-client"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "fuser",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-common"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-composition"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "kiseki-common",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-control"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-crypto"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "aws-lc-rs",
  "cucumber",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-gateway"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2066,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-keymanager"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-log"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-profile"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-proto"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-raft"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-server"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-tracing"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -2232,7 +2232,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-transport"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "aws-lc-rs",
  "kiseki-common",
@@ -2255,7 +2255,7 @@ dependencies = [
 
 [[package]]
 name = "kiseki-view"
-version = "2026.40.0"
+version = "2026.41.0"
 dependencies = [
  "kiseki-common",
  "kiseki-log",

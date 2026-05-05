@@ -204,6 +204,15 @@ async fn then_apply_hook_fired_on_every_node(w: &mut KisekiWorld) {
     // registration. Bootstrap baseline is 2 (the per-node bootstrap
     // shard's group + the control-plane group); after a split the
     // gauge should read 3 on every node.
+    //
+    // The cluster harness is a process-level singleton reused across
+    // every `@multi-node` scenario, so a node may have been killed +
+    // restarted by an earlier `@leader-change` scenario. Restarted
+    // nodes momentarily reset their multiplexed listener registry
+    // until the per-shard groups re-register via control-plane
+    // hydration. Poll the gauge with a 10 s deadline so we tolerate
+    // that catch-up window — the BDD harness covers the existence-of-
+    // metric path; the absolute count is timing-sensitive.
     let right = w
         .cluster
         .name_index_state
@@ -218,32 +227,39 @@ async fn then_apply_hook_fired_on_every_node(w: &mut KisekiWorld) {
         let g = cluster(w);
         g.nodes().map(|n| (n.node_id, n.ports.metrics)).collect()
     };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut missing: Vec<u64> = Vec::new();
-    for (node_id, metrics_port) in ports {
-        let url = format!("http://127.0.0.1:{metrics_port}/metrics");
-        let body = reqwest::get(&url)
-            .await
-            .unwrap_or_else(|e| panic!("scrape node-{node_id} metrics: {e}"))
-            .text()
-            .await
-            .unwrap_or_else(|e| panic!("read node-{node_id} metrics body: {e}"));
-        // The registry_size gauge increments by 1 per registered
-        // shard. With cluster_control wired we expect at least 3:
-        // bootstrap data shard + control-plane group + new split
-        // target shard. If the apply hook never ran on a follower,
-        // that follower's gauge stays at 2.
-        let value = parse_registry_size(&body);
-        if value < 3.0 {
-            missing.push(node_id);
+    loop {
+        missing.clear();
+        for (node_id, metrics_port) in &ports {
+            let url = format!("http://127.0.0.1:{metrics_port}/metrics");
+            let value = match reqwest::get(&url).await {
+                Ok(r) => r.text().await.map(|body| parse_registry_size(&body)).unwrap_or(0.0),
+                Err(_) => 0.0,
+            };
+            if value < 3.0 {
+                missing.push(*node_id);
+            }
         }
+        if missing.is_empty() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    assert!(
-        missing.is_empty(),
+    panic!(
         "ADR-033 §4 cluster-wide split: nodes {missing:?} did not register the \
-         new shard's Raft group locally — apply hook either did not fire or \
-         RaftShardStore::create_shard returned without registration. \
-         Expected `kiseki_raft_transport_registry_size >= 3` on every node, \
-         got <3 on {missing:?}.",
+         new shard's Raft group locally within 10 s — apply hook either did \
+         not fire or RaftShardStore::create_shard returned without \
+         registration. Expected `kiseki_raft_transport_registry_size >= 3` on \
+         every node, got <3 on {missing:?}. (Note: the cluster harness is a \
+         process-level singleton; if a prior `@leader-change` scenario killed \
+         a node, the restarted node's listener registry takes a few seconds \
+         to re-populate via control-plane hydration — the 10 s deadline \
+         accommodates that. A persistent failure means the apply hook is \
+         genuinely not firing.)",
     );
 }
 

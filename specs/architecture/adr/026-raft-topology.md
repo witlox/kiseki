@@ -92,10 +92,17 @@ Placement rule: no two members of the same group on the same node
 
 | Phase | Transport | Optimization |
 |-------|-----------|-------------|
-| Phase 1 (now) | TCP + TLS | Direct connections, one per Raft peer |
+| Phase 1 (now) | TCP + TLS, **multiplexed per node** (ADR-041) | One listener per node carries all shard groups; RPC envelope tags target shard id |
 | Phase 2 (10+ nodes) | TCP + TLS + connection pooling | Reuse connections across groups |
 | Phase 3 (100+ nodes) | Batched transport (Strategy C) | Coalesce heartbeats per node pair |
 | Future | Slingshot CXI / RDMA | Sub-10µs Raft RTT |
+
+**ADR-041 amendment (2026-05-04):** the original "one listener per
+Raft group" model from openraft hits the port and fd budget at
+ratio-floor split scale. Every shard group on a node now shares a
+single multiplexed listener and a registry. See ADR-041 for the
+envelope format, the apply-hook registration protocol, and the
+observability surface.
 
 ### Election storm mitigation
 

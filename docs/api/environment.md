@@ -81,6 +81,20 @@ Standard Rust/tokio observability variables:
 |---|---|---|---|
 | `RUST_LOG` | `String` | `info` | Log filter directive (e.g., `kiseki_log=debug,kiseki_raft=trace`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `String` | (none) | OpenTelemetry collector endpoint for distributed tracing |
+| `KISEKI_OBSERVABILITY` | `String` | `on` | Set to `off` to bypass `InstrumentedLogOps` / `InstrumentedKeyManager` wrappers for hot-path latency-sensitive deployments. Disables fine-grained per-op metrics; coarse counters and traces still emitted. |
+
+---
+
+## Durability tuning (read [`operations/durability.md`](../operations/durability.md) before changing)
+
+Group-commit knobs trade per-op fsync stalls for a bounded loss window
+on hard reset. Safe at the targeted 10–100+ node deployment shapes
+where R-3/EC-4+2 replicas + scrub recover per-node loss windows.
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS` | `u64` | (unset = per-write fsync) | When set, composition redb writes use eventual durability and a background task fsyncs the database every N ms. `fsync(2)` from a FUSE client still drains via `gateway.fsync_pending()`. |
+| `KISEKI_CHUNK_FLUSH_INTERVAL_MS` | `u64` | `1000` | Block-device fsync cadence. Lower = smaller loss window, more device sync overhead. |
 
 ---
 
