@@ -36,6 +36,9 @@ pub mod remote_http;
 #[allow(missing_docs, clippy::cast_possible_truncation)]
 pub mod remote_nfs;
 
+#[cfg(feature = "native")]
+pub mod native;
+
 #[cfg(feature = "ffi")]
 #[allow(missing_docs, unsafe_code, clippy::missing_safety_doc)]
 pub mod ffi;
