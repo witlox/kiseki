@@ -1771,9 +1771,20 @@ pub async fn run_main(
         native_signing_keys,
     );
     let native_intercept_for_tonic = std::sync::Arc::clone(&native_intercept);
-    let native_svc = kiseki_proto::v1::native::gateway_data_service_server::GatewayDataServiceServer::with_interceptor(
+    let native_inner = kiseki_proto::v1::native::gateway_data_service_server::GatewayDataServiceServer::new(
         native_server,
-        move |req| native_intercept_for_tonic.intercept(req),
+    )
+    // Streaming PUT can deliver up to the configured per-stream cap
+    // (default 64 MiB, env KISEKI_NATIVE_STREAM_CAP overrides). The
+    // server-side decoded-message-size default is 4 MiB; raise to
+    // match the per-stream cap so a single PutObjectChunk payload
+    // doesn't get OutOfRange'd at the codec boundary. Encoding cap
+    // covers GET responses with similarly large payloads.
+    .max_decoding_message_size(64 * 1024 * 1024)
+    .max_encoding_message_size(64 * 1024 * 1024);
+    let native_svc = tonic::service::interceptor::InterceptedService::new(
+        native_inner,
+        move |req: tonic::Request<()>| native_intercept_for_tonic.intercept(req),
     );
     router = router.add_service(native_svc);
     tracing::info!(
