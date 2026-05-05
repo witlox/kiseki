@@ -15,10 +15,12 @@
 //! Phase 2 of the ADR-042 implementation plan
 //! (`specs/implementation/adr-042-native-gateway.md`).
 
+pub mod canonical_san;
 pub mod dek_fetch_ticket;
 pub mod handle_token;
 pub mod lease_store;
 pub mod multipart_upload_id;
+pub mod san_interceptor;
 pub mod signing_keys;
 
 pub mod server;
