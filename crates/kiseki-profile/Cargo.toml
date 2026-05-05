@@ -22,12 +22,14 @@ name = "kiseki-profile"
 path = "src/main.rs"
 
 [dependencies]
-kiseki-client = { workspace = true, features = ["remote-http", "remote-nfs"] }
+kiseki-client = { workspace = true, features = ["remote-http", "remote-nfs", "native"] }
 kiseki-chunk = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-crypto = { workspace = true }
 kiseki-gateway = { workspace = true }
+kiseki-proto = { workspace = true }
+tonic = { workspace = true }
 
 async-trait = { workspace = true }
 clap = { version = "4", features = ["derive"] }

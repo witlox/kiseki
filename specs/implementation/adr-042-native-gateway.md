@@ -28,11 +28,11 @@ Adversary findings cleared:
 | # | Phase | Status | Owner |
 |---|-------|--------|-------|
 | 1 | `gateway_data.proto` plumbed through `kiseki-proto` | **Done (`d7144b9`)** | implementer |
-| 2 | `kiseki_gateway::native::ServerImpl` thin wrapper over `GatewayOps` | Pending | implementer |
-| 3 | `SanInterceptor` (canonicalization + audit emission + cert reval) | Pending | implementer |
-| 4 | Wire into `kiseki-server::runtime::run_data_path` | Pending | implementer |
-| 5 | `kiseki_client::native::NativeClient` + `TopologyCache` + `StreamSlot` RAII | Pending | implementer |
-| 6 | BDD steps for `native-gateway.feature` against the cluster harness | Pending | implementer |
+| 2 | `kiseki_gateway::native::ServerImpl` thin wrapper over `GatewayOps` | **Done (`bc3fc62`, `d2ece85`)** | implementer |
+| 3 | `SanInterceptor` (canonicalization + audit emission + cert reval) | **Done (`d128a24`, `07eea1d`)** | implementer |
+| 4 | Wire into `kiseki-server::runtime::run_data_path` | **Done (`9e38e59`)** | implementer |
+| 5 | `kiseki_client::native::NativeClient` + `TopologyCache` + `StreamSlot` RAII | **Done (`ffe76bd`)** | implementer |
+| 6 | BDD steps for `native-gateway.feature` against the cluster harness | **Partial — 15/38 green; tracking notes below** | implementer |
 | 7 | `kiseki-profile --protocol native` driver | Pending | implementer |
 | 8 | Re-measure against A-NG11 targets (≥80 k GET, ≥56 k PUT) | Pending | implementer |
 
@@ -182,6 +182,63 @@ The 33 scenarios in `native-gateway.feature` are the integration witness. Per AD
 
 - All 33 scenarios green (or marked `@flaky` per the existing convention with explanatory Gherkin comments — gate-1 should not surface new flakes).
 - `KISEKI_BDD_FAST=1` lane skips `@native @perf @smoke` (those are nightly-only).
+
+### Status (as of `efab8ab`): 15 / 38 scenarios green
+
+The feature file expanded from the planned "33 scenarios" to **38** when
+the canonicalization Scenario Outline rows are counted individually
+(6 outline rows + 32 plain). Real bugs surfaced and fixed during the
+first iteration:
+
+1. `native-gateway.feature` had been parse-broken since it landed
+   (multi-line Gherkin steps with no DocString continuation —
+   gherkin-official rejected it). Folded; restored Feature
+   description's allowed multi-line text.
+2. `rustls::CryptoProvider` was never installed at the kiseki-server
+   `main` entry. Pre-existing race in 3-node mTLS tests that this
+   feature reliably exposed in 1-node mode. Explicit
+   `aws_lc_rs::default_provider().install_default()` lands in both
+   `kiseki-server::main` and the cucumber test binary.
+3. Gateway-data-service codec defaults were too small for streaming
+   PUT (4 MiB) — bumped to 64 MiB to match the per-stream cap.
+4. Real Phase 2/3 gap closed: SanInterceptor stashed the
+   canonical-SAN URI in extensions but no RPC handler was reading
+   it. New `enforce_san_payload_tenant_match` helper threads the
+   gate-1 F-H1 cross-check through every handler that consumes
+   `ControlFields.tenant_id`.
+
+What's green (15 scenarios — auth, basic objects, near-miss outline,
+lease verbs):
+- @auth match + mismatch
+- All 6 `Scenario Outline` near-miss rows (canonicalization)
+- Native object PUT — small payload (unary)
+- Streaming 16 MiB PUT — commit-on-close
+- Stream-interrupted before CommitStream
+- Native POSIX rename within / across shards (return
+  Unimplemented today; assertion structurally satisfied)
+- Native POSIX lease — exclusive write (acquire / held / release)
+
+What's deferred (the remaining 23 scenarios, broken down):
+
+| Group | Scenarios | Required runtime work |
+|-------|-----------|----------------------|
+| @routing | 4 | Multi-node mTLS cluster harness wiring + leader-change driver, NotLeader / proxy-fallback path on the server |
+| @encryption @trusted-compute | 2 | TrustedCompute namespace flag via control-plane CreateNamespace + real DEK fetch + keymanager forward path (Phase 4 follow-up §) |
+| @encryption @config | 2 | crypto_boundary mutation via UpdateNamespace admin RPC |
+| @posix lease (expiry / partition-heal) | 2 | Lease TTL clock + drain RPC |
+| @drain | 2 | Drain RPC + lease/quiesce window wiring |
+| @audit | 2 | AuditSink wired into the harness with inspection API |
+| @perf @smoke | 2 | Phase 8 measurement (gates the ADR `Accepted` flip) |
+| @resource-limits | 1 | Per-tenant stream cap bookkeeping at the server (the unit-level RAII guard is in the client) |
+| @auth (cert revocation) | 1 | CRL re-validation task + mid-stream tear-down |
+| @posix Fsync visibility | 1 | POSIX inode bridging at the GatewayOps layer |
+| @posix multipart-via-cap | 1 | Stream-cap → multipart auto-promotion |
+| @clock | 2 | Clock-skew metric wiring + alarm path |
+| @objects idempotency dedup | 1 | Idempotency-key dedup window at the native gateway |
+
+Each entry above corresponds to a discrete runtime feature; none is
+a `@flaky` retryable. Closing them out is the natural next slice
+once Phases 7–8 confirm the perf gate and ADR-042 ships.
 
 ---
 

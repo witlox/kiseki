@@ -209,10 +209,21 @@ impl CanonicalSanUri {
     /// Canonical SAN used in plaintext development mode. **Never**
     /// install this when `require_tls = true`; the audit pipeline
     /// would silently see it as a real principal.
+    ///
+    /// The result is cached in a `OnceLock` so the canonicalization
+    /// rule chain runs exactly once for the lifetime of the process.
+    /// Without the cache, every plaintext-mode RPC re-canonicalized
+    /// the same string and that hot-path waste was visible in the
+    /// first kiseki-profile native run (Phase 7) — small constant
+    /// per call but it accumulates at >10 k op/s.
     #[must_use]
     pub fn default_for_dev() -> Self {
-        canonicalize("spiffe://kiseki/tenant/dev")
-            .expect("dev tenant URI is canonical by construction")
+        static DEV: std::sync::OnceLock<CanonicalSanUri> = std::sync::OnceLock::new();
+        DEV.get_or_init(|| {
+            canonicalize("spiffe://kiseki/tenant/dev")
+                .expect("dev tenant URI is canonical by construction")
+        })
+        .clone()
     }
 
     /// Test-only helper: build a `CanonicalSanUri` directly from a

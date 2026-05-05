@@ -58,6 +58,12 @@ enum Protocol {
     /// graduation gate from `A-NG11` requires this floor to clear
     /// 100 k op/s 64 KiB GET before ADR-042's protocol shape commits.
     InProcess,
+    /// Native gRPC `GatewayDataService` (ADR-042). Drives the
+    /// `kiseki.v1.native` service on the harness's data port. The
+    /// gRPC tax this measures vs. the in-process floor is what
+    /// ADR-042's perf gate (A-NG11: ≥80 k op/s GET, ≥56 k op/s PUT
+    /// per node) bounds.
+    Native,
 }
 
 /// Workload shape — what mix of operations to drive.
@@ -168,9 +174,10 @@ fn main() {
 async fn run(args: RunArgs) -> Result<(), String> {
     // The in-process driver doesn't need a spawned server — it
     // instantiates the gateway directly. Skip the harness for it.
-    let server = match args.protocol {
-        Protocol::InProcess => None,
-        _ => {
+    let server = if matches!(args.protocol, Protocol::InProcess) {
+        None
+    } else {
+        {
             let s = harness::ProfileServer::start(args.server_bin.as_deref()).await?;
             eprintln!(
                 "[harness] server up; s3={} nfs={} ds={} metrics={}",

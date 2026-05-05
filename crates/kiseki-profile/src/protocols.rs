@@ -43,7 +43,7 @@ pub async fn build(
     match protocol {
         Protocol::InProcess => {
             // No server needed.
-            Ok(Arc::new(InProcessDriver::new().await))
+            Ok(Arc::new(InProcessDriver::new()))
         }
         Protocol::S3 => {
             let s = server.ok_or("S3 driver requires --server-bin (none was passed)")?;
@@ -64,6 +64,11 @@ pub async fn build(
         Protocol::Fuse => {
             let s = server.ok_or("Fuse driver requires --server-bin")?;
             Ok(Arc::new(FuseDriver::new(&s.s3_base)))
+        }
+        Protocol::Native => {
+            let s = server.ok_or("Native driver requires --server-bin")?;
+            let addr = format!("127.0.0.1:{}", s.ports.grpc_data);
+            Ok(Arc::new(NativeDriver::new(&addr).await?))
         }
     }
 }
@@ -767,7 +772,7 @@ struct InProcessDriver {
 }
 
 impl InProcessDriver {
-    async fn new() -> Self {
+    fn new() -> Self {
         use kiseki_chunk::store::ChunkStore;
         use kiseki_common::ids::ShardId;
         use kiseki_common::tenancy::KeyEpoch;
@@ -836,6 +841,123 @@ impl Driver for InProcessDriver {
             })
             .await
             .map_err(|e| format!("in-process get: {e}"))?;
+        Ok(resp.data.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native gRPC (ADR-042)
+// ---------------------------------------------------------------------------
+
+/// Drives the `kiseki.v1.native.GatewayDataService` over real tonic
+/// gRPC. The harness's `ProfileServer` runs in plaintext mode (no TLS
+/// material), so the `SanInterceptor` falls through to the synthetic
+/// "dev" tenant principal — the cross-check against the payload's
+/// `tenant_id` is a no-op in that posture, matching what S3 and NFS
+/// drivers do today (they use the same single-tenant cluster).
+pub struct NativeDriver {
+    /// Cloneable gRPC channel held by every per-call client construction.
+    channel: tonic::transport::Channel,
+    namespace_id: NamespaceId,
+    tenant_id: OrgId,
+}
+
+impl NativeDriver {
+    pub async fn new(grpc_addr: &str) -> Result<Self, String> {
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{grpc_addr}"))
+            .map_err(|e| format!("native endpoint: {e}"))?
+            .tcp_nodelay(true)
+            .timeout(std::time::Duration::from_secs(30));
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| format!("native connect: {e}"))?;
+        // Same single-tenant defaults the existing S3 driver uses —
+        // the harness's `kiseki-server` registers the bootstrap
+        // namespace under the bootstrap tenant, and the perf workload
+        // PUTs against it.
+        Ok(Self {
+            channel,
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+        })
+    }
+
+    fn ctrl(&self) -> kiseki_proto::v1::native::ControlFields {
+        kiseki_proto::v1::native::ControlFields {
+            tenant_id: Some(kiseki_proto::v1::OrgId {
+                value: self.tenant_id.0.to_string(),
+            }),
+            // 16-byte random idempotency key per call. Dedup window
+            // bookkeeping isn't wired in v1 (Phase 4 follow-up), but
+            // a unique key per call is the right shape for when it
+            // is.
+            idempotency_key: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            workflow_ref: String::new(),
+            cache_hint: None,
+            conditional: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Driver for NativeDriver {
+    async fn put(&self, payload: &[u8]) -> Result<Key, String> {
+        let mut client = kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient::new(
+            self.channel.clone(),
+        )
+        // Match the server-side codec config (Phase 4 wiring) so 16
+        // MiB+ streams can encode round-trip.
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+        let req = tonic::Request::new(kiseki_proto::v1::native::PutObjectRequest {
+            control: Some(self.ctrl()),
+            namespace_id: Some(kiseki_proto::v1::NamespaceId {
+                value: self.namespace_id.0.to_string(),
+            }),
+            name: format!("perf-{}", uuid::Uuid::new_v4().simple()),
+            data: payload.to_vec(),
+        });
+        let resp = client
+            .put_object(req)
+            .await
+            .map_err(|e| format!("native put: {e}"))?
+            .into_inner();
+        let comp = resp
+            .composition_id
+            .ok_or_else(|| "native put: response missing composition_id".to_string())?;
+        let uuid = uuid::Uuid::parse_str(&comp.value)
+            .map_err(|e| format!("native put: composition_id parse: {e}"))?;
+        Ok(Key {
+            composition_id: kiseki_common::ids::CompositionId(uuid),
+            name: None,
+        })
+    }
+
+    async fn get(&self, key: &Key) -> Result<usize, String> {
+        let mut client = kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient::new(
+            self.channel.clone(),
+        )
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+        let req = tonic::Request::new(kiseki_proto::v1::native::GetObjectRequest {
+            control: Some(self.ctrl()),
+            namespace_id: Some(kiseki_proto::v1::NamespaceId {
+                value: self.namespace_id.0.to_string(),
+            }),
+            range_start: 0,
+            range_end: 0,
+            key: Some(kiseki_proto::v1::native::get_object_request::Key::CompositionId(
+                kiseki_proto::v1::CompositionId {
+                    value: key.composition_id.0.to_string(),
+                },
+            )),
+        });
+        let resp = client
+            .get_object(req)
+            .await
+            .map_err(|e| format!("native get: {e}"))?
+            .into_inner();
         Ok(resp.data.len())
     }
 }
