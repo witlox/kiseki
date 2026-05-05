@@ -516,14 +516,163 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 
 ---
 
+## Native gateway data service failures (ADR-042 — in design)
+
+### F-NG1: Cert SAN / payload tenant_id mismatch
+
+| Field | Value |
+|---|---|
+| **Description** | A native gRPC request arrives whose payload `tenant_id` does not match the SAN URI tenant in the client cert (I-NG1). |
+| **Blast radius** | The single rejected request. No state mutation. |
+| **Detection** | Proto-handler boundary check before any gateway work runs. |
+| **Degradation** | Request rejected with `PermissionDenied`. A security-failure audit event is emitted with the SAN, the claimed payload tenant, and the timestamp so operators can trace forgery attempts. |
+| **Recovery** | None needed; the request never executed. |
+| **Severity** | **P3** (per-request; cumulative pattern raises severity for the operator's threat model) |
+
+### F-NG2: Streaming write interrupted before CommitStream
+
+| Field | Value |
+|---|---|
+| **Description** | A native object streaming Write transmits N MiB but the connection drops, the client crashes, or the leader changes before `CommitStream` is called (I-NG2). |
+| **Blast radius** | Server-side staging buffer for that one stream — bounded by the per-stream cap (64 MiB). |
+| **Detection** | Stream end-of-data without `CommitStream`; idempotency-key dedup window timer. |
+| **Degradation** | The partial state is never visible to readers. Server-side buffer is reclaimed within the 5-min idempotency dedup window. Concurrent reads of the target name see the pre-write state. |
+| **Recovery** | Client retries with the same idempotency key (within the window) → fresh stream, original outcome surface; or with a new key → fresh write. |
+| **Severity** | **P3** (per-stream, bounded blast radius) |
+
+### F-NG3: Streaming write interrupted by leader change
+
+| Field | Value |
+|---|---|
+| **Description** | A native streaming Write is in progress when the namespace's shard leader changes mid-stream. Writes accepted by the old leader but not yet committed to the Raft log are not durable. |
+| **Blast radius** | All in-flight streams targeting the affected shard. |
+| **Detection** | The new leader has no record of the pre-`CommitStream` state; the client receives `Aborted{leader_changed}` on the next stream frame. |
+| **Degradation** | Per I-NG2, no partial state is visible. Per I-NG8, the client refreshes topology and retries against the new leader. The retry uses the same `idempotency_key` so a subsequent successful write commits exactly once. |
+| **Recovery** | Client-side topology refresh + automatic retry via the hybrid leader routing (I-NG8). |
+| **Severity** | **P3** (transparent to the caller after retry; observability via `kiseki_native_leader_change_retries_total`) |
+
+### F-NG4: Lease holder crash without ReleaseLease
+
+| Field | Value |
+|---|---|
+| **Description** | A native POSIX client holding an exclusive Write lease on an inode (I-NG10) crashes, exits without `ReleaseLease`, or partitions away from the cluster before the next `RenewLease`. |
+| **Blast radius** | The one inode under lease. Other inodes in the same namespace continue to operate. |
+| **Detection** | Lease TTL (default 30 s) expires without renewal; server-side lease tracker fires expiry. |
+| **Degradation** | Uncommitted writes on the dead lease are invalidated server-side. Subsequent `AcquireLease` from any client succeeds after expiry. The inode's last-fsync'd state remains visible. |
+| **Recovery** | Automatic on TTL expiry. Operator can also force-revoke via the admin RPC (out of ADR-042 scope; deferred). |
+| **Severity** | **P3** (single-inode, bounded by TTL) |
+
+### F-NG5: DEK fetch failure during client-decrypt
+
+| Field | Value |
+|---|---|
+| **Description** | A namespace with `crypto_boundary = TrustedCompute` (I-NG6) is being read by a native client, but the keymanager fetch for the per-chunk DEK fails (network blip, KMS rate limit, `KeyNotYetAvailable` for a freshly rotated key). |
+| **Blast radius** | The single failing read. The client cannot decrypt the envelope. |
+| **Detection** | KeyManagerService returns an error code on the DEK fetch RPC. |
+| **Degradation** | The client retries the DEK fetch with backoff; if the keymanager remains unreachable beyond the retry window, the read returns `Unavailable{key_fetch_failed}` to the caller. The plaintext is never reconstructed without the DEK. |
+| **Recovery** | Restore keymanager reachability. Kiseki client cache (ADR-031) does NOT cache plaintext for `TrustedCompute` namespaces' first-touch reads, so cache hits don't bypass this. |
+| **Severity** | **P2** (read-path outage for the affected namespace until keymanager is reachable; durability and confidentiality are preserved) |
+
+### F-NG6: Idempotency key collision across tenants
+
+| Field | Value |
+|---|---|
+| **Description** | Two clients in different tenants happen to pick the same opaque `idempotency_key` (e.g., `"retry-001"`). Server dedup must NOT cross tenants. |
+| **Blast radius** | None if dedup is correctly keyed; cross-tenant data leak if not (security-critical). |
+| **Detection** | Audit event review; would surface as a Read returning a different tenant's composition_id. |
+| **Degradation** | Server's dedup map is keyed by `(tenant_id, namespace_id, idempotency_key)` (I-NG5), so the collision is impossible by construction. The proto request validation (I-NG1) ensures `tenant_id` is bound to the cert SAN. |
+| **Recovery** | None needed; the design prevents the failure. |
+| **Severity** | **P0 if the dedup key were tenant-blind** (cross-tenant leak); **N/A** in the spec'd design. |
+
+### F-NG7: Native traffic starves data-port heartbeats
+
+| Field | Value |
+|---|---|
+| **Description** | The data-path gRPC server hosts `GatewayDataService` alongside `LogService`, `KeyManagerService`, etc. (A-NG9). High native traffic could in theory starve Raft heartbeats sharing the same HTTP/2 connection. |
+| **Blast radius** | Cluster-wide if Raft heartbeats are missed long enough to trigger spurious elections. |
+| **Detection** | `kiseki_raft_heartbeat_latency_seconds` p99 alarm; spurious-election counter. |
+| **Degradation** | Tonic per-service queue isolation + HTTP/2 flow-control windows (16 MiB stream / 32 MiB connection) bound the worst-case starvation. If the alarm fires in production, the operator's mitigation is to move heartbeat-critical services (raft, keymanager) to a separate port via configuration. |
+| **Recovery** | Configurable: per-service port allocation (deferred ADR; A-NG9 risk acknowledgment). |
+| **Severity** | **P2** if it manifests; **P3** in steady-state (mitigated by isolation defaults) |
+
+### F-NG8: Long-running stream's cert is revoked mid-flight
+
+| Field | Value |
+|---|---|
+| **Description** | A native streaming Write or long-lived POSIX-handle session is in progress when the cluster CRL is updated to revoke the client's cert (A-NG17). |
+| **Blast radius** | The single stream / handle. Subsequent ops from the same client are rejected at session establishment. |
+| **Detection** | Server-side periodic cert re-validation (`KISEKI_CERT_REVAL_INTERVAL_MS`, default 60 s); on revocation match, the stream is torn down. |
+| **Degradation** | Stream torn down with `Unauthenticated{reason=cert_revoked}`. Partial-stream state reclaimed via the idempotency-key dedup window (per F-NG2). No commit-on-close visibility leak (per I-NG2). Cert-rotation (vs revocation) is handled by clients re-establishing the channel with the new cert; in-flight streams under the old cert continue until completion or detection at the next reval cycle. |
+| **Recovery** | Client retries with the new cert (idempotency_key dedup ensures retries are safe per A-NG10). |
+| **Severity** | **P3** (per-stream blast, bounded by reval interval) |
+
+### F-NG9: Clock skew exceeds tolerance breaks lease arithmetic
+
+| Field | Value |
+|---|---|
+| **Description** | Clock skew between client and server exceeds the 5-second tolerance assumed by A-NG18 / I-T1-T2. Lease TTL arithmetic, idempotency dedup window, and topology-version comparison can all misbehave. |
+| **Blast radius** | Single client (clock-skewed). Other clients with synced clocks are unaffected. |
+| **Detection** | `kiseki_clock_skew_seconds` exceeds alarm threshold; raised on first misbehavior or proactively on time-quality probe. |
+| **Degradation** | A skewed-fast client may believe its lease has more time than the server thinks; renewals arrive after server-side expiry → spurious `LeaseFenced` rejections on writes. A skewed-slow client may renew too late → lease expires server-side, fencing token bumped, old lease rejected. The fencing-token mechanism (I-NG12) preserves correctness; only the affected client experiences elevated retry rates. |
+| **Recovery** | NTP / chrony fix on the client; cluster admin alerted via clock-skew alarm. |
+| **Severity** | **P3** (single-client; correctness preserved by fencing) |
+
+### F-NG10: Server-side proxy fallback — proxying node fails mid-proxy
+
+| Field | Value |
+|---|---|
+| **Description** | The hybrid leader routing (I-NG8) executes a server-side proxy fallback: client's request is sent to node-X, which proxies to the actual leader node-Y. Node-X crashes between (a) confirming commit on node-Y and (b) returning the response to the client. |
+| **Blast radius** | The single in-flight request. Client doesn't know if the write committed. |
+| **Detection** | Client's gRPC call fails with `Unavailable` / `Aborted{proxy_failure}` on node-X's connection. |
+| **Degradation** | Per A-NG20, the proxying node's responsibility is "either confirm commit and return response, OR return Aborted{proxy_failure}; never silently drop". If node-X dies mid-proxy, the client retries with topology refresh; the same idempotency_key (I-NG5) deduplicates against any commit that did land on node-Y, so the caller sees exactly-once semantics. |
+| **Recovery** | Client retry via the topology-version refresh path. |
+| **Severity** | **P3** (transparent to the caller after retry) |
+
+### F-NG12: Multi-chunk PUT — partial chunk failure across shards
+
+| Field | Value |
+|---|---|
+| **Description** | A `PutObjectStream` / `PutPart` whose payload spans multiple chunks (across multiple shards via rendezvous-hash placement) succeeds on N of M chunks; the (N+1)th fails (shard quorum loss, timeout, etc.). Resolves gate-1 F-C2. |
+| **Blast radius** | The single PUT. Successful chunks orphan with refcount=1 (no composition reference). |
+| **Detection** | `CommitStream` returns `Aborted{partial_chunk_failure, succeeded=N, total=M}`. Metric `kiseki_native_put_partial_chunk_failure_total{tenant}` increments. |
+| **Degradation** | Reader visibility unaffected — composition is never created (preserves I-NG2). Storage cost: orphaned chunks for up to 24 h until the orphan-fragment scrub (ADR-005, F-D7 mitigation) reclaims them. |
+| **Recovery** | Client retries via the idempotency_key path (A-NG10): same key dedups to the original Aborted outcome (or fresh attempt). Operator-side: the orphan-fragment scrub runs on its standard cadence. |
+| **Severity** | **P3** (per-PUT, bounded blast; client-visible via the typed Aborted code) |
+
+### F-NG13: TrustedCompute multi-chunk Read latency cliff
+
+| Field | Value |
+|---|---|
+| **Description** | Resolved-design failure mode: WITHOUT `BatchFetchDek` (gate-1 F-H2), a 1 GiB Read in TrustedCompute mode pays N keymanager round-trips (≈256 calls, ~512 ms total). |
+| **Blast radius** | Per-Read latency on TrustedCompute namespaces. |
+| **Detection** | Per-op p99 latency vs ServerOnly mode for the same payload size. |
+| **Degradation** | None in the resolved design — `BatchFetchDek` (A-NG21) collapses to one round-trip. The failure mode is captured here for future audit: any regression that reverts to per-chunk fetch on the TrustedCompute path is a P2 incident. |
+| **Recovery** | Spec contract: implementer MUST use `BatchFetchDek` on multi-chunk Reads. CI-level lint (gate-2 audit) verifies no per-chunk `FetchDek` loop in the TrustedCompute Read path. |
+| **Severity** | **P2 if regressed** — TrustedCompute would become slower than ServerOnly, defeating the mode |
+
+### F-NG11: Replay attack with captured pre-rotation cert
+
+| Field | Value |
+|---|---|
+| **Description** | An attacker captures a `(cert, request payload, idempotency_key)` triple from a client and attempts to replay it after the client's cert has rotated. |
+| **Blast radius** | None if mTLS + CRL/OCSP enforcement is correct (A-NG19). |
+| **Detection** | The pre-rotation cert is on the CRL; the server rejects the mTLS handshake before the gRPC layer is reached. |
+| **Degradation** | Per A-NG19, the threat model relies on mTLS handshake validation against the CRL/OCSP source (ADR-023). The dedup window (A-NG10) is irrelevant to replay safety; it is a retry-correctness mechanism. An attacker with a long-validity uncovered cert and a captured ciphertext could in principle replay during the cert's NotBefore-NotAfter window — bounded by the per-cert validity policy, which ADR-042 inherits unchanged. |
+| **Recovery** | None needed if CRL is current. If CRL update lags revocation, mitigation is to shorten cert validity windows (operational tuning, not ADR-042 scope). |
+| **Severity** | **P0 if mTLS handshake validation is bypassed** (would be a critical bug); **N/A** in the spec'd design assuming ADR-023 holds. |
+
+---
+
 ## Failure severity summary
 
 | Severity | Count | Examples |
 |---|---|---|
-| P0 | 2 | System key manager loss, system KEK compromise |
+| P0 | 2 | System key manager loss, system KEK compromise (F-NG11 replay attack: P0 *if mTLS bypass exists*; design-resistant, see A-NG19) |
 | P1 | 7 | Tenant KMS loss, log corruption, key compromise, algo deprecation, control plane down, network partition (wide), crypto-shred with cached plaintext (F-CC3) |
-| P2 | 10 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm, control plane quorum loss (F-O8) |
-| P3 | 15 | Gateway crash, client crash, device failure, split latency, replay attack, bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4), drain interrupted (F-O4), drain refused (F-O5), merge/split race (F-O6), node-add mid-operation (F-O7), merge convergence timeout (F-O9) |
+| P2 | 12 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm, control plane quorum loss (F-O8), DEK fetch failure (F-NG5), native heartbeat starvation if observed (F-NG7) |
+| P3 | 25 | Gateway crash, client crash, device failure, split latency, replay attack (S3 layer), bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4), drain interrupted (F-O4), drain refused (F-O5), merge/split race (F-O6), node-add mid-operation (F-O7), merge convergence timeout (F-O9), native cert/payload mismatch (F-NG1), native stream interrupted (F-NG2), native leader-change mid-stream (F-NG3), native lease holder crash (F-NG4), native heartbeat starvation steady-state (F-NG7), native cert revocation mid-stream (F-NG8), native clock skew (F-NG9), native proxy mid-fail (F-NG10), native multi-chunk PUT partial failure (F-NG12) |
 
-Total: **34 failure modes** catalogued with blast radius, detection,
+P2-if-regressed: F-NG13 (TrustedCompute multi-chunk latency cliff — captured for future audit; resolved-design avoids it via `BatchFetchDek`).
+
+Total: **47 failure modes** catalogued with blast radius, detection,
 degradation, and recovery.

@@ -16,6 +16,15 @@
 /// v1 protobuf types and gRPC services.
 pub mod v1 {
     tonic::include_proto!("kiseki.v1");
+
+    /// Native gateway data service (ADR-042). Sub-namespace
+    /// `kiseki.v1.native` so its message names don't collide with
+    /// the rest of `kiseki.v1` (e.g., `Empty`, `AbortMultipartRequest`).
+    /// Shared ID types (`OrgId`, `ShardId`, `NamespaceId`,
+    /// `CompositionId`, `ChunkId`) come from the parent `kiseki.v1`.
+    pub mod native {
+        tonic::include_proto!("kiseki.v1.native");
+    }
 }
 
 #[cfg(test)]
@@ -75,6 +84,32 @@ mod tests {
         let decoded = v1::Quota::decode(&[][..]).expect("empty decode should succeed");
         assert_eq!(decoded.capacity_bytes, 0);
         assert_eq!(decoded.iops, 0);
+    }
+
+    #[test]
+    fn native_gateway_data_service_module_compiles() {
+        // Smoke test: the kiseki.v1.native sub-namespace generated
+        // the ServerImpl + ClientImpl traits. Constructing a request
+        // proves the messages exist with the expected field names.
+        use super::v1::native;
+        let req = native::GetTopologyRequest {
+            known_topology_version: 0,
+            tenant_id: Some(v1::OrgId {
+                value: "org-perf".into(),
+            }),
+        };
+        assert_eq!(req.known_topology_version, 0);
+        let _topo = native::TopologyInfo {
+            topology_version: 1,
+            nodes: Vec::new(),
+            shards: Vec::new(),
+        };
+        let _grant = native::LeaseGrant {
+            lease_id: vec![0xab; 16],
+            fencing_token: 42,
+            ttl_ms: 30_000,
+            expires_at_millis_since_epoch: 1_700_000_000_000,
+        };
     }
 
     #[test]

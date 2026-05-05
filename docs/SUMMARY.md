@@ -44,6 +44,7 @@
 - [Troubleshooting](operations/troubleshooting.md)
 - [Performance Tuning](operations/performance.md)
 - [Performance Benchmarks](performance/README.md)
+- [Optimization Backlog](performance/optimization-backlog.md)
 - [Durability & Data-Loss Windows](operations/durability.md)
 - [Capacity Planning](operations/capacity.md)
 
@@ -98,3 +99,4 @@
   - [ADR-039: Flex Files Mirror-List Encoding](decisions/adr/039-flex-files-mirror-list-encoding.md)
   - [ADR-040: Persistent Metadata Stores](decisions/adr/040-persistent-metadata-stores.md)
   - [ADR-041: Raft Transport — Shard Multiplexing](decisions/adr/041-raft-transport-shard-multiplexing.md)
+  - [ADR-042: Native Gateway Data Service](decisions/adr/042-native-gateway-data-service.md)

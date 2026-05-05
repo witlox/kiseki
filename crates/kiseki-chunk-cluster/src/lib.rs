@@ -858,6 +858,13 @@ impl AsyncChunkOps for ClusteredChunkStore {
         self.local.increment_refcount(chunk_id).await
     }
 
+    async fn try_increment_if_exists(
+        &self,
+        chunk_id: &ChunkId,
+    ) -> Result<Option<u64>, ChunkError> {
+        self.local.try_increment_if_exists(chunk_id).await
+    }
+
     async fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
         self.local.decrement_refcount(chunk_id).await
     }

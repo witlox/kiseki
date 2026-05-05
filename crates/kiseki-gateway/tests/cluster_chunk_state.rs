@@ -472,6 +472,12 @@ impl AsyncChunkOps for RecordingChunks {
     async fn increment_refcount(&self, id: &ChunkId) -> Result<u64, ChunkError> {
         self.inner.increment_refcount(id).await
     }
+    async fn try_increment_if_exists(
+        &self,
+        id: &ChunkId,
+    ) -> Result<Option<u64>, ChunkError> {
+        self.inner.try_increment_if_exists(id).await
+    }
     async fn decrement_refcount(&self, id: &ChunkId) -> Result<u64, ChunkError> {
         self.inner.decrement_refcount(id).await
     }

@@ -34,6 +34,89 @@ ADR-036 (LogOps shard management)
     in-memory.
   - F-8..F-17 acknowledged as Medium / Low — addressed inline
     during implementation review (auditor + post-impl adversary).
+- **rev 3** (2026-05-05): write-behind queue amendment for the S3
+  / FUSE hot path. The 2026-05-05 single-host profile run measured
+  S3 mixed at 35–40 % of the May-3 baseline (3 370 op/s vs
+  8 470 op/s) — flamegraph attributed the regression to the per-
+  write redb write-transaction added by rev 1/2. See §"Write-
+  behind amendment" below; pattern mirrors the chunk-store
+  group-commit fix from `681de37` and the I-L5 amendment.
+
+## Write-behind amendment (rev 3, 2026-05-05)
+
+**Problem.** rev 1/2 puts `CompositionStore::create` and
+`bind_name` on the synchronous redb write-transaction path. Even
+under `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS` (which only switches
+durability from `Immediate` to `None`), redb's single-writer lock
+serializes every PUT through one txn-commit per op, costing
+~2-3 ms per op at c=16 — measured as a 60 % S3 throughput regression
+vs. the in-memory baseline.
+
+**Decision.** Composition writes adopt the same write-behind
+pattern the chunk store uses (commit `681de37`):
+
+1. **In-memory overlay first.** `PersistentRedbStorage` keeps a
+   `parking_lot::RwLock<HashMap<CompositionId, CompositionRecord>>`
+   overlay (and the analogous map for `name_index`). Every
+   `put` / `bind_name` updates the overlay synchronously and
+   enqueues the change on a bounded `tokio::sync::mpsc` channel.
+   The op returns as soon as the overlay is updated — no redb
+   write-transaction on the hot path.
+2. **Reads check overlay → redb.** `get` / `lookup_name` do a
+   read-lock on the overlay first; on miss, fall through to redb.
+   This preserves read-after-write for any client that reads its
+   own write through the same node, including the S3-PUT-then-GET
+   case the smoke test exercises.
+3. **Background drainer flushes batches.** A single async task
+   drains the channel, batches up to `N` ops, and commits one
+   redb write-transaction per batch. The batch boundary is the
+   smaller of `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS` (default 100)
+   and a max-batch size (default 1024). After commit, the drainer
+   removes the just-flushed entries from the overlay.
+4. **`fsync_pending` hook still works.** The existing
+   `register_fsync_hook` path now drains the queue *and* fsyncs
+   redb, so POSIX `fsync(2)` from FUSE / NFS clients gets
+   correct durability semantics without waiting for the periodic
+   tick. (Same hook contract as today; the implementation just
+   has more to flush.)
+
+**Source-of-truth model unchanged.** Composition state is
+authoritatively held in the raft log; redb is a cache for fast
+restart hydration. A single-node hard crash that loses queued-but-
+not-flushed entries is recovered by raft-log replay on rejoin
+(same recovery path as a corrupt or missing
+`compositions.redb` — already specified in §D5/D6).
+
+**Read-path consistency.** The overlay is the *primary* state
+during the in-flight window. Reads MUST consult the overlay
+before redb; the `RwLock` read path is uncontended for the common
+case. New invariant **I-CP9**: every `get` and `lookup_name` reads
+overlay-then-redb in that order, and every `put` / `bind_name`
+inserts into the overlay *before* enqueuing for the drainer.
+Violating this ordering re-introduces the read-after-write race.
+
+**Loss windows.** Same as chunk-store group commit (I-L5): a
+single-node hard reset within `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS`
+of an unflushed write loses the local copy on that node only.
+Multi-node R-3 / EC-4+2 + scrub recover via raft-log replay on
+rejoin. Operators with stricter requirements set the interval to
+0 to fall back to the rev-1/2 synchronous path.
+
+**Knobs (env vars unchanged).**
+
+- `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS` (default `100`): batch
+  flush cadence. `0` disables the queue and uses
+  `Durability::Immediate` per write (rev-1/2 behavior).
+- New: `KISEKI_COMPOSITION_QUEUE_MAX` (default `4096`): bounded
+  queue capacity. Backpressure once full — writers block until
+  the drainer commits a batch.
+
+**Out of scope for this amendment.** Multi-tenant queue
+isolation. The drainer is global per node; a noisy tenant can
+delay another tenant's flush. Re-evaluate if telemetry shows
+queue saturation in practice. Raft-side composition replication
+is also unaffected — this amendment only changes the redb-cache
+write path on the leader.
 
 ## Problem
 
@@ -628,6 +711,19 @@ the implementation lands, then `Confirmed`):
   under persistence, the hydrator must distinguish so a transient
   upstream condition (e.g. namespace not yet replicated to this
   node) doesn't permanently lose deltas.
+
+- **I-CP9** (rev 3, 2026-05-05): When the persistent
+  `CompositionStore` runs in write-behind mode (any non-zero
+  `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS`), every `put` /
+  `bind_name` MUST insert into the in-memory overlay *before*
+  enqueuing the change for the redb drainer, and every `get` /
+  `lookup_name` MUST consult the overlay before falling through
+  to redb. Violating this ordering re-introduces the read-after-
+  write race that the rev-1/2 synchronous path implicitly
+  prevented. Enforcement: a single `apply_overlay` helper is the
+  only mutation entrypoint; tests assert that a `put` followed by
+  a `get` on the same handle returns the just-written value even
+  while the drainer queue is non-empty.
 
 ## Alternatives considered
 

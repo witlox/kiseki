@@ -1,0 +1,686 @@
+syntax = "proto3";
+
+// Sub-namespace for the native gateway data service (ADR-042) to
+// avoid type-name collisions with the existing kiseki.v1 protos
+// (e.g., AbortMultipartRequest, Empty). All shared ID types
+// (OrgId, ShardId, NamespaceId, etc.) come from kiseki.v1.
+package kiseki.v1.native;
+
+import "kiseki/v1/common.proto";
+
+option go_package = "github.com/witlox/kiseki/control/proto/kiseki/v1/native";
+
+// --- Native Gateway Data Service (ADR-042) ---
+//
+// Native data-plane RPCs over the existing data-path port
+// (KISEKI_DATA_ADDR, default 9100). Both object-flavored and
+// POSIX-flavored verbs share this service. Auth is mTLS with
+// SPIFFE-format tenant SAN URIs (I-NG1, canonical form).
+//
+// Every response carries `kiseki-topology-version: <u64>` in the
+// gRPC trailing metadata for client-side topology cache invalidation
+// (I-NG13, A-NG13). That trailer is delivered by tonic — not in the
+// proto schema below.
+
+service GatewayDataService {
+  // ===== Object verbs (commit-on-close, I-NG2) =====
+  rpc PutObject(PutObjectRequest) returns (PutObjectResponse);
+  rpc PutObjectStream(stream PutObjectChunk) returns (PutObjectResponse);
+  rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
+  rpc GetObjectStream(GetObjectRequest) returns (stream GetObjectChunk);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+  rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc LookupByName(LookupByNameRequest) returns (LookupByNameResponse);
+
+  // ===== Multipart (above 64 MiB stream cap, I-NG9) =====
+  rpc InitMultipart(InitMultipartRequest) returns (InitMultipartResponse);
+  rpc PutPart(stream PutPartChunk) returns (PutPartResponse);
+  rpc CompleteMultipart(CompleteMultipartRequest) returns (CompleteMultipartResponse);
+  rpc AbortMultipart(AbortMultipartRequest) returns (AbortMultipartResponse);
+
+  // ===== POSIX verbs (handle-token-based, partial-visible-on-fsync) =====
+  rpc PathLookup(PathLookupRequest) returns (PathLookupResponse);
+  rpc Open(OpenRequest) returns (OpenResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc ReadStream(ReadRequest) returns (stream ReadChunk);
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc WriteStream(stream WriteChunk) returns (WriteResponse);
+  rpc Fsync(FsyncRequest) returns (FsyncResponse);
+  rpc Close(CloseRequest) returns (CloseResponse);
+  rpc Setattr(SetattrRequest) returns (SetattrResponse);
+  rpc Getattr(GetattrRequest) returns (GetattrResponse);
+  rpc ReadDir(ReadDirRequest) returns (stream ReadDirEntry);
+  rpc Mkdir(MkdirRequest) returns (MkdirResponse);
+  rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+  rpc RenameWithinShard(RenameRequest) returns (RenameResponse);
+
+  // ===== Lease-based RMW (I-NG10, I-NG12, I-NG14) =====
+  rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
+
+  // ===== Encryption boundary — DEK fetch for TrustedCompute (I-NG6a, A-NG7) =====
+  // FetchDek is the per-chunk variant; BatchFetchDek (resolves F-H2)
+  // collapses N tickets to a single keymanager round-trip on the
+  // multi-chunk Read path. Clients SHOULD prefer BatchFetchDek even
+  // for single-chunk Reads.
+  rpc FetchDek(FetchDekRequest) returns (FetchDekResponse);
+  rpc BatchFetchDek(BatchFetchDekRequest) returns (BatchFetchDekResponse);
+
+  // ===== Topology discovery (I-NG13, A-NG13) =====
+  //
+  // 304-equivalent on `known_topology_version == current` so polling
+  // is cheap when the cache is fresh.
+  rpc GetTopology(GetTopologyRequest) returns (TopologyInfo);
+}
+
+// =====================================================================
+// Common per-call control (A-NG6)
+// =====================================================================
+
+message ControlFields {
+  kiseki.v1.OrgId tenant_id = 1;
+  // 1..=64 bytes opaque, client-generated. Server dedup keyed on
+  // (tenant_id, namespace_id, idempotency_key) over a 5-min window
+  // (I-NG5, A-NG10). Out of range -> InvalidArgument at proto-handler.
+  bytes idempotency_key = 2;
+  // Empty string defaults to "unattributed". Tenant policy may
+  // require non-empty (ADR-020).
+  string workflow_ref = 3;
+  CacheHint cache_hint = 4;
+  oneof conditional {
+    Empty if_none_match = 5;     // S3 If-None-Match: *
+    Etag if_match = 6;
+    VersionId if_version_match = 7;
+  }
+}
+
+message Empty {}
+
+message Etag {
+  bytes value = 1;
+}
+
+message VersionId {
+  uint64 value = 1;
+}
+
+message CacheHint {
+  bool force_revalidate = 1;
+  bool skip_cache = 2;
+  bool pin_after_read = 3;
+}
+
+// =====================================================================
+// Topology
+// =====================================================================
+
+message GetTopologyRequest {
+  // 0 = unknown / first call. Server returns full topology.
+  // > 0 and == current => empty TopologyInfo with topology_version
+  // set to current (304-equivalent, allows the client to confirm
+  // freshness without a full payload).
+  uint64 known_topology_version = 1;
+  // Caller's tenant (validated against cert SAN per I-NG1). Server
+  // filters the `shards` list to only shards owned by this tenant
+  // (F-H3 fix). The `nodes` list still includes every node the
+  // client may need to dial.
+  kiseki.v1.OrgId tenant_id = 2;
+}
+
+message TopologyInfo {
+  uint64 topology_version = 1;
+  repeated NodeInfo nodes = 2;
+  // Shards filtered to caller's tenant only (F-H3).
+  repeated ShardLeadership shards = 3;
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  ACTIVE = 1;
+  DEGRADED = 2;
+  FAILED = 3;
+  DRAINING = 4;
+  EVICTED = 5;
+}
+
+message NodeInfo {
+  uint64 node_id = 1;
+  string data_addr = 2;          // "host:port" or "[ipv6]:port"
+  NodeState state = 3;
+}
+
+message ShardLeadership {
+  kiseki.v1.ShardId shard_id = 1;
+  uint64 leader_node_id = 2;
+  bytes range_start = 3;
+  bytes range_end = 4;
+}
+
+// =====================================================================
+// Lease lifecycle (§7 of ADR-042)
+// =====================================================================
+
+enum LeaseMode {
+  LEASE_MODE_UNSPECIFIED = 0;
+  // proto3 enum values are sibling-scoped to the package; use a
+  // disambiguated name so we can keep `WRITE` for OpenMode.
+  LEASE_MODE_WRITE = 1;          // exclusive write
+}
+
+message AcquireLeaseRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 inode = 3;
+  LeaseMode mode = 4;
+  uint64 requested_ttl_ms = 5;   // server clamps to its config max
+}
+
+message AcquireLeaseResponse {
+  oneof outcome {
+    LeaseGrant grant = 1;
+    LeaseHeld held = 2;          // another client holds it
+    NodeDraining draining = 3;   // I-NG14
+  }
+}
+
+message LeaseGrant {
+  bytes lease_id = 1;            // opaque, 16 bytes
+  uint64 fencing_token = 2;       // I-NG12 monotonic
+  uint64 ttl_ms = 3;             // server-granted; may be < requested
+  uint64 expires_at_millis_since_epoch = 4;
+}
+
+message LeaseHeld {
+  string holder_principal = 1;   // opaque cert SAN URI of holder
+  uint64 ttl_remaining_ms = 2;
+}
+
+message NodeDraining {
+  uint64 quiesce_window_remaining_ms = 1;
+}
+
+message RenewLeaseRequest {
+  ControlFields control = 1;
+  bytes lease_id = 2;
+  uint64 ttl_ms = 3;
+}
+
+message RenewLeaseResponse {
+  oneof outcome {
+    LeaseGrant grant = 1;        // refreshed (same fencing_token)
+    LeaseExpired expired = 2;    // someone else acquired
+  }
+}
+
+message LeaseExpired {
+  uint64 current_fencing_token = 1;
+  string current_holder_principal = 2;
+}
+
+message ReleaseLeaseRequest {
+  ControlFields control = 1;
+  bytes lease_id = 2;
+}
+
+message ReleaseLeaseResponse {}
+
+// =====================================================================
+// DEK fetch (TrustedCompute, §8)
+// =====================================================================
+
+message FetchDekRequest {
+  ControlFields control = 1;
+  // Opaque, server-signed (HMAC-SHA256 under system DEK).
+  // Commits to (tenant_id, namespace_id, composition_id, chunk_id,
+  // namespace crypto_boundary at-Read-time, expires_at).
+  bytes dek_fetch_ticket = 2;
+}
+
+message FetchDekResponse {
+  oneof outcome {
+    Dek dek = 1;
+    InvalidDekTicket invalid = 2;
+    NamespaceModeChanged mode_changed = 3;
+  }
+}
+
+// Batch DEK fetch (resolves F-H2). All tickets in one request MUST
+// belong to the same tenant (cert SAN); mixing tenants returns
+// PermissionDenied at the proto-handler boundary.
+message BatchFetchDekRequest {
+  ControlFields control = 1;
+  repeated bytes dek_fetch_tickets = 2;     // up to 1024 per request
+}
+
+message BatchFetchDekResponse {
+  // One outcome per ticket, in the same order as the request.
+  // Partial failure is allowed: some tickets resolve to Dek,
+  // others to InvalidDekTicket / NamespaceModeChanged. Client
+  // handles each chunk independently.
+  repeated FetchDekResponse outcomes = 1;
+}
+
+message Dek {
+  bytes key_bytes = 1;            // 32-byte AES-256 DEK
+  uint64 dek_validity_ms = 2;    // bounded by namespace policy
+}
+
+message InvalidDekTicket {
+  string reason = 1;             // hmac_invalid | expired | tenant_mismatch
+}
+
+message NamespaceModeChanged {
+  string current_mode = 1;       // "ServerOnly" | "TrustedCompute"
+}
+
+// =====================================================================
+// Object verb requests/responses (skeleton; full payload shapes deferred
+// to the implementation phase — they mirror the GatewayOps trait shape
+// in `kiseki-gateway::ops`)
+// =====================================================================
+//
+// The following are placeholders documenting the schema surface.
+// Full message definitions land alongside the implementer's first
+// commit; the wire shape will mirror `WriteRequest` / `WriteResponse`
+// from the existing in-process `GatewayOps` trait.
+
+message PutObjectRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  string name = 3;               // optional; empty = anonymous (no name binding)
+  bytes data = 4;                 // ≤ inline_threshold (8 KiB by default)
+}
+
+message PutObjectChunk {
+  // First message: request envelope. Subsequent: data chunks.
+  oneof kind {
+    PutObjectRequest first = 1;  // header (no `data`)
+    bytes data = 2;
+    PutObjectCommit commit = 3;  // explicit "I'm done; commit"
+  }
+}
+
+message PutObjectCommit {
+  // Server returns PutObjectResponse on commit success or
+  // GoogleStatus(OutOfRange) on per-stream cap exceeded etc.
+}
+
+message PutObjectResponse {
+  kiseki.v1.CompositionId composition_id = 1;
+  uint64 size = 2;
+  Etag etag = 3;
+}
+
+message GetObjectRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  oneof key {
+    string name = 3;
+    kiseki.v1.CompositionId composition_id = 4;
+  }
+  // Optional byte range [start, end). Empty = whole object.
+  uint64 range_start = 5;
+  uint64 range_end = 6;
+}
+
+message GetObjectResponse {
+  bytes data = 1;
+  uint64 size = 2;
+  string content_type = 3;
+  Etag etag = 4;
+  // For TrustedCompute namespaces: server returns sealed envelopes
+  // + dek_fetch_tickets here instead of `data` (see GetObjectChunk
+  // for the streaming variant).
+  repeated SealedChunk sealed_chunks = 5;
+}
+
+message GetObjectChunk {
+  oneof kind {
+    GetObjectHeader header = 1;
+    bytes data = 2;
+    SealedChunk sealed = 3;       // TrustedCompute mode
+  }
+}
+
+message GetObjectHeader {
+  uint64 size = 1;
+  string content_type = 2;
+  Etag etag = 3;
+  bool client_decrypt = 4;        // true => sealed chunks follow
+}
+
+message SealedChunk {
+  kiseki.v1.ChunkId chunk_id = 1;
+  bytes ciphertext = 2;
+  bytes nonce = 3;
+  bytes tag = 4;
+  bytes dek_fetch_ticket = 5;     // present iff client_decrypt
+}
+
+message DeleteObjectRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  kiseki.v1.CompositionId composition_id = 3;
+}
+
+message DeleteObjectResponse {
+  bool removed = 1;
+}
+
+message HeadObjectRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  oneof key {
+    string name = 3;
+    kiseki.v1.CompositionId composition_id = 4;
+  }
+}
+
+message HeadObjectResponse {
+  uint64 size = 1;
+  string content_type = 2;
+  Etag etag = 3;
+  uint64 last_modified_millis_since_epoch = 4;
+}
+
+message ListObjectsRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  string prefix = 3;
+  uint32 limit = 4;
+  bytes continuation = 5;
+}
+
+message ListObjectsResponse {
+  repeated ObjectSummary objects = 1;
+  bytes continuation = 2;        // empty = end
+}
+
+message ObjectSummary {
+  string name = 1;
+  kiseki.v1.CompositionId composition_id = 2;
+  uint64 size = 3;
+  Etag etag = 4;
+  uint64 last_modified_millis_since_epoch = 5;
+}
+
+message LookupByNameRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  string name = 3;
+}
+
+message LookupByNameResponse {
+  kiseki.v1.CompositionId composition_id = 1;
+}
+
+// =====================================================================
+// Multipart (skeleton — wire shape mirrors S3)
+// =====================================================================
+
+message InitMultipartRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  string name = 3;
+}
+
+message InitMultipartResponse {
+  string upload_id = 1;
+}
+
+message PutPartChunk {
+  oneof kind {
+    PutPartHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message PutPartHeader {
+  ControlFields control = 1;
+  string upload_id = 2;
+  uint32 part_number = 3;
+}
+
+message PutPartResponse {
+  Etag etag = 1;
+  uint64 size = 2;
+}
+
+message CompleteMultipartRequest {
+  ControlFields control = 1;
+  string upload_id = 2;
+  repeated PartEtag parts = 3;
+}
+
+message PartEtag {
+  uint32 part_number = 1;
+  Etag etag = 2;
+}
+
+message CompleteMultipartResponse {
+  kiseki.v1.CompositionId composition_id = 1;
+  uint64 size = 2;
+  Etag etag = 3;
+}
+
+message AbortMultipartRequest {
+  ControlFields control = 1;
+  string upload_id = 2;
+}
+
+message AbortMultipartResponse {}
+
+// =====================================================================
+// POSIX verbs (skeleton — handle-token-based, §9)
+// =====================================================================
+
+message PathLookupRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 parent_inode = 3;
+  string name = 4;
+}
+
+message PathLookupResponse {
+  uint64 inode = 1;
+  Attr attr = 2;
+}
+
+enum OpenMode {
+  OPEN_MODE_UNSPECIFIED = 0;
+  READ = 1;
+  WRITE = 2;
+  READ_WRITE = 3;
+}
+
+message OpenRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 inode = 3;
+  OpenMode mode = 4;
+}
+
+message OpenResponse {
+  // Opaque, server-signed token encoding (schema_version, namespace_id,
+  // inode, open_mode, crypto_boundary_at_open, cert_san_canonical,
+  // master_key_epoch, issued_at, issuance_nonce). HMAC-SHA256 under
+  // the gateway's `handle_token_signing_key`, derived once at startup
+  // from the system master key (§9.1 of ADR-042).
+  //
+  // The token is BOUND to the cert SAN that minted it (F-H1 fix):
+  // a token presented over a connection with a different SAN is
+  // rejected even if the new SAN is from a valid cert.
+  bytes handle_token = 1;
+}
+
+message ReadRequest {
+  ControlFields control = 1;
+  bytes handle_token = 2;
+  uint64 offset = 3;
+  uint64 length = 4;
+}
+
+message ReadResponse {
+  bytes data = 1;
+  bool eof = 2;
+  // For TrustedCompute: sealed chunks instead of plaintext.
+  repeated SealedChunk sealed_chunks = 3;
+}
+
+message ReadChunk {
+  oneof kind {
+    ReadHeader header = 1;
+    bytes data = 2;
+    SealedChunk sealed = 3;
+    ReadEof eof = 4;
+  }
+}
+
+message ReadHeader {
+  uint64 size = 1;
+  bool client_decrypt = 2;
+}
+
+message ReadEof {}
+
+message WriteRequest {
+  ControlFields control = 1;
+  bytes handle_token = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  // Required when handle was obtained under a lease (I-NG12).
+  uint64 fencing_token = 5;
+}
+
+message WriteResponse {
+  uint64 bytes_written = 1;
+}
+
+message WriteChunk {
+  oneof kind {
+    WriteHeader header = 1;
+    bytes data = 2;
+    WriteCommit commit = 3;
+  }
+}
+
+message WriteHeader {
+  ControlFields control = 1;
+  bytes handle_token = 2;
+  uint64 offset = 3;
+  uint64 fencing_token = 4;
+}
+
+message WriteCommit {}
+
+message FsyncRequest {
+  ControlFields control = 1;
+  bytes handle_token = 2;
+}
+
+message FsyncResponse {
+  // The lsn at which all preceding writes are durable. Clients
+  // tracking last-fsync per shard for read-your-writes (A-NG16)
+  // record this and route reads on that shard to the leader until
+  // a follower-served response confirms apply at >= this lsn.
+  uint64 fsynced_lsn = 1;
+  kiseki.v1.ShardId shard_id = 2;
+}
+
+message CloseRequest {
+  ControlFields control = 1;
+  bytes handle_token = 2;
+}
+
+message CloseResponse {}
+
+message SetattrRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 inode = 3;
+  AttrUpdate update = 4;
+}
+
+message SetattrResponse {
+  Attr attr = 1;
+}
+
+message AttrUpdate {
+  // sparse field set; only present fields are mutated
+  optional uint64 size = 1;
+  optional uint32 mode = 2;
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
+  optional uint64 mtime_millis_since_epoch = 5;
+}
+
+message GetattrRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 inode = 3;
+}
+
+message GetattrResponse {
+  Attr attr = 1;
+}
+
+message Attr {
+  uint64 inode = 1;
+  uint64 size = 2;
+  uint32 mode = 3;
+  uint32 uid = 4;
+  uint32 gid = 5;
+  uint64 mtime_millis_since_epoch = 6;
+  uint64 ctime_millis_since_epoch = 7;
+  uint64 atime_millis_since_epoch = 8;
+}
+
+message ReadDirRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 inode = 3;
+}
+
+message ReadDirEntry {
+  string name = 1;
+  uint64 inode = 2;
+  Attr attr = 3;
+}
+
+message MkdirRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 parent_inode = 3;
+  string name = 4;
+  uint32 mode = 5;
+}
+
+message MkdirResponse {
+  uint64 inode = 1;
+  Attr attr = 2;
+}
+
+message UnlinkRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 parent_inode = 3;
+  string name = 4;
+}
+
+message UnlinkResponse {}
+
+message RenameRequest {
+  ControlFields control = 1;
+  kiseki.v1.NamespaceId namespace_id = 2;
+  uint64 src_parent_inode = 3;
+  string src_name = 4;
+  uint64 dst_parent_inode = 5;
+  string dst_name = 6;
+}
+
+message RenameResponse {
+  // Empty on success; cross-shard returns EXDEV via tonic::Status
+  // (FailedPrecondition with reason "EXDEV") — see I-NG4.
+}

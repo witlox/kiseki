@@ -1,25 +1,28 @@
 //! Async-trait wrapper around the sync [`ChunkOps`] interface.
 //!
-//! Phase 16a — D-7. The cluster fabric layer is async (gRPC), but
-//! every existing local store implements the sync [`ChunkOps`]
-//! trait. Calling sync methods directly from a tokio worker would
-//! risk deadlocks (the inner store may take time to write to disk).
-//! Instead, [`SyncBridge`] owns the inner store behind a
-//! `tokio::sync::Mutex` and dispatches each sync call onto a
-//! `spawn_blocking` thread, so the async caller never blocks the
-//! tokio reactor.
+//! Phase 16a — D-7 (revised 2026-05-05 perf spike). The cluster
+//! fabric layer is async (gRPC), but every existing local store
+//! implements the sync [`ChunkOps`] trait. [`SyncBridge`] owns the
+//! inner store behind a `parking_lot::Mutex` and dispatches each
+//! sync call **inline** on the calling tokio task — no
+//! `spawn_blocking`, no `tokio::sync::Mutex`. Profile evidence
+//! (2026-05-05 in-process flamegraph) showed the original spawn-
+//! blocking + tokio-Mutex round-trip was ~30 % of PUT-path CPU even
+//! for in-memory work that takes microseconds.
 //!
-//! `ClusteredChunkStore` (step 4, `kiseki-chunk-cluster`) will
-//! implement [`AsyncChunkOps`] directly. Existing single-node
-//! deployments wrap their `ChunkStore` / `PersistentChunkStore` in
-//! a [`SyncBridge`] when wiring into the gateway runtime.
+//! Trade-off: if the inner store does slow IO (redb fsync under
+//! contention), the parking_lot guard is held across that IO and
+//! other writers park. For the single-node persistent backend that
+//! ships today, redb commits are sub-millisecond at the workloads
+//! we measure. If a production deployment shows reactor stalls
+//! under sustained-fsync contention, revisit by reintroducing the
+//! spawn_blocking path selectively.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use kiseki_common::ids::ChunkId;
 use kiseki_crypto::envelope::Envelope;
-use tokio::sync::Mutex;
 
 use crate::error::ChunkError;
 use crate::store::ChunkOps;
@@ -39,6 +42,14 @@ pub trait AsyncChunkOps: Send + Sync {
 
     /// Increment refcount for an existing chunk.
     async fn increment_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
+
+    /// Atomic dedup pre-flight: increment refcount if chunk exists,
+    /// else return `Ok(None)`. Single round-trip vs the two-step
+    /// `refcount` + `increment_refcount` path.
+    async fn try_increment_if_exists(
+        &self,
+        chunk_id: &ChunkId,
+    ) -> Result<Option<u64>, ChunkError>;
 
     /// Decrement refcount. Returns the new refcount.
     async fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
@@ -193,85 +204,71 @@ pub trait AsyncChunkOps: Send + Sync {
     }
 }
 
-/// Adapter that exposes any sync [`ChunkOps`] as [`AsyncChunkOps`]
-/// without blocking the tokio reactor.
+/// Adapter that exposes any sync [`ChunkOps`] as [`AsyncChunkOps`].
 ///
-/// The inner store sits behind an `Arc<Mutex<T>>` so each async
-/// method can lock-then-spawn-blocking-then-release without holding
-/// the lock across `.await` points (the lock is only held by the
-/// blocking task). The `Arc` lets the lock guard move into the
-/// `spawn_blocking` closure cheaply.
-pub struct SyncBridge<T: ChunkOps + Send + 'static> {
-    inner: Arc<Mutex<T>>,
+/// The inner store sits behind an `Arc<parking_lot::Mutex<T>>` and
+/// each async method runs the inner sync op **inline** on the
+/// calling tokio task — no `spawn_blocking`, no `tokio::sync::Mutex`.
+/// Profile evidence (2026-05-05 in-process flamegraph) showed the
+/// previous design's spawn-blocking + tokio-Mutex round-trip was
+/// ~30 % of PUT-path CPU even for in-memory work.
+///
+/// The `Arc<parking_lot::RwLock<T>>` lets multiple [`SyncBridge`]
+/// clones share the same inner store while still satisfying
+/// [`AsyncChunkOps`]'s `&self` signature. Reads (`read_chunk`,
+/// `refcount`, `list_chunk_ids`, `list_fragments`, `read_fragment`,
+/// `snapshot_pools`) take a read lock so parallel readers proceed
+/// concurrently. Writes take a write lock and serialize with both
+/// readers and other writers. (B7 in the optimization backlog.)
+pub struct SyncBridge<T: ChunkOps + Send + Sync + 'static> {
+    inner: Arc<parking_lot::RwLock<T>>,
 }
 
-impl<T: ChunkOps + Send + 'static> SyncBridge<T> {
+impl<T: ChunkOps + Send + Sync + 'static> SyncBridge<T> {
     /// Wrap a sync chunk store as an async one.
     #[must_use]
     pub fn new(inner: T) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(inner)),
+            inner: Arc::new(parking_lot::RwLock::new(inner)),
         }
     }
 
-    /// Borrow the inner mutex (test helper / integration glue).
+    /// Borrow the inner lock (test helper / integration glue).
     #[must_use]
-    pub fn inner(&self) -> Arc<Mutex<T>> {
+    pub fn inner(&self) -> Arc<parking_lot::RwLock<T>> {
         Arc::clone(&self.inner)
     }
 }
 
-/// Wrap any `T: ChunkOps + Send + 'static` as a shared async store.
-/// Convenience for the gateway's `Arc<dyn AsyncChunkOps>` slot — far
-/// shorter at the call site than `Arc::new(SyncBridge::new(...))`.
-pub fn arc_async<T: ChunkOps + Send + 'static>(inner: T) -> Arc<dyn AsyncChunkOps> {
+/// Wrap any `T: ChunkOps + Send + Sync + 'static` as a shared async store.
+/// Convenience for the gateway's `Arc<dyn AsyncChunkOps>` slot.
+pub fn arc_async<T: ChunkOps + Send + Sync + 'static>(inner: T) -> Arc<dyn AsyncChunkOps> {
     Arc::new(SyncBridge::new(inner))
 }
 
 #[async_trait]
-impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
+impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
     async fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let pool = pool.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.write_chunk(envelope, &pool)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().write_chunk(envelope, pool)
     }
 
     async fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
-            guard.read_chunk(&chunk_id)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.read().read_chunk(chunk_id)
     }
 
     async fn increment_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.increment_refcount(&chunk_id)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().increment_refcount(chunk_id)
+    }
+
+    async fn try_increment_if_exists(
+        &self,
+        chunk_id: &ChunkId,
+    ) -> Result<Option<u64>, ChunkError> {
+        self.inner.write().try_increment_if_exists(chunk_id)
     }
 
     async fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.decrement_refcount(&chunk_id)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().decrement_refcount(chunk_id)
     }
 
     async fn set_retention_hold(
@@ -279,15 +276,7 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         chunk_id: &ChunkId,
         hold_name: &str,
     ) -> Result<(), ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        let hold_name = hold_name.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.set_retention_hold(&chunk_id, &hold_name)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().set_retention_hold(chunk_id, hold_name)
     }
 
     async fn release_retention_hold(
@@ -295,46 +284,19 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         chunk_id: &ChunkId,
         hold_name: &str,
     ) -> Result<(), ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        let hold_name = hold_name.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.release_retention_hold(&chunk_id, &hold_name)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().release_retention_hold(chunk_id, hold_name)
     }
 
     async fn gc(&self) -> u64 {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.gc()
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().gc()
     }
 
     async fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
-            guard.refcount(&chunk_id)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.read().refcount(chunk_id)
     }
 
     async fn list_chunk_ids(&self) -> Vec<ChunkId> {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
-            guard.list_chunk_ids()
-        })
-        .await
-        .unwrap_or_default()
+        self.inner.read().list_chunk_ids()
     }
 
     async fn write_fragment(
@@ -343,14 +305,7 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         fragment_index: u32,
         bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.write_fragment(&chunk_id, fragment_index, bytes)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().write_fragment(chunk_id, fragment_index, bytes)
     }
 
     async fn read_fragment(
@@ -358,14 +313,7 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         chunk_id: &ChunkId,
         fragment_index: u32,
     ) -> Result<Vec<u8>, ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
-            guard.read_fragment(&chunk_id, fragment_index)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.read().read_fragment(chunk_id, fragment_index)
     }
 
     async fn delete_fragment(
@@ -373,56 +321,23 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         chunk_id: &ChunkId,
         fragment_index: u32,
     ) -> Result<bool, ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.delete_fragment(&chunk_id, fragment_index)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().delete_fragment(chunk_id, fragment_index)
     }
 
     async fn delete_chunk_force(&self, chunk_id: &ChunkId) -> Result<bool, ChunkError> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            guard.delete_chunk_force(&chunk_id)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.inner.write().delete_chunk_force(chunk_id)
     }
 
     async fn list_fragments(&self, chunk_id: &ChunkId) -> Vec<u32> {
-        let inner = Arc::clone(&self.inner);
-        let chunk_id = *chunk_id;
-        tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
-            guard.list_fragments(&chunk_id)
-        })
-        .await
-        .unwrap_or_default()
+        self.inner.read().list_fragments(chunk_id)
     }
 
     async fn snapshot_pools(&self) -> Vec<crate::pool::AffinityPool> {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
-            guard.snapshot_pools()
-        })
-        .await
-        .unwrap_or_default()
+        self.inner.read().snapshot_pools()
     }
 
     async fn add_pool(&self, pool: crate::pool::AffinityPool) -> Result<(), String> {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let mut g = inner.blocking_lock();
-            g.add_pool_checked(pool)
-        })
-        .await
-        .map_err(|e| format!("join: {e}"))?
+        self.inner.write().add_pool_checked(pool)
     }
 
     async fn add_device_to_pool(
@@ -430,25 +345,11 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         pool_name: &str,
         device: crate::pool::PoolDevice,
     ) -> Result<(), String> {
-        let inner = Arc::clone(&self.inner);
-        let pool_name = pool_name.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let mut g = inner.blocking_lock();
-            g.add_device(&pool_name, device)
-        })
-        .await
-        .map_err(|e| format!("join: {e}"))?
+        self.inner.write().add_device(pool_name, device)
     }
 
     async fn remove_device(&self, device_id: &str) -> Result<(), String> {
-        let inner = Arc::clone(&self.inner);
-        let device_id = device_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let mut g = inner.blocking_lock();
-            g.remove_device(&device_id)
-        })
-        .await
-        .map_err(|e| format!("join: {e}"))?
+        self.inner.write().remove_device(device_id)
     }
 
     async fn set_pool_durability(
@@ -456,14 +357,7 @@ impl<T: ChunkOps + Send + 'static> AsyncChunkOps for SyncBridge<T> {
         pool_name: &str,
         strategy: crate::pool::DurabilityStrategy,
     ) -> Result<(), String> {
-        let inner = Arc::clone(&self.inner);
-        let pool_name = pool_name.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let mut g = inner.blocking_lock();
-            g.set_pool_durability(&pool_name, strategy)
-        })
-        .await
-        .map_err(|e| format!("join: {e}"))?
+        self.inner.write().set_pool_durability(pool_name, strategy)
     }
 }
 
@@ -515,7 +409,7 @@ mod tests {
 
         // Inspect via inner mutex — the sync store must agree.
         let inner = bridge.inner();
-        let guard = inner.lock().await;
+        let guard = inner.read();
         assert_eq!(
             guard.refcount(&chunk_id).expect("chunk visible"),
             1,

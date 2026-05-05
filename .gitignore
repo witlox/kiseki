@@ -8,6 +8,7 @@
 /target/
 /target-rocky9/
 /target-dhat/
+/target-vanilla/
 **/*.rs.bk
 # Cargo.lock is committed — workspace contains binaries (kiseki-server, kiseki-keyserver, kiseki-client-fuse).
 

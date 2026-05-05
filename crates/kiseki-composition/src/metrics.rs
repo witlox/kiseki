@@ -88,6 +88,11 @@ pub struct CompositionMetrics {
     pub hydrator_stalled: IntGauge,
     /// redb `commit()` failures (out-of-space, fsync error, etc.).
     pub redb_commit_errors_total: IntCounter,
+    /// Total successful redb `commit()` calls from the write-behind
+    /// drainer. Each commit can hold many overlay entries — this is
+    /// keyed by mutations applied, so dividing by `redb_commits_total`
+    /// gives the average batch size.
+    pub redb_commits_total: IntCounter,
     /// Decode-path errors keyed by error kind. See `decode_kind`.
     pub decode_errors_total: IntCounterVec,
 }
@@ -171,6 +176,12 @@ impl CompositionMetrics {
         )?;
         registry.register(Box::new(redb_commit_errors_total.clone()))?;
 
+        let redb_commits_total = IntCounter::new(
+            "kiseki_composition_redb_commits_total",
+            "Total mutations applied by the write-behind drainer's redb commits (rev-3 amendment).",
+        )?;
+        registry.register(Box::new(redb_commits_total.clone()))?;
+
         let decode_errors_total = IntCounterVec::new(
             Opts::new(
                 "kiseki_composition_decode_errors_total",
@@ -191,6 +202,7 @@ impl CompositionMetrics {
             hydrator_skip_total,
             hydrator_stalled,
             redb_commit_errors_total,
+            redb_commits_total,
             decode_errors_total,
         })
     }

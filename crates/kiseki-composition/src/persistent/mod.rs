@@ -21,7 +21,9 @@
 pub mod error;
 pub mod redb;
 pub mod storage;
+pub mod write_behind;
 
 pub use error::PersistentStoreError;
 pub use redb::{PersistentRedbStorage, RedbFlusher};
 pub use storage::{CompositionStorage, HydrationBatch, MemoryStorage};
+pub use write_behind::{WriteBehindDrainer, WriteBehindFlusher};

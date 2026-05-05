@@ -35,18 +35,36 @@ pub trait Driver: Send + Sync {
     async fn get(&self, key: &Key) -> Result<usize, String>;
 }
 
-#[allow(clippy::unused_async)] // build is async to leave room for future driver setup that needs awaits
 pub async fn build(
     protocol: Protocol,
-    server: &ProfileServer,
+    server: Option<&ProfileServer>,
     pool_size: usize,
 ) -> Result<Arc<dyn Driver>, String> {
     match protocol {
-        Protocol::S3 => Ok(Arc::new(S3Driver::new(&server.s3_base))),
-        Protocol::Nfs3 => Ok(Arc::new(Nfs3Driver::new(server.nfs_addr, pool_size))),
-        Protocol::Nfs4 => Ok(Arc::new(Nfs4Driver::new(server.nfs_addr, pool_size))),
-        Protocol::Pnfs => Ok(Arc::new(PnfsDriver::new(server.nfs_addr, pool_size))),
-        Protocol::Fuse => Ok(Arc::new(FuseDriver::new(&server.s3_base))),
+        Protocol::InProcess => {
+            // No server needed.
+            Ok(Arc::new(InProcessDriver::new().await))
+        }
+        Protocol::S3 => {
+            let s = server.ok_or("S3 driver requires --server-bin (none was passed)")?;
+            Ok(Arc::new(S3Driver::new(&s.s3_base)))
+        }
+        Protocol::Nfs3 => {
+            let s = server.ok_or("Nfs3 driver requires --server-bin")?;
+            Ok(Arc::new(Nfs3Driver::new(s.nfs_addr, pool_size)))
+        }
+        Protocol::Nfs4 => {
+            let s = server.ok_or("Nfs4 driver requires --server-bin")?;
+            Ok(Arc::new(Nfs4Driver::new(s.nfs_addr, pool_size)))
+        }
+        Protocol::Pnfs => {
+            let s = server.ok_or("Pnfs driver requires --server-bin")?;
+            Ok(Arc::new(PnfsDriver::new(s.nfs_addr, pool_size)))
+        }
+        Protocol::Fuse => {
+            let s = server.ok_or("Fuse driver requires --server-bin")?;
+            Ok(Arc::new(FuseDriver::new(&s.s3_base)))
+        }
     }
 }
 
@@ -734,4 +752,90 @@ fn uaddr_to_socket(uaddr: &str) -> Option<SocketAddr> {
     let lo: u16 = parts[5].parse().ok()?;
     let port = (hi << 8) | lo;
     format!("{ip}:{port}").parse().ok()
+}
+
+// ---------------------------------------------------------------------------
+// In-process gateway floor (ADR-042 graduation gate)
+// ---------------------------------------------------------------------------
+
+/// Drives `InMemoryGateway` directly with no IPC. Measures the upper
+/// bound any wire protocol could possibly serve at this hardware.
+struct InProcessDriver {
+    gateway: kiseki_gateway::mem_gateway::InMemoryGateway,
+    namespace_id: NamespaceId,
+    tenant_id: OrgId,
+}
+
+impl InProcessDriver {
+    async fn new() -> Self {
+        use kiseki_chunk::store::ChunkStore;
+        use kiseki_common::ids::ShardId;
+        use kiseki_common::tenancy::KeyEpoch;
+        use kiseki_composition::composition::CompositionStore;
+        use kiseki_composition::namespace::Namespace;
+        use kiseki_crypto::keys::SystemMasterKey;
+        use kiseki_gateway::mem_gateway::InMemoryGateway;
+
+
+        let tenant_id = OrgId(uuid::Uuid::from_u128(100));
+        let namespace_id = NamespaceId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            b"in-process-floor",
+        ));
+        let mut compositions = CompositionStore::new();
+        compositions.add_namespace(Namespace {
+            id: namespace_id,
+            tenant_id,
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        });
+        let chunks = ChunkStore::new();
+        let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let gateway =
+            InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key);
+        Self {
+            gateway,
+            namespace_id,
+            tenant_id,
+        }
+    }
+}
+
+#[async_trait]
+impl Driver for InProcessDriver {
+    async fn put(&self, payload: &[u8]) -> Result<Key, String> {
+        let resp = self
+            .gateway
+            .write(WriteRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                data: payload.to_vec(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .map_err(|e| format!("in-process put: {e}"))?;
+        Ok(Key {
+            composition_id: resp.composition_id,
+            name: None,
+        })
+    }
+
+    async fn get(&self, key: &Key) -> Result<usize, String> {
+        let resp = self
+            .gateway
+            .read(kiseki_gateway::ops::ReadRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                composition_id: key.composition_id,
+                offset: 0,
+                length: u64::MAX,
+            })
+            .await
+            .map_err(|e| format!("in-process get: {e}"))?;
+        Ok(resp.data.len())
+    }
 }

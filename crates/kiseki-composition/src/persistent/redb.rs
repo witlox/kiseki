@@ -33,7 +33,8 @@ use kiseki_common::locks::LockOrDie;
 pub const COMPOSITION_RECORD_SCHEMA_VERSION: u8 = 1;
 
 /// Compositions: `comp_id.0.as_bytes()` → `[version][postcard]`.
-const COMPOSITIONS: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("compositions");
+pub(crate) const COMPOSITIONS: TableDefinition<'_, &[u8], &[u8]> =
+    TableDefinition::new("compositions");
 
 /// Meta: see `meta_keys` for the namespace.
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
@@ -43,11 +44,12 @@ const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 /// per-namespace range scans for `name_list` (and future
 /// LIST-with-prefix). Lexicographic order on `name` is the natural S3
 /// LIST ordering.
-const NAMES: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("names");
+pub(crate) const NAMES: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("names");
 
 /// Name index reverse: 16-byte `composition_id` → 16-byte `ns_id` || name.
 /// Used by Delete to drop the forward binding without scanning.
-const NAMES_REVERSE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("names_reverse");
+pub(crate) const NAMES_REVERSE: TableDefinition<'_, &[u8], &[u8]> =
+    TableDefinition::new("names_reverse");
 
 mod meta_keys {
     pub const SCHEMA_VERSION: &str = "schema_version";
@@ -61,7 +63,9 @@ const DEFAULT_LRU_CAPACITY: usize = 100_000;
 // -- Encoding helpers -------------------------------------------------------
 
 /// `[1 byte: version][postcard payload]` — see ADR-040 §D2.
-fn encode_composition(comp: &Composition) -> Result<Vec<u8>, PersistentStoreError> {
+pub(crate) fn encode_composition(
+    comp: &Composition,
+) -> Result<Vec<u8>, PersistentStoreError> {
     let mut out = Vec::with_capacity(280);
     out.push(COMPOSITION_RECORD_SCHEMA_VERSION);
     let payload = postcard::to_stdvec(comp)?;
@@ -97,7 +101,7 @@ fn encode_stuck_state(state: Option<(SequenceNumber, u32)>) -> Vec<u8> {
 /// Encode a (`namespace_id`, name) tuple as a flat key for the NAMES
 /// table. Layout: 16 bytes `ns_id` || UTF-8 name. Namespace prefix
 /// gives free per-namespace range scans.
-fn name_key(ns: NamespaceId, name: &str) -> Vec<u8> {
+pub(crate) fn name_key(ns: NamespaceId, name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + name.len());
     out.extend_from_slice(ns.0.as_bytes());
     out.extend_from_slice(name.as_bytes());
@@ -106,7 +110,7 @@ fn name_key(ns: NamespaceId, name: &str) -> Vec<u8> {
 
 /// Decode a flat key from the `NAMES_REVERSE` value field back into
 /// `(NamespaceId, name)`. Mirror of `name_key`.
-fn decode_name_key(bytes: &[u8]) -> Result<(NamespaceId, String), String> {
+pub(crate) fn decode_name_key(bytes: &[u8]) -> Result<(NamespaceId, String), String> {
     if bytes.len() < 16 {
         return Err(format!("name key too short: {}", bytes.len()));
     }
@@ -138,6 +142,19 @@ fn decode_stuck_state(bytes: &[u8]) -> Result<Option<(SequenceNumber, u32)>, Per
     )))
 }
 
+/// Three-valued result of a write-behind overlay lookup. Spelled
+/// out as an enum because the `Option<Option<T>>` form trips
+/// clippy's `option_option` lint and obscures intent.
+enum OverlayLookup<T> {
+    /// Overlay has the value; reader returns it without consulting redb.
+    Hit(T),
+    /// Overlay tombstoned this key; reader returns "not found"
+    /// without consulting redb (the redb row is stale).
+    Tombstone,
+    /// Overlay doesn't know about this key; reader falls through to redb.
+    Miss,
+}
+
 // -- Storage struct ---------------------------------------------------------
 
 /// redb-backed `CompositionStorage`.
@@ -161,6 +178,11 @@ pub struct PersistentRedbStorage {
     cache: Mutex<LruCache<CompositionId, Composition>>,
     metrics: Option<std::sync::Arc<crate::metrics::CompositionMetrics>>,
     eventual_durability: bool,
+    /// rev-3 write-behind handle. `Some` when group commit is on
+    /// AND `enable_write_behind` has been called (which the runtime
+    /// does at startup before handing the storage to the gateway).
+    /// `None` keeps the rev-1/2 synchronous path unchanged.
+    write_behind: Option<super::write_behind::WriteBehindHandle>,
 }
 
 /// Shared, clone-able handle for forcing a real fsync on the
@@ -323,7 +345,82 @@ impl PersistentRedbStorage {
             cache: Mutex::new(cache),
             metrics: None,
             eventual_durability: false,
+            write_behind: None,
         })
+    }
+
+    /// Enable the rev-3 write-behind queue and return a drainer
+    /// handle the runtime should `tokio::spawn` to flush batches
+    /// periodically. Caller-supplied `max_queue_size` is the
+    /// soft-cap above which writers fall back to the inline redb
+    /// path; `interval` is the periodic flush cadence; `max_batch`
+    /// is the per-flush op count cap.
+    ///
+    /// Idempotent at the API level — calling twice replaces the
+    /// existing handle (and any pending overlay entries from the
+    /// old one are leaked). Runtime calls this exactly once at
+    /// startup, before the storage is handed to the gateway.
+    pub fn enable_write_behind(
+        &mut self,
+        max_queue_size: usize,
+        interval: std::time::Duration,
+        max_batch: usize,
+    ) -> super::write_behind::WriteBehindDrainer {
+        let handle = super::write_behind::WriteBehindHandle::new(max_queue_size);
+        self.write_behind = Some(handle.clone());
+        super::write_behind::WriteBehindDrainer::new(
+            handle,
+            std::sync::Arc::clone(&self.db),
+            self.metrics.clone(),
+            interval,
+            max_batch,
+        )
+    }
+
+    /// Look up a composition in the overlay. Three-valued result:
+    /// `Hit(c)` = overlay has the value; `Tombstone` = overlay says
+    /// "removed, ignore redb"; `Miss` = overlay doesn't know,
+    /// caller must consult redb.
+    fn overlay_get(&self, id: CompositionId) -> OverlayLookup<Composition> {
+        let Some(handle) = self.write_behind.as_ref() else {
+            return OverlayLookup::Miss;
+        };
+        let ov = handle.overlay.read();
+        match ov.comp.get(&id) {
+            None => OverlayLookup::Miss,
+            Some((_, None)) => OverlayLookup::Tombstone,
+            Some((_, Some(c))) => OverlayLookup::Hit(c.clone()),
+        }
+    }
+
+    /// Look up a forward name binding in the overlay.
+    fn overlay_name_lookup(
+        &self,
+        ns: NamespaceId,
+        name: &str,
+    ) -> OverlayLookup<CompositionId> {
+        let Some(handle) = self.write_behind.as_ref() else {
+            return OverlayLookup::Miss;
+        };
+        let ov = handle.overlay.read();
+        match ov.name_fwd.get(&(ns, name.to_owned())) {
+            None => OverlayLookup::Miss,
+            Some((_, None)) => OverlayLookup::Tombstone,
+            Some((_, Some(id))) => OverlayLookup::Hit(*id),
+        }
+    }
+
+    /// Look up a reverse name binding in the overlay.
+    fn overlay_name_for(&self, id: CompositionId) -> OverlayLookup<(NamespaceId, String)> {
+        let Some(handle) = self.write_behind.as_ref() else {
+            return OverlayLookup::Miss;
+        };
+        let ov = handle.overlay.read();
+        match ov.name_rev.get(&id) {
+            None => OverlayLookup::Miss,
+            Some((_, None)) => OverlayLookup::Tombstone,
+            Some((_, Some(k))) => OverlayLookup::Hit(k.clone()),
+        }
     }
 
     fn record_decode_error(&self, e: &PersistentStoreError) {
@@ -364,6 +461,15 @@ impl PersistentRedbStorage {
 
 impl CompositionStorage for PersistentRedbStorage {
     fn get(&self, id: CompositionId) -> Result<Option<Composition>, PersistentStoreError> {
+        // I-CP9: write-behind overlay takes precedence over both
+        // the LRU cache and redb. A pending put or a pending
+        // tombstone must be observable here even though the redb
+        // commit hasn't landed yet.
+        match self.overlay_get(id) {
+            OverlayLookup::Hit(c) => return Ok(Some(c)),
+            OverlayLookup::Tombstone => return Ok(None),
+            OverlayLookup::Miss => {}
+        }
         // Cache lookup first — sync mutex, brief.
         if let Some(comp) = self
             .cache
@@ -414,24 +520,86 @@ impl CompositionStorage for PersistentRedbStorage {
     }
 
     fn list_in_namespace(&self, ns: NamespaceId) -> Result<Vec<Composition>, PersistentStoreError> {
+        // I-CP9 LIST consistency: merge redb scan with the overlay.
+        // - Overlay tombstone (None) hides the redb row.
+        // - Overlay Some(comp) replaces the redb row for the same id.
+        // - Overlay Some(comp) for an id absent from redb is added.
+        let mut out: Vec<Composition> = Vec::new();
+        // Overlay snapshot for this namespace (cheap — short read lock).
+        let (overlay_keep, overlay_extra): (
+            std::collections::HashMap<CompositionId, Option<Composition>>,
+            Vec<Composition>,
+        ) = if let Some(handle) = &self.write_behind {
+            let ov = handle.overlay.read();
+            let mut keep = std::collections::HashMap::new();
+            let mut extra = Vec::new();
+            for (id, (_, payload)) in &ov.comp {
+                match payload {
+                    Some(c) if c.namespace_id == ns => {
+                        keep.insert(*id, Some(c.clone()));
+                        extra.push(c.clone());
+                    }
+                    Some(_) => {
+                        // Other namespace — overlay still hides any
+                        // redb row with the same id (e.g. moved between
+                        // namespaces). Mark as "skip" without an extra.
+                        keep.insert(*id, None);
+                    }
+                    None => {
+                        keep.insert(*id, None);
+                    }
+                }
+            }
+            (keep, extra)
+        } else {
+            (std::collections::HashMap::new(), Vec::new())
+        };
         // v1: full table scan. ADR-040 calls out that a future
         // revision adds a (namespace_id → comp_id) secondary index.
         let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(COMPOSITIONS)?;
-        let mut out = Vec::new();
         for entry in table.iter()? {
             let (_, value) = entry?;
             let comp = decode_composition(value.value())?;
-            if comp.namespace_id == ns {
+            if comp.namespace_id != ns {
+                continue;
+            }
+            // Both `Some(Some(_))` (overlay supplied a fresher copy
+            // via `extra`) and `Some(None)` (tombstone / moved
+            // namespace) mean "skip the redb row." Only an
+            // overlay-miss falls through to the push.
+            if !overlay_keep.contains_key(&comp.id) {
                 out.push(comp);
             }
         }
+        out.extend(overlay_extra);
         Ok(out)
     }
 
     fn put(&mut self, comp: Composition) -> Result<(), PersistentStoreError> {
         let id = comp.id;
+        // rev-3: route through the overlay when write-behind is on
+        // AND the queue isn't saturated. On saturation we fall back
+        // to the inline path so the queue can drain.
+        if let Some(handle) = &self.write_behind {
+            let mut ov = handle.overlay.write();
+            if ov.len() < handle.max_queue_size {
+                let seq = ov.next_seq();
+                ov.comp.insert(id, (seq, Some(comp.clone())));
+                drop(ov);
+                handle.notify.notify_one();
+                // Cache update mirrors the inline path — readers
+                // following this put can still see the value via
+                // the overlay (which takes precedence), but
+                // populating the cache lets the post-flush hot path
+                // serve from cache without re-reading redb.
+                let push_result = self.cache.lock().lock_or_die("redb.cache").push(id, comp);
+                self.record_eviction(Self::is_capacity_eviction(push_result.as_ref(), id));
+                return Ok(());
+            }
+            // Saturated: fall through to inline.
+        }
         let bytes = encode_composition(&comp).inspect_err(|e| {
             self.record_decode_error(e);
         })?;
@@ -453,6 +621,51 @@ impl CompositionStorage for PersistentRedbStorage {
     }
 
     fn remove(&mut self, id: CompositionId) -> Result<bool, PersistentStoreError> {
+        // rev-3 write-behind path: stamp a tombstone in the overlay
+        // and let the drainer clean redb. Existence is best-effort
+        // — overlay doesn't always know whether redb still holds
+        // the row, so we approximate "did it exist?" as "either
+        // the overlay had a non-tombstone OR redb has the row."
+        if let Some(handle) = &self.write_behind {
+            let prior_overlay = match self.overlay_get(id) {
+                OverlayLookup::Hit(c) => Some(c),
+                _ => None,
+            };
+            let mut ov = handle.overlay.write();
+            if ov.len() < handle.max_queue_size {
+                let seq = ov.next_seq();
+                ov.comp.insert(id, (seq, None));
+                // Drop the reverse-name binding (and forward, if we
+                // know it). The overlay is consulted before redb on
+                // both lookups.
+                let prior_name = ov
+                    .name_rev
+                    .get(&id)
+                    .and_then(|(_, payload)| payload.clone());
+                if let Some(name_key) = prior_name.clone() {
+                    let nseq = ov.next_seq();
+                    ov.name_fwd.insert(name_key, (nseq, None));
+                }
+                let rseq = ov.next_seq();
+                ov.name_rev.insert(id, (rseq, None));
+                drop(ov);
+                handle.notify.notify_one();
+                self.cache.lock().lock_or_die("redb.cache").pop(&id);
+                // Existence flag: overlay said "yes" → existed; else
+                // peek redb for a more accurate answer.
+                if prior_overlay.is_some() {
+                    return Ok(true);
+                }
+                let exists = {
+                    let db = self.db.lock().lock_or_die("redb.db");
+                    let txn = db.begin_read()?;
+                    let table = txn.open_table(COMPOSITIONS)?;
+                    table.get(id.0.as_bytes().as_slice())?.is_some()
+                };
+                return Ok(exists);
+            }
+            // Saturated → fall through.
+        }
         let existed = {
             let db = self.db.lock().lock_or_die("redb.db");
             let mut txn = db.begin_write()?;
@@ -488,6 +701,12 @@ impl CompositionStorage for PersistentRedbStorage {
         ns: NamespaceId,
         name: &str,
     ) -> Result<Option<CompositionId>, PersistentStoreError> {
+        // I-CP9: overlay first, redb second.
+        match self.overlay_name_lookup(ns, name) {
+            OverlayLookup::Hit(id) => return Ok(Some(id)),
+            OverlayLookup::Tombstone => return Ok(None),
+            OverlayLookup::Miss => {}
+        }
         let key = name_key(ns, name);
         let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
@@ -511,6 +730,12 @@ impl CompositionStorage for PersistentRedbStorage {
         &self,
         id: CompositionId,
     ) -> Result<Option<(NamespaceId, String)>, PersistentStoreError> {
+        // I-CP9: overlay first, redb second.
+        match self.overlay_name_for(id) {
+            OverlayLookup::Hit(k) => return Ok(Some(k)),
+            OverlayLookup::Tombstone => return Ok(None),
+            OverlayLookup::Miss => {}
+        }
         let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(NAMES_REVERSE)?;
@@ -528,6 +753,40 @@ impl CompositionStorage for PersistentRedbStorage {
         name: String,
         id: CompositionId,
     ) -> Result<(), PersistentStoreError> {
+        // rev-3 write-behind path.
+        if let Some(handle) = &self.write_behind {
+            let mut ov = handle.overlay.write();
+            if ov.len() < handle.max_queue_size {
+                let key = (ns, name.clone());
+                // If this id had a prior name binding (visible from
+                // either the overlay or — implicitly — redb), we'd
+                // ideally tombstone the prior forward entry too. The
+                // overlay only tracks pending writes; we look up the
+                // prior reverse for it, and the drainer's
+                // `commit_snapshot_to_redb` re-asserts the same
+                // "drop prior forward entry for this id" rule when
+                // it lands the redb update. Net effect matches the
+                // inline path.
+                let prior_rev = ov
+                    .name_rev
+                    .get(&id)
+                    .and_then(|(_, payload)| payload.clone());
+                if let Some(prior) = prior_rev {
+                    if prior != key {
+                        let pseq = ov.next_seq();
+                        ov.name_fwd.insert(prior, (pseq, None));
+                    }
+                }
+                let fseq = ov.next_seq();
+                ov.name_fwd.insert(key.clone(), (fseq, Some(id)));
+                let rseq = ov.next_seq();
+                ov.name_rev.insert(id, (rseq, Some(key)));
+                drop(ov);
+                handle.notify.notify_one();
+                return Ok(());
+            }
+            // Saturated → fall through.
+        }
         let new_key = name_key(ns, &name);
         let db = self.db.lock().lock_or_die("redb.db");
         let mut txn = db.begin_write()?;
@@ -565,6 +824,37 @@ impl CompositionStorage for PersistentRedbStorage {
     }
 
     fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
+        // rev-3 write-behind path.
+        if let Some(handle) = &self.write_behind {
+            let key_tup = (ns, name.to_owned());
+            let prior_overlay = match self.overlay_name_lookup(ns, name) {
+                OverlayLookup::Hit(id) => Some(id),
+                _ => None,
+            };
+            let mut ov = handle.overlay.write();
+            if ov.len() < handle.max_queue_size {
+                let fseq = ov.next_seq();
+                ov.name_fwd.insert(key_tup.clone(), (fseq, None));
+                if let Some(id) = prior_overlay {
+                    let rseq = ov.next_seq();
+                    ov.name_rev.insert(id, (rseq, None));
+                }
+                drop(ov);
+                handle.notify.notify_one();
+                if prior_overlay.is_some() {
+                    return Ok(true);
+                }
+                // Peek redb to give an accurate "did it exist?" answer.
+                let exists = {
+                    let db = self.db.lock().lock_or_die("redb.db");
+                    let txn = db.begin_read()?;
+                    let table = txn.open_table(NAMES)?;
+                    table.get(name_key(ns, name).as_slice())?.is_some()
+                };
+                return Ok(exists);
+            }
+            // Saturated → fall through.
+        }
         let key = name_key(ns, name);
         let db = self.db.lock().lock_or_die("redb.db");
         let mut txn = db.begin_write()?;
@@ -589,6 +879,24 @@ impl CompositionStorage for PersistentRedbStorage {
         ns: NamespaceId,
         prefix: Option<&str>,
     ) -> Result<Vec<(String, CompositionId)>, PersistentStoreError> {
+        // I-CP9 LIST consistency for the name index:
+        //   - Overlay tombstone (None) hides the redb entry for that name.
+        //   - Overlay Some(id) overrides redb for that name.
+        //   - Overlay Some(id) for a name absent from redb is added.
+        let overlay_keep: std::collections::HashMap<String, Option<CompositionId>> =
+            if let Some(handle) = &self.write_behind {
+                let ov = handle.overlay.read();
+                ov.name_fwd
+                    .iter()
+                    .filter(|((entry_ns, name), _)| {
+                        *entry_ns == ns
+                            && prefix.is_none_or(|p| name.starts_with(p))
+                    })
+                    .map(|((_, name), (_, payload))| (name.clone(), *payload))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
         let db = self.db.lock().lock_or_die("redb.db");
         let txn = db.begin_read()?;
         let table = txn.open_table(NAMES)?;
@@ -623,6 +931,12 @@ impl CompositionStorage for PersistentRedbStorage {
                     continue;
                 }
             }
+            // Overlay precedence: if the overlay says this name was
+            // tombstoned or rebound, skip the redb entry (it's about
+            // to be replaced by the overlay merge below).
+            if overlay_keep.contains_key(name) {
+                continue;
+            }
             let id_bytes = v.value();
             if id_bytes.len() != 16 {
                 continue;
@@ -630,6 +944,13 @@ impl CompositionStorage for PersistentRedbStorage {
             let mut buf = [0u8; 16];
             buf.copy_from_slice(id_bytes);
             out.push((name.to_owned(), CompositionId(uuid::Uuid::from_bytes(buf))));
+        }
+        // Merge overlay's `Some(id)` entries; tombstones (`None`)
+        // were already excluded from the redb scan above.
+        for (name, payload) in overlay_keep {
+            if let Some(id) = payload {
+                out.push((name, id));
+            }
         }
         Ok(out)
     }

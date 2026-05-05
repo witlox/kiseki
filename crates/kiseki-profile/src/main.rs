@@ -51,6 +51,13 @@ enum Protocol {
     /// FUSE → `GatewayOps` → S3 wire. Drives `KisekiFuse` against a
     /// `RemoteHttpGateway` connected to the running server.
     Fuse,
+    /// In-process gateway floor (ADR-042 §"graduation gate"). Drives
+    /// `InMemoryGateway` directly with no server, no IPC, no gRPC, no
+    /// HTTP — pure compute path. Measures the upper bound any wire
+    /// protocol could possibly serve at this hardware. The
+    /// graduation gate from `A-NG11` requires this floor to clear
+    /// 100 k op/s 64 KiB GET before ADR-042's protocol shape commits.
+    InProcess,
 }
 
 /// Workload shape — what mix of operations to drive.
@@ -123,23 +130,58 @@ fn main() {
         .build()
         .expect("tokio runtime");
 
+    // For the in-process driver, the work happens *inside this
+    // process* (not the spawned server), so the server's pprof guard
+    // doesn't help. Wrap the run in a local pprof guard when
+    // KISEKI_PROFILE_PPROF_OUT is set. Output is the same SVG
+    // flamegraph format. Only active for InProcess; no-op for
+    // protocols that drive a separately-instrumented server.
+    let local_pprof_path = match args.protocol {
+        Protocol::InProcess => std::env::var("KISEKI_PROFILE_PPROF_OUT").ok(),
+        _ => None,
+    };
+    let local_pprof_guard = local_pprof_path.as_ref().and_then(|_| {
+        pprof::ProfilerGuardBuilder::default()
+            .frequency(99)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .ok()
+    });
+
     rt.block_on(async move {
         if let Err(e) = run(args).await {
             eprintln!("profile run failed: {e}");
             std::process::exit(1);
         }
     });
+
+    if let (Some(guard), Some(path)) = (local_pprof_guard, local_pprof_path) {
+        if let Ok(report) = guard.report().build() {
+            if let Ok(file) = std::fs::File::create(&path) {
+                let _ = report.flamegraph(file);
+                eprintln!("[pprof] flamegraph written to {path}");
+            }
+        }
+    }
 }
 
 async fn run(args: RunArgs) -> Result<(), String> {
-    let server = harness::ProfileServer::start(args.server_bin.as_deref()).await?;
-    eprintln!(
-        "[harness] server up; s3={} nfs={} ds={} metrics={}",
-        server.s3_base,
-        server.nfs_addr,
-        server.ds_addr,
-        server.metrics_url(),
-    );
+    // The in-process driver doesn't need a spawned server — it
+    // instantiates the gateway directly. Skip the harness for it.
+    let server = match args.protocol {
+        Protocol::InProcess => None,
+        _ => {
+            let s = harness::ProfileServer::start(args.server_bin.as_deref()).await?;
+            eprintln!(
+                "[harness] server up; s3={} nfs={} ds={} metrics={}",
+                s.s3_base,
+                s.nfs_addr,
+                s.ds_addr,
+                s.metrics_url(),
+            );
+            Some(s)
+        }
+    };
 
     // Size the NFS connection pool to match concurrency: each
     // worker gets its own session, no FIFO queueing on a shared
@@ -147,7 +189,7 @@ async fn run(args: RunArgs) -> Result<(), String> {
     // session memory if someone runs at extreme concurrency.
     let pool_size = args.concurrency.clamp(1, 32);
     let driver: Arc<dyn protocols::Driver> =
-        protocols::build(args.protocol, &server, pool_size).await?;
+        protocols::build(args.protocol, server.as_ref(), pool_size).await?;
 
     let warmup_keys = if matches!(args.shape, Shape::PutHeavy) {
         Arc::new(Vec::new())

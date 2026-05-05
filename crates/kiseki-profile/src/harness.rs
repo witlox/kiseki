@@ -94,7 +94,16 @@ impl ProfileServer {
         // Forward optional self-profiling env vars. The server's
         // pprof guard reads `KISEKI_PPROF_OUT` and dumps a flamegraph
         // SVG at that path on SIGTERM; dhat reads `DHAT_OUTPUT_FILE`.
-        for var in ["KISEKI_PPROF_OUT", "DHAT_OUTPUT_FILE"] {
+        // Also forward operator-tuning env vars so the matrix can
+        // sweep their effect (KISEKI_OBSERVABILITY, group-commit
+        // intervals, etc.) without a recompile.
+        for var in [
+            "KISEKI_PPROF_OUT",
+            "DHAT_OUTPUT_FILE",
+            "KISEKI_OBSERVABILITY",
+            "KISEKI_COMPOSITION_FLUSH_INTERVAL_MS",
+            "KISEKI_CHUNK_FLUSH_INTERVAL_MS",
+        ] {
             if let Ok(v) = std::env::var(var) {
                 cmd.env(var, v);
             }

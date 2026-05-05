@@ -50,6 +50,22 @@ pub trait ChunkOps {
     /// Increment refcount for an existing chunk (dedup).
     fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
+    /// Atomic dedup-pre-flight: increment the refcount IF the chunk
+    /// exists, else return `Ok(None)`. Saves one round-trip on the
+    /// gateway dedup path (vs `refcount` + `increment_refcount`).
+    /// Default impl falls back to the two-step path; backends that
+    /// can do this in a single critical section override it.
+    fn try_increment_if_exists(
+        &mut self,
+        chunk_id: &ChunkId,
+    ) -> Result<Option<u64>, ChunkError> {
+        match self.refcount(chunk_id) {
+            Ok(_) => self.increment_refcount(chunk_id).map(Some),
+            Err(ChunkError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Decrement refcount. Returns the new refcount.
     fn decrement_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
@@ -464,6 +480,23 @@ impl ChunkOps for ChunkStore {
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         entry.refcount += 1;
         Ok(entry.refcount)
+    }
+
+    /// Single-critical-section dedup pre-flight. Halves the round-
+    /// trips through the AsyncChunkOps SyncBridge mutex on dedup-
+    /// hit writes, the dominant write-path bottleneck observed in
+    /// the 2026-05-05 in-process flamegraph.
+    fn try_increment_if_exists(
+        &mut self,
+        chunk_id: &ChunkId,
+    ) -> Result<Option<u64>, ChunkError> {
+        match self.chunks.get_mut(chunk_id) {
+            Some(entry) => {
+                entry.refcount += 1;
+                Ok(Some(entry.refcount))
+            }
+            None => Ok(None),
+        }
     }
 
     fn decrement_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {

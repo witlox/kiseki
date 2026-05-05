@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 
 use kiseki_chunk::AsyncChunkOps;
 use kiseki_common::tenancy::DedupPolicy;
@@ -50,6 +50,15 @@ pub struct InMemoryGateway {
     /// so leader-emitted Create deltas land in the same store the gateway
     /// reads from on followers.
     compositions: Arc<Mutex<CompositionStore>>,
+    /// Lock-free namespace metadata cache for the write hot path.
+    /// `add_namespace` populates this; `setattr` invalidates. The
+    /// gateway's `write` no longer needs to acquire the composition
+    /// mutex just to check `ns.read_only` for the simple non-
+    /// conditional path — saves one tokio-Mutex round-trip per
+    /// write under contention. (2026-05-05 perf spike, option #3.)
+    namespace_meta: std::sync::Arc<parking_lot::RwLock<
+        std::collections::HashMap<kiseki_common::ids::NamespaceId, NamespaceMeta>,
+    >>,
     chunks: Arc<dyn AsyncChunkOps>,
     aead: Aead,
     master_key: SystemMasterKey,
@@ -186,43 +195,140 @@ pub struct InMemoryGateway {
     decrypt_cache: std::sync::Mutex<DecryptCache>,
 }
 
+/// Lock-free snapshot of the namespace metadata fields the write hot
+/// path needs. Cached by the gateway so a simple non-conditional
+/// PUT doesn't acquire the composition mutex just to look up
+/// `ns.read_only`.
+#[derive(Clone, Copy, Debug)]
+struct NamespaceMeta {
+    read_only: bool,
+}
+
+impl NamespaceMeta {
+    fn from_namespace(ns: &kiseki_composition::namespace::Namespace) -> Self {
+        Self {
+            read_only: ns.read_only,
+        }
+    }
+}
+
 const MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
+/// Default plaintext TTL for the decrypt cache. Matches F-CC3's
+/// 30-second exposure-window contract for cached plaintext under
+/// crypto-shred. Operators with stricter requirements set
+/// `KISEKI_DECRYPT_CACHE_TTL_MS=0` to disable the cache (sacrifice
+/// throughput for zero residual exposure).
+const DEFAULT_CACHE_TTL_MS: u64 = 30_000;
+
+/// Read the configured plaintext-cache TTL from
+/// `KISEKI_DECRYPT_CACHE_TTL_MS` (milliseconds). `0` disables the
+/// cache; unset uses the default. Parsed at gateway construction
+/// time; subsequent env changes do not retroactively affect a
+/// running gateway.
+fn read_decrypt_cache_ttl() -> std::time::Duration {
+    let ms = std::env::var("KISEKI_DECRYPT_CACHE_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_TTL_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Per-entry plaintext with bookkeeping for TTL + zeroize-on-drop.
+/// `Zeroizing<Vec<u8>>` clears the bytes when the entry is evicted
+/// (or the whole cache is wiped on a crypto-shred signal). Without
+/// this wrapper a plain `Vec<u8>` only deallocates on drop — the
+/// memory pages stay populated with plaintext until the allocator
+/// reuses them, leaving a residual-exposure window beyond the TTL.
+struct DecryptCacheEntry {
+    plaintext: zeroize::Zeroizing<Vec<u8>>,
+    inserted_at: std::time::Instant,
+}
 
 #[derive(Default)]
 struct DecryptCache {
-    /// Insertion-ordered (`chunk_id` → plaintext) for FIFO eviction.
+    /// Insertion-ordered (`chunk_id` → entry) for FIFO eviction.
     /// FIFO is good enough — sequential reads on a single composition
     /// hit the same chunk repeatedly within a short window, so even
     /// FIFO retains the hot chunk for the duration of a streaming
     /// read.
-    map: std::collections::HashMap<kiseki_common::ids::ChunkId, Vec<u8>>,
+    map: std::collections::HashMap<kiseki_common::ids::ChunkId, DecryptCacheEntry>,
     /// Eviction queue: front = oldest. Pop here when total exceeds cap.
     queue: std::collections::VecDeque<kiseki_common::ids::ChunkId>,
     /// Sum of `plaintext.len()` across the map.
     total_bytes: usize,
+    /// Per-entry TTL. Reads observe expiry as a miss and the entry
+    /// is removed (and zeroized via `Zeroizing`) on the next mutation
+    /// of the cache or on the next read. `Duration::ZERO` disables
+    /// the cache entirely (every read does a fresh decrypt).
+    ttl: std::time::Duration,
 }
 
 impl DecryptCache {
-    fn get(&self, id: &kiseki_common::ids::ChunkId) -> Option<Vec<u8>> {
-        self.map.get(id).cloned()
+    fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            queue: std::collections::VecDeque::new(),
+            total_bytes: 0,
+            ttl,
+        }
+    }
+
+    fn get(&mut self, id: &kiseki_common::ids::ChunkId) -> Option<Vec<u8>> {
+        let entry = self.map.get(id)?;
+        if !self.ttl.is_zero() && entry.inserted_at.elapsed() > self.ttl {
+            // TTL expired — evict on read so the residual-exposure
+            // window is bounded by the TTL rather than the FIFO
+            // eviction pressure. The Zeroizing drop clears the bytes.
+            let _ = self.evict(id);
+            return None;
+        }
+        Some((*entry.plaintext).clone())
     }
 
     fn insert(&mut self, id: kiseki_common::ids::ChunkId, plaintext: Vec<u8>) {
+        if self.ttl.is_zero() {
+            return; // cache disabled
+        }
         if self.map.contains_key(&id) {
             return; // duplicate insert — keep the existing entry
         }
         let len = plaintext.len();
         self.total_bytes += len;
-        self.map.insert(id, plaintext);
+        let entry = DecryptCacheEntry {
+            plaintext: zeroize::Zeroizing::new(plaintext),
+            inserted_at: std::time::Instant::now(),
+        };
+        self.map.insert(id, entry);
         self.queue.push_back(id);
         while self.total_bytes > MAX_CACHE_BYTES {
             let Some(victim) = self.queue.pop_front() else {
                 break;
             };
             if let Some(v) = self.map.remove(&victim) {
-                self.total_bytes = self.total_bytes.saturating_sub(v.len());
+                self.total_bytes = self.total_bytes.saturating_sub(v.plaintext.len());
+                // `v` is dropped here — Zeroizing clears the bytes.
             }
         }
+    }
+
+    /// Evict a single entry by id. Used on TTL expiry on read; the
+    /// `Zeroizing` drop clears the plaintext bytes.
+    fn evict(&mut self, id: &kiseki_common::ids::ChunkId) -> Option<DecryptCacheEntry> {
+        let entry = self.map.remove(id)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.plaintext.len());
+        // queue retains the id but the next FIFO sweep will skip
+        // missing keys; cheaper than a linear scan here.
+        Some(entry)
+    }
+
+    /// Wipe every entry. Called on a crypto-shred signal from the
+    /// keymanager (e.g., a tenant-key rotation that destroys the
+    /// previous epoch). Every plaintext byte is zeroized via the
+    /// `Zeroizing` drop.
+    fn wipe(&mut self) {
+        self.map.clear(); // drops every Zeroizing → bytes cleared
+        self.queue.clear();
+        self.total_bytes = 0;
     }
 }
 
@@ -264,7 +370,10 @@ impl InMemoryGateway {
             target_copies: 0,
             retry_metrics: None,
             fsync_hooks: std::sync::RwLock::new(Vec::new()),
-            decrypt_cache: std::sync::Mutex::new(DecryptCache::default()),
+            decrypt_cache: std::sync::Mutex::new(DecryptCache::new(read_decrypt_cache_ttl())),
+            namespace_meta: std::sync::Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -279,6 +388,21 @@ impl InMemoryGateway {
             .workflow_table
             .write()
             .lock_or_die("mem_gateway.unknown") = Some(table);
+    }
+
+    /// Wipe the plaintext decrypt cache. Called by the runtime on
+    /// crypto-shred signals from the keymanager (e.g., a tenant-key
+    /// rotation that destroys the previous epoch). Every cached
+    /// plaintext byte is zeroized via the `Zeroizing` drop. Returns
+    /// the number of entries wiped, for the audit event.
+    pub fn wipe_decrypt_cache(&self) -> usize {
+        let mut cache = self
+            .decrypt_cache
+            .lock()
+            .lock_or_die("mem_gateway.decrypt_cache");
+        let n = cache.map.len();
+        cache.wipe();
+        n
     }
 
     /// Register a fsync-pending hook. Called by the runtime when
@@ -453,7 +577,7 @@ impl InMemoryGateway {
     /// NFS opens/locks and in-flight multipart uploads are lost.
     pub async fn crash(&self) {
         // Clear composition namespace cache (ephemeral).
-        self.compositions.lock().await.clear_namespaces();
+        self.compositions.lock().clear_namespaces();
         // Clear session tracking.
         self.last_written_seq
             .lock()
@@ -485,7 +609,19 @@ impl InMemoryGateway {
     /// Namespaces are created by the Control Plane and must be registered
     /// with the gateway before any write/read operations can target them.
     pub async fn add_namespace(&self, ns: kiseki_composition::namespace::Namespace) {
-        self.compositions.lock().await.add_namespace(ns);
+        // Snapshot the hot-path fields into the lock-free metadata
+        // cache BEFORE inserting into the composition store. This
+        // ordering guarantees that a writer that sees the namespace
+        // in the composition store also sees it in the cache (and
+        // vice versa, modulo the brief window between the two
+        // mutations — gateways serialize add_namespace through the
+        // outer GatewayOps interface so concurrent add+write on the
+        // same namespace_id is not a real workload).
+        let meta = NamespaceMeta::from_namespace(&ns);
+        self.namespace_meta
+            .write()
+            .insert(ns.id, meta);
+        self.compositions.lock().add_namespace(ns);
     }
 
     /// List compositions in a namespace (for S3 `ListObjectsV2`).
@@ -493,7 +629,7 @@ impl InMemoryGateway {
         &self,
         ns_id: kiseki_common::ids::NamespaceId,
     ) -> Vec<(kiseki_common::ids::CompositionId, u64)> {
-        let compositions = self.compositions.lock().await;
+        let compositions = self.compositions.lock();
         compositions
             .list_by_namespace(ns_id)
             .unwrap_or_default()
@@ -509,7 +645,6 @@ impl InMemoryGateway {
     ) -> Result<String, GatewayError> {
         self.compositions
             .lock()
-            .await
             .start_multipart(namespace_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
@@ -552,7 +687,6 @@ impl InMemoryGateway {
 
         self.compositions
             .lock()
-            .await
             .upload_part(upload_id, part_number, chunk_id, size, was_new)
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
@@ -587,7 +721,7 @@ impl InMemoryGateway {
         // for the Raft emit + name bind, drop the lock before any
         // await on Raft consensus (ADR-032).
         let (comp_id, log, emit_params, new_chunk_ids) = {
-            let mut comps = self.compositions.lock().await;
+            let mut comps = self.compositions.lock();
             let comp_id = comps.finalize_multipart(upload_id).map_err(|e| {
                 tracing::warn!(error = %e, "complete_multipart: finalize_multipart failed");
                 GatewayError::Upstream(e.to_string())
@@ -719,7 +853,6 @@ impl InMemoryGateway {
     pub async fn abort_multipart_internal(&self, upload_id: &str) -> Result<(), GatewayError> {
         self.compositions
             .lock()
-            .await
             .abort_multipart(upload_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
@@ -822,7 +955,7 @@ impl InMemoryGateway {
         // Phase 1: local mutation + capture log handle. Scope the
         // MutexGuard so it drops before any .await point.
         let log = {
-            let mut comps = self.compositions.lock().await;
+            let mut comps = self.compositions.lock();
             if comps.namespace(namespace_id).is_some() {
                 return Ok(()); // already registered locally; no-op
             }
@@ -850,7 +983,7 @@ impl InMemoryGateway {
                     // Roll back the local registration — without
                     // follower visibility this would be a stealth
                     // single-node namespace.
-                    let mut comps = self.compositions.lock().await;
+                    let mut comps = self.compositions.lock();
                     comps.remove_namespace(namespace_id);
                     tracing::warn!(
                         namespace_id = %namespace_id.0,
@@ -899,18 +1032,12 @@ impl GatewayOps for InMemoryGateway {
     // staleness check) that doesn't decompose cleanly. Splitting would
     // obscure the read-path data flow more than it would help.
     #[allow(clippy::too_many_lines)]
-    #[tracing::instrument(
-        skip(self, req),
-        fields(
-            tenant_id = %req.tenant_id.0,
-            namespace_id = %req.namespace_id.0,
-            composition_id = %req.composition_id.0,
-            offset = req.offset,
-            length = req.length,
-        ),
-    )]
+    // tracing::instrument removed from hot path (B3 — 2026-05-05 spike).
+    // Outer-fn span machinery cost ~3-5 % per call; drop it here and
+    // rely on the request_duration / phase-duration histograms for
+    // observability. Internal `tracing::debug!` calls remain.
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        tracing::debug!("gateway read: entry");
+        // (B9: dropped "entry" debug — phase histograms cover this.)
         let composition_lookup_started = std::time::Instant::now();
         // Phase 16f / ADR-040 §D7: on a follower, the hydrator may not
         // have applied the create-delta yet for a composition the
@@ -934,52 +1061,63 @@ impl GatewayOps for InMemoryGateway {
             .unwrap_or(1000);
         let comp_retry_budget = std::time::Duration::from_millis(budget);
         let deadline = std::time::Instant::now() + comp_retry_budget;
-        let compositions = loop {
-            let guard = self.compositions.lock().await;
-            if guard.get(req.composition_id).is_ok() {
-                if let Some(ref m) = self.retry_metrics {
-                    m.read_retry_total.inc();
+        // Loop, cloning the composition out before releasing the lock,
+        // so the parking_lot guard is never held across the
+        // tokio::time::sleep().await. Composition is `Clone` (cheap —
+        // chunks: Vec<ChunkId>, version, sizes, plus optional content
+        // type), so the per-retry clone is fine.
+        let comp = loop {
+            // Inner block scopes the guard so it drops before the
+            // possible `.await` in the retry path.
+            let outcome: Result<kiseki_composition::composition::Composition, GatewayError> = {
+                let guard = self.compositions.lock();
+                if let Ok(c) = guard.get(req.composition_id) {
+                    if let Some(ref m) = self.retry_metrics {
+                        m.read_retry_total.inc();
+                    }
+                    Ok(c.clone())
+                } else if guard.storage().halted().unwrap_or(false) {
+                    // Halt-mode short-circuit: if the hydrator can't
+                    // catch up, surface ServiceUnavailable now.
+                    tracing::warn!(
+                        "gateway read: composition hydrator halted — returning ServiceUnavailable"
+                    );
+                    Err(GatewayError::ServiceUnavailable(format!(
+                        "composition hydrator halted; retry against another node (composition_id={})",
+                        req.composition_id.0
+                    )))
+                } else if std::time::Instant::now() >= deadline {
+                    if let Some(ref m) = self.retry_metrics {
+                        m.read_retry_exhausted_total.inc();
+                    }
+                    tracing::warn!(
+                        budget_ms = budget,
+                        "gateway read: composition not found within retry budget — surfacing inner error",
+                    );
+                    Err(guard
+                        .get(req.composition_id)
+                        .map(|_| ()) // map success-impossible (we already checked)
+                        .map_err(|e| GatewayError::Upstream(e.to_string()))
+                        .err()
+                        .unwrap_or_else(|| {
+                            GatewayError::Upstream(
+                                "composition lookup exhausted retry budget".into(),
+                            )
+                        }))
+                } else {
+                    // Need to retry — drop guard, sleep, loop.
+                    Err(GatewayError::Upstream("retry".into()))
                 }
-                break guard;
-            }
-            // Halt-mode short-circuit: if the hydrator can't catch up,
-            // there's no point waiting out the budget. Surface a
-            // retry-elsewhere signal immediately.
-            if guard.storage().halted().unwrap_or(false) {
-                tracing::warn!(
-                    "gateway read: composition hydrator halted — returning ServiceUnavailable"
-                );
-                return Err(GatewayError::ServiceUnavailable(format!(
-                    "composition hydrator halted; retry against another node (composition_id={})",
-                    req.composition_id.0
-                )));
-            }
-            drop(guard);
-            if std::time::Instant::now() >= deadline {
-                if let Some(ref m) = self.retry_metrics {
-                    m.read_retry_exhausted_total.inc();
+                // guard drops at end of block
+            };
+            match outcome {
+                Ok(c) => break c,
+                Err(GatewayError::Upstream(ref s)) if s == "retry" => {
+                    tokio::time::sleep(COMP_RETRY_INTERVAL).await;
                 }
-                tracing::warn!(
-                    budget_ms = budget,
-                    "gateway read: composition not found within retry budget — surfacing inner error",
-                );
-                // Surface the original error path.
-                let g = self.compositions.lock().await;
-                let _ = g.get(req.composition_id).map_err(|e| {
-                    tracing::warn!(error = %e, "gateway read: compositions.get failed (post-budget)");
-                    GatewayError::Upstream(e.to_string())
-                })?;
-                // Unreachable: get() failed by contract; the `?` returned.
-                break g;
+                Err(e) => return Err(e),
             }
-            tokio::time::sleep(COMP_RETRY_INTERVAL).await;
         };
-
-        // Look up the composition.
-        let comp = compositions.get(req.composition_id).map_err(|e| {
-            tracing::warn!(error = %e, "gateway read: compositions.get failed");
-            GatewayError::Upstream(e.to_string())
-        })?;
         self.observe_get_phase("composition_lookup", composition_lookup_started.elapsed());
 
         // Verify tenant ownership (I-T1).
@@ -1073,11 +1211,9 @@ impl GatewayOps for InMemoryGateway {
             };
 
             let env = if let Some(env) = inline_hit {
-                tracing::debug!(?chunk_id, "gateway read: inline hit");
                 env
             } else {
                 // Fall back to chunk store (block device).
-                tracing::debug!(?chunk_id, "gateway read: chunk store fetch");
                 self.chunks.read_chunk(chunk_id).await.map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway read: chunks.read_chunk failed");
                     GatewayError::Upstream(e.to_string())
@@ -1135,7 +1271,7 @@ impl GatewayOps for InMemoryGateway {
             c.inc_by(returned);
         }
 
-        tracing::debug!(returned_bytes = end - start, eof, "gateway read: success",);
+        // (B9: dropped "success" debug — phase histograms cover this.)
         Ok(ReadResponse {
             data: plaintext[start..end].to_vec(),
             eof,
@@ -1149,7 +1285,7 @@ impl GatewayOps for InMemoryGateway {
         composition_id: kiseki_common::ids::CompositionId,
         content_type: Option<String>,
     ) -> Result<(), GatewayError> {
-        let mut comps = self.compositions.lock().await;
+        let mut comps = self.compositions.lock();
         comps
             .set_content_type(composition_id, content_type)
             .map_err(|e| {
@@ -1158,17 +1294,13 @@ impl GatewayOps for InMemoryGateway {
             })
     }
 
+    // tracing::instrument removed from hot path (B3). Same rationale
+    // as `read` above — phase histograms cover the observability
+    // surface; the per-call span was a measurable per-op cost on the
+    // 2026-05-05 in-process flamegraph.
     #[allow(clippy::too_many_lines)]
-    #[tracing::instrument(
-        skip(self, req),
-        fields(
-            tenant_id = %req.tenant_id.0,
-            namespace_id = %req.namespace_id.0,
-            bytes = req.data.len(),
-        ),
-    )]
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
-        tracing::debug!("gateway write: entry");
+        // (B9: dropped "entry" debug — phase histograms cover this.)
         // ADR-021 §3.b / I-WA1: validate the optional workflow_ref
         // header before any storage work. The header is advisory: an
         // unknown ref or one with no shared workflow table simply
@@ -1225,60 +1357,34 @@ impl GatewayOps for InMemoryGateway {
         // POSIX/NFS read-only namespace gate (POSIX.1-2024 EROFS,
         // NFS3ERR_ROFS, NFSv4 NFS4ERR_ROFS). Performed before any
         // crypto/storage work so the rejection is cheap and uniform.
-        // Also evaluate the optional HTTP-derived conditional in the
-        // same critical section so the existence-check + decision +
+        //
+        // Fast path: lock-free namespace-metadata cache (populated by
+        // add_namespace, no composition mutex required). Saves a
+        // tokio-Mutex round-trip on every write that doesn't carry
+        // an HTTP conditional. The S3 conditional path still acquires
+        // the composition mutex so the existence-check + decision +
         // (later) bind are race-free against concurrent writers to
-        // the same name. The S3 layer relies on this — if two PUTs
-        // with `If-None-Match: *` race against an empty key, exactly
-        // one must succeed.
-        {
-            let comps = self.compositions.lock().await;
-            if let Some(ns) = comps.namespace(req.namespace_id) {
-                if ns.read_only {
-                    tracing::warn!("gateway write: rejected — namespace is read-only");
-                    return Err(GatewayError::ReadOnlyNamespace);
-                }
-            }
-            if let (Some(name), Some(cond)) = (req.name.as_deref(), req.conditional.as_ref()) {
-                let existing = comps.lookup_by_name(req.namespace_id, name).map_err(|e| {
-                    tracing::warn!(error = %e, "gateway write: lookup_by_name failed");
-                    GatewayError::Upstream(e.to_string())
-                })?;
-                match (cond, existing) {
-                    (crate::ops::WriteConditional::IfNoneMatch, Some(_)) => {
-                        tracing::debug!(
-                            name = %name,
-                            "gateway write: If-None-Match * but key exists → PreconditionFailed",
-                        );
-                        return Err(GatewayError::PreconditionFailed(format!(
-                            "object \"{name}\" already exists; If-None-Match: * requires it not to"
-                        )));
-                    }
-                    (crate::ops::WriteConditional::IfMatch(_), None) => {
-                        tracing::debug!(
-                            name = %name,
-                            "gateway write: If-Match against missing key → PreconditionFailed",
-                        );
-                        return Err(GatewayError::PreconditionFailed(format!(
-                            "object \"{name}\" does not exist; If-Match requires existing match"
-                        )));
-                    }
-                    (crate::ops::WriteConditional::IfMatch(want), Some(got)) if *want != got => {
-                        tracing::debug!(
-                            name = %name,
-                            want = %want.0,
-                            got = %got.0,
-                            "gateway write: If-Match etag mismatch → PreconditionFailed",
-                        );
-                        return Err(GatewayError::PreconditionFailed(format!(
-                            "object \"{name}\" etag mismatch (have {}, want {})",
-                            got.0, want.0,
-                        )));
-                    }
-                    _ => {}
-                }
+        // the same name (S3 If-None-Match: * semantics).
+        if let Some(meta) = self.namespace_meta.read().get(&req.namespace_id) {
+            if meta.read_only {
+                tracing::warn!("gateway write: rejected — namespace is read-only");
+                return Err(GatewayError::ReadOnlyNamespace);
             }
         }
+        // (B6: the conditional check used to live here in its own
+        // composition-mutex critical section, then drop, then encrypt,
+        // then re-acquire for create+bind_name. Two issues with that:
+        // (a) two lock acquisitions per conditional PUT, (b) a real
+        // race where between the check and the create, another writer
+        // could PUT the same name and BOTH succeed — violating
+        // S3 If-None-Match: * semantics.
+        //
+        // The conditional check is now folded into the create
+        // critical section below. Cost: a write whose conditional
+        // FAILS pays the encrypt + write_chunk before the failure
+        // surfaces — those chunks orphan with refcount=0 and GC
+        // collects them. Conditional failures are the minority path,
+        // so this is a fair trade for atomicity + one fewer lock.)
         let bytes_written = req.data.len() as u64;
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
@@ -1313,6 +1419,31 @@ impl GatewayOps for InMemoryGateway {
                         tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
                         GatewayError::Upstream(e.to_string())
                     })?;
+
+            // Dedup short-circuit: if the chunk already exists, skip
+            // the per-write HKDF + AEAD seal + nonce-RNG and just
+            // bump the refcount. `try_increment_if_exists` does this
+            // in ONE critical section (one SyncBridge round-trip)
+            // instead of the two-step `refcount` + `increment_refcount`
+            // pattern, which dominated the post-dedup-fix flamegraph.
+            //
+            // Also fixes the long-standing double-increment that
+            // happened in the legacy seal-then-dedup path: chunk
+            // store's `write_chunk` ALREADY increments on dedup
+            // (returns is_new=false); the gateway's `else` branch
+            // would then increment AGAIN. This pre-seal route
+            // increments exactly once.
+            if let Ok(Some(_)) = self.chunks.try_increment_if_exists(&chunk_id).await {
+                landed.push(ChunkLanded {
+                    id: chunk_id,
+                    ciphertext_len: 0,
+                    was_new: false,
+                });
+                continue;
+            }
+            // Either the chunk didn't exist (Ok(None)) or the
+            // try-increment errored — fall through to the normal
+            // seal + write_chunk path.
 
             let encrypt_started = std::time::Instant::now();
             let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, piece)
@@ -1357,15 +1488,12 @@ impl GatewayOps for InMemoryGateway {
                     GatewayError::Upstream(e.to_string())
                 })?;
                 if is_new {
-                    tracing::debug!(?chunk_id, "gateway write: new chunk landed");
                     chunk_was_new = true;
-                } else {
-                    tracing::debug!(
-                        ?chunk_id,
-                        "gateway write: dedup hit — incrementing refcount"
-                    );
-                    let _ = self.chunks.increment_refcount(&chunk_id).await;
                 }
+                // (B9: dropped per-chunk debug calls from the hot
+                // path. The else-branch comment about ChunkStore's
+                // internal refcount handling is preserved in the
+                // file's git history; it remains true.)
             }
             self.observe_put_phase("chunk_write", chunk_write_started.elapsed());
 
@@ -1380,9 +1508,42 @@ impl GatewayOps for InMemoryGateway {
         // Create composition (sync, fast) — lock released before Raft.
         // Log emission happens after lock release to avoid holding the
         // Mutex across Raft consensus (ADR-032).
+        //
+        // B6 (atomic conditional check): if the request carries an
+        // S3-style conditional, the check + create + bind_name run
+        // in this single critical section so the atomicity contract
+        // (e.g., If-None-Match: * → exactly one writer succeeds) is
+        // race-free against concurrent writers.
         let composition_record_started = std::time::Instant::now();
         let (comp_id, log, emit_params) = {
-            let mut comps = self.compositions.lock().await;
+            let mut comps = self.compositions.lock();
+            // ----- Conditional check (atomic with create+bind below) -----
+            if let (Some(name), Some(cond)) = (req.name.as_deref(), req.conditional.as_ref()) {
+                let existing = comps.lookup_by_name(req.namespace_id, name).map_err(|e| {
+                    tracing::warn!(error = %e, "gateway write: lookup_by_name failed");
+                    GatewayError::Upstream(e.to_string())
+                })?;
+                match (cond, existing) {
+                    (crate::ops::WriteConditional::IfNoneMatch, Some(_)) => {
+                        return Err(GatewayError::PreconditionFailed(format!(
+                            "object \"{name}\" already exists; If-None-Match: * requires it not to"
+                        )));
+                    }
+                    (crate::ops::WriteConditional::IfMatch(_), None) => {
+                        return Err(GatewayError::PreconditionFailed(format!(
+                            "object \"{name}\" does not exist; If-Match requires existing match"
+                        )));
+                    }
+                    (crate::ops::WriteConditional::IfMatch(want), Some(got)) if *want != got => {
+                        return Err(GatewayError::PreconditionFailed(format!(
+                            "object \"{name}\" etag mismatch (have {}, want {})",
+                            got.0, want.0,
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            // ----- Create -----
             let comp_id = comps
                 .create(req.namespace_id, chunk_ids.clone(), bytes_written)
                 .map_err(|e| {
@@ -1399,9 +1560,7 @@ impl GatewayOps for InMemoryGateway {
                         GatewayError::Upstream(e.to_string())
                     }
                 })?;
-            // Bind the name to the new composition_id (S3 PUT URL key).
-            // The conditional check above (or its absence) means the
-            // bind is unconditional here — overwrite-replace semantics.
+            // ----- Bind name (race-free vs the conditional check above) -----
             // The Raft delta below carries the name to followers via
             // the v2 create payload so their hydrators stay consistent.
             if let Some(name) = req.name.as_deref() {
@@ -1424,11 +1583,7 @@ impl GatewayOps for InMemoryGateway {
             let log = comps.log().cloned();
             (comp_id, log, params)
         }; // Lock dropped here — before Raft consensus.
-        tracing::debug!(
-            comp_id = %comp_id.0,
-            shard_id = %emit_params.0.0,
-            "gateway write: composition created (pre-Raft)",
-        );
+        // (B9: dropped "composition created (pre-Raft)" debug.)
 
         // Emit delta to log (async, slow — Raft consensus).
         if let Some(ref log) = log {
@@ -1523,7 +1678,7 @@ impl GatewayOps for InMemoryGateway {
                         shard_id = %sid.0,
                         "gateway write: KeyOutOfRange — rolling back composition",
                     );
-                    let _ = self.compositions.lock().await.delete(comp_id).ok();
+                    let _ = self.compositions.lock().delete(comp_id).ok();
                     return Err(GatewayError::KeyOutOfRange { shard_id: sid });
                 }
                 Err(e) => {
@@ -1534,7 +1689,7 @@ impl GatewayOps for InMemoryGateway {
                         error = %e,
                         "gateway write: emit_chunk_and_delta failed — rolling back composition",
                     );
-                    let _ = self.compositions.lock().await.delete(comp_id).ok();
+                    let _ = self.compositions.lock().delete(comp_id).ok();
                     // ADR-021 / I-WA5: emit a per-tenant backpressure
                     // signal whenever the data path returns a retriable
                     // error. Subscribers (workloads with active workflow
@@ -1589,7 +1744,7 @@ impl GatewayOps for InMemoryGateway {
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
         // Filter by tenant_id to prevent cross-tenant composition ID leak.
-        let compositions = self.compositions.lock().await;
+        let compositions = self.compositions.lock();
         let entries: Vec<(kiseki_common::ids::CompositionId, u64)> = compositions
             .list_by_namespace(namespace_id)
             .map_err(|e| {
@@ -1678,14 +1833,7 @@ impl GatewayOps for InMemoryGateway {
         self.ensure_namespace_exists(tenant_id, namespace_id).await
     }
 
-    #[tracing::instrument(
-        skip(self),
-        fields(
-            tenant_id = %tenant_id.0,
-            namespace_id = %_namespace_id.0,
-            composition_id = %composition_id.0,
-        ),
-    )]
+    // tracing::instrument removed from delete (B3 — same rationale).
     async fn delete(
         &self,
         tenant_id: kiseki_common::ids::OrgId,
@@ -1708,8 +1856,16 @@ impl GatewayOps for InMemoryGateway {
         // us hold across the emit await; release before chunk-
         // refcount Raft work since that's a separate transaction.
         tracing::debug!("gateway delete: entry");
-        let mut compositions = self.compositions.lock().await;
+        // parking_lot::Mutex is non-async, so we extract everything
+        // we need from the composition under a brief lock, drop the
+        // guard, then run the emit (async). Re-acquire the lock for
+        // the local delete after the emit commits. The window between
+        // emit-commit and local-delete is small; a concurrent reader
+        // may briefly see the composition while the cluster-wide
+        // tombstone has already landed — acceptable per S3 / POSIX
+        // delete semantics (no atomicity-with-readers contract).
         let (shard_id, namespace_id, log) = {
+            let compositions = self.compositions.lock();
             let comp = compositions.get(composition_id).map_err(|e| {
                 tracing::warn!(error = %e, "gateway delete: compositions.get failed");
                 GatewayError::Upstream(e.to_string())
@@ -1727,6 +1883,7 @@ impl GatewayOps for InMemoryGateway {
                 comp.namespace_id,
                 compositions.log().cloned(),
             )
+            // guard drops here — emit runs off-lock
         };
 
         // Emit the Delete tombstone if a log is attached. If the emit
@@ -1775,11 +1932,14 @@ impl GatewayOps for InMemoryGateway {
         }
 
         // Local delete only after the cluster has the tombstone.
-        let delete_result = compositions.delete(composition_id).map_err(|e| {
-            tracing::warn!(error = %e, "gateway delete: local compositions.delete failed");
-            GatewayError::Upstream(e.to_string())
-        })?;
-        drop(compositions); // release lock before chunk-refcount Raft work below
+        // Re-acquire the parking_lot guard briefly for the delete.
+        let delete_result = {
+            let mut compositions = self.compositions.lock();
+            compositions.delete(composition_id).map_err(|e| {
+                tracing::warn!(error = %e, "gateway delete: local compositions.delete failed");
+                GatewayError::Upstream(e.to_string())
+            })?
+        }; // guard drops here — chunk-refcount Raft work runs off-lock
 
         // Decrement chunk refcounts only when actually removed (not
         // a versioned delete marker). I-C2: GC when refcount reaches 0.
@@ -1834,7 +1994,7 @@ impl GatewayOps for InMemoryGateway {
         // this a misrouted CompleteMultipartUpload could let one
         // tenant rebind another tenant's composition under its own
         // bucket — defense in depth even if S3 routing is correct.
-        let mut comps = self.compositions.lock().await;
+        let mut comps = self.compositions.lock();
         if let Ok(comp) = comps.get(composition_id) {
             if comp.tenant_id != tenant_id {
                 tracing::warn!(
@@ -1862,7 +2022,7 @@ impl GatewayOps for InMemoryGateway {
         namespace_id: kiseki_common::ids::NamespaceId,
         name: &str,
     ) -> Result<Option<kiseki_common::ids::CompositionId>, GatewayError> {
-        let comps = self.compositions.lock().await;
+        let comps = self.compositions.lock();
         let id = comps.lookup_by_name(namespace_id, name).map_err(|e| {
             tracing::warn!(error = %e, "gateway lookup_object_by_name: lookup_by_name failed");
             GatewayError::Upstream(e.to_string())
@@ -1919,7 +2079,7 @@ impl GatewayOps for InMemoryGateway {
         namespace_id: kiseki_common::ids::NamespaceId,
         prefix: Option<&str>,
     ) -> Result<Vec<(String, kiseki_common::ids::CompositionId, u64)>, GatewayError> {
-        let comps = self.compositions.lock().await;
+        let comps = self.compositions.lock();
         let pairs = comps.list_names(namespace_id, prefix).map_err(|e| {
             tracing::warn!(error = %e, "gateway list_named: list_names failed");
             GatewayError::Upstream(e.to_string())
@@ -2277,7 +2437,7 @@ mod chunking_tests {
             .await
             .expect("write must succeed");
 
-        let comps = gw.compositions.lock().await;
+        let comps = gw.compositions.lock();
         let comp = comps.get(resp.composition_id).expect("composition exists");
         assert!(
             comp.chunks.len() >= 2,

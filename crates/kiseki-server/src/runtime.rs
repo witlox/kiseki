@@ -584,6 +584,9 @@ pub async fn run_main(
     // both the chunk-store section below and the composition-store
     // section further down can write into the same scope.
     let mut comp_flusher_for_fsync: Option<kiseki_composition::persistent::RedbFlusher> = None;
+    let mut comp_write_behind_flusher_for_fsync: Option<
+        kiseki_composition::persistent::WriteBehindFlusher,
+    > = None;
     let mut chunk_device_for_fsync: Option<std::sync::Arc<dyn kiseki_block::DeviceBackend>> = None;
 
     // Local chunk store: persistent (raw block device) if KISEKI_DATA_DIR
@@ -904,28 +907,36 @@ pub async fn run_main(
                 // the periodic task.
                 comp_flusher_for_fsync = Some(flusher.clone());
                 let interval_ms = flush_interval_ms.unwrap_or(100);
-                tokio::spawn(async move {
-                    let mut tick =
-                        tokio::time::interval(std::time::Duration::from_millis(interval_ms));
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    loop {
-                        tick.tick().await;
-                        let f = flusher.clone();
-                        let res = tokio::task::spawn_blocking(move || f.flush())
-                            .await
-                            .ok()
-                            .and_then(Result::ok);
-                        if res.is_none() {
-                            tracing::warn!(
-                                "composition redb group-commit flush failed; retry next tick",
-                            );
-                        }
-                    }
-                });
+                // ADR-040 rev 3: write-behind queue. The 2026-05-05
+                // perf test pinned the per-write redb txn (not just
+                // its fsync) as the bottleneck, so eventual
+                // durability alone wasn't enough — the queue moves
+                // the txn off the gateway hot path entirely. Knobs:
+                // QUEUE_MAX (4096 default) is the soft-cap before
+                // writers fall back to inline; FLUSH_INTERVAL_MS is
+                // the drainer cadence (above); MAX_BATCH (1024) is
+                // per-flush mutation cap.
+                let max_queue = std::env::var("KISEKI_COMPOSITION_QUEUE_MAX")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4096);
+                let max_batch = std::env::var("KISEKI_COMPOSITION_BATCH_MAX")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1024);
+                let drainer = store.enable_write_behind(
+                    max_queue,
+                    std::time::Duration::from_millis(interval_ms),
+                    max_batch,
+                );
+                comp_write_behind_flusher_for_fsync = Some(drainer.flusher());
+                tokio::spawn(drainer.run());
                 tracing::info!(
                     path = %path.display(),
                     interval_ms,
-                    "composition store: persistent (redb-backed, group commit)",
+                    max_queue,
+                    max_batch,
+                    "composition store: persistent (redb-backed, ADR-040 rev-3 write-behind)",
                 );
             } else {
                 tracing::info!(
@@ -1065,6 +1076,21 @@ pub async fn run_main(
     // backing store. Without these, callers that explicitly issue
     // `fsync(2)` would silently get the periodic-task SLA (≤100 ms
     // window) instead of POSIX's "data is on disk now" guarantee.
+    if let Some(wb_flusher) = comp_write_behind_flusher_for_fsync {
+        // ADR-040 rev-3: drain the overlay first so any pending
+        // overlay entries get into redb before we issue the
+        // Immediate-durability commit that follows. Without this,
+        // FUSE / NFS `fsync(2)` would silently miss any in-flight
+        // overlay writes.
+        gw.register_fsync_hook(std::sync::Arc::new(move || {
+            wb_flusher.flush_blocking().map_err(|e| {
+                kiseki_gateway::error::GatewayError::Upstream(format!(
+                    "composition write-behind drain: {e}"
+                ))
+            })
+        }));
+        tracing::info!("fsync hook: composition write-behind drainer registered");
+    }
     if let Some(flusher) = comp_flusher_for_fsync {
         gw.register_fsync_hook(std::sync::Arc::new(move || {
             flusher.flush().map_err(|e| {
@@ -1446,10 +1472,11 @@ pub async fn run_main(
                         .redb_size_bytes
                         .set(i64::try_from(meta.len()).unwrap_or(i64::MAX));
                 }
-                let store = count_compositions.lock().await;
+                let store = count_compositions.lock();
                 if let Ok(c) = store.storage().count() {
                     size_metrics.count.set(i64::try_from(c).unwrap_or(i64::MAX));
                 }
+                drop(store);
             }
         });
     }

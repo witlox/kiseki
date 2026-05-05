@@ -67,6 +67,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
+parking_lot = { workspace = true }
 prometheus = { workspace = true }
 postcard = { workspace = true }
 redb = { workspace = true }

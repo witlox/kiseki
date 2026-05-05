@@ -29,7 +29,7 @@ pub struct UiState {
     /// leader endpoint surfaces the hydrator's halt flag from here so
     /// load balancers can route around a halted node.
     pub compositions:
-        Option<Arc<tokio::sync::Mutex<kiseki_composition::composition::CompositionStore>>>,
+        Option<Arc<parking_lot::Mutex<kiseki_composition::composition::CompositionStore>>>,
     /// Local chunk store — `/admin/chunk/{id}` reports per-node fragment
     /// presence by calling `list_fragments` on this handle. Operators
     /// use the endpoint to debug placement / GC / under-replication.
@@ -432,7 +432,7 @@ async fn shard_leader(
     // halt flag so load balancers and clients can route around a node
     // whose composition state can no longer catch up to the cluster.
     let composition_halted = if let Some(ref comps) = state.compositions {
-        comps.lock().await.storage().halted().unwrap_or(false)
+        comps.lock().storage().halted().unwrap_or(false)
     } else {
         false
     };
@@ -551,7 +551,7 @@ async fn admin_inspect_composition(
             axum::Json(serde_json::json!({"error": "composition store not initialized"})),
         );
     };
-    let guard = store.lock().await;
+    let guard = store.lock();
     match guard.storage().get(comp_id) {
         Ok(Some(comp)) => (
             axum::http::StatusCode::OK,

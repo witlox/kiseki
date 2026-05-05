@@ -489,7 +489,7 @@ pub async fn run_metrics_server(
     log_store: Option<std::sync::Arc<dyn kiseki_log::LogOps + Send + Sync>>,
     node_info: crate::web::api::NodeInfo,
     compositions: Option<
-        std::sync::Arc<tokio::sync::Mutex<kiseki_composition::composition::CompositionStore>>,
+        std::sync::Arc<parking_lot::Mutex<kiseki_composition::composition::CompositionStore>>,
     >,
     local_chunk_store: Option<std::sync::Arc<dyn kiseki_chunk::AsyncChunkOps>>,
 ) -> std::io::Result<()> {

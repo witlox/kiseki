@@ -27,6 +27,7 @@ uuid = { workspace = true }
 redb = { workspace = true }
 postcard = { workspace = true }
 lru = { workspace = true }
+parking_lot = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 # §D10 observability — exposes hydrator + persistent-store counters /
 # gauges / histograms via the same `prometheus::Registry` the rest of
