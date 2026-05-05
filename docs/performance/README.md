@@ -100,6 +100,95 @@ Hot stacks in the post-fix S3 PUT path (server side):
 
 These are the candidates for the next round of optimization.
 
+## ADR-042 native gateway data service — local matrix (2026-05-05)
+
+The Phase 7 work added `--protocol native` to `kiseki-profile`. This
+section records the first end-to-end measurement on the
+single-node plaintext harness and compares it to the in-process
+floor (Phase 8 of `specs/implementation/adr-042-native-gateway.md`).
+
+### Configuration
+
+| | |
+|---|---|
+| Machine | dev workstation (Linux, x86_64, 16 cores) — same as the May matrix |
+| Object size | 64 KiB |
+| Concurrency | 16 |
+| Duration | 10 s |
+| Warmup | 64 objects pre-created for get-heavy |
+| Cluster | single-node `kiseki-server` (plaintext data port; SanInterceptor falls through to the synthetic "dev" tenant) |
+
+### Throughput
+
+| Protocol | put-heavy | get-heavy |
+|---|---:|---:|
+| **InProcess (floor)** | 216 212 op/s · 13.5 GiB/s | 218 660 op/s · 13.7 GiB/s |
+| **S3 HTTP** | 8 260 op/s · 516 MiB/s | 48 862 op/s · 3.05 GiB/s |
+| **Native gRPC (ADR-042)** | 7 373 op/s · 461 MiB/s | **12 293 op/s · 768 MiB/s** |
+
+### A-NG11 gates
+
+A-NG11 commits to **≥80 k op/s GET, ≥56 k op/s PUT per node** on the
+profile harness. The above run shows:
+
+- GET: 12 293 op/s — **15.4 % of the gate** (gate not cleared)
+- PUT: 7 373 op/s — **13.2 % of the gate** (gate not cleared)
+
+ADR-042's status remains **Proposed** — A-NG11 is not yet
+satisfied. The wire shape, auth boundary, and feature surface are
+in place (Phases 2-6), but the gRPC tax on this single-host config
+is far higher than the targets allow. Specifically:
+
+- Native GET runs at **25 % of S3 HTTP GET** on the same workload.
+  The gRPC tax should be lower than HTTP's tax, not higher — there
+  is a real bottleneck on the get path.
+- Native PUT runs at **89 % of S3 HTTP PUT** — close to parity, so
+  the issue is concentrated on the read side.
+
+### Where the GET tax lives (next-investigation candidates)
+
+Without a fresh flamegraph the analysis is informed-guess level —
+the @perf @smoke BDD scenario in `native-gateway.feature` will
+land the rigorous attribution once it has a step driver. Concrete
+suspects from code inspection:
+
+1. **Per-call codec setup**: every call clones the channel and
+   constructs a fresh `GatewayDataServiceClient` with
+   `max_decoding_message_size(64 MiB)`. The codec config touches
+   tonic-internal fields per call; a process-wide pre-built client
+   would eliminate that. Estimated cost: 1-3 µs / call.
+2. **UUID `parse_str` per request**: `OrgId` /
+   `NamespaceId` / `CompositionId` arrive as proto `string value`
+   fields and the handler runs `uuid::Uuid::parse_str` three times
+   per call. The wire shape is fixed (proto3 contract) but the
+   handler could intern parsed UUIDs in a small per-stream cache
+   if the same tenant/namespace dominates a session. Estimated
+   cost: ~150 ns / call — small per call but measurable at >10 k
+   op/s.
+3. **HTTP/2 vs HTTP/1.1 framing**: tonic's HTTP/2 with
+   `initial_stream_window_size = 16 MiB` should be FASTER than
+   HTTP/1.1 keepalive, not slower. The 4× regression vs S3 hints
+   at something specific to tonic's per-call work — possibly
+   HEADERS frame compression overhead under high message rate.
+4. **InterceptedService dispatch**: every native RPC pays
+   `SanInterceptor::intercept` which reads `TlsConnectInfo` and
+   stashes a `CanonicalSanUri` clone (the OnceLock cache landed in
+   `5c9ef9b`, but the `req.extensions_mut().insert(...)` itself
+   takes a TypeMap insert per call).
+
+### Targeting Phase 9 (perf optimization slice)
+
+The path from 12 k → 80 k op/s GET is concrete:
+- Land a flamegraph capture against the harness server while the
+  native driver is in steady-state (KISEKI_PPROF_OUT supports this
+  on `--features pprof` builds).
+- Audit the four candidates above against the flame.
+- Iterate per-candidate, re-running the matrix.
+
+Until that work lands, the wire-shape and security surface of
+ADR-042 are validated (Phases 2-6 + the Phase 7 driver) but the
+perf gate (A-NG11) blocks the ADR `Accepted` flip.
+
 ## GCP transport profile (2026-05-03)
 
 ### Cluster

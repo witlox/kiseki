@@ -33,8 +33,8 @@ Adversary findings cleared:
 | 4 | Wire into `kiseki-server::runtime::run_data_path` | **Done (`9e38e59`)** | implementer |
 | 5 | `kiseki_client::native::NativeClient` + `TopologyCache` + `StreamSlot` RAII | **Done (`ffe76bd`)** | implementer |
 | 6 | BDD steps for `native-gateway.feature` against the cluster harness | **Partial — 15/38 green; tracking notes below** | implementer |
-| 7 | `kiseki-profile --protocol native` driver | Pending | implementer |
-| 8 | Re-measure against A-NG11 targets (≥80 k GET, ≥56 k PUT) | Pending | implementer |
+| 7 | `kiseki-profile --protocol native` driver | **Done (`5c9ef9b`)** | implementer |
+| 8 | Re-measure against A-NG11 targets (≥80 k GET, ≥56 k PUT) | **Measured — gate NOT cleared. See `docs/performance/README.md` "ADR-042 native gateway" section.** | implementer |
 
 ---
 
@@ -275,8 +275,8 @@ A-NG11 commits to ≥80 k op/s GET / ≥56 k op/s PUT per node. The 2026-05-05 i
 
 ### Definition of done
 
-- A perf report appended to `docs/performance/README.md` showing the native column.
-- ADR-042's status field flipped to `Accepted` (with a "perf-validated YYYY-MM-DD" note).
+- A perf report appended to `docs/performance/README.md` showing the native column. **DONE (`docs/performance/README.md` "ADR-042 native gateway data service" section).**
+- ADR-042's status field flipped to `Accepted` (with a "perf-validated YYYY-MM-DD" note). **DEFERRED — A-NG11 gate not cleared on first measurement (12 293 op/s GET vs ≥80 000 target; 7 373 op/s PUT vs ≥56 000 target). Concrete next-step candidates documented in the perf report. ADR-042 stays `Proposed` until the perf gap closes.**
 - The 4 LOW gate-1 findings (F-L1..F-L4) addressed during phase 2/5 review or marked as acceptable post-hoc.
 
 ---
