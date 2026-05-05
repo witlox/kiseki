@@ -18,11 +18,15 @@ use crate::epoch::KeyManagerOps;
 use crate::error::KeyManagerError;
 
 /// gRPC handler wrapping a `KeyManagerOps` implementation.
-pub struct KeyManagerGrpc<T: KeyManagerOps> {
+///
+/// `T: ?Sized` so callers can pass `Arc<dyn KeyManagerOps>` (the
+/// runtime swaps between an `InstrumentedKeyManager` wrapper and
+/// the bare `PersistentKeyStore` based on `KISEKI_OBSERVABILITY`).
+pub struct KeyManagerGrpc<T: KeyManagerOps + ?Sized> {
     ops: Arc<T>,
 }
 
-impl<T: KeyManagerOps> KeyManagerGrpc<T> {
+impl<T: KeyManagerOps + ?Sized> KeyManagerGrpc<T> {
     /// Create a new gRPC handler.
     #[must_use]
     pub fn new(ops: Arc<T>) -> Self {
@@ -45,7 +49,7 @@ fn to_proto_epoch(epoch: DomainKeyEpoch) -> kiseki_proto::v1::KeyEpoch {
 }
 
 #[tonic::async_trait]
-impl<T: KeyManagerOps + Send + Sync + 'static> KeyManagerService for KeyManagerGrpc<T> {
+impl<T: KeyManagerOps + Send + Sync + ?Sized + 'static> KeyManagerService for KeyManagerGrpc<T> {
     async fn fetch_master_key(
         &self,
         request: Request<FetchMasterKeyRequest>,

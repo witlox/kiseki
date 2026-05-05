@@ -107,6 +107,50 @@ pub struct KisekiMetrics {
     /// `RaftRpcListener` via `with_metrics(...)`.
     pub raft_transport: std::sync::Arc<kiseki_raft::transport_metrics::RaftTransportMetrics>,
 
+    // --- Control-plane Raft (ADR-033 §4) ---
+    /// 6 metrics covering control-plane submit count + duration,
+    /// apply count, apply-hook duration, namespace gauge, and
+    /// leader-forwarded admin RPCs. Wired into
+    /// `OpenRaftControlStore` and the storage-admin forwarding
+    /// path at runtime construction.
+    pub cluster_control: std::sync::Arc<crate::cluster_control::ClusterControlMetrics>,
+
+    // --- Log context (ADR-032) ---
+    /// 9 metrics: per-shard append/read/compaction count + duration
+    /// histograms, watermark advance count, truncate boundary
+    /// gauge, total deltas removed by compaction. Wired into
+    /// `RaftShardStore` / `MemShardStore` / `PersistentShardStore`
+    /// via `with_metrics(...)` at runtime construction.
+    pub log: std::sync::Arc<kiseki_log::LogMetrics>,
+
+    // --- Key manager (security-critical) ---
+    /// 5 metrics: rotation count, current epoch gauge, epoch count
+    /// gauge, fetch duration histogram, migration-complete count.
+    /// Wired into the production key store via
+    /// `InstrumentedKeyManager` at runtime construction.
+    pub keymanager: std::sync::Arc<kiseki_keymanager::KeyManagerMetrics>,
+
+    // --- Control plane (ADR-027 + ADR-033) ---
+    /// 5 metrics: tenant ops + namespace creates + active gauge,
+    /// ratio-floor evaluations, alias counter. Owned by the
+    /// control crate; consumers (`storage_admin` handlers, ratio
+    /// floor evaluator) record directly.
+    pub control: std::sync::Arc<kiseki_control::metrics::ControlMetrics>,
+
+    // --- View context (NFS materialization) ---
+    /// 5 metrics: versions added/deleted, objects + total versions
+    /// gauges, per-shard delta poll counter. Owned by the view
+    /// crate; the runtime hands the `Arc` to the `StreamProcessor`
+    /// poll loop and the version-store mutators.
+    pub view: std::sync::Arc<kiseki_view::metrics::ViewMetrics>,
+
+    // --- Block storage backend ---
+    /// 6 metrics: per-device read/write IOP count + byte count +
+    /// latency histograms. Wired into `DeviceBackend` impls (when
+    /// they record on each `read`/`write` call) — concrete-store
+    /// instrumentation lands incrementally.
+    pub block: std::sync::Arc<kiseki_block::BlockMetrics>,
+
     // --- Gateway retry budget (ADR-040 §D7 + §D10 — F-4 closure) ---
     /// Read-path retry counters. Wired into `InMemoryGateway` via
     /// `with_retry_metrics(...)` at runtime construction.
@@ -328,6 +372,33 @@ impl KisekiMetrics {
                 .expect("raft transport metrics register"),
         );
 
+        let cluster_control = std::sync::Arc::new(
+            crate::cluster_control::ClusterControlMetrics::register(&registry)
+                .expect("cluster-control metrics register"),
+        );
+
+        let log = std::sync::Arc::new(
+            kiseki_log::LogMetrics::register(&registry).expect("log metrics register"),
+        );
+
+        let keymanager = std::sync::Arc::new(
+            kiseki_keymanager::KeyManagerMetrics::register(&registry)
+                .expect("keymanager metrics register"),
+        );
+
+        let control = std::sync::Arc::new(
+            kiseki_control::metrics::ControlMetrics::register(&registry)
+                .expect("control metrics register"),
+        );
+
+        let view = std::sync::Arc::new(
+            kiseki_view::metrics::ViewMetrics::register(&registry).expect("view metrics register"),
+        );
+
+        let block = std::sync::Arc::new(
+            kiseki_block::BlockMetrics::register(&registry).expect("block metrics register"),
+        );
+
         let gateway_retry = std::sync::Arc::new(
             kiseki_gateway::metrics::GatewayRetryMetrics::register(&registry)
                 .expect("gateway retry metrics register"),
@@ -372,6 +443,12 @@ impl KisekiMetrics {
             crypto_shred_total,
             fabric,
             raft_transport,
+            cluster_control,
+            log,
+            keymanager,
+            control,
+            view,
+            block,
             gateway_retry,
             composition,
             storage_admin_calls_total,

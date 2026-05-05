@@ -113,6 +113,7 @@ impl WorkflowTable {
     }
 
     /// Declare a new workflow.
+    #[tracing::instrument(skip(self, profile), fields(workflow_ref = ?workflow_ref, initial_phase = ?initial_phase))]
     pub fn declare(
         &mut self,
         workflow_ref: WorkflowRef,
@@ -138,6 +139,7 @@ impl WorkflowTable {
     }
 
     /// End a workflow (remove from table).
+    #[tracing::instrument(skip(self), fields(workflow_ref = ?workflow_ref))]
     pub fn end(&mut self, workflow_ref: &WorkflowRef) -> bool {
         self.entries.remove(workflow_ref).is_some()
     }

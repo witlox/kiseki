@@ -69,8 +69,8 @@ fn single_node_store_with_shard(rt: &tokio::runtime::Runtime) -> (RaftShardStore
         NodeId(1),
         ShardConfig::default(),
         Some(&format!("127.0.0.1:{port}")),
-        true, // bootstrap = seed
     );
+    store.initialize_shard(shard_id).expect("initialize");
     // Wait for leader election.
     rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
     (store, shard_id)
@@ -125,7 +125,6 @@ fn merge_shards_does_not_return_shard_not_found_for_existing_shards() {
         NodeId(1),
         ShardConfig::default(),
         Some(&format!("127.0.0.1:{port_a}")),
-        true,
     );
     store.create_shard(
         shard_b,
@@ -133,8 +132,9 @@ fn merge_shards_does_not_return_shard_not_found_for_existing_shards() {
         NodeId(1),
         ShardConfig::default(),
         Some(&format!("127.0.0.1:{port_b}")),
-        false,
     );
+    store.initialize_shard(shard_a).expect("initialize a");
+    store.initialize_shard(shard_b).expect("initialize b");
     rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
 
     let result = LogOps::merge_shards(&store, shard_a, shard_b);
@@ -240,7 +240,7 @@ fn adr_033_default_for_3_node_cluster_yields_at_least_3_shards() {
 /// `LogOps::split_shard`, deltas in the upper half of the original
 /// range MUST appear in the new shard's log. Pre-redistribution
 /// (commit f60d5fc and earlier) the new shard started empty and
-/// reads against upper-half keys returned NotFound regardless of
+/// reads against upper-half keys returned `NotFound` regardless of
 /// what the source had previously committed.
 ///
 /// Test shape:
@@ -379,8 +379,8 @@ fn single_node_with_shard_and_addr(rt: &tokio::runtime::Runtime) -> (RaftShardSt
         NodeId(1),
         ShardConfig::default(),
         Some(&format!("127.0.0.1:{port}")),
-        true,
     );
+    store.initialize_shard(shard_id).expect("initialize");
     rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
     (store, shard_id)
 }

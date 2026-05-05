@@ -83,6 +83,34 @@ pub struct StorageAdminGrpc {
     /// (ADR-025 W5). `None` = those RPCs return
     /// `FailedPrecondition`.
     log_store: Option<Arc<dyn LogOps + Send + Sync>>,
+    /// Control-plane Raft store for cluster-wide topology
+    /// consensus (ADR-033 §4). When `Some`, `SplitShard` /
+    /// `MergeShards` route through `RecordSplit` / `RecordMerge`
+    /// commands so every node creates the new per-shard Raft
+    /// group locally on apply. `None` falls back to the legacy
+    /// direct-`LogOps` path (single-node only).
+    cluster_control: Option<Arc<crate::cluster_control::OpenRaftControlStore>>,
+    /// Concrete `RaftShardStore` handle for `initialize_shard`
+    /// after a control-plane `RecordSplit` commits. Required when
+    /// `cluster_control` is wired — the trait `LogOps` doesn't
+    /// surface initialization, only the concrete type does.
+    raft_store: Option<Arc<kiseki_log::RaftShardStore>>,
+    /// Bootstrap namespace id — the namespace under which the
+    /// bootstrap shard sits in the control-plane state machine.
+    /// Used to address `RecordSplit` / `RecordMerge` commands at
+    /// the right namespace map. Defaults to `Uuid::nil()` when
+    /// running with no control-plane wiring.
+    bootstrap_namespace: String,
+    /// Node id → data-port `host:port` map for forwarding admin
+    /// RPCs to the control-plane leader. Same shape as
+    /// `cfg.fabric_peers` — the data-path gRPC port is where
+    /// `StorageAdminService` is mounted, so the same address works.
+    /// Empty vec disables forwarding (single-node).
+    admin_peers: Vec<(u64, String)>,
+    /// Control-plane metrics — used by the forwarding paths so the
+    /// `kiseki_cluster_control_leader_forwarded_total` counter ticks
+    /// on every non-leader admin RPC.
+    cluster_control_metrics: Option<Arc<crate::cluster_control::ClusterControlMetrics>>,
     /// Event broker channels for `DeviceHealth` / `IOStats`
     /// (ADR-025 W7). `None` = both streaming RPCs return
     /// `FailedPrecondition`.
@@ -127,6 +155,11 @@ impl StorageAdminGrpc {
             scrub: None,
             pool_mutations: None,
             log_store: None,
+            cluster_control: None,
+            raft_store: None,
+            bootstrap_namespace: uuid::Uuid::nil().to_string(),
+            admin_peers: Vec::new(),
+            cluster_control_metrics: None,
             event_streams: None,
             calls_total: None,
         }
@@ -220,6 +253,30 @@ impl StorageAdminGrpc {
     #[must_use]
     pub fn with_log_store(mut self, log: Arc<dyn LogOps + Send + Sync>) -> Self {
         self.log_store = Some(log);
+        self
+    }
+
+    /// Builder: attach the control-plane Raft store (ADR-033 §4).
+    /// When wired, `SplitShard` / `MergeShards` go through the
+    /// control-plane consensus layer so every node creates the
+    /// new per-shard Raft group locally on apply. The
+    /// `bootstrap_namespace` parameter selects which namespace
+    /// the bootstrap shard sits in (`Uuid::from_u128(1)` matches
+    /// what `runtime::run_main` seeds).
+    #[must_use]
+    pub fn with_cluster_control(
+        mut self,
+        ctrl: Arc<crate::cluster_control::OpenRaftControlStore>,
+        raft_store: Arc<kiseki_log::RaftShardStore>,
+        bootstrap_namespace: String,
+        admin_peers: Vec<(u64, String)>,
+        metrics: Arc<crate::cluster_control::ClusterControlMetrics>,
+    ) -> Self {
+        self.cluster_control = Some(ctrl);
+        self.raft_store = Some(raft_store);
+        self.bootstrap_namespace = bootstrap_namespace;
+        self.admin_peers = admin_peers;
+        self.cluster_control_metrics = Some(metrics);
         self
     }
 
@@ -1069,11 +1126,20 @@ impl StorageAdminService for StorageAdminGrpc {
         .await
     }
 
+    #[tracing::instrument(skip(self, req), fields(shard_id = %req.get_ref().shard_id, self_node_id = self.self_node_id))]
     async fn split_shard(
         &self,
         req: Request<pb::SplitShardRequest>,
     ) -> Result<Response<pb::SplitShardResponse>, Status> {
         self.with_obs("StorageAdminService.SplitShard", || async move {
+            // ADR-033 §4: SplitShard mutates topology via the
+            // control-plane Raft group. Only the leader of that
+            // group can `client_write`, so non-leader admin calls
+            // forward the entire RPC to the leader's data port
+            // (which hosts the same StorageAdminService).
+            if let Some(forwarded) = self.forward_split_to_leader(&req).await? {
+                return Ok(forwarded);
+            }
             let log = self.log_store.as_ref().ok_or_else(|| {
                 Status::failed_precondition(
                     "StorageAdminService.SplitShard: log_store dep not wired",
@@ -1085,22 +1151,95 @@ impl StorageAdminService for StorageAdminGrpc {
             }
             let shard = parse_shard_id(&r.shard_id)?;
             let new_shard = ShardId(uuid::Uuid::new_v4());
-            // Delegate to the trait. node_id 0 here is fine for
-            // single-node mode; multi-node clusters land split
-            // ownership via the cluster control shard's Raft.
-            let _returned = log
-                .split_shard(shard, new_shard, kiseki_common::ids::NodeId(0))
+
+            // ADR-033 §4 path: read source range, submit RecordSplit
+            // through control-plane consensus so every node's apply
+            // hook registers the new shard locally, then explicitly
+            // initialize the new shard's membership, then drive
+            // source-side rebalancing.
+            //
+            // Single-node setups (in-memory / persistent stores) skip
+            // the control-plane step — there's no cluster to
+            // coordinate across. The legacy `LogOps::split_shard` is
+            // self-contained for those.
+            let source_info = log.shard_health(shard).await.map_err(|e| {
+                if matches!(e, kiseki_log::error::LogError::ShardNotFound(_)) {
+                    Status::not_found(format!("shard {} not found", r.shard_id))
+                } else {
+                    Status::internal(format!("split: read source: {e}"))
+                }
+            })?;
+            let mut midpoint = [0u8; 32];
+            for (i, mid) in midpoint.iter_mut().enumerate() {
+                *mid = source_info.range_start[i] / 2 + source_info.range_end[i] / 2;
+            }
+
+            if let Some(ctrl) = self.cluster_control.as_ref() {
+                // 1. Replicate the topology mutation. Apply hook on
+                //    every node registers the new shard's per-shard
+                //    Raft group with its multiplexed listener.
+                let cmd = crate::cluster_control::ControlCommand::RecordSplit {
+                    namespace_id: self.bootstrap_namespace.clone(),
+                    source_shard_id: shard,
+                    new_shard_id: new_shard,
+                    midpoint,
+                    new_leader: kiseki_common::ids::NodeId(self.self_node_id.max(1)),
+                };
+                submit_with_leader_retry(ctrl.as_ref(), cmd, "split").await?;
+
+                // 2. Initialize membership on the new shard's Raft
+                //    group (this node is the new leader). Retry
+                //    briefly to absorb follower-apply lag — followers
+                //    apply RecordSplit ~ms after commit, but the
+                //    initialize() vote sweep can still race.
+                let raft_store = self.raft_store.as_ref().ok_or_else(|| {
+                    Status::failed_precondition(
+                        "SplitShard: raft_store dep not wired alongside cluster_control",
+                    )
+                })?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let mut attempt = 0u32;
+                loop {
+                    match raft_store.initialize_shard_async(new_shard).await {
+                        Ok(()) => break,
+                        Err(e) if std::time::Instant::now() < deadline => {
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            tracing::debug!(
+                                attempt,
+                                error = %e,
+                                "SplitShard: initialize_shard retry",
+                            );
+                        }
+                        Err(e) => {
+                            return Err(Status::internal(format!(
+                                "split: initialize new shard: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // 3. Drive source-side rebalancing through the source's
+            //    existing per-shard Raft group. Tightens range,
+            //    redistributes upper-half deltas, resets state.
+            //    `LogOps::split_shard` short-circuits the create-
+            //    new-shard step when `has_shard(new_shard)` is true
+            //    — which it is now, post-RecordSplit.
+            let _ = log
+                .split_shard(
+                    shard,
+                    new_shard,
+                    kiseki_common::ids::NodeId(self.self_node_id.max(1)),
+                )
                 .map_err(|e| {
                     if matches!(e, kiseki_log::error::LogError::ShardNotFound(_)) {
                         Status::not_found(format!("shard {} not found", r.shard_id))
                     } else {
-                        Status::internal(format!("split: {e}"))
+                        Status::internal(format!("split: source rebalance: {e}"))
                     }
                 })?;
-            // Proto convention: original shard becomes "left" (the
-            // lower half of the key range after the split); new
-            // shard is "right". `LogStore::split_shard` returns the
-            // new shard id; we wire it as `right_shard_id`.
+
             Ok(Response::new(pb::SplitShardResponse {
                 left_shard_id: shard.0.to_string(),
                 right_shard_id: new_shard.0.to_string(),
@@ -1110,11 +1249,15 @@ impl StorageAdminService for StorageAdminGrpc {
         .await
     }
 
+    #[tracing::instrument(skip(self, req), fields(left = %req.get_ref().left_shard_id, right = %req.get_ref().right_shard_id, self_node_id = self.self_node_id))]
     async fn merge_shards(
         &self,
         req: Request<pb::MergeShardsRequest>,
     ) -> Result<Response<pb::MergeShardsResponse>, Status> {
         self.with_obs("StorageAdminService.MergeShards", || async move {
+            if let Some(forwarded) = self.forward_merge_to_leader(&req).await? {
+                return Ok(forwarded);
+            }
             let log = self.log_store.as_ref().ok_or_else(|| {
                 Status::failed_precondition(
                     "StorageAdminService.MergeShards: log_store dep not wired",
@@ -1133,8 +1276,33 @@ impl StorageAdminService for StorageAdminGrpc {
                     "left and right shards must differ",
                 ));
             }
-            // Convention: merge "right into left" → left becomes the
-            // surviving target, right is decommissioned.
+
+            // ADR-033 §4: replicate the merge mutation through the
+            // control-plane group so every node's apply hook
+            // observes the merge and the namespace map version
+            // bumps cluster-wide. The source-side bookkeeping
+            // (range expansion + retirement marker) still flows
+            // through the source's per-shard Raft below.
+            if let Some(ctrl) = self.cluster_control.as_ref() {
+                let l_info = log
+                    .shard_health(left)
+                    .await
+                    .map_err(|e| Status::internal(format!("merge: read left: {e}")))?;
+                let r_info = log
+                    .shard_health(right)
+                    .await
+                    .map_err(|e| Status::internal(format!("merge: read right: {e}")))?;
+                let new_range_start = l_info.range_start.min(r_info.range_start);
+                let new_range_end = l_info.range_end.max(r_info.range_end);
+                let cmd = crate::cluster_control::ControlCommand::RecordMerge {
+                    namespace_id: self.bootstrap_namespace.clone(),
+                    surviving_shard_id: left,
+                    retired_shard_id: right,
+                    new_range_start,
+                    new_range_end,
+                };
+                submit_with_leader_retry(ctrl.as_ref(), cmd, "merge").await?;
+            }
             log.merge_shards(left, right).map_err(|e| {
                 if matches!(e, kiseki_log::error::LogError::ShardNotFound(_)) {
                     Status::not_found(format!("merge: {e}"))
@@ -1332,6 +1500,104 @@ impl StorageAdminGrpc {
         uuid::Uuid::from_u128(1).to_string()
     }
 
+    /// If a control-plane Raft group is wired and a different node
+    /// holds leadership, forward the `SplitShard` RPC to that node's
+    /// `StorageAdminService` and return its response. Returns
+    /// `Ok(None)` when the local node is the leader (or there's no
+    /// control-plane wiring) — caller proceeds with local handling.
+    ///
+    /// Times out after ~3 s if `current_leader()` never returns Some
+    /// (cluster mid-election); the local handler then runs anyway,
+    /// hits `submit_with_leader_retry`, and either succeeds when
+    /// election converges or surfaces the timeout error.
+    #[tracing::instrument(skip(self, req), fields(self_node_id = self.self_node_id))]
+    async fn forward_split_to_leader(
+        &self,
+        req: &Request<pb::SplitShardRequest>,
+    ) -> Result<Option<Response<pb::SplitShardResponse>>, Status> {
+        let Some((leader_id, leader_addr)) = self.control_leader_address().await else {
+            return Ok(None);
+        };
+        tracing::debug!(
+            leader_id,
+            self_node_id = self.self_node_id,
+            "SplitShard: forwarding to control-plane leader",
+        );
+        if let Some(m) = self.cluster_control_metrics.as_ref() {
+            m.record_forwarded(crate::cluster_control::metrics::op::RECORD_SPLIT);
+        }
+        let mut client = open_admin_channel(&leader_addr).await?;
+        let resp = client
+            .split_shard(req.get_ref().clone())
+            .await
+            .map_err(|s| {
+                Status::unavailable(format!(
+                    "SplitShard: forward to leader node-{leader_id} ({leader_addr}): {s}",
+                ))
+            })?;
+        Ok(Some(resp))
+    }
+
+    /// Same shape as `forward_split_to_leader` for `MergeShards`.
+    #[tracing::instrument(skip(self, req), fields(self_node_id = self.self_node_id))]
+    async fn forward_merge_to_leader(
+        &self,
+        req: &Request<pb::MergeShardsRequest>,
+    ) -> Result<Option<Response<pb::MergeShardsResponse>>, Status> {
+        let Some((leader_id, leader_addr)) = self.control_leader_address().await else {
+            return Ok(None);
+        };
+        tracing::debug!(
+            leader_id,
+            self_node_id = self.self_node_id,
+            "MergeShards: forwarding to control-plane leader",
+        );
+        if let Some(m) = self.cluster_control_metrics.as_ref() {
+            m.record_forwarded(crate::cluster_control::metrics::op::RECORD_MERGE);
+        }
+        let mut client = open_admin_channel(&leader_addr).await?;
+        let resp = client
+            .merge_shards(req.get_ref().clone())
+            .await
+            .map_err(|s| {
+                Status::unavailable(format!(
+                    "MergeShards: forward to leader node-{leader_id} ({leader_addr}): {s}",
+                ))
+            })?;
+        Ok(Some(resp))
+    }
+
+    /// Resolve the control-plane Raft leader's data-port address.
+    /// Returns `None` when this node is the leader (caller handles
+    /// locally) or there is no control-plane wiring (single-node).
+    /// Polls `current_leader()` for up to 3 s to absorb election
+    /// transients — gives up rather than blocking the RPC longer.
+    async fn control_leader_address(&self) -> Option<(u64, String)> {
+        let ctrl = self.cluster_control.as_ref()?;
+        if self.admin_peers.is_empty() {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(leader_id) = ctrl.raft().current_leader().await {
+                if leader_id == self.self_node_id {
+                    return None;
+                }
+                if let Some((_, addr)) = self.admin_peers.iter().find(|(id, _)| *id == leader_id) {
+                    return Some((leader_id, addr.clone()));
+                }
+                // Leader id present but not in our admin_peers map —
+                // misconfiguration; fall through to local handling
+                // (will surface as `submit_with_leader_retry` timeout).
+                return None;
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     fn bootstrap_admin_shard_info(&self) -> pb::AdminShardInfo {
         let leader_node = if self.self_node_id == 0 {
             String::new()
@@ -1356,6 +1622,74 @@ impl StorageAdminGrpc {
             last_applied_log_index: 0,
             maintenance: false,
             entry_count: 0,
+        }
+    }
+}
+
+/// Build a plaintext tonic gRPC channel to a peer's data-port and
+/// wrap it in a `StorageAdminServiceClient`. Used by the forwarding
+/// path that sends non-leader admin RPCs to the control-plane
+/// leader's `StorageAdminService`.
+///
+/// Plaintext today because the BDD harness boots without mTLS and
+/// production mTLS is wired separately on the data port; the same
+/// helper would gain a TLS branch when admin-cluster mTLS lands.
+async fn open_admin_channel(
+    addr: &str,
+) -> Result<
+    kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient<
+        tonic::transport::Channel,
+    >,
+    Status,
+> {
+    let url = format!("http://{addr}");
+    let endpoint = tonic::transport::Endpoint::from_shared(url.clone())
+        .map_err(|e| Status::internal(format!("admin endpoint parse {url}: {e}")))?
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(20));
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| Status::unavailable(format!("admin connect {url}: {e}")))?;
+    Ok(kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient::new(channel))
+}
+
+/// Submit a `ControlCommand` through the control-plane Raft group
+/// with bounded retry to absorb the leader-election race window
+/// that surfaces when an admin RPC arrives before the
+/// control-plane group has a leader (boot, leader change, etc).
+///
+/// The retry catches both "no leader yet" (`forward to: None`) and
+/// "this node is a follower" (`forward to: Some(X)`) — in either
+/// case the next iteration may land on or get forwarded to the
+/// current leader. After the deadline elapses the most recent
+/// error propagates as `Status::Unavailable` so callers see a
+/// retry-friendly status code rather than `Internal`.
+async fn submit_with_leader_retry(
+    ctrl: &crate::cluster_control::OpenRaftControlStore,
+    cmd: crate::cluster_control::ControlCommand,
+    op: &'static str,
+) -> Result<(), Status> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut attempt = 0u32;
+    loop {
+        match ctrl.submit(cmd.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(e) if std::time::Instant::now() < deadline => {
+                attempt += 1;
+                tracing::debug!(
+                    op,
+                    attempt,
+                    error = %e,
+                    "control-plane submit retry",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                return Err(Status::unavailable(format!(
+                    "{op}: control-plane submit failed after {attempt} retries: {e}"
+                )));
+            }
         }
     }
 }

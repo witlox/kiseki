@@ -20,9 +20,12 @@ pub mod error;
 pub mod extent;
 pub mod file;
 pub mod journal;
+pub mod metrics;
 pub mod probe;
 pub mod superblock;
 pub mod trim;
+
+pub use metrics::BlockMetrics;
 
 pub use allocator::{BitmapAllocator, MAX_EXTENT_BYTES};
 pub use backend::DeviceBackend;

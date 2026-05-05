@@ -20,7 +20,9 @@ pub mod compaction_worker;
 pub mod delta;
 pub mod error;
 pub mod grpc;
+pub mod instrumented;
 pub mod merge;
+pub mod metrics;
 pub mod persistent_store;
 pub mod raft;
 pub mod raft_shard_store;
@@ -33,6 +35,8 @@ pub mod watermark;
 
 pub use delta::{Delta, DeltaHeader, DeltaPayload, OperationType};
 pub use error::LogError;
+pub use instrumented::InstrumentedLogOps;
+pub use metrics::LogMetrics;
 pub use persistent_store::PersistentShardStore;
 pub use raft_shard_store::RaftShardStore;
 pub use raft_store::RaftLogStore;

@@ -23,6 +23,7 @@ uuid = { workspace = true }
 redb = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 postcard = { workspace = true }
+prometheus = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

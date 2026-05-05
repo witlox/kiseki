@@ -643,7 +643,20 @@ fn main() {
     // table. So skip `@slow` only when the host is macOS AND the
     // `slow-tests` feature is off; on Linux always include them, and on
     // macOS include them when the feature is explicitly requested.
-    let skip_slow = cfg!(target_os = "macos") && !cfg!(feature = "slow-tests");
+    //
+    // CI fast lane: `KISEKI_BDD_FAST=1` ALSO skips `@slow` (regardless
+    // of OS) AND skips `@integration` scenarios unless tagged
+    // `@smoke`. The smoke set covers the must-not-regress cross-
+    // cutting paths (split, leader-change, fabric quorum, cross-node
+    // read, mTLS rejection) — ~5-10 scenarios kept on the fast lane
+    // so multi-node regressions surface on PRs.
+    //
+    // Release / nightly run without the env var → full suite, no
+    // tagging filter at all.
+    let bdd_fast = std::env::var("KISEKI_BDD_FAST")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    let skip_slow = bdd_fast || (cfg!(target_os = "macos") && !cfg!(feature = "slow-tests"));
 
     // Limit scenario concurrency. The default (one scenario per CPU
     // thread) lets ~16 scenarios run in parallel on a beefy laptop, and
@@ -662,6 +675,15 @@ fn main() {
         .max_concurrent_scenarios(4)
         .filter_run("features/", move |feat, _, sc| {
             if skip_slow && sc.tags.iter().any(|t| t == "slow") {
+                return false;
+            }
+            // Fast lane: skip `@integration` unless also `@smoke`.
+            // The full suite (release / nightly) leaves
+            // `bdd_fast=false` → all @integration scenarios run.
+            if bdd_fast
+                && sc.tags.iter().any(|t| t == "integration")
+                && !sc.tags.iter().any(|t| t == "smoke")
+            {
                 return false;
             }
             // Scenarios that require a real OS-level mount (privileged

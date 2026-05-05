@@ -44,6 +44,7 @@ const MAX_MSG_SIZE: usize = 65_536;
 /// # Errors
 ///
 /// Returns an I/O error if the listener cannot bind to `addr`.
+#[tracing::instrument(skip(budget), fields(%addr))]
 pub async fn run_advisory_stream_server(
     addr: std::net::SocketAddr,
     budget: std::sync::Arc<Mutex<BudgetEnforcer>>,

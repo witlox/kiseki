@@ -26,6 +26,7 @@ pub mod grpc;
 pub mod iam;
 pub mod idp;
 pub mod maintenance;
+pub mod metrics;
 pub mod namespace;
 pub mod node_lifecycle;
 pub mod policy;

@@ -247,14 +247,14 @@ async fn then_no_quorum_lost(w: &mut KisekiWorld) {
 /// Borrow the cluster guard installed by `given_3_node_cluster`.
 /// Panics if the Given step hasn't run — every multi-node step relies
 /// on the scenario-level lock.
-fn cluster<'a>(w: &'a KisekiWorld) -> &'a crate::steps::cluster_harness::ClusterHarness {
+pub(crate) fn cluster<'a>(w: &'a KisekiWorld) -> &'a crate::steps::cluster_harness::ClusterHarness {
     w.cluster
         .cluster_guard
         .as_deref()
         .expect("@multi-node step ran without `Given a 3-node kiseki cluster`")
 }
 
-fn cluster_mut<'a>(
+pub(crate) fn cluster_mut<'a>(
     w: &'a mut KisekiWorld,
 ) -> &'a mut crate::steps::cluster_harness::ClusterHarness {
     w.cluster

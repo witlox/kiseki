@@ -127,23 +127,23 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
 }
 
 impl OpenRaftLogStore {
-    /// Create a Raft log store for a shard.
+    /// Create a Raft log store for a shard. **Does not call
+    /// `initialize()`** — handle construction is always non-blocking.
+    /// Membership setup is a separate, explicit step:
+    /// [`OpenRaftLogStore::initialize_membership`] is the seed-node
+    /// call; followers learn membership from the leader via
+    /// `AppendEntries` and never need to call it.
     ///
-    /// When `peers` is empty, runs in single-node mode with a stub network.
-    /// When `peers` contains entries, uses TCP transport for multi-node Raft.
-    /// The `peers` map should include this node's own `(node_id, addr)` entry.
+    /// Decoupling these two phases is what unblocks ADR-033 §4
+    /// cluster-wide split: the apply hook on every node creates
+    /// (and registers) the new shard's Raft group locally without
+    /// blocking on votes from peers that haven't yet applied the
+    /// same `RecordSplit`. The leader of the new shard then calls
+    /// `initialize_membership` once every replica is registered.
     ///
-    /// `bootstrap` controls whether `raft.initialize()` is called:
-    /// - `true`: this is the seed node — calls `initialize(members)` to
-    ///   create the initial cluster membership. Only one node should
-    ///   bootstrap per cluster.
-    /// - `false`: this is a follower — does NOT call `initialize()`.
-    ///   The node will receive membership from the leader via
-    ///   `AppendEntries` RPCs.
-    ///
-    /// On persistent restarts (`data_dir` is `Some` and the redb store
-    /// already has state), `initialize()` is skipped regardless of
-    /// the `bootstrap` flag.
+    /// When `peers` is empty, runs in single-node mode with a stub
+    /// network. When `peers` contains entries, uses the multiplexed
+    /// TCP transport (ADR-041).
     pub async fn new(
         node_id: u64,
         shard_id: ShardId,
@@ -151,52 +151,6 @@ impl OpenRaftLogStore {
         peers: &BTreeMap<u64, String>,
         data_dir: Option<&std::path::Path>,
         inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
-    ) -> Result<Self, LogError> {
-        Self::create(
-            node_id,
-            shard_id,
-            tenant_id,
-            peers,
-            data_dir,
-            inline_store,
-            true,
-        )
-        .await
-    }
-
-    /// Create a follower Raft log store — does NOT call `initialize()`.
-    ///
-    /// Use this for non-seed nodes joining an existing cluster. The node
-    /// receives its membership configuration from the leader via Raft RPCs.
-    pub async fn new_follower(
-        node_id: u64,
-        shard_id: ShardId,
-        tenant_id: OrgId,
-        peers: &BTreeMap<u64, String>,
-        data_dir: Option<&std::path::Path>,
-        inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
-    ) -> Result<Self, LogError> {
-        Self::create(
-            node_id,
-            shard_id,
-            tenant_id,
-            peers,
-            data_dir,
-            inline_store,
-            false,
-        )
-        .await
-    }
-
-    /// Internal constructor shared by `new` (seed) and `new_follower`.
-    async fn create(
-        node_id: u64,
-        shard_id: ShardId,
-        tenant_id: OrgId,
-        peers: &BTreeMap<u64, String>,
-        data_dir: Option<&std::path::Path>,
-        inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
-        bootstrap: bool,
     ) -> Result<Self, LogError> {
         let config = KisekiRaftConfig::default_config();
         let mut sm_inner = ShardSmInner::new(shard_id, tenant_id);
@@ -206,28 +160,14 @@ impl OpenRaftLogStore {
         let state_inner = Arc::new(futures::lock::Mutex::new(sm_inner));
         let state_machine = ShardStateMachine::new(Arc::clone(&state_inner));
 
-        let members: BTreeMap<u64, KisekiNode> = if peers.len() > 1 {
-            peers
-                .iter()
-                .map(|(id, addr)| (*id, KisekiNode::new(addr)))
-                .collect()
-        } else {
-            let mut m = BTreeMap::new();
-            let addr = peers.get(&node_id).map_or("localhost:9201", String::as_str);
-            m.insert(node_id, KisekiNode::new(addr));
-            m
-        };
-
         // Select log store backend: persistent (redb) or in-memory.
-        let (raft, already_initialized) = if let Some(dir) = data_dir {
+        let raft = if let Some(dir) = data_dir {
             let raft_dir = dir.join("raft");
             std::fs::create_dir_all(&raft_dir).ok();
             let redb_path = raft_dir.join(format!("shard-{}.redb", shard_id.0));
             let log_store =
                 RedbRaftLogStore::<C>::open(&redb_path).map_err(|_| LogError::Unavailable)?;
-            let has_state = log_store.has_state();
-
-            let raft = if peers.len() > 1 {
+            if peers.len() > 1 {
                 let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
@@ -237,11 +177,10 @@ impl OpenRaftLogStore {
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
                     .map_err(|_e| LogError::Unavailable)?
-            };
-            (raft, has_state)
+            }
         } else {
             let log_store = MemLogStore::<C>::new();
-            let raft = if peers.len() > 1 {
+            if peers.len() > 1 {
                 let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
@@ -251,23 +190,8 @@ impl OpenRaftLogStore {
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
                     .map_err(|_e| LogError::Unavailable)?
-            };
-            (raft, false)
+            }
         };
-
-        // Initialize the Raft cluster membership.
-        //
-        // Only the seed node (bootstrap=true) calls initialize() on first boot.
-        // Follower nodes (bootstrap=false) receive membership from the leader
-        // via AppendEntries RPCs — they must NOT call initialize().
-        //
-        // On persistent restarts, already_initialized=true (redb has state),
-        // so initialize() is skipped regardless.
-        if bootstrap && !already_initialized {
-            raft.initialize(members)
-                .await
-                .map_err(|_| LogError::Unavailable)?;
-        }
 
         Ok(Self {
             raft,
@@ -276,6 +200,50 @@ impl OpenRaftLogStore {
             tenant_id,
             inline_rate: std::sync::Mutex::new(InlineRateMeter::new(10)), // 10 MB/s default
         })
+    }
+
+    /// Initialize the Raft cluster membership for this shard. Call
+    /// this ONLY on the seed node, ONLY once, and ONLY after every
+    /// replica's `OpenRaftLogStore::new` has registered the shard
+    /// with the multiplexed transport — otherwise the seed's vote
+    /// requests race against peer registration.
+    ///
+    /// Idempotent against persistent restarts (`already_initialized`
+    /// state is checked internally by openraft) and against
+    /// repeated calls on the same handle (subsequent calls return
+    /// `NotAllowed` which we map to `Ok(())`).
+    pub async fn initialize_membership(
+        &self,
+        peers: &BTreeMap<u64, String>,
+    ) -> Result<(), LogError> {
+        let members: BTreeMap<u64, KisekiNode> = if peers.len() > 1 {
+            peers
+                .iter()
+                .map(|(id, addr)| (*id, KisekiNode::new(addr)))
+                .collect()
+        } else {
+            // Single-node fallback: same address derivation as `new`.
+            let mut m = BTreeMap::new();
+            let node_id = peers.keys().copied().next().unwrap_or(1);
+            let addr = peers.get(&node_id).map_or("localhost:9201", String::as_str);
+            m.insert(node_id, KisekiNode::new(addr));
+            m
+        };
+        match self.raft.initialize(members).await {
+            Ok(()) => Ok(()),
+            // openraft returns `NotAllowed` when the group is
+            // already initialized (persistent restart) — treat as
+            // success so the runtime's bootstrap path is idempotent.
+            Err(e) => {
+                let s = format!("{e}");
+                if s.contains("not allowed") || s.contains("already initialized") {
+                    Ok(())
+                } else {
+                    tracing::warn!(error = %s, "initialize_membership failed");
+                    Err(LogError::Unavailable)
+                }
+            }
+        }
     }
 
     /// Check if the inline write rate is currently exceeded (I-SF7).

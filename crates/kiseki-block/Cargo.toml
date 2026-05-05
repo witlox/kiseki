@@ -23,6 +23,7 @@ serde_json = "1"
 # auto-detects HW support at runtime and falls back to a fast software
 # table on platforms without the intrinsic.
 crc32c = "0.6"
+prometheus = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

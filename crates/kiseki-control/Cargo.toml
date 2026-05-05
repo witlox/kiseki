@@ -26,6 +26,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 aws-lc-rs = { workspace = true }
+# Observability: prometheus is permitted under ADV-3 because it's
+# an observability shim (no data-path types). The crate exposes
+# `ControlMetrics` so the runtime can wire it into KisekiMetrics.
+prometheus = { workspace = true }
 # Phase 15d (ADR-038 §D10): tokio::sync::broadcast hosts the
 # TopologyEventBus that fans out drain / split / merge / composition-
 # delete / key-rotation events to pNFS LayoutManagers.

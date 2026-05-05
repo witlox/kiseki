@@ -97,16 +97,20 @@ async fn three_node_cluster_formation() {
     let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
 
     // Node 2: follower — does NOT call initialize().
-    let node2 = OpenRaftLogStore::new_follower(2, test_shard(), test_tenant(), &peers, None, None)
+    let node2 = OpenRaftLogStore::new(2, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
     let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
 
     // Node 3: follower.
-    let node3 = OpenRaftLogStore::new_follower(3, test_shard(), test_tenant(), &peers, None, None)
+    let node3 = OpenRaftLogStore::new(3, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
     let _rpc3 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[2]), &node3);
+
+    // Seed node initializes membership AFTER every listener is up
+    // — Vote requests need peers reachable.
+    node1.initialize_membership(&peers).await.unwrap();
 
     // Wait for leader election (need quorum = 2 of 3).
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -150,15 +154,17 @@ async fn writes_replicate_to_followers() {
         .unwrap();
     let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
 
-    let node2 = OpenRaftLogStore::new_follower(2, test_shard(), test_tenant(), &peers, None, None)
+    let node2 = OpenRaftLogStore::new(2, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
     let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
 
-    let node3 = OpenRaftLogStore::new_follower(3, test_shard(), test_tenant(), &peers, None, None)
+    let node3 = OpenRaftLogStore::new(3, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
     let _rpc3 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[2]), &node3);
+
+    node1.initialize_membership(&peers).await.unwrap();
 
     // Wait for cluster formation + leader election.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -208,10 +214,12 @@ async fn follower_joins_late_and_catches_up() {
         .unwrap();
     let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
 
-    let node2 = OpenRaftLogStore::new_follower(2, test_shard(), test_tenant(), &peers, None, None)
+    let node2 = OpenRaftLogStore::new(2, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
     let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
+
+    node1.initialize_membership(&peers).await.unwrap();
 
     // Wait for leader election with 2 nodes.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -223,7 +231,7 @@ async fn follower_joins_late_and_catches_up() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Now node 3 joins late.
-    let node3 = OpenRaftLogStore::new_follower(3, test_shard(), test_tenant(), &peers, None, None)
+    let node3 = OpenRaftLogStore::new(3, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
     let _rpc3 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[2]), &node3);
@@ -256,10 +264,12 @@ async fn follower_skips_initialize() {
     let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
 
     // Follower: does NOT initialize — should not panic.
-    let node2 = OpenRaftLogStore::new_follower(2, test_shard(), test_tenant(), &peers, None, None)
+    let node2 = OpenRaftLogStore::new(2, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
     let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
+
+    node1.initialize_membership(&peers).await.unwrap();
 
     // Wait for cluster.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -280,9 +290,15 @@ async fn follower_skips_initialize() {
 #[tokio::test]
 async fn single_node_cluster() {
     // Empty peers → single-node mode (backward compatible).
-    let node = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &BTreeMap::new(), None, None)
+    // `OpenRaftLogStore::new` no longer initializes membership
+    // automatically (Phase B of #4 — see the doc on `new`); the
+    // caller handles bootstrap.
+    let mut peers = BTreeMap::new();
+    peers.insert(1u64, "localhost:9201".to_owned());
+    let node = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &peers, None, None)
         .await
         .unwrap();
+    node.initialize_membership(&peers).await.unwrap();
 
     // Should become leader immediately.
     let health = node.shard_health().await;

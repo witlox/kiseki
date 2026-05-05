@@ -251,7 +251,7 @@ pub async fn run_main(
         );
         store
     };
-    let key_store = Arc::new(key_store);
+    let key_store_inner = Arc::new(key_store);
 
     // Small object store for inline files (ADR-030).
     // Created before the log store so Raft state machines can use it.
@@ -277,10 +277,56 @@ pub async fn run_main(
     // throughout setup.
     let metrics = crate::metrics::KisekiMetrics::new();
 
+    // Observability opt-out for performance benchmarks. Defaults
+    // ON for production deployments; the `infra/gcp/transport`
+    // perf profile sets `KISEKI_OBSERVABILITY=off` so the GCP run
+    // gets a clean baseline (no metric-record overhead, no
+    // wrapper vtable dispatch on the data path). The hot-path
+    // tracing spans are already at `level = "debug"`, so they
+    // short-circuit at production INFO/WARN regardless of this
+    // flag.
+    let observability_enabled = std::env::var("KISEKI_OBSERVABILITY").map_or(true, |v| {
+        !matches!(
+            v.to_lowercase().as_str(),
+            "off" | "0" | "false" | "disabled"
+        )
+    });
+    if !observability_enabled {
+        tracing::info!(
+            "observability: wrappers disabled via KISEKI_OBSERVABILITY \
+             — metric records on the LogOps / KeyManagerOps hot paths skipped"
+        );
+    }
+
+    // Wrap the key store with `InstrumentedKeyManager` for
+    // metric recording + tracing spans. When observability is
+    // disabled, hand the bare `Arc<PersistentKeyStore>` to the
+    // gRPC handler instead. `KeyManagerGrpc<T: ?Sized>` accepts
+    // both the wrapper concrete type and the underlying trait
+    // object so the choice is at runtime construction.
+    let key_store: Arc<dyn kiseki_keymanager::KeyManagerOps> = if observability_enabled {
+        Arc::new(kiseki_keymanager::InstrumentedKeyManager::new(
+            key_store_inner,
+            Arc::clone(&metrics.keymanager),
+        ))
+    } else {
+        key_store_inner
+    };
+
     // Log store: Raft (multi-node), persistent (redb), or in-memory.
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
     let bootstrap_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
 
+    // Holds the control-plane Raft store on multi-node deployments.
+    // None on single-node / persistent / in-memory paths — those run
+    // without cluster consensus on the namespace shard map (ADR-033
+    // §4 only applies when there's a real cluster to coordinate
+    // across).
+    let mut cluster_control_store: Option<Arc<crate::cluster_control::OpenRaftControlStore>> = None;
+    // Typed `RaftShardStore` handle for the storage admin RPC's
+    // `initialize_shard` call after `RecordSplit` commits. Same
+    // gating as `cluster_control_store` — only set on multi-node.
+    let mut raft_shard_store_for_admin: Option<Arc<kiseki_log::RaftShardStore>> = None;
     let log_store: Arc<dyn kiseki_log::LogOps + Send + Sync> = if cfg.node_id > 0
         && cfg.raft_peers.len() > 1
     {
@@ -290,7 +336,8 @@ pub async fn run_main(
         let raft_addr_str = cfg
             .raft_addr
             .map_or_else(|| "0.0.0.0:9300".to_owned(), |a| a.to_string());
-        let mut store = kiseki_log::RaftShardStore::new(cfg.node_id, peers, cfg.data_dir.clone());
+        let mut store =
+            kiseki_log::RaftShardStore::new(cfg.node_id, peers.clone(), cfg.data_dir.clone());
         if let Some(ref ss) = small_store {
             store = store.with_inline_store(std::sync::Arc::clone(ss)
                 as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>);
@@ -298,23 +345,168 @@ pub async fn run_main(
         // ADR-041 §"Observability": wire transport metrics BEFORE the
         // first create_shard so the lazy-init listener picks them up.
         store.set_transport_metrics(std::sync::Arc::clone(&metrics.raft_transport));
-        // All nodes in the cluster create the shard. The bootstrap flag
-        // controls whether this node seeds the Raft group (calls initialize)
-        // or joins as a follower (receives membership from the leader).
+
+        // ADR-033 §4: bring up the multiplexed Raft listener BEFORE
+        // any per-shard `create_shard` so the control-plane group can
+        // share it. Returns the registry handle for the
+        // control-plane group's `register_shard`.
+        let registry = store.ensure_listener_started(&raft_addr_str);
+
+        // All nodes in the cluster register the shard's per-shard
+        // Raft handle with the multiplexed listener. Membership
+        // initialization is a separate, explicit step (the
+        // `initialize_shard` call below on the bootstrap node)
+        // — see the ADR-033 §4 doc on `RaftShardStore::create_shard`.
         store.create_shard(
             bootstrap_shard,
             bootstrap_tenant,
             kiseki_common::ids::NodeId(cfg.node_id),
             kiseki_log::ShardConfig::default(),
             Some(&raft_addr_str),
-            cfg.bootstrap,
         );
+        // Bootstrap node initializes membership for the bootstrap
+        // shard. Followers do not — they learn membership via
+        // AppendEntries from the leader.
+        if cfg.bootstrap {
+            if let Err(e) = store.initialize_shard(bootstrap_shard) {
+                tracing::warn!(
+                    error = %e,
+                    "bootstrap shard initialize_shard failed — \
+                     cluster may need manual intervention",
+                );
+            }
+        }
         tracing::info!(
             node_id = cfg.node_id,
             peers = cfg.raft_peers.len(),
             "log store: Raft",
         );
-        Arc::new(store)
+
+        let store_arc = Arc::new(store);
+
+        // ADR-033 §4: control-plane Raft group. Built on the same
+        // tokio runtime as the per-shard groups (mixing runtimes
+        // deadlocks openraft). Apply hook bridges to RaftShardStore
+        // so RecordSplit on every node creates the new shard's
+        // per-shard Raft group locally — closes the cluster-wide
+        // split gap surfaced by the @shard-mgmt BDD scenarios.
+        let raft_rt = store_arc.raft_runtime_handle();
+        let apply_hook: Arc<dyn crate::cluster_control::ApplyHook> = Arc::new(
+            crate::cluster_control::ShardStoreApplyHook::new(Arc::clone(&store_arc), cfg.node_id),
+        );
+        let peers_for_ctrl = peers.clone();
+        let bootstrap_flag = cfg.bootstrap;
+        let data_dir_for_ctrl = cfg.data_dir.clone();
+        // Construct on the dedicated Raft runtime (block_on inside a
+        // spawned thread so we don't nest runtimes — the same pattern
+        // RaftShardStore uses for create_shard).
+        let registry_for_ctrl = registry.clone();
+        let ctrl_metrics = Arc::clone(&metrics.cluster_control);
+        let ctrl_store_res: Result<
+            Arc<crate::cluster_control::OpenRaftControlStore>,
+            std::io::Error,
+        > = std::thread::spawn(move || {
+            raft_rt.block_on(async move {
+                crate::cluster_control::OpenRaftControlStore::new(
+                    cfg.node_id,
+                    &peers_for_ctrl,
+                    data_dir_for_ctrl.as_deref(),
+                    &registry_for_ctrl,
+                    apply_hook,
+                    bootstrap_flag,
+                    Some(ctrl_metrics),
+                )
+                .await
+                .map(Arc::new)
+            })
+        })
+        .join()
+        .map_err(|_| "control-plane raft thread panicked".to_owned())?;
+
+        let ctrl_store = ctrl_store_res.map_err(|e| format!("control-plane raft init: {e}"))?;
+        tracing::info!(
+            node_id = cfg.node_id,
+            peers = cfg.raft_peers.len(),
+            "control-plane Raft group: up (ADR-033 §4)",
+        );
+
+        // Bootstrap node seeds the control-plane state machine with
+        // the bootstrap namespace + bootstrap shard. Followers learn
+        // it via Raft replication. The apply hook is idempotent on
+        // already-existing shards, so the bootstrap shard's
+        // per-shard Raft group (created above) is not re-built.
+        //
+        // Runs on the dedicated Raft runtime so the client_write
+        // awaits don't try to drive the host runtime's reactor.
+        // Background-only: don't block boot on the seed completing
+        // (the leader may need an election first); the next admin
+        // RPC will encounter a usable, seeded namespace map by the
+        // time consensus closes.
+        if cfg.bootstrap {
+            let ctrl_for_seed = Arc::clone(&ctrl_store);
+            let raft_rt_for_seed = store_arc.raft_runtime_handle();
+            let bootstrap_ns = bootstrap_tenant.0.to_string();
+            std::thread::spawn(move || {
+                raft_rt_for_seed.block_on(async move {
+                    let cmd = crate::cluster_control::ControlCommand::CreateNamespace {
+                        namespace_id: bootstrap_ns,
+                        tenant_id: bootstrap_tenant,
+                        shards: vec![crate::cluster_control::commands::ShardRecord {
+                            shard_id: bootstrap_shard,
+                            range_start: [0u8; 32],
+                            range_end: [0xFFu8; 32],
+                            leader_node: kiseki_common::ids::NodeId(1),
+                        }],
+                    };
+                    // Retry for up to 60s while leader election
+                    // converges. The control-plane group's
+                    // initialize() returns immediately but voters
+                    // don't agree on a leader until the other
+                    // nodes' control-plane groups come up — and
+                    // the BDD harness brings nodes up serially,
+                    // so node-1's first ~5s sees no peer.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    let mut attempt = 0u32;
+                    loop {
+                        match ctrl_for_seed.submit(cmd.clone()).await {
+                            Ok(_) => {
+                                tracing::info!(
+                                    attempts = attempt + 1,
+                                    "control-plane: bootstrap namespace seeded",
+                                );
+                                return;
+                            }
+                            Err(e) if std::time::Instant::now() < deadline => {
+                                attempt += 1;
+                                if attempt % 10 == 0 {
+                                    tracing::debug!(
+                                        attempt,
+                                        error = %e,
+                                        "control-plane bootstrap seed: still retrying",
+                                    );
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    attempts = attempt,
+                                    "control-plane bootstrap CreateNamespace failed \
+                                     after 60s — cluster will operate without \
+                                     control-plane state",
+                                );
+                                return;
+                            }
+                        }
+                    }
+                });
+            });
+        }
+
+        cluster_control_store = Some(ctrl_store);
+        raft_shard_store_for_admin = Some(Arc::clone(&store_arc));
+
+        store_arc
     } else if let Some(ref dir) = cfg.data_dir {
         std::fs::create_dir_all(dir.join("raft")).ok();
         let store = kiseki_log::persistent_store::PersistentShardStore::open(
@@ -344,6 +536,24 @@ pub async fn run_main(
         }
         tracing::info!("log store: in-memory (no persistence)");
         Arc::new(store)
+    };
+
+    // Wrap in `InstrumentedLogOps` so every LogOps call records to
+    // `LogMetrics` and emits a tracing span. The wrapper is opaque
+    // to callers (still `Arc<dyn LogOps>`); inner store paths that
+    // need concrete types (`RaftShardStore::initialize_shard` for
+    // SplitShard's leader-side init) hold their own typed `Arc`.
+    //
+    // Skipped when `KISEKI_OBSERVABILITY=off` so perf runs measure
+    // bare LogOps throughput. See the explanatory comment near the
+    // key-store wrap above.
+    let log_store: Arc<dyn kiseki_log::LogOps + Send + Sync> = if observability_enabled {
+        Arc::new(kiseki_log::InstrumentedLogOps::new(
+            log_store,
+            Arc::clone(&metrics.log),
+        ))
+    } else {
+        log_store
     };
 
     if cfg.bootstrap {
@@ -854,6 +1064,9 @@ pub async fn run_main(
     // Pre-clone the fabric metrics for the ClusterChunkServer wired
     // further down; same reason — `metrics` moves into the spawn.
     let cluster_chunk_server_fabric = Arc::clone(&metrics.fabric);
+    // Pre-clone the cluster-control metrics for `StorageAdminGrpc`'s
+    // forwarding paths and `OpenRaftControlStore::with_metrics()`.
+    let cluster_control_metrics_for_admin = Arc::clone(&metrics.cluster_control);
     tokio::spawn(async move {
         if let Err(e) = crate::metrics::run_metrics_server(
             metrics_addr,
@@ -1281,6 +1494,27 @@ pub async fn run_main(
         .with_log_store(log_for_admin)
         .with_event_streams(event_streams)
         .with_metrics(Arc::clone(&storage_admin_calls_counter));
+    if let (Some(ctrl), Some(raft)) = (
+        cluster_control_store.as_ref(),
+        raft_shard_store_for_admin.as_ref(),
+    ) {
+        // ADR-033 §4: route SplitShard / MergeShards through the
+        // control-plane Raft group so every node creates the new
+        // per-shard Raft group locally on apply. Pass the typed
+        // RaftShardStore handle so `initialize_shard` is callable
+        // after the control-plane RecordSplit commits.
+        // `cfg.fabric_peers` doubles as the admin-RPC peer list
+        // because `StorageAdminService` is mounted on the data
+        // port — forwarding non-leader admin calls to the leader
+        // uses the same address.
+        storage_admin_handler = storage_admin_handler.with_cluster_control(
+            Arc::clone(ctrl),
+            Arc::clone(raft),
+            bootstrap_tenant.0.to_string(),
+            cfg.fabric_peers.clone(),
+            Arc::clone(&cluster_control_metrics_for_admin),
+        );
+    }
     if let Some(ref s) = scrub_scheduler_handle {
         storage_admin_handler = storage_admin_handler.with_scrub(Arc::clone(s));
     }

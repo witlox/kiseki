@@ -289,6 +289,7 @@ impl NamespaceShardMapStore {
     ///
     /// Returns the created `NamespaceShardMap` or an error if the namespace
     /// already exists or is currently being created.
+    #[tracing::instrument(skip(self, config, active_nodes), fields(namespace = namespace_id, tenant = %tenant_id.0, requested_shards = requested_shards))]
     pub fn create_namespace(
         &self,
         namespace_id: &str,
@@ -394,6 +395,7 @@ impl NamespaceShardMapStore {
     /// If the shards-per-node ratio is below `ratio_floor`, splits the
     /// largest shard(s) until the target count is reached (capped by `shard_cap`).
     /// Returns the new shard count, or `None` if no splits were needed.
+    #[tracing::instrument(skip(self, config, active_nodes), fields(namespace = namespace_id, active_nodes = active_nodes.len()))]
     pub fn evaluate_ratio_floor(
         &self,
         namespace_id: &str,

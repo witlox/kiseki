@@ -1,0 +1,145 @@
+//! `ControlCommand` — the entries that flow through the control-plane
+//! Raft log (ADR-033 §4).
+//!
+//! Every mutation to the cluster's namespace shard map is a
+//! `ControlCommand` submitted via `client_write` on the leader of the
+//! control-plane Raft group, then deterministically applied on every
+//! node. The same command sequence produces the same `HashMap` state
+//! on every replica — that is what makes consensus safe to drive
+//! per-shard Raft group creation locally on each node.
+
+use kiseki_common::ids::{NodeId, OrgId, ShardId};
+use serde::{Deserialize, Serialize};
+
+/// One mutation to the cluster's namespace shard map.
+///
+/// All variants are idempotent on replay so the state machine can
+/// safely apply the same command twice (e.g. on snapshot install
+/// followed by tail replay) without diverging from the leader.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ControlCommand {
+    /// Create a brand-new namespace with the supplied initial shards.
+    /// Idempotent: ignored if the namespace already exists.
+    CreateNamespace {
+        /// Stable namespace identifier (e.g. bucket name or
+        /// `Uuid::from_u128(1)` for the bootstrap namespace).
+        namespace_id: String,
+        /// Owning tenant.
+        tenant_id: OrgId,
+        /// One per initial shard. Pre-computed by the caller (e.g.
+        /// from `compute_shard_ranges`) so the state machine itself
+        /// stays free of placement policy.
+        shards: Vec<ShardRecord>,
+    },
+    /// Record that a shard has been split. Removes `source_shard_id`
+    /// from the namespace's shards, replaces it with two halves —
+    /// `[range_start, midpoint)` keeps `source_shard_id`, and
+    /// `[midpoint, range_end)` becomes `new_shard_id`. The apply hook
+    /// fires on every node so the new per-shard Raft group is
+    /// created locally on every replica (ADR-033 §3).
+    RecordSplit {
+        /// Namespace whose shard map is being mutated.
+        namespace_id: String,
+        /// The shard being split. Must exist in the namespace map
+        /// or the command is a no-op (idempotent on replay).
+        source_shard_id: ShardId,
+        /// The new shard's id — caller-allocated so leader and
+        /// followers all converge on the same id (every replica's
+        /// apply hook needs the exact same id when it locally
+        /// creates the per-shard Raft group).
+        new_shard_id: ShardId,
+        /// 256-bit key-range midpoint where the source's range is
+        /// split. The new shard owns `[midpoint, source.range_end)`;
+        /// the source keeps `[source.range_start, midpoint)`.
+        midpoint: [u8; 32],
+        /// Best-effort leader placement for the new shard
+        /// (round-robin across nodes per ADR-033 §3).
+        new_leader: NodeId,
+    },
+    /// Record that two adjacent shards have been merged. Extends
+    /// `surviving_shard_id`'s range to the union of the two and
+    /// marks `retired_shard_id` for retirement (ADR-034). The
+    /// retired shard stays in the map until a follow-up
+    /// `RetireShard` command, so in-flight reads can drain.
+    RecordMerge {
+        /// Namespace whose shard map is being mutated.
+        namespace_id: String,
+        /// Surviving shard — keeps its id, range expands to the
+        /// union of the two inputs.
+        surviving_shard_id: ShardId,
+        /// Shard being retired. Stays in the map (in `Retiring`
+        /// state) until `RetireShard` finalizes removal.
+        retired_shard_id: ShardId,
+        /// New `[range_start, range_end)` for the surviving shard.
+        new_range_start: [u8; 32],
+        /// Exclusive upper bound for the surviving shard.
+        new_range_end: [u8; 32],
+    },
+    /// Permanently remove a retired shard from the namespace map.
+    /// Issued after the retired shard's deltas have been drained
+    /// to the survivor (ADR-034). Idempotent.
+    RetireShard {
+        /// Namespace whose shard map is being mutated.
+        namespace_id: String,
+        /// The shard to remove. No-op if not present.
+        shard_id: ShardId,
+    },
+}
+
+// I-K8-style courtesy: Display omits payload bytes (key ranges) so
+// trace logs don't dump 32-byte boundaries on every consensus event.
+impl std::fmt::Display for ControlCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateNamespace {
+                namespace_id,
+                shards,
+                ..
+            } => write!(
+                f,
+                "CreateNamespace(ns={namespace_id}, shards={})",
+                shards.len()
+            ),
+            Self::RecordSplit {
+                namespace_id,
+                source_shard_id,
+                new_shard_id,
+                ..
+            } => write!(
+                f,
+                "RecordSplit(ns={namespace_id}, src={:?}, new={:?})",
+                source_shard_id.0, new_shard_id.0
+            ),
+            Self::RecordMerge {
+                namespace_id,
+                surviving_shard_id,
+                retired_shard_id,
+                ..
+            } => write!(
+                f,
+                "RecordMerge(ns={namespace_id}, surv={:?}, ret={:?})",
+                surviving_shard_id.0, retired_shard_id.0
+            ),
+            Self::RetireShard {
+                namespace_id,
+                shard_id,
+            } => write!(f, "RetireShard(ns={namespace_id}, shard={:?})", shard_id.0),
+        }
+    }
+}
+
+/// One shard's entry in the namespace map at the moment of a
+/// `CreateNamespace` command. Carried in the command (rather than
+/// computed in the apply hook) so the state machine stays free of
+/// placement policy and apply remains deterministic.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardRecord {
+    /// Stable shard id.
+    pub shard_id: ShardId,
+    /// Inclusive lower bound of the 256-bit key range.
+    pub range_start: [u8; 32],
+    /// Exclusive upper bound of the 256-bit key range.
+    pub range_end: [u8; 32],
+    /// Best-effort leader placement.
+    pub leader_node: NodeId,
+}

@@ -698,11 +698,10 @@ impl RaftRpcListener {
                 continue;
             }
             if let Some(m) = &metrics {
-                #[allow(clippy::cast_possible_wrap)]
                 m.active_connections.set(
                     self.active_per_peer
                         .iter()
-                        .map(|e| e.value().load(Ordering::Relaxed) as i64)
+                        .map(|e| i64::from(e.value().load(Ordering::Relaxed)))
                         .sum(),
                 );
             }

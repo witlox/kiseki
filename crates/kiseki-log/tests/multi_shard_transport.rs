@@ -103,16 +103,22 @@ fn both_shards_reach_quorum_when_sharing_a_single_port_per_node() {
         registry_n1.register_shard(shard_b(), n1b.raft_handle());
 
         // Node 2, Shard A — follower.
-        let n2a = OpenRaftLogStore::new_follower(2, shard_a(), test_tenant(), &peers, None, None)
+        let n2a = OpenRaftLogStore::new(2, shard_a(), test_tenant(), &peers, None, None)
             .await
             .unwrap();
         registry_n2.register_shard(shard_a(), n2a.raft_handle());
 
         // Node 2, Shard B — follower.
-        let n2b = OpenRaftLogStore::new_follower(2, shard_b(), test_tenant(), &peers, None, None)
+        let n2b = OpenRaftLogStore::new(2, shard_b(), test_tenant(), &peers, None, None)
             .await
             .unwrap();
         registry_n2.register_shard(shard_b(), n2b.raft_handle());
+
+        // Seed initializes both shards now that every replica's
+        // listener is up and the per-shard Raft handles are
+        // registered with their respective registry handles.
+        n1a.initialize_membership(&peers).await.unwrap();
+        n1b.initialize_membership(&peers).await.unwrap();
 
         // Wait for elections (need 2-of-2 quorum on each shard).
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -186,8 +192,13 @@ fn split_shard_creates_new_raft_group_via_multiplexed_listener() {
         NodeId(1),
         ShardConfig::default(),
         Some(&format!("127.0.0.1:{port}")),
-        true,
     );
+    // Phase B of #4: `create_shard` no longer initializes — the
+    // caller drives membership setup explicitly. Single-node init
+    // is fast (no peers to wait for).
+    store
+        .initialize_shard(original)
+        .expect("initialize original");
     rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
 
     // Verify original shard has a leader.

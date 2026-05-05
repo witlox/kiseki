@@ -192,6 +192,7 @@ impl StorageAdminService {
     }
 
     /// Create a storage pool. Requires admin role.
+    #[tracing::instrument(skip(self, pool), fields(pool = %pool.name, role = ?role))]
     pub fn create_pool(&self, pool: StoragePool, role: AdminRole) -> Result<(), AdminError> {
         require_admin(role)?;
         let mut pools = self.pools.write().lock_or_die("storage_admin.unknown");

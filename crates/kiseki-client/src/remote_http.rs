@@ -83,6 +83,7 @@ impl RemoteHttpGateway {
 
 #[async_trait::async_trait]
 impl GatewayOps for RemoteHttpGateway {
+    #[tracing::instrument(level = "debug", skip(self, req), fields(namespace = ?req.namespace_id, composition = %req.composition_id.0))]
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
         let ns = Self::ns_to_path(req.namespace_id);
         let url = format!("{}/{}/{}", self.base_url, ns, req.composition_id.0);
@@ -132,6 +133,7 @@ impl GatewayOps for RemoteHttpGateway {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip(self, req), fields(namespace = ?req.namespace_id, bytes = req.data.len()))]
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         let ns = Self::ns_to_path(req.namespace_id);
 

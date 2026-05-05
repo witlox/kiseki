@@ -44,6 +44,7 @@ kiseki-raft = { workspace = true }
 kiseki-keymanager = { workspace = true }
 kiseki-audit = { workspace = true }
 kiseki-backup = { workspace = true }
+kiseki-block = { workspace = true }
 kiseki-tracing = { workspace = true }
 kiseki-chunk = { workspace = true }
 kiseki-chunk-cluster = { workspace = true }
@@ -56,6 +57,11 @@ kiseki-control = { workspace = true }
 kiseki-proto = { workspace = true }
 async-trait = { workspace = true }
 axum = "0.8"
+# Control-plane Raft group (ADR-033 §4) lives in `cluster_control`
+# and constructs an `openraft::Raft` over the shared multiplexed
+# transport. Same major as kiseki-raft uses.
+openraft = { workspace = true }
+futures = "0.3"
 libc = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
 opentelemetry = { workspace = true }

@@ -19,6 +19,7 @@ pub(crate) mod admin;
 pub(crate) mod admin_grpc;
 pub(crate) mod backup;
 pub(crate) mod cli;
+pub(crate) mod cluster_control;
 mod config;
 pub(crate) mod event_streams;
 mod integrity;

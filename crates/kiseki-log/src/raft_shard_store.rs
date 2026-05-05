@@ -128,18 +128,103 @@ impl RaftShardStore {
         self
     }
 
-    /// Create a shard with its own Raft group.
+    /// Ensure the multiplexed Raft listener (ADR-041) is running on
+    /// `addr` and return a clone of its registry handle. Idempotent:
+    /// the second call with a different `addr` is ignored — the
+    /// existing listener (already-created on first call) wins.
     ///
-    /// When `bootstrap` is true, calls `raft.initialize()` with the
-    /// configured peers (seed node). When false, the node joins the
-    /// existing cluster by receiving membership from the leader.
+    /// The runtime calls this BEFORE the first `create_shard` so the
+    /// control-plane Raft group can register with the same listener
+    /// as the per-shard groups (one port per node, ADR-041 §"Lifecycle").
+    ///
+    /// Returns the registry handle the runtime needs to call
+    /// `register_shard` on for the control-plane group; the per-shard
+    /// `create_shard` calls register through the same handle
+    /// internally.
+    pub fn ensure_listener_started(
+        &self,
+        addr: &str,
+    ) -> kiseki_raft::tcp_transport::RegistryHandle {
+        let mut guard = self
+            .listener_registry
+            .lock()
+            .lock_or_die("raft_shard_store.listener_registry");
+        if let Some(existing) = guard.as_ref() {
+            return existing.clone();
+        }
+        let mut listener = kiseki_raft::tcp_transport::RaftRpcListener::new(addr.to_owned(), None);
+        if let Some(m) = self
+            .transport_metrics
+            .lock()
+            .lock_or_die("raft_shard_store.transport_metrics")
+            .as_ref()
+        {
+            listener = listener.with_metrics(Arc::clone(m));
+        }
+        let reg = listener.registry();
+        let handle = self.rt.handle().clone();
+        handle.spawn(async move {
+            if let Err(e) = listener.run().await {
+                tracing::warn!(error = %e, "Raft RPC listener exited");
+            }
+        });
+        tracing::info!(addr = %addr, "Raft RPC listener spawned (multiplexed, ADR-041)");
+        *guard = Some(reg.clone());
+        reg
+    }
+
+    /// Borrow the dedicated Raft tokio runtime handle. The
+    /// `cluster_control` module needs this so it can run its own
+    /// `Raft::new` / `client_write` futures on the same runtime as
+    /// the per-shard Raft groups (mixing runtimes deadlocks tokio's
+    /// reactor when openraft awaits cross-runtime).
+    #[must_use]
+    pub fn raft_runtime_handle(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
+    }
+
+    /// Sync lookup of a shard's tenant. Returns `None` if the shard
+    /// is unknown to this node. Used by `cluster_control::ApplyHook`
+    /// (sync trait) to find the tenant of a source shard before
+    /// locally creating the new (split-target) shard's Raft group on
+    /// every replica.
+    #[must_use]
+    pub fn shard_tenant(&self, shard_id: ShardId) -> Option<OrgId> {
+        let store = self.get_shard(shard_id).ok()?;
+        self.shard_health_blocking(&store).ok().map(|i| i.tenant_id)
+    }
+
+    /// Sync availability check: does this node already host the
+    /// shard's Raft group? Used by `cluster_control::ApplyHook` to
+    /// stay idempotent — replaying `RecordSplit` on a node that
+    /// already has the new shard must not double-create it.
+    #[must_use]
+    pub fn has_shard(&self, shard_id: ShardId) -> bool {
+        self.shards
+            .lock()
+            .lock_or_die("raft_shard_store.shards")
+            .contains_key(&shard_id)
+    }
+
+    /// Create a shard's Raft group on this node.
+    ///
+    /// **Does not call `Raft::initialize()`** — the per-shard handle
+    /// is registered with the multiplexed listener immediately so
+    /// inbound RPCs can dispatch, but membership setup is a separate
+    /// step ([`Self::initialize_shard`]). This decoupling is what
+    /// makes ADR-033 §4 cluster-wide split safe: every node's apply
+    /// hook calls `create_shard` for the new shard without blocking
+    /// on votes from peers that haven't yet applied the same
+    /// `RecordSplit`. Once every replica has the shard registered,
+    /// the leader of the new shard explicitly calls
+    /// `initialize_shard`.
     ///
     /// Optionally spawns the Raft RPC server on `raft_addr`.
     ///
     /// # Panics
     ///
-    /// Panics if the Raft instance fails to initialize (fatal for
-    /// server startup).
+    /// Panics if the Raft instance fails to construct (out of memory
+    /// or unrecoverable openraft config error — both fatal at boot).
     pub fn create_shard(
         &self,
         shard_id: ShardId,
@@ -147,7 +232,6 @@ impl RaftShardStore {
         _node_id: NodeId,
         _config: ShardConfig,
         raft_addr: Option<&str>,
-        bootstrap: bool,
     ) {
         let peers = self.peers.clone();
         let node_id = self.node_id;
@@ -159,66 +243,28 @@ impl RaftShardStore {
         // through the same listener via the cloned `RegistryHandle`
         // — ADR-041 §"Lifecycle".
         let registry = if let Some(addr) = raft_addr {
-            let mut guard = self
-                .listener_registry
-                .lock()
-                .lock_or_die("raft_shard_store.listener_registry");
-            if let Some(existing) = guard.as_ref() {
-                Some(existing.clone())
-            } else {
-                let mut listener =
-                    kiseki_raft::tcp_transport::RaftRpcListener::new(addr.to_owned(), None);
-                // Attach transport metrics if the runtime wired them
-                // before the first create_shard.
-                if let Some(m) = self
-                    .transport_metrics
-                    .lock()
-                    .lock_or_die("raft_shard_store.transport_metrics")
-                    .as_ref()
-                {
-                    listener = listener.with_metrics(Arc::clone(m));
-                }
-                let reg = listener.registry();
-                let handle = self.rt.handle().clone();
-                handle.spawn(async move {
-                    if let Err(e) = listener.run().await {
-                        tracing::warn!(error = %e, "Raft RPC listener exited");
-                    }
-                });
-                tracing::info!(addr = %addr, "Raft RPC listener spawned (multiplexed, ADR-041)");
-                *guard = Some(reg.clone());
-                Some(reg)
-            }
+            Some(self.ensure_listener_started(addr))
         } else {
-            None
+            self.listener_registry
+                .lock()
+                .lock_or_die("raft_shard_store.listener_registry")
+                .as_ref()
+                .cloned()
         };
 
         let handle = self.rt.handle().clone();
         let store = std::thread::spawn(move || {
             handle.block_on(async {
-                let store = if bootstrap {
-                    OpenRaftLogStore::new(
-                        node_id,
-                        shard_id,
-                        tenant_id,
-                        &peers,
-                        data_dir.as_deref(),
-                        inline_store,
-                    )
-                    .await
-                    .expect("failed to create Raft log store (seed)")
-                } else {
-                    OpenRaftLogStore::new_follower(
-                        node_id,
-                        shard_id,
-                        tenant_id,
-                        &peers,
-                        data_dir.as_deref(),
-                        inline_store,
-                    )
-                    .await
-                    .expect("failed to create Raft log store (follower)")
-                };
+                let store = OpenRaftLogStore::new(
+                    node_id,
+                    shard_id,
+                    tenant_id,
+                    &peers,
+                    data_dir.as_deref(),
+                    inline_store,
+                )
+                .await
+                .expect("failed to create Raft log store");
                 Arc::new(store)
             })
         })
@@ -234,6 +280,40 @@ impl RaftShardStore {
 
         let mut shards = self.shards.lock().lock_or_die("raft_shard_store.shards");
         shards.insert(shard_id, store);
+    }
+
+    /// Initialize the Raft membership for a shard's group. Must be
+    /// called only on the seed node, only after every replica has
+    /// registered the shard via `create_shard` (otherwise the seed's
+    /// vote requests race against peer registration and time out).
+    ///
+    /// Idempotent: openraft returns `NotAllowed` once a group is
+    /// initialized, which we map to `Ok(())` in
+    /// `OpenRaftLogStore::initialize_membership`.
+    pub fn initialize_shard(&self, shard_id: ShardId) -> Result<(), LogError> {
+        let store = self.get_shard(shard_id)?;
+        let peers = self.peers.clone();
+        let handle = self.rt.handle().clone();
+        let res = std::thread::spawn(move || {
+            handle.block_on(async move { store.initialize_membership(&peers).await })
+        })
+        .join()
+        .map_err(|_| LogError::Unavailable)?;
+        if res.is_ok() {
+            tracing::info!(
+                shard_id = %shard_id.0,
+                "shard membership initialized",
+            );
+        }
+        res
+    }
+
+    /// Async variant of [`Self::initialize_shard`] for callers that
+    /// already run on the Raft runtime. Avoids the
+    /// `thread::spawn + join` blocking dance.
+    pub async fn initialize_shard_async(&self, shard_id: ShardId) -> Result<(), LogError> {
+        let store = self.get_shard(shard_id)?;
+        store.initialize_membership(&self.peers).await
     }
 
     /// Look up a shard's Raft store.
@@ -409,15 +489,23 @@ impl LogOps for RaftShardStore {
         node_id: NodeId,
         config: ShardConfig,
     ) {
-        // Delegate to the inherent `create_shard` (which spawns a real
-        // Raft group). The trait method has no `raft_addr` /
-        // `bootstrap` plumbing — pass `None` / `true` so a single-node
-        // bootstrap path works. Production callers that need explicit
-        // RPC addresses or follower placement use the inherent method
-        // directly (see `kiseki-server::runtime`). The new shard
-        // inherits the cluster's configured peer set; future ADR-033
-        // §2 placement-engine work narrows this down per shard.
-        Self::create_shard(self, shard_id, tenant_id, node_id, config, None, true);
+        // Delegate to the inherent `create_shard` — registers the
+        // per-shard Raft group with the multiplexed listener but
+        // does NOT initialize membership. The split-shard flow in
+        // `LogOps::split_shard` was the only LogOps caller that
+        // needed initialize, and it now goes through the
+        // control-plane Raft group's apply hook + an explicit
+        // `initialize_shard` after registration converges.
+        Self::create_shard(self, shard_id, tenant_id, node_id, config, None);
+        // Best-effort: initialize on this node so single-node /
+        // legacy paths (in-memory store, persistent store) keep
+        // working as a self-contained bootstrap. Multi-node
+        // production paths invoke `initialize_shard` explicitly
+        // from the `kiseki-server` runtime once every replica is
+        // registered.
+        if self.peers.len() <= 1 {
+            let _ = self.initialize_shard(shard_id);
+        }
     }
 
     fn update_shard_range(&self, shard_id: ShardId, range_start: [u8; 32], range_end: [u8; 32]) {
@@ -481,16 +569,29 @@ impl LogOps for RaftShardStore {
         // contract that they're being redistributed.
         self.set_shard_state_blocking(&source, ShardState::Splitting)?;
 
-        // Create the new shard's Raft group (upper half).
-        Self::create_shard(
-            self,
-            new_shard_id,
-            info.tenant_id,
-            node_id,
-            info.config.clone(),
-            None,
-            true,
-        );
+        // Create the new shard's Raft group (upper half). With
+        // ADR-033 §4 wired, the per-shard groups for splits are
+        // created cluster-wide via the control-plane apply hook
+        // BEFORE `LogOps::split_shard` runs — but for single-node
+        // setups (and as a fallback when `has_shard` is false) we
+        // create + initialize locally here so this method stays
+        // self-contained.
+        if !self.has_shard(new_shard_id) {
+            Self::create_shard(
+                self,
+                new_shard_id,
+                info.tenant_id,
+                node_id,
+                info.config.clone(),
+                None,
+            );
+            // Single-node / fallback: initialize membership now so
+            // the per-shard Raft has a leader that can accept
+            // writes during redistribution. Multi-node clusters
+            // initialize the new shard via the admin RPC handler
+            // *before* calling `LogOps::split_shard`.
+            self.initialize_shard(new_shard_id)?;
+        }
 
         // Set the new shard's range = [midpoint, upper_end).
         let new_store = self.get_shard(new_shard_id)?;

@@ -271,8 +271,21 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # makes a 3-node cluster genuinely tolerant of single-node loss.
   # See specs/implementation/phase-16-cross-node-chunks.md (rev 4)
   # and ADR-026 for the design rationale (D-1, D-5, D-6, D-7, D-10).
+  #
+  # `@smoke` tag on a curated subset:
+  #   * `Cross-node read after leader-only PUT (B-3)` — basic
+  #     cross-node read path
+  #   * `Read survives leader failure (D-1)` — leader-change
+  #   * `Write requires 2-of-3 quorum (D-5)` — quorum loss
+  #   * `Tenant cert presented to fabric port is rejected (I-Auth4)`
+  #     — mTLS / SAN role rejection
+  #   * `Admin SplitShard returns a new shard id` — control-plane
+  #     consensus + leader forwarding (ADR-033 §4)
+  #
+  # CI fast lane (`KISEKI_BDD_FAST=1`) runs only the smoke set from
+  # `@integration` scenarios — full suite runs on release / nightly.
 
-  @integration @multi-node @cross-node
+  @integration @multi-node @cross-node @smoke
   Scenario: Cross-node read after leader-only PUT (closes B-3)
     Given a 3-node kiseki cluster
     When a client writes 1MB via S3 PUT to node-1
@@ -298,7 +311,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And every follower has received the fragment
     Then S3 GET from any follower in the fresh bucket returns the same 1MB
 
-  @integration @multi-node @cross-node
+  @integration @multi-node @cross-node @smoke
   Scenario: Read survives leader failure (D-1)
     Given a 3-node kiseki cluster
     When a client writes 1MB via S3 PUT to node-1
@@ -317,7 +330,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # failure mode from the EC 4+2 6-node D-5 promotion (which
   # conflates fabric and Raft loss because killing 3 of 6 also
   # breaks Raft majority).
-  @integration @multi-node @cross-node
+  @integration @multi-node @cross-node @smoke
   Scenario: Write requires 2-of-3 quorum (D-5)
     Given a 3-node kiseki cluster
     And node-2's incoming fabric is denied
@@ -388,7 +401,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # and calls `PutFragment` against node-1's data-path port — the
   # SAN-role interceptor (`fabric_san_interceptor`) rejects the call
   # with `PermissionDenied`. Closes I-Auth4 in the BDD harness.
-  @integration @multi-node @cross-node
+  @integration @multi-node @cross-node @smoke
   Scenario: Tenant cert presented to fabric port is rejected (I-Auth4)
     Given a 3-node mTLS kiseki cluster
     When a tenant cert calls PutFragment against node-1's data-path port
@@ -401,3 +414,37 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     Then S3 GET returns the same 1MB
     And no fabric fan-out RPCs were issued
     And the server did not report quorum errors
+
+  # === Shard split/merge admin (ADR-033, ADR-034) ===
+  # These scenarios mirror the @library split/merge in storage-admin.feature
+  # and log.feature, but drive admin gRPC against a real spawned 3-node
+  # cluster — exercising the multiplexed Raft transport (ADR-041) and the
+  # cluster-wide consensus path through `RaftShardStore::split_shard` /
+  # `merge_shards`. Closes the @library→@integration fidelity gap that
+  # the gate-2 audit flagged for shard lifecycle.
+
+  @integration @multi-node @shard-mgmt @smoke
+  Scenario: Admin SplitShard returns a new shard id on a 3-node cluster (ADR-033)
+    Given a 3-node kiseki cluster
+    When the admin calls SplitShard for the bootstrap shard via node-1 admin gRPC
+    Then the SplitShard response carries a non-empty right_shard_id distinct from the left
+    And the bootstrap shard remains queryable on every node
+
+  @integration @multi-node @shard-mgmt
+  Scenario: Admin SplitShard followed by MergeShards round-trips via admin gRPC (ADR-033, ADR-034)
+    Given a 3-node kiseki cluster
+    When the admin calls SplitShard for the bootstrap shard via node-1 admin gRPC
+    And the admin calls MergeShards merging the right back into the left via node-1 admin gRPC
+    Then the MergeShards response merged_shard_id equals the left shard id
+    And the bootstrap shard remains queryable on every node
+
+  # ADR-033 §4 (Phase B): the control-plane Raft group's apply hook
+  # creates the new shard's per-shard Raft group locally on every
+  # node — leader explicitly initializes membership after the
+  # control-plane RecordSplit commits. Pins that gap closure: pre-#4
+  # the new shard existed only on the calling node.
+  @integration @multi-node @shard-mgmt @cross-node
+  Scenario: SplitShard creates the new shard's per-shard Raft group on every node (ADR-033 §4)
+    Given a 3-node kiseki cluster
+    When the admin calls SplitShard for the bootstrap shard via node-1 admin gRPC
+    Then every node logged the apply hook registering the new shard locally
