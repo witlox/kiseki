@@ -65,14 +65,28 @@ pub struct NativeWorld {
 }
 
 impl NativeWorld {
-    /// Resolve a Gherkin tenant name to its `OrgId`. Mints a fresh
-    /// UUID on first lookup so the same name persists across all
-    /// steps in a scenario.
+    /// Resolve a Gherkin tenant name to its `OrgId`.
+    ///
+    /// The first tenant a Background asks for ("org-pharma" in
+    /// `native-gateway.feature`) is mapped to the cluster's bootstrap
+    /// tenant — the only tenant that the harness's S3 bucket-create
+    /// path registers namespaces under today, since the existing S3
+    /// gateway path is single-tenant. Subsequent tenants get fresh
+    /// UUIDs; scenarios that exercise multi-tenant rejection (e.g.
+    /// "org-bank" vs "org-pharma") rely on those mismatches.
     pub fn tenant_id_for(&mut self, name: &str) -> OrgId {
         if let Some(id) = self.tenants.get(name) {
             return *id;
         }
-        let id = OrgId(uuid::Uuid::new_v4());
+        let id = if self.tenants.is_empty() {
+            // Bootstrap tenant — matches `runtime.rs`'s
+            // `Uuid::from_u128(1)` constant. The S3 bucket-create
+            // path registers under this tenant; native gateway
+            // scenarios talking to those buckets must use the same.
+            OrgId(uuid::Uuid::from_u128(1))
+        } else {
+            OrgId(uuid::Uuid::new_v4())
+        };
         self.tenants.insert(name.to_string(), id);
         id
     }

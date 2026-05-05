@@ -86,6 +86,15 @@ fn main() {
         }
     }
 
+    // Install the rustls CryptoProvider once, very early. Without this
+    // the first thread to use rustls (which is `kiseki-advisory` in
+    // mTLS-configured builds — the advisory runtime spins up before
+    // the main data path) panics with "Could not automatically
+    // determine the process-level CryptoProvider". The data-path
+    // tonic stack would normally race ahead and lose this race only
+    // intermittently; explicit install removes the race entirely.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Load config before the runtime — it's pure env parsing, no async needed.
     let cfg = config::ServerConfig::from_env();
 

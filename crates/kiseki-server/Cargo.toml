@@ -73,6 +73,7 @@ postcard = { workspace = true }
 redb = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 tonic = { workspace = true }
 thiserror = { workspace = true }
 serde = { version = "1", features = ["derive"] }

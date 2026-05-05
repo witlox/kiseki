@@ -632,6 +632,13 @@ impl KisekiWorld {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Install the rustls CryptoProvider once for the BDD test binary.
+    // Without this, the first thread to use rustls (typically the
+    // tonic data-path channel built by the cluster harness or the
+    // reqwest client minted by `register_namespace_via_s3`) panics
+    // with "Could not automatically determine the process-level
+    // CryptoProvider".
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     // Optional env-var filter for ad-hoc per-subset timing measurements.

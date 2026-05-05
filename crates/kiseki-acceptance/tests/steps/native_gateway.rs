@@ -114,23 +114,46 @@ fn ns_id(ns: NamespaceId) -> kiseki_proto::v1::NamespaceId {
     }
 }
 
-/// Register a namespace via the in-process gateway path. The harness's
-/// kiseki-server binary doesn't expose a dedicated CreateNamespace
-/// admin RPC for arbitrary tenants today; the @native scenarios that
-/// need a typed namespace use this S3-side bucket-create shortcut
-/// (which calls `gateway.ensure_namespace(fallback_tenant, derived_ns)`).
+/// Register a namespace via S3 bucket-create. When the harness runs
+/// in mTLS mode, the S3 port uses TLS (`https://...:port`) and the
+/// caller must present a tenant cert. We use a reqwest client built
+/// against the harness CA + a freshly-minted kiseki-tenant cert.
 ///
 /// Returns the namespace id the gateway derived from the bucket name —
-/// scenarios that need to drive the native gateway use this id, not
-/// the synthetic `world.namespace_id_for(name)` UUID.
+/// scenarios drive the native gateway against this id, NOT the
+/// synthetic `world.namespace_id_for(name)` UUID.
 async fn register_namespace_via_s3(
     harness: &ClusterHarness,
     bucket: &str,
+    tenant_id: OrgId,
 ) -> Result<NamespaceId, String> {
     let node = harness.node(1);
-    let url = format!("{}/{bucket}", node.s3_base);
-    let resp = node
-        .http
+    let port = node.ports.s3_http;
+    let certs = harness.mtls_certs().expect("mTLS harness");
+    let cert = certs.mint_kiseki_tenant_cert(&tenant_id.0.to_string());
+    let mut ca_buf = std::io::Cursor::new(certs.ca_pem_text().as_bytes());
+    let ca_certs = rustls_pemfile::certs(&mut ca_buf)
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let mut root = rustls::RootCertStore::empty();
+    for c in ca_certs {
+        let _ = root.add(c);
+    }
+    let _ = root; // root is used by use_preconfigured_tls below.
+    let id = reqwest::Identity::from_pem(
+        format!("{}\n{}", cert.cert_pem, cert.key_pem).as_bytes(),
+    )
+    .map_err(|e| format!("identity: {e}"))?;
+    let http = reqwest::Client::builder()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(certs.ca_pem_text().as_bytes())
+                .map_err(|e| format!("root cert: {e}"))?,
+        )
+        .identity(id)
+        .build()
+        .map_err(|e| format!("reqwest build: {e}"))?;
+    let url = format!("https://localhost:{port}/{bucket}");
+    let resp = http
         .put(&url)
         .send()
         .await
@@ -138,11 +161,10 @@ async fn register_namespace_via_s3(
     if !resp.status().is_success() && resp.status().as_u16() != 409 {
         return Err(format!("bucket create returned {}", resp.status()));
     }
-    // Mirror the gateway's `namespace_from_bucket` derivation. The
-    // function is private to kiseki-gateway::s3_server, but the
-    // derivation is documented as `Uuid::new_v5(NIL, bucket_name)`.
+    // Mirror the gateway's `namespace_from_bucket` derivation: the
+    // S3 server uses Uuid::new_v5(NAMESPACE_DNS, bucket_name).
     Ok(NamespaceId(uuid::Uuid::new_v5(
-        &uuid::Uuid::nil(),
+        &uuid::Uuid::NAMESPACE_DNS,
         bucket.as_bytes(),
     )))
 }
@@ -179,12 +201,13 @@ async fn given_tenant_cert(w: &mut KisekiWorld, tenant: String, _san: String) {
 async fn given_namespace_registered(
     w: &mut KisekiWorld,
     namespace: String,
-    _tenant: String,
+    tenant: String,
 ) {
+    let tenant_id = w.native.tenant_id_for(&tenant);
     // Buckets are unique per scenario to avoid collisions across the
     // singleton-shared cluster.
     let bucket = format!("{namespace}-{}", uuid::Uuid::new_v4().simple());
-    let real_ns = register_namespace_via_s3(cluster_ref(w), &bucket)
+    let real_ns = register_namespace_via_s3(cluster_ref(w), &bucket, tenant_id)
         .await
         .expect("register namespace via S3 bucket-create");
     w.native.namespaces.insert(namespace, real_ns);
