@@ -45,6 +45,11 @@ pub async fn build(
             // No server needed.
             Ok(Arc::new(InProcessDriver::new()))
         }
+        Protocol::InProcessPersistent => {
+            // No server needed; mirrors `kiseki-server`'s persistent
+            // wiring inside this process.
+            Ok(Arc::new(InProcessPersistentDriver::new().await?))
+        }
         Protocol::S3 => {
             let s = server.ok_or("S3 driver requires --server-bin (none was passed)")?;
             Ok(Arc::new(S3Driver::new(&s.s3_base)))
@@ -990,6 +995,155 @@ impl Driver for NativeDriver {
             .await
             .map_err(|e| format!("native get: {e}"))?
             .into_inner();
+        Ok(resp.data.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-process gateway WITH the persistent stores (the "transport-tax floor")
+// ---------------------------------------------------------------------------
+
+/// Same gateway shape `kiseki-server` runs (redb-backed
+/// `CompositionStore`, raw-block `PersistentChunkStore` with
+/// group-commit fsync), but called directly in this process — no
+/// gRPC, no h2, no tonic. The gap between this driver's throughput
+/// and the [`InProcessDriver`]'s pure-RAM measurement is the
+/// **persistence tax**; the gap between this driver and the
+/// [`NativeDriver`] is the **transport tax**.
+///
+/// `kiseki-server` also runs Raft + view store + workflow table +
+/// metrics histograms; we deliberately omit those because they're
+/// orthogonal to the per-write cost we're trying to bound. With
+/// the listed bits in place a single PUT exercises the same redb
+/// commit + chunk device write + group-commit fsync pipeline the
+/// production server pays.
+pub struct InProcessPersistentDriver {
+    gateway: kiseki_gateway::mem_gateway::InMemoryGateway,
+    namespace_id: NamespaceId,
+    tenant_id: OrgId,
+    /// Tempdir owning the redb files + raw block device. Drops at
+    /// the end of the run.
+    _data_dir: tempfile::TempDir,
+}
+
+impl InProcessPersistentDriver {
+    pub async fn new() -> Result<Self, String> {
+        use kiseki_common::ids::ShardId;
+        use kiseki_common::tenancy::KeyEpoch;
+        use kiseki_composition::composition::CompositionStore;
+        use kiseki_composition::namespace::Namespace;
+        use kiseki_crypto::keys::SystemMasterKey;
+        use kiseki_gateway::mem_gateway::InMemoryGateway;
+
+        let data_dir = tempfile::tempdir()
+            .map_err(|e| format!("InProcessPersistent tempdir: {e}"))?;
+        let dir = data_dir.path();
+
+        // 1. Persistent chunk store — same shape as runtime.rs:
+        //    raw block device + group-commit fsync (sync_per_write =
+        //    false). 4 GiB is plenty for a 30 s run; the spawned
+        //    `kiseki-server` uses the same default.
+        std::fs::create_dir_all(dir.join("chunks"))
+            .map_err(|e| format!("chunks dir: {e}"))?;
+        let dev_path = dir.join("chunks").join("data.dev");
+        let meta_path = dir.join("chunks").join("meta.json");
+        let chunks = kiseki_chunk::PersistentChunkStore::init(
+            &dev_path,
+            &meta_path,
+            4 * 1024 * 1024 * 1024,
+        )
+        .map_err(|e| format!("chunk store init: {e}"))?;
+        chunks.set_sync_per_write(false);
+        let chunks_async = kiseki_chunk::arc_async(chunks);
+
+        // 2. Persistent composition store — redb-backed, with the
+        //    same write-behind queue config the runtime uses by
+        //    default (KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100).
+        std::fs::create_dir_all(dir.join("metadata"))
+            .map_err(|e| format!("metadata dir: {e}"))?;
+        let comp_path = dir.join("metadata").join("compositions.redb");
+        let interval_ms = std::env::var("KISEKI_COMPOSITION_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(100);
+        let mut comp_store_redb =
+            kiseki_composition::persistent::PersistentRedbStorage::open(&comp_path)
+                .map_err(|e| format!("composition redb open: {e}"))?
+                .with_eventual_durability(true);
+        let drainer = comp_store_redb.enable_write_behind(
+            4096,
+            std::time::Duration::from_millis(interval_ms),
+            1024,
+        );
+        tokio::spawn(drainer.run());
+        let comp_storage: Box<dyn kiseki_composition::persistent::CompositionStorage> =
+            Box::new(comp_store_redb);
+        let mut compositions = CompositionStore::with_storage(comp_storage);
+
+        // 3. Single-tenant namespace registration so PUT/GET have
+        //    a target. Distinct from the runtime's bootstrap tenant
+        //    (Uuid::from_u128(1)) so this driver doesn't share state
+        //    with anything else if the run is invoked in a shared
+        //    workspace.
+        let tenant_id = OrgId(uuid::Uuid::from_u128(101));
+        let namespace_id = NamespaceId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            b"in-process-persistent-floor",
+        ));
+        compositions.add_namespace(Namespace {
+            id: namespace_id,
+            tenant_id,
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        });
+
+        // 4. Build the InMemoryGateway with these persistent stores.
+        let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let gateway = InMemoryGateway::new(compositions, chunks_async, master_key);
+        Ok(Self {
+            gateway,
+            namespace_id,
+            tenant_id,
+            _data_dir: data_dir,
+        })
+    }
+}
+
+#[async_trait]
+impl Driver for InProcessPersistentDriver {
+    async fn put(&self, payload: &[u8]) -> Result<Key, String> {
+        let resp = self
+            .gateway
+            .write(WriteRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                data: payload.to_vec(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .map_err(|e| format!("in-process-persistent put: {e}"))?;
+        Ok(Key {
+            composition_id: resp.composition_id,
+            name: None,
+        })
+    }
+
+    async fn get(&self, key: &Key) -> Result<usize, String> {
+        let resp = self
+            .gateway
+            .read(kiseki_gateway::ops::ReadRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                composition_id: key.composition_id,
+                offset: 0,
+                length: u64::MAX,
+            })
+            .await
+            .map_err(|e| format!("in-process-persistent get: {e}"))?;
         Ok(resp.data.len())
     }
 }

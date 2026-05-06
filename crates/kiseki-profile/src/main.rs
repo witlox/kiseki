@@ -64,6 +64,15 @@ enum Protocol {
     /// ADR-042's perf gate (A-NG11: ≥80 k op/s GET, ≥56 k op/s PUT
     /// per node) bounds.
     Native,
+    /// In-process gateway with the SAME persistent stores the
+    /// spawned `kiseki-server` uses (redb-backed `CompositionStore`,
+    /// raw-block `PersistentChunkStore` with group-commit fsync).
+    /// Skips the gRPC + tonic + h2 stack but pays every persistence
+    /// cost the production gateway pays. The right floor for the
+    /// "transport tax" measurement: the gap between this and
+    /// `Native` is whatever the protocol layer adds; the gap
+    /// between this and `InProcess` is the persistence tax.
+    InProcessPersistent,
 }
 
 /// Workload shape — what mix of operations to drive.
@@ -143,7 +152,9 @@ fn main() {
     // flamegraph format. Only active for InProcess; no-op for
     // protocols that drive a separately-instrumented server.
     let local_pprof_path = match args.protocol {
-        Protocol::InProcess => std::env::var("KISEKI_PROFILE_PPROF_OUT").ok(),
+        Protocol::InProcess | Protocol::InProcessPersistent => {
+            std::env::var("KISEKI_PROFILE_PPROF_OUT").ok()
+        }
         _ => None,
     };
     let local_pprof_guard = local_pprof_path.as_ref().and_then(|_| {
@@ -174,7 +185,10 @@ fn main() {
 async fn run(args: RunArgs) -> Result<(), String> {
     // The in-process driver doesn't need a spawned server — it
     // instantiates the gateway directly. Skip the harness for it.
-    let server = if matches!(args.protocol, Protocol::InProcess) {
+    let server = if matches!(
+        args.protocol,
+        Protocol::InProcess | Protocol::InProcessPersistent
+    ) {
         None
     } else {
         {
