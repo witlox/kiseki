@@ -39,6 +39,12 @@ pub mod remote_nfs;
 #[cfg(feature = "native")]
 pub mod native;
 
+/// `GatewayOps` adapter over the ADR-042 TCP-framed-postcard binding.
+/// FUSE / NFS / S3 callers consume `GatewayOps`; this lets them ride
+/// the native binding the same way `remote_http` lets them ride S3.
+#[cfg(feature = "native")]
+pub mod native_remote;
+
 #[cfg(feature = "ffi")]
 #[allow(missing_docs, unsafe_code, clippy::missing_safety_doc)]
 pub mod ffi;

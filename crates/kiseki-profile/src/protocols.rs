@@ -69,7 +69,12 @@ pub async fn build(
         }
         Protocol::Fuse => {
             let s = server.ok_or("Fuse driver requires --server-bin")?;
-            Ok(Arc::new(FuseDriver::new(&s.s3_base)))
+            // ADR-042: FUSE rides the TCP-framed binding directly,
+            // not the S3 listener. The S3-over-HTTP path FUSE used
+            // to take capped at ~7.6 k op/s; the native binding
+            // measures ~70 k op/s on the same hardware.
+            let addr = format!("127.0.0.1:{}", s.ports.tcp_framed);
+            Ok(Arc::new(FuseDriver::new(&addr, pool_size).await?))
         }
         Protocol::Native => {
             let s = server.ok_or("Native driver requires --server-bin")?;
@@ -531,15 +536,15 @@ impl Driver for PnfsDriver {
 }
 
 // ---------------------------------------------------------------------------
-// FUSE → GatewayOps → S3 wire
+// FUSE → GatewayOps → native TCP-framed wire (ADR-042)
 // ---------------------------------------------------------------------------
 //
 // `KisekiFuse` is a sync POSIX-style API backed by an async
-// `GatewayOps` impl. We point it at `RemoteHttpGateway` so every
-// `fs.create()` is a real HTTP PUT to the running server, every
-// `fs.read()` is a real HTTP GET. The KisekiFuse instance manages
-// its own internal tokio runtime; we run each op via
-// `spawn_blocking` so the outer worker stays async.
+// `GatewayOps` impl. We point it at `NativeRemoteGateway` so every
+// `fs.create()` rides a put_object verb on the TCP-framed binding,
+// every `fs.read()` rides a get_object verb. The S3-over-HTTP detour
+// is gone — the V3 split-bulk wire format ships meta + payload in
+// one writev syscall.
 
 struct FuseDriver {
     /// One shared `KisekiFuse` instance. The wrapped Mutex
@@ -555,20 +560,26 @@ struct FuseDriver {
     /// std mutex would block tokio worker threads under concurrency
     /// (same starvation pattern fixed for `Nfs4Client`). Measured
     /// pre-fix: c=1 p99 = 630µs, c=16 p99 = 218 ms.
-    fs: tokio::sync::Mutex<kiseki_client::fuse_fs::KisekiFuse<RemoteHttpGateway>>,
+    fs: tokio::sync::Mutex<
+        kiseki_client::fuse_fs::KisekiFuse<kiseki_client::native_remote::NativeRemoteGateway>,
+    >,
 }
 
 impl FuseDriver {
-    fn new(s3_base: &str) -> Self {
-        let gateway = RemoteHttpGateway::new(s3_base);
+    async fn new(addr: &str, pool_size: usize) -> Result<Self, String> {
+        let gateway = kiseki_client::native_remote::NativeRemoteGateway::connect_plaintext(
+            addr, pool_size,
+        )
+        .await
+        .map_err(|e| format!("native-remote connect: {e}"))?;
         let fs = kiseki_client::fuse_fs::KisekiFuse::new(
             gateway,
             OrgId(uuid::Uuid::from_u128(1)),
             NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
         );
-        Self {
+        Ok(Self {
             fs: tokio::sync::Mutex::new(fs),
-        }
+        })
     }
 }
 
