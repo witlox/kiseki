@@ -38,11 +38,8 @@ Key Management   Internal · Vault · AWS KMS · Azure Key Vault · GCP Cloud KM
 Transports       CXI / InfiniBand / RoCEv2 / TCP+TLS
 ```
 
-21 Rust crates (20 production + 1 BDD-test), ~1650 unit/integration tests, 31 e2e tests, 321 BDD scenarios, 41 ADRs, 140 invariants.
-
 Integrates with [Lattice](https://github.com/witlox/lattice) (workload scheduling),
-[Pact](https://github.com/witlox/pact) (node configuration), and
-[OpenCHAMI](https://openchami.org) (boot infrastructure).
+[Pact](https://github.com/witlox/pact) (node configuration).
 
 ## Installation
 
