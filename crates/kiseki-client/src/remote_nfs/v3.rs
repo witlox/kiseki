@@ -55,6 +55,16 @@ pub struct Nfs3Client {
     /// Held only across cheap clones, not network IO, so `std::Mutex`
     /// is fine here.
     root_fh: Mutex<Option<Vec<u8>>>,
+    /// Composition-id → file-handle cache. NFSv3 GET would otherwise
+    /// pay LOOKUP + READ on every call (2 RPCs). After a write or a
+    /// successful read, we cache the server-returned handle keyed by
+    /// composition_id; subsequent GETs of the same composition skip
+    /// the LOOKUP and go straight to READ. Halves NFSv3 GET RPC
+    /// count on the warmup-then-read perf workload.
+    ///
+    /// `std::sync::Mutex` — only held briefly across HashMap
+    /// `get_cloned` / `insert`, never across network IO.
+    fh_cache: Mutex<HashMap<CompositionId, Vec<u8>>>,
     /// Client-side multipart upload buffers keyed by upload ID.
     /// Each value is a list of (`part_number`, data) pairs assembled
     /// into a single CREATE+WRITE on `complete_multipart`.
@@ -84,8 +94,19 @@ impl Nfs3Client {
             transports,
             next: AtomicUsize::new(0),
             root_fh: Mutex::new(None),
+            fh_cache: Mutex::new(HashMap::new()),
             multipart_buffers: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn cache_fh(&self, comp_id: CompositionId, fh: Vec<u8>) {
+        if let Ok(mut c) = self.fh_cache.lock() {
+            c.insert(comp_id, fh);
+        }
+    }
+
+    fn cached_fh(&self, comp_id: CompositionId) -> Option<Vec<u8>> {
+        self.fh_cache.lock().ok().and_then(|c| c.get(&comp_id).cloned())
     }
 
     async fn ensure_transport(
@@ -255,6 +276,10 @@ impl GatewayOps for Nfs3Client {
             CompositionId(uuid::Uuid::parse_str(&filename).unwrap_or_else(|_| uuid::Uuid::new_v4()))
         };
 
+        // Cache the post-WRITE handle so subsequent READs of this
+        // composition skip the LOOKUP RPC.
+        self.cache_fh(composition_id, new_fh);
+
         Ok(WriteResponse {
             composition_id,
             bytes_written: req.data.len() as u64,
@@ -262,6 +287,17 @@ impl GatewayOps for Nfs3Client {
     }
 
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
+        // Fast path: cached file handle from a prior write or read.
+        // Skips the LOOKUP RPC entirely — single READ RPC per call.
+        // Halves the per-read latency and op count.
+        if let Some(cached) = self.cached_fh(req.composition_id) {
+            let mut guard = self.ensure_transport().await?;
+            let t = guard
+                .as_mut()
+                .expect("transport not initialized — call connect() first");
+            return read_with_fh(t, &cached, &req);
+        }
+
         let root_fh = self.ensure_root_fh().await?;
         let mut guard = self.ensure_transport().await?;
         let t = guard
@@ -287,38 +323,11 @@ impl GatewayOps for Nfs3Client {
             )));
         }
         let file_fh = r.read_opaque().map_err(|e| xdr_err(&e))?;
+        // Populate cache so future reads of the same composition
+        // take the fast path above.
+        self.cache_fh(req.composition_id, file_fh.clone());
 
-        // READ
-        let mut args = XdrWriter::new();
-        args.write_opaque(&file_fh);
-        args.write_u64(req.offset);
-        args.write_u32(u32::try_from(req.length).unwrap_or(u32::MAX));
-        let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_READ, &args.into_bytes())?;
-
-        let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
-        if status != NFS3_OK {
-            return Err(GatewayError::ProtocolError(format!(
-                "NFSv3 READ failed: status={status}"
-            )));
-        }
-        // post_op_attr
-        let has_attr = r.read_u32().map_err(|e| xdr_err(&e))?;
-        if has_attr != 0 {
-            // Skip fattr3 (84 bytes)
-            for _ in 0..21 {
-                let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
-            }
-        }
-        let _count = r.read_u32().map_err(|e| xdr_err(&e))?;
-        let eof = r.read_u32().map_err(|e| xdr_err(&e))? != 0;
-        let data = r.read_opaque().map_err(|e| xdr_err(&e))?;
-
-        Ok(ReadResponse {
-            data,
-            eof,
-            content_type: None,
-        })
+        read_with_fh(t, &file_fh, &req)
     }
 
     async fn list(
@@ -446,4 +455,45 @@ impl GatewayOps for Nfs3Client {
     ) -> Result<(), GatewayError> {
         Ok(()) // NFSv3 namespaces are implicit (directory tree).
     }
+}
+
+/// Issue an NFSv3 READ for `fh` against `req.offset`/`req.length`.
+/// Shared between the cached-handle fast path and the LOOKUP+READ
+/// slow path. The transport guard is held by the caller — this
+/// helper just drives the wire format and parses the reply.
+fn read_with_fh(
+    t: &mut RpcTransport,
+    fh: &[u8],
+    req: &ReadRequest,
+) -> Result<ReadResponse, GatewayError> {
+    let mut args = XdrWriter::new();
+    args.write_opaque(fh);
+    args.write_u64(req.offset);
+    args.write_u32(u32::try_from(req.length).unwrap_or(u32::MAX));
+    let reply = t.call(NFS_PROGRAM, NFS3_VERSION, NFSPROC3_READ, &args.into_bytes())?;
+
+    let mut r = XdrReader::new(&reply);
+    let status = r.read_u32().map_err(|e| xdr_err(&e))?;
+    if status != NFS3_OK {
+        return Err(GatewayError::ProtocolError(format!(
+            "NFSv3 READ failed: status={status}"
+        )));
+    }
+    // post_op_attr
+    let has_attr = r.read_u32().map_err(|e| xdr_err(&e))?;
+    if has_attr != 0 {
+        // Skip fattr3 (84 bytes)
+        for _ in 0..21 {
+            let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
+        }
+    }
+    let _count = r.read_u32().map_err(|e| xdr_err(&e))?;
+    let eof = r.read_u32().map_err(|e| xdr_err(&e))? != 0;
+    let data = r.read_opaque().map_err(|e| xdr_err(&e))?;
+
+    Ok(ReadResponse {
+        data,
+        eof,
+        content_type: None,
+    })
 }

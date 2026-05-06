@@ -53,6 +53,14 @@ pub struct Nfs4Client {
     /// Round-robin slot selector. Wrapping add with `% sessions.len()`
     /// hands out connections fairly without locking the pool itself.
     next: AtomicUsize,
+    /// Composition-id → file-handle cache. NFSv4 read compounds
+    /// otherwise pay PUTROOTFH+OPEN(by name)+READ (3 ops, server
+    /// resolves the name via a directory lookup). With a cached
+    /// handle the compound becomes PUTFH+READ (2 ops, no name
+    /// resolution server-side) — meaningfully cheaper at the
+    /// server. Populated from each `write` compound's GETFH
+    /// result and from successful `read` slow paths.
+    fh_cache: Mutex<HashMap<CompositionId, Vec<u8>>>,
     /// Client-side multipart buffers. NFS has no native multipart concept,
     /// so we buffer parts locally and concatenate on complete.
     multipart_buffers: MultipartBuffer,
@@ -98,8 +106,19 @@ impl Nfs4Client {
             minor_version,
             sessions,
             next: AtomicUsize::new(0),
+            fh_cache: Mutex::new(HashMap::new()),
             multipart_buffers: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn cache_fh(&self, comp_id: CompositionId, fh: Vec<u8>) {
+        if let Ok(mut c) = self.fh_cache.lock() {
+            c.insert(comp_id, fh);
+        }
+    }
+
+    fn cached_fh(&self, comp_id: CompositionId) -> Option<Vec<u8>> {
+        self.fh_cache.lock().ok().and_then(|c| c.get(&comp_id).cloned())
     }
 
     async fn ensure_session(
@@ -523,6 +542,10 @@ impl GatewayOps for Nfs4Client {
             CompositionId(uuid::Uuid::new_v4())
         };
 
+        // Cache for subsequent reads — they'll use PUTFH+READ
+        // instead of PUTROOTFH+OPEN(by name)+READ.
+        self.cache_fh(composition_id, fh);
+
         Ok(WriteResponse {
             composition_id,
             bytes_written: u64::from(count),
@@ -535,31 +558,49 @@ impl GatewayOps for Nfs4Client {
             .as_mut()
             .expect("session not initialized — call connect_v41() first");
 
-        let filename = req.composition_id.0.to_string();
+        // Fast path: cached file handle from a prior write or read.
+        // Server sets current_fh from PUTFH directly — no name
+        // resolution, no OPEN. Compound is PUTFH+READ (2 ops vs the
+        // slow path's PUTROOTFH+OPEN+READ).
+        let reply = if let Some(cached) = self.cached_fh(req.composition_id) {
+            let mut w = XdrWriter::new();
+            w.write_opaque(&cached);
+            let putfh = (op::PUTFH, w.into_bytes());
 
-        let putrootfh = (op::PUTROOTFH, Vec::new());
+            let mut w = XdrWriter::new();
+            w.write_u32(0);
+            w.write_opaque_fixed(&[0u8; 12]);
+            w.write_u64(req.offset);
+            w.write_u32(u32::try_from(req.length).unwrap_or(u32::MAX));
+            let read = (op::READ, w.into_bytes());
 
-        // OPEN (read existing)
-        let mut w = XdrWriter::new();
-        w.write_u32(0);
-        w.write_u32(1); // READ
-        w.write_u32(0);
-        w.write_u64(sess.client_id);
-        w.write_opaque(b"kiseki-client");
-        w.write_u32(0); // OPEN4_NOCREATE
-        w.write_u32(0); // CLAIM_NULL
-        w.write_string(&filename);
-        let open = (op::OPEN, w.into_bytes());
+            sess.sequenced_compound(self.minor_version, &[putfh, read])?
+        } else {
+            let filename = req.composition_id.0.to_string();
+            let putrootfh = (op::PUTROOTFH, Vec::new());
 
-        // READ
-        let mut w = XdrWriter::new();
-        w.write_u32(0);
-        w.write_opaque_fixed(&[0u8; 12]);
-        w.write_u64(req.offset);
-        w.write_u32(u32::try_from(req.length).unwrap_or(u32::MAX));
-        let read = (op::READ, w.into_bytes());
+            // OPEN (read existing)
+            let mut w = XdrWriter::new();
+            w.write_u32(0);
+            w.write_u32(1); // READ
+            w.write_u32(0);
+            w.write_u64(sess.client_id);
+            w.write_opaque(b"kiseki-client");
+            w.write_u32(0); // OPEN4_NOCREATE
+            w.write_u32(0); // CLAIM_NULL
+            w.write_string(&filename);
+            let open = (op::OPEN, w.into_bytes());
 
-        let reply = sess.sequenced_compound(self.minor_version, &[putrootfh, open, read])?;
+            // READ
+            let mut w = XdrWriter::new();
+            w.write_u32(0);
+            w.write_opaque_fixed(&[0u8; 12]);
+            w.write_u64(req.offset);
+            w.write_u32(u32::try_from(req.length).unwrap_or(u32::MAX));
+            let read = (op::READ, w.into_bytes());
+
+            sess.sequenced_compound(self.minor_version, &[putrootfh, open, read])?
+        };
 
         // Find READ result — scan for the op code
         let read_bytes = op::READ.to_be_bytes();
