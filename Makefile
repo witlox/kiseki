@@ -135,10 +135,36 @@ test: test-fast ## Alias for `test-fast` — the pre-commit standard
 # Architecture enforcement (ADV-3)
 # ---------------------------------------------------------------------
 
-arch-check: ## Verify kiseki-control depends only on allowed crates
-	@! grep -E 'kiseki-(log|chunk|composition|view|gateway|client|keymanager|crypto|raft|transport|server|audit|advisory)' \
+arch-check: ## Verify cross-crate boundaries (kiseki-control isolation + ADR-042 §1.8 enforcement)
+	@# kiseki-control isolation: forbid data-path crate names appearing
+	@# as a dep ENTRY (`<name> = ` at start of line), not in comments
+	@# or other prose. Anchored on `^` + `\s*` to match Cargo dep keys.
+	@! grep -E '^\s*kiseki-(log|chunk|composition|view|gateway|client|keymanager|crypto|raft|transport|server|audit|advisory)\s*=' \
 	    crates/kiseki-control/Cargo.toml \
 	    || { echo "VIOLATION: kiseki-control depends on a data-path crate"; exit 1; }
+	@# ADR-042 §1.8: ServerImpl is binding-agnostic — no
+	@# `tonic::Request` / `tonic::Response` / `tonic::Streaming`, no
+	@# TCP-framed `ConnectionContext`, no cxi `AttestationContext`
+	@# may appear in the handler module. The grpc adapter (sibling
+	@# module) is allowed to use tonic; ServerImpl reads request-
+	@# source identity ONLY through `&dyn RequestPrincipal`. A future
+	@# contributor adding a binding-specific shortcut method to
+	@# ServerImpl fails CI before review.
+	@#
+	@# `tonic::Status` is the per-call error type returned by handler
+	@# methods today and stays allowed (the bigger NativeError-mapping
+	@# refactor is its own follow-up). All other `tonic::*` symbols
+	@# are forbidden.
+	@# Skip comment-only lines (`^\s*//`) so module-level docs that
+	@# REFERENCE the forbidden symbols (e.g., explaining the rule)
+	@# don't trip the grep — only real code references count.
+	@violations=$$(grep -nE 'tonic::(Request|Response|Streaming)\b|tcp_framed::ConnectionContext|cxi::AttestationContext' crates/kiseki-gateway/src/native/server.rs | grep -vE '^[0-9]+:[[:space:]]*//' || true); \
+	    if [ -n "$$violations" ]; then \
+	        echo "VIOLATION (ADR-042 §1.8): kiseki-gateway::native::server references a binding-specific request type:"; \
+	        echo "$$violations"; \
+	        echo "ServerImpl must read request-source identity ONLY through &dyn RequestPrincipal. Move binding-specific code into kiseki-gateway::native::<binding>::adapter."; \
+	        exit 1; \
+	    fi
 
 # ---------------------------------------------------------------------
 # Aggregate targets

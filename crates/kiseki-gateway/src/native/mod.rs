@@ -17,11 +17,14 @@
 
 pub mod canonical_san;
 pub mod dek_fetch_ticket;
+pub mod grpc;
 pub mod handle_token;
 pub mod lease_store;
 pub mod multipart_upload_id;
 pub mod san_interceptor;
 pub mod signing_keys;
+pub mod tcp_framed;
+pub mod topology_proto;
 
 pub mod server;
 

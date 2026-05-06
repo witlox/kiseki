@@ -18,7 +18,7 @@ use kiseki_gateway::nfs_xdr::{XdrReader, XdrWriter};
 use kiseki_gateway::ops::{GatewayOps, ReadRequest, WriteRequest};
 
 use crate::harness::ProfileServer;
-use crate::Protocol;
+use crate::{NativeBinding, Protocol};
 
 /// Opaque per-driver handle for a previously-PUT object. Most drivers
 /// just stash the `composition_id`; FUSE additionally tracks its own
@@ -37,6 +37,7 @@ pub trait Driver: Send + Sync {
 
 pub async fn build(
     protocol: Protocol,
+    binding: NativeBinding,
     server: Option<&ProfileServer>,
     pool_size: usize,
 ) -> Result<Arc<dyn Driver>, String> {
@@ -72,8 +73,20 @@ pub async fn build(
         }
         Protocol::Native => {
             let s = server.ok_or("Native driver requires --server-bin")?;
-            let addr = format!("127.0.0.1:{}", s.ports.grpc_data);
-            Ok(Arc::new(NativeDriver::new(&addr).await?))
+            // ADR-042 §16.1 phase 7: per-binding driver. `auto`
+            // resolves to gRPC for now (the historical default);
+            // when the client-side selector lands TopologyCache
+            // integration this branch consults it.
+            match binding {
+                NativeBinding::Grpc | NativeBinding::Auto => {
+                    let addr = format!("127.0.0.1:{}", s.ports.grpc_data);
+                    Ok(Arc::new(NativeDriver::new(&addr).await?))
+                }
+                NativeBinding::Tcp => {
+                    let addr = format!("127.0.0.1:{}", s.ports.tcp_framed);
+                    Ok(Arc::new(TcpFramedNativeDriver::new(&addr, pool_size).await?))
+                }
+            }
         }
     }
 }
@@ -1152,6 +1165,129 @@ impl Driver for InProcessPersistentDriver {
             })
             .await
             .map_err(|e| format!("in-process-persistent get: {e}"))?;
+        Ok(resp.data.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native — TCP-framed-postcard binding (ADR-042 §2.2)
+// ---------------------------------------------------------------------------
+
+/// Drives the kiseki-server's TCP-framed-postcard binding through
+/// [`kiseki_client::native::TcpFramedClient`]. Same handler as the
+/// gRPC `NativeDriver`; different wire — no h2 framing tax,
+/// length-prefixed postcard envelopes with `request_id`-multiplexed
+/// pipelining.
+///
+/// Pool shape mirrors `NativeDriver`: N independent TCP-framed
+/// clients (one TCP connection each) load-balanced round-robin so
+/// per-connection reader-task contention doesn't pin throughput to
+/// a single core.
+pub struct TcpFramedNativeDriver {
+    clients: Vec<Arc<kiseki_client::native::TcpFramedClient>>,
+    next: std::sync::atomic::AtomicUsize,
+    namespace_id: NamespaceId,
+    tenant_id: OrgId,
+}
+
+impl TcpFramedNativeDriver {
+    pub async fn new(addr: &str, pool_size: usize) -> Result<Self, String> {
+        let env_pool: usize = std::env::var("KISEKI_NATIVE_DRIVER_POOL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(pool_size.max(1));
+        let mut clients = Vec::with_capacity(env_pool);
+        for _ in 0..env_pool {
+            let client = kiseki_client::native::TcpFramedClient::connect_plaintext(addr)
+                .await
+                .map_err(|e| format!("tcp-framed connect: {e}"))?;
+            clients.push(client);
+        }
+        Ok(Self {
+            clients,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+        })
+    }
+
+    fn pick(&self) -> Arc<kiseki_client::native::TcpFramedClient> {
+        let idx = self
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.clients.len();
+        Arc::clone(&self.clients[idx])
+    }
+
+    fn ctrl(&self) -> kiseki_proto::v1::native::ControlFields {
+        kiseki_proto::v1::native::ControlFields {
+            tenant_id: Some(kiseki_proto::v1::OrgId {
+                value: self.tenant_id.0.to_string(),
+            }),
+            idempotency_key: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            workflow_ref: String::new(),
+            cache_hint: None,
+            conditional: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Driver for TcpFramedNativeDriver {
+    async fn put(&self, payload: &[u8]) -> Result<Key, String> {
+        let req = kiseki_proto::v1::native::PutObjectRequest {
+            control: Some(self.ctrl()),
+            namespace_id: Some(kiseki_proto::v1::NamespaceId {
+                value: self.namespace_id.0.to_string(),
+            }),
+            name: format!("perf-{}", uuid::Uuid::new_v4().simple()),
+            data: payload.to_vec(),
+        };
+        let body = postcard::to_allocvec(&req)
+            .map_err(|e| format!("tcp-framed put encode: {e}"))?;
+        let resp_bytes = self
+            .pick()
+            .call_ok("put_object", body)
+            .await
+            .map_err(|e| format!("tcp-framed put: {e}"))?;
+        let resp: kiseki_proto::v1::native::PutObjectResponse =
+            postcard::from_bytes(&resp_bytes)
+                .map_err(|e| format!("tcp-framed put decode: {e}"))?;
+        let comp = resp
+            .composition_id
+            .ok_or_else(|| "tcp-framed put: response missing composition_id".to_string())?;
+        let uuid = uuid::Uuid::parse_str(&comp.value)
+            .map_err(|e| format!("tcp-framed put: composition_id parse: {e}"))?;
+        Ok(Key {
+            composition_id: kiseki_common::ids::CompositionId(uuid),
+            name: None,
+        })
+    }
+
+    async fn get(&self, key: &Key) -> Result<usize, String> {
+        let req = kiseki_proto::v1::native::GetObjectRequest {
+            control: Some(self.ctrl()),
+            namespace_id: Some(kiseki_proto::v1::NamespaceId {
+                value: self.namespace_id.0.to_string(),
+            }),
+            range_start: 0,
+            range_end: 0,
+            key: Some(kiseki_proto::v1::native::get_object_request::Key::CompositionId(
+                kiseki_proto::v1::CompositionId {
+                    value: key.composition_id.0.to_string(),
+                },
+            )),
+        };
+        let body = postcard::to_allocvec(&req)
+            .map_err(|e| format!("tcp-framed get encode: {e}"))?;
+        let resp_bytes = self
+            .pick()
+            .call_ok("get_object", body)
+            .await
+            .map_err(|e| format!("tcp-framed get: {e}"))?;
+        let resp: kiseki_proto::v1::native::GetObjectResponse =
+            postcard::from_bytes(&resp_bytes)
+                .map_err(|e| format!("tcp-framed get decode: {e}"))?;
         Ok(resp.data.len())
     }
 }

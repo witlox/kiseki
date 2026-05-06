@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = true
 
 [lints]
 workspace = true
@@ -31,8 +32,19 @@ remote-http = ["reqwest", "async-trait"]
 # translates GatewayOps into NFSv4 COMPOUND RPCs over TCP. Uses
 # XDR utilities from kiseki-gateway. ADR-023 D7.
 remote-nfs = ["async-trait"]
-# Native gRPC GatewayDataService client (ADR-042 Phase 5).
-native = ["dep:kiseki-proto", "dep:tonic", "dep:dashmap", "async-trait"]
+# Native GatewayDataService client (ADR-042). Covers BOTH the gRPC
+# binding (Phase 5) and the TCP-framed-postcard binding (§2.2).
+# Bindings are always-compiled when the `native` feature is on;
+# runtime selection picks per-edge per ADR-042 §3.2.
+native = [
+    "dep:kiseki-proto",
+    "dep:tonic",
+    "dep:dashmap",
+    "dep:postcard",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "async-trait",
+]
 
 [dependencies]
 kiseki-common = { workspace = true }
@@ -41,8 +53,16 @@ kiseki-composition = { workspace = true }
 kiseki-crypto = { workspace = true }
 kiseki-gateway = { workspace = true }
 kiseki-proto = { workspace = true, optional = true }
+# ADR-042 §3.2 client-side per-edge selector reuses
+# kiseki-transport::native::OperatorPin for the
+# `KISEKI_NATIVE_TRANSPORT` semantics — same pin shape applies to
+# both server-side and client-side selection.
+kiseki-transport = { workspace = true }
 tonic = { workspace = true, optional = true }
 dashmap = { version = "6", optional = true }
+postcard = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", default-features = false, optional = true }
 parking_lot = { workspace = true }
 async-trait = { version = "0.1", optional = true }
 fuser = { version = "0.17", optional = true }

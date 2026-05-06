@@ -20,6 +20,9 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod metrics;
+/// ADR-042 native gateway data-service binding selector +
+/// per-binding probe contract.
+pub mod native;
 #[allow(unsafe_code)] // pin_linux uses sched_setaffinity
 pub mod numa;
 pub mod pool;

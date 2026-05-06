@@ -1772,31 +1772,156 @@ pub async fn run_main(
             cfg.tls.is_some(),
         ),
     );
-    let native_server = kiseki_gateway::native::ServerImpl::new(
+    let native_server = std::sync::Arc::new(kiseki_gateway::native::ServerImpl::new(
         std::sync::Arc::clone(&gw) as std::sync::Arc<dyn kiseki_gateway::ops::GatewayOps>,
         native_signing_keys,
-    );
-    let native_intercept_for_tonic = std::sync::Arc::clone(&native_intercept);
-    let native_inner = kiseki_proto::v1::native::gateway_data_service_server::GatewayDataServiceServer::new(
-        native_server,
-    )
-    // Streaming PUT can deliver up to the configured per-stream cap
-    // (default 64 MiB, env KISEKI_NATIVE_STREAM_CAP overrides). The
-    // server-side decoded-message-size default is 4 MiB; raise to
-    // match the per-stream cap so a single PutObjectChunk payload
-    // doesn't get OutOfRange'd at the codec boundary. Encoding cap
-    // covers GET responses with similarly large payloads.
-    .max_decoding_message_size(64 * 1024 * 1024)
-    .max_encoding_message_size(64 * 1024 * 1024);
-    let native_svc = tonic::service::interceptor::InterceptedService::new(
-        native_inner,
-        move |req: tonic::Request<()>| native_intercept_for_tonic.intercept(req),
-    );
-    router = router.add_service(native_svc);
-    tracing::info!(
-        require_tls = cfg.tls.is_some(),
-        "native GatewayDataService registered (ADR-042)",
-    );
+    ));
+
+    // ADR-042 §3.1 + §16.1 phase 4: the BindingSelector orchestrates
+    // the three-phase startup. Each binding ships a probe; the
+    // selector probes them all, detects port collisions, applies the
+    // operator pin (`KISEKI_NATIVE_TRANSPORT`), and emits a plan in
+    // priority order (Rdma > Low > Standard).
+    let pin = match kiseki_transport::native::OperatorPin::parse(
+        std::env::var("KISEKI_NATIVE_TRANSPORT").ok().as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "KISEKI_NATIVE_TRANSPORT parse failed");
+            return Err(std::io::Error::other(e.to_string()).into());
+        }
+    };
+    let mut selector = kiseki_transport::native::BindingSelector::new();
+    selector.register(Box::new(kiseki_gateway::native::grpc::GrpcProbe::new(
+        cfg.data_addr.to_string(),
+    )));
+    selector.register(Box::new(
+        kiseki_gateway::native::tcp_framed::TcpFramedProbe::new("0.0.0.0:9101"),
+    ));
+    let selector = selector.with_pin(pin);
+    let (plan, report) = match selector.plan().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "native binding selector failed");
+            return Err(std::io::Error::other(e.to_string()).into());
+        }
+    };
+    let banner = kiseki_transport::native::selector::render_banner(&plan, &report);
+    for line in banner.lines() {
+        tracing::info!("{}", line);
+    }
+
+    // ADR-042 §1.7: publish the local node's binding set into the
+    // TopologyInjector so `GetTopology` carries the per-node
+    // BindingEndpoint list every client needs for §3.2 per-edge
+    // selection. Single-node deployment: this node's bindings ARE
+    // the topology. Multi-node deployments augment via control-
+    // plane gossip (a follow-up — once gossip lands, this same
+    // helper produces the LOCAL entry while the cluster-wide list
+    // is assembled across nodes).
+    {
+        let local_node_info = kiseki_gateway::native::topology_proto::node_info_from_plan(
+            cfg.node_id,
+            kiseki_proto::v1::native::NodeState::Active,
+            &plan,
+        );
+        native_server
+            .topology()
+            .replace(kiseki_gateway::native::server::TopologySnapshot {
+                nodes: vec![local_node_info],
+                shards_by_tenant: std::collections::HashMap::new(),
+            });
+    }
+
+    // ADR-042 §1.8: the binding-agnostic handler (`ServerImpl`) is
+    // wrapped by per-binding adapters. Same `ServerImpl` instance
+    // backs every binding the plan includes — multiple bindings
+    // concurrently when the operator hasn't pinned one.
+    let mut tcp_framed_listener_to_spawn: Option<
+        kiseki_gateway::native::tcp_framed::TcpFramedListener,
+    > = None;
+    for binding in &plan.spawn_order {
+        match binding.binding_id {
+            kiseki_proto::native_contract::BindingId::Grpc => {
+                let adapter = kiseki_gateway::native::grpc::GrpcAdapter::new(
+                    std::sync::Arc::clone(&native_server),
+                );
+                let native_intercept_for_tonic = std::sync::Arc::clone(&native_intercept);
+                let native_inner = kiseki_proto::v1::native::gateway_data_service_server::GatewayDataServiceServer::new(
+                    adapter,
+                )
+                // Streaming PUT can deliver up to the configured
+                // per-stream cap (default 64 MiB, env
+                // KISEKI_NATIVE_STREAM_CAP overrides). The server-
+                // side decoded-message-size default is 4 MiB; raise
+                // to match the per-stream cap so a single
+                // PutObjectChunk payload doesn't get OutOfRange'd at
+                // the codec boundary. Encoding cap covers GET
+                // responses with similarly large payloads.
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024);
+                let native_svc = tonic::service::interceptor::InterceptedService::new(
+                    native_inner,
+                    move |req: tonic::Request<()>| native_intercept_for_tonic.intercept(req),
+                );
+                router = router.add_service(native_svc);
+                tracing::info!(
+                    require_tls = cfg.tls.is_some(),
+                    "gRPC native binding registered on shared data_addr (ADR-042 §2.1)",
+                );
+            }
+            kiseki_proto::native_contract::BindingId::TcpFramed => {
+                let addr_str =
+                    if let kiseki_proto::native_contract::ListenAddr::HostPort(s) = &binding.addr {
+                        s.clone()
+                    } else {
+                        // TCP-framed should always have a host:port —
+                        // FabricDescriptor is RDMA-only.
+                        tracing::warn!(
+                            "TCP-framed binding probed with non-HostPort addr; skipping",
+                        );
+                        continue;
+                    };
+                tcp_framed_listener_to_spawn =
+                    Some(kiseki_gateway::native::tcp_framed::TcpFramedListener::new(
+                        addr_str.clone(),
+                        std::sync::Arc::clone(&native_server),
+                        // TLS wiring deferred to a follow-up slice —
+                        // listener accepts the same
+                        // `Arc<rustls::ServerConfig>` shape the gRPC
+                        // binding uses; for now plaintext in dev mode.
+                        None,
+                        /* allow_plaintext = */ cfg.tls.is_none(),
+                    ));
+                tracing::info!(
+                    addr = %addr_str,
+                    require_tls = cfg.tls.is_some(),
+                    "TCP-framed native binding registered (ADR-042 §2.2)",
+                );
+            }
+            kiseki_proto::native_contract::BindingId::Ibverbs => {
+                tracing::warn!(
+                    "ibverbs native binding probed but listener not yet implemented (ADR-042 phase 9)",
+                );
+            }
+            kiseki_proto::native_contract::BindingId::Libfabric { .. } => {
+                tracing::warn!(
+                    "libfabric native binding probed but listener not yet implemented (ADR-042 phase 10)",
+                );
+            }
+        }
+    }
+
+    // Spawn the TCP-framed listener (if any) on the runtime — it
+    // owns its socket separately from the cfg.data_addr router.
+    if let Some(listener) = tcp_framed_listener_to_spawn {
+        tokio::spawn(async move {
+            if let Err(e) = listener.run().await {
+                tracing::error!(error = %e, "TCP-framed native binding listener exited");
+            }
+        });
+    }
+
     router.serve_with_shutdown(cfg.data_addr, shutdown).await?;
 
     tracing::info!("data-path: shut down");

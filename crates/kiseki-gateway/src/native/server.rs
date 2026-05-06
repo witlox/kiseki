@@ -1,29 +1,35 @@
-//! `ServerImpl` — tonic service wrapper over `GatewayOps`.
+//! `ServerImpl` — binding-agnostic native gateway data-service handler.
 //!
-//! Implements `kiseki.v1.native.GatewayDataService` per ADR-042 §3-§14.
-//! Behavioral logic (commit-on-close, dedup, name binding, lease
-//! semantics) lives in [`GatewayOps`]; this module is the wire-decode +
-//! tonic-status-mapping shim plus per-call audit emission.
+//! ADR-042 §1.8: every binding (gRPC, TCP-framed-postcard, ibverbs,
+//! libfabric/cxi) ships its own adapter that decodes its
+//! binding-specific request shape and dispatches into the inherent
+//! methods on this struct, passing `&dyn RequestPrincipal` for the
+//! per-request identity context. Behavioral logic (commit-on-close,
+//! dedup, name binding, lease semantics) lives in [`GatewayOps`];
+//! this module is the proto-decode + status-mapping shim plus
+//! per-call audit emission.
 //!
-//! POSIX verbs (Open, Read, Write, ...) currently return
-//! `Status::unimplemented`. The POSIX path requires per-(namespace,
-//! inode) state that `GatewayOps` does not yet expose; that work is
-//! tracked as a Phase 2/4 follow-up in
-//! `specs/implementation/adr-042-native-gateway.md`. The wire bodies
-//! return real status codes (no `unimplemented!()` macro) so the
-//! handler is honest about what's not yet bridged.
+//! Per ADR-042 §1.8 enforcement (Makefile arch-check rule): this
+//! module MUST NOT reference binding-specific request-metadata types
+//! (`tonic::Request`, `tonic::Response`, `tonic::Streaming`,
+//! TCP-framed `ConnectionContext`, cxi `AttestationContext`). The
+//! grpc and tcp_framed adapters live in sibling modules and own the
+//! wire decode.
+//!
+//! POSIX verbs (`open`, `read`, `write`, ...) are not bridged here.
+//! The grpc adapter returns `Status::unimplemented` for them;
+//! TCP-framed dispatch surfaces them as `UnknownVerb`. Bridging to a
+//! real inode store is a Phase 2/4 follow-up in
+//! `specs/implementation/adr-042-native-gateway.md`.
 
 #![allow(clippy::too_many_lines)]
 
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
-use kiseki_proto::v1::native::{
-    self as np, gateway_data_service_server::GatewayDataService,
-};
-use tonic::{Request, Response, Status, Streaming};
+use kiseki_proto::v1::native as np;
+use tonic::Status;
 
 use crate::error::GatewayError;
 use crate::ops::{GatewayOps, ReadRequest, WriteConditional, WriteRequest};
@@ -194,41 +200,50 @@ fn org_from_proto(o: Option<&kiseki_proto::v1::OrgId>) -> Result<OrgId, Status> 
 }
 
 /// Cross-check the payload `tenant_id` against the canonical SAN URI
-/// stashed in the request's tonic extensions by `SanInterceptor`
-/// (gate-1 F-H1 — second half: the proto handler is responsible for
-/// the SAN ↔ payload binding; the interceptor only stashes).
+/// surfaced via [`RequestPrincipal::cert_san_canonical`] (ADR-042
+/// §1.8). Gate-1 F-H1 — second half: the proto handler is responsible
+/// for the SAN ↔ payload binding; bindings stash the canonical SAN at
+/// connection-acceptance time and the principal-adapter exposes it.
 ///
 /// The canonical SAN URI carries the tenant id as the trailing
 /// `/<tenant_id>` path segment. We require byte-equality between
 /// that segment and the payload's UUID-stringified `OrgId` value.
 ///
-/// In plaintext development mode the interceptor installs a synthetic
-/// `dev` SAN; the cross-check is then a no-op (production runtimes
-/// flip `require_tls = true` and the dev SAN never appears).
+/// In plaintext development mode the gRPC interceptor installs a
+/// synthetic `dev` SAN; the cross-check is then a no-op (production
+/// runtimes flip `require_tls = true` and the dev SAN never appears).
+///
+/// The principal is `&dyn RequestPrincipal` so this function is
+/// binding-agnostic — TCP-framed, ibverbs, libfabric/cxi all reach
+/// the same check via their own adapter that fills in the canonical
+/// SAN from their per-connection stash.
 #[allow(clippy::result_large_err)]
 fn enforce_san_payload_tenant_match(
-    canonical: Option<&super::canonical_san::CanonicalSanUri>,
+    principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
     payload_tenant: &OrgId,
 ) -> Result<(), Status> {
-    let Some(canonical) = canonical else {
-        // Interceptor not installed (e.g. unit tests on the bare
-        // ServerImpl). Skip the check rather than fail-closed; the
-        // test harness is responsible for installing a real or
-        // synthetic SAN when behavior depends on it.
+    let san = principal.cert_san_canonical();
+    if san.is_empty() {
+        // Adapter present but no canonical SAN was stashed (interceptor
+        // not installed — e.g. unit tests on the bare ServerImpl).
+        // Skip the check rather than fail-closed; the test harness is
+        // responsible for installing a real or synthetic SAN when
+        // behavior depends on it.
         return Ok(());
-    };
-    if canonical.tenant_id() == "dev" {
+    }
+    // The canonical SAN format is `spiffe://kiseki/tenant/<tenant_id>`
+    // (per `CanonicalSanUri`); pull the trailing segment.
+    let tenant = san.rsplit('/').next().unwrap_or("");
+    if tenant == "dev" {
         // Plaintext development principal — single-tenant posture.
         return Ok(());
     }
     let payload_str = payload_tenant.0.to_string();
-    if canonical.tenant_id() == payload_str {
+    if tenant == payload_str {
         return Ok(());
     }
     Err(Status::permission_denied(format!(
-        "san_payload_tenant_mismatch: cert SAN tenant {:?} != payload tenant {:?}",
-        canonical.tenant_id(),
-        payload_str,
+        "san_payload_tenant_mismatch: cert SAN tenant {tenant:?} != payload tenant {payload_str:?}",
     )))
 }
 
@@ -350,26 +365,38 @@ fn now_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------
-// GatewayDataService impl
+// ServerImpl handler methods (binding-agnostic)
 // ---------------------------------------------------------------------
+//
+// ADR-042 §1.8 enforcement: every handler reads request-source identity
+// only through `&dyn RequestPrincipal`. The tonic-shaped
+// `GatewayDataService` trait impl lives in [`super::grpc::adapter`];
+// other bindings (TCP-framed-postcard, ibverbs, libfabric/cxi) ship
+// their own adapter to the same inherent surface.
+//
+// Streaming methods (`put_object_stream`, `get_object_stream`,
+// `put_part`, `read_stream`, `write_stream`) live exclusively in the
+// adapter: they buffer/frame on the binding-specific stream type and
+// then call into the unary inherent methods here. This module never
+// references `tonic::Streaming`.
+//
+// POSIX-only methods (`path_lookup`, `open`, `read`, `write`, `close`,
+// `setattr`, `getattr`, `read_dir`, `mkdir`, `unlink`,
+// `rename_within_shard`) are not bridged in this phase; the adapter
+// returns `Unimplemented` directly.
 
-#[tonic::async_trait]
-impl GatewayDataService for ServerImpl {
+impl ServerImpl {
     // ----- Object verbs -----
 
-    async fn put_object(
+    pub async fn put_object(
         &self,
-        request: Request<np::PutObjectRequest>,
-    ) -> Result<Response<np::PutObjectResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::PutObjectRequest,
+    ) -> Result<np::PutObjectResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let conditional = write_conditional_from(cf)?;
         let workflow_ref = workflow_ref_bytes(&cf.workflow_ref)?;
@@ -389,77 +416,22 @@ impl GatewayDataService for ServerImpl {
             workflow_ref,
         };
         let resp = self.ops.write(wreq).await.map_err(map_gateway_error)?;
-        Ok(Response::new(np::PutObjectResponse {
+        Ok(np::PutObjectResponse {
             composition_id: Some(comp_to_proto(resp.composition_id)),
             size: resp.bytes_written,
             etag: Some(etag_for(resp.composition_id)),
-        }))
+        })
     }
 
-    async fn put_object_stream(
+    pub async fn get_object(
         &self,
-        request: Request<Streaming<np::PutObjectChunk>>,
-    ) -> Result<Response<np::PutObjectResponse>, Status> {
-        // Buffer the stream, then call put_object once. Phase 5+ may
-        // optimize for multi-chunk PUT atomicity (F-NG12) — the
-        // ServerImpl needs an atomic CommitStream barrier with
-        // orphan-fragment scrub on partial failure. v1 buffers.
-        let mut stream = request.into_inner();
-        let mut header: Option<np::PutObjectRequest> = None;
-        let mut data: Vec<u8> = Vec::new();
-        let mut committed = false;
-        while let Some(chunk) = stream.message().await? {
-            let Some(kind) = chunk.kind else {
-                return Err(Status::invalid_argument("PutObjectChunk.kind required"));
-            };
-            match kind {
-                np::put_object_chunk::Kind::First(h) => {
-                    if header.is_some() {
-                        return Err(Status::invalid_argument(
-                            "First sent more than once on PutObjectStream",
-                        ));
-                    }
-                    header = Some(h);
-                }
-                np::put_object_chunk::Kind::Data(b) => {
-                    if header.is_none() {
-                        return Err(Status::invalid_argument(
-                            "Data before First on PutObjectStream",
-                        ));
-                    }
-                    data.extend_from_slice(&b);
-                }
-                np::put_object_chunk::Kind::Commit(_) => {
-                    committed = true;
-                    break;
-                }
-            }
-        }
-        if !committed {
-            return Err(Status::aborted(
-                "PutObjectStream ended without explicit Commit",
-            ));
-        }
-        let mut req = header.ok_or_else(|| {
-            Status::invalid_argument("PutObjectStream missing First")
-        })?;
-        req.data = data;
-        self.put_object(Request::new(req)).await
-    }
-
-    async fn get_object(
-        &self,
-        request: Request<np::GetObjectRequest>,
-    ) -> Result<Response<np::GetObjectResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::GetObjectRequest,
+    ) -> Result<np::GetObjectResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let comp = match req.key {
             Some(np::get_object_request::Key::CompositionId(id)) => {
@@ -492,79 +464,42 @@ impl GatewayDataService for ServerImpl {
             length,
         };
         let resp = self.ops.read(read_req).await.map_err(map_gateway_error)?;
-        Ok(Response::new(np::GetObjectResponse {
+        Ok(np::GetObjectResponse {
             size: resp.data.len() as u64,
             content_type: resp.content_type.unwrap_or_default(),
             etag: Some(etag_for(comp)),
             data: resp.data,
             sealed_chunks: Vec::new(),
-        }))
+        })
     }
 
-    type GetObjectStreamStream = Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<np::GetObjectChunk, Status>> + Send + 'static>,
-    >;
-
-    async fn get_object_stream(
+    pub async fn delete_object(
         &self,
-        request: Request<np::GetObjectRequest>,
-    ) -> Result<Response<Self::GetObjectStreamStream>, Status> {
-        // v1: identical wire content, just framed. Future work: emit
-        // per-chunk sealed envelopes for TrustedCompute and lazy-stream
-        // chunks from the chunk store directly.
-        let resp = self.get_object(request).await?.into_inner();
-        let header = np::GetObjectChunk {
-            kind: Some(np::get_object_chunk::Kind::Header(np::GetObjectHeader {
-                size: resp.size,
-                content_type: resp.content_type,
-                etag: resp.etag,
-                client_decrypt: false,
-            })),
-        };
-        let data_chunk = np::GetObjectChunk {
-            kind: Some(np::get_object_chunk::Kind::Data(resp.data)),
-        };
-        let s = tokio_stream::iter(vec![Ok(header), Ok(data_chunk)]);
-        Ok(Response::new(Box::pin(s)))
-    }
-
-    async fn delete_object(
-        &self,
-        request: Request<np::DeleteObjectRequest>,
-    ) -> Result<Response<np::DeleteObjectResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::DeleteObjectRequest,
+    ) -> Result<np::DeleteObjectResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let comp = comp_from_proto(req.composition_id.as_ref())?;
         match self.ops.delete(tenant, ns, comp).await {
-            Ok(()) => Ok(Response::new(np::DeleteObjectResponse { removed: true })),
-            Err(GatewayError::NotFound(_)) => {
-                Ok(Response::new(np::DeleteObjectResponse { removed: false }))
-            }
+            Ok(()) => Ok(np::DeleteObjectResponse { removed: true }),
+            Err(GatewayError::NotFound(_)) => Ok(np::DeleteObjectResponse { removed: false }),
             Err(e) => Err(map_gateway_error(e)),
         }
     }
 
-    async fn head_object(
+    pub async fn head_object(
         &self,
-        request: Request<np::HeadObjectRequest>,
-    ) -> Result<Response<np::HeadObjectResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::HeadObjectRequest,
+    ) -> Result<np::HeadObjectResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let comp = match req.key {
             Some(np::head_object_request::Key::CompositionId(id)) => {
@@ -591,27 +526,23 @@ impl GatewayDataService for ServerImpl {
             })
             .await
             .map_err(map_gateway_error)?;
-        Ok(Response::new(np::HeadObjectResponse {
+        Ok(np::HeadObjectResponse {
             size: resp.data.len() as u64,
             content_type: resp.content_type.unwrap_or_default(),
             etag: Some(etag_for(comp)),
             last_modified_millis_since_epoch: 0,
-        }))
+        })
     }
 
-    async fn list_objects(
+    pub async fn list_objects(
         &self,
-        request: Request<np::ListObjectsRequest>,
-    ) -> Result<Response<np::ListObjectsResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::ListObjectsRequest,
+    ) -> Result<np::ListObjectsResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let prefix = if req.prefix.is_empty() {
             None
@@ -636,26 +567,22 @@ impl GatewayDataService for ServerImpl {
                 last_modified_millis_since_epoch: 0,
             })
             .collect();
-        Ok(Response::new(np::ListObjectsResponse {
+        Ok(np::ListObjectsResponse {
             objects,
             // v1 returns full result; pagination wiring lands in Phase 4.
             continuation: Vec::new(),
-        }))
+        })
     }
 
-    async fn lookup_by_name(
+    pub async fn lookup_by_name(
         &self,
-        request: Request<np::LookupByNameRequest>,
-    ) -> Result<Response<np::LookupByNameResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::LookupByNameRequest,
+    ) -> Result<np::LookupByNameResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name required"));
@@ -666,26 +593,22 @@ impl GatewayDataService for ServerImpl {
             .await
             .map_err(map_gateway_error)?
             .ok_or_else(|| Status::not_found(format!("name not found: {}", req.name)))?;
-        Ok(Response::new(np::LookupByNameResponse {
+        Ok(np::LookupByNameResponse {
             composition_id: Some(comp_to_proto(comp)),
-        }))
+        })
     }
 
     // ----- Multipart -----
 
-    async fn init_multipart(
+    pub async fn init_multipart(
         &self,
-        request: Request<np::InitMultipartRequest>,
-    ) -> Result<Response<np::InitMultipartResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::InitMultipartRequest,
+    ) -> Result<np::InitMultipartResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let _ = tenant; // multipart impls don't need the tenant directly
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let upload_id = self
@@ -693,244 +616,104 @@ impl GatewayDataService for ServerImpl {
             .start_multipart(ns)
             .await
             .map_err(map_gateway_error)?;
-        Ok(Response::new(np::InitMultipartResponse { upload_id }))
+        Ok(np::InitMultipartResponse { upload_id })
     }
 
-    async fn put_part(
+    /// Buffer-then-call entry point for multipart `PutPart` —
+    /// stream-handling lives on the binding adapter, the handler
+    /// just consumes the assembled `(header, data)` pair.
+    pub async fn put_part_buffered(
         &self,
-        request: Request<Streaming<np::PutPartChunk>>,
-    ) -> Result<Response<np::PutPartResponse>, Status> {
-        let mut stream = request.into_inner();
-        let mut header: Option<np::PutPartHeader> = None;
-        let mut data: Vec<u8> = Vec::new();
-        while let Some(chunk) = stream.message().await? {
-            let Some(kind) = chunk.kind else {
-                return Err(Status::invalid_argument("PutPartChunk.kind required"));
-            };
-            match kind {
-                np::put_part_chunk::Kind::Header(h) => {
-                    if header.is_some() {
-                        return Err(Status::invalid_argument(
-                            "Header sent more than once on PutPart",
-                        ));
-                    }
-                    header = Some(h);
-                }
-                np::put_part_chunk::Kind::Data(b) => {
-                    if header.is_none() {
-                        return Err(Status::invalid_argument("Data before Header"));
-                    }
-                    data.extend_from_slice(&b);
-                }
-            }
-        }
-        let h = header.ok_or_else(|| Status::invalid_argument("PutPart missing Header"))?;
+        _principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        header: np::PutPartHeader,
+        data: Vec<u8>,
+    ) -> Result<np::PutPartResponse, Status> {
         let etag = self
             .ops
-            .upload_part(&h.upload_id, h.part_number, &data)
+            .upload_part(&header.upload_id, header.part_number, &data)
             .await
             .map_err(map_gateway_error)?;
-        Ok(Response::new(np::PutPartResponse {
+        Ok(np::PutPartResponse {
             etag: Some(np::Etag {
                 value: etag.into_bytes(),
             }),
             size: data.len() as u64,
-        }))
+        })
     }
 
-    async fn complete_multipart(
+    pub async fn complete_multipart(
         &self,
-        request: Request<np::CompleteMultipartRequest>,
-    ) -> Result<Response<np::CompleteMultipartResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::CompleteMultipartRequest,
+    ) -> Result<np::CompleteMultipartResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let _ = tenant;
         let comp = self
             .ops
             .complete_multipart(&req.upload_id, None)
             .await
             .map_err(map_gateway_error)?;
-        Ok(Response::new(np::CompleteMultipartResponse {
+        Ok(np::CompleteMultipartResponse {
             composition_id: Some(comp_to_proto(comp)),
             size: 0,
             etag: Some(etag_for(comp)),
-        }))
+        })
     }
 
-    async fn abort_multipart(
+    pub async fn abort_multipart(
         &self,
-        request: Request<np::AbortMultipartRequest>,
-    ) -> Result<Response<np::AbortMultipartResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::AbortMultipartRequest,
+    ) -> Result<np::AbortMultipartResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let _ = tenant;
         self.ops
             .abort_multipart(&req.upload_id)
             .await
             .map_err(map_gateway_error)?;
-        Ok(Response::new(np::AbortMultipartResponse {}))
+        Ok(np::AbortMultipartResponse {})
     }
 
-    // ----- POSIX verbs (stubs returning Status::unimplemented; bridging
-    // to a real inode store is a follow-up — see ADR-042 §9 + the
-    // implementation plan's open items.) -----
-
-    async fn path_lookup(
-        &self,
-        _request: Request<np::PathLookupRequest>,
-    ) -> Result<Response<np::PathLookupResponse>, Status> {
-        Err(Status::unimplemented("POSIX path_lookup not bridged in Phase 2"))
-    }
-
-    async fn open(
-        &self,
-        _request: Request<np::OpenRequest>,
-    ) -> Result<Response<np::OpenResponse>, Status> {
-        Err(Status::unimplemented("POSIX open not bridged in Phase 2"))
-    }
-
-    async fn read(
-        &self,
-        _request: Request<np::ReadRequest>,
-    ) -> Result<Response<np::ReadResponse>, Status> {
-        Err(Status::unimplemented("POSIX read not bridged in Phase 2"))
-    }
-
-    type ReadStreamStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<np::ReadChunk, Status>> + Send + 'static>>;
-
-    async fn read_stream(
-        &self,
-        _request: Request<np::ReadRequest>,
-    ) -> Result<Response<Self::ReadStreamStream>, Status> {
-        Err(Status::unimplemented("POSIX read_stream not bridged in Phase 2"))
-    }
-
-    async fn write(
-        &self,
-        _request: Request<np::WriteRequest>,
-    ) -> Result<Response<np::WriteResponse>, Status> {
-        Err(Status::unimplemented("POSIX write not bridged in Phase 2"))
-    }
-
-    async fn write_stream(
-        &self,
-        _request: Request<Streaming<np::WriteChunk>>,
-    ) -> Result<Response<np::WriteResponse>, Status> {
-        Err(Status::unimplemented("POSIX write_stream not bridged in Phase 2"))
-    }
-
-    async fn fsync(
-        &self,
-        _request: Request<np::FsyncRequest>,
-    ) -> Result<Response<np::FsyncResponse>, Status> {
-        // Drive the gateway's fsync_pending hook chain even without a
-        // bridged inode model — clients calling Fsync on an unknown
-        // handle still get the cluster-wide flush they expect.
+    /// POSIX `Fsync` — drives the gateway's `fsync_pending` hook
+    /// chain even without a bridged inode model. No principal needed
+    /// (it's an unauthenticated cluster-wide flush trigger today;
+    /// authenticated/per-handle Fsync lands with the POSIX bridging
+    /// follow-up).
+    pub async fn fsync(&self) -> Result<np::FsyncResponse, Status> {
         self.ops.fsync_pending().await.map_err(map_gateway_error)?;
-        Ok(Response::new(np::FsyncResponse {
+        Ok(np::FsyncResponse {
             fsynced_lsn: 0,
             shard_id: None,
-        }))
-    }
-
-    async fn close(
-        &self,
-        _request: Request<np::CloseRequest>,
-    ) -> Result<Response<np::CloseResponse>, Status> {
-        Err(Status::unimplemented("POSIX close not bridged in Phase 2"))
-    }
-
-    async fn setattr(
-        &self,
-        _request: Request<np::SetattrRequest>,
-    ) -> Result<Response<np::SetattrResponse>, Status> {
-        Err(Status::unimplemented("POSIX setattr not bridged in Phase 2"))
-    }
-
-    async fn getattr(
-        &self,
-        _request: Request<np::GetattrRequest>,
-    ) -> Result<Response<np::GetattrResponse>, Status> {
-        Err(Status::unimplemented("POSIX getattr not bridged in Phase 2"))
-    }
-
-    type ReadDirStream = Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<np::ReadDirEntry, Status>> + Send + 'static>,
-    >;
-
-    async fn read_dir(
-        &self,
-        _request: Request<np::ReadDirRequest>,
-    ) -> Result<Response<Self::ReadDirStream>, Status> {
-        Err(Status::unimplemented("POSIX read_dir not bridged in Phase 2"))
-    }
-
-    async fn mkdir(
-        &self,
-        _request: Request<np::MkdirRequest>,
-    ) -> Result<Response<np::MkdirResponse>, Status> {
-        Err(Status::unimplemented("POSIX mkdir not bridged in Phase 2"))
-    }
-
-    async fn unlink(
-        &self,
-        _request: Request<np::UnlinkRequest>,
-    ) -> Result<Response<np::UnlinkResponse>, Status> {
-        Err(Status::unimplemented("POSIX unlink not bridged in Phase 2"))
-    }
-
-    async fn rename_within_shard(
-        &self,
-        _request: Request<np::RenameRequest>,
-    ) -> Result<Response<np::RenameResponse>, Status> {
-        Err(Status::unimplemented("POSIX rename not bridged in Phase 2"))
+        })
     }
 
     // ----- Lease verbs -----
 
-    async fn acquire_lease(
+    pub async fn acquire_lease(
         &self,
-        request: Request<np::AcquireLeaseRequest>,
-    ) -> Result<Response<np::AcquireLeaseResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::AcquireLeaseRequest,
+    ) -> Result<np::AcquireLeaseResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         // Cap TTL at 5 min (300_000 ms) per ADR-042 §7.
         let ttl_ms = req.requested_ttl_ms.min(300_000);
         let lease_id_seed: [u8; 16] = uuid::Uuid::new_v4().into_bytes();
-        // Principal = the canonical SAN URI when available (production
-        // mTLS posture), otherwise fall back to the tenant UUID string
-        // (unit tests / plaintext dev mode).
-        let principal = canonical
-            .as_ref()
-            .map_or_else(|| tenant.0.to_string(), |c| c.as_str().to_string());
+        let lease_holder_principal = lease_holder_principal_for(principal, &tenant);
         let outcome = self.lease_store.acquire(
             tenant,
             ns,
             req.inode,
-            principal,
+            lease_holder_principal,
             ttl_ms,
             lease_id_seed,
             now_ms(),
@@ -963,32 +746,26 @@ impl GatewayDataService for ServerImpl {
                 )),
             },
         };
-        Ok(Response::new(resp))
+        Ok(resp)
     }
 
-    async fn renew_lease(
+    pub async fn renew_lease(
         &self,
-        request: Request<np::RenewLeaseRequest>,
-    ) -> Result<Response<np::RenewLeaseResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::RenewLeaseRequest,
+    ) -> Result<np::RenewLeaseResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
-        let principal = canonical
-            .as_ref()
-            .map_or_else(|| tenant.0.to_string(), |c| c.as_str().to_string());
+        enforce_san_payload_tenant_match(principal, &tenant)?;
+        let lease_holder_principal = lease_holder_principal_for(principal, &tenant);
         if req.lease_id.len() != 16 {
             return Err(Status::invalid_argument("lease_id must be 16 bytes"));
         }
         let mut lid = [0u8; 16];
         lid.copy_from_slice(&req.lease_id);
         let ttl_ms = req.ttl_ms.min(300_000);
-        let outcome = self.lease_store.renew(lid, &principal, ttl_ms, now_ms());
+        let outcome = self.lease_store.renew(lid, &lease_holder_principal, ttl_ms, now_ms());
         let resp = match outcome {
             RenewOutcome::Renewed(g) => np::RenewLeaseResponse {
                 outcome: Some(np::renew_lease_response::Outcome::Grant(np::LeaseGrant {
@@ -1011,32 +788,26 @@ impl GatewayDataService for ServerImpl {
                 return Err(Status::not_found("lease_id not found"));
             }
         };
-        Ok(Response::new(resp))
+        Ok(resp)
     }
 
-    async fn release_lease(
+    pub async fn release_lease(
         &self,
-        request: Request<np::ReleaseLeaseRequest>,
-    ) -> Result<Response<np::ReleaseLeaseResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::ReleaseLeaseRequest,
+    ) -> Result<np::ReleaseLeaseResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
-        let principal = canonical
-            .as_ref()
-            .map_or_else(|| tenant.0.to_string(), |c| c.as_str().to_string());
+        enforce_san_payload_tenant_match(principal, &tenant)?;
+        let lease_holder_principal = lease_holder_principal_for(principal, &tenant);
         if req.lease_id.len() != 16 {
             return Err(Status::invalid_argument("lease_id must be 16 bytes"));
         }
         let mut lid = [0u8; 16];
         lid.copy_from_slice(&req.lease_id);
-        match self.lease_store.release(lid, &principal) {
-            ReleaseOutcome::Released => Ok(Response::new(np::ReleaseLeaseResponse {})),
+        match self.lease_store.release(lid, &lease_holder_principal) {
+            ReleaseOutcome::Released => Ok(np::ReleaseLeaseResponse {}),
             ReleaseOutcome::NotFound => Err(Status::not_found("lease_id not found")),
             ReleaseOutcome::NotHolder => Err(Status::permission_denied(
                 "release_lease: not the holder",
@@ -1051,19 +822,15 @@ impl GatewayDataService for ServerImpl {
     // calls into the gateway-local verify path so the wire surface is
     // exercised; Phase 4 wires the keymanager forward path.
 
-    async fn fetch_dek(
+    pub async fn fetch_dek(
         &self,
-        request: Request<np::FetchDekRequest>,
-    ) -> Result<Response<np::FetchDekResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::FetchDekRequest,
+    ) -> Result<np::FetchDekResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let outcome = match super::dek_fetch_ticket::verify_and_decode(
             &self.signing_keys,
             &req.dek_fetch_ticket,
@@ -1081,24 +848,20 @@ impl GatewayDataService for ServerImpl {
                 reason: format!("{e}"),
             }),
         };
-        Ok(Response::new(np::FetchDekResponse {
+        Ok(np::FetchDekResponse {
             outcome: Some(outcome),
-        }))
+        })
     }
 
-    async fn batch_fetch_dek(
+    pub async fn batch_fetch_dek(
         &self,
-        request: Request<np::BatchFetchDekRequest>,
-    ) -> Result<Response<np::BatchFetchDekResponse>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::BatchFetchDekRequest,
+    ) -> Result<np::BatchFetchDekResponse, Status> {
         let cf = require_control(&req.control)?;
         validate_idempotency_key(&cf.idempotency_key)?;
         let tenant = org_from_proto(cf.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         if req.dek_fetch_tickets.len() > MAX_BATCH_DEK_TICKETS {
             return Err(Status::invalid_argument(format!(
                 "batch_too_large: max {MAX_BATCH_DEK_TICKETS} tickets per request"
@@ -1126,30 +889,26 @@ impl GatewayDataService for ServerImpl {
                 }
             })
             .collect();
-        Ok(Response::new(np::BatchFetchDekResponse { outcomes }))
+        Ok(np::BatchFetchDekResponse { outcomes })
     }
 
     // ----- Topology -----
 
-    async fn get_topology(
+    pub async fn get_topology(
         &self,
-        request: Request<np::GetTopologyRequest>,
-    ) -> Result<Response<np::TopologyInfo>, Status> {
-        let canonical = request
-            .extensions()
-            .get::<super::canonical_san::CanonicalSanUri>()
-            .cloned();
-        let req = request.into_inner();
+        principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+        req: np::GetTopologyRequest,
+    ) -> Result<np::TopologyInfo, Status> {
         let tenant = org_from_proto(req.tenant_id.as_ref())?;
-        enforce_san_payload_tenant_match(canonical.as_ref(), &tenant)?;
+        enforce_san_payload_tenant_match(principal, &tenant)?;
         let current = self.topology.version.load(Ordering::SeqCst);
         if req.known_topology_version > 0 && req.known_topology_version == current {
             // 304-equivalent — empty payload, just the version stamp.
-            return Ok(Response::new(np::TopologyInfo {
+            return Ok(np::TopologyInfo {
                 topology_version: current,
                 nodes: Vec::new(),
                 shards: Vec::new(),
-            }));
+            });
         }
         let snap = self.topology.snapshot.read();
         let shards = snap
@@ -1157,11 +916,27 @@ impl GatewayDataService for ServerImpl {
             .get(&tenant)
             .cloned()
             .unwrap_or_default();
-        Ok(Response::new(np::TopologyInfo {
+        Ok(np::TopologyInfo {
             topology_version: current,
             nodes: snap.nodes.clone(),
             shards,
-        }))
+        })
+    }
+}
+
+/// Lease-holder principal string: canonical SAN when present
+/// (production mTLS posture), tenant UUID otherwise (unit-test /
+/// plaintext dev mode). Shared by `acquire_lease`, `renew_lease`,
+/// `release_lease` so the derivation rule is one place.
+fn lease_holder_principal_for(
+    principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
+    tenant: &OrgId,
+) -> String {
+    let san = principal.cert_san_canonical();
+    if san.is_empty() {
+        tenant.0.to_string()
+    } else {
+        san.to_string()
     }
 }
 
@@ -1215,6 +990,22 @@ mod tests {
         }
     }
 
+    /// Default principal — empty canonical SAN. Triggers the
+    /// "interceptor-not-installed" fallback in
+    /// `enforce_san_payload_tenant_match` so handler tests aren't
+    /// gated on real cert plumbing.
+    fn anon_principal() -> super::super::grpc::TonicPrincipal {
+        use kiseki_proto::native_contract::ConnectionId;
+        super::super::grpc::TonicPrincipal::new(String::new(), ConnectionId(0))
+    }
+
+    /// Principal carrying a specific canonical SAN. Used by the
+    /// SAN/payload cross-check tests.
+    fn principal_with_san(san: &str) -> super::super::grpc::TonicPrincipal {
+        use kiseki_proto::native_contract::ConnectionId;
+        super::super::grpc::TonicPrincipal::new(san.into(), ConnectionId(0))
+    }
+
     async fn register_namespace(gw: &InMemoryGateway) {
         use kiseki_common::ids::ShardId;
         use kiseki_composition::namespace::Namespace;
@@ -1239,7 +1030,7 @@ mod tests {
             data: b"world".to_vec(),
         };
         let err = server
-            .put_object(Request::new(put))
+            .put_object(&anon_principal(), put)
             .await
             .expect_err("namespace not registered");
         assert_eq!(err.code(), tonic::Code::NotFound);
@@ -1255,11 +1046,7 @@ mod tests {
             name: "hello".into(),
             data: b"world".to_vec(),
         };
-        let resp = server
-            .put_object(Request::new(put))
-            .await
-            .unwrap()
-            .into_inner();
+        let resp = server.put_object(&anon_principal(), put).await.unwrap();
         assert_eq!(resp.size, 5);
         let comp = resp.composition_id.expect("composition_id");
         let get = np::GetObjectRequest {
@@ -1269,11 +1056,7 @@ mod tests {
             range_end: 0,
             key: Some(np::get_object_request::Key::CompositionId(comp.clone())),
         };
-        let got = server
-            .get_object(Request::new(get))
-            .await
-            .unwrap()
-            .into_inner();
+        let got = server.get_object(&anon_principal(), get).await.unwrap();
         assert_eq!(got.data, b"world");
         assert_eq!(got.size, 5);
     }
@@ -1289,21 +1072,16 @@ mod tests {
             name: "alpha".into(),
             data: b"data".to_vec(),
         };
-        let put_resp = server
-            .put_object(Request::new(put))
-            .await
-            .unwrap()
-            .into_inner();
+        let put_resp = server.put_object(&anon_principal(), put).await.unwrap();
         let lookup = np::LookupByNameRequest {
             control: Some(ctrl()),
             namespace_id: Some(ns_to_proto(ns())),
             name: "alpha".into(),
         };
         let lresp = server
-            .lookup_by_name(Request::new(lookup))
+            .lookup_by_name(&anon_principal(), lookup)
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         assert_eq!(lresp.composition_id, put_resp.composition_id);
     }
 
@@ -1311,19 +1089,22 @@ mod tests {
     async fn put_object_rejects_when_san_tenant_mismatches_payload() {
         let (gw, server) = make_server();
         register_namespace(&gw).await;
-        // Install a canonical SAN whose tenant id != the payload's
-        // tenant id. The handler must reject before any gateway work.
-        let san = super::super::canonical_san::CanonicalSanUri::from_canonical_for_tests(
+        // Principal carries a canonical SAN whose tenant id !=
+        // payload's tenant id. The handler must reject before any
+        // gateway work.
+        let principal = principal_with_san(
             "spiffe://kiseki/tenant/00000000-0000-0000-0000-000000000999",
         );
-        let mut req = Request::new(np::PutObjectRequest {
+        let req = np::PutObjectRequest {
             control: Some(ctrl()),
             namespace_id: Some(ns_to_proto(ns())),
             name: "x".into(),
             data: b"y".to_vec(),
-        });
-        req.extensions_mut().insert(san);
-        let err = server.put_object(req).await.expect_err("mismatch");
+        };
+        let err = server
+            .put_object(&principal, req)
+            .await
+            .expect_err("mismatch");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("san_payload_tenant_mismatch"));
     }
@@ -1332,17 +1113,14 @@ mod tests {
     async fn put_object_accepts_when_san_tenant_matches_payload() {
         let (gw, server) = make_server();
         register_namespace(&gw).await;
-        let san = super::super::canonical_san::CanonicalSanUri::from_canonical_for_tests(
-            &format!("spiffe://kiseki/tenant/{}", org().0),
-        );
-        let mut req = Request::new(np::PutObjectRequest {
+        let principal = principal_with_san(&format!("spiffe://kiseki/tenant/{}", org().0));
+        let req = np::PutObjectRequest {
             control: Some(ctrl()),
             namespace_id: Some(ns_to_proto(ns())),
             name: "x".into(),
             data: b"y".to_vec(),
-        });
-        req.extensions_mut().insert(san);
-        let resp = server.put_object(req).await.unwrap().into_inner();
+        };
+        let resp = server.put_object(&principal, req).await.unwrap();
         assert!(resp.composition_id.is_some());
     }
 
@@ -1356,7 +1134,7 @@ mod tests {
             name: "nope".into(),
         };
         let err = server
-            .lookup_by_name(Request::new(lookup))
+            .lookup_by_name(&anon_principal(), lookup)
             .await
             .expect_err("missing");
         assert_eq!(err.code(), tonic::Code::NotFound);
@@ -1369,11 +1147,7 @@ mod tests {
             known_topology_version: 0,
             tenant_id: Some(org_to_proto(org())),
         };
-        let resp = server
-            .get_topology(Request::new(req))
-            .await
-            .unwrap()
-            .into_inner();
+        let resp = server.get_topology(&anon_principal(), req).await.unwrap();
         assert_eq!(resp.topology_version, 0);
 
         server.topology().replace(TopologySnapshot {
@@ -1381,6 +1155,7 @@ mod tests {
                 node_id: 1,
                 data_addr: "127.0.0.1:9100".into(),
                 state: np::NodeState::Active as i32,
+                bindings: Vec::new(),
             }],
             shards_by_tenant: std::collections::HashMap::new(),
         });
@@ -1388,11 +1163,7 @@ mod tests {
             known_topology_version: 0,
             tenant_id: Some(org_to_proto(org())),
         };
-        let resp2 = server
-            .get_topology(Request::new(req2))
-            .await
-            .unwrap()
-            .into_inner();
+        let resp2 = server.get_topology(&anon_principal(), req2).await.unwrap();
         assert_eq!(resp2.topology_version, 1);
         assert_eq!(resp2.nodes.len(), 1);
     }
@@ -1405,17 +1176,20 @@ mod tests {
                 node_id: 1,
                 data_addr: "127.0.0.1:9100".into(),
                 state: np::NodeState::Active as i32,
+                bindings: Vec::new(),
             }],
             shards_by_tenant: std::collections::HashMap::new(),
         });
         let resp = server
-            .get_topology(Request::new(np::GetTopologyRequest {
-                known_topology_version: 1,
-                tenant_id: Some(org_to_proto(org())),
-            }))
+            .get_topology(
+                &anon_principal(),
+                np::GetTopologyRequest {
+                    known_topology_version: 1,
+                    tenant_id: Some(org_to_proto(org())),
+                },
+            )
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         // 304-equivalent: same version, empty payload.
         assert_eq!(resp.topology_version, 1);
         assert!(resp.nodes.is_empty());
@@ -1427,32 +1201,36 @@ mod tests {
         let (_gw, server) = make_server();
         let cf = ctrl;
         let acq = server
-            .acquire_lease(Request::new(np::AcquireLeaseRequest {
-                control: Some(cf()),
-                namespace_id: Some(ns_to_proto(ns())),
-                inode: 100,
-                mode: np::LeaseMode::Write as i32,
-                requested_ttl_ms: 30_000,
-            }))
+            .acquire_lease(
+                &anon_principal(),
+                np::AcquireLeaseRequest {
+                    control: Some(cf()),
+                    namespace_id: Some(ns_to_proto(ns())),
+                    inode: 100,
+                    mode: np::LeaseMode::Write as i32,
+                    requested_ttl_ms: 30_000,
+                },
+            )
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         assert!(matches!(
             acq.outcome.as_ref().unwrap(),
             np::acquire_lease_response::Outcome::Grant(_)
         ));
         // Second acquire on same (ns, inode) -> Held.
         let acq2 = server
-            .acquire_lease(Request::new(np::AcquireLeaseRequest {
-                control: Some(cf()),
-                namespace_id: Some(ns_to_proto(ns())),
-                inode: 100,
-                mode: np::LeaseMode::Write as i32,
-                requested_ttl_ms: 30_000,
-            }))
+            .acquire_lease(
+                &anon_principal(),
+                np::AcquireLeaseRequest {
+                    control: Some(cf()),
+                    namespace_id: Some(ns_to_proto(ns())),
+                    inode: 100,
+                    mode: np::LeaseMode::Write as i32,
+                    requested_ttl_ms: 30_000,
+                },
+            )
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         assert!(matches!(
             acq2.outcome.as_ref().unwrap(),
             np::acquire_lease_response::Outcome::Held(_)
@@ -1464,10 +1242,13 @@ mod tests {
         let (_gw, server) = make_server();
         let tickets = vec![vec![0u8; 100]; MAX_BATCH_DEK_TICKETS + 1];
         let err = server
-            .batch_fetch_dek(Request::new(np::BatchFetchDekRequest {
-                control: Some(ctrl()),
-                dek_fetch_tickets: tickets,
-            }))
+            .batch_fetch_dek(
+                &anon_principal(),
+                np::BatchFetchDekRequest {
+                    control: Some(ctrl()),
+                    dek_fetch_tickets: tickets,
+                },
+            )
             .await
             .expect_err("batch too large");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -1490,19 +1271,10 @@ mod tests {
             data: b"y".to_vec(),
         };
         let err = server
-            .put_object(Request::new(req))
+            .put_object(&anon_principal(), req)
             .await
             .expect_err("idempotency key too short");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
-
-    #[tokio::test]
-    async fn posix_open_returns_unimplemented() {
-        let (_gw, server) = make_server();
-        let err = server
-            .open(Request::new(np::OpenRequest::default()))
-            .await
-            .expect_err("POSIX not bridged");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-    }
 }
+

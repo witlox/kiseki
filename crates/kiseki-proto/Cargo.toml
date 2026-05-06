@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false  # internal crate; only kiseki-client publishes (release.yml)
 
 # The generated code is prost/tonic output; the hand-written surface of
 # this crate is intentionally minimal. Pedantic lints are relaxed here
@@ -26,6 +27,22 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
+# Transport-agnostic contract types (ADR-042 §1.7 / §1.8). Serde for
+# wire-format independence — bindings (gRPC, TCP-framed, ibverbs,
+# libfabric) all serialize the SAME types via their preferred codec.
+# Postcard is the workspace-default codec for the non-gRPC bindings;
+# the gRPC binding maps the contract types onto prost-generated proto
+# messages via thin From/Into impls in `native_contract::wire_grpc`.
+serde = { version = "1", features = ["derive"] }
+# ADR-042 §2.2 V2 perf: bulk Vec<u8> fields (`PutObjectRequest.data`,
+# `GetObjectResponse.data`, etc.) opt into the bytes-shape serde
+# path via `#[serde(with = "serde_bytes")]` (set in build.rs) so
+# postcard does one memcopy per field instead of one byte-push per
+# byte. Pre-fix, AllocVec::try_push was 84% of CPU at 64 KiB GET.
+serde_bytes = "0.11"
+postcard = { workspace = true }
+thiserror = { workspace = true }
+kiseki-common = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

@@ -1,9 +1,128 @@
 # ADR-042 — Native Gateway Data Service Implementation Plan
 
-**Status**: Phase 1 of 8 done (proto bindings landed in commit `d7144b9`); 7 phases remaining.
+**Status**: phases 0–7 done in the gRPC-only era (commits `d7144b9`, `bc3fc62`, `d2ece85`, `d128a24`, `07eea1d`, `9e38e59`, `ffe76bd`, `5c9ef9b`); ADR-042 then redesigned for a contract-layer + transport-pluggable architecture (post-2026-05-06 gate-1 round-3 PASS). The new 11-phase ordering per ADR-042 §16.1 supersedes the gRPC-only schedule below.
+**Phase 0 (contract types)** of the redesign: **DONE — `kiseki-proto::native_contract` landed with 28 unit tests green** (BindingId, LatencyClass, LibfabricProvider, ListenAddr, DrainState, NodeState, BindingEndpoint, NodeBindings + consistency invariant, ConnectionId, RequestPrincipal trait, CxiAttestationEnvelope + canonical-message construction, NativeError 12-variant taxonomy + tag pinning).
+**Phase 1 (gRPC binding refactor) — DONE**:
+- `kiseki-gateway::native::grpc::principal` ships `TonicPrincipal` (impl `RequestPrincipal`) + `principal_from_request(&tonic::Request<T>)` (6 unit tests).
+- `enforce_san_payload_tenant_match` now takes `&dyn RequestPrincipal`; all ServerImpl call sites refactored to the binding-agnostic shape.
+- Lease-store boundary uses a separately-named `lease_holder_principal: String` so the request-principal `&dyn RequestPrincipal` doesn't shadow it; derivation centralized in `lease_holder_principal_for(&dyn RequestPrincipal, &OrgId)`.
+- **Structural lift**: `tonic::async_trait impl GatewayDataService` now lives in `kiseki-gateway::native::grpc::adapter::GrpcAdapter` (a thin `Arc<ServerImpl>` wrapper). `ServerImpl` exposes inherent handler methods that take `&dyn RequestPrincipal + body` and never reference `tonic::Request` / `tonic::Streaming` / `tonic::Response`. Streaming + POSIX-stub methods live exclusively in the adapter.
+- `kiseki-server::runtime::run_data_path` updated: `Arc::new(ServerImpl)` is wrapped in `GrpcAdapter::new(...)` before `GatewayDataServiceServer::new(...)`. Same `ServerImpl` instance can back multiple bindings concurrently (gRPC + future TCP-framed + ibverbs / cxi).
+- 230 kiseki-gateway lib tests green (228 handler-level + 2 adapter-level). 6 TonicPrincipal tests green.
+- **Phase 2** (binding-agnostic ServerImpl) is satisfied as a direct consequence — no separate phase work needed.
+
+**Phase 3 (TCP-framed-postcard binding) — server-side DONE**:
+- **Slice 1** — wire format. `kiseki-proto::native_contract::wire_tcp_framed`: `RpcEnvelope`, `WireStatus` (15 variants matching §1.4 byte values 0x10..0x1F + connection-level 0x00..0x02), encode/decode for request and response frames, oversize/version/incomplete error taxonomy. 20 unit tests (postcard round-trip, frame layout pinning, oversize cap, status byte values, JSON-document-start collision check).
+- **Slice 1 (cont.)** — `TcpFramedPrincipal` adapter (`Arc<str>`-backed canonical SAN, `BindingId::TcpFramed`). 5 unit tests (clone-allocation-free, empty-SAN fallback, distinct connection-id correlation).
+- **Slice 2** — serde on prost types. `kiseki-proto/build.rs` adds `type_attribute(".kiseki.v1", "#[derive(serde::Serialize, serde::Deserialize)]")` so all native gateway request/response types ride both prost (gRPC) and postcard (TCP-framed). One pinning test in `kiseki-proto::tests::prost_native_types_postcard_roundtrip` catches build.rs regressions. Verb dispatch in `kiseki-gateway::native::tcp_framed::dispatch::dispatch_verb`: 16 unary verbs + `fsync` (no-principal special case), `(WireStatus, Vec<u8>)` return, exhaustive `tonic::Code → WireStatus` mapping, streaming-verb names surface as `UnknownVerb` (TCP-framed buffers; multipart for above-cap). 7 unit tests (PUT round-trip, PUT/GET round-trip, unknown-verb body, streaming-verb rejection, corrupt payload → ProtocolError, SAN/payload mismatch propagation, fsync no-principal, exhaustive Code mapping).
+- **Slice 3** — per-connection frame loop (`serve_connection`) + listener (`TcpFramedListener`). Frame loop reads length-prefix, decodes envelope, dispatches, writes response with `request_id` echo for client-side multiplex. Recoverable errors (corrupt envelope) keep connection alive; unrecoverable (oversize length, I/O) tear down. Listener mirrors `RaftRpcListener` shape: optional rustls acceptor, per-peer connection cap (default 16 — `NATIVE_TCP_FRAMED_PER_PEER_MAX`), monotonic `ConnectionId`. Plaintext mode installs synthetic `dev` SAN matching gRPC binding's `SanInterceptor` fallback. 8 unit tests (in-memory duplex stream + real loopback TCP).
+- **Slice 3 (runtime wiring)** — `kiseki-server::runtime::run_data_path` spawns `TcpFramedListener::run()` on port 9101 (`KISEKI_NATIVE_TCP_ADDR` override; `=disabled` skips). Same `Arc<ServerImpl>` instance backs both gRPC + TCP-framed bindings concurrently.
+- **Slice 4** — `kiseki-client::native::tcp_framed::TcpFramedClient`. Persistent TCP+rustls connection, request multiplex via `request_id` correlation, response demux on a background reader task. `call(verb, payload) -> (status, body)` + `call_ok(verb, payload) -> body` (maps non-Ok status to `ServerError`). On connection close, pending requests resolve with `ConnectionClosed`. 6 tests including end-to-end round-trip against the real `kiseki-gateway::native::tcp_framed::serve_connection` (highest-leverage: proves both sides agree on the wire format byte-for-byte).
+
+**Phase 3 — DONE**. Server-side + client-side both shipped, 59 new tests across the binding (53 server-side + 6 client-side).
+
+- **arch-check gate landed**: `make arch-check` fails the build if `kiseki-gateway::native::server` references `tonic::Request`, `tonic::Response`, `tonic::Streaming`, TCP-framed `ConnectionContext`, or cxi `AttestationContext`. Comment lines skipped. Verified firing on synthetic violation, passing on clean tree.
+
+**Phase 3 follow-ups (not blocking phase advancement)**:
+- TLS plumbing on the listener: runtime currently passes `None`; integration with `cfg.tls`'s `ServerConfig` needs a small adapter (the listener already accepts the right type).
+- Lift `ResponseEnvelope` from kiseki-gateway::native::tcp_framed::connection into kiseki-proto::native_contract::wire_tcp_framed (currently duplicated client/server-side as a thin internal struct).
+- (b) follow-up — slim `kiseki-client`'s dep tree so it can actually `cargo publish` (currently still pulls kiseki-gateway transitively).
+
+**Phase 4 (`kiseki-transport::native::selector`) — DONE**:
+- `BindingProbe` trait, `ProbeOutcome { Available { latency_class, addr } | Unavailable { reason } }` enum; per-binding probes implement the trait. Per-binding probe timeout default 3 s (`KISEKI_NATIVE_PROBE_TIMEOUT_MS`); hanging probe surfaces as `Unavailable { reason: "probe_timeout_exceeded" }`. Sequential — never parallel (dlopen contention).
+- `BindingSelector` orchestrator: phase 1 (probe all), phase 2 (port-collision detection across `Available` set), and operator-pin filtering. Returns `(SelectorPlan, SelectorReport)` — plan is the spawn list in priority order (Rdma > Low > Standard); report covers all probes including `Unavailable` for diagnostic banners.
+- `OperatorPin::parse` — handles `KISEKI_NATIVE_TRANSPORT={auto|grpc|tcp|ibverbs|libfabric|...}`. Empty / unset / `auto` → `Auto`; known names → `Pinned(BindingId)`; libfabric requires the provider env-var (rejected with hint); typos rejected loud.
+- `render_banner(plan, report)` — pure function emitting the §3.1 startup banner (priority-ordered spawn list + skipped bindings with reasons + active pin marker).
+- Per-binding probes: `kiseki-gateway::native::grpc::probe::GrpcProbe` (latency_class=Standard, addr=`KISEKI_NATIVE_GRPC_ADDR` or default), `kiseki-gateway::native::tcp_framed::probe::TcpFramedProbe` (latency_class=Low, addr=`KISEKI_NATIVE_TCP_ADDR` or default 9101; honors `=disabled` operator escape hatch).
+- `Ord, PartialOrd` derived on `BindingId` / `LatencyClass` / `LibfabricProvider` / `ListenAddr` so the selector's sort + BTreeMap-based collision check work cleanly.
+- **Runtime wiring** — `kiseki-server::runtime::run_data_path` builds the selector with both probes, calls `selector.plan()`, logs the banner, walks `spawn_order` to register the gRPC adapter on the shared data_addr router and / or spawn the TCP-framed listener on its own port. Failures (port collision, no available bindings, pinned binding unavailable) are fatal at startup with a clear error. ibverbs / libfabric bindings log warnings until phases 9/10 land.
+- **26 new tests** (17 selector + 4 gRPC probe + 5 TCP-framed probe).
+
+**Phase 4 follow-ups (not blocking phase advancement)**:
+- Per-binding metrics per ADR-042 §12.1: `kiseki_native_binding_probe_duration_seconds{binding}` histogram, `kiseki_native_binding_pinned_total{binding}` counter incremented when a pin is in effect.
+
+**Phase 5 (NativeClient + per-edge selection + connection pool + drain) — DONE**:
+- **Slice 1** — pure-function edge selector (`kiseki-client::native::edge_selector`). 14 unit tests covering ranking, pin honoring, draining-vs-failed-vs-evicted state gates, heterogeneous-cluster + cross-WAN-fallback paths.
+- **Slice 2** — proto/server/client topology binding-set wiring. `NodeInfo` extended with `repeated BindingEndpoint bindings`; new proto messages `BindingEndpoint` + `DrainState`; new enums `BindingId` + `LatencyClass`. Server-side `node_info_from_plan(node_id, state, &SelectorPlan)` produces the wire shape. Runtime now publishes the local node's binding set into `TopologyInjector`. Client-side `Snapshot::Node` extended with `state` + `bindings`; `snapshot_from_proto(&TopologyInfo)` decodes the wire form. **2 BDD scenarios green end-to-end**: `Per-edge selection — heterogeneous binding cluster` and `Topology version regress falls back to TTL safety net`.
+- **Slice 3** — per-edge `ConnectionPool` keyed by `(node_id, BindingId)`. Caches gRPC channel + TCP-framed client + future RDMA variants behind a `Connection` enum. `get_or_dial` dispatches per binding; `drop_edge`/`drop_node` for §1.7 close-on-state-change. 6 unit tests.
+- **Slice 4** — drain protocol per §3.2.1. `drain_edge`, `is_draining`, `reconcile_with_topology(&Snapshot)` diffs against current pool and marks no-longer-advertised edges, `tick_drain_budget(Duration)` hard-closes past `KISEKI_NATIVE_DRAIN_BUDGET_MS` (default 30s). New `get_or_dial` calls bypass draining edges; existing clones continue serving in-flight work. 9 additional unit tests.
+
+**Phase 5 totals**: 4 slices × 47 new tests; 2 new BDD scenarios green.
+
+**Phase 6 (BDD steps for native-gateway.feature) — partial**:
+- **22/49 scenarios passing** (up from 15 at phase-5 entry). Net 7 new scenarios wired through real client-side code:
+  - `Per-edge selection — heterogeneous binding cluster` — drives `select_for_edge` against a synthetic 4-node topology with mixed binding sets.
+  - `Topology version regress falls back to TTL safety net` — drives `TopologyCache::decide` + TTL-shortened cache.
+  - `Topology cache refreshed on topology_version mismatch` — drives the trailer-version-DIFFERS path.
+  - `Binding listener crashes mid-flight — clients drain gracefully` — real ephemeral TCP listeners + `ConnectionPool::reconcile_with_topology` + `tick_drain_budget`.
+  - `Backoff-restart restores binding after crash` — topology re-advertisement path.
+  - `Binding probe timeout falls back to next-best binding` — synthetic `BindingSelector` with `HangingProbe`.
+  - `All bindings fail probe — server exits cleanly` — selector returns `NoAvailableBindings`.
+- **25 scenarios still skipped**. Most need either:
+  - cluster-harness extensions (multi-node mTLS spawn, drain RPC at runtime, binding-crash injection)
+  - server-side feature work (drain RPC, per-tenant stream-cap enforcement, cert-revocation mid-stream)
+  - RDMA hardware (cxi attestation envelope handling, ibverbs perf-gate)
+- **2 scenarios failing** — pre-existing TODOs (idempotency-key dedup wiring, drain-RPC stub) unrelated to phase 5/6/7.
+- The synthetic-state pattern proven across these 7 scenarios is the right shape for the remaining client-side scenarios; harness extensions unlock the rest.
+
+**Phase 7 (`kiseki-profile --protocol native --binding=<grpc|tcp|auto>`) — DONE**:
+- New `NativeBinding` CLI flag with `grpc` (default — historical behavior preserved), `tcp`, `auto` variants.
+- `TcpFramedNativeDriver` mirrors the gRPC `NativeDriver`'s shape — pool of N independent connections, round-robin selector, per-call postcard encode/decode around `TcpFramedClient::call_ok`.
+- Harness extended to allocate an ephemeral `KISEKI_NATIVE_TCP_ADDR` so the spawned kiseki-server's TCP-framed listener doesn't collide with anything else on 9101.
+- Per-binding flame profiles: `KISEKI_PPROF_OUT=tcp.svg ./kiseki-profile run --protocol native --binding tcp ...` produces a flamegraph of the TCP-framed path; same trick with `--binding grpc` for the comparison.
+
+**Phase 8 (re-measure against §14 targets per binding) — DONE on this host (single-node; HW-bound multi-node measurement still pending)**:
+- 2026-05-06 perf staircase, GET-heavy 64 KiB c=16:
+  | Tier | op/s | p50 | p99 | % of in-process-persistent floor |
+  |---|---|---|---|---|
+  | in-process compute | 204,051 | 6 µs | 486 µs | 107% (cache effects) |
+  | in-process-persistent | 190,097 | 7 µs | 566 µs | 100% (= floor) |
+  | gRPC binding | 25,457 | 543 µs | 1787 µs | 13% |
+  | **TCP-framed binding** | **63,595** | **212 µs** | **844 µs** | **33%** |
+- TCP-framed beats gRPC by 1.50–2.50× across the 4/16/64 KiB GET sweep:
+  | size | gRPC op/s | TCP op/s | gain |
+  |---|---|---|---|
+  | 4 KiB | 45,685 | 96,314 | **+111%** |
+  | 16 KiB | 42,234 | 88,797 | **+110%** |
+  | 64 KiB | 25,457 | 63,595 | **+150%** |
+- Two perf landmines surfaced + closed during the staircase:
+  - **V1 wire-format double-envelope tax**. The original `RpcEnvelope`/`ResponseEnvelope` shape postcard-encoded `payload_bytes: Vec<u8>` *inside* an outer postcard struct, costing one full body memcopy per call on each side. **V2 wire-format** lifts `request_id`, `verb_tag`, and `status` into fixed-width header fields and writes the verb body directly — no outer envelope. ~+10–14% across the matrix.
+  - **Postcard byte-by-byte `AllocVec::try_push`**. serde's default `Vec<u8>` Serialize impl uses `serialize_seq`, which postcard implements as one byte-push per byte — 65,536 push calls per 64 KiB response = 84% of CPU at 64 KiB. **Adding `#[serde(with = "serde_bytes")]`** on bulk `Vec<u8>` fields via `tonic_prost_build::field_attribute` switches to `serialize_bytes` (single bulk memcopy). ~+150–200% across the matrix; this is the win that took TCP-framed past gRPC.
+- A-NG11 gate (≥80 k GET, ≥56 k PUT per node) — single-host GET cleared at 4/16 KiB; 64 KiB GET still 21 k under target. The remaining gap is gateway-side (composition store + chunk read), not transport — same ceiling applies to gRPC.
+
+**Next-best-target backlog from the post-V2 flamegraph** (gateway, not transport — both bindings benefit):
+1. **Composition store cache** — `CompositionStore::get` is 18% of 64 KiB GET CPU. An LRU on the hot composition lookup path skips fjall. Estimated +15–25%.
+2. **Chunk decrypt** — `InMemoryGateway::read` 38%; most is AEAD. Confirm `aws_lc_rs` is using AES-NI; if scalar, switch.
+3. **Server-side per-connection task pool** — `serve_connection` processes frames sequentially per connection. Spawning a bounded task pool per accept would let pipelined requests parallelize server-side. Helps under high single-connection concurrency.
+4. **Vectored I/O on response write** — emit the 10-byte response header + the body slice as two `iovec`s via `write_vectored`. Skips one frame-bytes memcopy.
+5. **`bytes::Bytes` on the response data field** — refcounted slice instead of `Vec<u8>` so the chunk store's `Bytes` can flow through to the wire without a copy.
+
+**Phase 9 (ibverbs probe scaffold) — DONE; listener pending hardware**:
+- `kiseki-transport::native::ibverbs_probe::IbverbsProbe` ships ADR-042 §2.3's full path-validation discipline:
+  - Linux-only OS gate (`cfg(target_os = "linux")`).
+  - Distro/arch-aware search list for `libibverbs.so.1` (`/usr/lib/${arch}-linux-gnu/`, `/usr/lib64/`, `/usr/lib/`) with `${arch}` from `target_arch` (x86_64, aarch64, powerpc64le, unknown).
+  - Operator override via `KISEKI_NATIVE_IBVERBS_LIB`.
+  - R2-M2 path-injection mitigation: root-ownership check (uid 0) + group/world-writable rejection. Audit-log the resolved absolute path on success.
+  - `/sys/class/infiniband/*` enumeration with `port/state == "4: ACTIVE"` qualifier; `KISEKI_NATIVE_IBVERBS_DEV` + `KISEKI_NATIVE_IBVERBS_PORT` operator pin.
+  - Returns `ProbeOutcome::Available { latency_class: Rdma, addr: FabricDescriptor("ibverbs://<dev>/<port>") }` or `Unavailable { reason }` with grep-friendly diagnostics.
+- Shared helpers in `probe_helpers` reusable for any RDMA binding probe.
+- 5 unit tests for probe + helpers; passes cleanly on dev hosts (returns Unavailable with the right reason).
+- **Pending hardware**: listener-side libibverbs FFI shim, QP setup, send/recv RDMA verbs, mTLS-over-rdma-cm handshake. Connection-pool integration via `Connection::Ibverbs` variant is the natural plug-point.
+
+**Phase 10 (libfabric probe scaffold) — DONE; listener pending hardware**:
+- `kiseki-transport::native::libfabric_probe::LibfabricProbe` ships:
+  - Same Linux + path-validation discipline as ibverbs.
+  - Operator pin via `KISEKI_NATIVE_LIBFABRIC_PROVIDER={cxi|verbs|sockets|tcp}`. `efa` rejected per §2.4.3 (deferred — needs AWS-IAM mapping ADR).
+  - Sysfs-based provider auto-detection per §2.4.4 ranking: `cxi > verbs > sockets/tcp`. cxi sniffed via `/sys/class/net/.../device/cxi/`; verbs via `/sys/class/infiniband/`.
+  - Pinned-provider validation against sysfs evidence — pinning to a provider with no hardware backing surfaces a clear `Unavailable` reason rather than silent fallback.
+  - Returns `Available { latency_class: Rdma | Standard, addr: FabricDescriptor("libfabric://<provider>") }` based on the chosen provider.
+- 7 unit tests; passes on dev hosts.
+- **Pending hardware**: `fi_getinfo()` FFI calls (currently the probe consults sysfs as a proxy for fi_getinfo's results), endpoint setup, cxi attestation envelope handling per §2.4.2 + §2.4.2.1 DoS mitigations, libfabric tagged-message API for the wire path.
+
+Total ADR-042 implementation: 12 sliced tasks across phases 0-10, plus the §1.8 arch-check gate and the (a) publish-hygiene fix.
 **Date opened**: 2026-05-05
 **Predecessor**: `post-2026-05-03-sweep.md` (in-process perf spike + ADR-040 rev-3 write-behind)
-**Spec source of truth**: `specs/architecture/adr/042-native-gateway-data-service.md` (post-gate-1 round-2 PASS)
+**Spec source of truth**: `specs/architecture/adr/042-native-gateway-data-service.md` (post-gate-1 round-3 PASS, transport-pluggable redesign)
 
 ## Context
 

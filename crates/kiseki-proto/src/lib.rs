@@ -13,6 +13,11 @@
 #![allow(missing_docs, rust_2018_idioms)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+/// Transport-agnostic contract types for the native gateway data
+/// service (ADR-042 §1.7 / §1.8). Carried verbatim by every binding
+/// (gRPC, TCP-framed-postcard, ibverbs, libfabric).
+pub mod native_contract;
+
 /// v1 protobuf types and gRPC services.
 pub mod v1 {
     tonic::include_proto!("kiseki.v1");
@@ -84,6 +89,37 @@ mod tests {
         let decoded = v1::Quota::decode(&[][..]).expect("empty decode should succeed");
         assert_eq!(decoded.capacity_bytes, 0);
         assert_eq!(decoded.iops, 0);
+    }
+
+    /// ADR-042 §2.2 TCP-framed binding requires postcard codec on
+    /// the same prost-generated request/response types the gRPC
+    /// binding uses. Pin a representative round-trip here so a
+    /// build.rs regression that drops the serde derive fails the
+    /// test loudly.
+    #[test]
+    fn prost_native_types_postcard_roundtrip() {
+        use super::v1;
+        use super::v1::native as np;
+        let req = np::PutObjectRequest {
+            control: Some(np::ControlFields {
+                tenant_id: Some(v1::OrgId {
+                    value: "tenant-postcard".into(),
+                }),
+                idempotency_key: vec![1, 2, 3],
+                workflow_ref: String::new(),
+                cache_hint: None,
+                conditional: None,
+            }),
+            namespace_id: Some(v1::NamespaceId {
+                value: "ns-postcard".into(),
+            }),
+            name: "obj-key".into(),
+            data: vec![0xAB; 64],
+        };
+        let bytes = postcard::to_allocvec(&req).expect("postcard encode on serde-derived type");
+        let decoded: np::PutObjectRequest =
+            postcard::from_bytes(&bytes).expect("postcard decode on serde-derived type");
+        assert_eq!(req, decoded);
     }
 
     #[test]

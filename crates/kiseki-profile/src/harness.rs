@@ -18,13 +18,19 @@ pub struct Ports {
     pub metrics: u16,
     pub raft: u16,
     pub ds_tcp: u16,
+    /// ADR-042 §2.2 TCP-framed-postcard binding listener port.
+    /// Allocated alongside the rest so the profiler can drive the
+    /// `--binding tcp` mode without colliding with another process
+    /// at the default 9101.
+    pub tcp_framed: u16,
 }
 
 impl Ports {
     pub fn allocate() -> Self {
-        let mut listeners = Vec::with_capacity(7);
-        let mut ports = Vec::with_capacity(7);
-        for _ in 0..7 {
+        const N: usize = 8;
+        let mut listeners = Vec::with_capacity(N);
+        let mut ports = Vec::with_capacity(N);
+        for _ in 0..N {
             let sock = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
             ports.push(
                 sock.local_addr()
@@ -45,6 +51,7 @@ impl Ports {
             metrics: ports[4],
             raft: ports[5],
             ds_tcp: ports[6],
+            tcp_framed: ports[7],
         }
     }
 }
@@ -81,6 +88,13 @@ impl ProfileServer {
                 format!("127.0.0.1:{}", ports.metrics),
             )
             .env("KISEKI_RAFT_ADDR", format!("127.0.0.1:{}", ports.raft))
+            // ADR-042 §2.2 TCP-framed binding listener — bind to the
+            // ephemeral port allocated alongside the gRPC stack so
+            // `--binding tcp` mode has a known target.
+            .env(
+                "KISEKI_NATIVE_TCP_ADDR",
+                format!("127.0.0.1:{}", ports.tcp_framed),
+            )
             .env("KISEKI_DATA_DIR", data_dir.path())
             .env("KISEKI_NODE_ID", "1")
             .env("KISEKI_BOOTSTRAP", "true")

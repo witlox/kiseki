@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false  # internal crate; only kiseki-client publishes (release.yml)
 
 [lints]
 workspace = true
@@ -60,6 +61,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = "0.26"
 tower = "0.5"
+# ADR-042 §2.2 TCP-framed binding listener: per-peer connection map
+# + hot-rotatable TLS acceptor mirror the kiseki-raft tcp_transport
+# listener pattern.
+arc-swap = "1.7"
+dashmap = "6"
 tracing = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }

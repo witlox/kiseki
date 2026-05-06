@@ -62,6 +62,48 @@ pub struct NativeWorld {
     /// Topology version observed on the most recent successful RPC's
     /// trailing metadata, when the step captured it.
     pub last_topology_version: Option<u64>,
+    /// Synthetic `TopologyCache` driven by `@routing` / `@topology`
+    /// scenarios — exercises the per-edge selector + version-regress
+    /// logic without spinning up a full multi-node mTLS cluster.
+    /// Empty for scenarios that don't touch routing/topology paths.
+    pub topology_cache:
+        Option<std::sync::Arc<kiseki_client::native::TopologyCache>>,
+    /// Local-environment binding capabilities for `@routing` —
+    /// scenarios set this from the "the local client environment
+    /// has X available" Given step.
+    pub local_capabilities: Option<kiseki_client::native::LocalCapabilities>,
+    /// Per-node edge-selection outcomes captured by the `When the
+    /// client opens connections...` step. Keyed by node_id.
+    pub edge_selections: HashMap<u64, kiseki_client::native::EdgeSelection>,
+    /// Synthetic ConnectionPool driven by the @binding-restart /
+    /// @drain scenarios.
+    pub connection_pool: Option<std::sync::Arc<kiseki_client::native::ConnectionPool>>,
+    /// Drain accounting captured per scenario — the count of edges
+    /// reconcile_with_topology marked as draining on the most
+    /// recent observed topology change.
+    pub last_drained: Option<usize>,
+    /// Selector report captured by @binding-probe scenarios — used
+    /// by the Then steps to assert on banner content / error
+    /// shape.
+    pub selector_outcome: Option<SelectorOutcomeStash>,
+    /// Background TCP listeners kept alive for the lifetime of a
+    /// @binding-restart scenario. Each `JoinHandle` drives an
+    /// accept loop that swallows incoming connections so the
+    /// `TcpFramedClient::connect_plaintext` handshake succeeds.
+    /// The handles abort on Drop (scenario teardown).
+    pub synthetic_listeners: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Captured selector outcome for `@binding-probe` scenarios. Either
+/// the (plan, report) pair or the typed error.
+pub enum SelectorOutcomeStash {
+    /// Successful selector run — both plan and report stashed.
+    Success {
+        plan: kiseki_transport::native::SelectorPlan,
+        report: kiseki_transport::native::SelectorReport,
+    },
+    /// Failed selector run — error captured for `Then` assertions.
+    Failure(kiseki_transport::native::BindingSelectorError),
 }
 
 impl NativeWorld {

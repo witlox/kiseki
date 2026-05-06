@@ -1847,6 +1847,7 @@ dependencies = [
 name = "kiseki-acceptance"
 version = "2026.41.0"
 dependencies = [
+ "async-trait",
  "axum",
  "cucumber",
  "futures",
@@ -2010,16 +2011,20 @@ dependencies = [
  "kiseki-crypto",
  "kiseki-gateway",
  "kiseki-proto",
+ "kiseki-transport",
  "libc",
  "parking_lot 0.12.5",
+ "postcard",
  "proptest",
  "pyo3",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tracing",
  "uuid",
@@ -2099,9 +2104,11 @@ dependencies = [
 name = "kiseki-gateway"
 version = "2026.41.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "aws-lc-rs",
  "axum",
+ "dashmap",
  "http-body-util",
  "httpdate",
  "hyper",
@@ -2207,6 +2214,7 @@ dependencies = [
  "kiseki-gateway",
  "kiseki-proto",
  "libc",
+ "postcard",
  "pprof",
  "reqwest",
  "tempfile",
@@ -2221,8 +2229,13 @@ dependencies = [
 name = "kiseki-proto"
 version = "2026.41.0"
 dependencies = [
+ "kiseki-common",
+ "postcard",
  "prost",
  "prost-types",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.18",
  "tonic",
  "tonic-build",
  "tonic-prost",
@@ -2317,8 +2330,10 @@ dependencies = [
 name = "kiseki-transport"
 version = "2026.41.0"
 dependencies = [
+ "async-trait",
  "aws-lc-rs",
  "kiseki-common",
+ "kiseki-proto",
  "libc",
  "proptest",
  "rcgen",
@@ -3977,6 +3992,16 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

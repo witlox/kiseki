@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false  # internal crate; only kiseki-client publishes (release.yml)
 
 [lints]
 workspace = true
@@ -19,6 +20,10 @@ verbs = ["serde", "serde_json"]
 
 [dependencies]
 kiseki-common = { workspace = true }
+# ADR-042 §3.1 native binding selector consumes BindingId / LatencyClass /
+# ListenAddr from kiseki-proto::native_contract.
+kiseki-proto = { workspace = true }
+async-trait = { workspace = true }
 aws-lc-rs = { workspace = true }
 libc = { workspace = true }
 serde = { version = "1", features = ["derive"], optional = true }

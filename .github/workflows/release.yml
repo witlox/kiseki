@@ -292,35 +292,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish crates (topological order)
+      - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
         run: |
-          # Publish in dependency order. --no-verify skips build (already tested).
-          # Sleep between publishes to let crates.io index catch up.
-          CRATES=(
-            kiseki-common
-            kiseki-proto
-            kiseki-block
-            kiseki-crypto
-            kiseki-raft
-            kiseki-transport
-            kiseki-log
-            kiseki-audit
-            kiseki-keymanager
-            kiseki-chunk
-            kiseki-composition
-            kiseki-view
-            kiseki-advisory
-            kiseki-gateway
-            kiseki-client
-            kiseki-server
-          )
-          for crate in "${CRATES[@]}"; do
-            echo "Publishing $crate..."
-            cargo publish -p "$crate" --no-verify --allow-dirty 2>&1 || echo "  $crate: skipped (already published or not publishable)"
-            sleep 5
-          done
+          # Only `kiseki-client` is the public-facing SDK and is
+          # configured with `publish = true` in its Cargo.toml. Every
+          # other crate in the workspace is internal infrastructure
+          # (raft, gateway, server, log, view, transport, ...) and is
+          # marked `publish = false`; they MUST NOT ship to crates.io
+          # because they have no public API contract and pulling them
+          # in pollutes the consumer namespace.
+          #
+          # FOLLOW-UP (b): kiseki-client currently depends on
+          # kiseki-gateway transitively (FUSE in-process path). Until
+          # those internal deps are feature-gated behind an
+          # `in-process` feature, `cargo publish kiseki-client` will
+          # fail with "dependency not on crates.io". This is the
+          # honest pre-1.0 state — fixing it is the (b) refactor in
+          # the implementation plan.
+          echo "Publishing kiseki-client..."
+          cargo publish -p kiseki-client --no-verify --allow-dirty 2>&1 \
+            || echo "  kiseki-client: publish failed (likely transitive internal deps not on crates.io — see follow-up (b) in specs/implementation/adr-042-native-gateway.md)"
 
   # ---------------------------------------------------------------------------
   # E2E: docker compose single-node + 3-node — must pass before publish

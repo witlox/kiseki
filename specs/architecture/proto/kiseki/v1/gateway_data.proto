@@ -147,8 +147,67 @@ enum NodeState {
 
 message NodeInfo {
   uint64 node_id = 1;
-  string data_addr = 2;          // "host:port" or "[ipv6]:port"
+  // Legacy single-address field. Pre-ADR-042-§1.7 wire shape — kept
+  // for backwards compat with v0 clients that only know about the
+  // gRPC binding. NEW clients MUST consult `bindings` instead;
+  // servers MAY still populate this with the gRPC binding's address
+  // for v0-client compat. Pre-1.0 plan is to remove this once every
+  // shipped client is on the binding-aware code path.
+  string data_addr = 2;
   NodeState state = 3;
+  // ADR-042 §1.7 NodeBindings: per-node binding endpoints. Empty
+  // when `state` is FAILED or EVICTED (clients route around).
+  // Multiple entries when the node serves more than one binding
+  // (gRPC + TCP-framed + ibverbs ...). Clients pick per-edge per
+  // §3.2 — the highest-ranked latency_class mutually supported by
+  // (a) the local environment, (b) the bindings the node
+  // advertises here.
+  repeated BindingEndpoint bindings = 4;
+}
+
+// One transport binding listener exposed by a node. ADR-042 §1.7.
+// Wire form of the contract type at
+// `kiseki-proto::native_contract::BindingEndpoint`.
+message BindingEndpoint {
+  BindingId binding_id = 1;
+  // For IP bindings (gRPC, TCP-framed): "host:port". For RDMA
+  // bindings (ibverbs, libfabric/cxi): provider-encoded opaque
+  // descriptor; clients with no RDMA support ignore.
+  string addr = 2;
+  LatencyClass latency_class = 3;
+  // Set only when the node's state == DRAINING. Carries the
+  // §1.7.1 lifecycle signal so clients distinguish "drain in
+  // progress" from "graceful release window".
+  DrainState drain_state = 4;
+}
+
+// ADR-042 §1.7. Coarse on purpose (§3.6) — finer signals come
+// from per-shard telemetry, not topology.
+enum LatencyClass {
+  LATENCY_CLASS_UNSPECIFIED = 0;
+  LATENCY_CLASS_STANDARD = 1;
+  LATENCY_CLASS_LOW = 2;
+  LATENCY_CLASS_RDMA = 3;
+}
+
+// ADR-042 §1.7.
+enum BindingId {
+  BINDING_ID_UNSPECIFIED = 0;
+  BINDING_ID_GRPC = 1;
+  BINDING_ID_TCP_FRAMED = 2;
+  BINDING_ID_IBVERBS = 3;
+  // Provider variant carried in `libfabric_provider` when this
+  // value is selected.
+  BINDING_ID_LIBFABRIC = 4;
+}
+
+// ADR-042 §1.7.1. Owned by kiseki-control (drain coordinator per
+// ADR-035). Always paired with `state == DRAINING`.
+message DrainState {
+  // Mirrors the §9 lease-tracker view.
+  uint64 quiesce_window_remaining_ms = 1;
+  // false during quiesce; briefly true during graceful release.
+  bool accepts_new_work = 2;
 }
 
 message ShardLeadership {

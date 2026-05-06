@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false  # internal crate; only kiseki-client publishes (release.yml)
 
 # Test-only crate — no library.
 [lib]
@@ -24,6 +25,9 @@ default = []
 slow-tests = []
 
 [dependencies]
+# Synthetic BindingProbe step impls implement the async trait via the
+# async-trait macro (same shape as the per-binding probes ship).
+async-trait = { workspace = true }
 # Domain crates under test
 kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }

@@ -86,6 +86,22 @@ enum Shape {
     Mixed,
 }
 
+/// Native binding selector for `--protocol native`. ADR-042 §2 lists
+/// the binding set; `auto` follows server-side ranking
+/// (`Rdma > Low > Standard`). For comparing transport-layer cost
+/// pin one binding at a time and re-run.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub(crate) enum NativeBinding {
+    /// gRPC/h2 over rustls/TCP (ADR-042 §2.1).
+    Grpc,
+    /// TCP-framed-postcard over rustls/TCP (ADR-042 §2.2). Tuned IP
+    /// path; no h2 framing tax.
+    Tcp,
+    /// Honor `KISEKI_NATIVE_TRANSPORT` (or default to highest-ranked
+    /// available — same logic as the server-side BindingSelector).
+    Auto,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "kiseki-profile", about = "Profile Kiseki data paths.")]
 enum Cli {
@@ -125,6 +141,14 @@ struct RunArgs {
     /// next to this profile binary.
     #[arg(long)]
     server_bin: Option<std::path::PathBuf>,
+
+    /// ADR-042 native binding. Only meaningful for
+    /// `--protocol native`; ignored for other protocols. Defaults
+    /// to `grpc` to match historical kiseki-profile behavior;
+    /// `--binding tcp` drives the TCP-framed-postcard binding for
+    /// per-binding throughput comparison.
+    #[arg(long, value_enum, default_value_t = NativeBinding::Grpc)]
+    binding: NativeBinding,
 }
 
 fn main() {
@@ -210,7 +234,7 @@ async fn run(args: RunArgs) -> Result<(), String> {
     // session memory if someone runs at extreme concurrency.
     let pool_size = args.concurrency.clamp(1, 32);
     let driver: Arc<dyn protocols::Driver> =
-        protocols::build(args.protocol, server.as_ref(), pool_size).await?;
+        protocols::build(args.protocol, args.binding, server.as_ref(), pool_size).await?;
 
     let warmup_keys = if matches!(args.shape, Shape::PutHeavy) {
         Arc::new(Vec::new())
