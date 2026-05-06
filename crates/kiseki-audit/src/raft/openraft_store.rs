@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kiseki_raft::{
-    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, RedbRaftLogStore, StubNetworkFactory,
-    TcpNetworkFactory,
+    tcp_transport, FjallRaftLogStore, KisekiNode, KisekiRaftConfig, MemLogStore,
+    StubNetworkFactory, TcpNetworkFactory,
 };
 use openraft::Raft;
 
@@ -73,9 +73,9 @@ impl OpenRaftAuditStore {
         let (raft, already_initialized) = if let Some(dir) = data_dir {
             let raft_dir = dir.join("raft");
             std::fs::create_dir_all(&raft_dir).ok();
-            let redb_path = raft_dir.join("audit.redb");
+            let log_path = raft_dir.join("audit");
             let log_store =
-                RedbRaftLogStore::<C>::open(&redb_path).map_err(|_| AuditError::Unavailable)?;
+                FjallRaftLogStore::<C>::open(&log_path).map_err(|_| AuditError::Unavailable)?;
             let has_state = log_store.has_state();
             let raft = if peers.len() > 1 {
                 let network = TcpNetworkFactory::<C>::new(AUDIT_RAFT_GROUP_ID);

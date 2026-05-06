@@ -1,51 +1,56 @@
-//! Persistent audit store — wraps `RaftAuditStore` + `RedbLogStore`.
+//! Persistent audit store — wraps `RaftAuditStore` + `FjallLogStore`.
 //!
 //! Every audit event is written to both in-memory state machine
-//! (fast reads) and redb (durability). On startup, reloads from redb
-//! and replays the command log. Per ADR-009/ADR-022. Append-only (I-A1).
+//! (fast reads) and the fjall keyspace (durability). On startup,
+//! reloads from the keyspace and replays the command log.
+//! Per ADR-009/ADR-022 rev-2. Append-only (I-A1).
 
 use std::path::Path;
 
 use kiseki_common::ids::{OrgId, SequenceNumber};
-use kiseki_raft::redb_log_store::RedbLogStore;
+use kiseki_raft::FjallLogStore;
 
 use crate::event::AuditEvent;
 use crate::raft_store::{AuditCommand, RaftAuditStore};
 use crate::store::{AuditOps, AuditQuery};
 
-/// Persistent audit log — in-memory state machine + redb for durability.
+/// Persistent audit log — in-memory state machine + fjall for durability.
 pub struct PersistentAuditStore {
     inner: RaftAuditStore,
-    redb: RedbLogStore,
+    store: FjallLogStore,
 }
 
 impl PersistentAuditStore {
     /// Open or create a persistent audit store at the given path.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let redb = RedbLogStore::open(path).map_err(|e| format!("redb open: {e}"))?;
+        let store = FjallLogStore::open(path).map_err(|e| format!("fjall open: {e}"))?;
 
-        let entries: Vec<(u64, AuditCommand)> = redb.range(1, u64::MAX).unwrap_or_default();
+        let entries: Vec<(u64, AuditCommand)> = store.range(1, u64::MAX).unwrap_or_default();
 
         if entries.is_empty() {
             Ok(Self {
                 inner: RaftAuditStore::new(),
-                redb,
+                store,
             })
         } else {
-            let redb_count = entries.len();
+            let on_disk_count = entries.len();
             let inner = RaftAuditStore::from_commands(entries.into_iter());
             let log_len = inner.log_length();
-            if log_len != redb_count {
-                tracing::error!(log_len, redb_count, "audit store log length differs from redb entry count");
+            if log_len != on_disk_count {
+                tracing::error!(
+                    log_len,
+                    on_disk_count,
+                    "audit store log length differs from persisted entry count"
+                );
             }
-            Ok(Self { inner, redb })
+            Ok(Self { inner, store })
         }
     }
 }
 
 impl AuditOps for PersistentAuditStore {
     fn append(&self, event: AuditEvent) {
-        // Build the command before appending (for redb persistence).
+        // Build the command before appending (for persistence).
         let cmd = AuditCommand::AppendEvent {
             tenant_id: event.tenant_id.map(|o| *o.0.as_bytes()),
             event_type: RaftAuditStore::event_type_to_str_pub(&event.event_type).to_owned(),
@@ -56,9 +61,9 @@ impl AuditOps for PersistentAuditStore {
         // Append to in-memory state machine.
         self.inner.append(event);
 
-        // Persist the command to redb.
+        // Persist the command.
         let idx = self.inner.log_length() as u64;
-        let _ = self.redb.append(idx, &cmd);
+        let _ = self.store.append(idx, &cmd);
     }
 
     fn query(&self, q: &AuditQuery) -> Vec<AuditEvent> {
@@ -118,7 +123,7 @@ mod tests {
     #[test]
     fn append_and_query() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PersistentAuditStore::open(&dir.path().join("audit.redb")).unwrap();
+        let store = PersistentAuditStore::open(&dir.path().join("audit")).unwrap();
         store.append(make_event(Some(test_tenant()), AuditEventType::DataWrite));
         assert_eq!(store.total_events(), 1);
         assert_eq!(store.tip(Some(test_tenant())), SequenceNumber(1));
@@ -127,7 +132,7 @@ mod tests {
     #[test]
     fn events_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.redb");
+        let path = dir.path().join("audit");
 
         // Write events.
         {
@@ -158,7 +163,7 @@ mod tests {
     #[test]
     fn tenant_export_after_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.redb");
+        let path = dir.path().join("audit");
 
         {
             let store = PersistentAuditStore::open(&path).unwrap();

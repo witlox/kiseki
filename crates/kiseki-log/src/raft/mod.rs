@@ -14,7 +14,7 @@ pub mod state_machine;
 pub mod test_cluster;
 pub mod types;
 
-pub use log_store::{ShardMemLogStore, ShardRedbLogStore};
+pub use log_store::{ShardFjallLogStore, ShardMemLogStore};
 pub use network::StubNetworkFactory;
 pub use openraft_store::OpenRaftLogStore;
 pub use state_machine::ShardStateMachine;

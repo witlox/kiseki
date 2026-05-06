@@ -30,8 +30,9 @@ use kiseki_common::locks::LockOrDie;
 /// trait methods are async (ADR-032), so callers await directly
 /// without sync↔async bridging.
 ///
-/// When `data_dir` is set, uses `RedbRaftLogStore` for persistent
-/// Raft state (Phase 12b). When `None`, uses in-memory `MemLogStore`.
+/// When `data_dir` is set, uses `FjallRaftLogStore` for persistent
+/// Raft state (Phase 12b; ADR-022 rev-2). When `None`, uses
+/// in-memory `MemLogStore`.
 ///
 /// **ADR-041 multiplexed transport.** All shards on this node share
 /// a single `RaftRpcListener`, lazily initialized on the first
@@ -64,8 +65,9 @@ impl RaftShardStore {
     /// Create a new (empty) Raft shard store.
     ///
     /// Spawns a dedicated tokio runtime for Raft async operations.
-    /// When `data_dir` is `Some`, Raft log state is persisted to redb
-    /// and survives restart. When `None`, uses in-memory log (volatile).
+    /// When `data_dir` is `Some`, Raft log state is persisted to the
+    /// fjall keyspace and survives restart. When `None`, uses
+    /// in-memory log (volatile).
     #[must_use]
     pub fn new(node_id: u64, peers: BTreeMap<u64, String>, data_dir: Option<PathBuf>) -> Self {
         // Build the Raft runtime on a background thread to avoid

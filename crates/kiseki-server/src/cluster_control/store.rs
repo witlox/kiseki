@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use kiseki_common::ids::{NodeId, OrgId, ShardId};
 use kiseki_raft::{
-    KisekiNode, KisekiRaftConfig, MemLogStore, RedbRaftLogStore, RegistryHandle, TcpNetworkFactory,
+    FjallRaftLogStore, KisekiNode, KisekiRaftConfig, MemLogStore, RegistryHandle, TcpNetworkFactory,
 };
 use openraft::Raft;
 
@@ -246,16 +246,16 @@ impl OpenRaftControlStore {
     ///   `cfg.raft_peers.len() > 1`), so there is no single-node
     ///   stub-network branch.
     /// * `data_dir` — when `Some`, the Raft log is persisted to
-    ///   `<dir>/raft/cluster_control.redb` so the control-plane
+    ///   `<dir>/raft/cluster_control/` so the control-plane
     ///   group's membership and committed entries survive node
     ///   restart. The BDD harness's `@leader-change` scenarios
     ///   stress this: every node cycles through kill+restart
     ///   during a single test session, and without persistence the
     ///   restarted nodes lose all knowledge of the cluster's
     ///   leader / membership and the group eventually wedges with
-    ///   `forward request to: None, None`. With redb backing the
-    ///   restarted node rejoins via `AppendEntries` from the
-    ///   surviving leader.
+    ///   `forward request to: None, None`. With the persistent log
+    ///   backing, the restarted node rejoins via `AppendEntries`
+    ///   from the surviving leader.
     /// * `registry` — handle to the shared multiplexed listener.
     /// * `apply_hook` — runtime-supplied bridge to per-shard Raft
     ///   groups (see `ApplyHook` doc above).
@@ -293,16 +293,16 @@ impl OpenRaftControlStore {
 
         // Persistent log store when `data_dir` is set; otherwise
         // in-memory. `already_initialized` lets us skip
-        // `Raft::initialize` on a redb-backed restart even if the
-        // caller still passes `bootstrap = true`.
+        // `Raft::initialize` on a persistent-backed restart even if
+        // the caller still passes `bootstrap = true`.
         let (raft, already_initialized) = if let Some(dir) = data_dir {
             let raft_dir = dir.join("raft");
             std::fs::create_dir_all(&raft_dir).ok();
-            let redb_path = raft_dir.join("cluster_control.redb");
-            let log_store = RedbRaftLogStore::<C>::open(&redb_path).map_err(|e| {
+            let log_path = raft_dir.join("cluster_control");
+            let log_store = FjallRaftLogStore::<C>::open(&log_path).map_err(|e| {
                 std::io::Error::other(format!(
-                    "control redb log store {}: {e}",
-                    redb_path.display()
+                    "control raft log store {}: {e}",
+                    log_path.display()
                 ))
             })?;
             let has_state = log_store.has_state();
@@ -330,7 +330,7 @@ impl OpenRaftControlStore {
         if bootstrap && !already_initialized {
             // First boot of a fresh cluster: write the initial
             // membership entry. Persistent restarts (`already_initialized`)
-            // skip this — the redb log already holds the membership
+            // skip this — the persistent log already holds the membership
             // and openraft would reject a repeat call with
             // `not allowed`.
             if let Err(e) = raft.initialize(members).await {

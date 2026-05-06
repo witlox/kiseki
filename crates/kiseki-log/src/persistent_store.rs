@@ -1,13 +1,15 @@
-//! Persistent shard store — wraps `MemShardStore` + `RedbLogStore`.
+//! Persistent shard store — wraps `MemShardStore` + `FjallLogStore`.
 //!
-//! Every delta append is written to both in-memory store (fast reads)
-//! and redb (durability). On startup, reloads from redb into memory.
-//! Per ADR-022.
+//! Every delta append is written to both the in-memory store (fast
+//! reads) and the fjall keyspace (durability). On startup, reloads
+//! from fjall into memory. Per ADR-022 rev-2 (fjall successor on
+//! the Raft log path; the same backend that backs the openraft
+//! `RaftLogStorage` impl).
 
 use std::path::Path;
 
 use kiseki_common::ids::{NodeId, OrgId, SequenceNumber, ShardId};
-use kiseki_raft::redb_log_store::RedbLogStore;
+use kiseki_raft::FjallLogStore;
 
 use crate::delta::Delta;
 use crate::error::LogError;
@@ -15,24 +17,24 @@ use crate::shard::{ShardConfig, ShardInfo, ShardState};
 use crate::store::MemShardStore;
 use crate::traits::{AppendDeltaRequest, LogOps, ReadDeltasRequest};
 
-/// Persistent shard store — in-memory + redb for durability.
+/// Persistent shard store — in-memory + fjall for durability.
 pub struct PersistentShardStore {
     mem: MemShardStore,
-    redb: RedbLogStore,
+    store: FjallLogStore,
 }
 
 impl PersistentShardStore {
     /// Open or create a persistent store at the given path.
     ///
-    /// If the redb database contains existing data, it is loaded
+    /// If the fjall keyspace contains existing data, it is loaded
     /// into the in-memory store on startup.
     pub async fn open(path: &Path) -> Result<Self, LogError> {
-        let redb = RedbLogStore::open(path).map_err(|_| LogError::Unavailable)?;
+        let store = FjallLogStore::open(path).map_err(|_| LogError::Unavailable)?;
         let mem = MemShardStore::new();
 
-        let mut store = Self { mem, redb };
-        store.reload().await;
-        Ok(store)
+        let mut s = Self { mem, store };
+        s.reload().await;
+        Ok(s)
     }
 
     /// Create a shard (delegates to in-memory store + persists metadata).
@@ -51,19 +53,20 @@ impl PersistentShardStore {
             tenant_id_bytes: *tenant_id.0.as_bytes(),
             node_id: node_id.0,
         };
-        let _ = self.redb.set_meta(&key, &meta);
+        let _ = self.store.set_meta(&key, &meta);
     }
 
-    /// Reload all data from redb into the in-memory store.
+    /// Reload all data from the persistent store into the in-memory
+    /// store.
     ///
     /// Iterates persisted shard metadata and deltas, re-creates shards
     /// and replays deltas into the in-memory store.
     async fn reload(&mut self) {
-        // MVP: shard metadata not iterated from redb. Shards are
-        // re-created via bootstrap on startup. Deltas replayed below.
+        // MVP: shard metadata not iterated. Shards are re-created via
+        // bootstrap on startup. Deltas replayed below.
 
         // Reload deltas — iterate all entries in the log table.
-        if let Ok(entries) = self.redb.range::<PersistedDelta>(1, u64::MAX) {
+        if let Ok(entries) = self.store.range::<PersistedDelta>(1, u64::MAX) {
             use kiseki_common::ids::{NodeId, OrgId, ShardId};
             use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
 
@@ -127,7 +130,10 @@ impl PersistentShardStore {
                     })
                     .await;
             }
-            tracing::info!(shard_count = seen_shards.len(), "shards restored from redb");
+            tracing::info!(
+                shard_count = seen_shards.len(),
+                "shards restored from persistent log store"
+            );
         }
     }
 }
@@ -162,7 +168,7 @@ impl LogOps for PersistentShardStore {
         // Write to in-memory first (assigns sequence number).
         let seq = self.mem.append_delta(req.clone()).await?;
 
-        // Persist the full request to redb for reload.
+        // Persist the full request for reload-on-restart.
         let persisted = PersistedDelta {
             shard_id_bytes: *req.shard_id.0.as_bytes(),
             tenant_id_bytes: *req.tenant_id.0.as_bytes(),
@@ -190,7 +196,7 @@ impl LogOps for PersistentShardStore {
                 kiseki_common::time::ClockQuality::Unsync => 3,
             },
         };
-        let _ = self.redb.append(seq.0, &persisted);
+        let _ = self.store.append(seq.0, &persisted);
 
         Ok(seq)
     }
@@ -222,7 +228,8 @@ impl LogOps for PersistentShardStore {
         node_id: NodeId,
         config: ShardConfig,
     ) {
-        // Delegate to inherent method (persists metadata to redb).
+        // Delegate to inherent method (persists metadata to the
+        // backing fjall store).
         Self::create_shard(self, shard_id, tenant_id, node_id, config);
     }
 
@@ -289,7 +296,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn append_and_read() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PersistentShardStore::open(&dir.path().join("test.redb"))
+        let store = PersistentShardStore::open(&dir.path().join("log"))
             .await
             .unwrap();
         store.create_shard(
@@ -329,9 +336,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn redb_records_persist() {
+    async fn records_persist_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("persist.redb");
+        let path = dir.path().join("persist");
 
         // Write data.
         {
@@ -376,7 +383,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn timestamps_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ts.redb");
+        let path = dir.path().join("ts");
 
         let ts = DeltaTimestamp {
             hlc: HybridLogicalClock {

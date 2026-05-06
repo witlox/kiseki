@@ -454,21 +454,21 @@ impl KisekiWorld {
     }
 
     /// Open or reuse a `PersistentShardStore` for persistence-feature
-    /// scenarios. Creates a tempdir-backed redb on first call; subsequent
-    /// calls return the existing handle until `restart_persistent_store`
-    /// drops it.
+    /// scenarios. Creates a tempdir-backed fjall keyspace on first
+    /// call; subsequent calls return the existing handle until
+    /// `restart_persistent_store` drops it.
     pub async fn persistent_store(
         &mut self,
     ) -> Arc<kiseki_log::persistent_store::PersistentShardStore> {
         if self.legacy.persistent_shard_store.is_none() {
             let dir = tempfile::tempdir().expect("persistent store tempdir");
             // Path matches production layout
-            // (`runtime.rs`: `dir.join("raft").join("log.redb")`) so
+            // (`runtime.rs`: `dir.join("raft").join("log")`) so
             // persistence.feature's Background step can assert against
             // the same on-disk shape that `kiseki-server` produces.
             let raft_dir = dir.path().join("raft");
             std::fs::create_dir_all(&raft_dir).expect("mkdir <data_dir>/raft");
-            let path = raft_dir.join("log.redb");
+            let path = raft_dir.join("log");
             let store = kiseki_log::persistent_store::PersistentShardStore::open(&path)
                 .await
                 .expect("open persistent store");
@@ -484,22 +484,24 @@ impl KisekiWorld {
     }
 
     /// Path the harness uses for the persistent shard log (mirrors
-    /// the production runtime: `<DATA_DIR>/raft/log.redb`). Returns
-    /// `None` until `persistent_store()` has been called at least
-    /// once. Used by the persistence.feature Background step to
-    /// assert the on-disk layout the spec documents.
+    /// the production runtime: `<DATA_DIR>/raft/log/`, fjall
+    /// keyspace directory). Returns `None` until `persistent_store()`
+    /// has been called at least once. Used by the persistence.feature
+    /// Background step to assert the on-disk layout the spec
+    /// documents.
     #[must_use]
     pub fn persistent_store_path(&self) -> Option<std::path::PathBuf> {
         self.legacy
             .persistent_temp_dir
             .as_ref()
-            .map(|d| d.path().join("raft").join("log.redb"))
+            .map(|d| d.path().join("raft").join("log"))
     }
 
     /// Simulate a server restart: drop the in-memory state of the
-    /// `PersistentShardStore`, then reopen it against the same redb path.
-    /// Anything that wasn't durably committed to redb is lost; anything
-    /// that was survives. The tempdir is preserved so the redb file persists.
+    /// `PersistentShardStore`, then reopen it against the same path.
+    /// Anything that wasn't durably committed is lost; anything that
+    /// was survives. The tempdir is preserved so the on-disk
+    /// keyspace persists.
     ///
     /// No-op when no persistent store has been opened — scenarios that
     /// don't touch the persistent store (chunk/view/key/inline restart
@@ -510,7 +512,7 @@ impl KisekiWorld {
         let Some(dir) = self.legacy.persistent_temp_dir.as_ref() else {
             return;
         };
-        let path = dir.path().join("raft").join("log.redb");
+        let path = dir.path().join("raft").join("log");
         // Drop the existing handle so we can reopen against the same path.
         self.legacy.persistent_shard_store = None;
         let store = kiseki_log::persistent_store::PersistentShardStore::open(&path)

@@ -1,11 +1,12 @@
 Feature: Persistence and crash recovery (ADR-022)
 
-  Data survives server restart. Raft log persisted via redb.
-  Chunk data in pool files. View watermarks checkpointed.
+  Data survives server restart. Raft log persisted via the
+  composition-store backend (fjall as of ADR-022 rev-2). Chunk data
+  in pool files. View watermarks checkpointed.
 
   Background:
     Given a Kiseki server with KISEKI_DATA_DIR configured
-    And redb database at $DATA_DIR/raft/log.redb
+    And persistent log store at $DATA_DIR/raft/log/
     And pool files at $DATA_DIR/pools/
 
   # === Raft log persistence ===

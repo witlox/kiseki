@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
-use kiseki_raft::{KisekiNode, RedbRaftLogStore, Topology};
+use kiseki_raft::{FjallRaftLogStore, KisekiNode, Topology};
 use openraft::error::RPCError;
 use openraft::type_config::async_runtime::WatchReceiver;
 use openraft::Raft;
@@ -187,7 +187,7 @@ impl openraft::network::v2::RaftNetworkV2<C> for TestNetwork {
     }
 }
 
-/// Construct one Raft node backed by a redb log store at `path`. Used
+/// Construct one Raft node backed by a fjall log store at `path`. Used
 /// by both `new` and `restart_node` so the construction recipe is
 /// shared and stays in sync across cold start vs. restart paths.
 async fn build_node(
@@ -197,7 +197,7 @@ async fn build_node(
     path: &std::path::Path,
     router: Arc<TestRouter>,
 ) -> Result<RaftTestNode, LogError> {
-    let log_store = RedbRaftLogStore::<C>::open(path).map_err(|_| LogError::Unavailable)?;
+    let log_store = FjallRaftLogStore::<C>::open(path).map_err(|_| LogError::Unavailable)?;
     let sm_inner = Arc::new(futures::lock::Mutex::new(ShardSmInner::new(
         shard_id, tenant_id,
     )));
@@ -230,7 +230,7 @@ async fn build_node(
 
 /// In-process multi-node Raft test cluster.
 ///
-/// Uses `RedbRaftLogStore` on a per-cluster tempdir so `restart_node()`
+/// Uses `FjallRaftLogStore` on a per-cluster tempdir so `restart_node()`
 /// can rebuild a Raft instance against the same on-disk state — proves
 /// log persistence end-to-end without an extra cluster variant.
 pub struct RaftTestCluster {
@@ -238,10 +238,10 @@ pub struct RaftTestCluster {
     nodes: HashMap<u64, RaftTestNode>,
     tenant_id: OrgId,
     shard_id: ShardId,
-    /// Owns the temp directory backing every node's redb log store.
+    /// Owns the temp directory backing every node's log store.
     /// Dropped with the cluster — files are gone after the test exits.
     log_dir: tempfile::TempDir,
-    /// Per-node redb file path under `log_dir` so `restart_node` can
+    /// Per-node log directory path under `log_dir` so `restart_node` can
     /// reopen the same state.
     log_paths: HashMap<u64, PathBuf>,
     /// Topology label per node (Phase 14f). Set via `set_topology`,
@@ -261,7 +261,7 @@ impl RaftTestCluster {
 
         // Create all nodes.
         for id in 1..=node_count {
-            let path = log_dir.path().join(format!("node-{id}.redb"));
+            let path = log_dir.path().join(format!("node-{id}"));
             log_paths.insert(id, path.clone());
             let node = build_node(id, shard_id, tenant_id, &path, Arc::clone(&router))
                 .await
@@ -448,7 +448,7 @@ impl RaftTestCluster {
     /// Spawn an additional node and add it as a learner to the cluster.
     /// Returns once the leader has accepted the learner change.
     pub async fn add_learner(&mut self, new_id: u64) -> Result<(), LogError> {
-        let path = self.log_dir.path().join(format!("node-{new_id}.redb"));
+        let path = self.log_dir.path().join(format!("node-{new_id}"));
         let node = build_node(
             new_id,
             self.shard_id,

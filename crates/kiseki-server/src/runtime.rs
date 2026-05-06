@@ -244,19 +244,20 @@ pub async fn run_main(
         let identity = select_node_identity_or_die(&cfg, dir)?;
         tracing::info!(source = identity.kind(), "key store at-rest identity");
         let store = kiseki_keymanager::PersistentKeyStore::open(
-            &dir.join("keys").join("epochs.redb"),
+            &dir.join("keys").join("epochs"),
             &*identity,
             &salt,
         )
         .map_err(|e| format!("persistent key store: {e}"))?;
         tracing::info!(
             epoch = store.health().current_epoch.unwrap_or(0),
-            "key manager: persistent (redb) ready",
+            "key manager: persistent (fjall) ready",
         );
         store
     } else {
-        // In-memory: use a process-scoped tempdir for both the redb file
-        // and the file-based node identity. Ephemeral by design.
+        // In-memory: use a process-scoped tempdir for both the
+        // keyspace and the file-based node identity. Ephemeral by
+        // design.
         let tmp = std::env::temp_dir().join(format!("kiseki-keys-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok();
         let identity = kiseki_keymanager::node_identity::FileIdentitySource::new(
@@ -264,7 +265,7 @@ pub async fn run_main(
         )
         .map_err(|e| format!("ephemeral node identity: {e}"))?;
         let store =
-            kiseki_keymanager::PersistentKeyStore::open(&tmp.join("epochs.redb"), &identity, &salt)
+            kiseki_keymanager::PersistentKeyStore::open(&tmp.join("epochs"), &identity, &salt)
                 .map_err(|e| format!("key store init: {e}"))?;
         tracing::info!(
             epoch = store.health().current_epoch.unwrap_or(0),
@@ -531,7 +532,7 @@ pub async fn run_main(
     } else if let Some(ref dir) = cfg.data_dir {
         std::fs::create_dir_all(dir.join("raft")).ok();
         let store = kiseki_log::persistent_store::PersistentShardStore::open(
-            &dir.join("raft").join("log.redb"),
+            &dir.join("raft").join("log"),
         )
         .await
         .map_err(|e| format!("persistent store: {e}"))?;
@@ -543,7 +544,7 @@ pub async fn run_main(
                 kiseki_log::ShardConfig::default(),
             );
         }
-        tracing::info!(path = %dir.display(), "log store: persistent (redb)");
+        tracing::info!(path = %dir.display(), "log store: persistent (fjall)");
         Arc::new(store)
     } else {
         let store = kiseki_log::MemShardStore::new();
@@ -1886,27 +1887,29 @@ mod tests {
     use std::path::PathBuf;
 
     /// The 4 canonical persistent store paths that the runtime constructs
-    /// under `data_dir`. Three are redb databases, one is a chunk device +
-    /// metadata pair. All must be in distinct subdirectories under `data_dir`.
+    /// under `data_dir`. Two are fjall keyspaces (directories), one is a
+    /// redb database (small-object inline store), and one is a chunk
+    /// device + metadata pair. All must be in distinct subdirectories
+    /// under `data_dir`.
     ///
     /// Layout (from `runtime::run_main`):
-    ///   raft/log.redb       — Raft log (persistent shard store)
-    ///   keys/epochs.redb    — Key manager epochs
-    ///   small/objects.redb  — Small object inline store
+    ///   raft/log/           — Raft log shard store (fjall, dir)
+    ///   keys/epochs/        — Key manager epochs (fjall, dir)
+    ///   small/objects.redb  — Small object inline store (still redb)
     ///   chunks/data.dev     — Raw block device for chunks
     fn canonical_store_paths(data_dir: &std::path::Path) -> [PathBuf; 4] {
         [
-            data_dir.join("raft").join("log.redb"),
-            data_dir.join("keys").join("epochs.redb"),
+            data_dir.join("raft").join("log"),
+            data_dir.join("keys").join("epochs"),
             data_dir.join("small").join("objects.redb"),
             data_dir.join("chunks").join("data.dev"),
         ]
     }
 
     #[test]
-    fn redb_layout_paths_are_distinct_and_under_data_dir() {
+    fn store_layout_paths_are_distinct_and_under_data_dir() {
         let data_dir =
-            std::env::temp_dir().join(format!("kiseki-redb-layout-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("kiseki-store-layout-test-{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let paths = canonical_store_paths(&data_dir);
@@ -1927,13 +1930,19 @@ mod tests {
             );
         }
 
-        // The 3 redb stores must have .redb extension.
-        let redb_paths = &paths[..3];
-        for path in redb_paths {
-            assert_eq!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("redb"),
-                "redb store path must have .redb extension: {path:?}"
+        // The remaining redb store keeps the .redb extension; the
+        // first two (fjall keyspaces) are directories with no
+        // extension.
+        let redb_path = &paths[2];
+        assert_eq!(
+            redb_path.extension().and_then(|e| e.to_str()),
+            Some("redb"),
+            "redb store path must have .redb extension: {redb_path:?}"
+        );
+        for fjall_path in &paths[..2] {
+            assert!(
+                fjall_path.extension().is_none(),
+                "fjall keyspace path must have no extension: {fjall_path:?}"
             );
         }
 

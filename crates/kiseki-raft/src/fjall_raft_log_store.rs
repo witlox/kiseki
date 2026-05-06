@@ -1,10 +1,12 @@
-//! Persistent Raft log store backed by redb.
+//! Persistent Raft log store backed by fjall.
 //!
-//! Wraps `RedbLogStore` and implements openraft's `RaftLogStorage` +
-//! `RaftLogReader` traits. Raft state (log entries, vote, committed
+//! Wraps [`FjallLogStore`] and implements openraft's `RaftLogStorage`
+//! + `RaftLogReader` traits. Raft state (log entries, vote, committed
 //! index, last purged) survives server restart.
 //!
-//! Phase 12b: replaces `MemLogStore` for production deployments.
+//! ADR-022 rev-2 successor: replaces the previous `RedbRaftLogStore`
+//! 2026-05-06. Wire / serde-json format unchanged so a `git revert`
+//! to the redb impl doesn't require re-encoding entries.
 
 use std::fmt::Debug;
 use std::io;
@@ -18,37 +20,39 @@ use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
 use openraft::{LogState, RaftTypeConfig};
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::redb_log_store::RedbLogStore;
+use crate::fjall_log_store::FjallLogStore;
 
-/// Persistent Raft log store backed by redb.
+/// Persistent Raft log store backed by fjall.
 ///
-/// Stores log entries in the `raft_log` table and metadata (vote,
-/// committed, last_purged) in the `raft_meta` table. Thread-safe
-/// via `Arc` — `Clone` shares the underlying database.
+/// Stores log entries in the `raft_log` keyspace and metadata
+/// (`vote`, `committed`, `last_purged`) in the `raft_meta` keyspace.
+/// Thread-safe via `Arc` — `Clone` shares the underlying database.
 #[derive(Clone)]
-pub struct RedbRaftLogStore<C: RaftTypeConfig> {
-    redb: Arc<RedbLogStore>,
+pub struct FjallRaftLogStore<C: RaftTypeConfig> {
+    inner: Arc<FjallLogStore>,
     _phantom: std::marker::PhantomData<C>,
 }
 
-impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
-    /// Open or create a persistent Raft log store.
+impl<C: RaftTypeConfig> FjallRaftLogStore<C> {
+    /// Open or create a persistent Raft log store at `path`. The
+    /// path is a directory (fjall layout); callers that previously
+    /// passed a `*.redb` file path should pass a sibling directory
+    /// name with no extension.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let redb = RedbLogStore::open(path)?;
+        let inner = FjallLogStore::open(path)?;
         Ok(Self {
-            redb: Arc::new(redb),
+            inner: Arc::new(inner),
             _phantom: std::marker::PhantomData,
         })
     }
 
-    /// Check whether this store has any persisted state (log entries or vote).
-    ///
-    /// Returns `true` if the store was previously used — the Raft node
-    /// should NOT call `initialize()` on restart.
+    /// Check whether this store has any persisted state (log entries
+    /// or vote). Returns `true` if the store was previously used —
+    /// the Raft node should NOT call `initialize()` on restart.
     pub fn has_state(&self) -> bool {
-        self.redb.len().unwrap_or(0) > 0
+        !self.inner.is_empty().unwrap_or(true)
             || self
-                .redb
+                .inner
                 .get_meta::<serde_json::Value>("vote")
                 .ok()
                 .flatten()
@@ -56,7 +60,7 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
     }
 }
 
-impl<C: RaftTypeConfig> RaftLogReader<C> for RedbRaftLogStore<C>
+impl<C: RaftTypeConfig> RaftLogReader<C> for FjallRaftLogStore<C>
 where
     C::Entry: DeserializeOwned + Clone,
     VoteOf<C>: DeserializeOwned,
@@ -75,16 +79,16 @@ where
             std::ops::Bound::Excluded(&e) => e.saturating_sub(1),
             std::ops::Bound::Unbounded => u64::MAX,
         };
-        let entries: Vec<(u64, C::Entry)> = self.redb.range(start, end)?;
+        let entries: Vec<(u64, C::Entry)> = self.inner.range(start, end)?;
         Ok(entries.into_iter().map(|(_, e)| e).collect())
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error> {
-        self.redb.get_meta("vote")
+        self.inner.get_meta("vote")
     }
 }
 
-impl<C: RaftTypeConfig> RaftLogStorage<C> for RedbRaftLogStore<C>
+impl<C: RaftTypeConfig> RaftLogStorage<C> for FjallRaftLogStore<C>
 where
     C::Entry: Serialize + DeserializeOwned + Clone,
     VoteOf<C>: Serialize + DeserializeOwned,
@@ -93,10 +97,10 @@ where
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, io::Error> {
-        let last_purged: Option<LogIdOf<C>> = self.redb.get_meta("last_purged")?;
-        let last_index = self.redb.last_index()?;
+        let last_purged: Option<LogIdOf<C>> = self.inner.get_meta("last_purged")?;
+        let last_index = self.inner.last_index()?;
         let last_log_id = if let Some(idx) = last_index {
-            let entry: Option<C::Entry> = self.redb.get(idx)?;
+            let entry: Option<C::Entry> = self.inner.get(idx)?;
             entry.map(|e| e.log_id())
         } else {
             last_purged.clone()
@@ -108,26 +112,33 @@ where
     }
 
     async fn save_committed(&mut self, committed: Option<LogIdOf<C>>) -> Result<(), io::Error> {
-        self.redb.set_meta("committed", &committed)
+        self.inner.set_meta("committed", &committed)
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogIdOf<C>>, io::Error> {
-        self.redb
+        self.inner
             .get_meta::<Option<LogIdOf<C>>>("committed")
             .map(Option::flatten)
     }
 
     async fn save_vote(&mut self, vote: &VoteOf<C>) -> Result<(), io::Error> {
-        self.redb.set_meta("vote", vote)
+        self.inner.set_meta("vote", vote)
     }
 
     async fn append<I>(&mut self, entries: I, callback: IOFlushed<C>) -> Result<(), io::Error>
     where
         I: IntoIterator<Item = C::Entry>,
     {
+        // Each `append` call is one fsync at the inner layer
+        // (`PersistMode::SyncAll` per entry). This matches the redb
+        // impl's per-entry txn commit. A future optimization can
+        // batch the iterator into one fjall WriteBatch + one fsync,
+        // but that requires confirming openraft's expectations on
+        // partial-failure semantics — the conservative port keeps
+        // parity with the redb durability shape.
         for entry in entries {
             let idx = entry.index();
-            self.redb.append(idx, &entry)?;
+            self.inner.append(idx, &entry)?;
         }
         callback.io_completed(Ok(()));
         Ok(())
@@ -135,18 +146,18 @@ where
 
     async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<C>>) -> Result<(), io::Error> {
         if let Some(ref log_id) = last_log_id {
-            self.redb.truncate_after(log_id.index())?;
+            self.inner.truncate_after(log_id.index())?;
         } else {
             // Truncate everything — remove all entries.
-            self.redb.truncate_before(u64::MAX)?;
+            self.inner.truncate_before(u64::MAX)?;
         }
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogIdOf<C>) -> Result<(), io::Error> {
         // Remove entries up to and including log_id.index().
-        self.redb.truncate_before(log_id.index() + 1)?;
-        self.redb.set_meta("last_purged", &log_id)?;
+        self.inner.truncate_before(log_id.index() + 1)?;
+        self.inner.set_meta("last_purged", &log_id)?;
         Ok(())
     }
 
@@ -159,8 +170,6 @@ where
 mod tests {
     use super::*;
 
-    // Use a concrete type config for testing — borrow from kiseki-log's LogTypeConfig.
-    // Since we can't depend on kiseki-log from kiseki-raft, define a minimal test config.
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
     struct TestCmd(String);
     impl std::fmt::Display for TestCmd {
@@ -189,18 +198,16 @@ mod tests {
     #[tokio::test]
     async fn vote_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vote.redb");
+        let path = dir.path().join("vote");
 
-        // Write vote.
         {
-            let mut store = RedbRaftLogStore::<TestConfig>::open(&path).unwrap();
+            let mut store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
             let vote = openraft::Vote::new(1, 42);
             store.save_vote(&vote).await.unwrap();
         }
 
-        // Reopen and read.
         {
-            let mut store = RedbRaftLogStore::<TestConfig>::open(&path).unwrap();
+            let mut store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
             let vote = store.read_vote().await.unwrap();
             assert!(vote.is_some());
         }
@@ -209,43 +216,43 @@ mod tests {
     #[tokio::test]
     async fn has_state_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbRaftLogStore::<TestConfig>::open(&dir.path().join("empty.redb")).unwrap();
+        let store =
+            FjallRaftLogStore::<TestConfig>::open(&dir.path().join("empty")).unwrap();
         assert!(!store.has_state());
     }
 
     #[tokio::test]
     async fn entries_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("persist.redb");
+        let path = dir.path().join("persist");
 
-        // Write entries, then drop the store.
         {
-            let mut store = RedbRaftLogStore::<TestConfig>::open(&path).unwrap();
+            let mut store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
             let vote = openraft::Vote::new(1, 10);
             store.save_vote(&vote).await.unwrap();
-
-            // Append entries via the underlying RedbLogStore directly,
-            // since creating proper Entry types requires internal openraft
-            // constructors. We verify persistence at the redb layer.
-            store.redb.append(1, &"entry-1").unwrap();
-            store.redb.append(2, &"entry-2").unwrap();
-            store.redb.append(3, &"entry-3").unwrap();
+            // Append entries via the underlying store directly —
+            // creating proper Entry types requires internal openraft
+            // constructors. We verify persistence at the inner layer.
+            store.inner.append(1, &"entry-1").unwrap();
+            store.inner.append(2, &"entry-2").unwrap();
+            store.inner.append(3, &"entry-3").unwrap();
         }
 
-        // Reopen and verify entries survived.
         {
-            let mut store = RedbRaftLogStore::<TestConfig>::open(&path).unwrap();
+            let mut store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
             assert!(store.has_state(), "store should have state after reopen");
-
-            // Verify entries at the redb layer.
-            let v1: Option<String> = store.redb.get(1).unwrap();
-            assert_eq!(v1, Some("entry-1".to_string()));
-            let v2: Option<String> = store.redb.get(2).unwrap();
-            assert_eq!(v2, Some("entry-2".to_string()));
-            let v3: Option<String> = store.redb.get(3).unwrap();
-            assert_eq!(v3, Some("entry-3".to_string()));
-
-            // Vote should also survive.
+            assert_eq!(
+                store.inner.get::<String>(1).unwrap(),
+                Some("entry-1".to_string())
+            );
+            assert_eq!(
+                store.inner.get::<String>(2).unwrap(),
+                Some("entry-2".to_string())
+            );
+            assert_eq!(
+                store.inner.get::<String>(3).unwrap(),
+                Some("entry-3".to_string())
+            );
             let vote = store.read_vote().await.unwrap();
             assert!(vote.is_some(), "vote should survive reopen");
         }
@@ -254,8 +261,8 @@ mod tests {
     #[tokio::test]
     async fn has_state_after_vote() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("voted.redb");
-        let mut store = RedbRaftLogStore::<TestConfig>::open(&path).unwrap();
+        let path = dir.path().join("voted");
+        let mut store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
         let vote = openraft::Vote::new(1, 1);
         store.save_vote(&vote).await.unwrap();
         assert!(store.has_state());

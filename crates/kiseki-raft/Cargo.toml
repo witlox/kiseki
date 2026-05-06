@@ -18,7 +18,14 @@ dashmap = "6"
 futures = "0.3"
 openraft = { workspace = true }
 prometheus = { workspace = true }
-redb = "4"
+# Persistent Raft log store (ADR-022 rev-2 successor): fjall replaces
+# redb 2026-05-06 alongside the composition path swap. The Raft log
+# is append-mostly + truncate-back-on-leader-change + range-scan on
+# replay; redb's per-write COW B-tree commit dominated CPU at the
+# rates the multi-shard fabric drives. fjall's LSM batches the
+# WAL append + memtable insert into one journal write per
+# `WriteBatch`, matching the durability contract openraft expects.
+fjall = "3.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = { workspace = true }
 serde_json = "1"

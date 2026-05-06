@@ -1,7 +1,8 @@
-# ADR-022: Storage Backend — redb (Pure Rust) + fjall on the Composition Hot Path
+# ADR-022: Storage Backend — fjall on Hot Paths, redb on Low-Frequency Stores
 
-**Status**: Accepted (rev-2 amendment 2026-05-06).
-**Date**: 2026-04-20 (rev-1 — redb), 2026-05-06 (rev-2 — fjall on composition).
+**Status**: Accepted (rev-3 amendment 2026-05-06).
+**Date**: 2026-04-20 (rev-1 — redb), 2026-05-06 (rev-2 — fjall on
+composition, rev-3 — fjall on the Raft log).
 **Deciders**: Architect + implementer.
 
 ## Context
@@ -168,25 +169,17 @@ queue was failing to remove. p99 latency improved alongside
 throughput because the LSM doesn't pay redb's freed-pages
 processing on every commit.
 
-### Scope of the swap (what stayed on redb)
+### Scope of the rev-2 swap (what stayed on redb)
 
-Only the `kiseki-composition` persistent path moved.
+Only the `kiseki-composition` persistent path moved in rev-2.
+rev-3 below extends the swap to the Raft log path.
 
-- **Raft log store** (`kiseki-raft`'s `RedbLogStore`): stayed on
-  redb. Append-mostly workload + snapshot-driven log truncation
-  fits redb's COW B-tree well; no measured throughput pressure
-  yet.
 - **View store** (`kiseki-view`'s `PersistentRedbStorage`):
   stayed on redb. Watermark checkpoints are low-frequency;
   migration would cost more than it returns.
-- **Key manager** (`kiseki-keymanager`'s `PersistentKeyStore`),
-  **small object store** (`kiseki-chunk`'s `SmallObjectStore`),
-  **tuning store** (`kiseki-server`'s `RedbTuningStore`): all
+- **Small object store** (`kiseki-chunk`'s `SmallObjectStore`)
+  and **tuning store** (`kiseki-server`'s `RedbTuningStore`):
   low-frequency; stay on redb.
-
-A future spike that finds Raft log append capped at the rev-1
-floor will reopen this for the log path; the same encoding-module
-pattern is in place to make that swap mechanical.
 
 ### Rollback path (pre-production stance)
 
@@ -195,6 +188,101 @@ operators wipe + re-replicate from Raft if they need to roll
 back. `git revert` on the rev-2 commits is the supported path
 (redb implementation is in git history, ~1 354 LOC for
 `PersistentRedbStorage` + 636 LOC for the write-behind queue).
+
+## Rev-3 amendment (2026-05-06) — fjall on the Raft log path
+
+Following rev-2's win on the composition path, the same swap
+landed on the Raft log:
+
+- `RedbLogStore` (the generic key-value persistence wrapper used
+  by `PersistentShardStore`, `PersistentKeyStore`,
+  `PersistentAuditStore`) → `FjallLogStore`. Same public surface
+  (`open`/`append`/`get`/`range`/`truncate_*`/`set_meta`/
+  `get_meta`/`last_index`/`len`).
+- `RedbRaftLogStore` (the openraft `RaftLogStorage` +
+  `RaftLogReader` impl) → `FjallRaftLogStore`. Thin wrapper, same
+  trait shape; consumers (cluster_control, log shards, audit,
+  keymanager) updated in-place.
+
+### Trigger
+
+Same theory as rev-2: redb's per-write COW B-tree commit cost
+dominates CPU at the rates the multi-shard Raft transport drives.
+Each Raft append calls `begin_write` + `insert` + `commit` with
+`Durability::Immediate` — one fsync, one freed-pages pass, one
+B-tree mutation per entry. fjall replaces this with one
+`PersistMode::SyncAll` per `WriteBatch::commit` (one fsync, one
+WAL append, one memtable insert) and amortizes the LSM compaction
+off the hot path.
+
+### Schema
+
+Two fjall keyspaces inside one database, matching the
+two-redb-table layout 1:1:
+
+- `raft_log`  — `u64.to_be_bytes()` (log index) → JSON-encoded entry
+- `raft_meta` — UTF-8 key (`vote`, `committed`, `last_purged`, …)
+                 → JSON-encoded value
+
+Big-endian u64 keys give the LSM range iterator the same monotonic
+traversal redb's native `u64` ordering provided.
+
+### Path layout change
+
+fjall is a directory keyspace, not a single file. Paths drop the
+`.redb` extension:
+
+| rev-1 / rev-2                               | rev-3                              |
+|---------------------------------------------|------------------------------------|
+| `<data_dir>/raft/log.redb`                   | `<data_dir>/raft/log/`             |
+| `<data_dir>/raft/cluster_control.redb`       | `<data_dir>/raft/cluster_control/` |
+| `<data_dir>/raft/keymanager.redb`            | `<data_dir>/raft/keymanager/`      |
+| `<data_dir>/raft/audit.redb`                 | `<data_dir>/raft/audit/`           |
+| `<data_dir>/raft/shard-{uuid}.redb`          | `<data_dir>/raft/shard-{uuid}/`    |
+| `<data_dir>/keys/epochs.redb`                | `<data_dir>/keys/epochs/`          |
+
+The runtime's canonical-path test (`runtime::tests::
+store_layout_paths_are_distinct_and_under_data_dir`) was updated
+to assert the new layout. The persistence.feature `Background`
+step uses the new path shape.
+
+### Measurement (single-host, single-thread, release)
+
+Append-throughput microbench
+(`crates/kiseki-raft/tests/raft_log_microbench.rs`) on
+`FjallLogStore::append` with `PersistMode::SyncAll`:
+
+| entry size | throughput     |
+|------------|----------------|
+| 64 B       | 237 932 op/s   |
+| 512 B      | 101 199 op/s   |
+| 4 KiB      |  27 248 op/s   |
+
+For comparison, redb's per-fsync `WriteTransaction::commit` lands
+in the ~5–15 k op/s range for small entries on the same hardware
+(measured during rev-2 spike); the microbench above shows fjall
+clearing 10× the throughput at 512 B (the typical Raft entry
+size for client writes).
+
+### Scope of the rev-3 swap (what stayed on redb)
+
+- **View store** (`kiseki-view`'s `PersistentRedbStorage`):
+  watermark checkpoints, low-frequency.
+- **Small object store** (`kiseki-chunk`'s `SmallObjectStore`):
+  ADR-030 inline-data path, low-frequency.
+- **Tuning store** (`kiseki-server`'s `RedbTuningStore`):
+  ADR-025 cluster tuning params, low-frequency.
+
+These are kept on redb because the cost of migration would not
+return any measurable performance lift; their bottleneck (if any)
+is upstream contention, not commit cost.
+
+### Rollback path (rev-3)
+
+`git revert` of the rev-3 commits. The redb implementation
+(`RedbLogStore`, `RedbRaftLogStore` — together ~625 LOC) is in
+git history. As with rev-2, no on-disk migration tool ships —
+operators wipe + re-replicate from Raft if a rollback is needed.
 
 ## References
 

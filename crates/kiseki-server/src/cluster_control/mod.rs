@@ -23,7 +23,7 @@
 //! Pattern follows `kiseki-keymanager::raft` and
 //! `kiseki-audit::raft`: a single well-known group id, registered
 //! with the multiplexed Raft transport (ADR-041), with `MemLogStore`
-//! / `RedbRaftLogStore` selected by whether `KISEKI_DATA_DIR` is set.
+//! / `FjallRaftLogStore` selected by whether `KISEKI_DATA_DIR` is set.
 
 #[allow(missing_docs)] // internal Raft plumbing
 pub mod commands;

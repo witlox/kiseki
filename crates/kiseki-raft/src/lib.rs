@@ -28,7 +28,7 @@ pub mod node;
     mismatched_lifetime_syntaxes,
     deprecated
 )]
-pub mod redb_log_store;
+pub mod fjall_log_store;
 
 pub use config::KisekiRaftConfig;
 pub use log_store::MemLogStore;
@@ -46,8 +46,8 @@ pub use membership::{
     clippy::needless_pass_by_value,
     dead_code
 )]
-pub mod redb_raft_log_store;
-pub use redb_raft_log_store::RedbRaftLogStore;
+pub mod fjall_raft_log_store;
+pub use fjall_raft_log_store::FjallRaftLogStore;
 #[allow(
     missing_docs,
     clippy::must_use_candidate,
@@ -62,9 +62,9 @@ pub use redb_raft_log_store::RedbRaftLogStore;
 pub mod tcp_transport;
 pub mod transport_metrics;
 
+pub use fjall_log_store::FjallLogStore;
 pub use network::{StubNetwork, StubNetworkFactory};
 pub use node::{KisekiNode, Topology};
-pub use redb_log_store::RedbLogStore;
 pub use tcp_transport::{
     classify_network_error, run_single_raft_group_listener, DispatchOutcome, DispatchStatus,
     NetworkErrorKind, RaftRpcListener, RegistryHandle, TcpNetwork, TcpNetworkFactory,

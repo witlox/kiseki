@@ -62,7 +62,7 @@ use serde::{Deserialize, Serialize};
 // Test type config — minimal openraft type config so the wire-shape
 // tests can build typed AppendEntries / Vote requests. Mirrors the
 // `KeyTypeConfig` in `kiseki-keymanager::raft::types` and the
-// `TestConfig` in `kiseki-raft::redb_raft_log_store::tests`.
+// `TestConfig` in `kiseki-raft::fjall_raft_log_store::tests`.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
 use kiseki_raft::{
-    KisekiNode, KisekiRaftConfig, MemLogStore, RedbRaftLogStore, StubNetworkFactory,
+    FjallRaftLogStore, KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory,
     TcpNetworkFactory,
 };
 use openraft::type_config::async_runtime::WatchReceiver;
@@ -160,13 +160,13 @@ impl OpenRaftLogStore {
         let state_inner = Arc::new(futures::lock::Mutex::new(sm_inner));
         let state_machine = ShardStateMachine::new(Arc::clone(&state_inner));
 
-        // Select log store backend: persistent (redb) or in-memory.
+        // Select log store backend: persistent (fjall) or in-memory.
         let raft = if let Some(dir) = data_dir {
             let raft_dir = dir.join("raft");
             std::fs::create_dir_all(&raft_dir).ok();
-            let redb_path = raft_dir.join(format!("shard-{}.redb", shard_id.0));
+            let log_path = raft_dir.join(format!("shard-{}", shard_id.0));
             let log_store =
-                RedbRaftLogStore::<C>::open(&redb_path).map_err(|_| LogError::Unavailable)?;
+                FjallRaftLogStore::<C>::open(&log_path).map_err(|_| LogError::Unavailable)?;
             if peers.len() > 1 {
                 let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)

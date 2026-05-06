@@ -11,8 +11,8 @@ use kiseki_common::ids::ShardId;
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_raft::{
-    tcp_transport, KisekiNode, KisekiRaftConfig, MemLogStore, RedbRaftLogStore, StubNetworkFactory,
-    TcpNetworkFactory,
+    tcp_transport, FjallRaftLogStore, KisekiNode, KisekiRaftConfig, MemLogStore,
+    StubNetworkFactory, TcpNetworkFactory,
 };
 use openraft::Raft;
 use uuid::Uuid;
@@ -71,12 +71,12 @@ impl OpenRaftKeyStore {
             m
         };
 
-        // Select log store backend: persistent (redb) or in-memory.
+        // Select log store backend: persistent (fjall) or in-memory.
         let (raft, already_initialized) = if let Some(dir) = data_dir {
             let raft_dir = dir.join("raft");
             std::fs::create_dir_all(&raft_dir).ok();
-            let redb_path = raft_dir.join("keymanager.redb");
-            let log_store = RedbRaftLogStore::<C>::open(&redb_path)
+            let log_path = raft_dir.join("keymanager");
+            let log_store = FjallRaftLogStore::<C>::open(&log_path)
                 .map_err(|_| KeyManagerError::Unavailable)?;
             let has_state = log_store.has_state();
             let raft = if peers.len() > 1 {

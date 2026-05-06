@@ -1450,22 +1450,22 @@ async fn then_nfs4_badsession_status(w: &mut KisekiWorld) {
 
 // --- Persistence ---
 
-#[given("redb database at $DATA_DIR/raft/log.redb")]
-async fn given_redb(w: &mut KisekiWorld) {
+#[given("persistent log store at $DATA_DIR/raft/log/")]
+async fn given_persistent_log_store(w: &mut KisekiWorld) {
     // Force the harness to open its persistent shard store so the
-    // on-disk redb file is materialised at the production-shaped
-    // path (`<data_dir>/raft/log.redb`, mirroring `runtime.rs`'s
-    // `dir.join("raft").join("log.redb")`). Then assert the file
-    // exists — proves the layout the spec documents matches what
-    // both the test harness and `kiseki-server` actually produce.
+    // on-disk keyspace is materialised at the production-shaped
+    // path (`<data_dir>/raft/log/`, mirroring `runtime.rs`'s
+    // `dir.join("raft").join("log")`). Then assert the path exists
+    // — proves the layout the spec documents matches what both the
+    // test harness and `kiseki-server` actually produce.
     let _ = w.persistent_store().await;
     let path = w
         .persistent_store_path()
-        .expect("persistent_store() materialises the redb path");
+        .expect("persistent_store() materialises the on-disk path");
     assert!(
         path.exists(),
-        "redb log file not created at {} — persistent store harness \
-         is out of sync with the spec's documented layout",
+        "persistent log keyspace not created at {} — persistent store \
+         harness is out of sync with the spec's documented layout",
         path.display(),
     );
 }
@@ -1754,10 +1754,11 @@ async fn when_sre_pool_status(w: &mut KisekiWorld, _pool: String) {
 // Persistence and crash recovery (persistence.feature)
 //
 // Every Given/When/Then in this section drives a real
-// `kiseki_log::PersistentShardStore` backed by a tempdir-scoped redb.
-// `when_server_restart` actually drops + reopens the store — the
-// "delta survives restart" assertion is now falsifiable: if redb
-// commit were skipped the reload would not see the delta.
+// `kiseki_log::PersistentShardStore` backed by a tempdir-scoped fjall
+// keyspace (ADR-022 rev-2). `when_server_restart` actually drops +
+// reopens the store — the "delta survives restart" assertion is now
+// falsifiable: if the WAL fsync were skipped the reload would not
+// see the delta.
 // =======================================================================
 
 /// Stable shard id for a persistence-feature shard name.
@@ -1814,8 +1815,8 @@ async fn given_delta_written(w: &mut KisekiWorld) {
 #[when("the server is restarted")]
 async fn when_server_restart(w: &mut KisekiWorld) {
     // Real restart: drop the in-memory PersistentShardStore handle and
-    // reopen against the same redb path. Anything not committed to redb
-    // is lost; anything committed survives.
+    // reopen against the same on-disk path. Anything not yet fsynced
+    // is lost; anything committed durably survives.
     w.restart_persistent_store().await;
 }
 

@@ -1,16 +1,17 @@
-//! Persistent key store — wraps `RaftKeyStore` + `RedbLogStore`.
+//! Persistent key store — wraps `RaftKeyStore` + `FjallLogStore`.
 //!
 //! Every key command is written to both the in-memory state machine
-//! (fast reads) and redb (durability). On startup, reloads from redb
-//! and replays the command log to rebuild state. Per ADR-007/ADR-022.
+//! (fast reads) and the fjall keyspace (durability). On startup,
+//! reloads from the keyspace and replays the command log to rebuild
+//! state. Per ADR-007/ADR-022 rev-2.
 //!
-//! Phase 14e: every command persisted to redb is wrapped in an
-//! AES-256-GCM envelope keyed off this node's identity (see
-//! `node_identity`). Reads decrypt with the same key — a wrong-key
-//! open fails AEAD authentication, surfacing as
-//! [`KeyManagerError::Unavailable`]. The in-memory state machine and
-//! the inter-node Raft transport remain plaintext (mTLS protects the
-//! wire); only the on-disk log is encrypted.
+//! Phase 14e: every persisted command is wrapped in an AES-256-GCM
+//! envelope keyed off this node's identity (see `node_identity`).
+//! Reads decrypt with the same key — a wrong-key open fails AEAD
+//! authentication, surfacing as [`KeyManagerError::Unavailable`].
+//! The in-memory state machine and the inter-node Raft transport
+//! remain plaintext (mTLS protects the wire); only the on-disk log
+//! is encrypted.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use kiseki_common::tenancy::KeyEpoch;
 use kiseki_crypto::aead::{Aead, GCM_NONCE_LEN};
 use kiseki_crypto::keys::SystemMasterKey;
-use kiseki_raft::redb_log_store::RedbLogStore;
+use kiseki_raft::FjallLogStore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -51,10 +52,10 @@ fn aad_for(index: u64) -> Vec<u8> {
     out
 }
 
-/// Persistent key store — in-memory state machine + redb for durability.
+/// Persistent key store — in-memory state machine + fjall for durability.
 pub struct PersistentKeyStore {
     inner: RaftKeyStore,
-    redb: RedbLogStore,
+    store: FjallLogStore,
     at_rest_key: Zeroizing<[u8; 32]>,
     aead: Aead,
 }
@@ -67,7 +68,7 @@ impl PersistentKeyStore {
     /// be a per-node value such as the node ID encoded as bytes —
     /// guarantees two nodes never share the derived key.
     ///
-    /// If the redb database contains existing commands, they are
+    /// If the fjall keyspace contains existing commands, they are
     /// decrypted and replayed into the state machine on startup. If no
     /// commands exist, a fresh epoch 1 is generated (bootstrap).
     pub fn open(
@@ -77,11 +78,11 @@ impl PersistentKeyStore {
     ) -> Result<Self, KeyManagerError> {
         let at_rest_key =
             derive_at_rest_key(identity, salt).map_err(|_| KeyManagerError::Unavailable)?;
-        let redb = RedbLogStore::open(path).map_err(|_| KeyManagerError::Unavailable)?;
+        let store = FjallLogStore::open(path).map_err(|_| KeyManagerError::Unavailable)?;
         let aead = Aead::new();
 
         // Decrypt every persisted entry.
-        let raw: Vec<(u64, EncryptedEntry)> = redb.range(1, u64::MAX).unwrap_or_default();
+        let raw: Vec<(u64, EncryptedEntry)> = store.range(1, u64::MAX).unwrap_or_default();
         let mut commands: Vec<(u64, KeyCommand)> = Vec::with_capacity(raw.len());
         for (idx, env) in raw {
             let bytes = aead
@@ -95,24 +96,24 @@ impl PersistentKeyStore {
         if commands.is_empty() {
             // Fresh start — bootstrap with new epoch 1.
             let inner = RaftKeyStore::new()?;
-            let store = Self {
+            let s = Self {
                 inner,
-                redb,
+                store,
                 at_rest_key,
                 aead,
             };
             // Persist the bootstrap commands as encrypted envelopes.
-            let log = store.inner.command_log();
+            let log = s.inner.command_log();
             for (idx, cmd) in &log {
-                store.persist_encrypted(*idx, cmd)?;
+                s.persist_encrypted(*idx, cmd)?;
             }
-            Ok(store)
+            Ok(s)
         } else {
             // Reload from persisted commands.
             let inner = RaftKeyStore::from_commands(commands.into_iter())?;
             Ok(Self {
                 inner,
-                redb,
+                store,
                 at_rest_key,
                 aead,
             })
@@ -125,13 +126,13 @@ impl PersistentKeyStore {
             .aead
             .seal(&self.at_rest_key, &bytes, &aad_for(index))
             .map_err(|_| KeyManagerError::Unavailable)?;
-        self.redb
+        self.store
             .append(index, &EncryptedEntry { nonce, ciphertext })
             .map_err(|_| KeyManagerError::Unavailable)?;
         Ok(())
     }
 
-    /// Persist a command to redb and apply it to the state machine.
+    /// Persist a command and apply it to the state machine.
     #[allow(clippy::needless_pass_by_value)]
     fn persist_and_apply(&self, cmd: KeyCommand) {
         let idx = self.inner.apply_command(cmd.clone());
@@ -196,7 +197,7 @@ impl core::fmt::Debug for PersistentKeyStore {
         // (no useful Debug output).
         f.debug_struct("PersistentKeyStore")
             .field("inner", &self.inner)
-            .field("redb", &"RedbLogStore")
+            .field("store", &"FjallLogStore")
             .finish_non_exhaustive()
     }
 }
@@ -218,7 +219,7 @@ mod tests {
     async fn bootstrap_and_read() {
         let dir = tempfile::tempdir().unwrap();
         let store =
-            PersistentKeyStore::open(&dir.path().join("keys.redb"), &identity(), SALT).unwrap();
+            PersistentKeyStore::open(&dir.path().join("keys"), &identity(), SALT).unwrap();
         assert_eq!(store.current_epoch().await.unwrap(), KeyEpoch(1));
         assert!(store.fetch_master_key(KeyEpoch(1)).await.is_ok());
     }
@@ -226,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn epochs_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keys.redb");
+        let path = dir.path().join("keys");
 
         let epoch1_material;
         // Write: bootstrap + rotate to epoch 2.
@@ -265,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_after_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keys.redb");
+        let path = dir.path().join("keys");
 
         {
             let store = PersistentKeyStore::open(&path, &identity(), SALT).unwrap();
@@ -280,14 +281,14 @@ mod tests {
         }
     }
 
-    /// Phase 14e: opening the redb with a *different* node identity
+    /// Phase 14e: opening the on-disk store with a *different* node identity
     /// must fail AEAD authentication — proves the at-rest envelope
     /// actually depends on the node-derived key, not just on our
     /// having any key at all.
     #[tokio::test]
     async fn wrong_node_identity_cannot_decrypt() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keys.redb");
+        let path = dir.path().join("keys");
 
         // Bootstrap with identity-A.
         {
@@ -306,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_salt_cannot_decrypt() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keys.redb");
+        let path = dir.path().join("keys");
 
         {
             let _ = PersistentKeyStore::open(&path, &identity(), b"node-1").unwrap();
