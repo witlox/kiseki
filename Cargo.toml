@@ -132,7 +132,7 @@ openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
 # postcard provides deterministic encoding; lru is the hot-tail cache.
 redb = "4"
 postcard = { version = "1", features = ["alloc", "use-std"] }
-lru = "0.16"
+lru = "0.18"
 # Non-poisoning RwLock for the composition write-behind overlay
 # (ADR-040 rev 3). std::sync::RwLock would force unwrap on every
 # acquisition site, which the workspace clippy config denies.
