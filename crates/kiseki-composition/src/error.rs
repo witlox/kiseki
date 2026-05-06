@@ -39,6 +39,13 @@ pub enum CompositionError {
     /// metric/log fan-out; opaque to callers above the gateway.
     #[error("composition storage: {0}")]
     Storage(String),
+
+    /// S3-style conditional check (`If-None-Match` / `If-Match`)
+    /// rejected the write. Surfaces from
+    /// [`crate::composition::CompositionStore::create_with_name_conditional`]
+    /// — the gateway maps this to HTTP 412 Precondition Failed.
+    #[error("composition precondition failed: {0}")]
+    PreconditionFailed(String),
 }
 
 impl From<CompositionError> for KisekiError {

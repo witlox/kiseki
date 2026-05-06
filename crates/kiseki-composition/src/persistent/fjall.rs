@@ -584,38 +584,42 @@ impl CompositionStorage for FjallStorage {
         comp: Composition,
         ns: NamespaceId,
         name: String,
+        prior_id: Option<CompositionId>,
     ) -> Result<(), PersistentStoreError> {
-        // One WriteBatch covers the composition row + the forward
+        // One `WriteBatch` covers the composition row + the forward
         // name binding + the reverse name binding atomically. Cuts
         // the gateway PUT path's fjall journal-mutex acquisitions
-        // from 4 (two `commit` + two `persist`) to 1, which is the
-        // hot bottleneck on the `kiseki-profile in-process-persistent`
-        // floor (single-host PUT plateaued at ~36 k op/s past c=4).
+        // from 4 (two `commit` + two `persist`) to 1 — the rev-2
+        // hot bottleneck on the in-process-persistent floor.
         //
         // **Skipped read** vs a `put` + `name_insert` pair: the
-        // reverse-name pre-flight on `comp.id`. `put_with_name` is
-        // contracted for freshly-minted comp_ids, so the reverse
-        // entry is guaranteed `None` — no cascade needed.
+        // reverse-name pre-flight on `comp.id`. Caller guarantees
+        // freshly-minted comp_id, so the reverse entry is `None`.
         //
-        // **Kept read**: the forward `(ns, name)` cascade lookup.
-        // The caller may not have pre-validated the binding (S3
-        // PUT-overwrite without `If-None-Match`), so a stale
-        // reverse for an old comp_id must still be cleared to
-        // preserve the names_rev ↔ names invariant.
+        // **Forward cascade** uses `prior_id` when supplied (the
+        // gateway path holds the storage lock across its own
+        // lookup + this call so the binding state is consistent),
+        // falling back to a fresh fjall.get only when the caller
+        // didn't have the result handy.
         let id = comp.id;
         let id_bytes = id.0.as_bytes();
         let new_key = name_key(ns, &name);
         let comp_bytes = encode_composition(&comp)?;
 
-        let prev_id = self
-            .names
-            .get(&new_key)
-            .map_err(map_fjall_err)?
-            .map(|s| s.to_vec());
+        // Resolve the forward cascade: prefer caller-supplied
+        // prior_id, fall back to a fjall.get.
+        let prev_id_bytes: Option<Vec<u8>> = match prior_id {
+            Some(id) => Some(id.0.as_bytes().to_vec()),
+            None => self
+                .names
+                .get(&new_key)
+                .map_err(map_fjall_err)?
+                .map(|s| s.to_vec()),
+        };
 
         let mut batch = self.db.batch();
         batch.insert(&self.comps, id_bytes.to_vec(), comp_bytes);
-        if let Some(prev) = prev_id {
+        if let Some(prev) = prev_id_bytes {
             if prev.as_slice() != id_bytes.as_slice() {
                 batch.remove(&self.names_rev, prev);
             }

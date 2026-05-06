@@ -6,7 +6,7 @@
 //! not pass/fail.
 //!
 //! Touches the same code path the openraft `RaftLogStorage::append`
-//! impl drives: serde_json encode + `FjallLogStore::append` (one
+//! impl drives: postcard encode + `FjallLogStore::append` (one
 //! `WriteBatch::commit` with `PersistMode::SyncAll`).
 
 use std::time::Instant;

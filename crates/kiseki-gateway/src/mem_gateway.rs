@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use kiseki_chunk::AsyncChunkOps;
+use kiseki_common::ids::CompositionId;
 use kiseki_common::tenancy::DedupPolicy;
-use kiseki_composition::composition::{CompositionOps, CompositionStore};
+use kiseki_composition::composition::{CompositionOps, CompositionStore, ConditionalCheck};
 
 /// Per-chunk landing record used by `MemGateway::write` to track each
 /// piece of a multi-chunk composition for the post-write Raft delta.
@@ -240,6 +241,38 @@ fn read_decrypt_cache_ttl() -> std::time::Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CACHE_TTL_MS);
     std::time::Duration::from_millis(ms)
+}
+
+/// Adapter that translates the gateway's protocol-shaped
+/// [`crate::ops::WriteConditional`] into the composition store's
+/// transport-agnostic [`ConditionalCheck`] trait. Lives only for the
+/// duration of a single `create_with_name_conditional` call — borrows
+/// the conditional + name from the request, no allocation.
+struct ConditionalCheckAdapter<'a> {
+    cond: &'a crate::ops::WriteConditional,
+    name: &'a str,
+}
+
+impl<'a> ConditionalCheck for ConditionalCheckAdapter<'a> {
+    fn check(&self, existing: Option<CompositionId>) -> Result<(), String> {
+        match (self.cond, existing) {
+            (crate::ops::WriteConditional::IfNoneMatch, Some(_)) => Err(format!(
+                "object \"{}\" already exists; If-None-Match: * requires it not to",
+                self.name
+            )),
+            (crate::ops::WriteConditional::IfMatch(_), None) => Err(format!(
+                "object \"{}\" does not exist; If-Match requires existing match",
+                self.name
+            )),
+            (crate::ops::WriteConditional::IfMatch(want), Some(got)) if *want != got => Err(
+                format!(
+                    "object \"{}\" etag mismatch (have {}, want {})",
+                    self.name, got.0, want.0
+                ),
+            ),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Per-entry plaintext with bookkeeping for TTL + zeroize-on-drop.
@@ -1525,47 +1558,39 @@ impl GatewayOps for InMemoryGateway {
         let composition_record_started = std::time::Instant::now();
         let (comp_id, log, emit_params) = {
             let comps = self.compositions.as_ref();
-            // ----- Conditional check (atomic with create+bind below) -----
-            if let (Some(name), Some(cond)) = (req.name.as_deref(), req.conditional.as_ref()) {
-                let existing = comps.lookup_by_name(req.namespace_id, name).map_err(|e| {
-                    tracing::warn!(error = %e, "gateway write: lookup_by_name failed");
-                    GatewayError::Upstream(e.to_string())
-                })?;
-                match (cond, existing) {
-                    (crate::ops::WriteConditional::IfNoneMatch, Some(_)) => {
-                        return Err(GatewayError::PreconditionFailed(format!(
-                            "object \"{name}\" already exists; If-None-Match: * requires it not to"
-                        )));
-                    }
-                    (crate::ops::WriteConditional::IfMatch(_), None) => {
-                        return Err(GatewayError::PreconditionFailed(format!(
-                            "object \"{name}\" does not exist; If-Match requires existing match"
-                        )));
-                    }
-                    (crate::ops::WriteConditional::IfMatch(want), Some(got)) if *want != got => {
-                        return Err(GatewayError::PreconditionFailed(format!(
-                            "object \"{name}\" etag mismatch (have {}, want {})",
-                            got.0, want.0,
-                        )));
-                    }
-                    _ => {}
-                }
-            }
             // ----- Create (+ bind name atomically when a key is given) -----
             // The Raft delta below carries the name to followers via
             // the v2 create payload so their hydrators stay consistent.
-            // When a name is present, fold create + bind_name into a
+            //
+            // When a name is present we fold create + bind_name into a
             // single storage-mutex + single backend-batch call so the
             // gateway PUT path takes one journal-mutex acquisition
-            // instead of four (perf-spike 2026-05-06: this is the
+            // instead of four (perf-spike 2026-05-06: this was the
             // dominant ceiling on the in-process-persistent floor).
+            //
+            // When a conditional check is also present
+            // (`If-None-Match`, `If-Match`),
+            // `create_with_name_conditional` holds the storage lock
+            // across the lookup + check + put — race-free, and the
+            // single fjall.get from the lookup feeds the cascade
+            // decision directly so the backend skips its own pre-
+            // flight read.
             let comp_id = match req.name.as_deref() {
-                Some(name) => comps.create_with_name(
-                    req.namespace_id,
-                    name.to_owned(),
-                    chunk_ids.clone(),
-                    bytes_written,
-                ),
+                Some(name) => {
+                    let check_owner = req
+                        .conditional
+                        .as_ref()
+                        .map(|cond| ConditionalCheckAdapter { cond, name });
+                    let check_ref =
+                        check_owner.as_ref().map(|c| c as &dyn ConditionalCheck);
+                    comps.create_with_name(
+                        req.namespace_id,
+                        name.to_owned(),
+                        check_ref,
+                        chunk_ids.clone(),
+                        bytes_written,
+                    )
+                }
                 None => comps.create(req.namespace_id, chunk_ids.clone(), bytes_written),
             }
             .map_err(|e| {
@@ -1573,11 +1598,17 @@ impl GatewayOps for InMemoryGateway {
                 // Map the typed NamespaceNotFound through to the
                 // gateway's typed variant so the HTTP layer can
                 // return 404 NoSuchBucket instead of an opaque 500.
+                // PreconditionFailed surfaces directly to S3 as 412.
                 if matches!(
                     e,
                     kiseki_composition::error::CompositionError::NamespaceNotFound(_)
                 ) {
                     GatewayError::NamespaceNotFound(e.to_string())
+                } else if let kiseki_composition::error::CompositionError::PreconditionFailed(
+                    reason,
+                ) = e
+                {
+                    GatewayError::PreconditionFailed(reason)
                 } else {
                     GatewayError::Upstream(e.to_string())
                 }

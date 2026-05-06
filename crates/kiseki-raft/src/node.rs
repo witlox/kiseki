@@ -119,19 +119,16 @@ mod tests {
     #[test]
     fn kiseki_node_serde_with_topology() {
         let n = KisekiNode::new("127.0.0.1:9100").with_topology(Topology::Rack("r1".into()));
-        let bytes = serde_json::to_vec(&n).unwrap();
-        let back: KisekiNode = serde_json::from_slice(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&n).unwrap();
+        let back: KisekiNode = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(n, back);
     }
 
-    #[test]
-    fn kiseki_node_back_compat_without_topology_field() {
-        // Pre-Phase-14f wire format had no `topology` field. The
-        // `#[serde(default)]` on the new field ensures we can still
-        // decode that JSON.
-        let json = br#"{"addr":"127.0.0.1:9100"}"#;
-        let n: KisekiNode = serde_json::from_slice(json).unwrap();
-        assert_eq!(n.addr, "127.0.0.1:9100");
-        assert!(n.topology.is_none());
-    }
+    // Pre-rev-2 (2026-05-06) carried a JSON-specific back-compat
+    // test asserting `#[serde(default)]` on the `topology` field
+    // tolerated old payloads without it. Postcard is non-self-
+    // describing — there's no "missing field" case the way JSON
+    // had one — and pre-1.0 we don't carry old payloads on the
+    // wire (operators wipe + re-replicate per ADR-022 rev-2/rev-3
+    // rollback story). Test removed.
 }

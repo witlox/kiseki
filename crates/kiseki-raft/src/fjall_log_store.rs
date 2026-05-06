@@ -15,20 +15,29 @@
 //!
 //! Two keyspaces inside one fjall database:
 //!
-//! - `raft_log`  — `u64.to_be_bytes()` (log index) → JSON-encoded entry
+//! - `raft_log`  — `u64.to_be_bytes()` (log index) → `[1B version][postcard bytes]`
 //! - `raft_meta` — UTF-8 key (`vote`, `committed`, `last_purged`, …)
-//!                 → JSON-encoded value
+//!                 → `[1B version][postcard bytes]`
 //!
 //! Big-endian u64 keys give the LSM range iterator the same monotonic
 //! traversal order redb's native `u64` ordering used to provide.
 //!
 //! ## Encoding
 //!
-//! `serde_json` for both entry payloads and meta values, matching the
-//! redb impl byte-for-byte at the value layer. The Raft log is
-//! cluster-internal; no operator inspects it directly, so format
-//! efficiency is not load-bearing — keep parity with the redb path
-//! so a `git revert` is mechanical.
+//! `postcard` for both entry payloads and meta values. The native PUT
+//! flame (rev-4) showed `serde_json::ser::to_vec` at 11.85% of the
+//! server's on-CPU samples, all coming through this path. Postcard is
+//! 5–10× faster on serde-derived types and same backend the
+//! composition + chunk meta encodings use — single source of
+//! truth across the workspace.
+//!
+//! Records carry a 1-byte schema-version prefix so a future
+//! incompatible change is fail-closed (binary too old). Same shape
+//! as `kiseki-composition::persistent::encoding` and
+//! `kiseki-chunk::persistent::encoding`.
+//!
+//! Pre-1.0 wire format change — no on-disk migration tool ships;
+//! operators wipe + re-replicate from peers.
 
 use std::io;
 use std::path::Path;
@@ -38,6 +47,35 @@ use serde::{de::DeserializeOwned, Serialize};
 
 const KS_LOG: &str = "raft_log";
 const KS_META: &str = "raft_meta";
+
+/// Wire-format schema version for both `raft_log` and `raft_meta`
+/// records. Bumped on any incompatible change. Records carrying
+/// `version > supported` fail open with [`io::Error`] (kind
+/// `InvalidData`) so an operator running an older binary against a
+/// newer data dir gets a clear surface instead of silent corruption.
+const RECORD_SCHEMA_VERSION: u8 = 1;
+
+/// `[1 byte: version][postcard bytes]` — same shape as the
+/// composition + chunk meta encodings.
+fn encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(64);
+    out.push(RECORD_SCHEMA_VERSION);
+    let payload = postcard::to_stdvec(value).map_err(io_err)?;
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
+    let Some((&version, payload)) = bytes.split_first() else {
+        return Err(invalid_data("empty raft record"));
+    };
+    if version > RECORD_SCHEMA_VERSION {
+        return Err(invalid_data(format!(
+            "raft record schema too new: found={version} supported={RECORD_SCHEMA_VERSION}"
+        )));
+    }
+    postcard::from_bytes(payload).map_err(invalid_data)
+}
 
 /// Fjall-backed Raft log store.
 ///
@@ -85,7 +123,7 @@ impl FjallLogStore {
     /// not per-entry, so the per-entry fsync cost only hits when the
     /// caller is appending one-by-one (test paths, `save_vote`).
     pub fn append<T: Serialize>(&self, index: u64, entry: &T) -> io::Result<()> {
-        let bytes = serde_json::to_vec(entry).map_err(io_err)?;
+        let bytes = encode(entry)?;
         let mut batch = self.commit_batch();
         batch.insert(&self.log_ks, index.to_be_bytes().to_vec(), bytes);
         batch.commit().map_err(io_err)
@@ -95,7 +133,7 @@ impl FjallLogStore {
     pub fn get<T: DeserializeOwned>(&self, index: u64) -> io::Result<Option<T>> {
         match self.log_ks.get(index.to_be_bytes()).map_err(io_err)? {
             Some(slice) => {
-                let val: T = serde_json::from_slice(slice.as_ref()).map_err(invalid_data)?;
+                let val: T = decode(slice.as_ref())?;
                 Ok(Some(val))
             }
             None => Ok(None),
@@ -116,7 +154,7 @@ impl FjallLogStore {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(kbytes);
             let key = u64::from_be_bytes(buf);
-            let val: T = serde_json::from_slice(v.as_ref()).map_err(invalid_data)?;
+            let val: T = decode(v.as_ref())?;
             out.push((key, val));
         }
         Ok(out)
@@ -172,7 +210,7 @@ impl FjallLogStore {
     /// — `save_vote` correctness depends on durability before the
     /// callback returns (Raft §5.4).
     pub fn set_meta<T: Serialize>(&self, key: &str, value: &T) -> io::Result<()> {
-        let bytes = serde_json::to_vec(value).map_err(io_err)?;
+        let bytes = encode(value)?;
         let mut batch = self.commit_batch();
         batch.insert(&self.meta_ks, key.as_bytes().to_vec(), bytes);
         batch.commit().map_err(io_err)
@@ -182,11 +220,22 @@ impl FjallLogStore {
     pub fn get_meta<T: DeserializeOwned>(&self, key: &str) -> io::Result<Option<T>> {
         match self.meta_ks.get(key.as_bytes()).map_err(io_err)? {
             Some(slice) => {
-                let val: T = serde_json::from_slice(slice.as_ref()).map_err(invalid_data)?;
+                let val: T = decode(slice.as_ref())?;
                 Ok(Some(val))
             }
             None => Ok(None),
         }
+    }
+
+    /// Presence check on a metadata key without decoding the value.
+    /// Used by [`crate::FjallRaftLogStore::has_state`] to probe for a
+    /// stored `vote` without needing to know the openraft `VoteOf<C>`
+    /// concrete type. Pre-rev-4 the same probe used
+    /// `get_meta::<serde_json::Value>` because JSON would parse any
+    /// shape; postcard refuses to decode without a typed target,
+    /// hence this presence helper.
+    pub fn meta_exists(&self, key: &str) -> io::Result<bool> {
+        Ok(self.meta_ks.get(key.as_bytes()).map_err(io_err)?.is_some())
     }
 
     /// Highest log index, or `None` if the log is empty.

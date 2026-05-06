@@ -28,7 +28,7 @@ prometheus = { workspace = true }
 fjall = "3.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = { workspace = true }
-serde_json = "1"
+postcard = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }

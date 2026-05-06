@@ -3,11 +3,17 @@
 //! Per ADR-026 (Strategy A) + ADR-041 amendment: one TCP listener per
 //! node, dispatching inbound RPCs to the right `Raft` instance via a
 //! shard registry. Each Raft RPC (`AppendEntries`, `Vote`, Snapshot)
-//! is `serde_json`-encoded, prefixed with a 1-byte schema version + a
-//! tuple-encoded `(shard_id, tag, payload)`, then length-framed.
+//! is `postcard`-encoded (rev-2, 2026-05-06 — was serde_json), prefixed
+//! with a 1-byte schema version + an outer tuple wrapper
+//! `(shard_id, tag, raw_payload_bytes)`, then length-framed. The
+//! inner `raw_payload_bytes` is itself postcard-encoded by the caller
+//! (typed at the call site); the dispatcher decodes the outer wrapper,
+//! routes by `tag`, then postcard-decodes the inner bytes against the
+//! typed handler's request shape.
+//!
 //! Responses carry a 1-byte status (`Ok`/`UnknownShard`/`ParseError`/
 //! `DispatcherPanic`) so callers can distinguish a retired shard
-//! from a transient transport failure.
+//! from a transient transport failure. `Ok` body is postcard-encoded.
 //!
 //! See `specs/architecture/adr/041-raft-transport-shard-multiplexing.md`
 //! for the full wire format + lifecycle.
@@ -41,14 +47,24 @@ use crate::node::KisekiNode;
 pub const MAX_RAFT_RPC_SIZE: usize = 128 * 1024 * 1024;
 
 /// Wire-format version for the multiplexed transport. Schema version
-/// is the first byte of every framed payload, per ADR-004.
-pub const RAFT_TRANSPORT_VERSION_V1: u8 = 1;
+/// is the first byte of every framed payload, per ADR-004. Bumped to
+/// 2 on 2026-05-06 — postcard replaced serde_json for the outer
+/// envelope and inner payloads. Pre-1.0 wire-format change; peers
+/// running v1 see "unknown version" and reject (`ParseError`)
+/// instead of mis-decoding. Operators wipe + re-replicate.
+pub const RAFT_TRANSPORT_VERSION_V2: u8 = 2;
+
+/// Backwards-compat alias for downstream callers that referenced the
+/// old name. Same value; new code should use `..._V2`.
+pub const RAFT_TRANSPORT_VERSION_V1: u8 = RAFT_TRANSPORT_VERSION_V2;
 
 /// Reserved version-byte values that match the start of a JSON value.
-/// Pre-ADR-041 frames (no version byte) start with one of these
+/// Pre-ADR-041 frames (no version byte) started with one of these
 /// because the payload was raw JSON. Permanently unassignable for
 /// future version codes (ADR-041 §"Reserved version-byte values" /
-/// gate-1 F-L1).
+/// gate-1 F-L1). Postcard frames don't collide with any of these
+/// because the version byte sits in front and we never assign a
+/// value in this set.
 pub const RESERVED_VERSION_BYTES: [u8; 3] = [0x5b, 0x7b, 0x22];
 
 /// Headroom reserved on top of `MAX_RAFT_RPC_SIZE` for the version
@@ -216,36 +232,46 @@ struct SnapshotEnvelope<C: RaftTypeConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// Wire codec — request: [u32 length][u8 version][JSON(shard_id, tag, payload)]
-//              response: [u32 length][u8 status][response body bytes]
+// Wire codec — request: [u32 length][u8 version][postcard((shard_id, tag, payload_bytes))]
+//              response: [u32 length][u8 status][postcard response body when Ok]
 // ---------------------------------------------------------------------------
 
-/// Build a request frame body: `[version_byte][JSON(shard_id, tag, payload)]`.
+/// Build a request frame body. Two-stage encoding:
+///
+/// 1. Postcard-encode the typed `payload` to raw bytes.
+/// 2. Postcard-encode the outer tuple
+///    `(shard_id_bytes [u8; 16], tag, payload_bytes Vec<u8>)`.
+///
+/// The two-stage shape lets the dispatcher decode the outer envelope
+/// without knowing the typed payload — it routes by `tag`, then
+/// hands `payload_bytes` to the matching typed handler which does
+/// its own postcard-decode.
 fn encode_request_body<P: Serialize>(
     shard_id: ShardId,
     tag: &str,
     payload: &P,
 ) -> io::Result<Vec<u8>> {
-    let json =
-        serde_json::to_vec(&(shard_id.0.to_string(), tag, payload)).map_err(io::Error::other)?;
-    let mut body = Vec::with_capacity(1 + json.len());
-    body.push(RAFT_TRANSPORT_VERSION_V1);
-    body.extend_from_slice(&json);
+    let payload_bytes = postcard::to_stdvec(payload).map_err(io::Error::other)?;
+    let outer = (*shard_id.0.as_bytes(), tag.to_owned(), payload_bytes);
+    let outer_bytes = postcard::to_stdvec(&outer).map_err(io::Error::other)?;
+    let mut body = Vec::with_capacity(1 + outer_bytes.len());
+    body.push(RAFT_TRANSPORT_VERSION_V2);
+    body.extend_from_slice(&outer_bytes);
     Ok(body)
 }
 
 /// Decode a request frame body. Returns `None` if the version byte is
 /// reserved or unknown — caller responds with `ParseError`.
-fn decode_request_body(body: &[u8]) -> Option<(ShardId, String, serde_json::Value)> {
+fn decode_request_body(body: &[u8]) -> Option<(ShardId, String, Vec<u8>)> {
     let version = *body.first()?;
-    if version != RAFT_TRANSPORT_VERSION_V1 || RESERVED_VERSION_BYTES.contains(&version) {
+    if version != RAFT_TRANSPORT_VERSION_V2 || RESERVED_VERSION_BYTES.contains(&version) {
         return None;
     }
-    let json_bytes = &body[1..];
-    let (shard_str, tag, payload): (String, String, serde_json::Value) =
-        serde_json::from_slice(json_bytes).ok()?;
-    let shard_id = ShardId(uuid::Uuid::parse_str(&shard_str).ok()?);
-    Some((shard_id, tag, payload))
+    let outer_bytes = &body[1..];
+    let (id_bytes, tag, payload_bytes): ([u8; 16], String, Vec<u8>) =
+        postcard::from_bytes(outer_bytes).ok()?;
+    let shard_id = ShardId(uuid::Uuid::from_bytes(id_bytes));
+    Some((shard_id, tag, payload_bytes))
 }
 
 /// Build a response frame body: `[status_byte][body bytes]`. Empty
@@ -307,7 +333,7 @@ where
         )
     })?;
     match status {
-        DispatchStatus::Ok => serde_json::from_slice(&resp_buf[1..]).map_err(io::Error::other),
+        DispatchStatus::Ok => postcard::from_bytes(&resp_buf[1..]).map_err(io::Error::other),
         DispatchStatus::UnknownShard => Err(network_error(
             NetworkErrorKind::ShardRetired,
             shard_id.0.to_string(),
@@ -503,40 +529,40 @@ impl RegistryHandle {
                     match tag.as_str() {
                         "append_entries" => {
                             let req: openraft::raft::AppendEntriesRequest<C> =
-                                match serde_json::from_slice(&payload) {
+                                match postcard::from_bytes(&payload) {
                                     Ok(r) => r,
                                     Err(_) => return DispatchOutcome::ParseError,
                                 };
                             let result = std::panic::AssertUnwindSafe(raft.append_entries(req));
                             match futures::FutureExt::catch_unwind(result).await {
                                 Ok(Ok(resp)) => DispatchOutcome::Ok(
-                                    serde_json::to_vec(&resp).unwrap_or_default(),
+                                    postcard::to_stdvec(&resp).unwrap_or_default(),
                                 ),
                                 Ok(Err(e)) => DispatchOutcome::Ok(
-                                    serde_json::to_vec(&Err::<(), _>(e)).unwrap_or_default(),
+                                    postcard::to_stdvec(&Err::<(), _>(e)).unwrap_or_default(),
                                 ),
                                 Err(_) => DispatchOutcome::Panicked,
                             }
                         }
                         "vote" => {
                             let req: openraft::raft::VoteRequest<C> =
-                                match serde_json::from_slice(&payload) {
+                                match postcard::from_bytes(&payload) {
                                     Ok(r) => r,
                                     Err(_) => return DispatchOutcome::ParseError,
                                 };
                             let result = std::panic::AssertUnwindSafe(raft.vote(req));
                             match futures::FutureExt::catch_unwind(result).await {
                                 Ok(Ok(resp)) => DispatchOutcome::Ok(
-                                    serde_json::to_vec(&resp).unwrap_or_default(),
+                                    postcard::to_stdvec(&resp).unwrap_or_default(),
                                 ),
                                 Ok(Err(e)) => DispatchOutcome::Ok(
-                                    serde_json::to_vec(&Err::<(), _>(e)).unwrap_or_default(),
+                                    postcard::to_stdvec(&Err::<(), _>(e)).unwrap_or_default(),
                                 ),
                                 Err(_) => DispatchOutcome::Panicked,
                             }
                         }
                         "full_snapshot" => {
-                            let env: SnapshotEnvelope<C> = match serde_json::from_slice(&payload) {
+                            let env: SnapshotEnvelope<C> = match postcard::from_bytes(&payload) {
                                 Ok(r) => r,
                                 Err(_) => return DispatchOutcome::ParseError,
                             };
@@ -549,10 +575,10 @@ impl RegistryHandle {
                             );
                             match futures::FutureExt::catch_unwind(result).await {
                                 Ok(Ok(resp)) => DispatchOutcome::Ok(
-                                    serde_json::to_vec(&resp).unwrap_or_default(),
+                                    postcard::to_stdvec(&resp).unwrap_or_default(),
                                 ),
                                 Ok(Err(e)) => DispatchOutcome::Ok(
-                                    serde_json::to_vec(&Err::<(), _>(e)).unwrap_or_default(),
+                                    postcard::to_stdvec(&Err::<(), _>(e)).unwrap_or_default(),
                                 ),
                                 Err(_) => DispatchOutcome::Panicked,
                             }
@@ -859,10 +885,11 @@ where
     };
 
     // The dispatcher closure takes a `&[u8]` payload (the typed
-    // request). Re-encode the inner JSON value as bytes for the
-    // closure's deserialization path.
-    let payload_bytes = serde_json::to_vec(&payload_value).unwrap_or_default();
-    let outcome = dispatch(&tag, &payload_bytes).await;
+    // request). `decode_request_body` now hands us the postcard-
+    // encoded inner bytes directly — pass them through untouched
+    // to the dispatcher, which postcard-decodes against the typed
+    // handler.
+    let outcome = dispatch(&tag, &payload_value).await;
     let (status, body, outcome_label) = match outcome {
         DispatchOutcome::Ok(b) => (DispatchStatus::Ok, b, crate::transport_metrics::outcome::OK),
         DispatchOutcome::ParseError => (
@@ -969,12 +996,26 @@ mod tests {
     /// Round-trip of request body encoding + decoding.
     #[test]
     fn request_body_round_trip() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Payload {
+            k: String,
+        }
         let shard = ShardId(uuid::Uuid::from_u128(0x1234));
-        let body = encode_request_body(shard, "vote", &serde_json::json!({"k": "v"})).unwrap();
-        assert_eq!(body[0], RAFT_TRANSPORT_VERSION_V1);
-        let decoded = decode_request_body(&body).expect("decodes");
-        assert_eq!(decoded.0, shard);
-        assert_eq!(decoded.1, "vote");
+        let body = encode_request_body(
+            shard,
+            "vote",
+            &Payload {
+                k: "v".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(body[0], RAFT_TRANSPORT_VERSION_V2);
+        let (decoded_shard, decoded_tag, decoded_payload) =
+            decode_request_body(&body).expect("decodes");
+        assert_eq!(decoded_shard, shard);
+        assert_eq!(decoded_tag, "vote");
+        let payload: Payload = postcard::from_bytes(&decoded_payload).expect("payload decodes");
+        assert_eq!(payload.k, "v");
     }
 
     /// Status byte mapping: each variant decodes back to itself.

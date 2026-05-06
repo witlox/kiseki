@@ -7,13 +7,15 @@
 //! implemented in `kiseki-raft::tcp_transport`:
 //!
 //!   - Length-prefixed framing: u32 big-endian length, followed by
-//!     `length` bytes of `serde_json` payload.
+//!     `length` bytes of `postcard` payload (rev-2, 2026-05-06 —
+//!     was `serde_json`).
 //!   - Hard cap `MAX_RAFT_RPC_SIZE = 128 MiB`. A larger length
 //!     prefix is rejected at the boundary (ADV-S1, ADV-S6).
-//!   - Payload is `(tag: String, body: T)` where `tag ∈ {
-//!     "append_entries", "vote", "full_snapshot" }`.
+//!   - Payload is the postcard-encoded outer tuple
+//!     `(shard_id_bytes, tag, raw_payload_bytes)` where
+//!     `tag ∈ { "append_entries", "vote", "full_snapshot" }`.
 //!   - `AppendEntries` / `Vote` / `InstallSnapshot` request bodies
-//!     ride as `serde_json::to_vec` of openraft's typed structs.
+//!     ride as `postcard::to_stdvec` of openraft's typed structs.
 //!
 //! Owner: `kiseki-raft::tcp_transport` — `rpc_exchange`,
 //! `dispatch_raft_rpc`, and the `MAX_RAFT_RPC_SIZE` constant.
@@ -247,11 +249,11 @@ fn frame_rejects_one_gib_length_prefix() {
 // AppendEntries serialization round-trip
 // ===========================================================================
 
-/// openraft 0.10 `AppendEntriesRequest<C>` serializes via serde_json
+/// openraft 0.10 `AppendEntriesRequest<C>` serializes via postcard
 /// to a stable shape: `{ vote, prev_log_id, entries, leader_commit }`.
 /// Round-trip MUST be identity.
 #[test]
-fn append_entries_request_json_round_trip_empty_entries() {
+fn append_entries_request_postcard_round_trip_empty_entries() {
     // Heartbeat (empty entries, no prior log entry).
     // Vote(term=1, leader=node_id=42); committed.
     let req: AppendEntriesRequest<WireTestConfig> = AppendEntriesRequest {
@@ -260,11 +262,11 @@ fn append_entries_request_json_round_trip_empty_entries() {
         entries: vec![],   // heartbeat
         leader_commit: None,
     };
-    let bytes = serde_json::to_vec(&req).expect("encode AppendEntries");
+    let bytes = postcard::to_stdvec(&req).expect("encode AppendEntries");
     assert!(!bytes.is_empty());
 
     let back: AppendEntriesRequest<WireTestConfig> =
-        serde_json::from_slice(&bytes).expect("decode AppendEntries");
+        postcard::from_bytes(&bytes).expect("decode AppendEntries");
     assert_eq!(back.vote, req.vote);
     assert_eq!(back.prev_log_id, req.prev_log_id);
     assert_eq!(back.entries.len(), 0);
@@ -274,7 +276,7 @@ fn append_entries_request_json_round_trip_empty_entries() {
 #[test]
 fn append_entries_request_with_kiseki_tag_prefix() {
     // The dispatcher reads `("append_entries", req)` — confirm the
-    // tagged tuple round-trips.
+    // tagged tuple round-trips through postcard.
     let req: AppendEntriesRequest<WireTestConfig> = AppendEntriesRequest {
         vote: Vote::new_committed(2u64, 7u64),
         prev_log_id: None,
@@ -282,9 +284,9 @@ fn append_entries_request_with_kiseki_tag_prefix() {
         leader_commit: None,
     };
     let tagged = ("append_entries".to_string(), req);
-    let bytes = serde_json::to_vec(&tagged).expect("encode tagged");
+    let bytes = postcard::to_stdvec(&tagged).expect("encode tagged");
     let back: (String, AppendEntriesRequest<WireTestConfig>) =
-        serde_json::from_slice(&bytes).expect("decode tagged");
+        postcard::from_bytes(&bytes).expect("decode tagged");
     assert_eq!(back.0, "append_entries");
     assert_eq!(back.1.vote, tagged.1.vote);
 }
@@ -296,7 +298,7 @@ fn append_entries_request_with_kiseki_tag_prefix() {
 /// openraft `VoteRequest<C>` carries `{ vote, last_log_id }`. Round
 /// trip MUST be identity.
 #[test]
-fn vote_request_json_round_trip() {
+fn vote_request_postcard_round_trip() {
     let req: VoteRequest<WireTestConfig> = VoteRequest {
         vote: Vote::new(3u64, 17u64),
         // Skipping `last_log_id` construction — the LogId<C> type is
@@ -305,8 +307,8 @@ fn vote_request_json_round_trip() {
         // (round-trip) is exercised with `None` here.
         last_log_id: None,
     };
-    let bytes = serde_json::to_vec(&req).expect("encode Vote");
-    let back: VoteRequest<WireTestConfig> = serde_json::from_slice(&bytes).expect("decode Vote");
+    let bytes = postcard::to_stdvec(&req).expect("encode Vote");
+    let back: VoteRequest<WireTestConfig> = postcard::from_bytes(&bytes).expect("decode Vote");
     assert_eq!(back.vote, req.vote);
     assert_eq!(back.last_log_id, req.last_log_id);
 }
@@ -318,9 +320,9 @@ fn vote_request_with_kiseki_tag_prefix() {
         last_log_id: None, // first vote — no prior log
     };
     let tagged = ("vote".to_string(), req);
-    let bytes = serde_json::to_vec(&tagged).expect("encode tagged vote");
+    let bytes = postcard::to_stdvec(&tagged).expect("encode tagged vote");
     let back: (String, VoteRequest<WireTestConfig>) =
-        serde_json::from_slice(&bytes).expect("decode tagged vote");
+        postcard::from_bytes(&bytes).expect("decode tagged vote");
     assert_eq!(back.0, "vote");
     assert_eq!(back.1.vote, tagged.1.vote);
     assert_eq!(back.1.last_log_id, None);
@@ -339,57 +341,48 @@ fn vote_request_with_kiseki_tag_prefix() {
 #[test]
 fn install_snapshot_envelope_round_trip() {
     // Mirror of `kiseki_raft::tcp_transport::SnapshotEnvelope` for
-    // the test (the real type is private to the crate). We keep the
-    // shape JSON-typed so it stays decoupled from openraft's
-    // generic Vote<C> machinery.
+    // the test (the real type is private to the crate). Uses
+    // openraft's typed `VoteOf<C>` directly — postcard requires a
+    // typed shape on both ends (no generic Value type like JSON).
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     struct LocalSnapshotEnvelope {
-        // The kiseki transport carries the openraft Vote here; the
-        // round-trip property is on the JSON bytes — that's what's
-        // exposed on the wire.
-        vote_json: serde_json::Value,
+        vote: openraft::alias::VoteOf<WireTestConfig>,
         // We don't replicate the full SnapshotMeta type here — it's
         // proprietary to openraft's storage layer. The bytes-level
         // round-trip on `data` is what matters.
         data: Vec<u8>,
     }
 
-    // Use openraft's typed VoteOf alias for the test config so the
-    // leader-id flavor (std vs adv) is unambiguous.
-    let real_vote: openraft::alias::VoteOf<WireTestConfig> = Vote::new_committed(5u64, 3u64);
-    let vote_json = serde_json::to_value(&real_vote).expect("vote → json");
-
     let env = LocalSnapshotEnvelope {
-        vote_json,
+        vote: Vote::new_committed(5u64, 3u64),
         data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03],
     };
-    let bytes = serde_json::to_vec(&env).expect("encode envelope");
-    let back: LocalSnapshotEnvelope = serde_json::from_slice(&bytes).expect("decode envelope");
+    let bytes = postcard::to_stdvec(&env).expect("encode envelope");
+    let back: LocalSnapshotEnvelope = postcard::from_bytes(&bytes).expect("decode envelope");
     assert_eq!(back, env);
 }
 
 #[test]
 fn install_snapshot_with_kiseki_tag_prefix() {
     // Confirm the `("full_snapshot", envelope)` tuple is what the
-    // dispatcher expects.
+    // dispatcher expects after the rev-2 postcard migration.
     #[derive(Serialize, Deserialize)]
     struct LocalEnv {
-        vote_json: serde_json::Value,
+        vote: openraft::alias::VoteOf<WireTestConfig>,
         data: Vec<u8>,
     }
-    let real_vote: openraft::alias::VoteOf<WireTestConfig> = Vote::new_committed(1u64, 1u64);
-    let vote_json = serde_json::to_value(&real_vote).expect("vote → json");
     let env = LocalEnv {
-        vote_json,
+        vote: Vote::new_committed(1u64, 1u64),
         data: vec![0xAA, 0xBB],
     };
     let tagged = ("full_snapshot".to_string(), env);
-    let bytes = serde_json::to_vec(&tagged).expect("encode tagged");
+    let bytes = postcard::to_stdvec(&tagged).expect("encode tagged");
 
-    // Decode the tag back; the dispatcher uses a 2-step decode where
-    // the tag is read first (as a (String, JsonValue) tuple).
-    let (tag, _value): (String, serde_json::Value) =
-        serde_json::from_slice(&bytes).expect("decode tagged");
+    // The dispatcher decodes the outer `(String, payload_bytes)`
+    // tuple from the request body; here we round-trip through
+    // postcard with the typed shape and assert the tag survives.
+    let (tag, _back_env): (String, LocalEnv) =
+        postcard::from_bytes(&bytes).expect("decode tagged");
     assert_eq!(
         tag, "full_snapshot",
         "Kiseki Raft framing: install-snapshot tag is 'full_snapshot'"
@@ -401,17 +394,9 @@ fn install_snapshot_with_kiseki_tag_prefix() {
 // ===========================================================================
 
 /// Cross-implementation seed: hand-build a heartbeat AppendEntries
-/// frame from the openraft 0.10 documentation's wire shape. The bytes
-/// below are what kiseki's transport produces today; they will be
-/// the regression sentinel if openraft's serde encoding shifts.
-///
-/// Source: openraft 0.10 docs §"AppendEntriesRequest" + the kiseki
-/// `("append_entries", request)` tuple convention.
-///
-/// The test uses `serde_json` to derive the expected bytes once per
-/// run (so it is robust to whitespace differences); the framing
-/// length prefix is assembled by hand to assert the kiseki wire
-/// shape end-to-end.
+/// frame from openraft 0.10's typed shape post rev-2 (postcard).
+/// The framing length prefix is assembled by hand to assert the
+/// kiseki wire shape end-to-end.
 #[test]
 fn rfc_seed_hand_built_append_entries_heartbeat_frame() {
     // Build a minimal heartbeat: empty entries, no prior log.
@@ -423,11 +408,11 @@ fn rfc_seed_hand_built_append_entries_heartbeat_frame() {
     };
     let tagged = ("append_entries".to_string(), req);
 
-    let body = serde_json::to_vec(&tagged).expect("encode tagged frame body");
+    let body = postcard::to_stdvec(&tagged).expect("encode tagged frame body");
     let framed = frame(&body);
 
-    // Frame structure: [4-byte BE length][JSON body]. Hand-derive the
-    // BE length and assert the prefix shape.
+    // Frame structure: [4-byte BE length][postcard body]. Hand-derive
+    // the BE length and assert the prefix shape.
     let body_len = u32::try_from(body.len()).expect("body fits in u32");
     let expected_prefix = body_len.to_be_bytes();
     assert_eq!(
@@ -441,18 +426,19 @@ fn rfc_seed_hand_built_append_entries_heartbeat_frame() {
         "Kiseki Raft framing: body follows prefix verbatim"
     );
 
-    // And confirm round-trip through unframe + serde decode.
+    // Round-trip through unframe + postcard decode of the tag.
     let body_back = unframe(&framed).expect("unframe");
-    let (tag, _val): (String, serde_json::Value) =
-        serde_json::from_slice(body_back).expect("decode tag");
+    let (tag, _req_back): (String, AppendEntriesRequest<WireTestConfig>) =
+        postcard::from_bytes(body_back).expect("decode tag + req");
     assert_eq!(tag, "append_entries");
 
-    // The body is non-empty (the JSON tag string alone is at least
-    // the 17 bytes of `["append_entries",`). This guards against an
-    // empty-frame regression where the dispatcher would silently
-    // accept an empty body.
+    // The body is non-empty — the postcard-encoded tag string alone
+    // (varint length + UTF-8 bytes for "append_entries") is 16 bytes,
+    // and the AppendEntriesRequest payload follows. This guards
+    // against an empty-frame regression where the dispatcher would
+    // silently accept an empty body.
     assert!(
-        body.len() > 17,
+        body.len() > 16,
         "Kiseki Raft framing: AppendEntries body must contain tag + payload; \
          got only {} bytes",
         body.len()

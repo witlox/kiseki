@@ -50,13 +50,7 @@ impl<C: RaftTypeConfig> FjallRaftLogStore<C> {
     /// or vote). Returns `true` if the store was previously used —
     /// the Raft node should NOT call `initialize()` on restart.
     pub fn has_state(&self) -> bool {
-        !self.inner.is_empty().unwrap_or(true)
-            || self
-                .inner
-                .get_meta::<serde_json::Value>("vote")
-                .ok()
-                .flatten()
-                .is_some()
+        !self.inner.is_empty().unwrap_or(true) || self.inner.meta_exists("vote").unwrap_or(false)
     }
 }
 

@@ -99,14 +99,40 @@ pub trait CompositionStorage: Send + Sync {
     /// caller may not have pre-validated the binding (S3 PUT-
     /// overwrite without `If-None-Match`).
     ///
-    /// Default implementation: sequential `put` + `name_insert`.
-    /// In-memory backends gain nothing from overriding; persistent
-    /// backends override to fold both into one batch.
+    /// Atomic create-then-name. Stores `comp` AND binds `(ns, name)`
+    /// → `comp.id` in a single backend batch — one journal-mutex
+    /// acquisition + one fsync instead of two. The persistent
+    /// backend MUST commit both atomically (no observable state
+    /// where the composition exists but the name is missing, or
+    /// vice versa).
+    ///
+    /// `prior_id` is the existing `(ns, name) → comp_id` binding
+    /// observed by the caller under the storage lock (or `None`
+    /// when no binding exists). The backend uses this to drive the
+    /// overwrite-replace cascade (drop the stale reverse for the
+    /// old comp_id) without paying its own pre-flight read.
+    /// Callers that don't already hold the lookup result pass
+    /// whatever they have; the persistent backend may do its own
+    /// lookup if `prior_id` is unreliable, but the
+    /// gateway-driven path always supplies it from the same
+    /// storage-critical-section that drives this call.
+    ///
+    /// Caller MUST guarantee `comp.id` is freshly minted (never
+    /// previously bound to a name). The forward `(ns, name)`
+    /// cascade-replace check uses `prior_id`; the reverse-name
+    /// pre-flight on `comp.id` is skipped on that basis.
+    ///
+    /// Default implementation: sequential `put` + `name_insert`,
+    /// ignoring `prior_id` (in-memory backends do their cascade
+    /// inside `name_insert` anyway, where the lookup is O(1) and
+    /// not worth bypassing). Persistent backends override to fold
+    /// both into one batch and consume `prior_id`.
     fn put_with_name(
         &mut self,
         comp: Composition,
         ns: NamespaceId,
         name: String,
+        _prior_id: Option<CompositionId>,
     ) -> Result<(), PersistentStoreError> {
         let id = comp.id;
         self.put(comp)?;

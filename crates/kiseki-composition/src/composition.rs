@@ -300,6 +300,30 @@ pub enum DeleteResult {
 /// `CompositionStore` holds its own short-lived locks per field
 /// (storage, namespaces, multiparts), so two writers operating on
 /// disjoint state run in parallel.
+/// Conditional-check evaluator passed by the gateway into
+/// [`CompositionStore::create_with_name_conditional`]. The store holds
+/// the storage lock across the lookup + check + write, so the check
+/// runs against the SAME forward-binding state the subsequent put
+/// uses for its cascade decision — no race window between the
+/// conditional evaluation and the binding update.
+///
+/// Kept as a trait (not a concrete enum) so the protocol layer
+/// owns the conditional taxonomy: S3 carries `If-None-Match` /
+/// `If-Match`, NFS4 carries OPEN4_CREATE_GUARDED4, etc. The
+/// composition store doesn't need to know which protocol asked.
+pub trait ConditionalCheck {
+    /// Returns `Ok(())` when the write may proceed, `Err(reason)`
+    /// when the precondition fails. `existing` is the
+    /// `(ns, name) → comp_id` lookup result observed under the
+    /// storage lock; `None` means no prior binding.
+    ///
+    /// # Errors
+    /// Returns the human-readable reason that surfaces as
+    /// `CompositionError::PreconditionFailed` and ultimately as
+    /// HTTP 412 (S3) / NFS4ERR_EXIST (NFS).
+    fn check(&self, existing: Option<CompositionId>) -> Result<(), String>;
+}
+
 pub trait CompositionOps {
     /// Create a new composition in a namespace.
     fn create(
@@ -612,29 +636,42 @@ impl CompositionStore {
         Ok(self.storage.lock().name_insert(namespace_id, name, id)?)
     }
 
-    /// Atomic create-then-name. Equivalent to
-    /// [`CompositionOps::create`] followed by [`Self::bind_name`]
-    /// but folds both into a single storage-mutex acquisition + a
-    /// single backend batch — one journal-mutex contention instead
-    /// of four on the persistent path. The atomicity is also
-    /// strictly stronger than the `create` + `bind_name` sequence:
-    /// no observable state where the composition exists but the
-    /// name is missing, or vice versa.
+    /// Atomic create-then-name with an optional S3-style
+    /// conditional check. Holds the storage lock once across:
     ///
-    /// Used by the gateway's S3 / NFS write path when a key/name
-    /// is supplied; the unconditional-PUT-overwrite cascade still
-    /// runs in the backend so existing names are correctly
-    /// re-pointed.
+    /// 1. Forward `(ns, name) → comp_id` lookup (one fjall.get).
+    /// 2. Conditional-header evaluation when `cond.is_some()`
+    ///    (`If-None-Match: *` rejects when an existing binding is
+    ///    present; `If-Match: <etag>` rejects when absent or
+    ///    mismatched).
+    /// 3. Composition row construction.
+    /// 4. `put_with_name(prior_id = step-1-result)` — feeds the
+    ///    cascade decision to the backend so it skips its own
+    ///    pre-flight read.
+    ///
+    /// One fjall.get total per call. When `cond.is_some()` this
+    /// replaces the prior gateway pattern of `lookup_by_name`
+    /// (releases lock) + `create_with_name` (re-acquires lock,
+    /// does its own pre-flight) — half the journal-mutex
+    /// acquisitions and the race window between the two is closed.
+    ///
+    /// Strictly stronger atomicity than `create()` +
+    /// `bind_name()`: no observable state where the composition
+    /// exists but the name is missing, or vice versa.
     ///
     /// # Errors
-    /// Returns `CompositionError::NamespaceNotFound` /
-    /// `CompositionError::ReadOnlyNamespace` /
-    /// `CompositionError::Storage` on the same conditions
-    /// `create` + `bind_name` would.
+    /// - `CompositionError::NamespaceNotFound` if the namespace
+    ///   isn't registered locally.
+    /// - `CompositionError::ReadOnlyNamespace` on read-only
+    ///   tenants.
+    /// - `CompositionError::PreconditionFailed(reason)` when
+    ///   `cond.is_some()` and the conditional check rejects.
+    /// - `CompositionError::Storage` on backend failure.
     pub fn create_with_name(
         &self,
         namespace_id: NamespaceId,
         name: String,
+        cond: Option<&dyn ConditionalCheck>,
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<CompositionId, CompositionError> {
@@ -662,9 +699,18 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
         };
-        self.storage
-            .lock()
-            .put_with_name(comp, namespace_id, name)?;
+
+        // Single storage-lock acquisition holds across the lookup +
+        // (optional) conditional check + put. No race window — the
+        // cascade decision uses the SAME forward-lookup result the
+        // conditional check evaluated.
+        let mut storage = self.storage.lock();
+        let existing = storage.name_lookup(namespace_id, &name)?;
+        if let Some(cond) = cond {
+            cond.check(existing)
+                .map_err(CompositionError::PreconditionFailed)?;
+        }
+        storage.put_with_name(comp, namespace_id, name, existing)?;
         Ok(id)
     }
 
