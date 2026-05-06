@@ -856,31 +856,73 @@ impl Driver for InProcessDriver {
 /// `tenant_id` is a no-op in that posture, matching what S3 and NFS
 /// drivers do today (they use the same single-tenant cluster).
 pub struct NativeDriver {
-    /// Cloneable gRPC channel held by every per-call client construction.
-    channel: tonic::transport::Channel,
+    /// Pool of pre-built gRPC clients, one per backing TCP / h2
+    /// connection. tonic's default `Channel::connect()` produces a
+    /// single-connection channel; on the server side, each h2
+    /// connection is processed by ONE tokio task — so when many
+    /// concurrent unary RPCs share one connection, the server-side
+    /// h2 stream polling serializes through that single task and
+    /// CPU stays pinned to one core regardless of concurrency.
+    /// Holding N independent channels gives the server N parallel
+    /// h2-connection tasks; the workers round-robin across the pool
+    /// so streams fan out across cores.
+    clients: Vec<kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient<
+        tonic::transport::Channel,
+    >>,
+    /// Per-call selector — atomic so workers don't all hash to slot 0.
+    next: std::sync::atomic::AtomicUsize,
     namespace_id: NamespaceId,
     tenant_id: OrgId,
 }
 
 impl NativeDriver {
     pub async fn new(grpc_addr: &str) -> Result<Self, String> {
-        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{grpc_addr}"))
-            .map_err(|e| format!("native endpoint: {e}"))?
-            .tcp_nodelay(true)
-            .timeout(std::time::Duration::from_secs(30));
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| format!("native connect: {e}"))?;
-        // Same single-tenant defaults the existing S3 driver uses —
-        // the harness's `kiseki-server` registers the bootstrap
-        // namespace under the bootstrap tenant, and the perf workload
-        // PUTs against it.
+        // Pool size: matches the typical worker concurrency (16) so
+        // every worker gets its own connection. Configurable via
+        // KISEKI_NATIVE_DRIVER_POOL.
+        let pool_size: usize = std::env::var("KISEKI_NATIVE_DRIVER_POOL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        let mut clients = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{grpc_addr}"))
+                .map_err(|e| format!("native endpoint: {e}"))?
+                .tcp_nodelay(true)
+                // Match the server's HTTP/2 flow-control windows
+                // (runtime.rs sets 16 MiB stream / 32 MiB connection).
+                .initial_stream_window_size(Some(16 * 1024 * 1024))
+                .initial_connection_window_size(Some(32 * 1024 * 1024))
+                .timeout(std::time::Duration::from_secs(30));
+            let channel = endpoint
+                .connect()
+                .await
+                .map_err(|e| format!("native connect: {e}"))?;
+            let client = kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient::new(
+                channel,
+            )
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024);
+            clients.push(client);
+        }
         Ok(Self {
-            channel,
+            clients,
+            next: std::sync::atomic::AtomicUsize::new(0),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
             namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
         })
+    }
+
+    fn pick_client(
+        &self,
+    ) -> kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient<
+        tonic::transport::Channel,
+    > {
+        let idx = self
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.clients.len();
+        self.clients[idx].clone()
     }
 
     fn ctrl(&self) -> kiseki_proto::v1::native::ControlFields {
@@ -903,13 +945,7 @@ impl NativeDriver {
 #[async_trait]
 impl Driver for NativeDriver {
     async fn put(&self, payload: &[u8]) -> Result<Key, String> {
-        let mut client = kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient::new(
-            self.channel.clone(),
-        )
-        // Match the server-side codec config (Phase 4 wiring) so 16
-        // MiB+ streams can encode round-trip.
-        .max_decoding_message_size(64 * 1024 * 1024)
-        .max_encoding_message_size(64 * 1024 * 1024);
+        let mut client = self.pick_client();
         let req = tonic::Request::new(kiseki_proto::v1::native::PutObjectRequest {
             control: Some(self.ctrl()),
             namespace_id: Some(kiseki_proto::v1::NamespaceId {
@@ -935,11 +971,7 @@ impl Driver for NativeDriver {
     }
 
     async fn get(&self, key: &Key) -> Result<usize, String> {
-        let mut client = kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient::new(
-            self.channel.clone(),
-        )
-        .max_decoding_message_size(64 * 1024 * 1024)
-        .max_encoding_message_size(64 * 1024 * 1024);
+        let mut client = self.pick_client();
         let req = tonic::Request::new(kiseki_proto::v1::native::GetObjectRequest {
             control: Some(self.ctrl()),
             namespace_id: Some(kiseki_proto::v1::NamespaceId {
