@@ -151,14 +151,12 @@ impl<G: GatewayOps> KisekiFuse<G> {
         &self.rt
     }
 
-    /// Borrow the gateway. Used by [`crate::fuse_daemon::FuseDaemon`]
-    /// to issue gateway calls outside the daemon's `RwLock` write
-    /// section — see the prep / apply method pairs below.
-    ///
-    /// `#[cfg(feature = "fuse")]` because the only caller is the
-    /// FUSE daemon. Without the feature this method is dead code.
-    #[cfg(feature = "fuse")]
-    pub(crate) fn gateway(&self) -> &G {
+    /// Borrow the gateway. Used by external orchestrators
+    /// ([`crate::fuse_daemon::FuseDaemon`], the kiseki-profile FUSE
+    /// driver) to issue gateway calls outside the wrapping
+    /// `RwLock`'s write section — see the build-request / apply-
+    /// response method pairs below for the 3-phase pattern.
+    pub fn gateway(&self) -> &G {
         &self.gateway
     }
 
@@ -178,12 +176,12 @@ impl<G: GatewayOps> KisekiFuse<G> {
         }
     }
 
-    /// `pub(crate)` mirror of [`Self::block_gateway`] so the
-    /// daemon-orchestrated flush / create paths can invoke gateway
-    /// futures without holding the daemon's `RwLock` for write.
-    /// Same `#[cfg(feature = "fuse")]` rationale as [`Self::gateway`].
-    #[cfg(feature = "fuse")]
-    pub(crate) fn block_gateway_pub<F, T>(&self, f: F) -> T
+    /// Public mirror of [`Self::block_gateway`] so external
+    /// orchestrators (FUSE daemon, kiseki-profile FUSE driver) can
+    /// invoke gateway futures without holding their wrapping lock
+    /// for write. Same dedicated runtime + `block_in_place` /
+    /// `block_on` selection logic as the private helper.
+    pub fn block_gateway_pub<F, T>(&self, f: F) -> T
     where
         F: std::future::Future<Output = T>,
     {
@@ -364,7 +362,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// the few microseconds it takes to mutate `self.dirty`, then
     /// drops the lock before [`Self::block_gateway`] / the gateway
     /// call. See `kiseki_client::fuse_daemon::FuseDaemon::flush`.
-    pub(crate) fn flush_take_buffer(&mut self, ino: Ino) -> Option<WriteRequest> {
+    pub fn flush_take_buffer(&mut self, ino: Ino) -> Option<WriteRequest> {
         let buf = self.dirty.remove(&ino)?;
         Some(WriteRequest {
             tenant_id: self.tenant_id,
@@ -380,7 +378,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// gateway's `composition_id` onto the inode (under exclusive
     /// lock). No-op if the inode is gone or not a file (e.g. it was
     /// unlinked between take-buffer and apply).
-    pub(crate) fn flush_apply_response(&mut self, ino: Ino, resp: &WriteResponse) {
+    pub fn flush_apply_response(&mut self, ino: Ino, resp: &WriteResponse) {
         if let Some(InodeEntry::File { composition_id, .. }) = self.inodes.get_mut(&ino) {
             *composition_id = resp.composition_id;
         }
@@ -445,7 +443,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// `flush_take_buffer` callers (which need exclusive write
     /// lock) wait, but parallel `create_build_request` callers
     /// proceed concurrently. The actual gateway call runs lock-free.
-    pub(crate) fn create_build_request(
+    pub fn create_build_request(
         &self,
         parent: Ino,
         name: &str,
@@ -475,7 +473,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// `EEXIST` in that case; caller is responsible for surfacing
     /// it (the orphaned composition the gateway minted will be
     /// GC'd by the chunk-refcount sweep).
-    pub(crate) fn create_apply_response(
+    pub fn create_apply_response(
         &mut self,
         parent: Ino,
         name: &str,
