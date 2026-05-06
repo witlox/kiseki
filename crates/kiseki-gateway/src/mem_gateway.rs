@@ -1551,34 +1551,37 @@ impl GatewayOps for InMemoryGateway {
                     _ => {}
                 }
             }
-            // ----- Create -----
-            let comp_id = comps
-                .create(req.namespace_id, chunk_ids.clone(), bytes_written)
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "gateway write: compositions.create failed");
-                    // Map the typed NamespaceNotFound through to the
-                    // gateway's typed variant so the HTTP layer can
-                    // return 404 NoSuchBucket instead of an opaque 500.
-                    if matches!(
-                        e,
-                        kiseki_composition::error::CompositionError::NamespaceNotFound(_)
-                    ) {
-                        GatewayError::NamespaceNotFound(e.to_string())
-                    } else {
-                        GatewayError::Upstream(e.to_string())
-                    }
-                })?;
-            // ----- Bind name (race-free vs the conditional check above) -----
+            // ----- Create (+ bind name atomically when a key is given) -----
             // The Raft delta below carries the name to followers via
             // the v2 create payload so their hydrators stay consistent.
-            if let Some(name) = req.name.as_deref() {
-                comps
-                    .bind_name(req.namespace_id, name.to_owned(), comp_id)
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, "gateway write: bind_name failed");
-                        GatewayError::Upstream(e.to_string())
-                    })?;
+            // When a name is present, fold create + bind_name into a
+            // single storage-mutex + single backend-batch call so the
+            // gateway PUT path takes one journal-mutex acquisition
+            // instead of four (perf-spike 2026-05-06: this is the
+            // dominant ceiling on the in-process-persistent floor).
+            let comp_id = match req.name.as_deref() {
+                Some(name) => comps.create_with_name(
+                    req.namespace_id,
+                    name.to_owned(),
+                    chunk_ids.clone(),
+                    bytes_written,
+                ),
+                None => comps.create(req.namespace_id, chunk_ids.clone(), bytes_written),
             }
+            .map_err(|e| {
+                tracing::warn!(error = %e, "gateway write: compositions.create failed");
+                // Map the typed NamespaceNotFound through to the
+                // gateway's typed variant so the HTTP layer can
+                // return 404 NoSuchBucket instead of an opaque 500.
+                if matches!(
+                    e,
+                    kiseki_composition::error::CompositionError::NamespaceNotFound(_)
+                ) {
+                    GatewayError::NamespaceNotFound(e.to_string())
+                } else {
+                    GatewayError::Upstream(e.to_string())
+                }
+            })?;
             let comp = comps
                 .get(comp_id)
                 .expect("composition was just created above; must be present");

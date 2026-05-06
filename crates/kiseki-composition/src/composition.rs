@@ -612,6 +612,62 @@ impl CompositionStore {
         Ok(self.storage.lock().name_insert(namespace_id, name, id)?)
     }
 
+    /// Atomic create-then-name. Equivalent to
+    /// [`CompositionOps::create`] followed by [`Self::bind_name`]
+    /// but folds both into a single storage-mutex acquisition + a
+    /// single backend batch — one journal-mutex contention instead
+    /// of four on the persistent path. The atomicity is also
+    /// strictly stronger than the `create` + `bind_name` sequence:
+    /// no observable state where the composition exists but the
+    /// name is missing, or vice versa.
+    ///
+    /// Used by the gateway's S3 / NFS write path when a key/name
+    /// is supplied; the unconditional-PUT-overwrite cascade still
+    /// runs in the backend so existing names are correctly
+    /// re-pointed.
+    ///
+    /// # Errors
+    /// Returns `CompositionError::NamespaceNotFound` /
+    /// `CompositionError::ReadOnlyNamespace` /
+    /// `CompositionError::Storage` on the same conditions
+    /// `create` + `bind_name` would.
+    pub fn create_with_name(
+        &self,
+        namespace_id: NamespaceId,
+        name: String,
+        chunks: Vec<ChunkId>,
+        size: u64,
+    ) -> Result<CompositionId, CompositionError> {
+        let ns_snap = {
+            let nss = self.namespaces.read();
+            let ns = nss
+                .get(&namespace_id)
+                .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
+            if ns.read_only {
+                return Err(CompositionError::ReadOnlyNamespace(namespace_id));
+            }
+            (ns.tenant_id, ns.shard_id)
+        };
+
+        let id = CompositionId(uuid::Uuid::new_v4());
+        let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
+        let comp = Composition {
+            id,
+            tenant_id: ns_snap.0,
+            namespace_id,
+            shard_id: ns_snap.1,
+            chunks,
+            version: 1,
+            size,
+            has_inline_data,
+            content_type: None,
+        };
+        self.storage
+            .lock()
+            .put_with_name(comp, namespace_id, name)?;
+        Ok(id)
+    }
+
     /// Unbind `name` in `ns`. Returns `true` if a binding existed.
     ///
     /// # Errors

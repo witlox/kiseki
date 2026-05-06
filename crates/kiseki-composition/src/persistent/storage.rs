@@ -85,6 +85,34 @@ pub trait CompositionStorage: Send + Sync {
         id: CompositionId,
     ) -> Result<(), PersistentStoreError>;
 
+    /// Atomic create-then-name. Stores `comp` AND binds `(ns, name)`
+    /// → `comp.id` in a single backend batch — one journal-mutex
+    /// acquisition + one fsync instead of two. The persistent
+    /// backend MUST commit both atomically (no observable state
+    /// where the composition exists but the name is missing, or
+    /// vice versa).
+    ///
+    /// Caller MUST guarantee `comp.id` is freshly minted (never
+    /// previously bound to a name); the backend is allowed to skip
+    /// the reverse-name pre-flight read on that basis. The forward
+    /// `(ns, name)` cascade-replace check still runs because the
+    /// caller may not have pre-validated the binding (S3 PUT-
+    /// overwrite without `If-None-Match`).
+    ///
+    /// Default implementation: sequential `put` + `name_insert`.
+    /// In-memory backends gain nothing from overriding; persistent
+    /// backends override to fold both into one batch.
+    fn put_with_name(
+        &mut self,
+        comp: Composition,
+        ns: NamespaceId,
+        name: String,
+    ) -> Result<(), PersistentStoreError> {
+        let id = comp.id;
+        self.put(comp)?;
+        self.name_insert(ns, name, id)
+    }
+
     /// Unbind `name` in `ns`. Returns `true` if a binding existed.
     fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError>;
 

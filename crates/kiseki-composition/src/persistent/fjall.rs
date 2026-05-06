@@ -179,16 +179,21 @@ impl FjallStorage {
 
     fn persist_after_write(&self) -> Result<(), PersistentStoreError> {
         if self.sync_per_write {
+            // Per-write fsync (POSIX semantics on the eventual-
+            // durability=false path).
             self.db
                 .persist(PersistMode::SyncAll)
                 .map_err(map_fjall_err)?;
-        } else {
-            // Buffer queues the WAL bytes asynchronously; the
-            // periodic flusher will fsync on its tick.
-            self.db
-                .persist(PersistMode::Buffer)
-                .map_err(map_fjall_err)?;
         }
+        // Eventual-durability path: nothing to do here. The WAL
+        // bytes are already in the journal from the preceding
+        // `WriteBatch::commit`; the runtime's periodic flusher
+        // (`KISEKI_COMPOSITION_FLUSH_INTERVAL_MS`) drives the
+        // actual fsync, and the gateway's `fsync_pending` hook
+        // can force one on demand. A `persist(Buffer)` call here
+        // would only re-acquire the journal mutex to enqueue an
+        // async fsync request — pure contention with no extra
+        // durability.
         Ok(())
     }
 }
@@ -572,6 +577,53 @@ impl CompositionStorage for FjallStorage {
             .persist(PersistMode::SyncAll)
             .map_err(map_fjall_err)?;
         Ok(())
+    }
+
+    fn put_with_name(
+        &mut self,
+        comp: Composition,
+        ns: NamespaceId,
+        name: String,
+    ) -> Result<(), PersistentStoreError> {
+        // One WriteBatch covers the composition row + the forward
+        // name binding + the reverse name binding atomically. Cuts
+        // the gateway PUT path's fjall journal-mutex acquisitions
+        // from 4 (two `commit` + two `persist`) to 1, which is the
+        // hot bottleneck on the `kiseki-profile in-process-persistent`
+        // floor (single-host PUT plateaued at ~36 k op/s past c=4).
+        //
+        // **Skipped read** vs a `put` + `name_insert` pair: the
+        // reverse-name pre-flight on `comp.id`. `put_with_name` is
+        // contracted for freshly-minted comp_ids, so the reverse
+        // entry is guaranteed `None` — no cascade needed.
+        //
+        // **Kept read**: the forward `(ns, name)` cascade lookup.
+        // The caller may not have pre-validated the binding (S3
+        // PUT-overwrite without `If-None-Match`), so a stale
+        // reverse for an old comp_id must still be cleared to
+        // preserve the names_rev ↔ names invariant.
+        let id = comp.id;
+        let id_bytes = id.0.as_bytes();
+        let new_key = name_key(ns, &name);
+        let comp_bytes = encode_composition(&comp)?;
+
+        let prev_id = self
+            .names
+            .get(&new_key)
+            .map_err(map_fjall_err)?
+            .map(|s| s.to_vec());
+
+        let mut batch = self.db.batch();
+        batch.insert(&self.comps, id_bytes.to_vec(), comp_bytes);
+        if let Some(prev) = prev_id {
+            if prev.as_slice() != id_bytes.as_slice() {
+                batch.remove(&self.names_rev, prev);
+            }
+        }
+        batch.insert(&self.names, new_key.clone(), id_bytes.to_vec());
+        batch.insert(&self.names_rev, id_bytes.to_vec(), new_key);
+        batch.commit().map_err(map_fjall_err)?;
+        self.persist_after_write()
     }
 }
 
