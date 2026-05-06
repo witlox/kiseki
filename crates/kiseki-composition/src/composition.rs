@@ -247,10 +247,11 @@ pub fn decode_composition_delete_payload(payload: &[u8]) -> Option<CompositionId
 /// A composition — metadata describing how to assemble chunks into a
 /// coherent data unit (file or object).
 ///
-/// Serde derives: ADR-040 stores compositions in a redb-backed
-/// `PersistentCompositionStore` using postcard encoding. All fields are
-/// concrete (no `HashMap` / `HashSet`) so postcard's encoding is
-/// deterministic across runs.
+/// Serde derives: ADR-040 stores compositions through the
+/// [`crate::persistent::CompositionStorage`] trait (currently
+/// fjall-backed; ADR-022 successor) using postcard encoding. All
+/// fields are concrete (no `HashMap` / `HashSet`) so postcard's
+/// encoding is deterministic across runs.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Composition {
     /// Composition identifier.
@@ -309,8 +310,8 @@ pub trait CompositionOps {
     ) -> Result<CompositionId, CompositionError>;
 
     /// Read a composition by ID. Returns an owned `Composition`
-    /// (ADR-040 — the persistent backend can't lend across a dropped
-    /// redb txn).
+    /// (ADR-040 — the persistent backend can't lend across a backend
+    /// transaction / batch).
     fn get(&self, id: CompositionId) -> Result<Composition, CompositionError>;
 
     /// Delete a composition. Returns `DeleteMarker` if versioning is
@@ -362,15 +363,16 @@ pub trait CompositionOps {
 ///
 /// Phase 17 ADR-040 introduces the `CompositionStorage` seam so the
 /// same struct can be backed by either an in-memory `HashMap` (tests,
-/// single-node deployments) or a redb-backed sibling that survives
-/// restart. `namespaces` and `multiparts` stay in-memory regardless
-/// (ADR-040 §D11). When a `LogOps` is attached via `with_log`,
-/// mutations emit deltas to the log shard.
+/// single-node deployments) or a fjall-backed sibling that survives
+/// restart (`FjallStorage`, ADR-022 successor). `namespaces` and
+/// `multiparts` stay in-memory regardless (ADR-040 §D11). When a
+/// `LogOps` is attached via `with_log`, mutations emit deltas to the
+/// log shard.
 ///
 /// Method semantics that changed in ADR-040:
 ///   - `get` and `list_by_namespace` now return owned `Composition`
 ///     values (the persistent backend can't lend references across a
-///     dropped redb transaction). All call sites accept this since
+///     backend transaction / batch). All call sites accept this since
 ///     `Composition` is `Clone` and the field accesses they perform
 ///     work uniformly on owned + borrowed values.
 /// Composition store. **B1 (2026-05-06):** all public methods take
@@ -395,7 +397,7 @@ impl CompositionStore {
     }
 
     /// Create a composition store with an explicit storage backend
-    /// (e.g. `PersistentRedbStorage` for multi-node deployments).
+    /// (e.g. `FjallStorage` for multi-node deployments).
     #[must_use]
     pub fn with_storage(storage: Box<dyn crate::persistent::CompositionStorage>) -> Self {
         Self {
@@ -478,7 +480,7 @@ impl CompositionStore {
 
     /// List all compositions in a namespace. Returns owned
     /// `Composition` values (ADR-040 — the persistent backend can't
-    /// lend across a dropped redb transaction).
+    /// lend across a backend transaction / batch).
     ///
     /// # Errors
     ///

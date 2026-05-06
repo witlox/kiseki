@@ -175,6 +175,27 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
     )
 }
 
+/// Recursive directory size in bytes. Tolerates I/O errors (returns
+/// the partial sum). Used by the periodic composition-store gauge —
+/// fjall is a keyspace directory rather than a single file.
+fn dir_size_recursive(path: &std::path::Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in read.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(dir_size_recursive(&entry.path()));
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
 /// Run the main data-path server.
 ///
 /// `workflow_table` is shared with the advisory runtime — see
@@ -576,17 +597,14 @@ pub async fn run_main(
     // See `metrics.raft_transport` plumbing in the multi-node path.)
     let _ = &metrics;
 
-    // Captures the chunk-store device handle + composition redb
+    // Captures the chunk-store device handle + composition fjall
     // flusher when their respective group-commit modes are on, so
     // the gateway's `fsync_pending` hook can drive explicit fsyncs
     // from FUSE / NFS `fsync(2)` callers (POSIX-compliance for
     // the eventual-durability optimization). Declared up here so
     // both the chunk-store section below and the composition-store
     // section further down can write into the same scope.
-    let mut comp_flusher_for_fsync: Option<kiseki_composition::persistent::RedbFlusher> = None;
-    let mut comp_write_behind_flusher_for_fsync: Option<
-        kiseki_composition::persistent::WriteBehindFlusher,
-    > = None;
+    let mut comp_flusher_for_fsync: Option<kiseki_composition::persistent::FjallFlusher> = None;
     let mut chunk_device_for_fsync: Option<std::sync::Arc<dyn kiseki_block::DeviceBackend>> = None;
 
     // Local chunk store: persistent (raw block device) if KISEKI_DATA_DIR
@@ -855,17 +873,18 @@ pub async fn run_main(
         }
     }
 
-    // Composition: wired to log for delta emission. ADR-040: when
-    // KISEKI_DATA_DIR is set we back the comp_id → Composition map
-    // with a redb file at `<data_dir>/metadata/compositions.redb`,
-    // so hydrated state survives restart and a node that joins late
-    // resumes from durable `last_applied_seq`. Single-node /
-    // no-data-dir deployments keep the in-memory backend (MemoryStorage)
-    // — same behavior as pre-ADR-040.
-    // Captures the redb path so the periodic gauge refresher can stat
-    // its size; None when the composition store is in-memory.
-    let mut comp_redb_path: Option<std::path::PathBuf> = None;
-    // Composition redb flusher, set when group-commit env var is on.
+    // Composition: wired to log for delta emission. ADR-040 + ADR-022
+    // successor: when KISEKI_DATA_DIR is set we back the comp_id →
+    // Composition map with a fjall keyspace at
+    // `<data_dir>/metadata/compositions/`, so hydrated state survives
+    // restart and a node that joins late resumes from durable
+    // `last_applied_seq`. Single-node / no-data-dir deployments keep
+    // the in-memory backend (MemoryStorage) — same behavior as
+    // pre-ADR-040.
+    // Captures the keyspace directory so the periodic gauge refresher
+    // can stat the on-disk footprint; None when the composition store
+    // is in-memory.
+    let mut comp_store_path: Option<std::path::PathBuf> = None;
     // `comp_flusher_for_fsync` declared at the runtime scope above
     // (before chunk-store construction) so both the chunk and
     // composition sections can populate it for the gateway
@@ -879,26 +898,24 @@ pub async fn run_main(
                     meta_dir.display()
                 )
             })?;
-            let path = meta_dir.join("compositions.redb");
+            let path = meta_dir.join("compositions");
             // Group commit (FUSE p99 fix): every put / bind_name
-            // currently triggers an inline fsync via redb's
-            // `Durability::Immediate`. With composition writes at
-            // ~1k/s on FUSE put-heavy, that's the same per-write
-            // fsync serialization the chunk store hit pre-`681de37`.
+            // would otherwise trigger an inline fsync. fjall's
+            // `PersistMode::Buffer` + a periodic flusher that calls
+            // `PersistMode::SyncAll` gives the same crash-safety
+            // contract as the previous redb write-behind queue at a
+            // bounded loss-window equal to the flush interval.
             // `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS` enables eventual
-            // durability + a periodic flusher; the loss window on a
-            // single-node hard crash is bounded by the interval.
-            // Multi-node deployments are safe because Raft re-
-            // replicates lost compositions via the under-
+            // durability; multi-node deployments are safe because
+            // Raft re-replicates lost compositions via the under-
             // replication scrub on restart.
             let flush_interval_ms = std::env::var("KISEKI_COMPOSITION_FLUSH_INTERVAL_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok());
-            let mut store = kiseki_composition::persistent::PersistentRedbStorage::open(&path)
-                .map_err(|e| format!("open persistent composition store: {e}"))?
-                .with_metrics(Arc::clone(&metrics.composition));
-            if flush_interval_ms.is_some() {
-                store = store.with_eventual_durability(true);
+            let store = kiseki_composition::persistent::FjallStorage::open(&path)
+                .map_err(|e| format!("open persistent composition store: {e}"))?;
+            let store = if flush_interval_ms.is_some() {
+                let store = store.with_eventual_durability(true);
                 let flusher = store.flusher();
                 // Hand the same flusher to the gateway via
                 // `register_fsync_hook` further below, so explicit
@@ -907,44 +924,39 @@ pub async fn run_main(
                 // the periodic task.
                 comp_flusher_for_fsync = Some(flusher.clone());
                 let interval_ms = flush_interval_ms.unwrap_or(100);
-                // ADR-040 rev 3: write-behind queue. The 2026-05-05
-                // perf test pinned the per-write redb txn (not just
-                // its fsync) as the bottleneck, so eventual
-                // durability alone wasn't enough — the queue moves
-                // the txn off the gateway hot path entirely. Knobs:
-                // QUEUE_MAX (4096 default) is the soft-cap before
-                // writers fall back to inline; FLUSH_INTERVAL_MS is
-                // the drainer cadence (above); MAX_BATCH (1024) is
-                // per-flush mutation cap.
-                let max_queue = std::env::var("KISEKI_COMPOSITION_QUEUE_MAX")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(4096);
-                let max_batch = std::env::var("KISEKI_COMPOSITION_BATCH_MAX")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(1024);
-                let drainer = store.enable_write_behind(
-                    max_queue,
-                    std::time::Duration::from_millis(interval_ms),
-                    max_batch,
-                );
-                comp_write_behind_flusher_for_fsync = Some(drainer.flusher());
-                tokio::spawn(drainer.run());
+                // Periodic WAL fsync. The LSM memtable + WAL append
+                // happens inline on every write (cheap, in-memory);
+                // this task drives the durability barrier at a bounded
+                // cadence. Same contract as the previous redb
+                // write-behind drainer's flush loop.
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(
+                        std::time::Duration::from_millis(interval_ms),
+                    );
+                    tick.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Delay,
+                    );
+                    loop {
+                        tick.tick().await;
+                        if let Err(e) = flusher.flush() {
+                            tracing::warn!(error=%e, "composition store periodic fsync failed");
+                        }
+                    }
+                });
                 tracing::info!(
                     path = %path.display(),
                     interval_ms,
-                    max_queue,
-                    max_batch,
-                    "composition store: persistent (redb-backed, ADR-040 rev-3 write-behind)",
+                    "composition store: persistent (fjall, eventual durability)",
                 );
+                store
             } else {
                 tracing::info!(
                     path = %path.display(),
-                    "composition store: persistent (redb-backed, ADR-040, immediate fsync)",
+                    "composition store: persistent (fjall, immediate fsync)",
                 );
-            }
-            comp_redb_path = Some(path);
+                store
+            };
+            comp_store_path = Some(path);
             Box::new(store)
         } else {
             tracing::info!("composition store: in-memory (no KISEKI_DATA_DIR)");
@@ -1090,30 +1102,19 @@ pub async fn run_main(
     // backing store. Without these, callers that explicitly issue
     // `fsync(2)` would silently get the periodic-task SLA (≤100 ms
     // window) instead of POSIX's "data is on disk now" guarantee.
-    if let Some(wb_flusher) = comp_write_behind_flusher_for_fsync {
-        // ADR-040 rev-3: drain the overlay first so any pending
-        // overlay entries get into redb before we issue the
-        // Immediate-durability commit that follows. Without this,
-        // FUSE / NFS `fsync(2)` would silently miss any in-flight
-        // overlay writes.
-        gw.register_fsync_hook(std::sync::Arc::new(move || {
-            wb_flusher.flush_blocking().map_err(|e| {
-                kiseki_gateway::error::GatewayError::Upstream(format!(
-                    "composition write-behind drain: {e}"
-                ))
-            })
-        }));
-        tracing::info!("fsync hook: composition write-behind drainer registered");
-    }
     if let Some(flusher) = comp_flusher_for_fsync {
+        // fjall's LSM memtable + WAL append happens inline on every
+        // write; the hook drives a `PersistMode::SyncAll` so the
+        // POSIX `fsync(2)` contract is honored (no extra "drain
+        // overlay first" stage — fjall has no separate overlay).
         gw.register_fsync_hook(std::sync::Arc::new(move || {
             flusher.flush().map_err(|e| {
                 kiseki_gateway::error::GatewayError::Upstream(format!(
-                    "composition redb fsync: {e}"
+                    "composition store fsync: {e}"
                 ))
             })
         }));
-        tracing::info!("fsync hook: composition redb registered");
+        tracing::info!("fsync hook: composition store (fjall) registered");
     }
     if let Some(device) = chunk_device_for_fsync {
         gw.register_fsync_hook(std::sync::Arc::new(move || {
@@ -1470,22 +1471,24 @@ pub async fn run_main(
         );
     }
 
-    // §D10 — periodic stat of `compositions.redb` so the
-    // `kiseki_composition_redb_size_bytes` gauge tracks on-disk growth.
+    // §D10 — periodic stat of the composition store directory so the
+    // `kiseki_composition_store_size_bytes` gauge tracks on-disk
+    // growth. fjall is a keyspace = directory of LSM segments + WAL,
+    // so we recurse one level (cheap — a few dozen files).
     // Only spawned when the persistent store is active. Also refreshes
-    // `kiseki_composition_count` from the live store (cheap — single
-    // redb metadata read, no scan).
-    if let Some(path) = comp_redb_path {
+    // `kiseki_composition_count` from the live store (cheap — backend
+    // `count()` does one len call against the comps partition, no
+    // full scan).
+    if let Some(path) = comp_store_path {
         let size_metrics = composition_metrics_for_size_refresh;
         let count_compositions = gw.compositions_handle();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    size_metrics
-                        .redb_size_bytes
-                        .set(i64::try_from(meta.len()).unwrap_or(i64::MAX));
-                }
+                let total = dir_size_recursive(&path);
+                size_metrics
+                    .store_size_bytes
+                    .set(i64::try_from(total).unwrap_or(i64::MAX));
                 if let Ok(c) =
                     count_compositions.with_storage_locked(|s| s.count())
                 {

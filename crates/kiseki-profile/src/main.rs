@@ -65,7 +65,7 @@ enum Protocol {
     /// per node) bounds.
     Native,
     /// In-process gateway with the SAME persistent stores the
-    /// spawned `kiseki-server` uses (redb-backed `CompositionStore`,
+    /// spawned `kiseki-server` uses (fjall-backed `CompositionStore`,
     /// raw-block `PersistentChunkStore` with group-commit fsync).
     /// Skips the gRPC + tonic + h2 stack but pays every persistence
     /// cost the production gateway pays. The right floor for the

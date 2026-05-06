@@ -7,11 +7,14 @@
 //!   - `MemoryStorage` — `HashMap` + plain fields. Used by tests and
 //!     by single-node deployments without `KISEKI_DATA_DIR`. Keeps
 //!     existing behavior bit-compatible.
-//!   - `PersistentRedbStorage` (in `redb.rs`) — redb-backed.
+//!   - `FjallStorage` (in `fjall.rs`) — fjall-backed (LSM keyspace
+//!     with WAL). Replaced redb on the write-heavy path 2026-05-06
+//!     per ADR-022's escape clause; metric and durability knobs are
+//!     unchanged.
 //!
 //! Hydrator state (`last_applied_seq`, `stuck_at_seq`,
 //! `stuck_retries`, `halted`) lives in the storage so the persistent
-//! backend can commit data + meta in a single transaction (I-CP1).
+//! backend can commit data + meta in a single atomic batch (I-CP1).
 
 use std::collections::HashMap;
 
@@ -33,7 +36,8 @@ pub trait CompositionStorage: Send + Sync {
     /// All compositions in a namespace. Used by the bucket-list path.
     /// Persistent backend implementations are encouraged to maintain
     /// a (`namespace_id` → `comp_id`) secondary index in a future
-    /// revision; the v1 redb impl does a full table scan.
+    /// revision; the current `FjallStorage` impl does a full
+    /// partition scan.
     fn list_in_namespace(&self, ns: NamespaceId) -> Result<Vec<Composition>, PersistentStoreError>;
 
     /// Insert or replace a composition. Used by both the gateway
@@ -103,7 +107,7 @@ pub trait CompositionStorage: Send + Sync {
     /// Per-stuck-delta retry counter (I-1 / N-1 closure). Returns
     /// `(stuck_at_seq, retries)` if a delta is currently being
     /// retried; `None` once it succeeds or is promoted to a permanent
-    /// skip. Persisted in the same redb transaction as
+    /// skip. Persisted in the same backend batch as
     /// `last_applied_seq` so a crash-loop accumulates retries
     /// reliably across restarts.
     fn stuck_state(&self) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError>;
@@ -115,7 +119,7 @@ pub trait CompositionStorage: Send + Sync {
 
     /// Apply a hydrator batch atomically. The persistent backend
     /// commits all inserts + removes + meta updates in a single
-    /// redb transaction (I-CP1).
+    /// atomic batch (I-CP1).
     fn apply_hydration_batch(&mut self, batch: HydrationBatch) -> Result<(), PersistentStoreError>;
 }
 

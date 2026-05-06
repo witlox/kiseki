@@ -41,6 +41,21 @@ ADR-036 (LogOps shard management)
   write redb write-transaction added by rev 1/2. See §"Write-
   behind amendment" below; pattern mirrors the chunk-store
   group-commit fix from `681de37` and the I-L5 amendment.
+- **rev 4** (2026-05-06): rev-3's write-behind queue is **deleted**.
+  The composition path moved off redb to fjall per ADR-022 rev-2;
+  fjall's LSM memtable + WAL is what the rev-3 queue was emulating.
+  A 2026-05-06 single-host profile measurement showed
+  put-heavy lift from ~18 k op/s to 36 324 op/s and mixed lift from
+  ~28 k op/s to 47 933 op/s. Throughout this ADR, read every
+  occurrence of "redb" / "redb txn" / "redb commit" in the
+  composition context as "the persistent composition backend"
+  (currently fjall, ADR-022 §"Rev-2 amendment"). The trait, the
+  encoding, the I-CP1 / I-CP6 invariants, the
+  metric surface, and the namespace/multipart memory placement
+  (§D11) are unchanged. The write-behind amendment below is
+  retained for archaeology only — its overlay/drainer/fsync
+  triple is replaced by fjall's native memtable + `PersistMode`
+  knob.
 
 ## Write-behind amendment (rev 3, 2026-05-05)
 

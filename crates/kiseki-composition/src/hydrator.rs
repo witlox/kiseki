@@ -4,7 +4,7 @@
 //! replicated delta log. The hydrator polls the log for new `Create`,
 //! `Update`, and `Delete` deltas, decodes the payload, and applies
 //! the resulting state changes through `CompositionStorage::apply_hydration_batch`
-//! (a single redb transaction per poll — atomic under crash, I-CP1).
+//! (a single atomic backend batch per poll — atomic under crash, I-CP1).
 //!
 //! Per ADR-040 §D5.1 + I-CP6, each delta has one of three outcomes:
 //!
@@ -22,7 +22,7 @@
 //!     and emit `kiseki_composition_hydrator_stalled = 1`.
 //!
 //! The retry counter is durable — persisted alongside `last_applied_seq`
-//! in the same redb transaction (I-1 / N-1 closure) — so a crash-loop
+//! in the same backend batch (I-1 / N-1 closure) — so a crash-loop
 //! accumulates retries reliably and the alarm fires after the threshold
 //! regardless of process restarts.
 //!
@@ -33,7 +33,7 @@
 //! emits one throttled `tracing::error!`, sets
 //! `kiseki_composition_hydrator_stalled = 1`, stops polling. Existing
 //! reads still serve from the persistent store. Recovery is operator-
-//! driven (drop the metadata redb + restart).
+//! driven (wipe the metadata directory + restart).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,7 +53,7 @@ use kiseki_common::ids::NamespaceId;
 /// In-progress staging state for a single poll's batch. Lets staging
 /// functions see the effects of earlier deltas in the same batch
 /// (e.g. Update of a comp that was Created earlier in the same poll
-/// — the Update needs to see the staged Create, not the empty redb).
+/// — the Update needs to see the staged Create, not the empty store).
 #[derive(Default)]
 struct Staging {
     /// `comp_id` → composition value, keyed for in-batch lookup.
@@ -140,7 +140,7 @@ fn read_transient_retry_threshold() -> u32 {
 pub struct CompositionHydrator {
     compositions: Arc<CompositionStore>,
     /// Cache of the durable `last_applied_seq` so most polls don't
-    /// pay a redb read for the meta key. Refreshed on apply.
+    /// pay a backend read for the meta key. Refreshed on apply.
     last_applied_cache: SequenceNumber,
     /// Cache of the durable halt flag so a halted hydrator skips the
     /// poll without acquiring the storage lock.
@@ -229,13 +229,13 @@ impl CompositionHydrator {
             tracing::error!(
                 shard = %shard_id.0,
                 last_applied = self.last_applied_cache.0,
-                "composition hydrator: halted (compaction outran us); operator must drop metadata redb + restart",
+                "composition hydrator: halted (compaction outran us); operator must wipe metadata directory + restart",
             );
             return 0;
         }
 
         let from = SequenceNumber(self.last_applied_cache.0.saturating_add(1));
-        // Bounded batch to keep redb txn duration reasonable.
+        // Bounded batch to keep backend commit duration reasonable.
         let to = SequenceNumber(from.0.saturating_add(999));
 
         let deltas = match log
@@ -386,9 +386,9 @@ impl CompositionHydrator {
             halted: None,
         };
 
-        // §D10: time the atomic redb commit, labeled by shard. The
-        // PersistentRedbStorage layer separately tracks commit errors
-        // (redb_commit_errors_total) so we don't need to here.
+        // §D10: time the atomic backend commit, labeled by shard. The
+        // storage backend separately tracks commit errors
+        // (`store_commit_errors_total`) so we don't need to here.
         let timer = self.metrics.as_ref().map(|m| {
             m.hydrator_apply_duration
                 .with_label_values(&[&shard_id.0.to_string()])
@@ -397,8 +397,8 @@ impl CompositionHydrator {
         let apply_result = store.with_storage_locked(|s| s.apply_hydration_batch(batch));
         drop(timer); // Stop the histogram timer before logging.
         if let Err(e) = apply_result {
-            // Commit failed (disk full, redb commit error, etc.). Don't
-            // advance the cache; next poll retries. The redb commit
+            // Commit failed (disk full, backend I/O error, etc.). Don't
+            // advance the cache; next poll retries. The store commit
             // error counter was already incremented by the storage
             // layer's record_commit_error helper.
             tracing::warn!(error=%e, "composition hydrator: apply batch failed");

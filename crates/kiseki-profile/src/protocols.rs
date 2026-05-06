@@ -1003,7 +1003,7 @@ impl Driver for NativeDriver {
 // In-process gateway WITH the persistent stores (the "transport-tax floor")
 // ---------------------------------------------------------------------------
 
-/// Same gateway shape `kiseki-server` runs (redb-backed
+/// Same gateway shape `kiseki-server` runs (fjall-backed
 /// `CompositionStore`, raw-block `PersistentChunkStore` with
 /// group-commit fsync), but called directly in this process — no
 /// gRPC, no h2, no tonic. The gap between this driver's throughput
@@ -1014,15 +1014,15 @@ impl Driver for NativeDriver {
 /// `kiseki-server` also runs Raft + view store + workflow table +
 /// metrics histograms; we deliberately omit those because they're
 /// orthogonal to the per-write cost we're trying to bound. With
-/// the listed bits in place a single PUT exercises the same redb
+/// the listed bits in place a single PUT exercises the same fjall
 /// commit + chunk device write + group-commit fsync pipeline the
 /// production server pays.
 pub struct InProcessPersistentDriver {
     gateway: kiseki_gateway::mem_gateway::InMemoryGateway,
     namespace_id: NamespaceId,
     tenant_id: OrgId,
-    /// Tempdir owning the redb files + raw block device. Drops at
-    /// the end of the run.
+    /// Tempdir owning the composition keyspace + raw block device.
+    /// Drops at the end of the run.
     _data_dir: tempfile::TempDir,
 }
 
@@ -1056,28 +1056,35 @@ impl InProcessPersistentDriver {
         chunks.set_sync_per_write(false);
         let chunks_async = kiseki_chunk::arc_async(chunks);
 
-        // 2. Persistent composition store — redb-backed, with the
-        //    same write-behind queue config the runtime uses by
-        //    default (KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100).
+        // 2. Persistent composition store — fjall-backed, with the
+        //    same eventual-durability + periodic flush model the
+        //    runtime uses by default (KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100).
         std::fs::create_dir_all(dir.join("metadata"))
             .map_err(|e| format!("metadata dir: {e}"))?;
-        let comp_path = dir.join("metadata").join("compositions.redb");
+        let comp_path = dir.join("metadata").join("compositions");
         let interval_ms = std::env::var("KISEKI_COMPOSITION_FLUSH_INTERVAL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(100);
-        let mut comp_store_redb =
-            kiseki_composition::persistent::PersistentRedbStorage::open(&comp_path)
-                .map_err(|e| format!("composition redb open: {e}"))?
+        let comp_store_fjall =
+            kiseki_composition::persistent::FjallStorage::open(&comp_path)
+                .map_err(|e| format!("composition fjall open: {e}"))?
                 .with_eventual_durability(true);
-        let drainer = comp_store_redb.enable_write_behind(
-            4096,
-            std::time::Duration::from_millis(interval_ms),
-            1024,
-        );
-        tokio::spawn(drainer.run());
+        let flusher = comp_store_fjall.flusher();
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if flusher.flush().is_err() {
+                    // Profile harness — log-and-continue, not load-bearing.
+                    break;
+                }
+            }
+        });
         let comp_storage: Box<dyn kiseki_composition::persistent::CompositionStorage> =
-            Box::new(comp_store_redb);
+            Box::new(comp_store_fjall);
         let compositions = CompositionStore::with_storage(comp_storage);
 
         // 3. Single-tenant namespace registration so PUT/GET have

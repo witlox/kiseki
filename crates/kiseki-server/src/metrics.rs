@@ -157,10 +157,10 @@ pub struct KisekiMetrics {
     pub gateway_retry: std::sync::Arc<kiseki_gateway::metrics::GatewayRetryMetrics>,
 
     // --- Composition persistent store + hydrator (ADR-040 §D10) ---
-    /// 11 metrics covering redb size, LRU hit/miss/evict, hydrator
-    /// apply duration, last-applied-seq per shard, skip counter,
-    /// halt flag, decode and commit error counters. Cloned into
-    /// `PersistentRedbStorage::with_metrics()` and
+    /// Metrics covering store on-disk size, hydrator apply duration,
+    /// last-applied-seq per shard, skip counter, halt flag, decode
+    /// and commit error counters. Cloned into the active
+    /// `CompositionStorage` backend (`with_metrics()`) and into
     /// `CompositionHydrator::with_metrics()` at runtime construction.
     pub composition: std::sync::Arc<kiseki_composition::metrics::CompositionMetrics>,
 

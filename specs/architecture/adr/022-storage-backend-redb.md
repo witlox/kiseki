@@ -1,7 +1,7 @@
-# ADR-022: Storage Backend — redb (Pure Rust)
+# ADR-022: Storage Backend — redb (Pure Rust) + fjall on the Composition Hot Path
 
-**Status**: Accepted.
-**Date**: 2026-04-20.
+**Status**: Accepted (rev-2 amendment 2026-05-06).
+**Date**: 2026-04-20 (rev-1 — redb), 2026-05-06 (rev-2 — fjall on composition).
 **Deciders**: Architect + implementer.
 
 ## Context
@@ -103,17 +103,107 @@ Raft log append + metadata lookup.
 
 ## Consequences
 
-- No LSM-tree compaction complexity
+- No LSM-tree compaction complexity (rev-1: when redb is the only backend; rev-2 carries an LSM on the composition path)
 - No C++ build toolchain required
 - Chunk blobs as files: simple, inspectable, compatible with RDMA
-- redb's COW B-tree has higher read amplification than LSM for
-  range scans — acceptable for our workload (point lookups + append)
-- If redb proves insufficient for high-throughput Raft log append,
-  migrate to fjall (LSM, same API pattern)
+- redb's COW B-tree has higher write amplification than LSM for
+  high-frequency point writes — see rev-2 amendment below
+
+## Rev-2 amendment (2026-05-06) — fjall on the composition hot path
+
+The escape clause "if redb proves insufficient … migrate to fjall"
+fired. The composition store is the highest-throughput metadata
+write path in Kiseki — every PUT lands one composition row + one
+name-binding row, and the gateway exercises it at every write
+amplification level (S3 PUT, NFSv4 CREATE, FUSE write-through).
+
+### Trigger
+
+The 2026-05-05 perf spike pinned redb's per-write commit cost as
+the bottleneck on the persistent composition path. Even after the
+ADR-040 rev-3 write-behind queue moved the txn off the gateway hot
+path, the drainer thread itself bottlenecked at ~18 k op/s PUT in
+the `kiseki-profile` `in-process-persistent` driver — the floor
+that bounds every wire protocol the production gateway runs.
+
+### Decision
+
+Replace `PersistentRedbStorage` (and the rev-3 write-behind queue
+layered on top of it) with `FjallStorage` on the
+`kiseki-composition` `CompositionStorage` trait. Wire format
+unchanged — postcard-encoded `Composition` values, 16-byte
+`(ns_id, name)` keys for the name index — moved to a shared
+`persistent::encoding` module so a future swap doesn't reserialize
+rows.
+
+The fjall keyspace ships **four columns** (one LSM-tree each):
+`comps`, `names`, `names_rev`, `meta`. Atomic batches commit
+across all four (cross-keyspace atomicity is fjall's contract),
+preserving I-CP1.
+
+Durability model maps 1:1 onto the existing knobs:
+
+| redb (rev-1)                            | fjall (rev-2)                                          |
+|----------------------------------------- |--------------------------------------------------------|
+| `Durability::Immediate` (per-write fsync)| `PersistMode::SyncAll` (per-write fsync)               |
+| `with_eventual_durability(true)`         | `PersistMode::Buffer` + periodic flush task            |
+| `RedbFlusher` for `fsync_pending` hook   | `FjallFlusher` for `fsync_pending` hook                |
+| Write-behind drainer (rev-3 queue)       | Native LSM memtable + WAL append (no extra queue)      |
+
+The write-behind queue is **deleted** — fjall's memtable is what
+the queue was emulating. POSIX `fsync(2)` semantics preserved via
+the same `gateway.fsync_pending()` hook chain documented in
+`docs/operations/durability.md`.
+
+### Measurement (2026-05-06, single-host, 16-way concurrency, 64 KiB objects)
+
+| shape       | redb baseline (rev-1+rev-3) | fjall (rev-2)        | factor |
+|-------------|----------------------------|----------------------|--------|
+| put-heavy   | ~18 000 op/s, p99 ~ 5 ms   | 36 324 op/s, p99 1.1 ms | **2.0×** |
+| get-heavy   | ~150 000 op/s              | 194 262 op/s, p99 0.5 ms | 1.3×   |
+| mixed 70/30 | ~28 000 op/s               | 47 933 op/s, p99 1.1 ms | 1.7×   |
+
+The 2× PUT lift is exactly the bottleneck the rev-3 write-behind
+queue was failing to remove. p99 latency improved alongside
+throughput because the LSM doesn't pay redb's freed-pages
+processing on every commit.
+
+### Scope of the swap (what stayed on redb)
+
+Only the `kiseki-composition` persistent path moved.
+
+- **Raft log store** (`kiseki-raft`'s `RedbLogStore`): stayed on
+  redb. Append-mostly workload + snapshot-driven log truncation
+  fits redb's COW B-tree well; no measured throughput pressure
+  yet.
+- **View store** (`kiseki-view`'s `PersistentRedbStorage`):
+  stayed on redb. Watermark checkpoints are low-frequency;
+  migration would cost more than it returns.
+- **Key manager** (`kiseki-keymanager`'s `PersistentKeyStore`),
+  **small object store** (`kiseki-chunk`'s `SmallObjectStore`),
+  **tuning store** (`kiseki-server`'s `RedbTuningStore`): all
+  low-frequency; stay on redb.
+
+A future spike that finds Raft log append capped at the rev-1
+floor will reopen this for the log path; the same encoding-module
+pattern is in place to make that swap mechanical.
+
+### Rollback path (pre-production stance)
+
+No on-disk migration tool ships — the project is pre-1.0 and
+operators wipe + re-replicate from Raft if they need to roll
+back. `git revert` on the rev-2 commits is the supported path
+(redb implementation is in git history, ~1 354 LOC for
+`PersistentRedbStorage` + 636 LOC for the write-behind queue).
 
 ## References
 
 - redb: https://github.com/cberner/redb
+- fjall: https://github.com/fjall-rs/fjall
 - RFC 1813 §3: NFS3 procedure semantics
 - build-phases.md Phase 3: "SSTable" storage (now redb B-tree)
 - ADR-029: Raw Block Device Allocator (chunk data I/O)
+- ADR-040: Persistent metadata stores (composition + view)
+- `docs/operations/durability.md`: per-knob loss windows
+- 2026-05-05 perf-spike findings: project memory
+  `project_2026_05_05_perf_findings.md`
