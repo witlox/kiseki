@@ -41,7 +41,6 @@ use std::sync::Arc;
 use kiseki_common::ids::{CompositionId, SequenceNumber, ShardId};
 use kiseki_log::delta::OperationType;
 use kiseki_log::traits::{LogOps, ReadDeltasRequest};
-use parking_lot::Mutex;
 
 use crate::composition::{
     decode_composition_create_payload_named, decode_composition_delete_payload,
@@ -90,7 +89,7 @@ impl Staging {
         if let Some(comp) = self.puts.get(&id) {
             return Some(comp.clone());
         }
-        store.storage().get(id).ok().flatten()
+        store.with_storage_locked(|s| s.get(id).ok().flatten())
     }
 
     fn put(&mut self, comp: Composition) {
@@ -139,12 +138,12 @@ fn read_transient_retry_threshold() -> u32 {
 /// Polls the Raft delta log and applies composition-create / update /
 /// delete records to a follower's local persistent store.
 pub struct CompositionHydrator {
-    compositions: Arc<Mutex<CompositionStore>>,
+    compositions: Arc<CompositionStore>,
     /// Cache of the durable `last_applied_seq` so most polls don't
     /// pay a redb read for the meta key. Refreshed on apply.
     last_applied_cache: SequenceNumber,
     /// Cache of the durable halt flag so a halted hydrator skips the
-    /// poll without acquiring the outer Mutex.
+    /// poll without acquiring the storage lock.
     halted_cache: bool,
     transient_retry_threshold: u32,
     /// §D10 metrics surface. Optional so unit tests get no-op behavior.
@@ -158,21 +157,15 @@ impl CompositionHydrator {
     /// installations performed here are immediately visible to
     /// subsequent gateway reads. Reads `last_applied_seq` and `halted`
     /// from the durable store synchronously to seed the in-memory
-    /// caches; if the store can't be read at construction time
-    /// (very unlikely), defaults to seq=0 / halted=false and the
-    /// next poll re-checks.
+    /// caches.
     #[must_use]
-    pub fn new(compositions: Arc<Mutex<CompositionStore>>) -> Self {
-        let (last_applied_cache, halted_cache) = if let Some(guard) = compositions.try_lock() {
-            let last = guard
-                .storage()
-                .last_applied_seq()
-                .unwrap_or(SequenceNumber(0));
-            let halted = guard.storage().halted().unwrap_or(false);
-            (last, halted)
-        } else {
-            (SequenceNumber(0), false)
-        };
+    pub fn new(compositions: Arc<CompositionStore>) -> Self {
+        let (last_applied_cache, halted_cache) = compositions.with_storage_locked(|s| {
+            (
+                s.last_applied_seq().unwrap_or(SequenceNumber(0)),
+                s.halted().unwrap_or(false),
+            )
+        });
         Self {
             compositions,
             last_applied_cache,
@@ -281,9 +274,10 @@ impl CompositionHydrator {
             "composition hydrator: read deltas",
         );
 
-        let mut store = self.compositions.lock();
+        let store: &CompositionStore = self.compositions.as_ref();
 
-        let prior_stuck_state = store.storage().stuck_state().ok().flatten();
+        let prior_stuck_state =
+            store.with_storage_locked(|s| s.stuck_state().ok().flatten());
 
         let mut staging = Staging::default();
         let mut last_applied_in_batch = self.last_applied_cache;
@@ -400,7 +394,7 @@ impl CompositionHydrator {
                 .with_label_values(&[&shard_id.0.to_string()])
                 .start_timer()
         });
-        let apply_result = store.storage_mut().apply_hydration_batch(batch);
+        let apply_result = store.with_storage_locked(|s| s.apply_hydration_batch(batch));
         drop(timer); // Stop the histogram timer before logging.
         if let Err(e) = apply_result {
             // Commit failed (disk full, redb commit error, etc.). Don't
@@ -444,7 +438,6 @@ impl CompositionHydrator {
             "composition hydrator: gap detected — log compaction outran us; entering halt mode",
         );
         // Persist halt flag so subsequent restarts also short-circuit.
-        let mut store = self.compositions.lock();
         let batch = HydrationBatch {
             puts: Vec::new(),
             removes: Vec::new(),
@@ -454,7 +447,9 @@ impl CompositionHydrator {
             stuck_state: None,
             halted: Some(true),
         };
-        let _ = store.storage_mut().apply_hydration_batch(batch);
+        let _ = self
+            .compositions
+            .with_storage_locked(|s| s.apply_hydration_batch(batch));
         self.halted_cache = true;
         if let Some(ref m) = self.metrics {
             m.hydrator_stalled.set(1);
@@ -578,7 +573,7 @@ fn stage_delete(
     // unbinds atomically with the composition row. Without this, a
     // GET-by-key after the delete would still resolve to a vanished
     // composition_id until the next compaction.
-    if let Ok(Some((ns, name))) = store.storage().name_for(comp_id) {
+    if let Ok(Some((ns, name))) = store.with_storage_locked(|s| s.name_for(comp_id)) {
         staging.unbind_name(ns, name);
     }
     staging.remove(comp_id);
@@ -611,8 +606,8 @@ mod tests {
     use kiseki_log::traits::{AppendDeltaRequest, LogOps};
     use kiseki_log::MemShardStore;
 
-    fn fresh_store_with_default_ns() -> Arc<Mutex<CompositionStore>> {
-        let mut store = CompositionStore::new();
+    fn fresh_store_with_default_ns() -> Arc<CompositionStore> {
+        let store = CompositionStore::new();
         let bootstrap_tenant = OrgId(uuid::Uuid::from_u128(1));
         let bootstrap_ns = NamespaceId(uuid::Uuid::from_u128(2));
         let bootstrap_shard = ShardId(uuid::Uuid::from_u128(1));
@@ -624,7 +619,7 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
         });
-        Arc::new(Mutex::new(store))
+        Arc::new(store)
     }
 
     fn now_timestamp() -> kiseki_common::time::DeltaTimestamp {
@@ -694,7 +689,7 @@ mod tests {
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
         assert_eq!(hydrator.poll(&log, shard_id).await, 1);
 
-        let s = store.lock();
+        let s = store.as_ref();
         let got = s.get(comp_id).unwrap();
         assert_eq!(got.namespace_id, ns_id);
         assert_eq!(got.size, 1024);
@@ -714,7 +709,7 @@ mod tests {
         assert_eq!(hydrator.poll(&log, shard_id).await, 1);
         assert_eq!(hydrator.poll(&log, shard_id).await, 0);
         assert_eq!(hydrator.poll(&log, shard_id).await, 0);
-        assert_eq!(store.lock().count().unwrap(), 1);
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -765,7 +760,7 @@ mod tests {
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
         assert_eq!(hydrator.poll(&log, shard_id).await, 2);
 
-        let s = store.lock();
+        let s = store.as_ref();
         let got = s.get(comp_id).unwrap();
         assert_eq!(got.chunks, vec![chunk_b, chunk_c]);
         assert_eq!(got.size, 250);
@@ -798,7 +793,7 @@ mod tests {
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
         assert_eq!(hydrator.poll(&log, shard_id).await, 2);
 
-        let s = store.lock();
+        let s = store.as_ref();
         assert!(s.get(comp_id).is_err(), "Delete should remove composition");
 
         // Phase 17 N-1 closure: a fresh hydrator reads `last_applied_seq`
@@ -820,7 +815,7 @@ mod tests {
         std::env::set_var("KISEKI_HYDRATOR_TRANSIENT_RETRIES", "3");
 
         // Fresh store with NO namespace registered.
-        let store = Arc::new(Mutex::new(CompositionStore::new()));
+        let store = Arc::new(CompositionStore::new());
         let (log, shard_id) = fresh_log();
 
         // Create against an unregistered namespace.
@@ -839,19 +834,21 @@ mod tests {
         // counter accumulates.
         for expected in 1..=2 {
             assert_eq!(hydrator.poll(&log, shard_id).await, 0);
-            let s = store.lock();
-            assert_eq!(s.storage().last_applied_seq().unwrap().0, 0);
-            assert_eq!(
-                s.storage().stuck_state().unwrap(),
-                Some((SequenceNumber(1), expected))
-            );
+            store.with_storage_locked(|s| {
+                assert_eq!(s.last_applied_seq().unwrap().0, 0);
+                assert_eq!(
+                    s.stuck_state().unwrap(),
+                    Some((SequenceNumber(1), expected))
+                );
+            });
         }
         // Third poll: hits threshold (3) → promote to permanent skip,
         // advance past, clear stuck.
         assert_eq!(hydrator.poll(&log, shard_id).await, 0);
-        let s = store.lock();
-        assert_eq!(s.storage().last_applied_seq().unwrap().0, 1);
-        assert_eq!(s.storage().stuck_state().unwrap(), None);
+        store.with_storage_locked(|s| {
+            assert_eq!(s.last_applied_seq().unwrap().0, 1);
+            assert_eq!(s.stuck_state().unwrap(), None);
+        });
 
         // Cleanup the env var so other tests aren't affected.
         std::env::remove_var("KISEKI_HYDRATOR_TRANSIENT_RETRIES");
@@ -1034,8 +1031,7 @@ mod tests {
 
         // Halt is durable — re-reading the storage's flag confirms
         // it persisted (I-CP5).
-        let s = store.lock();
-        assert!(s.storage().halted().unwrap());
+        assert!(store.with_storage_locked(|s| s.halted().unwrap()));
     }
 
     #[tokio::test]
@@ -1065,16 +1061,17 @@ mod tests {
         let store = fresh_store_with_default_ns();
         // Move last_applied to 5 first.
         {
-            let mut s = store.lock();
-            s.storage_mut()
-                .apply_hydration_batch(HydrationBatch {
-                    puts: Vec::new(),
-                    removes: Vec::new(),
-                    name_inserts: Vec::new(),
-                    name_removes: Vec::new(),
-                    new_last_applied_seq: kiseki_common::ids::SequenceNumber(5),
-                    stuck_state: Some(None),
-                    halted: None,
+            store
+                .with_storage_locked(|s| {
+                    s.apply_hydration_batch(HydrationBatch {
+                        puts: Vec::new(),
+                        removes: Vec::new(),
+                        name_inserts: Vec::new(),
+                        name_removes: Vec::new(),
+                        new_last_applied_seq: kiseki_common::ids::SequenceNumber(5),
+                        stuck_state: Some(None),
+                        halted: None,
+                    })
                 })
                 .unwrap();
         }
@@ -1131,7 +1128,7 @@ mod tests {
 
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
         hydrator.poll(&log, shard_id).await;
-        let v = store.lock().get(comp_id).unwrap().version;
+        let v = store.get(comp_id).unwrap().version;
         assert_eq!(v, 2, "version should bump exactly once for two ops");
     }
 }

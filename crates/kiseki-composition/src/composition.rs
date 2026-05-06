@@ -293,10 +293,16 @@ pub enum DeleteResult {
 /// Log emission (Raft consensus) is handled by the gateway after
 /// releasing the composition lock, avoiding lock-across-await
 /// serialization (ADR-032).
+///
+/// **B1 (2026-05-06):** all writes take `&self`. Concurrent callers
+/// no longer need an outer `Arc<Mutex<CompositionStore>>` — the
+/// `CompositionStore` holds its own short-lived locks per field
+/// (storage, namespaces, multiparts), so two writers operating on
+/// disjoint state run in parallel.
 pub trait CompositionOps {
     /// Create a new composition in a namespace.
     fn create(
-        &mut self,
+        &self,
         namespace_id: NamespaceId,
         chunks: Vec<ChunkId>,
         size: u64,
@@ -309,26 +315,26 @@ pub trait CompositionOps {
 
     /// Delete a composition. Returns `DeleteMarker` if versioning is
     /// enabled on the namespace.
-    fn delete(&mut self, id: CompositionId) -> Result<DeleteResult, CompositionError>;
+    fn delete(&self, id: CompositionId) -> Result<DeleteResult, CompositionError>;
 
     /// Rename a composition. Returns `CrossShardRename` if source and
     /// target are on different shards (I-L8).
     fn rename(
-        &mut self,
+        &self,
         id: CompositionId,
         target_namespace: NamespaceId,
     ) -> Result<(), CompositionError>;
 
     /// Update a composition — creates a new version with new chunk refs.
     fn update(
-        &mut self,
+        &self,
         id: CompositionId,
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<u64, CompositionError>;
 
     /// Start a multipart upload.
-    fn start_multipart(&mut self, namespace_id: NamespaceId) -> Result<String, CompositionError>;
+    fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, CompositionError>;
 
     /// Upload a single part of a multipart upload. `was_new` is the
     /// `is_new` bool returned by the chunk store's `write_chunk` —
@@ -337,7 +343,7 @@ pub trait CompositionOps {
     /// the `new_chunks` list for the Raft Create-delta so followers'
     /// `cluster_chunk_state` is seeded for cross-node fabric reads.
     fn upload_part(
-        &mut self,
+        &self,
         upload_id: &str,
         part_number: u32,
         chunk_id: ChunkId,
@@ -346,10 +352,10 @@ pub trait CompositionOps {
     ) -> Result<(), CompositionError>;
 
     /// Abort a multipart upload — marks parts for GC.
-    fn abort_multipart(&mut self, upload_id: &str) -> Result<(), CompositionError>;
+    fn abort_multipart(&self, upload_id: &str) -> Result<(), CompositionError>;
 
     /// Finalize a multipart upload — makes the composition visible (I-L5).
-    fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError>;
+    fn finalize_multipart(&self, upload_id: &str) -> Result<CompositionId, CompositionError>;
 }
 
 /// Composition store — wraps a `CompositionStorage` backend.
@@ -367,11 +373,18 @@ pub trait CompositionOps {
 ///     dropped redb transaction). All call sites accept this since
 ///     `Composition` is `Clone` and the field accesses they perform
 ///     work uniformly on owned + borrowed values.
+/// Composition store. **B1 (2026-05-06):** all public methods take
+/// `&self`; per-field locks (storage in `Mutex`, namespaces in
+/// `RwLock`, multiparts in `Mutex`) so concurrent writers operating
+/// on disjoint state proceed in parallel. The previous outer
+/// `Arc<Mutex<CompositionStore>>` in mem_gateway / hydrator is
+/// replaced with `Arc<CompositionStore>` — the lock convoy that
+/// regressed PUT throughput at concurrency ≥ 8 is gone.
 pub struct CompositionStore {
-    storage: Box<dyn crate::persistent::CompositionStorage>,
-    namespaces: HashMap<NamespaceId, Namespace>,
-    multiparts: HashMap<String, (MultipartUpload, NamespaceId)>,
-    log: Option<Arc<dyn LogOps + Send + Sync>>,
+    storage: parking_lot::Mutex<Box<dyn crate::persistent::CompositionStorage>>,
+    namespaces: parking_lot::RwLock<HashMap<NamespaceId, Namespace>>,
+    multiparts: parking_lot::Mutex<HashMap<String, (MultipartUpload, NamespaceId)>>,
+    log: parking_lot::RwLock<Option<Arc<dyn LogOps + Send + Sync>>>,
 }
 
 impl CompositionStore {
@@ -386,60 +399,71 @@ impl CompositionStore {
     #[must_use]
     pub fn with_storage(storage: Box<dyn crate::persistent::CompositionStorage>) -> Self {
         Self {
-            storage,
-            namespaces: HashMap::new(),
-            multiparts: HashMap::new(),
-            log: None,
+            storage: parking_lot::Mutex::new(storage),
+            namespaces: parking_lot::RwLock::new(HashMap::new()),
+            multiparts: parking_lot::Mutex::new(HashMap::new()),
+            log: parking_lot::RwLock::new(None),
         }
     }
 
-    /// Borrow the storage backend (used by the hydrator for atomic
-    /// `apply_hydration_batch` and direct meta-state reads).
-    #[must_use]
-    pub fn storage(&self) -> &dyn crate::persistent::CompositionStorage {
-        self.storage.as_ref()
+    /// Run a closure with the storage backend held under the
+    /// per-store storage `Mutex`. The hydrator uses this for
+    /// `apply_hydration_batch` (the only caller that needs typed
+    /// access to the storage handle).
+    pub fn with_storage_locked<R>(
+        &self,
+        f: impl FnOnce(&mut dyn crate::persistent::CompositionStorage) -> R,
+    ) -> R {
+        let mut guard = self.storage.lock();
+        f(&mut **guard)
     }
 
-    /// Borrow the storage backend mutably (hydrator's batch-apply
-    /// path needs `&mut self` on the trait method).
-    pub fn storage_mut(&mut self) -> &mut dyn crate::persistent::CompositionStorage {
-        self.storage.as_mut()
+    /// Attach a log store for delta emission. `&self` so callers can
+    /// install the log on a `CompositionStore` shared via `Arc`
+    /// (the post-B1 gateway shape).
+    pub fn install_log(&self, log: Arc<dyn LogOps + Send + Sync>) {
+        *self.log.write() = Some(log);
     }
 
-    /// Attach a log store for delta emission.
+    /// Builder-style log attachment for callers that still own the
+    /// store by value (tests, single-threaded setup).
     #[must_use]
-    pub fn with_log(mut self, log: Arc<dyn LogOps + Send + Sync>) -> Self {
-        self.log = Some(log);
+    pub fn with_log(self, log: Arc<dyn LogOps + Send + Sync>) -> Self {
+        *self.log.write() = Some(log);
         self
     }
 
-    /// Get the attached log store (if any).
+    /// Get a clone of the attached log store (if any). Returns owned
+    /// because callers route the log through `Arc::clone` anyway and
+    /// holding a reference would force the read-lock guard to live
+    /// across `.await`.
     #[must_use]
-    pub fn log(&self) -> Option<&Arc<dyn LogOps + Send + Sync>> {
-        self.log.as_ref()
+    pub fn log(&self) -> Option<Arc<dyn LogOps + Send + Sync>> {
+        self.log.read().clone()
     }
 
     /// Register a namespace.
-    pub fn add_namespace(&mut self, ns: Namespace) {
-        self.namespaces.insert(ns.id, ns);
+    pub fn add_namespace(&self, ns: Namespace) {
+        self.namespaces.write().insert(ns.id, ns);
     }
 
     /// Remove a namespace registration. Used by `ensure_namespace_exists`
     /// to roll back after a Raft replication failure (ADR-040 Phase 18).
     /// Returns the removed namespace if it was registered.
-    pub fn remove_namespace(&mut self, id: NamespaceId) -> Option<Namespace> {
-        self.namespaces.remove(&id)
+    pub fn remove_namespace(&self, id: NamespaceId) -> Option<Namespace> {
+        self.namespaces.write().remove(&id)
     }
 
     /// Clear all namespace registrations (gateway crash simulation).
-    pub fn clear_namespaces(&mut self) {
-        self.namespaces.clear();
+    pub fn clear_namespaces(&self) {
+        self.namespaces.write().clear();
     }
 
-    /// Get a namespace.
+    /// Get a namespace, returning an owned clone (so the read-lock
+    /// guard doesn't leak to callers).
     #[must_use]
-    pub fn namespace(&self, id: NamespaceId) -> Option<&Namespace> {
-        self.namespaces.get(&id)
+    pub fn namespace(&self, id: NamespaceId) -> Option<Namespace> {
+        self.namespaces.read().get(&id).cloned()
     }
 
     /// Total composition count.
@@ -449,7 +473,7 @@ impl CompositionStore {
     /// Returns `CompositionError::Storage` if the storage backend
     /// fails (rare; only persistent backends fail this).
     pub fn count(&self) -> Result<u64, CompositionError> {
-        Ok(self.storage.count()?)
+        Ok(self.storage.lock().count()?)
     }
 
     /// List all compositions in a namespace. Returns owned
@@ -463,7 +487,7 @@ impl CompositionStore {
         &self,
         ns_id: NamespaceId,
     ) -> Result<Vec<Composition>, CompositionError> {
-        Ok(self.storage.list_in_namespace(ns_id)?)
+        Ok(self.storage.lock().list_in_namespace(ns_id)?)
     }
 
     /// Attach a Content-Type to an existing composition (RFC 6838
@@ -477,16 +501,16 @@ impl CompositionStore {
     /// not in the store; `CompositionError::Storage` on backend
     /// failure.
     pub fn set_content_type(
-        &mut self,
+        &self,
         id: CompositionId,
         content_type: Option<String>,
     ) -> Result<(), CompositionError> {
-        let mut comp = self
-            .storage
+        let mut storage = self.storage.lock();
+        let mut comp = storage
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.content_type = content_type;
-        self.storage.put(comp)?;
+        storage.put(comp)?;
         Ok(())
     }
 
@@ -505,32 +529,38 @@ impl CompositionStore {
     /// namespace is registered at server startup; tenant-specific
     /// namespaces would need their own replication path).
     pub fn create_at(
-        &mut self,
+        &self,
         comp_id: CompositionId,
         namespace_id: NamespaceId,
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<(), CompositionError> {
-        if self.storage.get(comp_id)?.is_some() {
+        // Snapshot namespace metadata under the namespaces read lock
+        // (does NOT hold across the storage write below — the
+        // storage Mutex is independent).
+        let ns_meta = self
+            .namespaces
+            .read()
+            .get(&namespace_id)
+            .map(|ns| (ns.tenant_id, ns.shard_id))
+            .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
+        let mut storage = self.storage.lock();
+        if storage.get(comp_id)?.is_some() {
             return Ok(()); // already hydrated — idempotent
         }
-        let ns = self
-            .namespaces
-            .get(&namespace_id)
-            .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
         let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
         let comp = Composition {
             id: comp_id,
-            tenant_id: ns.tenant_id,
+            tenant_id: ns_meta.0,
             namespace_id,
-            shard_id: ns.shard_id,
+            shard_id: ns_meta.1,
             chunks,
             version: 1,
             size,
             has_inline_data,
             content_type: None,
         };
-        self.storage.put(comp)?;
+        storage.put(comp)?;
         Ok(())
     }
 
@@ -551,7 +581,7 @@ impl CompositionStore {
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<Option<CompositionId>, CompositionError> {
-        Ok(self.storage.name_lookup(namespace_id, name)?)
+        Ok(self.storage.lock().name_lookup(namespace_id, name)?)
     }
 
     /// Reverse-lookup: `composition_id` → `(namespace_id, name)` if the
@@ -563,7 +593,7 @@ impl CompositionStore {
         &self,
         id: CompositionId,
     ) -> Result<Option<(NamespaceId, String)>, CompositionError> {
-        Ok(self.storage.name_for(id)?)
+        Ok(self.storage.lock().name_for(id)?)
     }
 
     /// Bind `name` to `id` in `ns`. Overwrites any existing binding;
@@ -572,12 +602,12 @@ impl CompositionStore {
     /// # Errors
     /// Returns `CompositionError::Storage` on backend failure.
     pub fn bind_name(
-        &mut self,
+        &self,
         namespace_id: NamespaceId,
         name: String,
         id: CompositionId,
     ) -> Result<(), CompositionError> {
-        Ok(self.storage.name_insert(namespace_id, name, id)?)
+        Ok(self.storage.lock().name_insert(namespace_id, name, id)?)
     }
 
     /// Unbind `name` in `ns`. Returns `true` if a binding existed.
@@ -585,11 +615,11 @@ impl CompositionStore {
     /// # Errors
     /// Returns `CompositionError::Storage` on backend failure.
     pub fn unbind_name(
-        &mut self,
+        &self,
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<bool, CompositionError> {
-        Ok(self.storage.name_remove(namespace_id, name)?)
+        Ok(self.storage.lock().name_remove(namespace_id, name)?)
     }
 
     /// Enumerate `(name, composition_id)` bindings in a namespace,
@@ -603,7 +633,7 @@ impl CompositionStore {
         namespace_id: NamespaceId,
         prefix: Option<&str>,
     ) -> Result<Vec<(String, CompositionId)>, CompositionError> {
-        Ok(self.storage.name_list(namespace_id, prefix)?)
+        Ok(self.storage.lock().name_list(namespace_id, prefix)?)
     }
 
     /// Return a snapshot of the parts uploaded for a multipart
@@ -614,6 +644,7 @@ impl CompositionStore {
     #[must_use]
     pub fn multipart_parts(&self, upload_id: &str) -> Vec<crate::multipart::MultipartPart> {
         self.multiparts
+            .lock()
             .get(upload_id)
             .map(|(u, _)| u.parts.clone())
             .unwrap_or_default()
@@ -637,13 +668,13 @@ impl CompositionStore {
     /// sequence (operator error). Both should surface, not silently
     /// swallow.
     pub fn update_at(
-        &mut self,
+        &self,
         comp_id: CompositionId,
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<(), CompositionError> {
-        let mut comp = self
-            .storage
+        let mut storage = self.storage.lock();
+        let mut comp = storage
             .get(comp_id)?
             .ok_or(CompositionError::CompositionNotFound(comp_id))?;
         if comp.chunks == chunks && comp.size == size {
@@ -654,7 +685,7 @@ impl CompositionStore {
         comp.version += 1;
         comp.has_inline_data =
             comp.chunks.is_empty() && comp.size > 0 && comp.size <= INLINE_DATA_THRESHOLD;
-        self.storage.put(comp)?;
+        storage.put(comp)?;
         Ok(())
     }
 
@@ -671,8 +702,8 @@ impl CompositionStore {
     /// # Errors
     ///
     /// Returns `CompositionError::Storage` on backend failure.
-    pub fn delete_at(&mut self, comp_id: CompositionId) -> Result<(), CompositionError> {
-        self.storage.remove(comp_id)?;
+    pub fn delete_at(&self, comp_id: CompositionId) -> Result<(), CompositionError> {
+        self.storage.lock().remove(comp_id)?;
         Ok(())
     }
 }
@@ -685,118 +716,126 @@ impl Default for CompositionStore {
 
 impl CompositionOps for CompositionStore {
     fn create(
-        &mut self,
+        &self,
         namespace_id: NamespaceId,
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<CompositionId, CompositionError> {
-        let ns = self
-            .namespaces
-            .get(&namespace_id)
-            .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
-
-        if ns.read_only {
-            return Err(CompositionError::ReadOnlyNamespace(namespace_id));
-        }
+        // Snapshot namespace metadata under the read lock without
+        // holding it across the storage write.
+        let ns_snap = {
+            let nss = self.namespaces.read();
+            let ns = nss
+                .get(&namespace_id)
+                .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
+            if ns.read_only {
+                return Err(CompositionError::ReadOnlyNamespace(namespace_id));
+            }
+            (ns.tenant_id, ns.shard_id)
+        };
 
         let id = CompositionId(uuid::Uuid::new_v4());
         let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
         let comp = Composition {
             id,
-            tenant_id: ns.tenant_id,
+            tenant_id: ns_snap.0,
             namespace_id,
-            shard_id: ns.shard_id,
+            shard_id: ns_snap.1,
             chunks,
             version: 1,
             size,
             has_inline_data,
             content_type: None,
         };
-        self.storage.put(comp)?;
+        self.storage.lock().put(comp)?;
         Ok(id)
     }
 
     fn get(&self, id: CompositionId) -> Result<Composition, CompositionError> {
         self.storage
+            .lock()
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))
     }
 
     fn update(
-        &mut self,
+        &self,
         id: CompositionId,
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<u64, CompositionError> {
-        let mut comp = self
-            .storage
+        let mut storage = self.storage.lock();
+        let mut comp = storage
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.version += 1;
         comp.chunks.clone_from(&chunks);
         comp.size = size;
         let version = comp.version;
-        self.storage.put(comp)?;
+        storage.put(comp)?;
         Ok(version)
     }
 
-    fn delete(&mut self, id: CompositionId) -> Result<DeleteResult, CompositionError> {
-        let mut comp = self
-            .storage
+    fn delete(&self, id: CompositionId) -> Result<DeleteResult, CompositionError> {
+        let versioning_enabled_for = |ns: NamespaceId| -> bool {
+            self.namespaces
+                .read()
+                .get(&ns)
+                .is_some_and(|n| n.versioning_enabled)
+        };
+        let mut storage = self.storage.lock();
+        let mut comp = storage
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
 
-        let versioning = self
-            .namespaces
-            .get(&comp.namespace_id)
-            .is_some_and(|n| n.versioning_enabled);
-
-        if versioning {
+        if versioning_enabled_for(comp.namespace_id) {
             // Versioned delete: keep all versions, just bump version as
             // a tombstone marker. Chunk refcounts are NOT decremented.
             comp.version += 1;
-            self.storage.put(comp)?;
+            storage.put(comp)?;
             Ok(DeleteResult::DeleteMarker)
         } else {
-            self.storage.remove(id)?;
+            storage.remove(id)?;
             Ok(DeleteResult::Removed(comp.chunks))
         }
     }
 
     fn rename(
-        &mut self,
+        &self,
         id: CompositionId,
         target_namespace: NamespaceId,
     ) -> Result<(), CompositionError> {
-        let mut comp = self
-            .storage
+        let target_shard = self
+            .namespaces
+            .read()
+            .get(&target_namespace)
+            .map(|n| n.shard_id)
+            .ok_or(CompositionError::NamespaceNotFound(target_namespace))?;
+
+        let mut storage = self.storage.lock();
+        let mut comp = storage
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
 
-        let target_ns = self
-            .namespaces
-            .get(&target_namespace)
-            .ok_or(CompositionError::NamespaceNotFound(target_namespace))?;
-
         // I-L8: cross-shard rename → EXDEV.
-        if comp.shard_id != target_ns.shard_id {
+        if comp.shard_id != target_shard {
             return Err(CompositionError::CrossShardRename(
                 comp.shard_id,
-                target_ns.shard_id,
+                target_shard,
             ));
         }
 
         comp.namespace_id = target_namespace;
-        self.storage.put(comp)?;
+        storage.put(comp)?;
         Ok(())
     }
 
-    fn start_multipart(&mut self, namespace_id: NamespaceId) -> Result<String, CompositionError> {
-        if !self.namespaces.contains_key(&namespace_id) {
+    fn start_multipart(&self, namespace_id: NamespaceId) -> Result<String, CompositionError> {
+        if !self.namespaces.read().contains_key(&namespace_id) {
             return Err(CompositionError::NamespaceNotFound(namespace_id));
         }
         let upload_id = uuid::Uuid::new_v4().to_string();
-        self.multiparts.insert(
+        self.multiparts.lock().insert(
             upload_id.clone(),
             (MultipartUpload::new(upload_id.clone()), namespace_id),
         );
@@ -804,15 +843,15 @@ impl CompositionOps for CompositionStore {
     }
 
     fn upload_part(
-        &mut self,
+        &self,
         upload_id: &str,
         part_number: u32,
         chunk_id: ChunkId,
         size: u64,
         was_new: bool,
     ) -> Result<(), CompositionError> {
-        let (upload, _ns_id) = self
-            .multiparts
+        let mut multiparts = self.multiparts.lock();
+        let (upload, _ns_id) = multiparts
             .get_mut(upload_id)
             .ok_or_else(|| CompositionError::MultipartNotFound(upload_id.to_owned()))?;
 
@@ -829,9 +868,9 @@ impl CompositionOps for CompositionStore {
         Ok(())
     }
 
-    fn abort_multipart(&mut self, upload_id: &str) -> Result<(), CompositionError> {
-        let (upload, _ns_id) = self
-            .multiparts
+    fn abort_multipart(&self, upload_id: &str) -> Result<(), CompositionError> {
+        let mut multiparts = self.multiparts.lock();
+        let (upload, _ns_id) = multiparts
             .get_mut(upload_id)
             .ok_or_else(|| CompositionError::MultipartNotFound(upload_id.to_owned()))?;
 
@@ -843,21 +882,26 @@ impl CompositionOps for CompositionStore {
         Ok(())
     }
 
-    fn finalize_multipart(&mut self, upload_id: &str) -> Result<CompositionId, CompositionError> {
-        let (upload, ns_id) = self
-            .multiparts
-            .get_mut(upload_id)
-            .ok_or_else(|| CompositionError::MultipartNotFound(upload_id.to_owned()))?;
+    fn finalize_multipart(&self, upload_id: &str) -> Result<CompositionId, CompositionError> {
+        // Drop the multipart-state lock before calling self.create
+        // (which takes the storage lock) to keep the critical sections
+        // disjoint.
+        let (chunks, size, ns_id) = {
+            let mut multiparts = self.multiparts.lock();
+            let (upload, ns_id) = multiparts
+                .get_mut(upload_id)
+                .ok_or_else(|| CompositionError::MultipartNotFound(upload_id.to_owned()))?;
 
-        if !upload.finalize() {
-            return Err(CompositionError::MultipartNotFinalized(
-                upload_id.to_owned(),
-            ));
-        }
+            if !upload.finalize() {
+                return Err(CompositionError::MultipartNotFinalized(
+                    upload_id.to_owned(),
+                ));
+            }
 
-        let chunks: Vec<ChunkId> = upload.parts.iter().map(|p| p.chunk_id).collect();
-        let size = upload.total_size();
-        let ns_id = *ns_id;
+            let chunks: Vec<ChunkId> = upload.parts.iter().map(|p| p.chunk_id).collect();
+            let size = upload.total_size();
+            (chunks, size, *ns_id)
+        };
 
         // Create the composition now that it's visible (I-L5).
         self.create(ns_id, chunks, size)
@@ -902,7 +946,7 @@ mod tests {
     }
 
     fn setup() -> CompositionStore {
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         store.add_namespace(make_ns(10, test_tenant(), test_shard()));
         store
     }
@@ -913,7 +957,7 @@ mod tests {
 
     #[test]
     fn create_and_get() {
-        let mut store = setup();
+        let store = setup();
         let id = store
             .create(test_ns(), vec![ChunkId([0x01; 32])], 1024)
             .unwrap();
@@ -926,7 +970,7 @@ mod tests {
 
     #[test]
     fn delete_removes_composition() {
-        let mut store = setup();
+        let store = setup();
         let id = store.create(test_ns(), vec![], 0).unwrap();
         let result = store.delete(id).unwrap();
         assert!(matches!(result, DeleteResult::Removed(_)));
@@ -935,7 +979,7 @@ mod tests {
 
     #[test]
     fn cross_shard_rename_returns_exdev() {
-        let mut store = setup();
+        let store = setup();
         store.add_namespace(make_ns(
             20,
             test_tenant(),
@@ -952,7 +996,7 @@ mod tests {
 
     #[test]
     fn same_shard_rename_succeeds() {
-        let mut store = setup();
+        let store = setup();
         store.add_namespace(make_ns(11, test_tenant(), test_shard()));
 
         let id = store.create(test_ns(), vec![], 0).unwrap();
@@ -962,7 +1006,7 @@ mod tests {
 
     #[test]
     fn read_only_namespace_rejects_create() {
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         let mut ns = make_ns(10, test_tenant(), test_shard());
         ns.read_only = true;
         store.add_namespace(ns);
@@ -976,25 +1020,31 @@ mod tests {
 
     #[test]
     fn multipart_lifecycle() {
-        let mut store = setup();
+        let store = setup();
         let upload_id = store
             .start_multipart(test_ns())
             .unwrap_or_else(|_| unreachable!());
 
-        // Add parts directly to the multipart.
-        if let Some((upload, _)) = store.multiparts.get_mut(&upload_id) {
-            upload.add_part(crate::multipart::MultipartPart {
-                part_number: 1,
-                chunk_id: ChunkId([0x01; 32]),
-                size: 512,
-                was_new: true,
-            });
-            upload.add_part(crate::multipart::MultipartPart {
-                part_number: 2,
-                chunk_id: ChunkId([0x02; 32]),
-                size: 512,
-                was_new: true,
-            });
+        // Add parts directly to the multipart. Scope the lock so it
+        // drops before `finalize_multipart` re-acquires it —
+        // `parking_lot::Mutex` is non-reentrant; holding it across
+        // the call would deadlock.
+        {
+            let mut multiparts = store.multiparts.lock();
+            if let Some((upload, _)) = multiparts.get_mut(&upload_id) {
+                upload.add_part(crate::multipart::MultipartPart {
+                    part_number: 1,
+                    chunk_id: ChunkId([0x01; 32]),
+                    size: 512,
+                    was_new: true,
+                });
+                upload.add_part(crate::multipart::MultipartPart {
+                    part_number: 2,
+                    chunk_id: ChunkId([0x02; 32]),
+                    size: 512,
+                    was_new: true,
+                });
+            }
         }
 
         let comp_id = store
@@ -1008,7 +1058,7 @@ mod tests {
 
     #[test]
     fn versioning() {
-        let mut store = setup();
+        let store = setup();
         let id = store
             .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
             .unwrap_or_else(|_| unreachable!());
@@ -1028,7 +1078,7 @@ mod tests {
 
     #[test]
     fn composition_belongs_to_one_tenant_ix1() {
-        let mut store = setup();
+        let store = setup();
         let id = store
             .create(test_ns(), vec![ChunkId([0xaa; 32])], 512)
             .unwrap_or_else(|_| unreachable!());
@@ -1041,7 +1091,7 @@ mod tests {
 
     #[test]
     fn namespace_not_found_returns_error() {
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         let bogus_ns = NamespaceId(uuid::Uuid::from_u128(999));
         let result = store.create(bogus_ns, vec![], 0);
         assert!(matches!(
@@ -1052,7 +1102,7 @@ mod tests {
 
     #[test]
     fn list_compositions_in_namespace() {
-        let mut store = setup();
+        let store = setup();
 
         let id1 = store
             .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
@@ -1075,7 +1125,7 @@ mod tests {
 
     #[test]
     fn count_tracks_compositions() {
-        let mut store = setup();
+        let store = setup();
         assert_eq!(store.count().unwrap(), 0);
 
         store
@@ -1099,7 +1149,7 @@ mod tests {
     // --- Scenario: Create a new file composition via protocol gateway ---
     #[test]
     fn create_composition_returns_chunk_ids_for_refcount() {
-        let mut store = setup();
+        let store = setup();
         let c1 = ChunkId([0x01; 32]);
         let c2 = ChunkId([0x02; 32]);
         let id = store.create(test_ns(), vec![c1, c2], 2048).unwrap();
@@ -1116,7 +1166,7 @@ mod tests {
     // --- Scenario: Create a small file with inline data ---
     #[test]
     fn create_small_file_sets_inline_data_flag() {
-        let mut store = setup();
+        let store = setup();
         // 512 bytes, no chunk IDs — data would be inline in the delta payload.
         let id = store.create(test_ns(), vec![], 512).unwrap();
         let comp = store.get(id).unwrap();
@@ -1128,7 +1178,7 @@ mod tests {
 
     #[test]
     fn create_above_threshold_not_inline() {
-        let mut store = setup();
+        let store = setup();
         // 8192 bytes with a chunk ref — not inline.
         let id = store
             .create(test_ns(), vec![ChunkId([0xaa; 32])], 8192)
@@ -1139,7 +1189,7 @@ mod tests {
 
     #[test]
     fn create_zero_size_not_inline() {
-        let mut store = setup();
+        let store = setup();
         // Empty file (size 0, no chunks) — not inline (nothing to inline).
         let id = store.create(test_ns(), vec![], 0).unwrap();
         let comp = store.get(id).unwrap();
@@ -1149,7 +1199,7 @@ mod tests {
     // --- Scenario: Append data to an existing composition ---
     #[test]
     fn append_extends_chunk_list() {
-        let mut store = setup();
+        let store = setup();
         let c1 = ChunkId([0x01; 32]);
         let c2 = ChunkId([0x02; 32]);
         let id = store
@@ -1170,7 +1220,7 @@ mod tests {
     // --- Scenario: Overwrite a byte range in a composition ---
     #[test]
     fn overwrite_replaces_chunk_in_list() {
-        let mut store = setup();
+        let store = setup();
         let c1 = ChunkId([0x01; 32]);
         let c2 = ChunkId([0x02; 32]);
         let c3 = ChunkId([0x03; 32]);
@@ -1194,7 +1244,7 @@ mod tests {
     // --- Scenario: S3 multipart upload (I-L5) ---
     #[test]
     fn multipart_not_visible_before_finalize_il5() {
-        let mut store = setup();
+        let store = setup();
         let upload_id = store.start_multipart(test_ns()).unwrap();
 
         store
@@ -1219,7 +1269,7 @@ mod tests {
     // --- Scenario: Multipart upload aborted ---
     #[test]
     fn multipart_abort_no_composition_created() {
-        let mut store = setup();
+        let store = setup();
         let upload_id = store.start_multipart(test_ns()).unwrap();
 
         store
@@ -1241,7 +1291,7 @@ mod tests {
 
     #[test]
     fn aborted_multipart_rejects_further_parts() {
-        let mut store = setup();
+        let store = setup();
         let upload_id = store.start_multipart(test_ns()).unwrap();
         store.abort_multipart(&upload_id).unwrap();
 
@@ -1252,7 +1302,7 @@ mod tests {
     // --- Scenario: Delete a composition (refcount tracking) ---
     #[test]
     fn delete_returns_chunk_ids_for_refcount_decrement() {
-        let mut store = setup();
+        let store = setup();
         let c5 = ChunkId([0x05; 32]);
         let c6 = ChunkId([0x06; 32]);
         let id = store.create(test_ns(), vec![c5, c6], 1024).unwrap();
@@ -1266,7 +1316,7 @@ mod tests {
     // --- Scenario: Delete composition with object versioning enabled ---
     #[test]
     fn versioned_delete_creates_delete_marker() {
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         let mut ns = make_ns(10, test_tenant(), test_shard());
         ns.versioning_enabled = true;
         store.add_namespace(ns);
@@ -1293,7 +1343,7 @@ mod tests {
     // --- Scenario: Intra-tenant dedup — same chunk ID yields same ref ---
     #[test]
     fn intra_tenant_dedup_same_chunk_id() {
-        let mut store = setup();
+        let store = setup();
         let chunk_abc = ChunkId([0xab; 32]); // sha256(P) = "abc"
 
         let id_a = store.create(test_ns(), vec![chunk_abc], 1024).unwrap();
@@ -1311,7 +1361,7 @@ mod tests {
     // --- Scenario: Cross-tenant dedup (default tenants) ---
     #[test]
     fn cross_tenant_dedup_same_chunk_id() {
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         let tenant_pharma = OrgId(uuid::Uuid::from_u128(100));
         let tenant_biotech = OrgId(uuid::Uuid::from_u128(200));
         store.add_namespace(make_ns(10, tenant_pharma, test_shard()));
@@ -1335,7 +1385,7 @@ mod tests {
     // --- Scenario: No cross-tenant dedup for HMAC opted-out tenant ---
     #[test]
     fn hmac_tenant_different_chunk_id_no_dedup() {
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         let tenant_defense = OrgId(uuid::Uuid::from_u128(300));
         let tenant_pharma = OrgId(uuid::Uuid::from_u128(100));
         store.add_namespace(make_ns(30, tenant_defense, test_shard()));
@@ -1409,7 +1459,7 @@ mod tests {
         // Composition creates take chunk IDs after the caller confirms
         // chunk writes. If the caller does not pass chunk IDs (simulating
         // a chunk write failure), no composition is created.
-        let mut store = setup();
+        let store = setup();
         let initial_count = store.count().unwrap();
 
         // Simulate: chunk write failed, so we never call create().
@@ -1428,7 +1478,7 @@ mod tests {
     // --- Scenario: Delta commit fails after chunk write succeeds ---
     #[test]
     fn delta_commit_failure_rollback_removes_composition() {
-        let mut store = setup();
+        let store = setup();
         let c20 = ChunkId([0x20; 32]);
         let id = store.create(test_ns(), vec![c20], 4096).unwrap();
 
@@ -1444,7 +1494,7 @@ mod tests {
     fn advisory_hint_does_not_affect_create_correctness() {
         // Advisory hints are pass-through — composition operations succeed
         // identically with or without them (I-WA1).
-        let mut store = setup();
+        let store = setup();
         let chunks = vec![ChunkId([0xcc; 32])];
 
         // Create without any advisory context.
@@ -1461,7 +1511,7 @@ mod tests {
     #[test]
     fn retention_intent_does_not_change_multipart_finalize() {
         // retention_intent is advisory — finalize semantics are unchanged.
-        let mut store = setup();
+        let store = setup();
         let upload_id = store.start_multipart(test_ns()).unwrap();
 
         store
@@ -1485,7 +1535,7 @@ mod tests {
     fn rapid_creates_tracked_by_store_count() {
         // Telemetry is an observability concern; unit-level validation:
         // the store tracks composition count accurately under rapid mutations.
-        let mut store = setup();
+        let store = setup();
         let mut ids = Vec::new();
         for i in 0u8..10 {
             let id = store
@@ -1504,7 +1554,7 @@ mod tests {
     // --- Scenario: Hint cannot enable cross-namespace creation (I-WA14) ---
     #[test]
     fn create_in_unauthorized_namespace_rejected_regardless_of_hints() {
-        let mut store = setup();
+        let store = setup();
         // Namespace 99 does not exist — any create attempt is rejected
         // regardless of advisory context.
         let bogus_ns = NamespaceId(uuid::Uuid::from_u128(99));
@@ -1520,7 +1570,7 @@ mod tests {
     fn all_ops_succeed_without_advisory_context() {
         // Full lifecycle without any advisory integration — correctness
         // is identical (I-WA2).
-        let mut store = setup();
+        let store = setup();
 
         // Create.
         let c1 = ChunkId([0x01; 32]);
@@ -1542,5 +1592,75 @@ mod tests {
         // Delete.
         let result = store.delete(id).unwrap();
         assert!(matches!(result, DeleteResult::Removed(_)));
+    }
+
+    // ---------------------------------------------------------------
+    // B1 — concurrent-write contention witness.
+    //
+    // The pre-B1 contention curve on `InProcessPersistent` regressed
+    // at concurrency >= 8: 1→4 scaled linearly, 4→8 plateaued, 8→16
+    // *fell back* to 1-thread speed (lock convoy on the outer
+    // `Arc<Mutex<CompositionStore>>`). After B1, the per-store locks
+    // are field-grained (storage + namespaces + multiparts each have
+    // their own Mutex / RwLock), so concurrent PUTs on disjoint
+    // composition_ids no longer serialize on a single mutex.
+    //
+    // This test pins the property: 16 worker threads each do K
+    // create()s against a shared `Arc<CompositionStore>`. We assert
+    // the final count is exactly `16 * K` and the run completes
+    // within a generous wall budget (10 s on any sane dev box).
+    // The wall budget is a regression-only guard, NOT a perf gate —
+    // the actual perf measurement lives in `kiseki-profile`.
+    //
+    // Runs in well under 1 s on the in-memory `MemoryStorage`
+    // backend; no `#[ignore = "slow:…"]` annotation needed.
+    // ---------------------------------------------------------------
+    #[test]
+    fn concurrent_creates_scale_to_sixteen_writers() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        const WORKERS: usize = 16;
+        const PER_WORKER: usize = 200;
+
+        let store = Arc::new(setup());
+        let started = Instant::now();
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for i in 0..PER_WORKER {
+                        // Distinct chunk_ids per write so there's no
+                        // accidental dedup short-circuit at the
+                        // composition-table layer.
+                        let mut chunk_bytes = [0u8; 32];
+                        chunk_bytes[0] = w as u8;
+                        chunk_bytes[1] = (i & 0xff) as u8;
+                        chunk_bytes[2] = ((i >> 8) & 0xff) as u8;
+                        store
+                            .create(test_ns(), vec![ChunkId(chunk_bytes)], 1024)
+                            .expect("concurrent create");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+        let elapsed = started.elapsed();
+
+        // Correctness: every create produced a fresh row.
+        assert_eq!(
+            store.count().unwrap(),
+            (WORKERS * PER_WORKER) as u64,
+            "all concurrent creates should land",
+        );
+        // Regression guard: 3200 creates against an in-memory
+        // backend should finish well under 10 s. If a future change
+        // re-introduces a global lock, this trips.
+        assert!(
+            elapsed.as_secs() < 10,
+            "concurrent_creates ran for {elapsed:?} — possible lock-convoy regression",
+        );
     }
 }

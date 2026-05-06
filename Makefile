@@ -44,14 +44,25 @@ SHELL := /bin/bash
 CARGO        ?= cargo
 
 # Tier 1 — fast unit (workspace minus acceptance via default-members
-# AND profile filter for safety). No ignored tests.
-NEXTEST_FAST_UNIT  ?= $(CARGO) nextest run --profile fast --locked
+# AND profile filter for safety). No ignored tests. The
+# kiseki-chunk-cluster gRPC+TLS round-trip tests need their OWN
+# process so the rustls `CryptoProvider::install_default()` they call
+# wins uncontested — workspace-parallel load lets another test's tonic
+# client install first, after which the TLS handshake codec_path
+# rejects with `received corrupt message of type InvalidContentType`
+# and the round-trip times out (observed: 360 s × 2 = entire Tier-1
+# wall before this split). Two invocations is the cheapest fix; the
+# CI workflow does the same. Same shape for Tier 2's
+# `--run-ignored=only` lane below.
+NEXTEST_FAST_UNIT_MAIN     ?= $(CARGO) nextest run --profile fast --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+NEXTEST_FAST_UNIT_TLS_PEER ?= $(CARGO) nextest run --profile fast -p kiseki-chunk-cluster --locked
 # Tier 1 — BDD @smoke. KISEKI_BDD_FAST=1 flips the cucumber runner
 # branch in acceptance.rs to skip @slow + non-smoke @integration.
 NEXTEST_FAST_BDD   ?= KISEKI_BDD_FAST=1 $(CARGO) nextest run --profile bdd --locked -p kiseki-acceptance
 # Tier 2 — only the slow-marked unit tests (Tier 1 already ran the
-# fast ones; this fills in the rest).
-NEXTEST_SLOW_UNIT  ?= $(CARGO) nextest run --profile slow --run-ignored=only --locked
+# fast ones; this fills in the rest). Same TLS-peer split.
+NEXTEST_SLOW_UNIT_MAIN     ?= $(CARGO) nextest run --profile slow --run-ignored=only --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+NEXTEST_SLOW_UNIT_TLS_PEER ?= $(CARGO) nextest run --profile slow --run-ignored=only -p kiseki-chunk-cluster --locked
 # Tier 2 — full BDD (no env var → no @smoke / @slow filtering).
 NEXTEST_SLOW_BDD   ?= $(CARGO) nextest run --profile bdd --locked -p kiseki-acceptance
 
@@ -107,11 +118,13 @@ rust-build: ## cargo build (default-members — no acceptance)
 # ---------------------------------------------------------------------
 
 test-fast: check-tools ## Tier 1: fast unit + BDD @smoke (the default)
-	$(NEXTEST_FAST_UNIT)
+	$(NEXTEST_FAST_UNIT_MAIN)
+	$(NEXTEST_FAST_UNIT_TLS_PEER)
 	$(NEXTEST_FAST_BDD)
 
 test-slow: test-fast ## Tier 2: Tier 1 + slow-marked unit + full BDD
-	$(NEXTEST_SLOW_UNIT)
+	$(NEXTEST_SLOW_UNIT_MAIN)
+	$(NEXTEST_SLOW_UNIT_TLS_PEER)
 	$(NEXTEST_SLOW_BDD)
 
 test-full: test-slow e2e ## Tier 3: Tier 2 + Python e2e via docker compose

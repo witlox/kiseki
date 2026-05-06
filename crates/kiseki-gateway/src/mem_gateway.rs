@@ -16,7 +16,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 use kiseki_chunk::AsyncChunkOps;
 use kiseki_common::tenancy::DedupPolicy;
@@ -59,7 +58,7 @@ pub struct InMemoryGateway {
     /// Shared with the Phase 16f composition hydrator (`compositions_handle`)
     /// so leader-emitted Create deltas land in the same store the gateway
     /// reads from on followers.
-    compositions: Arc<Mutex<CompositionStore>>,
+    compositions: Arc<CompositionStore>,
     /// Lock-free namespace metadata cache for the write hot path.
     /// `add_namespace` populates this; `setattr` invalidates. The
     /// gateway's `write` no longer needs to acquire the composition
@@ -354,7 +353,7 @@ impl InMemoryGateway {
         master_key: SystemMasterKey,
     ) -> Self {
         Self {
-            compositions: Arc::new(Mutex::new(compositions)),
+            compositions: Arc::new(compositions),
             chunks,
             aead: Aead::new(),
             master_key,
@@ -587,7 +586,7 @@ impl InMemoryGateway {
     /// NFS opens/locks and in-flight multipart uploads are lost.
     pub async fn crash(&self) {
         // Clear composition namespace cache (ephemeral).
-        self.compositions.lock().clear_namespaces();
+        self.compositions.clear_namespaces();
         // Clear session tracking.
         self.last_written_seq
             .lock()
@@ -631,7 +630,7 @@ impl InMemoryGateway {
         self.namespace_meta
             .write()
             .insert(ns.id, meta);
-        self.compositions.lock().add_namespace(ns);
+        self.compositions.add_namespace(ns);
     }
 
     /// List compositions in a namespace (for S3 `ListObjectsV2`).
@@ -639,7 +638,7 @@ impl InMemoryGateway {
         &self,
         ns_id: kiseki_common::ids::NamespaceId,
     ) -> Vec<(kiseki_common::ids::CompositionId, u64)> {
-        let compositions = self.compositions.lock();
+        let compositions = self.compositions.as_ref();
         compositions
             .list_by_namespace(ns_id)
             .unwrap_or_default()
@@ -654,7 +653,6 @@ impl InMemoryGateway {
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<String, GatewayError> {
         self.compositions
-            .lock()
             .start_multipart(namespace_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
@@ -696,7 +694,6 @@ impl InMemoryGateway {
         }
 
         self.compositions
-            .lock()
             .upload_part(upload_id, part_number, chunk_id, size, was_new)
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
@@ -731,7 +728,7 @@ impl InMemoryGateway {
         // for the Raft emit + name bind, drop the lock before any
         // await on Raft consensus (ADR-032).
         let (comp_id, log, emit_params, new_chunk_ids) = {
-            let mut comps = self.compositions.lock();
+            let comps = self.compositions.as_ref();
             let comp_id = comps.finalize_multipart(upload_id).map_err(|e| {
                 tracing::warn!(error = %e, "complete_multipart: finalize_multipart failed");
                 GatewayError::Upstream(e.to_string())
@@ -766,7 +763,7 @@ impl InMemoryGateway {
                         GatewayError::Upstream(e.to_string())
                     })?;
             }
-            let log = comps.log().cloned();
+            let log = comps.log();
             (comp_id, log, params, new_chunk_ids)
         };
         tracing::debug!(
@@ -862,7 +859,6 @@ impl InMemoryGateway {
     /// Abort a multipart upload.
     pub async fn abort_multipart_internal(&self, upload_id: &str) -> Result<(), GatewayError> {
         self.compositions
-            .lock()
             .abort_multipart(upload_id)
             .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
@@ -879,10 +875,12 @@ impl InMemoryGateway {
     /// The Phase 16f composition hydrator (a sibling of the view stream
     /// processor) holds a clone of this `Arc` so it can install
     /// leader-emitted compositions into the same store the gateway reads
-    /// from. The lock is `tokio::sync::Mutex` because the gateway holds
-    /// it across awaits in the read path.
+    /// from. **B1 (2026-05-06):** the outer `Mutex` is gone — the
+    /// `CompositionStore` itself holds per-field locks (storage,
+    /// namespaces, multiparts), so concurrent gateway writes no longer
+    /// serialize on a single mutex.
     #[must_use]
-    pub fn compositions_handle(&self) -> Arc<Mutex<CompositionStore>> {
+    pub fn compositions_handle(&self) -> Arc<CompositionStore> {
         Arc::clone(&self.compositions)
     }
 
@@ -965,12 +963,12 @@ impl InMemoryGateway {
         // Phase 1: local mutation + capture log handle. Scope the
         // MutexGuard so it drops before any .await point.
         let log = {
-            let mut comps = self.compositions.lock();
+            let comps = self.compositions.as_ref();
             if comps.namespace(namespace_id).is_some() {
                 return Ok(()); // already registered locally; no-op
             }
             comps.add_namespace(ns.clone());
-            comps.log().cloned()
+            comps.log()
         };
         // Phase 2: replicate to followers if a Raft log is attached.
         if let Some(log) = log {
@@ -993,7 +991,7 @@ impl InMemoryGateway {
                     // Roll back the local registration — without
                     // follower visibility this would be a stealth
                     // single-node namespace.
-                    let mut comps = self.compositions.lock();
+                    let comps = self.compositions.as_ref();
                     comps.remove_namespace(namespace_id);
                     tracing::warn!(
                         namespace_id = %namespace_id.0,
@@ -1080,13 +1078,13 @@ impl GatewayOps for InMemoryGateway {
             // Inner block scopes the guard so it drops before the
             // possible `.await` in the retry path.
             let outcome: Result<kiseki_composition::composition::Composition, GatewayError> = {
-                let guard = self.compositions.lock();
+                let guard = self.compositions.as_ref();
                 if let Ok(c) = guard.get(req.composition_id) {
                     if let Some(ref m) = self.retry_metrics {
                         m.read_retry_total.inc();
                     }
                     Ok(c.clone())
-                } else if guard.storage().halted().unwrap_or(false) {
+                } else if guard.with_storage_locked(|s| s.halted().unwrap_or(false)) {
                     // Halt-mode short-circuit: if the hydrator can't
                     // catch up, surface ServiceUnavailable now.
                     tracing::warn!(
@@ -1295,7 +1293,7 @@ impl GatewayOps for InMemoryGateway {
         composition_id: kiseki_common::ids::CompositionId,
         content_type: Option<String>,
     ) -> Result<(), GatewayError> {
-        let mut comps = self.compositions.lock();
+        let comps = self.compositions.as_ref();
         comps
             .set_content_type(composition_id, content_type)
             .map_err(|e| {
@@ -1526,7 +1524,7 @@ impl GatewayOps for InMemoryGateway {
         // race-free against concurrent writers.
         let composition_record_started = std::time::Instant::now();
         let (comp_id, log, emit_params) = {
-            let mut comps = self.compositions.lock();
+            let comps = self.compositions.as_ref();
             // ----- Conditional check (atomic with create+bind below) -----
             if let (Some(name), Some(cond)) = (req.name.as_deref(), req.conditional.as_ref()) {
                 let existing = comps.lookup_by_name(req.namespace_id, name).map_err(|e| {
@@ -1590,7 +1588,7 @@ impl GatewayOps for InMemoryGateway {
                 comp.namespace_id,
                 comp.chunks.clone(),
             );
-            let log = comps.log().cloned();
+            let log = comps.log();
             (comp_id, log, params)
         }; // Lock dropped here — before Raft consensus.
         // (B9: dropped "composition created (pre-Raft)" debug.)
@@ -1688,7 +1686,7 @@ impl GatewayOps for InMemoryGateway {
                         shard_id = %sid.0,
                         "gateway write: KeyOutOfRange — rolling back composition",
                     );
-                    let _ = self.compositions.lock().delete(comp_id).ok();
+                    let _ = self.compositions.delete(comp_id).ok();
                     return Err(GatewayError::KeyOutOfRange { shard_id: sid });
                 }
                 Err(e) => {
@@ -1699,7 +1697,7 @@ impl GatewayOps for InMemoryGateway {
                         error = %e,
                         "gateway write: emit_chunk_and_delta failed — rolling back composition",
                     );
-                    let _ = self.compositions.lock().delete(comp_id).ok();
+                    let _ = self.compositions.delete(comp_id).ok();
                     // ADR-021 / I-WA5: emit a per-tenant backpressure
                     // signal whenever the data path returns a retriable
                     // error. Subscribers (workloads with active workflow
@@ -1754,7 +1752,7 @@ impl GatewayOps for InMemoryGateway {
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
         // Filter by tenant_id to prevent cross-tenant composition ID leak.
-        let compositions = self.compositions.lock();
+        let compositions = self.compositions.as_ref();
         let entries: Vec<(kiseki_common::ids::CompositionId, u64)> = compositions
             .list_by_namespace(namespace_id)
             .map_err(|e| {
@@ -1875,7 +1873,7 @@ impl GatewayOps for InMemoryGateway {
         // tombstone has already landed — acceptable per S3 / POSIX
         // delete semantics (no atomicity-with-readers contract).
         let (shard_id, namespace_id, log) = {
-            let compositions = self.compositions.lock();
+            let compositions = self.compositions.as_ref();
             let comp = compositions.get(composition_id).map_err(|e| {
                 tracing::warn!(error = %e, "gateway delete: compositions.get failed");
                 GatewayError::Upstream(e.to_string())
@@ -1891,7 +1889,7 @@ impl GatewayOps for InMemoryGateway {
             (
                 comp.shard_id,
                 comp.namespace_id,
-                compositions.log().cloned(),
+                compositions.log(),
             )
             // guard drops here — emit runs off-lock
         };
@@ -1944,7 +1942,7 @@ impl GatewayOps for InMemoryGateway {
         // Local delete only after the cluster has the tombstone.
         // Re-acquire the parking_lot guard briefly for the delete.
         let delete_result = {
-            let mut compositions = self.compositions.lock();
+            let compositions = self.compositions.as_ref();
             compositions.delete(composition_id).map_err(|e| {
                 tracing::warn!(error = %e, "gateway delete: local compositions.delete failed");
                 GatewayError::Upstream(e.to_string())
@@ -2004,7 +2002,7 @@ impl GatewayOps for InMemoryGateway {
         // this a misrouted CompleteMultipartUpload could let one
         // tenant rebind another tenant's composition under its own
         // bucket — defense in depth even if S3 routing is correct.
-        let mut comps = self.compositions.lock();
+        let comps = self.compositions.as_ref();
         if let Ok(comp) = comps.get(composition_id) {
             if comp.tenant_id != tenant_id {
                 tracing::warn!(
@@ -2032,7 +2030,7 @@ impl GatewayOps for InMemoryGateway {
         namespace_id: kiseki_common::ids::NamespaceId,
         name: &str,
     ) -> Result<Option<kiseki_common::ids::CompositionId>, GatewayError> {
-        let comps = self.compositions.lock();
+        let comps = self.compositions.as_ref();
         let id = comps.lookup_by_name(namespace_id, name).map_err(|e| {
             tracing::warn!(error = %e, "gateway lookup_object_by_name: lookup_by_name failed");
             GatewayError::Upstream(e.to_string())
@@ -2089,7 +2087,7 @@ impl GatewayOps for InMemoryGateway {
         namespace_id: kiseki_common::ids::NamespaceId,
         prefix: Option<&str>,
     ) -> Result<Vec<(String, kiseki_common::ids::CompositionId, u64)>, GatewayError> {
-        let comps = self.compositions.lock();
+        let comps = self.compositions.as_ref();
         let pairs = comps.list_names(namespace_id, prefix).map_err(|e| {
             tracing::warn!(error = %e, "gateway list_named: list_names failed");
             GatewayError::Upstream(e.to_string())
@@ -2447,7 +2445,7 @@ mod chunking_tests {
             .await
             .expect("write must succeed");
 
-        let comps = gw.compositions.lock();
+        let comps = gw.compositions.as_ref();
         let comp = comps.get(resp.composition_id).expect("composition exists");
         assert!(
             comp.chunks.len() >= 2,

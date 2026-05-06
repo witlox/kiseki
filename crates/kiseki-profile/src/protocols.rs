@@ -792,7 +792,7 @@ impl InProcessDriver {
             &uuid::Uuid::NAMESPACE_DNS,
             b"in-process-floor",
         ));
-        let mut compositions = CompositionStore::new();
+        let compositions = CompositionStore::new();
         compositions.add_namespace(Namespace {
             id: namespace_id,
             tenant_id,
@@ -1078,7 +1078,7 @@ impl InProcessPersistentDriver {
         tokio::spawn(drainer.run());
         let comp_storage: Box<dyn kiseki_composition::persistent::CompositionStorage> =
             Box::new(comp_store_redb);
-        let mut compositions = CompositionStore::with_storage(comp_storage);
+        let compositions = CompositionStore::with_storage(comp_storage);
 
         // 3. Single-tenant namespace registration so PUT/GET have
         //    a target. Distinct from the runtime's bootstrap tenant

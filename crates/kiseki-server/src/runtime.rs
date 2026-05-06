@@ -950,7 +950,7 @@ pub async fn run_main(
             tracing::info!("composition store: in-memory (no KISEKI_DATA_DIR)");
             Box::new(kiseki_composition::persistent::MemoryStorage::new())
         };
-    let mut comp_store =
+    let comp_store =
         kiseki_composition::composition::CompositionStore::with_storage(comp_storage)
             .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
 
@@ -1486,11 +1486,11 @@ pub async fn run_main(
                         .redb_size_bytes
                         .set(i64::try_from(meta.len()).unwrap_or(i64::MAX));
                 }
-                let store = count_compositions.lock();
-                if let Ok(c) = store.storage().count() {
+                if let Ok(c) =
+                    count_compositions.with_storage_locked(|s| s.count())
+                {
                     size_metrics.count.set(i64::try_from(c).unwrap_or(i64::MAX));
                 }
-                drop(store);
             }
         });
     }
