@@ -151,12 +151,11 @@ impl<G: GatewayOps> KisekiFuse<G> {
         &self.rt
     }
 
-    /// Borrow the gateway. Used by external orchestrators
-    /// ([`crate::fuse_daemon::FuseDaemon`], the kiseki-profile FUSE
-    /// driver) to issue gateway calls outside the wrapping
-    /// `RwLock`'s write section — see the build-request / apply-
-    /// response method pairs below for the 3-phase pattern.
-    pub fn gateway(&self) -> &G {
+    /// Borrow the gateway. Used by [`crate::fuse_daemon::FuseDaemon`]
+    /// to issue gateway calls outside the daemon's `RwLock` write
+    /// section — see the build-request / apply-response method pairs
+    /// below for the 3-phase pattern.
+    pub(crate) fn gateway(&self) -> &G {
         &self.gateway
     }
 
@@ -176,12 +175,12 @@ impl<G: GatewayOps> KisekiFuse<G> {
         }
     }
 
-    /// Public mirror of [`Self::block_gateway`] so external
-    /// orchestrators (FUSE daemon, kiseki-profile FUSE driver) can
-    /// invoke gateway futures without holding their wrapping lock
-    /// for write. Same dedicated runtime + `block_in_place` /
-    /// `block_on` selection logic as the private helper.
-    pub fn block_gateway_pub<F, T>(&self, f: F) -> T
+    /// `pub(crate)` mirror of [`Self::block_gateway`] so the FUSE
+    /// daemon's flush / create paths can invoke gateway futures
+    /// without holding the daemon's `RwLock` for write. Same
+    /// dedicated runtime + `block_in_place` / `block_on` selection
+    /// logic as the private helper.
+    pub(crate) fn block_gateway_pub<F, T>(&self, f: F) -> T
     where
         F: std::future::Future<Output = T>,
     {
@@ -362,7 +361,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// the few microseconds it takes to mutate `self.dirty`, then
     /// drops the lock before [`Self::block_gateway`] / the gateway
     /// call. See `kiseki_client::fuse_daemon::FuseDaemon::flush`.
-    pub fn flush_take_buffer(&mut self, ino: Ino) -> Option<WriteRequest> {
+    pub(crate) fn flush_take_buffer(&mut self, ino: Ino) -> Option<WriteRequest> {
         let buf = self.dirty.remove(&ino)?;
         Some(WriteRequest {
             tenant_id: self.tenant_id,
@@ -378,7 +377,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// gateway's `composition_id` onto the inode (under exclusive
     /// lock). No-op if the inode is gone or not a file (e.g. it was
     /// unlinked between take-buffer and apply).
-    pub fn flush_apply_response(&mut self, ino: Ino, resp: &WriteResponse) {
+    pub(crate) fn flush_apply_response(&mut self, ino: Ino, resp: &WriteResponse) {
         if let Some(InodeEntry::File { composition_id, .. }) = self.inodes.get_mut(&ino) {
             *composition_id = resp.composition_id;
         }

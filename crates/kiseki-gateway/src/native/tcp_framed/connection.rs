@@ -5,8 +5,8 @@
 //! 1. Caller (the listener) hands us an already-handshaked stream
 //!    (rustls or plaintext) plus the [`TcpFramedPrincipal`] minted
 //!    from the validated peer cert.
-//! 2. We loop: read `[length be u32][body]`, decode the body via
-//!    [`decode_request_body`], dispatch the verb via
+//! 2. We loop: read `[length be u32][body]`, decode the V3 frame via
+//!    [`decode_request_frame`], dispatch the verb via
 //!    [`super::dispatch::dispatch_verb`], encode the result via
 //!    [`encode_response_frame`], write back.
 //! 3. Loop ends on read EOF, write error, or unrecoverable wire-level
