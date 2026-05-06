@@ -24,6 +24,35 @@ members = [
     "crates/kiseki-transport",
     "crates/kiseki-view",
 ]
+# `cargo build` / `cargo test` / `cargo nextest run` invoked at the
+# workspace root without `--workspace` operate ONLY on the crates
+# below — `kiseki-acceptance` is excluded from the default set so the
+# inner-loop dev cycle (`make test-fast`) doesn't pull in cucumber +
+# spawned-server harness compile cost. Use `--workspace` (or `make
+# test-bdd` / `make test-all`) to include acceptance.
+default-members = [
+    "crates/kiseki-advisory",
+    "crates/kiseki-audit",
+    "crates/kiseki-backup",
+    "crates/kiseki-block",
+    "crates/kiseki-chunk",
+    "crates/kiseki-chunk-cluster",
+    "crates/kiseki-client",
+    "crates/kiseki-common",
+    "crates/kiseki-composition",
+    "crates/kiseki-control",
+    "crates/kiseki-crypto",
+    "crates/kiseki-gateway",
+    "crates/kiseki-keymanager",
+    "crates/kiseki-log",
+    "crates/kiseki-profile",
+    "crates/kiseki-proto",
+    "crates/kiseki-raft",
+    "crates/kiseki-server",
+    "crates/kiseki-tracing",
+    "crates/kiseki-transport",
+    "crates/kiseki-view",
+]
 
 [workspace.package]
 edition = "2021"

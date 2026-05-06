@@ -1,39 +1,90 @@
 # cargo-nextest config — workspace defaults.
 #
-# Why a config:
-#   The default `test-threads = num_cpus` over-subscribes when many
-#   of our tests build their own multi-thread tokio runtime (each
-#   spawning ~num_cpus worker threads). With ~1650 tests across the
-#   workspace and several integration tests doing real TCP+TLS
-#   handshakes, the parallelism causes resource starvation: tests
-#   that pass in 80 ms in isolation take >180 s under workspace
-#   load (observed: `kiseki-chunk-cluster::grpc_tls_san_round_trip`
-#   and similar). nextest then marks them as failed.
+# Tier model — three tiers, cascading:
 #
-#   Capping `test-threads` to half the host CPU count keeps
-#   per-test parallelism but leaves headroom for each test's own
-#   runtime threads, eliminating the starvation.
+#   fast   Tier 1. Default for `cargo nextest run` and `make test`.
+#          Unit tests only (kiseki-acceptance excluded via the
+#          workspace's default-members), with `#[ignore = "slow:…"]`
+#          tests SKIPPED. Target ≤ a few minutes wall.
+#
+#   bdd    Used by the BDD smoke + full BDD sub-runs. Includes the
+#          kiseki-acceptance crate; cucumber is the work, slow-timeout
+#          is generous because spawning kiseki-server children
+#          legitimately takes 5–15 s each. The Makefile flips
+#          `KISEKI_BDD_FAST=1` for the smoke subset.
+#
+#   slow   Tier 2 unit-test add-on — runs ONLY `#[ignore = "slow:…"]`
+#          unit tests via `nextest run --run-ignored=only`. The
+#          Makefile chains `make test-fast` first so the full slow
+#          tier covers everything the fast tier does plus what was
+#          marked-ignored.
+#
+#   ci     GitHub Actions runners (4 vCPU, oversubscription times out
+#          cluster-harness scenarios). Tightest test-thread cap.
+#
+# Why `test-threads` capping:
+#   The default `test-threads = num_cpus` over-subscribes when many
+#   tests build their own multi-thread tokio runtime (each spawning
+#   ~num_cpus worker threads). With ~1650 tests across the workspace
+#   and several integration tests doing real TCP+TLS handshakes, the
+#   parallelism causes resource starvation: tests that pass in 80 ms
+#   in isolation take >180 s under workspace load. Cap test-threads
+#   so each test still has a real CPU to share with its own runtime
+#   threads.
 
 [profile.default]
-# Default profile inherits these settings unless overridden by the
-# CI profile below.
+# Generic profile for ad-hoc invocations. Inherits sane defaults.
 slow-timeout = { period = "30s", terminate-after = 8 }
 
+[profile.fast]
+# Tier 1 — `make test-fast` and `make test`'s first stage.
+# kiseki-acceptance excluded by the workspace's default-members; the
+# default-filter expression below is belt-and-suspenders so this
+# profile is safe to invoke even with `--workspace`.
+default-filter = 'not package(kiseki-acceptance)'
+slow-timeout = { period = "60s", terminate-after = 4 }
+fail-fast = false
+
+[[profile.fast.overrides]]
+# kiseki-chunk-cluster gRPC + TLS tests hang under workspace-parallel
+# load (process-wide rustls CryptoProvider conflict with other
+# tonic clients). Pin them to a serial group; the test itself is
+# short, the contention is the issue.
+filter = 'binary(grpc_tls_san_round_trip) | binary(grpc_peer_round_trip)'
+test-group = 'tls-server'
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[profile.bdd]
+# BDD lane — kiseki-acceptance only. The Makefile sets
+# KISEKI_BDD_FAST=1 for the smoke variant; this profile relaxes
+# slow-timeout so the spawned-server cluster bootstrap doesn't get
+# clipped.
+slow-timeout = { period = "120s", terminate-after = 4 }
+fail-fast = false
+
+[profile.slow]
+# Tier 2 add-on. Used with `--run-ignored=only` to run the
+# `#[ignore = "slow:…"]` unit tests on top of what `fast` already
+# ran. Same default-filter as fast (no acceptance — those scenarios
+# go through the bdd profile separately).
+default-filter = 'not package(kiseki-acceptance)'
+slow-timeout = { period = "120s", terminate-after = 6 }
+fail-fast = false
+
+[[profile.slow.overrides]]
+filter = 'binary(grpc_tls_san_round_trip) | binary(grpc_peer_round_trip)'
+test-group = 'tls-server'
+slow-timeout = { period = "120s", terminate-after = 3 }
+
 [profile.ci]
-# GitHub-hosted Linux runners are 4 vCPU. Cap test concurrency
-# at 2 so each test still has a CPU to share with whatever its
-# own multi-thread tokio runtime spawns. The slow-timeout
-# extension lets a contended test ride out a brief CPU spike
-# without being marked as failed.
+# GitHub-hosted Linux runners — 4 vCPU. Cap test concurrency at 2 so
+# each test still has a CPU to share with its own multi-thread tokio
+# runtime. Slow-timeout extension lets a contended test ride out a
+# brief CPU spike without being marked failed.
 test-threads = 2
 slow-timeout = { period = "60s", terminate-after = 6 }
 fail-fast = false
 
-# The kiseki-chunk-cluster gRPC + TLS tests hang under workspace-
-# parallel load (process-wide rustls CryptoProvider conflict with
-# other tests' tonic clients). The CI workflow runs them in a
-# separate nextest invocation; this group keeps them serial WITHIN
-# that invocation just to be safe.
 [[profile.ci.overrides]]
 filter = 'binary(grpc_tls_san_round_trip) | binary(grpc_peer_round_trip)'
 test-group = 'tls-server'

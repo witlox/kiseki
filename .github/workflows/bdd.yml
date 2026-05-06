@@ -1,4 +1,4 @@
-name: BDD Acceptance
+name: Slow Tier (slow unit + full BDD)
 
 on:
   push:
@@ -11,43 +11,42 @@ on:
       - "infra/**"
   workflow_dispatch:
   schedule:
-    # Nightly full BDD run at 03:00 UTC. Catches drift in
-    # @slow / @integration scenarios that the push-time fast lane
-    # skips.
+    # Nightly at 03:00 UTC. Catches drift in slow-marked unit tests
+    # and the @slow / @integration BDD scenarios that the Tier 1
+    # smoke filter skips.
     - cron: "0 3 * * *"
 
 concurrency:
-  group: bdd-${{ github.ref }}
+  group: slow-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
 
-# BDD lives outside `ci.yml` because every multi-node scenario
-# spawns 3-20 `kiseki-server` children, and the kiseki-server
-# release build is the long pole — neither fits the ≤2 min CI
-# merge-blocking budget.
+# **Tier 2 (slow)** — Makefile target: `make test-slow`.
 #
-# Two jobs:
-#   - `smoke` (push + workflow_dispatch): KISEKI_BDD_FAST=1 +
-#     `slow-tests` feature OFF → skips @slow and skips
-#     @integration scenarios that aren't @smoke. Runs ~5 curated
-#     multi-node @smoke scenarios + the ~200 @library scenarios
-#     in 3-5 min. Catches the obvious cross-cutting regressions.
-#   - `full` (nightly + workflow_dispatch): no env var, no
-#     filtering → all 316 scenarios in 8-12 min.
+# Tier 2 = Tier 1 (fast unit + BDD smoke) + the slow-marked unit
+# tests + the rest of the BDD suite. CI runs this on push-to-main +
+# nightly + dispatch, advisory only (does NOT block merges — Tier 1
+# in `ci.yml` is the merge-blocking gate).
 #
-# Failures are reported but don't gate merges (intentionally —
-# the design tradeoff in the CI revamp). Catch + revert
-# workflow: a regression on main triggers a Slack/email alert
-# (separate workflow, out of scope here) and the author
-# auto-reverts via `git revert`.
+# Why two jobs:
+#   - `slow-unit` runs `cargo nextest run --run-ignored=only` which
+#     picks up only the `#[ignore = "slow:…"]` tests Tier 1 skipped.
+#   - `slow-bdd` runs the full BDD suite (no `KISEKI_BDD_FAST`
+#     env var → no @smoke / @slow filtering). Release-grade
+#     kiseki-server build because the @slow Raft scenarios
+#     legitimately need optimized binaries to settle within the
+#     150-300 ms election windows.
+#
+# Failures here are reported but do NOT gate merges. A regression
+# on main triggers an alert (separate workflow, out of scope) and
+# the author auto-reverts via `git revert`.
 
 jobs:
-  smoke:
-    name: BDD Smoke (KISEKI_BDD_FAST=1)
-    if: github.event_name != 'schedule'
+  slow-unit:
+    name: Slow-marked unit tests (run-ignored=only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -55,33 +54,16 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - name: Build kiseki-server for ClusterHarness scenarios
-        # Debug build instead of release — saves ~3 min vs the
-        # previous CI's release build, costs ~30% runtime per
-        # scenario which is fine for the smoke set (~5 multi-node
-        # scenarios, ~30s total runtime).
-        run: cargo build --locked -p kiseki-server
-      - name: Run BDD smoke + @library suite
-        env:
-          # Filter @slow + non-smoke @integration scenarios.
-          # The full suite (no env var) runs in the `full` job
-          # below on nightly schedule.
-          KISEKI_BDD_FAST: "1"
-        run: |
-          output=$(cargo test -p kiseki-acceptance --locked 2>&1)
-          echo "$output" | tail -10
-          if echo "$output" | grep -qE "[1-9][0-9]* failed"; then
-            echo "::error::BDD smoke scenarios failed"
-            echo "$output" | grep -E "[1-9][0-9]* failed"
-            echo "::group::Failed scenarios"
-            echo "$output" | grep -B 4 -A 2 "Step failed:" || true
-            echo "::endgroup::"
-            exit 1
-          fi
+      - uses: taiki-e/install-action@nextest
+      # `slow` profile + --run-ignored=only → only the
+      # `#[ignore = "slow:…"]` unit tests. kiseki-acceptance excluded
+      # via the profile's default-filter. Two invocations to dodge
+      # the kiseki-chunk-cluster rustls conflict, same as ci.yml.
+      - run: cargo nextest run --profile slow --run-ignored=only --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+      - run: cargo nextest run --profile slow --run-ignored=only -p kiseki-chunk-cluster --locked
 
-  full:
-    name: BDD Full Suite (nightly)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+  slow-bdd:
+    name: Full BDD suite (no @smoke filter)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -89,20 +71,12 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - name: Build kiseki-server (release for full-suite scenarios)
-        # Release build for the nightly path — full @slow +
-        # @integration coverage benefits from optimized binaries
-        # (Raft elections settle within their 150-300 ms windows).
+      - uses: taiki-e/install-action@nextest
+      - name: Build kiseki-server (release — needed for @slow Raft scenarios)
         run: cargo build --locked --release -p kiseki-server
-      - name: Run full BDD suite (no fast-lane filter, slow-tests on)
-        run: |
-          output=$(cargo test -p kiseki-acceptance --features slow-tests --locked 2>&1)
-          echo "$output" | tail -10
-          if echo "$output" | grep -qE "[1-9][0-9]* failed"; then
-            echo "::error::BDD full suite scenarios failed"
-            echo "$output" | grep -E "[1-9][0-9]* failed"
-            echo "::group::Failed scenarios"
-            echo "$output" | grep -B 4 -A 2 "Step failed:" || true
-            echo "::endgroup::"
-            exit 1
-          fi
+      - name: Run full BDD suite (slow-tests feature on)
+        # No `KISEKI_BDD_FAST` env var → cucumber runner picks up
+        # @slow + @integration scenarios. `--features slow-tests`
+        # toggles a runtime branch that includes Raft-cluster
+        # scenarios skipped on macOS by default.
+        run: cargo nextest run --profile bdd --features kiseki-acceptance/slow-tests --locked -p kiseki-acceptance

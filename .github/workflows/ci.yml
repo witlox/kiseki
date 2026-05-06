@@ -26,29 +26,27 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
 
-# Merge-blocking lane only — target ≤2 min warm.
+# Merge-blocking lane = Makefile **Tier 1 (fast)**.
 #
-# Stage 1 (parallel): fmt, clippy, deny.
-# Stage 2 (after stage 1, parallel): unit tests, chunk-cluster
-#   tests, proto coverage, arch check.
+#   Stage 1 (parallel, no deps):  fmt, clippy, deny, proto-coverage,
+#                                 arch-check.
+#   Stage 2 (depends on Stage 1): unit-tests-fast, bdd-smoke.
 #
-# BDD acceptance is OUT of this workflow — every multi-node
-# scenario spawns 3-20 `kiseki-server` children, the harness boot
-# alone runs ~5-30 s per cluster size, and the kiseki-server
-# release build is the long pole. BDD now lives in `bdd.yml`,
-# which runs on push-to-main + workflow_dispatch + nightly so
-# multi-node coverage stays present without blocking PR merge.
-#
-# The 14-job feature-flag compilation matrix lives in
-# `feature-matrix.yml` — paths-filtered (Cargo.toml / build.rs)
-# + nightly + workflow_dispatch + run-on-release.
-#
-# Coverage + e2e + slow BDD live in `release.yml` (weekly +
+# Tier 1 = fast unit tests + BDD `@smoke` scenarios. Slow-marked unit
+# tests (`#[ignore = "slow:…"]`) and the rest of the BDD suite live
+# in `bdd.yml` (Tier 2 — push-to-main + nightly). Python e2e + the
+# release-grade lanes live in `release.yml` (Tier 3 — weekly +
 # workflow_dispatch).
+#
+# Why BDD smoke is in CI now (a change from prior runs that had it
+# in `bdd.yml`): the three-tier model commits Tier 1 to "unit + BDD
+# smoke" so PRs catch cross-context regressions before merge. The
+# kiseki-server build is the long pole; we use the debug build to
+# keep total CI wall under a few minutes.
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Stage 1 — fast checks, gate everything
+  # Stage 1 — fast checks, gate everything (run in parallel)
   # ---------------------------------------------------------------------------
 
   fmt:
@@ -82,40 +80,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # ---------------------------------------------------------------------------
-  # Stage 2 — test suites (needs stage 1, all parallel)
-  # ---------------------------------------------------------------------------
-
-  test:
-    name: Unit Tests
-    runs-on: ubuntu-latest
-    needs: [fmt, clippy, deny]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
-      # Two invocations because the kiseki-chunk-cluster gRPC + TLS
-      # tests hang under any workspace-parallel load (process-wide
-      # rustls CryptoProvider conflict with other tests' tonic
-      # clients). Running them in a separate nextest process gives
-      # them a fresh `rustls::crypto` install and they pass in 80 ms.
-      - run: cargo nextest run --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked --profile ci
-      - run: cargo nextest run -p kiseki-chunk-cluster --locked --profile ci
-
-  # BDD acceptance moved out of CI — see `bdd.yml`. Runs on push-to-
-  # main + workflow_dispatch + nightly so multi-node coverage stays
-  # present without blocking PR merge on the kiseki-server build.
-  #
-  # E2E moved to release.yml — runs on workflow_dispatch / weekly
-  # schedule and gates `publish`. CI keeps fast-feedback only.
-
   proto-coverage:
     name: Proto Coverage
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, deny]
     steps:
       - uses: actions/checkout@v6
       - name: Check every .proto is in build.rs
@@ -134,7 +101,6 @@ jobs:
   arch-check:
     name: Architecture Check
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, deny]
     steps:
       - uses: actions/checkout@v6
       - name: Verify kiseki-control dependency boundary (ADR-027)
@@ -152,6 +118,45 @@ jobs:
             exit 1
           fi
 
-  # Coverage moved to release.yml (weekly + workflow_dispatch) —
-  # the codecov upload is a trend signal, not a merge gate, and
-  # adding ~4 min to every push isn't worth the spend.
+  # ---------------------------------------------------------------------------
+  # Stage 2 — Tier 1 fast tests (depend on Stage 1)
+  # ---------------------------------------------------------------------------
+
+  unit-tests-fast:
+    name: Unit Tests (Tier 1 fast)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, deny]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # `fast` profile excludes kiseki-acceptance + skips
+      # `#[ignore = "slow:…"]` tests. Two invocations because the
+      # kiseki-chunk-cluster gRPC + TLS tests hang under workspace-
+      # parallel load (process-wide rustls CryptoProvider conflict).
+      - run: cargo nextest run --profile fast --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+      - run: cargo nextest run --profile fast -p kiseki-chunk-cluster --locked
+
+  bdd-smoke:
+    name: BDD @smoke (Tier 1 fast)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, deny]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Build kiseki-server (debug — saves ~3 min vs release)
+        run: cargo build --locked -p kiseki-server
+      - name: Run BDD @smoke
+        env:
+          # Cucumber runner branch in `acceptance.rs`: skip @slow,
+          # skip non-smoke @integration. The remaining ~5 multi-node
+          # @smoke + ~200 @library scenarios run in 3-5 min.
+          KISEKI_BDD_FAST: "1"
+        run: cargo nextest run --profile bdd --locked -p kiseki-acceptance

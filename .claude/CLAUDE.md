@@ -20,7 +20,27 @@ Standards: `.claude/guidelines/`. Coding: `.claude/coding/`.
 
 ## Pre-commit
 
-`make` (lint + test + build). Use `/project:verify` for full checklist.
+Three test tiers, cascading. Each higher tier includes the lower:
+
+| Tier | What | Make target | When |
+|---|---|---|---|
+| **1 (fast — default)** | fast unit tests (workspace minus `kiseki-acceptance`, `#[ignore = "slow:…"]` skipped) + BDD `@smoke` | `make test-fast` (alias `make test`) | between every code edit; pre-commit |
+| **2 (slow)** | Tier 1 + slow-marked unit tests (`--run-ignored=only`) + full BDD suite | `make test-slow` | pre-PR |
+| **3 (full)** | Tier 2 + Python e2e via docker compose | `make test-full` | pre-merge / nightly / pre-release |
+
+`make` (no target) = `make verify` = fmt-check + clippy + Tier 1 + arch-check. Run before every commit.
+
+GitHub Actions mirrors the tiers:
+- `ci.yml` runs Tier 1 on PR + push (merge-blocking).
+- `bdd.yml` runs Tier 2 on push-to-main + nightly (advisory).
+- `release.yml` runs Tier 3 weekly + on `workflow_dispatch` (gates the release).
+
+To mark a unit test as slow so Tier 1 skips it:
+```rust
+#[test]
+#[ignore = "slow: <reason — what makes this expensive>"]
+fn my_expensive_test() { ... }
+```
 
 ## Automatic commands
 

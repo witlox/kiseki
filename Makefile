@@ -1,33 +1,86 @@
 # Kiseki — root Makefile
 #
-# Targets here mirror the pre-commit discipline documented in
-# `.claude/CLAUDE.md`: `make` runs fmt + lint + test + build across the
-# full workspace. `make verify` is the strict CI-equivalent used by the
-# `/project:verify` check.
+# Three test tiers (cascading; each higher tier includes the lower):
+#
+#   make test-fast        Tier 1 — DEFAULT. Fast unit tests
+#                         (kiseki-acceptance excluded; tests marked
+#                         `#[ignore = "slow:…"]` skipped) plus the
+#                         BDD `@smoke` subset (KISEKI_BDD_FAST=1).
+#                         Target: a few minutes wall on a dev box.
+#                         Run between every code edit; runs as the
+#                         pre-commit gate.
+#
+#   make test-slow        Tier 2 — adds the `#[ignore = "slow:…"]`
+#                         unit tests + every BDD scenario the smoke
+#                         filter skipped. Re-runs Tier 1 first so a
+#                         single `make test-slow` covers both. Run
+#                         pre-PR.
+#
+#   make test-full        Tier 3 — adds Python e2e via docker compose.
+#                         Slowest; weekly / pre-merge / CI release
+#                         lane. Runs `make test-slow` first.
+#
+# `make` (no target) = `make verify` = fmt-check + clippy + Tier 1
+# + arch-check. The pre-commit standard.
+#
+# Tooling:
+#   - cargo-nextest is required (`cargo install cargo-nextest --locked`).
+#   - Slow unit tests: annotate with `#[ignore = "slow: <reason>"]`.
+#     Plain `cargo test` and Tier 1 skip them; Tier 2 picks them up
+#     via `cargo nextest run --run-ignored=only`.
+#   - BDD smoke selection: the existing `KISEKI_BDD_FAST=1` runtime
+#     branch in `crates/kiseki-acceptance/tests/acceptance.rs`. No
+#     new tags needed.
 
-.PHONY: all verify rust-fmt rust-fmt-check rust-clippy rust-test rust-deny \
-        check fmt test build clean help arch-check e2e
+.PHONY: all verify verify-full \
+        test test-fast test-slow test-full e2e \
+        rust-fmt rust-fmt-check rust-clippy rust-deny rust-build \
+        check fmt build clean help arch-check \
+        check-tools
 
 SHELL := /bin/bash
 
 # --- Rust toolchain commands ---
 CARGO        ?= cargo
-CARGO_TEST   ?= $(CARGO) test --workspace --all-targets
-CARGO_BUILD  ?= $(CARGO) build --workspace --all-targets
-# Mirrors the CI Clippy invocation (`.github/workflows/ci.yml`) — keep
-# them in sync so `make` catches everything CI does. -D warnings promotes
-# all warnings to errors. RUSTFLAGS=-Dwarnings is also set in CI; --locked
-# matches the exact lockfile resolution CI uses.
+
+# Tier 1 — fast unit (workspace minus acceptance via default-members
+# AND profile filter for safety). No ignored tests.
+NEXTEST_FAST_UNIT  ?= $(CARGO) nextest run --profile fast --locked
+# Tier 1 — BDD @smoke. KISEKI_BDD_FAST=1 flips the cucumber runner
+# branch in acceptance.rs to skip @slow + non-smoke @integration.
+NEXTEST_FAST_BDD   ?= KISEKI_BDD_FAST=1 $(CARGO) nextest run --profile bdd --locked -p kiseki-acceptance
+# Tier 2 — only the slow-marked unit tests (Tier 1 already ran the
+# fast ones; this fills in the rest).
+NEXTEST_SLOW_UNIT  ?= $(CARGO) nextest run --profile slow --run-ignored=only --locked
+# Tier 2 — full BDD (no env var → no @smoke / @slow filtering).
+NEXTEST_SLOW_BDD   ?= $(CARGO) nextest run --profile bdd --locked -p kiseki-acceptance
+
+# Plain build (default-members → no acceptance).
+CARGO_BUILD  ?= $(CARGO) build --all-targets --locked
+# Clippy at the same scope CI runs (full workspace including
+# acceptance — clippy is cheap, value is high).
 CARGO_CLIPPY ?= $(CARGO) clippy --workspace --all-targets --locked -- -D warnings
 CARGO_FMT    ?= $(CARGO) fmt --all
 
-all: check ## Default: fmt + lint + test
+all: verify ## Default: pre-commit (fmt-check + clippy + Tier 1 tests + arch-check)
 
 help: ## Show this help
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 # ---------------------------------------------------------------------
-# Rust
+# Tool checks
+# ---------------------------------------------------------------------
+
+check-tools: ## Verify required tools are installed
+	@command -v $(CARGO) >/dev/null || { echo "cargo not found in PATH"; exit 1; }
+	@$(CARGO) nextest --version >/dev/null 2>&1 || { \
+		echo "cargo-nextest not installed."; \
+		echo "Install: cargo install cargo-nextest --locked"; \
+		exit 1; \
+	}
+
+# ---------------------------------------------------------------------
+# Rust — formatting + lints
 # ---------------------------------------------------------------------
 
 rust-fmt: ## Apply rustfmt to all crates
@@ -36,11 +89,8 @@ rust-fmt: ## Apply rustfmt to all crates
 rust-fmt-check: ## Check rustfmt without modifying files
 	$(CARGO_FMT) -- --check
 
-rust-clippy: ## cargo clippy with -D warnings
+rust-clippy: ## cargo clippy with -D warnings (workspace, including kiseki-acceptance)
 	$(CARGO_CLIPPY)
-
-rust-test: ## cargo test --workspace
-	$(CARGO_TEST)
 
 rust-deny: ## cargo-deny (licenses, advisories, bans)
 	@if command -v cargo-deny >/dev/null; then \
@@ -49,8 +99,24 @@ rust-deny: ## cargo-deny (licenses, advisories, bans)
 		echo "cargo-deny not installed; skipping (install: cargo install cargo-deny)"; \
 	fi
 
-rust-build: ## cargo build workspace
+rust-build: ## cargo build (default-members — no acceptance)
 	$(CARGO_BUILD)
+
+# ---------------------------------------------------------------------
+# Rust — test tiers
+# ---------------------------------------------------------------------
+
+test-fast: check-tools ## Tier 1: fast unit + BDD @smoke (the default)
+	$(NEXTEST_FAST_UNIT)
+	$(NEXTEST_FAST_BDD)
+
+test-slow: test-fast ## Tier 2: Tier 1 + slow-marked unit + full BDD
+	$(NEXTEST_SLOW_UNIT)
+	$(NEXTEST_SLOW_BDD)
+
+test-full: test-slow e2e ## Tier 3: Tier 2 + Python e2e via docker compose
+
+test: test-fast ## Alias for `test-fast` — the pre-commit standard
 
 # ---------------------------------------------------------------------
 # Architecture enforcement (ADV-3)
@@ -67,15 +133,15 @@ arch-check: ## Verify kiseki-control depends only on allowed crates
 
 fmt: rust-fmt ## Apply all formatters
 
-check: rust-fmt-check rust-clippy rust-test ## Standard pre-commit check
+check: rust-fmt-check rust-clippy test-fast arch-check ## Pre-commit (Tier 1 + lint + arch)
 
-test: rust-test ## Run all tests
+verify: check ## Alias for `check` — the pre-commit standard
+
+verify-full: rust-fmt-check rust-clippy rust-deny test-full arch-check ## CI release-equivalent (Tier 3 + deny)
 
 build: rust-build ## Build all artefacts
 
-verify: rust-fmt-check rust-clippy rust-deny rust-test arch-check ## CI-equivalent strict verification
-
-e2e: ## Run Python e2e tests (requires docker compose)
+e2e: ## Python e2e tests via docker compose (Tier 3 component)
 	/usr/local/bin/docker compose up --build -d
 	.venv/bin/pytest tests/e2e/ -m e2e -v || { /usr/local/bin/docker compose down; exit 1; }
 	/usr/local/bin/docker compose down

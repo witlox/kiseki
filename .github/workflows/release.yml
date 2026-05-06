@@ -11,10 +11,19 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Preflight: format, clippy, tests, deny
+  # Preflight = Makefile **Tier 3 (full)** minus the e2e step (e2e
+  # has its own job below, gated separately so log artifacts upload
+  # on failure). Runs:
+  #   - fmt-check + clippy + cargo-deny (lints).
+  #   - Tier 1 fast unit tests (`fast` profile).
+  #   - Tier 2 slow-marked unit tests (`slow` profile,
+  #     --run-ignored=only).
+  #   - Full BDD suite with `slow-tests` feature on (Tier 2 BDD).
+  # The e2e step lives in the dedicated `e2e` job for log capture
+  # on failure.
   # ---------------------------------------------------------------------------
   preflight:
-    name: Preflight checks
+    name: Preflight (Tier 3 — fast + slow unit + full BDD + lint)
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -36,19 +45,24 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --exclude kiseki-acceptance --run-ignored all
-      - name: Run full BDD acceptance suite (incl. @slow scenarios)
-        # Release runs the complete suite — `--features slow-tests` enables
-        # the Raft-cluster scenarios that CI excludes for speed.
-        run: |
-          output=$(cargo test -p kiseki-acceptance --features slow-tests 2>&1)
-          echo "$output" | tail -10
-          if echo "$output" | grep -qE "[1-9][0-9]* failed"; then
-            echo "::error::BDD scenarios failed"
-            exit 1
-          fi
+      # Tier 1 fast unit (skips slow-marked tests, no acceptance).
+      - name: Tier 1 — fast unit tests
+        run: cargo nextest run --profile fast --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+      - name: Tier 1 — fast unit tests (kiseki-chunk-cluster, isolated)
+        run: cargo nextest run --profile fast -p kiseki-chunk-cluster --locked
+      # Tier 2 slow-marked unit tests (only the ignored ones — the
+      # fast set above already covered the rest).
+      - name: Tier 2 — slow-marked unit tests (run-ignored=only)
+        run: cargo nextest run --profile slow --run-ignored=only --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+      - name: Tier 2 — slow-marked kiseki-chunk-cluster tests (run-ignored=only)
+        run: cargo nextest run --profile slow --run-ignored=only -p kiseki-chunk-cluster --locked
+      # Tier 2 BDD — full suite with @slow / @integration on.
+      - name: Build kiseki-server (release — for full BDD @slow scenarios)
+        run: cargo build --locked --release -p kiseki-server
+      - name: Tier 2 — full BDD suite (slow-tests feature on)
+        run: cargo nextest run --profile bdd --features kiseki-acceptance/slow-tests --locked -p kiseki-acceptance
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # ---------------------------------------------------------------------------
