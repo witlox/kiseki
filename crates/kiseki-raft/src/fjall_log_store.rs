@@ -83,10 +83,24 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
 /// `Keyspace` are `Clone + Send + Sync`. The exposed `&self`
 /// methods can be called concurrently; fjall serializes writers on
 /// the journal mutex internally.
+///
+/// Durability mode (`sync_per_write`):
+/// * `true` (default): every `append` / `truncate_*` commits with
+///   `PersistMode::SyncAll` — strict per-entry durability.
+/// * `false`: writes commit with `PersistMode::Buffer` (memtable +
+///   in-memory WAL append). A periodic flusher (driven by the
+///   server runtime via [`Self::flush`]) drives the durability
+///   barrier at a bounded cadence. Same contract as the composition
+///   store's eventual-durability mode — multi-node deployments
+///   recover the loss window via Raft replication on restart.
+#[derive(Clone)]
 pub struct FjallLogStore {
     db: Database,
     log_ks: Keyspace,
     meta_ks: Keyspace,
+    /// When `false`, writes use `PersistMode::Buffer` instead of
+    /// `SyncAll`. Toggle via [`Self::with_eventual_durability`].
+    sync_per_write: bool,
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
@@ -114,7 +128,19 @@ impl FjallLogStore {
             db,
             log_ks,
             meta_ks,
+            sync_per_write: true,
         })
+    }
+
+    /// Switch the store between `SyncAll` (default) and `Buffer`
+    /// durability for `append` / `truncate_*` writes. When `eventual`
+    /// is `true`, the caller is responsible for periodic
+    /// [`Self::flush`] calls (and any explicit `fsync(2)` paths).
+    /// Returns `self` for builder chaining.
+    #[must_use]
+    pub fn with_eventual_durability(mut self, eventual: bool) -> Self {
+        self.sync_per_write = !eventual;
+        self
     }
 
     /// Append a single log entry. Each call commits inline with
@@ -273,9 +299,17 @@ impl FjallLogStore {
         self.db.persist(PersistMode::SyncAll).map_err(io_err)
     }
 
-    /// Build a fresh batch with `PersistMode::SyncAll` durability set.
+    /// Build a fresh batch with the configured durability:
+    /// `PersistMode::SyncAll` (default, fsync per write) or
+    /// `PersistMode::Buffer` (eventual, periodic flusher drives
+    /// durability).
     fn commit_batch(&self) -> OwnedWriteBatch {
-        self.db.batch().durability(Some(PersistMode::SyncAll))
+        let mode = if self.sync_per_write {
+            PersistMode::SyncAll
+        } else {
+            PersistMode::Buffer
+        };
+        self.db.batch().durability(Some(mode))
     }
 }
 

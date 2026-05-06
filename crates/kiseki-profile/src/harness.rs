@@ -117,6 +117,7 @@ impl ProfileServer {
             "KISEKI_OBSERVABILITY",
             "KISEKI_COMPOSITION_FLUSH_INTERVAL_MS",
             "KISEKI_CHUNK_FLUSH_INTERVAL_MS",
+            "KISEKI_RAFT_FLUSH_INTERVAL_MS",
         ] {
             if let Ok(v) = std::env::var(var) {
                 cmd.env(var, v);

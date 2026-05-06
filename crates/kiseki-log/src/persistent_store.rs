@@ -37,6 +37,33 @@ impl PersistentShardStore {
         Ok(s)
     }
 
+    /// Open in eventual-durability mode: writes commit with
+    /// `PersistMode::Buffer` instead of `SyncAll`. Caller MUST
+    /// drive a periodic [`FjallLogStore::flush`] task (e.g. via
+    /// the runtime's `KISEKI_RAFT_FLUSH_INTERVAL_MS` knob) to
+    /// bound the loss window. Mirrors the composition store's
+    /// eventual-durability mode — same R-3/EC-4+2 + scrub recovery
+    /// contract.
+    pub async fn open_eventual(path: &Path) -> Result<Self, LogError> {
+        let store = FjallLogStore::open(path)
+            .map_err(|_| LogError::Unavailable)?
+            .with_eventual_durability(true);
+        let mem = MemShardStore::new();
+        let mut s = Self { mem, store };
+        s.reload().await;
+        Ok(s)
+    }
+
+    /// Borrow the underlying log store. The runtime uses this to
+    /// register the periodic flusher when eventual durability is
+    /// enabled, and to wire `fsync_pending()` so explicit
+    /// `fsync(2)` calls flush the Raft log alongside the
+    /// composition + chunk stores.
+    #[must_use]
+    pub fn fjall(&self) -> &FjallLogStore {
+        &self.store
+    }
+
     /// Create a shard (delegates to in-memory store + persists metadata).
     pub fn create_shard(
         &self,

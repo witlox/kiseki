@@ -531,10 +531,23 @@ pub async fn run_main(
         store_arc
     } else if let Some(ref dir) = cfg.data_dir {
         std::fs::create_dir_all(dir.join("raft")).ok();
-        let store = kiseki_log::persistent_store::PersistentShardStore::open(
-            &dir.join("raft").join("log"),
-        )
-        .await
+        // Match the composition + chunk store durability knobs:
+        // when KISEKI_RAFT_FLUSH_INTERVAL_MS is set, the Raft log
+        // commits with PersistMode::Buffer and a periodic task
+        // drives the fsync barrier. Multi-node deployments recover
+        // the loss window via Raft replication on restart; single-
+        // node deployments accept the documented per-knob loss
+        // window in exchange for the throughput lift (PUT path was
+        // fsync-bound at ~31 k op/s with sync-per-write).
+        let raft_flush_interval_ms = std::env::var("KISEKI_RAFT_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        let log_path = dir.join("raft").join("log");
+        let store = if raft_flush_interval_ms.is_some() {
+            kiseki_log::persistent_store::PersistentShardStore::open_eventual(&log_path).await
+        } else {
+            kiseki_log::persistent_store::PersistentShardStore::open(&log_path).await
+        }
         .map_err(|e| format!("persistent store: {e}"))?;
         if cfg.bootstrap {
             store.create_shard(
@@ -544,7 +557,30 @@ pub async fn run_main(
                 kiseki_log::ShardConfig::default(),
             );
         }
-        tracing::info!(path = %dir.display(), "log store: persistent (fjall)");
+        if let Some(interval_ms) = raft_flush_interval_ms {
+            // Periodic Raft-log fsync. Same shape as the
+            // composition store flusher: cheap memtable + WAL append
+            // inline, durability barrier at a bounded cadence.
+            // Borrow a clone of the underlying FjallLogStore for
+            // the flush task.
+            let fjall = store.fjall().clone();
+            tracing::info!(
+                interval_ms,
+                "log store: persistent fjall (eventual durability)"
+            );
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = fjall.flush() {
+                        tracing::warn!(error = %e, "raft log periodic flush failed");
+                    }
+                }
+            });
+        } else {
+            tracing::info!(path = %dir.display(), "log store: persistent (fjall)");
+        }
         Arc::new(store)
     } else {
         let store = kiseki_log::MemShardStore::new();
