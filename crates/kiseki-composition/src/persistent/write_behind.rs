@@ -22,12 +22,12 @@
 //! EC-4+2 + scrub recover via raft-log replay (same loss-window
 //! contract as the chunk-store group commit, I-L5).
 
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ::redb::ReadableTable;
+use dashmap::DashMap;
 use kiseki_common::ids::{CompositionId, NamespaceId};
-use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 use crate::composition::Composition;
@@ -36,36 +36,49 @@ use crate::composition::Composition;
 pub(crate) type NameKey = (NamespaceId, String);
 
 /// In-memory overlay of pending redb writes. Each entry carries a
-/// monotonically-increasing sequence number assigned by the writer;
-/// the drainer uses it to remove only entries that haven't been
-/// superseded by a later write while the redb commit was in flight.
+/// monotonically-increasing sequence number stamped at insert time
+/// by the writer; the drainer uses it to remove only entries that
+/// haven't been superseded by a later write while the redb commit
+/// was in flight.
 ///
 /// `None` payloads are tombstones — the next read returns "not
 /// found" without consulting redb, even if redb still holds the
 /// pre-tombstone value.
+///
+/// Concurrency model: the three maps are `DashMap`s so independent
+/// writers don't contend; `next_seq` is a single `AtomicU64`. A
+/// writer's update to `name_fwd` + `name_rev` is no longer atomic
+/// against a concurrent drainer snapshot — the drainer may catch
+/// only one half. The next drainer cycle picks up the other half;
+/// the redb txn applies whatever the snapshot contains. Net effect
+/// matches the previous semantics modulo a brief visibility window
+/// (≤ one drain interval) where redb has fwd without matching rev.
+/// Readers always consult the overlay first, so this window is
+/// invisible at the gateway layer.
 #[derive(Default)]
 pub(crate) struct OverlayState {
-    pub comp: HashMap<CompositionId, (u64, Option<Composition>)>,
-    pub name_fwd: HashMap<NameKey, (u64, Option<CompositionId>)>,
+    pub comp: DashMap<CompositionId, (u64, Option<Composition>)>,
+    pub name_fwd: DashMap<NameKey, (u64, Option<CompositionId>)>,
     /// Reverse map: `composition_id` → currently-bound `(ns, name)`.
     /// `None` = "this composition has no name binding right now"
-    /// (the previous binding has been removed). The drainer pairs
-    /// updates here with `name_fwd` updates atomically inside one
-    /// write-lock acquisition.
-    pub name_rev: HashMap<CompositionId, (u64, Option<NameKey>)>,
-    next_seq: u64,
+    /// (the previous binding has been removed).
+    pub name_rev: DashMap<CompositionId, (u64, Option<NameKey>)>,
+    next_seq: AtomicU64,
 }
 
 impl OverlayState {
-    /// Allocate the next monotonic sequence number. Held under the
-    /// caller's write lock.
-    pub(crate) fn next_seq(&mut self) -> u64 {
-        self.next_seq += 1;
-        self.next_seq
+    /// Allocate the next monotonic sequence number. Lock-free;
+    /// concurrent writers each get a unique value.
+    pub(crate) fn next_seq(&self) -> u64 {
+        // SeqCst is overkill for a counter, but the cost is dwarfed
+        // by the surrounding DashMap insert; correctness > micro-perf.
+        self.next_seq.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Total number of overlay entries across all three maps. Used to
-    /// gate the queue-max backpressure check.
+    /// gate the queue-max backpressure check. Approximate under
+    /// concurrent inserts (DashMap::len walks the shards) — the cap
+    /// is a soft-bound anyway.
     pub(crate) fn len(&self) -> usize {
         self.comp.len() + self.name_fwd.len() + self.name_rev.len()
     }
@@ -73,10 +86,10 @@ impl OverlayState {
 
 /// Shared handle held by `PersistentRedbStorage` (writer side) and
 /// the drainer (reader side). Cheap to clone — both halves point at
-/// the same `RwLock<OverlayState>` and `Notify`.
+/// the same `OverlayState` and `Notify`.
 #[derive(Clone)]
 pub(crate) struct WriteBehindHandle {
-    pub overlay: Arc<RwLock<OverlayState>>,
+    pub overlay: Arc<OverlayState>,
     pub notify: Arc<Notify>,
     /// Bounded soft-cap. When exceeded, writers fall back to the
     /// inline redb path (taking the per-op fsync hit) so the queue
@@ -88,7 +101,7 @@ pub(crate) struct WriteBehindHandle {
 impl WriteBehindHandle {
     pub(crate) fn new(max_queue_size: usize) -> Self {
         Self {
-            overlay: Arc::new(RwLock::new(OverlayState::default())),
+            overlay: Arc::new(OverlayState::default()),
             notify: Arc::new(Notify::new()),
             max_queue_size,
         }
@@ -223,16 +236,25 @@ impl WriteBehindDrainer {
 }
 
 fn take_snapshot(handle: &WriteBehindHandle, max_batch: usize) -> OverlaySnapshot {
-    let ov = handle.overlay.read();
+    let ov = &handle.overlay;
     let mut snap = OverlaySnapshot::default();
-    for (&id, (seq, payload)) in ov.comp.iter().take(max_batch) {
-        snap.comp.push((id, *seq, payload.clone()));
+    // DashMap iteration locks one shard at a time, so concurrent
+    // writers to other shards keep flowing while we collect. Entries
+    // observed mid-update may have a half-stale seq vs payload — the
+    // pair is read under the per-shard lock so they're internally
+    // consistent for THIS entry; cross-entry consistency is preserved
+    // at redb-txn boundaries (each entry commits independently).
+    for entry in ov.comp.iter().take(max_batch) {
+        let (seq, payload) = entry.value();
+        snap.comp.push((*entry.key(), *seq, payload.clone()));
     }
-    for (key, (seq, payload)) in ov.name_fwd.iter().take(max_batch) {
-        snap.name_fwd.push((key.clone(), *seq, *payload));
+    for entry in ov.name_fwd.iter().take(max_batch) {
+        let (seq, payload) = entry.value();
+        snap.name_fwd.push((entry.key().clone(), *seq, *payload));
     }
-    for (&id, (seq, payload)) in ov.name_rev.iter().take(max_batch) {
-        snap.name_rev.push((id, *seq, payload.clone()));
+    for entry in ov.name_rev.iter().take(max_batch) {
+        let (seq, payload) = entry.value();
+        snap.name_rev.push((*entry.key(), *seq, payload.clone()));
     }
     snap
 }
@@ -484,21 +506,21 @@ mod tests {
 }
 
 fn prune_committed(handle: &WriteBehindHandle, snapshot: &OverlaySnapshot) {
-    let mut ov = handle.overlay.write();
+    let ov = &handle.overlay;
+    // DashMap::remove_if drops the entry only when the predicate
+    // matches under the per-shard lock — so a writer that updated
+    // the same key with a higher seq during the redb commit isn't
+    // overwritten. This is the same correctness rule the previous
+    // get-then-remove dance enforced under the global RwLock,
+    // expressed directly with the entry-API guard.
     for (id, seq, _) in &snapshot.comp {
-        if ov.comp.get(id).is_some_and(|(s, _)| *s == *seq) {
-            ov.comp.remove(id);
-        }
+        ov.comp.remove_if(id, |_, (s, _)| *s == *seq);
     }
     for (key, seq, _) in &snapshot.name_fwd {
-        if ov.name_fwd.get(key).is_some_and(|(s, _)| *s == *seq) {
-            ov.name_fwd.remove(key);
-        }
+        ov.name_fwd.remove_if(key, |_, (s, _)| *s == *seq);
     }
     for (id, seq, _) in &snapshot.name_rev {
-        if ov.name_rev.get(id).is_some_and(|(s, _)| *s == *seq) {
-            ov.name_rev.remove(id);
-        }
+        ov.name_rev.remove_if(id, |_, (s, _)| *s == *seq);
     }
 }
 

@@ -385,11 +385,12 @@ impl PersistentRedbStorage {
         let Some(handle) = self.write_behind.as_ref() else {
             return OverlayLookup::Miss;
         };
-        let ov = handle.overlay.read();
-        match ov.comp.get(&id) {
+        match handle.overlay.comp.get(&id) {
             None => OverlayLookup::Miss,
-            Some((_, None)) => OverlayLookup::Tombstone,
-            Some((_, Some(c))) => OverlayLookup::Hit(c.clone()),
+            Some(entry) => match entry.value() {
+                (_, None) => OverlayLookup::Tombstone,
+                (_, Some(c)) => OverlayLookup::Hit(c.clone()),
+            },
         }
     }
 
@@ -402,11 +403,12 @@ impl PersistentRedbStorage {
         let Some(handle) = self.write_behind.as_ref() else {
             return OverlayLookup::Miss;
         };
-        let ov = handle.overlay.read();
-        match ov.name_fwd.get(&(ns, name.to_owned())) {
+        match handle.overlay.name_fwd.get(&(ns, name.to_owned())) {
             None => OverlayLookup::Miss,
-            Some((_, None)) => OverlayLookup::Tombstone,
-            Some((_, Some(id))) => OverlayLookup::Hit(*id),
+            Some(entry) => match entry.value() {
+                (_, None) => OverlayLookup::Tombstone,
+                (_, Some(id)) => OverlayLookup::Hit(*id),
+            },
         }
     }
 
@@ -415,11 +417,12 @@ impl PersistentRedbStorage {
         let Some(handle) = self.write_behind.as_ref() else {
             return OverlayLookup::Miss;
         };
-        let ov = handle.overlay.read();
-        match ov.name_rev.get(&id) {
+        match handle.overlay.name_rev.get(&id) {
             None => OverlayLookup::Miss,
-            Some((_, None)) => OverlayLookup::Tombstone,
-            Some((_, Some(k))) => OverlayLookup::Hit(k.clone()),
+            Some(entry) => match entry.value() {
+                (_, None) => OverlayLookup::Tombstone,
+                (_, Some(k)) => OverlayLookup::Hit(k.clone()),
+            },
         }
     }
 
@@ -530,23 +533,26 @@ impl CompositionStorage for PersistentRedbStorage {
             std::collections::HashMap<CompositionId, Option<Composition>>,
             Vec<Composition>,
         ) = if let Some(handle) = &self.write_behind {
-            let ov = handle.overlay.read();
             let mut keep = std::collections::HashMap::new();
             let mut extra = Vec::new();
-            for (id, (_, payload)) in &ov.comp {
+            // DashMap iter — concurrent writers to other shards keep
+            // flowing while we collect this namespace's entries.
+            for entry in handle.overlay.comp.iter() {
+                let id = *entry.key();
+                let payload = &entry.value().1;
                 match payload {
                     Some(c) if c.namespace_id == ns => {
-                        keep.insert(*id, Some(c.clone()));
+                        keep.insert(id, Some(c.clone()));
                         extra.push(c.clone());
                     }
                     Some(_) => {
                         // Other namespace — overlay still hides any
                         // redb row with the same id (e.g. moved between
                         // namespaces). Mark as "skip" without an extra.
-                        keep.insert(*id, None);
+                        keep.insert(id, None);
                     }
                     None => {
-                        keep.insert(*id, None);
+                        keep.insert(id, None);
                     }
                 }
             }
@@ -583,11 +589,14 @@ impl CompositionStorage for PersistentRedbStorage {
         // AND the queue isn't saturated. On saturation we fall back
         // to the inline path so the queue can drain.
         if let Some(handle) = &self.write_behind {
-            let mut ov = handle.overlay.write();
-            if ov.len() < handle.max_queue_size {
-                let seq = ov.next_seq();
-                ov.comp.insert(id, (seq, Some(comp.clone())));
-                drop(ov);
+            // DashMap-based overlay: the queue-cap check is
+            // approximate (DashMap::len walks shards) but the cap
+            // is a soft-bound. The insert below is lock-free for
+            // non-conflicting `id`s — concurrent writers no longer
+            // serialize on a global RwLock as they did pre-B1.
+            if handle.overlay.len() < handle.max_queue_size {
+                let seq = handle.overlay.next_seq();
+                handle.overlay.comp.insert(id, (seq, Some(comp.clone())));
                 handle.notify.notify_one();
                 // Cache update mirrors the inline path — readers
                 // following this put can still see the value via
@@ -631,24 +640,25 @@ impl CompositionStorage for PersistentRedbStorage {
                 OverlayLookup::Hit(c) => Some(c),
                 _ => None,
             };
-            let mut ov = handle.overlay.write();
-            if ov.len() < handle.max_queue_size {
-                let seq = ov.next_seq();
-                ov.comp.insert(id, (seq, None));
+            if handle.overlay.len() < handle.max_queue_size {
+                let seq = handle.overlay.next_seq();
+                handle.overlay.comp.insert(id, (seq, None));
                 // Drop the reverse-name binding (and forward, if we
                 // know it). The overlay is consulted before redb on
-                // both lookups.
-                let prior_name = ov
+                // both lookups. Reading name_rev to find the prior
+                // forward key is per-entry consistent (DashMap holds
+                // the per-shard lock for that read).
+                let prior_name = handle
+                    .overlay
                     .name_rev
                     .get(&id)
-                    .and_then(|(_, payload)| payload.clone());
+                    .and_then(|entry| entry.value().1.clone());
                 if let Some(name_key) = prior_name.clone() {
-                    let nseq = ov.next_seq();
-                    ov.name_fwd.insert(name_key, (nseq, None));
+                    let nseq = handle.overlay.next_seq();
+                    handle.overlay.name_fwd.insert(name_key, (nseq, None));
                 }
-                let rseq = ov.next_seq();
-                ov.name_rev.insert(id, (rseq, None));
-                drop(ov);
+                let rseq = handle.overlay.next_seq();
+                handle.overlay.name_rev.insert(id, (rseq, None));
                 handle.notify.notify_one();
                 self.cache.lock().lock_or_die("redb.cache").pop(&id);
                 // Existence flag: overlay said "yes" → existed; else
@@ -755,8 +765,7 @@ impl CompositionStorage for PersistentRedbStorage {
     ) -> Result<(), PersistentStoreError> {
         // rev-3 write-behind path.
         if let Some(handle) = &self.write_behind {
-            let mut ov = handle.overlay.write();
-            if ov.len() < handle.max_queue_size {
+            if handle.overlay.len() < handle.max_queue_size {
                 let key = (ns, name.clone());
                 // If this id had a prior name binding (visible from
                 // either the overlay or — implicitly — redb), we'd
@@ -767,21 +776,21 @@ impl CompositionStorage for PersistentRedbStorage {
                 // "drop prior forward entry for this id" rule when
                 // it lands the redb update. Net effect matches the
                 // inline path.
-                let prior_rev = ov
+                let prior_rev = handle
+                    .overlay
                     .name_rev
                     .get(&id)
-                    .and_then(|(_, payload)| payload.clone());
+                    .and_then(|entry| entry.value().1.clone());
                 if let Some(prior) = prior_rev {
                     if prior != key {
-                        let pseq = ov.next_seq();
-                        ov.name_fwd.insert(prior, (pseq, None));
+                        let pseq = handle.overlay.next_seq();
+                        handle.overlay.name_fwd.insert(prior, (pseq, None));
                     }
                 }
-                let fseq = ov.next_seq();
-                ov.name_fwd.insert(key.clone(), (fseq, Some(id)));
-                let rseq = ov.next_seq();
-                ov.name_rev.insert(id, (rseq, Some(key)));
-                drop(ov);
+                let fseq = handle.overlay.next_seq();
+                handle.overlay.name_fwd.insert(key.clone(), (fseq, Some(id)));
+                let rseq = handle.overlay.next_seq();
+                handle.overlay.name_rev.insert(id, (rseq, Some(key)));
                 handle.notify.notify_one();
                 return Ok(());
             }
@@ -831,15 +840,13 @@ impl CompositionStorage for PersistentRedbStorage {
                 OverlayLookup::Hit(id) => Some(id),
                 _ => None,
             };
-            let mut ov = handle.overlay.write();
-            if ov.len() < handle.max_queue_size {
-                let fseq = ov.next_seq();
-                ov.name_fwd.insert(key_tup.clone(), (fseq, None));
+            if handle.overlay.len() < handle.max_queue_size {
+                let fseq = handle.overlay.next_seq();
+                handle.overlay.name_fwd.insert(key_tup.clone(), (fseq, None));
                 if let Some(id) = prior_overlay {
-                    let rseq = ov.next_seq();
-                    ov.name_rev.insert(id, (rseq, None));
+                    let rseq = handle.overlay.next_seq();
+                    handle.overlay.name_rev.insert(id, (rseq, None));
                 }
-                drop(ov);
                 handle.notify.notify_one();
                 if prior_overlay.is_some() {
                     return Ok(true);
@@ -885,14 +892,19 @@ impl CompositionStorage for PersistentRedbStorage {
         //   - Overlay Some(id) for a name absent from redb is added.
         let overlay_keep: std::collections::HashMap<String, Option<CompositionId>> =
             if let Some(handle) = &self.write_behind {
-                let ov = handle.overlay.read();
-                ov.name_fwd
+                handle
+                    .overlay
+                    .name_fwd
                     .iter()
-                    .filter(|((entry_ns, name), _)| {
-                        *entry_ns == ns
-                            && prefix.is_none_or(|p| name.starts_with(p))
+                    .filter(|entry| {
+                        let (entry_ns, name) = entry.key();
+                        *entry_ns == ns && prefix.is_none_or(|p| name.starts_with(p))
                     })
-                    .map(|((_, name), (_, payload))| (name.clone(), *payload))
+                    .map(|entry| {
+                        let name = entry.key().1.clone();
+                        let payload = entry.value().1;
+                        (name, payload)
+                    })
                     .collect()
             } else {
                 std::collections::HashMap::new()

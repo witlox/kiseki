@@ -28,6 +28,10 @@ redb = { workspace = true }
 postcard = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }
+# B1 (optimization-backlog): write-behind overlay's three maps and
+# `next_seq` counter are sharded via DashMap + AtomicU64 so concurrent
+# writers don't serialize on a global RwLock.
+dashmap = "6"
 serde = { version = "1", features = ["derive"] }
 # §D10 observability — exposes hydrator + persistent-store counters /
 # gauges / histograms via the same `prometheus::Registry` the rest of
