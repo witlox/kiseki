@@ -183,6 +183,19 @@ The 33 scenarios in `native-gateway.feature` are the integration witness. Per AD
 - All 33 scenarios green (or marked `@flaky` per the existing convention with explanatory Gherkin comments — gate-1 should not surface new flakes).
 - `KISEKI_BDD_FAST=1` lane skips `@native @perf @smoke` (those are nightly-only).
 
+### Phase-6 fault-injection BDD additions (R2-O3 + R3-O3 acceptance)
+
+Per ADR-042 §15 hot spot 9 + §16.1 phase 6 amendments, phase 6 MUST include the following four fault-injection BDD scenarios. These were called out by the gate-1 round-2 + round-3 adversary findings; gate-2 auditor verifies presence.
+
+| Scenario | Tag | What it covers |
+|---|---|---|
+| Probe timeout simulation | `@native @binding-probe` | `KISEKI_NATIVE_PROBE_TIMEOUT_MS=10` artificially short forces ibverbs probe to time out; selector continues with TCP-framed + gRPC; banner reflects the timeout |
+| Listener crash + restart cycle | `@native @binding-restart` | Inject SIGCONT-driven listener panic on TCP-framed; topology version bumps; client falls back to gRPC; backoff-restart succeeds; topology version bumps again; client returns to TCP-framed |
+| Topology version regress under operator error | `@native @topology` | Manually publish a regressed `topology_version`; client refresh fails closed via 30 s TTL safety net |
+| cxi attestation replay under load | `@native @binding-cxi @attestation` (deferred to phase 10) | Capture an attestation envelope; replay against the server within the 60 s window; assert `Unauthenticated{cxi_attestation_replay}` and rate-limited handling. Requires cxi binding implementation; lands with phase 10. |
+
+Phases 0–8 ship the first three; the fourth ships with phase 10 (cxi binding implementation).
+
 ### Status (as of `efab8ab`): 15 / 38 scenarios green
 
 The feature file expanded from the planned "33 scenarios" to **38** when

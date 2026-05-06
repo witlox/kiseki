@@ -338,3 +338,102 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     When client-a issues any native op
     Then the metric kiseki_clock_skew_seconds exceeds the alarm threshold (5s) and an operator alert fires
     And the op itself proceeds (correctness preserved by the existing time invariants and clock-quality observability)
+
+  # --- ADR-042 round-1 + round-2 + round-3 binding-rewrite scenarios ---
+  # Closes the gate-1 fault-injection BDD coverage gap (R3-O3) and
+  # asserts the contract/binding architecture's runtime behavior.
+
+  @native @binding-probe
+  Scenario: Binding probe timeout falls back to next-best binding
+    Given the kiseki-server is configured with KISEKI_NATIVE_PROBE_TIMEOUT_MS=10
+    And the host has libibverbs installed but `/sys/class/infiniband/*` is artificially blocked
+    When the server starts and runs phase-1 probes
+    Then the ibverbs binding self-disqualifies with Unavailable{reason="no usable port"}
+    And the startup banner enumerates: tcp-framed (Available), grpc-h2 (Available), ibverbs (Unavailable), libfabric (per host)
+    And the server starts successfully with at least one binding listening
+    And kiseki_native_binding_probe_duration_seconds{binding="ibverbs"} records the probe time
+
+  @native @binding-probe
+  Scenario: All bindings fail probe — server exits cleanly
+    Given the kiseki-server is started with no listen addresses configured for any binding
+    When the server runs phase-3 listener-spawn
+    Then the server exits with code 3 and the message indicates no bindings could spawn
+
+  @native @binding-restart
+  Scenario: Binding listener crashes mid-flight — clients drain gracefully
+    Given a healthy native client with open connections on tcp-framed and grpc-h2 to node-2
+    And client-a has 3 in-flight requests on the tcp-framed connection
+    When the tcp-framed listener on node-2 panics
+    Then the runtime emits kiseki_native_binding_listener_crashed_total{binding="tcp-framed"} and bumps topology_version
+    And the client observes the topology change on the next response trailer
+    And the client opens a new grpc-h2 connection to node-2 for new work
+    And the 3 in-flight tcp-framed requests run to completion within KISEKI_NATIVE_DRAIN_BUDGET_MS
+    And kiseki_native_client_binding_drain_total{binding="tcp-framed", reason="listener_crashed"} increments by 1
+
+  @native @binding-restart
+  Scenario: Backoff-restart restores binding after crash
+    Given the tcp-framed binding crashed and entered backoff
+    When the runtime's backoff-restart timer fires (default 5 s)
+    And the listener spawn succeeds
+    Then topology_version bumps and the new endpoint is advertised
+    And clients eventually re-establish tcp-framed connections to node-2
+
+  @native @topology
+  Scenario: Topology version regress falls back to TTL safety net
+    Given the cluster manually publishes a regressed topology_version (operator error simulation)
+    When the client polls or sees the regressed version on a response trailer
+    Then the client refuses the regression and continues with its highest-seen version
+    And after 30 s the TopologyCache TTL fires and the client refreshes regardless
+
+  @native @routing
+  Scenario: Per-edge selection — heterogeneous binding cluster
+    Given a 4-node cluster where node-1 + node-2 advertise libfabric/cxi + tcp-framed + grpc-h2
+    And node-3 + node-4 advertise tcp-framed + grpc-h2 only
+    And the local client environment has libfabric/cxi available
+    When the client opens connections to all four nodes for a multi-node operation
+    Then the client uses libfabric/cxi for node-1 + node-2
+    And the client uses tcp-framed for node-3 + node-4 (next-best mutually-supported)
+    And request_id + idempotency_key carry across the binding boundary within the same operation
+
+  @native @drain
+  Scenario: Draining node serves in-flight lease writes but rejects new opens
+    Given node-2 is currently the leader for shard S1
+    And node-2 is in Draining state with drain_state.accepts_new_work=false (quiesce in progress)
+    And client-a holds an active lease on inode I in S1
+    When client-a issues a lease-bound Write to node-2 (carrying a valid fencing_token)
+    Then the server processes the write to completion (in-flight lease respected)
+    When client-b calls AcquireLease(inode J in S1, mode=Write)
+    Then the server rejects with Unavailable{node_draining}
+
+  @native @drain
+  Scenario: Graceful release window allows straggler in-flight work
+    Given node-2 has quiesced (drain_state.accepts_new_work flips false → true for the graceful-release window)
+    And client-c has a stale topology that still routes to node-2
+    When client-c issues a lease-bound write within KISEKI_NATIVE_DRAIN_GRACEFUL_RELEASE_MS
+    Then the server accepts the write (briefly) until the window closes
+    And after the window, node-2 transitions to Evicted and bindings advertise empty
+
+  @native @binding-cxi @attestation
+  Scenario: cxi attestation envelope replay rejected
+    Given the libfabric/cxi binding is active on node-1
+    And client-a has successfully attested with envelope E (nonce N, issued_at T)
+    When the same envelope E is replayed against node-1 within 60 seconds
+    Then the server rejects with Unauthenticated{cxi_attestation_replay}
+    And the metric kiseki_native_binding_handshake_failures_total{binding="Libfabric/Cxi", reason="cxi_attestation_replay"} increments
+
+  @native @binding-cxi @attestation
+  Scenario: cxi attestation rate-limited under flood
+    Given the libfabric/cxi binding is active on node-1
+    And source S has consumed its rate-limit budget (default 100 attempts / 60 s)
+    When source S issues a 101st attestation attempt within the window
+    Then the server rejects with ResourceExhausted{cxi_attestation_rate_limit}
+    And kiseki_native_cxi_attestation_throttled_total{source="S", reason="rate_limit"} increments
+    And the rejection happens before envelope decode (no ECDSA verify cost paid)
+
+  @native @binding-cxi @attestation
+  Scenario: cxi attestation oversize envelope rejected
+    Given the libfabric/cxi binding is active on node-1
+    When a client sends a CxiAttestationEnvelope with cert_chain_der totalling 9 KiB (over the 8 KiB cap)
+    Then the server rejects with InvalidArgument{cxi_attestation_oversize}
+    And the connection closes immediately
+    And no postcard parsing of the envelope body is attempted

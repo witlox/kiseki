@@ -754,3 +754,35 @@ Phase 0 (common, proto)
 - Phase 5 (audit) can start as soon as Phase 3 is done
 - Phase 6.5 (block I/O) depends only on Phase 0 and can be built in parallel with Phases 1-5
 - Phase 11.5 (advisory) can start as soon as Phase 5 (audit) and the Phase 11 advisory-policy endpoint are done; it is independent of Phases 6-10 because it does not link against any data-path crate
+
+---
+
+## ADR-042 native gateway phases (transport-binding architecture)
+
+ADR-042 introduces a separate phase numbering for the native gateway,
+parallel to the workspace-wide phases above. ADR-042's phases sit
+inside Phase 9 (gateways) of the workspace plan but have their own
+internal sequencing because the contract/binding split + per-binding
+implementation order have specific dependencies.
+
+| ADR-042 phase | What | Depends on (workspace) | Depends on (ADR-042) |
+|---|---|---|---|
+| 0 | Contract Rust types in `kiseki-proto::native_contract` (`NodeBindings`, `BindingEndpoint`, `LatencyClass`, `RequestPrincipal`, `DrainState`, `CxiAttestationEnvelope`) | Phase 0 (proto) | none |
+| 1 | gRPC/h2 binding (refactor existing) | Phase 9 (gateways) | 0 |
+| 2 | `kiseki_gateway::native::ServerImpl` binding-agnostic handler | Phase 9 | 0, 1 |
+| 3 | TCP-framed-postcard binding | Phase 9 | 0, 2; reuses ADR-041 fabric framing primitives |
+| 4 | `kiseki-transport::native::selector` (probe + selection per ADR-042 §3.1) | Phase 2 (transport) | 0, 1, 3 |
+| 5 | `kiseki_client::native::NativeClient` + `TopologyCache` (per-edge selection per §3.2, drain protocol per §3.2.1, hard-close discipline per §3.2.2) | Phase 10 (client) | 0, 4 |
+| 6 | BDD steps for `native-gateway.feature` (parameterized via `@binding=*` tags; fault-injection scenarios per §16.1 phase 6 + R3-O3 acceptance) | Phase 9 | 1, 2, 3, 4, 5 |
+| 7 | `kiseki-profile --protocol native --binding={grpc\|tcp\|ibverbs\|libfabric\|auto}` driver | none | 1, 3 |
+| 8 | Re-measure against §14 perf budget per binding (gRPC/h2 + TCP-framed in this phase) | none | 5, 7 |
+| 9 | ibverbs binding (mTLS-over-rdma-cm; Linux ≥ 6.4) | Phase 2 (transport) | 0, 2, 4, 5; requires RDMA hardware to validate per §14.1 |
+| 10 | libfabric binding (cxi + verbs providers; cxi attestation envelope per §2.4.2 + §2.4.2.1 DoS controls; efa deferred) | Phase 2 (transport) | 0, 2, 4, 5; requires Slingshot+Cassini or RoCE hardware |
+
+**Sequencing notes**:
+- Phases 0–8 ship in the first deliverable (the v1 native gateway).
+- Phases 9–10 follow once the contract is validated and TCP-framed has been characterized.
+- Phase 9–10 implementer MUST close ADR-042 round-3 findings R3-M1 (per-binding hard-close discipline §3.2.2) and R3-M3 (`DrainState` lifecycle §1.7.1) before shipping.
+- Phase 10 implementer MUST include the §2.4.2.1 DoS mitigations (rate limit, size caps, cooldown, bounded verify pool) — non-optional per I-NG26.
+
+**ADR-042 spec source of truth**: `specs/architecture/adr/042-native-gateway-data-service.md`. Round-3 PASS as of 2026-05-06; ready for implementer phase 0.

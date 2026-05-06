@@ -650,6 +650,28 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 | **Recovery** | Spec contract: implementer MUST use `BatchFetchDek` on multi-chunk Reads. CI-level lint (gate-2 audit) verifies no per-chunk `FetchDek` loop in the TrustedCompute Read path. |
 | **Severity** | **P2 if regressed** — TrustedCompute would become slower than ServerOnly, defeating the mode |
 
+### F-NG14: Binding-selection startup-probe failure
+
+| Field | Value |
+|---|---|
+| **Description** | A native binding's startup probe (ADR-042 §3.1) fails because of a transient cause: dlopen contention on a heavily loaded host, `/sys/class/infiniband` masked in a container, libfabric `fi_getinfo()` hang, or an operator-pinned binding whose system .so isn't installed. |
+| **Blast radius** | Single binding — that binding self-disqualifies and the runtime falls through to the next-best `Available` binding. Server starts. If ALL bindings fail probe, the server exits with code 3. |
+| **Detection** | `kiseki_native_binding_probe_duration_seconds{binding}` histogram + `kiseki_native_binding_handshake_failures_total{binding, reason}` (e.g. `dlopen_failed` for path/perms-rejected libraries). Startup banner enumerates every binding's outcome. |
+| **Degradation** | Operators don't get the optimal binding for their hardware, but throughput falls back gracefully to a slower binding (gRPC always works as the worst-case fallback). |
+| **Recovery** | Operator restarts the kiseki-server process after fixing the transient cause (install missing system lib, raise `KISEKI_NATIVE_PROBE_TIMEOUT_MS`, fix path-validation perms). The §3.4 listener-crash backoff-restart path doesn't trigger here — startup probe is one-shot. |
+| **Severity** | **P3** (single-binding impact; bounded fallback; observable in startup banner) |
+
+### F-NG15: RDMA QP-cleanup leak under churn
+
+| Field | Value |
+|---|---|
+| **Description** | An RDMA binding's per-binding hard-close discipline (ADR-042 §3.2.2) skips a cleanup step (e.g. forgot `ibv_dereg_mr` between `ibv_destroy_qp` and process exit), leaking kernel resources (memory regions stay pinned, QP slots stay allocated). On a node that cycles bindings many times in a session (operator iteration during deployment, listener-crash restart loop), the leak accumulates until NIC limits are hit. |
+| **Blast radius** | Single node — that node loses its RDMA capacity. Other nodes unaffected; topology routes around. |
+| **Detection** | Periodic `ibv_devinfo` (or libfabric provider equivalent) MR/QP counter reading vs baseline. Phase 9–10 implementer 1000-close-cycle stress test catches before release. |
+| **Degradation** | Node loses ability to spawn new RDMA listener; existing connections continue. Other bindings on the same node (TCP-framed, gRPC) unaffected. |
+| **Recovery** | Restart the kiseki-server process to release leaked kernel resources. If kernel-level leak (driver bug), node reboot. Fix: implementer addresses the missed cleanup step in the binding's hard-close path. |
+| **Severity** | **P2** (per-node RDMA capacity loss; observable; gate-2 audit blocks release on detected leak) |
+
 ### F-NG11: Replay attack with captured pre-rotation cert
 
 | Field | Value |
@@ -669,10 +691,10 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 |---|---|---|
 | P0 | 2 | System key manager loss, system KEK compromise (F-NG11 replay attack: P0 *if mTLS bypass exists*; design-resistant, see A-NG19) |
 | P1 | 7 | Tenant KMS loss, log corruption, key compromise, algo deprecation, control plane down, network partition (wide), crypto-shred with cached plaintext (F-CC3) |
-| P2 | 12 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm, control plane quorum loss (F-O8), DEK fetch failure (F-NG5), native heartbeat starvation if observed (F-NG7) |
-| P3 | 25 | Gateway crash, client crash, device failure, split latency, replay attack (S3 layer), bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4), drain interrupted (F-O4), drain refused (F-O5), merge/split race (F-O6), node-add mid-operation (F-O7), merge convergence timeout (F-O9), native cert/payload mismatch (F-NG1), native stream interrupted (F-NG2), native leader-change mid-stream (F-NG3), native lease holder crash (F-NG4), native heartbeat starvation steady-state (F-NG7), native cert revocation mid-stream (F-NG8), native clock skew (F-NG9), native proxy mid-fail (F-NG10), native multi-chunk PUT partial failure (F-NG12) |
+| P2 | 13 | Shard quorum loss, compaction storm, stale view, federation peer down, chunk loss, crypto-shred window, network partition (narrow), advisory outage, advisory audit storm, control plane quorum loss (F-O8), DEK fetch failure (F-NG5), native heartbeat starvation if observed (F-NG7), **RDMA QP-cleanup leak under churn (F-NG15)** |
+| P3 | 26 | Gateway crash, client crash, device failure, split latency, replay attack (S3 layer), bitmap corruption, extent leak, cache crash plaintext (F-CC1), L2 NVMe corruption (F-CC2), staging NVMe exhaustion (F-CC4), drain interrupted (F-O4), drain refused (F-O5), merge/split race (F-O6), node-add mid-operation (F-O7), merge convergence timeout (F-O9), native cert/payload mismatch (F-NG1), native stream interrupted (F-NG2), native leader-change mid-stream (F-NG3), native lease holder crash (F-NG4), native heartbeat starvation steady-state (F-NG7), native cert revocation mid-stream (F-NG8), native clock skew (F-NG9), native proxy mid-fail (F-NG10), native multi-chunk PUT partial failure (F-NG12), **native binding-probe failure (F-NG14)** |
 
 P2-if-regressed: F-NG13 (TrustedCompute multi-chunk latency cliff — captured for future audit; resolved-design avoids it via `BatchFetchDek`).
 
-Total: **47 failure modes** catalogued with blast radius, detection,
+Total: **49 failure modes** catalogued with blast radius, detection,
 degradation, and recovery.
