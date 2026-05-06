@@ -74,7 +74,13 @@ pub struct InMemoryGateway {
     master_key: SystemMasterKey,
     dedup_policy: DedupPolicy,
     tenant_hmac_key: Option<Vec<u8>>,
-    view_store: Option<Arc<std::sync::Mutex<ViewStore>>>,
+    /// `parking_lot::RwLock`: read-mostly (every gateway read takes
+    /// a read lock; only the stream processor's 100 ms watermark
+    /// advance takes a write lock). std::sync::Mutex here was a
+    /// 9.78% CPU hog on the post-V3+LRU native flame at 64 KiB GET
+    /// — sixteen concurrent readers all serialized through one
+    /// futex.
+    view_store: Option<Arc<parking_lot::RwLock<ViewStore>>>,
     /// Total gateway requests (reads + writes).
     pub requests_total: AtomicU64,
     /// Cumulative bytes written through the gateway.
@@ -202,7 +208,13 @@ pub struct InMemoryGateway {
     /// (256 MiB), oldest entries are dropped FIFO. Memory pressure
     /// is bounded; correctness is unaffected because the chunk store
     /// is the source of truth.
-    decrypt_cache: std::sync::Mutex<DecryptCache>,
+    /// `parking_lot::Mutex` not `std::sync::Mutex`: locked twice per
+    /// read (cache check + cache insert), once per chunk. With 16
+    /// concurrent readers std's futex contention costed ~11% of CPU
+    /// on the post-V3+LRU native flame at 64 KiB GET. parking_lot's
+    /// adaptive spin + word-sized lock body is meaningfully cheaper
+    /// for short, contended critical sections.
+    decrypt_cache: parking_lot::Mutex<DecryptCache>,
 }
 
 /// Lock-free snapshot of the namespace metadata fields the write hot
@@ -412,7 +424,7 @@ impl InMemoryGateway {
             target_copies: 0,
             retry_metrics: None,
             fsync_hooks: std::sync::RwLock::new(Vec::new()),
-            decrypt_cache: std::sync::Mutex::new(DecryptCache::new(read_decrypt_cache_ttl())),
+            decrypt_cache: parking_lot::Mutex::new(DecryptCache::new(read_decrypt_cache_ttl())),
             namespace_meta: std::sync::Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -438,10 +450,7 @@ impl InMemoryGateway {
     /// plaintext byte is zeroized via the `Zeroizing` drop. Returns
     /// the number of entries wiped, for the audit event.
     pub fn wipe_decrypt_cache(&self) -> usize {
-        let mut cache = self
-            .decrypt_cache
-            .lock()
-            .lock_or_die("mem_gateway.decrypt_cache");
+        let mut cache = self.decrypt_cache.lock();
         let n = cache.map.len();
         cache.wipe();
         n
@@ -898,7 +907,7 @@ impl InMemoryGateway {
 
     /// Attach a shared view store for staleness enforcement (I-K9).
     #[must_use]
-    pub fn with_view_store(mut self, vs: Arc<std::sync::Mutex<ViewStore>>) -> Self {
+    pub fn with_view_store(mut self, vs: Arc<parking_lot::RwLock<ViewStore>>) -> Self {
         self.view_store = Some(vs);
         self
     }
@@ -1096,11 +1105,20 @@ impl GatewayOps for InMemoryGateway {
         // lookups (cache or redb hit) still serve normally.
         #[allow(clippy::items_after_statements)]
         const COMP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
-        let budget = std::env::var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1000);
-        let comp_retry_budget = std::time::Duration::from_millis(budget);
+        // Parse env once via OnceLock — `std::env::var` takes a
+        // process-global RwLock under the hood (futex-contended on
+        // Linux). Reading it on every gateway.read() was 9.78% of
+        // CPU at 64 KiB GET on the perf flame.
+        #[allow(clippy::items_after_statements)]
+        static COMP_RETRY_BUDGET: std::sync::OnceLock<std::time::Duration> =
+            std::sync::OnceLock::new();
+        let comp_retry_budget = *COMP_RETRY_BUDGET.get_or_init(|| {
+            let ms = std::env::var("KISEKI_GATEWAY_READ_RETRY_BUDGET_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1000);
+            std::time::Duration::from_millis(ms)
+        });
         let deadline = std::time::Instant::now() + comp_retry_budget;
         // Loop, cloning the composition out before releasing the lock,
         // so the parking_lot guard is never held across the
@@ -1132,7 +1150,7 @@ impl GatewayOps for InMemoryGateway {
                         m.read_retry_exhausted_total.inc();
                     }
                     tracing::warn!(
-                        budget_ms = budget,
+                        budget_ms = comp_retry_budget.as_millis() as u64,
                         "gateway read: composition not found within retry budget — surfacing inner error",
                     );
                     Err(guard
@@ -1173,7 +1191,7 @@ impl GatewayOps for InMemoryGateway {
 
         // Check view staleness and ReadYourWrites consistency (I-K9, I-V3).
         if let Some(ref vs) = self.view_store {
-            let view_store = vs.lock().lock_or_die("mem_gateway.view_store");
+            let view_store = vs.read();
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -1228,11 +1246,7 @@ impl GatewayOps for InMemoryGateway {
         for chunk_id in &comp.chunks {
             // Cache lookup first (cheap mutex; clone is unavoidable
             // because the cache holds Vec<u8> shared across calls).
-            if let Some(cached) = self
-                .decrypt_cache
-                .lock()
-                .lock_or_die("mem_gateway.decrypt_cache")
-                .get(chunk_id)
+            if let Some(cached) = self.decrypt_cache.lock().get(chunk_id)
             {
                 plaintext.extend_from_slice(&cached);
                 continue;
@@ -1273,10 +1287,7 @@ impl GatewayOps for InMemoryGateway {
 
             // Insert into cache for the next call. Bounded eviction
             // ensures memory stays under MAX_CACHE_BYTES.
-            self.decrypt_cache
-                .lock()
-                .lock_or_die("mem_gateway.decrypt_cache")
-                .insert(*chunk_id, decrypted);
+            self.decrypt_cache.lock().insert(*chunk_id, decrypted);
         }
 
         // Pull Content-Type from the composition for RFC 6838 round-trip

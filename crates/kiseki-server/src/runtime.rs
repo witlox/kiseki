@@ -987,7 +987,13 @@ pub async fn run_main(
             tracing::info!("view store: in-memory (no KISEKI_DATA_DIR)");
             Box::new(kiseki_view::persistent::MemoryStorage::new())
         };
-    let view_store = Arc::new(std::sync::Mutex::new(
+    // parking_lot::RwLock — read-mostly. The mem_gateway read path
+    // takes a read lock to check view staleness on every gateway
+    // read; std::sync::Mutex was 9.78% of CPU at 64 KiB GET on the
+    // perf flame because all c=16 readers serialized through it.
+    // Stream processor (advances watermarks every 100 ms) takes a
+    // write lock briefly.
+    let view_store = Arc::new(parking_lot::RwLock::new(
         kiseki_view::view::ViewStore::with_storage(view_storage),
     ));
 
@@ -1013,8 +1019,7 @@ pub async fn run_main(
         compliance_tags: Vec::new(),
     });
     let _ = view_store
-        .lock()
-        .lock_or_die("runtime.view_store")
+        .write()
         .create_view(kiseki_view::ViewDescriptor {
             view_id: bootstrap_view,
             tenant_id: bootstrap_tenant,
@@ -1433,7 +1438,7 @@ pub async fn run_main(
     tokio::spawn(async move {
         loop {
             tokio::task::block_in_place(|| {
-                let mut vs = sp_views.lock().lock_or_die("runtime.sp_views");
+                let mut vs = sp_views.write();
                 let mut sp = kiseki_view::stream_processor::TrackedStreamProcessor::new(
                     sp_log.as_ref(),
                     &mut *vs,
