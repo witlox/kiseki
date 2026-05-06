@@ -42,6 +42,15 @@ use crate::native::{TcpFramedClient, TcpFramedClientError};
 /// native binding. Holds a pool of independent connections so
 /// concurrent FUSE / NFS / S3 callers fan out across server-side
 /// reader tasks (one per connection on the server).
+///
+/// Cheap to clone: the `clients` Vec is `Arc<TcpFramedClient>` so
+/// clones share the same connection pool. The round-robin counter
+/// is also `Arc`-shared so all clones balance across the same set
+/// of slots (no double-loading slot 0 by two clones starting fresh).
+/// Lets callers (e.g. the FUSE perf driver) hold one instance for
+/// direct `.await` calls AND hand a peer instance to a `KisekiFuse`
+/// inode-table holder without duplicating the underlying TCP
+/// connections.
 pub struct NativeRemoteGateway {
     /// Round-robin pool. Each connection has its own server-side
     /// reader task; with N connections the server processes up to N
@@ -49,8 +58,18 @@ pub struct NativeRemoteGateway {
     /// `KISEKI_NATIVE_GATEWAY_POOL` (default 16) at construction.
     clients: Vec<Arc<TcpFramedClient>>,
     /// Per-call selector — atomic so concurrent callers don't all
-    /// hash to slot 0.
-    next: AtomicUsize,
+    /// hash to slot 0. `Arc`-wrapped so cheap clones share the
+    /// counter.
+    next: Arc<AtomicUsize>,
+}
+
+impl Clone for NativeRemoteGateway {
+    fn clone(&self) -> Self {
+        Self {
+            clients: self.clients.clone(),
+            next: Arc::clone(&self.next),
+        }
+    }
 }
 
 /// Default pool size when `KISEKI_NATIVE_GATEWAY_POOL` isn't set.
@@ -84,7 +103,7 @@ impl NativeRemoteGateway {
         }
         Ok(Self {
             clients,
-            next: AtomicUsize::new(0),
+            next: Arc::new(AtomicUsize::new(0)),
         })
     }
 

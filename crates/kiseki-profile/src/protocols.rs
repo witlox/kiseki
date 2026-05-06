@@ -567,14 +567,24 @@ impl Driver for PnfsDriver {
 // on the inode-table mutex held across the gateway call.
 
 struct FuseDriver {
-    /// `tokio::sync::RwLock` — read lock for build-request /
-    /// gateway calls, write lock for inode-table mutation. Reads
-    /// (`get`) take a read lock, do an inode lookup + composition
-    /// id resolution, then drop the lock for the gateway call.
-    /// Writes (`put`) follow the 3-phase pattern above.
+    /// `tokio::sync::RwLock` — read lock for build-request, write
+    /// lock for inode-table mutation. The KisekiFuse instance holds
+    /// a peer-cloned `NativeRemoteGateway` for API symmetry but the
+    /// hot path (gateway call) bypasses it via the separate
+    /// `gateway` field below.
     fs: tokio::sync::RwLock<
         kiseki_client::fuse_fs::KisekiFuse<kiseki_client::native_remote::NativeRemoteGateway>,
     >,
+    /// Direct gateway handle — same connection pool the
+    /// KisekiFuse instance holds (cheap `Arc`-shared clone). Used
+    /// to `.await` the gateway call DIRECTLY from the perf-driver
+    /// task instead of round-tripping through KisekiFuse's
+    /// `block_gateway_pub` which `block_in_place`s into a separate
+    /// dedicated runtime. The detour was a measurable cap on PUT
+    /// throughput (the read lock was held for the full
+    /// `block_in_place` window; under c=16 the write-lock handoff
+    /// then bottlenecked).
+    gateway: Arc<kiseki_client::native_remote::NativeRemoteGateway>,
     tenant_id: OrgId,
     namespace_id: NamespaceId,
 }
@@ -588,9 +598,13 @@ impl FuseDriver {
         .map_err(|e| format!("native-remote connect: {e}"))?;
         let tenant_id = OrgId(uuid::Uuid::from_u128(1));
         let namespace_id = NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
-        let fs = kiseki_client::fuse_fs::KisekiFuse::new(gateway, tenant_id, namespace_id);
+        // Hand KisekiFuse a peer clone so it satisfies the API but
+        // never actually drives the connection pool — the FuseDriver
+        // hits `gateway` directly.
+        let fs = kiseki_client::fuse_fs::KisekiFuse::new(gateway.clone(), tenant_id, namespace_id);
         Ok(Self {
             fs: tokio::sync::RwLock::new(fs),
+            gateway: Arc::new(gateway),
             tenant_id,
             namespace_id,
         })
@@ -604,8 +618,7 @@ impl Driver for FuseDriver {
         let name = format!("fuse-prof-{}", uuid::Uuid::new_v4().simple());
 
         // Phase 1 — build the WriteRequest under a read lock. Many
-        // concurrent puts can do this in parallel (read lock allows
-        // shared access).
+        // concurrent puts can do this in parallel.
         let req = {
             let fs = self.fs.read().await;
             fs.create_build_request(1, &name, payload)
@@ -613,16 +626,26 @@ impl Driver for FuseDriver {
         };
         let size = req.data.len() as u64;
 
-        // Phase 2 — gateway call WITHOUT holding the FuseDriver
-        // lock. Other FuseDriver puts/gets proceed concurrently.
-        let resp = {
-            let fs = self.fs.read().await;
-            fs.block_gateway_pub(fs.gateway().write(req))
-                .map_err(|e| format!("fuse gateway write: {e}"))?
-        };
+        // Phase 2 — gateway call. Direct `.await` on the
+        // FuseDriver's own gateway handle — NO read lock held, NO
+        // `block_in_place` round-trip into KisekiFuse's dedicated
+        // runtime. Lets dozens of concurrent puts overlap on the
+        // connection pool.
+        let resp = self
+            .gateway
+            .write(kiseki_gateway::ops::WriteRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                data: req.data,
+                name: req.name,
+                conditional: req.conditional,
+                workflow_ref: req.workflow_ref,
+            })
+            .await
+            .map_err(|e| format!("fuse gateway write: {e}"))?;
 
-        // Phase 3 — register the inode under a write lock. Microseconds
-        // of contention; the slow gateway call is already done.
+        // Phase 3 — register the inode under a write lock.
+        // Microseconds of contention; gateway is already done.
         let mut fs = self.fs.write().await;
         fs.create_apply_response(1, &name, size, &resp)
             .map_err(|e| format!("fuse create_apply_response errno {e}"))?;
@@ -634,14 +657,10 @@ impl Driver for FuseDriver {
     }
 
     async fn get(&self, key: &Key) -> Result<usize, String> {
-        // Reads only need a shared lock the whole way through —
-        // KisekiFuse::read is `&self`, no inode-table mutation.
-        // Multiple gets fan out across the connection pool.
-        //
-        // Fast path: if the gateway response already supplied a
-        // composition_id (post-rewire `put` sets this), skip the
-        // inode-table lookup and call the gateway directly. Saves
-        // one read-lock round-trip per get.
+        // Direct gateway call. The fast path post-`put` already has
+        // a composition_id; the slow path looks it up via KisekiFuse
+        // (used for backwards compat with synthetic keys, currently
+        // unreached in steady-state perf runs).
         let composition_id = if !key.composition_id.0.is_nil() {
             key.composition_id
         } else {
@@ -653,32 +672,23 @@ impl Driver for FuseDriver {
             let attr = fs
                 .lookup(&name)
                 .map_err(|e| format!("fuse lookup errno {e}"))?;
-            // attr.ino → InodeEntry → composition_id; but lookup
-            // returns FileAttr which doesn't expose composition_id.
-            // Drop into the underlying read path (which `&self`
-            // gateway-calls under a shared lock).
             let bytes = fs
                 .read(attr.ino, 0, u32::try_from(attr.size).unwrap_or(u32::MAX))
                 .map_err(|e| format!("fuse read errno {e}"))?;
             return Ok(bytes.len());
         };
 
-        // Direct gateway call via the GatewayOps API — no inode
-        // table involved. Same path FUSE's `read(ino)` would take
-        // after lookup, just bypassing the inode round-trip.
-        let resp = {
-            let fs = self.fs.read().await;
-            fs.block_gateway_pub(fs.gateway().read(
-                kiseki_gateway::ops::ReadRequest {
-                    tenant_id: self.tenant_id,
-                    namespace_id: self.namespace_id,
-                    composition_id,
-                    offset: 0,
-                    length: u64::MAX,
-                },
-            ))
-            .map_err(|e| format!("fuse gateway read: {e}"))?
-        };
+        let resp = self
+            .gateway
+            .read(kiseki_gateway::ops::ReadRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                composition_id,
+                offset: 0,
+                length: u64::MAX,
+            })
+            .await
+            .map_err(|e| format!("fuse gateway read: {e}"))?;
         Ok(resp.data.len())
     }
 }
