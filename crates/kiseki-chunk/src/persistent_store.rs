@@ -1,8 +1,13 @@
 //! Persistent chunk store — wraps `ChunkStore` + `DeviceBackend`.
 //!
 //! Chunk ciphertext stored on raw block devices (or file-backed for
-//! VMs/CI). Chunk metadata (refcount, holds, envelope meta) stored
-//! alongside the in-memory store and persisted via the device backend.
+//! VMs/CI). Chunk metadata (refcount, holds, envelope meta) lives in
+//! a fjall-backed write-through cache (ADR-022 rev-4): in-memory
+//! `Mutex<HashMap>` for O(1) reads, [`FjallMetaStore`] as the WAL.
+//!
+//! Pools sit in a [`DashMap`] for sharded concurrent reads on the
+//! `pools.get(pool)` durability-strategy lookup that runs once per
+//! `write_chunk`; admin mutations rewrite a small `pools.json` file.
 //!
 //! Per ADR-029: bitmap allocator, per-extent CRC32, crash-safe writes.
 
@@ -10,84 +15,70 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+use dashmap::DashMap;
 use kiseki_block::file::FileBackedDevice;
 use kiseki_block::{DeviceBackend, Extent, MAX_EXTENT_PAYLOAD_BYTES};
 use kiseki_common::ids::ChunkId;
+use kiseki_common::locks::LockOrDie;
 use kiseki_crypto::envelope::Envelope;
 
 use crate::error::ChunkError;
+use crate::persistent::encoding::{ChunkRecord, FragmentRecord};
+use crate::persistent::FjallMetaStore;
 use crate::pool::AffinityPool;
 use crate::store::ChunkOps;
-use kiseki_common::locks::LockOrDie;
 
 /// Compile-time assertion: `ChunkId` must be exactly 32 bytes.
 const _: () = assert!(std::mem::size_of::<ChunkId>() == 32);
 
-/// Metadata for a persisted chunk.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct PersistedChunkMeta {
-    chunk_id: [u8; 32],
-    refcount: u64,
-    retention_holds: Vec<String>,
-    pool_name: String,
-    stored_bytes: u64,
-    /// Actual data length in bytes (distinct from extent-aligned `stored_bytes`).
-    /// Used for accurate capacity accounting in pool usage.
-    #[serde(default)]
-    data_bytes: u64,
-    /// First extent (legacy single-extent layout). For chunks that fit
-    /// in a single extent, this is the only extent. Kept for
-    /// backward-compat with metadata files written before Bug 5's
-    /// multi-extent fix landed.
-    extent_offset: u64,
-    extent_length: u64,
-    /// Additional extents holding the rest of the ciphertext, in
-    /// order. Empty for single-extent chunks (the common case;
-    /// ciphertext ≤ `MAX_EXTENT_PAYLOAD_BYTES`). Bug 5
-    /// (GCP 2026-05-04): chunks larger than the per-extent cap
-    /// silently corrupted; the fix splits oversize chunks across
-    /// multiple extents.
-    #[serde(default)]
-    extra_extents: Vec<(u64, u64)>,
-    /// Serialized envelope metadata (nonce, `auth_tag`, epochs, etc.)
-    /// Ciphertext is on the device; this is just the crypto fields.
-    nonce: [u8; 12],
-    auth_tag: [u8; 16],
-    system_epoch: u64,
-    tenant_epoch: Option<u64>,
-    tenant_wrapped_material: Option<Vec<u8>>,
-}
-
-/// In-memory chunk entry for the persistent store.
+/// In-memory chunk entry for the persistent store. The `record`
+/// holds the durable metadata; `extents` is a derived view of the
+/// extent layout (rebuilt from `record.extent_offset` +
+/// `record.extra_extents`) so the read path doesn't reparse on every
+/// call.
 struct ChunkEntry {
-    envelope_meta: PersistedChunkMeta,
+    record: ChunkRecord,
     /// All extents holding this chunk's ciphertext, in order.
     /// `extents[0]` is the legacy single extent; for chunks that
     /// exceed the per-extent cap, additional extents follow.
     extents: Vec<Extent>,
 }
 
-/// Metadata for a persisted EC fragment. Distinct from
-/// `PersistedChunkMeta` because EC fragments don't carry per-fragment
-/// envelope crypto state — they're slices of one chunk's ciphertext
-/// addressed by `(chunk_id, fragment_index)`.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct PersistedFragmentMeta {
-    chunk_id: [u8; 32],
-    fragment_index: u32,
-    extent_offset: u64,
-    extent_length: u64,
-    data_bytes: u64,
-}
-
 struct FragmentEntry {
-    meta: PersistedFragmentMeta,
+    record: FragmentRecord,
     extent: Extent,
 }
 
-/// Persistent chunk store — in-memory index + device backend for data.
+/// Build the in-memory `extents: Vec<Extent>` view from a
+/// [`ChunkRecord`]. Empty record (`extent_length == 0`) yields an
+/// empty vec — `reconstruct_envelope` must never call `device.read`
+/// on a zero-length extent (POSIX `touch` / NFSv4 OPEN-CREATE on an
+/// empty file).
+fn extents_from_record(record: &ChunkRecord) -> Vec<Extent> {
+    let mut extents = Vec::with_capacity(1 + record.extra_extents.len());
+    if record.extent_length > 0 {
+        extents.push(Extent::new(record.extent_offset, record.extent_length));
+    }
+    for &(off, len) in &record.extra_extents {
+        extents.push(Extent::new(off, len));
+    }
+    extents
+}
+
+/// On-disk path for the small per-pool config (rare admin
+/// mutations). Sibling of the fjall meta directory.
+fn pools_path_for(meta_dir: &Path) -> std::path::PathBuf {
+    meta_dir
+        .parent()
+        .map_or_else(|| std::path::PathBuf::from("pools.json"), |p| p.join("pools.json"))
+}
+
+/// Persistent chunk store — in-memory index + fjall WAL + device
+/// backend for data.
 pub struct PersistentChunkStore {
-    /// In-memory index: `chunk_id` → metadata + extent.
+    /// In-memory index: `chunk_id` → metadata + extents. Source of
+    /// truth on the hot read path; [`FjallMetaStore`] is the
+    /// write-through WAL behind it.
     chunks: Mutex<HashMap<ChunkId, ChunkEntry>>,
     /// EC fragment index: `(chunk_id, fragment_index)` → metadata +
     /// extent. Used by EC X+Y mode (`defaults_for(>=6)` selects
@@ -98,33 +89,42 @@ pub struct PersistentChunkStore {
     /// because the inherited default trait impl returned
     /// `Io("write_fragment not implemented")`.
     fragments: Mutex<HashMap<(ChunkId, u32), FragmentEntry>>,
-    /// Pools (same as in-memory `ChunkStore`).
-    pools: Mutex<HashMap<String, AffinityPool>>,
+    /// Pools — `DashMap` for sharded concurrent reads. The
+    /// `pools.get(pool)` durability-strategy lookup runs once per
+    /// `write_chunk`; the previous `Mutex<HashMap>` serialized every
+    /// fabric writer through one global lock. Persisted to the
+    /// small `pools.json` file (rewritten only on rare admin
+    /// mutations, not on the chunk write path).
+    pools: DashMap<String, AffinityPool>,
     /// Device backend for chunk data storage.
     device: std::sync::Arc<dyn DeviceBackend>,
-    /// Path to metadata file (JSON, for crash recovery).
-    meta_path: std::path::PathBuf,
-    /// Path to fragment metadata file. Defaults to `meta_path` with
-    /// `.frag` appended — kept separate from the chunks file so the
-    /// existing on-disk format stays back-compat for chunk-only
-    /// deployments.
-    frag_meta_path: std::path::PathBuf,
+    /// Fjall-backed metadata WAL. Writes are O(1) per record (one
+    /// `WriteBatch::commit`) regardless of store size — the
+    /// pre-rev-4 JSON `save_meta` rewrote every record on every
+    /// mutation, capping the in-process-persistent floor at the
+    /// JSON-serialise + fsync rate.
+    meta: FjallMetaStore,
+    /// Path to the small JSON file holding pool config. Mutated
+    /// only on admin commands (`add_pool` / `add_device` /
+    /// `set_pool_durability`); never on the chunk write path. Kept
+    /// out of fjall because the LSM compaction overhead would
+    /// dominate the actual op cost for a 10-entry table.
+    pools_path: std::path::PathBuf,
     /// Optional `kiseki_chunk_persistent_write_phase_duration_seconds
     /// {phase}` histogram. Phases observed in `write_chunk`:
-    /// `dedup_check`, `extent_io`, `save_meta`, `device_sync`. The
-    /// 2026-05-04 docker compose run with the CRC32C fix landed
-    /// pinned receiver-side `write_chunk` at ~17.5 ms / 16 MiB; this
-    /// breakdown lets us see whether the remaining cost is in the
-    /// extent I/O, the JSON-rewrite-all-metadata `save_meta`, or the
-    /// per-write `device.sync()`. `None` for tests + library users
-    /// without metrics.
+    /// `dedup_check`, `extent_io`, `save_meta`, `device_sync`.
+    /// The `save_meta` label is retained for dashboard continuity
+    /// post-rev-4; it now measures the fjall record-put round trip
+    /// (microseconds) instead of the JSON rewrite (milliseconds).
+    /// `None` for tests + library users without metrics.
     write_phase_metric: std::sync::RwLock<Option<std::sync::Arc<prometheus::HistogramVec>>>,
     /// When true (default), every `write_chunk` calls `device.sync()`
-    /// inline before returning. When false, the per-write fsync is
-    /// deferred to a caller-driven `flush()` (typically a periodic
-    /// background task wired by the runtime). Group-commit mode
-    /// unblocks concurrent writers — per-write fsync was serializing
-    /// fabric receivers through the kernel sync, capping parallel
+    /// inline before returning AND the fjall meta write commits with
+    /// `PersistMode::SyncAll`. When false, both are deferred to a
+    /// caller-driven `flush()` (typically a periodic background
+    /// task wired by the runtime). Group-commit mode unblocks
+    /// concurrent writers — per-write fsync was serializing fabric
+    /// receivers through the kernel sync, capping parallel
     /// throughput at ~1× even with multiple concurrent peers.
     ///
     /// **Crash safety**: with `sync_per_write=false`, a single-node
@@ -138,103 +138,110 @@ pub struct PersistentChunkStore {
     sync_per_write: std::sync::atomic::AtomicBool,
 }
 
-fn frag_path_for(meta: &Path) -> std::path::PathBuf {
-    let mut s = meta.as_os_str().to_owned();
-    s.push(".frag");
-    std::path::PathBuf::from(s)
+/// Load the pools-config JSON if present. Missing file → empty map
+/// (fresh init, or old data dir with no admin mutations yet).
+fn load_pools(path: &Path) -> Result<DashMap<String, AffinityPool>, ChunkError> {
+    if !path.exists() {
+        return Ok(DashMap::new());
+    }
+    let data = std::fs::read_to_string(path).map_err(|e| ChunkError::Io(e.to_string()))?;
+    if data.trim().is_empty() {
+        return Ok(DashMap::new());
+    }
+    let pools: Vec<AffinityPool> = serde_json::from_str(&data)
+        .map_err(|e| ChunkError::Io(format!("pools config parse: {e}")))?;
+    let map = DashMap::new();
+    for pool in pools {
+        map.insert(pool.name.clone(), pool);
+    }
+    Ok(map)
+}
+
+/// Persist the pool config — atomic write+rename. Only called on
+/// admin mutations (`add_pool`, `add_device`, `remove_device`,
+/// `set_pool_durability`).
+fn save_pools(path: &Path, pools: &DashMap<String, AffinityPool>) -> Result<(), ChunkError> {
+    let snapshot: Vec<AffinityPool> = pools.iter().map(|e| e.value().clone()).collect();
+    let json = serde_json::to_string(&snapshot).map_err(|e| ChunkError::Io(e.to_string()))?;
+    let tmp_path = path.with_extension("tmp");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ChunkError::Io(e.to_string()))?;
+    }
+    std::fs::write(&tmp_path, json).map_err(|e| ChunkError::Io(e.to_string()))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| ChunkError::Io(e.to_string()))?;
+    Ok(())
 }
 
 impl PersistentChunkStore {
     /// Initialize a new persistent chunk store.
     ///
-    /// - `device_path`: path to the block device or file for chunk data
-    /// - `meta_path`: path to the metadata JSON file (on system partition)
-    /// - `device_size`: total device size in bytes
+    /// - `device_path`: path to the block device or file for chunk data.
+    /// - `meta_path`: path to the **directory** holding the fjall meta
+    ///    keyspace (ADR-022 rev-4). Pre-rev-4 callers passed a `*.json`
+    ///    file path; the new layout is a sibling directory without an
+    ///    extension. The runtime writes a `pools.json` next to it for
+    ///    the small admin-rate pool config.
+    /// - `device_size`: total device size in bytes.
     pub fn init(
         device_path: &Path,
         meta_path: &Path,
         device_size: u64,
     ) -> Result<Self, ChunkError> {
+        if let Some(parent) = meta_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ChunkError::Io(e.to_string()))?;
+        }
         let device = FileBackedDevice::init(device_path, device_size)
             .map_err(|e| ChunkError::Io(e.to_string()))?;
+        let meta = FjallMetaStore::open(meta_path)?;
+        let pools_path = pools_path_for(meta_path);
 
-        let store = Self {
+        Ok(Self {
             chunks: Mutex::new(HashMap::new()),
             fragments: Mutex::new(HashMap::new()),
-            pools: Mutex::new(HashMap::new()),
+            pools: DashMap::new(),
             device: std::sync::Arc::new(device),
-            meta_path: meta_path.to_owned(),
-            frag_meta_path: frag_path_for(meta_path),
+            meta,
+            pools_path,
             write_phase_metric: std::sync::RwLock::new(None),
             sync_per_write: std::sync::atomic::AtomicBool::new(true),
-        };
-        store.save_meta()?;
-        store.save_frag_meta()?;
-        Ok(store)
+        })
     }
 
-    /// Open an existing persistent chunk store.
+    /// Open an existing persistent chunk store. Hydrates the
+    /// in-memory caches from the fjall WAL.
     pub fn open(device_path: &Path, meta_path: &Path) -> Result<Self, ChunkError> {
         let device =
             FileBackedDevice::open(device_path).map_err(|e| ChunkError::Io(e.to_string()))?;
+        let meta = FjallMetaStore::open(meta_path)?;
+        let pools_path = pools_path_for(meta_path);
+        let pools = load_pools(&pools_path)?;
 
-        let chunks = if meta_path.exists() {
-            let data =
-                std::fs::read_to_string(meta_path).map_err(|e| ChunkError::Io(e.to_string()))?;
-            let metas: Vec<PersistedChunkMeta> = serde_json::from_str(&data)
-                .map_err(|e| ChunkError::Io(format!("metadata parse error: {e}")))?;
-            let mut map = HashMap::new();
-            for meta in metas {
-                let chunk_id = ChunkId(meta.chunk_id);
-                // Empty chunks (data_bytes == 0) skip the device
-                // entirely — extent_length stays 0. Don't push a
-                // sentinel (0, 0) Extent: reconstruct_envelope must
-                // never call device.read on a zero-length extent.
-                let mut extents = Vec::new();
-                if meta.extent_length > 0 {
-                    extents.push(Extent::new(meta.extent_offset, meta.extent_length));
-                }
-                for &(off, len) in &meta.extra_extents {
-                    extents.push(Extent::new(off, len));
-                }
-                map.insert(
-                    chunk_id,
-                    ChunkEntry {
-                        envelope_meta: meta,
-                        extents,
-                    },
-                );
-            }
-            map
-        } else {
-            HashMap::new()
-        };
+        // Hydrate chunk cache.
+        let mut chunk_map = HashMap::new();
+        for record in meta.iter_chunks()? {
+            let id = ChunkId(record.chunk_id);
+            let extents = extents_from_record(&record);
+            chunk_map.insert(id, ChunkEntry { record, extents });
+        }
 
-        let frag_meta_path = frag_path_for(meta_path);
-        let fragments = if frag_meta_path.exists() {
-            let data = std::fs::read_to_string(&frag_meta_path)
-                .map_err(|e| ChunkError::Io(e.to_string()))?;
-            let metas: Vec<PersistedFragmentMeta> = serde_json::from_str(&data)
-                .map_err(|e| ChunkError::Io(format!("fragment metadata parse error: {e}")))?;
-            let mut map = HashMap::new();
-            for meta in metas {
-                let chunk_id = ChunkId(meta.chunk_id);
-                let extent = Extent::new(meta.extent_offset, meta.extent_length);
-                let key = (chunk_id, meta.fragment_index);
-                map.insert(key, FragmentEntry { meta, extent });
-            }
-            map
-        } else {
-            HashMap::new()
-        };
+        // Hydrate fragment cache.
+        let mut frag_map = HashMap::new();
+        for record in meta.iter_fragments()? {
+            let id = ChunkId(record.chunk_id);
+            let extent = Extent::new(record.extent_offset, record.extent_length);
+            frag_map.insert(
+                (id, record.fragment_index),
+                FragmentEntry { record, extent },
+            );
+        }
 
         Ok(Self {
-            chunks: Mutex::new(chunks),
-            fragments: Mutex::new(fragments),
-            pools: Mutex::new(HashMap::new()),
+            chunks: Mutex::new(chunk_map),
+            fragments: Mutex::new(frag_map),
+            pools,
             device: std::sync::Arc::new(device),
-            meta_path: meta_path.to_owned(),
-            frag_meta_path,
+            meta,
+            pools_path,
             write_phase_metric: std::sync::RwLock::new(None),
             sync_per_write: std::sync::atomic::AtomicBool::new(true),
         })
@@ -273,6 +280,12 @@ impl PersistentChunkStore {
     pub fn set_sync_per_write(&self, enabled: bool) {
         self.sync_per_write
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        // Mirror the knob into the fjall meta store so its
+        // `WriteBatch::commit` durability matches the device-side
+        // behavior. Without this, a `sync_per_write=false` runtime
+        // would still pay an inline fjall fsync per chunk meta
+        // mutation — the same trap the device path already escaped.
+        self.meta.set_sync_per_write(enabled);
     }
 
     /// Flush pending writes to stable storage. Calls
@@ -289,9 +302,26 @@ impl PersistentChunkStore {
     /// Returns `ChunkError::Io` if the device backend reports a
     /// sync failure.
     pub fn flush(&self) -> Result<(), ChunkError> {
+        // Order: meta WAL fsync first, then device sync. The device
+        // is the data; the meta is the index — losing a meta entry
+        // for data that did fsync just leaks an extent (the scrub
+        // reclaims). Losing data for a meta entry that did fsync
+        // leaves a dangling pointer (read-time error). Better to
+        // promote the meta first.
+        self.meta.flush()?;
         self.device
             .sync()
             .map_err(|e| ChunkError::Io(e.to_string()))
+    }
+
+    /// Off-thread fsync handle for the gateway `fsync_pending` hook.
+    /// Returns a [`crate::persistent::FjallMetaFlusher`] clone — the
+    /// hook chain calls this in addition to `device.sync()` so a
+    /// FUSE / NFS `fsync(2)` from one thread doesn't queue behind a
+    /// concurrent `write_chunk` on another's `&self` mutex chain.
+    #[must_use]
+    pub fn meta_flusher(&self) -> crate::persistent::FjallMetaFlusher {
+        self.meta.flusher()
     }
 
     /// Borrow the device backend handle. Returns a cheap `Arc`
@@ -306,43 +336,25 @@ impl PersistentChunkStore {
         std::sync::Arc::clone(&self.device)
     }
 
-    /// Add an affinity pool.
+    /// Add an affinity pool. Best-effort persists `pools.json` —
+    /// admin-rate frequency, drops the persist on I/O error and
+    /// logs (the pool is still in the in-memory cache and a
+    /// subsequent admin write will rewrite the JSON).
     pub fn add_pool(&self, pool: AffinityPool) {
-        self.pools
-            .lock()
-            .lock_or_die("persistent_store.pools")
-            .insert(pool.name.clone(), pool);
+        self.pools.insert(pool.name.clone(), pool);
+        if let Err(e) = save_pools(&self.pools_path, &self.pools) {
+            tracing::warn!(error = %e, "persist pools.json failed");
+        }
     }
 
-    /// Save metadata to JSON file (atomic: write tmp then rename).
-    fn save_meta(&self) -> Result<(), ChunkError> {
-        let chunks = self.chunks.lock().unwrap_or_else(|e| {
-            tracing::warn!("mutex poisoned in save_meta, recovering");
-            e.into_inner()
-        });
-        let metas: Vec<&PersistedChunkMeta> = chunks.values().map(|e| &e.envelope_meta).collect();
-        let json = serde_json::to_string(&metas).map_err(|e| ChunkError::Io(e.to_string()))?;
-        let tmp_path = self.meta_path.with_extension("tmp");
-        std::fs::write(&tmp_path, json).map_err(|e| ChunkError::Io(e.to_string()))?;
-        std::fs::rename(&tmp_path, &self.meta_path).map_err(|e| ChunkError::Io(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Persist the fragment index. Same crash-safe write+rename
-    /// pattern as `save_meta` but on `frag_meta_path`.
-    fn save_frag_meta(&self) -> Result<(), ChunkError> {
-        let fragments = self.fragments.lock().unwrap_or_else(|e| {
-            tracing::warn!("mutex poisoned in save_frag_meta, recovering");
-            e.into_inner()
-        });
-        let metas: Vec<&PersistedFragmentMeta> = fragments.values().map(|e| &e.meta).collect();
-        let json = serde_json::to_string(&metas).map_err(|e| ChunkError::Io(e.to_string()))?;
-        let tmp_path = self.frag_meta_path.with_extension("tmp");
-        std::fs::write(&tmp_path, json).map_err(|e| ChunkError::Io(e.to_string()))?;
-        std::fs::rename(&tmp_path, &self.frag_meta_path)
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
-        Ok(())
-    }
+    // ADR-022 rev-4 (2026-05-06): the old `save_meta` /
+    // `save_frag_meta` JSON-rewrite-the-world helpers are gone.
+    // Each mutating op now writes ONE record through
+    // [`FjallMetaStore`] — O(1) per op vs the previous O(N)
+    // in-store-size cost. The save_meta/save_frag_meta phase labels
+    // on the `kiseki_chunk_persistent_write_phase_duration_seconds`
+    // histogram are retained for dashboard continuity (they now
+    // measure the fjall record-put round-trip).
 
     /// Reconstruct an Envelope from persisted metadata + device data.
     ///
@@ -351,11 +363,11 @@ impl PersistentChunkStore {
     /// that exceeded the per-extent cap at write time read all of them.
     fn reconstruct_envelope(
         &self,
-        meta: &PersistedChunkMeta,
+        record: &ChunkRecord,
         extents: &[Extent],
     ) -> Result<Envelope, ChunkError> {
         let mut ciphertext: Vec<u8> =
-            Vec::with_capacity(usize::try_from(meta.data_bytes).unwrap_or(0));
+            Vec::with_capacity(usize::try_from(record.data_bytes).unwrap_or(0));
         for extent in extents {
             let part = self
                 .device
@@ -366,12 +378,12 @@ impl PersistentChunkStore {
 
         Ok(Envelope {
             ciphertext,
-            auth_tag: meta.auth_tag,
-            nonce: meta.nonce,
-            system_epoch: kiseki_common::tenancy::KeyEpoch(meta.system_epoch),
-            tenant_epoch: meta.tenant_epoch.map(kiseki_common::tenancy::KeyEpoch),
-            tenant_wrapped_material: meta.tenant_wrapped_material.clone(),
-            chunk_id: ChunkId(meta.chunk_id),
+            auth_tag: record.auth_tag,
+            nonce: record.nonce,
+            system_epoch: kiseki_common::tenancy::KeyEpoch(record.system_epoch),
+            tenant_epoch: record.tenant_epoch.map(kiseki_common::tenancy::KeyEpoch),
+            tenant_wrapped_material: record.tenant_wrapped_material.clone(),
+            chunk_id: ChunkId(record.chunk_id),
         })
     }
 
@@ -422,15 +434,16 @@ impl ChunkOps for PersistentChunkStore {
 
         // Dedup: if chunk already exists, just bump refcount.
         if let Some(entry) = chunks.get_mut(&chunk_id) {
-            entry.envelope_meta.refcount = entry
-                .envelope_meta
+            entry.record.refcount = entry
+                .record
                 .refcount
                 .checked_add(1)
                 .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
+            let updated = entry.record.clone();
             drop(chunks);
             self.observe_write_phase("dedup_check", dedup_started.elapsed());
             let save_started = std::time::Instant::now();
-            self.save_meta()?;
+            self.meta.put_chunk(&updated)?;
             self.observe_write_phase("save_meta", save_started.elapsed());
             return Ok(false);
         }
@@ -458,18 +471,17 @@ impl ChunkOps for PersistentChunkStore {
         self.observe_write_phase("extent_io", extent_io_started.elapsed());
         let stored_bytes: u64 = extents.iter().map(|e| e.length).sum();
 
-        // Build metadata. The first extent goes into the legacy
-        // `extent_offset/extent_length` pair; any additional extents
-        // go into `extra_extents`. Empty chunks keep the legacy fields
-        // at (0, 0); old metadata files (single extent only)
-        // deserialize unchanged.
+        // Build the persistent record. The first extent goes into
+        // the legacy `extent_offset/extent_length` pair; any
+        // additional extents go into `extra_extents`. Empty chunks
+        // keep the legacy fields at (0, 0).
         let (first_offset, first_length) = extents.first().map_or((0, 0), |e| (e.offset, e.length));
         let extra_extents: Vec<(u64, u64)> = extents
             .iter()
             .skip(1)
             .map(|e| (e.offset, e.length))
             .collect();
-        let meta = PersistedChunkMeta {
+        let record = ChunkRecord {
             chunk_id: chunk_id.0,
             refcount: 1,
             retention_holds: Vec::new(),
@@ -486,19 +498,19 @@ impl ChunkOps for PersistentChunkStore {
             tenant_wrapped_material: envelope.tenant_wrapped_material.clone(),
         };
 
-        // Update pool usage (use data_bytes for accurate capacity accounting).
-        {
-            let mut pools = self.pools.lock().lock_or_die("persistent_store.pools");
-            if let Some(p) = pools.get_mut(pool) {
-                p.used_bytes += data_bytes;
-            }
+        // Update pool usage (use data_bytes for accurate capacity
+        // accounting). DashMap shard lock — the sharded layout
+        // means a writer for pool A doesn't contend with a writer
+        // for pool B, in contrast to the prior `Mutex<HashMap>`.
+        if let Some(mut p) = self.pools.get_mut(pool) {
+            p.used_bytes += data_bytes;
         }
 
         // Insert into in-memory index.
         chunks.insert(
             chunk_id,
             ChunkEntry {
-                envelope_meta: meta,
+                record: record.clone(),
                 extents,
             },
         );
@@ -507,7 +519,7 @@ impl ChunkOps for PersistentChunkStore {
 
         // Persist metadata; sync only when group-commit is OFF.
         let save_started = std::time::Instant::now();
-        self.save_meta()?;
+        self.meta.put_chunk(&record)?;
         self.observe_write_phase("save_meta", save_started.elapsed());
         if self
             .sync_per_write
@@ -528,7 +540,7 @@ impl ChunkOps for PersistentChunkStore {
         let entry = chunks
             .get(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
-        self.reconstruct_envelope(&entry.envelope_meta, &entry.extents)
+        self.reconstruct_envelope(&entry.record, &entry.extents)
     }
 
     fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
@@ -536,14 +548,15 @@ impl ChunkOps for PersistentChunkStore {
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
-        entry.envelope_meta.refcount = entry
-            .envelope_meta
+        entry.record.refcount = entry
+            .record
             .refcount
             .checked_add(1)
             .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
-        let rc = entry.envelope_meta.refcount;
+        let rc = entry.record.refcount;
+        let updated = entry.record.clone();
         drop(chunks);
-        self.save_meta()?;
+        self.meta.put_chunk(&updated)?;
         Ok(rc)
     }
 
@@ -552,13 +565,14 @@ impl ChunkOps for PersistentChunkStore {
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
-        if entry.envelope_meta.refcount == 0 {
+        if entry.record.refcount == 0 {
             return Err(ChunkError::RefcountUnderflow(*chunk_id));
         }
-        entry.envelope_meta.refcount -= 1;
-        let rc = entry.envelope_meta.refcount;
+        entry.record.refcount -= 1;
+        let rc = entry.record.refcount;
+        let updated = entry.record.clone();
         drop(chunks);
-        self.save_meta()?;
+        self.meta.put_chunk(&updated)?;
         Ok(rc)
     }
 
@@ -572,17 +586,18 @@ impl ChunkOps for PersistentChunkStore {
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         if !entry
-            .envelope_meta
+            .record
             .retention_holds
             .contains(&hold_name.to_owned())
         {
             entry
-                .envelope_meta
+                .record
                 .retention_holds
                 .push(hold_name.to_owned());
         }
+        let updated = entry.record.clone();
         drop(chunks);
-        self.save_meta()?;
+        self.meta.put_chunk(&updated)?;
         Ok(())
     }
 
@@ -596,11 +611,12 @@ impl ChunkOps for PersistentChunkStore {
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         entry
-            .envelope_meta
+            .record
             .retention_holds
             .retain(|h| h != hold_name);
+        let updated = entry.record.clone();
         drop(chunks);
-        self.save_meta()?;
+        self.meta.put_chunk(&updated)?;
         Ok(())
     }
 
@@ -613,19 +629,20 @@ impl ChunkOps for PersistentChunkStore {
         let to_remove: Vec<(ChunkId, Vec<Extent>, String, u64)> = chunks
             .iter()
             .filter(|(_, e)| {
-                e.envelope_meta.refcount == 0 && e.envelope_meta.retention_holds.is_empty()
+                e.record.refcount == 0 && e.record.retention_holds.is_empty()
             })
             .map(|(id, e)| {
                 (
                     *id,
                     e.extents.clone(),
-                    e.envelope_meta.pool_name.clone(),
-                    e.envelope_meta.data_bytes,
+                    e.record.pool_name.clone(),
+                    e.record.data_bytes,
                 )
             })
             .collect();
 
         let mut freed_count: u64 = 0;
+        let mut removed_ids: Vec<ChunkId> = Vec::new();
 
         for (id, extents, pool_name, data_bytes) in &to_remove {
             // Free every extent for this chunk; only drop metadata if
@@ -641,20 +658,24 @@ impl ChunkOps for PersistentChunkStore {
             }
             if all_freed {
                 chunks.remove(id);
+                removed_ids.push(*id);
                 freed_count += 1;
                 // Update pool usage.
-                let mut pools = self.pools.lock().unwrap_or_else(|e| {
-                    tracing::warn!("mutex poisoned in gc pool update, recovering");
-                    e.into_inner()
-                });
-                if let Some(p) = pools.get_mut(pool_name.as_str()) {
+                if let Some(mut p) = self.pools.get_mut(pool_name.as_str()) {
                     p.used_bytes = p.used_bytes.saturating_sub(*data_bytes);
                 }
             }
         }
 
         drop(chunks);
-        let _ = self.save_meta();
+        // Per-record removes — fjall journal absorbs each removal in
+        // O(1). The pre-rev-4 path called save_meta() once at the
+        // end of gc() which rewrote the entire file; per-record
+        // removes are also O(removed) total which is bounded by what
+        // the freed-count loop already touched.
+        for id in removed_ids {
+            let _ = self.meta.remove_chunk(&id);
+        }
         let _ = self.device.sync();
 
         freed_count
@@ -664,7 +685,7 @@ impl ChunkOps for PersistentChunkStore {
         let chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         chunks
             .get(chunk_id)
-            .map(|e| e.envelope_meta.refcount)
+            .map(|e| e.record.refcount)
             .ok_or(ChunkError::NotFound(*chunk_id))
     }
 
@@ -707,28 +728,34 @@ impl ChunkOps for PersistentChunkStore {
             .write(&extent, &bytes)
             .map_err(|e| ChunkError::Io(e.to_string()))?;
 
-        let old_extent = {
+        let (old_extent, persisted_record) = {
             let mut fragments = self
                 .fragments
                 .lock()
                 .lock_or_die("persistent_store.fragments");
             let old = fragments.remove(&key).map(|e| e.extent);
-            let meta = PersistedFragmentMeta {
+            let record = FragmentRecord {
                 chunk_id: chunk_id.0,
                 fragment_index,
                 extent_offset: extent.offset,
                 extent_length: extent.length,
                 data_bytes,
             };
-            fragments.insert(key, FragmentEntry { meta, extent });
-            old
+            fragments.insert(
+                key,
+                FragmentEntry {
+                    record: record.clone(),
+                    extent,
+                },
+            );
+            (old, record)
         };
         if let Some(old) = old_extent {
             // Best-effort — if free fails, we leak an extent (the
             // periodic scrub will reclaim). Don't fail the write.
             let _ = self.device.free(&old);
         }
-        self.save_frag_meta()?;
+        self.meta.put_fragment(&persisted_record)?;
         Ok(())
     }
 
@@ -770,7 +797,7 @@ impl ChunkOps for PersistentChunkStore {
             return Ok(false);
         };
         let _ = self.device.free(&entry.extent);
-        self.save_frag_meta()?;
+        self.meta.remove_fragment(chunk_id, fragment_index)?;
         Ok(true)
     }
 
@@ -791,27 +818,38 @@ impl ChunkOps for PersistentChunkStore {
         }
         // Per-fragment path (EC, server.put_fragment for fragment_index>0).
         // Drain every (chunk_id, *) tuple.
-        let frag_entries: Vec<_> = {
+        let (frag_extents, removed_indices): (Vec<_>, Vec<u32>) = {
             let mut fragments = self
                 .fragments
                 .lock()
                 .lock_or_die("persistent_store.fragments");
-            let keys: Vec<_> = fragments
+            let keys: Vec<(ChunkId, u32)> = fragments
                 .keys()
                 .filter(|(c, _)| c == chunk_id)
                 .copied()
                 .collect();
-            keys.into_iter()
-                .filter_map(|k| fragments.remove(&k).map(|e| e.extent))
-                .collect()
+            let mut extents = Vec::with_capacity(keys.len());
+            let mut indices = Vec::with_capacity(keys.len());
+            for k in keys {
+                if let Some(entry) = fragments.remove(&k) {
+                    extents.push(entry.extent);
+                    indices.push(k.1);
+                }
+            }
+            (extents, indices)
         };
-        for extent in frag_entries {
+        for extent in frag_extents {
             let _ = self.device.free(&extent);
             anything_removed = true;
         }
         if anything_removed {
-            self.save_meta()?;
-            self.save_frag_meta()?;
+            // Atomic cross-keyspace removal — the chunks +
+            // fragments rows of `chunk_id` go in one fjall batch.
+            // Strictly stronger than the pre-rev-4 split where the
+            // two JSON files were rewritten sequentially and a
+            // crash between them left a hung-state.
+            self.meta
+                .remove_chunk_and_fragments(chunk_id, &removed_indices)?;
         }
         Ok(anything_removed)
     }
@@ -830,20 +868,18 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn snapshot_pools(&self) -> Vec<crate::pool::AffinityPool> {
-        self.pools
-            .lock()
-            .lock_or_die("persistent_store.pools")
-            .values()
-            .cloned()
-            .collect()
+        self.pools.iter().map(|e| e.value().clone()).collect()
     }
 
     fn add_pool_checked(&mut self, pool: crate::pool::AffinityPool) -> Result<(), String> {
-        let mut g = self.pools.lock().lock_or_die("persistent_store.pools");
-        if g.contains_key(&pool.name) {
+        if self.pools.contains_key(&pool.name) {
             return Err(format!("pool {} already exists", pool.name));
         }
-        g.insert(pool.name.clone(), pool);
+        let name = pool.name.clone();
+        self.pools.insert(name, pool);
+        if let Err(e) = save_pools(&self.pools_path, &self.pools) {
+            tracing::warn!(error = %e, "persist pools.json failed (add_pool_checked)");
+        }
         Ok(())
     }
 
@@ -852,26 +888,38 @@ impl ChunkOps for PersistentChunkStore {
         pool_name: &str,
         device: crate::pool::PoolDevice,
     ) -> Result<(), String> {
-        let mut g = self.pools.lock().lock_or_die("persistent_store.pools");
-        let pool = g
-            .get_mut(pool_name)
-            .ok_or_else(|| format!("pool {pool_name} not found"))?;
-        if pool.devices.iter().any(|d| d.id == device.id) {
-            return Err(format!("device {} already in pool {pool_name}", device.id));
+        {
+            let mut pool = self
+                .pools
+                .get_mut(pool_name)
+                .ok_or_else(|| format!("pool {pool_name} not found"))?;
+            if pool.devices.iter().any(|d| d.id == device.id) {
+                return Err(format!("device {} already in pool {pool_name}", device.id));
+            }
+            pool.devices.push(device);
         }
-        pool.devices.push(device);
+        if let Err(e) = save_pools(&self.pools_path, &self.pools) {
+            tracing::warn!(error = %e, "persist pools.json failed (add_device)");
+        }
         Ok(())
     }
 
     fn remove_device(&mut self, device_id: &str) -> Result<(), String> {
-        let mut g = self.pools.lock().lock_or_die("persistent_store.pools");
-        for pool in g.values_mut() {
+        let mut found = false;
+        for mut pool in self.pools.iter_mut() {
             if let Some(idx) = pool.devices.iter().position(|d| d.id == device_id) {
                 pool.devices.remove(idx);
-                return Ok(());
+                found = true;
+                break;
             }
         }
-        Err(format!("device {device_id} not found"))
+        if !found {
+            return Err(format!("device {device_id} not found"));
+        }
+        if let Err(e) = save_pools(&self.pools_path, &self.pools) {
+            tracing::warn!(error = %e, "persist pools.json failed (remove_device)");
+        }
+        Ok(())
     }
 
     fn set_pool_durability(
@@ -879,18 +927,23 @@ impl ChunkOps for PersistentChunkStore {
         pool_name: &str,
         strategy: crate::pool::DurabilityStrategy,
     ) -> Result<(), String> {
-        let mut g = self.pools.lock().lock_or_die("persistent_store.pools");
-        let pool = g
-            .get_mut(pool_name)
-            .ok_or_else(|| format!("pool {pool_name} not found"))?;
-        if pool.used_bytes > 0 {
-            return Err(format!(
-                "pool {pool_name} is non-empty (used_bytes={}); durability \
-                 change while data exists requires a separate migration plan",
-                pool.used_bytes
-            ));
+        {
+            let mut pool = self
+                .pools
+                .get_mut(pool_name)
+                .ok_or_else(|| format!("pool {pool_name} not found"))?;
+            if pool.used_bytes > 0 {
+                return Err(format!(
+                    "pool {pool_name} is non-empty (used_bytes={}); durability \
+                     change while data exists requires a separate migration plan",
+                    pool.used_bytes
+                ));
+            }
+            pool.durability = strategy;
         }
-        pool.durability = strategy;
+        if let Err(e) = save_pools(&self.pools_path, &self.pools) {
+            tracing::warn!(error = %e, "persist pools.json failed (set_pool_durability)");
+        }
         Ok(())
     }
 }

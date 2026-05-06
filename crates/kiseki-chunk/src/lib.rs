@@ -23,6 +23,7 @@ pub mod evacuation;
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm", test))]
 #[allow(unsafe_code)]
 pub mod gpu_direct;
+pub mod persistent;
 pub mod persistent_store;
 pub mod placement;
 pub mod pool;

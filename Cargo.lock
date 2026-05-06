@@ -1953,12 +1953,15 @@ name = "kiseki-chunk"
 version = "2026.41.0"
 dependencies = [
  "async-trait",
+ "dashmap",
+ "fjall",
  "kiseki-block",
  "kiseki-common",
  "kiseki-crypto",
  "kiseki-keymanager",
  "libc",
  "parking_lot 0.12.5",
+ "postcard",
  "prometheus",
  "proptest",
  "redb",

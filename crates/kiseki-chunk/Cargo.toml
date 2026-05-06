@@ -25,9 +25,25 @@ kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }
 parking_lot = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+# `serde_json` retained for the small-object inline store + the
+# rare-mutation pools.json file. Chunk + fragment meta moved off JSON
+# 2026-05-06 (ADR-022 rev-4) — see `persistent/encoding.rs`.
 serde_json = "1"
+# DashMap on the pool cache: `pools.get(name)` is in the chunk
+# write hot path (durability-strategy lookup per PUT). Sharded
+# concurrent reads kill the previous `Mutex<HashMap>` contention
+# without paying for an LSM on a 10-entry config table.
+dashmap = "6"
+# fjall WAL for chunk + fragment meta (ADR-022 rev-4). Replaces the
+# `save_meta` / `save_frag_meta` JSON-rewrite-the-world calls that
+# capped per-PUT cost at O(N) in store size. Same backend the
+# composition store and the Raft log use (rev-2 / rev-3).
+fjall = "3.1"
+postcard = { workspace = true }
 kiseki-keymanager = { workspace = true }
 prometheus = { workspace = true }
+# `redb` retained for `SmallObjectStore` (low-frequency ADR-030
+# inline-data path; not on the chunk hot path).
 redb = "4"
 reed-solomon-erasure = { workspace = true }
 thiserror = { workspace = true }

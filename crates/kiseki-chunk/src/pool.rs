@@ -1,7 +1,7 @@
 //! Affinity pool management (I-C3, I-C4).
 
 /// Durability strategy per pool.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DurabilityStrategy {
     /// Erasure coding (default).
     ErasureCoding {
@@ -27,7 +27,7 @@ impl Default for DurabilityStrategy {
 }
 
 /// Device class for pool-level placement decisions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DeviceClass {
     /// `NVMe` SSD — lowest latency.
     NvmeSsd,
@@ -40,7 +40,7 @@ pub enum DeviceClass {
 }
 
 /// An affinity pool — group of storage devices sharing a device class.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AffinityPool {
     /// Pool name (e.g., `"fast-nvme"`, `"bulk-nvme"`).
     pub name: String,
@@ -57,7 +57,7 @@ pub struct AffinityPool {
 }
 
 /// A device within a pool.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PoolDevice {
     /// Device identifier (e.g., `"d1"`).
     pub id: String,

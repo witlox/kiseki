@@ -1046,7 +1046,8 @@ impl InProcessPersistentDriver {
         std::fs::create_dir_all(dir.join("chunks"))
             .map_err(|e| format!("chunks dir: {e}"))?;
         let dev_path = dir.join("chunks").join("data.dev");
-        let meta_path = dir.join("chunks").join("meta.json");
+        // ADR-022 rev-4: chunk meta is a fjall keyspace (directory).
+        let meta_path = dir.join("chunks").join("meta");
         let chunks = kiseki_chunk::PersistentChunkStore::init(
             &dev_path,
             &meta_path,

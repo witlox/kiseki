@@ -617,7 +617,9 @@ pub async fn run_main(
     {
         std::fs::create_dir_all(dir.join("chunks")).ok();
         let dev_path = dir.join("chunks").join("data.dev");
-        let meta_path = dir.join("chunks").join("meta.json");
+        // ADR-022 rev-4: chunk meta moved off JSON to fjall. Path
+        // is now a keyspace directory (no extension).
+        let meta_path = dir.join("chunks").join("meta");
         let store = if dev_path.exists() {
             kiseki_chunk::PersistentChunkStore::open(&dev_path, &meta_path)
                 .map_err(|e| format!("persistent chunk store open: {e}"))?
@@ -1886,21 +1888,23 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    /// The 4 canonical persistent store paths that the runtime constructs
-    /// under `data_dir`. Two are fjall keyspaces (directories), one is a
-    /// redb database (small-object inline store), and one is a chunk
-    /// device + metadata pair. All must be in distinct subdirectories
-    /// under `data_dir`.
+    /// The 5 canonical persistent store paths that the runtime constructs
+    /// under `data_dir`. Three are fjall keyspaces (directories), one is
+    /// a redb database (small-object inline store), and one is a chunk
+    /// device file. All must be in distinct subdirectories under
+    /// `data_dir`.
     ///
     /// Layout (from `runtime::run_main`):
     ///   raft/log/           — Raft log shard store (fjall, dir)
     ///   keys/epochs/        — Key manager epochs (fjall, dir)
+    ///   chunks/meta/        — Chunk + fragment meta (fjall, dir; ADR-022 rev-4)
+    ///   chunks/data.dev     — Raw block device for chunk ciphertext
     ///   small/objects.redb  — Small object inline store (still redb)
-    ///   chunks/data.dev     — Raw block device for chunks
-    fn canonical_store_paths(data_dir: &std::path::Path) -> [PathBuf; 4] {
+    fn canonical_store_paths(data_dir: &std::path::Path) -> [PathBuf; 5] {
         [
             data_dir.join("raft").join("log"),
             data_dir.join("keys").join("epochs"),
+            data_dir.join("chunks").join("meta"),
             data_dir.join("small").join("objects.redb"),
             data_dir.join("chunks").join("data.dev"),
         ]
@@ -1914,12 +1918,12 @@ mod tests {
 
         let paths = canonical_store_paths(&data_dir);
 
-        // All 4 paths must be distinct.
+        // All 5 paths must be distinct.
         let unique: HashSet<&PathBuf> = paths.iter().collect();
         assert_eq!(
             unique.len(),
-            4,
-            "all 4 store paths must be distinct: {paths:?}"
+            5,
+            "all 5 store paths must be distinct: {paths:?}"
         );
 
         // Each path must be under data_dir.
@@ -1931,22 +1935,24 @@ mod tests {
         }
 
         // The remaining redb store keeps the .redb extension; the
-        // first two (fjall keyspaces) are directories with no
-        // extension.
-        let redb_path = &paths[2];
+        // three fjall keyspaces are directories with no extension;
+        // the chunk device file uses a `.dev` extension.
+        let redb_path = &paths[3];
         assert_eq!(
             redb_path.extension().and_then(|e| e.to_str()),
             Some("redb"),
             "redb store path must have .redb extension: {redb_path:?}"
         );
-        for fjall_path in &paths[..2] {
+        for fjall_path in &paths[..3] {
             assert!(
                 fjall_path.extension().is_none(),
                 "fjall keyspace path must have no extension: {fjall_path:?}"
             );
         }
 
-        // Subdirectories must be distinct (raft, keys, small, chunks).
+        // Subdirectories must collapse to {raft, keys, chunks, small}
+        // — chunks/meta + chunks/data.dev share the same first
+        // component.
         let subdirs: HashSet<_> = paths
             .iter()
             .filter_map(|p| {
@@ -1959,7 +1965,8 @@ mod tests {
         assert_eq!(
             subdirs.len(),
             4,
-            "each store must reside in a distinct subdirectory: {subdirs:?}"
+            "stores collapse to 4 distinct first-level subdirs \
+             (chunks/meta + chunks/data.dev share `chunks`): {subdirs:?}"
         );
 
         // Cleanup.

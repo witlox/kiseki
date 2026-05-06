@@ -1,8 +1,9 @@
 # ADR-022: Storage Backend — fjall on Hot Paths, redb on Low-Frequency Stores
 
-**Status**: Accepted (rev-3 amendment 2026-05-06).
+**Status**: Accepted (rev-4 amendment 2026-05-06).
 **Date**: 2026-04-20 (rev-1 — redb), 2026-05-06 (rev-2 — fjall on
-composition, rev-3 — fjall on the Raft log).
+composition, rev-3 — fjall on the Raft log, rev-4 — fjall on chunk
++ fragment meta).
 **Deciders**: Architect + implementer.
 
 ## Context
@@ -295,3 +296,109 @@ operators wipe + re-replicate from Raft if a rollback is needed.
 - `docs/operations/durability.md`: per-knob loss windows
 - 2026-05-05 perf-spike findings: project memory
   `project_2026_05_05_perf_findings.md`
+
+## Rev-4 amendment (2026-05-06) — fjall on the chunk + fragment meta path
+
+The `PersistentChunkStore::save_meta` / `save_frag_meta` JSON-rewrite-
+the-world pattern was the next floor under composition + Raft log.
+Every chunk mutation rewrote the entire metadata table to JSON, atomic-
+renamed it, and called `device.sync()`. O(N) per write in store size,
+which capped the in-process-persistent PUT bench at ~36 k op/s — the
+ceiling stayed flat past concurrency 4 because workers all queued for
+the next save_meta turn.
+
+### Decision
+
+Move chunk + fragment meta off JSON to fjall (ADR-022 rev-4). Same
+backend the composition store and the Raft log use (rev-2 / rev-3).
+Pools (~10 entries, admin-rate mutations) stay out of fjall — moved
+to a `DashMap` for sharded concurrent reads on the per-PUT
+durability-strategy lookup, persisted to a small `pools.json` file
+on the rare admin mutation.
+
+### What changed
+
+- `PersistentChunkStore::save_meta` + `save_frag_meta` deleted.
+  Each mutating op (`write_chunk`, `increment_refcount`,
+  `decrement_refcount`, `set_retention_hold`, `release_retention_hold`,
+  `gc`, `write_fragment`, `delete_fragment`, `delete_chunk_force`)
+  now writes ONE record through `FjallMetaStore` — O(1) per op.
+- New module `kiseki-chunk::persistent` mirrors the
+  `kiseki-composition::persistent` layout: `encoding` (wire format,
+  schema-versioned postcard records, single source of truth) +
+  `fjall_meta` (`FjallMetaStore` impl + `FjallMetaFlusher` off-thread
+  fsync handle).
+- Two fjall keyspaces inside one database: `chunks` (32-byte
+  `chunk_id` keys → `ChunkRecord`) + `fragments` (36-byte
+  `chunk_id || fragment_index_be` keys → `FragmentRecord`).
+- `delete_chunk_force` uses one fjall WriteBatch across both
+  keyspaces — strictly stronger atomicity than the prior
+  sequential JSON pair where a crash between the two rewrites left
+  hung state.
+- `pools: Mutex<HashMap>` → `pools: DashMap`. The per-PUT
+  `pools.get(pool)` durability-strategy lookup no longer serialises
+  every fabric writer through one global lock.
+
+### Path layout change
+
+| pre-rev-4                                  | rev-4                          |
+|--------------------------------------------|--------------------------------|
+| `<data_dir>/chunks/data.dev`                | `<data_dir>/chunks/data.dev` (unchanged) |
+| `<data_dir>/chunks/meta.json`               | `<data_dir>/chunks/meta/`      |
+| `<data_dir>/chunks/meta.json.frag`          | (folded into the same fjall keyspace) |
+| (none — pools were memory-only)             | `<data_dir>/chunks/pools.json` |
+
+The runtime canonical-paths layout test
+(`runtime::tests::store_layout_paths_are_distinct_and_under_data_dir`)
+counts 5 paths now (up from 4) — `chunks/meta` + `chunks/data.dev`
+collapse into the same first-level subdir.
+
+### Measurement (single-host, in-process-persistent floor, 64 KiB)
+
+Scaling sweep — the previous plateau at concurrency ≥ 4 is gone:
+
+| concurrency | rev-3 (JSON save_meta) | rev-4 (fjall) | factor |
+|-------------|------------------------|---------------|--------|
+| 1           |  16 728 op/s           |  23 095 op/s   | 1.4×   |
+| 2           |  31 892 op/s           |  44 262 op/s   | 1.4×   |
+| 4           |  36 893 op/s           |  81 082 op/s   | 2.2×   |
+| 8           |  35 408 op/s           | **125 299 op/s** | **3.5×** |
+| 16          |  35 655 op/s           |  98 747 op/s   | 2.8×   |
+| 32          |  35 242 op/s           |  98 788 op/s   | 2.8×   |
+| 64          |   —                    |  99 201 op/s   |        |
+
+Per-shape (c=16, 15s):
+
+| shape       | rev-3        | rev-4               | factor | p99 rev-3 | p99 rev-4 |
+|-------------|--------------|---------------------|--------|-----------|-----------|
+| put-heavy   |  35 215 op/s | **95 203 op/s**     | **2.7×** | 1.0 ms | 0.6 ms |
+| get-heavy   | 193 940 op/s | 192 229 op/s        | 1.0×   | 0.5 ms | 0.5 ms |
+| mixed 70/30 |  47 196 op/s | **104 468 op/s**    | **2.2×** | 1.0 ms | 0.6 ms |
+
+GET unchanged (reads never went through `save_meta`). Writes lifted
+2–3× as expected once the O(N) JSON rewrite was gone. p99 latency
+also dropped on the write paths because workers no longer queue for
+the JSON-serialise + write+rename critical section.
+
+### Scope of the rev-4 swap (what stayed on redb)
+
+- **View store** (`kiseki-view`'s `PersistentRedbStorage`):
+  watermark checkpoints, low-frequency.
+- **Small object store** (`kiseki-chunk`'s `SmallObjectStore`):
+  ADR-030 inline-data path, low-frequency.
+- **Tuning store** (`kiseki-server`'s `RedbTuningStore`):
+  ADR-025 cluster tuning params, low-frequency.
+
+These stay on redb because the cost of migration would not return
+any measurable performance lift; their bottleneck (if any) is
+upstream contention, not commit cost.
+
+### Rollback path (rev-4)
+
+`git revert` of the rev-4 commits. The pre-rev-4 implementation
+(JSON save_meta + save_frag_meta + Mutex<HashMap> pools, ~280 LOC
+in `persistent_store.rs`) is in git history. As with rev-2 / rev-3,
+no on-disk migration tool ships — operators wipe + re-replicate
+from peers if a rollback is needed (the deployment target is 10–100+
+nodes with R-3 / EC-4+2; per-node loss windows are recoverable from
+the cluster).
