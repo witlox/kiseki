@@ -1,30 +1,35 @@
-//! Verb dispatch for the TCP-framed binding (ADR-042 §2.2).
+//! Verb dispatch for the TCP-framed binding (ADR-042 §2.2, V3 wire).
 //!
-//! Per-frame work: postcard-decode the request body against the type
-//! the verb identifier names, call the corresponding inherent method
-//! on [`ServerImpl`], postcard-encode the response (or
-//! tonic-Status-mapped error reason), return `(WireStatus, body)`
-//! for the caller to wrap in a response frame.
+//! Per-frame work:
+//! 1. Postcard-decode the request `meta` bytes against the verb's
+//!    typed request struct.
+//! 2. For request-bulk verbs (`put_object`, `write`): attach the
+//!    request `bulk` bytes onto the typed struct's bulk field.
+//! 3. Call the corresponding inherent method on [`ServerImpl`].
+//! 4. For response-bulk verbs (`get_object`, `read`): take the bulk
+//!    field OUT of the response, postcard-encode the rest as
+//!    `meta_bytes`, return the bulk separately.
+//! 5. For non-bulk verbs: postcard-encode the full response as
+//!    `meta_bytes`, `bulk_bytes` is empty.
 //!
-//! The verb-tag → ServerImpl mapping is one big match; each arm is
-//! ~one line via the [`unary_verb!`] macro. Adding a new verb is:
-//! one match arm + one signature confirmation. No reflection, no
-//! registry — explicit dispatch keeps the wire surface review-able.
+//! Returns `(WireStatus, meta_bytes, bulk_bytes)` — the V3 frame
+//! layout writes these as three iovecs in one syscall, no postcard
+//! encode/decode of the bulk path on either side.
 
-use kiseki_proto::native_contract::RequestPrincipal;
 use kiseki_proto::native_contract::wire_tcp_framed::WireStatus;
+use kiseki_proto::native_contract::RequestPrincipal;
 use kiseki_proto::v1::native as np;
 use tonic::Status;
 
 use crate::native::server::ServerImpl;
 
+/// V3 dispatch outcome: `(status, meta_bytes, bulk_bytes)`. Bulk is
+/// empty for non-bulk verbs and on error responses.
+pub type DispatchOutcome = (WireStatus, Vec<u8>, Vec<u8>);
+
 /// Map a `tonic::Status` (returned by `ServerImpl` inherent methods)
 /// to the wire's [`WireStatus`] byte. The reason string travels in
-/// the body, encoded by the dispatch caller.
-///
-/// `tonic::Code` is exhaustive; unknown future variants fall into
-/// `Internal`. The mapping below mirrors ADR-042 §1.4 exactly for
-/// the variants both share.
+/// `meta_bytes`, encoded by the dispatch caller.
 #[must_use]
 pub fn status_to_wire(status: &Status) -> WireStatus {
     use tonic::Code;
@@ -40,161 +45,187 @@ pub fn status_to_wire(status: &Status) -> WireStatus {
         Code::OutOfRange => WireStatus::OutOfRange,
         Code::Unavailable | Code::DeadlineExceeded => WireStatus::Unavailable,
         Code::Unauthenticated => WireStatus::Unauthenticated,
-        // Internal / Unknown / Unimplemented / DataLoss collapse to
-        // Internal (§1.4 has no Unimplemented variant — POSIX stubs
-        // shouldn't reach the TCP-framed dispatch path because they
-        // live in the gRPC adapter only).
         Code::Internal | Code::Unknown | Code::Unimplemented | Code::DataLoss => {
             WireStatus::Internal
         }
     }
 }
 
-/// Macro: generate one match arm of [`dispatch_verb`] for a unary
-/// verb. Decode the request body, call the handler future, encode
-/// the response. On any error path the body carries the
-/// human-readable reason the handler emitted (encoded as raw UTF-8
-/// bytes; the client decodes via `String::from_utf8_lossy`).
+/// Build an error outcome: status mapped, meta = reason string,
+/// bulk empty.
+fn err_outcome(verb: &str, status: &Status) -> DispatchOutcome {
+    let reason = status.message();
+    let payload = if reason.is_empty() {
+        format!("{verb}: handler returned status without message").into_bytes()
+    } else {
+        reason.as_bytes().to_vec()
+    };
+    (status_to_wire(status), payload, Vec::new())
+}
+
+fn protocol_error(verb: &str, e: impl std::fmt::Display) -> DispatchOutcome {
+    (
+        WireStatus::ProtocolError,
+        format!("postcard decode failed in {verb}: {e}").into_bytes(),
+        Vec::new(),
+    )
+}
+
+fn internal_encode_error(verb: &str, e: impl std::fmt::Display) -> DispatchOutcome {
+    (
+        WireStatus::Internal,
+        format!("postcard encode failed in {verb}: {e}").into_bytes(),
+        Vec::new(),
+    )
+}
+
+/// Macro: one match arm for a unary, NON-bulk verb. Decodes
+/// `req_meta` as the typed request, calls the handler, encodes the
+/// response as `meta_bytes`. `bulk_bytes` is always empty.
 macro_rules! unary_verb {
-    ($verb:literal, $payload:expr, $handler:expr) => {{
-        let req = match postcard::from_bytes($payload) {
+    ($verb:literal, $req_meta:expr, $handler:expr) => {{
+        let req = match postcard::from_bytes($req_meta) {
             Ok(r) => r,
-            Err(e) => {
-                return (
-                    WireStatus::ProtocolError,
-                    format!("postcard decode failed in {}: {e}", $verb).into_bytes(),
-                );
-            }
+            Err(e) => return protocol_error($verb, e),
         };
         match $handler(req).await {
             Ok(resp) => match postcard::to_allocvec(&resp) {
-                Ok(bytes) => (WireStatus::Ok, bytes),
-                Err(e) => (
-                    WireStatus::Internal,
-                    format!("postcard encode failed in {}: {e}", $verb).into_bytes(),
-                ),
+                Ok(meta) => (WireStatus::Ok, meta, Vec::new()),
+                Err(e) => internal_encode_error($verb, e),
             },
-            Err(status) => (
-                status_to_wire(&status),
-                status.message().as_bytes().to_vec(),
-            ),
+            Err(status) => err_outcome($verb, &status),
         }
     }};
 }
 
-/// Dispatch one TCP-framed RPC. Decodes the verb's request body,
-/// calls the corresponding [`ServerImpl`] inherent method, encodes
-/// the response (or maps the status). Returns `(WireStatus, body)`
-/// for the caller to wrap in a [`encode_response_frame`] frame.
-///
-/// Streaming gRPC verbs (`put_object_stream`, `get_object_stream`,
-/// `put_part`, `read_stream`, `write_stream`) are NOT exposed on
-/// TCP-framed — the binding's per-call body cap of 80 MiB
-/// (>64 MiB per-stream cap, §1.5) covers the unary surface; clients
-/// use multipart for above-cap. Spec §2.2 calls this out: "requests
-/// multiplex via `request_id` like h2 streams" — the multiplex IS
-/// the streaming, per-call body is buffered.
-///
-/// POSIX stubs (`open`, `read`, `write`, `close`, ...) are not
-/// bridged in this phase; the dispatch returns `UnknownVerb` for
-/// them so a v1 client + v0 server pairing surfaces a clear error.
-///
-/// `fsync` is special-cased: no principal, no request body.
-///
-/// [`encode_response_frame`]: kiseki_proto::native_contract::wire_tcp_framed::encode_response_frame
+/// Dispatch one V3 TCP-framed RPC. Returns `(status, meta, bulk)`.
+/// See module docs for the per-verb logic.
 pub async fn dispatch_verb(
     server: &ServerImpl,
     principal: &dyn RequestPrincipal,
     verb_tag: &str,
-    payload_bytes: &[u8],
-) -> (WireStatus, Vec<u8>) {
+    req_meta: &[u8],
+    req_bulk: &[u8],
+) -> DispatchOutcome {
     match verb_tag {
-        // Object verbs.
-        "put_object" => unary_verb!("put_object", payload_bytes, |req: np::PutObjectRequest| {
-            server.put_object(principal, req)
-        }),
-        "get_object" => unary_verb!("get_object", payload_bytes, |req: np::GetObjectRequest| {
-            server.get_object(principal, req)
-        }),
+        // ---------------- Object verbs ----------------
+        // Request-bulk verb: PutObjectRequest.data ← req_bulk.
+        "put_object" => {
+            let mut req: np::PutObjectRequest = match postcard::from_bytes(req_meta) {
+                Ok(r) => r,
+                Err(e) => return protocol_error("put_object", e),
+            };
+            // V3: attach bulk bytes onto the typed struct's bulk
+            // field. The encoded `meta_bytes` had `data` empty; the
+            // server reassembles here. One memcopy from the wire
+            // buffer into the Vec<u8> of the request struct.
+            req.data = req_bulk.to_vec();
+            match server.put_object(principal, req).await {
+                Ok(resp) => match postcard::to_allocvec(&resp) {
+                    Ok(meta) => (WireStatus::Ok, meta, Vec::new()),
+                    Err(e) => internal_encode_error("put_object", e),
+                },
+                Err(status) => err_outcome("put_object", &status),
+            }
+        }
+        // Response-bulk verb: GetObjectResponse.data → bulk.
+        "get_object" => {
+            let req: np::GetObjectRequest = match postcard::from_bytes(req_meta) {
+                Ok(r) => r,
+                Err(e) => return protocol_error("get_object", e),
+            };
+            match server.get_object(principal, req).await {
+                Ok(mut resp) => {
+                    // V3 hot path: take the bulk OUT of the response
+                    // before postcard-encoding, ship it raw on the
+                    // wire as `bulk_bytes`. Skips one full-body
+                    // postcard encode + matching decode on the
+                    // client (84% of CPU pre-fix at 64 KiB).
+                    let bulk = std::mem::take(&mut resp.data);
+                    match postcard::to_allocvec(&resp) {
+                        Ok(meta) => (WireStatus::Ok, meta, bulk),
+                        Err(e) => internal_encode_error("get_object", e),
+                    }
+                }
+                Err(status) => err_outcome("get_object", &status),
+            }
+        }
         "delete_object" => unary_verb!(
             "delete_object",
-            payload_bytes,
+            req_meta,
             |req: np::DeleteObjectRequest| server.delete_object(principal, req)
         ),
-        "head_object" => unary_verb!("head_object", payload_bytes, |req: np::HeadObjectRequest| {
+        "head_object" => unary_verb!("head_object", req_meta, |req: np::HeadObjectRequest| {
             server.head_object(principal, req)
         }),
         "list_objects" => unary_verb!(
             "list_objects",
-            payload_bytes,
+            req_meta,
             |req: np::ListObjectsRequest| server.list_objects(principal, req)
         ),
         "lookup_by_name" => unary_verb!(
             "lookup_by_name",
-            payload_bytes,
+            req_meta,
             |req: np::LookupByNameRequest| server.lookup_by_name(principal, req)
         ),
-        // Multipart verbs (init / complete / abort; put_part requires
-        // streaming on TCP-framed and is deferred to a follow-up).
+        // ---------------- Multipart ----------------
         "init_multipart" => unary_verb!(
             "init_multipart",
-            payload_bytes,
+            req_meta,
             |req: np::InitMultipartRequest| server.init_multipart(principal, req)
         ),
         "complete_multipart" => unary_verb!(
             "complete_multipart",
-            payload_bytes,
+            req_meta,
             |req: np::CompleteMultipartRequest| server.complete_multipart(principal, req)
         ),
         "abort_multipart" => unary_verb!(
             "abort_multipart",
-            payload_bytes,
+            req_meta,
             |req: np::AbortMultipartRequest| server.abort_multipart(principal, req)
         ),
-        // Lease verbs.
+        // ---------------- Lease ----------------
         "acquire_lease" => unary_verb!(
             "acquire_lease",
-            payload_bytes,
+            req_meta,
             |req: np::AcquireLeaseRequest| server.acquire_lease(principal, req)
         ),
-        "renew_lease" => unary_verb!("renew_lease", payload_bytes, |req: np::RenewLeaseRequest| {
+        "renew_lease" => unary_verb!("renew_lease", req_meta, |req: np::RenewLeaseRequest| {
             server.renew_lease(principal, req)
         }),
         "release_lease" => unary_verb!(
             "release_lease",
-            payload_bytes,
+            req_meta,
             |req: np::ReleaseLeaseRequest| server.release_lease(principal, req)
         ),
-        // DEK fetch.
-        "fetch_dek" => unary_verb!("fetch_dek", payload_bytes, |req: np::FetchDekRequest| {
+        // ---------------- DEK fetch ----------------
+        "fetch_dek" => unary_verb!("fetch_dek", req_meta, |req: np::FetchDekRequest| {
             server.fetch_dek(principal, req)
         }),
         "batch_fetch_dek" => unary_verb!(
             "batch_fetch_dek",
-            payload_bytes,
+            req_meta,
             |req: np::BatchFetchDekRequest| server.batch_fetch_dek(principal, req)
         ),
-        // Topology.
+        // ---------------- Topology ----------------
         "get_topology" => unary_verb!(
             "get_topology",
-            payload_bytes,
+            req_meta,
             |req: np::GetTopologyRequest| server.get_topology(principal, req)
         ),
-        // Cluster-wide flush — no principal, no body.
+        // No-principal cluster-wide flush.
         "fsync" => match server.fsync().await {
             Ok(resp) => match postcard::to_allocvec(&resp) {
-                Ok(bytes) => (WireStatus::Ok, bytes),
-                Err(e) => (
-                    WireStatus::Internal,
-                    format!("postcard encode failed in fsync: {e}").into_bytes(),
-                ),
+                Ok(meta) => (WireStatus::Ok, meta, Vec::new()),
+                Err(e) => internal_encode_error("fsync", e),
             },
-            Err(status) => (
-                status_to_wire(&status),
-                status.message().as_bytes().to_vec(),
-            ),
+            Err(status) => err_outcome("fsync", &status),
         },
-        _ => (WireStatus::UnknownVerb, verb_tag.as_bytes().to_vec()),
+        _ => (
+            WireStatus::UnknownVerb,
+            verb_tag.as_bytes().to_vec(),
+            Vec::new(),
+        ),
     }
 }
 
@@ -260,82 +291,112 @@ mod tests {
         }
     }
 
-    /// End-to-end through the dispatch boundary: postcard-encode a
-    /// PutObjectRequest, run dispatch, postcard-decode the response.
-    /// Proves the dispatch path closes the loop on a real verb.
+    /// V3 PUT round-trip via dispatch: meta carries a PutObjectRequest
+    /// with empty `data`; the actual bulk rides as `req_bulk`.
+    /// Server reassembles, calls handler, returns
+    /// (Ok, postcard(PutObjectResponse), empty bulk).
     #[tokio::test]
-    async fn put_object_dispatches_and_returns_postcard_response() {
+    async fn put_object_v3_dispatches_with_bulk_split() {
         let server = make_server().await;
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
-        let req = np::PutObjectRequest {
+        let mut req = np::PutObjectRequest {
             control: Some(ctrl(tenant)),
             namespace_id: Some(ns_proto(ns)),
             name: "alpha".into(),
-            data: b"hello".to_vec(),
+            data: Vec::new(), // empty in meta — bulk rides separately
         };
-        let payload = postcard::to_allocvec(&req).expect("encode req");
+        let meta_bytes = postcard::to_allocvec(&req).unwrap();
+        req.data = b"hello".to_vec(); // would-be bulk
+        let bulk_bytes = req.data;
         let principal = anon_principal();
-        let (status, body) =
-            dispatch_verb(&server, &principal, "put_object", &payload).await;
-        assert_eq!(status, WireStatus::Ok, "body: {:?}", String::from_utf8_lossy(&body));
-        let resp: np::PutObjectResponse = postcard::from_bytes(&body).expect("decode resp");
+        let (status, resp_meta, resp_bulk) =
+            dispatch_verb(&server, &principal, "put_object", &meta_bytes, &bulk_bytes).await;
+        assert_eq!(status, WireStatus::Ok);
+        assert!(resp_bulk.is_empty(), "PutObject response has no bulk");
+        let resp: np::PutObjectResponse = postcard::from_bytes(&resp_meta).unwrap();
         assert_eq!(resp.size, 5);
         assert!(resp.composition_id.is_some());
     }
 
-    /// Round-trip a PUT then a GET via the dispatch table — proves
-    /// the same handler logic the gRPC adapter sees is reached.
+    /// V3 GET round-trip: server splits the response's `data` field
+    /// out of the postcard meta and returns it as `bulk_bytes`.
+    /// Client reassembles. The full GetObjectResponse rides the
+    /// wire WITHOUT postcard-encoding the bulk bytes themselves.
     #[tokio::test]
-    async fn put_then_get_round_trip_via_dispatch() {
+    async fn get_object_v3_dispatches_with_bulk_split() {
         let server = make_server().await;
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
+        let principal = anon_principal();
 
-        let put_payload = postcard::to_allocvec(&np::PutObjectRequest {
+        // Seed an object via dispatch.
+        let put_req = np::PutObjectRequest {
             control: Some(ctrl(tenant)),
             namespace_id: Some(ns_proto(ns)),
-            name: "key".into(),
-            data: b"value".to_vec(),
-        })
-        .unwrap();
-        let principal = anon_principal();
-        let (s1, b1) = dispatch_verb(&server, &principal, "put_object", &put_payload).await;
-        assert_eq!(s1, WireStatus::Ok);
-        let put_resp: np::PutObjectResponse = postcard::from_bytes(&b1).unwrap();
-        let comp = put_resp.composition_id.expect("comp id");
+            name: "k".into(),
+            data: Vec::new(),
+        };
+        let put_meta = postcard::to_allocvec(&put_req).unwrap();
+        let (s, _, _) =
+            dispatch_verb(&server, &principal, "put_object", &put_meta, b"value").await;
+        assert_eq!(s, WireStatus::Ok);
 
-        let get_payload = postcard::to_allocvec(&np::GetObjectRequest {
+        // GET via dispatch: lookup by name.
+        let get_req = np::GetObjectRequest {
             control: Some(ctrl(tenant)),
             namespace_id: Some(ns_proto(ns)),
             range_start: 0,
             range_end: 0,
-            key: Some(np::get_object_request::Key::CompositionId(comp)),
-        })
-        .unwrap();
-        let (s2, b2) = dispatch_verb(&server, &principal, "get_object", &get_payload).await;
-        assert_eq!(s2, WireStatus::Ok);
-        let get_resp: np::GetObjectResponse = postcard::from_bytes(&b2).unwrap();
-        assert_eq!(get_resp.data, b"value");
+            key: Some(np::get_object_request::Key::Name("k".into())),
+        };
+        let get_meta = postcard::to_allocvec(&get_req).unwrap();
+        let (status, resp_meta, resp_bulk) =
+            dispatch_verb(&server, &principal, "get_object", &get_meta, &[]).await;
+        assert_eq!(status, WireStatus::Ok);
+        // Bulk on the wire is the actual data.
+        assert_eq!(resp_bulk, b"value");
+        // Meta decodes as GetObjectResponse with EMPTY data — the
+        // bulk has been hoisted out.
+        let resp: np::GetObjectResponse = postcard::from_bytes(&resp_meta).unwrap();
+        assert!(resp.data.is_empty(), "data field must be empty in meta");
+        assert_eq!(resp.size, 5);
     }
 
-    /// Unknown verb → WireStatus::UnknownVerb. Body carries the
-    /// verb name so a server-version mismatch is debuggable.
     #[tokio::test]
-    async fn unknown_verb_returns_unknownverb_with_tag_in_body() {
+    async fn unknown_verb_returns_unknown_verb_with_tag_in_meta() {
         let server = make_server().await;
         let principal = anon_principal();
-        let (status, body) = dispatch_verb(&server, &principal, "not_a_real_verb", b"").await;
+        let (status, meta, bulk) =
+            dispatch_verb(&server, &principal, "not_a_verb", &[], &[]).await;
         assert_eq!(status, WireStatus::UnknownVerb);
-        assert_eq!(body, b"not_a_real_verb");
+        assert_eq!(meta, b"not_a_verb");
+        assert!(bulk.is_empty());
     }
 
-    /// Streaming verbs were intentionally not added to the dispatch
-    /// table per §2.2 (TCP-framed buffers). Confirm `put_object_stream`
-    /// surfaces as UnknownVerb so a client mistakenly sending the
-    /// gRPC stream verb name fails closed rather than hanging.
     #[tokio::test]
-    async fn streaming_verb_names_surface_as_unknown_verb() {
+    async fn corrupt_meta_returns_protocol_error() {
+        let server = make_server().await;
+        let principal = anon_principal();
+        let (status, _meta, bulk) =
+            dispatch_verb(&server, &principal, "lookup_by_name", &[0xFF; 4], &[]).await;
+        assert_eq!(status, WireStatus::ProtocolError);
+        assert!(bulk.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fsync_dispatches_without_principal_or_body() {
+        let server = make_server().await;
+        let principal = anon_principal();
+        let (status, meta, bulk) =
+            dispatch_verb(&server, &principal, "fsync", &[], &[]).await;
+        assert_eq!(status, WireStatus::Ok);
+        assert!(bulk.is_empty());
+        let _resp: np::FsyncResponse = postcard::from_bytes(&meta).expect("decode");
+    }
+
+    #[tokio::test]
+    async fn streaming_verbs_surface_as_unknown_verb() {
         let server = make_server().await;
         let principal = anon_principal();
         for verb in [
@@ -345,78 +406,13 @@ mod tests {
             "read_stream",
             "write_stream",
         ] {
-            let (status, _body) = dispatch_verb(&server, &principal, verb, b"").await;
-            assert_eq!(
-                status,
-                WireStatus::UnknownVerb,
-                "streaming verb {verb} should be UnknownVerb on TCP-framed",
-            );
+            let (status, _, _) = dispatch_verb(&server, &principal, verb, &[], &[]).await;
+            assert_eq!(status, WireStatus::UnknownVerb);
         }
-    }
-
-    /// Malformed postcard payload → ProtocolError. Body carries the
-    /// reason so operators can debug schema skew.
-    #[tokio::test]
-    async fn corrupt_payload_returns_protocol_error() {
-        let server = make_server().await;
-        let principal = anon_principal();
-        // Random bytes that won't decode as PutObjectRequest.
-        let (status, body) =
-            dispatch_verb(&server, &principal, "put_object", &[0xFF; 8]).await;
-        assert_eq!(status, WireStatus::ProtocolError);
-        let msg = String::from_utf8_lossy(&body);
-        assert!(msg.contains("put_object"), "reason should name the verb: {msg}");
-        assert!(msg.contains("postcard decode failed"), "reason: {msg}");
-    }
-
-    /// Handler returning Status::permission_denied (e.g.
-    /// san_payload_tenant_mismatch) maps to
-    /// WireStatus::PermissionDenied; reason carries through.
-    #[tokio::test]
-    async fn handler_status_maps_to_wire_status() {
-        let server = make_server().await;
-        // Principal whose canonical SAN tenant id != payload tenant.
-        let principal = TcpFramedPrincipal::new(
-            "spiffe://kiseki/tenant/00000000-0000-0000-0000-000000000999",
-            ConnectionId(0),
-        );
-        let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
-        let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
-        let payload = postcard::to_allocvec(&np::PutObjectRequest {
-            control: Some(ctrl(tenant)),
-            namespace_id: Some(ns_proto(ns)),
-            name: "x".into(),
-            data: b"y".to_vec(),
-        })
-        .unwrap();
-        let (status, body) = dispatch_verb(&server, &principal, "put_object", &payload).await;
-        assert_eq!(status, WireStatus::PermissionDenied);
-        let reason = String::from_utf8_lossy(&body);
-        assert!(
-            reason.contains("san_payload_tenant_mismatch"),
-            "expected SAN/payload mismatch reason, got: {reason}",
-        );
-    }
-
-    /// `fsync` doesn't take a body or principal. Confirm dispatch
-    /// reaches the handler and round-trips an Ok response.
-    #[tokio::test]
-    async fn fsync_dispatches_without_principal_or_body() {
-        let server = make_server().await;
-        let principal = anon_principal();
-        let (status, body) = dispatch_verb(&server, &principal, "fsync", b"").await;
-        assert_eq!(status, WireStatus::Ok);
-        let resp: np::FsyncResponse = postcard::from_bytes(&body).expect("decode");
-        assert_eq!(resp.fsynced_lsn, 0);
     }
 
     #[test]
     fn status_to_wire_covers_all_tonic_codes() {
-        // Pin the mapping so a future tonic update that adds a Code
-        // doesn't silently default to Internal without a conscious
-        // decision. Each variant present in tonic 0.14 is asserted
-        // here; if rustc complains about a missing match arm in
-        // status_to_wire, this test forces a re-review.
         use tonic::Code;
         let cases: Vec<(Code, WireStatus)> = vec![
             (Code::Ok, WireStatus::Ok),

@@ -55,9 +55,13 @@ pub enum TcpFramedClientError {
     },
 }
 
+/// V3 response payload sent through the oneshot — status + meta +
+/// bulk. Bulk is empty for non-bulk verbs and for error responses.
+pub type CallResponse = (WireStatus, Vec<u8>, Vec<u8>);
+
 /// Pending requests keyed by `request_id`. The writer side inserts;
-/// the reader task removes + signals.
-type PendingMap = DashMap<u64, oneshot::Sender<(WireStatus, Vec<u8>)>>;
+/// the reader task removes + signals with `CallResponse`.
+type PendingMap = DashMap<u64, oneshot::Sender<CallResponse>>;
 
 /// Client-side TCP-framed-postcard connection. Cheap to clone via
 /// `Arc<TcpFramedClient>` for shared use across tasks.
@@ -131,33 +135,41 @@ impl TcpFramedClient {
         Ok(Self::from_stream(tls))
     }
 
-    /// Issue one RPC. Returns the `(WireStatus, payload)` pair from
-    /// the response envelope. On `WireStatus::Ok`, `payload` is the
-    /// postcard-encoded response body (caller decodes against the
-    /// verb's response type). On non-Ok statuses, `payload` is a
-    /// UTF-8 reason string surfaced through
-    /// [`TcpFramedClientError::ServerError`].
+    /// Issue one V3 RPC. Returns `(status, meta, bulk)` matching the
+    /// V3 wire layout. `meta` is the postcard-encoded response struct
+    /// (with bulk fields empty); `bulk` is the raw bulk-field bytes
+    /// for response-bulk verbs (`get_object`, `read`) or empty
+    /// otherwise. On non-Ok statuses, `meta` is a UTF-8 reason
+    /// string and `bulk` is empty.
+    ///
+    /// `req_meta`: postcard-encoded request struct (with the
+    /// request's bulk field — if any — set to empty/None).
+    /// `req_bulk`: raw bulk bytes for request-bulk verbs
+    /// (`put_object`, `write`); empty for non-bulk verbs.
     ///
     /// # Errors
-    /// Returns `TcpFramedClientError` on I/O failure, wire decode
-    /// failure, connection closed before response, or server-side
-    /// non-Ok status. On `ServerError`, callers may want to map
-    /// `WireStatus` back to `NativeError` for typed handling.
+    /// `Io` / `WireDecode` / `ConnectionClosed`. Non-Ok statuses do
+    /// NOT error here — they ride through `meta`; use [`call_ok`] for
+    /// the convenience wrapping.
     pub async fn call(
         &self,
         verb_tag: &str,
-        payload_bytes: Vec<u8>,
-    ) -> Result<(WireStatus, Vec<u8>), TcpFramedClientError> {
+        req_meta: Vec<u8>,
+        req_bulk: Vec<u8>,
+    ) -> Result<CallResponse, TcpFramedClientError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.insert(request_id, tx);
 
         // Build the small request header (length prefix + version +
-        // request_id + verb_tag header) — typically ~24 bytes.
-        // Body bytes go to the socket DIRECTLY in a second write_all
-        // call, avoiding the 64 KiB `Vec::extend_from_slice` memcopy
-        // that `encode_request_frame` would do internally.
-        let header = match build_request_header(request_id, verb_tag, payload_bytes.len()) {
+        // request_id + verb_tag + meta_len). Vectored write below
+        // ships [header, meta, bulk] in one syscall.
+        let header = match build_request_header(
+            request_id,
+            verb_tag,
+            req_meta.len(),
+            req_bulk.len(),
+        ) {
             Ok(h) => h,
             Err(e) => {
                 self.pending.remove(&request_id);
@@ -166,10 +178,8 @@ impl TcpFramedClient {
         };
         {
             let mut guard = self.write_half.lock().await;
-            // Vectored write: header + body in one syscall (one TCP
-            // send). Eliminates Nagle delay AND the body memcopy
-            // that a single-Vec encode would do.
-            if let Err(e) = write_request_vectored(&mut *guard, &header, &payload_bytes).await
+            if let Err(e) =
+                write_request_vectored3(&mut *guard, &header, &req_meta, &req_bulk).await
             {
                 self.pending.remove(&request_id);
                 return Err(e.into());
@@ -180,35 +190,32 @@ impl TcpFramedClient {
             }
         }
 
-        // Await the reader task signaling our response. If the reader
-        // dropped (connection closed), the oneshot returns Err.
-        let (status, payload) = rx
+        let (status, meta, bulk) = rx
             .await
             .map_err(|_| TcpFramedClientError::ConnectionClosed)?;
-
-        Ok((status, payload))
+        Ok((status, meta, bulk))
     }
 
     /// Convenience: like [`call`] but maps non-Ok statuses to
-    /// `TcpFramedClientError::ServerError`. Useful when the caller
-    /// just wants `Ok(payload)` on success and an error otherwise.
+    /// `ServerError`. Returns `(meta, bulk)` on Ok.
     ///
     /// # Errors
-    /// Same as [`call`], plus `ServerError` for any non-Ok status.
+    /// Same as [`call`], plus `ServerError` for non-Ok status.
     ///
     /// [`call`]: Self::call
     pub async fn call_ok(
         &self,
         verb_tag: &str,
-        payload_bytes: Vec<u8>,
-    ) -> Result<Vec<u8>, TcpFramedClientError> {
-        let (status, payload) = self.call(verb_tag, payload_bytes).await?;
+        req_meta: Vec<u8>,
+        req_bulk: Vec<u8>,
+    ) -> Result<(Vec<u8>, Vec<u8>), TcpFramedClientError> {
+        let (status, meta, bulk) = self.call(verb_tag, req_meta, req_bulk).await?;
         if status == WireStatus::Ok {
-            Ok(payload)
+            Ok((meta, bulk))
         } else {
             Err(TcpFramedClientError::ServerError {
                 status,
-                reason: String::from_utf8_lossy(&payload).into_owned(),
+                reason: String::from_utf8_lossy(&meta).into_owned(),
             })
         }
     }
@@ -229,44 +236,55 @@ impl Drop for TcpFramedClient {
 /// `request_id`, signal the matching `oneshot::Sender`. Loop ends
 /// on EOF, oversize/version error, or any I/O error — pending
 /// requests then drop with `ConnectionClosed`.
-/// `writev`-style two-buffer write — header + body in one syscall.
-/// Falls back to two sequential `write_all`s if the underlying
-/// stream's vectored impl returns 0 bytes (some `AsyncWrite`
-/// adapters don't support vectored).
-async fn write_request_vectored<S: AsyncWrite + Unpin + ?Sized>(
+/// `writev`-style 3-buffer write — header + meta + bulk in one
+/// syscall. Falls back to sequential `write_all`s if the underlying
+/// stream's vectored impl returns 0.
+async fn write_request_vectored3<S: AsyncWrite + Unpin + ?Sized>(
     stream: &mut S,
     header: &[u8],
-    body: &[u8],
+    meta: &[u8],
+    bulk: &[u8],
 ) -> std::io::Result<()> {
     use std::io::IoSlice;
     use std::pin::Pin;
     use tokio::io::AsyncWriteExt;
 
-    let mut header_off = 0usize;
-    let mut body_off = 0usize;
-    let total = header.len() + body.len();
+    let mut offs = [0usize, 0, 0];
+    let lens = [header.len(), meta.len(), bulk.len()];
+    let total = lens.iter().sum::<usize>();
     let mut written = 0usize;
     while written < total {
-        let bufs: [IoSlice<'_>; 2] = [
-            IoSlice::new(&header[header_off..]),
-            IoSlice::new(&body[body_off..]),
+        let bufs: [IoSlice<'_>; 3] = [
+            IoSlice::new(&header[offs[0]..]),
+            IoSlice::new(&meta[offs[1]..]),
+            IoSlice::new(&bulk[offs[2]..]),
         ];
         let n = std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_write_vectored(cx, &bufs))
             .await?;
         if n == 0 {
-            stream.write_all(&header[header_off..]).await?;
-            if body_off < body.len() {
-                stream.write_all(&body[body_off..]).await?;
+            stream.write_all(&header[offs[0]..]).await?;
+            if offs[1] < meta.len() {
+                stream.write_all(&meta[offs[1]..]).await?;
+            }
+            if offs[2] < bulk.len() {
+                stream.write_all(&bulk[offs[2]..]).await?;
             }
             return Ok(());
         }
         written += n;
-        let header_remaining = header.len() - header_off;
-        if n <= header_remaining {
-            header_off += n;
-        } else {
-            header_off = header.len();
-            body_off += n - header_remaining;
+        let mut remaining = n;
+        for i in 0..3 {
+            let avail = lens[i] - offs[i];
+            if remaining == 0 {
+                break;
+            }
+            if remaining <= avail {
+                offs[i] += remaining;
+                remaining = 0;
+            } else {
+                offs[i] = lens[i];
+                remaining -= avail;
+            }
         }
     }
     Ok(())
@@ -287,15 +305,13 @@ where
             Ok(n) => n,
             Err(_) => break,
         };
-        // Single read for the whole frame body (header + payload).
-        // Splitting into two `read_exact`s would double the read
-        // syscalls per response — measured 3% throughput penalty
-        // and 15% p99 hit on this host. The `to_vec()` of the body
-        // suffix below is O(body_len) memcopy but doesn't add a
-        // syscall round-trip; on loopback the trade-off favors
-        // single-read. On real networks the trade-off may flip
-        // (memcopy bandwidth becomes scarcer relative to syscall
-        // cost) — revisit when we have RDMA / 100 GbE numbers.
+        // Single read of the whole frame body. The V3 wire format's
+        // bulk-bytes-around-postcard split means we're already
+        // skipping the body's postcard encode/decode on each side;
+        // the `to_vec()`s below copy the meta + bulk slices out of
+        // the read buffer once each so they can ride through the
+        // oneshot. Caller (`call`) reattaches `bulk` onto the typed
+        // verb response WITHOUT another postcard pass.
         let mut body = vec![0u8; body_len];
         if read_half.read_exact(&mut body).await.is_err() {
             break;
@@ -305,7 +321,7 @@ where
             Err(_) => break,
         };
         if let Some((_, sender)) = pending.remove(&view.request_id) {
-            let _ = sender.send((view.status, view.body.to_vec()));
+            let _ = sender.send((view.status, view.meta.to_vec(), view.bulk.to_vec()));
         }
         // Unmatched response (server bug): drop silently.
     }
@@ -317,11 +333,11 @@ mod tests {
     use super::*;
     use tokio::io::duplex;
 
-    /// Test helper: read one V2 request frame from the duplex
-    /// stream. Returns (request_id, verb_tag, body).
-    async fn read_v2_request<S: AsyncRead + Unpin>(
+    /// Test helper: read one V3 request frame from the duplex
+    /// stream. Returns (request_id, verb_tag, meta, bulk).
+    async fn read_v3_request<S: AsyncRead + Unpin>(
         stream: &mut S,
-    ) -> (u64, String, Vec<u8>) {
+    ) -> (u64, String, Vec<u8>, Vec<u8>) {
         use kiseki_proto::native_contract::wire_tcp_framed::decode_request_frame;
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await.unwrap();
@@ -329,7 +345,12 @@ mod tests {
         let mut body = vec![0u8; body_len];
         stream.read_exact(&mut body).await.unwrap();
         let view = decode_request_frame(&body).expect("decode req");
-        (view.request_id, view.verb_tag.to_string(), view.body.to_vec())
+        (
+            view.request_id,
+            view.verb_tag.to_string(),
+            view.meta.to_vec(),
+            view.bulk.to_vec(),
+        )
     }
 
     /// Minimal in-memory loopback test: spawn a fake server that
@@ -341,20 +362,25 @@ mod tests {
         let (client_side, mut server_side) = duplex(64 * 1024);
 
         let server_task = tokio::spawn(async move {
-            let (request_id, verb, body) = read_v2_request(&mut server_side).await;
+            let (request_id, verb, meta, bulk) = read_v3_request(&mut server_side).await;
             assert_eq!(verb, "ping");
-            assert_eq!(body, b"hello".to_vec());
+            assert_eq!(meta, b"hello".to_vec());
+            assert!(bulk.is_empty());
 
             let resp_frame =
-                encode_response_frame(WireStatus::Ok, request_id, b"world").unwrap();
+                encode_response_frame(WireStatus::Ok, request_id, b"world", &[]).unwrap();
             server_side.write_all(&resp_frame).await.unwrap();
             server_side.flush().await.unwrap();
         });
 
         let client = TcpFramedClient::from_stream(client_side);
-        let (status, body) = client.call("ping", b"hello".to_vec()).await.unwrap();
+        let (status, meta, bulk) = client
+            .call("ping", b"hello".to_vec(), Vec::new())
+            .await
+            .unwrap();
         assert_eq!(status, WireStatus::Ok);
-        assert_eq!(body, b"world");
+        assert_eq!(meta, b"world");
+        assert!(bulk.is_empty());
 
         server_task.await.unwrap();
     }
@@ -365,14 +391,16 @@ mod tests {
         use kiseki_proto::native_contract::wire_tcp_framed::encode_response_frame;
         let (client_side, mut server_side) = duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
-            let (request_id, _verb, _body) = read_v2_request(&mut server_side).await;
+            let (request_id, _verb, _meta, _bulk) =
+                read_v3_request(&mut server_side).await;
             let frame =
-                encode_response_frame(WireStatus::Ok, request_id, &[1, 2, 3]).unwrap();
+                encode_response_frame(WireStatus::Ok, request_id, &[1, 2, 3], &[]).unwrap();
             server_side.write_all(&frame).await.unwrap();
         });
         let client = TcpFramedClient::from_stream(client_side);
-        let body = client.call_ok("v", Vec::new()).await.unwrap();
-        assert_eq!(body, vec![1, 2, 3]);
+        let (meta, bulk) = client.call_ok("v", Vec::new(), Vec::new()).await.unwrap();
+        assert_eq!(meta, vec![1, 2, 3]);
+        assert!(bulk.is_empty());
         server_task.await.unwrap();
     }
 
@@ -383,18 +411,20 @@ mod tests {
         use kiseki_proto::native_contract::wire_tcp_framed::encode_response_frame;
         let (client_side, mut server_side) = duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
-            let (request_id, _verb, _body) = read_v2_request(&mut server_side).await;
+            let (request_id, _verb, _meta, _bulk) =
+                read_v3_request(&mut server_side).await;
             let frame = encode_response_frame(
                 WireStatus::PermissionDenied,
                 request_id,
                 b"san_payload_tenant_mismatch",
+                &[],
             )
             .unwrap();
             server_side.write_all(&frame).await.unwrap();
         });
         let client = TcpFramedClient::from_stream(client_side);
         let err = client
-            .call_ok("v", Vec::new())
+            .call_ok("v", Vec::new(), Vec::new())
             .await
             .expect_err("non-Ok status");
         match err {
@@ -421,13 +451,14 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let mut request_ids = Vec::new();
             for _ in 0..2 {
-                let (rid, _verb, _body) = read_v2_request(&mut server_side).await;
+                let (rid, _verb, _meta, _bulk) =
+                    read_v3_request(&mut server_side).await;
                 request_ids.push(rid);
             }
             for rid in request_ids.into_iter().rev() {
                 let payload = format!("rid={rid}").into_bytes();
                 let frame =
-                    encode_response_frame(WireStatus::Ok, rid, &payload).unwrap();
+                    encode_response_frame(WireStatus::Ok, rid, &payload, &[]).unwrap();
                 server_side.write_all(&frame).await.unwrap();
             }
             server_side.flush().await.unwrap();
@@ -436,14 +467,14 @@ mod tests {
         let client = TcpFramedClient::from_stream(client_side);
         let c1 = Arc::clone(&client);
         let c2 = Arc::clone(&client);
-        let f1 = tokio::spawn(async move { c1.call_ok("a", Vec::new()).await });
-        let f2 = tokio::spawn(async move { c2.call_ok("b", Vec::new()).await });
-        let r1 = f1.await.unwrap().unwrap();
-        let r2 = f2.await.unwrap().unwrap();
-        // Each call gets its OWN request_id back; first call_ok is
-        // request_id 1, second is 2 (atomic counter starts at 1).
-        assert_eq!(String::from_utf8(r1).unwrap(), "rid=1");
-        assert_eq!(String::from_utf8(r2).unwrap(), "rid=2");
+        let f1 =
+            tokio::spawn(async move { c1.call_ok("a", Vec::new(), Vec::new()).await });
+        let f2 =
+            tokio::spawn(async move { c2.call_ok("b", Vec::new(), Vec::new()).await });
+        let (m1, _b1) = f1.await.unwrap().unwrap();
+        let (m2, _b2) = f2.await.unwrap().unwrap();
+        assert_eq!(String::from_utf8(m1).unwrap(), "rid=1");
+        assert_eq!(String::from_utf8(m2).unwrap(), "rid=2");
         server_task.await.unwrap();
     }
 
@@ -455,7 +486,8 @@ mod tests {
         let (client_side, server_side) = duplex(64 * 1024);
         let client = TcpFramedClient::from_stream(client_side);
         let c = Arc::clone(&client);
-        let call_task = tokio::spawn(async move { c.call("v", Vec::new()).await });
+        let call_task =
+            tokio::spawn(async move { c.call("v", Vec::new(), Vec::new()).await });
         // Give the writer a moment to enqueue the request.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         drop(server_side);
@@ -519,7 +551,9 @@ mod tests {
         let client = TcpFramedClient::from_stream(client_side);
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
-        let put_payload = postcard::to_allocvec(&np::PutObjectRequest {
+        // V3: meta = postcard(PutObjectRequest with empty .data),
+        // bulk = the actual object data bytes.
+        let req_meta = postcard::to_allocvec(&np::PutObjectRequest {
             control: Some(np::ControlFields {
                 tenant_id: Some(v1::OrgId {
                     value: tenant.0.to_string(),
@@ -533,12 +567,16 @@ mod tests {
                 value: ns.0.to_string(),
             }),
             name: "alpha".into(),
-            data: b"hello".to_vec(),
+            data: Vec::new(),
         })
         .unwrap();
+        let req_bulk = b"hello".to_vec();
 
-        let resp_bytes = client.call_ok("put_object", put_payload).await.unwrap();
-        let put_resp: np::PutObjectResponse = postcard::from_bytes(&resp_bytes).unwrap();
+        let (resp_meta, resp_bulk) =
+            client.call_ok("put_object", req_meta, req_bulk).await.unwrap();
+        // PutObject response has no bulk.
+        assert!(resp_bulk.is_empty());
+        let put_resp: np::PutObjectResponse = postcard::from_bytes(&resp_meta).unwrap();
         assert_eq!(put_resp.size, 5);
         assert!(put_resp.composition_id.is_some());
 

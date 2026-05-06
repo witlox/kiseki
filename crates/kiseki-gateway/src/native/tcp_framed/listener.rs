@@ -324,16 +324,17 @@ mod tests {
 
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
-        let body = postcard::to_allocvec(&np::PutObjectRequest {
+        // V3: meta = postcard(request with empty data); bulk = data.
+        let meta = postcard::to_allocvec(&np::PutObjectRequest {
             control: Some(ctrl(tenant)),
             namespace_id: Some(v1::NamespaceId {
                 value: ns.0.to_string(),
             }),
             name: "alpha".into(),
-            data: b"hello".to_vec(),
+            data: Vec::new(),
         })
         .unwrap();
-        let frame = encode_request_frame(7, "put_object", &body).unwrap();
+        let frame = encode_request_frame(7, "put_object", &meta, b"hello").unwrap();
         client.write_all(&frame).await.unwrap();
         client.flush().await.unwrap();
 
@@ -345,7 +346,9 @@ mod tests {
         let view = decode_response_frame(&frame_body).expect("decode response frame");
         assert_eq!(view.status, WireStatus::Ok);
         assert_eq!(view.request_id, 7);
-        let put_resp: np::PutObjectResponse = postcard::from_bytes(view.body).unwrap();
+        // PutObject response: bulk is empty, meta has the response.
+        assert!(view.bulk.is_empty());
+        let put_resp: np::PutObjectResponse = postcard::from_bytes(view.meta).unwrap();
         assert_eq!(put_resp.size, 5);
 
         // Tear down.

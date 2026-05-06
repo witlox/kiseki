@@ -1,43 +1,47 @@
 //! TCP-framed-postcard wire format for the native gateway data
 //! service. ADR-042 §2.2.
 //!
-//! **Wire shape (V2 — post-2026-05-06 perf-fix)**:
-//! - Request:  `[len u32 BE][ver u8][request_id u64 BE][verb_tag_len u8][verb_tag bytes][postcard(verb_request_body)...]`
-//! - Response: `[len u32 BE][ver u8][status u8][request_id u64 BE][postcard(verb_response_body)...]`
+//! **Wire shape (V3 — post-2026-05-06 bulk-bytes-around-postcard
+//! perf-fix)**:
+//! - Request:  `[len u32 BE][ver u8][request_id u64 BE][verb_tag_len u8][verb_tag bytes][meta_len u32 BE][meta_bytes][bulk_bytes]`
+//! - Response: `[len u32 BE][ver u8][status u8][request_id u64 BE][meta_len u32 BE][meta_bytes][bulk_bytes]`
 //! - One TCP connection per (client, node); requests multiplex via
 //!   `request_id`.
 //!
-//! V1 (pre-2026-05-06) wrapped both directions in an outer postcard
-//! envelope (`RpcEnvelope` for requests, `ResponseEnvelope` for
-//! responses) carrying `payload_bytes: Vec<u8>`. That re-encoded the
-//! typed body bytes a second time, costing a 64 KiB memcopy per call
-//! on each side for bulk verbs (a measured 53% throughput regression
-//! at 64 KiB GET vs gRPC). V2 hoists `request_id`, `verb_tag`, and
-//! `status` into fixed-width / length-prefixed prefix fields and
-//! writes the typed body bytes directly — no postcard wrapping
-//! around the payload, no second memcopy. The verb's body is still
-//! postcard-encoded (the typed PutObjectRequest, PutObjectResponse,
-//! etc.), but at the codec boundary, not wrapped again at the wire.
+//! `meta_bytes` is the postcard-encoded "metadata" struct — i.e.,
+//! the verb's typed body MINUS its single bulk `Vec<u8>` field
+//! (when present). `bulk_bytes` is the raw bytes of that bulk field
+//! shipped DIRECTLY on the wire — no postcard framing — so a
+//! 64 KiB GET response avoids the `postcard::serialize_bytes`
+//! memcopy and the matching client-side decode copy. For verbs
+//! with no bulk field, `bulk_bytes` is empty (length 0); the verb
+//! body is fully in `meta_bytes`.
 //!
-//! Pre-1.0 wire-format break per ADR-042 §13.2: peers running V1
-//! see V2 frames as `UnsupportedVersion` and reject; operators wipe +
-//! redeploy. No rolling upgrade across this bump.
+//! Wire-format history:
+//! - V1 (pre-2026-05-06): outer `RpcEnvelope` / `ResponseEnvelope`
+//!   wrapping payload bytes in a postcard tuple — one full body
+//!   memcopy per call on each side just from the wrap.
+//! - V2 (mid-day 2026-05-06): hoisted `request_id` / `verb_tag` /
+//!   `status` into fixed-width frame-header fields; verb body went
+//!   straight on the wire without an outer envelope. Closed the V1
+//!   double-memcopy.
+//! - V3 (this version): split bulk Vec<u8> fields out of the
+//!   postcard payload. Eliminates the per-call postcard
+//!   encode/decode of the bulk bytes themselves on object verbs
+//!   (put_object, get_object, write, read).
 //!
-//! Version byte is its own value space distinct from ADR-041's raft
-//! transport version.
+//! Pre-1.0 wire-format break per ADR-042 §13.2: peers running V1/V2
+//! see V3 frames as `UnsupportedVersion` and reject; operators wipe
+//! + redeploy. No rolling upgrade across this bump.
 
-use serde::{Deserialize, Serialize};
+// (No serde derive — V3 wire types are encoded by hand; the verb
+// metadata structs are postcard-encoded by callers and ride as
+// `meta_bytes` slices.)
 
-/// Wire-format version for the native TCP-framed binding. V2 lifts
-/// `request_id` + `verb_tag` + `status` into the frame header and
-/// drops the outer postcard envelope. See module docs for the layout.
-pub const NATIVE_TCP_FRAMED_VERSION_V2: u8 = 2;
-
-/// Backwards-compat alias. V1 is no longer accepted on the wire;
-/// the constant exists so downstream callers that referenced the old
-/// name still compile (see ADR-041's similar pattern). Equal to V2;
-/// no actual V1 support remains in the codec.
-pub const NATIVE_TCP_FRAMED_VERSION_V1: u8 = NATIVE_TCP_FRAMED_VERSION_V2;
+/// Active wire-format version: V3 (split-bulk). Pre-1.0 — no V1/V2
+/// back-compat. Peers running older versions hit `UnsupportedVersion`
+/// and reject; operators wipe + redeploy.
+pub const NATIVE_TCP_FRAMED_VERSION_V3: u8 = 3;
 
 /// Maximum body size for a single TCP-framed message (request OR
 /// response). Matches the per-stream cap (§1.5) at 64 MiB plus
@@ -51,29 +55,6 @@ pub const NATIVE_TCP_FRAMED_MAX_BODY: usize = 80 * 1024 * 1024;
 /// `UnsupportedVersion` rather than mis-decoding into a postcard
 /// envelope. Mirrors ADR-041 §"Reserved version-byte values".
 pub const RESERVED_VERSION_BYTES: [u8; 3] = [0x5B, 0x7B, 0x22];
-
-/// Wire-level RPC envelope. ADR-042 §2.2.
-///
-/// Postcard-encoded inside the outer length-framed frame. Carries
-/// per-call routing metadata. The inner request/response bodies are
-/// in `payload_bytes`, also postcard-encoded (the typed request +
-/// response types live in `kiseki_proto::v1::native`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RpcEnvelope {
-    /// Unique-per-connection identifier. Multiplexes concurrent
-    /// requests on one TCP connection (h2 stream-id moral
-    /// equivalent). Wraps to zero on overflow; the per-connection
-    /// outstanding-request map is bounded so wrap is cosmetic.
-    pub request_id: u64,
-    /// Verb identifier — the kiseki proto verb name in
-    /// `snake_case`. The server-side dispatch table maps this to a
-    /// `ServerImpl` inherent method. Stable wire identity; rename =
-    /// version bump.
-    pub verb_tag: String,
-    /// Postcard-encoded request body. Server decodes against the
-    /// type the dispatch table associates with `verb_tag`.
-    pub payload_bytes: Vec<u8>,
-}
 
 /// Server-side dispatch outcome for one TCP-framed call. ADR-042
 /// §2.2 uses the same byte-status approach as the gRPC binding's
@@ -205,70 +186,73 @@ pub enum WireEncodeError {
     },
 }
 
-/// Decoded request frame view (V2). Holds borrowed slices into the
-/// caller's buffer — no copies. The verb's request body is what
-/// remains after the header and is what the dispatch layer
-/// postcard-decodes into the typed request struct.
+/// Decoded request frame view (V3). Holds borrowed slices into the
+/// caller's buffer — no copies. `meta` is what dispatch passes to
+/// `postcard::from_bytes` into the verb's typed request struct
+/// (with bulk fields empty); `bulk` is the raw bulk-field bytes the
+/// caller attaches into the typed struct after decoding.
 #[derive(Debug)]
 pub struct RequestFrameView<'a> {
     /// Echoed by the response so the client can demultiplex.
     pub request_id: u64,
-    /// Verb identifier — caller maps to a dispatch entry. UTF-8;
-    /// `verb_tag.as_bytes().len() <= u8::MAX`.
+    /// Verb identifier. UTF-8; ≤ 255 bytes.
     pub verb_tag: &'a str,
-    /// Postcard-encoded body — the typed request struct. Caller
-    /// `postcard::from_bytes(body)` into the verb's request type.
-    pub body: &'a [u8],
+    /// Postcard-encoded metadata — the typed request struct minus
+    /// any bulk Vec<u8> field.
+    pub meta: &'a [u8],
+    /// Raw bulk bytes (empty for verbs with no bulk field).
+    pub bulk: &'a [u8],
 }
 
-/// Decoded response frame view (V2). Borrowed slice; caller copies
-/// if the body must outlive the underlying buffer.
+/// Decoded response frame view (V3). Borrowed slices.
 #[derive(Debug)]
 pub struct ResponseFrameView<'a> {
     /// Status byte mapped to ADR-042 §1.4.
     pub status: WireStatus,
     /// Echoed from the request so the client correlates.
     pub request_id: u64,
-    /// Postcard-encoded body on `Ok`; UTF-8 reason string on error
-    /// statuses (caller decodes via `String::from_utf8_lossy`).
-    pub body: &'a [u8],
+    /// On `WireStatus::Ok`: postcard-encoded metadata struct (verb
+    /// response minus its bulk Vec<u8>). On error statuses: UTF-8
+    /// reason string (the meta_len carries the full message; bulk
+    /// is empty on error).
+    pub meta: &'a [u8],
+    /// Raw bulk-field bytes, or empty for non-bulk verbs / errors.
+    pub bulk: &'a [u8],
 }
 
 /// Maximum verb-tag length on the wire. `u8::MAX` (255) — every
 /// kiseki verb name is ≤ 24 chars, so this is generous headroom.
 const MAX_VERB_TAG_LEN: usize = u8::MAX as usize;
 
-/// Minimum response body bytes (post-length-prefix): version u8 +
-/// status u8 + request_id u64 = 10. Anything shorter is malformed.
-/// Public so client-side hot-path readers can size their header
-/// stack buffers exactly.
-pub const RESPONSE_HEADER_LEN: usize = 1 + 1 + 8;
+/// V3 response body header: version u8 + status u8 + request_id u64
+/// + meta_len u32 = 14. Bulk follows after `meta_len` bytes of
+/// `meta_bytes`; total frame body = 14 + meta_len + bulk_len.
+pub const RESPONSE_HEADER_LEN: usize = 1 + 1 + 8 + 4;
 
-/// Minimum request body bytes: version u8 + request_id u64 +
-/// verb_tag_len u8 = 10 (verb_tag itself can be 1..=255 bytes;
-/// body 0..=N).
+/// V3 request body fixed header: version u8 + request_id u64 +
+/// verb_tag_len u8 = 10. Followed by `verb_tag bytes` then
+/// `meta_len u32 BE` then `meta_bytes` then `bulk_bytes`. Total
+/// frame body = 10 + verb_tag_len + 4 + meta_len + bulk_len.
 pub const REQUEST_HEADER_FIXED_LEN: usize = 1 + 8 + 1;
 
-/// Build a request frame *header* (length prefix + version +
-/// request_id + verb_tag header). Caller writes this small buffer
-/// to the wire, THEN writes `body` in a second `write_all` —
-/// avoiding the 64 KiB `extend_from_slice` memcopy that
-/// [`encode_request_frame`] would perform.
+/// Build a request frame *header* — everything up to (and
+/// including) the meta_len prefix. Caller follows with separate
+/// writes of `meta_bytes` and `bulk_bytes`; the wire layout is
+/// `[len][ver][rid][verb_len][verb][meta_len][meta][bulk]`.
 ///
-/// Header layout: `[len u32 BE][ver u8][request_id u64 BE][verb_tag_len u8][verb_tag bytes]`.
-///
-/// `body_len` is the length of the body bytes the caller will write
-/// next — it's used to compute the length prefix. The header
-/// itself is at most 14 + 255 = 269 bytes; typical kiseki verbs
-/// produce ~24-byte headers.
+/// Vectored I/O on the call site makes the three pieces a single
+/// `writev` syscall on Linux — no Nagle, no second memcopy.
 ///
 /// # Errors
-/// Same as [`encode_request_frame`].
+/// `Oversize` if the resulting frame exceeds
+/// [`NATIVE_TCP_FRAMED_MAX_BODY`]. `Postcard` if `verb_tag` is
+/// longer than [`MAX_VERB_TAG_LEN`] (255 bytes).
 #[allow(clippy::missing_errors_doc)]
 pub fn build_request_header(
     request_id: u64,
     verb_tag: &str,
-    body_len: usize,
+    meta_len: usize,
+    bulk_len: usize,
 ) -> Result<Vec<u8>, WireEncodeError> {
     let verb_bytes = verb_tag.as_bytes();
     if verb_bytes.len() > MAX_VERB_TAG_LEN {
@@ -277,54 +261,59 @@ pub fn build_request_header(
             verb_bytes.len()
         )));
     }
-    let total_body_len = REQUEST_HEADER_FIXED_LEN + verb_bytes.len() + body_len;
+    let total_body_len =
+        REQUEST_HEADER_FIXED_LEN + verb_bytes.len() + 4 + meta_len + bulk_len;
     if total_body_len > NATIVE_TCP_FRAMED_MAX_BODY {
         return Err(WireEncodeError::Oversize {
             len: total_body_len,
             cap: NATIVE_TCP_FRAMED_MAX_BODY,
         });
     }
-    let mut out = Vec::with_capacity(4 + REQUEST_HEADER_FIXED_LEN + verb_bytes.len());
+    let mut out =
+        Vec::with_capacity(4 + REQUEST_HEADER_FIXED_LEN + verb_bytes.len() + 4);
     out.extend_from_slice(
         &u32::try_from(total_body_len).unwrap_or(u32::MAX).to_be_bytes(),
     );
-    out.push(NATIVE_TCP_FRAMED_VERSION_V2);
+    out.push(NATIVE_TCP_FRAMED_VERSION_V3);
     out.extend_from_slice(&request_id.to_be_bytes());
     #[allow(clippy::cast_possible_truncation)]
     out.push(verb_bytes.len() as u8);
     out.extend_from_slice(verb_bytes);
+    out.extend_from_slice(
+        &u32::try_from(meta_len).unwrap_or(u32::MAX).to_be_bytes(),
+    );
     Ok(out)
 }
 
-/// Encode a complete request frame in a single allocation. Convenient
-/// for tests and small-payload callers; hot-path callers prefer
-/// [`build_request_header`] + a separate `write_all(body)` to avoid
-/// the body memcopy (saves ~64 KiB per call at typical object sizes).
+/// Encode a complete request frame in a single allocation —
+/// convenience wrapper for tests and small-payload callers.
+/// Hot-path callers prefer [`build_request_header`] + vectored I/O
+/// of `[header, meta, bulk]` to skip the body memcopy.
 ///
 /// # Errors
-/// `Oversize` if the resulting body exceeds [`NATIVE_TCP_FRAMED_MAX_BODY`].
-/// `Postcard` if `verb_tag` is longer than [`MAX_VERB_TAG_LEN`].
+/// `Oversize`, `Postcard` (verb_tag too long).
 #[allow(clippy::missing_errors_doc)]
 pub fn encode_request_frame(
     request_id: u64,
     verb_tag: &str,
-    body: &[u8],
+    meta: &[u8],
+    bulk: &[u8],
 ) -> Result<Vec<u8>, WireEncodeError> {
-    let mut out = build_request_header(request_id, verb_tag, body.len())?;
-    out.extend_from_slice(body);
+    let mut out = build_request_header(request_id, verb_tag, meta.len(), bulk.len())?;
+    out.extend_from_slice(meta);
+    out.extend_from_slice(bulk);
     Ok(out)
 }
 
-/// Decode a request frame from a buffer that already contains a
-/// complete frame body (length-prefix-stripped). Returns borrowed
-/// slices into `body` — no copies; caller owns the buffer's
-/// lifetime.
+/// Decode a V3 request frame from a length-prefix-stripped buffer.
+/// Returns borrowed slices for `meta` and `bulk` — no copies.
 ///
-/// Input layout: `[ver u8][request_id u64 BE][verb_tag_len u8][verb_tag bytes][body...]`.
+/// Input layout:
+/// `[ver u8][request_id u64 BE][verb_tag_len u8][verb_tag bytes][meta_len u32 BE][meta_bytes][bulk_bytes]`.
 ///
 /// # Errors
-/// `Incomplete` / `UnsupportedVersion` / `Postcard` (for invalid
-/// UTF-8 in the verb tag).
+/// `Incomplete` / `UnsupportedVersion` / `Postcard` (invalid UTF-8
+/// in verb_tag, or meta_len overruns the body).
 #[allow(clippy::missing_errors_doc)]
 pub fn decode_request_frame(body: &[u8]) -> Result<RequestFrameView<'_>, WireDecodeError> {
     if body.len() < REQUEST_HEADER_FIXED_LEN {
@@ -334,63 +323,60 @@ pub fn decode_request_frame(body: &[u8]) -> Result<RequestFrameView<'_>, WireDec
         });
     }
     let version = body[0];
-    if version != NATIVE_TCP_FRAMED_VERSION_V2 {
+    if version != NATIVE_TCP_FRAMED_VERSION_V3 {
         return Err(WireDecodeError::UnsupportedVersion {
             version,
-            supported: NATIVE_TCP_FRAMED_VERSION_V2,
+            supported: NATIVE_TCP_FRAMED_VERSION_V3,
         });
     }
     let request_id = u64::from_be_bytes(body[1..9].try_into().unwrap());
     let verb_tag_len = body[9] as usize;
     let verb_tag_end = REQUEST_HEADER_FIXED_LEN + verb_tag_len;
-    if body.len() < verb_tag_end {
+    if body.len() < verb_tag_end + 4 {
         return Err(WireDecodeError::Incomplete {
             have: body.len(),
-            need: verb_tag_end,
+            need: verb_tag_end + 4,
         });
     }
     let verb_tag_bytes = &body[REQUEST_HEADER_FIXED_LEN..verb_tag_end];
     let verb_tag = std::str::from_utf8(verb_tag_bytes)
         .map_err(|e| WireDecodeError::Postcard(format!("verb_tag not utf-8: {e}")))?;
+    let meta_len =
+        u32::from_be_bytes(body[verb_tag_end..verb_tag_end + 4].try_into().unwrap()) as usize;
+    let meta_start = verb_tag_end + 4;
+    let meta_end = meta_start + meta_len;
+    if body.len() < meta_end {
+        return Err(WireDecodeError::Incomplete {
+            have: body.len(),
+            need: meta_end,
+        });
+    }
     Ok(RequestFrameView {
         request_id,
         verb_tag,
-        body: &body[verb_tag_end..],
+        meta: &body[meta_start..meta_end],
+        bulk: &body[meta_end..],
     })
 }
 
-/// Compatibility shim: legacy callers that consumed the V1
-/// `RpcEnvelope`. Decodes the V2 wire shape and constructs an
-/// equivalent owned `RpcEnvelope`. The body bytes are copied into
-/// `payload_bytes` — slower than [`decode_request_frame`]'s borrow,
-/// kept for tests / non-hot-path callers.
-#[allow(clippy::missing_errors_doc)]
-pub fn decode_request_body(body: &[u8]) -> Result<RpcEnvelope, WireDecodeError> {
-    let view = decode_request_frame(body)?;
-    Ok(RpcEnvelope {
-        request_id: view.request_id,
-        verb_tag: view.verb_tag.to_string(),
-        payload_bytes: view.body.to_vec(),
-    })
-}
-
-/// Build a response frame *header* (length prefix + version +
-/// status + request_id). Fixed 14 bytes — caller writes this small
-/// buffer first, then `write_all(body)` separately so the body
-/// avoids one full memcopy on the way to the kernel.
+/// Build a V3 response frame *header* — length prefix + version +
+/// status + request_id + meta_len. Fixed 18 bytes. Caller follows
+/// with `meta_bytes` and `bulk_bytes`; vectored I/O sends all three
+/// in one syscall.
 ///
-/// Header layout: `[len u32 BE][ver u8][status u8][request_id u64 BE]`.
+/// Header layout: `[len u32 BE][ver u8][status u8][request_id u64 BE][meta_len u32 BE]`.
 ///
 /// # Errors
-/// `Oversize` if the resulting frame would exceed
+/// `Oversize` if the total frame exceeds
 /// [`NATIVE_TCP_FRAMED_MAX_BODY`].
 #[allow(clippy::missing_errors_doc)]
 pub fn build_response_header(
     status: WireStatus,
     request_id: u64,
-    body_len: usize,
+    meta_len: usize,
+    bulk_len: usize,
 ) -> Result<[u8; 4 + RESPONSE_HEADER_LEN], WireEncodeError> {
-    let total_body_len = RESPONSE_HEADER_LEN + body_len;
+    let total_body_len = RESPONSE_HEADER_LEN + meta_len + bulk_len;
     if total_body_len > NATIVE_TCP_FRAMED_MAX_BODY {
         return Err(WireEncodeError::Oversize {
             len: total_body_len,
@@ -401,16 +387,19 @@ pub fn build_response_header(
     header[0..4].copy_from_slice(
         &u32::try_from(total_body_len).unwrap_or(u32::MAX).to_be_bytes(),
     );
-    header[4] = NATIVE_TCP_FRAMED_VERSION_V2;
+    header[4] = NATIVE_TCP_FRAMED_VERSION_V3;
     header[5] = status as u8;
     header[6..14].copy_from_slice(&request_id.to_be_bytes());
+    header[14..18].copy_from_slice(
+        &u32::try_from(meta_len).unwrap_or(u32::MAX).to_be_bytes(),
+    );
     Ok(header)
 }
 
 /// Encode a complete response frame in a single allocation —
 /// convenience wrapper for tests + small-payload paths. Hot-path
-/// callers prefer [`build_response_header`] + a separate
-/// `write_all(body)` to avoid the body memcopy.
+/// callers use vectored I/O on `[header, meta, bulk]` to skip the
+/// body memcopy.
 ///
 /// # Errors
 /// `Oversize` if the body exceeds [`NATIVE_TCP_FRAMED_MAX_BODY`].
@@ -418,22 +407,26 @@ pub fn build_response_header(
 pub fn encode_response_frame(
     status: WireStatus,
     request_id: u64,
-    body: &[u8],
+    meta: &[u8],
+    bulk: &[u8],
 ) -> Result<Vec<u8>, WireEncodeError> {
-    let header = build_response_header(status, request_id, body.len())?;
-    let mut out = Vec::with_capacity(header.len() + body.len());
+    let header = build_response_header(status, request_id, meta.len(), bulk.len())?;
+    let mut out = Vec::with_capacity(header.len() + meta.len() + bulk.len());
     out.extend_from_slice(&header);
-    out.extend_from_slice(body);
+    out.extend_from_slice(meta);
+    out.extend_from_slice(bulk);
     Ok(out)
 }
 
-/// Decode a response frame body (length-prefix-stripped). Returns
-/// borrowed slices into `body`.
+/// Decode a V3 response frame body (length-prefix-stripped).
+/// Returns borrowed slices for `meta` and `bulk`.
 ///
-/// Input layout: `[ver u8][status u8][request_id u64 BE][body...]`.
+/// Input layout:
+/// `[ver u8][status u8][request_id u64 BE][meta_len u32 BE][meta_bytes][bulk_bytes]`.
 ///
 /// # Errors
-/// `Incomplete` / `UnsupportedVersion` / `Postcard` (unknown status byte).
+/// `Incomplete` / `UnsupportedVersion` / `Postcard` (unknown
+/// status byte, or meta_len overruns body).
 #[allow(clippy::missing_errors_doc)]
 pub fn decode_response_frame(body: &[u8]) -> Result<ResponseFrameView<'_>, WireDecodeError> {
     if body.len() < RESPONSE_HEADER_LEN {
@@ -443,31 +436,33 @@ pub fn decode_response_frame(body: &[u8]) -> Result<ResponseFrameView<'_>, WireD
         });
     }
     let version = body[0];
-    if version != NATIVE_TCP_FRAMED_VERSION_V2 {
+    if version != NATIVE_TCP_FRAMED_VERSION_V3 {
         return Err(WireDecodeError::UnsupportedVersion {
             version,
-            supported: NATIVE_TCP_FRAMED_VERSION_V2,
+            supported: NATIVE_TCP_FRAMED_VERSION_V3,
         });
     }
     let status = WireStatus::from_u8(body[1]).ok_or_else(|| {
         WireDecodeError::Postcard(format!("unknown status byte 0x{:02x}", body[1]))
     })?;
     let request_id = u64::from_be_bytes(body[2..10].try_into().unwrap());
+    let meta_len = u32::from_be_bytes(body[10..14].try_into().unwrap()) as usize;
+    let meta_start = RESPONSE_HEADER_LEN;
+    let meta_end = meta_start + meta_len;
+    if body.len() < meta_end {
+        return Err(WireDecodeError::Incomplete {
+            have: body.len(),
+            need: meta_end,
+        });
+    }
     Ok(ResponseFrameView {
         status,
         request_id,
-        body: &body[RESPONSE_HEADER_LEN..],
+        meta: &body[meta_start..meta_end],
+        bulk: &body[meta_end..],
     })
 }
 
-/// Compatibility shim — V1 returned `(WireStatus, &[u8])`. V2 also
-/// carries `request_id`, but callers from before the V2 cutover only
-/// consumed status + body. Use [`decode_response_frame`] for new code.
-#[allow(clippy::missing_errors_doc)]
-pub fn decode_response_body(body: &[u8]) -> Result<(WireStatus, &[u8]), WireDecodeError> {
-    let view = decode_response_frame(body)?;
-    Ok((view.status, view.body))
-}
 
 /// Validate a length prefix read from the wire. Caller has already
 /// read the four-byte BE length; this enforces the cap and returns
@@ -492,13 +487,10 @@ mod tests {
 
     #[test]
     fn version_pinned() {
-        // V2 (post-2026-05-06) is the active wire version after the
-        // request_id-hoist refactor that closed the bulk-payload
-        // memcopy tax. V1's alias still equals V2 — the constant is
-        // for downstream-name compat only; no V1 wire support
-        // remains.
-        assert_eq!(NATIVE_TCP_FRAMED_VERSION_V2, 2);
-        assert_eq!(NATIVE_TCP_FRAMED_VERSION_V1, NATIVE_TCP_FRAMED_VERSION_V2);
+        // V3 (split-bulk) is the active wire version. Pin so a
+        // refactor that bumps it forces a conscious decision +
+        // operator wipe-and-redeploy notice.
+        assert_eq!(NATIVE_TCP_FRAMED_VERSION_V3, 3);
     }
 
     #[test]
@@ -506,28 +498,16 @@ mod tests {
         // `[` `{` `"` — JSON document starts. Pin so a refactor
         // doesn't inadvertently assign a version byte that overlaps.
         assert_eq!(RESERVED_VERSION_BYTES, [0x5B, 0x7B, 0x22]);
-        assert_ne!(NATIVE_TCP_FRAMED_VERSION_V1, RESERVED_VERSION_BYTES[0]);
-        assert_ne!(NATIVE_TCP_FRAMED_VERSION_V1, RESERVED_VERSION_BYTES[1]);
-        assert_ne!(NATIVE_TCP_FRAMED_VERSION_V1, RESERVED_VERSION_BYTES[2]);
+        assert_ne!(NATIVE_TCP_FRAMED_VERSION_V3, RESERVED_VERSION_BYTES[0]);
+        assert_ne!(NATIVE_TCP_FRAMED_VERSION_V3, RESERVED_VERSION_BYTES[1]);
+        assert_ne!(NATIVE_TCP_FRAMED_VERSION_V3, RESERVED_VERSION_BYTES[2]);
     }
 
     #[test]
-    fn rpc_envelope_postcard_roundtrip() {
-        let env = RpcEnvelope {
-            request_id: 0xDEAD_BEEF_CAFE_F00D,
-            verb_tag: "put_object".into(),
-            payload_bytes: vec![0xAA; 64],
-        };
-        let bytes = postcard::to_allocvec(&env).expect("encode");
-        let decoded: RpcEnvelope = postcard::from_bytes(&bytes).expect("decode");
-        assert_eq!(env, decoded);
-    }
-
-    #[test]
-    fn request_frame_roundtrip() {
-        let body = b"verb-body-bytes";
-        let framed = encode_request_frame(42, "get_object", body).expect("encode");
-        // Skip the 4-byte length prefix; decoder operates on body.
+    fn request_frame_roundtrip_meta_and_bulk() {
+        let meta = b"meta-postcard-bytes";
+        let bulk = b"raw-bulk-bytes";
+        let framed = encode_request_frame(42, "get_object", meta, bulk).expect("encode");
         assert!(framed.len() > 4);
         let length =
             u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
@@ -536,26 +516,35 @@ mod tests {
         let view = decode_request_frame(frame_body).expect("decode");
         assert_eq!(view.request_id, 42);
         assert_eq!(view.verb_tag, "get_object");
-        assert_eq!(view.body, body);
+        assert_eq!(view.meta, meta);
+        assert_eq!(view.bulk, bulk);
+    }
+
+    #[test]
+    fn request_frame_with_empty_bulk_round_trips() {
+        // Non-bulk verbs send an empty bulk slice.
+        let meta = b"x";
+        let framed = encode_request_frame(1, "get_topology", meta, &[]).expect("encode");
+        let view = decode_request_frame(&framed[4..]).expect("decode");
+        assert_eq!(view.meta, meta);
+        assert!(view.bulk.is_empty());
     }
 
     #[test]
     fn request_frame_starts_with_supported_version_byte() {
-        let framed = encode_request_frame(0, "x", &[]).expect("encode");
-        // Layout: [len u32 BE][ver u8][...]
-        assert_eq!(framed[4], NATIVE_TCP_FRAMED_VERSION_V2);
+        let framed = encode_request_frame(0, "x", &[], &[]).expect("encode");
+        assert_eq!(framed[4], NATIVE_TCP_FRAMED_VERSION_V3);
     }
 
     #[test]
     fn decode_rejects_unsupported_version() {
-        // Construct a body with version byte 99 — never supported.
         let mut body = vec![99u8];
         body.extend_from_slice(&[0; 9]);
         let err = decode_request_frame(&body).expect_err("must reject");
         match err {
             WireDecodeError::UnsupportedVersion { version, supported } => {
                 assert_eq!(version, 99);
-                assert_eq!(supported, NATIVE_TCP_FRAMED_VERSION_V2);
+                assert_eq!(supported, NATIVE_TCP_FRAMED_VERSION_V3);
             }
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
@@ -575,11 +564,11 @@ mod tests {
 
     #[test]
     fn decode_request_with_invalid_utf8_verb_tag_rejected() {
-        // Build a frame with verb_tag bytes that aren't valid UTF-8.
-        let mut frame_body = vec![NATIVE_TCP_FRAMED_VERSION_V2];
+        let mut frame_body = vec![NATIVE_TCP_FRAMED_VERSION_V3];
         frame_body.extend_from_slice(&0u64.to_be_bytes()); // request_id
         frame_body.push(2); // verb_tag_len
         frame_body.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        frame_body.extend_from_slice(&0u32.to_be_bytes()); // meta_len
         let err = decode_request_frame(&frame_body).expect_err("must reject");
         assert!(matches!(err, WireDecodeError::Postcard(_)));
     }
@@ -607,39 +596,54 @@ mod tests {
 
     #[test]
     fn response_frame_roundtrip_ok() {
-        let payload = b"some-postcard-bytes";
-        let framed = encode_response_frame(WireStatus::Ok, 99, payload).expect("encode");
+        let meta = b"meta-bytes";
+        let bulk = b"raw-bulk-bytes";
+        let framed =
+            encode_response_frame(WireStatus::Ok, 99, meta, bulk).expect("encode");
         let body = &framed[4..];
         let view = decode_response_frame(body).expect("decode");
         assert_eq!(view.status, WireStatus::Ok);
         assert_eq!(view.request_id, 99);
-        assert_eq!(view.body, payload);
+        assert_eq!(view.meta, meta);
+        assert_eq!(view.bulk, bulk);
+    }
+
+    #[test]
+    fn response_frame_with_empty_bulk_round_trips() {
+        let meta = b"only-meta";
+        let framed = encode_response_frame(WireStatus::Ok, 1, meta, &[]).expect("encode");
+        let view = decode_response_frame(&framed[4..]).expect("decode");
+        assert_eq!(view.meta, meta);
+        assert!(view.bulk.is_empty());
     }
 
     #[test]
     fn response_frame_roundtrip_error_status() {
         let payload = b"reason: san_payload_tenant_mismatch";
-        let framed = encode_response_frame(WireStatus::PermissionDenied, 7, payload)
+        // Error reason rides in `meta` (postcard-decoded as a String
+        // by the caller); bulk is empty on error frames.
+        let framed = encode_response_frame(WireStatus::PermissionDenied, 7, payload, &[])
             .expect("encode");
         let body = &framed[4..];
         let view = decode_response_frame(body).expect("decode");
         assert_eq!(view.status, WireStatus::PermissionDenied);
         assert_eq!(view.request_id, 7);
-        assert_eq!(view.body, payload);
+        assert_eq!(view.meta, payload);
+        assert!(view.bulk.is_empty());
     }
 
     #[test]
     fn response_frame_short_body_is_incomplete() {
-        // Only one byte (version) — missing status + request_id.
-        let body = vec![NATIVE_TCP_FRAMED_VERSION_V2];
+        let body = vec![NATIVE_TCP_FRAMED_VERSION_V3];
         let err = decode_response_frame(&body).expect_err("must reject");
         assert!(matches!(err, WireDecodeError::Incomplete { .. }));
     }
 
     #[test]
     fn response_frame_unknown_status_byte_rejected() {
-        let mut body = vec![NATIVE_TCP_FRAMED_VERSION_V2, 0x77];
+        let mut body = vec![NATIVE_TCP_FRAMED_VERSION_V3, 0x77];
         body.extend_from_slice(&[0; 8]); // request_id padding
+        body.extend_from_slice(&0u32.to_be_bytes()); // meta_len padding
         let err = decode_response_frame(&body).expect_err("must reject");
         assert!(matches!(err, WireDecodeError::Postcard(_)));
     }
@@ -708,37 +712,37 @@ mod tests {
     #[test]
     fn encode_request_frame_oversize_rejected() {
         let body = vec![0u8; NATIVE_TCP_FRAMED_MAX_BODY];
-        let err = encode_request_frame(0, "x", &body).expect_err("must reject");
+        let err = encode_request_frame(0, "x", &[], &body).expect_err("must reject");
         assert!(matches!(err, WireEncodeError::Oversize { .. }));
     }
 
     #[test]
     fn encode_response_frame_oversize_rejected() {
         let payload = vec![0u8; NATIVE_TCP_FRAMED_MAX_BODY];
-        let err = encode_response_frame(WireStatus::Ok, 0, &payload).expect_err("must reject");
+        let err =
+            encode_response_frame(WireStatus::Ok, 0, &[], &payload).expect_err("must reject");
         assert!(matches!(err, WireEncodeError::Oversize { .. }));
     }
 
     #[test]
     fn encode_request_with_oversize_verb_tag_rejected() {
-        // Verb tag length is u8 on the wire — 256 bytes overflows.
         let big_verb = "x".repeat(256);
-        let err = encode_request_frame(0, &big_verb, &[]).expect_err("must reject");
+        let err = encode_request_frame(0, &big_verb, &[], &[]).expect_err("must reject");
         assert!(matches!(err, WireEncodeError::Postcard(_)));
     }
 
-    /// End-to-end framing layout assertion — proves the wire bytes
-    /// match the V2 layout so a refactor that changes either side
-    /// fails the test rather than silently breaking peers.
+    /// End-to-end V3 framing layout assertion — proves the wire
+    /// bytes match the layout described in the module docs.
     #[test]
     fn request_frame_layout_matches_spec() {
-        let body = b"\xCA\xFE";
-        let framed = encode_request_frame(7, "ping", body).expect("encode");
+        let meta = b"\xCA\xFE";
+        let bulk = b"\xBA\xBE";
+        let framed = encode_request_frame(7, "ping", meta, bulk).expect("encode");
         // [len u32 BE]
         let len = u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
         assert_eq!(len, framed.len() - 4);
         // [ver u8]
-        assert_eq!(framed[4], NATIVE_TCP_FRAMED_VERSION_V2);
+        assert_eq!(framed[4], NATIVE_TCP_FRAMED_VERSION_V3);
         // [request_id u64 BE]
         let request_id = u64::from_be_bytes(framed[5..13].try_into().unwrap());
         assert_eq!(request_id, 7);
@@ -746,21 +750,31 @@ mod tests {
         assert_eq!(framed[13], 4); // "ping" is 4 bytes
         // [verb_tag bytes]
         assert_eq!(&framed[14..18], b"ping");
-        // [body]
-        assert_eq!(&framed[18..], body);
+        // [meta_len u32 BE]
+        let meta_len = u32::from_be_bytes(framed[18..22].try_into().unwrap()) as usize;
+        assert_eq!(meta_len, meta.len());
+        // [meta_bytes]
+        assert_eq!(&framed[22..22 + meta_len], meta);
+        // [bulk_bytes]
+        assert_eq!(&framed[22 + meta_len..], bulk);
     }
 
-    /// Response frame layout pin.
+    /// V3 response frame layout pin.
     #[test]
     fn response_frame_layout_matches_spec() {
-        let body = b"\xDE\xAD\xBE\xEF";
-        let framed = encode_response_frame(WireStatus::Ok, 13, body).expect("encode");
+        let meta = b"\xDE\xAD";
+        let bulk = b"\xBE\xEF";
+        let framed =
+            encode_response_frame(WireStatus::Ok, 13, meta, bulk).expect("encode");
         let len = u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
         assert_eq!(len, framed.len() - 4);
-        assert_eq!(framed[4], NATIVE_TCP_FRAMED_VERSION_V2);
+        assert_eq!(framed[4], NATIVE_TCP_FRAMED_VERSION_V3);
         assert_eq!(framed[5], WireStatus::Ok as u8);
         let request_id = u64::from_be_bytes(framed[6..14].try_into().unwrap());
         assert_eq!(request_id, 13);
-        assert_eq!(&framed[14..], body);
+        let meta_len = u32::from_be_bytes(framed[14..18].try_into().unwrap()) as usize;
+        assert_eq!(meta_len, meta.len());
+        assert_eq!(&framed[18..18 + meta_len], meta);
+        assert_eq!(&framed[18 + meta_len..], bulk);
     }
 }

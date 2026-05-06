@@ -1235,23 +1235,27 @@ impl TcpFramedNativeDriver {
 #[async_trait]
 impl Driver for TcpFramedNativeDriver {
     async fn put(&self, payload: &[u8]) -> Result<Key, String> {
+        // V3: meta = postcard(PutObjectRequest with empty .data),
+        // bulk = the actual payload bytes. The server attaches bulk
+        // onto req.data before calling the handler.
         let req = kiseki_proto::v1::native::PutObjectRequest {
             control: Some(self.ctrl()),
             namespace_id: Some(kiseki_proto::v1::NamespaceId {
                 value: self.namespace_id.0.to_string(),
             }),
             name: format!("perf-{}", uuid::Uuid::new_v4().simple()),
-            data: payload.to_vec(),
+            data: Vec::new(), // bulk rides separately
         };
-        let body = postcard::to_allocvec(&req)
+        let req_meta = postcard::to_allocvec(&req)
             .map_err(|e| format!("tcp-framed put encode: {e}"))?;
-        let resp_bytes = self
+        let req_bulk = payload.to_vec();
+        let (resp_meta, _resp_bulk) = self
             .pick()
-            .call_ok("put_object", body)
+            .call_ok("put_object", req_meta, req_bulk)
             .await
             .map_err(|e| format!("tcp-framed put: {e}"))?;
         let resp: kiseki_proto::v1::native::PutObjectResponse =
-            postcard::from_bytes(&resp_bytes)
+            postcard::from_bytes(&resp_meta)
                 .map_err(|e| format!("tcp-framed put decode: {e}"))?;
         let comp = resp
             .composition_id
@@ -1265,6 +1269,10 @@ impl Driver for TcpFramedNativeDriver {
     }
 
     async fn get(&self, key: &Key) -> Result<usize, String> {
+        // V3: GET request has no bulk; response carries bulk = data.
+        // We don't need to postcard-decode the bulk bytes — the
+        // length is what the perf driver measures, so just count
+        // resp_bulk.len().
         let req = kiseki_proto::v1::native::GetObjectRequest {
             control: Some(self.ctrl()),
             namespace_id: Some(kiseki_proto::v1::NamespaceId {
@@ -1278,16 +1286,15 @@ impl Driver for TcpFramedNativeDriver {
                 },
             )),
         };
-        let body = postcard::to_allocvec(&req)
+        let req_meta = postcard::to_allocvec(&req)
             .map_err(|e| format!("tcp-framed get encode: {e}"))?;
-        let resp_bytes = self
+        let (_resp_meta, resp_bulk) = self
             .pick()
-            .call_ok("get_object", body)
+            .call_ok("get_object", req_meta, Vec::new())
             .await
             .map_err(|e| format!("tcp-framed get: {e}"))?;
-        let resp: kiseki_proto::v1::native::GetObjectResponse =
-            postcard::from_bytes(&resp_bytes)
-                .map_err(|e| format!("tcp-framed get decode: {e}"))?;
-        Ok(resp.data.len())
+        // resp_bulk IS the object data. No postcard decode of the
+        // bulk bytes — that's the V3 win.
+        Ok(resp_bulk.len())
     }
 }

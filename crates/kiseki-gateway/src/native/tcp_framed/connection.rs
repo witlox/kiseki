@@ -89,7 +89,8 @@ where
                 // drain. Send a wire-level error response (request_id
                 // 0 — we never decoded a frame header) then close.
                 let payload = format!("frame oversize: {length_be} > cap").into_bytes();
-                let _ = write_response(stream, WireStatus::ProtocolError, 0, &payload).await;
+                let _ =
+                    write_response(stream, WireStatus::ProtocolError, 0, &payload, &[]).await;
                 return Err(e.into());
             }
         };
@@ -97,97 +98,122 @@ where
         let mut body = vec![0u8; body_len];
         stream.read_exact(&mut body).await?;
 
-        // Decode V2 frame header — borrowed view over `body`.
-        // Hot path: zero copies of the verb body. Compare to V1
-        // which postcard-decoded an outer RpcEnvelope and copied
-        // `payload_bytes` for every call.
-        let (request_id, verb_tag, verb_body) = match decode_request_frame(&body) {
-            Ok(view) => (view.request_id, view.verb_tag.to_string(), view.body),
-            Err(e) => {
-                let payload = format!("frame decode failed: {e}").into_bytes();
-                write_response(stream, WireStatus::ProtocolError, 0, &payload).await?;
-                // Recoverable — keep the connection alive.
-                continue;
-            }
-        };
+        // Decode V3 frame header — borrowed view over `body`.
+        // `meta` is the postcard-encoded request metadata; `bulk`
+        // is the raw bulk bytes (empty for non-bulk verbs). No copy
+        // of either is needed at this layer; dispatch sees borrowed
+        // slices.
+        let (request_id, verb_tag, req_meta_off, req_bulk_off) =
+            match decode_request_frame(&body) {
+                Ok(view) => {
+                    // Capture offsets so we can re-slice `body` for
+                    // the dispatch call (the borrow checker won't
+                    // let us hold `view` across the await — it
+                    // borrows `body` and `body` is moved into the
+                    // dispatch path).
+                    let verb = view.verb_tag.to_string();
+                    let meta_start = body.len() - view.meta.len() - view.bulk.len();
+                    let bulk_start = body.len() - view.bulk.len();
+                    (view.request_id, verb, meta_start, bulk_start)
+                }
+                Err(e) => {
+                    let payload = format!("frame decode failed: {e}").into_bytes();
+                    write_response(stream, WireStatus::ProtocolError, 0, &payload, &[])
+                        .await?;
+                    continue;
+                }
+            };
 
-        // Dispatch — verb_body is a borrowed slice into `body`, no
-        // copy. The dispatch table postcard-decodes it once into the
-        // typed verb request struct.
-        let (status, response_body) =
-            dispatch_verb(&server, &principal, &verb_tag, verb_body).await;
-        write_response(stream, status, request_id, &response_body).await?;
+        let (status, resp_meta, resp_bulk) = dispatch_verb(
+            &server,
+            &principal,
+            &verb_tag,
+            &body[req_meta_off..req_bulk_off],
+            &body[req_bulk_off..],
+        )
+        .await;
+        write_response(stream, status, request_id, &resp_meta, &resp_bulk).await?;
     }
 }
 
-/// Write a V2 response frame to the wire via **vectored I/O** —
-/// the 14-byte header and the verb body go to the kernel in a
-/// single `writev` syscall, the kernel emits them as one TCP send.
-/// Avoids both the `Vec::extend_from_slice(body)` memcopy that
-/// `encode_response_frame` would do (saves one body memcopy per
-/// call) AND the two-syscall + Nagle pitfall of doing two
-/// sequential `write_all`s.
+/// Write a V3 response frame to the wire via **3-iovec vectored
+/// I/O** — the 18-byte header, the postcard `meta_bytes`, and the
+/// raw `bulk_bytes` all go to the kernel in a single `writev`
+/// syscall. Critical: bulk bytes are NEVER postcard-encoded; the
+/// hot path for 64 KiB GET ships them straight from the chunk
+/// store buffer to the wire, no per-byte serialize loop.
 ///
-/// Falls back to a single buffered `write_all` if the runtime's
-/// `poll_write_vectored` returns 0 vectored bytes (some `AsyncWrite`
-/// adapters don't implement vectored — we want forward compat).
+/// Falls back to sequential `write_all`s if the runtime's
+/// `poll_write_vectored` returns 0 (some `AsyncWrite` adapters
+/// don't implement vectored).
 async fn write_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     status: WireStatus,
     request_id: u64,
-    body: &[u8],
+    meta: &[u8],
+    bulk: &[u8],
 ) -> std::io::Result<()> {
-    let header = match build_response_header(status, request_id, body.len()) {
+    let header = match build_response_header(status, request_id, meta.len(), bulk.len()) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "response frame header build failed; sending Internal");
             return write_response_oversize(stream, request_id).await;
         }
     };
-    write_all_vectored(stream, &header, body).await?;
+    write_all_vectored3(stream, &header, meta, bulk).await?;
     stream.flush().await
 }
 
-/// `writev`-style two-buffer write that drains both buffers via
-/// the runtime's `poll_write_vectored` if supported, else falls
-/// back to two sequential `write_all` calls. Single syscall on
-/// Linux + tokio TcpStream (which implements vectored writes
-/// natively); deterministic across other AsyncWrite adapters.
-async fn write_all_vectored<S: AsyncWrite + Unpin>(
+/// `writev`-style 3-buffer write — drains [header, meta, bulk] via
+/// `poll_write_vectored` in a loop, falling back to sequential
+/// `write_all` if vectored returns 0.
+async fn write_all_vectored3<S: AsyncWrite + Unpin>(
     stream: &mut S,
     header: &[u8],
-    body: &[u8],
+    meta: &[u8],
+    bulk: &[u8],
 ) -> std::io::Result<()> {
     use std::io::IoSlice;
     use std::pin::Pin;
     use tokio::io::AsyncWriteExt;
 
-    let mut header_off = 0usize;
-    let mut body_off = 0usize;
-    let total = header.len() + body.len();
+    let mut offs = [0usize, 0, 0];
+    let lens = [header.len(), meta.len(), bulk.len()];
+    let total = lens.iter().sum::<usize>();
     let mut written = 0usize;
     while written < total {
-        let bufs: [IoSlice<'_>; 2] = [
-            IoSlice::new(&header[header_off..]),
-            IoSlice::new(&body[body_off..]),
+        let bufs: [IoSlice<'_>; 3] = [
+            IoSlice::new(&header[offs[0]..]),
+            IoSlice::new(&meta[offs[1]..]),
+            IoSlice::new(&bulk[offs[2]..]),
         ];
         let n = std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_write_vectored(cx, &bufs))
             .await?;
         if n == 0 {
-            // Adapter doesn't support vectored writes — fall back
-            // to two sequential writes for the remainder.
-            stream.write_all(&header[header_off..]).await?;
-            stream.write_all(&body[body_off..]).await?;
+            stream.write_all(&header[offs[0]..]).await?;
+            if offs[1] < meta.len() {
+                stream.write_all(&meta[offs[1]..]).await?;
+            }
+            if offs[2] < bulk.len() {
+                stream.write_all(&bulk[offs[2]..]).await?;
+            }
             return Ok(());
         }
         written += n;
-        // Consume bytes from the header first, then the body.
-        let header_remaining = header.len() - header_off;
-        if n <= header_remaining {
-            header_off += n;
-        } else {
-            header_off = header.len();
-            body_off += n - header_remaining;
+        // Consume bytes from header → meta → bulk in order.
+        let mut remaining = n;
+        for i in 0..3 {
+            let avail = lens[i] - offs[i];
+            if remaining == 0 {
+                break;
+            }
+            if remaining <= avail {
+                offs[i] += remaining;
+                remaining = 0;
+            } else {
+                offs[i] = lens[i];
+                remaining -= avail;
+            }
         }
     }
     Ok(())
@@ -200,9 +226,13 @@ async fn write_response_oversize<S: AsyncWrite + Unpin>(
     stream: &mut S,
     request_id: u64,
 ) -> std::io::Result<()> {
-    let frame =
-        encode_response_frame(WireStatus::Internal, request_id, b"response too large")
-            .map_err(|_| std::io::Error::other("response oversize fallback also too large"))?;
+    let frame = encode_response_frame(
+        WireStatus::Internal,
+        request_id,
+        b"response too large",
+        &[],
+    )
+    .map_err(|_| std::io::Error::other("response oversize fallback also too large"))?;
     stream.write_all(&frame).await?;
     stream.flush().await
 }
@@ -236,7 +266,7 @@ mod tests {
     use kiseki_composition::namespace::Namespace;
     use kiseki_crypto::keys::SystemMasterKey;
     use kiseki_proto::native_contract::wire_tcp_framed::{
-        encode_request_frame, NATIVE_TCP_FRAMED_VERSION_V2,
+        encode_request_frame, NATIVE_TCP_FRAMED_VERSION_V3,
     };
     use kiseki_proto::native_contract::ConnectionId;
     use kiseki_proto::v1 as v1;
@@ -286,10 +316,11 @@ mod tests {
         }
     }
 
-    /// Test-only response frame reader. Returns (status, request_id, body).
+    /// Test-only response frame reader. Returns
+    /// (status, request_id, meta, bulk) — V3 split-bulk shape.
     async fn read_response_frame<S: AsyncRead + Unpin>(
         stream: &mut S,
-    ) -> (WireStatus, u64, Vec<u8>) {
+    ) -> (WireStatus, u64, Vec<u8>, Vec<u8>) {
         use kiseki_proto::native_contract::wire_tcp_framed::decode_response_frame;
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await.expect("read length");
@@ -297,7 +328,7 @@ mod tests {
         let mut body = vec![0u8; body_len];
         stream.read_exact(&mut body).await.expect("read body");
         let view = decode_response_frame(&body).expect("decode response frame");
-        (view.status, view.request_id, view.body.to_vec())
+        (view.status, view.request_id, view.meta.to_vec(), view.bulk.to_vec())
     }
 
     /// End-to-end: client sends a put_object request frame; the
@@ -316,24 +347,28 @@ mod tests {
 
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
-        let body = postcard::to_allocvec(&np::PutObjectRequest {
+        // V3: meta = postcard(PutObjectRequest with empty data),
+        // bulk = the actual data bytes.
+        let meta = postcard::to_allocvec(&np::PutObjectRequest {
             control: Some(ctrl(tenant)),
             namespace_id: Some(ns_proto(ns)),
             name: "alpha".into(),
-            data: b"hello".to_vec(),
+            data: Vec::new(),
         })
         .unwrap();
-        let req_frame = encode_request_frame(7, "put_object", &body).unwrap();
+        let bulk = b"hello";
+        let req_frame = encode_request_frame(7, "put_object", &meta, bulk).unwrap();
         client_side.write_all(&req_frame).await.unwrap();
         client_side.flush().await.unwrap();
 
-        let (status, request_id, body) = read_response_frame(&mut client_side).await;
+        let (status, request_id, resp_meta, resp_bulk) =
+            read_response_frame(&mut client_side).await;
         assert_eq!(status, WireStatus::Ok);
         assert_eq!(request_id, 7, "request_id must echo");
-        let put_resp: np::PutObjectResponse = postcard::from_bytes(&body).unwrap();
+        assert!(resp_bulk.is_empty(), "PutObject has no response bulk");
+        let put_resp: np::PutObjectResponse = postcard::from_bytes(&resp_meta).unwrap();
         assert_eq!(put_resp.size, 5);
 
-        // Close client → serve_connection's read EOFs → returns Ok.
         drop(client_side);
         let result = server_task.await.expect("task joined");
         assert!(result.is_ok(), "serve_connection ended with: {result:?}");
@@ -355,20 +390,20 @@ mod tests {
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
         for &(rid, name) in &[(11u64, "a"), (22u64, "b")] {
-            let body = postcard::to_allocvec(&np::PutObjectRequest {
+            let meta = postcard::to_allocvec(&np::PutObjectRequest {
                 control: Some(ctrl(tenant)),
                 namespace_id: Some(ns_proto(ns)),
                 name: name.into(),
-                data: b"x".to_vec(),
+                data: Vec::new(),
             })
             .unwrap();
-            let frame = encode_request_frame(rid, "put_object", &body).unwrap();
+            let frame = encode_request_frame(rid, "put_object", &meta, b"x").unwrap();
             client_side.write_all(&frame).await.unwrap();
         }
         client_side.flush().await.unwrap();
 
         for &want_rid in &[11u64, 22u64] {
-            let (status, request_id, _body) = read_response_frame(&mut client_side).await;
+            let (status, request_id, _, _) = read_response_frame(&mut client_side).await;
             assert_eq!(status, WireStatus::Ok);
             assert_eq!(request_id, want_rid);
         }
@@ -390,28 +425,28 @@ mod tests {
         });
 
         // Send a frame with valid length but corrupt postcard payload.
-        let bad_payload: Vec<u8> = vec![NATIVE_TCP_FRAMED_VERSION_V2, 0xFF, 0xFF, 0xFF];
+        let bad_payload: Vec<u8> = vec![NATIVE_TCP_FRAMED_VERSION_V3, 0xFF, 0xFF, 0xFF];
         let len = u32::try_from(bad_payload.len()).unwrap();
         client_side.write_all(&len.to_be_bytes()).await.unwrap();
         client_side.write_all(&bad_payload).await.unwrap();
         client_side.flush().await.unwrap();
-        let (s1, _, _) = read_response_frame(&mut client_side).await;
+        let (s1, _, _, _) = read_response_frame(&mut client_side).await;
         assert_eq!(s1, WireStatus::ProtocolError);
 
-        // Now a valid request — still works.
+        // Now a valid V3 request — still works.
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
-        let body = postcard::to_allocvec(&np::PutObjectRequest {
+        let meta = postcard::to_allocvec(&np::PutObjectRequest {
             control: Some(ctrl(tenant)),
             namespace_id: Some(ns_proto(ns)),
             name: "after-bad".into(),
-            data: b"ok".to_vec(),
+            data: Vec::new(),
         })
         .unwrap();
-        let frame = encode_request_frame(99, "put_object", &body).unwrap();
+        let frame = encode_request_frame(99, "put_object", &meta, b"ok").unwrap();
         client_side.write_all(&frame).await.unwrap();
         client_side.flush().await.unwrap();
-        let (s2, request_id, _) = read_response_frame(&mut client_side).await;
+        let (s2, request_id, _, _) = read_response_frame(&mut client_side).await;
         assert_eq!(s2, WireStatus::Ok);
         assert_eq!(request_id, 99);
 
@@ -436,7 +471,7 @@ mod tests {
         client_side.write_all(&evil_len.to_be_bytes()).await.unwrap();
         client_side.flush().await.unwrap();
         // Server should reply with ProtocolError frame then drop.
-        let (status, _, _) = read_response_frame(&mut client_side).await;
+        let (status, _, _, _) = read_response_frame(&mut client_side).await;
         assert_eq!(status, WireStatus::ProtocolError);
 
         let result = server_task.await.expect("task joined");

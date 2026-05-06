@@ -376,9 +376,21 @@ impl CompositionHydrator {
             store.add_namespace(ns);
         }
 
+        let puts: Vec<Composition> = staging.puts.into_values().collect();
+        let removes: Vec<CompositionId> = staging.removes.into_iter().collect();
+        // Collect the ids the LRU read-cache must drop before we move
+        // `puts` / `removes` into the batch. Followers serve reads
+        // through the same `CompositionStore::get` path the leader
+        // does, so a stale post-Update cache entry would let a
+        // follower hand back the pre-Update version forever.
+        let touched_ids: Vec<CompositionId> = puts
+            .iter()
+            .map(|c| c.id)
+            .chain(removes.iter().copied())
+            .collect();
         let batch = HydrationBatch {
-            puts: staging.puts.into_values().collect(),
-            removes: staging.removes.into_iter().collect(),
+            puts,
+            removes,
             name_inserts: staging.name_inserts,
             name_removes: staging.name_removes,
             new_last_applied_seq: last_applied_in_batch,
@@ -394,7 +406,23 @@ impl CompositionHydrator {
                 .with_label_values(&[&shard_id.0.to_string()])
                 .start_timer()
         });
-        let apply_result = store.with_storage_locked(|s| s.apply_hydration_batch(batch));
+        // Apply the batch AND invalidate the LRU read-cache for every
+        // touched composition id while the storage `Mutex` is still
+        // held. Doing the invalidation inside the closure (rather than
+        // after `with_storage_locked` returns) closes the brief
+        // read-staleness window where the storage backend already
+        // holds the post-batch values but the LRU still has a
+        // pre-batch entry. Same lock-ordering invariant the
+        // leader-side mutators (`update`, `delete`, `rename`) follow.
+        let apply_result = store.with_storage_locked(|s| {
+            let r = s.apply_hydration_batch(batch);
+            if r.is_ok() {
+                for id in &touched_ids {
+                    store.invalidate_cache(*id);
+                }
+            }
+            r
+        });
         drop(timer); // Stop the histogram timer before logging.
         if let Err(e) = apply_result {
             // Commit failed (disk full, backend I/O error, etc.). Don't

@@ -34,6 +34,10 @@ uuid = { workspace = true }
 fjall = "3.1"
 postcard = { workspace = true }
 parking_lot = { workspace = true }
+# ADR-042 §post-V3 perf: composition LRU on top of the storage Mutex
+# so the GET hot path skips fjall lookup on cache hit (14.74% of CPU
+# at 64 KiB GET pre-fix).
+lru = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 # §D10 observability — exposes hydrator + persistent-store counters /
 # gauges / histograms via the same `prometheus::Registry` the rest of

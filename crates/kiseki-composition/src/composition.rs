@@ -1,10 +1,12 @@
 //! Composition types and operations.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use kiseki_common::ids::{ChunkId, CompositionId, NamespaceId, OrgId, ShardId};
 use kiseki_log::traits::LogOps;
+use lru::LruCache;
 
 use crate::error::CompositionError;
 use crate::multipart::MultipartUpload;
@@ -411,6 +413,41 @@ pub struct CompositionStore {
     namespaces: parking_lot::RwLock<HashMap<NamespaceId, Namespace>>,
     multiparts: parking_lot::Mutex<HashMap<String, (MultipartUpload, NamespaceId)>>,
     log: parking_lot::RwLock<Option<Arc<dyn LogOps + Send + Sync>>>,
+    /// Composition read cache (post-V3 ADR-042 perf sweep).
+    ///
+    /// `CompositionStore::get` was 14.74% of CPU at 64 KiB GET in the
+    /// post-V3 native flame because every lookup took the storage
+    /// `Mutex` and round-tripped through fjall's LSM. The LRU shaves
+    /// the storage hit on hot keys while keeping the storage backend
+    /// the source of truth — mutations invalidate the entry under the
+    /// same storage lock that publishes the new value, so a hit is
+    /// always a value that was committed at the time of insertion.
+    ///
+    /// Lock-ordering invariant (the only thing that makes this
+    /// correct): cache entries are inserted on a get-miss while the
+    /// storage `Mutex` is held, and removed by mutators while the
+    /// storage `Mutex` is held. Cache hits don't touch storage at
+    /// all — they're a snapshot read of a value that was once
+    /// published. Subsequent mutations clear the entry, so a read
+    /// after a mutation either misses the cache (re-fetches from
+    /// storage) or hits a fresh post-mutation entry.
+    read_cache: parking_lot::Mutex<LruCache<CompositionId, Composition>>,
+}
+
+/// Default composition read-cache capacity (entries). Each entry is
+/// ~200 bytes (`Composition` has a small fixed shape + a `Vec<ChunkId>`
+/// of 32-byte refs), so 65 536 entries ≈ 12 MiB at typical chunk
+/// counts. Override via `KISEKI_COMPOSITION_CACHE_ENTRIES`. Setting
+/// to 0 disables the cache entirely (still allocates a 1-entry LRU
+/// to keep the type uniform).
+pub const DEFAULT_COMPOSITION_CACHE_CAPACITY: usize = 65_536;
+
+fn read_cache_capacity() -> NonZeroUsize {
+    let cap = std::env::var("KISEKI_COMPOSITION_CACHE_ENTRIES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_COMPOSITION_CACHE_CAPACITY);
+    NonZeroUsize::new(cap.max(1)).expect("capacity at least 1")
 }
 
 impl CompositionStore {
@@ -429,7 +466,27 @@ impl CompositionStore {
             namespaces: parking_lot::RwLock::new(HashMap::new()),
             multiparts: parking_lot::Mutex::new(HashMap::new()),
             log: parking_lot::RwLock::new(None),
+            read_cache: parking_lot::Mutex::new(LruCache::new(read_cache_capacity())),
         }
+    }
+
+    /// Drop every cached `(CompositionId, Composition)` entry.
+    ///
+    /// Used by the hydrator after `apply_hydration_batch` — that path
+    /// mutates the storage backend through `with_storage_locked` and
+    /// the LRU here would otherwise serve pre-batch values for
+    /// composition ids the hydrator just rewrote. Hot path on
+    /// followers; no-op when the cache is empty.
+    pub fn clear_cache(&self) {
+        self.read_cache.lock().clear();
+    }
+
+    /// Drop a single composition's cache entry. Used by the hydrator
+    /// when it knows the exact composition ids touched by an applied
+    /// batch (cheaper than `clear_cache` when the hot working set is
+    /// large but the batch is small).
+    pub fn invalidate_cache(&self, id: CompositionId) {
+        self.read_cache.lock().pop(&id);
     }
 
     /// Run a closure with the storage backend held under the
@@ -537,6 +594,7 @@ impl CompositionStore {
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.content_type = content_type;
         storage.put(comp)?;
+        self.read_cache.lock().pop(&id);
         Ok(())
     }
 
@@ -790,6 +848,7 @@ impl CompositionStore {
         comp.has_inline_data =
             comp.chunks.is_empty() && comp.size > 0 && comp.size <= INLINE_DATA_THRESHOLD;
         storage.put(comp)?;
+        self.read_cache.lock().pop(&comp_id);
         Ok(())
     }
 
@@ -807,7 +866,9 @@ impl CompositionStore {
     ///
     /// Returns `CompositionError::Storage` on backend failure.
     pub fn delete_at(&self, comp_id: CompositionId) -> Result<(), CompositionError> {
-        self.storage.lock().remove(comp_id)?;
+        let mut storage = self.storage.lock();
+        storage.remove(comp_id)?;
+        self.read_cache.lock().pop(&comp_id);
         Ok(())
     }
 }
@@ -856,10 +917,27 @@ impl CompositionOps for CompositionStore {
     }
 
     fn get(&self, id: CompositionId) -> Result<Composition, CompositionError> {
-        self.storage
-            .lock()
-            .get(id)?
-            .ok_or(CompositionError::CompositionNotFound(id))
+        // Cache hit: cheap path, returns owned clone of the cached
+        // value. `LruCache::get` updates recency, so the lock here is
+        // a write-style lock — that's fine, this critical section
+        // holds nothing else.
+        if let Some(hit) = self.read_cache.lock().get(&id).cloned() {
+            return Ok(hit);
+        }
+        // Miss: take the storage lock, fetch, and insert into the LRU
+        // while the storage lock is still held. This is the
+        // lock-ordering rule that makes the cache safe — see the
+        // comment on `read_cache`. Any mutation that started after
+        // our storage acquire will wait for our release; any mutation
+        // that finished before our acquire has already been observed
+        // by the storage read below.
+        let storage = self.storage.lock();
+        let comp = storage.get(id)?;
+        if let Some(ref c) = comp {
+            self.read_cache.lock().put(id, c.clone());
+        }
+        drop(storage);
+        comp.ok_or(CompositionError::CompositionNotFound(id))
     }
 
     fn update(
@@ -877,6 +955,10 @@ impl CompositionOps for CompositionStore {
         comp.size = size;
         let version = comp.version;
         storage.put(comp)?;
+        // Drop the cache entry before releasing the storage lock so
+        // any concurrent reader that lands between these two
+        // unlocks observes the new value via the storage backend.
+        self.read_cache.lock().pop(&id);
         Ok(version)
     }
 
@@ -897,9 +979,11 @@ impl CompositionOps for CompositionStore {
             // a tombstone marker. Chunk refcounts are NOT decremented.
             comp.version += 1;
             storage.put(comp)?;
+            self.read_cache.lock().pop(&id);
             Ok(DeleteResult::DeleteMarker)
         } else {
             storage.remove(id)?;
+            self.read_cache.lock().pop(&id);
             Ok(DeleteResult::Removed(comp.chunks))
         }
     }
@@ -931,6 +1015,7 @@ impl CompositionOps for CompositionStore {
 
         comp.namespace_id = target_namespace;
         storage.put(comp)?;
+        self.read_cache.lock().pop(&id);
         Ok(())
     }
 
@@ -1766,5 +1851,153 @@ mod tests {
             elapsed.as_secs() < 10,
             "concurrent_creates ran for {elapsed:?} — possible lock-convoy regression",
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Read-cache (LRU) tests — ADR-042 post-V3 perf sweep.
+    //
+    // Goal: prove the cache is correct, not that it's fast. The
+    // interesting cases are: hit returns a value, mutation
+    // invalidates so subsequent reads see the new value, and
+    // hydrator-side `invalidate_cache` lets follower reads observe
+    // post-batch state.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn read_cache_hit_returns_value() {
+        let store = setup();
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 1024)
+            .unwrap();
+
+        // First get populates the cache; second hits the cache.
+        let first = store.get(id).unwrap();
+        let second = store.get(id).unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.version, second.version);
+        assert_eq!(first.chunks, second.chunks);
+    }
+
+    #[test]
+    fn read_cache_invalidates_on_update() {
+        let store = setup();
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+            .unwrap();
+        // Prime the cache with v=1.
+        let v1 = store.get(id).unwrap();
+        assert_eq!(v1.version, 1);
+
+        // Update bumps to v=2 and must drop the cache entry.
+        let v2 = store
+            .update(id, vec![ChunkId([0x02; 32])], 200)
+            .unwrap();
+        assert_eq!(v2, 2);
+
+        // Subsequent get must reflect the post-update version, not
+        // the pre-update cached value.
+        let after = store.get(id).unwrap();
+        assert_eq!(after.version, 2);
+        assert_eq!(after.size, 200);
+        assert_eq!(after.chunks, vec![ChunkId([0x02; 32])]);
+    }
+
+    #[test]
+    fn read_cache_invalidates_on_delete() {
+        let store = setup();
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+            .unwrap();
+        // Prime cache.
+        let _ = store.get(id).unwrap();
+
+        store.delete(id).unwrap();
+        // Post-delete get must miss cache and surface NotFound from
+        // the storage backend, not return the cached pre-delete value.
+        assert!(matches!(
+            store.get(id),
+            Err(CompositionError::CompositionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn read_cache_invalidates_on_rename() {
+        let store = setup();
+        store.add_namespace(make_ns(11, test_tenant(), test_shard()));
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+            .unwrap();
+        let _ = store.get(id).unwrap();
+
+        store
+            .rename(id, NamespaceId(uuid::Uuid::from_u128(11)))
+            .unwrap();
+
+        let after = store.get(id).unwrap();
+        assert_eq!(after.namespace_id, NamespaceId(uuid::Uuid::from_u128(11)));
+    }
+
+    #[test]
+    fn read_cache_invalidates_on_set_content_type() {
+        let store = setup();
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+            .unwrap();
+        let v1 = store.get(id).unwrap();
+        assert_eq!(v1.content_type, None);
+
+        store
+            .set_content_type(id, Some("application/json".into()))
+            .unwrap();
+
+        let after = store.get(id).unwrap();
+        assert_eq!(after.content_type.as_deref(), Some("application/json"));
+    }
+
+    #[test]
+    fn invalidate_cache_drops_single_entry() {
+        let store = setup();
+        let id = store
+            .create(test_ns(), vec![ChunkId([0x01; 32])], 100)
+            .unwrap();
+
+        // Prime, then bypass CompositionOps to mutate storage
+        // directly — simulates what the hydrator does on a follower
+        // via `with_storage_locked`. Without the explicit
+        // invalidate_cache call below, the next get would return a
+        // stale clone.
+        let _ = store.get(id).unwrap();
+        store.with_storage_locked(|s| {
+            let mut comp = s.get(id).unwrap().unwrap();
+            comp.version = 99;
+            comp.size = 999;
+            s.put(comp).unwrap();
+        });
+
+        // Without invalidate_cache → stale.
+        let stale = store.get(id).unwrap();
+        assert_eq!(stale.version, 1);
+
+        // After invalidate_cache → fresh from storage.
+        store.invalidate_cache(id);
+        let fresh = store.get(id).unwrap();
+        assert_eq!(fresh.version, 99);
+        assert_eq!(fresh.size, 999);
+    }
+
+    #[test]
+    fn clear_cache_drops_every_entry() {
+        let store = setup();
+        let id_a = store.create(test_ns(), vec![], 1).unwrap();
+        let id_b = store.create(test_ns(), vec![], 2).unwrap();
+        // Prime both.
+        let _ = store.get(id_a).unwrap();
+        let _ = store.get(id_b).unwrap();
+
+        store.clear_cache();
+        // Both must miss cache and re-fetch — no panic, correct
+        // values.
+        assert_eq!(store.get(id_a).unwrap().size, 1);
+        assert_eq!(store.get(id_b).unwrap().size, 2);
     }
 }
