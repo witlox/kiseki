@@ -16,6 +16,7 @@ RUN apt-get update \
         fuse3 \
         ca-certificates \
         coreutils \
+        fio \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-built binary (Glibc Ubuntu 24.04 host should match the

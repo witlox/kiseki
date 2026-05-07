@@ -41,6 +41,7 @@ def perf_cluster() -> Generator[ClusterInfo, None, None]:
 
 
 PNFS_CLIENT_IMAGE = "kiseki-pnfs-client:test"
+FUSE_PERF_CLIENT_IMAGE = "kiseki-fuse-perf-client:test"
 
 
 @pytest.fixture(scope="module")
@@ -65,6 +66,83 @@ def perf_client_image() -> str:
         capture_output=True,
     )
     return PNFS_CLIENT_IMAGE
+
+
+@pytest.fixture(scope="module")
+def fuse_perf_client_image() -> str:
+    """FUSE client image with `kiseki-client mount` + `fio` baked in.
+    Pre-built `target/release/kiseki-client` must exist with the
+    `fuse remote-http` features (`cargo build --release -p
+    kiseki-client --features fuse remote-http`); the image build
+    just COPYs the binary in. fuse3 + fio come from apt."""
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    client_bin = repo_root / "target" / "release" / "kiseki-client"
+    if not client_bin.exists():
+        subprocess.run(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "-p",
+                "kiseki-client",
+                "--bin",
+                "kiseki-client",
+                "--features",
+                "fuse remote-http",
+            ],
+            cwd=repo_root,
+            check=True,
+        )
+    dockerfile = Path(__file__).parent / "Dockerfile.fuse-client"
+    subprocess.run(
+        [
+            "docker",
+            "build",
+            "-t",
+            FUSE_PERF_CLIENT_IMAGE,
+            "-f",
+            str(dockerfile),
+            str(repo_root),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return FUSE_PERF_CLIENT_IMAGE
+
+
+def _run_in_fuse_client(
+    image: str,
+    script: str,
+    *,
+    timeout: int = 180,
+) -> subprocess.CompletedProcess[str]:
+    """Same shape as `_run_in_client` but with `/dev/fuse` passed
+    through and `apparmor:unconfined` (both required for FUSE
+    mount inside the container)."""
+    return subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--privileged",
+            "--device",
+            "/dev/fuse",
+            "--cap-add",
+            "SYS_ADMIN",
+            "--security-opt",
+            "apparmor:unconfined",
+            "--network",
+            "kiseki_default",
+            image,
+            script,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 
 def _docker_available() -> bool:
@@ -352,4 +430,110 @@ fio --name=seq-write --rw=write --direct=0 --bs=1M --size=8M \
         )
     bw = _parse_fio_bw(result.stdout)
     print(f"\n[B-5/NFSv3] seq-write = {bw.get('write_mbps', 0):7.1f} MB/s")
+
+
+# ---------------------------------------------------------------------------
+# 7-8. FUSE → cluster sequential read/write — fio against `kiseki-client
+# mount`.
+# ---------------------------------------------------------------------------
+#
+# The FUSE daemon attaches to the cluster via the S3 listener
+# (`--endpoint http://kiseki-node1:9000`, same shape as
+# `test_fuse_remote_http_cross_protocol_roundtrip`). Reads and writes
+# go through the in-process `RemoteHttpGateway`, not the kernel NFS
+# client; this is the path a Linux pod would take when bind-mounting
+# kiseki via FUSE inside the container.
+#
+# The read fixture is created via FUSE itself (rather than seeded
+# via S3 + lookup-by-etag) because the FUSE inode table addresses
+# objects by name, not composition_id — writing through FUSE then
+# reading the same name back is the most realistic shape.
+
+
+@pytest.mark.e2e
+@pytest.mark.perf
+def test_perf_fuse_seq_read(
+    perf_cluster: ClusterInfo,
+    fuse_perf_client_image: str,
+) -> None:
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    # Single docker invocation: bring up FUSE, write the fixture, run
+    # fio. Splitting into two `_run_in_fuse_client` calls would tear
+    # down the FUSE mount between calls (the daemon dies when the
+    # container exits) and lose the fixture.
+    script = r"""
+set -euo pipefail
+MNT=/mnt/kiseki
+mkdir -p "$MNT"
+kiseki-client mount --endpoint http://kiseki-node1:9000 \
+    --mountpoint "$MNT" --cache-mode bypass --read-write &
+DAEMON_PID=$!
+trap 'fusermount3 -u "$MNT" 2>/dev/null || true; kill $DAEMON_PID 2>/dev/null || true' EXIT
+
+for i in $(seq 1 50); do
+    if mountpoint -q "$MNT"; then break; fi
+    sleep 0.1
+done
+mountpoint -q "$MNT"
+
+# Seed an 8 MiB fixture through FUSE so the kernel + composition
+# store both have it. Warm-up read populates the server-side
+# decrypt cache (matches the NFSv4.1 read test).
+dd if=/dev/zero of="$MNT/perf-read-fuse" bs=1M count=8 status=none conv=fsync
+dd if="$MNT/perf-read-fuse" of=/dev/null bs=1M status=none
+
+fio --name=seq-read --rw=read --direct=0 --bs=1M --size=8M \
+    --filename="$MNT/perf-read-fuse" --runtime=10 --time_based \
+    --output-format=normal 2>&1 | tail -30
+"""
+    result = _run_in_fuse_client(fuse_perf_client_image, script, timeout=180)
+    if result.returncode != 0:
+        pytest.fail(
+            f"fio FUSE seq-read failed (rc={result.returncode}):\n"
+            f"stdout: {result.stdout[-2000:]}\n"
+            f"stderr: {result.stderr[-2000:]}"
+        )
+    bw = _parse_fio_bw(result.stdout)
+    print(f"\n[B-5/FUSE] seq-read  = {bw.get('read_mbps', 0):7.1f} MB/s")
+
+
+@pytest.mark.e2e
+@pytest.mark.perf
+def test_perf_fuse_seq_write(
+    perf_cluster: ClusterInfo,
+    fuse_perf_client_image: str,
+) -> None:
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    script = r"""
+set -euo pipefail
+MNT=/mnt/kiseki
+mkdir -p "$MNT"
+kiseki-client mount --endpoint http://kiseki-node1:9000 \
+    --mountpoint "$MNT" --cache-mode bypass --read-write &
+DAEMON_PID=$!
+trap 'fusermount3 -u "$MNT" 2>/dev/null || true; kill $DAEMON_PID 2>/dev/null || true' EXIT
+
+for i in $(seq 1 50); do
+    if mountpoint -q "$MNT"; then break; fi
+    sleep 0.1
+done
+mountpoint -q "$MNT"
+
+fio --name=seq-write --rw=write --direct=0 --bs=1M --size=8M \
+    --filename="$MNT/perf-write-fuse" --runtime=10 --time_based \
+    --output-format=normal 2>&1 | tail -30
+"""
+    result = _run_in_fuse_client(fuse_perf_client_image, script, timeout=180)
+    if result.returncode != 0:
+        pytest.fail(
+            f"fio FUSE seq-write failed (rc={result.returncode}):\n"
+            f"stdout: {result.stdout[-2000:]}\n"
+            f"stderr: {result.stderr[-2000:]}"
+        )
+    bw = _parse_fio_bw(result.stdout)
+    print(f"\n[B-5/FUSE] seq-write = {bw.get('write_mbps', 0):7.1f} MB/s")
 

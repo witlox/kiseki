@@ -419,10 +419,10 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
             {
                 match parse_byte_range(range_hdr, body_bytes.len()) {
                     Some(RangeResult::Single { start, end }) => {
-                        use axum::http::HeaderValue;
                         use axum::http::header::{
                             CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
                         };
+                        use axum::http::HeaderValue;
                         let slice = body_bytes[start..=end].to_vec();
                         let slice_len = slice.len();
                         let total_len = body_bytes.len();
@@ -578,8 +578,8 @@ fn build_get_response_with_headers(
     etag: &str,
     content_type: Option<String>,
 ) -> axum::response::Response {
-    use axum::http::HeaderValue;
     use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+    use axum::http::HeaderValue;
     let mut response = (StatusCode::OK, body).into_response();
     let h = response.headers_mut();
     h.insert(CONTENT_LENGTH, HeaderValue::from(content_length));

@@ -189,9 +189,9 @@ verify-full: rust-fmt-check rust-clippy rust-deny test-full arch-check ## CI rel
 build: rust-build ## Build all artefacts
 
 e2e: ## Python e2e tests via docker compose (Tier 3 component)
-	/usr/local/bin/docker compose up --build -d
-	.venv/bin/pytest tests/e2e/ -m e2e -v || { /usr/local/bin/docker compose down; exit 1; }
-	/usr/local/bin/docker compose down
+	docker compose up --build -d
+	.venv/bin/pytest tests/e2e/ -m e2e -v || { docker compose down; exit 1; }
+	docker compose down
 
 clean: ## Remove build artefacts
 	$(CARGO) clean
