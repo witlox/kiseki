@@ -79,6 +79,14 @@ LimitNOFILE=65536
 Environment=KISEKI_DATA_ADDR=0.0.0.0:9100
 Environment=KISEKI_ADVISORY_ADDR=0.0.0.0:9101
 Environment=KISEKI_ADVISORY_STREAM_ADDR=0.0.0.0:9102
+# ADR-042 §2.2 TCP-framed native binding. Default was 9101 in the
+# original ADR but that collided with ADR-021 advisory which also
+# defaults to 9101 — TCP-framed lost the bind race and the listener
+# silently exited (observed on the 2026-05-07 GCP compact run). The
+# server-side default is now 9103; this line makes the choice
+# explicit in the systemd unit so an operator looking at the file
+# sees the port plan at a glance.
+Environment=KISEKI_NATIVE_TCP_ADDR=0.0.0.0:9103
 Environment=KISEKI_S3_ADDR=0.0.0.0:9000
 Environment=KISEKI_NFS_ADDR=0.0.0.0:2049
 Environment=KISEKI_METRICS_ADDR=0.0.0.0:9090
@@ -108,6 +116,38 @@ Environment=KISEKI_RAFT_THREADS=64
 # ADR-038 §D4.2: plaintext NFS fallback (no TLS bundle in perf-test env)
 Environment=KISEKI_INSECURE_NFS=true
 Environment=KISEKI_ALLOW_PLAINTEXT_NFS=true
+
+# 2026-05-07: NFSv4.1 LAYOUTGET disabled until pNFS DS supports
+# WRITE + persistent sessions. Without this the kernel pNFS client
+# does per-file EXCHANGE_ID + CREATE_SESSION + RECLAIM_COMPLETE
+# against the DS for every OPEN, then issues maybe ONE READ at the
+# end of kernel readahead, then DESTROY_SESSION + DESTROY_CLIENTID.
+# 8 MiB sequential read measured 0.5 MB/s in 3-node compose because
+# of this. Setting it disabled forces NFSv4 to use the MDS metadata-
+# stream READ/WRITE path, which on the same workload measured
+# 182 MB/s. Drop this Environment= line once the DS WRITE + session-
+# persistence ADR slice lands.
+Environment=KISEKI_DISABLE_PNFS_LAYOUT=true
+
+# Eventual-durability flush cadence (ADR-022 rev-3 + d5c56ad).
+# All three are CRITICAL for perf:
+#   * KISEKI_RAFT_FLUSH_INTERVAL_MS unset → Raft log uses
+#     sync-per-write fsync, capping PUT at ~31 k op/s. Setting it
+#     switches to periodic-flush; multi-node Raft re-replicates the
+#     loss window on restart so the durability contract is
+#     preserved at the cluster level.
+#   * KISEKI_COMPOSITION_FLUSH_INTERVAL_MS — same shape for the
+#     composition store (fjall). Without it every PUT fsyncs the
+#     composition row inline.
+#   * KISEKI_CHUNK_FLUSH_INTERVAL_MS — chunk-data device sync. The
+#     periodic task runs regardless of the env var (defaults to
+#     100 ms when unset); set it explicitly so per-knob tuning is
+#     visible in the systemd unit.
+# 100 ms = 1 minor election timeout = the same cadence ADR-022 §4
+# uses for the loss-window analysis in docs/operations/durability.md.
+Environment=KISEKI_RAFT_FLUSH_INTERVAL_MS=100
+Environment=KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
+Environment=KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 
 Environment=RUST_LOG=info
 

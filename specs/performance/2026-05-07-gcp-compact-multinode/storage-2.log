@@ -1,0 +1,224 @@
+May 07 19:11:11 kiseki-storage-2 systemd[1]: Started Kiseki Storage Server (node 2, nvme).
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.866064Z  INFO kiseki_server: kiseki-server starting data_addr=0.0.0.0:9100 advisory_addr=0.0.0.0:9101
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.866185Z  WARN kiseki_server::runtime: advisory gRPC listening (PLAINTEXT — development only) addr=0.0.0.0:9101
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.866339Z  INFO run_advisory_stream_server{addr=0.0.0.0:9102}: kiseki_advisory::stream: advisory TCP stream server listening addr=0.0.0.0:9102
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.867235Z  INFO kiseki_server::runtime: system disk detected media_type=Nvme total_gb=49 soft_limit_gb=24 budget_gb=20
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.867252Z  INFO kiseki_server::runtime: node identity configured node_id=2 peers=3 raft_addr=Some(10.0.0.11:9300)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.896399Z  INFO kiseki_server::runtime: key store at-rest identity source="file"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.896513Z  INFO fjall::db: Creating database at /var/lib/kiseki/keys/epochs
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.904400Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.908767Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.911178Z  INFO kiseki_server::runtime: key manager: persistent (fjall) ready epoch=1
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.913851Z  INFO kiseki_server::runtime: small object store: persistent (redb) path=/var/lib/kiseki
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.914062Z  INFO kiseki_log::raft_shard_store: Raft runtime threads=64
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.916480Z  INFO kiseki_log::raft_shard_store: Raft RPC listener spawned (multiplexed, ADR-041) addr=10.0.0.11:9300
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.916604Z  WARN kiseki_raft::tcp_transport: Raft RPC listener started (plaintext — dev mode, multiplexed) addr=10.0.0.11:9300
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.916702Z  INFO fjall::db: Creating database at /var/lib/kiseki/raft/shard-00000000-0000-0000-0000-000000000001
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.922269Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.927456Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.928793Z  INFO openraft::storage::helper: get_initial_state: vote: <T0-N2:->, last_purged_log_id: None, last_applied: None, committed: None, last_log_id: None
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.928809Z  INFO openraft::storage::helper: load membership from log: [0..0)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.928828Z  INFO openraft::storage::helper: load key log ids from (None,None]
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.937975Z  INFO openraft::engine::engine_impl: startup begin: state: RaftState { vote: Leased { data: Vote { leader_id: LeaderId { term: 0, node_id: 2 }, committed: false }, last_update: Some(TokioInstant(Instant { tv_sec: 92, tv_nsec: 269018358 })), lease: 0ns, lease_enabled: true }, log_ids: LogIdList { purged: None, key_log_ids: [] }, membership_state: MembershipState { committed: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} }, effective: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} } }, snapshot_meta: SnapshotMeta { last_log_id: None, last_membership: StoredMembership { log_id: None, membership: Membership { configs: [], nodes: {} } }, snapshot_id: "" }, last_inflight_id: 0, server_state: Learner, io_state: IOState { building_snapshot: false, log_progress: IOProgress { accepted: Some(Vote(UncommittedVote { leader_id: LeaderId { term: 0, node_id: 2 } })), submitted: Some(Vote(UncommittedVote { leader_id: LeaderId { term: 0, node_id: 2 } })), flushed: Some(Vote(UncommittedVote { leader_id: LeaderId { term: 0, node_id: 2 } })), id: "2", name: "LogIO" }, apply_progress: IOProgress { accepted: None, submitted: None, flushed: None, id: "2", name: "Apply" }, snapshot: IOProgress { accepted: None, submitted: None, flushed: None, id: "2", name: "Snapshot" }, cluster_committed: MonotonicIncrease { value: None }, purged: None }, purge_upto: None, progress_id_gen: SharedIdGenerator { next_id: 1 } }, is_leader: false, is_voter: false
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.938016Z  INFO openraft::engine::engine_impl: startup done, id=2, target_state: Learner
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.938015Z  INFO kiseki_log::raft_shard_store: shard registered with Raft RPC listener shard_id=00000000-0000-0000-0000-000000000001
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.938027Z  INFO kiseki_server::runtime: log store: Raft node_id=2 peers=3
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.938205Z  INFO fjall::db: Creating database at /var/lib/kiseki/raft/cluster_control
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.943490Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.948272Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.949642Z  INFO openraft::storage::helper: get_initial_state: vote: <T0-N2:->, last_purged_log_id: None, last_applied: None, committed: None, last_log_id: None
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.949663Z  INFO openraft::storage::helper: load membership from log: [0..0)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.949673Z  INFO openraft::storage::helper: load key log ids from (None,None]
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.949755Z  INFO openraft::engine::engine_impl: startup begin: state: RaftState { vote: Leased { data: Vote { leader_id: LeaderId { term: 0, node_id: 2 }, committed: false }, last_update: Some(TokioInstant(Instant { tv_sec: 92, tv_nsec: 289861020 })), lease: 0ns, lease_enabled: true }, log_ids: LogIdList { purged: None, key_log_ids: [] }, membership_state: MembershipState { committed: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} }, effective: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} } }, snapshot_meta: SnapshotMeta { last_log_id: None, last_membership: StoredMembership { log_id: None, membership: Membership { configs: [], nodes: {} } }, snapshot_id: "" }, last_inflight_id: 0, server_state: Learner, io_state: IOState { building_snapshot: false, log_progress: IOProgress { accepted: Some(Vote(UncommittedVote { leader_id: LeaderId { term: 0, node_id: 2 } })), submitted: Some(Vote(UncommittedVote { leader_id: LeaderId { term: 0, node_id: 2 } })), flushed: Some(Vote(UncommittedVote { leader_id: LeaderId { term: 0, node_id: 2 } })), id: "2", name: "LogIO" }, apply_progress: IOProgress { accepted: None, submitted: None, flushed: None, id: "2", name: "Apply" }, snapshot: IOProgress { accepted: None, submitted: None, flushed: None, id: "2", name: "Snapshot" }, cluster_committed: MonotonicIncrease { value: None }, purged: None }, purge_upto: None, progress_id_gen: SharedIdGenerator { next_id: 1 } }, is_leader: false, is_voter: false
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.949802Z  INFO openraft::engine::engine_impl: startup done, id=2, target_state: Learner
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.949807Z  INFO kiseki_server::runtime: control-plane Raft group: up (ADR-033 §4) node_id=2 peers=3
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.949848Z  INFO kiseki_server::runtime: audit log: in-memory events=0
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.952208Z  INFO fjall::db: Creating database at /var/lib/kiseki/chunks/meta
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.952783Z  INFO openraft::engine::handler::vote_handler: vote is changing from <T0-N2:-> to <T10-N1:Q>
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.957693Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.962307Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963629Z  INFO kiseki_server::runtime: chunk store: persistent (raw block, group commit) path=/var/lib/kiseki flush_interval_ms=100
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963662Z  INFO kiseki_server::runtime: fabric peer registered for cross-node chunks peer_id=1 fabric_addr="10.0.0.10:9100"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963673Z  INFO kiseki_server::runtime: fabric peer registered for cross-node chunks peer_id=3 fabric_addr="10.0.0.12:9100"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963677Z  INFO kiseki_server::runtime: cross-node chunk replication enabled (Phase 16a) peers=2
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963680Z  INFO kiseki_server::runtime: cluster durability defaults cluster_size=3 copies=3 min_acks=2 strategy=Replication { copies: 3 }
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963693Z  INFO kiseki_server::runtime: scrub scheduler: spawned (orphan + under-replication, 10-min cadence, drain-on-shutdown)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963696Z  INFO kiseki_server::runtime: raw block devices configured devices=8
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963753Z  INFO kiseki_server::runtime: raw device detected device="/dev/disk/by-id/google-local-nvme-ssd-0"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963763Z  INFO kiseki_server::runtime: raw device detected device="/dev/disk/by-id/google-local-nvme-ssd-1"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963769Z  INFO kiseki_server::runtime: raw device detected device="/dev/disk/by-id/google-local-nvme-ssd-2"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963774Z  INFO kiseki_server::runtime: raw device detected device="/dev/disk/by-id/google-local-nvme-ssd-3"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963778Z  INFO kiseki_server::runtime: raw device detected device="/dev/disk/by-id/google-local-nvme-ssd-4"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963782Z  INFO kiseki_server::runtime: raw device detected device="/dev/disk/by-id/google-local-nvme-ssd-5"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963787Z  INFO kiseki_server::runtime: raw device detected device="/dev/disk/by-id/google-local-nvme-ssd-6"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963791Z  INFO kiseki_server::runtime: raw device detected device="/dev/disk/by-id/google-local-nvme-ssd-7"
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.963888Z  INFO fjall::db: Creating database at /var/lib/kiseki/metadata/compositions
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.964756Z  INFO kiseki_chunk_cluster::scrub_scheduler: scrub scheduler: shutdown received, draining
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.968806Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.973215Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.976774Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.981996Z  INFO lsm_tree::tree::ingest: Finished ingestion writer
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.983678Z  INFO kiseki_server::runtime: composition store: persistent (fjall, eventual durability) path=/var/lib/kiseki/metadata/compositions interval_ms=100
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.986331Z  INFO kiseki_server::runtime: view store: persistent (redb-backed, ADR-040) path=/var/lib/kiseki/metadata/views.redb
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.986917Z  INFO kiseki_server::runtime: bootstrap: namespace 'default' + view installed (Raft follower; will hydrate compositions from log)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.986953Z  INFO kiseki_server::runtime: inline write path disabled in multi-node cluster — small writes go through fabric (Phase 16a)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.986961Z  INFO kiseki_server::runtime: fsync hook: composition store (fjall) registered
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.986964Z  INFO kiseki_server::runtime: fsync hook: chunk-store device registered
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987012Z  WARN kiseki::nfs::security: NFS path is PLAINTEXT — fh4s and data are observable on the network. Mitigations: VPC isolation, firewall ingress restrictions. Compliance: this configuration violates I-PN7-default and is acceptable only with documented compensating controls.
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987022Z  INFO kiseki_server::runtime: NFS transport posture mode=Plaintext layout_ttl_seconds=60
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987086Z  WARN kiseki_gateway::s3_server: S3 HTTP gateway listening (PLAINTEXT — development only) addr=0.0.0.0:9000
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987150Z  INFO kiseki_server::runtime: portmapper listening (NFS3 + MOUNT3 → NFS port) addr=0.0.0.0:111 advertised_nfs_port=2049
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987151Z  INFO kiseki_gateway::nfs_server: NFS server listening (NFSv3 + NFSv4.2) addr=0.0.0.0:2049
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987192Z  INFO kiseki_server::metrics: metrics + admin UI server listening addr=0.0.0.0:9090
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987197Z  INFO kiseki_server::runtime: pNFS DS listener spawned addr=0.0.0.0:2052
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987219Z  INFO kiseki_server::runtime: composition hydrator spawned (Phase 16f — followers consume create-deltas)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987223Z  INFO kiseki_server::runtime: backup: disabled (set KISEKI_BACKUP_BACKEND=fs|s3 to enable)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987226Z  INFO kiseki_server::runtime: control plane: in-process (ControlService on data-path gRPC)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.987239Z  INFO kiseki_gateway::pnfs_ds_server: pNFS DS listening addr=0.0.0.0:2052 tls=false
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.989781Z  INFO kiseki_server::runtime: tuning store: persistent (redb) path=/var/lib/kiseki/tuning
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.989915Z  WARN kiseki_server::runtime: data-path gRPC listening (PLAINTEXT — development only) addr=0.0.0.0:9100
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.989947Z  WARN kiseki_server::runtime: ClusterChunkService: NO SAN interceptor (plaintext development mode — cross-node fabric is not protected against tenant certs)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.989976Z  INFO kiseki_server::runtime: [transport.native] available bindings (in priority order):
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.989981Z  INFO kiseki_server::runtime:   1. tcp-framed       (latency_class=Low, addr=0.0.0.0:9101)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.989984Z  INFO kiseki_server::runtime:   2. grpc-h2          (latency_class=Standard, addr=0.0.0.0:9100)
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.989986Z  INFO kiseki_server::runtime: [transport.native] override available via KISEKI_NATIVE_TRANSPORT={grpc|tcp|ibverbs|libfabric|auto}
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.990003Z  INFO kiseki_server::runtime: TCP-framed native binding registered (ADR-042 §2.2) addr=0.0.0.0:9101 require_tls=false
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.990009Z  INFO kiseki_server::runtime: gRPC native binding registered on shared data_addr (ADR-042 §2.1) require_tls=false
+May 07 19:11:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:11.990048Z ERROR kiseki_server::runtime: TCP-framed native binding listener exited error=Address already in use (os error 98)
+May 07 19:11:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:11:12.132794Z  INFO openraft::engine::handler::vote_handler: vote is changing from <T0-N2:-> to <T8-N1:Q>
+May 07 19:12:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:12:11.988831Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:13:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:13:11.990726Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:14:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:14:11.991927Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:14:47 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:14:47.903735Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=2 last_applied=2
+May 07 19:15:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:15:11.993385Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:16:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:16:11.994395Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:16:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:16:17.159951Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=3
+May 07 19:16:55 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:16:55.774599Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=2 last_applied=5
+May 07 19:17:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:17:08.722496Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=6
+May 07 19:17:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:17:10.035965Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=7
+May 07 19:17:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:17:11.995261Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:17:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:17:12.966800Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=8
+May 07 19:17:46 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:17:46.730517Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=9
+May 07 19:18:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:18:11.996609Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:18:38 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:18:38.681901Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=10
+May 07 19:19:00 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:19:00.819264Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=11
+May 07 19:19:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:19:11.997225Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:20:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:20:11.997879Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:20:41 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:20:41.412223Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=2 last_applied=13
+May 07 19:21:07 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:07.594992Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=14
+May 07 19:21:07 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:07.697332Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=15
+May 07 19:21:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:08.000774Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=16
+May 07 19:21:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:08.103087Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=17
+May 07 19:21:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:08.205165Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=18
+May 07 19:21:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:08.307168Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=19
+May 07 19:21:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:08.509556Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=4 last_applied=23
+May 07 19:21:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:08.610800Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=4 last_applied=27
+May 07 19:21:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:08.713072Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=4 last_applied=31
+May 07 19:21:08 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:08.815108Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=4 last_applied=35
+May 07 19:21:09 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:09.119161Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=5 last_applied=40
+May 07 19:21:09 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:09.221181Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=11 last_applied=51
+May 07 19:21:09 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:09.323218Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=7 last_applied=58
+May 07 19:21:09 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:09.425066Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=67
+May 07 19:21:09 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:09.526514Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=76
+May 07 19:21:09 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:09.627452Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=7 last_applied=83
+May 07 19:21:09 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:09.729639Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=10 last_applied=93
+May 07 19:21:09 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:09.830869Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=99
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.134860Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=2 last_applied=101
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.237148Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=102
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.339267Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=103
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.441167Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=5 last_applied=108
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.543460Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=13 last_applied=121
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.644692Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=13 last_applied=134
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.745892Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=7 last_applied=141
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.848256Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=149
+May 07 19:21:10 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:10.950254Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=157
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.052419Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=16 last_applied=173
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.153633Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=11 last_applied=184
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.254811Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=5 last_applied=189
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.357116Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=197
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.459255Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=203
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.561116Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=211
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.663282Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=14 last_applied=225
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.765357Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=11 last_applied=236
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.866447Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=244
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.967653Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=253
+May 07 19:21:11 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:11.999799Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.069013Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=14 last_applied=267
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.171090Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=5 last_applied=272
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.273325Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=281
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.375223Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=12 last_applied=293
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.477485Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=15 last_applied=308
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.578660Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=7 last_applied=315
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.679738Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=17 last_applied=332
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.781829Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=16 last_applied=348
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.883945Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=354
+May 07 19:21:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:12.985999Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=355
+May 07 19:21:13 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:13.492294Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=2 last_applied=357
+May 07 19:21:13 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:13.594438Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=4 last_applied=361
+May 07 19:21:13 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:13.695542Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=367
+May 07 19:21:13 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:13.796789Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=3 last_applied=370
+May 07 19:21:13 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:13.898833Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=4 last_applied=374
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.001105Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=3 last_applied=377
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.103219Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=7 last_applied=384
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.204572Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=390
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.305621Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=10 last_applied=400
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.407078Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=409
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.509281Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=12 last_applied=421
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.611243Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=5 last_applied=426
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.713417Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=10 last_applied=436
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.814442Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=7 last_applied=443
+May 07 19:21:14 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:14.916393Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=17 last_applied=460
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.017611Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=15 last_applied=475
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.118590Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=483
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.219610Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=5 last_applied=488
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.320440Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=494
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.422336Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=10 last_applied=504
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.524505Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=512
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.626237Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=13 last_applied=525
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.728237Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=14 last_applied=539
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.830353Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=13 last_applied=552
+May 07 19:21:15 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:15.931677Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=558
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.032953Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=564
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.135008Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=572
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.237178Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=10 last_applied=582
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.339363Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=591
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.440882Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=7 last_applied=598
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.543207Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=607
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.645165Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=616
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.747289Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=12 last_applied=628
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.849326Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=11 last_applied=639
+May 07 19:21:16 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:16.951253Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=648
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.053404Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=11 last_applied=659
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.154547Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=10 last_applied=669
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.255869Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=10 last_applied=679
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.357757Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=12 last_applied=691
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.459980Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=10 last_applied=701
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.562233Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=710
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.664356Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=5 last_applied=715
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.766493Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=9 last_applied=724
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.867618Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=17 last_applied=741
+May 07 19:21:17 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:17.968778Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=6 last_applied=747
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.070936Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=13 last_applied=760
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.173216Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=11 last_applied=771
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.275451Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=12 last_applied=783
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.376698Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=12 last_applied=795
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.477892Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=13 last_applied=808
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.579715Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=15 last_applied=823
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.680642Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=13 last_applied=836
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.781785Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=22 last_applied=858
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.883831Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=8 last_applied=866
+May 07 19:21:18 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:21:18.985841Z  INFO kiseki_composition::hydrator: composition hydrator: installed compositions from log applied=1 last_applied=867
+May 07 19:22:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:22:12.001597Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:23:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:23:12.002047Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:24:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:24:12.003188Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:25:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:25:12.004472Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:26:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:26:12.005639Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:27:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:27:12.006705Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:28:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:28:12.007348Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:29:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:29:12.008100Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:30:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:30:12.009372Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:31:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:31:12.010309Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:32:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:32:12.011090Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:33:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:33:12.012739Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:34:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:34:12.014715Z  INFO kiseki_server::runtime: scrub: periodic check completed
+May 07 19:35:12 kiseki-storage-2 kiseki-server[16653]: 2026-05-07T19:35:12.016588Z  INFO kiseki_server::runtime: scrub: periodic check completed

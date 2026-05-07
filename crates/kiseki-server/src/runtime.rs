@@ -1827,8 +1827,14 @@ pub async fn run_main(
     selector.register(Box::new(kiseki_gateway::native::grpc::GrpcProbe::new(
         cfg.data_addr.to_string(),
     )));
+    // Port plan: 9100 data-gRPC, 9101 advisory, 9102 advisory-stream,
+    // 9103 native TCP-framed. ADR-042 §2.2 originally specified 9101
+    // for TCP-framed which collided with ADR-021's advisory listener
+    // (both used `KISEKI_*_ADDR` defaults at 9101). The collision was
+    // silent on the 2026-05-07 GCP run — the advisory listener won
+    // the race and TCP-framed exited with EADDRINUSE.
     selector.register(Box::new(
-        kiseki_gateway::native::tcp_framed::TcpFramedProbe::new("0.0.0.0:9101"),
+        kiseki_gateway::native::tcp_framed::TcpFramedProbe::new("0.0.0.0:9103"),
     ));
     let selector = selector.with_pin(pin);
     let (plan, report) = match selector.plan().await {

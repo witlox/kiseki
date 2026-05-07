@@ -1304,6 +1304,55 @@ mod tests {
         assert!(ffiles > 0, "free files should be reported");
     }
 
+    // ---------- MKDIR registers handle in registry (regression) ----------
+
+    /// Pre-2026-05-07 bug (observed on the GCP `compact` perf run):
+    /// `mkdir` minted a 32-byte handle and returned it in the
+    /// `post_op_fh3` of the MKDIR reply, but never registered it in
+    /// `HandleRegistry::handles`. Every follow-up op that ran a
+    /// handle lookup (kernel issued GETATTR on the new fh to verify
+    /// the directory) hit the missing-handle path and returned
+    /// `NFS3ERR_BADHANDLE` (10001) — Linux NFS errno mapping
+    /// surfaced this as errno 521 to userspace.
+    ///
+    /// This test checks the contract directly: after `mkdir` returns,
+    /// (a) the handle resolves via `handles.lookup`, (b) it reports
+    /// as a directory, and (c) `lookup_by_name` for the same name
+    /// returns the same fh with `FileType::Directory`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mkdir_registers_handle_so_followup_ops_dont_badhandle() {
+        let ctx = test_ctx();
+        let (fh, attrs) = ctx.mkdir("perf").expect("mkdir must succeed");
+
+        // Bug regression: handle MUST resolve via the registry.
+        assert!(
+            ctx.handles.lookup(&fh).is_some(),
+            "mkdir must register the new fh in HandleRegistry::handles \
+             — pre-fix the registry was empty for this fh and follow-up \
+             GETATTR returned NFS3ERR_BADHANDLE (kernel errno 521).",
+        );
+        assert!(
+            ctx.handles.is_directory(&fh),
+            "the registered handle must be classified as a directory",
+        );
+        assert!(matches!(
+            attrs.file_type,
+            crate::nfs_ops::FileType::Directory,
+        ));
+
+        // lookup_by_name must agree on the type — pre-fix it always
+        // returned `FileType::Regular` for any dir_index hit.
+        let (looked_fh, looked_attrs) = ctx
+            .lookup_by_name("perf")
+            .await
+            .expect("lookup_by_name must find the dir");
+        assert_eq!(looked_fh, fh);
+        assert!(matches!(
+            looked_attrs.file_type,
+            crate::nfs_ops::FileType::Directory,
+        ));
+    }
+
     // ---------- Wrong program number ----------
 
     #[tokio::test(flavor = "multi_thread")]

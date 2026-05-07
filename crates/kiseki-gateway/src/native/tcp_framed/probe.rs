@@ -9,7 +9,8 @@
 //! Listen-address resolution mirrors the gRPC probe:
 //! 1. `KISEKI_NATIVE_TCP_ADDR` env var.
 //! 2. The address passed to [`TcpFramedProbe::with_addr`].
-//! 3. Default `0.0.0.0:9101` (per §2.2).
+//! 3. Default `0.0.0.0:9103` (per §2.2 as amended 2026-05-07; the
+//!    original §2.2 default of 9101 collided with ADR-021 advisory).
 //!
 //! `KISEKI_NATIVE_TCP_ADDR=disabled` is the operator escape hatch:
 //! the probe reports `Unavailable { reason: "disabled by operator" }`

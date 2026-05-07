@@ -55,6 +55,60 @@ KISEKI_TRANSPORT=tcp kiseki-client-fuse --mountpoint /mnt/kiseki
 
 ---
 
+## NFSv4.1 / pNFS
+
+Kiseki implements NFSv4.1 with the Flex Files Layout type (RFC 8435):
+the gateway is the metadata server (MDS) and `kiseki-pnfs-ds` ports
+on each node serve as data servers (DS). On a Linux NFSv4.1 client
+that fully understands Flex Files this is a fast path — reads and
+writes go directly to the DS that owns the chunks, bypassing the
+MDS metadata stream.
+
+### `KISEKI_DISABLE_PNFS_LAYOUT` (force MDS-only NFSv4)
+
+| Aspect | Value |
+|---|---|
+| Default | unset (LAYOUTGET issues Flex Files layouts; FATTR4_FS_LAYOUT_TYPES advertises `LAYOUT4_FLEX_FILES`) |
+| Set to `true` / `1` / any non-empty non-`0` value | empty `layouttype4<>`; LAYOUTGET returns `NFS4ERR_LAYOUTUNAVAILABLE`; the kernel client falls back to MDS metadata-stream READ/WRITE |
+| Recommended for production multi-node | **set** (until pNFS DS WRITE + persistent sessions land) |
+| Recommended for single-node compose / dev | unset |
+| Type | perf-correctness knob — **not** a durability knob |
+
+**Why this exists.** The current pNFS DS (Phase 15a) only supports
+the read path, and each NFSv4.1 OPEN against the MDS triggers the
+kernel to do a fresh `EXCHANGE_ID` + `CREATE_SESSION` + `RECLAIM_COMPLETE`
+sequence against every DS in the layout, then issue (sometimes only
+one) READ inside readahead, then `DESTROY_SESSION` + `DESTROY_CLIENTID`
+when the file closes. Per-file session establishment dominates
+small-file workloads.
+
+**Workload impact (3-node compose, 8 MiB sequential read):**
+
+| Layout state | NFSv4.1 seq-read |
+|---|---|
+| LAYOUTGET enabled (default) | ~0.5 MB/s |
+| `KISEKI_DISABLE_PNFS_LAYOUT=true` | ~182 MB/s |
+
+The MDS metadata-stream path doesn't pay the per-OPEN session tax,
+which is why disabling layouts is currently the right operational
+choice for multi-node deployments. NFSv3 is unaffected — it
+ignores `FATTR4_FS_LAYOUT_TYPES` entirely.
+
+**When to drop this flag.** Once the DS supports WRITE end-to-end
+and sessions persist across OPENs (tracked in the post-Phase-15a
+sweep), the per-file overhead disappears and the pNFS fast path
+should beat the MDS path on multi-DS aggregate bandwidth. Re-run
+the sequential-read matrix against compose at that point — if it
+exceeds the MDS number, the flag can come out of the systemd unit
+in `infra/gcp/scripts/setup-raw-storage.sh`.
+
+**Where it's set today.** GCP `compact` / `transport` perf profile
+(see `infra/gcp/scripts/setup-raw-storage.sh:122`); not set in the
+3-node docker compose harness because the BDD scenario
+`test_pnfs_plaintext_fallback` exercises the layout path itself.
+
+---
+
 ## NUMA pinning
 
 For multi-socket servers, NUMA-aware placement is critical for avoiding

@@ -41,6 +41,37 @@ struct ChunkLanded {
 /// envelope wrapper) while keeping per-PUT chunk count bounded for
 /// metadata / refcount overhead.
 pub const MAX_PLAINTEXT_PER_CHUNK: usize = 64 * 1024 * 1024;
+
+/// Copy the bytes of one chunk's plaintext that fall inside the
+/// requested `[start, end)` range into `out`. Used by the range-aware
+/// read path; pulled out so the cache-hit and cache-miss branches
+/// share the same offset arithmetic.
+///
+/// `chunk_start_in_file` is the byte offset at which this chunk's
+/// plaintext begins in the composition. The caller has already
+/// verified that the chunk index falls within
+/// `[first_chunk, last_chunk]`, so at least one byte of intersection
+/// exists when the chunk's plaintext length matches the expected
+/// `MAX_PLAINTEXT_PER_CHUNK`. The defensive `byte_lo < byte_hi`
+/// guard handles the corner case of a short last chunk shorter than
+/// the chunk arithmetic predicted (stale composition record, etc.)
+/// without panicking.
+fn copy_chunk_range_into(
+    out: &mut Vec<u8>,
+    plaintext: &[u8],
+    chunk_start_in_file: usize,
+    start: usize,
+    end: usize,
+) {
+    let chunk_end_in_file = chunk_start_in_file.saturating_add(plaintext.len());
+    let byte_lo = start.saturating_sub(chunk_start_in_file);
+    let byte_hi = std::cmp::min(end, chunk_end_in_file).saturating_sub(chunk_start_in_file);
+    let byte_hi = std::cmp::min(byte_hi, plaintext.len());
+    if byte_lo < byte_hi {
+        out.extend_from_slice(&plaintext[byte_lo..byte_hi]);
+    }
+}
+
 use kiseki_crypto::aead::Aead;
 use kiseki_crypto::chunk_id::derive_chunk_id;
 use kiseki_crypto::envelope;
@@ -1249,17 +1280,81 @@ impl GatewayOps for InMemoryGateway {
             }
         }
 
-        // Read and decrypt all chunks, concatenate. Per-chunk plaintext
-        // is cached by content-addressed chunk_id; cache hits skip the
+        // Range-aware decrypt: only fetch + decrypt chunks that
+        // intersect [start, end). Per-chunk plaintext is cached by
+        // content-addressed chunk_id; cache hits skip the
         // envelope::open_envelope call (the dominant cost on
-        // sequential NFS reads where the kernel issues many small
-        // READs against the same composition).
-        let mut plaintext = Vec::new();
-        for chunk_id in &comp.chunks {
-            // Cache lookup first (cheap mutex; clone is unavoidable
-            // because the cache holds Vec<u8> shared across calls).
+        // sequential reads).
+        //
+        // Pre-2026-05-07 the read path always reconstructed the
+        // FULL plaintext (sum of all chunks) and then sliced. With
+        // MAX_PLAINTEXT_PER_CHUNK = 64 MiB and a 256 MiB decrypt
+        // cache, any composition larger than 4 chunks made every
+        // range read thrash: 16 chunks × 12 misses/read × 64 MiB ≈
+        // 786 GiB of AES-GCM for one 1 GiB sequential `dd`. The
+        // window-only loop fixes that.
+        let content_type = comp.content_type.clone();
+        let comp_size = usize::try_from(comp.size).unwrap_or(usize::MAX);
+
+        // Resolve [start, end) against `comp.size` rather than against
+        // an accumulating plaintext — this lets us short-circuit
+        // beyond-EOF and zero-length reads without touching any
+        // chunk.
+        let start = usize::try_from(req.offset).unwrap_or(usize::MAX);
+        if start >= comp_size {
+            tracing::debug!(
+                comp_size,
+                "gateway read: offset beyond EOF — returning empty",
+            );
+            return Ok(ReadResponse {
+                data: Vec::new(),
+                eof: true,
+                content_type,
+            });
+        }
+        let length = usize::try_from(req.length).unwrap_or(usize::MAX);
+        let end = std::cmp::min(start.saturating_add(length), comp_size);
+        let eof = end >= comp_size;
+
+        if start == end {
+            // Zero-length read inside the file. No chunks needed.
+            return Ok(ReadResponse {
+                data: Vec::new(),
+                eof,
+                content_type,
+            });
+        }
+
+        // Chunk window. The PUT path splits payloads at
+        // `MAX_PLAINTEXT_PER_CHUNK` boundaries (see the chunks(N)
+        // call in `write`), so chunk i covers
+        // `[i * MAX_PLAINTEXT_PER_CHUNK,
+        //   i * MAX_PLAINTEXT_PER_CHUNK + chunk_plaintext_len)`
+        // with `chunk_plaintext_len == MAX_PLAINTEXT_PER_CHUNK` for
+        // every chunk except (possibly) the last.
+        let n_chunks = comp.chunks.len();
+        let first_chunk = start / MAX_PLAINTEXT_PER_CHUNK;
+        let last_chunk = std::cmp::min(
+            (end - 1) / MAX_PLAINTEXT_PER_CHUNK,
+            n_chunks.saturating_sub(1),
+        );
+
+        let mut data = Vec::with_capacity(end - start);
+
+        for (i, chunk_id) in comp
+            .chunks
+            .iter()
+            .enumerate()
+            .skip(first_chunk)
+            .take(last_chunk.saturating_sub(first_chunk).saturating_add(1))
+        {
+            let chunk_start_in_file = i.saturating_mul(MAX_PLAINTEXT_PER_CHUNK);
+
+            // Cache lookup first — `get` clones the cached Vec out
+            // and releases the mutex before we extend the output,
+            // so the lock isn't held across a memcpy.
             if let Some(cached) = self.decrypt_cache.lock().get(chunk_id) {
-                plaintext.extend_from_slice(&cached);
+                copy_chunk_range_into(&mut data, &cached, chunk_start_in_file, start, end);
                 continue;
             }
 
@@ -1271,7 +1366,7 @@ impl GatewayOps for InMemoryGateway {
                     .get(&chunk_id.0)
                     .ok()
                     .flatten()
-                    .and_then(|data| serde_json::from_slice::<envelope::Envelope>(&data).ok())
+                    .and_then(|d| serde_json::from_slice::<envelope::Envelope>(&d).ok())
             } else {
                 None
             };
@@ -1294,33 +1389,15 @@ impl GatewayOps for InMemoryGateway {
                     GatewayError::Upstream(e.to_string())
                 })?;
             self.observe_get_phase("decrypt", decrypt_started.elapsed());
-            plaintext.extend_from_slice(&decrypted);
 
-            // Insert into cache for the next call. Bounded eviction
-            // ensures memory stays under MAX_CACHE_BYTES.
+            // Borrow first (slice into output), then move into cache.
+            // Same "borrow then move" pattern as the pre-fix path —
+            // no extra clone on the miss path.
+            copy_chunk_range_into(&mut data, &decrypted, chunk_start_in_file, start, end);
+
+            // Bounded eviction ensures cache stays under MAX_CACHE_BYTES.
             self.decrypt_cache.lock().insert(*chunk_id, decrypted);
         }
-
-        // Pull Content-Type from the composition for RFC 6838 round-trip
-        // (ADV-PA-4: store-side metadata, not per-instance HashMap).
-        let content_type = comp.content_type.clone();
-
-        // Apply offset/length.
-        let start = usize::try_from(req.offset).unwrap_or(usize::MAX);
-        if start >= plaintext.len() {
-            tracing::debug!(
-                plaintext_len = plaintext.len(),
-                "gateway read: offset beyond EOF — returning empty",
-            );
-            return Ok(ReadResponse {
-                data: Vec::new(),
-                eof: true,
-                content_type,
-            });
-        }
-        let length = usize::try_from(req.length).unwrap_or(usize::MAX);
-        let end = std::cmp::min(start.saturating_add(length), plaintext.len());
-        let eof = end >= plaintext.len();
 
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         let returned: u64 = (end - start) as u64;
@@ -1334,16 +1411,6 @@ impl GatewayOps for InMemoryGateway {
             c.inc_by(returned);
         }
 
-        // (B9: dropped "success" debug — phase histograms cover this.)
-        // Common-case fast path: offset == 0 and length covers the
-        // whole plaintext — move the accumulator into the response
-        // instead of slicing-and-copying. Eliminates one full-payload
-        // memcpy per GET on the typical full-object read.
-        let data = if start == 0 && end == plaintext.len() {
-            plaintext
-        } else {
-            plaintext[start..end].to_vec()
-        };
         Ok(ReadResponse {
             data,
             eof,
@@ -2612,6 +2679,226 @@ mod chunking_tests {
             "round-trip length mismatch",
         );
         assert_eq!(read.data, original, "round-trip bytes diverged");
+    }
+
+    /// Range read against a multi-chunk composition must return the
+    /// same bytes the offset/length specify, regardless of which
+    /// chunks they land in. Pre-2026-05-07 the read path
+    /// reconstructed the full plaintext before slicing, masking any
+    /// chunk-boundary bug with a copy-then-slice. The range-aware
+    /// path computes the chunk window directly from `MAX_PLAINTEXT_PER_CHUNK`,
+    /// so a math error would surface as garbage bytes here.
+    #[tokio::test]
+    async fn range_read_within_first_chunk() {
+        let (gw, tenant, namespace) = build_gateway().await;
+        let mut data = vec![0u8; 96 * 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from((i * 17 + 3) % 251).unwrap();
+        }
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data: data.clone(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .unwrap();
+
+        // 1 MiB read at offset 1 MiB — entirely inside chunk 0.
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: 1024 * 1024,
+                length: 1024 * 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(read.data, data[1024 * 1024..2 * 1024 * 1024]);
+        assert!(!read.eof);
+    }
+
+    /// Range read that straddles a 64 MiB chunk boundary must stitch
+    /// the slices from the two chunks correctly. The first 1 MiB
+    /// comes from the tail of chunk 0; the second from the head of
+    /// chunk 1.
+    #[tokio::test]
+    async fn range_read_across_chunk_boundary() {
+        let (gw, tenant, namespace) = build_gateway().await;
+        let mut data = vec![0u8; 96 * 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from((i * 17 + 3) % 251).unwrap();
+        }
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data: data.clone(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .unwrap();
+
+        // 2 MiB read centered on the chunk-0/chunk-1 boundary
+        // (64 MiB - 1 MiB through 64 MiB + 1 MiB).
+        let chunk = MAX_PLAINTEXT_PER_CHUNK;
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: u64::try_from(chunk - 1024 * 1024).unwrap(),
+                length: 2 * 1024 * 1024,
+            })
+            .await
+            .unwrap();
+        let lo = chunk - 1024 * 1024;
+        let hi = lo + 2 * 1024 * 1024;
+        assert_eq!(read.data, data[lo..hi]);
+        assert!(!read.eof);
+    }
+
+    /// Range read entirely past the first chunk exercises the
+    /// pre-fix cache-thrash hot path — pre-2026-05-07 it always
+    /// touched chunk 0 even when the requested range was inside
+    /// chunk 1. The new path must skip chunk 0 entirely; we verify
+    /// the bytes match (correctness) and rely on perf to confirm
+    /// the skip empirically.
+    #[tokio::test]
+    async fn range_read_inside_later_chunk_only() {
+        let (gw, tenant, namespace) = build_gateway().await;
+        let mut data = vec![0u8; 96 * 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from((i * 17 + 3) % 251).unwrap();
+        }
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data: data.clone(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .unwrap();
+
+        let chunk = MAX_PLAINTEXT_PER_CHUNK;
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: u64::try_from(chunk + 4 * 1024 * 1024).unwrap(),
+                length: 1024 * 1024,
+            })
+            .await
+            .unwrap();
+        let lo = chunk + 4 * 1024 * 1024;
+        let hi = lo + 1024 * 1024;
+        assert_eq!(read.data, data[lo..hi]);
+    }
+
+    /// Read at offset == comp.size returns empty + EOF.
+    #[tokio::test]
+    async fn read_at_eof_returns_empty() {
+        let (gw, tenant, namespace) = build_gateway().await;
+        let data = vec![0x55u8; 1024 * 1024];
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data: data.clone(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .unwrap();
+
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: data.len() as u64,
+                length: 4096,
+            })
+            .await
+            .unwrap();
+        assert!(read.data.is_empty());
+        assert!(read.eof);
+    }
+
+    /// Zero-length read inside the file returns empty without
+    /// touching any chunk.
+    #[tokio::test]
+    async fn zero_length_read_inside_file_returns_empty() {
+        let (gw, tenant, namespace) = build_gateway().await;
+        let data = vec![0x77u8; 1024 * 1024];
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data: data.clone(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .unwrap();
+
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: 0,
+                length: 0,
+            })
+            .await
+            .unwrap();
+        assert!(read.data.is_empty());
+        assert!(!read.eof); // start (0) < comp.size, so not at EOF
+    }
+
+    /// A read that asks for more bytes than the file holds returns
+    /// only the bytes that exist plus EOF=true.
+    #[tokio::test]
+    async fn over_read_truncates_to_eof() {
+        let (gw, tenant, namespace) = build_gateway().await;
+        let data = vec![0x33u8; 100 * 1024];
+        let resp = gw
+            .write(WriteRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                data: data.clone(),
+                name: None,
+                conditional: None,
+                workflow_ref: None,
+            })
+            .await
+            .unwrap();
+
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: resp.composition_id,
+                offset: 50 * 1024,
+                length: 1024 * 1024, // way more than the remaining 50 KiB
+            })
+            .await
+            .unwrap();
+        assert_eq!(read.data.len(), 50 * 1024);
+        assert!(read.eof);
+        assert!(read.data.iter().all(|&b| b == 0x33));
     }
 }
 

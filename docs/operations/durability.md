@@ -40,6 +40,11 @@ op/s in exchange for a bounded loss window.
 
 ## Performance flags that trade durability for throughput
 
+> Looking for `KISEKI_DISABLE_PNFS_LAYOUT`? It's a perf-correctness
+> knob (NFSv4.1 fast-path workaround), not a durability knob —
+> documented in [`performance.md`](performance.md#kiseki_disable_pnfs_layout-force-mds-only-nfsv4).
+
+
 ### `KISEKI_CHUNK_FLUSH_INTERVAL_MS` (chunk-store flush interval)
 
 | Aspect | Value |
@@ -117,6 +122,45 @@ production scale this means the per-node loss window is invisible
 to applications.
 
 **Single-node:** dev only — same caveat as the chunk flag.
+
+---
+
+### `KISEKI_RAFT_FLUSH_INTERVAL_MS` (Raft log group commit)
+
+| Aspect | Value |
+|---|---|
+| Default | unset (per-write fsync via `PersistMode::SyncAll`) |
+| Recommended value when set | `100` ms |
+| Recommended for production | `100` (multi-node Raft re-replicates the loss window) |
+| Recommended for perf bench | `100` |
+
+When set, the Raft log (`kiseki-log::persistent_store::PersistentShardStore`)
+opens via the `open_eventual` constructor — every log append commits
+with `PersistMode::Buffer` (queues in the WAL, no fsync) and a
+periodic background task drives one `PersistMode::SyncAll` every
+N ms. When unset, every Raft append fsyncs inline.
+
+Per the inline comment in `runtime.rs`: **"PUT path was fsync-bound
+at ~31 k op/s with sync-per-write"** — setting this knob is what
+unlocks the in-process-persistent matrix's 125 k op/s. Equivalent
+shape to the chunk + composition group-commit flags above; landed
+in `d5c56ad` (perf: eventual durability for FjallLogStore via
+flush interval).
+
+**Loss window on power loss:** up to N ms of Raft log entries
+that the leader accepted but hadn't yet flushed. Followers may have
+seen those entries via AppendEntries replication and persisted them;
+quorum durability still holds at the cluster level even when the
+leader's local copy is briefly behind disk.
+
+**Multi-node mitigation:** Raft replication itself is the answer.
+On restart, a node that lost the last 100 ms of its log catches up
+from peers via the standard append-entries / install-snapshot
+machinery before it can vote or serve reads. Production is safe.
+
+**Single-node:** dev only. Same caveat as the chunk + composition
+flags — single-node group commit moves writes the application
+already saw succeed into the loss window.
 
 ---
 
@@ -211,11 +255,19 @@ also forces durability per write.)
 
 Three columns to track:
 - **Default** = `KISEKI_DATA_DIR` set, no other env vars. Chunk group
-  commit is on (always — see above), composition is at
-  `Durability::Immediate`.
+  commit is on (always — see above), composition + Raft log are at
+  per-write fsync.
 - **+composition GC, single-node** = `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100`.
 - **+composition GC, multi-node R-3** = same env var on a 3-node
   Replication-3 cluster.
+
+`KISEKI_RAFT_FLUSH_INTERVAL_MS=100` widens the per-node loss window
+to also cover the last ≤ 100 ms of Raft log appends. On multi-node
+R-3 the recovery story is identical to the composition column —
+followers refill from peers via AppendEntries on restart, so the
+cluster-level durability is unchanged. On single-node it adds the
+Raft loss window to the existing chunk + composition windows; not
+recommended outside dev / perf-bench.
 
 | Failure | Default | +composition GC, single-node | +composition GC, multi-node R-3 |
 |---|---|---|---|
@@ -249,26 +301,44 @@ unset KISEKI_OBSERVABILITY
 ### Multi-node production (3+ nodes, Replication-3 or EC)
 
 ```bash
-# Composition group commit ON. Raft re-replication recovers the
-# ≤ 100 ms loss window from peers on restart.
+# All three group-commit flags ON. Raft re-replication + chunk
+# under-replication scrub recover the ≤ 100 ms loss window from
+# peers on restart.
+export KISEKI_RAFT_FLUSH_INTERVAL_MS=100
 export KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
+export KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 ```
 
-### Perf cluster (GCP `transport` profile, throughput baseline)
+### Perf cluster (GCP `compact` / `transport` profile, throughput baseline)
 
 ```bash
-# Composition group commit ON + observability OFF for clean baseline.
+# All three group-commit flags ON + observability OFF for clean baseline.
+# Without KISEKI_RAFT_FLUSH_INTERVAL_MS the PUT path saturates at
+# ~31 k op/s on Raft fsync; with it set the in-process-persistent
+# matrix lifts to ~125 k op/s.
+export KISEKI_RAFT_FLUSH_INTERVAL_MS=100
 export KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
+export KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 export KISEKI_OBSERVABILITY=off
+
+# Until pNFS DS supports WRITE + persistent sessions, kernel pNFS
+# clients pay per-file EXCHANGE_ID/CREATE_SESSION/RECLAIM_COMPLETE
+# overhead per OPEN — capping NFSv4.1 seq-read at ~0.5 MB/s in the
+# multi-node compose harness. Disabling layouts makes NFSv4 fall
+# back to the MDS metadata-stream READ/WRITE path (~182 MB/s on the
+# same workload). Not a durability knob — see `performance.md`.
+export KISEKI_DISABLE_PNFS_LAYOUT=true
 ```
 
 ### Single-node FUSE benchmark
 
 ```bash
-# Composition group commit ON, observability OFF. Accepts the 100 ms
-# loss window (the benchmark itself doesn't care; operators DO need
-# to know).
+# All three group-commit flags ON, observability OFF. Accepts the
+# 100 ms loss window — single-node has no peers to recover from,
+# so dev / smoke-test only.
+export KISEKI_RAFT_FLUSH_INTERVAL_MS=100
 export KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
+export KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 export KISEKI_OBSERVABILITY=off
 ```
 

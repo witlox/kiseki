@@ -21,7 +21,7 @@ pub struct Ports {
     /// ADR-042 §2.2 TCP-framed-postcard binding listener port.
     /// Allocated alongside the rest so the profiler can drive the
     /// `--binding tcp` mode without colliding with another process
-    /// at the default 9101.
+    /// at the default 9103.
     pub tcp_framed: u16,
 }
 

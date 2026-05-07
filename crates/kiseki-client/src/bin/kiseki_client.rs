@@ -3,7 +3,8 @@
 //! Kiseki client CLI -- staging, cache management, FUSE mount, diagnostics.
 //!
 //! Usage:
-//!   kiseki-client mount --endpoint <host:port> --mountpoint /mnt/kiseki [--cache-mode organic] [--cache-dir /cache]
+//!   kiseki-client mount --endpoint http://<host>:<port> --mountpoint /mnt/kiseki [--cache-mode organic] [--cache-dir /cache]
+//!   kiseki-client mount --in-memory --mountpoint /mnt/kiseki [--cache-mode organic]
 //!   kiseki-client stage --dataset /training/imagenet [--timeout 300]
 //!   kiseki-client stage --status
 //!   kiseki-client stage --release /training/imagenet
@@ -56,8 +57,9 @@ COMMANDS:
     help        Print this help
 
 MOUNT OPTIONS:
-    --endpoint <host:port>   Gateway endpoint (required)
+    --endpoint <url>         Gateway endpoint, http(s):// (required unless --in-memory)
     --mountpoint <path>      Local mount path (required)
+    --in-memory              Run against an in-process sandbox (dev only)
     --cache-mode <mode>      Cache mode: pinned, organic, bypass (default: organic)
     --read-write             Mount RW (default: RO — HPC compute-node default)
     --cache-dir <path>       Cache directory (default: /tmp/kiseki-cache)
@@ -99,6 +101,7 @@ fn handle_mount(args: &[String]) {
     let mut cache_mode = String::from("organic");
     let mut _cache_dir: Option<String> = None;
     let mut read_write = false;
+    let mut in_memory = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -139,6 +142,10 @@ fn handle_mount(args: &[String]) {
                 read_write = true;
                 i += 1;
             }
+            "--in-memory" => {
+                in_memory = true;
+                i += 1;
+            }
             other => {
                 eprintln!("Unknown mount option: {other}");
                 std::process::exit(2);
@@ -146,32 +153,47 @@ fn handle_mount(args: &[String]) {
         }
     }
 
-    let endpoint = endpoint.unwrap_or_else(|| {
-        eprintln!("Error: --endpoint is required");
-        std::process::exit(2);
-    });
     let mountpoint = mountpoint.unwrap_or_else(|| {
         eprintln!("Error: --mountpoint is required");
         std::process::exit(2);
     });
 
+    // Validate endpoint vs sandbox mode. The previous behavior silently
+    // fell through to an in-process sandbox whenever `--endpoint` was
+    // not an http(s):// URL — that masked a 2026-05-07 GCP run where
+    // every read/write was hitting an in-daemon HashMap, not the
+    // cluster. Sandbox is now opt-in via `--in-memory`.
+    if in_memory {
+        if endpoint.is_some() {
+            eprintln!("Error: --in-memory and --endpoint are mutually exclusive");
+            std::process::exit(2);
+        }
+    } else {
+        let ep = endpoint.as_deref().unwrap_or_else(|| {
+            eprintln!("Error: --endpoint is required (or use --in-memory for a dev sandbox)");
+            std::process::exit(2);
+        });
+        if !(ep.starts_with("http://") || ep.starts_with("https://")) {
+            eprintln!(
+                "Error: --endpoint must start with http:// or https:// (got '{ep}'). \
+                 Use --in-memory to run an in-process sandbox.",
+            );
+            std::process::exit(2);
+        }
+    }
+
     let tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
     let namespace =
         kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
 
-    // When `--endpoint` is an HTTP(S) URL AND the `remote-http`
-    // feature is compiled in, attach to the running cluster's S3
-    // listener. Otherwise fall back to the local in-memory sandbox
-    // (sandbox is the default for development; the remote path is
-    // the actual networked client).
-    let is_http_endpoint = endpoint.starts_with("http://") || endpoint.starts_with("https://");
-
-    println!("Mounting at {mountpoint} (cache_mode: {cache_mode})");
-
+    // Networked path: --endpoint is http(s):// and `remote-http` is
+    // compiled in. Returns from the function on success.
     #[cfg(all(feature = "fuse", feature = "remote-http"))]
     {
         use std::path::Path;
-        if is_http_endpoint {
+        if !in_memory {
+            let endpoint = endpoint.expect("validated above");
+            println!("Mounting at {mountpoint} via remote {endpoint} (cache_mode: {cache_mode})");
             let gw = kiseki_client::remote_http::RemoteHttpGateway::new(endpoint);
             let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
             kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
@@ -180,12 +202,32 @@ fn handle_mount(args: &[String]) {
         }
     }
 
+    // Without `remote-http`, the only honest path is in-memory. If the
+    // operator passed `--endpoint` but the binary wasn't built with
+    // `remote-http`, refuse rather than silently sandboxing.
+    #[cfg(all(feature = "fuse", not(feature = "remote-http")))]
+    {
+        if !in_memory {
+            eprintln!(
+                "Error: this binary was built without `remote-http` — \
+                 networked --endpoint cannot be served. Rebuild with \
+                 `--features remote-http` or pass `--in-memory`.",
+            );
+            std::process::exit(1);
+        }
+    }
+
     #[cfg(feature = "fuse")]
     {
         use std::path::Path;
-        let _ = is_http_endpoint;
+        // Sandbox path. Reaching here means `in_memory == true` (the
+        // remote-http branch above already returned for the network
+        // case, and the not(remote-http) branch exited if the
+        // operator didn't ask for sandbox).
+        let _ = endpoint;
+        println!("Mounting at {mountpoint} via in-memory sandbox (cache_mode: {cache_mode})");
         let shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
-        let mut compositions = kiseki_composition::composition::CompositionStore::new();
+        let compositions = kiseki_composition::composition::CompositionStore::new();
         compositions.add_namespace(kiseki_composition::namespace::Namespace {
             id: namespace,
             tenant_id: tenant,
@@ -209,7 +251,9 @@ fn handle_mount(args: &[String]) {
     }
     #[cfg(not(feature = "fuse"))]
     {
-        let _ = (read_write, endpoint, is_http_endpoint, tenant, namespace);
+        let _ = (
+            read_write, endpoint, in_memory, tenant, namespace, mountpoint, cache_mode,
+        );
         eprintln!("FUSE support not compiled — rebuild with --features fuse");
         std::process::exit(1);
     }

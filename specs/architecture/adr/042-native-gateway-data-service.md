@@ -295,7 +295,7 @@ trait NativeTransportClient<C: NativeGatewayServiceClient> {
 
 **Auth**: mTLS via tokio-rustls (same setup as the Raft fabric). SAN canonicalization at the connection-acceptance hook before the first frame is parsed.
 
-**Listen address**: `KISEKI_NATIVE_TCP_ADDR`, default 9101.
+**Listen address**: `KISEKI_NATIVE_TCP_ADDR`, default `0.0.0.0:9103`. (Originally specified as 9101 — see commit 51c48aa on 2026-05-07; that collided with ADR-021 advisory which also defaults to 9101. Port plan is 9100 data-gRPC, 9101 advisory, 9102 advisory-stream, 9103 native TCP-framed.)
 
 **Latency class**: `Low` (~1.5–2× tax over the in-process floor; per the ADR-041 fabric measurements).
 
@@ -495,7 +495,7 @@ After phase 3, emit the structured startup banner:
 [transport.native] available bindings (in priority order):
   1. libfabric/cxi    (latency_class=Rdma, addr=cxi0:0,    Slingshot+Cassini detected)
   2. ibverbs          (latency_class=Rdma, addr=mlx5_0:1,  InfiniBand HDR detected, rdma-cm TLS ok)
-  3. tcp-framed       (latency_class=Low,  addr=10.0.0.42:9101)
+  3. tcp-framed       (latency_class=Low,  addr=10.0.0.42:9103)
   4. grpc-h2          (latency_class=Std,  addr=10.0.0.42:9100)
 [transport.native] all 4 listening; clients select per their topology
 [transport.native] override available via KISEKI_NATIVE_TRANSPORT={grpc|tcp|ibverbs|libfabric|auto}

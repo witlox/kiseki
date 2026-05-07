@@ -225,11 +225,17 @@ jobs:
         with:
           key: client-${{ matrix.arch }}
 
-      - name: Build client library and CLI (FFI + FUSE)
+      - name: Build client library and CLI (FFI + FUSE + remote-http)
         run: |
           sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml
-          cargo build --release -p kiseki-client --features ffi,fuse
-          cargo build --release --bin kiseki-client --features ffi,fuse
+          # remote-http: required so `kiseki-client mount --endpoint http://…`
+          # actually talks to a cluster instead of refusing the
+          # network endpoint up front (see kiseki_client.rs handle_mount).
+          # Adds reqwest+rustls to the FFI/cdylib path; acceptable for
+          # the released CLI but kept opt-in at the crate level for
+          # downstream Python/C++ wrappers.
+          cargo build --release -p kiseki-client --features ffi,fuse,remote-http
+          cargo build --release --bin kiseki-client --features ffi,fuse,remote-http
 
       - name: Package
         run: |

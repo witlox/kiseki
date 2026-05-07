@@ -70,12 +70,18 @@ variable "profile" {
       "gpu"       — ML training scenario. 3 × c3-standard-44 storage (4 × local NVMe,
                     Tier_1 50 Gbps), 2 × a2-highgpu-1g GPU clients (1 × A100 each).
                     Runs perf-suite-gpu.sh against the cuFile/GDS path.
+      "compact"   — short manual matrix. 3 × c3-standard-44-lssd storage
+                    (8 × local NVMe partitions / node, ~12 TB combined) +
+                    2 × c3-standard-44 plain CPU clients. No GPU, no
+                    cuFile path. Cheaper than `transport` (~$15/hr vs
+                    ~$25/hr) for ad-hoc 3+2 perf runs. Same client
+                    image + setup script as `transport`.
   EOT
   type        = string
   default     = "default"
   validation {
-    condition     = contains(["default", "transport", "gpu"], var.profile)
-    error_message = "profile must be one of: default, transport, gpu"
+    condition     = contains(["default", "transport", "gpu", "compact"], var.profile)
+    error_message = "profile must be one of: default, transport, gpu, compact"
   }
 }
 
@@ -89,9 +95,9 @@ locals {
       label              = "default"
       storage_count      = 6
       storage_machine    = "c3-standard-22-lssd" # bundled NVMe (no scratch_disk blocks)
-      storage_scratch     = 0                     # lssd: SSDs are bundled, not scratch
-      storage_nvme_count  = 4                     # device path count for raw_devices
-      storage_tier_1     = false # c3-standard-22-lssd (22 vCPU) is below Tier_1 floor; 6×23 Gbps aggregate
+      storage_scratch    = 0                     # lssd: SSDs are bundled, not scratch
+      storage_nvme_count = 4                     # device path count for raw_devices
+      storage_tier_1     = false                 # c3-standard-22-lssd (22 vCPU) is below Tier_1 floor; 6×23 Gbps aggregate
       client_count       = 3
       client_machine     = "c3-standard-22"
       client_cache_gb    = 200
@@ -105,8 +111,8 @@ locals {
       label              = "transport"
       storage_count      = 3
       storage_machine    = "c3-standard-88-lssd" # bundled NVMe
-      storage_scratch     = 0
-      storage_nvme_count  = 16 # c3-standard-88-lssd bundles 16 partitions
+      storage_scratch    = 0
+      storage_nvme_count = 16 # c3-standard-88-lssd bundles 16 partitions
       storage_tier_1     = true
       client_count       = 3
       client_machine     = "c3-standard-44"
@@ -121,8 +127,8 @@ locals {
       label              = "gpu"
       storage_count      = 3
       storage_machine    = "c3-standard-44-lssd" # bundled NVMe
-      storage_scratch     = 0
-      storage_nvme_count  = 8 # c3-standard-44-lssd bundles 8 partitions
+      storage_scratch    = 0
+      storage_nvme_count = 8 # c3-standard-44-lssd bundles 8 partitions
       storage_tier_1     = true
       client_count       = 2
       client_machine     = "a2-highgpu-1g"
@@ -133,6 +139,22 @@ locals {
       client_image = "deeplearning-platform-release/common-cu123-debian-11"
       client_setup = "setup-gpu-client.sh"
       bench_suite  = "perf-suite-gpu.sh"
+    }
+    compact = {
+      label              = "compact"
+      storage_count      = 3
+      storage_machine    = "c3-standard-44-lssd" # bundled NVMe (same as `gpu`)
+      storage_scratch    = 0
+      storage_nvme_count = 8 # c3-standard-44-lssd bundles 8 partitions
+      storage_tier_1     = true
+      client_count       = 2
+      client_machine     = "c3-standard-44"
+      client_cache_gb    = 100
+      client_tier_1      = true
+      client_gpu         = false
+      client_image       = "rocky-linux-cloud/rocky-linux-9"
+      client_setup       = "setup-perf-client.sh"
+      bench_suite        = "perf-suite-transport.sh" # same suite — protocol matrix
     }
   }
 
@@ -198,7 +220,7 @@ resource "google_compute_firewall" "services" {
   network = google_compute_network.net.name
   allow {
     protocol = "tcp"
-    ports    = ["2049", "9000", "9090", "9100", "9101", "9102"]
+    ports    = ["2049", "9000", "9090", "9100", "9101", "9102", "9103"]
   }
   source_ranges = ["0.0.0.0/0"]
   target_tags   = ["kiseki-storage"]
@@ -252,10 +274,10 @@ resource "google_compute_instance" "storage" {
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-raw-storage.sh", {
-    node_id      = count.index + 1
-    node_ip      = local.storage_ips[count.index]
-    all_peers    = local.all_peers
-    raft_port    = local.raft_port
+    node_id         = count.index + 1
+    node_ip         = local.storage_ips[count.index]
+    all_peers       = local.all_peers
+    raft_port       = local.raft_port
     raw_devices     = local.raw_devices
     device_class    = "nvme"
     meta_dir        = "/var/lib/kiseki"

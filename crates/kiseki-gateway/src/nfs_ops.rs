@@ -56,6 +56,19 @@ enum HandleEntry {
         namespace_id: NamespaceId,
         tenant_id: OrgId,
     },
+    /// Subdirectory created via `mkdir` (NFSv3 MKDIR / NFSv4 CREATE
+    /// type=NF4DIR). Behaves like `Root` for handle-lookup purposes
+    /// (no composition_id, namespace+tenant ownership) but is
+    /// distinct so `getattr` reports `FileType::Directory` and
+    /// readdir routes correctly. Pre-2026-05-07 the mkdir path
+    /// minted the 32-byte handle (`0xFE` marker byte) but never
+    /// registered it in `HandleRegistry::handles`, so every
+    /// follow-up op (kernel does GETATTR on the freshly-created
+    /// handle to verify) returned `NFS3ERR_BADHANDLE` → errno 521.
+    Directory {
+        namespace_id: NamespaceId,
+        tenant_id: OrgId,
+    },
     File {
         namespace_id: NamespaceId,
         tenant_id: OrgId,
@@ -148,6 +161,10 @@ impl HandleRegistry {
             HandleEntry::Root {
                 namespace_id,
                 tenant_id,
+            }
+            | HandleEntry::Directory {
+                namespace_id,
+                tenant_id,
             } => Some((*namespace_id, *tenant_id, None)),
             HandleEntry::File {
                 namespace_id,
@@ -161,6 +178,35 @@ impl HandleRegistry {
     pub fn is_root(&self, fh: &FileHandle) -> bool {
         let handles = self.handles.lock().lock_or_die("nfs_ops.unknown");
         matches!(handles.get(fh), Some(HandleEntry::Root { .. }))
+    }
+
+    /// Check if a handle is a directory (root *or* subdirectory).
+    /// Used by `lookup_by_name` to set the right `FileType` on
+    /// the returned attrs and by NFSv4 `getattr` to decide
+    /// `FATTR4_TYPE`.
+    pub fn is_directory(&self, fh: &FileHandle) -> bool {
+        let handles = self.handles.lock().lock_or_die("nfs_ops.unknown");
+        matches!(
+            handles.get(fh),
+            Some(
+                HandleEntry::Root { .. } | HandleEntry::Directory { .. } | HandleEntry::PseudoRoot
+            ),
+        )
+    }
+
+    /// Register a subdirectory handle minted by `mkdir`. The handle
+    /// bytes are produced by the caller (deterministic UUIDv5 with a
+    /// `0xFE` marker so the byte pattern is distinguishable from
+    /// `Root` handles' `0xFF` marker), but only landing it in the
+    /// registry makes follow-up ops resolve.
+    pub fn register_dir_handle(&self, fh: FileHandle, namespace_id: NamespaceId, tenant_id: OrgId) {
+        self.handles.lock().lock_or_die("nfs_ops.unknown").insert(
+            fh,
+            HandleEntry::Directory {
+                namespace_id,
+                tenant_id,
+            },
+        );
     }
 
     /// Repoint a `File` handle entry at a new `composition_id`.
@@ -524,16 +570,31 @@ impl<G: GatewayOps> NfsContext<G> {
 
     /// Look up a file by name in the namespace. Returns handle + attrs.
     pub async fn lookup_by_name(&self, name: &str) -> Option<(FileHandle, NfsAttrs)> {
-        // 1) NFS-CREATE'd files are tracked in `dir_index`.
+        // 1) NFS-CREATE'd files and `mkdir`'d subdirs are tracked in
+        // `dir_index`. The index alone doesn't carry type info — we
+        // ask the handle registry whether the resolved handle is a
+        // directory and pick the right mode + nlink + size shape.
         if let Some(entry) = self.dir_index.lookup(self.namespace_id, name) {
-            let attrs = NfsAttrs {
-                file_type: FileType::Regular,
-                size: entry.size,
-                mode: 0o644,
-                nlink: 1,
-                uid: 0,
-                gid: 0,
-                fileid: u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+            let attrs = if self.handles.is_directory(&entry.file_handle) {
+                NfsAttrs {
+                    file_type: FileType::Directory,
+                    size: 4096,
+                    mode: 0o755,
+                    nlink: 2,
+                    uid: 0,
+                    gid: 0,
+                    fileid: u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+                }
+            } else {
+                NfsAttrs {
+                    file_type: FileType::Regular,
+                    size: entry.size,
+                    mode: 0o644,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    fileid: u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+                }
             };
             return Some((entry.file_handle, attrs));
         }
@@ -664,6 +725,14 @@ impl<G: GatewayOps> NfsContext<G> {
             CompositionId(uuid::Uuid::nil()), // dirs have no composition
             0,
         );
+
+        // Register the new fh in the handle registry. Pre-2026-05-07
+        // the dir_index insert above was the only effect — any
+        // follow-up op (kernel does GETATTR on the freshly-returned
+        // handle to verify) would `handles.lookup(&fh)` and miss,
+        // returning `NFS3ERR_BADHANDLE` → kernel errno 521.
+        self.handles
+            .register_dir_handle(fh, self.namespace_id, self.tenant_id);
 
         Ok((
             fh,

@@ -768,28 +768,29 @@ async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
     Path(bucket): Path<String>,
 ) -> axum::response::Response {
-    // Check and insert bucket — scope the MutexGuard so it is dropped
-    // before any `.await` point, keeping the future `Send`.
-    let already_exists = {
-        let mut buckets = state.buckets.lock().lock_or_die("s3_server.buckets");
+    // Existence check first — if the bucket name is already cached
+    // we never touch the namespace path. Scope the MutexGuard so it
+    // is dropped before any `.await` point.
+    {
+        let buckets = state.buckets.lock().lock_or_die("s3_server.buckets");
         if buckets.contains(&bucket) {
-            true
-        } else {
-            buckets.insert(bucket.clone());
-            false
+            return s3_error_response(
+                StatusCode::CONFLICT,
+                "BucketAlreadyExists",
+                "The requested bucket name is not available.",
+            );
         }
-    };
-
-    if already_exists {
-        return s3_error_response(
-            StatusCode::CONFLICT,
-            "BucketAlreadyExists",
-            "The requested bucket name is not available.",
-        );
     }
 
-    // Register the namespace in the composition store so that subsequent
-    // PUT object requests can find it (fixes "namespace not found" 500).
+    // Register the namespace BEFORE inserting into `state.buckets`.
+    // Original ordering (insert-then-ensure) leaked the bucket name on
+    // a partial `ensure_namespace` failure: the cached name made
+    // subsequent `create_bucket` short-circuit with `BucketAlreadyExists`
+    // while every `PutObject` against the same name 404'd because the
+    // namespace was never actually registered. Observed on the
+    // 2026-05-07 GCP compact run — `curl -sf … &` perf scripts ate
+    // the 404s and the bug looked like a perf measurement until a
+    // canary HEAD revealed empty objects.
     let ns_id = namespace_from_bucket(&bucket);
     if let Err(e) = state
         .gateway
@@ -799,7 +800,25 @@ async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
-    StatusCode::OK.into_response()
+    // Namespace is registered (locally + replicated). Now claim the
+    // name. A concurrent `create_bucket` for the same name racing
+    // through `ensure_namespace` is benign because `add_namespace` is
+    // idempotent on the namespace-id; whichever caller wins the
+    // `buckets.insert` race below returns 200, the other returns 409.
+    let inserted = {
+        let mut buckets = state.buckets.lock().lock_or_die("s3_server.buckets");
+        buckets.insert(bucket)
+    };
+
+    if inserted {
+        StatusCode::OK.into_response()
+    } else {
+        s3_error_response(
+            StatusCode::CONFLICT,
+            "BucketAlreadyExists",
+            "The requested bucket name is not available.",
+        )
+    }
 }
 
 /// `DELETE /<bucket>` — delete a bucket. Returns 204 or 404.
