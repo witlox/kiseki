@@ -150,19 +150,17 @@ pub async fn dispatch_verb(
                 Err(status) => err_outcome("get_object", &status),
             }
         }
-        "delete_object" => unary_verb!(
-            "delete_object",
-            req_meta,
-            |req: np::DeleteObjectRequest| server.delete_object(principal, req)
-        ),
+        "delete_object" => {
+            unary_verb!("delete_object", req_meta, |req: np::DeleteObjectRequest| {
+                server.delete_object(principal, req)
+            })
+        }
         "head_object" => unary_verb!("head_object", req_meta, |req: np::HeadObjectRequest| {
             server.head_object(principal, req)
         }),
-        "list_objects" => unary_verb!(
-            "list_objects",
-            req_meta,
-            |req: np::ListObjectsRequest| server.list_objects(principal, req)
-        ),
+        "list_objects" => unary_verb!("list_objects", req_meta, |req: np::ListObjectsRequest| {
+            server.list_objects(principal, req)
+        }),
         "lookup_by_name" => unary_verb!(
             "lookup_by_name",
             req_meta,
@@ -185,19 +183,19 @@ pub async fn dispatch_verb(
             |req: np::AbortMultipartRequest| server.abort_multipart(principal, req)
         ),
         // ---------------- Lease ----------------
-        "acquire_lease" => unary_verb!(
-            "acquire_lease",
-            req_meta,
-            |req: np::AcquireLeaseRequest| server.acquire_lease(principal, req)
-        ),
+        "acquire_lease" => {
+            unary_verb!("acquire_lease", req_meta, |req: np::AcquireLeaseRequest| {
+                server.acquire_lease(principal, req)
+            })
+        }
         "renew_lease" => unary_verb!("renew_lease", req_meta, |req: np::RenewLeaseRequest| {
             server.renew_lease(principal, req)
         }),
-        "release_lease" => unary_verb!(
-            "release_lease",
-            req_meta,
-            |req: np::ReleaseLeaseRequest| server.release_lease(principal, req)
-        ),
+        "release_lease" => {
+            unary_verb!("release_lease", req_meta, |req: np::ReleaseLeaseRequest| {
+                server.release_lease(principal, req)
+            })
+        }
         // ---------------- DEK fetch ----------------
         "fetch_dek" => unary_verb!("fetch_dek", req_meta, |req: np::FetchDekRequest| {
             server.fetch_dek(principal, req)
@@ -208,11 +206,9 @@ pub async fn dispatch_verb(
             |req: np::BatchFetchDekRequest| server.batch_fetch_dek(principal, req)
         ),
         // ---------------- Topology ----------------
-        "get_topology" => unary_verb!(
-            "get_topology",
-            req_meta,
-            |req: np::GetTopologyRequest| server.get_topology(principal, req)
-        ),
+        "get_topology" => unary_verb!("get_topology", req_meta, |req: np::GetTopologyRequest| {
+            server.get_topology(principal, req)
+        }),
         // No-principal cluster-wide flush.
         "fsync" => match server.fsync().await {
             Ok(resp) => match postcard::to_allocvec(&resp) {
@@ -338,8 +334,7 @@ mod tests {
             data: Vec::new(),
         };
         let put_meta = postcard::to_allocvec(&put_req).unwrap();
-        let (s, _, _) =
-            dispatch_verb(&server, &principal, "put_object", &put_meta, b"value").await;
+        let (s, _, _) = dispatch_verb(&server, &principal, "put_object", &put_meta, b"value").await;
         assert_eq!(s, WireStatus::Ok);
 
         // GET via dispatch: lookup by name.
@@ -367,8 +362,7 @@ mod tests {
     async fn unknown_verb_returns_unknown_verb_with_tag_in_meta() {
         let server = make_server().await;
         let principal = anon_principal();
-        let (status, meta, bulk) =
-            dispatch_verb(&server, &principal, "not_a_verb", &[], &[]).await;
+        let (status, meta, bulk) = dispatch_verb(&server, &principal, "not_a_verb", &[], &[]).await;
         assert_eq!(status, WireStatus::UnknownVerb);
         assert_eq!(meta, b"not_a_verb");
         assert!(bulk.is_empty());
@@ -388,8 +382,7 @@ mod tests {
     async fn fsync_dispatches_without_principal_or_body() {
         let server = make_server().await;
         let principal = anon_principal();
-        let (status, meta, bulk) =
-            dispatch_verb(&server, &principal, "fsync", &[], &[]).await;
+        let (status, meta, bulk) = dispatch_verb(&server, &principal, "fsync", &[], &[]).await;
         assert_eq!(status, WireStatus::Ok);
         assert!(bulk.is_empty());
         let _resp: np::FsyncResponse = postcard::from_bytes(&meta).expect("decode");

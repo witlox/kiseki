@@ -43,12 +43,11 @@ use crate::KisekiWorld;
 // Helpers
 // ---------------------------------------------------------------------
 
-fn cluster_guard(
-    w: &mut KisekiWorld,
-) -> &mut tokio::sync::OwnedMutexGuard<ClusterHarness> {
-    w.native.cluster_guard.as_mut().expect(
-        "BDD: `cluster_guard` accessed before `Given a Kiseki cluster with tenant ...`",
-    )
+fn cluster_guard(w: &mut KisekiWorld) -> &mut tokio::sync::OwnedMutexGuard<ClusterHarness> {
+    w.native
+        .cluster_guard
+        .as_mut()
+        .expect("BDD: `cluster_guard` accessed before `Given a Kiseki cluster with tenant ...`")
 }
 
 fn cluster_ref(w: &KisekiWorld) -> &ClusterHarness {
@@ -98,10 +97,8 @@ fn ctrl(tenant: OrgId, idem: Option<&[u8]>, workflow: &str) -> np::ControlFields
         tenant_id: Some(kiseki_proto::v1::OrgId {
             value: tenant.0.to_string(),
         }),
-        idempotency_key: idem.map_or_else(
-            || uuid::Uuid::new_v4().as_bytes().to_vec(),
-            <[u8]>::to_vec,
-        ),
+        idempotency_key: idem
+            .map_or_else(|| uuid::Uuid::new_v4().as_bytes().to_vec(), <[u8]>::to_vec),
         workflow_ref: workflow.to_string(),
         cache_hint: None,
         conditional: None,
@@ -140,10 +137,8 @@ async fn register_namespace_via_s3(
         let _ = root.add(c);
     }
     let _ = root; // root is used by use_preconfigured_tls below.
-    let id = reqwest::Identity::from_pem(
-        format!("{}\n{}", cert.cert_pem, cert.key_pem).as_bytes(),
-    )
-    .map_err(|e| format!("identity: {e}"))?;
+    let id = reqwest::Identity::from_pem(format!("{}\n{}", cert.cert_pem, cert.key_pem).as_bytes())
+        .map_err(|e| format!("identity: {e}"))?;
     let http = reqwest::Client::builder()
         .add_root_certificate(
             reqwest::Certificate::from_pem(certs.ca_pem_text().as_bytes())
@@ -198,11 +193,7 @@ async fn given_tenant_cert(w: &mut KisekiWorld, tenant: String, _san: String) {
 }
 
 #[given(regex = r#"^namespace "([^"]*)" registered in tenant "([^"]*)"$"#)]
-async fn given_namespace_registered(
-    w: &mut KisekiWorld,
-    namespace: String,
-    tenant: String,
-) {
+async fn given_namespace_registered(w: &mut KisekiWorld, namespace: String, tenant: String) {
     let tenant_id = w.native.tenant_id_for(&tenant);
     // Buckets are unique per scenario to avoid collisions across the
     // singleton-shared cluster.
@@ -259,11 +250,7 @@ async fn given_native_client_configured(w: &mut KisekiWorld, name: String) {
 #[when(
     regex = r#"^client-a sends a native Write with payload\s+tenant_id="([^"]*)" and namespace_id="([^"]*)"$"#
 )]
-async fn when_client_a_writes_payload(
-    w: &mut KisekiWorld,
-    tenant: String,
-    namespace: String,
-) {
+async fn when_client_a_writes_payload(w: &mut KisekiWorld, tenant: String, namespace: String) {
     let tenant_id = w.native.tenant_id_for(&tenant);
     let ns = *w
         .native
@@ -285,9 +272,9 @@ async fn when_client_a_writes_payload(
     match grpc.put_object(req).await {
         Ok(resp) => {
             let resp = resp.into_inner();
-            w.native.last_composition = resp
-                .composition_id
-                .map(|c| kiseki_common::ids::CompositionId(uuid::Uuid::parse_str(&c.value).unwrap()));
+            w.native.last_composition = resp.composition_id.map(|c| {
+                kiseki_common::ids::CompositionId(uuid::Uuid::parse_str(&c.value).unwrap())
+            });
             w.native.last_etag = resp.etag.map(|e| e.value);
             w.native.last_status = None;
         }
@@ -298,9 +285,7 @@ async fn when_client_a_writes_payload(
     }
 }
 
-#[then(
-    regex = r#"^the proto-handler validates the SAN URI carries\s+"([^"]*)"$"#
-)]
+#[then(regex = r#"^the proto-handler validates the SAN URI carries\s+"([^"]*)"$"#)]
 async fn then_san_validated(w: &mut KisekiWorld, expected_san: String) {
     // Witness assertion: the cert minted in the Given step has this
     // SAN, AND the previous When step (PUT) succeeded — implying the
@@ -355,19 +340,18 @@ async fn given_client_a_san(w: &mut KisekiWorld, san: String) {
     // assertion (rejected before any composition or chunk lookup) is
     // strictly stronger: rejection at cert-mint never even reached
     // the wire.
-    let cert = match std::panic::catch_unwind(|| {
-        certs.mint_cert_with_raw_san("kiseki-mismatch", &san)
-    }) {
-        Ok(c) => c,
-        Err(_) => {
-            w.native.last_status = Some(tonic::Status::permission_denied(format!(
-                "san_canonicalization_mismatch: rcgen rejected SAN URI {san:?} \
+    let cert =
+        match std::panic::catch_unwind(|| certs.mint_cert_with_raw_san("kiseki-mismatch", &san)) {
+            Ok(c) => c,
+            Err(_) => {
+                w.native.last_status = Some(tonic::Status::permission_denied(format!(
+                    "san_canonicalization_mismatch: rcgen rejected SAN URI {san:?} \
                  (non-ASCII or otherwise invalid IA5String — equivalent to the \
                  proto-handler rejection one layer down)",
-            )));
-            return;
-        }
-    };
+                )));
+                return;
+            }
+        };
     // The TLS handshake must still succeed (the harness's CA signs
     // the cert; the cert lists `localhost` so SNI matches). The
     // SanInterceptor's canonicalization rejects on canonical-form
@@ -441,7 +425,9 @@ async fn when_client_a_writes_with_tenant(w: &mut KisekiWorld, tenant: String) {
     // string that may not be a clean UUID (for trailing-slash test).
     let ctrl_msg = if tenant.ends_with('/') {
         np::ControlFields {
-            tenant_id: Some(kiseki_proto::v1::OrgId { value: tenant.clone() }),
+            tenant_id: Some(kiseki_proto::v1::OrgId {
+                value: tenant.clone(),
+            }),
             idempotency_key: uuid::Uuid::new_v4().as_bytes().to_vec(),
             workflow_ref: String::new(),
             cache_hint: None,
@@ -541,11 +527,7 @@ async fn given_inline_threshold(w: &mut KisekiWorld, kib: u64) {
 }
 
 #[given(regex = r#"^the inline threshold is (\d+) KiB and per-stream cap is (\d+) MiB$"#)]
-async fn given_inline_threshold_and_stream_cap(
-    w: &mut KisekiWorld,
-    kib: u64,
-    mib: u64,
-) {
+async fn given_inline_threshold_and_stream_cap(w: &mut KisekiWorld, kib: u64, mib: u64) {
     w.native.inline_threshold_bytes = Some(kib * 1024);
     w.native.per_stream_cap_bytes = Some(mib * 1024 * 1024);
 }
@@ -615,7 +597,10 @@ async fn then_server_ok_new_composition(w: &mut KisekiWorld) {
 #[then(regex = r#"^a follow-up native Read returns the same (\d+) KiB$"#)]
 async fn then_follow_up_read_matches(w: &mut KisekiWorld, kib: u64) {
     let tenant_id = w.native.client("client-a").tenant_id;
-    let comp = w.native.last_composition.expect("prior PUT must have succeeded");
+    let comp = w
+        .native
+        .last_composition
+        .expect("prior PUT must have succeeded");
     let ns = *w.native.namespaces.values().next().expect("namespace");
     let client = w.native.client("client-a").client.clone();
     let mut grpc = client.rpc_client();
@@ -630,11 +615,7 @@ async fn then_follow_up_read_matches(w: &mut KisekiWorld, kib: u64) {
             },
         )),
     });
-    let resp = grpc
-        .get_object(req)
-        .await
-        .expect("native GET")
-        .into_inner();
+    let resp = grpc.get_object(req).await.expect("native GET").into_inner();
     assert_eq!(resp.size, kib * 1024);
     assert_eq!(resp.data.len(), (kib * 1024) as usize);
     assert!(resp.data.iter().all(|&b| b == 0x42));
@@ -648,9 +629,10 @@ async fn when_streaming_write_open(w: &mut KisekiWorld, mib: u64) {
     // then issues a unary PUT (the server's PutObjectStream collapses
     // to put_object — a known limitation for v1, called out in
     // server.rs).
-    w.native
-        .audit_security_events
-        .push(("streaming_write_pending_bytes".into(), Some(mib.to_string())));
+    w.native.audit_security_events.push((
+        "streaming_write_pending_bytes".into(),
+        Some(mib.to_string()),
+    ));
 }
 
 #[when(regex = r#"^streams the (\d+) MiB across multiple gRPC frames$"#)]
@@ -728,12 +710,7 @@ async fn then_no_partial_state(w: &mut KisekiWorld) {
 #[when(
     regex = r#"^client-a writes (\d+) KiB to "([^"]*)" with\s+idempotency_key="([^"]*)" and the response is lost in transit$"#
 )]
-async fn when_writes_with_idem_lost(
-    w: &mut KisekiWorld,
-    kib: u64,
-    path: String,
-    idem: String,
-) {
+async fn when_writes_with_idem_lost(w: &mut KisekiWorld, kib: u64, path: String, idem: String) {
     let tenant_id = w.native.client("client-a").tenant_id;
     let ns = *w.native.namespaces.values().next().expect("namespace");
     let body = vec![0x77u8; (kib * 1024) as usize];
@@ -755,9 +732,7 @@ async fn when_writes_with_idem_lost(
         .map(|c| kiseki_common::ids::CompositionId(uuid::Uuid::parse_str(&c.value).unwrap()));
 }
 
-#[when(
-    regex = r#"^client-a retries with the same idempotency_key="([^"]*)"\s+within 5 minutes$"#
-)]
+#[when(regex = r#"^client-a retries with the same idempotency_key="([^"]*)"\s+within 5 minutes$"#)]
 async fn when_retry_same_idem(w: &mut KisekiWorld, idem: String) {
     let tenant_id = w.native.client("client-a").tenant_id;
     let ns = *w.native.namespaces.values().next().expect("namespace");
@@ -833,10 +808,9 @@ async fn then_chunk_store_one_write(_w: &mut KisekiWorld) {
 
 #[when(regex = r#"^streams (\d+) MiB$"#)]
 async fn when_streams_n_mib(w: &mut KisekiWorld, mib: u64) {
-    w.native.audit_security_events.push((
-        "stream_partial_mib".into(),
-        Some(mib.to_string()),
-    ));
+    w.native
+        .audit_security_events
+        .push(("stream_partial_mib".into(), Some(mib.to_string())));
 }
 
 #[when("the connection drops before CommitStream")]
@@ -882,9 +856,7 @@ async fn then_server_fresh_write(_w: &mut KisekiWorld) {
 // @posix scenarios — return Status::unimplemented today
 // ---------------------------------------------------------------------
 
-#[when(
-    regex = r#"^client-a opens inode for "([^"]*)" in Write mode$"#
-)]
+#[when(regex = r#"^client-a opens inode for "([^"]*)" in Write mode$"#)]
 async fn when_open_inode_write_mode(w: &mut KisekiWorld, _path: String) {
     let tenant_id = w.native.client("client-a").tenant_id;
     let ns = *w.native.namespaces.values().next().expect("namespace");
@@ -907,9 +879,7 @@ async fn when_posix_write(_w: &mut KisekiWorld, _kib: u64, _off: u64) {
     // POSIX path returns Unimplemented today — no-op step.
 }
 
-#[then(
-    regex = r#"^a concurrent reader opening the same inode does NOT yet see\s+the (\d+) KiB$"#
-)]
+#[then(regex = r#"^a concurrent reader opening the same inode does NOT yet see\s+the (\d+) KiB$"#)]
 async fn then_concurrent_reader_no_see(_w: &mut KisekiWorld, _kib: u64) {
     // Witnessed by the POSIX surface returning Unimplemented — there
     // is no commit semantic to violate. The behavioral assertion is
@@ -940,10 +910,11 @@ async fn then_concurrent_reader_sees(w: &mut KisekiWorld, _kib: u64) {
     // partial witness we can assert today. Full POSIX bridging
     // (Phase 2 follow-up) lights up the read-after-fsync path.
     assert!(
-        w.native.last_status.is_none() || matches!(
-            w.native.last_status.as_ref().map(tonic::Status::code),
-            Some(tonic::Code::Unimplemented)
-        ),
+        w.native.last_status.is_none()
+            || matches!(
+                w.native.last_status.as_ref().map(tonic::Status::code),
+                Some(tonic::Code::Unimplemented)
+            ),
         "Fsync must Ok or Unimplemented (POSIX bridging deferred): {:?}",
         w.native.last_status,
     );
@@ -958,7 +929,12 @@ async fn then_concurrent_reader_sees(w: &mut KisekiWorld, _kib: u64) {
 #[given(
     regex = r#"^namespace "([^"]*)" maps to shard S1 covering both\s+"([^"]*)" and "([^"]*)" directories$"#
 )]
-async fn given_namespace_shard_layout_two(_w: &mut KisekiWorld, _ns: String, _a: String, _b: String) {
+async fn given_namespace_shard_layout_two(
+    _w: &mut KisekiWorld,
+    _ns: String,
+    _a: String,
+    _b: String,
+) {
 }
 
 #[when(regex = r#"^client-a calls RenameWithinShard from "([^"]*)" to "([^"]*)"$"#)]
@@ -1009,9 +985,7 @@ async fn then_no_atomic_cross_shard(_w: &mut KisekiWorld) {}
 
 // --- @posix lease ---
 
-#[when(
-    regex = r#"^client-a calls AcquireLease\(inode="([^"]*)", mode=Write\)$"#
-)]
+#[when(regex = r#"^client-a calls AcquireLease\(inode="([^"]*)", mode=Write\)$"#)]
 async fn when_acquire_lease(w: &mut KisekiWorld, _inode: String) {
     let tenant_id = w.native.client("client-a").tenant_id;
     let ns = *w.native.namespaces.values().next().expect("namespace");
@@ -1027,10 +1001,9 @@ async fn when_acquire_lease(w: &mut KisekiWorld, _inode: String) {
     match grpc.acquire_lease(req).await {
         Ok(resp) => {
             let outcome = resp.into_inner().outcome.expect("outcome required");
-            w.native.audit_security_events.push((
-                "lease_outcome".into(),
-                Some(format!("{outcome:?}")),
-            ));
+            w.native
+                .audit_security_events
+                .push(("lease_outcome".into(), Some(format!("{outcome:?}"))));
             w.native.last_status = None;
         }
         Err(s) => w.native.last_status = Some(s),
@@ -1059,9 +1032,7 @@ async fn then_local_writes_no_coord(_w: &mut KisekiWorld) {
     // satisfied by the lease grant.
 }
 
-#[when(
-    regex = r#"^client-b calls AcquireLease\(inode="([^"]*)", mode=Write\)$"#
-)]
+#[when(regex = r#"^client-b calls AcquireLease\(inode="([^"]*)", mode=Write\)$"#)]
 async fn when_client_b_acquire(w: &mut KisekiWorld, _inode: String) {
     // Provision client-b on demand — same dial pattern as client-a.
     if !w.native.clients.contains_key("client-b") {
@@ -1190,9 +1161,7 @@ todo_step!(
 // the synthetic-topology shape exercises the same code paths and
 // catches the same regressions for v1.
 
-use kiseki_client::native::{
-    EdgeSelection, LocalCapabilities, Snapshot, TopologyCache,
-};
+use kiseki_client::native::{EdgeSelection, LocalCapabilities, Snapshot, TopologyCache};
 use kiseki_proto::native_contract as nc;
 use kiseki_transport::native::OperatorPin;
 
@@ -1224,9 +1193,7 @@ fn endpoints_from_phrase(phrase: &str, node_id: u64) -> Vec<nc::BindingEndpoint>
             let class = match id {
                 nc::BindingId::Grpc => nc::LatencyClass::Standard,
                 nc::BindingId::TcpFramed => nc::LatencyClass::Low,
-                nc::BindingId::Ibverbs | nc::BindingId::Libfabric { .. } => {
-                    nc::LatencyClass::Rdma
-                }
+                nc::BindingId::Ibverbs | nc::BindingId::Libfabric { .. } => nc::LatencyClass::Rdma,
             };
             let port = match id {
                 nc::BindingId::Grpc => 9100,
@@ -1243,20 +1210,14 @@ fn endpoints_from_phrase(phrase: &str, node_id: u64) -> Vec<nc::BindingEndpoint>
         .collect()
 }
 
-fn ensure_topology_cache(
-    w: &mut crate::world::native::NativeWorld,
-) -> Arc<TopologyCache> {
+fn ensure_topology_cache(w: &mut crate::world::native::NativeWorld) -> Arc<TopologyCache> {
     if w.topology_cache.is_none() {
         w.topology_cache = Some(Arc::new(TopologyCache::new()));
     }
     Arc::clone(w.topology_cache.as_ref().unwrap())
 }
 
-fn add_node_to_topology(
-    cache: &TopologyCache,
-    node_id: u64,
-    bindings: Vec<nc::BindingEndpoint>,
-) {
+fn add_node_to_topology(cache: &TopologyCache, node_id: u64, bindings: Vec<nc::BindingEndpoint>) {
     let mut snap = cache.snapshot();
     snap.nodes.push(kiseki_client::native::Node {
         node_id,
@@ -1307,8 +1268,7 @@ async fn given_local_capabilities(w: &mut KisekiWorld, available: String) {
     if lower.contains("ibverbs") || lower.contains("verbs") {
         supported.insert(nc::BindingId::Ibverbs);
     }
-    w.native.local_capabilities =
-        Some(LocalCapabilities::from_iter(supported.into_iter()));
+    w.native.local_capabilities = Some(LocalCapabilities::from_iter(supported.into_iter()));
 }
 
 #[when("the client opens connections to all four nodes for a multi-node operation")]
@@ -1344,11 +1304,7 @@ async fn when_open_connections_4node(w: &mut KisekiWorld) {
     w.native.edge_selections = selections;
 }
 
-fn assert_picked_for(
-    selections: &HashMap<u64, EdgeSelection>,
-    node_id: u64,
-    want: nc::BindingId,
-) {
+fn assert_picked_for(selections: &HashMap<u64, EdgeSelection>, node_id: u64, want: nc::BindingId) {
     let outcome = selections
         .get(&node_id)
         .unwrap_or_else(|| panic!("no edge selection captured for node-{node_id}"));
@@ -1361,9 +1317,7 @@ fn assert_picked_for(
             );
         }
         EdgeSelection::NoMatch { reason } => {
-            panic!(
-                "node-{node_id}: expected Match({want:?}), got NoMatch({reason:?})"
-            );
+            panic!("node-{node_id}: expected Match({want:?}), got NoMatch({reason:?})");
         }
     }
 }
@@ -1377,7 +1331,9 @@ async fn then_libfabric_for_first_pair(w: &mut KisekiWorld) {
     assert_picked_for(&w.native.edge_selections, 2, want);
 }
 
-#[then(regex = r#"^the client uses tcp-framed for node-3 \+ node-4 \(next-best mutually-supported\)$"#)]
+#[then(
+    regex = r#"^the client uses tcp-framed for node-3 \+ node-4 \(next-best mutually-supported\)$"#
+)]
 async fn then_tcp_framed_for_second_pair(w: &mut KisekiWorld) {
     assert_picked_for(&w.native.edge_selections, 3, nc::BindingId::TcpFramed);
     assert_picked_for(&w.native.edge_selections, 4, nc::BindingId::TcpFramed);
@@ -1465,7 +1421,9 @@ async fn given_cached_topology_version(w: &mut KisekiWorld, version: u64) {
     w.native.last_topology_version = Some(version);
 }
 
-#[given(regex = r#"^the cluster topology_version has advanced to (\d+) due to a leader change for shard (.+)$"#)]
+#[given(
+    regex = r#"^the cluster topology_version has advanced to (\d+) due to a leader change for shard (.+)$"#
+)]
 async fn given_cluster_advances_topology_version(
     w: &mut KisekiWorld,
     new_version: u64,
@@ -1474,11 +1432,15 @@ async fn given_cluster_advances_topology_version(
     // Stash the new version on the world for the When step to drive.
     // The cluster-side change is just notation here — we model the
     // observable from the client's POV (a higher trailer version).
-    w.native.namespaces.insert("__advanced_topology_version".into(),
-        kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(new_version as u128)));
+    w.native.namespaces.insert(
+        "__advanced_topology_version".into(),
+        kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(new_version as u128)),
+    );
 }
 
-#[when(regex = r#"^client-a sends a native Read whose response trailing metadata carries topology_version=(\d+)$"#)]
+#[when(
+    regex = r#"^client-a sends a native Read whose response trailing metadata carries topology_version=(\d+)$"#
+)]
 async fn when_read_carries_higher_topology_version(w: &mut KisekiWorld, trailer_version: u64) {
     let cache = w
         .native
@@ -1616,14 +1578,15 @@ async fn when_tcp_framed_listener_panics(w: &mut KisekiWorld) {
     let mut snap = cache.snapshot();
     snap.version += 1;
     if let Some(node) = snap.nodes.iter_mut().find(|n| n.node_id == 2) {
-        node.bindings.retain(|ep| {
-            ep.binding_id != kiseki_proto::native_contract::BindingId::TcpFramed
-        });
+        node.bindings
+            .retain(|ep| ep.binding_id != kiseki_proto::native_contract::BindingId::TcpFramed);
     }
     cache.replace(snap);
 }
 
-#[then(regex = r#"^the runtime emits kiseki_native_binding_listener_crashed_total\{binding="tcp-framed"\} and bumps topology_version$"#)]
+#[then(
+    regex = r#"^the runtime emits kiseki_native_binding_listener_crashed_total\{binding="tcp-framed"\} and bumps topology_version$"#
+)]
 async fn then_runtime_emits_metric_and_bumps_version(w: &mut KisekiWorld) {
     // The metric assertion is the runtime's responsibility (server-
     // side observability); the version bump is what the client
@@ -1666,16 +1629,12 @@ async fn then_new_work_routes_via_grpc(w: &mut KisekiWorld) {
     // remaining advertised binding). Assert via select_for_edge.
     use kiseki_proto::native_contract as nc;
     let cache = w.native.topology_cache.as_ref().unwrap().clone();
-    let local = w
-        .native
-        .local_capabilities
-        .clone()
-        .unwrap_or_else(|| {
-            kiseki_client::native::LocalCapabilities::from_iter([
-                nc::BindingId::Grpc,
-                nc::BindingId::TcpFramed,
-            ])
-        });
+    let local = w.native.local_capabilities.clone().unwrap_or_else(|| {
+        kiseki_client::native::LocalCapabilities::from_iter([
+            nc::BindingId::Grpc,
+            nc::BindingId::TcpFramed,
+        ])
+    });
     let snap = cache.snapshot();
     let node = snap.nodes.iter().find(|n| n.node_id == 2).unwrap();
     let target = nc::NodeBindings {
@@ -1701,7 +1660,9 @@ async fn then_new_work_routes_via_grpc(w: &mut KisekiWorld) {
     }
 }
 
-#[then("the 3 in-flight tcp-framed requests run to completion within KISEKI_NATIVE_DRAIN_BUDGET_MS")]
+#[then(
+    "the 3 in-flight tcp-framed requests run to completion within KISEKI_NATIVE_DRAIN_BUDGET_MS"
+)]
 async fn then_inflight_requests_complete_within_budget(w: &mut KisekiWorld) {
     // The pool reconciliation marked tcp-framed as draining
     // (`last_drained` count). The drain budget is advisory: by
@@ -1720,7 +1681,9 @@ async fn then_inflight_requests_complete_within_budget(w: &mut KisekiWorld) {
     );
 }
 
-#[then(regex = r#"^kiseki_native_client_binding_drain_total\{binding="tcp-framed", reason="listener_crashed"\} increments by (\d+)$"#)]
+#[then(
+    regex = r#"^kiseki_native_client_binding_drain_total\{binding="tcp-framed", reason="listener_crashed"\} increments by (\d+)$"#
+)]
 async fn then_drain_metric_increments(w: &mut KisekiWorld, expected: u64) {
     // The drain count is the observable outcome of
     // reconcile_with_topology. The Prometheus counter is the
@@ -1728,8 +1691,7 @@ async fn then_drain_metric_increments(w: &mut KisekiWorld, expected: u64) {
     // pool transitioned exactly N edges to drain mode.
     let drained = w.native.last_drained.unwrap_or(0);
     assert_eq!(
-        drained as u64,
-        expected,
+        drained as u64, expected,
         "drain count must match the binding-set diff",
     );
 }
@@ -1786,8 +1748,9 @@ async fn then_topology_bumps_and_endpoint_advertised(w: &mut KisekiWorld) {
     );
     let node = snap.nodes.iter().find(|n| n.node_id == 2).unwrap();
     assert!(
-        node.bindings.iter().any(|ep| ep.binding_id
-            == kiseki_proto::native_contract::BindingId::TcpFramed),
+        node.bindings
+            .iter()
+            .any(|ep| ep.binding_id == kiseki_proto::native_contract::BindingId::TcpFramed),
         "tcp-framed must be re-advertised on node-2 after restart",
     );
 }
@@ -1811,7 +1774,9 @@ async fn given_probe_timeout_configured(_w: &mut KisekiWorld, _ms: u64) {
     // No state to stash here — the Given is descriptive.
 }
 
-#[given(regex = r#"^the host has libibverbs installed but `/sys/class/infiniband/\*` is artificially blocked$"#)]
+#[given(
+    regex = r#"^the host has libibverbs installed but `/sys/class/infiniband/\*` is artificially blocked$"#
+)]
 async fn given_libibverbs_present_but_sysfs_blocked(_w: &mut KisekiWorld) {
     // Modeled by registering a HangingProbe for ibverbs in the
     // selector — same observable: the probe fails the §3.1 phase-1
@@ -1821,9 +1786,7 @@ async fn given_libibverbs_present_but_sysfs_blocked(_w: &mut KisekiWorld) {
 #[when("the server starts and runs phase-1 probes")]
 async fn when_server_runs_phase_1_probes(w: &mut KisekiWorld) {
     use kiseki_proto::native_contract::{BindingId, LatencyClass, ListenAddr};
-    use kiseki_transport::native::{
-        BindingProbe, BindingSelector, ProbeOutcome,
-    };
+    use kiseki_transport::native::{BindingProbe, BindingSelector, ProbeOutcome};
 
     /// Synthetic probes used by @binding-probe scenarios — keeps
     /// the BDD step from depending on real /sys + libibverbs
@@ -1873,9 +1836,7 @@ async fn when_server_runs_phase_1_probes(w: &mut KisekiWorld) {
     let sel = sel.with_probe_timeout(Duration::from_millis(10));
     let outcome = sel.plan().await;
     w.native.selector_outcome = Some(match outcome {
-        Ok((plan, report)) => {
-            crate::world::native::SelectorOutcomeStash::Success { plan, report }
-        }
+        Ok((plan, report)) => crate::world::native::SelectorOutcomeStash::Success { plan, report },
         Err(e) => crate::world::native::SelectorOutcomeStash::Failure(e),
     });
 }
@@ -1900,8 +1861,7 @@ async fn then_ibverbs_self_disqualifies(w: &mut KisekiWorld, _reason: String) {
                     // §3.1 phase-1 self-disqualify behavior the
                     // scenario asserts.
                     assert!(
-                        r.contains("probe_timeout_exceeded")
-                            || r.contains("no usable port"),
+                        r.contains("probe_timeout_exceeded") || r.contains("no usable port"),
                         "ibverbs unavailable reason: {reason}",
                     );
                 }
@@ -1914,7 +1874,9 @@ async fn then_ibverbs_self_disqualifies(w: &mut KisekiWorld, _reason: String) {
     }
 }
 
-#[then(regex = r#"^the startup banner enumerates: tcp-framed \(Available\), grpc-h2 \(Available\), ibverbs \(Unavailable\), libfabric \(per host\)$"#)]
+#[then(
+    regex = r#"^the startup banner enumerates: tcp-framed \(Available\), grpc-h2 \(Available\), ibverbs \(Unavailable\), libfabric \(per host\)$"#
+)]
 async fn then_banner_enumerates_per_binding(w: &mut KisekiWorld) {
     let outcome = w.native.selector_outcome.as_ref().expect("selector ran");
     if let crate::world::native::SelectorOutcomeStash::Success { plan, report } = outcome {
@@ -1947,7 +1909,9 @@ async fn then_server_starts_with_one_binding(w: &mut KisekiWorld) {
     }
 }
 
-#[then(regex = r#"^kiseki_native_binding_probe_duration_seconds\{binding="ibverbs"\} records the probe time$"#)]
+#[then(
+    regex = r#"^kiseki_native_binding_probe_duration_seconds\{binding="ibverbs"\} records the probe time$"#
+)]
 async fn then_probe_duration_recorded(_w: &mut KisekiWorld) {
     // The metric is observability follow-up wiring — the
     // selector's probe-completion already happens; emitting the
@@ -1998,9 +1962,7 @@ async fn when_server_runs_phase_3(w: &mut KisekiWorld) {
     sel.register(Box::new(AllUnavailable2));
     let outcome = sel.plan().await;
     w.native.selector_outcome = Some(match outcome {
-        Ok((plan, report)) => {
-            crate::world::native::SelectorOutcomeStash::Success { plan, report }
-        }
+        Ok((plan, report)) => crate::world::native::SelectorOutcomeStash::Success { plan, report },
         Err(e) => crate::world::native::SelectorOutcomeStash::Failure(e),
     });
 }
@@ -2021,7 +1983,9 @@ async fn then_server_exits_code_3(w: &mut KisekiWorld) {
             panic!("expected NoAvailableBindings, got: {other:?}")
         }
         crate::world::native::SelectorOutcomeStash::Success { .. } => {
-            panic!("selector succeeded unexpectedly when all bindings should have been Unavailable");
+            panic!(
+                "selector succeeded unexpectedly when all bindings should have been Unavailable"
+            );
         }
     }
 }
@@ -2032,9 +1996,7 @@ async fn then_ttl_fires_and_refreshes(_w: &mut KisekiWorld) {
     // The test rebuilds a TTL-shortened cache so the assertion runs
     // in milliseconds — same `TopologyCache::decide` → `TtlExpired`
     // path, just compressed time.
-    let short_ttl_cache = Arc::new(
-        TopologyCache::new().with_ttl(Duration::from_millis(50)),
-    );
+    let short_ttl_cache = Arc::new(TopologyCache::new().with_ttl(Duration::from_millis(50)));
     short_ttl_cache.replace(Snapshot {
         version: 5,
         nodes: Vec::new(),
@@ -2043,10 +2005,7 @@ async fn then_ttl_fires_and_refreshes(_w: &mut KisekiWorld) {
     tokio::time::sleep(Duration::from_millis(80)).await;
     let decision = short_ttl_cache.decide(5);
     assert!(
-        matches!(
-            decision,
-            kiseki_client::native::RefreshDecision::TtlExpired
-        ),
+        matches!(decision, kiseki_client::native::RefreshDecision::TtlExpired),
         "TTL must fire on its own clock independent of trailer mismatches; got {decision:?}",
     );
 }

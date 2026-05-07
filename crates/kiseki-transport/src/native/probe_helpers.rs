@@ -136,10 +136,7 @@ pub fn validate_candidate(path: &Path) -> PathOutcome {
 /// # Errors
 /// Returns the rejection diagnostics string if no path is usable.
 #[allow(clippy::missing_errors_doc)]
-pub fn resolve_system_library(
-    leaf: &str,
-    env_override: &str,
-) -> Result<PathBuf, String> {
+pub fn resolve_system_library(leaf: &str, env_override: &str) -> Result<PathBuf, String> {
     let mut rejections: Vec<String> = Vec::new();
 
     if let Ok(operator_path) = std::env::var(env_override) {
@@ -152,9 +149,7 @@ pub fn resolve_system_library(
                 ));
             }
             PathOutcome::RejectedUnsafe { path, reason } => {
-                return Err(format!(
-                    "{env_override}={path:?} rejected: {reason}",
-                ));
+                return Err(format!("{env_override}={path:?} rejected: {reason}",));
             }
         }
     }
@@ -216,9 +211,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn validate_candidate_returns_not_present_for_missing_path() {
-        let outcome = validate_candidate(Path::new(
-            "/this/path/should/not/exist/libfake.so.1",
-        ));
+        let outcome = validate_candidate(Path::new("/this/path/should/not/exist/libfake.so.1"));
         assert!(matches!(outcome, PathOutcome::NotPresent { .. }));
     }
 
@@ -232,8 +225,7 @@ mod tests {
         match outcome {
             PathOutcome::RejectedUnsafe { reason, .. } => {
                 assert!(
-                    reason.contains("owner uid")
-                        || reason.contains("not a regular file"),
+                    reason.contains("owner uid") || reason.contains("not a regular file"),
                     "reason: {reason}",
                 );
             }
@@ -241,9 +233,7 @@ mod tests {
             // is) the file passes ownership but may still be
             // group/world-writable depending on umask. Either
             // RejectedUnsafe path is acceptable.
-            other => panic!(
-                "expected RejectedUnsafe (non-root owner), got: {other:?}"
-            ),
+            other => panic!("expected RejectedUnsafe (non-root owner), got: {other:?}"),
         }
     }
 

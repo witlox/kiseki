@@ -31,9 +31,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::nfs_ops::NfsContext;
-use crate::nfs_xdr::{
-    encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter,
-};
+use crate::nfs_xdr::{encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter};
 use crate::ops::GatewayOps;
 
 /// MOUNT3 program number per IANA RPC program registry.

@@ -276,8 +276,7 @@ impl CompositionHydrator {
 
         let store: &CompositionStore = self.compositions.as_ref();
 
-        let prior_stuck_state =
-            store.with_storage_locked(|s| s.stuck_state().ok().flatten());
+        let prior_stuck_state = store.with_storage_locked(|s| s.stuck_state().ok().flatten());
 
         let mut staging = Staging::default();
         let mut last_applied_in_batch = self.last_applied_cache;

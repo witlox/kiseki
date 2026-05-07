@@ -89,9 +89,7 @@ pub fn serialize_signed(
     let body = postcard::to_allocvec(inner).map_err(|e| HandleTokenError::Encode(e.to_string()))?;
     let key_bytes = signing_keys
         .handle_token_key(inner.master_key_epoch)
-        .ok_or(HandleTokenError::KeyEpochUnknown(
-            inner.master_key_epoch.0,
-        ))?;
+        .ok_or(HandleTokenError::KeyEpochUnknown(inner.master_key_epoch.0))?;
 
     let mac_key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
     // HMAC over [schema_version || body] so the framing byte is bound.
@@ -135,9 +133,7 @@ pub fn verify_and_decode(
 
     let key_bytes = signing_keys
         .handle_token_key(inner.master_key_epoch)
-        .ok_or(HandleTokenError::KeyEpochUnknown(
-            inner.master_key_epoch.0,
-        ))?;
+        .ok_or(HandleTokenError::KeyEpochUnknown(inner.master_key_epoch.0))?;
     let mac_key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
     let mut signed_input = Vec::with_capacity(1 + body.len());
     signed_input.push(schema_version);

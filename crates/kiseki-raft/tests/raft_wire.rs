@@ -381,8 +381,7 @@ fn install_snapshot_with_kiseki_tag_prefix() {
     // The dispatcher decodes the outer `(String, payload_bytes)`
     // tuple from the request body; here we round-trip through
     // postcard with the typed shape and assert the tag survives.
-    let (tag, _back_env): (String, LocalEnv) =
-        postcard::from_bytes(&bytes).expect("decode tagged");
+    let (tag, _back_env): (String, LocalEnv) = postcard::from_bytes(&bytes).expect("decode tagged");
     assert_eq!(
         tag, "full_snapshot",
         "Kiseki Raft framing: install-snapshot tag is 'full_snapshot'"

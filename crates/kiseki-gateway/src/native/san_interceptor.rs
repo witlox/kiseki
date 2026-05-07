@@ -247,7 +247,9 @@ mod tests {
     }
     impl AuditSink for CollectingSink {
         fn emit_security_failure(&self, reason: &str, peer: Option<&str>) {
-            self.events.lock().push((reason.to_string(), peer.map(String::from)));
+            self.events
+                .lock()
+                .push((reason.to_string(), peer.map(String::from)));
         }
     }
 
@@ -283,12 +285,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cert_with_multiple_tenant_sans_rejected() {
         let der = cert_with_sans(vec![
-            rcgen::SanType::URI(
-                "spiffe://kiseki/tenant/org-a".try_into().unwrap(),
-            ),
-            rcgen::SanType::URI(
-                "spiffe://kiseki/tenant/org-b".try_into().unwrap(),
-            ),
+            rcgen::SanType::URI("spiffe://kiseki/tenant/org-a".try_into().unwrap()),
+            rcgen::SanType::URI("spiffe://kiseki/tenant/org-b".try_into().unwrap()),
         ]);
         let err = extract_canonical_tenant_san(&der).unwrap_err();
         assert!(matches!(err, InterceptError::MultipleTenantSans));

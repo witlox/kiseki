@@ -24,9 +24,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use kiseki_proto::v1::native::{
-    self as np, gateway_data_service_server::GatewayDataService,
-};
+use kiseki_proto::v1::native::{self as np, gateway_data_service_server::GatewayDataService};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::native::server::ServerImpl;
@@ -69,7 +67,10 @@ impl GatewayDataService for GrpcAdapter {
     ) -> Result<Response<np::PutObjectResponse>, Status> {
         let principal = principal_from_request(&request);
         let req = request.into_inner();
-        self.inner.put_object(&principal, req).await.map(Response::new)
+        self.inner
+            .put_object(&principal, req)
+            .await
+            .map(Response::new)
     }
 
     async fn put_object_stream(
@@ -117,9 +118,8 @@ impl GatewayDataService for GrpcAdapter {
                 "PutObjectStream ended without explicit Commit",
             ));
         }
-        let mut req = header.ok_or_else(|| {
-            Status::invalid_argument("PutObjectStream missing First")
-        })?;
+        let mut req =
+            header.ok_or_else(|| Status::invalid_argument("PutObjectStream missing First"))?;
         req.data = data;
         self.inner
             .put_object(&principal, req)
@@ -133,7 +133,10 @@ impl GatewayDataService for GrpcAdapter {
     ) -> Result<Response<np::GetObjectResponse>, Status> {
         let principal = principal_from_request(&request);
         let req = request.into_inner();
-        self.inner.get_object(&principal, req).await.map(Response::new)
+        self.inner
+            .get_object(&principal, req)
+            .await
+            .map(Response::new)
     }
 
     type GetObjectStreamStream = Pin<
@@ -295,7 +298,9 @@ impl GatewayDataService for GrpcAdapter {
         &self,
         _request: Request<np::PathLookupRequest>,
     ) -> Result<Response<np::PathLookupResponse>, Status> {
-        Err(Status::unimplemented("POSIX path_lookup not bridged in Phase 2"))
+        Err(Status::unimplemented(
+            "POSIX path_lookup not bridged in Phase 2",
+        ))
     }
 
     async fn open(
@@ -319,7 +324,9 @@ impl GatewayDataService for GrpcAdapter {
         &self,
         _request: Request<np::ReadRequest>,
     ) -> Result<Response<Self::ReadStreamStream>, Status> {
-        Err(Status::unimplemented("POSIX read_stream not bridged in Phase 2"))
+        Err(Status::unimplemented(
+            "POSIX read_stream not bridged in Phase 2",
+        ))
     }
 
     async fn write(
@@ -333,7 +340,9 @@ impl GatewayDataService for GrpcAdapter {
         &self,
         _request: Request<Streaming<np::WriteChunk>>,
     ) -> Result<Response<np::WriteResponse>, Status> {
-        Err(Status::unimplemented("POSIX write_stream not bridged in Phase 2"))
+        Err(Status::unimplemented(
+            "POSIX write_stream not bridged in Phase 2",
+        ))
     }
 
     async fn fsync(
@@ -356,14 +365,18 @@ impl GatewayDataService for GrpcAdapter {
         &self,
         _request: Request<np::SetattrRequest>,
     ) -> Result<Response<np::SetattrResponse>, Status> {
-        Err(Status::unimplemented("POSIX setattr not bridged in Phase 2"))
+        Err(Status::unimplemented(
+            "POSIX setattr not bridged in Phase 2",
+        ))
     }
 
     async fn getattr(
         &self,
         _request: Request<np::GetattrRequest>,
     ) -> Result<Response<np::GetattrResponse>, Status> {
-        Err(Status::unimplemented("POSIX getattr not bridged in Phase 2"))
+        Err(Status::unimplemented(
+            "POSIX getattr not bridged in Phase 2",
+        ))
     }
 
     type ReadDirStream = Pin<
@@ -374,7 +387,9 @@ impl GatewayDataService for GrpcAdapter {
         &self,
         _request: Request<np::ReadDirRequest>,
     ) -> Result<Response<Self::ReadDirStream>, Status> {
-        Err(Status::unimplemented("POSIX read_dir not bridged in Phase 2"))
+        Err(Status::unimplemented(
+            "POSIX read_dir not bridged in Phase 2",
+        ))
     }
 
     async fn mkdir(

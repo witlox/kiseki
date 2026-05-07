@@ -51,8 +51,8 @@ use super::storage::{CompositionStorage, HydrationBatch};
 use crate::composition::Composition;
 
 use super::encoding::{
-    decode_composition, decode_stuck_state, encode_composition, encode_stuck_state,
-    name_key, COMPOSITION_RECORD_SCHEMA_VERSION,
+    decode_composition, decode_stuck_state, encode_composition, encode_stuck_state, name_key,
+    COMPOSITION_RECORD_SCHEMA_VERSION,
 };
 
 // Each fjall keyspace is its own physical LSM-tree (column-family
@@ -107,9 +107,7 @@ impl FjallStorage {
         // verify it matches what this binary supports — a future
         // version > supported is fail-closed (operators wipe &
         // re-hydrate from Raft).
-        let stamped = meta
-            .get(meta_keys::SCHEMA_VERSION)
-            .map_err(map_fjall_err)?;
+        let stamped = meta.get(meta_keys::SCHEMA_VERSION).map_err(map_fjall_err)?;
         match stamped {
             Some(slice) => {
                 let &v = slice.first().ok_or_else(|| {
@@ -223,11 +221,7 @@ impl FjallFlusher {
 
 impl CompositionStorage for FjallStorage {
     fn get(&self, id: CompositionId) -> Result<Option<Composition>, PersistentStoreError> {
-        match self
-            .comps
-            .get(id.0.as_bytes())
-            .map_err(map_fjall_err)?
-        {
+        match self.comps.get(id.0.as_bytes()).map_err(map_fjall_err)? {
             None => Ok(None),
             Some(slice) => Ok(Some(decode_composition(slice.as_ref())?)),
         }
@@ -240,10 +234,7 @@ impl CompositionStorage for FjallStorage {
         Ok(self.comps.len().map_err(map_fjall_err)? as u64)
     }
 
-    fn list_in_namespace(
-        &self,
-        ns: NamespaceId,
-    ) -> Result<Vec<Composition>, PersistentStoreError> {
+    fn list_in_namespace(&self, ns: NamespaceId) -> Result<Vec<Composition>, PersistentStoreError> {
         // No secondary index by namespace yet (same as redb impl) —
         // full scan + filter. ADR-040 calls this out as a future
         // optimization; volume is bounded by per-tenant namespace
@@ -320,11 +311,7 @@ impl CompositionStorage for FjallStorage {
         &self,
         id: CompositionId,
     ) -> Result<Option<(NamespaceId, String)>, PersistentStoreError> {
-        match self
-            .names_rev
-            .get(id.0.as_bytes())
-            .map_err(map_fjall_err)?
-        {
+        match self.names_rev.get(id.0.as_bytes()).map_err(map_fjall_err)? {
             None => Ok(None),
             Some(slice) => {
                 let bytes = slice.as_ref();
@@ -337,9 +324,7 @@ impl CompositionStorage for FjallStorage {
                 let mut ns_buf = [0u8; 16];
                 ns_buf.copy_from_slice(&bytes[..16]);
                 let name = std::str::from_utf8(&bytes[16..])
-                    .map_err(|e| {
-                        PersistentStoreError::Decode(format!("name reverse utf8: {e}"))
-                    })?
+                    .map_err(|e| PersistentStoreError::Decode(format!("name reverse utf8: {e}")))?
                     .to_owned();
                 Ok(Some((NamespaceId(uuid::Uuid::from_bytes(ns_buf)), name)))
             }
@@ -388,13 +373,13 @@ impl CompositionStorage for FjallStorage {
         self.persist_after_write()
     }
 
-    fn name_remove(
-        &self,
-        ns: NamespaceId,
-        name: &str,
-    ) -> Result<bool, PersistentStoreError> {
+    fn name_remove(&self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
         let key = name_key(ns, name);
-        let existed_id = self.names.get(&key).map_err(map_fjall_err)?.map(|s| s.to_vec());
+        let existed_id = self
+            .names
+            .get(&key)
+            .map_err(map_fjall_err)?
+            .map(|s| s.to_vec());
         let mut batch = self.db.batch();
         let removed = if let Some(id_bytes) = existed_id {
             batch.remove(&self.names, key);
@@ -424,9 +409,8 @@ impl CompositionStorage for FjallStorage {
             if kbytes.len() < 16 {
                 continue;
             }
-            let name = std::str::from_utf8(&kbytes[16..]).map_err(|e| {
-                PersistentStoreError::Decode(format!("name forward utf8: {e}"))
-            })?;
+            let name = std::str::from_utf8(&kbytes[16..])
+                .map_err(|e| PersistentStoreError::Decode(format!("name forward utf8: {e}")))?;
             if let Some(p) = prefix {
                 if !name.starts_with(p) {
                     continue;
@@ -441,7 +425,10 @@ impl CompositionStorage for FjallStorage {
             }
             let mut id_buf = [0u8; 16];
             id_buf.copy_from_slice(vbytes);
-            out.push((name.to_owned(), CompositionId(uuid::Uuid::from_bytes(id_buf))));
+            out.push((
+                name.to_owned(),
+                CompositionId(uuid::Uuid::from_bytes(id_buf)),
+            ));
         }
         // Stable order — S3 LIST ordering is alphabetical. The LSM
         // iterator yields key-sorted output, but the merge-sort
@@ -491,10 +478,7 @@ impl CompositionStorage for FjallStorage {
         }
     }
 
-    fn apply_hydration_batch(
-        &self,
-        batch: HydrationBatch,
-    ) -> Result<(), PersistentStoreError> {
+    fn apply_hydration_batch(&self, batch: HydrationBatch) -> Result<(), PersistentStoreError> {
         // One fjall batch covers every mutation in the hydration
         // tick atomically — same I-CP1 contract as redb.
         let mut wb = self.db.batch();
@@ -545,7 +529,11 @@ impl CompositionStorage for FjallStorage {
         }
         for (ns, name) in batch.name_removes {
             let key = name_key(ns, &name);
-            let existed_id = self.names.get(&key).map_err(map_fjall_err)?.map(|s| s.to_vec());
+            let existed_id = self
+                .names
+                .get(&key)
+                .map_err(map_fjall_err)?
+                .map(|s| s.to_vec());
             wb.remove(&self.names, key);
             if let Some(id_bytes) = existed_id {
                 wb.remove(&self.names_rev, id_bytes);
@@ -560,7 +548,11 @@ impl CompositionStorage for FjallStorage {
             batch.new_last_applied_seq.0.to_le_bytes().to_vec(),
         );
         if let Some(stuck) = batch.stuck_state {
-            wb.insert(&self.meta, meta_keys::STUCK_STATE.to_vec(), encode_stuck_state(stuck));
+            wb.insert(
+                &self.meta,
+                meta_keys::STUCK_STATE.to_vec(),
+                encode_stuck_state(stuck),
+            );
         }
         if let Some(halted) = batch.halted {
             wb.insert(
@@ -669,10 +661,7 @@ mod tests {
         let ns = NamespaceId(uuid::Uuid::from_u128(2));
         store.name_insert(ns, "alpha".into(), id).unwrap();
         assert_eq!(store.name_lookup(ns, "alpha").unwrap(), Some(id));
-        assert_eq!(
-            store.name_for(id).unwrap(),
-            Some((ns, "alpha".to_string()))
-        );
+        assert_eq!(store.name_for(id).unwrap(), Some((ns, "alpha".to_string())));
         assert!(store.name_remove(ns, "alpha").unwrap());
         assert_eq!(store.name_lookup(ns, "alpha").unwrap(), None);
         assert_eq!(store.name_for(id).unwrap(), None);

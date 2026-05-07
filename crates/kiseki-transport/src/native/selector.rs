@@ -57,8 +57,7 @@ impl OperatorPin {
             }),
             other => Err(BindingSelectorError::UnknownPin {
                 got: other.into(),
-                hint: "valid: auto | grpc | tcp | ibverbs (libfabric needs provider env)"
-                    .into(),
+                hint: "valid: auto | grpc | tcp | ibverbs (libfabric needs provider env)".into(),
             }),
         }
     }
@@ -375,9 +374,7 @@ impl Default for BindingSelector {
 
 /// Phase-2 helper: detect address collisions between Available
 /// bindings. Pure function, no async; tested in isolation.
-fn check_port_collisions(
-    probes: &[(BindingId, ProbeOutcome)],
-) -> Result<(), BindingSelectorError> {
+fn check_port_collisions(probes: &[(BindingId, ProbeOutcome)]) -> Result<(), BindingSelectorError> {
     // Map address → first binding that claimed it.
     let mut seen: BTreeMap<&ListenAddr, BindingId> = BTreeMap::new();
     for (id, outcome) in probes {
@@ -659,15 +656,11 @@ mod tests {
         let mut sel = BindingSelector::new();
         sel.register(StubProbe::boxed(
             BindingId::Grpc,
-            ProbeOutcome::Unavailable {
-                reason: "x".into(),
-            },
+            ProbeOutcome::Unavailable { reason: "x".into() },
         ));
         sel.register(StubProbe::boxed(
             BindingId::TcpFramed,
-            ProbeOutcome::Unavailable {
-                reason: "y".into(),
-            },
+            ProbeOutcome::Unavailable { reason: "y".into() },
         ));
         let err = sel.plan().await.expect_err("must fail");
         match err {
@@ -855,7 +848,10 @@ mod tests {
         let sel = sel.with_pin(OperatorPin::Pinned(BindingId::Grpc));
         let (plan, report) = sel.plan().await.unwrap();
         let banner = render_banner(&plan, &report);
-        assert!(banner.contains("PINNED"), "banner should indicate pin: {banner}");
+        assert!(
+            banner.contains("PINNED"),
+            "banner should indicate pin: {banner}"
+        );
         assert!(banner.contains("grpc-h2"));
     }
 }

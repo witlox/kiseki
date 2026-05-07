@@ -75,8 +75,8 @@ pub fn serialize_signed(
     signing_keys: &SigningKeys,
     inner: &MultipartUploadIdInner,
 ) -> Result<Vec<u8>, MultipartUploadIdError> {
-    let body = postcard::to_allocvec(inner)
-        .map_err(|e| MultipartUploadIdError::Encode(e.to_string()))?;
+    let body =
+        postcard::to_allocvec(inner).map_err(|e| MultipartUploadIdError::Encode(e.to_string()))?;
     let key_bytes = signing_keys
         .multipart_upload_id_key(inner.master_key_epoch)
         .ok_or(MultipartUploadIdError::KeyEpochUnknown(

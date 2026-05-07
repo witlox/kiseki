@@ -234,7 +234,11 @@ async fn then_apply_hook_fired_on_every_node(w: &mut KisekiWorld) {
         for (node_id, metrics_port) in &ports {
             let url = format!("http://127.0.0.1:{metrics_port}/metrics");
             let value = match reqwest::get(&url).await {
-                Ok(r) => r.text().await.map(|body| parse_registry_size(&body)).unwrap_or(0.0),
+                Ok(r) => r
+                    .text()
+                    .await
+                    .map(|body| parse_registry_size(&body))
+                    .unwrap_or(0.0),
                 Err(_) => 0.0,
             };
             if value < 3.0 {

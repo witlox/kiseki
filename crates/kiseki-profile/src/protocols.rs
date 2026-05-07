@@ -86,7 +86,9 @@ pub async fn build(
             match binding {
                 NativeBinding::Tcp | NativeBinding::Auto => {
                     let addr = format!("127.0.0.1:{}", s.ports.tcp_framed);
-                    Ok(Arc::new(TcpFramedNativeDriver::new(&addr, pool_size).await?))
+                    Ok(Arc::new(
+                        TcpFramedNativeDriver::new(&addr, pool_size).await?,
+                    ))
                 }
                 NativeBinding::Grpc => {
                     let addr = format!("127.0.0.1:{}", s.ports.grpc_data);
@@ -592,11 +594,10 @@ struct FuseDriver {
 
 impl FuseDriver {
     async fn new(addr: &str, pool_size: usize) -> Result<Self, String> {
-        let gateway = kiseki_client::native_remote::NativeRemoteGateway::connect_plaintext(
-            addr, pool_size,
-        )
-        .await
-        .map_err(|e| format!("native-remote connect: {e}"))?;
+        let gateway =
+            kiseki_client::native_remote::NativeRemoteGateway::connect_plaintext(addr, pool_size)
+                .await
+                .map_err(|e| format!("native-remote connect: {e}"))?;
         let tenant_id = OrgId(uuid::Uuid::from_u128(1));
         let namespace_id = NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
         // Hand KisekiFuse a peer clone so it satisfies the API but
@@ -886,7 +887,6 @@ impl InProcessDriver {
         use kiseki_crypto::keys::SystemMasterKey;
         use kiseki_gateway::mem_gateway::InMemoryGateway;
 
-
         let tenant_id = OrgId(uuid::Uuid::from_u128(100));
         let namespace_id = NamespaceId(uuid::Uuid::new_v5(
             &uuid::Uuid::NAMESPACE_DNS,
@@ -971,9 +971,11 @@ pub struct NativeDriver {
     /// Holding N independent channels gives the server N parallel
     /// h2-connection tasks; the workers round-robin across the pool
     /// so streams fan out across cores.
-    clients: Vec<kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient<
-        tonic::transport::Channel,
-    >>,
+    clients: Vec<
+        kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient<
+            tonic::transport::Channel,
+        >,
+    >,
     /// Per-call selector — atomic so workers don't all hash to slot 0.
     next: std::sync::atomic::AtomicUsize,
     namespace_id: NamespaceId,
@@ -1023,10 +1025,7 @@ impl NativeDriver {
     ) -> kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient<
         tonic::transport::Channel,
     > {
-        let idx = self
-            .next
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.clients.len();
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
         self.clients[idx].clone()
     }
 
@@ -1084,11 +1083,13 @@ impl Driver for NativeDriver {
             }),
             range_start: 0,
             range_end: 0,
-            key: Some(kiseki_proto::v1::native::get_object_request::Key::CompositionId(
-                kiseki_proto::v1::CompositionId {
-                    value: key.composition_id.0.to_string(),
-                },
-            )),
+            key: Some(
+                kiseki_proto::v1::native::get_object_request::Key::CompositionId(
+                    kiseki_proto::v1::CompositionId {
+                        value: key.composition_id.0.to_string(),
+                    },
+                ),
+            ),
         });
         let resp = client
             .get_object(req)
@@ -1135,46 +1136,39 @@ impl InProcessPersistentDriver {
         use kiseki_crypto::keys::SystemMasterKey;
         use kiseki_gateway::mem_gateway::InMemoryGateway;
 
-        let data_dir = tempfile::tempdir()
-            .map_err(|e| format!("InProcessPersistent tempdir: {e}"))?;
+        let data_dir =
+            tempfile::tempdir().map_err(|e| format!("InProcessPersistent tempdir: {e}"))?;
         let dir = data_dir.path();
 
         // 1. Persistent chunk store — same shape as runtime.rs:
         //    raw block device + group-commit fsync (sync_per_write =
         //    false). 4 GiB is plenty for a 30 s run; the spawned
         //    `kiseki-server` uses the same default.
-        std::fs::create_dir_all(dir.join("chunks"))
-            .map_err(|e| format!("chunks dir: {e}"))?;
+        std::fs::create_dir_all(dir.join("chunks")).map_err(|e| format!("chunks dir: {e}"))?;
         let dev_path = dir.join("chunks").join("data.dev");
         // ADR-022 rev-4: chunk meta is a fjall keyspace (directory).
         let meta_path = dir.join("chunks").join("meta");
-        let chunks = kiseki_chunk::PersistentChunkStore::init(
-            &dev_path,
-            &meta_path,
-            4 * 1024 * 1024 * 1024,
-        )
-        .map_err(|e| format!("chunk store init: {e}"))?;
+        let chunks =
+            kiseki_chunk::PersistentChunkStore::init(&dev_path, &meta_path, 4 * 1024 * 1024 * 1024)
+                .map_err(|e| format!("chunk store init: {e}"))?;
         chunks.set_sync_per_write(false);
         let chunks_async = kiseki_chunk::arc_async(chunks);
 
         // 2. Persistent composition store — fjall-backed, with the
         //    same eventual-durability + periodic flush model the
         //    runtime uses by default (KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100).
-        std::fs::create_dir_all(dir.join("metadata"))
-            .map_err(|e| format!("metadata dir: {e}"))?;
+        std::fs::create_dir_all(dir.join("metadata")).map_err(|e| format!("metadata dir: {e}"))?;
         let comp_path = dir.join("metadata").join("compositions");
         let interval_ms = std::env::var("KISEKI_COMPOSITION_FLUSH_INTERVAL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(100);
-        let comp_store_fjall =
-            kiseki_composition::persistent::FjallStorage::open(&comp_path)
-                .map_err(|e| format!("composition fjall open: {e}"))?
-                .with_eventual_durability(true);
+        let comp_store_fjall = kiseki_composition::persistent::FjallStorage::open(&comp_path)
+            .map_err(|e| format!("composition fjall open: {e}"))?
+            .with_eventual_durability(true);
         let flusher = comp_store_fjall.flusher();
         tokio::spawn(async move {
-            let mut tick =
-                tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
@@ -1299,10 +1293,7 @@ impl TcpFramedNativeDriver {
     }
 
     fn pick(&self) -> Arc<kiseki_client::native::TcpFramedClient> {
-        let idx = self
-            .next
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.clients.len();
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
         Arc::clone(&self.clients[idx])
     }
 
@@ -1333,8 +1324,8 @@ impl Driver for TcpFramedNativeDriver {
             name: format!("perf-{}", uuid::Uuid::new_v4().simple()),
             data: Vec::new(), // bulk rides separately
         };
-        let req_meta = postcard::to_allocvec(&req)
-            .map_err(|e| format!("tcp-framed put encode: {e}"))?;
+        let req_meta =
+            postcard::to_allocvec(&req).map_err(|e| format!("tcp-framed put encode: {e}"))?;
         let req_bulk = payload.to_vec();
         let (resp_meta, _resp_bulk) = self
             .pick()
@@ -1342,8 +1333,7 @@ impl Driver for TcpFramedNativeDriver {
             .await
             .map_err(|e| format!("tcp-framed put: {e}"))?;
         let resp: kiseki_proto::v1::native::PutObjectResponse =
-            postcard::from_bytes(&resp_meta)
-                .map_err(|e| format!("tcp-framed put decode: {e}"))?;
+            postcard::from_bytes(&resp_meta).map_err(|e| format!("tcp-framed put decode: {e}"))?;
         let comp = resp
             .composition_id
             .ok_or_else(|| "tcp-framed put: response missing composition_id".to_string())?;
@@ -1367,14 +1357,16 @@ impl Driver for TcpFramedNativeDriver {
             }),
             range_start: 0,
             range_end: 0,
-            key: Some(kiseki_proto::v1::native::get_object_request::Key::CompositionId(
-                kiseki_proto::v1::CompositionId {
-                    value: key.composition_id.0.to_string(),
-                },
-            )),
+            key: Some(
+                kiseki_proto::v1::native::get_object_request::Key::CompositionId(
+                    kiseki_proto::v1::CompositionId {
+                        value: key.composition_id.0.to_string(),
+                    },
+                ),
+            ),
         };
-        let req_meta = postcard::to_allocvec(&req)
-            .map_err(|e| format!("tcp-framed get encode: {e}"))?;
+        let req_meta =
+            postcard::to_allocvec(&req).map_err(|e| format!("tcp-framed get encode: {e}"))?;
         let (_resp_meta, resp_bulk) = self
             .pick()
             .call_ok("get_object", req_meta, Vec::new())

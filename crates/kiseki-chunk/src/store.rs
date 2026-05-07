@@ -55,10 +55,7 @@ pub trait ChunkOps {
     /// gateway dedup path (vs `refcount` + `increment_refcount`).
     /// Default impl falls back to the two-step path; backends that
     /// can do this in a single critical section override it.
-    fn try_increment_if_exists(
-        &mut self,
-        chunk_id: &ChunkId,
-    ) -> Result<Option<u64>, ChunkError> {
+    fn try_increment_if_exists(&mut self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
         match self.refcount(chunk_id) {
             Ok(_) => self.increment_refcount(chunk_id).map(Some),
             Err(ChunkError::NotFound(_)) => Ok(None),
@@ -486,10 +483,7 @@ impl ChunkOps for ChunkStore {
     /// trips through the `AsyncChunkOps` `SyncBridge` mutex on dedup-
     /// hit writes, the dominant write-path bottleneck observed in
     /// the 2026-05-05 in-process flamegraph.
-    fn try_increment_if_exists(
-        &mut self,
-        chunk_id: &ChunkId,
-    ) -> Result<Option<u64>, ChunkError> {
+    fn try_increment_if_exists(&mut self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
         match self.chunks.get_mut(chunk_id) {
             Some(entry) => {
                 entry.refcount += 1;

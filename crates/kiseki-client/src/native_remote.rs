@@ -29,8 +29,8 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 use kiseki_gateway::error::GatewayError;
@@ -166,10 +166,8 @@ impl GatewayOps for NativeRemoteGateway {
             .call_ok("get_object", req_meta, Vec::new())
             .await
             .map_err(|e| map_native_err("get_object", e))?;
-        let resp: kiseki_proto::v1::native::GetObjectResponse =
-            postcard::from_bytes(&resp_meta).map_err(|e| {
-                GatewayError::ProtocolError(format!("native read decode: {e}"))
-            })?;
+        let resp: kiseki_proto::v1::native::GetObjectResponse = postcard::from_bytes(&resp_meta)
+            .map_err(|e| GatewayError::ProtocolError(format!("native read decode: {e}")))?;
         // EOF inference matches RemoteHttpGateway: if the server
         // returned fewer bytes than requested, EOF.
         let eof = req.length == u64::MAX
@@ -193,9 +191,7 @@ impl GatewayOps for NativeRemoteGateway {
         // Server requires a non-empty name for the binding index.
         // FUSE callers pass `None`; mint a UUID so the put still
         // routes through the named-PUT path uniformly.
-        let name = req
-            .name
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let name = req.name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let proto_req = kiseki_proto::v1::native::PutObjectRequest {
             control: Some(Self::ctrl(req.tenant_id)),
             namespace_id: Some(kiseki_proto::v1::NamespaceId {
@@ -211,13 +207,11 @@ impl GatewayOps for NativeRemoteGateway {
             .call_ok("put_object", req_meta, req.data)
             .await
             .map_err(|e| map_native_err("put_object", e))?;
-        let resp: kiseki_proto::v1::native::PutObjectResponse =
-            postcard::from_bytes(&resp_meta).map_err(|e| {
-                GatewayError::ProtocolError(format!("native write decode: {e}"))
-            })?;
-        let comp = resp
-            .composition_id
-            .ok_or_else(|| GatewayError::ProtocolError("native write: missing composition_id".into()))?;
+        let resp: kiseki_proto::v1::native::PutObjectResponse = postcard::from_bytes(&resp_meta)
+            .map_err(|e| GatewayError::ProtocolError(format!("native write decode: {e}")))?;
+        let comp = resp.composition_id.ok_or_else(|| {
+            GatewayError::ProtocolError("native write: missing composition_id".into())
+        })?;
         let composition_id = uuid::Uuid::parse_str(&comp.value)
             .map(CompositionId)
             .map_err(|_| {

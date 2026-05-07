@@ -512,12 +512,10 @@ impl CompositionStore {
     pub fn with_storage(storage: Box<dyn crate::persistent::CompositionStorage>) -> Self {
         // Box the arrays to keep CompositionStore's stack footprint
         // small. parking_lot::Mutex<()> is one word per shard.
-        let name_locks: Box<[parking_lot::Mutex<()>; NAME_LOCK_SHARDS]> = Box::new(
-            std::array::from_fn(|_| parking_lot::Mutex::new(())),
-        );
-        let id_locks: Box<[parking_lot::Mutex<()>; ID_LOCK_SHARDS]> = Box::new(
-            std::array::from_fn(|_| parking_lot::Mutex::new(())),
-        );
+        let name_locks: Box<[parking_lot::Mutex<()>; NAME_LOCK_SHARDS]> =
+            Box::new(std::array::from_fn(|_| parking_lot::Mutex::new(())));
+        let id_locks: Box<[parking_lot::Mutex<()>; ID_LOCK_SHARDS]> =
+            Box::new(std::array::from_fn(|_| parking_lot::Mutex::new(())));
         Self {
             storage,
             name_locks,
@@ -837,7 +835,8 @@ impl CompositionStore {
             cond.check(existing)
                 .map_err(CompositionError::PreconditionFailed)?;
         }
-        self.storage.put_with_name(comp, namespace_id, name, existing)?;
+        self.storage
+            .put_with_name(comp, namespace_id, name, existing)?;
         Ok(id)
     }
 
@@ -1960,9 +1959,7 @@ mod tests {
         assert_eq!(v1.version, 1);
 
         // Update bumps to v=2 and must drop the cache entry.
-        let v2 = store
-            .update(id, vec![ChunkId([0x02; 32])], 200)
-            .unwrap();
+        let v2 = store.update(id, vec![ChunkId([0x02; 32])], 200).unwrap();
         assert_eq!(v2, 2);
 
         // Subsequent get must reflect the post-update version, not

@@ -161,7 +161,10 @@ impl TopologyCache {
             .shards
             .iter()
             .find(|s| key_in_range(hashed_key, &s.range_start, &s.range_end))?;
-        let node = snap.nodes.iter().find(|n| n.node_id == shard.leader_node_id)?;
+        let node = snap
+            .nodes
+            .iter()
+            .find(|n| n.node_id == shard.leader_node_id)?;
         Some(RouteHit {
             shard_id: shard.shard_id.clone(),
             leader_node_id: node.node_id,
@@ -194,9 +197,7 @@ pub struct RouteHit {
 /// the `kiseki-proto::native_contract` value types the cache + edge
 /// selector consume.
 #[must_use]
-pub fn snapshot_from_proto(
-    info: &kiseki_proto::v1::native::TopologyInfo,
-) -> Snapshot {
+pub fn snapshot_from_proto(info: &kiseki_proto::v1::native::TopologyInfo) -> Snapshot {
     use kiseki_proto::native_contract as nc;
     use kiseki_proto::v1::native as np;
 
@@ -238,9 +239,7 @@ pub fn snapshot_from_proto(
     }
 }
 
-fn proto_node_state_to_contract(
-    state: i32,
-) -> kiseki_proto::native_contract::NodeState {
+fn proto_node_state_to_contract(state: i32) -> kiseki_proto::native_contract::NodeState {
     use kiseki_proto::native_contract::NodeState as Nc;
     use kiseki_proto::v1::native::NodeState as Pb;
     match Pb::try_from(state).unwrap_or(Pb::Unspecified) {
@@ -272,9 +271,7 @@ fn proto_binding_endpoint_to_contract(
         },
     };
     let latency_class = match np::LatencyClass::try_from(ep.latency_class).ok()? {
-        np::LatencyClass::Unspecified | np::LatencyClass::Standard => {
-            nc::LatencyClass::Standard
-        }
+        np::LatencyClass::Unspecified | np::LatencyClass::Standard => nc::LatencyClass::Standard,
         np::LatencyClass::Low => nc::LatencyClass::Low,
         np::LatencyClass::Rdma => nc::LatencyClass::Rdma,
     };
@@ -377,16 +374,13 @@ mod tests {
         let d = cache.decide(7);
         assert!(matches!(
             d,
-            RefreshDecision::TrailerVersionDiffers {
-                cached: 3,
-                seen: 7
-            }
+            RefreshDecision::TrailerVersionDiffers { cached: 3, seen: 7 }
         ));
     }
 
     #[test]
     fn snapshot_from_proto_carries_node_bindings() {
-        use kiseki_proto::v1 as v1;
+        use kiseki_proto::v1;
         use kiseki_proto::v1::native as np;
         let info = np::TopologyInfo {
             topology_version: 5,

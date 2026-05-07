@@ -34,9 +34,7 @@ use tonic::Status;
 use crate::error::GatewayError;
 use crate::ops::{GatewayOps, ReadRequest, WriteConditional, WriteRequest};
 
-use super::lease_store::{
-    AcquireOutcome, LeaseStore, ReleaseOutcome, RenewOutcome,
-};
+use super::lease_store::{AcquireOutcome, LeaseStore, ReleaseOutcome, RenewOutcome};
 use super::signing_keys::SigningKeys;
 
 /// Maximum bytes per `BatchFetchDek` request (gate-1 round-2 N2).
@@ -85,8 +83,7 @@ pub struct TopologyInjector {
 pub struct TopologySnapshot {
     pub nodes: Vec<np::NodeInfo>,
     /// Per-tenant shard list (F-H3 fix).
-    pub shards_by_tenant:
-        std::collections::HashMap<OrgId, Vec<np::ShardLeadership>>,
+    pub shards_by_tenant: std::collections::HashMap<OrgId, Vec<np::ShardLeadership>>,
 }
 
 impl TopologyInjector {
@@ -118,9 +115,7 @@ impl ServerImpl {
             signing_keys,
             lease_store: Arc::new(LeaseStore::new(60_000)),
             topology: Arc::new(TopologyInjector::empty()),
-            stream_caps: Arc::new(parking_lot::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            stream_caps: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             max_streams_per_tenant: 256,
         }
     }
@@ -178,7 +173,8 @@ impl ServerImpl {
 
 #[allow(clippy::result_large_err, clippy::ref_option)]
 fn require_control(c: &Option<np::ControlFields>) -> Result<&np::ControlFields, Status> {
-    c.as_ref().ok_or_else(|| Status::invalid_argument("control fields required"))
+    c.as_ref()
+        .ok_or_else(|| Status::invalid_argument("control fields required"))
 }
 
 #[allow(clippy::result_large_err)]
@@ -256,9 +252,7 @@ fn ns_from_proto(o: Option<&kiseki_proto::v1::NamespaceId>) -> Result<NamespaceI
 }
 
 #[allow(clippy::result_large_err)]
-fn comp_from_proto(
-    o: Option<&kiseki_proto::v1::CompositionId>,
-) -> Result<CompositionId, Status> {
+fn comp_from_proto(o: Option<&kiseki_proto::v1::CompositionId>) -> Result<CompositionId, Status> {
     let s = o.ok_or_else(|| Status::invalid_argument("composition_id required"))?;
     let uuid = uuid::Uuid::parse_str(&s.value)
         .map_err(|e| Status::invalid_argument(format!("composition_id: {e}")))?;
@@ -303,17 +297,13 @@ fn map_gateway_error(e: GatewayError) -> Status {
         GatewayError::KeyOutOfRange { shard_id } => {
             Status::out_of_range(format!("key out of range for shard {shard_id:?}"))
         }
-        GatewayError::ReadOnlyNamespace => {
-            Status::failed_precondition("namespace is read-only")
-        }
+        GatewayError::ReadOnlyNamespace => Status::failed_precondition("namespace is read-only"),
         GatewayError::ServiceUnavailable(m) => Status::unavailable(m),
         GatewayError::PreconditionFailed(m) => Status::failed_precondition(m),
         // Both NotFound (composition missing) and NamespaceNotFound
         // map to gRPC NOT_FOUND. The S3 layer disambiguates the two
         // for HTTP semantics; native callers don't.
-        GatewayError::NotFound(m) | GatewayError::NamespaceNotFound(m) => {
-            Status::not_found(m)
-        }
+        GatewayError::NotFound(m) | GatewayError::NamespaceNotFound(m) => Status::not_found(m),
     }
 }
 
@@ -331,9 +321,7 @@ fn workflow_ref_bytes(s: &str) -> Result<Option<[u8; 16]>, Status> {
 }
 
 #[allow(clippy::result_large_err)]
-fn write_conditional_from(
-    cf: &np::ControlFields,
-) -> Result<Option<WriteConditional>, Status> {
+fn write_conditional_from(cf: &np::ControlFields) -> Result<Option<WriteConditional>, Status> {
     use np::control_fields::Conditional;
     let Some(cond) = cf.conditional.as_ref() else {
         return Ok(None);
@@ -342,18 +330,14 @@ fn write_conditional_from(
         Conditional::IfNoneMatch(_) => WriteConditional::IfNoneMatch,
         Conditional::IfMatch(et) => {
             if et.value.len() != 16 {
-                return Err(Status::invalid_argument(
-                    "if_match etag must be 16 bytes",
-                ));
+                return Err(Status::invalid_argument("if_match etag must be 16 bytes"));
             }
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&et.value);
             WriteConditional::IfMatch(CompositionId(uuid::Uuid::from_bytes(bytes)))
         }
         Conditional::IfVersionMatch(_) => {
-            return Err(Status::unimplemented(
-                "if_version_match not yet supported",
-            ));
+            return Err(Status::unimplemented("if_version_match not yet supported"));
         }
     }))
 }
@@ -434,9 +418,7 @@ impl ServerImpl {
         enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let comp = match req.key {
-            Some(np::get_object_request::Key::CompositionId(id)) => {
-                comp_from_proto(Some(&id))?
-            }
+            Some(np::get_object_request::Key::CompositionId(id)) => comp_from_proto(Some(&id))?,
             Some(np::get_object_request::Key::Name(name)) => {
                 if name.is_empty() {
                     return Err(Status::invalid_argument("name must be non-empty"));
@@ -448,7 +430,9 @@ impl ServerImpl {
                     .ok_or_else(|| Status::not_found(format!("name not found: {name}")))?
             }
             None => {
-                return Err(Status::invalid_argument("key required (name | composition_id)"));
+                return Err(Status::invalid_argument(
+                    "key required (name | composition_id)",
+                ));
             }
         };
         let length = if req.range_end == 0 || req.range_end <= req.range_start {
@@ -502,9 +486,7 @@ impl ServerImpl {
         enforce_san_payload_tenant_match(principal, &tenant)?;
         let ns = ns_from_proto(req.namespace_id.as_ref())?;
         let comp = match req.key {
-            Some(np::head_object_request::Key::CompositionId(id)) => {
-                comp_from_proto(Some(&id))?
-            }
+            Some(np::head_object_request::Key::CompositionId(id)) => comp_from_proto(Some(&id))?,
             Some(np::head_object_request::Key::Name(name)) => self
                 .ops
                 .lookup_object_by_name(tenant, ns, &name)
@@ -765,7 +747,9 @@ impl ServerImpl {
         let mut lid = [0u8; 16];
         lid.copy_from_slice(&req.lease_id);
         let ttl_ms = req.ttl_ms.min(300_000);
-        let outcome = self.lease_store.renew(lid, &lease_holder_principal, ttl_ms, now_ms());
+        let outcome = self
+            .lease_store
+            .renew(lid, &lease_holder_principal, ttl_ms, now_ms());
         let resp = match outcome {
             RenewOutcome::Renewed(g) => np::RenewLeaseResponse {
                 outcome: Some(np::renew_lease_response::Outcome::Grant(np::LeaseGrant {
@@ -779,10 +763,12 @@ impl ServerImpl {
                 current_fencing_token,
                 current_holder_principal,
             } => np::RenewLeaseResponse {
-                outcome: Some(np::renew_lease_response::Outcome::Expired(np::LeaseExpired {
-                    current_fencing_token,
-                    current_holder_principal,
-                })),
+                outcome: Some(np::renew_lease_response::Outcome::Expired(
+                    np::LeaseExpired {
+                        current_fencing_token,
+                        current_holder_principal,
+                    },
+                )),
             },
             RenewOutcome::NotFound => {
                 return Err(Status::not_found("lease_id not found"));
@@ -809,9 +795,9 @@ impl ServerImpl {
         match self.lease_store.release(lid, &lease_holder_principal) {
             ReleaseOutcome::Released => Ok(np::ReleaseLeaseResponse {}),
             ReleaseOutcome::NotFound => Err(Status::not_found("lease_id not found")),
-            ReleaseOutcome::NotHolder => Err(Status::permission_denied(
-                "release_lease: not the holder",
-            )),
+            ReleaseOutcome::NotHolder => {
+                Err(Status::permission_denied("release_lease: not the holder"))
+            }
         }
     }
 
@@ -1092,9 +1078,8 @@ mod tests {
         // Principal carries a canonical SAN whose tenant id !=
         // payload's tenant id. The handler must reject before any
         // gateway work.
-        let principal = principal_with_san(
-            "spiffe://kiseki/tenant/00000000-0000-0000-0000-000000000999",
-        );
+        let principal =
+            principal_with_san("spiffe://kiseki/tenant/00000000-0000-0000-0000-000000000999");
         let req = np::PutObjectRequest {
             control: Some(ctrl()),
             namespace_id: Some(ns_to_proto(ns())),
@@ -1277,4 +1262,3 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }
-

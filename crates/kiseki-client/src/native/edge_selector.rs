@@ -256,11 +256,7 @@ mod tests {
             ep(BindingId::TcpFramed, LatencyClass::Low),
             ep(BindingId::Ibverbs, LatencyClass::Rdma),
         ]);
-        let local = local_supports(&[
-            BindingId::Grpc,
-            BindingId::TcpFramed,
-            BindingId::Ibverbs,
-        ]);
+        let local = local_supports(&[BindingId::Grpc, BindingId::TcpFramed, BindingId::Ibverbs]);
         let outcome = select_for_edge(&node, &local, OperatorPin::Auto, false);
         match outcome {
             EdgeSelection::Match(picked) => {
@@ -280,12 +276,7 @@ mod tests {
         let local = local_supports(&[BindingId::Grpc, BindingId::TcpFramed]);
         // Pinned to Grpc — must pick Grpc even though TcpFramed
         // would normally outrank.
-        let outcome = select_for_edge(
-            &node,
-            &local,
-            OperatorPin::Pinned(BindingId::Grpc),
-            false,
-        );
+        let outcome = select_for_edge(&node, &local, OperatorPin::Pinned(BindingId::Grpc), false);
         match outcome {
             EdgeSelection::Match(picked) => {
                 assert_eq!(picked.binding_id, BindingId::Grpc);
@@ -420,11 +411,7 @@ mod tests {
     /// choice is independent across nodes.
     #[test]
     fn heterogeneous_cluster_yields_different_bindings_per_node() {
-        let local = local_supports(&[
-            BindingId::Grpc,
-            BindingId::TcpFramed,
-            BindingId::Ibverbs,
-        ]);
+        let local = local_supports(&[BindingId::Grpc, BindingId::TcpFramed, BindingId::Ibverbs]);
         let slingshot_node = active_node(vec![
             ep(BindingId::Grpc, LatencyClass::Standard),
             ep(BindingId::Ibverbs, LatencyClass::Rdma),
@@ -457,12 +444,7 @@ mod tests {
             ep(BindingId::Ibverbs, LatencyClass::Rdma),
         ]);
         let outside_client = local_supports(&[BindingId::Grpc]);
-        let outcome = select_for_edge(
-            &cluster_node,
-            &outside_client,
-            OperatorPin::Auto,
-            false,
-        );
+        let outcome = select_for_edge(&cluster_node, &outside_client, OperatorPin::Auto, false);
         match outcome {
             EdgeSelection::Match(picked) => {
                 assert_eq!(picked.binding_id, BindingId::Grpc);

@@ -21,8 +21,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use kiseki_proto::native_contract::wire_tcp_framed::{
-    build_request_header, decode_response_frame, validate_frame_length, WireDecodeError,
-    WireStatus,
+    build_request_header, decode_response_frame, validate_frame_length, WireDecodeError, WireStatus,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -164,18 +163,14 @@ impl TcpFramedClient {
         // Build the small request header (length prefix + version +
         // request_id + verb_tag + meta_len). Vectored write below
         // ships [header, meta, bulk] in one syscall.
-        let header = match build_request_header(
-            request_id,
-            verb_tag,
-            req_meta.len(),
-            req_bulk.len(),
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                self.pending.remove(&request_id);
-                return Err(TcpFramedClientError::Io(io::Error::other(e.to_string())));
-            }
-        };
+        let header =
+            match build_request_header(request_id, verb_tag, req_meta.len(), req_bulk.len()) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.pending.remove(&request_id);
+                    return Err(TcpFramedClientError::Io(io::Error::other(e.to_string())));
+                }
+            };
         {
             let mut guard = self.write_half.lock().await;
             if let Err(e) =
@@ -391,10 +386,8 @@ mod tests {
         use kiseki_proto::native_contract::wire_tcp_framed::encode_response_frame;
         let (client_side, mut server_side) = duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
-            let (request_id, _verb, _meta, _bulk) =
-                read_v3_request(&mut server_side).await;
-            let frame =
-                encode_response_frame(WireStatus::Ok, request_id, &[1, 2, 3], &[]).unwrap();
+            let (request_id, _verb, _meta, _bulk) = read_v3_request(&mut server_side).await;
+            let frame = encode_response_frame(WireStatus::Ok, request_id, &[1, 2, 3], &[]).unwrap();
             server_side.write_all(&frame).await.unwrap();
         });
         let client = TcpFramedClient::from_stream(client_side);
@@ -411,8 +404,7 @@ mod tests {
         use kiseki_proto::native_contract::wire_tcp_framed::encode_response_frame;
         let (client_side, mut server_side) = duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
-            let (request_id, _verb, _meta, _bulk) =
-                read_v3_request(&mut server_side).await;
+            let (request_id, _verb, _meta, _bulk) = read_v3_request(&mut server_side).await;
             let frame = encode_response_frame(
                 WireStatus::PermissionDenied,
                 request_id,
@@ -451,14 +443,12 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let mut request_ids = Vec::new();
             for _ in 0..2 {
-                let (rid, _verb, _meta, _bulk) =
-                    read_v3_request(&mut server_side).await;
+                let (rid, _verb, _meta, _bulk) = read_v3_request(&mut server_side).await;
                 request_ids.push(rid);
             }
             for rid in request_ids.into_iter().rev() {
                 let payload = format!("rid={rid}").into_bytes();
-                let frame =
-                    encode_response_frame(WireStatus::Ok, rid, &payload, &[]).unwrap();
+                let frame = encode_response_frame(WireStatus::Ok, rid, &payload, &[]).unwrap();
                 server_side.write_all(&frame).await.unwrap();
             }
             server_side.flush().await.unwrap();
@@ -467,10 +457,8 @@ mod tests {
         let client = TcpFramedClient::from_stream(client_side);
         let c1 = Arc::clone(&client);
         let c2 = Arc::clone(&client);
-        let f1 =
-            tokio::spawn(async move { c1.call_ok("a", Vec::new(), Vec::new()).await });
-        let f2 =
-            tokio::spawn(async move { c2.call_ok("b", Vec::new(), Vec::new()).await });
+        let f1 = tokio::spawn(async move { c1.call_ok("a", Vec::new(), Vec::new()).await });
+        let f2 = tokio::spawn(async move { c2.call_ok("b", Vec::new(), Vec::new()).await });
         let (m1, _b1) = f1.await.unwrap().unwrap();
         let (m2, _b2) = f2.await.unwrap().unwrap();
         assert_eq!(String::from_utf8(m1).unwrap(), "rid=1");
@@ -486,8 +474,7 @@ mod tests {
         let (client_side, server_side) = duplex(64 * 1024);
         let client = TcpFramedClient::from_stream(client_side);
         let c = Arc::clone(&client);
-        let call_task =
-            tokio::spawn(async move { c.call("v", Vec::new(), Vec::new()).await });
+        let call_task = tokio::spawn(async move { c.call("v", Vec::new(), Vec::new()).await });
         // Give the writer a moment to enqueue the request.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         drop(server_side);
@@ -516,7 +503,7 @@ mod tests {
             serve_connection as server_serve, TcpFramedPrincipal,
         };
         use kiseki_proto::native_contract::ConnectionId;
-        use kiseki_proto::v1 as v1;
+        use kiseki_proto::v1;
         use kiseki_proto::v1::native as np;
 
         let gw = Arc::new(InMemoryGateway::new(
@@ -572,8 +559,10 @@ mod tests {
         .unwrap();
         let req_bulk = b"hello".to_vec();
 
-        let (resp_meta, resp_bulk) =
-            client.call_ok("put_object", req_meta, req_bulk).await.unwrap();
+        let (resp_meta, resp_bulk) = client
+            .call_ok("put_object", req_meta, req_bulk)
+            .await
+            .unwrap();
         // PutObject response has no bulk.
         assert!(resp_bulk.is_empty());
         let put_resp: np::PutObjectResponse = postcard::from_bytes(&resp_meta).unwrap();

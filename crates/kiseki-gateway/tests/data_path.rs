@@ -335,7 +335,10 @@ mod nfs_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn nfs3_write_named_then_lookup() {
         let ctx = setup_nfs_ctx();
-        let (fh, resp) = ctx.write_named("test.dat", b"hello".to_vec()).await.unwrap();
+        let (fh, resp) = ctx
+            .write_named("test.dat", b"hello".to_vec())
+            .await
+            .unwrap();
         assert_eq!(resp.count, 5);
 
         let (lookup_fh, attrs) = ctx.lookup_by_name("test.dat").await.unwrap();

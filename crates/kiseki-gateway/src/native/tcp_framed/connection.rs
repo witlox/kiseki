@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use kiseki_proto::native_contract::wire_tcp_framed::{
-    build_response_header, decode_request_frame, encode_response_frame,
-    validate_frame_length, WireDecodeError, WireStatus,
+    build_response_header, decode_request_frame, encode_response_frame, validate_frame_length,
+    WireDecodeError, WireStatus,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -89,8 +89,7 @@ where
                 // drain. Send a wire-level error response (request_id
                 // 0 — we never decoded a frame header) then close.
                 let payload = format!("frame oversize: {length_be} > cap").into_bytes();
-                let _ =
-                    write_response(stream, WireStatus::ProtocolError, 0, &payload, &[]).await;
+                let _ = write_response(stream, WireStatus::ProtocolError, 0, &payload, &[]).await;
                 return Err(e.into());
             }
         };
@@ -103,26 +102,24 @@ where
         // is the raw bulk bytes (empty for non-bulk verbs). No copy
         // of either is needed at this layer; dispatch sees borrowed
         // slices.
-        let (request_id, verb_tag, req_meta_off, req_bulk_off) =
-            match decode_request_frame(&body) {
-                Ok(view) => {
-                    // Capture offsets so we can re-slice `body` for
-                    // the dispatch call (the borrow checker won't
-                    // let us hold `view` across the await — it
-                    // borrows `body` and `body` is moved into the
-                    // dispatch path).
-                    let verb = view.verb_tag.to_string();
-                    let meta_start = body.len() - view.meta.len() - view.bulk.len();
-                    let bulk_start = body.len() - view.bulk.len();
-                    (view.request_id, verb, meta_start, bulk_start)
-                }
-                Err(e) => {
-                    let payload = format!("frame decode failed: {e}").into_bytes();
-                    write_response(stream, WireStatus::ProtocolError, 0, &payload, &[])
-                        .await?;
-                    continue;
-                }
-            };
+        let (request_id, verb_tag, req_meta_off, req_bulk_off) = match decode_request_frame(&body) {
+            Ok(view) => {
+                // Capture offsets so we can re-slice `body` for
+                // the dispatch call (the borrow checker won't
+                // let us hold `view` across the await — it
+                // borrows `body` and `body` is moved into the
+                // dispatch path).
+                let verb = view.verb_tag.to_string();
+                let meta_start = body.len() - view.meta.len() - view.bulk.len();
+                let bulk_start = body.len() - view.bulk.len();
+                (view.request_id, verb, meta_start, bulk_start)
+            }
+            Err(e) => {
+                let payload = format!("frame decode failed: {e}").into_bytes();
+                write_response(stream, WireStatus::ProtocolError, 0, &payload, &[]).await?;
+                continue;
+            }
+        };
 
         let (status, resp_meta, resp_bulk) = dispatch_verb(
             &server,
@@ -226,13 +223,8 @@ async fn write_response_oversize<S: AsyncWrite + Unpin>(
     stream: &mut S,
     request_id: u64,
 ) -> std::io::Result<()> {
-    let frame = encode_response_frame(
-        WireStatus::Internal,
-        request_id,
-        b"response too large",
-        &[],
-    )
-    .map_err(|_| std::io::Error::other("response oversize fallback also too large"))?;
+    let frame = encode_response_frame(WireStatus::Internal, request_id, b"response too large", &[])
+        .map_err(|_| std::io::Error::other("response oversize fallback also too large"))?;
     stream.write_all(&frame).await?;
     stream.flush().await
 }
@@ -269,7 +261,7 @@ mod tests {
         encode_request_frame, NATIVE_TCP_FRAMED_VERSION_V3,
     };
     use kiseki_proto::native_contract::ConnectionId;
-    use kiseki_proto::v1 as v1;
+    use kiseki_proto::v1;
     use kiseki_proto::v1::native as np;
     use tokio::io::duplex;
 
@@ -328,7 +320,12 @@ mod tests {
         let mut body = vec![0u8; body_len];
         stream.read_exact(&mut body).await.expect("read body");
         let view = decode_response_frame(&body).expect("decode response frame");
-        (view.status, view.request_id, view.meta.to_vec(), view.bulk.to_vec())
+        (
+            view.status,
+            view.request_id,
+            view.meta.to_vec(),
+            view.bulk.to_vec(),
+        )
     }
 
     /// End-to-end: client sends a put_object request frame; the
@@ -341,9 +338,10 @@ mod tests {
 
         let (mut client_side, mut server_side) = duplex(64 * 1024);
 
-        let server_task = tokio::spawn(async move {
-            serve_connection(&mut server_side, server, principal).await
-        });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(&mut server_side, server, principal).await },
+            );
 
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
@@ -383,9 +381,10 @@ mod tests {
         let principal = TcpFramedPrincipal::new("", ConnectionId(1));
 
         let (mut client_side, mut server_side) = duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            serve_connection(&mut server_side, server, principal).await
-        });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(&mut server_side, server, principal).await },
+            );
 
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
@@ -420,9 +419,10 @@ mod tests {
         let server = make_server().await;
         let principal = TcpFramedPrincipal::new("", ConnectionId(1));
         let (mut client_side, mut server_side) = duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            serve_connection(&mut server_side, server, principal).await
-        });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(&mut server_side, server, principal).await },
+            );
 
         // Send a frame with valid length but corrupt postcard payload.
         let bad_payload: Vec<u8> = vec![NATIVE_TCP_FRAMED_VERSION_V3, 0xFF, 0xFF, 0xFF];
@@ -462,13 +462,17 @@ mod tests {
         let server = make_server().await;
         let principal = TcpFramedPrincipal::new("", ConnectionId(1));
         let (mut client_side, mut server_side) = duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            serve_connection(&mut server_side, server, principal).await
-        });
+        let server_task =
+            tokio::spawn(
+                async move { serve_connection(&mut server_side, server, principal).await },
+            );
 
         // Length way above the cap.
         let evil_len = u32::MAX;
-        client_side.write_all(&evil_len.to_be_bytes()).await.unwrap();
+        client_side
+            .write_all(&evil_len.to_be_bytes())
+            .await
+            .unwrap();
         client_side.flush().await.unwrap();
         // Server should reply with ProtocolError frame then drop.
         let (status, _, _, _) = read_response_frame(&mut client_side).await;
@@ -478,7 +482,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(ConnectionError::WireDecode(WireDecodeError::Oversize { .. }))
+                Err(ConnectionError::WireDecode(
+                    WireDecodeError::Oversize { .. }
+                ))
             ),
             "expected oversize wire-decode error, got: {result:?}",
         );

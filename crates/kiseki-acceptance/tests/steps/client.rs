@@ -1278,7 +1278,11 @@ async fn when_write_modifies(_w: &mut KisekiWorld, _ns: String) {
     // A write modifies a composition in a namespace. Ensure gateway
     // is ready; cache invalidation is validated in Then steps.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"modified-composition".to_vec()).await;
+    let result = _w
+        .legacy
+        .nfs_ctx
+        .write(b"modified-composition".to_vec())
+        .await;
     assert!(result.is_ok(), "write must succeed: {:?}", result.err());
 }
 

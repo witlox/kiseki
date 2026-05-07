@@ -46,10 +46,7 @@ pub trait AsyncChunkOps: Send + Sync {
     /// Atomic dedup pre-flight: increment refcount if chunk exists,
     /// else return `Ok(None)`. Single round-trip vs the two-step
     /// `refcount` + `increment_refcount` path.
-    async fn try_increment_if_exists(
-        &self,
-        chunk_id: &ChunkId,
-    ) -> Result<Option<u64>, ChunkError>;
+    async fn try_increment_if_exists(&self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError>;
 
     /// Decrement refcount. Returns the new refcount.
     async fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
@@ -260,10 +257,7 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
         self.inner.write().increment_refcount(chunk_id)
     }
 
-    async fn try_increment_if_exists(
-        &self,
-        chunk_id: &ChunkId,
-    ) -> Result<Option<u64>, ChunkError> {
+    async fn try_increment_if_exists(&self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
         self.inner.write().try_increment_if_exists(chunk_id)
     }
 
@@ -284,7 +278,9 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
         chunk_id: &ChunkId,
         hold_name: &str,
     ) -> Result<(), ChunkError> {
-        self.inner.write().release_retention_hold(chunk_id, hold_name)
+        self.inner
+            .write()
+            .release_retention_hold(chunk_id, hold_name)
     }
 
     async fn gc(&self) -> u64 {
@@ -305,7 +301,9 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
         fragment_index: u32,
         bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
-        self.inner.write().write_fragment(chunk_id, fragment_index, bytes)
+        self.inner
+            .write()
+            .write_fragment(chunk_id, fragment_index, bytes)
     }
 
     async fn read_fragment(

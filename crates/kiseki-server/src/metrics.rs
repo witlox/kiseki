@@ -488,9 +488,7 @@ pub async fn run_metrics_server(
     peer_addrs: Vec<String>,
     log_store: Option<std::sync::Arc<dyn kiseki_log::LogOps + Send + Sync>>,
     node_info: crate::web::api::NodeInfo,
-    compositions: Option<
-        std::sync::Arc<kiseki_composition::composition::CompositionStore>,
-    >,
+    compositions: Option<std::sync::Arc<kiseki_composition::composition::CompositionStore>>,
     local_chunk_store: Option<std::sync::Arc<dyn kiseki_chunk::AsyncChunkOps>>,
 ) -> std::io::Result<()> {
     use crate::web;

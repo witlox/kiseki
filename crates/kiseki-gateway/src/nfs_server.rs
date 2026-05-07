@@ -160,11 +160,8 @@ pub async fn serve_nfs_listener_with_mgr<G: GatewayOps + Send + Sync + 'static>(
         }
         // Accept with a 50ms cancellation-aware timeout so the
         // shutdown flag is polled promptly without busy-looping.
-        let accepted = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            listener.accept(),
-        )
-        .await;
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await;
         let (stream, peer) = match accepted {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
@@ -240,8 +237,7 @@ where
         handle_nfs4_connection(stream, ctx, sessions).await
     } else {
         // NFSv3 (or unknown — v3 handler returns PROG_MISMATCH for wrong versions).
-        let reply =
-            crate::nfs3_server::handle_nfs3_first_message(&header, &first_msg, &ctx).await;
+        let reply = crate::nfs3_server::handle_nfs3_first_message(&header, &first_msg, &ctx).await;
         crate::nfs_xdr::write_rm_message_async(&mut stream, &reply).await?;
         handle_nfs3_connection(stream, ctx).await
     }

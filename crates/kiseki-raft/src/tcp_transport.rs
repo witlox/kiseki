@@ -1001,14 +1001,7 @@ mod tests {
             k: String,
         }
         let shard = ShardId(uuid::Uuid::from_u128(0x1234));
-        let body = encode_request_body(
-            shard,
-            "vote",
-            &Payload {
-                k: "v".to_owned(),
-            },
-        )
-        .unwrap();
+        let body = encode_request_body(shard, "vote", &Payload { k: "v".to_owned() }).unwrap();
         assert_eq!(body[0], RAFT_TRANSPORT_VERSION_V2);
         let (decoded_shard, decoded_tag, decoded_payload) =
             decode_request_body(&body).expect("decodes");

@@ -66,9 +66,11 @@ pub struct InMemoryGateway {
     /// mutex just to check `ns.read_only` for the simple non-
     /// conditional path — saves one tokio-Mutex round-trip per
     /// write under contention. (2026-05-05 perf spike, option #3.)
-    namespace_meta: std::sync::Arc<parking_lot::RwLock<
-        std::collections::HashMap<kiseki_common::ids::NamespaceId, NamespaceMeta>,
-    >>,
+    namespace_meta: std::sync::Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<kiseki_common::ids::NamespaceId, NamespaceMeta>,
+        >,
+    >,
     chunks: Arc<dyn AsyncChunkOps>,
     aead: Aead,
     master_key: SystemMasterKey,
@@ -276,12 +278,12 @@ impl<'a> ConditionalCheck for ConditionalCheckAdapter<'a> {
                 "object \"{}\" does not exist; If-Match requires existing match",
                 self.name
             )),
-            (crate::ops::WriteConditional::IfMatch(want), Some(got)) if *want != got => Err(
-                format!(
+            (crate::ops::WriteConditional::IfMatch(want), Some(got)) if *want != got => {
+                Err(format!(
                     "object \"{}\" etag mismatch (have {}, want {})",
                     self.name, got.0, want.0
-                ),
-            ),
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -669,9 +671,7 @@ impl InMemoryGateway {
         // outer GatewayOps interface so concurrent add+write on the
         // same namespace_id is not a real workload).
         let meta = NamespaceMeta::from_namespace(&ns);
-        self.namespace_meta
-            .write()
-            .insert(ns.id, meta);
+        self.namespace_meta.write().insert(ns.id, meta);
         self.compositions.add_namespace(ns);
     }
 
@@ -1246,8 +1246,7 @@ impl GatewayOps for InMemoryGateway {
         for chunk_id in &comp.chunks {
             // Cache lookup first (cheap mutex; clone is unavoidable
             // because the cache holds Vec<u8> shared across calls).
-            if let Some(cached) = self.decrypt_cache.lock().get(chunk_id)
-            {
+            if let Some(cached) = self.decrypt_cache.lock().get(chunk_id) {
                 plaintext.extend_from_slice(&cached);
                 continue;
             }
@@ -1601,8 +1600,7 @@ impl GatewayOps for InMemoryGateway {
                         .conditional
                         .as_ref()
                         .map(|cond| ConditionalCheckAdapter { cond, name });
-                    let check_ref =
-                        check_owner.as_ref().map(|c| c as &dyn ConditionalCheck);
+                    let check_ref = check_owner.as_ref().map(|c| c as &dyn ConditionalCheck);
                     comps.create_with_name(
                         req.namespace_id,
                         name.to_owned(),
@@ -1645,7 +1643,7 @@ impl GatewayOps for InMemoryGateway {
             let log = comps.log();
             (comp_id, log, params)
         }; // Lock dropped here — before Raft consensus.
-        // (B9: dropped "composition created (pre-Raft)" debug.)
+           // (B9: dropped "composition created (pre-Raft)" debug.)
 
         // Emit delta to log (async, slow — Raft consensus).
         if let Some(ref log) = log {
@@ -1940,11 +1938,7 @@ impl GatewayOps for InMemoryGateway {
                 );
                 return Err(GatewayError::AuthenticationFailed("tenant mismatch".into()));
             }
-            (
-                comp.shard_id,
-                comp.namespace_id,
-                compositions.log(),
-            )
+            (comp.shard_id, comp.namespace_id, compositions.log())
             // guard drops here — emit runs off-lock
         };
 

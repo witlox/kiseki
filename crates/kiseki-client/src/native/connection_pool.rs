@@ -280,10 +280,7 @@ impl ConnectionPool {
     /// change. Cheap snapshot — clones the keys only.
     #[must_use]
     pub fn open_edges(&self) -> Vec<(u64, BindingId)> {
-        self.entries
-            .iter()
-            .map(|kv| *kv.key())
-            .collect::<Vec<_>>()
+        self.entries.iter().map(|kv| *kv.key()).collect::<Vec<_>>()
     }
 
     /// Drop the pool entry for `(node_id, binding_id)`. ADR-042
@@ -388,8 +385,16 @@ mod tests {
     async fn unsupported_binding_returns_error_without_caching() {
         let pool = ConnectionPool::new();
         let ibverbs = host_port_endpoint(BindingId::Ibverbs, "10.0.0.1:9000");
-        let err = pool.get_or_dial(1, &ibverbs).await.expect_err("ibverbs unsupported");
-        assert!(matches!(err, PoolError::UnsupportedBinding { binding_id: BindingId::Ibverbs }));
+        let err = pool
+            .get_or_dial(1, &ibverbs)
+            .await
+            .expect_err("ibverbs unsupported");
+        assert!(matches!(
+            err,
+            PoolError::UnsupportedBinding {
+                binding_id: BindingId::Ibverbs
+            }
+        ));
         // Failed dial does NOT pollute the pool — the next call
         // also takes the same path.
         assert!(pool.is_empty());
@@ -404,7 +409,10 @@ mod tests {
             latency_class: LatencyClass::Rdma,
             drain_state: None,
         };
-        let err = pool.get_or_dial(1, &edge).await.expect_err("fabric addr unsupported");
+        let err = pool
+            .get_or_dial(1, &edge)
+            .await
+            .expect_err("fabric addr unsupported");
         match err {
             PoolError::UnsupportedFabricAddr(bytes) => {
                 assert_eq!(bytes, vec![0xCA, 0xFE]);
@@ -474,10 +482,7 @@ mod tests {
         assert_eq!(pool.len(), 2, "two bindings → two pool entries");
         let mut edges = pool.open_edges();
         edges.sort();
-        assert_eq!(
-            edges,
-            vec![(7, BindingId::Grpc), (7, BindingId::TcpFramed)],
-        );
+        assert_eq!(edges, vec![(7, BindingId::Grpc), (7, BindingId::TcpFramed)],);
     }
 
     #[tokio::test]
@@ -562,10 +567,7 @@ mod tests {
     // Drain protocol (ADR-042 §3.2.1).
     // -----------------------------------------------------------------
 
-    fn snapshot_advertising(
-        version: u64,
-        per_node: Vec<(u64, Vec<BindingId>)>,
-    ) -> Snapshot {
+    fn snapshot_advertising(version: u64, per_node: Vec<(u64, Vec<BindingId>)>) -> Snapshot {
         let nodes = per_node
             .into_iter()
             .map(|(node_id, ids)| crate::native::Node {

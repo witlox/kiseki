@@ -101,10 +101,7 @@ mod tests {
         let probe = TcpFramedProbe::new("0.0.0.0:9101").with_addr("disabled");
         match probe.probe().await {
             ProbeOutcome::Unavailable { reason } => {
-                assert!(
-                    reason.contains("disabled by operator"),
-                    "reason: {reason}",
-                );
+                assert!(reason.contains("disabled by operator"), "reason: {reason}",);
             }
             other => panic!("expected Unavailable, got: {other:?}"),
         }

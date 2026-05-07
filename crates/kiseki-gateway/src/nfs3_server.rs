@@ -9,9 +9,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::nfs_ops::NfsContext;
-use crate::nfs_xdr::{
-    encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter,
-};
+use crate::nfs_xdr::{encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter};
 use crate::ops::GatewayOps;
 
 /// NFS3 program number.
@@ -221,7 +219,11 @@ async fn reply_getattr<G: GatewayOps>(
     w.into_bytes()
 }
 
-async fn reply_read<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> Vec<u8> {
+async fn reply_read<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
@@ -786,7 +788,11 @@ async fn reply_rmdir<G: GatewayOps>(
     w.into_bytes()
 }
 
-async fn reply_link<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> Vec<u8> {
+async fn reply_link<G: GatewayOps>(
+    xid: u32,
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 

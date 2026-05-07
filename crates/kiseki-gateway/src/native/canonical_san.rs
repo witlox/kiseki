@@ -163,9 +163,7 @@ fn reject_percent_encoded_unreserved(uri: &str) -> Result<(), SanError> {
     while i < bytes.len() {
         if bytes[i] == b'%' {
             if i + 2 >= bytes.len() {
-                return Err(SanError::Malformed(
-                    "incomplete percent-encoding".into(),
-                ));
+                return Err(SanError::Malformed("incomplete percent-encoding".into()));
             }
             let hi = bytes[i + 1];
             let lo = bytes[i + 2];

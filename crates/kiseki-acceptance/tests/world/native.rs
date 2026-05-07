@@ -30,9 +30,8 @@ pub struct NativeWorld {
     /// scenario. Drop releases it. cucumber-rs runs scenarios
     /// concurrently and the singleton must be serialized for
     /// destructive scenarios (drain mode).
-    pub cluster_guard: Option<
-        tokio::sync::OwnedMutexGuard<crate::steps::cluster_harness::ClusterHarness>,
-    >,
+    pub cluster_guard:
+        Option<tokio::sync::OwnedMutexGuard<crate::steps::cluster_harness::ClusterHarness>>,
     /// Named clients keyed by Gherkin name (`client-a`).
     pub clients: HashMap<String, NamedClient>,
     /// Tenant name → UUID. Reused across scenarios for the same name
@@ -66,8 +65,7 @@ pub struct NativeWorld {
     /// scenarios — exercises the per-edge selector + version-regress
     /// logic without spinning up a full multi-node mTLS cluster.
     /// Empty for scenarios that don't touch routing/topology paths.
-    pub topology_cache:
-        Option<std::sync::Arc<kiseki_client::native::TopologyCache>>,
+    pub topology_cache: Option<std::sync::Arc<kiseki_client::native::TopologyCache>>,
     /// Local-environment binding capabilities for `@routing` —
     /// scenarios set this from the "the local client environment
     /// has X available" Given step.
@@ -147,8 +145,8 @@ impl NativeWorld {
     /// hasn't been declared via the `Given native client "<name>" is
     /// configured ...` step.
     pub fn client(&self, name: &str) -> &NamedClient {
-        self.clients
-            .get(name)
-            .unwrap_or_else(|| panic!("native client {name:?} not configured (missing Given step?)"))
+        self.clients.get(name).unwrap_or_else(|| {
+            panic!("native client {name:?} not configured (missing Given step?)")
+        })
     }
 }

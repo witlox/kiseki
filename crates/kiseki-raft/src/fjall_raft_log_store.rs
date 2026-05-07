@@ -210,8 +210,7 @@ mod tests {
     #[tokio::test]
     async fn has_state_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            FjallRaftLogStore::<TestConfig>::open(&dir.path().join("empty")).unwrap();
+        let store = FjallRaftLogStore::<TestConfig>::open(&dir.path().join("empty")).unwrap();
         assert!(!store.has_state());
     }
 

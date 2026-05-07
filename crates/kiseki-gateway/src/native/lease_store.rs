@@ -48,7 +48,9 @@ pub enum AcquireOutcome {
         ttl_remaining_ms: u64,
     },
     /// This node is in drain mode and refusing new leases.
-    Draining { quiesce_window_remaining_ms: u64 },
+    Draining {
+        quiesce_window_remaining_ms: u64,
+    },
 }
 
 /// Outcome of a renewal attempt.
@@ -257,8 +259,7 @@ impl LeaseStore {
     /// `Draining` until `now_ms + quiesce_window_ms`. Existing leases
     /// continue to operate.
     pub fn begin_drain(&self, now_ms: u64) {
-        *self.drain_until_ms.lock() =
-            Some(now_ms.saturating_add(self.quiesce_window_ms));
+        *self.drain_until_ms.lock() = Some(now_ms.saturating_add(self.quiesce_window_ms));
     }
 }
 
@@ -349,7 +350,10 @@ mod tests {
             AcquireOutcome::Granted(g) => g,
             _ => unreachable!(),
         };
-        assert!(matches!(s.release(g.lease_id, "alice"), ReleaseOutcome::Released));
+        assert!(matches!(
+            s.release(g.lease_id, "alice"),
+            ReleaseOutcome::Released
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -359,7 +363,10 @@ mod tests {
             AcquireOutcome::Granted(g) => g,
             _ => unreachable!(),
         };
-        assert!(matches!(s.release(g.lease_id, "bob"), ReleaseOutcome::NotHolder));
+        assert!(matches!(
+            s.release(g.lease_id, "bob"),
+            ReleaseOutcome::NotHolder
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]

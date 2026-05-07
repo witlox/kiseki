@@ -324,9 +324,7 @@ impl<G: GatewayOps> NfsContext<G> {
                 .lock_or_die("nfs_ops.write_buffers");
             if let Some(buf) = buffers.get(fh) {
                 let off = usize::try_from(offset).unwrap_or(usize::MAX);
-                let end = off
-                    .saturating_add(count as usize)
-                    .min(buf.len());
+                let end = off.saturating_add(count as usize).min(buf.len());
                 let slice = if off < buf.len() {
                     buf[off..end].to_vec()
                 } else {
@@ -386,10 +384,7 @@ impl<G: GatewayOps> NfsContext<G> {
         // created). Leaving the empty Vec in place preserves the
         // 0-byte read semantics of an empty file.
         let data = {
-            let mut buffers = self
-                .write_buffers
-                .lock()
-                .lock_or_die("nfs_ops.unknown");
+            let mut buffers = self.write_buffers.lock().lock_or_die("nfs_ops.unknown");
             // Only remove + return when there's actually data to
             // flush. An empty Vec marks a CREATE-pending fh; we
             // need to keep it so subsequent reads still serve
@@ -484,11 +479,9 @@ impl<G: GatewayOps> NfsContext<G> {
         // matches what `HandleRegistry::file_handle` produces for
         // post-write handles; clients can't tell the difference.
         let placeholder_id = CompositionId(uuid::Uuid::new_v4());
-        let fh = self.handles.file_handle(
-            self.namespace_id,
-            self.tenant_id,
-            placeholder_id,
-        );
+        let fh = self
+            .handles
+            .file_handle(self.namespace_id, self.tenant_id, placeholder_id);
         // Pre-populate write_buffers with an empty Vec — both
         // signals "this fh is buffer-served" to `read` AND gives
         // `buffer_write` a starting point so the entry().or_default()
@@ -497,13 +490,8 @@ impl<G: GatewayOps> NfsContext<G> {
             .lock()
             .lock_or_die("nfs_ops.write_buffers")
             .insert(fh, Vec::new());
-        self.dir_index.insert(
-            self.namespace_id,
-            name.to_owned(),
-            fh,
-            placeholder_id,
-            0,
-        );
+        self.dir_index
+            .insert(self.namespace_id, name.to_owned(), fh, placeholder_id, 0);
         Ok((
             fh,
             NfsWriteResponse {

@@ -76,8 +76,7 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<ChunkRecord, ChunkError> {
             "chunk record schema too new: found={version} supported={CHUNK_RECORD_SCHEMA_VERSION}"
         )));
     }
-    postcard::from_bytes(payload)
-        .map_err(|e| ChunkError::Io(format!("decode chunk record: {e}")))
+    postcard::from_bytes(payload).map_err(|e| ChunkError::Io(format!("decode chunk record: {e}")))
 }
 
 // -- Fragment meta record (one per (`chunk_id`, `fragment_index`)) ----

@@ -17,9 +17,7 @@
 //! listener-spawn time (phase 10 hardware work). On dev hosts
 //! without RDMA hardware, returns `Unavailable` cleanly.
 
-use kiseki_proto::native_contract::{
-    BindingId, LatencyClass, LibfabricProvider, ListenAddr,
-};
+use kiseki_proto::native_contract::{BindingId, LatencyClass, LibfabricProvider, ListenAddr};
 
 use super::selector::{BindingProbe, ProbeOutcome};
 
@@ -120,7 +118,9 @@ impl BindingProbe for LibfabricProbe {
         if self.pinned_provider.is_some() {
             if let Err(reason) = validate_pinned_provider(provider) {
                 return ProbeOutcome::Unavailable {
-                    reason: format!("KISEKI_NATIVE_LIBFABRIC_PROVIDER pinned to {provider:?}: {reason}"),
+                    reason: format!(
+                        "KISEKI_NATIVE_LIBFABRIC_PROVIDER pinned to {provider:?}: {reason}"
+                    ),
                 };
             }
         }
@@ -235,15 +235,15 @@ mod tests {
                     "reason should name the failure mode: {reason}",
                 );
             }
-            ProbeOutcome::Available { latency_class, addr } => {
+            ProbeOutcome::Available {
+                latency_class,
+                addr,
+            } => {
                 // Some dev hosts have libfabric installed (e.g. for
                 // testing). Sockets-provider fallback yields
                 // Standard latency class.
                 assert!(
-                    matches!(
-                        latency_class,
-                        LatencyClass::Standard | LatencyClass::Rdma
-                    ),
+                    matches!(latency_class, LatencyClass::Standard | LatencyClass::Rdma),
                     "latency class must match a known provider: {latency_class:?}",
                 );
                 if let ListenAddr::FabricDescriptor(bytes) = &addr {

@@ -114,10 +114,7 @@ impl BindingProbe for IbverbsProbe {
 /// `Some(name)` → only that device qualifies; if absent / no active
 /// port, return `Err`.
 #[cfg(target_os = "linux")]
-fn probe_sysfs_for_active_device(
-    wanted_device: Option<&str>,
-    port: u32,
-) -> Result<String, String> {
+fn probe_sysfs_for_active_device(wanted_device: Option<&str>, port: u32) -> Result<String, String> {
     let infiniband_dir = std::path::Path::new("/sys/class/infiniband");
     let dir = match std::fs::read_dir(infiniband_dir) {
         Ok(d) => d,
@@ -190,9 +187,7 @@ mod tests {
             ProbeOutcome::Unavailable { reason } => {
                 let r = reason.to_ascii_lowercase();
                 assert!(
-                    r.contains("libibverbs")
-                        || r.contains("infiniband")
-                        || r.contains("non-linux"),
+                    r.contains("libibverbs") || r.contains("infiniband") || r.contains("non-linux"),
                     "reason should name the failure mode: {reason}",
                 );
             }

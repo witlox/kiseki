@@ -28,8 +28,7 @@ pub struct UiState {
     /// Shared composition store handle (ADR-040 / I-2): the per-shard
     /// leader endpoint surfaces the hydrator's halt flag from here so
     /// load balancers can route around a halted node.
-    pub compositions:
-        Option<Arc<kiseki_composition::composition::CompositionStore>>,
+    pub compositions: Option<Arc<kiseki_composition::composition::CompositionStore>>,
     /// Local chunk store — `/admin/chunk/{id}` reports per-node fragment
     /// presence by calling `list_fragments` on this handle. Operators
     /// use the endpoint to debug placement / GC / under-replication.

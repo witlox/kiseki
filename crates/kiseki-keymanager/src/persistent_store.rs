@@ -218,8 +218,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_and_read() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            PersistentKeyStore::open(&dir.path().join("keys"), &identity(), SALT).unwrap();
+        let store = PersistentKeyStore::open(&dir.path().join("keys"), &identity(), SALT).unwrap();
         assert_eq!(store.current_epoch().await.unwrap(), KeyEpoch(1));
         assert!(store.fetch_master_key(KeyEpoch(1)).await.is_ok());
     }

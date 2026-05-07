@@ -176,11 +176,7 @@ impl FjallMetaStore {
         batch.commit().map_err(map_err)
     }
 
-    pub fn remove_fragment(
-        &self,
-        id: &ChunkId,
-        fragment_index: u32,
-    ) -> Result<(), ChunkError> {
+    pub fn remove_fragment(&self, id: &ChunkId, fragment_index: u32) -> Result<(), ChunkError> {
         let key = fragment_key(id, fragment_index);
         let mut batch = self.batch_for_write();
         batch.remove(&self.fragments_ks, key.to_vec());

@@ -150,11 +150,15 @@ impl TcpFramedListener {
             }
 
             tokio::spawn(async move {
-                let conn_id =
-                    ConnectionId(conn_id_counter.fetch_add(1, Ordering::Relaxed));
-                let result =
-                    handle_one_connection(tcp_stream, acceptor.as_ref().clone(), allow_plaintext, server, conn_id)
-                        .await;
+                let conn_id = ConnectionId(conn_id_counter.fetch_add(1, Ordering::Relaxed));
+                let result = handle_one_connection(
+                    tcp_stream,
+                    acceptor.as_ref().clone(),
+                    allow_plaintext,
+                    server,
+                    conn_id,
+                )
+                .await;
                 if let Some(c) = per_peer.get(&peer_key) {
                     c.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -254,7 +258,7 @@ mod tests {
     use kiseki_proto::native_contract::wire_tcp_framed::{
         decode_response_frame, encode_request_frame, WireStatus,
     };
-    use kiseki_proto::v1 as v1;
+    use kiseki_proto::v1;
     use kiseki_proto::v1::native as np;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

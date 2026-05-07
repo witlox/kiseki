@@ -11,11 +11,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod config;
-pub mod log_store;
-pub mod mem_transport;
-pub mod membership;
-pub mod network;
-pub mod node;
 #[allow(
     missing_docs,
     clippy::len_without_is_empty,
@@ -29,6 +24,11 @@ pub mod node;
     deprecated
 )]
 pub mod fjall_log_store;
+pub mod log_store;
+pub mod mem_transport;
+pub mod membership;
+pub mod network;
+pub mod node;
 
 pub use config::KisekiRaftConfig;
 pub use log_store::MemLogStore;

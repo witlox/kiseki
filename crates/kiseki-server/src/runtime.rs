@@ -969,12 +969,9 @@ pub async fn run_main(
                 // cadence. Same contract as the previous redb
                 // write-behind drainer's flush loop.
                 tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(
-                        std::time::Duration::from_millis(interval_ms),
-                    );
-                    tick.set_missed_tick_behavior(
-                        tokio::time::MissedTickBehavior::Delay,
-                    );
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tick.tick().await;
                         if let Err(e) = flusher.flush() {
@@ -1001,9 +998,8 @@ pub async fn run_main(
             tracing::info!("composition store: in-memory (no KISEKI_DATA_DIR)");
             Box::new(kiseki_composition::persistent::MemoryStorage::new())
         };
-    let comp_store =
-        kiseki_composition::composition::CompositionStore::with_storage(comp_storage)
-            .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
+    let comp_store = kiseki_composition::composition::CompositionStore::with_storage(comp_storage)
+        .with_log(Arc::clone(&log_store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
 
     // View: shared between gateway (staleness check) and stream
     // processor. With KISEKI_DATA_DIR set, persist views via the
@@ -1054,17 +1050,15 @@ pub async fn run_main(
         versioning_enabled: false,
         compliance_tags: Vec::new(),
     });
-    let _ = view_store
-        .write()
-        .create_view(kiseki_view::ViewDescriptor {
-            view_id: bootstrap_view,
-            tenant_id: bootstrap_tenant,
-            source_shards: vec![bootstrap_shard],
-            protocol: kiseki_view::ProtocolSemantics::Posix,
-            consistency: kiseki_view::ConsistencyModel::ReadYourWrites,
-            discardable: true,
-            version: 1,
-        });
+    let _ = view_store.write().create_view(kiseki_view::ViewDescriptor {
+        view_id: bootstrap_view,
+        tenant_id: bootstrap_tenant,
+        source_shards: vec![bootstrap_shard],
+        protocol: kiseki_view::ProtocolSemantics::Posix,
+        consistency: kiseki_view::ConsistencyModel::ReadYourWrites,
+        discardable: true,
+        version: 1,
+    });
     if cfg.bootstrap {
         tracing::info!("bootstrap: namespace 'default' + view installed (Raft seed node)");
     } else {
@@ -1085,10 +1079,7 @@ pub async fn run_main(
         .and_then(|v| v.parse().ok())
         .unwrap_or(300_000);
     let native_signing_keys = std::sync::Arc::new(
-        kiseki_gateway::native::signing_keys::SigningKeys::new(
-            &master_key,
-            native_grace_ms,
-        ),
+        kiseki_gateway::native::signing_keys::SigningKeys::new(&master_key, native_grace_ms),
     );
     // Phase 16b step 2: pass the cluster's node-id list as the
     // placement for every fresh chunk. In a 1-node cluster this is
@@ -1539,9 +1530,7 @@ pub async fn run_main(
                 size_metrics
                     .store_size_bytes
                     .set(i64::try_from(total).unwrap_or(i64::MAX));
-                if let Ok(c) =
-                    count_compositions.with_storage_locked(|s| s.count())
-                {
+                if let Ok(c) = count_compositions.with_storage_locked(|s| s.count()) {
                     size_metrics.count.set(i64::try_from(c).unwrap_or(i64::MAX));
                 }
             }
@@ -1808,11 +1797,8 @@ pub async fn run_main(
     // synthetic dev principal (the runtime is single-tenant in that
     // posture). Audit emission uses NullAuditSink today; Phase 4
     // follow-up replaces it with the real `kiseki-audit` adapter.
-    let native_audit: std::sync::Arc<
-        dyn kiseki_gateway::native::san_interceptor::AuditSink,
-    > = std::sync::Arc::new(
-        kiseki_gateway::native::san_interceptor::NullAuditSink,
-    );
+    let native_audit: std::sync::Arc<dyn kiseki_gateway::native::san_interceptor::AuditSink> =
+        std::sync::Arc::new(kiseki_gateway::native::san_interceptor::NullAuditSink);
     let native_intercept = std::sync::Arc::new(
         kiseki_gateway::native::san_interceptor::SanInterceptor::new(
             native_audit,
@@ -1918,17 +1904,16 @@ pub async fn run_main(
                 );
             }
             kiseki_proto::native_contract::BindingId::TcpFramed => {
-                let addr_str =
-                    if let kiseki_proto::native_contract::ListenAddr::HostPort(s) = &binding.addr {
-                        s.clone()
-                    } else {
-                        // TCP-framed should always have a host:port —
-                        // FabricDescriptor is RDMA-only.
-                        tracing::warn!(
-                            "TCP-framed binding probed with non-HostPort addr; skipping",
-                        );
-                        continue;
-                    };
+                let addr_str = if let kiseki_proto::native_contract::ListenAddr::HostPort(s) =
+                    &binding.addr
+                {
+                    s.clone()
+                } else {
+                    // TCP-framed should always have a host:port —
+                    // FabricDescriptor is RDMA-only.
+                    tracing::warn!("TCP-framed binding probed with non-HostPort addr; skipping",);
+                    continue;
+                };
                 tcp_framed_listener_to_spawn =
                     Some(kiseki_gateway::native::tcp_framed::TcpFramedListener::new(
                         addr_str.clone(),

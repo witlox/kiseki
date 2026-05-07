@@ -261,27 +261,25 @@ pub fn build_request_header(
             verb_bytes.len()
         )));
     }
-    let total_body_len =
-        REQUEST_HEADER_FIXED_LEN + verb_bytes.len() + 4 + meta_len + bulk_len;
+    let total_body_len = REQUEST_HEADER_FIXED_LEN + verb_bytes.len() + 4 + meta_len + bulk_len;
     if total_body_len > NATIVE_TCP_FRAMED_MAX_BODY {
         return Err(WireEncodeError::Oversize {
             len: total_body_len,
             cap: NATIVE_TCP_FRAMED_MAX_BODY,
         });
     }
-    let mut out =
-        Vec::with_capacity(4 + REQUEST_HEADER_FIXED_LEN + verb_bytes.len() + 4);
+    let mut out = Vec::with_capacity(4 + REQUEST_HEADER_FIXED_LEN + verb_bytes.len() + 4);
     out.extend_from_slice(
-        &u32::try_from(total_body_len).unwrap_or(u32::MAX).to_be_bytes(),
+        &u32::try_from(total_body_len)
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
     );
     out.push(NATIVE_TCP_FRAMED_VERSION_V3);
     out.extend_from_slice(&request_id.to_be_bytes());
     #[allow(clippy::cast_possible_truncation)]
     out.push(verb_bytes.len() as u8);
     out.extend_from_slice(verb_bytes);
-    out.extend_from_slice(
-        &u32::try_from(meta_len).unwrap_or(u32::MAX).to_be_bytes(),
-    );
+    out.extend_from_slice(&u32::try_from(meta_len).unwrap_or(u32::MAX).to_be_bytes());
     Ok(out)
 }
 
@@ -385,14 +383,14 @@ pub fn build_response_header(
     }
     let mut header = [0u8; 4 + RESPONSE_HEADER_LEN];
     header[0..4].copy_from_slice(
-        &u32::try_from(total_body_len).unwrap_or(u32::MAX).to_be_bytes(),
+        &u32::try_from(total_body_len)
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
     );
     header[4] = NATIVE_TCP_FRAMED_VERSION_V3;
     header[5] = status as u8;
     header[6..14].copy_from_slice(&request_id.to_be_bytes());
-    header[14..18].copy_from_slice(
-        &u32::try_from(meta_len).unwrap_or(u32::MAX).to_be_bytes(),
-    );
+    header[14..18].copy_from_slice(&u32::try_from(meta_len).unwrap_or(u32::MAX).to_be_bytes());
     Ok(header)
 }
 
@@ -463,7 +461,6 @@ pub fn decode_response_frame(body: &[u8]) -> Result<ResponseFrameView<'_>, WireD
     })
 }
 
-
 /// Validate a length prefix read from the wire. Caller has already
 /// read the four-byte BE length; this enforces the cap and returns
 /// the validated body length so the caller knows how many bytes to
@@ -509,8 +506,7 @@ mod tests {
         let bulk = b"raw-bulk-bytes";
         let framed = encode_request_frame(42, "get_object", meta, bulk).expect("encode");
         assert!(framed.len() > 4);
-        let length =
-            u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
+        let length = u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
         let frame_body = &framed[4..];
         assert_eq!(frame_body.len(), length);
         let view = decode_request_frame(frame_body).expect("decode");
@@ -598,8 +594,7 @@ mod tests {
     fn response_frame_roundtrip_ok() {
         let meta = b"meta-bytes";
         let bulk = b"raw-bulk-bytes";
-        let framed =
-            encode_response_frame(WireStatus::Ok, 99, meta, bulk).expect("encode");
+        let framed = encode_response_frame(WireStatus::Ok, 99, meta, bulk).expect("encode");
         let body = &framed[4..];
         let view = decode_response_frame(body).expect("decode");
         assert_eq!(view.status, WireStatus::Ok);
@@ -622,8 +617,8 @@ mod tests {
         let payload = b"reason: san_payload_tenant_mismatch";
         // Error reason rides in `meta` (postcard-decoded as a String
         // by the caller); bulk is empty on error frames.
-        let framed = encode_response_frame(WireStatus::PermissionDenied, 7, payload, &[])
-            .expect("encode");
+        let framed =
+            encode_response_frame(WireStatus::PermissionDenied, 7, payload, &[]).expect("encode");
         let body = &framed[4..];
         let view = decode_response_frame(body).expect("decode");
         assert_eq!(view.status, WireStatus::PermissionDenied);
@@ -719,8 +714,7 @@ mod tests {
     #[test]
     fn encode_response_frame_oversize_rejected() {
         let payload = vec![0u8; NATIVE_TCP_FRAMED_MAX_BODY];
-        let err =
-            encode_response_frame(WireStatus::Ok, 0, &[], &payload).expect_err("must reject");
+        let err = encode_response_frame(WireStatus::Ok, 0, &[], &payload).expect_err("must reject");
         assert!(matches!(err, WireEncodeError::Oversize { .. }));
     }
 
@@ -748,7 +742,7 @@ mod tests {
         assert_eq!(request_id, 7);
         // [verb_tag_len u8]
         assert_eq!(framed[13], 4); // "ping" is 4 bytes
-        // [verb_tag bytes]
+                                   // [verb_tag bytes]
         assert_eq!(&framed[14..18], b"ping");
         // [meta_len u32 BE]
         let meta_len = u32::from_be_bytes(framed[18..22].try_into().unwrap()) as usize;
@@ -764,8 +758,7 @@ mod tests {
     fn response_frame_layout_matches_spec() {
         let meta = b"\xDE\xAD";
         let bulk = b"\xBE\xEF";
-        let framed =
-            encode_response_frame(WireStatus::Ok, 13, meta, bulk).expect("encode");
+        let framed = encode_response_frame(WireStatus::Ok, 13, meta, bulk).expect("encode");
         let len = u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
         assert_eq!(len, framed.len() - 4);
         assert_eq!(framed[4], NATIVE_TCP_FRAMED_VERSION_V3);

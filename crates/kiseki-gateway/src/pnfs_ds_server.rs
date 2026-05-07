@@ -27,9 +27,7 @@ use crate::nfs4_server::{
     nfs4_status, op, op_create_session, op_destroy_session, op_exchange_id_with_role, op_sequence,
     ServerRole, SessionManager,
 };
-use crate::nfs_xdr::{
-    encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter,
-};
+use crate::nfs_xdr::{encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter};
 use crate::ops::{GatewayOps, ReadRequest};
 use crate::pnfs::{FhValidateError, PnfsFhMacKey, PnfsFileHandle};
 
@@ -197,11 +195,8 @@ pub async fn serve_ds_listener<G: GatewayOps + Send + Sync + 'static>(
                 return;
             }
         }
-        let accepted = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            listener.accept(),
-        )
-        .await;
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await;
         let (stream, peer) = match accepted {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
@@ -220,8 +215,7 @@ pub async fn serve_ds_listener<G: GatewayOps + Send + Sync + 'static>(
                 let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
                 match acceptor.accept(stream).await {
                     Ok(mut tls_stream) => {
-                        if let Err(e) =
-                            handle_ds_connection(&mut tls_stream, &ctx, &sessions).await
+                        if let Err(e) = handle_ds_connection(&mut tls_stream, &ctx, &sessions).await
                         {
                             tracing::debug!(error = %e, peer = %peer, "DS-over-TLS connection ended");
                         }
@@ -701,7 +695,8 @@ mod tests {
         let inner = buf.into_bytes();
         let mut reader = XdrReader::new(&inner);
 
-        let (status, _) = process_ds_op(ALLOCATE_OP, &mut reader, &ctx, &session_mgr, &mut state).await;
+        let (status, _) =
+            process_ds_op(ALLOCATE_OP, &mut reader, &ctx, &session_mgr, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4ERR_NOTSUPP);
         assert!(state.current_fh.is_none());
     }

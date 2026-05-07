@@ -196,10 +196,9 @@ impl MtlsCerts {
         // Sanity-check via the gateway's canonicalizer so a typo in
         // the test fixture surfaces as a panic, not a runtime
         // canonicalization-mismatch reject from the server.
-        kiseki_gateway::native::canonical_san::canonicalize(&san_uri)
-            .unwrap_or_else(|e| {
-                panic!("non-canonical kiseki tenant SAN in test fixture: {san_uri:?}: {e}")
-            });
+        kiseki_gateway::native::canonical_san::canonicalize(&san_uri).unwrap_or_else(|e| {
+            panic!("non-canonical kiseki tenant SAN in test fixture: {san_uri:?}: {e}")
+        });
 
         let mut cache = self.kiseki_tenant_certs.lock().unwrap();
         if let Some(c) = cache.get(tenant_id) {
@@ -211,9 +210,10 @@ impl MtlsCerts {
         }
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::NoCa;
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, format!("kiseki-tenant-{tenant_id}"));
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!("kiseki-tenant-{tenant_id}"),
+        );
         params
             .subject_alt_names
             .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
@@ -232,11 +232,14 @@ impl MtlsCerts {
             cert_pem: cert.pem(),
             key_pem: key.serialize_pem(),
         };
-        cache.insert(tenant_id.to_string(), TenantClientCert {
-            san_uri: entry.san_uri.clone(),
-            cert_pem: entry.cert_pem.clone(),
-            key_pem: entry.key_pem.clone(),
-        });
+        cache.insert(
+            tenant_id.to_string(),
+            TenantClientCert {
+                san_uri: entry.san_uri.clone(),
+                cert_pem: entry.cert_pem.clone(),
+                key_pem: entry.key_pem.clone(),
+            },
+        );
         entry
     }
 

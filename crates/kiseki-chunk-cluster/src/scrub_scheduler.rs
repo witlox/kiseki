@@ -353,10 +353,7 @@ mod tests {
         async fn increment_refcount(&self, _id: &ChunkId) -> Result<u64, ChunkError> {
             unreachable!()
         }
-        async fn try_increment_if_exists(
-            &self,
-            _id: &ChunkId,
-        ) -> Result<Option<u64>, ChunkError> {
+        async fn try_increment_if_exists(&self, _id: &ChunkId) -> Result<Option<u64>, ChunkError> {
             unreachable!("scheduler test does not dedup-write")
         }
         async fn decrement_refcount(&self, _id: &ChunkId) -> Result<u64, ChunkError> {

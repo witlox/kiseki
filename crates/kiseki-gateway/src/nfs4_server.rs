@@ -14,9 +14,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use crate::nfs_ops::{FileHandle, NfsContext};
-use crate::nfs_xdr::{
-    encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter,
-};
+use crate::nfs_xdr::{encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter};
 use crate::ops::GatewayOps;
 use kiseki_common::locks::LockOrDie;
 
@@ -600,7 +598,10 @@ pub(crate) async fn op_destroy_session(
     }
 }
 
-pub(crate) async fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) async fn op_sequence(
+    reader: &mut XdrReader<'_>,
+    sessions: &SessionManager,
+) -> (u32, Vec<u8>) {
     let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
     let mut session_id = [0u8; 16];
     if sid_bytes.len() == 16 {
@@ -630,7 +631,10 @@ pub(crate) async fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionMa
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-async fn op_putrootfh<G: GatewayOps>(ctx: &NfsContext<G>, state: &mut CompoundState) -> (u32, Vec<u8>) {
+async fn op_putrootfh<G: GatewayOps>(
+    ctx: &NfsContext<G>,
+    state: &mut CompoundState,
+) -> (u32, Vec<u8>) {
     // RFC 8881 §18.21 + Phase 15c.2: PUTROOTFH returns the server's
     // pseudo-root, NOT a specific namespace root. The pseudo-root is
     // a virtual parent directory whose only child is "default", which
@@ -1923,7 +1927,10 @@ async fn op_lookup<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-async fn op_remove<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+async fn op_remove<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> (u32, Vec<u8>) {
     let name = reader.read_string().unwrap_or_default();
 
     let mut w = XdrWriter::new();
@@ -2076,7 +2083,10 @@ async fn op_setattr<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-async fn op_rename<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+async fn op_rename<G: GatewayOps>(
+    reader: &mut XdrReader<'_>,
+    ctx: &NfsContext<G>,
+) -> (u32, Vec<u8>) {
     let old_name = reader.read_string().unwrap_or_default();
     let new_name = reader.read_string().unwrap_or_default();
 
@@ -2825,7 +2835,9 @@ mod tests {
         let sessions = test_sessions();
 
         // Create and open a file to get a stateid.
-        ctx.write_named("closeable.txt", b"data".to_vec()).await.unwrap();
+        ctx.write_named("closeable.txt", b"data".to_vec())
+            .await
+            .unwrap();
         let (fh, _) = ctx.lookup_by_name("closeable.txt").await.unwrap();
         let sid = sessions.open_file(fh);
 
@@ -3088,7 +3100,8 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (_status, result) = op_exchange_id_with_role(&mut reader, &sessions, ServerRole::Ds).await;
+        let (_status, result) =
+            op_exchange_id_with_role(&mut reader, &sessions, ServerRole::Ds).await;
 
         let mut r = XdrReader::new(&result);
         let _ = r.read_u32();

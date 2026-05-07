@@ -22,8 +22,11 @@ pub fn node_info_from_plan(
     state: np::NodeState,
     plan: &SelectorPlan,
 ) -> np::NodeInfo {
-    let bindings: Vec<np::BindingEndpoint> =
-        plan.spawn_order.iter().map(binding_endpoint_to_proto).collect();
+    let bindings: Vec<np::BindingEndpoint> = plan
+        .spawn_order
+        .iter()
+        .map(binding_endpoint_to_proto)
+        .collect();
     let legacy_addr = bindings
         .iter()
         .find(|b| b.binding_id == np::BindingId::Grpc as i32)

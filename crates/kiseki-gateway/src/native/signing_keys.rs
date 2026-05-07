@@ -159,7 +159,8 @@ impl SigningKeys {
         }
         g.keys.insert(new_epoch, EpochKeys::derive(new_master));
         g.current_epoch = new_epoch;
-        g.retired_at.insert(retiring, now_ms.saturating_add(self.grace_ms));
+        g.retired_at
+            .insert(retiring, now_ms.saturating_add(self.grace_ms));
     }
 
     /// Drop epochs whose grace window expired before `now_ms`.

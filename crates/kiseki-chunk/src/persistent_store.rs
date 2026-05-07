@@ -68,9 +68,10 @@ fn extents_from_record(record: &ChunkRecord) -> Vec<Extent> {
 /// On-disk path for the small per-pool config (rare admin
 /// mutations). Sibling of the fjall meta directory.
 fn pools_path_for(meta_dir: &Path) -> std::path::PathBuf {
-    meta_dir
-        .parent()
-        .map_or_else(|| std::path::PathBuf::from("pools.json"), |p| p.join("pools.json"))
+    meta_dir.parent().map_or_else(
+        || std::path::PathBuf::from("pools.json"),
+        |p| p.join("pools.json"),
+    )
 }
 
 /// Persistent chunk store — in-memory index + fjall WAL + device
@@ -585,15 +586,8 @@ impl ChunkOps for PersistentChunkStore {
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
-        if !entry
-            .record
-            .retention_holds
-            .contains(&hold_name.to_owned())
-        {
-            entry
-                .record
-                .retention_holds
-                .push(hold_name.to_owned());
+        if !entry.record.retention_holds.contains(&hold_name.to_owned()) {
+            entry.record.retention_holds.push(hold_name.to_owned());
         }
         let updated = entry.record.clone();
         drop(chunks);
@@ -610,10 +604,7 @@ impl ChunkOps for PersistentChunkStore {
         let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
-        entry
-            .record
-            .retention_holds
-            .retain(|h| h != hold_name);
+        entry.record.retention_holds.retain(|h| h != hold_name);
         let updated = entry.record.clone();
         drop(chunks);
         self.meta.put_chunk(&updated)?;
@@ -628,9 +619,7 @@ impl ChunkOps for PersistentChunkStore {
 
         let to_remove: Vec<(ChunkId, Vec<Extent>, String, u64)> = chunks
             .iter()
-            .filter(|(_, e)| {
-                e.record.refcount == 0 && e.record.retention_holds.is_empty()
-            })
+            .filter(|(_, e)| e.record.refcount == 0 && e.record.retention_holds.is_empty())
             .map(|(id, e)| {
                 (
                     *id,
