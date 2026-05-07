@@ -108,8 +108,8 @@ mod status {
 /// even those kiseki does not implement. The dispatcher MUST recognize
 /// each number; un-implemented procs route to PROC_UNAVAIL but the
 /// number is reserved.
-#[test]
-fn s3_0_procedure_registry_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_0_procedure_registry_pinned() {
     assert_eq!(NFS3_PROGRAM, 100003, "RFC 1813 §1.2: program = 100003");
     assert_eq!(NFS3_VERSION, 3, "RFC 1813 §1.2: version = 3");
 
@@ -241,14 +241,14 @@ fn reader_at_proc_result(reply: &[u8]) -> XdrReader<'_> {
 /// RFC 1813 §3.3.0 — NULL: takes no args, returns no body. The reply
 /// MUST be a bare `MSG_ACCEPTED + SUCCESS` with no procedure result
 /// bytes following.
-#[test]
-fn s3_3_0_null_returns_empty_body() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_0_null_returns_empty_body() {
     let ctx = make_ctx();
     let xid = 0x0000_0001;
     let header = make_header(xid, proc::NULL);
     let raw = build_nfs3_call(xid, proc::NULL, &[]);
 
-    let reply = handle_nfs3_first_message(&header, &raw, &ctx);
+    let reply = handle_nfs3_first_message(&header, &raw, &ctx).await;
     let mut r = XdrReader::new(&reply);
     assert_eq!(r.read_u32().unwrap(), xid, "xid echoed");
     let _msg_type = r.read_u32().unwrap();
@@ -271,15 +271,15 @@ fn s3_3_0_null_returns_empty_body() {
 /// RFC 1813 §3.3.1 — GETATTR: input `nfs_fh3` (32-byte handle),
 /// output on success is `NFS3_OK + fattr3`. `fattr3` is a fixed-shape
 /// 21-u32-equivalent struct (with three nfstime3 trios at the tail).
-#[test]
-fn s3_3_1_getattr_root_handle_returns_ok_and_directory_fattr3() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_1_getattr_root_handle_returns_ok_and_directory_fattr3() {
     let ctx = make_ctx();
     let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
     let mut body = XdrWriter::new();
     body.write_opaque(&root_fh);
     let raw = build_nfs3_call(7, proc::GETATTR, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(7, proc::GETATTR), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(7, proc::GETATTR), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(
@@ -295,14 +295,14 @@ fn s3_3_1_getattr_root_handle_returns_ok_and_directory_fattr3() {
 /// RFC 1813 §3.3.1 — negative path. Per §2.6 a malformed handle
 /// (length != 32 octets in our concrete fh3 shape) MUST be rejected
 /// with `NFS3ERR_BADHANDLE` (10001).
-#[test]
-fn s3_3_1_getattr_short_handle_returns_badhandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_1_getattr_short_handle_returns_badhandle() {
     let ctx = make_ctx();
     let mut body = XdrWriter::new();
     body.write_opaque(&[0xDEu8, 0xAD]); // 2 bytes, not 32
     let raw = build_nfs3_call(11, proc::GETATTR, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(11, proc::GETATTR), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(11, proc::GETATTR), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(
@@ -319,8 +319,8 @@ fn s3_3_1_getattr_short_handle_returns_badhandle() {
 /// RFC 1813 §3.3.3 — LOOKUP(dir_fh, name): on miss returns
 /// `NFS3ERR_NOENT` (2) followed by the `post_op_attr` for the
 /// directory.
-#[test]
-fn s3_3_3_lookup_missing_name_returns_noent() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_3_lookup_missing_name_returns_noent() {
     let ctx = make_ctx();
     let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
     let mut body = XdrWriter::new();
@@ -328,7 +328,7 @@ fn s3_3_3_lookup_missing_name_returns_noent() {
     body.write_string("does-not-exist.txt");
     let raw = build_nfs3_call(20, proc::LOOKUP, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(20, proc::LOOKUP), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(20, proc::LOOKUP), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(
@@ -346,8 +346,8 @@ fn s3_3_3_lookup_missing_name_returns_noent() {
 /// surface as either NFS3ERR_BADHANDLE (handle unknown) or
 /// NFS3ERR_IO (handle decode succeeded but the lookup failed). A
 /// strict server prefers NFS3ERR_BADHANDLE per §2.6's classification.
-#[test]
-fn s3_3_6_read_unknown_handle_yields_io_or_badhandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_6_read_unknown_handle_yields_io_or_badhandle() {
     let ctx = make_ctx();
     let mut body = XdrWriter::new();
     body.write_opaque(&[0x55u8; 32]); // never-registered 32-byte handle
@@ -355,7 +355,7 @@ fn s3_3_6_read_unknown_handle_yields_io_or_badhandle() {
     body.write_u32(4096); // count
     let raw = build_nfs3_call(33, proc::READ, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(33, proc::READ), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(33, proc::READ), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert!(
@@ -384,8 +384,8 @@ fn s3_3_6_read_unknown_handle_yields_io_or_badhandle() {
 /// COMMIT/CLOSE (see `s3_3_7_write_at_nonzero_offset_buffers_data`
 /// for the offset > 0 witness; the buffered-write rewrite landed in
 /// commit 40cac2b).
-#[test]
-fn s3_3_7_write_at_offset_zero_returns_ok_and_count() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_7_write_at_offset_zero_returns_ok_and_count() {
     let ctx = make_ctx();
     let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
 
@@ -394,11 +394,12 @@ fn s3_3_7_write_at_offset_zero_returns_ok_and_count() {
     body.write_opaque(&root_fh);
     body.write_string("layer1-write.txt");
     let raw = build_nfs3_call(50, proc::CREATE, &body.into_bytes());
-    let _ = handle_nfs3_first_message(&make_header(50, proc::CREATE), &raw, &ctx);
+    let _ = handle_nfs3_first_message(&make_header(50, proc::CREATE), &raw, &ctx).await;
 
     // LOOKUP returns the file handle.
     let (file_fh, _) = ctx
         .lookup_by_name("layer1-write.txt")
+        .await
         .expect("CREATE must have registered the handle");
 
     // WRITE with stable_how = FILE_SYNC (2) per RFC 1813 §3.3.7.
@@ -411,7 +412,7 @@ fn s3_3_7_write_at_offset_zero_returns_ok_and_count() {
     body.write_opaque(payload);
     let raw = build_nfs3_call(51, proc::WRITE, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(51, proc::WRITE), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(51, proc::WRITE), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(nfs_status, status::NFS3_OK, "RFC 1813 §3.3.7: WRITE OK");
@@ -437,8 +438,8 @@ fn s3_3_7_write_at_offset_zero_returns_ok_and_count() {
 /// RFC 1813 §3.3.8 — CREATE(dir_fh, name, createhow): on success
 /// returns `NFS3_OK + post_op_fh3{handle_follows=TRUE, fh3} +
 /// post_op_attr + wcc_data`.
-#[test]
-fn s3_3_8_create_returns_ok_with_handle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_8_create_returns_ok_with_handle() {
     let ctx = make_ctx();
     let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
     let mut body = XdrWriter::new();
@@ -446,7 +447,7 @@ fn s3_3_8_create_returns_ok_with_handle() {
     body.write_string("layer1-create.txt");
     let raw = build_nfs3_call(60, proc::CREATE, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(60, proc::CREATE), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(60, proc::CREATE), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(
@@ -474,8 +475,8 @@ fn s3_3_8_create_returns_ok_with_handle() {
 /// RFC 1813 §3.3.12 — REMOVE on a missing name MUST return
 /// `NFS3ERR_NOENT`. (One of the wire-side NFS3ERR_* negatives the
 /// catalog calls out.)
-#[test]
-fn s3_3_12_remove_missing_name_returns_noent() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_12_remove_missing_name_returns_noent() {
     let ctx = make_ctx();
     let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
     let mut body = XdrWriter::new();
@@ -483,7 +484,7 @@ fn s3_3_12_remove_missing_name_returns_noent() {
     body.write_string("ghost.txt");
     let raw = build_nfs3_call(70, proc::REMOVE, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(70, proc::REMOVE), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(70, proc::REMOVE), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(
@@ -501,15 +502,15 @@ fn s3_3_12_remove_missing_name_returns_noent() {
 /// success returns `NFS3_OK + post_op_attr + cookieverf3(8) + entries
 /// + eof`. We only cover the minimal contract here: status==OK and
 /// the 8-byte cookieverf is present.
-#[test]
-fn s3_3_16_readdir_root_returns_ok_with_cookieverf() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_16_readdir_root_returns_ok_with_cookieverf() {
     let ctx = make_ctx();
     let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
     let mut body = XdrWriter::new();
     body.write_opaque(&root_fh);
     let raw = build_nfs3_call(80, proc::READDIR, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(80, proc::READDIR), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(80, proc::READDIR), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(
@@ -537,8 +538,8 @@ fn s3_3_16_readdir_root_returns_ok_with_cookieverf() {
 /// because each WRITE was forced to mint its own composition; the
 /// 4 KiB-block compositions blew up the dedup table on sequential
 /// writes and silently dropped data past offset 0).
-#[test]
-fn s3_3_7_write_at_nonzero_offset_buffers_data() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_3_7_write_at_nonzero_offset_buffers_data() {
     let ctx = make_ctx();
     let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
 
@@ -547,9 +548,10 @@ fn s3_3_7_write_at_nonzero_offset_buffers_data() {
     body.write_opaque(&root_fh);
     body.write_string("buffered-write.txt");
     let raw = build_nfs3_call(90, proc::CREATE, &body.into_bytes());
-    let _ = handle_nfs3_first_message(&make_header(90, proc::CREATE), &raw, &ctx);
+    let _ = handle_nfs3_first_message(&make_header(90, proc::CREATE), &raw, &ctx).await;
     let (file_fh, _) = ctx
         .lookup_by_name("buffered-write.txt")
+        .await
         .expect("CREATE must have registered the handle");
 
     // WRITE at offset 100, UNSTABLE — must be buffered, not rejected.
@@ -561,7 +563,7 @@ fn s3_3_7_write_at_nonzero_offset_buffers_data() {
     body.write_opaque(b"abc");
     let raw = build_nfs3_call(91, proc::WRITE, &body.into_bytes());
 
-    let reply = handle_nfs3_first_message(&make_header(91, proc::WRITE), &raw, &ctx);
+    let reply = handle_nfs3_first_message(&make_header(91, proc::WRITE), &raw, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert_eq!(
@@ -586,8 +588,8 @@ fn s3_3_7_write_at_nonzero_offset_buffers_data() {
 /// values below match what `nfs-utils` emits for the trivial root
 /// GETATTR path (xid is per-client; we pick `0xCAFE_BABE` for the
 /// fixture).
-#[test]
-fn rfc_1813_seed_canonical_getattr_call_frame_decodes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_1813_seed_canonical_getattr_call_frame_decodes() {
     // 32-byte file handle — all 0xAB bytes for a deterministic seed.
     let fh = [0xABu8; 32];
 
@@ -635,7 +637,7 @@ fn rfc_1813_seed_canonical_getattr_call_frame_decodes() {
     // not registered) — the wire path is exercised end-to-end.
     let ctx = make_ctx();
     let header = make_header(0xCAFE_BABE, proc::GETATTR);
-    let reply = handle_nfs3_first_message(&header, &frame, &ctx);
+    let reply = handle_nfs3_first_message(&header, &frame, &ctx).await;
     let mut r = reader_at_proc_result(&reply);
     let nfs_status = r.read_u32().expect("nfs_status");
     assert!(

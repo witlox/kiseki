@@ -271,8 +271,8 @@ impl Default for LockManager {
 mod tests {
     use super::*;
 
-    #[test]
-    fn read_locks_are_shared() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_locks_are_shared() {
         let mgr = LockManager::default();
         let fh = [0x01; 32];
         mgr.lock(fh, "owner-a", LockType::Read, 0, 100, 1000)
@@ -282,8 +282,8 @@ mod tests {
         assert_eq!(mgr.lock_count(), 2);
     }
 
-    #[test]
-    fn write_lock_is_exclusive() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_lock_is_exclusive() {
         let mgr = LockManager::default();
         let fh = [0x02; 32];
         mgr.lock(fh, "owner-a", LockType::Write, 0, 100, 1000)
@@ -294,8 +294,8 @@ mod tests {
         assert!(matches!(err, LockError::Denied(LockType::Write, _)));
     }
 
-    #[test]
-    fn write_blocks_read() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_blocks_read() {
         let mgr = LockManager::default();
         let fh = [0x03; 32];
         mgr.lock(fh, "owner-a", LockType::Write, 0, 100, 1000)
@@ -306,8 +306,8 @@ mod tests {
         assert!(matches!(err, LockError::Denied(LockType::Write, _)));
     }
 
-    #[test]
-    fn non_overlapping_locks_allowed() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_overlapping_locks_allowed() {
         let mgr = LockManager::default();
         let fh = [0x04; 32];
         mgr.lock(fh, "owner-a", LockType::Write, 0, 50, 1000)
@@ -317,8 +317,8 @@ mod tests {
         assert_eq!(mgr.lock_count(), 2);
     }
 
-    #[test]
-    fn unlock_removes_lock() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unlock_removes_lock() {
         let mgr = LockManager::default();
         let fh = [0x05; 32];
         mgr.lock(fh, "owner-a", LockType::Read, 0, 100, 1000)
@@ -327,8 +327,8 @@ mod tests {
         assert_eq!(mgr.lock_count(), 0);
     }
 
-    #[test]
-    fn expired_lock_does_not_block() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_lock_does_not_block() {
         let mgr = LockManager::new(1000); // 1 second lease
         let fh = [0x06; 32];
         mgr.lock(fh, "owner-a", LockType::Write, 0, 100, 1000)
@@ -339,8 +339,8 @@ mod tests {
         assert_eq!(mgr.lock_count(), 1);
     }
 
-    #[test]
-    fn test_lock_detects_conflict() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lock_detects_conflict() {
         let mgr = LockManager::default();
         let fh = [0x07; 32];
         mgr.lock(fh, "owner-a", LockType::Write, 0, 100, 1000)
@@ -350,8 +350,8 @@ mod tests {
         assert_eq!(conflict.unwrap().owner, "owner-a");
     }
 
-    #[test]
-    fn same_owner_can_relock() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_owner_can_relock() {
         let mgr = LockManager::default();
         let fh = [0x08; 32];
         mgr.lock(fh, "owner-a", LockType::Read, 0, 100, 1000)
@@ -362,8 +362,8 @@ mod tests {
         assert_eq!(mgr.lock_count(), 1);
     }
 
-    #[test]
-    fn expire_all_cleans_stale() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expire_all_cleans_stale() {
         let mgr = LockManager::new(500);
         let fh = [0x09; 32];
         mgr.lock(fh, "owner-a", LockType::Read, 0, 100, 1000)
@@ -375,8 +375,8 @@ mod tests {
         assert_eq!(mgr.lock_count(), 0);
     }
 
-    #[test]
-    fn zero_length_means_eof() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_length_means_eof() {
         let mgr = LockManager::default();
         let fh = [0x0A; 32];
         // Lock entire file (offset=0, length=0 = to EOF).

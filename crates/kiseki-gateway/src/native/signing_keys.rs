@@ -181,8 +181,8 @@ impl SigningKeys {
 mod tests {
     use super::*;
 
-    #[test]
-    fn deterministic_derivation_per_epoch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deterministic_derivation_per_epoch() {
         let m1 = SystemMasterKey::new([0x42; 32], KeyEpoch(7));
         let m2 = SystemMasterKey::new([0x42; 32], KeyEpoch(7));
         let k1 = EpochKeys::derive(&m1);
@@ -192,8 +192,8 @@ mod tests {
         assert_eq!(*k1.multipart_upload_id, *k2.multipart_upload_id);
     }
 
-    #[test]
-    fn three_keys_are_distinct() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn three_keys_are_distinct() {
         let m = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
         let k = EpochKeys::derive(&m);
         assert_ne!(*k.handle_token, *k.dek_fetch_ticket);
@@ -201,8 +201,8 @@ mod tests {
         assert_ne!(*k.dek_fetch_ticket, *k.multipart_upload_id);
     }
 
-    #[test]
-    fn rotation_keeps_old_epoch_during_grace() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rotation_keeps_old_epoch_during_grace() {
         let old = SystemMasterKey::new([0x01; 32], KeyEpoch(1));
         let store = SigningKeys::new(&old, 60_000);
         assert!(store.handle_token_key(KeyEpoch(1)).is_some());

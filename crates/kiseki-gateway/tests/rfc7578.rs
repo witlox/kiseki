@@ -227,8 +227,8 @@ async fn s4_multipart_post_at_object_path_is_rejected() {
 ///
 /// Today this is shape-only — when an actual parser lands, expand
 /// to round-trip + boundary-collision negative tests.
-#[test]
-fn s4_1_boundary_shape_canonical_form_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s4_1_boundary_shape_canonical_form_pinned() {
     // The body MUST start with `--<boundary>\r\n` and end with
     // `--<boundary>--\r\n`. Verify our seed satisfies both rules.
     let boundary = b"----WebKitFormBoundary7MA4YWxkTrZu0gW";
@@ -273,8 +273,8 @@ fn s4_1_boundary_shape_canonical_form_pinned() {
 /// `Content-Disposition: form-data; name="..."` header shape.
 /// When the real parser lands, this test asserts it parses
 /// `name="file"` + the optional `filename="..."` parameter.
-#[test]
-fn rfc_example_s4_2_content_disposition_shape() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_example_s4_2_content_disposition_shape() {
     const SEED: &[(&str, &str)] = &[
         // (header value → expected `name` parameter)
         ("form-data; name=\"file\"", "file"),

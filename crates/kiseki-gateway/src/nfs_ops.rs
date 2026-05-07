@@ -177,31 +177,12 @@ impl HandleRegistry {
     }
 }
 
-/// Process-wide override for the runtime NFS handlers `block_on`
-/// against. The kiseki-server runtime sets this to its main tokio
-/// runtime handle BEFORE spawning the NFS listener thread, which
-/// lifts NFS PUT throughput from the dedicated-runtime cap (~6 k
-/// op/s) to native-equivalent levels — every block_gateway call
-/// dispatches the future on a runtime with native's worker count,
-/// not a fresh 2-or-N-worker runtime tucked behind a separate
-/// reactor.
-static EXTERNAL_NFS_RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> =
-    std::sync::OnceLock::new();
-
-/// Install a tokio runtime handle that subsequent `NfsContext`
-/// constructions will block_on against. Idempotent — only the first
-/// call wins (subsequent set attempts are silently ignored). Must
-/// be called before any NFS listener spawns.
-pub fn set_external_nfs_runtime(handle: tokio::runtime::Handle) {
-    let _ = EXTERNAL_NFS_RUNTIME.set(handle);
-}
-
 /// NFS operations context — wraps gateway + handle registry + lock manager.
 ///
-/// Holds a `tokio::runtime::Handle` to bridge sync NFS protocol callbacks
-/// to async `GatewayOps` methods via `block_on`. Configured once via
-/// [`set_external_nfs_runtime`]; otherwise a dedicated runtime is spawned
-/// (the test path — cucumber would panic on a nested block_on).
+/// Methods are async-native: they `.await` gateway ops directly
+/// instead of `block_on`-ing into a sub-runtime. Lifts NFS PUT from
+/// the per-request `block_on` coordination tax (~6 k op/s ceiling)
+/// to native-equivalent throughput.
 pub struct NfsContext<G: GatewayOps> {
     pub gateway: NfsGateway<G>,
     pub handles: HandleRegistry,
@@ -218,8 +199,6 @@ pub struct NfsContext<G: GatewayOps> {
     pub mds_layout_manager: Option<Arc<crate::pnfs::MdsLayoutManager>>,
     pub tenant_id: OrgId,
     pub namespace_id: NamespaceId,
-    /// Tokio runtime handle for bridging sync NFS → async gateway ops.
-    pub rt: tokio::runtime::Handle,
     /// Per-file write buffer. NFS clients write sequentially at
     /// increasing offsets; the buffer accumulates all writes and
     /// flushes to a single composition on CLOSE or COMMIT.
@@ -259,38 +238,6 @@ impl<G: GatewayOps> NfsContext<G> {
         // Register root handle.
         handles.root_handle(namespace_id, tenant_id);
 
-        // Reuse the caller-provided tokio runtime if one was set via
-        // `set_external_runtime` BEFORE this point. Otherwise spawn
-        // a dedicated NFS runtime (the test path — cucumber's async
-        // runtime would panic if we tried to nest block_on against
-        // it). Production servers wire their main runtime in to
-        // avoid the dedicated-runtime tax (~6 k op/s cap measured
-        // pre-fix).
-        let rt = EXTERNAL_NFS_RUNTIME.get().cloned().unwrap_or_else(|| {
-            let nfs_workers: usize = std::env::var("KISEKI_NFS_RUNTIME_THREADS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| {
-                    std::thread::available_parallelism()
-                        .map(std::num::NonZeroUsize::get)
-                        .unwrap_or(4)
-                        .max(4)
-                });
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(nfs_workers)
-                    .enable_all()
-                    .thread_name("nfs-rt")
-                    .build()
-                    .expect("failed to create NFS tokio runtime");
-                let handle = runtime.handle().clone();
-                std::mem::forget(runtime);
-                handle
-            })
-            .join()
-            .expect("NFS runtime thread panicked")
-        });
-
         Self {
             gateway,
             handles,
@@ -301,26 +248,12 @@ impl<G: GatewayOps> NfsContext<G> {
             mds_layout_manager,
             tenant_id,
             namespace_id,
-            rt,
             write_buffers: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Block on an async gateway call. Uses `block_in_place` when on a
-    /// tokio worker thread (tests), or direct `block_on` on OS threads.
-    fn block_gateway<F, T>(&self, f: F) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.rt.block_on(f))
-        } else {
-            self.rt.block_on(f)
-        }
-    }
-
     /// Get attributes for a file handle.
-    pub fn getattr(&self, fh: &FileHandle) -> Result<NfsAttrs, GatewayError> {
+    pub async fn getattr(&self, fh: &FileHandle) -> Result<NfsAttrs, GatewayError> {
         if self.handles.is_root(fh) {
             return Ok(NfsAttrs {
                 file_type: FileType::Directory,
@@ -347,7 +280,9 @@ impl<G: GatewayOps> NfsContext<G> {
         // regular file). Resolve the actual size via gateway.list,
         // which already filters by tenant.
         let size = self
-            .block_gateway(self.gateway.list(tenant_id, ns_id))
+            .gateway
+            .list(tenant_id, ns_id)
+            .await
             .ok()
             .and_then(|entries| {
                 entries
@@ -369,7 +304,7 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Read from a file handle.
-    pub fn read(
+    pub async fn read(
         &self,
         fh: &FileHandle,
         offset: u64,
@@ -412,13 +347,15 @@ impl<G: GatewayOps> NfsContext<G> {
             ));
         };
 
-        self.block_gateway(self.gateway.read(NfsReadRequest {
-            tenant_id,
-            namespace_id: ns_id,
-            composition_id: comp_id,
-            offset,
-            count,
-        }))
+        self.gateway
+            .read(NfsReadRequest {
+                tenant_id,
+                namespace_id: ns_id,
+                composition_id: comp_id,
+                offset,
+                count,
+            })
+            .await
     }
 
     /// Buffer a write at the given offset for the given file handle.
@@ -437,7 +374,7 @@ impl<G: GatewayOps> NfsContext<G> {
     /// Flush buffered writes for a file handle. Creates a new
     /// composition with the accumulated data, updates the file handle
     /// and directory index. Returns the new file handle.
-    pub fn flush_writes(
+    pub async fn flush_writes(
         &self,
         fh: &FileHandle,
     ) -> Result<Option<(FileHandle, NfsWriteResponse)>, GatewayError> {
@@ -467,7 +404,7 @@ impl<G: GatewayOps> NfsContext<G> {
         let Some(data) = data else {
             return Ok(None);
         };
-        let (new_fh, resp) = self.write(data)?;
+        let (new_fh, resp) = self.write(data).await?;
 
         // Update dir_index: if the old fh had a name, re-map it to the
         // new composition.
@@ -494,12 +431,12 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Write to create a new named file (NFS CREATE).
-    pub fn write_named(
+    pub async fn write_named(
         &self,
         name: &str,
         data: Vec<u8>,
     ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
-        let (fh, resp) = self.write(data)?;
+        let (fh, resp) = self.write(data).await?;
         self.dir_index.insert(
             self.namespace_id,
             name.to_owned(),
@@ -577,12 +514,18 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Write to create a new file (NFS CREATE + WRITE).
-    pub fn write(&self, data: Vec<u8>) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
-        let resp = self.block_gateway(self.gateway.write(NfsWriteRequest {
-            tenant_id: self.tenant_id,
-            namespace_id: self.namespace_id,
-            data,
-        }))?;
+    pub async fn write(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
+        let resp = self
+            .gateway
+            .write(NfsWriteRequest {
+                tenant_id: self.tenant_id,
+                namespace_id: self.namespace_id,
+                data,
+            })
+            .await?;
 
         let fh = self
             .handles
@@ -592,7 +535,7 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Look up a file by name in the namespace. Returns handle + attrs.
-    pub fn lookup_by_name(&self, name: &str) -> Option<(FileHandle, NfsAttrs)> {
+    pub async fn lookup_by_name(&self, name: &str) -> Option<(FileHandle, NfsAttrs)> {
         // 1) NFS-CREATE'd files are tracked in `dir_index`.
         if let Some(entry) = self.dir_index.lookup(self.namespace_id, name) {
             let attrs = NfsAttrs {
@@ -614,7 +557,9 @@ impl<G: GatewayOps> NfsContext<G> {
         let uuid = uuid::Uuid::parse_str(name).ok()?;
         let comp_id = CompositionId(uuid);
         let entries = self
-            .block_gateway(self.gateway.list(self.tenant_id, self.namespace_id))
+            .gateway
+            .list(self.tenant_id, self.namespace_id)
+            .await
             .ok()?;
         let (_, size) = entries.iter().find(|(cid, _)| *cid == comp_id).copied()?;
         // Materialize a file handle for the composition; future
@@ -649,7 +594,7 @@ impl<G: GatewayOps> NfsContext<G> {
     /// every production NFSv4 server (NFS-Ganesha, knfsd, EFS)
     /// omits them for the same reason. Wire-test guard:
     /// `nfs4_server::tests::readdir_response_omits_dot_and_dotdot`.
-    pub fn readdir(&self) -> Vec<ReadDirEntry> {
+    pub async fn readdir(&self) -> Vec<ReadDirEntry> {
         let mut entries: Vec<ReadDirEntry> = Vec::new();
 
         // NFS-CREATE'd files (named via dir_index). Their backing
@@ -670,8 +615,7 @@ impl<G: GatewayOps> NfsContext<G> {
         // namespace (S3-PUT'd objects have no dir_index entry but
         // are visible to NFS as files named by their UUID). Skip
         // any composition that's already surfaced via a named entry.
-        if let Ok(comps) = self.block_gateway(self.gateway.list(self.tenant_id, self.namespace_id))
-        {
+        if let Ok(comps) = self.gateway.list(self.tenant_id, self.namespace_id).await {
             for (comp_id, _size) in comps {
                 if named_comp_ids.contains(&comp_id) {
                     continue;
@@ -707,10 +651,14 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Set file attributes (mode, size). Returns updated attrs.
-    pub fn setattr(&self, fh: &FileHandle, _mode: Option<u32>) -> Result<NfsAttrs, GatewayError> {
+    pub async fn setattr(
+        &self,
+        fh: &FileHandle,
+        _mode: Option<u32>,
+    ) -> Result<NfsAttrs, GatewayError> {
         // In-memory store: attrs are computed, not stored.
         // Return current attrs (mode update is advisory for now).
-        self.getattr(fh)
+        self.getattr(fh).await
     }
 
     /// Create a directory. Returns handle + attrs.
@@ -764,12 +712,12 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Create a symbolic link. Stores target as inline data.
-    pub fn symlink(
+    pub async fn symlink(
         &self,
         name: &str,
         target: &str,
     ) -> Result<(FileHandle, NfsAttrs), GatewayError> {
-        let (fh, resp) = self.write(target.as_bytes().to_vec())?;
+        let (fh, resp) = self.write(target.as_bytes().to_vec()).await?;
         self.dir_index.insert(
             self.namespace_id,
             name.to_owned(),
@@ -792,8 +740,8 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Read a symbolic link target. Capped at 4096 bytes (NFS3 MAXPATHLEN).
-    pub fn readlink(&self, fh: &FileHandle) -> Result<String, GatewayError> {
-        let resp = self.read(fh, 0, 4096)?;
+    pub async fn readlink(&self, fh: &FileHandle) -> Result<String, GatewayError> {
+        let resp = self.read(fh, 0, 4096).await?;
         String::from_utf8(resp.data)
             .map_err(|_| GatewayError::ProtocolError("invalid symlink target".into()))
     }

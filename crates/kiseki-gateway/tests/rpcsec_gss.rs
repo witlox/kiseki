@@ -52,8 +52,8 @@ use kiseki_gateway::nfs_auth::{
 /// This sentinel guards the wire constant — a future code change
 /// that adds a typed `AuthFlavor::RpcsecGss` variant MUST pick the
 /// value 6, not anything else.
-#[test]
-fn rfc5531_s8_1_rpcsec_gss_flavor_is_6() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc5531_s8_1_rpcsec_gss_flavor_is_6() {
     const RPCSEC_GSS: u32 = 6;
     assert_eq!(
         RPCSEC_GSS, 6,
@@ -96,8 +96,8 @@ fn rfc5531_s8_1_rpcsec_gss_flavor_is_6() {
 /// allows AUTH_SYS rejects a Kerberos cred with the documented
 /// error variant — not a panic, not a silent fall-through, not a
 /// mapped-to-AUTH_SYS shortcut.
-#[test]
-fn rfc2203_s5_1_kerberos_creds_rejected_when_export_disallows() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc2203_s5_1_kerberos_creds_rejected_when_export_disallows() {
     let tenant = OrgId(uuid::Uuid::new_v4());
     let export = NfsExportAuth {
         path: "/data/auth-sys-only".into(),
@@ -144,8 +144,8 @@ fn rfc2203_s5_1_kerberos_creds_rejected_when_export_disallows() {
 /// uid/gid as AUTH_SYS" when GSS context establishment fails.
 /// Per RFC 2203 §5.1 that's a security violation: the client
 /// asked for integrity/privacy and didn't get it.
-#[test]
-fn rfc7204_s2_kerberos_without_principal_is_rejected_not_downgraded() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc7204_s2_kerberos_without_principal_is_rejected_not_downgraded() {
     let tenant = OrgId(uuid::Uuid::new_v4());
     let export = NfsExportAuth {
         path: "/data/krb-mount".into(),

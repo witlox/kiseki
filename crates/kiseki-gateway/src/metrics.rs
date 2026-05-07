@@ -63,8 +63,8 @@ impl GatewayRetryMetrics {
 mod tests {
     use super::*;
 
-    #[test]
-    fn register_succeeds_in_fresh_registry() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_succeeds_in_fresh_registry() {
         let reg = Registry::new();
         let m = GatewayRetryMetrics::register(&reg).expect("register ok");
         m.read_retry_total.inc();
@@ -73,8 +73,8 @@ mod tests {
         assert_eq!(m.read_retry_exhausted_total.get(), 2);
     }
 
-    #[test]
-    fn register_twice_in_same_registry_fails() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_twice_in_same_registry_fails() {
         let reg = Registry::new();
         let _m1 = GatewayRetryMetrics::register(&reg).expect("first");
         let m2 = GatewayRetryMetrics::register(&reg);

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::nfs_ops::NfsContext;
 use crate::nfs_xdr::{
-    encode_reply_accepted, read_rm_message, write_rm_message, RpcCallHeader, XdrReader, XdrWriter,
+    encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter,
 };
 use crate::ops::GatewayOps;
 
@@ -66,7 +66,7 @@ mod status {
 }
 
 /// Process a single already-decoded NFS3 message and return the reply bytes.
-pub fn handle_nfs3_first_message<G: GatewayOps>(
+pub async fn handle_nfs3_first_message<G: GatewayOps>(
     header: &RpcCallHeader,
     raw_msg: &[u8],
     ctx: &NfsContext<G>,
@@ -74,19 +74,23 @@ pub fn handle_nfs3_first_message<G: GatewayOps>(
     let mut reader = XdrReader::new(raw_msg);
     // Skip past the RPC header (already decoded by caller).
     let _ = RpcCallHeader::decode(&mut reader);
-    dispatch_nfs3(header, &mut reader, ctx)
+    dispatch_nfs3(header, &mut reader, ctx).await
 }
 
-/// Handle one NFS3 connection (after the first message).
-///
-/// Accepts any `Read + Write` so callers can pass either a raw
-/// `TcpStream` (plaintext fallback) or a TLS-wrapped stream (default).
-pub fn handle_nfs3_connection<G: GatewayOps, S: io::Read + io::Write>(
+/// Handle one NFS3 connection (after the first message). Async-native
+/// — uses tokio I/O on the stream and `.await`s gateway calls in the
+/// dispatch path. The previous design spawned an OS thread per
+/// connection and `block_on`ed each gateway call, which capped NFS
+/// PUT at ~6 k op/s under c=16 (per-request block_on coordination).
+pub async fn handle_nfs3_connection<G: GatewayOps, S>(
     mut stream: S,
     ctx: Arc<NfsContext<G>>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
-        let msg = match read_rm_message(&mut stream) {
+        let msg = match crate::nfs_xdr::read_rm_message_async(&mut stream).await {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
@@ -101,16 +105,16 @@ pub fn handle_nfs3_connection<G: GatewayOps, S: io::Read + io::Write>(
             encode_reply_accepted(&mut w, header.xid, 2); // PROG_MISMATCH
             w.write_u32(NFS3_VERSION); // low
             w.write_u32(NFS3_VERSION); // high
-            write_rm_message(&mut stream, &w.into_bytes())?;
+            crate::nfs_xdr::write_rm_message_async(&mut stream, &w.into_bytes()).await?;
             continue;
         }
 
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
-        write_rm_message(&mut stream, &reply)?;
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
+        crate::nfs_xdr::write_rm_message_async(&mut stream, &reply).await?;
     }
 }
 
-fn dispatch_nfs3<G: GatewayOps>(
+async fn dispatch_nfs3<G: GatewayOps>(
     header: &RpcCallHeader,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -121,28 +125,28 @@ fn dispatch_nfs3<G: GatewayOps>(
         "NFSv3 dispatch"
     );
     match header.procedure {
-        proc::NULL => reply_null(header.xid),
-        proc::GETATTR => reply_getattr(header.xid, reader, ctx),
-        proc::SETATTR => reply_setattr(header.xid, reader, ctx),
-        proc::LOOKUP => reply_lookup(header.xid, reader, ctx),
-        proc::ACCESS => reply_access(header.xid, reader, ctx),
-        proc::READLINK => reply_readlink(header.xid, reader, ctx),
-        proc::READ => reply_read(header.xid, reader, ctx),
-        proc::WRITE => reply_write(header.xid, reader, ctx),
-        proc::CREATE => reply_create(header.xid, reader, ctx),
-        proc::MKDIR => reply_mkdir(header.xid, reader, ctx),
-        proc::SYMLINK => reply_symlink(header.xid, reader, ctx),
-        proc::MKNOD => reply_mknod(header.xid),
-        proc::REMOVE => reply_remove(header.xid, reader, ctx),
-        proc::RMDIR => reply_rmdir(header.xid, reader, ctx),
-        proc::RENAME => reply_rename(header.xid, reader, ctx),
-        proc::LINK => reply_link(header.xid, reader, ctx),
-        proc::READDIR => reply_readdir(header.xid, reader, ctx),
-        proc::READDIRPLUS => reply_readdirplus(header.xid, reader, ctx),
-        proc::PATHCONF => reply_pathconf(header.xid, reader, ctx),
-        proc::FSSTAT => reply_fsstat(header.xid, ctx),
-        proc::FSINFO => reply_fsinfo(header.xid, ctx),
-        proc::COMMIT => reply_commit(header.xid, reader, ctx),
+        proc::NULL => reply_null(header.xid).await,
+        proc::GETATTR => reply_getattr(header.xid, reader, ctx).await,
+        proc::SETATTR => reply_setattr(header.xid, reader, ctx).await,
+        proc::LOOKUP => reply_lookup(header.xid, reader, ctx).await,
+        proc::ACCESS => reply_access(header.xid, reader, ctx).await,
+        proc::READLINK => reply_readlink(header.xid, reader, ctx).await,
+        proc::READ => reply_read(header.xid, reader, ctx).await,
+        proc::WRITE => reply_write(header.xid, reader, ctx).await,
+        proc::CREATE => reply_create(header.xid, reader, ctx).await,
+        proc::MKDIR => reply_mkdir(header.xid, reader, ctx).await,
+        proc::SYMLINK => reply_symlink(header.xid, reader, ctx).await,
+        proc::MKNOD => reply_mknod(header.xid).await,
+        proc::REMOVE => reply_remove(header.xid, reader, ctx).await,
+        proc::RMDIR => reply_rmdir(header.xid, reader, ctx).await,
+        proc::RENAME => reply_rename(header.xid, reader, ctx).await,
+        proc::LINK => reply_link(header.xid, reader, ctx).await,
+        proc::READDIR => reply_readdir(header.xid, reader, ctx).await,
+        proc::READDIRPLUS => reply_readdirplus(header.xid, reader, ctx).await,
+        proc::PATHCONF => reply_pathconf(header.xid, reader, ctx).await,
+        proc::FSSTAT => reply_fsstat(header.xid, ctx).await,
+        proc::FSINFO => reply_fsinfo(header.xid, ctx).await,
+        proc::COMMIT => reply_commit(header.xid, reader, ctx).await,
         _ => {
             // Unsupported procedure — reply PROC_UNAVAIL.
             let mut w = XdrWriter::new();
@@ -152,13 +156,13 @@ fn dispatch_nfs3<G: GatewayOps>(
     }
 }
 
-fn reply_null(xid: u32) -> Vec<u8> {
+async fn reply_null(xid: u32) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0); // SUCCESS
     w.into_bytes()
 }
 
-fn reply_getattr<G: GatewayOps>(
+async fn reply_getattr<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -186,7 +190,7 @@ fn reply_getattr<G: GatewayOps>(
         return w.into_bytes();
     }
 
-    match ctx.getattr(&fh) {
+    match ctx.getattr(&fh).await {
         Ok(attrs) => {
             w.write_u32(status::NFS3_OK);
             // fattr3: type, mode, nlink, uid, gid, size, used, rdev, fsid, fileid
@@ -217,7 +221,7 @@ fn reply_getattr<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_read<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> Vec<u8> {
+async fn reply_read<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
@@ -244,7 +248,7 @@ fn reply_read<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsCont
         return w.into_bytes();
     }
 
-    match ctx.read(&fh, offset, count) {
+    match ctx.read(&fh, offset, count).await {
         Ok(resp) => {
             w.write_u32(status::NFS3_OK);
             // post-op attributes (false = not present)
@@ -261,7 +265,7 @@ fn reply_read<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsCont
     w.into_bytes()
 }
 
-fn reply_write<G: GatewayOps>(
+async fn reply_write<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -301,7 +305,7 @@ fn reply_write<G: GatewayOps>(
     // FILE_SYNC (2) and DATA_SYNC (1) require the data to be on
     // stable storage before we ack. UNSTABLE (0) allows lazy flush
     // on COMMIT — we still buffer the data either way.
-    if stable >= 1 && ctx.flush_writes(&fh).is_err() {
+    if stable >= 1 && ctx.flush_writes(&fh).await.is_err() {
         w.write_u32(status::NFS3ERR_IO);
         return w.into_bytes();
     }
@@ -317,7 +321,7 @@ fn reply_write<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_lookup<G: GatewayOps>(
+async fn reply_lookup<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -328,7 +332,7 @@ fn reply_lookup<G: GatewayOps>(
     let _dir_fh = reader.read_opaque().unwrap_or_default();
     let name = reader.read_string().unwrap_or_default();
 
-    match ctx.lookup_by_name(&name) {
+    match ctx.lookup_by_name(&name).await {
         Some((fh, _attrs)) => {
             w.write_u32(status::NFS3_OK);
             w.write_opaque(&fh);
@@ -344,7 +348,7 @@ fn reply_lookup<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_create<G: GatewayOps>(
+async fn reply_create<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -379,7 +383,7 @@ fn reply_create<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_readdir<G: GatewayOps>(
+async fn reply_readdir<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -393,7 +397,7 @@ fn reply_readdir<G: GatewayOps>(
     w.write_bool(false); // dir attrs omitted
     w.write_opaque_fixed(&[0u8; 8]); // cookieverf
 
-    let entries = ctx.readdir();
+    let entries = ctx.readdir().await;
     for (i, entry) in entries.iter().enumerate() {
         w.write_bool(true);
         w.write_u64(entry.fileid);
@@ -406,7 +410,7 @@ fn reply_readdir<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_remove<G: GatewayOps>(
+async fn reply_remove<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -433,7 +437,7 @@ fn reply_remove<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_rename<G: GatewayOps>(
+async fn reply_rename<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -467,7 +471,7 @@ fn reply_rename<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_fsstat<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
+async fn reply_fsstat<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
@@ -487,7 +491,7 @@ fn reply_fsstat<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
     w.into_bytes()
 }
 
-fn reply_fsinfo<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
+async fn reply_fsinfo<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
@@ -516,7 +520,7 @@ fn reply_fsinfo<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> {
 
 // --- F1: New NFS3 handlers below ---
 
-fn reply_setattr<G: GatewayOps>(
+async fn reply_setattr<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -578,7 +582,7 @@ fn reply_setattr<G: GatewayOps>(
         let _ = reader.read_u32(); // nseconds
     }
 
-    match ctx.setattr(&fh, mode) {
+    match ctx.setattr(&fh, mode).await {
         Ok(_attrs) => {
             w.write_u32(status::NFS3_OK);
             w.write_bool(false); // pre wcc
@@ -594,7 +598,7 @@ fn reply_setattr<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_access<G: GatewayOps>(
+async fn reply_access<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -632,7 +636,7 @@ fn reply_access<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_readlink<G: GatewayOps>(
+async fn reply_readlink<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -653,7 +657,7 @@ fn reply_readlink<G: GatewayOps>(
         }
     };
 
-    match ctx.readlink(&fh) {
+    match ctx.readlink(&fh).await {
         Ok(target) => {
             w.write_u32(status::NFS3_OK);
             w.write_bool(false); // post-op attrs
@@ -668,7 +672,7 @@ fn reply_readlink<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_mkdir<G: GatewayOps>(
+async fn reply_mkdir<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -707,7 +711,7 @@ fn reply_mkdir<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_symlink<G: GatewayOps>(
+async fn reply_symlink<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -725,7 +729,7 @@ fn reply_symlink<G: GatewayOps>(
     }
     let target = reader.read_string().unwrap_or_default();
 
-    match ctx.symlink(&name, &target) {
+    match ctx.symlink(&name, &target).await {
         Ok((new_fh, _attrs)) => {
             w.write_u32(status::NFS3_OK);
             w.write_bool(true);
@@ -746,7 +750,7 @@ fn reply_symlink<G: GatewayOps>(
 
 /// MKNOD creates special device files. Kiseki does not support device files,
 /// so we always return `NFS3ERR_NOTSUPP`.
-fn reply_mknod(xid: u32) -> Vec<u8> {
+async fn reply_mknod(xid: u32) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
     w.write_u32(status::NFS3ERR_NOTSUPP);
@@ -755,7 +759,7 @@ fn reply_mknod(xid: u32) -> Vec<u8> {
     w.into_bytes()
 }
 
-fn reply_rmdir<G: GatewayOps>(
+async fn reply_rmdir<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -782,7 +786,7 @@ fn reply_rmdir<G: GatewayOps>(
     w.into_bytes()
 }
 
-fn reply_link<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> Vec<u8> {
+async fn reply_link<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> Vec<u8> {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, xid, 0);
 
@@ -822,7 +826,7 @@ fn reply_link<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsCont
     w.into_bytes()
 }
 
-fn reply_readdirplus<G: GatewayOps>(
+async fn reply_readdirplus<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -840,7 +844,7 @@ fn reply_readdirplus<G: GatewayOps>(
     w.write_bool(false); // dir attrs omitted
     w.write_opaque_fixed(&[0u8; 8]); // cookieverf
 
-    let entries = ctx.readdir();
+    let entries = ctx.readdir().await;
     for (i, entry) in entries.iter().enumerate() {
         w.write_bool(true); // entry follows
         w.write_u64(entry.fileid);
@@ -863,7 +867,7 @@ fn reply_readdirplus<G: GatewayOps>(
 /// them; emitting `attributes_follow=false` causes the kernel mount
 /// helper to retry then EIO. We synthesize the namespace-root
 /// directory attrs (the same shape NFSv3 GETATTR returns for root).
-fn reply_pathconf<G: GatewayOps>(
+async fn reply_pathconf<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -886,7 +890,7 @@ fn reply_pathconf<G: GatewayOps>(
     w.write_u32(status::NFS3_OK);
     // post_op_attr = TRUE + fattr3.
     w.write_bool(true);
-    let attrs = ctx.getattr(&fh).unwrap_or(crate::nfs_ops::NfsAttrs {
+    let attrs = ctx.getattr(&fh).await.unwrap_or(crate::nfs_ops::NfsAttrs {
         file_type: crate::nfs_ops::FileType::Directory,
         size: 4096,
         mode: 0o755,
@@ -924,7 +928,7 @@ fn reply_pathconf<G: GatewayOps>(
 }
 
 /// COMMIT flushes pending writes to stable storage.
-fn reply_commit<G: GatewayOps>(
+async fn reply_commit<G: GatewayOps>(
     xid: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -944,7 +948,7 @@ fn reply_commit<G: GatewayOps>(
     // Flush any UNSTABLE writes buffered for this handle. `flush_writes`
     // returns `Ok(None)` if nothing was buffered — that's a fast path,
     // not an error.
-    match ctx.flush_writes(&fh) {
+    match ctx.flush_writes(&fh).await {
         Ok(_) => {
             w.write_u32(status::NFS3_OK);
             w.write_bool(false); // pre wcc
@@ -1008,13 +1012,13 @@ mod tests {
 
     // ---------- NULL (§3.3.0) ----------
 
-    #[test]
-    fn null_returns_success_with_empty_body() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn null_returns_success_with_empty_body() {
         let ctx = test_ctx();
         let header = make_header(proc::NULL);
         let body = Vec::new();
         let mut reader = XdrReader::new(&body);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         // Decode: xid(4) + REPLY(4) + MSG_ACCEPTED(4) + verifier(8) + accept_stat(4)
         let mut r = XdrReader::new(&reply);
@@ -1032,8 +1036,8 @@ mod tests {
 
     // ---------- WRITE with FILE_SYNC (§3.3.7) ----------
 
-    #[test]
-    fn write_file_sync_returns_ok_and_count() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_file_sync_returns_ok_and_count() {
         let ctx = test_ctx();
 
         // First CREATE a file to get a handle.
@@ -1045,11 +1049,12 @@ mod tests {
         body.write_string("testfile.txt");
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
-        let _create_reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let _create_reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         // Look up the created file to get its handle.
         let (file_fh, _) = ctx
             .lookup_by_name("testfile.txt")
+            .await
             .expect("file should exist");
 
         // WRITE to the file handle.
@@ -1062,7 +1067,7 @@ mod tests {
         body.write_opaque(b"written via nfs3");
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         // Parse reply.
         let mut r = XdrReader::new(&reply);
@@ -1085,8 +1090,8 @@ mod tests {
 
     // ---------- WRITE bad handle (§3.3.7) ----------
 
-    #[test]
-    fn write_invalid_handle_returns_badhandle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_invalid_handle_returns_badhandle() {
         let ctx = test_ctx();
         let header = make_header(proc::WRITE);
         let mut body = XdrWriter::new();
@@ -1098,7 +1103,7 @@ mod tests {
         body.write_opaque(b"bad");
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         // Parse — skip RPC header to NFS status.
         let mut r = XdrReader::new(&reply);
@@ -1114,8 +1119,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn write_unregistered_handle_returns_badhandle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_unregistered_handle_returns_badhandle() {
         // Used to be `..._at_nonzero_offset_returns_io_error` — the old
         // contract rejected nonzero offsets unconditionally because
         // compositions were treated as immutable. After the
@@ -1135,7 +1140,7 @@ mod tests {
         body.write_opaque(b"bad");
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         let mut r = XdrReader::new(&reply);
         for _ in 0..6 {
@@ -1151,8 +1156,8 @@ mod tests {
 
     // ---------- CREATE (§3.3.8) ----------
 
-    #[test]
-    fn create_returns_ok_with_handle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_returns_ok_with_handle() {
         let ctx = test_ctx();
         let header = make_header(proc::CREATE);
         let mut body = XdrWriter::new();
@@ -1160,7 +1165,7 @@ mod tests {
         body.write_string("newfile.txt");
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         let mut r = XdrReader::new(&reply);
         for _ in 0..6 {
@@ -1176,8 +1181,8 @@ mod tests {
 
     // ---------- LOOKUP NOENT (§3.3.3) ----------
 
-    #[test]
-    fn lookup_nonexistent_returns_noent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lookup_nonexistent_returns_noent() {
         let ctx = test_ctx();
         let header = make_header(proc::LOOKUP);
         let mut body = XdrWriter::new();
@@ -1185,7 +1190,7 @@ mod tests {
         body.write_string("nonexistent.txt");
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         let mut r = XdrReader::new(&reply);
         for _ in 0..6 {
@@ -1197,8 +1202,8 @@ mod tests {
 
     // ---------- REMOVE NOENT (§3.3.12) ----------
 
-    #[test]
-    fn remove_nonexistent_returns_noent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_nonexistent_returns_noent() {
         let ctx = test_ctx();
         let header = make_header(proc::REMOVE);
         let mut body = XdrWriter::new();
@@ -1206,7 +1211,7 @@ mod tests {
         body.write_string("nosuchfile.txt");
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         let mut r = XdrReader::new(&reply);
         for _ in 0..6 {
@@ -1218,13 +1223,13 @@ mod tests {
 
     // ---------- FSINFO (§3.3.20) ----------
 
-    #[test]
-    fn fsinfo_returns_ok_with_sizes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fsinfo_returns_ok_with_sizes() {
         let ctx = test_ctx();
         let header = make_header(proc::FSINFO);
         let body = Vec::new();
         let mut reader = XdrReader::new(&body);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         let mut r = XdrReader::new(&reply);
         for _ in 0..6 {
@@ -1248,13 +1253,13 @@ mod tests {
 
     // ---------- FSSTAT (§3.3.21) ----------
 
-    #[test]
-    fn fsstat_returns_ok_with_bytes_and_files() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fsstat_returns_ok_with_bytes_and_files() {
         let ctx = test_ctx();
         let header = make_header(proc::FSSTAT);
         let body = Vec::new();
         let mut reader = XdrReader::new(&body);
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
 
         let mut r = XdrReader::new(&reply);
         for _ in 0..6 {
@@ -1276,8 +1281,8 @@ mod tests {
 
     // ---------- Wrong program number ----------
 
-    #[test]
-    fn wrong_program_returns_prog_unavail() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wrong_program_returns_prog_unavail() {
         let ctx = test_ctx();
         // Use dispatch with wrong program — this would be caught by
         // handle_nfs3_connection, but we verify reply_null still works
@@ -1293,7 +1298,7 @@ mod tests {
         // dispatch_nfs3 doesn't check program — that's done in
         // handle_nfs3_connection. The scenario tests the connection
         // handler. Let's verify the reply_null path works.
-        let reply = dispatch_nfs3(&header, &mut reader, &ctx);
+        let reply = dispatch_nfs3(&header, &mut reader, &ctx).await;
         // It should still return SUCCESS for NULL.
         let mut r = XdrReader::new(&reply);
         let xid = r.read_u32().unwrap();

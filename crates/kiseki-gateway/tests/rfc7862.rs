@@ -132,8 +132,8 @@ const NFS4ERR_OFFLOAD_NO_REQS: u32 = 10094;
 /// against the spec, plus pins the rest of the registry so a future
 /// addition (e.g. promoting `op::READ_PLUS` to public) cannot
 /// silently use the wrong number.
-#[test]
-fn s11_op_codes_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s11_op_codes_pinned() {
     assert_eq!(OP_ALLOCATE, 59, "RFC 7862 §11.1: ALLOCATE = 59");
     assert_eq!(OP_COPY, 60, "RFC 7862 §11.2: COPY = 60");
     assert_eq!(OP_COPY_NOTIFY, 61, "RFC 7862 §11.3: COPY_NOTIFY = 61");
@@ -158,8 +158,8 @@ fn s11_op_codes_pinned() {
 
 /// RFC 7862 §15.5 — v4.2-specific error codes. Pin the constants so
 /// any future NFS4ERR enum or refactor cannot renumber them.
-#[test]
-fn s15_5_v4_2_error_codes_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_5_v4_2_error_codes_pinned() {
     assert_eq!(NFS4ERR_BADIOMODE, 10049, "RFC 8881 §13.1 inherited");
     assert_eq!(
         NFS4ERR_NOTSUPP, 10004,
@@ -274,12 +274,12 @@ fn reader_at_compound_result(reply: &[u8]) -> XdrReader<'_> {
     r
 }
 
-fn drive_compound(xid: u32, body: &[u8]) -> Vec<u8> {
+async fn drive_compound(xid: u32, body: &[u8]) -> Vec<u8> {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
     let header = make_header(xid);
     let raw = build_nfs4_call(xid, body);
-    handle_nfs4_first_compound(&header, &raw, &ctx, &sessions)
+    handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await
 }
 
 // ===========================================================================
@@ -290,8 +290,8 @@ fn drive_compound(xid: u32, body: &[u8]) -> Vec<u8> {
 /// the server actually applied. With no current filehandle the args
 /// are still parseable; the production handler returns NFS4_OK with
 /// an empty hint mask. (TODO in source: forward to ADR-020 advisory.)
-#[test]
-fn s11_5_io_advise_returns_ok_with_empty_hint_mask() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s11_5_io_advise_returns_ok_with_empty_hint_mask() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_IO_ADVISE);
         w.write_opaque_fixed(&[0u8; 16]); // stateid
@@ -300,7 +300,7 @@ fn s11_5_io_advise_returns_ok_with_empty_hint_mask() {
         w.write_u32(1); // hints bitmap word count
         w.write_u32(0x0000_0001); // IO_ADVISE4_NORMAL
     });
-    let reply = drive_compound(0x1001, &body);
+    let reply = drive_compound(0x1001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -335,15 +335,15 @@ fn s11_5_io_advise_returns_ok_with_empty_hint_mask() {
 /// code via the catch-all arm — the wire result happens to match.
 /// When ALLOCATE lands in production, this test will REQUIRE NFS4_OK
 /// instead (the reply shape is identical: just a status).
-#[test]
-fn s11_1_allocate_returns_notsupp_today_or_ok_when_implemented() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s11_1_allocate_returns_notsupp_today_or_ok_when_implemented() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_ALLOCATE);
         w.write_opaque_fixed(&[0u8; 16]); // stateid
         w.write_u64(0); // offset
         w.write_u64(4096); // length
     });
-    let reply = drive_compound(0x2001, &body);
+    let reply = drive_compound(0x2001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     let _ = r.read_opaque(); // tag
@@ -369,15 +369,15 @@ fn s11_1_allocate_returns_notsupp_today_or_ok_when_implemented() {
 /// RFC 7862 §11.4 — DEALLOCATE has the same arg shape as ALLOCATE
 /// (stateid + offset + length). Reply: just `nfsstat4`. Today's
 /// catch-all emits NFS4ERR_NOTSUPP.
-#[test]
-fn s11_4_deallocate_returns_notsupp_today_or_ok_when_implemented() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s11_4_deallocate_returns_notsupp_today_or_ok_when_implemented() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_DEALLOCATE);
         w.write_opaque_fixed(&[0u8; 16]);
         w.write_u64(0);
         w.write_u64(4096);
     });
-    let reply = drive_compound(0x2101, &body);
+    let reply = drive_compound(0x2101, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -405,8 +405,8 @@ fn s11_4_deallocate_returns_notsupp_today_or_ok_when_implemented() {
 /// dispatcher returns either NFS4_OK or NFS4ERR_NOTSUPP — the catch-
 /// all path covers it today; a real implementation will need a typed
 /// COPY decoder.
-#[test]
-fn s11_2_copy_args_grammar_and_status() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s11_2_copy_args_grammar_and_status() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_COPY);
         w.write_opaque_fixed(&[0u8; 16]); // ca_src_stateid
@@ -418,7 +418,7 @@ fn s11_2_copy_args_grammar_and_status() {
         w.write_bool(true); // ca_synchronous
         w.write_u32(0); // ca_source_server<> (empty)
     });
-    let reply = drive_compound(0x2201, &body);
+    let reply = drive_compound(0x2201, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -439,15 +439,15 @@ fn s11_2_copy_args_grammar_and_status() {
 /// (same shape as READ §18.22). The reply differs: an array of
 /// `read_plus_content` discriminated unions (DATA vs HOLE). A
 /// non-implementing server MUST return `NFS4ERR_NOTSUPP`.
-#[test]
-fn s11_10_read_plus_returns_notsupp_today_or_data_when_implemented() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s11_10_read_plus_returns_notsupp_today_or_data_when_implemented() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_READ_PLUS);
         w.write_opaque_fixed(&[0u8; 16]); // stateid
         w.write_u64(0); // offset
         w.write_u32(4096); // count
     });
-    let reply = drive_compound(0x2301, &body);
+    let reply = drive_compound(0x2301, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -467,15 +467,15 @@ fn s11_10_read_plus_returns_notsupp_today_or_data_when_implemented() {
 /// RFC 7862 §11.11 — `SEEK4args` is `sa_stateid + sa_offset +
 /// sa_what`. `sa_what` is `data4(0)` or `hole4(1)`. Reply on success:
 /// `eof + offset` of the next data/hole boundary.
-#[test]
-fn s11_11_seek_returns_notsupp_today_or_data_position_when_implemented() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s11_11_seek_returns_notsupp_today_or_data_position_when_implemented() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_SEEK);
         w.write_opaque_fixed(&[0u8; 16]); // sa_stateid
         w.write_u64(0); // sa_offset
         w.write_u32(0); // sa_what = SEEK4_DATA (0)
     });
-    let reply = drive_compound(0x2401, &body);
+    let reply = drive_compound(0x2401, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -511,15 +511,15 @@ fn s11_11_seek_returns_notsupp_today_or_data_position_when_implemented() {
 /// dispatcher emits NFS4ERR_NOTSUPP via the catch-all because SEEK
 /// isn't implemented at all — fidelity gap. RED until SEEK lands
 /// with full discriminant validation.
-#[test]
-fn s15_5_seek_invalid_sa_what_returns_union_notsupp() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_5_seek_invalid_sa_what_returns_union_notsupp() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_SEEK);
         w.write_opaque_fixed(&[0u8; 16]);
         w.write_u64(0);
         w.write_u32(99); // not SEEK4_DATA(0) or SEEK4_HOLE(1)
     });
-    let reply = drive_compound(0x3001, &body);
+    let reply = drive_compound(0x3001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -539,8 +539,8 @@ fn s15_5_seek_invalid_sa_what_returns_union_notsupp() {
 /// (`{LAYOUTIOMODE4_READ(1), LAYOUTIOMODE4_RW(2), LAYOUTIOMODE4_ANY(3)}`)
 /// MUST yield `NFS4ERR_BADIOMODE` (10049). Today's dispatcher emits
 /// NFS4ERR_NOTSUPP via the catch-all. RED.
-#[test]
-fn s15_5_layouterror_invalid_iomode_returns_badiomode() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_5_layouterror_invalid_iomode_returns_badiomode() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_LAYOUTERROR);
         w.write_u64(0); // lea_offset
@@ -552,7 +552,7 @@ fn s15_5_layouterror_invalid_iomode_returns_badiomode() {
                         // BADIOMODE path.
         w.write_u32(99); // bogus iomode
     });
-    let reply = drive_compound(0x3101, &body);
+    let reply = drive_compound(0x3101, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -577,8 +577,8 @@ fn s15_5_layouterror_invalid_iomode_returns_badiomode() {
 /// `NFS4ERR_NOTSUPP`. Today's dispatcher ignores `minor_version` and
 /// runs ALLOCATE through the catch-all (returning NFS4ERR_NOTSUPP) —
 /// the per-op result happens to be spec-compliant.
-#[test]
-fn s15_5_v4_2_op_in_minor_v1_compound_returns_notsupp_or_minor_mismatch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_5_v4_2_op_in_minor_v1_compound_returns_notsupp_or_minor_mismatch() {
     // Encode COMPOUND with minor_version=1 (NFSv4.1) but include a
     // v4.2-only op (ALLOCATE).
     let mut w = XdrWriter::new();
@@ -591,7 +591,7 @@ fn s15_5_v4_2_op_in_minor_v1_compound_returns_notsupp_or_minor_mismatch() {
     w.write_u64(0);
     let body = w.into_bytes();
 
-    let reply = drive_compound(0x4001, &body);
+    let reply = drive_compound(0x4001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     const NFS4ERR_MINOR_VERS_MISMATCH: u32 = 10021;
@@ -628,8 +628,8 @@ fn s15_5_v4_2_op_in_minor_v1_compound_returns_notsupp_or_minor_mismatch() {
 /// Source: RFC 7862 §11.1 (ALLOCATE) + §15 (XDR grammar). This is
 /// the smallest spec-conformant ALLOCATE call. The seed bytes below
 /// are the byte-for-byte XDR encoding of that COMPOUND body.
-#[test]
-fn rfc_7862_seed_allocate_compound_byte_shape() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_7862_seed_allocate_compound_byte_shape() {
     let body = encode_compound(b"", 1, |w| {
         w.write_u32(OP_ALLOCATE);
         w.write_opaque_fixed(&[0u8; 16]);
@@ -656,7 +656,7 @@ fn rfc_7862_seed_allocate_compound_byte_shape() {
     // either NFS4_OK (when ALLOCATE is implemented) or NFS4ERR_NOTSUPP
     // (today's catch-all). Either is RFC-compliant; the test fails
     // only if we get a different error.
-    let reply = drive_compound(0xCAFE_BABE, &body);
+    let reply = drive_compound(0xCAFE_BABE, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert!(

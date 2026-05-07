@@ -49,8 +49,8 @@ const LAYOUTIOMODE4_READ: u32 = 1;
 #[allow(dead_code)]
 const LAYOUTIOMODE4_RW: u32 = 2;
 
-#[test]
-fn s3_layout_type_constant_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_layout_type_constant_pinned() {
     assert_eq!(
         LAYOUT4_FLEX_FILES, 4,
         "RFC 8435 §3 / IANA registry: LAYOUT4_FLEX_FILES = 4"
@@ -107,8 +107,8 @@ fn build_ff_layout4_body(stripe_unit: u64, fh_bytes: &[u8], device_id: [u8; 16])
     body.into_bytes()
 }
 
-#[test]
-fn s5_1_ff_layout4_one_mirror_one_ds_round_trips() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_1_ff_layout4_one_mirror_one_ds_round_trips() {
     let stripe_unit = 1_048_576u64;
     let device_id = [0xAA; 16];
     let fh = vec![0xCC; PNFS_FH_BYTES];
@@ -144,8 +144,8 @@ fn s5_1_ff_layout4_one_mirror_one_ds_round_trips() {
     assert_eq!(r.remaining(), 0, "no trailing bytes");
 }
 
-#[test]
-fn s5_1_ff_data_server4_field_order_is_fixed() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_1_ff_data_server4_field_order_is_fixed() {
     // RFC 8435 §5.1: every field of `ff_data_server4` MUST appear in
     // the listed order. Reversing any pair here is a wire-fidelity bug.
     let body = build_ff_layout4_body(4096, &[0xDE; 32], [0x11; 16]);
@@ -177,8 +177,8 @@ fn s5_1_ff_data_server4_field_order_is_fixed() {
 /// the FF_FLAGS_NO_LAYOUTCOMMIT bit value the kiseki encoder MUST
 /// emit when tightly_coupled (ADR-038 §D3) — the production constant
 /// is imported from `pnfs.rs` and the test asserts the spec value.
-#[test]
-fn s5_1_ff_flags_no_layoutcommit_bit_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_1_ff_flags_no_layoutcommit_bit_pinned() {
     // Spec values (RFC 8435 §5.1): bit 0 / bit 1 / bit 2.
     assert_eq!(
         FF_FLAGS_NO_LAYOUTCOMMIT, 0x0000_0001,
@@ -197,8 +197,8 @@ fn s5_1_ff_flags_no_layoutcommit_bit_pinned() {
     );
 }
 
-#[test]
-fn s5_1_truncated_ff_layout4_body_is_invalid() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_1_truncated_ff_layout4_body_is_invalid() {
     // Malformed: claim 1 mirror + 1 DS, then truncate before
     // ffds_deviceid. A strict decoder must error.
     let mut w = XdrWriter::new();
@@ -262,8 +262,8 @@ fn build_ff_device_addr4_body_per_spec(netid: &str, uaddr: &str) -> Vec<u8> {
     body.into_bytes()
 }
 
-#[test]
-fn s5_2_ff_device_addr4_field_order_is_netaddrs_then_versions() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_ff_device_addr4_field_order_is_netaddrs_then_versions() {
     let body = build_ff_device_addr4_body_per_spec("tcp", "10.0.0.11.8.4");
 
     let mut r = XdrReader::new(&body);
@@ -296,8 +296,8 @@ fn s5_2_ff_device_addr4_field_order_is_netaddrs_then_versions() {
 /// `op_getdeviceinfo` (see nfs4_server.rs line 938-957). That violates
 /// the spec field order. This negative test pins the spec contract;
 /// it's RED until the encoder swaps.
-#[test]
-fn s5_2_kiseki_encoder_field_order_matches_spec() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_kiseki_encoder_field_order_matches_spec() {
     // We synthesize a real LAYOUTGET → GETDEVICEINFO flow via the
     // public manager, then assert the wire shape would match §5.2.
     // For RED-by-design, we use the same hand-built body the encoder
@@ -314,8 +314,8 @@ fn s5_2_kiseki_encoder_field_order_matches_spec() {
     );
 }
 
-#[test]
-fn s5_2_ff_device_versions4_size_is_5_u32_words() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_ff_device_versions4_size_is_5_u32_words() {
     // RFC 8435 §5.2: ff_device_versions4 has exactly 5 fields: 4 u32
     // + 1 bool (also encoded as 4 bytes per RFC 4506 §4.4) = 20 bytes.
     let mut w = XdrWriter::new();
@@ -331,8 +331,8 @@ fn s5_2_ff_device_versions4_size_is_5_u32_words() {
     );
 }
 
-#[test]
-fn s5_2_truncated_ff_device_versions4_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_truncated_ff_device_versions4_rejected() {
     // versions count = 1 but only 16 bytes (missing bool) follow.
     let mut w = XdrWriter::new();
     w.write_u32(1); // netaddrs count
@@ -370,8 +370,8 @@ fn s5_2_truncated_ff_device_versions4_rejected() {
 // 16 bytes — 4 bytes seqid + 12 bytes other. RFC 8435 carries one in
 // every `ff_data_server4`.
 
-#[test]
-fn s5_3_stateid4_is_exactly_16_bytes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_3_stateid4_is_exactly_16_bytes() {
     // The MdsLayoutManager emits a stateid via layout_get; assert it
     // is exactly 16 bytes wide.
     let key = derive_pnfs_fh_mac_key(&[0xab; 32], &[0xcd; 16]);
@@ -405,8 +405,8 @@ fn s5_3_stateid4_is_exactly_16_bytes() {
 // ADR-038 §D4.3 — PnfsFileHandle wire layout (76 bytes)
 // ===========================================================================
 
-#[test]
-fn adr038_d4_3_fh4_constants_match_spec() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adr038_d4_3_fh4_constants_match_spec() {
     assert_eq!(PNFS_FH_BYTES, 76, "ADR-038 §D4.3: 60 + 16 = 76");
     assert_eq!(PNFS_FH_PAYLOAD_BYTES, 60, "ADR-038 §D4.3: payload");
     assert_eq!(PNFS_FH_MAC_BYTES, 16, "ADR-038 §D4.3: MAC truncated to 16");
@@ -427,8 +427,8 @@ fn fixed_handle(expiry_ms: u64) -> PnfsFileHandle {
     )
 }
 
-#[test]
-fn adr038_d4_3_fh4_field_offsets_per_spec() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adr038_d4_3_fh4_field_offsets_per_spec() {
     let h = fixed_handle(1_000_000);
     let bytes = h.encode();
     assert_eq!(bytes.len(), PNFS_FH_BYTES);
@@ -455,8 +455,8 @@ fn adr038_d4_3_fh4_field_offsets_per_spec() {
     assert_eq!(&bytes[60..76], h.mac.as_slice());
 }
 
-#[test]
-fn adr038_d4_3_fh4_round_trips_via_encode_decode() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adr038_d4_3_fh4_round_trips_via_encode_decode() {
     let h = fixed_handle(u64::MAX);
     let bytes = h.encode();
     let back = PnfsFileHandle::decode(&bytes).expect("decode");
@@ -465,8 +465,8 @@ fn adr038_d4_3_fh4_round_trips_via_encode_decode() {
     back.validate(&fixed_key_v1(), 0).expect("MAC validates");
 }
 
-#[test]
-fn adr038_d4_3_fh4_wrong_length_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adr038_d4_3_fh4_wrong_length_rejected() {
     // 75 bytes is one short of the 76-byte spec.
     let err = PnfsFileHandle::decode(&[0u8; 75]).unwrap_err();
     assert_eq!(
@@ -481,8 +481,8 @@ fn adr038_d4_3_fh4_wrong_length_rejected() {
     assert!(matches!(err, FhDecodeError::WrongLength { .. }));
 }
 
-#[test]
-fn adr038_d4_3_fh4_with_bad_mac_fails_validate() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adr038_d4_3_fh4_with_bad_mac_fails_validate() {
     // Encode a valid handle, flip a payload byte → MAC mismatch.
     let h = fixed_handle(u64::MAX);
     let mut bytes = h.encode();
@@ -496,8 +496,8 @@ fn adr038_d4_3_fh4_with_bad_mac_fails_validate() {
     );
 }
 
-#[test]
-fn adr038_d4_3_fh4_expired_fails_validate() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adr038_d4_3_fh4_expired_fails_validate() {
     // expiry_ms = 1_000, validate at now_ms = 5_000 → expired.
     let h = fixed_handle(1_000);
     let err = h.validate(&fixed_key_v1(), 5_000).unwrap_err();
@@ -511,8 +511,8 @@ fn adr038_d4_3_fh4_expired_fails_validate() {
     );
 }
 
-#[test]
-fn adr038_d4_3_fh4_wrong_key_fails_validate() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adr038_d4_3_fh4_wrong_key_fails_validate() {
     // A handle minted under one key cannot validate under another.
     let h = fixed_handle(u64::MAX);
     let other_key = derive_pnfs_fh_mac_key(&[0x99; 32], &[0x88; 16]);
@@ -528,8 +528,8 @@ fn adr038_d4_3_fh4_wrong_key_fails_validate() {
 // LAYOUTGET → GETDEVICEINFO round-trip via MdsLayoutManager
 // ===========================================================================
 
-#[test]
-fn layoutget_then_getdeviceinfo_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn layoutget_then_getdeviceinfo_round_trip() {
     let key = derive_pnfs_fh_mac_key(&[0xab; 32], &[0xcd; 16]);
     let mgr = MdsLayoutManager::new(
         key.clone(),
@@ -592,8 +592,8 @@ fn layoutget_then_getdeviceinfo_round_trip() {
 ///
 /// Any compliant encoder MUST produce these exact bytes. Any compliant
 /// decoder MUST accept them.
-#[test]
-fn rfc_seed_s5_1_minimal_ff_layout4() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_seed_s5_1_minimal_ff_layout4() {
     let stripe_unit = 4096u64;
     let device_id = [
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, //
@@ -658,8 +658,8 @@ fn rfc_seed_s5_1_minimal_ff_layout4() {
 // uaddr seed (RFC 5665 §5.2.3.4) — covered in detail in tests/rfc5665.rs
 // ===========================================================================
 
-#[test]
-fn host_port_to_uaddr_emits_rfc_5665_form() {
+#[tokio::test(flavor = "multi_thread")]
+async fn host_port_to_uaddr_emits_rfc_5665_form() {
     // RFC 5665 §5.2.3.4: port 2052 = 8*256 + 4 → ".8.4".
     assert_eq!(host_port_to_uaddr("10.0.0.11:2052"), "10.0.0.11.8.4");
 }

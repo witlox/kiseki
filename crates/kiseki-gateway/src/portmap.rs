@@ -201,8 +201,8 @@ mod tests {
         w.into_bytes()
     }
 
-    #[test]
-    fn null_returns_success() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn null_returns_success() {
         let raw = build_call(0xDEAD, proc::NULL, &[]);
         let mut reader = XdrReader::new(&raw);
         let header = RpcCallHeader::decode(&mut reader).unwrap();
@@ -217,8 +217,8 @@ mod tests {
         assert_eq!(r.read_u32().unwrap(), 0); // SUCCESS
     }
 
-    #[test]
-    fn getport_for_mount3_tcp_returns_nfs_port() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn getport_for_mount3_tcp_returns_nfs_port() {
         let mut body = XdrWriter::new();
         body.write_u32(MOUNT_PROGRAM);
         body.write_u32(3);
@@ -242,8 +242,8 @@ mod tests {
         assert_eq!(port, 2049, "MOUNT3/TCP must resolve to the NFS port");
     }
 
-    #[test]
-    fn getport_for_nfs3_tcp_returns_nfs_port() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn getport_for_nfs3_tcp_returns_nfs_port() {
         let mut body = XdrWriter::new();
         body.write_u32(NFS_PROGRAM);
         body.write_u32(3);
@@ -269,8 +269,8 @@ mod tests {
     /// MOUNT3/TCP, and verify the response carries the configured
     /// NFS port. Proves the listener wiring (not just the in-process
     /// dispatch) so the Bug 10 fix is testable without root.
-    #[test]
-    fn tcp_round_trip_getport_returns_nfs_port() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_round_trip_getport_returns_nfs_port() {
         use std::io::{Read, Write};
         use std::net::TcpStream;
 
@@ -316,8 +316,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn getport_for_unknown_program_returns_zero() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn getport_for_unknown_program_returns_zero() {
         let mut body = XdrWriter::new();
         body.write_u32(999_999); // unknown program
         body.write_u32(3);

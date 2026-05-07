@@ -133,8 +133,8 @@ mod tests {
         CompositionId(uuid::Uuid::from_u128(n))
     }
 
-    #[test]
-    fn insert_and_lookup() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_and_lookup() {
         let idx = DirectoryIndex::new();
         let fh = [0x42u8; 32];
         idx.insert(ns1(), "file.txt".into(), fh, comp(100), 1024);
@@ -146,14 +146,14 @@ mod tests {
         assert_eq!(entry.size, 1024);
     }
 
-    #[test]
-    fn lookup_miss() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lookup_miss() {
         let idx = DirectoryIndex::new();
         assert!(idx.lookup(ns1(), "nope").is_none());
     }
 
-    #[test]
-    fn list_entries() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_entries() {
         let idx = DirectoryIndex::new();
         idx.insert(ns1(), "a.txt".into(), [1; 32], comp(1), 10);
         idx.insert(ns1(), "b.txt".into(), [2; 32], comp(2), 20);
@@ -169,8 +169,8 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    #[test]
-    fn remove_entry() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_entry() {
         let idx = DirectoryIndex::new();
         idx.insert(ns1(), "delete_me.txt".into(), [1; 32], comp(1), 10);
         assert_eq!(idx.count(ns1()), 1);
@@ -180,14 +180,14 @@ mod tests {
         assert!(idx.lookup(ns1(), "delete_me.txt").is_none());
     }
 
-    #[test]
-    fn remove_nonexistent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_nonexistent() {
         let idx = DirectoryIndex::new();
         assert!(!idx.remove(ns1(), "nope"));
     }
 
-    #[test]
-    fn rename_entry() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_entry() {
         let idx = DirectoryIndex::new();
         idx.insert(ns1(), "old.txt".into(), [1; 32], comp(1), 10);
 
@@ -198,14 +198,14 @@ mod tests {
         assert_eq!(entry.name, "new.txt");
     }
 
-    #[test]
-    fn rename_nonexistent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_nonexistent() {
         let idx = DirectoryIndex::new();
         assert!(!idx.rename(ns1(), "nope", "also_nope"));
     }
 
-    #[test]
-    fn namespace_isolation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn namespace_isolation() {
         let idx = DirectoryIndex::new();
         idx.insert(ns1(), "shared_name.txt".into(), [1; 32], comp(1), 10);
         idx.insert(ns2(), "shared_name.txt".into(), [2; 32], comp(2), 20);

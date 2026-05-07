@@ -71,8 +71,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// + IANA registry). This sentinel pins the wire values so a future
 /// refactor that adds a typed `AuthFlavor` enum cannot accidentally
 /// renumber them.
-#[test]
-fn s7_2_auth_flavor_constants_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s7_2_auth_flavor_constants_pinned() {
     // Flavor values as they MUST appear on the wire.
     const AUTH_NONE: u32 = 0;
     const AUTH_SYS: u32 = 1;
@@ -112,8 +112,8 @@ fn s7_2_auth_flavor_constants_pinned() {
 /// In practice, every real implementation emits length=0; a strict
 /// decoder MUST accept the empty body and SHOULD treat any non-zero
 /// body as a fidelity gap to flag (real client compatibility).
-#[test]
-fn s9_1_auth_none_body_is_empty_on_wire() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_1_auth_none_body_is_empty_on_wire() {
     // Build the opaque_auth wrapper for AUTH_NONE: flavor=0, body=[].
     let mut w = XdrWriter::new();
     w.write_u32(0); // flavor = AUTH_NONE
@@ -148,8 +148,8 @@ fn s9_1_auth_none_body_is_empty_on_wire() {
 /// `OpaqueAuth::decode` (used by `RpcCallHeader::decode` so we don't
 /// break interop with chatty clients) accepts non-empty bodies and
 /// just enforces the §8.2 400-byte cap.
-#[test]
-fn s9_1_auth_none_with_nonempty_body_is_rejected_by_strict_decoder() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_1_auth_none_with_nonempty_body_is_rejected_by_strict_decoder() {
     // Build flavor=AUTH_NONE with a 4-byte body. Spec says body
     // SHOULD be zero-length; a strict server flags this.
     let mut w = XdrWriter::new();
@@ -220,8 +220,8 @@ fn encode_authsys_parms(
 ///
 /// Positive case: a typical Linux client with stamp=arbitrary,
 /// machinename="client.example", uid=1000, gid=1000, gids=[1000].
-#[test]
-fn s9_2_auth_sys_body_round_trips_through_xdr() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_auth_sys_body_round_trips_through_xdr() {
     let bytes = encode_authsys_parms(0xCAFE_BABE, "client.example", 1000, 1000, &[1000]);
 
     // Walk the body back out and assert each field matches.
@@ -242,8 +242,8 @@ fn s9_2_auth_sys_body_round_trips_through_xdr() {
 
 /// RFC 1057 §9.2 — `stamp` is an arbitrary `unsigned int`. All
 /// values 0..=u32::MAX are legal; the server MUST NOT reject any.
-#[test]
-fn s9_2_stamp_accepts_full_u32_range() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_stamp_accepts_full_u32_range() {
     for stamp in [0u32, 1, 0xCAFE_BABE, u32::MAX] {
         let bytes = encode_authsys_parms(stamp, "h", 0, 0, &[]);
         let mut r = XdrReader::new(&bytes);
@@ -257,8 +257,8 @@ fn s9_2_stamp_accepts_full_u32_range() {
 
 /// RFC 1057 §9.2 negative — `stamp` is fixed-width 4 bytes; if
 /// the body is truncated mid-stamp the decoder MUST error.
-#[test]
-fn s9_2_stamp_truncated_body_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_stamp_truncated_body_rejected() {
     // Only 3 bytes — one short of a u32.
     let bytes = [0xFFu8, 0xFF, 0xFF];
     let mut r = XdrReader::new(&bytes);
@@ -275,8 +275,8 @@ fn s9_2_stamp_truncated_body_rejected() {
 /// RFC 1057 §9.2 — `machinename` is `string<255>`: an XDR string
 /// with a maximum length of 255 octets. A 255-octet machinename
 /// is the longest a strict decoder MUST accept.
-#[test]
-fn s9_2_machinename_at_max_length_255_accepted() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_machinename_at_max_length_255_accepted() {
     let max_name = "a".repeat(255);
     let bytes = encode_authsys_parms(0, &max_name, 0, 0, &[]);
     let mut r = XdrReader::new(&bytes);
@@ -291,8 +291,8 @@ fn s9_2_machinename_at_max_length_255_accepted() {
 /// RFC 1057 §9.2 negative — `machinename` over 255 octets violates
 /// the `string<255>` constraint. `AuthSysParams::decode` MUST reject
 /// it with a BADXDR-equivalent error.
-#[test]
-fn s9_2_machinename_over_255_must_error() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_machinename_over_255_must_error() {
     let oversized = "X".repeat(256); // one byte over the limit
     let bytes = encode_authsys_parms(0, &oversized, 0, 0, &[]);
     let mut r = XdrReader::new(&bytes);
@@ -312,8 +312,8 @@ fn s9_2_machinename_over_255_must_error() {
 /// All values are legal on the wire; mapping/permission decisions
 /// happen at the auth layer (`validate_credentials`), not the
 /// codec.
-#[test]
-fn s9_2_uid_gid_accept_full_u32_range() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_uid_gid_accept_full_u32_range() {
     // Edge: uid=0 (root), gid=0 (root group). Spec doesn't ban
     // root creds at the wire layer; export config decides.
     let bytes = encode_authsys_parms(0, "h", 0, 0, &[]);
@@ -335,8 +335,8 @@ fn s9_2_uid_gid_accept_full_u32_range() {
 /// RFC 1057 §9.2 — when AUTH_SYS creds reach the auth layer,
 /// `NfsCredentials::from_auth_sys` is the entry point. The fields
 /// must round-trip exactly (no value mangling).
-#[test]
-fn s9_2_uid_gid_round_trip_through_nfs_credentials() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_uid_gid_round_trip_through_nfs_credentials() {
     let creds = NfsCredentials::from_auth_sys(1000, 1000, "client.example".into());
     assert_eq!(creds.method, NfsAuthMethod::AuthSys);
     assert_eq!(creds.uid, 1000);
@@ -355,8 +355,8 @@ fn s9_2_uid_gid_round_trip_through_nfs_credentials() {
 /// RFC 1057 §9.2 — `gids<16>` is a variable-length array of
 /// unsigned int with **maximum 16 entries**. An empty array is
 /// legal (no supplemental groups).
-#[test]
-fn s9_2_gids_empty_array_accepted() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_gids_empty_array_accepted() {
     let bytes = encode_authsys_parms(0, "h", 1000, 1000, &[]);
     let mut r = XdrReader::new(&bytes);
     let _ = r.read_u32(); // stamp
@@ -369,8 +369,8 @@ fn s9_2_gids_empty_array_accepted() {
 
 /// RFC 1057 §9.2 — exactly 16 supplemental gids is the documented
 /// maximum and MUST be accepted.
-#[test]
-fn s9_2_gids_at_max_16_entries_accepted() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_gids_at_max_16_entries_accepted() {
     let gids: Vec<u32> = (1000..1016).collect(); // exactly 16
     let bytes = encode_authsys_parms(0, "h", 1000, 1000, &gids);
     let mut r = XdrReader::new(&bytes);
@@ -391,8 +391,8 @@ fn s9_2_gids_at_max_16_entries_accepted() {
 /// Real-world note: oversized gids arrays are a known auth-bypass
 /// vector — a malicious client could claim membership in an
 /// arbitrary number of groups to hit edge-case authorization paths.
-#[test]
-fn s9_2_gids_over_16_entries_must_error() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_gids_over_16_entries_must_error() {
     let too_many: Vec<u32> = (1000..1017).collect(); // 17 entries — one over cap
     let bytes = encode_authsys_parms(0, "h", 1000, 1000, &too_many);
     let mut r = XdrReader::new(&bytes);
@@ -410,8 +410,8 @@ fn s9_2_gids_over_16_entries_must_error() {
 
 /// RFC 1057 §9.2 — encode the full `authsys_parms` struct, decode
 /// it back, and verify every field matches. Round-trip is identity.
-#[test]
-fn s9_2_full_authsys_parms_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_full_authsys_parms_round_trip() {
     let stamp = 0xCAFE_BABE;
     let machinename = "nfs-client.example.com";
     let uid = 1000;
@@ -452,8 +452,8 @@ fn s9_2_full_authsys_parms_round_trip() {
 /// using values the spec discusses (`stamp=0`, `machinename="unix"`,
 /// `uid=0`, `gid=0`, no supplemental gids — the trivial root
 /// credential). Any compliant encoder MUST produce these bytes.
-#[test]
-fn rfc_example_s9_2_authsys_parms_root_unix_credential() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_example_s9_2_authsys_parms_root_unix_credential() {
     let bytes = encode_authsys_parms(0, "unix", 0, 0, &[]);
     let expected = vec![
         0x00, 0x00, 0x00, 0x00, // stamp = 0
@@ -473,8 +473,8 @@ fn rfc_example_s9_2_authsys_parms_root_unix_credential() {
 /// RFC 1057 §9.2 — vendored fixture comparison (ADR-023 §D2.3.1).
 /// `tests/wire-samples/rfc1057/section-9-2-authsys/trivial-root-credential.bin`
 /// is the byte-for-byte trivial root credential.
-#[test]
-fn s9_2_authsys_root_credential_matches_vendored_fixture() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_authsys_root_credential_matches_vendored_fixture() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/wire-samples/rfc1057/section-9-2-authsys/trivial-root-credential.bin");
     let on_disk =
@@ -489,8 +489,8 @@ fn s9_2_authsys_root_credential_matches_vendored_fixture() {
 }
 
 /// RFC 1057 §9.2 fixture corruption guard (ADR-023 §D2.3.2).
-#[test]
-fn s9_2_fixture_sha256_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_2_fixture_sha256_pinned() {
     use aws_lc_rs::digest;
     const EXPECTED_SHA256: &str =
         "d230d66793d45e61ffccea0e656718d210390f9c5b16371193a531b5b647accb";

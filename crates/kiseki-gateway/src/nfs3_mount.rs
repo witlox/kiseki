@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crate::nfs_ops::NfsContext;
 use crate::nfs_xdr::{
-    encode_reply_accepted, read_rm_message, write_rm_message, RpcCallHeader, XdrReader, XdrWriter,
+    encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter,
 };
 use crate::ops::GatewayOps;
 
@@ -94,13 +94,17 @@ pub fn handle_mount3_message<G: GatewayOps>(
 
 /// Long-lived MOUNT3 connection handler. Some Linux clients keep the
 /// MOUNT TCP socket open after MNT (for UMNT later), so we loop the
-/// way the NFSv3/v4 dispatchers do.
-pub fn handle_mount3_connection<G: GatewayOps, S: io::Read + io::Write>(
+/// way the NFSv3/v4 dispatchers do. Async-native — shares the
+/// kiseki-server runtime with NFS3/NFS4 handlers.
+pub async fn handle_mount3_connection<G: GatewayOps, S>(
     mut stream: S,
     ctx: Arc<NfsContext<G>>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
-        let msg = match read_rm_message(&mut stream) {
+        let msg = match crate::nfs_xdr::read_rm_message_async(&mut stream).await {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
@@ -114,12 +118,12 @@ pub fn handle_mount3_connection<G: GatewayOps, S: io::Read + io::Write>(
             encode_reply_accepted(&mut w, header.xid, 2); // PROG_MISMATCH
             w.write_u32(MOUNT3_VERSION); // low
             w.write_u32(MOUNT3_VERSION); // high
-            write_rm_message(&mut stream, &w.into_bytes())?;
+            crate::nfs_xdr::write_rm_message_async(&mut stream, &w.into_bytes()).await?;
             continue;
         }
 
         let reply = dispatch_mount3(&header, &mut reader, &ctx);
-        write_rm_message(&mut stream, &reply)?;
+        crate::nfs_xdr::write_rm_message_async(&mut stream, &reply).await?;
     }
 }
 
@@ -283,8 +287,8 @@ mod tests {
     /// MUST be RPC accept_stat=SUCCESS (0) with an empty body. Linux
     /// `mount.nfs -o vers=3` issues this before MNT to verify the
     /// MOUNT service is alive.
-    #[test]
-    fn rfc1813_appendix_i_mount3_null_returns_empty_accept_ok() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rfc1813_appendix_i_mount3_null_returns_empty_accept_ok() {
         let ctx = test_ctx();
         let raw = build_call(0xCAFE, MOUNT3_PROGRAM, MOUNT3_VERSION, proc::NULL, &[]);
         let reply = handle_mount3_message(&header(0xCAFE, proc::NULL), &raw, &ctx);
@@ -312,8 +316,8 @@ mod tests {
     /// namespace root file handle so subsequent NFSv3 ops can reference
     /// the mount point. AUTH_SYS (1) advertised in auth_flavors so
     /// Linux's `mount.nfs` accepts the export.
-    #[test]
-    fn rfc1813_appendix_i_mount3_mnt_default_returns_root_fh() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rfc1813_appendix_i_mount3_mnt_default_returns_root_fh() {
         let ctx = test_ctx();
         // args: dirpath = "/default" (Linux client passes the full path)
         let mut body = XdrWriter::new();
@@ -359,8 +363,8 @@ mod tests {
     /// RFC 1813 Appendix I — MNT for an unknown export name MUST yield
     /// `MNT3ERR_NOENT` (2). Linux surfaces this as `mount.nfs: access
     /// denied by server while mounting`.
-    #[test]
-    fn rfc1813_appendix_i_mount3_mnt_unknown_export_returns_noent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rfc1813_appendix_i_mount3_mnt_unknown_export_returns_noent() {
         let ctx = test_ctx();
         let mut body = XdrWriter::new();
         body.write_string("/no-such-export");

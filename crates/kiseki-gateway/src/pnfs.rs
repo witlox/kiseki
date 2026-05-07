@@ -1024,8 +1024,8 @@ mod mds_layout_tests {
         CompositionId(uuid::Uuid::from_u128(idx))
     }
 
-    #[test]
-    fn layout_covers_full_requested_range() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layout_covers_full_requested_range() {
         let mgr = MdsLayoutManager::new(
             fixed_key(),
             cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
@@ -1056,8 +1056,8 @@ mod mds_layout_tests {
         );
     }
 
-    #[test]
-    fn stripes_round_robin_across_nodes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stripes_round_robin_across_nodes() {
         let mgr = MdsLayoutManager::new(
             fixed_key(),
             cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
@@ -1080,8 +1080,8 @@ mod mds_layout_tests {
     /// per-stripe addressing anymore. The DS reads at the
     /// kernel's absolute composition offset directly. Each FH
     /// MUST still validate against the live MAC key.
-    #[test]
-    fn every_mirror_carries_a_whole_segment_fh4() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_mirror_carries_a_whole_segment_fh4() {
         let mgr = MdsLayoutManager::new(
             fixed_key(),
             cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
@@ -1107,8 +1107,8 @@ mod mds_layout_tests {
         }
     }
 
-    #[test]
-    fn layout_cache_returns_clone_on_repeat() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layout_cache_returns_clone_on_repeat() {
         let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
         let l1 = mgr.layout_get(
             OrgId(uuid::Uuid::nil()),
@@ -1132,8 +1132,8 @@ mod mds_layout_tests {
         assert_eq!(mgr.active_count(), 1);
     }
 
-    #[test]
-    fn sweeper_removes_expired_entries() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweeper_removes_expired_entries() {
         let mgr = MdsLayoutManager::new(
             fixed_key(),
             MdsLayoutConfig {
@@ -1166,8 +1166,8 @@ mod mds_layout_tests {
     /// over `stripe_size` = ~281e12 times, OOM-killing the server
     /// — that's the documented Phase 15c.5 deferral. Post-fix:
     /// stripe count is bounded by a sane cap.
-    #[test]
-    fn layout_get_with_u64_max_length_does_not_oom() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layout_get_with_u64_max_length_does_not_oom() {
         let mgr = MdsLayoutManager::new(
             fixed_key(),
             cfg_with_nodes(vec!["n1:2052", "n2:2052", "n3:2052"]),
@@ -1210,8 +1210,8 @@ mod mds_layout_tests {
     /// stripes correctly — actually the bug was the opposite: it
     /// looped `u64::MAX` times). Either way, post-fix the layout
     /// is non-empty and starts at the requested offset.
-    #[test]
-    fn layout_get_with_nonzero_offset_and_u64_max_length_starts_at_offset() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layout_get_with_nonzero_offset_and_u64_max_length_starts_at_offset() {
         let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
         let layout = mgr.layout_get(
             OrgId(uuid::Uuid::nil()),
@@ -1240,8 +1240,8 @@ mod mds_layout_tests {
     /// stale offset-0 layout, the response didn't cover the
     /// requested offset, the kernel re-issued LAYOUTGET, infinite
     /// loop. This test pins the cache-coverage check.
-    #[test]
-    fn cache_recomputes_when_offset_is_outside_cached_range() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cache_recomputes_when_offset_is_outside_cached_range() {
         let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
         // First call seeds the cache for composition C with a layout
         // starting at offset 0, covering one stripe.
@@ -1289,8 +1289,8 @@ mod mds_layout_tests {
     /// stateid we issued in LAYOUTGET). Without this, the kernel
     /// clears its local state but the server keeps serving the
     /// stale cached layout — pnfs read loop deadlocks.
-    #[test]
-    fn layout_return_by_stateid_removes_matching_entry() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layout_return_by_stateid_removes_matching_entry() {
         let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
         let layout = mgr.layout_get(
             OrgId(uuid::Uuid::nil()),
@@ -1309,8 +1309,8 @@ mod mds_layout_tests {
 
     /// `layout_return_by_stateid` returns false when the stateid
     /// matches no live entry — defensive idempotency.
-    #[test]
-    fn layout_return_by_stateid_returns_false_when_unknown() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layout_return_by_stateid_returns_false_when_unknown() {
         let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
         let removed = mgr.layout_return_by_stateid(&[0xAA; 16]);
         assert!(!removed);
@@ -1319,8 +1319,8 @@ mod mds_layout_tests {
     /// A cache hit when the requested range IS contained in the
     /// cached layout returns the cached layout — the fast path that
     /// I-PN8 relies on for capacity-bounded layout state.
-    #[test]
-    fn cache_hits_when_offset_is_inside_cached_range() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cache_hits_when_offset_is_inside_cached_range() {
         let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
         let l0 = mgr.layout_get(
             OrgId(uuid::Uuid::nil()),
@@ -1347,8 +1347,8 @@ mod mds_layout_tests {
         assert_eq!(l0.stripes[0].offset, l1.stripes[0].offset);
     }
 
-    #[test]
-    fn lru_evicts_smallest_issued_at_ms_on_capacity_hit() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lru_evicts_smallest_issued_at_ms_on_capacity_hit() {
         let mgr = MdsLayoutManager::new(
             fixed_key(),
             MdsLayoutConfig {
@@ -1371,8 +1371,8 @@ mod mds_layout_tests {
         assert_eq!(mgr.active_count(), 3);
     }
 
-    #[test]
-    fn get_device_info_resolves_active_layout_devices() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_device_info_resolves_active_layout_devices() {
         let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["10.0.0.11:2052"]));
         let layout = mgr.layout_get(
             OrgId(uuid::Uuid::nil()),
@@ -1391,14 +1391,14 @@ mod mds_layout_tests {
         assert_eq!(info.addresses[0].uaddr, "10.0.0.11.8.4");
     }
 
-    #[test]
-    fn get_device_info_returns_none_for_unknown_device() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_device_info_returns_none_for_unknown_device() {
         let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
         assert!(mgr.get_device_info(&[0xff; 16]).is_none());
     }
 
-    #[test]
-    fn host_port_to_uaddr_handles_ipv4() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_port_to_uaddr_handles_ipv4() {
         assert_eq!(host_port_to_uaddr("10.0.0.11:2049"), "10.0.0.11.8.1");
         assert_eq!(host_port_to_uaddr("127.0.0.1:80"), "127.0.0.1.0.80");
     }
@@ -1406,8 +1406,8 @@ mod mds_layout_tests {
     /// Phase 15c.5 step 3: an IP literal must round-trip through
     /// the resolver without DNS — the fast path that production
     /// IPv4 deployments rely on.
-    #[test]
-    fn host_port_to_resolved_uaddr_passes_ipv4_literal_through() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_port_to_resolved_uaddr_passes_ipv4_literal_through() {
         let r = host_port_to_resolved_uaddr("10.0.0.11:2052").unwrap();
         assert_eq!(r.netid, "tcp");
         assert_eq!(r.uaddr, "10.0.0.11.8.4");
@@ -1415,8 +1415,8 @@ mod mds_layout_tests {
 
     /// Phase 15c.5 step 3: an IPv6 literal returns netid=tcp6 and
     /// the colon-form universal address.
-    #[test]
-    fn host_port_to_resolved_uaddr_passes_ipv6_literal_through() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_port_to_resolved_uaddr_passes_ipv6_literal_through() {
         let r = host_port_to_resolved_uaddr("[::1]:2052").unwrap();
         assert_eq!(r.netid, "tcp6");
         assert!(r.uaddr.ends_with(".8.4"));
@@ -1425,8 +1425,8 @@ mod mds_layout_tests {
     /// Phase 15c.5 step 3: a hostname with no DNS entry returns
     /// `None` so the GETDEVICEINFO handler can omit the device.
     /// This is the "kiseki-node1.8.4 fallback" regression check.
-    #[test]
-    fn host_port_to_resolved_uaddr_returns_none_for_unresolvable() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_port_to_resolved_uaddr_returns_none_for_unresolvable() {
         // ".invalid" is reserved by RFC 6761 — guaranteed to fail DNS.
         assert!(host_port_to_resolved_uaddr("nonexistent.invalid:2052").is_none());
     }
@@ -1579,16 +1579,16 @@ mod fh_tests {
         )
     }
 
-    #[test]
-    fn fh_const_sizes_match_spec() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fh_const_sizes_match_spec() {
         assert_eq!(PNFS_FH_BYTES, 76);
         assert_eq!(PNFS_FH_PAYLOAD_BYTES, 60);
         assert_eq!(PNFS_FH_MAC_BYTES, 16);
         assert_eq!(PNFS_FH_PAYLOAD_BYTES + PNFS_FH_MAC_BYTES, PNFS_FH_BYTES);
     }
 
-    #[test]
-    fn encode_then_decode_roundtrips_all_fields() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encode_then_decode_roundtrips_all_fields() {
         let h = fixed_handle(1_000_000);
         let bytes = h.encode();
         assert_eq!(bytes.len(), PNFS_FH_BYTES);
@@ -1596,8 +1596,8 @@ mod fh_tests {
         assert_eq!(back, h);
     }
 
-    #[test]
-    fn decode_wrong_length_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn decode_wrong_length_rejected() {
         let err = PnfsFileHandle::decode(&[0u8; 75]).unwrap_err();
         assert_eq!(
             err,
@@ -1608,22 +1608,22 @@ mod fh_tests {
         );
     }
 
-    #[test]
-    fn validate_succeeds_with_correct_key_and_future_expiry() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_succeeds_with_correct_key_and_future_expiry() {
         let h = fixed_handle(u64::MAX);
         h.validate(&fixed_key(), 0).expect("valid");
     }
 
-    #[test]
-    fn validate_rejects_wrong_key_with_mac_mismatch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_rejects_wrong_key_with_mac_mismatch() {
         let h = fixed_handle(u64::MAX);
         let other_key = PnfsFhMacKey::from_bytes([0xcd; 32]);
         let err = h.validate(&other_key, 0).unwrap_err();
         assert_eq!(err, FhValidateError::MacMismatch);
     }
 
-    #[test]
-    fn validate_rejects_tampered_payload_byte() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_rejects_tampered_payload_byte() {
         let h = fixed_handle(u64::MAX);
         let mut bytes = h.encode();
         bytes[10] ^= 0x01; // flip a bit inside tenant_id
@@ -1632,8 +1632,8 @@ mod fh_tests {
         assert_eq!(err, FhValidateError::MacMismatch);
     }
 
-    #[test]
-    fn validate_rejects_expired_fh() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_rejects_expired_fh() {
         let h = fixed_handle(1_000); // expiry_ms = 1000
         let err = h.validate(&fixed_key(), 5_000).unwrap_err();
         assert_eq!(
@@ -1645,8 +1645,8 @@ mod fh_tests {
         );
     }
 
-    #[test]
-    fn validate_rejects_at_exact_expiry_boundary() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_rejects_at_exact_expiry_boundary() {
         // ADR-038 §D4.4 wording: `expiry_ms > now_ms` — equality is expired.
         let h = fixed_handle(5_000);
         assert!(matches!(
@@ -1655,8 +1655,8 @@ mod fh_tests {
         ));
     }
 
-    #[test]
-    fn derive_pnfs_fh_mac_key_is_deterministic() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn derive_pnfs_fh_mac_key_is_deterministic() {
         let master = [0x42; 32];
         let cluster = [0x77; 16];
         let k1 = derive_pnfs_fh_mac_key(&master, &cluster);
@@ -1664,24 +1664,24 @@ mod fh_tests {
         assert_eq!(*k1.material(), *k2.material());
     }
 
-    #[test]
-    fn derive_pnfs_fh_mac_key_differs_per_cluster_id() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn derive_pnfs_fh_mac_key_differs_per_cluster_id() {
         let master = [0x42; 32];
         let k_a = derive_pnfs_fh_mac_key(&master, &[0x01; 16]);
         let k_b = derive_pnfs_fh_mac_key(&master, &[0x02; 16]);
         assert_ne!(*k_a.material(), *k_b.material());
     }
 
-    #[test]
-    fn derive_pnfs_fh_mac_key_differs_per_master_key() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn derive_pnfs_fh_mac_key_differs_per_master_key() {
         let cluster = [0x77; 16];
         let k_a = derive_pnfs_fh_mac_key(&[0x01; 32], &cluster);
         let k_b = derive_pnfs_fh_mac_key(&[0x02; 32], &cluster);
         assert_ne!(*k_a.material(), *k_b.material());
     }
 
-    #[test]
-    fn fh_uses_domain_separation_tag() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fh_uses_domain_separation_tag() {
         // If the MAC input were just the payload (no PNFS_FH_MAC_DOMAIN
         // prefix), this round-trip with a manually-computed
         // hmac-without-tag would validate. Asserting that it does NOT
@@ -1710,8 +1710,8 @@ mod fh_tests {
         );
     }
 
-    #[test]
-    fn fh_payload_field_widths_total_60() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fh_payload_field_widths_total_60() {
         // Sentinel test: if anyone changes ID widths or removes a field
         // they must update ADR-038 §D4.3 and this test together.
         let h = fixed_handle(0);
@@ -1733,8 +1733,8 @@ mod fh_tests {
         );
     }
 
-    #[test]
-    fn issue_then_validate_with_same_key_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn issue_then_validate_with_same_key_succeeds() {
         let key = fixed_key();
         let h = PnfsFileHandle::issue(
             &key,
@@ -1760,8 +1760,8 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn layout_get_covers_full_range() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layout_get_covers_full_range() {
         let mut mgr = LayoutManager::new(test_nodes());
         let layout = mgr.layout_get(1, 0, 4 * 1024 * 1024, IoMode::Read);
 
@@ -1775,8 +1775,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn segments_distributed_across_nodes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn segments_distributed_across_nodes() {
         let mut mgr = LayoutManager::new(test_nodes());
         let layout = mgr.layout_get(1, 0, 3 * 1024 * 1024, IoMode::ReadWrite);
 
@@ -1788,8 +1788,8 @@ mod tests {
         assert_eq!(addrs, vec!["node1:9100", "node2:9100", "node3:9100"]);
     }
 
-    #[test]
-    fn layout_return_removes_layout() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layout_return_removes_layout() {
         let mut mgr = LayoutManager::new(test_nodes());
         mgr.layout_get(42, 0, 1024 * 1024, IoMode::Read);
         assert_eq!(mgr.active_count(), 1);
@@ -1801,8 +1801,8 @@ mod tests {
         assert!(!mgr.layout_return(42));
     }
 
-    #[test]
-    fn repeat_layout_get_returns_cached() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeat_layout_get_returns_cached() {
         let mut mgr = LayoutManager::new(test_nodes());
         let l1 = mgr.layout_get(7, 0, 2 * 1024 * 1024, IoMode::Read);
         let l2 = mgr.layout_get(7, 0, 2 * 1024 * 1024, IoMode::Read);

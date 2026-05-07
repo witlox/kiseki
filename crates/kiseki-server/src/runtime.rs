@@ -1382,14 +1382,11 @@ pub async fn run_main(
         std::net::TcpListener::bind(nfs_addr).map_err(|e| format!("NFS bind {nfs_addr}: {e}"))?;
     let nfs_tls_for_thread = nfs_tls.clone();
     let pnfs_layout_mgr_for_nfs = pnfs_layout_mgr.clone();
-    // Hand the kiseki-server's main tokio runtime handle to the NFS
-    // path so `NfsContext::block_gateway` dispatches against it
-    // instead of spawning a dedicated 2-or-N-worker runtime. Pre-fix
-    // measurement showed NFS PUT capped at ~6 k op/s with the
-    // dedicated runtime; the main runtime has the same parallelism
-    // native uses (no cap from the runtime side).
-    kiseki_gateway::nfs_ops::set_external_nfs_runtime(tokio::runtime::Handle::current());
-    std::thread::spawn(move || {
+    // Spawn the NFS listener as a tokio task on the main runtime —
+    // post-async-native conversion the listener uses tokio::net and
+    // each connection becomes a tokio task. No more std::thread::spawn,
+    // no more block_on into a dedicated NFS runtime.
+    tokio::spawn(async move {
         kiseki_gateway::nfs_server::serve_nfs_listener_with_mgr(
             nfs_listener,
             nfs_gw,
@@ -1399,7 +1396,8 @@ pub async fn run_main(
             pnfs_layout_mgr_for_nfs,
             None,
             nfs_tls_for_thread,
-        );
+        )
+        .await;
     });
 
     // Bug 10 fix: minimal portmapper / RPCBIND listener (RFC 1057).
@@ -1458,13 +1456,14 @@ pub async fn run_main(
                 mds_layout_manager: pnfs_layout_mgr.clone(),
             });
             let ds_tls_for_thread = nfs_tls.clone();
-            std::thread::spawn(move || {
+            tokio::spawn(async move {
                 kiseki_gateway::pnfs_ds_server::run_ds_server(
                     ds_addr,
                     ds_ctx,
                     None,
                     ds_tls_for_thread,
-                );
+                )
+                .await;
             });
             tracing::info!(addr = %ds_addr, "pNFS DS listener spawned");
         }

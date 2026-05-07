@@ -54,8 +54,8 @@ fn build_call(xid: u32, program: u32, version: u32, procedure: u32, rpc_version:
 
 /// RFC 5531 §9 — call header: xid, msg_type=CALL(0), rpc_version=2,
 /// program, version, procedure, then `opaque_auth` cred + verf.
-#[test]
-fn s9_call_header_decodes_with_correct_xid_program_version_procedure() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_call_header_decodes_with_correct_xid_program_version_procedure() {
     let bytes = build_call(0xCAFE_BABE, 100_003, 4, 1, 2);
     let mut r = XdrReader::new(&bytes);
     let h = RpcCallHeader::decode(&mut r).expect("valid call");
@@ -67,8 +67,8 @@ fn s9_call_header_decodes_with_correct_xid_program_version_procedure() {
 
 /// RFC 5531 §9: msg_type values are CALL=0 and REPLY=1. A call
 /// header decoder must reject REPLY (1).
-#[test]
-fn s9_msg_type_reply_in_call_position_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_msg_type_reply_in_call_position_rejected() {
     let mut w = XdrWriter::new();
     w.write_u32(0xDEAD); // xid
     w.write_u32(1); // REPLY — not valid for incoming call
@@ -91,8 +91,8 @@ fn s9_msg_type_reply_in_call_position_rejected() {
 /// RFC 5531 §9: `rpcvers` is fixed at 2. Anything else must
 /// produce RPC_MISMATCH at the protocol layer; at the decoder,
 /// it's a hard error.
-#[test]
-fn s9_rpc_version_must_be_2() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_rpc_version_must_be_2() {
     for unsupported in [0u32, 1, 3, 100] {
         let bytes = build_call(0, 0, 0, 0, unsupported);
         let mut r = XdrReader::new(&bytes);
@@ -115,8 +115,8 @@ fn s9_rpc_version_must_be_2() {
 ///   accept_stat: u32 (SUCCESS=0, …)
 ///
 /// `encode_reply_accepted` MUST emit exactly this shape.
-#[test]
-fn s9_reply_accepted_header_is_24_bytes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_reply_accepted_header_is_24_bytes() {
     let mut w = XdrWriter::new();
     encode_reply_accepted(&mut w, 0xCAFE_BABE, 0); // SUCCESS
     let bytes = w.into_bytes();
@@ -145,8 +145,8 @@ fn s9_reply_accepted_header_is_24_bytes() {
 ///   SYSTEM_ERR    = 5
 ///
 /// All six must round-trip through `encode_reply_accepted`.
-#[test]
-fn s9_accept_stat_round_trip_for_all_six_values() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_accept_stat_round_trip_for_all_six_values() {
     for stat in 0u32..=5 {
         let mut w = XdrWriter::new();
         encode_reply_accepted(&mut w, 0, stat);
@@ -172,8 +172,8 @@ fn s9_accept_stat_round_trip_for_all_six_values() {
 /// RFC 5531 §8.2 — opaque_auth is `flavor: enum + body: opaque<400>`.
 /// Body length cap = 400 bytes (RFC 5531 §8.2). Decoder must
 /// reject longer bodies.
-#[test]
-fn s8_2_opaque_auth_body_capped_at_400_bytes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s8_2_opaque_auth_body_capped_at_400_bytes() {
     // Build a call with an oversized AUTH_SYS body (401 bytes).
     let mut w = XdrWriter::new();
     w.write_u32(0xDEAD); // xid
@@ -208,8 +208,8 @@ fn s8_2_opaque_auth_body_capped_at_400_bytes() {
 ///
 /// This sentinel test pins the constants so a future code change
 /// can't accidentally renumber.
-#[test]
-fn s8_1_auth_flavor_constants() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s8_1_auth_flavor_constants() {
     // We don't expose enum constants today; this test asserts the
     // wire values match the RFC + IANA registry. When kiseki adds
     // a typed AuthFlavor enum, it must use these values.
@@ -228,8 +228,8 @@ fn s8_1_auth_flavor_constants() {
 /// (NULL procedure, program 100003, version 4, AUTH_NONE).
 /// These bytes are what Linux `mount.nfs4 -t nfs4 -o vers=4.1`
 /// emits as its first message after TCP handshake.
-#[test]
-fn rfc_example_nfsv4_null_call_decodes_correctly() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_example_nfsv4_null_call_decodes_correctly() {
     let bytes = build_call(0xCAFE_BABE, 100_003, 4, 0, 2);
     // Spec-fixed expected layout (verbatim, byte-for-byte):
     let expected = vec![
@@ -259,8 +259,8 @@ fn rfc_example_nfsv4_null_call_decodes_correctly() {
 /// `tests/wire-samples/rfc5531/section-9-call/nfsv4-null-call.bin`
 /// is the byte-for-byte canonical NFSv4 NULL CALL frame. Verifies
 /// kiseki's `build_call` matches.
-#[test]
-fn s9_nfsv4_null_call_matches_vendored_fixture() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_nfsv4_null_call_matches_vendored_fixture() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/wire-samples/rfc5531/section-9-call/nfsv4-null-call.bin");
     let on_disk =
@@ -274,8 +274,8 @@ fn s9_nfsv4_null_call_matches_vendored_fixture() {
 }
 
 /// RFC 5531 §9 fixture corruption guard (ADR-023 §D2.3.2).
-#[test]
-fn s9_fixture_sha256_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_fixture_sha256_pinned() {
     use aws_lc_rs::digest;
     const EXPECTED_SHA256: &str =
         "8db9c1c9cfe32aa1897c76768cc118ae81e0e2029de3568f7d0de06f92078661";

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::nfs_ops::{FileHandle, NfsContext};
 use crate::nfs_xdr::{
-    encode_reply_accepted, read_rm_message, write_rm_message, RpcCallHeader, XdrReader, XdrWriter,
+    encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter,
 };
 use crate::ops::GatewayOps;
 use kiseki_common::locks::LockOrDie;
@@ -249,7 +249,7 @@ impl SessionManager {
 }
 
 /// Process a single already-decoded NFSv4 COMPOUND and return the reply bytes.
-pub fn handle_nfs4_first_compound<G: GatewayOps>(
+pub async fn handle_nfs4_first_compound<G: GatewayOps>(
     header: &RpcCallHeader,
     raw_msg: &[u8],
     ctx: &NfsContext<G>,
@@ -276,20 +276,20 @@ pub fn handle_nfs4_first_compound<G: GatewayOps>(
     let mut reader = XdrReader::new(raw_msg);
     // Skip past the RPC header (already decoded by caller).
     let _ = RpcCallHeader::decode(&mut reader);
-    dispatch_compound(header, &mut reader, ctx, sessions)
+    dispatch_compound(header, &mut reader, ctx, sessions).await
 }
 
-/// Handle one NFSv4 connection (after the first message).
-///
-/// Accepts any `Read + Write` so callers can pass either a raw
-/// `TcpStream` (plaintext fallback) or a TLS-wrapped stream (default).
-pub fn handle_nfs4_connection<G: GatewayOps, S: io::Read + io::Write>(
+/// Handle one NFSv4 connection (after the first message). Async-native.
+pub async fn handle_nfs4_connection<G: GatewayOps, S>(
     mut stream: S,
     ctx: Arc<NfsContext<G>>,
     sessions: Arc<SessionManager>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
-        let msg = match read_rm_message(&mut stream) {
+        let msg = match crate::nfs_xdr::read_rm_message_async(&mut stream).await {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
@@ -299,16 +299,10 @@ pub fn handle_nfs4_connection<G: GatewayOps, S: io::Read + io::Write>(
         let header = RpcCallHeader::decode(&mut reader)?;
 
         // RFC 8881 §20 — accept CB_NULL on the back-channel program.
-        // The kernel sends CB_NULL on the SAME TCP connection as the
-        // forward channel after CREATE_SESSION; rejecting it as
-        // PROG_MISMATCH breaks bidirectional channel verification.
-        // For CB_COMPOUND (proc=1) we don't actually dispatch back-
-        // channel ops yet — return PROG_MISMATCH for that path
-        // (Phase 15c follow-up) but ACCEPT_OK for NULL.
         if header.program == NFS4_CB_PROGRAM && header.procedure == 0 {
             let mut w = XdrWriter::new();
             encode_reply_accepted(&mut w, header.xid, 0); // SUCCESS
-            write_rm_message(&mut stream, &w.into_bytes())?;
+            crate::nfs_xdr::write_rm_message_async(&mut stream, &w.into_bytes()).await?;
             continue;
         }
 
@@ -317,30 +311,29 @@ pub fn handle_nfs4_connection<G: GatewayOps, S: io::Read + io::Write>(
             encode_reply_accepted(&mut w, header.xid, 2); // PROG_MISMATCH
             w.write_u32(NFS4_VERSION);
             w.write_u32(NFS4_VERSION);
-            write_rm_message(&mut stream, &w.into_bytes())?;
+            crate::nfs_xdr::write_rm_message_async(&mut stream, &w.into_bytes()).await?;
             continue;
         }
 
-        // RFC 7530 §15.1: NULL ping must succeed with an empty body.
         if header.procedure == 0 {
             let mut w = XdrWriter::new();
             encode_reply_accepted(&mut w, header.xid, 0); // SUCCESS
-            write_rm_message(&mut stream, &w.into_bytes())?;
+            crate::nfs_xdr::write_rm_message_async(&mut stream, &w.into_bytes()).await?;
             continue;
         }
         if header.procedure != 1 {
             let mut w = XdrWriter::new();
             encode_reply_accepted(&mut w, header.xid, 3); // PROC_UNAVAIL
-            write_rm_message(&mut stream, &w.into_bytes())?;
+            crate::nfs_xdr::write_rm_message_async(&mut stream, &w.into_bytes()).await?;
             continue;
         }
 
-        let reply = dispatch_compound(&header, &mut reader, &ctx, &sessions);
-        write_rm_message(&mut stream, &reply)?;
+        let reply = dispatch_compound(&header, &mut reader, &ctx, &sessions).await;
+        crate::nfs_xdr::write_rm_message_async(&mut stream, &reply).await?;
     }
 }
 
-fn dispatch_compound<G: GatewayOps>(
+async fn dispatch_compound<G: GatewayOps>(
     header: &RpcCallHeader,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -381,7 +374,7 @@ fn dispatch_compound<G: GatewayOps>(
         };
         op_codes.push(op_code);
 
-        let (status, result) = process_op(op_code, reader, ctx, sessions, &mut state);
+        let (status, result) = process_op(op_code, reader, ctx, sessions, &mut state).await;
         op_results.push(result);
 
         if status != nfs4_status::NFS4_OK {
@@ -418,7 +411,7 @@ fn dispatch_compound<G: GatewayOps>(
     buf
 }
 
-fn process_op<G: GatewayOps>(
+async fn process_op<G: GatewayOps>(
     op_code: u32,
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
@@ -426,41 +419,41 @@ fn process_op<G: GatewayOps>(
     state: &mut CompoundState,
 ) -> (u32, Vec<u8>) {
     match op_code {
-        op::ACCESS => op_access(reader, ctx, state),
-        op::EXCHANGE_ID => op_exchange_id(reader, sessions),
-        op::CREATE_SESSION => op_create_session(reader, sessions),
-        op::DESTROY_SESSION => op_destroy_session(reader, sessions),
-        op::SEQUENCE => op_sequence(reader, sessions),
-        op::PUTROOTFH => op_putrootfh(ctx, state),
-        op::PUTFH => op_putfh(reader, state),
-        op::GETFH => op_getfh(state),
-        op::GETATTR => op_getattr(reader, ctx, state),
-        op::SETATTR => op_setattr(reader, ctx, state),
-        op::LOOKUP => op_lookup(reader, ctx, state),
-        op::OPEN => op_open(reader, ctx, sessions, state),
-        op::CLOSE => op_close(reader, ctx, sessions, state),
-        op::LOCK => op_lock(reader, sessions, state),
-        op::READ => op_read(reader, ctx, state),
-        op::WRITE => op_write(reader, ctx, sessions, state),
-        op::REMOVE => op_remove(reader, ctx),
-        op::RENAME => op_rename(reader, ctx),
-        op::LINK => op_link(reader, ctx, state),
-        op::READDIR => op_readdir(reader, ctx, state),
-        op::READLINK => op_readlink(ctx, state),
-        op::CREATE => op_create(reader, ctx, state),
-        op::COMMIT => op_commit(reader, ctx, state),
-        op::SAVEFH => op_savefh(state),
-        op::RESTOREFH => op_restorefh(state),
-        op::RECLAIM_COMPLETE => op_reclaim_complete(reader),
-        op::IO_ADVISE => op_io_advise(reader),
-        op::LAYOUTGET => op_layoutget(reader, ctx, state),
-        op::LAYOUTRETURN => op_layoutreturn(reader, ctx),
-        op::GETDEVICEINFO => op_getdeviceinfo(reader, ctx),
-        op::SEEK => op_seek(reader),
-        op::LAYOUTERROR => op_layouterror(reader),
-        op::BIND_CONN_TO_SESSION => op_bind_conn_to_session(reader),
-        op::SECINFO_NO_NAME => op_secinfo_no_name(reader),
-        op::DESTROY_CLIENTID => op_destroy_clientid(reader),
+        op::ACCESS => op_access(reader, ctx, state).await,
+        op::EXCHANGE_ID => op_exchange_id(reader, sessions).await,
+        op::CREATE_SESSION => op_create_session(reader, sessions).await,
+        op::DESTROY_SESSION => op_destroy_session(reader, sessions).await,
+        op::SEQUENCE => op_sequence(reader, sessions).await,
+        op::PUTROOTFH => op_putrootfh(ctx, state).await,
+        op::PUTFH => op_putfh(reader, state).await,
+        op::GETFH => op_getfh(state).await,
+        op::GETATTR => op_getattr(reader, ctx, state).await,
+        op::SETATTR => op_setattr(reader, ctx, state).await,
+        op::LOOKUP => op_lookup(reader, ctx, state).await,
+        op::OPEN => op_open(reader, ctx, sessions, state).await,
+        op::CLOSE => op_close(reader, ctx, sessions, state).await,
+        op::LOCK => op_lock(reader, sessions, state).await,
+        op::READ => op_read(reader, ctx, state).await,
+        op::WRITE => op_write(reader, ctx, sessions, state).await,
+        op::REMOVE => op_remove(reader, ctx).await,
+        op::RENAME => op_rename(reader, ctx).await,
+        op::LINK => op_link(reader, ctx, state).await,
+        op::READDIR => op_readdir(reader, ctx, state).await,
+        op::READLINK => op_readlink(ctx, state).await,
+        op::CREATE => op_create(reader, ctx, state).await,
+        op::COMMIT => op_commit(reader, ctx, state).await,
+        op::SAVEFH => op_savefh(state).await,
+        op::RESTOREFH => op_restorefh(state).await,
+        op::RECLAIM_COMPLETE => op_reclaim_complete(reader).await,
+        op::IO_ADVISE => op_io_advise(reader).await,
+        op::LAYOUTGET => op_layoutget(reader, ctx, state).await,
+        op::LAYOUTRETURN => op_layoutreturn(reader, ctx).await,
+        op::GETDEVICEINFO => op_getdeviceinfo(reader, ctx).await,
+        op::SEEK => op_seek(reader).await,
+        op::LAYOUTERROR => op_layouterror(reader).await,
+        op::BIND_CONN_TO_SESSION => op_bind_conn_to_session(reader).await,
+        op::SECINFO_NO_NAME => op_secinfo_no_name(reader).await,
+        op::DESTROY_CLIENTID => op_destroy_clientid(reader).await,
         // RFC 7862 v4.2 ops kiseki claims to recognize but does not
         // implement — return NFS4ERR_NOTSUPP per §15.5 (the op is in
         // the registry; we just don't do it).
@@ -482,11 +475,11 @@ fn process_op<G: GatewayOps>(
     }
 }
 
-pub(crate) fn op_exchange_id(
+pub(crate) async fn op_exchange_id(
     reader: &mut XdrReader<'_>,
     sessions: &SessionManager,
 ) -> (u32, Vec<u8>) {
-    op_exchange_id_with_role(reader, sessions, ServerRole::Mds)
+    op_exchange_id_with_role(reader, sessions, ServerRole::Mds).await
 }
 
 /// `EXCHANGE_ID` server role — selects the `EXCHGID4_FLAG_USE_PNFS_*`
@@ -503,7 +496,7 @@ pub enum ServerRole {
     Ds,
 }
 
-pub(crate) fn op_exchange_id_with_role(
+pub(crate) async fn op_exchange_id_with_role(
     reader: &mut XdrReader<'_>,
     sessions: &SessionManager,
     role: ServerRole,
@@ -546,7 +539,7 @@ pub(crate) fn op_exchange_id_with_role(
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-pub(crate) fn op_create_session(
+pub(crate) async fn op_create_session(
     reader: &mut XdrReader<'_>,
     sessions: &SessionManager,
 ) -> (u32, Vec<u8>) {
@@ -586,7 +579,7 @@ pub(crate) fn op_create_session(
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-pub(crate) fn op_destroy_session(
+pub(crate) async fn op_destroy_session(
     reader: &mut XdrReader<'_>,
     sessions: &SessionManager,
 ) -> (u32, Vec<u8>) {
@@ -607,7 +600,7 @@ pub(crate) fn op_destroy_session(
     }
 }
 
-pub(crate) fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
+pub(crate) async fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionManager) -> (u32, Vec<u8>) {
     let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
     let mut session_id = [0u8; 16];
     if sid_bytes.len() == 16 {
@@ -637,7 +630,7 @@ pub(crate) fn op_sequence(reader: &mut XdrReader<'_>, sessions: &SessionManager)
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-fn op_putrootfh<G: GatewayOps>(ctx: &NfsContext<G>, state: &mut CompoundState) -> (u32, Vec<u8>) {
+async fn op_putrootfh<G: GatewayOps>(ctx: &NfsContext<G>, state: &mut CompoundState) -> (u32, Vec<u8>) {
     // RFC 8881 §18.21 + Phase 15c.2: PUTROOTFH returns the server's
     // pseudo-root, NOT a specific namespace root. The pseudo-root is
     // a virtual parent directory whose only child is "default", which
@@ -656,7 +649,7 @@ fn op_putrootfh<G: GatewayOps>(ctx: &NfsContext<G>, state: &mut CompoundState) -
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-fn op_getfh(state: &CompoundState) -> (u32, Vec<u8>) {
+async fn op_getfh(state: &CompoundState) -> (u32, Vec<u8>) {
     let mut w = XdrWriter::new();
     w.write_u32(op::GETFH);
     match &state.current_fh {
@@ -763,7 +756,7 @@ const KISEKI_FSID_MAJOR: u64 = 0xC0FFEE;
 const KISEKI_FSID_MINOR: u64 = 0x1;
 
 #[allow(clippy::too_many_lines)]
-fn op_getattr<G: GatewayOps>(
+async fn op_getattr<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &CompoundState,
@@ -803,7 +796,7 @@ fn op_getattr<G: GatewayOps>(
             fileid: 1,
         }
     } else {
-        match ctx.getattr(&fh) {
+        match ctx.getattr(&fh).await {
             Ok(a) => a,
             Err(_) => {
                 w.write_u32(nfs4_status::NFS4ERR_NOENT);
@@ -1033,7 +1026,7 @@ fn op_getattr<G: GatewayOps>(
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-fn op_read<G: GatewayOps>(
+async fn op_read<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &CompoundState,
@@ -1053,7 +1046,7 @@ fn op_read<G: GatewayOps>(
         return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
     };
 
-    let status = match ctx.read(fh, offset, count) {
+    let status = match ctx.read(fh, offset, count).await {
         Ok(resp) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_bool(resp.eof);
@@ -1069,7 +1062,7 @@ fn op_read<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_write<G: GatewayOps>(
+async fn op_write<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     sessions: &SessionManager,
@@ -1119,7 +1112,7 @@ fn op_write<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+async fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     // IO_ADVISE: stateid + offset + count + hints bitmap
     let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
     let _offset = reader.read_u64().unwrap_or(0);
@@ -1146,7 +1139,7 @@ fn op_io_advise(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
 /// is parsed only enough to validate the `sa_what` discriminant:
 /// per §15.5 + §11.11 a value outside `{SEEK4_DATA(0), SEEK4_HOLE(1)}`
 /// is NFS4ERR_UNION_NOTSUPP, distinct from "op not implemented".
-fn op_seek(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+async fn op_seek(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
     let _offset = reader.read_u64().unwrap_or(0);
     let sa_what = reader.read_u32().unwrap_or(0);
@@ -1167,7 +1160,7 @@ fn op_seek(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
 /// §15.5 with §11.6, an iomode outside the set
 /// {READ(1), RW(2), ANY(3)} is `NFS4ERR_BADIOMODE`, distinct from
 /// "op not implemented".
-fn op_layouterror(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+async fn op_layouterror(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let _offset = reader.read_u64().unwrap_or(0);
     let _length = reader.read_u64().unwrap_or(0);
     let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
@@ -1197,7 +1190,7 @@ fn op_layouterror(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
 /// Linux 6.x mount.nfs4 emits this in some session bring-up paths.
 /// kiseki uses a single bidirectional connection for both channels
 /// implicitly, so we accept the bind without further state.
-fn op_bind_conn_to_session(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+async fn op_bind_conn_to_session(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let sessionid = reader.read_opaque_fixed(16).unwrap_or_default();
     let dir = reader.read_u32().unwrap_or(0);
     let _use_rdma = reader.read_bool().unwrap_or(false);
@@ -1228,7 +1221,7 @@ fn op_bind_conn_to_session(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
 /// flavor + (if RPCSEC_GSS) sec_oid + qop + service. kiseki only
 /// advertises AUTH_SYS today; emit a single secinfo4 entry with
 /// flavor=1 (AUTH_SYS) and no extra body.
-fn op_secinfo_no_name(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+async fn op_secinfo_no_name(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let _style = reader.read_u32().unwrap_or(0);
 
     let mut w = XdrWriter::new();
@@ -1247,7 +1240,7 @@ fn op_secinfo_no_name(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
 /// state lives in `SessionManager` and is purged when the last
 /// session for that clientid is destroyed; for the kernel's mount
 /// path this is fire-and-forget).
-fn op_destroy_clientid(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+async fn op_destroy_clientid(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let _client_id = reader.read_u64().unwrap_or(0);
 
     let mut w = XdrWriter::new();
@@ -1260,7 +1253,7 @@ fn op_destroy_clientid(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
 /// for direct I/O. Phase 15b emits a Flexible Files Layout
 /// (`ff_layout4`) when `ctx.mds_layout_manager` is wired; older
 /// scenarios fall back to the Phase-14 stub.
-fn op_layoutget<G: GatewayOps>(
+async fn op_layoutget<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &CompoundState,
@@ -1289,7 +1282,7 @@ fn op_layoutget<G: GatewayOps>(
 
     // Phase 15b path — production MDS layout manager is wired.
     if let Some(mgr) = ctx.mds_layout_manager.as_ref() {
-        return op_layoutget_ff(w, mgr, ctx, &fh, iomode, offset, length, layout_type);
+        return op_layoutget_ff(w, mgr, ctx, &fh, iomode, offset, length, layout_type).await;
     }
 
     // Legacy Phase-14 fallback. Kept until the @pnfs-15b BDD scenarios
@@ -1330,7 +1323,7 @@ const LAYOUT4_NFSV4_1_FILES: u32 = 1;
 const LAYOUT4_FLEX_FILES: u32 = 4;
 /// Encode a Flexible Files Layout (RFC 8435 §5.1). Phase 15b path.
 #[allow(clippy::too_many_arguments)]
-fn op_layoutget_ff<G: GatewayOps>(
+async fn op_layoutget_ff<G: GatewayOps>(
     mut w: XdrWriter,
     mgr: &std::sync::Arc<crate::pnfs::MdsLayoutManager>,
     ctx: &NfsContext<G>,
@@ -1451,7 +1444,7 @@ fn ff_now_ms() -> u64 {
 }
 
 /// LAYOUTRETURN (RFC 5661 §18.44) — return pNFS layout.
-fn op_layoutreturn<G: GatewayOps>(
+async fn op_layoutreturn<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
 ) -> (u32, Vec<u8>) {
@@ -1529,7 +1522,7 @@ fn op_layoutreturn<G: GatewayOps>(
 /// the device in the live layout cache. Otherwise we return
 /// `NFS4ERR_NOENT` — older deployments (Phase 14 stub) never offered
 /// device-resolution at all.
-fn op_getdeviceinfo<G: GatewayOps>(
+async fn op_getdeviceinfo<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
 ) -> (u32, Vec<u8>) {
@@ -1619,7 +1612,7 @@ fn op_getdeviceinfo<G: GatewayOps>(
 }
 
 #[allow(clippy::too_many_lines)] // RFC 8881 §18.16.1 args grammar is intrinsically large
-fn op_open<G: GatewayOps>(
+async fn op_open<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     sessions: &SessionManager,
@@ -1797,7 +1790,7 @@ fn op_open<G: GatewayOps>(
     } else {
         // NOCREATE: open existing file by name.
         tracing::debug!(name = %name, "nfs4 op_open: NOCREATE (lookup) path");
-        match ctx.lookup_by_name(&name) {
+        match ctx.lookup_by_name(&name).await {
             Some((fh, _attrs)) => {
                 let sid = sessions.open_file(fh);
                 state.current_fh = Some(fh);
@@ -1819,7 +1812,7 @@ fn op_open<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_close<G: GatewayOps>(
+async fn op_close<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     sessions: &SessionManager,
@@ -1830,7 +1823,7 @@ fn op_close<G: GatewayOps>(
 
     // Flush buffered writes before closing the file.
     if let Some(fh) = state.current_fh {
-        if let Ok(Some((new_fh, _resp))) = ctx.flush_writes(&fh) {
+        if let Ok(Some((new_fh, _resp))) = ctx.flush_writes(&fh).await {
             state.current_fh = Some(new_fh);
         }
     }
@@ -1858,7 +1851,7 @@ fn op_close<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_lock(
+async fn op_lock(
     reader: &mut XdrReader<'_>,
     sessions: &SessionManager,
     state: &mut CompoundState,
@@ -1890,7 +1883,7 @@ fn op_lock(
     (status, w.into_bytes())
 }
 
-fn op_lookup<G: GatewayOps>(
+async fn op_lookup<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &mut CompoundState,
@@ -1915,7 +1908,7 @@ fn op_lookup<G: GatewayOps>(
         return (nfs4_status::NFS4_OK, w.into_bytes());
     }
 
-    let status = match ctx.lookup_by_name(&name) {
+    let status = match ctx.lookup_by_name(&name).await {
         Some((fh, _attrs)) => {
             state.current_fh = Some(fh);
             w.write_u32(nfs4_status::NFS4_OK);
@@ -1930,7 +1923,7 @@ fn op_lookup<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_remove<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+async fn op_remove<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
     let name = reader.read_string().unwrap_or_default();
 
     let mut w = XdrWriter::new();
@@ -1951,7 +1944,7 @@ fn op_remove<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> 
     (status, w.into_bytes())
 }
 
-fn op_readdir<G: GatewayOps>(
+async fn op_readdir<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &CompoundState,
@@ -1984,7 +1977,7 @@ fn op_readdir<G: GatewayOps>(
     // attr_vals opaque length prefix), which made the kernel
     // mis-parse the linked-list and silently drop every entry —
     // the Phase 15c.3 ls-empty bug.
-    let entries = ctx.readdir();
+    let entries = ctx.readdir().await;
     for (i, entry) in entries.iter().enumerate() {
         w.write_bool(true); // nextentry pointer = present
         w.write_u64((i + 1) as u64); // cookie
@@ -2003,7 +1996,7 @@ fn op_readdir<G: GatewayOps>(
 
 // --- F2: New NFSv4 operation handlers ---
 
-fn op_access<G: GatewayOps>(
+async fn op_access<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &CompoundState,
@@ -2048,7 +2041,7 @@ fn op_access<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_setattr<G: GatewayOps>(
+async fn op_setattr<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &CompoundState,
@@ -2070,7 +2063,7 @@ fn op_setattr<G: GatewayOps>(
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    let status = if ctx.setattr(fh, None).is_ok() {
+    let status = if ctx.setattr(fh, None).await.is_ok() {
         w.write_u32(nfs4_status::NFS4_OK);
         w.write_u32(0); // attrsset bitmap count (none actually set)
         nfs4_status::NFS4_OK
@@ -2083,7 +2076,7 @@ fn op_setattr<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_rename<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
+async fn op_rename<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> (u32, Vec<u8>) {
     let old_name = reader.read_string().unwrap_or_default();
     let new_name = reader.read_string().unwrap_or_default();
 
@@ -2106,7 +2099,7 @@ fn op_rename<G: GatewayOps>(reader: &mut XdrReader<'_>, ctx: &NfsContext<G>) -> 
     (status, w.into_bytes())
 }
 
-fn op_link<G: GatewayOps>(
+async fn op_link<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &CompoundState,
@@ -2137,7 +2130,7 @@ fn op_link<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_readlink<G: GatewayOps>(ctx: &NfsContext<G>, state: &CompoundState) -> (u32, Vec<u8>) {
+async fn op_readlink<G: GatewayOps>(ctx: &NfsContext<G>, state: &CompoundState) -> (u32, Vec<u8>) {
     let mut w = XdrWriter::new();
     w.write_u32(op::READLINK);
 
@@ -2146,7 +2139,7 @@ fn op_readlink<G: GatewayOps>(ctx: &NfsContext<G>, state: &CompoundState) -> (u3
         return (nfs4_status::NFS4ERR_BADHANDLE, w.into_bytes());
     };
 
-    let status = match ctx.readlink(fh) {
+    let status = match ctx.readlink(fh).await {
         Ok(target) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_string(&target);
@@ -2161,7 +2154,7 @@ fn op_readlink<G: GatewayOps>(ctx: &NfsContext<G>, state: &CompoundState) -> (u3
     (status, w.into_bytes())
 }
 
-fn op_create<G: GatewayOps>(
+async fn op_create<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &mut CompoundState,
@@ -2203,7 +2196,7 @@ fn op_create<G: GatewayOps>(
         }
         5 => {
             // Symlink
-            match ctx.symlink(&name, &linkdata) {
+            match ctx.symlink(&name, &linkdata).await {
                 Ok((fh, _)) => {
                     state.current_fh = Some(fh);
                     w.write_u32(nfs4_status::NFS4_OK);
@@ -2239,7 +2232,7 @@ fn op_create<G: GatewayOps>(
     (status, w.into_bytes())
 }
 
-fn op_commit<G: GatewayOps>(
+async fn op_commit<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
     ctx: &NfsContext<G>,
     state: &mut CompoundState,
@@ -2250,7 +2243,7 @@ fn op_commit<G: GatewayOps>(
 
     // Flush buffered writes on COMMIT.
     if let Some(fh) = state.current_fh {
-        if let Ok(Some((new_fh, _resp))) = ctx.flush_writes(&fh) {
+        if let Ok(Some((new_fh, _resp))) = ctx.flush_writes(&fh).await {
             state.current_fh = Some(new_fh);
         }
     }
@@ -2262,7 +2255,7 @@ fn op_commit<G: GatewayOps>(
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-fn op_putfh(reader: &mut XdrReader<'_>, state: &mut CompoundState) -> (u32, Vec<u8>) {
+async fn op_putfh(reader: &mut XdrReader<'_>, state: &mut CompoundState) -> (u32, Vec<u8>) {
     let mut w = XdrWriter::new();
     w.write_u32(op::PUTFH);
 
@@ -2292,7 +2285,7 @@ fn op_putfh(reader: &mut XdrReader<'_>, state: &mut CompoundState) -> (u32, Vec<
     (status, w.into_bytes())
 }
 
-fn op_savefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
+async fn op_savefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
     let mut w = XdrWriter::new();
     w.write_u32(op::SAVEFH);
 
@@ -2308,7 +2301,7 @@ fn op_savefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
     (status, w.into_bytes())
 }
 
-fn op_restorefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
+async fn op_restorefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
     let mut w = XdrWriter::new();
     w.write_u32(op::RESTOREFH);
 
@@ -2324,7 +2317,7 @@ fn op_restorefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
     (status, w.into_bytes())
 }
 
-fn op_reclaim_complete(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+async fn op_reclaim_complete(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let _one_fs = reader.read_bool().unwrap_or(false);
 
     let mut w = XdrWriter::new();
@@ -2373,8 +2366,8 @@ mod tests {
 
     // ---------- EXCHANGE_ID (§18.35) ----------
 
-    #[test]
-    fn exchange_id_returns_ok_with_client_id() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exchange_id_returns_ok_with_client_id() {
         let sessions = test_sessions();
         let mut body = XdrWriter::new();
         body.write_opaque_fixed(&[0u8; 8]); // verifier
@@ -2384,7 +2377,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, result) = op_exchange_id(&mut reader, &sessions);
+        let (status, result) = op_exchange_id(&mut reader, &sessions).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -2410,11 +2403,11 @@ mod tests {
         assert!(!major_id.is_empty(), "server major_id should be present");
     }
 
-    #[test]
-    fn exchange_id_returns_unique_client_ids() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exchange_id_returns_unique_client_ids() {
         let sessions = test_sessions();
 
-        let make_exchange = || {
+        let make_exchange = async || {
             let mut body = XdrWriter::new();
             body.write_opaque_fixed(&[0u8; 8]);
             body.write_opaque(b"client");
@@ -2422,22 +2415,22 @@ mod tests {
             body.write_u32(0);
             let bytes = body.into_bytes();
             let mut reader = XdrReader::new(&bytes);
-            let (_, result) = op_exchange_id(&mut reader, &sessions);
+            let (_, result) = op_exchange_id(&mut reader, &sessions).await;
             let mut r = XdrReader::new(&result);
             r.read_u32().unwrap(); // op
             r.read_u32().unwrap(); // status
             r.read_u64().unwrap() // client_id
         };
 
-        let id1 = make_exchange();
-        let id2 = make_exchange();
+        let id1 = make_exchange().await;
+        let id2 = make_exchange().await;
         assert_ne!(id1, id2, "client_ids should be unique");
     }
 
     // ---------- CREATE_SESSION (§18.36) ----------
 
-    #[test]
-    fn create_session_returns_ok_with_session_id() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_session_returns_ok_with_session_id() {
         let sessions = test_sessions();
         let client_id = sessions.exchange_id();
 
@@ -2448,7 +2441,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, result) = op_create_session(&mut reader, &sessions);
+        let (status, result) = op_create_session(&mut reader, &sessions).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -2471,27 +2464,27 @@ mod tests {
         assert!(maxreqs > 0, "maxreqs should be positive");
     }
 
-    #[test]
-    fn create_session_produces_distinct_ids() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_session_produces_distinct_ids() {
         let sessions = test_sessions();
         let cid = sessions.exchange_id();
 
-        let create = |s: &SessionManager| {
+        let create = async |s: &SessionManager| {
             let mut body = XdrWriter::new();
             body.write_u64(cid);
             body.write_u32(1);
             body.write_u32(0);
             let bytes = body.into_bytes();
             let mut reader = XdrReader::new(&bytes);
-            let (_, result) = op_create_session(&mut reader, s);
+            let (_, result) = op_create_session(&mut reader, s).await;
             let mut r = XdrReader::new(&result);
             r.read_u32().unwrap(); // op
             r.read_u32().unwrap(); // status
             r.read_opaque_fixed(16).unwrap()
         };
 
-        let sid1 = create(&sessions);
-        let sid2 = create(&sessions);
+        let sid1 = create(&sessions).await;
+        let sid2 = create(&sessions).await;
         assert_ne!(
             sid1, sid2,
             "session_ids should be cryptographically distinct"
@@ -2500,8 +2493,8 @@ mod tests {
 
     // ---------- SEQUENCE (§18.46) ----------
 
-    #[test]
-    fn sequence_valid_session_returns_ok() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequence_valid_session_returns_ok() {
         let sessions = test_sessions();
         let cid = sessions.exchange_id();
         let session_id = sessions.create_session(cid, 8);
@@ -2515,7 +2508,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, result) = op_sequence(&mut reader, &sessions);
+        let (status, result) = op_sequence(&mut reader, &sessions).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -2530,8 +2523,8 @@ mod tests {
         assert_eq!(slotid, 0);
     }
 
-    #[test]
-    fn sequence_invalid_session_returns_badsession() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequence_invalid_session_returns_badsession() {
         let sessions = test_sessions();
         let fake_sid = [0xABu8; 16];
 
@@ -2544,14 +2537,14 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, _) = op_sequence(&mut reader, &sessions);
+        let (status, _) = op_sequence(&mut reader, &sessions).await;
         assert_eq!(status, nfs4_status::NFS4ERR_BADSESSION);
     }
 
     // ---------- PUTROOTFH (§18.24) ----------
 
-    #[test]
-    fn putrootfh_sets_current_filehandle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn putrootfh_sets_current_filehandle() {
         let ctx = test_ctx();
         let mut state = CompoundState {
             current_fh: None,
@@ -2559,7 +2552,7 @@ mod tests {
             current_stateid: None,
         };
 
-        let (status, _) = op_putrootfh(&ctx, &mut state);
+        let (status, _) = op_putrootfh(&ctx, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
         assert!(
             state.current_fh.is_some(),
@@ -2577,8 +2570,8 @@ mod tests {
 
     // ---------- GETATTR (§18.9) ----------
 
-    #[test]
-    fn getattr_root_returns_dir_type() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn getattr_root_returns_dir_type() {
         let ctx = test_ctx();
         let state = CompoundState {
             current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
@@ -2593,7 +2586,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, result) = op_getattr(&mut reader, &ctx, &state);
+        let (status, result) = op_getattr(&mut reader, &ctx, &state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -2621,8 +2614,8 @@ mod tests {
         assert!(size > 0, "root size should be reported");
     }
 
-    #[test]
-    fn getattr_no_filehandle_returns_nofilehandle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn getattr_no_filehandle_returns_nofilehandle() {
         let ctx = test_ctx();
         let state = CompoundState {
             current_fh: None,
@@ -2635,7 +2628,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, _) = op_getattr(&mut reader, &ctx, &state);
+        let (status, _) = op_getattr(&mut reader, &ctx, &state).await;
         // RFC 8881 §18.7.4: GETATTR with no current_fh is NOFILEHANDLE,
         // not BADHANDLE.
         assert_eq!(status, nfs4_status::NFS4ERR_NOFILEHANDLE);
@@ -2643,8 +2636,8 @@ mod tests {
 
     // ---------- WRITE (§18.38) ----------
 
-    #[test]
-    fn write_returns_ok_with_count_and_file_sync() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_returns_ok_with_count_and_file_sync() {
         let ctx = test_ctx();
         let sessions = test_sessions();
         let mut state = CompoundState {
@@ -2662,7 +2655,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, result) = op_write(&mut reader, &ctx, &sessions, &mut state);
+        let (status, result) = op_write(&mut reader, &ctx, &sessions, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -2675,8 +2668,8 @@ mod tests {
         assert_eq!(committed, 2, "committed should be FILE_SYNC");
     }
 
-    #[test]
-    fn write_buffers_against_current_filehandle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_buffers_against_current_filehandle() {
         // Post-40cac2b semantics: WRITE buffers data against the
         // current file handle and the handle is unchanged. Composition
         // creation is deferred to COMMIT/CLOSE via flush_writes — the
@@ -2700,7 +2693,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, _) = op_write(&mut reader, &ctx, &sessions, &mut state);
+        let (status, _) = op_write(&mut reader, &ctx, &sessions, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
         assert_eq!(
             state.current_fh, original_fh,
@@ -2708,6 +2701,7 @@ mod tests {
         );
         let (flushed_fh, resp) = ctx
             .flush_writes(&original_fh.unwrap())
+            .await
             .expect("flush_writes infallible on buffered data")
             .expect("flush should produce a new composition");
         assert_ne!(
@@ -2723,8 +2717,8 @@ mod tests {
 
     // ---------- OPEN (§18.16) ----------
 
-    #[test]
-    fn open_create_returns_ok_with_stateid() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_create_returns_ok_with_stateid() {
         let ctx = test_ctx();
         let sessions = test_sessions();
         let mut state = CompoundState {
@@ -2748,7 +2742,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, result) = op_open(&mut reader, &ctx, &sessions, &mut state);
+        let (status, result) = op_open(&mut reader, &ctx, &sessions, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -2759,13 +2753,14 @@ mod tests {
         assert_ne!(stateid, [0u8; 16], "stateid should be non-zero");
     }
 
-    #[test]
-    fn open_read_existing_returns_ok_with_stateid() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_read_existing_returns_ok_with_stateid() {
         let ctx = test_ctx();
         let sessions = test_sessions();
 
         // First create a file.
         ctx.write_named("readable.txt", b"content".to_vec())
+            .await
             .unwrap();
 
         let mut state = CompoundState {
@@ -2786,7 +2781,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, result) = op_open(&mut reader, &ctx, &sessions, &mut state);
+        let (status, result) = op_open(&mut reader, &ctx, &sessions, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -2796,8 +2791,8 @@ mod tests {
         assert_ne!(stateid, [0u8; 16]);
     }
 
-    #[test]
-    fn open_nonexistent_nocreate_returns_noent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_nonexistent_nocreate_returns_noent() {
         let ctx = test_ctx();
         let sessions = test_sessions();
         let mut state = CompoundState {
@@ -2818,20 +2813,20 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, _) = op_open(&mut reader, &ctx, &sessions, &mut state);
+        let (status, _) = op_open(&mut reader, &ctx, &sessions, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4ERR_NOENT);
     }
 
     // ---------- CLOSE (§18.2) ----------
 
-    #[test]
-    fn close_valid_stateid_returns_ok() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_valid_stateid_returns_ok() {
         let ctx = test_ctx();
         let sessions = test_sessions();
 
         // Create and open a file to get a stateid.
-        ctx.write_named("closeable.txt", b"data".to_vec()).unwrap();
-        let (fh, _) = ctx.lookup_by_name("closeable.txt").unwrap();
+        ctx.write_named("closeable.txt", b"data".to_vec()).await.unwrap();
+        let (fh, _) = ctx.lookup_by_name("closeable.txt").await.unwrap();
         let sid = sessions.open_file(fh);
 
         let mut state = CompoundState {
@@ -2846,7 +2841,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, _) = op_close(&mut reader, &ctx, &sessions, &mut state);
+        let (status, _) = op_close(&mut reader, &ctx, &sessions, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         // The stateid should no longer be valid.
@@ -2856,8 +2851,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn close_then_read_returns_bad_stateid() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_then_read_returns_bad_stateid() {
         let sessions = test_sessions();
 
         // Open a file.
@@ -2912,8 +2907,8 @@ mod tests {
     /// before any COMPOUND; if we don't reply with `accept_stat = 0`
     /// the kernel client gives up with `Input/output error` at the
     /// mount syscall.
-    #[test]
-    fn null_procedure_returns_accept_ok_with_empty_body() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn null_procedure_returns_accept_ok_with_empty_body() {
         let ctx = test_ctx();
         let sessions = test_sessions();
         let xid = 0xCAFE_BABE;
@@ -2925,7 +2920,7 @@ mod tests {
         let header = RpcCallHeader::decode(&mut r).expect("decode header");
         assert_eq!(header.procedure, 0, "we built a NULL call");
 
-        let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+        let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
         let (got_xid, msg_type, reply_stat, accept_stat) = parse_rpc_reply(&reply);
 
         assert_eq!(got_xid, xid);
@@ -2961,8 +2956,8 @@ mod tests {
     ///   server_owner4          eir_server_owner;   // u64 + opaque
     ///   opaque                 eir_server_scope;
     ///   nfs_impl_id4           eir_server_impl_id<1>;
-    #[test]
-    fn exchange_id_reply_is_rfc5661_18_35_compliant() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exchange_id_reply_is_rfc5661_18_35_compliant() {
         let sessions = test_sessions();
 
         // Build a minimal EXCHANGE_ID4args body.
@@ -2974,7 +2969,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (status, result) = op_exchange_id(&mut reader, &sessions);
+        let (status, result) = op_exchange_id(&mut reader, &sessions).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -3031,8 +3026,8 @@ mod tests {
     /// tests/e2e/test_pnfs.py was hitting).
     ///
     /// Kiseki is a pNFS MDS, so the bit we expect is `USE_PNFS_MDS`.
-    #[test]
-    fn exchange_id_advertises_pnfs_mds_mode() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exchange_id_advertises_pnfs_mds_mode() {
         let sessions = test_sessions();
         let mut body = XdrWriter::new();
         body.write_opaque_fixed(&[0u8; 8]);
@@ -3042,7 +3037,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (_status, result) = op_exchange_id(&mut reader, &sessions);
+        let (_status, result) = op_exchange_id(&mut reader, &sessions).await;
 
         let mut r = XdrReader::new(&result);
         // Skip op_code, status, clientid, sequenceid.
@@ -3082,8 +3077,8 @@ mod tests {
     /// the layout, attempted DS connect, the EXCHANGE_ID handshake
     /// returned the wrong role, and the kernel invalidated the
     /// layout segment.
-    #[test]
-    fn exchange_id_with_role_ds_advertises_pnfs_ds_mode() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exchange_id_with_role_ds_advertises_pnfs_ds_mode() {
         let sessions = test_sessions();
         let mut body = XdrWriter::new();
         body.write_opaque_fixed(&[0u8; 8]);
@@ -3093,7 +3088,7 @@ mod tests {
         let body_bytes = body.into_bytes();
         let mut reader = XdrReader::new(&body_bytes);
 
-        let (_status, result) = op_exchange_id_with_role(&mut reader, &sessions, ServerRole::Ds);
+        let (_status, result) = op_exchange_id_with_role(&mut reader, &sessions, ServerRole::Ds).await;
 
         let mut r = XdrReader::new(&result);
         let _ = r.read_u32();
@@ -3188,8 +3183,8 @@ mod tests {
     ///
     /// Failing test: assert the server's READDIR response contains
     /// no `.` and no `..` entries.
-    #[test]
-    fn readdir_response_omits_dot_and_dotdot() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn readdir_response_omits_dot_and_dotdot() {
         let ctx = test_ctx();
         let state = CompoundState {
             current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
@@ -3199,7 +3194,7 @@ mod tests {
         let args = make_readdir_args();
         let mut reader = XdrReader::new(&args);
 
-        let (status, result) = op_readdir(&mut reader, &ctx, &state);
+        let (status, result) = op_readdir(&mut reader, &ctx, &state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let (_, names, eof) = drain_readdir_entries(&result);
@@ -3238,8 +3233,8 @@ mod tests {
     /// advertised, kernel behavior will improve immediately
     /// (clients use it for caching, version detection, and the
     /// user-visible `ls -la` mtime).
-    #[test]
-    fn getattr_advertises_time_modify_in_supported_attrs() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn getattr_advertises_time_modify_in_supported_attrs() {
         let ctx = test_ctx();
         let state = CompoundState {
             current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
@@ -3254,7 +3249,7 @@ mod tests {
         let args_bytes = args.into_bytes();
         let mut reader = XdrReader::new(&args_bytes);
 
-        let (status, result) = op_getattr(&mut reader, &ctx, &state);
+        let (status, result) = op_getattr(&mut reader, &ctx, &state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         // Response shape (RFC 8881 §18.7.2):
@@ -3304,8 +3299,8 @@ mod tests {
     /// When the kernel asks for TIME_MODIFY directly, the response
     /// must echo it in the attrmask AND emit a non-zero
     /// `nfstime4 = (seconds: i64, nseconds: u32)` value.
-    #[test]
-    fn getattr_returns_nonzero_time_modify_when_requested() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn getattr_returns_nonzero_time_modify_when_requested() {
         let ctx = test_ctx();
         let state = CompoundState {
             current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
@@ -3320,7 +3315,7 @@ mod tests {
         let args_bytes = args.into_bytes();
         let mut reader = XdrReader::new(&args_bytes);
 
-        let (status, result) = op_getattr(&mut reader, &ctx, &state);
+        let (status, result) = op_getattr(&mut reader, &ctx, &state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let mut r = XdrReader::new(&result);
@@ -3364,8 +3359,8 @@ mod tests {
     /// Companion: every emitted entry is unique (no duplicates of
     /// real names either, in case a future change reintroduces
     /// the same class of bug for non-dot entries).
-    #[test]
-    fn readdir_emits_each_entry_at_most_once() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn readdir_emits_each_entry_at_most_once() {
         let ctx = test_ctx();
         let state = CompoundState {
             current_fh: Some(ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id)),
@@ -3374,7 +3369,7 @@ mod tests {
         };
         let args = make_readdir_args();
         let mut reader = XdrReader::new(&args);
-        let (status, result) = op_readdir(&mut reader, &ctx, &state);
+        let (status, result) = op_readdir(&mut reader, &ctx, &state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
 
         let (_, names, _eof) = drain_readdir_entries(&result);

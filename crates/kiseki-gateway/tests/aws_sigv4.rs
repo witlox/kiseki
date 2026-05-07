@@ -146,8 +146,8 @@ const EMPTY_PAYLOAD_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b93
 /// AWS SigV4 — `parse_authorization` on the `get-vanilla` vector
 /// must extract every component verbatim. (Public helper; pins the
 /// parser contract independent of the canonical-request derivation.)
-#[test]
-fn vector_get_vanilla_parse_authorization() {
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_get_vanilla_parse_authorization() {
     let parsed = parse_authorization(GET_VANILLA_AUTHZ).expect("AWS test vector parses");
     assert_eq!(parsed.access_key, ACCESS_KEY);
     assert_eq!(parsed.date, DATE);
@@ -170,8 +170,8 @@ fn vector_get_vanilla_parse_authorization() {
 // constants. They also document the grammar for any reader.
 
 /// AWS SigV4 — pin the `get-vanilla` canonical-request shape.
-#[test]
-fn vector_get_vanilla_canonical_request_sentinel() {
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_get_vanilla_canonical_request_sentinel() {
     // Six newline-separated fields per the AWS spec:
     //   1. HTTPMethod
     //   2. CanonicalURI
@@ -197,8 +197,8 @@ fn vector_get_vanilla_canonical_request_sentinel() {
 /// file (BSD-3-licensed mirror of the AWS test suite). Closes
 /// ADV-PA-10: prior to this, the "AWS-published" claim was
 /// transcription-only; now the constant has a verbatim source.
-#[test]
-fn vector_get_vanilla_creq_matches_vendored_fixture() {
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_get_vanilla_creq_matches_vendored_fixture() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/wire-samples/aws-sigv4/get-vanilla/get-vanilla.creq");
     let on_disk = std::fs::read_to_string(&path)
@@ -221,8 +221,8 @@ fn vector_get_vanilla_creq_matches_vendored_fixture() {
 /// SHA-256 of the canonical-request bytes — same hash AWS publishes
 /// in `get-vanilla.sts` step 3. To re-pin after a deliberate fixture
 /// update, run `sha256sum tests/wire-samples/aws-sigv4/get-vanilla/get-vanilla.creq`.
-#[test]
-fn vector_get_vanilla_creq_fixture_sha256_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_get_vanilla_creq_fixture_sha256_pinned() {
     use aws_lc_rs::digest;
     const EXPECTED_SHA256: &str =
         "bb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63";
@@ -243,8 +243,8 @@ fn vector_get_vanilla_creq_fixture_sha256_pinned() {
 }
 
 /// AWS SigV4 — pin the `get-vanilla` string-to-sign shape.
-#[test]
-fn vector_get_vanilla_string_to_sign_sentinel() {
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_get_vanilla_string_to_sign_sentinel() {
     let lines: Vec<&str> = GET_VANILLA_STS.split('\n').collect();
     assert_eq!(lines[0], "AWS4-HMAC-SHA256", "algorithm line");
     assert_eq!(lines[1], TIMESTAMP);
@@ -273,8 +273,8 @@ fn vector_get_vanilla_string_to_sign_sentinel() {
 /// — no encoding sensitivity — so this vector's path step matches.
 /// The test SHOULD pass today; if it doesn't, the regression is at
 /// the headers / query / scope step.
-#[test]
-fn vector_get_vanilla_validates_via_public_helper() {
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_get_vanilla_validates_via_public_helper() {
     let mut store = AccessKeyStore::new();
     let tenant = OrgId(uuid::Uuid::from_u128(0xAA));
     store.insert(ACCESS_KEY.into(), SECRET_KEY.into(), tenant);
@@ -340,8 +340,8 @@ const GET_VANILLA_QUERY_AUTHZ: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/2
 
 /// AWS SigV4 — `get-vanilla-query` vector parses with the query
 /// string in canonical (sorted-by-key) form.
-#[test]
-fn vector_get_vanilla_query_parse_authorization() {
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_get_vanilla_query_parse_authorization() {
     let parsed = parse_authorization(GET_VANILLA_QUERY_AUTHZ).expect("parses");
     assert_eq!(parsed.access_key, ACCESS_KEY);
     assert_eq!(parsed.signed_headers, vec!["host", "x-amz-date"]);
@@ -355,8 +355,8 @@ fn vector_get_vanilla_query_parse_authorization() {
 /// The canonical-request includes `Param1=value1` in the query line;
 /// `s3_auth::canonical_request` builds that line by sorting key-value
 /// pairs. With one param, no sort divergence; this should validate.
-#[test]
-fn vector_get_vanilla_query_validates_via_public_helper() {
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_get_vanilla_query_validates_via_public_helper() {
     let mut store = AccessKeyStore::new();
     let tenant = OrgId(uuid::Uuid::from_u128(0xBB));
     store.insert(ACCESS_KEY.into(), SECRET_KEY.into(), tenant);
@@ -394,8 +394,8 @@ fn vector_get_vanilla_query_validates_via_public_helper() {
 /// AWS SigV4 — flipping a single bit of the secret key MUST cause
 /// the verifier to reject. (Catches a silent "we ignored the secret"
 /// regression.)
-#[test]
-fn negative_wrong_secret_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn negative_wrong_secret_rejected() {
     let mut store = AccessKeyStore::new();
     let tenant = OrgId(uuid::Uuid::from_u128(0xCC));
     // Note the prefix change "wK..." vs "wJ..." — flips a key byte.
@@ -422,8 +422,8 @@ fn negative_wrong_secret_rejected() {
 /// AWS SigV4 — host MUST be a signed header (per the SigV4 spec
 /// step "build the SignedHeaders string"). `validate_request`
 /// enforces this explicitly.
-#[test]
-fn negative_missing_host_in_signed_headers_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn negative_missing_host_in_signed_headers_rejected() {
     let mut store = AccessKeyStore::new();
     let tenant = OrgId(uuid::Uuid::from_u128(0xDD));
     store.insert(ACCESS_KEY.into(), SECRET_KEY.into(), tenant);
@@ -458,8 +458,8 @@ fn negative_missing_host_in_signed_headers_rejected() {
 /// We cannot call `derive_signing_key` directly (private), but we
 /// can pin the AWS-published expected hex so a future commit that
 /// exposes the helper can re-use the constant.
-#[test]
-fn aws_signing_key_expected_hex_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_signing_key_expected_hex_pinned() {
     const EXPECTED_HEX_SIGNING_KEY: &str =
         "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9";
     assert_eq!(EXPECTED_HEX_SIGNING_KEY.len(), 64);

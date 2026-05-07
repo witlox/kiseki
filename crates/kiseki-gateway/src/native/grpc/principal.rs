@@ -93,14 +93,14 @@ mod tests {
     use super::*;
     use tonic::Request;
 
-    #[test]
-    fn binding_id_is_grpc() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn binding_id_is_grpc() {
         let p = TonicPrincipal::new("spiffe://kiseki/tenant/org-test".into(), ConnectionId(1));
         assert_eq!(p.binding_id(), BindingId::Grpc);
     }
 
-    #[test]
-    fn cert_san_canonical_round_trips_through_dyn_dispatch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cert_san_canonical_round_trips_through_dyn_dispatch() {
         let want = "spiffe://kiseki/tenant/org-perf";
         let p = TonicPrincipal::new(want.into(), ConnectionId(42));
         let dyn_p: &dyn RequestPrincipal = &p;
@@ -109,8 +109,8 @@ mod tests {
         assert_eq!(dyn_p.binding_id(), BindingId::Grpc);
     }
 
-    #[test]
-    fn principal_from_request_with_extension_carries_canonical_san() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_from_request_with_extension_carries_canonical_san() {
         let want = "spiffe://kiseki/tenant/org-pharma";
         let mut req: Request<()> = Request::new(());
         let canonical = CanonicalSanUri::from_canonical_for_tests(want);
@@ -119,8 +119,8 @@ mod tests {
         assert_eq!(p.cert_san_canonical(), want);
     }
 
-    #[test]
-    fn principal_from_request_without_extension_yields_empty_san() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_from_request_without_extension_yields_empty_san() {
         // Mirrors enforce_san_payload_tenant_match's existing fallback:
         // when the interceptor wasn't installed (unit-test bare
         // ServerImpl path), the canonical SAN is absent and the cross-
@@ -131,8 +131,8 @@ mod tests {
         assert!(p.cert_san_canonical().is_empty());
     }
 
-    #[test]
-    fn principal_from_request_mints_unique_connection_ids() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_from_request_mints_unique_connection_ids() {
         let req1: Request<()> = Request::new(());
         let req2: Request<()> = Request::new(());
         let p1 = principal_from_request(&req1);
@@ -151,8 +151,8 @@ mod tests {
         p.cert_san_canonical().to_string()
     }
 
-    #[test]
-    fn handler_code_only_sees_dyn_request_principal() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handler_code_only_sees_dyn_request_principal() {
         let mut req: Request<()> = Request::new(());
         let canonical =
             CanonicalSanUri::from_canonical_for_tests("spiffe://kiseki/tenant/org-handler");

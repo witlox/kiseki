@@ -60,14 +60,14 @@ impl RequestPrincipal for TcpFramedPrincipal {
 mod tests {
     use super::*;
 
-    #[test]
-    fn binding_id_is_tcp_framed() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn binding_id_is_tcp_framed() {
         let p = TcpFramedPrincipal::new("spiffe://kiseki/tenant/x", ConnectionId(7));
         assert_eq!(p.binding_id(), BindingId::TcpFramed);
     }
 
-    #[test]
-    fn cert_san_round_trips_through_dyn_dispatch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cert_san_round_trips_through_dyn_dispatch() {
         let want = "spiffe://kiseki/tenant/org-perf";
         let p = TcpFramedPrincipal::new(want, ConnectionId(99));
         let dyn_p: &dyn RequestPrincipal = &p;
@@ -80,8 +80,8 @@ mod tests {
     /// either Copy or Arc-backed. We can't directly assert constant
     /// time, but we CAN assert no fresh allocation by checking the
     /// `Arc<str>` strong-count rises after a clone.
-    #[test]
-    fn clone_does_not_reallocate_canonical_san() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clone_does_not_reallocate_canonical_san() {
         let p = TcpFramedPrincipal::new("spiffe://kiseki/tenant/x", ConnectionId(1));
         let strong_before = Arc::strong_count(&p.canonical_san);
         let q = p.clone();
@@ -95,8 +95,8 @@ mod tests {
     /// as empty `cert_san_canonical()` so the existing
     /// `enforce_san_payload_tenant_match` skip logic in
     /// `kiseki-gateway::native::server` works for both bindings.
-    #[test]
-    fn empty_canonical_san_yields_empty_string() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_canonical_san_yields_empty_string() {
         let p = TcpFramedPrincipal::new("", ConnectionId(0));
         assert!(p.cert_san_canonical().is_empty());
     }
@@ -104,8 +104,8 @@ mod tests {
     /// Different connection ids on the same SAN — the principal can
     /// distinguish concurrent requests on different connections from
     /// the same tenant. Important for audit correlation.
-    #[test]
-    fn distinct_connection_ids_distinguish_principals() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_connection_ids_distinguish_principals() {
         let san: Arc<str> = Arc::from("spiffe://kiseki/tenant/multi");
         let a = TcpFramedPrincipal::new(Arc::clone(&san), ConnectionId(1));
         let b = TcpFramedPrincipal::new(Arc::clone(&san), ConnectionId(2));

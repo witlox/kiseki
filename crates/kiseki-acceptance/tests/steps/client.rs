@@ -123,7 +123,7 @@ async fn then_kek(_w: &mut KisekiWorld) {
 async fn then_ready(_w: &mut KisekiWorld) {
     // Verify end-to-end readiness: write through the NFS context path.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"readiness-probe".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"readiness-probe".to_vec()).await;
     assert!(
         result.is_ok(),
         "gateway must accept writes when ready: {:?}",
@@ -205,7 +205,7 @@ async fn when_reads(_w: &mut KisekiWorld, _path: String) {
     // Workload reads a file. Write test data through the gateway so
     // Then steps can verify the read path.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"test-read-data".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"test-read-data".to_vec()).await;
     assert!(
         result.is_ok(),
         "write for read test must succeed: {:?}",
@@ -319,7 +319,7 @@ async fn given_write_data(_w: &mut KisekiWorld, _data_desc: String, _path: Strin
     // through the gateway to set up state for subsequent Then steps.
     _w.ensure_gateway_ns().await;
     let data = format!("test-data-{}", _data_desc);
-    let result = _w.legacy.nfs_ctx.write(data.into_bytes());
+    let result = _w.legacy.nfs_ctx.write(data.into_bytes()).await;
     assert!(
         result.is_ok(),
         "write precondition must succeed: {:?}",
@@ -768,7 +768,7 @@ async fn given_write_committed(_w: &mut KisekiWorld) {
     // Precondition: write is committed (delta committed, acknowledged).
     // Write through the gateway to produce a committed composition.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"committed-write".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"committed-write".to_vec()).await;
     assert!(
         result.is_ok(),
         "committed write must succeed: {:?}",
@@ -984,7 +984,7 @@ async fn when_nc_write(_w: &mut KisekiWorld) {
     // Native client processes a write (encrypt, chunk, store, commit).
     // Execute a write through the gateway pipeline.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"nc-write-data".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"nc-write-data".to_vec()).await;
     assert!(
         result.is_ok(),
         "native client write must succeed: {:?}",
@@ -1278,7 +1278,7 @@ async fn when_write_modifies(_w: &mut KisekiWorld, _ns: String) {
     // A write modifies a composition in a namespace. Ensure gateway
     // is ready; cache invalidation is validated in Then steps.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"modified-composition".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"modified-composition".to_vec()).await;
     assert!(result.is_ok(), "write must succeed: {:?}", result.err());
 }
 
@@ -1526,7 +1526,7 @@ async fn then_others_unaffected(_w: &mut KisekiWorld) {
 async fn then_no_cluster_impact(_w: &mut KisekiWorld) {
     // Gateway remains operational after client crash.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"cluster-ok".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"cluster-ok".to_vec()).await;
     assert!(
         result.is_ok(),
         "cluster must remain operational after client crash: {:?}",
@@ -1584,7 +1584,7 @@ async fn then_eio(_w: &mut KisekiWorld) {
 async fn then_ops_resume(_w: &mut KisekiWorld) {
     // After KMS recovery, the gateway can serve reads/writes again.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"resumed".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"resumed".to_vec()).await;
     assert!(
         result.is_ok(),
         "operations must resume when KMS is reachable: {:?}",
@@ -2083,7 +2083,7 @@ async fn then_annotated(_w: &mut KisekiWorld) {
 async fn then_unchanged(_w: &mut KisekiWorld) {
     // Operations work without a workflow session — verify gateway write with no session.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"no-session".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"no-session".to_vec()).await;
     assert!(
         result.is_ok(),
         "operations without session must work unchanged: {:?}",
@@ -2602,7 +2602,7 @@ async fn when_client_reads_file(_w: &mut KisekiWorld, _path: String) {
 async fn when_client_writes_file(_w: &mut KisekiWorld, _path: String) {
     // Client writes a file. Execute through gateway pipeline.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"client-write-data".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"client-write-data".to_vec()).await;
     assert!(
         result.is_ok(),
         "client write must succeed: {:?}",
@@ -2819,7 +2819,7 @@ async fn then_meta_updated(_w: &mut KisekiWorld) {
 async fn then_read_your_writes_cache(_w: &mut KisekiWorld, _path: String) {
     // Read-your-writes via cache: write then read returns written data.
     _w.ensure_gateway_ns().await;
-    let result = _w.legacy.nfs_ctx.write(b"ryw-cache-data".to_vec());
+    let result = _w.legacy.nfs_ctx.write(b"ryw-cache-data".to_vec()).await;
     assert!(
         result.is_ok(),
         "write for RYW must succeed: {:?}",

@@ -274,8 +274,8 @@ mod tests {
         NamespaceId(uuid::Uuid::from_bytes([2; 16]))
     }
 
-    #[test]
-    fn acquire_grants_fresh_lease_with_fencing_token_1() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_grants_fresh_lease_with_fencing_token_1() {
         let s = LeaseStore::new(60_000);
         let outcome = s.acquire(org(), ns(), 42, "alice".into(), 30_000, [0xab; 16], 1_000);
         match outcome {
@@ -288,16 +288,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn second_acquire_while_held_returns_held() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_acquire_while_held_returns_held() {
         let s = LeaseStore::new(60_000);
         let _ = s.acquire(org(), ns(), 42, "alice".into(), 30_000, [0xab; 16], 1_000);
         let outcome = s.acquire(org(), ns(), 42, "bob".into(), 30_000, [0xcd; 16], 1_500);
         assert!(matches!(outcome, AcquireOutcome::Held { .. }));
     }
 
-    #[test]
-    fn fencing_token_monotonically_increases_after_expiry() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fencing_token_monotonically_increases_after_expiry() {
         let s = LeaseStore::new(60_000);
         let g1 = match s.acquire(org(), ns(), 42, "alice".into(), 1_000, [0xab; 16], 1_000) {
             AcquireOutcome::Granted(g) => g,
@@ -314,8 +314,8 @@ mod tests {
         assert!(s.check_fencing_token(org(), ns(), 42, g2.fencing_token));
     }
 
-    #[test]
-    fn renew_keeps_same_fencing_token() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renew_keeps_same_fencing_token() {
         let s = LeaseStore::new(60_000);
         let g = match s.acquire(org(), ns(), 42, "alice".into(), 30_000, [0xab; 16], 1_000) {
             AcquireOutcome::Granted(g) => g,
@@ -330,8 +330,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn renew_after_expiry_returns_expired() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renew_after_expiry_returns_expired() {
         let s = LeaseStore::new(60_000);
         let g = match s.acquire(org(), ns(), 42, "alice".into(), 1_000, [0xab; 16], 1_000) {
             AcquireOutcome::Granted(g) => g,
@@ -342,8 +342,8 @@ mod tests {
         assert!(matches!(outcome, RenewOutcome::Expired { .. }));
     }
 
-    #[test]
-    fn release_by_holder_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_by_holder_succeeds() {
         let s = LeaseStore::new(60_000);
         let g = match s.acquire(org(), ns(), 42, "alice".into(), 30_000, [0xab; 16], 1_000) {
             AcquireOutcome::Granted(g) => g,
@@ -352,8 +352,8 @@ mod tests {
         assert!(matches!(s.release(g.lease_id, "alice"), ReleaseOutcome::Released));
     }
 
-    #[test]
-    fn release_by_other_principal_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_by_other_principal_rejected() {
         let s = LeaseStore::new(60_000);
         let g = match s.acquire(org(), ns(), 42, "alice".into(), 30_000, [0xab; 16], 1_000) {
             AcquireOutcome::Granted(g) => g,
@@ -362,8 +362,8 @@ mod tests {
         assert!(matches!(s.release(g.lease_id, "bob"), ReleaseOutcome::NotHolder));
     }
 
-    #[test]
-    fn drain_rejects_new_acquires() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drain_rejects_new_acquires() {
         let s = LeaseStore::new(60_000);
         s.begin_drain(1_000);
         assert!(matches!(

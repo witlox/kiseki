@@ -132,8 +132,8 @@ I-PN7-default and is acceptable only with documented compensating controls.";
 mod tests {
     use super::*;
 
-    #[test]
-    fn tls_default_with_bundle_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_default_with_bundle_succeeds() {
         let s = evaluate(false, false, true, 300, 1).expect("ok");
         assert_eq!(s.mode, NfsTransport::Tls);
         assert_eq!(s.effective_layout_ttl_seconds, 300);
@@ -141,14 +141,14 @@ mod tests {
         assert!(!s.emit_warn_banner);
     }
 
-    #[test]
-    fn tls_default_without_bundle_refused() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_default_without_bundle_refused() {
         let err = evaluate(false, false, false, 300, 1).unwrap_err();
         assert_eq!(err, NfsSecurityError::TlsBundleMissing);
     }
 
-    #[test]
-    fn only_env_set_is_refused() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_env_set_is_refused() {
         let err = evaluate(false, true, true, 300, 1).unwrap_err();
         assert_eq!(
             err,
@@ -159,8 +159,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_config_set_is_refused() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_config_set_is_refused() {
         let err = evaluate(true, false, true, 300, 1).unwrap_err();
         assert_eq!(
             err,
@@ -171,8 +171,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn both_flags_single_tenant_yields_plaintext() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn both_flags_single_tenant_yields_plaintext() {
         let s = evaluate(true, true, false, 300, 1).expect("ok");
         assert_eq!(s.mode, NfsTransport::Plaintext);
         assert_eq!(s.effective_layout_ttl_seconds, 60);
@@ -183,8 +183,8 @@ mod tests {
         assert!(s.emit_warn_banner);
     }
 
-    #[test]
-    fn both_flags_multi_tenant_is_refused() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn both_flags_multi_tenant_is_refused() {
         let err = evaluate(true, true, false, 300, 2).unwrap_err();
         assert_eq!(
             err,
@@ -192,16 +192,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plaintext_halves_ttl_regardless_of_input() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plaintext_halves_ttl_regardless_of_input() {
         // Even if config asked for a 600s layout TTL, plaintext clamps
         // to 60s per ADR-038 §D4.2.
         let s = evaluate(true, true, false, 600, 1).expect("ok");
         assert_eq!(s.effective_layout_ttl_seconds, 60);
     }
 
-    #[test]
-    fn warn_banner_text_is_pinned() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warn_banner_text_is_pinned() {
         // Pin the banner string — any drift requires updating ADR-038
         // and this test together.
         assert!(PLAINTEXT_WARN_BANNER.contains("NFS path is PLAINTEXT"));

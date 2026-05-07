@@ -261,8 +261,8 @@ mod tests {
         params.self_signed(&key).unwrap().der().to_vec()
     }
 
-    #[test]
-    fn tenant_san_extracted_and_canonicalized() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tenant_san_extracted_and_canonicalized() {
         let der = cert_with_sans(vec![rcgen::SanType::URI(
             "spiffe://kiseki/tenant/org-pharma".try_into().unwrap(),
         )]);
@@ -271,8 +271,8 @@ mod tests {
         assert_eq!(san.tenant_id(), "org-pharma");
     }
 
-    #[test]
-    fn cert_with_no_tenant_san_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cert_with_no_tenant_san_rejected() {
         let der = cert_with_sans(vec![rcgen::SanType::URI(
             "spiffe://cluster/fabric/node-1".try_into().unwrap(),
         )]);
@@ -280,8 +280,8 @@ mod tests {
         assert!(matches!(err, InterceptError::NotTenantRole));
     }
 
-    #[test]
-    fn cert_with_multiple_tenant_sans_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cert_with_multiple_tenant_sans_rejected() {
         let der = cert_with_sans(vec![
             rcgen::SanType::URI(
                 "spiffe://kiseki/tenant/org-a".try_into().unwrap(),
@@ -294,8 +294,8 @@ mod tests {
         assert!(matches!(err, InterceptError::MultipleTenantSans));
     }
 
-    #[test]
-    fn near_miss_san_canonicalization_failure_audited() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn near_miss_san_canonicalization_failure_audited() {
         let der = cert_with_sans(vec![rcgen::SanType::URI(
             "spiffe://kiseki/tenant/org-pharma/".try_into().unwrap(),
         )]);
@@ -305,8 +305,8 @@ mod tests {
         assert_eq!(err.reason_tag(), "SAN_CANONICALIZATION_MISMATCH");
     }
 
-    #[test]
-    fn intercept_in_plaintext_dev_mode_installs_default_principal() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn intercept_in_plaintext_dev_mode_installs_default_principal() {
         let sink = Arc::new(NullAuditSink);
         let intercept = SanInterceptor::new(sink, /*require_tls=*/ false);
         let req: Request<()> = Request::new(());
@@ -318,8 +318,8 @@ mod tests {
         assert_eq!(sun.tenant_id(), "dev");
     }
 
-    #[test]
-    fn intercept_with_require_tls_rejects_plaintext() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn intercept_with_require_tls_rejects_plaintext() {
         let sink = Arc::new(CollectingSink::default());
         let intercept = SanInterceptor::new(sink.clone(), /*require_tls=*/ true);
         let req: Request<()> = Request::new(());

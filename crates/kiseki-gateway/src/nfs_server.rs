@@ -18,7 +18,7 @@ use crate::nfs::NfsGateway;
 use crate::nfs3_server::handle_nfs3_connection;
 use crate::nfs4_server::handle_nfs4_connection;
 use crate::nfs_ops::NfsContext;
-use crate::nfs_xdr::{read_rm_message, write_rm_message, RpcCallHeader, XdrReader};
+use crate::nfs_xdr::{RpcCallHeader, XdrReader};
 use crate::ops::GatewayOps;
 
 /// RFC 9289 §4.2 — recommended keep-alive cadence on a long-lived
@@ -42,17 +42,17 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
 ///
 /// Spawns a thread per connection. The first RPC call determines the
 /// version for that connection.
-pub fn run_nfs_server<G: GatewayOps + Send + Sync + 'static>(
+pub async fn run_nfs_server<G: GatewayOps + Send + Sync + 'static>(
     addr: SocketAddr,
     gateway: NfsGateway<G>,
     tenant_id: OrgId,
     namespace_id: NamespaceId,
 ) {
-    run_nfs_server_with_peers(addr, gateway, tenant_id, namespace_id, Vec::new());
+    run_nfs_server_with_peers(addr, gateway, tenant_id, namespace_id, Vec::new()).await;
 }
 
 /// Start the NFS server with pNFS storage node addresses for layout delegation.
-pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
+pub async fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
     addr: SocketAddr,
     gateway: NfsGateway<G>,
     tenant_id: OrgId,
@@ -71,7 +71,8 @@ pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
         storage_nodes,
         None,
         None,
-    );
+    )
+    .await;
 }
 
 /// Run the NFS server on an already-bound listener with an optional
@@ -90,7 +91,7 @@ pub fn run_nfs_server_with_peers<G: GatewayOps + Send + Sync + 'static>(
 /// the audited `[security].allow_plaintext_nfs` fallback per
 /// ADR-038 §D4.2).
 #[allow(clippy::needless_pass_by_value)]
-pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
+pub async fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
     listener: TcpListener,
     gateway: NfsGateway<G>,
     tenant_id: OrgId,
@@ -108,7 +109,8 @@ pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
         None,
         shutdown,
         tls,
-    );
+    )
+    .await;
 }
 
 /// Phase 15c.4 — same as `serve_nfs_listener` plus an optional
@@ -116,7 +118,7 @@ pub fn serve_nfs_listener<G: GatewayOps + Send + Sync + 'static>(
 /// LAYOUTGET path returns Flex Files layouts pointing at real DS
 /// endpoints instead of the legacy FILES-layout stub.
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
-pub fn serve_nfs_listener_with_mgr<G: GatewayOps + Send + Sync + 'static>(
+pub async fn serve_nfs_listener_with_mgr<G: GatewayOps + Send + Sync + 'static>(
     listener: TcpListener,
     gateway: NfsGateway<G>,
     tenant_id: OrgId,
@@ -136,9 +138,18 @@ pub fn serve_nfs_listener_with_mgr<G: GatewayOps + Send + Sync + 'static>(
     if let Ok(addr) = listener.local_addr() {
         tracing::info!(addr = %addr, "NFS server listening (NFSv3 + NFSv4.2)");
     }
-    // Use a short accept timeout so the shutdown flag is checked
-    // promptly. Without this `incoming()` blocks forever.
+    // Convert to tokio listener for async accept. The std listener
+    // was set_nonblocking(true) + busy-looped before; tokio's
+    // listener gives us proper readiness notification + cooperative
+    // shutdown via the cancellation token check between accepts.
     let _ = listener.set_nonblocking(true);
+    let listener = match tokio::net::TcpListener::from_std(listener) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = %e, "NFS listener: std → tokio conversion failed");
+            return;
+        }
+    };
 
     loop {
         if let Some(ref s) = shutdown {
@@ -147,69 +158,63 @@ pub fn serve_nfs_listener_with_mgr<G: GatewayOps + Send + Sync + 'static>(
                 return;
             }
         }
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                let ctx = Arc::clone(&ctx);
-                let tls = tls.clone();
-                thread::spawn(move || {
-                    let _ = stream.set_nonblocking(false);
-                    // Disable Nagle's algorithm. NFS RPC is a strict
-                    // request/reply protocol with sub-MSS replies for
-                    // many ops (NULL, GETATTR, ACCESS, SEQUENCE-only
-                    // compounds). Nagle + Linux's 40 ms delayed-ACK on
-                    // the kernel client side adds 40-200 ms latency
-                    // per round-trip, capping NFS read throughput
-                    // around 0.5-7 MB/s regardless of how fast the
-                    // server is. Measured: 275 ms/op without
-                    // TCP_NODELAY → ~5 ms/op with it.
-                    let _ = stream.set_nodelay(true);
-                    if let Err(e) = enable_tcp_keepalive(&stream) {
-                        tracing::debug!(
-                            error = %e,
-                            peer = %peer,
-                            "TCP keep-alive setup failed (RFC 9289 §4.2)"
-                        );
-                    }
-                    if let Some(tls_cfg) = tls {
-                        match rustls::ServerConnection::new(tls_cfg) {
-                            Ok(conn) => {
-                                let tls_stream = rustls::StreamOwned::new(conn, stream);
-                                if let Err(e) = handle_connection(tls_stream, ctx) {
-                                    tracing::debug!(error = %e, peer = %peer, "NFS-over-TLS connection ended");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, peer = %peer, "TLS server-conn init failed");
-                            }
-                        }
-                    } else if let Err(e) = handle_connection(stream, ctx) {
-                        tracing::debug!(error = %e, peer = %peer, "NFS plaintext connection ended");
-                    }
-                });
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // No pending connection; sleep briefly and re-check shutdown.
-                thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => {
+        // Accept with a 50ms cancellation-aware timeout so the
+        // shutdown flag is polled promptly without busy-looping.
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            listener.accept(),
+        )
+        .await;
+        let (stream, peer) = match accepted {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
                 tracing::error!(error = %e, "NFS accept error");
+                continue;
             }
-        }
+            Err(_) => continue, // timeout — re-check shutdown.
+        };
+
+        let ctx = Arc::clone(&ctx);
+        let tls = tls.clone();
+        // Spawn a tokio task per connection — no OS thread per
+        // connection, no block_on per request. Native-equivalent
+        // scheduling for NFS handlers.
+        tokio::spawn(async move {
+            // Disable Nagle's algorithm — same rationale as the
+            // pre-async server: NFS RPC is request/reply with many
+            // sub-MSS replies, Nagle + Linux's 40 ms delayed-ACK
+            // would cap throughput around 0.5-7 MB/s.
+            let _ = stream.set_nodelay(true);
+            if let Some(tls_cfg) = tls {
+                let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+                match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        if let Err(e) = handle_connection(tls_stream, ctx).await {
+                            tracing::debug!(error = %e, peer = %peer, "NFS-over-TLS connection ended");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, peer = %peer, "TLS handshake failed");
+                    }
+                }
+            } else if let Err(e) = handle_connection(stream, ctx).await {
+                tracing::debug!(error = %e, peer = %peer, "NFS plaintext connection ended");
+            }
+        });
     }
 }
 
 /// Handle a connection — peek at the first RPC to determine version,
-/// then delegate to v3 or v4 handler for the rest.
-///
-/// Generic over the stream type so the same dispatcher serves both
-/// raw `TcpStream` (plaintext fallback) and `rustls::StreamOwned`
-/// (TLS default).
-fn handle_connection<G: GatewayOps, S: io::Read + io::Write>(
+/// then delegate to v3 or v4 handler for the rest. Async-native.
+async fn handle_connection<G: GatewayOps, S>(
     mut stream: S,
     ctx: Arc<NfsContext<G>>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Read first message to determine program + version.
-    let first_msg = read_rm_message(&mut stream)?;
+    let first_msg = crate::nfs_xdr::read_rm_message_async(&mut stream).await?;
     let mut reader = XdrReader::new(&first_msg);
     let header = RpcCallHeader::decode(&mut reader)?;
     tracing::debug!(
@@ -219,29 +224,25 @@ fn handle_connection<G: GatewayOps, S: io::Read + io::Write>(
         "NFS dispatch first message"
     );
 
-    // MOUNT3 (program 100005) shares port 2049 with NFS when the
-    // client uses `mountport=2049,mountproto=tcp` — RFC 1813 Appendix
-    // I doesn't reserve a port. The standard portmapper-driven mount
-    // discovers MOUNT's port via RPCBIND, which kiseki doesn't run;
-    // co-locating MOUNT on 2049 is the documented Phase 15c.5
-    // dispatch path.
     if header.program == crate::nfs3_mount::MOUNT3_PROGRAM {
         let reply = crate::nfs3_mount::handle_mount3_message(&header, &first_msg, &ctx);
-        write_rm_message(&mut stream, &reply)?;
-        return crate::nfs3_mount::handle_mount3_connection(stream, ctx);
+        crate::nfs_xdr::write_rm_message_async(&mut stream, &reply).await?;
+        return crate::nfs3_mount::handle_mount3_connection(stream, ctx).await;
     }
 
     if header.version == 4 {
         // NFSv4 — process first COMPOUND, then continue with v4 handler.
         let sessions = Arc::clone(&ctx.sessions);
         let reply =
-            crate::nfs4_server::handle_nfs4_first_compound(&header, &first_msg, &ctx, &sessions);
-        write_rm_message(&mut stream, &reply)?;
-        handle_nfs4_connection(stream, ctx, sessions)
+            crate::nfs4_server::handle_nfs4_first_compound(&header, &first_msg, &ctx, &sessions)
+                .await;
+        crate::nfs_xdr::write_rm_message_async(&mut stream, &reply).await?;
+        handle_nfs4_connection(stream, ctx, sessions).await
     } else {
         // NFSv3 (or unknown — v3 handler returns PROG_MISMATCH for wrong versions).
-        let reply = crate::nfs3_server::handle_nfs3_first_message(&header, &first_msg, &ctx);
-        write_rm_message(&mut stream, &reply)?;
-        handle_nfs3_connection(stream, ctx)
+        let reply =
+            crate::nfs3_server::handle_nfs3_first_message(&header, &first_msg, &ctx).await;
+        crate::nfs_xdr::write_rm_message_async(&mut stream, &reply).await?;
+        handle_nfs3_connection(stream, ctx).await
     }
 }

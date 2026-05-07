@@ -248,8 +248,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn auth_sys_accepted_when_allowed() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_sys_accepted_when_allowed() {
         let tenant = test_org_id();
         let export = auth_sys_export(tenant);
         let creds = NfsCredentials::from_auth_sys(1000, 1000, "client1.local".into());
@@ -258,8 +258,8 @@ mod tests {
         assert_eq!(result.unwrap(), tenant);
     }
 
-    #[test]
-    fn method_not_allowed_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn method_not_allowed_rejected() {
         let tenant = test_org_id();
         let export = NfsExportAuth {
             path: "/data/secure".into(),
@@ -276,8 +276,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn uid_range_mapping_works() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uid_range_mapping_works() {
         let tenant = test_org_id();
         let export = NfsExportAuth {
             path: "/data/multi".into(),
@@ -309,8 +309,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn kerberos_requires_principal() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kerberos_requires_principal() {
         let tenant = test_org_id();
         let export = NfsExportAuth {
             path: "/data/kerberized".into(),
@@ -343,8 +343,8 @@ mod tests {
         assert_eq!(validate_credentials(&creds_ok, &export).unwrap(), tenant);
     }
 
-    #[test]
-    fn from_auth_sys_constructor() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn from_auth_sys_constructor() {
         let creds = NfsCredentials::from_auth_sys(42, 100, "myhost".into());
         assert_eq!(creds.method, NfsAuthMethod::AuthSys);
         assert_eq!(creds.uid, 42);
@@ -353,8 +353,8 @@ mod tests {
         assert!(creds.principal.is_none());
     }
 
-    #[test]
-    fn allows_method_check() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_method_check() {
         let export = NfsExportAuth {
             path: "/test".into(),
             allowed_methods: vec![NfsAuthMethod::AuthSys, NfsAuthMethod::Kerberos],
@@ -367,8 +367,8 @@ mod tests {
         assert!(!export.allows_method(NfsAuthMethod::None));
     }
 
-    #[test]
-    fn auth_none_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_none_rejected() {
         // NFS AUTH_NONE must be rejected when not in allowed methods.
         let tenant = test_org_id();
         let export = NfsExportAuth {
@@ -396,8 +396,8 @@ mod tests {
     // Gateway configured for a tenant; client validates against
     // tenant config and maps identity to the authorization model.
     // ---------------------------------------------------------------
-    #[test]
-    fn nfs_gateway_authenticates_client_to_tenant() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs_gateway_authenticates_client_to_tenant() {
         let tenant = test_org_id();
         let export = NfsExportAuth {
             path: "/data/pharma".into(),

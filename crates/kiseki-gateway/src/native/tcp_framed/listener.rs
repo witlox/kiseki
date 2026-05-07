@@ -356,8 +356,8 @@ mod tests {
         server_handle.abort();
     }
 
-    #[test]
-    fn per_peer_cap_default_pinned() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_peer_cap_default_pinned() {
         // §3.4 / R2-M5: cap defaults to 16, configurable via builder.
         // Pin so a refactor doesn't change it under the radar.
         assert_eq!(NATIVE_TCP_FRAMED_PER_PEER_MAX, 16);

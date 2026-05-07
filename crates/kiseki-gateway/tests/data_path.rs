@@ -322,35 +322,35 @@ mod nfs_tests {
         NfsContext::new(nfs_gw, test_tenant(), test_namespace())
     }
 
-    #[test]
-    fn nfs3_getattr_root_is_directory() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_getattr_root_is_directory() {
         let ctx = setup_nfs_ctx();
         let root_fh = ctx.handles.root_handle(test_namespace(), test_tenant());
-        let attrs = ctx.getattr(&root_fh).unwrap();
+        let attrs = ctx.getattr(&root_fh).await.unwrap();
         assert_eq!(attrs.file_type, FileType::Directory);
         assert_eq!(attrs.mode, 0o755);
         assert_eq!(attrs.nlink, 2);
     }
 
-    #[test]
-    fn nfs3_write_named_then_lookup() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_write_named_then_lookup() {
         let ctx = setup_nfs_ctx();
-        let (fh, resp) = ctx.write_named("test.dat", b"hello".to_vec()).unwrap();
+        let (fh, resp) = ctx.write_named("test.dat", b"hello".to_vec()).await.unwrap();
         assert_eq!(resp.count, 5);
 
-        let (lookup_fh, attrs) = ctx.lookup_by_name("test.dat").unwrap();
+        let (lookup_fh, attrs) = ctx.lookup_by_name("test.dat").await.unwrap();
         assert_eq!(lookup_fh, fh);
         assert_eq!(attrs.file_type, FileType::Regular);
         assert_eq!(attrs.size, 5);
     }
 
-    #[test]
-    fn nfs3_readdir_includes_created_files() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_readdir_includes_created_files() {
         let ctx = setup_nfs_ctx();
-        ctx.write_named("a.txt", b"aaa".to_vec()).unwrap();
-        ctx.write_named("b.txt", b"bbb".to_vec()).unwrap();
+        ctx.write_named("a.txt", b"aaa".to_vec()).await.unwrap();
+        ctx.write_named("b.txt", b"bbb".to_vec()).await.unwrap();
 
-        let entries = ctx.readdir();
+        let entries = ctx.readdir().await;
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         // 2026-05-04: `readdir()` no longer emits `.` / `..`. The
         // Linux NFS client (v3 and v4) synthesizes them locally
@@ -367,96 +367,97 @@ mod nfs_tests {
         assert_eq!(entries.len(), 2);
     }
 
-    #[test]
-    fn nfs3_remove_file() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_remove_file() {
         let ctx = setup_nfs_ctx();
-        ctx.write_named("gone.txt", b"bye".to_vec()).unwrap();
-        assert!(ctx.lookup_by_name("gone.txt").is_some());
+        ctx.write_named("gone.txt", b"bye".to_vec()).await.unwrap();
+        assert!(ctx.lookup_by_name("gone.txt").await.is_some());
 
         ctx.remove_file("gone.txt").unwrap();
-        assert!(ctx.lookup_by_name("gone.txt").is_none());
+        assert!(ctx.lookup_by_name("gone.txt").await.is_none());
     }
 
-    #[test]
-    fn nfs3_rename_file() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_rename_file() {
         let ctx = setup_nfs_ctx();
-        ctx.write_named("old.txt", b"data".to_vec()).unwrap();
+        ctx.write_named("old.txt", b"data".to_vec()).await.unwrap();
 
         ctx.rename_file("old.txt", "new.txt").unwrap();
-        assert!(ctx.lookup_by_name("old.txt").is_none());
-        assert!(ctx.lookup_by_name("new.txt").is_some());
+        assert!(ctx.lookup_by_name("old.txt").await.is_none());
+        assert!(ctx.lookup_by_name("new.txt").await.is_some());
     }
 
-    #[test]
-    fn nfs3_mkdir_and_rmdir() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_mkdir_and_rmdir() {
         let ctx = setup_nfs_ctx();
         let (_fh, attrs) = ctx.mkdir("subdir").unwrap();
         assert_eq!(attrs.file_type, FileType::Directory);
         assert_eq!(attrs.mode, 0o755);
 
         // Should appear in readdir.
-        let entries = ctx.readdir();
+        let entries = ctx.readdir().await;
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"subdir"));
 
         // Remove it.
         ctx.rmdir("subdir").unwrap();
-        let entries = ctx.readdir();
+        let entries = ctx.readdir().await;
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&"subdir"));
     }
 
-    #[test]
-    fn nfs3_setattr_returns_attrs() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_setattr_returns_attrs() {
         let ctx = setup_nfs_ctx();
         let root_fh = ctx.handles.root_handle(test_namespace(), test_tenant());
-        let attrs = ctx.setattr(&root_fh, Some(0o700)).unwrap();
+        let attrs = ctx.setattr(&root_fh, Some(0o700)).await.unwrap();
         // setattr is advisory — returns current attrs.
         assert_eq!(attrs.file_type, FileType::Directory);
     }
 
-    #[test]
-    fn nfs3_access_grants_all() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_access_grants_all() {
         let ctx = setup_nfs_ctx();
         let root_fh = ctx.handles.root_handle(test_namespace(), test_tenant());
         let bits = ctx.access(&root_fh).unwrap();
         assert_eq!(bits, 0x3F); // all access bits
     }
 
-    #[test]
-    fn nfs3_symlink_and_readlink() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_symlink_and_readlink() {
         let ctx = setup_nfs_ctx();
-        let (fh, attrs) = ctx.symlink("link.txt", "/target/path").unwrap();
+        let (fh, attrs) = ctx.symlink("link.txt", "/target/path").await.unwrap();
         assert_eq!(attrs.size, 12); // "/target/path".len()
 
-        let target = ctx.readlink(&fh).unwrap();
+        let target = ctx.readlink(&fh).await.unwrap();
         assert_eq!(target, "/target/path");
     }
 
-    #[test]
-    fn nfs3_link_creates_hard_link() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_link_creates_hard_link() {
         let ctx = setup_nfs_ctx();
         let (fh, _) = ctx
             .write_named("original.txt", b"content".to_vec())
+            .await
             .unwrap();
 
         ctx.link(&fh, "hardlink.txt").unwrap();
-        let (link_fh, _) = ctx.lookup_by_name("hardlink.txt").unwrap();
+        let (link_fh, _) = ctx.lookup_by_name("hardlink.txt").await.unwrap();
         assert_eq!(link_fh, fh); // same handle
     }
 
-    #[test]
-    fn nfs3_commit_is_noop() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_commit_is_noop() {
         let ctx = setup_nfs_ctx();
         ctx.commit().unwrap();
     }
 
-    #[test]
-    fn nfs3_stale_handle_returns_error() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs3_stale_handle_returns_error() {
         let ctx = setup_nfs_ctx();
         let bogus_fh = [0xDEu8; 32];
-        assert!(ctx.getattr(&bogus_fh).is_err());
-        assert!(ctx.read(&bogus_fh, 0, 100).is_err());
+        assert!(ctx.getattr(&bogus_fh).await.is_err());
+        assert!(ctx.read(&bogus_fh, 0, 100).await.is_err());
         assert!(ctx.access(&bogus_fh).is_err());
     }
 }

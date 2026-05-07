@@ -334,12 +334,57 @@ pub fn write_rm_message<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()>
     writer.flush()
 }
 
+/// Async variant of [`read_rm_message`] for the tokio-native NFS
+/// server. Same multi-fragment RM framing semantics, async I/O.
+pub async fn read_rm_message_async<R>(reader: &mut R) -> io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    loop {
+        let mut hdr = [0u8; 4];
+        reader.read_exact(&mut hdr).await?;
+        let fragment_header = u32::from_be_bytes(hdr);
+        let last = (fragment_header & 0x8000_0000) != 0;
+        let len = (fragment_header & 0x7FFF_FFFF) as usize;
+
+        if buf.len() + len > MAX_NFS_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NFS frame exceeds 16MB limit",
+            ));
+        }
+
+        let start = buf.len();
+        buf.resize(start + len, 0);
+        reader.read_exact(&mut buf[start..]).await?;
+
+        if last {
+            break;
+        }
+    }
+    Ok(buf)
+}
+
+/// Async variant of [`write_rm_message`].
+pub async fn write_rm_message_async<W>(writer: &mut W, data: &[u8]) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let header = 0x8000_0000 | (data.len() as u32);
+    writer.write_all(&header.to_be_bytes()).await?;
+    writer.write_all(data).await?;
+    writer.flush().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn xdr_u32_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xdr_u32_roundtrip() {
         let mut w = XdrWriter::new();
         w.write_u32(42);
         w.write_u32(0xDEAD_BEEF);
@@ -350,8 +395,8 @@ mod tests {
         assert_eq!(r.read_u32().unwrap(), 0xDEAD_BEEF);
     }
 
-    #[test]
-    fn xdr_string_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xdr_string_roundtrip() {
         let mut w = XdrWriter::new();
         w.write_string("hello");
 
@@ -360,8 +405,8 @@ mod tests {
         assert_eq!(r.read_string().unwrap(), "hello");
     }
 
-    #[test]
-    fn xdr_opaque_padded() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xdr_opaque_padded() {
         let mut w = XdrWriter::new();
         w.write_opaque(&[1, 2, 3]); // 3 bytes → padded to 4
 

@@ -175,8 +175,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn round_trip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_trip() {
         let s = signing(1);
         let t = org(1);
         let bytes = serialize_signed(&s, &sample(1, t, 9_999_999_999)).unwrap();
@@ -184,8 +184,8 @@ mod tests {
         assert_eq!(decoded.tenant_id, t);
     }
 
-    #[test]
-    fn expiry_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expiry_rejected() {
         let s = signing(1);
         let t = org(1);
         let bytes = serialize_signed(&s, &sample(1, t, 1_000)).unwrap();
@@ -193,8 +193,8 @@ mod tests {
         assert!(matches!(err, DekFetchTicketError::Expired { .. }));
     }
 
-    #[test]
-    fn tenant_mismatch_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tenant_mismatch_rejected() {
         let s = signing(1);
         let alice = org(1);
         let bob = org(2);
@@ -203,8 +203,8 @@ mod tests {
         assert!(matches!(err, DekFetchTicketError::TenantMismatch));
     }
 
-    #[test]
-    fn flipped_byte_fails_hmac() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flipped_byte_fails_hmac() {
         let s = signing(1);
         let t = org(1);
         let mut bytes = serialize_signed(&s, &sample(1, t, 9_999_999_999)).unwrap();

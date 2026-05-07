@@ -162,8 +162,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn round_trip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_trip() {
         let s = signing();
         let t = org(1);
         let bytes = serialize_signed(&s, &sample(t)).unwrap();
@@ -171,8 +171,8 @@ mod tests {
         assert_eq!(decoded.tenant_id, t);
     }
 
-    #[test]
-    fn tenant_mismatch_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tenant_mismatch_rejected() {
         let s = signing();
         let alice = org(1);
         let bob = org(2);
@@ -181,8 +181,8 @@ mod tests {
         assert!(matches!(err, MultipartUploadIdError::TenantMismatch));
     }
 
-    #[test]
-    fn flipped_byte_fails_hmac() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flipped_byte_fails_hmac() {
         let s = signing();
         let t = org(1);
         let mut bytes = serialize_signed(&s, &sample(t)).unwrap();

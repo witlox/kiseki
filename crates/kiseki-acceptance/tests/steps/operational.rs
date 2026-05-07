@@ -1597,7 +1597,7 @@ async fn then_mmap_succeeds(_w: &mut KisekiWorld) {
     let root_fh = nfs_ctx
         .handles
         .root_handle(nfs_ctx.namespace_id, nfs_ctx.tenant_id);
-    let attrs = nfs_ctx.getattr(&root_fh);
+    let attrs = nfs_ctx.getattr(&root_fh).await;
     assert!(
         attrs.is_ok(),
         "NFS getattr should succeed (read path functional)"
@@ -1609,13 +1609,13 @@ async fn then_contents_readable(_w: &mut KisekiWorld) {
     // Read-only access works: verify NFS read path returns data.
     // Write a file, then read it back.
     let nfs_ctx = &_w.legacy.nfs_ctx;
-    let write_result = nfs_ctx.write(vec![0x42; 64]);
+    let write_result = nfs_ctx.write(vec![0x42; 64]).await;
     assert!(
         write_result.is_ok(),
         "write should succeed for read-back test"
     );
     if let Ok((fh, _)) = write_result {
-        let read_result = nfs_ctx.read(&fh, 0, 64);
+        let read_result = nfs_ctx.read(&fh, 0, 64).await;
         assert!(
             read_result.is_ok(),
             "read should succeed through mapped region"
@@ -1631,7 +1631,7 @@ async fn then_useful_for_models(_w: &mut KisekiWorld) {
     let root_fh = nfs_ctx
         .handles
         .root_handle(nfs_ctx.namespace_id, nfs_ctx.tenant_id);
-    let readdir = nfs_ctx.readdir();
+    let readdir = nfs_ctx.readdir().await;
     // readdir succeeds — the read-only data access path is functional.
     assert!(
         readdir.len() >= 0,
@@ -1685,7 +1685,7 @@ async fn then_nfs_reconnects(_w: &mut KisekiWorld) {
     let root_fh = nfs_ctx
         .handles
         .root_handle(nfs_ctx.namespace_id, nfs_ctx.tenant_id);
-    let attrs = nfs_ctx.getattr(&root_fh);
+    let attrs = nfs_ctx.getattr(&root_fh).await;
     assert!(
         attrs.is_ok(),
         "NFS reconnection to alternate node should work"
@@ -1700,7 +1700,7 @@ async fn then_nfs_resumes(_w: &mut KisekiWorld) {
     let root_fh = nfs_ctx
         .handles
         .root_handle(nfs_ctx.namespace_id, nfs_ctx.tenant_id);
-    let attrs = nfs_ctx.getattr(&root_fh);
+    let attrs = nfs_ctx.getattr(&root_fh).await;
     assert!(
         attrs.is_ok(),
         "NFS operations should resume after reconnection"
@@ -1739,7 +1739,7 @@ async fn then_retry_succeeds(_w: &mut KisekiWorld) {
     // After retrying on a different node, the write succeeds.
     // Verify: gateway write works (simulates a healthy node).
     let nfs_ctx = &_w.legacy.nfs_ctx;
-    let result = nfs_ctx.write(vec![0xAA; 32]);
+    let result = nfs_ctx.write(vec![0xAA; 32]).await;
     assert!(result.is_ok(), "write should succeed on a healthy node");
 }
 
@@ -2149,7 +2149,7 @@ async fn then_data_path_slos(_w: &mut KisekiWorld) {
     // Advisory subsystem is isolated from the data path (I-WA2).
     // Verify: gateway operations succeed even when advisory is saturated.
     let nfs_ctx = &_w.legacy.nfs_ctx;
-    let result = nfs_ctx.write(vec![0xBB; 32]);
+    let result = nfs_ctx.write(vec![0xBB; 32]).await;
     assert!(
         result.is_ok(),
         "data-path should function independently of advisory load"
@@ -2163,7 +2163,7 @@ async fn then_data_path_not_blocked(_w: &mut KisekiWorld) {
     let advisory_count = _w.legacy.advisory_table.active_count();
     // Gateway write works regardless of advisory state.
     let nfs_ctx = &_w.legacy.nfs_ctx;
-    let result = nfs_ctx.write(vec![0xCC; 16]);
+    let result = nfs_ctx.write(vec![0xCC; 16]).await;
     assert!(
         result.is_ok(),
         "data path should not be blocked by advisory subsystem"
@@ -2215,7 +2215,7 @@ async fn then_data_path_healthy(_w: &mut KisekiWorld) {
     let root_fh = nfs_ctx
         .handles
         .root_handle(nfs_ctx.namespace_id, nfs_ctx.tenant_id);
-    let attrs = nfs_ctx.getattr(&root_fh);
+    let attrs = nfs_ctx.getattr(&root_fh).await;
     assert!(
         attrs.is_ok(),
         "data path should remain healthy during advisory outage"
@@ -2245,7 +2245,7 @@ async fn then_alert_restart_advisory(w: &mut KisekiWorld) {
 async fn then_no_data_path_failure(_w: &mut KisekiWorld) {
     // Verify: data-path operations succeed despite advisory outage.
     let nfs_ctx = &_w.legacy.nfs_ctx;
-    let write_result = nfs_ctx.write(vec![0xEE; 32]);
+    let write_result = nfs_ctx.write(vec![0xEE; 32]).await;
     assert!(
         write_result.is_ok(),
         "no data-path failure should occur due to advisory outage"

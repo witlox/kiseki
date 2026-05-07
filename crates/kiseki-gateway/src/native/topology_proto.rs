@@ -99,8 +99,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn node_info_carries_every_binding_in_spawn_order() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn node_info_carries_every_binding_in_spawn_order() {
         let plan = plan_with(vec![
             AvailableBinding {
                 binding_id: nc::BindingId::TcpFramed,
@@ -121,8 +121,8 @@ mod tests {
         assert_eq!(info.bindings[1].binding_id, np::BindingId::Grpc as i32);
     }
 
-    #[test]
-    fn legacy_data_addr_prefers_grpc_for_v0_clients() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_data_addr_prefers_grpc_for_v0_clients() {
         let plan = plan_with(vec![
             AvailableBinding {
                 binding_id: nc::BindingId::TcpFramed,
@@ -142,8 +142,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_data_addr_falls_back_to_first_when_grpc_absent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_data_addr_falls_back_to_first_when_grpc_absent() {
         // TCP-framed-only deployment (operator pinned to TCP-framed).
         let plan = plan_with(vec![AvailableBinding {
             binding_id: nc::BindingId::TcpFramed,
@@ -155,16 +155,16 @@ mod tests {
         assert_eq!(info.bindings.len(), 1);
     }
 
-    #[test]
-    fn empty_plan_yields_empty_bindings_and_empty_data_addr() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_plan_yields_empty_bindings_and_empty_data_addr() {
         let plan = plan_with(Vec::new());
         let info = node_info_from_plan(1, np::NodeState::Active, &plan);
         assert!(info.bindings.is_empty());
         assert!(info.data_addr.is_empty());
     }
 
-    #[test]
-    fn node_state_threads_through_to_proto() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn node_state_threads_through_to_proto() {
         let plan = plan_with(Vec::new());
         for (state, want) in [
             (np::NodeState::Active, np::NodeState::Active as i32),
@@ -178,8 +178,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn libfabric_binding_id_collapses_to_proto_libfabric() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn libfabric_binding_id_collapses_to_proto_libfabric() {
         let plan = plan_with(vec![AvailableBinding {
             binding_id: nc::BindingId::Libfabric {
                 provider: nc::LibfabricProvider::Cxi,
@@ -196,8 +196,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn latency_class_mapping_is_total() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latency_class_mapping_is_total() {
         for (nc_class, proto_class) in [
             (nc::LatencyClass::Standard, np::LatencyClass::Standard),
             (nc::LatencyClass::Low, np::LatencyClass::Low),

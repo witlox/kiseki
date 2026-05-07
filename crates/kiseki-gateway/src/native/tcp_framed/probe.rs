@@ -121,16 +121,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn binding_id_is_tcp_framed() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn binding_id_is_tcp_framed() {
         let probe = TcpFramedProbe::new("0.0.0.0:9101");
         assert_eq!(probe.binding_id(), BindingId::TcpFramed);
     }
 
     /// Latency-class outranks Standard so `auto`-mode selector
     /// picks TCP-framed over gRPC when both are present.
-    #[test]
-    fn latency_class_outranks_standard() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latency_class_outranks_standard() {
         assert!(LatencyClass::Low > LatencyClass::Standard);
     }
 }

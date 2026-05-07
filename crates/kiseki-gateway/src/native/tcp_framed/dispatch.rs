@@ -411,8 +411,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn status_to_wire_covers_all_tonic_codes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_to_wire_covers_all_tonic_codes() {
         use tonic::Code;
         let cases: Vec<(Code, WireStatus)> = vec![
             (Code::Ok, WireStatus::Ok),

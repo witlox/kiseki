@@ -111,8 +111,8 @@ const NFS4ERR_MINOR_VERS_MISMATCH: u32 = 10021;
 /// `nfs4_server::op` and `nfs4_server::nfs4_status`; this test asserts
 /// the public values match the wire registry. A future refactor that
 /// changes the constants would require fixing this test FIRST.
-#[test]
-fn s15_1_program_version_and_op_registry_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_1_program_version_and_op_registry_pinned() {
     assert_eq!(NFS4_PROGRAM, 100003, "RFC 8881 §15.1: program = 100003");
     assert_eq!(NFS4_VERSION, 4, "RFC 8881 §15.1: version = 4");
     assert_eq!(PROC_NULL, 0, "RFC 8881 §16.1: NULL = procedure 0");
@@ -295,12 +295,12 @@ fn reader_at_compound_result(reply: &[u8]) -> XdrReader<'_> {
 
 /// Drive a 4.1 COMPOUND through the dispatcher and return a reader
 /// positioned at the COMPOUND result body.
-fn drive_compound(xid: u32, body: &[u8]) -> Vec<u8> {
+async fn drive_compound(xid: u32, body: &[u8]) -> Vec<u8> {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
     let header = make_header(xid, PROC_COMPOUND);
     let raw = build_nfs4_call(xid, PROC_COMPOUND, body);
-    handle_nfs4_first_compound(&header, &raw, &ctx, &sessions)
+    handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await
 }
 
 // ===========================================================================
@@ -316,13 +316,13 @@ fn drive_compound(xid: u32, body: &[u8]) -> Vec<u8> {
 /// This test pins the contract independently of the production code's
 /// procedure-dispatch path. A regression that re-introduces
 /// `PROC_UNAVAIL` for procedure 0 fails here.
-#[test]
-fn s16_1_null_procedure_returns_empty_accept_ok_regression_guard() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s16_1_null_procedure_returns_empty_accept_ok_regression_guard() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
     let header = make_header(0xCAFE_BABE, PROC_NULL);
     let raw = build_nfs4_call(0xCAFE_BABE, PROC_NULL, &[]);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
 
     let mut r = XdrReader::new(&reply);
     let xid = r.read_u32().unwrap();
@@ -360,13 +360,13 @@ fn s16_1_null_procedure_returns_empty_accept_ok_regression_guard() {
 /// RFC 8881 §15.1 + RFC 5531 §9.2 — any procedure number outside
 /// `{NULL=0, COMPOUND=1}` MUST yield `PROC_UNAVAIL` (accept_stat=3).
 /// This protects the dispatcher from extension-probe traffic.
-#[test]
-fn s15_1_unknown_procedure_returns_proc_unavail() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_1_unknown_procedure_returns_proc_unavail() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
     let header = make_header(7, 99);
     let raw = build_nfs4_call(7, 99, &[]);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
 
     let mut r = XdrReader::new(&reply);
     let _xid = r.read_u32().unwrap();
@@ -416,12 +416,12 @@ fn encode_exchange_id_args(w: &mut XdrWriter, verifier: &[u8; 8], owner_id: &[u8
 /// RFC 8881 §18.35 — EXCHANGE_ID positive: a minimal call with empty
 /// verifier and a short ownerid succeeds and returns a non-zero
 /// clientid + sequenceid=1.
-#[test]
-fn s18_35_exchange_id_returns_clientid_and_initial_seqid() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_35_exchange_id_returns_clientid_and_initial_seqid() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         encode_exchange_id_args(w, &[0u8; 8], b"kiseki-test", 0);
     });
-    let reply = drive_compound(0x1001, &body);
+    let reply = drive_compound(0x1001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().expect("compound status");
     assert_eq!(
@@ -466,8 +466,8 @@ fn s18_35_exchange_id_returns_clientid_and_initial_seqid() {
 /// emitted `0x01` (`SUPP_MOVED_REFER`) which Linux 6.x rejects with
 /// EIO before sending CREATE_SESSION. Kiseki is a pNFS MDS (ADR-038)
 /// so the bit we expect is `USE_PNFS_MDS`.
-#[test]
-fn s18_35_4_exchange_id_eir_flags_must_advertise_pnfs_mds_regression_guard() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_35_4_exchange_id_eir_flags_must_advertise_pnfs_mds_regression_guard() {
     const EXCHGID4_FLAG_USE_NON_PNFS: u32 = 0x0001_0000;
     const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x0002_0000;
     const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x0004_0000;
@@ -477,7 +477,7 @@ fn s18_35_4_exchange_id_eir_flags_must_advertise_pnfs_mds_regression_guard() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         encode_exchange_id_args(w, &[0u8; 8], b"linux-kernel", 0);
     });
-    let reply = drive_compound(0x1002, &body);
+    let reply = drive_compound(0x1002, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _compound_status = r.read_u32().unwrap();
     let _tag = r.read_opaque().unwrap();
@@ -531,8 +531,8 @@ fn s18_35_4_exchange_id_eir_flags_must_advertise_pnfs_mds_regression_guard() {
 /// Production helper that would be ideal to drive this test
 /// directly: `kiseki_gateway::nfs4_server::op_create_session` is
 /// `pub(crate)`. We exercise it via the COMPOUND dispatcher.
-#[test]
-fn s18_36_create_session_returns_session_id_and_initial_seqid() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_36_create_session_returns_session_id_and_initial_seqid() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
 
@@ -542,7 +542,7 @@ fn s18_36_create_session_returns_session_id_and_initial_seqid() {
     });
     let raw = build_nfs4_call(0x2001, PROC_COMPOUND, &exid);
     let header = make_header(0x2001, PROC_COMPOUND);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -566,7 +566,7 @@ fn s18_36_create_session_returns_session_id_and_initial_seqid() {
 
     let raw = build_nfs4_call(0x2002, PROC_COMPOUND, &cs_body);
     let header = make_header(0x2002, PROC_COMPOUND);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -602,13 +602,13 @@ fn s18_36_create_session_returns_session_id_and_initial_seqid() {
 
 /// RFC 8881 §18.37 — DESTROY_SESSION with an unknown session_id MUST
 /// return `NFS4ERR_BADSESSION` (10052).
-#[test]
-fn s18_37_destroy_session_unknown_id_returns_badsession() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_37_destroy_session_unknown_id_returns_badsession() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::DESTROY_SESSION);
         w.write_opaque_fixed(&[0xDEu8; 16]); // session_id never created
     });
-    let reply = drive_compound(0x3001, &body);
+    let reply = drive_compound(0x3001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().expect("compound status");
     assert_eq!(
@@ -626,8 +626,8 @@ fn s18_37_destroy_session_unknown_id_returns_badsession() {
 /// return `NFS4ERR_BADSESSION`. SEQUENCE is the very first op in
 /// every steady-state COMPOUND, so this guard prevents a stale client
 /// from re-using a destroyed session.
-#[test]
-fn s18_46_sequence_unknown_session_returns_badsession() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_46_sequence_unknown_session_returns_badsession() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::SEQUENCE);
         w.write_opaque_fixed(&[0xABu8; 16]); // bogus session_id
@@ -636,7 +636,7 @@ fn s18_46_sequence_unknown_session_returns_badsession() {
         w.write_u32(0); // highest_slotid
         w.write_bool(false); // cachethis
     });
-    let reply = drive_compound(0x4001, &body);
+    let reply = drive_compound(0x4001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().expect("compound status");
     assert_eq!(
@@ -653,12 +653,12 @@ fn s18_46_sequence_unknown_session_returns_badsession() {
 /// RFC 8881 §18.21 — PUTROOTFH sets the current filehandle to the
 /// server's root and returns NFS4_OK. No body in either request or
 /// response.
-#[test]
-fn s18_21_putrootfh_returns_ok_with_no_body() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_21_putrootfh_returns_ok_with_no_body() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::PUTROOTFH);
     });
-    let reply = drive_compound(0x5001, &body);
+    let reply = drive_compound(0x5001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().expect("compound status");
     assert_eq!(compound_status, nfs4_status::NFS4_OK);
@@ -679,13 +679,13 @@ fn s18_21_putrootfh_returns_ok_with_no_body() {
 
 /// RFC 8881 §18.19 — PUTFH replaces the current filehandle. With a
 /// 32-byte filehandle (kiseki's wire shape per ADR-038) it succeeds.
-#[test]
-fn s18_19_putfh_with_32_byte_handle_succeeds() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_19_putfh_with_32_byte_handle_succeeds() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::PUTFH);
         w.write_opaque(&[0u8; 32]);
     });
-    let reply = drive_compound(0x5101, &body);
+    let reply = drive_compound(0x5101, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -699,13 +699,13 @@ fn s18_19_putfh_with_32_byte_handle_succeeds() {
 /// filehandle MUST return `NFS4ERR_BADHANDLE`. Today's path checks
 /// `len == 32` and emits `NFS4ERR_BADHANDLE` for everything else,
 /// matching the spec.
-#[test]
-fn s18_19_putfh_with_malformed_handle_returns_badhandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_19_putfh_with_malformed_handle_returns_badhandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::PUTFH);
         w.write_opaque(&[0u8; 7]); // way too short
     });
-    let reply = drive_compound(0x5102, &body);
+    let reply = drive_compound(0x5102, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -728,12 +728,12 @@ fn s18_19_putfh_with_malformed_handle_returns_badhandle() {
 /// filehandle and it's malformed" (BADHANDLE) and "you didn't set a
 /// current filehandle at all" (NOFILEHANDLE). The dispatcher MUST
 /// emit NOFILEHANDLE here. RED until that's tightened.
-#[test]
-fn s18_8_getfh_without_current_fh_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_8_getfh_without_current_fh_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::GETFH);
     });
-    let reply = drive_compound(0x5201, &body);
+    let reply = drive_compound(0x5201, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -747,13 +747,13 @@ fn s18_8_getfh_without_current_fh_returns_nofilehandle() {
 /// RFC 8881 §18.8 — GETFH returns the current filehandle as
 /// `nfs_fh4` (variable-length opaque). After PUTROOTFH, GETFH yields
 /// the kiseki root handle (32 bytes per ADR-038).
-#[test]
-fn s18_8_getfh_after_putrootfh_returns_root_handle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_8_getfh_after_putrootfh_returns_root_handle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::GETFH);
     });
-    let reply = drive_compound(0x5202, &body);
+    let reply = drive_compound(0x5202, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -783,13 +783,13 @@ fn s18_8_getfh_after_putrootfh_returns_root_handle() {
 /// `NFS4ERR_NOFILEHANDLE`. Same NOFILEHANDLE-vs-BADHANDLE distinction
 /// applies here as in GETFH (§18.8); production currently emits
 /// BADHANDLE. RED until tightened.
-#[test]
-fn s18_7_getattr_without_current_fh_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_7_getattr_without_current_fh_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::GETATTR);
         w.write_u32(0); // empty bitmap
     });
-    let reply = drive_compound(0x5301, &body);
+    let reply = drive_compound(0x5301, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -805,8 +805,8 @@ fn s18_7_getattr_without_current_fh_returns_nofilehandle() {
 /// 15c.2 refactored op_getattr from "always return TYPE|SIZE" to
 /// "honor the request"; this test now asserts the spec-correct
 /// behaviour rather than the previous fixed-set quirk.)
-#[test]
-fn s18_7_getattr_root_returns_requested_type_and_size() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_7_getattr_root_returns_requested_type_and_size() {
     let bm = (1u32 << 1) | (1u32 << 4); // TYPE | SIZE
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
@@ -814,7 +814,7 @@ fn s18_7_getattr_root_returns_requested_type_and_size() {
         w.write_u32(1); // bitmap_count
         w.write_u32(bm);
     });
-    let reply = drive_compound(0x5302, &body);
+    let reply = drive_compound(0x5302, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32();
     let _ = r.read_opaque();
@@ -851,8 +851,8 @@ fn s18_7_getattr_root_returns_requested_type_and_size() {
 /// includes the stateid + change_info4 + rflags + attrset bitmap +
 /// delegation. Today's `op_open` emits stateid + cinfo(bool) + rflags
 /// only; the missing attrset and delegation fields are a fidelity gap.
-#[test]
-fn s18_16_open_create_returns_non_zero_stateid() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_16_open_create_returns_non_zero_stateid() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::OPEN);
@@ -870,7 +870,7 @@ fn s18_16_open_create_returns_non_zero_stateid() {
         w.write_u32(0); // CLAIM_NULL
         w.write_string("rfc8881-newfile");
     });
-    let reply = drive_compound(0x6001, &body);
+    let reply = drive_compound(0x6001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -899,14 +899,14 @@ fn s18_16_open_create_returns_non_zero_stateid() {
 /// RFC 8881 §18.2 — CLOSE with an unknown stateid MUST yield
 /// `NFS4ERR_BAD_STATEID` (10025). Today's `op_close` checks the
 /// stateid map and emits BAD_STATEID for unknowns — matches the spec.
-#[test]
-fn s18_2_close_unknown_stateid_returns_bad_stateid() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_2_close_unknown_stateid_returns_bad_stateid() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::CLOSE);
         w.write_u32(0); // seqid
         w.write_opaque_fixed(&[0xAAu8; 16]); // bogus stateid
     });
-    let reply = drive_compound(0x7001, &body);
+    let reply = drive_compound(0x7001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -923,15 +923,15 @@ fn s18_2_close_unknown_stateid_returns_bad_stateid() {
 /// RFC 8881 §18.22 — READ with no current filehandle MUST yield
 /// `NFS4ERR_NOFILEHANDLE`. Today's `op_read` returns BADHANDLE
 /// (same NOFILEHANDLE/BADHANDLE confusion as GETFH/GETATTR). RED.
-#[test]
-fn s18_22_read_without_current_fh_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_22_read_without_current_fh_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::READ);
         w.write_opaque_fixed(&[0u8; 16]); // anonymous stateid
         w.write_u64(0); // offset
         w.write_u32(4096); // count
     });
-    let reply = drive_compound(0x8001, &body);
+    let reply = drive_compound(0x8001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -950,8 +950,8 @@ fn s18_22_read_without_current_fh_returns_nofilehandle() {
 /// the namespace root anchor file and reports `committed = FILE_SYNC`
 /// (2). Production handles offset=0 only (kiseki immutable
 /// compositions); larger offsets MUST yield `NFS4ERR_*`.
-#[test]
-fn s18_32_write_at_offset_zero_returns_count_and_file_sync() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_32_write_at_offset_zero_returns_count_and_file_sync() {
     let payload = b"rfc8881 hello";
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
@@ -961,7 +961,7 @@ fn s18_32_write_at_offset_zero_returns_count_and_file_sync() {
         w.write_u32(2); // FILE_SYNC
         w.write_opaque(payload);
     });
-    let reply = drive_compound(0x9001, &body);
+    let reply = drive_compound(0x9001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -1002,14 +1002,14 @@ fn s18_32_write_at_offset_zero_returns_count_and_file_sync() {
 /// verifier MUST be stable across calls in a single server-instance
 /// epoch. Today's `op_commit` always writes 8 zeroes — captured below
 /// as a fidelity gap on top of the basic shape.
-#[test]
-fn s18_3_commit_returns_8_byte_writeverf() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_3_commit_returns_8_byte_writeverf() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::COMMIT);
         w.write_u64(0); // offset
         w.write_u32(0); // count
     });
-    let reply = drive_compound(0xA001, &body);
+    let reply = drive_compound(0xA001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -1028,13 +1028,13 @@ fn s18_3_commit_returns_8_byte_writeverf() {
 /// RFC 8881 §18.51 — RECLAIM_COMPLETE marks the end of the per-client
 /// reclaim phase. Body: one bool `rca_one_fs`. Reply: NFS4_OK with no
 /// extra fields.
-#[test]
-fn s18_51_reclaim_complete_returns_ok_with_no_body() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_51_reclaim_complete_returns_ok_with_no_body() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::RECLAIM_COMPLETE);
         w.write_bool(false); // rca_one_fs
     });
-    let reply = drive_compound(0xB001, &body);
+    let reply = drive_compound(0xB001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -1054,8 +1054,8 @@ fn s18_51_reclaim_complete_returns_ok_with_no_body() {
 /// RFC 8881 §18.43 — LAYOUTGET without a current filehandle MUST
 /// return `NFS4ERR_NOFILEHANDLE`. Today's `op_layoutget` checks
 /// `state.current_fh` and emits NOFILEHANDLE — matches the spec.
-#[test]
-fn s18_43_layoutget_without_current_fh_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_43_layoutget_without_current_fh_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::LAYOUTGET);
         w.write_bool(false); // signal_layout_avail
@@ -1067,7 +1067,7 @@ fn s18_43_layoutget_without_current_fh_returns_nofilehandle() {
         w.write_opaque_fixed(&[0u8; 16]); // stateid
         w.write_u32(0); // maxcount
     });
-    let reply = drive_compound(0xC001, &body);
+    let reply = drive_compound(0xC001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1083,8 +1083,8 @@ fn s18_43_layoutget_without_current_fh_returns_nofilehandle() {
 
 /// RFC 8881 §18.44 — LAYOUTRETURN with `LAYOUTRETURN4_ALL`
 /// (return_type=4) and no per-file body MUST succeed.
-#[test]
-fn s18_44_layoutreturn_all_succeeds() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_44_layoutreturn_all_succeeds() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::LAYOUTRETURN);
         w.write_bool(false); // reclaim
@@ -1092,7 +1092,7 @@ fn s18_44_layoutreturn_all_succeeds() {
         w.write_u32(1); // iomode
         w.write_u32(4); // LAYOUTRETURN4_ALL
     });
-    let reply = drive_compound(0xC101, &body);
+    let reply = drive_compound(0xC101, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque(); // tag
@@ -1111,8 +1111,8 @@ fn s18_44_layoutreturn_all_succeeds() {
 /// `NFS4ERR_NOENT`. With a wired manager but a deviceid that's never
 /// been issued: also `NFS4ERR_NOENT`. (RFC mandates `NFS4ERR_NOENT`
 /// per §13.1 + §18.40.4 for both cases.)
-#[test]
-fn s18_40_getdeviceinfo_unknown_device_returns_noent() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_40_getdeviceinfo_unknown_device_returns_noent() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::GETDEVICEINFO);
         w.write_opaque_fixed(&[0u8; 16]); // deviceid (never issued)
@@ -1120,7 +1120,7 @@ fn s18_40_getdeviceinfo_unknown_device_returns_noent() {
         w.write_u32(0); // maxcount
         w.write_u32(0); // notify_types bitmap (empty)
     });
-    let reply = drive_compound(0xC201, &body);
+    let reply = drive_compound(0xC201, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1143,13 +1143,13 @@ fn s18_40_getdeviceinfo_unknown_device_returns_noent() {
 /// but the server hasn't implemented it"; OP_ILLEGAL is "the wire
 /// op-code doesn't exist". Linux clients treat them differently in
 /// recovery logic. RED until production tightens the dispatcher.
-#[test]
-fn s13_1_unknown_op_code_returns_op_illegal_not_notsupp() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s13_1_unknown_op_code_returns_op_illegal_not_notsupp() {
     const FAKE_OP: u32 = 999; // not in any RFC registry
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(FAKE_OP);
     });
-    let reply = drive_compound(0xD001, &body);
+    let reply = drive_compound(0xD001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1162,12 +1162,12 @@ fn s13_1_unknown_op_code_returns_op_illegal_not_notsupp() {
 /// RFC 8881 §15.1 + §13.1 — `minor_version` outside `{0, 1, 2}` MUST
 /// yield `NFS4ERR_MINOR_VERS_MISMATCH` (10021) for the entire COMPOUND.
 /// Today's dispatcher reads the field and ignores it. RED.
-#[test]
-fn s15_1_unsupported_minor_version_returns_minor_vers_mismatch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_1_unsupported_minor_version_returns_minor_vers_mismatch() {
     let body = encode_compound(b"", 99, 1, |w| {
         w.write_u32(v4op::PUTROOTFH);
     });
-    let reply = drive_compound(0xD101, &body);
+    let reply = drive_compound(0xD101, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1185,8 +1185,8 @@ fn s15_1_unsupported_minor_version_returns_minor_vers_mismatch() {
 /// The closest production helper for a wire-XDR fault is XdrReader's
 /// `io::Error`. A future strict path would translate that to
 /// NFS4ERR_BADXDR before reaching the op handler.
-#[test]
-fn s13_1_truncated_compound_op_body_returns_badxdr() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s13_1_truncated_compound_op_body_returns_badxdr() {
     // Claim 1 op — PUTFH — but supply zero bytes for its argument.
     // The op body should fail to decode and the dispatcher should
     // surface BADXDR per §13.1.
@@ -1194,7 +1194,7 @@ fn s13_1_truncated_compound_op_body_returns_badxdr() {
         w.write_u32(v4op::PUTFH);
         // Missing the nfs_fh4 argument bytes entirely.
     });
-    let reply = drive_compound(0xD201, &body);
+    let reply = drive_compound(0xD201, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1236,8 +1236,8 @@ fn s13_1_truncated_compound_op_body_returns_badxdr() {
 /// ownerid="Linux NFSv4.1") so the seed is reproducible. Driving this
 /// through the dispatcher MUST yield `NFS4_OK` and a parseable
 /// EXCHANGE_ID4resok body.
-#[test]
-fn rfc_8881_seed_linux_6x_exchange_id_compound() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_8881_seed_linux_6x_exchange_id_compound() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         encode_exchange_id_args(
             w,
@@ -1273,7 +1273,7 @@ fn rfc_8881_seed_linux_6x_exchange_id_compound() {
     );
 
     // Drive through the dispatcher — must succeed.
-    let reply = drive_compound(0xCAFE_BABE, &body);
+    let reply = drive_compound(0xCAFE_BABE, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().expect("compound status");
     assert_eq!(
@@ -1297,13 +1297,13 @@ fn rfc_8881_seed_linux_6x_exchange_id_compound() {
 /// RFC 8881 §18.1 — ACCESS without a current filehandle MUST yield
 /// `NFS4ERR_NOFILEHANDLE` (the same boundary every fh-consuming op
 /// observes; cross-checked against the dispatcher's pre-check rule).
-#[test]
-fn s18_1_access_without_current_fh_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_1_access_without_current_fh_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::ACCESS);
         w.write_u32(0x3F); // request all defined access bits
     });
-    let reply = drive_compound(0xA001, &body);
+    let reply = drive_compound(0xA001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     // op_access today returns BADHANDLE; ADV-PA-6 + ADV-PA-9 will
@@ -1319,14 +1319,14 @@ fn s18_1_access_without_current_fh_returns_nofilehandle() {
 
 /// RFC 8881 §18.1 positive — ACCESS after PUTROOTFH returns OK and
 /// echoes the access bitmap (`supported`, `access`).
-#[test]
-fn s18_1_access_after_putrootfh_returns_ok_with_bitmap() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_1_access_after_putrootfh_returns_ok_with_bitmap() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::ACCESS);
         w.write_u32(0x3F);
     });
-    let reply = drive_compound(0xA002, &body);
+    let reply = drive_compound(0xA002, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1339,14 +1339,14 @@ fn s18_1_access_after_putrootfh_returns_ok_with_bitmap() {
 /// RFC 8881 §18.15 — LOOKUP for a missing name MUST yield
 /// `NFS4ERR_NOENT` (10002), not BADHANDLE / IO. Distinguishes "name
 /// not in directory" from "directory itself unreachable".
-#[test]
-fn s18_15_lookup_missing_name_returns_noent() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_15_lookup_missing_name_returns_noent() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::LOOKUP);
         w.write_string("file-that-does-not-exist");
     });
-    let reply = drive_compound(0xB001, &body);
+    let reply = drive_compound(0xB001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1360,8 +1360,8 @@ fn s18_15_lookup_missing_name_returns_noent() {
 /// `NFS4_OK` plus the `(eof, data<>)` reply shape. Until the
 /// in-memory gateway round-trips the inline data, kiseki may emit
 /// IO; the positive shape pinned here is the spec contract.
-#[test]
-fn s18_22_read_after_open_returns_ok_or_io_with_eof_field() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_22_read_after_open_returns_ok_or_io_with_eof_field() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
         // 1. PUTROOTFH
         w.write_u32(v4op::PUTROOTFH);
@@ -1386,7 +1386,7 @@ fn s18_22_read_after_open_returns_ok_or_io_with_eof_field() {
         w.write_u64(0);
         w.write_u32(4096);
     });
-    let reply = drive_compound(0xC001, &body);
+    let reply = drive_compound(0xC001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     // Either the full pipeline succeeds (NFS4_OK) OR the in-memory
@@ -1402,8 +1402,8 @@ fn s18_22_read_after_open_returns_ok_or_io_with_eof_field() {
 
 /// RFC 8881 §18.26 — READDIR without a current filehandle MUST yield
 /// `NFS4ERR_NOFILEHANDLE`.
-#[test]
-fn s18_26_readdir_without_current_fh_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_26_readdir_without_current_fh_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::READDIR);
         w.write_u64(0); // cookie
@@ -1412,7 +1412,7 @@ fn s18_26_readdir_without_current_fh_returns_nofilehandle() {
         w.write_u32(8192); // maxcount
         w.write_u32(0); // attr_request bitmap len
     });
-    let reply = drive_compound(0xD001, &body);
+    let reply = drive_compound(0xD001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert!(
@@ -1426,8 +1426,8 @@ fn s18_26_readdir_without_current_fh_returns_nofilehandle() {
 /// RFC 8881 §18.26 positive — READDIR on root returns a non-error
 /// status (op_readdir's exact shape is implementation-defined; we
 /// pin "did not error" as the wire contract).
-#[test]
-fn s18_26_readdir_after_putrootfh_returns_ok() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_26_readdir_after_putrootfh_returns_ok() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::READDIR);
@@ -1437,7 +1437,7 @@ fn s18_26_readdir_after_putrootfh_returns_ok() {
         w.write_u32(8192);
         w.write_u32(0);
     });
-    let reply = drive_compound(0xD002, &body);
+    let reply = drive_compound(0xD002, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1450,13 +1450,13 @@ fn s18_26_readdir_after_putrootfh_returns_ok() {
 /// RFC 8881 §18.28 — REMOVE without a current filehandle MUST yield
 /// `NFS4ERR_NOFILEHANDLE`. The spec text: "The current filehandle
 /// is the directory in which the entry to be removed resides."
-#[test]
-fn s18_28_remove_without_current_fh_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_28_remove_without_current_fh_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::REMOVE);
         w.write_string("doomed");
     });
-    let reply = drive_compound(0xE001, &body);
+    let reply = drive_compound(0xE001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert!(
@@ -1471,14 +1471,14 @@ fn s18_28_remove_without_current_fh_returns_nofilehandle() {
 /// RFC 8881 §18.29 — RENAME without a saved+current filehandle pair
 /// MUST yield `NFS4ERR_NOFILEHANDLE`. The op uses both saved_fh
 /// (source) and current_fh (target).
-#[test]
-fn s18_29_rename_without_fh_pair_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_29_rename_without_fh_pair_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::RENAME);
         w.write_string("from");
         w.write_string("to");
     });
-    let reply = drive_compound(0xE002, &body);
+    let reply = drive_compound(0xE002, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert!(
@@ -1492,15 +1492,15 @@ fn s18_29_rename_without_fh_pair_returns_nofilehandle() {
 
 /// RFC 8881 §18.30 — SETATTR without a current filehandle MUST yield
 /// `NFS4ERR_NOFILEHANDLE`.
-#[test]
-fn s18_30_setattr_without_current_fh_returns_nofilehandle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_30_setattr_without_current_fh_returns_nofilehandle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(v4op::SETATTR);
         w.write_opaque_fixed(&[0u8; 16]); // stateid
         w.write_u32(0); // bitmap_len = 0 (no attrs)
         w.write_opaque(&[]); // attr_vals
     });
-    let reply = drive_compound(0xE003, &body);
+    let reply = drive_compound(0xE003, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert!(
@@ -1520,8 +1520,8 @@ fn s18_30_setattr_without_current_fh_returns_nofilehandle() {
 /// test asserts the spec/contract behaviour: a composition created
 /// via the gateway write path is reachable via NFS LOOKUP by its
 /// canonical UUID name.
-#[test]
-fn s18_15_lookup_composition_uuid_returns_file_handle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_15_lookup_composition_uuid_returns_file_handle() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
 
@@ -1559,7 +1559,7 @@ fn s18_15_lookup_composition_uuid_returns_file_handle() {
 
     let header = make_header(0x4201, PROC_COMPOUND);
     let raw = build_nfs4_call(0x4201, PROC_COMPOUND, &body);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
     let mut r = reader_at_compound_result(&reply);
     let cs = r.read_u32().unwrap();
     assert_eq!(
@@ -1577,8 +1577,8 @@ fn s18_15_lookup_composition_uuid_returns_file_handle() {
 /// entries (NFS-CREATE'd files); this test asserts the broader
 /// contract: an S3-PUT'd composition shows up in the readdir
 /// response.
-#[test]
-fn s18_26_readdir_lists_compositions_in_namespace() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_26_readdir_lists_compositions_in_namespace() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
 
@@ -1616,7 +1616,7 @@ fn s18_26_readdir_lists_compositions_in_namespace() {
     });
     let header = make_header(0x4202, PROC_COMPOUND);
     let raw = build_nfs4_call(0x4202, PROC_COMPOUND, &body);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
 
     // Brute-force: assert the composition UUID appears as bytes in
     // the reply. Rigorous READDIR4resok decoding requires walking
@@ -1637,15 +1637,15 @@ fn s18_26_readdir_lists_compositions_in_namespace() {
 /// /mnt` does PUTROOTFH+LOOKUP("default") expecting a sub-directory
 /// to descend into. kiseki should treat the namespace name as an
 /// alias for the namespace root so the canonical mount path works.
-#[test]
-fn s18_15_lookup_default_namespace_returns_root_handle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_15_lookup_default_namespace_returns_root_handle() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::LOOKUP);
         w.write_string("default"); // the namespace name kiseki uses
         w.write_u32(v4op::GETFH);
     });
-    let reply = drive_compound(0x4101, &body);
+    let reply = drive_compound(0x4101, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_eq!(
@@ -1676,8 +1676,8 @@ fn s18_15_lookup_default_namespace_returns_root_handle() {
 /// PUTROOTFH; if the result bitmap doesn't include it, kernel
 /// can't determine lease cadence and returns EIO. kiseki must
 /// honor a bit-10-only request.
-#[test]
-fn s5_7_getattr_lease_time_only_returned_in_result_bitmap() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_7_getattr_lease_time_only_returned_in_result_bitmap() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::GETATTR);
@@ -1685,7 +1685,7 @@ fn s5_7_getattr_lease_time_only_returned_in_result_bitmap() {
         w.write_u32(1); // bm_count
         w.write_u32(1u32 << 10);
     });
-    let reply = drive_compound(0x4001, &body);
+    let reply = drive_compound(0x4001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _cs = r.read_u32(); // compound status
     let _tag = r.read_opaque();
@@ -1729,8 +1729,8 @@ fn s5_7_getattr_lease_time_only_returned_in_result_bitmap() {
 /// RFC 8881 §5.6 — GETATTR request `[TYPE, CHANGE, SIZE, FSID]`
 /// (bits 1, 3, 4, 8) MUST return exactly those four attrs in the
 /// result bitmap, in bit-order, with each attr's wire encoding.
-#[test]
-fn s5_6_getattr_type_change_size_fsid_returned_in_request_order() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_6_getattr_type_change_size_fsid_returned_in_request_order() {
     let bm = (1u32 << 1) | (1u32 << 3) | (1u32 << 4) | (1u32 << 8);
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
@@ -1738,7 +1738,7 @@ fn s5_6_getattr_type_change_size_fsid_returned_in_request_order() {
         w.write_u32(1); // bm_count
         w.write_u32(bm);
     });
-    let reply = drive_compound(0x4002, &body);
+    let reply = drive_compound(0x4002, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _ = r.read_u32(); // compound status
     let _ = r.read_opaque();
@@ -1800,15 +1800,15 @@ fn s5_6_getattr_type_change_size_fsid_returned_in_request_order() {
 /// least one flavor in `secinfo4<>` (typical: AUTH_SYS = 1) or
 /// NFS4ERR_NOTSUPP per §18.31.4. OP_ILLEGAL is wrong because the
 /// op IS in the v4.1 registry — kiseki just hadn't wired it.
-#[test]
-fn s18_31_secinfo_no_name_dispatched_not_op_illegal() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_31_secinfo_no_name_dispatched_not_op_illegal() {
     // SECINFO_STYLE4_CURRENT_FH = 0 per RFC 8881 §18.31.1.
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(52); // op SECINFO_NO_NAME
         w.write_u32(0); // SECINFO_STYLE4_CURRENT_FH
     });
-    let reply = drive_compound(0xF001, &body);
+    let reply = drive_compound(0xF001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_ne!(
@@ -1824,15 +1824,15 @@ fn s18_31_secinfo_no_name_dispatched_not_op_illegal() {
 /// RFC 8881 §18.34 — BIND_CONN_TO_SESSION (op 41). Linux clients
 /// emit this in some paths after CREATE_SESSION to claim the
 /// connection for forward / back / both channels.
-#[test]
-fn s18_34_bind_conn_to_session_dispatched_not_op_illegal() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_34_bind_conn_to_session_dispatched_not_op_illegal() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(41); // op BIND_CONN_TO_SESSION
         w.write_opaque_fixed(&[0u8; 16]); // bctsa_sessionid
         w.write_u32(1); // bctsa_dir = CDFC4_FORE
         w.write_bool(false); // bctsa_use_conn_in_rdma_mode
     });
-    let reply = drive_compound(0xF002, &body);
+    let reply = drive_compound(0xF002, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_ne!(
@@ -1844,13 +1844,13 @@ fn s18_34_bind_conn_to_session_dispatched_not_op_illegal() {
 }
 
 /// RFC 8881 §18.50 — DESTROY_CLIENTID (op 57). Kernel cleanup op.
-#[test]
-fn s18_50_destroy_clientid_dispatched_not_op_illegal() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_50_destroy_clientid_dispatched_not_op_illegal() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(57); // op DESTROY_CLIENTID
         w.write_u64(0xCAFE_BABE_DEAD_BEEF); // dca_clientid
     });
-    let reply = drive_compound(0xF003, &body);
+    let reply = drive_compound(0xF003, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert_ne!(
@@ -1865,8 +1865,8 @@ fn s18_50_destroy_clientid_dispatched_not_op_illegal() {
 /// (or NOTSUPP if dispatched through a stub). The v4.0 fallback path
 /// goes via SETCLIENTID; this test asserts kiseki rejects it cleanly
 /// within a v4.1 frame.
-#[test]
-fn s18_27_setclientid_in_v4_1_compound_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_27_setclientid_in_v4_1_compound_rejected() {
     const OP_SETCLIENTID: u32 = 35;
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 1, |w| {
         w.write_u32(OP_SETCLIENTID);
@@ -1880,7 +1880,7 @@ fn s18_27_setclientid_in_v4_1_compound_rejected() {
         w.write_string("");
         w.write_u32(0); // callback_ident
     });
-    let reply = drive_compound(0xE004, &body);
+    let reply = drive_compound(0xE004, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().unwrap();
     assert!(
@@ -1929,8 +1929,8 @@ fn s18_27_setclientid_in_v4_1_compound_rejected() {
 /// GETATTR reply MUST include the actual composition size in
 /// FATTR4_SIZE; today `nfs_ops::getattr` returns 0 unconditionally
 /// for any non-root file handle. This is **B1** above.
-#[test]
-fn s5_8_getattr_after_lookup_returns_actual_composition_size() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_8_getattr_after_lookup_returns_actual_composition_size() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
 
@@ -1975,7 +1975,7 @@ fn s5_8_getattr_after_lookup_returns_actual_composition_size() {
 
     let header = make_header(0xCA01, PROC_COMPOUND);
     let raw = build_nfs4_call(0xCA01, PROC_COMPOUND, &body);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
 
     let mut r = reader_at_compound_result(&reply);
     let cs = r.read_u32().unwrap();
@@ -2050,8 +2050,8 @@ fn s5_8_getattr_after_lookup_returns_actual_composition_size() {
 /// delegation. Total ~24 bytes vs spec ~36 bytes minimum. This is
 /// **B2** above and is what desyncs the kernel's parser when OPEN is
 /// followed by GETFH+GETATTR in the same compound.
-#[test]
-fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
 
@@ -2092,7 +2092,7 @@ fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
     });
     let header = make_header(0xCA02, PROC_COMPOUND);
     let raw = build_nfs4_call(0xCA02, PROC_COMPOUND, &body);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
 
     let mut r = reader_at_compound_result(&reply);
     let _cs = r.read_u32();
@@ -2167,8 +2167,8 @@ fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
 /// NFS4ERR_NOENT to userspace. THIS is the actual cat ENOENT bug
 /// surfaced by the docker e2e mount; B2's reply structure mattered
 /// too but B3 was the trigger.
-#[test]
-fn s18_16_1_open_args_claim_discriminator_is_required() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_16_1_open_args_claim_discriminator_is_required() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
 
@@ -2210,7 +2210,7 @@ fn s18_16_1_open_args_claim_discriminator_is_required() {
     });
     let header = make_header(0xCA05, PROC_COMPOUND);
     let raw = build_nfs4_call(0xCA05, PROC_COMPOUND, &body);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
 
     let mut r = reader_at_compound_result(&reply);
     let _cs = r.read_u32().unwrap();
@@ -2242,8 +2242,8 @@ fn s18_16_1_open_args_claim_discriminator_is_required() {
 /// into the file-handle bytes (it shouldn't — OPEN is in C3, not
 /// C1) READ returns ENOENT or BADHANDLE. This test pins the
 /// happy-path contract.
-#[test]
-fn s18_22_read_after_lookup_returns_seeded_bytes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s18_22_read_after_lookup_returns_seeded_bytes() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
 
@@ -2279,7 +2279,7 @@ fn s18_22_read_after_lookup_returns_seeded_bytes() {
     });
     let h1 = make_header(0xCA03, PROC_COMPOUND);
     let raw1 = build_nfs4_call(0xCA03, PROC_COMPOUND, &body1);
-    let reply1 = handle_nfs4_first_compound(&h1, &raw1, &ctx, &sessions);
+    let reply1 = handle_nfs4_first_compound(&h1, &raw1, &ctx, &sessions).await;
     let mut r1 = reader_at_compound_result(&reply1);
     let _ = r1.read_u32(); // compound status
     let _ = r1.read_opaque(); // tag
@@ -2307,7 +2307,7 @@ fn s18_22_read_after_lookup_returns_seeded_bytes() {
     });
     let h2 = make_header(0xCA04, PROC_COMPOUND);
     let raw2 = build_nfs4_call(0xCA04, PROC_COMPOUND, &body2);
-    let reply2 = handle_nfs4_first_compound(&h2, &raw2, &ctx, &sessions);
+    let reply2 = handle_nfs4_first_compound(&h2, &raw2, &ctx, &sessions).await;
     let mut r2 = reader_at_compound_result(&reply2);
     let cs = r2.read_u32().unwrap();
     assert_eq!(cs, nfs4_status::NFS4_OK, "C2 compound MUST be NFS4_OK");
@@ -2355,8 +2355,8 @@ fn s18_22_read_after_lookup_returns_seeded_bytes() {
 ///
 /// Re-enabled in Phase 15c.5 step 2 after step 1 fixed the LAYOUTGET
 /// `loga_length = u64::MAX` OOM by capping `max_stripes_per_layout`.
-#[test]
-fn s5_8_supported_attrs_includes_fs_layout_types_bit_62() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_8_supported_attrs_includes_fs_layout_types_bit_62() {
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 2, |w| {
         w.write_u32(v4op::PUTROOTFH);
         w.write_u32(v4op::GETATTR);
@@ -2364,7 +2364,7 @@ fn s5_8_supported_attrs_includes_fs_layout_types_bit_62() {
         w.write_u32(1);
         w.write_u32(1u32 << 0);
     });
-    let reply = drive_compound(0xD001, &body);
+    let reply = drive_compound(0xD001, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _cs = r.read_u32();
     let _tag = r.read_opaque();
@@ -2402,8 +2402,8 @@ fn s5_8_supported_attrs_includes_fs_layout_types_bit_62() {
 /// LAYOUT4_FLEX_FILES (RFC 8435) via the MDS Layout Manager.
 ///
 /// Re-enabled in Phase 15c.5 step 2 alongside the SUPPORTED_ATTRS bit.
-#[test]
-fn s5_12_fs_layout_types_returns_flex_files() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_12_fs_layout_types_returns_flex_files() {
     const LAYOUT4_FLEX_FILES: u32 = 4;
     const FATTR4_FS_LAYOUT_TYPES_BIT_W1: u32 = 62 - 32;
 
@@ -2415,7 +2415,7 @@ fn s5_12_fs_layout_types_returns_flex_files() {
         w.write_u32(0); // word0
         w.write_u32(1u32 << FATTR4_FS_LAYOUT_TYPES_BIT_W1);
     });
-    let reply = drive_compound(0xD002, &body);
+    let reply = drive_compound(0xD002, &body).await;
     let mut r = reader_at_compound_result(&reply);
     let _cs = r.read_u32();
     let _tag = r.read_opaque();

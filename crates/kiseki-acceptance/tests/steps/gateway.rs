@@ -1028,7 +1028,7 @@ async fn then_nfs_detect_loss(_w: &mut KisekiWorld) {
     // see `nfs_ops::readdir` doc + `nfs4_server::tests::
     // readdir_response_omits_dot_and_dotdot`). The structural
     // assertion is "no user-visible files survived the crash".
-    let entries = fresh_gw.readdir();
+    let entries = fresh_gw.readdir().await;
     assert!(
         entries.is_empty(),
         "fresh gateway should have no user files, got {} entries: {:?}",
@@ -1053,7 +1053,7 @@ async fn then_nfs_state_lost(w: &mut KisekiWorld) {
     // After crash(), the gateway's composition store has no namespaces.
     // NFS opens and locks are gateway-local ephemeral state — lost on crash.
     // Verify by checking the NFS context returns only . and .. (no user files).
-    let entries = w.legacy.nfs_ctx.readdir();
+    let entries = w.legacy.nfs_ctx.readdir().await;
     assert!(
         entries.len() <= 2,
         "NFS state should be cleared after crash"
@@ -1731,7 +1731,7 @@ async fn then_advisory_async(w: &mut KisekiWorld) {
     // Pre-2026-05-04 this used `entries.len() >= 2` to
     // smuggle in a check that `.` and `..` were emitted; that's
     // no longer true (kernel synthesizes them locally).
-    let _entries = w.legacy.nfs_ctx.readdir();
+    let _entries = w.legacy.nfs_ctx.readdir().await;
 }
 
 #[then("the View Materialization subsystem MAY readahead for subsequent reads of the same caller")]
@@ -1779,7 +1779,7 @@ async fn when_nfs_mount(w: &mut KisekiWorld, _gw: String) {
     // namespace's readdir returns 0 entries (no `.` / `..`); the
     // earlier `>= 2` check was a now-stale proxy for "the dot
     // entries showed up".
-    let _entries = w.legacy.nfs_ctx.readdir();
+    let _entries = w.legacy.nfs_ctx.readdir().await;
 }
 
 #[then("workflow correlation for NFS clients is attached per-mount by the gateway:")]

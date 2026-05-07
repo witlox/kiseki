@@ -37,7 +37,7 @@ fn build_nfs3_rpc(xid: u32, procedure: u32, body: &[u8]) -> Vec<u8> {
 }
 
 /// Send an NFS3 RPC through the real server and return the reply bytes.
-fn nfs3_call(w: &KisekiWorld, procedure: u32, body: &[u8]) -> Vec<u8> {
+async fn nfs3_call(w: &KisekiWorld, procedure: u32, body: &[u8]) -> Vec<u8> {
     let msg = build_nfs3_rpc(1, procedure, body);
     let header = RpcCallHeader {
         xid: 1,
@@ -45,7 +45,7 @@ fn nfs3_call(w: &KisekiWorld, procedure: u32, body: &[u8]) -> Vec<u8> {
         version: 3,
         procedure,
     };
-    handle_nfs3_first_message(&header, &msg, &w.legacy.nfs_ctx)
+    handle_nfs3_first_message(&header, &msg, &w.legacy.nfs_ctx).await
 }
 
 // ===================================================================
@@ -218,8 +218,8 @@ async fn given_file_with_content(w: &mut KisekiWorld, name: String, content: Str
 #[when(regex = r#"^the client sends READ on "([^"]*)" at offset (\d+) count (\d+)$"#)]
 async fn when_read(w: &mut KisekiWorld, name: String, offset: u64, count: u64) {
     // Read through real NFS context (handles offset/count correctly).
-    if let Some((fh, _)) = w.legacy.nfs_ctx.lookup_by_name(&name) {
-        match w.legacy.nfs_ctx.read(&fh, offset, count as u32) {
+    if let Some((fh, _)) = w.legacy.nfs_ctx.lookup_by_name(&name).await {
+        match w.legacy.nfs_ctx.read(&fh, offset, count as u32).await {
             Ok(resp) => {
                 w.last_read_data = Some(resp.data);
                 w.last_error = None;
@@ -563,7 +563,7 @@ async fn then_nfs4_noent(w: &mut KisekiWorld, _name: String) {
 async fn then_subsequent_lookup_noent(w: &mut KisekiWorld, name: String) {
     // After REMOVE, a subsequent LOOKUP should return NFS4ERR_NOENT.
     // Verify the NFS context does not find the removed file.
-    let result = w.legacy.nfs_ctx.lookup_by_name(&name);
+    let result = w.legacy.nfs_ctx.lookup_by_name(&name).await;
     assert!(
         result.is_none(),
         "LOOKUP for removed file '{}' should return NFS4ERR_NOENT",
@@ -573,7 +573,7 @@ async fn then_subsequent_lookup_noent(w: &mut KisekiWorld, name: String) {
 
 #[then(regex = r#"^READDIR returns entries including "([^"]*)" and "([^"]*)"$"#)]
 async fn then_readdir_includes(w: &mut KisekiWorld, a: String, b: String) {
-    let entries = w.legacy.nfs_ctx.readdir();
+    let entries = w.legacy.nfs_ctx.readdir().await;
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(
         names.contains(&a.as_str()),

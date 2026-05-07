@@ -156,8 +156,8 @@ async fn s8_8_3_etag_format_is_quoted_or_weak_quoted() {
 /// `W/"abc"` vs `"abc"` are NOT strong-equal but ARE weak-equal.
 ///
 /// Cross-implementation seed: a real curl-style ETag comparison.
-#[test]
-fn s8_8_3_2_etag_strong_vs_weak_comparison_seed() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s8_8_3_2_etag_strong_vs_weak_comparison_seed() {
     fn parse(etag: &str) -> (bool, &str) {
         if let Some(rest) = etag.strip_prefix("W/") {
             (true, rest.trim_matches('"'))
@@ -515,8 +515,8 @@ async fn s15_3_5_204_no_content_on_delete() {
 /// RFC 9110 §15.4.5 / §15.5.5 — pin every status code we emit so
 /// a future refactor cannot quietly renumber. (Non-runtime check;
 /// confirms the constants we depend on.)
-#[test]
-fn s15_status_codes_we_emit_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_status_codes_we_emit_pinned() {
     // 2xx
     assert_eq!(StatusCode::OK.as_u16(), 200);
     assert_eq!(StatusCode::CREATED.as_u16(), 201);
@@ -641,8 +641,8 @@ async fn s6_6_chunked_encoding_body_buffered_correctly() {
 /// RFC 9110 §8.8.3 verbatim examples. Pin them so a future ETag
 /// comparator (when one lands in `s3_server`) is contracted to
 /// match these.
-#[test]
-fn rfc_example_s8_8_3_etag_comparison_matrix() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_example_s8_8_3_etag_comparison_matrix() {
     // From RFC 9110 §8.8.3.2 Table 3 — etag comparison matrix.
     // (a, b, strong-eq, weak-eq)
     const MATRIX: &[(&str, &str, bool, bool)] = &[

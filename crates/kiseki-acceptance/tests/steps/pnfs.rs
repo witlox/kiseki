@@ -80,7 +80,7 @@ fn issue_handle(world: &mut KisekiWorld, expiry_ms: u64, stripe: u32) -> PnfsFil
 
 /// Drive a single COMPOUND through the DS dispatcher and capture
 /// per-op `(op_code, status, payload)` triples in the world.
-fn run_compound(
+async fn run_compound(
     world: &mut KisekiWorld,
     ctx: &Arc<DsContext<kiseki_gateway::mem_gateway::InMemoryGateway>>,
     sessions: &SessionManager,
@@ -106,7 +106,7 @@ fn run_compound(
         procedure: 1,
     };
     let mut reader = XdrReader::new(&bytes);
-    let reply = dispatch_ds_compound(&header, &mut reader, ctx, sessions);
+    let reply = dispatch_ds_compound(&header, &mut reader, ctx, sessions).await;
 
     // Decode the COMPOUND reply: skip RPC accept header (xid + 0 + 0 + 0
     // + 0 + 0 = 24 bytes), then compound_status (4) + tag (4) + num_ops (4)
@@ -243,7 +243,8 @@ async fn when_client_reads_via_ds(world: &mut KisekiWorld, _stripe: u32, offset:
                 read_args.into_bytes(),
             ),
         ],
-    );
+    )
+    .await;
 }
 
 #[then(regex = r#"^the DS returns NFS4_OK with (\d+) bytes of plaintext$"#)]
@@ -370,7 +371,8 @@ async fn when_compound_putfh_allocate(world: &mut KisekiWorld) {
             ),
             (ALLOCATE, allocate_args.into_bytes()),
         ],
-    );
+    )
+    .await;
 }
 
 #[then(regex = r#"^the DS returns NFS4ERR_NOTSUPP for ALLOCATE$"#)]
@@ -427,7 +429,8 @@ async fn then_no_later_op_parsed(world: &mut KisekiWorld) {
                 read_args.into_bytes(),
             ),
         ],
-    );
+    )
+    .await;
     // Result count caps at 2 — READ never executes.
     assert_eq!(world.pnfs.last_results.len(), 2);
 }
@@ -1358,7 +1361,8 @@ async fn then_recalled_fh4_badhandle(world: &mut KisekiWorld) {
             kiseki_gateway::nfs4_server::op::PUTFH,
             putfh_args.into_bytes(),
         )],
-    );
+    )
+    .await;
     let putfh = world.pnfs.last_results.first().expect("PUTFH result");
     assert_eq!(
         putfh.1,
@@ -1558,7 +1562,8 @@ async fn then_subsequent_badhandle(world: &mut KisekiWorld) {
             kiseki_gateway::nfs4_server::op::PUTFH,
             putfh_args.into_bytes(),
         )],
-    );
+    )
+    .await;
     let putfh = world.pnfs.last_results.first().expect("PUTFH result");
     // After the TTL elapses, the fh4's expiry_ms is in the past →
     // PnfsFileHandle::validate returns Expired → BADHANDLE. The DS

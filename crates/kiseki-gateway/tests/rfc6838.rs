@@ -81,8 +81,8 @@ fn setup_router() -> axum::Router {
 /// The grammar is opaque to our gateway; we pin the canonical types
 /// we tell users we support. A refactor that accidentally renames or
 /// downcases these constants flips this test.
-#[test]
-fn s4_2_canonical_media_types_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s4_2_canonical_media_types_pinned() {
     // From IANA's media-type registry — the most common types an S3
     // workload submits. Treated as opaque strings; the test asserts
     // the literal `type/subtype` shape.
@@ -127,8 +127,8 @@ fn s4_2_canonical_media_types_pinned() {
 /// RFC 6838 §4.2.6 — a media type may carry parameters separated
 /// by `;`. The gateway must NOT reorder or strip parameters during
 /// round-trip; this is the "opaque" contract.
-#[test]
-fn s4_2_6_parameters_are_opaque_string_after_semicolon() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s4_2_6_parameters_are_opaque_string_after_semicolon() {
     // Synthetic samples — we never look INTO the parameter, we only
     // assert that what we receive on PUT we return on GET.
     const SAMPLES: &[&str] = &[
@@ -286,8 +286,8 @@ async fn put_without_content_type_get_does_not_invent_one() {
 /// reproduced verbatim. Any compliant gateway round-trips these.
 ///
 /// <https://www.iana.org/assignments/media-types/media-types.xhtml>
-#[test]
-fn iana_registry_seed_three_canonical_types() {
+#[tokio::test(flavor = "multi_thread")]
+async fn iana_registry_seed_three_canonical_types() {
     const SEED: &[(&str, &str)] = &[
         // (input from IANA → expected output)
         ("application/octet-stream", "application/octet-stream"),

@@ -60,8 +60,8 @@ use kiseki_gateway::pnfs::host_port_to_uaddr;
 /// equivalent). UDP is rejected (NFSv4.1 mandates a connection-oriented
 /// transport per RFC 8881 §2.2). This test pins the four standard
 /// strings.
-#[test]
-fn s3_netid_registry_strings() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_netid_registry_strings() {
     let registry: &[(&str, &str)] = &[
         ("tcp", "IPv4 + TCP"),
         ("udp", "IPv4 + UDP"),
@@ -91,8 +91,8 @@ fn s3_netid_registry_strings() {
 //
 // For all six fields we expect bare decimal — no hex, no zero-padding.
 
-#[test]
-fn s5_2_3_4_ipv4_uaddr_basic_form() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_ipv4_uaddr_basic_form() {
     // Linux NFS server default port 2049 = 8 * 256 + 1 → "8.1".
     assert_eq!(
         host_port_to_uaddr("127.0.0.1:2049"),
@@ -105,16 +105,16 @@ fn s5_2_3_4_ipv4_uaddr_basic_form() {
     assert_eq!(host_port_to_uaddr("127.0.0.1:80"), "127.0.0.1.0.80");
 }
 
-#[test]
-fn s5_2_3_4_ipv4_uaddr_port_low_byte_zero() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_ipv4_uaddr_port_low_byte_zero() {
     // Port 256 = 1 * 256 + 0 → "1.0".
     assert_eq!(host_port_to_uaddr("10.0.0.1:256"), "10.0.0.1.1.0");
     // Port 0 = 0 * 256 + 0 → "0.0".
     assert_eq!(host_port_to_uaddr("10.0.0.1:0"), "10.0.0.1.0.0");
 }
 
-#[test]
-fn s5_2_3_4_ipv4_uaddr_max_port_65535() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_ipv4_uaddr_max_port_65535() {
     // RFC 5665 §5.2.3.4 — maximum port is 65535 = 255 * 256 + 255.
     assert_eq!(
         host_port_to_uaddr("10.0.0.1:65535"),
@@ -123,8 +123,8 @@ fn s5_2_3_4_ipv4_uaddr_max_port_65535() {
     );
 }
 
-#[test]
-fn s5_2_3_4_ipv4_uaddr_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_ipv4_uaddr_round_trip() {
     // Round-trip every example from §5.2.3.4 verbatim. The reverse
     // direction (uaddr → host:port) isn't a public API yet — but we
     // can still parse our emitted form and compare back to expected.
@@ -155,8 +155,8 @@ fn s5_2_3_4_ipv4_uaddr_round_trip() {
 // §5.2.3.4 negatives — malformed IPv4 uaddr
 // ===========================================================================
 
-#[test]
-fn s5_2_3_4_negative_no_port_returns_unmodified_default() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_negative_no_port_returns_unmodified_default() {
     // No `:port` separator — kiseki's defensive default is to return
     // the input unchanged. A strict RFC-compliant decoder would
     // reject; we pin the current contract so a future tightening is
@@ -175,15 +175,15 @@ fn s5_2_3_4_negative_no_port_returns_unmodified_default() {
     );
 }
 
-#[test]
-fn s5_2_3_4_negative_non_numeric_port() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_negative_non_numeric_port() {
     // Defensive default: non-numeric port → return verbatim.
     let result = host_port_to_uaddr("127.0.0.1:abc");
     assert_eq!(result, "127.0.0.1:abc");
 }
 
-#[test]
-fn s5_2_3_4_negative_port_out_of_range() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_negative_port_out_of_range() {
     // Port > 65535 — won't parse as u16 → defensive default.
     let result = host_port_to_uaddr("127.0.0.1:99999");
     assert_eq!(
@@ -198,8 +198,8 @@ fn s5_2_3_4_negative_port_out_of_range() {
     );
 }
 
-#[test]
-fn s5_2_3_4_negative_wrong_segment_count_in_uaddr() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_negative_wrong_segment_count_in_uaddr() {
     // RFC 5665 §5.2.3.4: a valid IPv4 uaddr has EXACTLY 6 dot-separated
     // segments (4 host + 2 port). We assert the contract directly on
     // a hand-built malformed string. (`host_port_to_uaddr` doesn't parse
@@ -241,8 +241,8 @@ fn s5_2_3_4_negative_wrong_segment_count_in_uaddr() {
 // IPv6 form to be parsed as IPv6 first. The test below asserts the
 // contract; it is RED until kiseki adds bracketed-IPv6 handling.
 
-#[test]
-fn s5_2_5_ipv6_uaddr_bracketed_form_should_emit_dotted_port() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_5_ipv6_uaddr_bracketed_form_should_emit_dotted_port() {
     // RFC 5665 §5.2.5 by example: the IPv6 loopback `[::1]:2049`
     // ought to map to "::1.8.1" (port 2049 = 8*256 + 1).
     let result = host_port_to_uaddr("[::1]:2049");
@@ -262,8 +262,8 @@ fn s5_2_5_ipv6_uaddr_bracketed_form_should_emit_dotted_port() {
     }
 }
 
-#[test]
-fn s5_2_5_ipv6_uaddr_unbracketed_is_ambiguous() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_5_ipv6_uaddr_unbracketed_is_ambiguous() {
     // Without brackets, `fe80::1:2049` is BOTH a valid IPv6 address
     // (no port) AND the input encoding kiseki currently accepts (port
     // 2049). RFC 5665 §5.2.5 effectively requires brackets to
@@ -285,8 +285,8 @@ fn s5_2_5_ipv6_uaddr_unbracketed_is_ambiguous() {
     );
 }
 
-#[test]
-fn s5_2_5_netid_for_ipv6_must_be_tcp6() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_5_netid_for_ipv6_must_be_tcp6() {
     // RFC 5665 §3 + §5.2.5: IPv6 + TCP universal addresses are paired
     // with netid="tcp6". kiseki's MdsLayoutManager picks the netid
     // based on whether the ds_addr contains '.' — that's an IPv4
@@ -316,8 +316,8 @@ fn s5_2_5_netid_for_ipv6_must_be_tcp6() {
 /// - `127.0.0.1` + port 2049 (nfs)           → "127.0.0.1.8.1"
 /// - `0.0.0.0`   + port 65535 (max)          → "0.0.0.0.255.255"
 /// - `10.0.0.11` + port 2052 (kiseki DS)     → "10.0.0.11.8.4"
-#[test]
-fn rfc_seed_s5_2_3_4_canonical_examples() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_seed_s5_2_3_4_canonical_examples() {
     let cases = [
         ("127.0.0.1:111", "127.0.0.1.0.111"),
         ("127.0.0.1:2049", "127.0.0.1.8.1"),
@@ -337,8 +337,8 @@ fn rfc_seed_s5_2_3_4_canonical_examples() {
 // Round-trip — every IPv4 example, parse port back and verify
 // ===========================================================================
 
-#[test]
-fn s5_2_3_4_full_round_trip_arithmetic() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_2_3_4_full_round_trip_arithmetic() {
     // For every example, decoding p1.p2 back to a port via
     // port = p1*256 + p2 must recover the original.
     for port in [0u16, 1, 80, 111, 443, 2049, 2052, 8080, 9000, 65535] {

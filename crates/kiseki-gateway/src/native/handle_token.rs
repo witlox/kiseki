@@ -173,8 +173,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn round_trip_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_trip_succeeds() {
         let s = keys(1);
         let san = "spiffe://kiseki/tenant/org-x";
         let bytes = serialize_signed(&s, &sample_inner(1, san)).unwrap();
@@ -182,8 +182,8 @@ mod tests {
         assert_eq!(decoded.inode, 123);
     }
 
-    #[test]
-    fn flipped_byte_fails_hmac() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flipped_byte_fails_hmac() {
         let s = keys(1);
         let san = "spiffe://kiseki/tenant/org-x";
         let mut bytes = serialize_signed(&s, &sample_inner(1, san)).unwrap();
@@ -193,8 +193,8 @@ mod tests {
         assert!(matches!(err, HandleTokenError::HmacInvalid));
     }
 
-    #[test]
-    fn san_mismatch_rejected_even_with_valid_hmac() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn san_mismatch_rejected_even_with_valid_hmac() {
         let s = keys(1);
         let san_a = "spiffe://kiseki/tenant/org-a";
         let san_b = "spiffe://kiseki/tenant/org-b";
@@ -203,8 +203,8 @@ mod tests {
         assert!(matches!(err, HandleTokenError::SanMismatch));
     }
 
-    #[test]
-    fn unknown_epoch_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_epoch_rejected() {
         let s = keys(5);
         let san = "spiffe://kiseki/tenant/org-x";
         // Mint with epoch 99 which is not in the store.
@@ -213,8 +213,8 @@ mod tests {
         assert!(matches!(err, HandleTokenError::KeyEpochUnknown(99)));
     }
 
-    #[test]
-    fn rotation_grace_keeps_old_tokens_valid() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rotation_grace_keeps_old_tokens_valid() {
         let store = keys(1);
         let san = "spiffe://kiseki/tenant/org-x";
         let bytes = serialize_signed(&store, &sample_inner(1, san)).unwrap();

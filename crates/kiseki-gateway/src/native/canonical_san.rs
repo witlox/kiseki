@@ -203,45 +203,45 @@ fn is_unreserved(b: u8) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn canonical_form_passes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canonical_form_passes() {
         let s = canonicalize("spiffe://kiseki/tenant/org-pharma").unwrap();
         assert_eq!(s.as_str(), "spiffe://kiseki/tenant/org-pharma");
         assert_eq!(s.tenant_id(), "org-pharma");
     }
 
-    #[test]
-    fn canonical_form_with_dots_and_underscores_passes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canonical_form_with_dots_and_underscores_passes() {
         let s = canonicalize("spiffe://kiseki/tenant/org_x.y-1").unwrap();
         assert_eq!(s.tenant_id(), "org_x.y-1");
     }
 
-    #[test]
-    fn trailing_slash_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trailing_slash_rejected() {
         assert_eq!(
             canonicalize("spiffe://kiseki/tenant/org-pharma/").unwrap_err(),
             SanError::TrailingSlash
         );
     }
 
-    #[test]
-    fn upper_case_scheme_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upper_case_scheme_rejected() {
         assert_eq!(
             canonicalize("SPIFFE://kiseki/tenant/org-pharma").unwrap_err(),
             SanError::SchemeNotLowercased
         );
     }
 
-    #[test]
-    fn upper_case_authority_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upper_case_authority_rejected() {
         assert_eq!(
             canonicalize("spiffe://Kiseki/tenant/org-pharma").unwrap_err(),
             SanError::AuthorityNotLowercased
         );
     }
 
-    #[test]
-    fn cyrillic_homograph_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cyrillic_homograph_rejected() {
         // 'к' is U+043A CYRILLIC SMALL LETTER KA, looks like ASCII 'k'.
         let homograph = "spiffe://кiseki/tenant/org-pharma";
         assert_eq!(
@@ -250,8 +250,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn percent_encoded_hyphen_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn percent_encoded_hyphen_rejected() {
         // org%2Dpharma — %2D is '-', an unreserved character.
         assert_eq!(
             canonicalize("spiffe://kiseki/tenant/org%2Dpharma").unwrap_err(),
@@ -259,36 +259,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unsupported_scheme_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsupported_scheme_rejected() {
         let err = canonicalize("https://kiseki/tenant/org-pharma").unwrap_err();
         assert!(matches!(err, SanError::UnsupportedScheme { .. }));
     }
 
-    #[test]
-    fn missing_tenant_segment_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_tenant_segment_rejected() {
         assert_eq!(
             canonicalize("spiffe://kiseki/whatever/org-pharma").unwrap_err(),
             SanError::MissingTenantSegment
         );
     }
 
-    #[test]
-    fn empty_tenant_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_tenant_rejected() {
         assert_eq!(
             canonicalize("spiffe://kiseki/tenant/").unwrap_err(),
             SanError::TrailingSlash
         );
     }
 
-    #[test]
-    fn extra_path_segment_rejected() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extra_path_segment_rejected() {
         let err = canonicalize("spiffe://kiseki/tenant/org-x/extra").unwrap_err();
         assert!(matches!(err, SanError::Malformed(_)));
     }
 
-    #[test]
-    fn percent_encoded_reserved_byte_passes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn percent_encoded_reserved_byte_passes() {
         // %2F is '/', which is RESERVED — encoded form is allowed.
         // We don't decode it (would change the structure), but we
         // shouldn't reject it as percent-encoded-unreserved.

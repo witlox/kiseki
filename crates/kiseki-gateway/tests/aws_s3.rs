@@ -378,8 +378,8 @@ async fn error_access_denied_xml_body_shape_documented() {
 /// AWS S3 — pin the (`<Code>`, status-code) pairs the gateway
 /// emits. A future commit that changes `s3_server` to invent a new
 /// error code without updating this list trips the auditor.
-#[test]
-fn aws_s3_error_codes_emitted_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_s3_error_codes_emitted_pinned() {
     // (`<Code>`, HTTP status, AWS docs URL fragment for cross-ref)
     const EMITTED: &[(&str, u16)] = &[
         ("NoSuchKey", 404),
@@ -465,8 +465,8 @@ async fn list_buckets_xml_body_shape() {
 /// implementer with the exact target.
 ///
 /// <https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html>
-#[test]
-fn aws_s3_seed_error_response_xml() {
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_s3_seed_error_response_xml() {
     const SEED: &str = "\
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <Error>
@@ -495,8 +495,8 @@ fn aws_s3_seed_error_response_xml() {
 
 /// AWS S3 docs — `<Error>` body schema fields. Pinned so the
 /// Group-VI implementer can hand-build response bodies.
-#[test]
-fn aws_s3_error_response_required_fields_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_s3_error_response_required_fields_pinned() {
     // Per AWS docs, the elements of <Error> body. Only Code and
     // Message are MUST-emit; the rest are SHOULD.
     const REQUIRED: &[&str] = &["Code", "Message"];

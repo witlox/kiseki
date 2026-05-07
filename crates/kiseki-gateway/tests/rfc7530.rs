@@ -91,8 +91,8 @@ const NFS4ERR_MINOR_VERS_MISMATCH: u32 = 10021;
 /// RFC 7530 §15.1 — pin the procedure registry. NFSv4 has exactly
 /// two procedures at the RPC layer; any other procedure number MUST
 /// produce PROC_UNAVAIL (RFC 5531 §9.2 accept_stat=3).
-#[test]
-fn s15_1_procedure_registry_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_1_procedure_registry_pinned() {
     assert_eq!(NFS4_PROGRAM, 100003, "RFC 7530 §1.4.1: program = 100003");
     assert_eq!(NFS4_VERSION, 4, "RFC 7530 §1.4.1: version = 4");
     assert_eq!(PROC_NULL, 0, "RFC 7530 §15.1: NULL = procedure 0");
@@ -109,8 +109,8 @@ fn s15_1_procedure_registry_pinned() {
 
 /// RFC 7530 §13.1 — pin the NFS4ERR_MINOR_VERS_MISMATCH constant.
 /// This is the spec-mandated reply when minor_version is unsupported.
-#[test]
-fn s13_1_minor_vers_mismatch_status_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s13_1_minor_vers_mismatch_status_pinned() {
     assert_eq!(
         NFS4ERR_MINOR_VERS_MISMATCH, 10021,
         "RFC 7530 §13.1: NFS4ERR_MINOR_VERS_MISMATCH = 10021"
@@ -223,14 +223,14 @@ fn reader_at_compound_result(reply: &[u8]) -> XdrReader<'_> {
 /// 2026-04-27 production bug rejected this with PROC_UNAVAIL. The
 /// fix landed in commit `5f6fece`. This test pins the contract so it
 /// cannot regress.
-#[test]
-fn s15_1_null_returns_empty_accept_ok() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_1_null_returns_empty_accept_ok() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
     let header = make_header(1, PROC_NULL);
     let raw = build_nfs4_call(1, PROC_NULL, &[]);
 
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
     let mut r = XdrReader::new(&reply);
     let xid = r.read_u32().unwrap();
     assert_eq!(xid, 1, "xid echoed");
@@ -266,15 +266,15 @@ fn s15_1_null_returns_empty_accept_ok() {
 /// may choke on a 4.1-only attr field. This positive test asserts
 /// the request succeeds end-to-end; the negative test below covers
 /// the strict path where the server rejects 4.0 outright.
-#[test]
-fn s15_2_compound_minor_v0_putrootfh_getattr_succeeds_or_rejects_cleanly() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_2_compound_minor_v0_putrootfh_getattr_succeeds_or_rejects_cleanly() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
     let body = encode_compound_body(b"", 0, &[v4op::PUTROOTFH, v4op::GETATTR]);
     let header = make_header(2, PROC_COMPOUND);
     let raw = build_nfs4_call(2, PROC_COMPOUND, &body);
 
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().expect("compound status");
     let _reply_tag = r.read_opaque().expect("reply tag");
@@ -321,15 +321,15 @@ fn s15_2_compound_minor_v0_putrootfh_getattr_succeeds_or_rejects_cleanly() {
 /// Today's server reads `minor_version` and ignores it (see
 /// `dispatch_compound`'s `let _minor_version = ...`), so this test
 /// is RED until version negotiation is added.
-#[test]
-fn s13_1_minor_v0_compound_should_return_minor_vers_mismatch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s13_1_minor_v0_compound_should_return_minor_vers_mismatch() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
     let body = encode_compound_body(b"", 0, &[v4op::PUTROOTFH]);
     let header = make_header(3, PROC_COMPOUND);
     let raw = build_nfs4_call(3, PROC_COMPOUND, &body);
 
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().expect("compound status");
 
@@ -349,14 +349,14 @@ fn s13_1_minor_v0_compound_should_return_minor_vers_mismatch() {
 /// 0 (NULL) or 1 (COMPOUND) MUST produce `PROC_UNAVAIL` (accept_stat
 /// = 3). This is the wire-side guard that prevents a malformed or
 /// extension-probing client from confusing the dispatcher.
-#[test]
-fn s15_1_unknown_procedure_returns_proc_unavail() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s15_1_unknown_procedure_returns_proc_unavail() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
     let header = make_header(4, 99); // procedure 99 doesn't exist
     let raw = build_nfs4_call(4, 99, &[]);
 
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
     let mut r = XdrReader::new(&reply);
     let _xid = r.read_u32().unwrap();
     let _msg_type = r.read_u32().unwrap();
@@ -388,8 +388,8 @@ fn s15_1_unknown_procedure_returns_proc_unavail() {
 /// one op (`PUTROOTFH`, op=24). This is what every Linux 4.0
 /// COMPOUND wire log starts with, modulo the empty tag (some
 /// clients embed a debug string).
-#[test]
-fn rfc_7530_seed_canonical_minor_v0_compound_body() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_7530_seed_canonical_minor_v0_compound_body() {
     let body = encode_compound_body(b"", 0, &[v4op::PUTROOTFH]);
     let expected: Vec<u8> = vec![
         0x00, 0x00, 0x00, 0x00, // tag length = 0
@@ -408,7 +408,7 @@ fn rfc_7530_seed_canonical_minor_v0_compound_body() {
     let sessions = SessionManager::new();
     let header = make_header(0xCAFE_BABE, PROC_COMPOUND);
     let raw = build_nfs4_call(0xCAFE_BABE, PROC_COMPOUND, &body);
-    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
     let mut r = reader_at_compound_result(&reply);
     let compound_status = r.read_u32().expect("compound status");
     assert!(

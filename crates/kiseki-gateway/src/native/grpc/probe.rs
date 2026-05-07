@@ -105,8 +105,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn with_addr_override_supersedes_default() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_addr_override_supersedes_default() {
         // Production flow: `GrpcProbe::new(default)` reads
         // `KISEKI_NATIVE_GRPC_ADDR`; tests bypass the env layer via
         // `with_addr` to keep the unit test deterministic across
@@ -116,8 +116,8 @@ mod tests {
         assert_eq!(probe.addr(), "127.0.0.1:9999");
     }
 
-    #[test]
-    fn binding_id_is_grpc() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn binding_id_is_grpc() {
         let probe = GrpcProbe::new("0.0.0.0:9100");
         assert_eq!(probe.binding_id(), BindingId::Grpc);
     }

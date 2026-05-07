@@ -78,8 +78,8 @@ async fn nfs_write_read_roundtrip() {
 ///
 /// The NFS server spawns an OS thread per connection. This test verifies
 /// that 16 concurrent writer threads don't deadlock or corrupt state.
-#[test]
-fn concurrent_nfs_writes_no_deadlock() {
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_nfs_writes_no_deadlock() {
     let nfs = setup_nfs_gateway();
     let mut handles = Vec::new();
 
@@ -109,8 +109,8 @@ fn concurrent_nfs_writes_no_deadlock() {
 }
 
 /// Concurrent NFS read + write (mixed workload).
-#[test]
-fn concurrent_nfs_mixed_read_write() {
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_nfs_mixed_read_write() {
     let nfs = setup_nfs_gateway();
 
     // Pre-write objects for readers.
@@ -178,8 +178,8 @@ fn concurrent_nfs_mixed_read_write() {
 }
 
 /// pNFS layout manager: concurrent layout requests.
-#[test]
-fn pnfs_layout_delegation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pnfs_layout_delegation() {
     use kiseki_gateway::pnfs::{IoMode, LayoutManager};
 
     let storage_nodes = vec![
@@ -218,8 +218,8 @@ fn pnfs_layout_delegation() {
 }
 
 /// pNFS: concurrent layout get/return from multiple threads.
-#[test]
-fn pnfs_concurrent_layout_requests() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pnfs_concurrent_layout_requests() {
     use kiseki_gateway::pnfs::IoMode;
     use std::sync::Mutex;
 

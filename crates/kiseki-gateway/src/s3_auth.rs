@@ -372,8 +372,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_valid_authorization() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parse_valid_authorization() {
         let header = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024";
         let parsed = parse_authorization(header).unwrap();
         assert_eq!(parsed.access_key, "AKIAIOSFODNN7EXAMPLE");
@@ -387,8 +387,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn canonical_request_matches_aws_get_vanilla() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canonical_request_matches_aws_get_vanilla() {
         // AWS SigV4 test suite — `get-vanilla` vector. Inline diagnostic
         // to pin every byte of the canonical-request output against the
         // expected AWS string. Stays in the suite as a regression guard.
@@ -415,8 +415,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signing_key_and_signature_match_aws_get_vanilla() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signing_key_and_signature_match_aws_get_vanilla() {
         // Reproduce the entire SigV4 chain for the AWS get-vanilla
         // vector and compare to the published expected signature.
         let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -475,8 +475,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_missing_algorithm() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parse_missing_algorithm() {
         let header = "Bearer token123";
         assert!(matches!(
             parse_authorization(header),
@@ -484,8 +484,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_missing_credential() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parse_missing_credential() {
         let header = "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc";
         assert!(matches!(
             parse_authorization(header),
@@ -493,8 +493,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn access_key_store_crud() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn access_key_store_crud() {
         let mut store = AccessKeyStore::new();
         assert!(store.is_empty());
 
@@ -509,8 +509,8 @@ mod tests {
         assert!(store.lookup("NONEXISTENT").is_none());
     }
 
-    #[test]
-    fn sigv4_signing_key_derivation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigv4_signing_key_derivation() {
         // AWS test vector from documentation.
         let key = derive_signing_key(
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -522,8 +522,8 @@ mod tests {
         assert!(!key.as_ref().is_empty());
     }
 
-    #[test]
-    fn sha256_hex_known_value() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sha256_hex_known_value() {
         let hash = sha256_hex(b"");
         assert_eq!(
             hash,
@@ -531,8 +531,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_unknown_access_key() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_unknown_access_key() {
         let store = AccessKeyStore::new();
         let headers = {
             let mut h = HeaderMap::new();
@@ -554,8 +554,8 @@ mod tests {
         assert!(matches!(result, Err(AuthError::UnknownAccessKey(_))));
     }
 
-    #[test]
-    fn validate_missing_auth_header() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_missing_auth_header() {
         let store = AccessKeyStore::new();
         let headers = HeaderMap::new();
         let result = validate_request(
@@ -568,8 +568,8 @@ mod tests {
         assert_eq!(result.unwrap_err(), AuthError::MissingAuth);
     }
 
-    #[test]
-    fn validate_signature_mismatch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_signature_mismatch() {
         let mut store = AccessKeyStore::new();
         let tenant = OrgId(uuid::Uuid::new_v4());
         store.insert("MYKEY".into(), "mysecret".into(), tenant);
@@ -598,8 +598,8 @@ mod tests {
         assert_eq!(result.unwrap_err(), AuthError::SignatureDoesNotMatch);
     }
 
-    #[test]
-    fn validate_correct_signature() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_correct_signature() {
         let mut store = AccessKeyStore::new();
         let tenant = OrgId(uuid::Uuid::new_v4());
         let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -646,8 +646,8 @@ mod tests {
         assert_eq!(auth.access_key, access_key);
     }
 
-    #[test]
-    fn missing_authorization_returns_missing_auth() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_authorization_returns_missing_auth() {
         // Verify that a request with no Authorization header yields MissingAuth.
         let store = AccessKeyStore::new();
         let headers = HeaderMap::new(); // no authorization header
@@ -666,8 +666,8 @@ mod tests {
     // Access key resolved to tenant + workload identity, request
     // authorized against tenant policy.
     // ---------------------------------------------------------------
-    #[test]
-    fn s3_gateway_resolves_access_key_to_tenant() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s3_gateway_resolves_access_key_to_tenant() {
         let mut store = AccessKeyStore::new();
         let tenant = OrgId(uuid::Uuid::new_v4());
         let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";

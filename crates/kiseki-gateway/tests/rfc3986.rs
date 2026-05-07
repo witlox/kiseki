@@ -117,8 +117,8 @@ fn is_unreserved(b: u8) -> bool {
 /// RFC 3986 §2.1 — percent-encoding represents an octet as `%HH`
 /// where HH is the upper-case hex of the byte. The encoding is a
 /// total function over 0x00..=0xFF and must round-trip exactly.
-#[test]
-fn s2_1_percent_encoding_round_trip_every_byte() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_1_percent_encoding_round_trip_every_byte() {
     for b in 0u8..=255 {
         let encoded = format!("%{b:02X}");
         // Hex shape — exactly 3 chars, '%' prefix, two upper-case hex digits.
@@ -145,8 +145,8 @@ fn s2_1_percent_encoding_round_trip_every_byte() {
 /// RFC 3986 §2.1 negative — lower-case hex IS technically accepted
 /// on decode (§6.2.2.1 normalization), but encoders MUST emit
 /// upper-case. Pin that contract.
-#[test]
-fn s2_1_encoders_emit_uppercase_hex() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_1_encoders_emit_uppercase_hex() {
     for b in [0x00u8, 0x0A, 0xAB, 0xFF] {
         let upper = format!("%{b:02X}");
         // §6.2.2.1: For consistency, a percent-encoded octet should
@@ -167,8 +167,8 @@ fn s2_1_encoders_emit_uppercase_hex() {
 /// inside a path segment (not as a delimiter), it MUST be
 /// percent-encoded. The decoder (and AWS SigV4 canonicalizer) must
 /// preserve that encoding.
-#[test]
-fn s2_2_reserved_characters_stay_encoded_in_path_segment() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_2_reserved_characters_stay_encoded_in_path_segment() {
     for b in RESERVED {
         let encoded = format!("%{b:02X}");
         // Round trip — re-encoding the byte produces the same string.
@@ -186,8 +186,8 @@ fn s2_2_reserved_characters_stay_encoded_in_path_segment() {
 
 /// RFC 3986 §2.2 — pin the reserved set verbatim. Catches a future
 /// refactor that misclassifies (e.g., loses '+' or ';').
-#[test]
-fn s2_2_reserved_set_pinned() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_2_reserved_set_pinned() {
     // gen-delims (§2.2) + sub-delims (§2.2)
     let want = b":/?#[]@!$&'()*+,;=";
     assert_eq!(RESERVED, want);
@@ -201,8 +201,8 @@ fn s2_2_reserved_set_pinned() {
 /// RFC 3986 §2.3 — unreserved set: `ALPHA / DIGIT / "-" / "." / "_"
 /// / "~"`. An encoder MUST NOT percent-encode these. (Common
 /// misimplementation: encoding `~` because it's "punctuation".)
-#[test]
-fn s2_3_unreserved_set_not_encoded() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_3_unreserved_set_not_encoded() {
     // Spot-check the corners.
     for b in [b'A', b'Z', b'a', b'z', b'0', b'9', b'-', b'.', b'_', b'~'] {
         assert!(
@@ -297,8 +297,8 @@ async fn s3_3_path_segment_percent_encoded_space_decodes_to_space() {
 /// known keys. When the fix lands, the test in `s3_auth.rs` (or a
 /// new one) will reproduce the SigV4 signature against these
 /// canonical strings.
-#[test]
-fn sigv4_canonical_uri_known_inputs() {
+#[tokio::test(flavor = "multi_thread")]
+async fn sigv4_canonical_uri_known_inputs() {
     // (raw key, expected canonical-URI segment per AWS S3 docs)
     const SEED: &[(&str, &str)] = &[
         // S3 keys with no reserved characters round-trip identically.
@@ -350,8 +350,8 @@ fn sigv4_canonical_uri_path(raw: &str) -> String {
 /// space and replaced it with `+`, signatures over keys-with-spaces
 /// would still fail to validate. (`+` is form-urlencoded, NOT
 /// RFC 3986 path-encoded.) Pin the contract.
-#[test]
-fn sigv4_canonical_uri_must_not_use_plus_for_space() {
+#[tokio::test(flavor = "multi_thread")]
+async fn sigv4_canonical_uri_must_not_use_plus_for_space() {
     let canon = sigv4_canonical_uri_path("a b");
     assert_eq!(
         canon, "a%20b",
@@ -370,8 +370,8 @@ fn sigv4_canonical_uri_must_not_use_plus_for_space() {
 /// names" appendix).
 ///
 /// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html>
-#[test]
-fn aws_s3_seed_object_key_examples() {
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_s3_seed_object_key_examples() {
     // (S3-key, RFC-3986 single-encoded URL form)
     const SEED: &[(&str, &str)] = &[
         ("4my-organization", "4my-organization"),
@@ -401,8 +401,8 @@ fn aws_s3_seed_object_key_examples() {
 /// character is in the unreserved set, the URI is "equivalent" to
 /// the form without encoding. Decoders MUST treat them as the same;
 /// encoders SHOULD prefer the unencoded form.
-#[test]
-fn s6_2_2_2_unreserved_percent_encoded_decodes_normally() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s6_2_2_2_unreserved_percent_encoded_decodes_normally() {
     // %41 == 'A' (unreserved) — these MUST decode to the same key.
     let k1 = "A";
     let k2 = "%41";
@@ -434,8 +434,8 @@ fn percent_decode(s: &str) -> Vec<u8> {
 /// servers MUST NOT see it on the wire. The S3 gateway must handle
 /// a request whose path-portion is interpreted independent of any
 /// fragment a misbehaving client might send.
-#[test]
-fn s3_5_fragment_is_not_part_of_request_uri_on_server() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_5_fragment_is_not_part_of_request_uri_on_server() {
     // The wire form NEVER includes a fragment — RFC 7230 §5.3
     // (request-target) excludes it. We document the rule; no
     // server-side test is needed because the byte never reaches us.

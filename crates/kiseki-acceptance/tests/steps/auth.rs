@@ -442,7 +442,7 @@ async fn then_maps_identity(w: &mut KisekiWorld) {
 #[then("the NFS session is established")]
 async fn then_nfs_session(w: &mut KisekiWorld) {
     // NFS session: gateway can serve NFS operations after authentication.
-    let entries = w.legacy.nfs_ctx.readdir();
+    let entries = w.legacy.nfs_ctx.readdir().await;
     // Successful readdir means the NFS session is established.
     assert!(w.last_error.is_none());
 }

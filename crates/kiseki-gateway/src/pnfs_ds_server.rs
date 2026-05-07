@@ -28,7 +28,7 @@ use crate::nfs4_server::{
     ServerRole, SessionManager,
 };
 use crate::nfs_xdr::{
-    encode_reply_accepted, read_rm_message, write_rm_message, RpcCallHeader, XdrReader, XdrWriter,
+    encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter,
 };
 use crate::ops::{GatewayOps, ReadRequest};
 use crate::pnfs::{FhValidateError, PnfsFhMacKey, PnfsFileHandle};
@@ -114,13 +114,17 @@ struct DsCompoundState {
 /// Generic over the stream type so the same dispatcher serves both
 /// raw `TcpStream` (plaintext fallback) and `rustls::StreamOwned`
 /// (TLS default) per ADR-038 §D4.
-pub fn handle_ds_connection<G: GatewayOps + Send + Sync + 'static, S: io::Read + io::Write>(
+pub async fn handle_ds_connection<G, S>(
     stream: &mut S,
     ctx: &Arc<DsContext<G>>,
     sessions: &SessionManager,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    G: GatewayOps + Send + Sync + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
-        let buf = match read_rm_message(stream) {
+        let buf = match crate::nfs_xdr::read_rm_message_async(stream).await {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
@@ -129,16 +133,15 @@ pub fn handle_ds_connection<G: GatewayOps + Send + Sync + 'static, S: io::Read +
 
         let header = RpcCallHeader::decode(&mut reader)?;
 
-        // We only accept NFS4_PROGRAM/NFS4_VERSION (4) — same gate as MDS.
         if header.program != 100_003 || header.version != 4 {
             let mut w = XdrWriter::new();
             encode_reply_accepted(&mut w, header.xid, 1); // PROG_MISMATCH
-            write_rm_message(stream, &w.into_bytes())?;
+            crate::nfs_xdr::write_rm_message_async(stream, &w.into_bytes()).await?;
             continue;
         }
 
-        let reply = dispatch_ds_compound(&header, &mut reader, ctx, sessions);
-        write_rm_message(stream, &reply)?;
+        let reply = dispatch_ds_compound(&header, &mut reader, ctx, sessions).await;
+        crate::nfs_xdr::write_rm_message_async(stream, &reply).await?;
     }
 }
 
@@ -148,7 +151,7 @@ pub fn handle_ds_connection<G: GatewayOps + Send + Sync + 'static, S: io::Read +
 ///
 /// Spec: ADR-038 §D2 (DS listener), §D4.1 (TLS default), I-PN7
 /// (op-subset enforced inside `dispatch_ds_compound`).
-pub fn run_ds_server<G: GatewayOps + Send + Sync + 'static>(
+pub async fn run_ds_server<G: GatewayOps + Send + Sync + 'static>(
     addr: SocketAddr,
     ctx: Arc<DsContext<G>>,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -161,13 +164,13 @@ pub fn run_ds_server<G: GatewayOps + Send + Sync + 'static>(
             return;
         }
     };
-    serve_ds_listener(listener, ctx, shutdown, tls);
+    serve_ds_listener(listener, ctx, shutdown, tls).await;
 }
 
 /// Run a DS server on an already-bound listener — useful for tests
-/// that pre-bind on `127.0.0.1:0`.
+/// that pre-bind on `127.0.0.1:0`. Async-native.
 #[allow(clippy::needless_pass_by_value)]
-pub fn serve_ds_listener<G: GatewayOps + Send + Sync + 'static>(
+pub async fn serve_ds_listener<G: GatewayOps + Send + Sync + 'static>(
     listener: TcpListener,
     ctx: Arc<DsContext<G>>,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -177,6 +180,13 @@ pub fn serve_ds_listener<G: GatewayOps + Send + Sync + 'static>(
     if let Ok(addr) = listener.local_addr() {
         tracing::info!(addr = %addr, tls = tls.is_some(), "pNFS DS listening");
     }
+    let listener = match tokio::net::TcpListener::from_std(listener) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = %e, "DS listener: std → tokio conversion failed");
+            return;
+        }
+    };
 
     let sessions = Arc::new(SessionManager::new());
 
@@ -187,52 +197,52 @@ pub fn serve_ds_listener<G: GatewayOps + Send + Sync + 'static>(
                 return;
             }
         }
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                let ctx = Arc::clone(&ctx);
-                let sessions = Arc::clone(&sessions);
-                let tls = tls.clone();
-                thread::spawn(move || {
-                    let _ = stream.set_nonblocking(false);
-                    // Disable Nagle — sub-MSS replies + Linux's 40 ms
-                    // delayed-ACK add 40 ms per RPC. Same fix and
-                    // rationale as the NFSv3/v4 listener in nfs_server.
-                    let _ = stream.set_nodelay(true);
-                    if let Some(tls_cfg) = tls {
-                        match rustls::ServerConnection::new(tls_cfg) {
-                            Ok(conn) => {
-                                let mut tls_stream = rustls::StreamOwned::new(conn, stream);
-                                if let Err(e) =
-                                    handle_ds_connection(&mut tls_stream, &ctx, &sessions)
-                                {
-                                    tracing::debug!(error = %e, peer = %peer, "DS-over-TLS connection ended");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, peer = %peer, "DS TLS server-conn init failed");
-                            }
-                        }
-                    } else {
-                        let mut s = stream;
-                        if let Err(e) = handle_ds_connection(&mut s, &ctx, &sessions) {
-                            tracing::debug!(error = %e, peer = %peer, "DS plaintext connection ended");
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            listener.accept(),
+        )
+        .await;
+        let (stream, peer) = match accepted {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "DS accept error");
+                continue;
+            }
+            Err(_) => continue,
+        };
+
+        let ctx = Arc::clone(&ctx);
+        let sessions = Arc::clone(&sessions);
+        let tls = tls.clone();
+        tokio::spawn(async move {
+            let _ = stream.set_nodelay(true);
+            if let Some(tls_cfg) = tls {
+                let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+                match acceptor.accept(stream).await {
+                    Ok(mut tls_stream) => {
+                        if let Err(e) =
+                            handle_ds_connection(&mut tls_stream, &ctx, &sessions).await
+                        {
+                            tracing::debug!(error = %e, peer = %peer, "DS-over-TLS connection ended");
                         }
                     }
-                });
+                    Err(e) => {
+                        tracing::warn!(error = %e, peer = %peer, "DS TLS handshake failed");
+                    }
+                }
+            } else {
+                let mut s = stream;
+                if let Err(e) = handle_ds_connection(&mut s, &ctx, &sessions).await {
+                    tracing::debug!(error = %e, peer = %peer, "DS plaintext connection ended");
+                }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "DS accept error");
-            }
-        }
+        });
     }
 }
 
 /// Process one COMPOUND request. Pure function — testable without
 /// touching TCP or TLS.
-pub fn dispatch_ds_compound<G: GatewayOps + Send + Sync + 'static>(
+pub async fn dispatch_ds_compound<G: GatewayOps + Send + Sync + 'static>(
     header: &RpcCallHeader,
     reader: &mut XdrReader<'_>,
     ctx: &DsContext<G>,
@@ -251,7 +261,7 @@ pub fn dispatch_ds_compound<G: GatewayOps + Send + Sync + 'static>(
             break;
         };
 
-        let (status, result) = process_ds_op(op_code, reader, ctx, sessions, &mut state);
+        let (status, result) = process_ds_op(op_code, reader, ctx, sessions, &mut state).await;
         op_results.push(result);
 
         if status != nfs4_status::NFS4_OK {
@@ -273,7 +283,7 @@ pub fn dispatch_ds_compound<G: GatewayOps + Send + Sync + 'static>(
     buf
 }
 
-fn process_ds_op<G: GatewayOps + Send + Sync + 'static>(
+async fn process_ds_op<G: GatewayOps + Send + Sync + 'static>(
     op_code: u32,
     reader: &mut XdrReader<'_>,
     ctx: &DsContext<G>,
@@ -281,14 +291,14 @@ fn process_ds_op<G: GatewayOps + Send + Sync + 'static>(
     state: &mut DsCompoundState,
 ) -> (u32, Vec<u8>) {
     match op_code {
-        op::EXCHANGE_ID => op_exchange_id_with_role(reader, sessions, ServerRole::Ds),
-        op::CREATE_SESSION => op_create_session(reader, sessions),
-        op::DESTROY_SESSION => op_destroy_session(reader, sessions),
-        op::SEQUENCE => op_sequence(reader, sessions),
-        op::PUTFH => op_putfh_ds(reader, ctx, state),
-        op::READ => op_read_ds(reader, ctx, state),
-        op::COMMIT => op_commit_ds(reader, state),
-        op::GETATTR => op_getattr_ds(reader, ctx, state),
+        op::EXCHANGE_ID => op_exchange_id_with_role(reader, sessions, ServerRole::Ds).await,
+        op::CREATE_SESSION => op_create_session(reader, sessions).await,
+        op::DESTROY_SESSION => op_destroy_session(reader, sessions).await,
+        op::SEQUENCE => op_sequence(reader, sessions).await,
+        op::PUTFH => op_putfh_ds(reader, ctx, state).await,
+        op::READ => op_read_ds(reader, ctx, state).await,
+        op::COMMIT => op_commit_ds(reader, state).await,
+        op::GETATTR => op_getattr_ds(reader, ctx, state).await,
         // I-PN7: every other op is rejected.
         _ => {
             let mut w = XdrWriter::new();
@@ -299,7 +309,7 @@ fn process_ds_op<G: GatewayOps + Send + Sync + 'static>(
     }
 }
 
-fn op_putfh_ds<G: GatewayOps + Send + Sync + 'static>(
+async fn op_putfh_ds<G: GatewayOps + Send + Sync + 'static>(
     reader: &mut XdrReader<'_>,
     ctx: &DsContext<G>,
     state: &mut DsCompoundState,
@@ -350,7 +360,7 @@ fn op_putfh_ds<G: GatewayOps + Send + Sync + 'static>(
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-fn op_read_ds<G: GatewayOps + Send + Sync + 'static>(
+async fn op_read_ds<G: GatewayOps + Send + Sync + 'static>(
     reader: &mut XdrReader<'_>,
     ctx: &DsContext<G>,
     state: &DsCompoundState,
@@ -410,7 +420,7 @@ fn op_read_ds<G: GatewayOps + Send + Sync + 'static>(
     (status, w.into_bytes())
 }
 
-fn op_commit_ds(_reader: &mut XdrReader<'_>, state: &DsCompoundState) -> (u32, Vec<u8>) {
+async fn op_commit_ds(_reader: &mut XdrReader<'_>, state: &DsCompoundState) -> (u32, Vec<u8>) {
     // Reads don't need COMMIT; for read-only DS in Phase 15a, COMMIT is
     // a no-op that returns a fixed writeverf. RFC 8435 tightly_coupled
     // mode allows this — durability comes from the underlying Raft log.
@@ -425,7 +435,7 @@ fn op_commit_ds(_reader: &mut XdrReader<'_>, state: &DsCompoundState) -> (u32, V
     (nfs4_status::NFS4_OK, w.into_bytes())
 }
 
-fn op_getattr_ds<G: GatewayOps + Send + Sync + 'static>(
+async fn op_getattr_ds<G: GatewayOps + Send + Sync + 'static>(
     reader: &mut XdrReader<'_>,
     _ctx: &DsContext<G>,
     state: &DsCompoundState,
@@ -526,8 +536,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn allowed_ds_ops_are_exactly_eight() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allowed_ds_ops_are_exactly_eight() {
         // I-PN7 — pin the spec: changes here require an ADR amendment.
         assert_eq!(ALLOWED_DS_OPS.len(), 8);
         let mut sorted: Vec<u32> = ALLOWED_DS_OPS.into();
@@ -547,8 +557,8 @@ mod tests {
         assert_eq!(sorted, expected);
     }
 
-    #[test]
-    fn putfh_with_valid_fh4_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn putfh_with_valid_fh4_succeeds() {
         let (ctx, key) = make_ctx();
         let fh = issue_fh(&key, 5_000, 0);
         let bytes = fh.encode();
@@ -559,13 +569,13 @@ mod tests {
         let inner = buf.into_bytes();
         let mut reader = XdrReader::new(&inner);
 
-        let (status, _) = op_putfh_ds(&mut reader, &ctx, &mut state);
+        let (status, _) = op_putfh_ds(&mut reader, &ctx, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
         assert_eq!(state.current_fh, Some(fh));
     }
 
-    #[test]
-    fn putfh_with_forged_mac_returns_badhandle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn putfh_with_forged_mac_returns_badhandle() {
         let (ctx, _real_key) = make_ctx();
         let other_key = derive_pnfs_fh_mac_key(&[0x99; 32], &[0x88; 16]);
         let fh = issue_fh(&other_key, 5_000, 0);
@@ -577,13 +587,13 @@ mod tests {
         let mut reader = XdrReader::new(&inner);
 
         let mut state = DsCompoundState::default();
-        let (status, _) = op_putfh_ds(&mut reader, &ctx, &mut state);
+        let (status, _) = op_putfh_ds(&mut reader, &ctx, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4ERR_BADHANDLE);
         assert!(state.current_fh.is_none());
     }
 
-    #[test]
-    fn putfh_with_expired_fh4_returns_badhandle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn putfh_with_expired_fh4_returns_badhandle() {
         let (ctx, key) = make_ctx(); // now_ms = 1000
         let fh = issue_fh(&key, 500, 0); // expiry < now → expired
         let bytes = fh.encode();
@@ -594,13 +604,13 @@ mod tests {
         let mut reader = XdrReader::new(&inner);
 
         let mut state = DsCompoundState::default();
-        let (status, _) = op_putfh_ds(&mut reader, &ctx, &mut state);
+        let (status, _) = op_putfh_ds(&mut reader, &ctx, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4ERR_BADHANDLE);
         assert!(state.current_fh.is_none());
     }
 
-    #[test]
-    fn read_without_putfh_returns_nofilehandle() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_without_putfh_returns_nofilehandle() {
         let (ctx, _) = make_ctx();
         let mut buf = XdrWriter::new();
         buf.write_opaque_fixed(&[0u8; 16]); // stateid
@@ -610,14 +620,14 @@ mod tests {
         let mut reader = XdrReader::new(&inner);
 
         let state = DsCompoundState::default();
-        let (status, _) = op_read_ds(&mut reader, &ctx, &state);
+        let (status, _) = op_read_ds(&mut reader, &ctx, &state).await;
         assert_eq!(status, nfs4_status::NFS4ERR_NOFILEHANDLE);
         // No GatewayOps call.
         assert_eq!(ctx.gateway.reads.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn read_with_valid_putfh_invokes_gateway_with_translated_offset() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_with_valid_putfh_invokes_gateway_with_translated_offset() {
         let (ctx, key) = make_ctx();
         let stripe_index = 3u32;
         let fh = issue_fh(&key, 5_000, stripe_index);
@@ -635,7 +645,7 @@ mod tests {
         let inner = buf.into_bytes();
         let mut reader = XdrReader::new(&inner);
 
-        let (status, _) = op_read_ds(&mut reader, &ctx, &state);
+        let (status, _) = op_read_ds(&mut reader, &ctx, &state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
         assert_eq!(ctx.gateway.reads.load(Ordering::SeqCst), 1);
         // Sanity check we'd compute the absolute offset correctly.
@@ -646,8 +656,8 @@ mod tests {
         let _ = state.current_fh.take();
     }
 
-    #[test]
-    fn read_clamps_count_to_stripe_boundary() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_clamps_count_to_stripe_boundary() {
         let (ctx, key) = make_ctx();
         let fh = issue_fh(&key, 5_000, 0);
         let state = DsCompoundState {
@@ -665,7 +675,7 @@ mod tests {
         let inner = buf.into_bytes();
         let mut reader = XdrReader::new(&inner);
 
-        let (status, _) = op_read_ds(&mut reader, &ctx, &state);
+        let (status, _) = op_read_ds(&mut reader, &ctx, &state).await;
         assert_eq!(status, nfs4_status::NFS4_OK);
         assert_eq!(ctx.gateway.reads.load(Ordering::SeqCst), 1);
         // Indirect: TrackingGateway always returns its fixed_response,
@@ -676,8 +686,8 @@ mod tests {
     /// op 59 = ALLOCATE — not in `ALLOWED_DS_OPS`.
     const ALLOCATE_OP: u32 = 59;
 
-    #[test]
-    fn unsupported_op_returns_notsupp_without_state_change() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsupported_op_returns_notsupp_without_state_change() {
         let (ctx, _) = make_ctx();
         let session_mgr = SessionManager::new();
         let mut state = DsCompoundState::default();
@@ -691,7 +701,7 @@ mod tests {
         let inner = buf.into_bytes();
         let mut reader = XdrReader::new(&inner);
 
-        let (status, _) = process_ds_op(ALLOCATE_OP, &mut reader, &ctx, &session_mgr, &mut state);
+        let (status, _) = process_ds_op(ALLOCATE_OP, &mut reader, &ctx, &session_mgr, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4ERR_NOTSUPP);
         assert!(state.current_fh.is_none());
     }

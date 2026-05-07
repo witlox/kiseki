@@ -63,8 +63,8 @@ use kiseki_gateway::nfs_security::{
 // All RFC 9289 §3 / ADR-038 §D4 tests below invoke this real
 // production function.
 
-#[test]
-fn s3_default_posture_is_tls_when_bundle_present() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_default_posture_is_tls_when_bundle_present() {
     // ADR-038 §D4.1 / RFC 9289 §3: defaults yield TLS posture.
     let security = evaluate(false, false, true, 300, 1).expect("default");
     assert_eq!(security.mode, NfsTransport::Tls);
@@ -76,8 +76,8 @@ fn s3_default_posture_is_tls_when_bundle_present() {
     assert_eq!(security.effective_layout_ttl_seconds, 300);
 }
 
-#[test]
-fn s3_no_tls_bundle_refuses_to_start() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_no_tls_bundle_refuses_to_start() {
     // RFC 9289 §3: a server without a TLS bundle and without the
     // explicit plaintext opt-in MUST refuse to start cleanly — kiseki
     // returns NfsSecurityError::TlsBundleMissing rather than
@@ -94,8 +94,8 @@ fn s3_no_tls_bundle_refuses_to_start() {
 // negotiates the cipher suites and certs only; the NFS RPC framing
 // rides on top of TLS records as it would on top of plain TCP.
 
-#[test]
-fn s3_2_no_alpn_for_nfs_over_tls() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_2_no_alpn_for_nfs_over_tls() {
     use rcgen::{CertificateParams, KeyPair};
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -150,8 +150,8 @@ fn s3_2_no_alpn_for_nfs_over_tls() {
 // §4 — Keep-alive cadence
 // ===========================================================================
 
-#[test]
-fn s4_2_keepalive_cadence_is_60_seconds() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s4_2_keepalive_cadence_is_60_seconds() {
     // RFC 9289 §4.2: 60-second cadence in the absence of other traffic.
     // Production constant lives in `nfs_server.rs::enable_tcp_keepalive`;
     // the kernel handles the idle-reset semantic via SO_KEEPALIVE.
@@ -166,8 +166,8 @@ fn s4_2_keepalive_cadence_is_60_seconds() {
 // §5 — Plaintext fallback gate (ADR-038 §D4.2)
 // ===========================================================================
 
-#[test]
-fn s5_plaintext_fallback_requires_two_flag_opt_in() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_plaintext_fallback_requires_two_flag_opt_in() {
     // ADR-038 §D4.2: BOTH flags (`allow_plaintext_nfs=true` AND
     // `KISEKI_INSECURE_NFS=true`) required. Single-flag attempts must
     // refuse to start. We exercise the production gate directly.
@@ -195,8 +195,8 @@ fn s5_plaintext_fallback_requires_two_flag_opt_in() {
     );
 }
 
-#[test]
-fn s5_plaintext_fallback_emits_audit_event_on_every_boot() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_plaintext_fallback_emits_audit_event_on_every_boot() {
     // ADR-038 §D4.2 step 2: every boot in plaintext mode produces
     // a SecurityDowngradeEnabled audit event. The gate function
     // returns `audit_event: Some(...)` so the boot loop emits it
@@ -211,8 +211,8 @@ fn s5_plaintext_fallback_emits_audit_event_on_every_boot() {
     assert!(s.emit_warn_banner);
 }
 
-#[test]
-fn s5_plaintext_fallback_halves_layout_ttl_to_60s() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_plaintext_fallback_halves_layout_ttl_to_60s() {
     // ADR-038 §D4.2 step 3: when plaintext is active, the layout TTL
     // is halved from default → 60s to compensate for the larger
     // fh4-replay window. Production gate enforces this regardless of
@@ -227,8 +227,8 @@ fn s5_plaintext_fallback_halves_layout_ttl_to_60s() {
     }
 }
 
-#[test]
-fn s5_plaintext_warn_banner_is_canonical() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_plaintext_warn_banner_is_canonical() {
     // ADR-038 §D4.2 — pin the WARN banner text byte-for-byte. A
     // future rewording is a deliberate operator-facing change.
     assert!(
@@ -241,8 +241,8 @@ fn s5_plaintext_warn_banner_is_canonical() {
     );
 }
 
-#[test]
-fn s5_multi_tenant_plaintext_is_refused() {
+#[tokio::test(flavor = "multi_thread")]
+async fn s5_multi_tenant_plaintext_is_refused() {
     // ADR-038 §D4.2 — even with both flags, plaintext is refused on
     // a listener with >1 tenant (data-attribution risk grows with
     // tenant count). Production gate enforces.
@@ -265,8 +265,8 @@ fn s5_multi_tenant_plaintext_is_refused() {
 /// `0x17`. Handshake = `0x16`. Alert = `0x15`. Pin against rustls's
 /// canonical enum so a rustls upgrade that renames or renumbers a
 /// variant is a visible failure.
-#[test]
-fn rfc_seed_tls_record_content_types_match_rustls() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rfc_seed_tls_record_content_types_match_rustls() {
     use rustls::ContentType;
     // Discriminant values are part of the wire ABI per RFC 8446 §5.1.
     assert_eq!(u8::from(ContentType::Handshake), 0x16);
