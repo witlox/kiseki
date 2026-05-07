@@ -144,10 +144,11 @@ struct RunArgs {
 
     /// ADR-042 native binding. Only meaningful for
     /// `--protocol native`; ignored for other protocols. Defaults
-    /// to `grpc` to match historical kiseki-profile behavior;
-    /// `--binding tcp` drives the TCP-framed-postcard binding for
-    /// per-binding throughput comparison.
-    #[arg(long, value_enum, default_value_t = NativeBinding::Grpc)]
+    /// to `tcp` (TCP-framed-postcard, ADR-042 §2.2) — measured
+    /// 36 k PUT / 78 k GET single-host vs gRPC's 21 k / 27 k. Pass
+    /// `--binding grpc` to drive the gRPC binding for per-binding
+    /// comparison, or `--binding auto` to honor `KISEKI_NATIVE_TRANSPORT`.
+    #[arg(long, value_enum, default_value_t = NativeBinding::Tcp)]
     binding: NativeBinding,
 }
 

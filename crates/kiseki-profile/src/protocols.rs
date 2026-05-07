@@ -79,17 +79,18 @@ pub async fn build(
         Protocol::Native => {
             let s = server.ok_or("Native driver requires --server-bin")?;
             // ADR-042 §16.1 phase 7: per-binding driver. `auto`
-            // resolves to gRPC for now (the historical default);
-            // when the client-side selector lands TopologyCache
+            // resolves to TCP-framed (the new default after Phase 8
+            // measurement showed +70 % PUT / +183 % GET vs gRPC).
+            // When the client-side selector lands TopologyCache
             // integration this branch consults it.
             match binding {
-                NativeBinding::Grpc | NativeBinding::Auto => {
-                    let addr = format!("127.0.0.1:{}", s.ports.grpc_data);
-                    Ok(Arc::new(NativeDriver::new(&addr).await?))
-                }
-                NativeBinding::Tcp => {
+                NativeBinding::Tcp | NativeBinding::Auto => {
                     let addr = format!("127.0.0.1:{}", s.ports.tcp_framed);
                     Ok(Arc::new(TcpFramedNativeDriver::new(&addr, pool_size).await?))
+                }
+                NativeBinding::Grpc => {
+                    let addr = format!("127.0.0.1:{}", s.ports.grpc_data);
+                    Ok(Arc::new(NativeDriver::new(&addr).await?))
                 }
             }
         }
