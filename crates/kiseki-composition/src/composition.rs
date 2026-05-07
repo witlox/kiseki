@@ -409,7 +409,31 @@ pub trait CompositionOps {
 /// replaced with `Arc<CompositionStore>` — the lock convoy that
 /// regressed PUT throughput at concurrency ≥ 8 is gone.
 pub struct CompositionStore {
-    storage: parking_lot::Mutex<Box<dyn crate::persistent::CompositionStorage>>,
+    /// Storage backend behind a Box for trait-object polymorphism.
+    /// `CompositionStorage`'s methods all take `&self` (fjall's
+    /// internal journal-mutex serialises commits; the in-memory
+    /// backend uses interior mutability) so concurrent writers
+    /// don't serialise on an outer Mutex. Cross-call atomicity for
+    /// `name_lookup` + `put_with_name` is preserved via per-name
+    /// shard locks (`name_locks`) rather than a single store-wide
+    /// lock — concurrent PUTs to *different* names parallelise;
+    /// concurrent PUTs to the *same* name still serialise to keep
+    /// `If-None-Match: *` race-free.
+    storage: Box<dyn crate::persistent::CompositionStorage>,
+    /// Per-`(ns, name)` shard locks for the create-with-name +
+    /// conditional-check critical section. 256 shards is enough for
+    /// realistic key distributions; fewer would cause coincidental
+    /// contention, more would waste memory with no practical
+    /// benefit.
+    name_locks: Box<[parking_lot::Mutex<()>; NAME_LOCK_SHARDS]>,
+    /// Per-`composition_id` shard locks for read-modify-write
+    /// methods (`update`, `delete`, `rename`, `set_content_type`,
+    /// `update_at`, `delete_at`). Without these, two concurrent
+    /// updates to the same composition could both read v=1, both
+    /// write v=2, and one update would silently disappear.
+    /// Different `composition_id`s hash to different shards →
+    /// concurrent updates to *distinct* compositions parallelise.
+    id_locks: Box<[parking_lot::Mutex<()>; ID_LOCK_SHARDS]>,
     namespaces: parking_lot::RwLock<HashMap<NamespaceId, Namespace>>,
     multiparts: parking_lot::Mutex<HashMap<String, (MultipartUpload, NamespaceId)>>,
     log: parking_lot::RwLock<Option<Arc<dyn LogOps + Send + Sync>>>,
@@ -432,6 +456,31 @@ pub struct CompositionStore {
     /// after a mutation either misses the cache (re-fetches from
     /// storage) or hits a fresh post-mutation entry.
     read_cache: parking_lot::Mutex<LruCache<CompositionId, Composition>>,
+}
+
+/// Number of shards in the per-name lock array. 256 keeps the
+/// shard-collision probability low for realistic key distributions
+/// while costing only 256 × 8 bytes (parking_lot::Mutex word size).
+pub const NAME_LOCK_SHARDS: usize = 256;
+
+/// Number of shards in the per-id lock array. Same sizing rationale
+/// as `NAME_LOCK_SHARDS` — 256 buckets, ~few KiB total.
+pub const ID_LOCK_SHARDS: usize = 256;
+
+fn name_shard(ns: NamespaceId, name: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ns.0.hash(&mut h);
+    name.hash(&mut h);
+    (h.finish() as usize) % NAME_LOCK_SHARDS
+}
+
+fn id_shard(id: CompositionId) -> usize {
+    // UUID bytes are already random — fold the high bytes into a
+    // shard index without invoking SipHash for a 1-byte modulo.
+    let bytes = id.0.as_bytes();
+    let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    (n as usize) % ID_LOCK_SHARDS
 }
 
 /// Default composition read-cache capacity (entries). Each entry is
@@ -461,8 +510,18 @@ impl CompositionStore {
     /// (e.g. `FjallStorage` for multi-node deployments).
     #[must_use]
     pub fn with_storage(storage: Box<dyn crate::persistent::CompositionStorage>) -> Self {
+        // Box the arrays to keep CompositionStore's stack footprint
+        // small. parking_lot::Mutex<()> is one word per shard.
+        let name_locks: Box<[parking_lot::Mutex<()>; NAME_LOCK_SHARDS]> = Box::new(
+            std::array::from_fn(|_| parking_lot::Mutex::new(())),
+        );
+        let id_locks: Box<[parking_lot::Mutex<()>; ID_LOCK_SHARDS]> = Box::new(
+            std::array::from_fn(|_| parking_lot::Mutex::new(())),
+        );
         Self {
-            storage: parking_lot::Mutex::new(storage),
+            storage,
+            name_locks,
+            id_locks,
             namespaces: parking_lot::RwLock::new(HashMap::new()),
             multiparts: parking_lot::Mutex::new(HashMap::new()),
             log: parking_lot::RwLock::new(None),
@@ -489,16 +548,19 @@ impl CompositionStore {
         self.read_cache.lock().pop(&id);
     }
 
-    /// Run a closure with the storage backend held under the
-    /// per-store storage `Mutex`. The hydrator uses this for
-    /// `apply_hydration_batch` (the only caller that needs typed
-    /// access to the storage handle).
+    /// Run a closure with direct access to the storage backend.
+    /// Trait methods all take `&self` (post-Mutex-removal refactor)
+    /// so the closure has lock-free access; concurrent writers in
+    /// other CompositionStore methods are serialized only by their
+    /// per-name / per-id shard locks where atomicity is required.
+    /// The hydrator uses this for `apply_hydration_batch` (still
+    /// the only caller that needs typed access to the storage
+    /// handle).
     pub fn with_storage_locked<R>(
         &self,
-        f: impl FnOnce(&mut dyn crate::persistent::CompositionStorage) -> R,
+        f: impl FnOnce(&dyn crate::persistent::CompositionStorage) -> R,
     ) -> R {
-        let mut guard = self.storage.lock();
-        f(&mut **guard)
+        f(&*self.storage)
     }
 
     /// Attach a log store for delta emission. `&self` so callers can
@@ -556,7 +618,7 @@ impl CompositionStore {
     /// Returns `CompositionError::Storage` if the storage backend
     /// fails (rare; only persistent backends fail this).
     pub fn count(&self) -> Result<u64, CompositionError> {
-        Ok(self.storage.lock().count()?)
+        Ok(self.storage.count()?)
     }
 
     /// List all compositions in a namespace. Returns owned
@@ -570,7 +632,7 @@ impl CompositionStore {
         &self,
         ns_id: NamespaceId,
     ) -> Result<Vec<Composition>, CompositionError> {
-        Ok(self.storage.lock().list_in_namespace(ns_id)?)
+        Ok(self.storage.list_in_namespace(ns_id)?)
     }
 
     /// Attach a Content-Type to an existing composition (RFC 6838
@@ -588,12 +650,13 @@ impl CompositionStore {
         id: CompositionId,
         content_type: Option<String>,
     ) -> Result<(), CompositionError> {
-        let mut storage = self.storage.lock();
-        let mut comp = storage
+        let _g = self.id_locks[id_shard(id)].lock();
+        let mut comp = self
+            .storage
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.content_type = content_type;
-        storage.put(comp)?;
+        self.storage.put(comp)?;
         self.read_cache.lock().pop(&id);
         Ok(())
     }
@@ -628,8 +691,8 @@ impl CompositionStore {
             .get(&namespace_id)
             .map(|ns| (ns.tenant_id, ns.shard_id))
             .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
-        let mut storage = self.storage.lock();
-        if storage.get(comp_id)?.is_some() {
+        let _g = self.id_locks[id_shard(comp_id)].lock();
+        if self.storage.get(comp_id)?.is_some() {
             return Ok(()); // already hydrated — idempotent
         }
         let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
@@ -644,7 +707,7 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
         };
-        storage.put(comp)?;
+        self.storage.put(comp)?;
         Ok(())
     }
 
@@ -665,7 +728,7 @@ impl CompositionStore {
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<Option<CompositionId>, CompositionError> {
-        Ok(self.storage.lock().name_lookup(namespace_id, name)?)
+        Ok(self.storage.name_lookup(namespace_id, name)?)
     }
 
     /// Reverse-lookup: `composition_id` → `(namespace_id, name)` if the
@@ -677,7 +740,7 @@ impl CompositionStore {
         &self,
         id: CompositionId,
     ) -> Result<Option<(NamespaceId, String)>, CompositionError> {
-        Ok(self.storage.lock().name_for(id)?)
+        Ok(self.storage.name_for(id)?)
     }
 
     /// Bind `name` to `id` in `ns`. Overwrites any existing binding;
@@ -691,7 +754,7 @@ impl CompositionStore {
         name: String,
         id: CompositionId,
     ) -> Result<(), CompositionError> {
-        Ok(self.storage.lock().name_insert(namespace_id, name, id)?)
+        Ok(self.storage.name_insert(namespace_id, name, id)?)
     }
 
     /// Atomic create-then-name with an optional S3-style
@@ -758,17 +821,23 @@ impl CompositionStore {
             content_type: None,
         };
 
-        // Single storage-lock acquisition holds across the lookup +
-        // (optional) conditional check + put. No race window — the
-        // cascade decision uses the SAME forward-lookup result the
-        // conditional check evaluated.
-        let mut storage = self.storage.lock();
-        let existing = storage.name_lookup(namespace_id, &name)?;
+        // Per-name shard lock holds across the lookup + (optional)
+        // conditional check + put. Concurrent PUTs to *different*
+        // names hash to different shards and parallelise. PUTs to
+        // the *same* name still serialise on the same shard so
+        // `If-None-Match: *` stays race-free. The previous design
+        // held a store-wide Mutex across the same critical section
+        // → measured 1/25µs ≈ 40k op/s ceiling at c=16 (we were at
+        // ~33k op/s). Per-name sharding lifts the ceiling for
+        // unique-name workloads (NFS, native, FUSE — fresh UUIDs
+        // per PUT).
+        let _g = self.name_locks[name_shard(namespace_id, &name)].lock();
+        let existing = self.storage.name_lookup(namespace_id, &name)?;
         if let Some(cond) = cond {
             cond.check(existing)
                 .map_err(CompositionError::PreconditionFailed)?;
         }
-        storage.put_with_name(comp, namespace_id, name, existing)?;
+        self.storage.put_with_name(comp, namespace_id, name, existing)?;
         Ok(id)
     }
 
@@ -781,7 +850,7 @@ impl CompositionStore {
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<bool, CompositionError> {
-        Ok(self.storage.lock().name_remove(namespace_id, name)?)
+        Ok(self.storage.name_remove(namespace_id, name)?)
     }
 
     /// Enumerate `(name, composition_id)` bindings in a namespace,
@@ -795,7 +864,7 @@ impl CompositionStore {
         namespace_id: NamespaceId,
         prefix: Option<&str>,
     ) -> Result<Vec<(String, CompositionId)>, CompositionError> {
-        Ok(self.storage.lock().name_list(namespace_id, prefix)?)
+        Ok(self.storage.name_list(namespace_id, prefix)?)
     }
 
     /// Return a snapshot of the parts uploaded for a multipart
@@ -835,8 +904,9 @@ impl CompositionStore {
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<(), CompositionError> {
-        let mut storage = self.storage.lock();
-        let mut comp = storage
+        let _g = self.id_locks[id_shard(comp_id)].lock();
+        let mut comp = self
+            .storage
             .get(comp_id)?
             .ok_or(CompositionError::CompositionNotFound(comp_id))?;
         if comp.chunks == chunks && comp.size == size {
@@ -847,7 +917,7 @@ impl CompositionStore {
         comp.version += 1;
         comp.has_inline_data =
             comp.chunks.is_empty() && comp.size > 0 && comp.size <= INLINE_DATA_THRESHOLD;
-        storage.put(comp)?;
+        self.storage.put(comp)?;
         self.read_cache.lock().pop(&comp_id);
         Ok(())
     }
@@ -866,8 +936,8 @@ impl CompositionStore {
     ///
     /// Returns `CompositionError::Storage` on backend failure.
     pub fn delete_at(&self, comp_id: CompositionId) -> Result<(), CompositionError> {
-        let mut storage = self.storage.lock();
-        storage.remove(comp_id)?;
+        let _g = self.id_locks[id_shard(comp_id)].lock();
+        self.storage.remove(comp_id)?;
         self.read_cache.lock().pop(&comp_id);
         Ok(())
     }
@@ -912,7 +982,7 @@ impl CompositionOps for CompositionStore {
             has_inline_data,
             content_type: None,
         };
-        self.storage.lock().put(comp)?;
+        self.storage.put(comp)?;
         Ok(id)
     }
 
@@ -924,19 +994,17 @@ impl CompositionOps for CompositionStore {
         if let Some(hit) = self.read_cache.lock().get(&id).cloned() {
             return Ok(hit);
         }
-        // Miss: take the storage lock, fetch, and insert into the LRU
-        // while the storage lock is still held. This is the
-        // lock-ordering rule that makes the cache safe — see the
-        // comment on `read_cache`. Any mutation that started after
-        // our storage acquire will wait for our release; any mutation
-        // that finished before our acquire has already been observed
-        // by the storage read below.
-        let storage = self.storage.lock();
-        let comp = storage.get(id)?;
+        // Miss: take the per-id shard lock so we don't race with a
+        // concurrent mutation on this same id. The shard lock plays
+        // the same lock-ordering role the old global storage Mutex
+        // did — any mutation that committed before we acquire it is
+        // observable by the storage read below; any mutation
+        // queued after waits.
+        let _g = self.id_locks[id_shard(id)].lock();
+        let comp = self.storage.get(id)?;
         if let Some(ref c) = comp {
             self.read_cache.lock().put(id, c.clone());
         }
-        drop(storage);
         comp.ok_or(CompositionError::CompositionNotFound(id))
     }
 
@@ -946,18 +1014,19 @@ impl CompositionOps for CompositionStore {
         chunks: Vec<ChunkId>,
         size: u64,
     ) -> Result<u64, CompositionError> {
-        let mut storage = self.storage.lock();
-        let mut comp = storage
+        let _g = self.id_locks[id_shard(id)].lock();
+        let mut comp = self
+            .storage
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
         comp.version += 1;
         comp.chunks.clone_from(&chunks);
         comp.size = size;
         let version = comp.version;
-        storage.put(comp)?;
-        // Drop the cache entry before releasing the storage lock so
-        // any concurrent reader that lands between these two
-        // unlocks observes the new value via the storage backend.
+        self.storage.put(comp)?;
+        // Drop the cache entry while still holding the per-id shard
+        // lock so any concurrent reader either sees the new value
+        // via the storage backend or waits on the same shard lock.
         self.read_cache.lock().pop(&id);
         Ok(version)
     }
@@ -969,8 +1038,9 @@ impl CompositionOps for CompositionStore {
                 .get(&ns)
                 .is_some_and(|n| n.versioning_enabled)
         };
-        let mut storage = self.storage.lock();
-        let mut comp = storage
+        let _g = self.id_locks[id_shard(id)].lock();
+        let mut comp = self
+            .storage
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
 
@@ -978,11 +1048,11 @@ impl CompositionOps for CompositionStore {
             // Versioned delete: keep all versions, just bump version as
             // a tombstone marker. Chunk refcounts are NOT decremented.
             comp.version += 1;
-            storage.put(comp)?;
+            self.storage.put(comp)?;
             self.read_cache.lock().pop(&id);
             Ok(DeleteResult::DeleteMarker)
         } else {
-            storage.remove(id)?;
+            self.storage.remove(id)?;
             self.read_cache.lock().pop(&id);
             Ok(DeleteResult::Removed(comp.chunks))
         }
@@ -1000,8 +1070,9 @@ impl CompositionOps for CompositionStore {
             .map(|n| n.shard_id)
             .ok_or(CompositionError::NamespaceNotFound(target_namespace))?;
 
-        let mut storage = self.storage.lock();
-        let mut comp = storage
+        let _g = self.id_locks[id_shard(id)].lock();
+        let mut comp = self
+            .storage
             .get(id)?
             .ok_or(CompositionError::CompositionNotFound(id))?;
 
@@ -1014,7 +1085,7 @@ impl CompositionOps for CompositionStore {
         }
 
         comp.namespace_id = target_namespace;
-        storage.put(comp)?;
+        self.storage.put(comp)?;
         self.read_cache.lock().pop(&id);
         Ok(())
     }

@@ -259,7 +259,7 @@ impl CompositionStorage for FjallStorage {
         Ok(out)
     }
 
-    fn put(&mut self, comp: Composition) -> Result<(), PersistentStoreError> {
+    fn put(&self, comp: Composition) -> Result<(), PersistentStoreError> {
         let bytes = encode_composition(&comp)?;
         self.comps
             .insert(comp.id.0.as_bytes(), bytes.as_slice())
@@ -267,7 +267,7 @@ impl CompositionStorage for FjallStorage {
         self.persist_after_write()
     }
 
-    fn remove(&mut self, id: CompositionId) -> Result<bool, PersistentStoreError> {
+    fn remove(&self, id: CompositionId) -> Result<bool, PersistentStoreError> {
         // Atomic batch: drop the comp row + cascade-drop the name
         // binding so a future PUT-by-name doesn't resolve to a
         // dangling composition_id. Mirrors the redb path.
@@ -347,7 +347,7 @@ impl CompositionStorage for FjallStorage {
     }
 
     fn name_insert(
-        &mut self,
+        &self,
         ns: NamespaceId,
         name: String,
         id: CompositionId,
@@ -389,7 +389,7 @@ impl CompositionStorage for FjallStorage {
     }
 
     fn name_remove(
-        &mut self,
+        &self,
         ns: NamespaceId,
         name: &str,
     ) -> Result<bool, PersistentStoreError> {
@@ -492,7 +492,7 @@ impl CompositionStorage for FjallStorage {
     }
 
     fn apply_hydration_batch(
-        &mut self,
+        &self,
         batch: HydrationBatch,
     ) -> Result<(), PersistentStoreError> {
         // One fjall batch covers every mutation in the hydration
@@ -580,7 +580,7 @@ impl CompositionStorage for FjallStorage {
     }
 
     fn put_with_name(
-        &mut self,
+        &self,
         comp: Composition,
         ns: NamespaceId,
         name: String,

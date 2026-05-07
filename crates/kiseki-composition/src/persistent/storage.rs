@@ -43,10 +43,17 @@ pub trait CompositionStorage: Send + Sync {
     /// Insert or replace a composition. Used by both the gateway
     /// (`create` / `update` / `set_content_type`) and the hydrator
     /// (when applying a single op outside the batch path).
-    fn put(&mut self, comp: Composition) -> Result<(), PersistentStoreError>;
+    ///
+    /// `&self` rather than `&mut self`: persistent backends rely on
+    /// fjall's internal journal-mutex for serialization, and the
+    /// in-memory backend uses interior mutability. This lets
+    /// concurrent writers operate on the store without an outer
+    /// Mutex around the trait object — fjall's per-write-batch
+    /// commit is still atomic.
+    fn put(&self, comp: Composition) -> Result<(), PersistentStoreError>;
 
     /// Remove a composition. Returns `true` if it existed.
-    fn remove(&mut self, id: CompositionId) -> Result<bool, PersistentStoreError>;
+    fn remove(&self, id: CompositionId) -> Result<bool, PersistentStoreError>;
 
     // -- Name index (per-bucket key → composition_id, S3 semantics) --
     //
@@ -79,7 +86,7 @@ pub trait CompositionStorage: Send + Sync {
     /// having checked conditional headers like `If-None-Match: *`
     /// before calling this).
     fn name_insert(
-        &mut self,
+        &self,
         ns: NamespaceId,
         name: String,
         id: CompositionId,
@@ -128,7 +135,7 @@ pub trait CompositionStorage: Send + Sync {
     /// not worth bypassing). Persistent backends override to fold
     /// both into one batch and consume `prior_id`.
     fn put_with_name(
-        &mut self,
+        &self,
         comp: Composition,
         ns: NamespaceId,
         name: String,
@@ -140,7 +147,7 @@ pub trait CompositionStorage: Send + Sync {
     }
 
     /// Unbind `name` in `ns`. Returns `true` if a binding existed.
-    fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError>;
+    fn name_remove(&self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError>;
 
     /// Enumerate `(name, composition_id)` bindings in a namespace.
     /// `prefix` filters by string prefix when `Some` (S3 LIST with
@@ -174,7 +181,7 @@ pub trait CompositionStorage: Send + Sync {
     /// Apply a hydrator batch atomically. The persistent backend
     /// commits all inserts + removes + meta updates in a single
     /// atomic batch (I-CP1).
-    fn apply_hydration_batch(&mut self, batch: HydrationBatch) -> Result<(), PersistentStoreError>;
+    fn apply_hydration_batch(&self, batch: HydrationBatch) -> Result<(), PersistentStoreError>;
 }
 
 /// One hydrator-poll's worth of state changes. Applied atomically by
@@ -241,22 +248,36 @@ impl HydrationBatch {
 // ---------------------------------------------------------------------------
 
 /// In-memory `CompositionStorage` for tests and single-node clusters.
-#[derive(Debug)]
+///
+/// All fields use interior mutability so the `CompositionStorage`
+/// trait can take `&self` on writes (the persistent fjall backend
+/// natively supports `&self` thanks to fjall's internal journal
+/// mutex; the in-memory backend mirrors that contract via
+/// `parking_lot::Mutex` here).
 pub struct MemoryStorage {
-    compositions: HashMap<CompositionId, Composition>,
+    compositions: parking_lot::Mutex<HashMap<CompositionId, Composition>>,
     /// Name index forward: (`namespace_id`, name) → `composition_id`.
     /// Maintained alongside the composition table; persisted as part
     /// of `apply_hydration_batch` on the leader and updated atomically
     /// with the underlying composition mutations on followers via
     /// `name_inserts` / `name_removes`.
-    names: HashMap<(NamespaceId, String), CompositionId>,
+    names: parking_lot::Mutex<HashMap<(NamespaceId, String), CompositionId>>,
     /// Name index reverse: `composition_id` → (`namespace_id`, name). Used
     /// by Delete deltas to find what to unbind. A composition without
     /// a name (NFS path, internal use) has no entry here.
-    names_reverse: HashMap<CompositionId, (NamespaceId, String)>,
-    last_applied_seq: SequenceNumber,
-    stuck_state: Option<(SequenceNumber, u32)>,
-    halted: bool,
+    names_reverse: parking_lot::Mutex<HashMap<CompositionId, (NamespaceId, String)>>,
+    last_applied_seq: parking_lot::Mutex<SequenceNumber>,
+    stuck_state: parking_lot::Mutex<Option<(SequenceNumber, u32)>>,
+    halted: parking_lot::Mutex<bool>,
+}
+
+impl std::fmt::Debug for MemoryStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryStorage")
+            .field("compositions_len", &self.compositions.lock().len())
+            .field("names_len", &self.names.lock().len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryStorage {
@@ -264,12 +285,12 @@ impl MemoryStorage {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            compositions: HashMap::new(),
-            names: HashMap::new(),
-            names_reverse: HashMap::new(),
-            last_applied_seq: SequenceNumber(0),
-            stuck_state: None,
-            halted: false,
+            compositions: parking_lot::Mutex::new(HashMap::new()),
+            names: parking_lot::Mutex::new(HashMap::new()),
+            names_reverse: parking_lot::Mutex::new(HashMap::new()),
+            last_applied_seq: parking_lot::Mutex::new(SequenceNumber(0)),
+            stuck_state: parking_lot::Mutex::new(None),
+            halted: parking_lot::Mutex::new(false),
         }
     }
 }
@@ -282,35 +303,36 @@ impl Default for MemoryStorage {
 
 impl CompositionStorage for MemoryStorage {
     fn get(&self, id: CompositionId) -> Result<Option<Composition>, PersistentStoreError> {
-        Ok(self.compositions.get(&id).cloned())
+        Ok(self.compositions.lock().get(&id).cloned())
     }
 
     fn count(&self) -> Result<u64, PersistentStoreError> {
-        Ok(self.compositions.len() as u64)
+        Ok(self.compositions.lock().len() as u64)
     }
 
     fn list_in_namespace(&self, ns: NamespaceId) -> Result<Vec<Composition>, PersistentStoreError> {
         Ok(self
             .compositions
+            .lock()
             .values()
             .filter(|c| c.namespace_id == ns)
             .cloned()
             .collect())
     }
 
-    fn put(&mut self, comp: Composition) -> Result<(), PersistentStoreError> {
-        self.compositions.insert(comp.id, comp);
+    fn put(&self, comp: Composition) -> Result<(), PersistentStoreError> {
+        self.compositions.lock().insert(comp.id, comp);
         Ok(())
     }
 
-    fn remove(&mut self, id: CompositionId) -> Result<bool, PersistentStoreError> {
+    fn remove(&self, id: CompositionId) -> Result<bool, PersistentStoreError> {
         // Drop the name binding when the composition goes away —
         // otherwise a future PUT to the same key would resolve to a
         // dangling composition_id. The reverse map stays consistent.
-        if let Some((ns, name)) = self.names_reverse.remove(&id) {
-            self.names.remove(&(ns, name));
+        if let Some((ns, name)) = self.names_reverse.lock().remove(&id) {
+            self.names.lock().remove(&(ns, name));
         }
-        Ok(self.compositions.remove(&id).is_some())
+        Ok(self.compositions.lock().remove(&id).is_some())
     }
 
     fn name_lookup(
@@ -318,18 +340,18 @@ impl CompositionStorage for MemoryStorage {
         ns: NamespaceId,
         name: &str,
     ) -> Result<Option<CompositionId>, PersistentStoreError> {
-        Ok(self.names.get(&(ns, name.to_owned())).copied())
+        Ok(self.names.lock().get(&(ns, name.to_owned())).copied())
     }
 
     fn name_for(
         &self,
         id: CompositionId,
     ) -> Result<Option<(NamespaceId, String)>, PersistentStoreError> {
-        Ok(self.names_reverse.get(&id).cloned())
+        Ok(self.names_reverse.lock().get(&id).cloned())
     }
 
     fn name_insert(
-        &mut self,
+        &self,
         ns: NamespaceId,
         name: String,
         id: CompositionId,
@@ -338,25 +360,29 @@ impl CompositionStorage for MemoryStorage {
         // composition, drop the old reverse entry. If id already has a
         // name, drop its old forward entry. Caller is responsible for
         // pre-flight conditional checks (If-None-Match etc.).
-        if let Some(old_id) = self.names.get(&(ns, name.clone())).copied() {
+        let mut names = self.names.lock();
+        let mut names_reverse = self.names_reverse.lock();
+        if let Some(old_id) = names.get(&(ns, name.clone())).copied() {
             if old_id != id {
-                self.names_reverse.remove(&old_id);
+                names_reverse.remove(&old_id);
             }
         }
-        if let Some((old_ns, old_name)) = self.names_reverse.get(&id).cloned() {
+        if let Some((old_ns, old_name)) = names_reverse.get(&id).cloned() {
             if old_ns != ns || old_name != name {
-                self.names.remove(&(old_ns, old_name));
+                names.remove(&(old_ns, old_name));
             }
         }
-        self.names.insert((ns, name.clone()), id);
-        self.names_reverse.insert(id, (ns, name));
+        names.insert((ns, name.clone()), id);
+        names_reverse.insert(id, (ns, name));
         Ok(())
     }
 
-    fn name_remove(&mut self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
+    fn name_remove(&self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
         let key = (ns, name.to_owned());
-        if let Some(id) = self.names.remove(&key) {
-            self.names_reverse.remove(&id);
+        let mut names = self.names.lock();
+        let mut names_reverse = self.names_reverse.lock();
+        if let Some(id) = names.remove(&key) {
+            names_reverse.remove(&id);
             Ok(true)
         } else {
             Ok(false)
@@ -370,6 +396,7 @@ impl CompositionStorage for MemoryStorage {
     ) -> Result<Vec<(String, CompositionId)>, PersistentStoreError> {
         let mut out: Vec<(String, CompositionId)> = self
             .names
+            .lock()
             .iter()
             .filter(|((n, name), _)| *n == ns && prefix.is_none_or(|p| name.starts_with(p)))
             .map(|((_, name), id)| (name.clone(), *id))
@@ -380,58 +407,61 @@ impl CompositionStorage for MemoryStorage {
     }
 
     fn last_applied_seq(&self) -> Result<SequenceNumber, PersistentStoreError> {
-        Ok(self.last_applied_seq)
+        Ok(*self.last_applied_seq.lock())
     }
 
     fn stuck_state(&self) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError> {
-        Ok(self.stuck_state)
+        Ok(*self.stuck_state.lock())
     }
 
     fn halted(&self) -> Result<bool, PersistentStoreError> {
-        Ok(self.halted)
+        Ok(*self.halted.lock())
     }
 
-    fn apply_hydration_batch(&mut self, batch: HydrationBatch) -> Result<(), PersistentStoreError> {
+    fn apply_hydration_batch(&self, batch: HydrationBatch) -> Result<(), PersistentStoreError> {
+        let mut compositions = self.compositions.lock();
+        let mut names = self.names.lock();
+        let mut names_reverse = self.names_reverse.lock();
         for comp in batch.puts {
-            self.compositions.insert(comp.id, comp);
+            compositions.insert(comp.id, comp);
         }
         for id in batch.removes {
             // Drop any name binding for the removed composition first
             // so the forward index can't outlive the data row.
-            if let Some((ns, name)) = self.names_reverse.remove(&id) {
-                self.names.remove(&(ns, name));
+            if let Some((ns, name)) = names_reverse.remove(&id) {
+                names.remove(&(ns, name));
             }
-            self.compositions.remove(&id);
+            compositions.remove(&id);
         }
         for (ns, name, id) in batch.name_inserts {
             // Reuse the same overwrite-replace semantics as
             // `name_insert` so a redo of the same Create delta on a
             // restarted hydrator stays idempotent.
-            if let Some(old_id) = self.names.get(&(ns, name.clone())).copied() {
+            if let Some(old_id) = names.get(&(ns, name.clone())).copied() {
                 if old_id != id {
-                    self.names_reverse.remove(&old_id);
+                    names_reverse.remove(&old_id);
                 }
             }
-            if let Some((old_ns, old_name)) = self.names_reverse.get(&id).cloned() {
+            if let Some((old_ns, old_name)) = names_reverse.get(&id).cloned() {
                 if old_ns != ns || old_name != name {
-                    self.names.remove(&(old_ns, old_name));
+                    names.remove(&(old_ns, old_name));
                 }
             }
-            self.names.insert((ns, name.clone()), id);
-            self.names_reverse.insert(id, (ns, name));
+            names.insert((ns, name.clone()), id);
+            names_reverse.insert(id, (ns, name));
         }
         for (ns, name) in batch.name_removes {
             let key = (ns, name);
-            if let Some(id) = self.names.remove(&key) {
-                self.names_reverse.remove(&id);
+            if let Some(id) = names.remove(&key) {
+                names_reverse.remove(&id);
             }
         }
-        self.last_applied_seq = batch.new_last_applied_seq;
+        *self.last_applied_seq.lock() = batch.new_last_applied_seq;
         if let Some(stuck) = batch.stuck_state {
-            self.stuck_state = stuck;
+            *self.stuck_state.lock() = stuck;
         }
         if let Some(halted) = batch.halted {
-            self.halted = halted;
+            *self.halted.lock() = halted;
         }
         Ok(())
     }
