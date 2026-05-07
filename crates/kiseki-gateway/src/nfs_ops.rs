@@ -177,10 +177,31 @@ impl HandleRegistry {
     }
 }
 
+/// Process-wide override for the runtime NFS handlers `block_on`
+/// against. The kiseki-server runtime sets this to its main tokio
+/// runtime handle BEFORE spawning the NFS listener thread, which
+/// lifts NFS PUT throughput from the dedicated-runtime cap (~6 k
+/// op/s) to native-equivalent levels — every block_gateway call
+/// dispatches the future on a runtime with native's worker count,
+/// not a fresh 2-or-N-worker runtime tucked behind a separate
+/// reactor.
+static EXTERNAL_NFS_RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> =
+    std::sync::OnceLock::new();
+
+/// Install a tokio runtime handle that subsequent `NfsContext`
+/// constructions will block_on against. Idempotent — only the first
+/// call wins (subsequent set attempts are silently ignored). Must
+/// be called before any NFS listener spawns.
+pub fn set_external_nfs_runtime(handle: tokio::runtime::Handle) {
+    let _ = EXTERNAL_NFS_RUNTIME.set(handle);
+}
+
 /// NFS operations context — wraps gateway + handle registry + lock manager.
 ///
 /// Holds a `tokio::runtime::Handle` to bridge sync NFS protocol callbacks
-/// to async `GatewayOps` methods via `block_on`.
+/// to async `GatewayOps` methods via `block_on`. Configured once via
+/// [`set_external_nfs_runtime`]; otherwise a dedicated runtime is spawned
+/// (the test path — cucumber would panic on a nested block_on).
 pub struct NfsContext<G: GatewayOps> {
     pub gateway: NfsGateway<G>,
     pub handles: HandleRegistry,
@@ -238,23 +259,37 @@ impl<G: GatewayOps> NfsContext<G> {
         // Register root handle.
         handles.root_handle(namespace_id, tenant_id);
 
-        // Always create a dedicated runtime for NFS — never reuse the
-        // caller's runtime. NFS methods use block_on() which panics if
-        // called from within the same runtime (e.g., in tests running
-        // under cucumber's async runtime).
-        let rt = std::thread::spawn(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .thread_name("nfs-rt")
-                .build()
-                .expect("failed to create NFS tokio runtime");
-            let handle = runtime.handle().clone();
-            std::mem::forget(runtime);
-            handle
-        })
-        .join()
-        .expect("NFS runtime thread panicked");
+        // Reuse the caller-provided tokio runtime if one was set via
+        // `set_external_runtime` BEFORE this point. Otherwise spawn
+        // a dedicated NFS runtime (the test path — cucumber's async
+        // runtime would panic if we tried to nest block_on against
+        // it). Production servers wire their main runtime in to
+        // avoid the dedicated-runtime tax (~6 k op/s cap measured
+        // pre-fix).
+        let rt = EXTERNAL_NFS_RUNTIME.get().cloned().unwrap_or_else(|| {
+            let nfs_workers: usize = std::env::var("KISEKI_NFS_RUNTIME_THREADS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(std::num::NonZeroUsize::get)
+                        .unwrap_or(4)
+                        .max(4)
+                });
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(nfs_workers)
+                    .enable_all()
+                    .thread_name("nfs-rt")
+                    .build()
+                    .expect("failed to create NFS tokio runtime");
+                let handle = runtime.handle().clone();
+                std::mem::forget(runtime);
+                handle
+            })
+            .join()
+            .expect("NFS runtime thread panicked")
+        });
 
         Self {
             gateway,

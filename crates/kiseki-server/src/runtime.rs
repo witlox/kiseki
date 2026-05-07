@@ -1382,6 +1382,13 @@ pub async fn run_main(
         std::net::TcpListener::bind(nfs_addr).map_err(|e| format!("NFS bind {nfs_addr}: {e}"))?;
     let nfs_tls_for_thread = nfs_tls.clone();
     let pnfs_layout_mgr_for_nfs = pnfs_layout_mgr.clone();
+    // Hand the kiseki-server's main tokio runtime handle to the NFS
+    // path so `NfsContext::block_gateway` dispatches against it
+    // instead of spawning a dedicated 2-or-N-worker runtime. Pre-fix
+    // measurement showed NFS PUT capped at ~6 k op/s with the
+    // dedicated runtime; the main runtime has the same parallelism
+    // native uses (no cap from the runtime side).
+    kiseki_gateway::nfs_ops::set_external_nfs_runtime(tokio::runtime::Handle::current());
     std::thread::spawn(move || {
         kiseki_gateway::nfs_server::serve_nfs_listener_with_mgr(
             nfs_listener,
