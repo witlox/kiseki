@@ -65,8 +65,11 @@ NEXTEST_FAST_UNIT_TLS_PEER ?= $(CARGO) nextest run --profile fast -p kiseki-chun
 NEXTEST_FAST_BDD   ?= KISEKI_BDD_FAST=1 $(CARGO) test --locked -p kiseki-acceptance --test acceptance
 # Tier 2 — only the slow-marked unit tests (Tier 1 already ran the
 # fast ones; this fills in the rest). Same TLS-peer split.
-NEXTEST_SLOW_UNIT_MAIN     ?= $(CARGO) nextest run --profile slow --run-ignored=only --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
-NEXTEST_SLOW_UNIT_TLS_PEER ?= $(CARGO) nextest run --profile slow --run-ignored=only -p kiseki-chunk-cluster --locked
+# `--no-tests=warn` because nextest 0.9.x defaults to exit 4 when
+# no tests match the filter, and that's the natural state while
+# the workspace has zero `#[ignore = "slow:…"]` tests.
+NEXTEST_SLOW_UNIT_MAIN     ?= $(CARGO) nextest run --profile slow --run-ignored=only --no-tests=warn --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+NEXTEST_SLOW_UNIT_TLS_PEER ?= $(CARGO) nextest run --profile slow --run-ignored=only --no-tests=warn -p kiseki-chunk-cluster --locked
 # Tier 2 — full BDD (no env var → no @smoke / @slow filtering).
 # Same `cargo test` rationale as Tier 1.
 NEXTEST_SLOW_BDD   ?= $(CARGO) test --locked -p kiseki-acceptance --test acceptance

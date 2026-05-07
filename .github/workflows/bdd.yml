@@ -59,8 +59,11 @@ jobs:
       # `#[ignore = "slow:…"]` unit tests. kiseki-acceptance excluded
       # via the profile's default-filter. Two invocations to dodge
       # the kiseki-chunk-cluster rustls conflict, same as ci.yml.
-      - run: cargo nextest run --profile slow --run-ignored=only --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
-      - run: cargo nextest run --profile slow --run-ignored=only -p kiseki-chunk-cluster --locked
+      # `--no-tests=warn` because nextest 0.9.x defaults to exit 4
+      # when no tests match the filter, and that's the natural state
+      # while the workspace has zero `#[ignore = "slow:…"]` tests.
+      - run: cargo nextest run --profile slow --run-ignored=only --no-tests=warn --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+      - run: cargo nextest run --profile slow --run-ignored=only --no-tests=warn -p kiseki-chunk-cluster --locked
 
   slow-bdd:
     name: Full BDD suite (no @smoke filter)
@@ -71,7 +74,6 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
       - name: Build kiseki-server (release — needed for @slow Raft scenarios)
         run: cargo build --locked --release -p kiseki-server
       - name: Run full BDD suite (slow-tests feature on)
@@ -79,4 +81,8 @@ jobs:
         # @slow + @integration scenarios. `--features slow-tests`
         # toggles a runtime branch that includes Raft-cluster
         # scenarios skipped on macOS by default.
-        run: cargo nextest run --profile bdd --features kiseki-acceptance/slow-tests --locked -p kiseki-acceptance
+        # `cargo test` not `nextest run` — same rationale as
+        # ci.yml's BDD @smoke step: cucumber is `harness = false`
+        # and rejects nextest's `--list --format terse` libtest
+        # probe via cucumber-rs's clap CLI parser.
+        run: cargo test --locked --features kiseki-acceptance/slow-tests -p kiseki-acceptance --test acceptance --release
