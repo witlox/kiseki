@@ -1324,8 +1324,17 @@ impl GatewayOps for InMemoryGateway {
         }
 
         // (B9: dropped "success" debug — phase histograms cover this.)
+        // Common-case fast path: offset == 0 and length covers the
+        // whole plaintext — move the accumulator into the response
+        // instead of slicing-and-copying. Eliminates one full-payload
+        // memcpy per GET on the typical full-object read.
+        let data = if start == 0 && end == plaintext.len() {
+            plaintext
+        } else {
+            plaintext[start..end].to_vec()
+        };
         Ok(ReadResponse {
-            data: plaintext[start..end].to_vec(),
+            data,
             eof,
             content_type,
         })
