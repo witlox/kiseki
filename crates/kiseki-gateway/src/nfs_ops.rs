@@ -300,7 +300,15 @@ impl<G: GatewayOps> NfsContext<G> {
 
     /// Get attributes for a file handle.
     pub async fn getattr(&self, fh: &FileHandle) -> Result<NfsAttrs, GatewayError> {
-        if self.handles.is_root(fh) {
+        // Both `Root` (namespace root, `0xFF` marker) and `Directory`
+        // (mkdir-created subdir, `0xFE` marker) share the same attrs
+        // shape. `is_directory` matches both, so a single early return
+        // covers both cases. Pre-2026-05-07 only `Root` had this
+        // branch; `Directory` fell through into the `Some(comp_id)`
+        // let-else, returned an error, and the dispatcher mapped it
+        // to NFS3ERR_IO — kernel ext4 dentry cache marked the new
+        // entry as `??????????` and `mkdir(1)` returned non-zero.
+        if self.handles.is_directory(fh) {
             return Ok(NfsAttrs {
                 file_type: FileType::Directory,
                 size: 4096,

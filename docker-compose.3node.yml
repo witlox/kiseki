@@ -16,12 +16,18 @@ services:
     ports:
       - "9100:9100"  # data-path gRPC
       - "9101:9101"  # advisory gRPC
+      - "9103:9103"  # native TCP-framed (ADR-042 §2.2)
       - "9000:9000"  # S3
       - "2049:2049"  # NFS
       - "9090:9090"  # Prometheus metrics + admin UI
     environment:
       KISEKI_DATA_ADDR: "0.0.0.0:9100"
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+      # Mirror the GCP setup-raw-storage.sh port plan: 9103 for the
+      # native TCP-framed binding. Default is now 9103 in code, but
+      # setting it explicitly keeps the systemd-style env layout
+      # consistent across compose / GCP / dev.
+      KISEKI_NATIVE_TCP_ADDR: "0.0.0.0:9103"
       KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
       KISEKI_METRICS_ADDR: "0.0.0.0:9090"
@@ -32,6 +38,14 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      # Group-commit knobs — all three required for the GCP-equivalent
+      # write path (see docs/operations/durability.md). Without
+      # KISEKI_RAFT_FLUSH_INTERVAL_MS the PUT path saturates at
+      # ~31 k op/s on Raft fsync. Multi-node Raft re-replicates the
+      # ≤ N ms loss window from peers on restart.
+      KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
+      KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
+      KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node1-data:/data
@@ -54,6 +68,7 @@ services:
     environment:
       KISEKI_DATA_ADDR: "0.0.0.0:9100"
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+      KISEKI_NATIVE_TCP_ADDR: "0.0.0.0:9103"
       KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
       KISEKI_METRICS_ADDR: "0.0.0.0:9090"
@@ -64,6 +79,9 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
+      KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
+      KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node2-data:/data
@@ -86,6 +104,7 @@ services:
     environment:
       KISEKI_DATA_ADDR: "0.0.0.0:9100"
       KISEKI_ADVISORY_ADDR: "0.0.0.0:9101"
+      KISEKI_NATIVE_TCP_ADDR: "0.0.0.0:9103"
       KISEKI_S3_ADDR: "0.0.0.0:9000"
       KISEKI_NFS_ADDR: "0.0.0.0:2049"
       KISEKI_METRICS_ADDR: "0.0.0.0:9090"
@@ -96,6 +115,9 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
+      KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
+      KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node3-data:/data

@@ -1351,6 +1351,24 @@ mod tests {
             looked_attrs.file_type,
             crate::nfs_ops::FileType::Directory,
         ));
+
+        // GETATTR on the new fh must succeed and report Directory.
+        // The first round of the fix only handled `lookup`/`lookup_by_name`
+        // and missed `getattr`, so the kernel's post-MKDIR GETATTR
+        // returned NFS3ERR_IO and the dentry surfaced as `??????????`
+        // in `ls -la` even though the entry was in the parent listing.
+        // The local 3-node compose repro caught it; this test pins
+        // the contract.
+        let attrs = ctx
+            .getattr(&fh)
+            .await
+            .expect("getattr on dir fh must succeed");
+        assert!(matches!(
+            attrs.file_type,
+            crate::nfs_ops::FileType::Directory,
+        ));
+        assert_eq!(attrs.mode, 0o755);
+        assert_eq!(attrs.nlink, 2);
     }
 
     // ---------- Wrong program number ----------
