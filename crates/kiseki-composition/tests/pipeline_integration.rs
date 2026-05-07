@@ -45,7 +45,7 @@ fn setup() -> (Arc<MemShardStore>, CompositionStore, ViewStore) {
 
     let compositions =
         CompositionStore::new().with_log(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
-    let mut comp_store = compositions;
+    let comp_store = compositions;
     comp_store.add_namespace(Namespace {
         id: test_namespace(),
         tenant_id: test_tenant(),
@@ -73,7 +73,7 @@ fn setup() -> (Arc<MemShardStore>, CompositionStore, ViewStore) {
 
 #[test]
 fn create_composition_stores_in_memory() {
-    let (_log, mut comp, _views) = setup();
+    let (_log, comp, _views) = setup();
 
     // Create a composition — sync, no log emission.
     let comp_id = comp
@@ -91,7 +91,7 @@ fn create_composition_stores_in_memory() {
 async fn composition_does_not_emit_deltas_to_log() {
     // Composition is now sync — it does NOT write to the log.
     // Log emission is the gateway's responsibility.
-    let (log, mut comp, _views) = setup();
+    let (log, comp, _views) = setup();
 
     let _comp_id = comp
         .create(test_namespace(), vec![ChunkId([0x01; 32])], 1024)
@@ -112,7 +112,7 @@ async fn composition_does_not_emit_deltas_to_log() {
 
 #[test]
 fn update_and_delete_operate_on_in_memory_store() {
-    let (_log, mut comp, _views) = setup();
+    let (_log, comp, _views) = setup();
 
     let comp_id = comp
         .create(test_namespace(), vec![ChunkId([0x01; 32])], 100)
@@ -132,7 +132,7 @@ fn update_and_delete_operate_on_in_memory_store() {
 async fn stream_processor_does_not_advance_without_gateway_deltas() {
     // Without the gateway emitting deltas, the log stays empty and the
     // stream processor has nothing to consume.
-    let (log, mut comp, mut views) = setup();
+    let (log, comp, mut views) = setup();
 
     for i in 0u8..3 {
         comp.create(test_namespace(), vec![ChunkId([i; 32])], u64::from(i) * 100)
@@ -159,7 +159,7 @@ async fn stream_processor_does_not_advance_without_gateway_deltas() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_processor_is_idempotent_on_empty_log() {
-    let (log, mut comp, mut views) = setup();
+    let (log, comp, mut views) = setup();
 
     comp.create(test_namespace(), vec![ChunkId([0x01; 32])], 100)
         .unwrap();
@@ -176,7 +176,7 @@ async fn stream_processor_is_idempotent_on_empty_log() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn composition_store_crud_independent_of_log() {
-    let (log, mut comp, _views) = setup();
+    let (log, comp, _views) = setup();
 
     // Write through composition store.
     let comp_id = comp

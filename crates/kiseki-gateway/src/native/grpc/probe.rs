@@ -87,7 +87,9 @@ mod tests {
                 assert_eq!(latency_class, LatencyClass::Standard);
                 assert_eq!(addr, ListenAddr::HostPort("0.0.0.0:9100".into()));
             }
-            other => panic!("expected Available, got: {other:?}"),
+            ProbeOutcome::Unavailable { reason } => {
+                panic!("expected Available, got Unavailable: {reason}");
+            }
         }
     }
 
@@ -101,7 +103,14 @@ mod tests {
                     "reason: {reason}",
                 );
             }
-            other => panic!("expected Unavailable, got: {other:?}"),
+            ProbeOutcome::Available {
+                latency_class,
+                addr,
+            } => {
+                panic!(
+                    "expected Unavailable, got Available: latency={latency_class:?} addr={addr:?}"
+                );
+            }
         }
     }
 

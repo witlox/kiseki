@@ -203,7 +203,7 @@ fn test_namespace() -> NamespaceId {
 }
 
 fn make_ctx() -> NfsContext<InMemoryGateway> {
-    let mut compositions = CompositionStore::new();
+    let compositions = CompositionStore::new();
     compositions.add_namespace(Namespace {
         id: test_namespace(),
         tenant_id: test_tenant(),

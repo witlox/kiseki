@@ -100,6 +100,12 @@ macro_rules! unary_verb {
 
 /// Dispatch one V3 TCP-framed RPC. Returns `(status, meta, bulk)`.
 /// See module docs for the per-verb logic.
+///
+/// One arm per native verb makes this function long by design;
+/// splitting verbs into helpers would shuffle code without
+/// improving clarity (every helper would need the same `server`,
+/// `principal`, `req_meta`, `req_bulk` hand-off).
+#[allow(clippy::too_many_lines)]
 pub async fn dispatch_verb(
     server: &ServerImpl,
     principal: &dyn RequestPrincipal,
@@ -287,7 +293,7 @@ mod tests {
         }
     }
 
-    /// V3 PUT round-trip via dispatch: meta carries a PutObjectRequest
+    /// V3 PUT round-trip via dispatch: meta carries a `PutObjectRequest`
     /// with empty `data`; the actual bulk rides as `req_bulk`.
     /// Server reassembles, calls handler, returns
     /// (Ok, postcard(PutObjectResponse), empty bulk).
@@ -317,7 +323,7 @@ mod tests {
 
     /// V3 GET round-trip: server splits the response's `data` field
     /// out of the postcard meta and returns it as `bulk_bytes`.
-    /// Client reassembles. The full GetObjectResponse rides the
+    /// Client reassembles. The full `GetObjectResponse` rides the
     /// wire WITHOUT postcard-encoding the bulk bytes themselves.
     #[tokio::test]
     async fn get_object_v3_dispatches_with_bulk_split() {

@@ -13,14 +13,14 @@
 //! meta keys.
 //!
 //! Module layout:
-//!   - `error`    — `PersistentStoreError` (ADR-040 §D8.1)
-//!   - `encoding` — wire format helpers (composition record, name
-//!                   key, stuck-state) shared by every backend
-//!   - `storage`  — `CompositionStorage` trait + `MemoryStorage` impl
-//!   - `fjall`    — `FjallStorage` impl (the write-heavy backend per
-//!                   ADR-022's "migrate to fjall" escape clause —
-//!                   replaced redb 2026-05-06 after measuring the
-//!                   redb commit-cost ceiling at ~18 k op/s)
+//! - `error`    — `PersistentStoreError` (ADR-040 §D8.1)
+//! - `encoding` — wire format helpers (composition record, name
+//!   key, stuck-state) shared by every backend
+//! - `storage`  — `CompositionStorage` trait + `MemoryStorage` impl
+//! - `fjall`    — `FjallStorage` impl (the write-heavy backend per
+//!   ADR-022's "migrate to fjall" escape clause — replaced redb
+//!   2026-05-06 after measuring the redb commit-cost ceiling at
+//!   ~18 k op/s)
 
 pub mod encoding;
 pub mod error;

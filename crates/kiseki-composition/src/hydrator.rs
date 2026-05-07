@@ -289,9 +289,9 @@ impl CompositionHydrator {
                 break;
             }
             let outcome = match delta.header.operation {
-                OperationType::Create => stage_create(&store, &mut staging, delta),
-                OperationType::Update => stage_update(&store, &mut staging, delta),
-                OperationType::Delete => stage_delete(&store, &mut staging, delta),
+                OperationType::Create => stage_create(store, &mut staging, delta),
+                OperationType::Update => stage_update(store, &mut staging, delta),
+                OperationType::Delete => stage_delete(store, &mut staging, delta),
                 OperationType::NamespaceCreate => stage_namespace_create(&mut staging, delta),
                 // Rename, SetAttribute, Finalize aren't installed by
                 // the hydrator. Treat as Applied so the seq advances
@@ -827,7 +827,8 @@ mod tests {
         // from the durable store, so a restart past this seq doesn't
         // replay previously-applied deltas. The store's
         // `last_applied_seq` is now 2; h2 polls from 3 and finds nothing.
-        drop(s);
+        // (`s` was a shared borrow of the store; the prior `drop(&s)`
+        // was a no-op caught by `clippy::dropping_references`.)
         let mut h2 = CompositionHydrator::new(Arc::clone(&store));
         assert_eq!(h2.poll(&log, shard_id).await, 0);
     }

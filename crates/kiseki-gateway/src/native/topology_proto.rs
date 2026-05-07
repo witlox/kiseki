@@ -79,10 +79,11 @@ fn listen_addr_string(addr: &nc::ListenAddr) -> String {
         // rather than empty. v1 clients consult the contract type
         // via the binding-aware path, not this string.
         nc::ListenAddr::FabricDescriptor(bytes) => {
+            use std::fmt::Write as _;
             let mut s = String::with_capacity(7 + bytes.len() * 2);
             s.push_str("fabric:");
             for b in bytes {
-                s.push_str(&format!("{:02x}", b));
+                let _ = write!(s, "{b:02x}");
             }
             s
         }

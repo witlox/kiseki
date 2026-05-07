@@ -66,6 +66,13 @@ pub struct ProfileServer {
 }
 
 impl ProfileServer {
+    /// Start a profile-test server. Long by design: the function
+    /// drives the full test setup — binary lookup, ephemeral port
+    /// reservation, env-var wiring, child spawn, log capture,
+    /// readiness polling, address parse — and splitting into
+    /// helpers would just shuffle the same setup across multiple
+    /// arguments without making the sequence clearer.
+    #[allow(clippy::too_many_lines)]
     pub async fn start(server_bin: Option<&Path>) -> Result<Self, String> {
         let binary = match server_bin {
             Some(p) => p.to_path_buf(),

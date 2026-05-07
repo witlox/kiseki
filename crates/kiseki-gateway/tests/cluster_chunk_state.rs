@@ -171,7 +171,7 @@ fn setup_with_placement_and_target(
     placement: Vec<u64>,
     target_copies: usize,
 ) -> InMemoryGateway {
-    let mut compositions = CompositionStore::new().with_log(log);
+    let compositions = CompositionStore::new().with_log(log);
     compositions.add_namespace(Namespace {
         id: test_namespace(),
         tenant_id: test_tenant(),
@@ -508,7 +508,7 @@ fn setup_with_chunks(
     chunks: Arc<dyn AsyncChunkOps>,
     placement: Vec<u64>,
 ) -> InMemoryGateway {
-    let mut compositions = CompositionStore::new().with_log(log);
+    let compositions = CompositionStore::new().with_log(log);
     compositions.add_namespace(Namespace {
         id: test_namespace(),
         tenant_id: test_tenant(),

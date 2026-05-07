@@ -27,7 +27,7 @@ fn test_namespace() -> NamespaceId {
 }
 
 fn setup_fuse() -> KisekiFuse<InMemoryGateway> {
-    let mut compositions = CompositionStore::new();
+    let compositions = CompositionStore::new();
     compositions.add_namespace(Namespace {
         id: test_namespace(),
         tenant_id: test_tenant(),

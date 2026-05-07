@@ -92,7 +92,9 @@ mod tests {
                 assert_eq!(latency_class, LatencyClass::Low);
                 assert_eq!(addr, ListenAddr::HostPort("0.0.0.0:9101".into()));
             }
-            other => panic!("expected Available, got: {other:?}"),
+            ProbeOutcome::Unavailable { reason } => {
+                panic!("expected Available, got Unavailable: {reason}");
+            }
         }
     }
 
@@ -101,9 +103,16 @@ mod tests {
         let probe = TcpFramedProbe::new("0.0.0.0:9101").with_addr("disabled");
         match probe.probe().await {
             ProbeOutcome::Unavailable { reason } => {
-                assert!(reason.contains("disabled by operator"), "reason: {reason}",);
+                assert!(reason.contains("disabled by operator"), "reason: {reason}");
             }
-            other => panic!("expected Unavailable, got: {other:?}"),
+            ProbeOutcome::Available {
+                latency_class,
+                addr,
+            } => {
+                panic!(
+                    "expected Unavailable, got Available: latency={latency_class:?} addr={addr:?}"
+                );
+            }
         }
     }
 
@@ -114,7 +123,14 @@ mod tests {
             ProbeOutcome::Unavailable { reason } => {
                 assert!(reason.contains("parse failed"), "reason: {reason}");
             }
-            other => panic!("expected Unavailable, got: {other:?}"),
+            ProbeOutcome::Available {
+                latency_class,
+                addr,
+            } => {
+                panic!(
+                    "expected Unavailable, got Available: latency={latency_class:?} addr={addr:?}"
+                );
+            }
         }
     }
 

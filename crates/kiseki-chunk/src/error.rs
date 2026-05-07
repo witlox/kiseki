@@ -46,6 +46,11 @@ pub enum ChunkError {
     #[error("chunk I/O error: {0}")]
     Io(String),
 
+    /// Underlying fjall LSM error (open, get, put, batch, persist).
+    /// Preserves the source error so operators see the full chain.
+    #[error("chunk fjall: {0}")]
+    Fjall(#[from] fjall::Error),
+
     /// Cross-node fragment fan-out failed to reach the configured
     /// minimum number of acks (Phase 16a, D-5). Caller should back
     /// off and retry — likely transient (peer flap, partition).
@@ -83,6 +88,9 @@ impl From<ChunkError> for KisekiError {
                 KisekiError::Permanent(PermanentError::ChunkLost(ChunkId([0; 32])))
             }
             ChunkError::Io(msg) => KisekiError::Permanent(PermanentError::InvariantViolation(msg)),
+            ChunkError::Fjall(e) => {
+                KisekiError::Permanent(PermanentError::InvariantViolation(format!("fjall: {e}")))
+            }
             // QuorumLost is the cross-node fan-out shortfall — retriable
             // by the caller. ShardId is filled at the gateway boundary
             // where the request's shard binding is in scope; here we

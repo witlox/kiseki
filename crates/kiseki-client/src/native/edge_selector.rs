@@ -1,6 +1,6 @@
 //! Client-side per-edge binding selection (ADR-042 §3.2).
 //!
-//! Server-side `BindingSelector` (kiseki-transport::native::selector)
+//! Server-side `BindingSelector` (`kiseki-transport::native::selector`)
 //! decides which bindings the LOCAL node spawns. The client side is
 //! the parallel: each `(client → remote-node)` connection picks
 //! independently from the bindings the remote node advertises in
@@ -8,7 +8,7 @@
 //! to nodes 1–4 (Slingshot peers) and TCP-framed to nodes 5–10
 //! (commodity peers) within the same session.
 //!
-//! Selection rule (§3.2.4): "highest-ranked latency_class mutually
+//! Selection rule (§3.2.4): "highest-ranked `latency_class` mutually
 //! supported by (a) the local environment, (b) the bindings that
 //! node advertises". `Rdma > Low > Standard`. Operator pin
 //! (`KISEKI_NATIVE_TRANSPORT`) collapses the choice to the pinned
@@ -73,15 +73,13 @@ pub enum NoMatchReason {
 pub struct LocalCapabilities {
     /// Bindings the local environment can actually use (set
     /// membership; ordering doesn't matter for the selector).
-    /// Built from kiseki-transport::native::BindingSelector's plan
+    /// Built from `kiseki-transport::native::BindingSelector`'s plan
     /// or a client-side equivalent that probes locally.
     pub supported: BTreeSet<BindingId>,
 }
 
-impl LocalCapabilities {
-    /// Build from an iterable of supported bindings.
-    #[must_use]
-    pub fn from_iter<I: IntoIterator<Item = BindingId>>(it: I) -> Self {
+impl FromIterator<BindingId> for LocalCapabilities {
+    fn from_iter<I: IntoIterator<Item = BindingId>>(it: I) -> Self {
         Self {
             supported: it.into_iter().collect(),
         }
@@ -171,7 +169,7 @@ mod tests {
     fn ep(binding_id: BindingId, latency_class: LatencyClass) -> BindingEndpoint {
         BindingEndpoint {
             binding_id,
-            addr: ListenAddr::HostPort(format!("10.0.0.1:{:?}", binding_id)),
+            addr: ListenAddr::HostPort(format!("10.0.0.1:{binding_id:?}")),
             latency_class,
             drain_state: None,
         }
@@ -180,7 +178,7 @@ mod tests {
     fn ep_with_drain(binding_id: BindingId, latency_class: LatencyClass) -> BindingEndpoint {
         BindingEndpoint {
             binding_id,
-            addr: ListenAddr::HostPort(format!("10.0.0.1:{:?}", binding_id)),
+            addr: ListenAddr::HostPort(format!("10.0.0.1:{binding_id:?}")),
             latency_class,
             drain_state: Some(DrainState {
                 quiesce_window_remaining_ms: 1000,
@@ -198,7 +196,7 @@ mod tests {
     }
 
     fn local_supports(ids: &[BindingId]) -> LocalCapabilities {
-        LocalCapabilities::from_iter(ids.iter().copied())
+        ids.iter().copied().collect()
     }
 
     #[test]
@@ -213,7 +211,9 @@ mod tests {
             EdgeSelection::Match(picked) => {
                 assert_eq!(picked.binding_id, BindingId::TcpFramed);
             }
-            other => panic!("expected Match, got: {other:?}"),
+            EdgeSelection::NoMatch { reason } => {
+                panic!("expected Match, got NoMatch: {reason:?}");
+            }
         }
     }
 
@@ -230,7 +230,9 @@ mod tests {
             EdgeSelection::Match(picked) => {
                 assert_eq!(picked.binding_id, BindingId::Grpc);
             }
-            other => panic!("expected Match, got: {other:?}"),
+            EdgeSelection::NoMatch { reason } => {
+                panic!("expected Match, got NoMatch: {reason:?}");
+            }
         }
     }
 
@@ -263,7 +265,9 @@ mod tests {
                 assert_eq!(picked.binding_id, BindingId::Ibverbs);
                 assert_eq!(picked.latency_class, LatencyClass::Rdma);
             }
-            other => panic!("expected Rdma match, got: {other:?}"),
+            EdgeSelection::NoMatch { reason } => {
+                panic!("expected Rdma Match, got NoMatch: {reason:?}");
+            }
         }
     }
 
@@ -281,7 +285,9 @@ mod tests {
             EdgeSelection::Match(picked) => {
                 assert_eq!(picked.binding_id, BindingId::Grpc);
             }
-            other => panic!("expected Grpc Match, got: {other:?}"),
+            EdgeSelection::NoMatch { reason } => {
+                panic!("expected Grpc Match, got NoMatch: {reason:?}");
+            }
         }
     }
 
@@ -386,7 +392,9 @@ mod tests {
                 assert_eq!(picked.binding_id, BindingId::Grpc);
                 assert!(picked.drain_state.is_some());
             }
-            other => panic!("expected Match for in-flight work, got: {other:?}"),
+            EdgeSelection::NoMatch { reason } => {
+                panic!("expected Match for in-flight work, got NoMatch: {reason:?}");
+            }
         }
     }
 
@@ -401,7 +409,9 @@ mod tests {
         let outcome = select_for_edge(&node, &local, OperatorPin::Auto, false);
         match outcome {
             EdgeSelection::Match(_) => {}
-            other => panic!("Degraded should be dialable, got: {other:?}"),
+            EdgeSelection::NoMatch { reason } => {
+                panic!("Degraded should be dialable, got NoMatch: {reason:?}");
+            }
         }
     }
 
@@ -429,7 +439,7 @@ mod tests {
                 assert_eq!(a.binding_id, BindingId::Ibverbs);
                 assert_eq!(b.binding_id, BindingId::TcpFramed);
             }
-            other => panic!("expected per-edge differentiation: {other:?}"),
+            (a, b) => panic!("expected per-edge differentiation; got a={a:?} b={b:?}"),
         }
     }
 
@@ -449,7 +459,9 @@ mod tests {
             EdgeSelection::Match(picked) => {
                 assert_eq!(picked.binding_id, BindingId::Grpc);
             }
-            other => panic!("expected gRPC fallback, got: {other:?}"),
+            EdgeSelection::NoMatch { reason } => {
+                panic!("expected gRPC fallback, got NoMatch: {reason:?}");
+            }
         }
     }
 }

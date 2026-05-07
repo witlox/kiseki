@@ -238,7 +238,7 @@ mod tests {
     fn test_ctx() -> NfsContext<InMemoryGateway> {
         let tenant = OrgId(uuid::Uuid::nil());
         let ns = NamespaceId(uuid::Uuid::from_u128(1));
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         store.add_namespace(Namespace {
             id: ns,
             tenant_id: tenant,

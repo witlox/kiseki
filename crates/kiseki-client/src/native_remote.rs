@@ -128,7 +128,7 @@ impl NativeRemoteGateway {
     }
 }
 
-fn map_native_err(verb: &'static str, e: TcpFramedClientError) -> GatewayError {
+fn map_native_err(verb: &'static str, e: &TcpFramedClientError) -> GatewayError {
     GatewayError::ProtocolError(format!("native {verb}: {e}"))
 }
 
@@ -165,7 +165,7 @@ impl GatewayOps for NativeRemoteGateway {
             .pick()
             .call_ok("get_object", req_meta, Vec::new())
             .await
-            .map_err(|e| map_native_err("get_object", e))?;
+            .map_err(|e| map_native_err("get_object", &e))?;
         let resp: kiseki_proto::v1::native::GetObjectResponse = postcard::from_bytes(&resp_meta)
             .map_err(|e| GatewayError::ProtocolError(format!("native read decode: {e}")))?;
         // EOF inference matches RemoteHttpGateway: if the server
@@ -206,7 +206,7 @@ impl GatewayOps for NativeRemoteGateway {
             .pick()
             .call_ok("put_object", req_meta, req.data)
             .await
-            .map_err(|e| map_native_err("put_object", e))?;
+            .map_err(|e| map_native_err("put_object", &e))?;
         let resp: kiseki_proto::v1::native::PutObjectResponse = postcard::from_bytes(&resp_meta)
             .map_err(|e| GatewayError::ProtocolError(format!("native write decode: {e}")))?;
         let comp = resp.composition_id.ok_or_else(|| {
@@ -247,7 +247,7 @@ impl GatewayOps for NativeRemoteGateway {
             .pick()
             .call_ok("delete_object", req_meta, Vec::new())
             .await
-            .map_err(|e| map_native_err("delete_object", e))?;
+            .map_err(|e| map_native_err("delete_object", &e))?;
         Ok(())
     }
 }

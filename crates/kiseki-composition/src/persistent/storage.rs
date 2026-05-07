@@ -117,7 +117,7 @@ pub trait CompositionStorage: Send + Sync {
     /// observed by the caller under the storage lock (or `None`
     /// when no binding exists). The backend uses this to drive the
     /// overwrite-replace cascade (drop the stale reverse for the
-    /// old comp_id) without paying its own pre-flight read.
+    /// old `comp_id`) without paying its own pre-flight read.
     /// Callers that don't already hold the lookup result pass
     /// whatever they have; the persistent backend may do its own
     /// lookup if `prior_id` is unreliable, but the

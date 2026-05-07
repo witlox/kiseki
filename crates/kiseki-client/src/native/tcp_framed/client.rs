@@ -290,15 +290,10 @@ where
     R: AsyncRead + Unpin,
 {
     let mut len_buf = [0u8; 4];
-    loop {
-        match read_half.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(_) => break,
-        }
+    while read_half.read_exact(&mut len_buf).await.is_ok() {
         let length_be = u32::from_be_bytes(len_buf);
-        let body_len = match validate_frame_length(length_be) {
-            Ok(n) => n,
-            Err(_) => break,
+        let Ok(body_len) = validate_frame_length(length_be) else {
+            break;
         };
         // Single read of the whole frame body. The V3 wire format's
         // bulk-bytes-around-postcard split means we're already
@@ -311,9 +306,8 @@ where
         if read_half.read_exact(&mut body).await.is_err() {
             break;
         }
-        let view = match decode_response_frame(&body) {
-            Ok(v) => v,
-            Err(_) => break,
+        let Ok(view) = decode_response_frame(&body) else {
+            break;
         };
         if let Some((_, sender)) = pending.remove(&view.request_id) {
             let _ = sender.send((view.status, view.meta.to_vec(), view.bulk.to_vec()));
@@ -329,7 +323,7 @@ mod tests {
     use tokio::io::duplex;
 
     /// Test helper: read one V3 request frame from the duplex
-    /// stream. Returns (request_id, verb_tag, meta, bulk).
+    /// stream. Returns (`request_id`, `verb_tag`, `meta`, `bulk`).
     async fn read_v3_request<S: AsyncRead + Unpin>(
         stream: &mut S,
     ) -> (u64, String, Vec<u8>, Vec<u8>) {
@@ -430,7 +424,7 @@ mod tests {
     }
 
     /// Pipelined calls — issue two `call` futures concurrently;
-    /// reader demuxes by request_id so each future gets its own
+    /// reader demuxes by `request_id` so each future gets its own
     /// response. Confirms multiplex actually works.
     #[tokio::test]
     async fn pipelined_calls_demultiplex_by_request_id() {
@@ -466,9 +460,9 @@ mod tests {
         server_task.await.unwrap();
     }
 
-    /// Connection closed mid-call → ConnectionClosed error. Drops
+    /// Connection closed mid-call → `ConnectionClosed` error. Drops
     /// the server side, the reader task EOFs, all pending oneshots
-    /// drop, the call returns ConnectionClosed.
+    /// drop, the call returns `ConnectionClosed`.
     #[tokio::test]
     async fn pending_call_returns_connection_closed_on_server_drop() {
         let (client_side, server_side) = duplex(64 * 1024);
@@ -485,7 +479,7 @@ mod tests {
         }
     }
 
-    /// End-to-end through the real server-side serve_connection (in
+    /// End-to-end through the real server-side `serve_connection` (in
     /// the kiseki-gateway crate). Confirms the wire format matches
     /// on both sides — the highest-leverage test in this slice.
     #[tokio::test]

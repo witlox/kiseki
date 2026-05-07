@@ -45,6 +45,13 @@ pub enum PersistentStoreError {
     /// map to a more precise variant.
     #[error("persistent store backend: {0}")]
     Backend(String),
+
+    /// Underlying fjall LSM error (open, get, put, batch, persist).
+    /// Preserves the source error so operators see the full chain;
+    /// `metric_kind()` reports `"fjall"` for the
+    /// `kiseki_composition_decode_errors_total` metric.
+    #[error("persistent store fjall: {0}")]
+    Fjall(#[from] fjall::Error),
 }
 
 impl PersistentStoreError {
@@ -59,6 +66,7 @@ impl PersistentStoreError {
             Self::Composition(_) => "composition",
             Self::Commit(_) => "commit",
             Self::Backend(_) => "backend",
+            Self::Fjall(_) => "fjall",
         }
     }
 }

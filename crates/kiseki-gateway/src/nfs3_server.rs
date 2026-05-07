@@ -5,6 +5,14 @@
 //!
 //! Program: 100003, Version: 3.
 
+// Every NFSv3 reply handler is `async fn` because the dispatch
+// match in `dispatch_nfs3` invokes them with `.await` uniformly.
+// Some handlers (NULL, FSINFO, etc.) don't need to await anything,
+// but keeping them async preserves a single dispatch shape and
+// leaves room for handlers to grow into needing gateway-side
+// `.await`s without churning the whole match.
+#![allow(clippy::unused_async)]
+
 use std::io;
 use std::sync::Arc;
 
@@ -987,7 +995,7 @@ mod tests {
         let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
         let tenant = OrgId(uuid::Uuid::nil());
         let ns = NamespaceId(uuid::Uuid::from_u128(1));
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         store.add_namespace(kiseki_composition::namespace::Namespace {
             id: ns,
             tenant_id: tenant,

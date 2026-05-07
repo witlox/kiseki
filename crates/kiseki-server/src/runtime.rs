@@ -18,7 +18,6 @@ use kiseki_view::ViewOps;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::config::{ServerConfig, TlsFiles};
-use kiseki_common::locks::LockOrDie;
 
 /// Pick the DS uaddrs the MDS will advertise via GETDEVICEINFO.
 ///

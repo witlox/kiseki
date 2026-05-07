@@ -29,10 +29,23 @@ pub const CHUNK_RECORD_SCHEMA_VERSION: u8 = 1;
 /// source of truth — backend swaps don't reserialise rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRecord {
+    /// Content-addressed chunk identifier (HKDF-SHA256 over the
+    /// plaintext) — 32 bytes, the same value [`ChunkId`] wraps.
     pub chunk_id: [u8; 32],
+    /// How many compositions reference this chunk. The deduper
+    /// increments on every PUT that resolves to an existing
+    /// `chunk_id`; deletion is gated on `refcount` reaching zero.
     pub refcount: u64,
+    /// Active retention holds that prevent deletion regardless of
+    /// `refcount`. Each entry is a free-form hold tag (legal hold,
+    /// compliance window) supplied by the gateway.
     pub retention_holds: Vec<String>,
+    /// Affinity pool the chunk landed in (e.g. `"hot"`, `"cold"`,
+    /// `"pool-fast"`). Drives placement on subsequent reads /
+    /// scrubs.
     pub pool_name: String,
+    /// Bytes used on the device, extent-aligned. Always ≥
+    /// `data_bytes`; the difference is allocator slack.
     pub stored_bytes: u64,
     /// Actual data length in bytes (distinct from extent-aligned
     /// `stored_bytes`). Preserves the same `serde(default)` tolerance
@@ -40,7 +53,11 @@ pub struct ChunkRecord {
     /// know about the field still decodes.
     #[serde(default)]
     pub data_bytes: u64,
+    /// Byte offset on the backing device of the primary (first)
+    /// extent.
     pub extent_offset: u64,
+    /// Length in bytes of the primary extent. Combined with
+    /// `extra_extents` this covers the entire ciphertext.
     pub extent_length: u64,
     /// Additional extents holding the rest of the ciphertext, in
     /// order. Empty for single-extent chunks (the common case).
@@ -48,16 +65,30 @@ pub struct ChunkRecord {
     /// postcard layer (Vec<(u64, u64)>).
     #[serde(default)]
     pub extra_extents: Vec<(u64, u64)>,
-    /// Serialised envelope crypto state (ciphertext is on the
-    /// device; this is just nonce / tag / epoch fields).
+    /// AEAD nonce (12 B) used to seal this chunk. Persisted so a
+    /// fresh process can decrypt without a server round-trip.
     pub nonce: [u8; 12],
+    /// AEAD authentication tag (16 B) bound to the ciphertext + AD.
     pub auth_tag: [u8; 16],
+    /// System DEK epoch in effect when the chunk was sealed.
+    /// Drives unwrap-key selection during decrypt.
     pub system_epoch: u64,
+    /// Tenant DEK epoch when the chunk was sealed under a
+    /// per-tenant key (cross-tenant deduped chunks have `None`).
     pub tenant_epoch: Option<u64>,
+    /// Tenant-key-wrapped DEK material (optional — present when
+    /// `tenant_epoch` is `Some`). Unwrapped at read time via the
+    /// tenant's KEK from the keymanager.
     pub tenant_wrapped_material: Option<Vec<u8>>,
 }
 
-/// `[1 byte: version][postcard payload]`.
+/// `[1 byte: version][postcard payload]`. The version prefix gates
+/// future incompatible format changes — see
+/// [`CHUNK_RECORD_SCHEMA_VERSION`].
+///
+/// # Errors
+/// [`ChunkError::Io`] if postcard encoding fails (allocation or
+/// serializer fault).
 pub fn encode_chunk(record: &ChunkRecord) -> Result<Vec<u8>, ChunkError> {
     let mut out = Vec::with_capacity(256);
     out.push(CHUNK_RECORD_SCHEMA_VERSION);
@@ -67,6 +98,13 @@ pub fn encode_chunk(record: &ChunkRecord) -> Result<Vec<u8>, ChunkError> {
     Ok(out)
 }
 
+/// Reverse of [`encode_chunk`]. Strips the version prefix, rejects
+/// payloads with `version > CHUNK_RECORD_SCHEMA_VERSION` (binary
+/// too old), and postcard-decodes the rest into a [`ChunkRecord`].
+///
+/// # Errors
+/// [`ChunkError::Io`] if the input is empty, the version is newer
+/// than this binary supports, or the payload fails postcard decode.
 pub fn decode_chunk(bytes: &[u8]) -> Result<ChunkRecord, ChunkError> {
     let Some((&version, payload)) = bytes.split_first() else {
         return Err(ChunkError::Io("empty chunk record".into()));
@@ -84,13 +122,27 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<ChunkRecord, ChunkError> {
 /// Serialisable form of `FragmentEntry::meta + extent`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FragmentRecord {
+    /// Parent chunk's content-addressed identifier.
     pub chunk_id: [u8; 32],
+    /// EC fragment index — `0..k` for data shards, `k..k+m` for
+    /// parity. Dense enumeration; gaps signal a lost shard.
     pub fragment_index: u32,
+    /// Byte offset on the backing device of this fragment's
+    /// extent.
     pub extent_offset: u64,
+    /// Length in bytes of this fragment's extent.
     pub extent_length: u64,
+    /// Actual ciphertext length carried inside the extent
+    /// (extent length is allocator-aligned).
     pub data_bytes: u64,
 }
 
+/// `[1 byte: version][postcard payload]` — same layout as
+/// [`encode_chunk`] but for [`FragmentRecord`].
+///
+/// # Errors
+/// [`ChunkError::Io`] if postcard encoding fails (allocation or
+/// serializer fault).
 pub fn encode_fragment(record: &FragmentRecord) -> Result<Vec<u8>, ChunkError> {
     let mut out = Vec::with_capacity(64);
     out.push(CHUNK_RECORD_SCHEMA_VERSION);
@@ -100,6 +152,12 @@ pub fn encode_fragment(record: &FragmentRecord) -> Result<Vec<u8>, ChunkError> {
     Ok(out)
 }
 
+/// Reverse of [`encode_fragment`]. Same version-gating discipline
+/// as [`decode_chunk`].
+///
+/// # Errors
+/// [`ChunkError::Io`] if the input is empty, the version is newer
+/// than this binary supports, or the payload fails postcard decode.
 pub fn decode_fragment(bytes: &[u8]) -> Result<FragmentRecord, ChunkError> {
     let Some((&version, payload)) = bytes.split_first() else {
         return Err(ChunkError::Io("empty fragment record".into()));
@@ -145,9 +203,9 @@ pub fn decode_fragment_key(bytes: &[u8]) -> Result<(ChunkId, u32), ChunkError> {
     }
     let mut id_buf = [0u8; 32];
     id_buf.copy_from_slice(&bytes[..32]);
-    let mut idx_buf = [0u8; 4];
-    idx_buf.copy_from_slice(&bytes[32..]);
-    Ok((ChunkId(id_buf), u32::from_be_bytes(idx_buf)))
+    let mut fragment_index_bytes = [0u8; 4];
+    fragment_index_bytes.copy_from_slice(&bytes[32..]);
+    Ok((ChunkId(id_buf), u32::from_be_bytes(fragment_index_bytes)))
 }
 
 #[cfg(test)]

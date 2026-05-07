@@ -31,7 +31,7 @@ pub struct Node {
     /// Per-node binding endpoints. ADR-042 §1.7. Empty when state
     /// is Failed/Evicted; multiple entries when the node serves
     /// multiple bindings concurrently. Per-edge selection (§3.2)
-    /// picks the highest-ranked latency_class mutually supported by
+    /// picks the highest-ranked `latency_class` mutually supported by
     /// the local environment.
     pub bindings: Vec<kiseki_proto::native_contract::BindingEndpoint>,
 }
@@ -506,7 +506,9 @@ mod tests {
             kiseki_proto::native_contract::ListenAddr::FabricDescriptor(bytes) => {
                 assert_eq!(bytes, &[0xCA, 0xFE, 0xBA, 0xBE]);
             }
-            other => panic!("expected FabricDescriptor, got: {other:?}"),
+            kiseki_proto::native_contract::ListenAddr::HostPort(s) => {
+                panic!("expected FabricDescriptor, got HostPort: {s:?}");
+            }
         }
     }
 

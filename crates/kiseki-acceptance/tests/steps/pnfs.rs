@@ -494,7 +494,7 @@ async fn then_every_other_op_notsupp(world: &mut KisekiWorld) {
         // Pad with zero bytes — abort-on-error short-circuits parsing
         // anyway so contents don't matter.
         args.write_opaque_fixed(&[0u8; 16]);
-        run_compound(world, &ctx, &sessions, &[(op_code, args.into_bytes())]);
+        run_compound(world, &ctx, &sessions, &[(op_code, args.into_bytes())]).await;
         let res = world.pnfs.last_results.first().expect("op result");
         assert_eq!(
             res.1,

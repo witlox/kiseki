@@ -12,7 +12,7 @@
 //!
 //! - `chunks`    — `chunk_id` (32 B raw) → encoded `ChunkRecord`
 //! - `fragments` — `chunk_id || fragment_index_be` (36 B) → encoded
-//!                 `FragmentRecord`
+//!   `FragmentRecord`
 //!
 //! `delete_chunk_force` and other multi-keyspace mutations commit
 //! across both in one fjall `WriteBatch`, so cross-keyspace
@@ -67,23 +67,15 @@ pub struct FjallMetaStore {
     sync_per_write: AtomicBool,
 }
 
-fn map_err(e: fjall::Error) -> ChunkError {
-    ChunkError::Io(format!("fjall: {e}"))
-}
-
 impl FjallMetaStore {
     /// Open or create a fjall database at `path`. The path is a
     /// directory (fjall keyspace layout); pre-rev-4 callers passing
     /// a `*.json` file path migrated to a sibling directory name
     /// without an extension.
     pub fn open(path: &Path) -> Result<Self, ChunkError> {
-        let db = Database::builder(path).open().map_err(map_err)?;
-        let chunks_ks = db
-            .keyspace(KS_CHUNKS, KeyspaceCreateOptions::default)
-            .map_err(map_err)?;
-        let fragments_ks = db
-            .keyspace(KS_FRAGMENTS, KeyspaceCreateOptions::default)
-            .map_err(map_err)?;
+        let db = Database::builder(path).open()?;
+        let chunks_ks = db.keyspace(KS_CHUNKS, KeyspaceCreateOptions::default)?;
+        let fragments_ks = db.keyspace(KS_FRAGMENTS, KeyspaceCreateOptions::default)?;
         Ok(Self {
             db,
             chunks_ks,
@@ -103,7 +95,7 @@ impl FjallMetaStore {
     /// Force an fsync of the WAL. Used by the runtime's periodic
     /// flusher and the gateway's `fsync_pending` hook.
     pub fn flush(&self) -> Result<(), ChunkError> {
-        self.db.persist(PersistMode::SyncAll).map_err(map_err)?;
+        self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
@@ -135,15 +127,19 @@ impl FjallMetaStore {
 
     /// Insert or replace a chunk record. Used by every mutating op
     /// on the chunk store path that touches `envelope_meta`
-    /// (write_chunk new write, increment, decrement, retention
+    /// (`write_chunk` new write, increment, decrement, retention
     /// holds, etc.). Caller updates the in-memory cache first; this
     /// is the WAL behind it.
+    ///
+    /// # Errors
+    /// [`ChunkError::Fjall`] if the underlying batch commit fails;
+    /// [`ChunkError::Io`] (via [`encode_chunk`]) on encoder fault.
     pub fn put_chunk(&self, record: &ChunkRecord) -> Result<(), ChunkError> {
         let bytes = encode_chunk(record)?;
         let key = chunk_key(&ChunkId(record.chunk_id));
         let mut batch = self.batch_for_write();
         batch.insert(&self.chunks_ks, key.to_vec(), bytes);
-        batch.commit().map_err(map_err)
+        batch.commit().map_err(ChunkError::from)
     }
 
     /// Remove a chunk record. Used by `gc` and `delete_chunk_force`.
@@ -151,7 +147,7 @@ impl FjallMetaStore {
         let key = chunk_key(id);
         let mut batch = self.batch_for_write();
         batch.remove(&self.chunks_ks, key.to_vec());
-        batch.commit().map_err(map_err)
+        batch.commit().map_err(ChunkError::from)
     }
 
     /// Drain every persisted chunk record into memory. Called once
@@ -160,7 +156,7 @@ impl FjallMetaStore {
     pub fn iter_chunks(&self) -> Result<Vec<ChunkRecord>, ChunkError> {
         let mut out = Vec::new();
         for entry in self.chunks_ks.iter() {
-            let (_k, v) = entry.into_inner().map_err(map_err)?;
+            let (_k, v) = entry.into_inner()?;
             out.push(decode_chunk(v.as_ref())?);
         }
         Ok(out)
@@ -168,19 +164,32 @@ impl FjallMetaStore {
 
     // -- Fragment-record operations ----------------------------------
 
+    /// Insert or replace a fragment record. Used on the EC write
+    /// path whenever a `(chunk_id, fragment_index)` tuple lands.
+    /// Caller updates the in-memory `fragments` cache first; this
+    /// is the WAL behind it.
+    ///
+    /// # Errors
+    /// [`ChunkError::Fjall`] if the underlying batch commit fails;
+    /// [`ChunkError::Io`] (via [`encode_fragment`]) on encoder fault.
     pub fn put_fragment(&self, record: &FragmentRecord) -> Result<(), ChunkError> {
         let bytes = encode_fragment(record)?;
         let key = fragment_key(&ChunkId(record.chunk_id), record.fragment_index);
         let mut batch = self.batch_for_write();
         batch.insert(&self.fragments_ks, key.to_vec(), bytes);
-        batch.commit().map_err(map_err)
+        batch.commit().map_err(ChunkError::from)
     }
 
+    /// Remove a single `(chunk_id, fragment_index)` row. Used by the
+    /// scrub when an orphan fragment is reaped.
+    ///
+    /// # Errors
+    /// [`ChunkError::Fjall`] if the batch commit fails.
     pub fn remove_fragment(&self, id: &ChunkId, fragment_index: u32) -> Result<(), ChunkError> {
         let key = fragment_key(id, fragment_index);
         let mut batch = self.batch_for_write();
         batch.remove(&self.fragments_ks, key.to_vec());
-        batch.commit().map_err(map_err)
+        batch.commit().map_err(ChunkError::from)
     }
 
     /// Atomically remove the chunk record AND every fragment under
@@ -199,13 +208,22 @@ impl FjallMetaStore {
         for &idx in fragment_indices {
             batch.remove(&self.fragments_ks, fragment_key(id, idx).to_vec());
         }
-        batch.commit().map_err(map_err)
+        batch.commit().map_err(ChunkError::from)
     }
 
+    /// Drain every persisted fragment record into memory. Called
+    /// once from `PersistentChunkStore::open` to seed the in-memory
+    /// `fragments` cache; no callers on the hot path. Validates the
+    /// key shape so a corrupted dir surfaces a decode error rather
+    /// than loading garbage.
+    ///
+    /// # Errors
+    /// [`ChunkError::Fjall`] on iterator I/O; [`ChunkError::Io`] on
+    /// key/payload decode failure.
     pub fn iter_fragments(&self) -> Result<Vec<FragmentRecord>, ChunkError> {
         let mut out = Vec::new();
         for entry in self.fragments_ks.iter() {
-            let (k, v) = entry.into_inner().map_err(map_err)?;
+            let (k, v) = entry.into_inner()?;
             // Validate the key shape so a corrupted dir doesn't
             // silently load garbage records.
             decode_fragment_key(k.as_ref())?;
@@ -229,8 +247,14 @@ pub struct FjallMetaFlusher {
 }
 
 impl FjallMetaFlusher {
+    /// Force a `PersistMode::SyncAll` against the underlying
+    /// database — drives the WAL fsync that the per-write path
+    /// would otherwise skip when `sync_per_write = false`.
+    ///
+    /// # Errors
+    /// [`ChunkError::Fjall`] if the persist call fails.
     pub fn flush(&self) -> Result<(), ChunkError> {
-        self.db.persist(PersistMode::SyncAll).map_err(map_err)?;
+        self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 }

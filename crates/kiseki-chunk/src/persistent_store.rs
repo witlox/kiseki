@@ -44,16 +44,19 @@ struct ChunkEntry {
     extents: Vec<Extent>,
 }
 
+/// In-memory cache row for an EC fragment. Only the resolved
+/// `extent` participates in `read_fragment` / `delete_fragment` —
+/// `FragmentRecord` lives durably in the meta store and is hydrated
+/// on restart, so we don't keep a copy in RAM.
 struct FragmentEntry {
-    record: FragmentRecord,
     extent: Extent,
 }
 
 /// Build the in-memory `extents: Vec<Extent>` view from a
 /// [`ChunkRecord`]. Empty record (`extent_length == 0`) yields an
 /// empty vec — `reconstruct_envelope` must never call `device.read`
-/// on a zero-length extent (POSIX `touch` / NFSv4 OPEN-CREATE on an
-/// empty file).
+/// on a zero-length extent (POSIX `touch` / `NFSv4` `OPEN-CREATE`
+/// on an empty file).
 fn extents_from_record(record: &ChunkRecord) -> Vec<Extent> {
     let mut extents = Vec::with_capacity(1 + record.extra_extents.len());
     if record.extent_length > 0 {
@@ -178,10 +181,10 @@ impl PersistentChunkStore {
     ///
     /// - `device_path`: path to the block device or file for chunk data.
     /// - `meta_path`: path to the **directory** holding the fjall meta
-    ///    keyspace (ADR-022 rev-4). Pre-rev-4 callers passed a `*.json`
-    ///    file path; the new layout is a sibling directory without an
-    ///    extension. The runtime writes a `pools.json` next to it for
-    ///    the small admin-rate pool config.
+    ///   keyspace (ADR-022 rev-4). Pre-rev-4 callers passed a `*.json`
+    ///   file path; the new layout is a sibling directory without an
+    ///   extension. The runtime writes a `pools.json` next to it for
+    ///   the small admin-rate pool config.
     /// - `device_size`: total device size in bytes.
     pub fn init(
         device_path: &Path,
@@ -230,10 +233,7 @@ impl PersistentChunkStore {
         for record in meta.iter_fragments()? {
             let id = ChunkId(record.chunk_id);
             let extent = Extent::new(record.extent_offset, record.extent_length);
-            frag_map.insert(
-                (id, record.fragment_index),
-                FragmentEntry { record, extent },
-            );
+            frag_map.insert((id, record.fragment_index), FragmentEntry { extent });
         }
 
         Ok(Self {
@@ -730,13 +730,7 @@ impl ChunkOps for PersistentChunkStore {
                 extent_length: extent.length,
                 data_bytes,
             };
-            fragments.insert(
-                key,
-                FragmentEntry {
-                    record: record.clone(),
-                    extent,
-                },
-            );
+            fragments.insert(key, FragmentEntry { extent });
             (old, record)
         };
         if let Some(old) = old_extent {

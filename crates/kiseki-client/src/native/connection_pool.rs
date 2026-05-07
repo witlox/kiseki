@@ -221,6 +221,7 @@ impl ConnectionPool {
     ///
     /// Returns the count of newly-drained edges (excludes edges
     /// that were already draining).
+    #[must_use]
     pub fn reconcile_with_topology(&self, snapshot: &Snapshot) -> usize {
         // Build a fast lookup set of currently-advertised
         // (node, binding) pairs.
@@ -251,6 +252,7 @@ impl ConnectionPool {
     /// clears the drain flag.
     ///
     /// Returns the count of edges hard-closed this tick.
+    #[must_use]
     pub fn tick_drain_budget(&self, budget: Duration) -> usize {
         let now = Instant::now();
         let expired: Vec<(u64, BindingId)> = self
@@ -289,6 +291,7 @@ impl ConnectionPool {
     /// cleanup on `Drop`. RDMA bindings (when added) MUST follow
     /// the ordered cleanup table in §3.2.2 — that's the binding
     /// crate's `Drop` impl; the pool just removes the entry here.
+    #[must_use]
     pub fn drop_edge(&self, node_id: u64, binding_id: BindingId) -> bool {
         self.entries.remove(&(node_id, binding_id)).is_some()
     }
@@ -296,6 +299,7 @@ impl ConnectionPool {
     /// Drop every connection to `node_id`, regardless of binding.
     /// Called when the topology marks the node `Failed` / `Evicted`
     /// (close-on-state-change per §1.7's R3-O1).
+    #[must_use]
     pub fn drop_node(&self, node_id: u64) -> usize {
         let to_remove: Vec<_> = self
             .entries
@@ -621,11 +625,11 @@ mod tests {
     async fn drain_edge_is_idempotent_and_preserves_start_instant() {
         let pool = ConnectionPool::new();
         pool.drain_edge(7, BindingId::Grpc);
-        let first = pool.draining.get(&(7, BindingId::Grpc)).unwrap().clone();
+        let first = *pool.draining.get(&(7, BindingId::Grpc)).unwrap();
         // Sleep to ensure a measurable gap.
         tokio::time::sleep(Duration::from_millis(2)).await;
         pool.drain_edge(7, BindingId::Grpc);
-        let second = pool.draining.get(&(7, BindingId::Grpc)).unwrap().clone();
+        let second = *pool.draining.get(&(7, BindingId::Grpc)).unwrap();
         assert_eq!(
             first, second,
             "second drain_edge must NOT reset the original instant; budget timer wins from the first call",

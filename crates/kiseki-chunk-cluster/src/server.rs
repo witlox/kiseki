@@ -666,7 +666,9 @@ fn chunk_err_to_status(e: &ChunkError) -> Status {
         | ChunkError::EcInvalidConfig
         | ChunkError::EcEncodeFailed => Status::internal(msg),
         ChunkError::PoolFull(_) => Status::resource_exhausted(msg),
-        ChunkError::Io(_) | ChunkError::QuorumLost { .. } => Status::unavailable(msg),
+        ChunkError::Io(_) | ChunkError::Fjall(_) | ChunkError::QuorumLost { .. } => {
+            Status::unavailable(msg)
+        }
     }
 }
 

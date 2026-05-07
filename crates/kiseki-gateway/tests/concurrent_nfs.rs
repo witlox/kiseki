@@ -26,7 +26,7 @@ fn test_namespace() -> NamespaceId {
 }
 
 fn setup_nfs_gateway() -> Arc<NfsGateway<InMemoryGateway>> {
-    let mut compositions = CompositionStore::new();
+    let compositions = CompositionStore::new();
     compositions.add_namespace(Namespace {
         id: test_namespace(),
         tenant_id: test_tenant(),

@@ -8,6 +8,12 @@
 
 // NFSv4 ops use match on Result for status tracking — clearer than if-let chains.
 #![allow(clippy::single_match_else)]
+// COMPOUND op handlers + helpers all share an `async fn` shape so
+// `process_op` / `process_compound` can `.await` them uniformly.
+// Handlers that don't currently need to await (PUTROOTFH, GETFH,
+// etc.) stay async to preserve dispatch uniformity and to leave
+// room for future gateway-side `.await`s.
+#![allow(clippy::unused_async)]
 
 use std::collections::HashMap;
 use std::io;
@@ -2352,7 +2358,7 @@ mod tests {
         let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
         let tenant = OrgId(uuid::Uuid::nil());
         let ns = NamespaceId(uuid::Uuid::from_u128(1));
-        let mut store = CompositionStore::new();
+        let store = CompositionStore::new();
         store.add_namespace(kiseki_composition::namespace::Namespace {
             id: ns,
             tenant_id: tenant,

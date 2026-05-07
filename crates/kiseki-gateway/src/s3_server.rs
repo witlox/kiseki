@@ -1558,7 +1558,7 @@ mod tests {
         use kiseki_composition::persistent::{CompositionStorage, HydrationBatch, MemoryStorage};
 
         // Build a CompositionStore whose backend reports halted=true.
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         storage
             .apply_hydration_batch(HydrationBatch {
                 puts: Vec::new(),

@@ -571,7 +571,7 @@ impl Driver for PnfsDriver {
 
 struct FuseDriver {
     /// `tokio::sync::RwLock` — read lock for build-request, write
-    /// lock for inode-table mutation. The KisekiFuse instance holds
+    /// lock for inode-table mutation. The `KisekiFuse` instance holds
     /// a peer-cloned `NativeRemoteGateway` for API symmetry but the
     /// hot path (gateway call) bypasses it via the separate
     /// `gateway` field below.
@@ -579,9 +579,9 @@ struct FuseDriver {
         kiseki_client::fuse_fs::KisekiFuse<kiseki_client::native_remote::NativeRemoteGateway>,
     >,
     /// Direct gateway handle — same connection pool the
-    /// KisekiFuse instance holds (cheap `Arc`-shared clone). Used
+    /// `KisekiFuse` instance holds (cheap `Arc`-shared clone). Used
     /// to `.await` the gateway call DIRECTLY from the perf-driver
-    /// task instead of round-tripping through KisekiFuse's
+    /// task instead of round-tripping through `KisekiFuse`'s
     /// `block_gateway_pub` which `block_in_place`s into a separate
     /// dedicated runtime. The detour was a measurable cap on PUT
     /// throughput (the read lock was held for the full
@@ -659,13 +659,11 @@ impl Driver for FuseDriver {
     }
 
     async fn get(&self, key: &Key) -> Result<usize, String> {
-        // Direct gateway call. The fast path post-`put` already has
-        // a composition_id; the slow path looks it up via KisekiFuse
-        // (used for backwards compat with synthetic keys, currently
-        // unreached in steady-state perf runs).
-        let composition_id = if !key.composition_id.0.is_nil() {
-            key.composition_id
-        } else {
+        // Slow path: synthetic key without a known composition_id —
+        // resolve via the FUSE inode-table lookup. Currently unreached
+        // in steady-state perf runs (the fast path post-`put` always
+        // carries a real composition_id) but kept for backwards compat.
+        if key.composition_id.0.is_nil() {
             let name = key
                 .name
                 .clone()
@@ -678,14 +676,15 @@ impl Driver for FuseDriver {
                 .read(attr.ino, 0, u32::try_from(attr.size).unwrap_or(u32::MAX))
                 .map_err(|e| format!("fuse read errno {e}"))?;
             return Ok(bytes.len());
-        };
+        }
 
+        // Fast path: bypass FUSE — `.await` the gateway directly.
         let resp = self
             .gateway
             .read(kiseki_gateway::ops::ReadRequest {
                 tenant_id: self.tenant_id,
                 namespace_id: self.namespace_id,
-                composition_id,
+                composition_id: key.composition_id,
                 offset: 0,
                 length: u64::MAX,
             })
@@ -1128,6 +1127,12 @@ pub struct InProcessPersistentDriver {
 }
 
 impl InProcessPersistentDriver {
+    /// Sibling driver constructors are all `async fn` to match the
+    /// `Driver` boundary in `build`, which `.await`s every driver's
+    /// `new()`. The persistent backend's setup is fully sync (fjall +
+    /// tempdir + compositions + spawning a flush task) but we keep
+    /// the async signature so the dispatch site stays uniform.
+    #[allow(clippy::unused_async)]
     pub async fn new() -> Result<Self, String> {
         use kiseki_common::ids::ShardId;
         use kiseki_common::tenancy::KeyEpoch;

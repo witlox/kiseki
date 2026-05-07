@@ -16,10 +16,16 @@
 //! return `NFS4ERR_NOTSUPP` (I-PN7). COMPOUND aborts on the first error
 //! per RFC 5661 §15.2 (inherited from `dispatch_compound`).
 
+// DS op handlers share the `async fn` shape with the v4.1 dispatcher
+// in `nfs4_server.rs` so the same `process_ds_op` glue can drive both.
+// The DS op subset is small (READ / WRITE / COMMIT / GETATTR /
+// SEQUENCE / etc.) and a handful are pure XDR construction with no
+// gateway await — they stay async for dispatch uniformity.
+#![allow(clippy::unused_async)]
+
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::thread;
 
 use rustls::ServerConfig;
 

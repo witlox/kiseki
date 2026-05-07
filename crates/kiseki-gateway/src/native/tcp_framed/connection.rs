@@ -16,7 +16,7 @@
 //! deferred to slice 4 (client-side). v1 server processes frames
 //! sequentially per-connection; the client may pipeline (multiple
 //! outstanding requests on one connection) since the server preserves
-//! request_id in the response envelope. Cross-connection concurrency
+//! `request_id` in the response envelope. Cross-connection concurrency
 //! comes from the listener spawning one task per accepted connection.
 
 use std::sync::Arc;
@@ -238,9 +238,10 @@ async fn drain_for_close<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Resul
     let mut total = 0usize;
     while total < ERROR_DRAIN_CAP {
         match stream.read(&mut buf).await {
-            Ok(0) => return Ok(()),
+            // EOF (Ok(0)) and any I/O error both terminate the
+            // drain — we're best-effort here, so collapse the arms.
+            Ok(0) | Err(_) => return Ok(()),
             Ok(n) => total += n,
-            Err(_) => return Ok(()),
         }
     }
     Ok(())
@@ -309,7 +310,7 @@ mod tests {
     }
 
     /// Test-only response frame reader. Returns
-    /// (status, request_id, meta, bulk) — V3 split-bulk shape.
+    /// (`status`, `request_id`, `meta`, `bulk`) — V3 split-bulk shape.
     async fn read_response_frame<S: AsyncRead + Unpin>(
         stream: &mut S,
     ) -> (WireStatus, u64, Vec<u8>, Vec<u8>) {
@@ -328,9 +329,9 @@ mod tests {
         )
     }
 
-    /// End-to-end: client sends a put_object request frame; the
-    /// server's serve_connection processes it, replies, and the
-    /// response decodes back to a real PutObjectResponse.
+    /// End-to-end: client sends a `put_object` request frame; the
+    /// server's `serve_connection` processes it, replies, and the
+    /// response decodes back to a real `PutObjectResponse`.
     #[tokio::test]
     async fn put_object_end_to_end_via_serve_connection() {
         let server = make_server().await;
@@ -374,7 +375,7 @@ mod tests {
 
     /// Pipelined requests: client writes two frames before reading
     /// any response. Server processes them in order and replies on
-    /// each — request_id correlation lets the client demultiplex.
+    /// each — `request_id` correlation lets the client demultiplex.
     #[tokio::test]
     async fn pipelined_requests_round_trip_in_order() {
         let server = make_server().await;
@@ -410,7 +411,7 @@ mod tests {
         let _ = server_task.await;
     }
 
-    /// Malformed envelope → ProtocolError response, but the
+    /// Malformed envelope → `ProtocolError` response, but the
     /// connection stays open and the next valid frame still
     /// processes. Important for client robustness: a single bad
     /// frame doesn't sever the channel.
@@ -454,7 +455,7 @@ mod tests {
         let _ = server_task.await;
     }
 
-    /// Oversize length prefix → ProtocolError response + connection
+    /// Oversize length prefix → `ProtocolError` response + connection
     /// terminates (we can't trust the read stream after that — the
     /// declared length skewed it).
     #[tokio::test]

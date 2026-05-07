@@ -300,7 +300,7 @@ mod tests {
     }
 
     /// End-to-end: spin up the listener in plaintext mode, connect a
-    /// raw TCP socket, send one put_object frame, decode the
+    /// raw TCP socket, send one `put_object` frame, decode the
     /// response. Confirms accept loop + per-connection task wiring.
     #[tokio::test]
     async fn plaintext_listener_round_trips_put_object() {

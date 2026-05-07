@@ -98,7 +98,7 @@ pub(crate) enum NativeBinding {
     /// path; no h2 framing tax.
     Tcp,
     /// Honor `KISEKI_NATIVE_TRANSPORT` (or default to highest-ranked
-    /// available — same logic as the server-side BindingSelector).
+    /// available — same logic as the server-side `BindingSelector`).
     Auto,
 }
 

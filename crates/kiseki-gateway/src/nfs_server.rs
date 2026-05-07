@@ -5,14 +5,11 @@
 //! NFSv3 = version 3, NFSv4.x = version 4.
 
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use kiseki_common::ids::{NamespaceId, OrgId};
 use rustls::ServerConfig;
-use socket2::{SockRef, TcpKeepalive};
 
 use crate::nfs::NfsGateway;
 use crate::nfs3_server::handle_nfs3_connection;
@@ -25,18 +22,12 @@ use crate::ops::GatewayOps;
 /// NFS-over-TLS session. The 60-second interval is the upper bound
 /// before NAT/firewall idle-timeouts can sever the TLS session in
 /// typical deployments.
+///
+/// Currently informational; the post-`bd56236` async-native server
+/// stack relies on tokio's read/write timeouts rather than
+/// kernel-level `SO_KEEPALIVE`. Kept as a documented constant so a
+/// future re-introduction matches the RFC cadence.
 pub const RFC9289_KEEPALIVE_INTERVAL_SECS: u64 = 60;
-
-/// Configure TCP keep-alive on an accepted connection. Per RFC 9289
-/// §4.2 a 60-sec cadence is the default; the kernel handles the
-/// idle-reset semantic (it only fires after `time` seconds of
-/// idleness).
-fn enable_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
-    let ka = TcpKeepalive::new()
-        .with_time(Duration::from_secs(RFC9289_KEEPALIVE_INTERVAL_SECS))
-        .with_interval(Duration::from_secs(RFC9289_KEEPALIVE_INTERVAL_SECS));
-    SockRef::from(stream).set_tcp_keepalive(&ka)
-}
 
 /// Start the NFS TCP server supporting both NFSv3 and NFSv4.2.
 ///

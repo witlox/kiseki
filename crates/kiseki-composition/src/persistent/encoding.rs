@@ -44,6 +44,7 @@ pub fn decode_composition(bytes: &[u8]) -> Result<Composition, PersistentStoreEr
 /// Encode a (`namespace_id`, name) tuple as a flat key. Layout:
 /// 16 bytes `ns_id` || UTF-8 name. The fixed namespace prefix gives a
 /// free per-namespace range scan in any LSM / B-tree backend.
+#[must_use]
 pub fn name_key(ns: NamespaceId, name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + name.len());
     out.extend_from_slice(ns.0.as_bytes());

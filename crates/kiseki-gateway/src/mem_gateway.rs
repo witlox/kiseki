@@ -78,7 +78,7 @@ pub struct InMemoryGateway {
     tenant_hmac_key: Option<Vec<u8>>,
     /// `parking_lot::RwLock`: read-mostly (every gateway read takes
     /// a read lock; only the stream processor's 100 ms watermark
-    /// advance takes a write lock). std::sync::Mutex here was a
+    /// advance takes a write lock). `std::sync::Mutex` here was a
     /// 9.78% CPU hog on the post-V3+LRU native flame at 64 KiB GET
     /// — sixteen concurrent readers all serialized through one
     /// futex.
@@ -213,7 +213,7 @@ pub struct InMemoryGateway {
     /// `parking_lot::Mutex` not `std::sync::Mutex`: locked twice per
     /// read (cache check + cache insert), once per chunk. With 16
     /// concurrent readers std's futex contention costed ~11% of CPU
-    /// on the post-V3+LRU native flame at 64 KiB GET. parking_lot's
+    /// on the post-V3+LRU native flame at 64 KiB GET. `parking_lot`'s
     /// adaptive spin + word-sized lock body is meaningfully cheaper
     /// for short, contended critical sections.
     decrypt_cache: parking_lot::Mutex<DecryptCache>,
@@ -267,7 +267,7 @@ struct ConditionalCheckAdapter<'a> {
     name: &'a str,
 }
 
-impl<'a> ConditionalCheck for ConditionalCheckAdapter<'a> {
+impl ConditionalCheck for ConditionalCheckAdapter<'_> {
     fn check(&self, existing: Option<CompositionId>) -> Result<(), String> {
         match (self.cond, existing) {
             (crate::ops::WriteConditional::IfNoneMatch, Some(_)) => Err(format!(
@@ -1150,7 +1150,8 @@ impl GatewayOps for InMemoryGateway {
                         m.read_retry_exhausted_total.inc();
                     }
                     tracing::warn!(
-                        budget_ms = comp_retry_budget.as_millis() as u64,
+                        budget_ms = u64::try_from(comp_retry_budget.as_millis())
+                            .unwrap_or(u64::MAX),
                         "gateway read: composition not found within retry budget — surfacing inner error",
                     );
                     Err(guard
@@ -2249,7 +2250,7 @@ mod halt_mode_tests {
 
     /// Build a `CompositionStore` whose storage has `halted = true`.
     fn make_halted_store() -> CompositionStore {
-        let mut storage = MemoryStorage::new();
+        let storage = MemoryStorage::new();
         storage
             .apply_hydration_batch(HydrationBatch {
                 puts: Vec::new(),

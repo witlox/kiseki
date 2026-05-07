@@ -25,7 +25,6 @@ const NFS3_VERSION: u32 = 3;
 
 // NFSv3 procedures (RFC 1813 §3)
 const NFSPROC3_NULL: u32 = 0;
-const NFSPROC3_LOOKUP: u32 = 3;
 const NFSPROC3_READ: u32 = 6;
 const NFSPROC3_WRITE: u32 = 7;
 const NFSPROC3_CREATE: u32 = 8;
@@ -389,8 +388,8 @@ impl GatewayOps for Nfs3Client {
     }
 }
 
-/// Issue an NFSv3 READ for `fh` against `req.offset`/`req.length`.
-/// Shared between the cached-handle fast path and the LOOKUP+READ
+/// Issue an `NFSv3` READ for `fh` against `req.offset`/`req.length`.
+/// Shared between the cached-handle fast path and the `LOOKUP+READ`
 /// slow path. The transport guard is held by the caller — this
 /// helper just drives the wire format and parses the reply.
 fn read_with_fh(

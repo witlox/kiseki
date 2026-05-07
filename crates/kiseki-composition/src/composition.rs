@@ -311,7 +311,7 @@ pub enum DeleteResult {
 ///
 /// Kept as a trait (not a concrete enum) so the protocol layer
 /// owns the conditional taxonomy: S3 carries `If-None-Match` /
-/// `If-Match`, NFS4 carries OPEN4_CREATE_GUARDED4, etc. The
+/// `If-Match`, NFS4 carries `OPEN4_CREATE_GUARDED4`, etc. The
 /// composition store doesn't need to know which protocol asked.
 pub trait ConditionalCheck {
     /// Returns `Ok(())` when the write may proceed, `Err(reason)`
@@ -322,10 +322,16 @@ pub trait ConditionalCheck {
     /// # Errors
     /// Returns the human-readable reason that surfaces as
     /// `CompositionError::PreconditionFailed` and ultimately as
-    /// HTTP 412 (S3) / NFS4ERR_EXIST (NFS).
+    /// HTTP 412 (S3) / `NFS4ERR_EXIST` (NFS).
     fn check(&self, existing: Option<CompositionId>) -> Result<(), String>;
 }
 
+/// Operations on the in-memory composition store.
+///
+/// Implementations include the canonical [`CompositionStore`] (lock-
+/// per-shard hash maps) and the persistent overlay used by ADR-040
+/// rev-3+ deployments. The trait surface is the contract the
+/// gateway, hydrator, and Raft apply path all program against.
 pub trait CompositionOps {
     /// Create a new composition in a namespace.
     fn create(
@@ -396,16 +402,18 @@ pub trait CompositionOps {
 /// log shard.
 ///
 /// Method semantics that changed in ADR-040:
-///   - `get` and `list_by_namespace` now return owned `Composition`
-///     values (the persistent backend can't lend references across a
-///     backend transaction / batch). All call sites accept this since
-///     `Composition` is `Clone` and the field accesses they perform
-///     work uniformly on owned + borrowed values.
-/// Composition store. **B1 (2026-05-06):** all public methods take
-/// `&self`; per-field locks (storage in `Mutex`, namespaces in
-/// `RwLock`, multiparts in `Mutex`) so concurrent writers operating
-/// on disjoint state proceed in parallel. The previous outer
-/// `Arc<Mutex<CompositionStore>>` in mem_gateway / hydrator is
+///
+/// - `get` and `list_by_namespace` now return owned `Composition`
+///   values (the persistent backend can't lend references across a
+///   backend transaction / batch). All call sites accept this since
+///   `Composition` is `Clone` and the field accesses they perform
+///   work uniformly on owned + borrowed values.
+///
+/// **B1 (2026-05-06):** all public methods take `&self`; per-field
+/// locks (storage in `Mutex`, namespaces in `RwLock`, multiparts in
+/// `Mutex`) so concurrent writers operating on disjoint state
+/// proceed in parallel. The previous outer
+/// `Arc<Mutex<CompositionStore>>` in `mem_gateway` / hydrator is
 /// replaced with `Arc<CompositionStore>` — the lock convoy that
 /// regressed PUT throughput at concurrency ≥ 8 is gone.
 pub struct CompositionStore {
@@ -460,7 +468,7 @@ pub struct CompositionStore {
 
 /// Number of shards in the per-name lock array. 256 keeps the
 /// shard-collision probability low for realistic key distributions
-/// while costing only 256 × 8 bytes (parking_lot::Mutex word size).
+/// while costing only 256 × 8 bytes (`parking_lot::Mutex` word size).
 pub const NAME_LOCK_SHARDS: usize = 256;
 
 /// Number of shards in the per-id lock array. Same sizing rationale
@@ -472,7 +480,10 @@ fn name_shard(ns: NamespaceId, name: &str) -> usize {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ns.0.hash(&mut h);
     name.hash(&mut h);
-    (h.finish() as usize) % NAME_LOCK_SHARDS
+    // Modulo in u64 first so the cast lands on a value already
+    // bounded by NAME_LOCK_SHARDS — fits in usize on every target.
+    let shard = h.finish() % NAME_LOCK_SHARDS as u64;
+    usize::try_from(shard).expect("shard < NAME_LOCK_SHARDS fits in usize")
 }
 
 fn id_shard(id: CompositionId) -> usize {
@@ -549,7 +560,7 @@ impl CompositionStore {
     /// Run a closure with direct access to the storage backend.
     /// Trait methods all take `&self` (post-Mutex-removal refactor)
     /// so the closure has lock-free access; concurrent writers in
-    /// other CompositionStore methods are serialized only by their
+    /// other `CompositionStore` methods are serialized only by their
     /// per-name / per-id shard locks where atomicity is required.
     /// The hydrator uses this for `apply_hydration_batch` (still
     /// the only caller that needs typed access to the storage
@@ -1893,9 +1904,12 @@ mod tests {
                         // accidental dedup short-circuit at the
                         // composition-table layer.
                         let mut chunk_bytes = [0u8; 32];
-                        chunk_bytes[0] = w as u8;
-                        chunk_bytes[1] = (i & 0xff) as u8;
-                        chunk_bytes[2] = ((i >> 8) & 0xff) as u8;
+                        chunk_bytes[0] = u8::try_from(w).expect("WORKERS fits in u8");
+                        let i_bytes = u16::try_from(i)
+                            .expect("PER_WORKER fits in u16")
+                            .to_le_bytes();
+                        chunk_bytes[1] = i_bytes[0];
+                        chunk_bytes[2] = i_bytes[1];
                         store
                             .create(test_ns(), vec![ChunkId(chunk_bytes)], 1024)
                             .expect("concurrent create");

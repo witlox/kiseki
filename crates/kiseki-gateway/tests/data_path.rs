@@ -19,7 +19,7 @@ fn test_namespace() -> NamespaceId {
 }
 
 fn setup_gateway() -> InMemoryGateway {
-    let mut compositions = CompositionStore::new();
+    let compositions = CompositionStore::new();
     compositions.add_namespace(Namespace {
         id: test_namespace(),
         tenant_id: test_tenant(),
@@ -178,7 +178,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
     let ns2 = NamespaceId(uuid::Uuid::from_u128(202));
     let tenant = test_tenant();
 
-    let mut compositions = CompositionStore::new();
+    let compositions = CompositionStore::new();
     compositions.add_namespace(Namespace {
         id: ns1,
         tenant_id: tenant,

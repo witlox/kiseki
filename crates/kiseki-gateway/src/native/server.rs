@@ -13,8 +13,8 @@
 //! module MUST NOT reference binding-specific request-metadata types
 //! (`tonic::Request`, `tonic::Response`, `tonic::Streaming`,
 //! TCP-framed `ConnectionContext`, cxi `AttestationContext`). The
-//! grpc and tcp_framed adapters live in sibling modules and own the
-//! wire decode.
+//! `grpc` and `tcp_framed` adapters live in sibling modules and own
+//! the wire decode.
 //!
 //! POSIX verbs (`open`, `read`, `write`, ...) are not bridged here.
 //! The grpc adapter returns `Status::unimplemented` for them;
@@ -23,6 +23,12 @@
 //! `specs/implementation/adr-042-native-gateway.md`.
 
 #![allow(clippy::too_many_lines)]
+// Native data-service handlers share the binding-agnostic `async fn`
+// shape so adapters (gRPC, TCP-framed, ibverbs, libfabric) can
+// `.await` them uniformly. A few handlers are placeholders that
+// don't yet exercise gateway-side awaits (Phase 2/4 inode work);
+// they stay async to preserve the wire-shape contract.
+#![allow(clippy::unused_async)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -372,6 +378,17 @@ fn now_ms() -> u64 {
 impl ServerImpl {
     // ----- Object verbs -----
 
+    /// Native binding-agnostic `PutObject` handler. Validates the
+    /// idempotency key + per-tenant SAN, resolves the conditional
+    /// pre-flight, and writes through the gateway. Returns the
+    /// composition's identity + ETag-equivalent metadata.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control frame /
+    /// tenant / namespace id; `Status::PermissionDenied` when the
+    /// SAN payload tenant doesn't match the request tenant;
+    /// `Status::FailedPrecondition` on a failing conditional;
+    /// `Status::Unavailable` on gateway-side write failure.
     pub async fn put_object(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -407,6 +424,17 @@ impl ServerImpl {
         })
     }
 
+    /// Native `GetObject` handler — fetches an object's bytes by
+    /// `(tenant, namespace, composition_id)` after enforcing the
+    /// SAN-vs-payload tenant check. The response carries the full
+    /// object body inline; range support lives in the dedicated
+    /// `get_object_range` slice when it ships.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / namespace
+    /// / composition id; `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::NotFound` when the composition doesn't exist;
+    /// `Status::Unavailable` on gateway-side read failure.
     pub async fn get_object(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -457,6 +485,14 @@ impl ServerImpl {
         })
     }
 
+    /// Native `DeleteObject` handler — removes a composition by id.
+    /// Idempotent: deleting an already-absent id returns success
+    /// without surfacing a `NotFound` (matches S3 semantics).
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / ids;
+    /// `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::Unavailable` on gateway-side delete failure.
     pub async fn delete_object(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -475,6 +511,16 @@ impl ServerImpl {
         }
     }
 
+    /// Native `HeadObject` handler — returns metadata (size,
+    /// composition fingerprint, conditional witness fields) without
+    /// transferring the object body. Cheaper than `get_object` when
+    /// the caller only needs to check existence / pre-flight a
+    /// conditional.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / ids;
+    /// `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::NotFound` when the composition doesn't exist.
     pub async fn head_object(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -516,6 +562,15 @@ impl ServerImpl {
         })
     }
 
+    /// Native `ListObjects` handler — paginates the
+    /// `(name, composition_id)` bindings inside a namespace. Uses
+    /// the gateway's prefix-scan path; the response carries a
+    /// continuation token when results are truncated.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / namespace;
+    /// `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::Unavailable` on gateway-side iterator failure.
     pub async fn list_objects(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -556,6 +611,15 @@ impl ServerImpl {
         })
     }
 
+    /// Native `LookupByName` handler — resolves
+    /// `(namespace, name) → composition_id`. Cheaper than
+    /// `head_object` when the caller already has the name and just
+    /// needs the id for a follow-up read.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / namespace;
+    /// `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::NotFound` when the name has no binding.
     pub async fn lookup_by_name(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -582,6 +646,15 @@ impl ServerImpl {
 
     // ----- Multipart -----
 
+    /// Native `InitMultipart` handler — opens a multipart upload
+    /// session and returns the opaque `upload_id` clients use to
+    /// stream subsequent parts. Held server-side until
+    /// `complete_multipart` or `abort_multipart`.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / namespace;
+    /// `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::Unavailable` if the upload-id store is exhausted.
     pub async fn init_multipart(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -604,6 +677,16 @@ impl ServerImpl {
     /// Buffer-then-call entry point for multipart `PutPart` —
     /// stream-handling lives on the binding adapter, the handler
     /// just consumes the assembled `(header, data)` pair.
+    /// Native `PutPartBuffered` handler — buffers a single part
+    /// inside an in-flight multipart upload. The "buffered" suffix
+    /// disambiguates it from a future stream-cap variant that
+    /// auto-promotes to multipart for large objects.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / `upload_id`
+    /// / part number; `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::NotFound` for an unknown `upload_id`;
+    /// `Status::Unavailable` on backing-store write failure.
     pub async fn put_part_buffered(
         &self,
         _principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -623,6 +706,16 @@ impl ServerImpl {
         })
     }
 
+    /// Native `CompleteMultipart` handler — finalises a multipart
+    /// upload. The server reassembles the buffered parts in part-
+    /// number order and writes a single composition atomically.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / `upload_id`
+    /// / part list; `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::NotFound` for an unknown `upload_id`;
+    /// `Status::FailedPrecondition` on a part-number gap or `ETag`
+    /// mismatch; `Status::Unavailable` on gateway-side write failure.
     pub async fn complete_multipart(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -645,6 +738,13 @@ impl ServerImpl {
         })
     }
 
+    /// Native `AbortMultipart` handler — drops the buffered parts
+    /// for an in-flight upload and releases the `upload_id`.
+    /// Idempotent: aborting an unknown id returns success.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / `upload_id`;
+    /// `Status::PermissionDenied` on SAN mismatch.
     pub async fn abort_multipart(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -677,6 +777,17 @@ impl ServerImpl {
 
     // ----- Lease verbs -----
 
+    /// Native `AcquireLease` handler — issues a fresh lease for
+    /// `(tenant, namespace, resource)`. Mirrors `NFSv4` OPEN-class
+    /// semantics: the lease grants the caller exclusive or shared
+    /// access for the requested mode and is renewed via
+    /// `renew_lease` on the configured cadence.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / lease
+    /// request; `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::AlreadyExists` if a conflicting lease is held;
+    /// `Status::Unavailable` if the lease store is degraded.
     pub async fn acquire_lease(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -731,6 +842,15 @@ impl ServerImpl {
         Ok(resp)
     }
 
+    /// Native `RenewLease` handler — extends the deadline on an
+    /// existing lease. Returns the new expiry. Failing to renew
+    /// before the deadline relinquishes the lease (no separate
+    /// "lost lease" notification — clients re-acquire on demand).
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / lease id;
+    /// `Status::PermissionDenied` on SAN mismatch or lease holder
+    /// mismatch; `Status::NotFound` for an unknown / expired lease.
     pub async fn renew_lease(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -777,6 +897,14 @@ impl ServerImpl {
         Ok(resp)
     }
 
+    /// Native `ReleaseLease` handler — voluntarily relinquishes a
+    /// lease before its deadline. Idempotent: releasing an unknown
+    /// lease returns success.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / lease id;
+    /// `Status::PermissionDenied` on SAN mismatch or lease holder
+    /// mismatch.
     pub async fn release_lease(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -808,6 +936,17 @@ impl ServerImpl {
     // calls into the gateway-local verify path so the wire surface is
     // exercised; Phase 4 wires the keymanager forward path.
 
+    /// Native `FetchDek` handler — returns a single
+    /// data-encryption-key wrapping for the requested
+    /// `(tenant, epoch)` pair. Used by the client when it has to
+    /// decrypt a single composition; the server never returns
+    /// plaintext DEK material — it always returns wrapped material
+    /// the client unwraps locally with its tenant KEK.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / tenant /
+    /// epoch; `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::NotFound` for an epoch the keymanager doesn't carry.
     pub async fn fetch_dek(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -839,6 +978,16 @@ impl ServerImpl {
         })
     }
 
+    /// Native `BatchFetchDek` handler — `fetch_dek` over multiple
+    /// `(tenant, epoch)` pairs in a single round-trip. Used by the
+    /// client when warming a fresh decrypt cache (e.g. immediately
+    /// after a long-running training-loop client reconnects).
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control / batch
+    /// shape; `Status::PermissionDenied` on SAN mismatch; per-entry
+    /// failures are reported inline in the response (the call
+    /// itself succeeds even if individual entries miss).
     pub async fn batch_fetch_dek(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,
@@ -880,6 +1029,16 @@ impl ServerImpl {
 
     // ----- Topology -----
 
+    /// Native `GetTopology` handler — returns the cluster topology
+    /// snapshot the client uses to drive shard-aware routing. The
+    /// response carries the current topology version + the per-
+    /// shard leader endpoints; the client refreshes on TTL via the
+    /// 30 s safety net documented in ADR-042 §4.
+    ///
+    /// # Errors
+    /// `Status::InvalidArgument` for malformed control;
+    /// `Status::PermissionDenied` on SAN mismatch;
+    /// `Status::Unavailable` if the topology cache is uninitialised.
     pub async fn get_topology(
         &self,
         principal: &dyn kiseki_proto::native_contract::RequestPrincipal,

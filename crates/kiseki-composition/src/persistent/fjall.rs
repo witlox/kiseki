@@ -16,8 +16,8 @@
 //! - `comps`     — `comp_id.0.as_bytes()` → `[version][postcard(Composition)]`
 //! - `names`     — 16-byte `ns_id` || name → `comp_id.0.as_bytes()`
 //! - `names_rev` — `comp_id.0.as_bytes()` → 16-byte `ns_id` || name
-//! - `meta`      — fixed string keys (last_applied_seq, stuck_state,
-//!                 halted, schema_version)
+//! - `meta`      — fixed string keys (`last_applied_seq`,
+//!   `stuck_state`, `halted`, `schema_version`)
 //!
 //! Encoding helpers (`encode_composition`, `decode_composition`,
 //! `name_key`, `decode_name_key`, `encode_stuck_state`,
@@ -89,45 +89,33 @@ pub struct FjallStorage {
 impl FjallStorage {
     /// Open or create a fjall database at `path`.
     pub fn open(path: &Path) -> Result<Self, PersistentStoreError> {
-        let db = Database::builder(path).open().map_err(map_fjall_err)?;
-        let comps = db
-            .keyspace(KS_COMPS, KeyspaceCreateOptions::default)
-            .map_err(map_fjall_err)?;
-        let names = db
-            .keyspace(KS_NAMES, KeyspaceCreateOptions::default)
-            .map_err(map_fjall_err)?;
-        let names_rev = db
-            .keyspace(KS_NAMES_REV, KeyspaceCreateOptions::default)
-            .map_err(map_fjall_err)?;
-        let meta = db
-            .keyspace(KS_META, KeyspaceCreateOptions::default)
-            .map_err(map_fjall_err)?;
+        let db = Database::builder(path).open()?;
+        let comps = db.keyspace(KS_COMPS, KeyspaceCreateOptions::default)?;
+        let names = db.keyspace(KS_NAMES, KeyspaceCreateOptions::default)?;
+        let names_rev = db.keyspace(KS_NAMES_REV, KeyspaceCreateOptions::default)?;
+        let meta = db.keyspace(KS_META, KeyspaceCreateOptions::default)?;
 
         // First-open: stamp the schema version. Subsequent opens
         // verify it matches what this binary supports — a future
         // version > supported is fail-closed (operators wipe &
         // re-hydrate from Raft).
-        let stamped = meta.get(meta_keys::SCHEMA_VERSION).map_err(map_fjall_err)?;
-        match stamped {
-            Some(slice) => {
-                let &v = slice.first().ok_or_else(|| {
-                    PersistentStoreError::Decode("schema_version row empty".into())
-                })?;
-                if v > COMPOSITION_RECORD_SCHEMA_VERSION {
-                    return Err(PersistentStoreError::SchemaTooNew {
-                        found: v,
-                        supported: COMPOSITION_RECORD_SCHEMA_VERSION,
-                    });
-                }
+        let stamped = meta.get(meta_keys::SCHEMA_VERSION)?;
+        if let Some(slice) = stamped {
+            let &v = slice
+                .first()
+                .ok_or_else(|| PersistentStoreError::Decode("schema_version row empty".into()))?;
+            if v > COMPOSITION_RECORD_SCHEMA_VERSION {
+                return Err(PersistentStoreError::SchemaTooNew {
+                    found: v,
+                    supported: COMPOSITION_RECORD_SCHEMA_VERSION,
+                });
             }
-            None => {
-                meta.insert(
-                    meta_keys::SCHEMA_VERSION,
-                    [COMPOSITION_RECORD_SCHEMA_VERSION].as_slice(),
-                )
-                .map_err(map_fjall_err)?;
-                db.persist(PersistMode::SyncAll).map_err(map_fjall_err)?;
-            }
+        } else {
+            meta.insert(
+                meta_keys::SCHEMA_VERSION,
+                [COMPOSITION_RECORD_SCHEMA_VERSION].as_slice(),
+            )?;
+            db.persist(PersistMode::SyncAll)?;
         }
 
         Ok(Self {
@@ -156,9 +144,7 @@ impl FjallStorage {
     /// periodic flusher and by the gateway's `fsync_pending` hook
     /// (FUSE / NFS `fsync(2)`).
     pub fn flush(&self) -> Result<(), PersistentStoreError> {
-        self.db
-            .persist(PersistMode::SyncAll)
-            .map_err(map_fjall_err)?;
+        self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
@@ -179,9 +165,7 @@ impl FjallStorage {
         if self.sync_per_write {
             // Per-write fsync (POSIX semantics on the eventual-
             // durability=false path).
-            self.db
-                .persist(PersistMode::SyncAll)
-                .map_err(map_fjall_err)?;
+            self.db.persist(PersistMode::SyncAll)?;
         }
         // Eventual-durability path: nothing to do here. The WAL
         // bytes are already in the journal from the preceding
@@ -196,10 +180,6 @@ impl FjallStorage {
     }
 }
 
-fn map_fjall_err(e: fjall::Error) -> PersistentStoreError {
-    PersistentStoreError::Decode(format!("fjall: {e}"))
-}
-
 /// Off-thread fsync handle. Calling [`Self::flush`] issues a
 /// `PersistMode::SyncAll` against the shared `Database` — the same
 /// fsync the inline write path would have done.
@@ -212,16 +192,14 @@ impl FjallFlusher {
     /// Drive an fsync of the WAL. Returns `Ok(())` once the WAL bytes
     /// are durable on disk.
     pub fn flush(&self) -> Result<(), PersistentStoreError> {
-        self.db
-            .persist(PersistMode::SyncAll)
-            .map_err(map_fjall_err)?;
+        self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 }
 
 impl CompositionStorage for FjallStorage {
     fn get(&self, id: CompositionId) -> Result<Option<Composition>, PersistentStoreError> {
-        match self.comps.get(id.0.as_bytes()).map_err(map_fjall_err)? {
+        match self.comps.get(id.0.as_bytes())? {
             None => Ok(None),
             Some(slice) => Ok(Some(decode_composition(slice.as_ref())?)),
         }
@@ -231,7 +209,7 @@ impl CompositionStorage for FjallStorage {
         // fjall's `len()` walks the partition; matches redb's
         // `Table::len()` cost. Acceptable for the operator-only
         // /metrics gauge that calls this.
-        Ok(self.comps.len().map_err(map_fjall_err)? as u64)
+        Ok(self.comps.len()? as u64)
     }
 
     fn list_in_namespace(&self, ns: NamespaceId) -> Result<Vec<Composition>, PersistentStoreError> {
@@ -241,7 +219,7 @@ impl CompositionStorage for FjallStorage {
         // size which is operator-shaped.
         let mut out = Vec::new();
         for entry in self.comps.iter() {
-            let (_k, v) = entry.into_inner().map_err(map_fjall_err)?;
+            let (_k, v) = entry.into_inner()?;
             let comp = decode_composition(v.as_ref())?;
             if comp.namespace_id == ns {
                 out.push(comp);
@@ -252,9 +230,7 @@ impl CompositionStorage for FjallStorage {
 
     fn put(&self, comp: Composition) -> Result<(), PersistentStoreError> {
         let bytes = encode_composition(&comp)?;
-        self.comps
-            .insert(comp.id.0.as_bytes(), bytes.as_slice())
-            .map_err(map_fjall_err)?;
+        self.comps.insert(comp.id.0.as_bytes(), bytes.as_slice())?;
         self.persist_after_write()
     }
 
@@ -262,16 +238,8 @@ impl CompositionStorage for FjallStorage {
         // Atomic batch: drop the comp row + cascade-drop the name
         // binding so a future PUT-by-name doesn't resolve to a
         // dangling composition_id. Mirrors the redb path.
-        let existed = self
-            .comps
-            .get(id.0.as_bytes())
-            .map_err(map_fjall_err)?
-            .is_some();
-        let prior_name = self
-            .names_rev
-            .get(id.0.as_bytes())
-            .map_err(map_fjall_err)?
-            .map(|s| s.to_vec());
+        let existed = self.comps.get(id.0.as_bytes())?.is_some();
+        let prior_name = self.names_rev.get(id.0.as_bytes())?.map(|s| s.to_vec());
 
         let mut batch = self.db.batch();
         batch.remove(&self.comps, id.0.as_bytes().to_vec());
@@ -279,7 +247,7 @@ impl CompositionStorage for FjallStorage {
             batch.remove(&self.names, name_key_bytes.clone());
             batch.remove(&self.names_rev, id.0.as_bytes().to_vec());
         }
-        batch.commit().map_err(map_fjall_err)?;
+        batch.commit()?;
         self.persist_after_write()?;
         Ok(existed)
     }
@@ -290,7 +258,7 @@ impl CompositionStorage for FjallStorage {
         name: &str,
     ) -> Result<Option<CompositionId>, PersistentStoreError> {
         let key = name_key(ns, name);
-        match self.names.get(&key).map_err(map_fjall_err)? {
+        match self.names.get(&key)? {
             None => Ok(None),
             Some(slice) => {
                 let bytes = slice.as_ref();
@@ -311,7 +279,7 @@ impl CompositionStorage for FjallStorage {
         &self,
         id: CompositionId,
     ) -> Result<Option<(NamespaceId, String)>, PersistentStoreError> {
-        match self.names_rev.get(id.0.as_bytes()).map_err(map_fjall_err)? {
+        match self.names_rev.get(id.0.as_bytes())? {
             None => Ok(None),
             Some(slice) => {
                 let bytes = slice.as_ref();
@@ -345,16 +313,8 @@ impl CompositionStorage for FjallStorage {
         // reverse entry; if id had a different prior name, drop
         // the old forward entry. Pre-flight conditional checks are
         // the caller's job.
-        let prev_id = self
-            .names
-            .get(&new_key)
-            .map_err(map_fjall_err)?
-            .map(|s| s.to_vec());
-        let old_rev_for_id = self
-            .names_rev
-            .get(id_bytes)
-            .map_err(map_fjall_err)?
-            .map(|s| s.to_vec());
+        let prev_id = self.names.get(&new_key)?.map(|s| s.to_vec());
+        let old_rev_for_id = self.names_rev.get(id_bytes)?.map(|s| s.to_vec());
 
         let mut batch = self.db.batch();
         if let Some(prev) = prev_id {
@@ -369,17 +329,13 @@ impl CompositionStorage for FjallStorage {
         }
         batch.insert(&self.names, new_key.clone(), id_bytes.to_vec());
         batch.insert(&self.names_rev, id_bytes.to_vec(), new_key);
-        batch.commit().map_err(map_fjall_err)?;
+        batch.commit()?;
         self.persist_after_write()
     }
 
     fn name_remove(&self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError> {
         let key = name_key(ns, name);
-        let existed_id = self
-            .names
-            .get(&key)
-            .map_err(map_fjall_err)?
-            .map(|s| s.to_vec());
+        let existed_id = self.names.get(&key)?.map(|s| s.to_vec());
         let mut batch = self.db.batch();
         let removed = if let Some(id_bytes) = existed_id {
             batch.remove(&self.names, key);
@@ -388,7 +344,7 @@ impl CompositionStorage for FjallStorage {
         } else {
             false
         };
-        batch.commit().map_err(map_fjall_err)?;
+        batch.commit()?;
         self.persist_after_write()?;
         Ok(removed)
     }
@@ -404,7 +360,7 @@ impl CompositionStorage for FjallStorage {
         let ns_prefix = ns.0.as_bytes();
         let mut out: Vec<(String, CompositionId)> = Vec::new();
         for entry in self.names.prefix(ns_prefix) {
-            let (k, v) = entry.into_inner().map_err(map_fjall_err)?;
+            let (k, v) = entry.into_inner()?;
             let kbytes = k.as_ref();
             if kbytes.len() < 16 {
                 continue;
@@ -439,11 +395,7 @@ impl CompositionStorage for FjallStorage {
     }
 
     fn last_applied_seq(&self) -> Result<SequenceNumber, PersistentStoreError> {
-        match self
-            .meta
-            .get(meta_keys::LAST_APPLIED_SEQ)
-            .map_err(map_fjall_err)?
-        {
+        match self.meta.get(meta_keys::LAST_APPLIED_SEQ)? {
             None => Ok(SequenceNumber(0)),
             Some(slice) => {
                 let bytes = slice.as_ref();
@@ -461,18 +413,14 @@ impl CompositionStorage for FjallStorage {
     }
 
     fn stuck_state(&self) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError> {
-        match self
-            .meta
-            .get(meta_keys::STUCK_STATE)
-            .map_err(map_fjall_err)?
-        {
+        match self.meta.get(meta_keys::STUCK_STATE)? {
             None => Ok(None),
             Some(slice) => decode_stuck_state(slice.as_ref()),
         }
     }
 
     fn halted(&self) -> Result<bool, PersistentStoreError> {
-        match self.meta.get(meta_keys::HALTED).map_err(map_fjall_err)? {
+        match self.meta.get(meta_keys::HALTED)? {
             None => Ok(false),
             Some(slice) => Ok(slice.first().is_some_and(|&b| b != 0)),
         }
@@ -489,11 +437,7 @@ impl CompositionStorage for FjallStorage {
         }
         for id in batch.removes {
             // Cascade-drop name binding (same as `remove`).
-            let prior_name = self
-                .names_rev
-                .get(id.0.as_bytes())
-                .map_err(map_fjall_err)?
-                .map(|s| s.to_vec());
+            let prior_name = self.names_rev.get(id.0.as_bytes())?.map(|s| s.to_vec());
             wb.remove(&self.comps, id.0.as_bytes().to_vec());
             if let Some(name_key_bytes) = prior_name {
                 wb.remove(&self.names, name_key_bytes);
@@ -504,16 +448,8 @@ impl CompositionStorage for FjallStorage {
             let new_key = name_key(ns, &name);
             let id_bytes = id.0.as_bytes();
             // Overwrite-replace cascade — match `name_insert`.
-            let prev_id = self
-                .names
-                .get(&new_key)
-                .map_err(map_fjall_err)?
-                .map(|s| s.to_vec());
-            let old_rev = self
-                .names_rev
-                .get(id_bytes)
-                .map_err(map_fjall_err)?
-                .map(|s| s.to_vec());
+            let prev_id = self.names.get(&new_key)?.map(|s| s.to_vec());
+            let old_rev = self.names_rev.get(id_bytes)?.map(|s| s.to_vec());
             if let Some(prev) = prev_id {
                 if prev.as_slice() != id_bytes.as_slice() {
                     wb.remove(&self.names_rev, prev);
@@ -529,11 +465,7 @@ impl CompositionStorage for FjallStorage {
         }
         for (ns, name) in batch.name_removes {
             let key = name_key(ns, &name);
-            let existed_id = self
-                .names
-                .get(&key)
-                .map_err(map_fjall_err)?
-                .map(|s| s.to_vec());
+            let existed_id = self.names.get(&key)?.map(|s| s.to_vec());
             wb.remove(&self.names, key);
             if let Some(id_bytes) = existed_id {
                 wb.remove(&self.names_rev, id_bytes);
@@ -561,13 +493,11 @@ impl CompositionStorage for FjallStorage {
                 vec![u8::from(halted)],
             );
         }
-        wb.commit().map_err(map_fjall_err)?;
+        wb.commit()?;
         // Hydration batch always fsyncs — the durability barrier is
         // load-bearing for `last_applied_seq` correctness on
         // restart.
-        self.db
-            .persist(PersistMode::SyncAll)
-            .map_err(map_fjall_err)?;
+        self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
@@ -602,11 +532,7 @@ impl CompositionStorage for FjallStorage {
         // prior_id, fall back to a fjall.get.
         let prev_id_bytes: Option<Vec<u8>> = match prior_id {
             Some(id) => Some(id.0.as_bytes().to_vec()),
-            None => self
-                .names
-                .get(&new_key)
-                .map_err(map_fjall_err)?
-                .map(|s| s.to_vec()),
+            None => self.names.get(&new_key)?.map(|s| s.to_vec()),
         };
 
         let mut batch = self.db.batch();
@@ -618,7 +544,7 @@ impl CompositionStorage for FjallStorage {
         }
         batch.insert(&self.names, new_key.clone(), id_bytes.to_vec());
         batch.insert(&self.names_rev, id_bytes.to_vec(), new_key);
-        batch.commit().map_err(map_fjall_err)?;
+        batch.commit()?;
         self.persist_after_write()
     }
 }
@@ -647,7 +573,7 @@ mod tests {
     #[test]
     fn put_get_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = FjallStorage::open(dir.path()).unwrap();
+        let store = FjallStorage::open(dir.path()).unwrap();
         let comp = make_comp(7);
         store.put(comp.clone()).unwrap();
         assert_eq!(store.get(comp.id).unwrap(), Some(comp));
@@ -656,7 +582,7 @@ mod tests {
     #[test]
     fn name_insert_lookup_remove() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = FjallStorage::open(dir.path()).unwrap();
+        let store = FjallStorage::open(dir.path()).unwrap();
         let id = CompositionId(uuid::Uuid::from_u128(42));
         let ns = NamespaceId(uuid::Uuid::from_u128(2));
         store.name_insert(ns, "alpha".into(), id).unwrap();
@@ -670,7 +596,7 @@ mod tests {
     #[test]
     fn name_list_prefix_scan() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = FjallStorage::open(dir.path()).unwrap();
+        let store = FjallStorage::open(dir.path()).unwrap();
         let ns = NamespaceId(uuid::Uuid::from_u128(2));
         for (i, n) in ["alpha", "beta", "alphabet"].iter().enumerate() {
             let id = CompositionId(uuid::Uuid::from_u128(i as u128 + 100));
@@ -687,7 +613,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let comp = make_comp(11);
         {
-            let mut store = FjallStorage::open(dir.path()).unwrap();
+            let store = FjallStorage::open(dir.path()).unwrap();
             store.put(comp.clone()).unwrap();
         }
         let store = FjallStorage::open(dir.path()).unwrap();
