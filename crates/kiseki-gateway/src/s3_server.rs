@@ -413,29 +413,33 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
             let body_bytes: Vec<u8> = resp.body;
 
             // RFC 9110 §14 — Range support.
-            if let Some(range_hdr) = headers.get("range").and_then(|v| v.to_str().ok()) {
+            if let Some(range_hdr) = headers
+                .get(axum::http::header::RANGE)
+                .and_then(|v| v.to_str().ok())
+            {
                 match parse_byte_range(range_hdr, body_bytes.len()) {
                     Some(RangeResult::Single { start, end }) => {
+                        use axum::http::HeaderValue;
+                        use axum::http::header::{
+                            CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+                        };
                         let slice = body_bytes[start..=end].to_vec();
-                        let mut hdrs = vec![
-                            ("content-length".to_string(), slice.len().to_string()),
-                            ("etag".to_string(), etag),
-                            (
-                                "content-range".to_string(),
-                                format!("bytes {start}-{end}/{}", body_bytes.len()),
-                            ),
-                        ];
-                        if let Some(ct) = stored_ct {
-                            hdrs.push(("content-type".to_string(), ct));
-                        }
+                        let slice_len = slice.len();
+                        let total_len = body_bytes.len();
                         let mut resp = (StatusCode::PARTIAL_CONTENT, slice).into_response();
                         let h = resp.headers_mut();
-                        for (k, v) in hdrs {
-                            if let (Ok(name), Ok(val)) = (
-                                axum::http::HeaderName::try_from(k),
-                                axum::http::HeaderValue::try_from(v),
-                            ) {
-                                h.insert(name, val);
+                        h.insert(CONTENT_LENGTH, HeaderValue::from(slice_len));
+                        if let Ok(v) = HeaderValue::from_str(&etag) {
+                            h.insert(ETAG, v);
+                        }
+                        if let Ok(v) =
+                            HeaderValue::from_str(&format!("bytes {start}-{end}/{total_len}"))
+                        {
+                            h.insert(CONTENT_RANGE, v);
+                        }
+                        if let Some(ct) = stored_ct {
+                            if let Ok(v) = HeaderValue::from_str(&ct) {
+                                h.insert(CONTENT_TYPE, v);
                             }
                         }
                         return resp;
@@ -446,27 +450,12 @@ async fn get_object<G: GatewayOps + Send + Sync + 'static>(
                 }
             }
 
-            let mut hdrs = vec![
-                (
-                    "content-length".to_string(),
-                    resp.content_length.to_string(),
-                ),
-                ("etag".to_string(), etag),
-            ];
-            if let Some(ct) = stored_ct {
-                hdrs.push(("content-type".to_string(), ct));
-            }
-            let mut response = (StatusCode::OK, body_bytes).into_response();
-            let h = response.headers_mut();
-            for (k, v) in hdrs {
-                if let (Ok(name), Ok(val)) = (
-                    axum::http::HeaderName::try_from(k),
-                    axum::http::HeaderValue::try_from(v),
-                ) {
-                    h.insert(name, val);
-                }
-            }
-            response
+            // Construct headers via static `HeaderName` constants
+            // and `HeaderValue::from(<u64>)` for the content-length
+            // (infallible). The previous shape allocated 5 Strings
+            // per response (header names + values via `to_string()`)
+            // and routed through 4-5 fallible `try_from` parses.
+            build_get_response_with_headers(body_bytes, resp.content_length, &etag, stored_ct)
         }
         Err(crate::error::GatewayError::ServiceUnavailable(msg)) => {
             // ADR-040 §D6.3 + I-2: hydrator halt mode → 503 with
@@ -577,6 +566,34 @@ fn now_unix_secs() -> u64 {
 /// Plain-text error bodies will confuse SDK clients that try to
 /// parse the XML. Use this helper for any error path that AWS
 /// documents an error code for.
+/// Build a 200 OK GET response with content-length / etag /
+/// optional content-type headers, using the static `HeaderName`
+/// constants + `HeaderValue::from(<u64>)` so the per-response
+/// allocation count is one body + one optional content-type
+/// String parse, instead of the previous 5-String + 5-`try_from`
+/// loop.
+fn build_get_response_with_headers(
+    body: Vec<u8>,
+    content_length: u64,
+    etag: &str,
+    content_type: Option<String>,
+) -> axum::response::Response {
+    use axum::http::HeaderValue;
+    use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+    let mut response = (StatusCode::OK, body).into_response();
+    let h = response.headers_mut();
+    h.insert(CONTENT_LENGTH, HeaderValue::from(content_length));
+    if let Ok(v) = HeaderValue::from_str(etag) {
+        h.insert(ETAG, v);
+    }
+    if let Some(ct) = content_type {
+        if let Ok(v) = HeaderValue::from_str(&ct) {
+            h.insert(CONTENT_TYPE, v);
+        }
+    }
+    response
+}
+
 fn s3_error_response(status: StatusCode, code: &str, message: &str) -> axum::response::Response {
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
