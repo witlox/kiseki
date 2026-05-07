@@ -507,14 +507,25 @@ async fn reply_fsinfo<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> 
 
     w.write_u32(status::NFS3_OK);
     w.write_bool(false); // post-op attrs
-                         // rtmax, rtpref, rtmult (read transfer)
-    w.write_u32(1_048_576); // 1MB max read
-    w.write_u32(65536); // 64KB preferred
-    w.write_u32(4096); // 4KB multiple
-                       // wtmax, wtpref, wtmult (write transfer)
-    w.write_u32(1_048_576);
-    w.write_u32(65536);
-    w.write_u32(4096);
+                         // rtmax, rtpref, rtmult (read transfer).
+                         // The Linux NFSv3 client uses `rtpref` (not
+                         // `rtmax`) when no explicit rsize= mount option
+                         // is given. With rtpref=64 KiB the kernel
+                         // issued 16× more RPCs per MiB than necessary —
+                         // a 3-node compose fio sequential read sat at
+                         // ~68 MB/s with auto-negotiated rsize, ~626 MB/s
+                         // with explicit rsize=1MiB. Match rtpref to
+                         // rtmax so the default mount gets the same
+                         // throughput as the explicit one.
+    w.write_u32(1_048_576); // rtmax — 1 MiB max read
+    w.write_u32(1_048_576); // rtpref — 1 MiB preferred (was 64 KiB)
+    w.write_u32(4096); // rtmult — 4 KiB transfer alignment
+                       // wtmax, wtpref, wtmult (write transfer) —
+                       // symmetric to read; same rtpref-vs-rtmax
+                       // trap on the write path.
+    w.write_u32(1_048_576); // wtmax — 1 MiB max write
+    w.write_u32(1_048_576); // wtpref — 1 MiB preferred (was 64 KiB)
+    w.write_u32(4096); // wtmult — 4 KiB transfer alignment
     // dtpref (readdir)
     w.write_u32(65536);
     // maxfilesize
