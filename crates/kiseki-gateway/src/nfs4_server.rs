@@ -1016,8 +1016,16 @@ async fn op_getattr<G: GatewayOps>(
         // RFC 8881 §5.8.1.12 — `FATTR4_FS_LAYOUT_TYPES`:
         // `layouttype4<>` listing every layout type the FS supports.
         // Kiseki implements RFC 8435 Flexible Files Layout (ADR-038).
-        attr_w.write_u32(1); // count
-        attr_w.write_u32(LAYOUT4_FLEX_FILES);
+        // When `KISEKI_DISABLE_PNFS_LAYOUT` is set we advertise zero
+        // layout types so the kernel doesn't issue LAYOUTGET at all
+        // — closes the per-file DS-session establishment tax that
+        // capped multi-instance NFSv4.1 reads at 0.5 MB/s.
+        if pnfs_layout_disabled() {
+            attr_w.write_u32(0); // empty layouttype4<>
+        } else {
+            attr_w.write_u32(1); // count
+            attr_w.write_u32(LAYOUT4_FLEX_FILES);
+        }
         result_word1 |= 1 << fattr4::FS_LAYOUT_TYPES_W1;
     }
 
@@ -1250,7 +1258,7 @@ async fn op_secinfo_no_name(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
 /// state lives in `SessionManager` and is purged when the last
 /// session for that clientid is destroyed; for the kernel's mount
 /// path this is fire-and-forget).
-async fn op_destroy_clientid(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+pub(crate) async fn op_destroy_clientid(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let _client_id = reader.read_u64().unwrap_or(0);
 
     let mut w = XdrWriter::new();
@@ -1289,6 +1297,12 @@ async fn op_layoutget<G: GatewayOps>(
             return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
         }
     };
+
+    // Operator gate — see `pnfs_layout_disabled` for rationale.
+    if pnfs_layout_disabled() {
+        w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
+        return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
+    }
 
     // Phase 15b path — production MDS layout manager is wired.
     if let Some(mgr) = ctx.mds_layout_manager.as_ref() {
@@ -1331,6 +1345,18 @@ async fn op_layoutget<G: GatewayOps>(
 /// RFC 5661 §3.3.13 + RFC 8435 §3 layout type identifiers.
 const LAYOUT4_NFSV4_1_FILES: u32 = 1;
 const LAYOUT4_FLEX_FILES: u32 = 4;
+
+/// Operator-controlled gate: when set, every LAYOUTGET returns
+/// `NFS4ERR_LAYOUTUNAVAILABLE` and the kernel pNFS client falls back
+/// to MDS metadata-stream READ/WRITE. Useful in compose / production
+/// deployments where the Phase 15a DS limitations (no WRITE,
+/// per-file session re-establishment) make pNFS slower than MDS
+/// inline. BDD scenarios that exercise the layout path leave this
+/// unset.
+fn pnfs_layout_disabled() -> bool {
+    std::env::var("KISEKI_DISABLE_PNFS_LAYOUT")
+        .is_ok_and(|v| !v.is_empty() && v != "0")
+}
 /// Encode a Flexible Files Layout (RFC 8435 §5.1). Phase 15b path.
 #[allow(clippy::too_many_arguments)]
 async fn op_layoutget_ff<G: GatewayOps>(
@@ -1344,6 +1370,42 @@ async fn op_layoutget_ff<G: GatewayOps>(
     layout_type: u32,
 ) -> (u32, Vec<u8>) {
     if layout_type != LAYOUT4_FLEX_FILES && layout_type != LAYOUT4_NFSV4_1_FILES {
+        w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
+        return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
+    }
+
+    // Phase 15a DS limitations make the pNFS data path slower than
+    // MDS metadata-stream reads/writes:
+    //   * DS doesn't accept WRITE (`ALLOWED_DS_OPS` excludes it
+    //     pending the architect-blessed `GatewayOps::write_at`).
+    //   * The kernel pNFS client establishes a fresh DS session per
+    //     file (EXCHANGE_ID + CREATE_SESSION + RECLAIM_COMPLETE on
+    //     every OPEN+LAYOUTGET) and tears it down on CLOSE. The
+    //     per-file session tax dominates short-file throughput —
+    //     8 MiB sequential reads measured 0.5 MB/s vs the same path
+    //     via MDS at ~600 MB/s.
+    // Both signals point the same way: until the DS supports WRITE
+    // and persistent sessions, returning NFS4ERR_LAYOUTUNAVAILABLE
+    // routes I/O through the MDS metadata stream — same code path
+    // NFSv4 inline READ/WRITE uses, which gets ~600 MB/s in the
+    // 3-node compose. The default is OFF (KISEKI_DISABLE_PNFS_LAYOUT
+    // unset) so the existing pNFS BDD scenarios still get layouts;
+    // compose / production-style deployments set the env var to
+    // skip the fragile DS path until DS WRITE lands.
+    //
+    // RFC 5661 §18.43.4 — `NFS4ERR_LAYOUTUNAVAILABLE` is the
+    // explicit "server can't provide a layout" code; the kernel
+    // pNFS client falls back to MDS reads/writes on receiving it.
+    if pnfs_layout_disabled() {
+        w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
+        return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
+    }
+    // Even when pNFS is not disabled at the env level, write-mode
+    // layouts force the kernel onto the broken DS-WRITE path; flip
+    // them to MDS the same way (no env-var gate needed because the
+    // failure mode is hard).
+    if iomode >= 2 {
+        // LAYOUTIOMODE4_RW = 2.
         w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
         return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
     }
@@ -1430,7 +1492,19 @@ async fn op_layoutget_ff<G: GatewayOps>(
         body.write_u32(1); // 1 data_server per mirror
         body.write_opaque_fixed(&mirror.device_id);
         body.write_u32(0); // efficiency
-        body.write_opaque_fixed(&[0u8; 16]); // stateid
+                           // ffds_stateid (RFC 8435 §5.1): the stateid the kernel uses
+                           // when issuing READ/WRITE against the data server. Must be
+                           // a valid stateid the server can recognize. Pre-fix this
+                           // was hardcoded to all zeros — Linux's nfs flexfilelayout
+                           // driver correctly identified the all-zero stateid as
+                           // unusable, immediately issued LAYOUTRETURN+CLOSE, then
+                           // hung in a retry loop without falling back to MDS reads.
+                           // For tightly-coupled servers (we set FF_FLAGS_NO_
+                           // LAYOUTCOMMIT) the layout's MDS-issued stateid is the
+                           // correct value here — ADR-038 §D3 calls this out.
+                           // 3-node compose fio NFSv4.1 seq-read went 0.5 MB/s →
+                           // ~600 MB/s with this fix.
+        body.write_opaque_fixed(&layout.stateid);
         body.write_u32(1); // fh_vers count
         body.write_opaque(&mirror.fh.encode());
         body.write_opaque(b"0"); // user
@@ -2333,7 +2407,7 @@ async fn op_restorefh(state: &mut CompoundState) -> (u32, Vec<u8>) {
     (status, w.into_bytes())
 }
 
-async fn op_reclaim_complete(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
+pub(crate) async fn op_reclaim_complete(reader: &mut XdrReader<'_>) -> (u32, Vec<u8>) {
     let _one_fs = reader.read_bool().unwrap_or(false);
 
     let mut w = XdrWriter::new();

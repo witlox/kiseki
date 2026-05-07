@@ -39,10 +39,12 @@ use crate::pnfs::{FhValidateError, PnfsFhMacKey, PnfsFileHandle};
 
 /// Op codes accepted by the DS. Anything outside this set returns
 /// `NFS4ERR_NOTSUPP` per I-PN7.
-pub const ALLOWED_DS_OPS: [u32; 8] = [
+pub const ALLOWED_DS_OPS: [u32; 10] = [
     op::EXCHANGE_ID,
     op::CREATE_SESSION,
     op::DESTROY_SESSION,
+    op::DESTROY_CLIENTID,
+    op::RECLAIM_COMPLETE,
     op::SEQUENCE,
     op::PUTFH,
     op::READ,
@@ -52,6 +54,14 @@ pub const ALLOWED_DS_OPS: [u32; 8] = [
     // creates a fresh composition, which doesn't match the pNFS write-to-an-
     // existing-stripe semantics. WRITE is wired in a follow-up phase along
     // with the architect-blessed `GatewayOps::write_at`. See Phase 15b notes.
+    //
+    // RECLAIM_COMPLETE + DESTROY_CLIENTID are required by Linux's pNFS
+    // client even on DS-only sessions. Per RFC 8881 §13.6.4: "servers
+    // MUST permit clients to send RECLAIM_COMPLETE on a session bound
+    // only to the data server"; symmetric for DESTROY_CLIENTID at
+    // teardown. Pre-fix the DS rejected both with NFS4ERR_NOTSUPP and
+    // the kernel got stuck retrying session establishment, eventually
+    // issuing LAYOUTRETURN+CLOSE without ever doing any READ.
 ];
 
 /// Stateless DS context. One instance per storage node.
@@ -294,6 +304,8 @@ async fn process_ds_op<G: GatewayOps + Send + Sync + 'static>(
         op::EXCHANGE_ID => op_exchange_id_with_role(reader, sessions, ServerRole::Ds).await,
         op::CREATE_SESSION => op_create_session(reader, sessions).await,
         op::DESTROY_SESSION => op_destroy_session(reader, sessions).await,
+        op::DESTROY_CLIENTID => crate::nfs4_server::op_destroy_clientid(reader).await,
+        op::RECLAIM_COMPLETE => crate::nfs4_server::op_reclaim_complete(reader).await,
         op::SEQUENCE => op_sequence(reader, sessions).await,
         op::PUTFH => op_putfh_ds(reader, ctx, state).await,
         op::READ => op_read_ds(reader, ctx, state).await,
@@ -537,15 +549,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn allowed_ds_ops_are_exactly_eight() {
+    async fn allowed_ds_ops_are_exactly_ten() {
         // I-PN7 — pin the spec: changes here require an ADR amendment.
-        assert_eq!(ALLOWED_DS_OPS.len(), 8);
+        // Bumped 8 → 10 in 2026-05-07: added RECLAIM_COMPLETE +
+        // DESTROY_CLIENTID after the kernel pNFS client retried session
+        // establishment in a loop when the DS rejected them with
+        // NFS4ERR_NOTSUPP. RFC 8881 §13.6.4 requires DS to permit
+        // RECLAIM_COMPLETE on DS-only sessions.
+        assert_eq!(ALLOWED_DS_OPS.len(), 10);
         let mut sorted: Vec<u32> = ALLOWED_DS_OPS.into();
         sorted.sort_unstable();
         let mut expected: Vec<u32> = [
             op::EXCHANGE_ID,
             op::CREATE_SESSION,
             op::DESTROY_SESSION,
+            op::DESTROY_CLIENTID,
+            op::RECLAIM_COMPLETE,
             op::PUTFH,
             op::READ,
             op::COMMIT,

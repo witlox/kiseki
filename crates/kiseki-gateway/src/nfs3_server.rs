@@ -526,7 +526,7 @@ async fn reply_fsinfo<G: GatewayOps>(xid: u32, _ctx: &NfsContext<G>) -> Vec<u8> 
     w.write_u32(1_048_576); // wtmax — 1 MiB max write
     w.write_u32(1_048_576); // wtpref — 1 MiB preferred (was 64 KiB)
     w.write_u32(4096); // wtmult — 4 KiB transfer alignment
-    // dtpref (readdir)
+                       // dtpref (readdir)
     w.write_u32(65536);
     // maxfilesize
     w.write_u64(u64::MAX);
