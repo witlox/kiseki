@@ -25,12 +25,21 @@ pub struct DirEntry {
     pub size: u64,
 }
 
+/// Per-namespace directory state. Holds the forward `name → entry`
+/// map plus a `fh → name` reverse index so `name_for` is O(1)
+/// instead of a linear scan over every file in the namespace.
+#[derive(Default)]
+struct NamespaceDir {
+    by_name: HashMap<String, DirEntry>,
+    by_handle: HashMap<FileHandle, String>,
+}
+
 /// Directory index — maps (namespace, filename) to directory entries.
 ///
 /// Thread-safe via `Mutex`. Shared between NFS CREATE (writer) and
 /// NFS LOOKUP / READDIR (readers).
 pub struct DirectoryIndex {
-    entries: Mutex<HashMap<NamespaceId, HashMap<String, DirEntry>>>,
+    entries: Mutex<HashMap<NamespaceId, NamespaceDir>>,
 }
 
 impl DirectoryIndex {
@@ -51,7 +60,17 @@ impl DirectoryIndex {
         size: u64,
     ) {
         let mut entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
-        entries.entry(ns).or_default().insert(
+        let dir = entries.entry(ns).or_default();
+        // If a previous entry with this name had a different fh,
+        // drop the stale fh→name back-edge so the reverse index
+        // doesn't keep pointing at a name that no longer exists.
+        if let Some(prev) = dir.by_name.get(&name) {
+            if prev.file_handle != file_handle {
+                dir.by_handle.remove(&prev.file_handle);
+            }
+        }
+        dir.by_handle.insert(file_handle, name.clone());
+        dir.by_name.insert(
             name.clone(),
             DirEntry {
                 name,
@@ -63,19 +82,20 @@ impl DirectoryIndex {
     }
 
     /// Reverse-lookup: find the name for a file handle in a namespace.
+    /// O(1) via the `by_handle` reverse index.
     pub fn name_for(&self, ns: NamespaceId, fh: &FileHandle) -> Option<String> {
         let entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
-        entries.get(&ns).and_then(|dir| {
-            dir.values()
-                .find(|e| &e.file_handle == fh)
-                .map(|e| e.name.clone())
-        })
+        entries
+            .get(&ns)
+            .and_then(|dir| dir.by_handle.get(fh).cloned())
     }
 
     /// Look up a file by name in a namespace.
     pub fn lookup(&self, ns: NamespaceId, name: &str) -> Option<DirEntry> {
         let entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
-        entries.get(&ns).and_then(|dir| dir.get(name).cloned())
+        entries
+            .get(&ns)
+            .and_then(|dir| dir.by_name.get(name).cloned())
     }
 
     /// List all files in a namespace.
@@ -83,17 +103,21 @@ impl DirectoryIndex {
         let entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
         entries
             .get(&ns)
-            .map(|dir| dir.values().cloned().collect())
+            .map(|dir| dir.by_name.values().cloned().collect())
             .unwrap_or_default()
     }
 
     /// Remove a file from the namespace directory.
     pub fn remove(&self, ns: NamespaceId, name: &str) -> bool {
         let mut entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
-        entries
-            .get_mut(&ns)
-            .map(|dir| dir.remove(name).is_some())
-            .unwrap_or(false)
+        let Some(dir) = entries.get_mut(&ns) else {
+            return false;
+        };
+        let Some(entry) = dir.by_name.remove(name) else {
+            return false;
+        };
+        dir.by_handle.remove(&entry.file_handle);
+        true
     }
 
     /// Rename a file within a namespace.
@@ -102,18 +126,19 @@ impl DirectoryIndex {
         let Some(dir) = entries.get_mut(&ns) else {
             return false;
         };
-        let Some(mut entry) = dir.remove(old_name) else {
+        let Some(mut entry) = dir.by_name.remove(old_name) else {
             return false;
         };
         entry.name = new_name.to_owned();
-        dir.insert(new_name.to_owned(), entry);
+        dir.by_handle.insert(entry.file_handle, new_name.to_owned());
+        dir.by_name.insert(new_name.to_owned(), entry);
         true
     }
 
     /// Number of files in a namespace.
     pub fn count(&self, ns: NamespaceId) -> usize {
         let entries = self.entries.lock().lock_or_die("nfs_dir.unknown");
-        entries.get(&ns).map_or(0, HashMap::len)
+        entries.get(&ns).map_or(0, |dir| dir.by_name.len())
     }
 }
 
@@ -202,6 +227,55 @@ mod tests {
     async fn rename_nonexistent() {
         let idx = DirectoryIndex::new();
         assert!(!idx.rename(ns1(), "nope", "also_nope"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn name_for_reverse_lookup() {
+        let idx = DirectoryIndex::new();
+        idx.insert(ns1(), "a.txt".into(), [1; 32], comp(1), 10);
+        idx.insert(ns1(), "b.txt".into(), [2; 32], comp(2), 20);
+
+        assert_eq!(idx.name_for(ns1(), &[1; 32]), Some("a.txt".into()));
+        assert_eq!(idx.name_for(ns1(), &[2; 32]), Some("b.txt".into()));
+        assert_eq!(idx.name_for(ns1(), &[3; 32]), None);
+        // Reverse lookup respects namespace isolation.
+        assert_eq!(idx.name_for(ns2(), &[1; 32]), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn name_for_after_remove() {
+        let idx = DirectoryIndex::new();
+        idx.insert(ns1(), "a.txt".into(), [1; 32], comp(1), 10);
+        assert_eq!(idx.name_for(ns1(), &[1; 32]), Some("a.txt".into()));
+
+        idx.remove(ns1(), "a.txt");
+        assert_eq!(idx.name_for(ns1(), &[1; 32]), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn name_for_after_rename() {
+        let idx = DirectoryIndex::new();
+        idx.insert(ns1(), "old.txt".into(), [1; 32], comp(1), 10);
+        idx.rename(ns1(), "old.txt", "new.txt");
+
+        assert_eq!(idx.name_for(ns1(), &[1; 32]), Some("new.txt".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_reuses_name_with_new_handle() {
+        // Repointing a name at a fresh fh — e.g. flush_writes in
+        // nfs_ops.rs creates a new composition and re-inserts the
+        // same name with a different fh. The old fh's reverse
+        // back-edge must not survive, otherwise name_for(old_fh)
+        // would still return the name and confuse subsequent
+        // flushes.
+        let idx = DirectoryIndex::new();
+        idx.insert(ns1(), "a.txt".into(), [1; 32], comp(1), 10);
+        assert_eq!(idx.name_for(ns1(), &[1; 32]), Some("a.txt".into()));
+
+        idx.insert(ns1(), "a.txt".into(), [2; 32], comp(2), 20);
+        assert_eq!(idx.name_for(ns1(), &[2; 32]), Some("a.txt".into()));
+        assert_eq!(idx.name_for(ns1(), &[1; 32]), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1,6 +1,9 @@
 # Performance
 
-Last refreshed: **2026-05-03** (after the May 2026 perf-fix sweep).
+Last refreshed: **2026-05-07** (local matrix re-run on HEAD = `51c48aa`,
+after the FUSE-via-TCP-framed wiring + NFS async-native conversion
++ ADR-022 fjall sweep). The 2026-05-03 baseline is preserved below for
+comparison.
 
 > Operators tuning a deployment for throughput should also read
 > [`docs/operations/durability.md`](../operations/durability.md) —
@@ -20,6 +23,91 @@ Two data sources currently:
    quorum-loss bug (cross-node `PutFragment` averaging 2 s on a
    28 Gbps wire). Throughput data from this run is not representative
    until the bug is fixed — see [Open issues](#open-issues).
+
+## Local matrix — 2026-05-07 refresh
+
+Re-run on HEAD = `51c48aa` after ~20 perf commits landed since the
+2026-05-03 snapshot (TCP-framed default, FUSE-via-TCP wiring, NFS
+async-native server, sharded composition store, fjall sweep, V3
+wire format, mem-gateway zero-copy GET). Same configuration as the
+older matrix (single-node `kiseki-server`, 64 KiB, c=16, 30 s,
+warmup=256). CPU phase via pprof; numbers below are CPU-phase
+throughput.
+
+### Throughput
+
+| Protocol | put-heavy | get-heavy | mixed (70 P / 30 G) |
+|---|---:|---:|---:|
+| **S3 (HTTP)** | 42 160 op/s · 2.6 GiB/s | 75 078 op/s · 4.7 GiB/s | 47 584 op/s · 2.9 GiB/s |
+| **NFSv3** | 5 006 op/s · 313 MiB/s | **107 830 op/s · 6.7 GiB/s** | 6 618 op/s · 414 MiB/s |
+| **NFSv4.1** | 5 008 op/s · 313 MiB/s | 58 861 op/s · 3.7 GiB/s | 6 634 op/s · 415 MiB/s |
+| **pNFS Flex Files** | 4 970 op/s · 311 MiB/s | 17 921 op/s · 1.1 GiB/s | 6 453 op/s · 403 MiB/s |
+| **FUSE** | **52 888 op/s · 3.3 GiB/s** | **115 368 op/s · 7.2 GiB/s** | **61 230 op/s · 3.8 GiB/s** |
+
+### Tail latencies (p99 µs, c=16)
+
+| Protocol | put-heavy | get-heavy | mixed |
+|---|---:|---:|---:|
+| S3 | 901 | 525 | 831 |
+| NFSv3 | 12 652 | 410 | 11 889 |
+| NFSv4.1 | 12 582 | 630 | 11 913 |
+| pNFS | 12 476 | 1 177 | 13 308 |
+| FUSE | 705 | 412 | 668 |
+
+### Delta vs 2026-05-03 baseline
+
+| Protocol | PUT now / was / Δ | GET now / was / Δ |
+|---|---|---|
+| S3 | 42 160 / 7 124 / **5.9×** | 75 078 / 25 843 / 2.9× |
+| NFSv3 | 5 006 / 2 042 / 2.5× | 107 830 / 26 615 / **4.1×** |
+| NFSv4.1 | 5 008 / 8 327 / **0.6× ↓** | 58 861 / 27 291 / 2.2× |
+| pNFS | 4 970 / 8 327 / **0.6× ↓** | 17 921 / 16 549 / 1.1× |
+| FUSE | 52 888 / 2 790 / **19×** | 115 368 / 10 789 / **10.7×** |
+
+### Findings
+
+1. **FUSE is now the fastest path on every shape.** TCP-framed
+   wiring (`29a6a35`) + 3-phase RwLock (`6035bab`) + bypass of the
+   KisekiFuse runtime detour (`c10cc65`) compounded into a 10–19×
+   lift. FUSE clears both A-NG11 gates (≥80 k GET, ≥56 k PUT)
+   on a single host.
+2. **NFSv3 GET (107 k op/s) is the throughput ceiling on this
+   host.** NFSv4 GET at 58 k is well behind v3 — the v4 session
+   machinery costs ~2× per op even after the async-native rewrite.
+3. **NFS-family PUT measures ~5 k op/s but it is run-time
+   degradation, not a structural regression.** The matrix's 30 s
+   duration captures the degraded end of an O(N²) curve in
+   `DirectoryIndex::name_for` (`crates/kiseki-gateway/src/
+   nfs_dir.rs:66`) — a linear scan over all files in the
+   namespace, called once per NFS COMMIT. Standalone NFSv3 PUT
+   c=16 starts at 9 970 op/s (10 s), halves to 4 984 op/s by
+   30 s, drops to 3 394 op/s at 60 s. v3 / v4 / pNFS all
+   converge on the same shared ceiling (~10 k op/s at startup,
+   uniform across protocols). The May 3 baseline's 8 327 op/s
+   NFSv4 number was also a degraded-state measurement; the 8 k
+   → 5 k delta reflects worse degradation rate (likely fjall
+   journal growth compounding) rather than a steady-state regression.
+   See addendum in `specs/performance/2026-05-07-local-matrix.md`
+   for the full investigation. Fix tracked in Open issues.
+4. **pNFS GET barely moved** (16 549 → 17 921). Every other GET
+   path gained 2–10×. The pNFS DS data path didn't pick up the
+   gateway-side wins — likely a frame copy or sync mutex on the DS
+   server that the other read paths shed.
+5. **A-NG11 gate** (≥80 k GET, ≥56 k PUT per node, single host):
+   FUSE clears both. S3 misses both narrowly (PUT 42 k, GET 75 k).
+   Native binding wasn't in this matrix — `run-all.sh` doesn't
+   include `--protocol native` yet.
+
+### Captured profiles
+
+- `/tmp/kiseki-prof/cpu-{protocol}-{shape}.svg` — pprof flamegraphs
+- `/tmp/kiseki-prof/heap-{protocol}-{shape}.json` — dhat heap
+
+(Heap-phase op/s numbers in the script output are dhat-instrumented
+and not throughput-representative. Use them for heap analysis only,
+via dh_view.html.)
+
+---
 
 ## Perf-fix history (May 2026)
 
@@ -286,6 +374,23 @@ this kind of bug is multi-node testing.
 
 ## Open issues
 
+- [x] **`DirectoryIndex::name_for` is O(N)** — fixed 2026-05-07.
+  Replaced per-namespace `HashMap<String, DirEntry>` with a
+  `NamespaceDir { by_name, by_handle }` pair so `name_for` is
+  O(1). NFSv3 PUT c=16 went 5 k → 45 k op/s steady-state (8.8×
+  at 30 s, 12.3× at 60 s); NFSv4 / pNFS to ~52 k op/s (10.4×).
+  See `specs/performance/2026-05-07-local-matrix.md` addendum.
+- [ ] **NFS v3 vs v4 gap** — post-fix v3 sits ~17 % below v4
+  (45 k vs 52 k op/s on PUT). v4 is a more complex protocol
+  on paper; gap suggests v3-specific overhead worth a flame.
+- [ ] **pNFS GET stagnation** — only 17 921 op/s vs FUSE's 115 k
+  and NFSv3's 107 k on the same workload. Every other GET path
+  picked up the gateway-side wins; pNFS DS data path didn't.
+  Likely a frame copy or sync mutex on the DS server.
+- [ ] **`run-all.sh` missing `--protocol native`** — the harness
+  doesn't include the ADR-042 native binding in the matrix, so
+  every refresh has to run native separately. Add it to
+  `PROTOCOLS=(s3 nfs3 nfs4 pnfs fuse native)`.
 - [ ] **Fabric channel missing `tcp_nodelay`** (`runtime.rs:build_fabric_channel`) —
   prime suspect for the GCP `quorum_lost_total` regression. Fix
   pattern: same as `e058ded`, just on the tonic `Endpoint`.
