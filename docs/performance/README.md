@@ -1,9 +1,10 @@
 # Performance
 
-Last refreshed: **2026-05-07** (local matrix re-run on HEAD = `51c48aa`,
-after the FUSE-via-TCP-framed wiring + NFS async-native conversion
-+ ADR-022 fjall sweep). The 2026-05-03 baseline is preserved below for
-comparison.
+Last refreshed: **2026-05-07 post-pool** (local matrix re-run on
+HEAD = `5fc9523`, after the pNFS DS session pool fix). The
+2026-05-07 (`51c48aa`) and 2026-05-03 snapshots are preserved
+below for comparison. Detailed per-snapshot data lives in
+[`specs/performance/`](../../specs/performance/INDEX.md).
 
 > Operators tuning a deployment for throughput should also read
 > [`docs/operations/durability.md`](../operations/durability.md) —
@@ -23,6 +24,41 @@ Two data sources currently:
    quorum-loss bug (cross-node `PutFragment` averaging 2 s on a
    28 Gbps wire). Throughput data from this run is not representative
    until the bug is fixed — see [Open issues](#open-issues).
+
+## Local matrix — 2026-05-07 post-pNFS-pool refresh
+
+Re-run on HEAD = `5fc9523` after replacing the harness's per-DS
+`Mutex<PnfsSession>` with a round-robin pool. Headline: pNFS GET
+went from 17 673 → 79 867 op/s (4.5×). All other rows are within
+noise of the prior snapshot. Same configuration as the older
+matrices (single-node `kiseki-server`, 64 KiB, c=16, 30 s,
+warmup=256, CPU phase via pprof).
+
+### Throughput
+
+| Protocol | put-heavy | get-heavy | mixed (70 P / 30 G) |
+|---|---:|---:|---:|
+| **S3 (HTTP)** | 36 675 op/s · 2 292 MiB/s | 77 414 op/s · 4 838 MiB/s | 47 584 op/s · 2 974 MiB/s |
+| **NFSv3** | 42 915 op/s · 2 682 MiB/s | **108 063 op/s · 6 754 MiB/s** | 43 173 op/s · 2 698 MiB/s |
+| **NFSv4.1** | 48 932 op/s · 3 058 MiB/s | 63 105 op/s · 3 944 MiB/s | 49 462 op/s · 3 091 MiB/s |
+| **pNFS Flex Files** | 47 699 op/s · 2 981 MiB/s | **79 867 op/s · 4 992 MiB/s** | 50 192 op/s · 3 137 MiB/s |
+| **FUSE** | **51 504 op/s · 3 219 MiB/s** | **125 606 op/s · 7 850 MiB/s** | **61 956 op/s · 3 872 MiB/s** |
+
+### Tail latency p99 (µs)
+
+| Protocol | put-heavy | get-heavy | mixed |
+|---|---:|---:|---:|
+| S3 | 925 | 510 | 832 |
+| NFSv3 | 854 | 411 | 902 |
+| NFSv4.1 | 752 | 615 | 783 |
+| pNFS | 816 | 510 | 743 |
+| FUSE | 707 | 421 | 698 |
+
+Full per-snapshot detail (delta tables, A-NG11 gate analysis,
+findings) lives in
+[`specs/performance/2026-05-07-post-pnfs-pool.md`](../../specs/performance/2026-05-07-post-pnfs-pool.md).
+
+---
 
 ## Local matrix — 2026-05-07 refresh
 
@@ -383,10 +419,22 @@ this kind of bug is multi-node testing.
 - [ ] **NFS v3 vs v4 gap** — post-fix v3 sits ~17 % below v4
   (45 k vs 52 k op/s on PUT). v4 is a more complex protocol
   on paper; gap suggests v3-specific overhead worth a flame.
-- [ ] **pNFS GET stagnation** — only 17 921 op/s vs FUSE's 115 k
-  and NFSv3's 107 k on the same workload. Every other GET path
-  picked up the gateway-side wins; pNFS DS data path didn't.
-  Likely a frame copy or sync mutex on the DS server.
+- [x] **pNFS GET stagnation** — fixed 2026-05-07. Root cause was
+  a harness artifact, NOT the DS server: the kiseki-profile
+  driver used a single `Mutex<PnfsSession>` per DS address, so
+  every GET serialized through one connection (~1 / per-call
+  60 µs ≈ 16 700 op/s ceiling, matched the observed 17 k). The
+  DS server itself was fine — NFSv4 inline GET (same DS code path)
+  hit 63 k op/s on a 16-transport pool. Replaced with a round-
+  robin `DsSessionPool` of `pool_size` sessions; pNFS GET now
+  79 867 op/s, p99 510 µs (was 1 177 µs). See
+  `specs/performance/2026-05-07-post-pnfs-pool.md`.
+- [ ] **pNFS DS slot-table multiplexing** (kernel-realistic
+  alternative) — the harness pool over-provisions vs the Linux
+  kernel pNFS client (16 sessions vs 1 with SEQUENCE slot-table
+  pipelining per RFC 8881 §2.10.4). Documented in `crates/
+  kiseki-profile/src/protocols.rs::DsSessionPool` doc-block as
+  the follow-up if we want kernel-realistic measurement.
 - [ ] **`run-all.sh` missing `--protocol native`** — the harness
   doesn't include the ADR-042 native binding in the matrix, so
   every refresh has to run native separately. Add it to
