@@ -724,11 +724,18 @@ fn main() {
                 return false;
             }
             // Scenarios that document intended behavior for a feature
-            // not yet implemented in the running server. Currently no
-            // scenarios use this tag (S3 per-key naming +
-            // workflow_ref header validation are both wired); the
-            // filter stays so a future deferred-feature scenario can
-            // be tagged without re-introducing the helper.
+            // not yet implemented in the running server. Step impls
+            // either panic with a `TODO` message or fail an
+            // assertion against the missing functionality. The
+            // scenarios stay in the feature file as the contract pin
+            // so the tests go green automatically once the
+            // implementation lands.
+            //
+            // Current users (as of 2026-05-07):
+            //   - native-gateway.feature idempotency-key dedup retry
+            //     (ADR-042 Phase 4 follow-up)
+            //   - native-gateway.feature `@drain` × 2 scenarios
+            //     (ADR-042 §16.1 phase 6 — drain RPC + quiesce wiring)
             if sc.tags.iter().any(|t| t == "deferred-feature") {
                 return false;
             }

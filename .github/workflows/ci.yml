@@ -150,7 +150,6 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
       - name: Build kiseki-server (debug — saves ~3 min vs release)
         run: cargo build --locked -p kiseki-server
       - name: Run BDD @smoke
@@ -159,4 +158,9 @@ jobs:
           # skip non-smoke @integration. The remaining ~5 multi-node
           # @smoke + ~200 @library scenarios run in 3-5 min.
           KISEKI_BDD_FAST: "1"
-        run: cargo nextest run --profile bdd --locked -p kiseki-acceptance
+        # `cargo test` not `nextest run`: the cucumber binary is
+        # `harness = false`, so nextest's libtest-style enumeration
+        # (`--list --format terse`) fails on cucumber-rs's clap
+        # parser. cargo test invokes the binary directly with no
+        # libtest pre-flight, which is what cucumber expects.
+        run: cargo test --locked -p kiseki-acceptance --test acceptance

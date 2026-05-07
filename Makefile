@@ -58,13 +58,18 @@ NEXTEST_FAST_UNIT_MAIN     ?= $(CARGO) nextest run --profile fast --workspace --
 NEXTEST_FAST_UNIT_TLS_PEER ?= $(CARGO) nextest run --profile fast -p kiseki-chunk-cluster --locked
 # Tier 1 — BDD @smoke. KISEKI_BDD_FAST=1 flips the cucumber runner
 # branch in acceptance.rs to skip @slow + non-smoke @integration.
-NEXTEST_FAST_BDD   ?= KISEKI_BDD_FAST=1 $(CARGO) nextest run --profile bdd --locked -p kiseki-acceptance
+# `cargo test`, not nextest: the cucumber binary is `harness = false`,
+# so nextest's libtest-style enumeration (`--list --format terse`)
+# fails on cucumber-rs's clap parser. cargo test invokes the binary
+# directly with no libtest pre-flight, which is what cucumber expects.
+NEXTEST_FAST_BDD   ?= KISEKI_BDD_FAST=1 $(CARGO) test --locked -p kiseki-acceptance --test acceptance
 # Tier 2 — only the slow-marked unit tests (Tier 1 already ran the
 # fast ones; this fills in the rest). Same TLS-peer split.
 NEXTEST_SLOW_UNIT_MAIN     ?= $(CARGO) nextest run --profile slow --run-ignored=only --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
 NEXTEST_SLOW_UNIT_TLS_PEER ?= $(CARGO) nextest run --profile slow --run-ignored=only -p kiseki-chunk-cluster --locked
 # Tier 2 — full BDD (no env var → no @smoke / @slow filtering).
-NEXTEST_SLOW_BDD   ?= $(CARGO) nextest run --profile bdd --locked -p kiseki-acceptance
+# Same `cargo test` rationale as Tier 1.
+NEXTEST_SLOW_BDD   ?= $(CARGO) test --locked -p kiseki-acceptance --test acceptance
 
 # Plain build (default-members → no acceptance).
 CARGO_BUILD  ?= $(CARGO) build --all-targets --locked
