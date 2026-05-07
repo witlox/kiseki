@@ -298,19 +298,73 @@ struct PnfsSession {
     sequence: u32,
 }
 
+/// Per-DS-address session pool. Pre-`pool_size` revision used a
+/// single `Mutex<PnfsSession>` per address — every GET serialized
+/// through one DS connection, capping pNFS GET at ~16 k op/s
+/// (1 / per-call DS round-trip) regardless of harness concurrency.
+/// This pool round-robins across N independent sessions so 16
+/// concurrent driver tasks light up 16 sessions in parallel,
+/// matching the [`Nfs3Client`] / [`Nfs4Client`] pool shape.
+///
+/// Lazy slot init: each slot starts `None`; the first lock acquirer
+/// for that slot opens a session against `addr` and stores it.
+/// Subsequent acquirers re-use it. Concurrent first-misses across
+/// DIFFERENT slots never serialize on each other.
+///
+/// RFC 8881 §2.10.4 caveat: a Linux kernel pNFS client opens ONE
+/// session per `(client_id, DS, principal)` and pipelines via the
+/// SEQUENCE slot table. The harness opens N sessions instead —
+/// over-provisioned vs the kernel client, but the simpler model
+/// gives an upper-bound on what the server's DS path can sustain
+/// without conflating server cost with kernel slot-table dynamics.
+struct DsSessionPool {
+    addr: SocketAddr,
+    sessions: Vec<tokio::sync::Mutex<Option<PnfsSession>>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl DsSessionPool {
+    fn new(addr: SocketAddr, pool_size: usize) -> Self {
+        let pool_size = pool_size.max(1);
+        let mut sessions = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            sessions.push(tokio::sync::Mutex::new(None));
+        }
+        Self {
+            addr,
+            sessions,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Acquire the next slot's guard, lazily opening the DS session
+    /// on first use. Round-robin selection so concurrent callers
+    /// land on disjoint slots and don't serialize on a single Mutex.
+    async fn acquire(&self) -> Result<tokio::sync::MutexGuard<'_, Option<PnfsSession>>, String> {
+        let idx =
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.sessions.len();
+        let mut guard = self.sessions[idx].lock().await;
+        if guard.is_none() {
+            *guard = Some(PnfsDriver::open_session(self.addr, b"pnfs-profile-ds")?);
+        }
+        Ok(guard)
+    }
+}
+
 struct PnfsDriver {
     nfs_addr: SocketAddr,
+    pool_size: usize,
     writer: Arc<Nfs4Client>,
     /// One MDS session shared by all workers — protocol allows it
-    /// because the SEQUENCE op serializes through `sequence`.
+    /// because the SEQUENCE op serializes through `sequence`. Only
+    /// the first GET of a given `composition_id` touches the MDS;
+    /// subsequent GETs hit `layout_cache` so MDS contention is
+    /// negligible in steady state (the put-heavy path does NOT use
+    /// the MDS — `writer` is a separate `Nfs4Client` pool).
     mds_session: tokio::sync::Mutex<Option<PnfsSession>>,
-    /// One session per DS address. Map under a sync mutex (lookups
-    /// are O(1) and brief); the per-session mutex serializes wire
-    /// access. Without this cache every GET paid 2 fresh RTTs for
-    /// `EXCHANGE_ID` + `CREATE_SESSION` before the actual READ.
-    ds_sessions: std::sync::Mutex<
-        std::collections::HashMap<SocketAddr, Arc<tokio::sync::Mutex<PnfsSession>>>,
-    >,
+    /// Per-DS-address session pool. See [`DsSessionPool`] for the
+    /// rationale and the round-robin selection policy.
+    ds_sessions: std::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<DsSessionPool>>>,
     layout_cache:
         tokio::sync::Mutex<std::collections::HashMap<CompositionId, (SocketAddr, Vec<u8>)>>,
     tenant_id: OrgId,
@@ -321,6 +375,7 @@ impl PnfsDriver {
     fn new(nfs_addr: SocketAddr, pool_size: usize) -> Self {
         Self {
             nfs_addr,
+            pool_size,
             writer: Arc::new(Nfs4Client::v41_with_pool(nfs_addr, pool_size)),
             mds_session: tokio::sync::Mutex::new(None),
             ds_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -342,28 +397,27 @@ impl PnfsDriver {
         })
     }
 
-    fn ds_session(&self, addr: SocketAddr) -> Result<Arc<tokio::sync::Mutex<PnfsSession>>, String> {
-        // Fast path — already cached.
+    fn ds_session_pool(&self, addr: SocketAddr) -> Result<Arc<DsSessionPool>, String> {
+        // Fast path — pool already exists.
         {
             let m = self
                 .ds_sessions
                 .lock()
                 .map_err(|e| format!("ds map: {e}"))?;
-            if let Some(s) = m.get(&addr) {
-                return Ok(Arc::clone(s));
+            if let Some(p) = m.get(&addr) {
+                return Ok(Arc::clone(p));
             }
         }
-        // Slow path — create a session outside the map lock so
-        // concurrent first-time-misses on different addrs don't
-        // serialize through it. Last writer wins on duplicate inserts;
-        // the loser drops their freshly-built session, which is fine.
-        let sess = Self::open_session(addr, b"pnfs-profile-ds")?;
-        let arc = Arc::new(tokio::sync::Mutex::new(sess));
+        // Slow path — first DS observation. Build the pool outside
+        // the map lock so concurrent first-time-misses on DIFFERENT
+        // addrs don't serialize on it. Last writer wins on duplicate
+        // inserts; the loser drops their freshly-built (empty) pool.
+        let pool = Arc::new(DsSessionPool::new(addr, self.pool_size));
         let mut m = self
             .ds_sessions
             .lock()
             .map_err(|e| format!("ds map: {e}"))?;
-        Ok(Arc::clone(m.entry(addr).or_insert(arc)))
+        Ok(Arc::clone(m.entry(addr).or_insert(pool)))
     }
 
     /// LAYOUTGET against the MDS for `comp_id`, then GETDEVICEINFO
@@ -438,8 +492,11 @@ impl PnfsDriver {
     }
 
     async fn ds_read(&self, addr: SocketAddr, fh: &[u8], length: usize) -> Result<usize, String> {
-        let arc = self.ds_session(addr)?;
-        let mut sess = arc.lock().await;
+        let pool = self.ds_session_pool(addr)?;
+        let mut guard = pool.acquire().await?;
+        let sess = guard
+            .as_mut()
+            .expect("DsSessionPool::acquire populated the slot");
 
         let seq = sess.sequence;
         sess.sequence += 1;
