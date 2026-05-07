@@ -162,6 +162,19 @@ impl HandleRegistry {
         let handles = self.handles.lock().lock_or_die("nfs_ops.unknown");
         matches!(handles.get(fh), Some(HandleEntry::Root { .. }))
     }
+
+    /// Repoint a `File` handle entry at a new `composition_id`.
+    /// Used when the pending-fh CREATE path's flush writes data —
+    /// the placeholder `comp_id` minted by `create_pending_named`
+    /// is replaced with the real one returned by `gateway.write()`,
+    /// so any client still holding the original fh keeps reading
+    /// the correct composition. No-op if the entry isn't a `File`.
+    pub fn repoint_file(&self, fh: &FileHandle, new_comp_id: CompositionId) {
+        let mut handles = self.handles.lock().lock_or_die("nfs_ops.unknown");
+        if let Some(HandleEntry::File { composition_id, .. }) = handles.get_mut(fh) {
+            *composition_id = new_comp_id;
+        }
+    }
 }
 
 /// NFS operations context — wraps gateway + handle registry + lock manager.
@@ -327,6 +340,33 @@ impl<G: GatewayOps> NfsContext<G> {
         offset: u64,
         count: u32,
     ) -> Result<NfsReadResponse, GatewayError> {
+        // Buffer-served path: a CREATE-via-`create_pending_named`
+        // pre-populates write_buffers, and a WRITE before the
+        // post-COMMIT flush leaves data sitting there. Serve from
+        // the buffer in either case rather than going to the
+        // gateway — for CREATE-only the composition doesn't exist
+        // yet; for WRITE-pending-COMMIT the in-buffer data is
+        // newer than what the gateway holds.
+        {
+            let buffers = self
+                .write_buffers
+                .lock()
+                .lock_or_die("nfs_ops.write_buffers");
+            if let Some(buf) = buffers.get(fh) {
+                let off = usize::try_from(offset).unwrap_or(usize::MAX);
+                let end = off
+                    .saturating_add(count as usize)
+                    .min(buf.len());
+                let slice = if off < buf.len() {
+                    buf[off..end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let eof = end >= buf.len();
+                return Ok(NfsReadResponse { data: slice, eof });
+            }
+        }
+
         let (ns_id, tenant_id, Some(comp_id)) = self
             .handles
             .lookup(fh)
@@ -366,16 +406,32 @@ impl<G: GatewayOps> NfsContext<G> {
         &self,
         fh: &FileHandle,
     ) -> Result<Option<(FileHandle, NfsWriteResponse)>, GatewayError> {
+        // Take the buffer ONLY when there's data to flush. With the
+        // pending-fh CREATE path, an empty buffer signals "this fh
+        // is buffer-served, no composition exists yet" — popping it
+        // here would leave subsequent reads with no source of
+        // truth (the buffer is gone, the composition was never
+        // created). Leaving the empty Vec in place preserves the
+        // 0-byte read semantics of an empty file.
         let data = {
-            let mut buffers = self.write_buffers.lock().lock_or_die("nfs_ops.unknown");
-            buffers.remove(fh)
+            let mut buffers = self
+                .write_buffers
+                .lock()
+                .lock_or_die("nfs_ops.unknown");
+            // Only remove + return when there's actually data to
+            // flush. An empty Vec marks a CREATE-pending fh; we
+            // need to keep it so subsequent reads still serve
+            // empty bytes from the buffer fast-path rather than
+            // hitting a not-yet-existing composition.
+            if buffers.get(fh).is_some_and(|b| !b.is_empty()) {
+                buffers.remove(fh)
+            } else {
+                None
+            }
         };
         let Some(data) = data else {
             return Ok(None);
         };
-        if data.is_empty() {
-            return Ok(None);
-        }
         let (new_fh, resp) = self.write(data)?;
 
         // Update dir_index: if the old fh had a name, re-map it to the
@@ -389,6 +445,15 @@ impl<G: GatewayOps> NfsContext<G> {
                 u64::from(resp.count),
             );
         }
+
+        // Repoint the OLD (placeholder) fh at the real composition
+        // so kernel clients holding it from CREATE keep reading
+        // the right data. Pre-fix the OLD fh pointed at an empty
+        // composition (always returned 0 bytes regardless of
+        // post-CREATE writes) — a latent correctness bug; this
+        // makes the OLD-fh-after-write path return the actual
+        // bytes.
+        self.handles.repoint_file(fh, resp.composition_id);
 
         Ok(Some((new_fh, resp)))
     }
@@ -408,6 +473,72 @@ impl<G: GatewayOps> NfsContext<G> {
             u64::from(resp.count),
         );
         Ok((fh, resp))
+    }
+
+    /// Reserve a "pending" file handle for a freshly created NFS file
+    /// without actually creating a composition in the gateway.
+    ///
+    /// Why: NFSv3 CREATE issues an empty file. The previous design
+    /// called `gateway.write([])` to materialise an empty
+    /// composition, which paid the full PUT cost (Raft delta + fjall
+    /// write + chunk_id derive) for ~zero data. Flame at 64 KiB PUT
+    /// showed this was ~22% of CPU on the PUT critical path; the
+    /// actual user data WRITE then created a *second* composition
+    /// and the first one was dead weight.
+    ///
+    /// New design — pending fh: synthesize the handle from a fresh
+    /// UUID, register it in the handle registry, insert in
+    /// `dir_index` with size 0, and pre-populate `write_buffers`
+    /// with an empty `Vec` so [`Self::read`] knows to serve from
+    /// the buffer (returning 0 bytes on an unwritten file) rather
+    /// than calling `gateway.read()` on a composition that doesn't
+    /// exist yet. When the first WRITE arrives, [`Self::buffer_write`]
+    /// extends that Vec; [`Self::flush_writes`] then does the
+    /// single `gateway.write(data)` and replaces the dir_index
+    /// entry with the real composition.
+    ///
+    /// Crash semantics: identical to eventual-durability mode for
+    /// the composition store — an empty file CREATE that survives
+    /// for less than the flush interval may not persist across a
+    /// crash. NFSv3 has no fsync hook on CREATE itself (only on
+    /// WRITE FILE_SYNC / COMMIT), so this matches POSIX expectations
+    /// for `creat(2)` durability before the first write.
+    pub fn create_pending_named(
+        &self,
+        name: &str,
+    ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
+        // Mint a fresh composition_id locally — never bound to a
+        // real composition row. The `[comp_id 16][zeros 16]` layout
+        // matches what `HandleRegistry::file_handle` produces for
+        // post-write handles; clients can't tell the difference.
+        let placeholder_id = CompositionId(uuid::Uuid::new_v4());
+        let fh = self.handles.file_handle(
+            self.namespace_id,
+            self.tenant_id,
+            placeholder_id,
+        );
+        // Pre-populate write_buffers with an empty Vec — both
+        // signals "this fh is buffer-served" to `read` AND gives
+        // `buffer_write` a starting point so the entry().or_default()
+        // fast path skips a HashMap insertion on the first write.
+        self.write_buffers
+            .lock()
+            .lock_or_die("nfs_ops.write_buffers")
+            .insert(fh, Vec::new());
+        self.dir_index.insert(
+            self.namespace_id,
+            name.to_owned(),
+            fh,
+            placeholder_id,
+            0,
+        );
+        Ok((
+            fh,
+            NfsWriteResponse {
+                count: 0,
+                composition_id: placeholder_id,
+            },
+        ))
     }
 
     /// Write to create a new file (NFS CREATE + WRITE).

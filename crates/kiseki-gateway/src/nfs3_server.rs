@@ -355,7 +355,12 @@ fn reply_create<G: GatewayOps>(
     let _dir_fh = reader.read_opaque().unwrap_or_default();
     let name = reader.read_string().unwrap_or_default();
 
-    match ctx.write_named(&name, Vec::new()) {
+    // NFSv3 CREATE creates an empty file. Use the pending-fh path
+    // — synthesize the handle without calling gateway.write(). The
+    // following WRITE op's flush_writes call will create the actual
+    // composition. Saves the per-PUT cost of a wasted empty
+    // composition + Raft delta + fjall journal write.
+    match ctx.create_pending_named(&name) {
         Ok((new_fh, _resp)) => {
             w.write_u32(status::NFS3_OK);
             w.write_bool(true);

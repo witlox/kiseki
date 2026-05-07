@@ -1746,9 +1746,12 @@ fn op_open<G: GatewayOps>(
     };
 
     let status = if open_type == 1 {
-        // CREATE: write a new file.
+        // CREATE: reserve a pending file handle (no gateway.write
+        // until the actual data arrives via WRITE+COMMIT). Same
+        // optimisation as NFSv3 reply_create — the wasted empty
+        // composition was ~22% of CPU on the PUT path.
         tracing::debug!(name = %name, "nfs4 op_open: CREATE path");
-        match ctx.write_named(&name, Vec::new()) {
+        match ctx.create_pending_named(&name) {
             Ok((fh, _resp)) => {
                 let sid = sessions.open_file(fh);
                 state.current_fh = Some(fh);
@@ -2215,8 +2218,9 @@ fn op_create<G: GatewayOps>(
             }
         }
         _ => {
-            // Regular file or unsupported — create empty file.
-            match ctx.write_named(&name, Vec::new()) {
+            // Regular file or unsupported — pending fh (no
+            // composition until first WRITE+COMMIT).
+            match ctx.create_pending_named(&name) {
                 Ok((fh, _)) => {
                     state.current_fh = Some(fh);
                     w.write_u32(nfs4_status::NFS4_OK);
