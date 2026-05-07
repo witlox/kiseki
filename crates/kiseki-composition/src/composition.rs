@@ -620,6 +620,18 @@ impl CompositionStore {
         self.namespaces.read().get(&id).cloned()
     }
 
+    /// Snapshot every registered namespace. Used by
+    /// `InMemoryGateway::new` to prime its lock-free
+    /// `namespace_meta` cache from a pre-populated store, so
+    /// constructing a gateway from a store that already has
+    /// namespaces (test setup, restart, hydration) doesn't need a
+    /// follow-up `gateway.add_namespace(...)` call to enforce
+    /// `read_only` etc.
+    #[must_use]
+    pub fn list_namespaces(&self) -> Vec<Namespace> {
+        self.namespaces.read().values().cloned().collect()
+    }
+
     /// Total composition count.
     ///
     /// # Errors

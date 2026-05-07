@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use kiseki_chunk::AsyncChunkOps;
-use kiseki_common::ids::CompositionId;
+use kiseki_common::ids::{CompositionId, NamespaceId};
 use kiseki_common::tenancy::DedupPolicy;
 use kiseki_composition::composition::{CompositionOps, CompositionStore, ConditionalCheck};
 
@@ -399,6 +399,19 @@ impl InMemoryGateway {
         chunks: Arc<dyn AsyncChunkOps>,
         master_key: SystemMasterKey,
     ) -> Self {
+        // Prime the lock-free namespace_meta cache from whatever's
+        // already in the store. add_namespace was historically the
+        // only path that populated this cache, so a gateway built
+        // from a pre-populated store (test setup, restart, hydration)
+        // would silently skip the `read_only` check on every PUT
+        // until a follow-up gateway.add_namespace landed. Snapshot
+        // here so the gateway and the store agree from t=0.
+        let namespace_meta_init: std::collections::HashMap<NamespaceId, NamespaceMeta> =
+            compositions
+                .list_namespaces()
+                .iter()
+                .map(|ns| (ns.id, NamespaceMeta::from_namespace(ns)))
+                .collect();
         Self {
             compositions: Arc::new(compositions),
             chunks,
@@ -427,9 +440,7 @@ impl InMemoryGateway {
             retry_metrics: None,
             fsync_hooks: std::sync::RwLock::new(Vec::new()),
             decrypt_cache: parking_lot::Mutex::new(DecryptCache::new(read_decrypt_cache_ttl())),
-            namespace_meta: std::sync::Arc::new(parking_lot::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
+            namespace_meta: std::sync::Arc::new(parking_lot::RwLock::new(namespace_meta_init)),
         }
     }
 
