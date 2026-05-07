@@ -636,7 +636,7 @@ mod concurrency_tests {
     fn concurrent_reads_do_not_serialize_behind_one_lock() {
         let tenant = OrgId(uuid::Uuid::from_u128(700));
         let ns = NamespaceId(uuid::Uuid::from_u128(701));
-        let mut compositions = CompositionStore::new();
+        let compositions = CompositionStore::new();
         compositions.add_namespace(Namespace {
             id: ns,
             tenant_id: tenant,

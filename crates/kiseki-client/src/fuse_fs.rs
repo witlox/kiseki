@@ -152,6 +152,14 @@ impl<G: GatewayOps> KisekiFuse<G> {
     }
 
     /// Borrow the gateway. Used by [`crate::fuse_daemon::FuseDaemon`]
+    /// (gated by the `fuse` feature) so the daemon's flush / create
+    /// paths can call gateway futures lock-free outside the daemon's
+    /// inner `RwLock` write section.
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub(crate) fn gateway(&self) -> &G {
+        &self.gateway
+    }
+
     /// Block on an async gateway call. Uses `block_in_place` when on a
     /// tokio multi-thread runtime (tests), or `block_on` when on an OS
     /// thread (FUSE daemon).
@@ -166,6 +174,19 @@ impl<G: GatewayOps> KisekiFuse<G> {
             // On an OS thread (FUSE daemon) — block_on directly.
             self.rt.block_on(f)
         }
+    }
+
+    /// `pub(crate)` mirror of [`Self::block_gateway`] so the FUSE
+    /// daemon's flush / create paths (gated by the `fuse` feature)
+    /// can invoke gateway futures without holding the daemon's
+    /// `RwLock` for write. Same dedicated runtime + `block_in_place`
+    /// / `block_on` selection logic as the private helper.
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub(crate) fn block_gateway_pub<F, T>(&self, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.block_gateway(f)
     }
 
     /// Validate that `ino` is a directory (Root or Dir). Returns error if not.
