@@ -55,16 +55,6 @@ pub struct Nfs3Client {
     /// Held only across cheap clones, not network IO, so `std::Mutex`
     /// is fine here.
     root_fh: Mutex<Option<Vec<u8>>>,
-    /// Composition-id → file-handle cache. NFSv3 GET would otherwise
-    /// pay LOOKUP + READ on every call (2 RPCs). After a write or a
-    /// successful read, we cache the server-returned handle keyed by
-    /// composition_id; subsequent GETs of the same composition skip
-    /// the LOOKUP and go straight to READ. Halves NFSv3 GET RPC
-    /// count on the warmup-then-read perf workload.
-    ///
-    /// `std::sync::Mutex` — only held briefly across HashMap
-    /// `get_cloned` / `insert`, never across network IO.
-    fh_cache: Mutex<HashMap<CompositionId, Vec<u8>>>,
     /// Client-side multipart upload buffers keyed by upload ID.
     /// Each value is a list of (`part_number`, data) pairs assembled
     /// into a single CREATE+WRITE on `complete_multipart`.
@@ -94,19 +84,8 @@ impl Nfs3Client {
             transports,
             next: AtomicUsize::new(0),
             root_fh: Mutex::new(None),
-            fh_cache: Mutex::new(HashMap::new()),
             multipart_buffers: Mutex::new(HashMap::new()),
         }
-    }
-
-    fn cache_fh(&self, comp_id: CompositionId, fh: Vec<u8>) {
-        if let Ok(mut c) = self.fh_cache.lock() {
-            c.insert(comp_id, fh);
-        }
-    }
-
-    fn cached_fh(&self, comp_id: CompositionId) -> Option<Vec<u8>> {
-        self.fh_cache.lock().ok().and_then(|c| c.get(&comp_id).cloned())
     }
 
     async fn ensure_transport(
@@ -241,44 +220,21 @@ impl GatewayOps for Nfs3Client {
             )));
         }
 
-        // Re-LOOKUP to discover the server-assigned composition_id.
-        // Under FILE_SYNC the server flushes the buffered write into a
-        // fresh composition (kiseki compositions are write-once-immutable
-        // — see nfs3_server::reply_write) and re-maps the directory
-        // entry to the new file handle. The new fh's first 16 bytes
-        // ARE the new composition's UUID, so we can decode it directly
-        // without a second round trip... except we need the new fh,
-        // which means a LOOKUP. One extra RPC for the canonical id.
-        let mut args = XdrWriter::new();
-        args.write_opaque(&root_fh);
-        args.write_string(&filename);
-        let reply = t.call(
-            NFS_PROGRAM,
-            NFS3_VERSION,
-            NFSPROC3_LOOKUP,
-            &args.into_bytes(),
-        )?;
-        let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
-        if status != NFS3_OK {
-            return Err(GatewayError::ProtocolError(format!(
-                "NFSv3 LOOKUP-after-WRITE failed: status={status}"
-            )));
-        }
-        let new_fh = r.read_opaque().map_err(|e| xdr_err(&e))?;
-        let composition_id = if new_fh.len() >= 16 {
+        // Skip the post-WRITE LOOKUP — the CREATE-returned fh's first
+        // 16 bytes are the placeholder composition UUID minted by
+        // `create_pending_named`. The server's `HandleRegistry` repoints
+        // that placeholder to the real composition during `flush_writes`
+        // (see `nfs_ops::HandleRegistry::repoint_file`), so a later GET
+        // can deterministically reconstruct the fh as
+        // `[composition_id 16][zeros 16]` and hit the right composition
+        // without a LOOKUP RPC. Saves one RPC per PUT (3 → 2).
+        let composition_id = if file_fh.len() >= 16 {
             let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&new_fh[..16]);
+            bytes.copy_from_slice(&file_fh[..16]);
             CompositionId(uuid::Uuid::from_bytes(bytes))
         } else {
-            // Defensive fallback — server should always return a
-            // 32-byte handle, but if it doesn't, parse the filename.
             CompositionId(uuid::Uuid::parse_str(&filename).unwrap_or_else(|_| uuid::Uuid::new_v4()))
         };
-
-        // Cache the post-WRITE handle so subsequent READs of this
-        // composition skip the LOOKUP RPC.
-        self.cache_fh(composition_id, new_fh);
 
         Ok(WriteResponse {
             composition_id,
@@ -287,47 +243,23 @@ impl GatewayOps for Nfs3Client {
     }
 
     async fn read(&self, req: ReadRequest) -> Result<ReadResponse, GatewayError> {
-        // Fast path: cached file handle from a prior write or read.
-        // Skips the LOOKUP RPC entirely — single READ RPC per call.
-        // Halves the per-read latency and op count.
-        if let Some(cached) = self.cached_fh(req.composition_id) {
-            let mut guard = self.ensure_transport().await?;
-            let t = guard
-                .as_mut()
-                .expect("transport not initialized — call connect() first");
-            return read_with_fh(t, &cached, &req);
-        }
+        // The kiseki NFSv3 server's file-handle layout is
+        // `[composition_id 16][zeros 16]` (see
+        // `nfs_ops::HandleRegistry::file_handle`). The fh registry
+        // is populated when the composition is created and the
+        // pending-fh path repoints the original CREATE fh to the
+        // real composition during `flush_writes`. Either way, a
+        // freshly-constructed `[composition_id 16][zeros 16]` fh
+        // resolves to the right composition server-side — no
+        // LOOKUP RPC required, no client-side fh cache.
+        let mut fh = vec![0u8; 32];
+        fh[..16].copy_from_slice(req.composition_id.0.as_bytes());
 
-        let root_fh = self.ensure_root_fh().await?;
         let mut guard = self.ensure_transport().await?;
         let t = guard
             .as_mut()
             .expect("transport not initialized — call connect() first");
-
-        // LOOKUP to get the file handle
-        let mut args = XdrWriter::new();
-        args.write_opaque(&root_fh);
-        args.write_string(&req.composition_id.0.to_string());
-        let reply = t.call(
-            NFS_PROGRAM,
-            NFS3_VERSION,
-            NFSPROC3_LOOKUP,
-            &args.into_bytes(),
-        )?;
-
-        let mut r = XdrReader::new(&reply);
-        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
-        if status != NFS3_OK {
-            return Err(GatewayError::ProtocolError(format!(
-                "NFSv3 LOOKUP failed: status={status}"
-            )));
-        }
-        let file_fh = r.read_opaque().map_err(|e| xdr_err(&e))?;
-        // Populate cache so future reads of the same composition
-        // take the fast path above.
-        self.cache_fh(req.composition_id, file_fh.clone());
-
-        read_with_fh(t, &file_fh, &req)
+        read_with_fh(t, &fh, &req)
     }
 
     async fn list(

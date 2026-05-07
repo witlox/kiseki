@@ -1529,24 +1529,16 @@ async fn s18_15_lookup_composition_uuid_returns_file_handle() {
     // PUT). dir_index is NOT touched; the LOOKUP must work purely
     // via the composition store.
     let payload = b"phase-15c.3-payload".to_vec();
-    let comp_id = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let resp = ctx
-                .gateway
-                .write(kiseki_gateway::nfs::NfsWriteRequest {
-                    tenant_id: test_tenant(),
-                    namespace_id: test_namespace(),
-                    data: payload,
-                })
-                .await
-                .expect("seed write");
-            resp.composition_id
+    let comp_id = ctx
+        .gateway
+        .write(kiseki_gateway::nfs::NfsWriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: payload,
         })
-    };
+        .await
+        .expect("seed write")
+        .composition_id;
     let name = comp_id.0.to_string();
 
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 4, |w| {
@@ -1583,24 +1575,16 @@ async fn s18_26_readdir_lists_compositions_in_namespace() {
     let sessions = SessionManager::new();
 
     // Seed a composition via the gateway path (S3 PUT-style).
-    let comp_id = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let resp = ctx
-                .gateway
-                .write(kiseki_gateway::nfs::NfsWriteRequest {
-                    tenant_id: test_tenant(),
-                    namespace_id: test_namespace(),
-                    data: b"readdir-fixture".to_vec(),
-                })
-                .await
-                .expect("seed write");
-            resp.composition_id
+    let comp_id = ctx
+        .gateway
+        .write(kiseki_gateway::nfs::NfsWriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: b"readdir-fixture".to_vec(),
         })
-    };
+        .await
+        .expect("seed write")
+        .composition_id;
     let expected_name = comp_id.0.to_string();
 
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
@@ -1938,24 +1922,16 @@ async fn s5_8_getattr_after_lookup_returns_actual_composition_size() {
     // non-zero size (matches the post-S3-PUT state pcap captures).
     let payload = b"phase-15c.3 cat-enoent payload bytes 0123456789".to_vec();
     let payload_len = payload.len() as u64;
-    let comp_id = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let resp = ctx
-                .gateway
-                .write(kiseki_gateway::nfs::NfsWriteRequest {
-                    tenant_id: test_tenant(),
-                    namespace_id: test_namespace(),
-                    data: payload,
-                })
-                .await
-                .expect("seed write");
-            resp.composition_id
+    let comp_id = ctx
+        .gateway
+        .write(kiseki_gateway::nfs::NfsWriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: payload,
         })
-    };
+        .await
+        .expect("seed write")
+        .composition_id;
     let name = comp_id.0.to_string();
 
     // Request bitmap: TYPE(1) | SIZE(4) — the two attrs `cat` walks
@@ -2056,24 +2032,16 @@ async fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
     let sessions = SessionManager::new();
 
     // Seed so OPEN(NOCREATE) can resolve.
-    let comp_id = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let resp = ctx
-                .gateway
-                .write(kiseki_gateway::nfs::NfsWriteRequest {
-                    tenant_id: test_tenant(),
-                    namespace_id: test_namespace(),
-                    data: b"open-fixture".to_vec(),
-                })
-                .await
-                .expect("seed write");
-            resp.composition_id
+    let comp_id = ctx
+        .gateway
+        .write(kiseki_gateway::nfs::NfsWriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: b"open-fixture".to_vec(),
         })
-    };
+        .await
+        .expect("seed write")
+        .composition_id;
     let name = comp_id.0.to_string();
 
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
@@ -2172,24 +2140,16 @@ async fn s18_16_1_open_args_claim_discriminator_is_required() {
     let ctx = make_ctx();
     let sessions = SessionManager::new();
 
-    let comp_id = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let resp = ctx
-                .gateway
-                .write(kiseki_gateway::nfs::NfsWriteRequest {
-                    tenant_id: test_tenant(),
-                    namespace_id: test_namespace(),
-                    data: b"open-claim-fixture".to_vec(),
-                })
-                .await
-                .expect("seed write");
-            resp.composition_id
+    let comp_id = ctx
+        .gateway
+        .write(kiseki_gateway::nfs::NfsWriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: b"open-claim-fixture".to_vec(),
         })
-    };
+        .await
+        .expect("seed write")
+        .composition_id;
     let name = comp_id.0.to_string();
 
     let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
@@ -2248,24 +2208,16 @@ async fn s18_22_read_after_lookup_returns_seeded_bytes() {
     let sessions = SessionManager::new();
 
     let payload = b"phase-15c.3 end-to-end read fixture: hello, kiseki!".to_vec();
-    let comp_id = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let resp = ctx
-                .gateway
-                .write(kiseki_gateway::nfs::NfsWriteRequest {
-                    tenant_id: test_tenant(),
-                    namespace_id: test_namespace(),
-                    data: payload.clone(),
-                })
-                .await
-                .expect("seed write");
-            resp.composition_id
+    let comp_id = ctx
+        .gateway
+        .write(kiseki_gateway::nfs::NfsWriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: payload.clone(),
         })
-    };
+        .await
+        .expect("seed write")
+        .composition_id;
     let name = comp_id.0.to_string();
 
     // C1: navigate + GETFH to harvest the file handle bytes.

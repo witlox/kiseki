@@ -113,20 +113,23 @@ async fn concurrent_nfs_writes_no_deadlock() {
 async fn concurrent_nfs_mixed_read_write() {
     let nfs = setup_nfs_gateway();
 
-    // Pre-write objects for readers.
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Pre-write objects for readers. We're already on the test's
+    // tokio runtime — `.await` directly instead of nesting a fresh
+    // `Runtime::new()`+`block_on` (tokio forbids that). The
+    // `thread::spawn`'d worker threads below are fine because they
+    // detach from the tokio runtime.
     let mut comp_ids = Vec::new();
     for i in 0u8..10 {
-        let resp = rt
-            .block_on(nfs.write(NfsWriteRequest {
+        let resp = nfs
+            .write(NfsWriteRequest {
                 tenant_id: test_tenant(),
                 namespace_id: test_namespace(),
                 data: vec![i; 2048],
-            }))
+            })
+            .await
             .unwrap();
         comp_ids.push(resp.composition_id);
     }
-    drop(rt);
 
     let comp_ids = Arc::new(comp_ids);
     let mut handles = Vec::new();
