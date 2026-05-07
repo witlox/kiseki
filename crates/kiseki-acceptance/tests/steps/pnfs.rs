@@ -441,21 +441,27 @@ async fn when_enumerate_dispatcher(_world: &mut KisekiWorld) {
 }
 
 #[then(
-    regex = r#"^exactly eight op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, PUTFH, READ, WRITE, COMMIT, GETATTR$"#
+    regex = r#"^exactly ten op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, DESTROY_CLIENTID, RECLAIM_COMPLETE, SEQUENCE, PUTFH, READ, COMMIT, GETATTR$"#
 )]
-async fn then_eight_ops(_world: &mut KisekiWorld) {
+async fn then_ten_ops(_world: &mut KisekiWorld) {
     use kiseki_gateway::nfs4_server::op;
-    assert_eq!(ALLOWED_DS_OPS.len(), 8);
+    // Bumped from 8 to 10 op codes 2026-05-07: kernel pNFS clients
+    // issue RECLAIM_COMPLETE + DESTROY_CLIENTID on DS-only sessions
+    // (RFC 8881 §13.6.4 mandates the DS permit these), and rejecting
+    // them with NFS4ERR_NOTSUPP made multi-instance NFSv4.1 reads
+    // hang in a DS-session retry loop. ADR-038 §D2 amended.
+    assert_eq!(ALLOWED_DS_OPS.len(), 10);
     let set: std::collections::BTreeSet<u32> = ALLOWED_DS_OPS.iter().copied().collect();
-    // Minor wording note: the feature lists WRITE, but Phase 15a defers
-    // WRITE wire-up (composition_id-aware GatewayOps::write_at is a
-    // Phase 15b dependency). The op set instead includes SEQUENCE for
-    // session conformance — same cardinality, different membership.
-    // ADR-038 §D2 lists these exact 8 op codes.
+    // The feature lists WRITE in the prose but Phase 15a defers
+    // WRITE wire-up (composition_id-aware `GatewayOps::write_at` is
+    // a Phase 15b dependency). The op set instead includes SEQUENCE
+    // for session conformance.
     let expected: std::collections::BTreeSet<u32> = [
         op::EXCHANGE_ID,
         op::CREATE_SESSION,
         op::DESTROY_SESSION,
+        op::DESTROY_CLIENTID,
+        op::RECLAIM_COMPLETE,
         op::SEQUENCE,
         op::PUTFH,
         op::READ,

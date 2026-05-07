@@ -1354,8 +1354,7 @@ const LAYOUT4_FLEX_FILES: u32 = 4;
 /// inline. BDD scenarios that exercise the layout path leave this
 /// unset.
 fn pnfs_layout_disabled() -> bool {
-    std::env::var("KISEKI_DISABLE_PNFS_LAYOUT")
-        .is_ok_and(|v| !v.is_empty() && v != "0")
+    std::env::var("KISEKI_DISABLE_PNFS_LAYOUT").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 /// Encode a Flexible Files Layout (RFC 8435 §5.1). Phase 15b path.
 #[allow(clippy::too_many_arguments)]

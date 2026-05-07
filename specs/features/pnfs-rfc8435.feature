@@ -59,9 +59,9 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
     And no later op in the COMPOUND was parsed
 
   @library @pnfs-15a
-  Scenario: DS accepts only the eight required ops
+  Scenario: DS accepts only the ten required ops
     When the DS dispatcher table is enumerated
-    Then exactly eight op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, PUTFH, READ, WRITE, COMMIT, GETATTR
+    Then exactly ten op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, DESTROY_CLIENTID, RECLAIM_COMPLETE, SEQUENCE, PUTFH, READ, COMMIT, GETATTR
     And every other op returns NFS4ERR_NOTSUPP
 
   @library @pnfs-15a
