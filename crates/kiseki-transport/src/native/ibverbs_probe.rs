@@ -1,6 +1,6 @@
 //! ibverbs binding probe (ADR-042 §2.3 + §16.1 phase 9).
 //!
-//! Probes the local environment for InfiniBand / RoCEv2 RDMA
+//! Probes the local environment for InfiniBand / `RoCEv2` RDMA
 //! capability:
 //!
 //! 1. **OS gate**: Linux only (`cfg(target_os = "linux")`); other
@@ -10,8 +10,8 @@
 //!    permissions per R2-M2 (path-injection mitigation), audit-log
 //!    the resolved absolute path.
 //! 3. **Sysfs presence**: enumerate `/sys/class/infiniband/*` for at
-//!    least one device with an `Active` port (link_layer ==
-//!    InfiniBand or RoCEv2 GID type).
+//!    least one device with an `Active` port (`link_layer` ==
+//!    `InfiniBand` or `RoCEv2` GID type).
 //! 4. **kernel version** for rdma-cm TLS (Linux ≥ 6.4 + rdma-core ≥
 //!    50.0): documented but not yet asserted — the actual TLS
 //!    handshake happens at listener-spawn time (phase 9 listener).
@@ -137,12 +137,9 @@ fn probe_sysfs_for_active_device(wanted_device: Option<&str>, port: u32) -> Resu
             .join("ports")
             .join(port.to_string())
             .join("state");
-        let state = match std::fs::read_to_string(&port_state_path) {
-            Ok(s) => s,
-            Err(_) => {
-                tried.push(format!("{device_name}/port{port}: no state file"));
-                continue;
-            }
+        let Ok(state) = std::fs::read_to_string(&port_state_path) else {
+            tried.push(format!("{device_name}/port{port}: no state file"));
+            continue;
         };
         // /sys writes "<code>: <NAME>\n", e.g. "4: ACTIVE\n". Match
         // the leading code so the parser doesn't break if the kernel

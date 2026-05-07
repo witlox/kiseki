@@ -2,7 +2,7 @@
 //!
 //! Wraps [`FjallLogStore`] and implements openraft's `RaftLogStorage`
 //! + `RaftLogReader` traits. Raft state (log entries, vote, committed
-//! index, last purged) survives server restart.
+//!   index, last purged) survives server restart.
 //!
 //! ADR-022 rev-2 successor: replaces the previous `RedbRaftLogStore`
 //! 2026-05-06. Wire / serde-json format unchanged so a `git revert`

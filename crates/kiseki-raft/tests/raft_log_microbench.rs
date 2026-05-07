@@ -39,6 +39,7 @@ fn bench_append(entry_size: usize, count: u64, label: &str) {
         store.append(i, &e).expect("append");
     }
     let elapsed = start.elapsed();
+    #[allow(clippy::cast_precision_loss)]
     let ops_per_sec = count as f64 / elapsed.as_secs_f64();
     println!(
         "{label}: count={count} entry_size={entry_size}B \

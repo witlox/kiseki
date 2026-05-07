@@ -78,13 +78,10 @@ pub enum PathOutcome {
 #[must_use]
 pub fn validate_candidate(path: &Path) -> PathOutcome {
     use std::os::linux::fs::MetadataExt;
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => {
-            return PathOutcome::NotPresent {
-                path: path.to_path_buf(),
-            };
-        }
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return PathOutcome::NotPresent {
+            path: path.to_path_buf(),
+        };
     };
     if !metadata.is_file() && !metadata.file_type().is_symlink() {
         // Direct files OR symlinks are acceptable — distros ship
@@ -145,11 +142,15 @@ pub fn resolve_system_library(leaf: &str, env_override: &str) -> Result<PathBuf,
             PathOutcome::Found { path } => return Ok(path),
             PathOutcome::NotPresent { path } => {
                 return Err(format!(
-                    "{env_override}={path:?} not present (operator override didn't resolve)",
+                    "{env_override}={} not present (operator override didn't resolve)",
+                    path.display()
                 ));
             }
             PathOutcome::RejectedUnsafe { path, reason } => {
-                return Err(format!("{env_override}={path:?} rejected: {reason}",));
+                return Err(format!(
+                    "{env_override}={} rejected: {reason}",
+                    path.display()
+                ));
             }
         }
     }
@@ -157,9 +158,9 @@ pub fn resolve_system_library(leaf: &str, env_override: &str) -> Result<PathBuf,
     for candidate in system_library_search_paths(leaf) {
         match validate_candidate(&candidate) {
             PathOutcome::Found { path } => return Ok(path),
-            PathOutcome::NotPresent { .. } => continue,
+            PathOutcome::NotPresent { .. } => {}
             PathOutcome::RejectedUnsafe { path, reason } => {
-                rejections.push(format!("{path:?} rejected: {reason}"));
+                rejections.push(format!("{} rejected: {reason}", path.display()));
             }
         }
     }

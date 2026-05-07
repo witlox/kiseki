@@ -56,8 +56,9 @@ fn parse_provider(s: &str) -> Option<LibfabricProvider> {
         "tcp" => Some(LibfabricProvider::Tcp),
         // efa is intentionally rejected — §2.4.3 deferred. Operators
         // pinning to efa get a hard error from the listener; the
-        // probe itself returns Unavailable.
-        "efa" => None,
+        // probe itself returns Unavailable. Folded into the wildcard
+        // arm to silence `clippy::match_same_arms`; the comment above
+        // is the load-bearing contract.
         _ => None,
     }
 }
@@ -126,13 +127,15 @@ impl BindingProbe for LibfabricProbe {
         }
         let descriptor = format!("libfabric://{}", provider_descriptor(provider));
         let latency_class = match provider {
-            LibfabricProvider::Cxi | LibfabricProvider::Verbs => LatencyClass::Rdma,
             // Sockets / tcp are emulated paths — Standard, not Rdma.
             LibfabricProvider::Sockets | LibfabricProvider::Tcp => LatencyClass::Standard,
             // Efa is deferred; can't be reached because parse_provider
             // rejects "efa" and choose_provider_via_sysfs never
-            // returns it. Defensive default.
-            LibfabricProvider::Efa => LatencyClass::Rdma,
+            // returns it. Folded into the Rdma arm to silence
+            // `clippy::match_same_arms`; the rejection happens upstream.
+            LibfabricProvider::Cxi | LibfabricProvider::Verbs | LibfabricProvider::Efa => {
+                LatencyClass::Rdma
+            }
         };
         ProbeOutcome::Available {
             latency_class,

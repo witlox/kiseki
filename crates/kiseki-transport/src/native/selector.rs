@@ -4,7 +4,7 @@
 //! The selector does NOT spawn listeners — that's the runtime's job.
 //! The selector outputs a [`SelectorPlan`]: the set of bindings that
 //! are `Available` and unmasked by an operator pin, in priority
-//! order (highest latency_class first). The runtime walks the plan
+//! order (highest `latency_class` first). The runtime walks the plan
 //! and spawns each.
 //!
 //! Per-binding probes implement [`BindingProbe`]. The trait is
@@ -21,10 +21,10 @@ use kiseki_proto::native_contract::{BindingId, LatencyClass, ListenAddr};
 pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 3_000;
 
 /// Operator pin via `KISEKI_NATIVE_TRANSPORT`. `Auto` is the literal
-/// "no pin" sentinel — clients and servers ranked by latency_class.
+/// "no pin" sentinel — clients and servers ranked by `latency_class`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperatorPin {
-    /// No pin — selector ranks by latency_class.
+    /// No pin — selector ranks by `latency_class`.
     Auto,
     /// Pin to a specific binding. Other bindings still execute
     /// phase 1 + phase 2 (collision detection still relevant for
@@ -41,7 +41,7 @@ impl OperatorPin {
     /// `Err(BindingSelectorError::UnknownPin)` for unrecognized pin
     /// names — operator typo / pre-`auto` syntax.
     pub fn parse(env_value: Option<&str>) -> Result<Self, BindingSelectorError> {
-        let trimmed = env_value.map(str::trim).unwrap_or("");
+        let trimmed = env_value.map_or("", str::trim);
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
             return Ok(Self::Auto);
         }
@@ -136,7 +136,11 @@ impl AvailableBinding {
     /// Sort key: descending priority. `BinaryHeap` / `sort_by_key`
     /// uses ascending order, so we negate via wrapping sub.
     fn sort_key(&self) -> (i8, BindingId) {
-        (-(latency_rank(self.latency_class) as i8), self.binding_id)
+        // latency_rank returns 1..=3 — well within i8 range, so the
+        // u8→i8 cast cannot wrap. Asserted in a debug build below.
+        let rank = latency_rank(self.latency_class);
+        let signed = i8::try_from(rank).expect("latency_rank fits in i8");
+        (-signed, self.binding_id)
     }
 }
 
@@ -242,7 +246,7 @@ impl BindingSelector {
 
     /// Register a per-binding probe. Order matters only for
     /// diagnostic output; the spawn order is determined by
-    /// latency_class ranking.
+    /// `latency_class` ranking.
     pub fn register(&mut self, probe: Box<dyn BindingProbe>) -> &mut Self {
         self.probes.push(probe);
         self
@@ -395,19 +399,21 @@ fn check_port_collisions(probes: &[(BindingId, ProbeOutcome)]) -> Result<(), Bin
 /// formatting, no I/O — runtime emits via `tracing::info`.
 #[must_use]
 pub fn render_banner(plan: &SelectorPlan, report: &SelectorReport) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     out.push_str("[transport.native] available bindings (in priority order):\n");
     if plan.spawn_order.is_empty() {
         out.push_str("  (none — no bindings will be spawned)\n");
     } else {
         for (idx, b) in plan.spawn_order.iter().enumerate() {
-            out.push_str(&format!(
-                "  {}. {:<16} (latency_class={:?}, addr={})\n",
+            let _ = writeln!(
+                out,
+                "  {}. {:<16} (latency_class={:?}, addr={})",
                 idx + 1,
                 binding_display(b.binding_id),
                 b.latency_class,
                 listen_addr_display(&b.addr),
-            ));
+            );
         }
     }
     let unavailable_count = report
@@ -419,11 +425,7 @@ pub fn render_banner(plan: &SelectorPlan, report: &SelectorReport) -> String {
         out.push_str("[transport.native] unavailable bindings:\n");
         for (id, outcome) in &report.probes {
             if let ProbeOutcome::Unavailable { reason } = outcome {
-                out.push_str(&format!(
-                    "  - {:<16} skipped: {}\n",
-                    binding_display(*id),
-                    reason
-                ));
+                let _ = writeln!(out, "  - {:<16} skipped: {}", binding_display(*id), reason);
             }
         }
     }
@@ -431,10 +433,13 @@ pub fn render_banner(plan: &SelectorPlan, report: &SelectorReport) -> String {
         OperatorPin::Auto => out.push_str(
             "[transport.native] override available via KISEKI_NATIVE_TRANSPORT={grpc|tcp|ibverbs|libfabric|auto}\n",
         ),
-        OperatorPin::Pinned(target) => out.push_str(&format!(
-            "[transport.native] PINNED to {} via KISEKI_NATIVE_TRANSPORT (other bindings probed but not spawned)\n",
-            binding_display(target)
-        )),
+        OperatorPin::Pinned(target) => {
+            let _ = writeln!(
+                out,
+                "[transport.native] PINNED to {} via KISEKI_NATIVE_TRANSPORT (other bindings probed but not spawned)",
+                binding_display(target)
+            );
+        }
     }
     out
 }
@@ -501,7 +506,7 @@ mod tests {
     #[test]
     fn parse_pin_auto_handles_empty_unset_and_explicit_auto() {
         for input in [None, Some(""), Some("   "), Some("auto"), Some("AUTO")] {
-            let pin = OperatorPin::parse(input).expect(&format!("input {input:?}"));
+            let pin = OperatorPin::parse(input).unwrap_or_else(|_| panic!("input {input:?}"));
             assert_eq!(pin, OperatorPin::Auto);
         }
     }

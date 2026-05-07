@@ -17,7 +17,7 @@
 //!
 //! - `raft_log`  — `u64.to_be_bytes()` (log index) → `[1B version][postcard bytes]`
 //! - `raft_meta` — UTF-8 key (`vote`, `committed`, `last_purged`, …)
-//!                 → `[1B version][postcard bytes]`
+//!   → `[1B version][postcard bytes]`
 //!
 //! Big-endian u64 keys give the LSM range iterator the same monotonic
 //! traversal order redb's native `u64` ordering used to provide.
@@ -288,7 +288,7 @@ impl FjallLogStore {
 
     /// Empty if no log entries are stored.
     pub fn is_empty(&self) -> io::Result<bool> {
-        Ok(self.log_ks.is_empty().map_err(io_err)?)
+        self.log_ks.is_empty().map_err(io_err)
     }
 
     /// Force a WAL fsync. Not normally needed — every public mutator
