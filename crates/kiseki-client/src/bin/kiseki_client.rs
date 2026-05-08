@@ -3,7 +3,8 @@
 //! Kiseki client CLI -- staging, cache management, FUSE mount, diagnostics.
 //!
 //! Usage:
-//!   kiseki-client mount --endpoint http://<host>:<port> --mountpoint /mnt/kiseki [--cache-mode organic] [--cache-dir /cache]
+//!   kiseki-client mount --endpoint kiseki://<host>:<port> --mountpoint /mnt/kiseki [--cache-mode organic] [--cache-dir /cache]
+//!   kiseki-client mount --endpoint http://<host>:<port> --mountpoint /mnt/kiseki  # S3 fallback
 //!   kiseki-client mount --in-memory --mountpoint /mnt/kiseki [--cache-mode organic]
 //!   kiseki-client stage --dataset /training/imagenet [--timeout 300]
 //!   kiseki-client stage --status
@@ -57,7 +58,9 @@ COMMANDS:
     help        Print this help
 
 MOUNT OPTIONS:
-    --endpoint <url>         Gateway endpoint, http(s):// (required unless --in-memory)
+    --endpoint <url>         Gateway endpoint (required unless --in-memory):
+                               kiseki://host:9103   ADR-042 native TCP-framed (preferred)
+                               http(s)://host:9000  S3 listener (one HTTP RTT per FUSE op)
     --mountpoint <path>      Local mount path (required)
     --in-memory              Run against an in-process sandbox (dev only)
     --cache-mode <mode>      Cache mode: pinned, organic, bypass (default: organic)
@@ -163,6 +166,15 @@ fn handle_mount(args: &[String]) {
     // not an http(s):// URL — that masked a 2026-05-07 GCP run where
     // every read/write was hitting an in-daemon HashMap, not the
     // cluster. Sandbox is now opt-in via `--in-memory`.
+    //
+    // Three URL schemes:
+    //   `kiseki://host:9103` — ADR-042 native TCP-framed binding
+    //                          (preferred for FUSE: streaming, no h2/HTTP
+    //                          framing tax, kernel-many-small-reads
+    //                          friendly).
+    //   `http(s)://host:9000` — S3 HTTP listener (one HTTP RTT per FUSE
+    //                          read; fine for a quick smoke or tiny
+    //                          objects, terrible for sequential I/O).
     if in_memory {
         if endpoint.is_some() {
             eprintln!("Error: --in-memory and --endpoint are mutually exclusive");
@@ -173,9 +185,12 @@ fn handle_mount(args: &[String]) {
             eprintln!("Error: --endpoint is required (or use --in-memory for a dev sandbox)");
             std::process::exit(2);
         });
-        if !(ep.starts_with("http://") || ep.starts_with("https://")) {
+        let is_kiseki = ep.starts_with("kiseki://");
+        let is_http = ep.starts_with("http://") || ep.starts_with("https://");
+        if !(is_kiseki || is_http) {
             eprintln!(
-                "Error: --endpoint must start with http:// or https:// (got '{ep}'). \
+                "Error: --endpoint must start with kiseki:// (native, preferred) \
+                 or http(s):// (S3 fallback) (got '{ep}'). \
                  Use --in-memory to run an in-process sandbox.",
             );
             std::process::exit(2);
@@ -186,34 +201,120 @@ fn handle_mount(args: &[String]) {
     let namespace =
         kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
 
-    // Networked path: --endpoint is http(s):// and `remote-http` is
+    // Native ADR-042 path: --endpoint is kiseki://… and `native` feature
+    // is compiled in. Connects a pool of TCP-framed-postcard connections
+    // to the server's TCP-framed listener (default port 9103 since the
+    // 2026-05-07 fix that moved it off advisory's 9101). Returns from
+    // the function on success.
+    #[cfg(all(feature = "fuse", feature = "native"))]
+    {
+        use std::path::Path;
+        if !in_memory {
+            let ep_full = endpoint.as_deref().unwrap_or("");
+            if let Some(rest) = ep_full.strip_prefix("kiseki://") {
+                // No path component supported yet — strip any trailing
+                // slashes so `kiseki://host:port/` is accepted.
+                let addr = rest.trim_end_matches('/');
+                if addr.is_empty() {
+                    eprintln!("Error: --endpoint kiseki:// requires host:port (got '{ep_full}')");
+                    std::process::exit(2);
+                }
+                let pool = std::env::var("KISEKI_NATIVE_GATEWAY_POOL")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(kiseki_client::native_remote::DEFAULT_POOL_SIZE);
+                println!(
+                    "Mounting at {mountpoint} via native kiseki://{addr} (pool={pool}, cache_mode: {cache_mode})",
+                );
+                // Build the connection pool on a dedicated long-lived
+                // runtime — `TcpFramedClient::connect_plaintext` spawns
+                // a per-connection reader task that demuxes RPC
+                // responses. If we built the pool on a one-shot
+                // runtime that we then drop, those reader tasks would
+                // get aborted and every subsequent FUSE op would block
+                // forever on a oneshot receiver. KisekiFuse builds its
+                // own multi-thread runtime via `std::thread::spawn` +
+                // `mem::forget`; we mirror that pattern here so the
+                // pool's reader tasks survive the connect call.
+                let rt_handle = std::thread::spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .thread_name("kiseki-native-rt")
+                        .build()
+                        .expect("failed to build kiseki native runtime");
+                    let handle = runtime.handle().clone();
+                    std::mem::forget(runtime);
+                    handle
+                })
+                .join()
+                .expect("native runtime thread panicked");
+                let gw = rt_handle
+                    .block_on(
+                        kiseki_client::native_remote::NativeRemoteGateway::connect_plaintext(
+                            addr.to_owned(),
+                            pool,
+                        ),
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error: native connect to {addr} failed: {e}");
+                        std::process::exit(1);
+                    });
+                let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
+                kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
+                    .expect("FUSE mount failed");
+                return;
+            }
+        }
+    }
+
+    // Networked HTTP path: --endpoint is http(s):// and `remote-http` is
     // compiled in. Returns from the function on success.
     #[cfg(all(feature = "fuse", feature = "remote-http"))]
     {
         use std::path::Path;
         if !in_memory {
-            let endpoint = endpoint.expect("validated above");
-            println!("Mounting at {mountpoint} via remote {endpoint} (cache_mode: {cache_mode})");
-            let gw = kiseki_client::remote_http::RemoteHttpGateway::new(endpoint);
-            let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
-            kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
-                .expect("FUSE mount failed");
-            return;
+            let endpoint = endpoint.clone().expect("validated above");
+            if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+                println!(
+                    "Mounting at {mountpoint} via remote {endpoint} (cache_mode: {cache_mode})",
+                );
+                let gw = kiseki_client::remote_http::RemoteHttpGateway::new(endpoint);
+                let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
+                kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
+                    .expect("FUSE mount failed");
+                return;
+            }
         }
     }
 
-    // Without `remote-http`, the only honest path is in-memory. If the
-    // operator passed `--endpoint` but the binary wasn't built with
-    // `remote-http`, refuse rather than silently sandboxing.
+    // Endpoint was passed but the binary was built without the feature
+    // that handles it. Refuse rather than silently sandboxing — same
+    // failure-mode lesson as the 2026-05-07 GCP run.
+    #[cfg(all(feature = "fuse", not(feature = "native")))]
+    if !in_memory {
+        if let Some(ep) = endpoint.as_deref() {
+            if ep.starts_with("kiseki://") {
+                eprintln!(
+                    "Error: this binary was built without `native` — \
+                     kiseki:// endpoints cannot be served. Rebuild \
+                     with `--features native` or use http://.",
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     #[cfg(all(feature = "fuse", not(feature = "remote-http")))]
-    {
-        if !in_memory {
-            eprintln!(
-                "Error: this binary was built without `remote-http` — \
-                 networked --endpoint cannot be served. Rebuild with \
-                 `--features remote-http` or pass `--in-memory`.",
-            );
-            std::process::exit(1);
+    if !in_memory {
+        if let Some(ep) = endpoint.as_deref() {
+            if ep.starts_with("http://") || ep.starts_with("https://") {
+                eprintln!(
+                    "Error: this binary was built without `remote-http` — \
+                     http:// endpoints cannot be served. Rebuild with \
+                     `--features remote-http` or use kiseki://.",
+                );
+                std::process::exit(1);
+            }
         }
     }
 

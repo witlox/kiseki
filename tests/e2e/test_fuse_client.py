@@ -57,9 +57,13 @@ def fuse_client_image() -> str:
     fast after the first build."""
     root = _workspace_root()
     # 1. Build the binary on the host (matches glibc with Ubuntu 24.04).
-    # Both `fuse` (FUSE adapter) and `remote-http` (cluster network
-    # attachment via S3) features are required for the cluster e2e
-    # path; the in-memory sandbox path doesn't need remote-http.
+    # Three network features compiled in:
+    #   `fuse`        — kernel FUSE adapter
+    #   `native`      — ADR-042 TCP-framed (kiseki://host:9103, the
+    #                   preferred path for FUSE — streaming, pool of
+    #                   connections, no HTTP framing tax)
+    #   `remote-http` — S3 listener fallback (http://host:9000)
+    # The in-memory sandbox path doesn't need either networked feature.
     subprocess.run(
         [
             "cargo",
@@ -70,7 +74,7 @@ def fuse_client_image() -> str:
             "--bin",
             "kiseki-client",
             "--features",
-            "fuse remote-http",
+            "fuse remote-http native",
         ],
         cwd=root,
         check=True,
