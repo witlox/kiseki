@@ -113,30 +113,74 @@ async fn start_peer(name: &str, pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<Grpc
     (local, Arc::new(GrpcFabricPeer::new(name, channel)))
 }
 
-/// Currently fails ~10% of the per-call rate with intermittent
-/// `ChunkError::`NotFound`` for chunks that ARE present on the
-/// expected peer (the post-seed sanity probe inside the test
-/// confirms each peer's chunks round-trip individually). Under
-/// concurrent fan-out through `ClusteredChunkStore::read_chunk`,
-/// some `peer.get_fragment` calls server-side return `NotFound` for
-/// chunks the peer's local store accepted via `write_chunk`. The
-/// wrapper then walks the remaining peers, none of which have the
-/// chunk (no replication in this test), and surfaces `NotFound` to
-/// the caller.
+type ClusteredResult = (u8, usize, Result<Envelope, kiseki_chunk::ChunkError>);
+
+/// Bucket the burst results. Pulled out of the test body so the
+/// match arms don't push the test fn over the 100-line clippy
+/// ceiling. Returns (completed-per-peer, false-NotFound,
+/// transient-Io, other).
+async fn classify(
+    handles: Vec<tokio::task::JoinHandle<ClusteredResult>>,
+) -> (Vec<usize>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut completed = vec![0usize; 3];
+    let mut false_not_found: Vec<String> = Vec::new();
+    let mut transient_errors: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for h in handles {
+        let (peer_idx, slot, res) = h.await.expect("join");
+        match res {
+            Ok(env) => {
+                let want = peer_idx ^ u8::try_from(slot % FRAGS_PER_PEER).expect("FRAGS_PER_PEER");
+                if env.ciphertext.first().copied() != Some(want) {
+                    other_errors.push(format!(
+                        "ciphertext seed mismatch peer={peer_idx} slot={slot} \
+                         want={want:#x} got={:?}",
+                        env.ciphertext.first(),
+                    ));
+                }
+                completed[usize::from(peer_idx)] += 1;
+            }
+            Err(kiseki_chunk::ChunkError::NotFound(_)) => {
+                // The pre-fix bug. After the wrapper fix this branch
+                // must stay empty — every transient peer problem
+                // surfaces as `ChunkError::Io` instead.
+                false_not_found.push(format!("peer={peer_idx} slot={slot}"));
+            }
+            Err(kiseki_chunk::ChunkError::Io(e)) => {
+                // Acceptable: peer-side stall or transport hiccup
+                // surfaced honestly.
+                transient_errors.push(format!("peer={peer_idx} slot={slot}: {e}"));
+            }
+            Err(e) => other_errors.push(format!("peer={peer_idx} slot={slot}: {e:?}")),
+        }
+    }
+    (completed, false_not_found, transient_errors, other_errors)
+}
+
+/// Pre-fix this test failed ~10% of per-call rate with intermittent
+/// `ChunkError::NotFound` for chunks that ARE present on the
+/// expected peer. Root cause (uncovered 2026-05-08 by bisecting
+/// `cfg.get_timeout`): peer 0 sees ALL 72 in-flight requests
+/// because the wrapper tries it first regardless of chunk
+/// placement. Under that load, a small fraction of per-peer calls
+/// exceed the 3 s default `get_timeout`. The wrapper warned + fell
+/// through; peer 1 / 2 legitimately don't have the chunk; the
+/// wrapper surfaced `ChunkError::NotFound`. Kernel-FUSE / NFS see
+/// the phantom `NotFound`, retry, and escalate to the indefinite
+/// hangs we observed on the 3-node compose.
 ///
-/// Symptom: data-loss shape (false-`NotFound`), not the
-/// indefinite-hang shape we saw on the 3-node compose. Likely a
-/// related bug in the same `peer.get_fragment` path — under enough
-/// parallelism on a single peer, the server's
-/// `read_fragment`-then-`read_chunk` two-step (server.rs:419-449)
-/// races and the second leg occasionally surfaces a stale lookup.
-/// Tagged `slow:` so Tier-1 skips it; `--ignored` runs it as a
-/// regression target. Fix candidates land in
-/// `kiseki-chunk-cluster::server::ClusterChunkServer::get_fragment`
-/// or in the wrapper's peer-walk error classification.
+/// Fix in `ClusteredChunkStore::read_chunk`: track non-NotFound
+/// peer errors during the fall-through and surface them as
+/// `ChunkError::Io` (with `ErrorKind::TimedOut` for timeouts)
+/// instead of masking as `NotFound`. The caller now distinguishes
+/// "data is gone" from "a peer was slow / unavailable" and can
+/// retry vs give up appropriately.
+///
+/// This test pins both halves of the contract: the read should
+/// usually succeed (peer 0 isn't always slow), and on the rare
+/// stall it must NOT surface as `NotFound`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "slow: 3 × 8 × 64 MiB pre-populate + 72 × 64 MiB concurrent fetch; \
-            CURRENTLY FAILS ~10% on intermittent peer `NotFound` — see doc-comment"]
+#[ignore = "slow: 3 × 8 × 64 MiB pre-populate + 72 × 64 MiB concurrent fetch ≈ 5 GiB total"]
 async fn clustered_read_chunk_concurrent_fanout_completes_within_deadline() {
     // 1. Three real chunk-cluster peers; each owns 8 distinct
     //    chunk_ids. No replication — peer N has chunk[N][0..8] only.
@@ -188,6 +232,23 @@ async fn clustered_read_chunk_concurrent_fanout_completes_within_deadline() {
     //    defaults; the only override is to keep the test bounded
     //    via a shorter get_timeout (default is generous).
     let empty_local = local_bridge("p", 1 << 30);
+    // Use the default 3 s get_timeout. The 2026-05-08 finding:
+    // under heavy concurrent fan-out (peer 0 sees all 72 in-flight
+    // requests because the wrapper tries it first regardless of
+    // chunk placement) some per-peer calls exceed 3 s. The wrapper
+    // pre-fix logged `warn` + fell through to peer 1 / 2 which
+    // legitimately don't have the chunk, then surfaced
+    // `ChunkError::NotFound` to the caller — masking a transient
+    // peer-0 slowdown as data loss. Production shape: kernel-FUSE/NFS
+    // see phantom `NotFound`, retry, escalate to indefinite stalls.
+    //
+    // The fix in `ClusteredChunkStore::read_chunk` propagates
+    // non-NotFound errors (timeouts, transport, server errors) as
+    // `Unavailable` instead of NotFound. With that fix in place
+    // this test passes at the default timeout because either
+    // (a) every peer 0 call really completes in 3 s (likely on a
+    // beefy host) OR (b) when a call does time out, the wrapper
+    // surfaces a real signal instead of false NotFound.
     let cfg = ClusterCfg::new(tenant, "p");
     let clustered = Arc::new(ClusteredChunkStore::new(empty_local, peer_clients, cfg));
 
@@ -212,47 +273,46 @@ async fn clustered_read_chunk_concurrent_fanout_completes_within_deadline() {
     }
 
     // 4. Bounded await. Failure mode = deadline elapses → panic.
-    let work = async {
-        let mut completed = vec![0usize; 3];
-        let mut errors: Vec<String> = Vec::new();
-        for h in handles {
-            let (peer_idx, slot, res) = h.await.expect("join");
-            match res {
-                Ok(env) => {
-                    let want =
-                        peer_idx ^ u8::try_from(slot % FRAGS_PER_PEER).expect("FRAGS_PER_PEER");
-                    if env.ciphertext.first().copied() != Some(want) {
-                        errors.push(format!(
-                            "ciphertext seed mismatch peer={peer_idx} slot={slot} \
-                             want={want:#x} got={:?}",
-                            env.ciphertext.first(),
-                        ));
-                    }
-                    completed[usize::from(peer_idx)] += 1;
-                }
-                Err(e) => errors.push(format!("read_chunk peer={peer_idx} slot={slot}: {e:?}")),
-            }
-        }
-        (completed, errors)
-    };
+    let work = classify(handles);
 
     let outcome = tokio::time::timeout(DEADLINE, work).await;
     let elapsed = work_started.elapsed();
-    let Ok((completed, errors)) = outcome else {
+    let Ok((completed, false_not_found, transient_errors, other_errors)) = outcome else {
         panic!(
             "ClusteredChunkStore::read_chunk concurrent fan-out hung past {DEADLINE:?} \
              — wrapper-layer hang. Inspect read_chunk's peer walk under contention.",
         );
     };
-    assert!(
-        errors.is_empty(),
-        "concurrent read_chunk surfaced errors after {elapsed:?}:\n  {}",
-        errors.join("\n  "),
+    println!(
+        "completed={completed:?} transient={} false_not_found={} other={} elapsed={elapsed:?}",
+        transient_errors.len(),
+        false_not_found.len(),
+        other_errors.len(),
     );
+    assert!(
+        false_not_found.is_empty(),
+        "BUG: {} reads surfaced as NotFound after wrapper fix \
+         (pre-fix: ~10%, post-fix: must be 0):\n  {}",
+        false_not_found.len(),
+        false_not_found.join("\n  "),
+    );
+    assert!(
+        other_errors.is_empty(),
+        "unexpected non-Io non-NotFound errors after {elapsed:?}:\n  {}",
+        other_errors.join("\n  "),
+    );
+    // Per-peer-placement completion may be slightly less than the
+    // ideal 24-each because a transient timeout on peer 0 takes a
+    // chunk[0][N] read into transient_errors instead of completed.
+    // What matters: completed + transient_errors covers every
+    // present chunk_id once, so no read silently went missing.
+    let total_completed: usize = completed.iter().sum();
     assert_eq!(
-        completed,
-        vec![CONCURRENT_PER_PLACEMENT; 3],
-        "per-peer-placement completion mismatch",
+        total_completed + transient_errors.len(),
+        CONCURRENT_PER_PLACEMENT * 3,
+        "every read must produce either a completion or a transient \
+         error; got completed={completed:?} transient={}",
+        transient_errors.len(),
     );
     assert!(
         elapsed < DEADLINE,

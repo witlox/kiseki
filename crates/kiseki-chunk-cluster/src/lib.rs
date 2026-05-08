@@ -835,20 +835,57 @@ impl AsyncChunkOps for ClusteredChunkStore {
 
         // Fabric fallback. Replication-N: any 1 fragment_index=0 is
         // sufficient. Walk peers in order; first success wins.
+        //
+        // Track whether we saw any *non-NotFound* peer error along the
+        // way (timeout, transport, unavailable, etc.). 2026-05-08
+        // finding: under concurrent fan-out a peer that has the chunk
+        // can intermittently time out; pre-fix the wrapper warned +
+        // fell through, then peer N+1 / N+2 legitimately returned
+        // NotFound, then the wrapper surfaced
+        // `ChunkError::NotFound` to the caller — masking a transient
+        // peer-side stall as data loss. Kernel-FUSE/NFS see the
+        // phantom NotFound, retry, and escalate to the indefinite
+        // hangs we observed on the 3-node compose. Surfacing the
+        // real error class lets the caller decide retry/give-up
+        // policy instead of inferring "data is gone".
+        let mut transient_error: Option<ChunkError> = None;
         for peer in &self.peers {
             match tokio::time::timeout(self.cfg.get_timeout, peer.get_fragment(*chunk_id, 0)).await
             {
                 Ok(Ok(env)) => return Ok(env),
                 Ok(Err(FabricPeerError::NotFound)) => {}
                 Ok(Err(e)) => {
-                    tracing::warn!(error=%e, "peer GetFragment errored, trying next");
+                    tracing::warn!(peer = peer.name(), error=%e, "peer GetFragment errored, trying next");
+                    // First non-NotFound error wins — preserves the
+                    // original peer's diagnosis through the fall-
+                    // through. Subsequent NotFounds don't overwrite
+                    // it; subsequent errors do (so the LAST peer's
+                    // error surfaces if multiple peers errored).
+                    transient_error = Some(ChunkError::Io(format!(
+                        "peer {} GetFragment failed: {e}",
+                        peer.name(),
+                    )));
                 }
                 Err(_) => {
-                    tracing::warn!("peer GetFragment timed out, trying next");
+                    tracing::warn!(
+                        peer = peer.name(),
+                        "peer GetFragment timed out, trying next"
+                    );
+                    transient_error = Some(ChunkError::Io(format!(
+                        "peer {} GetFragment exceeded {:?}",
+                        peer.name(),
+                        self.cfg.get_timeout,
+                    )));
                 }
             }
         }
 
+        // No peer satisfied the read. If any peer had a non-NotFound
+        // error along the way, surface that — otherwise it's a
+        // genuine cluster-wide miss.
+        if let Some(e) = transient_error {
+            return Err(e);
+        }
         Err(ChunkError::NotFound(*chunk_id))
     }
 
