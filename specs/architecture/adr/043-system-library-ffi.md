@@ -1,8 +1,8 @@
 # ADR-043: System Library FFI Policy
 
-**Status**: Proposed (rev 3 — gate-1 round-2 amendments applied; acceptance pending only on Open item B)
-**Date**: 2026-05-09 (rev 1); 2026-05-09 (rev 2 same day, post gate-1); 2026-05-09 (rev 3 same day, post gate-1 round 2)
-**Deciders**: Architect (this draft); Adversary gate-1 round 1 + round 2 both closed.
+**Status**: Proposed (rev 4 — gate-1 round-3 plan-specific findings closed; acceptance pending only on Open item B)
+**Date**: 2026-05-09 (rev 1); 2026-05-09 (rev 2 same day, post gate-1); 2026-05-09 (rev 3 same day, post gate-1 round 2); 2026-05-09 (rev 4 same day, post gate-1 round 3 / plan-specific)
+**Deciders**: Architect (this draft); Adversary gate-1 rounds 1, 2, and 3 all closed.
 
 ## Revision history
 
@@ -31,6 +31,12 @@
   - CC2-1: §D6 findings-filename convention adopts the existing `YYYY-MM-DD-adv-gate1-<artifact>-findings.md` shape.
 
   The remaining round-2 findings (F2-H2 D1.1 acceptance check; F2-H3 FFI safety contract; F2-M3 GCP build-path audit; F2-M4 go/no-go criteria; F2-M5 rollback procedure; F2-L3 macOS-retirement upgrade) are amendments to `specs/implementation/libfuse-swap.md`, applied in the same change-set.
+- **rev 4 (2026-05-09)**: Adversary gate-1 round 3 (`specs/findings/2026-05-09-adv-gate1-libfuse-swap-findings.md`) was the first plan-specific gate-1 — attacked the libfuse-swap implementation plan directly per the §D6 review-discipline. Returned **CHANGES REQUESTED — small-to-medium scope** (0 CRITICAL, 5 HIGH, 8 MEDIUM, 4 LOW + 2 cross-cutting). Rev-4 closes the policy-side findings:
+  - F3-H1: §D6 checklist criterion 4 (license change) — surfaced as plausibly **yes**. Resolution: in-plan justification of the **no** answer (LGPL-2.1's dynamic-linking exception keeps kiseki-client itself permissive; libfabric precedent established the same shape; downstream wrapper LGPL exposure is operational disclosure, not architectural change). Plan's §D6 checklist table now documents this.
+  - F3-H2: §D6 checklist criterion 6 (new invariants/failure modes) — was plausibly **yes**. Resolution: catalogue promotion (path b). The libfuse-swap plan's §"Safety contract" rules promoted to `specs/invariants.md` as I-FUSE-1..I-FUSE-8; failure modes promoted to `specs/failure-modes.md` as F-FUSE-1..F-FUSE-3. With the catalogues updated, the plan introduces no *new* invariants beyond the catalogues — answer is **no**.
+  - CC3-1: process note (this rev): the plan's first heading section MUST contain a §D6 checklist table with one row per criterion and a yes/no/explain answer. libfuse-swap.md adds the table at the top.
+
+  All other round-3 findings (F3-H3 ADR-013 parity, F3-H4 async-bridge mechanics, F3-H5 session-crash handling, all 8 MEDIUMs, all 4 LOWs) are plan-side and are addressed in the same change-set's amendments to `specs/implementation/libfuse-swap.md`. With the round-3 closure, the plan is ready for implementer phase 0.
 
 ## Context
 
@@ -106,13 +112,15 @@ If every answer is **no**, the policy ADR plus implementation plan are sufficien
 
 Active plans:
 
-- **`specs/implementation/libfuse-swap.md`**: libfuse 3.x via `kiseki-fuse-sys` + `kiseki-fuse` — replaces `kiseki-client`'s `fuser`-based FUSE adapter. Decides binding-crate version pin, trait-surface details, testing strategy, performance targets at parity, perf-cluster validation order. Inherits §D1, §D1.1, §D2, §D5. Architect's checklist answers (rev 3): every criterion answered **no**; therefore plan-only adoption is appropriate.
+- **`specs/implementation/libfuse-swap.md`**: libfuse 3.x via `kiseki-fuse-sys` + `kiseki-fuse` — replaces `kiseki-client`'s `fuser`-based FUSE adapter. Decides binding-crate version pin, trait-surface details, testing strategy, performance targets at parity, perf-cluster validation order. Inherits §D1, §D1.1, §D2, §D5. Architect's checklist answers documented in the plan's §"§D6 checklist" table (rev-4): every criterion answered **no**, with explicit justifications for criteria 4 (license — dynamic-linking exception) and 6 (invariants — promoted to catalogues so the plan introduces no *new* invariants beyond `specs/invariants.md` and `specs/failure-modes.md`). Therefore plan-only adoption is appropriate.
 
 Pre-existing pure-Rust paths (`fuser` 0.17 in `kiseki-client/src/fuse_daemon.rs`) remain in tree and CI-tested until the plan delivers a replacement that passes the existing `@integration` suite at parity. No big-bang removal.
 
 **Review discipline**: even without a per-binding ADR, the implementation plan IS reviewed by adversary gate-1 (per `.claude/CLAUDE.md` Diamond workflow) BEFORE implementer phase 0. Skipping the per-binding ADR does not skip the adversary review — it relocates the review from "attack the ADR" to "attack the plan." Findings live in `specs/findings/` keyed on the plan basename and date: `YYYY-MM-DD-adv-gate1-<plan-base-name>-findings.md` (per the existing convention used for ADR findings). The review verifies the architect's answers to the checklist above; if any answer is plausibly **yes** but was answered **no**, the adversary requires a per-binding ADR before implementer phase 0.
 
 **Amendment-trigger rule**: material amendments to a reviewed plan (new phases, new dependencies, scope expansion, removal of acceptance criteria) trigger a gate-1 round-N+1 on the amended sections only. Cosmetic edits (typos, formatting, citation fixes) do not. The architect tags the commit message with `gate-1-amendment` so the review trigger is visible in `git log`.
+
+**Plan-frontmatter-checklist rule (added rev 4 per gate-1 round-3 CC3-1)**: every implementation plan in `specs/implementation/` covered by §D6's plan-only adoption path MUST include, in its first heading section, a §D6 checklist table with one row per criterion and a yes/no/explain answer. This makes both the architect's reasoning and the adversary's verification machine-traceable. The plan-specific gate-1 review verifies the table directly. The libfuse-swap plan's table at `specs/implementation/libfuse-swap.md` §"§D6 checklist" is the reference shape for future plans.
 
 ## Rationale
 
@@ -199,5 +207,8 @@ Triggers for the review (per §D5): perf regression > 20% on Tier_1 reference ma
 - ADR-042: Native Gateway Data Service — independent; native clients don't go through libfuse. ADR-042's libfabric/ibverbs bindings are codified by this ADR's D2 retroactively.
 - `specs/findings/2026-05-09-adv-gate1-adr043-findings.md` — round-1 findings that drove the rev-1 → rev-2 scope reduction.
 - `specs/findings/2026-05-09-adv-gate1-round2-adr043-findings.md` — round-2 findings that drove the rev-2 → rev-3 amendments documented in the Revision history.
-- `specs/implementation/libfuse-swap.md` — implementation plan for the libfuse swap; per §D6, no per-binding ADR is required (architect's checklist answers documented in §D6).
+- `specs/findings/2026-05-09-adv-gate1-libfuse-swap-findings.md` — round-3 plan-specific findings that drove the rev-3 → rev-4 amendments + the catalogue promotions (I-FUSE-1..8, F-FUSE-1..3).
+- `specs/implementation/libfuse-swap.md` — implementation plan for the libfuse swap; per §D6, no per-binding ADR is required. The plan's §"§D6 checklist" table documents the architect's answers per the rule in §D6 above.
+- `specs/invariants.md` §"FUSE wrapper invariants (libfuse-swap, ADR-043 §D2)" — I-FUSE-1..I-FUSE-8 promoted from the libfuse-swap plan's §"Safety contract" per gate-1 round-3 F3-H2.
+- `specs/failure-modes.md` §"FUSE wrapper failures (libfuse-swap, ADR-043 §D2)" — F-FUSE-1..F-FUSE-3 promoted from the libfuse-swap plan per gate-1 round-3 F3-H2.
 - `specs/performance/2026-05-09-gcp-compact-fixes-verify/sync-kills-daemon.md` — the original FUSE_SYNCFS opcode 50 finding; the libfuse swap closes it.

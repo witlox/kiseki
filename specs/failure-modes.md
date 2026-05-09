@@ -685,6 +685,45 @@ Severity scale: **P0** (cluster-wide outage), **P1** (tenant-wide outage),
 
 ---
 
+## FUSE wrapper failures (libfuse-swap, ADR-043 §D2)
+
+These failure modes were promoted from `specs/implementation/libfuse-swap.md` per round-3 finding F3-H2 in `2026-05-09-adv-gate1-libfuse-swap-findings.md`. They govern the `kiseki-fuse` safe wrapper around libfuse 3.x. Each failure mode is exercised by a test in Acceptance criterion 8 of the libfuse-swap plan.
+
+### F-FUSE-1: Reply token dropped without consume
+
+| Field | Value |
+|---|---|
+| **Description** | A Rust handler returns or panics without consuming its libfuse reply token. The token's `Drop` impl runs while libfuse still holds the request slot. |
+| **Blast radius** | Single FUSE request; userspace caller sees `EIO` and the request slot is freed. No daemon-wide state corruption. |
+| **Detection** | `Drop` impl issues `fuse_reply_err(req, EIO)`, increments `kiseki_fuse_drop_without_consume_total{op}`, logs at WARN. Debug builds additionally panic. Operator runbook alerts on non-zero counter. |
+| **Degradation** | Userspace caller sees `EIO` on the affected op; subsequent ops on the same handle continue normally. Logic bug in the handler is preserved as a counter signal rather than a hung session. |
+| **Recovery** | None needed at the FUSE layer. Handler bug must be fixed in source; counter alert routes to engineering. |
+| **Severity** | **P3** (single op affected; no propagation) |
+
+### F-FUSE-2: Async handler cancellation mid-call
+
+| Field | Value |
+|---|---|
+| **Description** | A tokio task driving a FUSE handler is cancelled (its future is dropped) before the handler completes. |
+| **Blast radius** | Single FUSE request. Plaintext buffers held by the cancelled future are released; without `ZeroOnCancel` discipline (I-FUSE-4) those buffers might sit in freed allocator slabs holding plaintext. |
+| **Detection** | Wrapper observes the bridge's `Sender` was dropped without `send()`; logs at WARN with request ID. Userspace sees `EINTR` (POSIX-correct cancellation signal). |
+| **Degradation** | Affected op returns `EINTR`; userspace caller retries or aborts per its own logic. `ZeroOnCancel<Vec<u8>>` zeroes plaintext on drop, so cached plaintext doesn't leak into other allocations. |
+| **Recovery** | None needed. Cancellation is a normal POSIX signal path. Frequency tracked by `kiseki_fuse_handler_cancellations_total`; high cancellation rate suggests upstream backpressure or runaway timeouts. |
+| **Severity** | **P3** (single op affected; F-CC3 cached-plaintext exposure window inherited from existing `Zeroizing` discipline) |
+
+### F-FUSE-3: libfuse session thread crash
+
+| Field | Value |
+|---|---|
+| **Description** | The dedicated `kiseki-fuse-session` thread exits unexpectedly: panic in libfuse, `EIO` from kernel `/dev/fuse` (rare; suggests kernel-side disconnect), or external signal. |
+| **Blast radius** | The FUSE mount becomes dead (no handler can be dispatched). Userspace processes against the mount hang on every syscall until OOM-killed or the mountpoint is `fusermount3 -uz`'d. The kiseki-client process is otherwise alive (S3, native, remote-http surfaces unaffected) until F-FUSE-3's response triggers. |
+| **Detection** | The wrapper observes the session thread's `JoinHandle` resolves; logs at ERROR with the panic payload or exit cause. |
+| **Degradation** | **Default**: kiseki-client process aborts (fail-fast, preserves the pre-swap shape where a fuser session crash effectively crashes the daemon). **Operator opt-in (`KisekiFuseConfig::auto_remount = true`)**: attempts one re-mount with the same options; if the re-mount also crashes, falls back to abort. |
+| **Recovery** | Process abort triggers the operator's existing daemon-restart machinery (systemd, supervisord, container orchestrator). Auto-remount mode is OFF by default because it can mask serious bugs. |
+| **Severity** | **P3** (single client; mount restart is the recovery path; affects only that mount's userspace processes) |
+
+---
+
 ## Failure severity summary
 
 | Severity | Count | Examples |
