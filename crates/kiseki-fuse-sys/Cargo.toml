@@ -1,0 +1,29 @@
+[package]
+name = "kiseki-fuse-sys"
+description = "Raw FFI bindings to libfuse 3.x. Internal crate for kiseki-fuse; not a public API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# Cargo `links` binds the crate to the system library it links against.
+# Cargo refuses to build a workspace where two crates declare the same
+# `links` value, which is the protection ADR-043 §D4 requires for the
+# `*-sys` convention. If a future transitive dep declares `links = "fuse3"`,
+# the workspace fails to build with a clear error rather than silently
+# linking two libfuse copies. Belt-and-braces: workspace `Cargo.toml`
+# carries a `[patch.crates-io]` block redirecting any `fuse3` crate.
+links = "fuse3"
+
+[lints]
+workspace = true
+
+[lib]
+# `*-sys` crate, used only as a build-time / link-time bridge to libfuse3.
+# Higher-level Rust API lives in `kiseki-fuse` per the §D4 split.
+crate-type = ["lib"]
+
+[build-dependencies]
+bindgen = "0.69"
+pkg-config = "0.3"

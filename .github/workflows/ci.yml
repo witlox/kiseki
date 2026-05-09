@@ -68,7 +68,7 @@ jobs:
         with:
           components: clippy
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev libclang-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -130,7 +130,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev libclang-dev
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       # `fast` profile excludes kiseki-acceptance + skips
@@ -148,7 +148,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev libclang-dev
       - uses: Swatinem/rust-cache@v2
       - name: Build kiseki-server (debug — saves ~3 min vs release)
         run: cargo build --locked -p kiseki-server
