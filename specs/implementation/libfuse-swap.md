@@ -1,6 +1,26 @@
 # ADR-043 Implementation Plan — fuser-rs → libfuse 3.x Swap
 
-**Status:** In progress. Phase 0 + 1a + 1b landed (commits `7bdfdbf` / `570a227` / `2b7fa0c`). Phase 2 in flight as a single rip-and-replace (cfg-flag/dual-compile/holding-period machinery dropped 2026-05-09 because kiseki is pre-production — no deployed clients, no rollback risk; see user memory `project_kiseki_pre_production`). Acceptance criterion 6 loosened per `specs/escalations/2026-05-09-libfuse-syncfs-not-in-318-release.md` Option A (accepted 2026-05-09).
+**Status:** **Complete (2026-05-09).** All phases landed:
+
+- Phase 0 (CI prep) — `7bdfdbf` libfuse3-dev install + `570a227` libclang-dev + Phase 1a.
+- Phase 1a (`kiseki-fuse-sys` bindgen FFI) — commit `570a227`.
+- Phase 1b (`kiseki-fuse` safe wrapper, all I-FUSE-1..8 contracts) — commit `2b7fa0c`.
+- Phase 2 (rip-and-replace `fuse_daemon.rs`) — commit `7c25a27`.
+- ABI portability fix (`fuse_session_new` @@FUSE_3.0) — commit `4129aa7`.
+- Release strategy (Rocky 9 SONAME pin + bindgen blocklist) — commit `527c2e6`.
+- pNFS layout regression caught by post-swap perf run (unrelated to swap; same kernel client) — fixed `da45687`.
+
+Phases 3–6 in the original plan were **collapsed into Phase 2** (the cfg-flag/dual-compile/holding-period machinery was sized for production-deployment-rollback risk that doesn't apply pre-production; see user memory `project_kiseki_pre_production`).
+
+**Acceptance criterion deferrals:**
+
+- Criterion 6 (FUSE_SYNCFS regression test) — deferred to libfuse 3.19+ per `specs/escalations/2026-05-09-libfuse-syncfs-not-in-318-release.md` Option A (accepted 2026-05-09). libfuse 3.18.2 has no `fuse_lowlevel_ops::syncfs` callback to wire; kernel ENOSYS-fallback to per-inode FUSE_FSYNC preserves correctness.
+- Criterion 10 (ADR-013 op-coverage parity) — partial; trait surface covers every ADR-013 op but data-plane backing for chown/truncate/utimensat/xattr quartet/getlk/setlk/statfs is still ENOSYS or EOPNOTSUPP. Documented in `specs/escalations/2026-05-09-adr-013-ops-pending-data-plane.md` as pre-existing gaps (not regressions); follow-up work sequenced separately.
+
+**Post-swap perf** (single-node, kiseki-profile matrix vs 2026-05-07 baseline):
+- FUSE put-heavy: 52,888 → 54,504 op/s (**+3.1%**).
+- FUSE get-heavy: 115,368 → 144,552 op/s (**+25%**) — the multi-thread session loop showing up; fuser's single-thread inline dispatch was the structural ceiling.
+- FUSE mixed: 61,230 → 65,596 op/s (**+7%**).
 
 ## Phase-collapse note (2026-05-09)
 

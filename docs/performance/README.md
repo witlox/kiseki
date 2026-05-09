@@ -1,9 +1,10 @@
 # Performance
 
-Last refreshed: **2026-05-07 post-pool** (local matrix re-run on
-HEAD = `5fc9523`, after the pNFS DS session pool fix). The
-2026-05-07 (`51c48aa`) and 2026-05-03 snapshots are preserved
-below for comparison. Detailed per-snapshot data lives in
+Last refreshed: **2026-05-09 post-libfuse-swap** (local matrix
+re-run on HEAD = `527c2e6` after the fuser → libfuse 3.x swap;
+multi-node 3-node matrix in commit `da45687`). Earlier snapshots
+(2026-05-07 post-pool, 2026-05-07, 2026-05-03) are preserved
+below. Detailed per-snapshot data lives in
 [`specs/performance/`](../../specs/performance/INDEX.md).
 
 > Operators tuning a deployment for throughput should also read
@@ -24,6 +25,77 @@ Two data sources currently:
    quorum-loss bug (cross-node `PutFragment` averaging 2 s on a
    28 Gbps wire). Throughput data from this run is not representative
    until the bug is fixed — see [Open issues](#open-issues).
+
+## Local matrix — 2026-05-09 post-libfuse-swap refresh
+
+Re-run on HEAD = `527c2e6` after the fuser → libfuse 3.x swap
+(ADR-043, commits `570a227` / `2b7fa0c` / `7c25a27` / `4129aa7` /
+`527c2e6`). Same configuration as prior matrices (single-node
+`kiseki-server`, 64 KiB, c=16, 30 s, warmup=256). CPU phase via
+pprof; numbers below are CPU-phase throughput.
+
+### FUSE delta vs 2026-05-07 baseline
+
+| Shape | Pre-swap | Post-swap | Δ |
+|---|---:|---:|---:|
+| put-heavy | 52,888 op/s · 3,305 MiB/s | **54,504 op/s · 3,406 MiB/s** | **+3.1%** |
+| get-heavy | 115,368 op/s · 7,210 MiB/s | **144,552 op/s · 9,034 MiB/s** | **+25%** |
+| mixed | 61,230 op/s · 3,826 MiB/s | **65,596 op/s · 4,099 MiB/s** | **+7%** |
+
+The +25% lift on get-heavy is the **multi-thread session loop** showing up — fuser's single-thread inline dispatch was the structural ceiling, replaced by libfuse's `fuse_session_loop_mt_31`. Other protocols are unchanged from the 2026-05-07 post-pool numbers (libfuse swap only touches the FUSE path).
+
+### Tail latency p99 (µs) — FUSE only
+
+| Shape | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| put-heavy | 235 | 483 | 683 |
+| get-heavy | 94 | 208 | 343 |
+| mixed | 200 | 428 | 624 |
+
+## Multi-node matrix — 2026-05-09 (`docker-compose.3node.yml`)
+
+`tests/e2e/test_perf_baseline.py` against 3-node Raft cluster on
+`docker-compose.3node.yml`. fio `bs=1M`, `size=8M`, `runtime=10s`,
+`time_based`, **`direct=0`** (this matters — see methodology note
+below).
+
+| Protocol | seq-read | seq-write |
+|---|---:|---:|
+| S3 | 240 MB/s (PUT 123 MB/s) | — |
+| NFSv3 | 2,265 MB/s | 134 MB/s |
+| NFSv4.1 (post `da45687`) | **923 MB/s** | 1,644 MB/s |
+| FUSE (post Rocky 9 image) | 351 MB/s | 1,955 MB/s |
+
+### NFSv4.1 read regression — root-caused (`da45687`)
+
+Pre-fix: 0.5 MB/s reads. Server advertises Flexible Files pNFS
+layout (`FATTR4_FS_LAYOUT_TYPES`); kernel client uses pNFS by
+default; per-file DS-session establishment tax (EXCHANGE_ID +
+CREATE_SESSION + RECLAIM_COMPLETE on every OPEN+LAYOUTGET, torn
+down on CLOSE) caps reads at sub-MB/s.
+
+The env-var gate `KISEKI_DISABLE_PNFS_LAYOUT=1` (existing since
+Phase 15a, documented in `nfs4_server.rs:1376-1393`) makes the
+server return `NFS4ERR_LAYOUTUNAVAILABLE` on LAYOUTGET; kernel
+falls back to MDS inline reads. Compose now sets it; BDD pNFS
+scenarios bring up their own compose without the env var to
+exercise the layout path intentionally.
+
+DS WRITE support is the actual fix; tracked separately.
+
+### Methodology note — fio `--direct=0`
+
+The `direct=0` flag in `test_perf_baseline.py` lets writes return
+as soon as they hit the kernel page cache; the actual gateway
+commit happens during writeback after the test ends. This inflates
+write numbers vs read numbers (writes look 5-15× faster than they
+"should") and is responsible for the asymmetric shape vs the
+single-node matrix (which uses kiseki-profile's userspace
+clients, no kernel page cache in the loop). For
+deployment-realistic numbers use `direct=1`; the GCP perf-suite
+already does (`infra/gcp/benchmarks/perf-suite.sh`).
+
+---
 
 ## Local matrix — 2026-05-07 post-pNFS-pool refresh
 
