@@ -1,8 +1,8 @@
 # ADR-043: System Library FFI Policy
 
-**Status**: Proposed (rev 2 — scoped to FFI policy only after gate-1)
-**Date**: 2026-05-09 (rev 1); 2026-05-09 (rev 2 — same day, post gate-1)
-**Deciders**: Architect (this draft); Adversary gate-1 closed.
+**Status**: Proposed (rev 3 — gate-1 round-2 amendments applied; acceptance pending only on Open item B)
+**Date**: 2026-05-09 (rev 1); 2026-05-09 (rev 2 same day, post gate-1); 2026-05-09 (rev 3 same day, post gate-1 round 2)
+**Deciders**: Architect (this draft); Adversary gate-1 round 1 + round 2 both closed.
 
 ## Revision history
 
@@ -21,6 +21,16 @@
   - F-H1, F-H5, F-H6 are ganesha-specific.
 
   The surviving findings (F-H2 security-posture rule, F-H4 FIPS evaluator written reference, F-M1 license, F-M5 cross-platform, F-M8 fuser-PR alternative, F-M9 *-sys enforceability) are addressed in this rev-2.
+- **rev 3 (2026-05-09)**: Adversary gate-1 round 2 (`specs/findings/2026-05-09-adv-gate1-round2-adr043-findings.md`) reviewed rev-2 itself plus the §D6 plan-gating amendment (commit `6fb88aa`) plus the libfuse-swap implementation plan, returning **CHANGES REQUESTED — small scope** (0 CRITICAL, 3 HIGH, 6 MEDIUM, 3 LOW). Rev-3 closes:
+  - F2-H1: §D6 illustrative "e.g." criteria → exhaustive 7-row checklist with "if any answer is yes" rule.
+  - F2-M1: §D2 grandfathered libfabric / libibverbs rows backfilled with D1.1 security-posture data.
+  - F2-M2: §D6 review-discipline gains "amendments trigger re-review" rule.
+  - F2-M6: §D2 libfuse row clarifies kernel-side (≥ 5.4) vs userspace-side (libfuse 3.10) version dependency.
+  - F2-L1: New §"Review schedule" section names architect as owner and lists per-binding review dates.
+  - F2-L2: §"Why libfuse..." adds deployment-scale grounding for the production-use citation.
+  - CC2-1: §D6 findings-filename convention adopts the existing `YYYY-MM-DD-adv-gate1-<artifact>-findings.md` shape.
+
+  The remaining round-2 findings (F2-H2 D1.1 acceptance check; F2-H3 FFI safety contract; F2-M3 GCP build-path audit; F2-M4 go/no-go criteria; F2-M5 rollback procedure; F2-L3 macOS-retirement upgrade) are amendments to `specs/implementation/libfuse-swap.md`, applied in the same change-set.
 
 ## Context
 
@@ -46,9 +56,9 @@ FIPS conformance is necessary but not sufficient. Every entry on the D2 positive
 
 | Library | Role | FFI shape | FIPS path? | Min version | Notes |
 |---|---|---|---|---|---|
-| `libfabric` | Transport (Slingshot/Cassini, EFA, generic OFI) | `libfabric-sys` Rust crate | No | per ADR-042 | Existing — pre-permitted by ADR-001 Consequences |
-| `librdmacm` / `libibverbs` | Transport (InfiniBand, RoCEv2) | Rust bindings via `rdma-core` ecosystem | No | per ADR-042 | Existing — pre-permitted by extension of ADR-001 |
-| `libfuse` 3.x | FUSE protocol dispatch | `kiseki-fuse-sys` (bindgen) + `kiseki-fuse` safe wrapper | No | 3.10 (FUSE_SYNCFS support) | **New rev-2 addition.** Replaces `fuser` 0.17. Implementation plan: `specs/implementation/libfuse-swap.md`. No per-binding ADR per §D6. |
+| `libfabric` | Transport (Slingshot/Cassini, EFA, generic OFI) | `libfabric-sys` Rust crate | No | per ADR-042 | Existing — pre-permitted by ADR-001 Consequences. **D1.1 data**: upstream `ofiwg/libfabric` on GitHub; security advisories tracked at GitHub Security Advisories on the upstream repo; no kiseki-blocking CVE in the 24 months preceding 2026-05-09; kiseki triage SLA = D1.1 default (CRITICAL ≤ 7d, HIGH ≤ 30d, MEDIUM at next release). |
+| `librdmacm` / `libibverbs` | Transport (InfiniBand, RoCEv2) | Rust bindings via `rdma-core` ecosystem | No | per ADR-042 | Existing — pre-permitted by extension of ADR-001. **D1.1 data**: upstream `linux-rdma/rdma-core`; security advisories tracked via GitHub Security Advisories; CVE history reviewed at this rev — no kiseki-blocking advisory open at 2026-05-09; kiseki triage SLA = D1.1 default. |
+| `libfuse` 3.x | FUSE protocol dispatch | `kiseki-fuse-sys` (bindgen) + `kiseki-fuse` safe wrapper | No | userspace ≥ 3.10 + kernel ≥ 5.4 | **New rev-2 addition.** Replaces `fuser` 0.17. The userspace floor (libfuse 3.10) is the Debian/Ubuntu LTS shipped version. The kernel floor (≥ 5.4) covers FUSE_SYNCFS opcode 50 dispatch (kernel-side; libfuse exposes the userspace callback from 3.0+, but the kernel only sends the opcode on ≥ 5.1 — kiseki requires ≥ 5.4 for stability). Operator docs document the kernel floor at acceptance of the libfuse swap. Implementation plan: `specs/implementation/libfuse-swap.md`. No per-binding ADR per §D6. **D1.1 data**: upstream `libfuse/libfuse`; security advisories tracked at the upstream's GitHub Security Advisories; CVE history filled in by libfuse-swap.md acceptance criterion (7); kiseki triage SLA = D1.1 default. |
 
 Adding a library to this table requires an ADR amendment plus the D1.1 security-posture data filled in.
 
@@ -82,15 +92,27 @@ For each addition to D2: the migration plan commits to a "go / no-go" review at 
 
 ### D6. Migration is per-binding and plan-gated
 
-This ADR codifies the policy. Each binding's adoption is governed by an implementation plan in `specs/implementation/`. **A separate per-binding ADR is required ONLY when the binding introduces architectural decisions beyond the policy in this ADR** — e.g., a process-isolated daemon (a new bounded-context boundary), a new auth shape, a cross-language schema, or a new ubiquitous-language term. For "swap library X for library Y under policy Z" changes, the policy ADR plus implementation plan are sufficient; no per-binding ADR ceremony.
+This ADR codifies the policy. Each binding's adoption is governed by an implementation plan in `specs/implementation/`. A separate per-binding ADR is required if **any** of the following criteria apply (the architect documents the answer to each before merging the plan; the gate-1 review verifies the answers):
+
+1. The binding introduces a new bounded-context boundary (a new OS process kiseki maintains, a new RPC service in `kiseki-proto`, or a new cross-language wire format).
+2. The binding's auth/authz model differs from kiseki's existing tenant identity propagation (`OrgId` / `NamespaceId` end-to-end through the call chain).
+3. The binding introduces a new ubiquitous-language term (`specs/ubiquitous-language.md` gains a new entry).
+4. The binding's license materially changes downstream distribution shape (transitions across permissive ↔ LGPL ↔ copyleft; or wrapper LGPL exposure that didn't exist before).
+5. The binding's distribution shape requires new packaging steps on the GCP perf cluster, the dev environment, or downstream wrapper builds beyond a single distro-package install.
+6. The binding adds a new failure mode (per `specs/failure-modes.md`) or a new invariant (per `specs/invariants.md`).
+7. The binding's adoption changes any existing ADR's decision (i.e., requires another ADR to be revised).
+
+If every answer is **no**, the policy ADR plus implementation plan are sufficient; no per-binding ADR ceremony. A **yes** to any criterion triggers a per-binding ADR.
 
 Active plans:
 
-- **`specs/implementation/libfuse-swap.md`**: libfuse 3.x via `kiseki-fuse-sys` + `kiseki-fuse` — replaces `kiseki-client`'s `fuser`-based FUSE adapter. Decides binding-crate version pin, trait-surface details, testing strategy, performance targets at parity, perf-cluster validation order. Inherits §D1, §D1.1, §D2, §D5.
+- **`specs/implementation/libfuse-swap.md`**: libfuse 3.x via `kiseki-fuse-sys` + `kiseki-fuse` — replaces `kiseki-client`'s `fuser`-based FUSE adapter. Decides binding-crate version pin, trait-surface details, testing strategy, performance targets at parity, perf-cluster validation order. Inherits §D1, §D1.1, §D2, §D5. Architect's checklist answers (rev 3): every criterion answered **no**; therefore plan-only adoption is appropriate.
 
 Pre-existing pure-Rust paths (`fuser` 0.17 in `kiseki-client/src/fuse_daemon.rs`) remain in tree and CI-tested until the plan delivers a replacement that passes the existing `@integration` suite at parity. No big-bang removal.
 
-**Review discipline**: even without a per-binding ADR, the implementation plan IS reviewed by adversary gate-1 (per `.claude/CLAUDE.md` Diamond workflow) BEFORE implementer phase 0. Skipping the per-binding ADR does not skip the adversary review — it relocates the review from "attack the ADR" to "attack the plan." Findings live in `specs/findings/` keyed on the plan filename, same format as ADR findings. The review verifies that the plan does not silently introduce architectural decisions (per the criteria above) that should have warranted a per-binding ADR after all.
+**Review discipline**: even without a per-binding ADR, the implementation plan IS reviewed by adversary gate-1 (per `.claude/CLAUDE.md` Diamond workflow) BEFORE implementer phase 0. Skipping the per-binding ADR does not skip the adversary review — it relocates the review from "attack the ADR" to "attack the plan." Findings live in `specs/findings/` keyed on the plan basename and date: `YYYY-MM-DD-adv-gate1-<plan-base-name>-findings.md` (per the existing convention used for ADR findings). The review verifies the architect's answers to the checklist above; if any answer is plausibly **yes** but was answered **no**, the adversary requires a per-binding ADR before implementer phase 0.
+
+**Amendment-trigger rule**: material amendments to a reviewed plan (new phases, new dependencies, scope expansion, removal of acceptance criteria) trigger a gate-1 round-N+1 on the amended sections only. Cosmetic edits (typos, formatting, citation fixes) do not. The architect tags the commit message with `gate-1-amendment` so the review trigger is visible in `git log`.
 
 ## Rationale
 
@@ -118,7 +140,7 @@ The argument that ADR-027 has the most teeth on — "kiseki's own code in two la
 The smaller-cost alternative (Alternative 6 below) is to file PRs upstream to `fuser` for each gap that bites us. The named gap (FUSE_SYNCFS opcode 50) is PR-able. But:
 
 - The structural concern (single-thread inline dispatch, smaller maintainer pool, slower release cadence) is not a single-PR fix.
-- libfuse 3.x is the reference implementation maintained by FUSE upstream itself; every production FUSE filesystem (sshfs, juicefs, gcsfuse, dfuse, ceph-fuse, gocryptfs) uses it.
+- libfuse 3.x is the reference implementation maintained by FUSE upstream itself. Production deployment scale: sshfs (millions of installs as the de-facto remote-mount tool); juicefs (thousands of production clusters); gcsfuse (Google Cloud Storage's FUSE adapter, used at GCP scale); dfuse (DAOS POSIX gateway, deployed on US national-lab HPC clusters); ceph-fuse (Ceph's userspace POSIX path, alternative to the kernel client at site-by-site choice); gocryptfs (encrypted-filesystem tooling). The pattern is: libfuse is what production FUSE filesystems sit on; pure-Rust reimplementations like fuser-rs are smaller-scope alternatives without that deployment base.
 - Cumulative PR-cycle cost across multiple gaps exceeds the one-time swap cost.
 
 The fuser-PR-only path was considered and rejected for reliability reasons, not for any failure of the upstream maintainer or the crate's quality at smaller scope.
@@ -156,6 +178,18 @@ The fuser-PR-only path was considered and rejected for reliability reasons, not 
 - **B**: Verify the FIPS argument concretely under FIPS 140-3 IG §A.5 (cryptographic boundary scope) and §C.G (loadable libraries). Existing precedent (kernel TCP, libfabric, network switches) says transport-only C libraries don't enter the boundary, but get a written reference from a FIPS evaluator before the certification effort starts. Until the reference is filed, ADR-043 stays Proposed.
 - **C**: Cross-platform FUSE policy is silently retired here. If macOS / Windows FUSE later becomes a requirement, that ADR adds D2 rows under the same rules.
 
+## Review schedule
+
+The architect (currently the workflow owner per `.claude/CLAUDE.md`) tracks per-binding go/no-go review dates in this section. Each row is set when the binding's final D6 step lands (e.g., for libfuse: when `fuser` is removed from `Cargo.lock`).
+
+| Binding | Final D6 step merged | Go/no-go review due (+ 6 months) | Owner | Status |
+|---|---|---|---|---|
+| `libfabric` | n/a (pre-ADR-043; ADR-001 era) | n/a (grandfathered into D2 at this ADR) | Architect | Active |
+| `librdmacm` / `libibverbs` | n/a (pre-ADR-043 via ADR-042) | n/a (grandfathered into D2 at this ADR) | Architect | Active |
+| `libfuse` 3.x | TBD (set at libfuse-swap.md final phase merge) | TBD + 6 months | Architect | Pending swap |
+
+Triggers for the review (per §D5): perf regression > 20% on Tier_1 reference matrix, OR an unpatched CRITICAL/HIGH CVE older than the D1.1 SLA, OR a kiseki-internal incident with CVSS ≥ 7.0 traced to the binding. Decision-maker: architect in consultation with kiseki-security (a designated reviewer per the project's role definitions).
+
 ## References
 
 - ADR-001: Pure Rust, No Mochi — the libfabric precedent this ADR codifies and generalizes.
@@ -163,6 +197,7 @@ The fuser-PR-only path was considered and rejected for reliability reasons, not 
 - ADR-019: Gateway Deployment Model — defines the gateway-as-binary pattern that the FUSE daemon already follows.
 - ADR-027: Single-Language Rust Only — bounded by this ADR's reading: about kiseki's own code, not about system libraries we depend on.
 - ADR-042: Native Gateway Data Service — independent; native clients don't go through libfuse. ADR-042's libfabric/ibverbs bindings are codified by this ADR's D2 retroactively.
-- `specs/findings/2026-05-09-adv-gate1-adr043-findings.md` — gate-1 findings that drove the rev-1 → rev-2 scope reduction.
-- `specs/implementation/libfuse-swap.md` — implementation plan for the libfuse swap; per §D6, no per-binding ADR is required.
+- `specs/findings/2026-05-09-adv-gate1-adr043-findings.md` — round-1 findings that drove the rev-1 → rev-2 scope reduction.
+- `specs/findings/2026-05-09-adv-gate1-round2-adr043-findings.md` — round-2 findings that drove the rev-2 → rev-3 amendments documented in the Revision history.
+- `specs/implementation/libfuse-swap.md` — implementation plan for the libfuse swap; per §D6, no per-binding ADR is required (architect's checklist answers documented in §D6).
 - `specs/performance/2026-05-09-gcp-compact-fixes-verify/sync-kills-daemon.md` — the original FUSE_SYNCFS opcode 50 finding; the libfuse swap closes it.
