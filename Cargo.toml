@@ -108,6 +108,7 @@ kiseki-raft = { path = "crates/kiseki-raft", version = "2026.41.0" }
 kiseki-transport = { path = "crates/kiseki-transport", version = "2026.41.0" }
 kiseki-log = { path = "crates/kiseki-log", version = "2026.41.0" }
 kiseki-keymanager = { path = "crates/kiseki-keymanager", version = "2026.41.0" }
+kiseki-fuse = { path = "crates/kiseki-fuse", version = "2026.41.0" }
 kiseki-audit = { path = "crates/kiseki-audit", version = "2026.41.0" }
 kiseki-chunk = { path = "crates/kiseki-chunk", version = "2026.41.0" }
 kiseki-chunk-cluster = { path = "crates/kiseki-chunk-cluster", version = "2026.41.0" }

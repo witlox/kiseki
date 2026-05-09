@@ -6,6 +6,23 @@
 **Plan:** `specs/implementation/libfuse-swap.md`
 **ADR:** ADR-043 rev 4 (`specs/architecture/adr/043-system-library-ffi.md`)
 **Severity:** Plan-level scope conflict (does not block the rest of Phase 1b)
+**Status:** **RESOLVED — Option A accepted 2026-05-09.** Plan + ADR amended; implementer-side interim plan is now the durable plan until libfuse 3.19 ships.
+
+## Resolution
+
+Architect accepted **Option A** on 2026-05-09. Concrete consequences:
+
+- ADR-043 §D2 libfuse row updated to note the syncfs deferral and the libfuse 3.19+ retarget.
+- libfuse-swap.md §"Why this binding" no longer cites FUSE_SYNCFS as a primary reason; the win is now multi-thread session loop + maintainer-pool depth + production deployment scale.
+- libfuse-swap.md Phase 2 step 10's syncfs wiring is omitted; the kernel ENOSYS-fallback (per-inode FUSE_FSYNC routed through `fsync`) preserves correctness.
+- libfuse-swap.md Phase 3 step 16's `syncfs`-via-`sync(2)` probe is a follow-up rather than a Phase 4 gate.
+- libfuse-swap.md Acceptance criterion 6 marked DEFERRED until libfuse 3.19 ships.
+- The `Filesystem` trait in `crates/kiseki-fuse/src/filesystem.rs` does NOT include a `syncfs` method (Phase 1b landed without it).
+- When libfuse 3.19 ships:
+  - bump `kiseki-fuse-sys` minimum version to 3.19 (one-line change in `build.rs`'s `pkg_config::Config::new().atleast_version("3.19")`),
+  - add `syncfs` to the `Filesystem` trait + the trampolines table,
+  - add the FUSE_SYNCFS regression test (Acceptance criterion 6),
+  - retire this escalation.
 
 ## Finding
 

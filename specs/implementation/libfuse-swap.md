@@ -1,6 +1,22 @@
 # ADR-043 Implementation Plan — fuser-rs → libfuse 3.x Swap
 
-**Status:** Draft (gate-1 round 3 amendments applied; ready for implementer phase 0).
+**Status:** In progress. Phase 0 + 1a + 1b landed (commits `7bdfdbf` / `570a227` / `2b7fa0c`). Phase 2 in flight as a single rip-and-replace (cfg-flag/dual-compile/holding-period machinery dropped 2026-05-09 because kiseki is pre-production — no deployed clients, no rollback risk; see user memory `project_kiseki_pre_production`). Acceptance criterion 6 loosened per `specs/escalations/2026-05-09-libfuse-syncfs-not-in-318-release.md` Option A (accepted 2026-05-09).
+
+## Phase-collapse note (2026-05-09)
+
+The original plan staged the swap across phases 2-6 with a `kiseki_fuse_backend_fuser` (default) + `kiseki_fuse_backend_libfuse` (opt-in) cfg flag, a default-flip at Phase 4 after BDD parity, and a 1-week holding period before fuser was deleted. That machinery was sized for the production-deployment-rollback risk shape.
+
+kiseki has no deployed clients (pre-production; iterate freely). The cfg-flag dance just slows the swap without buying anything. Replaced with a single rip-and-replace: fuser dep dropped, `fuse_daemon.rs` rewritten against `kiseki_fuse::Filesystem` directly, tests + bin updated. If something regresses we revert the commit; the fuser code is in git history.
+
+What this collapses, concretely:
+- **Phase 2 step 9** (cfg flag): SKIPPED.
+- **Phase 2 step 10**: simplified to "rewrite fuse_daemon.rs against kiseki_fuse::Filesystem; preserve the 3-phase RwLock pattern + ADR-040 fsync hook chain".
+- **Phase 4 step 21** (default flip): SKIPPED — the new default is libfuse from the moment the rewrite lands.
+- **Phase 4 step 22 holding-period** (≥ 1 week parity in CI before Phase 6): SKIPPED — Phase 6 (fuser deletion) lands in the same commit as the rewrite.
+- **Phase 6**: collapsed into the rewrite commit — `fuser` is deleted from `Cargo.toml` and `Cargo.lock` immediately.
+- **Risk-register row** "if Phase 4 step 21 regresses, revert one cfg edit": replaced with "revert the rewrite commit; fuser is in git history".
+
+Phase 3 (test ports), Phase 5 (kiseki-profile port), and the §"Sequencing relative to remote-nfs removal" section remain as-is — they're independent of the cfg-flag machinery.
 **Created:** 2026-05-09
 **Last amended:** 2026-05-09 (round-3 findings F3-H1..H5, all 8 MEDIUMs, all 4 LOWs, both cross-cutting closed inline)
 **Tracks:** ADR-043 rev 3.
@@ -36,7 +52,7 @@ minimal diffs.
 
 | Candidate | Verdict | Reason |
 |---|---|---|
-| **libfuse 3.x via FFI** | **Selected** | Reference impl maintained by FUSE upstream. Multi-thread session loop. All opcodes implemented including FUSE_SYNCFS (the 2026-05-09 sync-investigation gap). Decades of bug history. Production deployment scale: sshfs (millions of installs), juicefs (thousands of clusters), gcsfuse (Google Cloud), dfuse (DAOS), ceph-fuse, gocryptfs. |
+| **libfuse 3.x via FFI** | **Selected** | Reference impl maintained by FUSE upstream. Multi-thread session loop. Decades of bug history. Production deployment scale: sshfs (millions of installs), juicefs (thousands of clusters), gcsfuse (Google Cloud), dfuse (DAOS), ceph-fuse, gocryptfs. (Originally also cited "FUSE_SYNCFS userspace handling," but that hook is in libfuse master only — added 2026-01-29 in commit `074f0dfc`, not in any tagged release through 3.18.2. Per Option A of `specs/escalations/2026-05-09-libfuse-syncfs-not-in-318-release.md`, deferred to libfuse 3.19+; correctness preserved by kernel ENOSYS-fallback to per-inode FUSE_FSYNC.) |
 | `fuse3` crate | Rejected | Has both pure-Rust and libfuse backends; unstable choice surface. We'd carry the crate's design churn. Selecting libfuse-direct is more durable. |
 | `polyfuse` | Rejected | Pure-Rust reimplementation; async-first and more actively maintained than fuser at the current cadence, but the fundamental issue (pure-Rust protocol reimpl in a small maintainer pool) is the same class of risk we're avoiding. Selecting libfuse-direct settles the question for both reimpl crates simultaneously. |
 | Direct `/dev/fuse` + custom protocol code | Rejected | Becomes a fourth Rust FUSE protocol impl. Effort comparable to upstreaming PRs to fuser. No reliability win. |
@@ -105,7 +121,7 @@ panic!(
 );
 ```
 
-Pinned minimum libfuse version: **3.10** (chosen because that's where FUSE_SYNCFS landed in the upstream FUSE protocol per kernel ≥ 5.1, which was the original gap that triggered this work). Kernel-side floor: **≥ 5.4** (FUSE_SYNCFS opcode 50 dispatch).
+Pinned minimum libfuse version: **3.10** (the Debian/Ubuntu LTS shipped version). Kernel-side floor: **≥ 5.4** (FUSE_SYNCFS opcode 50 dispatch by the kernel; userspace handling deferred per Option A above). Future bump target: libfuse 3.19+ when it ships, at which point the `Filesystem` trait gains a `syncfs` method and Acceptance criterion 6 fires for real.
 
 ### `crates/kiseki-fuse/`
 
@@ -146,7 +162,12 @@ pub trait Filesystem: Send + Sync + 'static {
     fn release(&self, req: &Request, ino: u64, fh: u64, flags: i32,
                lock_owner: Option<LockOwner>, flush: bool, reply: ReplyEmpty);
     fn fsync(&self, req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty);
-    fn syncfs(&self, req: &Request, reply: ReplyEmpty);
+    // syncfs DEFERRED to libfuse 3.19+ per Option A of
+    // specs/escalations/2026-05-09-libfuse-syncfs-not-in-318-release.md.
+    // libfuse 3.18.2 has no fuse_lowlevel_ops::syncfs callback; kernel
+    // ENOSYS-fallback gives per-inode FUSE_FSYNC which routes through
+    // our `fsync` method. Re-add when libfuse 3.19 ships.
+    // fn syncfs(&self, req: &Request, reply: ReplyEmpty);
 
     // ---- Namespace / dir ops ----
     fn create(&self, req: &Request, parent: u64, name: &OsStr, mode: u32,
@@ -301,7 +322,7 @@ The gate-2 audit on `kiseki-fuse` validates this contract is honored in code, wi
     - Duplicate the handler-impl block under both cfgs initially (the new branch is the working port; the legacy branch keeps fuser-shape unchanged).
     - **Implement the "❌ missing" ADR-013 ops** (chmod/chown/truncate via setattr; symlink/readlink; xattr quartet; getlk/setlk) — see §"ADR-013 parity check." If any op is unimplementable against the current `KisekiFuse` data plane, file as a separate spec-only invariant and escalate.
     - Update reply type names where the wrapper diverges from fuser's vocabulary.
-    - Implement the `syncfs` op against `gateway.fsync_pending()` — the hook chain that ADR-040 / `docs/operations/durability.md` already documents. This closes the FUSE_SYNCFS opcode 50 gap that was the original trigger.
+    - **(deferred per Option A — 2026-05-09)** Originally: implement `syncfs` against `gateway.fsync_pending()`. libfuse 3.18.2 has no userspace hook for FUSE_SYNCFS; kernel ENOSYS-fallback dispatches per-inode `FUSE_FSYNC` which already routes through our `fsync` method on `gateway.fsync_pending()` for `force_fsync = true`. End-user `sync(2)` semantics preserved. Re-enable when libfuse 3.19 ships.
     - Replace `fuser::mount2(daemon, mountpoint, &options)` with `kiseki_fuse::mount(daemon, mountpoint, options)` (libfuse branch).
 11. In `crates/kiseki-client/src/bin/kiseki_client.rs`: the `evict_stale_fuse_mount` helper using `fusermount3 -uz` keeps working unchanged.
 12. In `crates/kiseki-client/Cargo.toml`:
@@ -313,7 +334,7 @@ The gate-2 audit on `kiseki-fuse` validates this contract is honored in code, wi
 13. `crates/kiseki-client/tests/fuse_linux.rs`: update imports.
 14. `crates/kiseki-client/tests/posix_semantics.rs`: update imports.
 15. `crates/kiseki-client/tests/concurrent_fuse.rs`: update imports.
-16. `crates/kiseki-client/tests/fuse_sync_adjacent_ops.rs`: update imports; **expand the test** — add a probe that drives `syncfs` directly via a kernel `sync(2)` against the mount, verifying our libfuse `syncfs` impl gets called and returns Ok. This is the regression test that pins the original FUSE_SYNCFS gap closed (Acceptance criterion 6).
+16. `crates/kiseki-client/tests/fuse_sync_adjacent_ops.rs`: update imports. **Acceptance criterion 6 is deferred** to libfuse 3.19+ per Option A; the syncfs-via-`sync(2)` probe is a follow-up. The test continues to drive `fsync(2)` per inode via existing `flush`/`fsync` paths, which are the kernel's ENOSYS-fallback target.
 17. `crates/kiseki-client/tests/fuse_mount_cleanup.rs`: no `fuser` direct deps; should compile unchanged.
 18. **`crates/kiseki-client/tests/fuse_macos.rs`: delete.** Per the §"Platform scope" decision macOS is officially out; the test is removed outright (git history preserves the prior content for reference).
 
@@ -348,7 +369,7 @@ This swap is "done" when:
 3. Local `kiseki-profile` FUSE perf is at parity or better than the current numbers in `docs/performance/README.md`.
 4. `cargo tree -p kiseki-client --features fuse` shows no `fuser` crate.
 5. `cargo deny check` passes (license + advisory + bans, including the `links = "fuse3"` ban rule).
-6. **The FUSE_SYNCFS opcode 50 path is exercised** by a test that drives `sync(2)` against a real mount and asserts our impl runs (not the kernel default-ENOSYS fallback). Phase 0 step 5 verifies CI runner privileges; if a privileged CI lane is required, the lane is configured before this criterion can pass.
+6. **The FUSE_SYNCFS opcode 50 path is exercised** by a test that drives `sync(2)` against a real mount and asserts our impl runs (not the kernel default-ENOSYS fallback). **DEFERRED to libfuse 3.19+** per Option A of `specs/escalations/2026-05-09-libfuse-syncfs-not-in-318-release.md` (accepted 2026-05-09): libfuse 3.18.2 has no `fuse_lowlevel_ops::syncfs` hook to wire into. Until libfuse 3.19 ships, kiseki replies ENOSYS to FUSE_SYNCFS and the kernel falls back to per-inode FUSE_FSYNC, which our `fsync` method handles on `gateway.fsync_pending()`. The acceptance criterion fires when libfuse 3.19 lands; until then, this row is satisfied-by-deferral.
 7. ADR-043 §D2 libfuse row is updated with D1.1 security-posture data: upstream CVE history reference (link to `libfuse/libfuse` GitHub Security Advisories), the most recent CVE id and the kiseki-internal time-to-patch we'd commit to (or "no CVE in window" if the advisories list is clean at acceptance), and the kiseki triage SLA (default per D1.1: CRITICAL ≤ 7 days, HIGH ≤ 30 days, MEDIUM at next release). Locks the plan's "done" state to the policy's stated requirement.
 8. `kiseki-fuse` crate has a gate-2 audit pass against the §"Safety contract" above; concretely: cancellation tests (cancel a handler future; assert `EINTR` reaches the kernel and plaintext is zeroed), drop-without-consume tests (drop a reply token; assert `EIO` is returned in release, panic in debug, counter incremented), session-crash test (synthetic panic; assert process aborts), max-pending-ops test (saturate; assert `EAGAIN`), and a compile-fail test asserting reply tokens cannot be sent across the C-thread boundary without the bridge.
 9. **GCP perf-cluster build scripts** (`.gcp-build/build.sh`, `infra/gcp/`) and **downstream wrapper build paths** (Python PyO3, C++) are updated by a **merged PR before Phase 1 of this plan begins**. The next GCP perf-cluster run after Phase 6 must succeed at the kiseki-client build step; this is verified by the `infra/gcp/benchmarks/perf-suite-*.sh` smoke check.
@@ -381,7 +402,7 @@ Six months after `fuser` is removed from `Cargo.lock` (final Phase 6 step), the 
 | Tier_1 perf-cluster numbers | within ±10% of pre-swap baseline (2026-05-09 GCP `compact` numbers in `specs/performance/`) | next `kiseki-profile` matrix run on the GCP cluster |
 | Unpatched libfuse CVE in the kiseki-pinned version range | 0 CRITICAL or HIGH older than the D1.1 SLA | `libfuse/libfuse` GitHub Security Advisories review |
 | FUSE BDD scenario flake rate | ≤ baseline + 1 scenario flagged `@flaky` | full BDD suite (Tier 2) trailing-30-day pass rate |
-| FUSE_SYNCFS regression coverage | the round-2-mandated test (Acceptance criterion 6) is still green | `cargo nextest` |
+| FUSE_SYNCFS regression coverage | per Option A: deferred until libfuse 3.19 ships; the per-inode FUSE_FSYNC fallback path (`fsync` op) is green | `cargo nextest` |
 
 If any criterion fails, mark the libfuse row Rejected per ADR-043 §D5 and revert via §"Rollback procedure" below.
 

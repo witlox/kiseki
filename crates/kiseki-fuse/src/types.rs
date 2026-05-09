@@ -120,3 +120,71 @@ pub struct SetAttrRequest {
 /// full" lists POSIX file locks via `getlk`/`setlk`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LockOwner(pub u64);
+
+/// Connection-negotiation parameters passed to
+/// [`Filesystem::init`](crate::filesystem::Filesystem::init).
+///
+/// Mirrors the writable fields of libfuse's `fuse_conn_info`. The
+/// backend mutates these to negotiate kernel-side caching, readahead,
+/// and capability flags before any other op runs.
+///
+/// `capable` lists what the kernel offers; the backend sets
+/// corresponding bits in `want` to enable them. Cap constants are in
+/// [`caps`].
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionInfo {
+    /// Kernel-offered capabilities (read-only).
+    pub capable: u32,
+    /// Capabilities to enable (set bits to opt in).
+    pub want: u32,
+    /// Maximum readahead in bytes the kernel will issue ahead of an
+    /// in-flight read. Defaults to ~1 MiB on modern kernels; bump to
+    /// 16 MiB or more for HPC/AI workloads with large sequential reads.
+    pub max_readahead: u32,
+    /// Maximum read size the kernel will request in a single FUSE_READ
+    /// (read-only — kernel-determined).
+    pub max_read: u32,
+    /// Maximum write size the kernel will request in a single
+    /// FUSE_WRITE (read-only).
+    pub max_write: u32,
+}
+
+/// FUSE capability flags (subset). Matches `FUSE_CAP_*` in
+/// `fuse_common.h`. Pass via [`ConnectionInfo::want`] to enable.
+pub mod caps {
+    /// Async reads — kernel can issue multiple reads in parallel.
+    pub const ASYNC_READ: u32 = kiseki_fuse_sys::FUSE_CAP_ASYNC_READ;
+    /// FS supports being NFS-re-exported.
+    pub const EXPORT_SUPPORT: u32 = kiseki_fuse_sys::FUSE_CAP_EXPORT_SUPPORT;
+    /// FS supports parallel directory ops (lookups + readdir on the
+    /// same dir don't serialize).
+    pub const PARALLEL_DIROPS: u32 = kiseki_fuse_sys::FUSE_CAP_PARALLEL_DIROPS;
+}
+
+/// Kernel-side cache hint flags returned by the backend on
+/// [`open`](crate::filesystem::Filesystem::open) and
+/// [`create`](crate::filesystem::Filesystem::create).
+///
+/// Mirrors the `fuse_file_info` response bitfield. Set
+/// `keep_cache = true` for content-addressed / immutable file
+/// systems where the kernel can keep page-cache pages across opens
+/// (kiseki's chunks are HMAC-named and immutable).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenOptions {
+    /// Backend-side opaque file handle the kernel passes back on
+    /// every subsequent op.
+    pub fh: u64,
+
+    /// `FOPEN_KEEP_CACHE`: tell the kernel NOT to invalidate the
+    /// page cache on this `open`. Safe for content-addressed files.
+    pub keep_cache: bool,
+
+    /// `FOPEN_DIRECT_IO`: bypass the kernel page cache for this fd.
+    pub direct_io: bool,
+
+    /// `FOPEN_NONSEEKABLE`: file is a stream, not seekable.
+    pub nonseekable: bool,
+
+    /// `FOPEN_CACHE_DIR`: cache directory contents for opendir.
+    pub cache_readdir: bool,
+}

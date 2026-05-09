@@ -124,15 +124,33 @@ unsafe fn cname_to_osstr<'a>(name: *const ::core::ffi::c_char) -> &'a OsStr {
 // init / destroy — informational, no reply expected
 // =============================================================================
 
-unsafe extern "C" fn t_init(_userdata: *mut ::core::ffi::c_void, _conn: *mut sys::fuse_conn_info) {
-    // No reply token. The conn parameter could be tuned (max_readahead,
-    // capabilities); leaving defaults for Phase 1b — Phase 2 will
-    // configure FOPEN_KEEP_CACHE / FUSE_EXPORT_SUPPORT here.
+unsafe extern "C" fn t_init(userdata: *mut ::core::ffi::c_void, conn: *mut sys::fuse_conn_info) {
+    // SAFETY: userdata is the &MountState set at fuse_session_new_versioned;
+    // conn is libfuse-managed and valid for the call.
+    let state: &crate::session::MountState =
+        unsafe { &*(userdata.cast::<crate::session::MountState>()) };
+    let conn_ref = unsafe { &mut *conn };
+    let mut info = crate::types::ConnectionInfo {
+        capable: conn_ref.capable,
+        want: conn_ref.want,
+        max_readahead: conn_ref.max_readahead,
+        max_read: conn_ref.max_read,
+        max_write: conn_ref.max_write,
+    };
+    state.fs.init(&mut info);
+    // Write back the writable fields; capable / max_read / max_write
+    // are kernel-determined and read-only.
+    conn_ref.want = info.want;
+    conn_ref.max_readahead = info.max_readahead;
 }
 
-unsafe extern "C" fn t_destroy(_userdata: *mut ::core::ffi::c_void) {
+unsafe extern "C" fn t_destroy(userdata: *mut ::core::ffi::c_void) {
     // userdata is &MountState; do not free it here — Session::Drop
-    // owns the Box.
+    // owns the Box. Notify the backend so it can flush state.
+    // SAFETY: see t_init.
+    let state: &crate::session::MountState =
+        unsafe { &*(userdata.cast::<crate::session::MountState>()) };
+    state.fs.destroy();
 }
 
 // =============================================================================

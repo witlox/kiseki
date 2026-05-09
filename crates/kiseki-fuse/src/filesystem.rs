@@ -30,7 +30,7 @@ use crate::reply::{
     ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
 };
 use crate::request::Request;
-use crate::types::{LockOwner, SetAttrRequest};
+use crate::types::{ConnectionInfo, LockOwner, SetAttrRequest};
 
 /// Per-op context handed to every [`Filesystem`] method.
 ///
@@ -58,6 +58,22 @@ pub struct OpContext {
 /// override only the ops they support.
 #[allow(unused_variables)]
 pub trait Filesystem: Send + Sync + 'static {
+    // -------- Connection lifecycle --------
+
+    /// Negotiate kernel-side capabilities + readahead + caching.
+    /// Called once on mount before any other op. Backends typically
+    /// set [`ConnectionInfo::max_readahead`] and OR
+    /// `caps::EXPORT_SUPPORT` / `caps::ASYNC_READ` into
+    /// [`ConnectionInfo::want`].
+    fn init(&self, conn: &mut ConnectionInfo) {
+        let _ = conn;
+    }
+
+    /// Called once on session destruction. Backends close out any
+    /// state (e.g., flush pending writes that don't have an inode
+    /// to attach to).
+    fn destroy(&self) {}
+
     // -------- Inode + lookup --------
 
     /// Resolve a name in a directory to an inode (`stat` + entry).

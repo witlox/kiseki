@@ -152,5 +152,7 @@ pub use error::FuseError;
 pub use filesystem::Filesystem;
 pub use mount::{mount, KisekiFuseConfig};
 pub use request::{Request, RequestId};
-pub use types::{FileAttr, FileType, LockOwner, SetAttrRequest, SetAttrValid};
+pub use types::{
+    caps, ConnectionInfo, FileAttr, FileType, LockOwner, OpenOptions, SetAttrRequest, SetAttrValid,
+};
 pub use zeroize::ZeroOnCancel;

@@ -121,9 +121,7 @@ async fn run_concurrency(parallelism: usize) -> f64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 #[ignore = "slow: cold-read GET concurrency probe; manual run only"]
 async fn gateway_cold_read_concurrency_curve() {
-    eprintln!(
-        "\nGET cold-read concurrency probe (cache disabled via TTL=0, 64 MiB object)"
-    );
+    eprintln!("\nGET cold-read concurrency probe (cache disabled via TTL=0, 64 MiB object)");
     eprintln!("  workers=16, reads_per_task={READS_PER_TASK}");
     let mut results = Vec::new();
     for n in [1usize, 4, 16, 64] {

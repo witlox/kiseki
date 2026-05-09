@@ -44,7 +44,7 @@ use kiseki_fuse_sys as sys;
 use prometheus::{register_int_counter_vec, IntCounterVec, Opts};
 
 use crate::error::FuseError;
-use crate::types::{FileAttr, FileType};
+use crate::types::{FileAttr, FileType, OpenOptions};
 
 mod flock_ext {
     //! Local extension: hide the `c_short` casts behind a tiny module
@@ -264,8 +264,9 @@ impl ReplyCreate {
         }
     }
 
-    /// Reply with the created entry + open file handle.
-    pub fn created(mut self, attr: &FileAttr, generation: u64, fh: u64, fopen_flags: u32) {
+    /// Reply with the created entry + open file handle and the
+    /// kernel-side cache hint flags ([`OpenOptions`]).
+    pub fn created(mut self, attr: &FileAttr, generation: u64, opts: OpenOptions) {
         if let Some(req) = self.state.take() {
             let entry = sys::fuse_entry_param {
                 ino: attr.ino,
@@ -274,7 +275,7 @@ impl ReplyCreate {
                 attr_timeout: attr.ttl.as_secs_f64(),
                 entry_timeout: attr.ttl.as_secs_f64(),
             };
-            let fi = make_fuse_file_info(fh, fopen_flags);
+            let fi = make_fuse_file_info(opts);
             // SAFETY: see drop_pending. `&entry` and `&fi` are
             // stack-local valid for the call duration.
             unsafe {
@@ -320,10 +321,11 @@ impl ReplyOpen {
         }
     }
 
-    /// Reply with an open file handle.
-    pub fn opened(mut self, fh: u64, fopen_flags: u32) {
+    /// Reply with an open file handle plus kernel-side cache hint
+    /// flags ([`OpenOptions`]).
+    pub fn opened(mut self, opts: OpenOptions) {
         if let Some(req) = self.state.take() {
-            let fi = make_fuse_file_info(fh, fopen_flags);
+            let fi = make_fuse_file_info(opts);
             // SAFETY: see drop_pending.
             unsafe {
                 sys::fuse_reply_open(req, &fi);
@@ -875,16 +877,24 @@ fn system_time_parts(t: std::time::SystemTime) -> (i64, i64) {
     }
 }
 
-fn make_fuse_file_info(fh: u64, flags: u32) -> sys::fuse_file_info {
+fn make_fuse_file_info(opts: OpenOptions) -> sys::fuse_file_info {
     // SAFETY: zero-init `fuse_file_info` is the libfuse idiom — bit
     // fields default to 0.
     let mut fi: sys::fuse_file_info = unsafe { std::mem::zeroed() };
-    fi.fh = fh;
-    // The `flags` member in `fuse_file_info` is `i32` (open flags
-    // sign-extended from kernel int).
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        fi.flags = flags as i32;
+    fi.fh = opts.fh;
+    if opts.keep_cache {
+        // bindgen synthesizes `set_keep_cache` / `set_direct_io` /
+        // `set_nonseekable` / `set_cache_readdir` for the bitfield.
+        fi.set_keep_cache(1);
+    }
+    if opts.direct_io {
+        fi.set_direct_io(1);
+    }
+    if opts.nonseekable {
+        fi.set_nonseekable(1);
+    }
+    if opts.cache_readdir {
+        fi.set_cache_readdir(1);
     }
     fi
 }

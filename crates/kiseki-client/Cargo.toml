@@ -20,7 +20,7 @@ crate-type = ["lib", "cdylib"]
 [features]
 default = []
 ffi = []
-fuse = ["fuser"]
+fuse = ["dep:kiseki-fuse"]
 python = ["pyo3"]
 # Network attachment of FUSE/POSIX path to a running kiseki cluster.
 # Adds a `RemoteHttpGateway` that implements `GatewayOps` against the
@@ -65,7 +65,7 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", default-features = false, optional = true }
 parking_lot = { workspace = true }
 async-trait = { version = "0.1", optional = true }
-fuser = { version = "0.17", optional = true }
+kiseki-fuse = { workspace = true, optional = true }
 libc = { workspace = true }
 pyo3 = { version = "0.28", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "http2"], optional = true }
