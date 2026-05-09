@@ -73,7 +73,18 @@ fn main() {
         // libc happens to expose through fuse_common.h.
         .allowlist_function("fuse_.*")
         .allowlist_type("fuse_.*|FUSE_.*")
-        .allowlist_var("FUSE_.*|fuse_.*");
+        .allowlist_var("FUSE_.*|fuse_.*")
+        // libfuse 3.10–3.16 expose `fuse_session_new` as a real
+        // function; libfuse 3.17+ replaced it with a versioning
+        // macro that expands to `fuse_session_new_versioned`. To
+        // keep the kiseki-fuse-sys API surface stable across both
+        // versions, we blocklist whichever shape bindgen sees
+        // (function on ≤ 3.16, nothing on 3.17+) and provide a
+        // single hand-written `extern "C"` declaration in `src/lib.rs`
+        // tied to the `@@FUSE_3.0` symbol exported by every libfuse
+        // 3.x release. Without this blocklist, building on 3.10 fails
+        // with E0428 "the name `fuse_session_new` is defined twice".
+        .blocklist_function("fuse_session_new");
 
     // Add include paths pkg-config gave us.
     for include_path in &lib.include_paths {

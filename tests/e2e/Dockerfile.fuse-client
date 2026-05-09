@@ -1,27 +1,100 @@
-# FUSE client — minimal Linux image with fuse3 + the prebuilt
-# kiseki-client binary. Used by tests/e2e/test_fuse_client.py via
+# FUSE client — minimal Linux image with fuse3 + a kiseki-client
+# binary built INSIDE the container so the libfuse SONAME match is
+# guaranteed. Used by tests/e2e/test_fuse_client.py via
 # `docker run --rm --privileged --device /dev/fuse …`. The host
 # must pass /dev/fuse through (privileged + CAP_SYS_ADMIN).
 #
 # Built once per pytest session by the `fuse_client_image` fixture.
-# Expects `target/release/kiseki-client` to exist (`cargo build
-# --release -p kiseki-client --features fuse` is done outside the
-# image so we don't pay rust-toolchain build cost on every CI run).
+#
+# # Why we build kiseki-client in-container post-Phase-2-libfuse-swap
+#
+# Pre-swap kiseki-client linked against pure-Rust fuser and had no
+# native runtime dep, so a host-built binary worked anywhere. After
+# the libfuse swap (ADR-043 / Phase 2), kiseki-client links libfuse
+# dynamically. libfuse 3.17 bumped the SONAME from `libfuse3.so.3`
+# (3.10–3.16) to `libfuse3.so.4` (3.17+); a binary built against the
+# host's 3.18 (SONAME `.so.4`) won't load on Ubuntu 24.04 (3.14,
+# SONAME `.so.3`). Building in-container against the same libfuse the
+# runtime stage installs makes the SONAME match by construction.
+#
+# Stage 1 — builder pinned to rockylinux:9 to match the kiseki release
+# strategy. Rocky 9 ships fuse3-3.10.2 (SONAME `libfuse3.so.3`),
+# exactly the floor `kiseki-fuse-sys` pins via `pkg_config::Config::
+# new().atleast_version("3.10")`. Building here produces binaries
+# compatible with every distro shipping libfuse 3.10+ — the GCP perf
+# cluster (Rocky 9), Ubuntu 24.04 (3.14), Fedora 40 (3.16), Debian
+# bookworm (3.14). The dev-box's Arch (libfuse 3.18, SONAME `.so.4`)
+# is the outlier; binaries built there don't deploy to Rocky 9.
+#
+# Mirrors `.gcp-build/build.sh` step-for-step (same dnf packages,
+# same FIPS-default disable, same cargo invocation pattern).
 
-FROM ubuntu:24.04
+FROM rockylinux:9 AS builder
 
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN dnf install -y --allowerasing \
+        gcc \
+        gcc-c++ \
+        openssl-devel \
+        pkgconf-pkg-config \
+        perl-IPC-Cmd \
+        git \
+        curl \
+        unzip \
+        tar \
+        gzip \
+        make \
+        findutils \
+        cmake \
+        fuse3-devel \
+        clang \
+        clang-devel \
+    && dnf clean all
+
+# Install Rust toolchain (Rocky 9 doesn't ship a recent enough rustc
+# in dnf — same workaround as `.gcp-build/build.sh`).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# protoc — release builds bake messages from the kiseki-proto crate;
+# protobuf-compiler isn't in default Rocky 9 repos, so install via
+# upstream release tarball (also matches `.gcp-build/build.sh`).
+ARG PROTOC_VERSION=25.1
+RUN curl -fsSL -o /tmp/protoc.zip \
+        "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+    && unzip -q /tmp/protoc.zip -d /usr/local \
+    && rm /tmp/protoc.zip
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+COPY specs/architecture/proto/ specs/architecture/proto/
+
+# Disable FIPS default in kiseki-crypto (matches Dockerfile.server +
+# .gcp-build/build.sh). The FIPS delocator requires a certified
+# toolchain that doesn't work in generic Docker.
+RUN sed -i 's/default = \["fips"\]/default = []/' crates/kiseki-crypto/Cargo.toml \
+    && cargo build --release \
+       --bin kiseki-client \
+       --features "fuse,remote-http,remote-nfs,native"
+
+# Stage 2 — runtime, also Rocky 9 so SONAME alignment is by
+# construction. The runtime image contains fio + fuse3 + the
+# kiseki-client binary.
+FROM rockylinux:9
+
+# `fuse3` package provides BOTH fusermount3 (setuid mount helper)
+# AND libfuse3.so.3 (the shared library) — Rocky 9 doesn't split
+# these into separate packages like Ubuntu does.
+RUN dnf install -y --allowerasing \
         fuse3 \
-        ca-certificates \
+        fuse3-libs \
         coreutils \
+        ca-certificates \
         fio \
-    && rm -rf /var/lib/apt/lists/*
+    && dnf clean all
 
-# Pre-built binary (Glibc Ubuntu 24.04 host should match the
-# container's Glibc — both jammy/noble).
-COPY target/release/kiseki-client /usr/local/bin/kiseki-client
+COPY --from=builder /src/target/release/kiseki-client /usr/local/bin/kiseki-client
 RUN chmod +x /usr/local/bin/kiseki-client
 
 ENTRYPOINT ["/bin/bash", "-c"]

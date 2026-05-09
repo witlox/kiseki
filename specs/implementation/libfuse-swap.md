@@ -121,7 +121,21 @@ panic!(
 );
 ```
 
-Pinned minimum libfuse version: **3.10** (the Debian/Ubuntu LTS shipped version). Kernel-side floor: **≥ 5.4** (FUSE_SYNCFS opcode 50 dispatch by the kernel; userspace handling deferred per Option A above). Future bump target: libfuse 3.19+ when it ships, at which point the `Filesystem` trait gains a `syncfs` method and Acceptance criterion 6 fires for real.
+Pinned minimum libfuse version: **3.10** (the Rocky 9 / RHEL 9 / GCP-perf-cluster shipped version — `fuse3-3.10.2-9.el9`). Kernel-side floor: **≥ 5.4** (FUSE_SYNCFS opcode 50 dispatch by the kernel; userspace handling deferred per Option A above). Future bump target: libfuse 3.19+ when it ships, at which point the `Filesystem` trait gains a `syncfs` method and Acceptance criterion 6 fires for real.
+
+### Release-strategy implication: SONAME pin to Rocky 9 (2026-05-09)
+
+libfuse 3.17 bumped the shared-library SONAME from `libfuse3.so.3` (3.10–3.16) to `libfuse3.so.4` (3.17+). Binaries built against 3.17+ won't load on systems with `libfuse3.so.3` — including Rocky 9 (3.10), Ubuntu 24.04 LTS (3.14), and Debian bookworm (3.14). Discovered the hard way 2026-05-09 when a host-built (Arch, libfuse 3.18 → `.so.4`) `kiseki-client` binary failed to start in `tests/e2e/Dockerfile.fuse-client` (Ubuntu 24.04 base): `error while loading shared libraries: libfuse3.so.4: cannot open shared object file`.
+
+**Release contract:** all kiseki release artifacts (binaries shipped via `release.yml`, the `tests/e2e/Dockerfile.fuse-client` build, the GCP perf-cluster build path in `.gcp-build/build.sh`) MUST be built against **libfuse 3.10–3.16** (SONAME `.so.3`). The build environment is **rockylinux:9** which ships exactly `fuse3-3.10.2`. Any binary built against libfuse 3.17+ is a dev-box artifact only and MUST NOT be deployed.
+
+The dev-box (Arch / Fedora 41 / Debian trixie / Ubuntu 25.04+) has `.so.4`. Local `cargo build` works for development, but produces non-deployable binaries. CI / release / e2e harnesses MUST go through a Rocky 9 build container.
+
+`tests/e2e/Dockerfile.fuse-client` was updated 2026-05-09 to multi-stage build kiseki-client inside `rockylinux:9` (mirroring `.gcp-build/build.sh` step-for-step). The runtime stage is also `rockylinux:9` so SONAME alignment is by construction.
+
+The same constraint applies to `Dockerfile.server` only if/when kiseki-server gains a FUSE-linked dep (today it doesn't link libfuse). Watch for this when the data plane gains in-process FUSE support.
+
+**Future-proofing:** when libfuse 3.19 ships and brings the `syncfs` userspace hook (Option A re-target trigger), the SONAME-`.so.4` migration becomes unavoidable. At that point Rocky 9 (which won't have 3.19 in its base appstream) needs either an EPEL backport, a vendored libfuse build, or the kiseki release strategy moves to a newer base distro. Tracked in the next libfuse-swap go/no-go review.
 
 ### `crates/kiseki-fuse/`
 
