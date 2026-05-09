@@ -46,6 +46,14 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
+      # NFSv4.1 reads via the kernel client take 5+ seconds per RPC
+      # (capping throughput at 0.5 MB/s) when pNFS is advertised but
+      # the DS path can't sustain a session — see
+      # crates/kiseki-gateway/src/nfs4_server.rs:1376-1393. Compose +
+      # production-style deployments disable layout advertisement so
+      # the kernel reads via MDS inline (~600 MB/s). BDD pNFS
+      # scenarios can override this in their own compose.
+      KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node1-data:/data
@@ -82,6 +90,14 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
+      # NFSv4.1 reads via the kernel client take 5+ seconds per RPC
+      # (capping throughput at 0.5 MB/s) when pNFS is advertised but
+      # the DS path can't sustain a session — see
+      # crates/kiseki-gateway/src/nfs4_server.rs:1376-1393. Compose +
+      # production-style deployments disable layout advertisement so
+      # the kernel reads via MDS inline (~600 MB/s). BDD pNFS
+      # scenarios can override this in their own compose.
+      KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node2-data:/data
@@ -118,6 +134,14 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
+      # NFSv4.1 reads via the kernel client take 5+ seconds per RPC
+      # (capping throughput at 0.5 MB/s) when pNFS is advertised but
+      # the DS path can't sustain a session — see
+      # crates/kiseki-gateway/src/nfs4_server.rs:1376-1393. Compose +
+      # production-style deployments disable layout advertisement so
+      # the kernel reads via MDS inline (~600 MB/s). BDD pNFS
+      # scenarios can override this in their own compose.
+      KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node3-data:/data
