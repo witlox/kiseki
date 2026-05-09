@@ -118,25 +118,19 @@ impl Session {
 
         let ops = crate::trampolines::ops_table();
 
-        let mut version = sys::libfuse_version {
-            major: sys::FUSE_MAJOR_VERSION,
-            minor: sys::FUSE_MINOR_VERSION,
-            hotfix: sys::FUSE_HOTFIX_VERSION,
-            padding: 0,
-        };
-
-        // SAFETY: the bindings expose `fuse_session_new_versioned`
-        // for libfuse 3.17+; we pass the size of our ops table and a
-        // populated libfuse_version. `args.raw` lives until the
-        // session does (kept in `args._argv_storage`); userdata_ptr
-        // points at `*state` which is kept by the returned struct.
+        // SAFETY: kiseki-fuse-sys exposes `fuse_session_new` (the
+        // pre-3.17 ABI, tagged `@@FUSE_3.0` and exported by every
+        // libfuse 3.x release). Using the versioned variant would
+        // require libfuse ≥ 3.17 at runtime — which Ubuntu 24.04 LTS
+        // (3.14.0) does not ship. `args.raw` lives until the session
+        // does (kept in `args._argv_storage`); `userdata_ptr` points
+        // at `*state` which is kept by the returned struct.
         let mut args_owned = args;
         let session = unsafe {
-            sys::fuse_session_new_versioned(
+            sys::fuse_session_new(
                 std::ptr::addr_of_mut!(args_owned.raw),
                 std::ptr::addr_of!(ops),
                 std::mem::size_of::<sys::fuse_lowlevel_ops>(),
-                std::ptr::addr_of_mut!(version),
                 userdata_ptr,
             )
         };

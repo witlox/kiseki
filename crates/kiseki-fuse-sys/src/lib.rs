@@ -43,3 +43,24 @@
 #![allow(clippy::nursery)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+// libfuse 3.17 turned `fuse_session_new` into a versioning macro that
+// expands to `fuse_session_new_versioned(..., &compile_time_version)`.
+// bindgen sees the macro, not a function, so the binding only exposes
+// `fuse_session_new_versioned` — which is tagged `@@FUSE_3.17` in the
+// shared library and unavailable on libfuse < 3.17 (Ubuntu 24.04 LTS
+// ships 3.14.0). To keep kiseki-fuse-sys ABI-portable across every
+// libfuse 3.x distro the lowest pinned floor is 3.10), we declare
+// the original (3.0+) function directly via `extern "C"` and call
+// that from the safe wrapper. The symbol `fuse_session_new@@FUSE_3.0`
+// is still exported by every libfuse 3.x release including 3.18.2.
+unsafe extern "C" {
+    /// Original (`@@FUSE_3.0`) `fuse_session_new` — bindgen can't see
+    /// it because libfuse 3.17+ headers `#define` it as a macro.
+    pub fn fuse_session_new(
+        args: *mut fuse_args,
+        op: *const fuse_lowlevel_ops,
+        op_size: usize,
+        userdata: *mut ::core::ffi::c_void,
+    ) -> *mut fuse_session;
+}

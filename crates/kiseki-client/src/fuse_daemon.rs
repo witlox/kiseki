@@ -17,7 +17,7 @@
 //! On 2026-05-09 the FUSE backend swapped to libfuse 3.x via
 //! `kiseki-fuse` (ADR-043 rev 4 + `specs/implementation/libfuse-swap.md`).
 //! The 3-phase write-lock pattern (Bug 8 / Bug 9 GCP 2026-05-04 fix)
-//! and the FOPEN_KEEP_CACHE / 16 MiB readahead tunings are preserved.
+//! and the `FOPEN_KEEP_CACHE` / 16 MiB readahead tunings are preserved.
 
 #[cfg(feature = "fuse")]
 use std::ffi::OsStr;
@@ -600,7 +600,7 @@ impl<G: GatewayOps + Send + Sync + 'static> kiseki_fuse::Filesystem for FuseDaem
 /// matches the HPC compute-node use case where writes go via S3).
 ///
 /// Internally:
-/// 1. Wraps `fs` in a [`FuseDaemon`] (3-phase RwLock).
+/// 1. Wraps `fs` in a [`FuseDaemon`] (3-phase `RwLock`).
 /// 2. Builds (or reuses) a tokio multi-thread runtime that the bridge
 ///    spawns its async finalize tasks on.
 /// 3. Calls `kiseki_fuse::mount` which spins up the dedicated
