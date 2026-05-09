@@ -1,0 +1,46 @@
+[package]
+name = "kiseki-fuse"
+description = "Safe Rust wrapper over libfuse 3.x via kiseki-fuse-sys. Public API for kiseki-client's FUSE daemon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+kiseki-fuse-sys = { path = "../kiseki-fuse-sys", version = "2026.41.0" }
+
+# Async bridge between the libfuse C session thread and tokio handlers
+# (I-FUSE-3): tokio's oneshot is the right shape (exact send-once,
+# detect dropped sender via RecvError, no over-allocation of mpsc
+# capacity). DashMap is the in-flight bridge map (I-FUSE-7's
+# max_pending_ops cap is enforced atomically against its size).
+tokio = { workspace = true }
+dashmap = "6"
+
+# Plaintext-on-cancel zeroize (I-FUSE-4) extends the existing
+# Zeroizing<Vec<u8>> discipline used in mem_gateway::DecryptCache
+# (commit de5a239) to handler-future-cancellation paths.
+zeroize = { workspace = true }
+
+# Errno conversions; libc::EIO / EINTR / EAGAIN are the wire-level
+# constants the wrapper passes to fuse_reply_err.
+libc = { workspace = true }
+
+# Counter for I-FUSE-2 drop-without-consume metric. Lazy-static
+# OnceLock pattern matches kiseki-gateway's existing Prometheus usage.
+prometheus = { workspace = true }
+
+# Structured logging — the I-FUSE-2 drop warns and the I-FUSE-8
+# session-crash log both go through tracing.
+tracing = { workspace = true }
+
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tracing-subscriber = { workspace = true }

@@ -2162,6 +2162,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiseki-fuse"
+version = "2026.41.0"
+dependencies = [
+ "dashmap",
+ "kiseki-fuse-sys",
+ "libc",
+ "prometheus",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "kiseki-fuse-sys"
 version = "2026.41.0"
 dependencies = [
