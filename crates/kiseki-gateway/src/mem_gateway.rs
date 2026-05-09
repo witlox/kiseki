@@ -327,7 +327,23 @@ impl ConditionalCheck for ConditionalCheckAdapter<'_> {
 /// memory pages stay populated with plaintext until the allocator
 /// reuses them, leaving a residual-exposure window beyond the TTL.
 struct DecryptCacheEntry {
-    plaintext: zeroize::Zeroizing<Vec<u8>>,
+    /// `Arc<Zeroizing<Vec<u8>>>`: the Arc lets `get` return a cheap
+    /// refcount-bump under the cache mutex (no full Vec clone), so
+    /// concurrent readers don't serialize through a memcpy. The
+    /// `Zeroizing` inner still scrubs the bytes when the last Arc
+    /// reference drops — crypto-shred semantics preserved (a reader
+    /// that's actively slicing the plaintext keeps it alive past
+    /// cache eviction, and the bytes are zeroed when that reader
+    /// also releases its Arc).
+    ///
+    /// Pre-2026-05-09: `Zeroizing<Vec<u8>>` only — every `get` did a
+    /// full Vec clone under the `parking_lot::Mutex`, forcing all
+    /// concurrent readers to serialize through one memcpy. The
+    /// in-process probe in `tests/get_concurrency_scaling.rs` showed
+    /// flat aggregate throughput at c=1/4/16/64 (8.2/8.1/8.1/7.8 Gbps)
+    /// — exactly the GET-asymmetry shape from the 2026-05-07 GCP
+    /// `compact` run.
+    plaintext: Arc<zeroize::Zeroizing<Vec<u8>>>,
     inserted_at: std::time::Instant,
 }
 
@@ -360,16 +376,25 @@ impl DecryptCache {
         }
     }
 
-    fn get(&mut self, id: &kiseki_common::ids::ChunkId) -> Option<Vec<u8>> {
+    fn get(
+        &mut self,
+        id: &kiseki_common::ids::ChunkId,
+    ) -> Option<Arc<zeroize::Zeroizing<Vec<u8>>>> {
         let entry = self.map.get(id)?;
         if !self.ttl.is_zero() && entry.inserted_at.elapsed() > self.ttl {
             // TTL expired — evict on read so the residual-exposure
             // window is bounded by the TTL rather than the FIFO
-            // eviction pressure. The Zeroizing drop clears the bytes.
+            // eviction pressure. The Zeroizing drop clears the bytes
+            // when the last Arc reference (this map slot + any
+            // in-flight reader holding an earlier `get` result) is
+            // dropped.
             let _ = self.evict(id);
             return None;
         }
-        Some((*entry.plaintext).clone())
+        // Arc clone — refcount bump only, no memcpy. Caller derefs
+        // through Arc → Zeroizing → Vec → &[u8] to slice the
+        // plaintext.
+        Some(entry.plaintext.clone())
     }
 
     fn insert(&mut self, id: kiseki_common::ids::ChunkId, plaintext: Vec<u8>) {
@@ -382,7 +407,7 @@ impl DecryptCache {
         let len = plaintext.len();
         self.total_bytes += len;
         let entry = DecryptCacheEntry {
-            plaintext: zeroize::Zeroizing::new(plaintext),
+            plaintext: Arc::new(zeroize::Zeroizing::new(plaintext)),
             inserted_at: std::time::Instant::now(),
         };
         self.map.insert(id, entry);
@@ -1350,11 +1375,17 @@ impl GatewayOps for InMemoryGateway {
         {
             let chunk_start_in_file = i.saturating_mul(MAX_PLAINTEXT_PER_CHUNK);
 
-            // Cache lookup first — `get` clones the cached Vec out
-            // and releases the mutex before we extend the output,
-            // so the lock isn't held across a memcpy.
+            // Cache lookup first — `get` returns `Arc<Zeroizing<Vec<u8>>>`,
+            // so the work under the cache mutex is one refcount bump.
+            // The slice memcpy into `data` happens AFTER the lock is
+            // released (the `lock()` MutexGuard temporary is dropped
+            // at the end of the `if let` head expression). This is
+            // what unblocks concurrent readers — pre-2026-05-09 the
+            // cache returned `Vec<u8>` and the 64 MiB clone happened
+            // under the lock, serializing every reader. See the
+            // probe in tests/get_concurrency_scaling.rs.
             if let Some(cached) = self.decrypt_cache.lock().get(chunk_id) {
-                copy_chunk_range_into(&mut data, &cached, chunk_start_in_file, start, end);
+                copy_chunk_range_into(&mut data, &cached[..], chunk_start_in_file, start, end);
                 continue;
             }
 

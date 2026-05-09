@@ -282,3 +282,77 @@ Hypotheses to confirm/reject with the data above:
 - (H3) Cross-node fabric fetch on every read. Step 5 isolates it.
 - (H4) Single-listener saturation on the leader. Step 4's flame
   graph distinguishes per-core load from a true axum/hyper bottleneck.
+
+---
+
+## 2026-05-09 update — root cause found in-process, fix landed
+
+I skipped the GCP re-run and instead built an in-process probe
+(`crates/kiseki-gateway/tests/get_concurrency_scaling.rs`) that
+drives `InMemoryGateway::read` from N concurrent tokio tasks
+against a pre-warmed 64 MiB composition — same shape as the GCP S3
+GET workload, but with axum/hyper/the listener stripped out.
+
+**Pre-fix curve** (cache values as `Zeroizing<Vec<u8>>`):
+
+| streams | aggregate | per-stream |
+|---:|---:|---:|
+| 1 | 8.2 Gbps | 8.2 Gbps |
+| 4 | 8.1 Gbps | 2.0 Gbps |
+| 16 | 8.1 Gbps | 0.51 Gbps |
+| 64 | 7.8 Gbps | 0.12 Gbps |
+
+Aggregate doesn't grow with concurrency. Per-stream bandwidth
+scales as `8.2 / N`. Textbook full serialization — the GCP
+asymmetry is reproduced at gateway level, not in the listener.
+
+**Cause:** `DecryptCache::get` at `mem_gateway.rs:363-373` did
+`(*entry.plaintext).clone()` — a full `Vec<u8>` clone of the
+cached chunk plaintext, executed under an exclusive
+`parking_lot::Mutex` on the cache. For 64 MiB chunks that's a
+64 MiB memcpy serialized across all concurrent cache hits. PUT
+doesn't pay this tax; GET pays it on every read. (H4) and (H3)
+are NOT the dominant factors — the listener and fabric were red
+herrings.
+
+**Fix:** wrap cache values as `Arc<Zeroizing<Vec<u8>>>`. `get`
+now returns an Arc clone (refcount bump) under the lock; the
+slice memcpy into the response Vec happens after the lock is
+released and parallelizes across readers. Crypto-shred
+semantics preserved — the inner `Zeroizing` scrubs bytes when
+the last Arc reference (cache slot + any in-flight reader)
+drops.
+
+**Post-fix curve** (same probe, identical workload):
+
+| streams | aggregate | per-stream |
+|---:|---:|---:|
+| 1 | 16.4 Gbps | 16.4 Gbps |
+| 4 | 18.0 Gbps | 4.5 Gbps |
+| 16 | 18.0 Gbps | 1.13 Gbps |
+| 64 | 18.1 Gbps | 0.28 Gbps |
+
+Single-stream **2× faster** (cache no longer clones the chunk).
+Aggregate now ceilings at memory bandwidth (the per-task slice
+memcpy in `copy_chunk_range_into`, which is 64 MiB per call).
+On a single-channel-DDR dev box, 18 Gbps ≈ 2.3 GB/s saturates
+one channel. On c3-standard-44 (4-channel DDR5, ~50 GB/s
+aggregate) the equivalent ceiling sits well above the 28 Gbps
+Tier_1 wire — so on production hardware this fix lifts the GET
+ceiling out of the way entirely.
+
+**Projected GCP impact** (subject to a re-run on the cluster):
+- Single-stream S3 GET: 9.7 Gbps → 18-20 Gbps (~2× from the
+  same memcpy-elimination that lifted the dev box)
+- High-concurrency S3 GET: 16-17 Gbps (capped) → wire-bound
+  (~25 Gbps on c3-standard-44 Tier_1)
+
+The probe is checked in as `#[ignore = "slow:"]` so Tier 1 skips
+it. Re-run with:
+
+    cargo nextest run -p kiseki-gateway --run-ignored only \
+        --test get_concurrency_scaling --nocapture
+
+If the curve regresses to flat-with-concurrency in the future,
+`assert!(c=4 ≥ c=1 × 1.05)` fires — the gate against silently
+re-introducing a 64 MiB clone under the cache mutex.
