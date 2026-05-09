@@ -93,6 +93,10 @@ required-features = ["ffi"]
 name = "per_peer_cap_collision"
 required-features = ["native"]
 
+[[test]]
+name = "fuse_sync_adjacent_ops"
+required-features = ["fuse"]
+
 [dev-dependencies]
 async-trait = "0.1"
 kiseki-chunk-cluster = { workspace = true }
