@@ -149,7 +149,12 @@ Environment=KISEKI_RAFT_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 
-Environment=RUST_LOG=info
+# 2026-05-09: bump kiseki_chunk_cluster to debug so wrapper-layer
+# warnings (peer GetFragment timeouts → surfaced as ChunkError::Io
+# per the wrapper fix in commit a69e490) land in the journal. Lets
+# us post-mortem any read-path stall on the cluster instead of
+# only seeing the user-visible Io error.
+Environment=RUST_LOG=info,kiseki_chunk_cluster=debug
 
 [Install]
 WantedBy=multi-user.target
