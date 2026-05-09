@@ -356,3 +356,47 @@ it. Re-run with:
 If the curve regresses to flat-with-concurrency in the future,
 `assert!(c=4 ≥ c=1 × 1.05)` fires — the gate against silently
 re-introducing a 64 MiB clone under the cache mutex.
+
+### Follow-up: cold-read probe (cache disabled, mirrors GCP pattern)
+
+The GCP GET workload reads 50 unique 64 MiB objects, totaling
+3.2 GiB working set against a 256 MiB cache — so ~96 % of reads
+are cache-cold. The hot probe answered "what happens on cache
+hits"; this probe answers "does the cold path also scale?"
+
+Probe: `crates/kiseki-gateway/tests/get_cold_concurrency_scaling.rs`.
+Sets `KISEKI_DECRYPT_CACHE_TTL_MS=0` to disable the cache
+entirely; every read forces fresh `chunks.read_chunk` + AES-GCM
+`open_envelope` + memcpy.
+
+| streams | aggregate | per-stream | speedup vs c=1 |
+|---:|---:|---:|---:|
+| 1 | 2.9 Gbps | 2.9 Gbps | 1.0× |
+| 4 | 8.5 Gbps | 2.1 Gbps | 2.9× |
+| 16 | 10.8 Gbps | 0.68 Gbps | 3.7× |
+| 64 | 11.0 Gbps | 0.17 Gbps | 3.8× |
+
+**Cold path scales cleanly.** Single-stream is slow (2.9 Gbps —
+AES-GCM-bound on a single core); aggregate climbs 3.8× before
+ceilinging at memory bandwidth + decrypt CPU saturation around
+11 Gbps on this dev box. No serialization point in the cold path
+itself.
+
+**Implication for the GCP asymmetry**: pre-fix, even cold-dominated
+GCP traffic was getting dragged down by the occasional hot-cache
+hit (FIFO retains the most-recently-touched chunks; whenever the
+50-object cycle landed on one of the resident 4, the read
+serialized through the 64 MiB Vec clone, blocking concurrent
+readers behind it). Post-fix that funnel is gone; hot AND cold
+both scale.
+
+**Projected GCP GET ceiling on c3-standard-44** (4-channel DDR5
+~50 GB/s aggregate, 88 vCPUs with AES-NI):
+- Cold path: dev-box 11 Gbps × ~5× memory-bandwidth headroom +
+  ~4× core count → comfortably above the 28 Gbps Tier_1 wire.
+- Hot path: dev-box 18 Gbps × similar headroom → also wire-bound.
+
+Re-run on the cluster to confirm. Both probes are checked in as
+`#[ignore = "slow:"]` regressions tests; the assertions
+(`c=4 ≥ c=1 × 1.05`) gate against future serialization
+regressions in either path.
