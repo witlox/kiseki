@@ -20,6 +20,59 @@ use std::path::PathBuf;
 use kiseki_client::cache::{CacheConfig, CacheManager, CacheMode};
 use kiseki_client::staging::{StagingConfig, StagingManager};
 
+/// Evict any stale FUSE mount left over at `mountpoint` from a
+/// prior kiseki-client daemon that died without unmounting.
+///
+/// 2026-05-09 GCP finding (bug #3): when a kiseki-client process is
+/// SIGKILL'd, the kernel keeps its FUSE mountpoint registered as a
+/// `kiseki on /mnt/X type fuse` entry, but the userspace daemon is
+/// gone. Subsequent `stat` calls on that path block in the kernel
+/// waiting for the dead daemon. The next mount attempt either fails
+/// outright (path already mounted) or succeeds-but-unresponsive
+/// (overlapping mounts produce a wedged dentry).
+///
+/// This runs `fusermount3 -uz <mountpoint>` before every `mount`
+/// invocation. `-z` is "lazy unmount" — it detaches immediately
+/// even if the mountpoint has pending operations, so a wedged
+/// zombie clears in ~ms. If nothing is mounted, fusermount3 exits
+/// non-zero with "not a mountpoint" or similar; we ignore that.
+///
+/// Tested by `tests/fuse_mount_cleanup.rs` against a real path
+/// (no FUSE state required — the spawn semantics are what matters).
+#[cfg(feature = "fuse")]
+fn evict_stale_fuse_mount(mountpoint: &str) {
+    let out = std::process::Command::new("fusermount3")
+        .args(["-uz", mountpoint])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            tracing::info!(mountpoint, "evicted stale FUSE mount before fresh mount",);
+        }
+        Ok(o) => {
+            // Common case: nothing was mounted. fusermount3 emits
+            // "entry for X not found in /etc/mtab" or similar.
+            // Logged at debug; not an error.
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::debug!(
+                mountpoint,
+                exit = ?o.status.code(),
+                stderr = %stderr.trim(),
+                "fusermount3 -uz: no stale mount to evict (expected on first run)",
+            );
+        }
+        Err(e) => {
+            // fusermount3 binary missing — print a hint but don't
+            // abort. The subsequent mount call will surface the
+            // real error if any.
+            tracing::warn!(
+                mountpoint,
+                error = %e,
+                "could not run fusermount3 — install fuse3 if FUSE mounts misbehave",
+            );
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -200,6 +253,19 @@ fn handle_mount(args: &[String]) {
     let tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
     let namespace =
         kiseki_common::ids::NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
+
+    // Bug #3 fix (GCP 2026-05-09): evict any stale FUSE mount left
+    // over from a prior daemon that died without unmounting. If
+    // nothing is there, this is a fast no-op. Applies regardless
+    // of `in_memory` mode — even sandbox runs can land on a path
+    // that has a leftover from a previous mount. Without this,
+    // a SIGKILL'd kiseki-client leaves the kernel with a
+    // registered-but-orphaned FUSE mount and subsequent stat/access
+    // blocks indefinitely.
+    #[cfg(feature = "fuse")]
+    {
+        evict_stale_fuse_mount(&mountpoint);
+    }
 
     // Native ADR-042 path: --endpoint is kiseki://… and `native` feature
     // is compiled in. Connects a pool of TCP-framed-postcard connections
