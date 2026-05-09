@@ -18,6 +18,7 @@
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use kiseki_proto::native_contract::wire_tcp_framed::{
@@ -26,6 +27,34 @@ use kiseki_proto::native_contract::wire_tcp_framed::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
+
+/// Configure `SO_LINGER = 0` so a `close(2)` on the socket — including
+/// the implicit close that happens when the kiseki-client process is
+/// SIGKILL'd — sends RST instead of FIN. Trades any in-flight bytes
+/// (the connection is being torn down anyway) for immediate cleanup.
+///
+/// 2026-05-09 GCP finding: without this, a SIGKILL'd kiseki-client
+/// leaves up to `pool` sockets in `LAST-ACK` for ~`tcp_fin_timeout`
+/// (60 s default Linux). The next kiseki-client restart's connect
+/// loop hits the server's per-peer-cap before the LAST-ACK sockets
+/// drop and the new pool can't fully establish. Pinning lives in
+/// `crates/kiseki-client/tests/per_peer_cap_collision.rs::cap_is_enforced_at_listener_layer`
+/// — bumping the cap is the structural fix; this `linger=0` is the
+/// per-socket fast-clean fix that makes restarts fast even within
+/// the cap.
+fn configure_close_linger(stream: &tokio::net::TcpStream) {
+    // `set_linger` is `#[deprecated]` in tokio because non-zero
+    // linger durations block the closing thread. We pass
+    // `Duration::ZERO`, which makes `close(2)` non-blocking AND
+    // sends RST instead of FIN — exactly the behavior we want for
+    // a daemon-restart fast-cleanup path. The deprecation is
+    // defensive over-warning for a different use case; suppress.
+    #[allow(deprecated)]
+    let r = stream.set_linger(Some(Duration::ZERO));
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "TCP-framed client: SO_LINGER=0 failed; restart cleanup may be slow");
+    }
+}
 
 /// Errors raised by [`TcpFramedClient`].
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +138,7 @@ impl TcpFramedClient {
         if let Err(e) = stream.set_nodelay(true) {
             tracing::warn!(error = %e, "TCP-framed client: TCP_NODELAY failed; perf may regress");
         }
+        configure_close_linger(&stream);
         Ok(Self::from_stream(stream))
     }
 
@@ -126,6 +156,7 @@ impl TcpFramedClient {
         tls_config: Arc<rustls::ClientConfig>,
     ) -> io::Result<Arc<Self>> {
         let tcp = tokio::net::TcpStream::connect(addr).await?;
+        configure_close_linger(&tcp);
         if let Err(e) = tcp.set_nodelay(true) {
             tracing::warn!(error = %e, "TCP-framed client (TLS): TCP_NODELAY failed");
         }

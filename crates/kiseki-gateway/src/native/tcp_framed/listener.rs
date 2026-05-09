@@ -39,9 +39,16 @@ use super::principal::TcpFramedPrincipal;
 
 /// Maximum concurrent inbound connections per peer IP. Same shape
 /// as [`kiseki_raft::tcp_transport::RAFT_TRANSPORT_PER_PEER_MAX`];
-/// docked at 16 so a single misbehaving peer can't soak up all
+/// docked so a single misbehaving peer can't soak up all
 /// connection slots. Configurable via [`TcpFramedListener::with_per_peer_cap`].
-pub const NATIVE_TCP_FRAMED_PER_PEER_MAX: u32 = 16;
+///
+/// Sized to give 2× headroom over `kiseki-client::native_remote::DEFAULT_POOL_SIZE`
+/// (16). 2026-05-09 GCP finding: with `cap == pool`, a SIGKILL+restart
+/// of kiseki-client mid-run left up to 16 sockets in LAST-ACK against
+/// the server's per-peer counter, and the new pool's connect-loop hit
+/// the cap on its very first socket. Pinning lives in
+/// `kiseki-client/tests/per_peer_cap_collision.rs::per_peer_cap_strictly_exceeds_client_default_pool`.
+pub const NATIVE_TCP_FRAMED_PER_PEER_MAX: u32 = 32;
 
 /// TCP-framed-postcard binding listener. Accepts inbound connections,
 /// runs the rustls handshake (if configured), extracts the canonical
@@ -362,9 +369,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn per_peer_cap_default_pinned() {
-        // §3.4 / R2-M5: cap defaults to 16, configurable via builder.
+        // §3.4 / R2-M5: cap defaults to 32 (2× kiseki-client
+        // `DEFAULT_POOL_SIZE` of 16 — pinned cross-crate by
+        // `crates/kiseki-client/tests/per_peer_cap_collision.rs`).
         // Pin so a refactor doesn't change it under the radar.
-        assert_eq!(NATIVE_TCP_FRAMED_PER_PEER_MAX, 16);
+        // Pre-2026-05-09 the cap was 16, exactly matching the client
+        // pool default; a transient reconnect race tripped the cap
+        // on every fresh kiseki-client mount. The bump to 32 leaves
+        // 2× headroom; the cross-crate contract test enforces the
+        // ratio so any future bump of either constant alone fails.
+        assert_eq!(NATIVE_TCP_FRAMED_PER_PEER_MAX, 32);
     }
 
     #[tokio::test]

@@ -89,7 +89,15 @@ required-features = ["ffi"]
 name = "c_abi_link"
 required-features = ["ffi"]
 
+[[test]]
+name = "per_peer_cap_collision"
+required-features = ["native"]
+
 [dev-dependencies]
 async-trait = "0.1"
+kiseki-chunk-cluster = { workspace = true }
+kiseki-proto = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3"
+tokio-stream = "0.1"
+tonic = { workspace = true }
