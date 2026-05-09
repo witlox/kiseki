@@ -13,7 +13,7 @@
   - F-H1: ganesha-as-process reversibility ratchet once in-tree NFS code is deleted.
   - F-H5: ADR-038 pNFS interop with ganesha unverified.
   - F-H6: gRPC-boundary perf regression on every NFS op.
-  Combined with the architectural realization that **the redundancy in our protocol surface is on the NFS axis specifically** (we hand-roll BOTH the NFS server and a userspace NFS client used only by tests + perf driver — see `specs/implementation/adr-043-libfuse-swap.md`), the rev-1 ganesha proposal was the wrong cut. The hand-rolled NFS server stays in tree; the redundant userspace NFS client is the thing to remove (separate work item, not this ADR).
+  Combined with the architectural realization that **the redundancy in our protocol surface is on the NFS axis specifically** (we hand-roll BOTH the NFS server and a userspace NFS client used only by tests + perf driver — see `specs/implementation/libfuse-swap.md`), the rev-1 ganesha proposal was the wrong cut. The hand-rolled NFS server stays in tree; the redundant userspace NFS client is the thing to remove (separate work item, not this ADR).
 - **rev 2 (2026-05-09)**: Scope reduced to FFI policy only. §D2 (process-daemon adoption) and §D4 (ganesha row) removed. §D7 (SELinux confinement of an external daemon) removed. The libfuse FFI direction survives because:
   - F-C1 doesn't apply: libfuse runs in the same process as the existing FUSE daemon; plaintext exposure shape is unchanged.
   - F-C2 doesn't apply: FUSE is single-tenant per mount.
@@ -48,7 +48,7 @@ FIPS conformance is necessary but not sufficient. Every entry on the D2 positive
 |---|---|---|---|---|---|
 | `libfabric` | Transport (Slingshot/Cassini, EFA, generic OFI) | `libfabric-sys` Rust crate | No | per ADR-042 | Existing — pre-permitted by ADR-001 Consequences |
 | `librdmacm` / `libibverbs` | Transport (InfiniBand, RoCEv2) | Rust bindings via `rdma-core` ecosystem | No | per ADR-042 | Existing — pre-permitted by extension of ADR-001 |
-| `libfuse` 3.x | FUSE protocol dispatch | `kiseki-fuse-sys` (bindgen) + `kiseki-fuse` safe wrapper | No | 3.10 (FUSE_SYNCFS support) | **New rev-2 addition.** Replaces `fuser` 0.17. Implementation plan: `specs/implementation/adr-043-libfuse-swap.md`. Migration ADR: ADR-044 (planned). |
+| `libfuse` 3.x | FUSE protocol dispatch | `kiseki-fuse-sys` (bindgen) + `kiseki-fuse` safe wrapper | No | 3.10 (FUSE_SYNCFS support) | **New rev-2 addition.** Replaces `fuser` 0.17. Implementation plan: `specs/implementation/libfuse-swap.md`. No per-binding ADR per §D6. |
 
 Adding a library to this table requires an ADR amendment plus the D1.1 security-posture data filled in.
 
@@ -68,7 +68,7 @@ A system library not on the D2 positive list and not obviously in D3's categorie
 
 System library FFI bindings live in dedicated `*-sys` crates following the `libfabric-sys` precedent (existing) and `kiseki-fuse-sys` (new). The `*-sys` crate contains only `bindgen`-generated C declarations and minimal safety wrappers; the higher-level Rust API lives in a sibling crate (`kiseki-fuse` for the libfuse case, paralleling `kiseki-fabric` for libfabric). This separates the unsafe boundary from the safe Rust surface and matches the workspace's existing `*-sys` / `kiseki-*` split.
 
-**Enforcement (added rev 2 per gate-1 F-M9):** a workspace lint rejects crates that declare `links = "..."` in Cargo.toml unless the crate name ends with `-sys`. Implemented either as a `cargo-deny` `bans` rule or a custom workspace lint; ADR-044 owns the concrete check.
+**Enforcement (added rev 2 per gate-1 F-M9):** a workspace lint rejects crates that declare `links = "..."` in Cargo.toml unless the crate name ends with `-sys`. Implemented either as a `cargo-deny` `bans` rule or a custom workspace lint; the libfuse-swap implementation plan owns the concrete check.
 
 Distribution implications:
 - Build-time: `libfuse3-dev` (Debian/Ubuntu) / `fuse3-devel` (RHEL/Fedora). FFI/cdylib for Python and C++ wrappers picks up `libfuse3.so` transitively when the `fuse` feature is enabled. Wrappers built without `fuse` are unaffected.
@@ -76,19 +76,21 @@ Distribution implications:
 
 ### D5. Reversibility
 
-Each FFI binding lives in a dedicated `*-sys` + safe-wrapper crate pair (D4) that can be replaced wholesale. Reversal cost = swap the crate pair, refactor the call sites, bound by the trait surface the safe wrapper exposes. Pre-existing pure-Rust paths remain in tree until the migration ADR delivers a replacement at parity (e.g., `fuser` stays as a dependency until `kiseki-fuse` ships at parity per ADR-044).
+Each FFI binding lives in a dedicated `*-sys` + safe-wrapper crate pair (D4) that can be replaced wholesale. Reversal cost = swap the crate pair, refactor the call sites, bound by the trait surface the safe wrapper exposes. Pre-existing pure-Rust paths remain in tree until the migration plan delivers a replacement at parity (e.g., `fuser` stays as a dependency until `kiseki-fuse` ships at parity).
 
-For each addition to D2: the migration ADR commits to a "go / no-go" review at a specific milestone (e.g., 6 months of cluster operation post-merge). Triggers for marking a row Rejected: a kiseki-internal incident tracing to a binding's bug whose CVSS ≥ 7.0 and which upstream cannot patch within the D1.1 SLA; OR a perf regression > 20% on the Tier_1 reference perf-cluster matrix; OR a security advisory with no upstream patch path. Decision-maker: architect in consultation with kiseki-security.
+For each addition to D2: the migration plan commits to a "go / no-go" review at a specific milestone (e.g., 6 months of cluster operation post-merge). Triggers for marking a row Rejected: a kiseki-internal incident tracing to a binding's bug whose CVSS ≥ 7.0 and which upstream cannot patch within the D1.1 SLA; OR a perf regression > 20% on the Tier_1 reference perf-cluster matrix; OR a security advisory with no upstream patch path. Decision-maker: architect in consultation with kiseki-security.
 
-### D6. Migration is per-binding and ADR-gated
+### D6. Migration is per-binding and plan-gated
 
-This ADR codifies the policy. Each binding's adoption is its own ADR:
+This ADR codifies the policy. Each binding's adoption is governed by an implementation plan in `specs/implementation/`. **A separate per-binding ADR is required ONLY when the binding introduces architectural decisions beyond the policy in this ADR** — e.g., a process-isolated daemon (a new bounded-context boundary), a new auth shape, a cross-language schema, or a new ubiquitous-language term. For "swap library X for library Y under policy Z" changes, the policy ADR plus implementation plan are sufficient; no per-binding ADR ceremony.
 
-- **ADR-044 (planned)**: libfuse 3.x via `kiseki-fuse-sys` + `kiseki-fuse` — replaces `kiseki-client`'s `fuser`-based FUSE adapter. Plan: `specs/implementation/adr-043-libfuse-swap.md`.
+Active plans:
 
-The implementation ADR decides concrete shape (binding crate version pins; trait-surface details; testing strategy; performance targets; perf-cluster validation order). It references this ADR for the policy and inherits §D1, §D1.1, §D5.
+- **`specs/implementation/libfuse-swap.md`**: libfuse 3.x via `kiseki-fuse-sys` + `kiseki-fuse` — replaces `kiseki-client`'s `fuser`-based FUSE adapter. Decides binding-crate version pin, trait-surface details, testing strategy, performance targets at parity, perf-cluster validation order. Inherits §D1, §D1.1, §D2, §D5.
 
-Pre-existing pure-Rust paths (`fuser` 0.17 in `kiseki-client/src/fuse_daemon.rs`) remain in tree and CI-tested until ADR-044 delivers a replacement that passes the existing `@integration` suite at parity. No big-bang removal.
+Pre-existing pure-Rust paths (`fuser` 0.17 in `kiseki-client/src/fuse_daemon.rs`) remain in tree and CI-tested until the plan delivers a replacement that passes the existing `@integration` suite at parity. No big-bang removal.
+
+**Review discipline**: even without a per-binding ADR, the implementation plan IS reviewed by adversary gate-1 (per `.claude/CLAUDE.md` Diamond workflow) BEFORE implementer phase 0. Skipping the per-binding ADR does not skip the adversary review — it relocates the review from "attack the ADR" to "attack the plan." Findings live in `specs/findings/` keyed on the plan filename, same format as ADR findings. The review verifies that the plan does not silently introduce architectural decisions (per the criteria above) that should have warranted a per-binding ADR after all.
 
 ## Rationale
 
@@ -144,13 +146,13 @@ The fuser-PR-only path was considered and rejected for reliability reasons, not 
 - New build-time dep: `libfuse3-dev`. New runtime dep: `libfuse3.so.3`. Cross-distro packaging matrix grows by one package.
 - macOS and Windows FUSE are out of scope under this ADR. Downstream wrappers building for those platforms must disable the `fuse` feature or wait for a future macFUSE / WinFsp ADR.
 - FFI/cdylib path for Python and C++ wrappers picks up `libfuse3.so` transitively when `fuse` feature is enabled. Wrappers must document this.
-- LGPL-2.1 dynamic-linking obligations propagate to the kiseki-client cdylib's `fuse` feature builds. Compatible with permissive overall licenses via the dynamic-linking exception, but downstream wrappers (Python via PyO3, C++) must honor LGPL-2.1's source-availability requirement for the kiseki-client object code on the FUSE feature path. ADR-044 owns the explicit license decision.
-- Reversal cost for ADR-044: once `fuser` is removed from `kiseki-client/Cargo.toml` (D6 final step), reverting requires re-adding it and re-porting `fuse_daemon.rs`. Mitigated by the parity-with-existing requirement in D6 (no removal until parity in `@integration`).
+- LGPL-2.1 dynamic-linking obligations propagate to the kiseki-client cdylib's `fuse` feature builds. Compatible with permissive overall licenses via the dynamic-linking exception, but downstream wrappers (Python via PyO3, C++) must honor LGPL-2.1's source-availability requirement for the kiseki-client object code on the FUSE feature path. The libfuse-swap plan owns the explicit license decision.
+- Reversal cost for the libfuse swap: once `fuser` is removed from `kiseki-client/Cargo.toml` (final step of the plan), reverting requires re-adding it and re-porting `fuse_daemon.rs`. Mitigated by the parity-with-existing requirement in D6 (no removal until parity in `@integration`).
 - ADR-027's "single language" cognitive-load benefit is partially given up for contributors touching the FUSE adapter (they learn libfuse's C API via the safe wrapper). The Rust-only invariant for kiseki's *own* code stays.
 
-## Open items (carry into ADR-044)
+## Open items (carry into the libfuse-swap implementation plan)
 
-- **A**: Confirm `libfuse3` LGPL-2.1 license is compatible with kiseki's overall license and downstream wrapper distribution. ADR-044 owns the explicit decision and CONTRIBUTING.md note.
+- **A**: Confirm `libfuse3` LGPL-2.1 license is compatible with kiseki's overall license and downstream wrapper distribution. The libfuse-swap plan owns the explicit decision and CONTRIBUTING.md note.
 - **B**: Verify the FIPS argument concretely under FIPS 140-3 IG §A.5 (cryptographic boundary scope) and §C.G (loadable libraries). Existing precedent (kernel TCP, libfabric, network switches) says transport-only C libraries don't enter the boundary, but get a written reference from a FIPS evaluator before the certification effort starts. Until the reference is filed, ADR-043 stays Proposed.
 - **C**: Cross-platform FUSE policy is silently retired here. If macOS / Windows FUSE later becomes a requirement, that ADR adds D2 rows under the same rules.
 
@@ -162,5 +164,5 @@ The fuser-PR-only path was considered and rejected for reliability reasons, not 
 - ADR-027: Single-Language Rust Only — bounded by this ADR's reading: about kiseki's own code, not about system libraries we depend on.
 - ADR-042: Native Gateway Data Service — independent; native clients don't go through libfuse. ADR-042's libfabric/ibverbs bindings are codified by this ADR's D2 retroactively.
 - `specs/findings/2026-05-09-adv-gate1-adr043-findings.md` — gate-1 findings that drove the rev-1 → rev-2 scope reduction.
-- `specs/implementation/adr-043-libfuse-swap.md` — implementation plan for the libfuse swap that ADR-044 will formalize.
+- `specs/implementation/libfuse-swap.md` — implementation plan for the libfuse swap; per §D6, no per-binding ADR is required.
 - `specs/performance/2026-05-09-gcp-compact-fixes-verify/sync-kills-daemon.md` — the original FUSE_SYNCFS opcode 50 finding; the libfuse swap closes it.
