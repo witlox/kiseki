@@ -3,6 +3,7 @@
 **Date:** 2026-05-10
 **From:** implementer
 **To:** architect
+**Status:** **RESOLVED — Option C accepted 2026-05-10.** ADR-038 amended in place to rev 3 (§D5 rewritten + new §D5.1 buffer-cap section). Implementation plan: `specs/implementation/pnfs-ds-write.md`.
 **Severity:** Design gap, not a regression. Blocks the WRITE-mode pNFS layout path; today the path is already gated off by `nfs4_server.rs:1402-1405` (write-mode LAYOUTGET routes to MDS regardless of `KISEKI_DISABLE_PNFS_LAYOUT`).
 **Recommended outcome:** amend **ADR-038 §D5** in place. No new ADR.
 

@@ -1,7 +1,7 @@
 # ADR-038: pNFS Layout and Data Server Subprotocol
 
-**Status**: Accepted (rev 2 — code landed in kiseki-gateway::pnfs + pnfs_ds_server; LAYOUTGET / GETDEVICEINFO / DS-side READ end-to-end via Linux 6.x pNFS client; tests in pnfs-rfc8435.feature)
-**Date**: 2026-04-27 (proposed); 2026-05-03 (status update — code fully shipped)
+**Status**: Accepted (rev 3 — §D5 amended for chunk-staging DS WRITE pattern; per `specs/escalations/2026-05-10-pnfs-ds-write-design.md` Option C)
+**Date**: 2026-04-27 (proposed); 2026-05-03 (rev 2 status update — code fully shipped); 2026-05-10 (rev 3 — §D5 amendment)
 **Deciders**: Architect (diamond workflow: architect → adversary gate 1 → implementer)
 **Context**: Phase 14 closed; perf-cluster spin-up gated on pNFS completeness (ADR-013, RFC 5661, RFC 8435, RFC 9289)
 
@@ -15,6 +15,7 @@
   doesn't work with Linux 6.x flex-files driver. The corrected
   encoding is one segment × N mirrors per RFC 8435 §13.2 — see
   ADR-039 for the full revision.
+- **rev 3 (2026-05-10)**: §D5 DS-WRITE shape rewritten. Original rev-2 wording claimed DS WRITE was "a thin XDR-decode wrapper around `GatewayOps::write`," but `GatewayOps::write` creates a new composition for the entire payload — it has no `composition_id` or `offset` parameter and so doesn't match pNFS write-to-an-existing-stripe semantics. `pnfs_ds_server.rs:53-56` correctly excluded WRITE from `ALLOWED_DS_OPS` pending this resolution. Per `specs/escalations/2026-05-10-pnfs-ds-write-design.md` (Option C accepted), the DS WRITE path mirrors the v4 inline-write pattern: per-`stateid` chunk-staging buffer, drained on COMMIT/LAYOUTCOMMIT via existing `GatewayOps::write`. New §D5.1 caps the buffer size. Composition immutability + content-addressing (ADR-040, ADR-005) preserved by construction.
 
 ## Problem
 
@@ -232,14 +233,49 @@ the protocol is plaintext NFS-on-the-wire). DS calls
 `GatewayOps::read` which already returns plaintext via `kiseki-gateway`
 → `kiseki-composition` → `kiseki-chunk` → `kiseki-crypto::decrypt`.
 
-DS writes (LAYOUTIOMODE4_RW): plaintext from client → `GatewayOps::write`
-→ encrypt → chunk store. This is the same path as the current MDS
-WRITE op; the DS handler is a thin XDR-decode wrapper around the
-existing `GatewayOps::write` call.
+DS writes (LAYOUTIOMODE4_RW): plaintext from client accumulates in a
+per-`stateid` in-memory buffer on the DS, mirroring `nfs_ops::WriteBuffers`
+(`crates/kiseki-gateway/src/nfs_ops.rs:415,429`) which the v4 inline
+WRITE path already uses. On `COMMIT`, session close, or `LAYOUTCOMMIT`,
+the DS drains the buffer and calls existing `GatewayOps::write` to
+produce a new composition; the new `composition_id` propagates back
+through the fh→composition mapping and the kernel pNFS client picks
+it up on its next LAYOUTGET. The DS handler for `op::WRITE` is a
+thin XDR-decode wrapper around `buffer_write` + `flush_writes`; the
+underlying crypto + Raft + audit paths are unchanged from the
+inline-write case.
+
+**Why not direct `GatewayOps::write_at(composition_id, offset, data)`:**
+considered and rejected (`specs/escalations/2026-05-10-pnfs-ds-write-design.md`
+Option A). Read-modify-write at the gateway level invalidates the
+layout on every WRITE (the kernel does not recover gracefully) and
+re-encrypts the entire composition for any non-full-file write —
+worse than the current MDS path. The chunk-staging buffer is the
+shape that lets WRITE coexist with content-addressed immutable
+compositions (ADR-040, ADR-005) the way `O_APPEND` already does
+(ADR-013 §"Atomic append via delta").
 
 This implies **all stripes for the same composition share the same
 DEK** (the composition's DEK), since stripes are byte-range views of
 the same composition. No new key material is introduced.
+
+### D5.1. Per-stateid buffer cap
+
+DS-side write buffers are bounded per `stateid` to prevent memory
+exhaustion under a slow/never-COMMITting client. Default cap:
+**256 MiB per stateid** (matches the kernel pNFS client's typical
+dirty-data budget per file). Overflow returns `NFS4ERR_NOSPC` to
+the client, which forces the kernel to issue COMMIT-then-OPEN-then-
+WRITE rather than buffer indefinitely. Configurable via
+`KISEKI_PNFS_DS_BUFFER_CAP_BYTES`.
+
+The per-storage-node aggregate cap is `max_clients × N stateids ×
+256 MiB`, which on the default 16k stateid LRU per DS (§D3 layout
+state cache) is bounded; operators with high-concurrency RW workloads
+should size DS RAM accordingly. The cap is enforced before the
+buffer write; partial writes (some bytes accepted before the cap is
+hit) DO NOT happen — the write either fits entirely or is rejected
+entirely, matching the kernel client's expectation.
 
 ### D6. Stripe pattern: **fixed 1-MiB stripes, round-robin across all
 healthy storage nodes in the namespace's shard set**
