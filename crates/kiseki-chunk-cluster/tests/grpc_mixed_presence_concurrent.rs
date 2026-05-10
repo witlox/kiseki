@@ -70,12 +70,13 @@ fn make_present_envelope(idx: u8) -> Envelope {
     }
 }
 
-async fn start_peer() -> Arc<GrpcFabricPeer> {
+async fn start_peer() -> (Arc<GrpcFabricPeer>, tokio::sync::oneshot::Sender<()>) {
     let local = local_bridge();
     let server = ClusterChunkServer::new(Arc::clone(&local), "p");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let stream = TcpListenerStream::new(listener);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
         Server::builder()
@@ -87,7 +88,12 @@ async fn start_peer() -> Arc<GrpcFabricPeer> {
                     .max_decoding_message_size(256 * 1024 * 1024)
                     .max_encoding_message_size(256 * 1024 * 1024),
             )
-            .serve_with_incoming(stream)
+            // serve_with_incoming_shutdown so streams drain cleanly
+            // when the test ends — see h2 0.4.13 `counts.rs:282`
+            // debug_assert! note in `grpc_concurrent_get_fragment.rs`.
+            .serve_with_incoming_shutdown(stream, async move {
+                let _ = shutdown_rx.await;
+            })
             .await
             .expect("server");
     });
@@ -105,7 +111,7 @@ async fn start_peer() -> Arc<GrpcFabricPeer> {
         }
     };
     let _ = local; // keep alive — server holds its own Arc::clone
-    Arc::new(GrpcFabricPeer::new("peer-0", channel))
+    (Arc::new(GrpcFabricPeer::new("peer-0", channel)), shutdown_tx)
 }
 
 type BurstResult = (usize, bool, u8, Result<Envelope, FabricPeerError>);
@@ -152,7 +158,7 @@ async fn classify(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "slow: 8 × 64 MiB pre-populate + 64 mixed-presence concurrent fetch ≈ 2.5 GiB"]
 async fn mixed_presence_concurrent_does_not_false_not_found() {
-    let peer = start_peer().await;
+    let (peer, shutdown_tx) = start_peer().await;
     let tenant = OrgId(uuid::Uuid::nil());
 
     // 1. Pre-populate 8 present chunks on the peer.
@@ -224,4 +230,11 @@ async fn mixed_presence_concurrent_does_not_false_not_found() {
         "BUG: {not_found_p} present chunks falsely returned NotFound (sanity probe earlier confirmed all present)",
     );
     assert_eq!(ok_p, half, "present reads ok mismatch");
+
+    // Drop the client first, then signal the server. h2 0.4.13
+    // `counts.rs:282` debug_assert! avoidance — see the same
+    // pattern in `grpc_concurrent_get_fragment.rs`.
+    drop(peer);
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }

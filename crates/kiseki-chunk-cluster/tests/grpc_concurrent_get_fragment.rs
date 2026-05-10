@@ -98,14 +98,31 @@ fn make_envelope(peer_idx: u8, frag_idx: u8) -> Envelope {
 }
 
 /// Spin up one `ClusterChunkServer` on an ephemeral port; return a
-/// connected `GrpcFabricPeer` plus the local-bridge handle so the
-/// caller can pre-populate fragments before the concurrent burst.
-async fn start_peer(name: &str, pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<GrpcFabricPeer>) {
+/// connected `GrpcFabricPeer` plus the local-bridge handle and a
+/// graceful-shutdown sender so the caller can drain streams before
+/// the test exits.
+///
+/// The shutdown sender matters: without it, when the test function
+/// returns the tokio runtime aborts the spawned server task
+/// mid-stream and h2's `Counts` drops while still tracking streams.
+/// In debug builds (CI's `cargo test --profile slow` default) that
+/// trips a `debug_assert!` in h2 0.4.13's `counts.rs:282` and
+/// panics in a tokio worker — the symptom seen on shared CI runners
+/// where scheduler pressure makes the abort race deterministic.
+async fn start_peer(
+    name: &str,
+    pool: &str,
+) -> (
+    Arc<dyn AsyncChunkOps>,
+    Arc<GrpcFabricPeer>,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let local = local_bridge(pool);
     let server = ClusterChunkServer::new(Arc::clone(&local), pool);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let stream = TcpListenerStream::new(listener);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
         Server::builder()
@@ -126,7 +143,9 @@ async fn start_peer(name: &str, pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<Grpc
                     .max_decoding_message_size(256 * 1024 * 1024)
                     .max_encoding_message_size(256 * 1024 * 1024),
             )
-            .serve_with_incoming(stream)
+            .serve_with_incoming_shutdown(stream, async move {
+                let _ = shutdown_rx.await;
+            })
             .await
             .expect("server");
     });
@@ -143,7 +162,7 @@ async fn start_peer(name: &str, pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<Grpc
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     };
-    (local, Arc::new(GrpcFabricPeer::new(name, channel)))
+    (local, Arc::new(GrpcFabricPeer::new(name, channel)), shutdown_tx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -151,9 +170,10 @@ async fn start_peer(name: &str, pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<Grpc
 async fn concurrent_get_fragment_completes_within_deadline() {
     // 1. Bring up three real chunk-cluster servers.
     let mut peers: Vec<Arc<GrpcFabricPeer>> = Vec::with_capacity(3);
+    let mut shutdowns: Vec<tokio::sync::oneshot::Sender<()>> = Vec::with_capacity(3);
     let tenant = OrgId(uuid::Uuid::nil());
     for peer_idx in 0..3u8 {
-        let (_local, peer) = start_peer(&format!("peer-{peer_idx}"), "p").await;
+        let (_local, peer, shutdown_tx) = start_peer(&format!("peer-{peer_idx}"), "p").await;
         // Pre-populate FRAGS_PER_PEER envelopes per peer.
         for frag_idx in 0..FRAGS_PER_PEER {
             let frag_idx_u8 = u8::try_from(frag_idx).expect("FRAGS_PER_PEER < 256");
@@ -163,6 +183,7 @@ async fn concurrent_get_fragment_completes_within_deadline() {
                 .expect("seed put");
         }
         peers.push(peer);
+        shutdowns.push(shutdown_tx);
     }
 
     // 2. Build the work plan. Each per-peer slot fires
@@ -242,4 +263,21 @@ async fn concurrent_get_fragment_completes_within_deadline() {
         elapsed < DEADLINE,
         "completed but slower than deadline ({elapsed:?})",
     );
+
+    // Drop all client channels first so the server side sees clean
+    // GOAWAY and drains stream state, then signal each server to
+    // gracefully shut down. Without this, the test exit aborts
+    // server tasks mid-stream and h2 0.4.13's `Counts::drop`
+    // `debug_assert!(!self.has_streams())` panics in a tokio
+    // worker — symptom seen on shared CI runners (2 vCPU GitHub
+    // Actions) where scheduler pressure makes the abort race
+    // deterministic.
+    drop(peers);
+    for tx in shutdowns {
+        let _ = tx.send(());
+    }
+    // Brief grace period so the spawned server tasks observe the
+    // shutdown signal and finish their drain before the test
+    // function returns and the runtime tears down.
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }

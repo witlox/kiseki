@@ -76,12 +76,20 @@ fn make_envelope(peer_idx: u8, frag_idx: u8) -> Envelope {
     }
 }
 
-async fn start_peer(name: &str, pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<GrpcFabricPeer>) {
+async fn start_peer(
+    name: &str,
+    pool: &str,
+) -> (
+    Arc<dyn AsyncChunkOps>,
+    Arc<GrpcFabricPeer>,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let local = local_bridge(pool, 1 << 34);
     let server = ClusterChunkServer::new(Arc::clone(&local), pool);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let stream = TcpListenerStream::new(listener);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
         Server::builder()
@@ -93,7 +101,14 @@ async fn start_peer(name: &str, pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<Grpc
                     .max_decoding_message_size(256 * 1024 * 1024)
                     .max_encoding_message_size(256 * 1024 * 1024),
             )
-            .serve_with_incoming(stream)
+            // serve_with_incoming_shutdown so the spawned server can
+            // drain h2 streams cleanly when the test ends — without
+            // it, dropping a `Counts` while streams are open trips
+            // h2 0.4.13 `counts.rs:282`'s debug_assert! on shared CI
+            // runners (debug-only panic in a tokio worker).
+            .serve_with_incoming_shutdown(stream, async move {
+                let _ = shutdown_rx.await;
+            })
             .await
             .expect("server");
     });
@@ -110,7 +125,7 @@ async fn start_peer(name: &str, pool: &str) -> (Arc<dyn AsyncChunkOps>, Arc<Grpc
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     };
-    (local, Arc::new(GrpcFabricPeer::new(name, channel)))
+    (local, Arc::new(GrpcFabricPeer::new(name, channel)), shutdown_tx)
 }
 
 type ClusteredResult = (u8, usize, Result<Envelope, kiseki_chunk::ChunkError>);
@@ -188,9 +203,10 @@ async fn clustered_read_chunk_concurrent_fanout_completes_within_deadline() {
     //    fall-through (chunks on peer 1 require a `NotFound` from peer
     //    0 first; chunks on peer 2 require `NotFound` from both 0 and 1).
     let mut peer_clients: Vec<Arc<dyn FabricPeer>> = Vec::with_capacity(3);
+    let mut shutdowns: Vec<tokio::sync::oneshot::Sender<()>> = Vec::with_capacity(3);
     let tenant = OrgId(uuid::Uuid::nil());
     for peer_idx in 0..3u8 {
-        let (_local, peer) = start_peer(&format!("peer-{peer_idx}"), "p").await;
+        let (_local, peer, shutdown_tx) = start_peer(&format!("peer-{peer_idx}"), "p").await;
         for frag_idx in 0..FRAGS_PER_PEER {
             let frag_idx_u8 = u8::try_from(frag_idx).expect("FRAGS_PER_PEER < 256");
             let env = make_envelope(peer_idx, frag_idx_u8);
@@ -199,6 +215,7 @@ async fn clustered_read_chunk_concurrent_fanout_completes_within_deadline() {
                 .expect("seed put");
         }
         peer_clients.push(peer as Arc<dyn FabricPeer>);
+        shutdowns.push(shutdown_tx);
     }
 
     // 1.5. Sanity probe: confirm EVERY seeded chunk_id round-trips
@@ -321,4 +338,14 @@ async fn clustered_read_chunk_concurrent_fanout_completes_within_deadline() {
     // Suppress unused-import warning when this test grows TLS
     // handling (tracked for the cert-binding follow-up).
     let _ = std::any::type_name::<FabricPeerError>();
+
+    // Drop the ClusteredChunkStore (which transitively owns the peer
+    // clients moved in at construction) first, then signal each
+    // server. Same h2 0.4.13 `counts.rs:282` debug_assert! avoidance
+    // as `grpc_concurrent_get_fragment.rs`.
+    drop(clustered);
+    for tx in shutdowns {
+        let _ = tx.send(());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
