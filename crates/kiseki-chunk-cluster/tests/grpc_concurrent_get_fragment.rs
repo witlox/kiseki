@@ -162,7 +162,11 @@ async fn start_peer(
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     };
-    (local, Arc::new(GrpcFabricPeer::new(name, channel)), shutdown_tx)
+    (
+        local,
+        Arc::new(GrpcFabricPeer::new(name, channel)),
+        shutdown_tx,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

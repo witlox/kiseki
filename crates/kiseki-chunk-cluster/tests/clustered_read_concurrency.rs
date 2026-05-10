@@ -125,7 +125,11 @@ async fn start_peer(
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     };
-    (local, Arc::new(GrpcFabricPeer::new(name, channel)), shutdown_tx)
+    (
+        local,
+        Arc::new(GrpcFabricPeer::new(name, channel)),
+        shutdown_tx,
+    )
 }
 
 type ClusteredResult = (u8, usize, Result<Envelope, kiseki_chunk::ChunkError>);

@@ -111,7 +111,10 @@ async fn start_peer() -> (Arc<GrpcFabricPeer>, tokio::sync::oneshot::Sender<()>)
         }
     };
     let _ = local; // keep alive — server holds its own Arc::clone
-    (Arc::new(GrpcFabricPeer::new("peer-0", channel)), shutdown_tx)
+    (
+        Arc::new(GrpcFabricPeer::new("peer-0", channel)),
+        shutdown_tx,
+    )
 }
 
 type BurstResult = (usize, bool, u8, Result<Envelope, FabricPeerError>);
