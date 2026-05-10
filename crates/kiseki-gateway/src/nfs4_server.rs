@@ -1400,15 +1400,16 @@ async fn op_layoutget_ff<G: GatewayOps>(
         w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
         return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
     }
-    // Even when pNFS is not disabled at the env level, write-mode
-    // layouts force the kernel onto the broken DS-WRITE path; flip
-    // them to MDS the same way (no env-var gate needed because the
-    // failure mode is hard).
-    if iomode >= 2 {
-        // LAYOUTIOMODE4_RW = 2.
-        w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
-        return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
-    }
+    // Pre-2026-05-10 (commit 330b312) write-mode LAYOUTGET requests
+    // were forced onto the MDS path because `ALLOWED_DS_OPS` excluded
+    // WRITE — the DS rejected `op::WRITE` with `NFS4ERR_NOTSUPP`,
+    // hanging the kernel client. Per `specs/escalations/2026-05-10-
+    // pnfs-ds-write-design.md` Option C + ADR-038 rev 3 §D5, DS
+    // WRITE is now wired via the chunk-staging buffer
+    // (`pnfs_write_buffer::DsWriteBuffers`), so write-mode layouts
+    // are honored end-to-end: kernel WRITE → DS buffer → COMMIT
+    // drains via existing `GatewayOps::write` → redirect table
+    // points OLD fh4 reads at the new composition.
 
     // For Phase 15b without a real composition lookup table, derive
     // composition_id from the current_fh's first 16 bytes (the same

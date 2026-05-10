@@ -46,13 +46,17 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
-      # NFSv4.1 reads via the kernel client take 5+ seconds per RPC
-      # (capping throughput at 0.5 MB/s) when pNFS is advertised but
-      # the DS path can't sustain a session — see
-      # crates/kiseki-gateway/src/nfs4_server.rs:1376-1393. Compose +
-      # production-style deployments disable layout advertisement so
-      # the kernel reads via MDS inline (~600 MB/s). BDD pNFS
-      # scenarios can override this in their own compose.
+      # 2026-05-10: re-disabled after Phase 3 perf retest (commit
+      # 330b312 + DS WRITE landing). Phase 1 (DS WRITE chunk-staging
+      # buffer) works correctly in unit tests — but the Phase 3 perf
+      # re-run on the kernel NFSv4.1 client still hits the 0.5 MB/s
+      # read regression. The hang is in the READ path (post-OPEN, the
+      # kernel goes silent for ~5 s with no further compounds visible
+      # on the MDS connection — likely a layout / DS-port interaction
+      # not in the WRITE machinery we just wired). DS WRITE is now
+      # functional in code; the layout-side bug remains a separate
+      # investigation. Until that lands, compose stays on the MDS
+      # inline path (~600 MB/s reads) by setting this env var.
       KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
@@ -90,13 +94,17 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
-      # NFSv4.1 reads via the kernel client take 5+ seconds per RPC
-      # (capping throughput at 0.5 MB/s) when pNFS is advertised but
-      # the DS path can't sustain a session — see
-      # crates/kiseki-gateway/src/nfs4_server.rs:1376-1393. Compose +
-      # production-style deployments disable layout advertisement so
-      # the kernel reads via MDS inline (~600 MB/s). BDD pNFS
-      # scenarios can override this in their own compose.
+      # 2026-05-10: re-disabled after Phase 3 perf retest (commit
+      # 330b312 + DS WRITE landing). Phase 1 (DS WRITE chunk-staging
+      # buffer) works correctly in unit tests — but the Phase 3 perf
+      # re-run on the kernel NFSv4.1 client still hits the 0.5 MB/s
+      # read regression. The hang is in the READ path (post-OPEN, the
+      # kernel goes silent for ~5 s with no further compounds visible
+      # on the MDS connection — likely a layout / DS-port interaction
+      # not in the WRITE machinery we just wired). DS WRITE is now
+      # functional in code; the layout-side bug remains a separate
+      # investigation. Until that lands, compose stays on the MDS
+      # inline path (~600 MB/s reads) by setting this env var.
       KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
@@ -134,13 +142,17 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
-      # NFSv4.1 reads via the kernel client take 5+ seconds per RPC
-      # (capping throughput at 0.5 MB/s) when pNFS is advertised but
-      # the DS path can't sustain a session — see
-      # crates/kiseki-gateway/src/nfs4_server.rs:1376-1393. Compose +
-      # production-style deployments disable layout advertisement so
-      # the kernel reads via MDS inline (~600 MB/s). BDD pNFS
-      # scenarios can override this in their own compose.
+      # 2026-05-10: re-disabled after Phase 3 perf retest (commit
+      # 330b312 + DS WRITE landing). Phase 1 (DS WRITE chunk-staging
+      # buffer) works correctly in unit tests — but the Phase 3 perf
+      # re-run on the kernel NFSv4.1 client still hits the 0.5 MB/s
+      # read regression. The hang is in the READ path (post-OPEN, the
+      # kernel goes silent for ~5 s with no further compounds visible
+      # on the MDS connection — likely a layout / DS-port interaction
+      # not in the WRITE machinery we just wired). DS WRITE is now
+      # functional in code; the layout-side bug remains a separate
+      # investigation. Until that lands, compose stays on the MDS
+      # inline path (~600 MB/s reads) by setting this env var.
       KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
