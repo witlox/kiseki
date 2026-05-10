@@ -164,15 +164,62 @@ where
         let buf = match crate::nfs_xdr::read_rm_message_async(stream).await {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e),
+            Err(e) => {
+                // 2026-05-10: surface the first bytes the framing layer
+                // tripped on. Without this, node2/node3 silently rejected
+                // the kernel's first frame as "frame exceeds 16MB" with
+                // no way to tell what the kernel actually sent. Diagnostic
+                // for the Phase 3 read-hang investigation.
+                tracing::debug!(
+                    error = %e,
+                    "DS framing error; closing connection"
+                );
+                return Err(e);
+            }
         };
         let mut reader = XdrReader::new(&buf);
 
         let header = RpcCallHeader::decode(&mut reader)?;
 
+        // RFC 8881 §20: kernel pNFS clients use the SAME forward TCP
+        // connection for back-channel callback probes (NFS4_CB_PROGRAM
+        // CB_NULL, procedure 0). Without this the kernel rejects the
+        // DS as un-bindable for callbacks and falls back to slow MDS
+        // reads — same shape as the MDS handler at `nfs4_server.rs:
+        // 306-311`. Pre-fix the DS handler missed this; nodes that
+        // received CB_NULL replied PROG_MISMATCH, leaving the kernel
+        // stuck waiting on a ~5 s connection-establishment retry timer.
+        if header.program == crate::nfs4_server::NFS4_CB_PROGRAM && header.procedure == 0 {
+            let mut w = XdrWriter::new();
+            encode_reply_accepted(&mut w, header.xid, 0); // SUCCESS
+            crate::nfs_xdr::write_rm_message_async(stream, &w.into_bytes()).await?;
+            continue;
+        }
+
         if header.program != 100_003 || header.version != 4 {
             let mut w = XdrWriter::new();
-            encode_reply_accepted(&mut w, header.xid, 1); // PROG_MISMATCH
+            encode_reply_accepted(&mut w, header.xid, 2); // PROG_MISMATCH
+                                                          // Per RFC 5531: PROG_MISMATCH carries (low, high) version
+                                                          // hints. Without these the kernel may misinterpret the
+                                                          // reply and retry with malformed framing — matches the
+                                                          // MDS handler.
+            w.write_u32(4); // low
+            w.write_u32(4); // high
+            crate::nfs_xdr::write_rm_message_async(stream, &w.into_bytes()).await?;
+            continue;
+        }
+
+        // RFC 5531: procedure 0 is the NFS NULL ping (no-op). Reply
+        // with empty SUCCESS — same shape as MDS.
+        if header.procedure == 0 {
+            let mut w = XdrWriter::new();
+            encode_reply_accepted(&mut w, header.xid, 0); // SUCCESS
+            crate::nfs_xdr::write_rm_message_async(stream, &w.into_bytes()).await?;
+            continue;
+        }
+        if header.procedure != 1 {
+            let mut w = XdrWriter::new();
+            encode_reply_accepted(&mut w, header.xid, 3); // PROC_UNAVAIL
             crate::nfs_xdr::write_rm_message_async(stream, &w.into_bytes()).await?;
             continue;
         }
@@ -281,11 +328,13 @@ pub async fn dispatch_ds_compound<G: GatewayOps + Send + Sync + 'static>(
     ctx: &DsContext<G>,
     sessions: &SessionManager,
 ) -> Vec<u8> {
+    let t_start = std::time::Instant::now();
     let _tag = reader.read_opaque().unwrap_or_default();
     let _minor_version = reader.read_u32().unwrap_or(1); // NFSv4.1
     let num_ops = reader.read_u32().unwrap_or(0).min(32);
 
     let mut op_results: Vec<Vec<u8>> = Vec::new();
+    let mut op_codes: Vec<u32> = Vec::new();
     let mut compound_status = nfs4_status::NFS4_OK;
     let mut state = DsCompoundState::default();
 
@@ -293,6 +342,7 @@ pub async fn dispatch_ds_compound<G: GatewayOps + Send + Sync + 'static>(
         let Ok(op_code) = reader.read_u32() else {
             break;
         };
+        op_codes.push(op_code);
 
         let (status, result) = process_ds_op(op_code, reader, ctx, sessions, &mut state).await;
         op_results.push(result);
@@ -313,6 +363,25 @@ pub async fn dispatch_ds_compound<G: GatewayOps + Send + Sync + 'static>(
     for result in &op_results {
         buf.extend_from_slice(result);
     }
+
+    // One log line per DS-side compound. Mirrors the MDS dispatcher
+    // (`nfs4_server::dispatch_compound`) so a unified trace can be
+    // assembled from `kiseki_gateway::nfs4_server` +
+    // `kiseki_gateway::pnfs_ds_server` log lines side-by-side.
+    // Pre-2026-05-10 the DS dispatcher was silent, which masked
+    // whether the kernel was even talking to the DS during the
+    // 0.5 MB/s read regression — added during the read-hang
+    // diagnostic in `specs/escalations/2026-05-10-pnfs-read-hang-
+    // post-ds-write.md`.
+    let elapsed_us = u64::try_from(t_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    tracing::debug!(
+        xid = header.xid,
+        ops = ?op_codes,
+        status = compound_status,
+        elapsed_us = elapsed_us,
+        bytes_out = buf.len(),
+        "pNFS DS compound"
+    );
     buf
 }
 

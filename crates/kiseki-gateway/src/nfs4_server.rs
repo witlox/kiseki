@@ -25,7 +25,7 @@ use crate::ops::GatewayOps;
 use kiseki_common::locks::LockOrDie;
 
 /// NFSv4 program/version constants.
-const NFS4_PROGRAM: u32 = 100003;
+pub(crate) const NFS4_PROGRAM: u32 = 100003;
 /// RFC 8881 §20 — NFSv4 callback program. Linux 6.x clients send
 /// CB_NULL on this program (version 1, procedure 0) over the SAME
 /// TCP socket as the forward NFS channel to verify the back-channel
@@ -34,7 +34,7 @@ const NFS4_PROGRAM: u32 = 100003;
 /// reject the framing or the kernel marks the back channel broken
 /// and the mount fails with "Operation not supported" (Phase 15
 /// e2e blocker, 2026-04-27).
-const NFS4_CB_PROGRAM: u32 = 400122;
+pub(crate) const NFS4_CB_PROGRAM: u32 = 400122;
 const NFS4_VERSION: u32 = 4;
 
 /// NFSv4 operation codes (RFC 7530 + RFC 7862).
@@ -1818,7 +1818,13 @@ async fn op_open<G: GatewayOps>(
         w.write_u32(0);
         // open_delegation4: OPEN_DELEGATE_NONE = 0 has an empty body
         // per §9.1.2 (no per-type fields after the discriminator).
-        // Future grants would emit OPEN_DELEGATE_READ/WRITE.
+        // 2026-05-10: tried bumping to OPEN_DELEGATE_NONE_EXT (4) +
+        // WND4_NOT_WANTED to address the Linux 6.x 5-second OPEN-syscall
+        // hang on pNFS mounts. Kernel rejected the reply with Remote
+        // I/O error — the encoding was correct per RFC 8881 §10.4.2 but
+        // some other field upstream of `delegation` may be the actual
+        // mismatch. Reverted; root cause stays open in
+        // `specs/escalations/2026-05-10-pnfs-read-hang-post-ds-write.md`.
         const OPEN_DELEGATE_NONE: u32 = 0;
         w.write_u32(OPEN_DELEGATE_NONE);
     };

@@ -4,7 +4,54 @@
 **From:** implementer (pnfs-ds-write Phase 3 perf gate)
 **To:** architect
 **Severity:** Phase 3 perf-gate not met. Phase 1 (DS WRITE) is correct in code; Phase 3.1 (WRITE-mode MDS-fallback removal) is correct in code; Phase 3.2 (compose env-var removal) reverted because the kernel-driven NFSv4.1 read path still hangs at 0.5 MB/s when layouts are advertised. The hang sits in the READ path, not WRITE.
-**Status:** Open. Phase 3.4 perf-gate failed; Phase 3.3 (BDD scenarios) deferred.
+**Status:** Open. Phase 3.4 perf-gate failed; Phase 3.3 (BDD scenarios) deferred. **Diagnostic round 1 (2026-05-10) narrowed the hang but did not resolve it.** See "Diagnostic round 1 findings" below.
+
+## Diagnostic round 1 findings (2026-05-10)
+
+Diagnostic work landed two improvements + one unresolved finding:
+
+### Improvement 1 — DS dispatcher CB_NULL + NULL-ping + proper PROG_MISMATCH
+
+`pnfs_ds_server::handle_ds_connection` lacked the back-channel `CB_NULL` (NFS4_CB_PROGRAM, procedure 0) handler that `nfs4_server::handle_nfs4_connection` has. When the kernel pNFS client sent a CB_NULL probe to nodes 2/3 to verify the back-channel, our DS replied PROG_MISMATCH **without the (low, high) version hints** required by RFC 5531 §11. The kernel then sent malformed bytes that tripped `read_rm_message_async`'s `frame exceeds 16MB limit` check on those nodes (logged as `DS plaintext connection ended error="NFS frame exceeds 16MB limit"`).
+
+Fixed: DS handler now mirrors MDS — accepts CB_NULL on `NFS4_CB_PROGRAM`, returns PROG_MISMATCH with low/high=4/4, handles procedure=0 NULL ping, returns PROC_UNAVAIL for unknown procedures. Post-fix nodes 2/3 see ZERO traffic during a kernel pNFS read instead of bad-framing rejections.
+
+### Improvement 2 — DS-side per-compound trace logging
+
+`dispatch_ds_compound` previously logged nothing per compound; the only visibility was at session-establishment + connection-end. Mirroring the MDS dispatcher's existing `tracing::debug!` line lets a unified MDS+DS trace be assembled side-by-side. Without this, the diagnostic round wouldn't have been able to confirm "DS sees no traffic during the silent gap." Worth keeping unconditionally.
+
+### Unresolved — `openat()` blocks 5 s; reads are sub-ms
+
+Captured `strace -ttT` of `cat /mnt/nfs41/<etag>` against a layout-enabled mount:
+
+```
+12:16:23.921506 openat(... O_RDONLY) = 3 <5.106265>   ← 5.1 s in OPEN syscall
+12:16:29.028721 read(... 524288)      = 524288 <0.000386>
+12:16:29.029217 read(... 524288)      = 524288 <0.000092>
+... 14 more reads, all 36-90 µs ...
+12:16:29.030506 read(..., 524288)     = 0 <0.000013>
+```
+
+The hang is in `openat()`, not READ. Once the kernel finishes OPEN, the actual reads + DS handshake (EXCHANGE_ID + CREATE_SESSION + RECLAIM_COMPLETE + 16 × `[53,22,25]` READ + DESTROY_SESSION + DESTROY_CLIENTID) all complete within **26 ms**. The 5 s lives entirely in the kernel's OPEN-reply processing.
+
+Hypothesis B — kernel waits for delegation callback that never arrives. NFSv4.1 §10.4.2 added `OPEN_DELEGATE_NONE_EXT (4)` carrying explicit `why_no_delegation4` — the legacy `OPEN_DELEGATE_NONE (0)` we emit may be ambiguous and read as "delegation pending."
+
+Tried emitting `OPEN_DELEGATE_NONE_EXT + WND4_NOT_WANTED (0)` per the RFC. **Kernel rejected the reply with `Remote I/O error` in 1 ms** — the encoding parsed but failed semantic validation. Without a `tcpdump` + Wireshark NFS dissector to confirm the exact byte layout, we can't tell whether the NONE_EXT shape needs additional framing or whether the issue is upstream of `delegation` in the reply (the `rflags`, `attrset`, or `cinfo` fields). Reverted to NONE (0).
+
+Other DS-side observations during the hang:
+- Kernel mountstats confirm `pnfs=LAYOUT_FLEX_FILES` is active.
+- 16 × 524 KiB DS reads complete in ~26 ms total once the kernel finally starts them.
+- DS session is destroyed at the end of every read cycle (`[44]` DESTROY_SESSION + `[57]` DESTROY_CLIENTID), so the next read goes through full re-establishment.
+- Kernel `nfs: server kiseki-node1 not responding, timed out` messages keep appearing in `dmesg -T` even with the CB_NULL fix in place — the timeouts are at the connection-establishment / OPEN-reply layer, not the data-transfer layer.
+
+## Recommended diagnostic round 2 (NOT executed)
+
+If you want to continue:
+1. **`tcpdump -i any -w /tmp/nfs.pcap port 2049 or port 2052`** during the hang. Decode in Wireshark with the NFS dissector. The dissector knows the OPEN reply structure and will surface exactly which field decodes wrong.
+2. **`echo 'file fs/nfs/nfs4xdr.c +p' > /sys/kernel/debug/dynamic_debug/control`** on the host kernel to enable the kernel's NFS XDR trace. Emits per-field decoder messages for OPEN replies; pinpoints the field that mis-parses.
+3. **Compare against a known-good pNFS server** (Ceph or NetApp simulator) to capture a working OPEN reply, then byte-diff against ours.
+
+I haven't done these because the diagnostic cost is open-ended (could take a day, could take a week) and the workaround (`KISEKI_DISABLE_PNFS_LAYOUT=1`) keeps NFSv4.1 reads at the production-realistic 978 MB/s baseline.
 
 ## Finding
 

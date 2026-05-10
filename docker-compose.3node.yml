@@ -57,6 +57,19 @@ services:
       # functional in code; the layout-side bug remains a separate
       # investigation. Until that lands, compose stays on the MDS
       # inline path (~600 MB/s reads) by setting this env var.
+      # TEMPORARILY OFF for read-hang diagnostic 2026-05-10. Re-set
+      # to "1" before merging if Phase 3 perf-gate still fails.
+      # 2026-05-10: re-disabled after Phase 3 perf retest + diagnostic.
+      # The diagnostic (escalation 2026-05-10-pnfs-read-hang-post-ds-write)
+      # narrowed the hang from "kernel goes silent" to "openat() blocks
+      # 5 s while reads are sub-ms"; CB_NULL on the DS dispatcher and
+      # the bytes-mismatched OPEN_DELEGATE_NONE_EXT attempt addressed
+      # framing-side / encoding-side hypotheses without resolving the
+      # 5 s OPEN delay. Likely root cause is upstream of `delegation`
+      # in the OPEN reply (rflags / attrset / cinfo) or a deeper kernel
+      # back-channel expectation. Until that's diagnosed, MDS-inline
+      # NFSv4.1 (~600 MB/s reads, ~1.6 GB/s writes) is the production
+      # baseline.
       KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
@@ -105,6 +118,19 @@ services:
       # functional in code; the layout-side bug remains a separate
       # investigation. Until that lands, compose stays on the MDS
       # inline path (~600 MB/s reads) by setting this env var.
+      # TEMPORARILY OFF for read-hang diagnostic 2026-05-10. Re-set
+      # to "1" before merging if Phase 3 perf-gate still fails.
+      # 2026-05-10: re-disabled after Phase 3 perf retest + diagnostic.
+      # The diagnostic (escalation 2026-05-10-pnfs-read-hang-post-ds-write)
+      # narrowed the hang from "kernel goes silent" to "openat() blocks
+      # 5 s while reads are sub-ms"; CB_NULL on the DS dispatcher and
+      # the bytes-mismatched OPEN_DELEGATE_NONE_EXT attempt addressed
+      # framing-side / encoding-side hypotheses without resolving the
+      # 5 s OPEN delay. Likely root cause is upstream of `delegation`
+      # in the OPEN reply (rflags / attrset / cinfo) or a deeper kernel
+      # back-channel expectation. Until that's diagnosed, MDS-inline
+      # NFSv4.1 (~600 MB/s reads, ~1.6 GB/s writes) is the production
+      # baseline.
       KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
@@ -153,6 +179,19 @@ services:
       # functional in code; the layout-side bug remains a separate
       # investigation. Until that lands, compose stays on the MDS
       # inline path (~600 MB/s reads) by setting this env var.
+      # TEMPORARILY OFF for read-hang diagnostic 2026-05-10. Re-set
+      # to "1" before merging if Phase 3 perf-gate still fails.
+      # 2026-05-10: re-disabled after Phase 3 perf retest + diagnostic.
+      # The diagnostic (escalation 2026-05-10-pnfs-read-hang-post-ds-write)
+      # narrowed the hang from "kernel goes silent" to "openat() blocks
+      # 5 s while reads are sub-ms"; CB_NULL on the DS dispatcher and
+      # the bytes-mismatched OPEN_DELEGATE_NONE_EXT attempt addressed
+      # framing-side / encoding-side hypotheses without resolving the
+      # 5 s OPEN delay. Likely root cause is upstream of `delegation`
+      # in the OPEN reply (rflags / attrset / cinfo) or a deeper kernel
+      # back-channel expectation. Until that's diagnosed, MDS-inline
+      # NFSv4.1 (~600 MB/s reads, ~1.6 GB/s writes) is the production
+      # baseline.
       KISEKI_DISABLE_PNFS_LAYOUT: "1"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
