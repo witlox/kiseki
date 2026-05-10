@@ -1444,6 +1444,7 @@ pub async fn run_main(
                 rt: tokio::runtime::Handle::current(),
                 now_ms: Arc::new(kiseki_gateway::pnfs_ds_server::default_now_ms),
                 mds_layout_manager: pnfs_layout_mgr.clone(),
+                write_buffers: Arc::new(kiseki_gateway::pnfs_write_buffer::DsWriteBuffers::new()),
             });
             let ds_tls_for_thread = nfs_tls.clone();
             tokio::spawn(async move {

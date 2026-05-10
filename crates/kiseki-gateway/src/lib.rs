@@ -133,6 +133,9 @@ pub mod pnfs;
 pub mod pnfs_ds_server;
 
 #[cfg(feature = "nfs")]
+pub mod pnfs_write_buffer;
+
+#[cfg(feature = "nfs")]
 pub mod portmap;
 
 #[cfg(feature = "s3")]

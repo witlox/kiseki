@@ -22,6 +22,10 @@
 // SEQUENCE / etc.) and a handful are pure XDR construction with no
 // gateway await — they stay async for dispatch uniformity.
 #![allow(clippy::unused_async)]
+// Doc identifiers (composition_id, stateid, fh4, etc.) appear too
+// often in this module's prose; backticking each occurrence is
+// noise. Same precedent as `nfs_ops.rs`.
+#![allow(clippy::doc_markdown)]
 
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -36,10 +40,11 @@ use crate::nfs4_server::{
 use crate::nfs_xdr::{encode_reply_accepted, RpcCallHeader, XdrReader, XdrWriter};
 use crate::ops::{GatewayOps, ReadRequest};
 use crate::pnfs::{FhValidateError, PnfsFhMacKey, PnfsFileHandle};
+use crate::pnfs_write_buffer::BufferWriteResult;
 
 /// Op codes accepted by the DS. Anything outside this set returns
 /// `NFS4ERR_NOTSUPP` per I-PN7.
-pub const ALLOWED_DS_OPS: [u32; 10] = [
+pub const ALLOWED_DS_OPS: [u32; 11] = [
     op::EXCHANGE_ID,
     op::CREATE_SESSION,
     op::DESTROY_SESSION,
@@ -48,12 +53,16 @@ pub const ALLOWED_DS_OPS: [u32; 10] = [
     op::SEQUENCE,
     op::PUTFH,
     op::READ,
+    op::WRITE,
     op::COMMIT,
     op::GETATTR,
-    // NOTE: WRITE is intentionally absent in Phase 15a — `GatewayOps::write`
-    // creates a fresh composition, which doesn't match the pNFS write-to-an-
-    // existing-stripe semantics. WRITE is wired in a follow-up phase along
-    // with the architect-blessed `GatewayOps::write_at`. See Phase 15b notes.
+    // WRITE wiring landed 2026-05-10 per ADR-038 rev 3 §D5 + §D5.1
+    // (chunk-staging buffer; flush via existing GatewayOps::write on
+    // COMMIT). See `pnfs_write_buffer.rs` for the buffer design and
+    // `specs/implementation/pnfs-ds-write.md` for the implementation
+    // plan; pre-fix this list excluded WRITE because the original
+    // ADR-038 rev 2 §D5 wording (DS WRITE → GatewayOps::write) didn't
+    // typecheck (the trait method has no composition_id/offset args).
     //
     // RECLAIM_COMPLETE + DESTROY_CLIENTID are required by Linux's pNFS
     // client even on DS-only sessions. Per RFC 8881 §13.6.4: "servers
@@ -65,9 +74,18 @@ pub const ALLOWED_DS_OPS: [u32; 10] = [
 ];
 
 /// Stateless DS context. One instance per storage node.
+///
+/// "Stateless" is now a slight misnomer post-ADR-038 rev 3: the DS
+/// holds chunk-staging write buffers + composition redirects so DS
+/// WRITE round-trips work without breaking composition immutability
+/// (`write_buffers`). The buffers are per-DS-process, scoped by
+/// `composition_id`, and dropped on `DESTROY_CLIENTID` /
+/// `DESTROY_SESSION`. The DS still doesn't own MDS-authoritative
+/// state (per ADR-038 §D3).
 pub struct DsContext<G: GatewayOps + Send + Sync + 'static> {
     /// Underlying gateway used to satisfy `GatewayOps::read` (decrypts
-    /// chunks server-side per I-PN3).
+    /// chunks server-side per I-PN3) and `GatewayOps::write` on
+    /// COMMIT-drain (ADR-038 rev 3 §D5).
     pub gateway: Arc<G>,
     /// MAC key derived from the cluster master + cluster id (ADR-038 §D4.1).
     pub mac_key: PnfsFhMacKey,
@@ -90,6 +108,11 @@ pub struct DsContext<G: GatewayOps + Send + Sync + 'static> {
     /// revoked set via the same `TopologyEventBus` that triggered the
     /// recall (out of scope for Phase 15c).
     pub mds_layout_manager: Option<Arc<crate::pnfs::MdsLayoutManager>>,
+    /// Chunk-staging write buffers (ADR-038 rev 3 §D5 + §D5.1). One
+    /// per `composition_id`; capped per-composition; redirect table
+    /// rewrites OLD fh4 reads to the post-COMMIT composition. See
+    /// [`crate::pnfs_write_buffer`] for the full design + tests.
+    pub write_buffers: Arc<crate::pnfs_write_buffer::DsWriteBuffers>,
 }
 
 /// Default wall-clock source: `SystemTime::now()` truncated to ms.
@@ -303,13 +326,14 @@ async fn process_ds_op<G: GatewayOps + Send + Sync + 'static>(
     match op_code {
         op::EXCHANGE_ID => op_exchange_id_with_role(reader, sessions, ServerRole::Ds).await,
         op::CREATE_SESSION => op_create_session(reader, sessions).await,
-        op::DESTROY_SESSION => op_destroy_session(reader, sessions).await,
-        op::DESTROY_CLIENTID => crate::nfs4_server::op_destroy_clientid(reader).await,
+        op::DESTROY_SESSION => op_destroy_session_ds(reader, ctx, sessions).await,
+        op::DESTROY_CLIENTID => op_destroy_clientid_ds(reader, ctx).await,
         op::RECLAIM_COMPLETE => crate::nfs4_server::op_reclaim_complete(reader).await,
         op::SEQUENCE => op_sequence(reader, sessions).await,
         op::PUTFH => op_putfh_ds(reader, ctx, state).await,
         op::READ => op_read_ds(reader, ctx, state).await,
-        op::COMMIT => op_commit_ds(reader, state).await,
+        op::WRITE => op_write_ds(reader, ctx, state).await,
+        op::COMMIT => op_commit_ds(reader, ctx, state).await,
         op::GETATTR => op_getattr_ds(reader, ctx, state).await,
         // I-PN7: every other op is rejected.
         _ => {
@@ -411,18 +435,47 @@ async fn op_read_ds<G: GatewayOps + Send + Sync + 'static>(
         (abs, u64::from(count).min(max_count))
     };
 
+    // ADR-038 rev 3 §D5: consult the write-buffer first. Two layers:
+    //   1. Resolve the fh's composition_id through the redirect table —
+    //      a prior COMMIT on the same fh4 may have produced a NEW
+    //      composition_id; reads via the OLD fh4 should see the new
+    //      bytes.
+    //   2. If a buffer exists for the (resolved) composition_id, serve
+    //      the prefix from the buffer; fall back to gateway.read for
+    //      the suffix that's past the buffer end.
+    let resolved_cid = ctx.write_buffers.resolve(fh.composition_id);
+    let (buf_prefix, fully_buffered) =
+        ctx.write_buffers
+            .read(resolved_cid, abs_offset, bounded_count);
+
+    if fully_buffered {
+        w.write_u32(nfs4_status::NFS4_OK);
+        // EOF on a buffered read is hard to signal precisely without
+        // knowing the underlying composition's size; the kernel
+        // tolerates eof=false on short responses (re-reads at higher
+        // offset will see EOF naturally when both buffer + composition
+        // are exhausted).
+        w.write_bool(false);
+        w.write_opaque(&buf_prefix);
+        return (nfs4_status::NFS4_OK, w.into_bytes());
+    }
+
+    let suffix_offset = abs_offset.saturating_add(u64::try_from(buf_prefix.len()).unwrap_or(0));
+    let suffix_len = bounded_count.saturating_sub(u64::try_from(buf_prefix.len()).unwrap_or(0));
     let req = ReadRequest {
         tenant_id: fh.tenant_id,
         namespace_id: fh.namespace_id,
-        composition_id: fh.composition_id,
-        offset: abs_offset,
-        length: bounded_count,
+        composition_id: resolved_cid,
+        offset: suffix_offset,
+        length: suffix_len,
     };
 
     let status = if let Ok(resp) = ctx.block_gateway(ctx.gateway.read(req)) {
         w.write_u32(nfs4_status::NFS4_OK);
         w.write_bool(resp.eof);
-        w.write_opaque(&resp.data);
+        let mut out = buf_prefix;
+        out.extend_from_slice(&resp.data);
+        w.write_opaque(&out);
         nfs4_status::NFS4_OK
     } else {
         w.write_u32(nfs4_status::NFS4ERR_IO);
@@ -432,19 +485,174 @@ async fn op_read_ds<G: GatewayOps + Send + Sync + 'static>(
     (status, w.into_bytes())
 }
 
-async fn op_commit_ds(_reader: &mut XdrReader<'_>, state: &DsCompoundState) -> (u32, Vec<u8>) {
-    // Reads don't need COMMIT; for read-only DS in Phase 15a, COMMIT is
-    // a no-op that returns a fixed writeverf. RFC 8435 tightly_coupled
-    // mode allows this — durability comes from the underlying Raft log.
+/// op::WRITE handler — accumulates plaintext into the per-composition
+/// write buffer (ADR-038 rev 3 §D5). On overflow returns
+/// `NFS4ERR_NOSPC`; the kernel pNFS client recovers by issuing
+/// COMMIT-then-OPEN-then-WRITE.
+async fn op_write_ds<G: GatewayOps + Send + Sync + 'static>(
+    reader: &mut XdrReader<'_>,
+    ctx: &DsContext<G>,
+    state: &DsCompoundState,
+) -> (u32, Vec<u8>) {
+    // RFC 8881 §18.32: stateid (16) + offset (u64) + stable (u32) + data (opaque<>)
+    let _stateid = reader.read_opaque_fixed(16).unwrap_or_default();
+    let offset = reader.read_u64().unwrap_or(0);
+    let _stable = reader.read_u32().unwrap_or(2); // FILE_SYNC=2; advisory only
+    let data = reader.read_opaque().unwrap_or_default();
+
     let mut w = XdrWriter::new();
-    w.write_u32(op::COMMIT);
-    if state.current_fh.is_none() {
+    w.write_u32(op::WRITE);
+
+    let Some(fh) = state.current_fh.as_ref() else {
         w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
         return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
+    };
+
+    // Translate kernel offset to composition-absolute (mirrors op_read_ds
+    // for the legacy stripe-FH shape; one-segment-N-mirrors layouts use
+    // stripe_index=0 so abs_offset == offset).
+    let abs_offset = if fh.stripe_index == 0 {
+        offset
+    } else {
+        let stripe_base = u64::from(fh.stripe_index) * ctx.stripe_size_bytes;
+        stripe_base.saturating_add(offset)
+    };
+
+    match ctx.write_buffers.buffer_write(
+        fh.composition_id,
+        fh.tenant_id,
+        fh.namespace_id,
+        abs_offset,
+        &data,
+    ) {
+        BufferWriteResult::Accepted => {
+            #[allow(clippy::cast_possible_truncation)]
+            let count = data.len() as u32;
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_u32(count);
+            w.write_u32(2); // committed = FILE_SYNC (we hold in our buffer; durability via COMMIT)
+            w.write_opaque_fixed(&[0u8; 8]); // writeverf4 — fixed verifier (we never restart server-side)
+            (nfs4_status::NFS4_OK, w.into_bytes())
+        }
+        BufferWriteResult::Nospc {
+            current,
+            cap,
+            requested,
+        } => {
+            tracing::debug!(
+                composition_id = ?fh.composition_id,
+                current_bytes = current,
+                cap_bytes = cap,
+                requested_bytes = requested,
+                "DS WRITE rejected NOSPC — per-composition buffer cap hit"
+            );
+            w.write_u32(nfs4_status::NFS4ERR_NOSPC);
+            (nfs4_status::NFS4ERR_NOSPC, w.into_bytes())
+        }
     }
-    w.write_u32(nfs4_status::NFS4_OK);
-    w.write_opaque_fixed(&[0u8; 8]); // writeverf4
-    (nfs4_status::NFS4_OK, w.into_bytes())
+}
+
+/// op::COMMIT handler — drains the per-composition write buffer and
+/// produces a new composition via `GatewayOps::write` (ADR-038 rev 3
+/// §D5). The new composition_id is recorded in the redirect table so
+/// subsequent reads through the OLD fh4 see post-commit bytes; the
+/// kernel pNFS client picks up the new id on its next LAYOUTGET.
+async fn op_commit_ds<G: GatewayOps + Send + Sync + 'static>(
+    reader: &mut XdrReader<'_>,
+    ctx: &DsContext<G>,
+    state: &DsCompoundState,
+) -> (u32, Vec<u8>) {
+    // RFC 8881 §18.3: offset + count are advisory; we flush the entire
+    // buffer on any COMMIT.
+    let _offset = reader.read_u64().unwrap_or(0);
+    let _count = reader.read_u32().unwrap_or(0);
+
+    let mut w = XdrWriter::new();
+    w.write_u32(op::COMMIT);
+
+    let Some(fh) = state.current_fh.as_ref() else {
+        crate::pnfs_write_buffer::ds_commit_total()
+            .with_label_values(&["no_fh"])
+            .inc();
+        w.write_u32(nfs4_status::NFS4ERR_NOFILEHANDLE);
+        return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
+    };
+
+    let Some(entry) = ctx.write_buffers.take(fh.composition_id) else {
+        // No buffered writes for this composition — nothing to flush.
+        // Reads-only path; reply OK with the fixed writeverf (RFC 8435
+        // tightly_coupled mode permits — durability via the underlying
+        // Raft log).
+        crate::pnfs_write_buffer::ds_commit_total()
+            .with_label_values(&["no_buffer"])
+            .inc();
+        w.write_u32(nfs4_status::NFS4_OK);
+        w.write_opaque_fixed(&[0u8; 8]); // writeverf4
+        return (nfs4_status::NFS4_OK, w.into_bytes());
+    };
+
+    let req = crate::ops::WriteRequest {
+        tenant_id: entry.tenant_id,
+        namespace_id: entry.namespace_id,
+        data: entry.data,
+        name: None,
+        conditional: None,
+        workflow_ref: None,
+    };
+    let status = match ctx.block_gateway(ctx.gateway.write(req)) {
+        Ok(resp) => {
+            ctx.write_buffers
+                .record_redirect(fh.composition_id, resp.composition_id);
+            crate::pnfs_write_buffer::ds_commit_total()
+                .with_label_values(&["ok"])
+                .inc();
+            tracing::debug!(
+                original = ?fh.composition_id,
+                current = ?resp.composition_id,
+                bytes = resp.bytes_written,
+                "DS COMMIT flushed buffer to new composition"
+            );
+            w.write_u32(nfs4_status::NFS4_OK);
+            w.write_opaque_fixed(&[0u8; 8]); // writeverf4
+            nfs4_status::NFS4_OK
+        }
+        Err(e) => {
+            crate::pnfs_write_buffer::ds_commit_total()
+                .with_label_values(&["gateway_err"])
+                .inc();
+            tracing::warn!(error = ?e, "DS COMMIT gateway.write failed");
+            w.write_u32(nfs4_status::NFS4ERR_IO);
+            nfs4_status::NFS4ERR_IO
+        }
+    };
+
+    (status, w.into_bytes())
+}
+
+/// DS-side wrapper around `nfs4_server::op_destroy_session`. After
+/// the session is removed, drops all DS write buffers + redirects so
+/// the next session sees a clean slate (per ADR-038 §D5.1, no
+/// implicit flush — the kernel must COMMIT before destroy if it
+/// wants durability).
+async fn op_destroy_session_ds<G: GatewayOps + Send + Sync + 'static>(
+    reader: &mut XdrReader<'_>,
+    ctx: &DsContext<G>,
+    sessions: &SessionManager,
+) -> (u32, Vec<u8>) {
+    let result = op_destroy_session(reader, sessions).await;
+    ctx.write_buffers.clear_all();
+    result
+}
+
+/// DS-side wrapper around `nfs4_server::op_destroy_clientid`. Same
+/// buffer-clear semantics as `op_destroy_session_ds`.
+async fn op_destroy_clientid_ds<G: GatewayOps + Send + Sync + 'static>(
+    reader: &mut XdrReader<'_>,
+    ctx: &DsContext<G>,
+) -> (u32, Vec<u8>) {
+    let result = crate::nfs4_server::op_destroy_clientid(reader).await;
+    ctx.write_buffers.clear_all();
+    result
 }
 
 async fn op_getattr_ds<G: GatewayOps + Send + Sync + 'static>(
@@ -488,8 +696,14 @@ mod tests {
     /// Tracking gateway that records read calls. Lets us assert that
     /// `op_read_ds` did or did not invoke the gateway (I-PN1: forged
     /// fh4 must NOT reach `GatewayOps::read`).
+    ///
+    /// Post-ADR-038-rev-3: `write` is no longer `unreachable!()` —
+    /// `op_commit_ds` flushes the chunk-staging buffer through it.
+    /// We synthesize a deterministic new composition_id from the
+    /// write count so tests can assert on redirect-table behavior.
     struct TrackingGateway {
         reads: AtomicU64,
+        writes: AtomicU64,
         fixed_response: Vec<u8>,
     }
 
@@ -508,9 +722,19 @@ mod tests {
         }
         async fn write(
             &self,
-            _req: crate::ops::WriteRequest,
+            req: crate::ops::WriteRequest,
         ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
-            unreachable!("DS Phase 15a does not call write")
+            let n = self.writes.fetch_add(1, Ordering::SeqCst);
+            // Derive a deterministic new composition_id from the write
+            // counter so round-trip tests can assert on the redirect.
+            let mut bytes = [0u8; 16];
+            bytes[0..8].copy_from_slice(&(n + 1).to_le_bytes());
+            bytes[8] = 0xc0;
+            bytes[9] = 0xde;
+            Ok(crate::ops::WriteResponse {
+                composition_id: kiseki_common::ids::CompositionId(uuid::Uuid::from_bytes(bytes)),
+                bytes_written: u64::try_from(req.data.len()).unwrap_or(0),
+            })
         }
     }
 
@@ -519,6 +743,7 @@ mod tests {
         let ctx = DsContext {
             gateway: Arc::new(TrackingGateway {
                 reads: AtomicU64::new(0),
+                writes: AtomicU64::new(0),
                 fixed_response: vec![0xee; 4096],
             }),
             mac_key: key.clone(),
@@ -532,6 +757,7 @@ mod tests {
             }),
             now_ms: fixed_clock(1_000),
             mds_layout_manager: None,
+            write_buffers: Arc::new(crate::pnfs_write_buffer::DsWriteBuffers::new()),
         };
         (Arc::new(ctx), key)
     }
@@ -549,14 +775,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn allowed_ds_ops_are_exactly_ten() {
+    async fn allowed_ds_ops_are_exactly_eleven() {
         // I-PN7 — pin the spec: changes here require an ADR amendment.
         // Bumped 8 → 10 in 2026-05-07: added RECLAIM_COMPLETE +
         // DESTROY_CLIENTID after the kernel pNFS client retried session
         // establishment in a loop when the DS rejected them with
         // NFS4ERR_NOTSUPP. RFC 8881 §13.6.4 requires DS to permit
-        // RECLAIM_COMPLETE on DS-only sessions.
-        assert_eq!(ALLOWED_DS_OPS.len(), 10);
+        // RECLAIM_COMPLETE on DS-only sessions. Bumped 10 → 11 in
+        // 2026-05-10: added WRITE per ADR-038 rev 3 §D5 (chunk-staging
+        // buffer; flush via gateway.write on COMMIT).
+        assert_eq!(ALLOWED_DS_OPS.len(), 11);
         let mut sorted: Vec<u32> = ALLOWED_DS_OPS.into();
         sorted.sort_unstable();
         let mut expected: Vec<u32> = [
@@ -567,6 +795,7 @@ mod tests {
             op::RECLAIM_COMPLETE,
             op::PUTFH,
             op::READ,
+            op::WRITE,
             op::COMMIT,
             op::SEQUENCE,
             op::GETATTR,
@@ -724,5 +953,209 @@ mod tests {
             process_ds_op(ALLOCATE_OP, &mut reader, &ctx, &session_mgr, &mut state).await;
         assert_eq!(status, nfs4_status::NFS4ERR_NOTSUPP);
         assert!(state.current_fh.is_none());
+    }
+
+    // =========================================================================
+    // ADR-038 rev 3 §D5 — DS WRITE / COMMIT integration tests.
+    // =========================================================================
+
+    /// Build a WRITE op argument (stateid + offset + stable + data).
+    fn write_args(offset: u64, data: &[u8]) -> Vec<u8> {
+        let mut w = XdrWriter::new();
+        w.write_opaque_fixed(&[0u8; 16]); // stateid
+        w.write_u64(offset);
+        w.write_u32(2); // stable = FILE_SYNC (advisory only)
+        w.write_opaque(data);
+        w.into_bytes()
+    }
+
+    /// Build a COMMIT op argument (offset + count, advisory).
+    fn commit_args(offset: u64, count: u32) -> Vec<u8> {
+        let mut w = XdrWriter::new();
+        w.write_u64(offset);
+        w.write_u32(count);
+        w.into_bytes()
+    }
+
+    /// Build a READ op argument (stateid + offset + count).
+    fn read_args(offset: u64, count: u32) -> Vec<u8> {
+        let mut w = XdrWriter::new();
+        w.write_opaque_fixed(&[0u8; 16]);
+        w.write_u64(offset);
+        w.write_u32(count);
+        w.into_bytes()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_then_read_serves_from_buffer() {
+        // Pre-fix the DS replied NFS4ERR_NOTSUPP on WRITE; post-fix
+        // (ADR-038 rev 3 §D5) WRITE accumulates into the buffer and a
+        // subsequent READ at the same offset returns the buffered
+        // bytes — without going through gateway.read.
+        let (ctx, key) = make_ctx();
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+
+        // 1. WRITE 8 bytes at offset 0.
+        let write_args = write_args(0, b"DEADBEEF");
+        let mut r = XdrReader::new(&write_args);
+        let (st, _) = op_write_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+
+        // 2. READ 8 bytes at offset 0 — buffer has them.
+        let read_args = read_args(0, 8);
+        let mut r = XdrReader::new(&read_args);
+        let (st, reply) = op_read_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        // gateway.read MUST NOT have been called — buffer covered.
+        assert_eq!(ctx.gateway.reads.load(Ordering::SeqCst), 0);
+        // Decode the reply: op + status + eof + opaque.
+        let mut rd = XdrReader::new(&reply);
+        assert_eq!(rd.read_u32().unwrap(), op::READ);
+        assert_eq!(rd.read_u32().unwrap(), nfs4_status::NFS4_OK);
+        let _eof = rd.read_bool().unwrap();
+        assert_eq!(rd.read_opaque().unwrap(), b"DEADBEEF");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_drains_to_gateway_and_records_redirect() {
+        let (ctx, key) = make_ctx();
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let original_cid = fh.composition_id;
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+
+        // WRITE → COMMIT → assert gateway saw exactly one write.
+        let write_args = write_args(0, b"hello world");
+        let mut r = XdrReader::new(&write_args);
+        let (st, _) = op_write_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+
+        let commit = commit_args(0, 0);
+        let mut r = XdrReader::new(&commit);
+        let (st, _) = op_commit_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        assert_eq!(ctx.gateway.writes.load(Ordering::SeqCst), 1);
+
+        // Buffer is drained — total_bytes back to 0.
+        assert_eq!(ctx.write_buffers.total_bytes(), 0);
+
+        // Redirect recorded: original_cid → new composition (whatever
+        // TrackingGateway::write minted, write count = 1).
+        let resolved = ctx.write_buffers.resolve(original_cid);
+        assert_ne!(
+            resolved, original_cid,
+            "redirect must point at new composition"
+        );
+
+        // Subsequent READ on the OLD fh4 hits gateway.read (buffer is
+        // gone post-COMMIT) but with the resolved (new) composition_id.
+        // Verified via gateway counter increment.
+        let read = read_args(0, 11);
+        let mut r = XdrReader::new(&read);
+        let (st, _) = op_read_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        assert_eq!(ctx.gateway.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_past_buffer_cap_returns_nospc() {
+        // Force a tiny cap by overriding the buffers field — the
+        // env-var reads-once-per-process so we can't change it
+        // mid-test reliably, but the DsContext is ours to construct.
+        let (mut_ctx, key) = make_ctx();
+        // Replace write_buffers with an 8-byte cap.
+        let arc = Arc::new(crate::pnfs_write_buffer::DsWriteBuffers::with_cap(8));
+        // SAFETY: we created mut_ctx; tests are single-threaded
+        // wrt this Arc. Build a fresh DsContext with the small-cap
+        // buffer and re-wrap.
+        let small_ctx = Arc::new(DsContext {
+            gateway: Arc::clone(&mut_ctx.gateway),
+            mac_key: mut_ctx.mac_key.clone(),
+            stripe_size_bytes: mut_ctx.stripe_size_bytes,
+            rt: mut_ctx.rt.clone(),
+            now_ms: Arc::clone(&mut_ctx.now_ms),
+            mds_layout_manager: mut_ctx.mds_layout_manager.clone(),
+            write_buffers: arc,
+        });
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+
+        // Fill cap.
+        let args = write_args(0, b"AAAAAAAA"); // 8 bytes
+        let mut r = XdrReader::new(&args);
+        let (st, _) = op_write_ds(&mut r, &small_ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+
+        // Overflow.
+        let args = write_args(8, b"X");
+        let mut r = XdrReader::new(&args);
+        let (st, _) = op_write_ds(&mut r, &small_ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4ERR_NOSPC);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destroy_session_drops_unflushed_buffers() {
+        // ADR-038 §D5.1: no implicit flush on DESTROY_SESSION. Bytes
+        // written but not committed are lost — the kernel must COMMIT
+        // before tearing down if it wants durability.
+        let (ctx, key) = make_ctx();
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+
+        let args = write_args(0, b"unflushed");
+        let mut r = XdrReader::new(&args);
+        let (st, _) = op_write_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        assert_eq!(ctx.write_buffers.total_bytes(), 9);
+
+        // Simulate DESTROY_SESSION via the DS-side wrapper. The wrapper
+        // calls into nfs4_server::op_destroy_session (which handles
+        // session state) and then clears DS write buffers.
+        let mut destroy_args = XdrWriter::new();
+        destroy_args.write_opaque_fixed(&[0u8; 16]); // session_id
+        let bytes = destroy_args.into_bytes();
+        let session_mgr = SessionManager::new();
+        let mut r = XdrReader::new(&bytes);
+        let _ = op_destroy_session_ds(&mut r, &ctx, &session_mgr).await;
+
+        // Buffer is gone; gateway.write was NOT called (no implicit flush).
+        assert_eq!(ctx.write_buffers.total_bytes(), 0);
+        assert_eq!(ctx.gateway.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overlap_writes_last_write_wins_through_buffer() {
+        let (ctx, key) = make_ctx();
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+
+        // First WRITE: AAAAAAAAAA at offset 0.
+        let w1 = write_args(0, b"AAAAAAAAAA");
+        let mut r = XdrReader::new(&w1);
+        op_write_ds(&mut r, &ctx, &state).await;
+        // Second WRITE: BBBB at offset 4 (overwrites bytes 4-7).
+        let w2 = write_args(4, b"BBBB");
+        let mut r = XdrReader::new(&w2);
+        op_write_ds(&mut r, &ctx, &state).await;
+
+        // READ 10 bytes — buffer should serve AAAABBBBAA.
+        let rargs = read_args(0, 10);
+        let mut r = XdrReader::new(&rargs);
+        let (_, reply) = op_read_ds(&mut r, &ctx, &state).await;
+        let mut rd = XdrReader::new(&reply);
+        let _ = rd.read_u32().unwrap(); // op
+        let _ = rd.read_u32().unwrap(); // status
+        let _ = rd.read_bool().unwrap(); // eof
+        assert_eq!(rd.read_opaque().unwrap(), b"AAAABBBBAA");
     }
 }

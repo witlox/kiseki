@@ -61,6 +61,7 @@ fn build_ds_ctx(
         // scenarios override before this point.
         now_ms: fixed_clock(now_ms()),
         mds_layout_manager: world.pnfs.mds_mgr.clone(),
+        write_buffers: Arc::new(kiseki_gateway::pnfs_write_buffer::DsWriteBuffers::new()),
     })
 }
 

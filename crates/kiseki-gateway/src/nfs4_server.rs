@@ -94,6 +94,7 @@ pub mod nfs4_status {
     pub const NFS4_OK: u32 = 0;
     pub const NFS4ERR_NOENT: u32 = 2;
     pub const NFS4ERR_IO: u32 = 5;
+    pub const NFS4ERR_NOSPC: u32 = 28;
     pub const NFS4ERR_NOTSUPP: u32 = 10004;
     pub const NFS4ERR_BADHANDLE: u32 = 10001;
     pub const NFS4ERR_STALE_CLIENTID: u32 = 10012;
