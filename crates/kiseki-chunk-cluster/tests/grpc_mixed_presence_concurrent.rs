@@ -33,7 +33,9 @@ use tonic::transport::{Channel, Server, Uri};
 const ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
 const PRESENT_CHUNKS: usize = 8;
 const CONCURRENT_READS: usize = 64;
-const DEADLINE: Duration = Duration::from_secs(45);
+// Same CI-runner-headroom bump as grpc_concurrent_get_fragment.rs;
+// real hangs still bounded at 120 s.
+const DEADLINE: Duration = Duration::from_secs(120);
 
 fn local_bridge() -> Arc<dyn AsyncChunkOps> {
     let mut store = ChunkStore::new();

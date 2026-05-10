@@ -46,7 +46,11 @@ use tonic::transport::{Channel, Server, Uri};
 const ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
 const FRAGS_PER_PEER: usize = 8;
 const CONCURRENT_PER_PLACEMENT: usize = 24;
-const DEADLINE: Duration = Duration::from_secs(45);
+// 45s is enough on a 16-core laptop (~16 s observed); on 2-vCPU
+// CI runners the same workload measured 48 s, just over. Bump to
+// 120 s for the same headroom rationale as
+// grpc_concurrent_get_fragment.rs.
+const DEADLINE: Duration = Duration::from_secs(120);
 
 fn local_bridge(pool: &str, capacity: u64) -> Arc<dyn AsyncChunkOps> {
     let mut store = ChunkStore::new();

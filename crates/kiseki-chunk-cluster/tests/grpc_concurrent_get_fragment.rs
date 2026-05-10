@@ -59,10 +59,14 @@ const CONCURRENT_PER_PEER: usize = 32;
 
 /// Deadline after which we declare the fabric hung. A healthy 3-peer
 /// in-process fabric serves 96 × 64 MiB through the H2 stream
-/// machinery in ~1-3 s on a laptop. The 30 s ceiling is well above
-/// any healthy timing while still bounded so a regression doesn't
-/// hang the whole test runner.
-const DEADLINE: Duration = Duration::from_secs(30);
+/// machinery in ~10 s on a 16-core laptop. On shared 2-vCPU CI
+/// runners (GitHub Actions ubuntu-latest) the same workload runs in
+/// 30-50 s — scheduler pressure across 96 concurrent tasks + 6 GiB
+/// of crypto. The 120 s ceiling is well above any healthy timing
+/// (laptop or runner) while still bounded so a true hang regression
+/// (h2 stream stall, fabric deadlock) doesn't hang the whole test
+/// runner indefinitely.
+const DEADLINE: Duration = Duration::from_secs(120);
 
 fn local_bridge(pool: &str) -> Arc<dyn AsyncChunkOps> {
     let mut store = ChunkStore::new();
