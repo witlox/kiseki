@@ -4,7 +4,42 @@
 **From:** implementer (pnfs-ds-write Phase 3 perf gate)
 **To:** architect
 **Severity:** Phase 3 perf-gate not met. Phase 1 (DS WRITE) is correct in code; Phase 3.1 (WRITE-mode MDS-fallback removal) is correct in code; Phase 3.2 (compose env-var removal) reverted because the kernel-driven NFSv4.1 read path still hangs at 0.5 MB/s when layouts are advertised. The hang sits in the READ path, not WRITE.
-**Status:** Open. Phase 3.4 perf-gate failed; Phase 3.3 (BDD scenarios) deferred. **Diagnostic round 1 (2026-05-10) narrowed the hang but did not resolve it.** See "Diagnostic round 1 findings" below.
+**Status:** RESOLVED 2026-05-10. Diagnostic round 2 root-caused the 5 s `openat()` hang to two server bugs (see "Diagnostic round 2 — RESOLVED" below). With both fixes in place, pNFS layouts deliver **~225 MB/s first cold read** and **~800 MB/s warm read** through the DS port — first OPEN drops from 5+ s to ~35 ms.
+
+## Diagnostic round 2 — RESOLVED (2026-05-10)
+
+Two server-side bugs combined to produce the 5 s `openat()` stall:
+
+### Root cause 1 — OPEN stateid `seqid` was random (the dominant 5 s)
+
+`fs/nfs/nfs4proc.c:nfs_set_open_stateid_locked` waits up to `5*HZ` in `schedule_timeout(5*HZ)` when the client's `nfs_stateid_is_sequential(state, stateid)` returns false. For a brand-new stateid (new `other` field), that helper accepts the stateid **only if `stateid.seqid == cpu_to_be32(1)`** — otherwise it sleeps 5 s "to process state changes in order."
+
+We were minting open stateids via `Uuid::new_v4().as_bytes()`. The first 4 bytes of a v4 UUID are uniformly random — almost never `1`. Every fresh OPEN therefore parked the kernel in the 5 s wait.
+
+**Fix:** `SessionManager::open_file` now forces `bytes[0..4] = 1u32.to_be_bytes()` and keeps the random 12-byte `other` from the UUID. Wire-side this surfaces as `StateID seqid: 1`. The Linux client now accepts the stateid immediately and proceeds to GETDEVICEINFO + READ.
+
+### Root cause 2 — Legacy `OPEN_DELEGATE_NONE` is ambiguous in v4.1
+
+NFSv4.1 §10.4.2 added `OPEN_DELEGATE_NONE_EXT = 3` carrying an explicit `why_no_delegation4`. The legacy `OPEN_DELEGATE_NONE = 0` reads as "no delegation this time, but maybe later" — a v4.1 client may wait for a possible async grant. Switching to `OPEN_DELEGATE_NONE_EXT (3)` + `WND4_NOT_WANTED (0)` tells the kernel definitively "no callback coming, proceed."
+
+This wasn't the dominant 5 s symptom (root cause 1 was), but the legacy encoding is wrong for v4.1 regardless.
+
+### Round 1's NONE_EXT EIO red herring
+
+Round 1 attempted `OPEN_DELEGATE_NONE_EXT` but emitted the discriminator as **4**. RFC 8881 says NONE_EXT is **3**; **4** is `OPEN_DELEGATE_READ_ATTRS_DELEG` introduced by NFSv4.2 RFC 7862 §22.5.2.1, whose body is a stateid + ACE, not a `why_no_delegation4`. The kernel decoded our reply as the v4.2 variant, found the body missing, and returned EIO. The round 1 escalation incorrectly concluded the encoding was rejected on semantic grounds.
+
+### How round 2 unblocked round 1
+
+The "diagnostic round 2" tcpdump+tshark capture revealed the actual wire bytes; the dissector parsed our OPEN reply with `Delegation Type: OPEN_DELEGATE_NONE (0)` and **5.0-second wire silence** between OPEN-reply and the next compound. Wire silence ruled out framing/encoding causes and pointed to a kernel-side timer. Grepping `fs/nfs/nfs4proc.c` for `5*HZ` surfaced the `nfs_set_open_stateid_locked` site at line 1745. Reading the enclosing `nfs_stateid_is_sequential` helper showed the seqid=1 requirement for fresh stateids.
+
+### Verification
+
+- 564 `kiseki-gateway` unit + integration tests green (RFC 8881 §18.16 regression test added: `open_stateid_seqid_is_one_for_fresh_state`; existing `s18_16_4_open_reply_includes_cinfo_attrset_delegation` upgraded to assert `delegation_type == 3` and `why_no_delegation4 == 0`).
+- 3-node docker-compose with `KISEKI_DISABLE_PNFS_LAYOUT=0`, kernel v4.1 client, `cat` of 8 MiB files: first cold read 35 ms (≈ 225 MB/s); subsequent reads ~10 ms each (≈ 800 MB/s); zero hang.
+
+### Round 1 improvements that stay
+
+The DS dispatcher CB_NULL handler + PROG_MISMATCH version hints and DS-side per-compound trace logging from round 1 are kept — they're independently correct and useful for future debugging.
 
 ## Diagnostic round 1 findings (2026-05-10)
 

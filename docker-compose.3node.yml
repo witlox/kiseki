@@ -46,31 +46,20 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
-      # 2026-05-10: re-disabled after Phase 3 perf retest (commit
-      # 330b312 + DS WRITE landing). Phase 1 (DS WRITE chunk-staging
-      # buffer) works correctly in unit tests — but the Phase 3 perf
-      # re-run on the kernel NFSv4.1 client still hits the 0.5 MB/s
-      # read regression. The hang is in the READ path (post-OPEN, the
-      # kernel goes silent for ~5 s with no further compounds visible
-      # on the MDS connection — likely a layout / DS-port interaction
-      # not in the WRITE machinery we just wired). DS WRITE is now
-      # functional in code; the layout-side bug remains a separate
-      # investigation. Until that lands, compose stays on the MDS
-      # inline path (~600 MB/s reads) by setting this env var.
-      # TEMPORARILY OFF for read-hang diagnostic 2026-05-10. Re-set
-      # to "1" before merging if Phase 3 perf-gate still fails.
-      # 2026-05-10: re-disabled after Phase 3 perf retest + diagnostic.
-      # The diagnostic (escalation 2026-05-10-pnfs-read-hang-post-ds-write)
-      # narrowed the hang from "kernel goes silent" to "openat() blocks
-      # 5 s while reads are sub-ms"; CB_NULL on the DS dispatcher and
-      # the bytes-mismatched OPEN_DELEGATE_NONE_EXT attempt addressed
-      # framing-side / encoding-side hypotheses without resolving the
-      # 5 s OPEN delay. Likely root cause is upstream of `delegation`
-      # in the OPEN reply (rflags / attrset / cinfo) or a deeper kernel
-      # back-channel expectation. Until that's diagnosed, MDS-inline
-      # NFSv4.1 (~600 MB/s reads, ~1.6 GB/s writes) is the production
-      # baseline.
-      KISEKI_DISABLE_PNFS_LAYOUT: "1"
+      # pNFS layouts ON. Round 2 diagnostic (2026-05-10) root-caused
+      # the 5 s post-OPEN hang to two server bugs:
+      #   1. OPEN stateids were minted from random UUID bytes — the
+      #      first 4 bytes (seqid) were rarely 1, so Linux's
+      #      `nfs_stateid_is_sequential` waited 5*HZ in
+      #      `schedule_timeout` for state changes to settle.
+      #      Fix: seqid=1 for fresh stateids.
+      #   2. Legacy OPEN_DELEGATE_NONE (0) is ambiguous in v4.1
+      #      ("might delegate later"). Switched to
+      #      OPEN_DELEGATE_NONE_EXT (3) + WND4_NOT_WANTED so the kernel
+      #      knows no callback is coming.
+      # With both fixes: first read ~35 ms, subsequent reads ~10 ms
+      # (≈ 800 MB/s) via flex-files layout to the DS port (2052).
+      KISEKI_DISABLE_PNFS_LAYOUT: "0"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node1-data:/data
@@ -107,31 +96,20 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
-      # 2026-05-10: re-disabled after Phase 3 perf retest (commit
-      # 330b312 + DS WRITE landing). Phase 1 (DS WRITE chunk-staging
-      # buffer) works correctly in unit tests — but the Phase 3 perf
-      # re-run on the kernel NFSv4.1 client still hits the 0.5 MB/s
-      # read regression. The hang is in the READ path (post-OPEN, the
-      # kernel goes silent for ~5 s with no further compounds visible
-      # on the MDS connection — likely a layout / DS-port interaction
-      # not in the WRITE machinery we just wired). DS WRITE is now
-      # functional in code; the layout-side bug remains a separate
-      # investigation. Until that lands, compose stays on the MDS
-      # inline path (~600 MB/s reads) by setting this env var.
-      # TEMPORARILY OFF for read-hang diagnostic 2026-05-10. Re-set
-      # to "1" before merging if Phase 3 perf-gate still fails.
-      # 2026-05-10: re-disabled after Phase 3 perf retest + diagnostic.
-      # The diagnostic (escalation 2026-05-10-pnfs-read-hang-post-ds-write)
-      # narrowed the hang from "kernel goes silent" to "openat() blocks
-      # 5 s while reads are sub-ms"; CB_NULL on the DS dispatcher and
-      # the bytes-mismatched OPEN_DELEGATE_NONE_EXT attempt addressed
-      # framing-side / encoding-side hypotheses without resolving the
-      # 5 s OPEN delay. Likely root cause is upstream of `delegation`
-      # in the OPEN reply (rflags / attrset / cinfo) or a deeper kernel
-      # back-channel expectation. Until that's diagnosed, MDS-inline
-      # NFSv4.1 (~600 MB/s reads, ~1.6 GB/s writes) is the production
-      # baseline.
-      KISEKI_DISABLE_PNFS_LAYOUT: "1"
+      # pNFS layouts ON. Round 2 diagnostic (2026-05-10) root-caused
+      # the 5 s post-OPEN hang to two server bugs:
+      #   1. OPEN stateids were minted from random UUID bytes — the
+      #      first 4 bytes (seqid) were rarely 1, so Linux's
+      #      `nfs_stateid_is_sequential` waited 5*HZ in
+      #      `schedule_timeout` for state changes to settle.
+      #      Fix: seqid=1 for fresh stateids.
+      #   2. Legacy OPEN_DELEGATE_NONE (0) is ambiguous in v4.1
+      #      ("might delegate later"). Switched to
+      #      OPEN_DELEGATE_NONE_EXT (3) + WND4_NOT_WANTED so the kernel
+      #      knows no callback is coming.
+      # With both fixes: first read ~35 ms, subsequent reads ~10 ms
+      # (≈ 800 MB/s) via flex-files layout to the DS port (2052).
+      KISEKI_DISABLE_PNFS_LAYOUT: "0"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node2-data:/data
@@ -168,31 +146,20 @@ services:
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
-      # 2026-05-10: re-disabled after Phase 3 perf retest (commit
-      # 330b312 + DS WRITE landing). Phase 1 (DS WRITE chunk-staging
-      # buffer) works correctly in unit tests — but the Phase 3 perf
-      # re-run on the kernel NFSv4.1 client still hits the 0.5 MB/s
-      # read regression. The hang is in the READ path (post-OPEN, the
-      # kernel goes silent for ~5 s with no further compounds visible
-      # on the MDS connection — likely a layout / DS-port interaction
-      # not in the WRITE machinery we just wired). DS WRITE is now
-      # functional in code; the layout-side bug remains a separate
-      # investigation. Until that lands, compose stays on the MDS
-      # inline path (~600 MB/s reads) by setting this env var.
-      # TEMPORARILY OFF for read-hang diagnostic 2026-05-10. Re-set
-      # to "1" before merging if Phase 3 perf-gate still fails.
-      # 2026-05-10: re-disabled after Phase 3 perf retest + diagnostic.
-      # The diagnostic (escalation 2026-05-10-pnfs-read-hang-post-ds-write)
-      # narrowed the hang from "kernel goes silent" to "openat() blocks
-      # 5 s while reads are sub-ms"; CB_NULL on the DS dispatcher and
-      # the bytes-mismatched OPEN_DELEGATE_NONE_EXT attempt addressed
-      # framing-side / encoding-side hypotheses without resolving the
-      # 5 s OPEN delay. Likely root cause is upstream of `delegation`
-      # in the OPEN reply (rflags / attrset / cinfo) or a deeper kernel
-      # back-channel expectation. Until that's diagnosed, MDS-inline
-      # NFSv4.1 (~600 MB/s reads, ~1.6 GB/s writes) is the production
-      # baseline.
-      KISEKI_DISABLE_PNFS_LAYOUT: "1"
+      # pNFS layouts ON. Round 2 diagnostic (2026-05-10) root-caused
+      # the 5 s post-OPEN hang to two server bugs:
+      #   1. OPEN stateids were minted from random UUID bytes — the
+      #      first 4 bytes (seqid) were rarely 1, so Linux's
+      #      `nfs_stateid_is_sequential` waited 5*HZ in
+      #      `schedule_timeout` for state changes to settle.
+      #      Fix: seqid=1 for fresh stateids.
+      #   2. Legacy OPEN_DELEGATE_NONE (0) is ambiguous in v4.1
+      #      ("might delegate later"). Switched to
+      #      OPEN_DELEGATE_NONE_EXT (3) + WND4_NOT_WANTED so the kernel
+      #      knows no callback is coming.
+      # With both fixes: first read ~35 ms, subsequent reads ~10 ms
+      # (≈ 800 MB/s) via flex-files layout to the DS port (2052).
+      KISEKI_DISABLE_PNFS_LAYOUT: "0"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node3-data:/data

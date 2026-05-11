@@ -2112,12 +2112,84 @@ async fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
         let _ = r.read_u32().unwrap();
     }
     // open_delegation4: 4-byte discriminator (open_delegation_type4).
-    // OPEN_DELEGATE_NONE = 0 has empty body; that's the kiseki path.
+    // The kiseki path emits OPEN_DELEGATE_NONE_EXT (3) — see
+    // `open_stateid_seqid_is_one_for_fresh_state` for the related
+    // 2026-05-10 fix. NONE_EXT carries a `why_no_delegation4` body;
+    // WND4_NOT_WANTED (0) for the default case (no callback).
     let deleg_type = r.read_u32().unwrap();
-    assert!(
-        deleg_type <= 4,
-        "RFC 8881 §9.1.2: open_delegation_type4 ∈ {{0..4}}; got \
-         {deleg_type} — parser is misaligned"
+    assert_eq!(
+        deleg_type, 3,
+        "RFC 8881 §10.4.2: kiseki MUST emit OPEN_DELEGATE_NONE_EXT (=3) \
+         so v4.1 clients don't stall in nfs_stateid_is_sequential's \
+         5*HZ wait for a delegation callback that never comes"
+    );
+    let why = r.read_u32().unwrap();
+    assert_eq!(
+        why, 0,
+        "RFC 8881 §10.4.2 why_no_delegation4: kiseki uses WND4_NOT_WANTED (0); got {why}"
+    );
+}
+
+/// Regression — RFC 8881 §8.2.2 + Linux kernel `nfs_stateid_is_sequential`
+/// (`fs/nfs/nfs4proc.c`): a brand-new OPEN stateid (new `other`) is
+/// only accepted by the v4.1 client without a 5-second
+/// `schedule_timeout(5*HZ)` wait when the seqid is **1**. Pre-fix the
+/// server returned random UUID bytes (random seqid) and every fresh
+/// OPEN stalled 5 s on the client — observed via tcpdump as a
+/// wire-silent gap between OPEN reply and the first READ. Diagnostic
+/// round 2, 2026-05-10.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_stateid_seqid_is_one_for_fresh_state() {
+    let ctx = make_ctx();
+    let sessions = SessionManager::new();
+
+    let comp_id = ctx
+        .gateway
+        .write(kiseki_gateway::nfs::NfsWriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: b"open-fixture".to_vec(),
+        })
+        .await
+        .expect("seed write")
+        .composition_id;
+    let name = comp_id.0.to_string();
+
+    let body = encode_compound(b"", NFS4_MINOR_VERSION_1, 3, |w| {
+        w.write_u32(v4op::PUTROOTFH);
+        w.write_u32(v4op::LOOKUP);
+        w.write_string("default");
+        w.write_u32(v4op::OPEN);
+        w.write_u32(0); // seqid
+        w.write_u32(1); // share_access = READ
+        w.write_u32(0); // share_deny = NONE
+        w.write_u64(1); // clientid
+        w.write_opaque(b"owner"); // owner
+        w.write_u32(0); // OPEN4_NOCREATE
+        w.write_u32(0); // open_claim4 = CLAIM_NULL
+        w.write_string(&name); // component4 file
+    });
+    let header = make_header(0xFAFA, PROC_COMPOUND);
+    let raw = build_nfs4_call(0xFAFA, PROC_COMPOUND, &body);
+    let reply = handle_nfs4_first_compound(&header, &raw, &ctx, &sessions).await;
+
+    let mut r = reader_at_compound_result(&reply);
+    let _cs = r.read_u32();
+    let _tag = r.read_opaque().unwrap();
+    let _ra = r.read_u32();
+    let _ = r.read_u32(); // PUTROOTFH op
+    let _ = r.read_u32(); // PUTROOTFH status
+    let _ = r.read_u32(); // LOOKUP op
+    let _ = r.read_u32(); // LOOKUP status
+    let _ = r.read_u32(); // OPEN op
+    let st = r.read_u32().unwrap();
+    assert_eq!(st, nfs4_status::NFS4_OK);
+    let stateid = r.read_opaque_fixed(16).unwrap();
+    let seqid = u32::from_be_bytes(stateid[0..4].try_into().unwrap());
+    assert_eq!(
+        seqid, 1,
+        "fresh OPEN stateid MUST have seqid=1; got {seqid:#x} \
+         (Linux client waits 5*HZ in nfs_stateid_is_sequential)"
     );
 }
 

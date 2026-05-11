@@ -163,7 +163,17 @@ impl SessionManager {
     }
 
     pub fn open_file(&self, fh: FileHandle) -> StateId {
-        let sid = StateId(*uuid::Uuid::new_v4().as_bytes());
+        // RFC 8881 §8.2.2 + Linux kernel `nfs_stateid_is_sequential`:
+        // a brand-new stateid (new `other` field) is only accepted by
+        // the client without a 5-second `schedule_timeout(5*HZ)` wait
+        // when the seqid is 1. Random UUID bytes give random seqids,
+        // which the kernel reads as "out of sequence" and stalls on.
+        // Diagnostic round 2 (2026-05-10): linux v6.x `fs/nfs/nfs4proc.c`
+        // line 1745 confirmed via source read.
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&1u32.to_be_bytes());
+        bytes[4..16].copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[4..16]);
+        let sid = StateId(bytes);
         self.open_files
             .lock()
             .lock_or_die("nfs4_server.unknown")
@@ -1816,17 +1826,40 @@ async fn op_open<G: GatewayOps>(
         // attrset (bitmap4): empty — server didn't set any attrs as
         // part of the OPEN. Encoded as `count=0` (no words).
         w.write_u32(0);
-        // open_delegation4: OPEN_DELEGATE_NONE = 0 has an empty body
-        // per §9.1.2 (no per-type fields after the discriminator).
-        // 2026-05-10: tried bumping to OPEN_DELEGATE_NONE_EXT (4) +
-        // WND4_NOT_WANTED to address the Linux 6.x 5-second OPEN-syscall
-        // hang on pNFS mounts. Kernel rejected the reply with Remote
-        // I/O error — the encoding was correct per RFC 8881 §10.4.2 but
-        // some other field upstream of `delegation` may be the actual
-        // mismatch. Reverted; root cause stays open in
-        // `specs/escalations/2026-05-10-pnfs-read-hang-post-ds-write.md`.
-        const OPEN_DELEGATE_NONE: u32 = 0;
-        w.write_u32(OPEN_DELEGATE_NONE);
+        // open_delegation4 — RFC 8881 §10.4.2 + §18.16.4.
+        //
+        // NFSv4.1 added OPEN_DELEGATE_NONE_EXT (=4) with a `why_no_delegation4`
+        // reason after the discriminator. The legacy OPEN_DELEGATE_NONE (=0)
+        // is ambiguous in NFSv4.1 — the kernel does not know whether the
+        // server "will never delegate" or "would have but chose not to,"
+        // so on pNFS mounts the Linux 6.x client waits ~5 seconds after
+        // the OPEN reply before doing the first GETDEVICEINFO/READ to give
+        // a possible asynchronous delegation callback time to arrive.
+        // Diagnostic round 2 (2026-05-10) confirmed via tcpdump that the
+        // 5.5 s gap is wire-silent on both directions — purely client-side.
+        //
+        // Switching to OPEN_DELEGATE_NONE_EXT + WND4_NOT_WANTED tells the
+        // kernel definitively "no delegation, no callback coming" so it
+        // can proceed immediately. Body for the WND4_NOT_WANTED case is
+        // void per §10.4.2 (only WND4_CONTENTION/WND4_RESOURCE carry a
+        // bool body). Total OPEN body grows by 4 bytes (the why_no_delegation4
+        // word).
+        // RFC 8881 §3 enum open_delegation_type4:
+        //   0 = OPEN_DELEGATE_NONE
+        //   1 = OPEN_DELEGATE_READ
+        //   2 = OPEN_DELEGATE_WRITE
+        //   3 = OPEN_DELEGATE_NONE_EXT  (new to v4.1)
+        // RFC 7862 §22 (NFSv4.2) extends:
+        //   4 = OPEN_DELEGATE_READ_ATTRS_DELEG
+        //   5 = OPEN_DELEGATE_WRITE_ATTRS_DELEG
+        // Diagnostic round 2 first attempt used 4 — the kernel parsed
+        // it as READ_ATTRS_DELEG (v4.2) and decode-failed because no
+        // body was present. The correct NFSv4.1 NONE_EXT discriminator
+        // is 3.
+        const OPEN_DELEGATE_NONE_EXT: u32 = 3;
+        const WND4_NOT_WANTED: u32 = 0;
+        w.write_u32(OPEN_DELEGATE_NONE_EXT);
+        w.write_u32(WND4_NOT_WANTED);
     };
 
     let status = if open_type == 1 {
