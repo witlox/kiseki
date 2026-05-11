@@ -599,8 +599,26 @@ async fn op_write_ds<G: GatewayOps + Send + Sync + 'static>(
             let count = data.len() as u32;
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_u32(count);
-            w.write_u32(2); // committed = FILE_SYNC (we hold in our buffer; durability via COMMIT)
-            w.write_opaque_fixed(&[0u8; 8]); // writeverf4 — fixed verifier (we never restart server-side)
+            // RFC 8881 §18.32.5 stable_how4:
+            //   0 = UNSTABLE4 — server may not have committed yet
+            //   1 = DATA_SYNC4 — server has committed data
+            //   2 = FILE_SYNC4 — server has committed data + metadata
+            // Pre-fix returned 2 (FILE_SYNC) unconditionally — a lie:
+            // we only staged the bytes in the per-composition buffer,
+            // nothing reached the underlying gateway/storage. Linux
+            // 6.x reads `committed=FILE_SYNC` as "no need to COMMIT,
+            // already durable" and proceeds straight to
+            // DESTROY_SESSION on file close. Our DESTROY_SESSION
+            // handler then drops the buffer per ADR-038 §D5 (no
+            // implicit flush), and the WRITE is silently lost.
+            //
+            // Replying UNSTABLE forces the client to issue COMMIT
+            // before destroying the session for durability — that's
+            // the contract the chunk-staging buffer's "COMMIT drains
+            // via gateway.write" semantics require. Verified via
+            // tcpdump 2026-05-10 round 2 follow-up.
+            w.write_u32(0); // committed = UNSTABLE4
+            w.write_opaque_fixed(&[0u8; 8]); // writeverf4 — fixed; we never restart server-side
             (nfs4_status::NFS4_OK, w.into_bytes())
         }
         BufferWriteResult::Nospc {

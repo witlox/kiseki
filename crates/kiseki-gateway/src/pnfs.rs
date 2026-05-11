@@ -781,11 +781,22 @@ impl MdsLayoutManager {
             });
         }
 
-        // Stateid carries (composition_id_low8 || issued_at_ms_be8).
+        // Layout stateid wire shape: seqid(4) || other(12).
+        //   seqid = 1   — see `SessionManager::open_file` for the kernel-side
+        //                 `nfs_stateid_is_sequential` invariant. Layout
+        //                 stateids go through a different client codepath
+        //                 (`nfs4_stateid_is_newer`) that doesn't strictly
+        //                 require seqid==1, but emitting 1 matches the OPEN
+        //                 path and keeps wire dumps unambiguous.
+        //   other = composition_id_low11 (11 bytes) || issued_at_ms_low1 (1 byte)
+        //           — kept as the historical layout fingerprint; only the
+        //           leading 4 bytes of the slot changed.
         let mut stateid = [0u8; 16];
+        stateid[..4].copy_from_slice(&1u32.to_be_bytes());
         let comp_bytes = composition_id.0.as_bytes();
-        stateid[..8].copy_from_slice(&comp_bytes[..8]);
-        stateid[8..].copy_from_slice(&now_ms.to_be_bytes());
+        stateid[4..12].copy_from_slice(&comp_bytes[..8]);
+        let now_ms_bytes = now_ms.to_be_bytes();
+        stateid[12..16].copy_from_slice(&now_ms_bytes[4..8]);
 
         let layout = ServerLayout {
             composition_id,

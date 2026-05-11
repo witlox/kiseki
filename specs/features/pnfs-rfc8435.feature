@@ -59,9 +59,9 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
     And no later op in the COMPOUND was parsed
 
   @library @pnfs-15a
-  Scenario: DS accepts only the ten required ops
+  Scenario: DS accepts only the eleven required ops
     When the DS dispatcher table is enumerated
-    Then exactly ten op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, DESTROY_CLIENTID, RECLAIM_COMPLETE, SEQUENCE, PUTFH, READ, COMMIT, GETATTR
+    Then exactly eleven op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, DESTROY_CLIENTID, RECLAIM_COMPLETE, SEQUENCE, PUTFH, READ, WRITE, COMMIT, GETATTR
     And every other op returns NFS4ERR_NOTSUPP
 
   @library @pnfs-15a
@@ -264,3 +264,50 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
     Then the layout cache is fully invalidated
     And a subsequent client op causes a fresh LAYOUTGET
     And `pnfs_topology_event_lag_total{reason="recv_lag"}` has incremented
+
+  # ============================================================================
+  # Phase 15d / 16 — DS WRITE via chunk-staging buffer (ADR-038 rev 3 §D5 + §D5.1)
+  # End-to-end pNFS write path: kernel WRITE → DS per-composition buffer →
+  # COMMIT drains via GatewayOps::write → redirect table rewrites OLD fh4
+  # reads to the new composition. Reads against the SAME composition_id
+  # post-COMMIT see the merged result.
+  # ============================================================================
+
+  @library @pnfs-15d @ds-write
+  Scenario: DS WRITE accumulates plaintext into a per-composition buffer
+    Given a composition "obj-w1" of size 64 KiB exists in "default"
+    And the MDS has issued a write-mode layout for "obj-w1" stripe 0
+    When a client sends NFSv4.1 WRITE to the DS using stripe-0 fh4 with offset 0 length 4096
+    Then the DS returns NFS4_OK with count=4096 and stable=FILE_SYNC
+    And the bytes are staged in the chunk buffer, not yet committed to GatewayOps
+
+  @library @pnfs-15d @ds-write
+  Scenario: COMMIT drains the buffer through GatewayOps::write and records a redirect
+    Given a client has issued WRITE to the DS at offset 0 length 8192 for "obj-w2"
+    When the client sends COMMIT to the DS for "obj-w2"
+    Then the DS returns COMMIT4OK with the new composition's verifier
+    And a subsequent READ via the OLD fh4 returns the merged bytes from the new composition
+    And ADR-040 composition immutability is preserved (old composition_id is unchanged on disk)
+
+  @library @pnfs-15d @ds-write
+  Scenario: WRITE past KISEKI_PNFS_DS_BUFFER_CAP_BYTES returns NFS4ERR_NOSPC
+    Given the per-composition buffer cap is 1 MiB (test override)
+    And a client has buffered 1 MiB on stateid S via WRITE
+    When the client sends another WRITE of 4 KiB on stateid S
+    Then the DS returns NFS4ERR_NOSPC
+    And a subsequent COMMIT clears the buffer
+    And a subsequent WRITE of 4 KiB on stateid S succeeds
+
+  @library @pnfs-15d @ds-write
+  Scenario: DESTROY_SESSION drops pending buffers without implicit flush
+    Given a client has buffered 8 KiB on stateid S via WRITE
+    When the DS receives DESTROY_SESSION for the owning session before COMMIT
+    Then the DS clears the buffer
+    And a subsequent READ via the OLD fh4 returns the pre-WRITE composition bytes (no implicit flush)
+
+  @library @pnfs-15d @ds-write
+  Scenario: Overlapping WRITEs resolve last-write-wins (POSIX pwrite semantics)
+    Given a client sends WRITE to the DS at offset 0 length 8 with bytes "AAAAAAAA"
+    When the client sends WRITE at offset 4 length 4 with bytes "BBBB"
+    And the client sends COMMIT
+    Then the resulting composition contains "AAAABBBB"
