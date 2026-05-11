@@ -16,6 +16,9 @@
 dhat-heap.json
 /tmp/kiseki-prof/
 
+# Local diagnostic pcaps (tcpdump dumps from in-cluster netshoot sidecars)
+.local-pcap/
+
 # Go
 /control/vendor/
 
