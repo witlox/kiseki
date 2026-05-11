@@ -157,9 +157,9 @@ def test_fuse_write_read_roundtrip(fuse_client_image: str) -> None:
 set -uo pipefail
 MNT=/mnt/kiseki
 mkdir -p "$MNT"
-# Spawn the FUSE daemon in the background. --endpoint is required
-# by argv but ignored by the in-memory backend.
-kiseki-client mount --endpoint 127.0.0.1:9100 --mountpoint "$MNT" --cache-mode bypass --read-write &
+# Spawn the FUSE daemon against the in-process sandbox. The roundtrip
+# only exercises kernel ↔ FUSE plumbing — no real gateway needed.
+kiseki-client mount --in-memory --mountpoint "$MNT" --cache-mode bypass --read-write &
 DAEMON_PID=$!
 trap 'fusermount3 -u "$MNT" 2>/dev/null || true; kill $DAEMON_PID 2>/dev/null || true' EXIT
 

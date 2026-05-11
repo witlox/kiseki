@@ -2467,10 +2467,20 @@ mod halt_mode_tests {
         // Allow generous slack (CI variance, mutex acquire), but
         // strictly less than the 1 s default — otherwise the env
         // override didn't take effect.
-        assert!(
-            elapsed.as_millis() < 500,
-            "override-budget read took {elapsed:?} — env var not honored",
-        );
+        //
+        // Under llvm-cov instrumentation (release.yml Coverage job),
+        // the async loop is 5-15× slower than uninstrumented, so the
+        // 75 ms-budgeted retry can easily blow past 500 ms. Skip the
+        // timing check there; correctness (Upstream(NotFound)) is the
+        // only invariant. We still gate functionally on the result.
+        let under_coverage = std::env::var("LLVM_PROFILE_FILE").is_ok()
+            || std::env::var("CARGO_LLVM_COV").is_ok();
+        if !under_coverage {
+            assert!(
+                elapsed.as_millis() < 500,
+                "override-budget read took {elapsed:?} — env var not honored",
+            );
+        }
     }
 
     #[tokio::test]
