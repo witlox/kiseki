@@ -50,7 +50,8 @@ All architectural decisions are recorded as ADRs in
 | [ADR-039](adr/039-flex-files-mirror-list-encoding.md) | Flexible Files Layout — Mirror-List Encoding | Accepted |
 | [ADR-040](adr/040-persistent-metadata-stores.md) | Persistent Metadata Stores (CompositionStore, ViewStore) | Accepted |
 | [ADR-041](adr/041-raft-transport-shard-multiplexing.md) | Raft Transport — Shard Multiplexing on a Single Node Port | Accepted |
-| [ADR-042](adr/042-native-gateway-data-service.md) | Native Gateway Data Service — gRPC data-plane for native clients | Proposed |
+| [ADR-042](adr/042-native-gateway-data-service.md) | Native Gateway Data Service — gRPC data-plane for native clients | Accepted |
+| [ADR-043](adr/043-system-library-ffi.md) | System Library FFI Policy (libfuse 3.x adoption) | Proposed |
 
 ---
 
@@ -135,3 +136,6 @@ What else was evaluated and why it was rejected.
 
 ### Testing
 - ADR-037: Test infrastructure — Raft harness and subsystem trait boundaries
+
+### Build and packaging
+- ADR-043: System library FFI policy (libfuse 3.x adoption rules)

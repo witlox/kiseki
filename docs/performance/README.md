@@ -7,6 +7,13 @@ multi-node 3-node matrix in commit `da45687`). Earlier snapshots
 below. Detailed per-snapshot data lives in
 [`specs/performance/`](../../specs/performance/INDEX.md).
 
+The 2026-05-10/11 pNFS NFSv4.1 fixes (5-second OPEN hang →
+800+ MB/s reads in commit `d7d90a5`; DS WRITE silent-data-loss
+→ correct UNSTABLE/COMMIT round-trip in `6ff8e65`) do not affect
+the local-matrix numbers below — those drive the in-process
+gateways directly and never enter the NFSv4.1 wire path. A
+remote-NFS multi-node re-measurement is pending.
+
 > Operators tuning a deployment for throughput should also read
 > [`docs/operations/durability.md`](../operations/durability.md) —
 > the group-commit flags described below trade durability for

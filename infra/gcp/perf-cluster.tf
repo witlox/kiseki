@@ -75,7 +75,10 @@ variable "profile" {
                     2 × c3-standard-44 plain CPU clients. No GPU, no
                     cuFile path. Cheaper than `transport` (~$15/hr vs
                     ~$25/hr) for ad-hoc 3+2 perf runs. Same client
-                    image + setup script as `transport`.
+                    image + setup script as `transport`. Runs the full
+                    `perf-suite.sh` matrix (S3 + NFSv4 + pNFS + FUSE);
+                    on 2 clients (vs `default`'s 3) the pNFS aggregate
+                    falls back to a 2-client fan-out.
   EOT
   type        = string
   default     = "default"
@@ -154,7 +157,7 @@ locals {
       client_gpu         = false
       client_image       = "rocky-linux-cloud/rocky-linux-9"
       client_setup       = "setup-perf-client.sh"
-      bench_suite        = "perf-suite-transport.sh" # same suite — protocol matrix
+      bench_suite        = "perf-suite.sh" # full protocol matrix (S3 + NFSv4 + pNFS + FUSE)
     }
   }
 

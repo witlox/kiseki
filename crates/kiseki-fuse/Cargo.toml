@@ -12,7 +12,7 @@ publish = false
 workspace = true
 
 [dependencies]
-kiseki-fuse-sys = { path = "../kiseki-fuse-sys", version = "2026.41.0" }
+kiseki-fuse-sys = { path = "../kiseki-fuse-sys", version = "2026.43.0" }
 
 # Async bridge between the libfuse C session thread and tokio handlers
 # (I-FUSE-3): tokio's oneshot is the right shape (exact send-once,

@@ -321,13 +321,18 @@ export KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
 export KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 export KISEKI_OBSERVABILITY=off
 
-# Until pNFS DS supports WRITE + persistent sessions, kernel pNFS
-# clients pay per-file EXCHANGE_ID/CREATE_SESSION/RECLAIM_COMPLETE
-# overhead per OPEN — capping NFSv4.1 seq-read at ~0.5 MB/s in the
-# multi-node compose harness. Disabling layouts makes NFSv4 fall
-# back to the MDS metadata-stream READ/WRITE path (~182 MB/s on the
-# same workload). Not a durability knob — see `performance.md`.
-export KISEKI_DISABLE_PNFS_LAYOUT=true
+# pNFS layouts are now ON by default. The earlier 0.5 MB/s pNFS
+# read regression was a server bug (fresh OPEN stateid seqid=0 +
+# OPEN_DELEGATE_NONE_EXT mis-encoded as v4.2 instead of v4.1)
+# resolved in commit `d7d90a5` (2026-05-10) — multi-node compose
+# now reads at 800+ MB/s. DS WRITE fix in `6ff8e65` plugged the
+# matching silent-data-loss bug (replied UNSTABLE so the kernel
+# COMMITs before DESTROY_SESSION).
+#
+# Leave KISEKI_DISABLE_PNFS_LAYOUT unset (or "0") for normal use.
+# Set to "1" only if you need to force the MDS metadata-stream
+# fallback for A/B testing or pNFS debugging.
+# export KISEKI_DISABLE_PNFS_LAYOUT=1
 ```
 
 ### Single-node FUSE benchmark
