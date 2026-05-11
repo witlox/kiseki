@@ -62,7 +62,11 @@ jobs:
       - name: Build kiseki-server (release — for full BDD @slow scenarios)
         run: cargo build --locked --release -p kiseki-server
       - name: Tier 2 — full BDD suite (slow-tests feature on)
-        run: cargo nextest run --profile bdd --features kiseki-acceptance/slow-tests --locked -p kiseki-acceptance
+        # `cargo test` not `nextest run` — kiseki-acceptance is
+        # `harness = false` with a cucumber clap CLI that rejects
+        # nextest's `--list --format terse` probe (commit e2d5de4).
+        # bdd.yml uses the same form.
+        run: cargo test --locked --features kiseki-acceptance/slow-tests -p kiseki-acceptance --test acceptance --release
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # ---------------------------------------------------------------------------
