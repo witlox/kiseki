@@ -377,7 +377,7 @@ impl ReplyData {
             // `bytes.len()` bytes; libfuse copies.
             #[allow(clippy::cast_possible_wrap)]
             unsafe {
-                sys::fuse_reply_buf(req, bytes.as_ptr().cast::<i8>(), bytes.len());
+                sys::fuse_reply_buf(req, bytes.as_ptr().cast::<core::ffi::c_char>(), bytes.len());
             }
         }
     }
@@ -580,7 +580,7 @@ impl ReplyDirectory {
         let n = unsafe {
             sys::fuse_add_direntry(
                 req,
-                tmp.as_mut_ptr().cast::<i8>(),
+                tmp.as_mut_ptr().cast::<core::ffi::c_char>(),
                 remaining,
                 cname.as_ptr(),
                 &st,
@@ -603,7 +603,11 @@ impl ReplyDirectory {
             // SAFETY: buffer is valid for the call; libfuse copies.
             #[allow(clippy::cast_possible_wrap)]
             unsafe {
-                sys::fuse_reply_buf(req, self.buf.as_ptr().cast::<i8>(), self.buf.len());
+                sys::fuse_reply_buf(
+                    req,
+                    self.buf.as_ptr().cast::<core::ffi::c_char>(),
+                    self.buf.len(),
+                );
             }
         }
     }
@@ -841,8 +845,10 @@ fn file_attr_to_stat(attr: &FileAttr) -> sys::stat {
     st.st_ino = attr.ino;
     st.st_size = attr.size as i64;
     st.st_blocks = attr.blocks as i64;
-    st.st_blksize = attr.blksize as i64;
-    st.st_nlink = u64::from(attr.nlink);
+    // st_blksize and st_nlink widen/narrow per arch: x86_64 = i64/u64,
+    // aarch64 = i32/u32. Use `as _` so rustc picks the right width.
+    st.st_blksize = attr.blksize as _;
+    st.st_nlink = attr.nlink as _;
     st.st_mode = attr.kind.to_mode_bits() | u32::from(attr.perm);
     st.st_uid = attr.uid;
     st.st_gid = attr.gid;
@@ -1009,7 +1015,7 @@ impl_reply_token!(ReplyData, Vec<u8>, |req, bytes| {
     #[allow(clippy::cast_possible_wrap)]
     // SAFETY: see ReplyData::data — bytes valid for call duration.
     unsafe {
-        sys::fuse_reply_buf(req, bytes.as_ptr().cast::<i8>(), bytes.len());
+        sys::fuse_reply_buf(req, bytes.as_ptr().cast::<core::ffi::c_char>(), bytes.len());
     }
 });
 
