@@ -2473,8 +2473,8 @@ mod halt_mode_tests {
         // 75 ms-budgeted retry can easily blow past 500 ms. Skip the
         // timing check there; correctness (Upstream(NotFound)) is the
         // only invariant. We still gate functionally on the result.
-        let under_coverage = std::env::var("LLVM_PROFILE_FILE").is_ok()
-            || std::env::var("CARGO_LLVM_COV").is_ok();
+        let under_coverage =
+            std::env::var("LLVM_PROFILE_FILE").is_ok() || std::env::var("CARGO_LLVM_COV").is_ok();
         if !under_coverage {
             assert!(
                 elapsed.as_millis() < 500,
