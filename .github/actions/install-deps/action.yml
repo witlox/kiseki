@@ -1,0 +1,35 @@
+name: Install system deps
+description: |
+  Install apt packages with a transient-failure retry loop. GitHub's
+  Azure-hosted runners occasionally hand out a mirror that hangs
+  `apt-get update` indefinitely (observed 2026-05-12: Preflight job
+  stuck >1h on a single apt-get). The Acquire::http::Timeout below
+  caps each download attempt; the outer for-loop retries the whole
+  update+install on transient failure.
+
+inputs:
+  packages:
+    description: Space-separated apt packages to install.
+    required: false
+    default: protobuf-compiler libfuse3-dev libclang-dev
+
+runs:
+  using: composite
+  steps:
+    - name: apt install (with retry on transient mirror failures)
+      shell: bash
+      run: |
+        set -e
+        for attempt in 1 2 3; do
+          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+             && sudo apt-get install -y \
+                  -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+                  ${{ inputs.packages }}; then
+            echo "apt install succeeded on attempt $attempt"
+            exit 0
+          fi
+          echo "apt attempt $attempt failed; sleeping 10s before retry"
+          sleep 10
+        done
+        echo "apt install failed after 3 attempts" >&2
+        exit 1
