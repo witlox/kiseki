@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = true
+publish = false  # source-distributed via GitHub releases — see release.yml comment block
 
 [lints]
 workspace = true
