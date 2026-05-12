@@ -137,9 +137,14 @@ def _put_object(node: int, key: str, data: bytes) -> str:
     the per-shard Raft leader. Even so, there's a brief window between
     "endpoint reports a leader_id" and "the gateway's log handle has
     observed the new term," during which a PUT can surface
-    `LeaderUnavailable`. Retry on that specific transient up to ~5s.
+    `LeaderUnavailable`. Retry on that specific transient.
+
+    Budget was 5 s historically but failed on GitHub-hosted runners
+    (`Client (aarch64)` queue load) where the gateway's log-handle
+    catch-up lagged well past 5 s after the cluster API reported a
+    leader_id. 15 s covers the observed worst-case at 2026-05-12.
     """
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 15.0
     last: requests.Response | None = None
     while True:
         resp = requests.put(f"{S3[node]}/default/{key}", data=data, timeout=10)
