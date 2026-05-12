@@ -11,8 +11,39 @@ jobs:
     runs-on: ubuntu-latest
     if: github.actor == 'dependabot[bot]'
     steps:
-      - name: Enable auto-merge for Dependabot PRs
+      # Parse dependabot's PR metadata so we can gate on update-type.
+      # Without this, *any* dependabot PR auto-merges — including a
+      # hypothetical major bump to a transport/crypto crate. The
+      # cooldown in dependabot.yml already protects against fresh-
+      # release supply-chain attacks; this gate adds human review for
+      # majors regardless of age.
+      - name: Fetch Dependabot PR metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Auto-merge only minor/patch updates. Majors stop here and wait
+      # for a human reviewer. The cooldown in dependabot.yml means
+      # whatever version we're merging is already 3+ days old.
+      - name: Auto-merge minor/patch updates
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
         run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Make the "held for review" case visible in the PR conversation
+      # so it doesn't quietly languish.
+      - name: Flag majors for human review
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "Major version bump (${{ steps.meta.outputs.dependency-names }}). \
+            Not auto-merged — please review the changelog and security posture \
+            before merging."
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

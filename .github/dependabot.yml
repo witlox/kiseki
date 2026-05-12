@@ -6,12 +6,27 @@ updates:
     schedule:
       interval: "weekly"
       day: "wednesday"
+    # Supply-chain hygiene: refuse to even *consider* a release that's
+    # less than N days old. Most caught-fast supply-chain attacks
+    # (eslint-config-prettier, ua-parser-js, recent crates.io yanks)
+    # are detected and yanked within 24-72h; xz-utils took ~4 weeks.
+    # A 7-day default covers the typical detection window without
+    # slowing down meaningful work. Patches move faster (usually CVE
+    # fixes), majors slower (they want human eyes regardless).
+    cooldown:
+      default-days: 7
+      semver-major-days: 21
+      semver-minor-days: 7
+      semver-patch-days: 3
+      include:
+        - "*"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
       - "rust"
     groups:
-      # Group minor/patch updates to reduce PR noise
+      # Group minor/patch updates to reduce PR noise.
+      # Majors stay separate — dependabot-auto-merge gates on this.
       rust-minor:
         update-types:
           - "minor"
@@ -23,6 +38,13 @@ updates:
     schedule:
       interval: "weekly"
       day: "wednesday"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+      include:
+        - "*"
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
