@@ -238,8 +238,7 @@ mod tests {
     // Finding S2: empty seed list errors with a clear message.
     #[tokio::test]
     async fn connect_with_seeds_rejects_empty_list() {
-        let result =
-            NativeClient::connect_with_seeds(&[], OrgId(uuid::Uuid::nil())).await;
+        let result = NativeClient::connect_with_seeds(&[], OrgId(uuid::Uuid::nil())).await;
         let Err(err) = result else {
             panic!("empty seed list must error, got Ok");
         };
@@ -266,8 +265,7 @@ mod tests {
             "192.0.2.3:1".to_owned(),
         ];
         let started = std::time::Instant::now();
-        let result =
-            NativeClient::connect_with_seeds(&seeds, OrgId(uuid::Uuid::nil())).await;
+        let result = NativeClient::connect_with_seeds(&seeds, OrgId(uuid::Uuid::nil())).await;
         let Err(err) = result else {
             panic!("unreachable seeds must error, got Ok");
         };

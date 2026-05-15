@@ -2018,10 +2018,7 @@ async fn then_ttl_fires_and_refreshes(_w: &mut KisekiWorld) {
 // ---------------------------------------------------------------------
 
 #[given(regex = r#"^client-a's topology cache identifies shard S1's leader as node-(\d+)$"#)]
-async fn given_topology_cache_identifies_shard_s1_leader(
-    w: &mut KisekiWorld,
-    leader_node: u64,
-) {
+async fn given_topology_cache_identifies_shard_s1_leader(w: &mut KisekiWorld, leader_node: u64) {
     let cache = ensure_topology_cache(&mut w.native);
     let mut snap = cache.snapshot();
     snap.nodes.push(kiseki_client::native::Node {
@@ -2067,7 +2064,9 @@ async fn given_leader_migrated_to(w: &mut KisekiWorld, new_leader: u64) {
     }
 }
 
-#[given(regex = r#"^node-\d+ is configured with the proxy-fallback path disabled \(client-side discovery only\)$"#)]
+#[given(
+    regex = r#"^node-\d+ is configured with the proxy-fallback path disabled \(client-side discovery only\)$"#
+)]
 async fn given_proxy_fallback_disabled(_w: &mut KisekiWorld) {
     // Step C operates entirely on the client side. Proxy-fallback is
     // Step A's concern; this Given is a no-op for Step C — the test
@@ -2146,10 +2145,7 @@ async fn then_topology_cache_refreshed(w: &mut KisekiWorld) {
     // Drive the refresh through the production cache API: a fresh
     // Snapshot with the true leader, bumped version, applied via
     // replace_if_newer.
-    let true_leader = w
-        .native
-        .last_topology_version
-        .expect("true leader stashed");
+    let true_leader = w.native.last_topology_version.expect("true leader stashed");
     let cache = w
         .native
         .topology_cache

@@ -190,14 +190,13 @@ impl DiscoveryClient {
             // sentinel address (loopback). Callers honour
             // `leader_node_id = None` as "no leader yet".
             let leader_addr = match &s.leader_data_addr {
-                Some(addr) => addr.parse::<SocketAddr>().map_err(|e| {
-                    DiscoveryParseError::InvalidLeaderAddr(format!("{addr}: {e}"))
-                })?,
-                None => "0.0.0.0:0".parse().unwrap(),
+                Some(addr) => addr
+                    .parse::<SocketAddr>()
+                    .map_err(|e| DiscoveryParseError::InvalidLeaderAddr(format!("{addr}: {e}")))?,
+                None => SocketAddr::from(([0, 0, 0, 0], 0)),
             };
-            let range_start = decode_hex_prefixed(&s.range_start).ok_or_else(|| {
-                DiscoveryParseError::InvalidHexRange(s.range_start.clone())
-            })?;
+            let range_start = decode_hex_prefixed(&s.range_start)
+                .ok_or_else(|| DiscoveryParseError::InvalidHexRange(s.range_start.clone()))?;
             let range_end = decode_hex_prefixed(&s.range_end)
                 .ok_or_else(|| DiscoveryParseError::InvalidHexRange(s.range_end.clone()))?;
             shards.push(ShardEndpoint {
@@ -376,8 +375,7 @@ mod from_cluster_info_json_tests {
 
     #[test]
     fn parses_rev2_payload_into_discovery_response() {
-        let resp = DiscoveryClient::from_cluster_info_json(REV2_JSON)
-            .expect("rev-2 JSON parses");
+        let resp = DiscoveryClient::from_cluster_info_json(REV2_JSON).expect("rev-2 JSON parses");
         assert_eq!(resp.shards.len(), 1);
         let s = &resp.shards[0];
         assert_eq!(s.shard_id, "00000000-0000-0000-0000-000000000001");
@@ -413,13 +411,12 @@ mod from_cluster_info_json_tests {
     #[test]
     fn rejects_invalid_hex_range() {
         // `range_start` is not a valid 0x-prefixed hex string.
-        let bad = REV2_JSON
-            .replace(
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "deadbeef",
-            );
-        let err = DiscoveryClient::from_cluster_info_json(&bad)
-            .expect_err("invalid hex must error");
+        let bad = REV2_JSON.replace(
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "deadbeef",
+        );
+        let err =
+            DiscoveryClient::from_cluster_info_json(&bad).expect_err("invalid hex must error");
         assert!(
             matches!(err, DiscoveryParseError::InvalidHexRange(_)),
             "expected InvalidHexRange, got {err:?}"
@@ -444,8 +441,7 @@ mod from_cluster_info_json_tests {
     fn ignores_unknown_fields() {
         // Forward-compat: rev-3 fields (not yet defined) must not break
         // a rev-2 client.
-        let with_extras =
-            r#"{ "node_id": 1, "s3_addr": "10.0.0.1:9000",
+        let with_extras = r#"{ "node_id": 1, "s3_addr": "10.0.0.1:9000",
             "nfs_addr": "10.0.0.1:2049", "metrics_addr": "10.0.0.1:9090",
             "peers": [], "future_field": "ignore-me" }"#;
         assert!(DiscoveryClient::from_cluster_info_json(with_extras).is_ok());

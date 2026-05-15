@@ -930,8 +930,9 @@ async fn admin_test_drop_fragment(
 }
 
 #[cfg(test)]
+#[allow(clippy::type_complexity, clippy::redundant_closure)]
 mod cluster_info_rev2_tests {
-    //! ADR-008 rev 2 — build_shards_from_state tests.
+    //! ADR-008 rev 2 — `build_shards_from_state` tests.
     //!
     //! Validates that the `/cluster/info` `shards` field projects the
     //! control-plane `NamespaceShardMap` onto the wire shape, with
@@ -953,19 +954,18 @@ mod cluster_info_rev2_tests {
         {
             let mut inner = state.inner.lock().await;
             for (ns_id, tenant_id, shards) in namespaces {
-                let snapshots: Vec<crate::cluster_control::state_machine::ShardSnapshot> =
-                    shards
-                        .into_iter()
-                        .map(|(sid, leader_node, rs, re)| {
-                            crate::cluster_control::state_machine::ShardSnapshot {
-                                shard_id: kiseki_common::ids::ShardId(sid),
-                                range_start: rs,
-                                range_end: re,
-                                leader_node: NodeId(leader_node),
-                                is_retiring: false,
-                            }
-                        })
-                        .collect();
+                let snapshots: Vec<crate::cluster_control::state_machine::ShardSnapshot> = shards
+                    .into_iter()
+                    .map(|(sid, leader_node, rs, re)| {
+                        crate::cluster_control::state_machine::ShardSnapshot {
+                            shard_id: kiseki_common::ids::ShardId(sid),
+                            range_start: rs,
+                            range_end: re,
+                            leader_node: NodeId(leader_node),
+                            is_retiring: false,
+                        }
+                    })
+                    .collect();
                 inner.namespaces.insert(
                     ns_id.clone(),
                     crate::cluster_control::NamespaceShardMapSnapshot {
@@ -1018,10 +1018,7 @@ mod cluster_info_rev2_tests {
         assert_eq!(shards[0].leader_id, Some(2));
         // Resolved from peer (2)'s raft_addr → host 10.0.0.2 → 9100
         // (KISEKI_DATA_ADDR default).
-        assert_eq!(
-            shards[0].leader_data_addr.as_deref(),
-            Some("10.0.0.2:9100")
-        );
+        assert_eq!(shards[0].leader_data_addr.as_deref(), Some("10.0.0.2:9100"));
         assert_eq!(
             shards[0].range_start,
             "0x0000000000000000000000000000000000000000000000000000000000000000"
@@ -1098,11 +1095,7 @@ mod cluster_info_rev2_tests {
                 (2, "10.0.0.2:7000".to_owned()),
                 (3, "10.0.0.3:7000".to_owned()),
             ],
-            vec![(
-                "trials".to_owned(),
-                OrgId(uuid::Uuid::from_u128(1)),
-                shards,
-            )],
+            vec![("trials".to_owned(), OrgId(uuid::Uuid::from_u128(1)), shards)],
         )
         .await;
         let projected = build_shards_from_state(&state).await;

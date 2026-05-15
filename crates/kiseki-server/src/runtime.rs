@@ -1238,9 +1238,7 @@ pub async fn run_main(
     // ADR-008 rev 2: thread the control-plane state machine to the
     // metrics server so `/cluster/info` can project per-shard leader
     // info from `NamespaceShardMap`. `None` on single-node deploys.
-    let cluster_control_state_for_ui = cluster_control_store
-        .as_ref()
-        .map(|s| Arc::new(s.state()));
+    let cluster_control_state_for_ui = cluster_control_store.as_ref().map(|s| Arc::new(s.state()));
     tokio::spawn(async move {
         if let Err(e) = crate::metrics::run_metrics_server(
             metrics_addr,

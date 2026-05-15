@@ -170,6 +170,7 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
 /// `peer_s3_addrs` maps `NodeId → "host:port"`. Empty in dev / test;
 /// the 307 path falls back to 503 when the leader hint can't be
 /// resolved.
+#[allow(clippy::implicit_hasher)] // HashMap default hasher is fine for the small peer map
 pub fn s3_router_with_peers<G: GatewayOps + Send + Sync + 'static>(
     gateway: S3Gateway<G>,
     fallback_tenant: OrgId,
@@ -345,10 +346,10 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
     let request_scheme = request_scheme_from_uri_and_headers(&original_uri, &headers);
-    let request_path_and_query = original_uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_owned())
-        .unwrap_or_else(|| format!("/{bucket}/{key}"));
+    let request_path_and_query = original_uri.path_and_query().map_or_else(
+        || format!("/{bucket}/{key}"),
+        |pq| pq.as_str().to_owned(),
+    );
 
     // If uploadId + partNumber present, this is UploadPart.
     if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
@@ -463,7 +464,10 @@ fn request_scheme_from_uri_and_headers(uri: &axum::http::Uri, headers: &HeaderMa
     if let Some(scheme) = uri.scheme_str() {
         return scheme.to_owned();
     }
-    if let Some(proto) = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) {
+    if let Some(proto) = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
         return proto.to_owned();
     }
     "http".to_owned()
@@ -1867,7 +1871,7 @@ mod tests {
     /// Finding S6 — GET against `LeaderUnavailable` MUST NOT 307;
     /// reads are served by any node with composition state (ADR-040
     /// §D6.3). The error maps to 503 + Retry-After (matching the
-    /// existing ServiceUnavailable path).
+    /// existing `ServiceUnavailable` path).
     #[tokio::test(flavor = "multi_thread")]
     async fn leader_unavailable_get_returns_503_not_307() {
         let resp = leader_unavailable_response(
@@ -1890,7 +1894,7 @@ mod tests {
         );
     }
 
-    /// LeaderUnavailable with NO leader hint (active election) MUST
+    /// `LeaderUnavailable` with NO leader hint (active election) MUST
     /// fall back to 503 + Retry-After — no peer to redirect to.
     #[tokio::test(flavor = "multi_thread")]
     async fn leader_unavailable_without_hint_falls_back_to_503() {
@@ -1910,7 +1914,7 @@ mod tests {
         );
     }
 
-    /// LeaderUnavailable with a hint that's NOT in the peer map (e.g.
+    /// `LeaderUnavailable` with a hint that's NOT in the peer map (e.g.
     /// a node that's no longer in the cluster) MUST fall back to 503.
     #[tokio::test(flavor = "multi_thread")]
     async fn leader_unavailable_with_unknown_peer_falls_back_to_503() {
@@ -1950,9 +1954,7 @@ mod tests {
             Some(&counter),
         );
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
-        let bumped = counter
-            .with_label_values(&["s3", "unknown"])
-            .get();
+        let bumped = counter.with_label_values(&["s3", "unknown"]).get();
         assert_eq!(bumped, 1, "307 emission must bump the metric");
     }
 }

@@ -502,6 +502,7 @@ impl Default for KisekiMetrics {
 /// - `GET /ui/api/*` — JSON API endpoints
 /// - `GET /ui/fragment/*` — HTMX HTML partial endpoints
 /// - `GET /ui/logo` — Logo image
+#[allow(clippy::too_many_arguments)] // wire 8 distinct ops handles into the metrics server boot
 pub async fn run_metrics_server(
     addr: SocketAddr,
     metrics: KisekiMetrics,

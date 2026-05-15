@@ -700,8 +700,10 @@ mod tests {
                 namespace_id: "trials".into(),
                 leader_id: Some(2),
                 leader_data_addr: Some("10.0.0.2:9100".into()),
-                range_start: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
-                range_end:   "0x5555555555555555555555555555555555555555555555555555555555555555".into(),
+                range_start: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                range_end: "0x5555555555555555555555555555555555555555555555555555555555555555"
+                    .into(),
             }],
         };
         let snap = snapshot_from_cluster_info(&parsed);
@@ -751,8 +753,10 @@ mod tests {
                 namespace_id: "trials".into(),
                 leader_id: None,
                 leader_data_addr: None,
-                range_start: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
-                range_end:   "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+                range_start: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                range_end: "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .into(),
             }],
         };
         let snap = snapshot_from_cluster_info(&parsed);
