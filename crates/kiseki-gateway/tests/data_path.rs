@@ -49,6 +49,7 @@ async fn write_then_read_roundtrip() {
             name: None,
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
         })
         .await
         .unwrap();
@@ -84,6 +85,7 @@ async fn read_with_offset_and_length() {
             name: None,
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
         })
         .await
         .unwrap();
@@ -116,6 +118,7 @@ async fn read_past_eof_returns_empty() {
             name: None,
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
         })
         .await
         .unwrap();
@@ -147,6 +150,7 @@ async fn tenant_mismatch_rejected() {
             name: None,
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
         })
         .await
         .unwrap();
@@ -207,6 +211,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         name: None,
         conditional: None,
         workflow_ref: None,
+        idempotency_key: None,
     })
     .await
     .unwrap();
@@ -219,6 +224,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         name: None,
         conditional: None,
         workflow_ref: None,
+        idempotency_key: None,
     })
     .await
     .unwrap();

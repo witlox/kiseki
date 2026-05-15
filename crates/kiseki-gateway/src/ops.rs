@@ -59,6 +59,20 @@ pub struct WriteRequest {
     /// **never** blocks the write — it is simply recorded as
     /// `invalid` in the `workflow_ref` counter and the write proceeds.
     pub workflow_ref: Option<[u8; 16]>,
+    /// Optional idempotency key (I-NG5 / ADR-042 §6). 1..=64 bytes,
+    /// opaque, client-generated. The server-side proxy fallback
+    /// (ADR-042 §4) MUST preserve this byte-for-byte when re-issuing
+    /// a write against the shard leader so the leader's dedup table
+    /// short-circuits a retry to the original response (exactly-once
+    /// semantics). Validated at the proto boundary in
+    /// `kiseki-gateway::native::server::validate_idempotency_key`;
+    /// the field carried here is the post-validation bytes.
+    ///
+    /// `None` for callers that don't have an idempotency context
+    /// (in-process tests, NFS data path — the file handle is the
+    /// addressing token and the gateway's per-handle bookkeeping
+    /// covers retries).
+    pub idempotency_key: Option<Vec<u8>>,
 }
 
 /// HTTP-derived conditional check applied to a `WriteRequest` against

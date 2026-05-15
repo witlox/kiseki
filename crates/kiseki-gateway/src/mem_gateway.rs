@@ -2685,6 +2685,7 @@ mod chunking_tests {
                 name: Some("big-object".to_owned()),
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .expect("write must succeed");
@@ -2729,6 +2730,7 @@ mod chunking_tests {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .unwrap();
@@ -2775,6 +2777,7 @@ mod chunking_tests {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .unwrap();
@@ -2820,6 +2823,7 @@ mod chunking_tests {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .unwrap();
@@ -2858,6 +2862,7 @@ mod chunking_tests {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .unwrap();
@@ -2902,6 +2907,7 @@ mod chunking_tests {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .unwrap();
@@ -2935,6 +2941,7 @@ mod chunking_tests {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .unwrap();
@@ -2967,6 +2974,7 @@ mod chunking_tests {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .unwrap();
@@ -2999,6 +3007,7 @@ mod chunking_tests {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .unwrap();
@@ -3077,6 +3086,7 @@ mod phase_duration_tests {
                 name: Some("phase-test".to_owned()),
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .expect("write must succeed");

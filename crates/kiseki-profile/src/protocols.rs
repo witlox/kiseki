@@ -131,6 +131,7 @@ impl Driver for S3Driver {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .map_err(|e| format!("s3 put: {e}"))?;
@@ -188,6 +189,7 @@ impl Driver for Nfs3Driver {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .map_err(|e| format!("nfs3 put: {e}"))?;
@@ -245,6 +247,7 @@ impl Driver for Nfs4Driver {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .map_err(|e| format!("nfs4 put: {e}"))?;
@@ -565,6 +568,7 @@ impl Driver for PnfsDriver {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .map_err(|e| format!("pnfs put: {e}"))?;
@@ -699,6 +703,7 @@ impl Driver for FuseDriver {
                 name: req.name,
                 conditional: req.conditional,
                 workflow_ref: req.workflow_ref,
+                idempotency_key: None,
             })
             .await
             .map_err(|e| format!("fuse gateway write: {e}"))?;
@@ -981,6 +986,7 @@ impl Driver for InProcessDriver {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .map_err(|e| format!("in-process put: {e}"))?;
@@ -1098,6 +1104,7 @@ impl NativeDriver {
             workflow_ref: String::new(),
             cache_hint: None,
             conditional: None,
+            forwarded_from_node: None,
         }
     }
 }
@@ -1287,6 +1294,7 @@ impl Driver for InProcessPersistentDriver {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .map_err(|e| format!("in-process-persistent put: {e}"))?;
@@ -1368,6 +1376,7 @@ impl TcpFramedNativeDriver {
             workflow_ref: String::new(),
             cache_hint: None,
             conditional: None,
+            forwarded_from_node: None,
         }
     }
 }

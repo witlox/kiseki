@@ -576,6 +576,7 @@ impl KisekiWorld {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await
             .map_err(|e| e.to_string())

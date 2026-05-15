@@ -102,6 +102,7 @@ fn ctrl(tenant: OrgId, idem: Option<&[u8]>, workflow: &str) -> np::ControlFields
         workflow_ref: workflow.to_string(),
         cache_hint: None,
         conditional: None,
+        forwarded_from_node: None,
     }
 }
 
@@ -432,6 +433,7 @@ async fn when_client_a_writes_with_tenant(w: &mut KisekiWorld, tenant: String) {
             workflow_ref: String::new(),
             cache_hint: None,
             conditional: None,
+            forwarded_from_node: None,
         }
     } else {
         ctrl(payload_tenant, None, "")

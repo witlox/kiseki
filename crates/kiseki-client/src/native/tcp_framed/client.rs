@@ -574,6 +574,7 @@ mod tests {
                 workflow_ref: String::new(),
                 cache_hint: None,
                 conditional: None,
+                forwarded_from_node: None,
             }),
             namespace_id: Some(v1::NamespaceId {
                 value: ns.0.to_string(),

@@ -685,6 +685,7 @@ impl GatewayOps for Nfs4Client {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
             })
             .await?;
         Ok(resp.composition_id)

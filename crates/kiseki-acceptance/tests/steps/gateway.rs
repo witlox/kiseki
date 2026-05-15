@@ -268,6 +268,7 @@ async fn given_s3_getobject(w: &mut KisekiWorld, _key: String) {
             name: None,
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
         })
         .await
         .expect("S3 write");
@@ -369,6 +370,7 @@ async fn then_gw_write_pipeline(w: &mut KisekiWorld) {
             name: None,
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
         })
         .await
         .expect("S3 write");

@@ -477,6 +477,9 @@ impl ServerImpl {
             Some(req.name.clone())
         };
         let bytes = req.data;
+        // I-NG5: preserve the client's idempotency_key on the internal
+        // WriteRequest so the wire-level proxy hop can re-issue it
+        // byte-for-byte against the leader (ADR-042 §6 dedup table).
         let wreq = WriteRequest {
             tenant_id: tenant,
             namespace_id: ns,
@@ -484,6 +487,7 @@ impl ServerImpl {
             name,
             conditional,
             workflow_ref,
+            idempotency_key: Some(cf.idempotency_key.clone()),
         };
         // ADR-042 §4 — when the proxy fallback is enabled, route writes
         // through `write_with_forwarding` so we can observe a
@@ -1252,6 +1256,7 @@ mod tests {
             workflow_ref: String::new(),
             cache_hint: None,
             conditional: None,
+            forwarded_from_node: None,
         }
     }
 
@@ -1529,6 +1534,7 @@ mod tests {
                 workflow_ref: String::new(),
                 cache_hint: None,
                 conditional: None,
+                forwarded_from_node: None,
             }),
             namespace_id: Some(ns_to_proto(ns())),
             name: "x".into(),
