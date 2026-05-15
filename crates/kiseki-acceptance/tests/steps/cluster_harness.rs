@@ -531,7 +531,15 @@ fn spawn_with_env(
         // slow-down, fabric deny-incoming) on the spawned server.
         // Only set in the BDD harness — production deployments leave
         // it unset, so the test endpoints respond 403.
-        .env("KISEKI_ENABLE_TEST_KNOBS", "1");
+        .env("KISEKI_ENABLE_TEST_KNOBS", "1")
+        // BDD steps hit /cluster/info, /admin/chunk, /admin/composition
+        // and the /admin/test/* knobs directly without presenting a
+        // Bearer. Default-ON HTTP RBAC (web::auth) is bypassed in the
+        // harness so existing scenarios continue to drive the spawned
+        // server unchanged. Production deployments leave both flags
+        // unset and a token must be configured.
+        .env("KISEKI_ADMIN_AUTH_DISABLED", "true")
+        .env("KISEKI_CLUSTER_INFO_PUBLIC", "true");
     if let Some(certs) = mtls_certs {
         let node = certs.node(node_id);
         cmd.env("KISEKI_CA_PATH", &node.ca)

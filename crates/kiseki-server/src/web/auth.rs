@@ -135,7 +135,6 @@ fn extract_bearer<B>(req: &Request<B>) -> Option<&str> {
     }
 }
 
-#[allow(dead_code)] // wired into middleware in the GREEN commit
 fn unauthorized(reason: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -145,7 +144,6 @@ fn unauthorized(reason: &str) -> Response {
         .into_response()
 }
 
-#[allow(dead_code)] // wired into middleware in the GREEN commit
 fn forbidden(reason: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -154,7 +152,6 @@ fn forbidden(reason: &str) -> Response {
         .into_response()
 }
 
-#[allow(dead_code)] // wired into middleware in the GREEN commit
 fn misconfigured(reason: &str) -> Response {
     // 503 — auth is required by policy but the server has no token
     // to compare against. Distinct from 401 (missing client cred) so
@@ -179,13 +176,26 @@ fn misconfigured(reason: &str) -> Response {
 ///   `KISEKI_ADMIN_TOKEN`. Missing header → 401. Wrong token → 403.
 ///   No `KISEKI_ADMIN_TOKEN` set on the server → 503 (misconfig).
 pub async fn admin_required(
-    State(_cfg): State<AuthConfig>,
+    State(cfg): State<AuthConfig>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    // RED: stub passes everything through. Real implementation lands
-    // in the follow-up commit; this lets the test file land first.
-    next.run(req).await
+    if cfg.admin_auth_disabled {
+        return next.run(req).await;
+    }
+    if cfg.admin_token.is_none() {
+        return misconfigured(
+            "KISEKI_ADMIN_TOKEN unset; set it or KISEKI_ADMIN_AUTH_DISABLED=true",
+        );
+    }
+    let Some(presented) = extract_bearer(&req) else {
+        return unauthorized("missing Authorization: Bearer header");
+    };
+    if cfg.is_admin_token(presented) {
+        next.run(req).await
+    } else {
+        forbidden("not an admin principal")
+    }
 }
 
 /// Middleware: require any-authenticated principal (or public-mode
@@ -202,13 +212,27 @@ pub async fn admin_required(
 ///   the configured tokens. Missing → 401. Wrong → 403. Neither
 ///   token configured on server → 503 (misconfig).
 pub async fn cluster_info_required(
-    State(_cfg): State<AuthConfig>,
+    State(cfg): State<AuthConfig>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    // RED: stub passes everything through. Real implementation lands
-    // in the follow-up commit; this lets the test file land first.
-    next.run(req).await
+    if cfg.cluster_info_public {
+        return next.run(req).await;
+    }
+    if cfg.admin_token.is_none() && cfg.client_token.is_none() {
+        return misconfigured(
+            "neither KISEKI_ADMIN_TOKEN nor KISEKI_CLIENT_TOKEN set; \
+             set one or KISEKI_CLUSTER_INFO_PUBLIC=true",
+        );
+    }
+    let Some(presented) = extract_bearer(&req) else {
+        return unauthorized("missing Authorization: Bearer header");
+    };
+    if cfg.is_client_or_admin_token(presented) {
+        next.run(req).await
+    } else {
+        forbidden("token does not match a configured principal")
+    }
 }
 
 /// Constant-time byte comparison. Returns `false` on length mismatch

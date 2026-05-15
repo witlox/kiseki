@@ -19,12 +19,64 @@ node is most convenient.
 
 The metrics HTTP server also serves:
 
-| Path | Purpose |
-|------|---------|
-| `/health` | Health probe (returns `200 OK`). Used by load balancers. |
-| `/metrics` | Prometheus text exposition format. |
-| `/ui` | Admin dashboard (HTML + HTMX + Chart.js). |
-| `/ui/logo` | Kiseki logo image. |
+| Path | Purpose | Auth tier |
+|------|---------|-----------|
+| `/health` | Health probe (returns `200 OK`). Used by load balancers. | open |
+| `/metrics` | Prometheus text exposition format. | open |
+| `/ui/logo` | Kiseki logo image. | open |
+| `/ui`, `/ui/api/*`, `/ui/fragment/*` | Admin dashboard. | **admin** |
+| `/admin/*` | Admin REST API (topology, tenants, audit, keys, snapshots, drains). | **admin** |
+| `/cluster/info` | Bootstrap topology (ADR-008 rev 2). | **client / admin** |
+| `/cluster/shards/{id}/leader` | Per-shard leader probe. | **client / admin** |
+
+### Authenticating to the admin tier
+
+The admin and client tiers are gated by a Bearer-token middleware
+(stopgap until full SSO / mTLS integration lands; see ADR-008 rev 2
+§"Authorization" and `specs/findings/2026-05-15-ui-cli-followups.md`
+follow-up D1).
+
+Configure tokens on each `kiseki-server` via environment variables:
+
+| Env var | Purpose | Default |
+|---------|---------|---------|
+| `KISEKI_ADMIN_TOKEN` | Bearer token accepted by `/admin/*` and `/ui/*`. Also accepted on `/cluster/info`. | unset → admin auth misconfigured (503) |
+| `KISEKI_CLIENT_TOKEN` | Bearer token accepted ONLY on `/cluster/info` (clients bootstrapping topology). | unset → only the admin token works |
+| `KISEKI_ADMIN_AUTH_DISABLED` | `true` opts out of admin/UI auth (local dev only). | `false` |
+| `KISEKI_CLUSTER_INFO_PUBLIC` | `true` opts out of `/cluster/info` auth (LB probes, public topology). | `false` |
+
+Present the token as a Bearer header:
+
+```bash
+# As an admin operator (full /admin/* + /ui/* + /cluster/info):
+curl -H "Authorization: Bearer $KISEKI_ADMIN_TOKEN" \
+     http://node1:9090/admin/topology/shards
+
+# As a client doing topology bootstrap (only /cluster/info):
+curl -H "Authorization: Bearer $KISEKI_CLIENT_TOKEN" \
+     http://node1:9090/cluster/info
+```
+
+Responses:
+
+- `200 OK` — token accepted, handler ran.
+- `401 Unauthorized` — `Authorization: Bearer …` header missing or empty.
+- `403 Forbidden` — Bearer present but token doesn't match the tier's ACL.
+- `503 Service Unavailable` — server has no token configured AND no
+  override flag set. Operator must set `KISEKI_ADMIN_TOKEN` (or
+  `KISEKI_CLIENT_TOKEN` for `/cluster/info`) or the corresponding
+  override flag.
+
+Tokens are compared in constant-time over the bytes; the secrets
+should be at least 32 random bytes (`openssl rand -hex 32`).
+
+### Dev / compose deployments
+
+`docker-compose.yml` and `docker-compose.3node.yml` set
+`KISEKI_ADMIN_AUTH_DISABLED=true` and `KISEKI_CLUSTER_INFO_PUBLIC=true`
+so the e2e suite and the BDD ClusterHarness can drive the spawned
+servers without managing tokens. Production deployments leave both
+unset.
 
 ---
 

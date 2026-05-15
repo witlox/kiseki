@@ -571,13 +571,27 @@ pub async fn run_metrics_server(
         drain,
     };
 
+    // Auth config snapshot at boot. `/metrics`, `/health`, `/ui/logo`
+    // intentionally stay open (probe surface); `/admin/*`, `/ui/*`
+    // and `/cluster/info` go through the auth-tier router. See
+    // `web::auth` for the env-var contract.
+    let auth = web::auth::AuthConfig::from_env();
+    tracing::info!(
+        addr = %addr,
+        admin_token_set = auth.admin_token.is_some(),
+        client_token_set = auth.client_token.is_some(),
+        admin_auth_disabled = auth.admin_auth_disabled,
+        cluster_info_public = auth.cluster_info_public,
+        "metrics + admin UI auth posture",
+    );
+
     // Build combined router: metrics + health + admin UI.
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/ui/logo", get(logo_handler))
         .with_state(metrics)
-        .merge(web::api::ui_router(ui_state));
+        .merge(web::api::ui_router(ui_state, auth));
 
     tracing::info!(addr = %addr, "metrics + admin UI server listening");
 
