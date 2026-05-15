@@ -173,6 +173,34 @@ Crypto-shred detection is bounded by:
 Default key health check interval: 30 seconds. Configurable per tenant
 within [5s, 300s], default 60s (I-K15).
 
+### Operator CLI: `kiseki-admin keys shred`
+
+```
+kiseki-admin keys shred <tenant-id> [--yes]
+```
+
+`shred` posts to `/admin/keys/shred` (which records a
+`KeyDestruction` audit event via
+`kiseki_audit::event::crypto_shred_force_override_event`) and is the
+audit-trail surface for the operation. The tenant-side KMS destruction
+remains the authoritative step — Kiseki cannot delete material it does
+not hold. Pair this CLI call with the provider-specific destroy verb
+(e.g. `vault delete transit/keys/<name>`, `aws kms schedule-key-deletion`,
+`pkcs11-tool --delete-object`).
+
+Confirmation: without `--yes`, the CLI prompts the operator to retype
+the tenant id. A mismatch cancels the call before any HTTP request is
+sent. Use `--yes` only in automation (e.g. break-glass runbooks).
+
+After the audit event is recorded, the next step in the runbook is:
+
+1. Verify the audit row landed:
+   `kiseki-admin audit query --type key-destruction --limit 5`
+2. Trigger the tenant KMS destruction (provider-specific).
+3. Watch `kiseki_crypto_shred_total` and the cluster-wide audit
+   aggregator (`kiseki-admin audit query`, no `--local-only`) for
+   propagation across all nodes.
+
 ---
 
 ## External KMS providers (ADR-028)

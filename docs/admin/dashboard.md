@@ -192,15 +192,21 @@ Operators can also pull this via `kiseki-admin shards` and
 ## Pools tab
 
 The Pools tab surfaces per-pool capacity from
-`kiseki_pool_capacity_total_bytes` and `kiseki_pool_capacity_used_bytes`.
+`kiseki_pool_capacity_total_bytes` and `kiseki_pool_capacity_used_bytes`,
+**plus** per-device capacity and IO error counters from
+`kiseki_pool_device_capacity_bytes{pool,device_id,kind=total|used|free}`
+and `kiseki_pool_device_errors_total{device_id,op=read|write}` (D2).
 
-Per-device health and the repair queue are deliberately NOT surfaced
-in the web UI today — they live behind the `StorageAdminService` gRPC
-handler and are exposed via the `kiseki-storage device-health` and
-`kiseki-storage repairs list` CLIs.  The notice card in the Pools tab
-links to those commands.  Wiring per-device gauges into the metrics
-registry is tracked in
-`specs/findings/2026-05-15-ui-cli-followups.md`.
+The same data is reachable via:
+
+- `GET /admin/pools` → `{pools: [...], devices: [...]}`
+
+The full per-device health stream (latency histograms, repair queue)
+still lives behind the `StorageAdminService` gRPC handler — see
+`kiseki-storage device-health` and `kiseki-storage repairs list`.
+The Pools tab links to those commands for the deep view; the gauges
+covered here are the always-on Prometheus surface so alert rules can
+target individual devices without scraping gRPC.
 
 ---
 
@@ -220,9 +226,25 @@ The same data is reachable via:
 `kiseki-admin tenant list --type org|project|workload|namespace`
 prints the JSON or a tabular view.
 
-Create-org is available over HTTP (`POST /admin/tenants/orgs`); the
-nested CRUD operations (project / workload / namespace) require the
-gRPC `ControlService` — see `docs/api/grpc.md`.
+Create + describe verbs (D3) are now available over HTTP:
+
+- `POST /admin/tenants/orgs`
+- `POST /admin/tenants/projects` — body `{org_id, name}`
+- `POST /admin/tenants/workloads` — body `{project_id, name}`
+- `POST /admin/tenants/namespaces` — body `{workload_id, name}`
+- `GET /admin/tenants/describe?id=<id>` — auto-detects type
+- `POST /admin/tenants/delete` — currently `501`; gRPC ControlService
+  remains canonical for lifecycle deletes
+
+CLI equivalents:
+
+```bash
+kiseki-admin tenant create-project <org-id> <name>
+kiseki-admin tenant create-workload <project-id> <name>
+kiseki-admin tenant create-namespace <workload-id> <name>
+kiseki-admin tenant describe <id>
+kiseki-admin tenant delete <id> [--yes]
+```
 
 ---
 
@@ -237,6 +259,17 @@ Backed by `GET /admin/audit/query` (tenant-scoped queries take
 `?tenant=<uuid>` and event-type filters take `?event_type=key-rotation`
 or any other variant in `AuditEventType`).  The CLI equivalent is
 `kiseki-admin audit query [--tenant T] [--type X] [--limit N]`.
+
+**Cross-node aggregation (D5)**: by default, `/admin/audit/query`
+fans out to every peer in `/cluster/info`'s `peers[]`, merges the
+results, dedupes by `(node_id, tenant_id, sequence)`, and truncates
+to `limit`. The response includes `aggregated: true` plus
+`reachable_nodes` and `unreachable_nodes` lists so operators can
+spot partial-fan-out runs.
+
+Pass `?local_only=true` (HTTP) or `--local-only` (CLI) to query
+only the responding node's audit shard. Per-peer fetches use a 5-second
+read timeout — a slow peer cannot pin the coordinator.
 
 ---
 

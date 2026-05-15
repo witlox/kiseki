@@ -735,30 +735,82 @@ fn parse_admin_endpoint(args: &[String]) -> String {
 
 fn handle_whoami(args: &[String]) {
     let endpoint = parse_admin_endpoint(args);
-    // For now, the only identity surface is the auth tier the client
-    // sees on /cluster/info. SAN identity (TLS) lives in the proto
-    // layer and isn't currently emitted on the HTTP control plane.
-    // Print what we can derive from /cluster/info and let the operator
-    // bridge the gap until a dedicated endpoint lands.
-    match http_get_admin(&endpoint, "/cluster/info") {
+    // Preferred: ask the server for the authenticated principal via
+    // `/admin/whoami`. The server reports the SAN extracted from the
+    // request's mTLS handshake when available, plus any
+    // server-resolved tenant/workload mapping (ADR-038 §D4).
+    //
+    // Fallback chain when the dedicated endpoint is unavailable
+    // (older server, plain HTTP listener): scrape `/cluster/info`
+    // for node id only and merge the env tenant.
+    let env_tenant = std::env::var("KISEKI_TENANT_ID").ok();
+    let body_result = http_get_admin(&endpoint, "/admin/whoami")
+        .or_else(|_| http_get_admin(&endpoint, "/cluster/info"));
+    match body_result {
         Ok(body) => {
-            let node_id = json_u64(&body, "node_id").unwrap_or(0);
-            // Tenant is currently always the bootstrap tenant on
-            // single-tenant deployments. ADR-038 §D4 documents the
-            // mTLS SAN→tenant mapping for production.
-            let tenant = std::env::var("KISEKI_TENANT_ID")
-                .unwrap_or_else(|_| "bootstrap (00000000-0000-0000-0000-000000000001)".to_string());
-            println!("Endpoint:   {endpoint}");
-            println!("Connected:  node {node_id}");
-            println!("Tenant:     {tenant}");
-            println!("Note: SAN identity isn't surfaced over HTTP yet — see");
-            println!("      specs/findings/2026-05-15-ui-cli-followups.md.");
+            let rendered = format_whoami(&body, &endpoint, env_tenant.as_deref());
+            print!("{rendered}");
         }
         Err(e) => {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
     }
+}
+
+/// Render the `whoami` block from a JSON body (either `/admin/whoami`
+/// or `/cluster/info`). The SAN-aware output takes precedence over the
+/// env tenant fallback when the server surfaces a `san` field.
+fn format_whoami(body: &str, endpoint: &str, env_tenant: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "Endpoint:   {endpoint}");
+    let node_id = json_u64(body, "node_id").unwrap_or(0);
+    let _ = writeln!(out, "Connected:  node {node_id}");
+
+    let san = json_str(body, "san");
+    let tenant_from_body = json_str(body, "tenant_id");
+    let workload_from_body = json_str(body, "workload_id");
+
+    match san {
+        Some(s) if !s.is_empty() => {
+            // The server saw an mTLS SAN — use it as the principal.
+            let _ = writeln!(out, "Principal:  {s}");
+        }
+        _ => {
+            // No SAN — the connection isn't mTLS-authenticated.
+            let _ = writeln!(
+                out,
+                "Principal:  (no SAN) — connection is not mTLS-authenticated"
+            );
+        }
+    }
+
+    let tenant_display = tenant_from_body
+        .map(str::to_string)
+        .or_else(|| env_tenant.map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    let _ = writeln!(out, "Tenant:     {tenant_display}");
+
+    if let Some(wl) = workload_from_body {
+        if !wl.is_empty() {
+            let _ = writeln!(out, "Workload:   {wl}");
+        }
+    }
+    out
+}
+
+/// Extract a string value for `key` from a flat JSON object. Mirrors
+/// `kiseki-admin`'s parser — stdlib only.
+fn json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\"");
+    let idx = json.find(&pattern)?;
+    let after_key = &json[idx + pattern.len()..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?;
+    let after_ws = after_colon.trim_start();
+    let stripped = after_ws.strip_prefix('"')?;
+    let end = stripped.find('"')?;
+    Some(&stripped[..end])
 }
 
 fn handle_namespaces(args: &[String]) {
@@ -932,5 +984,48 @@ mod tests {
     fn json_u64_extracts_simple_value() {
         let body = r#"{"node_id": 42, "other": "x"}"#;
         assert_eq!(json_u64(body, "node_id"), Some(42));
+    }
+
+    // --- D6: SAN identity is surfaced in whoami when the server reports it ---
+
+    #[test]
+    fn whoami_san_from_body_preferred_over_env() {
+        // `/admin/whoami` response. When `san` is present, the CLI MUST
+        // print it as the authenticated principal. The env fallback
+        // only fires when the server didn't report one.
+        let body = r#"{"node_id": 1, "san": "spiffe://kiseki/tenant/acme/wl/trainer", "tenant_id": "acme", "workload_id": "trainer"}"#;
+        let rendered = format_whoami(body, "http://localhost:9090", Some("env-fallback"));
+        assert!(
+            rendered.contains("spiffe://kiseki/tenant/acme/wl/trainer"),
+            "SAN principal missing from output: {rendered}"
+        );
+        assert!(rendered.contains("acme"), "tenant missing: {rendered}");
+        assert!(rendered.contains("trainer"), "workload missing: {rendered}");
+    }
+
+    #[test]
+    fn whoami_falls_back_to_env_when_san_absent() {
+        let body = r#"{"node_id": 7}"#;
+        let rendered = format_whoami(body, "http://localhost:9090", Some("env-fallback"));
+        assert!(
+            rendered.contains("env-fallback"),
+            "env tenant fallback missing: {rendered}"
+        );
+        // We should signal that no mTLS SAN was negotiated.
+        assert!(
+            rendered.contains("none")
+                || rendered.contains("not authenticated")
+                || rendered.contains("(no SAN)"),
+            "absent-SAN marker missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn whoami_handles_no_env_fallback() {
+        let body = r#"{"node_id": 7}"#;
+        let rendered = format_whoami(body, "http://localhost:9090", None);
+        // Tolerant of either explicit `unknown` or empty: just check
+        // the helper doesn't panic and emits node info.
+        assert!(rendered.contains("node 7"), "node line missing: {rendered}");
     }
 }
