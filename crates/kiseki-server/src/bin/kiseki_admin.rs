@@ -1,4 +1,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![allow(
+    clippy::assigning_clones,
+    clippy::too_many_lines,
+    clippy::map_unwrap_or,
+    clippy::useless_format,
+    clippy::write_literal
+)]
 //! kiseki-admin -- remote cluster administration CLI.
 //!
 //! Connects to any Kiseki node via the REST API at `:9090`.
@@ -486,6 +493,7 @@ fn format_ops_response(body: &str) -> String {
 
 struct Args {
     endpoint: String,
+    json: bool,
     command: Command,
 }
 
@@ -505,6 +513,50 @@ enum Command {
     Backup,
     Scrub,
     Help,
+    /// `--version` short-circuit.
+    Version,
+    /// `shards` — per-shard leader map (mirrors `/cluster/info` shards).
+    Shards,
+    /// `forwarding` — proxy + stale-leader counters per node.
+    Forwarding,
+    /// `audit query [--tenant T] [--type X] [--limit N] [--from S]`
+    AuditQuery {
+        tenant: Option<String>,
+        event_type: Option<String>,
+        limit: Option<usize>,
+        from: Option<u64>,
+    },
+    /// `tenant <subcmd>`
+    TenantCreateOrg {
+        name: String,
+    },
+    TenantList {
+        kind: String,
+    },
+    /// `snapshot {create|list|restore}`
+    SnapshotCreate {
+        note: Option<String>,
+    },
+    SnapshotList,
+    SnapshotRestore {
+        snapshot_id: String,
+    },
+    /// `drain <node-id>`
+    Drain {
+        node_id: u64,
+    },
+    DrainCancel {
+        node_id: u64,
+    },
+    DrainStatus,
+    /// `keys {status|rotate}`
+    KeysStatus,
+    KeysRotate,
+    /// `config show [--node N | --all]`
+    ConfigShow {
+        node: Option<String>,
+        all: bool,
+    },
 }
 
 fn print_usage() {
@@ -512,41 +564,65 @@ fn print_usage() {
         "kiseki-admin -- remote cluster administration CLI\n\
          \n\
          Usage:\n\
-         \x20 kiseki-admin [--endpoint URL] <command> [options]\n\
+         \x20 kiseki-admin [--endpoint URL] [--json] <command> [options]\n\
          \n\
          Commands:\n\
          \x20 status                         Cluster status summary\n\
          \x20 nodes                          Node list with health and metrics\n\
-         \x20 events [--severity S] [--hours N]  Event log (severity: info|warning|error|critical)\n\
+         \x20 events [--severity S] [--hours N]  Event log\n\
          \x20 history [--hours N]            Metric history time series\n\
          \x20 maintenance on|off             Toggle cluster maintenance mode\n\
          \x20 backup                         Trigger a backup\n\
          \x20 scrub                          Trigger an integrity scrub\n\
+         \x20 shards                         Per-shard leader map (ADR-008 rev 2)\n\
+         \x20 forwarding                     Proxy + stale-leader counters\n\
+         \x20 tenant list [--type org|project|workload|namespace]\n\
+         \x20 tenant create-org <name>\n\
+         \x20 audit query [--tenant T] [--type X] [--limit N] [--from S]\n\
+         \x20 snapshot create [--note T]     Create a snapshot\n\
+         \x20 snapshot list                  List snapshots\n\
+         \x20 snapshot restore <id>          Restore a snapshot\n\
+         \x20 drain <node-id>                Initiate drain\n\
+         \x20 drain status                   Show drain progress\n\
+         \x20 drain cancel <node-id>         Cancel a drain\n\
+         \x20 keys status                    Show key-manager epochs\n\
+         \x20 keys rotate                    Rotate the system master key\n\
+         \x20 config show [--node N | --all] Show runtime knobs\n\
+         \x20 --version                      Print version\n\
          \x20 help                           Show this message\n\
          \n\
-         Endpoint defaults to KISEKI_ENDPOINT env var, or http://localhost:9090"
+         Global flags:\n\
+         \x20 --json                         Emit machine-readable JSON instead of human tables\n\
+         \x20 --endpoint URL                 Defaults to KISEKI_ENDPOINT or http://localhost:9090"
     );
 }
 
-/// Parse the global `--endpoint` flag and return (endpoint, remaining index).
-fn parse_endpoint(args: &[String]) -> (String, usize) {
+/// Parse the global `--endpoint` and `--json` flags. Returns (endpoint, json, remaining index).
+fn parse_globals(args: &[String]) -> (String, bool, usize) {
     let mut endpoint: Option<String> = None;
+    let mut json = false;
     let mut i = 0;
 
     while i < args.len() {
-        if args[i] == "--endpoint" {
-            i += 1;
-            endpoint = args.get(i).cloned();
-            i += 1;
-        } else if let Some(val) = args[i].strip_prefix("--endpoint=") {
-            endpoint = Some(val.to_string());
-            i += 1;
-        } else {
-            break;
+        match args[i].as_str() {
+            "--endpoint" => {
+                i += 1;
+                endpoint = args.get(i).cloned();
+                i += 1;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            other if other.starts_with("--endpoint=") => {
+                endpoint = Some(other.trim_start_matches("--endpoint=").to_string());
+                i += 1;
+            }
+            _ => break,
         }
     }
 
-    (endpoint.unwrap_or_else(default_endpoint), i)
+    (endpoint.unwrap_or_else(default_endpoint), json, i)
 }
 
 /// Parse the subcommand and its options from remaining args.
@@ -618,9 +694,196 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
         }
         "backup" => Ok(Command::Backup),
         "scrub" => Ok(Command::Scrub),
+        "shards" => Ok(Command::Shards),
+        "forwarding" => Ok(Command::Forwarding),
+        "audit" => parse_audit(&args[i..]),
+        "tenant" => parse_tenant(&args[i..]),
+        "snapshot" => parse_snapshot(&args[i..]),
+        "drain" => parse_drain(&args[i..]),
+        "keys" => parse_keys(&args[i..]),
+        "config" => parse_config(&args[i..]),
+        "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command: {other}")),
     }
+}
+
+fn parse_audit(rest: &[String]) -> Result<Command, String> {
+    let sub = rest.first().ok_or("audit requires a subcommand (query)")?;
+    if sub != "query" {
+        return Err(format!("unknown audit subcommand: {sub}"));
+    }
+    let mut tenant = None;
+    let mut event_type = None;
+    let mut limit = None;
+    let mut from = None;
+    let mut i = 1;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--tenant" => {
+                i += 1;
+                tenant = Some(rest.get(i).ok_or("--tenant requires a value")?.clone());
+            }
+            "--type" => {
+                i += 1;
+                event_type = Some(rest.get(i).ok_or("--type requires a value")?.clone());
+            }
+            "--limit" => {
+                i += 1;
+                limit = Some(
+                    rest.get(i)
+                        .ok_or("--limit requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--limit must be a positive integer")?,
+                );
+            }
+            "--from" => {
+                i += 1;
+                from = Some(
+                    rest.get(i)
+                        .ok_or("--from requires a value")?
+                        .parse::<u64>()
+                        .map_err(|_| "--from must be a positive integer")?,
+                );
+            }
+            other => return Err(format!("unknown audit query option: {other}")),
+        }
+        i += 1;
+    }
+    Ok(Command::AuditQuery {
+        tenant,
+        event_type,
+        limit,
+        from,
+    })
+}
+
+fn parse_tenant(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .ok_or("tenant requires a subcommand (list, create-org, ...)")?;
+    match sub.as_str() {
+        "list" => {
+            // optional --type flag; default = orgs
+            let mut kind = String::from("org");
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--type" => {
+                        i += 1;
+                        kind = rest.get(i).ok_or("--type requires a value")?.clone();
+                    }
+                    other => return Err(format!("unknown tenant list option: {other}")),
+                }
+                i += 1;
+            }
+            Ok(Command::TenantList { kind })
+        }
+        "create-org" => {
+            let name = rest.get(1).ok_or("create-org requires <name>")?.clone();
+            Ok(Command::TenantCreateOrg { name })
+        }
+        // create-project / create-workload / create-namespace need
+        // multi-step gRPC plumbing (org-id / project-id resolution,
+        // typed enums); deferred to the followups doc — the existing
+        // ControlService gRPC handles these.
+        other => Err(format!(
+            "tenant subcommand {other} not yet wired into CLI; use the gRPC ControlService"
+        )),
+    }
+}
+
+fn parse_snapshot(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .ok_or("snapshot requires a subcommand (create, list, restore)")?;
+    match sub.as_str() {
+        "create" => {
+            let mut note = None;
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--note" => {
+                        i += 1;
+                        note = Some(rest.get(i).ok_or("--note requires a value")?.clone());
+                    }
+                    other => return Err(format!("unknown snapshot create option: {other}")),
+                }
+                i += 1;
+            }
+            Ok(Command::SnapshotCreate { note })
+        }
+        "list" => Ok(Command::SnapshotList),
+        "restore" => {
+            let id = rest.get(1).ok_or("restore requires <snapshot-id>")?.clone();
+            Ok(Command::SnapshotRestore { snapshot_id: id })
+        }
+        other => Err(format!("unknown snapshot subcommand: {other}")),
+    }
+}
+
+fn parse_drain(rest: &[String]) -> Result<Command, String> {
+    let head = rest
+        .first()
+        .ok_or("drain requires <node-id> or 'status' / 'cancel'")?;
+    match head.as_str() {
+        "status" => Ok(Command::DrainStatus),
+        "cancel" => {
+            let id = rest
+                .get(1)
+                .ok_or("drain cancel requires <node-id>")?
+                .parse::<u64>()
+                .map_err(|_| "node-id must be a positive integer")?;
+            Ok(Command::DrainCancel { node_id: id })
+        }
+        other => {
+            let id = other
+                .parse::<u64>()
+                .map_err(|_| format!("drain expects a node-id, got '{other}'"))?;
+            Ok(Command::Drain { node_id: id })
+        }
+    }
+}
+
+fn parse_keys(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .ok_or("keys requires a subcommand (status, rotate)")?;
+    match sub.as_str() {
+        "status" => Ok(Command::KeysStatus),
+        "rotate" => Ok(Command::KeysRotate),
+        // 'shred' requires a tenant-id arg and the live KeyManagerOps
+        // path — not yet exposed over HTTP; see followups doc.
+        other => Err(format!(
+            "keys subcommand {other} not wired into CLI; use the gRPC KeyManagerService"
+        )),
+    }
+}
+
+fn parse_config(rest: &[String]) -> Result<Command, String> {
+    let sub = rest.first().ok_or("config requires 'show' subcommand")?;
+    if sub != "show" {
+        return Err(format!("unknown config subcommand: {sub}"));
+    }
+    let mut node = None;
+    let mut all = false;
+    let mut i = 1;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--node" => {
+                i += 1;
+                node = Some(rest.get(i).ok_or("--node requires a value")?.clone());
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+                continue;
+            }
+            other => return Err(format!("unknown config show option: {other}")),
+        }
+        i += 1;
+    }
+    Ok(Command::ConfigShow { node, all })
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -629,14 +892,29 @@ fn parse_args() -> Result<Args, String> {
     if args.is_empty() {
         return Ok(Args {
             endpoint: default_endpoint(),
+            json: false,
             command: Command::Help,
         });
     }
 
-    let (endpoint, sub_start) = parse_endpoint(&args);
+    // Short-circuit --version before any other parsing so it works
+    // even with no other args.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        return Ok(Args {
+            endpoint: default_endpoint(),
+            json: false,
+            command: Command::Version,
+        });
+    }
+
+    let (endpoint, json, sub_start) = parse_globals(&args);
     let command = parse_subcommand(&args, sub_start)?;
 
-    Ok(Args { endpoint, command })
+    Ok(Args {
+        endpoint,
+        json,
+        command,
+    })
 }
 
 fn default_endpoint() -> String {
@@ -657,49 +935,231 @@ fn main() {
         }
     };
 
-    let result =
-        match args.command {
-            Command::Status => {
-                http_get(&args.endpoint, "/ui/api/cluster").map(|b| format_cluster_status(&b))
+    let json = args.json;
+    let result = match args.command {
+        Command::Status => http_get(&args.endpoint, "/ui/api/cluster").map(|b| {
+            if json {
+                b
+            } else {
+                format_cluster_status(&b)
             }
-            Command::Nodes => http_get(&args.endpoint, "/ui/api/nodes").map(|b| format_nodes(&b)),
-            Command::Events { severity, hours } => {
-                let mut params = Vec::new();
-                if let Some(s) = &severity {
-                    params.push(format!("severity={s}"));
-                }
-                if let Some(h) = hours {
-                    params.push(format!("hours={h}"));
-                }
-                let path = if params.is_empty() {
-                    "/ui/api/events".to_string()
+        }),
+        Command::Nodes => {
+            http_get(&args.endpoint, "/ui/api/nodes")
+                .map(|b| if json { b } else { format_nodes(&b) })
+        }
+        Command::Events { severity, hours } => {
+            let mut params = Vec::new();
+            if let Some(s) = &severity {
+                params.push(format!("severity={s}"));
+            }
+            if let Some(h) = hours {
+                params.push(format!("hours={h}"));
+            }
+            let path = if params.is_empty() {
+                "/ui/api/events".to_string()
+            } else {
+                format!("/ui/api/events?{}", params.join("&"))
+            };
+            http_get(&args.endpoint, &path).map(|b| if json { b } else { format_events(&b) })
+        }
+        Command::History { hours } => {
+            let path = if let Some(h) = hours {
+                format!("/ui/api/history?hours={h}")
+            } else {
+                "/ui/api/history".to_string()
+            };
+            http_get(&args.endpoint, &path).map(|b| if json { b } else { format_history(&b) })
+        }
+        Command::Maintenance { enabled } => {
+            let body = format!(r#"{{"enabled":{enabled}}}"#);
+            http_post(&args.endpoint, "/ui/api/ops/maintenance", &body).map(|b| {
+                if json {
+                    b
                 } else {
-                    format!("/ui/api/events?{}", params.join("&"))
-                };
-                http_get(&args.endpoint, &path).map(|b| format_events(&b))
+                    format_ops_response(&b)
+                }
+            })
+        }
+        Command::Backup => http_post(&args.endpoint, "/ui/api/ops/backup", "{}").map(|b| {
+            if json {
+                b
+            } else {
+                format_ops_response(&b)
             }
-            Command::History { hours } => {
-                let path = if let Some(h) = hours {
-                    format!("/ui/api/history?hours={h}")
+        }),
+        Command::Scrub => http_post(&args.endpoint, "/ui/api/ops/scrub", "{}").map(|b| {
+            if json {
+                b
+            } else {
+                format_ops_response(&b)
+            }
+        }),
+        Command::Shards => http_get(&args.endpoint, "/admin/topology/shards").map(|b| {
+            if json {
+                b
+            } else {
+                format_shards(&b)
+            }
+        }),
+        Command::Forwarding => http_get(&args.endpoint, "/admin/topology/forwarding").map(|b| {
+            if json {
+                b
+            } else {
+                format_forwarding(&b)
+            }
+        }),
+        Command::AuditQuery {
+            tenant,
+            event_type,
+            limit,
+            from,
+        } => {
+            let mut params = Vec::new();
+            if let Some(t) = &tenant {
+                params.push(format!("tenant={t}"));
+            }
+            if let Some(t) = &event_type {
+                params.push(format!("event_type={t}"));
+            }
+            if let Some(n) = limit {
+                params.push(format!("limit={n}"));
+            }
+            if let Some(s) = from {
+                params.push(format!("from={s}"));
+            }
+            let path = if params.is_empty() {
+                "/admin/audit/query".to_string()
+            } else {
+                format!("/admin/audit/query?{}", params.join("&"))
+            };
+            http_get(&args.endpoint, &path).map(|b| if json { b } else { format_audit(&b) })
+        }
+        Command::TenantList { kind } => {
+            let path = match kind.as_str() {
+                "project" | "projects" => "/admin/tenants/projects",
+                "workload" | "workloads" => "/admin/tenants/workloads",
+                "namespace" | "namespaces" => "/admin/tenants/namespaces",
+                _ => "/admin/tenants/orgs",
+            };
+            http_get(&args.endpoint, path).map(|b| if json { b } else { format_tenants(&b, &kind) })
+        }
+        Command::TenantCreateOrg { name } => {
+            let body = format!(r#"{{"name":"{}"}}"#, json_escape(&name));
+            http_post(&args.endpoint, "/admin/tenants/orgs", &body).map(|b| {
+                if json {
+                    b
                 } else {
-                    "/ui/api/history".to_string()
-                };
-                http_get(&args.endpoint, &path).map(|b| format_history(&b))
+                    format!("Created org: {b}\n")
+                }
+            })
+        }
+        Command::SnapshotCreate { note } => {
+            let body = note
+                .map(|n| format!(r#"{{"note":"{}"}}"#, json_escape(&n)))
+                .unwrap_or_else(|| "{}".to_string());
+            http_post(&args.endpoint, "/admin/snapshots", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format_ops_response(&b)
+                }
+            })
+        }
+        Command::SnapshotList => http_get(&args.endpoint, "/admin/snapshots").map(|b| {
+            if json {
+                b
+            } else {
+                format_snapshots(&b)
             }
-            Command::Maintenance { enabled } => {
-                let body = format!(r#"{{"enabled":{enabled}}}"#);
-                http_post(&args.endpoint, "/ui/api/ops/maintenance", &body)
-                    .map(|b| format_ops_response(&b))
+        }),
+        Command::SnapshotRestore { snapshot_id } => {
+            let body = format!(r#"{{"snapshot_id":"{}"}}"#, json_escape(&snapshot_id));
+            http_post(&args.endpoint, "/admin/snapshots/restore", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format_ops_response(&b)
+                }
+            })
+        }
+        Command::Drain { node_id } => {
+            let body = format!(r#"{{"node_id":{node_id}}}"#);
+            http_post(&args.endpoint, "/admin/drains", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format_ops_response(&b)
+                }
+            })
+        }
+        Command::DrainCancel { node_id } => {
+            let body = format!(r#"{{"node_id":{node_id}}}"#);
+            http_post(&args.endpoint, "/admin/drains/cancel", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format_ops_response(&b)
+                }
+            })
+        }
+        Command::DrainStatus => {
+            http_get(&args.endpoint, "/admin/drains")
+                .map(|b| if json { b } else { format_drains(&b) })
+        }
+        Command::KeysStatus => http_get(&args.endpoint, "/admin/keys/status").map(|b| {
+            if json {
+                b
+            } else {
+                format_keys_status(&b)
             }
-            Command::Backup => http_post(&args.endpoint, "/ui/api/ops/backup", "{}")
-                .map(|b| format_ops_response(&b)),
-            Command::Scrub => http_post(&args.endpoint, "/ui/api/ops/scrub", "{}")
-                .map(|b| format_ops_response(&b)),
-            Command::Help => {
-                print_usage();
-                std::process::exit(0);
+        }),
+        Command::KeysRotate => http_post(&args.endpoint, "/admin/keys/rotate", "{}").map(|b| {
+            if json {
+                b
+            } else {
+                format_ops_response(&b)
             }
-        };
+        }),
+        Command::ConfigShow { node, all } => {
+            // The HTTP endpoint always reports the local node's config.
+            // --all = scrape /admin/config on every peer (discovered via /cluster/info).
+            // --node N picks one peer's metrics_addr from /cluster/info.
+            if all {
+                fetch_config_for_all_peers(&args.endpoint).map(|b| {
+                    if json {
+                        b
+                    } else {
+                        format_config_all(&b)
+                    }
+                })
+            } else if let Some(n) = node {
+                fetch_config_for_peer(&args.endpoint, &n).map(|b| {
+                    if json {
+                        b
+                    } else {
+                        format_config(&b)
+                    }
+                })
+            } else {
+                http_get(&args.endpoint, "/admin/config").map(|b| {
+                    if json {
+                        b
+                    } else {
+                        format_config(&b)
+                    }
+                })
+            }
+        }
+        Command::Version => {
+            println!("kiseki-admin {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Command::Help => {
+            print_usage();
+            std::process::exit(0);
+        }
+    };
 
     match result {
         Ok(output) => {
@@ -710,4 +1170,304 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Formatters for new subcommand responses
+// ---------------------------------------------------------------------------
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn format_shards(body: &str) -> String {
+    let arr = json_array_value(body, "shards").unwrap_or("[]");
+    let shards = json_array_elements(arr);
+    if shards.is_empty() {
+        return "No shards reported.\n".to_string();
+    }
+    let mut out = format!(
+        "\n{BOLD}{:<40} {:<24} {:<8} {:<24}{RESET}\n",
+        "SHARD", "NAMESPACE", "LEADER", "LEADER-ADDR"
+    );
+    for s in &shards {
+        let _ = writeln!(
+            out,
+            "{:<40} {:<24} {:<8} {:<24}",
+            json_str(s, "shard_id").unwrap_or("?"),
+            json_str(s, "namespace_id").unwrap_or("?"),
+            json_u64(s, "leader_id")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            json_str(s, "leader_data_addr").unwrap_or("-"),
+        );
+    }
+    out
+}
+
+fn format_forwarding(body: &str) -> String {
+    let proxy_on = json_bool(body, "proxy_fallback_enabled").unwrap_or(false);
+    let mut out = format!(
+        "\n{BOLD}Proxy fallback:{RESET} {}\n",
+        if proxy_on { "ON" } else { "off" }
+    );
+    let forwards = json_array_value(body, "forwards").unwrap_or("[]");
+    let forwards = json_array_elements(forwards);
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{BOLD}{:<14} {:<14} {:>10}{RESET}",
+        "SOURCE", "LEADER", "FORWARDS"
+    );
+    if forwards.is_empty() {
+        let _ = writeln!(out, "(none yet)");
+    } else {
+        for r in &forwards {
+            // Each row has `{"labels":{"source_node":"1","leader_node":"2"},"value":3}`
+            let labels = json_object_value(r, "labels").unwrap_or("{}");
+            let val = json_u64(r, "value").unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "{:<14} {:<14} {:>10}",
+                json_str(labels, "source_node").unwrap_or("?"),
+                json_str(labels, "leader_node").unwrap_or("?"),
+                val,
+            );
+        }
+    }
+    let stale = json_array_value(body, "stale_leader_redirects").unwrap_or("[]");
+    let stale = json_array_elements(stale);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{BOLD}{:<14} {:>10}{RESET}", "PROTOCOL", "REDIRECTS");
+    if stale.is_empty() {
+        let _ = writeln!(out, "(none yet)");
+    } else {
+        for r in &stale {
+            let labels = json_object_value(r, "labels").unwrap_or("{}");
+            let val = json_u64(r, "value").unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "{:<14} {:>10}",
+                json_str(labels, "protocol").unwrap_or("?"),
+                val,
+            );
+        }
+    }
+    out
+}
+
+fn format_audit(body: &str) -> String {
+    let events_arr = json_array_value(body, "events").unwrap_or("[]");
+    let events = json_array_elements(events_arr);
+    if events.is_empty() {
+        return "No audit events.\n".to_string();
+    }
+    let mut out = format!(
+        "\n{BOLD}{:<8} {:<22} {:<20} {}{RESET}\n",
+        "SEQ", "TYPE", "ACTOR", "DESCRIPTION"
+    );
+    for e in &events {
+        let _ = writeln!(
+            out,
+            "{:<8} {:<22} {:<20} {}",
+            json_u64(e, "sequence").unwrap_or(0),
+            json_str(e, "type").unwrap_or("?"),
+            json_str(e, "actor").unwrap_or("?"),
+            json_str(e, "description").unwrap_or(""),
+        );
+    }
+    out
+}
+
+fn format_tenants(body: &str, kind: &str) -> String {
+    let key = match kind {
+        "project" | "projects" => "projects",
+        "workload" | "workloads" => "workloads",
+        "namespace" | "namespaces" => "namespaces",
+        _ => "orgs",
+    };
+    let arr = json_array_value(body, key).unwrap_or("[]");
+    let items = json_array_elements(arr);
+    if items.is_empty() {
+        return format!("No {key}.\n");
+    }
+    let mut out = format!("\n{BOLD}{:<40} {}{RESET}\n", "ID", "NAME");
+    for it in &items {
+        let _ = writeln!(
+            out,
+            "{:<40} {}",
+            json_str(it, "id").unwrap_or("?"),
+            json_str(it, "name").unwrap_or(""),
+        );
+    }
+    out
+}
+
+fn format_snapshots(body: &str) -> String {
+    let arr = json_array_value(body, "snapshots").unwrap_or("[]");
+    let snaps = json_array_elements(arr);
+    if snaps.is_empty() {
+        return "No snapshots.\n".to_string();
+    }
+    let mut out = format!(
+        "\n{BOLD}{:<40} {:>12} {:>12} {}{RESET}\n",
+        "SNAPSHOT-ID", "META-BYTES", "DATA-BYTES", "CREATED-AT"
+    );
+    for s in &snaps {
+        let _ = writeln!(
+            out,
+            "{:<40} {:>12} {:>12} {}",
+            json_str(s, "snapshot_id").unwrap_or("?"),
+            json_u64(s, "metadata_bytes").unwrap_or(0),
+            json_u64(s, "data_bytes").unwrap_or(0),
+            json_str(s, "created_at").unwrap_or(""),
+        );
+    }
+    out
+}
+
+fn format_drains(body: &str) -> String {
+    let arr = json_array_value(body, "drains").unwrap_or("[]");
+    let drains = json_array_elements(arr);
+    if drains.is_empty() {
+        return "No drains active.\n".to_string();
+    }
+    let mut out = format!(
+        "\n{BOLD}{:<10} {:<12} {:>10}{RESET}\n",
+        "NODE", "STATE", "SHARDS"
+    );
+    for d in &drains {
+        let _ = writeln!(
+            out,
+            "{:<10} {:<12} {:>10}",
+            json_u64(d, "node_id").unwrap_or(0),
+            json_str(d, "state").unwrap_or("?"),
+            json_u64(d, "voter_in_shards").unwrap_or(0),
+        );
+    }
+    out
+}
+
+fn format_keys_status(body: &str) -> String {
+    let cur = json_u64(body, "current_epoch")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".into());
+    let mut out = format!("\n{BOLD}Current epoch:{RESET} {cur}\n");
+    let epochs_arr = json_array_value(body, "epochs").unwrap_or("[]");
+    let epochs = json_array_elements(epochs_arr);
+    let _ = writeln!(
+        out,
+        "{BOLD}{:>6} {:<8} {}{RESET}",
+        "EPOCH", "CURRENT", "MIGRATED"
+    );
+    for e in &epochs {
+        let _ = writeln!(
+            out,
+            "{:>6} {:<8} {}",
+            json_u64(e, "epoch").unwrap_or(0),
+            json_bool(e, "is_current").unwrap_or(false),
+            json_bool(e, "migration_complete").unwrap_or(false),
+        );
+    }
+    out
+}
+
+fn format_config(body: &str) -> String {
+    let node_id = json_u64(body, "node_id").unwrap_or(0);
+    let mut out = format!("\n{BOLD}Node {node_id} config{RESET}\n");
+    // The "config" object isn't easy to parse with the homegrown JSON
+    // utilities (no recursive walk); just append the raw body for
+    // operator readability.
+    let cfg = json_object_value(body, "config").unwrap_or("{}");
+    let _ = writeln!(out, "{cfg}");
+    out
+}
+
+fn format_config_all(body: &str) -> String {
+    // body is `{"nodes":[{node_id, config}, ...]}`
+    let nodes_arr = json_array_value(body, "nodes").unwrap_or("[]");
+    let nodes = json_array_elements(nodes_arr);
+    let mut out = String::new();
+    for n in &nodes {
+        out.push_str(&format_config(n));
+    }
+    out
+}
+
+/// Discover all peer metrics endpoints from `/cluster/info` and scrape
+/// `/admin/config` on each, returning a synthesized JSON object.
+fn fetch_config_for_all_peers(endpoint: &str) -> Result<String, String> {
+    let info = http_get(endpoint, "/cluster/info")?;
+    let peers_arr = json_array_value(&info, "peers").unwrap_or("[]");
+    let peers = json_array_elements(peers_arr);
+    let mut out = String::from(r#"{"nodes":["#);
+    for (i, p) in peers.iter().enumerate() {
+        let metrics_addr = json_str(p, "metrics_addr").unwrap_or("");
+        if metrics_addr.is_empty() {
+            continue;
+        }
+        let url = format!("http://{metrics_addr}");
+        let body = http_get(&url, "/admin/config").unwrap_or_else(|_| "{}".to_string());
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&body);
+    }
+    out.push_str("]}");
+    Ok(out)
+}
+
+fn fetch_config_for_peer(endpoint: &str, node: &str) -> Result<String, String> {
+    // `node` may be either a NodeId (decimal) or a `host:port`. If it
+    // parses as integer, look it up via `/cluster/info` `peers`.
+    if let Ok(target_id) = node.parse::<u64>() {
+        let info = http_get(endpoint, "/cluster/info")?;
+        let peers_arr = json_array_value(&info, "peers").unwrap_or("[]");
+        let peers = json_array_elements(peers_arr);
+        for p in &peers {
+            if json_u64(p, "id") == Some(target_id) {
+                let metrics_addr = json_str(p, "metrics_addr").unwrap_or("");
+                if metrics_addr.is_empty() {
+                    return Err(format!("node {target_id} has no metrics_addr"));
+                }
+                let url = format!("http://{metrics_addr}");
+                return http_get(&url, "/admin/config");
+            }
+        }
+        Err(format!("node {target_id} not found in /cluster/info peers"))
+    } else {
+        let url = if node.starts_with("http://") {
+            node.to_string()
+        } else {
+            format!("http://{node}")
+        };
+        http_get(&url, "/admin/config")
+    }
+}
+
+/// Extract a JSON object substring (`{...}`) for a key. Like
+/// `json_array_value` but for `{...}` instead of `[...]`.
+fn json_object_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\"");
+    let idx = json.find(&pattern)?;
+    let after_key = &json[idx + pattern.len()..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?;
+    let after_ws = after_colon.trim_start();
+    if !after_ws.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, c) in after_ws.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&after_ws[..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

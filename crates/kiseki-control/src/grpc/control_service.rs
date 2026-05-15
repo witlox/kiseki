@@ -22,7 +22,7 @@ use kiseki_common::locks::LockOrDie;
 /// gRPC handler wrapping the control-plane stores.
 pub struct ControlGrpc {
     tenants: Arc<TenantStore>,
-    namespaces: NamespaceStore,
+    namespaces: Arc<NamespaceStore>,
     retention: RetentionStore,
     federation: FederationRegistry,
     maintenance: MaintenanceState,
@@ -30,12 +30,22 @@ pub struct ControlGrpc {
 }
 
 impl ControlGrpc {
-    /// Create a new gRPC handler.
+    /// Create a new gRPC handler with a freshly-constructed namespace store.
     #[must_use]
     pub fn new(tenants: Arc<TenantStore>) -> Self {
+        Self::with_namespaces(tenants, Arc::new(NamespaceStore::new()))
+    }
+
+    /// Create a new gRPC handler sharing an existing namespace store.
+    ///
+    /// The admin web UI clones the same `Arc<NamespaceStore>` so the
+    /// Tenants dashboard tab and `kiseki-client namespaces list` see
+    /// the same data that `CreateNamespace` writes go to.
+    #[must_use]
+    pub fn with_namespaces(tenants: Arc<TenantStore>, namespaces: Arc<NamespaceStore>) -> Self {
         Self {
             tenants,
-            namespaces: NamespaceStore::new(),
+            namespaces,
             retention: RetentionStore::new(),
             federation: FederationRegistry::new(),
             maintenance: MaintenanceState::new(),

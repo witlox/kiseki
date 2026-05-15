@@ -82,6 +82,81 @@ kiseki-admin scrub
 
 Toggle cluster-wide maintenance mode (sets all shards read-only — write commands return a retriable error per I-O6), trigger an immediate backup snapshot (ADR-016), or kick off an integrity scrub.
 
+### shards / forwarding
+
+```
+kiseki-admin shards                       # ADR-008 rev 2 per-shard leader map
+kiseki-admin forwarding                   # proxy + stale-leader counters
+```
+
+### audit query
+
+```
+kiseki-admin audit query [--tenant <uuid>] [--type key-rotation] [--limit 200] [--from 1]
+```
+
+Reads the in-memory audit shard. `--type` accepts any
+`AuditEventType` variant in kebab- or PascalCase (`key-rotation`,
+`KeyRotation`, `KEYROTATION`).
+
+### snapshot
+
+```
+kiseki-admin snapshot create [--note "pre-upgrade"]
+kiseki-admin snapshot list
+kiseki-admin snapshot restore <snapshot-id>
+```
+
+Requires `KISEKI_BACKUP_BACKEND=fs|s3` on the node.
+
+### drain
+
+```
+kiseki-admin drain <node-id>              # request drain
+kiseki-admin drain status                 # list active drains
+kiseki-admin drain cancel <node-id>
+```
+
+### keys
+
+```
+kiseki-admin keys status                  # current epoch + per-epoch history
+kiseki-admin keys rotate                  # cut a new system master-key epoch
+```
+
+`keys shred` is intentionally not yet wired — see
+`specs/findings/2026-05-15-ui-cli-followups.md`.
+
+### tenant
+
+```
+kiseki-admin tenant list                  # orgs (default)
+kiseki-admin tenant list --type project
+kiseki-admin tenant list --type workload
+kiseki-admin tenant list --type namespace
+kiseki-admin tenant create-org "Acme Corp"
+```
+
+Nested CRUD (project / workload / namespace) requires the gRPC
+`ControlService` — see `docs/api/grpc.md`.
+
+### config show
+
+```
+kiseki-admin config show                  # local node
+kiseki-admin config show --node 2         # peer node 2
+kiseki-admin config show --all            # every peer
+```
+
+### Global flags
+
+| Flag | Effect |
+|------|--------|
+| `--endpoint URL` | Override KISEKI_ENDPOINT for one invocation |
+| `--json` | Emit raw JSON for every subcommand (machine-parseable) |
+| `--version` / `-V` | Print version and exit |
+| `help`, `-h`, `--help` | Print usage and exit |
+
 ---
 
 ## kiseki-storage (gRPC StorageAdminService)
@@ -172,7 +247,29 @@ Every `kiseki-storage` RPC emits an OpenTelemetry span named `StorageAdminServic
 
 ## kiseki-client
 
-The native client binary provides dataset staging and cache management commands for compute nodes.
+The native client binary provides FUSE mounts, dataset staging, cache
+management, and lightweight diagnostics for compute nodes.
+
+### mount
+
+```
+kiseki-client mount --endpoint kiseki://host:9103 --mountpoint /mnt/kiseki
+kiseki-client mount --seeds host1,host2,host3 --mountpoint /mnt/kiseki
+kiseki-client mount --in-memory --mountpoint /mnt/kiseki
+```
+
+`--seeds` takes precedence over `--endpoint` when both are given:
+each seed is tried in turn; the first one that accepts wins.
+
+### Diagnostics (HTTP scrapers, no FUSE required)
+
+```
+kiseki-client whoami [--endpoint URL]
+kiseki-client namespaces list [--endpoint URL]
+kiseki-client quota [--endpoint URL]
+kiseki-client topology [--endpoint URL]
+kiseki-client --version
+```
 
 ### stage --dataset
 
