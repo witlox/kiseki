@@ -1,18 +1,45 @@
 # Performance
 
-Last refreshed: **2026-05-09 post-libfuse-swap** (local matrix
-re-run on HEAD = `527c2e6` after the fuser → libfuse 3.x swap;
-multi-node 3-node matrix in commit `da45687`). Earlier snapshots
-(2026-05-07 post-pool, 2026-05-07, 2026-05-03) are preserved
-below. Detailed per-snapshot data lives in
-[`specs/performance/`](../../specs/performance/INDEX.md).
+Last refreshed: **2026-05-15 GCP compact rerun** (3 × `c3-standard-44-lssd` storage + 2 × `c3-standard-44` client; release `v2026.43.759`). Earlier snapshots are preserved below. Detailed per-snapshot data lives in [`specs/performance/`](../../specs/performance/INDEX.md).
+
+## GCP compact profile — 2026-05-15
+
+3 × `c3-standard-44-lssd` storage (8 × 375 GB NVMe = 3 TB raw per node, Tier_1 100 Gbps) + 2 × `c3-standard-44` clients with 100 GB PD-SSD cache. `europe-west1-b`. Suite: `perf-suite.sh` against the in-cluster ctrl node.
+
+| Protocol | Number | Workload |
+|---|---:|---|
+| NFSv4.2 write | **1.71 GB/s aggregate** | 2 clients × fio bs=1M, direct=1, 4G × 4 jobs |
+| NFSv4.1 write (no layout delegation — see below) | **2.92 GB/s aggregate** | same shape, vers=4.1 mount |
+| S3 PUT 1 MB × 1024 | **673 MB/s** | single client, 8∥ |
+| S3 PUT 4 MB × 256 | **972 MB/s** | |
+| S3 PUT 16 MB × 64 | **1094 MB/s** | |
+| S3 PUT 64 MB × 16 | **1014 MB/s** | |
+| S3 GET 200 × 1 MB | **1170 MB/s** | single client, 8∥ |
+| S3 parallel write | **528 MB/s aggregate** | 2 clients × 100 × 1 MB |
+| S3 PUT latency 1 KB | **p50 7.0 ms · p99 7.5 ms** | |
+| FUSE metadata | **2125 ops/s** | 1000 × `mkdir + create` |
+| FUSE I/O throughput | (unmeasurable) | GH #37 — see below |
+| iperf3 client→leader | 46 Gbps | per direction |
+| iperf3 storage↔storage | 31 Gbps | per direction |
+
+### Open issues surfaced by this run
+
+- **GH #36 — chunk-store fills after ~200 GB cumulative writes** despite 3 TB raw NVMe per node. Allocator hits "device full" with `largest_free_blocks=64` (256 KB). Suspected GC gap or single-disk fan-out.
+- **GH #37 — `kiseki-client mount` does not expose libfuse's `direct_io` flag**, so `fio --direct=1` silently returns 0 MB/s on FUSE mounts. Workaround in suite: `dd conv=fdatasync` (fsync time lands in elapsed total → real gateway throughput rather than memcpy-to-page-cache speed).
+- **GH #38 — EC-4+2 fragment exceeds the 16 MiB per-extent cap by 8 bytes** in any ≥ 6-node cluster. Default profile is unusable until this lands. Compact (3 nodes, R-3 path) does not trip it.
+- **pNFS layout delegation never triggered** on this run. The GCP boot script carried the obsolete `KISEKI_DISABLE_PNFS_LAYOUT=true` workaround (line removed in commit `07e8a96`); next run on a clean cluster should see real LAYOUTGET round-trips. Also requires firewall opening **port 2052** for the kernel client to reach the DS — terraform now opens it.
+
+The NFSv4.1 number above is therefore "NFSv4.1 with MDS-only fallback" — not real pNFS. Re-measure after `07e8a96` deploys.
+
+---
+
+## Earlier snapshots
 
 The 2026-05-10/11 pNFS NFSv4.1 fixes (5-second OPEN hang →
 800+ MB/s reads in commit `d7d90a5`; DS WRITE silent-data-loss
 → correct UNSTABLE/COMMIT round-trip in `6ff8e65`) do not affect
 the local-matrix numbers below — those drive the in-process
-gateways directly and never enter the NFSv4.1 wire path. A
-remote-NFS multi-node re-measurement is pending.
+gateways directly and never enter the NFSv4.1 wire path.
 
 > Operators tuning a deployment for throughput should also read
 > [`docs/operations/durability.md`](../operations/durability.md) —
@@ -81,14 +108,12 @@ default; per-file DS-session establishment tax (EXCHANGE_ID +
 CREATE_SESSION + RECLAIM_COMPLETE on every OPEN+LAYOUTGET, torn
 down on CLOSE) caps reads at sub-MB/s.
 
-The env-var gate `KISEKI_DISABLE_PNFS_LAYOUT=1` (existing since
-Phase 15a, documented in `nfs4_server.rs:1376-1393`) makes the
-server return `NFS4ERR_LAYOUTUNAVAILABLE` on LAYOUTGET; kernel
-falls back to MDS inline reads. Compose now sets it; BDD pNFS
-scenarios bring up their own compose without the env var to
-exercise the layout path intentionally.
-
-DS WRITE support is the actual fix; tracked separately.
+The env-var gate `KISEKI_DISABLE_PNFS_LAYOUT=1` (deprecated as
+of `d7d90a5` + `6ff8e65`; see
+[`docs/operations/performance.md`](../operations/performance.md))
+was the workaround at the time of this snapshot. The DS WRITE +
+session-persistence fix in `d7d90a5` / `6ff8e65` is the real fix;
+the env var should now stay unset in production.
 
 ### Methodology note — fio `--direct=0`
 
@@ -99,8 +124,14 @@ write numbers vs read numbers (writes look 5-15× faster than they
 "should") and is responsible for the asymmetric shape vs the
 single-node matrix (which uses kiseki-profile's userspace
 clients, no kernel page cache in the loop). For
-deployment-realistic numbers use `direct=1`; the GCP perf-suite
-already does (`infra/gcp/benchmarks/perf-suite.sh`).
+deployment-realistic numbers use `direct=1` where the underlying
+filesystem honors `O_DIRECT` (NFS does; S3 has no kernel page
+cache in the loop). The GCP perf-suite uses `direct=1` for NFS
+and S3. **FUSE is the exception**: `kiseki-client mount` does not
+expose libfuse's `direct_io` flag (GH #37), so the suite's FUSE
+phase uses `dd conv=fdatasync` so the fsync time lands in the
+elapsed total — gives real gateway throughput rather than
+memcpy-to-page-cache speed.
 
 ---
 

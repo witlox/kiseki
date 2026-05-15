@@ -123,7 +123,8 @@ data path. Advisory failures never block data-path operations (I-WA2).
 | 9100 | Data-path gRPC (Log, Chunk, Composition, View, Discovery) |
 | 9101 | Advisory gRPC (WorkflowAdvisoryService) |
 | 9000 | S3 HTTP gateway |
-| 2049 | NFS server |
+| 2049 | NFS MDS (v3 + v4.1 + v4.2) |
+| 2052 | pNFS Data Server (NFSv4.1 Flex Files layout) |
 | 9090 | Prometheus metrics + health + admin UI |
 
 ## Binaries

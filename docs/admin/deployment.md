@@ -14,7 +14,7 @@ services for tracing, KMS, and identity.
 
 | Service | Image | Ports | Purpose |
 |---------|-------|-------|---------|
-| `kiseki-server` | `Dockerfile.server` (local build) | 2049, 9000, 9090, 9100, 9101 | Storage node |
+| `kiseki-server` | `Dockerfile.server` (local build) | 2049, 2052, 9000, 9090, 9100, 9101 | Storage node |
 | `jaeger` | `jaegertracing/all-in-one:latest` | 4317, 16686 | Distributed tracing (OTLP) |
 | `vault` | `hashicorp/vault:1.19` | 8200 | Tenant KMS backend (Transit engine) |
 | `keycloak` | `quay.io/keycloak/keycloak:26.0` | 8080 | OIDC identity provider |
@@ -33,7 +33,8 @@ docker compose up --build -d && pytest tests/e2e/
 
 | Port | Protocol | Service |
 |------|----------|---------|
-| 2049 | TCP | NFS (v3 + v4.2) |
+| 2049 | TCP | NFS MDS (v3 + v4.1 + v4.2) |
+| 2052 | TCP | pNFS Data Server (NFSv4.1 Flex Files layout — clients fetch from this port once the MDS issues a LAYOUTGET) |
 | 9000 | HTTP | S3 gateway |
 | 9090 | HTTP | Prometheus metrics + admin dashboard |
 | 9100 | gRPC | Data-path (log, chunk, composition, view) |
@@ -345,7 +346,8 @@ Before starting a production cluster, verify the following:
 - [ ] Data-fabric ports (9100, 9101) reachable between all nodes
 - [ ] Raft port (9300) reachable between all nodes
 - [ ] Metrics port (9090) accessible to monitoring infrastructure
-- [ ] NFS port (2049) accessible to clients
+- [ ] NFS MDS port (2049) accessible to clients
+- [ ] pNFS DS port (2052) accessible to clients — required for NFSv4.1 Flex Files layout reads/writes; the MDS issues a LAYOUTGET pointing the client at this port
 - [ ] S3 port (9000) accessible to clients
 - [ ] Management network separated from data fabric (recommended)
 

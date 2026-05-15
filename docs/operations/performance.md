@@ -64,48 +64,61 @@ that fully understands Flex Files this is a fast path — reads and
 writes go directly to the DS that owns the chunks, bypassing the
 MDS metadata stream.
 
-### `KISEKI_DISABLE_PNFS_LAYOUT` (force MDS-only NFSv4)
+### `KISEKI_DISABLE_PNFS_LAYOUT` (deprecated — leave unset)
+
+Historical 2026-05-07 workaround for a per-OPEN DS session tax that
+capped NFSv4.1 reads at ~0.5 MB/s on 3-node compose. Resolved by:
+
+- `d7d90a5` (2026-05-10) — DS session persistence + seqid + NONE_EXT
+  fix; 8 MiB sequential read recovered to ~800 MB/s.
+- `6ff8e65` (2026-05-10) — DS WRITE round-trip with correct
+  UNSTABLE / COMMIT semantics.
+
+The env var is still honored by `nfs4_server.rs` for A/B testing the
+MDS-only fallback path, but should not be set in production. The GCP
+boot script (`infra/gcp/scripts/setup-raw-storage.sh`) carried
+`KISEKI_DISABLE_PNFS_LAYOUT=true` until commit `07e8a96` (2026-05-15)
+— anyone running a perf cluster from an older commit should pull
+the line manually before measuring pNFS, or layouts will never be
+delegated.
 
 | Aspect | Value |
 |---|---|
 | Default | unset (LAYOUTGET issues Flex Files layouts; FATTR4_FS_LAYOUT_TYPES advertises `LAYOUT4_FLEX_FILES`) |
-| Set to `true` / `1` / any non-empty non-`0` value | empty `layouttype4<>`; LAYOUTGET returns `NFS4ERR_LAYOUTUNAVAILABLE`; the kernel client falls back to MDS metadata-stream READ/WRITE |
-| Recommended for production multi-node | **set** (until pNFS DS WRITE + persistent sessions land) |
-| Recommended for single-node compose / dev | unset |
+| Set to `true` / `1` / any non-empty non-`0` value | empty `layouttype4<>`; LAYOUTGET returns `NFS4ERR_LAYOUTUNAVAILABLE`; kernel client falls back to MDS metadata-stream READ/WRITE |
+| Recommended | leave unset; only set for A/B testing the MDS-only path |
 | Type | perf-correctness knob — **not** a durability knob |
 
-**Why this exists.** The current pNFS DS (Phase 15a) only supports
-the read path, and each NFSv4.1 OPEN against the MDS triggers the
-kernel to do a fresh `EXCHANGE_ID` + `CREATE_SESSION` + `RECLAIM_COMPLETE`
-sequence against every DS in the layout, then issue (sometimes only
-one) READ inside readahead, then `DESTROY_SESSION` + `DESTROY_CLIENTID`
-when the file closes. Per-file session establishment dominates
-small-file workloads.
+NFSv3 is unaffected by this flag — it ignores `FATTR4_FS_LAYOUT_TYPES` entirely.
 
-**Workload impact (3-node compose, 8 MiB sequential read):**
+### Mount options (NFSv4.1 pNFS clients)
 
-| Layout state | NFSv4.1 seq-read |
-|---|---|
-| LAYOUTGET enabled (default) | ~0.5 MB/s |
-| `KISEKI_DISABLE_PNFS_LAYOUT=true` | ~182 MB/s |
+Linux NFS clients auto-detect Flex Files layout capability when
+mounting with `vers=4.1`. **Do not pass `-o pnfs`** — that option
+was removed from `nfs(5)` in kernel 5.x and modern kernels reject
+the mount with `EINVAL`.
 
-The MDS metadata-stream path doesn't pay the per-OPEN session tax,
-which is why disabling layouts is currently the right operational
-choice for multi-node deployments. NFSv3 is unaffected — it
-ignores `FATTR4_FS_LAYOUT_TYPES` entirely.
+```bash
+# Correct
+mount -t nfs4 -o vers=4.1,rsize=1048576,wsize=1048576 \
+  $MDS_HOST:/ /mnt/kiseki
 
-**When to drop this flag.** Once the DS supports WRITE end-to-end
-and sessions persist across OPENs (tracked in the post-Phase-15a
-sweep), the per-file overhead disappears and the pNFS fast path
-should beat the MDS path on multi-DS aggregate bandwidth. Re-run
-the sequential-read matrix against compose at that point — if it
-exceeds the MDS number, the flag can come out of the systemd unit
-in `infra/gcp/scripts/setup-raw-storage.sh`.
+# Wrong — modern kernels reject the option
+mount -t nfs4 -o vers=4.2,pnfs,rsize=1048576,wsize=1048576 \
+  $MDS_HOST:/ /mnt/kiseki
+```
 
-**Where it's set today.** GCP `compact` / `transport` perf profile
-(see `infra/gcp/scripts/setup-raw-storage.sh:122`); not set in the
-3-node docker compose harness because the BDD scenario
-`test_pnfs_plaintext_fallback` exercises the layout path itself.
+Confirm layout delegation is actually happening by reading
+`/proc/self/mountstats` after a real I/O op:
+
+```bash
+grep -A5 'kiseki' /proc/self/mountstats | grep -iE 'layout|flexfiles'
+```
+
+If no `LAYOUTGET` appears, either (a) the MDS isn't advertising
+layouts (check `KISEKI_DISABLE_PNFS_LAYOUT` above), or (b) the
+firewall is blocking the DS port (2052 — see
+[`docs/admin/deployment.md`](../admin/deployment.md#network)).
 
 ---
 
