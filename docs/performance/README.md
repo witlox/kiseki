@@ -11,28 +11,53 @@ files are immutable snapshots, this file moves with HEAD.
 > throughput, and the matrix in that doc spells out the loss
 > windows under each failure mode.
 
-## Latest snapshot — 2026-05-15 GCP compact
+## Latest snapshot — 2026-05-15 evening (PARTIAL — phase 4 wedged)
 
-3 × `c3-standard-44-lssd` storage + 2 × `c3-standard-44` clients in
-`europe-west1-b`, release `v2026.43.759`. Full breakdown in
-[`specs/performance/2026-05-15-gcp-compact.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-15-gcp-compact.md).
+3 × `c3-standard-44-lssd` storage + 2 × `c3-standard-44` clients in `europe-west1-b`, binaries built from main `defd8c3` (post all 9 PRs in the sweep). Full breakdown in [`specs/performance/2026-05-15-gcp-compact-evening-partial.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-15-gcp-compact-evening-partial.md).
+
+| Protocol | Number | Status |
+|---|---:|---|
+| iperf3 client → leader | **46.3 Gbps** | ✓ Tier_1 line confirmed |
+| S3 PUT 1 KB latency | **p50 2.5 ms** · p99 93.8 ms | p50 ✓; p99 hit by hydrator backlog |
+| S3 PUT 1 MB serial single-client | **103.7 MB/s** | low — Raft-commit bound serial |
+| S3 PUT 1 MB × 200 × 16-way single-client | **726 MB/s** | under hydrator-backlog load |
+| FUSE mount (RW) | works | mount itself functional |
+| FUSE create (any size / any flags) | **EIO** | ✗ — F-1 in the snapshot |
+| FUSE metadata (mkdir+create) | **31 ops/s** | ✗ — vs prior 2125, same Raft-commit saturation |
+| NFSv4.2 write (aggregate) | **wedged** | phase 4 stalled at +205s; hydrator backlog saturating writes |
+| NFSv4.1 pNFS, pNFS LAYOUTGET delegation, multi-shard fan-out, #36 200 GB cumulative, #38 EC-4+2 cap, #39 io_uring runtime toggle, β #48 multi-protocol 307, γ #46 RBAC, δ surfaces | not measured | downstream of the wedge; need a per-protocol isolated run |
+
+### Earlier 2026-05-15 morning snapshot (pre-sweep release `v2026.43.759`)
 
 | Protocol | Throughput | Notes |
 |---|---:|---|
 | NFSv4.2 write (aggregate) | **1.71 GB/s** | 2 clients × fio bs=1M, direct=1 |
-| NFSv4.1 write (no layout — MDS fallback) | 2.92 GB/s | server-side env-var fix landed in `07e8a96`, will re-measure |
+| NFSv4.1 write (no layout — MDS fallback) | 2.92 GB/s | env-var fix in `07e8a96`, awaiting clean re-measure |
 | S3 PUT (1MB → 64MB objects) | 673 → 1094 MB/s | single client, 8∥ |
 | S3 GET (1 MB × 200) | 1170 MB/s | single client, 8∥ |
 | S3 parallel write (2 clients) | 528 MB/s aggregate | |
 | S3 PUT latency (1 KB) | p50 7.0 ms · p99 7.5 ms | |
-| FUSE mount + metadata | 2125 ops/s | 1000 × mkdir+create |
-| FUSE I/O throughput | (unmeasurable) | GH #37 — see below |
+| FUSE mount + metadata | 2125 ops/s | 1000 × mkdir+create — pre-α |
+| FUSE I/O throughput | (unmeasurable) | GH #37 — fixed in PR #41 (released, not validated on GCP yet) |
 
-Open product issues surfaced by this run:
+### Issues now open (post-evening run)
 
-- **GH [#36](https://github.com/witlox/kiseki/issues/36)** — chunk-store fills after ~200 GB cumulative writes despite 3 TB raw NVMe per node.
-- **GH [#37](https://github.com/witlox/kiseki/issues/37)** — `kiseki-client mount` doesn't expose libfuse's `direct_io`; FUSE perf unmeasurable under `fio --direct=1`. Workaround in suite: `dd conv=fdatasync`.
-- **GH [#38](https://github.com/witlox/kiseki/issues/38)** — EC-4+2 fragment exceeds 16 MiB per-extent cap by 8 bytes; ≥ 6-node profiles unusable until this lands.
+- **GH [#36](https://github.com/witlox/kiseki/issues/36)** — chunk-store fills after ~200 GB cumulative writes. PR #45 wired the GC plumbing; awaits GCP re-run to confirm on real hardware.
+- **GH [#37](https://github.com/witlox/kiseki/issues/37)** — `kiseki-client mount` direct_io. PR #41 landed `FOPEN_DIRECT_IO`; end-to-end GCP verification deferred (the evening run's EIO is F-1, not #37).
+- **GH [#38](https://github.com/witlox/kiseki/issues/38)** — EC-4+2 fragment cap. PR #43 fixed; not validated on a real 6-node cluster.
+- **GH [#39](https://github.com/witlox/kiseki/issues/39)** — io_uring backend. PR #42 + follow-up wiring landed; runtime toggle not exercised on GCP yet.
+- **F-1** (new, file as bug) — Composition hydrator backlog saturates write path under sustained load. Symptom: NFS / FUSE / S3 writes all stall after a ~30-second burst.
+- **F-2** (new, file as bug) — FUSE `create()` defaults to RO; `--read-write` should be the default OR the daemon should log the RO posture loudly.
+
+### Verification gaps (need a clean re-run)
+
+- pNFS LAYOUTGET delegation post-`07e8a96` boot fix
+- #37 end-to-end FUSE `O_DIRECT` against real cluster
+- #36 200 GB cumulative chunk-fill resolved by PR #45
+- #38 EC-4+2 cap on 6-node default profile
+- Multi-shard write fan-out (Step B): `gateway_requests > 0` on all 3 nodes
+- β #48 307 routing to follower
+- γ #46 admin-tier Bearer-token enforcement
 
 ## Snapshot index
 
@@ -42,7 +67,8 @@ Latest few:
 
 | Date | Snapshot | One-liner |
 |---|---|---|
-| 2026-05-15 | [GCP compact](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-15-gcp-compact.md) | First post-libfuse-swap GCP run; 3 product bugs surfaced (#36/#37/#38). |
+| 2026-05-15 evening | [GCP compact PARTIAL](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-15-gcp-compact-evening-partial.md) | Phase 4 wedged on hydrator backlog; NFS/FUSE/pNFS not measured. F-1/F-2 to file. |
+| 2026-05-15 morning | [GCP compact](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-15-gcp-compact.md) | First post-libfuse-swap GCP run; 3 product bugs surfaced (#36/#37/#38). |
 | 2026-05-09 | [libfuse-swap](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-09-libfuse-swap.md) | FUSE GET +25% on multi-thread libfuse session loop. NFSv4.1 read 0.5 → 923 MB/s. |
 | 2026-05-07 | [post-pNFS-pool](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-07-post-pnfs-pool.md) | pNFS GET 17 k → 80 k op/s (round-robin DS pool). |
 | 2026-05-07 | [local matrix](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-07-local-matrix.md) | FUSE leapfrogs every protocol (52 k PUT / 115 k GET); NFS PUT degradation surfaced. |

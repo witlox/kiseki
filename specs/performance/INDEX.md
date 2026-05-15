@@ -21,7 +21,8 @@ catch regressions.
 
 | Date | HEAD | Hardware | One-line takeaway |
 |---|---|---|---|
-| [2026-05-15 GCP compact](2026-05-15-gcp-compact.md) | `v2026.43.759` (`f6f6e5b`) | 3 × c3-standard-44-lssd + 2 × c3-standard-44 (europe-west1-b) | First post-libfuse-swap GCP run. NFSv4.2 1.71 GB/s aggregate, S3 PUT 673-1094 MB/s, S3 GET 1170 MB/s. Surfaced GH #36 (chunk-fill), #37 (FUSE O_DIRECT), #38 (EC-4+2 cap). |
+| [2026-05-15 evening — compact PARTIAL](2026-05-15-gcp-compact-evening-partial.md) | main `defd8c3` (post-sweep) | 3 × c3-standard-44-lssd + 2 × c3-standard-44 (europe-west1-b) | Phase 4 wedged on composition hydrator backlog. iperf3 46.3 Gbps ✓, S3 PUT 1 KB p50 2.5 ms, S3 16∥ 726 MB/s, FUSE create() = EIO, NFS not measured. F-1 (hydrator) + F-2 (FUSE RO default) to file. |
+| [2026-05-15 morning — compact](2026-05-15-gcp-compact.md) | `v2026.43.759` (`f6f6e5b`) | 3 × c3-standard-44-lssd + 2 × c3-standard-44 (europe-west1-b) | First post-libfuse-swap GCP run. NFSv4.2 1.71 GB/s aggregate, S3 PUT 673-1094 MB/s, S3 GET 1170 MB/s. Surfaced GH #36 (chunk-fill), #37 (FUSE O_DIRECT), #38 (EC-4+2 cap). |
 | [2026-05-09 libfuse-swap](2026-05-09-libfuse-swap.md) | `527c2e6` (single) / `da45687` (multi) | dev workstation 16c | FUSE GET +25% on the multi-thread libfuse loop; NFSv4.1 read 0.5 MB/s → 923 MB/s after disabling pNFS layout advertisement on the 3-node compose. |
 | [2026-05-07 post-pool](2026-05-07-post-pnfs-pool.md) | `5fc9523` | dev workstation 16c | pNFS GET unstuck via DS pool (17 k → 80 k); CI green for the first time post rust 1.95. |
 | [2026-05-07 post-fix](2026-05-07-local-matrix.md) | `51c48aa` | dev workstation 16c | FUSE leapfrogs everything (52 k PUT / 115 k GET); NFS PUT regressed to 5 k. |

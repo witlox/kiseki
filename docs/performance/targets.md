@@ -82,21 +82,28 @@ ships those numbers per-binding; this doc cites them.
 
 **Targets**:
 
-| Op | Target (per node) | Target (cluster aggregate) | Measured 2026-05-15 | Status |
-|---|---:|---:|---:|---|
-| S3 PUT 64 MB, single client | 4 GB/s | — | 1.01 GB/s | ✗ — single-leader bottleneck (see plan A+B+C) |
-| S3 PUT aggregate 2 clients | — | 7 GB/s ÷ R-3 = **2.3 GB/s** | 528 MB/s | ✗ — same single-leader issue |
-| S3 GET 1 MB, single client | 4 GB/s | — | 1.17 GB/s | ≈ — read-side serialization (DecryptCache?) |
-| S3 GET aggregate 2 clients | — | 10 GB/s (no R-3 on reads) | — | — |
-| NFSv4.2 write aggregate 2 clients | — | 7 GB/s ÷ R-3 = **2.3 GB/s** | 1.71 GB/s | ≈ — getting close, may be measurement noise |
-| NFSv4.1 (pNFS with layouts) write | — | per-DS spread × 3 nodes = **6.9 GB/s ÷ R-3 = 2.3 GB/s** | 2.92 GB/s (no layouts — see below) | 🚧 GH #36 + KISEKI_DISABLE_PNFS_LAYOUT was set |
-| FUSE seq write, single client | 4 GB/s | — | 0 (GH #37) | 🚧 GH #37 |
-| FUSE seq read, single client | 4 GB/s | — | 0 (GH #37) | 🚧 GH #37 |
-| FUSE 4 KB random read IOPS | 60 k IOPS | — | — | — |
-| FUSE metadata (mkdir + create) | 5 k ops/s | — | 2125 ops/s | ≈ — Raft fsync cost dominates |
-| Native gRPC PUT 64 KiB | 22 k op/s (ADR-042 §14 gate) | 66 k op/s aggregate | — | — |
-| Native TCP-framed PUT 64 KiB | 60 k op/s (ADR-042 §14 gate) | 180 k op/s aggregate | — | — |
-| S3 PUT latency 1 KB | p99 ≤ 5 ms | — | p99 7.5 ms | ≈ |
+`m1` = measured 2026-05-15 morning run (pre-sweep release `v2026.43.759`); `m2` = measured 2026-05-15 evening run (current main `defd8c3`, post all 9 sweep PRs — PARTIAL because phase 4 wedged).
+
+| Op | Target (per node) | Target (cluster aggregate) | `m1` morning | `m2` evening | Status |
+|---|---:|---:|---:|---:|---|
+| iperf3 client → leader | 12.5 GB/s line | — | 46 Gbps (5.75 GB/s) | **46.3 Gbps** | ✓ line confirmed |
+| S3 PUT 64 MB, single client | 4 GB/s | — | 1.01 GB/s | not run as 64 MB | ✗ (m1) — single-leader bottleneck |
+| S3 PUT 1 MB × 200 × 16∥ single-client | (not in table — ad-hoc) | — | — | **726 MB/s** | regressed under hydrator backlog (F-1) |
+| S3 PUT 1 MB serial single-client | (not in table — ad-hoc) | — | — | **103.7 MB/s** | serial: Raft-commit bound |
+| S3 PUT aggregate 2 clients | — | 7 GB/s ÷ R-3 = **2.3 GB/s** | 528 MB/s | not run (multi-client) | ✗ — single-leader (m1); F-1 (m2) |
+| S3 GET 1 MB, single client | 4 GB/s | — | 1.17 GB/s | not run | ≈ (m1) — read-side serialization |
+| S3 GET aggregate 2 clients | — | 10 GB/s (no R-3 on reads) | — | — | — |
+| NFSv4.2 write aggregate 2 clients | — | 7 GB/s ÷ R-3 = **2.3 GB/s** | 1.71 GB/s | **WEDGED** (phase 4 stalled) | ≈ (m1); 🚧 F-1 (m2) |
+| NFSv4.1 (pNFS with layouts) write | — | per-DS spread × 3 nodes = **6.9 GB/s ÷ R-3 = 2.3 GB/s** | 2.92 GB/s (no layouts — env-var bug) | not reached | 🚧 |
+| FUSE seq write, single client | 4 GB/s | — | 0 (GH #37 pre-fix) | **EIO** (F-1, not #37) | 🚧 F-1 |
+| FUSE seq read, single client | 4 GB/s | — | 0 (GH #37 pre-fix) | not reached | 🚧 F-1 |
+| FUSE 4 KB random read IOPS | 60 k IOPS | — | — | not reached | — |
+| FUSE metadata (mkdir + create) | 5 k ops/s | — | 2125 ops/s | **31 ops/s** | ≈ (m1); 🚧 F-1 (m2) — 68× regression under hydrator load |
+| Native gRPC PUT 64 KiB | 22 k op/s (ADR-042 §14 gate) | 66 k op/s aggregate | — | — | — (kiseki-profile not on GCP) |
+| Native TCP-framed PUT 64 KiB | 60 k op/s (ADR-042 §14 gate) | 180 k op/s aggregate | — | — | — |
+| S3 PUT latency 1 KB | p99 ≤ 5 ms | — | p50 7.0 ms · p99 7.5 ms | **p50 2.5 ms · p99 93.8 ms** | p50 ✓ (m2); p99 ✗ (F-1 backlog spike) |
+
+**Why m2 is worse than m1 on almost every row**: the composition hydrator on the leader cannot drain a 30-second fio write burst before downstream phases run. m1 ran on a quieter pre-sweep binary; m2 ran on current main and hit the wall (F-1, to file). Performance numbers under hydrator backlog are not meaningful — they reflect commit-queue depth, not protocol throughput.
 
 **Why aggregate is so far off**: today's perf-suite routes every PUT through the single leader (see write-routing posture plan). Post plan A+B+C, the 2.3 GB/s aggregate target becomes the right comparison; pre-plan, single-leader bottleneck holds the cluster at ~530 MB/s.
 
