@@ -139,3 +139,5 @@ What else was evaluated and why it was rejected.
 
 ### Build and packaging
 - ADR-043: System library FFI policy (libfuse 3.x adoption rules)
+
+### Routing

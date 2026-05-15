@@ -4,7 +4,7 @@
 **Date**: 2026-05-09
 **Reviewer**: adversary (architecture mode + impl-aware)
 **Mode**: pre-implementer-phase-0 review against `7066574` (`specs/implementation/libfuse-swap.md` + ADR-043 rev 3).
-**Verdict**: **CHANGES REQUESTED** — 0 CRITICAL, 5 HIGH, 8 MEDIUM, 4 LOW + 2 cross-cutting. Two of the HIGHs flag that the architect's §D6 checklist answers (every criterion **no**) are debatable; per §D6, "if any answer is plausibly **yes** but was answered **no**, the adversary requires a per-binding ADR before implementer phase 0." This review concludes one of the two genuinely qualifies and recommends a small ADR-044 OR an explicit in-plan justification for the **no** answer.
+**Verdict**: **CHANGES REQUESTED** — 0 CRITICAL, 5 HIGH, 8 MEDIUM, 4 LOW + 2 cross-cutting. Two of the HIGHs flag that the architect's §D6 checklist answers (every criterion **no**) are debatable; per §D6, "if any answer is plausibly **yes** but was answered **no**, the adversary requires a per-binding ADR before implementer phase 0." This review concludes one of the two genuinely qualifies and recommends a small ADR-042 §4 OR an explicit in-plan justification for the **no** answer.
 
 The plan's overall shape is **structurally sound**: the crate split, migration sequencing, cfg-flag rollback mechanism, go/no-go criteria, and rollback table are all the right shape. Issues are concentrated in:
 
@@ -39,7 +39,7 @@ The plan replaces `fuser` 0.17 (MIT OR Apache-2.0; permissive) with libfuse 3.x 
 
 If the architect's answer to criterion 4 is **no**, that is contradicted by ADR-043's own §"Negative consequences" naming the LGPL obligation. If the answer is **yes**, §D6 says a per-binding ADR is required.
 
-**Suggested resolution**: Either (a) escalate to ADR-044 with the license decision as the architectural content (a small ADR — ~30-50 lines — that names the LGPL-2.1 dynamic-linking decision, the wrappers/README disclosure, the CONTRIBUTING.md note, and the per-distro packaging implications); OR (b) add an explicit paragraph to libfuse-swap.md §"Why this binding (not the others)" that walks through criterion 4 in detail and concludes that the dynamic-linking exception keeps kiseki-client itself permissive, the wrapper exposure is documented in wrappers/README rather than enforced in code, and therefore the answer is **no** *despite* the surface evidence. (b) is simpler; (a) is more defensive. Architect picks.
+**Suggested resolution**: Either (a) escalate to ADR-042 §4 with the license decision as the architectural content (a small ADR — ~30-50 lines — that names the LGPL-2.1 dynamic-linking decision, the wrappers/README disclosure, the CONTRIBUTING.md note, and the per-distro packaging implications); OR (b) add an explicit paragraph to libfuse-swap.md §"Why this binding (not the others)" that walks through criterion 4 in detail and concludes that the dynamic-linking exception keeps kiseki-client itself permissive, the wrapper exposure is documented in wrappers/README rather than enforced in code, and therefore the answer is **no** *despite* the surface evidence. (b) is simpler; (a) is more defensive. Architect picks.
 
 ---
 
@@ -297,7 +297,7 @@ The §D6 review-discipline says "the architect documents the answer to each befo
 
 ### CC3-2: Invariants/failure-modes promotion path
 
-F3-H2 recommends promoting §"Safety contract" rules to `specs/invariants.md` (I-FUSE-1..I-FUSE-6) and failure modes to `specs/failure-modes.md` (F-FUSE-1..F-FUSE-3). Doing this changes the catalogues and triggers ADR-027's "domain model in one place" discipline. Architect confirms whether this is the resolution path or whether a per-binding ADR-044 is cleaner.
+F3-H2 recommends promoting §"Safety contract" rules to `specs/invariants.md` (I-FUSE-1..I-FUSE-6) and failure modes to `specs/failure-modes.md` (F-FUSE-1..F-FUSE-3). Doing this changes the catalogues and triggers ADR-027's "domain model in one place" discipline. Architect confirms whether this is the resolution path or whether a per-binding ADR-042 §4 is cleaner.
 
 **Resolution**: Architect picks F3-H2's (a) per-binding ADR or (b) catalogue promotion. Either keeps the policy honest; (b) is more durable.
 
@@ -308,7 +308,7 @@ F3-H2 recommends promoting §"Safety contract" rules to `specs/invariants.md` (I
 **CHANGES REQUESTED — small-to-medium scope.** The plan is structurally sound; the issues are concentrated in checklist-answer integrity (F3-H1, F3-H2), trait-surface coverage (F3-H3), and async-bridge mechanics (F3-H4, F3-H5).
 
 What blocks implementer phase 0:
-- **F3-H1, F3-H2**: resolve the §D6 checklist disagreement. Either escalate to ADR-044 (small) OR (preferred) promote the §"Safety contract" rules to `specs/invariants.md` as I-FUSE-* and add failure modes to `specs/failure-modes.md`, then explicitly justify the **no** answers in the plan.
+- **F3-H1, F3-H2**: resolve the §D6 checklist disagreement. Either escalate to ADR-042 §4 (small) OR (preferred) promote the §"Safety contract" rules to `specs/invariants.md` as I-FUSE-* and add failure modes to `specs/failure-modes.md`, then explicitly justify the **no** answers in the plan.
 - **F3-H3**: ADR-013 parity check added to plan + acceptance criterion 10. Without this the swap silently regresses POSIX scope.
 - **F3-H4**: §"Safety contract" expanded with concrete bridge mechanics (timeout, max_pending_ops, ZeroOnCancel for plaintext).
 - **F3-H5**: session-thread crash handling added to §"Safety contract" + F-FUSE-3 promoted.

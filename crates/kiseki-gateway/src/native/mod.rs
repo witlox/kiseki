@@ -21,6 +21,7 @@ pub mod grpc;
 pub mod handle_token;
 pub mod lease_store;
 pub mod multipart_upload_id;
+pub mod proxy_client;
 pub mod san_interceptor;
 pub mod signing_keys;
 pub mod tcp_framed;

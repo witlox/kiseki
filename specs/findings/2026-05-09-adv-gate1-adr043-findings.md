@@ -4,7 +4,7 @@
 **Date**: 2026-05-09
 **Reviewer**: adversary (architecture mode)
 **Mode**: pre-acceptance review against the architect's draft (`d65564d`).
-**Verdict**: **CHANGES REQUESTED** — 3 CRITICAL, 6 HIGH, 9 MEDIUM, 4 LOW. CRITICALS block ADR acceptance; HIGHs should be resolved in the ADR amendment before ADR-044 / ADR-045 (the implementation ADRs) are written, or they will inherit unresolved policy questions.
+**Verdict**: **CHANGES REQUESTED** — 3 CRITICAL, 6 HIGH, 9 MEDIUM, 4 LOW. CRITICALS block ADR acceptance; HIGHs should be resolved in the ADR amendment before ADR-042 §4 / ADR-045 (the implementation ADRs) are written, or they will inherit unresolved policy questions.
 
 ADR-043's overall direction is **structurally defensible** — the libfabric-precedent argument in §Rationale holds, the FIPS-isolation rule (D1) is the right shape, and the process-boundary rule (D2) cleanly extends ADR-027 §Enforcement. The structural problems are concentrated in three areas:
 
@@ -12,7 +12,7 @@ ADR-043's overall direction is **structurally defensible** — the libfabric-pre
 2. **Tenant identity propagation through the FSAL plugin is unspecified.** kiseki-gateway today routes per-tenant on the data path with type-checked `OrgId` / `NamespaceId` end-to-end. ganesha's FSAL ABI passes file handles + RPC credentials, not kiseki tenant types. Lossy translation here is a cross-tenant key-leak class of bug.
 3. **Ganesha-as-process is a different reversibility shape than libfuse-FFI.** The ADR's D9 reversibility argument was crafted for the FFI-binding case (replace the `*-sys` crate). For ganesha, "reverse" means "rewrite the in-tree NFS server we removed at parity per D8." That cost is multi-month after the in-tree code is deleted. The two cases need separate reversibility analyses.
 
-The architect's pre-emptive list of open items (A–G in the ADR itself) covers some of these — but several are policy-load-bearing decisions deferred to "gate-1 will tell us," and gate-1 should now decide them rather than punt to ADR-044 / ADR-045.
+The architect's pre-emptive list of open items (A–G in the ADR itself) covers some of these — but several are policy-load-bearing decisions deferred to "gate-1 will tell us," and gate-1 should now decide them rather than punt to ADR-042 §4 / ADR-045.
 
 ## Summary
 
@@ -65,17 +65,17 @@ ADR-011 caps the in-process plaintext window at 60s via the crypto-shred TTL. F-
 - A `fsal_obj_handle` (an opaque blob the FSAL plugin previously minted)
 - The op-specific args (read offset/length, write buffer, etc.)
 
-Translating `caller_uid` / `caller_gid` to `OrgId` / `NamespaceId` requires a mapping that is **not** part of NFS protocol mechanics — it's a kiseki tenancy decision. The ADR delegates this to "ADR-044 owns concrete shape" but D2 rule (3) merely says ganesha can receive plaintext if needed. There is no rule saying:
+Translating `caller_uid` / `caller_gid` to `OrgId` / `NamespaceId` requires a mapping that is **not** part of NFS protocol mechanics — it's a kiseki tenancy decision. The ADR delegates this to "ADR-042 §4 owns concrete shape" but D2 rule (3) merely says ganesha can receive plaintext if needed. There is no rule saying:
 
 - The FSAL plugin MUST attach a tenant identity claim to every gRPC call to kiseki-server, signed in such a way that ganesha cannot impersonate a different tenant.
 - The FSAL plugin MUST NOT cache plaintext or handles across tenant identities (a single ganesha export shared by tenants A and B has a leak surface if handle minting collides).
 - kiseki-server MUST verify tenant identity on every FSAL-originated call rather than trusting the plugin.
 
-Without these rules, ADR-044 will hit a class of bugs where uid-1000 in tenant-A's NFS export resolves to a chunk in tenant-B because the FSAL plugin's handle cache returned a stale entry. This is exactly the cross-tenant data-leak failure mode I-T1 was written to prevent.
+Without these rules, ADR-042 §4 will hit a class of bugs where uid-1000 in tenant-A's NFS export resolves to a chunk in tenant-B because the FSAL plugin's handle cache returned a stale entry. This is exactly the cross-tenant data-leak failure mode I-T1 was written to prevent.
 
 **Evidence**: kiseki-gateway's NFSv3 `nfs_ops.rs` derives tenant-id from the namespace bound to the export at mount time (single-tenant-per-export), enforced by namespace-meta lookup. Ganesha's standard deployment pattern is multi-export-per-process; if kiseki adopts the standard pattern without amendment, the cross-tenant boundary previously enforced by per-export gateway processes collapses into per-export FSAL routing inside one ganesha process.
 
-**Suggested resolution**: Add D2 rule (5): External daemons that translate from non-kiseki credentials (uid/gid, RPC creds, X.509 SAN) into kiseki tenant identity MUST do so via a verified mapping, the mapping MUST be signed by `kiseki-control` over gRPC, and `kiseki-server` MUST re-verify the tenant identity claim on every plugin-originated call (no daemon-side trust). ADR-044 inherits this rule; the FSAL plugin must implement it before it can be deployed even in test.
+**Suggested resolution**: Add D2 rule (5): External daemons that translate from non-kiseki credentials (uid/gid, RPC creds, X.509 SAN) into kiseki tenant identity MUST do so via a verified mapping, the mapping MUST be signed by `kiseki-control` over gRPC, and `kiseki-server` MUST re-verify the tenant identity claim on every plugin-originated call (no daemon-side trust). ADR-042 §4 inherits this rule; the FSAL plugin must implement it before it can be deployed even in test.
 
 ---
 
@@ -92,11 +92,11 @@ Today this is dormant because RPCSEC_GSS is `❌ not implemented` per protocol-c
 
 **Evidence**: nfs-ganesha's `configure.ac` defaults: `enable_krb5=yes` if `pkg-config --exists krb5-gssapi`. Default Red Hat / Ubuntu builds ship with this on. Per the FIPS 140-3 IG (Implementation Guidance), §A.5: any cryptographic library linked into a process within the cryptographic module boundary becomes part of the certification scope.
 
-**Suggested resolution**: Add D5 sub-rule: "External daemons under D2 MUST be built with all crypto submodules disabled (e.g., for nfs-ganesha: `--disable-krb5 --disable-rdma-crypto`); kiseki packages a kiseki-specific build of ganesha (or pins to a distro package whose options exclude krb5)." Add D4 row column "build flags": for ganesha, `--disable-krb5 --without-gssapi --disable-tls`. If RPCSEC_GSS is later required, it is implemented in kiseki-server (Rust on aws-lc-rs) and exposed through the FSAL plugin via a callback into kiseki — the C krb5 implementation is forbidden under D5. ADR-044 inherits this constraint.
+**Suggested resolution**: Add D5 sub-rule: "External daemons under D2 MUST be built with all crypto submodules disabled (e.g., for nfs-ganesha: `--disable-krb5 --disable-rdma-crypto`); kiseki packages a kiseki-specific build of ganesha (or pins to a distro package whose options exclude krb5)." Add D4 row column "build flags": for ganesha, `--disable-krb5 --without-gssapi --disable-tls`. If RPCSEC_GSS is later required, it is implemented in kiseki-server (Rust on aws-lc-rs) and exposed through the FSAL plugin via a callback into kiseki — the C krb5 implementation is forbidden under D5. ADR-042 §4 inherits this constraint.
 
 ---
 
-## HIGH findings (resolve in ADR amendment before ADR-044/045)
+## HIGH findings (resolve in ADR amendment before ADR-042 §4/045)
 
 ### F-H1: D9 reversibility argument doesn't apply to ganesha-as-process
 
@@ -114,7 +114,7 @@ Mechanism (1) applies to libfuse but not to ganesha (there is no FFI). Mechanism
 
 D9 reads as if the reversibility cost is symmetric across the libfuse and ganesha cases. It is not. The ganesha case has a one-way ratchet at the moment in-tree code is deleted (D8 step 4: "Once stable, remove crates/kiseki-gateway's NFS server code").
 
-**Suggested resolution**: Split D9 into D9.1 (libfuse-class FFI; reversibility cost = swap `*-sys` crate, weeks) and D9.2 (external-daemon-class; reversibility cost = re-implement gateway, multi-month — and must therefore meet a higher acceptance bar before in-tree code is deleted in D8). ADR-044 must define, before any in-tree NFS code is removed, a rollback procedure that does NOT require re-implementation. Candidates: keep the in-tree code in tree but unwired (not removed); ship both code paths under a feature flag for one full release cycle; ensure the FSAL plugin can be stopped and the in-tree gateway re-enabled by config change alone.
+**Suggested resolution**: Split D9 into D9.1 (libfuse-class FFI; reversibility cost = swap `*-sys` crate, weeks) and D9.2 (external-daemon-class; reversibility cost = re-implement gateway, multi-month — and must therefore meet a higher acceptance bar before in-tree code is deleted in D8). ADR-042 §4 must define, before any in-tree NFS code is removed, a rollback procedure that does NOT require re-implementation. Candidates: keep the in-tree code in tree but unwired (not removed); ship both code paths under a feature flag for one full release cycle; ensure the FSAL plugin can be stopped and the in-tree gateway re-enabled by config change alone.
 
 ---
 
@@ -148,7 +148,7 @@ For libfuse and nfs-ganesha this is met; for hypothetical future entries on the 
 
 The ADR's claim that confinement makes "the FIPS module boundary enforceable at the OS level, not just at the source-code level" depends entirely on this enforcement chain working in practice.
 
-**Suggested resolution**: Add D7.1 "Runtime confinement check": at kiseki-server startup with the `nfs-via-ganesha` feature enabled, kiseki-server MUST query the OS for the ganesha process's confinement label and refuse to forward FSAL traffic if the expected label is absent. List supported confinement backends (SELinux RHEL ≥ 8, AppArmor Ubuntu ≥ 22.04, containerized seccomp+namespaces fallback) and what each enforces concretely. ADR-044 owns the implementation; this ADR should pin the policy.
+**Suggested resolution**: Add D7.1 "Runtime confinement check": at kiseki-server startup with the `nfs-via-ganesha` feature enabled, kiseki-server MUST query the OS for the ganesha process's confinement label and refuse to forward FSAL traffic if the expected label is absent. List supported confinement backends (SELinux RHEL ≥ 8, AppArmor Ubuntu ≥ 22.04, containerized seccomp+namespaces fallback) and what each enforces concretely. ADR-042 §4 owns the implementation; this ADR should pin the policy.
 
 ---
 
@@ -162,7 +162,7 @@ The ADR's claim that confinement makes "the FIPS module boundary enforceable at 
 
 This is the ADR's central argument for why D1 is sound. If the answer comes back "ambiguous" or "requires module-by-module review," D1 needs a stricter formulation. Treating it as a routine open item — to be resolved later by analyst or implementer — defers the question past acceptance, after which removing rows from D3/D4 is significantly more disruptive.
 
-**Suggested resolution**: B is reclassified as a **gating prerequisite**: ADR-043 cannot move from Proposed to Accepted until a written reference is on file. The reference should specifically cite FIPS 140-3 Implementation Guidance §A.5 (cryptographic boundary scope) and §C.G (loadable libraries). Until the reference is filed, the ADR's status remains Proposed and ADR-044/045 are blocked from drafting.
+**Suggested resolution**: B is reclassified as a **gating prerequisite**: ADR-043 cannot move from Proposed to Accepted until a written reference is on file. The reference should specifically cite FIPS 140-3 Implementation Guidance §A.5 (cryptographic boundary scope) and §C.G (loadable libraries). Until the reference is filed, the ADR's status remains Proposed and ADR-042 §4/045 are blocked from drafting.
 
 ---
 
@@ -177,7 +177,7 @@ This is the ADR's central argument for why D1 is sound. If the answer comes back
 
 If ganesha + FSAL plugin cannot serve Flex Files at the protocol fidelity ADR-038 requires, the migration cannot replace the in-tree pNFS MDS code. Either ganesha's pNFS support is an addressable gap (file an upstream feature request), or kiseki keeps the in-tree pNFS code (NFS-via-ganesha for v3/v4.1/v4.2 only; pNFS stays in-tree). Either way, ADR-043's D4 ganesha row needs a sub-row for "pNFS MDS scope" that is honest about coverage.
 
-**Suggested resolution**: Add D4 column "scope coverage": for ganesha, "NFSv3 + NFSv4.1 + NFSv4.2; pNFS MDS deferred until FSAL_PNFS_FLEXFILES coverage is verified." ADR-044 owns the verification step (a small probe deployment that exercises the existing pNFS BDD scenarios against ganesha + a stub FSAL); only on verified coverage may pNFS MDS migrate. Without this scoping, ADR-044 inherits an unbounded research task.
+**Suggested resolution**: Add D4 column "scope coverage": for ganesha, "NFSv3 + NFSv4.1 + NFSv4.2; pNFS MDS deferred until FSAL_PNFS_FLEXFILES coverage is verified." ADR-042 §4 owns the verification step (a small probe deployment that exercises the existing pNFS BDD scenarios against ganesha + a stub FSAL); only on verified coverage may pNFS MDS migrate. Without this scoping, ADR-042 §4 inherits an unbounded research task.
 
 ---
 
@@ -192,9 +192,9 @@ If ganesha + FSAL plugin cannot serve Flex Files at the protocol fidelity ADR-03
 
 UDS gRPC adds ~10–20 µs per call on Linux at small-message sizes. At 27 k op/s, that's ~50% of the current 4 ms p99 if the regression is per-op. The post-perf-fix-sweep numbers in `specs/performance/` were achieved by aggressive in-process optimization (read decrypt cache, fast-path composition lookup, persistent fjall stores per ADR-040). Adding a process boundary on the hot path is a structurally different shape; a 5–20% regression is plausible, a 50% regression is plausible if the round-trip happens per-op rather than per-batch.
 
-ADR-043 lists "Performance characterisation gap" as a Negative consequence and defers the measurement to Open item E + ADR-044. But performance is **strategic** per the project's positioning ("HPC/AI workloads") — Open item E should set a hard floor below which the migration is rejected, not a soft "gather data and decide later."
+ADR-043 lists "Performance characterisation gap" as a Negative consequence and defers the measurement to Open item E + ADR-042 §4. But performance is **strategic** per the project's positioning ("HPC/AI workloads") — Open item E should set a hard floor below which the migration is rejected, not a soft "gather data and decide later."
 
-**Suggested resolution**: Add to Open item E: "ADR-044 MUST establish a perf-floor commitment before in-tree code is removed (per F-H1). Suggested floor: 90% of post-perf-fix-sweep numbers on c3-standard-44 / Tier_1 (e.g., ≥ 24 562 op/s NFSv4 GET, p99 ≤ 5 ms; ≥ 14 894 op/s pNFS GET). If the actual measurement misses the floor, the migration moves from D8 'land at parity' to D8 'rejected' or 'partial' (e.g., FUSE migration proceeds; NFS migration paused pending an optimization pass)."
+**Suggested resolution**: Add to Open item E: "ADR-042 §4 MUST establish a perf-floor commitment before in-tree code is removed (per F-H1). Suggested floor: 90% of post-perf-fix-sweep numbers on c3-standard-44 / Tier_1 (e.g., ≥ 24 562 op/s NFSv4 GET, p99 ≤ 5 ms; ≥ 14 894 op/s pNFS GET). If the actual measurement misses the floor, the migration moves from D8 'land at parity' to D8 'rejected' or 'partial' (e.g., FUSE migration proceeds; NFS migration paused pending an optimization pass)."
 
 ---
 
@@ -210,7 +210,7 @@ ADR-043 lists "Performance characterisation gap" as a Negative consequence and d
 
 For ganesha as an external process, LGPL-3 doesn't reach into kiseki's source (process boundary, not link boundary). But the FSAL plugin (`libfsalkiseki.so`) is loaded into ganesha at runtime. The plugin's license must be LGPL-3-compatible (BSD, MIT, Apache-2.0 with explicit AGPL-compatibility, or LGPL-3 itself). If the plugin is GPL-3, the combined work is GPL-3 with linking exception handled by ganesha's LGPL-3 form.
 
-**Suggested resolution**: Close A in this ADR (or in ADR-044/045) with the explicit license decisions: kiseki-client `fuse` feature → kiseki-overall license + LGPL-2.1 dynamic-linking compatibility statement; FSAL plugin → BSD-3 or LGPL-3 (matching ganesha). Document the constraint that downstream wrappers (Python, C++) inherit LGPL-2.1 dynamic-linking obligations on the FUSE path.
+**Suggested resolution**: Close A in this ADR (or in ADR-042 §4/045) with the explicit license decisions: kiseki-client `fuse` feature → kiseki-overall license + LGPL-2.1 dynamic-linking compatibility statement; FSAL plugin → BSD-3 or LGPL-3 (matching ganesha). Document the constraint that downstream wrappers (Python, C++) inherit LGPL-2.1 dynamic-linking obligations on the FUSE path.
 
 ---
 
@@ -226,9 +226,9 @@ For ganesha as an external process, LGPL-3 doesn't reach into kiseki's source (p
 - One per tenant: tenant isolation by process boundary, but operationally heavy at 100+ tenants and complicates SELinux confinement (one policy per tenant?).
 - One per export: matches typical multi-export ganesha deployments, but requires kiseki to materialize exports as ganesha config entries — non-trivial sync between kiseki tenancy and ganesha config.
 
-ADR-044 will hit this question on day 1.
+ADR-042 §4 will hit this question on day 1.
 
-**Suggested resolution**: ADR-043 picks one as the recommended pattern (architect's recommendation: one ganesha process per kiseki-server, with one export per namespace; the process boundary plus FSAL-routed tenant identity is the isolation, not separate processes per tenant). ADR-044 can revise but defaults to the pattern this ADR recommends.
+**Suggested resolution**: ADR-043 picks one as the recommended pattern (architect's recommendation: one ganesha process per kiseki-server, with one export per namespace; the process boundary plus FSAL-routed tenant identity is the isolation, not separate processes per tenant). ADR-042 §4 can revise but defaults to the pattern this ADR recommends.
 
 ---
 
@@ -263,7 +263,7 @@ ADR-044 will hit this question on day 1.
 
 This is a non-trivial CI cost not enumerated in §Negative consequences. The cost compounds if BDD tests run in parallel (multiple ganesha processes per CI worker → port collisions, mount-point collisions).
 
-**Suggested resolution**: Add to §Negative consequences: "BDD acceptance test infrastructure must be migrated alongside the production code path. ADR-044 owns the test-harness migration and budgets the CI cost." Acknowledge that during the migration window CI runs both paths (twice the cost) until in-tree code is retired.
+**Suggested resolution**: Add to §Negative consequences: "BDD acceptance test infrastructure must be migrated alongside the production code path. ADR-042 §4 owns the test-harness migration and budgets the CI cost." Acknowledge that during the migration window CI runs both paths (twice the cost) until in-tree code is retired.
 
 ---
 
@@ -297,7 +297,7 @@ Each shape has consequences:
 
 ADR-019 covers gateway deployment but doesn't anticipate an external daemon.
 
-**Suggested resolution**: ADR-043 picks a default deployment shape; ADR-044 can adjust. Architect's suggestion: kiseki ships a `kiseki-nfs.service` systemd unit that starts ganesha with the kiseki-FSAL plugin + the kiseki SELinux module, with `Requires=kiseki-server.service` so ganesha doesn't start until kiseki-server is healthy. K8s deployments use a sidecar container in the same pod, with shared UDS volume.
+**Suggested resolution**: ADR-043 picks a default deployment shape; ADR-042 §4 can adjust. Architect's suggestion: kiseki ships a `kiseki-nfs.service` systemd unit that starts ganesha with the kiseki-FSAL plugin + the kiseki SELinux module, with `Requires=kiseki-server.service` so ganesha doesn't start until kiseki-server is healthy. K8s deployments use a sidecar container in the same pod, with shared UDS volume.
 
 ---
 
@@ -316,7 +316,7 @@ ADR-019 covers gateway deployment but doesn't anticipate an external daemon.
 
 Each of these can leak the plaintext F-C1 cited.
 
-**Suggested resolution**: Expand D7 to require: `PrCtl=PR_SET_DUMPABLE 0` to disable core dumps; SELinux/AppArmor policy that denies `ptrace` from unconfined sources; ganesha config pinned to log level `WARN` or below for payload-touching code paths. ADR-044 implements these in the systemd unit + SELinux module.
+**Suggested resolution**: Expand D7 to require: `PrCtl=PR_SET_DUMPABLE 0` to disable core dumps; SELinux/AppArmor policy that denies `ptrace` from unconfined sources; ganesha config pinned to log level `WARN` or below for payload-touching code paths. ADR-042 §4 implements these in the systemd unit + SELinux module.
 
 ---
 
@@ -403,19 +403,19 @@ Excluding it from Alternatives weakens the ADR's argument. The architect should 
 
 ADR-043 doesn't address how kiseki-audit's tamper-evident log (per ADR-009 audit log sharding) handles events generated inside ganesha. Per I-A1..A3, every audited operation must be appended to the chain with a verifiable hash. NFS operations served by ganesha + FSAL plugin generate two audit signals: ganesha's own log (free-form, not hash-chained) and the kiseki-server-side audit on the FSAL-call. Without a rule, the audit invariant "every NFS op is in the chain" weakens to "every kiseki-side FSAL call is in the chain" — which may be fine if FSAL is the right level of granularity, but ADR-043 should state it explicitly.
 
-**Resolution**: ADR-044 owns the audit-integration story; ADR-043 should add a one-line cross-cutting note that audit is NOT delegated to ganesha — kiseki-server records every FSAL-originated call into the audit chain.
+**Resolution**: ADR-042 §4 owns the audit-integration story; ADR-043 should add a one-line cross-cutting note that audit is NOT delegated to ganesha — kiseki-server records every FSAL-originated call into the audit chain.
 
 ### CC2: Observability — metrics from ganesha vs kiseki-server are siloed
 
 ganesha exposes Prometheus metrics via its own exporter; kiseki-server has its own Prometheus surface. Operators correlating an NFS client error to a kiseki composition store hiccup need to join across two metric namespaces. Not blocking, but a real day-2 cost.
 
-**Resolution**: ADR-044 owns metric integration (relabel ganesha metrics into kiseki's namespace? scrape both into the same Prometheus job?). ADR-043 should note this as a known integration cost.
+**Resolution**: ADR-042 §4 owns metric integration (relabel ganesha metrics into kiseki's namespace? scrape both into the same Prometheus job?). ADR-043 should note this as a known integration cost.
 
 ### CC3: Schema versioning of the FSAL gRPC contract
 
-The FSAL plugin's gRPC service definition will live in `kiseki-proto`. Like any gRPC service that crosses process boundaries with independent release cadences (kiseki-server release N can talk to FSAL plugin release N-1 or N+1 within a window), it needs a versioning policy per ADR-004 (schema versioning + upgrade). ADR-043 doesn't mention this; ADR-044 will hit it on day 1.
+The FSAL plugin's gRPC service definition will live in `kiseki-proto`. Like any gRPC service that crosses process boundaries with independent release cadences (kiseki-server release N can talk to FSAL plugin release N-1 or N+1 within a window), it needs a versioning policy per ADR-004 (schema versioning + upgrade). ADR-043 doesn't mention this; ADR-042 §4 will hit it on day 1.
 
-**Resolution**: ADR-044 owns the schema-versioning policy and inherits the ADR-004 patterns. ADR-043 should add a one-line note in §References that ADR-004 governs the FSAL gRPC schema's evolution.
+**Resolution**: ADR-042 §4 owns the schema-versioning policy and inherits the ADR-004 patterns. ADR-043 should add a one-line note in §References that ADR-004 governs the FSAL gRPC schema's evolution.
 
 ---
 
@@ -429,10 +429,10 @@ Highest-risk areas, in order:
 3. **F-C3** (ganesha + krb5 implicit FIPS scope leak): the build-flag pin must be in the ADR, not deferred.
 4. **F-H4** (FIPS evaluator written reference): policy is conditional on a question that hasn't been answered.
 
-What blocks ADR-044 / ADR-045 from drafting:
+What blocks ADR-042 §4 / ADR-045 from drafting:
 - All 3 CRITICAL findings resolved in the ADR amendment.
 - F-H1 (reversibility split), F-H4 (FIPS reference filed), F-H5 (pNFS scope) resolved or scoped explicitly in ADR-043's amendment.
 
-Other HIGHs and MEDIUMs may be inherited by ADR-044 / ADR-045 with explicit cross-references; LOWs may be deferred. Cross-cutting concerns (CC1–CC3) need one-line notes in the ADR amendment.
+Other HIGHs and MEDIUMs may be inherited by ADR-042 §4 / ADR-045 with explicit cross-references; LOWs may be deferred. Cross-cutting concerns (CC1–CC3) need one-line notes in the ADR amendment.
 
 Estimated amendment size: ~50–80 lines of additions to ADR-043 covering D1.1, D1.2, D5 sub-rule, D7.1, D9.1+D9.2 split, Open item E perf-floor, Open item B reclassification, Alternative 6 (fuser PR), Industry-comparison citations, three cross-cutting notes. Architect-only round; no need for a second analyst pass.

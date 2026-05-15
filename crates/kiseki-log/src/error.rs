@@ -1,7 +1,7 @@
 //! Log-specific errors.
 
 use kiseki_common::error::{KisekiError, PermanentError, RetriableError};
-use kiseki_common::ids::ShardId;
+use kiseki_common::ids::{NodeId, ShardId};
 
 /// Errors from Log operations.
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +21,37 @@ pub enum LogError {
     /// Raft leader unavailable (election in progress).
     #[error("leader unavailable: {0:?}")]
     LeaderUnavailable(ShardId),
+
+    /// Raft `ForwardToLeader` hint — the leader for this shard is
+    /// known and the caller should re-issue against `leader_node_id`.
+    /// Surfaced only by callers that opt into the
+    /// `*_with_forwarding`-suffix methods on the openraft store
+    /// (ADR-042 §4 §"Implementation map"). The legacy methods
+    /// (`append_delta`, `append_delta_raw`, `append_chunk_and_delta`,
+    /// `set_shard_*`, `advance_watermark`) still collapse this onto
+    /// [`Self::LeaderUnavailable`] for backwards compatibility — no
+    /// existing S3 / NFS / mem-gateway caller regresses.
+    ///
+    /// Distinct from [`Self::LeaderUnavailable`] which is returned
+    /// when the leader is **unknown** (election in progress, no
+    /// quorum yet). With `ForwardToLeader` the leader **is** known;
+    /// the receiving node is simply a follower and the request must
+    /// be re-issued against the named leader. Server-side handlers
+    /// that have `KISEKI_NATIVE_PROXY_FALLBACK=on` proxy the request
+    /// to the leader transparently (ADR-042 §4 + ADR-042 §4 native
+    /// row); others surface this error to the client which then
+    /// dials the leader directly (ADR-042 §4 S3 307 row / ADR-008
+    /// rev 2 client-side hint path).
+    #[error("forward to leader: shard={shard_id:?} leader={leader_node_id:?}")]
+    ForwardToLeader {
+        /// The shard whose leader is on a different node.
+        shard_id: ShardId,
+        /// The node that owns the leader replica for this shard.
+        /// Sourced from `openraft::error::ForwardToLeader::leader_id`
+        /// (the openraft hint embedded inside
+        /// `ClientWriteError::ForwardToLeader`).
+        leader_node_id: NodeId,
+    },
 
     /// Raft quorum lost.
     #[error("quorum lost: {0:?}")]
@@ -64,7 +95,15 @@ impl From<LogError> for KisekiError {
             LogError::LeaderUnavailable(id) | LogError::ShardSplitting(id) => {
                 KisekiError::Retriable(RetriableError::ShardUnavailable(id))
             }
-            LogError::ShardBusy { shard_id, .. } => {
+            // Retriable from the caller's perspective: the leader is
+            // known, dial it. The S3 / native server layers may
+            // intercept this variant earlier (before the conversion)
+            // and return a 307 redirect / proxy-fallback respectively
+            // — only fully-unhandled `ForwardToLeader` flows reach
+            // `KisekiError`, where the shard-unavailable mapping
+            // gives the upstream caller the same retry semantics as
+            // `LeaderUnavailable`.
+            LogError::ForwardToLeader { shard_id, .. } | LogError::ShardBusy { shard_id, .. } => {
                 KisekiError::Retriable(RetriableError::ShardUnavailable(shard_id))
             }
             LogError::QuorumLost(id) => KisekiError::Retriable(RetriableError::QuorumLost(id)),

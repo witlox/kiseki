@@ -50,7 +50,7 @@ struct S3State<G: GatewayOps> {
     /// existed in `/metrics` with always-zero counts, leaving the
     /// read-path latency invisible. Wiring it here closes that gap.
     request_duration_metric: Option<Arc<prometheus::HistogramVec>>,
-    /// ADR-008 rev 2 / ADR-044 — `NodeId → s3 host:port` resolver for
+    /// ADR-008 rev 2 / ADR-014 — `NodeId → s3 host:port` resolver for
     /// 307 redirect targets. Populated from `cluster/info` peer map
     /// at startup. Empty in dev / test deploys; the 307 path falls
     /// back to 503 + `Retry-After` when the leader hint can't be
@@ -163,7 +163,7 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
     )
 }
 
-/// ADR-008 rev 2 / ADR-044 — full constructor with peer-map for the
+/// ADR-008 rev 2 / ADR-014 — full constructor with peer-map for the
 /// `307` redirect target resolution and the new
 /// `kiseki_native_topology_stale_leader_redirects_total` counter.
 ///
@@ -241,7 +241,7 @@ pub fn s3_router_with_peers<G: GatewayOps + Send + Sync + 'static>(
         .with_state(state)
 }
 
-/// ADR-008 rev 2 / ADR-044 — emit a `307 Temporary Redirect` toward
+/// ADR-008 rev 2 / ADR-014 — emit a `307 Temporary Redirect` toward
 /// the cached shard leader when a write-side handler trips
 /// `LeaderUnavailable{leader_hint=Some(node_id)}`. Read-side handlers
 /// (GET, HEAD, LIST) fall back to `503 Service Unavailable` with
@@ -1803,7 +1803,7 @@ mod tests {
         );
     }
 
-    // === ADR-008 rev 2 / ADR-044 — S3 307 on LeaderUnavailable ===
+    // === ADR-008 rev 2 / ADR-014 — S3 307 on LeaderUnavailable ===
 
     fn build_peer_map() -> std::collections::HashMap<u64, String> {
         let mut m = std::collections::HashMap::new();

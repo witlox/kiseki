@@ -308,3 +308,154 @@ async fn single_node_cluster() {
     let seq = node.append_delta(make_append_req(0x10)).await.unwrap();
     assert_eq!(seq, SequenceNumber(1));
 }
+
+// =========================================================================
+// ADR-042 §4 — `append_delta_with_forwarding` surfaces leader id on a
+// follower's write attempt.
+// =========================================================================
+
+/// Two-node Raft cluster. node1 becomes leader; we issue
+/// `append_delta_with_forwarding` against the follower (node2) and
+/// expect `LogError::ForwardToLeader { leader_node_id = NodeId(1) }`.
+///
+/// Validates ADR-042 §4 §"Decision — native row" + the new variant's
+/// contract documented on
+/// `OpenRaftLogStore::append_delta_with_forwarding`.
+#[tokio::test]
+async fn follower_append_delta_with_forwarding_returns_leader_id() {
+    use kiseki_log::error::LogError;
+
+    let ports = find_ports(2);
+    let peers = peers_map(&ports);
+
+    let node1 = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &peers, None, None)
+        .await
+        .unwrap();
+    let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
+
+    let node2 = OpenRaftLogStore::new(2, test_shard(), test_tenant(), &peers, None, None)
+        .await
+        .unwrap();
+    let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
+
+    node1.initialize_membership(&peers).await.unwrap();
+
+    // Wait for leader election to converge.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let h1 = node1.shard_health().await;
+    let h2 = node2.shard_health().await;
+    assert_eq!(h1.leader, h2.leader, "both nodes must agree on leader");
+    let leader_id = h1.leader.expect("leader must be elected").0;
+    let follower = if leader_id == 1 { &node2 } else { &node1 };
+    let leader_expected = kiseki_common::ids::NodeId(leader_id);
+
+    // The follower MUST surface the ForwardToLeader hint with the
+    // current leader's node id — the proxy code path uses this to
+    // dial the leader directly.
+    let result = follower
+        .append_delta_with_forwarding(make_append_req(0xAA))
+        .await;
+    match result {
+        Err(LogError::ForwardToLeader { leader_node_id, .. }) => {
+            assert_eq!(
+                leader_node_id, leader_expected,
+                "follower's ForwardToLeader hint must name the actual leader"
+            );
+        }
+        Err(LogError::LeaderUnavailable(_)) => {
+            // Acceptable transient: openraft hadn't published the
+            // leader hint to this follower yet. Retry once after a
+            // longer settle.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let retry = follower
+                .append_delta_with_forwarding(make_append_req(0xAB))
+                .await;
+            match retry {
+                Err(LogError::ForwardToLeader { leader_node_id, .. }) => {
+                    assert_eq!(leader_node_id, leader_expected);
+                }
+                other => panic!("after settle, expected ForwardToLeader, got {other:?}"),
+            }
+        }
+        other => panic!("expected ForwardToLeader from follower, got {other:?}"),
+    }
+}
+
+/// Verify the **legacy** `append_delta` still collapses the
+/// forward hint onto `LeaderUnavailable`. This is the
+/// backwards-compatibility contract — existing callers
+/// (`mem_gateway`, `composition::log_bridge`, etc.) MUST see no
+/// behavior change from the ADR-042 §4 work.
+#[tokio::test]
+async fn follower_legacy_append_delta_still_returns_leader_unavailable() {
+    use kiseki_log::error::LogError;
+
+    let ports = find_ports(2);
+    let peers = peers_map(&ports);
+
+    let node1 = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &peers, None, None)
+        .await
+        .unwrap();
+    let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
+
+    let node2 = OpenRaftLogStore::new(2, test_shard(), test_tenant(), &peers, None, None)
+        .await
+        .unwrap();
+    let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
+
+    node1.initialize_membership(&peers).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let h1 = node1.shard_health().await;
+    let leader_id = h1.leader.expect("leader must be elected").0;
+    let follower = if leader_id == 1 { &node2 } else { &node1 };
+
+    // Legacy method MUST NOT return ForwardToLeader — that variant
+    // is reserved for callers that opted in via the _with_forwarding
+    // suffix. Existing callers expect LeaderUnavailable.
+    let result = follower.append_delta(make_append_req(0xCC)).await;
+    assert!(
+        matches!(
+            result,
+            Err(LogError::LeaderUnavailable(_) | LogError::Unavailable)
+        ),
+        "legacy append_delta on follower must return LeaderUnavailable / Unavailable, got {result:?}"
+    );
+    assert!(
+        !matches!(result, Err(LogError::ForwardToLeader { .. })),
+        "legacy append_delta MUST NOT surface ForwardToLeader (backwards compat)"
+    );
+}
+
+/// Leader's `append_delta_with_forwarding` MUST commit normally
+/// (same shape as legacy `append_delta`). The new method only
+/// changes the **error** mapping, never the success path.
+#[tokio::test]
+async fn leader_append_delta_with_forwarding_commits_normally() {
+    let ports = find_ports(2);
+    let peers = peers_map(&ports);
+
+    let node1 = OpenRaftLogStore::new(1, test_shard(), test_tenant(), &peers, None, None)
+        .await
+        .unwrap();
+    let _rpc1 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[0]), &node1);
+
+    let node2 = OpenRaftLogStore::new(2, test_shard(), test_tenant(), &peers, None, None)
+        .await
+        .unwrap();
+    let _rpc2 = spawn_listener_with_shard(format!("127.0.0.1:{}", ports[1]), &node2);
+
+    node1.initialize_membership(&peers).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let h1 = node1.shard_health().await;
+    let leader_id = h1.leader.expect("leader must be elected").0;
+    let leader = if leader_id == 1 { &node1 } else { &node2 };
+
+    let seq = leader
+        .append_delta_with_forwarding(make_append_req(0xDD))
+        .await
+        .expect("leader writes must succeed");
+    assert_eq!(seq, SequenceNumber(1));
+}

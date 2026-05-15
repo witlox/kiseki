@@ -83,7 +83,7 @@ Key sequencing facts:
 - `crates/kiseki-log/src/error.rs` — new variant.
 - `crates/kiseki-gateway/src/native/grpc.rs` / `server.rs` — implement the proxy path. On `ForwardToLeader{leader_node_id}`, look up the leader's `data_addr` from the local topology cache (already maintained by `kiseki-control::cluster_control::state_machine`), build a `GatewayDataServiceClient` against that node, re-issue the RPC with the *original* `ControlFields` (idempotency_key dedups per ADR-042 §6), return the response + trailing `kiseki-topology-version` from the leader.
 - Server config: `KISEKI_NATIVE_PROXY_FALLBACK=on|off` (default `off`, matching ADR-042 §4 "explicit-routing-only").
-- `docs/decisions/adr/044-leader-forwarding-posture.md` — new ADR.
+- `specs/findings/2026-05-15-leader-forwarding-posture.md` — new ADR.
 - `specs/features/native-gateway.feature:161-178` — scenarios "transparently uses server-side proxy fallback" + "proxying node fails mid-proxy" are already drafted; wire BDD step impls.
 
 **Acceptance**:

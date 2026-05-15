@@ -90,6 +90,13 @@ pub struct NativeWorld {
     /// `TcpFramedClient::connect_plaintext` handshake succeeds.
     /// The handles abort on Drop (scenario teardown).
     pub synthetic_listeners: Vec<tokio::task::JoinHandle<()>>,
+    /// Per-scenario typed scratch space — keyed by step-defined
+    /// strings, values are `Box<dyn Any + Send + Sync>` so a new
+    /// scenario family can stash an arbitrary type without adding a
+    /// dedicated field. Used by the ADR-042 §4 proxy-gate scenarios to
+    /// hold the `Arc<ProxyClient>` and the `validate_forward`
+    /// result across step boundaries.
+    pub scratch: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Captured selector outcome for `@binding-probe` scenarios. Either

@@ -1810,10 +1810,54 @@ pub async fn run_main(
             cfg.tls.is_some(),
         ),
     );
-    let native_server = std::sync::Arc::new(kiseki_gateway::native::ServerImpl::new(
-        std::sync::Arc::clone(&gw) as std::sync::Arc<dyn kiseki_gateway::ops::GatewayOps>,
-        native_signing_keys,
-    ));
+    // ADR-042 §4 — proxy fallback channel pool. The runtime wires this
+    // unconditionally so a runtime-toggled
+    // `KISEKI_NATIVE_PROXY_FALLBACK` flip doesn't need to allocate
+    // the pool on the hot path. `register_node` for peer addresses is
+    // populated below from the cluster topology (the data_addr port
+    // is shared across nodes in `docker-compose` deployments;
+    // localhost-multi-node test harnesses populate it via the
+    // `peer_data_addrs` config — Step C wiring lands per node when
+    // topology gossip becomes available).
+    let proxy_client_for_native =
+        std::sync::Arc::new(kiseki_gateway::native::proxy_client::ProxyClient::new(
+            kiseki_common::ids::NodeId(cfg.node_id),
+        ));
+    // Best-effort peer registration: for every Raft peer we know the
+    // address of, register a placeholder data_addr derived from the
+    // local data_addr port. This mirrors what `config.rs` does for
+    // the fabric path. Operators with non-uniform port deployments
+    // override via `KISEKI_PEER_DATA_ADDRS=id=host:port,…` (Step C
+    // makes this the topology-published source). Empty unless the
+    // local node has peers.
+    let peer_data_port = cfg.data_addr.port();
+    for (peer_id, peer_addr) in &cfg.raft_peers {
+        if *peer_id == cfg.node_id {
+            continue;
+        }
+        let host = peer_addr
+            .rsplit_once(':')
+            .map_or(peer_addr.as_str(), |(h, _)| h);
+        let data_addr = format!("{host}:{peer_data_port}");
+        proxy_client_for_native.register_node(kiseki_common::ids::NodeId(*peer_id), data_addr);
+    }
+    let proxy_fallback_enabled = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
+        .ok()
+        .as_deref()
+        .is_some_and(|v| matches!(v, "on" | "1" | "true" | "yes"));
+    let native_server = std::sync::Arc::new(
+        kiseki_gateway::native::ServerImpl::new(
+            std::sync::Arc::clone(&gw) as std::sync::Arc<dyn kiseki_gateway::ops::GatewayOps>,
+            native_signing_keys,
+        )
+        .with_proxy_client(std::sync::Arc::clone(&proxy_client_for_native)),
+    );
+    native_server.set_proxy_fallback_enabled(proxy_fallback_enabled);
+    tracing::info!(
+        proxy_fallback = proxy_fallback_enabled,
+        registered_peers = proxy_client_for_native.registered_nodes().len(),
+        "ADR-042 §4 native proxy fallback configured",
+    );
 
     // ADR-042 §3.1 + §16.1 phase 4: the BindingSelector orchestrates
     // the three-phase startup. Each binding ships a probe; the

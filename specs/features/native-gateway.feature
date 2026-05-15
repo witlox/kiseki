@@ -157,7 +157,20 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     And client-a re-issues the Write to node-3
     And the Write commits successfully
 
-  @native @routing
+  # ADR-042 §4 server-side leader-forwarding posture. The Step A
+  # implementer commit (e2c1001) lands the proxy plumbing:
+  # `KISEKI_NATIVE_PROXY_FALLBACK=on`, `ProxyClient` with the gate-1
+  # self-forward defense (C-H2), hop-cap (C-H4), and lazy tonic
+  # channel pool, plus the `write_with_forwarding` chain from gateway
+  # → openraft. The wire-level gateway-to-gateway dial of `put_object`
+  # (re-issuing the original `ControlFields` byte-for-byte against the
+  # leader) is the follow-up. The two scenarios below assert that
+  # follow-up's contract; tag `@deferred-feature` keeps them out of
+  # CI until then. The Step A code path validates the forward gate
+  # and surfaces `Status::unavailable` with a structured leader hint —
+  # the same shape the Step C client-side topology-cache path catches.
+
+  @native @routing @deferred-feature
   Scenario: Native client transparently uses server-side proxy fallback
     Given client-a's topology cache says shard S1's leader is node-2
     But the leader has actually migrated to node-3
@@ -168,13 +181,39 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     And the trailing metadata carries the new topology_version
     And client-a's topology cache is refreshed to identify node-3 as leader via the topology_version mismatch path (I-NG13)
 
-  @native @routing
+  @native @routing @deferred-feature
   Scenario: Server-side proxy fallback — proxying node fails mid-proxy
     Given client-a issues a Write to node-2 which is acting as a proxy to leader node-3
     When node-2 crashes between (a) committing the proxied request on node-3 and (b) returning the response to client-a
     Then client-a's RPC fails with Aborted{proxy_failure}
     When client-a refreshes topology, dials node-3 directly, and retries with the same idempotency_key
     Then the server returns the original outcome (idempotency dedup via I-NG5 + A-NG10) and the write commits exactly once
+
+  # ADR-042 §4 gate-1 defenses — these CAN be exercised end-to-end
+  # today against `ProxyClient::validate_forward`. The scenarios
+  # below cover the self-forward refusal (gate-1 C-H2), the hop-cap
+  # enforcement (gate-1 C-H4), and the unknown-leader rejection.
+
+  @native @routing
+  Scenario: ADR-042 §4 proxy gate refuses self-forward (gate-1 C-H2)
+    Given a node-1 with KISEKI_NATIVE_PROXY_FALLBACK=on and node-1 registered in its own ProxyClient pool
+    When the proxy code path is asked to forward to leader_node_id == node-1 at hop_count 0
+    Then validate_forward returns SelfForwardRefused
+    And no tonic channel is opened to a peer
+
+  @native @routing
+  Scenario: ADR-042 §4 proxy gate enforces hop cap (gate-1 C-H4)
+    Given a node-1 with KISEKI_NATIVE_PROXY_FALLBACK=on and node-2 registered as a proxy target
+    When the proxy code path is asked to forward to node-2 at hop_count 2
+    Then validate_forward returns HopLimitExceeded
+    And the client must refresh its own topology cache before retry
+
+  @native @routing
+  Scenario: ADR-042 §4 proxy gate rejects unknown leader
+    Given a node-1 with KISEKI_NATIVE_PROXY_FALLBACK=on and no registered peer entries
+    When the proxy code path is asked to forward to leader_node_id == node-99 at hop_count 0
+    Then validate_forward returns LeaderAddrUnknown
+    And the response surfaces Status::unavailable with a structured leader hint
 
   # --- Streaming boundary (I-NG9) ---
 

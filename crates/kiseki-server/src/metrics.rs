@@ -71,13 +71,21 @@ pub struct KisekiMetrics {
     /// `invalid` writes still succeed — operators use this counter
     /// to spot misconfigured clients.
     pub gateway_workflow_ref_writes_total: IntCounterVec,
-    /// ADR-008 rev 2 / ADR-044 — stale-leader redirects emitted on
+    /// ADR-008 rev 2 / ADR-042 §4 — stale-leader redirects emitted on
     /// the protocol boundary. Labels: `protocol` ∈ {`s3`, `native`}.
     /// Incremented every time the gateway returns a leader hint
     /// (307 for S3, NotLeader/ForwardToLeader for native) because
     /// the caller's request arrived at a non-leader. Alarm at
     /// sustained > 20 % of total writes for any tenant.
     pub stale_leader_redirects_total: IntCounterVec,
+
+    /// ADR-042 §4 — count of writes the native server forwarded to a
+    /// peer leader via the in-process proxy path. Labels:
+    /// `source_node` (this node's id) and `leader_node` (target
+    /// leader's id). Sustained share > 20% of total writes is the
+    /// operator alarm declared in ADR-042 §4 §"Consequences" (stale
+    /// client topology cache or unstable leadership).
+    pub native_proxy_forwards_total: IntCounterVec,
 
     // --- Pool ---
     /// Pool capacity bytes (total).
@@ -311,13 +319,25 @@ impl KisekiMetrics {
         let stale_leader_redirects_total = IntCounterVec::new(
             Opts::new(
                 "kiseki_native_topology_stale_leader_redirects_total",
-                "ADR-008 rev 2 / ADR-044 — stale-leader redirects emitted on the protocol boundary",
+                "ADR-008 rev 2 / ADR-014 — stale-leader redirects emitted on the protocol boundary",
             ),
             &["protocol"],
         )
         .expect("metric");
         registry
             .register(Box::new(stale_leader_redirects_total.clone()))
+            .expect("register");
+
+        let native_proxy_forwards_total = IntCounterVec::new(
+            Opts::new(
+                "kiseki_native_proxy_forwards_total",
+                "ADR-042 §4 — native gateway requests forwarded to a peer leader via the in-process proxy path",
+            ),
+            &["source_node", "leader_node"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(native_proxy_forwards_total.clone()))
             .expect("register");
 
         let pool_capacity_total = IntGaugeVec::new(
@@ -454,6 +474,7 @@ impl KisekiMetrics {
             gateway_put_phase_duration,
             gateway_workflow_ref_writes_total,
             stale_leader_redirects_total,
+            native_proxy_forwards_total,
             pool_capacity_total,
             pool_capacity_used,
             transport_connections_active,

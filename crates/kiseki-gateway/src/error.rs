@@ -1,7 +1,7 @@
 //! Gateway errors.
 
 use kiseki_common::error::{KisekiError, PermanentError, SecurityError};
-use kiseki_common::ids::ShardId;
+use kiseki_common::ids::{NodeId, ShardId};
 
 /// Errors from gateway operations.
 #[derive(Debug, thiserror::Error)]
@@ -77,18 +77,13 @@ pub enum GatewayError {
     #[error("bucket / namespace not registered: {0}")]
     NamespaceNotFound(String),
 
-    /// ADR-044 / ADR-008 rev 2 — the shard's Raft leader is
+    /// ADR-008 rev 2 / ADR-014 — the shard's Raft leader is
     /// unavailable on this node (election in progress, shard
-    /// splitting, etc.). The S3 gateway maps this to a `307 Temporary
-    /// Redirect` toward the cached leader (when a hint is
-    /// available) or a `503 Service Unavailable` with `Retry-After`
-    /// when no hint is yet known.
-    ///
-    /// `shard_id`: the shard the request was routed to.
-    /// `leader_hint`: best-effort `NodeId` of the current leader.
-    /// `None` during an active election. Sourced from the
-    /// `NamespaceShardMap` (ADR-033 §4) or from a future
-    /// `LogError::ForwardToLeader` variant once Step A lands.
+    /// splitting, etc.) and we don't yet know who the new leader is.
+    /// The S3 gateway maps this to `503 Service Unavailable` when
+    /// `leader_hint` is `None`, or `307 Temporary Redirect` when a
+    /// hint is available. Sourced from `NamespaceShardMap` (ADR-033
+    /// §4) when the topology cache has a guess.
     #[error("leader unavailable for shard {shard_id:?} (hint: {leader_hint:?})")]
     LeaderUnavailable {
         /// The shard the request was routed to.
@@ -96,6 +91,23 @@ pub enum GatewayError {
         /// Best-effort `NodeId` of the current leader (None during
         /// an active election).
         leader_hint: Option<u64>,
+    },
+
+    /// ADR-042 §4 / ADR-014 — the local node is a Raft follower for
+    /// the target shard; the leader is on `leader_node_id`. Surfaced
+    /// by the `*_with_forwarding`-suffix gateway entry points
+    /// ([`crate::ops::GatewayOps::write_with_forwarding`]). The
+    /// native server's proxy fallback
+    /// (`KISEKI_NATIVE_PROXY_FALLBACK=on`) matches this variant and
+    /// dials the leader transparently; the S3 gateway's 307-redirect
+    /// path consumes the same variant for the `Location:` header.
+    #[error("forward to leader: shard={shard_id:?} leader_node_id={leader_node_id:?}")]
+    ForwardToLeader {
+        /// The shard whose leader is on a different node.
+        shard_id: ShardId,
+        /// The node id of the actual leader (sourced from
+        /// `LogError::ForwardToLeader::leader_node_id`).
+        leader_node_id: NodeId,
     },
 }
 

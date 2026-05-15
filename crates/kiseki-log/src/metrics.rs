@@ -36,6 +36,13 @@ pub mod outcome {
     /// `ShardNotFound` — separated so dashboards can highlight
     /// stale routing-cache pressure.
     pub const SHARD_NOT_FOUND: &str = "shard_not_found";
+    /// `ForwardToLeader` (ADR-042 §4) — separated so the
+    /// "proxy-forward rate" alarm (`kiseki_log_append_total{outcome="forward_to_leader"}`)
+    /// can fire on sustained > 20 % forwarding share without
+    /// drowning in the generic `error` bucket. The gate-1 finding
+    /// C-M3 mandated this label so operators can distinguish "leader
+    /// stable, follower received the write" from generic Raft failures.
+    pub const FORWARD_TO_LEADER: &str = "forward_to_leader";
 }
 
 /// Prometheus metrics struct for the Log context.

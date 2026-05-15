@@ -30,7 +30,7 @@
 // they stay async to preserve the wire-shape contract.
 #![allow(clippy::unused_async)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
@@ -41,6 +41,7 @@ use crate::error::GatewayError;
 use crate::ops::{GatewayOps, ReadRequest, WriteConditional, WriteRequest};
 
 use super::lease_store::{AcquireOutcome, LeaseStore, ReleaseOutcome, RenewOutcome};
+use super::proxy_client::ProxyClient;
 use super::signing_keys::SigningKeys;
 
 /// Maximum bytes per `BatchFetchDek` request (gate-1 round-2 N2).
@@ -68,6 +69,16 @@ pub struct ServerImpl {
     stream_caps: Arc<parking_lot::Mutex<std::collections::HashMap<OrgId, AtomicU64>>>,
     #[allow(dead_code)]
     max_streams_per_tenant: u64,
+    /// ADR-042 §4 proxy fallback toggle — `KISEKI_NATIVE_PROXY_FALLBACK`.
+    /// `false` by default (ADR-042 §4 "explicit-routing-only"). When
+    /// `true`, the per-verb proxy code paths catch
+    /// [`GatewayError::ForwardToLeader`] and dial the leader via
+    /// [`proxy_client`].
+    proxy_fallback_enabled: AtomicBool,
+    /// ADR-042 §4 proxy channel pool. `None` when proxy fallback is
+    /// off or hasn't been wired; the per-verb proxy paths fall back
+    /// to surfacing the original `ForwardToLeader` error in that case.
+    proxy_client: Option<Arc<ProxyClient>>,
 }
 
 /// Topology snapshot (server side). The data-path runtime updates this
@@ -113,7 +124,8 @@ impl TopologyInjector {
 
 impl ServerImpl {
     /// Build a new handler with sensible defaults
-    /// (`max_streams_per_tenant = 256`).
+    /// (`max_streams_per_tenant = 256`, proxy fallback disabled per
+    /// ADR-042 §4).
     #[must_use]
     pub fn new(ops: Arc<dyn GatewayOps>, signing_keys: Arc<SigningKeys>) -> Self {
         Self {
@@ -123,7 +135,40 @@ impl ServerImpl {
             topology: Arc::new(TopologyInjector::empty()),
             stream_caps: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             max_streams_per_tenant: 256,
+            proxy_fallback_enabled: AtomicBool::new(false),
+            proxy_client: None,
         }
+    }
+
+    /// ADR-042 §4 — flip the proxy fallback on/off. Runtime calls this
+    /// at startup based on `KISEKI_NATIVE_PROXY_FALLBACK`. The flag
+    /// can also be toggled at runtime (e.g., from a future admin
+    /// gRPC) since it's an `AtomicBool`.
+    pub fn set_proxy_fallback_enabled(&self, enabled: bool) {
+        self.proxy_fallback_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Read the current proxy fallback toggle.
+    #[must_use]
+    pub fn is_proxy_fallback_enabled(&self) -> bool {
+        self.proxy_fallback_enabled.load(Ordering::SeqCst)
+    }
+
+    /// ADR-042 §4 — wire the proxy channel pool. Once set, per-verb
+    /// proxy paths use this to dial peer leaders. Setting to `None`
+    /// disables proxying (the flag alone is not enough — the
+    /// channel pool must be present too).
+    #[must_use]
+    pub fn with_proxy_client(mut self, pc: Arc<ProxyClient>) -> Self {
+        self.proxy_client = Some(pc);
+        self
+    }
+
+    /// Borrow the proxy channel pool (if any). Tests + runtime
+    /// inspection.
+    #[must_use]
+    pub fn proxy_client(&self) -> Option<&Arc<ProxyClient>> {
+        self.proxy_client.as_ref()
     }
 
     /// Override the per-tenant in-flight stream cap.
@@ -310,16 +355,29 @@ fn map_gateway_error(e: GatewayError) -> Status {
         // map to gRPC NOT_FOUND. The S3 layer disambiguates the two
         // for HTTP semantics; native callers don't.
         GatewayError::NotFound(m) | GatewayError::NamespaceNotFound(m) => Status::not_found(m),
-        // ADR-008 rev 2 / ADR-044 — the S3 path translates this to a
-        // `307 Temporary Redirect` toward the cached leader. The
-        // native (gRPC) path returns `Unavailable` for now; Step A's
-        // proxy-fallback + `ForwardToLeader` integration replaces
-        // this with a typed leader-hint response.
+        // ADR-008 rev 2 / ADR-014 — the S3 path translates this to a
+        // `307 Temporary Redirect` (when `leader_hint` is `Some`) or
+        // `503 Service Unavailable` (when `None`). The native gRPC
+        // path returns `Unavailable` so the client refreshes
+        // topology and retries.
         GatewayError::LeaderUnavailable {
             shard_id,
             leader_hint,
         } => Status::unavailable(format!(
             "leader unavailable for shard {shard_id:?} (hint: {leader_hint:?})"
+        )),
+        // ADR-042 §4: this variant should be intercepted by the
+        // proxy path BEFORE reaching `map_gateway_error` when
+        // `KISEKI_NATIVE_PROXY_FALLBACK=on`. When the proxy is
+        // disabled (default), surfacing as `Status::unavailable`
+        // gives the client the same retry shape as
+        // `ServiceUnavailable` — the client refreshes its topology
+        // cache and retries the leader directly.
+        GatewayError::ForwardToLeader {
+            shard_id,
+            leader_node_id,
+        } => Status::unavailable(format!(
+            "forward to leader: shard={shard_id:?} leader={leader_node_id:?}"
         )),
     }
 }
@@ -427,7 +485,58 @@ impl ServerImpl {
             conditional,
             workflow_ref,
         };
-        let resp = self.ops.write(wreq).await.map_err(map_gateway_error)?;
+        // ADR-042 §4 — when the proxy fallback is enabled, route writes
+        // through `write_with_forwarding` so we can observe a
+        // `GatewayError::ForwardToLeader` hint and proxy to the
+        // leader. Otherwise the legacy `write` path is unchanged.
+        let resp = if self.is_proxy_fallback_enabled() {
+            match self.ops.write_with_forwarding(wreq).await {
+                Ok(r) => r,
+                Err(GatewayError::ForwardToLeader {
+                    shard_id,
+                    leader_node_id,
+                }) => {
+                    // Proxy plumbing is wired (commits 5501d9f +
+                    // this commit). The actual gateway→gateway
+                    // request re-issue is deferred to a follow-up
+                    // implementer commit — the wire-level proxy
+                    // dial needs the original PutObjectRequest
+                    // re-built from `wreq` plus the original
+                    // `ControlFields` and the `kiseki-proxy-hop-count`
+                    // metadata. For now, the gate-1 defenses fire
+                    // (self-forward / hop-cap / leader-known)
+                    // and the call surfaces as Status::unavailable
+                    // with a structured leader hint so the client's
+                    // Step C topology-cache path can route around it.
+                    if let Some(pc) = self.proxy_client() {
+                        match pc.validate_forward(leader_node_id, /* hop */ 0) {
+                            Ok(addr) => {
+                                tracing::warn!(
+                                    shard_id = %shard_id.0,
+                                    leader_node_id = leader_node_id.0,
+                                    leader_addr = %addr,
+                                    "ADR-042 §4 proxy fallback: forward gate validated, wire-level dial pending follow-up",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard_id = %shard_id.0,
+                                    leader_node_id = leader_node_id.0,
+                                    error = %e,
+                                    "ADR-042 §4 proxy fallback: validate_forward rejected",
+                                );
+                            }
+                        }
+                    }
+                    return Err(Status::unavailable(format!(
+                        "forward to leader: shard={shard_id:?} leader={leader_node_id:?}"
+                    )));
+                }
+                Err(e) => return Err(map_gateway_error(e)),
+            }
+        } else {
+            self.ops.write(wreq).await.map_err(map_gateway_error)?
+        };
         Ok(np::PutObjectResponse {
             composition_id: Some(comp_to_proto(resp.composition_id)),
             size: resp.bytes_written,

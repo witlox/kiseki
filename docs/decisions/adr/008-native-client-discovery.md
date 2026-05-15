@@ -60,7 +60,7 @@ the control-plane Raft group; rev 1 just hides it from clients.
 **Cross-refs**: ADR-033 §4 (`NamespaceShardMap` is the source of
 truth); ADR-033 §7 row 5 (the deferred work this rev closes);
 ADR-042 §4 (steady-state refresh via gRPC `GetTopology` trailing
-`topology_version`); ADR-044 (cross-protocol leader-forwarding posture
+`topology_version`); ADR-014 (cross-protocol leader-forwarding posture
 — declares S3 = 307 redirect, native = client direct-dial, NFS =
 deferred).
 
@@ -98,7 +98,7 @@ deferred).
    steady-state gRPC `GetTopology` (ADR-042 §4) or a fresh
    `/cluster/info` poll if the gRPC channel is not yet established.
 
-4. **Cross-protocol redirect coordination.** ADR-044 (the new
+4. **Cross-protocol redirect coordination.** ADR-014 (the new
    leader-forwarding posture ADR introduced by Step A of the same
    plan) declares the per-protocol policy: native = client direct-dial
    to leader (this rev's mechanism), S3 = 307 Temporary Redirect on
@@ -192,9 +192,9 @@ client.connect(seeds, tenant_id):
   timeout per seed; fall through to next. Three seeds × 2 s = 6 s
   worst-case bootstrap latency. Operators size the seed list to keep
   bootstrap latency bounded.
-- **307 storms under leader-election churn** (S3 path, ADR-044):
+- **307 storms under leader-election churn** (S3 path, ADR-014):
   mitigated by `Retry-After: 0-50ms` jitter on the 307 response and
-  bench-side `curl -L --max-redirs 3`. ADR-044 carries the full
+  bench-side `curl -L --max-redirs 3`. ADR-014 carries the full
   analysis.
 - **`/cluster/info` reports leader=A but A is now follower** (the
   responding node and the leader disagree on leadership): the
