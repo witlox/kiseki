@@ -11,6 +11,17 @@ publish = false  # internal crate; only kiseki-client publishes (release.yml)
 [lints]
 workspace = true
 
+[features]
+default = []
+# io_uring-backed `DeviceBackend` impl (GH #39). Linux-only, kernel
+# >= 5.6 required (5.11+ recommended for `IORING_FEAT_FAST_POLL`).
+# Opt-in: default off so non-Linux builds and older kernels stay
+# unaffected, and so the existing `FileBackedDevice` remains the
+# tested default until the criterion bench in `benches/` clears the
+# perf gate spelled out in the issue (>= 20% single-fsync write win
+# at 4 KB on a real NVMe; no regression at 64 KB).
+io_uring = ["dep:io-uring"]
+
 [dependencies]
 kiseki-common = { workspace = true }
 thiserror = { workspace = true }
@@ -25,6 +36,21 @@ serde_json = "1"
 # table on platforms without the intrinsic.
 crc32c = "0.6"
 prometheus = { workspace = true }
+# Raw io_uring bindings. The `tokio-uring` alternative replaces the
+# whole runtime — `io-uring` keeps the workspace runtime-agnostic and
+# can be driven from a tokio task via its own reactor inside
+# `UringFileBackedDevice`. Gated behind the `io_uring` feature so
+# non-Linux builds and the default Tier-1 unit suite stay unaffected.
+io-uring = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# `criterion` drives the `FileBackedDevice` vs `UringFileBackedDevice`
+# perf gate in `benches/backend_compare.rs` (GH #39). Pinned to 0.5
+# (current stable line) and built without its plotters dep to keep
+# the bench compile cheap on dev boxes.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "backend_compare"
+harness = false
