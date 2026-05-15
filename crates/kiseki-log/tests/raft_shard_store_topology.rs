@@ -252,6 +252,7 @@ fn adr_033_default_for_3_node_cluster_yields_at_least_3_shards() {
 ///    (it stays in the now-restricted range) AND the new shard has
 ///    the upper-half delta replayed.
 #[test]
+#[allow(clippy::too_many_lines)] // Multi-phase setup + retry loop + post-split shard health verification.
 fn split_shard_redistributes_upper_half_deltas_to_new_shard() {
     use kiseki_common::ids::ChunkId;
     use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
