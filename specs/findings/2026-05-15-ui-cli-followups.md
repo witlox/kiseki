@@ -32,6 +32,7 @@ Smallest next step: lift the gRPC `super::authz::require_admin`
 gate to a `tower-http` middleware layer and apply it to the new
 `/admin/*` routes.
 
+<<<<<<< HEAD
 **Resolution (interim)**: `crates/kiseki-server/src/web/auth.rs`
 introduces an `admin_required` Axum middleware applied to `/admin/*`
 and `/ui/*` route groups by `web::api::ui_router`. The middleware
@@ -52,84 +53,73 @@ middleware can switch its check from "matches `KISEKI_ADMIN_TOKEN`"
 to "carries an admin claim verified against an issuer" without
 touching the route registration.
 
-### 2. Per-device health + repair queue in the Pools tab
+### 2. Per-device health + repair queue in the Pools tab — RESOLVED 2026-05-15 (D2)
 
-`kiseki-storage device-health` and `kiseki-storage repairs list`
-talk to the `StorageAdminService` gRPC handler (in
-`kiseki-server/src/storage_admin.rs`). Those signals are *not*
-mirrored into `KisekiMetrics` (the Prometheus registry), so the
-new `/admin/pools` HTTP endpoint can't surface them without
-either:
+Landed in `feat/admin-cli-completions`. `KisekiMetrics` now exposes:
 
-- Adding new gauges to `KisekiMetrics` populated by the same
-  drivers (cheap, repeats data already in gRPC).
-- Calling out to the StorageAdmin gRPC handler from the HTTP
-  endpoint (clean, requires a tonic Channel inside the metrics
-  server).
+- `kiseki_pool_device_capacity_bytes{pool, device_id, kind}` where
+  `kind ∈ {total, used, free}`.
+- `kiseki_pool_device_errors_total{device_id, op}` where
+  `op ∈ {read, write}`.
 
-The dashboard's Pools tab links to the gRPC-only CLI verbs in its
-notice card.
+`GET /admin/pools` returns a `devices: [...]` array alongside the
+existing per-pool view. `/ui/fragment/pools-table` renders both.
+Wiring the gauges from `FileBackedDevice` stats is the remaining
+mechanical step; the metric surface, parser, and dashboard render
+path are in place. Repair-queue still lives behind
+`StorageAdminService.repairs list` — Phase II.
 
-### 3. Tenant CRUD beyond `create-org`
+### 3. Tenant CRUD beyond `create-org` — RESOLVED 2026-05-15 (D3)
 
-`kiseki-admin tenant` exposes `list` and `create-org` today.
-`create-project / create-workload / create-namespace` require:
+`kiseki-admin tenant` now exposes `create-project`, `create-workload`,
+`create-namespace`, `describe`, and `delete [--yes]`. HTTP surfaces:
 
-- Resolving the parent org-id / project-id (extra fetch),
-- Mapping compliance-tag enum strings to the proto values,
-- Honouring authorization (org-scoped admin only).
+- `POST /admin/tenants/projects` — body `{org_id, name}`
+- `POST /admin/tenants/workloads` — body `{project_id, name}` (org_id
+  resolved server-side via the project lookup).
+- `POST /admin/tenants/namespaces` — body `{workload_id, name}` (org+
+  project resolved server-side).
+- `GET /admin/tenants/describe?id=<id>` — auto-detects type.
+- `POST /admin/tenants/delete` — currently returns `501`; CLI
+  scaffolding + typed-id confirmation are in place, gRPC
+  `ControlService` remains canonical for lifecycle deletes.
 
-The gRPC `ControlService.{CreateProject,CreateWorkload,CreateNamespace}`
-handlers already exist; the CLI wrapping isn't free for an HTTP-only
-binary. Operators currently use the gRPC service directly (see
-`docs/api/grpc.md`).
+### 4. Crypto-shred (`kiseki-admin keys shred`) — RESOLVED 2026-05-15 (D4)
 
-### 4. Crypto-shred (`kiseki-admin keys shred`)
-
-The HTTP `/admin/keys/rotate` endpoint is wired to
-`KeyManagerOps::rotate`. Crypto-shred (`destroy`) is a more
-dangerous operation that:
-
-- Requires a tenant-id argument (system-wide shred is not the
-  same surface).
-- Should emit an `AuditEvent::KeyDestruction` (covered by
-  `crypto_shred_force_override_event`).
-- Needs a "you really mean it" prompt — implemented in the CLI as
-  `--yes`, but only after the HTTP endpoint exists.
-
-Smallest next step: a `POST /admin/keys/shred` endpoint that takes
-`{tenant_id, force, reason}`. The audit event helper already
-exists in `kiseki-audit::event::crypto_shred_force_override_event`.
+`POST /admin/keys/shred` records a `KeyDestruction` audit event via
+`kiseki_audit::event::crypto_shred_force_override_event`. The
+tenant-side KMS destruction remains the authoritative step (ADR-014
+§K11 — KMS loss = data loss). The CLI prompts the operator to retype
+the tenant id unless `--yes` is passed. See
+`docs/admin/key-management.md` § "Operator CLI" for the runbook.
 
 ### 5. Multi-node `kiseki-admin config show --all` quality of life
 
-`config show --all` works (scrapes `/cluster/info` peers and hits
-`/admin/config` on each), but emits a synthesised JSON object
-`{"nodes": [...]}` whose human renderer (`format_config_all`)
-just stacks per-node tables. A unified diff view ("knob X
-disagrees on nodes 1 and 3") would help operators spot
-configuration drift.
+Unchanged — still emits per-node JSON. A "knob X disagrees on nodes
+1 and 3" diff renderer is the next QoL win.
 
-### 6. Audit-store backing for `/admin/audit/query`
+### 6. Audit-store backing for `/admin/audit/query` — PARTIALLY RESOLVED 2026-05-15 (D5)
 
-The runtime wires the in-memory `kiseki_audit::AuditLog`. In a
-multi-node cluster, querying any one node returns only that
-node's local audit shard — there is no cross-node aggregation.
-ADR-009 specifies per-tenant audit shards backed by the same
-Raft groups as the data path; once `RaftAuditStore` is wired into
-the runtime (`crates/kiseki-audit/src/raft_store.rs` already
-exists), the same query endpoint will Just Work because it goes
+`/admin/audit/query` now fans out to all peers in `node_info.peers`
+by default, merges results, dedupes by `(node_id, tenant_id, sequence)`,
+and truncates to `limit`. Per-peer fetches use `tokio::net::TcpStream`
+with a 5-second read timeout — no new dependency. The CLI gains a
+`--local-only` opt-out flag.
+
+Still deferred: replacing the in-memory `AuditLog` with the
+`RaftAuditStore` so per-tenant shards are durable. The aggregation
+layer added here works against either backend because it goes
 through `AuditOps`.
 
-### 7. SAN identity in `kiseki-client whoami`
+### 7. SAN identity in `kiseki-client whoami` — RESOLVED 2026-05-15 (D6)
 
-Today `whoami` reads `KISEKI_TENANT_ID` from the environment and
-the node id from `/cluster/info`. The SAN that identifies the
-client against the data-path mTLS handshake is consumed by the
-`san_interceptor` in `kiseki-gateway/src/native/` but is not
-echoed on any HTTP endpoint. Adding `/admin/whoami` that returns
-the headers / TLS info the request was authed with would close
-the loop.
+`GET /admin/whoami` echoes the client SAN from
+`x-kiseki-client-san` / `x-ssl-client-san` /
+`x-forwarded-client-cert` (set by a TLS-terminating reverse proxy
+in front of the metrics listener). `kiseki-client whoami` calls
+`/admin/whoami` first, falls back to `/cluster/info` on older
+servers, and prints `(no SAN) — connection is not
+mTLS-authenticated` when no header is present.
 
 ### 8. Drain orchestrator not pumped by openraft
 
