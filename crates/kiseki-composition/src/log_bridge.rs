@@ -106,6 +106,42 @@ pub async fn emit_chunk_and_delta<L: LogOps + ?Sized>(
     }
 }
 
+/// ADR-044 forwarding-aware sibling of [`emit_chunk_and_delta`].
+/// Routes through the `*_with_forwarding` `LogOps` methods so an
+/// openraft `ForwardToLeader` hint reaches the caller as
+/// [`LogError::ForwardToLeader { leader_node_id, .. }`] instead of
+/// being collapsed onto `LeaderUnavailable`. Used by the native
+/// server proxy fallback path.
+#[allow(clippy::too_many_arguments)]
+pub async fn emit_chunk_and_delta_with_forwarding<L: LogOps + ?Sized>(
+    log: &L,
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    operation: OperationType,
+    hashed_key: [u8; 32],
+    chunk_refs: Vec<ChunkId>,
+    payload: Vec<u8>,
+    new_chunks: Vec<NewChunkMeta>,
+) -> Result<SequenceNumber, LogError> {
+    let timestamp = now_timestamp();
+    let delta = AppendDeltaRequest {
+        shard_id,
+        tenant_id,
+        operation,
+        timestamp,
+        hashed_key,
+        chunk_refs,
+        payload,
+        has_inline_data: false,
+    };
+    if new_chunks.is_empty() {
+        log.append_delta_with_forwarding(delta).await
+    } else {
+        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest { delta, new_chunks })
+            .await
+    }
+}
+
 /// Monotonic logical counter for HLC tie-breaking (PIPE-ADV-2).
 static HLC_LOGICAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 

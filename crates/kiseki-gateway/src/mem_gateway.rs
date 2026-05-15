@@ -1468,440 +1468,30 @@ impl GatewayOps for InMemoryGateway {
     // as `read` above — phase histograms cover the observability
     // surface; the per-call span was a measurable per-op cost on the
     // 2026-05-05 in-process flamegraph.
-    #[allow(clippy::too_many_lines)]
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
-        // (B9: dropped "entry" debug — phase histograms cover this.)
-        // ADR-021 §3.b / I-WA1: validate the optional workflow_ref
-        // header before any storage work. The header is advisory: an
-        // unknown ref or one with no shared workflow table simply
-        // records `invalid` / `absent` and the write proceeds. The
-        // counter is observable via `workflow_ref_writes_total` and
-        // the BDD harness asserts on it to prove the header path is
-        // wired end-to-end.
-        let bucket: usize = match req.workflow_ref {
-            None => 0, // absent
-            Some(handle) => {
-                let table_arc = self
-                    .workflow_table
-                    .read()
-                    .lock_or_die("mem_gateway.workflow_table")
-                    .clone();
-                match table_arc {
-                    None => {
-                        tracing::debug!(
-                            "gateway write: workflow_ref present but no table → absent"
-                        );
-                        0
-                    }
-                    Some(table) => {
-                        let wf_ref = kiseki_common::advisory::WorkflowRef(handle);
-                        let table = table.lock().lock_or_die("mem_gateway.table");
-                        if table.get(&wf_ref).is_some() {
-                            tracing::debug!(
-                                workflow_ref = %uuid::Uuid::from_bytes(handle),
-                                "gateway write: workflow_ref valid",
-                            );
-                            1
-                        } else {
-                            tracing::debug!(
-                                workflow_ref = %uuid::Uuid::from_bytes(handle),
-                                "gateway write: workflow_ref invalid (advisory ignore — I-WA1)",
-                            );
-                            2
-                        }
-                    }
-                }
-            }
-        };
-        self.workflow_ref_writes[bucket].fetch_add(1, Ordering::Relaxed);
-        if let Some(counter) = self
-            .workflow_ref_writes_metric
-            .read()
-            .lock_or_die("mem_gateway.workflow_ref_writes_metric")
-            .as_ref()
-        {
-            let label = ["absent", "valid", "invalid"][bucket];
-            counter.with_label_values(&[label]).inc();
-        }
-
-        // POSIX/NFS read-only namespace gate (POSIX.1-2024 EROFS,
-        // NFS3ERR_ROFS, NFSv4 NFS4ERR_ROFS). Performed before any
-        // crypto/storage work so the rejection is cheap and uniform.
-        //
-        // Fast path: lock-free namespace-metadata cache (populated by
-        // add_namespace, no composition mutex required). Saves a
-        // tokio-Mutex round-trip on every write that doesn't carry
-        // an HTTP conditional. The S3 conditional path still acquires
-        // the composition mutex so the existence-check + decision +
-        // (later) bind are race-free against concurrent writers to
-        // the same name (S3 If-None-Match: * semantics).
-        if let Some(meta) = self.namespace_meta.read().get(&req.namespace_id) {
-            if meta.read_only {
-                tracing::warn!("gateway write: rejected — namespace is read-only");
-                return Err(GatewayError::ReadOnlyNamespace);
-            }
-        }
-        // (B6: the conditional check used to live here in its own
-        // composition-mutex critical section, then drop, then encrypt,
-        // then re-acquire for create+bind_name. Two issues with that:
-        // (a) two lock acquisitions per conditional PUT, (b) a real
-        // race where between the check and the create, another writer
-        // could PUT the same name and BOTH succeed — violating
-        // S3 If-None-Match: * semantics.
-        //
-        // The conditional check is now folded into the create
-        // critical section below. Cost: a write whose conditional
-        // FAILS pays the encrypt + write_chunk before the failure
-        // surfaces — those chunks orphan with refcount=0 and GC
-        // collects them. Conditional failures are the minority path,
-        // so this is a fair trade for atomicity + one fewer lock.)
-        let bytes_written = req.data.len() as u64;
-        self.requests_total.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written
-            .fetch_add(bytes_written, Ordering::Relaxed);
-        if let Some(c) = self
-            .chunk_write_bytes_metric
-            .read()
-            .lock_or_die("mem_gateway.chunk_write_bytes_metric")
-            .as_ref()
-        {
-            c.inc_by(bytes_written);
-        }
-
-        // Bug 4 fix: split payloads larger than MAX_PLAINTEXT_PER_CHUNK
-        // across multiple chunks. Smaller payloads (the common case)
-        // get a single-chunk composition, identical to the pre-fix
-        // shape. The 0-byte case yields a 1-chunk composition with an
-        // empty-payload chunk (POSIX `touch` / NFSv4 OPEN-CREATE).
-        let raw_pieces: Vec<&[u8]> = if req.data.is_empty() {
-            vec![&req.data[..]]
-        } else {
-            req.data.chunks(MAX_PLAINTEXT_PER_CHUNK).collect()
-        };
-        let pieces_len = raw_pieces.len();
-
-        let mut landed: Vec<ChunkLanded> = Vec::with_capacity(pieces_len);
-
-        for piece in raw_pieces {
-            let chunk_id =
-                derive_chunk_id(piece, self.dedup_policy, self.tenant_hmac_key.as_deref())
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
-                        GatewayError::Upstream(e.to_string())
-                    })?;
-
-            // Dedup short-circuit: if the chunk already exists, skip
-            // the per-write HKDF + AEAD seal + nonce-RNG and just
-            // bump the refcount. `try_increment_if_exists` does this
-            // in ONE critical section (one SyncBridge round-trip)
-            // instead of the two-step `refcount` + `increment_refcount`
-            // pattern, which dominated the post-dedup-fix flamegraph.
-            //
-            // Also fixes the long-standing double-increment that
-            // happened in the legacy seal-then-dedup path: chunk
-            // store's `write_chunk` ALREADY increments on dedup
-            // (returns is_new=false); the gateway's `else` branch
-            // would then increment AGAIN. This pre-seal route
-            // increments exactly once.
-            if let Ok(Some(_)) = self.chunks.try_increment_if_exists(&chunk_id).await {
-                landed.push(ChunkLanded {
-                    id: chunk_id,
-                    ciphertext_len: 0,
-                    was_new: false,
-                });
-                continue;
-            }
-            // Either the chunk didn't exist (Ok(None)) or the
-            // try-increment errored — fall through to the normal
-            // seal + write_chunk path.
-
-            let encrypt_started = std::time::Instant::now();
-            let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, piece)
-                .map_err(|e| {
-                    tracing::warn!(?chunk_id, error = %e, "gateway write: seal_envelope failed");
-                    GatewayError::Upstream(e.to_string())
-                })?;
-            self.observe_put_phase("encrypt", encrypt_started.elapsed());
-            let ciphertext_len = env.ciphertext.len() as u64;
-
-            let piece_len = piece.len() as u64;
-            // Inline path eligibility is per-chunk: a multi-chunk PUT
-            // never goes inline (each chunk is large by definition).
-            // Single-chunk PUTs ≤ inline_threshold still take the
-            // fast path so small-object storage is unchanged.
-            let mut chunk_was_new = false;
-            let chunk_write_started = std::time::Instant::now();
-            if pieces_len == 1 && piece_len <= self.inline_threshold && self.small_store.is_some() {
-                tracing::debug!(
-                    ?chunk_id,
-                    inline_threshold = self.inline_threshold,
-                    "gateway write: inline path",
-                );
-                let env_bytes = serde_json::to_vec(&env).map_err(|e| {
-                    tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
-                    GatewayError::Upstream(e.to_string())
-                })?;
-                if let Some(ref store) = self.small_store {
-                    store.put(&chunk_id.0, &env_bytes).map_err(|e| {
-                        tracing::warn!(?chunk_id, error = %e, "gateway write: small_store.put failed");
-                        GatewayError::Upstream(e.to_string())
-                    })?;
-                }
-            } else {
-                tracing::debug!(
-                    ?chunk_id,
-                    ciphertext_len,
-                    "gateway write: chunk path → chunks.write_chunk",
-                );
-                let is_new = self.chunks.write_chunk(env, "default").await.map_err(|e| {
-                    tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
-                    GatewayError::Upstream(e.to_string())
-                })?;
-                if is_new {
-                    chunk_was_new = true;
-                }
-                // (B9: dropped per-chunk debug calls from the hot
-                // path. The else-branch comment about ChunkStore's
-                // internal refcount handling is preserved in the
-                // file's git history; it remains true.)
-            }
-            self.observe_put_phase("chunk_write", chunk_write_started.elapsed());
-
-            landed.push(ChunkLanded {
-                id: chunk_id,
-                ciphertext_len,
-                was_new: chunk_was_new,
-            });
-        }
-        let chunk_ids: Vec<kiseki_common::ids::ChunkId> = landed.iter().map(|l| l.id).collect();
-
-        // Create composition (sync, fast) — lock released before Raft.
-        // Log emission happens after lock release to avoid holding the
-        // Mutex across Raft consensus (ADR-032).
-        //
-        // B6 (atomic conditional check): if the request carries an
-        // S3-style conditional, the check + create + bind_name run
-        // in this single critical section so the atomicity contract
-        // (e.g., If-None-Match: * → exactly one writer succeeds) is
-        // race-free against concurrent writers.
-        let composition_record_started = std::time::Instant::now();
-        let (comp_id, log, emit_params) = {
-            let comps = self.compositions.as_ref();
-            // ----- Create (+ bind name atomically when a key is given) -----
-            // The Raft delta below carries the name to followers via
-            // the v2 create payload so their hydrators stay consistent.
-            //
-            // When a name is present we fold create + bind_name into a
-            // single storage-mutex + single backend-batch call so the
-            // gateway PUT path takes one journal-mutex acquisition
-            // instead of four (perf-spike 2026-05-06: this was the
-            // dominant ceiling on the in-process-persistent floor).
-            //
-            // When a conditional check is also present
-            // (`If-None-Match`, `If-Match`),
-            // `create_with_name_conditional` holds the storage lock
-            // across the lookup + check + put — race-free, and the
-            // single fjall.get from the lookup feeds the cascade
-            // decision directly so the backend skips its own pre-
-            // flight read.
-            let comp_id = match req.name.as_deref() {
-                Some(name) => {
-                    let check_owner = req
-                        .conditional
-                        .as_ref()
-                        .map(|cond| ConditionalCheckAdapter { cond, name });
-                    let check_ref = check_owner.as_ref().map(|c| c as &dyn ConditionalCheck);
-                    comps.create_with_name(
-                        req.namespace_id,
-                        name.to_owned(),
-                        check_ref,
-                        chunk_ids.clone(),
-                        bytes_written,
-                    )
-                }
-                None => comps.create(req.namespace_id, chunk_ids.clone(), bytes_written),
-            }
-            .map_err(|e| {
-                tracing::warn!(error = %e, "gateway write: compositions.create failed");
-                // Map the typed NamespaceNotFound through to the
-                // gateway's typed variant so the HTTP layer can
-                // return 404 NoSuchBucket instead of an opaque 500.
-                // PreconditionFailed surfaces directly to S3 as 412.
-                if matches!(
-                    e,
-                    kiseki_composition::error::CompositionError::NamespaceNotFound(_)
-                ) {
-                    GatewayError::NamespaceNotFound(e.to_string())
-                } else if let kiseki_composition::error::CompositionError::PreconditionFailed(
-                    reason,
-                ) = e
-                {
-                    GatewayError::PreconditionFailed(reason)
-                } else {
-                    GatewayError::Upstream(e.to_string())
-                }
-            })?;
-            let comp = comps
-                .get(comp_id)
-                .expect("composition was just created above; must be present");
-            let params = (
-                comp.shard_id,
-                comp.tenant_id,
-                comp.namespace_id,
-                comp.chunks.clone(),
-            );
-            let log = comps.log();
-            (comp_id, log, params)
-        }; // Lock dropped here — before Raft consensus.
-           // (B9: dropped "composition created (pre-Raft)" debug.)
-
-        // Emit delta to log (async, slow — Raft consensus).
-        if let Some(ref log) = log {
-            let hashed_key = kiseki_composition::composition_hash_key(emit_params.2, comp_id);
-
-            // ADR-033: route to correct shard via shard map if available.
-            let shard_id = if let Some(ref shard_map) =
-                *self.shard_map.read().lock_or_die("mem_gateway.unknown")
-            {
-                // Convert NamespaceId to string for shard map lookup.
-                let ns_str = emit_params.2 .0.to_string();
-                if let Ok(map) = shard_map.get(&ns_str, emit_params.1) {
-                    kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)
-                        .unwrap_or(emit_params.0)
-                } else {
-                    emit_params.0
-                }
-            } else {
-                emit_params.0
-            };
-
-            // Phase 16b D-4: if this write created a new chunk, carry
-            // it in the `new_chunks` list so the per-shard Raft state
-            // machine seeds a `cluster_chunk_state[(tenant, chunk_id)]`
-            // row atomically with the delta. Dedup-hit writes use the
-            // plain `AppendDelta` path.
-            let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = landed
-                .iter()
-                .filter(|l| l.was_new)
-                .map(|l| {
-                    // Phase 16c step 2: when target_copies is set, pick
-                    // exactly that many nodes via rendezvous hashing. When
-                    // 0 (the 16b posture) carry the whole cluster set.
-                    let placement = if self.target_copies > 0 {
-                        kiseki_chunk_cluster::pick_placement(
-                            &l.id,
-                            &self.cluster_placement,
-                            self.target_copies,
-                        )
-                    } else {
-                        self.cluster_placement.clone()
-                    };
-                    kiseki_log::raft_store::NewChunkMeta {
-                        chunk_id: l.id.0,
-                        placement,
-                        original_len: l.ciphertext_len,
-                    }
-                })
-                .collect();
-
-            // Phase 16f: payload encodes (comp_id, namespace_id, size) so
-            // followers can hydrate their CompositionStore from the log.
-            // S3 per-key naming extends the payload (v2 length-dispatched
-            // form) with the optional name so followers can replay name
-            // bindings; legacy v1 callers (NFS, internal) keep the 40-
-            // byte payload and the hydrator's name index stays untouched.
-            let comp_payload = kiseki_composition::encode_composition_create_payload_named(
-                comp_id,
-                emit_params.2,
-                bytes_written,
-                req.name.as_deref(),
-            );
-            tracing::debug!(
-                comp_id = %comp_id.0,
-                shard_id = %shard_id.0,
-                new_chunks = new_chunks.len(),
-                "gateway write: emit_chunk_and_delta start",
-            );
-            match kiseki_composition::log_bridge::emit_chunk_and_delta(
-                log.as_ref(),
+        // Default: legacy semantics. `LogError::ForwardToLeader` (if
+        // it slipped through any path) is post-translated below to
+        // `GatewayError::Upstream(...)` so existing S3 / NFS / FUSE
+        // callers see no behavior change from the ADR-044 work.
+        match self.write_impl(req, /* with_forwarding = */ false).await {
+            Err(GatewayError::ForwardToLeader {
                 shard_id,
-                emit_params.1,
-                kiseki_log::delta::OperationType::Create,
-                hashed_key,
-                emit_params.3,
-                comp_payload,
-                new_chunks,
-            )
-            .await
-            {
-                Ok(seq) => {
-                    tracing::debug!(
-                        comp_id = %comp_id.0,
-                        shard_id = %shard_id.0,
-                        seq = ?seq,
-                        "gateway write: emit_chunk_and_delta committed",
-                    );
-                }
-                Err(kiseki_log::error::LogError::KeyOutOfRange(sid)) => {
-                    tracing::warn!(
-                        comp_id = %comp_id.0,
-                        shard_id = %sid.0,
-                        "gateway write: KeyOutOfRange — rolling back composition",
-                    );
-                    let _ = self.compositions.delete(comp_id).ok();
-                    return Err(GatewayError::KeyOutOfRange { shard_id: sid });
-                }
-                Err(e) => {
-                    // Rollback: re-acquire lock and remove (PIPE-ADV-1).
-                    tracing::warn!(
-                        comp_id = %comp_id.0,
-                        shard_id = %shard_id.0,
-                        error = %e,
-                        "gateway write: emit_chunk_and_delta failed — rolling back composition",
-                    );
-                    let _ = self.compositions.delete(comp_id).ok();
-                    // ADR-021 / I-WA5: emit a per-tenant backpressure
-                    // signal whenever the data path returns a retriable
-                    // error. Subscribers (workloads with active workflow
-                    // declarations on this tenant) can react. The emit
-                    // is non-blocking — it never delays the data path
-                    // (I-WA1, I-WA2). Only retriable errors produce a
-                    // signal; permanent errors (KeyOutOfRange, etc.)
-                    // are surfaced via their own typed paths above.
-                    let detail = e.to_string();
-                    let is_retriable = matches!(
-                        e,
-                        kiseki_log::error::LogError::ShardSplitting(_)
-                            | kiseki_log::error::LogError::LeaderUnavailable(_)
-                            | kiseki_log::error::LogError::QuorumLost(_)
-                            | kiseki_log::error::LogError::Unavailable
-                            | kiseki_log::error::LogError::ShardBusy { .. }
-                            | kiseki_log::error::LogError::MaintenanceMode(_)
-                    );
-                    if is_retriable {
-                        // Use the tenant id as the workload key — production
-                        // deployments will swap this for the workflow_ref
-                        // once ADR-021 hint headers reach the data path.
-                        let workload = req.tenant_id.0.to_string();
-                        self.report_backpressure(
-                            &workload,
-                            kiseki_advisory::BackpressureSeverity::Soft,
-                            100,
-                        );
-                    }
-                    return Err(GatewayError::Upstream(format!(
-                        "delta emission failed: {detail}"
-                    )));
-                }
-            }
+                leader_node_id,
+            }) => Err(GatewayError::Upstream(format!(
+                "delta emission failed: forward to leader: shard={shard_id:?} leader_node_id={leader_node_id:?}",
+            ))),
+            other => other,
         }
+    }
 
-        self.observe_put_phase("composition_record", composition_record_started.elapsed());
-        tracing::debug!(comp_id = %comp_id.0, bytes_written, "gateway write: success");
-        Ok(WriteResponse {
-            composition_id: comp_id,
-            bytes_written,
-        })
+    /// ADR-044 override — surfaces `GatewayError::ForwardToLeader`
+    /// with the leader's node id (consumed by the native server's
+    /// proxy fallback path).
+    async fn write_with_forwarding(
+        &self,
+        req: WriteRequest,
+    ) -> Result<WriteResponse, GatewayError> {
+        self.write_impl(req, /* with_forwarding = */ true).await
     }
 
     #[tracing::instrument(
@@ -2261,6 +1851,492 @@ impl GatewayOps for InMemoryGateway {
         }
         tracing::debug!(returned = out.len(), "gateway list_named: done");
         Ok(out)
+    }
+}
+
+impl InMemoryGateway {
+    /// Shared `write` body. The `with_forwarding` flag toggles the
+    /// `LogOps` call used to emit the composition delta: when `true`,
+    /// the route through `*_with_forwarding` returns
+    /// `LogError::ForwardToLeader { leader_node_id, .. }` which the
+    /// outer `write_with_forwarding` maps to
+    /// `GatewayError::ForwardToLeader`. When `false`, the openraft
+    /// hint is collapsed onto `LeaderUnavailable` as in the legacy
+    /// path.
+    #[allow(clippy::too_many_lines)]
+    async fn write_impl(
+        &self,
+        req: WriteRequest,
+        with_forwarding: bool,
+    ) -> Result<WriteResponse, GatewayError> {
+        // (B9: dropped "entry" debug — phase histograms cover this.)
+        // ADR-021 §3.b / I-WA1: validate the optional workflow_ref
+        // header before any storage work. The header is advisory: an
+        // unknown ref or one with no shared workflow table simply
+        // records `invalid` / `absent` and the write proceeds. The
+        // counter is observable via `workflow_ref_writes_total` and
+        // the BDD harness asserts on it to prove the header path is
+        // wired end-to-end.
+        let bucket: usize = match req.workflow_ref {
+            None => 0, // absent
+            Some(handle) => {
+                let table_arc = self
+                    .workflow_table
+                    .read()
+                    .lock_or_die("mem_gateway.workflow_table")
+                    .clone();
+                match table_arc {
+                    None => {
+                        tracing::debug!(
+                            "gateway write: workflow_ref present but no table → absent"
+                        );
+                        0
+                    }
+                    Some(table) => {
+                        let wf_ref = kiseki_common::advisory::WorkflowRef(handle);
+                        let table = table.lock().lock_or_die("mem_gateway.table");
+                        if table.get(&wf_ref).is_some() {
+                            tracing::debug!(
+                                workflow_ref = %uuid::Uuid::from_bytes(handle),
+                                "gateway write: workflow_ref valid",
+                            );
+                            1
+                        } else {
+                            tracing::debug!(
+                                workflow_ref = %uuid::Uuid::from_bytes(handle),
+                                "gateway write: workflow_ref invalid (advisory ignore — I-WA1)",
+                            );
+                            2
+                        }
+                    }
+                }
+            }
+        };
+        self.workflow_ref_writes[bucket].fetch_add(1, Ordering::Relaxed);
+        if let Some(counter) = self
+            .workflow_ref_writes_metric
+            .read()
+            .lock_or_die("mem_gateway.workflow_ref_writes_metric")
+            .as_ref()
+        {
+            let label = ["absent", "valid", "invalid"][bucket];
+            counter.with_label_values(&[label]).inc();
+        }
+
+        // POSIX/NFS read-only namespace gate (POSIX.1-2024 EROFS,
+        // NFS3ERR_ROFS, NFSv4 NFS4ERR_ROFS). Performed before any
+        // crypto/storage work so the rejection is cheap and uniform.
+        //
+        // Fast path: lock-free namespace-metadata cache (populated by
+        // add_namespace, no composition mutex required). Saves a
+        // tokio-Mutex round-trip on every write that doesn't carry
+        // an HTTP conditional. The S3 conditional path still acquires
+        // the composition mutex so the existence-check + decision +
+        // (later) bind are race-free against concurrent writers to
+        // the same name (S3 If-None-Match: * semantics).
+        if let Some(meta) = self.namespace_meta.read().get(&req.namespace_id) {
+            if meta.read_only {
+                tracing::warn!("gateway write: rejected — namespace is read-only");
+                return Err(GatewayError::ReadOnlyNamespace);
+            }
+        }
+        // (B6: the conditional check used to live here in its own
+        // composition-mutex critical section, then drop, then encrypt,
+        // then re-acquire for create+bind_name. Two issues with that:
+        // (a) two lock acquisitions per conditional PUT, (b) a real
+        // race where between the check and the create, another writer
+        // could PUT the same name and BOTH succeed — violating
+        // S3 If-None-Match: * semantics.
+        //
+        // The conditional check is now folded into the create
+        // critical section below. Cost: a write whose conditional
+        // FAILS pays the encrypt + write_chunk before the failure
+        // surfaces — those chunks orphan with refcount=0 and GC
+        // collects them. Conditional failures are the minority path,
+        // so this is a fair trade for atomicity + one fewer lock.)
+        let bytes_written = req.data.len() as u64;
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(bytes_written, Ordering::Relaxed);
+        if let Some(c) = self
+            .chunk_write_bytes_metric
+            .read()
+            .lock_or_die("mem_gateway.chunk_write_bytes_metric")
+            .as_ref()
+        {
+            c.inc_by(bytes_written);
+        }
+
+        // Bug 4 fix: split payloads larger than MAX_PLAINTEXT_PER_CHUNK
+        // across multiple chunks. Smaller payloads (the common case)
+        // get a single-chunk composition, identical to the pre-fix
+        // shape. The 0-byte case yields a 1-chunk composition with an
+        // empty-payload chunk (POSIX `touch` / NFSv4 OPEN-CREATE).
+        let raw_pieces: Vec<&[u8]> = if req.data.is_empty() {
+            vec![&req.data[..]]
+        } else {
+            req.data.chunks(MAX_PLAINTEXT_PER_CHUNK).collect()
+        };
+        let pieces_len = raw_pieces.len();
+
+        let mut landed: Vec<ChunkLanded> = Vec::with_capacity(pieces_len);
+
+        for piece in raw_pieces {
+            let chunk_id =
+                derive_chunk_id(piece, self.dedup_policy, self.tenant_hmac_key.as_deref())
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
+                        GatewayError::Upstream(e.to_string())
+                    })?;
+
+            // Dedup short-circuit: if the chunk already exists, skip
+            // the per-write HKDF + AEAD seal + nonce-RNG and just
+            // bump the refcount. `try_increment_if_exists` does this
+            // in ONE critical section (one SyncBridge round-trip)
+            // instead of the two-step `refcount` + `increment_refcount`
+            // pattern, which dominated the post-dedup-fix flamegraph.
+            //
+            // Also fixes the long-standing double-increment that
+            // happened in the legacy seal-then-dedup path: chunk
+            // store's `write_chunk` ALREADY increments on dedup
+            // (returns is_new=false); the gateway's `else` branch
+            // would then increment AGAIN. This pre-seal route
+            // increments exactly once.
+            if let Ok(Some(_)) = self.chunks.try_increment_if_exists(&chunk_id).await {
+                landed.push(ChunkLanded {
+                    id: chunk_id,
+                    ciphertext_len: 0,
+                    was_new: false,
+                });
+                continue;
+            }
+            // Either the chunk didn't exist (Ok(None)) or the
+            // try-increment errored — fall through to the normal
+            // seal + write_chunk path.
+
+            let encrypt_started = std::time::Instant::now();
+            let env = envelope::seal_envelope(&self.aead, &self.master_key, &chunk_id, piece)
+                .map_err(|e| {
+                    tracing::warn!(?chunk_id, error = %e, "gateway write: seal_envelope failed");
+                    GatewayError::Upstream(e.to_string())
+                })?;
+            self.observe_put_phase("encrypt", encrypt_started.elapsed());
+            let ciphertext_len = env.ciphertext.len() as u64;
+
+            let piece_len = piece.len() as u64;
+            // Inline path eligibility is per-chunk: a multi-chunk PUT
+            // never goes inline (each chunk is large by definition).
+            // Single-chunk PUTs ≤ inline_threshold still take the
+            // fast path so small-object storage is unchanged.
+            let mut chunk_was_new = false;
+            let chunk_write_started = std::time::Instant::now();
+            if pieces_len == 1 && piece_len <= self.inline_threshold && self.small_store.is_some() {
+                tracing::debug!(
+                    ?chunk_id,
+                    inline_threshold = self.inline_threshold,
+                    "gateway write: inline path",
+                );
+                let env_bytes = serde_json::to_vec(&env).map_err(|e| {
+                    tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
+                    GatewayError::Upstream(e.to_string())
+                })?;
+                if let Some(ref store) = self.small_store {
+                    store.put(&chunk_id.0, &env_bytes).map_err(|e| {
+                        tracing::warn!(?chunk_id, error = %e, "gateway write: small_store.put failed");
+                        GatewayError::Upstream(e.to_string())
+                    })?;
+                }
+            } else {
+                tracing::debug!(
+                    ?chunk_id,
+                    ciphertext_len,
+                    "gateway write: chunk path → chunks.write_chunk",
+                );
+                let is_new = self.chunks.write_chunk(env, "default").await.map_err(|e| {
+                    tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
+                    GatewayError::Upstream(e.to_string())
+                })?;
+                if is_new {
+                    chunk_was_new = true;
+                }
+                // (B9: dropped per-chunk debug calls from the hot
+                // path. The else-branch comment about ChunkStore's
+                // internal refcount handling is preserved in the
+                // file's git history; it remains true.)
+            }
+            self.observe_put_phase("chunk_write", chunk_write_started.elapsed());
+
+            landed.push(ChunkLanded {
+                id: chunk_id,
+                ciphertext_len,
+                was_new: chunk_was_new,
+            });
+        }
+        let chunk_ids: Vec<kiseki_common::ids::ChunkId> = landed.iter().map(|l| l.id).collect();
+
+        // Create composition (sync, fast) — lock released before Raft.
+        // Log emission happens after lock release to avoid holding the
+        // Mutex across Raft consensus (ADR-032).
+        //
+        // B6 (atomic conditional check): if the request carries an
+        // S3-style conditional, the check + create + bind_name run
+        // in this single critical section so the atomicity contract
+        // (e.g., If-None-Match: * → exactly one writer succeeds) is
+        // race-free against concurrent writers.
+        let composition_record_started = std::time::Instant::now();
+        let (comp_id, log, emit_params) = {
+            let comps = self.compositions.as_ref();
+            // ----- Create (+ bind name atomically when a key is given) -----
+            // The Raft delta below carries the name to followers via
+            // the v2 create payload so their hydrators stay consistent.
+            //
+            // When a name is present we fold create + bind_name into a
+            // single storage-mutex + single backend-batch call so the
+            // gateway PUT path takes one journal-mutex acquisition
+            // instead of four (perf-spike 2026-05-06: this was the
+            // dominant ceiling on the in-process-persistent floor).
+            //
+            // When a conditional check is also present
+            // (`If-None-Match`, `If-Match`),
+            // `create_with_name_conditional` holds the storage lock
+            // across the lookup + check + put — race-free, and the
+            // single fjall.get from the lookup feeds the cascade
+            // decision directly so the backend skips its own pre-
+            // flight read.
+            let comp_id = match req.name.as_deref() {
+                Some(name) => {
+                    let check_owner = req
+                        .conditional
+                        .as_ref()
+                        .map(|cond| ConditionalCheckAdapter { cond, name });
+                    let check_ref = check_owner.as_ref().map(|c| c as &dyn ConditionalCheck);
+                    comps.create_with_name(
+                        req.namespace_id,
+                        name.to_owned(),
+                        check_ref,
+                        chunk_ids.clone(),
+                        bytes_written,
+                    )
+                }
+                None => comps.create(req.namespace_id, chunk_ids.clone(), bytes_written),
+            }
+            .map_err(|e| {
+                tracing::warn!(error = %e, "gateway write: compositions.create failed");
+                // Map the typed NamespaceNotFound through to the
+                // gateway's typed variant so the HTTP layer can
+                // return 404 NoSuchBucket instead of an opaque 500.
+                // PreconditionFailed surfaces directly to S3 as 412.
+                if matches!(
+                    e,
+                    kiseki_composition::error::CompositionError::NamespaceNotFound(_)
+                ) {
+                    GatewayError::NamespaceNotFound(e.to_string())
+                } else if let kiseki_composition::error::CompositionError::PreconditionFailed(
+                    reason,
+                ) = e
+                {
+                    GatewayError::PreconditionFailed(reason)
+                } else {
+                    GatewayError::Upstream(e.to_string())
+                }
+            })?;
+            let comp = comps
+                .get(comp_id)
+                .expect("composition was just created above; must be present");
+            let params = (
+                comp.shard_id,
+                comp.tenant_id,
+                comp.namespace_id,
+                comp.chunks.clone(),
+            );
+            let log = comps.log();
+            (comp_id, log, params)
+        }; // Lock dropped here — before Raft consensus.
+           // (B9: dropped "composition created (pre-Raft)" debug.)
+
+        // Emit delta to log (async, slow — Raft consensus).
+        if let Some(ref log) = log {
+            let hashed_key = kiseki_composition::composition_hash_key(emit_params.2, comp_id);
+
+            // ADR-033: route to correct shard via shard map if available.
+            let shard_id = if let Some(ref shard_map) =
+                *self.shard_map.read().lock_or_die("mem_gateway.unknown")
+            {
+                // Convert NamespaceId to string for shard map lookup.
+                let ns_str = emit_params.2 .0.to_string();
+                if let Ok(map) = shard_map.get(&ns_str, emit_params.1) {
+                    kiseki_control::shard_topology::route_to_shard(&map, &hashed_key)
+                        .unwrap_or(emit_params.0)
+                } else {
+                    emit_params.0
+                }
+            } else {
+                emit_params.0
+            };
+
+            // Phase 16b D-4: if this write created a new chunk, carry
+            // it in the `new_chunks` list so the per-shard Raft state
+            // machine seeds a `cluster_chunk_state[(tenant, chunk_id)]`
+            // row atomically with the delta. Dedup-hit writes use the
+            // plain `AppendDelta` path.
+            let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = landed
+                .iter()
+                .filter(|l| l.was_new)
+                .map(|l| {
+                    // Phase 16c step 2: when target_copies is set, pick
+                    // exactly that many nodes via rendezvous hashing. When
+                    // 0 (the 16b posture) carry the whole cluster set.
+                    let placement = if self.target_copies > 0 {
+                        kiseki_chunk_cluster::pick_placement(
+                            &l.id,
+                            &self.cluster_placement,
+                            self.target_copies,
+                        )
+                    } else {
+                        self.cluster_placement.clone()
+                    };
+                    kiseki_log::raft_store::NewChunkMeta {
+                        chunk_id: l.id.0,
+                        placement,
+                        original_len: l.ciphertext_len,
+                    }
+                })
+                .collect();
+
+            // Phase 16f: payload encodes (comp_id, namespace_id, size) so
+            // followers can hydrate their CompositionStore from the log.
+            // S3 per-key naming extends the payload (v2 length-dispatched
+            // form) with the optional name so followers can replay name
+            // bindings; legacy v1 callers (NFS, internal) keep the 40-
+            // byte payload and the hydrator's name index stays untouched.
+            let comp_payload = kiseki_composition::encode_composition_create_payload_named(
+                comp_id,
+                emit_params.2,
+                bytes_written,
+                req.name.as_deref(),
+            );
+            tracing::debug!(
+                comp_id = %comp_id.0,
+                shard_id = %shard_id.0,
+                new_chunks = new_chunks.len(),
+                "gateway write: emit_chunk_and_delta start",
+            );
+            let emit_result = if with_forwarding {
+                kiseki_composition::log_bridge::emit_chunk_and_delta_with_forwarding(
+                    log.as_ref(),
+                    shard_id,
+                    emit_params.1,
+                    kiseki_log::delta::OperationType::Create,
+                    hashed_key,
+                    emit_params.3,
+                    comp_payload,
+                    new_chunks,
+                )
+                .await
+            } else {
+                kiseki_composition::log_bridge::emit_chunk_and_delta(
+                    log.as_ref(),
+                    shard_id,
+                    emit_params.1,
+                    kiseki_log::delta::OperationType::Create,
+                    hashed_key,
+                    emit_params.3,
+                    comp_payload,
+                    new_chunks,
+                )
+                .await
+            };
+            match emit_result {
+                Ok(seq) => {
+                    tracing::debug!(
+                        comp_id = %comp_id.0,
+                        shard_id = %shard_id.0,
+                        seq = ?seq,
+                        "gateway write: emit_chunk_and_delta committed",
+                    );
+                }
+                Err(kiseki_log::error::LogError::KeyOutOfRange(sid)) => {
+                    tracing::warn!(
+                        comp_id = %comp_id.0,
+                        shard_id = %sid.0,
+                        "gateway write: KeyOutOfRange — rolling back composition",
+                    );
+                    let _ = self.compositions.delete(comp_id).ok();
+                    return Err(GatewayError::KeyOutOfRange { shard_id: sid });
+                }
+                Err(kiseki_log::error::LogError::ForwardToLeader {
+                    shard_id: sid,
+                    leader_node_id,
+                }) => {
+                    // ADR-044 — surfaces only via `write_with_forwarding`'s
+                    // `emit_chunk_and_delta_with_forwarding` path. The
+                    // outer `write` wrapper post-translates this to
+                    // `GatewayError::Upstream` so legacy callers see
+                    // unchanged semantics.
+                    tracing::debug!(
+                        comp_id = %comp_id.0,
+                        shard_id = %sid.0,
+                        leader_node_id = %leader_node_id.0,
+                        "gateway write: ForwardToLeader — rolling back composition",
+                    );
+                    let _ = self.compositions.delete(comp_id).ok();
+                    return Err(GatewayError::ForwardToLeader {
+                        shard_id: sid,
+                        leader_node_id,
+                    });
+                }
+                Err(e) => {
+                    // Rollback: re-acquire lock and remove (PIPE-ADV-1).
+                    tracing::warn!(
+                        comp_id = %comp_id.0,
+                        shard_id = %shard_id.0,
+                        error = %e,
+                        "gateway write: emit_chunk_and_delta failed — rolling back composition",
+                    );
+                    let _ = self.compositions.delete(comp_id).ok();
+                    // ADR-021 / I-WA5: emit a per-tenant backpressure
+                    // signal whenever the data path returns a retriable
+                    // error. Subscribers (workloads with active workflow
+                    // declarations on this tenant) can react. The emit
+                    // is non-blocking — it never delays the data path
+                    // (I-WA1, I-WA2). Only retriable errors produce a
+                    // signal; permanent errors (KeyOutOfRange, etc.)
+                    // are surfaced via their own typed paths above.
+                    let detail = e.to_string();
+                    let is_retriable = matches!(
+                        e,
+                        kiseki_log::error::LogError::ShardSplitting(_)
+                            | kiseki_log::error::LogError::LeaderUnavailable(_)
+                            | kiseki_log::error::LogError::ForwardToLeader { .. }
+                            | kiseki_log::error::LogError::QuorumLost(_)
+                            | kiseki_log::error::LogError::Unavailable
+                            | kiseki_log::error::LogError::ShardBusy { .. }
+                            | kiseki_log::error::LogError::MaintenanceMode(_)
+                    );
+                    if is_retriable {
+                        // Use the tenant id as the workload key — production
+                        // deployments will swap this for the workflow_ref
+                        // once ADR-021 hint headers reach the data path.
+                        let workload = req.tenant_id.0.to_string();
+                        self.report_backpressure(
+                            &workload,
+                            kiseki_advisory::BackpressureSeverity::Soft,
+                            100,
+                        );
+                    }
+                    return Err(GatewayError::Upstream(format!(
+                        "delta emission failed: {detail}"
+                    )));
+                }
+            }
+        }
+
+        self.observe_put_phase("composition_record", composition_record_started.elapsed());
+        tracing::debug!(comp_id = %comp_id.0, bytes_written, "gateway write: success");
+        Ok(WriteResponse {
+            composition_id: comp_id,
+            bytes_written,
+        })
     }
 }
 

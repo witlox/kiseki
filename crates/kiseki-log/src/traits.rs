@@ -111,6 +111,19 @@ pub trait LogOps: Send + Sync {
         self.append_delta(req.delta).await
     }
 
+    /// ADR-044 — `append_chunk_and_delta` with `ForwardToLeader`
+    /// hint preserved. Default impl drops `new_chunks` and forwards
+    /// to `append_delta_with_forwarding` (the same simplification
+    /// as `append_chunk_and_delta` itself); the Raft-backed store
+    /// overrides with an atomic `ChunkAndDelta` proposal that maps
+    /// the openraft hint via `map_raft_error_with_forwarding`.
+    async fn append_chunk_and_delta_with_forwarding(
+        &self,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.append_delta_with_forwarding(req.delta).await
+    }
+
     /// Bump a chunk's `cluster_chunk_state` refcount on an existing
     /// entry — Phase 16b. No-op default (in-memory store does not
     /// track `cluster_chunk_state`). Production override proposes

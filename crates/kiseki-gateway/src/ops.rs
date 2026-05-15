@@ -96,6 +96,30 @@ pub trait GatewayOps: Send + Sync {
     /// Write data to a composition (encrypt plaintext from client → store).
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError>;
 
+    /// ADR-044 — `write` that surfaces
+    /// [`GatewayError::ForwardToLeader`] when the local node is a
+    /// follower for the target shard's Raft group.
+    ///
+    /// Default impl delegates to [`Self::write`], so backends that
+    /// always behave as their own leader (in-process single-node,
+    /// in-memory test gateways) need no change. Production
+    /// gateways with multi-node Raft override this to call
+    /// [`kiseki_log::traits::LogOps::append_chunk_and_delta_with_forwarding`]
+    /// (and the matching `..._with_forwarding` sibling on
+    /// `append_delta` paths) so the follower's hint reaches the
+    /// caller as `GatewayError::ForwardToLeader { leader_node_id }`.
+    ///
+    /// The native `ServerImpl::put_object` proxy path
+    /// (`KISEKI_NATIVE_PROXY_FALLBACK=on`) calls this method when
+    /// proxy fallback is enabled; otherwise it falls back to
+    /// `write` so the existing semantics are unchanged.
+    async fn write_with_forwarding(
+        &self,
+        req: WriteRequest,
+    ) -> Result<WriteResponse, GatewayError> {
+        self.write(req).await
+    }
+
     /// Force durability of all writes the gateway has accepted.
     ///
     /// Honors POSIX `fsync(2)` semantics under the group-commit

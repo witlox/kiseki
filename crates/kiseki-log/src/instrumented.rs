@@ -115,6 +115,25 @@ impl LogOps for InstrumentedLogOps {
         result
     }
 
+    /// ADR-044 forwarding-aware sibling of `append_chunk_and_delta`.
+    /// Same metrics bucket; the new outcome label `forward_to_leader`
+    /// distinguishes the gate-1 C-M3 case in the time series.
+    #[tracing::instrument(level = "debug", skip(self, req), fields(shard_id = %req.delta.shard_id.0))]
+    async fn append_chunk_and_delta_with_forwarding(
+        &self,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        let shard = req.delta.shard_id.0.to_string();
+        let started = Instant::now();
+        let result = self.inner.append_chunk_and_delta_with_forwarding(req).await;
+        let label = match &result {
+            Ok(_) => outcome::OK,
+            Err(e) => outcome_for(e),
+        };
+        self.metrics.record_append(&shard, label, started.elapsed());
+        result
+    }
+
     async fn increment_chunk_refcount(
         &self,
         shard_id: ShardId,

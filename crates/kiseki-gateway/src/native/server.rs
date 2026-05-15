@@ -473,7 +473,58 @@ impl ServerImpl {
             conditional,
             workflow_ref,
         };
-        let resp = self.ops.write(wreq).await.map_err(map_gateway_error)?;
+        // ADR-044 — when the proxy fallback is enabled, route writes
+        // through `write_with_forwarding` so we can observe a
+        // `GatewayError::ForwardToLeader` hint and proxy to the
+        // leader. Otherwise the legacy `write` path is unchanged.
+        let resp = if self.is_proxy_fallback_enabled() {
+            match self.ops.write_with_forwarding(wreq).await {
+                Ok(r) => r,
+                Err(GatewayError::ForwardToLeader {
+                    shard_id,
+                    leader_node_id,
+                }) => {
+                    // Proxy plumbing is wired (commits 5501d9f +
+                    // this commit). The actual gateway→gateway
+                    // request re-issue is deferred to a follow-up
+                    // implementer commit — the wire-level proxy
+                    // dial needs the original PutObjectRequest
+                    // re-built from `wreq` plus the original
+                    // `ControlFields` and the `kiseki-proxy-hop-count`
+                    // metadata. For now, the gate-1 defenses fire
+                    // (self-forward / hop-cap / leader-known)
+                    // and the call surfaces as Status::unavailable
+                    // with a structured leader hint so the client's
+                    // Step C topology-cache path can route around it.
+                    if let Some(pc) = self.proxy_client() {
+                        match pc.validate_forward(leader_node_id, /* hop */ 0) {
+                            Ok(addr) => {
+                                tracing::warn!(
+                                    shard_id = %shard_id.0,
+                                    leader_node_id = leader_node_id.0,
+                                    leader_addr = %addr,
+                                    "ADR-044 proxy fallback: forward gate validated, wire-level dial pending follow-up",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard_id = %shard_id.0,
+                                    leader_node_id = leader_node_id.0,
+                                    error = %e,
+                                    "ADR-044 proxy fallback: validate_forward rejected",
+                                );
+                            }
+                        }
+                    }
+                    return Err(Status::unavailable(format!(
+                        "forward to leader: shard={shard_id:?} leader={leader_node_id:?}"
+                    )));
+                }
+                Err(e) => return Err(map_gateway_error(e)),
+            }
+        } else {
+            self.ops.write(wreq).await.map_err(map_gateway_error)?
+        };
         Ok(np::PutObjectResponse {
             composition_id: Some(comp_to_proto(resp.composition_id)),
             size: resp.bytes_written,
