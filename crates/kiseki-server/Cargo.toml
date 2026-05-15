@@ -89,3 +89,7 @@ dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Drives axum routers through `oneshot` in middleware tests without
+# binding a real TCP socket. Axum re-exports tower internally; the
+# explicit dev-dep is just so `use tower::ServiceExt` resolves.
+tower = { version = "0.5", features = ["util"] }

@@ -14,6 +14,10 @@ where the design already exists.
 
 ### 1. RBAC / authn on the admin HTTP surface (ADR-038 §D4, ADR-014)
 
+**Status (2026-05-15)**: **PARTIALLY RESOLVED** by branch
+`feat/admin-rbac-auth` — Bearer-token stopgap landed; SAN-based
+binding remains future work.
+
 The new `/admin/*` endpoints inherit the existing posture: the
 metrics HTTP port is operator-only and firewalled. There is no
 per-request auth.
@@ -27,6 +31,26 @@ tenant-scoped client should only see its own events.
 Smallest next step: lift the gRPC `super::authz::require_admin`
 gate to a `tower-http` middleware layer and apply it to the new
 `/admin/*` routes.
+
+**Resolution (interim)**: `crates/kiseki-server/src/web/auth.rs`
+introduces an `admin_required` Axum middleware applied to `/admin/*`
+and `/ui/*` route groups by `web::api::ui_router`. The middleware
+requires `Authorization: Bearer <KISEKI_ADMIN_TOKEN>` by default;
+`KISEKI_ADMIN_AUTH_DISABLED=true` provides a documented dev opt-out.
+`KISEKI_CLIENT_TOKEN` is recognised on `/cluster/info` only — the
+two-tier ACL is the smallest viable shape that lets CLI clients
+bootstrap topology without granting them admin powers. Operator
+guidance is in `docs/admin/dashboard.md` §"Authenticating to the
+admin tier".
+
+**Still deferred**: SAN-based binding (so the token carries a
+tenant identity and `/admin/audit/query`'s `?tenant=<uuid>`
+filter can be enforced server-side), full SSO integration via
+Keycloak, and per-tenant filtering of `/cluster/info` `shards[]`.
+The Bearer stopgap is structurally compatible — the same
+middleware can switch its check from "matches `KISEKI_ADMIN_TOKEN`"
+to "carries an admin claim verified against an issuer" without
+touching the route registration.
 
 ### 2. Per-device health + repair queue in the Pools tab
 
