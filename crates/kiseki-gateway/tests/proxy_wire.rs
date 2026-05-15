@@ -172,25 +172,34 @@ async fn proxy_put_object_wire_level_reissues_with_forwarded_from_node_and_idemp
     assert_eq!(resp.size, 7);
 
     // ---- assert leader observed the forwarded request -------------
-    let captured = recorder.captured.lock();
+    // Clippy: don't hold the parking_lot MutexGuard across the
+    // `.await` on `leader_task` below. Extract the fields we need,
+    // drop the lock immediately.
+    let (observed_count, observed_idem, observed_forwarded_from) = {
+        let captured = recorder.captured.lock();
+        let count = captured.len();
+        assert_eq!(
+            count, 1,
+            "leader MUST have observed exactly one proxied write"
+        );
+        (
+            count,
+            captured[0].idempotency_key.clone(),
+            captured[0].forwarded_from_node,
+        )
+    };
+    assert_eq!(observed_count, 1);
     assert_eq!(
-        captured.len(),
-        1,
-        "leader MUST have observed exactly one proxied write"
-    );
-    let observed = &captured[0];
-    assert_eq!(
-        observed.idempotency_key.as_deref(),
+        observed_idem.as_deref(),
         Some(idem.as_slice()),
         "I-NG5: idempotency_key MUST cross the proxy boundary byte-for-byte"
     );
     assert_eq!(
-        observed.forwarded_from_node,
+        observed_forwarded_from,
         Some(follower_node_id.0),
         "I-NG1 / finding §M2: leader MUST see `forwarded_from_node` stamped \
          with the proxying node's id so audit attribution is preserved"
     );
-    drop(captured);
 
     // shut the leader down cleanly
     let _ = shutdown_tx.send(());

@@ -262,7 +262,7 @@ impl ProxyClient {
     ///    cap (gate-1 finding C-H4).
     ///
     /// The `ControlFields.idempotency_key` MUST already be set on the
-    /// outbound `req` — the caller (server.rs put_object handler)
+    /// outbound `req` — the caller (server.rs `put_object` handler)
     /// preserves it from the original inbound request. I-NG5 holds
     /// because we never construct a new key here; the leader's dedup
     /// table sees the original.
