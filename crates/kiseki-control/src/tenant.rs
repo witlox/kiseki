@@ -185,6 +185,20 @@ impl TenantStore {
             .ok_or_else(|| ControlError::NotFound(format!("project {id}")))
     }
 
+    /// List all projects. Order is unspecified.
+    #[must_use]
+    pub fn list_projects(&self) -> Vec<Project> {
+        let projects = self.projects.read().lock_or_die("tenant.unknown");
+        projects.values().cloned().collect()
+    }
+
+    /// List all workloads. Order is unspecified.
+    #[must_use]
+    pub fn list_workloads(&self) -> Vec<Workload> {
+        let workloads = self.workloads.read().lock_or_die("tenant.unknown");
+        workloads.values().cloned().collect()
+    }
+
     /// Create a workload within an organization.
     pub fn create_workload(&self, wl: Workload) -> Result<(), ControlError> {
         let orgs = self.orgs.read().lock_or_die("tenant.unknown");
@@ -298,6 +312,40 @@ mod tests {
         };
         let tags = effective_compliance_tags(&org, Some(&proj));
         assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn list_projects_and_workloads_return_inserted() {
+        let store = TenantStore::new();
+        store.create_org(test_org()).unwrap();
+        store
+            .create_project(Project {
+                id: "proj-1".into(),
+                org_id: "org-test".into(),
+                name: "proj-1".into(),
+                compliance_tags: vec![],
+                quota: Quota {
+                    capacity_bytes: 100,
+                    iops: 10,
+                    metadata_ops_per_sec: 1,
+                },
+            })
+            .unwrap();
+        store
+            .create_workload(Workload {
+                id: "wl-1".into(),
+                org_id: "org-test".into(),
+                project_id: "proj-1".into(),
+                name: "wl-1".into(),
+                quota: Quota {
+                    capacity_bytes: 100,
+                    iops: 10,
+                    metadata_ops_per_sec: 1,
+                },
+            })
+            .unwrap();
+        assert_eq!(store.list_projects().len(), 1);
+        assert_eq!(store.list_workloads().len(), 1);
     }
 
     #[test]
