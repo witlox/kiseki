@@ -44,6 +44,10 @@ pub struct OpenRaftLogStore {
     state: Arc<futures::lock::Mutex<ShardSmInner>>,
     shard_id: ShardId,
     tenant_id: OrgId,
+    /// Local Raft node id (ADR-044). Stashed at construction so the
+    /// proxy code path can detect a self-forward without dipping
+    /// into the openraft metrics watch. See [`Self::node_id`].
+    local_node_id: u64,
     /// Inline write rate meter (I-SF7): tracks bytes written in the
     /// current sliding window. When rate exceeds budget, the effective
     /// inline threshold drops to floor.
@@ -227,6 +231,7 @@ impl OpenRaftLogStore {
             state: state_inner,
             shard_id,
             tenant_id,
+            local_node_id: node_id,
             inline_rate: std::sync::Mutex::new(InlineRateMeter::new(10)), // 10 MB/s default
         })
     }
@@ -917,5 +922,85 @@ impl OpenRaftLogStore {
     #[must_use]
     pub fn tenant_id(&self) -> OrgId {
         self.tenant_id
+    }
+
+    /// The raft node id this store's local replica owns. Used by the
+    /// native server proxy path's self-forward defense (ADR-044
+    /// gate-1 finding C-H2) — the proxy MUST reject
+    /// `leader_node_id == self.node_id()` as a stale-Raft self-loop.
+    #[must_use]
+    pub fn node_id(&self) -> u64 {
+        // The raft handle keeps this internally; openraft 0.10 exposes
+        // it via the metrics watch. Avoid pulling metrics on the hot
+        // path — instead we stash the value at construction time.
+        self.local_node_id
+    }
+}
+
+#[cfg(test)]
+mod adr044_tests {
+    //! ADR-044 — `ForwardToLeader` extraction unit tests.
+    //!
+    //! Drives the `map_raft_error_with_forwarding` helper through
+    //! every branch of `openraft::error::ClientWriteError` to
+    //! validate the mapping invariants documented in the
+    //! `append_delta_with_forwarding` rustdoc table.
+
+    use super::{map_raft_error_with_forwarding, C};
+    use crate::error::LogError;
+    use kiseki_common::ids::{NodeId, ShardId};
+    use openraft::error::ClientWriteError;
+    use openraft::errors::{Fatal, RaftError};
+
+    fn dummy_shard() -> ShardId {
+        ShardId(uuid::Uuid::from_u128(
+            0x044_0000_0000_0000_0000_0000_0000_0001,
+        ))
+    }
+
+    #[test]
+    fn forward_to_leader_with_known_leader_id_maps_to_forward_variant() {
+        let hint = openraft::error::ForwardToLeader::<C>::new(
+            7,
+            kiseki_raft::KisekiNode::new("127.0.0.1:9100"),
+        );
+        let err: RaftError<C, ClientWriteError<C>> =
+            RaftError::APIError(ClientWriteError::ForwardToLeader(hint));
+        let mapped = map_raft_error_with_forwarding(err, dummy_shard());
+        match mapped {
+            LogError::ForwardToLeader {
+                shard_id,
+                leader_node_id,
+            } => {
+                assert_eq!(shard_id, dummy_shard());
+                assert_eq!(leader_node_id, NodeId(7));
+            }
+            other => panic!("expected ForwardToLeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_to_leader_with_unknown_leader_id_falls_back_to_leader_unavailable() {
+        let hint = openraft::error::ForwardToLeader::<C>::empty();
+        let err: RaftError<C, ClientWriteError<C>> =
+            RaftError::APIError(ClientWriteError::ForwardToLeader(hint));
+        let mapped = map_raft_error_with_forwarding(err, dummy_shard());
+        match mapped {
+            LogError::LeaderUnavailable(id) => assert_eq!(id, dummy_shard()),
+            other => panic!("expected LeaderUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raft_fatal_error_maps_to_unavailable() {
+        // Any non-ForwardToLeader Raft error collapses to
+        // `LogError::Unavailable` — clients retry, no forwarding hint.
+        let fatal: Fatal<C> = Fatal::Stopped;
+        let err: RaftError<C, ClientWriteError<C>> = RaftError::Fatal(fatal);
+        let mapped = map_raft_error_with_forwarding(err, dummy_shard());
+        assert!(
+            matches!(mapped, LogError::Unavailable),
+            "expected LogError::Unavailable, got {mapped:?}"
+        );
     }
 }
