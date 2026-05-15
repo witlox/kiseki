@@ -372,6 +372,9 @@ impl<G: GatewayOps> KisekiFuse<G> {
             name: None,
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
+
+            forwarded_from_node: None,
         })
     }
 
@@ -461,6 +464,9 @@ impl<G: GatewayOps> KisekiFuse<G> {
             name: None,
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
+
+            forwarded_from_node: None,
         })
     }
 

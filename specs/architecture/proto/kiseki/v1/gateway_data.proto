@@ -94,6 +94,16 @@ message ControlFields {
     Etag if_match = 6;
     VersionId if_version_match = 7;
   }
+  // ADR-042 §4 / `2026-05-15-leader-forwarding-posture.md` §M2:
+  // when a non-leader node proxies a write to the leader, it MUST
+  // stamp this field with its own NodeId before re-issuing the RPC.
+  // The leader's audit log records both the originating tenant
+  // (`tenant_id`) AND the forwarding node so an audit reviewer can
+  // tell a "client-direct" write from a "proxied" one. Original
+  // client requests leave this field unset; the proxy hop sets it.
+  // Optional => proto3 default 0 means "not present" (no node has
+  // id 0 by convention; NodeId(0) is the bootstrap sentinel).
+  optional uint64 forwarded_from_node = 8;
 }
 
 message Empty {}

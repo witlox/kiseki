@@ -59,6 +59,29 @@ pub struct WriteRequest {
     /// **never** blocks the write — it is simply recorded as
     /// `invalid` in the `workflow_ref` counter and the write proceeds.
     pub workflow_ref: Option<[u8; 16]>,
+    /// Optional idempotency key (I-NG5 / ADR-042 §6). 1..=64 bytes,
+    /// opaque, client-generated. The server-side proxy fallback
+    /// (ADR-042 §4) MUST preserve this byte-for-byte when re-issuing
+    /// a write against the shard leader so the leader's dedup table
+    /// short-circuits a retry to the original response (exactly-once
+    /// semantics). Validated at the proto boundary in
+    /// `kiseki-gateway::native::server::validate_idempotency_key`;
+    /// the field carried here is the post-validation bytes.
+    ///
+    /// `None` for callers that don't have an idempotency context
+    /// (in-process tests, NFS data path — the file handle is the
+    /// addressing token and the gateway's per-handle bookkeeping
+    /// covers retries).
+    pub idempotency_key: Option<Vec<u8>>,
+    /// Optional forwarding attribution (audit I-NG1 / finding §M2).
+    /// `Some(node_id)` when the request reached this gateway via the
+    /// ADR-042 §4 server-side proxy fallback — the value is the
+    /// `NodeId` of the proxying node. The leader's audit record for
+    /// this write MUST carry both the originating tenant (`tenant_id`)
+    /// AND `forwarded_from_node` so an audit reviewer can distinguish
+    /// a "client-direct" write from one routed via another gateway.
+    /// `None` for client-direct writes (no proxy hop).
+    pub forwarded_from_node: Option<u64>,
 }
 
 /// HTTP-derived conditional check applied to a `WriteRequest` against
@@ -395,5 +418,59 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
         prefix: Option<&str>,
     ) -> Result<Vec<(String, CompositionId, u64)>, GatewayError> {
         (**self).list_named(tenant_id, namespace_id, prefix).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RED-first: I-NG5 (idempotency dedup byte-preserve through proxy)
+    /// requires `WriteRequest` to carry the request's
+    /// `ControlFields.idempotency_key`. Audit finding `I-NG5` in
+    /// `specs/findings/2026-05-15-gate2-audit.md` calls this out as
+    /// DEFERRED — the internal `WriteRequest` doesn't have the field, so
+    /// the wire-level proxy can't preserve it byte-for-byte. Without
+    /// the key on `WriteRequest`, retries through a different node will
+    /// commit twice instead of dedup-short-circuiting on the leader.
+    #[test]
+    fn write_request_carries_idempotency_key() {
+        let req = WriteRequest {
+            tenant_id: OrgId(uuid::Uuid::nil()),
+            namespace_id: NamespaceId(uuid::Uuid::nil()),
+            data: b"payload".to_vec(),
+            name: Some("k".into()),
+            conditional: None,
+            workflow_ref: None,
+            idempotency_key: Some(vec![0xAB; 16]),
+            forwarded_from_node: None,
+        };
+        let cloned = req.clone();
+        assert_eq!(
+            cloned.idempotency_key,
+            Some(vec![0xAB; 16]),
+            "idempotency_key MUST survive a clone so the proxy hop can re-issue it byte-for-byte"
+        );
+    }
+
+    /// Audit I-NG1 / finding §M2: a proxy hop MUST surface
+    /// `forwarded_from_node` on the leader's internal `WriteRequest`
+    /// so the audit-record write attributes both originating tenant
+    /// AND forwarding node. Validates struct-level support; the
+    /// proto<->Rust thread is exercised by the wire-level test in
+    /// `tests/proxy_wire.rs`.
+    #[test]
+    fn write_request_carries_forwarded_from_node() {
+        let req = WriteRequest {
+            tenant_id: OrgId(uuid::Uuid::nil()),
+            namespace_id: NamespaceId(uuid::Uuid::nil()),
+            data: b"payload".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
+            idempotency_key: Some(vec![1, 2, 3]),
+            forwarded_from_node: Some(7),
+        };
+        assert_eq!(req.clone().forwarded_from_node, Some(7));
     }
 }

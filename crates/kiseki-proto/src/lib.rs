@@ -109,6 +109,7 @@ mod tests {
                 workflow_ref: String::new(),
                 cache_hint: None,
                 conditional: None,
+                forwarded_from_node: None,
             }),
             namespace_id: Some(v1::NamespaceId {
                 value: "ns-postcard".into(),
@@ -120,6 +121,59 @@ mod tests {
         let decoded: np::PutObjectRequest =
             postcard::from_bytes(&bytes).expect("postcard decode on serde-derived type");
         assert_eq!(req, decoded);
+    }
+
+    /// RED-first: ControlFields MUST carry `forwarded_from_node` so the
+    /// leader's audit record for a proxied write can attribute the
+    /// originating tenant AND the forwarding node (per the
+    /// `2026-05-15-leader-forwarding-posture.md` finding §M2). proto3
+    /// optional field: encoded as a single u64; absent => `None`,
+    /// present => `Some(node_id)`. Round-trips through prost encode/decode
+    /// AND through postcard (TCP-framed binding, ADR-042 §2.2).
+    #[test]
+    fn control_fields_forwarded_from_node_roundtrips() {
+        use super::v1;
+        use super::v1::native as np;
+
+        // Case A: unset — proxy hop didn't happen. `forwarded_from_node`
+        // is None on the wire.
+        let cf_no_forward = np::ControlFields {
+            tenant_id: Some(v1::OrgId {
+                value: "tenant-roundtrip".into(),
+            }),
+            idempotency_key: vec![1, 2, 3],
+            workflow_ref: String::new(),
+            cache_hint: None,
+            conditional: None,
+            forwarded_from_node: None,
+        };
+        let mut buf = Vec::new();
+        cf_no_forward.encode(&mut buf).expect("encode no_forward");
+        let decoded = np::ControlFields::decode(&buf[..]).expect("decode no_forward");
+        assert_eq!(decoded.forwarded_from_node, None);
+
+        // Case B: proxy hop happened — `forwarded_from_node = Some(7)`.
+        // The leader's audit record consumes this value.
+        let cf_forwarded = np::ControlFields {
+            tenant_id: Some(v1::OrgId {
+                value: "tenant-roundtrip".into(),
+            }),
+            idempotency_key: vec![1, 2, 3],
+            workflow_ref: String::new(),
+            cache_hint: None,
+            conditional: None,
+            forwarded_from_node: Some(7),
+        };
+        let mut buf2 = Vec::new();
+        cf_forwarded.encode(&mut buf2).expect("encode forwarded");
+        let decoded2 = np::ControlFields::decode(&buf2[..]).expect("decode forwarded");
+        assert_eq!(decoded2.forwarded_from_node, Some(7));
+
+        // Postcard (TCP-framed binding) preserves the same shape.
+        let pc_bytes = postcard::to_allocvec(&cf_forwarded).expect("postcard encode");
+        let pc_decoded: np::ControlFields =
+            postcard::from_bytes(&pc_bytes).expect("postcard decode");
+        assert_eq!(pc_decoded.forwarded_from_node, Some(7));
     }
 
     #[test]

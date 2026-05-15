@@ -74,6 +74,9 @@ async fn build_warm_gateway() -> (Arc<InMemoryGateway>, CompositionId) {
             name: Some("warm.bin".into()),
             conditional: None,
             workflow_ref: None,
+            idempotency_key: None,
+
+            forwarded_from_node: None,
         })
         .await
         .expect("warm-put");

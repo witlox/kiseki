@@ -356,6 +356,9 @@ impl GatewayOps for Nfs3Client {
                 name: None,
                 conditional: None,
                 workflow_ref: None,
+                idempotency_key: None,
+
+                forwarded_from_node: None,
             })
             .await?;
         Ok(resp.composition_id)

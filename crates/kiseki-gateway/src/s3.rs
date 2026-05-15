@@ -131,6 +131,11 @@ impl<G: GatewayOps> S3Gateway<G> {
                 name: req.key,
                 conditional: req.conditional,
                 workflow_ref: req.workflow_ref,
+                // S3 path: no native-protocol idempotency_key; S3
+                // clients dedup via PutObject's natural overwrite +
+                // ETag semantics, not the per-tenant dedup table.
+                idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await?;
 

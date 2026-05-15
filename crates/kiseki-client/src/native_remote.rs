@@ -124,6 +124,10 @@ impl NativeRemoteGateway {
             workflow_ref: String::new(),
             cache_hint: None,
             conditional: None,
+            // Client-origin request: no proxy hop yet. The server-side
+            // proxy fallback (ADR-042 §4) stamps this with its own
+            // NodeId before re-issuing to the leader.
+            forwarded_from_node: None,
         }
     }
 }
