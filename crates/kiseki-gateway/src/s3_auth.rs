@@ -177,7 +177,12 @@ pub fn parse_authorization(header: &str) -> Result<SigV4Auth, AuthError> {
 /// DateRegionServiceKey = HMAC-SHA256(DateRegionKey, service)
 /// SigningKey           = HMAC-SHA256(DateRegionServiceKey, "aws4_request")
 /// ```
-fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
+pub(crate) fn derive_signing_key(
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> hmac::Tag {
     let k_secret = format!("AWS4{secret}");
     let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(k_date.as_ref(), region.as_bytes());
@@ -195,7 +200,7 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
 /// SignedHeaders\n
 /// HashedPayload
 /// ```
-fn canonical_request(
+pub(crate) fn canonical_request(
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -249,7 +254,7 @@ fn canonical_request(
 /// Scope\n
 /// SHA256(CanonicalRequest)
 /// ```
-fn string_to_sign(timestamp: &str, scope: &str, canonical_request: &str) -> String {
+pub(crate) fn string_to_sign(timestamp: &str, scope: &str, canonical_request: &str) -> String {
     let hash = sha256_hex(canonical_request.as_bytes());
     format!("AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{hash}")
 }
@@ -330,7 +335,7 @@ pub fn validate_request(
 // Crypto helpers
 // ---------------------------------------------------------------------------
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
     let k = hmac::Key::new(hmac::HMAC_SHA256, key);
     hmac::sign(&k, data)
 }
@@ -355,7 +360,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
