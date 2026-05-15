@@ -26,6 +26,11 @@ const OVERHEAD: usize = HEADER_SIZE + CRC_SIZE;
 /// Maximum payload bytes (ciphertext) that fit in a single extent
 /// after subtracting the per-extent header + CRC trailer overhead.
 ///
+/// Post-GH-#38: `MAX_EXTENT_BYTES = 16 MiB + 8 B` so subtracting the
+/// 8 B framing yields exactly 16 MiB of payload — the upper bound EC
+/// shards (`MAX_PLAINTEXT_PER_CHUNK = 64 MiB` ÷ 4 data shards) and
+/// `alloc_and_write_chunked` need.
+///
 /// Callers writing payloads larger than this MUST split into multiple
 /// extents — `alloc()` caps any single allocation at
 /// [`MAX_EXTENT_BYTES`].
@@ -451,11 +456,11 @@ mod tests {
     }
 
     /// Bug 5 (GCP 2026-05-04): the bitmap allocator silently truncates
-    /// any single request to `MAX_EXTENT_BYTES = 16 MiB`. Combined with
-    /// `write` not enforcing `data.len() <= extent.length`, oversized
-    /// payloads overran into adjacent extent space. Subsequent writes
-    /// then overwrote the first chunk's data, surfacing as a
-    /// `BlockError::Corruption` on read.
+    /// any single request to `MAX_EXTENT_BYTES` (≈16 MiB). Combined
+    /// with `write` not enforcing `data.len() <= extent.length`,
+    /// oversized payloads overran into adjacent extent space.
+    /// Subsequent writes then overwrote the first chunk's data,
+    /// surfacing as a `BlockError::Corruption` on read.
     ///
     /// Contract: `alloc(N)` returns an extent that fits `N` bytes of
     /// payload, OR errors. Silent truncation is forbidden.
@@ -465,7 +470,7 @@ mod tests {
         let path = dir.path().join("test.dev");
         let dev = FileBackedDevice::init(&path, 256 * MB).unwrap();
 
-        // 64 MiB exceeds the 16 MiB per-extent cap. Caller must learn
+        // 64 MiB far exceeds the per-extent cap. Caller must learn
         // this and split into multiple alloc + write pairs.
         let result = dev.alloc(64 * MB);
         match result {
