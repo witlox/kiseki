@@ -212,3 +212,21 @@ Feature: Cluster formation — multi-node Raft group bootstrap and join
     When the gateway calls GetNamespaceShardMap("alpha-data")
     Then the call is rejected with PermissionDenied
     And no shard topology information is returned
+
+  # === ADR-008 rev 2 — per-shard leader exposure on /cluster/info ===
+
+  @library @routing @slow @deferred-feature
+  Scenario: /cluster/info exposes per-shard leader map (ADR-008 rev 2)
+    Given a 3-node cluster is fully formed with namespace "ns-multi-leader" of 3 shards
+    When a client GETs /cluster/info on each node
+    Then every node's JSON response carries a top-level "shards" array
+    And each entry carries shard_id, namespace_id, leader_id, leader_data_addr
+    And the union of leader_ids across the 3 shards is {1, 2, 3} (one shard per node)
+    And each shard's range_start + range_end together cover the full 256-bit key space
+
+  @library @routing
+  Scenario: /cluster/info shards array is empty when control-plane not yet wired
+    Given a single-node cluster without the control-plane state machine
+    When a client GETs /cluster/info
+    Then the JSON response carries a "shards" array of length 0
+    And rev-1 clients fall back to seed-only routing without error

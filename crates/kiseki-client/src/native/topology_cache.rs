@@ -118,6 +118,20 @@ impl TopologyCache {
         *self.last_refresh.write() = Instant::now();
     }
 
+    /// ADR-008 rev 2 / adversary finding S4 — conditional replace
+    /// that only accepts a strictly newer snapshot. Used by the
+    /// HTTP `/cluster/info` bootstrap path so a stale poll cannot
+    /// overwrite a fresher gRPC `GetTopology` update.
+    ///
+    /// Returns `true` iff the snapshot was applied (`snap.version >
+    /// self.current_version()`).
+    ///
+    /// Implementer-step stub: always returns `false`. Body lands
+    /// next.
+    pub fn replace_if_newer(&self, _snap: Snapshot) -> bool {
+        false
+    }
+
     /// Snapshot the current cache. Cheap (`Snapshot: Clone`).
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
@@ -586,5 +600,134 @@ mod tests {
         cache.replace(s);
         assert!(cache.route_for_hashed_key(&[0xc0]).is_none());
         assert!(cache.route_for_hashed_key(&[0xa5]).is_some());
+    }
+
+    // ADR-008 rev 2 — snapshot_from_cluster_info bootstrap path.
+
+    #[test]
+    fn snapshot_from_cluster_info_populates_shards_and_nodes() {
+        let parsed = crate::discovery::ClusterInfoResponse {
+            node_id: 1,
+            s3_addr: "10.0.0.1:9000".into(),
+            nfs_addr: "10.0.0.1:2049".into(),
+            metrics_addr: "10.0.0.1:9090".into(),
+            leader_id: Some(2),
+            leader_s3: Some("10.0.0.2:9000".into()),
+            peers: vec![
+                crate::discovery::PeerInfoJson {
+                    id: 1,
+                    raft_addr: "10.0.0.1:7000".into(),
+                    s3_addr: "10.0.0.1:9000".into(),
+                    nfs_addr: "10.0.0.1:2049".into(),
+                    metrics_addr: "10.0.0.1:9090".into(),
+                },
+                crate::discovery::PeerInfoJson {
+                    id: 2,
+                    raft_addr: "10.0.0.2:7000".into(),
+                    s3_addr: "10.0.0.2:9000".into(),
+                    nfs_addr: "10.0.0.2:2049".into(),
+                    metrics_addr: "10.0.0.2:9090".into(),
+                },
+            ],
+            shards: vec![crate::discovery::ShardInfoJson {
+                shard_id: "00000000-0000-0000-0000-000000000001".into(),
+                namespace_id: "trials".into(),
+                leader_id: Some(2),
+                leader_data_addr: Some("10.0.0.2:9100".into()),
+                range_start: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
+                range_end:   "0x5555555555555555555555555555555555555555555555555555555555555555".into(),
+            }],
+        };
+        let snap = snapshot_from_cluster_info(&parsed);
+        // Two nodes derived from peers, one shard.
+        assert_eq!(snap.nodes.len(), 2, "nodes derived from peers list");
+        let node_2 = snap
+            .nodes
+            .iter()
+            .find(|n| n.node_id == 2)
+            .expect("node 2 present");
+        assert_eq!(node_2.data_addr, "10.0.0.2:9100");
+        assert_eq!(snap.shards.len(), 1);
+        assert_eq!(snap.shards[0].leader_node_id, 2);
+        assert_eq!(snap.shards[0].range_start[0], 0x00);
+        assert_eq!(snap.shards[0].range_end[31], 0x55);
+        // Bootstrap version is non-zero so subsequent replace_if_newer
+        // calls against a fresh gRPC version (which starts >= 1)
+        // behave deterministically.
+        assert!(
+            snap.version >= 1,
+            "bootstrap snapshot must carry a non-zero version"
+        );
+    }
+
+    #[test]
+    fn snapshot_from_cluster_info_falls_back_when_leader_data_addr_missing() {
+        // Cold start: rev-2 server hasn't yet observed a leader, so
+        // `leader_data_addr` is None. The bootstrap must still produce
+        // a Snapshot — the shard's data_addr falls back to the peer's
+        // S3 / metrics address derived host.
+        let parsed = crate::discovery::ClusterInfoResponse {
+            node_id: 1,
+            s3_addr: "10.0.0.1:9000".into(),
+            nfs_addr: "10.0.0.1:2049".into(),
+            metrics_addr: "10.0.0.1:9090".into(),
+            leader_id: None,
+            leader_s3: None,
+            peers: vec![crate::discovery::PeerInfoJson {
+                id: 1,
+                raft_addr: "10.0.0.1:7000".into(),
+                s3_addr: "10.0.0.1:9000".into(),
+                nfs_addr: "10.0.0.1:2049".into(),
+                metrics_addr: "10.0.0.1:9090".into(),
+            }],
+            shards: vec![crate::discovery::ShardInfoJson {
+                shard_id: "00000000-0000-0000-0000-000000000001".into(),
+                namespace_id: "trials".into(),
+                leader_id: None,
+                leader_data_addr: None,
+                range_start: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
+                range_end:   "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+            }],
+        };
+        let snap = snapshot_from_cluster_info(&parsed);
+        // With no leader hint, the shard is still recorded but
+        // its leader_node_id is 0 (sentinel for "unknown").
+        assert_eq!(snap.shards.len(), 1);
+        assert_eq!(snap.shards[0].leader_node_id, 0);
+    }
+
+    // Finding S4 — replace_if_newer guard against version regressions.
+
+    #[test]
+    fn replace_if_newer_only_accepts_strictly_greater_version() {
+        let cache = TopologyCache::new();
+        cache.replace(snap(42));
+        // Same version: rejected.
+        assert!(
+            !cache.replace_if_newer(snap(42)),
+            "equal version must be rejected"
+        );
+        assert_eq!(cache.current_version(), 42);
+        // Stale (HTTP bootstrap returning version=0): rejected.
+        assert!(
+            !cache.replace_if_newer(snap(0)),
+            "stale version must be rejected"
+        );
+        assert_eq!(cache.current_version(), 42);
+        // Strictly greater: accepted.
+        assert!(
+            cache.replace_if_newer(snap(43)),
+            "strictly newer version must be accepted"
+        );
+        assert_eq!(cache.current_version(), 43);
+    }
+
+    #[test]
+    fn replace_if_newer_populates_when_cache_is_empty() {
+        let cache = TopologyCache::new();
+        assert_eq!(cache.current_version(), 0);
+        // Fresh cache + any non-zero version: accepted.
+        assert!(cache.replace_if_newer(snap(7)));
+        assert_eq!(cache.current_version(), 7);
     }
 }

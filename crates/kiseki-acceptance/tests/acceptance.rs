@@ -88,6 +88,10 @@ pub struct KisekiWorld {
     /// struct holds the per-named-client registry and the
     /// scenario's typed mappings.
     pub native: world::native::NativeWorld,
+    /// Step C / ADR-008 rev 2 — per-scenario state for the
+    /// `/cluster/info exposes per-shard leader map` family of
+    /// cluster-formation scenarios.
+    pub cluster_info_rev2: steps::native_gateway::ClusterInfoRev2State,
 
     // --- Shared test state (used across step files) ---
     pub last_error: Option<String>,
@@ -146,6 +150,7 @@ impl KisekiWorld {
             backup: world::backup::BackupState::new(),
             cluster: world::cluster::ClusterState::default(),
             native: world::native::NativeWorld::default(),
+            cluster_info_rev2: steps::native_gateway::ClusterInfoRev2State::default(),
             last_error: None,
             last_read_data: None,
             last_epoch: None,

@@ -270,3 +270,110 @@ pub struct ClusterInfoResponse {
     #[serde(default)]
     pub shards: Vec<ShardInfoJson>,
 }
+
+#[cfg(test)]
+mod from_cluster_info_json_tests {
+    use super::*;
+
+    const REV2_JSON: &str = r#"{
+        "node_id": 1,
+        "s3_addr": "10.0.0.1:9000",
+        "nfs_addr": "10.0.0.1:2049",
+        "metrics_addr": "10.0.0.1:9090",
+        "leader_id": 2,
+        "leader_s3": "10.0.0.2:9000",
+        "peers": [
+            {"id": 1, "raft_addr": "10.0.0.1:7000", "s3_addr": "10.0.0.1:9000",
+             "nfs_addr": "10.0.0.1:2049", "metrics_addr": "10.0.0.1:9090"},
+            {"id": 2, "raft_addr": "10.0.0.2:7000", "s3_addr": "10.0.0.2:9000",
+             "nfs_addr": "10.0.0.2:2049", "metrics_addr": "10.0.0.2:9090"},
+            {"id": 3, "raft_addr": "10.0.0.3:7000", "s3_addr": "10.0.0.3:9000",
+             "nfs_addr": "10.0.0.3:2049", "metrics_addr": "10.0.0.3:9090"}
+        ],
+        "shards": [
+            {"shard_id": "00000000-0000-0000-0000-000000000001",
+             "namespace_id": "trials",
+             "leader_id": 2,
+             "leader_data_addr": "10.0.0.2:9100",
+             "range_start": "0x0000000000000000000000000000000000000000000000000000000000000000",
+             "range_end":   "0x5555555555555555555555555555555555555555555555555555555555555555"}
+        ]
+    }"#;
+
+    #[test]
+    fn parses_rev2_payload_into_discovery_response() {
+        let resp = DiscoveryClient::from_cluster_info_json(REV2_JSON)
+            .expect("rev-2 JSON parses");
+        assert_eq!(resp.shards.len(), 1);
+        let s = &resp.shards[0];
+        assert_eq!(s.shard_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(s.namespace_id, "trials");
+        assert_eq!(s.leader_node_id, Some(2));
+        assert_eq!(s.leader_addr.to_string(), "10.0.0.2:9100");
+        assert_eq!(s.range_start.len(), 32);
+        assert_eq!(s.range_end.len(), 32);
+        // First byte of start = 0x00, last byte of end = 0x55.
+        assert_eq!(s.range_start[0], 0x00);
+        assert_eq!(s.range_end[31], 0x55);
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        let err = DiscoveryClient::from_cluster_info_json("{not valid json")
+            .expect_err("malformed JSON must error");
+        assert!(matches!(err, DiscoveryParseError::Json(_)));
+    }
+
+    #[test]
+    fn rejects_unparseable_leader_data_addr() {
+        // `leader_data_addr` is "not-a-host-port".
+        let bad = REV2_JSON.replace("10.0.0.2:9100", "not-a-host-port");
+        let err = DiscoveryClient::from_cluster_info_json(&bad)
+            .expect_err("unparseable host:port must error");
+        assert!(
+            matches!(err, DiscoveryParseError::InvalidLeaderAddr(_)),
+            "expected InvalidLeaderAddr, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_hex_range() {
+        // `range_start` is not a valid 0x-prefixed hex string.
+        let bad = REV2_JSON
+            .replace(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "deadbeef",
+            );
+        let err = DiscoveryClient::from_cluster_info_json(&bad)
+            .expect_err("invalid hex must error");
+        assert!(
+            matches!(err, DiscoveryParseError::InvalidHexRange(_)),
+            "expected InvalidHexRange, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_empty_shards_for_rev1_compat() {
+        // ADR-008 rev 2 §"Compatibility": empty shards list is honoured
+        // as "fall back to seed-only routing".
+        let rev1 = r#"{
+            "node_id": 1, "s3_addr": "10.0.0.1:9000",
+            "nfs_addr": "10.0.0.1:2049", "metrics_addr": "10.0.0.1:9090",
+            "peers": []
+        }"#;
+        let resp = DiscoveryClient::from_cluster_info_json(rev1)
+            .expect("rev-1 JSON parses with empty shards");
+        assert!(resp.shards.is_empty());
+    }
+
+    #[test]
+    fn ignores_unknown_fields() {
+        // Forward-compat: rev-3 fields (not yet defined) must not break
+        // a rev-2 client.
+        let with_extras =
+            r#"{ "node_id": 1, "s3_addr": "10.0.0.1:9000",
+            "nfs_addr": "10.0.0.1:2049", "metrics_addr": "10.0.0.1:9090",
+            "peers": [], "future_field": "ignore-me" }"#;
+        assert!(DiscoveryClient::from_cluster_info_json(with_extras).is_ok());
+    }
+}

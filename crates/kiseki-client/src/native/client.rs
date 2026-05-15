@@ -64,6 +64,13 @@ pub struct NativeClient {
 /// mitigation"). Three seeds × 2 s = 6 s worst-case bootstrap latency.
 pub const SEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Adversary gate-1 finding S1 — cap on leader-hint redirects per
+/// request, enforced by callers of the gRPC retry path. A request
+/// that has burned through this many leader hints terminates with
+/// `LeaderUnavailable` rather than chasing an arbitrarily long
+/// chain of stale cache entries.
+pub const MAX_LEADER_REDIRECT_HOPS: u8 = 2;
+
 impl NativeClient {
     /// Connect to a single seed address (`host:port` or full URL). The
     /// caller supplies the tenant id — this is what the proto-handler
@@ -197,5 +204,73 @@ mod tests {
         let org = OrgId(uuid::Uuid::nil());
         let _slot = caps.try_acquire(org).unwrap();
         assert_eq!(caps.current(org), 1);
+    }
+
+    // Finding S1: MAX_LEADER_REDIRECT_HOPS exists and is 2 per
+    // ADR-008 rev 2 §"Failure modes / mitigation".
+    #[test]
+    fn max_leader_redirect_hops_is_two() {
+        assert_eq!(super::MAX_LEADER_REDIRECT_HOPS, 2);
+    }
+
+    // Finding S1: SEED_CONNECT_TIMEOUT is the 2 s budget per seed.
+    #[test]
+    fn seed_connect_timeout_is_two_seconds() {
+        assert_eq!(SEED_CONNECT_TIMEOUT.as_secs(), 2);
+    }
+
+    // Finding S2: empty seed list errors with a clear message.
+    #[tokio::test]
+    async fn connect_with_seeds_rejects_empty_list() {
+        let result =
+            NativeClient::connect_with_seeds(&[], OrgId(uuid::Uuid::nil())).await;
+        let Err(err) = result else {
+            panic!("empty seed list must error, got Ok");
+        };
+        match err {
+            NativeClientError::Connect(msg) => {
+                assert!(
+                    msg.contains("no seeds") || msg.contains("seed"),
+                    "expected seed-related error: {msg}"
+                );
+            }
+            other => panic!("expected Connect error, got {other:?}"),
+        }
+    }
+
+    // Finding S2: all-seeds-unreachable reports each attempted seed.
+    #[tokio::test]
+    async fn connect_with_seeds_all_unreachable_reports_aggregated_error() {
+        // Three guaranteed-unreachable addresses (TEST-NET-1 192.0.2/24
+        // per RFC 5737; on a sandboxed test host this returns ECONNREFUSED
+        // or a timeout. Use the per-seed 2 s timeout to bound the test.
+        let seeds = vec![
+            "192.0.2.1:1".to_owned(),
+            "192.0.2.2:1".to_owned(),
+            "192.0.2.3:1".to_owned(),
+        ];
+        let started = std::time::Instant::now();
+        let result =
+            NativeClient::connect_with_seeds(&seeds, OrgId(uuid::Uuid::nil())).await;
+        let Err(err) = result else {
+            panic!("unreachable seeds must error, got Ok");
+        };
+        let elapsed = started.elapsed();
+        match err {
+            NativeClientError::Connect(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("all seeds")
+                        || msg.to_lowercase().contains("unreachable"),
+                    "expected aggregated error mentioning all seeds: {msg}"
+                );
+            }
+            other => panic!("expected Connect error, got {other:?}"),
+        }
+        // Total time bounded by 3 × per-seed timeout (2 s each) with
+        // generous headroom for the timer.
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "connect must bottom out within 3 × 2 s + slack, got {elapsed:?}"
+        );
     }
 }

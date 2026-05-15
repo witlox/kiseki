@@ -524,13 +524,19 @@ async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
 /// rev-1 deploys, BDD harnesses) — clients honour the empty list as
 /// "fall back to seed-only routing" per ADR-008 rev 2 §"Compatibility".
 ///
-/// Architect-step stub: returns `vec![]` unconditionally. The
-/// implementer step replaces this with a real walk over
-/// `cluster_control.snapshot()` once the failing unit tests are in
+/// Implementer-step stub: returns `vec![]` unconditionally; replaced
+/// by the GREEN commit's body once the failing unit tests are in
 /// place.
 #[allow(clippy::unused_async)]
 async fn build_shards_from_state(_state: &UiState) -> Vec<ShardInfoJson> {
     Vec::new()
+}
+
+/// Public re-export of `build_shards_from_state` for cross-crate tests
+/// (kiseki-acceptance BDD step impls). Same body, public visibility.
+#[allow(clippy::unused_async)]
+pub async fn build_shards_for_test(state: &UiState) -> Vec<ShardInfoJson> {
+    build_shards_from_state(state).await
 }
 
 /// Per-shard leader info (Phase 17 item 4).
@@ -868,4 +874,189 @@ async fn admin_test_drop_fragment(
             "chunk_removed": chunk_removed,
         })),
     )
+}
+
+#[cfg(test)]
+mod cluster_info_rev2_tests {
+    //! ADR-008 rev 2 — build_shards_from_state tests.
+    //!
+    //! Validates that the `/cluster/info` `shards` field projects the
+    //! control-plane `NamespaceShardMap` onto the wire shape, with
+    //! the peer-map providing the `leader_data_addr` resolution.
+
+    use super::*;
+    use crate::cluster_control::ControlStateMachine;
+    use kiseki_common::ids::{NodeId, OrgId};
+
+    async fn ui_state_with_namespaces(
+        peers: Vec<(u64, String)>,
+        namespaces: Vec<(String, OrgId, Vec<(uuid::Uuid, u64, [u8; 32], [u8; 32])>)>,
+    ) -> UiState {
+        let aggregator = Arc::new(MetricsAggregator::new("127.0.0.1:9090".to_owned(), 10));
+        let diagnostics = super::super::events::new_shared();
+        let state = ControlStateMachine::new();
+        // Synthesise the state machine's inner map directly — avoids
+        // dragging in a full openraft store for a unit test.
+        {
+            let mut inner = state.inner.lock().await;
+            for (ns_id, tenant_id, shards) in namespaces {
+                let snapshots: Vec<crate::cluster_control::state_machine::ShardSnapshot> =
+                    shards
+                        .into_iter()
+                        .map(|(sid, leader_node, rs, re)| {
+                            crate::cluster_control::state_machine::ShardSnapshot {
+                                shard_id: kiseki_common::ids::ShardId(sid),
+                                range_start: rs,
+                                range_end: re,
+                                leader_node: NodeId(leader_node),
+                                is_retiring: false,
+                            }
+                        })
+                        .collect();
+                inner.namespaces.insert(
+                    ns_id.clone(),
+                    crate::cluster_control::NamespaceShardMapSnapshot {
+                        namespace_id: ns_id,
+                        tenant_id,
+                        version: 1,
+                        shards: snapshots,
+                    },
+                );
+            }
+        }
+        UiState {
+            aggregator,
+            metrics_encode: Arc::new(|| String::new()),
+            diagnostics,
+            log_store: None,
+            node_info: NodeInfo {
+                node_id: 1,
+                s3_addr: "10.0.0.1:9000".to_owned(),
+                nfs_addr: "10.0.0.1:2049".to_owned(),
+                metrics_addr: "10.0.0.1:9090".to_owned(),
+                raft_peers: peers,
+            },
+            compositions: None,
+            local_chunk_store: None,
+            cluster_control: Some(Arc::new(state)),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_shards_emits_one_entry_per_shard() {
+        let s_id = uuid::Uuid::from_u128(1);
+        let state = ui_state_with_namespaces(
+            vec![
+                (1, "10.0.0.1:7000".to_owned()),
+                (2, "10.0.0.2:7000".to_owned()),
+                (3, "10.0.0.3:7000".to_owned()),
+            ],
+            vec![(
+                "trials".to_owned(),
+                OrgId(uuid::Uuid::from_u128(1)),
+                vec![(s_id, 2, [0u8; 32], [0xff; 32])],
+            )],
+        )
+        .await;
+        let shards = build_shards_from_state(&state).await;
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].shard_id, s_id.to_string());
+        assert_eq!(shards[0].namespace_id, "trials");
+        assert_eq!(shards[0].leader_id, Some(2));
+        // Resolved from peer (2)'s raft_addr → host 10.0.0.2 → 9100
+        // (KISEKI_DATA_ADDR default).
+        assert_eq!(
+            shards[0].leader_data_addr.as_deref(),
+            Some("10.0.0.2:9100")
+        );
+        assert_eq!(
+            shards[0].range_start,
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            shards[0].range_end,
+            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_shards_omits_leader_when_peer_unknown() {
+        // Leader node = 7, but peer list only knows nodes 1, 2, 3.
+        let s_id = uuid::Uuid::from_u128(1);
+        let state = ui_state_with_namespaces(
+            vec![
+                (1, "10.0.0.1:7000".to_owned()),
+                (2, "10.0.0.2:7000".to_owned()),
+                (3, "10.0.0.3:7000".to_owned()),
+            ],
+            vec![(
+                "trials".to_owned(),
+                OrgId(uuid::Uuid::from_u128(1)),
+                vec![(s_id, 7, [0u8; 32], [0xff; 32])],
+            )],
+        )
+        .await;
+        let shards = build_shards_from_state(&state).await;
+        assert_eq!(shards.len(), 1);
+        // leader_id is still surfaced (the control plane knows it);
+        // leader_data_addr is None (we can't resolve the host).
+        assert_eq!(shards[0].leader_id, Some(7));
+        assert_eq!(shards[0].leader_data_addr, None);
+    }
+
+    #[tokio::test]
+    async fn build_shards_emits_empty_when_no_control_plane() {
+        // Single-node deploys have no cluster_control wired — the
+        // empty Vec lets rev-1 clients fall back to seed-only routing.
+        let aggregator = Arc::new(MetricsAggregator::new("127.0.0.1:9090".to_owned(), 10));
+        let state = UiState {
+            aggregator,
+            metrics_encode: Arc::new(|| String::new()),
+            diagnostics: super::super::events::new_shared(),
+            log_store: None,
+            node_info: NodeInfo {
+                node_id: 1,
+                s3_addr: "10.0.0.1:9000".to_owned(),
+                nfs_addr: "10.0.0.1:2049".to_owned(),
+                metrics_addr: "10.0.0.1:9090".to_owned(),
+                raft_peers: vec![],
+            },
+            compositions: None,
+            local_chunk_store: None,
+            cluster_control: None,
+        };
+        let shards = build_shards_from_state(&state).await;
+        assert!(shards.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_shards_emits_multiple_shards_per_namespace() {
+        // ADR-033 §1 default `initial_shards = max(min(3 * 3, 64), 3)
+        // = 9`. Mimic a 3-shard namespace with disjoint ranges.
+        let mut shards = Vec::new();
+        let split_a = [0x55u8; 32];
+        let split_b = [0xaau8; 32];
+        shards.push((uuid::Uuid::from_u128(1), 1, [0u8; 32], split_a));
+        shards.push((uuid::Uuid::from_u128(2), 2, split_a, split_b));
+        shards.push((uuid::Uuid::from_u128(3), 3, split_b, [0xffu8; 32]));
+        let state = ui_state_with_namespaces(
+            vec![
+                (1, "10.0.0.1:7000".to_owned()),
+                (2, "10.0.0.2:7000".to_owned()),
+                (3, "10.0.0.3:7000".to_owned()),
+            ],
+            vec![(
+                "trials".to_owned(),
+                OrgId(uuid::Uuid::from_u128(1)),
+                shards,
+            )],
+        )
+        .await;
+        let projected = build_shards_from_state(&state).await;
+        assert_eq!(projected.len(), 3);
+        // Sorted by range_start.
+        assert_eq!(projected[0].leader_id, Some(1));
+        assert_eq!(projected[1].leader_id, Some(2));
+        assert_eq!(projected[2].leader_id, Some(3));
+    }
 }
