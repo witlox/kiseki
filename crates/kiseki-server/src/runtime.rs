@@ -58,6 +58,29 @@ fn compute_storage_ds_addrs(
     Vec::new()
 }
 
+/// Build the `NodeId → "host:port"` map the S3 router uses to fill
+/// `307 Location:` headers. The local S3 port is substituted into
+/// each `raft_peers` entry's host — same pattern as
+/// `compute_storage_ds_addrs` for the DS uaddrs — assuming the
+/// cluster uses a uniform per-node S3 port (the normal container
+/// deployment). Localhost-multi-node deployments (each node on a
+/// distinct ephemeral S3 port) need a separate peer-list env var;
+/// follow-up. Empty `raft_peers` → empty map → the 307 path
+/// gracefully falls back to 503 + `Retry-After`.
+pub(crate) fn compute_s3_peer_addrs(
+    raft_peers: &[(u64, String)],
+    local_s3_addr: SocketAddr,
+) -> std::collections::HashMap<u64, String> {
+    let s3_port = local_s3_addr.port();
+    raft_peers
+        .iter()
+        .map(|(node_id, raft_peer_addr)| {
+            let host = raft_peer_addr.split(':').next().unwrap_or(raft_peer_addr);
+            (*node_id, format!("{host}:{s3_port}"))
+        })
+        .collect()
+}
+
 /// Pick the per-node identity source for the at-rest key store
 /// (Phase 14e). Precedence: SPIFFE > mTLS > file-in-data-dir.
 ///
@@ -1234,13 +1257,24 @@ pub async fn run_main(
     );
 
     // S3 gateway.
+    //
+    // ADR-008 rev 2 / ADR-014 / ADR-042 §4 — activate the leader-
+    // redirect-capable router. Builds a `NodeId → "host:s3_port"` map
+    // from `cfg.raft_peers` using the same host-substitution +
+    // local-port pattern as `compute_storage_ds_addrs` above so the
+    // 307 `Location:` header points at the right peer. Plumbs the
+    // `stale_leader_redirects_total` counter so every 307 emission
+    // ticks the metric with the SigV4-resolved tenant label (S8).
     let s3_gw = kiseki_gateway::s3::S3Gateway::new(Arc::clone(&gw));
-    let s3_router = kiseki_gateway::s3_server::s3_router_full(
+    let s3_peer_addrs = compute_s3_peer_addrs(&cfg.raft_peers, cfg.s3_addr);
+    let s3_router = kiseki_gateway::s3_server::s3_router_with_peers(
         s3_gw,
         bootstrap_tenant,
         kiseki_gateway::s3_auth::AccessKeyStore::new(),
         Some(Arc::new(metrics.gateway_requests_total.clone())),
         Some(Arc::new(metrics.gateway_request_duration.clone())),
+        s3_peer_addrs,
+        Some(Arc::new(metrics.stale_leader_redirects_total.clone())),
     );
     let s3_addr = cfg.s3_addr;
     let s3_tls = cfg.tls.as_ref().and_then(|files| {
@@ -2370,5 +2404,48 @@ mod tests {
     fn no_peers_no_local_addr_returns_empty() {
         let got = super::compute_storage_ds_addrs(&[], &[], None);
         assert!(got.is_empty());
+    }
+
+    // === ADR-008 rev 2 / ADR-014 — S3 307 peer map for `runtime` ===
+
+    /// Each `raft_peers` entry's host gets the local S3 port
+    /// substituted. The 307 `Location:` header in `s3_server` uses
+    /// this map to look up the leader hint by `NodeId`.
+    #[test]
+    fn s3_peer_addrs_substitutes_local_s3_port() {
+        let raft_peers = vec![
+            (1, "kiseki-node1:9300".to_string()),
+            (2, "kiseki-node2:9300".to_string()),
+            (3, "kiseki-node3:9300".to_string()),
+        ];
+        let local_s3: std::net::SocketAddr = "0.0.0.0:9000".parse().unwrap();
+        let got = super::compute_s3_peer_addrs(&raft_peers, local_s3);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.get(&1).map(String::as_str), Some("kiseki-node1:9000"));
+        assert_eq!(got.get(&2).map(String::as_str), Some("kiseki-node2:9000"));
+        assert_eq!(got.get(&3).map(String::as_str), Some("kiseki-node3:9000"));
+    }
+
+    /// Single-node / empty `raft_peers` → empty peer map. The 307
+    /// helper in `s3_server` falls back to 503 + `Retry-After` in
+    /// that case (no peer to redirect to).
+    #[test]
+    fn s3_peer_addrs_empty_raft_peers_returns_empty_map() {
+        let local_s3: std::net::SocketAddr = "0.0.0.0:9000".parse().unwrap();
+        let got = super::compute_s3_peer_addrs(&[], local_s3);
+        assert!(got.is_empty());
+    }
+
+    /// Raft peer entry that has no port colon still parses cleanly:
+    /// the whole string is treated as the host. Defensive against
+    /// misconfigured peer lists (the 307 path's peer-map lookup
+    /// works against any string; bad host → DNS / connect failure
+    /// at the client, not a panic on the server).
+    #[test]
+    fn s3_peer_addrs_handles_hostonly_entry() {
+        let raft_peers = vec![(1, "kiseki-node1".to_string())];
+        let local_s3: std::net::SocketAddr = "0.0.0.0:9000".parse().unwrap();
+        let got = super::compute_s3_peer_addrs(&raft_peers, local_s3);
+        assert_eq!(got.get(&1).map(String::as_str), Some("kiseki-node1:9000"));
     }
 }

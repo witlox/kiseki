@@ -117,6 +117,30 @@ impl<G: GatewayOps> S3State<G> {
             }
         }
     }
+
+    /// Step C gate-1 finding S8 — resolve the `SigV4`-authenticated
+    /// tenant ID for use as the
+    /// `kiseki_native_topology_stale_leader_redirects_total{tenant=…}`
+    /// label. Returns `Some(OrgId)` only when `SigV4` actually
+    /// validated the request; the fallback tenant from dev-mode key-
+    /// store-empty is reported as `None` so the metric distinguishes
+    /// "anonymous / no auth" from "tenant X was authenticated by
+    /// `SigV4`". The `tenant_label_from_auth` helper below maps the
+    /// `Option` to the final string label.
+    fn resolve_auth_tenant(
+        &self,
+        method: &axum::http::Method,
+        uri: &axum::http::Uri,
+        headers: &HeaderMap,
+    ) -> Option<OrgId> {
+        let payload_hash = headers
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("UNSIGNED-PAYLOAD");
+        crate::s3_auth::validate_request(method, uri, headers, payload_hash, &self.key_store)
+            .ok()
+            .map(|auth| auth.tenant_id)
+    }
 }
 
 /// Build an axum router for the S3 API.
@@ -256,10 +280,14 @@ pub fn s3_router_with_peers<G: GatewayOps + Send + Sync + 'static>(
 /// closure of the unresolvable-hint case).
 ///
 /// `metric` (optional) is bumped with labels `(protocol="s3",
-/// tenant="<tenant_uuid>")` per ADR-008 rev 2 §"Observability".
-/// `"unknown"` is used when the handler did not yet resolve a
-/// tenant (rare; pre-routing rejection paths).
-#[allow(dead_code)] // wired into handlers in the GREEN commit
+/// tenant="<tenant_label>")` per ADR-008 rev 2 §"Observability".
+/// `tenant_label` should be the `SigV4`-resolved tenant UUID string
+/// for authenticated requests, or `"unauthenticated"` when no
+/// `SigV4` validation succeeded (no `Authorization` header,
+/// malformed header, signature mismatch, etc.). This closes Step C
+/// gate-1 finding S8 — the legacy `"unknown"` placeholder is no
+/// longer emitted.
+#[allow(clippy::too_many_arguments)] // tenant_label is a deliberate add-on for S8
 fn leader_unavailable_response(
     method: &axum::http::Method,
     request_scheme: &str,
@@ -268,6 +296,7 @@ fn leader_unavailable_response(
     leader_hint: Option<u64>,
     peer_s3_addrs: &std::collections::HashMap<u64, String>,
     metric: Option<&prometheus::IntCounterVec>,
+    tenant_label: &str,
 ) -> axum::response::Response {
     // Finding S6: GET / HEAD / OPTIONS / LIST MUST NOT 307. Reads
     // can be served by any node with composition state (ADR-040
@@ -293,10 +322,11 @@ fn leader_unavailable_response(
         return service_unavailable_with_retry_after();
     };
 
-    // Bump the metric. The tenant label is "unknown" here — the
-    // call site can plumb a resolved tenant later via a wrapper.
+    // Bump the metric. The tenant label is the SigV4-resolved tenant
+    // UUID when present, else `"unauthenticated"` for requests with no
+    // (or invalid) SigV4 auth.
     if let Some(c) = metric {
-        c.with_label_values(&["s3", "unknown"]).inc();
+        c.with_label_values(&["s3", tenant_label]).inc();
     }
 
     let location = format!("{request_scheme}://{peer_addr}{request_path_and_query}");
@@ -308,6 +338,18 @@ fn leader_unavailable_response(
     // §10.2.3 is delta-seconds only; client-side retry policy
     // carries any sub-second jitter).
     resp
+}
+
+/// Map a `SigV4`-resolved tenant `Option<OrgId>` to the metric label
+/// used by `kiseki_native_topology_stale_leader_redirects_total`:
+/// `"<uuid>"` for an authenticated tenant, `"unauthenticated"` for
+/// no `SigV4` or a failed validation. Replaces the legacy
+/// `"unknown"` placeholder (Step C gate-1 S8).
+fn tenant_label_from_auth(resolved: Option<OrgId>) -> String {
+    match resolved {
+        Some(t) => t.0.to_string(),
+        None => "unauthenticated".to_owned(),
+    }
 }
 
 /// 503 + `Retry-After: 1` body for write-side fallback and
@@ -336,6 +378,7 @@ struct PutParams {
     part_number: Option<u32>,
 }
 
+#[allow(clippy::too_many_lines)] // S8 tenant resolution + 307 arms across UploadPart + PutObject
 async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
@@ -349,6 +392,13 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
     let request_path_and_query = original_uri
         .path_and_query()
         .map_or_else(|| format!("/{bucket}/{key}"), |pq| pq.as_str().to_owned());
+
+    // S8 — resolve SigV4 tenant up front so the 307 helper can label
+    // the metric with the real tenant UUID instead of the legacy
+    // `"unknown"` placeholder. Anonymous / failed-auth requests
+    // produce `None` → `"unauthenticated"`.
+    let auth_tenant = state.resolve_auth_tenant(&axum::http::Method::PUT, &original_uri, &headers);
+    let tenant_label = tenant_label_from_auth(auth_tenant);
 
     // If uploadId + partNumber present, this is UploadPart.
     if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
@@ -366,6 +416,32 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
                 String::new(),
             )
                 .into_response(),
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id,
+                leader_hint,
+            }) => leader_unavailable_response(
+                &axum::http::Method::PUT,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                leader_hint,
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id,
+                leader_node_id,
+            }) => leader_unavailable_response(
+                &axum::http::Method::PUT,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                Some(leader_node_id.0),
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
     }
@@ -446,6 +522,7 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
             leader_hint,
             &state.peer_s3_addrs,
             state.stale_leader_redirects_total.as_deref(),
+            &tenant_label,
         ),
         // ADR-042 §4 / ADR-014 — `GatewayError::ForwardToLeader` is the
         // definite-leader sibling of `LeaderUnavailable`: the openraft
@@ -468,6 +545,7 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
             Some(leader_node_id.0),
             &state.peer_s3_addrs,
             state.stale_leader_redirects_total.as_deref(),
+            &tenant_label,
         ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -839,10 +917,21 @@ struct PostParams {
 
 async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<PostParams>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
+    let request_scheme = request_scheme_from_uri_and_headers(&original_uri, &headers);
+    let request_path_and_query = original_uri
+        .path_and_query()
+        .map_or_else(|| format!("/{bucket}/{key}"), |pq| pq.as_str().to_owned());
+
+    // S8 — resolve SigV4 tenant up front so the 307 helper labels the
+    // metric with the real tenant UUID instead of `"unknown"`.
+    let auth_tenant = state.resolve_auth_tenant(&axum::http::Method::POST, &original_uri, &headers);
+    let tenant_label = tenant_label_from_auth(auth_tenant);
 
     // POST ?uploads → CreateMultipartUpload
     if params.uploads.is_some() {
@@ -856,6 +945,32 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
                 axum::Json(serde_json::json!({ "uploadId": resp.upload_id })),
             )
                 .into_response(),
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id,
+                leader_hint,
+            }) => leader_unavailable_response(
+                &axum::http::Method::POST,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                leader_hint,
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id,
+                leader_node_id,
+            }) => leader_unavailable_response(
+                &axum::http::Method::POST,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                Some(leader_node_id.0),
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
     }
@@ -880,6 +995,32 @@ async fn post_multipart<G: GatewayOps + Send + Sync + 'static>(
                 axum::Json(serde_json::json!({ "etag": resp.etag })),
             )
                 .into_response(),
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id,
+                leader_hint,
+            }) => leader_unavailable_response(
+                &axum::http::Method::POST,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                leader_hint,
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id,
+                leader_node_id,
+            }) => leader_unavailable_response(
+                &axum::http::Method::POST,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                Some(leader_node_id.0),
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
     }
@@ -896,16 +1037,54 @@ struct DeleteParams {
 
 async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<DeleteParams>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
+    let request_scheme = request_scheme_from_uri_and_headers(&original_uri, &headers);
+    let request_path_and_query = original_uri
+        .path_and_query()
+        .map_or_else(|| format!("/{bucket}/{key}"), |pq| pq.as_str().to_owned());
+
+    // S8 — resolve SigV4 tenant up front so the 307 helper labels the
+    // metric with the real tenant UUID instead of `"unknown"`.
+    let auth_tenant =
+        state.resolve_auth_tenant(&axum::http::Method::DELETE, &original_uri, &headers);
+    let tenant_label = tenant_label_from_auth(auth_tenant);
 
     // DELETE ?uploadId=X → AbortMultipartUpload
     if let Some(upload_id) = params.upload_id {
         let req = AbortMultipartUploadRequest { upload_id };
         return match state.gateway.abort_multipart_upload(&req).await {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id,
+                leader_hint,
+            }) => leader_unavailable_response(
+                &axum::http::Method::DELETE,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                leader_hint,
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id,
+                leader_node_id,
+            }) => leader_unavailable_response(
+                &axum::http::Method::DELETE,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                Some(leader_node_id.0),
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
     }
@@ -938,6 +1117,32 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::error::GatewayError::LeaderUnavailable {
+            shard_id,
+            leader_hint,
+        }) => leader_unavailable_response(
+            &axum::http::Method::DELETE,
+            &request_scheme,
+            &request_path_and_query,
+            shard_id,
+            leader_hint,
+            &state.peer_s3_addrs,
+            state.stale_leader_redirects_total.as_deref(),
+            &tenant_label,
+        ),
+        Err(crate::error::GatewayError::ForwardToLeader {
+            shard_id,
+            leader_node_id,
+        }) => leader_unavailable_response(
+            &axum::http::Method::DELETE,
+            &request_scheme,
+            &request_path_and_query,
+            shard_id,
+            Some(leader_node_id.0),
+            &state.peer_s3_addrs,
+            state.stale_leader_redirects_total.as_deref(),
+            &tenant_label,
+        ),
         Err(e) => {
             let code = if e.to_string().contains("not found") {
                 StatusCode::NO_CONTENT
@@ -954,8 +1159,20 @@ async fn delete_or_abort<G: GatewayOps + Send + Sync + 'static>(
 /// `PUT /<bucket>` — create a bucket. Returns 200 or 409.
 async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path(bucket): Path<String>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
+    let request_scheme = request_scheme_from_uri_and_headers(&original_uri, &headers);
+    let request_path_and_query = original_uri
+        .path_and_query()
+        .map_or_else(|| format!("/{bucket}"), |pq| pq.as_str().to_owned());
+
+    // S8 — resolve SigV4 tenant up front so the 307 helper labels the
+    // metric with the real tenant UUID instead of `"unknown"`.
+    let auth_tenant = state.resolve_auth_tenant(&axum::http::Method::PUT, &original_uri, &headers);
+    let tenant_label = tenant_label_from_auth(auth_tenant);
+
     // Existence check first — if the bucket name is already cached
     // we never touch the namespace path. Scope the MutexGuard so it
     // is dropped before any `.await` point.
@@ -985,7 +1202,35 @@ async fn create_bucket<G: GatewayOps + Send + Sync + 'static>(
         .ensure_namespace(state.fallback_tenant, ns_id)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return match e {
+            crate::error::GatewayError::LeaderUnavailable {
+                shard_id,
+                leader_hint,
+            } => leader_unavailable_response(
+                &axum::http::Method::PUT,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                leader_hint,
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
+            crate::error::GatewayError::ForwardToLeader {
+                shard_id,
+                leader_node_id,
+            } => leader_unavailable_response(
+                &axum::http::Method::PUT,
+                &request_scheme,
+                &request_path_and_query,
+                shard_id,
+                Some(leader_node_id.0),
+                &state.peer_s3_addrs,
+                state.stale_leader_redirects_total.as_deref(),
+                &tenant_label,
+            ),
+            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()).into_response(),
+        };
     }
 
     // Namespace is registered (locally + replicated). Now claim the
@@ -1847,6 +2092,7 @@ mod tests {
             Some(2),
             &build_peer_map(),
             None,
+            "unauthenticated",
         );
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
         let loc = resp
@@ -1875,6 +2121,7 @@ mod tests {
             Some(2),
             &build_peer_map(),
             None,
+            "unauthenticated",
         );
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
         let loc = resp
@@ -1903,6 +2150,7 @@ mod tests {
             Some(2),
             &build_peer_map(),
             None,
+            "unauthenticated",
         );
         assert_eq!(
             resp.status(),
@@ -1927,6 +2175,7 @@ mod tests {
             None, // no leader hint — mid-election
             &build_peer_map(),
             None,
+            "unauthenticated",
         );
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -1947,6 +2196,7 @@ mod tests {
             Some(99), // not in peer map
             &build_peer_map(),
             None,
+            "unauthenticated",
         );
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1973,9 +2223,13 @@ mod tests {
             Some(2),
             &build_peer_map(),
             Some(&counter),
+            "unauthenticated",
         );
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
-        let bumped = counter.with_label_values(&["s3", "unknown"]).get();
+        // Step C gate-1 S8 — the metric label MUST be the resolved
+        // tenant id (or `"unauthenticated"` when no SigV4 ran), no
+        // longer the legacy `"unknown"` placeholder.
+        let bumped = counter.with_label_values(&["s3", "unauthenticated"]).get();
         assert_eq!(bumped, 1, "307 emission must bump the metric");
     }
 
@@ -2092,7 +2346,9 @@ mod tests {
         // The 307 path also bumps the
         // `kiseki_native_topology_stale_leader_redirects_total` metric
         // for `ForwardToLeader` (same code path as `LeaderUnavailable`).
-        let bumped = counter.with_label_values(&["s3", "unknown"]).get();
+        // Step C gate-1 S8 — the label is `"unauthenticated"` because
+        // this PUT carries no `SigV4` Authorization header.
+        let bumped = counter.with_label_values(&["s3", "unauthenticated"]).get();
         assert_eq!(
             bumped, 1,
             "ForwardToLeader 307 emission must bump the metric (ADR-008 rev 2 §Observability)",
@@ -2136,5 +2392,538 @@ mod tests {
             resp.headers().contains_key(axum::http::header::RETRY_AFTER),
             "503 fallback must carry Retry-After",
         );
+    }
+
+    // === Item 2 — extend 307 arm to DELETE / multipart finalize / bucket ops ===
+    //
+    // Today (pre-feat/s3-307-completion) only `put_or_upload_part` honored
+    // `GatewayError::LeaderUnavailable` / `GatewayError::ForwardToLeader`.
+    // The other mutation paths (`delete_or_abort`, `post_multipart`'s
+    // `complete_multipart_upload` and `create_multipart_upload` branches,
+    // and `create_bucket`'s `ensure_namespace`) collapsed all errors to
+    // 500. These RED tests assert the same 307 contract on each verb;
+    // they fail until the corresponding match arms are added to the
+    // handlers.
+
+    /// Stub gateway whose mutation paths return
+    /// `GatewayError::ForwardToLeader{leader_node_id}`. Used to drive
+    /// the 307 contract on each S3 verb without standing up Raft.
+    struct ForwardToLeaderMutationStub {
+        leader_node_id: kiseki_common::ids::NodeId,
+        shard_id: kiseki_common::ids::ShardId,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ops::GatewayOps for ForwardToLeaderMutationStub {
+        async fn read(
+            &self,
+            _req: crate::ops::ReadRequest,
+        ) -> Result<crate::ops::ReadResponse, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::NotFound("stub".into()))
+        }
+        async fn write(
+            &self,
+            _req: crate::ops::WriteRequest,
+        ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::Upstream("legacy write".into()))
+        }
+        async fn write_with_forwarding(
+            &self,
+            _req: crate::ops::WriteRequest,
+        ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id: self.shard_id,
+                leader_node_id: self.leader_node_id,
+            })
+        }
+        async fn delete(
+            &self,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+            _composition_id: kiseki_common::ids::CompositionId,
+        ) -> Result<(), crate::error::GatewayError> {
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id: self.shard_id,
+                leader_node_id: self.leader_node_id,
+            })
+        }
+        async fn lookup_object_by_name(
+            &self,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+            _name: &str,
+        ) -> Result<Option<kiseki_common::ids::CompositionId>, crate::error::GatewayError> {
+            // Resolve by-name so DELETE proceeds to `delete()` rather
+            // than the 204-on-missing fast path.
+            Ok(Some(kiseki_common::ids::CompositionId(
+                uuid::Uuid::from_u128(42),
+            )))
+        }
+        async fn ensure_namespace(
+            &self,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+        ) -> Result<(), crate::error::GatewayError> {
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id: self.shard_id,
+                leader_node_id: self.leader_node_id,
+            })
+        }
+        async fn start_multipart(
+            &self,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+        ) -> Result<String, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id: self.shard_id,
+                leader_node_id: self.leader_node_id,
+            })
+        }
+        async fn complete_multipart(
+            &self,
+            _upload_id: &str,
+            _name: Option<&str>,
+        ) -> Result<kiseki_common::ids::CompositionId, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id: self.shard_id,
+                leader_node_id: self.leader_node_id,
+            })
+        }
+    }
+
+    /// Same shape as `ForwardToLeaderMutationStub` but returns
+    /// `LeaderUnavailable{leader_hint=Some(2)}` from each mutation
+    /// path. Asserts parity between the two error variants on the
+    /// extended 307 arms.
+    struct LeaderUnavailableMutationStub {
+        leader_hint: Option<u64>,
+        shard_id: kiseki_common::ids::ShardId,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ops::GatewayOps for LeaderUnavailableMutationStub {
+        async fn read(
+            &self,
+            _req: crate::ops::ReadRequest,
+        ) -> Result<crate::ops::ReadResponse, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::NotFound("stub".into()))
+        }
+        async fn write(
+            &self,
+            _req: crate::ops::WriteRequest,
+        ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::Upstream("legacy write".into()))
+        }
+        async fn write_with_forwarding(
+            &self,
+            _req: crate::ops::WriteRequest,
+        ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id: self.shard_id,
+                leader_hint: self.leader_hint,
+            })
+        }
+        async fn delete(
+            &self,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+            _composition_id: kiseki_common::ids::CompositionId,
+        ) -> Result<(), crate::error::GatewayError> {
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id: self.shard_id,
+                leader_hint: self.leader_hint,
+            })
+        }
+        async fn lookup_object_by_name(
+            &self,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+            _name: &str,
+        ) -> Result<Option<kiseki_common::ids::CompositionId>, crate::error::GatewayError> {
+            Ok(Some(kiseki_common::ids::CompositionId(
+                uuid::Uuid::from_u128(42),
+            )))
+        }
+        async fn ensure_namespace(
+            &self,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+        ) -> Result<(), crate::error::GatewayError> {
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id: self.shard_id,
+                leader_hint: self.leader_hint,
+            })
+        }
+        async fn start_multipart(
+            &self,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+        ) -> Result<String, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id: self.shard_id,
+                leader_hint: self.leader_hint,
+            })
+        }
+        async fn complete_multipart(
+            &self,
+            _upload_id: &str,
+            _name: Option<&str>,
+        ) -> Result<kiseki_common::ids::CompositionId, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::LeaderUnavailable {
+                shard_id: self.shard_id,
+                leader_hint: self.leader_hint,
+            })
+        }
+    }
+
+    fn build_stub_app_forward_to_leader(
+        counter: Option<std::sync::Arc<prometheus::IntCounterVec>>,
+    ) -> Router {
+        let stub = ForwardToLeaderMutationStub {
+            leader_node_id: kiseki_common::ids::NodeId(2),
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(7)),
+        };
+        let s3gw = S3Gateway::new(stub);
+        let tenant = OrgId(uuid::Uuid::nil());
+        s3_router_with_peers(
+            s3gw,
+            tenant,
+            AccessKeyStore::new(),
+            None,
+            None,
+            build_peer_map(),
+            counter,
+        )
+    }
+
+    fn build_stub_app_leader_unavailable(
+        counter: Option<std::sync::Arc<prometheus::IntCounterVec>>,
+    ) -> Router {
+        let stub = LeaderUnavailableMutationStub {
+            leader_hint: Some(2),
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(7)),
+        };
+        let s3gw = S3Gateway::new(stub);
+        let tenant = OrgId(uuid::Uuid::nil());
+        s3_router_with_peers(
+            s3gw,
+            tenant,
+            AccessKeyStore::new(),
+            None,
+            None,
+            build_peer_map(),
+            counter,
+        )
+    }
+
+    fn test_counter() -> std::sync::Arc<prometheus::IntCounterVec> {
+        std::sync::Arc::new(
+            prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    format!("test_307_arm_extension_{}", uuid::Uuid::new_v4().simple()),
+                    "test counter for extended 307 arm",
+                ),
+                &["protocol", "tenant"],
+            )
+            .unwrap(),
+        )
+    }
+
+    // ----- DELETE object -----
+
+    /// DELETE /bucket/key against a follower MUST emit 307 (not 500)
+    /// when the gateway surfaces `ForwardToLeader`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_object_forward_to_leader_emits_307() {
+        let counter = test_counter();
+        let app = build_stub_app_forward_to_leader(Some(counter.clone()));
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mybucket/mykey")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "DELETE on ForwardToLeader must emit 307, not 500",
+        );
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("Location header")
+            .to_str()
+            .unwrap();
+        assert_eq!(loc, "http://10.0.0.2:9000/mybucket/mykey");
+        assert_eq!(
+            counter.with_label_values(&["s3", "unauthenticated"]).get(),
+            1,
+            "307 must bump the metric with the unauthenticated tenant label",
+        );
+    }
+
+    /// DELETE /bucket/key against a follower MUST emit 307 when the
+    /// gateway surfaces `LeaderUnavailable` with a resolvable hint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_object_leader_unavailable_emits_307() {
+        let app = build_stub_app_leader_unavailable(None);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mybucket/mykey")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "DELETE on LeaderUnavailable must emit 307, not 500",
+        );
+    }
+
+    // ----- Multipart finalize (POST ?uploadId=...) -----
+
+    /// POST /bucket/key?uploadId=X against a follower must emit 307
+    /// when `CompleteMultipartUpload` surfaces `ForwardToLeader`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_multipart_forward_to_leader_emits_307() {
+        let app = build_stub_app_forward_to_leader(None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mybucket/mykey?uploadId=abc")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "CompleteMultipartUpload on ForwardToLeader must emit 307, not 500",
+        );
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("Location header")
+            .to_str()
+            .unwrap();
+        assert_eq!(loc, "http://10.0.0.2:9000/mybucket/mykey?uploadId=abc");
+    }
+
+    /// POST /bucket/key?uploadId=X against a follower must emit 307
+    /// when `CompleteMultipartUpload` surfaces `LeaderUnavailable`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_multipart_leader_unavailable_emits_307() {
+        let app = build_stub_app_leader_unavailable(None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mybucket/mykey?uploadId=abc")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "CompleteMultipartUpload on LeaderUnavailable must emit 307, not 500",
+        );
+    }
+
+    /// POST /bucket/key?uploads against a follower
+    /// (`CreateMultipartUpload`) must emit 307 when `start_multipart`
+    /// surfaces `ForwardToLeader`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_multipart_forward_to_leader_emits_307() {
+        let app = build_stub_app_forward_to_leader(None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mybucket/mykey?uploads")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "CreateMultipartUpload on ForwardToLeader must emit 307, not 500",
+        );
+    }
+
+    // ----- create_bucket -----
+
+    /// PUT /bucket against a follower (`CreateBucket` →
+    /// `ensure_namespace`) must emit 307 when `ensure_namespace`
+    /// surfaces `ForwardToLeader`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_bucket_forward_to_leader_emits_307() {
+        let app = build_stub_app_forward_to_leader(None);
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "CreateBucket on ForwardToLeader must emit 307, not 500",
+        );
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("Location header")
+            .to_str()
+            .unwrap();
+        assert_eq!(loc, "http://10.0.0.2:9000/mybucket");
+    }
+
+    /// PUT /bucket against a follower must emit 307 when
+    /// `ensure_namespace` surfaces `LeaderUnavailable`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_bucket_leader_unavailable_emits_307() {
+        let app = build_stub_app_leader_unavailable(None);
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "CreateBucket on LeaderUnavailable must emit 307, not 500",
+        );
+    }
+
+    // === Item 3 — SigV4-resolved tenant on the metric ===
+
+    /// PUT WITHOUT a `SigV4` Authorization header MUST label the metric
+    /// `"unauthenticated"` — the new replacement for the legacy
+    /// `"unknown"` label (no `SigV4` ran, so no resolved tenant).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unauthenticated_put_307_labels_metric_unauthenticated() {
+        let counter = test_counter();
+        let app = build_stub_app_forward_to_leader(Some(counter.clone()));
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .body(Body::from(&b"payload"[..]))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let unauthed = counter.with_label_values(&["s3", "unauthenticated"]).get();
+        assert_eq!(
+            unauthed, 1,
+            "Unauthenticated request must label the metric `unauthenticated` (not `unknown`)",
+        );
+    }
+
+    /// PUT against `ForwardToLeader` emitted by a `SigV4`-authenticated
+    /// request MUST label the metric with the resolved tenant id, NOT
+    /// `"unknown"` or `"unauthenticated"`. End-to-end through the real
+    /// handler: signs a request, runs `validate_request`, surfaces the
+    /// resolved tenant on the metric.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigv4_authenticated_put_307_carries_tenant_label() {
+        let tenant = OrgId(uuid::Uuid::from_u128(0xABCD_EF01));
+        let access_key = "AKIAIOSFODNN7EXAMPLE";
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let mut keys = AccessKeyStore::new();
+        keys.insert(access_key.to_owned(), secret.to_owned(), tenant);
+
+        let stub = ForwardingStubGateway {
+            leader_node_id: kiseki_common::ids::NodeId(2),
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(7)),
+        };
+        let s3gw = S3Gateway::new(stub);
+        let counter = test_counter();
+        let app = s3_router_with_peers(
+            s3gw,
+            OrgId(uuid::Uuid::nil()), // fallback differs from real tenant
+            keys,
+            None,
+            None,
+            build_peer_map(),
+            Some(counter.clone()),
+        );
+
+        let req = build_signed_put_request(access_key, secret, "/mybucket/mykey", b"payload");
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "Authenticated PUT against ForwardToLeader must emit 307",
+        );
+        let tenant_label = tenant.0.to_string();
+        let bumped = counter.with_label_values(&["s3", &tenant_label]).get();
+        assert_eq!(
+            bumped, 1,
+            "307 emitted from a SigV4-authenticated request must label the metric \
+             with the resolved tenant id (expected={tenant_label})",
+        );
+        let unauthed = counter.with_label_values(&["s3", "unauthenticated"]).get();
+        assert_eq!(
+            unauthed, 0,
+            "Authenticated request must NOT tick the unauthenticated bucket",
+        );
+    }
+
+    /// Build a valid `SigV4`-signed PUT request using the same
+    /// canonical-request / signing-key derivation as
+    /// `kiseki_gateway::s3_auth`. Reuses the `pub(crate)` helpers in
+    /// `s3_auth` so the test exercises the real
+    /// `validate_request` code path end-to-end.
+    fn build_signed_put_request(
+        access_key: &str,
+        secret: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Request<Body> {
+        use aws_lc_rs::digest;
+
+        // Use a fixed date — the s3_auth path doesn't enforce a clock
+        // skew window today (TODO in s3_auth:299), so any well-formed
+        // timestamp signs cleanly.
+        let date = "20260515";
+        let timestamp = "20260515T120000Z";
+        let region = "us-east-1";
+        let service = "s3";
+
+        let payload_hash =
+            crate::s3_auth::hex_encode(digest::digest(&digest::SHA256, body).as_ref());
+
+        let host = "localhost";
+        let signed_header_names = vec![
+            "host".to_string(),
+            "x-amz-content-sha256".to_string(),
+            "x-amz-date".to_string(),
+        ];
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", host.parse().unwrap());
+        headers.insert("x-amz-content-sha256", payload_hash.parse().unwrap());
+        headers.insert("x-amz-date", timestamp.parse().unwrap());
+
+        let uri: axum::http::Uri = path.parse().unwrap();
+        let canon = crate::s3_auth::canonical_request(
+            &axum::http::Method::PUT,
+            &uri,
+            &headers,
+            &signed_header_names,
+            &payload_hash,
+        );
+        let scope = format!("{date}/{region}/{service}/aws4_request");
+        let sts = crate::s3_auth::string_to_sign(timestamp, &scope, &canon);
+        let signing_key = crate::s3_auth::derive_signing_key(secret, date, region, service);
+        let sig = crate::s3_auth::hmac_sha256(signing_key.as_ref(), sts.as_bytes());
+        let sig_hex = crate::s3_auth::hex_encode(sig.as_ref());
+
+        let auth = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{date}/{region}/{service}/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={sig_hex}",
+        );
+
+        Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("host", host)
+            .header("x-amz-content-sha256", &payload_hash)
+            .header("x-amz-date", timestamp)
+            .header("authorization", auth)
+            .body(Body::from(body.to_vec()))
+            .unwrap()
     }
 }
