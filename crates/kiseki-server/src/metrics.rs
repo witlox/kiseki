@@ -321,7 +321,12 @@ impl KisekiMetrics {
                 "kiseki_native_topology_stale_leader_redirects_total",
                 "ADR-008 rev 2 / ADR-014 — stale-leader redirects emitted on the protocol boundary",
             ),
-            &["protocol"],
+            // Labels match the call site in `kiseki-gateway::s3_server::
+            // leader_unavailable_response` (line 299) which passes
+            // `&["s3", "<tenant>"]`. Arity-mismatch with the call site
+            // would panic at runtime on every 307 emission. ADR-008
+            // rev 2 §"Observability" specifies (protocol, tenant).
+            &["protocol", "tenant"],
         )
         .expect("metric");
         registry

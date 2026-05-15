@@ -2438,8 +2438,16 @@ async fn then_status_unavailable_structured(w: &mut KisekiWorld) {
     // `Status::unavailable("forward to leader: shard=… leader=…")`
     // when the proxy gate rejects (any of the three reasons above).
     // We can't trivially drive that full path from cucumber without
-    // a multi-node cluster harness — the gate-1 defenses are
-    // unit-tested in `kiseki-gateway::native::proxy_client::tests`.
-    // This step records that the gate fired without dialing.
-    let _ = w;
+    // a multi-node cluster harness — the full gRPC mapping is unit-
+    // tested in `kiseki-gateway::native::proxy_client::tests` and the
+    // mapping site is `kiseki-gateway::native::server::map_gateway_error`
+    // (server.rs:376-381). What we CAN bite here at the BDD layer is
+    // that the gate produced an Err — i.e. the proxy refused — so a
+    // future regression that silently lets a forward through would
+    // trip this assertion before reaching the (unobserved) gRPC layer.
+    let res = read_validate_result(w);
+    assert!(
+        res.is_err(),
+        "proxy gate must reject (Err) to surface Status::unavailable; got Ok({res:?})"
+    );
 }
