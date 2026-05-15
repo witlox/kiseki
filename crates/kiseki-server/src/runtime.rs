@@ -649,23 +649,13 @@ pub async fn run_main(
 
     // GH #39 wiring: the `io_uring` Cargo feature on `kiseki-block`
     // adds a `UringFileBackedDevice` alongside `FileBackedDevice`.
-    // `PersistentChunkStore::init` / `open` (below) currently hard-
-    // codes `FileBackedDevice` inside `kiseki-chunk` — threading a
-    // generic `Arc<dyn DeviceBackend>` through that constructor is
-    // tracked as a follow-up to GH #39 so this issue's scope stays
-    // inside `kiseki-block` + the runtime selector. For now this
-    // logs the operator's intent so the deploy path is obvious from
-    // `/var/log` once the chunk-store ctor change lands.
-    if std::env::var("KISEKI_IO_URING")
-        .ok()
-        .is_some_and(|v| !matches!(v.as_str(), "" | "0" | "false" | "FALSE"))
-    {
-        tracing::warn!(
-            "KISEKI_IO_URING=1 acknowledged; per-device backend switch \
-             into PersistentChunkStore is pending the follow-up to GH \
-             #39 — current run uses FileBackedDevice"
-        );
-    }
+    // `kiseki_block::open_or_init_device` reads `KISEKI_IO_URING` and
+    // returns the appropriate `Arc<dyn DeviceBackend>` (falling back
+    // to `FileBackedDevice` when the feature isn't compiled in or
+    // when the kernel rejects ring setup). We feed that handle into
+    // `PersistentChunkStore::from_device` so the chunk store's data
+    // plane actually points at the operator's choice — without
+    // this, the env var was just a log line.
 
     // Local chunk store: persistent (raw block device) if KISEKI_DATA_DIR
     // set, otherwise in-memory. Wrapped via SyncBridge so it satisfies
@@ -679,13 +669,14 @@ pub async fn run_main(
         // ADR-022 rev-4: chunk meta moved off JSON to fjall. Path
         // is now a keyspace directory (no extension).
         let meta_path = dir.join("chunks").join("meta");
-        let store = if dev_path.exists() {
-            kiseki_chunk::PersistentChunkStore::open(&dev_path, &meta_path)
-                .map_err(|e| format!("persistent chunk store open: {e}"))?
-        } else {
-            kiseki_chunk::PersistentChunkStore::init(&dev_path, &meta_path, 4 * 1024 * 1024 * 1024)
-                .map_err(|e| format!("persistent chunk store init: {e}"))?
-        };
+        // Resolve the device backend through the selector — emits
+        // the `device backend: io_uring` tracing::info! line when
+        // `KISEKI_IO_URING=1` and the feature is compiled in, so the
+        // deploy path is observable from `/var/log`.
+        let device = kiseki_block::open_or_init_device(&dev_path, 4 * 1024 * 1024 * 1024)
+            .map_err(|e| format!("chunk device backend init: {e}"))?;
+        let store = kiseki_chunk::PersistentChunkStore::from_device(device, &meta_path)
+            .map_err(|e| format!("persistent chunk store from_device: {e}"))?;
         // Receiver-side write_chunk phase histogram so /metrics shows
         // dedup_check / extent_io / save_meta / device_sync per write.
         store.set_write_phase_metric(Arc::new(
