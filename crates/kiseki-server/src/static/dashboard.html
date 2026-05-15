@@ -62,6 +62,10 @@
     <nav id="nav">
         <a class="active" onclick="showTab('overview',this)">Overview</a>
         <a onclick="showTab('performance',this)">Performance</a>
+        <a onclick="showTab('topology',this)">Topology</a>
+        <a onclick="showTab('pools',this)">Pools</a>
+        <a onclick="showTab('tenants',this)">Tenants</a>
+        <a onclick="showTab('audit',this)">Audit</a>
         <a onclick="showTab('alerts',this)">Alerts</a>
         <a onclick="showTab('operations',this)">Operations</a>
     </nav>
@@ -101,6 +105,47 @@
             <div class="chart-box"><h3>Raft Entries per Node</h3><canvas id="pnRaft"></canvas></div>
             <div class="chart-box"><h3>Gateway Requests per Node</h3><canvas id="pnReq"></canvas></div>
         </div>
+    </div>
+</div>
+
+<!-- =============== TOPOLOGY =============== -->
+<div id="tab-topology" style="display:none">
+    <div class="section">
+        <div class="section-head"><h2>Per-Shard Leaders</h2></div>
+        <div hx-get="/ui/fragment/topology-shards" hx-trigger="load,every 5s" hx-swap="innerHTML"></div>
+    </div>
+    <div class="section">
+        <div class="section-head"><h2>Proxy &amp; Stale-Leader Redirects</h2></div>
+        <div class="grid-3" hx-get="/ui/fragment/topology-forwarding" hx-trigger="load,every 5s" hx-swap="innerHTML"></div>
+    </div>
+</div>
+
+<!-- =============== POOLS =============== -->
+<div id="tab-pools" style="display:none">
+    <div class="section">
+        <div class="section-head"><h2>Storage Pools</h2></div>
+        <div hx-get="/ui/fragment/pools-table" hx-trigger="load,every 5s" hx-swap="innerHTML"></div>
+    </div>
+    <div class="section">
+        <div class="section-head"><h2>Per-Device Health</h2></div>
+        <div class="chart-box"><p style="color:var(--dim);font-size:11px">Per-device + repair-queue health is available via <code>kiseki-storage device-health</code> / <code>kiseki-storage repairs list</code> (gRPC). The web UI does not surface them today — see <code>specs/findings/2026-05-15-ui-cli-followups.md</code>.</p></div>
+    </div>
+</div>
+
+<!-- =============== TENANTS =============== -->
+<div id="tab-tenants" style="display:none">
+    <div class="section">
+        <div class="section-head"><h2>Tenants</h2></div>
+        <div class="grid-3" hx-get="/ui/fragment/tenants-table" hx-trigger="load,every 5s" hx-swap="innerHTML"></div>
+    </div>
+</div>
+
+<!-- =============== AUDIT =============== -->
+<div id="tab-audit" style="display:none">
+    <div class="section">
+        <div class="section-head"><h2>Audit Events</h2></div>
+        <div hx-get="/ui/fragment/audit-table" hx-trigger="load,every 5s" hx-swap="innerHTML"></div>
+        <p style="color:var(--dim);font-size:11px;margin-top:8px">System-shard events. Tenant-scoped queries: <code>GET /admin/audit/query?tenant=&lt;uuid&gt;</code> or <code>kiseki-admin audit query --tenant &lt;uuid&gt;</code>.</p>
     </div>
 </div>
 

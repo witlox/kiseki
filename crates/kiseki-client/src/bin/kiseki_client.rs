@@ -85,7 +85,13 @@ fn main() {
         "mount" => handle_mount(&args[2..]),
         "stage" => handle_stage(&args[2..]),
         "cache" => handle_cache(&args[2..]),
-        "version" => println!("kiseki-client {}", env!("CARGO_PKG_VERSION")),
+        "whoami" => handle_whoami(&args[2..]),
+        "namespaces" => handle_namespaces(&args[2..]),
+        "quota" => handle_quota(&args[2..]),
+        "topology" => handle_topology(&args[2..]),
+        "version" | "--version" | "-V" => {
+            println!("kiseki-client {}", env!("CARGO_PKG_VERSION"));
+        }
         "--help" | "-h" | "help" => print_usage(),
         _ => {
             eprintln!("Unknown command: {}", args[1]);
@@ -107,13 +113,19 @@ COMMANDS:
     mount       Mount a Kiseki filesystem via FUSE
     stage       Dataset staging (pre-fetch, status, release)
     cache       Cache management (stats, wipe)
+    whoami      Show authenticated tenant identity (scrapes /cluster/info)
+    namespaces  List namespaces this client is authorized for
+    quota       Show this tenant's quota usage
+    topology    Show the client's local topology cache
     version     Print version
     help        Print this help
 
 MOUNT OPTIONS:
-    --endpoint <url>         Gateway endpoint (required unless --in-memory):
+    --endpoint <url>         Gateway endpoint (required unless --in-memory or --seeds):
                                kiseki://host:9103   ADR-042 native TCP-framed (preferred)
                                http(s)://host:9000  S3 listener (one HTTP RTT per FUSE op)
+    --seeds host1,host2,...  Multi-seed dial; takes precedence over --endpoint.
+                             First seed that accepts wins. Native (kiseki://) only.
     --mountpoint <path>      Local mount path (required)
     --in-memory              Run against an in-process sandbox (dev only)
     --cache-mode <mode>      Cache mode: pinned, organic, bypass (default: organic)
@@ -153,6 +165,7 @@ fn pool_dir() -> PathBuf {
 #[allow(clippy::too_many_lines)] // mount has lots of CLI flag wiring
 fn handle_mount(args: &[String]) {
     let mut endpoint: Option<String> = None;
+    let mut seeds: Vec<String> = Vec::new();
     let mut mountpoint: Option<String> = None;
     let mut cache_mode = String::from("organic");
     let mut _cache_dir: Option<String> = None;
@@ -168,6 +181,18 @@ fn handle_mount(args: &[String]) {
                     std::process::exit(2);
                 }
                 endpoint = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--seeds" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --seeds requires host1,host2,... value");
+                    std::process::exit(2);
+                }
+                seeds = args[i + 1]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 i += 2;
             }
             "--mountpoint" => {
@@ -220,22 +245,35 @@ fn handle_mount(args: &[String]) {
     // every read/write was hitting an in-daemon HashMap, not the
     // cluster. Sandbox is now opt-in via `--in-memory`.
     //
-    // Three URL schemes:
-    //   `kiseki://host:9103` — ADR-042 native TCP-framed binding
-    //                          (preferred for FUSE: streaming, no h2/HTTP
-    //                          framing tax, kernel-many-small-reads
-    //                          friendly).
-    //   `http(s)://host:9000` — S3 HTTP listener (one HTTP RTT per FUSE
-    //                          read; fine for a quick smoke or tiny
-    //                          objects, terrible for sequential I/O).
+    // `--seeds` takes precedence over `--endpoint` when both are given
+    // — multi-seed dial is the recommended HPC posture (any one node
+    // can serve the discovery, and the client routes to leaders on
+    // its own via topology cache).
     if in_memory {
-        if endpoint.is_some() {
-            eprintln!("Error: --in-memory and --endpoint are mutually exclusive");
+        if endpoint.is_some() || !seeds.is_empty() {
+            eprintln!("Error: --in-memory and --endpoint / --seeds are mutually exclusive");
             std::process::exit(2);
         }
+    } else if !seeds.is_empty() {
+        // Promote the first seed to `endpoint` (kiseki:// scheme is
+        // implied for seeds). The native code path below loops over
+        // the rest if the first one is unreachable.
+        let first = seeds[0].clone();
+        let promoted = if first.starts_with("kiseki://") || first.starts_with("http") {
+            first
+        } else {
+            format!("kiseki://{first}")
+        };
+        endpoint = Some(promoted);
+        eprintln!(
+            "info: --seeds={} → first reachable seed dialled (native kiseki:// only)",
+            seeds.join(",")
+        );
     } else {
         let ep = endpoint.as_deref().unwrap_or_else(|| {
-            eprintln!("Error: --endpoint is required (or use --in-memory for a dev sandbox)");
+            eprintln!(
+                "Error: --endpoint or --seeds is required (or use --in-memory for a dev sandbox)"
+            );
             std::process::exit(2);
         });
         let is_kiseki = ep.starts_with("kiseki://");
@@ -315,17 +353,47 @@ fn handle_mount(args: &[String]) {
                 })
                 .join()
                 .expect("native runtime thread panicked");
-                let gw = rt_handle
-                    .block_on(
+                // Build the seed list: --seeds takes precedence and was
+                // already promoted to `endpoint` above; the remaining
+                // seeds are tried in turn if the first one is down.
+                // The kiseki:// prefix on each entry is stripped here.
+                let candidates: Vec<String> = if seeds.is_empty() {
+                    vec![addr.to_owned()]
+                } else {
+                    seeds
+                        .iter()
+                        .map(|s| s.trim_start_matches("kiseki://").to_owned())
+                        .collect()
+                };
+                let mut last_err: Option<std::io::Error> = None;
+                let mut gw_opt = None;
+                for candidate in &candidates {
+                    match rt_handle.block_on(
                         kiseki_client::native_remote::NativeRemoteGateway::connect_plaintext(
-                            addr.to_owned(),
+                            candidate.clone(),
                             pool,
                         ),
-                    )
-                    .unwrap_or_else(|e| {
-                        eprintln!("Error: native connect to {addr} failed: {e}");
-                        std::process::exit(1);
-                    });
+                    ) {
+                        Ok(g) => {
+                            if candidates.len() > 1 {
+                                println!("info: dialled seed {candidate}");
+                            }
+                            gw_opt = Some(g);
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("warn: seed {candidate} unreachable: {e}");
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                let gw = gw_opt.unwrap_or_else(|| {
+                    let msg = last_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "no seeds".into());
+                    eprintln!("Error: native connect failed (all seeds): {msg}");
+                    std::process::exit(1);
+                });
                 let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
                 kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
                     .expect("FUSE mount failed");
@@ -634,5 +702,235 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// whoami / namespaces / quota / topology — minimal scrapers over HTTP.
+//
+// These commands hit the server's admin HTTP surface on port 9090. They
+// take an optional --endpoint flag pointing at the metrics HTTP URL
+// (defaults to KISEKI_ENDPOINT or http://localhost:9090). The client
+// CLI is stdlib-only just like kiseki-admin — no extra deps for
+// these read-only operations.
+// ---------------------------------------------------------------------------
+
+fn default_admin_endpoint() -> String {
+    std::env::var("KISEKI_ENDPOINT").unwrap_or_else(|_| "http://localhost:9090".to_string())
+}
+
+fn parse_admin_endpoint(args: &[String]) -> String {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--endpoint" && i + 1 < args.len() {
+            return args[i + 1].clone();
+        }
+        if let Some(v) = args[i].strip_prefix("--endpoint=") {
+            return v.to_string();
+        }
+        i += 1;
+    }
+    default_admin_endpoint()
+}
+
+fn handle_whoami(args: &[String]) {
+    let endpoint = parse_admin_endpoint(args);
+    // For now, the only identity surface is the auth tier the client
+    // sees on /cluster/info. SAN identity (TLS) lives in the proto
+    // layer and isn't currently emitted on the HTTP control plane.
+    // Print what we can derive from /cluster/info and let the operator
+    // bridge the gap until a dedicated endpoint lands.
+    match http_get_admin(&endpoint, "/cluster/info") {
+        Ok(body) => {
+            let node_id = json_u64(&body, "node_id").unwrap_or(0);
+            // Tenant is currently always the bootstrap tenant on
+            // single-tenant deployments. ADR-038 §D4 documents the
+            // mTLS SAN→tenant mapping for production.
+            let tenant = std::env::var("KISEKI_TENANT_ID")
+                .unwrap_or_else(|_| "bootstrap (00000000-0000-0000-0000-000000000001)".to_string());
+            println!("Endpoint:   {endpoint}");
+            println!("Connected:  node {node_id}");
+            println!("Tenant:     {tenant}");
+            println!("Note: SAN identity isn't surfaced over HTTP yet — see");
+            println!("      specs/findings/2026-05-15-ui-cli-followups.md.");
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_namespaces(args: &[String]) {
+    let endpoint = parse_admin_endpoint(args);
+    let sub = args.first().map_or("list", String::as_str);
+    if sub != "list" {
+        eprintln!("Usage: kiseki-client namespaces list [--endpoint URL]");
+        std::process::exit(2);
+    }
+    match http_get_admin(&endpoint, "/admin/tenants/namespaces") {
+        Ok(body) => {
+            // Tenant filtering: production filters by the client's own
+            // tenant. The HTTP endpoint already only exposes the
+            // namespaces the responding node knows; for a single-
+            // tenant deploy that is all of them.
+            print!("{body}");
+            println!();
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_quota(args: &[String]) {
+    let endpoint = parse_admin_endpoint(args);
+    // Quotas live on the gRPC ControlService.SetQuota path; there's
+    // no read-only quota endpoint over HTTP today. Scrape the gateway
+    // bytes counters as a usage proxy.
+    match http_get_admin(&endpoint, "/metrics") {
+        Ok(body) => {
+            let mut bytes_written = 0u64;
+            let mut bytes_read = 0u64;
+            for line in body.lines() {
+                if line.starts_with("kiseki_gateway_bytes_written_total ") {
+                    if let Some(v) = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()) {
+                        bytes_written = v;
+                    }
+                } else if line.starts_with("kiseki_gateway_bytes_read_total ") {
+                    if let Some(v) = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()) {
+                        bytes_read = v;
+                    }
+                }
+            }
+            println!("Tenant usage (from gateway counters, no per-tenant breakdown today):");
+            println!("  Bytes written: {}", format_bytes(bytes_written));
+            println!("  Bytes read:    {}", format_bytes(bytes_read));
+            println!("Note: per-tenant quota query is not yet exposed over HTTP — see followups.");
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_topology(args: &[String]) {
+    let endpoint = parse_admin_endpoint(args);
+    match http_get_admin(&endpoint, "/admin/topology/shards") {
+        Ok(body) => {
+            print!("{body}");
+            println!();
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// --- HTTP helpers (stdlib only, mirrors kiseki-admin's helpers) ---
+
+fn http_get_admin(endpoint: &str, path: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let host_port = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("invalid endpoint URL")?;
+    let mut stream = TcpStream::connect(host_port)
+        .map_err(|e| format!("connection failed ({host_port}): {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write failed: {e}"))?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+    let text = String::from_utf8_lossy(&buf);
+    let body_start = text
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .ok_or("malformed HTTP response")?;
+    let body = &text[body_start..];
+    if text[..body_start]
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        Ok(decode_chunked(body))
+    } else {
+        Ok(body.to_string())
+    }
+}
+
+fn decode_chunked(input: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = input;
+    loop {
+        let trimmed = remaining.trim_start();
+        if trimmed.is_empty() {
+            break;
+        }
+        let line_end = trimmed.find("\r\n").unwrap_or(trimmed.len());
+        let size = usize::from_str_radix(trimmed[..line_end].trim(), 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        let data_start = line_end + 2;
+        if data_start + size <= trimmed.len() {
+            result.push_str(&trimmed[data_start..data_start + size]);
+            remaining = &trimmed[data_start + size..];
+            if remaining.starts_with("\r\n") {
+                remaining = &remaining[2..];
+            }
+        } else {
+            result.push_str(&trimmed[data_start..]);
+            break;
+        }
+    }
+    result
+}
+
+fn json_u64(json: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{key}\"");
+    let idx = json.find(&pattern)?;
+    let after_key = &json[idx + pattern.len()..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?;
+    let after_ws = after_colon.trim_start();
+    let end = after_ws
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(after_ws.len());
+    after_ws[..end].parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_admin_endpoint_picks_flag_value() {
+        let args = vec!["--endpoint".to_string(), "http://x:9090".to_string()];
+        assert_eq!(parse_admin_endpoint(&args), "http://x:9090");
+    }
+
+    #[test]
+    fn parse_admin_endpoint_falls_back_to_default() {
+        let args: Vec<String> = vec![];
+        // Default may be overridden by KISEKI_ENDPOINT in the env;
+        // verify it's an http(s) URL.
+        let ep = parse_admin_endpoint(&args);
+        assert!(ep.starts_with("http://") || ep.starts_with("https://"));
+    }
+
+    #[test]
+    fn json_u64_extracts_simple_value() {
+        let body = r#"{"node_id": 42, "other": "x"}"#;
+        assert_eq!(json_u64(body, "node_id"), Some(42));
     }
 }

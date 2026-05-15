@@ -7,7 +7,6 @@ use kiseki_advisory::budget::BudgetConfig;
 use kiseki_advisory::grpc::AdvisoryGrpc;
 use kiseki_audit::AuditOps;
 use kiseki_control::grpc::ControlGrpc;
-use kiseki_control::tenant::TenantStore;
 use kiseki_keymanager::grpc::KeyManagerGrpc;
 use kiseki_log::grpc::LogGrpc;
 use kiseki_proto::v1::control_service_server::ControlServiceServer;
@@ -621,9 +620,14 @@ pub async fn run_main(
         );
     }
 
-    // Audit: in-memory store.
-    let audit_store = kiseki_audit::AuditLog::new();
+    // Audit: in-memory store. Wrapped in Arc so the admin web UI /
+    // `kiseki-admin audit query` can read events out of the same
+    // store the runtime appends to (NFS-fallback opt-in, plaintext
+    // banners, etc).
+    let audit_store: Arc<kiseki_audit::AuditLog> = Arc::new(kiseki_audit::AuditLog::new());
     tracing::info!(events = audit_store.total_events(), "audit log: in-memory",);
+    let audit_for_ui: Arc<dyn kiseki_audit::AuditOps + Send + Sync> =
+        Arc::clone(&audit_store) as Arc<dyn kiseki_audit::AuditOps + Send + Sync>;
 
     // Metrics — built early so the cluster-fabric Arc<FabricMetrics>
     // can be threaded into the per-peer client wrappers below.
@@ -1239,6 +1243,23 @@ pub async fn run_main(
     // metrics server so `/cluster/info` can project per-shard leader
     // info from `NamespaceShardMap`. `None` on single-node deploys.
     let cluster_control_state_for_ui = cluster_control_store.as_ref().map(|s| Arc::new(s.state()));
+    // Pre-construct the tenant + namespace + drain handles so the
+    // admin UI can share them with the gRPC `ControlService` further
+    // below. The gRPC service is built after this point — both
+    // consumers see the same in-memory state.
+    let control_tenants_for_ui: Arc<kiseki_control::tenant::TenantStore> =
+        Arc::new(kiseki_control::tenant::TenantStore::new());
+    let control_namespaces_for_ui: Arc<kiseki_control::namespace::NamespaceStore> =
+        Arc::new(kiseki_control::namespace::NamespaceStore::new());
+    let drain_orchestrator: Arc<kiseki_control::node_lifecycle::DrainOrchestrator> =
+        Arc::new(kiseki_control::node_lifecycle::DrainOrchestrator::new());
+    // UI handles cloned for the spawn (originals stay in scope to
+    // pass to the gRPC `ControlService` further down).
+    let tenants_for_spawn = Arc::clone(&control_tenants_for_ui);
+    let namespaces_for_spawn = Arc::clone(&control_namespaces_for_ui);
+    let drain_for_spawn = Arc::clone(&drain_orchestrator);
+    let audit_for_spawn = Arc::clone(&audit_for_ui);
+    let key_store_for_spawn: Arc<dyn kiseki_keymanager::KeyManagerOps> = Arc::clone(&key_store);
     tokio::spawn(async move {
         if let Err(e) = crate::metrics::run_metrics_server(
             metrics_addr,
@@ -1249,6 +1270,11 @@ pub async fn run_main(
             metrics_compositions,
             metrics_local_chunk_store,
             cluster_control_state_for_ui,
+            Some(audit_for_spawn),
+            Some(key_store_for_spawn),
+            Some(tenants_for_spawn),
+            Some(namespaces_for_spawn),
+            Some(drain_for_spawn),
         )
         .await
         {
@@ -1581,8 +1607,12 @@ pub async fn run_main(
     // --- gRPC services ---
 
     // Control plane (ADR-027: Rust-only).
-    let control_tenants = Arc::new(TenantStore::new());
-    let control_svc = ControlServiceServer::new(ControlGrpc::new(control_tenants));
+    // The tenant + namespace stores are pre-built above so the admin
+    // UI shares the same in-memory state as this gRPC service.
+    let control_svc = ControlServiceServer::new(ControlGrpc::with_namespaces(
+        Arc::clone(&control_tenants_for_ui),
+        Arc::clone(&control_namespaces_for_ui),
+    ));
     tracing::info!("control plane: in-process (ControlService on data-path gRPC)");
 
     let key_svc = KeyManagerServiceServer::new(KeyManagerGrpc::new(key_store));

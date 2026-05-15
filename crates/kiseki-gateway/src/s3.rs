@@ -108,13 +108,23 @@ impl<G: GatewayOps> S3Gateway<G> {
     /// optional Content-Type is attached to the resulting composition
     /// so a subsequent GET on any gateway instance round-trips it
     /// (RFC 6838 / ADV-PA-4).
+    ///
+    /// Uses [`GatewayOps::write_with_forwarding`] (ADR-042 §4 / ADR-014)
+    /// so a `LogError::ForwardToLeader` from a follower openraft store
+    /// surfaces as `GatewayError::ForwardToLeader { leader_node_id }`
+    /// instead of being collapsed onto `Upstream`. The S3 HTTP handler
+    /// (`s3_server::put_or_upload_part`) consumes that variant to emit
+    /// a 307 Temporary Redirect at the leader (`Location:` header).
+    /// Backends without per-shard Raft (in-process / single-node test
+    /// gateways) inherit the default `write_with_forwarding` impl that
+    /// delegates to `write` — zero behavior change for those.
     pub async fn put_object(
         &self,
         req: PutObjectRequest,
     ) -> Result<PutObjectResponse, GatewayError> {
         let write_resp = self
             .inner
-            .write(WriteRequest {
+            .write_with_forwarding(WriteRequest {
                 tenant_id: req.tenant_id,
                 namespace_id: req.namespace_id,
                 data: req.body,

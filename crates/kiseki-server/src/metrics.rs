@@ -321,7 +321,12 @@ impl KisekiMetrics {
                 "kiseki_native_topology_stale_leader_redirects_total",
                 "ADR-008 rev 2 / ADR-014 — stale-leader redirects emitted on the protocol boundary",
             ),
-            &["protocol"],
+            // Labels match the call site in `kiseki-gateway::s3_server::
+            // leader_unavailable_response` (line 299) which passes
+            // `&["s3", "<tenant>"]`. Arity-mismatch with the call site
+            // would panic at runtime on every 307 emission. ADR-008
+            // rev 2 §"Observability" specifies (protocol, tenant).
+            &["protocol", "tenant"],
         )
         .expect("metric");
         registry
@@ -523,7 +528,7 @@ impl Default for KisekiMetrics {
 /// - `GET /ui/api/*` — JSON API endpoints
 /// - `GET /ui/fragment/*` — HTMX HTML partial endpoints
 /// - `GET /ui/logo` — Logo image
-#[allow(clippy::too_many_arguments)] // wire 8 distinct ops handles into the metrics server boot
+#[allow(clippy::too_many_arguments)] // wire many distinct ops handles into the metrics server boot
 pub async fn run_metrics_server(
     addr: SocketAddr,
     metrics: KisekiMetrics,
@@ -533,6 +538,11 @@ pub async fn run_metrics_server(
     compositions: Option<std::sync::Arc<kiseki_composition::composition::CompositionStore>>,
     local_chunk_store: Option<std::sync::Arc<dyn kiseki_chunk::AsyncChunkOps>>,
     cluster_control: Option<std::sync::Arc<crate::cluster_control::ControlStateMachine>>,
+    audit: Option<crate::web::admin_extra::AuditHandle>,
+    key_manager: Option<crate::web::admin_extra::KeyManagerHandle>,
+    tenants: Option<crate::web::admin_extra::TenantHandle>,
+    namespaces: Option<crate::web::admin_extra::NamespaceHandle>,
+    drain: Option<crate::web::admin_extra::DrainHandle>,
 ) -> std::io::Result<()> {
     use crate::web;
 
@@ -554,6 +564,11 @@ pub async fn run_metrics_server(
         compositions,
         local_chunk_store,
         cluster_control,
+        audit,
+        key_manager,
+        tenants,
+        namespaces,
+        drain,
     };
 
     // Build combined router: metrics + health + admin UI.

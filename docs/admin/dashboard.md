@@ -120,6 +120,74 @@ curl http://node1:9090/ui/fragment/chart-data
 
 ---
 
+## Topology tab
+
+The Topology tab shows ADR-008 rev 2 cluster routing state: per-shard
+leader assignments and proxy-fallback / stale-leader counters.
+
+| Panel | Source |
+|-------|--------|
+| Per-shard leaders | `/ui/fragment/topology-shards` (mirrors `/cluster/info` `shards`) |
+| Proxy fallback toggle | `KISEKI_NATIVE_PROXY_FALLBACK` env var |
+| Proxy forwards | `kiseki_native_proxy_forwards_total{source_node,leader_node}` |
+| Stale-leader redirects | `kiseki_native_topology_stale_leader_redirects_total{protocol}` |
+
+Operators can also pull this via `kiseki-admin shards` and
+`kiseki-admin forwarding` (both honour `--json`).
+
+---
+
+## Pools tab
+
+The Pools tab surfaces per-pool capacity from
+`kiseki_pool_capacity_total_bytes` and `kiseki_pool_capacity_used_bytes`.
+
+Per-device health and the repair queue are deliberately NOT surfaced
+in the web UI today — they live behind the `StorageAdminService` gRPC
+handler and are exposed via the `kiseki-storage device-health` and
+`kiseki-storage repairs list` CLIs.  The notice card in the Pools tab
+links to those commands.  Wiring per-device gauges into the metrics
+registry is tracked in
+`specs/findings/2026-05-15-ui-cli-followups.md`.
+
+---
+
+## Tenants tab
+
+The Tenants tab lists the three-level tenant hierarchy
+(Organization → Project → Workload) plus namespaces, all read from the
+in-process `TenantStore` and `NamespaceStore` (ADR-009 / I-T1..I-T4).
+
+The same data is reachable via:
+
+- `GET /admin/tenants/orgs`
+- `GET /admin/tenants/projects`
+- `GET /admin/tenants/workloads`
+- `GET /admin/tenants/namespaces`
+
+`kiseki-admin tenant list --type org|project|workload|namespace`
+prints the JSON or a tabular view.
+
+Create-org is available over HTTP (`POST /admin/tenants/orgs`); the
+nested CRUD operations (project / workload / namespace) require the
+gRPC `ControlService` — see `docs/api/grpc.md`.
+
+---
+
+## Audit tab
+
+The Audit tab shows the most recent events from the system audit
+shard.  This is the compliance-facing trail (key rotations, namespace
+lifecycle, drain requests, ...) — *distinct* from the Alerts tab,
+which surfaces severity-driven operational state.
+
+Backed by `GET /admin/audit/query` (tenant-scoped queries take
+`?tenant=<uuid>` and event-type filters take `?event_type=key-rotation`
+or any other variant in `AuditEventType`).  The CLI equivalent is
+`kiseki-admin audit query [--tenant T] [--type X] [--limit N]`.
+
+---
+
 ## Alerts tab
 
 The alerts tab shows health status and capacity warnings. Each alert is
