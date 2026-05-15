@@ -38,6 +38,8 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      KISEKI_ADMIN_AUTH_DISABLED: "true"
+      KISEKI_CLUSTER_INFO_PUBLIC: "true"
       # Group-commit knobs — all three required for the GCP-equivalent
       # write path (see docs/operations/durability.md). Without
       # KISEKI_RAFT_FLUSH_INTERVAL_MS the PUT path saturates at
@@ -93,6 +95,8 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      KISEKI_ADMIN_AUTH_DISABLED: "true"
+      KISEKI_CLUSTER_INFO_PUBLIC: "true"
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
@@ -143,6 +147,8 @@ services:
       KISEKI_RAFT_ADDR: "0.0.0.0:9300"
       KISEKI_ALLOW_PLAINTEXT_NFS: "true"
       KISEKI_INSECURE_NFS: "true"
+      KISEKI_ADMIN_AUTH_DISABLED: "true"
+      KISEKI_CLUSTER_INFO_PUBLIC: "true"
       KISEKI_RAFT_FLUSH_INTERVAL_MS: "100"
       KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       KISEKI_CHUNK_FLUSH_INTERVAL_MS: "100"
