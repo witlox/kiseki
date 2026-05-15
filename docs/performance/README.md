@@ -2,7 +2,7 @@
 
 Live view of where the numbers stand and how to reproduce them.
 Time-series record of every matrix run lives in
-[`specs/performance/`](../../specs/performance/INDEX.md) — those
+[`specs/performance/`](https://github.com/witlox/kiseki/blob/main/specs/performance/INDEX.md) — those
 files are immutable snapshots, this file moves with HEAD.
 
 > Operators tuning a deployment for throughput should also read
@@ -15,7 +15,7 @@ files are immutable snapshots, this file moves with HEAD.
 
 3 × `c3-standard-44-lssd` storage + 2 × `c3-standard-44` clients in
 `europe-west1-b`, release `v2026.43.759`. Full breakdown in
-[`specs/performance/2026-05-15-gcp-compact.md`](../../specs/performance/2026-05-15-gcp-compact.md).
+[`specs/performance/2026-05-15-gcp-compact.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-15-gcp-compact.md).
 
 | Protocol | Throughput | Notes |
 |---|---:|---|
@@ -37,18 +37,18 @@ Open product issues surfaced by this run:
 ## Snapshot index
 
 The chronological record lives in
-[`specs/performance/INDEX.md`](../../specs/performance/INDEX.md).
+[`specs/performance/INDEX.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/INDEX.md).
 Latest few:
 
 | Date | Snapshot | One-liner |
 |---|---|---|
-| 2026-05-15 | [GCP compact](../../specs/performance/2026-05-15-gcp-compact.md) | First post-libfuse-swap GCP run; 3 product bugs surfaced (#36/#37/#38). |
-| 2026-05-09 | [libfuse-swap](../../specs/performance/2026-05-09-libfuse-swap.md) | FUSE GET +25% on multi-thread libfuse session loop. NFSv4.1 read 0.5 → 923 MB/s. |
-| 2026-05-07 | [post-pNFS-pool](../../specs/performance/2026-05-07-post-pnfs-pool.md) | pNFS GET 17 k → 80 k op/s (round-robin DS pool). |
-| 2026-05-07 | [local matrix](../../specs/performance/2026-05-07-local-matrix.md) | FUSE leapfrogs every protocol (52 k PUT / 115 k GET); NFS PUT degradation surfaced. |
-| 2026-05-05 | [ADR-042 native local](../../specs/performance/2026-05-05-adr042-native-local.md) | First end-to-end native-binding measurement. A-NG11 gate at 15 % — Phase 9 perf slice pending. |
-| 2026-05-03 | [GCP transport](../../specs/performance/2026-05-03-gcp-transport.md) | First multi-node GCP run. Surfaced fabric write quorum-loss bug (fixed in `f362060`). |
-| 2026-05-03 | [local baseline](../../specs/performance/2026-05-03-local-baseline.md) | Post-fix May matrix; the "May 2026 baseline" later snapshots delta against. |
+| 2026-05-15 | [GCP compact](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-15-gcp-compact.md) | First post-libfuse-swap GCP run; 3 product bugs surfaced (#36/#37/#38). |
+| 2026-05-09 | [libfuse-swap](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-09-libfuse-swap.md) | FUSE GET +25% on multi-thread libfuse session loop. NFSv4.1 read 0.5 → 923 MB/s. |
+| 2026-05-07 | [post-pNFS-pool](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-07-post-pnfs-pool.md) | pNFS GET 17 k → 80 k op/s (round-robin DS pool). |
+| 2026-05-07 | [local matrix](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-07-local-matrix.md) | FUSE leapfrogs every protocol (52 k PUT / 115 k GET); NFS PUT degradation surfaced. |
+| 2026-05-05 | [ADR-042 native local](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-05-adr042-native-local.md) | First end-to-end native-binding measurement. A-NG11 gate at 15 % — Phase 9 perf slice pending. |
+| 2026-05-03 | [GCP transport](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-03-gcp-transport.md) | First multi-node GCP run. Surfaced fabric write quorum-loss bug (fixed in `f362060`). |
+| 2026-05-03 | [local baseline](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-03-local-baseline.md) | Post-fix May matrix; the "May 2026 baseline" later snapshots delta against. |
 
 ## How to run the matrix
 

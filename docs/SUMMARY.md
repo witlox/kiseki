@@ -44,6 +44,7 @@
 - [Troubleshooting](operations/troubleshooting.md)
 - [Performance Tuning](operations/performance.md)
 - [Performance Benchmarks](performance/README.md)
+- [Performance Targets](performance/targets.md)
 - [Optimization Backlog](performance/optimization-backlog.md)
 - [Durability & Data-Loss Windows](operations/durability.md)
 - [Capacity Planning](operations/capacity.md)
@@ -101,3 +102,8 @@
   - [ADR-041: Raft Transport — Shard Multiplexing](decisions/adr/041-raft-transport-shard-multiplexing.md)
   - [ADR-042: Native Gateway Data Service](decisions/adr/042-native-gateway-data-service.md)
   - [ADR-043: System Library FFI Policy](decisions/adr/043-system-library-ffi.md)
+
+# Background
+
+- [Design Conversation](analysis/design-conversation.md)
+- [DeltaFS + Mochi Evaluation](prior-art/deltafs-mochi-evaluation.md)
