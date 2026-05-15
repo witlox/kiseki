@@ -690,12 +690,63 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Remove a file by name.
-    pub fn remove_file(&self, name: &str) -> Result<(), GatewayError> {
-        if self.dir_index.remove(self.namespace_id, name) {
-            Ok(())
-        } else {
-            Err(GatewayError::ProtocolError("file not found".into()))
+    ///
+    /// GH #36: this must (a) drop the dir-index binding and (b) call
+    /// the gateway's `delete` path so the composition is removed and
+    /// every referenced chunk's refcount is decremented. Without (b)
+    /// the chunk-store's bitmap allocator never sees the space come
+    /// back — on the GCP 2026-05-15 perf cluster this manifested as
+    /// `device full: largest free extent is 256 KiB` after ~200 GB
+    /// of cumulative writes, despite 2.8 TB of raw NVMe untouched.
+    /// Decrementing chunk refcounts is necessary but not sufficient —
+    /// the runtime's periodic GC task (see `runtime.rs`) is what
+    /// actually frees the device extents once `refcount == 0`.
+    pub async fn remove_file(&self, name: &str) -> Result<(), GatewayError> {
+        // Look up before removing so we still know the composition_id
+        // after the dir entry is gone.
+        let Some(entry) = self.dir_index.lookup(self.namespace_id, name) else {
+            return Err(GatewayError::ProtocolError("file not found".into()));
+        };
+        let composition_id = entry.composition_id;
+
+        // Drop the dir-index binding first — kernel sees the file
+        // gone the instant REMOVE returns. The composition delete
+        // (which decrements chunk refcounts) follows so a partial
+        // failure can't leave a name pointing at a half-deleted
+        // composition.
+        let removed = self.dir_index.remove(self.namespace_id, name);
+        debug_assert!(removed, "lookup succeeded above, remove must too");
+
+        // Skip the gateway delete for placeholder/nil compositions —
+        // directory entries minted by `mkdir` use `CompositionId::nil`
+        // and the gateway delete path would just error out. Real
+        // files always carry a concrete UUID.
+        if composition_id.0.is_nil() {
+            return Ok(());
         }
+
+        // Best-effort: gateway.delete decrements chunk refcounts and
+        // emits the cluster-wide Delete delta. If the call fails (e.g.
+        // the composition was already deleted out-of-band, or the
+        // cluster transport is degraded) we still return Ok — the dir
+        // entry is gone, the kernel is satisfied, and the next GC pass
+        // is harmless because the composition's chunks remain
+        // ref-held by any surviving references.
+        if let Err(e) = self
+            .gateway
+            .delete(self.tenant_id, self.namespace_id, composition_id)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                name = %name,
+                composition_id = %composition_id.0,
+                "NFS REMOVE: gateway.delete failed; dir entry dropped but \
+                 chunk refcounts not decremented",
+            );
+        }
+
+        Ok(())
     }
 
     /// Rename a file within the namespace.
