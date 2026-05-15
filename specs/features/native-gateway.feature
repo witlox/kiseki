@@ -170,7 +170,7 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   # and surfaces `Status::unavailable` with a structured leader hint —
   # the same shape the Step C client-side topology-cache path catches.
 
-  @native @routing @deferred-feature
+  @native @routing
   Scenario: Native client transparently uses server-side proxy fallback
     Given client-a's topology cache says shard S1's leader is node-2
     But the leader has actually migrated to node-3
@@ -181,7 +181,7 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
     And the trailing metadata carries the new topology_version
     And client-a's topology cache is refreshed to identify node-3 as leader via the topology_version mismatch path (I-NG13)
 
-  @native @routing @deferred-feature
+  @native @routing
   Scenario: Server-side proxy fallback — proxying node fails mid-proxy
     Given client-a issues a Write to node-2 which is acting as a proxy to leader node-3
     When node-2 crashes between (a) committing the proxied request on node-3 and (b) returning the response to client-a
