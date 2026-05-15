@@ -4,6 +4,79 @@ This guide covers day-to-day cluster operations: adding and removing
 nodes, managing shards and pools, maintenance mode, and schema
 migration.
 
+The `kiseki-admin` CLI is the primary operator surface. It uses raw
+HTTP to the metrics port (default `:9090`) so it has no external
+dependencies. Add `--json` to any command for machine-readable output
+and `--endpoint URL` (or `KISEKI_ENDPOINT`) to target a specific node.
+
+```bash
+kiseki-admin --version
+kiseki-admin status                       # cluster summary
+kiseki-admin nodes --json | jq            # all nodes, JSON output
+kiseki-admin --endpoint http://node2:9090 status
+```
+
+## Tenant management
+
+The `kiseki-admin tenant` family talks to the in-process tenant store
+shared with `ControlService`. Reads work over HTTP; writes beyond
+`create-org` require the gRPC `ControlService` (see
+`docs/api/grpc.md`).
+
+```bash
+kiseki-admin tenant list                  # orgs
+kiseki-admin tenant list --type project
+kiseki-admin tenant list --type workload
+kiseki-admin tenant list --type namespace
+kiseki-admin tenant create-org "Acme Corp"
+```
+
+## Snapshots (ADR-016)
+
+```bash
+kiseki-admin snapshot create [--note "pre-upgrade"]
+kiseki-admin snapshot list
+kiseki-admin snapshot restore <snapshot-id>
+```
+
+Backups are only available when `KISEKI_BACKUP_BACKEND=fs|s3` is set
+on the target node; otherwise the CLI receives `503 Service Unavailable`
+with a message naming the missing env var.
+
+## Drain (ADR-035 §5)
+
+```bash
+kiseki-admin drain 3                       # request drain on node-id 3
+kiseki-admin drain status                  # show all active drains
+kiseki-admin drain cancel 3
+```
+
+The drain orchestrator records the request and surfaces progress over
+HTTP. Voter-replacement execution is the openraft membership pump
+(tracked separately — see the followups doc).
+
+## Key rotation (ADR-007)
+
+```bash
+kiseki-admin keys status                   # current epoch + history
+kiseki-admin keys rotate                   # cut a new epoch
+```
+
+`kiseki-admin keys shred <tenant>` is intentionally not yet wired
+into the CLI (irreversible operation; needs `--yes` and the
+`/admin/keys/shred` HTTP endpoint, tracked in the followups doc).
+
+## Config show
+
+Inspect runtime env-var knobs per node. Useful for debugging
+configuration drift across a fleet.
+
+```bash
+kiseki-admin config show                   # local node
+kiseki-admin config show --node 2          # peer node 2 (via /cluster/info)
+kiseki-admin config show --all             # every peer
+```
+
 ---
 
 ## Node management

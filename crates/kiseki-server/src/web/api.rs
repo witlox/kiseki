@@ -37,6 +37,17 @@ pub struct UiState {
     /// per-namespace shard maps the `/cluster/info` `shards` field
     /// (ADR-008 rev 2) projects. `None` on single-node deployments.
     pub cluster_control: Option<Arc<crate::cluster_control::ControlStateMachine>>,
+    /// In-process audit log. The Audit dashboard tab + `kiseki-admin
+    /// audit query` read from here.
+    pub audit: Option<super::admin_extra::AuditHandle>,
+    /// Key manager. Powers `kiseki-admin keys status / keys rotate`.
+    pub key_manager: Option<super::admin_extra::KeyManagerHandle>,
+    /// Tenant store — orgs, projects, workloads.
+    pub tenants: Option<super::admin_extra::TenantHandle>,
+    /// Namespace store — exposed for the Tenants tab's namespace list.
+    pub namespaces: Option<super::admin_extra::NamespaceHandle>,
+    /// Drain orchestrator — `kiseki-admin drain {start,cancel,status}`.
+    pub drain: Option<super::admin_extra::DrainHandle>,
 }
 
 /// Static node identity exposed via `/cluster/info`.
@@ -182,6 +193,7 @@ pub fn ui_router(state: UiState) -> Router {
             "/admin/test/chunk/{chunk_id}/fragment/{fragment_index}",
             axum::routing::delete(admin_test_drop_fragment),
         )
+        .merge(super::admin_extra::admin_extra_routes())
         .with_state(state)
 }
 
@@ -992,6 +1004,11 @@ mod cluster_info_rev2_tests {
             compositions: None,
             local_chunk_store: None,
             cluster_control: Some(Arc::new(state)),
+            audit: None,
+            key_manager: None,
+            tenants: None,
+            namespaces: None,
+            drain: None,
         }
     }
 
@@ -1074,6 +1091,11 @@ mod cluster_info_rev2_tests {
             compositions: None,
             local_chunk_store: None,
             cluster_control: None,
+            audit: None,
+            key_manager: None,
+            tenants: None,
+            namespaces: None,
+            drain: None,
         };
         let shards = build_shards_from_state(&state).await;
         assert!(shards.is_empty());

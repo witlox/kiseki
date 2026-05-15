@@ -23,11 +23,36 @@ being available on the host:
 ## Mounting
 
 ```bash
-kiseki-client-fuse mount /mnt/kiseki \
-    --data-addr <storage-node>:9100 \
-    --tenant <tenant-id> \
-    --namespace <namespace-id>
+# Single endpoint (back-compat).
+kiseki-client mount \
+    --endpoint kiseki://storage-1:9103 \
+    --mountpoint /mnt/kiseki
+
+# Multi-seed dial (recommended for HPC fabrics — any seed serves
+# discovery; the client routes per-shard via the topology cache).
+kiseki-client mount \
+    --seeds storage-1:9103,storage-2:9103,storage-3:9103 \
+    --mountpoint /mnt/kiseki
 ```
+
+`--seeds` takes precedence over `--endpoint` when both are given. The
+client tries each seed in order; the first one that accepts a TCP
+connection wins. Subsequent operations route to per-shard leaders via
+the topology cache (no per-RPC fan-out).
+
+### Client diagnostics
+
+```bash
+kiseki-client --version
+kiseki-client whoami                       # client identity + connected node
+kiseki-client namespaces list              # namespaces visible to this tenant
+kiseki-client quota                        # gateway-counter usage proxy
+kiseki-client topology                     # per-shard leader map
+```
+
+All four take an optional `--endpoint URL` (defaults to
+`KISEKI_ENDPOINT` or `http://localhost:9090`) and scrape the admin
+HTTP surface of the targeted node.
 
 ### Mount Options
 

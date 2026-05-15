@@ -7,6 +7,29 @@ cluster admin and tenant admin (ADR-015).
 
 ---
 
+## kiseki-admin: operator visibility
+
+`kiseki-admin` exposes operator-facing diagnostics over the metrics
+HTTP port. Every command supports `--json` for machine consumption.
+
+| Command | Surface |
+|---------|---------|
+| `kiseki-admin status` | Cluster health summary |
+| `kiseki-admin nodes` | Per-node health + metrics |
+| `kiseki-admin events [--severity S] [--hours N]` | Event log |
+| `kiseki-admin history [--hours N]` | Cluster-wide metric time series |
+| `kiseki-admin shards` | Per-shard leader map (ADR-008 rev 2) |
+| `kiseki-admin forwarding` | Proxy + stale-leader redirect counters |
+| `kiseki-admin audit query [--tenant T] [--type X] [--limit N] [--from S]` | Compliance audit trail (ADR-009) |
+| `kiseki-admin keys status` | Key-manager epochs |
+| `kiseki-admin config show [--node N | --all]` | Runtime env-var knobs |
+| `kiseki-admin drain status` | Drains in progress |
+| `kiseki-admin snapshot list` | Stored snapshots |
+
+The dashboard at `/ui` mirrors all of the above in browser-friendly form.
+
+---
+
 ## Prometheus metrics
 
 Every `kiseki-server` node exposes Prometheus metrics in text exposition
