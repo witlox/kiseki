@@ -1471,3 +1471,167 @@ fn json_object_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     }
     None
 }
+
+// ---------------------------------------------------------------------------
+// Tests — argument parsers (no I/O).
+//
+// These cover the parser surface added under the 2026-05-15 UI/CLI
+// follow-ups (D3 nested tenant CRUD, D4 keys shred, D5 audit
+// --local-only). Each test isolates one option matrix so future
+// drift surfaces a precise failure.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Result<Command, String> {
+        let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+        parse_subcommand(&owned, 0)
+    }
+
+    // --- D3: nested tenant CRUD ----------------------------------------
+
+    #[test]
+    fn tenant_create_project_requires_org_and_name() {
+        let cmd = parse(&["tenant", "create-project", "ORG-1", "myproj"]).unwrap();
+        match cmd {
+            Command::TenantCreateProject { org_id, name } => {
+                assert_eq!(org_id, "ORG-1");
+                assert_eq!(name, "myproj");
+            }
+            _ => panic!("expected TenantCreateProject"),
+        }
+        assert!(parse(&["tenant", "create-project", "ORG-1"]).is_err());
+        assert!(parse(&["tenant", "create-project"]).is_err());
+    }
+
+    #[test]
+    fn tenant_create_workload_requires_project_and_name() {
+        let cmd = parse(&["tenant", "create-workload", "PROJ-1", "trainer"]).unwrap();
+        match cmd {
+            Command::TenantCreateWorkload { project_id, name } => {
+                assert_eq!(project_id, "PROJ-1");
+                assert_eq!(name, "trainer");
+            }
+            _ => panic!("expected TenantCreateWorkload"),
+        }
+        assert!(parse(&["tenant", "create-workload"]).is_err());
+    }
+
+    #[test]
+    fn tenant_create_namespace_requires_workload_and_name() {
+        let cmd = parse(&["tenant", "create-namespace", "WL-1", "ns-a"]).unwrap();
+        match cmd {
+            Command::TenantCreateNamespace { workload_id, name } => {
+                assert_eq!(workload_id, "WL-1");
+                assert_eq!(name, "ns-a");
+            }
+            _ => panic!("expected TenantCreateNamespace"),
+        }
+    }
+
+    #[test]
+    fn tenant_describe_takes_one_id() {
+        let cmd = parse(&["tenant", "describe", "ORG-1"]).unwrap();
+        match cmd {
+            Command::TenantDescribe { id } => assert_eq!(id, "ORG-1"),
+            _ => panic!("expected TenantDescribe"),
+        }
+        assert!(parse(&["tenant", "describe"]).is_err());
+    }
+
+    #[test]
+    fn tenant_delete_supports_yes_flag() {
+        let cmd = parse(&["tenant", "delete", "ORG-1"]).unwrap();
+        match cmd {
+            Command::TenantDelete { id, yes } => {
+                assert_eq!(id, "ORG-1");
+                assert!(!yes);
+            }
+            _ => panic!("expected TenantDelete"),
+        }
+        let cmd_yes = parse(&["tenant", "delete", "ORG-1", "--yes"]).unwrap();
+        match cmd_yes {
+            Command::TenantDelete { id, yes } => {
+                assert_eq!(id, "ORG-1");
+                assert!(yes);
+            }
+            _ => panic!("expected TenantDelete with --yes"),
+        }
+        assert!(parse(&["tenant", "delete"]).is_err());
+    }
+
+    // --- D4: keys shred ------------------------------------------------
+
+    #[test]
+    fn keys_shred_requires_tenant_id() {
+        let cmd = parse(&["keys", "shred", "TENANT-1"]).unwrap();
+        match cmd {
+            Command::KeysShred { tenant_id, yes } => {
+                assert_eq!(tenant_id, "TENANT-1");
+                assert!(!yes);
+            }
+            _ => panic!("expected KeysShred"),
+        }
+        let cmd_yes = parse(&["keys", "shred", "TENANT-1", "--yes"]).unwrap();
+        match cmd_yes {
+            Command::KeysShred { tenant_id, yes } => {
+                assert_eq!(tenant_id, "TENANT-1");
+                assert!(yes);
+            }
+            _ => panic!("expected KeysShred with --yes"),
+        }
+        assert!(parse(&["keys", "shred"]).is_err());
+    }
+
+    // --- D5: audit query supports --local-only -------------------------
+
+    #[test]
+    fn audit_query_defaults_to_cluster_aggregation() {
+        let cmd = parse(&["audit", "query"]).unwrap();
+        match cmd {
+            Command::AuditQuery { local_only, .. } => assert!(!local_only),
+            _ => panic!("expected AuditQuery"),
+        }
+    }
+
+    #[test]
+    fn audit_query_local_only_opts_out_of_aggregation() {
+        let cmd = parse(&["audit", "query", "--local-only"]).unwrap();
+        match cmd {
+            Command::AuditQuery { local_only, .. } => assert!(local_only),
+            _ => panic!("expected AuditQuery"),
+        }
+    }
+
+    #[test]
+    fn audit_query_local_only_works_with_filters() {
+        let cmd = parse(&[
+            "audit",
+            "query",
+            "--tenant",
+            "00000000-0000-0000-0000-000000000001",
+            "--limit",
+            "10",
+            "--local-only",
+        ])
+        .unwrap();
+        match cmd {
+            Command::AuditQuery {
+                tenant,
+                limit,
+                local_only,
+                ..
+            } => {
+                assert_eq!(
+                    tenant.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000001")
+                );
+                assert_eq!(limit, Some(10));
+                assert!(local_only);
+            }
+            _ => panic!("expected AuditQuery"),
+        }
+    }
+}

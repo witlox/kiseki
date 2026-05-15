@@ -933,4 +933,45 @@ mod tests {
         let body = r#"{"node_id": 42, "other": "x"}"#;
         assert_eq!(json_u64(body, "node_id"), Some(42));
     }
+
+    // --- D6: SAN identity is surfaced in whoami when the server reports it ---
+
+    #[test]
+    fn whoami_san_from_body_preferred_over_env() {
+        // `/admin/whoami` response. When `san` is present, the CLI MUST
+        // print it as the authenticated principal. The env fallback
+        // only fires when the server didn't report one.
+        let body = r#"{"node_id": 1, "san": "spiffe://kiseki/tenant/acme/wl/trainer", "tenant_id": "acme", "workload_id": "trainer"}"#;
+        let rendered = format_whoami(body, "http://localhost:9090", Some("env-fallback"));
+        assert!(
+            rendered.contains("spiffe://kiseki/tenant/acme/wl/trainer"),
+            "SAN principal missing from output: {rendered}"
+        );
+        assert!(rendered.contains("acme"), "tenant missing: {rendered}");
+        assert!(rendered.contains("trainer"), "workload missing: {rendered}");
+    }
+
+    #[test]
+    fn whoami_falls_back_to_env_when_san_absent() {
+        let body = r#"{"node_id": 7}"#;
+        let rendered = format_whoami(body, "http://localhost:9090", Some("env-fallback"));
+        assert!(
+            rendered.contains("env-fallback"),
+            "env tenant fallback missing: {rendered}"
+        );
+        // We should signal that no mTLS SAN was negotiated.
+        assert!(
+            rendered.contains("none") || rendered.contains("not authenticated") || rendered.contains("(no SAN)"),
+            "absent-SAN marker missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn whoami_handles_no_env_fallback() {
+        let body = r#"{"node_id": 7}"#;
+        let rendered = format_whoami(body, "http://localhost:9090", None);
+        // Tolerant of either explicit `unknown` or empty: just check
+        // the helper doesn't panic and emits node info.
+        assert!(rendered.contains("node 7"), "node line missing: {rendered}");
+    }
 }

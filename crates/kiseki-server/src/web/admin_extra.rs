@@ -1160,4 +1160,55 @@ mod tests {
         assert_eq!(s.chars().count(), 13);
         assert!(s.ends_with('…'));
     }
+
+    // --- D2: per-device pool gauges show up in /admin/pools shape -----
+
+    #[test]
+    fn parse_device_gauge_with_pool_and_kind_labels() {
+        let text = "# HELP kiseki_pool_device_capacity_bytes Per-device capacity\n\
+                    # TYPE kiseki_pool_device_capacity_bytes gauge\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"total\"} 1000\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"used\"} 400\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"free\"} 600\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"warm\",device_id=\"d-2\",kind=\"total\"} 5000\n";
+        let rows = parse_gauge_with_labels(
+            text,
+            "kiseki_pool_device_capacity_bytes",
+            &["pool", "device_id", "kind"],
+        );
+        assert_eq!(rows.len(), 4, "expected 4 sample rows, got {}", rows.len());
+        let hot_d1_total = rows
+            .iter()
+            .find(|s| {
+                s.labels.get("pool").map(String::as_str) == Some("hot")
+                    && s.labels.get("device_id").map(String::as_str) == Some("d-1")
+                    && s.labels.get("kind").map(String::as_str) == Some("total")
+            })
+            .expect("hot/d-1/total row");
+        assert!((hot_d1_total.value - 1000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_per_device_pool_rows_groups_by_device() {
+        let text = "kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"total\"} 1000\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"used\"} 400\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"free\"} 600\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-2\",kind=\"total\"} 2000\n";
+        let rows = build_per_device_rows(text);
+        assert_eq!(rows.len(), 2, "expected 2 device rows, got {}", rows.len());
+        let d1 = rows
+            .iter()
+            .find(|r| r.device_id == "d-1")
+            .expect("d-1 row");
+        assert_eq!(d1.pool, "hot");
+        assert_eq!(d1.total_bytes, 1000);
+        assert_eq!(d1.used_bytes, 400);
+        assert_eq!(d1.free_bytes, 600);
+        let d2 = rows.iter().find(|r| r.device_id == "d-2").expect("d-2 row");
+        assert_eq!(d2.total_bytes, 2000);
+        // Missing `used`/`free` rows default to 0; free derives from
+        // total - used when missing.
+        assert_eq!(d2.used_bytes, 0);
+        assert_eq!(d2.free_bytes, 2000);
+    }
 }
