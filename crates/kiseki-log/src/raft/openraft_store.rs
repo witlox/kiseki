@@ -114,6 +114,35 @@ impl InlineRateMeter {
     }
 }
 
+/// Map an openraft `client_write` error into either
+/// [`LogError::ForwardToLeader`] (with the leader node id surfaced),
+/// [`LogError::LeaderUnavailable`] (no known leader), or
+/// [`LogError::Unavailable`] (any other Raft-side failure).
+///
+/// Used by the `*_with_forwarding`-suffix methods on
+/// [`OpenRaftLogStore`] to preserve the openraft `ForwardToLeader`
+/// hint for ADR-044 server-side proxy / ADR-008 rev 2 client-side
+/// hint paths. The legacy methods (`append_delta` and siblings)
+/// collapse `ForwardToLeader` onto `LeaderUnavailable` for
+/// backwards compatibility.
+fn map_raft_error_with_forwarding(
+    err: openraft::errors::RaftError<C, openraft::error::ClientWriteError<C>>,
+    shard_id: ShardId,
+) -> LogError {
+    use openraft::error::ClientWriteError;
+    use openraft::errors::RaftError;
+    match err {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(hint)) => match hint.leader_id {
+            Some(leader_u64) => LogError::ForwardToLeader {
+                shard_id,
+                leader_node_id: kiseki_common::ids::NodeId(leader_u64),
+            },
+            None => LogError::LeaderUnavailable(shard_id),
+        },
+        _ => LogError::Unavailable,
+    }
+}
+
 fn op_to_u8(op: crate::delta::OperationType) -> u8 {
     match op {
         crate::delta::OperationType::Create => 0,
@@ -313,6 +342,69 @@ impl OpenRaftLogStore {
                 LogError::Unavailable
             }
         })?;
+
+        match resp.response() {
+            LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
+        }
+    }
+
+    /// Append a delta through Raft consensus, surfacing the
+    /// openraft `ForwardToLeader` hint to the caller (ADR-044).
+    ///
+    /// Identical to [`Self::append_delta`] in success behavior, but
+    /// the error mapping is different:
+    ///
+    /// | openraft outcome                                                  | this method            | [`Self::append_delta`] |
+    /// |---|---|---|
+    /// | `Ok(_)`                                                           | `Ok(seq)`              | `Ok(seq)`              |
+    /// | `ClientWriteError::ForwardToLeader(hint)` with `Some(leader_id)`  | `Err(ForwardToLeader)` | `Err(LeaderUnavailable)` |
+    /// | `ClientWriteError::ForwardToLeader(hint)` with `None`             | `Err(LeaderUnavailable)` | `Err(LeaderUnavailable)` |
+    /// | Other Raft errors                                                 | `Err(Unavailable)`     | `Err(Unavailable)`     |
+    ///
+    /// Callers that opt into the forwarding hint (the native gRPC
+    /// server with `KISEKI_NATIVE_PROXY_FALLBACK=on`; the S3
+    /// gateway's 307-redirect path; the native client's
+    /// topology-cache refresh path) use this method. Existing
+    /// callers that don't yet handle `ForwardToLeader` keep using
+    /// [`Self::append_delta`] and observe no behavior change.
+    ///
+    /// # Errors
+    /// - [`LogError::MaintenanceMode`] if the shard is in maintenance.
+    /// - [`LogError::ForwardToLeader`] if the local replica is a
+    ///   follower and openraft knows the leader id.
+    /// - [`LogError::LeaderUnavailable`] if no leader is currently known.
+    /// - [`LogError::Unavailable`] for any other Raft-side write
+    ///   failure.
+    pub async fn append_delta_with_forwarding(
+        &self,
+        req: AppendDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        // Pre-check state. Mirror of `append_delta` — kept inline
+        // rather than refactored into a shared helper so the two
+        // methods stay easy to compare diff-side-by-side during
+        // ADR-044 review.
+        {
+            let inner = self.state.lock().await;
+            if inner.maintenance {
+                return Err(LogError::MaintenanceMode(self.shard_id));
+            }
+        }
+
+        let cmd = LogCommand::AppendDelta {
+            tenant_id_bytes: *req.tenant_id.0.as_bytes(),
+            operation: op_to_u8(req.operation),
+            hashed_key: req.hashed_key,
+            chunk_refs: req.chunk_refs.iter().map(|c| c.0).collect(),
+            payload: req.payload,
+            has_inline_data: req.has_inline_data,
+        };
+
+        let resp = self
+            .raft
+            .client_write(cmd)
+            .await
+            .map_err(|e| map_raft_error_with_forwarding(e, self.shard_id))?;
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),

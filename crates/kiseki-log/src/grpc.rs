@@ -34,6 +34,7 @@ fn to_status(e: &LogError) -> Status {
         LogError::MaintenanceMode(_) => Status::failed_precondition(e.to_string()),
         LogError::ShardSplitting(_)
         | LogError::LeaderUnavailable(_)
+        | LogError::ForwardToLeader { .. }
         | LogError::QuorumLost(_)
         | LogError::ShardBusy { .. }
         | LogError::Unavailable => Status::unavailable(e.to_string()),
