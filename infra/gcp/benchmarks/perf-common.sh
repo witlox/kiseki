@@ -14,8 +14,13 @@ set -o pipefail
 # Env load + derived globals
 # ----------------------------------------------------------------------------
 
-source /etc/kiseki-bench.env 2>/dev/null || {
-  echo "ERROR: /etc/kiseki-bench.env missing — was this script run from bench-ctrl?" >&2
+# Env file path is overridable for local unit tests (see
+# tests/test_pick_helpers.sh). On the bench-ctrl VM the default
+# /etc/kiseki-bench.env is what setup-bench-ctrl.sh writes.
+KISEKI_BENCH_ENV="${KISEKI_BENCH_ENV:-/etc/kiseki-bench.env}"
+# shellcheck disable=SC1090
+source "$KISEKI_BENCH_ENV" 2>/dev/null || {
+  echo "ERROR: $KISEKI_BENCH_ENV missing — was this script run from bench-ctrl?" >&2
   exit 1
 }
 
@@ -23,6 +28,8 @@ source /etc/kiseki-bench.env 2>/dev/null || {
 ALL_STORAGE=$(echo "$STORAGE_IPS" | tr ',' ' ')
 CLIENTS_WS=$(echo "$CLIENT_IPS" | tr ',' ' ')
 read -r -a CLIENT_ARRAY <<< "$CLIENTS_WS"
+# Array form for round-robin fan-out — see pick_storage_for_client.
+read -r -a STORAGE_IPS_ARRAY <<< "$ALL_STORAGE"
 
 PAR=${KISEKI_BENCH_PAR:-8}
 GCS_BUCKET="${KISEKI_PERF_BUCKET:-gs://kiseki-perf-results}"
@@ -49,6 +56,32 @@ node_ssh() {
   # scripts that contain single quotes (python -c '...').
   ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $SSH_KEY \
     "$SSH_USER@$host" "sudo bash -s" <<< "$*"
+}
+
+# ----------------------------------------------------------------------------
+# Write fan-out helpers — spread bench load across the storage IPs and
+# bench-managed namespaces (Step B of the write-routing posture plan;
+# see specs/implementation/write-routing-posture.md).
+#
+# Today's perf-suite phase 9 funnels every PUT to $LEADER_S3, which
+# masks ADR-033 §1's per-shard leader spread. The two helpers below
+# let phase 9 (and the new phase 9b) round-robin clients across
+# different ingest gateways and different namespaces — the two
+# effects compound: different namespace = different shard set =
+# different shard leaders; different node = different gateway
+# process (S3-server -> chunk-store -> per-shard Raft client).
+# ----------------------------------------------------------------------------
+
+pick_storage_for_client() {
+  local idx=$1
+  local n=${#STORAGE_IPS_ARRAY[@]}
+  echo "${STORAGE_IPS_ARRAY[$((idx % n))]}"
+}
+
+pick_namespace_for_client() {
+  local idx=$1
+  local n=${#STORAGE_IPS_ARRAY[@]}
+  echo "perf-agg-ns$((idx % n))"
 }
 
 # ----------------------------------------------------------------------------
