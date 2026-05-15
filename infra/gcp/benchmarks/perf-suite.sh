@@ -288,17 +288,33 @@ node_ssh "$FIRST_CLIENT" "
 " 2>/dev/null | tee -a "$RESULTS/s3-read.txt"
 
 # ---------------------------------------------------------------------------
-# 9. S3 parallel write (3 clients, aggregate)
+# 9. S3 parallel write — single namespace, fan-out across storage gateways
 # ---------------------------------------------------------------------------
+# Step B of the write-routing posture plan: phase 9 previously aimed every
+# client at $LEADER_S3, so the 2026-05-15 GCP compact run showed
+# gateway_requests=1863/0/0 across the three nodes (single-leader
+# bottleneck masking ADR-033 §1's per-shard leader spread). Now each
+# client posts to a different storage node's S3 gateway; the gateway
+# routes to the shard-owning Raft leader, so writes still serialize
+# at each shard's leader, but the *bucket-into-shards* spread lets
+# multiple shard leaders ingest in parallel. Same single namespace,
+# same total payload — only the ingest gateway changes.
 log ""
-log "=== 9. S3 Parallel Write (3 clients → leader, aggregate throughput) ==="
+log "=== 9. S3 Parallel Write — single namespace, fan-out ingest gateways ==="
 log "  3 clients × 100 × 1MB = 300 MB total, ${PAR} concurrent per client"
+log "  client[i] -> S3 gateway on STORAGE_IPS_ARRAY[i % N] (round-robin)"
+for idx in 0 1 2; do
+  ING_IP=$(pick_storage_for_client "$idx")
+  log "  client-$((idx+1)) (${CLIENT_ARRAY[$idx]}) -> ingest http://${ING_IP}:9000"
+done
 AGG_START=$(date +%s%N)
 PIDS=""
 for idx in 0 1 2; do
   CIP="${CLIENT_ARRAY[$idx]}"
+  ING_IP=$(pick_storage_for_client "$idx")
+  ING_EP="http://${ING_IP}:9000"
   node_ssh "$CIP" "
-    EP='$LEADER_S3'
+    EP='$ING_EP'
     curl -sf -X PUT \"\$EP/perf-agg\" >/dev/null 2>&1 || true
     for i in \$(seq 1 100); do
       dd if=/dev/urandom bs=1M count=1 2>/dev/null | \
@@ -316,14 +332,89 @@ AGG_MBPS=$(python3 -c "print(f'{300 * 1000 / $AGG_MS:.1f}')" 2>/dev/null || echo
 log "  Aggregate: 300 MB in ${AGG_MS}ms — ${AGG_MBPS} MB/s" | tee -a "$RESULTS/s3-parallel-write.txt"
 
 # ---------------------------------------------------------------------------
-# 10. Prometheus metrics snapshot
+# 9b. S3 parallel write — per-client namespace + per-client ingest gateway
 # ---------------------------------------------------------------------------
+# Compounds two effects on top of phase 9:
+#   (a) different namespace => different shard set (and almost certainly
+#       different shard leaders, since each namespace creates its own
+#       3xN shards via ADR-033 §1).
+#   (b) different ingest gateway => different S3-server -> chunk-store
+#       -> per-shard-Raft-client pipeline.
+# Where phase 9 still shares ONE namespace (so one initial-shard-map
+# spread) across all three clients, phase 9b gives each client its own
+# namespace AND its own gateway. The acceptance criterion is "gateway
+# requests > 0 on all three nodes with max/min ratio <= 4:1" per the
+# plan.
+log ""
+log "=== 9b. S3 Parallel Write — per-client namespace + ingest fan-out ==="
+log "  3 clients × 100 × 1MB = 300 MB total, ${PAR} concurrent per client"
+log "  client[i] -> namespace perf-agg-ns(i%N) on STORAGE_IPS_ARRAY[i % N]"
+for idx in 0 1 2; do
+  ING_IP=$(pick_storage_for_client "$idx")
+  NS=$(pick_namespace_for_client "$idx")
+  log "  client-$((idx+1)) (${CLIENT_ARRAY[$idx]}) -> http://${ING_IP}:9000/${NS}"
+done
+AGG_START=$(date +%s%N)
+PIDS=""
+for idx in 0 1 2; do
+  CIP="${CLIENT_ARRAY[$idx]}"
+  ING_IP=$(pick_storage_for_client "$idx")
+  ING_EP="http://${ING_IP}:9000"
+  NS=$(pick_namespace_for_client "$idx")
+  node_ssh "$CIP" "
+    EP='$ING_EP'
+    NS='$NS'
+    # Create the per-client namespace (PUT /<bucket>). Idempotent on
+    # the S3 gateway. If creation fails the subsequent object PUTs
+    # will 404 with NoSuchBucket (see s3-api.feature comment block).
+    curl -sf -X PUT \"\$EP/\$NS\" >/dev/null 2>&1 || true
+    for i in \$(seq 1 100); do
+      dd if=/dev/urandom bs=1M count=1 2>/dev/null | \
+        curl -sf -X PUT \"\$EP/\$NS/c${idx}-\$i\" --data-binary @- >/dev/null &
+      [ \$((i % $PAR)) -eq 0 ] && wait
+    done
+    wait
+  " 2>/dev/null &
+  PIDS="$PIDS $!"
+done
+for pid in $PIDS; do wait $pid 2>/dev/null || true; done
+AGG_END=$(date +%s%N)
+AGG_MS=$(( (AGG_END - AGG_START) / 1000000 ))
+AGG_MBPS=$(python3 -c "print(f'{300 * 1000 / $AGG_MS:.1f}')" 2>/dev/null || echo "N/A")
+log "  Aggregate: 300 MB in ${AGG_MS}ms — ${AGG_MBPS} MB/s (per-ns + per-gw fan-out)" \
+  | tee -a "$RESULTS/s3-parallel-write.txt"
+
+# ---------------------------------------------------------------------------
+# 10. Prometheus metrics snapshot — acceptance check for Step B fan-out
+# ---------------------------------------------------------------------------
+# Acceptance criterion (specs/implementation/write-routing-posture.md
+# Step B): every storage node shows gateway_requests > 0 with the
+# max:min ratio no worse than 4:1. Pre-Step-B baseline (2026-05-15) was
+# 1863 / 0 / 0 — infinitely lopsided. Post-Step-B should land each
+# node in the same order of magnitude.
 log ""
 log "=== 10. Prometheus Metrics Snapshot ==="
+MAX_REQS=0
+MIN_REQS=""
 for ip in $ALL_STORAGE; do
   REQS=$(curl -sf "http://$ip:9090/metrics" 2>/dev/null | grep "kiseki_gateway_requests_total" | awk '{sum+=$2} END{print sum+0}')
   log "  $ip: gateway_requests=$REQS" | tee -a "$RESULTS/metrics-snapshot.txt"
+  [ "$REQS" -gt "$MAX_REQS" ] && MAX_REQS=$REQS
+  if [ -z "$MIN_REQS" ] || [ "$REQS" -lt "$MIN_REQS" ]; then MIN_REQS=$REQS; fi
 done
+# Fan-out verdict — log only, never exit non-zero (the suite is for
+# measurement, not gating). Operators read this line to decide whether
+# the run is comparable to prior phase-9 runs.
+if [ "$MIN_REQS" -gt 0 ]; then
+  RATIO=$(python3 -c "print(f'{$MAX_REQS / $MIN_REQS:.2f}')" 2>/dev/null || echo "N/A")
+  if python3 -c "import sys; sys.exit(0 if $MAX_REQS / $MIN_REQS <= 4.0 else 1)" 2>/dev/null; then
+    log "  Fan-out OK: max/min = ${RATIO} (<= 4.0 target)" | tee -a "$RESULTS/metrics-snapshot.txt"
+  else
+    log "  Fan-out SKEWED: max/min = ${RATIO} (> 4.0 target — investigate)" | tee -a "$RESULTS/metrics-snapshot.txt"
+  fi
+else
+  log "  Fan-out FAIL: at least one storage node has gateway_requests=0" | tee -a "$RESULTS/metrics-snapshot.txt"
+fi
 
 log ""
 log "╔═══════════════════════════════════════════════════════════════╗"
