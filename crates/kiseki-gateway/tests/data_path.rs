@@ -376,7 +376,7 @@ mod nfs_tests {
         ctx.write_named("gone.txt", b"bye".to_vec()).await.unwrap();
         assert!(ctx.lookup_by_name("gone.txt").await.is_some());
 
-        ctx.remove_file("gone.txt").unwrap();
+        ctx.remove_file("gone.txt").await.unwrap();
         assert!(ctx.lookup_by_name("gone.txt").await.is_none());
     }
 
@@ -462,5 +462,52 @@ mod nfs_tests {
         assert!(ctx.getattr(&bogus_fh).await.is_err());
         assert!(ctx.read(&bogus_fh, 0, 100).await.is_err());
         assert!(ctx.access(&bogus_fh).is_err());
+    }
+
+    /// GH #36 — NFS REMOVE must reclaim the composition + decrement
+    /// chunk refcounts. The pre-fix path called only
+    /// `DirectoryIndex::remove`, leaving the composition (and its
+    /// chunks) live in the gateway's `CompositionStore` forever.
+    ///
+    /// Symptom on the GCP 2026-05-15 perf cluster: ~200 GB of
+    /// cumulative fio writes filled every node's chunk store despite
+    /// `rm -rf` on the NFS mount between runs — the unlinks were no-
+    /// ops at the chunk-store level, so the bitmap allocator's free
+    /// list bled out until `largest_free_blocks=64` (256 KiB) and
+    /// `device full` started rejecting every write.
+    ///
+    /// Contract: after `remove_file(name)`, the gateway's underlying
+    /// `CompositionStore` MUST no longer hold the composition that
+    /// `write_named(name, …)` minted. Otherwise the chunk
+    /// `decrement_refcount` path never fires and GC has nothing to
+    /// reclaim even when (and if) it eventually runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nfs_remove_drops_composition_for_gc() {
+        let gw = setup_gateway();
+        let comps = gw.compositions_handle();
+        let nfs_gw = NfsGateway::new(Arc::new(gw));
+        let ctx = NfsContext::new(nfs_gw, test_tenant(), test_namespace());
+
+        // Write a named file — mints a fresh composition.
+        ctx.write_named("doomed.dat", b"GC me please".to_vec())
+            .await
+            .unwrap();
+        let before = comps.count().unwrap();
+        assert_eq!(
+            before, 1,
+            "write_named must mint a composition (got {before})",
+        );
+
+        // NFS REMOVE: deletes the dir entry. Pre-fix it stopped there;
+        // post-fix it must also call the gateway's delete path so the
+        // composition is removed and chunk refcounts decremented.
+        ctx.remove_file("doomed.dat").await.unwrap();
+
+        let after = comps.count().unwrap();
+        assert_eq!(
+            after, 0,
+            "NFS REMOVE must drop the composition so chunks can be \
+             garbage-collected (got {after} compositions, expected 0)",
+        );
     }
 }

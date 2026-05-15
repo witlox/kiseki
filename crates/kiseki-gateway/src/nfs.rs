@@ -120,4 +120,19 @@ impl<G: GatewayOps> NfsGateway<G> {
     ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
         self.inner.list(tenant_id, namespace_id).await
     }
+
+    /// GH #36: NFS REMOVE delegates here so the composition is
+    /// actually deleted and chunk refcounts decremented. Pre-fix the
+    /// NFS path only dropped the dir-index binding, leaving every
+    /// composition (and its chunks) live in the chunk store forever.
+    pub async fn delete(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+        composition_id: kiseki_common::ids::CompositionId,
+    ) -> Result<(), GatewayError> {
+        self.inner
+            .delete(tenant_id, namespace_id, composition_id)
+            .await
+    }
 }

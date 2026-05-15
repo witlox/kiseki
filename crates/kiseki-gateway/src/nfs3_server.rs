@@ -431,7 +431,7 @@ async fn reply_remove<G: GatewayOps>(
     let _dir_fh = reader.read_opaque().unwrap_or_default();
     let name = reader.read_string().unwrap_or_default();
 
-    match ctx.remove_file(&name) {
+    match ctx.remove_file(&name).await {
         Ok(()) => {
             w.write_u32(status::NFS3_OK);
             w.write_bool(false); // pre wcc

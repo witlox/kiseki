@@ -2056,7 +2056,7 @@ async fn op_remove<G: GatewayOps>(
     let mut w = XdrWriter::new();
     w.write_u32(op::REMOVE);
 
-    let status = match ctx.remove_file(&name) {
+    let status = match ctx.remove_file(&name).await {
         Ok(()) => {
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_bool(false); // cinfo
