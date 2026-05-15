@@ -476,59 +476,85 @@ impl ServerImpl {
         } else {
             Some(req.name.clone())
         };
-        let bytes = req.data;
-        // I-NG5: preserve the client's idempotency_key on the internal
-        // WriteRequest so the wire-level proxy hop can re-issue it
-        // byte-for-byte against the leader (ADR-042 §6 dedup table).
-        let wreq = WriteRequest {
-            tenant_id: tenant,
-            namespace_id: ns,
-            data: bytes,
-            name,
-            conditional,
-            workflow_ref,
-            idempotency_key: Some(cf.idempotency_key.clone()),
-        };
         // ADR-042 §4 — when the proxy fallback is enabled, route writes
         // through `write_with_forwarding` so we can observe a
         // `GatewayError::ForwardToLeader` hint and proxy to the
-        // leader. Otherwise the legacy `write` path is unchanged.
+        // leader. The wire-level re-issue (this commit) preserves the
+        // ORIGINAL inbound request shape so `ControlFields` (including
+        // `idempotency_key`) crosses to the leader byte-for-byte; the
+        // proxy hop stamps `forwarded_from_node` so the leader's audit
+        // log records BOTH origin tenant AND proxying node (audit
+        // I-NG1 / finding §M2). Otherwise the legacy `write` path is
+        // unchanged.
         let resp = if self.is_proxy_fallback_enabled() {
+            // Keep the original request around in case we proxy. We
+            // can't reuse `req` after consuming it into WriteRequest
+            // below, so clone the bits we need now. Cloning the full
+            // PutObjectRequest is acceptable on the proxy *fallback*
+            // path (< 5 % of writes per ADR-042 §4 "Consequences");
+            // the steady-state direct-dial path doesn't enter this
+            // branch.
+            let original_proxy_req = req.clone();
+            // I-NG5: preserve the client's idempotency_key on the
+            // internal WriteRequest so a single-leader backend
+            // (which doesn't re-issue) still dedups correctly.
+            // I-NG1 / finding §M2: forward `forwarded_from_node` so
+            // the leader (or single-leader backend) records both the
+            // originating tenant AND the proxying node in audit.
+            let wreq = WriteRequest {
+                tenant_id: tenant,
+                namespace_id: ns,
+                data: req.data,
+                name,
+                conditional,
+                workflow_ref,
+                idempotency_key: Some(cf.idempotency_key.clone()),
+                forwarded_from_node: cf.forwarded_from_node,
+            };
             match self.ops.write_with_forwarding(wreq).await {
                 Ok(r) => r,
                 Err(GatewayError::ForwardToLeader {
                     shard_id,
                     leader_node_id,
                 }) => {
-                    // Proxy plumbing is wired (commits 5501d9f +
-                    // this commit). The actual gateway→gateway
-                    // request re-issue is deferred to a follow-up
-                    // implementer commit — the wire-level proxy
-                    // dial needs the original PutObjectRequest
-                    // re-built from `wreq` plus the original
-                    // `ControlFields` and the `kiseki-proxy-hop-count`
-                    // metadata. For now, the gate-1 defenses fire
-                    // (self-forward / hop-cap / leader-known)
-                    // and the call surfaces as Status::unavailable
-                    // with a structured leader hint so the client's
-                    // Step C topology-cache path can route around it.
                     if let Some(pc) = self.proxy_client() {
-                        match pc.validate_forward(leader_node_id, /* hop */ 0) {
-                            Ok(addr) => {
-                                tracing::warn!(
+                        // Wire-level re-issue: dial the leader's
+                        // GatewayDataService::put_object and return
+                        // the leader's response unchanged. The hop
+                        // count starts at the value carried by the
+                        // INCOMING request's metadata (a chain of
+                        // forwards bumps it; clients start at 0).
+                        // ServerImpl doesn't see tonic::Request, so
+                        // hop_count detection from the inbound
+                        // metadata is a follow-up — for now start
+                        // every server-initiated forward at hop 0,
+                        // which is the most defensive interpretation
+                        // (the gate-1 cap fires after MAX_PROXY_HOPS
+                        // server-initiated forwards). A client-side
+                        // adapter that tracks incoming hop count
+                        // would replace this `0` with the real value.
+                        match pc
+                            .forward_put_object(leader_node_id, 0, original_proxy_req)
+                            .await
+                        {
+                            Ok(leader_resp) => {
+                                tracing::debug!(
                                     shard_id = %shard_id.0,
                                     leader_node_id = leader_node_id.0,
-                                    leader_addr = %addr,
-                                    "ADR-042 §4 proxy fallback: forward gate validated, wire-level dial pending follow-up",
+                                    "ADR-042 §4 proxy fallback: wire-level re-issue succeeded",
                                 );
+                                return Ok(leader_resp);
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     shard_id = %shard_id.0,
                                     leader_node_id = leader_node_id.0,
                                     error = %e,
-                                    "ADR-042 §4 proxy fallback: validate_forward rejected",
+                                    "ADR-042 §4 proxy fallback: wire-level re-issue failed",
                                 );
+                                return Err(Status::unavailable(format!(
+                                    "proxy forward to leader failed: shard={shard_id:?} leader={leader_node_id:?} error={e}",
+                                )));
                             }
                         }
                     }
@@ -539,6 +565,16 @@ impl ServerImpl {
                 Err(e) => return Err(map_gateway_error(e)),
             }
         } else {
+            let wreq = WriteRequest {
+                tenant_id: tenant,
+                namespace_id: ns,
+                data: req.data,
+                name,
+                conditional,
+                workflow_ref,
+                idempotency_key: Some(cf.idempotency_key.clone()),
+                forwarded_from_node: cf.forwarded_from_node,
+            };
             self.ops.write(wreq).await.map_err(map_gateway_error)?
         };
         Ok(np::PutObjectResponse {

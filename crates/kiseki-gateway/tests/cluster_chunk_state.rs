@@ -207,6 +207,8 @@ async fn fresh_chunk_write_emits_chunk_and_delta_proposal() {
         conditional: None,
         workflow_ref: None,
         idempotency_key: None,
+
+        forwarded_from_node: None,
     })
     .await
     .expect("write");
@@ -261,6 +263,8 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         conditional: None,
         workflow_ref: None,
         idempotency_key: None,
+
+        forwarded_from_node: None,
     })
     .await
     .expect("write 1");
@@ -274,6 +278,8 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         conditional: None,
         workflow_ref: None,
         idempotency_key: None,
+
+        forwarded_from_node: None,
     })
     .await
     .expect("write 2");
@@ -321,6 +327,8 @@ async fn fresh_chunk_write_carries_configured_placement() {
         conditional: None,
         workflow_ref: None,
         idempotency_key: None,
+
+        forwarded_from_node: None,
     })
     .await
     .expect("write");
@@ -356,6 +364,8 @@ async fn placement_is_capped_at_target_copies_when_cluster_is_larger() {
         conditional: None,
         workflow_ref: None,
         idempotency_key: None,
+
+        forwarded_from_node: None,
     })
     .await
     .expect("write");
@@ -393,6 +403,8 @@ async fn single_node_gateway_emits_empty_placement() {
         conditional: None,
         workflow_ref: None,
         idempotency_key: None,
+
+        forwarded_from_node: None,
     })
     .await
     .expect("write");
@@ -427,6 +439,8 @@ async fn composition_delete_emits_decrement_for_each_chunk() {
             conditional: None,
             workflow_ref: None,
             idempotency_key: None,
+
+            forwarded_from_node: None,
         })
         .await
         .expect("write");
@@ -553,6 +567,8 @@ async fn tombstone_decrement_triggers_delete_distributed() {
             conditional: None,
             workflow_ref: None,
             idempotency_key: None,
+
+            forwarded_from_node: None,
         })
         .await
         .expect("write");
@@ -595,6 +611,8 @@ async fn non_tombstone_decrement_does_not_fan_out() {
             conditional: None,
             workflow_ref: None,
             idempotency_key: None,
+
+            forwarded_from_node: None,
         })
         .await
         .expect("write");

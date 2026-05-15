@@ -132,6 +132,8 @@ impl Driver for S3Driver {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+
+                forwarded_from_node: None,
             })
             .await
             .map_err(|e| format!("s3 put: {e}"))?;
@@ -190,6 +192,8 @@ impl Driver for Nfs3Driver {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+
+                forwarded_from_node: None,
             })
             .await
             .map_err(|e| format!("nfs3 put: {e}"))?;
@@ -248,6 +252,8 @@ impl Driver for Nfs4Driver {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+
+                forwarded_from_node: None,
             })
             .await
             .map_err(|e| format!("nfs4 put: {e}"))?;
@@ -569,6 +575,8 @@ impl Driver for PnfsDriver {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+
+                forwarded_from_node: None,
             })
             .await
             .map_err(|e| format!("pnfs put: {e}"))?;
@@ -704,6 +712,8 @@ impl Driver for FuseDriver {
                 conditional: req.conditional,
                 workflow_ref: req.workflow_ref,
                 idempotency_key: None,
+
+                forwarded_from_node: None,
             })
             .await
             .map_err(|e| format!("fuse gateway write: {e}"))?;
@@ -987,6 +997,8 @@ impl Driver for InProcessDriver {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+
+                forwarded_from_node: None,
             })
             .await
             .map_err(|e| format!("in-process put: {e}"))?;
@@ -1295,6 +1307,8 @@ impl Driver for InProcessPersistentDriver {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+
+                forwarded_from_node: None,
             })
             .await
             .map_err(|e| format!("in-process-persistent put: {e}"))?;

@@ -2686,6 +2686,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .expect("write must succeed");
@@ -2731,6 +2732,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .unwrap();
@@ -2778,6 +2780,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .unwrap();
@@ -2824,6 +2827,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .unwrap();
@@ -2863,6 +2867,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .unwrap();
@@ -2908,6 +2913,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .unwrap();
@@ -2942,6 +2948,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .unwrap();
@@ -2975,6 +2982,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .unwrap();
@@ -3008,6 +3016,7 @@ mod chunking_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .unwrap();
@@ -3087,6 +3096,7 @@ mod phase_duration_tests {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await
             .expect("write must succeed");

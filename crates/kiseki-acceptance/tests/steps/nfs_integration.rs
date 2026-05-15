@@ -356,6 +356,8 @@ async fn given_nfs_write_cross(w: &mut KisekiWorld, payload: String) {
             conditional: None,
             workflow_ref: None,
             idempotency_key: None,
+
+            forwarded_from_node: None,
         })
         .await
     {
@@ -456,6 +458,8 @@ async fn nfs3_write_helper(w: &mut KisekiWorld, data: Vec<u8>) {
             conditional: None,
             workflow_ref: None,
             idempotency_key: None,
+
+            forwarded_from_node: None,
         })
         .await
         .expect("NFSv3 write failed");

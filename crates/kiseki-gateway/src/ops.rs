@@ -73,6 +73,15 @@ pub struct WriteRequest {
     /// addressing token and the gateway's per-handle bookkeeping
     /// covers retries).
     pub idempotency_key: Option<Vec<u8>>,
+    /// Optional forwarding attribution (audit I-NG1 / finding §M2).
+    /// `Some(node_id)` when the request reached this gateway via the
+    /// ADR-042 §4 server-side proxy fallback — the value is the
+    /// `NodeId` of the proxying node. The leader's audit record for
+    /// this write MUST carry both the originating tenant (`tenant_id`)
+    /// AND `forwarded_from_node` so an audit reviewer can distinguish
+    /// a "client-direct" write from one routed via another gateway.
+    /// `None` for client-direct writes (no proxy hop).
+    pub forwarded_from_node: Option<u64>,
 }
 
 /// HTTP-derived conditional check applied to a `WriteRequest` against
@@ -433,8 +442,8 @@ mod tests {
             name: Some("k".into()),
             conditional: None,
             workflow_ref: None,
-            // RED: this field doesn't exist yet — adding it is the GREEN.
             idempotency_key: Some(vec![0xAB; 16]),
+            forwarded_from_node: None,
         };
         let cloned = req.clone();
         assert_eq!(
@@ -442,5 +451,26 @@ mod tests {
             Some(vec![0xAB; 16]),
             "idempotency_key MUST survive a clone so the proxy hop can re-issue it byte-for-byte"
         );
+    }
+
+    /// Audit I-NG1 / finding §M2: a proxy hop MUST surface
+    /// `forwarded_from_node` on the leader's internal `WriteRequest`
+    /// so the audit-record write attributes both originating tenant
+    /// AND forwarding node. Validates struct-level support; the
+    /// proto<->Rust thread is exercised by the wire-level test in
+    /// `tests/proxy_wire.rs`.
+    #[test]
+    fn write_request_carries_forwarded_from_node() {
+        let req = WriteRequest {
+            tenant_id: OrgId(uuid::Uuid::nil()),
+            namespace_id: NamespaceId(uuid::Uuid::nil()),
+            data: b"payload".to_vec(),
+            name: None,
+            conditional: None,
+            workflow_ref: None,
+            idempotency_key: Some(vec![1, 2, 3]),
+            forwarded_from_node: Some(7),
+        };
+        assert_eq!(req.clone().forwarded_from_node, Some(7));
     }
 }

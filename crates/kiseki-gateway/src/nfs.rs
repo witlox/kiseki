@@ -101,6 +101,7 @@ impl<G: GatewayOps> NfsGateway<G> {
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await?;
 

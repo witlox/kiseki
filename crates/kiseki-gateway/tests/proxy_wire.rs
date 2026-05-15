@@ -184,6 +184,12 @@ async fn proxy_put_object_wire_level_reissues_with_forwarded_from_node_and_idemp
         Some(idem.as_slice()),
         "I-NG5: idempotency_key MUST cross the proxy boundary byte-for-byte"
     );
+    assert_eq!(
+        observed.forwarded_from_node,
+        Some(follower_node_id.0),
+        "I-NG1 / finding §M2: leader MUST see `forwarded_from_node` stamped \
+         with the proxying node's id so audit attribution is preserved"
+    );
     drop(captured);
 
     // shut the leader down cleanly

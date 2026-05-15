@@ -247,6 +247,83 @@ impl ProxyClient {
             .map(|(k, v)| (*k, v.data_addr.clone()))
             .collect()
     }
+
+    /// ADR-042 §4 wire-level proxy `put_object` re-issue.
+    ///
+    /// Dial the leader's `GatewayDataService::put_object` and forward
+    /// the request **byte-for-byte** with two mutations:
+    ///
+    /// 1. `ControlFields.forwarded_from_node` is stamped with our own
+    ///    `self_node_id` (gate-1 finding M2 — leader's audit log sees
+    ///    BOTH the originating tenant AND the forwarding node).
+    /// 2. The request carries `kiseki-proxy-hop-count` metadata
+    ///    incremented from `incoming_hop_count`. The receiving node's
+    ///    [`Self::validate_forward`] enforces the [`MAX_PROXY_HOPS`]
+    ///    cap (gate-1 finding C-H4).
+    ///
+    /// The `ControlFields.idempotency_key` MUST already be set on the
+    /// outbound `req` — the caller (server.rs put_object handler)
+    /// preserves it from the original inbound request. I-NG5 holds
+    /// because we never construct a new key here; the leader's dedup
+    /// table sees the original.
+    ///
+    /// The leader's openraft `client_write().await` is what waits for
+    /// Raft commit — this call is a single `.await` on the upstream
+    /// RPC (gate-1 finding H1 — no `tokio::spawn`, no early-return,
+    /// no `tokio::time::timeout` shorter than the proposal timeout).
+    /// I-L2 holds end-to-end.
+    ///
+    /// # Errors
+    /// Returns `ProxyError::Transport` for tonic-level failures (no
+    /// connection, leader crashed mid-RPC). Returns the leader's
+    /// `Status` wrapped in `Transport` for application-level errors
+    /// (so the caller can surface them through `map_gateway_error`
+    /// or a `Status::aborted` for proxy-node-died-mid-proxy paths
+    /// — that scenario is covered by I-NG5 dedup on client retry).
+    pub async fn forward_put_object(
+        &self,
+        leader_node_id: NodeId,
+        incoming_hop_count: u8,
+        mut req: kiseki_proto::v1::native::PutObjectRequest,
+    ) -> Result<kiseki_proto::v1::native::PutObjectResponse, ProxyError> {
+        // Validate first — applies hop-cap, self-forward, leader-known
+        // defenses. Re-applies the cap so two concurrent forwards
+        // from the same node observe the same gate.
+        self.validate_forward(leader_node_id, incoming_hop_count)?;
+
+        // Stamp `forwarded_from_node` so the leader's audit log
+        // attributes both the originating tenant AND the proxy hop.
+        if let Some(cf) = req.control.as_mut() {
+            cf.forwarded_from_node = Some(self.self_node_id.0);
+        }
+
+        // Acquire / build the tonic channel.
+        let channel = self.acquire_channel(leader_node_id).await?;
+
+        // Build the typed gRPC client over the shared channel and
+        // wrap the request with the hop-count metadata. Bumping by
+        // 1 ensures the leader sees `hop_count = incoming + 1` and
+        // the gate-1 cap fires at MAX_PROXY_HOPS.
+        let next_hop = incoming_hop_count.saturating_add(1);
+        let mut grpc_client =
+            kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient::new(
+                channel,
+            );
+        let mut tonic_req = tonic::Request::new(req);
+        tonic_req.metadata_mut().insert(
+            PROXY_HOP_COUNT_HEADER,
+            next_hop
+                .to_string()
+                .parse()
+                .expect("u8 hop count is ASCII numeric — always valid metadata"),
+        );
+
+        let resp = grpc_client
+            .put_object(tonic_req)
+            .await
+            .map_err(|s| ProxyError::Transport(format!("leader returned {s}")))?;
+        Ok(resp.into_inner())
+    }
 }
 
 #[cfg(test)]

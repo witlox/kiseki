@@ -135,6 +135,7 @@ impl<G: GatewayOps> S3Gateway<G> {
                 // clients dedup via PutObject's natural overwrite +
                 // ETag semantics, not the per-tenant dedup table.
                 idempotency_key: None,
+                forwarded_from_node: None,
             })
             .await?;
 
