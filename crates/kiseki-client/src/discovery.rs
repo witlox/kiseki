@@ -2,6 +2,12 @@
 //!
 //! Native clients discover shards, views, and gateways via seed
 //! endpoints on the data fabric. No control plane connectivity required.
+//!
+//! ADR-008 rev 2 — the bootstrap discovery response carries a
+//! per-shard leader map projected from the control-plane
+//! `NamespaceShardMap` (ADR-033 §4). Clients hydrate their
+//! `TopologyCache` from this map on first connect, then refresh via
+//! gRPC `GetTopology` (ADR-042 §4) once a data channel is dialled.
 
 use std::net::SocketAddr;
 
@@ -30,8 +36,21 @@ pub struct DiscoveryResponse {
 pub struct ShardEndpoint {
     /// Shard identifier (opaque string from discovery).
     pub shard_id: String,
-    /// Leader node address.
+    /// Owning namespace (ADR-008 rev 2). Empty for rev-1 stubs.
+    pub namespace_id: String,
+    /// Leader's `NodeId`. `None` when the responding node has not yet
+    /// observed a leader (cold start, mid-election).
+    pub leader_node_id: Option<u64>,
+    /// Leader node address — the legacy single-binding form. ADR-008
+    /// rev 2 retains this for compat; per-binding endpoints are
+    /// resolved via the gRPC `GetTopology` follow-up (ADR-042 §1.7).
     pub leader_addr: SocketAddr,
+    /// Hex-encoded 32-byte inclusive lower bound of the shard's
+    /// hashed-key range (ADR-033 §4). Empty `Vec` for rev-1 stubs.
+    pub range_start: Vec<u8>,
+    /// Hex-encoded 32-byte exclusive upper bound. Empty `Vec` for
+    /// rev-1 stubs.
+    pub range_end: Vec<u8>,
 }
 
 /// A view endpoint from discovery.
@@ -117,7 +136,11 @@ impl DiscoveryClient {
         let resp = DiscoveryResponse {
             shards: vec![ShardEndpoint {
                 shard_id: "bootstrap".to_owned(),
+                namespace_id: String::new(),
+                leader_node_id: None,
                 leader_addr: seed.addr,
+                range_start: Vec::new(),
+                range_end: Vec::new(),
             }],
             views: vec![],
             gateways: vec![GatewayEndpoint {
@@ -147,4 +170,103 @@ impl DiscoveryClient {
                 .map(|s| s.leader_addr)
         })
     }
+
+    /// ADR-008 rev 2 — parse a `/cluster/info` JSON response into a
+    /// fully-populated [`DiscoveryResponse`]. Used during
+    /// [`crate::native::NativeClient::connect`] bootstrap, before the
+    /// gRPC data channel is dialled.
+    ///
+    /// Returns a [`DiscoveryParseError`] if the JSON is unparseable,
+    /// missing required fields, or carries an unparseable
+    /// `leader_data_addr` / hex range. Unknown fields are ignored
+    /// (forward-compat with future rev-N additions).
+    ///
+    /// Architect-step stub: signature only; the parsing body lands in
+    /// the implementer step once the failing unit tests are in place.
+    pub fn from_cluster_info_json(_json: &str) -> Result<DiscoveryResponse, DiscoveryParseError> {
+        Err(DiscoveryParseError::NotImplemented)
+    }
+}
+
+/// Parse failures for ADR-008 rev 2 `/cluster/info` JSON.
+#[allow(missing_docs)]
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryParseError {
+    #[error("malformed json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+    #[error("invalid leader_data_addr: {0}")]
+    InvalidLeaderAddr(String),
+    #[error("invalid hex range: {0}")]
+    InvalidHexRange(String),
+    #[error("from_cluster_info_json: architect-stub — implementer step pending")]
+    NotImplemented,
+}
+
+/// Wire-shape mirror of `kiseki_server::web::api::ShardInfoJson` —
+/// duplicated here so kiseki-client doesn't depend on kiseki-server.
+/// The two structs MUST stay byte-equivalent on the wire; tests in
+/// both crates round-trip the same fixture JSON.
+///
+/// Field semantics: ADR-008 rev 2 §"Wire shape".
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShardInfoJson {
+    /// UUID string form.
+    pub shard_id: String,
+    /// Owning namespace.
+    pub namespace_id: String,
+    /// Best-effort leader's `NodeId`. May be absent when the
+    /// responding node has not yet observed a leader.
+    #[serde(default)]
+    pub leader_id: Option<u64>,
+    /// Best-effort leader's data-port address (`host:port`).
+    #[serde(default)]
+    pub leader_data_addr: Option<String>,
+    /// Hex-encoded 32-byte inclusive lower bound, prefixed `0x`.
+    pub range_start: String,
+    /// Hex-encoded 32-byte exclusive upper bound, prefixed `0x`.
+    pub range_end: String,
+}
+
+/// Wire-shape mirror of `kiseki_server::web::api::PeerInfoJson`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PeerInfoJson {
+    /// Peer `NodeId`.
+    pub id: u64,
+    /// Raft address.
+    pub raft_addr: String,
+    /// S3 address (`host:9000`).
+    pub s3_addr: String,
+    /// NFS address (`host:2049`).
+    pub nfs_addr: String,
+    /// Metrics address (`host:9090`).
+    pub metrics_addr: String,
+}
+
+/// Wire-shape mirror of `kiseki_server::web::api::ClusterInfoResponse`.
+/// kiseki-client deserializes the HTTP `/cluster/info` response into
+/// this type; the typed surface keeps the client / server contract
+/// readable in both crates.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ClusterInfoResponse {
+    /// This node's `NodeId`.
+    pub node_id: u64,
+    /// This node's S3 address.
+    pub s3_addr: String,
+    /// This node's NFS address.
+    pub nfs_addr: String,
+    /// This node's metrics address.
+    pub metrics_addr: String,
+    /// Bootstrap-shard leader id (rev 1 retained).
+    #[serde(default)]
+    pub leader_id: Option<u64>,
+    /// Bootstrap-shard leader S3 address (rev 1 retained).
+    #[serde(default)]
+    pub leader_s3: Option<String>,
+    /// Cluster peers.
+    pub peers: Vec<PeerInfoJson>,
+    /// ADR-008 rev 2 per-shard leader map.
+    #[serde(default)]
+    pub shards: Vec<ShardInfoJson>,
 }

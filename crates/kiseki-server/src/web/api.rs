@@ -33,6 +33,10 @@ pub struct UiState {
     /// presence by calling `list_fragments` on this handle. Operators
     /// use the endpoint to debug placement / GC / under-replication.
     pub local_chunk_store: Option<Arc<dyn kiseki_chunk::AsyncChunkOps>>,
+    /// Cluster-control state machine handle (ADR-033 §4): exposes the
+    /// per-namespace shard maps the `/cluster/info` `shards` field
+    /// (ADR-008 rev 2) projects. `None` on single-node deployments.
+    pub cluster_control: Option<Arc<crate::cluster_control::ControlStateMachine>>,
 }
 
 /// Static node identity exposed via `/cluster/info`.
@@ -43,6 +47,97 @@ pub struct NodeInfo {
     pub nfs_addr: String,
     pub metrics_addr: String,
     pub raft_peers: Vec<(u64, String)>,
+}
+
+/// One row in the `/cluster/info` `shards` array (ADR-008 rev 2).
+///
+/// ADR-033 §4 holds the source-of-truth `NamespaceShardMap` on the
+/// control-plane Raft group; this wire shape projects each shard onto
+/// the JSON contract clients consume to populate their topology cache
+/// without going through gRPC `GetTopology` (ADR-042 §4) first.
+///
+/// Field semantics (matching ADR-008 rev 2 §"Wire shape"):
+///
+/// - `shard_id`: UUID string form, matching ADR-033 §4 / ADR-042 §1.
+/// - `leader_id`: `NodeId` u64. `None` when the responding node has
+///   not yet observed a leader (cold start, mid-election).
+/// - `leader_data_addr`: `host:port` of the leader's native gateway
+///   (`KISEKI_DATA_ADDR`, default 9100). `None` when the
+///   responding node cannot resolve the leader's address.
+/// - `range_start` / `range_end`: hex-encoded 32-byte hashed-key
+///   bounds, matching `NamespaceShardMap.ShardRange` (ADR-033 §4).
+///   `range_end = "0xFF…FF"` is the inclusive upper bound for the
+///   last shard.
+/// - `namespace_id`: the namespace the shard belongs to. Surfaced so
+///   multi-namespace clusters can route per-namespace without an
+///   extra round-trip.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShardInfoJson {
+    /// UUID string form.
+    pub shard_id: String,
+    /// Owning namespace.
+    pub namespace_id: String,
+    /// Best-effort leader's `NodeId`.
+    #[serde(default)]
+    pub leader_id: Option<u64>,
+    /// Best-effort leader's data-port address (`host:port`).
+    #[serde(default)]
+    pub leader_data_addr: Option<String>,
+    /// Hex-encoded 32-byte inclusive lower bound, prefixed `0x`.
+    pub range_start: String,
+    /// Hex-encoded 32-byte exclusive upper bound, prefixed `0x`.
+    pub range_end: String,
+}
+
+/// Full JSON shape of `/cluster/info` as of ADR-008 rev 2.
+///
+/// Defined as a typed struct (not just `serde_json::json!`) so
+/// `kiseki-client::discovery` and the BDD/unit-test surfaces can
+/// share the deserialization path. The handler still constructs the
+/// response value, but lives behind this contract.
+///
+/// `peers` and `node_info` fields stay flat for ADR-008 rev-1
+/// compatibility (older clients ignore unknown fields).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ClusterInfoResponse {
+    /// This node's `NodeId`.
+    pub node_id: u64,
+    /// This node's S3 address (`host:port`).
+    pub s3_addr: String,
+    /// This node's NFS address (`host:port`).
+    pub nfs_addr: String,
+    /// This node's metrics address (`host:port`).
+    pub metrics_addr: String,
+    /// Bootstrap-shard leader id (rev-1 retained). Per ADR-008 rev 2
+    /// `shards` is the authoritative per-shard map; this remains for
+    /// older clients.
+    #[serde(default)]
+    pub leader_id: Option<u64>,
+    /// Bootstrap-shard leader S3 address (rev-1 retained).
+    #[serde(default)]
+    pub leader_s3: Option<String>,
+    /// Cluster peers — id + addresses for every replica.
+    pub peers: Vec<PeerInfoJson>,
+    /// ADR-008 rev 2: per-shard leader map. Empty when this node has
+    /// not yet observed any namespace's shard map (cold start, no
+    /// control-plane connectivity, single-node compose).
+    #[serde(default)]
+    pub shards: Vec<ShardInfoJson>,
+}
+
+/// Per-peer record on `/cluster/info` `peers[]`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PeerInfoJson {
+    /// Peer `NodeId`.
+    pub id: u64,
+    /// Raft address (`host:raft_port`).
+    pub raft_addr: String,
+    /// S3 address (`host:9000`).
+    pub s3_addr: String,
+    /// NFS address (`host:2049`).
+    pub nfs_addr: String,
+    /// Metrics address (`host:9090`).
+    pub metrics_addr: String,
 }
 
 /// Build the web UI router.
@@ -349,7 +444,11 @@ async fn ops_scrub(State(state): State<UiState>) -> impl IntoResponse {
 /// Cluster info: this node's identity, leader, and peer map.
 ///
 /// Benchmark scripts and clients use this to discover the Raft leader
-/// and route writes to the correct node's S3/NFS endpoint.
+/// and route writes to the correct node's S3/NFS endpoint. ADR-008
+/// rev 2 adds the `shards: [...]` top-level array so native clients
+/// learn per-shard leaders on bootstrap (without needing gRPC
+/// `GetTopology`, which they can't reach until the topology cache is
+/// primed).
 async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
 
@@ -378,24 +477,60 @@ async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
         (None, None)
     };
 
-    axum::Json(serde_json::json!({
-        "node_id": state.node_info.node_id,
-        "s3_addr": state.node_info.s3_addr,
-        "nfs_addr": state.node_info.nfs_addr,
-        "metrics_addr": state.node_info.metrics_addr,
-        "leader_id": leader_id,
-        "leader_s3": leader_s3,
-        "peers": state.node_info.raft_peers.iter().map(|(id, addr)| {
+    let metrics_port = state
+        .node_info
+        .metrics_addr
+        .split(':')
+        .next_back()
+        .unwrap_or("9090")
+        .to_owned();
+
+    let peers: Vec<PeerInfoJson> = state
+        .node_info
+        .raft_peers
+        .iter()
+        .map(|(id, addr)| {
             let host = addr.split(':').next().unwrap_or("127.0.0.1");
-            serde_json::json!({
-                "id": id,
-                "raft_addr": addr,
-                "s3_addr": format!("{host}:9000"),
-                "nfs_addr": format!("{host}:2049"),
-                "metrics_addr": format!("{host}:{}", state.node_info.metrics_addr.split(':').next_back().unwrap_or("9090")),
-            })
-        }).collect::<Vec<_>>(),
-    }))
+            PeerInfoJson {
+                id: *id,
+                raft_addr: addr.clone(),
+                s3_addr: format!("{host}:9000"),
+                nfs_addr: format!("{host}:2049"),
+                metrics_addr: format!("{host}:{metrics_port}"),
+            }
+        })
+        .collect();
+
+    // ADR-008 rev 2 `shards: [...]` — populated from the control-plane
+    // state machine when present, else empty (operational degradation
+    // path: rev-1 clients fall back to seed-only routing).
+    let shards = build_shards_from_state(&state).await;
+
+    axum::Json(ClusterInfoResponse {
+        node_id: state.node_info.node_id,
+        s3_addr: state.node_info.s3_addr.clone(),
+        nfs_addr: state.node_info.nfs_addr.clone(),
+        metrics_addr: state.node_info.metrics_addr.clone(),
+        leader_id,
+        leader_s3,
+        peers,
+        shards,
+    })
+}
+
+/// ADR-008 rev 2 — project the control-plane `NamespaceShardMap`s onto
+/// the wire-shape `Vec<ShardInfoJson>`. Returns an empty Vec when the
+/// control-plane state machine is not wired in (single-node compose,
+/// rev-1 deploys, BDD harnesses) — clients honour the empty list as
+/// "fall back to seed-only routing" per ADR-008 rev 2 §"Compatibility".
+///
+/// Architect-step stub: returns `vec![]` unconditionally. The
+/// implementer step replaces this with a real walk over
+/// `cluster_control.snapshot()` once the failing unit tests are in
+/// place.
+#[allow(clippy::unused_async)]
+async fn build_shards_from_state(_state: &UiState) -> Vec<ShardInfoJson> {
+    Vec::new()
 }
 
 /// Per-shard leader info (Phase 17 item 4).

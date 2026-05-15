@@ -1235,6 +1235,12 @@ pub async fn run_main(
     // Pre-clone the cluster-control metrics for `StorageAdminGrpc`'s
     // forwarding paths and `OpenRaftControlStore::with_metrics()`.
     let cluster_control_metrics_for_admin = Arc::clone(&metrics.cluster_control);
+    // ADR-008 rev 2: thread the control-plane state machine to the
+    // metrics server so `/cluster/info` can project per-shard leader
+    // info from `NamespaceShardMap`. `None` on single-node deploys.
+    let cluster_control_state_for_ui = cluster_control_store
+        .as_ref()
+        .map(|s| Arc::new(s.state()));
     tokio::spawn(async move {
         if let Err(e) = crate::metrics::run_metrics_server(
             metrics_addr,
@@ -1244,6 +1250,7 @@ pub async fn run_main(
             node_info,
             metrics_compositions,
             metrics_local_chunk_store,
+            cluster_control_state_for_ui,
         )
         .await
         {

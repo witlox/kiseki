@@ -60,25 +60,60 @@ pub struct NativeClient {
     tenant_id: OrgId,
 }
 
+/// Per-seed connect timeout (ADR-008 rev 2 §"Failure modes /
+/// mitigation"). Three seeds × 2 s = 6 s worst-case bootstrap latency.
+pub const SEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl NativeClient {
     /// Connect to a single seed address (`host:port` or full URL). The
     /// caller supplies the tenant id — this is what the proto-handler
     /// boundary cross-checks against the SAN-derived tenant on every
     /// RPC.
     ///
+    /// Forwarded to [`Self::connect_with_seeds`] with a single-seed
+    /// vector for ADR-008 rev-1 back-compat.
+    ///
     /// # Errors
     /// Returns `Connect(...)` if the endpoint is malformed or the
     /// initial TCP / TLS handshake fails.
     pub async fn connect(seed: &str, tenant_id: OrgId) -> Result<Self, NativeClientError> {
+        Self::connect_with_seeds(&[seed.to_owned()], tenant_id).await
+    }
+
+    /// ADR-008 rev 2 — connect with a list of seeds. Dials each seed
+    /// in order with a 2 s per-seed connect timeout
+    /// (`SEED_CONNECT_TIMEOUT`), falling through to the next on
+    /// failure. Returns the first reachable seed's channel.
+    ///
+    /// # Errors
+    /// Returns `Connect("all seeds unreachable: ...")` when every
+    /// seed in the list fails to connect within the per-seed timeout.
+    ///
+    /// Architect-step stub: implements the single-seed fast path
+    /// (matches the rev-1 `connect` behavior). The seed-fall-through
+    /// + per-seed timeout body lands in the implementer step once
+    /// the failing unit tests are in place.
+    pub async fn connect_with_seeds(
+        seeds: &[String],
+        tenant_id: OrgId,
+    ) -> Result<Self, NativeClientError> {
+        if seeds.is_empty() {
+            return Err(NativeClientError::Connect("no seeds provided".to_owned()));
+        }
+        // STUB — implementer step replaces the single-seed body with
+        // a proper fall-through loop. Today, the first seed is the
+        // only attempt; behavior matches rev-1.
+        let seed = &seeds[0];
         let url = if seed.starts_with("http://") || seed.starts_with("https://") {
-            seed.to_string()
+            seed.clone()
         } else {
             format!("http://{seed}")
         };
         let endpoint = Endpoint::from_shared(url)
             .map_err(|e| NativeClientError::Connect(e.to_string()))?
             .tcp_nodelay(true)
-            .timeout(Duration::from_secs(30));
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(SEED_CONNECT_TIMEOUT);
         let channel = endpoint
             .connect()
             .await

@@ -82,7 +82,11 @@ async fn then_discovers(_w: &mut KisekiWorld) {
     let resp = DiscoveryResponse {
         shards: vec![ShardEndpoint {
             shard_id: "shard-1".into(),
+            namespace_id: String::new(),
+            leader_node_id: None,
             leader_addr: "127.0.0.1:9000".parse().unwrap(),
+            range_start: Vec::new(),
+            range_end: Vec::new(),
         }],
         views: vec![ViewEndpoint {
             view_id: "view-1".into(),
@@ -1755,7 +1759,11 @@ async fn then_response_contains(_w: &mut KisekiWorld) {
     let resp = DiscoveryResponse {
         shards: vec![ShardEndpoint {
             shard_id: "shard-1".into(),
+            namespace_id: String::new(),
+            leader_node_id: None,
             leader_addr: "10.0.0.1:9000".parse().unwrap(),
+            range_start: Vec::new(),
+            range_end: Vec::new(),
         }],
         views: vec![ViewEndpoint {
             view_id: "view-posix".into(),
@@ -1796,7 +1804,11 @@ async fn then_no_sensitive(_w: &mut KisekiWorld) {
     let resp = DiscoveryResponse {
         shards: vec![ShardEndpoint {
             shard_id: "shard-1".into(),
+            namespace_id: String::new(),
+            leader_node_id: None,
             leader_addr: "10.0.0.1:9000".parse().unwrap(),
+            range_start: Vec::new(),
+            range_end: Vec::new(),
         }],
         views: vec![],
         gateways: vec![],

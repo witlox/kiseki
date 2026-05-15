@@ -50,6 +50,18 @@ struct S3State<G: GatewayOps> {
     /// existed in `/metrics` with always-zero counts, leaving the
     /// read-path latency invisible. Wiring it here closes that gap.
     request_duration_metric: Option<Arc<prometheus::HistogramVec>>,
+    /// ADR-008 rev 2 / ADR-044 — `NodeId → s3 host:port` resolver for
+    /// 307 redirect targets. Populated from `cluster/info` peer map
+    /// at startup. Empty in dev / test deploys; the 307 path falls
+    /// back to 503 + `Retry-After` when the leader hint can't be
+    /// resolved to a host.
+    #[allow(dead_code)] // implementer-step wires the 307 redirect path
+    peer_s3_addrs: std::collections::HashMap<u64, String>,
+    /// ADR-008 rev 2 — `kiseki_native_topology_stale_leader_redirects_total`
+    /// counter, labeled by `protocol` ("s3", "native"). Optional;
+    /// metric-less deploys take a no-op bump.
+    #[allow(dead_code)] // implementer-step wires the metric bump on 307
+    stale_leader_redirects_total: Option<Arc<prometheus::IntCounterVec>>,
 }
 
 impl<G: GatewayOps> S3State<G> {
@@ -140,6 +152,33 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
     requests_total: Option<Arc<prometheus::IntCounterVec>>,
     request_duration: Option<Arc<prometheus::HistogramVec>>,
 ) -> Router {
+    s3_router_with_peers(
+        gateway,
+        fallback_tenant,
+        key_store,
+        requests_total,
+        request_duration,
+        std::collections::HashMap::new(),
+        None,
+    )
+}
+
+/// ADR-008 rev 2 / ADR-044 — full constructor with peer-map for the
+/// `307` redirect target resolution and the new
+/// `kiseki_native_topology_stale_leader_redirects_total` counter.
+///
+/// `peer_s3_addrs` maps `NodeId → "host:port"`. Empty in dev / test;
+/// the 307 path falls back to 503 when the leader hint can't be
+/// resolved.
+pub fn s3_router_with_peers<G: GatewayOps + Send + Sync + 'static>(
+    gateway: S3Gateway<G>,
+    fallback_tenant: OrgId,
+    key_store: AccessKeyStore,
+    requests_total: Option<Arc<prometheus::IntCounterVec>>,
+    request_duration: Option<Arc<prometheus::HistogramVec>>,
+    peer_s3_addrs: std::collections::HashMap<u64, String>,
+    stale_leader_redirects_total: Option<Arc<prometheus::IntCounterVec>>,
+) -> Router {
     let state = Arc::new(S3State {
         gateway,
         fallback_tenant,
@@ -147,6 +186,8 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
         buckets: Mutex::new(HashSet::new()),
         requests_total_metric: requests_total,
         request_duration_metric: request_duration,
+        peer_s3_addrs,
+        stale_leader_redirects_total,
     });
 
     // Per-request middleware that records `kiseki_gateway_requests_

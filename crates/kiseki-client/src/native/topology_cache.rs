@@ -192,6 +192,25 @@ pub struct RouteHit {
     pub data_addr: String,
 }
 
+/// ADR-008 rev 2 — bootstrap-time [`Snapshot`] constructor from the
+/// HTTP `/cluster/info` JSON. Used before the native gRPC channel is
+/// dialled (the gRPC `GetTopology` is the steady-state refresh).
+///
+/// Returns a `Snapshot` whose `version` is derived from the index of
+/// the response within the client's lifetime — the HTTP bootstrap
+/// endpoint does not surface the control-plane Raft state-machine
+/// version directly. Subsequent gRPC `GetTopology` calls overwrite
+/// this with the authoritative version on first response trailer.
+///
+/// Architect-step stub: returns an empty snapshot. The implementer
+/// step replaces this with a real walk over `parsed.shards` once the
+/// failing unit tests are in place.
+#[must_use]
+#[allow(clippy::missing_panics_doc)]
+pub fn snapshot_from_cluster_info(_parsed: &crate::discovery::ClusterInfoResponse) -> Snapshot {
+    Snapshot::default()
+}
+
 /// Convert a proto-shaped `TopologyInfo` (from `GetTopology`) into a
 /// cache-shaped [`Snapshot`]. ADR-042 §1.7 wire types map back to
 /// the `kiseki-proto::native_contract` value types the cache + edge

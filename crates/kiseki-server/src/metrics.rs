@@ -71,6 +71,13 @@ pub struct KisekiMetrics {
     /// `invalid` writes still succeed — operators use this counter
     /// to spot misconfigured clients.
     pub gateway_workflow_ref_writes_total: IntCounterVec,
+    /// ADR-008 rev 2 / ADR-044 — stale-leader redirects emitted on
+    /// the protocol boundary. Labels: `protocol` ∈ {`s3`, `native`}.
+    /// Incremented every time the gateway returns a leader hint
+    /// (307 for S3, NotLeader/ForwardToLeader for native) because
+    /// the caller's request arrived at a non-leader. Alarm at
+    /// sustained > 20 % of total writes for any tenant.
+    pub stale_leader_redirects_total: IntCounterVec,
 
     // --- Pool ---
     /// Pool capacity bytes (total).
@@ -301,6 +308,18 @@ impl KisekiMetrics {
             .register(Box::new(gateway_workflow_ref_writes_total.clone()))
             .expect("register");
 
+        let stale_leader_redirects_total = IntCounterVec::new(
+            Opts::new(
+                "kiseki_native_topology_stale_leader_redirects_total",
+                "ADR-008 rev 2 / ADR-044 — stale-leader redirects emitted on the protocol boundary",
+            ),
+            &["protocol"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(stale_leader_redirects_total.clone()))
+            .expect("register");
+
         let pool_capacity_total = IntGaugeVec::new(
             Opts::new("kiseki_pool_capacity_total_bytes", "Pool total capacity"),
             &["pool"],
@@ -434,6 +453,7 @@ impl KisekiMetrics {
             gateway_get_phase_duration,
             gateway_put_phase_duration,
             gateway_workflow_ref_writes_total,
+            stale_leader_redirects_total,
             pool_capacity_total,
             pool_capacity_used,
             transport_connections_active,
@@ -490,6 +510,7 @@ pub async fn run_metrics_server(
     node_info: crate::web::api::NodeInfo,
     compositions: Option<std::sync::Arc<kiseki_composition::composition::CompositionStore>>,
     local_chunk_store: Option<std::sync::Arc<dyn kiseki_chunk::AsyncChunkOps>>,
+    cluster_control: Option<std::sync::Arc<crate::cluster_control::ControlStateMachine>>,
 ) -> std::io::Result<()> {
     use crate::web;
 
@@ -510,6 +531,7 @@ pub async fn run_metrics_server(
         node_info,
         compositions,
         local_chunk_store,
+        cluster_control,
     };
 
     // Build combined router: metrics + health + admin UI.
