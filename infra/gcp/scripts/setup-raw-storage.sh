@@ -117,18 +117,6 @@ Environment=KISEKI_RAFT_THREADS=64
 Environment=KISEKI_INSECURE_NFS=true
 Environment=KISEKI_ALLOW_PLAINTEXT_NFS=true
 
-# 2026-05-07: NFSv4.1 LAYOUTGET disabled until pNFS DS supports
-# WRITE + persistent sessions. Without this the kernel pNFS client
-# does per-file EXCHANGE_ID + CREATE_SESSION + RECLAIM_COMPLETE
-# against the DS for every OPEN, then issues maybe ONE READ at the
-# end of kernel readahead, then DESTROY_SESSION + DESTROY_CLIENTID.
-# 8 MiB sequential read measured 0.5 MB/s in 3-node compose because
-# of this. Setting it disabled forces NFSv4 to use the MDS metadata-
-# stream READ/WRITE path, which on the same workload measured
-# 182 MB/s. Drop this Environment= line once the DS WRITE + session-
-# persistence ADR slice lands.
-Environment=KISEKI_DISABLE_PNFS_LAYOUT=true
-
 # Eventual-durability flush cadence (ADR-022 rev-3 + d5c56ad).
 # All three are CRITICAL for perf:
 #   * KISEKI_RAFT_FLUSH_INTERVAL_MS unset → Raft log uses

@@ -133,7 +133,7 @@ for idx in 0 1 2; do
   node_ssh "$CIP" "
     mkdir -p /mnt/kiseki-pnfs
     umount /mnt/kiseki-pnfs 2>/dev/null || true
-    mount -t nfs4 -o vers=4.2,pnfs,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/ /mnt/kiseki-pnfs 2>/dev/null
+    mount -t nfs4 -o vers=4.1,rsize=1048576,wsize=1048576 $LEADER_NFS_HOST:/ /mnt/kiseki-pnfs 2>/dev/null
     if mountpoint -q /mnt/kiseki-pnfs 2>/dev/null; then
       fio --name=pnfs-write --directory=/mnt/kiseki-pnfs --rw=write --bs=1m \
         --size=$WRITE_SIZE --numjobs=$NUMJOBS --direct=1 --group_reporting \
@@ -172,7 +172,7 @@ log "=== 5. FUSE Native Client (client-1 → leader) ==="
 FIRST_CLIENT="${CLIENT_ARRAY[0]}"
 node_ssh "$FIRST_CLIENT" "
   source /etc/kiseki-client.env 2>/dev/null || true
-  kiseki-client mount --endpoint $LEADER_HOST:9100 --mountpoint /mnt/kiseki-fuse \
+  /usr/local/bin/kiseki-client mount --endpoint kiseki://$LEADER_HOST:9100 --mountpoint /mnt/kiseki-fuse \
     --cache-mode organic --cache-dir /cache 2>/dev/null &
   FUSE_PID=\$!
   sleep 3
@@ -180,21 +180,24 @@ node_ssh "$FIRST_CLIENT" "
   if mountpoint -q /mnt/kiseki-fuse 2>/dev/null; then
     echo '  FUSE mounted'
 
-    echo '  Sequential write (fio, $NUMJOBS jobs × $WRITE_SIZE, --direct=1):'
-    fio --name=fuse-write --directory=/mnt/kiseki-fuse --rw=write --bs=1m \
-      --size=$WRITE_SIZE --numjobs=$NUMJOBS --direct=1 --group_reporting \
-      --output-format=json 2>/dev/null | \
-      python3 -c 'import sys,json; d=json.load(sys.stdin); bw=d[\"jobs\"][0][\"write\"][\"bw\"]/1024; print(f\"    Write: {bw:.1f} MB/s\")' 2>/dev/null
+    # FUSE doesn't honor O_DIRECT (kiseki-client mount doesn't set
+    # direct_io). Use dd with conv=fdatasync so the fsync time is
+    # included in the elapsed total — that gives real gateway
+    # throughput rather than memcpy-to-page-cache speed.
+    echo '  Sequential write (dd 1GB, bs=1M, conv=fdatasync — fsync in elapsed):'
+    rm -f /mnt/kiseki-fuse/dd-write 2>/dev/null
+    DD_OUT=\$(dd if=/dev/zero of=/mnt/kiseki-fuse/dd-write bs=1M count=1024 conv=fdatasync 2>&1 | tail -1)
+    echo \"    \$DD_OUT\"
 
-    echo '  Sequential read (fio, $NUMJOBS jobs × $READ_SIZE, --direct=1):'
-    fio --name=fuse-read --directory=/mnt/kiseki-fuse --rw=read --bs=1m \
-      --size=$READ_SIZE --numjobs=$NUMJOBS --direct=1 --group_reporting \
-      --output-format=json 2>/dev/null | \
-      python3 -c 'import sys,json; d=json.load(sys.stdin); bw=d[\"jobs\"][0][\"read\"][\"bw\"]/1024; print(f\"    Read:  {bw:.1f} MB/s\")' 2>/dev/null
+    echo '  Sequential read (dd 1GB, bs=1M, page cache dropped):'
+    sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    DD_OUT=\$(dd if=/mnt/kiseki-fuse/dd-write of=/dev/null bs=1M 2>&1 | tail -1)
+    echo \"    \$DD_OUT\"
+    rm -f /mnt/kiseki-fuse/dd-write 2>/dev/null
 
-    echo '  Random 4K read (fio, $NUMJOBS jobs × $RAND_SIZE, --direct=1, 30s):'
+    echo '  Random 4K read (fio, $NUMJOBS jobs × $RAND_SIZE, --direct=0 — buffered):'
     fio --name=fuse-rand --directory=/mnt/kiseki-fuse --rw=randread --bs=4k \
-      --size=$RAND_SIZE --numjobs=$NUMJOBS --direct=1 --runtime=30 --time_based --ramp_time=5 \
+      --size=$RAND_SIZE --numjobs=$NUMJOBS --direct=0 --runtime=30 --time_based --ramp_time=5 \
       --group_reporting --output-format=json 2>/dev/null | \
       python3 -c 'import sys,json; d=json.load(sys.stdin); iops=d[\"jobs\"][0][\"read\"][\"iops\"]; lat=d[\"jobs\"][0][\"read\"][\"lat_ns\"][\"mean\"]/1000; print(f\"    IOPS: {iops:.0f}, avg lat: {lat:.0f} µs\")' 2>/dev/null
 

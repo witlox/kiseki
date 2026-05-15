@@ -223,7 +223,9 @@ resource "google_compute_firewall" "services" {
   network = google_compute_network.net.name
   allow {
     protocol = "tcp"
-    ports    = ["2049", "9000", "9090", "9100", "9101", "9102", "9103"]
+    # 2049 NFSv4 MDS, 2052 pNFS DS (kernel client mounts the DS over
+    # this port once the MDS issues a LAYOUTGET — see ADR-038 §pNFS).
+    ports = ["2049", "2052", "9000", "9090", "9100", "9101", "9102", "9103"]
   }
   source_ranges = ["0.0.0.0/0"]
   target_tags   = ["kiseki-storage"]

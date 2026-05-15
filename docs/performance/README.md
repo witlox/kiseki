@@ -555,29 +555,28 @@ bash crates/kiseki-profile/resume.sh
 
 ## Running on GCP
 
+Set your GCP project ID once:
+
+```bash
+export KISEKI_GCP_PROJECT=<your-gcp-project>
+```
+
+Put the rest in `infra/gcp/perf.auto.tfvars` (gitignored — never commit it):
+
+```hcl
+project_id  = "<your-gcp-project>"
+region      = "europe-west1"     # required for transport (c3-standard-88-lssd unavailable in west6)
+zone        = "europe-west1-b"
+profile     = "compact"          # or "default", "transport", "gpu"
+release_tag = "v2026.43.759"     # pulls tarballs from GitHub releases
+```
+
+Then:
+
 ```bash
 cd infra/gcp
 terraform init
-
-# Build VM-target binaries (rocky9 container)
-docker run --rm \
-  -v $PWD/../..:/src \
-  -v $PWD/../../.gcp-build/cache-target:/src/target \
-  -v $PWD/../../.gcp-build/cache-cargo:/root/.cargo \
-  -v $PWD/../../.gcp-build/dist:/out \
-  -w /src rockylinux:9 \
-  bash /src/.gcp-build/build.sh
-
-gcloud storage cp ../../.gcp-build/dist/kiseki-{server,client}-x86_64.tar.gz \
-  gs://kiseki-bench-binaries-pwitlox-20260502/
-
-# transport profile must run in europe-west1 (c3-standard-88-lssd
-# is not available in west6 as of 2026-05-03)
-terraform apply \
-  -var=project_id=cscs-400112 \
-  -var=region=europe-west1 -var=zone=europe-west1-b \
-  -var=profile=transport \
-  -var=binary_url_base=https://storage.googleapis.com/kiseki-bench-binaries-pwitlox-20260502
+terraform apply -auto-approve
 
 # Drive each phase manually rather than running the full suite at
 # once — that way you stop at the first error instead of carrying
@@ -589,7 +588,25 @@ bash .gcp-build/ssh-helper.sh kiseki-ctrl
 Tear down when done — `c3-standard-88-lssd` is ~$22-30/hr.
 
 ```bash
-terraform destroy -var=project_id=cscs-400112 \
-  -var=region=europe-west1 -var=zone=europe-west1-b \
-  -var=profile=transport
+terraform destroy -auto-approve
+```
+
+**Testing unreleased binaries**: build in a rocky9 container, push to your own
+GCS staging bucket, and override `binary_url_base` in your tfvars to point at
+it. The boot scripts append `/kiseki-{server,client}-<arch>.tar.gz` to whatever
+URL you set.
+
+```bash
+docker run --rm \
+  -v $PWD/../..:/src \
+  -v $PWD/../../.gcp-build/cache-target:/src/target \
+  -v $PWD/../../.gcp-build/cache-cargo:/root/.cargo \
+  -v $PWD/../../.gcp-build/dist:/out \
+  -w /src rockylinux:9 \
+  bash /src/.gcp-build/build.sh
+
+gcloud storage cp ../../.gcp-build/dist/kiseki-{server,client}-x86_64.tar.gz \
+  gs://<your-staging-bucket>/
+# then in perf.auto.tfvars:
+#   binary_url_base = "https://storage.googleapis.com/<your-staging-bucket>"
 ```
