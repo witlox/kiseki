@@ -92,6 +92,14 @@ pub struct KisekiMetrics {
     pub pool_capacity_total: IntGaugeVec,
     /// Pool capacity bytes (used).
     pub pool_capacity_used: IntGaugeVec,
+    /// Per-device pool capacity gauge with labels
+    /// `{pool, device_id, kind}` where `kind` is one of
+    /// `total` / `used` / `free` (2026-05-15 follow-ups doc D2).
+    pub pool_device_capacity_bytes: IntGaugeVec,
+    /// Per-device IO error counter with labels `{device_id, op}`
+    /// where `op` is one of `read` / `write`. Cheap signal that
+    /// surfaces media trouble before a full health probe runs.
+    pub pool_device_errors_total: IntCounterVec,
 
     // --- Transport ---
     /// Active transport connections.
@@ -363,6 +371,34 @@ impl KisekiMetrics {
             .register(Box::new(pool_capacity_used.clone()))
             .expect("register");
 
+        // Per-device pool capacity (D2). `kind` is `total` / `used` /
+        // `free`. Wired from FileBackedDevice / DeviceBackend stats —
+        // the runtime fills the gauges from the StorageAdminService
+        // payloads (`ListDevicesResponse`) on its periodic refresh.
+        let pool_device_capacity_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kiseki_pool_device_capacity_bytes",
+                "Per-device capacity (kind = total | used | free)",
+            ),
+            &["pool", "device_id", "kind"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(pool_device_capacity_bytes.clone()))
+            .expect("register");
+
+        let pool_device_errors_total = IntCounterVec::new(
+            Opts::new(
+                "kiseki_pool_device_errors_total",
+                "Per-device IO error counter (op = read | write)",
+            ),
+            &["device_id", "op"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(pool_device_errors_total.clone()))
+            .expect("register");
+
         let transport_connections_active = IntGauge::new(
             "kiseki_transport_connections_active",
             "Active transport connections",
@@ -482,6 +518,8 @@ impl KisekiMetrics {
             native_proxy_forwards_total,
             pool_capacity_total,
             pool_capacity_used,
+            pool_device_capacity_bytes,
+            pool_device_errors_total,
             transport_connections_active,
             transport_connections_idle,
             shard_delta_count,
@@ -571,13 +609,27 @@ pub async fn run_metrics_server(
         drain,
     };
 
+    // Auth config snapshot at boot. `/metrics`, `/health`, `/ui/logo`
+    // intentionally stay open (probe surface); `/admin/*`, `/ui/*`
+    // and `/cluster/info` go through the auth-tier router. See
+    // `web::auth` for the env-var contract.
+    let auth = web::auth::AuthConfig::from_env();
+    tracing::info!(
+        addr = %addr,
+        admin_token_set = auth.admin_token.is_some(),
+        client_token_set = auth.client_token.is_some(),
+        admin_auth_disabled = auth.admin_auth_disabled,
+        cluster_info_public = auth.cluster_info_public,
+        "metrics + admin UI auth posture",
+    );
+
     // Build combined router: metrics + health + admin UI.
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/ui/logo", get(logo_handler))
         .with_state(metrics)
-        .merge(web::api::ui_router(ui_state));
+        .merge(web::api::ui_router(ui_state, auth));
 
     tracing::info!(addr = %addr, "metrics + admin UI server listening");
 

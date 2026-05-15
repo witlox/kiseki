@@ -38,6 +38,8 @@ services:
       KISEKI_CA_PATH: "/tls/ca.pem"
       KISEKI_CERT_PATH: "/tls/server.pem"
       KISEKI_KEY_PATH: "/tls/server.key"
+      KISEKI_ADMIN_AUTH_DISABLED: "true"
+      KISEKI_CLUSTER_INFO_PUBLIC: "true"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node1-data:/data
@@ -70,6 +72,8 @@ services:
       KISEKI_CA_PATH: "/tls/ca.pem"
       KISEKI_CERT_PATH: "/tls/server.pem"
       KISEKI_KEY_PATH: "/tls/server.key"
+      KISEKI_ADMIN_AUTH_DISABLED: "true"
+      KISEKI_CLUSTER_INFO_PUBLIC: "true"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node2-data:/data
@@ -102,6 +106,8 @@ services:
       KISEKI_CA_PATH: "/tls/ca.pem"
       KISEKI_CERT_PATH: "/tls/server.pem"
       KISEKI_KEY_PATH: "/tls/server.key"
+      KISEKI_ADMIN_AUTH_DISABLED: "true"
+      KISEKI_CLUSTER_INFO_PUBLIC: "true"
       RUST_LOG: "kiseki_gateway=debug,kiseki_server=info"
     volumes:
       - node3-data:/data

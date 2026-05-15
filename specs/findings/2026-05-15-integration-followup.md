@@ -103,22 +103,44 @@ would 500 instead of 307).
 
 ## Follow-up backlog
 
-1. **S8 metric label arity** — production registration must add the
-   `tenant` label before the runtime wires `s3_router_with_peers`.
-   Best closed when the runtime upgrade lands; today the call-site
-   takes the 2-label key and the registered metric is 1-label, so the
-   runtime wiring is intentionally not done until both ends agree.
-2. **S3 multipart / DELETE 307 wiring** — `post_multipart`,
-   `delete_or_abort`, `create_bucket`, `delete_bucket` follow the
-   same posture as PUT and would benefit from the same arm. Track as
-   a follow-up alongside the comprehensive S3 error taxonomy review.
+1. **S8 metric label arity** — **CLOSED 2026-05-15** by branch
+   `feat/s3-307-completion`. The registration was already
+   `&["protocol", "tenant"]` (`kiseki-server/src/metrics.rs:319`);
+   the handler-side call sites previously passed `"unknown"` because
+   no SigV4 resolution had run at the 307 emission point. The fix
+   resolves the SigV4 tenant up front in each mutation handler
+   (`put_or_upload_part`, `post_multipart`, `delete_or_abort`,
+   `create_bucket`) via the new `S3State::resolve_auth_tenant` +
+   `tenant_label_from_auth` helpers. Authenticated requests now
+   tick `tenant="<uuid>"`; anonymous / failed-auth requests tick
+   `tenant="unauthenticated"` (no longer `"unknown"`). Covered by
+   `s3_server::tests::sigv4_authenticated_put_307_carries_tenant_label`
+   and `s3_server::tests::unauthenticated_put_307_labels_metric_unauthenticated`.
+
+2. **S3 multipart / DELETE 307 wiring** — **CLOSED 2026-05-15** by
+   branch `feat/s3-307-completion`. Added `LeaderUnavailable` +
+   `ForwardToLeader` arms to `post_multipart` (both
+   `CreateMultipartUpload` and `CompleteMultipartUpload` branches),
+   `delete_or_abort` (both `AbortMultipartUpload` and `DeleteObject`
+   branches), `create_bucket` (covers `ensure_namespace`), and the
+   `UploadPart` branch of `put_or_upload_part`. `delete_bucket` is
+   a pure local-bucket-cache op and does NOT route through Raft so
+   it has no 307 arm. Covered by six new `*_emits_307` tests in
+   `s3_server::tests`.
+
 3. **Wire-level proxy `put_object` re-issue** (ADR-042 §4 native row,
-   step A's deferred wire scope) — the `@deferred-feature` scenarios
-   in `native-gateway.feature` lines 173-190 stay tagged until the
-   gateway-to-gateway dial reuses `ControlFields` byte-for-byte. Step
-   A's `ProxyClient` plumbing landed; the missing piece is the actual
-   `put_object` RPC re-issue, which is the next implementer slot.
+   step A's deferred wire scope) — Open. The `@deferred-feature`
+   scenarios in `native-gateway.feature` lines 173-190 stay tagged
+   until the gateway-to-gateway dial reuses `ControlFields` byte-
+   for-byte. Step A's `ProxyClient` plumbing landed; the missing
+   piece is the actual `put_object` RPC re-issue, which is the next
+   implementer slot.
+
 4. **`/cluster/info` peer-map → S3 router wiring in `runtime.rs`** —
-   today's runtime calls `s3_router_full` (no peer map / no metric).
-   When the runtime upgrade lands to use `s3_router_with_peers`, the
-   S8 metric label fix above is on the same commit.
+   **CLOSED 2026-05-15** by branch `feat/s3-307-completion`.
+   `runtime.rs` now calls `s3_router_with_peers` with a
+   `NodeId → "host:s3_port"` map computed from `cfg.raft_peers` via
+   the new `compute_s3_peer_addrs` helper, and plumbs
+   `metrics.stale_leader_redirects_total` so every 307 emission
+   ticks the live counter. Covered by three new unit tests in
+   `runtime::tests`.

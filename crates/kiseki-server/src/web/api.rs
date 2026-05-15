@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use super::aggregator::MetricsAggregator;
+use super::auth::{admin_required, cluster_info_required, AuthConfig};
 use super::events::SharedDiagnostics;
 
 /// Shared state for API handlers.
@@ -152,8 +153,25 @@ pub struct PeerInfoJson {
 }
 
 /// Build the web UI router.
-pub fn ui_router(state: UiState) -> Router {
-    Router::new()
+///
+/// Three auth tiers, all sharing the same `UiState`:
+///
+/// 1. **admin tier** — `/admin/*` plus `/ui/*` (dashboard HTML +
+///    fragment polls). Gated by `admin_required` middleware: requires
+///    `KISEKI_ADMIN_TOKEN`. `KISEKI_ADMIN_AUTH_DISABLED=true` opts
+///    out for dev / single-machine compose. ADR-008 rev 2
+///    §"Authorization" + UI/CLI follow-up D1.
+/// 2. **cluster-info tier** — just `/cluster/info` +
+///    `/cluster/shards/{id}/leader`. Gated by
+///    `cluster_info_required`: requires admin OR client token.
+///    `KISEKI_CLUSTER_INFO_PUBLIC=true` reverts to the historical
+///    open posture (LB probes, public topology).
+/// 3. **open tier** — none today; `/health`, `/metrics`, `/ui/logo`
+///    live on the outer router in `metrics.rs` and stay open.
+pub fn ui_router(state: UiState, auth: AuthConfig) -> Router {
+    // Admin tier: all /admin/* and /ui/* (UI fragments are admin-only
+    // because they expose the same cluster-wide stats as /admin/*).
+    let admin_routes = Router::new()
         .route("/ui", get(dashboard_page))
         .route("/ui/", get(dashboard_page))
         .route("/ui/api/cluster", get(api_cluster_summary))
@@ -167,8 +185,6 @@ pub fn ui_router(state: UiState) -> Router {
         .route("/ui/api/ops/maintenance", post(ops_maintenance))
         .route("/ui/api/ops/backup", post(ops_backup))
         .route("/ui/api/ops/scrub", post(ops_scrub))
-        .route("/cluster/info", get(cluster_info))
-        .route("/cluster/shards/{shard_id}/leader", get(shard_leader))
         .route("/admin/chunk/{chunk_id}", get(admin_inspect_chunk))
         .route(
             "/admin/composition/{composition_id}",
@@ -194,7 +210,24 @@ pub fn ui_router(state: UiState) -> Router {
             axum::routing::delete(admin_test_drop_fragment),
         )
         .merge(super::admin_extra::admin_extra_routes())
-        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            admin_required,
+        ));
+
+    // Cluster-info tier: any-authenticated principal (admin OR
+    // client token). Per-shard leader probes share this tier because
+    // they expose the same per-shard routing data clients need for
+    // bootstrap and stale-leader retry per ADR-008 rev 2.
+    let cluster_info_routes = Router::new()
+        .route("/cluster/info", get(cluster_info))
+        .route("/cluster/shards/{shard_id}/leader", get(shard_leader))
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            cluster_info_required,
+        ));
+
+    admin_routes.merge(cluster_info_routes).with_state(state)
 }
 
 async fn api_cluster_summary(State(state): State<UiState>) -> impl IntoResponse {
@@ -1126,5 +1159,195 @@ mod cluster_info_rev2_tests {
         assert_eq!(projected[0].leader_id, Some(1));
         assert_eq!(projected[1].leader_id, Some(2));
         assert_eq!(projected[2].leader_id, Some(3));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::redundant_closure)] // `Arc::new(|| String::new())` mirrors sibling rev2 tests
+mod ui_router_auth_tests {
+    //! End-to-end router-level coverage: verifies that the auth
+    //! middleware actually attaches to the right routes once they
+    //! are merged into `ui_router`. The standalone middleware
+    //! tests in `web::auth::tests` cover the middleware logic in
+    //! isolation; this module catches wiring regressions
+    //! (e.g. forgetting to apply the layer to `/admin/*` routes
+    //! added through `admin_extra::admin_extra_routes`).
+
+    use super::*;
+    use crate::web::auth::AuthConfig;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc as StdArc;
+    use tower::ServiceExt;
+
+    fn auth_config(admin: Option<&str>, client: Option<&str>) -> AuthConfig {
+        AuthConfig {
+            admin_token: admin.map(|s| StdArc::new(s.to_owned())),
+            client_token: client.map(|s| StdArc::new(s.to_owned())),
+            admin_auth_disabled: false,
+            cluster_info_public: false,
+        }
+    }
+
+    fn minimal_ui_state() -> UiState {
+        // Minimal-but-valid state. Several admin routes will return
+        // 503/SERVICE_UNAVAILABLE because the underlying handle is
+        // None, but that's *after* the auth layer — these tests only
+        // check the auth-layer outcome, never the handler body.
+        UiState {
+            aggregator: Arc::new(MetricsAggregator::new("127.0.0.1:9090".to_owned(), 10)),
+            metrics_encode: Arc::new(|| String::new()),
+            diagnostics: super::super::events::new_shared(),
+            log_store: None,
+            node_info: NodeInfo {
+                node_id: 1,
+                s3_addr: "10.0.0.1:9000".to_owned(),
+                nfs_addr: "10.0.0.1:2049".to_owned(),
+                metrics_addr: "10.0.0.1:9090".to_owned(),
+                raft_peers: vec![],
+            },
+            compositions: None,
+            local_chunk_store: None,
+            cluster_control: None,
+            audit: None,
+            key_manager: None,
+            tenants: None,
+            namespaces: None,
+            drain: None,
+        }
+    }
+
+    fn get_req(uri: &str, bearer: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method("GET").uri(uri);
+        if let Some(tok) = bearer {
+            b = b.header("authorization", format!("Bearer {tok}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    async fn status_of(router: Router, req: Request<Body>) -> StatusCode {
+        router.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn admin_route_blocked_without_bearer() {
+        let router = ui_router(minimal_ui_state(), auth_config(Some("admin"), None));
+        // /admin/topology/shards comes from admin_extra_routes — the
+        // wiring test catches regressions where the merge-then-layer
+        // order would have applied the middleware only to the inner
+        // builder and bypassed admin_extra.
+        assert_eq!(
+            status_of(router, get_req("/admin/topology/shards", None)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_route_blocked_with_client_token() {
+        let router = ui_router(
+            minimal_ui_state(),
+            auth_config(Some("admin"), Some("client")),
+        );
+        assert_eq!(
+            status_of(router, get_req("/admin/topology/shards", Some("client"))).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_fragment_route_requires_admin() {
+        let router = ui_router(minimal_ui_state(), auth_config(Some("admin"), None));
+        // The dashboard fragments expose cluster-wide stats; admin
+        // tier per UI/CLI follow-up D1.
+        assert_eq!(
+            status_of(router, get_req("/ui/fragment/cluster-cards", None)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_info_blocked_without_bearer() {
+        let router = ui_router(
+            minimal_ui_state(),
+            auth_config(Some("admin"), Some("client")),
+        );
+        assert_eq!(
+            status_of(router, get_req("/cluster/info", None)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_info_accepts_client_token() {
+        let router = ui_router(
+            minimal_ui_state(),
+            auth_config(Some("admin"), Some("client")),
+        );
+        // Real handler runs and returns 200; we don't validate body.
+        assert_eq!(
+            status_of(router, get_req("/cluster/info", Some("client"))).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_info_accepts_admin_token() {
+        let router = ui_router(
+            minimal_ui_state(),
+            auth_config(Some("admin"), Some("client")),
+        );
+        assert_eq!(
+            status_of(router, get_req("/cluster/info", Some("admin"))).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_info_public_override_lets_anonymous_through() {
+        let mut cfg = auth_config(Some("admin"), Some("client"));
+        cfg.cluster_info_public = true;
+        let router = ui_router(minimal_ui_state(), cfg);
+        assert_eq!(
+            status_of(router, get_req("/cluster/info", None)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_disabled_override_lets_anonymous_through_to_admin() {
+        let mut cfg = auth_config(Some("admin"), None);
+        cfg.admin_auth_disabled = true;
+        let router = ui_router(minimal_ui_state(), cfg);
+        // /admin/topology/shards returns 200 even without auth.
+        assert_eq!(
+            status_of(router, get_req("/admin/topology/shards", None)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_leader_route_is_cluster_info_tier() {
+        // Per-shard leader probes feed the same client-bootstrap
+        // path; gate them with the cluster-info tier (client token
+        // suffices).
+        let router = ui_router(
+            minimal_ui_state(),
+            auth_config(Some("admin"), Some("client")),
+        );
+        let uuid = uuid::Uuid::from_u128(1);
+        let path = format!("/cluster/shards/{uuid}/leader");
+
+        // No token → 401.
+        assert_eq!(
+            status_of(router.clone(), get_req(&path, None)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Client token → through the auth layer. Handler returns 503
+        // (no log_store wired) which is the *post-auth* response and
+        // confirms the layer let the request through.
+        assert_eq!(
+            status_of(router, get_req(&path, Some("client"))).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
     }
 }

@@ -7,4 +7,5 @@
 pub mod admin_extra;
 pub mod aggregator;
 pub mod api;
+pub mod auth;
 pub mod events;

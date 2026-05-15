@@ -519,16 +519,39 @@ enum Command {
     Shards,
     /// `forwarding` — proxy + stale-leader counters per node.
     Forwarding,
-    /// `audit query [--tenant T] [--type X] [--limit N] [--from S]`
+    /// `audit query [--tenant T] [--type X] [--limit N] [--from S] [--local-only]`
     AuditQuery {
         tenant: Option<String>,
         event_type: Option<String>,
         limit: Option<usize>,
         from: Option<u64>,
+        /// When true, query only the local node's audit shard.
+        /// Default (false) fans out to all peers via the aggregating
+        /// endpoint. See ADR-009 + 2026-05-15 follow-ups doc D5.
+        local_only: bool,
     },
     /// `tenant <subcmd>`
     TenantCreateOrg {
         name: String,
+    },
+    TenantCreateProject {
+        org_id: String,
+        name: String,
+    },
+    TenantCreateWorkload {
+        project_id: String,
+        name: String,
+    },
+    TenantCreateNamespace {
+        workload_id: String,
+        name: String,
+    },
+    TenantDescribe {
+        id: String,
+    },
+    TenantDelete {
+        id: String,
+        yes: bool,
     },
     TenantList {
         kind: String,
@@ -549,9 +572,14 @@ enum Command {
         node_id: u64,
     },
     DrainStatus,
-    /// `keys {status|rotate}`
+    /// `keys {status|rotate|shred}`
     KeysStatus,
     KeysRotate,
+    /// `keys shred <tenant-id> [--yes]` — IRREVERSIBLE crypto-shred.
+    KeysShred {
+        tenant_id: String,
+        yes: bool,
+    },
     /// `config show [--node N | --all]`
     ConfigShow {
         node: Option<String>,
@@ -578,7 +606,12 @@ fn print_usage() {
          \x20 forwarding                     Proxy + stale-leader counters\n\
          \x20 tenant list [--type org|project|workload|namespace]\n\
          \x20 tenant create-org <name>\n\
-         \x20 audit query [--tenant T] [--type X] [--limit N] [--from S]\n\
+         \x20 tenant create-project <org-id> <name>\n\
+         \x20 tenant create-workload <project-id> <name>\n\
+         \x20 tenant create-namespace <workload-id> <name>\n\
+         \x20 tenant describe <id>\n\
+         \x20 tenant delete <id> [--yes]\n\
+         \x20 audit query [--tenant T] [--type X] [--limit N] [--from S] [--local-only]\n\
          \x20 snapshot create [--note T]     Create a snapshot\n\
          \x20 snapshot list                  List snapshots\n\
          \x20 snapshot restore <id>          Restore a snapshot\n\
@@ -587,6 +620,7 @@ fn print_usage() {
          \x20 drain cancel <node-id>         Cancel a drain\n\
          \x20 keys status                    Show key-manager epochs\n\
          \x20 keys rotate                    Rotate the system master key\n\
+         \x20 keys shred <tenant-id> [--yes] Crypto-shred a tenant (IRREVERSIBLE)\n\
          \x20 config show [--node N | --all] Show runtime knobs\n\
          \x20 --version                      Print version\n\
          \x20 help                           Show this message\n\
@@ -717,6 +751,7 @@ fn parse_audit(rest: &[String]) -> Result<Command, String> {
     let mut event_type = None;
     let mut limit = None;
     let mut from = None;
+    let mut local_only = false;
     let mut i = 1;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -746,6 +781,9 @@ fn parse_audit(rest: &[String]) -> Result<Command, String> {
                         .map_err(|_| "--from must be a positive integer")?,
                 );
             }
+            "--local-only" => {
+                local_only = true;
+            }
             other => return Err(format!("unknown audit query option: {other}")),
         }
         i += 1;
@@ -755,13 +793,14 @@ fn parse_audit(rest: &[String]) -> Result<Command, String> {
         event_type,
         limit,
         from,
+        local_only,
     })
 }
 
 fn parse_tenant(rest: &[String]) -> Result<Command, String> {
     let sub = rest
         .first()
-        .ok_or("tenant requires a subcommand (list, create-org, ...)")?;
+        .ok_or("tenant requires a subcommand (list, create-org, create-project, create-workload, create-namespace, describe, delete)")?;
     match sub.as_str() {
         "list" => {
             // optional --type flag; default = orgs
@@ -783,13 +822,57 @@ fn parse_tenant(rest: &[String]) -> Result<Command, String> {
             let name = rest.get(1).ok_or("create-org requires <name>")?.clone();
             Ok(Command::TenantCreateOrg { name })
         }
-        // create-project / create-workload / create-namespace need
-        // multi-step gRPC plumbing (org-id / project-id resolution,
-        // typed enums); deferred to the followups doc — the existing
-        // ControlService gRPC handles these.
-        other => Err(format!(
-            "tenant subcommand {other} not yet wired into CLI; use the gRPC ControlService"
-        )),
+        "create-project" => {
+            let org_id = rest
+                .get(1)
+                .ok_or("create-project requires <org-id> <name>")?
+                .clone();
+            let name = rest
+                .get(2)
+                .ok_or("create-project requires <org-id> <name>")?
+                .clone();
+            Ok(Command::TenantCreateProject { org_id, name })
+        }
+        "create-workload" => {
+            let project_id = rest
+                .get(1)
+                .ok_or("create-workload requires <project-id> <name>")?
+                .clone();
+            let name = rest
+                .get(2)
+                .ok_or("create-workload requires <project-id> <name>")?
+                .clone();
+            Ok(Command::TenantCreateWorkload { project_id, name })
+        }
+        "create-namespace" => {
+            let workload_id = rest
+                .get(1)
+                .ok_or("create-namespace requires <workload-id> <name>")?
+                .clone();
+            let name = rest
+                .get(2)
+                .ok_or("create-namespace requires <workload-id> <name>")?
+                .clone();
+            Ok(Command::TenantCreateNamespace { workload_id, name })
+        }
+        "describe" => {
+            let id = rest.get(1).ok_or("describe requires <id>")?.clone();
+            Ok(Command::TenantDescribe { id })
+        }
+        "delete" => {
+            let id = rest.get(1).ok_or("delete requires <id>")?.clone();
+            let mut yes = false;
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--yes" => yes = true,
+                    other => return Err(format!("unknown tenant delete option: {other}")),
+                }
+                i += 1;
+            }
+            Ok(Command::TenantDelete { id, yes })
+        }
+        other => Err(format!("unknown tenant subcommand: {other}")),
     }
 }
 
@@ -848,15 +931,27 @@ fn parse_drain(rest: &[String]) -> Result<Command, String> {
 fn parse_keys(rest: &[String]) -> Result<Command, String> {
     let sub = rest
         .first()
-        .ok_or("keys requires a subcommand (status, rotate)")?;
+        .ok_or("keys requires a subcommand (status, rotate, shred)")?;
     match sub.as_str() {
         "status" => Ok(Command::KeysStatus),
         "rotate" => Ok(Command::KeysRotate),
-        // 'shred' requires a tenant-id arg and the live KeyManagerOps
-        // path — not yet exposed over HTTP; see followups doc.
-        other => Err(format!(
-            "keys subcommand {other} not wired into CLI; use the gRPC KeyManagerService"
-        )),
+        "shred" => {
+            let tenant_id = rest
+                .get(1)
+                .ok_or("keys shred requires <tenant-id>")?
+                .clone();
+            let mut yes = false;
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--yes" => yes = true,
+                    other => return Err(format!("unknown keys shred option: {other}")),
+                }
+                i += 1;
+            }
+            Ok(Command::KeysShred { tenant_id, yes })
+        }
+        other => Err(format!("unknown keys subcommand: {other}")),
     }
 }
 
@@ -1014,6 +1109,7 @@ fn main() {
             event_type,
             limit,
             from,
+            local_only,
         } => {
             let mut params = Vec::new();
             if let Some(t) = &tenant {
@@ -1027,6 +1123,9 @@ fn main() {
             }
             if let Some(s) = from {
                 params.push(format!("from={s}"));
+            }
+            if local_only {
+                params.push("local_only=true".to_string());
             }
             let path = if params.is_empty() {
                 "/admin/audit/query".to_string()
@@ -1053,6 +1152,68 @@ fn main() {
                     format!("Created org: {b}\n")
                 }
             })
+        }
+        Command::TenantCreateProject { org_id, name } => {
+            let body = format!(
+                r#"{{"org_id":"{}","name":"{}"}}"#,
+                json_escape(&org_id),
+                json_escape(&name),
+            );
+            http_post(&args.endpoint, "/admin/tenants/projects", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format!("Created project: {b}\n")
+                }
+            })
+        }
+        Command::TenantCreateWorkload { project_id, name } => {
+            let body = format!(
+                r#"{{"project_id":"{}","name":"{}"}}"#,
+                json_escape(&project_id),
+                json_escape(&name),
+            );
+            http_post(&args.endpoint, "/admin/tenants/workloads", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format!("Created workload: {b}\n")
+                }
+            })
+        }
+        Command::TenantCreateNamespace { workload_id, name } => {
+            let body = format!(
+                r#"{{"workload_id":"{}","name":"{}"}}"#,
+                json_escape(&workload_id),
+                json_escape(&name),
+            );
+            http_post(&args.endpoint, "/admin/tenants/namespaces", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format!("Created namespace: {b}\n")
+                }
+            })
+        }
+        Command::TenantDescribe { id } => {
+            let path = format!("/admin/tenants/describe?id={}", url_encode(&id));
+            http_get(&args.endpoint, &path).map(|b| if json { b } else { format!("{b}\n") })
+        }
+        Command::TenantDelete { id, yes } => {
+            if !yes
+                && !confirm_destructive(&format!("This permanently removes tenant `{id}`."), &id)
+            {
+                Ok(format!("{YELLOW}cancelled{RESET}\n"))
+            } else {
+                let body = format!(r#"{{"id":"{}"}}"#, json_escape(&id));
+                http_post(&args.endpoint, "/admin/tenants/delete", &body).map(|b| {
+                    if json {
+                        b
+                    } else {
+                        format_ops_response(&b)
+                    }
+                })
+            }
         }
         Command::SnapshotCreate { note } => {
             let body = note
@@ -1121,6 +1282,31 @@ fn main() {
                 format_ops_response(&b)
             }
         }),
+        Command::KeysShred { tenant_id, yes } => {
+            if !yes
+                && !confirm_destructive(
+                    &format!(
+                        "{RED}IRREVERSIBLE:{RESET} crypto-shred permanently destroys all data \
+                         for tenant `{tenant_id}` (ADR-014 §K11)."
+                    ),
+                    &tenant_id,
+                )
+            {
+                Ok(format!("{YELLOW}cancelled{RESET}\n"))
+            } else {
+                let body = format!(
+                    r#"{{"tenant_id":"{}","reason":"kiseki-admin keys shred"}}"#,
+                    json_escape(&tenant_id),
+                );
+                http_post(&args.endpoint, "/admin/keys/shred", &body).map(|b| {
+                    if json {
+                        b
+                    } else {
+                        format_ops_response(&b)
+                    }
+                })
+            }
+        }
         Command::ConfigShow { node, all } => {
             // The HTTP endpoint always reports the local node's config.
             // --all = scrape /admin/config on every peer (discovered via /cluster/info).
@@ -1178,6 +1364,39 @@ fn main() {
 
 fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// URL-encode a query-string value. Only the limited subset needed by
+/// the admin CLI (alphanumerics + `-._~` pass through; everything else
+/// gets %-encoded). No external dependency.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// Prompt the operator to retype the destructive-action target id.
+/// Returns `true` only when stdin echoed the exact `target` string.
+///
+/// Skipped (returns `true`) when `--yes` was passed at the call site.
+/// The caller is responsible for `--yes` short-circuit; this helper
+/// only handles the interactive confirmation.
+fn confirm_destructive(message: &str, target: &str) -> bool {
+    eprintln!("{message}");
+    eprint!("Type `{target}` to confirm (or anything else to cancel): ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim() == target
 }
 
 fn format_shards(body: &str) -> String {
@@ -1470,4 +1689,168 @@ fn json_object_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Tests — argument parsers (no I/O).
+//
+// These cover the parser surface added under the 2026-05-15 UI/CLI
+// follow-ups (D3 nested tenant CRUD, D4 keys shred, D5 audit
+// --local-only). Each test isolates one option matrix so future
+// drift surfaces a precise failure.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Result<Command, String> {
+        let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+        parse_subcommand(&owned, 0)
+    }
+
+    // --- D3: nested tenant CRUD ----------------------------------------
+
+    #[test]
+    fn tenant_create_project_requires_org_and_name() {
+        let cmd = parse(&["tenant", "create-project", "ORG-1", "myproj"]).unwrap();
+        match cmd {
+            Command::TenantCreateProject { org_id, name } => {
+                assert_eq!(org_id, "ORG-1");
+                assert_eq!(name, "myproj");
+            }
+            _ => panic!("expected TenantCreateProject"),
+        }
+        assert!(parse(&["tenant", "create-project", "ORG-1"]).is_err());
+        assert!(parse(&["tenant", "create-project"]).is_err());
+    }
+
+    #[test]
+    fn tenant_create_workload_requires_project_and_name() {
+        let cmd = parse(&["tenant", "create-workload", "PROJ-1", "trainer"]).unwrap();
+        match cmd {
+            Command::TenantCreateWorkload { project_id, name } => {
+                assert_eq!(project_id, "PROJ-1");
+                assert_eq!(name, "trainer");
+            }
+            _ => panic!("expected TenantCreateWorkload"),
+        }
+        assert!(parse(&["tenant", "create-workload"]).is_err());
+    }
+
+    #[test]
+    fn tenant_create_namespace_requires_workload_and_name() {
+        let cmd = parse(&["tenant", "create-namespace", "WL-1", "ns-a"]).unwrap();
+        match cmd {
+            Command::TenantCreateNamespace { workload_id, name } => {
+                assert_eq!(workload_id, "WL-1");
+                assert_eq!(name, "ns-a");
+            }
+            _ => panic!("expected TenantCreateNamespace"),
+        }
+    }
+
+    #[test]
+    fn tenant_describe_takes_one_id() {
+        let cmd = parse(&["tenant", "describe", "ORG-1"]).unwrap();
+        match cmd {
+            Command::TenantDescribe { id } => assert_eq!(id, "ORG-1"),
+            _ => panic!("expected TenantDescribe"),
+        }
+        assert!(parse(&["tenant", "describe"]).is_err());
+    }
+
+    #[test]
+    fn tenant_delete_supports_yes_flag() {
+        let cmd = parse(&["tenant", "delete", "ORG-1"]).unwrap();
+        match cmd {
+            Command::TenantDelete { id, yes } => {
+                assert_eq!(id, "ORG-1");
+                assert!(!yes);
+            }
+            _ => panic!("expected TenantDelete"),
+        }
+        let cmd_yes = parse(&["tenant", "delete", "ORG-1", "--yes"]).unwrap();
+        match cmd_yes {
+            Command::TenantDelete { id, yes } => {
+                assert_eq!(id, "ORG-1");
+                assert!(yes);
+            }
+            _ => panic!("expected TenantDelete with --yes"),
+        }
+        assert!(parse(&["tenant", "delete"]).is_err());
+    }
+
+    // --- D4: keys shred ------------------------------------------------
+
+    #[test]
+    fn keys_shred_requires_tenant_id() {
+        let cmd = parse(&["keys", "shred", "TENANT-1"]).unwrap();
+        match cmd {
+            Command::KeysShred { tenant_id, yes } => {
+                assert_eq!(tenant_id, "TENANT-1");
+                assert!(!yes);
+            }
+            _ => panic!("expected KeysShred"),
+        }
+        let cmd_yes = parse(&["keys", "shred", "TENANT-1", "--yes"]).unwrap();
+        match cmd_yes {
+            Command::KeysShred { tenant_id, yes } => {
+                assert_eq!(tenant_id, "TENANT-1");
+                assert!(yes);
+            }
+            _ => panic!("expected KeysShred with --yes"),
+        }
+        assert!(parse(&["keys", "shred"]).is_err());
+    }
+
+    // --- D5: audit query supports --local-only -------------------------
+
+    #[test]
+    fn audit_query_defaults_to_cluster_aggregation() {
+        let cmd = parse(&["audit", "query"]).unwrap();
+        match cmd {
+            Command::AuditQuery { local_only, .. } => assert!(!local_only),
+            _ => panic!("expected AuditQuery"),
+        }
+    }
+
+    #[test]
+    fn audit_query_local_only_opts_out_of_aggregation() {
+        let cmd = parse(&["audit", "query", "--local-only"]).unwrap();
+        match cmd {
+            Command::AuditQuery { local_only, .. } => assert!(local_only),
+            _ => panic!("expected AuditQuery"),
+        }
+    }
+
+    #[test]
+    fn audit_query_local_only_works_with_filters() {
+        let cmd = parse(&[
+            "audit",
+            "query",
+            "--tenant",
+            "00000000-0000-0000-0000-000000000001",
+            "--limit",
+            "10",
+            "--local-only",
+        ])
+        .unwrap();
+        match cmd {
+            Command::AuditQuery {
+                tenant,
+                limit,
+                local_only,
+                ..
+            } => {
+                assert_eq!(
+                    tenant.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000001")
+                );
+                assert_eq!(limit, Some(10));
+                assert!(local_only);
+            }
+            _ => panic!("expected AuditQuery"),
+        }
+    }
 }

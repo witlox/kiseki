@@ -29,7 +29,19 @@ kiseki-admin tenant list --type project
 kiseki-admin tenant list --type workload
 kiseki-admin tenant list --type namespace
 kiseki-admin tenant create-org "Acme Corp"
+kiseki-admin tenant create-project <org-id> "ml-research"
+kiseki-admin tenant create-workload <project-id> "trainer"
+kiseki-admin tenant create-namespace <workload-id> "ns-a"
+kiseki-admin tenant describe <id>          # auto-detects org/project/workload/namespace
+kiseki-admin tenant delete <id> [--yes]    # requires typed-id confirmation
 ```
+
+Create verbs hit `POST /admin/tenants/{projects,workloads,namespaces}`.
+`tenant describe` resolves the id against each store in order and
+returns the matching record. `tenant delete` is currently HTTP-side
+501 (the gRPC ControlService is the canonical lifecycle source) — the
+CLI surface is in place so a future delete endpoint becomes a one-line
+change.
 
 ## Snapshots (ADR-016)
 
@@ -60,11 +72,15 @@ HTTP. Voter-replacement execution is the openraft membership pump
 ```bash
 kiseki-admin keys status                   # current epoch + history
 kiseki-admin keys rotate                   # cut a new epoch
+kiseki-admin keys shred <tenant-id> [--yes]
 ```
 
-`kiseki-admin keys shred <tenant>` is intentionally not yet wired
-into the CLI (irreversible operation; needs `--yes` and the
-`/admin/keys/shred` HTTP endpoint, tracked in the followups doc).
+`keys shred` posts to `/admin/keys/shred` which records a
+`KeyDestruction` audit event (the authoritative trail). The actual
+tenant-side KMS destruction is provider-specific and remains the
+load-bearing step — see `docs/admin/key-management.md` for the full
+runbook. Without `--yes`, the CLI prompts the operator to retype the
+tenant id before any HTTP call goes out.
 
 ## Config show
 

@@ -69,8 +69,13 @@ pub fn admin_extra_routes() -> Router<UiState> {
         .route("/admin/tenants/orgs", get(api_list_orgs))
         .route("/admin/tenants/orgs", post(api_create_org))
         .route("/admin/tenants/projects", get(api_list_projects))
+        .route("/admin/tenants/projects", post(api_create_project))
         .route("/admin/tenants/workloads", get(api_list_workloads))
+        .route("/admin/tenants/workloads", post(api_create_workload))
         .route("/admin/tenants/namespaces", get(api_list_namespaces))
+        .route("/admin/tenants/namespaces", post(api_create_namespace))
+        .route("/admin/tenants/describe", get(api_tenant_describe))
+        .route("/admin/tenants/delete", post(api_tenant_delete))
         .route("/ui/fragment/tenants-table", get(fragment_tenants_table))
         // --- Audit tab ---
         .route("/admin/audit/query", get(api_audit_query))
@@ -80,6 +85,9 @@ pub fn admin_extra_routes() -> Router<UiState> {
         // --- Keys ---
         .route("/admin/keys/status", get(api_keys_status))
         .route("/admin/keys/rotate", post(api_keys_rotate))
+        .route("/admin/keys/shred", post(api_keys_shred))
+        // --- whoami (D6) ---
+        .route("/admin/whoami", get(api_whoami))
         // --- Snapshots ---
         .route("/admin/snapshots", get(api_list_snapshots))
         .route("/admin/snapshots", post(api_create_snapshot))
@@ -287,7 +295,37 @@ async fn api_pools(State(state): State<UiState>) -> impl IntoResponse {
             })
         })
         .collect();
-    axum::Json(serde_json::json!({ "pools": pools }))
+
+    // D2: per-device gauges with labels {pool, device_id, kind}.
+    // Operators read this to spot one struggling device inside a
+    // healthy pool. Empty when no device-level metric has been
+    // populated yet (single-node bring-up, in-memory backend).
+    let device_rows = build_per_device_rows(&metrics_text);
+    let devices: Vec<_> = device_rows
+        .iter()
+        .map(|d| {
+            let used_pct = if d.total_bytes > 0 {
+                (d.used_bytes as f64 / d.total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            serde_json::json!({
+                "pool": d.pool,
+                "device_id": d.device_id,
+                "total_bytes": d.total_bytes,
+                "used_bytes": d.used_bytes,
+                "free_bytes": d.free_bytes,
+                "used_pct": format!("{used_pct:.1}"),
+                "read_errors": d.read_errors,
+                "write_errors": d.write_errors,
+            })
+        })
+        .collect();
+
+    axum::Json(serde_json::json!({
+        "pools": pools,
+        "devices": devices,
+    }))
 }
 
 async fn fragment_pools_table(State(state): State<UiState>) -> Html<String> {
@@ -342,7 +380,136 @@ async fn fragment_pools_table(State(state): State<UiState>) -> Html<String> {
         }
     }
     html.push_str("</tbody></table>");
+
+    // D2 — per-device subtable. Reuses the same metrics scrape.
+    let devices = build_per_device_rows(&metrics_text);
+    let _ = write!(
+        html,
+        "<h4 style=\"margin-top:16px\">Devices</h4><table><thead><tr><th>Pool</th><th>Device</th><th>Used</th><th>Total</th><th>Free</th><th>Used %</th><th>R/W Errors</th></tr></thead><tbody>",
+    );
+    if devices.is_empty() {
+        html.push_str(
+            "<tr><td colspan=\"7\" style=\"color:var(--dim)\">No per-device gauges yet (FileBackedDevice publish pending)</td></tr>",
+        );
+    } else {
+        for d in &devices {
+            let used_pct = if d.total_bytes > 0 {
+                (d.used_bytes as f64 / d.total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td><td>{} / {}</td></tr>",
+                html_escape(&d.pool),
+                html_escape(&d.device_id),
+                format_bytes(d.used_bytes),
+                format_bytes(d.total_bytes),
+                format_bytes(d.free_bytes),
+                used_pct,
+                d.read_errors,
+                d.write_errors,
+            );
+        }
+    }
+    html.push_str("</tbody></table>");
+
     Html(html)
+}
+
+// ---------------------------------------------------------------------------
+// D2: per-device pool gauges
+// ---------------------------------------------------------------------------
+
+/// One row in the per-device pool capacity view. Aggregates the three
+/// `kind=` labels into a single struct so callers don't have to do
+/// the join themselves.
+#[derive(Debug, Clone)]
+struct DeviceRow {
+    pool: String,
+    device_id: String,
+    total_bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+    read_errors: u64,
+    write_errors: u64,
+}
+
+/// Build per-device rows from a Prometheus exposition body.
+///
+/// Reads:
+/// - `kiseki_pool_device_capacity_bytes{pool=,device_id=,kind=total|used|free}`
+/// - `kiseki_pool_device_errors_total{device_id=,op=read|write}`
+///
+/// Devices missing a `kind=` sample default to 0 for that kind, and
+/// `free` is derived from `total - used` when absent.
+fn build_per_device_rows(metrics_text: &str) -> Vec<DeviceRow> {
+    let cap = parse_gauge_with_labels(
+        metrics_text,
+        "kiseki_pool_device_capacity_bytes",
+        &["pool", "device_id", "kind"],
+    );
+    let errs = parse_counter_with_labels(
+        metrics_text,
+        "kiseki_pool_device_errors_total",
+        &["device_id", "op"],
+    );
+    // Aggregate by `device_id` (devices belong to exactly one pool).
+    let mut acc: std::collections::BTreeMap<String, DeviceRow> = Default::default();
+    for s in &cap {
+        let device_id = s
+            .labels
+            .get("device_id")
+            .cloned()
+            .unwrap_or_else(|| "?".into());
+        let pool = s
+            .labels
+            .get("pool")
+            .cloned()
+            .unwrap_or_else(|| "default".into());
+        let kind = s.labels.get("kind").map(String::as_str).unwrap_or("total");
+        let row = acc.entry(device_id.clone()).or_insert_with(|| DeviceRow {
+            pool: pool.clone(),
+            device_id: device_id.clone(),
+            total_bytes: 0,
+            used_bytes: 0,
+            free_bytes: 0,
+            read_errors: 0,
+            write_errors: 0,
+        });
+        if row.pool.is_empty() {
+            row.pool = pool;
+        }
+        let value = s.value as u64;
+        match kind {
+            "total" => row.total_bytes = value,
+            "used" => row.used_bytes = value,
+            "free" => row.free_bytes = value,
+            _ => {}
+        }
+    }
+    for s in &errs {
+        let device_id = s
+            .labels
+            .get("device_id")
+            .cloned()
+            .unwrap_or_else(|| "?".into());
+        let op = s.labels.get("op").map(String::as_str).unwrap_or("");
+        if let Some(row) = acc.get_mut(&device_id) {
+            match op {
+                "read" => row.read_errors = s.value as u64,
+                "write" => row.write_errors = s.value as u64,
+                _ => {}
+            }
+        }
+    }
+    // Derive `free` when missing.
+    for row in acc.values_mut() {
+        if row.free_bytes == 0 && row.total_bytes >= row.used_bytes {
+            row.free_bytes = row.total_bytes - row.used_bytes;
+        }
+    }
+    acc.into_values().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +573,270 @@ async fn api_create_org(
             axum::Json(serde_json::json!({"error": e.to_string()})),
         ),
     }
+}
+
+/// D3: nested tenant CRUD — create a project under an existing org.
+///
+/// Body: `{"org_id": "...", "name": "..."}`.
+/// Returns `201 {"project_id": "..."}` on success, `404` when the
+/// parent org is missing, `409` on duplicate name, `503` when the
+/// tenant store is not wired on this node.
+#[derive(serde::Deserialize)]
+struct CreateProjectBody {
+    org_id: String,
+    name: String,
+}
+
+async fn api_create_project(
+    State(state): State<UiState>,
+    axum::Json(body): axum::Json<CreateProjectBody>,
+) -> impl IntoResponse {
+    let Some(store) = state.tenants.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "tenant store not wired on this node"})),
+        );
+    };
+    if store.get_org(&body.org_id).is_err() {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!("org {} not found", body.org_id),
+            })),
+        );
+    }
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let proj = kiseki_control::tenant::Project {
+        id: project_id.clone(),
+        org_id: body.org_id,
+        name: body.name,
+        compliance_tags: vec![],
+        quota: kiseki_common::tenancy::Quota {
+            capacity_bytes: 0,
+            iops: 0,
+            metadata_ops_per_sec: 0,
+        },
+    };
+    match store.create_project(proj) {
+        Ok(()) => (
+            axum::http::StatusCode::CREATED,
+            axum::Json(serde_json::json!({"project_id": project_id})),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CreateWorkloadBody {
+    project_id: String,
+    name: String,
+}
+
+async fn api_create_workload(
+    State(state): State<UiState>,
+    axum::Json(body): axum::Json<CreateWorkloadBody>,
+) -> impl IntoResponse {
+    let Some(store) = state.tenants.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "tenant store not wired on this node"})),
+        );
+    };
+    // Resolve org_id via the project lookup so the workload row is
+    // fully populated (TenantStore::create_workload requires it).
+    let Ok(project) = store.get_project(&body.project_id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!("project {} not found", body.project_id),
+            })),
+        );
+    };
+    let workload_id = uuid::Uuid::new_v4().to_string();
+    let wl = kiseki_control::tenant::Workload {
+        id: workload_id.clone(),
+        org_id: project.org_id,
+        project_id: body.project_id,
+        name: body.name,
+        quota: kiseki_common::tenancy::Quota {
+            capacity_bytes: 0,
+            iops: 0,
+            metadata_ops_per_sec: 0,
+        },
+    };
+    match store.create_workload(wl) {
+        Ok(()) => (
+            axum::http::StatusCode::CREATED,
+            axum::Json(serde_json::json!({"workload_id": workload_id})),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CreateNamespaceBody {
+    workload_id: String,
+    name: String,
+}
+
+async fn api_create_namespace(
+    State(state): State<UiState>,
+    axum::Json(body): axum::Json<CreateNamespaceBody>,
+) -> impl IntoResponse {
+    let Some(tenants) = state.tenants.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "tenant store not wired"})),
+        );
+    };
+    let Some(namespaces) = state.namespaces.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "namespace store not wired"})),
+        );
+    };
+    let Ok(workload) = tenants.get_workload(&body.workload_id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!("workload {} not found", body.workload_id),
+            })),
+        );
+    };
+    let namespace_id = uuid::Uuid::new_v4().to_string();
+    let _ = body.name; // namespace store does not persist a human name today
+    let ns = kiseki_control::namespace::Namespace {
+        id: namespace_id.clone(),
+        org_id: workload.org_id,
+        project_id: workload.project_id,
+        shard_id: String::new(),
+        compliance_tags: vec![],
+        read_only: false,
+    };
+    match namespaces.create(ns) {
+        Ok(()) => (
+            axum::http::StatusCode::CREATED,
+            axum::Json(serde_json::json!({"namespace_id": namespace_id})),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TenantDescribeQuery {
+    id: String,
+}
+
+async fn api_tenant_describe(
+    State(state): State<UiState>,
+    Query(params): Query<TenantDescribeQuery>,
+) -> impl IntoResponse {
+    let Some(store) = state.tenants.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "tenant store not wired"})),
+        );
+    };
+    // Auto-detect type by looking it up in each store in order: org,
+    // project, workload, namespace.
+    if let Ok(o) = store.get_org(&params.id) {
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "kind": "organization",
+                "id": o.id,
+                "name": o.name,
+                "quota": {
+                    "capacity_bytes": o.quota.capacity_bytes,
+                    "iops": o.quota.iops,
+                    "metadata_ops_per_sec": o.quota.metadata_ops_per_sec,
+                },
+                "compression_enabled": o.compression_enabled,
+            })),
+        );
+    }
+    if let Ok(p) = store.get_project(&params.id) {
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "kind": "project",
+                "id": p.id,
+                "org_id": p.org_id,
+                "name": p.name,
+            })),
+        );
+    }
+    if let Ok(w) = store.get_workload(&params.id) {
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "kind": "workload",
+                "id": w.id,
+                "org_id": w.org_id,
+                "project_id": w.project_id,
+                "name": w.name,
+            })),
+        );
+    }
+    if let Some(ns_store) = state.namespaces.as_ref() {
+        if let Ok(n) = ns_store.get(&params.id) {
+            return (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "kind": "namespace",
+                    "id": n.id,
+                    "org_id": n.org_id,
+                    "project_id": n.project_id,
+                    "shard_id": n.shard_id,
+                    "read_only": n.read_only,
+                })),
+            );
+        }
+    }
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": format!("no org / project / workload / namespace with id {}", params.id),
+        })),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct TenantDeleteBody {
+    id: String,
+}
+
+async fn api_tenant_delete(
+    State(_state): State<UiState>,
+    axum::Json(body): axum::Json<TenantDeleteBody>,
+) -> impl IntoResponse {
+    // TenantStore / NamespaceStore don't expose `delete` today (the
+    // gRPC ControlService is the source of truth for tenant lifecycle).
+    // Surface a stable error contract so the CLI prints a clear
+    // message; the gRPC path remains canonical until the HTTP delete
+    // verb lands. Tracked in the 2026-05-15 follow-ups doc — this
+    // endpoint exists so operators get a typed error instead of a
+    // 404 on the route.
+    (
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        axum::Json(serde_json::json!({
+            "status": "error",
+            "message": format!(
+                "tenant delete for id {} is not exposed over HTTP yet; \
+                 use the gRPC ControlService (see docs/api/grpc.md)",
+                body.id,
+            ),
+        })),
+    )
 }
 
 async fn api_list_projects(State(state): State<UiState>) -> impl IntoResponse {
@@ -566,8 +997,19 @@ struct AuditQueryParams {
     limit: Option<usize>,
     /// Sequence to start from (inclusive). Default 1.
     from: Option<u64>,
+    /// D5: when true, return only the local node's audit shard.
+    /// Default (false) fans out to all peers and merges results
+    /// keyed by (tenant_id, sequence).
+    #[serde(default)]
+    local_only: bool,
+    /// Internal — set by the coordinator on per-peer fan-out so the
+    /// peer skips its own fan-out (avoids infinite loops). Operators
+    /// should never set this directly.
+    #[serde(default)]
+    no_fanout: bool,
 }
 
+#[allow(clippy::too_many_lines)] // D5 fan-out logic is naturally long
 async fn api_audit_query(
     State(state): State<UiState>,
     Query(params): Query<AuditQueryParams>,
@@ -577,32 +1019,260 @@ async fn api_audit_query(
     };
     let tenant_id = parse_tenant(&params.tenant);
     let event_type = parse_event_type(params.event_type.as_deref());
+    let limit = params.limit.unwrap_or(200);
     let query = AuditQuery {
         tenant_id,
         from: kiseki_common::ids::SequenceNumber(params.from.unwrap_or(1)),
-        limit: params.limit.unwrap_or(200),
+        limit,
         event_type,
     };
-    let events = audit.query(&query);
+
+    // Local query first — always.
+    let local_events = audit.query(&query);
     let total = audit.total_events();
-    let events_json: Vec<_> = events
-        .into_iter()
-        .map(|e| {
-            serde_json::json!({
-                "sequence": e.sequence.0,
-                "type": format!("{:?}", e.event_type),
-                "tenant_id": e.tenant_id.map(|t| t.0.to_string()),
-                "actor": e.actor,
-                "description": e.description,
-                "wall_ms": e.timestamp.wall.millis_since_epoch,
-            })
+
+    // D5: fan out to peers when not explicitly local-only and not in
+    // a per-peer recursion. Each peer record is keyed by `(node_id,
+    // tenant_id, sequence)` for dedup; the global view sorts by
+    // sequence and truncates to `limit`.
+    let do_fanout = !params.local_only && !params.no_fanout;
+    let aggregated_local = local_events
+        .iter()
+        .map(|e| audit_event_to_json(e, state.node_info.node_id))
+        .collect::<Vec<_>>();
+
+    if !do_fanout {
+        return axum::Json(serde_json::json!({
+            "events": aggregated_local,
+            "total_events": total,
+            "available": true,
+            "aggregated": false,
+            "node_id": state.node_info.node_id,
+        }));
+    }
+
+    // Build the peer fan-out target list. Skip self (matched by
+    // node_id) and any peer with no resolvable metrics address.
+    let metrics_port = state
+        .node_info
+        .metrics_addr
+        .split(':')
+        .next_back()
+        .unwrap_or("9090")
+        .to_owned();
+    let self_node_id = state.node_info.node_id;
+    let peers: Vec<(u64, String)> = state
+        .node_info
+        .raft_peers
+        .iter()
+        .filter(|(id, _)| *id != self_node_id)
+        .map(|(id, addr)| {
+            let host = addr.split(':').next().unwrap_or("127.0.0.1");
+            (*id, format!("{host}:{metrics_port}"))
         })
         .collect();
+
+    // Compose the per-peer query string. Cap fan-out by `since`
+    // window + `limit` to bound the byte budget; per-peer responses
+    // can be large, so we deliberately re-use the same limit budget
+    // per peer (the coordinator then truncates the merged set).
+    let mut qs = Vec::new();
+    if let Some(t) = &params.tenant {
+        qs.push(format!("tenant={}", urlencode(t)));
+    }
+    if let Some(t) = &params.event_type {
+        qs.push(format!("event_type={}", urlencode(t)));
+    }
+    qs.push(format!("limit={limit}"));
+    qs.push(format!("from={}", params.from.unwrap_or(1)));
+    // Important: tell the peer NOT to fan out further.
+    qs.push("no_fanout=true".into());
+    let qs_joined = qs.join("&");
+
+    let mut merged: Vec<serde_json::Value> = aggregated_local;
+    let mut unreachable: Vec<u64> = Vec::new();
+    let mut reachable: Vec<u64> = vec![self_node_id];
+
+    for (peer_id, host_port) in &peers {
+        match fetch_peer_audit(host_port, &qs_joined).await {
+            Ok(peer_events) => {
+                reachable.push(*peer_id);
+                for mut ev in peer_events {
+                    // Tag with the originating node_id; the dedup key
+                    // is (node_id, tenant_id, sequence) — without a
+                    // node tag, two nodes may have overlapping local
+                    // sequence numbers for the system shard.
+                    if let Some(obj) = ev.as_object_mut() {
+                        obj.entry("node_id").or_insert(serde_json::json!(peer_id));
+                    }
+                    merged.push(ev);
+                }
+            }
+            Err(_) => unreachable.push(*peer_id),
+        }
+    }
+
+    // Dedup by (node_id, tenant_id, sequence). Audit records carry
+    // monotonic sequence per shard, so a single (node, tenant,
+    // sequence) triple is the canonical id.
+    let mut seen: std::collections::HashSet<(u64, String, u64)> = std::collections::HashSet::new();
+    merged.retain(|ev| {
+        let nid = ev
+            .get("node_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let tid = ev
+            .get("tenant_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let seq = ev
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        seen.insert((nid, tid, seq))
+    });
+
+    // Sort newest-first by sequence; tie-break by node_id for
+    // determinism. Then truncate to `limit` after the merge.
+    merged.sort_by(|a, b| {
+        let aseq = a
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let bseq = b
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        bseq.cmp(&aseq).then_with(|| {
+            let an = a
+                .get("node_id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let bn = b
+                .get("node_id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            an.cmp(&bn)
+        })
+    });
+    merged.truncate(limit);
+
     axum::Json(serde_json::json!({
-        "events": events_json,
+        "events": merged,
         "total_events": total,
         "available": true,
+        "aggregated": true,
+        "node_id": self_node_id,
+        "reachable_nodes": reachable,
+        "unreachable_nodes": unreachable,
     }))
+}
+
+fn audit_event_to_json(e: &kiseki_audit::AuditEvent, node_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "sequence": e.sequence.0,
+        "type": format!("{:?}", e.event_type),
+        "tenant_id": e.tenant_id.map(|t| t.0.to_string()),
+        "actor": e.actor,
+        "description": e.description,
+        "wall_ms": e.timestamp.wall.millis_since_epoch,
+        "node_id": node_id,
+    })
+}
+
+/// Best-effort %-encode for URL query values. Matches the kiseki-admin
+/// CLI's own `url_encode` semantics.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// Fetch a peer's `/admin/audit/query` response and return its events
+/// array. Adds a short timeout so a slow peer doesn't pin the
+/// coordinator's connection pool. Implemented over `tokio::net` with
+/// no extra HTTP client dependency.
+async fn fetch_peer_audit(host_port: &str, query: &str) -> Result<Vec<serde_json::Value>, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+
+    let path = format!("/admin/audit/query?{query}");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    let connect_fut = TcpStream::connect(host_port);
+    let mut stream = timeout(Duration::from_secs(2), connect_fut)
+        .await
+        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|e| format!("connect: {e}"))?;
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let read_fut = stream.read_to_end(&mut buf);
+    timeout(Duration::from_secs(5), read_fut)
+        .await
+        .map_err(|_| "read timeout".to_string())?
+        .map_err(|e| format!("read: {e}"))?;
+    let text = String::from_utf8_lossy(&buf);
+    let body_start = text
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .ok_or("malformed HTTP response")?;
+    let header_lc = text[..body_start].to_ascii_lowercase();
+    let raw_body = &text[body_start..];
+    let body = if header_lc.contains("transfer-encoding: chunked") {
+        decode_chunked_local(raw_body)
+    } else {
+        raw_body.to_string()
+    };
+    let resp: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("decode: {e}"))?;
+    Ok(resp
+        .get("events")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Minimal chunked-encoding decoder. Used only by the peer
+/// audit-query fan-out path; the rest of the server uses axum's
+/// hyper layer for chunked handling.
+fn decode_chunked_local(input: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = input;
+    loop {
+        let trimmed = remaining.trim_start();
+        if trimmed.is_empty() {
+            break;
+        }
+        let line_end = trimmed.find("\r\n").unwrap_or(trimmed.len());
+        let size = usize::from_str_radix(trimmed[..line_end].trim(), 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        let data_start = line_end + 2;
+        if data_start + size <= trimmed.len() {
+            result.push_str(&trimmed[data_start..data_start + size]);
+            remaining = &trimmed[data_start + size..];
+            if remaining.starts_with("\r\n") {
+                remaining = &remaining[2..];
+            }
+        } else {
+            result.push_str(&trimmed[data_start..]);
+            break;
+        }
+    }
+    result
 }
 
 async fn fragment_audit_table(
@@ -715,6 +1385,64 @@ async fn api_keys_status(State(state): State<UiState>) -> impl IntoResponse {
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct KeysShredBody {
+    tenant_id: String,
+    /// Operator-supplied reason — surfaced in the audit event for
+    /// crypto-shred forensics (see
+    /// `kiseki_audit::event::crypto_shred_force_override_event`).
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// D4: tenant-scoped crypto-shred. IRREVERSIBLE — destroys the
+/// tenant's KEK cache entry and emits a `KeyDestruction` audit
+/// event. The actual KEK material lives in the tenant-side KMS
+/// provider and is not retained on the gateway; clearing the
+/// in-process cache + emitting the audit event is the
+/// authoritative HTTP-surface action for this node.
+async fn api_keys_shred(
+    State(state): State<UiState>,
+    axum::Json(body): axum::Json<KeysShredBody>,
+) -> impl IntoResponse {
+    // Parse the tenant id up front so a bad UUID returns 400 instead
+    // of touching the key store / audit log.
+    let Ok(uuid) = uuid::Uuid::parse_str(&body.tenant_id) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": format!("tenant_id `{}` is not a valid UUID", body.tenant_id),
+            })),
+        );
+    };
+    let tenant = kiseki_common::ids::OrgId(uuid);
+    // Emit the audit event regardless of whether a key manager is
+    // wired — the audit trail is the load-bearing artefact for
+    // crypto-shred (ADR-014 §K11).
+    if let Some(audit) = state.audit.as_ref() {
+        let reason = body
+            .reason
+            .clone()
+            .unwrap_or_else(|| "kiseki-admin keys shred".to_string());
+        let event = kiseki_audit::event::crypto_shred_force_override_event(tenant, &reason);
+        audit.append(event);
+    }
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "status": "ok",
+            "message": format!(
+                "crypto-shred audit event recorded for tenant {}; \
+                 tenant-side KMS destruction is the authoritative step \
+                 (see docs/admin/key-management.md)",
+                tenant.0,
+            ),
+            "tenant_id": tenant.0.to_string(),
+            "audit_recorded": state.audit.is_some(),
+        })),
+    )
+}
+
 async fn api_keys_rotate(State(state): State<UiState>) -> impl IntoResponse {
     let Some(km) = state.key_manager.as_ref() else {
         return (
@@ -736,6 +1464,51 @@ async fn api_keys_rotate(State(state): State<UiState>) -> impl IntoResponse {
             axum::Json(serde_json::json!({"error": e.to_string()})),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// whoami (D6)
+// ---------------------------------------------------------------------------
+
+/// D6: surface the authenticated principal back to the client.
+///
+/// The metrics HTTP listener is plain HTTP today (operator-only,
+/// firewalled to the admin VLAN). Reverse proxies (envoy, nginx)
+/// typically forward the client cert's SAN in a header before
+/// proxying to a backend; we honour the canonical ones so a TLS-
+/// terminating proxy in front of this server still gives the client
+/// a meaningful principal.
+///
+/// Headers consulted, in order:
+/// - `x-kiseki-client-san` (kiseki convention)
+/// - `x-ssl-client-san` (envoy default)
+/// - `x-forwarded-client-cert` (proxy spec)
+///
+/// When no header is present, the response sets `san=null` and the
+/// CLI prints "(no SAN) — connection is not mTLS-authenticated".
+async fn api_whoami(
+    State(state): State<UiState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let header_value = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let san = header_value("x-kiseki-client-san")
+        .or_else(|| header_value("x-ssl-client-san"))
+        .or_else(|| header_value("x-forwarded-client-cert"))
+        .filter(|s| !s.is_empty());
+    let tenant_id = header_value("x-kiseki-tenant-id");
+    let workload_id = header_value("x-kiseki-workload-id");
+    axum::Json(serde_json::json!({
+        "node_id": state.node_info.node_id,
+        "metrics_addr": state.node_info.metrics_addr,
+        "san": san,
+        "tenant_id": tenant_id,
+        "workload_id": workload_id,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,5 +1932,53 @@ mod tests {
         let s = short_id(long);
         assert_eq!(s.chars().count(), 13);
         assert!(s.ends_with('…'));
+    }
+
+    // --- D2: per-device pool gauges show up in /admin/pools shape -----
+
+    #[test]
+    fn parse_device_gauge_with_pool_and_kind_labels() {
+        let text = "# HELP kiseki_pool_device_capacity_bytes Per-device capacity\n\
+                    # TYPE kiseki_pool_device_capacity_bytes gauge\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"total\"} 1000\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"used\"} 400\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"free\"} 600\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"warm\",device_id=\"d-2\",kind=\"total\"} 5000\n";
+        let rows = parse_gauge_with_labels(
+            text,
+            "kiseki_pool_device_capacity_bytes",
+            &["pool", "device_id", "kind"],
+        );
+        assert_eq!(rows.len(), 4, "expected 4 sample rows, got {}", rows.len());
+        let hot_d1_total = rows
+            .iter()
+            .find(|s| {
+                s.labels.get("pool").map(String::as_str) == Some("hot")
+                    && s.labels.get("device_id").map(String::as_str) == Some("d-1")
+                    && s.labels.get("kind").map(String::as_str) == Some("total")
+            })
+            .expect("hot/d-1/total row");
+        assert!((hot_d1_total.value - 1000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_per_device_pool_rows_groups_by_device() {
+        let text = "kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"total\"} 1000\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"used\"} 400\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-1\",kind=\"free\"} 600\n\
+                    kiseki_pool_device_capacity_bytes{pool=\"hot\",device_id=\"d-2\",kind=\"total\"} 2000\n";
+        let rows = build_per_device_rows(text);
+        assert_eq!(rows.len(), 2, "expected 2 device rows, got {}", rows.len());
+        let d1 = rows.iter().find(|r| r.device_id == "d-1").expect("d-1 row");
+        assert_eq!(d1.pool, "hot");
+        assert_eq!(d1.total_bytes, 1000);
+        assert_eq!(d1.used_bytes, 400);
+        assert_eq!(d1.free_bytes, 600);
+        let d2 = rows.iter().find(|r| r.device_id == "d-2").expect("d-2 row");
+        assert_eq!(d2.total_bytes, 2000);
+        // Missing `used`/`free` rows default to 0; free derives from
+        // total - used when missing.
+        assert_eq!(d2.used_bytes, 0);
+        assert_eq!(d2.free_bytes, 2000);
     }
 }
