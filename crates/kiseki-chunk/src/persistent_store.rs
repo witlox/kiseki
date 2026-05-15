@@ -1306,6 +1306,7 @@ mod tests {
         assert_eq!(read_b.ciphertext, vec![0x77u8; 8 * 1024 * 1024]);
     }
 
+<<<<<<< HEAD
     /// GH #38 — EC-4+2 fragment exceeds 16 MiB per-extent cap by 8 bytes.
     ///
     /// Reproduces the GCP 6-node `default` profile failure: every
@@ -1323,10 +1324,30 @@ mod tests {
     /// the same bytes verbatim.
     #[test]
     fn write_fragment_at_max_ec_shard_size_round_trips() {
+=======
+    /// GH #39 follow-up: `PersistentChunkStore::from_device` must
+    /// accept a pre-opened `Arc<dyn DeviceBackend>` so the runtime
+    /// can inject `UringFileBackedDevice` (or any other backend the
+    /// selector resolves) without `kiseki-chunk` knowing the concrete
+    /// type. The existing `init`/`open` constructors hard-code
+    /// `FileBackedDevice` inside `kiseki-chunk`, defeating the whole
+    /// point of the `DeviceBackend` trait abstraction.
+    ///
+    /// Pin the contract: a chunk written into a store built from an
+    /// injected device must round-trip through `read_chunk` on the
+    /// same store, exercising the full write+read+meta path on the
+    /// injected backend (no `FileBackedDevice` shortcut anywhere).
+    #[test]
+    fn from_device_round_trips_a_chunk() {
+        use kiseki_block::file::FileBackedDevice;
+        use std::sync::Arc;
+
+>>>>>>> 0701cc1 (test(chunk): RED — PersistentChunkStore::from_device(Arc<dyn DeviceBackend>) (#39))
         let dir = tempfile::tempdir().unwrap();
         let dev_path = dir.path().join("chunks.dev");
         let meta_path = dir.path().join("chunks.meta");
 
+<<<<<<< HEAD
         // 256 MiB device — comfortably larger than the 16 MiB fragment
         // plus superblock + bitmap overhead.
         let mut store =
@@ -1354,6 +1375,34 @@ mod tests {
         assert_eq!(
             read_back, frag_bytes,
             "fragment bytes corrupted after round-trip",
+=======
+        // Open the device OUTSIDE the chunk store — this is the
+        // injection point the runtime selector lives at. Once
+        // KISEKI_IO_URING wiring lands, the runtime swaps
+        // `FileBackedDevice` here for `UringFileBackedDevice`.
+        let device: Arc<dyn DeviceBackend> =
+            Arc::new(FileBackedDevice::init(&dev_path, 64 * 1024 * 1024).unwrap());
+
+        let mut store = PersistentChunkStore::from_device(Arc::clone(&device), &meta_path)
+            .expect("from_device init");
+
+        let env = test_envelope(0x39);
+        let chunk_id = env.chunk_id;
+        let new_written = store.write_chunk(env, "default").unwrap();
+        assert!(new_written, "first write must be new (not dedup)");
+
+        let read_back = store.read_chunk(&chunk_id).unwrap();
+        assert_eq!(read_back.ciphertext, vec![0x39u8; 256]);
+        assert_eq!(read_back.chunk_id, chunk_id);
+
+        // Same device handle is observable from the store — proves
+        // the injection actually went through to the data plane.
+        let handle = store.device_handle();
+        assert!(
+            Arc::ptr_eq(&handle, &device),
+            "device_handle must be the same Arc the runtime injected; \
+             from_device should not re-wrap or clone-construct internally",
+>>>>>>> 0701cc1 (test(chunk): RED — PersistentChunkStore::from_device(Arc<dyn DeviceBackend>) (#39))
         );
     }
 }
