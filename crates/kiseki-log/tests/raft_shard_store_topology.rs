@@ -299,7 +299,22 @@ fn split_shard_redistributes_upper_half_deltas_to_new_shard() {
     });
 
     let new_shard = make_shard_id(50);
-    LogOps::split_shard(&store, shard_id, new_shard, NodeId(1)).expect("split succeeds");
+    // Retry split with a 15-s budget — on contended CI runners the
+    // shard's Raft leader can take a few seconds longer to settle
+    // after init than the preceding `append_delta` calls (those went
+    // through a leader that may have stepped down before the split
+    // call). LeaderUnavailable is the retriable signal.
+    let mut attempts = 0u32;
+    loop {
+        match LogOps::split_shard(&store, shard_id, new_shard, NodeId(1)) {
+            Ok(_) => break,
+            Err(LogError::LeaderUnavailable(_)) if attempts < 30 => {
+                attempts += 1;
+                rt.block_on(async { tokio::time::sleep(Duration::from_millis(500)).await });
+            }
+            Err(e) => panic!("split_shard failed (attempt {attempts}): {e:?}"),
+        }
+    }
     rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
 
     // Original shard: read its full log via the trait. The
