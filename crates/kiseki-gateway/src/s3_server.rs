@@ -1978,4 +1978,163 @@ mod tests {
         let bumped = counter.with_label_values(&["s3", "unknown"]).get();
         assert_eq!(bumped, 1, "307 emission must bump the metric");
     }
+
+    // === Integration — `GatewayError::ForwardToLeader` end-to-end ===
+    //
+    // ADR-042 §4 / ADR-014: the openraft follower hint surfaces as
+    // `LogError::ForwardToLeader { leader_node_id }` through the
+    // `write_with_forwarding` chain; the S3 adapter (`s3.rs::put_object`)
+    // now calls that path, so the handler's match arm at the bottom of
+    // `put_or_upload_part` must convert the typed variant to a 307. The
+    // stub gateway below short-circuits at `write_with_forwarding` so
+    // we exercise the integration without standing up a Raft cluster.
+
+    /// Stub `GatewayOps` whose `write_with_forwarding` always returns
+    /// `GatewayError::ForwardToLeader { leader_node_id }`. Used to
+    /// drive the S3 handler's new arm end-to-end without a real
+    /// openraft store. All other ops are no-ops or error out — the
+    /// test only touches the PUT path.
+    struct ForwardingStubGateway {
+        leader_node_id: kiseki_common::ids::NodeId,
+        shard_id: kiseki_common::ids::ShardId,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ops::GatewayOps for ForwardingStubGateway {
+        async fn read(
+            &self,
+            _req: crate::ops::ReadRequest,
+        ) -> Result<crate::ops::ReadResponse, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::NotFound("stub".into()))
+        }
+        async fn write(
+            &self,
+            _req: crate::ops::WriteRequest,
+        ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
+            // Legacy `write` collapses `ForwardToLeader` onto
+            // `Upstream` — match that contract for any caller that
+            // bypasses `write_with_forwarding`.
+            Err(crate::error::GatewayError::Upstream(
+                "stub: legacy write collapses ForwardToLeader".into(),
+            ))
+        }
+        async fn write_with_forwarding(
+            &self,
+            _req: crate::ops::WriteRequest,
+        ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
+            Err(crate::error::GatewayError::ForwardToLeader {
+                shard_id: self.shard_id,
+                leader_node_id: self.leader_node_id,
+            })
+        }
+        async fn ensure_namespace(
+            &self,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _namespace_id: kiseki_common::ids::NamespaceId,
+        ) -> Result<(), crate::error::GatewayError> {
+            Ok(())
+        }
+    }
+
+    /// PUT against a follower whose openraft store surfaced
+    /// `ForwardToLeader{leader_node_id=2}` must emit `307 Temporary
+    /// Redirect` with `Location: http://10.0.0.2:9000/...`. Covers the
+    /// new arm wired between `S3Adapter::put_object` (now calling
+    /// `write_with_forwarding`) and `put_or_upload_part`'s match.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forward_to_leader_put_emits_307_with_peer_location() {
+        let stub = ForwardingStubGateway {
+            leader_node_id: kiseki_common::ids::NodeId(2),
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(7)),
+        };
+        let s3gw = S3Gateway::new(stub);
+        let tenant = OrgId(uuid::Uuid::nil());
+        let counter = std::sync::Arc::new(
+            prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "test_forward_to_leader_redirects_total",
+                    "test counter for ForwardToLeader integration",
+                ),
+                &["protocol", "tenant"],
+            )
+            .unwrap(),
+        );
+        let app = s3_router_with_peers(
+            s3gw,
+            tenant,
+            AccessKeyStore::new(),
+            None,
+            None,
+            build_peer_map(),
+            Some(counter.clone()),
+        );
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .body(Body::from(&b"payload"[..]))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "ForwardToLeader{{leader_node_id=2}} must emit 307 (ADR-042 §4 / ADR-014)",
+        );
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("Location header on 307")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            loc, "http://10.0.0.2:9000/mybucket/mykey",
+            "Location must point at the leader's S3 endpoint from the peer map",
+        );
+        // The 307 path also bumps the
+        // `kiseki_native_topology_stale_leader_redirects_total` metric
+        // for `ForwardToLeader` (same code path as `LeaderUnavailable`).
+        let bumped = counter.with_label_values(&["s3", "unknown"]).get();
+        assert_eq!(
+            bumped, 1,
+            "ForwardToLeader 307 emission must bump the metric (ADR-008 rev 2 §Observability)",
+        );
+    }
+
+    /// PUT against `ForwardToLeader{leader_node_id=99}` where node 99
+    /// is NOT in the peer map falls back to 503 — the redirect helper
+    /// can't construct a valid `Location:` without a peer entry, and
+    /// silently dropping the redirect is preferable to a malformed
+    /// Location header.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forward_to_leader_unknown_peer_falls_back_to_503() {
+        let stub = ForwardingStubGateway {
+            leader_node_id: kiseki_common::ids::NodeId(99),
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(7)),
+        };
+        let s3gw = S3Gateway::new(stub);
+        let tenant = OrgId(uuid::Uuid::nil());
+        let app = s3_router_with_peers(
+            s3gw,
+            tenant,
+            AccessKeyStore::new(),
+            None,
+            None,
+            build_peer_map(),
+            None,
+        );
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .body(Body::from(&b"payload"[..]))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Unknown peer for ForwardToLeader must fall back to 503",
+        );
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "503 fallback must carry Retry-After",
+        );
+    }
 }
