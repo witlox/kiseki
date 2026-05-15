@@ -52,6 +52,7 @@ All architectural decisions are recorded as ADRs in
 | [ADR-041](adr/041-raft-transport-shard-multiplexing.md) | Raft Transport — Shard Multiplexing on a Single Node Port | Accepted |
 | [ADR-042](adr/042-native-gateway-data-service.md) | Native Gateway Data Service — gRPC data-plane for native clients | Accepted |
 | [ADR-043](adr/043-system-library-ffi.md) | System Library FFI Policy (libfuse 3.x adoption) | Proposed |
+| [ADR-044](adr/044-leader-forwarding-posture.md) | Per-protocol leader-forwarding posture | Accepted |
 
 ---
 
@@ -139,3 +140,6 @@ What else was evaluated and why it was rejected.
 
 ### Build and packaging
 - ADR-043: System library FFI policy (libfuse 3.x adoption rules)
+
+### Routing
+- ADR-044: Per-protocol leader-forwarding posture (S3 307, native proxy, NFS deferred)

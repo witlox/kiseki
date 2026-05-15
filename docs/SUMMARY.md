@@ -102,6 +102,7 @@
   - [ADR-041: Raft Transport — Shard Multiplexing](decisions/adr/041-raft-transport-shard-multiplexing.md)
   - [ADR-042: Native Gateway Data Service](decisions/adr/042-native-gateway-data-service.md)
   - [ADR-043: System Library FFI Policy](decisions/adr/043-system-library-ffi.md)
+  - [ADR-044: Per-Protocol Leader-Forwarding Posture](decisions/adr/044-leader-forwarding-posture.md)
 
 # Background
 
