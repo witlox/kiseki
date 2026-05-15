@@ -1305,4 +1305,55 @@ mod tests {
         let read_b = store.read_chunk(&ChunkId([0xB2; 32])).unwrap();
         assert_eq!(read_b.ciphertext, vec![0x77u8; 8 * 1024 * 1024]);
     }
+
+    /// GH #38 — EC-4+2 fragment exceeds 16 MiB per-extent cap by 8 bytes.
+    ///
+    /// Reproduces the GCP 6-node `default` profile failure: every
+    /// `NFSv4` write loops on
+    /// `block alloc: request exceeds per-extent cap requested=16777224
+    ///  max_per_extent=16777216` (a 16 MiB EC fragment plus the
+    /// 8-byte per-extent header+CRC overhead from `FileBackedDevice`).
+    /// The surface symptom is `quorum lost: only 1/4 replicas acked`
+    /// because every EC fragment with `fragment_index > 0` returns
+    /// `Status::unavailable`.
+    ///
+    /// Contract: `write_fragment` must accept a 16 MiB fragment
+    /// payload (the upper bound for an EC-4+2 split of the 64 MiB
+    /// `MAX_PLAINTEXT_PER_CHUNK`) and `read_fragment` must return
+    /// the same bytes verbatim.
+    #[test]
+    fn write_fragment_at_max_ec_shard_size_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        // 256 MiB device — comfortably larger than the 16 MiB fragment
+        // plus superblock + bitmap overhead.
+        let mut store =
+            PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
+
+        // 16 MiB fragment — what EC-4+2 produces for a 64 MiB chunk
+        // (the gateway's MAX_PLAINTEXT_PER_CHUNK).
+        let frag_bytes: Vec<u8> = (0..16usize * 1024 * 1024)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let chunk_id = ChunkId([0xEC; 32]);
+
+        store
+            .write_fragment(&chunk_id, 1, frag_bytes.clone())
+            .expect("16 MiB EC fragment must fit in a single allocator call");
+
+        let read_back = store
+            .read_fragment(&chunk_id, 1)
+            .expect("read_fragment after write_fragment must succeed");
+        assert_eq!(
+            read_back.len(),
+            frag_bytes.len(),
+            "fragment length mismatch after round-trip",
+        );
+        assert_eq!(
+            read_back, frag_bytes,
+            "fragment bytes corrupted after round-trip",
+        );
+    }
 }
