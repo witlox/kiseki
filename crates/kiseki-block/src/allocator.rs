@@ -396,4 +396,42 @@ mod tests {
         alloc.alloc(4096).unwrap();
         assert_eq!(alloc.free_blocks(), 0);
     }
+
+    /// GH #38 — EC-4+2 fragment exceeds 16 MiB per-extent cap by 8 bytes.
+    ///
+    /// On a 6-node EC-4+2 cluster, a 64 MiB chunk splits into four 16 MiB
+    /// data fragments. `PersistentChunkStore::write_fragment` calls
+    /// `device.alloc(16 MiB)`. The `FileBackedDevice::alloc` impl adds
+    /// `OVERHEAD = HEADER_SIZE + CRC_SIZE = 8` bytes of per-extent
+    /// header/CRC, so the underlying `BitmapAllocator::alloc` request is
+    /// `16 MiB + 8 = 16777224` — exactly `MAX_EXTENT_BYTES + 8`, which
+    /// trips `AllocError::RequestTooLarge` and surfaces upstream as
+    /// `quorum lost: only 1/4 replicas acked`.
+    ///
+    /// Contract: a single `alloc()` call MUST be able to back a 16 MiB
+    /// payload plus the per-extent header/CRC overhead — that's what
+    /// real callers (write_fragment, write_chunk-via-chunked) need.
+    #[test]
+    fn alloc_fits_16_mib_payload_plus_overhead() {
+        // 64 MiB device — enough for one 16 MiB+overhead extent with
+        // plenty of headroom.
+        let mut alloc = BitmapAllocator::new(16 * 1024, 4096); // 64 MiB / 4K blocks
+
+        // `FileBackedDevice` adds 4 B header + 4 B CRC = 8 B overhead
+        // before delegating to the bitmap allocator. A 16 MiB EC
+        // fragment becomes a 16 MiB + 8 B request here.
+        const OVERHEAD: u64 = 8;
+        let req = 16 * 1024 * 1024 + OVERHEAD;
+        let ext = alloc
+            .alloc(req)
+            .expect("16 MiB payload + per-extent overhead must fit");
+        // Extent must cover the full request — anything smaller would
+        // silently truncate the write (the original Bug 5 mode).
+        assert!(
+            ext.length >= req,
+            "extent length {} < requested {}",
+            ext.length,
+            req,
+        );
+    }
 }
