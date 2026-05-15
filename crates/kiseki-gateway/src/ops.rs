@@ -397,3 +397,36 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
         (**self).list_named(tenant_id, namespace_id, prefix).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RED-first: I-NG5 (idempotency dedup byte-preserve through proxy)
+    /// requires `WriteRequest` to carry the request's
+    /// `ControlFields.idempotency_key`. Audit finding `I-NG5` in
+    /// `specs/findings/2026-05-15-gate2-audit.md` calls this out as
+    /// DEFERRED — the internal `WriteRequest` doesn't have the field, so
+    /// the wire-level proxy can't preserve it byte-for-byte. Without
+    /// the key on `WriteRequest`, retries through a different node will
+    /// commit twice instead of dedup-short-circuiting on the leader.
+    #[test]
+    fn write_request_carries_idempotency_key() {
+        let req = WriteRequest {
+            tenant_id: OrgId(uuid::Uuid::nil()),
+            namespace_id: NamespaceId(uuid::Uuid::nil()),
+            data: b"payload".to_vec(),
+            name: Some("k".into()),
+            conditional: None,
+            workflow_ref: None,
+            // RED: this field doesn't exist yet — adding it is the GREEN.
+            idempotency_key: Some(vec![0xAB; 16]),
+        };
+        let cloned = req.clone();
+        assert_eq!(
+            cloned.idempotency_key,
+            Some(vec![0xAB; 16]),
+            "idempotency_key MUST survive a clone so the proxy hop can re-issue it byte-for-byte"
+        );
+    }
+}
