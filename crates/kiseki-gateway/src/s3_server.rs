@@ -346,10 +346,9 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
     let request_scheme = request_scheme_from_uri_and_headers(&original_uri, &headers);
-    let request_path_and_query = original_uri.path_and_query().map_or_else(
-        || format!("/{bucket}/{key}"),
-        |pq| pq.as_str().to_owned(),
-    );
+    let request_path_and_query = original_uri
+        .path_and_query()
+        .map_or_else(|| format!("/{bucket}/{key}"), |pq| pq.as_str().to_owned());
 
     // If uploadId + partNumber present, this is UploadPart.
     if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
@@ -445,6 +444,28 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
             &request_path_and_query,
             shard_id,
             leader_hint,
+            &state.peer_s3_addrs,
+            state.stale_leader_redirects_total.as_deref(),
+        ),
+        // ADR-042 §4 / ADR-014 — `GatewayError::ForwardToLeader` is the
+        // definite-leader sibling of `LeaderUnavailable`: the openraft
+        // follower surfaced a concrete `leader_node_id` hint via the
+        // `write_with_forwarding` chain. Re-use the 307 helper with
+        // `Some(leader_node_id.0)` so the same scheme-preserving,
+        // method-gated path applies (write-only redirect, peer-map
+        // lookup, optional metric bump). The native-server proxy
+        // fallback (`KISEKI_NATIVE_PROXY_FALLBACK=on`) handles the
+        // gRPC equivalent; this arm covers the S3 protocol's analog
+        // per ADR-042 §4 cross-protocol policy.
+        Err(crate::error::GatewayError::ForwardToLeader {
+            shard_id,
+            leader_node_id,
+        }) => leader_unavailable_response(
+            &axum::http::Method::PUT,
+            &request_scheme,
+            &request_path_and_query,
+            shard_id,
+            Some(leader_node_id.0),
             &state.peer_s3_addrs,
             state.stale_leader_redirects_total.as_deref(),
         ),
