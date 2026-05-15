@@ -728,6 +728,50 @@ pub async fn run_main(
         ))
     };
 
+    // GH #36 — periodic chunk GC. `decrement_refcount` (called by the
+    // gateway delete path on NFS REMOVE / S3 DELETE / FUSE unlink)
+    // drops the refcount, but the actual device-extent reclamation
+    // happens inside `AsyncChunkOps::gc()` which sweeps chunks whose
+    // refcount has reached 0 (and have no retention holds) and calls
+    // `device.free()` on each extent. Without this task the bitmap
+    // allocator's free list bled out on the GCP 2026-05-15 perf
+    // cluster — ~200 GB of cumulative writes filled every node despite
+    // every fio file having been `rm`-ed between runs. `largest_free_
+    // blocks=64` (256 KiB) was the smoking gun: the free list had
+    // collapsed into singleton tail-extents because reclaimed space
+    // never returned.
+    //
+    // Cadence: 60 s default, override via `KISEKI_CHUNK_GC_INTERVAL_S`.
+    // Cheap when there's nothing to do — `gc()` is an in-memory
+    // filter over the chunks map keyed on `refcount == 0`. Per-record
+    // fjall removes only run for chunks that actually became
+    // garbage.
+    {
+        let gc_store = Arc::clone(&local_chunk_store);
+        let gc_interval_s = std::env::var("KISEKI_CHUNK_GC_INTERVAL_S")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(60);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(gc_interval_s));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the first immediate tick — let the server settle
+            // before the first sweep. Subsequent ticks fire on schedule.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let freed = gc_store.gc().await;
+                if freed > 0 {
+                    tracing::info!(freed_chunks = freed, "chunk GC swept refcount-0 chunks");
+                } else {
+                    tracing::debug!("chunk GC: nothing to reclaim");
+                }
+            }
+        });
+        tracing::info!(gc_interval_s, "chunk store: periodic GC task spawned");
+    }
+
     // Cluster chunk fabric (Phase 16a step 12). For each *other* peer
     // in raft_peers we open a lazy mTLS gRPC Channel to its data-path
     // port and wrap it in GrpcFabricPeer. For a 1-node cluster peers
