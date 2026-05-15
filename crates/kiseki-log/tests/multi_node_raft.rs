@@ -373,7 +373,7 @@ async fn follower_append_delta_with_forwarding_returns_leader_id() {
                 .await;
             match retry {
                 Err(LogError::ForwardToLeader { leader_node_id, .. }) => {
-                    assert_eq!(leader_node_id, leader_expected)
+                    assert_eq!(leader_node_id, leader_expected);
                 }
                 other => panic!("after settle, expected ForwardToLeader, got {other:?}"),
             }
@@ -385,8 +385,8 @@ async fn follower_append_delta_with_forwarding_returns_leader_id() {
 /// Verify the **legacy** `append_delta` still collapses the
 /// forward hint onto `LeaderUnavailable`. This is the
 /// backwards-compatibility contract — existing callers
-/// (mem_gateway, composition::log_bridge, etc.) MUST see no behavior
-/// change from the ADR-044 work.
+/// (`mem_gateway`, `composition::log_bridge`, etc.) MUST see no
+/// behavior change from the ADR-044 work.
 #[tokio::test]
 async fn follower_legacy_append_delta_still_returns_leader_unavailable() {
     use kiseki_log::error::LogError;
@@ -418,7 +418,7 @@ async fn follower_legacy_append_delta_still_returns_leader_unavailable() {
     assert!(
         matches!(
             result,
-            Err(LogError::LeaderUnavailable(_)) | Err(LogError::Unavailable)
+            Err(LogError::LeaderUnavailable(_) | LogError::Unavailable)
         ),
         "legacy append_delta on follower must return LeaderUnavailable / Unavailable, got {result:?}"
     );

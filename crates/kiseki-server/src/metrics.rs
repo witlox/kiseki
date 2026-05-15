@@ -72,6 +72,14 @@ pub struct KisekiMetrics {
     /// to spot misconfigured clients.
     pub gateway_workflow_ref_writes_total: IntCounterVec,
 
+    /// ADR-044 — count of writes the native server forwarded to a
+    /// peer leader via the in-process proxy path. Labels:
+    /// `source_node` (this node's id) and `leader_node` (target
+    /// leader's id). Sustained share > 20% of total writes is the
+    /// operator alarm declared in ADR-044 §"Consequences" (stale
+    /// client topology cache or unstable leadership).
+    pub native_proxy_forwards_total: IntCounterVec,
+
     // --- Pool ---
     /// Pool capacity bytes (total).
     pub pool_capacity_total: IntGaugeVec,
@@ -301,6 +309,18 @@ impl KisekiMetrics {
             .register(Box::new(gateway_workflow_ref_writes_total.clone()))
             .expect("register");
 
+        let native_proxy_forwards_total = IntCounterVec::new(
+            Opts::new(
+                "kiseki_native_proxy_forwards_total",
+                "Native gateway requests forwarded to a peer leader via the in-process proxy path (ADR-044)",
+            ),
+            &["source_node", "leader_node"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(native_proxy_forwards_total.clone()))
+            .expect("register");
+
         let pool_capacity_total = IntGaugeVec::new(
             Opts::new("kiseki_pool_capacity_total_bytes", "Pool total capacity"),
             &["pool"],
@@ -434,6 +454,7 @@ impl KisekiMetrics {
             gateway_get_phase_duration,
             gateway_put_phase_duration,
             gateway_workflow_ref_writes_total,
+            native_proxy_forwards_total,
             pool_capacity_total,
             pool_capacity_used,
             transport_connections_active,

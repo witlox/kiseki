@@ -30,7 +30,7 @@
 // they stay async to preserve the wire-shape contract.
 #![allow(clippy::unused_async)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
@@ -41,6 +41,7 @@ use crate::error::GatewayError;
 use crate::ops::{GatewayOps, ReadRequest, WriteConditional, WriteRequest};
 
 use super::lease_store::{AcquireOutcome, LeaseStore, ReleaseOutcome, RenewOutcome};
+use super::proxy_client::ProxyClient;
 use super::signing_keys::SigningKeys;
 
 /// Maximum bytes per `BatchFetchDek` request (gate-1 round-2 N2).
@@ -68,6 +69,16 @@ pub struct ServerImpl {
     stream_caps: Arc<parking_lot::Mutex<std::collections::HashMap<OrgId, AtomicU64>>>,
     #[allow(dead_code)]
     max_streams_per_tenant: u64,
+    /// ADR-044 proxy fallback toggle — `KISEKI_NATIVE_PROXY_FALLBACK`.
+    /// `false` by default (ADR-042 §4 "explicit-routing-only"). When
+    /// `true`, the per-verb proxy code paths catch
+    /// [`GatewayError::ForwardToLeader`] and dial the leader via
+    /// [`proxy_client`].
+    proxy_fallback_enabled: AtomicBool,
+    /// ADR-044 proxy channel pool. `None` when proxy fallback is
+    /// off or hasn't been wired; the per-verb proxy paths fall back
+    /// to surfacing the original `ForwardToLeader` error in that case.
+    proxy_client: Option<Arc<ProxyClient>>,
 }
 
 /// Topology snapshot (server side). The data-path runtime updates this
@@ -113,7 +124,8 @@ impl TopologyInjector {
 
 impl ServerImpl {
     /// Build a new handler with sensible defaults
-    /// (`max_streams_per_tenant = 256`).
+    /// (`max_streams_per_tenant = 256`, proxy fallback disabled per
+    /// ADR-042 §4).
     #[must_use]
     pub fn new(ops: Arc<dyn GatewayOps>, signing_keys: Arc<SigningKeys>) -> Self {
         Self {
@@ -123,7 +135,40 @@ impl ServerImpl {
             topology: Arc::new(TopologyInjector::empty()),
             stream_caps: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             max_streams_per_tenant: 256,
+            proxy_fallback_enabled: AtomicBool::new(false),
+            proxy_client: None,
         }
+    }
+
+    /// ADR-044 — flip the proxy fallback on/off. Runtime calls this
+    /// at startup based on `KISEKI_NATIVE_PROXY_FALLBACK`. The flag
+    /// can also be toggled at runtime (e.g., from a future admin
+    /// gRPC) since it's an `AtomicBool`.
+    pub fn set_proxy_fallback_enabled(&self, enabled: bool) {
+        self.proxy_fallback_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Read the current proxy fallback toggle.
+    #[must_use]
+    pub fn is_proxy_fallback_enabled(&self) -> bool {
+        self.proxy_fallback_enabled.load(Ordering::SeqCst)
+    }
+
+    /// ADR-044 — wire the proxy channel pool. Once set, per-verb
+    /// proxy paths use this to dial peer leaders. Setting to `None`
+    /// disables proxying (the flag alone is not enough — the
+    /// channel pool must be present too).
+    #[must_use]
+    pub fn with_proxy_client(mut self, pc: Arc<ProxyClient>) -> Self {
+        self.proxy_client = Some(pc);
+        self
+    }
+
+    /// Borrow the proxy channel pool (if any). Tests + runtime
+    /// inspection.
+    #[must_use]
+    pub fn proxy_client(&self) -> Option<&Arc<ProxyClient>> {
+        self.proxy_client.as_ref()
     }
 
     /// Override the per-tenant in-flight stream cap.
