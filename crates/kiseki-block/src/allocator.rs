@@ -25,15 +25,32 @@ pub struct BitmapAllocator {
     max_extent_blocks: u64,
 }
 
-/// Maximum extent size: 16 MiB.
+/// Maximum extent size: 16 MiB + 8 bytes of per-extent header/CRC
+/// overhead — i.e. enough to hold a **16 MiB payload** plus the
+/// `FileBackedDevice` framing (`HEADER_SIZE + CRC_SIZE = 8 B`).
+///
+/// GH #38 (2026-05-15): the prior 16 MiB-exactly cap rejected every
+/// EC-4+2 fragment write on a 6-node `default` profile cluster. The
+/// gateway's `MAX_PLAINTEXT_PER_CHUNK = 64 MiB` splits into four
+/// 16 MiB data shards under EC-4+2; `write_fragment` then calls
+/// `device.alloc(16 MiB)`, the file backend wraps it as
+/// `16 MiB + 8 B = 16777224`, and the bitmap allocator returned
+/// `RequestTooLarge`. Caller could not retry — `write_fragment`
+/// stores a single extent per `(chunk_id, fragment_index)`. Bumping
+/// the cap to include the 8 B of framing lets a 16 MiB payload fit
+/// in one extent without changing the **payload semantic** (still
+/// 16 MiB per fragment); the underlying extent rounds up to one
+/// extra 4 KiB block per request, which is a negligible cost given
+/// the bitmap allocator's block-level accounting.
 ///
 /// Public so chunk-store callers can pre-chunk payloads larger than
 /// one extent. A single `alloc()` call returns at most this many
 /// bytes; for larger payloads, callers must loop. See
 /// [`crate::file::FileBackedDevice::write`] for the per-extent
 /// header + CRC trailer overhead the caller must subtract from this
-/// to size each chunk.
-pub const MAX_EXTENT_BYTES: u64 = 16 * 1024 * 1024;
+/// to size each chunk (i.e. use `MAX_EXTENT_PAYLOAD_BYTES = 16 MiB`,
+/// which subtracts the 8 B framing back out).
+pub const MAX_EXTENT_BYTES: u64 = 16 * 1024 * 1024 + 8;
 
 impl BitmapAllocator {
     /// Create a new allocator for a device.
@@ -46,7 +63,14 @@ impl BitmapAllocator {
         // bitmap index always fits in usize for practical device sizes
         let bitmap_bytes = total_blocks.div_ceil(8) as usize;
         let bitmap = vec![0u8; bitmap_bytes];
-        let max_extent_blocks = MAX_EXTENT_BYTES / u64::from(block_size);
+        // GH #38: `div_ceil` so an extent capped at
+        // `MAX_EXTENT_BYTES = 16 MiB + 8 B` rounds *up* to a whole
+        // number of blocks (4097 × 4 KiB = 16 MiB + 4 KiB for the
+        // default block size). Plain `/` would truncate to 4096 and
+        // re-reject the 16 MiB + 8 B framed request — defeating the
+        // whole point of the cap bump. Pin the block-aligned upper
+        // bound at "smallest block count ≥ MAX_EXTENT_BYTES".
+        let max_extent_blocks = MAX_EXTENT_BYTES.div_ceil(u64::from(block_size));
 
         let mut alloc = Self {
             total_blocks,
@@ -63,7 +87,8 @@ impl BitmapAllocator {
     #[must_use]
     pub fn from_bitmap(bitmap: Vec<u8>, total_blocks: u64, block_size: u32) -> Self {
         assert!(block_size > 0, "block_size must be positive");
-        let max_extent_blocks = MAX_EXTENT_BYTES / u64::from(block_size);
+        // GH #38: see `new()` for the `div_ceil` rationale.
+        let max_extent_blocks = MAX_EXTENT_BYTES.div_ceil(u64::from(block_size));
         let mut alloc = Self {
             total_blocks,
             block_size,
