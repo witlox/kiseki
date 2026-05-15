@@ -97,6 +97,10 @@ required-features = ["native"]
 name = "fuse_sync_adjacent_ops"
 required-features = ["fuse"]
 
+[[test]]
+name = "fuse_o_direct"
+required-features = ["fuse"]
+
 [dev-dependencies]
 async-trait = "0.1"
 kiseki-chunk-cluster = { workspace = true }

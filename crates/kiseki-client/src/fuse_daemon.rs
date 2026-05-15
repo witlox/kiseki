@@ -81,6 +81,50 @@ pub(crate) const FILE_OPEN_OPTIONS: OpenOptions = OpenOptions {
     cache_readdir: false,
 };
 
+/// Per-open cache hint derivation — examines the kernel-supplied
+/// open `flags` (POSIX `O_*` bits) and returns the
+/// [`OpenOptions`] reply for `FUSE_OPEN` / `FUSE_CREATE`.
+///
+/// Default (no `O_DIRECT`): the long-standing
+/// `FOPEN_KEEP_CACHE` behavior — kiseki chunks are content-
+/// addressed so the kernel page cache stays coherent across
+/// opens and a repeat read need not refetch through the gateway.
+///
+/// With `O_DIRECT`: surface `FOPEN_DIRECT_IO` so the kernel
+/// routes IO through the direct path (no page cache, the user
+/// MUST supply aligned buffers). Without this reply bit the
+/// kernel either rejects the `open(2)` with EINVAL or silently
+/// services the IO from the page cache — both surface as
+/// `fio --direct=1` reporting 0 MB/s. See GH issue #37.
+///
+/// `direct_io` and `keep_cache` are mutually exclusive — when
+/// direct-IO is on, the kernel must not cache pages for this fd
+/// or stale reads would slip out.
+#[cfg(feature = "fuse")]
+#[must_use]
+pub fn open_options_for_flags(flags: i32) -> OpenOptions {
+    // GH#37: when the caller opened the file with O_DIRECT, the
+    // kernel only honors direct-IO semantics if the FUSE backend
+    // returns FOPEN_DIRECT_IO from FUSE_OPEN / FUSE_CREATE.
+    // Without that reply bit the kernel either rejects the open
+    // with EINVAL or silently routes through the page cache.
+    //
+    // direct_io and keep_cache are mutually exclusive: a fd with
+    // direct-IO MUST bypass the page cache (or stale pre-direct
+    // pages would surface on subsequent reads).
+    if (flags & libc::O_DIRECT) != 0 {
+        OpenOptions {
+            fh: 0,
+            keep_cache: false,
+            direct_io: true,
+            nonseekable: false,
+            cache_readdir: false,
+        }
+    } else {
+        FILE_OPEN_OPTIONS
+    }
+}
+
 #[cfg(feature = "fuse")]
 fn to_kiseki_fuse_attr(ino: u64, attr: &crate::fuse_fs::FileAttr) -> KFuseAttr {
     // Bug 7 (GCP 2026-05-04): the prior implementation hard-coded
@@ -235,13 +279,18 @@ impl<G: GatewayOps + Send + Sync + 'static> kiseki_fuse::Filesystem for FuseDaem
         conn.want |= conn.capable & caps::EXPORT_SUPPORT;
     }
 
-    fn open(&self, _ctx: &OpContext, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(FILE_OPEN_OPTIONS);
+    fn open(&self, _ctx: &OpContext, _ino: u64, flags: i32, reply: ReplyOpen) {
+        // GH#37: honor caller-requested O_DIRECT by surfacing
+        // FOPEN_DIRECT_IO so the kernel actually bypasses the
+        // page cache for this fd. Otherwise `fio --direct=1`
+        // either errors with EINVAL or silently routes through
+        // the cache and reports 0 MB/s.
+        reply.opened(open_options_for_flags(flags));
     }
 
     fn opendir(&self, _ctx: &OpContext, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Same OpenOptions — keep_cache lets the kernel cache
-        // directory entries between opendir + readdir invocations.
+        // Directories never carry O_DIRECT semantics — keep_cache
+        // lets the kernel cache entries between opendir + readdir.
         reply.opened(FILE_OPEN_OPTIONS);
     }
 
@@ -342,7 +391,7 @@ impl<G: GatewayOps + Send + Sync + 'static> kiseki_fuse::Filesystem for FuseDaem
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         if parent != 1 {
@@ -402,7 +451,16 @@ impl<G: GatewayOps + Send + Sync + 'static> kiseki_fuse::Filesystem for FuseDaem
                         return;
                     }
                 };
-                reply.created(&to_kiseki_fuse_attr(ino, &attr), 0, FILE_OPEN_OPTIONS);
+                // GH#37: a CREATE that opens with O_DIRECT (e.g.
+                // `open(path, O_CREAT | O_DIRECT | O_RDWR)`) must
+                // get FOPEN_DIRECT_IO on the open-half of the
+                // combined CREATE+OPEN op, same as the standalone
+                // open() callback above.
+                reply.created(
+                    &to_kiseki_fuse_attr(ino, &attr),
+                    0,
+                    open_options_for_flags(flags),
+                );
             }
             Err(e) => reply.error(FuseError::Errno(e)),
         }
