@@ -1309,7 +1309,7 @@ mod tests {
     /// GH #38 — EC-4+2 fragment exceeds 16 MiB per-extent cap by 8 bytes.
     ///
     /// Reproduces the GCP 6-node `default` profile failure: every
-    /// NFSv4 write loops on
+    /// `NFSv4` write loops on
     /// `block alloc: request exceeds per-extent cap requested=16777224
     ///  max_per_extent=16777216` (a 16 MiB EC fragment plus the
     /// 8-byte per-extent header+CRC overhead from `FileBackedDevice`).

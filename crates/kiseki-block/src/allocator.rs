@@ -435,17 +435,18 @@ mod tests {
     ///
     /// Contract: a single `alloc()` call MUST be able to back a 16 MiB
     /// payload plus the per-extent header/CRC overhead — that's what
-    /// real callers (write_fragment, write_chunk-via-chunked) need.
+    /// real callers (`write_fragment`, `write_chunk`-via-chunked) need.
     #[test]
     fn alloc_fits_16_mib_payload_plus_overhead() {
-        // 64 MiB device — enough for one 16 MiB+overhead extent with
-        // plenty of headroom.
-        let mut alloc = BitmapAllocator::new(16 * 1024, 4096); // 64 MiB / 4K blocks
-
         // `FileBackedDevice` adds 4 B header + 4 B CRC = 8 B overhead
         // before delegating to the bitmap allocator. A 16 MiB EC
         // fragment becomes a 16 MiB + 8 B request here.
         const OVERHEAD: u64 = 8;
+
+        // 64 MiB device — enough for one 16 MiB+overhead extent with
+        // plenty of headroom.
+        let mut alloc = BitmapAllocator::new(16 * 1024, 4096); // 64 MiB / 4K blocks
+
         let req = 16 * 1024 * 1024 + OVERHEAD;
         let ext = alloc
             .alloc(req)
