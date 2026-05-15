@@ -125,11 +125,13 @@ impl TopologyCache {
     ///
     /// Returns `true` iff the snapshot was applied (`snap.version >
     /// self.current_version()`).
-    ///
-    /// Implementer-step stub: always returns `false`. Body lands
-    /// next.
-    pub fn replace_if_newer(&self, _snap: Snapshot) -> bool {
-        false
+    pub fn replace_if_newer(&self, snap: Snapshot) -> bool {
+        if snap.version > self.current_version() {
+            self.replace(snap);
+            true
+        } else {
+            false
+        }
     }
 
     /// Snapshot the current cache. Cheap (`Snapshot: Clone`).
@@ -210,19 +212,83 @@ pub struct RouteHit {
 /// HTTP `/cluster/info` JSON. Used before the native gRPC channel is
 /// dialled (the gRPC `GetTopology` is the steady-state refresh).
 ///
-/// Returns a `Snapshot` whose `version` is derived from the index of
-/// the response within the client's lifetime — the HTTP bootstrap
-/// endpoint does not surface the control-plane Raft state-machine
-/// version directly. Subsequent gRPC `GetTopology` calls overwrite
-/// this with the authoritative version on first response trailer.
-///
-/// Architect-step stub: returns an empty snapshot. The implementer
-/// step replaces this with a real walk over `parsed.shards` once the
-/// failing unit tests are in place.
+/// The returned snapshot carries `version = 1` as a synthetic
+/// floor — strictly above the cache's initial `version = 0` so the
+/// HTTP bootstrap populates an empty cache. Subsequent gRPC
+/// `GetTopology` responses carry the authoritative control-plane
+/// version (typically ≥ 1 for any namespace that has ever been
+/// created), and `replace_if_newer` upgrades the cache to that
+/// version on first response.
 #[must_use]
-#[allow(clippy::missing_panics_doc)]
-pub fn snapshot_from_cluster_info(_parsed: &crate::discovery::ClusterInfoResponse) -> Snapshot {
-    Snapshot::default()
+pub fn snapshot_from_cluster_info(parsed: &crate::discovery::ClusterInfoResponse) -> Snapshot {
+    // Build the nodes list from `peers`. Each peer's data-port
+    // address is its raft host + the conventional 9100 port; this
+    // mirrors what `node_info_from_plan` produces server-side.
+    let nodes: Vec<Node> = parsed
+        .peers
+        .iter()
+        .map(|p| {
+            let host = p.raft_addr.split(':').next().unwrap_or("127.0.0.1");
+            Node {
+                node_id: p.id,
+                data_addr: format!("{host}:9100"),
+                state: kiseki_proto::native_contract::NodeState::Active,
+                bindings: Vec::new(),
+            }
+        })
+        .collect();
+
+    // Project each shard onto the cache's Shard shape. Missing
+    // leader_id maps to 0 (sentinel for "unknown" — the cache's
+    // route_for_hashed_key falls back to a refresh in that case).
+    let shards: Vec<Shard> = parsed
+        .shards
+        .iter()
+        .map(|s| {
+            let range_start = decode_hex_prefixed(&s.range_start).unwrap_or_default();
+            let range_end = decode_hex_prefixed(&s.range_end).unwrap_or_default();
+            Shard {
+                shard_id: s.shard_id.clone(),
+                leader_node_id: s.leader_id.unwrap_or(0),
+                range_start,
+                range_end,
+            }
+        })
+        .collect();
+
+    Snapshot {
+        version: 1,
+        nodes,
+        shards,
+    }
+}
+
+/// Same hex decoder as `discovery.rs`. Duplicated here so the two
+/// modules don't cross-import each other's internals.
+fn decode_hex_prefixed(s: &str) -> Option<Vec<u8>> {
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    if stripped.len() != 64 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(32);
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble_value(bytes[i])?;
+        let lo = hex_nibble_value(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+const fn hex_nibble_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Convert a proto-shaped `TopologyInfo` (from `GetTopology`) into a

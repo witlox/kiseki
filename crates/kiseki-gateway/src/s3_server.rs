@@ -337,12 +337,18 @@ struct PutParams {
 
 async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<PutParams>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
+    let request_scheme = request_scheme_from_uri_and_headers(&original_uri, &headers);
+    let request_path_and_query = original_uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| format!("/{bucket}/{key}"));
 
     // If uploadId + partNumber present, this is UploadPart.
     if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
@@ -429,8 +435,38 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
             "NoSuchBucket",
             "The specified bucket does not exist.",
         ),
+        Err(crate::error::GatewayError::LeaderUnavailable {
+            shard_id,
+            leader_hint,
+        }) => leader_unavailable_response(
+            &axum::http::Method::PUT,
+            &request_scheme,
+            &request_path_and_query,
+            shard_id,
+            leader_hint,
+            &state.peer_s3_addrs,
+            state.stale_leader_redirects_total.as_deref(),
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// ADR-008 rev 2 / adversary finding S3 — resolve the request's
+/// URI scheme to preserve TLS / non-TLS in the 307 redirect
+/// Location header. Falls back to:
+///   1. `original_uri.scheme_str()` — set when the gateway sits
+///      behind a TLS-terminating proxy that forwards `X-Forwarded-Proto`
+///      *as* the scheme. Axum exposes the parsed URI here.
+///   2. `X-Forwarded-Proto` header (standard reverse-proxy convention).
+///   3. "http" — sane default for plain-listener deploys.
+fn request_scheme_from_uri_and_headers(uri: &axum::http::Uri, headers: &HeaderMap) -> String {
+    if let Some(scheme) = uri.scheme_str() {
+        return scheme.to_owned();
+    }
+    if let Some(proto) = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) {
+        return proto.to_owned();
+    }
+    "http".to_owned()
 }
 
 /// Parse `If-None-Match` / `If-Match` HTTP headers into a

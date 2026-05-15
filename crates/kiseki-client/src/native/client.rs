@@ -95,11 +95,6 @@ impl NativeClient {
     /// # Errors
     /// Returns `Connect("all seeds unreachable: ...")` when every
     /// seed in the list fails to connect within the per-seed timeout.
-    ///
-    /// Architect-step stub: implements the single-seed fast path
-    /// (matches the rev-1 `connect` behavior). The seed-fall-through
-    /// + per-seed timeout body lands in the implementer step once
-    /// the failing unit tests are in place.
     pub async fn connect_with_seeds(
         seeds: &[String],
         tenant_id: OrgId,
@@ -107,31 +102,52 @@ impl NativeClient {
         if seeds.is_empty() {
             return Err(NativeClientError::Connect("no seeds provided".to_owned()));
         }
-        // STUB — implementer step replaces the single-seed body with
-        // a proper fall-through loop. Today, the first seed is the
-        // only attempt; behavior matches rev-1.
-        let seed = &seeds[0];
-        let url = if seed.starts_with("http://") || seed.starts_with("https://") {
-            seed.clone()
-        } else {
-            format!("http://{seed}")
-        };
-        let endpoint = Endpoint::from_shared(url)
-            .map_err(|e| NativeClientError::Connect(e.to_string()))?
-            .tcp_nodelay(true)
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(SEED_CONNECT_TIMEOUT);
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| NativeClientError::Connect(e.to_string()))?;
-        Ok(Self {
-            channel,
-            topology: Arc::new(TopologyCache::new()),
-            leases: LeaseManager::new(),
-            stream_caps: Arc::new(StreamCapMap::new(256)),
-            tenant_id,
-        })
+        let mut last_err: Option<String> = None;
+        let mut attempts: Vec<String> = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let url = if seed.starts_with("http://") || seed.starts_with("https://") {
+                seed.clone()
+            } else {
+                format!("http://{seed}")
+            };
+            let endpoint = match Endpoint::from_shared(url) {
+                Ok(ep) => ep
+                    .tcp_nodelay(true)
+                    .timeout(Duration::from_secs(30))
+                    .connect_timeout(SEED_CONNECT_TIMEOUT),
+                Err(e) => {
+                    attempts.push(seed.clone());
+                    last_err = Some(format!("{seed}: malformed: {e}"));
+                    continue;
+                }
+            };
+            match endpoint.connect().await {
+                Ok(channel) => {
+                    return Ok(Self {
+                        channel,
+                        topology: Arc::new(TopologyCache::new()),
+                        leases: LeaseManager::new(),
+                        stream_caps: Arc::new(StreamCapMap::new(256)),
+                        tenant_id,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        seed = %seed,
+                        error = %e,
+                        "native client: seed unreachable, falling through to next"
+                    );
+                    attempts.push(seed.clone());
+                    last_err = Some(format!("{seed}: {e}"));
+                }
+            }
+        }
+        Err(NativeClientError::Connect(format!(
+            "all seeds unreachable ({} attempted: {}); last error: {}",
+            attempts.len(),
+            attempts.join(", "),
+            last_err.unwrap_or_else(|| "<unknown>".to_owned())
+        )))
     }
 
     /// Build a client over a pre-dialed `Channel` (test convenience —

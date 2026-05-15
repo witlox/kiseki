@@ -523,13 +523,66 @@ async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
 /// control-plane state machine is not wired in (single-node compose,
 /// rev-1 deploys, BDD harnesses) — clients honour the empty list as
 /// "fall back to seed-only routing" per ADR-008 rev 2 §"Compatibility".
-///
-/// Implementer-step stub: returns `vec![]` unconditionally; replaced
-/// by the GREEN commit's body once the failing unit tests are in
-/// place.
-#[allow(clippy::unused_async)]
-async fn build_shards_from_state(_state: &UiState) -> Vec<ShardInfoJson> {
-    Vec::new()
+async fn build_shards_from_state(state: &UiState) -> Vec<ShardInfoJson> {
+    let Some(cluster_control) = state.cluster_control.as_ref() else {
+        return Vec::new();
+    };
+    let snapshot = cluster_control.snapshot().await;
+
+    // Build the (node_id → "host:port") map for `leader_data_addr`
+    // resolution. Convention: native data port is 9100 (matches
+    // `KISEKI_DATA_ADDR` default + `node_info_from_plan`).
+    let peer_data_addrs: std::collections::HashMap<u64, String> = state
+        .node_info
+        .raft_peers
+        .iter()
+        .map(|(id, addr)| {
+            let host = addr.split(':').next().unwrap_or("127.0.0.1");
+            (*id, format!("{host}:9100"))
+        })
+        .collect();
+
+    let mut shards = Vec::new();
+    for (namespace_id, ns_snapshot) in snapshot.namespaces {
+        for shard in ns_snapshot.shards {
+            if shard.is_retiring {
+                // Skip retired shards: ADR-033 §4 says routing should
+                // ignore them once the merge has absorbed the range.
+                continue;
+            }
+            let leader_id = shard.leader_node.0;
+            let leader_data_addr = peer_data_addrs.get(&leader_id).cloned();
+            shards.push(ShardInfoJson {
+                shard_id: shard.shard_id.0.to_string(),
+                namespace_id: namespace_id.clone(),
+                leader_id: Some(leader_id),
+                leader_data_addr,
+                range_start: encode_hex_prefixed(&shard.range_start),
+                range_end: encode_hex_prefixed(&shard.range_end),
+            });
+        }
+    }
+    // Sort by namespace_id + range_start so the order is
+    // deterministic across nodes (HashMap iteration order is not).
+    shards.sort_by(|a, b| {
+        a.namespace_id
+            .cmp(&b.namespace_id)
+            .then_with(|| a.range_start.cmp(&b.range_start))
+    });
+    shards
+}
+
+/// Encode a 32-byte hashed-key bound as a `0x`-prefixed lowercase
+/// hex string. Matches the wire format documented in ADR-008 rev 2
+/// §"Wire shape".
+fn encode_hex_prefixed(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(2 + 64);
+    s.push_str("0x");
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Public re-export of `build_shards_from_state` for cross-crate tests

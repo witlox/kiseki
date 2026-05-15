@@ -180,11 +180,87 @@ impl DiscoveryClient {
     /// missing required fields, or carries an unparseable
     /// `leader_data_addr` / hex range. Unknown fields are ignored
     /// (forward-compat with future rev-N additions).
-    ///
-    /// Architect-step stub: signature only; the parsing body lands in
-    /// the implementer step once the failing unit tests are in place.
-    pub fn from_cluster_info_json(_json: &str) -> Result<DiscoveryResponse, DiscoveryParseError> {
-        Err(DiscoveryParseError::NotImplemented)
+    pub fn from_cluster_info_json(json: &str) -> Result<DiscoveryResponse, DiscoveryParseError> {
+        let parsed: ClusterInfoResponse = serde_json::from_str(json)?;
+        let mut shards = Vec::with_capacity(parsed.shards.len());
+        for s in &parsed.shards {
+            // Per-shard leader address. ADR-008 rev 2 §"Wire shape":
+            // the field is `"host:port"`. Empty / missing means the
+            // shard's leader is unknown — surface this with a
+            // sentinel address (loopback). Callers honour
+            // `leader_node_id = None` as "no leader yet".
+            let leader_addr = match &s.leader_data_addr {
+                Some(addr) => addr.parse::<SocketAddr>().map_err(|e| {
+                    DiscoveryParseError::InvalidLeaderAddr(format!("{addr}: {e}"))
+                })?,
+                None => "0.0.0.0:0".parse().unwrap(),
+            };
+            let range_start = decode_hex_prefixed(&s.range_start).ok_or_else(|| {
+                DiscoveryParseError::InvalidHexRange(s.range_start.clone())
+            })?;
+            let range_end = decode_hex_prefixed(&s.range_end)
+                .ok_or_else(|| DiscoveryParseError::InvalidHexRange(s.range_end.clone()))?;
+            shards.push(ShardEndpoint {
+                shard_id: s.shard_id.clone(),
+                namespace_id: s.namespace_id.clone(),
+                leader_node_id: s.leader_id,
+                leader_addr,
+                range_start,
+                range_end,
+            });
+        }
+        // Gateways: project each peer onto a `GatewayEndpoint` so
+        // rev-1 fields (gateways list) are populated for forward-
+        // compat consumers.
+        let gateways = parsed
+            .peers
+            .iter()
+            .filter_map(|p| {
+                p.s3_addr
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(|endpoint| GatewayEndpoint {
+                        protocol: "s3".to_owned(),
+                        transport: "tcp".to_owned(),
+                        endpoint,
+                    })
+            })
+            .collect();
+        Ok(DiscoveryResponse {
+            shards,
+            views: Vec::new(),
+            gateways,
+            ttl_ms: 30_000,
+        })
+    }
+}
+
+/// Parse a `0x`-prefixed hex string (64 chars = 32 bytes after the
+/// prefix). Returns `None` on missing prefix, wrong length, or any
+/// non-hex character.
+fn decode_hex_prefixed(s: &str) -> Option<Vec<u8>> {
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    if stripped.len() != 64 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(32);
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble_value(bytes[i])?;
+        let lo = hex_nibble_value(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+const fn hex_nibble_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -200,8 +276,6 @@ pub enum DiscoveryParseError {
     InvalidLeaderAddr(String),
     #[error("invalid hex range: {0}")]
     InvalidHexRange(String),
-    #[error("from_cluster_info_json: architect-stub — implementer step pending")]
-    NotImplemented,
 }
 
 /// Wire-shape mirror of `kiseki_server::web::api::ShardInfoJson` —
