@@ -1,10 +1,10 @@
 //! `FileBackedDevice` vs `UringFileBackedDevice` criterion bench.
 //!
-//! Promotes / blocks the io_uring backend per GH #39:
+//! Promotes / blocks the `io_uring` backend per GH #39:
 //!
-//!   - Acceptance gate: ≥ 20 % single-fsync write win at 4 KB on a
-//!     real NVMe.
-//!   - 64 KB shape: no regression.
+//! - Acceptance gate: at least 20 % single-fsync write win at 4 KB
+//!   on a real `NVMe`.
+//! - 64 KB shape: no regression.
 //!
 //! Runs:
 //!   `cargo bench -p kiseki-block --features io_uring`
@@ -14,12 +14,13 @@
 //! non-Linux / older-kernel hosts. The `FileBackedDevice` half always
 //! runs as the baseline.
 //!
-//! Where the bench is run:
-//!   $TMPDIR (or /tmp). The acceptance threshold is only meaningful
-//!   when $TMPDIR points at an NVMe — on a tmpfs (RAM) host fsync is
-//!   ~free and the win shrinks. The PR records the medium used.
+//! Where the bench is run: `$TMPDIR` (or `/tmp`). The acceptance
+//! threshold is only meaningful when `$TMPDIR` points at an `NVMe`
+//! — on a `tmpfs` (RAM) host fsync is roughly free and the win
+//! shrinks. The PR records the medium used.
 
 #![allow(clippy::unwrap_used)] // bench code — panic-on-error is fine.
+#![allow(missing_docs)] // criterion_group! / criterion_main! generate undocumented items.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kiseki_block::{DeviceBackend, FileBackedDevice};
@@ -122,7 +123,7 @@ fn bench_read(c: &mut Criterion) {
                 ) {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!("uring init failed ({e}); skipping uring half.",);
+                        eprintln!("uring init failed ({e}); skipping uring half.");
                         return;
                     }
                 };

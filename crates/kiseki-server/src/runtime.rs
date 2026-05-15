@@ -647,6 +647,26 @@ pub async fn run_main(
     let mut comp_flusher_for_fsync: Option<kiseki_composition::persistent::FjallFlusher> = None;
     let mut chunk_device_for_fsync: Option<std::sync::Arc<dyn kiseki_block::DeviceBackend>> = None;
 
+    // GH #39 wiring: the `io_uring` Cargo feature on `kiseki-block`
+    // adds a `UringFileBackedDevice` alongside `FileBackedDevice`.
+    // `PersistentChunkStore::init` / `open` (below) currently hard-
+    // codes `FileBackedDevice` inside `kiseki-chunk` — threading a
+    // generic `Arc<dyn DeviceBackend>` through that constructor is
+    // tracked as a follow-up to GH #39 so this issue's scope stays
+    // inside `kiseki-block` + the runtime selector. For now this
+    // logs the operator's intent so the deploy path is obvious from
+    // `/var/log` once the chunk-store ctor change lands.
+    if std::env::var("KISEKI_IO_URING")
+        .ok()
+        .is_some_and(|v| !matches!(v.as_str(), "" | "0" | "false" | "FALSE"))
+    {
+        tracing::warn!(
+            "KISEKI_IO_URING=1 acknowledged; per-device backend switch \
+             into PersistentChunkStore is pending the follow-up to GH \
+             #39 — current run uses FileBackedDevice"
+        );
+    }
+
     // Local chunk store: persistent (raw block device) if KISEKI_DATA_DIR
     // set, otherwise in-memory. Wrapped via SyncBridge so it satisfies
     // AsyncChunkOps — the cluster fabric and the gateway both consume the
