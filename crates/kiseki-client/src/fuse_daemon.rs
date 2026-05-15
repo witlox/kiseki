@@ -81,6 +81,35 @@ pub(crate) const FILE_OPEN_OPTIONS: OpenOptions = OpenOptions {
     cache_readdir: false,
 };
 
+/// Per-open cache hint derivation — examines the kernel-supplied
+/// open `flags` (POSIX `O_*` bits) and returns the
+/// [`OpenOptions`] reply for `FUSE_OPEN` / `FUSE_CREATE`.
+///
+/// Default (no `O_DIRECT`): the long-standing
+/// `FOPEN_KEEP_CACHE` behavior — kiseki chunks are content-
+/// addressed so the kernel page cache stays coherent across
+/// opens and a repeat read need not refetch through the gateway.
+///
+/// With `O_DIRECT`: surface `FOPEN_DIRECT_IO` so the kernel
+/// routes IO through the direct path (no page cache, the user
+/// MUST supply aligned buffers). Without this reply bit the
+/// kernel either rejects the `open(2)` with EINVAL or silently
+/// services the IO from the page cache — both surface as
+/// `fio --direct=1` reporting 0 MB/s. See GH issue #37.
+///
+/// `direct_io` and `keep_cache` are mutually exclusive — when
+/// direct-IO is on, the kernel must not cache pages for this fd
+/// or stale reads would slip out.
+#[cfg(feature = "fuse")]
+#[must_use]
+pub fn open_options_for_flags(flags: i32) -> OpenOptions {
+    // Pre-fix behavior — TODO: detect O_DIRECT and flip
+    // direct_io / keep_cache. Kept here to make the RED test
+    // visible and the fix commit obvious in git history.
+    let _ = flags;
+    FILE_OPEN_OPTIONS
+}
+
 #[cfg(feature = "fuse")]
 fn to_kiseki_fuse_attr(ino: u64, attr: &crate::fuse_fs::FileAttr) -> KFuseAttr {
     // Bug 7 (GCP 2026-05-04): the prior implementation hard-coded
