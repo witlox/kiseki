@@ -248,6 +248,67 @@ impl PersistentChunkStore {
         })
     }
 
+    /// Build a chunk store around a pre-opened device backend.
+    ///
+    /// This is the injection point for the GH #39 `io_uring` backend
+    /// (and any future `DeviceBackend` impls): the runtime resolves
+    /// the device via [`kiseki_block::open_or_init_device`] (which
+    /// reads `KISEKI_IO_URING` and picks `UringFileBackedDevice` vs
+    /// `FileBackedDevice`) and hands the resulting `Arc<dyn
+    /// DeviceBackend>` to this constructor.
+    ///
+    /// The fjall meta WAL and `pools.json` are loaded from
+    /// `meta_path` exactly like [`Self::open`]; only the device
+    /// construction differs. If the meta directory is empty (fresh
+    /// device), the chunk + fragment indexes start empty and hydrate
+    /// records on first write.
+    ///
+    /// Kept additive — [`Self::init`] and [`Self::open`] retain
+    /// their existing signatures and behavior (per GH #39 follow-up
+    /// scope: "DO NOT touch other crates" / "additive only").
+    ///
+    /// # Errors
+    /// Returns [`ChunkError::Io`] if the fjall keyspace fails to
+    /// open or `pools.json` exists but is malformed.
+    pub fn from_device(
+        device: std::sync::Arc<dyn DeviceBackend>,
+        meta_path: &Path,
+    ) -> Result<Self, ChunkError> {
+        if let Some(parent) = meta_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ChunkError::Io(e.to_string()))?;
+        }
+        let meta = FjallMetaStore::open(meta_path)?;
+        let pools_path = pools_path_for(meta_path);
+        let pools = load_pools(&pools_path)?;
+
+        // Hydrate chunk cache — empty on a fresh keyspace.
+        let mut chunk_map = HashMap::new();
+        for record in meta.iter_chunks()? {
+            let id = ChunkId(record.chunk_id);
+            let extents = extents_from_record(&record);
+            chunk_map.insert(id, ChunkEntry { record, extents });
+        }
+
+        // Hydrate fragment cache.
+        let mut frag_map = HashMap::new();
+        for record in meta.iter_fragments()? {
+            let id = ChunkId(record.chunk_id);
+            let extent = Extent::new(record.extent_offset, record.extent_length);
+            frag_map.insert((id, record.fragment_index), FragmentEntry { extent });
+        }
+
+        Ok(Self {
+            chunks: Mutex::new(chunk_map),
+            fragments: Mutex::new(frag_map),
+            pools,
+            device,
+            meta,
+            pools_path,
+            write_phase_metric: std::sync::RwLock::new(None),
+            sync_per_write: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
     /// Attach the per-phase write-duration histogram. Once set, every
     /// `write_chunk` records its `dedup_check`, `extent_io`,
     /// `save_meta`, and `device_sync` phase latencies on
@@ -1354,6 +1415,95 @@ mod tests {
         assert_eq!(
             read_back, frag_bytes,
             "fragment bytes corrupted after round-trip",
+        );
+    }
+
+    /// GH #39 follow-up: `PersistentChunkStore::from_device` must
+    /// accept a pre-opened `Arc<dyn DeviceBackend>` so the runtime
+    /// can inject `UringFileBackedDevice` (or any other backend the
+    /// selector resolves) without `kiseki-chunk` knowing the concrete
+    /// type. The existing `init`/`open` constructors hard-code
+    /// `FileBackedDevice` inside `kiseki-chunk`, defeating the whole
+    /// point of the `DeviceBackend` trait abstraction.
+    ///
+    /// Pin the contract: a chunk written into a store built from an
+    /// injected device must round-trip through `read_chunk` on the
+    /// same store, exercising the full write+read+meta path on the
+    /// injected backend (no `FileBackedDevice` shortcut anywhere).
+    #[test]
+    fn from_device_round_trips_a_chunk() {
+        use kiseki_block::file::FileBackedDevice;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        // Open the device OUTSIDE the chunk store — this is the
+        // injection point the runtime selector lives at. Once
+        // KISEKI_IO_URING wiring lands, the runtime swaps
+        // `FileBackedDevice` here for `UringFileBackedDevice`.
+        let device: Arc<dyn DeviceBackend> =
+            Arc::new(FileBackedDevice::init(&dev_path, 64 * 1024 * 1024).unwrap());
+
+        let mut store = PersistentChunkStore::from_device(Arc::clone(&device), &meta_path)
+            .expect("from_device init");
+
+        let env = test_envelope(0x39);
+        let chunk_id = env.chunk_id;
+        let new_written = store.write_chunk(env, "default").unwrap();
+        assert!(new_written, "first write must be new (not dedup)");
+
+        let read_back = store.read_chunk(&chunk_id).unwrap();
+        assert_eq!(read_back.ciphertext, vec![0x39u8; 256]);
+        assert_eq!(read_back.chunk_id, chunk_id);
+
+        // Same device handle is observable from the store — proves
+        // the injection actually went through to the data plane.
+        let handle = store.device_handle();
+        assert!(
+            Arc::ptr_eq(&handle, &device),
+            "device_handle must be the same Arc the runtime injected; \
+             from_device should not re-wrap or clone-construct internally",
+        );
+    }
+
+    /// GH #39 runtime-toggle smoke test. The runtime resolves the
+    /// device through [`kiseki_block::open_or_init_device`] (which
+    /// honors `KISEKI_IO_URING`) and hands the resulting handle to
+    /// [`PersistentChunkStore::from_device`]. This test exercises
+    /// the same two-call sequence the runtime uses, proving the
+    /// selector → constructor contract end-to-end without needing
+    /// the `io_uring` kernel feature on CI (the selector falls back
+    /// to `FileBackedDevice` when the Cargo feature isn't compiled
+    /// in, which is exactly what we want under default Tier-1).
+    ///
+    /// We do NOT set `KISEKI_IO_URING` here because env vars are
+    /// process-global and the parallel test runner would race other
+    /// tests. The contract this pins is "selector returns a valid
+    /// `Arc<dyn DeviceBackend>` and `from_device` round-trips a
+    /// chunk through it"; the env-var branch of the selector is
+    /// covered by the `kiseki-block` cross-backend layout tests.
+    #[test]
+    fn open_or_init_device_into_from_device_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        // Same call sequence the runtime uses post-#39 wiring.
+        let device =
+            kiseki_block::open_or_init_device(&dev_path, 64 * 1024 * 1024).expect("selector init");
+        let mut store =
+            PersistentChunkStore::from_device(device, &meta_path).expect("from_device init");
+
+        store
+            .write_chunk(test_envelope(0x42), "default")
+            .expect("write");
+        let read_back = store.read_chunk(&ChunkId([0x42; 32])).expect("read");
+        assert_eq!(
+            read_back.ciphertext,
+            vec![0x42u8; 256],
+            "round-trip via selector + from_device must preserve payload",
         );
     }
 }
