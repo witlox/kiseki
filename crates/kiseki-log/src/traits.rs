@@ -80,6 +80,23 @@ pub trait LogOps: Send + Sync {
     /// out-of-range keys), or has lost Raft quorum.
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError>;
 
+    /// Append a delta, surfacing the openraft `ForwardToLeader` hint
+    /// (ADR-044). Callers that opt into server-side proxy /
+    /// client-side leader hints use this method; others stay on
+    /// [`Self::append_delta`] which collapses the hint onto
+    /// `LeaderUnavailable` for backwards compatibility.
+    ///
+    /// Default impl forwards to `append_delta` so in-memory stores
+    /// (which always behave as their own leader) need no change.
+    /// The openraft-backed store overrides with the
+    /// hint-preserving mapping.
+    async fn append_delta_with_forwarding(
+        &self,
+        req: AppendDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.append_delta(req).await
+    }
+
     /// Atomic "create `cluster_chunk_state` + append delta" — Phase 16b
     /// D-4 contract. Same failure modes as `append_delta`. Default
     /// impl forwards to `append_delta` and ignores `new_chunks` (used

@@ -1,7 +1,7 @@
 //! Gateway errors.
 
 use kiseki_common::error::{KisekiError, PermanentError, SecurityError};
-use kiseki_common::ids::ShardId;
+use kiseki_common::ids::{NodeId, ShardId};
 
 /// Errors from gateway operations.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +76,23 @@ pub enum GatewayError {
     /// 404 makes the operator's mistake obvious.
     #[error("bucket / namespace not registered: {0}")]
     NamespaceNotFound(String),
+
+    /// ADR-044 — the local node is a Raft follower for the target
+    /// shard; the leader is on `leader_node_id`. Surfaced only by
+    /// the `*_with_forwarding`-suffix gateway entry points
+    /// ([`crate::ops::GatewayOps::write_with_forwarding`]). The
+    /// native server's proxy fallback (`KISEKI_NATIVE_PROXY_FALLBACK=on`)
+    /// matches this variant and dials the leader transparently;
+    /// the S3 gateway's 307-redirect path (Step C scope) consumes
+    /// the same variant for the `Location:` header.
+    #[error("forward to leader: shard={shard_id:?} leader_node_id={leader_node_id:?}")]
+    ForwardToLeader {
+        /// The shard whose leader is on a different node.
+        shard_id: ShardId,
+        /// The node id of the actual leader (sourced from
+        /// `LogError::ForwardToLeader::leader_node_id`).
+        leader_node_id: NodeId,
+    },
 }
 
 impl From<GatewayError> for KisekiError {

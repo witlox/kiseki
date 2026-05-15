@@ -310,6 +310,18 @@ fn map_gateway_error(e: GatewayError) -> Status {
         // map to gRPC NOT_FOUND. The S3 layer disambiguates the two
         // for HTTP semantics; native callers don't.
         GatewayError::NotFound(m) | GatewayError::NamespaceNotFound(m) => Status::not_found(m),
+        // ADR-044: this variant should be intercepted by the proxy
+        // path BEFORE reaching `map_gateway_error`. When the proxy
+        // is disabled (default), surfacing as Status::unavailable
+        // gives the client the same retry shape as
+        // ServiceUnavailable — the client refreshes its topology
+        // cache and retries the leader directly (Step C path).
+        GatewayError::ForwardToLeader {
+            shard_id,
+            leader_node_id,
+        } => Status::unavailable(format!(
+            "forward to leader: shard={shard_id:?} leader={leader_node_id:?}"
+        )),
     }
 }
 

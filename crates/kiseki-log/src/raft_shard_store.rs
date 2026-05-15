@@ -399,6 +399,27 @@ impl LogOps for RaftShardStore {
         })
     }
 
+    /// ADR-044 override: surfaces `LogError::ForwardToLeader` with
+    /// the leader's node id instead of collapsing onto
+    /// `LeaderUnavailable`. Used by the native server proxy
+    /// fallback path (`KISEKI_NATIVE_PROXY_FALLBACK=on`) and by
+    /// future S3 307 / NFS referral paths.
+    #[tracing::instrument(skip(self, req), fields(shard_id = %req.shard_id.0, tenant_id = %req.tenant_id.0, op = ?req.operation))]
+    async fn append_delta_with_forwarding(
+        &self,
+        req: AppendDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        let store = self.get_shard(req.shard_id).inspect_err(|e| {
+            tracing::warn!(error = %e, "log append_delta_with_forwarding: shard lookup failed");
+        })?;
+        store
+            .append_delta_with_forwarding(req)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "log append_delta_with_forwarding: shard append failed");
+            })
+    }
+
     #[tracing::instrument(skip(self, req), fields(shard_id = %req.delta.shard_id.0, tenant_id = %req.delta.tenant_id.0, op = ?req.delta.operation, new_chunks = req.new_chunks.len()))]
     async fn append_chunk_and_delta(
         &self,

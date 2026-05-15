@@ -25,6 +25,7 @@ use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, Read
 fn outcome_for(err: &LogError) -> &'static str {
     match err {
         LogError::ShardNotFound(_) => outcome::SHARD_NOT_FOUND,
+        LogError::ForwardToLeader { .. } => outcome::FORWARD_TO_LEADER,
         _ => outcome::ERROR,
     }
 }
@@ -67,6 +68,26 @@ impl LogOps for InstrumentedLogOps {
         let shard = req.shard_id.0.to_string();
         let started = Instant::now();
         let result = self.inner.append_delta(req).await;
+        let label = match &result {
+            Ok(_) => outcome::OK,
+            Err(e) => outcome_for(e),
+        };
+        self.metrics.record_append(&shard, label, started.elapsed());
+        result
+    }
+
+    /// ADR-044 — mirror of `append_delta` with the
+    /// `ForwardToLeader` hint preserved. Same metric histogram
+    /// bucket as `append_delta` (the slot tracks the openraft
+    /// `client_write` latency, not the variant).
+    #[tracing::instrument(level = "debug", skip(self, req), fields(shard_id = %req.shard_id.0, op = ?req.operation))]
+    async fn append_delta_with_forwarding(
+        &self,
+        req: AppendDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        let shard = req.shard_id.0.to_string();
+        let started = Instant::now();
+        let result = self.inner.append_delta_with_forwarding(req).await;
         let label = match &result {
             Ok(_) => outcome::OK,
             Err(e) => outcome_for(e),
