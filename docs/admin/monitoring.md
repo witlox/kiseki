@@ -54,6 +54,8 @@ GET http://<node>:9090/metrics
 | `kiseki_gateway_request_duration_seconds` | Histogram | `method` | Gateway request duration. Buckets: 1ms to 5s. |
 | `kiseki_pool_capacity_total_bytes` | Gauge | `pool` | Total capacity per pool in bytes. |
 | `kiseki_pool_capacity_used_bytes` | Gauge | `pool` | Used capacity per pool in bytes. |
+| `kiseki_pool_device_capacity_bytes` | Gauge | `pool`, `device_id`, `kind=total\|used\|free` | Per-device capacity (D2). One row per `(device, kind)`. |
+| `kiseki_pool_device_errors_total` | Counter | `device_id`, `op=read\|write` | Per-device IO error counter. Cheap signal that surfaces struggling media before a full health probe. |
 | `kiseki_transport_connections_active` | Gauge | (none) | Active transport connections. |
 | `kiseki_transport_connections_idle` | Gauge | (none) | Idle transport connections. |
 | `kiseki_shard_delta_count` | Gauge | `shard` | Current delta count per shard. |

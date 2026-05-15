@@ -647,16 +647,13 @@ async fn api_create_workload(
     };
     // Resolve org_id via the project lookup so the workload row is
     // fully populated (TenantStore::create_workload requires it).
-    let project = match store.get_project(&body.project_id) {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                axum::Json(serde_json::json!({
-                    "error": format!("project {} not found", body.project_id),
-                })),
-            );
-        }
+    let Ok(project) = store.get_project(&body.project_id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!("project {} not found", body.project_id),
+            })),
+        );
     };
     let workload_id = uuid::Uuid::new_v4().to_string();
     let wl = kiseki_control::tenant::Workload {
@@ -704,16 +701,13 @@ async fn api_create_namespace(
             axum::Json(serde_json::json!({"error": "namespace store not wired"})),
         );
     };
-    let workload = match tenants.get_workload(&body.workload_id) {
-        Ok(w) => w,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                axum::Json(serde_json::json!({
-                    "error": format!("workload {} not found", body.workload_id),
-                })),
-            );
-        }
+    let Ok(workload) = tenants.get_workload(&body.workload_id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!("workload {} not found", body.workload_id),
+            })),
+        );
     };
     let namespace_id = uuid::Uuid::new_v4().to_string();
     let _ = body.name; // namespace store does not persist a human name today
@@ -1015,6 +1009,7 @@ struct AuditQueryParams {
     no_fanout: bool,
 }
 
+#[allow(clippy::too_many_lines)] // D5 fan-out logic is naturally long
 async fn api_audit_query(
     State(state): State<UiState>,
     Query(params): Query<AuditQueryParams>,
@@ -1212,7 +1207,7 @@ async fn fetch_peer_audit(host_port: &str, query: &str) -> Result<Vec<serde_json
     use tokio::time::{timeout, Duration};
 
     let path = format!("/admin/audit/query?{query}");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n",);
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     let connect_fut = TcpStream::connect(host_port);
     let mut stream = timeout(Duration::from_secs(2), connect_fut)
         .await
