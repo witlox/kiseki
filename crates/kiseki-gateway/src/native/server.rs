@@ -310,6 +310,17 @@ fn map_gateway_error(e: GatewayError) -> Status {
         // map to gRPC NOT_FOUND. The S3 layer disambiguates the two
         // for HTTP semantics; native callers don't.
         GatewayError::NotFound(m) | GatewayError::NamespaceNotFound(m) => Status::not_found(m),
+        // ADR-008 rev 2 / ADR-044 — the S3 path translates this to a
+        // `307 Temporary Redirect` toward the cached leader. The
+        // native (gRPC) path returns `Unavailable` for now; Step A's
+        // proxy-fallback + `ForwardToLeader` integration replaces
+        // this with a typed leader-hint response.
+        GatewayError::LeaderUnavailable {
+            shard_id,
+            leader_hint,
+        } => Status::unavailable(format!(
+            "leader unavailable for shard {shard_id:?} (hint: {leader_hint:?})"
+        )),
     }
 }
 

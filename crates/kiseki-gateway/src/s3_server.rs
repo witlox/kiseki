@@ -50,6 +50,18 @@ struct S3State<G: GatewayOps> {
     /// existed in `/metrics` with always-zero counts, leaving the
     /// read-path latency invisible. Wiring it here closes that gap.
     request_duration_metric: Option<Arc<prometheus::HistogramVec>>,
+    /// ADR-008 rev 2 / ADR-044 — `NodeId → s3 host:port` resolver for
+    /// 307 redirect targets. Populated from `cluster/info` peer map
+    /// at startup. Empty in dev / test deploys; the 307 path falls
+    /// back to 503 + `Retry-After` when the leader hint can't be
+    /// resolved to a host.
+    #[allow(dead_code)] // implementer-step wires the 307 redirect path
+    peer_s3_addrs: std::collections::HashMap<u64, String>,
+    /// ADR-008 rev 2 — `kiseki_native_topology_stale_leader_redirects_total`
+    /// counter, labeled by `protocol` ("s3", "native"). Optional;
+    /// metric-less deploys take a no-op bump.
+    #[allow(dead_code)] // implementer-step wires the metric bump on 307
+    stale_leader_redirects_total: Option<Arc<prometheus::IntCounterVec>>,
 }
 
 impl<G: GatewayOps> S3State<G> {
@@ -140,6 +152,34 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
     requests_total: Option<Arc<prometheus::IntCounterVec>>,
     request_duration: Option<Arc<prometheus::HistogramVec>>,
 ) -> Router {
+    s3_router_with_peers(
+        gateway,
+        fallback_tenant,
+        key_store,
+        requests_total,
+        request_duration,
+        std::collections::HashMap::new(),
+        None,
+    )
+}
+
+/// ADR-008 rev 2 / ADR-044 — full constructor with peer-map for the
+/// `307` redirect target resolution and the new
+/// `kiseki_native_topology_stale_leader_redirects_total` counter.
+///
+/// `peer_s3_addrs` maps `NodeId → "host:port"`. Empty in dev / test;
+/// the 307 path falls back to 503 when the leader hint can't be
+/// resolved.
+#[allow(clippy::implicit_hasher)] // HashMap default hasher is fine for the small peer map
+pub fn s3_router_with_peers<G: GatewayOps + Send + Sync + 'static>(
+    gateway: S3Gateway<G>,
+    fallback_tenant: OrgId,
+    key_store: AccessKeyStore,
+    requests_total: Option<Arc<prometheus::IntCounterVec>>,
+    request_duration: Option<Arc<prometheus::HistogramVec>>,
+    peer_s3_addrs: std::collections::HashMap<u64, String>,
+    stale_leader_redirects_total: Option<Arc<prometheus::IntCounterVec>>,
+) -> Router {
     let state = Arc::new(S3State {
         gateway,
         fallback_tenant,
@@ -147,6 +187,8 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
         buckets: Mutex::new(HashSet::new()),
         requests_total_metric: requests_total,
         request_duration_metric: request_duration,
+        peer_s3_addrs,
+        stale_leader_redirects_total,
     });
 
     // Per-request middleware that records `kiseki_gateway_requests_
@@ -199,6 +241,92 @@ pub fn s3_router_full<G: GatewayOps + Send + Sync + 'static>(
         .with_state(state)
 }
 
+/// ADR-008 rev 2 / ADR-044 — emit a `307 Temporary Redirect` toward
+/// the cached shard leader when a write-side handler trips
+/// `LeaderUnavailable{leader_hint=Some(node_id)}`. Read-side handlers
+/// (GET, HEAD, LIST) fall back to `503 Service Unavailable` with
+/// `Retry-After: 1` because reads SHOULD succeed locally per ADR-040
+/// §D6.3 — a `LeaderUnavailable` on a read is a bug, not a routing
+/// hint.
+///
+/// `request_scheme` MUST be the current request's URI scheme ("http"
+/// or "https") to avoid the TLS-downgrade vector (adversary finding
+/// S3). `peer_s3_addrs` maps `NodeId` → "host:port" for the cluster;
+/// an empty or stale map falls back to 503 (adversary finding S6 +
+/// closure of the unresolvable-hint case).
+///
+/// `metric` (optional) is bumped with labels `(protocol="s3",
+/// tenant="<tenant_uuid>")` per ADR-008 rev 2 §"Observability".
+/// `"unknown"` is used when the handler did not yet resolve a
+/// tenant (rare; pre-routing rejection paths).
+#[allow(dead_code)] // wired into handlers in the GREEN commit
+fn leader_unavailable_response(
+    method: &axum::http::Method,
+    request_scheme: &str,
+    request_path_and_query: &str,
+    _shard_id: kiseki_common::ids::ShardId,
+    leader_hint: Option<u64>,
+    peer_s3_addrs: &std::collections::HashMap<u64, String>,
+    metric: Option<&prometheus::IntCounterVec>,
+) -> axum::response::Response {
+    // Finding S6: GET / HEAD / OPTIONS / LIST MUST NOT 307. Reads
+    // can be served by any node with composition state (ADR-040
+    // §D6.3). The 307 path is write-only.
+    let is_write = matches!(
+        *method,
+        axum::http::Method::PUT
+            | axum::http::Method::POST
+            | axum::http::Method::DELETE
+            | axum::http::Method::PATCH
+    );
+    if !is_write {
+        return service_unavailable_with_retry_after();
+    }
+
+    let Some(leader) = leader_hint else {
+        // Mid-election: no peer to redirect to. 503 + Retry-After.
+        return service_unavailable_with_retry_after();
+    };
+    let Some(peer_addr) = peer_s3_addrs.get(&leader) else {
+        // Leader not in peer map (e.g. evicted node still in the
+        // shard map). Fall back to 503.
+        return service_unavailable_with_retry_after();
+    };
+
+    // Bump the metric. The tenant label is "unknown" here — the
+    // call site can plumb a resolved tenant later via a wrapper.
+    if let Some(c) = metric {
+        c.with_label_values(&["s3", "unknown"]).inc();
+    }
+
+    let location = format!("{request_scheme}://{peer_addr}{request_path_and_query}");
+    let mut resp = (axum::http::StatusCode::TEMPORARY_REDIRECT, String::new()).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
+        resp.headers_mut().insert(axum::http::header::LOCATION, v);
+    }
+    // Finding S5 — NOT emitting Retry-After on the 307 (RFC 9110
+    // §10.2.3 is delta-seconds only; client-side retry policy
+    // carries any sub-second jitter).
+    resp
+}
+
+/// 503 + `Retry-After: 1` body for write-side fallback and
+/// read-side `LeaderUnavailable` responses. The header is
+/// integer-seconds per RFC 9110 §10.2.3.
+#[allow(dead_code)] // wired into handlers in the GREEN commit
+fn service_unavailable_with_retry_after() -> axum::response::Response {
+    let mut resp = s3_error_response(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "ServiceUnavailable",
+        "shard leader unavailable; retry against another node",
+    );
+    if let Ok(v) = axum::http::HeaderValue::try_from("1") {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, v);
+    }
+    resp
+}
+
 /// Query params for PUT — distinguishes `PutObject` from `UploadPart`.
 #[derive(serde::Deserialize, Default)]
 struct PutParams {
@@ -210,12 +338,18 @@ struct PutParams {
 
 async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
     State(state): State<Arc<S3State<G>>>,
+    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<PutParams>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let ns_id = namespace_from_bucket(&bucket);
+    let request_scheme = request_scheme_from_uri_and_headers(&original_uri, &headers);
+    let request_path_and_query = original_uri.path_and_query().map_or_else(
+        || format!("/{bucket}/{key}"),
+        |pq| pq.as_str().to_owned(),
+    );
 
     // If uploadId + partNumber present, this is UploadPart.
     if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
@@ -302,8 +436,41 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
             "NoSuchBucket",
             "The specified bucket does not exist.",
         ),
+        Err(crate::error::GatewayError::LeaderUnavailable {
+            shard_id,
+            leader_hint,
+        }) => leader_unavailable_response(
+            &axum::http::Method::PUT,
+            &request_scheme,
+            &request_path_and_query,
+            shard_id,
+            leader_hint,
+            &state.peer_s3_addrs,
+            state.stale_leader_redirects_total.as_deref(),
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// ADR-008 rev 2 / adversary finding S3 — resolve the request's
+/// URI scheme to preserve TLS / non-TLS in the 307 redirect
+/// Location header. Falls back to:
+///   1. `original_uri.scheme_str()` — set when the gateway sits
+///      behind a TLS-terminating proxy that forwards `X-Forwarded-Proto`
+///      *as* the scheme. Axum exposes the parsed URI here.
+///   2. `X-Forwarded-Proto` header (standard reverse-proxy convention).
+///   3. "http" — sane default for plain-listener deploys.
+fn request_scheme_from_uri_and_headers(uri: &axum::http::Uri, headers: &HeaderMap) -> String {
+    if let Some(scheme) = uri.scheme_str() {
+        return scheme.to_owned();
+    }
+    if let Some(proto) = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
+        return proto.to_owned();
+    }
+    "http".to_owned()
 }
 
 /// Parse `If-None-Match` / `If-Match` HTTP headers into a
@@ -1634,5 +1801,160 @@ mod tests {
             resp.headers().contains_key(axum::http::header::RETRY_AFTER),
             "503 must include Retry-After header",
         );
+    }
+
+    // === ADR-008 rev 2 / ADR-044 — S3 307 on LeaderUnavailable ===
+
+    fn build_peer_map() -> std::collections::HashMap<u64, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(1, "10.0.0.1:9000".to_owned());
+        m.insert(2, "10.0.0.2:9000".to_owned());
+        m.insert(3, "10.0.0.3:9000".to_owned());
+        m
+    }
+
+    /// PUT against `LeaderUnavailable{leader_hint=Some(2)}` MUST emit
+    /// 307 Temporary Redirect with `Location: http://10.0.0.2:9000/...`.
+    /// Finding S3 — scheme is the request's scheme (http here).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leader_unavailable_put_emits_307_with_peer_location() {
+        let resp = leader_unavailable_response(
+            &axum::http::Method::PUT,
+            "http",
+            "/mybucket/mykey?uploadId=abc",
+            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            Some(2),
+            &build_peer_map(),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("Location header on 307")
+            .to_str()
+            .unwrap();
+        assert_eq!(loc, "http://10.0.0.2:9000/mybucket/mykey?uploadId=abc");
+        // Finding S5 — Retry-After header NOT emitted on 307 (sub-second
+        // jitter isn't RFC-compliant; client-side backoff carries it).
+        assert!(
+            !resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "Retry-After must NOT be emitted on 307 (RFC 9110 §10.2.3 delta-seconds only)"
+        );
+    }
+
+    /// Finding S3 — TLS deploys MUST get https:// redirects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leader_unavailable_put_preserves_https_scheme() {
+        let resp = leader_unavailable_response(
+            &axum::http::Method::PUT,
+            "https",
+            "/mybucket/mykey",
+            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            Some(2),
+            &build_peer_map(),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.starts_with("https://"),
+            "HTTPS request must produce HTTPS redirect, got: {loc}"
+        );
+    }
+
+    /// Finding S6 — GET against `LeaderUnavailable` MUST NOT 307;
+    /// reads are served by any node with composition state (ADR-040
+    /// §D6.3). The error maps to 503 + Retry-After (matching the
+    /// existing `ServiceUnavailable` path).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leader_unavailable_get_returns_503_not_307() {
+        let resp = leader_unavailable_response(
+            &axum::http::Method::GET,
+            "http",
+            "/mybucket/mykey",
+            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            Some(2),
+            &build_peer_map(),
+            None,
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GET against LeaderUnavailable must be 503, not 307"
+        );
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "503 must carry Retry-After"
+        );
+    }
+
+    /// `LeaderUnavailable` with NO leader hint (active election) MUST
+    /// fall back to 503 + Retry-After — no peer to redirect to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leader_unavailable_without_hint_falls_back_to_503() {
+        let resp = leader_unavailable_response(
+            &axum::http::Method::PUT,
+            "http",
+            "/mybucket/mykey",
+            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            None, // no leader hint — mid-election
+            &build_peer_map(),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "503 fallback must carry Retry-After"
+        );
+    }
+
+    /// `LeaderUnavailable` with a hint that's NOT in the peer map (e.g.
+    /// a node that's no longer in the cluster) MUST fall back to 503.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leader_unavailable_with_unknown_peer_falls_back_to_503() {
+        let resp = leader_unavailable_response(
+            &axum::http::Method::PUT,
+            "http",
+            "/mybucket/mykey",
+            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            Some(99), // not in peer map
+            &build_peer_map(),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Finding S8 — the metric counter is bumped on every 307 emission
+    /// with `protocol="s3"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leader_unavailable_bumps_stale_leader_redirects_counter() {
+        let counter = std::sync::Arc::new(
+            prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "test_stale_leader_redirects_total",
+                    "test counter for unit test",
+                ),
+                &["protocol", "tenant"],
+            )
+            .unwrap(),
+        );
+        let resp = leader_unavailable_response(
+            &axum::http::Method::PUT,
+            "http",
+            "/mybucket/mykey",
+            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            Some(2),
+            &build_peer_map(),
+            Some(&counter),
+        );
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let bumped = counter.with_label_values(&["s3", "unknown"]).get();
+        assert_eq!(bumped, 1, "307 emission must bump the metric");
     }
 }

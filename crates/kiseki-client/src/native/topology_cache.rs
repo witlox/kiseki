@@ -118,6 +118,22 @@ impl TopologyCache {
         *self.last_refresh.write() = Instant::now();
     }
 
+    /// ADR-008 rev 2 / adversary finding S4 — conditional replace
+    /// that only accepts a strictly newer snapshot. Used by the
+    /// HTTP `/cluster/info` bootstrap path so a stale poll cannot
+    /// overwrite a fresher gRPC `GetTopology` update.
+    ///
+    /// Returns `true` iff the snapshot was applied (`snap.version >
+    /// self.current_version()`).
+    pub fn replace_if_newer(&self, snap: Snapshot) -> bool {
+        if snap.version > self.current_version() {
+            self.replace(snap);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Snapshot the current cache. Cheap (`Snapshot: Clone`).
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
@@ -190,6 +206,89 @@ pub struct RouteHit {
     pub shard_id: String,
     pub leader_node_id: u64,
     pub data_addr: String,
+}
+
+/// ADR-008 rev 2 — bootstrap-time [`Snapshot`] constructor from the
+/// HTTP `/cluster/info` JSON. Used before the native gRPC channel is
+/// dialled (the gRPC `GetTopology` is the steady-state refresh).
+///
+/// The returned snapshot carries `version = 1` as a synthetic
+/// floor — strictly above the cache's initial `version = 0` so the
+/// HTTP bootstrap populates an empty cache. Subsequent gRPC
+/// `GetTopology` responses carry the authoritative control-plane
+/// version (typically ≥ 1 for any namespace that has ever been
+/// created), and `replace_if_newer` upgrades the cache to that
+/// version on first response.
+#[must_use]
+pub fn snapshot_from_cluster_info(parsed: &crate::discovery::ClusterInfoResponse) -> Snapshot {
+    // Build the nodes list from `peers`. Each peer's data-port
+    // address is its raft host + the conventional 9100 port; this
+    // mirrors what `node_info_from_plan` produces server-side.
+    let nodes: Vec<Node> = parsed
+        .peers
+        .iter()
+        .map(|p| {
+            let host = p.raft_addr.split(':').next().unwrap_or("127.0.0.1");
+            Node {
+                node_id: p.id,
+                data_addr: format!("{host}:9100"),
+                state: kiseki_proto::native_contract::NodeState::Active,
+                bindings: Vec::new(),
+            }
+        })
+        .collect();
+
+    // Project each shard onto the cache's Shard shape. Missing
+    // leader_id maps to 0 (sentinel for "unknown" — the cache's
+    // route_for_hashed_key falls back to a refresh in that case).
+    let shards: Vec<Shard> = parsed
+        .shards
+        .iter()
+        .map(|s| {
+            let range_start = decode_hex_prefixed(&s.range_start).unwrap_or_default();
+            let range_end = decode_hex_prefixed(&s.range_end).unwrap_or_default();
+            Shard {
+                shard_id: s.shard_id.clone(),
+                leader_node_id: s.leader_id.unwrap_or(0),
+                range_start,
+                range_end,
+            }
+        })
+        .collect();
+
+    Snapshot {
+        version: 1,
+        nodes,
+        shards,
+    }
+}
+
+/// Same hex decoder as `discovery.rs`. Duplicated here so the two
+/// modules don't cross-import each other's internals.
+fn decode_hex_prefixed(s: &str) -> Option<Vec<u8>> {
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    if stripped.len() != 64 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(32);
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble_value(bytes[i])?;
+        let lo = hex_nibble_value(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+const fn hex_nibble_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Convert a proto-shaped `TopologyInfo` (from `GetTopology`) into a
@@ -567,5 +666,138 @@ mod tests {
         cache.replace(s);
         assert!(cache.route_for_hashed_key(&[0xc0]).is_none());
         assert!(cache.route_for_hashed_key(&[0xa5]).is_some());
+    }
+
+    // ADR-008 rev 2 — snapshot_from_cluster_info bootstrap path.
+
+    #[test]
+    fn snapshot_from_cluster_info_populates_shards_and_nodes() {
+        let parsed = crate::discovery::ClusterInfoResponse {
+            node_id: 1,
+            s3_addr: "10.0.0.1:9000".into(),
+            nfs_addr: "10.0.0.1:2049".into(),
+            metrics_addr: "10.0.0.1:9090".into(),
+            leader_id: Some(2),
+            leader_s3: Some("10.0.0.2:9000".into()),
+            peers: vec![
+                crate::discovery::PeerInfoJson {
+                    id: 1,
+                    raft_addr: "10.0.0.1:7000".into(),
+                    s3_addr: "10.0.0.1:9000".into(),
+                    nfs_addr: "10.0.0.1:2049".into(),
+                    metrics_addr: "10.0.0.1:9090".into(),
+                },
+                crate::discovery::PeerInfoJson {
+                    id: 2,
+                    raft_addr: "10.0.0.2:7000".into(),
+                    s3_addr: "10.0.0.2:9000".into(),
+                    nfs_addr: "10.0.0.2:2049".into(),
+                    metrics_addr: "10.0.0.2:9090".into(),
+                },
+            ],
+            shards: vec![crate::discovery::ShardInfoJson {
+                shard_id: "00000000-0000-0000-0000-000000000001".into(),
+                namespace_id: "trials".into(),
+                leader_id: Some(2),
+                leader_data_addr: Some("10.0.0.2:9100".into()),
+                range_start: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                range_end: "0x5555555555555555555555555555555555555555555555555555555555555555"
+                    .into(),
+            }],
+        };
+        let snap = snapshot_from_cluster_info(&parsed);
+        // Two nodes derived from peers, one shard.
+        assert_eq!(snap.nodes.len(), 2, "nodes derived from peers list");
+        let node_2 = snap
+            .nodes
+            .iter()
+            .find(|n| n.node_id == 2)
+            .expect("node 2 present");
+        assert_eq!(node_2.data_addr, "10.0.0.2:9100");
+        assert_eq!(snap.shards.len(), 1);
+        assert_eq!(snap.shards[0].leader_node_id, 2);
+        assert_eq!(snap.shards[0].range_start[0], 0x00);
+        assert_eq!(snap.shards[0].range_end[31], 0x55);
+        // Bootstrap version is non-zero so subsequent replace_if_newer
+        // calls against a fresh gRPC version (which starts >= 1)
+        // behave deterministically.
+        assert!(
+            snap.version >= 1,
+            "bootstrap snapshot must carry a non-zero version"
+        );
+    }
+
+    #[test]
+    fn snapshot_from_cluster_info_falls_back_when_leader_data_addr_missing() {
+        // Cold start: rev-2 server hasn't yet observed a leader, so
+        // `leader_data_addr` is None. The bootstrap must still produce
+        // a Snapshot — the shard's data_addr falls back to the peer's
+        // S3 / metrics address derived host.
+        let parsed = crate::discovery::ClusterInfoResponse {
+            node_id: 1,
+            s3_addr: "10.0.0.1:9000".into(),
+            nfs_addr: "10.0.0.1:2049".into(),
+            metrics_addr: "10.0.0.1:9090".into(),
+            leader_id: None,
+            leader_s3: None,
+            peers: vec![crate::discovery::PeerInfoJson {
+                id: 1,
+                raft_addr: "10.0.0.1:7000".into(),
+                s3_addr: "10.0.0.1:9000".into(),
+                nfs_addr: "10.0.0.1:2049".into(),
+                metrics_addr: "10.0.0.1:9090".into(),
+            }],
+            shards: vec![crate::discovery::ShardInfoJson {
+                shard_id: "00000000-0000-0000-0000-000000000001".into(),
+                namespace_id: "trials".into(),
+                leader_id: None,
+                leader_data_addr: None,
+                range_start: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                range_end: "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .into(),
+            }],
+        };
+        let snap = snapshot_from_cluster_info(&parsed);
+        // With no leader hint, the shard is still recorded but
+        // its leader_node_id is 0 (sentinel for "unknown").
+        assert_eq!(snap.shards.len(), 1);
+        assert_eq!(snap.shards[0].leader_node_id, 0);
+    }
+
+    // Finding S4 — replace_if_newer guard against version regressions.
+
+    #[test]
+    fn replace_if_newer_only_accepts_strictly_greater_version() {
+        let cache = TopologyCache::new();
+        cache.replace(snap(42));
+        // Same version: rejected.
+        assert!(
+            !cache.replace_if_newer(snap(42)),
+            "equal version must be rejected"
+        );
+        assert_eq!(cache.current_version(), 42);
+        // Stale (HTTP bootstrap returning version=0): rejected.
+        assert!(
+            !cache.replace_if_newer(snap(0)),
+            "stale version must be rejected"
+        );
+        assert_eq!(cache.current_version(), 42);
+        // Strictly greater: accepted.
+        assert!(
+            cache.replace_if_newer(snap(43)),
+            "strictly newer version must be accepted"
+        );
+        assert_eq!(cache.current_version(), 43);
+    }
+
+    #[test]
+    fn replace_if_newer_populates_when_cache_is_empty() {
+        let cache = TopologyCache::new();
+        assert_eq!(cache.current_version(), 0);
+        // Fresh cache + any non-zero version: accepted.
+        assert!(cache.replace_if_newer(snap(7)));
+        assert_eq!(cache.current_version(), 7);
     }
 }

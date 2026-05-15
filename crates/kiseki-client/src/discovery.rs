@@ -2,6 +2,12 @@
 //!
 //! Native clients discover shards, views, and gateways via seed
 //! endpoints on the data fabric. No control plane connectivity required.
+//!
+//! ADR-008 rev 2 — the bootstrap discovery response carries a
+//! per-shard leader map projected from the control-plane
+//! `NamespaceShardMap` (ADR-033 §4). Clients hydrate their
+//! `TopologyCache` from this map on first connect, then refresh via
+//! gRPC `GetTopology` (ADR-042 §4) once a data channel is dialled.
 
 use std::net::SocketAddr;
 
@@ -30,8 +36,21 @@ pub struct DiscoveryResponse {
 pub struct ShardEndpoint {
     /// Shard identifier (opaque string from discovery).
     pub shard_id: String,
-    /// Leader node address.
+    /// Owning namespace (ADR-008 rev 2). Empty for rev-1 stubs.
+    pub namespace_id: String,
+    /// Leader's `NodeId`. `None` when the responding node has not yet
+    /// observed a leader (cold start, mid-election).
+    pub leader_node_id: Option<u64>,
+    /// Leader node address — the legacy single-binding form. ADR-008
+    /// rev 2 retains this for compat; per-binding endpoints are
+    /// resolved via the gRPC `GetTopology` follow-up (ADR-042 §1.7).
     pub leader_addr: SocketAddr,
+    /// Hex-encoded 32-byte inclusive lower bound of the shard's
+    /// hashed-key range (ADR-033 §4). Empty `Vec` for rev-1 stubs.
+    pub range_start: Vec<u8>,
+    /// Hex-encoded 32-byte exclusive upper bound. Empty `Vec` for
+    /// rev-1 stubs.
+    pub range_end: Vec<u8>,
 }
 
 /// A view endpoint from discovery.
@@ -117,7 +136,11 @@ impl DiscoveryClient {
         let resp = DiscoveryResponse {
             shards: vec![ShardEndpoint {
                 shard_id: "bootstrap".to_owned(),
+                namespace_id: String::new(),
+                leader_node_id: None,
                 leader_addr: seed.addr,
+                range_start: Vec::new(),
+                range_end: Vec::new(),
             }],
             views: vec![],
             gateways: vec![GatewayEndpoint {
@@ -146,5 +169,281 @@ impl DiscoveryClient {
                 .find(|s| s.shard_id == shard_id)
                 .map(|s| s.leader_addr)
         })
+    }
+
+    /// ADR-008 rev 2 — parse a `/cluster/info` JSON response into a
+    /// fully-populated [`DiscoveryResponse`]. Used during
+    /// [`crate::native::NativeClient::connect`] bootstrap, before the
+    /// gRPC data channel is dialled.
+    ///
+    /// Returns a [`DiscoveryParseError`] if the JSON is unparseable,
+    /// missing required fields, or carries an unparseable
+    /// `leader_data_addr` / hex range. Unknown fields are ignored
+    /// (forward-compat with future rev-N additions).
+    pub fn from_cluster_info_json(json: &str) -> Result<DiscoveryResponse, DiscoveryParseError> {
+        let parsed: ClusterInfoResponse = serde_json::from_str(json)?;
+        let mut shards = Vec::with_capacity(parsed.shards.len());
+        for s in &parsed.shards {
+            // Per-shard leader address. ADR-008 rev 2 §"Wire shape":
+            // the field is `"host:port"`. Empty / missing means the
+            // shard's leader is unknown — surface this with a
+            // sentinel address (loopback). Callers honour
+            // `leader_node_id = None` as "no leader yet".
+            let leader_addr = match &s.leader_data_addr {
+                Some(addr) => addr
+                    .parse::<SocketAddr>()
+                    .map_err(|e| DiscoveryParseError::InvalidLeaderAddr(format!("{addr}: {e}")))?,
+                None => SocketAddr::from(([0, 0, 0, 0], 0)),
+            };
+            let range_start = decode_hex_prefixed(&s.range_start)
+                .ok_or_else(|| DiscoveryParseError::InvalidHexRange(s.range_start.clone()))?;
+            let range_end = decode_hex_prefixed(&s.range_end)
+                .ok_or_else(|| DiscoveryParseError::InvalidHexRange(s.range_end.clone()))?;
+            shards.push(ShardEndpoint {
+                shard_id: s.shard_id.clone(),
+                namespace_id: s.namespace_id.clone(),
+                leader_node_id: s.leader_id,
+                leader_addr,
+                range_start,
+                range_end,
+            });
+        }
+        // Gateways: project each peer onto a `GatewayEndpoint` so
+        // rev-1 fields (gateways list) are populated for forward-
+        // compat consumers.
+        let gateways = parsed
+            .peers
+            .iter()
+            .filter_map(|p| {
+                p.s3_addr
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(|endpoint| GatewayEndpoint {
+                        protocol: "s3".to_owned(),
+                        transport: "tcp".to_owned(),
+                        endpoint,
+                    })
+            })
+            .collect();
+        Ok(DiscoveryResponse {
+            shards,
+            views: Vec::new(),
+            gateways,
+            ttl_ms: 30_000,
+        })
+    }
+}
+
+/// Parse a `0x`-prefixed hex string (64 chars = 32 bytes after the
+/// prefix). Returns `None` on missing prefix, wrong length, or any
+/// non-hex character.
+fn decode_hex_prefixed(s: &str) -> Option<Vec<u8>> {
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    if stripped.len() != 64 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(32);
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble_value(bytes[i])?;
+        let lo = hex_nibble_value(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+const fn hex_nibble_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse failures for ADR-008 rev 2 `/cluster/info` JSON.
+#[allow(missing_docs)]
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryParseError {
+    #[error("malformed json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+    #[error("invalid leader_data_addr: {0}")]
+    InvalidLeaderAddr(String),
+    #[error("invalid hex range: {0}")]
+    InvalidHexRange(String),
+}
+
+/// Wire-shape mirror of `kiseki_server::web::api::ShardInfoJson` —
+/// duplicated here so kiseki-client doesn't depend on kiseki-server.
+/// The two structs MUST stay byte-equivalent on the wire; tests in
+/// both crates round-trip the same fixture JSON.
+///
+/// Field semantics: ADR-008 rev 2 §"Wire shape".
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShardInfoJson {
+    /// UUID string form.
+    pub shard_id: String,
+    /// Owning namespace.
+    pub namespace_id: String,
+    /// Best-effort leader's `NodeId`. May be absent when the
+    /// responding node has not yet observed a leader.
+    #[serde(default)]
+    pub leader_id: Option<u64>,
+    /// Best-effort leader's data-port address (`host:port`).
+    #[serde(default)]
+    pub leader_data_addr: Option<String>,
+    /// Hex-encoded 32-byte inclusive lower bound, prefixed `0x`.
+    pub range_start: String,
+    /// Hex-encoded 32-byte exclusive upper bound, prefixed `0x`.
+    pub range_end: String,
+}
+
+/// Wire-shape mirror of `kiseki_server::web::api::PeerInfoJson`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PeerInfoJson {
+    /// Peer `NodeId`.
+    pub id: u64,
+    /// Raft address.
+    pub raft_addr: String,
+    /// S3 address (`host:9000`).
+    pub s3_addr: String,
+    /// NFS address (`host:2049`).
+    pub nfs_addr: String,
+    /// Metrics address (`host:9090`).
+    pub metrics_addr: String,
+}
+
+/// Wire-shape mirror of `kiseki_server::web::api::ClusterInfoResponse`.
+/// kiseki-client deserializes the HTTP `/cluster/info` response into
+/// this type; the typed surface keeps the client / server contract
+/// readable in both crates.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ClusterInfoResponse {
+    /// This node's `NodeId`.
+    pub node_id: u64,
+    /// This node's S3 address.
+    pub s3_addr: String,
+    /// This node's NFS address.
+    pub nfs_addr: String,
+    /// This node's metrics address.
+    pub metrics_addr: String,
+    /// Bootstrap-shard leader id (rev 1 retained).
+    #[serde(default)]
+    pub leader_id: Option<u64>,
+    /// Bootstrap-shard leader S3 address (rev 1 retained).
+    #[serde(default)]
+    pub leader_s3: Option<String>,
+    /// Cluster peers.
+    pub peers: Vec<PeerInfoJson>,
+    /// ADR-008 rev 2 per-shard leader map.
+    #[serde(default)]
+    pub shards: Vec<ShardInfoJson>,
+}
+
+#[cfg(test)]
+mod from_cluster_info_json_tests {
+    use super::*;
+
+    const REV2_JSON: &str = r#"{
+        "node_id": 1,
+        "s3_addr": "10.0.0.1:9000",
+        "nfs_addr": "10.0.0.1:2049",
+        "metrics_addr": "10.0.0.1:9090",
+        "leader_id": 2,
+        "leader_s3": "10.0.0.2:9000",
+        "peers": [
+            {"id": 1, "raft_addr": "10.0.0.1:7000", "s3_addr": "10.0.0.1:9000",
+             "nfs_addr": "10.0.0.1:2049", "metrics_addr": "10.0.0.1:9090"},
+            {"id": 2, "raft_addr": "10.0.0.2:7000", "s3_addr": "10.0.0.2:9000",
+             "nfs_addr": "10.0.0.2:2049", "metrics_addr": "10.0.0.2:9090"},
+            {"id": 3, "raft_addr": "10.0.0.3:7000", "s3_addr": "10.0.0.3:9000",
+             "nfs_addr": "10.0.0.3:2049", "metrics_addr": "10.0.0.3:9090"}
+        ],
+        "shards": [
+            {"shard_id": "00000000-0000-0000-0000-000000000001",
+             "namespace_id": "trials",
+             "leader_id": 2,
+             "leader_data_addr": "10.0.0.2:9100",
+             "range_start": "0x0000000000000000000000000000000000000000000000000000000000000000",
+             "range_end":   "0x5555555555555555555555555555555555555555555555555555555555555555"}
+        ]
+    }"#;
+
+    #[test]
+    fn parses_rev2_payload_into_discovery_response() {
+        let resp = DiscoveryClient::from_cluster_info_json(REV2_JSON).expect("rev-2 JSON parses");
+        assert_eq!(resp.shards.len(), 1);
+        let s = &resp.shards[0];
+        assert_eq!(s.shard_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(s.namespace_id, "trials");
+        assert_eq!(s.leader_node_id, Some(2));
+        assert_eq!(s.leader_addr.to_string(), "10.0.0.2:9100");
+        assert_eq!(s.range_start.len(), 32);
+        assert_eq!(s.range_end.len(), 32);
+        // First byte of start = 0x00, last byte of end = 0x55.
+        assert_eq!(s.range_start[0], 0x00);
+        assert_eq!(s.range_end[31], 0x55);
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        let err = DiscoveryClient::from_cluster_info_json("{not valid json")
+            .expect_err("malformed JSON must error");
+        assert!(matches!(err, DiscoveryParseError::Json(_)));
+    }
+
+    #[test]
+    fn rejects_unparseable_leader_data_addr() {
+        // `leader_data_addr` is "not-a-host-port".
+        let bad = REV2_JSON.replace("10.0.0.2:9100", "not-a-host-port");
+        let err = DiscoveryClient::from_cluster_info_json(&bad)
+            .expect_err("unparseable host:port must error");
+        assert!(
+            matches!(err, DiscoveryParseError::InvalidLeaderAddr(_)),
+            "expected InvalidLeaderAddr, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_hex_range() {
+        // `range_start` is not a valid 0x-prefixed hex string.
+        let bad = REV2_JSON.replace(
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "deadbeef",
+        );
+        let err =
+            DiscoveryClient::from_cluster_info_json(&bad).expect_err("invalid hex must error");
+        assert!(
+            matches!(err, DiscoveryParseError::InvalidHexRange(_)),
+            "expected InvalidHexRange, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_empty_shards_for_rev1_compat() {
+        // ADR-008 rev 2 §"Compatibility": empty shards list is honoured
+        // as "fall back to seed-only routing".
+        let rev1 = r#"{
+            "node_id": 1, "s3_addr": "10.0.0.1:9000",
+            "nfs_addr": "10.0.0.1:2049", "metrics_addr": "10.0.0.1:9090",
+            "peers": []
+        }"#;
+        let resp = DiscoveryClient::from_cluster_info_json(rev1)
+            .expect("rev-1 JSON parses with empty shards");
+        assert!(resp.shards.is_empty());
+    }
+
+    #[test]
+    fn ignores_unknown_fields() {
+        // Forward-compat: rev-3 fields (not yet defined) must not break
+        // a rev-2 client.
+        let with_extras = r#"{ "node_id": 1, "s3_addr": "10.0.0.1:9000",
+            "nfs_addr": "10.0.0.1:2049", "metrics_addr": "10.0.0.1:9090",
+            "peers": [], "future_field": "ignore-me" }"#;
+        assert!(DiscoveryClient::from_cluster_info_json(with_extras).is_ok());
     }
 }

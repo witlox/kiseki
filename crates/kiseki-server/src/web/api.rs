@@ -33,6 +33,10 @@ pub struct UiState {
     /// presence by calling `list_fragments` on this handle. Operators
     /// use the endpoint to debug placement / GC / under-replication.
     pub local_chunk_store: Option<Arc<dyn kiseki_chunk::AsyncChunkOps>>,
+    /// Cluster-control state machine handle (ADR-033 §4): exposes the
+    /// per-namespace shard maps the `/cluster/info` `shards` field
+    /// (ADR-008 rev 2) projects. `None` on single-node deployments.
+    pub cluster_control: Option<Arc<crate::cluster_control::ControlStateMachine>>,
 }
 
 /// Static node identity exposed via `/cluster/info`.
@@ -43,6 +47,97 @@ pub struct NodeInfo {
     pub nfs_addr: String,
     pub metrics_addr: String,
     pub raft_peers: Vec<(u64, String)>,
+}
+
+/// One row in the `/cluster/info` `shards` array (ADR-008 rev 2).
+///
+/// ADR-033 §4 holds the source-of-truth `NamespaceShardMap` on the
+/// control-plane Raft group; this wire shape projects each shard onto
+/// the JSON contract clients consume to populate their topology cache
+/// without going through gRPC `GetTopology` (ADR-042 §4) first.
+///
+/// Field semantics (matching ADR-008 rev 2 §"Wire shape"):
+///
+/// - `shard_id`: UUID string form, matching ADR-033 §4 / ADR-042 §1.
+/// - `leader_id`: `NodeId` u64. `None` when the responding node has
+///   not yet observed a leader (cold start, mid-election).
+/// - `leader_data_addr`: `host:port` of the leader's native gateway
+///   (`KISEKI_DATA_ADDR`, default 9100). `None` when the
+///   responding node cannot resolve the leader's address.
+/// - `range_start` / `range_end`: hex-encoded 32-byte hashed-key
+///   bounds, matching `NamespaceShardMap.ShardRange` (ADR-033 §4).
+///   `range_end = "0xFF…FF"` is the inclusive upper bound for the
+///   last shard.
+/// - `namespace_id`: the namespace the shard belongs to. Surfaced so
+///   multi-namespace clusters can route per-namespace without an
+///   extra round-trip.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShardInfoJson {
+    /// UUID string form.
+    pub shard_id: String,
+    /// Owning namespace.
+    pub namespace_id: String,
+    /// Best-effort leader's `NodeId`.
+    #[serde(default)]
+    pub leader_id: Option<u64>,
+    /// Best-effort leader's data-port address (`host:port`).
+    #[serde(default)]
+    pub leader_data_addr: Option<String>,
+    /// Hex-encoded 32-byte inclusive lower bound, prefixed `0x`.
+    pub range_start: String,
+    /// Hex-encoded 32-byte exclusive upper bound, prefixed `0x`.
+    pub range_end: String,
+}
+
+/// Full JSON shape of `/cluster/info` as of ADR-008 rev 2.
+///
+/// Defined as a typed struct (not just `serde_json::json!`) so
+/// `kiseki-client::discovery` and the BDD/unit-test surfaces can
+/// share the deserialization path. The handler still constructs the
+/// response value, but lives behind this contract.
+///
+/// `peers` and `node_info` fields stay flat for ADR-008 rev-1
+/// compatibility (older clients ignore unknown fields).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ClusterInfoResponse {
+    /// This node's `NodeId`.
+    pub node_id: u64,
+    /// This node's S3 address (`host:port`).
+    pub s3_addr: String,
+    /// This node's NFS address (`host:port`).
+    pub nfs_addr: String,
+    /// This node's metrics address (`host:port`).
+    pub metrics_addr: String,
+    /// Bootstrap-shard leader id (rev-1 retained). Per ADR-008 rev 2
+    /// `shards` is the authoritative per-shard map; this remains for
+    /// older clients.
+    #[serde(default)]
+    pub leader_id: Option<u64>,
+    /// Bootstrap-shard leader S3 address (rev-1 retained).
+    #[serde(default)]
+    pub leader_s3: Option<String>,
+    /// Cluster peers — id + addresses for every replica.
+    pub peers: Vec<PeerInfoJson>,
+    /// ADR-008 rev 2: per-shard leader map. Empty when this node has
+    /// not yet observed any namespace's shard map (cold start, no
+    /// control-plane connectivity, single-node compose).
+    #[serde(default)]
+    pub shards: Vec<ShardInfoJson>,
+}
+
+/// Per-peer record on `/cluster/info` `peers[]`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PeerInfoJson {
+    /// Peer `NodeId`.
+    pub id: u64,
+    /// Raft address (`host:raft_port`).
+    pub raft_addr: String,
+    /// S3 address (`host:9000`).
+    pub s3_addr: String,
+    /// NFS address (`host:2049`).
+    pub nfs_addr: String,
+    /// Metrics address (`host:9090`).
+    pub metrics_addr: String,
 }
 
 /// Build the web UI router.
@@ -349,7 +444,11 @@ async fn ops_scrub(State(state): State<UiState>) -> impl IntoResponse {
 /// Cluster info: this node's identity, leader, and peer map.
 ///
 /// Benchmark scripts and clients use this to discover the Raft leader
-/// and route writes to the correct node's S3/NFS endpoint.
+/// and route writes to the correct node's S3/NFS endpoint. ADR-008
+/// rev 2 adds the `shards: [...]` top-level array so native clients
+/// learn per-shard leaders on bootstrap (without needing gRPC
+/// `GetTopology`, which they can't reach until the topology cache is
+/// primed).
 async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
     let bootstrap_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
 
@@ -378,24 +477,119 @@ async fn cluster_info(State(state): State<UiState>) -> impl IntoResponse {
         (None, None)
     };
 
-    axum::Json(serde_json::json!({
-        "node_id": state.node_info.node_id,
-        "s3_addr": state.node_info.s3_addr,
-        "nfs_addr": state.node_info.nfs_addr,
-        "metrics_addr": state.node_info.metrics_addr,
-        "leader_id": leader_id,
-        "leader_s3": leader_s3,
-        "peers": state.node_info.raft_peers.iter().map(|(id, addr)| {
+    let metrics_port = state
+        .node_info
+        .metrics_addr
+        .split(':')
+        .next_back()
+        .unwrap_or("9090")
+        .to_owned();
+
+    let peers: Vec<PeerInfoJson> = state
+        .node_info
+        .raft_peers
+        .iter()
+        .map(|(id, addr)| {
             let host = addr.split(':').next().unwrap_or("127.0.0.1");
-            serde_json::json!({
-                "id": id,
-                "raft_addr": addr,
-                "s3_addr": format!("{host}:9000"),
-                "nfs_addr": format!("{host}:2049"),
-                "metrics_addr": format!("{host}:{}", state.node_info.metrics_addr.split(':').next_back().unwrap_or("9090")),
-            })
-        }).collect::<Vec<_>>(),
-    }))
+            PeerInfoJson {
+                id: *id,
+                raft_addr: addr.clone(),
+                s3_addr: format!("{host}:9000"),
+                nfs_addr: format!("{host}:2049"),
+                metrics_addr: format!("{host}:{metrics_port}"),
+            }
+        })
+        .collect();
+
+    // ADR-008 rev 2 `shards: [...]` — populated from the control-plane
+    // state machine when present, else empty (operational degradation
+    // path: rev-1 clients fall back to seed-only routing).
+    let shards = build_shards_from_state(&state).await;
+
+    axum::Json(ClusterInfoResponse {
+        node_id: state.node_info.node_id,
+        s3_addr: state.node_info.s3_addr.clone(),
+        nfs_addr: state.node_info.nfs_addr.clone(),
+        metrics_addr: state.node_info.metrics_addr.clone(),
+        leader_id,
+        leader_s3,
+        peers,
+        shards,
+    })
+}
+
+/// ADR-008 rev 2 — project the control-plane `NamespaceShardMap`s onto
+/// the wire-shape `Vec<ShardInfoJson>`. Returns an empty Vec when the
+/// control-plane state machine is not wired in (single-node compose,
+/// rev-1 deploys, BDD harnesses) — clients honour the empty list as
+/// "fall back to seed-only routing" per ADR-008 rev 2 §"Compatibility".
+async fn build_shards_from_state(state: &UiState) -> Vec<ShardInfoJson> {
+    let Some(cluster_control) = state.cluster_control.as_ref() else {
+        return Vec::new();
+    };
+    let snapshot = cluster_control.snapshot().await;
+
+    // Build the (node_id → "host:port") map for `leader_data_addr`
+    // resolution. Convention: native data port is 9100 (matches
+    // `KISEKI_DATA_ADDR` default + `node_info_from_plan`).
+    let peer_data_addrs: std::collections::HashMap<u64, String> = state
+        .node_info
+        .raft_peers
+        .iter()
+        .map(|(id, addr)| {
+            let host = addr.split(':').next().unwrap_or("127.0.0.1");
+            (*id, format!("{host}:9100"))
+        })
+        .collect();
+
+    let mut shards = Vec::new();
+    for (namespace_id, ns_snapshot) in snapshot.namespaces {
+        for shard in ns_snapshot.shards {
+            if shard.is_retiring {
+                // Skip retired shards: ADR-033 §4 says routing should
+                // ignore them once the merge has absorbed the range.
+                continue;
+            }
+            let leader_id = shard.leader_node.0;
+            let leader_data_addr = peer_data_addrs.get(&leader_id).cloned();
+            shards.push(ShardInfoJson {
+                shard_id: shard.shard_id.0.to_string(),
+                namespace_id: namespace_id.clone(),
+                leader_id: Some(leader_id),
+                leader_data_addr,
+                range_start: encode_hex_prefixed(&shard.range_start),
+                range_end: encode_hex_prefixed(&shard.range_end),
+            });
+        }
+    }
+    // Sort by namespace_id + range_start so the order is
+    // deterministic across nodes (HashMap iteration order is not).
+    shards.sort_by(|a, b| {
+        a.namespace_id
+            .cmp(&b.namespace_id)
+            .then_with(|| a.range_start.cmp(&b.range_start))
+    });
+    shards
+}
+
+/// Encode a 32-byte hashed-key bound as a `0x`-prefixed lowercase
+/// hex string. Matches the wire format documented in ADR-008 rev 2
+/// §"Wire shape".
+fn encode_hex_prefixed(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(2 + 64);
+    s.push_str("0x");
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Public re-export of `build_shards_from_state` for cross-crate tests
+/// (kiseki-acceptance BDD step impls). Same body, public visibility.
+#[allow(clippy::unused_async)]
+pub async fn build_shards_for_test(state: &UiState) -> Vec<ShardInfoJson> {
+    build_shards_from_state(state).await
 }
 
 /// Per-shard leader info (Phase 17 item 4).
@@ -733,4 +927,182 @@ async fn admin_test_drop_fragment(
             "chunk_removed": chunk_removed,
         })),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::type_complexity, clippy::redundant_closure)]
+mod cluster_info_rev2_tests {
+    //! ADR-008 rev 2 — `build_shards_from_state` tests.
+    //!
+    //! Validates that the `/cluster/info` `shards` field projects the
+    //! control-plane `NamespaceShardMap` onto the wire shape, with
+    //! the peer-map providing the `leader_data_addr` resolution.
+
+    use super::*;
+    use crate::cluster_control::ControlStateMachine;
+    use kiseki_common::ids::{NodeId, OrgId};
+
+    async fn ui_state_with_namespaces(
+        peers: Vec<(u64, String)>,
+        namespaces: Vec<(String, OrgId, Vec<(uuid::Uuid, u64, [u8; 32], [u8; 32])>)>,
+    ) -> UiState {
+        let aggregator = Arc::new(MetricsAggregator::new("127.0.0.1:9090".to_owned(), 10));
+        let diagnostics = super::super::events::new_shared();
+        let state = ControlStateMachine::new();
+        // Synthesise the state machine's inner map directly — avoids
+        // dragging in a full openraft store for a unit test.
+        {
+            let mut inner = state.inner.lock().await;
+            for (ns_id, tenant_id, shards) in namespaces {
+                let snapshots: Vec<crate::cluster_control::state_machine::ShardSnapshot> = shards
+                    .into_iter()
+                    .map(|(sid, leader_node, rs, re)| {
+                        crate::cluster_control::state_machine::ShardSnapshot {
+                            shard_id: kiseki_common::ids::ShardId(sid),
+                            range_start: rs,
+                            range_end: re,
+                            leader_node: NodeId(leader_node),
+                            is_retiring: false,
+                        }
+                    })
+                    .collect();
+                inner.namespaces.insert(
+                    ns_id.clone(),
+                    crate::cluster_control::NamespaceShardMapSnapshot {
+                        namespace_id: ns_id,
+                        tenant_id,
+                        version: 1,
+                        shards: snapshots,
+                    },
+                );
+            }
+        }
+        UiState {
+            aggregator,
+            metrics_encode: Arc::new(|| String::new()),
+            diagnostics,
+            log_store: None,
+            node_info: NodeInfo {
+                node_id: 1,
+                s3_addr: "10.0.0.1:9000".to_owned(),
+                nfs_addr: "10.0.0.1:2049".to_owned(),
+                metrics_addr: "10.0.0.1:9090".to_owned(),
+                raft_peers: peers,
+            },
+            compositions: None,
+            local_chunk_store: None,
+            cluster_control: Some(Arc::new(state)),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_shards_emits_one_entry_per_shard() {
+        let s_id = uuid::Uuid::from_u128(1);
+        let state = ui_state_with_namespaces(
+            vec![
+                (1, "10.0.0.1:7000".to_owned()),
+                (2, "10.0.0.2:7000".to_owned()),
+                (3, "10.0.0.3:7000".to_owned()),
+            ],
+            vec![(
+                "trials".to_owned(),
+                OrgId(uuid::Uuid::from_u128(1)),
+                vec![(s_id, 2, [0u8; 32], [0xff; 32])],
+            )],
+        )
+        .await;
+        let shards = build_shards_from_state(&state).await;
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].shard_id, s_id.to_string());
+        assert_eq!(shards[0].namespace_id, "trials");
+        assert_eq!(shards[0].leader_id, Some(2));
+        // Resolved from peer (2)'s raft_addr → host 10.0.0.2 → 9100
+        // (KISEKI_DATA_ADDR default).
+        assert_eq!(shards[0].leader_data_addr.as_deref(), Some("10.0.0.2:9100"));
+        assert_eq!(
+            shards[0].range_start,
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            shards[0].range_end,
+            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_shards_omits_leader_when_peer_unknown() {
+        // Leader node = 7, but peer list only knows nodes 1, 2, 3.
+        let s_id = uuid::Uuid::from_u128(1);
+        let state = ui_state_with_namespaces(
+            vec![
+                (1, "10.0.0.1:7000".to_owned()),
+                (2, "10.0.0.2:7000".to_owned()),
+                (3, "10.0.0.3:7000".to_owned()),
+            ],
+            vec![(
+                "trials".to_owned(),
+                OrgId(uuid::Uuid::from_u128(1)),
+                vec![(s_id, 7, [0u8; 32], [0xff; 32])],
+            )],
+        )
+        .await;
+        let shards = build_shards_from_state(&state).await;
+        assert_eq!(shards.len(), 1);
+        // leader_id is still surfaced (the control plane knows it);
+        // leader_data_addr is None (we can't resolve the host).
+        assert_eq!(shards[0].leader_id, Some(7));
+        assert_eq!(shards[0].leader_data_addr, None);
+    }
+
+    #[tokio::test]
+    async fn build_shards_emits_empty_when_no_control_plane() {
+        // Single-node deploys have no cluster_control wired — the
+        // empty Vec lets rev-1 clients fall back to seed-only routing.
+        let aggregator = Arc::new(MetricsAggregator::new("127.0.0.1:9090".to_owned(), 10));
+        let state = UiState {
+            aggregator,
+            metrics_encode: Arc::new(|| String::new()),
+            diagnostics: super::super::events::new_shared(),
+            log_store: None,
+            node_info: NodeInfo {
+                node_id: 1,
+                s3_addr: "10.0.0.1:9000".to_owned(),
+                nfs_addr: "10.0.0.1:2049".to_owned(),
+                metrics_addr: "10.0.0.1:9090".to_owned(),
+                raft_peers: vec![],
+            },
+            compositions: None,
+            local_chunk_store: None,
+            cluster_control: None,
+        };
+        let shards = build_shards_from_state(&state).await;
+        assert!(shards.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_shards_emits_multiple_shards_per_namespace() {
+        // ADR-033 §1 default `initial_shards = max(min(3 * 3, 64), 3)
+        // = 9`. Mimic a 3-shard namespace with disjoint ranges.
+        let mut shards = Vec::new();
+        let split_a = [0x55u8; 32];
+        let split_b = [0xaau8; 32];
+        shards.push((uuid::Uuid::from_u128(1), 1, [0u8; 32], split_a));
+        shards.push((uuid::Uuid::from_u128(2), 2, split_a, split_b));
+        shards.push((uuid::Uuid::from_u128(3), 3, split_b, [0xffu8; 32]));
+        let state = ui_state_with_namespaces(
+            vec![
+                (1, "10.0.0.1:7000".to_owned()),
+                (2, "10.0.0.2:7000".to_owned()),
+                (3, "10.0.0.3:7000".to_owned()),
+            ],
+            vec![("trials".to_owned(), OrgId(uuid::Uuid::from_u128(1)), shards)],
+        )
+        .await;
+        let projected = build_shards_from_state(&state).await;
+        assert_eq!(projected.len(), 3);
+        // Sorted by range_start.
+        assert_eq!(projected[0].leader_id, Some(1));
+        assert_eq!(projected[1].leader_id, Some(2));
+        assert_eq!(projected[2].leader_id, Some(3));
+    }
 }

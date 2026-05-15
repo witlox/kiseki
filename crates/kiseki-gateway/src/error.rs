@@ -76,6 +76,27 @@ pub enum GatewayError {
     /// 404 makes the operator's mistake obvious.
     #[error("bucket / namespace not registered: {0}")]
     NamespaceNotFound(String),
+
+    /// ADR-044 / ADR-008 rev 2 — the shard's Raft leader is
+    /// unavailable on this node (election in progress, shard
+    /// splitting, etc.). The S3 gateway maps this to a `307 Temporary
+    /// Redirect` toward the cached leader (when a hint is
+    /// available) or a `503 Service Unavailable` with `Retry-After`
+    /// when no hint is yet known.
+    ///
+    /// `shard_id`: the shard the request was routed to.
+    /// `leader_hint`: best-effort `NodeId` of the current leader.
+    /// `None` during an active election. Sourced from the
+    /// `NamespaceShardMap` (ADR-033 §4) or from a future
+    /// `LogError::ForwardToLeader` variant once Step A lands.
+    #[error("leader unavailable for shard {shard_id:?} (hint: {leader_hint:?})")]
+    LeaderUnavailable {
+        /// The shard the request was routed to.
+        shard_id: ShardId,
+        /// Best-effort `NodeId` of the current leader (None during
+        /// an active election).
+        leader_hint: Option<u64>,
+    },
 }
 
 impl From<GatewayError> for KisekiError {
