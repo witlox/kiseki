@@ -1012,3 +1012,99 @@ pub struct ReadDirEntry {
     pub fileid: u64,
     pub name: String,
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the NFS write-buffer + flush_writes path.
+    //!
+    //! These pin the sustained-write contract per #50 (F-1): multiple
+    //! NFS WRITE ops to the same fh, with intervening per-write
+    //! flushes (the NFSv3 stable>=1 path, and the NFSv4 COMMIT-after-
+    //! each-WRITE path that Linux sends under fio --direct=1), MUST
+    //! yield a final composition containing the CONCATENATION of all
+    //! writes. Pre-fix the second + subsequent flushes hit the
+    //! `create_at` idempotent no-op in mem_gateway.rs:2146 and the
+    //! data was silently dropped.
+    use super::*;
+    use crate::mem_gateway::InMemoryGateway;
+    use crate::nfs::NfsGateway;
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_crypto::keys::SystemMasterKey;
+
+    fn ctx() -> NfsContext<InMemoryGateway> {
+        let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
+        let tenant = OrgId(uuid::Uuid::nil());
+        let ns = NamespaceId(uuid::Uuid::from_u128(1));
+        let store = CompositionStore::new();
+        store.add_namespace(kiseki_composition::namespace::Namespace {
+            id: ns,
+            tenant_id: tenant,
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        });
+        let gw = InMemoryGateway::new(
+            store,
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            master_key,
+        );
+        let nfs_gw = NfsGateway::new(gw);
+        NfsContext::new(nfs_gw, tenant, ns)
+    }
+
+    /// Three sequential writes to the same fh, each followed by a
+    /// flush (mirrors NFSv4.2 + fio `--direct=1`: COMMIT after every
+    /// WRITE). The final file content MUST be the concatenation of
+    /// all three writes.
+    ///
+    /// Pre-#50 the second flush hits `create_at`'s idempotent path
+    /// and the data is silently dropped — read returns only the
+    /// first 1 KB of 'A' with zeros in [1024, 3072) instead of
+    /// AAAA…BBBB…CCCC…
+    ///
+    /// Currently `#[ignore]` because the fix is still in progress
+    /// in this branch — `cargo test -- --ignored` surfaces it as
+    /// the regression gate. The fix lifts the ignore once the
+    /// flush path coalesces correctly.
+    #[ignore = "RED — #50 fix in progress on this branch (sustained-write data loss)"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sustained_writes_with_per_write_flush_concatenate() {
+        let ctx = ctx();
+        let (fh, _) = ctx.create_pending_named("sustained-fio").expect("create");
+        const CHUNK: usize = 1024;
+        let a = vec![b'A'; CHUNK];
+        let b = vec![b'B'; CHUNK];
+        let c = vec![b'C'; CHUNK];
+
+        ctx.buffer_write(&fh, 0, &a);
+        ctx.flush_writes(&fh).await.expect("flush 1");
+
+        ctx.buffer_write(&fh, CHUNK as u64, &b);
+        ctx.flush_writes(&fh).await.expect("flush 2");
+
+        ctx.buffer_write(&fh, (CHUNK * 2) as u64, &c);
+        ctx.flush_writes(&fh).await.expect("flush 3");
+
+        // Read the entire file back.
+        let resp = ctx
+            .read(&fh, 0, (CHUNK * 3) as u32)
+            .await
+            .expect("read after sustained writes");
+
+        let expected: Vec<u8> = a.iter().chain(b.iter()).chain(c.iter()).copied().collect();
+        assert_eq!(
+            resp.data.len(),
+            expected.len(),
+            "read returned {} bytes, expected {} — sustained-write flushes silently dropped data (#50)",
+            resp.data.len(),
+            expected.len(),
+        );
+        assert_eq!(
+            resp.data, expected,
+            "read content does not match concatenated writes — flush_writes dropped data (#50)"
+        );
+    }
+}
