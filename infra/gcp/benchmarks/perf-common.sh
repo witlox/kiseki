@@ -34,8 +34,36 @@ read -r -a STORAGE_IPS_ARRAY <<< "$ALL_STORAGE"
 PAR=${KISEKI_BENCH_PAR:-8}
 GCS_BUCKET="${KISEKI_PERF_BUCKET:-gs://kiseki-perf-results}"
 
-RUN_TS=$(date +%Y%m%d-%H%M%S)
-RESULTS="/tmp/kiseki-perf-${KISEKI_PROFILE:-unknown}-${RUN_TS}"
+# Closes #55: $RESULTS is sticky per session, not per source.
+#
+# Pre-fix RESULTS used `$(date +%Y%m%d-%H%M%S)` evaluated AT SOURCE
+# TIME, so every phase script that sourced perf-common.sh got its own
+# timestamped dir. The 2026-05-16 GCP run scattered results across
+# 7+ /tmp/kiseki-perf-compact-* dirs.
+#
+# New shape: $KISEKI_RUN_ID is the source of truth. If unset (first
+# source of the session), read from /tmp/kiseki-bench-runid; if the
+# marker is missing, generate a fresh timestamp + write it. Every
+# subsequent source inside the same session reads the same id, so all
+# phases land under the same $RESULTS.
+#
+# The `bench` driver (infra/gcp/benchmarks/bench) creates a fresh
+# run-id on entry by writing a new marker; operators can also pin one
+# explicitly via `KISEKI_RUN_ID=<value> bash phases/<name>.sh`.
+RUN_ID_MARKER="${KISEKI_RUN_ID_MARKER:-/tmp/kiseki-bench-runid}"
+if [ -z "${KISEKI_RUN_ID:-}" ]; then
+  if [ -f "$RUN_ID_MARKER" ]; then
+    KISEKI_RUN_ID=$(cat "$RUN_ID_MARKER" 2>/dev/null || echo "")
+  fi
+  if [ -z "${KISEKI_RUN_ID:-}" ]; then
+    KISEKI_RUN_ID=$(date +%Y%m%d-%H%M%S)
+    echo "$KISEKI_RUN_ID" > "$RUN_ID_MARKER" 2>/dev/null || true
+  fi
+  export KISEKI_RUN_ID
+fi
+# Legacy compatibility: some downstream tooling still reads $RUN_TS.
+RUN_TS="$KISEKI_RUN_ID"
+RESULTS="/tmp/kiseki-perf-${KISEKI_PROFILE:-unknown}-${KISEKI_RUN_ID}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[1]:-$0}")" && pwd)"
 mkdir -p "$RESULTS"
 
