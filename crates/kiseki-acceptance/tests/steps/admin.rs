@@ -1796,9 +1796,23 @@ async fn then_backs_off(w: &mut KisekiWorld, _pool: String) {
 
 #[then("the rebalance pauses with a capacity warning")]
 async fn then_rebalance_pauses(w: &mut KisekiWorld) {
-    // Verify that the rebalance detected the capacity warning and paused.
+    // The When-step pre-checks the target pool's CapacityThresholds
+    // and sets `last_error = "target pool <name> at <health> — backing off"`
+    // when the destination is at Warning / Critical / Full. Verify the
+    // error reflects that specific reason — a regression where the
+    // rebalance backs off for the wrong reason (e.g. tenant quota
+    // exhausted, source unavailable) would still satisfy `is_some()`.
+    let err = w
+        .last_error
+        .as_ref()
+        .expect("rebalance should have paused with a capacity warning");
+    let lower = err.to_lowercase();
     assert!(
-        w.last_error.is_some(),
-        "rebalance should have paused with a capacity warning"
+        lower.contains("backing off") || lower.contains("back off") || lower.contains("capacity"),
+        "rebalance pause reason should reference capacity / back-off; got {err:?}",
+    );
+    assert!(
+        lower.contains("warning") || lower.contains("critical") || lower.contains("full"),
+        "rebalance pause should cite a non-Healthy pool state; got {err:?}",
     );
 }

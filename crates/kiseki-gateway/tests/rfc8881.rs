@@ -1535,6 +1535,7 @@ async fn s18_15_lookup_composition_uuid_returns_file_handle() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: payload,
+            comp_id_override: None,
         })
         .await
         .expect("seed write")
@@ -1581,6 +1582,7 @@ async fn s18_26_readdir_lists_compositions_in_namespace() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: b"readdir-fixture".to_vec(),
+            comp_id_override: None,
         })
         .await
         .expect("seed write")
@@ -1928,6 +1930,7 @@ async fn s5_8_getattr_after_lookup_returns_actual_composition_size() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: payload,
+            comp_id_override: None,
         })
         .await
         .expect("seed write")
@@ -2038,6 +2041,7 @@ async fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: b"open-fixture".to_vec(),
+            comp_id_override: None,
         })
         .await
         .expect("seed write")
@@ -2149,6 +2153,7 @@ async fn open_stateid_seqid_is_one_for_fresh_state() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: b"open-fixture".to_vec(),
+            comp_id_override: None,
         })
         .await
         .expect("seed write")
@@ -2218,6 +2223,7 @@ async fn s18_16_1_open_args_claim_discriminator_is_required() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: b"open-claim-fixture".to_vec(),
+            comp_id_override: None,
         })
         .await
         .expect("seed write")
@@ -2286,6 +2292,7 @@ async fn s18_22_read_after_lookup_returns_seeded_bytes() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: payload.clone(),
+            comp_id_override: None,
         })
         .await
         .expect("seed write")

@@ -74,6 +74,7 @@ async fn build_gateway_with_cache_disabled() -> (Arc<InMemoryGateway>, Compositi
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .expect("warm-put");

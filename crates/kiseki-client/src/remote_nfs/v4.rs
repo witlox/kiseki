@@ -244,6 +244,55 @@ fn xdr_err(e: &std::io::Error) -> GatewayError {
     GatewayError::ProtocolError(format!("XDR: {e}"))
 }
 
+/// Consume the `open_delegation4` union body that follows the
+/// discriminator in an OPEN reply. RFC 8881 §10.4.2 + §18.16.4:
+///
+/// - 0 = `OPEN_DELEGATE_NONE`      → no body
+/// - 1 = `OPEN_DELEGATE_READ`      → stateid(16) + recall(4) + ace(varies)
+/// - 2 = `OPEN_DELEGATE_WRITE`     → stateid(16) + recall(4) + limit + ace
+/// - 3 = `OPEN_DELEGATE_NONE_EXT`  → `why_no_delegation4`(4) + optional body
+///
+/// The Kiseki server only ever emits NONE (0) or `NONE_EXT` (3) +
+/// `WND4_NOT_WANTED` (0, void body). Pre-fix this helper, callers read
+/// only the discriminator and assumed NONE-with-no-body; when the
+/// server sends `NONE_EXT` the parser slid 4 bytes off, mistaking the
+/// next op's u32 op-code for its status (e.g. WRITE's op 38 was
+/// reported as "WRITE\[0\]: 38").
+fn read_open_delegation_body(
+    r: &mut XdrReader<'_>,
+    delegation_type: u32,
+) -> Result<(), GatewayError> {
+    match delegation_type {
+        0 => Ok(()), // NONE — no body
+        3 => {
+            // NONE_EXT — why_no_delegation4 discriminator (always present).
+            // WND4_NOT_WANTED (0) / WND4_RESOURCE (2) carry no body;
+            // WND4_CONTENTION (1) carries one bool (4 bytes). Anything
+            // else means the server emitted something we don't model —
+            // bail with a protocol error so we don't silently misalign.
+            let why = r.read_u32().map_err(|e| xdr_err(&e))?;
+            match why {
+                0 | 2 => Ok(()),
+                1 => {
+                    // contention: bool (XDR bools are 4 bytes)
+                    let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
+                    Ok(())
+                }
+                _ => Err(GatewayError::ProtocolError(format!(
+                    "unrecognised why_no_delegation4: {why}",
+                ))),
+            }
+        }
+        1 | 2 => Err(GatewayError::ProtocolError(format!(
+            "OPEN_DELEGATE_READ/WRITE body not parsed (type={delegation_type}) — \
+             Kiseki server does not currently issue delegations",
+        ))),
+        other => Err(GatewayError::ProtocolError(format!(
+            "unknown open_delegation_type4: {other}",
+        ))),
+    }
+}
+
 /// Parse a COMPOUND reply containing a single op result.
 fn parse_compound_single_op<T>(
     reply: &[u8],
@@ -352,7 +401,7 @@ impl Nfs4Client {
         if st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("OPEN: {st}")));
         }
-        // stateid + change_info + rflags + attrset + delegation_type
+        // stateid + change_info + rflags + attrset + delegation
         r.read_u32().map_err(|e| xdr_err(&e))?;
         r.read_opaque_fixed(12).map_err(|e| xdr_err(&e))?;
         r.read_u32().map_err(|e| xdr_err(&e))?;
@@ -363,8 +412,9 @@ impl Nfs4Client {
         for _ in 0..bm {
             r.read_u32().map_err(|e| xdr_err(&e))?;
         }
-        r.read_u32().map_err(|e| xdr_err(&e))?; // delegation_type=NONE
-                                                // WRITEs
+        let deleg_type = r.read_u32().map_err(|e| xdr_err(&e))?;
+        read_open_delegation_body(&mut r, deleg_type)?;
+        // WRITEs
         for (i, _) in parts.iter().enumerate() {
             r.read_u32().map_err(|e| xdr_err(&e))?; // op
             let st = r.read_u32().map_err(|e| xdr_err(&e))?;
@@ -482,8 +532,9 @@ impl GatewayOps for Nfs4Client {
         for _ in 0..bm_count {
             let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
         }
-        // open_delegation4: type (0=NONE, no body)
-        let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
+        // open_delegation4: discriminator + body (varies per type)
+        let deleg_type = r.read_u32().map_err(|e| xdr_err(&e))?;
+        read_open_delegation_body(&mut r, deleg_type)?;
 
         // WRITE result: op(4) + status(4) + count(4) + committed(4) + verifier(8)
         let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // op
@@ -688,6 +739,7 @@ impl GatewayOps for Nfs4Client {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await?;
         Ok(resp.composition_id)
@@ -719,5 +771,117 @@ impl GatewayOps for Nfs4Client {
         _namespace_id: NamespaceId,
     ) -> Result<(), GatewayError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Server-free contract tests for the `NFSv4.1`/`NFSv4.2` client adapter.
+    //!
+    //! Mirrors `remote_nfs::v3::tests` — covers the in-memory
+    //! multipart buffer state machine plus the no-op `GatewayOps`
+    //! stubs (`list`, `set_object_content_type`, `ensure_namespace`).
+    //! Wire-level paths (`read`, `write`, `delete`, the
+    //! `complete_multipart` write tail) require a live server and
+    //! are exercised by the e2e suite + acceptance crate.
+    use super::*;
+    use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+
+    fn client_v41() -> Nfs4Client {
+        Nfs4Client::v41(SocketAddr::from_str("127.0.0.1:0").expect("addr"))
+    }
+
+    fn client_v42() -> Nfs4Client {
+        Nfs4Client::v42(SocketAddr::from_str("127.0.0.1:0").expect("addr"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_returns_empty_until_readdir_is_wired() {
+        // Same contract as the v3 path: list is deliberately empty;
+        // the S3 path is canonical for object enumeration.
+        let c = client_v41();
+        let got = c
+            .list(OrgId(uuid::Uuid::nil()), NamespaceId(uuid::Uuid::nil()))
+            .await
+            .expect("list must succeed as a no-op");
+        assert!(got.is_empty(), "NFSv4 list is intentionally empty");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_object_content_type_is_a_noop_returning_ok() {
+        let c = client_v42();
+        c.set_object_content_type(
+            CompositionId(uuid::Uuid::from_u128(7)),
+            Some("text/plain".into()),
+        )
+        .await
+        .expect("set_object_content_type must succeed");
+        c.set_object_content_type(CompositionId(uuid::Uuid::from_u128(8)), None)
+            .await
+            .expect("set_object_content_type(None) must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_namespace_is_a_noop_returning_ok() {
+        let c = client_v41();
+        c.ensure_namespace(OrgId(uuid::Uuid::nil()), NamespaceId(uuid::Uuid::nil()))
+            .await
+            .expect("ensure_namespace must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multipart_buffer_lifecycle_start_upload_abort() {
+        // After abort_multipart the upload_id must be forgotten so
+        // subsequent upload_part hard-errors. Otherwise abort would
+        // leak buffers indefinitely.
+        let c = client_v41();
+        let uid = c
+            .start_multipart(NamespaceId(uuid::Uuid::nil()))
+            .await
+            .expect("start_multipart");
+        assert!(!uid.is_empty());
+
+        let etag = c.upload_part(&uid, 3, b"abc").await.expect("upload_part");
+        // v4 impl uses the bare part_number as the ETag — distinct
+        // from v3's "nfs3-part-N" prefix.
+        assert_eq!(etag, "3");
+
+        c.abort_multipart(&uid).await.expect("abort_multipart");
+
+        let err = c
+            .upload_part(&uid, 4, b"def")
+            .await
+            .expect_err("upload_part after abort must fail");
+        match err {
+            GatewayError::ProtocolError(m) => {
+                assert!(
+                    m.contains("unknown upload_id"),
+                    "abort+upload error must say 'unknown upload_id': {m}"
+                );
+            }
+            other => panic!("expected ProtocolError; got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_part_on_unknown_upload_id_fails() {
+        let c = client_v42();
+        let err = c
+            .upload_part("does-not-exist", 1, b"x")
+            .await
+            .expect_err("unknown upload_id must error");
+        assert!(matches!(err, GatewayError::ProtocolError(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_multipart_on_unknown_upload_id_fails() {
+        let c = client_v41();
+        let err = c
+            .complete_multipart("does-not-exist", None)
+            .await
+            .expect_err("unknown upload_id must error before reaching the wire");
+        assert!(matches!(err, GatewayError::ProtocolError(_)));
     }
 }

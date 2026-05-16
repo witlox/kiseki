@@ -53,6 +53,7 @@ async fn nfs_write_read_roundtrip() {
             tenant_id: test_tenant(),
             namespace_id: test_namespace(),
             data: data.clone(),
+            comp_id_override: None,
         })
         .await
         .unwrap();
@@ -94,6 +95,7 @@ async fn concurrent_nfs_writes_no_deadlock() {
                         tenant_id: test_tenant(),
                         namespace_id: test_namespace(),
                         data,
+                        comp_id_override: None,
                     }))
                     .unwrap();
                 assert!(resp.count > 0, "write returned 0 bytes");
@@ -125,6 +127,7 @@ async fn concurrent_nfs_mixed_read_write() {
                 tenant_id: test_tenant(),
                 namespace_id: test_namespace(),
                 data: vec![i; 2048],
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -145,6 +148,7 @@ async fn concurrent_nfs_mixed_read_write() {
                     tenant_id: test_tenant(),
                     namespace_id: test_namespace(),
                     data,
+                    comp_id_override: None,
                 }))
                 .unwrap();
             }

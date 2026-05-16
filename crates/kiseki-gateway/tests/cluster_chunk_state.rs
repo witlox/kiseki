@@ -209,6 +209,7 @@ async fn fresh_chunk_write_emits_chunk_and_delta_proposal() {
         idempotency_key: None,
 
         forwarded_from_node: None,
+        comp_id_override: None,
     })
     .await
     .expect("write");
@@ -265,6 +266,7 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         idempotency_key: None,
 
         forwarded_from_node: None,
+        comp_id_override: None,
     })
     .await
     .expect("write 1");
@@ -280,6 +282,7 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         idempotency_key: None,
 
         forwarded_from_node: None,
+        comp_id_override: None,
     })
     .await
     .expect("write 2");
@@ -329,6 +332,7 @@ async fn fresh_chunk_write_carries_configured_placement() {
         idempotency_key: None,
 
         forwarded_from_node: None,
+        comp_id_override: None,
     })
     .await
     .expect("write");
@@ -366,6 +370,7 @@ async fn placement_is_capped_at_target_copies_when_cluster_is_larger() {
         idempotency_key: None,
 
         forwarded_from_node: None,
+        comp_id_override: None,
     })
     .await
     .expect("write");
@@ -405,6 +410,7 @@ async fn single_node_gateway_emits_empty_placement() {
         idempotency_key: None,
 
         forwarded_from_node: None,
+        comp_id_override: None,
     })
     .await
     .expect("write");
@@ -441,6 +447,7 @@ async fn composition_delete_emits_decrement_for_each_chunk() {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .expect("write");
@@ -569,6 +576,7 @@ async fn tombstone_decrement_triggers_delete_distributed() {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .expect("write");
@@ -613,6 +621,7 @@ async fn non_tombstone_decrement_does_not_fan_out() {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .expect("write");

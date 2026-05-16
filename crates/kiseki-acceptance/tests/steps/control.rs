@@ -1662,9 +1662,23 @@ async fn when_org_exceeds_cache(w: &mut KisekiWorld, _org: String, _max: String)
 
 #[then(regex = r#"^the request is rejected with "exceeds_parent_ceiling"$"#)]
 async fn then_exceeds_ceiling_rejected(w: &mut KisekiWorld) {
+    // The Gherkin pins the exact rejection reason. Without checking
+    // the error string, a regression where the wrong code path fires
+    // (e.g. permission-denied or generic invalid-argument) would
+    // satisfy `is_some()` while violating the contract this scenario
+    // is supposed to enforce.
+    let err = w
+        .control
+        .last_error
+        .as_ref()
+        .expect("expected an error indicating ceiling violation");
+    let lower = err.to_lowercase();
     assert!(
-        w.control.last_error.is_some(),
-        "expected exceeds_parent_ceiling rejection"
+        lower.contains("exceeds_parent_ceiling")
+            || lower.contains("exceeds parent ceiling")
+            || lower.contains("parent_ceiling")
+            || lower.contains("budget_exceeded"),
+        "expected error to indicate parent-ceiling violation; got {err:?}",
     );
 }
 

@@ -118,30 +118,47 @@ pub fn encode_composition_create_payload(
     namespace_id: NamespaceId,
     bytes_written: u64,
 ) -> Vec<u8> {
-    encode_composition_create_payload_named(comp_id, namespace_id, bytes_written, None)
+    encode_composition_create_payload_named(comp_id, namespace_id, bytes_written, None, &[])
 }
 
 /// Encode a composition-create delta payload with an optional name
-/// (S3 PUT key).
+/// (S3 PUT key) and an optional per-chunk plaintext-length vector.
 ///
 /// Wire format:
-/// - Legacy v1 (no name): 40 bytes — `[comp_id 16][ns_id 16][size 8]`.
-/// - v2 (with name): 44 + `name_len` bytes — `[comp_id 16][ns_id 16][size 8]
-///   [name_len 4][name name_len bytes]`.
+/// - Legacy v1 (no name, no lens): 40 bytes — `[comp_id 16][ns_id 16][size 8]`.
+/// - v2 (name only): 44 + `name_len` bytes — v1 + `[name_len 4][name]`.
+/// - v3 (name + per-chunk lens): v2 + `[lens_count 4][lens_count × u32 LE]`.
+///   Requires `name.is_some()` so the form is unambiguously
+///   length-distinguishable from v1/v2; pass `Some("")` if the
+///   composition is anonymous and lens are still needed.
 ///
 /// Length-based dispatch (no magic byte) keeps backwards compatibility
 /// with existing on-the-wire deltas the hydrator may still see during
-/// rolling upgrades.
+/// rolling upgrades. `chunk_plaintext_lens` is currently set only by
+/// `complete_multipart`: regular PUTs follow the
+/// `MAX_PLAINTEXT_PER_CHUNK` grid and the read path uses index math.
 #[must_use]
 pub fn encode_composition_create_payload_named(
     comp_id: CompositionId,
     namespace_id: NamespaceId,
     bytes_written: u64,
     name: Option<&str>,
+    chunk_plaintext_lens: &[u32],
 ) -> Vec<u8> {
-    let name_bytes = name.unwrap_or("").as_bytes();
-    let cap = if name.is_some() {
-        COMPOSITION_CREATE_PAYLOAD_LEN + 4 + name_bytes.len()
+    // v3 requires a name to be encoded (so the v2 framing is present).
+    // Callers that need lens with no name should pass Some("").
+    let has_lens = !chunk_plaintext_lens.is_empty();
+    let effective_name = if has_lens { name.or(Some("")) } else { name };
+    let name_bytes = effective_name.unwrap_or("").as_bytes();
+    let cap = if effective_name.is_some() {
+        COMPOSITION_CREATE_PAYLOAD_LEN
+            + 4
+            + name_bytes.len()
+            + if has_lens {
+                4 + 4 * chunk_plaintext_lens.len()
+            } else {
+                0
+            }
     } else {
         COMPOSITION_CREATE_PAYLOAD_LEN
     };
@@ -149,32 +166,49 @@ pub fn encode_composition_create_payload_named(
     out.extend_from_slice(comp_id.0.as_bytes());
     out.extend_from_slice(namespace_id.0.as_bytes());
     out.extend_from_slice(&bytes_written.to_le_bytes());
-    if name.is_some() {
+    if effective_name.is_some() {
         let name_len = u32::try_from(name_bytes.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&name_len.to_le_bytes());
         out.extend_from_slice(name_bytes);
+    }
+    if has_lens {
+        let lens_count = u32::try_from(chunk_plaintext_lens.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&lens_count.to_le_bytes());
+        for &len in chunk_plaintext_lens {
+            out.extend_from_slice(&len.to_le_bytes());
+        }
     }
     out
 }
 
 /// Decode a composition-create delta payload (legacy 3-tuple form,
-/// drops the optional name). Kept for callers that don't yet care
-/// about the name field; new callers should use
+/// drops the optional name + lens). Kept for callers that don't yet
+/// care about the additional fields; new callers should use
 /// [`decode_composition_create_payload_named`].
 #[must_use]
 pub fn decode_composition_create_payload(
     payload: &[u8],
 ) -> Option<(CompositionId, NamespaceId, u64)> {
-    decode_composition_create_payload_named(payload).map(|(c, n, s, _)| (c, n, s))
+    decode_composition_create_payload_named(payload).map(|(c, n, s, _, _)| (c, n, s))
 }
 
+/// Decoded composition-create delta payload — see
+/// [`decode_composition_create_payload_named`].
+pub type DecodedCompositionCreate = (
+    CompositionId,
+    NamespaceId,
+    u64,
+    Option<String>,
+    Option<Vec<u32>>,
+);
+
 /// Decode a composition-create delta payload, including the optional
-/// name. Recognizes both the legacy 40-byte form (returns `name = None`)
-/// and the v2 form (returns `name = Some(...)`).
+/// name and the optional per-chunk plaintext lens. Recognizes:
+/// - v1 (40 bytes): name = None, lens = None.
+/// - v2 (44 + `name_len`): name = Some, lens = None.
+/// - v3 (v2 + `[4 lens_count][n × u32]`): name = Some, lens = Some(Vec).
 #[must_use]
-pub fn decode_composition_create_payload_named(
-    payload: &[u8],
-) -> Option<(CompositionId, NamespaceId, u64, Option<String>)> {
+pub fn decode_composition_create_payload_named(payload: &[u8]) -> Option<DecodedCompositionCreate> {
     if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN {
         return None;
     }
@@ -183,23 +217,64 @@ pub fn decode_composition_create_payload_named(
     let mut size_bytes = [0u8; 8];
     size_bytes.copy_from_slice(&payload[32..40]);
     let size = u64::from_le_bytes(size_bytes);
-    let name = if payload.len() == COMPOSITION_CREATE_PAYLOAD_LEN {
-        None
-    } else {
-        // v2: must have at least 4 bytes for name_len.
-        if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN + 4 {
-            return None;
-        }
-        let mut len_bytes = [0u8; 4];
-        len_bytes.copy_from_slice(&payload[40..44]);
-        let name_len = u32::from_le_bytes(len_bytes) as usize;
-        if payload.len() != COMPOSITION_CREATE_PAYLOAD_LEN + 4 + name_len {
-            return None;
-        }
-        let name_bytes = &payload[44..44 + name_len];
-        Some(std::str::from_utf8(name_bytes).ok()?.to_owned())
-    };
-    Some((CompositionId(comp_uuid), NamespaceId(ns_uuid), size, name))
+    if payload.len() == COMPOSITION_CREATE_PAYLOAD_LEN {
+        return Some((
+            CompositionId(comp_uuid),
+            NamespaceId(ns_uuid),
+            size,
+            None,
+            None,
+        ));
+    }
+    // v2 / v3: must have at least 4 bytes for name_len.
+    if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN + 4 {
+        return None;
+    }
+    let mut len_bytes = [0u8; 4];
+    len_bytes.copy_from_slice(&payload[40..44]);
+    let name_len = u32::from_le_bytes(len_bytes) as usize;
+    let name_end = 44 + name_len;
+    if payload.len() < name_end {
+        return None;
+    }
+    let name_bytes = &payload[44..name_end];
+    let name = Some(std::str::from_utf8(name_bytes).ok()?.to_owned());
+    // v2 (no lens suffix): exact length match against v2.
+    if payload.len() == name_end {
+        return Some((
+            CompositionId(comp_uuid),
+            NamespaceId(ns_uuid),
+            size,
+            name,
+            None,
+        ));
+    }
+    // v3: `[4 lens_count][n × u32]` after the v2 form.
+    if payload.len() < name_end + 4 {
+        return None;
+    }
+    let mut count_bytes = [0u8; 4];
+    count_bytes.copy_from_slice(&payload[name_end..name_end + 4]);
+    let lens_count = u32::from_le_bytes(count_bytes) as usize;
+    let lens_start = name_end + 4;
+    let lens_end = lens_start + 4 * lens_count;
+    if payload.len() != lens_end {
+        return None;
+    }
+    let mut lens = Vec::with_capacity(lens_count);
+    for i in 0..lens_count {
+        let off = lens_start + 4 * i;
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&payload[off..off + 4]);
+        lens.push(u32::from_le_bytes(b));
+    }
+    Some((
+        CompositionId(comp_uuid),
+        NamespaceId(ns_uuid),
+        size,
+        name,
+        Some(lens),
+    ))
 }
 
 /// Encode a composition-update delta payload.
@@ -277,6 +352,21 @@ pub struct Composition {
     /// instances (per ADV-PA-4: a per-`S3State` `HashMap` loses the
     /// header on multi-gateway deployments).
     pub content_type: Option<String>,
+    /// Per-chunk plaintext length, when the chunks do **not** fit the
+    /// regular `MAX_PLAINTEXT_PER_CHUNK` grid that the write path
+    /// produces. Currently set only by `complete_multipart`: S3
+    /// multipart parts are 1:1 with chunks but have arbitrary sizes
+    /// (the regular PUT path always splits at `MAX_PLAINTEXT_PER_CHUNK`
+    /// boundaries, so for those the read path can derive each chunk's
+    /// position by index × `MAX_PLAINTEXT_PER_CHUNK`).
+    ///
+    /// `Vec::new()` is the "regular grid" sentinel — keep using the
+    /// legacy index math. A non-empty vec must have the same length
+    /// as `chunks` and gives the read path each chunk's plaintext
+    /// length directly, so the offset of chunk `i` in the file is
+    /// `chunk_plaintext_lens[0..i].sum()`.
+    #[serde(default)]
+    pub chunk_plaintext_lens: Vec<u32>,
 }
 
 /// Result of a delete operation.
@@ -682,6 +772,61 @@ impl CompositionStore {
         Ok(())
     }
 
+    /// Create a composition where the chunks do not fit the regular
+    /// `MAX_PLAINTEXT_PER_CHUNK` write-grid (currently used only by
+    /// S3 multipart uploads, where parts are 1:1 with chunks but have
+    /// arbitrary plaintext sizes). The supplied `chunk_plaintext_lens`
+    /// must have the same length as `chunks`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CompositionError::NamespaceNotFound` /
+    /// `CompositionError::ReadOnlyNamespace` for the usual reasons,
+    /// plus `CompositionError::InvalidArgument` when the lens vec
+    /// length doesn't match the chunks vec length.
+    pub fn create_with_lens(
+        &self,
+        namespace_id: NamespaceId,
+        chunks: Vec<ChunkId>,
+        chunk_plaintext_lens: Vec<u32>,
+        size: u64,
+    ) -> Result<CompositionId, CompositionError> {
+        if chunk_plaintext_lens.len() != chunks.len() {
+            return Err(CompositionError::InvalidArgument(format!(
+                "chunk_plaintext_lens length {} != chunks length {}",
+                chunk_plaintext_lens.len(),
+                chunks.len(),
+            )));
+        }
+        let ns_snap = {
+            let nss = self.namespaces.read();
+            let ns = nss
+                .get(&namespace_id)
+                .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
+            if ns.read_only {
+                return Err(CompositionError::ReadOnlyNamespace(namespace_id));
+            }
+            (ns.tenant_id, ns.shard_id)
+        };
+
+        let id = CompositionId(uuid::Uuid::new_v4());
+        let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
+        let comp = Composition {
+            id,
+            tenant_id: ns_snap.0,
+            namespace_id,
+            shard_id: ns_snap.1,
+            chunks,
+            version: 1,
+            size,
+            has_inline_data,
+            content_type: None,
+            chunk_plaintext_lens,
+        };
+        self.storage.put(comp)?;
+        Ok(id)
+    }
+
     /// Install a composition with a leader-assigned id (Phase 16f
     /// follower hydration).
     ///
@@ -727,6 +872,7 @@ impl CompositionStore {
             size,
             has_inline_data,
             content_type: None,
+            chunk_plaintext_lens: Vec::new(),
         };
         self.storage.put(comp)?;
         Ok(())
@@ -840,6 +986,7 @@ impl CompositionStore {
             size,
             has_inline_data,
             content_type: None,
+            chunk_plaintext_lens: Vec::new(),
         };
 
         // Per-name shard lock holds across the lookup + (optional)
@@ -1003,6 +1150,7 @@ impl CompositionOps for CompositionStore {
             size,
             has_inline_data,
             content_type: None,
+            chunk_plaintext_lens: Vec::new(),
         };
         self.storage.put(comp)?;
         Ok(id)
@@ -1165,10 +1313,10 @@ impl CompositionOps for CompositionStore {
     }
 
     fn finalize_multipart(&self, upload_id: &str) -> Result<CompositionId, CompositionError> {
-        // Drop the multipart-state lock before calling self.create
+        // Drop the multipart-state lock before calling self.create_with_lens
         // (which takes the storage lock) to keep the critical sections
         // disjoint.
-        let (chunks, size, ns_id) = {
+        let (chunks, chunk_plaintext_lens, size, ns_id) = {
             let mut multiparts = self.multiparts.lock();
             let (upload, ns_id) = multiparts
                 .get_mut(upload_id)
@@ -1181,12 +1329,21 @@ impl CompositionOps for CompositionStore {
             }
 
             let chunks: Vec<ChunkId> = upload.parts.iter().map(|p| p.chunk_id).collect();
+            // Multipart parts have arbitrary sizes — capture each
+            // part's plaintext length so the read path can compute
+            // per-chunk file offsets without assuming the regular
+            // MAX_PLAINTEXT_PER_CHUNK grid.
+            let lens: Vec<u32> = upload
+                .parts
+                .iter()
+                .map(|p| u32::try_from(p.size).unwrap_or(u32::MAX))
+                .collect();
             let size = upload.total_size();
-            (chunks, size, *ns_id)
+            (chunks, lens, size, *ns_id)
         };
 
         // Create the composition now that it's visible (I-L5).
-        self.create(ns_id, chunks, size)
+        self.create_with_lens(ns_id, chunks, chunk_plaintext_lens, size)
     }
 }
 

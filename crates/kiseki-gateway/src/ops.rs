@@ -82,6 +82,20 @@ pub struct WriteRequest {
     /// a "client-direct" write from one routed via another gateway.
     /// `None` for client-direct writes (no proxy hop).
     pub forwarded_from_node: Option<u64>,
+    /// Optional composition-id override (Group V #1 cross-protocol
+    /// bridge). When `Some(id)`, the gateway uses `create_at(id, …)`
+    /// instead of minting a fresh UUID — i.e. the resulting
+    /// composition's id is exactly the supplied value.
+    ///
+    /// Used by the NFS data path's flush-on-COMMIT to keep the
+    /// `composition_id` the NFS client returned at CREATE time
+    /// (extracted from the synthetic `[comp_id 16][zeros 16]` file
+    /// handle) consistent across the protocol boundary, so a later
+    /// S3 GET on `bucket/{that_uuid}` finds the actual composition
+    /// via the `comps.get(uuid)` fallback in `s3_server::get_object`.
+    /// `None` for callers (S3 PUT, native, in-memory) that don't
+    /// need a stable cross-protocol id.
+    pub comp_id_override: Option<CompositionId>,
 }
 
 /// HTTP-derived conditional check applied to a `WriteRequest` against
@@ -444,6 +458,7 @@ mod tests {
             workflow_ref: None,
             idempotency_key: Some(vec![0xAB; 16]),
             forwarded_from_node: None,
+            comp_id_override: None,
         };
         let cloned = req.clone();
         assert_eq!(
@@ -470,6 +485,7 @@ mod tests {
             workflow_ref: None,
             idempotency_key: Some(vec![1, 2, 3]),
             forwarded_from_node: Some(7),
+            comp_id_override: None,
         };
         assert_eq!(req.clone().forwarded_from_node, Some(7));
     }

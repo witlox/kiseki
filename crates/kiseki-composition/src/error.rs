@@ -46,6 +46,11 @@ pub enum CompositionError {
     /// — the gateway maps this to HTTP 412 Precondition Failed.
     #[error("composition precondition failed: {0}")]
     PreconditionFailed(String),
+
+    /// Caller passed an inconsistent argument (e.g. `chunk_plaintext_lens`
+    /// length doesn't match `chunks` length on `create_with_lens`).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 impl From<CompositionError> for KisekiError {

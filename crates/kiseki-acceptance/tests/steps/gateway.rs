@@ -271,6 +271,7 @@ async fn given_s3_getobject(w: &mut KisekiWorld, _key: String) {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .expect("S3 write");
@@ -375,6 +376,7 @@ async fn then_gw_write_pipeline(w: &mut KisekiWorld) {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .expect("S3 write");
@@ -1289,8 +1291,16 @@ async fn when_read_unavailable_device(w: &mut KisekiWorld) {
     // EC-aware read pulls the missing fragment from parity.
     let cid = w.last_chunk_id.expect("repairable chunk staged");
     match w.legacy.chunk_store.read_chunk_ec(&cid) {
-        Ok(_) => w.last_error = None,
-        Err(e) => w.last_error = Some(e.to_string()),
+        Ok(bytes) => {
+            w.last_error = None;
+            // Stash the reconstructed bytes so the Then-step can
+            // verify EC actually rebuilt the original ciphertext.
+            w.last_read_data = Some(bytes);
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+            w.last_read_data = None;
+        }
     }
 }
 
@@ -1298,11 +1308,33 @@ async fn when_read_unavailable_device(w: &mut KisekiWorld) {
 async fn then_ec_repair_attempted(w: &mut KisekiWorld) {
     // The read in the When step exercised the EC decode path with one
     // device offline (4+2 pool, only d3 down) — repair must have run and
-    // succeeded.
+    // succeeded. Verify both the call returned Ok AND the reconstructed
+    // bytes equal the originally-written ciphertext (per the
+    // `ec_envelope_for` Given), so a regression where the EC math
+    // silently returns a wrong reassembly (rather than erroring) is
+    // caught here.
     assert!(
         w.last_error.is_none(),
         "EC repair must succeed when parity covers the missing device, got {:?}",
         w.last_error,
+    );
+    let reconstructed = w
+        .last_read_data
+        .as_ref()
+        .expect("when_read_unavailable_device must stash the reassembled bytes");
+    let expected = vec![0xabu8; 64 * 1024]; // matches `ec_envelope_for`
+    assert_eq!(
+        reconstructed.len(),
+        expected.len(),
+        "EC reconstruction length wrong: got {} bytes, expected {}",
+        reconstructed.len(),
+        expected.len(),
+    );
+    assert_eq!(
+        reconstructed, &expected,
+        "EC reconstruction returned bytes that diverge from the \
+         original ciphertext — silent corruption of the reconstructed \
+         fragment.",
     );
 }
 

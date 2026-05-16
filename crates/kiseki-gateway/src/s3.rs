@@ -136,6 +136,7 @@ impl<G: GatewayOps> S3Gateway<G> {
                 // ETag semantics, not the per-tenant dedup table.
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await?;
 

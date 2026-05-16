@@ -52,6 +52,7 @@ async fn write_then_read_roundtrip() {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .unwrap();
@@ -90,6 +91,7 @@ async fn read_with_offset_and_length() {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .unwrap();
@@ -125,6 +127,7 @@ async fn read_past_eof_returns_empty() {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .unwrap();
@@ -159,6 +162,7 @@ async fn tenant_mismatch_rejected() {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .unwrap();
@@ -222,6 +226,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         idempotency_key: None,
 
         forwarded_from_node: None,
+        comp_id_override: None,
     })
     .await
     .unwrap();
@@ -237,6 +242,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         idempotency_key: None,
 
         forwarded_from_node: None,
+        comp_id_override: None,
     })
     .await
     .unwrap();
@@ -313,6 +319,7 @@ mod nfs_tests {
                 tenant_id: test_tenant(),
                 namespace_id: test_namespace(),
                 data: b"nfs file content".to_vec(),
+                comp_id_override: None,
             })
             .await
             .unwrap();

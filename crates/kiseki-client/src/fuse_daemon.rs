@@ -673,7 +673,21 @@ pub fn mount<G: GatewayOps + Send + Sync + 'static>(
 ) -> Result<(), std::io::Error> {
     let daemon: Arc<dyn kiseki_fuse::Filesystem> = Arc::new(FuseDaemon::new(fs));
     let mut mount_options = vec!["-o".to_owned(), "fsname=kiseki".to_owned()];
-    if !read_write {
+    if read_write {
+        tracing::info!(
+            mountpoint = %mountpoint.display(),
+            "FUSE mount posture: read-write (default). Use --read-only for RO datasets.",
+        );
+    } else {
+        // Loud log on the RO posture — F-2 (2026-05-15): operators
+        // missed this on GCP perf runs because the prior default was
+        // silently RO and the first POSIX write returned EROFS with
+        // no daemon-side context.
+        tracing::warn!(
+            mountpoint = %mountpoint.display(),
+            "FUSE mount posture: READ-ONLY (--read-only). All writes \
+             through this mount will fail with EROFS.",
+        );
         mount_options.push("-o".to_owned());
         mount_options.push("ro".to_owned());
     }

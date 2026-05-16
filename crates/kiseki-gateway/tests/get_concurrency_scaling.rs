@@ -77,6 +77,7 @@ async fn build_warm_gateway() -> (Arc<InMemoryGateway>, CompositionId) {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .expect("warm-put");

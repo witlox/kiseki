@@ -42,6 +42,11 @@ pub struct NfsWriteRequest {
     pub namespace_id: NamespaceId,
     /// Data to write.
     pub data: Vec<u8>,
+    /// Optional comp-id override. The NFS flush-on-COMMIT path supplies
+    /// the placeholder UUID it minted at CREATE time so the resulting
+    /// composition is stored under that id end-to-end — cross-protocol
+    /// readers (S3 GET on `bucket/{uuid}`) can then find it.
+    pub comp_id_override: Option<CompositionId>,
 }
 
 /// NFS WRITE response.
@@ -102,6 +107,7 @@ impl<G: GatewayOps> NfsGateway<G> {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: req.comp_id_override,
             })
             .await?;
 

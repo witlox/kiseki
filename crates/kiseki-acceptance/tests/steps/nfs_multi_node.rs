@@ -62,10 +62,33 @@ async fn when_open_create_and_write(w: &mut KisekiWorld, payload: String, node_i
 
 #[then("the NFSv4 COMPOUND status is NFS4_OK")]
 async fn then_compound_ok(w: &mut KisekiWorld) {
+    // The When-step uses `Nfs4Client::write_at_offsets` which only
+    // returns `Ok` after the entire COMPOUND (PUTROOTFH + OPEN +
+    // WRITE×N + COMMIT + GETFH) succeeded with NFS4_OK on every op.
+    // Any op-level NFS4ERR_* surfaces as `Err(ProtocolError("OPEN: N"))`
+    // etc. The GCP 2026-05-02 failure-mode (`op_open` swallowing an
+    // inner gateway error and returning NFS4ERR_IO=5) AND the
+    // 2026-05-15 Group I OPEN_DELEGATE_NONE_EXT misalignment (which
+    // mis-read WRITE op-code 38 as the WRITE status) both surface
+    // here as a non-empty `last_error`.
     assert!(
         w.last_error.is_none(),
         "NFSv4 COMPOUND failed: {:?}",
-        w.last_error
+        w.last_error,
+    );
+    // Also pin: a successful end-to-end COMPOUND MUST produce a
+    // composition_id (returned by the GETFH op encoded in the fh's
+    // first 16 bytes). A regression where the GETFH op silently
+    // returns NFS4_OK with an all-zero or stale fh would slip past
+    // the error-only check above.
+    let comp_id = w
+        .last_composition_id
+        .expect("end-to-end NFSv4 COMPOUND must produce a composition_id (returned by GETFH)");
+    assert_ne!(
+        comp_id.0,
+        uuid::Uuid::nil(),
+        "GETFH returned the nil UUID — the COMPOUND was reported OK \
+         but the fh's first 16 bytes don't encode a real composition.",
     );
 }
 

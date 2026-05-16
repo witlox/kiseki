@@ -860,6 +860,7 @@ impl InMemoryGateway {
                 comp.namespace_id,
                 comp.chunks.clone(),
                 comp.size,
+                comp.chunk_plaintext_lens.clone(),
             );
             // Bind the URL key locally so the leader resolves
             // GET-by-key immediately; followers get the same binding
@@ -935,6 +936,7 @@ impl InMemoryGateway {
                 emit_params.2,
                 emit_params.4,
                 name,
+                &emit_params.5,
             );
             tracing::debug!(
                 comp_id = %comp_id.0,
@@ -1350,30 +1352,63 @@ impl GatewayOps for InMemoryGateway {
             });
         }
 
-        // Chunk window. The PUT path splits payloads at
-        // `MAX_PLAINTEXT_PER_CHUNK` boundaries (see the chunks(N)
-        // call in `write`), so chunk i covers
-        // `[i * MAX_PLAINTEXT_PER_CHUNK,
-        //   i * MAX_PLAINTEXT_PER_CHUNK + chunk_plaintext_len)`
-        // with `chunk_plaintext_len == MAX_PLAINTEXT_PER_CHUNK` for
-        // every chunk except (possibly) the last.
+        // Chunk window. Two layouts coexist:
+        //
+        // (a) Regular PUT — the write path splits payloads at
+        //     `MAX_PLAINTEXT_PER_CHUNK` boundaries, so chunk `i`
+        //     covers `[i * MAX_PLAINTEXT_PER_CHUNK,
+        //     i * MAX_PLAINTEXT_PER_CHUNK + plaintext.len())` with
+        //     `plaintext.len() == MAX_PLAINTEXT_PER_CHUNK` for every
+        //     chunk except (possibly) the last. We can skip
+        //     non-overlapping chunks by simple division.
+        //
+        // (b) Multipart-uploaded composition — parts are 1:1 with
+        //     chunks but have arbitrary plaintext sizes
+        //     (`comp.chunk_plaintext_lens` carries them). The
+        //     division shortcut would map every multipart chunk to
+        //     "chunk 0" for tiny objects and silently drop parts 2+;
+        //     we walk every chunk and use the recorded lens to compute
+        //     each chunk's offset.
         let n_chunks = comp.chunks.len();
-        let first_chunk = start / MAX_PLAINTEXT_PER_CHUNK;
-        let last_chunk = std::cmp::min(
-            (end - 1) / MAX_PLAINTEXT_PER_CHUNK,
-            n_chunks.saturating_sub(1),
-        );
+        // chunks_to_read: ordered (i, chunk_id, chunk_start_in_file)
+        // for every chunk that overlaps `[start, end)`. Built without
+        // any I/O so the existing cache/fetch loop below stays the same.
+        let chunks_to_read: Vec<(usize, kiseki_common::ids::ChunkId, usize)> =
+            if comp.chunk_plaintext_lens.is_empty() {
+                // Regular grid.
+                let first_chunk = start / MAX_PLAINTEXT_PER_CHUNK;
+                let last_chunk = std::cmp::min(
+                    (end - 1) / MAX_PLAINTEXT_PER_CHUNK,
+                    n_chunks.saturating_sub(1),
+                );
+                comp.chunks
+                    .iter()
+                    .enumerate()
+                    .skip(first_chunk)
+                    .take(last_chunk.saturating_sub(first_chunk).saturating_add(1))
+                    .map(|(i, c)| (i, *c, i.saturating_mul(MAX_PLAINTEXT_PER_CHUNK)))
+                    .collect()
+            } else {
+                // Explicit per-chunk lens (multipart). Walk every chunk,
+                // accumulate offset, keep only those that overlap.
+                let mut out = Vec::with_capacity(n_chunks);
+                let mut chunk_start_in_file: usize = 0;
+                for (i, chunk_id) in comp.chunks.iter().enumerate() {
+                    let chunk_plaintext_len =
+                        comp.chunk_plaintext_lens.get(i).copied().unwrap_or(0) as usize;
+                    let chunk_end_in_file = chunk_start_in_file.saturating_add(chunk_plaintext_len);
+                    if chunk_end_in_file > start && chunk_start_in_file < end {
+                        out.push((i, *chunk_id, chunk_start_in_file));
+                    }
+                    chunk_start_in_file = chunk_end_in_file;
+                }
+                out
+            };
 
         let mut data = Vec::with_capacity(end - start);
 
-        for (i, chunk_id) in comp
-            .chunks
-            .iter()
-            .enumerate()
-            .skip(first_chunk)
-            .take(last_chunk.saturating_sub(first_chunk).saturating_add(1))
-        {
-            let chunk_start_in_file = i.saturating_mul(MAX_PLAINTEXT_PER_CHUNK);
+        for (_i, chunk_id, chunk_start_in_file) in chunks_to_read {
+            let chunk_id = &chunk_id;
 
             // Cache lookup first — `get` returns `Arc<Zeroizing<Vec<u8>>>`,
             // so the work under the cache mutex is one refcount bump.
@@ -2103,8 +2138,25 @@ impl InMemoryGateway {
             // single fjall.get from the lookup feeds the cascade
             // decision directly so the backend skips its own pre-
             // flight read.
-            let comp_id = match req.name.as_deref() {
-                Some(name) => {
+            let comp_id = match (req.name.as_deref(), req.comp_id_override) {
+                // Cross-protocol comp-id pin (Group V #1). The NFS
+                // flush-on-COMMIT path supplies the placeholder UUID it
+                // returned to the client at CREATE time so the resulting
+                // composition lands under that exact id. `create_at` is
+                // idempotent on the supplied id — a follow-up flush
+                // with the same id is a no-op rather than a duplicate
+                // composition. `name` is incompatible with the
+                // override (S3 PUT doesn't use override; NFS doesn't
+                // use name); ignore name here.
+                (_, Some(target_id)) => comps
+                    .create_at(
+                        target_id,
+                        req.namespace_id,
+                        chunk_ids.clone(),
+                        bytes_written,
+                    )
+                    .map(|()| target_id),
+                (Some(name), None) => {
                     let check_owner = req
                         .conditional
                         .as_ref()
@@ -2118,7 +2170,7 @@ impl InMemoryGateway {
                         bytes_written,
                     )
                 }
-                None => comps.create(req.namespace_id, chunk_ids.clone(), bytes_written),
+                (None, None) => comps.create(req.namespace_id, chunk_ids.clone(), bytes_written),
             }
             .map_err(|e| {
                 tracing::warn!(error = %e, "gateway write: compositions.create failed");
@@ -2214,6 +2266,10 @@ impl InMemoryGateway {
                 emit_params.2,
                 bytes_written,
                 req.name.as_deref(),
+                // Regular PUTs always follow the MAX_PLAINTEXT_PER_CHUNK
+                // grid; readers derive per-chunk offsets via index math
+                // (no per-chunk lens needed in the delta).
+                &[],
             );
             tracing::debug!(
                 comp_id = %comp_id.0,
@@ -2687,6 +2743,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .expect("write must succeed");
@@ -2733,6 +2790,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -2781,6 +2839,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -2828,6 +2887,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -2868,6 +2928,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -2914,6 +2975,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -2949,6 +3011,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -2983,6 +3046,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -3017,6 +3081,7 @@ mod chunking_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .unwrap();
@@ -3034,6 +3099,86 @@ mod chunking_tests {
         assert_eq!(read.data.len(), 50 * 1024);
         assert!(read.eof);
         assert!(read.data.iter().all(|&b| b == 0x33));
+    }
+
+    /// Regression pin for the 2026-05-15 Group IV data-corruption
+    /// finding: S3 multipart parts are stored 1:1 with chunks but
+    /// have arbitrary sizes, so the read path's `i × MAX_PLAINTEXT_PER_CHUNK`
+    /// offset math (correct for the regular write-grid) silently
+    /// truncated the response to chunk 0's plaintext. The fix wires
+    /// `chunk_plaintext_lens` through `complete_multipart` and reads
+    /// it back in the read path. This test concatenates 3 × 11-byte
+    /// parts and asserts the full 33-byte body comes back.
+    #[tokio::test]
+    async fn multipart_complete_then_read_returns_concatenated_parts() {
+        let (gw, tenant, namespace) = build_gateway().await;
+
+        let upload_id = gw
+            .start_multipart_internal(namespace)
+            .await
+            .expect("start_multipart");
+
+        let parts: [&[u8]; 3] = [b"alpha-bravo", b"-charlie--d", b"-elta--echo"];
+        for (i, payload) in parts.iter().enumerate() {
+            let pn = u32::try_from(i + 1).unwrap();
+            gw.upload_part_internal(&upload_id, pn, payload)
+                .await
+                .expect("upload_part");
+        }
+
+        let comp_id = gw
+            .complete_multipart_internal(&upload_id, Some("mp/3-parts.bin"))
+            .await
+            .expect("complete_multipart");
+
+        let comp = gw.compositions.get(comp_id).expect("composition");
+        assert_eq!(comp.chunks.len(), 3, "one chunk per part");
+        assert_eq!(comp.chunk_plaintext_lens, vec![11, 11, 11]);
+        assert_eq!(comp.size, 33);
+
+        // Read full body: must return all 33 bytes in part order.
+        let expected: Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
+        let read = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: comp_id,
+                offset: 0,
+                length: comp.size,
+            })
+            .await
+            .expect("read");
+        assert_eq!(
+            read.data, expected,
+            "multipart GET truncated or reordered — pre-fix would return only part 1 (11 bytes)",
+        );
+
+        // Range across part boundary: bytes 8..15 must include the
+        // tail of part 1 + head of part 2.
+        let range = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: comp_id,
+                offset: 8,
+                length: 7,
+            })
+            .await
+            .expect("range read");
+        assert_eq!(range.data, expected[8..15]);
+
+        // Range entirely inside part 3: bytes 25..33.
+        let tail = gw
+            .read(crate::ops::ReadRequest {
+                tenant_id: tenant,
+                namespace_id: namespace,
+                composition_id: comp_id,
+                offset: 25,
+                length: 8,
+            })
+            .await
+            .expect("tail read");
+        assert_eq!(tail.data, expected[25..33]);
     }
 }
 
@@ -3097,6 +3242,7 @@ mod phase_duration_tests {
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .expect("write must succeed");

@@ -104,6 +104,15 @@ pub struct KisekiWorld {
     pub last_view_id: Option<ViewId>,
     pub last_workflow_ref: Option<WorkflowRef>,
     pub last_extent: Option<Extent>,
+    /// Raw wire-protocol response bytes from the most recent ONC RPC
+    /// / NFS COMPOUND / S3 HTTP call issued by a When-step. Populated
+    /// by `protocol.rs::nfs3_call` and siblings so the corresponding
+    /// Then-steps can parse and assert specific fields (status codes,
+    /// reply shape, payload bytes) instead of just inspecting
+    /// `last_error`. Without this, protocol-conformance Thens collapse
+    /// to "no error during the call" — the audit's bucket (iii)
+    /// shallowness across `protocol.rs`.
+    pub last_response: Option<Vec<u8>>,
     pub writes_rejected: bool,
     pub reads_working: bool,
 
@@ -161,6 +170,7 @@ impl KisekiWorld {
             last_view_id: None,
             last_workflow_ref: None,
             last_extent: None,
+            last_response: None,
             writes_rejected: false,
             reads_working: false,
             shard_names: HashMap::new(),
@@ -579,6 +589,7 @@ impl KisekiWorld {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .map_err(|e| e.to_string())
@@ -704,12 +715,17 @@ fn main() {
     // failures across all 3 attempts; flakes pass on at least one.
     let flaky_filter: cucumber::gherkin::tagexpr::TagOperation =
         "@flaky".parse().expect("@flaky tag expression parses");
+    // `filter_run_and_exit` (vs plain `filter_run`) checks
+    // `execution_has_failed()` after the run and calls
+    // `process::exit(1)` if any scenario panicked. Without it the
+    // surrounding `cargo test` returns 0 even when scenarios fail,
+    // which silently green-lights broken BDD on pre-commit and CI.
     let runner = KisekiWorld::cucumber()
         .max_concurrent_scenarios(4)
         .retries(2)
         .retry_after(std::time::Duration::from_secs(1))
         .retry_filter(flaky_filter)
-        .filter_run("features/", move |feat, _, sc| {
+        .filter_run_and_exit("features/", move |feat, _, sc| {
             if skip_slow && sc.tags.iter().any(|t| t == "slow") {
                 return false;
             }

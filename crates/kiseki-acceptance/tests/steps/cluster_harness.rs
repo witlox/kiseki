@@ -585,7 +585,11 @@ fn spawn_with_env(
         cmd.stderr(Stdio::null());
     }
     install_pdeathsig(&mut cmd);
-    cmd.spawn().map_err(|e| {
+    // Route through the supervisor thread so PR_SET_PDEATHSIG is
+    // anchored to a thread that lives the entire test-binary
+    // lifetime (not a transient tokio worker that may exit between
+    // scenarios). See the `supervisor` module above for why.
+    supervisor::spawn(cmd).map_err(|e| {
         format!(
             "spawn kiseki-server (node-{node_id}) at {}: {e}",
             binary.display()
@@ -593,22 +597,45 @@ fn spawn_with_env(
     })
 }
 
+/// Install the pre_exec hook that ties spawned children's lifetime
+/// to the BDD test binary's lifetime.
+///
+/// Two pieces:
+///
+/// 1. `setsid()` — each child runs in its own session + process group
+///    so the harness's `Drop` (and the supervisor-thread atexit path
+///    below) can `killpg(pgid, …)` cleanly without taking down siblings.
+///
+/// 2. `prctl(PR_SET_PDEATHSIG, SIGKILL)` — kernel asynchronously
+///    SIGKILLs the child when its **spawning thread** exits.
+///
+/// History of (2): a previous version of this helper added PDEATHSIG
+/// here and then removed it because, under tokio's multi-thread
+/// runtime, the worker thread that called `Command::spawn` may die
+/// between batched scenarios — children received the signal mid-test.
+///
+/// The fix is **not** to drop PDEATHSIG; it's to make sure all spawns
+/// happen from a thread that lives the entire test-binary lifetime.
+/// That's what [`spawn_via_supervisor`] does: a single dedicated OS
+/// thread, parked on an mpsc channel, performs every `Command::spawn`.
+/// PDEATHSIG then ties children to the supervisor — and the
+/// supervisor only dies when the test-binary process exits, including
+/// SIGKILL. Children get SIGKILL'd by the kernel within
+/// microseconds, no host-port leak, no orphaned `kiseki-server`s
+/// surviving the run.
+///
+/// SAFETY: pre_exec runs in the forked child between fork() and
+/// execve(); `setsid` and `prctl(PR_SET_PDEATHSIG, …)` are both
+/// async-signal-safe.
 #[cfg(target_os = "linux")]
 fn install_pdeathsig(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // Put each spawned server in its own session+process-group via
-    // setsid(2). On clean shutdown the harness's Drop kills each child
-    // explicitly. We previously tried prctl(PR_SET_PDEATHSIG, SIGTERM)
-    // here but that fires on the *spawning thread's* exit, not the
-    // parent process — and tokio scenarios end their workers between
-    // batched scenarios, so the children received SIGTERM mid-test.
-    // setsid alone leaks children on `kill -9` of cargo test (they
-    // reparent to init), but at least passes batched runs reliably.
-    // SAFETY: pre_exec runs in the forked child between fork() and
-    // execve(); setsid is async-signal-safe.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -618,8 +645,70 @@ fn install_pdeathsig(cmd: &mut Command) {
 
 #[cfg(not(target_os = "linux"))]
 fn install_pdeathsig(_cmd: &mut Command) {
-    // No-op on non-Linux. Children may outlive the test binary on
-    // crash, but tempdir cleanup at least removes their state.
+    // No-op on non-Linux. macOS / *BSD have no PR_SET_PDEATHSIG
+    // analogue; children may outlive the test binary on crash.
+    // Acceptable because the BDD suite's `make test-fast` /
+    // `make test-slow` only target Linux (kiseki itself is Linux-only
+    // per `project_macos_not_target` memory).
+}
+
+/// Supervisor thread: owns every `Command::spawn` performed by the
+/// cluster harness. Parks on an mpsc receiver for the lifetime of the
+/// test binary; PR_SET_PDEATHSIG (installed by [`install_pdeathsig`])
+/// ties spawned children to this thread, so they die exactly when
+/// the test binary dies — including SIGKILL of `cargo test`.
+///
+/// Why a singleton thread instead of an ad-hoc tokio block_in_place:
+/// PDEATHSIG fires on the spawning **thread**'s exit, not the
+/// process's. tokio workers come and go between batched scenarios;
+/// pinning to a long-lived OS thread is the only stable anchor.
+mod supervisor {
+    use std::process::{Child, Command};
+    use std::sync::mpsc;
+    use std::sync::OnceLock;
+
+    type SpawnFn = Box<dyn FnOnce() -> std::io::Result<Child> + Send + 'static>;
+    type Reply = mpsc::SyncSender<std::io::Result<Child>>;
+
+    struct Req {
+        spawn: SpawnFn,
+        reply: Reply,
+    }
+
+    static TX: OnceLock<mpsc::Sender<Req>> = OnceLock::new();
+
+    fn tx() -> &'static mpsc::Sender<Req> {
+        TX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<Req>();
+            // Detached: parks forever on `rx`, terminates only with
+            // the process. Std doesn't have a join handle we keep —
+            // that's intentional, the OS reaps on process death.
+            std::thread::Builder::new()
+                .name("kiseki-bdd-spawn-supervisor".to_owned())
+                .spawn(move || {
+                    while let Ok(req) = rx.recv() {
+                        let result = (req.spawn)();
+                        let _ = req.reply.send(result);
+                    }
+                })
+                .expect("spawn cluster-harness supervisor thread");
+            tx
+        })
+    }
+
+    /// Run `cmd.spawn()` on the supervisor thread. Synchronous from
+    /// the caller's perspective — sends + waits for the reply.
+    pub fn spawn(mut cmd: Command) -> std::io::Result<Child> {
+        let (rtx, rrx) = mpsc::sync_channel::<std::io::Result<Child>>(1);
+        let req = Req {
+            spawn: Box::new(move || cmd.spawn()),
+            reply: rtx,
+        };
+        tx().send(req)
+            .map_err(|_| std::io::Error::other("supervisor thread gone"))?;
+        rrx.recv()
+            .map_err(|_| std::io::Error::other("supervisor reply lost"))?
+    }
 }
 
 // ---------------------------------------------------------------------------

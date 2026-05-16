@@ -18,6 +18,15 @@ pub enum GatewayError {
     #[error("protocol error: {0}")]
     ProtocolError(String),
 
+    /// Semantic invalid-argument — the request is well-formed but the
+    /// referenced object is the wrong type for the operation. Distinct
+    /// from [`Self::ProtocolError`] (wire malformed) and [`Self::NotFound`]
+    /// (object missing). NFS dispatchers map this to `NFS3ERR_INVAL` /
+    /// `NFS4ERR_INVAL` (RFC 1813 §3.3.5, RFC 7530 §16.11.6). Example:
+    /// READLINK on a non-symlink file handle.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
     /// Upstream error from the view or composition layer.
     #[error("upstream error: {0}")]
     Upstream(String),

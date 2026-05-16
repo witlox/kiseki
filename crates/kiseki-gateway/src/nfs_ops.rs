@@ -74,6 +74,18 @@ enum HandleEntry {
         tenant_id: OrgId,
         composition_id: CompositionId,
     },
+    /// Symbolic link — composition_id points at storage holding the
+    /// target path bytes. Distinct from `File` so READLINK can reject
+    /// non-symlink handles (RFC 1813 §3.3.5 + RFC 7530 §16.11.6 both
+    /// mandate NFS3ERR_INVAL / NFS4ERR_INVAL for READLINK on a
+    /// non-symlink target). Pre-2026-05-15 symlinks were stored as
+    /// `File`, so READLINK on any composition handle succeeded with
+    /// the file's raw contents — silent type-confusion.
+    Symlink {
+        namespace_id: NamespaceId,
+        tenant_id: OrgId,
+        composition_id: CompositionId,
+    },
 }
 
 impl HandleRegistry {
@@ -170,8 +182,41 @@ impl HandleRegistry {
                 namespace_id,
                 tenant_id,
                 composition_id,
+            }
+            | HandleEntry::Symlink {
+                namespace_id,
+                tenant_id,
+                composition_id,
             } => Some((*namespace_id, *tenant_id, Some(*composition_id))),
         })
+    }
+
+    /// Register a fh as a symbolic link. Mirrors `file_handle` but
+    /// the entry is `Symlink`, so `readlink` accepts it and other
+    /// callers can distinguish via `is_symlink`.
+    pub fn symlink_handle(
+        &self,
+        namespace_id: NamespaceId,
+        tenant_id: OrgId,
+        composition_id: CompositionId,
+    ) -> FileHandle {
+        let mut fh = [0u8; 32];
+        fh[..16].copy_from_slice(composition_id.0.as_bytes());
+        self.handles.lock().lock_or_die("nfs_ops.unknown").insert(
+            fh,
+            HandleEntry::Symlink {
+                namespace_id,
+                tenant_id,
+                composition_id,
+            },
+        );
+        fh
+    }
+
+    /// Is this handle a symbolic link?
+    pub fn is_symlink(&self, fh: &FileHandle) -> bool {
+        let handles = self.handles.lock().lock_or_die("nfs_ops.unknown");
+        matches!(handles.get(fh), Some(HandleEntry::Symlink { .. }))
     }
 
     /// Check if a handle is a root directory.
@@ -389,15 +434,36 @@ impl<G: GatewayOps> NfsContext<G> {
             }
         }
 
-        let (ns_id, tenant_id, Some(comp_id)) = self
-            .handles
-            .lookup(fh)
-            .ok_or_else(|| GatewayError::ProtocolError("stale file handle".into()))?
-        else {
-            return Err(GatewayError::ProtocolError(
-                "cannot read a directory".into(),
-            ));
+        // Group II partial (2026-05-15): an NFS client may PUTFH a
+        // synthetic `[comp_id 16][zeros 16]` handle that this server's
+        // HandleRegistry never registered — e.g. a composition created
+        // via the S3 gateway. The client's deterministic-fh contract
+        // (kiseki-client/src/remote_nfs/v4.rs:594) is "the first 16
+        // bytes ARE the composition_id, the rest is zeros". Honor it:
+        // if registry lookup misses AND the fh has that exact shape,
+        // resolve the comp_id directly from the bytes. The composition
+        // still has to exist (otherwise `gateway.read` returns
+        // CompositionNotFound and the caller maps it to NFS4ERR_IO).
+        let resolved = match self.handles.lookup(fh) {
+            Some((ns_id, tenant_id, Some(comp_id))) => (ns_id, tenant_id, comp_id),
+            Some((_, _, None)) => {
+                return Err(GatewayError::ProtocolError(
+                    "cannot read a directory".into(),
+                ));
+            }
+            None => {
+                // Registry miss — try the synthetic-fh fallback.
+                if fh.len() == 32 && fh[16..32].iter().all(|&b| b == 0) {
+                    let mut id_bytes = [0u8; 16];
+                    id_bytes.copy_from_slice(&fh[..16]);
+                    let comp_id = CompositionId(uuid::Uuid::from_bytes(id_bytes));
+                    (self.namespace_id, self.tenant_id, comp_id)
+                } else {
+                    return Err(GatewayError::ProtocolError("stale file handle".into()));
+                }
+            }
         };
+        let (ns_id, tenant_id, comp_id) = resolved;
 
         self.gateway
             .read(NfsReadRequest {
@@ -453,10 +519,28 @@ impl<G: GatewayOps> NfsContext<G> {
         let Some(data) = data else {
             return Ok(None);
         };
-        let (new_fh, resp) = self.write(data).await?;
+        // Extract the placeholder composition_id from the fh's first
+        // 16 bytes. The synthetic fh layout is `[comp_id 16][zeros 16]`
+        // (see `HandleRegistry::file_handle`), so the placeholder UUID
+        // the NFS client received at CREATE time is recoverable here.
+        // Passing it as `comp_id_override` makes the resulting
+        // composition land under that exact id — Group V #1: cross-
+        // protocol GETs that captured the placeholder can find it via
+        // `comps.get(uuid)`.
+        let placeholder_id = {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&fh[..16]);
+            CompositionId(uuid::Uuid::from_bytes(bytes))
+        };
+        let (new_fh, resp) = self
+            .write_with_optional_id(data, Some(placeholder_id))
+            .await?;
 
         // Update dir_index: if the old fh had a name, re-map it to the
-        // new composition.
+        // new composition. After Group V #1: `new_fh == fh` and
+        // `resp.composition_id == placeholder_id`, but this keeps the
+        // shape for the (hypothetical) future case where the override
+        // isn't supplied.
         if let Some(name) = self.dir_index.name_for(self.namespace_id, fh) {
             self.dir_index.insert(
                 self.namespace_id,
@@ -467,13 +551,9 @@ impl<G: GatewayOps> NfsContext<G> {
             );
         }
 
-        // Repoint the OLD (placeholder) fh at the real composition
-        // so kernel clients holding it from CREATE keep reading
-        // the right data. Pre-fix the OLD fh pointed at an empty
-        // composition (always returned 0 bytes regardless of
-        // post-CREATE writes) — a latent correctness bug; this
-        // makes the OLD-fh-after-write path return the actual
-        // bytes.
+        // After Group V #1: `fh` IS the real composition's fh, so this
+        // is a no-op. Kept defensively for the path where a future
+        // caller bypasses the override.
         self.handles.repoint_file(fh, resp.composition_id);
 
         Ok(Some((new_fh, resp)))
@@ -560,12 +640,28 @@ impl<G: GatewayOps> NfsContext<G> {
         &self,
         data: Vec<u8>,
     ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
+        self.write_with_optional_id(data, None).await
+    }
+
+    /// Same as [`Self::write`] but pins the resulting composition to
+    /// `comp_id_override` when `Some`. Used by [`Self::flush_writes`]
+    /// to materialise the placeholder UUID minted at CREATE time as
+    /// the actual stored composition_id — see Group V #1: without this,
+    /// the NFS client's first response gives the caller a UUID that
+    /// `comps.get(uuid)` doesn't resolve, so an S3 GET on the same
+    /// UUID fails with 404.
+    pub async fn write_with_optional_id(
+        &self,
+        data: Vec<u8>,
+        comp_id_override: Option<CompositionId>,
+    ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
         let resp = self
             .gateway
             .write(NfsWriteRequest {
                 tenant_id: self.tenant_id,
                 namespace_id: self.namespace_id,
                 data,
+                comp_id_override,
             })
             .await?;
 
@@ -827,13 +923,23 @@ impl<G: GatewayOps> NfsContext<G> {
         Ok(0x3F)
     }
 
-    /// Create a symbolic link. Stores target as inline data.
+    /// Create a symbolic link. Stores target as inline data and
+    /// registers the resulting fh as `HandleEntry::Symlink` so
+    /// `readlink` can later distinguish it from a regular file
+    /// (RFC 1813 §3.3.5 / RFC 7530 §16.11.6 require READLINK on a
+    /// non-symlink to return INVAL).
     pub async fn symlink(
         &self,
         name: &str,
         target: &str,
     ) -> Result<(FileHandle, NfsAttrs), GatewayError> {
+        // `self.write` calls `handles.file_handle(...)` which registers
+        // the new fh as `File`. Re-register the same fh as `Symlink`
+        // so the entry reflects the actual file type.
         let (fh, resp) = self.write(target.as_bytes().to_vec()).await?;
+        let _ = self
+            .handles
+            .symlink_handle(self.namespace_id, self.tenant_id, resp.composition_id);
         self.dir_index.insert(
             self.namespace_id,
             name.to_owned(),
@@ -844,7 +950,7 @@ impl<G: GatewayOps> NfsContext<G> {
         Ok((
             fh,
             NfsAttrs {
-                file_type: FileType::Regular, // symlinks stored as regular files with link content
+                file_type: FileType::Regular, // wire ftype reported as REG until FileType gains a Symlink variant
                 size: target.len() as u64,
                 mode: 0o777,
                 nlink: 1,
@@ -856,7 +962,19 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Read a symbolic link target. Capped at 4096 bytes (NFS3 MAXPATHLEN).
+    ///
+    /// RFC 1813 §3.3.5 + RFC 7530 §16.11.6: READLINK on a non-symlink
+    /// target MUST return NFS3ERR_INVAL / NFS4ERR_INVAL. Pre-2026-05-15
+    /// any `File` handle returned `Ok(file_contents)`, silently
+    /// type-confusing a regular file as a symlink. The handle-registry
+    /// `is_symlink` gate enforces the RFC contract; callers surface the
+    /// `InvalidArgument` error in the wire response.
     pub async fn readlink(&self, fh: &FileHandle) -> Result<String, GatewayError> {
+        if !self.handles.is_symlink(fh) {
+            return Err(GatewayError::InvalidArgument(
+                "READLINK on a non-symlink".into(),
+            ));
+        }
         let resp = self.read(fh, 0, 4096).await?;
         String::from_utf8(resp.data)
             .map_err(|_| GatewayError::ProtocolError("invalid symlink target".into()))

@@ -22,17 +22,53 @@ async fn when_nfs_null(w: &mut KisekiWorld) {
     // NULL = program 100003, version 4, procedure 0
     let result = transport.call(100003, 4, 0, &[]);
     match result {
-        Ok(_) => w.last_error = None,
-        Err(e) => w.last_error = Some(format!("{e}")),
+        Ok(reply) => {
+            // Capture the reply bytes so the Then-step can verify
+            // the RFC 5531 §9 framing (MSG_ACCEPTED + SUCCESS + empty
+            // body). Pre-2026-05-16 the Then asserted only
+            // `last_error.is_none()` — a NULL response that was the
+            // wrong shape but didn't error at transport level would
+            // slip past.
+            w.server_mut().last_body = Some(reply);
+            w.last_error = None;
+        }
+        Err(e) => {
+            w.last_error = Some(format!("{e}"));
+            w.server_mut().last_body = None;
+        }
     }
 }
 
 #[then("the server replies with RPC ACCEPT_SUCCESS")]
 async fn then_rpc_accept(w: &mut KisekiWorld) {
+    // `RpcTransport::call` enforces RFC 5531 §9 envelope contract
+    // internally: it reads the 4-byte record-marking header + the
+    // 24-byte RPC reply header, and ONLY returns `Ok(body)` when
+    // `reply_stat == MSG_ACCEPTED` AND `accept_stat == SUCCESS`.
+    // Anything else (mtype != REPLY, MSG_DENIED, PROC_UNAVAIL, …)
+    // surfaces as `Err(GatewayError::ProtocolError)`. So `Ok` here
+    // IS the MSG_ACCEPTED+SUCCESS contract; we only need to verify
+    // the proc-specific body shape.
     assert!(
         w.last_error.is_none(),
-        "NFS NULL RPC failed: {:?}",
-        w.last_error
+        "RFC 5531 §9: NFS NULL did not return MSG_ACCEPTED+SUCCESS: {:?}",
+        w.last_error,
+    );
+    let body = w
+        .server()
+        .last_body
+        .as_ref()
+        .expect("when_nfs_null must populate last_body on Ok");
+    // RFC 8881 §16.1: NULL is the empty ping — the reply body
+    // (post-RPC-envelope) MUST be empty. A regression where the
+    // server appended a stray body would be visible here as a
+    // non-zero length even though the transport accepted the reply.
+    assert_eq!(
+        body.len(),
+        0,
+        "RFC 8881 §16.1: NULL response body MUST be empty; got {} trailing bytes ({:?})",
+        body.len(),
+        &body[..body.len().min(16)],
     );
 }
 
@@ -82,9 +118,65 @@ async fn then_compound_both_ok(w: &mut KisekiWorld) {
 
 #[then("GETATTR returns type directory for the root filehandle")]
 async fn then_getattr_dir(w: &mut KisekiWorld) {
-    // GETATTR succeeded (checked in previous step). The root is a directory.
-    // Full fattr4 parsing is covered by crate test getattr_root_returns_dir_type.
-    assert!(w.server().last_body.is_some());
+    // Walk past:
+    //   COMPOUND envelope: status(4) + tag_opaque(4 len + padded bytes) + resarray_len(4)
+    //   PUTROOTFH result:  op(4) + status(4)
+    //   GETATTR result:    op(4) + status(4) + bitmap_len(4) + bitmap_words(4*N) + attrs_opaque(4 len + N bytes)
+    // …then parse the attrs_opaque. Bit 1 of the bitmap = `fattr4_type`,
+    // an `nfs_ftype4` enum (RFC 7530 §3.3.4). NF4DIR = 2.
+    let body = w
+        .server()
+        .last_body
+        .as_ref()
+        .expect("no COMPOUND reply captured");
+    // The buffer here is the post-RPC-envelope body produced by
+    // `when_compound_putrootfh_getattr` — the When-step stores the
+    // raw transport.call() return, which `RpcTransport::call` already
+    // sliced past the record-marking AND the RPC reply header for us
+    // (see RpcTransport implementation). So `body[0..4]` is the
+    // COMPOUND-level status. If `RpcTransport` changes, this offset
+    // changes too — keep the parser tolerant.
+    // Verify the assumption: the byte layout we walk below must end at
+    // a non-empty attrs blob; otherwise the offsets shifted under us.
+    let mut off = 0usize;
+    let _status = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+    off += 4;
+    let tag_len = u32::from_be_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    off += (tag_len + 3) & !3; // tag (padded)
+    let _resarray_len = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+    off += 4;
+    // PUTROOTFH result
+    let _op0 = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+    off += 4;
+    let st0 = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+    off += 4;
+    assert_eq!(st0, 0, "PUTROOTFH must be NFS4_OK; got {st0}");
+    // GETATTR result header
+    let _op1 = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+    off += 4;
+    let st1 = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+    off += 4;
+    assert_eq!(st1, 0, "GETATTR must be NFS4_OK; got {st1}");
+    // attrset bitmap (variable-length: count + words)
+    let bm_words = u32::from_be_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    off += 4 * bm_words;
+    // attrs opaque: length-prefixed
+    let attrs_len = u32::from_be_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    assert!(
+        attrs_len >= 4,
+        "GETATTR attrs body must hold at least one u32 (fattr4_type)",
+    );
+    let ftype = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+    assert_eq!(
+        ftype, 2,
+        "RFC 7530 §3.3.4: root filehandle fattr4_type MUST be NF4DIR(=2), got {ftype}. \
+         (NF4REG=1, NF4DIR=2, NF4BLK=3, NF4CHR=4, NF4LNK=5, NF4SOCK=6, NF4FIFO=7, \
+         NF4ATTRDIR=8, NF4NAMEDATTR=9.) A regression here means PUTROOTFH is \
+         returning a non-directory file handle.",
+    );
 }
 
 // --- Scenario: NFSv4 sequential write then read ---
@@ -358,6 +450,7 @@ async fn given_nfs_write_cross(w: &mut KisekiWorld, payload: String) {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
     {
@@ -460,6 +553,7 @@ async fn nfs3_write_helper(w: &mut KisekiWorld, data: Vec<u8>) {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
         .await
         .expect("NFSv3 write failed");

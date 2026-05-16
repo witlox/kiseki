@@ -92,28 +92,110 @@ async fn given_bootstrap_tenant(w: &mut KisekiWorld, tenant: String) {
 #[when(
     regex = r"^the client sends an ONC RPC CALL for program (\d+) version (\d+) procedure (\d+)$"
 )]
-async fn when_rpc_call(w: &mut KisekiWorld, program: u32, _version: u32, procedure: u32) {
-    if program != 100003 {
-        w.last_error = Some("PROG_UNAVAIL".into());
-    } else {
-        w.last_error = None;
+async fn when_rpc_call(w: &mut KisekiWorld, program: u32, version: u32, procedure: u32) {
+    // Build a real ONC RPC CALL message and hand it to the in-process
+    // NFS3 dispatcher. The response bytes land in `w.last_response`
+    // so the Then-steps can parse RPC REPLY framing per RFC 1057 §9.
+    // Empty body — the only procedure with no args is NULL, which is
+    // the dominant caller; non-NULL procedures use their own When-steps.
+    let msg = build_nfs3_rpc(/* xid */ 1, procedure, &[]);
+    let header = RpcCallHeader {
+        xid: 1,
+        program,
+        version,
+        procedure,
+    };
+    let reply = handle_nfs3_first_message(&header, &msg, &w.legacy.nfs_ctx).await;
+    w.last_response = Some(reply);
+    w.last_error = None;
+}
+
+/// Parse the RPC REPLY header per RFC 1057 §9. Returns
+/// `(reply_stat, accept_stat, body_offset)`:
+///   - `reply_stat` = MSG_ACCEPTED (0) or MSG_DENIED (1)
+///   - `accept_stat` = SUCCESS (0), PROG_UNAVAIL (1), … (only valid when MSG_ACCEPTED).
+///   - `body_offset` = byte offset of the proc-specific result (only valid on MSG_ACCEPTED+SUCCESS).
+///
+/// Wire layout (XDR, big-endian u32 throughout):
+///   xid(4) | mtype=REPLY(=1)(4) | reply_stat(4)
+///   if MSG_ACCEPTED:  verf:{flavor(4) len(4) opaque(len, 0..N rounded to 4)} | accept_stat(4) | result-body
+///   if MSG_DENIED:    reject_stat(4) | …
+fn parse_rpc_reply(buf: &[u8]) -> (u32, u32, usize) {
+    assert!(buf.len() >= 12, "RPC reply truncated: {} bytes", buf.len());
+    let xid = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+    let mtype = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+    let reply_stat = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+    assert_eq!(xid, 1, "RPC xid mismatch: expected 1, got {xid}");
+    assert_eq!(mtype, 1, "RPC mtype must be REPLY(=1), got {mtype}");
+    if reply_stat != 0 {
+        // MSG_DENIED — body offset is post reject_stat which we don't peek.
+        return (reply_stat, u32::MAX, buf.len());
     }
+    // MSG_ACCEPTED — verifier follows: flavor(4) + opaque-len(4) + opaque-bytes (padded to 4).
+    let verf_flavor = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+    let verf_len = u32::from_be_bytes(buf[16..20].try_into().unwrap()) as usize;
+    let _ = verf_flavor;
+    let verf_padded = (verf_len + 3) & !3;
+    let accept_off = 20 + verf_padded;
+    assert!(
+        buf.len() >= accept_off + 4,
+        "RPC reply too short for accept_stat: have {}, need {}",
+        buf.len(),
+        accept_off + 4,
+    );
+    let accept_stat = u32::from_be_bytes(buf[accept_off..accept_off + 4].try_into().unwrap());
+    (0, accept_stat, accept_off + 4)
 }
 
 #[then("the server responds with RPC REPLY MSG_ACCEPTED SUCCESS")]
 async fn then_rpc_success(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none());
+    let reply = w
+        .last_response
+        .as_deref()
+        .expect("when_rpc_call must populate last_response");
+    let (reply_stat, accept_stat, _body_off) = parse_rpc_reply(reply);
+    assert_eq!(
+        reply_stat, 0,
+        "RFC 1057 §9: reply_stat must be MSG_ACCEPTED(0), got {reply_stat}",
+    );
+    assert_eq!(
+        accept_stat, 0,
+        "RFC 1057 §9: accept_stat must be SUCCESS(0), got {accept_stat}",
+    );
 }
 
 #[then("the response body is empty")]
 async fn then_empty_body(w: &mut KisekiWorld) {
-    // NULL procedure: no response body, just RPC SUCCESS.
-    assert!(w.last_error.is_none());
+    // RFC 1813 §3.3.0 NULL procedure: post-RPC-header body length is 0.
+    let reply = w
+        .last_response
+        .as_deref()
+        .expect("when_rpc_call must populate last_response");
+    let (reply_stat, accept_stat, body_off) = parse_rpc_reply(reply);
+    assert_eq!(reply_stat, 0, "expected MSG_ACCEPTED");
+    assert_eq!(accept_stat, 0, "expected SUCCESS");
+    let body_len = reply.len() - body_off;
+    assert_eq!(
+        body_len, 0,
+        "NULL procedure response MUST have empty body per RFC 1813 §3.3.0; got {body_len} bytes",
+    );
 }
 
 #[then("the server responds with RPC REPLY MSG_ACCEPTED PROG_UNAVAIL")]
 async fn then_prog_unavail(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_some());
+    let reply = w
+        .last_response
+        .as_deref()
+        .expect("when_rpc_call must populate last_response");
+    let (reply_stat, accept_stat, _) = parse_rpc_reply(reply);
+    assert_eq!(
+        reply_stat, 0,
+        "RFC 1057 §9: PROG_UNAVAIL is reported via MSG_ACCEPTED, not MSG_DENIED",
+    );
+    assert_eq!(
+        accept_stat, 1,
+        "RFC 1057 §9: accept_stat MUST be PROG_UNAVAIL(1) for unknown program, got {accept_stat}",
+    );
 }
 
 // --- GETATTR ---

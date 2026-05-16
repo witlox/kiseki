@@ -113,6 +113,16 @@ Environment=KISEKI_RAW_DEVICES=${raw_devices}
 # blocking on redb I/O in the state machine apply path.
 Environment=KISEKI_RAFT_THREADS=64
 
+# F-1 (2026-05-15 GCP perf-run finding): without this, every composition
+# write does an immediate fjall fsync. Under sustained NFS-write load
+# the hydrator's apply_hydration_batch fsync becomes the dominant cost
+# (~50 ops/sec observed). 100ms eventual-durability mode buffers WAL
+# appends and drives a periodic fsync — the loss-window is bounded to
+# the interval, and Raft + the under-replication scrub re-replicate
+# any compositions lost on a leader crash. Documented as safe for
+# multi-node deployments in runtime.rs's open-fjall path.
+Environment=KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
+
 # ADR-038 §D4.2: plaintext NFS fallback (no TLS bundle in perf-test env)
 Environment=KISEKI_INSECURE_NFS=true
 Environment=KISEKI_ALLOW_PLAINTEXT_NFS=true

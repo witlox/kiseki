@@ -495,7 +495,7 @@ fn stage_create(
     staging: &mut Staging,
     delta: &kiseki_log::delta::Delta,
 ) -> DeltaOutcome {
-    let Some((comp_id, namespace_id, size, name)) =
+    let Some((comp_id, namespace_id, size, name, chunk_plaintext_lens)) =
         decode_composition_create_payload_named(&delta.payload.ciphertext)
     else {
         return DeltaOutcome::PermanentSkip {
@@ -546,6 +546,12 @@ fn stage_create(
         size,
         has_inline_data,
         content_type: None,
+        // For follower-hydrated compositions, the per-chunk lens
+        // ride along in the v3 create-delta payload (decoded above
+        // into `chunk_plaintext_lens` when present). Regular PUTs
+        // emit a v2-or-earlier payload and the read path falls back
+        // to MAX_PLAINTEXT_PER_CHUNK index math.
+        chunk_plaintext_lens: chunk_plaintext_lens.unwrap_or_default(),
     });
     if let Some(name) = name {
         staging.bind_name(namespace_id, name, comp_id);
@@ -700,6 +706,62 @@ mod tests {
         chunk_refs: Vec<ChunkId>,
     ) {
         append_delta_op(log, shard_id, OperationType::Create, payload, chunk_refs).await;
+    }
+
+    /// F-1 RED pin (2026-05-15 GCP perf-run observation): the hydrator
+    /// catches up at ~50 deltas/sec when fed a burst, observed as a
+    /// 100 k-delta backlog accumulating in the seconds after a fio
+    /// write phase. Symptom downstream: every subsequent
+    /// protocol-agnostic write blocks waiting on Raft commit ack
+    /// because the leader's mutex stack is saturated.
+    ///
+    /// Today the hydrator reads up to 1 000 deltas per poll
+    /// (`from..from+999`) and sleeps 100 ms between polls — a
+    /// theoretical ceiling of ~10 000 ops/sec. The observed 50 ops/sec
+    /// puts the actual catch-up rate at 200x below the theoretical
+    /// ceiling, which is more than a slow fsync can explain on its
+    /// own.
+    ///
+    /// This test pins a bounded catch-up budget: 5 000 deltas in a
+    /// burst must drain in < 5 seconds of wall clock on the same
+    /// (in-memory) backend. Today the in-memory backend has no fsync
+    /// cost so this test bounds the **algorithmic** ceiling — if it
+    /// fails RED, the hydrator's per-delta cost is the bottleneck
+    /// (not fjall fsync). If it passes locally, the GCP backlog is
+    /// fjall/disk-bound and the bottleneck is in storage.
+    #[tokio::test]
+    async fn hydrator_drains_5k_delta_burst_within_5s() {
+        const N: u64 = 5_000;
+
+        let store = fresh_store_with_default_ns();
+        let (log, shard_id) = fresh_log();
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+
+        for i in 0..N {
+            let comp_id = CompositionId(uuid::Uuid::from_u128(u128::from(i) + 1));
+            let payload = encode_composition_create_payload(comp_id, ns_id, 64);
+            append_create(&log, shard_id, payload, vec![ChunkId([0u8; 32])]).await;
+        }
+
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
+        let started = std::time::Instant::now();
+        let mut applied_total: u64 = 0;
+        let deadline = started + std::time::Duration::from_secs(5);
+        while applied_total < N && std::time::Instant::now() < deadline {
+            applied_total += hydrator.poll(&log, shard_id).await;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            applied_total >= N,
+            "F-1: hydrator only applied {applied_total}/{N} deltas in {:.2}s — \
+             the per-delta apply path is slower than the algorithmic ceiling. \
+             At 5 000 deltas the in-memory backend (zero fsync, zero disk I/O) \
+             should drain in well under a second. If this test stays red, \
+             investigate (a) hot loops in `stage_create`, (b) lock-contention on \
+             `CompositionStore::storage`, (c) per-delta tracing overhead, before \
+             attributing the GCP-observed 50 ops/sec to fjall fsync.",
+            elapsed.as_secs_f64(),
+        );
     }
 
     #[tokio::test]

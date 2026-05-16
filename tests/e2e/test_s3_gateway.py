@@ -53,9 +53,38 @@ def test_s3_get_not_found(kiseki_server: ServerInfo) -> None:
 
 @pytest.mark.e2e
 def test_s3_delete(kiseki_server: ServerInfo) -> None:
-    """DELETE returns 204 (no-op for now)."""
-    resp = requests.delete(f"{S3_BASE}/default/anything", timeout=5)
-    assert resp.status_code == 204
+    """PUT → DELETE → GET-404. Without the post-DELETE verification
+    a regression that returned 204 without actually removing the
+    object would slip through; the prior version of this test
+    asserted the 204 only.
+    """
+    key = "del/should-be-gone.bin"
+    put = requests.put(f"{S3_BASE}/default/{key}", data=b"to-be-deleted", timeout=5)
+    assert put.status_code == 200, f"PUT failed: {put.status_code} {put.text[:200]}"
+
+    head_before = requests.head(f"{S3_BASE}/default/{key}", timeout=5)
+    assert head_before.status_code == 200, (
+        f"sanity: object must exist before DELETE; got {head_before.status_code}"
+    )
+
+    delete = requests.delete(f"{S3_BASE}/default/{key}", timeout=5)
+    assert delete.status_code in (200, 204), (
+        f"DELETE returned {delete.status_code}; expected 200 or 204"
+    )
+
+    # Post-condition: the key must not resolve anymore. This is what
+    # makes the test actually verify DELETE *semantics* rather than
+    # just status-code shape.
+    get_after = requests.get(f"{S3_BASE}/default/{key}", timeout=5)
+    assert get_after.status_code == 404, (
+        f"DELETE did not remove the object: subsequent GET returned "
+        f"{get_after.status_code} (expected 404). Body: {get_after.text[:200]}"
+    )
+    head_after = requests.head(f"{S3_BASE}/default/{key}", timeout=5)
+    assert head_after.status_code == 404, (
+        f"DELETE did not remove the object: subsequent HEAD returned "
+        f"{head_after.status_code} (expected 404)."
+    )
 
 
 @pytest.mark.e2e

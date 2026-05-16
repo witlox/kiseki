@@ -359,6 +359,7 @@ impl GatewayOps for Nfs3Client {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await?;
         Ok(resp.composition_id)
@@ -430,4 +431,128 @@ fn read_with_fh(
         eof,
         content_type: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Server-free contract tests for the `NFSv3` client adapter.
+    //!
+    //! These cover only the paths that never touch the network — the
+    //! in-memory multipart buffer state machine and the explicit
+    //! no-op `GatewayOps` stubs (`list`, `set_object_content_type`,
+    //! `ensure_namespace`). The wire-level paths (`read`, `write`,
+    //! `delete`) need a running gateway and are exercised by the
+    //! e2e Python suite + BDD acceptance crate.
+    use super::*;
+    use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+
+    fn client() -> Nfs3Client {
+        // Unbound port — these tests never actually connect.
+        Nfs3Client::new(SocketAddr::from_str("127.0.0.1:0").expect("addr"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_returns_empty_until_readdirplus_is_wired() {
+        // NFSv3 client deliberately does NOT implement READDIRPLUS (RFC
+        // 1813 §3.3.17) — S3 LIST is the canonical listing path. The
+        // contract is "always Ok(empty)" so callers that ask both
+        // paths see consistent semantics rather than a Protocol error.
+        let c = client();
+        let got = c
+            .list(OrgId(uuid::Uuid::nil()), NamespaceId(uuid::Uuid::nil()))
+            .await
+            .expect("list must succeed as a no-op");
+        assert!(
+            got.is_empty(),
+            "NFSv3 list is intentionally empty; got {} entries",
+            got.len()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_object_content_type_is_a_noop_returning_ok() {
+        // NFSv3 has no per-file Content-Type metadata. Callers that
+        // unconditionally set one (S3 PUT translation) must not error
+        // out — the contract is silent acceptance.
+        let c = client();
+        c.set_object_content_type(
+            CompositionId(uuid::Uuid::from_u128(7)),
+            Some("application/octet-stream".into()),
+        )
+        .await
+        .expect("set_object_content_type must succeed");
+        c.set_object_content_type(CompositionId(uuid::Uuid::from_u128(8)), None)
+            .await
+            .expect("set_object_content_type(None) must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_namespace_is_a_noop_returning_ok() {
+        // NFSv3's directory tree is implicit; namespaces aren't
+        // declared via a protocol op. The stub MUST return Ok so the
+        // generic mount path doesn't degrade to an error.
+        let c = client();
+        c.ensure_namespace(OrgId(uuid::Uuid::nil()), NamespaceId(uuid::Uuid::nil()))
+            .await
+            .expect("ensure_namespace must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multipart_buffer_lifecycle_start_upload_abort() {
+        // Cover the buffer-only side of S3-style multipart upload.
+        // After abort_multipart, the upload_id must be forgotten so
+        // a later upload_part against the same id is a hard error
+        // (otherwise we'd silently leak buffers).
+        let c = client();
+        let uid = c
+            .start_multipart(NamespaceId(uuid::Uuid::nil()))
+            .await
+            .expect("start_multipart");
+        assert!(!uid.is_empty(), "upload id must be non-empty");
+
+        let etag = c.upload_part(&uid, 1, b"hello").await.expect("upload_part");
+        // ETag shape per impl — synthetic, derived from part number.
+        assert_eq!(etag, "nfs3-part-1");
+
+        c.abort_multipart(&uid).await.expect("abort_multipart");
+
+        let err = c
+            .upload_part(&uid, 2, b"world")
+            .await
+            .expect_err("upload_part after abort must fail");
+        // The buffer must be gone, not silently re-created.
+        match err {
+            GatewayError::ProtocolError(m) => {
+                assert!(
+                    m.contains("unknown upload_id"),
+                    "abort+upload error must say 'unknown upload_id': {m}"
+                );
+            }
+            other => panic!("expected ProtocolError; got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_part_on_unknown_upload_id_fails() {
+        let c = client();
+        let err = c
+            .upload_part("does-not-exist", 1, b"x")
+            .await
+            .expect_err("unknown upload_id must error");
+        assert!(matches!(err, GatewayError::ProtocolError(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_multipart_on_unknown_upload_id_fails() {
+        // complete_multipart's first step is buffer lookup — that
+        // happens before any wire op, so this test stays server-free.
+        let c = client();
+        let err = c
+            .complete_multipart("does-not-exist", None)
+            .await
+            .expect_err("unknown upload_id must error before reaching the wire");
+        assert!(matches!(err, GatewayError::ProtocolError(_)));
+    }
 }

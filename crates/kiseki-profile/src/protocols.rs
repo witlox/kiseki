@@ -134,6 +134,7 @@ impl Driver for S3Driver {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .map_err(|e| format!("s3 put: {e}"))?;
@@ -194,6 +195,7 @@ impl Driver for Nfs3Driver {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .map_err(|e| format!("nfs3 put: {e}"))?;
@@ -254,6 +256,7 @@ impl Driver for Nfs4Driver {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .map_err(|e| format!("nfs4 put: {e}"))?;
@@ -577,6 +580,7 @@ impl Driver for PnfsDriver {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .map_err(|e| format!("pnfs put: {e}"))?;
@@ -714,6 +718,7 @@ impl Driver for FuseDriver {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .map_err(|e| format!("fuse gateway write: {e}"))?;
@@ -999,6 +1004,7 @@ impl Driver for InProcessDriver {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .map_err(|e| format!("in-process put: {e}"))?;
@@ -1309,6 +1315,7 @@ impl Driver for InProcessPersistentDriver {
                 idempotency_key: None,
 
                 forwarded_from_node: None,
+                comp_id_override: None,
             })
             .await
             .map_err(|e| format!("in-process-persistent put: {e}"))?;

@@ -129,7 +129,10 @@ MOUNT OPTIONS:
     --mountpoint <path>      Local mount path (required)
     --in-memory              Run against an in-process sandbox (dev only)
     --cache-mode <mode>      Cache mode: pinned, organic, bypass (default: organic)
-    --read-write             Mount RW (default: RO — HPC compute-node default)
+    --read-only              Mount RO (default: RW). Use for read-only datasets
+                             where accidental writes should fail with EROFS.
+    --read-write             Compatibility alias for the default (RW) — kept so
+                             existing scripts that opt in explicitly still work.
     --cache-dir <path>       Cache directory (default: /tmp/kiseki-cache)
 
 STAGE OPTIONS:
@@ -169,7 +172,13 @@ fn handle_mount(args: &[String]) {
     let mut mountpoint: Option<String> = None;
     let mut cache_mode = String::from("organic");
     let mut _cache_dir: Option<String> = None;
-    let mut read_write = false;
+    // F-2 (2026-05-15): default is RW. A filesystem mount that defaults
+    // RO surprises every operator + script that interacts with it (write
+    // returns EROFS with no log); the "HPC compute-node convention"
+    // framing of the prior default was post-hoc rationalisation. RO is
+    // still available via `--read-only`; `--read-write` stays as an
+    // explicit opt-in alias for backwards compatibility.
+    let mut read_write = true;
     let mut in_memory = false;
 
     let mut i = 0;
@@ -220,7 +229,13 @@ fn handle_mount(args: &[String]) {
                 i += 2;
             }
             "--read-write" => {
+                // Explicit opt-in: matches the new default but kept so
+                // pre-F-2 scripts continue to work unmodified.
                 read_write = true;
+                i += 1;
+            }
+            "--read-only" => {
+                read_write = false;
                 i += 1;
             }
             "--in-memory" => {

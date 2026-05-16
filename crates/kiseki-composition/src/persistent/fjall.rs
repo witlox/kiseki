@@ -567,6 +567,7 @@ mod tests {
             size: u64::from(idx) * 100,
             has_inline_data: false,
             content_type: None,
+            chunk_plaintext_lens: Vec::new(),
         }
     }
 

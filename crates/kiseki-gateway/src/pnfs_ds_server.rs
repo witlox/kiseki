@@ -687,6 +687,7 @@ async fn op_commit_ds<G: GatewayOps + Send + Sync + 'static>(
         workflow_ref: None,
         idempotency_key: None,
         forwarded_from_node: None,
+        comp_id_override: None,
     };
     let status = match ctx.block_gateway(ctx.gateway.write(req)) {
         Ok(resp) => {

@@ -47,6 +47,15 @@ services:
       # KISEKI_CLIENT_TOKEN. See `docs/admin/dashboard.md`.
       KISEKI_ADMIN_AUTH_DISABLED: "true"
       KISEKI_CLUSTER_INFO_PUBLIC: "true"
+      # F-1 (2026-05-15): buffer composition-store writes + drive a
+      # periodic 100ms fsync instead of fsync-per-write. Without this
+      # the hydrator's apply_hydration_batch path hits the disk-fsync
+      # ceiling under sustained NFS write load (~50 ops/sec on GCP
+      # local-SSD; in-memory baseline showed 167k/sec, so the math is
+      # fine). Safe at dev/test scope: single-node compose has no
+      # cross-node replication, so a hard crash within 100ms of a
+      # write loses that write — acceptable for e2e tests.
+      KISEKI_COMPOSITION_FLUSH_INTERVAL_MS: "100"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
       OTEL_SERVICE_NAME: "kiseki-server"
       OTEL_TRACES_SAMPLER_ARG: "1.0"
@@ -96,8 +105,15 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
     command: ["start-dev"]
+    # Keycloak 26 `start-dev` does NOT expose `/health/ready` —
+    # that endpoint only lives in the production `start` mode behind
+    # `--health-enabled=true` on the management port (9000), which
+    # dev-mode doesn't bind. Probe the OIDC well-known endpoint
+    # instead: 200 + `"issuer"` in the body means Keycloak is fully
+    # booted (realm loaded, HTTP listener accepting REST calls).
+    # `Connection: close` keeps each probe self-contained.
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && cat <&3 | grep -q UP"]
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /realms/master/.well-known/openid-configuration HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && timeout 3 cat <&3 | grep -q '\"issuer\"'"]
       interval: 5s
       timeout: 5s
       retries: 30

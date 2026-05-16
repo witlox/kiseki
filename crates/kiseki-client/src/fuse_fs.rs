@@ -375,6 +375,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
     }
 
@@ -467,6 +468,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
             idempotency_key: None,
 
             forwarded_from_node: None,
+            comp_id_override: None,
         })
     }
 

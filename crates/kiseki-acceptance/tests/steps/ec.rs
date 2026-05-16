@@ -133,12 +133,22 @@ async fn then_n_fragments(w: &mut KisekiWorld, n: usize) {
 async fn given_ec_chunk(w: &mut KisekiWorld) {
     let env = ec_envelope(0x50, 1024 * 1024);
     let chunk_id = env.chunk_id;
+    let expected_ciphertext = env.ciphertext.clone();
     w.last_chunk_id = Some(chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     // Pre-read for the When step (which is a no-op from operational.rs).
+    // The Thens assert structural EC properties; we ALSO bind the
+    // byte-level equality here so a regression that returns a
+    // truncated or differently-padded reconstruction shows up.
     match w.legacy.chunk_store.read_chunk_ec(&chunk_id) {
-        Ok(_) => w.last_error = None,
-        Err(e) => w.last_error = Some(e.to_string()),
+        Ok(bytes) => {
+            w.last_error = None;
+            w.reads_working = bytes == expected_ciphertext;
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+            w.reads_working = false;
+        }
     }
 }
 
@@ -157,7 +167,17 @@ async fn then_no_parity_read(w: &mut KisekiWorld) {
 
 #[then("the chunk is reassembled from data fragments")]
 async fn then_reassembled(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none());
+    assert!(
+        w.last_error.is_none(),
+        "EC fast-path read errored: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.reads_working,
+        "EC fast-path reassembly produced a payload that does not \
+         match the originally-written ciphertext — fragments were \
+         either truncated, reordered, or trim-zeroed incorrectly.",
+    );
 }
 
 // === Degraded read ===
@@ -166,6 +186,7 @@ async fn then_reassembled(w: &mut KisekiWorld) {
 async fn given_d3_offline(w: &mut KisekiWorld) {
     let env = ec_envelope(0x51, 1024 * 1024);
     let chunk_id = env.chunk_id;
+    let expected_ciphertext = env.ciphertext.clone();
     w.last_chunk_id = Some(chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     w.legacy
@@ -174,8 +195,14 @@ async fn given_d3_offline(w: &mut KisekiWorld) {
         .unwrap()
         .set_device_online("d3", false);
     match w.legacy.chunk_store.read_chunk_ec(&chunk_id) {
-        Ok(_) => w.last_error = None,
-        Err(e) => w.last_error = Some(e.to_string()),
+        Ok(bytes) => {
+            w.last_error = None;
+            w.reads_working = bytes == expected_ciphertext;
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+            w.reads_working = false;
+        }
     }
 }
 
@@ -186,12 +213,31 @@ async fn then_degraded_3_plus_1(w: &mut KisekiWorld) {
 
 #[then("the missing fragment is reconstructed via EC math")]
 async fn then_reconstructed(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none());
+    assert!(
+        w.last_error.is_none(),
+        "EC degraded read errored: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.reads_working,
+        "EC degraded reconstruction (1 missing fragment) did NOT \
+         reproduce the original ciphertext bytes — silent corruption \
+         of the reconstructed chunk.",
+    );
 }
 
 #[then("the chunk is returned successfully")]
 async fn then_returned_ok(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none());
+    assert!(
+        w.last_error.is_none(),
+        "EC degraded read errored: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.reads_working,
+        "EC degraded reconstruction returned bytes that diverge from \
+         the originally-written ciphertext.",
+    );
 }
 
 // === Two devices offline ===
@@ -200,30 +246,65 @@ async fn then_returned_ok(w: &mut KisekiWorld) {
 async fn given_d3_d5_offline(w: &mut KisekiWorld) {
     let env = ec_envelope(0x52, 1024 * 1024);
     let chunk_id = env.chunk_id;
+    let expected_ciphertext = env.ciphertext.clone();
     w.last_chunk_id = Some(chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
     let pool = w.legacy.chunk_store.pool_mut("fast-nvme").unwrap();
     pool.set_device_online("d3", false);
     pool.set_device_online("d5", false);
     match w.legacy.chunk_store.read_chunk_ec(&chunk_id) {
-        Ok(_) => w.last_error = None,
-        Err(e) => w.last_error = Some(e.to_string()),
+        Ok(bytes) => {
+            w.last_error = None;
+            w.reads_working = bytes == expected_ciphertext;
+        }
+        Err(e) => {
+            w.last_error = Some(e.to_string());
+            w.reads_working = false;
+        }
     }
 }
 
 #[then(regex = r"^2 data \(d1, d2\) \+ 2 remaining \(d4, d6\) are read$")]
 async fn then_degraded_2_plus_2(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none());
+    assert!(
+        w.last_error.is_none(),
+        "EC 2+2 degraded read errored: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.reads_working,
+        "EC 2-fragment-missing reconstruction returned bytes that \
+         diverge from the originally-written ciphertext — at the \
+         k = parity_count boundary; this is the most likely shape \
+         for an EC-math bug.",
+    );
 }
 
 #[then("2 missing fragments reconstructed from parity")]
 async fn then_two_reconstructed(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none());
+    assert!(
+        w.last_error.is_none(),
+        "two-fragment reconstruction errored: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.reads_working,
+        "two-fragment reconstruction did not produce the original \
+         ciphertext bytes — silent corruption at the EC threshold.",
+    );
 }
 
 #[then("the chunk is returned")]
 async fn then_chunk_returned(w: &mut KisekiWorld) {
-    assert!(w.last_error.is_none());
+    assert!(
+        w.last_error.is_none(),
+        "EC read errored: {:?}",
+        w.last_error
+    );
+    assert!(
+        w.reads_working,
+        "reconstructed chunk bytes do not match the original.",
+    );
 }
 
 // === Too many offline ===

@@ -395,3 +395,215 @@ def test_fuse_cluster_cross_node_read(
             )
     finally:
         stop_cluster(cluster)
+
+
+# ---------------------------------------------------------------------------
+# F-2 / F-3 regression pins (2026-05-15 GCP perf-run findings).
+#
+# F-2: `kiseki-client mount` defaults to read-only, so an operator who
+# just runs `kiseki-client mount --endpoint … --mountpoint …` and tries
+# to write gets EROFS with no log warning. A filesystem mount that
+# defaults RO surprises every other tool in the stack; the RO posture
+# should be opt-in via an explicit `--read-only` flag.
+#
+# F-3: `mountpoint -q` (canonical "is this a mount?" probe) returns exit
+# 32 on a kiseki RO FUSE mount even though the mount IS live. Test
+# harness scripts and operator scripts both depend on this returning 0
+# whenever the mount is up; the RO case must not differ from the RW
+# case in how `mountpoint(1)` sees it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+def test_fuse_default_mount_is_writable(fuse_client_image: str) -> None:
+    """F-2 RED: `kiseki-client mount` **without** `--read-write` should
+    still allow writes. Today the flag defaults to RO, so the very
+    first POSIX write returns EROFS — this test pins the corrected
+    default behaviour."""
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    # No --read-write flag here — that's the whole point of the test.
+    script = r"""
+set -uo pipefail
+MNT=/mnt/kiseki
+mkdir -p "$MNT"
+kiseki-client mount --in-memory --mountpoint "$MNT" --cache-mode bypass &
+DAEMON_PID=$!
+trap 'fusermount3 -u "$MNT" 2>/dev/null || true; kill $DAEMON_PID 2>/dev/null || true' EXIT
+
+for i in $(seq 1 50); do
+    if mountpoint -q "$MNT"; then break; fi
+    sleep 0.1
+done
+if ! mountpoint -q "$MNT"; then
+    echo 'FUSE mount did not come up'
+    exit 1
+fi
+
+# Without --read-write, today the kernel rejects this with EROFS. The
+# corrected default makes the write succeed.
+if ! echo -n hello > "$MNT/probe.bin" 2>/tmp/werr; then
+    echo "WRITE-FAILED-AS-EROFS"
+    cat /tmp/werr
+    exit 2
+fi
+ACTUAL=$(cat "$MNT/probe.bin")
+[ "$ACTUAL" = "hello" ] || { echo "BODY-MISMATCH actual=$ACTUAL"; exit 3; }
+echo "DEFAULT-MOUNT-IS-RW"
+
+fusermount3 -u "$MNT"
+wait $DAEMON_PID 2>/dev/null || true
+"""
+    result = _run_fuse_script(fuse_client_image, script, timeout=60)
+
+    assert "WRITE-FAILED-AS-EROFS" not in result.stdout, (
+        "F-2: default mount is RO; write returned EROFS. The default "
+        "must be RW so operators don't have to opt in to writeable "
+        f"filesystems. stdout={result.stdout[-1500:]} stderr={result.stderr[-500:]}"
+    )
+    assert result.returncode == 0, (
+        f"F-2: default mount RW probe exited rc={result.returncode}\n"
+        f"stdout: {result.stdout[-1500:]}\nstderr: {result.stderr[-500:]}"
+    )
+    assert "DEFAULT-MOUNT-IS-RW" in result.stdout, (
+        f"F-2: did not reach the RW-confirmed marker. stdout={result.stdout[-1500:]}"
+    )
+
+
+@pytest.mark.e2e
+def test_mountpoint_q_succeeds_on_ro_fuse_mount(fuse_client_image: str) -> None:
+    """F-3 RED: when explicitly mounted read-only via `--read-only`,
+    `mountpoint -q /path` must still return 0. Today it returns 32 on
+    a kiseki RO FUSE mount (EACCES on the stat() pair), even though
+    `/proc/mounts` shows the mount is live. Test/operator scripts that
+    gate on `mountpoint -q` see "not mounted" and bail.
+
+    NOTE: until F-2 lands, the equivalent flag is the **absence** of
+    `--read-write`. The script below uses that legacy path so this
+    test pins F-3 independently of the F-2 fix. Once F-2 lands and a
+    `--read-only` flag exists, swap the script.
+    """
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    script = r"""
+set -uo pipefail
+MNT=/mnt/kiseki-ro
+mkdir -p "$MNT"
+# No --read-write — under the current default this gives us an RO mount.
+kiseki-client mount --in-memory --mountpoint "$MNT" --cache-mode bypass &
+DAEMON_PID=$!
+trap 'fusermount3 -u "$MNT" 2>/dev/null || true; kill $DAEMON_PID 2>/dev/null || true' EXIT
+
+# Give the FUSE session time to wire up via /proc/mounts.
+for i in $(seq 1 50); do
+    if grep -q " $MNT " /proc/mounts; then break; fi
+    sleep 0.1
+done
+if ! grep -q " $MNT " /proc/mounts; then
+    echo 'FUSE mount never appeared in /proc/mounts'
+    cat /proc/mounts
+    exit 1
+fi
+
+# THIS is the F-3 assertion: mountpoint(1) must agree with /proc/mounts.
+if mountpoint -q "$MNT"; then
+    echo "MOUNTPOINT-Q-OK"
+else
+    RC=$?
+    echo "MOUNTPOINT-Q-RC=$RC"
+    ls -la "$MNT" 2>&1 || true
+    cat /proc/mounts | grep "$MNT" || true
+    exit 2
+fi
+
+fusermount3 -u "$MNT"
+wait $DAEMON_PID 2>/dev/null || true
+"""
+    result = _run_fuse_script(fuse_client_image, script, timeout=60)
+
+    assert "MOUNTPOINT-Q-RC=" not in result.stdout, (
+        "F-3: `mountpoint -q` returns non-zero on a kiseki RO FUSE "
+        "mount that /proc/mounts confirms is live. The RO mount must "
+        "expose the same metadata to `mountpoint(1)` as the RW mount, "
+        f"or operator/test scripts that gate on it bail incorrectly. stdout={result.stdout[-1500:]}"
+    )
+    assert result.returncode == 0, (
+        f"F-3: mountpoint-q probe exited rc={result.returncode}\n"
+        f"stdout: {result.stdout[-1500:]}\nstderr: {result.stderr[-500:]}"
+    )
+    assert "MOUNTPOINT-Q-OK" in result.stdout
+
+
+@pytest.mark.e2e
+def test_fuse_native_endpoint_roundtrip(fuse_client_image: str) -> None:
+    """Native binding e2e coverage (ADR-042 TCP-framed). Pre-2026-05-16
+    every Tier 3 FUSE test used `--endpoint http://...:9000` (the S3
+    listener, `remote-http` feature). The native binding on port 9103
+    had ~93 BDD scenarios for in-process correctness but **zero**
+    end-to-end wire coverage — a regression that broke the
+    TCP-framed listener under load would slip past CI and only
+    surface on GCP perf runs.
+
+    This test exercises the same FUSE→cluster cross-protocol round-
+    trip as `test_fuse_remote_http_cross_protocol_roundtrip`, but
+    routes the data plane through `kiseki://kiseki-server:9103`
+    instead of the S3 HTTP gateway. The kiseki-client picks the
+    native TCP-framed binding for the kiseki:// scheme.
+    """
+    if not _docker_available():
+        pytest.skip("docker daemon not reachable")
+
+    from helpers.cluster import start_cluster, stop_cluster
+
+    cluster = start_cluster()
+    try:
+        script = r"""
+set -uo pipefail
+MNT=/mnt/kiseki-native
+mkdir -p "$MNT"
+# kiseki://host:9103 routes through the ADR-042 TCP-framed binding.
+# Without `--read-write` the default is now RW (F-2 2026-05-15).
+kiseki-client mount --endpoint kiseki://kiseki-node1:9103 \
+    --mountpoint "$MNT" --cache-mode bypass &
+DAEMON_PID=$!
+trap 'fusermount3 -u "$MNT" 2>/dev/null || true; kill $DAEMON_PID 2>/dev/null || true' EXIT
+
+for i in $(seq 1 50); do
+    if mountpoint -q "$MNT"; then break; fi
+    sleep 0.1
+done
+if ! mountpoint -q "$MNT"; then
+    echo 'FUSE-native mount did not come up'
+    exit 1
+fi
+
+PAYLOAD='kiseki FUSE-cluster NATIVE-binding round-trip bytes!'
+echo -n "$PAYLOAD" > "$MNT/native-probe.bin"
+ACTUAL=$(cat "$MNT/native-probe.bin")
+
+if [ "$ACTUAL" != "$PAYLOAD" ]; then
+    echo 'NATIVE-ROUNDTRIP-MISMATCH'
+    exit 2
+fi
+echo 'NATIVE-ROUNDTRIP-OK'
+
+fusermount3 -u "$MNT"
+wait $DAEMON_PID 2>/dev/null || true
+"""
+        result = _run_fuse_script(
+            fuse_client_image, script, timeout=60, network="kiseki_default"
+        )
+
+        assert result.returncode == 0, (
+            f"FUSE→native ({fuse_native := 'kiseki://kiseki-node1:9103'}) "
+            f"round-trip failed (rc={result.returncode}):\n"
+            f"stdout: {result.stdout[-2000:]}\n"
+            f"stderr: {result.stderr[-2000:]}"
+        )
+        assert "NATIVE-ROUNDTRIP-OK" in result.stdout, (
+            f"FUSE→native round-trip body diverged: stdout={result.stdout[-1500:]}"
+        )
+    finally:
+        stop_cluster(cluster)

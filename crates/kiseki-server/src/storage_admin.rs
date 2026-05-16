@@ -1226,19 +1226,46 @@ impl StorageAdminService for StorageAdminGrpc {
             //    `LogOps::split_shard` short-circuits the create-
             //    new-shard step when `has_shard(new_shard)` is true
             //    — which it is now, post-RecordSplit.
-            let _ = log
-                .split_shard(
+            //
+            //    Retry on `LeaderUnavailable` / `ForwardToLeader`: the
+            //    RecordSplit at step 1 + initialize at step 2 ran
+            //    against the control-plane Raft group; the *source*
+            //    shard's own per-shard Raft group can be mid-election
+            //    or mid-handoff at this point. The 15 s budget mirrors
+            //    `submit_with_leader_retry` above.
+            let split_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut split_attempt = 0u32;
+            loop {
+                match log.split_shard(
                     shard,
                     new_shard,
                     kiseki_common::ids::NodeId(self.self_node_id.max(1)),
-                )
-                .map_err(|e| {
-                    if matches!(e, kiseki_log::error::LogError::ShardNotFound(_)) {
-                        Status::not_found(format!("shard {} not found", r.shard_id))
-                    } else {
-                        Status::internal(format!("split: source rebalance: {e}"))
+                ) {
+                    Ok(_) => break,
+                    Err(kiseki_log::error::LogError::ShardNotFound(_)) => {
+                        return Err(Status::not_found(format!("shard {} not found", r.shard_id)));
                     }
-                })?;
+                    Err(e)
+                        if matches!(
+                            e,
+                            kiseki_log::error::LogError::LeaderUnavailable(_)
+                                | kiseki_log::error::LogError::ForwardToLeader { .. }
+                                | kiseki_log::error::LogError::ShardSplitting(_)
+                        ) && std::time::Instant::now() < split_deadline =>
+                    {
+                        split_attempt += 1;
+                        tracing::debug!(
+                            attempt = split_attempt,
+                            error = %e,
+                            "SplitShard: source rebalance retry on transient leader state",
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    Err(e) => {
+                        return Err(Status::internal(format!("split: source rebalance: {e}")));
+                    }
+                }
+            }
 
             Ok(Response::new(pb::SplitShardResponse {
                 left_shard_id: shard.0.to_string(),

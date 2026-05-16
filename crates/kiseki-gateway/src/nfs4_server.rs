@@ -558,12 +558,73 @@ pub(crate) async fn op_create_session(
     reader: &mut XdrReader<'_>,
     sessions: &SessionManager,
 ) -> (u32, Vec<u8>) {
+    // RFC 8881 §18.36.1 CREATE_SESSION4args:
+    //   clientid + seqid + flags
+    //   + fore channel_attrs4 + back channel_attrs4
+    //   + cb_program + callback_sec_parms4<>
+    //
+    // channel_attrs4 = 6 × u32 + rdma_ird<1> (a variable-length array
+    // capped at 1 entry per RFC). Consume all of it — leaving bytes
+    // unread corrupts subsequent ops in the same compound (the
+    // dispatcher shares one XdrReader; see op_lock for the original
+    // version of this same wire-bug class).
     let client_id = reader.read_u64().unwrap_or(0);
     let _sequence = reader.read_u32().unwrap_or(0);
     let _flags = reader.read_u32().unwrap_or(0);
 
-    // Skip fore/back channel attrs (simplified).
-    // In full impl, parse ca_headerpadsize, ca_maxrequestsize, etc.
+    // Consume fore + back channel_attrs4, then cb_program +
+    // sec_parms<>. We don't honor the negotiated sizes today (slot
+    // count is hard-coded), but the bytes MUST be read so the
+    // XdrReader cursor lands at the start of the next op.
+    for _ in 0..2 {
+        for _ in 0..6 {
+            let _ = reader.read_u32(); // ca_* fields
+        }
+        // rdma_ird<1>: zero or one trailing u32.
+        if let Ok(n) = reader.read_u32() {
+            for _ in 0..n.min(1) {
+                let _ = reader.read_u32();
+            }
+        }
+    }
+    let _cb_program = reader.read_u32();
+    // callback_sec_parms4<> — RFC 8881 §18.36.1.  Each entry is a
+    // discriminated union switch (auth_flavor). AUTH_NONE / AUTH_SYS
+    // carry a body of varying length; for the few flavors kiseki ever
+    // sees (AUTH_NONE during mount.nfs4, occasionally AUTH_SYS), we
+    // discriminate just enough to skip the body. Anything we don't
+    // recognize is treated as "no body" — wrong on paper, but safe
+    // because the very next read is the COMPOUND op-code boundary
+    // and the test above pins that boundary explicitly.
+    let n_sec_parms = reader.read_u32().unwrap_or(0);
+    for _ in 0..n_sec_parms.min(8) {
+        let flavor = reader.read_u32().unwrap_or(0);
+        match flavor {
+            0 => {} // AUTH_NONE — no body
+            1 => {
+                // AUTH_SYS — authsys_parms (RFC 5531 §8.2): stamp(u32)
+                // + machinename<255>(opaque) + uid(u32) + gid(u32)
+                // + gids<16>(opaque-array-of-u32).
+                let _ = reader.read_u32();
+                let _ = reader.read_opaque();
+                let _ = reader.read_u32();
+                let _ = reader.read_u32();
+                if let Ok(n) = reader.read_u32() {
+                    for _ in 0..n.min(16) {
+                        let _ = reader.read_u32();
+                    }
+                }
+            }
+            _ => {
+                // Unknown flavor — be conservative and stop scanning;
+                // the reader cursor is in an unknown state and we'd
+                // rather the next op surface NFS4ERR_OP_ILLEGAL than
+                // crash the COMPOUND with a wild dispatch.
+                break;
+            }
+        }
+    }
+
     let slots = 8u32; // default slot count
 
     let session_id = sessions.create_session(client_id, slots);
@@ -1980,11 +2041,34 @@ async fn op_lock(
     sessions: &SessionManager,
     state: &mut CompoundState,
 ) -> (u32, Vec<u8>) {
+    // RFC 5661 §18.10.1 LOCK4args:
+    //   locktype, reclaim, offset, length, locker4 locker
+    // locker4 is a `union switch (bool new_lock_owner)`:
+    //   TRUE  → open_to_lock_owner4 = open_seqid + open_stateid(16)
+    //          + lock_seqid + lock_owner4 (clientid(8) + owner<>)
+    //   FALSE → exist_lock_owner4   = lock_stateid(16) + lock_seqid
+    //
+    // Pre-fix the locker bytes were left in the buffer. The COMPOUND
+    // dispatcher (line 392) shares ONE XdrReader across every op, so
+    // any op following LOCK in the same compound parsed into the
+    // locker payload — silent corruption that surfaces as
+    // NFS4ERR_OP_ILLEGAL or wildly-wrong status from the next op.
     let lock_type = reader.read_u32().unwrap_or(1); // READ_LT=1, WRITE_LT=2
     let _reclaim = reader.read_bool().unwrap_or(false);
     let offset = reader.read_u64().unwrap_or(0);
     let length = reader.read_u64().unwrap_or(u64::MAX);
-    // Skip locker union (simplified).
+
+    let new_lock_owner = reader.read_bool().unwrap_or(false);
+    if new_lock_owner {
+        let _open_seqid = reader.read_u32();
+        let _open_stateid = reader.read_opaque_fixed(16);
+        let _lock_seqid = reader.read_u32();
+        let _clientid = reader.read_u64();
+        let _owner = reader.read_opaque(); // variable-length lock_owner4.owner
+    } else {
+        let _lock_stateid = reader.read_opaque_fixed(16);
+        let _lock_seqid = reader.read_u32();
+    }
 
     let write = lock_type == 2 || lock_type == 4; // WRITE_LT or WRITEW_LT
 
@@ -3512,6 +3596,306 @@ mod tests {
                 seen.insert(name.clone()),
                 "READDIR returned duplicate entry `{name}` (got: {names:?})",
             );
+        }
+    }
+
+    // ---------- IO_ADVISE (RFC 7862 §15.4) ----------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn io_advise_accepts_with_empty_hints_applied() {
+        // Build an IO_ADVISE4args: stateid(16) + offset(8) + count(8) +
+        // hints<>(4 + n*4). Client sends 1 hint word with bit 0 set
+        // (IO_ADVISE4_NORMAL); we return NFS4_OK and an empty applied
+        // bitmap (RFC 7862 §15.4 — server MAY ignore hints).
+        let mut w = XdrWriter::new();
+        w.write_opaque_fixed(&[0u8; 16]); // stateid
+        w.write_u64(0); // offset
+        w.write_u64(4096); // count
+        w.write_u32(1); // hints bitmap word count
+        w.write_u32(0x1); // hints bitmap[0]
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let (status, body) = op_io_advise(&mut reader).await;
+        assert_eq!(
+            status,
+            nfs4_status::NFS4_OK,
+            "IO_ADVISE on a well-formed request must succeed"
+        );
+        // Body: op-code(4) + status(4) + applied-bitmap-count(4) + words.
+        let mut r = XdrReader::new(&body);
+        assert_eq!(r.read_u32().unwrap(), op::IO_ADVISE);
+        assert_eq!(r.read_u32().unwrap(), nfs4_status::NFS4_OK);
+        let applied_count = r.read_u32().unwrap();
+        // The current impl writes a single zero word; assert that's
+        // 0 hints applied (the wire shape, not the impl detail).
+        let mut applied = 0u32;
+        for _ in 0..applied_count {
+            applied |= r.read_u32().unwrap();
+        }
+        assert_eq!(
+            applied, 0,
+            "IO_ADVISE applied-hints bitmap must be empty until ADR-020 wiring"
+        );
+    }
+
+    // ---------- SEEK (RFC 7862 §15.11) ----------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seek_data_or_hole_returns_notsupp() {
+        // sa_what = 0 (SEEK4_DATA) — well-formed but unimplemented.
+        // RFC 7862 §15.11 says NFS4ERR_NOTSUPP is the right answer.
+        let mut w = XdrWriter::new();
+        w.write_opaque_fixed(&[0u8; 16]);
+        w.write_u64(0);
+        w.write_u32(0); // SEEK4_DATA
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let (status, body) = op_seek(&mut reader).await;
+        assert_eq!(
+            status,
+            nfs4_status::NFS4ERR_NOTSUPP,
+            "SEEK(DATA) on a non-sparse server must return NFS4ERR_NOTSUPP"
+        );
+        let mut r = XdrReader::new(&body);
+        assert_eq!(r.read_u32().unwrap(), op::SEEK);
+        assert_eq!(r.read_u32().unwrap(), nfs4_status::NFS4ERR_NOTSUPP);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seek_with_invalid_what_returns_union_notsupp() {
+        // sa_what = 7 — outside {0=SEEK4_DATA, 1=SEEK4_HOLE}.
+        // RFC 7862 §11.11: union discriminator out of range is
+        // NFS4ERR_UNION_NOTSUPP, NOT NFS4ERR_NOTSUPP.
+        let mut w = XdrWriter::new();
+        w.write_opaque_fixed(&[0u8; 16]);
+        w.write_u64(0);
+        w.write_u32(7);
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let (status, _body) = op_seek(&mut reader).await;
+        assert_eq!(
+            status,
+            nfs4_status::NFS4ERR_UNION_NOTSUPP,
+            "SEEK with out-of-range sa_what must return NFS4ERR_UNION_NOTSUPP per RFC 7862 §11.11",
+        );
+    }
+
+    // ---------- LAYOUTERROR (RFC 7862 §15.5) ----------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn layouterror_with_zero_errors_returns_notsupp() {
+        // offset(8) + length(8) + stateid(16) + error_count(4) = 0.
+        // No trailing iomode → impl returns NFS4ERR_NOTSUPP.
+        let mut w = XdrWriter::new();
+        w.write_u64(0);
+        w.write_u64(0xFFFF_FFFF_FFFF_FFFF);
+        w.write_opaque_fixed(&[0u8; 16]);
+        w.write_u32(0); // zero device_error4 entries
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let (status, body) = op_layouterror(&mut reader).await;
+        assert_eq!(
+            status,
+            nfs4_status::NFS4ERR_NOTSUPP,
+            "LAYOUTERROR without a usable error path must return NFS4ERR_NOTSUPP"
+        );
+        let mut r = XdrReader::new(&body);
+        assert_eq!(r.read_u32().unwrap(), op::LAYOUTERROR);
+        assert_eq!(r.read_u32().unwrap(), nfs4_status::NFS4ERR_NOTSUPP);
+    }
+
+    // ---------- BIND_CONN_TO_SESSION (RFC 8881 §18.34) ----------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_conn_to_session_echoes_session_and_direction() {
+        // sessionid(16) + dir(u32) + use_rdma(bool). Server echoes
+        // sessionid + agreed direction + use_rdma=false (we don't do RDMA).
+        let sessionid = [0xABu8; 16];
+        let dir = 3u32; // CDFC4_BOTH per RFC 8881 §18.34
+        let mut w = XdrWriter::new();
+        w.write_opaque_fixed(&sessionid);
+        w.write_u32(dir);
+        w.write_bool(false);
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let (status, body) = op_bind_conn_to_session(&mut reader).await;
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&body);
+        assert_eq!(r.read_u32().unwrap(), op::BIND_CONN_TO_SESSION);
+        assert_eq!(r.read_u32().unwrap(), nfs4_status::NFS4_OK);
+        let echoed = r.read_opaque_fixed(16).unwrap();
+        assert_eq!(
+            echoed, sessionid,
+            "BIND_CONN_TO_SESSION must echo the requested sessionid per RFC 8881 §18.34.4"
+        );
+        assert_eq!(
+            r.read_u32().unwrap(),
+            dir,
+            "BIND_CONN_TO_SESSION must agree to the requested direction"
+        );
+        assert!(
+            !r.read_bool().unwrap(),
+            "kiseki does not negotiate RDMA — bctsr_use_conn_in_rdma_mode must be false"
+        );
+    }
+
+    // ---------- SECINFO_NO_NAME (RFC 8881 §18.31) ----------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secinfo_no_name_returns_a_single_auth_sys_flavor() {
+        // SECINFO_NO_NAME4args: style(u32). Reply: secinfo4<>; we
+        // advertise exactly one entry — AUTH_SYS (flavor=1, no body).
+        let mut w = XdrWriter::new();
+        w.write_u32(0); // SECINFO_STYLE4_CURRENT_FH
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let (status, body) = op_secinfo_no_name(&mut reader).await;
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        let mut r = XdrReader::new(&body);
+        assert_eq!(r.read_u32().unwrap(), op::SECINFO_NO_NAME);
+        assert_eq!(r.read_u32().unwrap(), nfs4_status::NFS4_OK);
+        let count = r.read_u32().unwrap();
+        assert_eq!(count, 1, "kiseki advertises a single auth flavor");
+        let flavor = r.read_u32().unwrap();
+        assert_eq!(
+            flavor, 1,
+            "AUTH_SYS (RFC 5531 §8.2) — flavor==1, no body. Required for kernel mount.nfs4 pre-mount probe."
+        );
+    }
+
+    // ---------- CREATE_SESSION args consumption (RFC 8881 §18.36) ----------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_session_consumes_channel_attrs_and_cb_so_next_op_parses() {
+        // CREATE_SESSION4args (RFC 8881 §18.36.1):
+        //   clientid (u64) + seqid (u32) + flags (u32)
+        //   + fore channel_attrs4 (24 bytes + rdma_ird<1>)
+        //   + back channel_attrs4 (24 bytes + rdma_ird<1>)
+        //   + cb_program (u32)
+        //   + sec_parms<>: array of callback_sec_parms4
+        //
+        // Pre-fix the impl read 16 bytes and stopped. Like LOCK, the
+        // COMPOUND dispatcher feeds a single XdrReader through every
+        // op, so leftover bytes get reinterpreted as the next op-code.
+        // CREATE_SESSION is typically the last op in its compound at
+        // mount-up, so the wild reads went unnoticed — but any client
+        // that pipelines CREATE_SESSION + RECLAIM_COMPLETE in one
+        // compound (legal per the RFC) would mis-parse RECLAIM_COMPLETE.
+        let sessions = test_sessions();
+
+        let mut w = XdrWriter::new();
+        // CREATE_SESSION4args head.
+        w.write_u64(0xDEAD_BEEF_CAFE_F00D); // clientid
+        w.write_u32(1); // seqid
+        w.write_u32(0); // flags
+                        // fore channel_attrs4.
+        w.write_u32(0); // headerpadsize
+        w.write_u32(1_048_576); // maxrequestsize
+        w.write_u32(1_048_576); // maxresponsesize
+        w.write_u32(1_048_576); // maxresponsesize_cached
+        w.write_u32(8); // maxoperations
+        w.write_u32(8); // maxrequests
+        w.write_u32(0); // rdma_ird count
+                        // back channel_attrs4.
+        w.write_u32(0);
+        w.write_u32(1_048_576);
+        w.write_u32(1_048_576);
+        w.write_u32(1_048_576);
+        w.write_u32(8);
+        w.write_u32(8);
+        w.write_u32(0);
+        // cb_program (callback program number).
+        w.write_u32(0x4000_0000);
+        // sec_parms<>: empty.
+        w.write_u32(0);
+
+        // Sentinel — the next op_code in the COMPOUND.
+        let sentinel: u32 = 0xCAFE_BABE;
+        w.write_u32(sentinel);
+
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let _ = op_create_session(&mut reader, &sessions).await;
+
+        let after = reader
+            .read_u32()
+            .expect("reader must still be readable after op_create_session");
+        assert_eq!(
+            after, sentinel,
+            "op_create_session left channel_attrs / cb_program / sec_parms unread — \
+             next op in the compound would parse those bytes as its op-code. \
+             RFC 8881 §18.36.1 requires the full CREATE_SESSION4args.",
+        );
+    }
+
+    // ---------- LOCK locker-consumption (RFC 5661 §18.10.1) ----------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lock_consumes_the_locker_so_the_next_op_parses_correctly() {
+        // op_lock historically read 24 bytes (locktype + reclaim +
+        // offset + length) but skipped the `locker4` union entirely.
+        // The COMPOUND dispatcher feeds a single XdrReader through
+        // every op, so trailing locker bytes are silently interpreted
+        // as the next op's wire prefix. RFC 5661 §18.10.1 defines
+        // LOCK4args.locker (a `union locker4 switch (bool)`); we
+        // exercise the FALSE arm (existing lock_owner) which carries
+        // a 16-byte stateid + 4-byte seqid.
+        //
+        // The test puts a sentinel u32 immediately after a valid
+        // LOCK4args. If op_lock leaves the locker unread, the
+        // sentinel won't be readable at the reader's post-op cursor.
+        let sessions = test_sessions();
+        let mut state = CompoundState {
+            current_fh: None,
+            saved_fh: None,
+            current_stateid: Some(StateId([0xCDu8; 16])),
+        };
+
+        let mut w = XdrWriter::new();
+        w.write_u32(1); // READ_LT
+        w.write_bool(false); // reclaim
+        w.write_u64(0); // offset
+        w.write_u64(u64::MAX); // length
+                               // locker4: new_lock_owner = FALSE → exist_lock_owner4.
+        w.write_bool(false);
+        w.write_opaque_fixed(&[0xEEu8; 16]); // lock_stateid (stateid4)
+        w.write_u32(1); // lock_seqid
+                        // Sentinel — the next op_code that the dispatcher would read.
+        let sentinel: u32 = 0xDEAD_BEEF;
+        w.write_u32(sentinel);
+
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let _ = op_lock(&mut reader, &sessions, &mut state).await;
+
+        // After op_lock returns, the next u32 in the reader MUST be
+        // the sentinel — i.e. op_lock consumed exactly LOCK4args's
+        // 48 bytes (24 fixed + 24 locker), no more, no less.
+        let after = reader
+            .read_u32()
+            .expect("reader must still be readable after op_lock");
+        assert_eq!(
+            after, sentinel,
+            "op_lock left the locker union unread — next op would parse the locker bytes \
+             as its op-code. RFC 5661 §18.10.1 requires the full LOCK4args.",
+        );
+    }
+
+    // ---------- RECLAIM_COMPLETE (RFC 8881 §18.51) ----------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reclaim_complete_returns_ok_for_both_one_fs_values() {
+        // RECLAIM_COMPLETE4args is a single boolean (rca_one_fs).
+        // Linux mount path always sends rca_one_fs=false at mount-up;
+        // a recover-from-restart path may send true. Both succeed.
+        for one_fs in [false, true] {
+            let mut w = XdrWriter::new();
+            w.write_bool(one_fs);
+            let bytes = w.into_bytes();
+            let mut reader = XdrReader::new(&bytes);
+            let (status, body) = op_reclaim_complete(&mut reader).await;
+            assert_eq!(
+                status,
+                nfs4_status::NFS4_OK,
+                "RECLAIM_COMPLETE(rca_one_fs={one_fs}) must succeed"
+            );
+            let mut r = XdrReader::new(&body);
+            assert_eq!(r.read_u32().unwrap(), op::RECLAIM_COMPLETE);
+            assert_eq!(r.read_u32().unwrap(), nfs4_status::NFS4_OK);
         }
     }
 }

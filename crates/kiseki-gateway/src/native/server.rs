@@ -340,7 +340,9 @@ fn map_gateway_error(e: GatewayError) -> Status {
     match e {
         GatewayError::AuthenticationFailed(m) => Status::unauthenticated(m),
         GatewayError::OperationNotSupported(m) => Status::unimplemented(m),
-        GatewayError::ProtocolError(m) => Status::invalid_argument(m),
+        GatewayError::ProtocolError(m) | GatewayError::InvalidArgument(m) => {
+            Status::invalid_argument(m)
+        }
         GatewayError::Upstream(m) => Status::internal(m),
         GatewayError::StaleView { lag_ms } => {
             Status::failed_precondition(format!("stale view (lag={lag_ms}ms)"))
@@ -510,6 +512,7 @@ impl ServerImpl {
                 workflow_ref,
                 idempotency_key: Some(cf.idempotency_key.clone()),
                 forwarded_from_node: cf.forwarded_from_node,
+                comp_id_override: None,
             };
             match self.ops.write_with_forwarding(wreq).await {
                 Ok(r) => r,
@@ -574,6 +577,7 @@ impl ServerImpl {
                 workflow_ref,
                 idempotency_key: Some(cf.idempotency_key.clone()),
                 forwarded_from_node: cf.forwarded_from_node,
+                comp_id_override: None,
             };
             self.ops.write(wreq).await.map_err(map_gateway_error)?
         };
