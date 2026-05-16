@@ -127,6 +127,22 @@ Environment=KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_INSECURE_NFS=true
 Environment=KISEKI_ALLOW_PLAINTEXT_NFS=true
 
+# Closes #52: without this, /cluster/info on the metrics port returns
+# `auth misconfigured` because the perf-test deployment has no
+# KISEKI_ADMIN_TOKEN/KISEKI_CLIENT_TOKEN set. perf-common.sh's
+# `discover_leader` needs an unauthenticated read of /cluster/info to
+# find the Raft leader; the local docker-compose.3node.yml already
+# sets this for the same reason. Production deployments that DO set
+# admin/client tokens should leave this off.
+Environment=KISEKI_CLUSTER_INFO_PUBLIC=true
+
+# Closes #56: kiseki-admin hits /ui/api/cluster which is admin-gated.
+# Without this, kiseki-admin status reported `Nodes: 0/0` against a
+# healthy cluster because the 401 body parsed as zero counts. Mirrors
+# the local docker-compose.3node.yml `KISEKI_ADMIN_AUTH_DISABLED:
+# "true"` posture for the same perf-test reason as #52.
+Environment=KISEKI_ADMIN_AUTH_DISABLED=true
+
 # Eventual-durability flush cadence (ADR-022 rev-3 + d5c56ad).
 # All three are CRITICAL for perf:
 #   * KISEKI_RAFT_FLUSH_INTERVAL_MS unset → Raft log uses

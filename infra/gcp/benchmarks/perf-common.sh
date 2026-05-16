@@ -17,12 +17,23 @@ set -o pipefail
 # Env file path is overridable for local unit tests (see
 # tests/test_pick_helpers.sh). On the bench-ctrl VM the default
 # /etc/kiseki-bench.env is what setup-bench-ctrl.sh writes.
+#
+# Local-mode fallback (#134): when /etc/kiseki-bench.env is absent,
+# fabricate a single-node env pointing at 127.0.0.1. Lets phases
+# run against a `docker compose -f docker-compose.3node.yml` cluster
+# from the dev box without any operator setup.
 KISEKI_BENCH_ENV="${KISEKI_BENCH_ENV:-/etc/kiseki-bench.env}"
-# shellcheck disable=SC1090
-source "$KISEKI_BENCH_ENV" 2>/dev/null || {
-  echo "ERROR: $KISEKI_BENCH_ENV missing — was this script run from bench-ctrl?" >&2
-  exit 1
-}
+if [ -f "$KISEKI_BENCH_ENV" ]; then
+  # shellcheck disable=SC1090
+  source "$KISEKI_BENCH_ENV"
+else
+  STORAGE_IPS="${STORAGE_IPS:-127.0.0.1}"
+  CLIENT_IPS="${CLIENT_IPS:-127.0.0.1}"
+  FIRST_STORAGE="${FIRST_STORAGE:-127.0.0.1}"
+  KISEKI_PERF_BUCKET="${KISEKI_PERF_BUCKET:-}"
+  SSH_USER="${SSH_USER:-$(whoami)}"
+  KISEKI_PROFILE="${KISEKI_PROFILE:-local}"
+fi
 
 # Whitespace-separated forms (most code prefers these).
 ALL_STORAGE=$(echo "$STORAGE_IPS" | tr ',' ' ')
@@ -34,8 +45,36 @@ read -r -a STORAGE_IPS_ARRAY <<< "$ALL_STORAGE"
 PAR=${KISEKI_BENCH_PAR:-8}
 GCS_BUCKET="${KISEKI_PERF_BUCKET:-gs://kiseki-perf-results}"
 
-RUN_TS=$(date +%Y%m%d-%H%M%S)
-RESULTS="/tmp/kiseki-perf-${KISEKI_PROFILE:-unknown}-${RUN_TS}"
+# Closes #55: $RESULTS is sticky per session, not per source.
+#
+# Pre-fix RESULTS used `$(date +%Y%m%d-%H%M%S)` evaluated AT SOURCE
+# TIME, so every phase script that sourced perf-common.sh got its own
+# timestamped dir. The 2026-05-16 GCP run scattered results across
+# 7+ /tmp/kiseki-perf-compact-* dirs.
+#
+# New shape: $KISEKI_RUN_ID is the source of truth. If unset (first
+# source of the session), read from /tmp/kiseki-bench-runid; if the
+# marker is missing, generate a fresh timestamp + write it. Every
+# subsequent source inside the same session reads the same id, so all
+# phases land under the same $RESULTS.
+#
+# The `bench` driver (infra/gcp/benchmarks/bench) creates a fresh
+# run-id on entry by writing a new marker; operators can also pin one
+# explicitly via `KISEKI_RUN_ID=<value> bash phases/<name>.sh`.
+RUN_ID_MARKER="${KISEKI_RUN_ID_MARKER:-/tmp/kiseki-bench-runid}"
+if [ -z "${KISEKI_RUN_ID:-}" ]; then
+  if [ -f "$RUN_ID_MARKER" ]; then
+    KISEKI_RUN_ID=$(cat "$RUN_ID_MARKER" 2>/dev/null || echo "")
+  fi
+  if [ -z "${KISEKI_RUN_ID:-}" ]; then
+    KISEKI_RUN_ID=$(date +%Y%m%d-%H%M%S)
+    echo "$KISEKI_RUN_ID" > "$RUN_ID_MARKER" 2>/dev/null || true
+  fi
+  export KISEKI_RUN_ID
+fi
+# Legacy compatibility: some downstream tooling still reads $RUN_TS.
+RUN_TS="$KISEKI_RUN_ID"
+RESULTS="/tmp/kiseki-perf-${KISEKI_PROFILE:-unknown}-${KISEKI_RUN_ID}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[1]:-$0}")" && pwd)"
 mkdir -p "$RESULTS"
 
@@ -56,6 +95,67 @@ node_ssh() {
   # scripts that contain single quotes (python -c '...').
   ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $SSH_KEY \
     "$SSH_USER@$host" "sudo bash -s" <<< "$*"
+}
+
+# ----------------------------------------------------------------------------
+# Bench-mode helpers (#134) — phases run against either the running
+# `docker compose -f docker-compose.3node.yml` (local mode) OR the GCP
+# perf cluster (gcp mode). The dispatch helpers below keep phase
+# scripts mode-agnostic.
+# ----------------------------------------------------------------------------
+
+# Resolve the operational mode. `auto` (default) detects by the
+# presence of /etc/kiseki-bench.env (only setup-bench-ctrl.sh writes
+# it). Operators can force a mode with `KISEKI_BENCH_MODE=local|gcp`.
+bench_mode() {
+  local mode="${KISEKI_BENCH_MODE:-auto}"
+  if [ "$mode" = "auto" ]; then
+    if [ -f /etc/kiseki-bench.env ]; then echo "gcp"; else echo "local"; fi
+  else
+    echo "$mode"
+  fi
+}
+
+# Run a command on a client. In gcp mode → node_ssh into the client
+# VM at `$CLIENT_ARRAY[idx]`. In local mode → run on the current host
+# (the "client" is loopback). Command is taken from stdin so callers
+# can pipe a heredoc without quoting hell.
+client_run() {
+  local idx=$1
+  if [ "$(bench_mode)" = "gcp" ]; then
+    local cip="${CLIENT_ARRAY[$idx]}"
+    # node_ssh reads from stdin; just pass it through.
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $SSH_KEY \
+      "$SSH_USER@$cip" "sudo bash -s"
+  else
+    # Local mode: stdin → bash. Same shape as node_ssh's redirected
+    # stdin so phase scripts work unmodified.
+    bash -s
+  fi
+}
+
+# Resolve the leader's S3 / NFS / native endpoints as URLs the
+# bench/curl/mount commands can dial directly. In gcp mode these are
+# the leader's internal-network IPs (10.0.0.X); in local mode they
+# default to 127.0.0.1 with the docker compose port mapping.
+leader_endpoints() {
+  local mode
+  mode=$(bench_mode)
+  if [ "$mode" = "gcp" ]; then
+    LEADER_S3_URL="${LEADER_S3:-http://$LEADER_HOST:9000}"
+    LEADER_NFS_HOSTPORT="$LEADER_HOST:2049"
+    LEADER_NATIVE_URL="kiseki://$LEADER_HOST:9103"
+    LEADER_METRICS_URL="http://$LEADER_HOST:9090"
+  else
+    # docker-compose.3node.yml maps node1's 9000/2049/9103/9090 to
+    # the host's same ports. discover_leader's LEADER_HOST is the
+    # container's internal hostname (kiseki-node1) which doesn't
+    # resolve from the host network, so we override.
+    LEADER_S3_URL="${KISEKI_LOCAL_S3_URL:-http://127.0.0.1:9000}"
+    LEADER_NFS_HOSTPORT="${KISEKI_LOCAL_NFS_HOSTPORT:-127.0.0.1:2049}"
+    LEADER_NATIVE_URL="${KISEKI_LOCAL_NATIVE_URL:-kiseki://127.0.0.1:9103}"
+    LEADER_METRICS_URL="${KISEKI_LOCAL_METRICS_URL:-http://127.0.0.1:9090}"
+  fi
 }
 
 # ----------------------------------------------------------------------------

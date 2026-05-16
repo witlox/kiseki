@@ -89,6 +89,7 @@ fn main() {
         "namespaces" => handle_namespaces(&args[2..]),
         "quota" => handle_quota(&args[2..]),
         "topology" => handle_topology(&args[2..]),
+        "bench" => handle_bench(&args[2..]),
         "version" | "--version" | "-V" => {
             println!("kiseki-client {}", env!("CARGO_PKG_VERSION"));
         }
@@ -117,6 +118,7 @@ COMMANDS:
     namespaces  List namespaces this client is authorized for
     quota       Show this tenant's quota usage
     topology    Show the client's local topology cache
+    bench       Drive PUT/GET workload against an external cluster
     version     Print version
     help        Print this help
 
@@ -895,6 +897,150 @@ fn handle_topology(args: &[String]) {
             std::process::exit(1);
         }
     }
+}
+
+/// `kiseki-client bench` — drive PUT/GET against an externally-running
+/// cluster. Closes #58 (no `kiseki-client bench` command for native).
+///
+/// Output format mirrors `kiseki-profile run`'s human / `--json`
+/// shapes so numbers compare directly across the two tools.
+#[cfg(any(feature = "native", feature = "remote-http"))]
+#[allow(clippy::too_many_lines)] // hand-rolled flag parser + 7 flags + help
+fn handle_bench(args: &[String]) {
+    use kiseki_client::bench::{BenchConfig, NativeBinding, Shape};
+
+    let mut endpoint: Option<String> = None;
+    let mut shape = Shape::PutHeavy;
+    let mut binding = NativeBinding::Tcp;
+    let mut concurrency: usize = 16;
+    let mut object_size: usize = 65_536;
+    let mut duration_secs: u64 = 30;
+    let mut warmup_objects: usize = 256;
+    let mut json = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--endpoint" => {
+                endpoint = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--shape" => {
+                shape = match args.get(i + 1).map(String::as_str) {
+                    Some("put-heavy") => Shape::PutHeavy,
+                    Some("get-heavy") => Shape::GetHeavy,
+                    Some("mixed") => Shape::Mixed,
+                    other => {
+                        eprintln!("--shape expects put-heavy|get-heavy|mixed, got {other:?}");
+                        std::process::exit(1);
+                    }
+                };
+                i += 2;
+            }
+            "--binding" => {
+                binding = match args.get(i + 1).map(String::as_str) {
+                    Some("tcp") => NativeBinding::Tcp,
+                    Some("grpc") => NativeBinding::Grpc,
+                    other => {
+                        eprintln!("--binding expects tcp|grpc, got {other:?}");
+                        std::process::exit(1);
+                    }
+                };
+                i += 2;
+            }
+            "--concurrency" => {
+                concurrency = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(concurrency);
+                i += 2;
+            }
+            "--object-size" => {
+                object_size = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(object_size);
+                i += 2;
+            }
+            "--duration-secs" => {
+                duration_secs = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(duration_secs);
+                i += 2;
+            }
+            "--warmup-objects" => {
+                warmup_objects = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(warmup_objects);
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "\
+kiseki-client bench -- drive PUT/GET against an externally-running cluster
+
+OPTIONS:
+    --endpoint <url>          REQUIRED. kiseki://host:9103 (native TCP-framed)
+                              or kiseki://host:9100 (with --binding grpc) or
+                              http(s)://host:9000 (S3 listener)
+    --shape <s>               put-heavy | get-heavy | mixed     (default: put-heavy)
+    --binding <b>             tcp | grpc       (default: tcp; only for kiseki://)
+    --concurrency <N>         in-flight ops    (default: 16)
+    --object-size <bytes>     payload size     (default: 65536)
+    --duration-secs <N>       wall-clock cap   (default: 30)
+    --warmup-objects <N>      pre-populate for GET shapes (default: 256)
+    --json                    machine-readable single-line JSON
+"
+                );
+                return;
+            }
+            other => {
+                eprintln!("unknown bench arg: {other}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let Some(endpoint) = endpoint else {
+        eprintln!("--endpoint is required (try `kiseki-client bench --help`)");
+        std::process::exit(1);
+    };
+
+    let cfg = BenchConfig {
+        endpoint,
+        binding,
+        shape,
+        concurrency,
+        object_size,
+        duration: std::time::Duration::from_secs(duration_secs),
+        warmup_objects,
+        json,
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("kiseki-bench")
+        .build()
+        .expect("tokio runtime");
+    if let Err(e) = rt.block_on(kiseki_client::bench::run(cfg)) {
+        eprintln!("bench failed: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(any(feature = "native", feature = "remote-http")))]
+fn handle_bench(_args: &[String]) {
+    eprintln!(
+        "bench requires the `native` and/or `remote-http` feature; \
+         rebuild kiseki-client with --features native,remote-http"
+    );
+    std::process::exit(1);
 }
 
 // --- HTTP helpers (stdlib only, mirrors kiseki-admin's helpers) ---

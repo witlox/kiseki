@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+#
+# bench — phase-per-file perf-suite driver.
+#
+# Closes #55 (the wrapper part): replaces the monolithic perf-suite.sh
+# with a driver that runs one phase script at a time, all phases
+# sharing a single $RESULTS dir via $KISEKI_RUN_ID.
+#
+# USAGE
+#   bench list                  # list available phases
+#   bench run <name>            # run a single phase (exact or prefix)
+#   bench run <a>..<b>          # run a contiguous range (sorted phase names)
+#   bench run all               # run every phase in sorted order
+#   bench run all --new-run     # roll a fresh KISEKI_RUN_ID first
+#   bench results               # print the resolved $RESULTS dir
+#   bench reset                 # delete the run-id marker (next run starts fresh)
+#
+# Phase scripts live under phases/<NN-name>.sh, where NN is a 2-digit
+# ordinal that defines list/all ordering. Each phase sources
+# ./perf-common.sh to inherit $RESULTS, $ALL_STORAGE, $LEADER_*, etc.
+# Standard exit codes:
+#   0   — phase completed (perf numbers may be poor; check the body)
+#   1   — phase script error (logic bug)
+#   2   — phase detected a wedge / functional break and halted
+#
+# A non-zero exit from `bench run all` stops the run; the remaining
+# phases are deferred so a single wedge doesn't poison everything.
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PHASES_DIR="$SCRIPT_DIR/phases"
+RUN_ID_MARKER="${KISEKI_RUN_ID_MARKER:-/tmp/kiseki-bench-runid}"
+
+list_phases() {
+  if [ ! -d "$PHASES_DIR" ]; then
+    echo "ERROR: phases dir missing at $PHASES_DIR" >&2
+    exit 1
+  fi
+  # Sorted by filename. Phases are 2-digit prefixed so lex sort = run order.
+  find "$PHASES_DIR" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null \
+    | sort \
+    | sed 's/\.sh$//'
+}
+
+# Resolve a user-typed phase token against the available phases:
+# - exact filename match (sans .sh)
+# - unique prefix match
+# Stdout: the resolved phase name on success.
+# Exit 1 on no-match / ambiguous match.
+resolve_phase() {
+  local query=$1
+  local matches
+  matches=$(list_phases | grep -E "^${query}(-|\$)|^${query}\$" || true)
+  local count
+  count=$(echo "$matches" | grep -c . || true)
+  case "$count" in
+    1) echo "$matches" ;;
+    0)
+      echo "ERROR: no phase matches '$query'. Available:" >&2
+      list_phases | sed 's/^/  /' >&2
+      return 1
+      ;;
+    *)
+      echo "ERROR: '$query' is ambiguous; matches:" >&2
+      echo "$matches" | sed 's/^/  /' >&2
+      return 1
+      ;;
+  esac
+}
+
+# Roll a fresh KISEKI_RUN_ID by deleting the marker. The next
+# perf-common.sh source will generate a new id + persist it.
+new_run() {
+  rm -f "$RUN_ID_MARKER"
+}
+
+# Bring up KISEKI_RUN_ID + create $RESULTS by sourcing perf-common.sh.
+# Done in a sub-shell so the caller's env stays clean. Stdout: the
+# resolved $RESULTS path.
+resolve_results_dir() {
+  (
+    # perf-common.sh's env-load is fatal if /etc/kiseki-bench.env is
+    # missing; for `bench results` to work pre-cluster we tolerate
+    # that and fall back to the path shape directly.
+    if [ -f /etc/kiseki-bench.env ] || [ -f "${KISEKI_BENCH_ENV:-}" ]; then
+      # shellcheck disable=SC1091
+      source "$SCRIPT_DIR/perf-common.sh" >/dev/null 2>&1 || true
+      echo "$RESULTS"
+    else
+      local id="${KISEKI_RUN_ID:-$(cat "$RUN_ID_MARKER" 2>/dev/null || echo unknown)}"
+      echo "/tmp/kiseki-perf-${KISEKI_PROFILE:-unknown}-${id}"
+    fi
+  )
+}
+
+run_phase() {
+  local name=$1
+  local script="$PHASES_DIR/${name}.sh"
+  if [ ! -x "$script" ]; then
+    if [ ! -f "$script" ]; then
+      echo "ERROR: phase script not found: $script" >&2
+      return 1
+    fi
+    chmod +x "$script" 2>/dev/null || true
+  fi
+  echo "=== phase: $name ==="
+  bash "$script"
+  local rc=$?
+  case $rc in
+    0) echo "=== phase: $name OK ===" ;;
+    2) echo "=== phase: $name HALTED (wedge / functional break) ===" >&2 ;;
+    *) echo "=== phase: $name FAILED (rc=$rc) ===" >&2 ;;
+  esac
+  return $rc
+}
+
+run_range() {
+  # Expand `a..b` into the sorted list of phases between (inclusive).
+  local lo=$1 hi=$2
+  local all
+  all=$(list_phases)
+  echo "$all" | awk -v lo="$lo" -v hi="$hi" '
+    $0 == lo || index($0, lo "-") == 1 { active = 1 }
+    active { print }
+    $0 == hi || index($0, hi "-") == 1 { exit }
+  '
+}
+
+cmd_list() {
+  list_phases
+}
+
+cmd_run() {
+  local new_run_flag=0
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --new-run) new_run_flag=1 ;;
+      *)         args+=("$a") ;;
+    esac
+  done
+  set -- "${args[@]}"
+  if [ "$new_run_flag" = 1 ]; then new_run; fi
+
+  if [ $# -eq 0 ]; then
+    echo "Usage: bench run <phase>|<a>..<b>|all [--new-run]" >&2
+    exit 1
+  fi
+
+  local target=$1
+  local to_run=()
+  if [ "$target" = "all" ]; then
+    mapfile -t to_run < <(list_phases)
+  elif [[ "$target" == *..* ]]; then
+    local lo="${target%%..*}" hi="${target##*..}"
+    lo=$(resolve_phase "$lo") || exit 1
+    hi=$(resolve_phase "$hi") || exit 1
+    mapfile -t to_run < <(run_range "$lo" "$hi")
+  else
+    local resolved
+    resolved=$(resolve_phase "$target") || exit 1
+    to_run=("$resolved")
+  fi
+
+  echo "Run id:    $(cat "$RUN_ID_MARKER" 2>/dev/null || echo '(will be assigned by phase)')"
+  echo "Results:   $(resolve_results_dir)"
+  echo "Phases:    ${to_run[*]}"
+  echo ""
+
+  for name in "${to_run[@]}"; do
+    run_phase "$name"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+      echo "" >&2
+      echo "Halting run; remaining phases deferred. Investigate before continuing:" >&2
+      printf '  %s\n' "${to_run[@]}" | grep -A 100 "^  $name" | tail -n +2 >&2
+      exit $rc
+    fi
+  done
+}
+
+cmd_results() {
+  resolve_results_dir
+}
+
+cmd_reset() {
+  if [ -f "$RUN_ID_MARKER" ]; then
+    echo "Removing run-id marker: $(cat "$RUN_ID_MARKER")"
+    rm -f "$RUN_ID_MARKER"
+  else
+    echo "No marker to remove (next run will create one)."
+  fi
+}
+
+cmd_help() {
+  sed -n '/^# bench —/,/^set -o pipefail/{/^set -o pipefail/!p}' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-help}" in
+  list) shift; cmd_list "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  results) cmd_results ;;
+  reset) cmd_reset ;;
+  help|-h|--help) cmd_help ;;
+  *)
+    echo "Unknown command: $1" >&2
+    cmd_help >&2
+    exit 1
+    ;;
+esac

@@ -45,6 +45,13 @@ pub mod native;
 #[cfg(feature = "native")]
 pub mod native_remote;
 
+/// Bench driver — drives PUT/GET against an externally-running
+/// kiseki cluster. The `kiseki-client bench` subcommand uses this
+/// (see [`crate::bench::run`]). Only compiled when at least one of
+/// `native` or `remote-http` is enabled.
+#[cfg(any(feature = "native", feature = "remote-http"))]
+pub mod bench;
+
 #[cfg(feature = "ffi")]
 #[allow(missing_docs, unsafe_code, clippy::missing_safety_doc)]
 pub mod ffi;

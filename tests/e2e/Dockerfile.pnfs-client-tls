@@ -47,5 +47,8 @@ private_key=/tls/client.key
 peerid=
 EOF
 
-ENTRYPOINT ["/bin/bash", "-c"]
-CMD ["echo 'kiseki-pnfs-client-tls: provide a command'"]
+# Closes #57 (sibling Dockerfile.pnfs-client): exec-form CMD with
+# empty ENTRYPOINT so `docker run <image> <cmd> <args>...` works
+# without an `--entrypoint` override.
+ENTRYPOINT []
+CMD ["echo", "kiseki-pnfs-client-tls: provide a command"]
