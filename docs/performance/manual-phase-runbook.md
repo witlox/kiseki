@@ -32,7 +32,7 @@ per-phase log capture.
         bash /src/.gcp-build/build.sh
 
   Upload with `gcloud storage cp .gcp-build/dist/kiseki-{server,client}-x86_64.tar.gz gs://kiseki-bench-binaries-pwitlox-20260502/`.
-- **Benchmark scripts are staged**: `bash .gcp-build/stage-benchmarks.sh`
+- **Benchmark scripts are staged**: `bash infra/gcp/scripts/stage-benchmarks.sh`
   packages `infra/gcp/benchmarks/` into a tarball and uploads it
   alongside the binaries. `setup-bench-ctrl.sh` fetches it on boot
   and lands `bench`, `perf-common.sh`, `phases/`, etc. at
