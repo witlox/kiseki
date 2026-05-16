@@ -204,6 +204,11 @@ async fn reply_getattr<G: GatewayOps>(
             let ftype = match attrs.file_type {
                 crate::nfs_ops::FileType::Regular => 1u32,
                 crate::nfs_ops::FileType::Directory => 2u32,
+                // NF3LNK per RFC 1813 §2.5 — closes the type-propagation
+                // side of the symlink path (#53). Without it the kernel
+                // saw symlinks as regular files and called READ instead
+                // of READLINK.
+                crate::nfs_ops::FileType::Symlink => 5u32,
             };
             w.write_u32(ftype);
             w.write_u32(attrs.mode);
@@ -938,6 +943,7 @@ async fn reply_pathconf<G: GatewayOps>(
     let ftype = match attrs.file_type {
         crate::nfs_ops::FileType::Regular => 1u32,
         crate::nfs_ops::FileType::Directory => 2u32,
+        crate::nfs_ops::FileType::Symlink => 5u32,
     };
     w.write_u32(ftype);
     w.write_u32(attrs.mode);
