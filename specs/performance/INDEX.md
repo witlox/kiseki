@@ -21,6 +21,7 @@ catch regressions.
 
 | Date | HEAD | Hardware | One-line takeaway |
 |---|---|---|---|
+| [2026-05-16 local matrix](2026-05-16-local-matrix.md) | `162c55e` + uncommitted READLINK / LOCK / CREATE_SESSION wire fixes | dev workstation 16c | NFS PUT ceiling lifted ~9× (5 k → 42–49 k) — `name_for` O(N²) hot path is gone. pNFS GET recovered 4.3× (17 k → 77 k). Native TCP 55 k PUT / 147 k GET — **A-NG11 PUT gate at 99 %, GET clears 1.84×**. gRPC binding ~2–3× slower. Zero functional breaks across all 21 combos. |
 | [2026-05-15 evening — compact PARTIAL](2026-05-15-gcp-compact-evening-partial.md) | main `defd8c3` (post-sweep) | 3 × c3-standard-44-lssd + 2 × c3-standard-44 (europe-west1-b) | Phase 4 wedged on composition hydrator backlog. iperf3 46.3 Gbps ✓, S3 PUT 1 KB p50 2.5 ms, S3 16∥ 726 MB/s, FUSE create() = EIO, NFS not measured. F-1 (hydrator) + F-2 (FUSE RO default) to file. |
 | [2026-05-15 morning — compact](2026-05-15-gcp-compact.md) | `v2026.43.759` (`f6f6e5b`) | 3 × c3-standard-44-lssd + 2 × c3-standard-44 (europe-west1-b) | First post-libfuse-swap GCP run. NFSv4.2 1.71 GB/s aggregate, S3 PUT 673-1094 MB/s, S3 GET 1170 MB/s. Surfaced GH #36 (chunk-fill), #37 (FUSE O_DIRECT), #38 (EC-4+2 cap). |
 | [2026-05-09 libfuse-swap](2026-05-09-libfuse-swap.md) | `527c2e6` (single) / `da45687` (multi) | dev workstation 16c | FUSE GET +25% on the multi-thread libfuse loop; NFSv4.1 read 0.5 MB/s → 923 MB/s after disabling pNFS layout advertisement on the 3-node compose. |
