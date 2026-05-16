@@ -53,6 +53,8 @@ pub fn admin_extra_routes() -> Router<UiState> {
     Router::new()
         // --- Topology tab ---
         .route("/admin/topology/shards", get(api_topology_shards))
+        .route("/admin/topology/shards/split", post(api_split_shard))
+        .route("/admin/topology/shards/merge", post(api_merge_shards))
         .route("/admin/topology/forwarding", get(api_topology_forwarding))
         .route(
             "/ui/fragment/topology-shards",
@@ -108,6 +110,236 @@ async fn api_topology_shards(State(state): State<UiState>) -> impl IntoResponse 
         "node_id": state.node_info.node_id,
         "shards": shards,
     }))
+}
+
+/// Resolve the local node's data-port URL (`http://127.0.0.1:PORT`)
+/// from `KISEKI_DATA_ADDR`, defaulting to 9100. The split/merge
+/// bridges below dial this URL to invoke the local
+/// `StorageAdminService` gRPC.
+fn local_data_endpoint_url() -> String {
+    let data_addr = std::env::var("KISEKI_DATA_ADDR").unwrap_or_else(|_| "0.0.0.0:9100".into());
+    let port = data_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(9100);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Map a tonic `Status` to the right HTTP code + JSON body. Mirrors
+/// the kiseki-storage CLI's status formatter so HTTP and CLI users
+/// see consistent error shapes.
+fn grpc_status_to_http(status: &tonic::Status) -> axum::http::StatusCode {
+    use axum::http::StatusCode;
+    match status.code() {
+        tonic::Code::NotFound => StatusCode::NOT_FOUND,
+        tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+        tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
+        tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Connect to the local data-port gRPC service. Single-shot (no
+/// pool) — split/merge are rare admin ops.
+async fn dial_local_storage_admin(
+) -> Result<tonic::transport::Channel, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    use axum::http::StatusCode;
+    let endpoint_url = local_data_endpoint_url();
+    let endpoint = tonic::transport::Endpoint::from_shared(endpoint_url.clone())
+        .map(|e| e.timeout(std::time::Duration::from_secs(30)))
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": format!("invalid local data endpoint ({endpoint_url}): {err}"),
+                })),
+            )
+        })?;
+    endpoint.connect().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({
+                "error": format!("connect to local data port: {err}"),
+                "endpoint": endpoint_url,
+            })),
+        )
+    })
+}
+
+/// `POST /admin/topology/shards/split` — split a shard via the
+/// `StorageAdminService.SplitShard` gRPC on the local node's data
+/// port. Closes #59 by exposing the existing ADR-033 §4 hook over
+/// HTTP so the `kiseki-admin shard split` CLI (stdlib-only HTTP)
+/// can drive multi-shard topology mutations without a tonic
+/// dependency.
+///
+/// Body: `{"shard_id": "<uuid>", "pivot_key": "<32-hex>"?}`. Empty
+/// `pivot_key` lets the gRPC handler default to the source range's
+/// midpoint (the common case for operator-initiated splits).
+///
+/// All leader-forwarding + 15 s retry semantics live in the gRPC
+/// handler (`storage_admin::split_shard`); this is a thin HTTP →
+/// gRPC bridge.
+async fn api_split_shard(
+    State(state): State<UiState>,
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    use kiseki_proto::v1::SplitShardRequest;
+
+    let parsed: serde_json::Value = if body.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!("invalid JSON body: {e}"),
+                    })),
+                );
+            }
+        }
+    };
+    let shard_id = parsed
+        .get("shard_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if shard_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "shard_id is required",
+            })),
+        );
+    }
+    let pivot_key = parsed
+        .get("pivot_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+
+    match client
+        .split_shard(SplitShardRequest {
+            shard_id: shard_id.clone(),
+            pivot_key,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let r = resp.into_inner();
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "node_id": state.node_info.node_id,
+                    "source_shard_id": shard_id,
+                    "left_shard_id": r.left_shard_id,
+                    "right_shard_id": r.right_shard_id,
+                    "committed_at_log_index": r.committed_at_log_index,
+                })),
+            )
+        }
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({
+                "error": status.message().to_string(),
+                "grpc_code": format!("{:?}", status.code()),
+            })),
+        ),
+    }
+}
+
+/// `POST /admin/topology/shards/merge` — merge two adjacent shards
+/// via `StorageAdminService.MergeShards`. The `left` shard's range
+/// expands to cover `right`'s; `right` is retired (ADR-033 §4).
+///
+/// Body: `{"left_shard_id": "<uuid>", "right_shard_id": "<uuid>"}`.
+async fn api_merge_shards(
+    State(state): State<UiState>,
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    use kiseki_proto::v1::MergeShardsRequest;
+
+    let parsed: serde_json::Value = if body.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!("invalid JSON body: {e}"),
+                    })),
+                );
+            }
+        }
+    };
+    let left_shard_id = parsed
+        .get("left_shard_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let right_shard_id = parsed
+        .get("right_shard_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if left_shard_id.is_empty() || right_shard_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "left_shard_id and right_shard_id are required",
+            })),
+        );
+    }
+
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+
+    match client
+        .merge_shards(MergeShardsRequest {
+            left_shard_id: left_shard_id.clone(),
+            right_shard_id: right_shard_id.clone(),
+        })
+        .await
+    {
+        Ok(resp) => {
+            let r = resp.into_inner();
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "node_id": state.node_info.node_id,
+                    "left_shard_id": left_shard_id,
+                    "right_shard_id": right_shard_id,
+                    "merged_shard_id": r.merged_shard_id,
+                    "committed_at_log_index": r.committed_at_log_index,
+                })),
+            )
+        }
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({
+                "error": status.message().to_string(),
+                "grpc_code": format!("{:?}", status.code()),
+            })),
+        ),
+    }
 }
 
 async fn api_topology_forwarding(State(state): State<UiState>) -> impl IntoResponse {

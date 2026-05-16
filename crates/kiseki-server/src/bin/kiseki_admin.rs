@@ -517,6 +517,24 @@ enum Command {
     Version,
     /// `shards` — per-shard leader map (mirrors `/cluster/info` shards).
     Shards,
+    /// `shard split <id> [--pivot HEX]` — split a shard via the
+    /// `StorageAdminService.SplitShard` hook (ADR-033 §4). Closes #59.
+    /// The HTTP route on the metrics port (`/admin/topology/shards/split`)
+    /// bridges into the gRPC service on the local data port; leader
+    /// forwarding + 15 s retry semantics live in the gRPC handler.
+    ShardSplit {
+        shard_id: String,
+        /// Optional 32-byte pivot key as 64-char hex. Empty = use
+        /// the source range's midpoint (most common case).
+        pivot_key: String,
+    },
+    /// `shard merge <left> <right>` — merge two adjacent shards via
+    /// `StorageAdminService.MergeShards`. The `left` shard's range
+    /// expands to cover `right`'s; `right` is retired (ADR-033 §4).
+    ShardMerge {
+        left_shard_id: String,
+        right_shard_id: String,
+    },
     /// `forwarding` — proxy + stale-leader counters per node.
     Forwarding,
     /// `audit query [--tenant T] [--type X] [--limit N] [--from S] [--local-only]`
@@ -603,6 +621,8 @@ fn print_usage() {
          \x20 backup                         Trigger a backup\n\
          \x20 scrub                          Trigger an integrity scrub\n\
          \x20 shards                         Per-shard leader map (ADR-008 rev 2)\n\
+         \x20 shard split <id> [--pivot HEX]  Split a shard (ADR-033 §4)\n\
+         \x20 shard merge <left> <right>      Merge two adjacent shards\n\
          \x20 forwarding                     Proxy + stale-leader counters\n\
          \x20 tenant list [--type org|project|workload|namespace]\n\
          \x20 tenant create-org <name>\n\
@@ -729,6 +749,7 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
         "backup" => Ok(Command::Backup),
         "scrub" => Ok(Command::Scrub),
         "shards" => Ok(Command::Shards),
+        "shard" => parse_shard(&args[i..]),
         "forwarding" => Ok(Command::Forwarding),
         "audit" => parse_audit(&args[i..]),
         "tenant" => parse_tenant(&args[i..]),
@@ -739,6 +760,59 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+fn parse_shard(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .ok_or("shard requires a subcommand (split|merge)")?;
+    match sub.as_str() {
+        "split" => {
+            let shard_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("shard split requires <shard-id> (a UUID)")?;
+            let mut pivot_key = String::new();
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--pivot" | "--split-key" => {
+                        i += 1;
+                        pivot_key = rest
+                            .get(i)
+                            .cloned()
+                            .ok_or("--pivot requires a 64-char hex value")?;
+                    }
+                    other => return Err(format!("unknown shard split flag: {other}")),
+                }
+                i += 1;
+            }
+            Ok(Command::ShardSplit {
+                shard_id,
+                pivot_key,
+            })
+        }
+        "merge" => {
+            let left_shard_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("shard merge requires <left-shard-id> <right-shard-id>")?;
+            let right_shard_id = rest
+                .get(2)
+                .cloned()
+                .ok_or("shard merge requires <right-shard-id> as second arg")?;
+            if rest.len() > 3 {
+                return Err(format!("unknown shard merge args: {:?}", &rest[3..]));
+            }
+            Ok(Command::ShardMerge {
+                left_shard_id,
+                right_shard_id,
+            })
+        }
+        other => Err(format!(
+            "unknown shard subcommand: {other} (try: shard split | shard merge)"
+        )),
     }
 }
 
@@ -1097,6 +1171,40 @@ fn main() {
                 format_shards(&b)
             }
         }),
+        Command::ShardSplit {
+            shard_id,
+            pivot_key,
+        } => {
+            let body = format!(
+                "{{\"shard_id\":\"{}\",\"pivot_key\":\"{}\"}}",
+                json_escape(&shard_id),
+                json_escape(&pivot_key)
+            );
+            http_post(&args.endpoint, "/admin/topology/shards/split", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format_shard_split(&b)
+                }
+            })
+        }
+        Command::ShardMerge {
+            left_shard_id,
+            right_shard_id,
+        } => {
+            let body = format!(
+                "{{\"left_shard_id\":\"{}\",\"right_shard_id\":\"{}\"}}",
+                json_escape(&left_shard_id),
+                json_escape(&right_shard_id)
+            );
+            http_post(&args.endpoint, "/admin/topology/shards/merge", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format_shard_merge(&b)
+                }
+            })
+        }
         Command::Forwarding => http_get(&args.endpoint, "/admin/topology/forwarding").map(|b| {
             if json {
                 b
@@ -1397,6 +1505,32 @@ fn confirm_destructive(message: &str, target: &str) -> bool {
         return false;
     }
     line.trim() == target
+}
+
+fn format_shard_split(body: &str) -> String {
+    let source = json_str(body, "source_shard_id").unwrap_or("?");
+    let left = json_str(body, "left_shard_id").unwrap_or("?");
+    let right = json_str(body, "right_shard_id").unwrap_or("?");
+    let idx = json_u64(body, "committed_at_log_index").unwrap_or(0);
+    if let Some(err) = json_str(body, "error") {
+        return format!("Shard split failed: {err}\n");
+    }
+    format!(
+        "Shard split:\n  source: {source}\n  left:   {left}\n  right:  {right}\n  log_index: {idx}\n"
+    )
+}
+
+fn format_shard_merge(body: &str) -> String {
+    let left = json_str(body, "left_shard_id").unwrap_or("?");
+    let right = json_str(body, "right_shard_id").unwrap_or("?");
+    let merged = json_str(body, "merged_shard_id").unwrap_or("?");
+    let idx = json_u64(body, "committed_at_log_index").unwrap_or(0);
+    if let Some(err) = json_str(body, "error") {
+        return format!("Shard merge failed: {err}\n");
+    }
+    format!(
+        "Shard merge:\n  left:   {left}\n  right:  {right} (retired)\n  merged: {merged}\n  log_index: {idx}\n"
+    )
 }
 
 fn format_shards(body: &str) -> String {
@@ -1710,6 +1844,64 @@ mod tests {
     }
 
     // --- D3: nested tenant CRUD ----------------------------------------
+
+    // --- #59: shard split parser ---------------------------------------
+
+    #[test]
+    fn shard_split_requires_id_and_optionally_takes_pivot() {
+        // Bare `shard split <id>` — no pivot key.
+        let cmd = parse(&["shard", "split", "abc-uuid"]).expect("bare id");
+        match cmd {
+            Command::ShardSplit {
+                shard_id,
+                pivot_key,
+            } => {
+                assert_eq!(shard_id, "abc-uuid");
+                assert!(pivot_key.is_empty(), "no --pivot → empty pivot_key");
+            }
+            _ => panic!("expected ShardSplit"),
+        }
+        // With --pivot
+        let pivot = "7f".repeat(32);
+        let cmd = parse(&["shard", "split", "abc-uuid", "--pivot", &pivot]).expect("with pivot");
+        match cmd {
+            Command::ShardSplit {
+                shard_id,
+                pivot_key,
+            } => {
+                assert_eq!(shard_id, "abc-uuid");
+                assert_eq!(pivot_key.len(), 64);
+            }
+            _ => panic!("expected ShardSplit"),
+        }
+        // Missing id → error
+        assert!(parse(&["shard", "split"]).is_err());
+        // Unknown flag
+        assert!(parse(&["shard", "split", "abc-uuid", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn shard_merge_requires_two_ids() {
+        let cmd = parse(&["shard", "merge", "left-uuid", "right-uuid"]).expect("merge");
+        match cmd {
+            Command::ShardMerge {
+                left_shard_id,
+                right_shard_id,
+            } => {
+                assert_eq!(left_shard_id, "left-uuid");
+                assert_eq!(right_shard_id, "right-uuid");
+            }
+            _ => panic!("expected ShardMerge"),
+        }
+        // Missing both
+        assert!(parse(&["shard", "merge"]).is_err());
+        // Missing right
+        assert!(parse(&["shard", "merge", "left-uuid"]).is_err());
+        // Extra args
+        assert!(parse(&["shard", "merge", "left-uuid", "right-uuid", "extra"]).is_err());
+        // Unknown shard subcommand
+        assert!(parse(&["shard", "rebalance", "x"]).is_err());
+    }
 
     #[test]
     fn tenant_create_project_requires_org_and_name() {
