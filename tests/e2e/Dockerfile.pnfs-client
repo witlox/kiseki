@@ -26,5 +26,14 @@ RUN apt-get update \
 # tlshd needs to be running for `xprtsec=mtls` mounts to complete
 # the TLS handshake. The pNFS test harness invokes the entrypoint
 # with explicit commands, so we keep CMD as a no-op.
-ENTRYPOINT ["/bin/bash", "-c"]
-CMD ["echo 'kiseki-pnfs-client: provide a command'"]
+#
+# Closes #57. Previously `ENTRYPOINT ["/bin/bash", "-c"]` ate
+# argument-style invocations: `docker run <image> /bin/sh -c '...'`
+# became `bash -c /bin/sh -c '...'`, where bash only consumes the
+# first arg as the script and the rest become positional ($0, $1)
+# invisible to the implicit shell — every command vanished with
+# rc=0. Use exec-form CMD so `docker run <image> <cmd> <args>...`
+# works as users expect, while still printing a helpful default
+# when no command is passed.
+ENTRYPOINT []
+CMD ["echo", "kiseki-pnfs-client: provide a command"]
