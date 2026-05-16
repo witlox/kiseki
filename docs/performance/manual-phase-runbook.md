@@ -32,6 +32,12 @@ per-phase log capture.
         bash /src/.gcp-build/build.sh
 
   Upload with `gcloud storage cp .gcp-build/dist/kiseki-{server,client}-x86_64.tar.gz gs://kiseki-bench-binaries-pwitlox-20260502/`.
+- **Benchmark scripts are staged**: `bash .gcp-build/stage-benchmarks.sh`
+  packages `infra/gcp/benchmarks/` into a tarball and uploads it
+  alongside the binaries. `setup-bench-ctrl.sh` fetches it on boot
+  and lands `bench`, `perf-common.sh`, `phases/`, etc. at
+  `/opt/kiseki-bench/` (#54). Without this, the bench-ctrl boots with
+  an empty results dir and the operator has to ssh-tee scripts up.
 - **Local wire smoke passes**: `docker compose -f docker-compose.3node.yml up -d --wait`
   followed by a kernel `mount -t nfs4 -o vers=4.2 kiseki-node1:/ /mnt/test`
   from the `kiseki-pnfs-client:test` image. If mount fails, the wire

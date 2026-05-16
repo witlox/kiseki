@@ -39,8 +39,36 @@ if [ -f /tmp/kiseki-server.tar.gz ]; then
   tar xzf /tmp/kiseki-server.tar.gz -C /usr/local/bin/ kiseki-admin 2>/dev/null || true
 fi
 
-# Create benchmark directory
+# Closes #54: stage the benchmark scripts.
+#
+# Pre-fix /opt/kiseki-bench/ shipped EMPTY except for results/, so
+# every fresh GCP cluster needed the operator to tee perf-common.sh
+# and perf-suite.sh up over ssh before any phase could run. The
+# 2026-05-16 run wasted ~15 min on this dance.
+#
+# The benchmarks tarball is uploaded to the same staging bucket
+# (binary_url_base) as the kiseki binaries — same operator workflow,
+# same `gcloud storage cp` step. The `bench`/perf-common.sh path
+# closes the loop with the per-phase / sticky-RUN_ID work in #55.
 mkdir -p /opt/kiseki-bench/results
+wget -q "${binary_url_base}/benchmarks.tar.gz" -O /tmp/benchmarks.tar.gz 2>/dev/null || true
+if [ -s /tmp/benchmarks.tar.gz ]; then
+  tar xzf /tmp/benchmarks.tar.gz -C /opt/kiseki-bench/ 2>&1 | tail -5
+  # Make the driver + every phase executable. The tarball preserves
+  # mode bits from the source tree, but some operators upload via
+  # tools that strip exec bits (e.g. gsutil-as-windows), so be
+  # defensive here.
+  chmod +x /opt/kiseki-bench/bench 2>/dev/null || true
+  chmod +x /opt/kiseki-bench/*.sh 2>/dev/null || true
+  chmod +x /opt/kiseki-bench/phases/*.sh 2>/dev/null || true
+  chmod +x /opt/kiseki-bench/tests/*.sh 2>/dev/null || true
+  echo "Benchmark scripts staged at /opt/kiseki-bench/"
+  ls /opt/kiseki-bench/ | sed 's/^/  /'
+else
+  echo "WARNING: benchmarks.tar.gz not found at ${binary_url_base}/" >&2
+  echo "         operators must upload it alongside the kiseki binaries," >&2
+  echo "         or scripts must be staged manually via ssh." >&2
+fi
 
 # Store cluster info — sourced by every perf-suite-*.sh and metrics-collector.sh
 cat > /etc/kiseki-bench.env <<EOF
