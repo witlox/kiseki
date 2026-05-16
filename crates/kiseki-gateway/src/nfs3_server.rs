@@ -313,13 +313,18 @@ async fn reply_write<G: GatewayOps>(
     // empty composition CREATE allocated.
     ctx.buffer_write(&fh, offset, &data);
 
-    // FILE_SYNC (2) and DATA_SYNC (1) require the data to be on
-    // stable storage before we ack. UNSTABLE (0) allows lazy flush
-    // on COMMIT — we still buffer the data either way.
-    if stable >= 1 && ctx.flush_writes(&fh).await.is_err() {
-        w.write_u32(status::NFS3ERR_IO);
-        return w.into_bytes();
-    }
+    // #50 fix: never inline-flush on stable >= 1. fio with
+    // `--direct=1` sets `stable=FILE_SYNC` on every WRITE; the
+    // pre-fix path turned each such WRITE into a `flush_writes` +
+    // Raft entry, which (a) hit `mem_gateway::create_at`'s
+    // idempotency no-op (silent data loss past the first WRITE)
+    // and (b) saturated the hydrator under sustained load (the
+    // 2026-05-16 GCP F-1 wedge). The accumulated buffer is flushed
+    // on `reply_commit` (the NFSv3 close-equivalent). Crash
+    // semantics match the eventual-durability posture documented
+    // in docs/operations/durability.md — same window as the
+    // composition flush interval.
+    let _ = stable;
 
     w.write_u32(status::NFS3_OK);
     // wcc_data (before + after attributes, both absent)
@@ -976,11 +981,18 @@ async fn reply_commit<G: GatewayOps>(
         return w.into_bytes();
     };
 
-    // Flush any UNSTABLE writes buffered for this handle. `flush_writes`
-    // returns `Ok(None)` if nothing was buffered — that's a fast path,
-    // not an error.
+    // Flush any buffered writes for this handle (#50: COMMIT is now
+    // the only flush trigger in NFSv3 since reply_write defers all
+    // stable >= 1 flushes here). `flush_writes` returns `Ok(None)`
+    // when there's no data or no growth since the previous flush —
+    // a fast path, not an error.
+    //
+    // After the flush, drop the per-fh buffer + flushed-length state
+    // so a long-running client that opens many files doesn't leak.
+    // NFSv3 has no CLOSE op, so COMMIT is the natural release point.
     match ctx.flush_writes(&fh).await {
         Ok(_) => {
+            ctx.release_buffer(&fh);
             w.write_u32(status::NFS3_OK);
             w.write_bool(false); // pre wcc
             w.write_bool(false); // post wcc

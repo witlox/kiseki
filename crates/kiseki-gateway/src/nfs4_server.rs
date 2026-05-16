@@ -2006,10 +2006,21 @@ async fn op_close<G: GatewayOps>(
     let _seqid = reader.read_u32().unwrap_or(0);
     let sid_bytes = reader.read_opaque_fixed(16).unwrap_or_default();
 
-    // Flush buffered writes before closing the file.
+    // Flush buffered writes before closing the file. #50 fix: this
+    // is the ONLY flush trigger in NFSv4 now (op_commit is a no-op),
+    // so all sustained-write traffic between OPEN and CLOSE
+    // collapses into a single gateway.write — one Raft entry, one
+    // composition, no hydrator backlog.
     if let Some(fh) = state.current_fh {
         if let Ok(Some((new_fh, _resp))) = ctx.flush_writes(&fh).await {
             state.current_fh = Some(new_fh);
+        }
+        // Drop the per-fh buffer + flushed-length state so the
+        // server's in-memory footprint doesn't grow unbounded with
+        // long-running clients that open many files. Safe to call
+        // even if there was no buffered data.
+        if let Some(fh) = state.current_fh {
+            ctx.release_buffer(&fh);
         }
     }
 
@@ -2448,19 +2459,27 @@ async fn op_create<G: GatewayOps>(
 
 async fn op_commit<G: GatewayOps>(
     reader: &mut XdrReader<'_>,
-    ctx: &NfsContext<G>,
-    state: &mut CompoundState,
+    _ctx: &NfsContext<G>,
+    _state: &mut CompoundState,
 ) -> (u32, Vec<u8>) {
     // RFC 8881 §18.3 COMMIT4args: offset(8) + count(4)
     let _offset = reader.read_u64().unwrap_or(0);
     let _count = reader.read_u32().unwrap_or(0);
 
-    // Flush buffered writes on COMMIT.
-    if let Some(fh) = state.current_fh {
-        if let Ok(Some((new_fh, _resp))) = ctx.flush_writes(&fh).await {
-            state.current_fh = Some(new_fh);
-        }
-    }
+    // #50 fix: COMMIT is a no-op for the flush path. Pre-fix this
+    // called `flush_writes` per COMMIT, which fio --direct=1 sends
+    // after every 1 MB WRITE — that turned each WRITE+COMMIT pair
+    // into a Raft entry + composition delta + hydrator apply. The
+    // 2nd+ deltas hit `mem_gateway::create_at`'s idempotency no-op
+    // and the new data was silently dropped, while the Raft/hydrator
+    // cost compounded into the 2026-05-16 GCP wedge.
+    //
+    // The accumulated buffer is now flushed exclusively on CLOSE
+    // (op_close), which collapses N WRITE+COMMIT pairs into one
+    // gateway.write call with the full file content. Durability
+    // window matches the rest of the eventual-durability posture
+    // (see docs/operations/durability.md): data committed within
+    // KISEKI_COMPOSITION_FLUSH_INTERVAL_MS of the CLOSE.
 
     let mut w = XdrWriter::new();
     w.write_u32(op::COMMIT);
