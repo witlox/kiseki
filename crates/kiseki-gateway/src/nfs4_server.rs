@@ -944,6 +944,10 @@ async fn op_getattr<G: GatewayOps>(
         let ftype = match attrs.file_type {
             crate::nfs_ops::FileType::Regular => 1u32,
             crate::nfs_ops::FileType::Directory => 2u32,
+            // NF4LNK per RFC 7530 §3.3.10 — closes #53's type-
+            // propagation side. The kernel uses this to decide READ
+            // vs READLINK on dentry resolution.
+            crate::nfs_ops::FileType::Symlink => 5u32,
         };
         attr_w.write_u32(ftype);
         result_word0 |= 1 << fattr4::TYPE;
@@ -2402,15 +2406,42 @@ async fn op_create<G: GatewayOps>(
     let mut w = XdrWriter::new();
     w.write_u32(op::CREATE);
 
+    // CREATE4resok wire encoding helper (RFC 7530 §16.4 + §3.3.3):
+    //   change_info4 cinfo { bool atomic; uint64 before; uint64 after; }
+    //   bitmap4      attrset { uint32 count; uint32 words<count>; }
+    //
+    // Closes #53: pre-fix the three branches below wrote just a 4-byte
+    // `bool false` instead of the full 20-byte change_info4. The kernel
+    // decoder then read the next 16 bytes (attrsset + downstream
+    // COMPOUND content) as the missing two u64s, mis-parsed the rest
+    // of the response, and surfaced the failure as EIO at the syscall
+    // (`ln -s ...` returned "Input/output error"). NF4REG also had the
+    // bug but Linux uses OPEN+OPEN_FLAG_CREATE for regular-file
+    // creation, so it never triggered in practice — fix all three
+    // arms for safety.
+    let write_create_resok = |w: &mut XdrWriter| {
+        w.write_u32(nfs4_status::NFS4_OK);
+        // cinfo: atomic=false (in-memory store gives no atomicity
+        // guarantee across the create + readdir), before/after=0
+        // (changeid4 sentinel; spec allows arbitrary values when the
+        // server doesn't track per-directory mtime as a monotonic
+        // counter — the kernel uses these for cache-coherence hints,
+        // not correctness).
+        w.write_bool(false); // atomic
+        w.write_u64(0); // before changeid4
+        w.write_u64(0); // after  changeid4
+                        // attrsset bitmap: empty — the server didn't materialize any
+                        // attrs as part of the create.
+        w.write_u32(0); // count
+    };
+
     let status = match obj_type {
         2 => {
             // Directory
             match ctx.mkdir(&name) {
                 Ok((fh, _)) => {
                     state.current_fh = Some(fh);
-                    w.write_u32(nfs4_status::NFS4_OK);
-                    w.write_bool(false); // cinfo
-                    w.write_u32(0); // attrsset bitmap count
+                    write_create_resok(&mut w);
                     nfs4_status::NFS4_OK
                 }
                 Err(_) => {
@@ -2420,13 +2451,11 @@ async fn op_create<G: GatewayOps>(
             }
         }
         5 => {
-            // Symlink
+            // Symlink (NF4LNK) — closes #53.
             match ctx.symlink(&name, &linkdata).await {
                 Ok((fh, _)) => {
                     state.current_fh = Some(fh);
-                    w.write_u32(nfs4_status::NFS4_OK);
-                    w.write_bool(false);
-                    w.write_u32(0);
+                    write_create_resok(&mut w);
                     nfs4_status::NFS4_OK
                 }
                 Err(_) => {
@@ -2441,9 +2470,7 @@ async fn op_create<G: GatewayOps>(
             match ctx.create_pending_named(&name) {
                 Ok((fh, _)) => {
                     state.current_fh = Some(fh);
-                    w.write_u32(nfs4_status::NFS4_OK);
-                    w.write_bool(false);
-                    w.write_u32(0);
+                    write_create_resok(&mut w);
                     nfs4_status::NFS4_OK
                 }
                 Err(_) => {
@@ -3915,6 +3942,104 @@ mod tests {
             let mut r = XdrReader::new(&body);
             assert_eq!(r.read_u32().unwrap(), op::RECLAIM_COMPLETE);
             assert_eq!(r.read_u32().unwrap(), nfs4_status::NFS4_OK);
+        }
+    }
+
+    // ---------- CREATE NF4LNK response shape (RFC 7530 §16.4) ----------
+
+    /// Closes #53: `ln -s target lnk` over an NFSv4.2 mount returned
+    /// `Input/output error`. Root cause is in the CREATE4resok wire
+    /// encoding for NF4LNK (and NF4DIR — same encoder path): cinfo
+    /// is `bool atomic + uint64 before + uint64 after` = 20 bytes,
+    /// but op_create wrote just a 4-byte `bool false`. The kernel
+    /// decoder reads the next 16 bytes (the actual `attrsset`
+    /// bitmap + GETATTR opcode) as cinfo's u64s, then fails the
+    /// rest of the COMPOUND parse → EIO surfaces at the syscall.
+    ///
+    /// This test wire-builds a SYMLINK CREATE4args, calls op_create,
+    /// and decodes the response per RFC 7530 §16.4. Pre-fix the
+    /// decode reaches a `change_info4` that's only 4 bytes (just
+    /// the atomic bool, missing the two u64s) followed by what
+    /// should be the attrsset count. We assert the encoder writes
+    /// 20 bytes for cinfo and an attrsset that decodes as a valid
+    /// bitmap4.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn op_create_nflnk_response_includes_full_change_info4() {
+        let ctx = test_ctx();
+        // Anchor at the namespace root so the symlink lands in
+        // a known directory; the dispatcher does this naturally via
+        // PUTROOTFH but the test calls op_create directly.
+        let root = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
+        let mut state = CompoundState {
+            current_fh: Some(root),
+            saved_fh: None,
+            current_stateid: None,
+        };
+
+        // CREATE4args (RFC 7530 §16.4 + §3.3.13):
+        //   createtype4 objtype   = union switch(u32 type) {
+        //                              NF4LNK (5): linktext4 linkdata;
+        //                              ...
+        //                            }
+        //   component4   objname  = string
+        //   fattr4       createattrs = bitmap4 + attr_vals<>
+        let mut w = XdrWriter::new();
+        w.write_u32(5); // NF4LNK
+        w.write_string("/tmp/target"); // linkdata
+        w.write_string("the-link"); // objname
+        w.write_u32(0); // attrsset bitmap count
+        w.write_opaque(&[]); // attrsset values (empty)
+        let bytes = w.into_bytes();
+
+        let mut reader = XdrReader::new(&bytes);
+        let (status, body) = op_create(&mut reader, &ctx, &mut state).await;
+        assert_eq!(
+            status,
+            nfs4_status::NFS4_OK,
+            "ctx.symlink should succeed (target stored as inline composition data)"
+        );
+
+        // Decode the response per RFC 7530 §16.4 CREATE4resok:
+        //   uint32_t opcode (op::CREATE = 6)
+        //   uint32_t status
+        //   change_info4 cinfo {
+        //     bool   atomic;
+        //     uint64 before;
+        //     uint64 after;
+        //   }
+        //   bitmap4 attrset {
+        //     uint32 count;
+        //     uint32 words<count>;
+        //   }
+        let mut r = XdrReader::new(&body);
+        assert_eq!(r.read_u32().expect("opcode"), op::CREATE);
+        assert_eq!(r.read_u32().expect("status"), nfs4_status::NFS4_OK);
+
+        // cinfo.atomic — the boolean. Encoder is allowed to set this
+        // false (we don't claim atomicity).
+        let _atomic = r.read_bool().expect("cinfo.atomic must be readable");
+        // cinfo.before — pre-fix THIS read fails (decoder hits the
+        // attrsset count where it expects a u64).
+        let before = r.read_u64().expect(
+            "cinfo.before must be a u64 per RFC 7530 §3.3.3 — missing from CREATE4resok (#53)",
+        );
+        let after = r
+            .read_u64()
+            .expect("cinfo.after must be a u64 per RFC 7530 §3.3.3");
+        // Spec allows arbitrary values; we just need them present so
+        // the kernel decoder doesn't slide.
+        let _ = (before, after);
+
+        // Now the attrsset bitmap MUST be readable. Pre-fix the
+        // decoder ate the attrsset's u32 count as part of cinfo and
+        // there are no bytes left here.
+        let attrset_count = r
+            .read_u32()
+            .expect("attrsset bitmap count must be readable");
+        for _ in 0..attrset_count {
+            let _ = r
+                .read_u32()
+                .expect("attrsset bitmap words must be readable");
         }
     }
 }

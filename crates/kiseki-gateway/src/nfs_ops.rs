@@ -20,10 +20,24 @@ use kiseki_common::locks::LockOrDie;
 pub type FileHandle = [u8; 32];
 
 /// File type for NFS attributes.
+///
+/// Maps to NFSv3 ftype3 / NFSv4 nfs_ftype4 wire encodings:
+///   Regular   → NF3REG (1) / NF4REG (1)
+///   Directory → NF3DIR (2) / NF4DIR (2)
+///   Symlink   → NF3LNK (5) / NF4LNK (5)
+///
+/// The Symlink variant (#53) lets `getattr` report the correct
+/// type for fhs registered as `HandleEntry::Symlink`. Without it,
+/// `ln -s` over a kernel NFSv4 mount creates the link entry but
+/// the kernel sees the file as a regular file and calls READ on
+/// it instead of READLINK, returning the raw target-path bytes
+/// (Group V #1 saved us from outright EIO but the link still
+/// doesn't behave like a symlink to userspace tools).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Regular,
     Directory,
+    Symlink,
 }
 
 /// NFS file attributes (subset shared by v3 and v4).
@@ -380,6 +394,17 @@ impl<G: GatewayOps> NfsContext<G> {
             });
         }
 
+        // #53: symlinks share the regular-file size/composition shape
+        // (target path is stored as inline composition data) but the
+        // file_type MUST be Symlink so the kernel calls READLINK
+        // instead of READ when resolving `ln -s` output. Pre-fix
+        // `getattr` returned Regular for every non-directory fh and
+        // the kernel saw symlinks as regular files (mode -rw- + size
+        // matching the target-path length, with READ returning the
+        // target-path bytes — Group V #1 saved us from EIO but the
+        // link was unusable).
+        let is_symlink = self.handles.is_symlink(fh);
+
         let (ns_id, tenant_id, Some(comp_id)) = self
             .handles
             .lookup(fh)
@@ -407,9 +432,13 @@ impl<G: GatewayOps> NfsContext<G> {
             .unwrap_or(0);
 
         Ok(NfsAttrs {
-            file_type: FileType::Regular,
+            file_type: if is_symlink {
+                FileType::Symlink
+            } else {
+                FileType::Regular
+            },
             size,
-            mode: 0o644,
+            mode: if is_symlink { 0o777 } else { 0o644 },
             nlink: 1,
             uid: 0,
             gid: 0,
@@ -738,6 +767,7 @@ impl<G: GatewayOps> NfsContext<G> {
         // ask the handle registry whether the resolved handle is a
         // directory and pick the right mode + nlink + size shape.
         if let Some(entry) = self.dir_index.lookup(self.namespace_id, name) {
+            let fileid = u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8]));
             let attrs = if self.handles.is_directory(&entry.file_handle) {
                 NfsAttrs {
                     file_type: FileType::Directory,
@@ -746,7 +776,20 @@ impl<G: GatewayOps> NfsContext<G> {
                     nlink: 2,
                     uid: 0,
                     gid: 0,
-                    fileid: u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+                    fileid,
+                }
+            } else if self.handles.is_symlink(&entry.file_handle) {
+                // #53: LOOKUP("lnk") after `ln -s target lnk` resolves
+                // here. Report Symlink so the kernel's subsequent
+                // GETATTR sees ftype=NF4LNK and calls READLINK.
+                NfsAttrs {
+                    file_type: FileType::Symlink,
+                    size: entry.size,
+                    mode: 0o777,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    fileid,
                 }
             } else {
                 NfsAttrs {
@@ -756,7 +799,7 @@ impl<G: GatewayOps> NfsContext<G> {
                     nlink: 1,
                     uid: 0,
                     gid: 0,
-                    fileid: u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8])),
+                    fileid,
                 }
             };
             return Some((entry.file_handle, attrs));
@@ -1009,7 +1052,7 @@ impl<G: GatewayOps> NfsContext<G> {
         Ok((
             fh,
             NfsAttrs {
-                file_type: FileType::Regular, // wire ftype reported as REG until FileType gains a Symlink variant
+                file_type: FileType::Symlink,
                 size: target.len() as u64,
                 mode: 0o777,
                 nlink: 1,
