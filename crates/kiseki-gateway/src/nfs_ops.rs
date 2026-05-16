@@ -294,6 +294,20 @@ pub struct NfsContext<G: GatewayOps> {
     /// increasing offsets; the buffer accumulates all writes and
     /// flushes to a single composition on CLOSE or COMMIT.
     pub write_buffers: Mutex<HashMap<FileHandle, Vec<u8>>>,
+    /// Per-fh "last flushed buffer length". Used by [`Self::flush_writes`]
+    /// to detect "no new data since last flush" (idempotent — skip the
+    /// gateway write entirely) vs "buffer grew" (allocate a FRESH
+    /// composition id and write the full cumulative buffer).
+    ///
+    /// Closes #50: pre-fix `flush_writes` always reused the placeholder
+    /// id from the fh, hitting `mem_gateway::write`'s `create_at`
+    /// idempotency no-op on the 2nd+ flush and silently dropping the
+    /// new data. The 2026-05-16 GCP wedge was that no-op +
+    /// useless-Raft-entry compounding. Tracking last-flushed length
+    /// lets us (a) skip no-growth flushes outright (no Raft entry), and
+    /// (b) mint a fresh composition id when we DO need to flush
+    /// growth, so the new data actually lands.
+    pub last_flushed_len: Mutex<HashMap<FileHandle, usize>>,
 }
 
 impl<G: GatewayOps> NfsContext<G> {
@@ -340,6 +354,7 @@ impl<G: GatewayOps> NfsContext<G> {
             tenant_id,
             namespace_id,
             write_buffers: Mutex::new(HashMap::new()),
+            last_flushed_len: Mutex::new(HashMap::new()),
         }
     }
 
@@ -492,55 +507,78 @@ impl<G: GatewayOps> NfsContext<G> {
     /// Flush buffered writes for a file handle. Creates a new
     /// composition with the accumulated data, updates the file handle
     /// and directory index. Returns the new file handle.
+    ///
+    /// Closes #50: pre-fix this function took (removed) the buffer and
+    /// wrote it under the placeholder id from `fh`. The second call
+    /// would build a fresh buffer (zero-padded prefix for the already-
+    /// flushed range + new data at the tail) and re-submit under the
+    /// SAME placeholder id — which hit `mem_gateway`'s `create_at`
+    /// idempotency no-op and silently dropped the new data. Tracked
+    /// by `nfs_ops::tests::sustained_writes_with_per_write_flush_concatenate`.
+    ///
+    /// New shape:
+    /// 1. Read (don't remove) the buffer. If empty or unchanged since
+    ///    the previous flush, return `Ok(None)` — no work, no Raft
+    ///    entry. This is the per-COMMIT idempotence that collapses the
+    ///    2026-05-16 GCP "hydrator backlog from useless deltas" load.
+    /// 2. On growth: allocate a FRESH composition id (not the
+    ///    placeholder) for the 2nd+ flush. The first flush still uses
+    ///    the placeholder so cross-protocol GET-by-placeholder-UUID
+    ///    (Group V #1) keeps working.
+    /// 3. Write the FULL cumulative buffer to gateway under that id.
+    /// 4. Update dir_index + handles.repoint_file at the new id.
+    /// 5. Record the new flushed length so subsequent equal-length
+    ///    calls go through the early-skip path.
     pub async fn flush_writes(
         &self,
         fh: &FileHandle,
     ) -> Result<Option<(FileHandle, NfsWriteResponse)>, GatewayError> {
-        // Take the buffer ONLY when there's data to flush. With the
-        // pending-fh CREATE path, an empty buffer signals "this fh
-        // is buffer-served, no composition exists yet" — popping it
-        // here would leave subsequent reads with no source of
-        // truth (the buffer is gone, the composition was never
-        // created). Leaving the empty Vec in place preserves the
-        // 0-byte read semantics of an empty file.
-        let data = {
-            let mut buffers = self.write_buffers.lock().lock_or_die("nfs_ops.unknown");
-            // Only remove + return when there's actually data to
-            // flush. An empty Vec marks a CREATE-pending fh; we
-            // need to keep it so subsequent reads still serve
-            // empty bytes from the buffer fast-path rather than
-            // hitting a not-yet-existing composition.
-            if buffers.get(fh).is_some_and(|b| !b.is_empty()) {
-                buffers.remove(fh)
-            } else {
-                None
+        let (data, last_len) = {
+            let buffers = self.write_buffers.lock().lock_or_die("nfs_ops.unknown");
+            let last_flushed = self
+                .last_flushed_len
+                .lock()
+                .lock_or_die("nfs_ops.last_flushed_len");
+            let Some(buf) = buffers.get(fh) else {
+                return Ok(None);
+            };
+            let last_len = last_flushed.get(fh).copied().unwrap_or(0);
+            if buf.is_empty() || buf.len() <= last_len {
+                // Empty (pending-CREATE marker), or no growth since
+                // last flush — skip the gateway call entirely. The
+                // buffer-served read path still serves stale-free
+                // because it reads from the live buffer.
+                return Ok(None);
             }
+            // Clone the buffer so we release the lock before the
+            // (potentially long) gateway.write.
+            (buf.clone(), last_len)
         };
-        let Some(data) = data else {
-            return Ok(None);
-        };
-        // Extract the placeholder composition_id from the fh's first
-        // 16 bytes. The synthetic fh layout is `[comp_id 16][zeros 16]`
-        // (see `HandleRegistry::file_handle`), so the placeholder UUID
-        // the NFS client received at CREATE time is recoverable here.
-        // Passing it as `comp_id_override` makes the resulting
-        // composition land under that exact id — Group V #1: cross-
-        // protocol GETs that captured the placeholder can find it via
-        // `comps.get(uuid)`.
-        let placeholder_id = {
+
+        // Choose the composition id:
+        // - First flush (last_len == 0): use the placeholder from the
+        //   fh's first 16 bytes. Preserves Group V #1's cross-protocol
+        //   GET-by-placeholder-UUID semantics — the NFS client received
+        //   that UUID at CREATE time; an S3 client doing
+        //   GET /<bucket>/<uuid> must still find it.
+        // - Subsequent flushes: mint a fresh UUID. `create_at`'s
+        //   idempotency would otherwise drop the new data.
+        let target_id = if last_len == 0 {
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&fh[..16]);
             CompositionId(uuid::Uuid::from_bytes(bytes))
+        } else {
+            CompositionId(uuid::Uuid::new_v4())
         };
-        let (new_fh, resp) = self
-            .write_with_optional_id(data, Some(placeholder_id))
-            .await?;
 
-        // Update dir_index: if the old fh had a name, re-map it to the
-        // new composition. After Group V #1: `new_fh == fh` and
-        // `resp.composition_id == placeholder_id`, but this keeps the
-        // shape for the (hypothetical) future case where the override
-        // isn't supplied.
+        let new_len = data.len();
+        let (new_fh, resp) = self.write_with_optional_id(data, Some(target_id)).await?;
+
+        // Update dir_index to point at the latest composition. Keeps
+        // cross-protocol GET-by-name (S3) reading the freshest data;
+        // older compositions become orphans and get GC'd by the chunk-
+        // store cleaner. This is the explicit "compositions are
+        // mutable until close" semantic for NFS-buffered writes.
         if let Some(name) = self.dir_index.name_for(self.namespace_id, fh) {
             self.dir_index.insert(
                 self.namespace_id,
@@ -550,13 +588,34 @@ impl<G: GatewayOps> NfsContext<G> {
                 u64::from(resp.count),
             );
         }
-
-        // After Group V #1: `fh` IS the real composition's fh, so this
-        // is a no-op. Kept defensively for the path where a future
-        // caller bypasses the override.
         self.handles.repoint_file(fh, resp.composition_id);
 
+        self.last_flushed_len
+            .lock()
+            .lock_or_die("nfs_ops.last_flushed_len")
+            .insert(*fh, new_len);
+
         Ok(Some((new_fh, resp)))
+    }
+
+    /// Release per-fh write state after the final flush.
+    ///
+    /// Called from NFSv4 `op_close` and NFSv3 `reply_commit` (the
+    /// "I'm done writing" signal) — both paths run `flush_writes`
+    /// first, then this. Frees the buffered Vec so the in-memory
+    /// footprint of long-running NFS clients doesn't grow unbounded
+    /// with the number of files they've ever opened.
+    ///
+    /// Safe to call when `fh` was never written to (idempotent).
+    pub fn release_buffer(&self, fh: &FileHandle) {
+        self.write_buffers
+            .lock()
+            .lock_or_die("nfs_ops.write_buffers")
+            .remove(fh);
+        self.last_flushed_len
+            .lock()
+            .lock_or_die("nfs_ops.last_flushed_len")
+            .remove(fh);
     }
 
     /// Write to create a new named file (NFS CREATE).
@@ -1011,4 +1070,99 @@ impl<G: GatewayOps> NfsContext<G> {
 pub struct ReadDirEntry {
     pub fileid: u64,
     pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the NFS write-buffer + flush_writes path.
+    //!
+    //! These pin the sustained-write contract per #50 (F-1): multiple
+    //! NFS WRITE ops to the same fh, with intervening per-write
+    //! flushes (the NFSv3 stable>=1 path, and the NFSv4 COMMIT-after-
+    //! each-WRITE path that Linux sends under fio --direct=1), MUST
+    //! yield a final composition containing the CONCATENATION of all
+    //! writes. Pre-fix the second + subsequent flushes hit the
+    //! `create_at` idempotent no-op in mem_gateway.rs:2146 and the
+    //! data was silently dropped.
+    use super::*;
+    use crate::mem_gateway::InMemoryGateway;
+    use crate::nfs::NfsGateway;
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_crypto::keys::SystemMasterKey;
+
+    fn ctx() -> NfsContext<InMemoryGateway> {
+        let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
+        let tenant = OrgId(uuid::Uuid::nil());
+        let ns = NamespaceId(uuid::Uuid::from_u128(1));
+        let store = CompositionStore::new();
+        store.add_namespace(kiseki_composition::namespace::Namespace {
+            id: ns,
+            tenant_id: tenant,
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+        });
+        let gw = InMemoryGateway::new(
+            store,
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            master_key,
+        );
+        let nfs_gw = NfsGateway::new(gw);
+        NfsContext::new(nfs_gw, tenant, ns)
+    }
+
+    /// Three sequential writes to the same fh, each followed by a
+    /// flush (mirrors NFSv4.2 + fio `--direct=1`: COMMIT after every
+    /// WRITE). The final file content MUST be the concatenation of
+    /// all three writes.
+    ///
+    /// Pre-#50 the second flush hits `create_at`'s idempotent path
+    /// and the data is silently dropped — read returned only the
+    /// first 1 KB of 'A' with zeros in [1024, 3072) instead of
+    /// AAAA…BBBB…CCCC… Fix (in the same commit / branch as this
+    /// test) tracks `last_flushed_len` per fh and mints a fresh
+    /// composition id on the 2nd+ flush so growth lands instead
+    /// of bouncing off `create_at`'s idempotency check.
+    const CHUNK: usize = 1024;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sustained_writes_with_per_write_flush_concatenate() {
+        let ctx = ctx();
+        let (fh, _) = ctx.create_pending_named("sustained-fio").expect("create");
+        let a = vec![b'A'; CHUNK];
+        let b = vec![b'B'; CHUNK];
+        let c = vec![b'C'; CHUNK];
+
+        ctx.buffer_write(&fh, 0, &a);
+        ctx.flush_writes(&fh).await.expect("flush 1");
+
+        ctx.buffer_write(&fh, CHUNK as u64, &b);
+        ctx.flush_writes(&fh).await.expect("flush 2");
+
+        ctx.buffer_write(&fh, (CHUNK as u64) * 2, &c);
+        ctx.flush_writes(&fh).await.expect("flush 3");
+
+        // Read the entire file back.
+        let total = u32::try_from(CHUNK * 3).expect("CHUNK * 3 fits in u32");
+        let resp = ctx
+            .read(&fh, 0, total)
+            .await
+            .expect("read after sustained writes");
+
+        let expected: Vec<u8> = a.iter().chain(b.iter()).chain(c.iter()).copied().collect();
+        assert_eq!(
+            resp.data.len(),
+            expected.len(),
+            "read returned {} bytes, expected {} — sustained-write flushes silently dropped data (#50)",
+            resp.data.len(),
+            expected.len(),
+        );
+        assert_eq!(
+            resp.data, expected,
+            "read content does not match concatenated writes — flush_writes dropped data (#50)"
+        );
+    }
 }
