@@ -1261,4 +1261,126 @@ mod tests {
         assert_eq!(&data[13..15], &[0, 0]);
         assert_eq!(&data[15..17], b"XY");
     }
+
+    // ---------------------------------------------------------------
+    // #51 — FUSE write + fsync + post-cache-drop read.
+    // ---------------------------------------------------------------
+    //
+    // Reproduces the 2026-05-16 GCP Phase 5 bug: a sequential write
+    // to a FUSE-over-native mount succeeded with conv=fdatasync, but
+    // after `echo 3 > /proc/sys/vm/drop_caches` the read returned 0
+    // bytes. At the adapter layer that pattern collapses to: write
+    // populates `dirty[ino]`, fsync drains it through `gateway.write`
+    // and removes the dirty entry, then read MUST go through
+    // `gateway.read(composition_id)` and return the same bytes.
+    //
+    // Pre-fix the second flush in `flush_take_buffer` + gateway.write
+    // pipeline hit the same `create_at` idempotency no-op as #50:
+    // because `create_pending_named` issued a placeholder composition
+    // id and the first gateway.write committed under that id, the
+    // fsync-time write tried to re-commit under the same id and got
+    // a silent no-op. The post-cache-drop read pulled the empty
+    // placeholder composition.
+    //
+    // The fix for #50 made flush_writes correct on growth for the
+    // NFS path; the FUSE adapter goes through a different
+    // create/write code path but the same gateway.write underneath.
+    // This test pins the adapter-level contract regardless of which
+    // layer underneath is responsible.
+
+    /// #51 regression fence — the FUSE adapter's write+fsync+read
+    /// cycle MUST be lossless. The 2026-05-16 GCP run reported
+    /// `dd ... conv=fdatasync` followed by `drop_caches` + read
+    /// returning 0 bytes against a FUSE-over-native mount. At the
+    /// adapter layer the failure shape collapses to: after fsync
+    /// drains `dirty[ino]` to the gateway, the read path MUST go
+    /// through `gateway.read(composition_id)` and return the same
+    /// bytes that were written.
+    ///
+    /// This test pins the contract at the adapter layer (in-memory
+    /// gateway). The wire-level path through native TCP-framed +
+    /// real kiseki-server is fenced separately by the 20-fuse phase
+    /// script (`infra/gcp/benchmarks/phases/20-fuse.sh`), which
+    /// halts the bench run if read bytes ≠ write bytes.
+    ///
+    /// Coverage:
+    /// 1. Single write + fsync + read.
+    /// 2. Multiple non-contiguous writes coalesced into one fsync.
+    /// 3. Two write-fsync-read cycles (rules out state corruption
+    ///    across the second-pass `create_at` idempotency that
+    ///    bit #50).
+    /// 4. Payload sized to span multiple gateway-side chunks
+    ///    (default 64 KiB chunks → use 256 KiB so the read path
+    ///    walks ≥4 chunks).
+    #[test]
+    fn write_fsync_then_read_after_dirty_drop_returns_full_buffer() {
+        // 256 KiB across multiple non-contiguous writes — exercises
+        // the dirty-buffer accumulation + multi-chunk gateway store.
+        const BLOCK: usize = 64 * 1024;
+        const BLOCKS: usize = 4;
+        const TOTAL: usize = BLOCK * BLOCKS;
+
+        let mut fs = setup_fuse();
+        let ino = fs.create("dd-write", Vec::new()).unwrap();
+
+        let mut expected = vec![0u8; TOTAL];
+        for i in 0..BLOCKS {
+            let pattern = b'A' + u8::try_from(i).unwrap();
+            let offset = i * BLOCK;
+            let chunk = vec![pattern; BLOCK];
+            expected[offset..offset + BLOCK].copy_from_slice(&chunk);
+            let n = fs.write(ino, offset as u64, &chunk).expect("write block");
+            assert_eq!(n as usize, BLOCK);
+        }
+
+        fs.fsync(ino).expect("fsync");
+
+        // Defensive: dirty MUST be drained. A future refactor that
+        // keeps dirty across fsync would make the read serve from
+        // the local buffer and hide a wire-level data loss.
+        assert!(
+            !fs.dirty.contains_key(&ino),
+            "fsync must drain the dirty buffer (precondition for the regression check below)"
+        );
+
+        let read = fs
+            .read(ino, 0, TOTAL.try_into().unwrap())
+            .expect("read after fsync");
+        assert_eq!(
+            read.len(),
+            expected.len(),
+            "read returned {} bytes, expected {} — silent data loss in FUSE-over-gateway fsync path (#51)",
+            read.len(),
+            expected.len(),
+        );
+        assert_eq!(
+            read, expected,
+            "read content does not match write content (#51)"
+        );
+
+        // ----- Second write-fsync-read cycle -----
+        //
+        // Pre-#50 the second cycle hit `create_at`'s idempotency
+        // no-op at the gateway level — the new data was dropped
+        // and the second-cycle read returned the first cycle's
+        // content. With #50's fix (fresh comp_id on growth) +
+        // FUSE's existing fresh-name-per-write semantic, this
+        // cycle should land cleanly.
+        let mut expected2 = vec![0u8; TOTAL];
+        for i in 0..BLOCKS {
+            let pattern = b'a' + u8::try_from(i).unwrap();
+            let offset = i * BLOCK;
+            let chunk = vec![pattern; BLOCK];
+            expected2[offset..offset + BLOCK].copy_from_slice(&chunk);
+            fs.write(ino, offset as u64, &chunk).expect("write cycle 2");
+        }
+        fs.fsync(ino).expect("fsync cycle 2");
+        let read2 = fs
+            .read(ino, 0, TOTAL.try_into().unwrap())
+            .expect("read after fsync cycle 2");
+        assert_eq!(
+            read2, expected2,
+            "second write-fsync-read cycle must reflect the SECOND write's content, not the first (#51 / #50 cross-check)"
+        );
+    }
 }
