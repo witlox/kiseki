@@ -43,21 +43,53 @@ fn read_http_body(stream: &mut TcpStream) -> Result<String, String> {
     stream
         .read_to_end(&mut buf)
         .map_err(|e| format!("read failed: {e}"))?;
+    parse_http_response(&buf)
+}
 
-    let text = String::from_utf8_lossy(&buf);
+/// Parse a raw HTTP response buffer into either the decoded body
+/// (on 2xx) or `Err("HTTP <code>: <snippet>")` (on non-2xx).
+///
+/// Split out from [`read_http_body`] so unit tests can exercise the
+/// status-handling logic without a live `TcpStream`. Closes #56:
+/// previously non-2xx bodies (e.g. 401 "missing Authorization: Bearer
+/// header") were returned as Ok and the CLI's `json_u64` / `json_str`
+/// parsed `total_nodes` as 0 → the famous `Nodes: 0/0` report against
+/// a healthy cluster.
+fn parse_http_response(buf: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(buf);
     let body_start = text
         .find("\r\n\r\n")
         .map(|i| i + 4)
         .ok_or("malformed HTTP response")?;
 
+    let headers = &text[..body_start];
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u16>().ok())
+        })
+        .unwrap_or(0);
+
     let body = &text[body_start..];
-    if text[..body_start]
+    let body_decoded = if headers
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked")
     {
-        Ok(decode_chunked(body))
+        decode_chunked(body)
     } else {
-        Ok(body.to_string())
+        body.to_string()
+    };
+
+    if (200..300).contains(&status) {
+        Ok(body_decoded)
+    } else {
+        // Trim + cap the error body so a giant HTML page from a
+        // reverse proxy doesn't drown the operator's terminal.
+        let snippet: String = body_decoded.trim().chars().take(200).collect();
+        Err(format!("HTTP {status}: {snippet}"))
     }
 }
 
@@ -1844,6 +1876,73 @@ mod tests {
     }
 
     // --- D3: nested tenant CRUD ----------------------------------------
+
+    // --- #56: HTTP status-line error surfacing -------------------------
+
+    #[test]
+    fn parse_http_response_returns_body_on_2xx() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Content-Type: application/json\r\n\
+                    Content-Length: 17\r\n\
+                    \r\n\
+                    {\"total_nodes\":3}";
+        let body = parse_http_response(raw).expect("2xx must return Ok");
+        assert_eq!(body, "{\"total_nodes\":3}");
+    }
+
+    #[test]
+    fn parse_http_response_errors_on_401_with_status_and_snippet() {
+        // The exact body kiseki-server's admin_required middleware sends.
+        let raw = b"HTTP/1.1 401 Unauthorized\r\n\
+                    Content-Type: text/plain\r\n\
+                    Content-Length: 35\r\n\
+                    \r\n\
+                    missing Authorization: Bearer header";
+        let err = parse_http_response(raw).expect_err("401 must be an Err");
+        assert!(
+            err.starts_with("HTTP 401: "),
+            "error message must surface the status code; got: {err}"
+        );
+        assert!(
+            err.contains("missing Authorization"),
+            "error body snippet must be included for diagnosis; got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_http_response_errors_on_503() {
+        let raw = b"HTTP/1.1 503 Service Unavailable\r\n\r\n\
+                    cluster booting";
+        let err = parse_http_response(raw).expect_err("503 must be Err");
+        assert!(err.contains("HTTP 503"));
+    }
+
+    #[test]
+    fn parse_http_response_handles_http_1_0() {
+        // Some misconfigured proxies still speak 1.0; status parser
+        // must not care about the protocol version.
+        let raw = b"HTTP/1.0 200 OK\r\n\r\nbody";
+        assert_eq!(parse_http_response(raw).unwrap(), "body");
+    }
+
+    #[test]
+    fn parse_http_response_errors_on_malformed_response() {
+        // No \r\n\r\n separator at all → diagnostic, not a panic.
+        let raw = b"definitely not an HTTP response";
+        let err = parse_http_response(raw).expect_err("malformed must Err");
+        assert!(err.contains("malformed"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_http_response_decodes_chunked_transfer_encoding() {
+        // Three chunks: "ab", "cdef", terminator (0\r\n\r\n)
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    \r\n\
+                    2\r\nab\r\n4\r\ncdef\r\n0\r\n\r\n";
+        let body = parse_http_response(raw).expect("chunked 2xx Ok");
+        assert_eq!(body, "abcdef", "chunked decoder must concatenate chunks");
+    }
 
     // --- #59: shard split parser ---------------------------------------
 

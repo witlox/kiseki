@@ -136,6 +136,13 @@ Environment=KISEKI_ALLOW_PLAINTEXT_NFS=true
 # admin/client tokens should leave this off.
 Environment=KISEKI_CLUSTER_INFO_PUBLIC=true
 
+# Closes #56: kiseki-admin hits /ui/api/cluster which is admin-gated.
+# Without this, kiseki-admin status reported `Nodes: 0/0` against a
+# healthy cluster because the 401 body parsed as zero counts. Mirrors
+# the local docker-compose.3node.yml `KISEKI_ADMIN_AUTH_DISABLED:
+# "true"` posture for the same perf-test reason as #52.
+Environment=KISEKI_ADMIN_AUTH_DISABLED=true
+
 # Eventual-durability flush cadence (ADR-022 rev-3 + d5c56ad).
 # All three are CRITICAL for perf:
 #   * KISEKI_RAFT_FLUSH_INTERVAL_MS unset → Raft log uses
