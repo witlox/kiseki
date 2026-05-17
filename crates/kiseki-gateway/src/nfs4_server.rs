@@ -2158,7 +2158,16 @@ async fn op_remove<G: GatewayOps>(
     let status = match ctx.remove_file(&name).await {
         Ok(()) => {
             w.write_u32(nfs4_status::NFS4_OK);
-            w.write_bool(false); // cinfo
+            // change_info4 cinfo { bool atomic; uint64 before; uint64 after; }
+            // RFC 7530 §16.25.4 + §3.3.3. Same wire bug as #53's CREATE
+            // path — emitting just `bool false` here mis-aligns the
+            // COMPOUND reply by 16 bytes; the kernel surfaces it as
+            // EIO on `unlink(2)`. fio --direct=1's filesetup phase
+            // calls unlink() on its layout file, which got us the
+            // initial #65 "wedge" symptom.
+            w.write_bool(false); // atomic
+            w.write_u64(0); // before changeid4
+            w.write_u64(0); // after  changeid4
             nfs4_status::NFS4_OK
         }
         Err(_) => {
@@ -2315,8 +2324,16 @@ async fn op_rename<G: GatewayOps>(
     let status = match ctx.rename_file(&old_name, &new_name) {
         Ok(()) => {
             w.write_u32(nfs4_status::NFS4_OK);
-            w.write_bool(false); // source cinfo
-            w.write_bool(false); // target cinfo
+            // RENAME4resok: source_cinfo (change_info4) + target_cinfo
+            // (change_info4). RFC 7530 §16.30.4. Same #53-shape wire
+            // bug as REMOVE / LINK — must emit 20 bytes per cinfo,
+            // not 4.
+            w.write_bool(false); // source cinfo: atomic
+            w.write_u64(0); //                before
+            w.write_u64(0); //                after
+            w.write_bool(false); // target cinfo: atomic
+            w.write_u64(0); //                before
+            w.write_u64(0); //                after
             nfs4_status::NFS4_OK
         }
         Err(_) => {
@@ -2347,7 +2364,11 @@ async fn op_link<G: GatewayOps>(
     let status = match ctx.link(target_fh, &new_name) {
         Ok(()) => {
             w.write_u32(nfs4_status::NFS4_OK);
-            w.write_bool(false); // cinfo
+            // LINK4resok cinfo (change_info4) — RFC 7530 §16.20.4.
+            // Same #53-shape wire bug as REMOVE / RENAME.
+            w.write_bool(false); // atomic
+            w.write_u64(0); // before changeid4
+            w.write_u64(0); // after  changeid4
             nfs4_status::NFS4_OK
         }
         Err(_) => {
@@ -4041,5 +4062,88 @@ mod tests {
                 .read_u32()
                 .expect("attrsset bitmap words must be readable");
         }
+    }
+
+    /// #65 RCA — REMOVE4resok must emit a 20-byte change_info4, not
+    /// 4 bytes. Pre-fix the kernel decoder slid into the next op
+    /// (or into the COMPOUND trailer) and surfaced as EIO at the
+    /// `unlink(2)` syscall — exactly the symptom that masqueraded
+    /// as a `fio --direct=1` wedge during the 2026-05-17 GCP run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn op_remove_response_includes_full_change_info4() {
+        let ctx = test_ctx();
+        let name = "rm-probe.bin";
+        ctx.write_named(name, b"hello".to_vec())
+            .await
+            .expect("seed file via write_named");
+
+        let mut w = XdrWriter::new();
+        w.write_string(name); // REMOVE4args: component4 target
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let (status, body) = op_remove(&mut reader, &ctx).await;
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        // Decode REMOVE4res: opcode + status + change_info4 (20 bytes).
+        let mut r = XdrReader::new(&body);
+        assert_eq!(r.read_u32().expect("opcode"), op::REMOVE);
+        assert_eq!(r.read_u32().expect("status"), nfs4_status::NFS4_OK);
+        let _atomic = r
+            .read_bool()
+            .expect("REMOVE4resok.cinfo.atomic must be a bool");
+        let _before = r.read_u64().expect(
+            "REMOVE4resok.cinfo.before must be a u64 per RFC 7530 §3.3.3 — missing pre-fix (#65)",
+        );
+        let _after = r
+            .read_u64()
+            .expect("REMOVE4resok.cinfo.after must be a u64");
+        assert_eq!(
+            r.remaining(),
+            0,
+            "REMOVE4resok must be exactly opcode + status + change_info4 (28 bytes); \
+             any trailing bytes indicate either an over-emit on the success path or a \
+             missed read on the test side"
+        );
+    }
+
+    /// #65 RCA — RENAME4resok carries TWO change_info4 records
+    /// (source dir + target dir). Pre-fix emitted 2 × 4 bytes
+    /// instead of 2 × 20.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn op_rename_response_includes_two_full_change_info4() {
+        let ctx = test_ctx();
+        let old = "rn-probe-old.bin";
+        let new_name = "rn-probe-new.bin";
+        ctx.write_named(old, b"x".to_vec())
+            .await
+            .expect("seed file via write_named");
+
+        let mut w = XdrWriter::new();
+        w.write_string(old); // oldname
+        w.write_string(new_name); // newname
+        let bytes = w.into_bytes();
+        let mut reader = XdrReader::new(&bytes);
+        let (status, body) = op_rename(&mut reader, &ctx).await;
+        assert_eq!(status, nfs4_status::NFS4_OK);
+
+        // RENAME4res: opcode + status + source_cinfo (20) + target_cinfo (20).
+        let mut r = XdrReader::new(&body);
+        assert_eq!(r.read_u32().expect("opcode"), op::RENAME);
+        assert_eq!(r.read_u32().expect("status"), nfs4_status::NFS4_OK);
+        let _sa = r.read_bool().expect("source.atomic");
+        let _sb = r
+            .read_u64()
+            .expect("RENAME4resok source_cinfo.before must be a u64 — missing pre-fix (#65)");
+        let _se = r.read_u64().expect("source_cinfo.after");
+        let _ta = r.read_bool().expect("target.atomic");
+        let _tb = r
+            .read_u64()
+            .expect("RENAME4resok target_cinfo.before must be a u64 — missing pre-fix (#65)");
+        let _te = r.read_u64().expect("target_cinfo.after");
+        assert_eq!(
+            r.remaining(),
+            0,
+            "RENAME4resok is exactly opcode + status + 2× change_info4 (48 bytes)"
+        );
     }
 }
