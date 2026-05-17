@@ -1332,6 +1332,10 @@ pub async fn run_main(
     // metrics server so `/cluster/info` can project per-shard leader
     // info from `NamespaceShardMap`. `None` on single-node deploys.
     let cluster_control_state_for_ui = cluster_control_store.as_ref().map(|s| Arc::new(s.state()));
+    // Writable store handle for the multi-shard namespace endpoint
+    // (`POST /admin/topology/namespaces`, #68). Read-only callers
+    // already use `cluster_control_state_for_ui` above.
+    let cluster_control_store_for_ui = cluster_control_store.clone();
     // Pre-construct the tenant + namespace + drain handles so the
     // admin UI can share them with the gRPC `ControlService` further
     // below. The gRPC service is built after this point — both
@@ -1359,6 +1363,7 @@ pub async fn run_main(
             metrics_compositions,
             metrics_local_chunk_store,
             cluster_control_state_for_ui,
+            cluster_control_store_for_ui,
             Some(audit_for_spawn),
             Some(key_store_for_spawn),
             Some(tenants_for_spawn),
