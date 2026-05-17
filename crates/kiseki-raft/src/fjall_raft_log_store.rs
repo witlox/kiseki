@@ -123,17 +123,16 @@ where
     where
         I: IntoIterator<Item = C::Entry>,
     {
-        // Each `append` call is one fsync at the inner layer
-        // (`PersistMode::SyncAll` per entry). This matches the redb
-        // impl's per-entry txn commit. A future optimization can
-        // batch the iterator into one fjall WriteBatch + one fsync,
-        // but that requires confirming openraft's expectations on
-        // partial-failure semantics — the conservative port keeps
-        // parity with the redb durability shape.
-        for entry in entries {
-            let idx = entry.index();
-            self.inner.append(idx, &entry)?;
-        }
+        // One fjall `WriteBatch` per openraft replication payload, one
+        // fsync. fjall's `commit` is all-or-nothing on the batch, which
+        // is strictly safer than the openraft `RaftLogStorage::append`
+        // contract (entries durable when `IOFlushed` fires, no holes
+        // in the log). Issue #66: pre-fix this loop called
+        // `inner.append` per entry, burning N fsyncs per replication
+        // payload — the dominant cost in the multi-node PUT ceiling
+        // (1% of GET on GCP compact 2026-05-17).
+        self.inner
+            .append_batch(entries.into_iter().map(|e| (e.index(), e)))?;
         callback.io_completed(Ok(()));
         Ok(())
     }

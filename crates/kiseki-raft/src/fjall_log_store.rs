@@ -144,14 +144,45 @@ impl FjallLogStore {
     }
 
     /// Append a single log entry. Each call commits inline with
-    /// `PersistMode::SyncAll`; openraft's batching is at the
-    /// `append` trait level (one batch per replication payload),
-    /// not per-entry, so the per-entry fsync cost only hits when the
-    /// caller is appending one-by-one (test paths, `save_vote`).
+    /// `PersistMode::SyncAll`. Prefer [`Self::append_batch`] when the
+    /// caller already has multiple entries in hand (openraft's
+    /// `RaftLogStorage::append` is the production case) — that fold
+    /// is one fsync per replication payload instead of N.
     pub fn append<T: Serialize>(&self, index: u64, entry: &T) -> io::Result<()> {
         let bytes = encode(entry)?;
         let mut batch = self.commit_batch();
         batch.insert(&self.log_ks, index.to_be_bytes().to_vec(), bytes);
+        batch.commit().map_err(io_err)
+    }
+
+    /// Append N entries in one atomic `WriteBatch` + one fsync.
+    /// Atomicity is fjall's guarantee on `commit`: either all entries
+    /// in the batch are durable or none are — strictly safer than the
+    /// openraft `RaftLogStorage::append` contract, which only requires
+    /// the entries to be durable when the `IOFlushed` callback fires
+    /// and forbids holes in the log.
+    ///
+    /// PUT-perf: per-payload fold removes the per-entry fsync that
+    /// dominated the multi-node Raft commit ceiling (issue #66). At
+    /// ~50 µs/fsync on `NVMe`, a 16-entry replication payload drops
+    /// from ~800 µs of pure fsync to ~50 µs.
+    pub fn append_batch<T, I>(&self, entries: I) -> io::Result<()>
+    where
+        T: Serialize,
+        I: IntoIterator<Item = (u64, T)>,
+    {
+        let mut batch = self.commit_batch();
+        let mut count = 0usize;
+        for (index, entry) in entries {
+            let bytes = encode(&entry)?;
+            batch.insert(&self.log_ks, index.to_be_bytes().to_vec(), bytes);
+            count += 1;
+        }
+        if count == 0 {
+            // Empty payload — nothing to commit. Skip the empty batch
+            // so we don't burn a no-op fsync.
+            return Ok(());
+        }
         batch.commit().map_err(io_err)
     }
 
@@ -333,6 +364,76 @@ mod tests {
 
         let v3: Option<String> = store.get(3).unwrap();
         assert_eq!(v3, None);
+    }
+
+    /// #66 — `append_batch` MUST persist every entry in the iterator
+    /// and the result MUST match per-entry `append` for any reader.
+    /// Atomicity (all-or-nothing on `commit`) is fjall's contract;
+    /// this test pins our consumption of it.
+    #[test]
+    fn append_batch_persists_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallLogStore::open(&dir.path().join("log")).unwrap();
+
+        let entries: Vec<(u64, String)> = (1..=10).map(|i| (i, format!("entry-{i}"))).collect();
+        store.append_batch(entries).unwrap();
+
+        for i in 1..=10u64 {
+            let v: Option<String> = store.get(i).unwrap();
+            assert_eq!(
+                v,
+                Some(format!("entry-{i}")),
+                "index {i} not persisted by append_batch — #66 atomic fold broken"
+            );
+        }
+
+        let last = store.last_index().unwrap();
+        assert_eq!(
+            last,
+            Some(10),
+            "last_index after batch must be 10, got {last:?}"
+        );
+    }
+
+    /// Empty iterator is a no-op — no fsync, no batch commit. Matches
+    /// openraft's "the batch in this trait call must be durable when
+    /// `io_completed` fires" — vacuously true for zero entries.
+    #[test]
+    fn append_batch_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallLogStore::open(&dir.path().join("log")).unwrap();
+
+        let entries: Vec<(u64, String)> = Vec::new();
+        store.append_batch(entries).unwrap();
+
+        assert_eq!(store.last_index().unwrap(), None);
+        assert!(store.is_empty().unwrap());
+    }
+
+    /// Mixing `append_batch` then `append` then `append_batch` again
+    /// must keep the log dense (no holes — openraft correctness
+    /// invariant).
+    #[test]
+    fn append_batch_interleaved_with_single_append_has_no_holes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallLogStore::open(&dir.path().join("log")).unwrap();
+
+        store
+            .append_batch((1..=3u64).map(|i| (i, format!("b1-{i}"))))
+            .unwrap();
+        store.append(4, &"single-4".to_string()).unwrap();
+        store
+            .append_batch((5..=7u64).map(|i| (i, format!("b2-{i}"))))
+            .unwrap();
+
+        for i in 1..=7u64 {
+            let v: Option<String> = store.get(i).unwrap();
+            assert!(
+                v.is_some(),
+                "hole at index {i} — would violate Raft monotonicity"
+            );
+        }
+        assert_eq!(store.last_index().unwrap(), Some(7));
     }
 
     #[test]
