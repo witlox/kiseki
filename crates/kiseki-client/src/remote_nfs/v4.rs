@@ -244,6 +244,54 @@ fn xdr_err(e: &std::io::Error) -> GatewayError {
     GatewayError::ProtocolError(format!("XDR: {e}"))
 }
 
+/// Send a second compound `PUTFH(fh) + CLOSE(stateid)` to flush the
+/// per-fh write buffer. Required after [`Nfs4Client::write`] because
+/// `op_commit` is a no-op post-#50 — `op_close` is the only flush
+/// trigger. Without this, the placeholder composition returned by
+/// WRITE is never materialized to the composition store and a
+/// follow-up GET (same or cross-protocol) sees 404.
+///
+/// `op_close` runs `flush_writes(state.current_fh)` before validating
+/// the stateid, so the flush still lands even if the stateid round
+/// trip fails. We tolerate `NFS4ERR_BAD_STATEID` at the CLOSE op
+/// level — the compound's top-level status is what matters.
+fn flush_via_close(
+    sess: &mut Nfs4Session,
+    minor_version: u32,
+    fh: &[u8],
+    stateid_seqid: u32,
+    stateid_other_bytes: &[u8],
+) -> Result<(), GatewayError> {
+    let mut w = XdrWriter::new();
+    w.write_opaque(fh);
+    let putfh = (op::PUTFH, w.into_bytes());
+
+    // CLOSE4args wire layout kiseki's op_close parses:
+    //   u32 open_seqid (outer seqid4 — NFSv4.0 carry-over, unused
+    //                   under sessions but the slot is read)
+    //   u32 stateid_seqid
+    //   opaque stateid_other[12]
+    // Total: 20 bytes.
+    let mut w = XdrWriter::new();
+    w.write_u32(0); // outer seqid4 — unused under sessions
+    w.write_u32(stateid_seqid);
+    w.write_opaque_fixed(stateid_other_bytes);
+    let close = (op::CLOSE, w.into_bytes());
+
+    let reply = sess.sequenced_compound(minor_version, &[putfh, close])?;
+    let mut r = XdrReader::new(&reply);
+    let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // PUTFH op
+    let putfh_st = r.read_u32().map_err(|e| xdr_err(&e))?;
+    if putfh_st != NFS4_OK {
+        return Err(GatewayError::ProtocolError(format!(
+            "CLOSE-compound PUTFH: {putfh_st}"
+        )));
+    }
+    let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // CLOSE op
+    let _ = r.read_u32().map_err(|e| xdr_err(&e))?; // status (tolerated)
+    Ok(())
+}
+
 /// Consume the `open_delegation4` union body that follows the
 /// discriminator in an OPEN reply. RFC 8881 §10.4.2 + §18.16.4:
 ///
@@ -518,9 +566,11 @@ impl GatewayOps for Nfs4Client {
         if open_st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("OPEN: {open_st}")));
         }
-        // stateid4: seqid(4) + other(12)
-        let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
-        let _ = r.read_opaque_fixed(12).map_err(|e| xdr_err(&e))?;
+        // stateid4: seqid(4) + other(12). Capture both — needed for the
+        // CLOSE in the second compound below (op_close is the only
+        // flush trigger post-#50; op_commit is a documented no-op).
+        let stateid_seqid = r.read_u32().map_err(|e| xdr_err(&e))?;
+        let stateid_other_bytes = r.read_opaque_fixed(12).map_err(|e| xdr_err(&e))?;
         // change_info4: atomic(4) + before(8) + after(8)
         let _ = r.read_u32().map_err(|e| xdr_err(&e))?;
         let _ = r.read_u64().map_err(|e| xdr_err(&e))?;
@@ -576,6 +626,14 @@ impl GatewayOps for Nfs4Client {
         } else {
             CompositionId(uuid::Uuid::new_v4())
         };
+
+        flush_via_close(
+            sess,
+            self.minor_version,
+            &fh,
+            stateid_seqid,
+            &stateid_other_bytes,
+        )?;
 
         Ok(WriteResponse {
             composition_id,

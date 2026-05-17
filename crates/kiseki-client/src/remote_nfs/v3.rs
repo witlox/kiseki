@@ -27,6 +27,7 @@ const NFS3_VERSION: u32 = 3;
 const NFSPROC3_NULL: u32 = 0;
 const NFSPROC3_READ: u32 = 6;
 const NFSPROC3_WRITE: u32 = 7;
+const NFSPROC3_COMMIT: u32 = 21;
 const NFSPROC3_CREATE: u32 = 8;
 const NFSPROC3_REMOVE: u32 = 12;
 const NFSPROC3_FSINFO: u32 = 19;
@@ -216,6 +217,35 @@ impl GatewayOps for Nfs3Client {
         if status != NFS3_OK {
             return Err(GatewayError::ProtocolError(format!(
                 "NFSv3 WRITE failed: status={status}"
+            )));
+        }
+
+        // COMMIT (RFC 1813 §3.3.21) — required after WRITE so the
+        // server's per-fh buffer is flushed and the placeholder
+        // composition is materialized. Without this, a follow-up GET
+        // (NFS or cross-protocol via S3) on the returned
+        // composition_id sees 404 until the next periodic flush.
+        //
+        // Real Linux NFS clients issue COMMIT before close /
+        // cross-mount visibility for the same reason. PR #50 removed
+        // inline flush on `stable >= 1` to prevent F-1
+        // (per-WRITE Raft hydrator saturation under `fio --direct=1`),
+        // so COMMIT is now the only flush trigger.
+        let mut args = XdrWriter::new();
+        args.write_opaque(&file_fh);
+        args.write_u64(0); // offset
+        args.write_u32(0); // count = 0 → flush all
+        let reply = t.call(
+            NFS_PROGRAM,
+            NFS3_VERSION,
+            NFSPROC3_COMMIT,
+            &args.into_bytes(),
+        )?;
+        let mut r = XdrReader::new(&reply);
+        let status = r.read_u32().map_err(|e| xdr_err(&e))?;
+        if status != NFS3_OK {
+            return Err(GatewayError::ProtocolError(format!(
+                "NFSv3 COMMIT failed: status={status}"
             )));
         }
 

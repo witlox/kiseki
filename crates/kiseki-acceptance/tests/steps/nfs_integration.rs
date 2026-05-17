@@ -514,8 +514,17 @@ async fn when_nfs3_null(w: &mut KisekiWorld) {
     // NFSv3 NULL = program 100003, version 3, procedure 0
     let result = transport.call(100003, 3, 0, &[]);
     match result {
-        Ok(_) => w.last_error = None,
-        Err(e) => w.last_error = Some(format!("{e}")),
+        Ok(reply) => {
+            // Mirror when_nfs_null (v4): capture the reply body so the
+            // shared `then_rpc_accept` step can verify the RFC 1813
+            // §2.7 / RFC 8881 §16.1 contract (empty body on NULL).
+            w.server_mut().last_body = Some(reply);
+            w.last_error = None;
+        }
+        Err(e) => {
+            w.last_error = Some(format!("{e}"));
+            w.server_mut().last_body = None;
+        }
     }
 }
 
