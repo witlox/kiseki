@@ -210,33 +210,58 @@ impl<G: GatewayOps> FuseDaemon<G> {
             .lock_or_die("fuse_daemon.inner.write.flush_take_buffer")
             .flush_take_buffer(ino);
         if let Some(req) = req {
-            // Phase 2: gateway call (no exclusive lock).
-            let resp = {
+            // Phase 2: gateway call — NO LOCK held. Issue #64: the
+            // previous shape held a READ lock across `block_on(
+            // gateway.write(...))`. Concurrent FUSE_WRITE handlers
+            // need the WRITE lock, so they blocked for the full
+            // gateway latency. Under `sync(2)`, the kernel waits for
+            // dirty page write-back before completing — but those
+            // write-backs are exactly the FUSE_WRITE handlers that
+            // were blocked. Result: deadlock against `super_lock`,
+            // and from the user's POV the FUSE daemon stops
+            // responding to subsequent stat/read calls.
+            //
+            // Clone the gateway `Arc<G>` + runtime handle inside the
+            // read guard, drop the guard, then call. Same semantics
+            // (the gateway is shared via Arc whether we deref through
+            // a guard or through a clone), no lock held during the
+            // blocking call.
+            let (gateway, rt) = {
                 let fs = self
                     .inner
                     .read()
                     .lock_or_die("fuse_daemon.inner.read.gateway_write");
-                fs.block_gateway_pub(fs.gateway().write(req))
-                    .map_err(|_| crate::fuse_fs::libc_eio())?
+                (fs.gateway_arc(), fs.rt_arc())
             };
+            let resp = if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(|| rt.block_on(gateway.write(req)))
+            } else {
+                rt.block_on(gateway.write(req))
+            }
+            .map_err(|_| crate::fuse_fs::libc_eio())?;
             // Phase 3: persist composition_id.
             self.inner
                 .write()
                 .lock_or_die("fuse_daemon.inner.write.flush_apply_response")
                 .flush_apply_response(ino, &resp);
         }
-        // Phase 4: durability barrier for `fsync(2)` callers. Even
-        // when there was no dirty buffer (no-op flush) we still
-        // honor the durability call — the user's `fsync(2)` may
-        // be sequencing prior writes by other handles on the
-        // same file.
+        // Phase 4: durability barrier for `fsync(2)` callers. Same
+        // lock-free pattern as Phase 2 — clone the Arc out of the
+        // guard, drop the guard, then block.
         if force_fsync {
-            let fs = self
-                .inner
-                .read()
-                .lock_or_die("fuse_daemon.inner.read.fsync_pending");
-            fs.block_gateway_pub(fs.gateway().fsync_pending())
-                .map_err(|_| crate::fuse_fs::libc_eio())?;
+            let (gateway, rt) = {
+                let fs = self
+                    .inner
+                    .read()
+                    .lock_or_die("fuse_daemon.inner.read.fsync_pending");
+                (fs.gateway_arc(), fs.rt_arc())
+            };
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(|| rt.block_on(gateway.fsync_pending()))
+            } else {
+                rt.block_on(gateway.fsync_pending())
+            }
+            .map_err(|_| crate::fuse_fs::libc_eio())?;
         }
         Ok(())
     }
@@ -418,16 +443,24 @@ impl<G: GatewayOps + Send + Sync + 'static> kiseki_fuse::Filesystem for FuseDaem
         };
         let size = req.data.len() as u64;
 
-        // Phase 2: gateway call — NO LOCK held. Other FUSE ops
-        // (write, read, unlink) proceed concurrently. This is the
-        // FUSE p99 fix: pre-fix, every other op queued behind this
-        // call's exclusive lock for the full gateway latency.
-        let fut_resp = {
+        // Phase 2: gateway call — TRULY no lock held. Same #64 fix
+        // as `flush_dirty_buffer` Phase 2: pre-fix the comment said
+        // "no lock" but the call site held a read guard across the
+        // blocking `block_on(gateway.write(...))`. That blocked
+        // concurrent FUSE_WRITE handlers (write guard) and could
+        // deadlock under `sync(2)`. Clone the Arc out, drop the
+        // guard, then block.
+        let (gateway, rt) = {
             let fs = self
                 .inner
                 .read()
                 .lock_or_die("fuse_daemon.inner.read.create_gateway_write");
-            fs.block_gateway_pub(fs.gateway().write(req))
+            (fs.gateway_arc(), fs.rt_arc())
+        };
+        let fut_resp = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| rt.block_on(gateway.write(req)))
+        } else {
+            rt.block_on(gateway.write(req))
         };
         let resp = match fut_resp {
             Ok(r) => r,
