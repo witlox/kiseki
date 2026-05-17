@@ -82,6 +82,39 @@ use crate::error::GatewayError;
 use crate::ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 use kiseki_common::locks::LockOrDie;
 
+/// First-touch namespace provisioner (ADR-033 §1 + §4).
+///
+/// The runtime injects an impl backed by the control-plane Raft
+/// group so the gateway can auto-create multi-shard topology for any
+/// namespace touched by the data path — without operator-side
+/// `kiseki-admin namespace-create-sharded` plumbing. Without this
+/// hook the gateway falls back to local-only single-shard
+/// registration (`comps.add_namespace`), which routes every write
+/// for that namespace through one Raft leader.
+///
+/// `provision` is contracted to be:
+/// - **Idempotent**: a repeat call for an existing namespace must
+///   succeed (the control-plane apply already short-circuits).
+/// - **Synchronous on the data path**: returns once the cluster-wide
+///   shard topology is committed so the immediately-following gateway
+///   write routes through `shard_map`. The data path serializes on
+///   this call only the first time a namespace is touched.
+/// - **Safe under concurrent calls**: multiple gateway threads racing
+///   on the same fresh namespace must converge on one topology
+///   (`ControlError::Rejected("namespace creation in progress")` is
+///   the expected raced loser; the runtime impl swallows it and
+///   waits-then-returns).
+#[async_trait::async_trait]
+pub trait NamespaceProvisioner: Send + Sync {
+    /// Ensure the namespace exists in the control-plane shard map
+    /// with multi-shard topology. Idempotent.
+    async fn provision(
+        &self,
+        namespace_id: kiseki_common::ids::NamespaceId,
+        tenant_id: kiseki_common::ids::OrgId,
+    ) -> Result<(), GatewayError>;
+}
+
 /// In-memory gateway backed by composition store, chunk store, and crypto.
 ///
 /// Uses `tokio::sync::Mutex` for interior mutability so `GatewayOps` methods can
@@ -248,6 +281,13 @@ pub struct InMemoryGateway {
     /// adaptive spin + word-sized lock body is meaningfully cheaper
     /// for short, contended critical sections.
     decrypt_cache: parking_lot::Mutex<DecryptCache>,
+    /// First-touch namespace provisioner (ADR-033). When wired,
+    /// `ensure_namespace_exists` consults the control-plane Raft
+    /// group to register a multi-shard topology for namespaces
+    /// touched for the first time. Without this, fresh-namespace
+    /// PUTs land on a single primary shard and PUT throughput
+    /// collapses to one Raft leader.
+    namespace_provisioner: std::sync::RwLock<Option<Arc<dyn NamespaceProvisioner>>>,
 }
 
 /// Lock-free snapshot of the namespace metadata fields the write hot
@@ -497,6 +537,7 @@ impl InMemoryGateway {
             fsync_hooks: std::sync::RwLock::new(Vec::new()),
             decrypt_cache: parking_lot::Mutex::new(DecryptCache::new(read_decrypt_cache_ttl())),
             namespace_meta: std::sync::Arc::new(parking_lot::RwLock::new(namespace_meta_init)),
+            namespace_provisioner: std::sync::RwLock::new(None),
         }
     }
 
@@ -688,6 +729,19 @@ impl InMemoryGateway {
         store: Arc<kiseki_control::shard_topology::NamespaceShardMapStore>,
     ) {
         *self.shard_map.write().lock_or_die("mem_gateway.unknown") = Some(store);
+    }
+
+    /// Attach a `NamespaceProvisioner` so the gateway can auto-create
+    /// multi-shard topology on first touch of a fresh namespace
+    /// (ADR-033 §1). Production runtime wires an impl backed by the
+    /// control-plane Raft group; tests and single-node deployments
+    /// leave this `None` and fall back to the local single-shard
+    /// `comps.add_namespace` path.
+    pub fn set_namespace_provisioner(&self, p: Arc<dyn NamespaceProvisioner>) {
+        *self
+            .namespace_provisioner
+            .write()
+            .lock_or_die("mem_gateway.unknown") = Some(p);
     }
 
     /// Simulate a gateway crash: drop all ephemeral state.
@@ -1062,6 +1116,49 @@ impl InMemoryGateway {
         tenant_id: kiseki_common::ids::OrgId,
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<(), GatewayError> {
+        // ADR-033 §1: if a multi-shard topology provisioner is wired,
+        // create the namespace in the control-plane shard map BEFORE
+        // the local composition registration. The provisioner submits
+        // CreateNamespace to the cluster-control Raft group, which
+        // hydrates this gateway's shard_map via the apply hook
+        // (`ControlStateMachine::hydrate_shard_map`) on every node.
+        // After this returns the gateway's `route_to_shard` lookup
+        // covers the fresh namespace's N shards — without it the
+        // first PUT lands on one Raft leader and PUT throughput
+        // collapses (RCA: 2026-05-17).
+        //
+        // Avoid the provisioner call when the namespace is already in
+        // the local shard_map (fast path: every subsequent PUT in the
+        // same namespace skips the trip).
+        let already_provisioned = {
+            let guard = self.shard_map.read().lock_or_die("mem_gateway.unknown");
+            guard
+                .as_ref()
+                .is_some_and(|sm| sm.namespace_exists(&namespace_id.0.to_string()))
+        };
+        if !already_provisioned {
+            let provisioner = self
+                .namespace_provisioner
+                .read()
+                .lock_or_die("mem_gateway.unknown")
+                .clone();
+            if let Some(p) = provisioner {
+                if let Err(e) = p.provision(namespace_id, tenant_id).await {
+                    tracing::warn!(
+                        namespace_id = %namespace_id.0,
+                        error = %e,
+                        "ensure_namespace_exists: provisioner failed — falling back to local single-shard registration",
+                    );
+                    // Don't bail — proceed with the legacy path so a
+                    // transient control-plane outage doesn't make all
+                    // writes 5xx. The follower hydrator path still
+                    // syncs the composition state via the per-shard
+                    // log; routing degrades to single-shard until the
+                    // next call hits a healthy provisioner.
+                }
+            }
+        }
+
         let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
         let ns = kiseki_composition::namespace::Namespace {
             id: namespace_id,

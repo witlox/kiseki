@@ -917,7 +917,6 @@ fn handle_bench(args: &[String]) {
     let mut duration_secs: u64 = 30;
     let mut warmup_objects: usize = 256;
     let mut json = false;
-    let mut namespace_fanout: usize = 1;
 
     let mut i = 0;
     while i < args.len() {
@@ -981,13 +980,6 @@ fn handle_bench(args: &[String]) {
                 json = true;
                 i += 1;
             }
-            "--namespace-fanout" => {
-                namespace_fanout = args
-                    .get(i + 1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(namespace_fanout);
-                i += 2;
-            }
             "--help" | "-h" => {
                 println!(
                     "\
@@ -1003,11 +995,6 @@ OPTIONS:
     --object-size <bytes>     payload size     (default: 65536)
     --duration-secs <N>       wall-clock cap   (default: 30)
     --warmup-objects <N>      pre-populate for GET shapes (default: 256)
-    --namespace-fanout <N>    round-robin PUTs across N namespaces (default: 1)
-                              native: distinct NamespaceIds derived from
-                              `bench-ns-<i>` UUIDv5. s3: distinct buckets
-                              `bench-<i>` (each maps to its own namespace).
-                              Issue #66 — spreads load across shard leaders.
     --json                    machine-readable single-line JSON
 "
                 );
@@ -1034,7 +1021,6 @@ OPTIONS:
         duration: std::time::Duration::from_secs(duration_secs),
         warmup_objects,
         json,
-        namespace_fanout,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

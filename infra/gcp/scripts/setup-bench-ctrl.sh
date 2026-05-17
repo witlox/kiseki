@@ -78,11 +78,6 @@ FIRST_STORAGE=$(echo "${storage_ips}" | cut -d',' -f1)
 KISEKI_PERF_BUCKET="${perf_bucket}"
 KISEKI_PROFILE="${profile}"
 KISEKI_BENCH_SUITE="${bench_suite}"
-# Tenant UUID used by `kiseki-client bench` and the bench namespace
-# topology (`OrgId(Uuid::from_u128(1))` in `default_ids`, matched by
-# the server's `bootstrap_tenant`). Threaded into setup-shards.sh
-# and any operator tooling that needs it.
-KISEKI_BENCH_TENANT_ID="00000000-0000-0000-0000-000000000001"
 EOF
 
 # Register SSH key with OS Login for ctrl→node access.
@@ -97,20 +92,6 @@ gcloud compute os-login ssh-keys add --key-file=/root/.ssh/id_ed25519.pub --ttl=
 OS_USER=$(gcloud compute os-login describe-profile --format='value(posixAccounts[0].username)' 2>/dev/null || echo root)
 echo "SSH_USER=$OS_USER" >> /etc/kiseki-bench.env
 echo "SSH key registered (OS Login user: $OS_USER)"
-
-# Post-boot topology setup: create multi-shard `bench-ns-<i>`
-# namespaces so `kiseki-client bench --namespace-fanout N` actually
-# fans PUTs across multiple shard leaders (#66 fix 2, #68
-# endpoint, #69 this script). Best-effort: if leader convergence
-# is slow or the admin endpoint isn't ready, log + continue —
-# phase 00's shard-count probe is the secondary safety net.
-if [ -x /opt/kiseki-bench/setup-shards.sh ]; then
-  echo "=== Setting up bench namespace topology ==="
-  bash /opt/kiseki-bench/setup-shards.sh 2>&1 | sed 's/^/  /' \
-    || echo "  (setup-shards.sh returned non-zero — phase 00 will fail-loud if topology is incomplete)"
-else
-  echo "WARNING: /opt/kiseki-bench/setup-shards.sh not present — bench fanout will collapse to bootstrap shard" >&2
-fi
 
 echo "=== Benchmark controller ready ==="
 echo "Profile:        ${profile}"

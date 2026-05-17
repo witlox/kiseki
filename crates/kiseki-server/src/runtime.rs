@@ -196,6 +196,196 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
     )
 }
 
+/// Initialize per-shard Raft membership for shards seeded by the
+/// control-plane `CreateNamespace` commit.
+///
+/// The apply hook on every node registers the shard's local Raft
+/// handle but doesn't call `initialize_membership` — by convention
+/// that's the leader's job, dispatched separately so vote requests
+/// don't race against peer registration. For the bootstrap path the
+/// bootstrap node is the only one that can drive it (it's the
+/// process that submitted the `CreateNamespace`).
+///
+/// `skip` lets the caller exclude the bootstrap shard, whose
+/// membership was already initialized inline before the
+/// `CreateNamespace` seed. Idempotent on a per-shard basis: a retried
+/// `initialize_membership` returns `NotAllowed` after the first
+/// commit, which `OpenRaftLogStore::initialize_membership` maps to
+/// `Ok(())`.
+async fn initialize_seeded_shards(
+    store: &Arc<kiseki_log::RaftShardStore>,
+    shard_ids: &[kiseki_common::ids::ShardId],
+    skip: Option<kiseki_common::ids::ShardId>,
+    label: &'static str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut initialized = 0usize;
+    for shard_id in shard_ids {
+        if skip == Some(*shard_id) {
+            continue;
+        }
+        // The apply hook fires after the CreateNamespace commit on
+        // every node, so by the time this runs the local shard
+        // handle should exist. If it doesn't yet (apply still in
+        // flight on a slow node), retry — handle registration is
+        // synchronous within the apply.
+        let mut last_err: Option<kiseki_log::LogError> = None;
+        while std::time::Instant::now() < deadline {
+            match store.initialize_shard_async(*shard_id).await {
+                Ok(()) => {
+                    last_err = None;
+                    initialized += 1;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            tracing::warn!(
+                label,
+                shard_id = %shard_id.0,
+                error = %e,
+                "initialize_shard: failed after 60s — shard will not accept writes",
+            );
+        }
+    }
+    if initialized > 0 {
+        tracing::info!(
+            label,
+            initialized,
+            total = shard_ids.len(),
+            "control-plane: per-shard Raft groups initialized",
+        );
+    }
+}
+
+/// Retry a control-plane `submit` through leader election. Returns
+/// once the command commits or the 60 s deadline elapses (whichever
+/// first). Called from the bootstrap path on the dedicated raft
+/// runtime so the `client_write` awaits don't try to drive the host
+/// runtime's reactor.
+async fn submit_with_leader_retry(
+    ctrl_store: &Arc<crate::cluster_control::OpenRaftControlStore>,
+    cmd: crate::cluster_control::ControlCommand,
+    label: &'static str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut attempt = 0u32;
+    loop {
+        match ctrl_store.submit(cmd.clone()).await {
+            Ok(_) => {
+                tracing::info!(
+                    label,
+                    attempts = attempt + 1,
+                    "control-plane: namespace seeded",
+                );
+                return;
+            }
+            Err(e) if std::time::Instant::now() < deadline => {
+                attempt += 1;
+                if attempt % 10 == 0 {
+                    tracing::debug!(
+                        label,
+                        attempt,
+                        error = %e,
+                        "control-plane seed: still retrying",
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    label,
+                    error = %e,
+                    attempts = attempt,
+                    "control-plane seed: failed after 60s — \
+                     cluster will operate without control-plane state \
+                     for this namespace",
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// `NamespaceProvisioner` impl backed by the control-plane Raft group.
+///
+/// Called from the gateway's `ensure_namespace_exists` on the first
+/// touch of a fresh namespace (ADR-033 §1). Submits a
+/// `ControlCommand::CreateNamespace` that hydrates the
+/// `NamespaceShardMapStore` on every node via the state machine's
+/// apply hook. Subsequent writes route by `hashed_key` range.
+///
+/// Idempotent: re-submission of an already-existing namespace is
+/// caught both in `ensure_namespace_exists`'s `shard_map` fast-path
+/// check and (defensively) by the state machine's `apply_command`
+/// which returns the existing shard count.
+struct ControlPlaneProvisioner {
+    ctrl_store: Arc<crate::cluster_control::OpenRaftControlStore>,
+    active_nodes: Vec<kiseki_common::ids::NodeId>,
+    raft_runtime: tokio::runtime::Handle,
+}
+
+#[async_trait::async_trait]
+impl kiseki_gateway::mem_gateway::NamespaceProvisioner for ControlPlaneProvisioner {
+    async fn provision(
+        &self,
+        namespace_id: kiseki_common::ids::NamespaceId,
+        tenant_id: kiseki_common::ids::OrgId,
+    ) -> Result<(), kiseki_gateway::error::GatewayError> {
+        let n = kiseki_control::shard_topology::compute_initial_shards(
+            &kiseki_control::shard_topology::ShardTopologyConfig::default(),
+            u32::try_from(self.active_nodes.len()).unwrap_or(1).max(1),
+        );
+        let shards: Vec<crate::cluster_control::commands::ShardRecord> =
+            kiseki_control::shard_topology::compute_shard_ranges(n, &self.active_nodes)
+                .into_iter()
+                .map(|r| crate::cluster_control::commands::ShardRecord {
+                    shard_id: r.shard_id,
+                    range_start: r.range_start,
+                    range_end: r.range_end,
+                    leader_node: r.leader_node,
+                })
+                .collect();
+        let cmd = crate::cluster_control::ControlCommand::CreateNamespace {
+            namespace_id: namespace_id.0.to_string(),
+            tenant_id,
+            shards,
+        };
+        // The data path may be on the host tokio runtime; openraft's
+        // client_write must run on the Raft runtime. Cross to the
+        // Raft runtime so we don't deadlock when the leader's apply
+        // pipeline parks on the host runtime's reactor.
+        let ctrl = Arc::clone(&self.ctrl_store);
+        let res = self
+            .raft_runtime
+            .spawn(async move { ctrl.submit(cmd).await })
+            .await
+            .map_err(|e| {
+                kiseki_gateway::error::GatewayError::Upstream(format!("raft join failed: {e}"))
+            })?;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // The control-plane state machine is idempotent: a
+                // race-loser's submit gets `AlreadyExists` from the
+                // local store. Treat that as success — the topology
+                // is committed.
+                let msg = e.to_string();
+                if msg.contains("AlreadyExists") || msg.contains("already exists") {
+                    return Ok(());
+                }
+                Err(kiseki_gateway::error::GatewayError::Upstream(format!(
+                    "namespace provision: {e}"
+                )))
+            }
+        }
+    }
+}
+
 /// Recursive directory size in bytes. Tolerates I/O errors (returns
 /// the partial sum). Used by the periodic composition-store gauge —
 /// fjall is a keyspace directory rather than a single file.
@@ -370,6 +560,13 @@ pub async fn run_main(
     // `initialize_shard` call after `RecordSplit` commits. Same
     // gating as `cluster_control_store` — only set on multi-node.
     let mut raft_shard_store_for_admin: Option<Arc<kiseki_log::RaftShardStore>> = None;
+    // ADR-033 §5: gateway-readable shard map. Hydrated by the control-
+    // plane apply (every node) so the gateway's `route_to_shard`
+    // engages on the hot path. `None` on single-node smoke paths
+    // where the control plane is also absent.
+    let mut shard_map_store_for_gateway: Option<
+        Arc<kiseki_control::shard_topology::NamespaceShardMapStore>,
+    > = None;
     let log_store: Arc<dyn kiseki_log::LogOps + Send + Sync> = if cfg.node_id > 0
         && cfg.raft_peers.len() > 1
     {
@@ -437,6 +634,14 @@ pub async fn run_main(
         let apply_hook: Arc<dyn crate::cluster_control::ApplyHook> = Arc::new(
             crate::cluster_control::ShardStoreApplyHook::new(Arc::clone(&store_arc), cfg.node_id),
         );
+        // ADR-033 §5: shared shard map between (a) the control-plane
+        // state machine's apply path (populates it on every node) and
+        // (b) the gateway's `shard_map` field (consults it for
+        // `route_to_shard`). Single source of truth — see
+        // `ControlStateMachine::hydrate_shard_map`.
+        let shard_map_store =
+            Arc::new(kiseki_control::shard_topology::NamespaceShardMapStore::new());
+        let shard_map_for_ctrl = Arc::clone(&shard_map_store);
         let peers_for_ctrl = peers.clone();
         let bootstrap_flag = cfg.bootstrap;
         let data_dir_for_ctrl = cfg.data_dir.clone();
@@ -458,6 +663,7 @@ pub async fn run_main(
                     apply_hook,
                     bootstrap_flag,
                     Some(ctrl_metrics),
+                    Some(shard_map_for_ctrl),
                 )
                 .await
                 .map(Arc::new)
@@ -486,68 +692,162 @@ pub async fn run_main(
         // RPC will encounter a usable, seeded namespace map by the
         // time consensus closes.
         if cfg.bootstrap {
+            // Multi-shard bootstrap namespaces (#66): every standard
+            // client (mount -t nfs4, aws s3 cp, FUSE, native bench)
+            // writes against either the bootstrap-tenant namespace
+            // (NFS / FUSE) or the UUIDv5("default") namespace (S3
+            // default bucket, bench `default_ids()`). Both must be
+            // sharded across the cluster at boot or per-protocol
+            // PUT throughput collapses to one Raft leader.
+            //
+            // compute_shard_ranges round-robins the leader_node
+            // across the cluster's NodeId list — shard_count =
+            // 3 × node_count distributes ~3 leaders per node and
+            // PUT loads balance naturally across Raft groups.
+            //
+            // The original single-shard bootstrap was correct for
+            // a fresh-empty cluster + operator who'd grow shards
+            // via `kiseki-admin shard split` later, but every PUT
+            // shipped to that single leader meanwhile. HPC clients
+            // never get there — they want fanout from minute one.
+            let bootstrap_active_nodes: Vec<kiseki_common::ids::NodeId> = cfg
+                .raft_peers
+                .iter()
+                .map(|(id, _)| kiseki_common::ids::NodeId(*id))
+                .collect();
+            let bootstrap_active_nodes = if bootstrap_active_nodes.is_empty() {
+                // Single-node smoke / dev-box paths: degenerate to
+                // node 1 so the apply hook still fires.
+                vec![kiseki_common::ids::NodeId(1)]
+            } else {
+                bootstrap_active_nodes
+            };
+            let bootstrap_shard_count = kiseki_control::shard_topology::compute_initial_shards(
+                &kiseki_control::shard_topology::ShardTopologyConfig::default(),
+                u32::try_from(bootstrap_active_nodes.len())
+                    .unwrap_or(1)
+                    .max(1),
+            );
+            // Bootstrap-tenant namespace (NFS / FUSE default mount).
+            // Reserve shard_id #1 (`Uuid::from_u128(1)`) for the
+            // first slot — preserves the long-standing invariant
+            // that node-1 owns that ID for cluster_info
+            // compatibility. Remaining shards get fresh UUIDs via
+            // compute_shard_ranges.
+            let mut shards_for_bootstrap: Vec<crate::cluster_control::commands::ShardRecord> =
+                kiseki_control::shard_topology::compute_shard_ranges(
+                    bootstrap_shard_count,
+                    &bootstrap_active_nodes,
+                )
+                .into_iter()
+                .map(|r| crate::cluster_control::commands::ShardRecord {
+                    shard_id: r.shard_id,
+                    range_start: r.range_start,
+                    range_end: r.range_end,
+                    leader_node: r.leader_node,
+                })
+                .collect();
+            if let Some(first) = shards_for_bootstrap.first_mut() {
+                first.shard_id = bootstrap_shard;
+            }
+            // S3 default-bucket / bench default namespace. UUIDv5 of
+            // `b"default"` — must match `namespace_from_bucket("default")`
+            // in `kiseki-gateway/src/s3_server.rs` and `default_ids()`
+            // in `kiseki-client/src/bench.rs`. Independent shard set
+            // (fresh shard IDs from compute_shard_ranges; no
+            // collision with bootstrap_shard).
+            let default_ns_str =
+                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default").to_string();
+            let shards_for_default: Vec<crate::cluster_control::commands::ShardRecord> =
+                kiseki_control::shard_topology::compute_shard_ranges(
+                    bootstrap_shard_count,
+                    &bootstrap_active_nodes,
+                )
+                .into_iter()
+                .map(|r| crate::cluster_control::commands::ShardRecord {
+                    shard_id: r.shard_id,
+                    range_start: r.range_start,
+                    range_end: r.range_end,
+                    leader_node: r.leader_node,
+                })
+                .collect();
+            tracing::info!(
+                bootstrap_shards = shards_for_bootstrap.len(),
+                default_shards = shards_for_default.len(),
+                active_nodes = bootstrap_active_nodes.len(),
+                "control-plane: seeding bootstrap + default namespaces with multi-shard topology",
+            );
+            // Submit BOTH CreateNamespaces on the raft runtime,
+            // retrying through leader election. Each namespace gets
+            // its own retry loop so a transient failure on one
+            // doesn't stop the other. The state machine's
+            // `apply_command` is idempotent for already-existing
+            // namespaces (returns existing shard count), so replay
+            // through snapshot install is safe.
+            //
+            // After a CreateNamespace commits, the bootstrap node
+            // calls `initialize_shard_async` for each NEW per-shard
+            // Raft group (skipping `bootstrap_shard` which was
+            // already initialized inline above). Without this step
+            // the apply hook registers the groups locally but no
+            // membership entry ever lands → first PUT routed to one
+            // of those shards fails with `shard not found`.
             let ctrl_for_seed = Arc::clone(&ctrl_store);
             let raft_rt_for_seed = store_arc.raft_runtime_handle();
-            let bootstrap_ns = bootstrap_tenant.0.to_string();
+            let bootstrap_ns_str = bootstrap_tenant.0.to_string();
+            let store_for_init = Arc::clone(&store_arc);
+            let bootstrap_shard_for_init = bootstrap_shard;
+            let bootstrap_shard_ids: Vec<kiseki_common::ids::ShardId> =
+                shards_for_bootstrap.iter().map(|s| s.shard_id).collect();
+            let default_shard_ids: Vec<kiseki_common::ids::ShardId> =
+                shards_for_default.iter().map(|s| s.shard_id).collect();
             std::thread::spawn(move || {
                 raft_rt_for_seed.block_on(async move {
-                    let cmd = crate::cluster_control::ControlCommand::CreateNamespace {
-                        namespace_id: bootstrap_ns,
-                        tenant_id: bootstrap_tenant,
-                        shards: vec![crate::cluster_control::commands::ShardRecord {
-                            shard_id: bootstrap_shard,
-                            range_start: [0u8; 32],
-                            range_end: [0xFFu8; 32],
-                            leader_node: kiseki_common::ids::NodeId(1),
-                        }],
-                    };
-                    // Retry for up to 60s while leader election
-                    // converges. The control-plane group's
-                    // initialize() returns immediately but voters
-                    // don't agree on a leader until the other
-                    // nodes' control-plane groups come up — and
-                    // the BDD harness brings nodes up serially,
-                    // so node-1's first ~5s sees no peer.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    let mut attempt = 0u32;
-                    loop {
-                        match ctrl_for_seed.submit(cmd.clone()).await {
-                            Ok(_) => {
-                                tracing::info!(
-                                    attempts = attempt + 1,
-                                    "control-plane: bootstrap namespace seeded",
-                                );
-                                return;
-                            }
-                            Err(e) if std::time::Instant::now() < deadline => {
-                                attempt += 1;
-                                if attempt % 10 == 0 {
-                                    tracing::debug!(
-                                        attempt,
-                                        error = %e,
-                                        "control-plane bootstrap seed: still retrying",
-                                    );
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    attempts = attempt,
-                                    "control-plane bootstrap CreateNamespace failed \
-                                     after 60s — cluster will operate without \
-                                     control-plane state",
-                                );
-                                return;
-                            }
-                        }
-                    }
+                    submit_with_leader_retry(
+                        &ctrl_for_seed,
+                        crate::cluster_control::ControlCommand::CreateNamespace {
+                            namespace_id: bootstrap_ns_str,
+                            tenant_id: bootstrap_tenant,
+                            shards: shards_for_bootstrap,
+                        },
+                        "bootstrap namespace",
+                    )
+                    .await;
+                    initialize_seeded_shards(
+                        &store_for_init,
+                        &bootstrap_shard_ids,
+                        Some(bootstrap_shard_for_init),
+                        "bootstrap namespace",
+                    )
+                    .await;
+                    submit_with_leader_retry(
+                        &ctrl_for_seed,
+                        crate::cluster_control::ControlCommand::CreateNamespace {
+                            namespace_id: default_ns_str,
+                            tenant_id: bootstrap_tenant,
+                            shards: shards_for_default,
+                        },
+                        "default namespace (S3 + bench)",
+                    )
+                    .await;
+                    initialize_seeded_shards(
+                        &store_for_init,
+                        &default_shard_ids,
+                        None,
+                        "default namespace (S3 + bench)",
+                    )
+                    .await;
                 });
             });
         }
 
         cluster_control_store = Some(ctrl_store);
         raft_shard_store_for_admin = Some(Arc::clone(&store_arc));
+        // Hand the shard map to the gateway-construction block below.
+        // Until `gw.set_shard_map(...)` is called the map sits idle —
+        // the apply path still hydrates it (so admin RPC reads work),
+        // but the data path doesn't consult it.
+        shard_map_store_for_gateway = Some(Arc::clone(&shard_map_store));
 
         store_arc
     } else if let Some(ref dir) = cfg.data_dir {
@@ -1212,6 +1512,51 @@ pub async fn run_main(
     // this the gateway's atomic counters tick but `/metrics` shows
     // zero — and the BDD harness has nothing to assert on.
     gw.set_workflow_table(workflow_table.clone());
+
+    // ADR-033 §5: hand the shard map to the gateway so writes route
+    // by hashed_key range across all shards in the namespace's
+    // topology. The map is hydrated by the control-plane apply path
+    // (every node) — without this `set_shard_map` call the gateway's
+    // `route_to_shard` lookup never fires and every write goes to
+    // the namespace's primary `comp.shard_id`, which is what the
+    // 2026-05-17 RCA traced "PUT throughput stuck at 1% of GET" to.
+    if let Some(sm) = shard_map_store_for_gateway.as_ref() {
+        gw.set_shard_map(Arc::clone(sm));
+        tracing::info!("gateway shard_map: wired (ADR-033 §5 routing engaged)",);
+    }
+
+    // ADR-033 §1: wire the first-touch provisioner so any namespace
+    // touched for the first time by S3, NFS, FUSE, or native picks
+    // up a multi-shard topology automatically — no operator-side
+    // `kiseki-admin namespace-create-sharded` step required. Only
+    // wired in multi-node mode where `cluster_control_store` exists;
+    // single-node smoke clusters fall back to the legacy single-
+    // shard `comps.add_namespace` path (no fanout to fan out to).
+    if let (Some(ctrl_store), Some(raft_store)) = (
+        cluster_control_store.as_ref(),
+        raft_shard_store_for_admin.as_ref(),
+    ) {
+        let active_nodes: Vec<kiseki_common::ids::NodeId> = cfg
+            .raft_peers
+            .iter()
+            .map(|(id, _)| kiseki_common::ids::NodeId(*id))
+            .collect();
+        let active_nodes = if active_nodes.is_empty() {
+            vec![kiseki_common::ids::NodeId(cfg.node_id)]
+        } else {
+            active_nodes
+        };
+        let provisioner = Arc::new(ControlPlaneProvisioner {
+            ctrl_store: Arc::clone(ctrl_store),
+            active_nodes,
+            raft_runtime: raft_store.raft_runtime_handle(),
+        });
+        gw.set_namespace_provisioner(provisioner);
+        tracing::info!(
+            "gateway namespace provisioner: wired \
+             (ADR-033 §1 first-touch multi-shard auto-create)",
+        );
+    }
 
     // FUSE / NFS `fsync(2)` correctness under the eventual-durability
     // optimization. Each registered hook drives a real fsync on its
