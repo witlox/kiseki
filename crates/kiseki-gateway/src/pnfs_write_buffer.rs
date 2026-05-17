@@ -192,6 +192,33 @@ impl DsWriteBuffers {
         Some(entry)
     }
 
+    /// Snapshot the accumulated bytes for `composition_id` without
+    /// removing the buffer. Returns `None` if no buffer exists.
+    ///
+    /// Used by `op_commit_ds` (RFC 8881 §18.3): COMMIT is "the server
+    /// has stable storage for the bytes you've written so far," NOT
+    /// "drop your buffer." Linux NFSv4.1 + `O_DIRECT` issues COMMIT
+    /// after **each** 1 MiB WRITE; if we drained the buffer per
+    /// COMMIT, the next COMMIT's new composition would only contain
+    /// the latest 1 MiB (zero-padded at lower offsets) and the
+    /// redirect would overwrite the previous COMMIT's composition_id
+    /// — silently orphaning prior data (#74).
+    ///
+    /// Keeping the buffer alive across COMMITs means each COMMIT's
+    /// `gateway.write` flushes the **full accumulated content** for
+    /// the file, the new composition supersedes the previous one in
+    /// the redirect map, and reads through the original fh4 always
+    /// land on a composition containing every byte written. The cap
+    /// (§D5.1, default 256 MiB) still bounds memory — buffers drain
+    /// on `DESTROY_SESSION` / `DESTROY_CLIENTID` via `clear_all`.
+    pub fn snapshot_for_commit(&self, composition_id: CompositionId) -> Option<BufferEntry> {
+        let g = self
+            .inner
+            .lock()
+            .lock_or_die("pnfs_write_buffer.snapshot_for_commit");
+        g.buffers.get(&composition_id).cloned()
+    }
+
     /// Record a redirect: subsequent reads through `original` resolve
     /// to `current`. Called by `op_commit_ds` after a successful
     /// `gateway.write`.
@@ -412,6 +439,49 @@ mod tests {
         // Drained — read returns nothing.
         let (bytes, _) = buf.read(cid(1), 0, 8);
         assert!(bytes.is_empty());
+    }
+
+    /// #74 regression: COMMIT must NOT remove the buffer. Linux pNFS +
+    /// `O_DIRECT` issues COMMIT after each 1 MiB WRITE — pre-fix `take`
+    /// dropped the buffer per COMMIT, so subsequent writes started
+    /// fresh and the new composition lost prior bytes. With
+    /// `snapshot_for_commit` the buffer stays alive and each COMMIT
+    /// flushes the full accumulated content.
+    #[test]
+    fn snapshot_for_commit_preserves_buffer_across_commits() {
+        let buf = DsWriteBuffers::with_cap(1024);
+        let (t, n) = tn();
+
+        // WRITE 1 + COMMIT 1
+        buf.buffer_write(cid(1), t, n, 0, b"AAAA");
+        let snap1 = buf
+            .snapshot_for_commit(cid(1))
+            .expect("snapshot present after first write");
+        assert_eq!(snap1.data, b"AAAA");
+
+        // Buffer survived the snapshot.
+        assert_eq!(buf.total_bytes(), 4);
+        let (live, _) = buf.read(cid(1), 0, 4);
+        assert_eq!(live, b"AAAA");
+
+        // WRITE 2 at offset=4 + COMMIT 2 → snapshot has BOTH writes.
+        buf.buffer_write(cid(1), t, n, 4, b"BBBB");
+        let snap2 = buf
+            .snapshot_for_commit(cid(1))
+            .expect("snapshot present after second write");
+        assert_eq!(
+            snap2.data, b"AAAABBBB",
+            "second commit must include first commit's bytes (#74)"
+        );
+
+        // Buffer still alive.
+        assert_eq!(buf.total_bytes(), 8);
+    }
+
+    #[test]
+    fn snapshot_for_commit_returns_none_for_missing_buffer() {
+        let buf = DsWriteBuffers::with_cap(1024);
+        assert!(buf.snapshot_for_commit(cid(42)).is_none());
     }
 
     #[test]

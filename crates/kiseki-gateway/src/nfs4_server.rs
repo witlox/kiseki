@@ -1380,15 +1380,6 @@ async fn op_layoutget<G: GatewayOps>(
         return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
     }
 
-    // #74 — Refuse write-mode layouts up front so both the
-    // production (`op_layoutget_ff`) and legacy fallback paths
-    // surface the same behaviour to operators. Details + rationale
-    // are in `op_layoutget_ff`.
-    if iomode >= 2 {
-        w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
-        return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
-    }
-
     // Phase 15b path — production MDS layout manager is wired.
     if let Some(mgr) = ctx.mds_layout_manager.as_ref() {
         return op_layoutget_ff(w, mgr, ctx, &fh, iomode, offset, length, layout_type).await;
@@ -1477,39 +1468,6 @@ async fn op_layoutget_ff<G: GatewayOps>(
     // explicit "server can't provide a layout" code; the kernel
     // pNFS client falls back to MDS reads/writes on receiving it.
     if pnfs_layout_disabled() {
-        w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
-        return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
-    }
-
-    // #74 — Refuse write-mode (`LAYOUTIOMODE4_RW = 2`) layouts: route
-    // to MDS WRITE instead.
-    //
-    // The chunk-staging buffer Phase 1 (`pnfs_write_buffer::
-    // DsWriteBuffers`) accumulates WRITEs per stateid and flushes on
-    // COMMIT — correct for kernel patterns that issue many WRITEs
-    // and one COMMIT at close. Linux NFSv4.1 with `--direct=1`
-    // issues COMMIT after **each** 1 MiB WRITE; the buffer flushes
-    // per write, each flush mints a fresh `composition_id`, and the
-    // redirect chain replaces the previous commit's data. 2026-05-17
-    // local 3-node compose pcap confirmed: a 4 MiB fio direct write
-    // produced 4 separate compositions, only the last reachable —
-    // silent data loss.
-    //
-    // The architecturally clean fix (DS COMMIT appends to the SAME
-    // composition_id across commits) is rejected Option B in
-    // `specs/escalations/2026-05-10-pnfs-ds-write-design.md`
-    // ("mutable compositions"). Until the architect re-evaluates,
-    // RW-mode LAYOUTGET returns `NFS4ERR_LAYOUTUNAVAILABLE` so the
-    // kernel falls back to MDS WRITE — that path routes through
-    // `nfs_ops::WriteBuffers` which already accumulates writes per
-    // fh and flushes once on COMMIT/CLOSE (#50). Read-mode layouts
-    // (LAYOUTIOMODE4_READ = 1) are unaffected: pNFS reads keep
-    // their throughput win.
-    //
-    // RFC 5661 §18.43.4 — `NFS4ERR_LAYOUTUNAVAILABLE` is the
-    // canonical "server cannot satisfy this layout request" code;
-    // kernel pNFS clients fall back gracefully.
-    if iomode >= 2 {
         w.write_u32(nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE);
         return (nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE, w.into_bytes());
     }
@@ -4175,14 +4133,16 @@ mod tests {
         );
     }
 
-    /// #74 — write-mode LAYOUTGET must return
-    /// `NFS4ERR_LAYOUTUNAVAILABLE` so the kernel pNFS client falls
-    /// back to MDS WRITE (`nfs_ops::WriteBuffers`, which correctly
-    /// accumulates per-fh writes and flushes once on COMMIT). The
-    /// pNFS DS path's per-COMMIT-new-composition behaviour silently
-    /// drops data under Linux's `fio --direct=1` pattern.
+    /// #74 — write-mode LAYOUTGET must NOT be refused unconditionally.
+    /// The DS COMMIT path now preserves the chunk-staging buffer across
+    /// commits (see `pnfs_write_buffer::snapshot_for_commit`), so the
+    /// per-1-MiB-COMMIT pattern from Linux NFSv4.1 + O_DIRECT no longer
+    /// silently drops data. This test pins that the refusal landed in
+    /// PR #76 has been removed: a RW LAYOUTGET against the legacy
+    /// Phase-14 path proceeds past the iomode gate (it still returns
+    /// the legacy NFS4_OK shape from the in-memory layout stub).
     #[tokio::test(flavor = "multi_thread")]
-    async fn op_layoutget_refuses_rw_mode_routes_to_mds() {
+    async fn op_layoutget_rw_mode_no_longer_refused() {
         let ctx = test_ctx();
         let root = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
         let state = CompoundState {
@@ -4206,37 +4166,28 @@ mod tests {
             w.write_u32(LAYOUT4_FLEX_FILES); // layout_type
             w.write_u32(iomode);
             w.write_u64(0); // offset
-            w.write_u64(0xFFFF_FFFF_FFFF_FFFF); // length
+                            // Use a small length so the legacy Phase-14 stub's
+                            // segment-emitting loop terminates promptly — pre-fix the
+                            // iomode>=2 short-circuit hid this, but with the
+                            // short-circuit gone a u64::MAX length would emit ~10^13
+                            // segments and wedge the test runner.
+            w.write_u64(1024 * 1024); // length = 1 MiB
             w.write_u64(0); // minlength
             w.write_opaque_fixed(&[0u8; 16]); // stateid
             w.write_u32(64 * 1024); // maxcount
             w.into_bytes()
         };
 
-        // LAYOUTIOMODE4_RW = 2
+        // LAYOUTIOMODE4_RW = 2 — must NOT be refused with
+        // NFS4ERR_LAYOUTUNAVAILABLE just for being write-mode.
         let bytes = build_args(2);
         let mut reader = XdrReader::new(&bytes);
-        let (status, body) = op_layoutget(&mut reader, &ctx, &state).await;
-        assert_eq!(
+        let (status, _body) = op_layoutget(&mut reader, &ctx, &state).await;
+        assert_ne!(
             status,
             nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE,
-            "RW-mode LAYOUTGET must return NFS4ERR_LAYOUTUNAVAILABLE (#74)",
+            "RW-mode LAYOUTGET must no longer be refused on iomode alone (#74 fix)",
         );
-        let mut r = XdrReader::new(&body);
-        assert_eq!(r.read_u32().expect("opcode"), op::LAYOUTGET);
-        assert_eq!(
-            r.read_u32().expect("status"),
-            nfs4_status::NFS4ERR_LAYOUTUNAVAILABLE
-        );
-
-        // Read-mode (iomode=1) is intentionally NOT exercised here:
-        // the legacy Phase-14 fallback path calls
-        // `ctx.layouts.lock().layout_get(...)` which the unit
-        // `test_ctx` doesn't wire (no MDS layout manager, no
-        // populated layouts map). The RW-refusal contract this test
-        // pins is independent of that path. Read-mode behaviour is
-        // covered by the @pnfs BDD scenarios in
-        // `specs/features/pnfs-rfc8435.feature`.
 
         let _ = state; // silence unused warning if compound state is touched in later refactors
     }

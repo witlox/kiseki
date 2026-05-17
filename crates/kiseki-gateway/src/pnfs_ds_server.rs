@@ -665,7 +665,19 @@ async fn op_commit_ds<G: GatewayOps + Send + Sync + 'static>(
         return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
     };
 
-    let Some(entry) = ctx.write_buffers.take(fh.composition_id) else {
+    // #74 — Snapshot the buffer instead of draining it. Linux NFSv4.1
+    // + `O_DIRECT` issues COMMIT after each 1 MiB WRITE; if we drained
+    // the per-composition buffer here, the next COMMIT's new
+    // composition would contain only the latest 1 MiB of bytes (with
+    // zeros at lower offsets), and the redirect would point at it —
+    // silent data loss for prior bytes. With `snapshot_for_commit`
+    // the buffer stays alive across COMMITs; each COMMIT's
+    // `gateway.write` writes the full accumulated content; the
+    // redirect always points at a composition containing every byte
+    // written through this fh. Buffer drains on session/client
+    // teardown via `clear_all` (called from `op_destroy_session_ds`
+    // / `op_destroy_clientid_ds`).
+    let Some(entry) = ctx.write_buffers.snapshot_for_commit(fh.composition_id) else {
         // No buffered writes for this composition — nothing to flush.
         // Reads-only path; reply OK with the fixed writeverf (RFC 8435
         // tightly_coupled mode permits — durability via the underlying
@@ -1110,7 +1122,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_drains_to_gateway_and_records_redirect() {
+    async fn commit_writes_to_gateway_keeps_buffer_alive_records_redirect() {
+        // #74 — COMMIT writes the buffer contents through `gateway.write`
+        // and records a redirect, BUT does NOT drain the buffer. The
+        // buffer stays alive across COMMITs so the per-1-MiB-COMMIT
+        // pattern from Linux `O_DIRECT` doesn't lose bytes between
+        // commits (covered by `per_commit_pattern_preserves_all_writes`
+        // below).
         let (ctx, key) = make_ctx();
         let fh = issue_fh(&key, 9_999_999, 0);
         let original_cid = fh.composition_id;
@@ -1130,8 +1148,12 @@ mod tests {
         assert_eq!(st, nfs4_status::NFS4_OK);
         assert_eq!(ctx.gateway.writes.load(Ordering::SeqCst), 1);
 
-        // Buffer is drained — total_bytes back to 0.
-        assert_eq!(ctx.write_buffers.total_bytes(), 0);
+        // #74 — buffer stays alive after COMMIT.
+        assert_eq!(
+            ctx.write_buffers.total_bytes(),
+            11,
+            "buffer must survive COMMIT so subsequent COMMITs include prior bytes (#74)"
+        );
 
         // Redirect recorded: original_cid → new composition (whatever
         // TrackingGateway::write minted, write count = 1).
@@ -1141,14 +1163,76 @@ mod tests {
             "redirect must point at new composition"
         );
 
-        // Subsequent READ on the OLD fh4 hits gateway.read (buffer is
-        // gone post-COMMIT) but with the resolved (new) composition_id.
-        // Verified via gateway counter increment.
+        // Subsequent READ on the OLD fh4: the read path resolves
+        // fh.composition_id through the redirect (to the new
+        // composition), then queries the buffer using the RESOLVED id.
+        // The buffer is keyed on the ORIGINAL id, so the lookup misses
+        // and gateway.read is invoked with the resolved id — which is
+        // the just-committed composition that has the bytes. Correct
+        // and intentional: post-COMMIT reads land on the durable
+        // gateway state, not the volatile in-memory buffer.
+        //
+        // The fact that the buffer remains alive (asserted above via
+        // total_bytes) is what matters for #74: the NEXT COMMIT will
+        // include the prior bytes.
         let read = read_args(0, 11);
         let mut r = XdrReader::new(&read);
         let (st, _) = op_read_ds(&mut r, &ctx, &state).await;
         assert_eq!(st, nfs4_status::NFS4_OK);
-        assert_eq!(ctx.gateway.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ctx.gateway.reads.load(Ordering::SeqCst),
+            1,
+            "post-COMMIT read goes through gateway.read on the resolved (post-commit) composition_id",
+        );
+    }
+
+    /// #74 regression: Linux NFSv4.1 + `O_DIRECT` issues COMMIT after
+    /// each WRITE. Pre-fix the per-COMMIT buffer drain left only the
+    /// latest WRITE's bytes in the new composition (zero-padded at
+    /// lower offsets), and the redirect overwrote the previous COMMIT's
+    /// composition — silent data loss. With `snapshot_for_commit` each
+    /// COMMIT writes the FULL accumulated buffer; the final composition
+    /// contains every byte written through the fh.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_commit_pattern_preserves_all_writes() {
+        let (ctx, key) = make_ctx();
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let original_cid = fh.composition_id;
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+
+        // Simulate 4 × (WRITE 1 MiB + COMMIT) like Linux O_DIRECT does.
+        let block = vec![0xab; 1024 * 1024];
+        for i in 0..4u64 {
+            let w = write_args(i * 1024 * 1024, &block);
+            let mut r = XdrReader::new(&w);
+            let (st, _) = op_write_ds(&mut r, &ctx, &state).await;
+            assert_eq!(st, nfs4_status::NFS4_OK, "WRITE {i} failed");
+
+            let c = commit_args(i * 1024 * 1024, 1024 * 1024);
+            let mut r = XdrReader::new(&c);
+            let (st, _) = op_commit_ds(&mut r, &ctx, &state).await;
+            assert_eq!(st, nfs4_status::NFS4_OK, "COMMIT {i} failed");
+        }
+
+        // 4 COMMITs → 4 gateway.write calls. Buffer total_bytes must
+        // equal 4 MiB (the cumulative content, not just the latest MB).
+        assert_eq!(ctx.gateway.writes.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            ctx.write_buffers.total_bytes(),
+            4 * 1024 * 1024,
+            "buffer must contain all 4 MiB after 4 per-1-MiB COMMITs (#74)"
+        );
+
+        // The redirect points to the LATEST composition; reads from
+        // offset 0 through 4 MiB must be served from the still-alive
+        // buffer with the right bytes.
+        let _resolved = ctx.write_buffers.resolve(original_cid);
+        let (buf_bytes, fully_covered) = ctx.write_buffers.read(original_cid, 0, 4 * 1024 * 1024);
+        assert!(fully_covered, "buffer must cover all bytes [0, 4 MiB)");
+        assert_eq!(buf_bytes.len(), 4 * 1024 * 1024);
+        assert!(buf_bytes.iter().all(|&b| b == 0xab), "every byte preserved");
     }
 
     #[tokio::test(flavor = "multi_thread")]
