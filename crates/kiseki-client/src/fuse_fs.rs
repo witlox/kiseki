@@ -86,7 +86,19 @@ impl InodeEntry {
 /// tokio worker thread (which panics). It spawns the future on the
 /// dedicated runtime and blocks the caller via `mpsc::recv`.
 pub struct KisekiFuse<G: GatewayOps> {
-    gateway: G,
+    /// `Arc<G>` not `G` so the FUSE daemon's flush / create paths can
+    /// clone the gateway handle out of the `RwLock<KisekiFuse>` guard
+    /// and call gateway methods AFTER dropping the lock. Holding the
+    /// read guard across a blocking `block_on(gateway.write(...))`
+    /// starves concurrent `FUSE_WRITE` handlers (which need the write
+    /// guard) and deadlocks `sync(2)` against in-flight writeback —
+    /// see issue #64.
+    ///
+    /// Existing read paths inside `KisekiFuse` still use `self.gateway`
+    /// directly via Arc's `Deref` (zero-cost; same wire calls). The
+    /// only behavioural change is the daemon clones the Arc before
+    /// dropping its lock.
+    gateway: std::sync::Arc<G>,
     tenant_id: OrgId,
     namespace_id: NamespaceId,
     inodes: HashMap<Ino, InodeEntry>,
@@ -127,7 +139,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
         .expect("FUSE runtime thread panicked");
 
         Self {
-            gateway,
+            gateway: std::sync::Arc::new(gateway),
             tenant_id,
             namespace_id,
             inodes,
@@ -136,6 +148,23 @@ impl<G: GatewayOps> KisekiFuse<G> {
             dirty: HashMap::new(),
             rt,
         }
+    }
+
+    /// Clone the gateway handle out of the lock so callers can drop
+    /// the `RwLock<KisekiFuse>` guard before issuing a blocking
+    /// gateway call (issue #64).
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub(crate) fn gateway_arc(&self) -> std::sync::Arc<G> {
+        std::sync::Arc::clone(&self.gateway)
+    }
+
+    /// Clone the tokio runtime handle out of the lock for the same
+    /// reason as [`Self::gateway_arc`]. The daemon's deadlock fix
+    /// (issue #64) clones both before dropping the lock and then
+    /// uses them to block on a gateway future.
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub(crate) fn rt_arc(&self) -> tokio::runtime::Handle {
+        self.rt.clone()
     }
 
     /// Test-only accessor — verifies that gateway-touching ops
@@ -149,15 +178,6 @@ impl<G: GatewayOps> KisekiFuse<G> {
     #[cfg(test)]
     pub(crate) fn rt_handle(&self) -> &tokio::runtime::Handle {
         &self.rt
-    }
-
-    /// Borrow the gateway. Used by [`crate::fuse_daemon::FuseDaemon`]
-    /// (gated by the `fuse` feature) so the daemon's flush / create
-    /// paths can call gateway futures lock-free outside the daemon's
-    /// inner `RwLock` write section.
-    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
-    pub(crate) fn gateway(&self) -> &G {
-        &self.gateway
     }
 
     /// Block on an async gateway call. Uses `block_in_place` when on a
@@ -174,19 +194,6 @@ impl<G: GatewayOps> KisekiFuse<G> {
             // On an OS thread (FUSE daemon) — block_on directly.
             self.rt.block_on(f)
         }
-    }
-
-    /// `pub(crate)` mirror of [`Self::block_gateway`] so the FUSE
-    /// daemon's flush / create paths (gated by the `fuse` feature)
-    /// can invoke gateway futures without holding the daemon's
-    /// `RwLock` for write. Same dedicated runtime + `block_in_place`
-    /// / `block_on` selection logic as the private helper.
-    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
-    pub(crate) fn block_gateway_pub<F, T>(&self, f: F) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        self.block_gateway(f)
     }
 
     /// Validate that `ino` is a directory (Root or Dir). Returns error if not.
@@ -556,11 +563,13 @@ impl<G: GatewayOps> KisekiFuse<G> {
     /// List directory entries for the given directory inode.
     ///
     /// The no-argument form lists the root directory (inode 1).
+    #[must_use]
     pub fn readdir(&self) -> Vec<DirEntry> {
         self.readdir_in(1)
     }
 
     /// List directory entries for a specific directory.
+    #[must_use]
     pub fn readdir_in(&self, dir_ino: Ino) -> Vec<DirEntry> {
         let parent_ino = match self.inodes.get(&dir_ino) {
             Some(InodeEntry::Root) => dir_ino, // root's parent is itself
